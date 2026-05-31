@@ -224,11 +224,25 @@ back to AR silently.
 ```
 qwen35-9b-dflash-mq4.hfq    590f35403cd7f1d634945233234a12b7  557 MB
 qwen35-27b-dflash-mq4.hfq   7b6df2a4ee1c8d933f0a52e187d1860b  919 MB
-qwen36-27b-dflash-mq4.hfq   ecc64877dfe0a1312b6f4066c3920128  919 MB
+qwen36-27b-dflash-mq4.hfq   204c4c4ceab30cb9ebc118fa9d59a446  919 MB
 qwen3.6-27b.mq4             9a6acdc49bcaa6a7b52ac161444cb769   15 GB
 ```
 
-Any mismatch = re-pull or report.
+Any mismatch = re-pull or report. (The `qwen36-27b-dflash-mq4.hfq`
+checksum was refreshed 2026-05-30 from the stale `ecc64877…` — the HF
+file was re-uploaded since the original manifest; verify against the
+current `204c4c4c…`.)
+
+> **Sizes here are decimal (MB = 10⁶ bytes, GB = 10⁹ bytes), matching
+> Hugging Face's reported sizes and the `hipfire pull` progress bar.**
+> `ls -lh` / `du -h` report **binary** units (MiB = 2²⁰, GiB = 2³⁰) but
+> *label them* `M`/`G`, so a 919 MB file shows as `877M` in `ls`
+> (919 × 10⁶ ÷ 2²⁰ ≈ 877 MiB) and a 15 GB file shows as `14G`. This is
+> not a size mismatch or a truncated download — it's the same byte
+> count in two unit systems. When a download looks "smaller than the
+> manifest," divide by 1.048576 (MB→MiB) or 1.073742 (GB→GiB) before
+> assuming corruption; confirm with the md5, not the human-readable
+> size.
 
 ### Build from source (if you're on a dev branch)
 

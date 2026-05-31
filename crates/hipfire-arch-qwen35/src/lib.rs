@@ -44,6 +44,12 @@ pub mod arch;
 #[cfg(feature = "deltanet")]
 pub mod paro_la_gates_codec;
 
+/// Grammar-guided decoding for qwen35 tool-call format. Independent of
+/// the deltanet feature gate — pure data-structure work, no GPU
+/// dependencies. See module docs for design and the Pi turn-12
+/// failure mode this prevents.
+pub mod grammar;
+
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
 
