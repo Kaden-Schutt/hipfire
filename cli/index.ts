@@ -3988,6 +3988,16 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "Phase 3 sparse-attention threshold (plumbing only; the kernel hasn't shipped). Source-token counts below this would fall back to dense drafter forward. Default 32768.",
       range: [0, 524288], step: 1024,
     },
+    mtp_mode: {
+      label: "mtp_mode",
+      desc: "Multi-token prediction speculative decode. off = disabled, on = always, auto = arch heuristic.",
+      options: ["off", "on", "auto"],
+    },
+    mtp_k: {
+      label: "mtp_k",
+      desc: "Number of draft tokens per multi-token-prediction spec-decode window (1-10).",
+      range: [1, 10], step: 1,
+    },
   };
 
   let selected = 0;
