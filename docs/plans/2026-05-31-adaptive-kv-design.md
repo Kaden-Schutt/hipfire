@@ -81,9 +81,13 @@ one tier. This is the unifying abstraction that makes it *adaptive KV* (not just
 adaptive V) and makes "selectable shift pattern" meaningful.
 
 - K starts at **fwht4** (128-wide), V starts at **q8**.
-- K chain is **fwht4 → fwht2** (both 128-wide ⇒ a cheap pure index-remap in
-  rotated space; **fwht3 is skipped** because it is 256-wide and would force a
-  de-rotate/re-rotate). V chain is **q8 → lloyd4 → lloyd3 → lloyd2**.
+- V chain is **q8 → lloyd4 → lloyd3 → lloyd2**.
+- K tiers are **fwht4 (128) / fwht3 (256) / fwht2 (128)**, all selectable as
+  floors. The **default/preset chains use `fwht4 → fwht2`** (both 128-wide ⇒ a
+  cheap pure index-remap in rotated space; they reach balance without needing
+  fwht3). **fwht3 enters the chain only when explicitly selected as a K tier
+  under the advanced selector** (§4.1), which engages the re-rotation transcode
+  (§5.3) because it crosses the 128↔256 width boundary.
 
 **Default pattern (`balanced`, the initial proposal — see §9, finalized by the
 KLD/coherence sweep):** keep the K/V bit-depth gap ≤ 1 tier at each stage, per
@@ -108,14 +112,36 @@ The controller executes **any** ordered pattern; presets are just named
 patterns. The `balanced` step order above is the starting default and is
 finalized empirically (§9).
 
+### 4.1 Advanced selector — independently configurable floors
+
+Adaptive is **configurable, not assumed.** Alongside the three presets, an
+**advanced** mode exposes two independent floor pickers:
+
+- **K floor ∈ {fwht4, fwht3, fwht2}** — the lowest K tier the descent reaches.
+- **V floor ∈ {lloyd4, lloyd3, lloyd2}** — the lowest V tier the descent reaches.
+
+The controller **auto-generates the descending interleave** (the balanced
+rule: keep the K/V bit-gap ≤ 1 tier, front-load the biggest byte win) from the
+fixed start tiers (K=fwht4, V=q8) down to the chosen floors. Choosing a floor
+equal to the start tier means that cache simply does not adapt (e.g. K floor =
+fwht4 ⇒ K stays at fwht4 for the whole run). Selecting **K floor = fwht3** (or
+fwht3 as an intermediate) is the only thing that engages the re-rotation K
+transcode (§5.3); every other floor combination stays on the cheap same-width
+remaps.
+
+Note: pinning a cache to a *single static tier with no adaptation at all* is
+already available via the existing non-adaptive `kv_mode` / `kv_v` load options
+(shipped with the composable-KV matrix). Advanced-adaptive governs the *descent
+floor*; static-pin is the orthogonal existing knob.
+
 ## 5. Components
 
 ### 5.1 `KMode` enum + `set_k_mode_realloc` (new, mirrors `VMode`)
 K mode is currently encoded as `quant_asym{2,3,4}` booleans read across many
-dispatch sites. Introduce a `KMode { Fwht4, Fwht2 }` (v1 chain) accessor that
-derives those booleans, so the controller can flip K tier coherently. The
-booleans remain the source the forward pass reads each call (no graph baking of
-K mode — see §7).
+dispatch sites. Introduce a `KMode { Fwht4, Fwht3, Fwht2 }` accessor that
+derives those booleans (and the rotation width: fwht4/fwht2 = 128, fwht3 =
+256), so the controller can flip K tier coherently. The booleans remain the
+source the forward pass reads each call (no graph baking of K mode — see §7).
 
 ### 5.2 `KvAdaptive` controller (new; sibling of `EvictionCtx`)
 Holds: the resolved `pattern` (Vec of steps), current step index, current
@@ -141,7 +167,15 @@ crash-safety.
 - **V `lloyd_hi → lloyd_lo`** (lloyd4→3, lloyd3→2) — read rotated indices →
   remap each to the nearest lower-LUT centroid → repack. **No FWHT.**
 - **K `fwht4 → fwht2`** — same shape as the V lloyd remap, 128-wide, on the K
-  buffer. **No FWHT** (same rotation width).
+  buffer. **No FWHT** (same rotation width). This is the default/preset K step.
+- **K re-rotation transcode** (`fwht4 → fwht3`, `fwht3 → fwht2`) — used only
+  when fwht3 is selected as a K tier (advanced, §4.1). Crosses the 128↔256 width
+  boundary, so it cannot be a same-width remap: reconstruct normal-space K
+  (dequant + inverse rotation at the source width) → re-rotate at the target
+  width → quantize to the target LUT. This **reuses the existing
+  `kv_cache_write_fwht{2,3,4}` write kernels** fed reconstructed normal-space K;
+  the only genuinely new piece is the dequant+inverse-rotation read. Costlier
+  than the remap (a normal-space round-trip), but off the hot/default path.
 
 **Plan spike (cheap, do first):** confirm `TURBO_C{2,3,4}_256` (V) and the K
 LUTs are normalized to a shared scale. If yes, every lloyd→lloyd / fwht4→fwht2
@@ -160,8 +194,11 @@ Mirror the existing `kv_mode` / `HIPFIRE_KV_V` wiring:
 - **daemon**: `HIPFIRE_KV_ADAPTIVE=off|conservative|balanced|aggressive` env +
   per-load `params.kv_adaptive`.
 - **TUI** (`cli/index.ts` settings menu, alongside `kv_cache`, `physical_cap`,
-  CASK descriptions): a `kv_adaptive` entry — off + the three presets + help
-  text explaining the max_seq-as-floor-context contract.
+  CASK descriptions): a `kv_adaptive` entry — off + the three presets + an
+  **advanced** option (§4.1) exposing independent K-floor / V-floor pickers +
+  help text explaining the max_seq-as-floor-context contract. The env / per-load
+  form accepts the preset names *and* an explicit floor pair (e.g.
+  `kv_adaptive=advanced:k=fwht3,v=lloyd2`).
 - **Constraint**: requires an FWHT K mode. When adaptive is ON, the loader
   forces K=fwht4 (satisfies the constraint by construction). If a non-FWHT
   K mode is otherwise selected, adaptive is ignored with a warning (reuse the
