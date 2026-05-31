@@ -3290,8 +3290,6 @@ fn apply_rope_cpu(data: &mut [f32], n_heads: usize, head_dim: usize, pos: usize,
     }
 }
 
-/// GPU-resident KV cache for autoregressive generation.
-///
 /// V-cache quantization mode. The bit-count IS the kernarg value passed to
 /// kernels: 8 = legacy Q8_0 (per-32-block fp16 scale + int8, 272 B/head at hd=256),
 /// 2/3/4 = FWHT-rotated centroid-LUT V (Lloyd-V), layout identical to the K fwht
@@ -3500,10 +3498,12 @@ impl KvCache {
     /// independent V quant after construction). Re-sizes only real KV layers
     /// (placeholder 1-element buffers for non-KV layers are left as-is).
     /// K buffers and rotation tables are untouched.
+    /// Note: single-GPU only; multi-GPU V-mode wiring is deferred (plan Task 9).
     pub fn set_v_mode_realloc(&mut self, gpu: &mut Gpu, v_mode: VMode) -> HipResult<()> {
         let v_bpp = Self::v_bytes_per_pos(self.n_kv_heads, self.head_dim, v_mode);
         let v_elems = (self.physical_cap * v_bpp + 3) / 4;
         for t in self.v_gpu.iter_mut() {
+            // 1-element placeholder convention for non-KV layers: see alloc_k_v_filtered
             if t.numel() > 1 {
                 *t = gpu.zeros(&[v_elems], DType::F32)?;
             }
