@@ -462,3 +462,14 @@ test("MiniMax-M2 preserves assistant content before the tool call", () => {
   expect(r.content).toBe("Let me check.");
   expect(r.tool_calls![0].function.name).toBe("f");
 });
+
+// Exact bytes the real MiniMax-M2 *embedded* chat_template renders for an
+// assistant tool call (note the leading indentation before <parameter> that
+// the template emits) — captured via jinja2 render of the model's own template.
+test("MiniMax-M2 real embedded-template emission (indented) parses", () => {
+  const out = '<minimax:tool_call>\n<invoke name="get_weather">\n                <parameter name="location">Paris</parameter>\n                <parameter name="units">metric</parameter>\n                </invoke>\n</minimax:tool_call>';
+  const r = parseXmlInvokeToolCalls(out);
+  expect(r.tool_calls!.length).toBe(1);
+  expect(r.tool_calls![0].function.name).toBe("get_weather");
+  expect(JSON.parse(r.tool_calls![0].function.arguments)).toEqual({ location: "Paris", units: "metric" });
+});
