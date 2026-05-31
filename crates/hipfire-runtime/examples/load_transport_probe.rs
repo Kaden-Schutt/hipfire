@@ -24,10 +24,10 @@ use hipfire_runtime::weight_pager::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-#[cfg(unix)]
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
 #[cfg(not(unix))]
 use std::os::unix::fs::FileExt;
+#[cfg(unix)]
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
 const DIRECT_ALIGN: usize = 4096;
 
@@ -226,7 +226,12 @@ fn run_slab_mode(
     for bank in &banks {
         let (slab, handle) = transport
             .fetch(bank.offset, bank.len, gpu)
-            .unwrap_or_else(|e| panic!("fetch bank offset={} len={} failed: {e}", bank.offset, bank.len));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "fetch bank offset={} len={} failed: {e}",
+                    bank.offset, bank.len
+                )
+            });
         transport.wait(&[handle]).expect("wait");
         copied_bytes += bank.len;
 
@@ -291,8 +296,7 @@ fn run_slab_profile_mode(
     let mut stats = SlabProfileStats::default();
     let mut heap = Vec::<u8>::new();
     let mut direct = AlignedBuf::new(max_direct_len.max(DIRECT_ALIGN), DIRECT_ALIGN);
-    let mut pinned = if read_mode == "cached" && matches!(transport_name, "pinned" | "pinned-h2d")
-    {
+    let mut pinned = if read_mode == "cached" && matches!(transport_name, "pinned" | "pinned-h2d") {
         Some(gpu.hip.host_malloc(max_bank_len, 0).expect("hipHostMalloc"))
     } else {
         None
@@ -333,14 +337,24 @@ fn run_slab_profile_mode(
             let dst = &mut unsafe { host.as_mut_slice() }[..bank.len];
             let t_read = Instant::now();
             file.read_exact_at(dst, bank.offset as u64)
-                .unwrap_or_else(|e| panic!("read bank offset={} len={} failed: {e}", bank.offset, bank.len));
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "read bank offset={} len={} failed: {e}",
+                        bank.offset, bank.len
+                    )
+                });
             stats.read_s += t_read.elapsed().as_secs_f64();
             (bank.len, &host.as_slice()[..bank.len], true)
         } else {
             let dst = &mut heap[..bank.len];
             let t_read = Instant::now();
             file.read_exact_at(dst, bank.offset as u64)
-                .unwrap_or_else(|e| panic!("read bank offset={} len={} failed: {e}", bank.offset, bank.len));
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "read bank offset={} len={} failed: {e}",
+                        bank.offset, bank.len
+                    )
+                });
             stats.read_s += t_read.elapsed().as_secs_f64();
             (bank.len, &heap[..bank.len], false)
         };
@@ -436,13 +450,12 @@ fn run_slab_prealloc_mode(
     let mut stats = SlabProfileStats::default();
     let mut heap = Vec::<u8>::new();
     let mut direct = AlignedBuf::new(max_direct_len.max(DIRECT_ALIGN), DIRECT_ALIGN);
-    let mut pinned = if effective_read_mode == "cached"
-        && matches!(transport_name, "pinned" | "pinned-h2d")
-    {
-        Some(gpu.hip.host_malloc(max_bank_len, 0).expect("hipHostMalloc"))
-    } else {
-        None
-    };
+    let mut pinned =
+        if effective_read_mode == "cached" && matches!(transport_name, "pinned" | "pinned-h2d") {
+            Some(gpu.hip.host_malloc(max_bank_len, 0).expect("hipHostMalloc"))
+        } else {
+            None
+        };
 
     if pinned.is_none() && effective_read_mode == "cached" {
         heap.resize(max_bank_len, 0);
@@ -453,7 +466,10 @@ fn run_slab_prealloc_mode(
     let mut slabs = Vec::with_capacity(banks.len());
     if !read_only {
         for bank in banks {
-            let buf = gpu.hip.malloc(bank.len).expect("hipMalloc preallocated slab");
+            let buf = gpu
+                .hip
+                .malloc(bank.len)
+                .expect("hipMalloc preallocated slab");
             slabs.push(GpuTensor {
                 buf,
                 shape: vec![bank.len],
@@ -465,7 +481,8 @@ fn run_slab_prealloc_mode(
 
     let load_t0 = Instant::now();
     for (bank_idx, bank) in banks.iter().enumerate() {
-        let (read_len, src, used_pinned): (usize, &[u8], bool) = if effective_read_mode == "direct" {
+        let (read_len, src, used_pinned): (usize, &[u8], bool) = if effective_read_mode == "direct"
+        {
             let (aligned_start, aligned_len, rel) = aligned_read_window(bank, file_len);
             let t_read = Instant::now();
             let got = read_direct_allow_eof(
@@ -494,14 +511,24 @@ fn run_slab_prealloc_mode(
             let dst = &mut unsafe { host.as_mut_slice() }[..bank.len];
             let t_read = Instant::now();
             file.read_exact_at(dst, bank.offset as u64)
-                .unwrap_or_else(|e| panic!("read bank offset={} len={} failed: {e}", bank.offset, bank.len));
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "read bank offset={} len={} failed: {e}",
+                        bank.offset, bank.len
+                    )
+                });
             stats.read_s += t_read.elapsed().as_secs_f64();
             (bank.len, &host.as_slice()[..bank.len], true)
         } else {
             let dst = &mut heap[..bank.len];
             let t_read = Instant::now();
             file.read_exact_at(dst, bank.offset as u64)
-                .unwrap_or_else(|e| panic!("read bank offset={} len={} failed: {e}", bank.offset, bank.len));
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "read bank offset={} len={} failed: {e}",
+                        bank.offset, bank.len
+                    )
+                });
             stats.read_s += t_read.elapsed().as_secs_f64();
             (bank.len, &heap[..bank.len], false)
         };
@@ -605,7 +632,11 @@ fn align_up(v: usize, align: usize) -> usize {
     (v + align - 1) & !(align - 1)
 }
 
-fn read_direct_allow_eof(file: &std::fs::File, dst: &mut [u8], offset: u64) -> std::io::Result<usize> {
+fn read_direct_allow_eof(
+    file: &std::fs::File,
+    dst: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
     let mut done = 0usize;
     while done < dst.len() {
         let remaining = dst.len() - done;

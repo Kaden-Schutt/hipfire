@@ -328,14 +328,16 @@ fn drive_generate(
         "max_tokens": args.max_tokens.unwrap_or(200),
     });
     if let Some(repeat_penalty) = args.repeat_penalty {
-        req.as_object_mut()
-            .unwrap()
-            .insert("repeat_penalty".to_string(), serde_json::json!(repeat_penalty));
+        req.as_object_mut().unwrap().insert(
+            "repeat_penalty".to_string(),
+            serde_json::json!(repeat_penalty),
+        );
     }
     if let Some(repeat_window) = args.repeat_window {
-        req.as_object_mut()
-            .unwrap()
-            .insert("repeat_window".to_string(), serde_json::json!(repeat_window));
+        req.as_object_mut().unwrap().insert(
+            "repeat_window".to_string(),
+            serde_json::json!(repeat_window),
+        );
     }
     if let Some(sys) = system {
         req.as_object_mut().unwrap().insert(

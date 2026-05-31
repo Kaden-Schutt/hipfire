@@ -56,19 +56,58 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--target" => { target_path = Some(args[i + 1].clone()); i += 2; }
-            "--drafter" | "--draft" => { drafter_path = Some(args[i + 1].clone()); i += 2; }
-            "--mtp-head" => { mtp_path = Some(args[i + 1].clone()); i += 2; }
-            "--prompt" => { prompt_str = Some(args[i + 1].clone()); i += 2; }
-            "--prompt-file" => { prompt_file = Some(args[i + 1].clone()); i += 2; }
-            "--max" => { max_tokens = args[i + 1].parse().unwrap(); i += 2; }
-            "--ctx" => { ctx_capacity = args[i + 1].parse().unwrap(); i += 2; }
-            "--temp" => { temp = args[i + 1].parse().unwrap(); i += 2; }
-            "--dflash-b" => { dflash_b = Some(args[i + 1].parse().unwrap()); i += 2; }
-            "--mtp-k" => { mtp_k = args[i + 1].parse().unwrap(); i += 2; }
-            "--no-chatml" => { chatml = false; i += 1; }
-            "--chatml" => { chatml = true; i += 1; }
-            "--kv-mode" => { kv_mode_str = args[i + 1].clone(); i += 2; }
+            "--target" => {
+                target_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--drafter" | "--draft" => {
+                drafter_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--mtp-head" => {
+                mtp_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--prompt" => {
+                prompt_str = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--prompt-file" => {
+                prompt_file = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--max" => {
+                max_tokens = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--ctx" => {
+                ctx_capacity = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--temp" => {
+                temp = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--dflash-b" => {
+                dflash_b = Some(args[i + 1].parse().unwrap());
+                i += 2;
+            }
+            "--mtp-k" => {
+                mtp_k = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--no-chatml" => {
+                chatml = false;
+                i += 1;
+            }
+            "--chatml" => {
+                chatml = true;
+                i += 1;
+            }
+            "--kv-mode" => {
+                kv_mode_str = args[i + 1].clone();
+                i += 2;
+            }
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: dflash_mtp_demo --target <trunk.mq4> --drafter <drafter.hfq> \\\n\
@@ -116,7 +155,9 @@ fn main() {
     eprintln!("drafter:    {drafter_path}");
     eprintln!("mtp-head:   {mtp_path}");
     eprintln!("prompt md5: {prompt_hash}");
-    eprintln!("max={max_tokens} ctx={ctx_capacity} mtp_k={mtp_k} kv_mode={kv_mode_str} chatml={chatml}");
+    eprintln!(
+        "max={max_tokens} ctx={ctx_capacity} mtp_k={mtp_k} kv_mode={kv_mode_str} chatml={chatml}"
+    );
 
     // ── Init GPU + load drafter cfg ────────────────────────────────────
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
@@ -160,15 +201,14 @@ fn main() {
     let max_seq_total = slot_cfg.max_seq;
 
     let t_load = Instant::now();
-    let mut target = ModelSlot::load(
-        &mut gpu, Path::new(&target_path), "target", slot_cfg,
-    ).expect("load trunk");
+    let mut target =
+        ModelSlot::load(&mut gpu, Path::new(&target_path), "target", slot_cfg).expect("load trunk");
     eprintln!("trunk loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     // ── Load drafter ───────────────────────────────────────────────────
     let t_d = Instant::now();
-    let draft_weights = DflashWeights::load(&mut gpu, &draft_hfq, &draft_cfg)
-        .expect("load drafter");
+    let draft_weights =
+        DflashWeights::load(&mut gpu, &draft_hfq, &draft_cfg).expect("load drafter");
     eprintln!("drafter loaded in {:.2}s", t_d.elapsed().as_secs_f64());
     assert_eq!(
         target.config.vocab_size, draft_cfg.vocab_size,
@@ -182,20 +222,21 @@ fn main() {
     );
 
     // Drafter scratch sized for B alone (drafter doesn't see MTP slots).
-    let mut draft_scratch = DflashScratch::new_with_mq(
-        &mut gpu, &draft_cfg, b, ctx_capacity, draft_weights.has_mq,
-    ).expect("alloc draft scratch");
+    let mut draft_scratch =
+        DflashScratch::new_with_mq(&mut gpu, &draft_cfg, b, ctx_capacity, draft_weights.has_mq)
+            .expect("alloc draft scratch");
 
     // ── Load MTP head ──────────────────────────────────────────────────
     let t_mtp = Instant::now();
-    let head = mtp_head::load_mtp_head(
-        Path::new(&mtp_path), &mut gpu, max_seq_total,
-    ).expect("load mtp head");
+    let head = mtp_head::load_mtp_head(Path::new(&mtp_path), &mut gpu, max_seq_total)
+        .expect("load mtp head");
     eprintln!(
         "mtp head loaded in {:.2}s — n_embd={} vocab={} n_rot={} rope_theta={}",
         t_mtp.elapsed().as_secs_f64(),
-        head.config.n_embd, head.config.vocab_size,
-        head.config.n_rot, head.config.rope_theta,
+        head.config.n_embd,
+        head.config.vocab_size,
+        head.config.n_rot,
+        head.config.rope_theta,
     );
     assert_eq!(head.config.n_embd, target.config.dim);
     assert_eq!(head.config.vocab_size, target.config.vocab_size);
@@ -221,7 +262,10 @@ fn main() {
         chat.extend_from_slice(&asst);
         chat.extend_from_slice(&nl);
         prompt_tokens = chat;
-        eprintln!("chatml wrap: prompt {} tokens after wrap", prompt_tokens.len());
+        eprintln!(
+            "chatml wrap: prompt {} tokens after wrap",
+            prompt_tokens.len()
+        );
     } else {
         eprintln!("prompt: {} tokens (no chatml)", prompt_tokens.len());
     }
@@ -229,7 +273,10 @@ fn main() {
     assert!(
         prompt_tokens.len() + max_tokens + n_verify + 16 <= max_seq_total,
         "prompt ({}) + max ({}) + n_verify ({}) won't fit in max_seq {}",
-        prompt_tokens.len(), max_tokens, n_verify, max_seq_total,
+        prompt_tokens.len(),
+        max_tokens,
+        n_verify,
+        max_seq_total,
     );
 
     // ── Hidden ring buffer + snapshot + verify scratch ─────────────────
@@ -242,12 +289,12 @@ fn main() {
         draft_cfg.hidden,
         ctx_capacity + n_verify,
         hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(n_verify),
-    ).expect("alloc hidden_rb");
+    )
+    .expect("alloc hidden_rb");
 
     let mut target_snap = DeltaNetSnapshot::new_for(&mut gpu, &target.dn_state).expect("snap");
-    let mut gdn_tape = GdnTape::new_for_config(
-        &mut gpu, &target.config, n_verify,
-    ).expect("alloc gdn tape");
+    let mut gdn_tape =
+        GdnTape::new_for_config(&mut gpu, &target.config, n_verify).expect("alloc gdn tape");
     let verify_scratch = VerifyScratch::with_prefill(
         &mut gpu,
         n_verify,
@@ -255,19 +302,28 @@ fn main() {
         target.config.vocab_size,
         target.weights.output.k,
         &target.config,
-    ).expect("alloc verify scratch");
+    )
+    .expect("alloc verify scratch");
 
-    let mut compose_state = MtpComposeState::new(&mut gpu, &target, &head, mtp_k)
-        .expect("alloc MtpComposeState");
+    let mut compose_state =
+        MtpComposeState::new(&mut gpu, &target, &head, mtp_k).expect("alloc MtpComposeState");
 
     // ── Prefill: seed target_hidden via per-token forward_with_hidden ──
     let mut target_hidden_host: Vec<f32> =
         Vec::with_capacity(ctx_capacity * draft_cfg.num_extract() * draft_cfg.hidden);
-    eprintln!("seeding target_hidden from prompt ({} tokens)...", prompt_tokens.len());
+    eprintln!(
+        "seeding target_hidden from prompt ({} tokens)...",
+        prompt_tokens.len()
+    );
     let t_prefill = Instant::now();
     speculative::seed_target_hidden_from_prompt(
-        &mut gpu, &mut target, &mut hidden_rb, &mut target_hidden_host, &prompt_tokens,
-    ).expect("seed target hidden");
+        &mut gpu,
+        &mut target,
+        &mut hidden_rb,
+        &mut target_hidden_host,
+        &prompt_tokens,
+    )
+    .expect("seed target hidden");
     speculative::scatter_hidden_block_to_interleaved(
         &gpu,
         &hidden_rb,
@@ -275,24 +331,37 @@ fn main() {
         0,
         prompt_tokens.len(),
         prompt_tokens.len(),
-    ).expect("seed scatter");
+    )
+    .expect("seed scatter");
     draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
     draft_scratch.target_hidden_abs_positions = (0..prompt_tokens.len() as i32).collect();
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
     let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
-    eprintln!("prefill in {:.2}s ({:.1} tok/s)", prefill_secs, prefill_tok_s);
+    eprintln!(
+        "prefill in {:.2}s ({:.1} tok/s)",
+        prefill_secs, prefill_tok_s
+    );
 
     // ── Initial seed_token: trunk's greedy pick after prefill ──────────
-    let logits0 = gpu.download_f32(&target.scratch.logits).expect("download logits");
+    let logits0 = gpu
+        .download_f32(&target.scratch.logits)
+        .expect("download logits");
     let mut seed_token = 0u32;
     let mut best = f32::NEG_INFINITY;
     for (i, &v) in logits0.iter().enumerate() {
-        if v > best { best = v; seed_token = i as u32; }
+        if v > best {
+            best = v;
+            seed_token = i as u32;
+        }
     }
     eprintln!(
         "seed token (greedy after prefill): {} ('{}')",
         seed_token,
-        tokenizer.decode(&[seed_token]).chars().take(16).collect::<String>(),
+        tokenizer
+            .decode(&[seed_token])
+            .chars()
+            .take(16)
+            .collect::<String>(),
     );
 
     // ── Decode loop ───────────────────────────────────────────────────
@@ -330,7 +399,8 @@ fn main() {
             seed_token,
             Some(b),
             mtp_k,
-        ).expect("spec_step_dflash_mtp");
+        )
+        .expect("spec_step_dflash_mtp");
 
         cycles += 1;
         accept_dflash_total += result.accept_dflash;
@@ -365,13 +435,19 @@ fn main() {
     // τ_total  = avg committed per cycle (= 1 + accept_dflash + accept_mtp avg)
     let tau_dflash = if cycles > 0 {
         accept_dflash_total as f64 / cycles as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     let tau_mtp = if cycles > 0 {
         accept_mtp_total as f64 / cycles as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     let tau_total = if cycles > 0 {
         ((total_committed - 1) as f64) / cycles as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     let text = tokenizer.decode(&emitted);
     println!("\n=== output ===\n{text}\n=== end ===");
@@ -384,9 +460,11 @@ fn main() {
     println!("committed_total:      {}", total_committed);
     println!("accept_dflash_total:  {}", accept_dflash_total);
     println!("accept_mtp_total:     {}", accept_mtp_total);
-    println!("full_dflash_cycles:   {} ({:.1}%)",
+    println!(
+        "full_dflash_cycles:   {} ({:.1}%)",
         full_dflash_cycles,
-        100.0 * full_dflash_cycles as f64 / cycles.max(1) as f64);
+        100.0 * full_dflash_cycles as f64 / cycles.max(1) as f64
+    );
     println!("tau_dflash:           {:.4}", tau_dflash);
     println!("tau_mtp:              {:.4}", tau_mtp);
     println!("tau_total:            {:.4}", tau_total);

@@ -29,7 +29,12 @@ fn f32_to_f16_bits(v: f32) -> u16 {
 const WARMUP: usize = 4;
 const TRIALS: usize = 30;
 
-fn wrap_buf(raw_ptr: *mut std::ffi::c_void, bytes: usize, shape: Vec<usize>, dtype: DType) -> GpuTensor {
+fn wrap_buf(
+    raw_ptr: *mut std::ffi::c_void,
+    bytes: usize,
+    shape: Vec<usize>,
+    dtype: DType,
+) -> GpuTensor {
     GpuTensor {
         buf: unsafe { hip_bridge::DeviceBuffer::from_raw(raw_ptr, bytes) },
         shape,
@@ -98,8 +103,8 @@ fn main() {
             continue;
         }
         // Synthesize weights (small range to avoid huge int8 saturation losses).
-        let weights_f32: Vec<f32> = (0..m*k).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
-        let x_f32: Vec<f32> = (0..n*k).map(|i| ((i % 13) as f32 - 6.0) * 0.01).collect();
+        let weights_f32: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
+        let x_f32: Vec<f32> = (0..n * k).map(|i| ((i % 13) as f32 - 6.0) * 0.01).collect();
         let weights_q8 = quantize_q8_block(&weights_f32);
         let x_f16 = f32_to_f16_bytes(&x_f32);
 
@@ -116,32 +121,38 @@ fn main() {
         let y2_tensor = wrap_buf(y2_gpu.as_ptr(), n * m * 4, vec![n, m], DType::F32);
 
         // ── Run reference kernel
-        gpu.gemm_q8_0_wmma(&a_tensor, &x_tensor, &y_tensor, m, k, n).expect("ref");
+        gpu.gemm_q8_0_wmma(&a_tensor, &x_tensor, &y_tensor, m, k, n)
+            .expect("ref");
         gpu.hip.device_synchronize().unwrap();
         let mut y_ref_bytes = vec![0u8; n * m * 4];
         gpu.hip.memcpy_dtoh(&mut y_ref_bytes, &y_gpu).unwrap();
-        let y_ref: &[f32] = unsafe {
-            std::slice::from_raw_parts(y_ref_bytes.as_ptr() as *const f32, n * m)
-        };
+        let y_ref: &[f32] =
+            unsafe { std::slice::from_raw_parts(y_ref_bytes.as_ptr() as *const f32, n * m) };
 
         // ── Run new 4w kernel
         // Need to call via launch_kernel since no wrapper yet.
-        gpu.gemm_q8_0_wmma_4w(&a_tensor, &x_tensor, &y2_tensor, m, k, n).expect("4w");
+        gpu.gemm_q8_0_wmma_4w(&a_tensor, &x_tensor, &y2_tensor, m, k, n)
+            .expect("4w");
         gpu.hip.device_synchronize().unwrap();
         let mut y_new_bytes = vec![0u8; n * m * 4];
         gpu.hip.memcpy_dtoh(&mut y_new_bytes, &y2_gpu).unwrap();
-        let y_new: &[f32] = unsafe {
-            std::slice::from_raw_parts(y_new_bytes.as_ptr() as *const f32, n * m)
-        };
+        let y_new: &[f32] =
+            unsafe { std::slice::from_raw_parts(y_new_bytes.as_ptr() as *const f32, n * m) };
 
         // Compare
         let mut max_diff = 0.0f32;
         let mut diff_idx = 0;
         let mut nan_count = 0;
-        for i in 0..n*m {
-            if !y_new[i].is_finite() { nan_count += 1; continue; }
+        for i in 0..n * m {
+            if !y_new[i].is_finite() {
+                nan_count += 1;
+                continue;
+            }
             let d = (y_ref[i] - y_new[i]).abs();
-            if d > max_diff { max_diff = d; diff_idx = i; }
+            if d > max_diff {
+                max_diff = d;
+                diff_idx = i;
+            }
         }
         let rel_max = max_diff / y_ref[diff_idx].abs().max(1e-6);
         println!("  max_abs_diff: {max_diff:.6e}  rel: {rel_max:.6e}  nan: {nan_count}");
@@ -152,23 +163,27 @@ fn main() {
 
         // ── Perf A/B
         for _ in 0..WARMUP {
-            gpu.gemm_q8_0_wmma(&a_tensor, &x_tensor, &y_tensor, m, k, n).unwrap();
+            gpu.gemm_q8_0_wmma(&a_tensor, &x_tensor, &y_tensor, m, k, n)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let t0 = Instant::now();
         for _ in 0..TRIALS {
-            gpu.gemm_q8_0_wmma(&a_tensor, &x_tensor, &y_tensor, m, k, n).unwrap();
+            gpu.gemm_q8_0_wmma(&a_tensor, &x_tensor, &y_tensor, m, k, n)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let ref_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
 
         for _ in 0..WARMUP {
-            gpu.gemm_q8_0_wmma_4w(&a_tensor, &x_tensor, &y2_tensor, m, k, n).unwrap();
+            gpu.gemm_q8_0_wmma_4w(&a_tensor, &x_tensor, &y2_tensor, m, k, n)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let t0 = Instant::now();
         for _ in 0..TRIALS {
-            gpu.gemm_q8_0_wmma_4w(&a_tensor, &x_tensor, &y2_tensor, m, k, n).unwrap();
+            gpu.gemm_q8_0_wmma_4w(&a_tensor, &x_tensor, &y2_tensor, m, k, n)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let new_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;

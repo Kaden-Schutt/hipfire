@@ -388,16 +388,19 @@ impl DirectH2DTransport {
         if self.staging_len >= len {
             return Ok(());
         }
-        self.staging = Some(AlignedHostBuffer::new(len.max(DIRECT_IO_ALIGN), DIRECT_IO_ALIGN)?);
+        self.staging = Some(AlignedHostBuffer::new(
+            len.max(DIRECT_IO_ALIGN),
+            DIRECT_IO_ALIGN,
+        )?);
         self.staging_len = len.max(DIRECT_IO_ALIGN);
         Ok(())
     }
 
     fn read_into_staging(&mut self, offset: usize, len: usize) -> std::io::Result<(usize, usize)> {
         let start = align_down(offset, DIRECT_IO_ALIGN);
-        let end = offset
-            .checked_add(len)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflow"))?;
+        let end = offset.checked_add(len).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflow")
+        })?;
         let direct_len = align_up(end, DIRECT_IO_ALIGN) - start;
         let rel = offset - start;
         self.ensure_staging(direct_len)?;
@@ -405,7 +408,8 @@ impl DirectH2DTransport {
             .staging
             .as_mut()
             .expect("DirectH2DTransport staging must be allocated before read");
-        let got = read_direct_allow_eof(&self.file, staging.as_mut_slice(direct_len), start as u64)?;
+        let got =
+            read_direct_allow_eof(&self.file, staging.as_mut_slice(direct_len), start as u64)?;
         if got < rel + len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -427,10 +431,13 @@ impl Transport for DirectH2DTransport {
         gpu: &mut Gpu,
     ) -> HipResult<(GpuTensor, TransferHandle)> {
         let (rel, copy_len) = self.read_into_staging(hfq_offset, len).map_err(|e| {
-            hip_bridge::HipError::new(0, &format!(
-                "direct read {} bytes at offset {} from {:?} (file_len={}): {}",
-                len, hfq_offset, self.path, self.file_len, e
-            ))
+            hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "direct read {} bytes at offset {} from {:?} (file_len={}): {}",
+                    len, hfq_offset, self.path, self.file_len, e
+                ),
+            )
         })?;
         let staging = self.staging.as_ref().expect("direct staging");
         let src = &staging.as_slice()[rel..rel + copy_len];
@@ -486,13 +493,12 @@ impl Transport for PinnedH2DTransport {
         gpu: &mut Gpu,
     ) -> HipResult<(GpuTensor, TransferHandle)> {
         self.ensure_staging(len, gpu)?;
-        self.pread_into_staging(hfq_offset, len)
-            .map_err(|e| {
-                hip_bridge::HipError::new(0, &format!(
-                    "pinned pread {} bytes at offset {}: {}",
-                    len, hfq_offset, e
-                ))
-            })?;
+        self.pread_into_staging(hfq_offset, len).map_err(|e| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("pinned pread {} bytes at offset {}: {}", len, hfq_offset, e),
+            )
+        })?;
         let buf = gpu.hip.malloc(len)?;
         let src = &self.staging.as_ref().unwrap().as_slice()[..len];
         let stream = hip_bridge::Stream::null();

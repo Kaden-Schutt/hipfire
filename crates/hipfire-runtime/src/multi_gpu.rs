@@ -440,7 +440,8 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
     let max_free = *frees.iter().max().unwrap();
     let min_free = *frees.iter().min().unwrap();
     let delta_gb = (max_free - min_free) as f64 / 1e9;
-    let tol_gb = crate::config::get().uniform_vram_tolerance_gb
+    let tol_gb = crate::config::get()
+        .uniform_vram_tolerance_gb
         .map(|t| t as f64)
         .unwrap_or(DEFAULT_VRAM_TOLERANCE_GB);
     if delta_gb > tol_gb {

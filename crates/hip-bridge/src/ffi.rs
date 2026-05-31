@@ -724,15 +724,25 @@ impl HipRuntime {
     /// the fast pinned-memory path instead of pageable Rust heap memory.
     pub fn host_malloc(&self, size: usize, flags: u32) -> HipResult<HostBuffer> {
         let host_malloc = self.fn_host_malloc.ok_or_else(|| {
-            HipError::new(0, "hipHostMalloc symbol not available in loaded HIP runtime")
+            HipError::new(
+                0,
+                "hipHostMalloc symbol not available in loaded HIP runtime",
+            )
         })?;
         let host_free = self.fn_host_free.ok_or_else(|| {
-            HipError::new(0, "hipHostFree/hipFreeHost symbol not available in loaded HIP runtime")
+            HipError::new(
+                0,
+                "hipHostFree/hipFreeHost symbol not available in loaded HIP runtime",
+            )
         })?;
         let mut ptr: *mut c_void = ptr::null_mut();
         let code = unsafe { host_malloc(&mut ptr, size, flags as c_uint) };
         self.check(code, "hipHostMalloc")?;
-        Ok(HostBuffer { ptr, size, host_free })
+        Ok(HostBuffer {
+            ptr,
+            size,
+            host_free,
+        })
     }
 
     /// # Safety

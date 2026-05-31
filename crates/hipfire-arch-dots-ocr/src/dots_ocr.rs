@@ -998,7 +998,11 @@ pub fn vision_forward(
     );
     eprintln!(
         "  vision kernels: {}",
-        if use_wmma { "rdna3-wmma" } else { "scalar-fallback" },
+        if use_wmma {
+            "rdna3-wmma"
+        } else {
+            "scalar-fallback"
+        },
     );
 
     // HIPFIRE_DOTS_OCR_DUMP_DIR=<path>: dump full per-stage tensor
@@ -1692,9 +1696,16 @@ mod tests {
         // IMG_END), and the trailing <|assistant|> cue. This MUST be
         // byte-exact.
         let img_block_end = 2 + n_visual; // 220, IMG_START, n×IMGPAD, then IMG_END at this index
-        assert_eq!(got[..=img_block_end], expected[..=img_block_end],
-            "image-block framing diverged from HF capture");
-        assert_eq!(*got.last().unwrap(), ASSISTANT_ID, "missing trailing <|assistant|> cue");
+        assert_eq!(
+            got[..=img_block_end],
+            expected[..=img_block_end],
+            "image-block framing diverged from HF capture"
+        );
+        assert_eq!(
+            *got.last().unwrap(),
+            ASSISTANT_ID,
+            "missing trailing <|assistant|> cue"
+        );
         assert_eq!(got.last(), expected.last(), "trailing cue diverged");
 
         // The prompt-text interior is tokenized by the shared GPT-2 BPE
@@ -1705,8 +1716,11 @@ mod tests {
         // decoded *text* is identical, only BPE boundaries on indentation
         // runs differ. Assert text-equality (the strong invariant) and
         // report any boundary diffs for visibility.
-        assert_eq!(tok.decode(&got), tok.decode(&expected),
-            "decoded prompt text diverged — this IS a real bug (not just a BPE-boundary diff)");
+        assert_eq!(
+            tok.decode(&got),
+            tok.decode(&expected),
+            "decoded prompt text diverged — this IS a real bug (not just a BPE-boundary diff)"
+        );
 
         let n_diff = (0..got.len()).filter(|&i| got[i] != expected[i]).count();
         if n_diff > 0 {

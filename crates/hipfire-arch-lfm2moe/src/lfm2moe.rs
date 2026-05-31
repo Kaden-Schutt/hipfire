@@ -34,9 +34,15 @@ fn read_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
 /// attached `awq_scale` stays None and `rotate_x_mq_for` takes the plain path).
 fn load_lfm2_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Option<GpuTensor> {
     let (qt, data) = read_tensor(hfq, name).ok()?;
-    if qt != 1 { return None; } // 1 = F16
+    if qt != 1 {
+        return None;
+    } // 1 = F16
     if data.len() != k * 2 {
-        eprintln!("lfm2moe AWQ sidecar {name}: {} bytes != {} (k*2); skipping", data.len(), k * 2);
+        eprintln!(
+            "lfm2moe AWQ sidecar {name}: {} bytes != {} (k*2); skipping",
+            data.len(),
+            k * 2
+        );
         return None;
     }
     let f32_data: Vec<f32> = data
@@ -51,7 +57,12 @@ fn load_lfm2_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Op
 /// LFM2 uses STANDARD RMSNorm (`weight * x̂`, no +1 offset — verified against
 /// Lfm2MoeRMSNorm), so no offset is baked in. Also used for the depthwise conv
 /// filter ([hidden, K]) and the F32 expert_bias.
-fn load_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> Result<GpuTensor, String> {
+fn load_f32(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    shape: &[usize],
+) -> Result<GpuTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
     let f32_data: Vec<f32> = match qt {
         1 => data
@@ -66,7 +77,11 @@ fn load_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> Result
             // Q8_0: 32-elem blocks [f16 scale | 32 i8]. Dequant to f32.
             dequant_q8_0(&data)
         }
-        _ => return Err(format!("lfm2moe: expected F16/F32/Q8 for {name}, got qt={qt}")),
+        _ => {
+            return Err(format!(
+                "lfm2moe: expected F16/F32/Q8 for {name}, got qt={qt}"
+            ))
+        }
     };
     gpu.upload_f32(&f32_data, shape)
         .map_err(|e| format!("lfm2moe: upload {name}: {e:?}"))
@@ -97,7 +112,13 @@ fn load_wt(
 
 /// quant_type → DType mapping (mirrors minimax::wt_from_raw); uploads raw
 /// bytes and tags the dtype for kernel dispatch.
-fn wt_from_raw(gpu: &mut Gpu, qt: u8, data: &[u8], m: usize, k: usize) -> Result<WeightTensor, String> {
+fn wt_from_raw(
+    gpu: &mut Gpu,
+    qt: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
     let dtype = match qt {
         3 => DType::Q8_0,
         6 => DType::HFQ4G256,
@@ -193,9 +214,9 @@ pub struct Lfm2MoeLayerWeights {
 }
 
 pub struct Lfm2MoeWeights {
-    pub embed: GpuTensor,        // model.embed_tokens.weight (raw, for embedding_lookup)
+    pub embed: GpuTensor, // model.embed_tokens.weight (raw, for embedding_lookup)
     pub embedding_norm: GpuTensor, // model.embedding_norm.weight (final norm)
-    pub lm_head: WeightTensor,   // tied = embed_tokens (loaded as Q8 weight)
+    pub lm_head: WeightTensor, // tied = embed_tokens (loaded as Q8 weight)
     pub layers: Vec<Lfm2MoeLayerWeights>,
 }
 
@@ -217,7 +238,13 @@ impl Lfm2MoeWeights {
             .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?;
         let embedding_norm = load_f32(hfq, gpu, "model.embedding_norm.weight", &[hidden])?;
         // lm_head: tied → reuse embed_tokens.weight as a Q8 weight tensor.
-        let lm_head = load_wt(hfq, gpu, "model.embed_tokens.weight", cfg.vocab_size, hidden)?;
+        let lm_head = load_wt(
+            hfq,
+            gpu,
+            "model.embed_tokens.weight",
+            cfg.vocab_size,
+            hidden,
+        )?;
 
         let mut conv_state_count = 0usize;
         let mut kv_count = 0usize;
@@ -225,19 +252,34 @@ impl Lfm2MoeWeights {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{l}");
-            let operator_norm = load_f32(hfq, gpu, &format!("{p}.operator_norm.weight"), &[hidden])?;
+            let operator_norm =
+                load_f32(hfq, gpu, &format!("{p}.operator_norm.weight"), &[hidden])?;
             let ffn_norm = load_f32(hfq, gpu, &format!("{p}.ffn_norm.weight"), &[hidden])?;
 
             // ── Mixer: conv vs attention ──────────────────────────────────
             let mixer = match cfg.mixer(l) {
                 MixerKind::Conv => {
-                    let in_proj =
-                        load_wt(hfq, gpu, &format!("{p}.conv.in_proj.weight"), 3 * hidden, hidden)?;
+                    let in_proj = load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.conv.in_proj.weight"),
+                        3 * hidden,
+                        hidden,
+                    )?;
                     // conv.conv.weight ships [hidden,1,K] → loaded flat as [hidden,K] f32.
-                    let conv_weight =
-                        load_f32(hfq, gpu, &format!("{p}.conv.conv.weight"), &[hidden * k_conv])?;
-                    let out_proj =
-                        load_wt(hfq, gpu, &format!("{p}.conv.out_proj.weight"), hidden, hidden)?;
+                    let conv_weight = load_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.conv.conv.weight"),
+                        &[hidden * k_conv],
+                    )?;
+                    let out_proj = load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.conv.out_proj.weight"),
+                        hidden,
+                        hidden,
+                    )?;
                     let conv_state_idx = conv_state_count;
                     conv_state_count += 1;
                     Mixer::Conv(ConvWeights {
@@ -248,15 +290,47 @@ impl Lfm2MoeWeights {
                     })
                 }
                 MixerKind::Attention => {
-                    let wq = load_wt(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_dim, hidden)?;
-                    let wk = load_wt(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, hidden)?;
-                    let wv = load_wt(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, hidden)?;
-                    let wo = load_wt(hfq, gpu, &format!("{p}.self_attn.out_proj.weight"), hidden, q_dim)?;
+                    let wq = load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.q_proj.weight"),
+                        q_dim,
+                        hidden,
+                    )?;
+                    let wk = load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.k_proj.weight"),
+                        kv_dim,
+                        hidden,
+                    )?;
+                    let wv = load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.v_proj.weight"),
+                        kv_dim,
+                        hidden,
+                    )?;
+                    let wo = load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.out_proj.weight"),
+                        hidden,
+                        q_dim,
+                    )?;
                     // Per-HEAD QK-norm: weight is [head_dim], applied to each head.
-                    let q_norm =
-                        load_f32(hfq, gpu, &format!("{p}.self_attn.q_layernorm.weight"), &[head_dim])?;
-                    let k_norm =
-                        load_f32(hfq, gpu, &format!("{p}.self_attn.k_layernorm.weight"), &[head_dim])?;
+                    let q_norm = load_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.q_layernorm.weight"),
+                        &[head_dim],
+                    )?;
+                    let k_norm = load_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.k_layernorm.weight"),
+                        &[head_dim],
+                    )?;
                     let kv_idx = kv_count;
                     kv_count += 1;
                     Mixer::Attention(AttnWeights {
@@ -273,13 +347,36 @@ impl Lfm2MoeWeights {
 
             // ── FFN: dense SwiGLU vs top-4 MoE ────────────────────────────
             let ffn = if cfg.is_dense_ffn(l) {
-                let w1 = load_wt(hfq, gpu, &format!("{p}.feed_forward.w1.weight"), dense_inter, hidden)?;
-                let w3 = load_wt(hfq, gpu, &format!("{p}.feed_forward.w3.weight"), dense_inter, hidden)?;
-                let w2 = load_wt(hfq, gpu, &format!("{p}.feed_forward.w2.weight"), hidden, dense_inter)?;
+                let w1 = load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{p}.feed_forward.w1.weight"),
+                    dense_inter,
+                    hidden,
+                )?;
+                let w3 = load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{p}.feed_forward.w3.weight"),
+                    dense_inter,
+                    hidden,
+                )?;
+                let w2 = load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{p}.feed_forward.w2.weight"),
+                    hidden,
+                    dense_inter,
+                )?;
                 Ffn::Dense(DenseFfn { w1, w3, w2 })
             } else {
-                let router =
-                    load_wt(hfq, gpu, &format!("{p}.feed_forward.gate.weight"), n_exp, hidden)?;
+                let router = load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{p}.feed_forward.gate.weight"),
+                    n_exp,
+                    hidden,
+                )?;
                 let expert_bias =
                     load_f32(hfq, gpu, &format!("{p}.feed_forward.expert_bias"), &[n_exp])?;
                 // Byte-fuse w1‖w3 → gate_up [2*moe_inter, hidden]; w2 → down.
@@ -306,18 +403,24 @@ impl Lfm2MoeWeights {
                     // AWQ is the whole point. No-op on non-AWQ files.
                     if e == 0 {
                         gate_up.awq_scale = load_lfm2_awq_scale(
-                            hfq, gpu,
+                            hfq,
+                            gpu,
                             &format!("{p}.feed_forward.awq_scale_gate_up.weight"),
-                            hidden);
+                            hidden,
+                        );
                         if gate_up.awq_scale.is_some() {
                             eprintln!("lfm2moe: AWQ gate_up scale attached at {p} (expert-0 representative)");
                         }
                         down.awq_scale = load_lfm2_awq_scale(
-                            hfq, gpu,
+                            hfq,
+                            gpu,
                             &format!("{p}.feed_forward.awq_scale_down.weight"),
-                            moe_inter);
+                            moe_inter,
+                        );
                         if down.awq_scale.is_some() {
-                            eprintln!("lfm2moe: AWQ down scale attached at {p} (expert-0 representative)");
+                            eprintln!(
+                                "lfm2moe: AWQ down scale attached at {p} (expert-0 representative)"
+                            );
                         }
                     }
                     experts.push(ExpertWeights { gate_up, down });
@@ -386,8 +489,8 @@ pub struct Lfm2MoeState {
     pub n_tokens: usize,
 
     // residual + shared scratch
-    pub h: GpuTensor,    // [hidden] residual stream
-    pub tmp: GpuTensor,  // [hidden] norm output (mixer input)
+    pub h: GpuTensor,   // [hidden] residual stream
+    pub tmp: GpuTensor, // [hidden] norm output (mixer input)
 
     // attention scratch
     pub fa_q: GpuTensor,        // [q_dim]

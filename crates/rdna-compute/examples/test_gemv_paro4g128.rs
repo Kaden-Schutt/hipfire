@@ -89,7 +89,9 @@ fn read_i16(payload: &[u8], off: usize) -> i16 {
 }
 
 fn read_f16(payload: &[u8], off: usize) -> f32 {
-    f16_bits_to_f32(u16::from_le_bytes(payload[off..off + 2].try_into().unwrap()))
+    f16_bits_to_f32(u16::from_le_bytes(
+        payload[off..off + 2].try_into().unwrap(),
+    ))
 }
 
 fn offsets(m: usize, k: usize) -> (usize, usize, usize, usize, usize, usize) {
@@ -101,10 +103,24 @@ fn offsets(m: usize, k: usize) -> (usize, usize, usize, usize, usize, usize) {
     let pairs_off = scales_off + groups * m * 2;
     let theta_off = pairs_off + KROT * k * 2;
     let channel_scales_off = theta_off + KROT * (k / 2) * 2;
-    (qweight_off, qzeros_off, scales_off, pairs_off, theta_off, channel_scales_off)
+    (
+        qweight_off,
+        qzeros_off,
+        scales_off,
+        pairs_off,
+        theta_off,
+        channel_scales_off,
+    )
 }
 
-fn rotate_group(xg: &mut [f32], payload: &[u8], group: usize, k: usize, pairs_off: usize, theta_off: usize) {
+fn rotate_group(
+    xg: &mut [f32],
+    payload: &[u8],
+    group: usize,
+    k: usize,
+    pairs_off: usize,
+    theta_off: usize,
+) {
     for r in 0..KROT {
         let pair_base = pairs_off + (r * k + group * GROUP_SIZE) * 2;
         let theta_base = theta_off + (r * (k / 2) + group * (GROUP_SIZE / 2)) * 2;
@@ -187,10 +203,15 @@ fn build_payload_with_seed(m: usize, k: usize, seed: usize) -> (Vec<u8>, Vec<f32
 
     // channel_scales [K]
     for i in 0..k {
-        push_f16(&mut payload, 0.75 + (i % 23) as f32 * 0.01 + seed as f32 * 0.001);
+        push_f16(
+            &mut payload,
+            0.75 + (i % 23) as f32 * 0.01 + seed as f32 * 0.001,
+        );
     }
 
-    let x: Vec<f32> = (0..k).map(|i| ((i as i32 % 29) as f32 - 14.0) * 0.027).collect();
+    let x: Vec<f32> = (0..k)
+        .map(|i| ((i as i32 % 29) as f32 - 14.0) * 0.027)
+        .collect();
     (payload, x)
 }
 
@@ -200,7 +221,8 @@ fn build_payload(m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
 
 fn retile_qweight_payload(payload: &[u8], m: usize, k: usize) -> Vec<u8> {
     let m_pack = m / PACK;
-    let (qweight_off, qzeros_off, _scales_off, _pairs_off, theta_off, channel_scales_off) = offsets(m, k);
+    let (qweight_off, qzeros_off, _scales_off, _pairs_off, theta_off, channel_scales_off) =
+        offsets(m, k);
     let mut out = Vec::with_capacity(payload.len() + KROT * (k / 2) * 6);
     for mc in 0..m_pack {
         for kk in 0..k {
@@ -221,7 +243,8 @@ fn retile_qweight_payload(payload: &[u8], m: usize, k: usize) -> Vec<u8> {
 fn cpu_reference(payload: &[u8], x: &[f32], m: usize, k: usize) -> Vec<f32> {
     let groups = k / GROUP_SIZE;
     let m_pack = m / PACK;
-    let (qweight_off, qzeros_off, scales_off, pairs_off, theta_off, channel_scales_off) = offsets(m, k);
+    let (qweight_off, qzeros_off, scales_off, pairs_off, theta_off, channel_scales_off) =
+        offsets(m, k);
     let mut y = vec![0.0f32; m];
     for row in 0..m {
         let m_col = row / PACK;
@@ -268,7 +291,9 @@ fn main() {
 
     let d_a = gpu.upload_raw(&payload, &[payload.len()]).unwrap();
     let payload_tiled = retile_qweight_payload(&payload, m, k);
-    let d_a_tiled = gpu.upload_raw(&payload_tiled, &[payload_tiled.len()]).unwrap();
+    let d_a_tiled = gpu
+        .upload_raw(&payload_tiled, &[payload_tiled.len()])
+        .unwrap();
     let d_x = gpu.upload_f32(&x, &[k]).unwrap();
     let d_y = gpu.zeros(&[m], DType::F32).unwrap();
     gpu.gemv_paro4g128(&d_a, &d_x, &d_y, m, k).unwrap();
@@ -290,7 +315,8 @@ fn main() {
     let d_x_rot = gpu.zeros(&[k], DType::F32).unwrap();
     let d_y_pre = gpu.zeros(&[m], DType::F32).unwrap();
     gpu.paro4g128_rotate(&d_a, &d_x, &d_x_rot, m, k).unwrap();
-    gpu.gemv_paro4g128_prerotated(&d_a, &d_x_rot, &d_y_pre, m, k).unwrap();
+    gpu.gemv_paro4g128_prerotated(&d_a, &d_x_rot, &d_y_pre, m, k)
+        .unwrap();
     let y_pre_gpu = gpu.download_f32(&d_y_pre).unwrap();
     let mut max_abs_pre = 0.0f32;
     let mut max_rel_pre = 0.0f32;
@@ -299,15 +325,20 @@ fn main() {
         max_abs_pre = max_abs_pre.max(abs);
         max_rel_pre = max_rel_pre.max(abs / y_ref[i].abs().max(1.0));
     }
-    println!("prerotated max_abs={:.6e} max_rel={:.6e}", max_abs_pre, max_rel_pre);
+    println!(
+        "prerotated max_abs={:.6e} max_rel={:.6e}",
+        max_abs_pre, max_rel_pre
+    );
     if max_abs_pre > 5e-5 || max_rel_pre > 5e-5 {
         std::process::exit(1);
     }
 
     let d_x_rot_tiled = gpu.zeros(&[k], DType::F32).unwrap();
-    gpu.paro4g128t_rotate(&d_a_tiled, &d_x, &d_x_rot_tiled, m, k).unwrap();
+    gpu.paro4g128t_rotate(&d_a_tiled, &d_x, &d_x_rot_tiled, m, k)
+        .unwrap();
     let d_y_tiled = gpu.zeros(&[m], DType::F32).unwrap();
-    gpu.gemv_paro4g128t_prerotated(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled, m, k).unwrap();
+    gpu.gemv_paro4g128t_prerotated(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled, m, k)
+        .unwrap();
     let y_tiled_gpu = gpu.download_f32(&d_y_tiled).unwrap();
     let mut max_abs_tiled = 0.0f32;
     let mut max_rel_tiled = 0.0f32;
@@ -316,13 +347,17 @@ fn main() {
         max_abs_tiled = max_abs_tiled.max(abs);
         max_rel_tiled = max_rel_tiled.max(abs / y_ref[i].abs().max(1.0));
     }
-    println!("tiled prerotated max_abs={:.6e} max_rel={:.6e}", max_abs_tiled, max_rel_tiled);
+    println!(
+        "tiled prerotated max_abs={:.6e} max_rel={:.6e}",
+        max_abs_tiled, max_rel_tiled
+    );
     if max_abs_tiled > 5e-5 || max_rel_tiled > 5e-5 {
         std::process::exit(1);
     }
 
     let d_y_tiled_pack4 = gpu.zeros(&[m], DType::F32).unwrap();
-    gpu.gemv_paro4g128t_prerotated_pack4(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled_pack4, m, k).unwrap();
+    gpu.gemv_paro4g128t_prerotated_pack4(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled_pack4, m, k)
+        .unwrap();
     let y_tiled_pack4_gpu = gpu.download_f32(&d_y_tiled_pack4).unwrap();
     let mut max_abs_tiled_pack4 = 0.0f32;
     let mut max_rel_tiled_pack4 = 0.0f32;
@@ -333,15 +368,15 @@ fn main() {
     }
     println!(
         "tiled pack4 prerotated max_abs={:.6e} max_rel={:.6e}",
-        max_abs_tiled_pack4,
-        max_rel_tiled_pack4
+        max_abs_tiled_pack4, max_rel_tiled_pack4
     );
     if max_abs_tiled_pack4 > 5e-5 || max_rel_tiled_pack4 > 5e-5 {
         std::process::exit(1);
     }
 
     let d_y_tiled_pack2 = gpu.zeros(&[m], DType::F32).unwrap();
-    gpu.gemv_paro4g128t_prerotated_pack2(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled_pack2, m, k).unwrap();
+    gpu.gemv_paro4g128t_prerotated_pack2(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled_pack2, m, k)
+        .unwrap();
     let y_tiled_pack2_gpu = gpu.download_f32(&d_y_tiled_pack2).unwrap();
     let mut max_abs_tiled_pack2 = 0.0f32;
     let mut max_rel_tiled_pack2 = 0.0f32;
@@ -352,15 +387,15 @@ fn main() {
     }
     println!(
         "tiled pack2 prerotated max_abs={:.6e} max_rel={:.6e}",
-        max_abs_tiled_pack2,
-        max_rel_tiled_pack2
+        max_abs_tiled_pack2, max_rel_tiled_pack2
     );
     if max_abs_tiled_pack2 > 5e-5 || max_rel_tiled_pack2 > 5e-5 {
         std::process::exit(1);
     }
 
     let d_y_tiled_pack1 = gpu.zeros(&[m], DType::F32).unwrap();
-    gpu.gemv_paro4g128t_prerotated_pack1(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled_pack1, m, k).unwrap();
+    gpu.gemv_paro4g128t_prerotated_pack1(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled_pack1, m, k)
+        .unwrap();
     let y_tiled_pack1_gpu = gpu.download_f32(&d_y_tiled_pack1).unwrap();
     let mut max_abs_tiled_pack1 = 0.0f32;
     let mut max_rel_tiled_pack1 = 0.0f32;
@@ -371,15 +406,15 @@ fn main() {
     }
     println!(
         "tiled pack1 prerotated max_abs={:.6e} max_rel={:.6e}",
-        max_abs_tiled_pack1,
-        max_rel_tiled_pack1
+        max_abs_tiled_pack1, max_rel_tiled_pack1
     );
     if max_abs_tiled_pack1 > 5e-5 || max_rel_tiled_pack1 > 5e-5 {
         std::process::exit(1);
     }
 
     let d_y_tiled_direct = gpu.zeros(&[m], DType::F32).unwrap();
-    gpu.gemv_paro4g128t_direct(&d_a_tiled, &d_x, &d_y_tiled_direct, m, k).unwrap();
+    gpu.gemv_paro4g128t_direct(&d_a_tiled, &d_x, &d_y_tiled_direct, m, k)
+        .unwrap();
     let y_tiled_direct_gpu = gpu.download_f32(&d_y_tiled_direct).unwrap();
     let mut max_abs_tiled_direct = 0.0f32;
     let mut max_rel_tiled_direct = 0.0f32;
@@ -390,8 +425,7 @@ fn main() {
     }
     println!(
         "tiled direct max_abs={:.6e} max_rel={:.6e}",
-        max_abs_tiled_direct,
-        max_rel_tiled_direct
+        max_abs_tiled_direct, max_rel_tiled_direct
     );
     if max_abs_tiled_direct > 5e-5 || max_rel_tiled_direct > 5e-5 {
         std::process::exit(1);
@@ -400,7 +434,9 @@ fn main() {
     let (payload_up, _) = build_payload_with_seed(m, k, 7);
     let y_up_ref = cpu_reference(&payload_up, &x, m, k);
     let payload_up_tiled = retile_qweight_payload(&payload_up, m, k);
-    let d_a_up_tiled = gpu.upload_raw(&payload_up_tiled, &[payload_up_tiled.len()]).unwrap();
+    let d_a_up_tiled = gpu
+        .upload_raw(&payload_up_tiled, &[payload_up_tiled.len()])
+        .unwrap();
     let d_y_gate_fused = gpu.zeros(&[m], DType::F32).unwrap();
     let d_y_up_fused = gpu.zeros(&[m], DType::F32).unwrap();
     let d_x_rot_gate_fused = gpu.zeros(&[k], DType::F32).unwrap();
@@ -431,10 +467,7 @@ fn main() {
     }
     println!(
         "fused gate/up max_abs_gate={:.6e} max_rel_gate={:.6e} max_abs_up={:.6e} max_rel_up={:.6e}",
-        max_abs_fused_gate,
-        max_rel_fused_gate,
-        max_abs_fused_up,
-        max_rel_fused_up
+        max_abs_fused_gate, max_rel_fused_gate, max_abs_fused_up, max_rel_fused_up
     );
     if max_abs_fused_gate > 5e-5
         || max_rel_fused_gate > 5e-5
@@ -445,9 +478,14 @@ fn main() {
     }
 
     let y_seed: Vec<f32> = (0..m).map(|i| 0.125 + i as f32 * 0.003).collect();
-    let y_res_ref: Vec<f32> = y_seed.iter().zip(y_ref.iter()).map(|(a, b)| a + b).collect();
+    let y_res_ref: Vec<f32> = y_seed
+        .iter()
+        .zip(y_ref.iter())
+        .map(|(a, b)| a + b)
+        .collect();
     let d_y_res = gpu.upload_f32(&y_seed, &[m]).unwrap();
-    gpu.gemv_paro4g128_residual(&d_a, &d_x, &d_y_res, m, k).unwrap();
+    gpu.gemv_paro4g128_residual(&d_a, &d_x, &d_y_res, m, k)
+        .unwrap();
     let y_res_gpu = gpu.download_f32(&d_y_res).unwrap();
     let mut max_abs_res = 0.0f32;
     let mut max_rel_res = 0.0f32;
@@ -456,13 +494,17 @@ fn main() {
         max_abs_res = max_abs_res.max(abs);
         max_rel_res = max_rel_res.max(abs / y_res_ref[i].abs().max(1.0));
     }
-    println!("residual max_abs={:.6e} max_rel={:.6e}", max_abs_res, max_rel_res);
+    println!(
+        "residual max_abs={:.6e} max_rel={:.6e}",
+        max_abs_res, max_rel_res
+    );
     if max_abs_res > 5e-5 || max_rel_res > 5e-5 {
         std::process::exit(1);
     }
 
     let d_y_pre_res = gpu.upload_f32(&y_seed, &[m]).unwrap();
-    gpu.gemv_paro4g128_prerotated_residual(&d_a, &d_x_rot, &d_y_pre_res, m, k).unwrap();
+    gpu.gemv_paro4g128_prerotated_residual(&d_a, &d_x_rot, &d_y_pre_res, m, k)
+        .unwrap();
     let y_pre_res_gpu = gpu.download_f32(&d_y_pre_res).unwrap();
     let mut max_abs_pre_res = 0.0f32;
     let mut max_rel_pre_res = 0.0f32;
@@ -473,15 +515,15 @@ fn main() {
     }
     println!(
         "prerotated residual max_abs={:.6e} max_rel={:.6e}",
-        max_abs_pre_res,
-        max_rel_pre_res
+        max_abs_pre_res, max_rel_pre_res
     );
     if max_abs_pre_res > 5e-5 || max_rel_pre_res > 5e-5 {
         std::process::exit(1);
     }
 
     let d_y_tiled_res = gpu.upload_f32(&y_seed, &[m]).unwrap();
-    gpu.gemv_paro4g128t_prerotated_residual(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled_res, m, k).unwrap();
+    gpu.gemv_paro4g128t_prerotated_residual(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled_res, m, k)
+        .unwrap();
     let y_tiled_res_gpu = gpu.download_f32(&d_y_tiled_res).unwrap();
     let mut max_abs_tiled_res = 0.0f32;
     let mut max_rel_tiled_res = 0.0f32;
@@ -492,15 +534,21 @@ fn main() {
     }
     println!(
         "tiled prerotated residual max_abs={:.6e} max_rel={:.6e}",
-        max_abs_tiled_res,
-        max_rel_tiled_res
+        max_abs_tiled_res, max_rel_tiled_res
     );
     if max_abs_tiled_res > 5e-5 || max_rel_tiled_res > 5e-5 {
         std::process::exit(1);
     }
 
     let d_y_tiled_res_pack4 = gpu.upload_f32(&y_seed, &[m]).unwrap();
-    gpu.gemv_paro4g128t_prerotated_residual_pack4(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled_res_pack4, m, k).unwrap();
+    gpu.gemv_paro4g128t_prerotated_residual_pack4(
+        &d_a_tiled,
+        &d_x_rot_tiled,
+        &d_y_tiled_res_pack4,
+        m,
+        k,
+    )
+    .unwrap();
     let y_tiled_res_pack4_gpu = gpu.download_f32(&d_y_tiled_res_pack4).unwrap();
     let mut max_abs_tiled_res_pack4 = 0.0f32;
     let mut max_rel_tiled_res_pack4 = 0.0f32;
@@ -511,15 +559,21 @@ fn main() {
     }
     println!(
         "tiled pack4 prerotated residual max_abs={:.6e} max_rel={:.6e}",
-        max_abs_tiled_res_pack4,
-        max_rel_tiled_res_pack4
+        max_abs_tiled_res_pack4, max_rel_tiled_res_pack4
     );
     if max_abs_tiled_res_pack4 > 5e-5 || max_rel_tiled_res_pack4 > 5e-5 {
         std::process::exit(1);
     }
 
     let d_y_tiled_res_pack2 = gpu.upload_f32(&y_seed, &[m]).unwrap();
-    gpu.gemv_paro4g128t_prerotated_residual_pack2(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled_res_pack2, m, k).unwrap();
+    gpu.gemv_paro4g128t_prerotated_residual_pack2(
+        &d_a_tiled,
+        &d_x_rot_tiled,
+        &d_y_tiled_res_pack2,
+        m,
+        k,
+    )
+    .unwrap();
     let y_tiled_res_pack2_gpu = gpu.download_f32(&d_y_tiled_res_pack2).unwrap();
     let mut max_abs_tiled_res_pack2 = 0.0f32;
     let mut max_rel_tiled_res_pack2 = 0.0f32;
@@ -530,15 +584,21 @@ fn main() {
     }
     println!(
         "tiled pack2 prerotated residual max_abs={:.6e} max_rel={:.6e}",
-        max_abs_tiled_res_pack2,
-        max_rel_tiled_res_pack2
+        max_abs_tiled_res_pack2, max_rel_tiled_res_pack2
     );
     if max_abs_tiled_res_pack2 > 5e-5 || max_rel_tiled_res_pack2 > 5e-5 {
         std::process::exit(1);
     }
 
     let d_y_tiled_res_pack1 = gpu.upload_f32(&y_seed, &[m]).unwrap();
-    gpu.gemv_paro4g128t_prerotated_residual_pack1(&d_a_tiled, &d_x_rot_tiled, &d_y_tiled_res_pack1, m, k).unwrap();
+    gpu.gemv_paro4g128t_prerotated_residual_pack1(
+        &d_a_tiled,
+        &d_x_rot_tiled,
+        &d_y_tiled_res_pack1,
+        m,
+        k,
+    )
+    .unwrap();
     let y_tiled_res_pack1_gpu = gpu.download_f32(&d_y_tiled_res_pack1).unwrap();
     let mut max_abs_tiled_res_pack1 = 0.0f32;
     let mut max_rel_tiled_res_pack1 = 0.0f32;
@@ -549,15 +609,15 @@ fn main() {
     }
     println!(
         "tiled pack1 prerotated residual max_abs={:.6e} max_rel={:.6e}",
-        max_abs_tiled_res_pack1,
-        max_rel_tiled_res_pack1
+        max_abs_tiled_res_pack1, max_rel_tiled_res_pack1
     );
     if max_abs_tiled_res_pack1 > 5e-5 || max_rel_tiled_res_pack1 > 5e-5 {
         std::process::exit(1);
     }
 
     let d_y_tiled_res_direct = gpu.upload_f32(&y_seed, &[m]).unwrap();
-    gpu.gemv_paro4g128t_direct_residual(&d_a_tiled, &d_x, &d_y_tiled_res_direct, m, k).unwrap();
+    gpu.gemv_paro4g128t_direct_residual(&d_a_tiled, &d_x, &d_y_tiled_res_direct, m, k)
+        .unwrap();
     let y_tiled_res_direct_gpu = gpu.download_f32(&d_y_tiled_res_direct).unwrap();
     let mut max_abs_tiled_res_direct = 0.0f32;
     let mut max_rel_tiled_res_direct = 0.0f32;
@@ -568,15 +628,18 @@ fn main() {
     }
     println!(
         "tiled direct residual max_abs={:.6e} max_rel={:.6e}",
-        max_abs_tiled_res_direct,
-        max_rel_tiled_res_direct
+        max_abs_tiled_res_direct, max_rel_tiled_res_direct
     );
     if max_abs_tiled_res_direct > 5e-5 || max_rel_tiled_res_direct > 5e-5 {
         std::process::exit(1);
     }
 
-    let gate: Vec<f32> = (0..k).map(|i| ((i as i32 % 31) as f32 - 15.0) * 0.019).collect();
-    let up: Vec<f32> = (0..k).map(|i| ((i as i32 % 37) as f32 - 18.0) * 0.017).collect();
+    let gate: Vec<f32> = (0..k)
+        .map(|i| ((i as i32 % 31) as f32 - 15.0) * 0.019)
+        .collect();
+    let up: Vec<f32> = (0..k)
+        .map(|i| ((i as i32 % 37) as f32 - 18.0) * 0.017)
+        .collect();
     let hidden = silu_mul(&gate, &up);
     let y_swiglu_ref_base = cpu_reference(&payload, &hidden, m, k);
     let y_swiglu_ref: Vec<f32> = y_seed
@@ -587,7 +650,8 @@ fn main() {
     let d_gate = gpu.upload_f32(&gate, &[k]).unwrap();
     let d_up = gpu.upload_f32(&up, &[k]).unwrap();
     let d_y_swiglu = gpu.upload_f32(&y_seed, &[m]).unwrap();
-    gpu.gemv_paro4g128_swiglu_residual(&d_a, &d_gate, &d_up, &d_y_swiglu, m, k).unwrap();
+    gpu.gemv_paro4g128_swiglu_residual(&d_a, &d_gate, &d_up, &d_y_swiglu, m, k)
+        .unwrap();
     let y_swiglu_gpu = gpu.download_f32(&d_y_swiglu).unwrap();
     let mut max_abs_swiglu = 0.0f32;
     let mut max_rel_swiglu = 0.0f32;
@@ -596,15 +660,20 @@ fn main() {
         max_abs_swiglu = max_abs_swiglu.max(abs);
         max_rel_swiglu = max_rel_swiglu.max(abs / y_swiglu_ref[i].abs().max(1.0));
     }
-    println!("swiglu residual max_abs={:.6e} max_rel={:.6e}", max_abs_swiglu, max_rel_swiglu);
+    println!(
+        "swiglu residual max_abs={:.6e} max_rel={:.6e}",
+        max_abs_swiglu, max_rel_swiglu
+    );
     if max_abs_swiglu > 5e-5 || max_rel_swiglu > 5e-5 {
         std::process::exit(1);
     }
 
     let d_x_rot_swiglu = gpu.zeros(&[k], DType::F32).unwrap();
     let d_y_swiglu_pre = gpu.upload_f32(&y_seed, &[m]).unwrap();
-    gpu.paro4g128_swiglu_rotate(&d_a, &d_gate, &d_up, &d_x_rot_swiglu, m, k).unwrap();
-    gpu.gemv_paro4g128_prerotated_residual(&d_a, &d_x_rot_swiglu, &d_y_swiglu_pre, m, k).unwrap();
+    gpu.paro4g128_swiglu_rotate(&d_a, &d_gate, &d_up, &d_x_rot_swiglu, m, k)
+        .unwrap();
+    gpu.gemv_paro4g128_prerotated_residual(&d_a, &d_x_rot_swiglu, &d_y_swiglu_pre, m, k)
+        .unwrap();
     let y_swiglu_pre_gpu = gpu.download_f32(&d_y_swiglu_pre).unwrap();
     let mut max_abs_swiglu_pre = 0.0f32;
     let mut max_rel_swiglu_pre = 0.0f32;
@@ -615,17 +684,24 @@ fn main() {
     }
     println!(
         "swiglu prerotated residual max_abs={:.6e} max_rel={:.6e}",
-        max_abs_swiglu_pre,
-        max_rel_swiglu_pre
+        max_abs_swiglu_pre, max_rel_swiglu_pre
     );
     if max_abs_swiglu_pre > 5e-5 || max_rel_swiglu_pre > 5e-5 {
         std::process::exit(1);
     }
 
     let d_x_rot_swiglu_tiled = gpu.zeros(&[k], DType::F32).unwrap();
-    gpu.paro4g128t_swiglu_rotate(&d_a_tiled, &d_gate, &d_up, &d_x_rot_swiglu_tiled, m, k).unwrap();
+    gpu.paro4g128t_swiglu_rotate(&d_a_tiled, &d_gate, &d_up, &d_x_rot_swiglu_tiled, m, k)
+        .unwrap();
     let d_y_swiglu_tiled = gpu.upload_f32(&y_seed, &[m]).unwrap();
-    gpu.gemv_paro4g128t_prerotated_residual(&d_a_tiled, &d_x_rot_swiglu_tiled, &d_y_swiglu_tiled, m, k).unwrap();
+    gpu.gemv_paro4g128t_prerotated_residual(
+        &d_a_tiled,
+        &d_x_rot_swiglu_tiled,
+        &d_y_swiglu_tiled,
+        m,
+        k,
+    )
+    .unwrap();
     let y_swiglu_tiled_gpu = gpu.download_f32(&d_y_swiglu_tiled).unwrap();
     let mut max_abs_swiglu_tiled = 0.0f32;
     let mut max_rel_swiglu_tiled = 0.0f32;
@@ -636,27 +712,33 @@ fn main() {
     }
     println!(
         "swiglu tiled prerotated residual max_abs={:.6e} max_rel={:.6e}",
-        max_abs_swiglu_tiled,
-        max_rel_swiglu_tiled
+        max_abs_swiglu_tiled, max_rel_swiglu_tiled
     );
     if max_abs_swiglu_tiled > 5e-5 || max_rel_swiglu_tiled > 5e-5 {
         std::process::exit(1);
     }
 
     let d_y_swiglu_tiled_pack4 = gpu.upload_f32(&y_seed, &[m]).unwrap();
-    gpu.gemv_paro4g128t_prerotated_residual_pack4(&d_a_tiled, &d_x_rot_swiglu_tiled, &d_y_swiglu_tiled_pack4, m, k).unwrap();
+    gpu.gemv_paro4g128t_prerotated_residual_pack4(
+        &d_a_tiled,
+        &d_x_rot_swiglu_tiled,
+        &d_y_swiglu_tiled_pack4,
+        m,
+        k,
+    )
+    .unwrap();
     let y_swiglu_tiled_pack4_gpu = gpu.download_f32(&d_y_swiglu_tiled_pack4).unwrap();
     let mut max_abs_swiglu_tiled_pack4 = 0.0f32;
     let mut max_rel_swiglu_tiled_pack4 = 0.0f32;
     for i in 0..m {
         let abs = (y_swiglu_tiled_pack4_gpu[i] - y_swiglu_ref[i]).abs();
         max_abs_swiglu_tiled_pack4 = max_abs_swiglu_tiled_pack4.max(abs);
-        max_rel_swiglu_tiled_pack4 = max_rel_swiglu_tiled_pack4.max(abs / y_swiglu_ref[i].abs().max(1.0));
+        max_rel_swiglu_tiled_pack4 =
+            max_rel_swiglu_tiled_pack4.max(abs / y_swiglu_ref[i].abs().max(1.0));
     }
     println!(
         "swiglu tiled pack4 prerotated residual max_abs={:.6e} max_rel={:.6e}",
-        max_abs_swiglu_tiled_pack4,
-        max_rel_swiglu_tiled_pack4
+        max_abs_swiglu_tiled_pack4, max_rel_swiglu_tiled_pack4
     );
     if max_abs_swiglu_tiled_pack4 > 5e-5 || max_rel_swiglu_tiled_pack4 > 5e-5 {
         std::process::exit(1);

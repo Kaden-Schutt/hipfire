@@ -95,10 +95,11 @@ pub fn encode_mq4g128_from_fp16(weight_fp16: &[u16], rows: usize, cols: usize) -
             // 2. FWHT-128 in place (matching kernel exactly)
             cpu_fwht_128(&mut group, &signs1_vec, &signs2_vec);
             // 3. Find min/max
-            let (min_v, max_v) = group.iter().fold(
-                (f32::INFINITY, f32::NEG_INFINITY),
-                |(lo, hi), &x| (lo.min(x), hi.max(x)),
-            );
+            let (min_v, max_v) = group
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &x| {
+                    (lo.min(x), hi.max(x))
+                });
             // 4. Scale + zero, with all-zeros guard
             let raw_scale = (max_v - min_v) / 15.0;
             let scale = if raw_scale == 0.0 || raw_scale.is_nan() {
@@ -118,10 +119,12 @@ pub fn encode_mq4g128_from_fp16(weight_fp16: &[u16], rows: usize, cols: usize) -
 
             // 6. Quantize and pack nibbles (lo nibble = even index, hi nibble = odd index)
             for i in 0..(GROUP_SIZE / 2) {
-                let lo_q =
-                    ((group[i * 2] - min_v) * inv_scale).round().clamp(0.0, 15.0) as u8;
-                let hi_q =
-                    ((group[i * 2 + 1] - min_v) * inv_scale).round().clamp(0.0, 15.0) as u8;
+                let lo_q = ((group[i * 2] - min_v) * inv_scale)
+                    .round()
+                    .clamp(0.0, 15.0) as u8;
+                let hi_q = ((group[i * 2 + 1] - min_v) * inv_scale)
+                    .round()
+                    .clamp(0.0, 15.0) as u8;
                 bytes[row_off + 8 + i] = lo_q | (hi_q << 4);
             }
         }
@@ -139,12 +142,13 @@ pub fn encode_mq4g128_from_fp16(weight_fp16: &[u16], rows: usize, cols: usize) -
 /// Env var `HIPFIRE_PARO_LA_GATES_MQ4G128={0|1}` overrides arch default;
 /// unset uses `rdna_compute::arch_caps::paro_la_gates_mq4g128_default(arch)`.
 pub fn should_quantize_la_gate(prefix: &str, arch: &str) -> bool {
-    if !(prefix.ends_with("linear_attn.in_proj_a")
-        || prefix.ends_with("linear_attn.in_proj_b"))
-    {
+    if !(prefix.ends_with("linear_attn.in_proj_a") || prefix.ends_with("linear_attn.in_proj_b")) {
         return false;
     }
-    match std::env::var("HIPFIRE_PARO_LA_GATES_MQ4G128").ok().as_deref() {
+    match std::env::var("HIPFIRE_PARO_LA_GATES_MQ4G128")
+        .ok()
+        .as_deref()
+    {
         Some("0") => return false,
         Some("1") => return true,
         Some("") | None => {}
@@ -304,7 +308,9 @@ mod tests {
     fn matching_prefix_on_non_gfx1151_when_env_unset() {
         // Force env-unset for this test (override Cargo's CI env if set).
         let orig = std::env::var("HIPFIRE_PARO_LA_GATES_MQ4G128").ok();
-        unsafe { std::env::remove_var("HIPFIRE_PARO_LA_GATES_MQ4G128"); }
+        unsafe {
+            std::env::remove_var("HIPFIRE_PARO_LA_GATES_MQ4G128");
+        }
         assert!(!should_quantize_la_gate(
             "model.layers.5.linear_attn.in_proj_a",
             "gfx1100"
@@ -315,7 +321,9 @@ mod tests {
         ));
         // Restore
         if let Some(v) = orig {
-            unsafe { std::env::set_var("HIPFIRE_PARO_LA_GATES_MQ4G128", v); }
+            unsafe {
+                std::env::set_var("HIPFIRE_PARO_LA_GATES_MQ4G128", v);
+            }
         }
     }
 }

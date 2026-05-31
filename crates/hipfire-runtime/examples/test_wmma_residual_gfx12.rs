@@ -101,7 +101,11 @@ fn main() {
 
 fn run_one_lmhead(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> Result<(), String> {
     assert_eq!(m % 16, 0);
-    assert_eq!(k % 256, 0, "K must be multiple of 256 (HFQ4G256 group size)");
+    assert_eq!(
+        k % 256,
+        0,
+        "K must be multiple of 256 (HFQ4G256 group size)"
+    );
     assert_eq!(n % 16, 0, "N must be multiple of 16 (WMMA batch tile)");
 
     let a_bytes = build_hfq4g256(m, k, 0xB4);

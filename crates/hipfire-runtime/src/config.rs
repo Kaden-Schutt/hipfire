@@ -67,15 +67,10 @@ impl RuntimeConfig {
             prompt_heat_json,
             prompt_heat_limit,
             dflash_draft: std::env::var("HIPFIRE_DFLASH_DRAFT").ok(),
-            dflash_mode: std::env::var("HIPFIRE_DFLASH_MODE")
-                .unwrap_or_else(|_| "off".to_string()),
+            dflash_mode: std::env::var("HIPFIRE_DFLASH_MODE").unwrap_or_else(|_| "off".to_string()),
             draft_f16: std::env::var("HIPFIRE_DRAFT_F16").ok().as_deref() != Some("0"),
-            draft_gemm_dump: std::env::var("HIPFIRE_DRAFT_GEMM_DUMP")
-                .ok()
-                .as_deref() == Some("1"),
-            draft_subphase: std::env::var("HIPFIRE_DRAFT_SUBPHASE")
-                .ok()
-                .as_deref() == Some("1"),
+            draft_gemm_dump: std::env::var("HIPFIRE_DRAFT_GEMM_DUMP").ok().as_deref() == Some("1"),
+            draft_subphase: std::env::var("HIPFIRE_DRAFT_SUBPHASE").ok().as_deref() == Some("1"),
             ddtree_budget: std::env::var("HIPFIRE_DDTREE_BUDGET")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -84,9 +79,7 @@ impl RuntimeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
-            prefill_batched: std::env::var("HIPFIRE_PREFILL_BATCHED")
-                .ok()
-                .as_deref() != Some("0"),
+            prefill_batched: std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() != Some("0"),
             flash_partials_batch: std::env::var("HIPFIRE_FLASH_PARTIALS_BATCH")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok()),
@@ -99,16 +92,14 @@ impl RuntimeConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256),
             devices: std::env::var("HIPFIRE_DEVICES").ok(),
-            allow_mixed_arch: std::env::var("HIPFIRE_ALLOW_MIXED_ARCH")
-                .ok()
-                .as_deref() == Some("1"),
+            allow_mixed_arch: std::env::var("HIPFIRE_ALLOW_MIXED_ARCH").ok().as_deref()
+                == Some("1"),
             uniform_vram_tolerance_gb: std::env::var("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
                 .ok()
                 .and_then(|s| s.parse().ok()),
             lm_head_f16: std::env::var("HIPFIRE_LM_HEAD_F16")
                 .unwrap_or_else(|_| "auto".to_string()),
-            mtp_mode: std::env::var("HIPFIRE_MTP_MODE")
-                .unwrap_or_else(|_| "auto".to_string()),
+            mtp_mode: std::env::var("HIPFIRE_MTP_MODE").unwrap_or_else(|_| "auto".to_string()),
             mtp_k: std::env::var("HIPFIRE_MTP_K")
                 .ok()
                 .and_then(|v| v.parse().ok())
