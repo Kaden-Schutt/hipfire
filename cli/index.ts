@@ -33,6 +33,7 @@ export interface HipfireConfig {
   max_seq: number;        // KV cache capacity allocated at model load (shared across turns)
   thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
   max_think_tokens: number; // per-turn budget for <think>...</think> reasoning (0 = unlimited)
+  max_total_think_tokens: number; // re-arm-proof TOTAL <think> budget across the turn (0 = off). Force-closes + blocks <think> re-open at the cap; hard-EOS past it. Bounds models that re-open <think> and out-think client timeouts.
   host: string;           // default serve bind address
   port: number;           // default serve port
   idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
@@ -189,6 +190,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // client times out and terminates the stream mid-think. Override per-model
   // or set 0 for unlimited (e.g. reasoning.effort=xhigh maps to 0).
   max_think_tokens: 2048,
+  max_total_think_tokens: 0,
   host: DEFAULT_HOST,
   port: DEFAULT_PORT,
   idle_timeout: 300,
@@ -245,6 +247,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "max_seq": return typeof value === "number" && Number.isInteger(value) && value >= 512 && value <= 524288;
     case "thinking": return ["on", "off"].includes(value);
     case "max_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 32768;
+    case "max_total_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1000000;
     case "host": return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 255 && !/\s/.test(value);
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
@@ -321,7 +324,7 @@ const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 // are serve-wide so they stay global-only.
 const PER_MODEL_KEYS = [
   "kv_cache", "flash_mode", "temperature", "top_p",
-  "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens",
+  "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens", "max_total_think_tokens",
   "dflash_adaptive_b", "dflash_mode", "dflash_ngram_block",
   "cask_sidecar", "cask",
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
@@ -886,6 +889,11 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
     process.env.HIPFIRE_DFLASH_NGRAM_BLOCK = "1";
   } else {
     delete process.env.HIPFIRE_DFLASH_NGRAM_BLOCK;
+  }
+  // Total-think cap (re-arm-proof <think> bound; daemon reads it per generate).
+  // Shell env wins if the user exported it; 0/unset = off (daemon default).
+  if (!process.env.HIPFIRE_MAX_TOTAL_THINK_TOKENS && cfg.max_total_think_tokens > 0) {
+    process.env.HIPFIRE_MAX_TOTAL_THINK_TOKENS = String(cfg.max_total_think_tokens);
   }
   process.env.HIPFIRE_MTP_MODE = cfg.mtp_mode;
   process.env.HIPFIRE_MTP_K = String(cfg.mtp_k);
@@ -4343,6 +4351,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "max_think_tokens",
       desc: "Budget for reasoning inside <think>...</think> (0 = unlimited). Truncates if exceeded.",
       range: [0, 32768], step: 128,
+    },
+    max_total_think_tokens: {
+      label: "max_total_think_tokens",
+      desc: "Re-arm-proof TOTAL <think> budget across the turn (0 = off). At the cap, force-close + block <think> re-open; hard-EOS past it. Bounds models that re-open <think> and out-think client timeouts.",
+      range: [0, 1000000], step: 256,
     },
     host: {
       label: "host",
