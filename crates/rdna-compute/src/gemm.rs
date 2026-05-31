@@ -14468,6 +14468,51 @@ impl Gpu {
         )
     }
 
+    /// Fused gate+up for Q8_0 weights: two Q8 GEMVs in one launch.
+    /// Grid=[gate_m + up_m], block=[32].
+    pub fn fused_gate_up_q8_0(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("fused_gate_up_q8_0", kernels::FUSED_GATE_UP_Q8_0_SRC, "fused_gate_up_q8_0")?;
+
+        let ag = a_gate.buf.as_ptr();
+        let au = a_up.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yg = y_gate.buf.as_ptr();
+        let yu = y_up.buf.as_ptr();
+        let gm = gate_m as i32;
+        let um = up_m as i32;
+        let kv = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ag as *const _ as *mut c_void, &au as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void, &yg as *const _ as *mut c_void,
+            &yu as *const _ as *mut c_void, &gm as *const _ as *mut c_void,
+            &um as *const _ as *mut c_void, &kv as *const _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "fused_gate_up_q8_0",
+            [(gate_m + up_m) as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xp);
+                b.push_ptr(yg); b.push_ptr(yu);
+                b.push_i32(gm); b.push_i32(um); b.push_i32(kv);
+                b
+            },
+        )
+    }
+
     /// dp4a-port of fused_gate_up_hfq4g256 for gfx906. Pre-quantizes
     /// `x` to Q8_1 (block_q8_1_mmq, 144 B per 128-K block) using the
     /// shared MMQ x-scratch buffer, then runs the dp4a-based GEMV. Math
@@ -14845,6 +14890,51 @@ impl Gpu {
         ];
         let grid_m = ((m + 15) / 16) as u32;
         let grid_n = ((n + 15) / 16) as u32;
+        unsafe { self.hip.launch_kernel(func, [grid_m, grid_n, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Fused-transpose WMMA GEMM: Y[N,M] = W_f16[M,K] @ X_f32[N,K]^T.
+    /// Writes transposed output directly with 4 N-subtiles per block.
+    pub fn gemm_f16_wmma_mb4(
+        &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_f16_wmma_mb4", kernels::GEMM_F16_WMMA_MB4_SRC, "gemm_f16_wmma_mb4")?;
+        let func = &self.functions["gemm_f16_wmma_mb4"];
+        let mut wp = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32; let mut ki = k as i32; let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void, &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_n = ((n + 63) / 64) as u32;
+        unsafe { self.hip.launch_kernel(func, [grid_m, grid_n, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// MB=8 fused-transpose WMMA GEMM: 8 N-subtiles per block.
+    pub fn gemm_f16_wmma_mb8(
+        &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_f16_wmma_mb8", kernels::GEMM_F16_WMMA_MB8_SRC, "gemm_f16_wmma_mb8")?;
+        let func = &self.functions["gemm_f16_wmma_mb8"];
+        let mut wp = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32; let mut ki = k as i32; let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void, &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_n = ((n + 127) / 128) as u32;
         unsafe { self.hip.launch_kernel(func, [grid_m, grid_n, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 

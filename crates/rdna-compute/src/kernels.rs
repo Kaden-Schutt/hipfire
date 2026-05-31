@@ -1874,10 +1874,21 @@ pub const ATTENTION_FLASH_SRC: &str = include_str!("../../../kernels/src/attenti
 pub const ATTENTION_FLASH_GQA_SRC: &str = include_str!("../../../kernels/src/attention_flash_gqa.hip");
 pub const ATTENTION_FLASH_GQA_FUSED_SRC: &str = include_str!("../../../kernels/src/attention_flash_gqa_fused.hip");
 
+/// Warp-cooperative GQA decode attention. One warp per head in the kv-group,
+/// chunked KV processing with partials. Grid=[n_kv_heads, n_chunks], block=[kv_group*32].
+/// 3.5× faster than scalar attention_flash on decode (271→77 µs).
+pub const ATTENTION_GQA_WARP_SRC: &str = include_str!("../../../kernels/src/attention_gqa_warp.hip");
+/// Device-side seq_len variant for hipGraph capture: seq_len read from device
+/// pointer (baked into graph), only content changes between replays.
+pub const ATTENTION_GQA_WARP_DV_SRC: &str = include_str!("../../../kernels/src/attention_gqa_warp_dv.hip");
+
 
 /// Fused Gate+Up HFQ4-G256: two GEMVs in one launch (saves 1 launch per layer).
 /// Grid: [gate_m + up_m, 1, 1]. Each block processes one row from gate or up weight.
 pub const FUSED_GATE_UP_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip");
+/// Fused gate+up for Q8_0 weights. Two Q8 GEMVs in one launch.
+/// Grid=[gate_m + up_m], block=[32]. +5.8 tok/s decode on dots.ocr.
+pub const FUSED_GATE_UP_Q8_0_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_q8_0.hip");
 
 /// Wave64-native counterpart to FUSED_GATE_UP_HFQ4G256_SRC for CDNA1/3.
 /// block=[64,1,1] with 2 rows per block (one per warp); grid halves from
@@ -2235,6 +2246,12 @@ pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V2_SRC: &str = include_str!("../.
 /// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip`.
 pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip");
 
+/// Vision attention winner (M=64, V_tile=32, f16 K/V, 2 WG/CU).
+/// ~40% faster than v3 at B=L=19520, hd=128. V_tile=32 stages V in 4
+/// v_chunks per K-tile, keeping LDS at 25.6 KB (2 WG/CU occupancy).
+/// Grid=[n_heads, ceil(B/64)], block=[128] (4 waves).
+pub const ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V5_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n32_f16kv_v5_f32.hip");
+
 /// Causal variant of v3 (M=64, N=128, f16 K/V). Adds causal mask:
 /// S[q, k] = -inf when k > q. Skips entirely-masked tiles. Grid
 /// `[n_heads, ceil(B/64)]`, block `[128]`.
@@ -2243,6 +2260,31 @@ pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_SRC: &str = include_str
 /// gfx12/RDNA4 sibling of the causal v3 kernel. Same C symbol, separate module
 /// because gfx12 WMMA uses half8 operands and the `_w32_gfx12` builtin.
 pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_GFX12_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3_causal.gfx12.hip");
+
+/// V_lds transpose variant of v3 (M=64, N=128, f16 K/V). V_lds transposed
+/// from [n_tile][head_dim] to [head_dim][V_T_STRIDE] so Phase C b_reg reads
+/// are 16 consecutive f16 values (compiler-vectorizable) instead of
+/// stride-128 scattered. V_T_STRIDE=130 (padded) eliminates bank conflicts.
+/// LDS: V_lds_T[128][130] + S_lds[64][130] + m/l/alpha = 49.5 KB, 1 WG/CU.
+pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V4_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v4.hip");
+
+/// V_lds transpose variant of v5 (M=64, V_tile=32, f16 K/V). Same
+/// transpose optimization: Phase C b_reg reads become contiguous,
+/// bank-conflict-free. V_T_STRIDE=34 (V_tile+2). LDS: 25.5 KB, 2 WG/CU.
+/// Negative result on vision shape (-6.5% vs v5). Kept for bench.
+pub const ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V6_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n32_f16kv_v6_f32.hip");
+
+/// v7: M=128 two-pass sub-tiling (§14.4C). K-shared sub-tiles.
+/// Negative result (-10.9% vs v5). Kept for bench.
+pub const ATTENTION_DFLASH_WMMA_M128_N32_F16KV_V7_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m128_n32_f16kv_v7_f32.hip");
+
+/// v7b: M=128 sequential sub-tiling, no K-sharing. Tests L2 warmth only.
+/// Negative result (-2.4% vs v5). Kept for bench.
+pub const ATTENTION_DFLASH_WMMA_M128_N32_F16KV_V7B_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m128_n32_f16kv_v7b_f32.hip");
+
+/// V_lds transpose variant of v3-causal. Same as v4 but with causal mask
+/// and tile skip. V_T_STRIDE_CAUSAL=130 for bank-conflict-free reads.
+pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V4_CAUSAL_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v4_causal.hip");
 
 /// Standalone f32 → f16 elementwise cast kernel. Block [256], grid
 /// `ceil(n / 256)`. See `kernels/src/cast_f32_to_f16.hip`.
@@ -2501,6 +2543,12 @@ pub const GEMM_F16_SRC: &str = include_str!("../../../kernels/src/gemm_f16.hip")
 /// Y[M,N] = W_f16[M,K] @ X_f32[N,K]^T.  Tiled 16x16 WMMA, ~10-50x vs naive gemm_f16.
 /// Grid=[ceil(M/16), ceil(N/16)], Block=[32].
 pub const GEMM_F16_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_f16_wmma.hip");
+/// Fused-transpose WMMA GEMM: Y[N,M] = W_f16[M,K] @ X_f32[N,K]^T.
+/// Writes transposed output directly (no separate transpose kernel).
+/// MB=4: 4 N-subtiles per block (64 N-cols). Grid=[ceil(M/16), ceil(N/64)], block=[32].
+pub const GEMM_F16_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_f16_wmma_mb4.hip");
+/// MB=8: 8 N-subtiles per block (128 N-cols). Grid=[ceil(M/16), ceil(N/128)], block=[32].
+pub const GEMM_F16_WMMA_MB8_SRC: &str = include_str!("../../../kernels/src/gemm_f16_wmma_mb8.hip");
 /// Tiled F16 GEMM with shared memory (no WMMA dependency, works on all RDNA).
 /// ~5-10x faster than naive gemm_f16 via LDS data reuse. Tile size 64K.
 pub const GEMM_F16_TILED_SRC: &str = include_str!("../../../kernels/src/gemm_f16_tiled.hip");
