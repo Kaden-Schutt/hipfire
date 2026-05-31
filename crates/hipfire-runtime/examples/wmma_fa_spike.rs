@@ -23,6 +23,9 @@ const SCALAR_KERNEL_SRC: &str = include_str!(
 const WMMA_KERNEL_SRC: &str = include_str!(
     "../../../experiments/wmma_fa_spike/fa_wmma_fp16.hip"
 );
+const WMMA_KERNEL_GFX12_SRC: &str = include_str!(
+    "../../../experiments/wmma_fa_spike/fa_wmma_fp16.gfx12.hip"
+);
 
 fn main() {
     use rdna_compute::DType;
@@ -118,7 +121,12 @@ fn main() {
 
     eprintln!("Compiling kernels…");
     gpu.ensure_kernel_public("fa_scalar_fp16", SCALAR_KERNEL_SRC, "fa_scalar_fp16").unwrap();
-    gpu.ensure_kernel_public("fa_wmma_fp16", WMMA_KERNEL_SRC, "fa_wmma_fp16").unwrap();
+    let wmma_kernel_src = if gpu.arch.starts_with("gfx12") {
+        WMMA_KERNEL_GFX12_SRC
+    } else {
+        WMMA_KERNEL_SRC
+    };
+    gpu.ensure_kernel_public("fa_wmma_fp16", wmma_kernel_src, "fa_wmma_fp16").unwrap();
     // No reduce kernel needed — the spike times the TILE kernel only. Reduce
     // is identical between scalar and WMMA branches (same partials layout) so
     // adding it to the measurement just adds noise.

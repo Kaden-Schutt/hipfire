@@ -24283,8 +24283,23 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // path. Phase 1.2 adds asym2 and Phase 3 adds tree-bias. Chunk
         // alignment to BLOCK_M=16 is required (the kernel doesn't carry a
         // chunk_size arg; trailing OOB rows would read garbage positions).
+        let wmma_fa_kernel = if self.arch_caps.has_wmma_w32_gfx12() {
+            Some((
+                "attention_flash_asym4_wmma_tile_batched_gfx12",
+                kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_GFX12_SRC,
+                "attention_flash_asym4_wmma_tile_batched_gfx12",
+            ))
+        } else if self.arch_caps.has_wmma_w32() {
+            Some((
+                "attention_flash_asym4_wmma_tile_batched",
+                kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_SRC,
+                "attention_flash_asym4_wmma_tile_batched",
+            ))
+        } else {
+            None
+        };
         let wmma_ok = is_wmma_fa_enabled()
-            && self.arch_caps.has_wmma_w32()
+            && wmma_fa_kernel.is_some()
             && (head_dim == 128 || head_dim == 256)
             && tree_bias.is_none()
             && tile_func_name == "attention_flash_asym4_tile_batched"
@@ -24292,11 +24307,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             && batch_size % WMMA_BLOCK_M == 0
             && sub_batch % WMMA_BLOCK_M == 0;
         let (eff_tile_key, eff_tile_src, eff_tile_func): (&'static str, &'static str, &'static str) = if wmma_ok {
-            (
-                "attention_flash_asym4_wmma_tile_batched",
-                kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_SRC,
-                "attention_flash_asym4_wmma_tile_batched",
-            )
+            wmma_fa_kernel.expect("wmma_ok requires a selected WMMA-FA kernel")
         } else {
             (tile_key, tile_src, tile_func_name)
         };

@@ -2005,6 +2005,7 @@ pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC: &str = include_str!("../../
 pub const KV_CACHE_WRITE_ASYM_K_GIVENS2_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_givens2_batched.hip");
 pub const ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym4_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym4_wmma_tile_batched.hip");
+pub const ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_GFX12_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym4_wmma_tile_batched.gfx12.hip");
 pub const ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym3_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");

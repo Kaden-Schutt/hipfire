@@ -4,7 +4,7 @@
 **Targets, in landing order:**
 1. gfx1100/1101/1102 (RDNA3 wave32 `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`).
 2. **gfx1151/1150/1152** (RDNA3.5 Strix Halo APU) — same builtin, but the perf win on this arch is **conditional on Phase 1.0 measurement passing the bandwidth-bound gate** (see §Phase 1.0). If gfx1151 scalar FA is already at VRAM ceiling, this arch is dropped from Phase 1.
-3. gfx1200/1201 (RDNA4) — `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` sibling. Phase 3.
+3. gfx1200/1201 (RDNA4) — `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` sibling. Pulled into Phase 1.1 during PR triage with separate gfx12 sources.
 
 **Date:** 2026-05-17 (rev 2 — incorporated findings from three adversarial reviews; review files dropped per project memory rule on review-as-scaffolding).
 
