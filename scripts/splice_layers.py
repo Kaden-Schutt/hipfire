@@ -49,8 +49,8 @@ HFQM layout (little-endian):
 
 Subcommands:
   analyze   <a.hfq> [b.hfq]            structure dump (+ diff if b given)
-  splice    --base B --vision-from-hfq V --out O [--validate-against R]
-  splice    --base B --vision-from-hf  DIR --out O [--validate-against R]
+  splice    --base B --from-hfq V --out O [--validate-against R]
+  splice    --base B --from-hf  DIR --out O [--validate-against R]
 """
 import argparse, json, struct, sys
 
@@ -171,8 +171,7 @@ def _read_st_header(path):
 
 def collect_layers_from_hf(hf_dir, prefixes):
     """Read tensors whose name starts with any prefix from an HF safetensors
-    checkpoint (sharded or single-file), cast to F16. Used for both
-    vision (--prefix model.visual.) and MTP (--prefix mtp.)."""
+    checkpoint (sharded or single-file), cast to F16."""
     import glob, os
     import numpy as np
     idxs = glob.glob(os.path.join(hf_dir, "*.index.json"))
