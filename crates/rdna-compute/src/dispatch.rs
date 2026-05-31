@@ -2477,62 +2477,6 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         result
     }
 
-    /// PARO4-G128 fused SwiGLU down projection: y += W * (silu(gate) * up).
-    /// Saves the standalone `silu_mul_f32` launch and ffn_hidden global write/read.
-    pub fn gemv_paro4g128_swiglu_residual(
-        &mut self,
-        a_raw: &GpuTensor,
-        gate: &GpuTensor,
-        up: &GpuTensor,
-        y: &GpuTensor,
-        m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        assert_eq!(m % 8, 0, "PARO4G128 SwiGLU residual GEMV requires M multiple of 8, got {m}");
-        assert_eq!(k % 128, 0, "PARO4G128 SwiGLU residual GEMV requires K multiple of 128, got {k}");
-        self.ensure_kernel(
-            "gemv_paro4g128",
-            kernels::GEMV_PARO4G128_SRC,
-            "gemv_paro4g128_swiglu_residual",
-        )?;
-
-        let a_ptr = a_raw.buf.as_ptr();
-        let gate_ptr = gate.buf.as_ptr();
-        let up_ptr = up.buf.as_ptr();
-        let y_ptr = y.buf.as_ptr();
-        let m_val = m as i32;
-        let k_val = k as i32;
-
-        let mut params: Vec<*mut c_void> = vec![
-            &a_ptr as *const _ as *mut c_void,
-            &gate_ptr as *const _ as *mut c_void,
-            &up_ptr as *const _ as *mut c_void,
-            &y_ptr as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-        ];
-
-        let grid_x = (m / 8) as u32;
-        let bytes = crate::profile::gemv_paro4g128_bytes(m, k) + k * 4 + m * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_paro4g128_swiglu_residual", bytes);
-        let result = self.launch_maybe_blob(
-            "gemv_paro4g128_swiglu_residual",
-            [grid_x, 1, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr); b.push_ptr(gate_ptr); b.push_ptr(up_ptr); b.push_ptr(y_ptr);
-                b.push_i32(m_val); b.push_i32(k_val);
-                b
-            },
-        );
-        if let Some(t) = timer { t.finish(&self.hip); }
-        result
-    }
-
     /// PARO4-G128T direct GEMV for tiny-M projections. This keeps the Paro
     /// rotation inside the GEMV block instead of materializing x_rot globally.
     pub fn gemv_paro4g128t_direct(

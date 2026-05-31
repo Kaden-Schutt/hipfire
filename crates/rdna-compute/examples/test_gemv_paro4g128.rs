@@ -586,21 +586,6 @@ fn main() {
         .collect();
     let d_gate = gpu.upload_f32(&gate, &[k]).unwrap();
     let d_up = gpu.upload_f32(&up, &[k]).unwrap();
-    let d_y_swiglu = gpu.upload_f32(&y_seed, &[m]).unwrap();
-    gpu.gemv_paro4g128_swiglu_residual(&d_a, &d_gate, &d_up, &d_y_swiglu, m, k).unwrap();
-    let y_swiglu_gpu = gpu.download_f32(&d_y_swiglu).unwrap();
-    let mut max_abs_swiglu = 0.0f32;
-    let mut max_rel_swiglu = 0.0f32;
-    for i in 0..m {
-        let abs = (y_swiglu_gpu[i] - y_swiglu_ref[i]).abs();
-        max_abs_swiglu = max_abs_swiglu.max(abs);
-        max_rel_swiglu = max_rel_swiglu.max(abs / y_swiglu_ref[i].abs().max(1.0));
-    }
-    println!("swiglu residual max_abs={:.6e} max_rel={:.6e}", max_abs_swiglu, max_rel_swiglu);
-    if max_abs_swiglu > 5e-5 || max_rel_swiglu > 5e-5 {
-        std::process::exit(1);
-    }
-
     let d_x_rot_swiglu = gpu.zeros(&[k], DType::F32).unwrap();
     let d_y_swiglu_pre = gpu.upload_f32(&y_seed, &[m]).unwrap();
     gpu.paro4g128_swiglu_rotate(&d_a, &d_gate, &d_up, &d_x_rot_swiglu, m, k).unwrap();
