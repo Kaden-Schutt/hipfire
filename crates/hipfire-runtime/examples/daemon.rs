@@ -6072,6 +6072,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
             kv.compact_offset = 0;
+            // Reset llama_kv too (decode-abort path does the same) so a model
+            // carrying both caches can't be left with a stale RoPE phase on the
+            // next cold prefill. No-op when llama_kv is absent.
+            if let Some(llkv) = m.llama_kv.as_mut() { llkv.compact_offset = 0; }
             m.seq_pos = 0;
             m.conversation_tokens.clear();
             m.prefill_checkpoints.clear();
@@ -6299,6 +6303,27 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             // Emit aborted+done so the CLI's drain loop terminates
             // cleanly without an extra max_tokens worth of wasted decode.
             if check_abort(id) {
+                // Client cancelled mid-decode. The tokens generated so far were
+                // advanced into the DeltaNet recurrent state (`dn`) and pushed to
+                // `m.conversation_tokens`, but they are UNCOMMITTED — the client
+                // never receives/echoes them. DeltaNet state is non-reversible, so
+                // leaving it dirty poisons the next turn: its prompt-cache LCP and
+                // checkpoint-resume run against a token stream that no longer
+                // matches what the client committed, the resume restores a snapshot
+                // whose recorded position is now misaligned, and the recurrent
+                // state drifts off-distribution → garbage that worsens on each
+                // retry. Full cold reset here, mirroring the DFlash abort path
+                // (the prefill-abort paths already reset). The resident-KV
+                // checkpoint-resume optimization stays correct because every
+                // retained checkpoint now sits on a committed prefix.
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+                m.prefill_checkpoints.clear();
+                for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                kv.compact_offset = 0;
+                if let Some(llkv) = m.llama_kv.as_mut() { llkv.compact_offset = 0; }
                 let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
                 let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#, id, generated);
                 let _ = stdout.flush();
