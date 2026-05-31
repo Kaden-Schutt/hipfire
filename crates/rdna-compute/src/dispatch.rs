@@ -24278,11 +24278,22 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         };
 
         self.ensure_givens4_kernel(tile_key, tile_src, tile_func_name)?;
-        self.ensure_kernel(
-            "attention_flash_asym_reduce_batched",
-            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
-            "attention_flash_asym_reduce_batched",
-        )?;
+        if v_mode != 8 {
+            // lloyd-V: partials are in ROTATED space; the dedicated lloyd
+            // reduce applies the inverse FWHT once after the cross-tile
+            // combine. Needs turbo_common.h → ensure_givens4_kernel.
+            self.ensure_givens4_kernel(
+                "attention_flash_lloyd_reduce_batched",
+                kernels::ATTENTION_FLASH_LLOYD_REDUCE_BATCHED_SRC,
+                "attention_flash_lloyd_reduce_batched",
+            )?;
+        } else {
+            self.ensure_kernel(
+                "attention_flash_asym_reduce_batched",
+                kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
+                "attention_flash_asym_reduce_batched",
+            )?;
+        }
 
         let q_dim = n_heads * head_dim;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -24358,32 +24369,70 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 let ts = TILE_SIZE as i32; let mt = max_tiles as i32;
                 let bo = offset as i32;
                 let bs = block_start as i32; let bc = block_cols as i32;
-                let mut params: Vec<*mut c_void> = vec![
-                    &p_ptr as *const _ as *mut c_void,
-                    &o_ptr as *const _ as *mut c_void,
-                    &pos_ptr as *const _ as *mut c_void,
-                    &nh as *const _ as *mut c_void,
-                    &hd as *const _ as *mut c_void,
-                    &ts as *const _ as *mut c_void,
-                    &mt as *const _ as *mut c_void,
-                    &bo as *const _ as *mut c_void,
-                    &bs as *const _ as *mut c_void,
-                    &bc as *const _ as *mut c_void,
-                ];
-                self.launch_maybe_blob(
-                    "attention_flash_asym_reduce_batched",
-                    [n_heads as u32, chunk as u32, 1],
-                    [32, 1, 1],
-                    0,
-                    &mut params,
-                    || {
-                        let mut b = hip_bridge::KernargBlob::new();
-                        b.push_ptr(p_ptr); b.push_ptr(o_ptr); b.push_ptr(pos_ptr);
-                        b.push_i32(nh); b.push_i32(hd); b.push_i32(ts); b.push_i32(mt);
-                        b.push_i32(bo); b.push_i32(bs); b.push_i32(bc);
-                        b
-                    },
-                )?;
+                if v_mode != 8 {
+                    // lloyd-V: partials are ROTATED → use the dedicated lloyd
+                    // batched reduce, appending the FWHT signs (carried in
+                    // cos_theta / sin_theta for the fwht family) as the final
+                    // two kernargs (must match the kernel's param order).
+                    let s1_ptr = cos_theta.buf.as_ptr();
+                    let s2_ptr = sin_theta.buf.as_ptr();
+                    let mut params: Vec<*mut c_void> = vec![
+                        &p_ptr as *const _ as *mut c_void,
+                        &o_ptr as *const _ as *mut c_void,
+                        &pos_ptr as *const _ as *mut c_void,
+                        &nh as *const _ as *mut c_void,
+                        &hd as *const _ as *mut c_void,
+                        &ts as *const _ as *mut c_void,
+                        &mt as *const _ as *mut c_void,
+                        &bo as *const _ as *mut c_void,
+                        &bs as *const _ as *mut c_void,
+                        &bc as *const _ as *mut c_void,
+                        &s1_ptr as *const _ as *mut c_void,
+                        &s2_ptr as *const _ as *mut c_void,
+                    ];
+                    self.launch_maybe_blob(
+                        "attention_flash_lloyd_reduce_batched",
+                        [n_heads as u32, chunk as u32, 1],
+                        [32, 1, 1],
+                        0,
+                        &mut params,
+                        || {
+                            let mut b = hip_bridge::KernargBlob::new();
+                            b.push_ptr(p_ptr); b.push_ptr(o_ptr); b.push_ptr(pos_ptr);
+                            b.push_i32(nh); b.push_i32(hd); b.push_i32(ts); b.push_i32(mt);
+                            b.push_i32(bo); b.push_i32(bs); b.push_i32(bc);
+                            b.push_ptr(s1_ptr); b.push_ptr(s2_ptr);
+                            b
+                        },
+                    )?;
+                } else {
+                    let mut params: Vec<*mut c_void> = vec![
+                        &p_ptr as *const _ as *mut c_void,
+                        &o_ptr as *const _ as *mut c_void,
+                        &pos_ptr as *const _ as *mut c_void,
+                        &nh as *const _ as *mut c_void,
+                        &hd as *const _ as *mut c_void,
+                        &ts as *const _ as *mut c_void,
+                        &mt as *const _ as *mut c_void,
+                        &bo as *const _ as *mut c_void,
+                        &bs as *const _ as *mut c_void,
+                        &bc as *const _ as *mut c_void,
+                    ];
+                    self.launch_maybe_blob(
+                        "attention_flash_asym_reduce_batched",
+                        [n_heads as u32, chunk as u32, 1],
+                        [32, 1, 1],
+                        0,
+                        &mut params,
+                        || {
+                            let mut b = hip_bridge::KernargBlob::new();
+                            b.push_ptr(p_ptr); b.push_ptr(o_ptr); b.push_ptr(pos_ptr);
+                            b.push_i32(nh); b.push_i32(hd); b.push_i32(ts); b.push_i32(mt);
+                            b.push_i32(bo); b.push_i32(bs); b.push_i32(bc);
+                            b
+                        },
+                    )?;
+                }
             }
             offset += chunk;
         }
@@ -24833,12 +24882,48 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             }
         }
 
-        self.ensure_kernel(
-            "attention_flash_q8_0_reduce",
-            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-            "attention_flash_q8_0_reduce",
-        )?;
-        {
+        if v_mode_bits != 8 {
+            // lloyd-V: partials are in ROTATED space; the dedicated lloyd
+            // reduce applies the inverse FWHT once after the cross-tile
+            // combine. Needs turbo_common.h → ensure_givens4_kernel.
+            self.ensure_givens4_kernel(
+                "attention_flash_lloyd_reduce",
+                kernels::ATTENTION_FLASH_LLOYD_REDUCE_SRC,
+                "attention_flash_lloyd_reduce",
+            )?;
+            let func = &self.functions["attention_flash_lloyd_reduce"];
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut o_ptr = out.buf.as_ptr();
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut ts = TILE_SIZE as i32;
+            let mut mt = max_tiles as i32;
+            let mut s1_ptr = signs1.buf.as_ptr();
+            let mut s2_ptr = signs2.buf.as_ptr();
+            let mut params: Vec<*mut c_void> = vec![
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut o_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut ts as *mut _ as *mut c_void,
+                &mut mt as *mut _ as *mut c_void,
+                &mut s1_ptr as *mut _ as *mut c_void,
+                &mut s2_ptr as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func, [n_heads as u32, 1, 1], [32, 1, 1], 0,
+                    self.stream_ref(), &mut params,
+                )?;
+            }
+        } else {
+            self.ensure_kernel(
+                "attention_flash_q8_0_reduce",
+                kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+                "attention_flash_q8_0_reduce",
+            )?;
             let func = &self.functions["attention_flash_q8_0_reduce"];
             let mut p_ptr = partials.buf.as_ptr();
             let mut o_ptr = out.buf.as_ptr();
@@ -25206,13 +25291,49 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             }
         }
 
-        // Reuse Q8_0 flash reduce (output already in normal space, same as asym4).
-        self.ensure_kernel(
-            "attention_flash_q8_0_reduce",
-            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-            "attention_flash_q8_0_reduce",
-        )?;
-        {
+        if v_mode_bits != 8 {
+            // lloyd-V: partials are in ROTATED space; the dedicated lloyd
+            // reduce applies the inverse FWHT once after the cross-tile
+            // combine. Needs turbo_common.h → ensure_givens4_kernel.
+            self.ensure_givens4_kernel(
+                "attention_flash_lloyd_reduce",
+                kernels::ATTENTION_FLASH_LLOYD_REDUCE_SRC,
+                "attention_flash_lloyd_reduce",
+            )?;
+            let func = &self.functions["attention_flash_lloyd_reduce"];
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut o_ptr = out.buf.as_ptr();
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut ts = TILE_SIZE as i32;
+            let mut mt = max_tiles as i32;
+            let mut s1_ptr = signs1.buf.as_ptr();
+            let mut s2_ptr = signs2.buf.as_ptr();
+            let mut params: Vec<*mut c_void> = vec![
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut o_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut ts as *mut _ as *mut c_void,
+                &mut mt as *mut _ as *mut c_void,
+                &mut s1_ptr as *mut _ as *mut c_void,
+                &mut s2_ptr as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func, [n_heads as u32, 1, 1], [32, 1, 1], 0,
+                    self.stream_ref(), &mut params,
+                )?;
+            }
+        } else {
+            // Reuse Q8_0 flash reduce (output already in normal space, same as asym4).
+            self.ensure_kernel(
+                "attention_flash_q8_0_reduce",
+                kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+                "attention_flash_q8_0_reduce",
+            )?;
             let func = &self.functions["attention_flash_q8_0_reduce"];
             let mut p_ptr = partials.buf.as_ptr();
             let mut o_ptr = out.buf.as_ptr();
@@ -25305,12 +25426,48 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             }
         }
 
-        self.ensure_kernel(
-            "attention_flash_q8_0_reduce",
-            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
-            "attention_flash_q8_0_reduce",
-        )?;
-        {
+        if v_mode_bits != 8 {
+            // lloyd-V: partials are in ROTATED space; the dedicated lloyd
+            // reduce applies the inverse FWHT once after the cross-tile
+            // combine. Needs turbo_common.h → ensure_givens4_kernel.
+            self.ensure_givens4_kernel(
+                "attention_flash_lloyd_reduce",
+                kernels::ATTENTION_FLASH_LLOYD_REDUCE_SRC,
+                "attention_flash_lloyd_reduce",
+            )?;
+            let func = &self.functions["attention_flash_lloyd_reduce"];
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut o_ptr = out.buf.as_ptr();
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut ts = TILE_SIZE as i32;
+            let mut mt = max_tiles as i32;
+            let mut s1_ptr = signs1.buf.as_ptr();
+            let mut s2_ptr = signs2.buf.as_ptr();
+            let mut params: Vec<*mut c_void> = vec![
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut o_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut ts as *mut _ as *mut c_void,
+                &mut mt as *mut _ as *mut c_void,
+                &mut s1_ptr as *mut _ as *mut c_void,
+                &mut s2_ptr as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func, [n_heads as u32, 1, 1], [32, 1, 1], 0,
+                    self.stream_ref(), &mut params,
+                )?;
+            }
+        } else {
+            self.ensure_kernel(
+                "attention_flash_q8_0_reduce",
+                kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+                "attention_flash_q8_0_reduce",
+            )?;
             let func = &self.functions["attention_flash_q8_0_reduce"];
             let mut p_ptr = partials.buf.as_ptr();
             let mut o_ptr = out.buf.as_ptr();

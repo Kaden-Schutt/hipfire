@@ -2007,6 +2007,15 @@ pub const ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC: &str = include_str!("../../../
 pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 
+// lloyd-V (FWHT-rotated centroid) dedicated reduce kernels. Used ONLY when
+// v_mode != 8 — the tile kernels now write rotated V partials and these
+// reduces apply the inverse FWHT once after the cross-tile combine. The
+// Q8/asym paths keep using the untouched q8_0_reduce / asym_reduce_batched.
+// Both require turbo_common.h (for fwht_shfl_inverse_256), so they MUST be
+// loaded via ensure_givens4_kernel.
+pub const ATTENTION_FLASH_LLOYD_REDUCE_SRC: &str = include_str!("../../../kernels/src/attention_flash_lloyd_reduce.hip");
+pub const ATTENTION_FLASH_LLOYD_REDUCE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_lloyd_reduce_batched.hip");
+
 // Signed-FWHT K-write + FA tile variants — same byte layout as asym family,
 // rotation primitive swapped from Givens (per-quad cos/sin) to signed-FWHT
 // (128-wide butterfly via ds_swizzle_b32). Q is forward-rotated by the same

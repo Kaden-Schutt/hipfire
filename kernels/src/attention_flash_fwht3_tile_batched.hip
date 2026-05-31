@@ -162,10 +162,10 @@ __global__ void attention_flash_fwht3_tile_batched(
                 out_vec[i] += w * (cnorm * c);
             }
         }
-        // V accumulated in rotated space (out_vec ≈ H·Σw·v). Undo once.
-        fwht_shfl_inverse_256(out_vec[0], out_vec[1], out_vec[2], out_vec[3],
-                              out_vec[4], out_vec[5], out_vec[6], out_vec[7],
-                              signs1, signs2, tid);
+        // V accumulated in ROTATED space (out_vec ≈ H·Σw·v). The inverse FWHT
+        // is deferred to the dedicated lloyd reduce kernel, which applies it
+        // once after the cross-tile combine (inverse is linear, so it commutes
+        // with the weighted-sum + scalar normalize the reduce performs).
     }
 
     float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
