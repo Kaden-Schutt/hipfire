@@ -308,3 +308,32 @@ plumbing item and is validated by the very **first** spike:
 5. **Pattern tuning** — finalize the `balanced` default via the sweep.
 6. **Wire-up** — presets, env, per-load param, TUI entry; opt-in default.
 7. **(fast-follow within feature)** DFlash decode-path hook.
+
+## 12. Status — shipped 2026-05-31
+
+Implemented end-to-end and validated on gfx1100 (qwen3.6-27b.mq4), fleet-hardened
+on gfx1201. Commits on `feat/kv-vquant-fwht-lloyd-v` (Spike 0 → wire-up).
+
+**What landed:**
+- `Gpu::invalidate_for_kv_mode_switch` (defensive graph invalidation; Spike 0).
+- `kv_adaptive` module: `KMode{Fwht4,Fwht3,Fwht2}`, capacity = **min-of-two
+  separate buffers** (corrected from the shared-pool draft — see §3), `KvAdaptive`
+  controller (presets + advanced floors), `maybe_downshift` (applies all crossed
+  steps). CPU-unit-tested.
+- Transcode kernels: `kv_transcode_v_q8_to_lloyd4` (FWHT), `kv_transcode_v_lloyd_down`,
+  `kv_transcode_k_fwht4_to_fwht2` (same-width remap), `kv_transcode_k_fwht4_to_fwht3`
+  (re-rotation). `KvCache::transcode_v_step` / `transcode_k_step` orchestrate
+  in place via a 1-layer scratch; `set_adaptive_floor_alloc` floor-sizes K and V
+  + upgrades signs to 256.
+- Daemon: `LoadedModel.kv_adaptive`, hooks after the prefill-chunk and decode
+  eviction sites, `HIPFIRE_KV_ADAPTIVE` env + per-load `params.kv_adaptive`.
+- CLI: `kv_adaptive` settings-menu entry (off | conservative | balanced |
+  aggressive | advanced:k=,v=).
+
+**Validated:** synthetic transcode≈direct (all 4 kernels, max diff = one
+quant-boundary step) on gfx1100 AND gfx1201; preset + advanced coherence
+end-to-end (downshifts fire at predicted positions; fluent through every
+transition incl. the attractor-prone K steps). Default OFF (opt-in).
+
+**Deferred (see `NEXT-STEPS.md`):** DFlash hook, default-on decision, multi-GPU,
+pattern-tuning KLD sweep, `Aggressive` differentiation, recency-tiered precision.
