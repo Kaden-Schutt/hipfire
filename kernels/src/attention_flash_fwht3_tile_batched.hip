@@ -138,8 +138,9 @@ __global__ void attention_flash_fwht3_tile_batched(
             }
         }
     } else {
-        // lloyd3: FWHT-rotated centroid V — layout identical to fwht3 K.
-        const int v_bytes_per_head = 4 + (head_dim * 3) / 8;   // 100 B at hd=256
+        // lloyd2/3/4: 256-wide FWHT-rotated centroid V. v_mode = bit width.
+        // Layout: 4B cnorm + (tid * v_mode) bytes packed (8 indices, LSB-first, i*v_mode shift).
+        const int v_bytes_per_head = 4 + (head_dim * v_mode) / 8;
         const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
         const int v_head_off       = kv_h * v_bytes_per_head;
         for (int t_local = 0; t_local < tile_len; t_local++) {
@@ -147,18 +148,19 @@ __global__ void attention_flash_fwht3_tile_batched(
             int t = tile_start + t_local;
             const unsigned char* vb = v_cache + (size_t)t * v_bytes_per_pos + v_head_off;
             float cnorm = *(const float*)vb;
-            const unsigned char* base = vb + 4 + tid * 3;
-            unsigned int packed = (unsigned int)base[0]
-                                | ((unsigned int)base[1] << 8)
-                                | ((unsigned int)base[2] << 16);
-            out_vec[0] += w * (cnorm * TURBO_C3_256[ packed        & 7]);
-            out_vec[1] += w * (cnorm * TURBO_C3_256[(packed >> 3)  & 7]);
-            out_vec[2] += w * (cnorm * TURBO_C3_256[(packed >> 6)  & 7]);
-            out_vec[3] += w * (cnorm * TURBO_C3_256[(packed >> 9)  & 7]);
-            out_vec[4] += w * (cnorm * TURBO_C3_256[(packed >> 12) & 7]);
-            out_vec[5] += w * (cnorm * TURBO_C3_256[(packed >> 15) & 7]);
-            out_vec[6] += w * (cnorm * TURBO_C3_256[(packed >> 18) & 7]);
-            out_vec[7] += w * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
+            const unsigned char* base = vb + 4 + tid * v_mode;   // v_mode bytes/thread
+            unsigned int packed = (unsigned int)base[0];
+            if (v_mode >= 2) packed |= ((unsigned int)base[1] << 8);
+            if (v_mode >= 3) packed |= ((unsigned int)base[2] << 16);
+            if (v_mode >= 4) packed |= ((unsigned int)base[3] << 24);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                float c;
+                if (v_mode == 2)      c = TURBO_C2_256[(packed >> (i * 2)) & 3];
+                else if (v_mode == 3) c = TURBO_C3_256[(packed >> (i * 3)) & 7];
+                else                  c = TURBO_C4_256[(packed >> (i * 4)) & 15];
+                out_vec[i] += w * (cnorm * c);
+            }
         }
         // V accumulated in rotated space (out_vec ≈ H·Σw·v). Undo once.
         fwht_shfl_inverse_256(out_vec[0], out_vec[1], out_vec[2], out_vec[3],
