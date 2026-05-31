@@ -1,0 +1,256 @@
+# Adaptive KV — Design
+
+> Runtime VRAM-fit downshift of **both** K and V precision as context grows,
+> recomputing the existing KV cache in place. Builds on the composable
+> FWHT-K × Lloyd-V quant matrix (branch `feat/kv-vquant-fwht-lloyd-v`).
+> Status: design approved 2026-05-31. Next: implementation plan.
+
+## 1. Goal
+
+As the live context grows toward the VRAM ceiling, the daemon **downshifts KV
+precision** (V: q8→lloyd4→lloyd3→lloyd2; K: fwht4→fwht2) along a user-selected
+**pattern** so it can keep fitting more tokens — turning what is today an OOM /
+hard `max_seq` ceiling into **graceful degradation**. Short contexts stay at the
+fastest, highest-precision modes; precision drops only as needed.
+
+Motivated by the measured **capacity-not-speed** result: low-bit V is a
+VRAM/capacity lever, not a speed lever (lloyd-V is *slower* than q8-V at every
+context). So: use the fast high-precision modes where they fit; spend precision
+only to reach contexts they can't.
+
+## 2. Non-goals (v1)
+
+- **Multi-GPU.** `set_v_mode_realloc` is single-GPU today; the transcode path is
+  single-GPU in v1. Multi-GPU is a follow-up.
+- **DFlash / spec-decode decode path.** v1 wires the standard linear `generate`
+  decode loop. DFlash already has the sibling `maybe_evict` hook site, so it is
+  an immediate fast-follow within this feature, not a rewrite.
+- **K below fwht2 / V below lloyd2.** The floor is the 2-bit tier on both sides.
+- **Auto-deriving the byte budget from free VRAM.** The budget is tied to the
+  existing `max_seq` knob (§3). VRAM autodetect → `max_seq` is the setup
+  wizard's job (see `project_hipfire_kv_vquant_wizard`), kept separate.
+
+## 3. Capacity model — the core contract
+
+Allocate each layer's K and V buffers **once at load**, sized for the **floor**
+tier across the full advertised context. Buffers are **never reallocated**:
+
+```
+budget(layer) = max_seq × n_kv_heads × ( k_bytes_per_head(fwht2) + v_bytes_per_head(lloyd2) )
+              = max_seq × n_kv_heads × ( 68 + 68 )            # head_dim = 256
+```
+
+Both buffers are **position-major, byte-strided by the current tier's
+bytes-per-head** (confirmed in `kv_cache_write_fwht256_*.hip`:
+`out = base + pos*bytes_per_pos + h*bytes_per_head`, with
+`bytes_per_head = 4 + head_dim*bits/8`; `physical_cap` does **not** appear in V
+indexing). Therefore the **token capacity at any tier is purely derived**:
+
+```
+cap(K_tier, V_tier) = budget ÷ ( n_kv_heads × (k_bph(K_tier) + v_bph(V_tier)) )
+```
+
+Bytes-per-head at head_dim=256:
+
+| cache | tier | B/head | | cache | tier | B/head |
+|---|---|---|---|---|---|---|
+| K | fwht4 | 132 | | V | q8 | 272 |
+| K | fwht3 | 100 | | V | lloyd4 | 132 |
+| K | fwht2 | 68  | | V | lloyd3 | 100 |
+|   |       |     | | V | lloyd2 | 68  |
+
+**Mental model for users:** `max_seq` is the context you are *guaranteed* at the
+floor; short contexts run at the fast high-precision tiers, and precision drops
+as you approach the ceiling. K + RoPE allocation is unchanged in shape — K is
+just allocated at its fwht4 footprint up front. Total KV VRAM is fixed and
+predictable: `max_seq × n_kv_heads × (k_bph(fwht2) + v_bph(lloyd2))`.
+
+### Why this works without reallocation
+
+In a fixed (floor-sized) buffer, a higher-precision tier simply uses *more bytes
+per token*, so *fewer tokens* fit — exactly the smaller `cap`. Downshifting
+rewrites the live tokens into a *smaller* per-token stride, compacting them to
+the front, which raises `cap` in the same buffer. Forward in-place transcode is
+safe because the write stride is strictly smaller than the read stride (the
+write pointer trails the read pointer for every `pos > 0`).
+
+## 4. The downshift pattern (both caches, one ordered schedule)
+
+A **pattern** is an ordered list of steps; each step downshifts **one** cache by
+one tier. This is the unifying abstraction that makes it *adaptive KV* (not just
+adaptive V) and makes "selectable shift pattern" meaningful.
+
+- K starts at **fwht4** (128-wide), V starts at **q8**.
+- K chain is **fwht4 → fwht2** (both 128-wide ⇒ a cheap pure index-remap in
+  rotated space; **fwht3 is skipped** because it is 256-wide and would force a
+  de-rotate/re-rotate). V chain is **q8 → lloyd4 → lloyd3 → lloyd2**.
+
+**Default pattern (`balanced`, the initial proposal — see §9, finalized by the
+KLD/coherence sweep):** keep the K/V bit-depth gap ≤ 1 tier at each stage, per
+the validated "balanced K/V beats lopsided at equal bytes" finding, and
+front-load the biggest byte win:
+
+| step | action | state (K/V) | combined B/head | cap (× max_seq) |
+|---|---|---|---|---|
+| start | — | fwht4 / q8 | 404 | 0.337 |
+| 1 | V q8→lloyd4 (FWHT) | fwht4 / lloyd4 | 264 | 0.515 |
+| 2 | V lloyd4→lloyd3 (remap) | fwht4 / lloyd3 | 232 | 0.586 |
+| 3 | K fwht4→fwht2 (remap) | fwht2 / lloyd3 | 168 | 0.810 |
+| 4 | V lloyd3→lloyd2 (remap) | fwht2 / lloyd2 | 136 | 1.000 (floor) |
+
+Thresholds fall out as `cap(state) − margin`. **Presets** select floor +
+interleave:
+- `conservative` — V→lloyd4 only, K fixed at fwht4. (smallest gain, safest)
+- `balanced` (default) — the table above.
+- `aggressive` — same floor, K stepped earlier for capacity sooner.
+
+The controller executes **any** ordered pattern; presets are just named
+patterns. The `balanced` step order above is the starting default and is
+finalized empirically (§9).
+
+## 5. Components
+
+### 5.1 `KMode` enum + `set_k_mode_realloc` (new, mirrors `VMode`)
+K mode is currently encoded as `quant_asym{2,3,4}` booleans read across many
+dispatch sites. Introduce a `KMode { Fwht4, Fwht2 }` (v1 chain) accessor that
+derives those booleans, so the controller can flip K tier coherently. The
+booleans remain the source the forward pass reads each call (no graph baking of
+K mode — see §7).
+
+### 5.2 `KvAdaptive` controller (new; sibling of `EvictionCtx`)
+Holds: the resolved `pattern` (Vec of steps), current step index, current
+(K_tier, V_tier), per-step thresholds, `margin`, and a **one-layer transcode
+scratch** (precedent: `EvictionCtx.v_compact`). One per inference session.
+
+```
+maybe_downshift(gpu, kv, seq_pos) -> HipResult<Option<Step>>
+```
+Called after every committed token write, at the **same site as
+`maybe_evict`**. 99% of tokens: a single integer compare → `None`. When
+`seq_pos ≥ threshold(current_step)`, it runs the transcode pass for that step,
+invalidates the replay graph (§7), advances the step, and returns `Some(step)`.
+
+### 5.3 Transcode kernels
+All operate per FA layer, positions `0..=seq_pos`, layer-by-layer through the
+1-layer scratch (read whole layer → scratch → write back compacted) for
+crash-safety.
+
+- **V `q8 → lloyd4`** — read q8 (normal space) → dequant → **FWHT-rotate**
+  (256-wide, signs seeds 42/1042) → quantize to `TURBO_C4_256` + per-(pos,head)
+  cnorm. *The only transcode that does an FWHT.*
+- **V `lloyd_hi → lloyd_lo`** (lloyd4→3, lloyd3→2) — read rotated indices →
+  remap each to the nearest lower-LUT centroid → repack. **No FWHT.**
+- **K `fwht4 → fwht2`** — same shape as the V lloyd remap, 128-wide, on the K
+  buffer. **No FWHT** (same rotation width).
+
+**Plan spike (cheap, do first):** confirm `TURBO_C{2,3,4}_256` (V) and the K
+LUTs are normalized to a shared scale. If yes, every lloyd→lloyd / fwht4→fwht2
+remap collapses to a **fixed host-built `idx_hi→idx_lo` table** (16→8→4 / 16→4
+entries), cnorm unchanged — a pure gather. If not, the remap recomputes cnorm
+per (pos,head). Either way it is a single rotated-space pass.
+
+### 5.4 Decode-loop hook (`crates/hipfire-runtime/examples/daemon.rs`)
+In `generate` (linear path), after the token append + `seq_pos += 1`, call
+`kv_adaptive.maybe_downshift(gpu, kv, seq_pos)` (guarded by `Option`). Mirrors
+the existing `ev.maybe_evict` placement. DFlash (`generate_dflash`) gets the
+same call at its committed-position site as the fast-follow.
+
+### 5.5 Config / TUI surfacing
+Mirror the existing `kv_mode` / `HIPFIRE_KV_V` wiring:
+- **daemon**: `HIPFIRE_KV_ADAPTIVE=off|conservative|balanced|aggressive` env +
+  per-load `params.kv_adaptive`.
+- **TUI** (`cli/index.ts` settings menu, alongside `kv_cache`, `physical_cap`,
+  CASK descriptions): a `kv_adaptive` entry — off + the three presets + help
+  text explaining the max_seq-as-floor-context contract.
+- **Constraint**: requires an FWHT K mode. When adaptive is ON, the loader
+  forces K=fwht4 (satisfies the constraint by construction). If a non-FWHT
+  K mode is otherwise selected, adaptive is ignored with a warning (reuse the
+  existing `set_v_mode_realloc` guard).
+
+## 6. Data flow
+
+```
+per committed token:
+  forward (replay graph at current K kernel + V kernarg)
+  → sample → append: write K@cur_K_tier, V@cur_V_tier
+  → seq_pos += 1
+  → maybe_downshift(seq_pos):
+       if seq_pos < threshold(step):  return None        # the common case
+       else:
+         transcode the step's cache (one rotated-space pass, via 1-layer scratch)
+         invalidate AR replay graph cache                 # §7
+         flip kv tier (VMode kernarg  OR  KMode booleans)
+         advance step; recompute next threshold
+  ...
+  floor reached → maybe_downshift is a no-op → fall through to existing behavior
+                  (CASK eviction if enabled, else the normal max_seq ceiling)
+```
+
+## 7. Critical integration risk: the AR replay graph
+
+AR decode uses a captured/replayed HIP graph (`Gpu.replay_graph_cache`,
+`ar_forward_replay_enabled`, `captured_graph`, `graph_exec`, keyed by batch `n`).
+A captured graph bakes the dispatched **K kernel** and may bake the **V-mode
+kernarg** by value. Therefore **any** downshift — K *or* V — MUST invalidate the
+replay cache so the next forward re-captures at the new mode. This is the #1
+plumbing item and is validated by the very **first** spike:
+
+> **Spike 0 (blocking):** with adaptive forced to shift at a fixed early
+> position, confirm that *without* replay-cache invalidation the post-shift
+> tokens are corrupt/stale, and *with* invalidation (`replay_graph_cache.clear()`
+> for the affected `n`, drop `replay_warmed_up`) they are correct. This gates the
+> whole design; resolve it before building the pattern controller.
+
+## 8. Error handling / edge cases
+
+- **Transcode HIP error** → poison the cache + return a clean generation error;
+  the 1-layer scratch guarantees no half-rewritten *live* buffer.
+- **Budget too small** for even one token at the start tier (K4/q8) → clamp /
+  assert at load with an actionable message.
+- **`head_dim == 256` and FWHT-K** already asserted by `set_v_mode_realloc`.
+- **Re-prompt / cache reset** mid-session must reset the controller to step 0 and
+  the buffers to the start tiers (re-quantize forward, or simply restart at q8/
+  fwht4 on the next prefill — prefill rewrites the cache anyway).
+
+## 9. Default on/off + pattern finalization
+
+- **Default OFF (opt-in)** for v1, consistent with "capacity-not-speed → keep
+  Q8-V default." Because adaptive runs the fast high-precision tiers until the
+  cap, enabling it has **zero perf cost at short context** and only helps at long
+  context — so **default-on is a strong post-validation follow-up**, flagged but
+  not v1.
+- The **exact `balanced` step order is finalized empirically** by the existing
+  KLD + coherence sweep (we do not hand-guess the optimal interleave). The §4
+  table is the starting proposal; the sweep confirms or reorders it.
+
+## 10. Testing / validation
+
+- **Spike 0** (§7) — replay-graph invalidation. Blocking; first.
+- **Unit** — `cap(tier)` + threshold arithmetic; transcode correctness:
+  `q8→lloyd4` transcode of a known V ≈ a direct lloyd4 write of the same V
+  (within quant error); each `lloyd_hi→lloyd_lo` and `fwht4→fwht2` remap ≈ a
+  direct write at the target tier.
+- **Coherence (the critical gate)** — a long generation crossing **all four**
+  steps must pass `scripts/coherence-gate.sh` with no attractor at any
+  transition (K transitions especially — softmax-exponent sensitivity). A
+  corrupting transcode surfaces precisely as a transition-point attractor.
+- **KLD continuity** — a sequence that transcodes at position P matches the
+  static-mode KLD for the tier it lands in (reuse the 12-cell matrix harness).
+- **Perf** — short-ctx (start tier = K=fwht4 / V=q8) perf == the equivalent
+  static config, with zero adaptive overhead until the first threshold;
+  transcode-pass cost measured and confirmed amortized (one O(ctx) pass per
+  step, 4 steps total over a full context).
+- All on gfx1100 / `qwen3.6-27b.mq4`, established harness.
+
+## 11. Build sequence
+
+1. **Spike 0** — replay-graph invalidation (blocking gate).
+2. **Shared infra** — `KvAdaptive` controller, capacity/threshold math, decode
+   hook, config/TUI surfacing, transcode orchestration + 1-layer scratch.
+3. **V transcodes** — `q8→lloyd4` (FWHT) + lloyd→lloyd remaps; validate KLD +
+   coherence across the V-only sub-pattern.
+4. **K transcodes** — `KMode` accessor + `fwht4→fwht2` remap + flag-flip;
+   validate K transitions *hard* (coherence).
+5. **Pattern tuning** — finalize the `balanced` default via the sweep.
+6. **Wire-up** — presets, env, per-load param, TUI entry; opt-in default.
+7. **(fast-follow within feature)** DFlash decode-path hook.
