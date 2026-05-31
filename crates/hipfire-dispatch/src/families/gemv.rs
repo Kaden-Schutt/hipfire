@@ -10,6 +10,7 @@
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
+c use crate::pipeline::{PipelineParams, dispatch_fused};
 use crate::tables::gemv_table;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
@@ -121,7 +122,20 @@ impl GemvFamily {
 
         match params.variant {
             GemvVariant::Plain => dispatch_plain(gpu, params),
-            GemvVariant::Prerotated => dispatch_prerotated(gpu, params),
+            GemvVariant::Prerotated => {
+                let dtype = params.w.dtype;
+                if dtype == DType::MFP4G32 {
+                    let key = KernelKey::GemvMfp4G32Fused;
+                    if self.registry.resolve(key, ctx).is_ok() {
+                        let pipe_params = PipelineParams {
+                            x: params.x, y: params.y, buf: params.w.buf,
+                            m: params.w.m, k: params.w.k,
+                        };
+                        return dispatch_fused(gpu, KernelKey::GemvMfp4G32Fused, &pipe_params);
+                    }
+                }
+                dispatch_prerotated(gpu, params)
+            }
             GemvVariant::WithResidual => dispatch_residual(gpu, params),
             GemvVariant::WithSwiGLUResidual => dispatch_swiglu_residual(gpu, params),
         }
@@ -170,6 +184,12 @@ fn dispatch_plain(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchErro
         Q4F16G64 => hip!(gpu.gemv_q4f16_g64(w.buf, x, y, m, k)),
         Q4F16G32 => hip!(gpu.gemv_q4f16_g32(w.buf, x, y, m, k)),
         PARO4G128 => hip!(gpu.gemv_paro4g128(w.buf, x, y, m, k)),
+        ParoQ4G128 => {
+            Err(DispatchError::UnsupportedVariant {
+                family: "gemv", variant: "plain",
+                arch: "", quant: "paro4g128 (pipeline step requires model-layer ParoRotation)",
+            })
+        }
         // MQ-family Plain requires the caller to use Prerotated variant:
         // rotation + prerotated GEMV is a two-step process managed externally.
         _ => Err(DispatchError::UnsupportedVariant {
@@ -200,6 +220,7 @@ fn dispatch_prerotated(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Dispatc
         MQ3G256 => hip!(gpu.gemv_mq3g256_prerotated(w.buf, x, y, m, k)),
         MQ2G256 => hip!(gpu.gemv_mq2g256_prerotated(w.buf, x, y, m, k)),
         MQ6G256 => hip!(gpu.gemv_mq6g256_prerotated(w.buf, x, y, m, k)),
+        MQ4G128 => hip!(gpu.gemv_mq4g128_prerotated(w.buf, x, y, m, k)),
         // MQ8 prerotated reads x from internal scratch — no x parameter.
         MQ8G256 => hip!(gpu.gemv_mq8g256_prerotated(w.buf, y, m, k)),
         MQ2G256Lloyd => hip!(gpu.gemv_mq2g256_lloyd(w.buf, x, y, m, k)),
@@ -238,6 +259,7 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),
         MQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x, y, m, k)),
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x, y, m, k)),
+        PARO4G128 => hip!(gpu.gemv_paro4g128_residual(w.buf, x, y, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x, y, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x, y, m, k)),
         _ => Err(DispatchError::UnsupportedVariant {
@@ -278,6 +300,7 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x_in, residual, m, k)),
         MQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x_in, residual, m, k)),
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
+        PARO4G128 => hip!(gpu.gemv_paro4g128_residual(w.buf, x_in, residual, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x_in, residual, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x_in, residual, m, k)),
         _ => Err(DispatchError::UnsupportedVariant {

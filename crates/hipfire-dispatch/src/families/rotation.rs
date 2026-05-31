@@ -45,6 +45,12 @@ impl RotationFamily {
         let batched = params.batch_size > 1;
 
         match params.variant {
+            RotationVariant::PlainG128 => {
+                self.registry.resolve(KernelKey::RotateMqG128, ctx)
+                    .map_err(he)?;
+                // rotate_x_mq_128 internally calls ensure_mq_signs_128()
+                gpu.rotate_x_mq_128(params.x, params.x_rot, params.k)
+            }
             RotationVariant::Plain => match (has_awq, batched) {
                 (false, false) => {
                     self.registry.resolve(KernelKey::RotateMq, ctx)

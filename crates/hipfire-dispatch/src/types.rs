@@ -12,6 +12,8 @@ pub enum PipelineOp {
     SiluMul,
     SiluMulRotate,
     ResidualAdd,
+    CopyD2D,
+    GivensRotate,
 }
 
 // ── Variant enums ─────────────────────────────────────
@@ -49,6 +51,7 @@ pub enum MoeVariant {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum RotationVariant {
     Plain,
+    PlainG128,
     WithRmsnorm,
     WithSwiGLU,
 }
@@ -80,6 +83,7 @@ pub enum KernelKey {
     GemvMq3G256Lloyd,
     GemvMq4G256Lloyd,
     GemvMfp4G32,
+    GemvMfp4G32Fused,
     GemvHfp4G32,
     GemvParo4G128,
     GemvParo4G128T,
@@ -149,6 +153,7 @@ pub enum KernelKey {
     FusedGateUpQ4K,
     // Rotation
     RotateMq,
+    RotateMqG128,
     RotateMqAwq,
     RotateMqBatched,
     RotateMqAwqBatched,
@@ -187,7 +192,7 @@ pub enum KernelKey {
 
 // ── Arch gating ──────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum ArchPredicate {
     Always,
     HasWmmaW32,
@@ -394,7 +399,9 @@ impl KernelKey {
                 };
                 steps
             }
-            Prerotated => &[PipelineOp::Gemv],
+            Prerotated => {
+                &[PipelineOp::Gemv]
+            }
             WithResidual => {
                 let steps: &[PipelineOp] = match dtype {
                     MQ4G256 | MQ3G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd

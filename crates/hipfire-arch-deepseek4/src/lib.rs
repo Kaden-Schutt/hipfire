@@ -55,8 +55,6 @@ pub mod arch;
 pub mod deepseek4;
 pub mod dsml;
 pub mod forward;
-#[cfg(feature = "new-dispatch")]
-pub mod forward_dispatch;
 pub mod grammar;
 pub mod sampling;
 pub mod spec_decode;

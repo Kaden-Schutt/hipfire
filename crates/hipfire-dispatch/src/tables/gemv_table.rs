@@ -12,6 +12,7 @@ pub fn populate(registry: &KernelRegistry) {
     register_prerotated(registry);
     register_residual(registry);
     register_swiglu_residual(registry);
+    register_fused(registry);
 }
 
 fn register_plain(registry: &KernelRegistry) {
@@ -110,6 +111,16 @@ fn register_residual(registry: &KernelRegistry) {
             has_awq: dtype == DType::MQ4G256,
         });
     }
+}
+
+fn register_fused(registry: &KernelRegistry) {
+    registry.register(KernelVariant {
+        key: KernelKey::GemvMfp4G32Fused,
+        arch_required: ArchPredicate::HasWmmaW32,
+        shape_gate: None,
+        steps: &[PipelineOp::RotateFwht, PipelineOp::Gemv],
+        has_awq: false,
+    });
 }
 
 fn register_swiglu_residual(registry: &KernelRegistry) {
