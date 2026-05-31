@@ -3558,7 +3558,16 @@ impl KvCache {
     /// ~physical_cap*68/272 ≈ 0.25*physical_cap positions — exactly why the
     /// controller transcodes before that cap. Single-GPU only (matches
     /// set_v_mode_realloc).
-    pub fn set_adaptive_floor_alloc(&mut self, gpu: &mut Gpu, v_floor: VMode) -> HipResult<()> {
+    /// `k_floor_bph` is the K bytes-per-head at the K FLOOR tier (e.g. fwht2 =
+    /// 68 @hd=256, fwht4 = 132 @hd=256). When it is SMALLER than the current K
+    /// mode's footprint (i.e. the floor is below fwht4), the K buffers are
+    /// reallocated to `physical_cap * n_kv_heads * k_floor_bph` so we actually
+    /// save K VRAM. K data is still WRITTEN at the fwht4 stride (132 @256) until
+    /// `transcode_k_step` runs, so the floor-sized K buffer physically holds
+    /// ~physical_cap * k_floor_bph / 132 positions at fwht4 — the controller
+    /// transcodes K→fwht2 before that cap. Pass the current K footprint (132 for
+    /// a fwht4 cache) to leave K unresized (V-only presets).
+    pub fn set_adaptive_floor_alloc(&mut self, gpu: &mut Gpu, v_floor: VMode, k_floor_bph: usize) -> HipResult<()> {
         // Mirror the set_v_mode_realloc guard: lloyd-V is 256-wide and requires
         // an FWHT K mode + head_dim == 256.
         assert!(
@@ -3603,6 +3612,22 @@ impl KvCache {
         }
         // v_mode STAYS at its current value (Q8 fast start tier); only the buffer
         // size changed.
+
+        // Size K at the K FLOOR (fwht2) when the floor is below the current
+        // fwht4 footprint. K data is still WRITTEN at the fwht4 stride until the
+        // K→fwht2 transcode fires (~0.515*physical_cap positions in), exactly
+        // mirroring the V side. The K-mode booleans STAY at fwht4 (start tier).
+        let k_bph_cur = 4 + self.head_dim / 2; // fwht4 footprint @ this head_dim
+        if k_floor_bph < k_bph_cur {
+            let k_bpp_floor = self.n_kv_heads * k_floor_bph;
+            let k_elems = (self.physical_cap * k_bpp_floor + 3) / 4;
+            for t in self.k_gpu.iter_mut() {
+                // 1-element placeholder convention for non-KV layers.
+                if t.numel() > 1 {
+                    *t = gpu.zeros(&[k_elems], DType::F32)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3718,15 +3743,95 @@ impl KvCache {
     }
 
     /// Adaptive-KV: re-quantize the EXISTING K cache to a lower tier
-    /// (`target_bits` ∈ {2,3,4}). STUB until the K transcode kernels land (plan
-    /// Task 6/7). Errors loudly so the balanced preset's K step can't silently
-    /// no-op; the V-only adaptive path (k_floor=fwht4 ⇒ no K step) never calls
-    /// this.
-    pub fn transcode_k_step(&mut self, _gpu: &mut Gpu, target_bits: u32, _n_positions: usize) -> HipResult<()> {
-        Err(hip_bridge::HipError::new(
-            0,
-            &format!("transcode_k_step(target_bits={target_bits}) not implemented yet (plan Task 6/7)"),
-        ))
+    /// (`target_bits` ∈ {2,3,4}). Only the SAME-WIDTH fwht4→fwht2 remap is
+    /// implemented (both 128-wide; the balanced/aggressive presets' only K
+    /// step). fwht3 involvement requires a 128↔256 re-rotation (Task 6b) and is
+    /// NOT implemented — this errors clearly for any non-(fwht4→fwht2) request.
+    ///
+    /// Per real KV layer: copy the K layer into a 1-layer scratch (d2d), then
+    /// transcode scratch→layer (separate buffers, never aliased). cnorm is
+    /// recomputed per (head, pos). Then flips the K-mode booleans
+    /// (quant_asym4→quant_asym2, quant_fwht stays true) so the next forward
+    /// dispatches the fwht2 attention kernel, and invalidates captured graphs.
+    ///
+    /// Sign tables: fwht4 and fwht2 are both 128-wide and share the SAME signs
+    /// (gen_fwht_signs(42/1042); the first 128 entries of a 256-wide table equal
+    /// the 128-wide table), so no sign realloc is needed.
+    ///
+    /// `n_positions` is the number of token positions currently written. The K
+    /// buffer is floor-sized to the fwht2 footprint at adaptive load, so the
+    /// fwht4 phase physically holds only ~physical_cap*68/132 ≈ 0.515*physical_cap
+    /// positions — the controller transcodes K→fwht2 before that cap.
+    pub fn transcode_k_step(&mut self, gpu: &mut Gpu, target_bits: u32, n_positions: usize) -> HipResult<()> {
+        // Determine the current K mode. Adaptive starts at fwht4
+        // (quant_asym4 && quant_fwht). The only supported step is fwht4→fwht2.
+        let src_is_fwht4 = self.quant_asym4 && self.quant_fwht;
+        let cur_label = if !self.quant_fwht {
+            "non-fwht"
+        } else if self.quant_asym4 {
+            "fwht4"
+        } else if self.quant_asym3 {
+            "fwht3"
+        } else if self.quant_asym2 {
+            "fwht2"
+        } else {
+            "unknown"
+        };
+        if !(src_is_fwht4 && target_bits == 2) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "K transcode {cur_label}->fwht{target_bits} not implemented \
+                     (Task 6b: fwht3 re-rotation); only fwht4->fwht2 (same-width remap) is supported"
+                ),
+            ));
+        }
+        assert!(self.head_dim % 128 == 0, "fwht K transcode requires head_dim multiple of 128");
+
+        if n_positions == 0 {
+            self.quant_asym4 = false;
+            self.quant_asym2 = true;
+            // quant_fwht stays true.
+            gpu.invalidate_for_kv_mode_switch();
+            return Ok(());
+        }
+
+        let n_kv_heads = self.n_kv_heads;
+        let head_dim = self.head_dim;
+
+        // 1-layer scratch sized to the max real K layer's element count (the K
+        // buffer is floor-sized to fwht2; the live fwht4 records occupy a prefix
+        // of it). Copy layer→scratch (d2d) then transcode scratch→layer
+        // (non-aliasing, crash-safe). Sized once, reused per layer.
+        let src_elems = self.k_gpu.iter().map(|t| t.numel()).filter(|&n| n > 1).max();
+        let scratch = match src_elems {
+            Some(n) => Some(gpu.zeros(&[n], DType::F32)?),
+            None => None,
+        };
+
+        // Free the scratch on EVERY exit path (GpuTensor has no Drop): capture
+        // the first error, break, free, then propagate.
+        let mut pending: HipResult<()> = Ok(());
+        for t in self.k_gpu.iter() {
+            // Skip 1-element placeholder buffers for non-KV layers.
+            if t.numel() <= 1 { continue; }
+            let scratch = scratch.as_ref().unwrap();
+            let nbytes = t.byte_size();
+            pending = gpu.hip.memcpy_dtod(&scratch.buf, &t.buf, nbytes);
+            if pending.is_err() { break; }
+            pending = gpu.transcode_k_fwht4_to_fwht2(t, scratch, n_kv_heads, head_dim, n_positions);
+            if pending.is_err() { break; }
+        }
+
+        if let Some(s) = scratch { let _ = gpu.free_tensor(s); }
+        pending?;
+
+        // Flip the K-mode booleans so the next forward dispatches fwht2
+        // attention. quant_fwht stays true (still FWHT-rotated K).
+        self.quant_asym4 = false;
+        self.quant_asym2 = true;
+        gpu.invalidate_for_kv_mode_switch();
+        Ok(())
     }
 
     /// Q8_0 KV cache that skips allocation for layers flagged as non-KV.

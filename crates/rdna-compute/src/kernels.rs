@@ -2034,6 +2034,8 @@ pub const KV_CACHE_WRITE_FWHT256_4BIT_BATCHED_SRC: &str = include_str!("../../..
 // all positions of one FA layer, higher tier → lower tier).
 pub const KV_TRANSCODE_V_Q8_TO_LLOYD4_SRC: &str = include_str!("../../../kernels/src/kv_transcode_v_q8_to_lloyd4.hip");
 pub const KV_TRANSCODE_V_LLOYD_DOWN_SRC: &str = include_str!("../../../kernels/src/kv_transcode_v_lloyd_down.hip");
+// Adaptive-KV K transcode (fwht4 → fwht2, same-width 128-LUT remap, no FWHT).
+pub const KV_TRANSCODE_K_FWHT4_TO_FWHT2_SRC: &str = include_str!("../../../kernels/src/kv_transcode_k_fwht4_to_fwht2.hip");
 pub const ATTENTION_FLASH_FWHT3_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht3_tile.hip");
 pub const ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht3_tile_batched.hip");
 pub const KV_CACHE_WRITE_ASYM_K_FWHT2_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht2.hip");

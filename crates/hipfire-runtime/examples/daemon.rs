@@ -2400,8 +2400,13 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                         if !kv.quant_asym4 {
                             eprintln!("[daemon] HIPFIRE_KV_ADAPTIVE: adaptive works best with kv_mode=fwht4 (K starts at fwht4); current K mode is not fwht4 — capacity thresholds assume the fwht4 start footprint");
                         }
-                        // Size the V buffer at the floor + upgrade signs to 256.
-                        kv.set_adaptive_floor_alloc(gpu, v_floor).map_err(|e| format!("{e}"))?;
+                        // Size the V buffer at the V floor + K buffer at the K
+                        // floor (so balanced/aggressive actually save K VRAM and
+                        // the K→fwht2 transcode threshold is meaningful) + upgrade
+                        // signs to 256. For k_floor==fwht4 (V-only presets) the K
+                        // footprint equals fwht4 so K is left unresized.
+                        let k_floor_bph = k_floor.bytes_per_head(config.head_dim);
+                        kv.set_adaptive_floor_alloc(gpu, v_floor, k_floor_bph).map_err(|e| format!("{e}"))?;
                         let ad = match preset {
                             Some(p) => KvAdaptive::from_preset(p, max_seq, config.n_kv_heads, config.head_dim),
                             None => KvAdaptive::new(max_seq, config.n_kv_heads, config.head_dim, k_floor, v_floor),

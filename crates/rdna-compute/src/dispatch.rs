@@ -24221,6 +24221,43 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         Ok(())
     }
 
+    /// Adaptive-KV K transcode: re-quantize an existing fwht4 K cache (one FA
+    /// layer, `n_positions` written positions) to fwht2 in place. Same-width
+    /// 128-LUT remap (no FWHT) — see kernels/src/kv_transcode_k_fwht4_to_fwht2.hip.
+    /// `dst`/`src` are SEPARATE buffers (the orchestrator uses a 1-layer scratch).
+    pub fn transcode_k_fwht4_to_fwht2(
+        &mut self, dst: &GpuTensor, src: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize, n_positions: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_transcode_k_fwht4_to_fwht2",
+            kernels::KV_TRANSCODE_K_FWHT4_TO_FWHT2_SRC,
+            "kv_transcode_k_fwht4_to_fwht2",
+        )?;
+        let func = &self.functions["kv_transcode_k_fwht4_to_fwht2"];
+        let mut dp = dst.buf.as_ptr();
+        let mut sp = src.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut np = n_positions as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut np as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [n_kv_heads as u32, n_positions as u32, 1], [32, 1, 1],
+                shared_mem, self.stream_ref(), &mut params,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Batched variant: launch `kv_cache_write_fwht256_4bit_batched` on an arbitrary buffer.
     /// Used for V when v_mode == Lloyd4 in the batched write path.
     pub fn kv_cache_write_v256_4bit_vec_batched(

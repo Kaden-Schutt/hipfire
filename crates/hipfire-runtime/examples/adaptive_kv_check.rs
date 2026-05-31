@@ -37,6 +37,14 @@ const TURBO_C4_256: [f32; 16] = [
     0.007938, 0.024249, 0.041003, 0.058869, 0.078505, 0.101134, 0.129321, 0.170807,
 ];
 
+// 128-dim Lloyd-Max centroids (must match kernels/src/turbo_common.h, the
+// 128-family used by the fwht2/fwht4 K rotation). NOT the _256 family above.
+const TURBO_C2_128: [f32; 4] = [-0.133466, -0.040022, 0.040022, 0.133466];
+const TURBO_C4_128: [f32; 16] = [
+    -0.241565, -0.182875, -0.143012, -0.111016, -0.083262, -0.057983, -0.034295, -0.011225,
+    0.011225, 0.034295, 0.057983, 0.083262, 0.111016, 0.143012, 0.182875, 0.241565,
+];
+
 const N_KV_HEADS: usize = 4;
 const HEAD_DIM: usize = 256;
 const N_LAYERS: usize = 3;
@@ -207,6 +215,152 @@ fn write_lloyd(gpu: &mut Gpu, kv: &KvCache, bits: usize) {
     }
 }
 
+// === K-side helpers (fwht4 / fwht2, 128-wide rotation, 128-LUT family) ===
+
+/// Make a fresh fwht4 K cache (3 layers, all real KV layers). K buffers sized
+/// at the fwht4 footprint (132 B/head @256); 128-wide FWHT signs (seeds 42/1042).
+fn make_k_cache(gpu: &mut Gpu) -> KvCache {
+    let is_kv = vec![true; N_LAYERS];
+    KvCache::new_gpu_fwht4_filtered(gpu, &is_kv, N_KV_HEADS, HEAD_DIM, MAX_SEQ).unwrap()
+}
+
+/// Write the deterministic source into every layer's K buffer via the fused
+/// fwht write at the given K bits (4 or 2). The fused kernel also writes a Q8 V
+/// record into the cache's V buffer (v_mode_bits=8); we ignore V and only
+/// inspect K. Uses the cache's 128-wide FWHT signs.
+fn write_k_fwht(gpu: &mut Gpu, kv: &KvCache, bits: usize) {
+    let s1 = kv.givens_cos.as_ref().unwrap().sub_offset(0, kv.givens_cos.as_ref().unwrap().numel());
+    let s2 = kv.givens_sin.as_ref().unwrap().sub_offset(0, kv.givens_sin.as_ref().unwrap().numel());
+    for layer in 0..N_LAYERS {
+        for p in 0..N_POS {
+            let src = build_pos_src(layer, p);
+            let kt = upload_src(gpu, &src);
+            // Dummy V source (same data); V record is written but never read.
+            let vt = upload_src(gpu, &src);
+            let pb = pos_buf(gpu, p as i32);
+            match bits {
+                4 => gpu
+                    .kv_cache_write_fwht4_fused(
+                        &kv.k_gpu[layer], &kv.v_gpu[layer], &kt, &vt, &pb, &s1, &s2,
+                        N_KV_HEADS, HEAD_DIM, 8,
+                    )
+                    .unwrap(),
+                2 => gpu
+                    .kv_cache_write_fwht2_fused(
+                        &kv.k_gpu[layer], &kv.v_gpu[layer], &kt, &vt, &pb, &s1, &s2,
+                        N_KV_HEADS, HEAD_DIM, 8,
+                    )
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            gpu.hip.device_synchronize().unwrap();
+            let _ = gpu.free_tensor(kt);
+            let _ = gpu.free_tensor(vt);
+            gpu.hip.free(pb).unwrap();
+        }
+    }
+}
+
+/// Dequantize a fwht K buffer (one layer) at the given `bits` tier (4 or 2),
+/// using the 128-LUT family and the K record layout (per 128-wide half:
+/// 32 threads × 4 dims, slot half*4+{0..3}). Returns [pos][head*head_dim + slot]
+/// where `slot` indexes the per-thread post-FWHT coefficient ordering — the
+/// SAME ordering both the fwht4 and fwht2 writers use, so transcoded-vs-direct
+/// compare element-wise.
+fn dequant_k_layer(gpu: &Gpu, buf: &GpuTensor, bits: usize, n_pos: usize) -> Vec<Vec<f32>> {
+    let byte_size = buf.byte_size();
+    let mut raw = vec![0u8; byte_size];
+    gpu.hip.memcpy_dtoh(&mut raw, &buf.buf).unwrap();
+
+    let n_halves = HEAD_DIM / 128;
+    let bph = 4 + (HEAD_DIM * bits) / 8; // fwht4=132, fwht2=68 @256
+    let bpp = N_KV_HEADS * bph;
+    let lut4: &[f32] = &TURBO_C4_128;
+    let lut2: &[f32] = &TURBO_C2_128;
+
+    let mut out = vec![vec![0.0f32; N_KV_HEADS * HEAD_DIM]; n_pos];
+    for p in 0..n_pos {
+        for h in 0..N_KV_HEADS {
+            let rec = p * bpp + h * bph;
+            let cnorm = f32::from_ne_bytes([raw[rec], raw[rec + 1], raw[rec + 2], raw[rec + 3]]);
+            for half in 0..n_halves {
+                for tid in 0..32usize {
+                    let (i0, i1, i2, i3);
+                    if bits == 4 {
+                        // 2 bytes/thread/half at 4 + half*64 + tid*2.
+                        let b = rec + 4 + half * 64 + tid * 2;
+                        i0 = (raw[b] & 0xF) as usize;
+                        i1 = ((raw[b] >> 4) & 0xF) as usize;
+                        i2 = (raw[b + 1] & 0xF) as usize;
+                        i3 = ((raw[b + 1] >> 4) & 0xF) as usize;
+                    } else {
+                        // 1 byte/thread/half at 4 + half*32 + tid.
+                        let b = rec + 4 + half * 32 + tid;
+                        let v = raw[b];
+                        i0 = (v & 0x3) as usize;
+                        i1 = ((v >> 2) & 0x3) as usize;
+                        i2 = ((v >> 4) & 0x3) as usize;
+                        i3 = ((v >> 6) & 0x3) as usize;
+                    }
+                    // Linear slot for this (half, tid, i): the post-FWHT
+                    // coefficient ordering is consistent between the two writers.
+                    let base = (half * 32 + tid) * 4;
+                    let (c0, c1, c2, c3) = if bits == 4 {
+                        (lut4[i0], lut4[i1], lut4[i2], lut4[i3])
+                    } else {
+                        (lut2[i0], lut2[i1], lut2[i2], lut2[i3])
+                    };
+                    out[p][h * HEAD_DIM + base] = cnorm * c0;
+                    out[p][h * HEAD_DIM + base + 1] = cnorm * c1;
+                    out[p][h * HEAD_DIM + base + 2] = cnorm * c2;
+                    out[p][h * HEAD_DIM + base + 3] = cnorm * c3;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Max stored K cnorm across all (layer, pos, head) of a fwht K cache.
+fn max_k_cnorm(gpu: &Gpu, kv: &KvCache, bits: usize) -> f32 {
+    let bph = 4 + (HEAD_DIM * bits) / 8;
+    let bpp = N_KV_HEADS * bph;
+    let mut cmax = 0.0f32;
+    for layer in 0..N_LAYERS {
+        let buf = &kv.k_gpu[layer];
+        let mut raw = vec![0u8; buf.byte_size()];
+        gpu.hip.memcpy_dtoh(&mut raw, &buf.buf).unwrap();
+        for p in 0..N_POS {
+            for h in 0..N_KV_HEADS {
+                let rec = p * bpp + h * bph;
+                let c = f32::from_ne_bytes([raw[rec], raw[rec + 1], raw[rec + 2], raw[rec + 3]]);
+                cmax = cmax.max(c.abs());
+            }
+        }
+    }
+    cmax
+}
+
+fn compare_k_layers(
+    gpu: &Gpu,
+    transcoded: &KvCache,
+    reference: &KvCache,
+    bits: usize,
+) -> (f32, f32, f32) {
+    let mut m = 0.0f32;
+    let mut mean = 0.0f32;
+    let mut frac = 0.0f32;
+    for layer in 0..N_LAYERS {
+        let a = dequant_k_layer(gpu, &transcoded.k_gpu[layer], bits, N_POS);
+        let b = dequant_k_layer(gpu, &reference.k_gpu[layer], bits, N_POS);
+        let (lm, lmean, lfrac) = diag(&a, &b);
+        m = m.max(lm);
+        mean = mean.max(lmean);
+        frac = frac.max(lfrac);
+    }
+    (m, mean, frac)
+}
+
 /// Max abs diff between two dequantized layer-sets.
 fn max_abs_diff(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
     let mut m = 0.0f32;
@@ -359,6 +513,50 @@ fn main() {
         println!(
             "  [lloyd3->lloyd2] max={m:.4e} mean={mean:.4e} frac_diff={frac:.4} (1step×cmax={step_full:.4e})  {}",
             if pass { "PASS" } else { "FAIL" }
+        );
+    }
+
+    // === Case 4: K fwht4 -> fwht2 (same-width 128-LUT remap) ===
+    {
+        let step4_128 = max_gap(&TURBO_C4_128);
+        let step2_128 = max_gap(&TURBO_C2_128);
+        let _ = step4_128;
+
+        // Transcode cache: write K directly at fwht4, then transcode K -> fwht2.
+        let mut trans = make_k_cache(&mut gpu);
+        write_k_fwht(&mut gpu, &trans, 4);
+        gpu.hip.device_synchronize().unwrap();
+        trans.transcode_k_step(&mut gpu, 2, N_POS).unwrap();
+        gpu.hip.device_synchronize().unwrap();
+
+        // Reference cache: write K directly at fwht2 over the same source.
+        let refc = make_k_cache(&mut gpu);
+        write_k_fwht(&mut gpu, &refc, 2);
+        gpu.hip.device_synchronize().unwrap();
+
+        let (m, mean, frac) = compare_k_layers(&gpu, &trans, &refc, 2);
+        let cmax = max_k_cnorm(&gpu, &refc, 2);
+        // The transcode reconstructs from the fwht4 record (one extra 4-bit
+        // rounding vs the direct fwht2 write of the same rotated values), so a
+        // dim can land one 2-bit centroid off at a boundary: bound by ~one
+        // 2-bit step × cnorm. (Direct fwht2 quantizes the exact rotated value;
+        // transcode quantizes the 4-bit-rounded value — they agree except near
+        // a 2-bit decision boundary that the 4-bit rounding nudges across.)
+        let step_full = step2_128 * cmax;
+        let pass = m <= step_full * 1.3 && mean <= step_full * 0.25;
+        all_pass &= pass;
+        println!(
+            "  [K fwht4->fwht2] max={m:.4e} mean={mean:.4e} frac_diff={frac:.4} (1step×cmax={step_full:.4e})  {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        // Verify the K-mode booleans flipped (so the next forward dispatches
+        // the fwht2 attention kernel).
+        let flipped = trans.quant_asym2 && !trans.quant_asym4 && trans.quant_fwht;
+        all_pass &= flipped;
+        println!(
+            "  [K mode flip]    quant_asym2={} quant_asym4={} quant_fwht={}  {}",
+            trans.quant_asym2, trans.quant_asym4, trans.quant_fwht,
+            if flipped { "PASS" } else { "FAIL" }
         );
     }
 
