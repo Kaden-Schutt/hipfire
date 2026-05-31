@@ -238,9 +238,15 @@ fn decode_step_body(
         .map_err(|e| format!("minimax L{l}: rope: {e:?}"))?;
 
         // KV cache write (Q8) + GQA attention. The attention kernel reads the
-        // live KV length from `pos_buf[0]+1`; we pass `state.max_seq` as the
-        // geometry hint (NOT `seq_len`) so the captured launch grid / shared-mem
-        // is sized for the max and stays valid as the cache grows on replay.
+        // live KV length from `pos_buf[0]+1`; pass the ACTUAL `seq_len` as the
+        // geometry hint so the launch sizes its dynamic LDS (`scores[]`) to the
+        // current length — matching qwen35 / llama / lfm2moe. Passing
+        // `state.max_seq` here over-requested LDS = (max_seq+block+head_dim)*4,
+        // which exceeds the 64 KB gfx11 LDS limit at max_seq ≳ 16K (observed:
+        // `hipModuleLaunchKernel: invalid argument` on gfx1151 at max_seq=32768,
+        // fine at 4096). Graph-capture sizing is handled separately by the
+        // dispatch's `capture_mode` branch (sizes to `physical_cap`), so the
+        // non-capture hint must be the real length, not the max.
         gpu.kv_cache_write_q8_0(&state.kv.k_gpu[l], &state.fa_k, &state.pos_buf,
             cfg.num_key_value_heads, cfg.head_dim)
             .map_err(|e| format!("minimax L{l}: kv write k: {e:?}"))?;
@@ -249,7 +255,7 @@ fn decode_step_body(
             .map_err(|e| format!("minimax L{l}: kv write v: {e:?}"))?;
         gpu.attention_q8_0_kv(
             &state.fa_q, &state.kv.k_gpu[l], &state.kv.v_gpu[l], &state.fa_attn_out,
-            &state.pos_buf, state.max_seq, cfg.num_attention_heads, cfg.num_key_value_heads,
+            &state.pos_buf, seq_len, cfg.num_attention_heads, cfg.num_key_value_heads,
             cfg.head_dim, state.kv.physical_cap,
         )
         .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
