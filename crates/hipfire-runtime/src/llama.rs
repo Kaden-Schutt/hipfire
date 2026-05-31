@@ -619,7 +619,7 @@ pub fn weight_gemv(
 ) -> HipResult<()> {
     match w.gpu_dtype {
         DType::F32 => gpu.gemv_f32(&w.buf, x, y),
-        DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, 1),
+        DType::F16 => gpu.gemv_f16_xf32(&w.buf, x, y, w.m, w.k),
         DType::Q4K => gpu.gemv_q4k(&w.buf, x, y, w.m, w.k),
         DType::Q6K => gpu.gemv_q6k(&w.buf, x, y, w.m, w.k),
         DType::Q8_0 => gpu.gemv_q8_0(&w.buf, x, y, w.m, w.k),

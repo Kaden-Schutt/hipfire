@@ -6,7 +6,7 @@
 //! Feature-gated behind `deltanet`.
 
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
-use hipfire_runtime::llama::{self, f16_to_f32, EmbeddingFormat, ParoRotation, WeightTensor,
+use hipfire_runtime::llama::{self, f16_to_f32, f32_to_f16, EmbeddingFormat, ParoRotation, WeightTensor,
                               weight_gemv, weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
                               fused_rmsnorm_rotate_for_paro,
                               fused_rmsnorm_rotate_mq_batched_for,
@@ -997,6 +997,32 @@ fn qwen35_tensor_data<'a>(hfq: &'a HfqFile, name: &str) -> Option<(&'a HfqTensor
     None
 }
 
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+fn bf16_bytes_to_f32(data: &[u8]) -> Vec<f32> {
+    data.chunks_exact(2)
+        .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect()
+}
+
+fn bf16_bytes_to_f16_bytes(data: &[u8]) -> Vec<u8> {
+    bf16_bytes_to_f32(data)
+        .into_iter()
+        .flat_map(|v| f32_to_f16(v).to_le_bytes())
+        .collect()
+}
+
+fn hfq_plain_tensor_as_f32(info: &HfqTensorInfo, data: &[u8], name: &str) -> Vec<f32> {
+    match info.quant_type {
+        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        16 => bf16_bytes_to_f32(data),
+        _ => panic!("expected F16/F32/BF16 for {name}, got qt={}", info.quant_type),
+    }
+}
+
 /// Load norm weight for Qwen3.5: stored as offset from 1.0 (output = x * (1 + weight))
 ///
 /// TODO(transformer-extraction): cross-arch duplicate. The Qwen2 variant
@@ -1009,11 +1035,7 @@ fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -
     let (info, data) = qwen35_tensor_data_vec(hfq, name)
         .unwrap_or_else(|| panic!("tensor not found: {name}"));
 
-    let mut f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
-    };
+    let mut f32_data = hfq_plain_tensor_as_f32(info, &data, name);
     // Qwen3.5 RMSNorm: output = x * rsqrt(var+eps) * (1 + weight)
     for v in &mut f32_data { *v += 1.0; }
     gpu.upload_f32(&f32_data, shape)
@@ -1025,11 +1047,7 @@ fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -
 fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
     let (info, data) = qwen35_tensor_data_vec(hfq, name)
         .unwrap_or_else(|| panic!("tensor not found: {name}"));
-    let f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
-    };
+    let f32_data = hfq_plain_tensor_as_f32(info, &data, name);
     gpu.upload_f32(&f32_data, shape)
 }
 
@@ -1126,6 +1144,10 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
+        2 => {
+            let buf = gpu.upload_raw(data, &[m, k])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
         1 => match f16_lm_head_mode_from_env() {
             F16LmHeadMode::Native => {
                 // qt=1 is F16. Keep raw F16 on GPU (previously decompressed
@@ -1147,7 +1169,12 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
                 Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None, awq_scale: None })
             }
         },
-        _ => panic!("unsupported quant_type {} for lm_head", quant_type),
+        16 => {
+            let f16_data = bf16_bytes_to_f16_bytes(data);
+            let buf = gpu.upload_raw(&f16_data, &[f16_data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        _ => panic!("unsupported quant_type {} for qwen35 weight", quant_type),
     }
 }
 
@@ -11634,7 +11661,21 @@ pub fn forward_prefill_batch_multi(
                     && is_batchable_la(l.w_gate.gpu_dtype, arch0)
                     && is_batchable_la(l.w_up.gpu_dtype, arch0)
                     && is_batchable_la(l.w_down.gpu_dtype, arch0),
-            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => moe_topk_ok,
+            LayerWeights::DeltaNetMoe(l) =>
+                moe_topk_ok
+                    && is_batchable_la(l.wqkv.gpu_dtype, arch0)
+                    && is_batchable_la(l.wz.gpu_dtype, arch0)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch0)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch0)
+                    && is_batchable_la(l.wo.gpu_dtype, arch0)
+                    && moe_ffn_batched_admissible(&l.ffn),
+            LayerWeights::FullAttnMoe(l) =>
+                moe_topk_ok
+                    && is_batchable_la(l.wq.gpu_dtype, arch0)
+                    && is_batchable_la(l.wk.gpu_dtype, arch0)
+                    && is_batchable_la(l.wv.gpu_dtype, arch0)
+                    && is_batchable_la(l.wo.gpu_dtype, arch0)
+                    && moe_ffn_batched_admissible(&l.ffn),
         });
 
     if !eligible {
@@ -11848,6 +11889,16 @@ mod tests {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.shared_expert_down = DType::MQ3G256;
         assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+    }
+
+    #[test]
+    fn moe_prefill_rejects_full_precision_until_batched_kernels_exist() {
+        let dtypes = MoePrefillDtypes::uniform(DType::F16);
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false));
+
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.router = DType::F16;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false));
     }
 
     #[test]
