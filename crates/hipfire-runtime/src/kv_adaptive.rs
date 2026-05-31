@@ -41,6 +41,78 @@ pub fn budget_bytes_per_layer(max_seq: usize, n_kv_heads: usize, head_dim: usize
     max_seq * n_kv_heads * (k_floor.bytes_per_head(head_dim) + v_bytes_per_head(v_floor, head_dim))
 }
 
+/// One downshift step: drop ONE cache by one tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step { V(VMode), K(KMode) }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preset { Conservative, Balanced, Aggressive }
+
+pub struct KvAdaptive {
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub budget_bytes_per_layer: usize,
+    pub cur_k: KMode,
+    pub cur_v: VMode,
+    pub steps: Vec<Step>,        // ordered remaining steps
+    pub next_step: usize,        // index into steps
+    pub thresholds: Vec<usize>,  // seq_pos at which steps[i] fires
+    pub margin: usize,           // fire this many tokens before the cap
+}
+
+impl KvAdaptive {
+    /// Build the default `balanced` step order: V q8→l4→l3, K f4→f2, V l3→l2.
+    /// (Keeps the K/V bit-gap ≤ 1 tier; finalized empirically in Task 8.)
+    fn balanced_steps(k_floor: KMode, v_floor: VMode) -> Vec<Step> {
+        let mut s = Vec::new();
+        // descend V to lloyd3 first (biggest byte win up front)
+        if v_floor != VMode::Q8 { s.push(Step::V(VMode::Lloyd4)); }
+        if matches!(v_floor, VMode::Lloyd3 | VMode::Lloyd2) { s.push(Step::V(VMode::Lloyd3)); }
+        // K step (cheap same-width fwht4→fwht2) once V is at lloyd3
+        if k_floor == KMode::Fwht2 { s.push(Step::K(KMode::Fwht2)); }
+        else if k_floor == KMode::Fwht3 { s.push(Step::K(KMode::Fwht3)); }
+        // final V step to the floor
+        if v_floor == VMode::Lloyd2 { s.push(Step::V(VMode::Lloyd2)); }
+        s
+    }
+
+    pub fn from_preset(p: Preset, max_seq: usize, n_kv_heads: usize, head_dim: usize) -> Self {
+        let (k_floor, v_floor) = match p {
+            Preset::Conservative => (KMode::Fwht4, VMode::Lloyd4),
+            Preset::Balanced     => (KMode::Fwht2, VMode::Lloyd2),
+            Preset::Aggressive   => (KMode::Fwht2, VMode::Lloyd2),
+        };
+        Self::new(max_seq, n_kv_heads, head_dim, k_floor, v_floor)
+    }
+
+    /// Advanced: caller picks K and V floors independently.
+    pub fn new(max_seq: usize, n_kv_heads: usize, head_dim: usize,
+               k_floor: KMode, v_floor: VMode) -> Self {
+        let budget = budget_bytes_per_layer(max_seq, n_kv_heads, head_dim, k_floor, v_floor);
+        let steps = Self::balanced_steps(k_floor, v_floor);
+        let mut s = Self {
+            n_kv_heads, head_dim, budget_bytes_per_layer: budget,
+            cur_k: KMode::Fwht4, cur_v: VMode::Q8, steps, next_step: 0,
+            thresholds: Vec::new(), margin: 64,
+        };
+        s.recompute_thresholds();
+        s
+    }
+
+    /// threshold[i] = cap(state AFTER applying steps[0..=i-1]) - margin,
+    /// i.e. the seq_pos at which we must apply steps[i] before overflowing the
+    /// cap of the CURRENT (pre-step-i) tier.
+    fn recompute_thresholds(&mut self) {
+        let mut k = KMode::Fwht4; let mut v = VMode::Q8;
+        self.thresholds.clear();
+        for st in &self.steps {
+            let cap = cap_tokens(self.budget_bytes_per_layer, self.n_kv_heads, self.head_dim, k, v);
+            self.thresholds.push(cap.saturating_sub(self.margin));
+            match *st { Step::V(nv) => v = nv, Step::K(nk) => k = nk }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,5 +141,25 @@ mod tests {
         assert!(c_floor > c_start * 2, "floor should fit >2x start ({c_floor} vs {c_start})");
         // design table: start K4/q8 ≈ 0.337*max_seq
         assert!((330..=345).contains(&c_start), "start cap {c_start}");
+    }
+    #[test]
+    fn balanced_pattern_shape() {
+        let a = KvAdaptive::from_preset(Preset::Balanced, 10_000, 4, 256);
+        assert_eq!(a.steps, vec![
+            Step::V(VMode::Lloyd4), Step::V(VMode::Lloyd3),
+            Step::K(KMode::Fwht2), Step::V(VMode::Lloyd2),
+        ]);
+        // thresholds strictly increasing (each tier fits more before the next shift)
+        for w in a.thresholds.windows(2) { assert!(w[1] > w[0], "thresholds {:?}", a.thresholds); }
+    }
+    #[test]
+    fn conservative_only_v_to_lloyd4() {
+        let a = KvAdaptive::from_preset(Preset::Conservative, 10_000, 4, 256);
+        assert_eq!(a.steps, vec![Step::V(VMode::Lloyd4)]);
+    }
+    #[test]
+    fn advanced_k_fwht3_floor() {
+        let a = KvAdaptive::new(10_000, 4, 256, KMode::Fwht3, VMode::Lloyd2);
+        assert!(a.steps.contains(&Step::K(KMode::Fwht3)));
     }
 }
