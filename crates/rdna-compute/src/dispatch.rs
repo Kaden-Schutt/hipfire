@@ -3198,15 +3198,6 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to `paro4g128t_rotate` which binds
         self.paro4g128t_rotate(a_raw, x, x_rot, m, k)?;
-        if std::env::var_os("HIPFIRE_PARO_PACK1").is_some() {
-            return self.gemv_paro4g128t_prerotated_pack1(a_raw, x_rot, y, m, k);
-        }
-        if std::env::var_os("HIPFIRE_PARO_PACK2").is_some() {
-            return self.gemv_paro4g128t_prerotated_pack2(a_raw, x_rot, y, m, k);
-        }
-        if std::env::var_os("HIPFIRE_PARO_PACK4").is_some() {
-            return self.gemv_paro4g128t_prerotated_pack4(a_raw, x_rot, y, m, k);
-        }
         self.gemv_paro4g128t_prerotated(a_raw, x_rot, y, m, k)
     }
 
@@ -3222,15 +3213,6 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to `paro4g128t_rotate` which binds
         self.paro4g128t_rotate(a_raw, x, x_rot, m, k)?;
-        if std::env::var_os("HIPFIRE_PARO_PACK1").is_some() {
-            return self.gemv_paro4g128t_prerotated_residual_pack1(a_raw, x_rot, y, m, k);
-        }
-        if std::env::var_os("HIPFIRE_PARO_PACK2").is_some() {
-            return self.gemv_paro4g128t_prerotated_residual_pack2(a_raw, x_rot, y, m, k);
-        }
-        if std::env::var_os("HIPFIRE_PARO_PACK4").is_some() {
-            return self.gemv_paro4g128t_prerotated_residual_pack4(a_raw, x_rot, y, m, k);
-        }
         self.gemv_paro4g128t_prerotated_residual(a_raw, x_rot, y, m, k)
     }
 
@@ -3247,15 +3229,6 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to `paro4g128t_swiglu_rotate` which binds
         self.paro4g128t_swiglu_rotate(a_raw, gate, up, x_rot, m, k)?;
-        if std::env::var_os("HIPFIRE_PARO_PACK1").is_some() {
-            return self.gemv_paro4g128t_prerotated_residual_pack1(a_raw, x_rot, y, m, k);
-        }
-        if std::env::var_os("HIPFIRE_PARO_PACK2").is_some() {
-            return self.gemv_paro4g128t_prerotated_residual_pack2(a_raw, x_rot, y, m, k);
-        }
-        if std::env::var_os("HIPFIRE_PARO_PACK4").is_some() {
-            return self.gemv_paro4g128t_prerotated_residual_pack4(a_raw, x_rot, y, m, k);
-        }
         self.gemv_paro4g128t_prerotated_residual(a_raw, x_rot, y, m, k)
     }
 
@@ -3293,20 +3266,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             x_rot_up.buf.size() / 4
         );
 
-        let shared_pairs = std::env::var_os("HIPFIRE_PARO_SHARED_PAIRS").is_some();
-        let rotate_kernel = if shared_pairs {
-            "paro4g128t_dual_rotate_shared_pairs"
-        } else {
-            "paro4g128t_dual_rotate"
-        };
-        let use_pack2 = std::env::var_os("HIPFIRE_PARO_FUSED_PACK2").is_some();
-        let gemv_kernel = if use_pack2 {
-            "fused_gate_up_paro4g128t_pack2"
-        } else {
-            "fused_gate_up_paro4g128t_pack4"
-        };
-        self.ensure_kernel("gemv_paro4g128", kernels::GEMV_PARO4G128_SRC, rotate_kernel)?;
-        self.ensure_kernel("gemv_paro4g128", kernels::GEMV_PARO4G128_SRC, gemv_kernel)?;
+        self.ensure_kernel("gemv_paro4g128", kernels::GEMV_PARO4G128_SRC, "paro4g128t_dual_rotate")?;
+        self.ensure_kernel("gemv_paro4g128", kernels::GEMV_PARO4G128_SRC, "fused_gate_up_paro4g128t_pack4")?;
 
         let ag = a_gate.buf.as_ptr();
         let au = a_up.buf.as_ptr();
@@ -3327,10 +3288,10 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             &k_val as *const _ as *mut c_void,
         ];
         let rotate_bytes = crate::profile::paro4g128t_rotate_bytes(m, k) * 2;
-        let rotate_timer = crate::profile::begin_timer(&self.hip, "format", rotate_kernel, rotate_bytes);
+        let rotate_timer = crate::profile::begin_timer(&self.hip, "format", "paro4g128t_dual_rotate", rotate_bytes);
         let rotate_result = self.launch_maybe_blob(
-            rotate_kernel,
-            [groups, if shared_pairs { 1 } else { 2 }, 1],
+            "paro4g128t_dual_rotate",
+            [groups, 2, 1],
             [32, 1, 1],
             0,
             &mut rotate_params,
@@ -3359,12 +3320,11 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
-        let pack_multiplier = if use_pack2 { 8 } else { 4 };
-        let gemv_bytes = crate::profile::gemv_paro4g128_prerotated_bytes(m, k) * pack_multiplier;
-        let gemv_timer = crate::profile::begin_timer(&self.hip, "gemv", gemv_kernel, gemv_bytes);
+        let gemv_bytes = crate::profile::gemv_paro4g128_prerotated_bytes(m, k) * 4;
+        let gemv_timer = crate::profile::begin_timer(&self.hip, "gemv", "fused_gate_up_paro4g128t_pack4", gemv_bytes);
         let gemv_result = self.launch_maybe_blob(
-            gemv_kernel,
-            [(m / if use_pack2 { 2 } else { 4 }) as u32, 2, 1],
+            "fused_gate_up_paro4g128t_pack4",
+            [(m / 4) as u32, 2, 1],
             [32, 1, 1],
             0,
             &mut gemv_params,
@@ -3423,20 +3383,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 scratch.buf.size() / 4
             );
         }
-        let shared_pairs = std::env::var_os("HIPFIRE_PARO_SHARED_PAIRS").is_some();
-        let rotate_kernel = if shared_pairs {
-            "paro4g128t_quad_rotate_shared_pairs"
-        } else {
-            "paro4g128t_quad_rotate"
-        };
-        let use_pack2 = std::env::var_os("HIPFIRE_PARO_FUSED_PACK2").is_some();
-        let gemv_kernel = if use_pack2 {
-            "fused_qkvza_paro4g128t_pack2"
-        } else {
-            "fused_qkvza_paro4g128t_pack4"
-        };
-        self.ensure_kernel("gemv_paro4g128", kernels::GEMV_PARO4G128_SRC, rotate_kernel)?;
-        self.ensure_kernel("gemv_paro4g128", kernels::GEMV_PARO4G128_SRC, gemv_kernel)?;
+        self.ensure_kernel("gemv_paro4g128", kernels::GEMV_PARO4G128_SRC, "paro4g128t_quad_rotate")?;
+        self.ensure_kernel("gemv_paro4g128", kernels::GEMV_PARO4G128_SRC, "fused_qkvza_paro4g128t_pack4")?;
 
         let a0p = a0.buf.as_ptr();
         let a1p = a1.buf.as_ptr();
@@ -3478,10 +3426,10 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             + crate::profile::paro4g128t_rotate_bytes(m1, k)
             + crate::profile::paro4g128t_rotate_bytes(m2, k)
             + crate::profile::paro4g128t_rotate_bytes(m3, k);
-        let rotate_timer = crate::profile::begin_timer(&self.hip, "format", rotate_kernel, rotate_bytes);
+        let rotate_timer = crate::profile::begin_timer(&self.hip, "format", "paro4g128t_quad_rotate", rotate_bytes);
         let rotate_result = self.launch_maybe_blob(
-            rotate_kernel,
-            [groups, if shared_pairs { 1 } else { 4 }, 1],
+            "paro4g128t_quad_rotate",
+            [groups, 4, 1],
             [32, 1, 1],
             0,
             &mut rotate_params,
@@ -3520,16 +3468,15 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             &kv as *const _ as *mut c_void,
         ];
         let max_m = m0.max(m1).max(m2).max(m3);
-        let pack_multiplier = if use_pack2 { 4 } else { 2 };
         let gemv_bytes = (crate::profile::gemv_paro4g128_prerotated_bytes(m0, k)
             + crate::profile::gemv_paro4g128_prerotated_bytes(m1, k)
             + crate::profile::gemv_paro4g128_prerotated_bytes(m2, k)
             + crate::profile::gemv_paro4g128_prerotated_bytes(m3, k))
-            * pack_multiplier;
-        let gemv_timer = crate::profile::begin_timer(&self.hip, "gemv", gemv_kernel, gemv_bytes);
+            * 4;
+        let gemv_timer = crate::profile::begin_timer(&self.hip, "gemv", "fused_qkvza_paro4g128t_pack4", gemv_bytes);
         let gemv_result = self.launch_maybe_blob(
-            gemv_kernel,
-            [(max_m / if use_pack2 { 2 } else { 4 }) as u32, 4, 1],
+            "fused_qkvza_paro4g128t_pack4",
+            [(max_m / 4) as u32, 4, 1],
             [32, 1, 1],
             0,
             &mut gemv_params,
