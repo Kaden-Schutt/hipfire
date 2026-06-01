@@ -2251,6 +2251,8 @@ pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_SRC: &str = include_str!("../.
 /// v_chunks per K-tile, keeping LDS at 25.6 KB (2 WG/CU occupancy).
 /// Grid=[n_heads, ceil(B/64)], block=[128] (4 waves).
 pub const ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V5_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n32_f16kv_v5_f32.hip");
+/// gfx12/RDNA4 sibling of the dots.ocr v5 vision attention kernel.
+pub const ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V5_GFX12_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n32_f16kv_v5_f32.gfx12.hip");
 
 /// Causal variant of v3 (M=64, N=128, f16 K/V). Adds causal mask:
 /// S[q, k] = -inf when k > q. Skips entirely-masked tiles. Grid
@@ -2549,6 +2551,8 @@ pub const GEMM_F16_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_f16_
 pub const GEMM_F16_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_f16_wmma_mb4.hip");
 /// MB=8: 8 N-subtiles per block (128 N-cols). Grid=[ceil(M/16), ceil(N/128)], block=[32].
 pub const GEMM_F16_WMMA_MB8_SRC: &str = include_str!("../../../kernels/src/gemm_f16_wmma_mb8.hip");
+/// gfx12/RDNA4 sibling of the MB=8 fused-transpose F16 WMMA GEMM.
+pub const GEMM_F16_WMMA_MB8_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_f16_wmma_mb8.gfx12.hip");
 /// Tiled F16 GEMM with shared memory (no WMMA dependency, works on all RDNA).
 /// ~5-10x faster than naive gemm_f16 via LDS data reuse. Tile size 64K.
 pub const GEMM_F16_TILED_SRC: &str = include_str!("../../../kernels/src/gemm_f16_tiled.hip");
