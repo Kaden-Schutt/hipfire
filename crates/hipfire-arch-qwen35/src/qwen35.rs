@@ -5347,6 +5347,16 @@ fn moe_ffn_decode_impl(
         .first()
         .map(|e| e.gate_up.gpu_dtype == DType::MQ6G256)
         .unwrap_or(false);
+    let routed_mq2_lloyd = ffn
+        .experts
+        .first()
+        .map(|e| e.down.gpu_dtype == DType::MQ2G256Lloyd)
+        .unwrap_or(false);
+    let routed_gate_up_mq2_lloyd = ffn
+        .experts
+        .first()
+        .map(|e| e.gate_up.gpu_dtype == DType::MQ2G256Lloyd)
+        .unwrap_or(false);
     // ParoQuant routed-expert eligibility. shisa-Qwen3.6-A3B-PARO and
     // friends carry ParoQ4G128 routed experts whose pairs/theta/channel_scales
     // are shared across all 256 experts via `ffn.paro_shared`. The indexed
@@ -5368,14 +5378,17 @@ fn moe_ffn_decode_impl(
         && ffn.paro_shared.is_some();
     // The indexed gate_up and down kernels live in separate dtype families;
     // we require the routed gate_up and down dtypes to match (i.e., both
-    // MQ4, both MQ6, or both ParoQ4G128) so the rotated x_rot_local feeds
+    // MQ4, both MQ6, both MQ2-Lloyd, or both ParoQ4G128) so the rotated x_rot_local feeds
     // both consistently. Mixed gate_up/down within a layer is not produced
     // by the quantizer.
     let routed_dtype_indexable_mq4 = routed_mq4 && routed_gate_up_mq4;
     let routed_dtype_indexable_mq6 = routed_mq6 && routed_gate_up_mq6;
+    let routed_dtype_indexable_mq2_lloyd = routed_mq2_lloyd && routed_gate_up_mq2_lloyd;
     let routed_dtype_indexable_paro = routed_paro && routed_gate_up_paro;
-    let routed_dtype_indexable =
-        routed_dtype_indexable_mq4 || routed_dtype_indexable_mq6 || routed_dtype_indexable_paro;
+    let routed_dtype_indexable = routed_dtype_indexable_mq4
+        || routed_dtype_indexable_mq6
+        || routed_dtype_indexable_mq2_lloyd
+        || routed_dtype_indexable_paro;
     // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
     // device and the indexed MoE kernels consume topk_indices /
     // topk_weights directly — no D2H sync, hipGraph-capture-safe.
@@ -5388,8 +5401,11 @@ fn moe_ffn_decode_impl(
     // promoted to MQ6 dispatch through the HFQ6 indexed kernels instead
     // of the HFQ4 ones — same control flow, different kernel binary.
     let use_gpu_topk = k == 8 && routed_dtype_indexable;
-    let needs_x_rot_local =
-        gate_side_mq4 || routed_gate_up_mq4 || routed_gate_up_mq6 || routed_gate_up_paro;
+    let needs_x_rot_local = gate_side_mq4
+        || routed_gate_up_mq4
+        || routed_gate_up_mq6
+        || routed_gate_up_mq2_lloyd
+        || routed_gate_up_paro;
     let x_rot_local = if needs_x_rot_local {
         if !routed_gate_up_paro {
             // FWHT-rotated path needs the MQ sign LUT.
@@ -5591,7 +5607,7 @@ fn moe_ffn_decode_impl(
         // the fixed-order `moe_down_combine_k8_batched` makes the MoE FFN
         // output byte-deterministic, eliminating the cumulative drift.
         let xr = x_rot_local.expect(
-            "use_gpu_topk implies routed_gate_up_{mq4,mq6,paro} implies x_rot_local is Some",
+            "use_gpu_topk implies routed_gate_up_{mq4,mq6,mq2_lloyd,paro} implies x_rot_local is Some",
         );
         let down_m = ffn.experts[0].down.m;
         let down_k = ffn.experts[0].down.k;
@@ -5621,6 +5637,17 @@ fn moe_ffn_decode_impl(
                 s.up_batch,
                 2 * mi,
                 gate_up_k,
+            )?;
+        } else if routed_dtype_indexable_mq2_lloyd {
+            gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+                &ffn.expert_gate_up_ptrs,
+                s.topk_indices,
+                xr,
+                s.gate_batch,
+                s.up_batch,
+                2 * mi,
+                gate_up_k,
+                k,
             )?;
         } else {
             // routed_dtype_indexable_paro — HFQ4G128 (72 B/group) indexed
@@ -5690,6 +5717,17 @@ fn moe_ffn_decode_impl(
             )?;
         } else if routed_dtype_indexable_mq6 {
             gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                &ffn.expert_down_ptrs,
+                s.topk_indices,
+                s.rot_batch,
+                s.down_expanded,
+                down_m,
+                down_k,
+                k,
+                1,
+            )?;
+        } else if routed_dtype_indexable_mq2_lloyd {
+            gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
                 &ffn.expert_down_ptrs,
                 s.topk_indices,
                 s.rot_batch,
