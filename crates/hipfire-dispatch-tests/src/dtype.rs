@@ -128,3 +128,12 @@ fn post_rotation_variant_paro_is_plain_mq_is_prerotated() {
     assert_eq!(dtype_post_rotation_variant(DType::MQ4G128), GemvVariant::Prerotated);
     assert_eq!(dtype_post_rotation_variant(DType::HFQ4G256), GemvVariant::Plain);
 }
+
+#[test]
+fn q8hfq_resolves_to_plain_gemv_key() {
+    use hipfire_dispatch::types::{KernelKey, GemvVariant};
+    use rdna_compute::DType;
+    let key = KernelKey::for_gemv(DType::Q8HFQ, GemvVariant::Plain, false)
+        .expect("Q8HFQ Plain must resolve");
+    assert_eq!(key, KernelKey::GemvQ8HFQ);
+}

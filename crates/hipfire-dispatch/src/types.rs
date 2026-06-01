@@ -128,6 +128,7 @@ pub enum KernelKey {
     GemvParoQ4G128,
     GemvQ4F16G64,
     GemvQ4F16G32,
+    GemvQ8HFQ,
     // GEMV prerotated
     GemvMq4G256Prerotated,
     GemvMq3G256Prerotated,
@@ -351,6 +352,7 @@ impl KernelKey {
             (ParoQ4G128, Plain) => Ok(Self::GemvParoQ4G128),
             (Q4F16G64, Plain) => Ok(Self::GemvQ4F16G64),
             (Q4F16G32, Plain) => Ok(Self::GemvQ4F16G32),
+            (Q8HFQ, Plain) => Ok(Self::GemvQ8HFQ),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv", variant: "unknown",
                 arch: "", quant: "",
