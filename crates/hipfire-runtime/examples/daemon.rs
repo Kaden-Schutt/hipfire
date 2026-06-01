@@ -1975,6 +1975,36 @@ fn main() {
                 if has_image && !has_vl {
                     write_error(&mut stdout, id, "model has no vision encoder");
                 } else if has_image && has_vl {
+                    // DEFENSIVE: VL is single-image, single-turn only. The
+                    // CLI rejects images in non-last turns, but a raw
+                    // JSONL client could send a second image on turn 2+.
+                    // If seq_pos > 0 here, a previous conversation's KV
+                    // entries are live — running vision_forward and
+                    // splicing visual tokens into that context would
+                    // produce garbage. Force a reset so VL always starts
+                    // from a clean KV state.
+                    //
+                    // Must mirror the "reset" command handler (line ~2098).
+                    // VL only runs on qwen35-vl (arch_id 5/8), so
+                    // qwen2_state, deepseek4_state, and llama_kv are
+                    // None — but clear them anyway for defense-in-depth
+                    // in case a future arch adds VL support.
+                    if m.seq_pos > 0 {
+                        eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
+                        m.seq_pos = 0;
+                        m.conversation_tokens.clear();
+                        m.prefill_checkpoints.clear();
+                        m.dflash_checkpoints.clear();
+                        if let Some(ref dn) = m.dn_state {
+                            for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                            for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                            for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                        }
+                        if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
+                        if let Some(kv) = m.llama_kv.as_mut() { kv.compact_offset = 0; }
+                        if let Some(ref mut s) = m.qwen2_state { s.reset(); }
+                        if let Some(ref mut s) = m.deepseek4_state { s.reset(); }
+                    }
                     if image_base64.is_some() && image.is_some() {
                         eprintln!("[daemon/vl] both image and image_base64 provided — using image_base64");
                     }
@@ -8405,6 +8435,12 @@ fn generate_qwen2(
 }
 
 fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, params: &GenerateVLParams) {
+    // INVARIANT: all early returns before the `vision_forward` call (the
+    // first expensive GPU allocation in this function) use `write_error`
+    // and return without owning any GPU buffers. If you add a GPU
+    // allocation above this line, you MUST clean it up on every early
+    // return path — the current early returns are safe because they
+    // only hold CPU-side data (tokenizer refs, preprocess output).
     let GenerateVLParams { id, prompt, system_prompt, ref image_source, temp, top_p, max_tokens, repeat_penalty, repeat_window, max_think_tokens } = *params;
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
@@ -8647,8 +8683,13 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let mut generated = 0;
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut emitted_bytes = 0usize;
-    let mut think_count: usize = 0;
-    let mut prev_in_think: bool = false;
+    // Think-depth tracking via token IDs (not UTF-8 rfind).
+    // The previous implementation decoded the full streamed output to a
+    // string and ran rfind on every token — O(N²) total, fragile to
+    // tokenizer changes. Since `think_pair` already gives us the
+    // open/close token IDs, we can track depth incrementally in O(1).
+    let mut think_depth: usize = 0; // number of unmatched opens seen
+    let mut think_count: usize = 0;  // tokens emitted while depth > 0
 
     // N-gram loop detector — mirrors the text path. Catches answer-phase
     // attractor loops that the think cap and repeat penalty miss.
@@ -8706,59 +8747,58 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &vl_cfg);
 
         if max_think_tokens > 0 {
-            let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-            let open_idx = raw_str.rfind("<think>");
-            let close_idx = raw_str.rfind("</think>");
-            let in_think = match (open_idx, close_idx) {
-                (Some(o), Some(c)) => o > c,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            if in_think {
-                if !prev_in_think { think_count = 1; } else { think_count += 1; }
-            } else {
-                think_count = 0;
-            }
-            prev_in_think = in_think;
+            if let Some((open, close)) = think_pair {
+                // Incremental think-depth tracking via token IDs — O(1)
+                // per token instead of the previous O(N²) decode+rfind.
+                if next_token == open {
+                    think_depth += 1;
+                    think_count = 1;
+                } else if next_token == close {
+                    think_depth = think_depth.saturating_sub(1);
+                    if think_depth == 0 { think_count = 0; }
+                } else if think_depth > 0 {
+                    think_count += 1;
+                }
 
-            if in_think && think_count >= max_think_tokens {
-                let close_tokens = tokenizer.encode("</think>\n");
-                let budget_left = max_tokens.saturating_sub(generated);
-                let take = close_tokens.len().min(budget_left);
-                for &t in &close_tokens[..take] {
-                    qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
-                    m.seq_pos += 1;
-                    if let Some(ref ev) = m.eviction {
-                        if let Some(hipfire_runtime::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
-                            m.seq_pos = new_phys;
+                if think_depth > 0 && think_count >= max_think_tokens {
+                    let close_tokens = tokenizer.encode("</think\n");
+                    let budget_left = max_tokens.saturating_sub(generated);
+                    let take = close_tokens.len().min(budget_left);
+                    for &t in &close_tokens[..take] {
+                        qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
+                        m.seq_pos += 1;
+                        if let Some(ref ev) = m.eviction {
+                            if let Some(hipfire_runtime::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                                m.seq_pos = new_phys;
+                            }
                         }
-                    }
-                    m.conversation_tokens.push(t);
-                    streamed_tokens.push(t);
+                        m.conversation_tokens.push(t);
+                        streamed_tokens.push(t);
 
-                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                    let new_bytes = &all_bytes[emitted_bytes..];
-                    let vl = match std::str::from_utf8(new_bytes) {
-                        Ok(_) => new_bytes.len(),
-                        Err(e) => e.valid_up_to(),
-                    };
-                    if vl > 0 {
-                        let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
-                        let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
-                        let _ = stdout.flush();
-                        emitted_bytes += vl;
+                        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                        let new_bytes = &all_bytes[emitted_bytes..];
+                        let vl = match std::str::from_utf8(new_bytes) {
+                            Ok(_) => new_bytes.len(),
+                            Err(e) => e.valid_up_to(),
+                        };
+                        if vl > 0 {
+                            let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+                            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                            let _ = stdout.flush();
+                            emitted_bytes += vl;
+                        }
+                        generated += 1;
                     }
-                    generated += 1;
-                }
-                think_count = 0;
-                prev_in_think = false;
-                if generated >= max_tokens { break; }
-                logits = gpu.download_f32(&scratch.logits).unwrap();
-                if let Some((open, close)) = think_pair {
+                    think_count = 0;
+                    think_depth = 0; // Must reset — the close tokens
+                    // above bypass the incremental tracker, so depth
+                    // is still > 0 here. Without this, any subsequent
+                    // non-open/close token would re-trigger the cap.
+                    if generated >= max_tokens { break; }
+                    logits = gpu.download_f32(&scratch.logits).unwrap();
                     block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
+                    next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &vl_cfg);
                 }
-                next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &vl_cfg);
             }
         }
     }
