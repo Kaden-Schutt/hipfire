@@ -1332,41 +1332,6 @@ fn load_paroquant_weight(
 
 /// Load an FP16 weight and encode it into MQ4G128 byte layout at load time.
 /// Used by `paro_load_wt` for LinearAttention `in_proj_a` / `in_proj_b` weights
-/// (alpha/beta) when the PARO checkpoint doesn't include them in the calibrated
-/// set AND the per-arch/env gating chose the MQ4G128 path.
-///
-/// At decode time, the weight routes through `gemv_mq4g128_prerotated` which
-/// applies FWHT-128 to the activation (via `rotate_x_mq_128_for`) before the
-/// inner GEMV. Encoder applies FWHT-128 to weight with the same sign tables,
-/// so the two FWHTs orthogonally cancel.
-fn load_fp16_then_encode_mq4g128(
-    source: &dyn ModelSource,
-    gpu: &Gpu,
-    name: &str,
-    m: usize,
-    k: usize,
-) -> HipResult<WeightTensor> {
-    let (_, data) = source.tensor_data(name)
-        .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
-    debug_assert_eq!(data.len(), 2 * m * k,
-        "load_fp16_then_encode_mq4g128: tensor {name} byte len {} != 2*m*k {}",
-        data.len(), 2 * m * k);
-    let fp16: &[u16] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u16, data.len() / 2)
-    };
-    let encoded = crate::paro_la_gates_codec::encode_mq4g128_from_fp16(fp16, m, k);
-    let buf = gpu.upload_raw(&encoded.bytes, &[encoded.bytes.len()])?;
-    Ok(WeightTensor {
-        buf,
-        gpu_dtype: DType::MQ4G128,
-        m,
-        k,
-        row_stride: 0,
-        paro: None,
-        awq_scale: None,
-    })
-}
-
 /// Load an FP16 weight tensor from safetensors (for excluded/unquantized layers).
 fn load_fp16_weight_from_source(
     source: &dyn ModelSource,
@@ -2305,9 +2270,6 @@ fn paro_load_wt(source: &dyn ModelSource, gpu: &Gpu, prefix: &str, m: usize, k: 
     let fp = format!("{mp}.{prefix}");
     if source.tensor_info(&format!("{fp}.qweight")).is_some() {
         return load_paroquant_weight(source, gpu, &fp, m, k, gs, kr);
-    }
-    if crate::paro_la_gates_codec::should_quantize_la_gate(prefix, gpu.arch.as_str()) {
-        return load_fp16_then_encode_mq4g128(source, gpu, &format!("{fp}.weight"), m, k);
     }
     load_fp16_weight_from_source(source, gpu, &format!("{fp}.weight"), m, k)
 }
