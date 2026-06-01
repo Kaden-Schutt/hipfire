@@ -8457,11 +8457,11 @@ fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipRes
 ///
 /// - router, shared_expert_gate: MQ4 or Q8 (small scalars; dispatched
 ///   inline below).
-/// - shared_expert.gate AND .up: same dtype, MQ4 or MQ6 (fused gate+up
-///   kernel handles one storage layout per call).
-/// - shared_expert.down: MQ4 or MQ6 (independent dtype).
-/// - experts.gate_up: uniform across all experts in this layer, MQ4 or MQ6.
-/// - experts.down: uniform across all experts in this layer, MQ4 or MQ6.
+/// - shared_expert.gate AND .up: same dtype; the fused gate+up kernel
+///   handles one storage layout per call.
+/// - shared_expert.down: same dtype as shared gate/up for now.
+/// - experts.gate_up: uniform across all experts in this layer.
+/// - experts.down: same dtype as experts.gate_up and uniform across experts.
 ///
 /// AWQ A3B dtype dump 2026-05-19 confirms experts are uniform per
 /// projection per layer. The 4 grouped/fused dispatch sites in
@@ -8553,18 +8553,21 @@ fn moe_ffn_batched_admissible_for_dtypes(
     }
 
     let shared_gu_one_dtype = dtypes.shared_expert_up == dtypes.shared_expert_gate;
+    let shared_one_dtype =
+        shared_gu_one_dtype && dtypes.shared_expert_down == dtypes.shared_expert_gate;
     let experts_one_dtype = dtypes.expert_down == dtypes.expert_gate_up;
-    if !(shared_gu_one_dtype && experts_one_dtype) {
+    if !(shared_one_dtype && experts_one_dtype) {
         return false;
     }
 
-    let shared_and_routed_same_family = dtypes.shared_expert_gate == dtypes.shared_expert_down
-        && dtypes.shared_expert_gate == dtypes.expert_gate_up;
-    if !shared_and_routed_same_family {
+    if !moe_prefill_quant_family_supported_for_arch(dtypes.shared_expert_gate, arch)
+        || !moe_prefill_quant_family_supported_for_arch(dtypes.expert_gate_up, arch)
+    {
         return false;
     }
 
-    moe_prefill_quant_family_supported_for_arch(dtypes.expert_gate_up, arch)
+    dtypes.shared_expert_gate == dtypes.expert_gate_up
+        || moe_grouped_gemm_supported_for_dtype(dtypes.expert_gate_up, arch)
 }
 
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
@@ -8677,6 +8680,7 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         DType::MQ4G256 => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
         DType::MQ6G256 => arch == "gfx1151" || arch.starts_with("gfx12"),
         DType::MQ3G256 => arch == "gfx1151" || arch.starts_with("gfx12"),
+        DType::MQ2G256Lloyd => arch == "gfx1151",
         DType::ParoQ4G128 => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
         _ => false,
     }
@@ -9251,6 +9255,18 @@ fn prefill_moe_ffn_body_batched(
                 m_total,
                 n,
             )?,
+            DType::MQ2G256Lloyd => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+                &ffn.expert_gate_up_ptrs,
+                tile_ids,
+                sorted,
+                &pbs.x_rot_batch,
+                y_gu_grouped,
+                2 * mi,
+                gate_up_k,
+                k_top,
+                m_total,
+                n,
+            )?,
             // Phase 4: Path 2 ParoQ4G128 grouped-WMMA. All 256 routed
             // experts at this layer share one gate_up Givens rotation
             // sidecar (ffn.paro_shared.gate_up_*); rotate x_norm into
@@ -9542,6 +9558,18 @@ fn prefill_moe_ffn_body_batched(
                 n * k_top,
             )?,
             DType::MQ3G256 => gpu.gemm_hfq3g256_moe_grouped_wmma(
+                &ffn.expert_down_ptrs,
+                tile_ids,
+                sorted,
+                rot_batch,
+                y_down_grouped,
+                down_m,
+                down_k,
+                1, /* x_row_div */
+                m_total,
+                n * k_top,
+            )?,
+            DType::MQ2G256Lloyd => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
                 &ffn.expert_down_ptrs,
                 tile_ids,
                 sorted,
@@ -18006,12 +18034,7 @@ mod tests {
 
     #[test]
     fn moe_prefill_admits_gfx1151_scalar_bringup_families() {
-        for dtype in [
-            DType::MQ2G256,
-            DType::MQ8G256,
-            DType::MQ2G256Lloyd,
-            DType::MQ3G256Lloyd,
-        ] {
+        for dtype in [DType::MQ2G256, DType::MQ8G256, DType::MQ3G256Lloyd] {
             let mut dtypes = MoePrefillDtypes::uniform(dtype);
             dtypes.router = DType::Q8_0;
             dtypes.shared_expert_scalar_gate = DType::Q8_0;
@@ -18074,6 +18097,35 @@ mod tests {
     }
 
     #[test]
+    fn moe_prefill_admits_gfx1151_mq2_lloyd_routed_with_mq4_shared() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        dtypes.expert_gate_up = DType::MQ2G256Lloyd;
+        dtypes.expert_down = DType::MQ2G256Lloyd;
+
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1151"
+        ));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1201"
+        ));
+    }
+
+    #[test]
+    fn moe_prefill_rejects_mixed_routed_family_without_grouped_gemm() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        dtypes.expert_gate_up = DType::MQ8G256;
+        dtypes.expert_down = DType::MQ8G256;
+
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1151"
+        ));
+    }
+
+    #[test]
     fn moe_prefill_grouped_gemm_routes_mq6_only_where_grouped_kernel_exists() {
         assert!(moe_grouped_gemm_supported_for_dtype(
             DType::MQ4G256,
@@ -18099,9 +18151,13 @@ mod tests {
             DType::MQ3G256,
             "gfx1151"
         ));
-        assert!(!moe_grouped_gemm_supported_for_dtype(
+        assert!(moe_grouped_gemm_supported_for_dtype(
             DType::MQ2G256Lloyd,
             "gfx1151"
+        ));
+        assert!(!moe_grouped_gemm_supported_for_dtype(
+            DType::MQ2G256Lloyd,
+            "gfx1201"
         ));
     }
 
