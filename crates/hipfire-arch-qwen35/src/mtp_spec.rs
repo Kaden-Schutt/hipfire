@@ -837,6 +837,36 @@ fn embed_device_token_into(
     }
 }
 
+/// Multi-GPU variant of `embed_device_token_into` that reads from the
+/// drafter's mirrored embedding table instead of the trunk's weights.
+/// Handles the same two formats as `mtp_device_token_chain_eligible_for`
+/// (HFQ4G256, Q8_0). The eligibility gate ensures the `panic!` branch
+/// is unreachable. If the eligibility gate is extended to new formats,
+/// this helper must be extended in lockstep — the existing
+/// `drafter_embed_lookup` supports 5 formats (HFQ4G256, HFQG128, Q8_0,
+/// Q4K, F32) but this helper needs the `_batched` embedding lookup variant
+/// to exist for that format.
+fn embed_device_token_into_drafter(
+    gpu: &mut Gpu,
+    mirrored_embd: &GpuTensor,
+    embd_format: EmbeddingFormat,
+    out: &GpuTensor,
+    token_id: &GpuTensor,
+    dim: usize,
+) -> HipResult<()> {
+    match embd_format {
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256_batched(mirrored_embd, out, token_id, 1, dim)
+        }
+        EmbeddingFormat::Q8_0 => {
+            gpu.embedding_lookup_q8_batched(mirrored_embd, out, token_id, 1, dim)
+        }
+        other => panic!(
+            "device-token chain: unsupported drafter embd format {other:?}"
+        ),
+    }
+}
+
 fn upload_mtp_proposal_graph_inputs(
     gpu: &mut Gpu,
     state: &MtpSpecState,
@@ -3065,6 +3095,17 @@ pub struct MtpHeteroDrafterState {
     /// argmax slot scratch.
     pub mtp_lm_argmax: GpuTensor,
 
+    /// Greedy device-token chain for compressed-serial MTP on the drafter
+    /// GPU. Slot 0 is seeded with `last_committed`; step k writes slot k+1
+    /// after argmax/remap, and step k+1 embeds slot k directly from GPU
+    /// memory. Shape `[max_n + 1]` i32 stored in F32-typed slots.
+    /// Mirrors `MtpSpecState.mtp_token_chain` for the multi-GPU path.
+    pub mtp_token_chain: GpuTensor,
+
+    /// Single-token embedding scratch used by the device-token-chain path
+    /// on the drafter GPU. Mirrors `MtpSpecState.mtp_token_embed`.
+    pub mtp_token_embed: GpuTensor,
+
     pub max_n: usize,
 }
 
@@ -3091,6 +3132,8 @@ impl MtpHeteroDrafterState {
         let mtp_kv = Qwen35MtpHeadKvCache::new_with_kv_mode(drafter_gpu, &head.config, kv_mode)?;
         let mtp_t_outs = drafter_gpu.alloc_tensor(&[max_n * n_embd], DType::F32)?;
         let mtp_lm_argmax = drafter_gpu.alloc_tensor(&[max_n], DType::F32)?;
+        let mtp_token_chain = drafter_gpu.alloc_tensor(&[max_n + 1], DType::F32)?;
+        let mtp_token_embed = drafter_gpu.alloc_tensor(&[n_embd], DType::F32)?;
 
         // Sidecar logits scratch is needed for the compressed path; caller
         // populates it via `mtp_scratch.ensure_compressed_logits(drafter_gpu, cvs)`
@@ -3108,6 +3151,8 @@ impl MtpHeteroDrafterState {
             mtp_kv,
             mtp_t_outs,
             mtp_lm_argmax,
+            mtp_token_chain,
+            mtp_token_embed,
             max_n,
         })
     }
@@ -3120,6 +3165,8 @@ impl MtpHeteroDrafterState {
         self.mtp_kv.free_gpu(drafter_gpu);
         let _ = drafter_gpu.free_tensor(self.mtp_t_outs);
         let _ = drafter_gpu.free_tensor(self.mtp_lm_argmax);
+        let _ = drafter_gpu.free_tensor(self.mtp_token_chain);
+        let _ = drafter_gpu.free_tensor(self.mtp_token_embed);
     }
 
     /// Seed `prev_hidden` from a trunk-side tensor at session start. Used
@@ -3654,11 +3701,30 @@ pub fn spec_step_mtp_compressed_serial_multi(
         state.p_min,
     );
 
+    // ── 0. Device-token-chain eligibility ──────────────────────────────
+    //
+    // Reuse the single-GPU eligibility gate (format + greedy + no p_min).
+    // The _multi path already asserts greedy-only and no-p_min above, so the
+    // format gate is the only live check. Do NOT duplicate the eligibility
+    // function — call the existing one to avoid drift (Gemini review 2.3).
+    let use_device_token_chain = mtp_device_token_chain_enabled_from_env()
+        && mtp_device_token_chain_eligible_for(
+            drafter_state.embd_format, false, false,
+        );
+    if use_device_token_chain {
+        assert!(
+            head.weights.lm_head_draft_vocab_map_gpu.is_some(),
+            "multi-GPU device-token chain requires GPU vocab_map"
+        );
+    }
+
     // ── 1. K-step draft chain (output_device) ────────────────────────────
     //
-    // Identical to _hetero's drafter-side loop. Rebind a single &mut Gpu to
-    // output_device for the chain; everything reads from drafter_state's
-    // own scratch / mirrored_token_embd / mtp_kv on this device.
+    // Two modes:
+    //   * Device-token-chain ON: embedding lookup + argmax + vocab-remap
+    //     all happen on-GPU. No per-step D2H. Bulk D2H of candidate tokens
+    //     once at the end.
+    //   * Legacy OFF: original per-step host roundtrip (unchanged).
     let drafts_generated;
     let mut candidates: Vec<u32>;
     {
@@ -3677,49 +3743,119 @@ pub fn spec_step_mtp_compressed_serial_multi(
                      call drafter_state.mtp_scratch.ensure_compressed_logits(\
                      output_device gpu, cvs)");
 
-        for k in 0..max_n {
-            let next_tok = if k == 0 { last_committed } else { candidates[k - 1] };
+        if use_device_token_chain {
+            // Seed the chain with last_committed.
+            let seed_token = last_committed as i32;
+            let seed_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(&seed_token as *const i32 as *const u8, 4) };
+            drafter_gpu.hip.memcpy_htod(&drafter_state.mtp_token_chain.buf, seed_bytes)?;
 
-            drafter_embed_lookup(drafter_gpu, drafter_state, next_tok, dim)?;
+            let vocab_map_gpu = head.weights.lm_head_draft_vocab_map_gpu.as_ref()
+                .expect("device-token chain: GPU vocab_map checked above");
 
-            if k == 0 {
-                mtp_head::mtp_head_forward_compressed_with_embed(
-                    drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
-                    &drafter_state.step_embd, &drafter_state.prev_hidden, cur_pos + k,
+            for k in 0..max_n {
+                // Embed the previous step's token directly from the on-device chain.
+                let token_slot = drafter_state.mtp_token_chain.sub_offset(k, 1);
+                embed_device_token_into_drafter(
+                    drafter_gpu,
+                    &drafter_state.mirrored_token_embd,
+                    drafter_state.embd_format,
+                    &drafter_state.mtp_token_embed,
+                    &token_slot,
+                    dim,
                 )?;
-            } else {
-                let prev_row = drafter_state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-                mtp_head::mtp_head_forward_compressed_with_embed(
-                    drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
-                    &drafter_state.step_embd, &prev_row, cur_pos + k,
+
+                if k == 0 {
+                    mtp_head::mtp_head_forward_compressed_with_embed(
+                        drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
+                        &drafter_state.mtp_token_embed, &drafter_state.prev_hidden, cur_pos + k,
+                    )?;
+                } else {
+                    let prev_row = drafter_state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                    mtp_head::mtp_head_forward_compressed_with_embed(
+                        drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
+                        &drafter_state.mtp_token_embed, &prev_row, cur_pos + k,
+                    )?;
+                }
+
+                // On-device argmax → vocab remap → write into chain slot k+1.
+                drafter_gpu.argmax_token_chain_f32(
+                    logits_c,
+                    &argmax_view,
+                    &drafter_state.mtp_token_chain,
+                    Some(vocab_map_gpu),
+                    cvs,
+                    k + 1,
                 )?;
+
+                if k + 1 < max_n {
+                    drafter_gpu.hip.memcpy_dtod_at(
+                        &drafter_state.mtp_t_outs.buf, k * dim_bytes,
+                        &drafter_state.mtp_scratch.t_mtp_out.buf, 0,
+                        dim_bytes,
+                    )?;
+                }
             }
 
-            drafter_gpu.argmax_f32_batched(logits_c, &argmax_view, cvs, 1)?;
-            let mut argmax_host: [i32; 1] = [0];
+            // Bulk D2H: harvest all candidates at once.
+            let candidate_view = drafter_state.mtp_token_chain.sub_offset(1, max_n);
+            let mut candidate_host: Vec<i32> = vec![0; max_n];
             {
                 let bytes: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(
-                        argmax_host.as_mut_ptr() as *mut u8, 4,
+                        candidate_host.as_mut_ptr() as *mut u8, max_n * 4,
                     )
                 };
-                drafter_gpu.hip.memcpy_dtoh(bytes, &argmax_view.buf)?;
+                drafter_gpu.hip.memcpy_dtoh(bytes, &candidate_view.buf)?;
             }
-            let draft_idx = argmax_host[0] as usize;
-            assert!(draft_idx < cvs,
-                "drafter argmax {draft_idx} out of cvs {cvs}");
-            let token_id = vocab_map[draft_idx];
-            candidates.push(token_id);
+            candidates.extend(candidate_host.into_iter().map(|t| t as u32));
+            drafts_generated = max_n;
+        } else {
+            // ── Legacy per-step host roundtrip (unchanged) ────────────────
+            for k in 0..max_n {
+                let next_tok = if k == 0 { last_committed } else { candidates[k - 1] };
 
-            if k + 1 < max_n {
-                drafter_gpu.hip.memcpy_dtod_at(
-                    &drafter_state.mtp_t_outs.buf, k * dim_bytes,
-                    &drafter_state.mtp_scratch.t_mtp_out.buf, 0,
-                    dim_bytes,
-                )?;
+                drafter_embed_lookup(drafter_gpu, drafter_state, next_tok, dim)?;
+
+                if k == 0 {
+                    mtp_head::mtp_head_forward_compressed_with_embed(
+                        drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
+                        &drafter_state.step_embd, &drafter_state.prev_hidden, cur_pos + k,
+                    )?;
+                } else {
+                    let prev_row = drafter_state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                    mtp_head::mtp_head_forward_compressed_with_embed(
+                        drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
+                        &drafter_state.step_embd, &prev_row, cur_pos + k,
+                    )?;
+                }
+
+                drafter_gpu.argmax_f32_batched(logits_c, &argmax_view, cvs, 1)?;
+                let mut argmax_host: [i32; 1] = [0];
+                {
+                    let bytes: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            argmax_host.as_mut_ptr() as *mut u8, 4,
+                        )
+                    };
+                    drafter_gpu.hip.memcpy_dtoh(bytes, &argmax_view.buf)?;
+                }
+                let draft_idx = argmax_host[0] as usize;
+                assert!(draft_idx < cvs,
+                    "drafter argmax {draft_idx} out of cvs {cvs}");
+                let token_id = vocab_map[draft_idx];
+                candidates.push(token_id);
+
+                if k + 1 < max_n {
+                    drafter_gpu.hip.memcpy_dtod_at(
+                        &drafter_state.mtp_t_outs.buf, k * dim_bytes,
+                        &drafter_state.mtp_scratch.t_mtp_out.buf, 0,
+                        dim_bytes,
+                    )?;
+                }
             }
+            drafts_generated = candidates.len();
         }
-        drafts_generated = candidates.len();
     }
 
     // ── 2. Trunk verify (multi-GPU dispatch via forward_prefill_batch_multi_with_caps) ──
@@ -3755,10 +3891,14 @@ pub fn spec_step_mtp_compressed_serial_multi(
         Some(&state.verify_hidden),
         None, // gdn_tape — v1 disabled (see header)
         None, // tree_verify — MTP verify is linear
+        false, // needs_last_token_logits: MTP verify uses per_token_hidden_out,
+               // not the last-token logits; skipping saves one rmsnorm + GEMV.
     )?;
 
     // ── 2b. lm_head GEMM + argmax (output_device — trunk.output lives there) ──
-    let argmax_per_pos: Vec<u32>;
+    let mut accept_count = 0usize;
+    let mut hit_eos = false;
+    let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
     {
         let target_gpu = &mut gpus.devices[output_device];
         let w_out = &trunk_weights.output;
@@ -3814,39 +3954,78 @@ pub fn spec_step_mtp_compressed_serial_multi(
 
         let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
         target_gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
-        let mut argmax_v_host: Vec<i32> = vec![0; n_verify];
-        {
-            let bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    argmax_v_host.as_mut_ptr() as *mut u8, n_verify * 4,
-                )
-            };
-            target_gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
-        }
-        argmax_per_pos = argmax_v_host.into_iter().map(|x| x as u32).collect();
-    }
 
-    // ── Greedy accept rule (v1 — sampling/p_min NYI) ──
-    let mut accept_count = 0usize;
-    let mut hit_eos = false;
-    let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
-    for k in 0..drafts_generated {
-        if argmax_per_pos[k] == candidates[k] {
-            committed.push(candidates[k]);
-            accept_count += 1;
-            if candidates[k] == eos_token_id {
-                hit_eos = true;
-                break;
+        // ── GPU-side greedy accept (when device-token-chain is active) ──
+        let use_gpu_accept = use_device_token_chain
+            && mtp_gpu_greedy_accept_enabled_from_env();
+
+        if use_gpu_accept {
+            let candidate_device = drafter_state.mtp_token_chain.sub_offset(1, drafts_generated);
+            // ALIASING: accept_result overlaps argmax_v[0..2]; both are views
+            // into state.verify_argmax. Safe because greedy_accept is
+            // single-thread (reads all inputs into registers before writing
+            // output). After this call, positions 0–1 of argmax_v are
+            // clobbered — no downstream consumer should read them.
+            let accept_result = state.verify_argmax.sub_offset(0, 2);
+            target_gpu.greedy_accept_from_argmax_i32(
+                &argmax_v,
+                &candidate_device,
+                &accept_result,
+                drafts_generated,
+                eos_token_id,
+            )?;
+            let mut accept_host: [i32; 2] = [0, 0];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        accept_host.as_mut_ptr() as *mut u8, 8,
+                    )
+                };
+                target_gpu.hip.memcpy_dtoh(bytes, &accept_result.buf)?;
             }
+            let accepted = assemble_greedy_accept_from_gpu_result(
+                &candidates[..drafts_generated],
+                accept_host[0] as usize,
+                accept_host[1],
+                eos_token_id,
+            );
+            committed = accepted.committed;
+            accept_count = accepted.accept_count;
+            hit_eos = accepted.hit_eos;
+            // argmax_per_pos not materialized in GPU accept path
         } else {
-            break;
-        }
-    }
-    if !hit_eos {
-        let bonus = argmax_per_pos[accept_count];
-        committed.push(bonus);
-        if bonus == eos_token_id {
-            hit_eos = true;
+            // ── Legacy host-side accept (unchanged) ────────────────────
+            let mut argmax_v_host: Vec<i32> = vec![0; n_verify];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        argmax_v_host.as_mut_ptr() as *mut u8, n_verify * 4,
+                    )
+                };
+                target_gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
+            }
+            let argmax_per_pos: Vec<u32> = argmax_v_host.into_iter().map(|x| x as u32).collect();
+
+            // ── Greedy accept rule (v1 — sampling/p_min NYI) ──
+            for k in 0..drafts_generated {
+                if argmax_per_pos[k] == candidates[k] {
+                    committed.push(candidates[k]);
+                    accept_count += 1;
+                    if candidates[k] == eos_token_id {
+                        hit_eos = true;
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if !hit_eos {
+                let bonus = argmax_per_pos[accept_count];
+                committed.push(bonus);
+                if bonus == eos_token_id {
+                    hit_eos = true;
+                }
+            }
         }
     }
 

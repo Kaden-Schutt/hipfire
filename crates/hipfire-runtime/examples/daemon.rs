@@ -4601,6 +4601,7 @@ fn generate_pp_mtp(m: &mut LoadedModel, ctx: &mut GenerateCtx<'_>) {
             Some(&per_tok_hidden_out),
             None, // gdn_tape — v1 disabled (matches spec_step_mtp_compressed_serial_multi)
             None, // tree_verify — MTP verify is linear
+            false, // needs_last_token_logits: MTP verify uses per_token_hidden_out
         ) {
             // Free the per-tok buffer before bail; bail returns.
             let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];

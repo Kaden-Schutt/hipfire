@@ -10962,6 +10962,7 @@ pub fn forward_prefill_batch_multi(
     forward_prefill_batch_multi_with_caps(
         gpus, weights, config, tokens, start_pos, kv_cache, dn_state, scratch_set,
         None, None, None,
+        true, // needs_last_token_logits: preserve multi-GPU post-condition for non-MTP callers
     )
 }
 
@@ -11003,6 +11004,7 @@ pub fn forward_prefill_batch_multi_with_caps(
     per_token_hidden_out: Option<&GpuTensor>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
+    needs_last_token_logits: bool,
 ) -> HipResult<()> {
     assert!(
         tree_verify.is_none(),
@@ -11186,7 +11188,7 @@ pub fn forward_prefill_batch_multi_with_caps(
                         false, // pre_uploaded
                         Some(&band_ctx),
                         None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
-                        true, // needs_last_token_logits: preserve multi-GPU post-condition
+                        needs_last_token_logits, // thread from caller
                         None, // max_layer: multi-GPU PP path runs full stack
                     )?;
                 }
