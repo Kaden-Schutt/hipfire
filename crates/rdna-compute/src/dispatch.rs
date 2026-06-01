@@ -1194,6 +1194,12 @@ impl Gpu {
             .replay_graph_destroy_all(&self.hip, self.device_id);
     }
 
+    /// Drop captured graph state after a live KV layout switch so the next
+    /// forward captures the current K/V modes and kernarg blobs.
+    pub fn invalidate_for_kv_mode_switch(&mut self) {
+        self.invalidate_graph_state();
+    }
+
     // ── Kernel operations ───────────────────────────────────────
 
     /// y = A * x (matrix-vector multiply, A is [M, K], x is [K], y is [M])

@@ -1648,6 +1648,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
                 st,
                 cfg.n_head_kv,
                 cfg.head_dim,
+                kv.inner.v_mode_bits(),
             )?;
             gpu.attention_flash_fwht4(
                 &scratch.q,
@@ -1663,6 +1664,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
                 cfg.head_dim,
                 kv.inner.physical_cap,
                 &scratch.flash_partials,
+                kv.inner.v_mode_bits(),
             )?;
         }
     }
