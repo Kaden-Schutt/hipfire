@@ -92,7 +92,7 @@ impl GemmFamily {
         gpu: &mut Gpu,
         params: &GemmParams,
     ) -> Result<(), DispatchError> {
-        let _resolved = self.resolve(params.w.dtype, ctx, None)?;
+        let key = self.resolve(params.w.dtype, ctx, None)?.key;
 
         let w = params.w;
         let x = params.x;
@@ -100,7 +100,6 @@ impl GemmFamily {
         let batch_size = params.batch_size;
         let m = w.m;
         let k = w.k;
-        use DType::*;
 
         macro_rules! hip {
             ($e:expr) => {
@@ -108,30 +107,16 @@ impl GemmFamily {
             };
         }
 
-        match w.dtype {
-            F32 => hip!(gpu.gemm_f32_register_tiled(w.buf, x, y, m, k, batch_size)),
-            F16 => hip!(gpu.gemm_f16_x_f16_wmma(w.buf, x, y, m, k, batch_size)),
-            Q8_0 => {
-                let preferred = KernelKey::GemmQ8_0Wmma;
-                if self.registry.resolve(preferred, ctx, None).is_ok() {
-                    hip!(gpu.gemm_q8_0_wmma(w.buf, x, y, m, k, batch_size))
-                } else {
-                    hip!(gpu.gemm_q8_0_batched_chunked(w.buf, x, y, m, k, batch_size))
-                }
-            }
-            HFQ4G256 => {
-                let preferred = KernelKey::GemmHfq4G256Wmma;
-                if self.registry.resolve(preferred, ctx, None).is_ok() {
-                    hip!(gpu.gemm_hfq4g256_wmma(w.buf, x, y, m, k, batch_size))
-                } else {
-                    hip!(gpu.gemm_hfq4g256(w.buf, x, y, m, k, batch_size))
-                }
-            }
-            HFQ4G128 => hip!(gpu.gemm_hfq4g128(w.buf, x, y, m, k, batch_size)),
-            _ => Err(DispatchError::UnsupportedVariant {
-                family: "gemm", variant: "plain",
-                arch: "", quant: "",
-            }),
+        use KernelKey as K;
+        match key {
+            K::GemmF32RegisterTiled => hip!(gpu.gemm_f32_register_tiled(w.buf, x, y, m, k, batch_size)),
+            K::GemmF16XF16Wmma => hip!(gpu.gemm_f16_x_f16_wmma(w.buf, x, y, m, k, batch_size)),
+            K::GemmQ8_0Wmma => hip!(gpu.gemm_q8_0_wmma(w.buf, x, y, m, k, batch_size)),
+            K::GemmQ8_0BatchedChunked => hip!(gpu.gemm_q8_0_batched_chunked(w.buf, x, y, m, k, batch_size)),
+            K::GemmHfq4G256Wmma => hip!(gpu.gemm_hfq4g256_wmma(w.buf, x, y, m, k, batch_size)),
+            K::GemmHfq4G256 => hip!(gpu.gemm_hfq4g256(w.buf, x, y, m, k, batch_size)),
+            K::GemmHfq4G128 => hip!(gpu.gemm_hfq4g128(w.buf, x, y, m, k, batch_size)),
+            other => Err(DispatchError::MissingImpl { key: other }),
         }
     }
 }

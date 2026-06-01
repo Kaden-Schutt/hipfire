@@ -79,24 +79,14 @@ impl MoeFamily {
         _gpu: &mut rdna_compute::Gpu,
         params: &MoeParams,
     ) -> Result<(), DispatchError> {
-        let _resolved = self.resolve(params.variant, ctx, None)?;
+        let _key = self.resolve(params.variant, ctx, None)?.key;
 
-        match params.variant {
-            MoeVariant::GroupedGemm => Err(DispatchError::UnsupportedVariant {
-                family: "moe",
-                variant: "grouped_gemm",
-                arch: "",
-                quant: "",
-            }),
-            MoeVariant::IndexedGateUp | MoeVariant::IndexedDown => Err(
-                DispatchError::UnsupportedVariant {
-                    family: "moe",
-                    variant: "indexed",
-                    arch: "",
-                    quant: "",
-                },
-            ),
-        }
+        Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "all",
+            arch: "",
+            quant: "",
+        })
     }
 }
 
