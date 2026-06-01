@@ -885,66 +885,6 @@ extern "C" __global__ void gemv_paro4g128t_prerotated_residual(
 }
 
 __launch_bounds__(32, 12)
-extern "C" __global__ void gemv_paro4g128t_prerotated_pack4(
-    const char* __restrict__ A,
-    const float* __restrict__ x_rot,
-    float* __restrict__ y,
-    int M, int K
-) {
-    gemv_paro4g128_prerotated_pack4_impl<false, true>(A, x_rot, y, M, K);
-}
-
-__launch_bounds__(32, 12)
-extern "C" __global__ void gemv_paro4g128t_prerotated_residual_pack4(
-    const char* __restrict__ A,
-    const float* __restrict__ x_rot,
-    float* __restrict__ y,
-    int M, int K
-) {
-    gemv_paro4g128_prerotated_pack4_impl<true, true>(A, x_rot, y, M, K);
-}
-
-__launch_bounds__(32, 16)
-extern "C" __global__ void gemv_paro4g128t_prerotated_pack2(
-    const char* __restrict__ A,
-    const float* __restrict__ x_rot,
-    float* __restrict__ y,
-    int M, int K
-) {
-    gemv_paro4g128_prerotated_pack2_impl<false, true>(A, x_rot, y, M, K);
-}
-
-__launch_bounds__(32, 16)
-extern "C" __global__ void gemv_paro4g128t_prerotated_residual_pack2(
-    const char* __restrict__ A,
-    const float* __restrict__ x_rot,
-    float* __restrict__ y,
-    int M, int K
-) {
-    gemv_paro4g128_prerotated_pack2_impl<true, true>(A, x_rot, y, M, K);
-}
-
-__launch_bounds__(32, 16)
-extern "C" __global__ void gemv_paro4g128t_prerotated_pack1(
-    const char* __restrict__ A,
-    const float* __restrict__ x_rot,
-    float* __restrict__ y,
-    int M, int K
-) {
-    gemv_paro4g128_prerotated_pack1_impl<false, true>(A, x_rot, y, M, K);
-}
-
-__launch_bounds__(32, 16)
-extern "C" __global__ void gemv_paro4g128t_prerotated_residual_pack1(
-    const char* __restrict__ A,
-    const float* __restrict__ x_rot,
-    float* __restrict__ y,
-    int M, int K
-) {
-    gemv_paro4g128_prerotated_pack1_impl<true, true>(A, x_rot, y, M, K);
-}
-
-__launch_bounds__(32, 12)
 extern "C" __global__ void fused_gate_up_paro4g128t_pack4(
     const char* __restrict__ A_gate,
     const char* __restrict__ A_up,
@@ -959,23 +899,6 @@ extern "C" __global__ void fused_gate_up_paro4g128t_pack4(
     const float* x_rot = up_lane ? x_rot_up : x_rot_gate;
     float* y = up_lane ? y_up : y_gate;
     gemv_paro4g128_prerotated_pack4_impl<false, true>(A, x_rot, y, M, K);
-}
-
-__launch_bounds__(32, 16)
-extern "C" __global__ void fused_gate_up_paro4g128t_pack2(
-    const char* __restrict__ A_gate,
-    const char* __restrict__ A_up,
-    const float* __restrict__ x_rot_gate,
-    const float* __restrict__ x_rot_up,
-    float* __restrict__ y_gate,
-    float* __restrict__ y_up,
-    int M, int K
-) {
-    const bool up_lane = blockIdx.y != 0;
-    const char* A = up_lane ? A_up : A_gate;
-    const float* x_rot = up_lane ? x_rot_up : x_rot_gate;
-    float* y = up_lane ? y_up : y_gate;
-    gemv_paro4g128_prerotated_pack2_impl<false, true>(A, x_rot, y, M, K);
 }
 
 __launch_bounds__(32, 12)
@@ -1019,43 +942,4 @@ extern "C" __global__ void fused_qkvza_paro4g128t_pack4(
     gemv_paro4g128_prerotated_pack4_impl<false, true>(A, x_rot, y, M, K);
 }
 
-__launch_bounds__(32, 16)
-extern "C" __global__ void fused_qkvza_paro4g128t_pack2(
-    const char* __restrict__ A0,
-    const char* __restrict__ A1,
-    const char* __restrict__ A2,
-    const char* __restrict__ A3,
-    const float* __restrict__ x_rot0,
-    const float* __restrict__ x_rot1,
-    const float* __restrict__ x_rot2,
-    const float* __restrict__ x_rot3,
-    float* __restrict__ y0,
-    float* __restrict__ y1,
-    float* __restrict__ y2,
-    float* __restrict__ y3,
-    int M0, int M1, int M2, int M3, int K
-) {
-    const int lane = blockIdx.y;
-    const char* A = A0;
-    const float* x_rot = x_rot0;
-    float* y = y0;
-    int M = M0;
-    if (lane == 1) {
-        A = A1;
-        x_rot = x_rot1;
-        y = y1;
-        M = M1;
-    } else if (lane == 2) {
-        A = A2;
-        x_rot = x_rot2;
-        y = y2;
-        M = M2;
-    } else if (lane == 3) {
-        A = A3;
-        x_rot = x_rot3;
-        y = y3;
-        M = M3;
-    }
-    if (M <= 0) return;
-    gemv_paro4g128_prerotated_pack2_impl<false, true>(A, x_rot, y, M, K);
-}
+
