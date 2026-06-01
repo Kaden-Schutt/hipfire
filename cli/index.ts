@@ -11,6 +11,7 @@ import { spawn } from "bun";
 import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
+import { stripVisibleThinking } from "./chat_pure.ts";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
@@ -3058,13 +3059,7 @@ async function serve(port: number, host: string) {
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
         const strippedContent = content;
-        if (preserveThinking) {
-          content = content.replace(/<\|im_end\|>/g, "").trim();
-        } else {
-          content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-            .replace(/<think>[\s\S]*$/, "") // unclosed think block
-            .replace(/<\|im_end\|>/g, "").trim();
-        }
+        content = stripVisibleThinking(content, preserveThinking);
 
         // Diagnostic: detect empty-after-unclosed-think-strip.
         let thinkWarning: string | null = null;

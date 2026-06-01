@@ -37,9 +37,15 @@ pub mod launch_counters {
                     COUNT.with(|c| c.set(c.get() + 1));
                     BYTES.with(|c| c.set(c.get() + bytes));
                 }
-                pub fn time_ns() -> u64 { TIME_NS.with(|c| c.get()) }
-                pub fn count() -> u64 { COUNT.with(|c| c.get()) }
-                pub fn bytes() -> u64 { BYTES.with(|c| c.get()) }
+                pub fn time_ns() -> u64 {
+                    TIME_NS.with(|c| c.get())
+                }
+                pub fn count() -> u64 {
+                    COUNT.with(|c| c.get())
+                }
+                pub fn bytes() -> u64 {
+                    BYTES.with(|c| c.get())
+                }
                 pub fn reset() {
                     TIME_NS.with(|c| c.set(0));
                     COUNT.with(|c| c.set(0));
@@ -77,8 +83,12 @@ pub mod launch_counters {
         graph_launch::reset();
     }
 
-    pub fn time_ns() -> u64 { TIME_NS.with(|c| c.get()) }
-    pub fn count() -> u64 { COUNT.with(|c| c.get()) }
+    pub fn time_ns() -> u64 {
+        TIME_NS.with(|c| c.get())
+    }
+    pub fn count() -> u64 {
+        COUNT.with(|c| c.get())
+    }
 
     // Per-API counters
     counter!(launch_kernel);
@@ -146,12 +156,10 @@ pub struct HipRuntime {
     // Multi-device / peer access
     fn_device_can_access_peer: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
     fn_device_enable_peer_access: unsafe extern "C" fn(c_int, c_uint) -> u32,
-    fn_memcpy_peer:
-        unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> u32,
+    fn_memcpy_peer: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> u32,
     fn_memcpy_peer_async:
         unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize, HipStream) -> u32,
-    fn_pointer_get_attributes:
-        unsafe extern "C" fn(*mut HipPointerAttribute, *const c_void) -> u32,
+    fn_pointer_get_attributes: unsafe extern "C" fn(*mut HipPointerAttribute, *const c_void) -> u32,
 
     // Memory
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
@@ -170,8 +178,7 @@ pub struct HipRuntime {
     // Modules & kernels
     fn_module_load: unsafe extern "C" fn(*mut HipModule, *const c_char) -> u32,
     fn_module_load_data: unsafe extern "C" fn(*mut HipModule, *const c_void) -> u32,
-    fn_module_get_function:
-        unsafe extern "C" fn(*mut HipFunction, HipModule, *const c_char) -> u32,
+    fn_module_get_function: unsafe extern "C" fn(*mut HipFunction, HipModule, *const c_char) -> u32,
     fn_module_launch_kernel: unsafe extern "C" fn(
         HipFunction,
         c_uint,
@@ -199,19 +206,15 @@ pub struct HipRuntime {
     fn_get_last_error: unsafe extern "C" fn() -> u32,
 
     // Graph capture & replay
-    fn_stream_begin_capture:
-        unsafe extern "C" fn(HipStream, c_uint) -> u32,
-    fn_stream_end_capture:
-        unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32,
+    fn_stream_begin_capture: unsafe extern "C" fn(HipStream, c_uint) -> u32,
+    fn_stream_end_capture: unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32,
     fn_graph_instantiate:
         unsafe extern "C" fn(*mut HipGraphExec, HipGraph, *mut HipGraph, *mut c_void, usize) -> u32,
-    fn_graph_launch:
-        unsafe extern "C" fn(HipGraphExec, HipStream) -> u32,
+    fn_graph_launch: unsafe extern "C" fn(HipGraphExec, HipStream) -> u32,
     fn_graph_exec_destroy: unsafe extern "C" fn(HipGraphExec) -> u32,
     fn_graph_destroy: unsafe extern "C" fn(HipGraph) -> u32,
     // Stream memory ops (HIP 7.2+)
-    fn_stream_write_value32:
-        unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32,
+    fn_stream_write_value32: unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32,
     fn_device_synchronize: unsafe extern "C" fn() -> u32,
     fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
     fn_get_device_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
@@ -293,53 +296,230 @@ impl HipRuntime {
         let runtime = unsafe {
             Self {
                 fn_init: load_fn!(lib, "hipInit", unsafe extern "C" fn(c_uint) -> u32),
-                fn_runtime_get_version: load_fn!(lib, "hipRuntimeGetVersion", unsafe extern "C" fn(*mut c_int) -> u32),
-                fn_get_device_count: load_fn!(lib, "hipGetDeviceCount", unsafe extern "C" fn(*mut c_int) -> u32),
+                fn_runtime_get_version: load_fn!(
+                    lib,
+                    "hipRuntimeGetVersion",
+                    unsafe extern "C" fn(*mut c_int) -> u32
+                ),
+                fn_get_device_count: load_fn!(
+                    lib,
+                    "hipGetDeviceCount",
+                    unsafe extern "C" fn(*mut c_int) -> u32
+                ),
                 fn_set_device: load_fn!(lib, "hipSetDevice", unsafe extern "C" fn(c_int) -> u32),
-                fn_get_device: load_fn!(lib, "hipGetDevice", unsafe extern "C" fn(*mut c_int) -> u32),
-                fn_device_can_access_peer: load_fn!(lib, "hipDeviceCanAccessPeer",
-                    unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32),
-                fn_device_enable_peer_access: load_fn!(lib, "hipDeviceEnablePeerAccess",
-                    unsafe extern "C" fn(c_int, c_uint) -> u32),
-                fn_memcpy_peer: load_fn!(lib, "hipMemcpyPeer",
-                    unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> u32),
-                fn_memcpy_peer_async: load_fn!(lib, "hipMemcpyPeerAsync",
-                    unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize, HipStream) -> u32),
-                fn_pointer_get_attributes: load_fn!(lib, "hipPointerGetAttributes",
-                    unsafe extern "C" fn(*mut HipPointerAttribute, *const c_void) -> u32),
-                fn_malloc: load_fn!(lib, "hipMalloc", unsafe extern "C" fn(*mut *mut c_void, usize) -> u32),
+                fn_get_device: load_fn!(
+                    lib,
+                    "hipGetDevice",
+                    unsafe extern "C" fn(*mut c_int) -> u32
+                ),
+                fn_device_can_access_peer: load_fn!(
+                    lib,
+                    "hipDeviceCanAccessPeer",
+                    unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32
+                ),
+                fn_device_enable_peer_access: load_fn!(
+                    lib,
+                    "hipDeviceEnablePeerAccess",
+                    unsafe extern "C" fn(c_int, c_uint) -> u32
+                ),
+                fn_memcpy_peer: load_fn!(
+                    lib,
+                    "hipMemcpyPeer",
+                    unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> u32
+                ),
+                fn_memcpy_peer_async: load_fn!(
+                    lib,
+                    "hipMemcpyPeerAsync",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        c_int,
+                        *const c_void,
+                        c_int,
+                        usize,
+                        HipStream,
+                    ) -> u32
+                ),
+                fn_pointer_get_attributes: load_fn!(
+                    lib,
+                    "hipPointerGetAttributes",
+                    unsafe extern "C" fn(*mut HipPointerAttribute, *const c_void) -> u32
+                ),
+                fn_malloc: load_fn!(
+                    lib,
+                    "hipMalloc",
+                    unsafe extern "C" fn(*mut *mut c_void, usize) -> u32
+                ),
                 fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
-                fn_memcpy: load_fn!(lib, "hipMemcpy", unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32),
-                fn_memcpy_async: load_fn!(lib, "hipMemcpyAsync", unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32),
-                fn_memset: load_fn!(lib, "hipMemset", unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32),
-                fn_memset_async: load_fn!(lib, "hipMemsetAsync", unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32),
-                fn_stream_create: load_fn!(lib, "hipStreamCreate", unsafe extern "C" fn(*mut HipStream) -> u32),
-                fn_stream_synchronize: load_fn!(lib, "hipStreamSynchronize", unsafe extern "C" fn(HipStream) -> u32),
-                fn_stream_destroy: load_fn!(lib, "hipStreamDestroy", unsafe extern "C" fn(HipStream) -> u32),
-                fn_module_load: load_fn!(lib, "hipModuleLoad", unsafe extern "C" fn(*mut HipModule, *const c_char) -> u32),
-                fn_module_load_data: load_fn!(lib, "hipModuleLoadData", unsafe extern "C" fn(*mut HipModule, *const c_void) -> u32),
-                fn_module_get_function: load_fn!(lib, "hipModuleGetFunction", unsafe extern "C" fn(*mut HipFunction, HipModule, *const c_char) -> u32),
-                fn_module_launch_kernel: load_fn!(lib, "hipModuleLaunchKernel", unsafe extern "C" fn(HipFunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, HipStream, *mut *mut c_void, *mut *mut c_void) -> u32),
-                fn_event_create: load_fn!(lib, "hipEventCreate", unsafe extern "C" fn(*mut HipEvent) -> u32),
-                fn_event_record: load_fn!(lib, "hipEventRecord", unsafe extern "C" fn(HipEvent, HipStream) -> u32),
-                fn_event_synchronize: load_fn!(lib, "hipEventSynchronize", unsafe extern "C" fn(HipEvent) -> u32),
-                fn_event_elapsed_time: load_fn!(lib, "hipEventElapsedTime", unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32),
-                fn_event_destroy: load_fn!(lib, "hipEventDestroy", unsafe extern "C" fn(HipEvent) -> u32),
-                fn_stream_wait_event: load_fn!(lib, "hipStreamWaitEvent", unsafe extern "C" fn(HipStream, HipEvent, c_uint) -> u32),
-                fn_get_error_string: load_fn!(lib, "hipGetErrorString", unsafe extern "C" fn(u32) -> *const i8),
+                fn_memcpy: load_fn!(
+                    lib,
+                    "hipMemcpy",
+                    unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32
+                ),
+                fn_memcpy_async: load_fn!(
+                    lib,
+                    "hipMemcpyAsync",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        *const c_void,
+                        usize,
+                        c_uint,
+                        HipStream,
+                    ) -> u32
+                ),
+                fn_memset: load_fn!(
+                    lib,
+                    "hipMemset",
+                    unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32
+                ),
+                fn_memset_async: load_fn!(
+                    lib,
+                    "hipMemsetAsync",
+                    unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32
+                ),
+                fn_stream_create: load_fn!(
+                    lib,
+                    "hipStreamCreate",
+                    unsafe extern "C" fn(*mut HipStream) -> u32
+                ),
+                fn_stream_synchronize: load_fn!(
+                    lib,
+                    "hipStreamSynchronize",
+                    unsafe extern "C" fn(HipStream) -> u32
+                ),
+                fn_stream_destroy: load_fn!(
+                    lib,
+                    "hipStreamDestroy",
+                    unsafe extern "C" fn(HipStream) -> u32
+                ),
+                fn_module_load: load_fn!(
+                    lib,
+                    "hipModuleLoad",
+                    unsafe extern "C" fn(*mut HipModule, *const c_char) -> u32
+                ),
+                fn_module_load_data: load_fn!(
+                    lib,
+                    "hipModuleLoadData",
+                    unsafe extern "C" fn(*mut HipModule, *const c_void) -> u32
+                ),
+                fn_module_get_function: load_fn!(
+                    lib,
+                    "hipModuleGetFunction",
+                    unsafe extern "C" fn(*mut HipFunction, HipModule, *const c_char) -> u32
+                ),
+                fn_module_launch_kernel: load_fn!(
+                    lib,
+                    "hipModuleLaunchKernel",
+                    unsafe extern "C" fn(
+                        HipFunction,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        c_uint,
+                        HipStream,
+                        *mut *mut c_void,
+                        *mut *mut c_void,
+                    ) -> u32
+                ),
+                fn_event_create: load_fn!(
+                    lib,
+                    "hipEventCreate",
+                    unsafe extern "C" fn(*mut HipEvent) -> u32
+                ),
+                fn_event_record: load_fn!(
+                    lib,
+                    "hipEventRecord",
+                    unsafe extern "C" fn(HipEvent, HipStream) -> u32
+                ),
+                fn_event_synchronize: load_fn!(
+                    lib,
+                    "hipEventSynchronize",
+                    unsafe extern "C" fn(HipEvent) -> u32
+                ),
+                fn_event_elapsed_time: load_fn!(
+                    lib,
+                    "hipEventElapsedTime",
+                    unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32
+                ),
+                fn_event_destroy: load_fn!(
+                    lib,
+                    "hipEventDestroy",
+                    unsafe extern "C" fn(HipEvent) -> u32
+                ),
+                fn_stream_wait_event: load_fn!(
+                    lib,
+                    "hipStreamWaitEvent",
+                    unsafe extern "C" fn(HipStream, HipEvent, c_uint) -> u32
+                ),
+                fn_get_error_string: load_fn!(
+                    lib,
+                    "hipGetErrorString",
+                    unsafe extern "C" fn(u32) -> *const i8
+                ),
                 fn_get_last_error: load_fn!(lib, "hipGetLastError", unsafe extern "C" fn() -> u32),
-                fn_stream_begin_capture: load_fn!(lib, "hipStreamBeginCapture", unsafe extern "C" fn(HipStream, c_uint) -> u32),
-                fn_stream_end_capture: load_fn!(lib, "hipStreamEndCapture", unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32),
-                fn_graph_instantiate: load_fn!(lib, "hipGraphInstantiate", unsafe extern "C" fn(*mut HipGraphExec, HipGraph, *mut HipGraph, *mut c_void, usize) -> u32),
-                fn_graph_launch: load_fn!(lib, "hipGraphLaunch", unsafe extern "C" fn(HipGraphExec, HipStream) -> u32),
-                fn_graph_exec_destroy: load_fn!(lib, "hipGraphExecDestroy", unsafe extern "C" fn(HipGraphExec) -> u32),
-                fn_graph_destroy: load_fn!(lib, "hipGraphDestroy", unsafe extern "C" fn(HipGraph) -> u32),
-                fn_stream_write_value32: load_fn!(lib, "hipStreamWriteValue32",
-                    unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32),
-                fn_device_synchronize: load_fn!(lib, "hipDeviceSynchronize", unsafe extern "C" fn() -> u32),
-                fn_get_device_properties: load_fn!(lib, "hipGetDeviceProperties", unsafe extern "C" fn(*mut u8, c_int) -> u32),
-                fn_get_device_attribute: load_fn!(lib, "hipDeviceGetAttribute", unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32),
-                fn_mem_get_info: load_fn!(lib, "hipMemGetInfo", unsafe extern "C" fn(*mut usize, *mut usize) -> u32),
+                fn_stream_begin_capture: load_fn!(
+                    lib,
+                    "hipStreamBeginCapture",
+                    unsafe extern "C" fn(HipStream, c_uint) -> u32
+                ),
+                fn_stream_end_capture: load_fn!(
+                    lib,
+                    "hipStreamEndCapture",
+                    unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32
+                ),
+                fn_graph_instantiate: load_fn!(
+                    lib,
+                    "hipGraphInstantiate",
+                    unsafe extern "C" fn(
+                        *mut HipGraphExec,
+                        HipGraph,
+                        *mut HipGraph,
+                        *mut c_void,
+                        usize,
+                    ) -> u32
+                ),
+                fn_graph_launch: load_fn!(
+                    lib,
+                    "hipGraphLaunch",
+                    unsafe extern "C" fn(HipGraphExec, HipStream) -> u32
+                ),
+                fn_graph_exec_destroy: load_fn!(
+                    lib,
+                    "hipGraphExecDestroy",
+                    unsafe extern "C" fn(HipGraphExec) -> u32
+                ),
+                fn_graph_destroy: load_fn!(
+                    lib,
+                    "hipGraphDestroy",
+                    unsafe extern "C" fn(HipGraph) -> u32
+                ),
+                fn_stream_write_value32: load_fn!(
+                    lib,
+                    "hipStreamWriteValue32",
+                    unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32
+                ),
+                fn_device_synchronize: load_fn!(
+                    lib,
+                    "hipDeviceSynchronize",
+                    unsafe extern "C" fn() -> u32
+                ),
+                fn_get_device_properties: load_fn!(
+                    lib,
+                    "hipGetDeviceProperties",
+                    unsafe extern "C" fn(*mut u8, c_int) -> u32
+                ),
+                fn_get_device_attribute: load_fn!(
+                    lib,
+                    "hipDeviceGetAttribute",
+                    unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32
+                ),
+                fn_mem_get_info: load_fn!(
+                    lib,
+                    "hipMemGetInfo",
+                    unsafe extern "C" fn(*mut usize, *mut usize) -> u32
+                ),
                 _lib: lib,
             }
         };
@@ -434,8 +614,16 @@ impl HipRuntime {
         src_device: i32,
         size: usize,
     ) -> HipResult<()> {
-        assert!(size <= dst.size(), "size ({size}) exceeds dst ({})", dst.size());
-        assert!(size <= src.size(), "size ({size}) exceeds src ({})", src.size());
+        assert!(
+            size <= dst.size(),
+            "size ({size}) exceeds dst ({})",
+            dst.size()
+        );
+        assert!(
+            size <= src.size(),
+            "size ({size}) exceeds src ({})",
+            src.size()
+        );
         let code = unsafe {
             (self.fn_memcpy_peer)(
                 dst.as_ptr(),
@@ -458,8 +646,16 @@ impl HipRuntime {
         size: usize,
         stream: &Stream,
     ) -> HipResult<()> {
-        assert!(size <= dst.size(), "size ({size}) exceeds dst ({})", dst.size());
-        assert!(size <= src.size(), "size ({size}) exceeds src ({})", src.size());
+        assert!(
+            size <= dst.size(),
+            "size ({size}) exceeds dst ({})",
+            dst.size()
+        );
+        assert!(
+            size <= src.size(),
+            "size ({size}) exceeds src ({})",
+            src.size()
+        );
         let code = unsafe {
             (self.fn_memcpy_peer_async)(
                 dst.as_ptr(),
@@ -493,7 +689,6 @@ impl HipRuntime {
     /// Caller must ensure the buffer is not in use by any pending GPU operations.
     pub fn free(&self, buf: DeviceBuffer) -> HipResult<()> {
         let code = unsafe { (self.fn_free)(buf.ptr) };
-        std::mem::forget(buf); // prevent double-free
         self.check(code, "hipFree")
     }
 
@@ -557,12 +752,7 @@ impl HipRuntime {
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
         let t = std::time::Instant::now();
         let code = unsafe {
-            (self.fn_memcpy)(
-                dst.ptr,
-                src_ptr,
-                size,
-                MemcpyKind::DeviceToDevice as c_uint,
-            )
+            (self.fn_memcpy)(dst.ptr, src_ptr, size, MemcpyKind::DeviceToDevice as c_uint)
         };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipMemcpy D2D offset")
@@ -609,11 +799,16 @@ impl HipRuntime {
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump = *DUMP.get_or_init(|| {
-            std::env::var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1")
-        });
+        let dump =
+            *DUMP.get_or_init(|| std::env::var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1"));
         if dump {
-            eprintln!("dtoh bytes={} us={} at {}:{}", dst.len(), elapsed / 1000, loc.file(), loc.line());
+            eprintln!(
+                "dtoh bytes={} us={} at {}:{}",
+                dst.len(),
+                elapsed / 1000,
+                loc.file(),
+                loc.line()
+            );
         }
         self.check(code, "hipMemcpy D2H")
     }
@@ -630,7 +825,9 @@ impl HipRuntime {
         assert!(
             src_offset + dst.len() <= src.size,
             "src_offset ({}) + dst len ({}) exceeds device buffer ({})",
-            src_offset, dst.len(), src.size
+            src_offset,
+            dst.len(),
+            src.size
         );
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
         let loc = std::panic::Location::caller();
@@ -646,11 +843,16 @@ impl HipRuntime {
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump = *DUMP.get_or_init(|| {
-            std::env::var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1")
-        });
+        let dump =
+            *DUMP.get_or_init(|| std::env::var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1"));
         if dump {
-            eprintln!("dtoh_at bytes={} us={} at {}:{}", dst.len(), elapsed / 1000, loc.file(), loc.line());
+            eprintln!(
+                "dtoh_at bytes={} us={} at {}:{}",
+                dst.len(),
+                elapsed / 1000,
+                loc.file(),
+                loc.line()
+            );
         }
         self.check(code, "hipMemcpy D2H at offset")
     }
@@ -684,11 +886,16 @@ impl HipRuntime {
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump = *DUMP.get_or_init(|| {
-            std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1")
-        });
+        let dump =
+            *DUMP.get_or_init(|| std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1"));
         if dump {
-            eprintln!("memset bytes={} us={} at {}:{}", size, elapsed / 1000, loc.file(), loc.line());
+            eprintln!(
+                "memset bytes={} us={} at {}:{}",
+                size,
+                elapsed / 1000,
+                loc.file(),
+                loc.line()
+            );
         }
         self.check(code, "hipMemset")
     }
@@ -710,11 +917,16 @@ impl HipRuntime {
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump = *DUMP.get_or_init(|| {
-            std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1")
-        });
+        let dump =
+            *DUMP.get_or_init(|| std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1"));
         if dump {
-            eprintln!("memset_async bytes={} us={} at {}:{}", size, elapsed / 1000, loc.file(), loc.line());
+            eprintln!(
+                "memset_async bytes={} us={} at {}:{}",
+                size,
+                elapsed / 1000,
+                loc.file(),
+                loc.line()
+            );
         }
         self.check(code, "hipMemsetAsync")
     }
@@ -737,7 +949,6 @@ impl HipRuntime {
 
     pub fn stream_destroy(&self, stream: Stream) -> HipResult<()> {
         let code = unsafe { (self.fn_stream_destroy)(stream.0) };
-        std::mem::forget(stream);
         self.check(code, "hipStreamDestroy")
     }
 
@@ -764,8 +975,7 @@ impl HipRuntime {
         let c_name = CString::new(name)
             .map_err(|_| HipError::new(1, "invalid kernel name for module_get_function"))?;
         let mut func: HipFunction = ptr::null_mut();
-        let code =
-            unsafe { (self.fn_module_get_function)(&mut func, module.0, c_name.as_ptr()) };
+        let code = unsafe { (self.fn_module_get_function)(&mut func, module.0, c_name.as_ptr()) };
         self.check(code, "hipModuleGetFunction")?;
         Ok(Function(func))
     }
@@ -844,11 +1054,11 @@ impl HipRuntime {
         let blob_ptr: *mut c_void = kernarg_blob.as_mut_ptr() as *mut c_void;
         let size_ptr: *mut c_void = (&mut blob_size as *mut usize) as *mut c_void;
         let mut extra: [*mut c_void; 5] = [
-            0x01 as *mut c_void,       // HIP_LAUNCH_PARAM_BUFFER_POINTER
-            blob_ptr,                  // → persistent kernarg blob
-            0x02 as *mut c_void,       // HIP_LAUNCH_PARAM_BUFFER_SIZE
-            size_ptr,                  // → &blob_size (must live across the call)
-            0x03 as *mut c_void,       // HIP_LAUNCH_PARAM_END
+            0x01 as *mut c_void, // HIP_LAUNCH_PARAM_BUFFER_POINTER
+            blob_ptr,            // → persistent kernarg blob
+            0x02 as *mut c_void, // HIP_LAUNCH_PARAM_BUFFER_SIZE
+            size_ptr,            // → &blob_size (must live across the call)
+            0x03 as *mut c_void, // HIP_LAUNCH_PARAM_END
         ];
 
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
@@ -863,7 +1073,7 @@ impl HipRuntime {
             block[2],
             shared_mem,
             stream_raw,
-            ptr::null_mut(),           // kernelParams = null (we use extra)
+            ptr::null_mut(), // kernelParams = null (we use extra)
             extra.as_mut_ptr(),
         );
         crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
@@ -901,7 +1111,6 @@ impl HipRuntime {
 
     pub fn event_destroy(&self, event: Event) -> HipResult<()> {
         let code = unsafe { (self.fn_event_destroy)(event.0) };
-        std::mem::forget(event);
         self.check(code, "hipEventDestroy")
     }
 
@@ -975,7 +1184,9 @@ impl HipRuntime {
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
         let code = unsafe {
             (self.fn_memcpy_async)(
-                dst_ptr, src_ptr, size,
+                dst_ptr,
+                src_ptr,
+                size,
                 MemcpyKind::DeviceToDevice as c_uint,
                 stream.0,
             )
@@ -1020,13 +1231,11 @@ impl HipRuntime {
 
     pub fn graph_exec_destroy(&self, exec: GraphExec) -> HipResult<()> {
         let code = unsafe { (self.fn_graph_exec_destroy)(exec.0) };
-        std::mem::forget(exec);
         self.check(code, "hipGraphExecDestroy")
     }
 
     pub fn graph_destroy(&self, graph: Graph) -> HipResult<()> {
         let code = unsafe { (self.fn_graph_destroy)(graph.0) };
-        std::mem::forget(graph);
         self.check(code, "hipGraphDestroy")
     }
 
@@ -1034,7 +1243,13 @@ impl HipRuntime {
     /// The write is ordered with respect to other operations on the stream.
     /// Graph-safe: can be used before hipGraphLaunch to update device state
     /// that captured kernels will read (e.g., position buffers).
-    pub fn stream_write_value32(&self, stream: &Stream, ptr: &DeviceBuffer, value: u32, flags: u32) -> HipResult<()> {
+    pub fn stream_write_value32(
+        &self,
+        stream: &Stream,
+        ptr: &DeviceBuffer,
+        value: u32,
+        flags: u32,
+    ) -> HipResult<()> {
         let code = unsafe { (self.fn_stream_write_value32)(stream.0, ptr.as_ptr(), value, flags) };
         self.check(code, "hipStreamWriteValue32")
     }
@@ -1058,7 +1273,9 @@ impl HipRuntime {
         let s = String::from_utf8_lossy(&buf);
         if let Some(pos) = s.find("gfx") {
             let arch_str = &s[pos..];
-            let end = arch_str.find(|c: char| c == '\0' || c == ':' || c == ' ').unwrap_or(arch_str.len());
+            let end = arch_str
+                .find(|c: char| c == '\0' || c == ':' || c == ' ')
+                .unwrap_or(arch_str.len());
             Ok(arch_str[..end].to_string())
         } else {
             // Fallback: read as null-terminated string from known offsets
@@ -1079,7 +1296,9 @@ impl HipRuntime {
     /// when sysfs/KFD is unavailable (Windows, restricted containers).
     pub fn get_device_attribute(&self, attr_id: i32, device_id: i32) -> HipResult<i32> {
         let mut value: c_int = 0;
-        let code = unsafe { (self.fn_get_device_attribute)(&mut value, attr_id as c_int, device_id as c_int) };
+        let code = unsafe {
+            (self.fn_get_device_attribute)(&mut value, attr_id as c_int, device_id as c_int)
+        };
         self.check(code, "hipDeviceGetAttribute")?;
         Ok(value as i32)
     }
@@ -1098,6 +1317,11 @@ impl HipRuntime {
 
 /// GPU stream handle.
 pub struct Stream(HipStream);
+impl Stream {
+    pub fn as_raw(&self) -> *mut c_void {
+        self.0
+    }
+}
 unsafe impl Send for Stream {}
 
 /// Loaded GPU module (compiled kernels).
