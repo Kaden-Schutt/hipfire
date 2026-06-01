@@ -2230,6 +2230,16 @@ async function serve(port: number, host: string) {
         } else if ((body as any).reasoning?.effort === "none") {
           genParams.assistant_prefix = "closed_think";
           genParams.max_think_tokens = 1;
+        } else {
+          // Thinking is ON (config default, or explicit enable_thinking=true /
+          // reasoning.effort>=minimal). OPEN the <think> block so the model
+          // actually reasons instead of emitting an empty <think></think> and
+          // answering directly. Without this, generic OpenAI clients (which
+          // never send assistant_prefix) get no-think behaviour, which fails
+          // hard reasoning on thinking models like Qwen3.6. Safe for non-
+          // thinking models: the daemon's prompt frame falls back to Plain
+          // when the tokenizer has no `<think>` special token.
+          genParams.assistant_prefix = "open_think";
         }
         if (systemPrompt) genParams.system = systemPrompt;
 
