@@ -41,8 +41,6 @@ pub mod mtp_spec;
 pub mod mtp_compose;
 #[cfg(feature = "deltanet")]
 pub mod arch;
-#[cfg(feature = "deltanet")]
-pub mod paro_la_gates_codec;
 
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
