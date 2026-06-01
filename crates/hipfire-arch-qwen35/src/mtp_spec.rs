@@ -3467,7 +3467,7 @@ pub fn spec_step_mtp_compressed_serial_multi(
         None, // tree_verify — MTP verify is linear
         false, // needs_last_token_logits: MTP verify uses per_token_hidden_out,
                // not the last-token logits; skipping saves one rmsnorm + GEMV.
-    )?;;
+    )?;
 
     // ── 2b. lm_head GEMM + argmax (output_device — trunk.output lives there) ──
     let mut accept_count = 0usize;
