@@ -3425,6 +3425,7 @@ pub fn spec_step_mtp_compressed_serial_multi(
     // convention — verify writes there, rollback restores from there).
     {
         let target_gpu = &mut gpus.devices[output_device];
+        target_gpu.bind_thread()?;
         state.trunk_snap.save_from(target_dn, target_gpu)?;
     }
 
@@ -3458,6 +3459,7 @@ pub fn spec_step_mtp_compressed_serial_multi(
     let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
     {
         let target_gpu = &mut gpus.devices[output_device];
+        target_gpu.bind_thread()?;
         let w_out = &trunk_weights.output;
         let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
         match w_out.gpu_dtype {
@@ -3577,6 +3579,7 @@ pub fn spec_step_mtp_compressed_serial_multi(
     if !full_accept_no_eos {
         {
             let target_gpu = &mut gpus.devices[output_device];
+            target_gpu.bind_thread()?;
             state.trunk_snap.restore_to(target_dn, target_gpu)?;
         }
         if tape_captured {

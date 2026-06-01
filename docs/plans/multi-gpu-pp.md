@@ -377,6 +377,69 @@ and re-stated here for permanence:
 
 ---
 
+## 10. Follow-up items (from code review, 2026-06-01)
+
+Consolidated review of the PP+MTP implementation by Gemini CLI and
+Claude Opus 4.8. Three accepted findings deferred from the initial
+implementation. Full review at `multi_gpu_pp_code_rev_consolidated.md`.
+
+### 10.1 DeltaNetSnapshot multi-GPU awareness [Major-portability]
+
+`DeltaNetSnapshot::new_for` allocates all backup buffers on one device.
+`save_from`/`restore_to` use `hipMemcpy(DeviceToDevice)`, which works
+correctly with peer access enabled (the production path), but silently
+depends on an undocumented invariant: all devices holding `DeltaNetState`
+buffers must have peer access to the snapshot device.
+
+**Current status:** Correct on tested gfx906+gfx1031 (peer access enabled
+before forward). Not guaranteed on N≥3 topologies or degraded peer edges.
+
+**Fix options:**
+- (a) **Document + guard:** Add `debug_assert!` in `save_from`/`restore_to`
+  checking source buffer reachability. Document the peer-access contract
+  on `DeltaNetSnapshot`. Sufficient for v1.
+- (b) **Device-aware snapshot:** Allocate each backup buffer on the same
+  device as its source tensor (mirror `new_with_quant_multi`'s per-layer
+  device loop). Every copy becomes true same-device D2D. Removes the
+  peer-access dependency entirely and reclaims perf lost to cross-peer
+  copies during rollback.
+
+**Why this won't fix the PP-MTP decode speed gap:** The cross-peer
+snapshot copies happen only during rollback (partial-accept cycles).
+The copy is ~128 KB × N_LA_layers_on_dev0 ≈ 2–4 MB over the PCIe bus
+(~0.5–1 ms). But the PP cycle wall is ~70 ms, and only ~65% of cycles
+trigger rollback. So the snapshot accounts for <2% of total cycle time.
+Even eliminating it entirely (option b) would not close the 14→17.6
+tok/s gap to pp2-AR. The structural bottleneck is the serialized
+band-by-band forward, not the snapshot/restore overhead.
+
+### 10.2 BoundaryEvent handle leak on error paths [Minor]
+
+`multi_gpu.rs:46-56`: `Drop` detects an un-waited `BoundaryEvent` and
+prints a warning but cannot free the HIP event (no runtime handle
+stored). Any `?` between `boundary_copy` and `wait_boundary` leaks one
+HIP event per occurrence.
+
+**Current status:** The copy/wait pair is always tight on the happy
+path. Not hit in production. Real under fault injection / OOM mid-forward.
+
+**Fix:** Store the device id in `BoundaryEvent` so `Drop` can bind +
+`event_destroy`.
+
+### 10.3 GdnTapeShards async assembly [Minor, cold path]
+
+`GdnTapeShards::assemble_into` uses synchronous `memcpy_peer`. Blocks
+host during tape assembly across the boundary.
+
+**Current status:** Cold path — PpMTP v1 forces `tape_captured = false`
+and the tape replay branch is `unreachable!()`. Not reached in shipping
+code.
+
+**Fix:** If tape replay is revived (the §5d-iii path), move to
+`memcpy_peer_async` + single sync point.
+
+---
+
 ## 9. References
 
 - Issue [#58](https://github.com/Kaden-Schutt/hipfire/issues/58) —
