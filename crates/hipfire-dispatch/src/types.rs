@@ -82,6 +82,20 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     }
 }
 
+/// GEMV variant to run AFTER the activation has been rotated.
+/// ParoQ4G128 uses the Plain HFQ4G128 kernel post-Givens; the MQ family
+/// uses Prerotated kernels; non-rotated dtypes are Plain.
+pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
+    use DType::*;
+    match dtype {
+        ParoQ4G128 => GemvVariant::Plain,
+        MQ4G256 | MQ3G256 | MQ2G256 | MQ6G256 | MQ8G256
+        | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
+        | MFP4G32 | MQ4G128 => GemvVariant::Prerotated,
+        _ => GemvVariant::Plain,
+    }
+}
+
 // ── Flat kernel key enum ──────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]

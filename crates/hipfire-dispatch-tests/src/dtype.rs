@@ -117,3 +117,14 @@ fn rotation_plan_matches_legacy_needs_fwht() {
         );
     }
 }
+
+#[test]
+fn post_rotation_variant_paro_is_plain_mq_is_prerotated() {
+    use hipfire_dispatch::types::{dtype_post_rotation_variant, GemvVariant};
+    use rdna_compute::DType;
+    assert_eq!(dtype_post_rotation_variant(DType::ParoQ4G128), GemvVariant::Plain);
+    assert_eq!(dtype_post_rotation_variant(DType::MQ4G256), GemvVariant::Prerotated);
+    assert_eq!(dtype_post_rotation_variant(DType::MQ8G256), GemvVariant::Prerotated);
+    assert_eq!(dtype_post_rotation_variant(DType::MQ4G128), GemvVariant::Prerotated);
+    assert_eq!(dtype_post_rotation_variant(DType::HFQ4G256), GemvVariant::Plain);
+}
