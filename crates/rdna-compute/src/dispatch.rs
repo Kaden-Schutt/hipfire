@@ -18111,7 +18111,7 @@ impl Gpu {
         self.bind_thread()?;
         self.gemm_gate_up_moe_scalar_batched(
             "gemm_gate_up_hfq8g256_scalar_batched",
-            264,
+            258,
             a_gate,
             a_up,
             x,
@@ -18192,7 +18192,7 @@ impl Gpu {
         self.bind_thread()?;
         self.gemv_moe_scalar_residual_sigmoid_scaled_batched(
             "gemv_hfq8g256_residual_sigmoid_scaled_gpu_batched",
-            264,
+            258,
             a_raw,
             x_batch,
             y_batch,
@@ -18265,7 +18265,7 @@ impl Gpu {
         gemv_hfq8g256_moe_down_k8_indexed_batched_expanded,
         "gemv_hfq8g256_moe_gate_up_k8_indexed_batched",
         "gemv_hfq8g256_moe_down_k8_indexed_batched_expanded",
-        264
+        258
     );
     moe_scalar_indexed_wrappers!(
         gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched,

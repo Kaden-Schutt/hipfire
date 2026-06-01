@@ -51,20 +51,19 @@ __device__ __forceinline__ float dot_hfq8_g256(
     float acc = 0.0f;
     const int groups_per_row = K / 256;
     for (int g = 0; g < groups_per_row; ++g) {
-        const char* gp = row_ptr + g * 264;
-        const float scale = __builtin_bit_cast(float, *(const unsigned int*)(gp));
-        const float zero = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        const unsigned char* data = (const unsigned char*)(gp + 8);
+        const char* gp = row_ptr + g * 258;
+        const float scale = __half2float(*(const __half*)gp);
+        const signed char* data = (const signed char*)(gp + 2);
         const int base = g * 256 + tid * 8;
         const int byte_off = tid * 8;
-        acc += (scale * (float)data[byte_off] + zero) * x[base]
-            +  (scale * (float)data[byte_off + 1] + zero) * x[base + 1]
-            +  (scale * (float)data[byte_off + 2] + zero) * x[base + 2]
-            +  (scale * (float)data[byte_off + 3] + zero) * x[base + 3]
-            +  (scale * (float)data[byte_off + 4] + zero) * x[base + 4]
-            +  (scale * (float)data[byte_off + 5] + zero) * x[base + 5]
-            +  (scale * (float)data[byte_off + 6] + zero) * x[base + 6]
-            +  (scale * (float)data[byte_off + 7] + zero) * x[base + 7];
+        acc += scale * (float)data[byte_off] * x[base]
+            +  scale * (float)data[byte_off + 1] * x[base + 1]
+            +  scale * (float)data[byte_off + 2] * x[base + 2]
+            +  scale * (float)data[byte_off + 3] * x[base + 3]
+            +  scale * (float)data[byte_off + 4] * x[base + 4]
+            +  scale * (float)data[byte_off + 5] * x[base + 5]
+            +  scale * (float)data[byte_off + 6] * x[base + 6]
+            +  scale * (float)data[byte_off + 7] * x[base + 7];
     }
     return acc;
 }
@@ -226,7 +225,6 @@ extern "C" __global__ void gemv_##TAG##_moe_down_k8_indexed_batched_expanded( \
 }
 
 DEFINE_MOE_FAMILY(hfq2g256, dot_hfq2_g256, 72)
-DEFINE_MOE_FAMILY(hfq8g256, dot_hfq8_g256, 264)
+DEFINE_MOE_FAMILY(hfq8g256, dot_hfq8_g256, 258)
 DEFINE_MOE_FAMILY(mq2g256_lloyd, dot_mq2_lloyd_g256, 72)
 DEFINE_MOE_FAMILY(mq3g256_lloyd, dot_mq3_lloyd_g256, 112)
-
