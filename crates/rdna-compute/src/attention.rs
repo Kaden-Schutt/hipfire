@@ -1028,7 +1028,9 @@ impl Gpu {
         let obj_path = self.compiler.compile(name, &full_src)?;
         let obj_path_str = obj_path.to_str().unwrap().to_string();
         if !self.modules.contains_key(name) {
-            let module = self.hip.module_load(&obj_path_str)?;
+            let module = crate::scratch::module_load_or_recompile(
+                &self.hip, &mut self.compiler, name, &full_src, &obj_path_str,
+            )?;
             self.modules.insert(name.to_string(), module);
         }
         let module = &self.modules[name];
