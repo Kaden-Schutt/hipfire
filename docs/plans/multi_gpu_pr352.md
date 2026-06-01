@@ -847,3 +847,38 @@ Everything — tape data, conv weights, DN state — is already local.
 4. GdnTapeShards async assembly — rejected (cold path, tape replay
    eliminated the need for `assemble_into`)
 5. Llama PP guard — rejected (guard exists at daemon.rs:2755)
+
+## 15. Design history
+
+Key design decisions were informed by the following preliminary analyses
+(now deleted from the tree — superseded by implementation):
+
+- **VRAM budget analysis** (`pp_plus_mtp_audit.md`): established that
+  qwen3.6-27b with 48 LA + 16 FA layers wastes ~3× KV VRAM without
+  filtered constructors. Confirmed gfx1031 can host 16–24 layers at
+  128k ctx with filtered KV. This drove the Stage 1 `_filtered_multi`
+  KV constructors and the 52,12 / 48,16 split benchmarks.
+- **Per-call swimlane audit** (`mtp_multi_gpu_split_audit.md`): classified
+  every `gpu.X` call in the MTP spec function as TRUNK or DRAFTER.
+  Discovered that compressed-sidecar `.mtp` files eliminate the need for
+  `trunk.output` mirroring — only `token_embd` needs to be mirrored
+  (~640 MB to the drafter device).
+- **Daemon dispatch plan** (`mtp_multi_refactor.md`): Stage 2b plan for
+  integrating PP+MTP into the daemon's serve path. Superseded by the
+  actual implementation in commits `37678c70`–`56425127`.
+- **External reviews** (`mtp_multi_gpu_glm5.md`, `mtp_multi_refactor_plan_rev_claude.md`,
+  `multi_gpu_pp_code_rev_consolidated.md`): Gemini CLI, Claude Opus 4.8,
+  and GLM-5 reviews of the plan and implementation. Consolidated findings
+  tracked in §10 of `multi-gpu-pp.md` and §14 above.
+
+## 16. Commit history (this branch)
+
+| Commit | Description |
+|---|---|
+| `37678c70` | Port PR #352 device-token-chain + GPU accept to multi-GPU MTP path |
+| `b33624bf` | Delete dead `spec_step_mtp_compressed_serial_hetero` (-868 LOC) |
+| `87fd0ccc` | Remove legacy env-gated branches from `_multi` (-109 LOC) |
+| `9a7aafc8` | `bind_thread()` in verify blocks + consolidated code review |
+| `56425127` | Opt 3: per-band GDN tape replay (+21.7% decode tok/s on 27B) |
+| `54d2c68a` | Fix double-semicolon warning |
+| `ff155303` | Update plan with §14 |

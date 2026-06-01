@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! MTP-only speculative decode: standalone trunk + native MTP head loop.
 //!
 //! The MTP head ([`crate::mtp_head`], Task 9) is a single transformer-decoder

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! mtp_only_demo: standalone Qwen3.5 MTP-only spec-decode bench harness.
 //!
 //! Loads a Qwen3.5 trunk (.hfq / .mq4 / etc.) and a native MTP head (.mtp,

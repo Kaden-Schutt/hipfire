@@ -426,17 +426,14 @@ path. Not hit in production. Real under fault injection / OOM mid-forward.
 **Fix:** Store the device id in `BoundaryEvent` so `Drop` can bind +
 `event_destroy`.
 
-### 10.3 GdnTapeShards async assembly [Minor, cold path]
+### 10.3 GdnTapeShards ~~async assembly~~ [Obsolete]
 
-`GdnTapeShards::assemble_into` uses synchronous `memcpy_peer`. Blocks
-host during tape assembly across the boundary.
+~~`GdnTapeShards::assemble_into` uses synchronous `memcpy_peer`.~~
 
-**Current status:** Cold path — PpMTP v1 forces `tape_captured = false`
-and the tape replay branch is `unreachable!()`. Not reached in shipping
-code.
-
-**Fix:** If tape replay is revived (the §5d-iii path), move to
-`memcpy_peer_async` + single sync point.
+**Status:** `assemble_into` is dead code after Opt 3 (commit `56425127`).
+The PP+MTP stepper now replays directly from per-band shards via
+`replay_gdn_multi` — no assembly into a target tape needed. The
+`assemble_into` method can be deleted in a cleanup pass.
 
 ---
 
