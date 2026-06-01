@@ -137,3 +137,15 @@ fn q8hfq_resolves_to_plain_gemv_key() {
         .expect("Q8HFQ Plain must resolve");
     assert_eq!(key, KernelKey::GemvQ8HFQ);
 }
+
+#[test]
+fn rotation_tag_distinguishes_awq_and_batched() {
+    use hipfire_dispatch::families::gemv::RotationTag;
+    use hipfire_dispatch::types::RotationPlan;
+    let base = RotationTag { plan: RotationPlan::FwhtG256, awq: false, batched: false };
+    let awq  = RotationTag { plan: RotationPlan::FwhtG256, awq: true,  batched: false };
+    let bat  = RotationTag { plan: RotationPlan::FwhtG256, awq: false, batched: true };
+    assert_ne!(base, awq, "AWQ vs non-AWQ must not compare equal");
+    assert_ne!(base, bat, "batched vs non-batched must not compare equal");
+    assert_eq!(base, RotationTag { plan: RotationPlan::FwhtG256, awq: false, batched: false });
+}

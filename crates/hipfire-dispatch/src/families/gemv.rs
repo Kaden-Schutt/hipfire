@@ -51,6 +51,65 @@ pub struct GemvParams<'a> {
     pub up: Option<&'a GpuTensor>,
 }
 
+/// Full rotation signature carried by a RotatedActivation. Records the
+/// sign-domain plan AND the awq/batched sub-variant so `run()` can reject
+/// a buffer rotated under a different kernel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RotationTag {
+    pub plan: crate::types::RotationPlan,
+    pub awq: bool,
+    pub batched: bool,
+}
+
+/// A rotated activation buffer plus the tag of the rotation that produced it.
+pub struct RotatedActivation {
+    pub(crate) x_rot: GpuTensor,
+    pub(crate) tag: RotationTag,
+}
+
+impl Clone for RotatedActivation {
+    fn clone(&self) -> Self {
+        RotatedActivation {
+            x_rot: GpuTensor {
+                buf: unsafe { self.x_rot.buf.alias() },
+                shape: self.x_rot.shape.clone(),
+                dtype: self.x_rot.dtype,
+            },
+            tag: self.tag,
+        }
+    }
+}
+
+impl RotatedActivation {
+    /// Fused QKV / gate-up / MoE kernels take a raw &GpuTensor; expose the
+    /// rotated buffer for them. The tag still guards the `run()` path.
+    pub fn buf(&self) -> &GpuTensor { &self.x_rot }
+    pub fn tag(&self) -> RotationTag { self.tag }
+    pub fn into_buf(self) -> GpuTensor { self.x_rot }
+}
+
+/// GEMV input: raw (family rotates if the plan needs it) or pre-rotated.
+pub enum RotInput<'a> {
+    Raw(&'a GpuTensor),
+    Rotated(RotatedActivation),
+}
+
+/// Caller's fusion intent + inputs for `rotate()`. The combination of which
+/// fields are Some, plus the weight's plan + awq_scale + batch_size, selects
+/// the concrete RotationVariant inside RotationFamily.
+pub struct RotateInputs<'a> {
+    pub norm_weight: Option<&'a GpuTensor>,
+    pub eps: f32,
+    pub swiglu_up: Option<&'a GpuTensor>,
+    pub batch_size: usize,
+}
+
+impl Default for RotateInputs<'_> {
+    fn default() -> Self {
+        Self { norm_weight: None, eps: 1e-6, swiglu_up: None, batch_size: 1 }
+    }
+}
+
 // ── Family ─────────────────────────────────────────────
 
 pub struct GemvFamily {
