@@ -114,7 +114,15 @@ impl KvAdaptive {
         let mut s = Self {
             n_kv_heads, head_dim, max_seq, k_floor, v_floor,
             cur_k: KMode::Fwht4, cur_v: VMode::Q8, steps, next_step: 0,
-            thresholds: Vec::new(), margin: 64,
+            // margin MUST be >= the largest single seq_pos advance between two
+            // maybe_downshift calls. The prefill loop advances by up to
+            // PREFILL_MAX_BATCH per chunk and only downshifts BETWEEN chunks, so
+            // the threshold has to fire a full chunk early — otherwise the chunk
+            // that trips it would already have written past `cap` (the
+            // floor-sized buffer's start-tier ceiling), overflowing it before the
+            // post-chunk downshift can free room. Decode advances 1/token, where
+            // 256 is comfortably conservative.
+            thresholds: Vec::new(), margin: crate::llama::PREFILL_MAX_BATCH,
         };
         s.recompute_thresholds();
         s
@@ -126,6 +134,16 @@ impl KvAdaptive {
     }
     pub fn v_buf_bytes_per_layer(&self) -> usize {
         v_buf_bytes_per_layer(self.max_seq, self.n_kv_heads, self.head_dim, self.v_floor)
+    }
+
+    /// Usable token capacity at the CURRENT (cur_k, cur_v) tier — the binding
+    /// floor-sized buffer's position count. Smallest at the q8/fwht4 start tier
+    /// (each position is largest there), growing as precision steps down. The
+    /// load path checks the start-tier value against PREFILL_MAX_BATCH before
+    /// engaging: a single prefill chunk must fit at the start tier, or the very
+    /// first chunk would overflow the floor buffer before any downshift fires.
+    pub fn current_cap(&self) -> usize {
+        cap_min(self.max_seq, self.head_dim, self.k_floor, self.v_floor, self.cur_k, self.cur_v)
     }
 
     /// threshold[i] = cap(state BEFORE applying steps[i]) - margin: the seq_pos
@@ -204,8 +222,23 @@ mod tests {
         // thresholds non-decreasing (coincident allowed when steps share a
         // binding point — here V→l3 and K→f2 both at ~0.515*max_seq).
         for w in a.thresholds.windows(2) { assert!(w[1] >= w[0], "thresholds {:?}", a.thresholds); }
-        // first threshold is V-bound (~0.25*max_seq - margin)
-        assert!((2400..=2500).contains(&a.thresholds[0]), "first threshold {:?}", a.thresholds[0]);
+        // first threshold = start-tier cap (V-bound, 0.25*max_seq=2500) - margin.
+        // Asserted relative to a.margin so it tracks the chunk-safety value.
+        let start_cap = cap_min(10_000, 256, KMode::Fwht2, VMode::Lloyd2, KMode::Fwht4, VMode::Q8);
+        assert_eq!(start_cap, 2500);
+        assert_eq!(a.current_cap(), start_cap, "current_cap at construction == start-tier cap");
+        assert_eq!(a.thresholds[0], start_cap - a.margin, "first threshold = start_cap - margin");
+    }
+    #[test]
+    fn margin_at_least_one_prefill_chunk() {
+        // SAFETY INVARIANT: the prefill loop advances seq_pos by up to
+        // PREFILL_MAX_BATCH per chunk and only downshifts between chunks, so the
+        // threshold must fire >= one chunk early or the tripping chunk writes
+        // past the floor buffer. See daemon.rs prefill loop + the load-time
+        // start_cap >= PREFILL_MAX_BATCH guard.
+        let a = KvAdaptive::from_preset(Preset::Balanced, 100_000, 4, 256);
+        assert!(a.margin >= crate::llama::PREFILL_MAX_BATCH,
+            "margin {} must be >= PREFILL_MAX_BATCH {}", a.margin, crate::llama::PREFILL_MAX_BATCH);
     }
     #[test]
     fn conservative_only_v_to_lloyd4() {

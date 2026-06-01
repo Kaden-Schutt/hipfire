@@ -3031,8 +3031,37 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             match parse_kv_adaptive(&kv_adaptive_spec) {
                 None => None,
                 Some((preset, k_floor, v_floor)) => {
-                    // Adaptive requires an FWHT K mode. Reuse the lloyd-V guard.
-                    if (kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) && kv.quant_fwht {
+                    // Build the controller first (pure CPU, no GPU side effects)
+                    // so the guards below can read its start-tier capacity and
+                    // thresholds BEFORE we shrink any buffers.
+                    let ad = match preset {
+                        Some(p) => KvAdaptive::from_preset(p, max_seq, config.n_kv_heads, config.head_dim),
+                        None => KvAdaptive::new(max_seq, config.n_kv_heads, config.head_dim, k_floor, v_floor),
+                    };
+                    // Guard 1: adaptive requires an FWHT K mode. Reuse the lloyd-V guard.
+                    if !((kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) && kv.quant_fwht) {
+                        eprintln!("[daemon] kv_adaptive={kv_adaptive_spec} ignored — adaptive KV requires an FWHT K mode (fwht2/3/4); cache is a different mode");
+                        None
+                    // Guard 2: adaptive is the no-eviction floor-buffer capacity
+                    // strategy; CASK eviction is the alternative. They are mutually
+                    // exclusive — running both leaves thresholds (computed from
+                    // max_seq) inconsistent with an eviction-bounded buffer.
+                    } else if cask.sidecar.is_some() {
+                        eprintln!("[daemon] kv_adaptive={kv_adaptive_spec} ignored — adaptive KV is a no-eviction capacity strategy and CASK eviction is active (mutually exclusive); reload without --cask-sidecar to use adaptive");
+                        None
+                    // Guard 3: the prefill loop writes whole PREFILL_MAX_BATCH
+                    // chunks at the start tier before the between-chunk downshift
+                    // can free room. If the start-tier capacity is smaller than one
+                    // chunk, even the first chunk overflows the floor-sized buffer.
+                    // Refuse rather than OOB (only hit at tiny max_seq where
+                    // adaptive is pointless anyway).
+                    } else if ad.current_cap() < hipfire_runtime::llama::PREFILL_MAX_BATCH {
+                        eprintln!(
+                            "[daemon] kv_adaptive={kv_adaptive_spec} ignored — max_seq={} too small: start-tier capacity {} < prefill chunk {} (raise max_seq or use a higher floor)",
+                            max_seq, ad.current_cap(), hipfire_runtime::llama::PREFILL_MAX_BATCH,
+                        );
+                        None
+                    } else {
                         // adaptive expects K=fwht4 at start; warn if the loaded K
                         // mode isn't fwht4 (full kv_mode-forcing is a later task —
                         // do NOT override the user's kv_mode here).
@@ -3046,18 +3075,11 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                         // footprint equals fwht4 so K is left unresized.
                         let k_floor_bph = k_floor.bytes_per_head(config.head_dim);
                         kv.set_adaptive_floor_alloc(gpu, v_floor, k_floor_bph).map_err(|e| format!("{e}"))?;
-                        let ad = match preset {
-                            Some(p) => KvAdaptive::from_preset(p, max_seq, config.n_kv_heads, config.head_dim),
-                            None => KvAdaptive::new(max_seq, config.n_kv_heads, config.head_dim, k_floor, v_floor),
-                        };
                         eprintln!(
-                            "[adaptive-kv] engaged: pattern={:?} k_floor={:?} v_floor={:?} thresholds={:?} (max_seq={}, V buffer sized at floor)",
-                            ad.steps, ad.k_floor, ad.v_floor, ad.thresholds, max_seq,
+                            "[adaptive-kv] engaged: pattern={:?} k_floor={:?} v_floor={:?} thresholds={:?} start_cap={} (max_seq={}, V buffer sized at floor)",
+                            ad.steps, ad.k_floor, ad.v_floor, ad.thresholds, ad.current_cap(), max_seq,
                         );
                         Some(ad)
-                    } else {
-                        eprintln!("[daemon] kv_adaptive={kv_adaptive_spec} ignored — adaptive KV requires an FWHT K mode (fwht2/3/4); cache is a different mode");
-                        None
                     }
                 }
             }
@@ -6284,6 +6306,18 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                     None, None, None, None,
                 ).unwrap();
                 m.seq_pos += chunk.len();
+                // Adaptive KV: downshift BETWEEN prefill chunks the moment the
+                // start-tier (q8/fwht4) buffer fills, so a long prompt can't
+                // overflow the floor-sized buffer before decode begins. The
+                // controller's margin (>= PREFILL_MAX_BATCH) guarantees the chunk
+                // that trips a threshold still wrote in-bounds; this call then
+                // re-quantizes [0, seq_pos) down a tier, freeing room for the next
+                // chunk. `m.kv_adaptive` is disjoint from the live kv/dn borrows.
+                if let Some(ad) = m.kv_adaptive.as_mut() {
+                    for step in ad.maybe_downshift(gpu, kv, m.seq_pos).unwrap() {
+                        eprintln!("[adaptive-kv] downshift @ pos {} (prefill): {:?} (K={:?} V={:?})", m.seq_pos, step, ad.cur_k, ad.cur_v);
+                    }
+                }
                 // Snapshot the recurrent state every ckpt_interval() tokens so a
                 // later divergent render can resume here instead of cold. `dn`
                 // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
