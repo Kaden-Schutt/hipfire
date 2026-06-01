@@ -399,6 +399,22 @@ fn dtype_needs_fwht_false_for_hfq_and_scalar() {
     }
 }
 
+#[test]
+fn gemv_steps_rotation_matches_plan() {
+    for dtype in [DType::MQ4G256, DType::MFP4G32, DType::ParoQ4G128, DType::HFQ4G256] {
+        let steps = KernelKey::gemv_steps(dtype, GemvVariant::Plain);
+        let plan = dtype_rotation_plan(dtype);
+        let has_fwht = steps.contains(&PipelineOp::RotateFwht);
+        let has_givens = steps.contains(&PipelineOp::GivensRotate);
+        match plan {
+            RotationPlan::Givens => { assert!(has_givens && !has_fwht, "{dtype:?}: Givens plan must emit GivensRotate, not FWHT"); }
+            RotationPlan::FwhtG256 | RotationPlan::FwhtG128 => { assert!(has_fwht && !has_givens, "{dtype:?}: FWHT plan must emit RotateFwht"); }
+            RotationPlan::None => { assert!(!has_fwht && !has_givens, "{dtype:?}: no rotation"); }
+            RotationPlan::Mq8Internal => {}
+        }
+    }
+}
+
 // ── GemvFamily::resolve via populated table ───────────────────────────────────
 
 #[test]

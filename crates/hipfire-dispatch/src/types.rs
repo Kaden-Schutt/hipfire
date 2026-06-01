@@ -439,15 +439,11 @@ impl KernelKey {
         use GemvVariant::*;
         match variant {
             Plain => {
-                let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ4G128 | MQ3G256 | MQ2G256 | MQ6G256 | MQ8G256
-                    | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
-                    | MFP4G32 | ParoQ4G128 => {
-                        &[PipelineOp::RotateFwht, PipelineOp::Gemv]
-                    }
-                    _ => &[PipelineOp::Gemv],
-                };
-                steps
+                match dtype_rotation_plan(dtype) {
+                    RotationPlan::Givens => &[PipelineOp::GivensRotate, PipelineOp::Gemv],
+                    RotationPlan::None => &[PipelineOp::Gemv],
+                    _ => &[PipelineOp::RotateFwht, PipelineOp::Gemv],
+                }
             }
             Prerotated => {
                 &[PipelineOp::Gemv]
