@@ -81,8 +81,6 @@ pub(crate) const FP8_WMMA_MIN_BATCH: usize = 1024;
 /// than uniformly applying FP8 everywhere.
 pub(crate) const FP8_GEMV_MIN_M: usize = 4096;
 
-
-
 /// Tensor stored on the GPU. Tracks shape and element type.
 pub struct GpuTensor {
     pub buf: DeviceBuffer,
@@ -117,42 +115,42 @@ impl GpuTensor {
 pub enum DType {
     F32,
     F16,
-    Q4K,  // 144 bytes per 256 elements
-    Q6K,  // 210 bytes per 256 elements
-    Q8_0,      // 34 bytes per 32 elements
-    Q4F16G64,  // 36 bytes per 64 elements (RDNA-native FP16 dequant)
-    Q4F16G32,  // 20 bytes per 32 elements (RDNA-native FP16 dequant)
-    Q8HFQ,     // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
-    HFQ4G256,  // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
-    HFQ4G128,  // 72 bytes per 128 elements (flat 4-bit, f32 scale+zero, 14 VGPRs)
-    PARO4G128, // ParoQuant: native G128 W4 plus pairwise activation rotation metadata
-    PARO4G128T, // ParoQuant: engine-tiled qweight [M/8, K] for coalesced GEMV reads
-    HFQ3G256,  // 104 bytes per 256 elements (flat 3-bit, f32 scale+zero)
-    HFQ3G128,  // 56 bytes per 128 elements (flat 3-bit, f32 scale+zero)
-    MQ4G256,   // MagnumQuant: FWHT-rotated HFQ4-G256 (136 bytes/group, same as HFQ4G256)
-    MQ4G128,   // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
-    MQ8G256,   // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
-    MQ6G256,   // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
-    MQ3G256,   // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
-    MQ2G256,   // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
+    Q4K,          // 144 bytes per 256 elements
+    Q6K,          // 210 bytes per 256 elements
+    Q8_0,         // 34 bytes per 32 elements
+    Q4F16G64,     // 36 bytes per 64 elements (RDNA-native FP16 dequant)
+    Q4F16G32,     // 20 bytes per 32 elements (RDNA-native FP16 dequant)
+    Q8HFQ,        // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
+    HFQ4G256,     // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
+    HFQ4G128,     // 72 bytes per 128 elements (flat 4-bit, f32 scale+zero, 14 VGPRs)
+    PARO4G128,    // ParoQuant: native G128 W4 plus pairwise activation rotation metadata
+    PARO4G128T,   // ParoQuant: engine-tiled qweight [M/8, K] for coalesced GEMV reads
+    HFQ3G256,     // 104 bytes per 256 elements (flat 3-bit, f32 scale+zero)
+    HFQ3G128,     // 56 bytes per 128 elements (flat 3-bit, f32 scale+zero)
+    MQ4G256,      // MagnumQuant: FWHT-rotated HFQ4-G256 (136 bytes/group, same as HFQ4G256)
+    MQ4G128,      // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
+    MQ8G256,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
+    MQ6G256,      // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
+    MQ3G256,      // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
+    MQ2G256,      // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
     MQ2G256Lloyd, // MagnumQuant 2-bit + Lloyd-Max 4-entry fp16 codebook (72 bytes/group)
     MQ3G256Lloyd, // MagnumQuant 3-bit + Lloyd-Max 8-entry fp16 codebook (112 bytes/group)
     MQ4G256Lloyd, // MagnumQuant 4-bit + Lloyd-Max 16-entry fp16 codebook (160 bytes/group)
-    HFP4G32,   // HFP4: E2M1 element + UE8M0 g32 block scale + FP16 row scale.
-               // Per-row header 16 B; per-block payload 17 B (UE8M0 + 16 packed nibbles).
-               // See docs/quant-formats/hfp4.md.
-    MFP4G32,   // MFP4: HFP4G32 + offline FWHT (drop-in MQ4 replacement). Same byte layout
-               // as HFP4G32; format_flags bit 0 + bits 2-3 = 01 stamps the rotation kind.
-               // Runtime applies the matching FWHT to x via mq_rotate_x; the kernel itself
-               // is shared with HFP4G32.
-    HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
-    HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
-    HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
+    HFP4G32,      // HFP4: E2M1 element + UE8M0 g32 block scale + FP16 row scale.
+    // Per-row header 16 B; per-block payload 17 B (UE8M0 + 16 packed nibbles).
+    // See docs/quant-formats/hfp4.md.
+    MFP4G32, // MFP4: HFP4G32 + offline FWHT (drop-in MQ4 replacement). Same byte layout
+    // as HFP4G32; format_flags bit 0 + bits 2-3 = 01 stamps the rotation kind.
+    // Runtime applies the matching FWHT to x via mq_rotate_x; the kernel itself
+    // is shared with HFP4G32.
+    HFQ2G256,   // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
+    HFQ2G128,   // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
+    HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     ParoQ4G128, // ParoQuant: AWQ-packed INT4 G128 repacked to HFQ4G128 layout at load.
-                // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
-                // is that weight_gemv applies Givens rotation to activations before GEMV.
-                // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
-    Raw,       // raw bytes, no element interpretation
+    // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
+    // is that weight_gemv applies Givens rotation to activations before GEMV.
+    // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
+    Raw, // raw bytes, no element interpretation
 }
 
 impl DType {
@@ -160,7 +158,34 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::PARO4G128 | DType::PARO4G128T | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ4G128 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MQ4G256Lloyd | DType::HFP4G32 | DType::MFP4G32 | DType::ParoQ4G128 | DType::Raw => 1, // byte-level
+            DType::Q4K
+            | DType::Q6K
+            | DType::Q8_0
+            | DType::Q4F16G64
+            | DType::Q4F16G32
+            | DType::Q8HFQ
+            | DType::HFQ4G256
+            | DType::HFQ4G128
+            | DType::PARO4G128
+            | DType::PARO4G128T
+            | DType::HFQ3G256
+            | DType::HFQ3G128
+            | DType::HFQ2G256
+            | DType::HFQ2G128
+            | DType::HFQ6G256
+            | DType::MQ4G256
+            | DType::MQ4G128
+            | DType::MQ6G256
+            | DType::MQ8G256
+            | DType::MQ3G256
+            | DType::MQ2G256
+            | DType::MQ2G256Lloyd
+            | DType::MQ3G256Lloyd
+            | DType::MQ4G256Lloyd
+            | DType::HFP4G32
+            | DType::MFP4G32
+            | DType::ParoQ4G128
+            | DType::Raw => 1, // byte-level
         }
     }
 
@@ -317,10 +342,16 @@ pub struct Gpu {
 /// device-side init (`ensure_mq_signs` / `ensure_mq_signs_128`).
 pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     let mut state = seed;
-    (0..n).map(|_| {
-        state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-        if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
-    }).collect()
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+            if (state >> 16) & 1 == 1 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
+        })
+        .collect()
 }
 
 impl Gpu {
@@ -369,7 +400,8 @@ impl Gpu {
         while t0.elapsed().as_secs_f32() < secs {
             // Rotate the fill byte so the driver/card can't short-circuit
             // repeated identical writes via any dedup or cache-match path.
-            self.hip.memset(&scratch, (n & 0xFF) as i32, SCRATCH_BYTES)?;
+            self.hip
+                .memset(&scratch, (n & 0xFF) as i32, SCRATCH_BYTES)?;
             self.hip.device_synchronize()?;
             n = n.wrapping_add(1);
         }
@@ -416,16 +448,28 @@ impl Gpu {
         // Check HIP runtime version matches GPU arch requirements
         let (hip_major, hip_minor) = hip.runtime_version().unwrap_or((0, 0));
         let (min_major, min_minor) = match arch.as_str() {
-            "gfx1200" | "gfx1201" => (6, 4), // RDNA4 needs ROCm 6.4+
+            "gfx1200" | "gfx1201" => (6, 4),             // RDNA4 needs ROCm 6.4+
             "gfx1150" | "gfx1151" | "gfx1152" => (7, 2), // RDNA3.5 (Strix) needs ROCm 7.2+
             "gfx1100" | "gfx1101" | "gfx1102" => (5, 5), // RDNA3 needs ROCm 5.5+
             _ => (5, 0),
         };
-        if hip_major > 0 && (hip_major < min_major || (hip_major == min_major && hip_minor < min_minor)) {
-            eprintln!("WARNING: HIP runtime {}.{} may not support {}. Minimum: {}.{}", hip_major, hip_minor, arch, min_major, min_minor);
+        if hip_major > 0
+            && (hip_major < min_major || (hip_major == min_major && hip_minor < min_minor))
+        {
+            eprintln!(
+                "WARNING: HIP runtime {}.{} may not support {}. Minimum: {}.{}",
+                hip_major, hip_minor, arch, min_major, min_minor
+            );
             eprintln!("  Update your HIP runtime or kernels may fail to load.");
         }
-        eprintln!("GPU dev {}: {} ({:.1} GB VRAM, HIP {}.{})", id, arch, vram_total as f64 / 1e9, hip_major, hip_minor);
+        eprintln!(
+            "GPU dev {}: {} ({:.1} GB VRAM, HIP {}.{})",
+            id,
+            arch,
+            vram_total as f64 / 1e9,
+            hip_major,
+            hip_minor
+        );
 
         let flags = Arc::new(FeatureFlags::from_env(&arch));
         let arch_caps = crate::arch_caps::ArchCaps::new(&arch, flags.clone());
@@ -515,24 +559,34 @@ impl Gpu {
     /// Callers always fall back to the non-rocBLAS path.
     pub fn try_init_rocblas(&mut self) {
         self.bind_thread_or_warn();
-        if self.rocblas.is_some() { return; }
+        if self.rocblas.is_some() {
+            return;
+        }
         let cdna3 = self.arch_caps.is_cdna3();
         let all_archs = self.flags.rocblas_all_archs;
-        if !cdna3 && !all_archs { return; }
+        if !cdna3 && !all_archs {
+            return;
+        }
         match Rocblas::load() {
             Ok(rb) => {
                 // Bind to the active stream if present; otherwise rocBLAS uses
                 // the default (null) stream, which still works — just bigger
                 // host-side sync cost.
                 if let Some(stream) = self.active_stream.as_ref() {
-                    let raw = stream as *const _ as *mut c_void;
-                    let _ = rb.set_stream(raw);
+                    if let Err(e) = rb.set_stream(stream) {
+                        eprintln!(
+                            "[rocblas] failed to bind active stream ({e}); using default stream"
+                        );
+                    }
                 }
                 eprintln!("[rocblas] loaded for {}", self.arch);
                 self.rocblas = Some(rb);
             }
             Err(e) => {
-                eprintln!("[rocblas] not available ({}); falling back to hand-rolled GEMMs", e);
+                eprintln!(
+                    "[rocblas] not available ({}); falling back to hand-rolled GEMMs",
+                    e
+                );
             }
         }
     }
@@ -549,10 +603,14 @@ impl Gpu {
         &mut self,
         w_mq4: &DeviceBuffer,
         w_fp16: &DeviceBuffer,
-        m: usize, k: usize,
+        m: usize,
+        k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(k % 256 == 0, "hfq4g256 dequant: K must be multiple of 256 (got {k})");
+        assert!(
+            k % 256 == 0,
+            "hfq4g256 dequant: K must be multiple of 256 (got {k})"
+        );
         self.ensure_kernel(
             "hfq4g256_dequantize_to_f16",
             kernels::HFQ4G256_DEQUANTIZE_TO_F16_SRC,
@@ -571,8 +629,14 @@ impl Gpu {
         ];
         let groups = (k / 256) as u32;
         unsafe {
-            self.hip.launch_kernel(func, [m as u32, groups, 1], [128, 1, 1], 0,
-                self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [m as u32, groups, 1],
+                [128, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -592,9 +656,11 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         if let Some(stream) = self.active_stream.as_ref() {
-            self.hip.memcpy_dtod_async_at(dst, dst_offset, src, src_offset, size, stream)
+            self.hip
+                .memcpy_dtod_async_at(dst, dst_offset, src, src_offset, size, stream)
         } else {
-            self.hip.memcpy_dtod_at(dst, dst_offset, src, src_offset, size)
+            self.hip
+                .memcpy_dtod_at(dst, dst_offset, src, src_offset, size)
         }
     }
 
@@ -616,14 +682,12 @@ impl Gpu {
     /// dependency with the capturing stream. This method routes to
     /// `memcpy_htod_async` on the active (capturing) stream when in capture
     /// mode, falling back to sync `memcpy_htod` otherwise.
-    pub fn memcpy_htod_auto(
-        &self,
-        dst: &hip_bridge::DeviceBuffer,
-        src: &[u8],
-    ) -> HipResult<()> {
+    pub fn memcpy_htod_auto(&self, dst: &hip_bridge::DeviceBuffer, src: &[u8]) -> HipResult<()> {
         self.bind_thread()?;
         if self.graphs.capture_mode {
-            let stream = self.active_stream.as_ref()
+            let stream = self
+                .active_stream
+                .as_ref()
                 .expect("capture mode requires an active stream");
             self.hip.memcpy_htod_async(dst, src, stream)
         } else {
@@ -693,15 +757,24 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let func = self.functions.get(func_name).ok_or_else(|| {
-            hip_bridge::HipError::new(0, &format!("launch_kernel_blob: function '{func_name}' not loaded"))
+            hip_bridge::HipError::new(
+                0,
+                &format!("launch_kernel_blob: function '{func_name}' not loaded"),
+            )
         })?;
         unsafe {
-            self.hip.launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
+            self.hip
+                .launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
         }
     }
 
     /// Compile and load a kernel, caching the result.
-    pub(crate) fn ensure_kernel(&mut self, module_name: &str, source: &str, func_name: &str) -> HipResult<()> {
+    pub(crate) fn ensure_kernel(
+        &mut self,
+        module_name: &str,
+        source: &str,
+        func_name: &str,
+    ) -> HipResult<()> {
         crate::scratch::compile_and_load_kernel(
             &mut self.compiler,
             &self.hip,
@@ -716,7 +789,11 @@ impl Gpu {
     /// Ensure the FP16 X scratch contains the conversion of `x`. Skips the
     /// convert kernel if `x.buf.as_ptr()` matches the last converted source.
     /// Returns the FP16 device pointer.
-    pub(crate) fn ensure_fp16_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
+    pub(crate) fn ensure_fp16_x(
+        &mut self,
+        x: &GpuTensor,
+        n_elems: usize,
+    ) -> HipResult<*mut c_void> {
         self.scratch.ensure_fp16_x(
             &self.hip,
             &mut self.compiler,
@@ -734,7 +811,11 @@ impl Gpu {
     /// Convert F32 to F16 without caching. Used when the same x tensor
     /// pointer is reused with different contents across layers, where
     /// pointer-keyed caching would read stale FP16.
-    pub(crate) fn convert_fp16_x_uncached(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
+    pub(crate) fn convert_fp16_x_uncached(
+        &mut self,
+        x: &GpuTensor,
+        n_elems: usize,
+    ) -> HipResult<*mut c_void> {
         self.scratch.convert_fp16_x_uncached(
             &self.hip,
             &mut self.compiler,
@@ -771,7 +852,12 @@ impl Gpu {
     /// Ensure prefill activations are quantized into a llama.cpp-style
     /// `block_q8_1_mmq` layout. The scratch is ordered by [K/128 block, batch]
     /// so a 128-column batch tile is contiguous for each K tile.
-    pub fn ensure_q8_1_mmq_x(&mut self, x: &GpuTensor, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
+    pub fn ensure_q8_1_mmq_x(
+        &mut self,
+        x: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
         // bind_thread: skip — delegated to scratch.rs
         self.scratch.ensure_q8_1_mmq_x(
             &self.hip,
@@ -808,11 +894,15 @@ impl Gpu {
 
         // Generate synthetic activations on CPU
         let mut state = 0xDEAD_BEEF_CAFE_BABEu64;
-        let x_data: Vec<f32> = (0..screen_batch * k).map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let t = (state >> 33) as f32 / (u32::MAX as f32);
-            t * 4.0 - 2.0
-        }).collect();
+        let x_data: Vec<f32> = (0..screen_batch * k)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let t = (state >> 33) as f32 / (u32::MAX as f32);
+                t * 4.0 - 2.0
+            })
+            .collect();
 
         let result = (|| -> HipResult<bool> {
             let x_gpu = self.upload_f32(&x_data, &[screen_batch * k])?;
@@ -824,7 +914,14 @@ impl Gpu {
 
             // Reference path: use FP16 wave64 on gfx906, WMMA otherwise
             if self.arch_caps.is_gfx906() {
-                self.gemm_hfq4g256_residual_fp16_wave64(a_raw, &x_gpu, &y_wmma, m, k, screen_batch)?;
+                self.gemm_hfq4g256_residual_fp16_wave64(
+                    a_raw,
+                    &x_gpu,
+                    &y_wmma,
+                    m,
+                    k,
+                    screen_batch,
+                )?;
             } else {
                 self.gemm_hfq4g256_residual_wmma(a_raw, &x_gpu, &y_wmma, m, k, screen_batch)?;
             }
@@ -855,7 +952,9 @@ impl Gpu {
                 for b in 0..screen_batch {
                     let idx = b * m + r;
                     let err = (ref_out[idx] - mmq_out[idx]).abs();
-                    if err > row_max { row_max = err; }
+                    if err > row_max {
+                        row_max = err;
+                    }
                 }
                 if row_max > worst_err {
                     worst_err = row_max;
@@ -895,9 +994,12 @@ impl Gpu {
     pub(crate) fn ensure_fp16_shadow(
         &mut self,
         w_mq4: &GpuTensor,
-        m: usize, k: usize,
+        m: usize,
+        k: usize,
     ) -> HipResult<Option<*mut c_void>> {
-        if self.rocblas.is_none() { return Ok(None); }
+        if self.rocblas.is_none() {
+            return Ok(None);
+        }
         let key = w_mq4.buf.as_ptr() as usize;
         if let Some(shadow) = self.fp16_shadow_cache.get(&key) {
             return Ok(Some(shadow.buf.as_ptr()));
@@ -918,10 +1020,10 @@ impl Gpu {
     /// a useful smoke-path in the absence of an MI300.
     pub(crate) fn rocblas_arch_eligible(&self) -> bool {
         static CACHE: OnceLock<bool> = OnceLock::new();
-        let all_archs = *CACHE.get_or_init(|| {
-            self.flags.rocblas_all_archs
-        });
-        if all_archs { return self.rocblas.is_some(); }
+        let all_archs = *CACHE.get_or_init(|| self.flags.rocblas_all_archs);
+        if all_archs {
+            return self.rocblas.is_some();
+        }
         self.arch_caps.is_cdna3()
     }
 
@@ -938,7 +1040,7 @@ impl Gpu {
             if self.flags.rocblas_off {
                 return usize::MAX;
             }
-self.flags.rocblas_min_batch.unwrap_or(4)
+            self.flags.rocblas_min_batch.unwrap_or(4)
         })
     }
 
@@ -948,7 +1050,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     pub fn precompile_kernels(&mut self, specs: &[(&str, &str, &str)]) -> HipResult<()> {
         self.bind_thread()?;
         // Collect (name, source) pairs for the compiler batch, skipping already-loaded
-        let batch: Vec<(&str, &str)> = specs.iter()
+        let batch: Vec<(&str, &str)> = specs
+            .iter()
             .filter(|(_, _, func)| !self.functions.contains_key(*func))
             .map(|(module, source, _)| (*module, *source))
             .collect();
@@ -995,9 +1098,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     pub fn upload_f32(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let tensor = self.alloc_tensor(shape, DType::F32)?;
-        let bytes = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         self.hip.memcpy_htod(&tensor.buf, bytes)?;
         Ok(tensor)
     }
@@ -1006,9 +1108,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.bind_thread()?;
         let numel = tensor.numel();
         let mut data = vec![0.0f32; numel];
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 4)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 4) };
         self.hip.memcpy_dtoh(bytes, &tensor.buf)?;
         Ok(data)
     }
@@ -1017,7 +1118,9 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.bind_thread()?;
         let tensor = self.alloc_tensor(shape, dtype)?;
         match self.active_stream.as_ref() {
-            Some(stream) => self.hip.memset_async(&tensor.buf, 0, tensor.byte_size(), stream)?,
+            Some(stream) => self
+                .hip
+                .memset_async(&tensor.buf, 0, tensor.byte_size(), stream)?,
             None => self.hip.memset(&tensor.buf, 0, tensor.byte_size())?,
         }
         Ok(tensor)
@@ -1085,8 +1188,10 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     pub fn invalidate_graph_state(&mut self) {
         self.bind_thread_or_warn();
         self.graphs.graph_destroy(&self.hip, self.device_id);
-        self.graphs.verify_graph_destroy_all(&self.hip, self.device_id);
-        self.graphs.replay_graph_destroy_all(&self.hip, self.device_id);
+        self.graphs
+            .verify_graph_destroy_all(&self.hip, self.device_id);
+        self.graphs
+            .replay_graph_destroy_all(&self.hip, self.device_id);
     }
 
     // ── Kernel operations ───────────────────────────────────────
@@ -1138,8 +1243,16 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// copies, which was a footgun.
     pub fn copy_d2d(&self, src: &GpuTensor, dst: &GpuTensor, n_bytes: usize) -> HipResult<()> {
         // bind_thread: skip — delegates to memcpy_dtod_auto which binds
-        debug_assert!(n_bytes <= src.buf.size(), "copy_d2d: n_bytes ({n_bytes}) exceeds src.buf.size ({})", src.buf.size());
-        debug_assert!(n_bytes <= dst.buf.size(), "copy_d2d: n_bytes ({n_bytes}) exceeds dst.buf.size ({})", dst.buf.size());
+        debug_assert!(
+            n_bytes <= src.buf.size(),
+            "copy_d2d: n_bytes ({n_bytes}) exceeds src.buf.size ({})",
+            src.buf.size()
+        );
+        debug_assert!(
+            n_bytes <= dst.buf.size(),
+            "copy_d2d: n_bytes ({n_bytes}) exceeds dst.buf.size ({})",
+            dst.buf.size()
+        );
         self.memcpy_dtod_auto(&dst.buf, &src.buf, n_bytes)
     }
 
@@ -1238,7 +1351,6 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// distinct rotations, so this batches four rotates and four pack4 GEMVs
     /// into two launches.
     #[allow(clippy::too_many_arguments)]
-
     // ═══════════════════════════════════════════════════════════════════════════
     // Batch precompilation — compile all kernels a model needs in parallel
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1246,7 +1358,12 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// Pre-compile all kernels needed for Qwen3.5 inference with a given
     /// weight quantization and KV cache type. Runs hipcc in parallel.
     #[cfg(feature = "deltanet")]
-    pub fn precompile_qwen35(&mut self, weight_quant: &str, kv_type: &str, head_dim: usize) -> HipResult<()> {
+    pub fn precompile_qwen35(
+        &mut self,
+        weight_quant: &str,
+        kv_type: &str,
+        head_dim: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         // asym kernels #include "turbo_common.h" + "givens_common.h"; the
         // runtime dispatch path (see ensure_givens4_kernel) prepends the
@@ -1256,33 +1373,59 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             let stripped = body
                 .replace("#include \"turbo_common.h\"", "")
                 .replace("#include \"givens_common.h\"", "");
-            format!("{}\n{}\n{}", kernels::TURBO_COMMON_H, kernels::GIVENS_COMMON_SRC, stripped)
+            format!(
+                "{}\n{}\n{}",
+                kernels::TURBO_COMMON_H,
+                kernels::GIVENS_COMMON_SRC,
+                stripped
+            )
         };
 
         // Common kernels for all Qwen3.5 models (DeltaNet + FullAttn shared ops)
         let mut specs: Vec<(&str, String)> = vec![
-            ("rmsnorm",                  kernels::RMSNORM_SRC.to_string()),
-            ("add_inplace",              kernels::ADD_INPLACE_SRC.to_string()),
-            ("mul",                      kernels::MUL_SRC.to_string()),
-            ("silu_mul",                 kernels::SILU_MUL_SRC.to_string()),
-            ("sigmoid",                  kernels::SIGMOID_SRC.to_string()),
-            ("alpha_gate",               kernels::ALPHA_GATE_SRC.to_string()),
-            ("conv1d_silu",              kernels::CONV1D_SILU_SRC.to_string()),
-            ("l2_norm",                  kernels::L2_NORM_SRC.to_string()),
-            ("fused_qk_l2_norm_scale",   kernels::FUSED_QK_L2_NORM_SCALE_SRC.to_string()),
-            ("fused_sigmoid_alpha_gate", kernels::FUSED_SIGMOID_ALPHA_GATE_SRC.to_string()),
-            ("conv1d_silu_split",        kernels::CONV1D_SILU_SPLIT_SRC.to_string()),
-            ("conv1d_silu_split_tree",   kernels::CONV1D_SILU_SPLIT_TREE_SRC.to_string()),
-            ("gated_delta_net_q8_tree",  kernels::GATED_DELTA_NET_Q8_TREE_SRC.to_string()),
-            ("sigmoid_mul",              kernels::SIGMOID_MUL_SRC.to_string()),
-            ("topk_logits",              kernels::TOPK_LOGITS_SRC.to_string()),
-            ("scale_f32",                kernels::SCALE_F32_SRC.to_string()),
-            ("gated_norm",               kernels::GATED_NORM_SRC.to_string()),
-            ("rope_partial_interleaved", kernels::ROPE_PARTIAL_INTERLEAVED_SRC.to_string()),
+            ("rmsnorm", kernels::RMSNORM_SRC.to_string()),
+            ("add_inplace", kernels::ADD_INPLACE_SRC.to_string()),
+            ("mul", kernels::MUL_SRC.to_string()),
+            ("silu_mul", kernels::SILU_MUL_SRC.to_string()),
+            ("sigmoid", kernels::SIGMOID_SRC.to_string()),
+            ("alpha_gate", kernels::ALPHA_GATE_SRC.to_string()),
+            ("conv1d_silu", kernels::CONV1D_SILU_SRC.to_string()),
+            ("l2_norm", kernels::L2_NORM_SRC.to_string()),
+            (
+                "fused_qk_l2_norm_scale",
+                kernels::FUSED_QK_L2_NORM_SCALE_SRC.to_string(),
+            ),
+            (
+                "fused_sigmoid_alpha_gate",
+                kernels::FUSED_SIGMOID_ALPHA_GATE_SRC.to_string(),
+            ),
+            (
+                "conv1d_silu_split",
+                kernels::CONV1D_SILU_SPLIT_SRC.to_string(),
+            ),
+            (
+                "conv1d_silu_split_tree",
+                kernels::CONV1D_SILU_SPLIT_TREE_SRC.to_string(),
+            ),
+            (
+                "gated_delta_net_q8_tree",
+                kernels::GATED_DELTA_NET_Q8_TREE_SRC.to_string(),
+            ),
+            ("sigmoid_mul", kernels::SIGMOID_MUL_SRC.to_string()),
+            ("topk_logits", kernels::TOPK_LOGITS_SRC.to_string()),
+            ("scale_f32", kernels::SCALE_F32_SRC.to_string()),
+            ("gated_norm", kernels::GATED_NORM_SRC.to_string()),
+            (
+                "rope_partial_interleaved",
+                kernels::ROPE_PARTIAL_INTERLEAVED_SRC.to_string(),
+            ),
             // FullAttn: Q+gate deinterleave split
-            ("deinterleave",             kernels::DEINTERLEAVE_SRC.to_string()),
+            ("deinterleave", kernels::DEINTERLEAVE_SRC.to_string()),
             // DeltaNet: Q/K repeat-interleave for asymmetric MQA (replaces 64+ memcpy_dtod calls per layer on 4B/9B)
-            ("repeat_interleave_qk",     kernels::REPEAT_INTERLEAVE_QK_SRC.to_string()),
+            (
+                "repeat_interleave_qk",
+                kernels::REPEAT_INTERLEAVE_QK_SRC.to_string(),
+            ),
         ];
 
         // Weight-format-specific GEMV
@@ -1300,105 +1443,172 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 specs.push(("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC.to_string()));
             }
             "hfq4" => {
-                let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
+                let (src, module) =
+                    kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
                 specs.push((module, src.to_string()));
-                specs.push(("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC.to_string()));
+                specs.push((
+                    "gemv_hfq4g256_wide",
+                    kernels::GEMV_HFQ4G256_WIDE_SRC.to_string(),
+                ));
                 // Multi-projection fused kernels (LA 4-way, FA 3-way, FFN
                 // gate+up). Cross-arch — same 4-accumulator inner loop as
                 // gemv_hfq4g256.hip; precompile on every arch that uses
                 // the HFQ4 weight path.
-                specs.push(("fused_qkvza_hfq4g256",
-                            kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string()));
-                specs.push(("fused_qkv_hfq4g256",
-                            kernels::FUSED_QKV_HFQ4G256_SRC.to_string()));
-                specs.push(("fused_gate_up_hfq4g256",
-                            kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string()));
+                specs.push((
+                    "fused_qkvza_hfq4g256",
+                    kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string(),
+                ));
+                specs.push((
+                    "fused_qkv_hfq4g256",
+                    kernels::FUSED_QKV_HFQ4G256_SRC.to_string(),
+                ));
+                specs.push((
+                    "fused_gate_up_hfq4g256",
+                    kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string(),
+                ));
                 // gfx906/gfx908/gfx94x wave64-native variants — cut
                 // wavefront pressure in half on the hottest kernels. Wave32
                 // block=[32,1,1] kernels otherwise waste the upper 32 lanes
                 // of every wave slot on these wave64-native arches.
                 if self.arch_caps.is_wave64_native() {
                     // Single-token (draft / single-layer paths).
-                    specs.push(("fused_qkvza_hfq4g256_wave64",
-                                kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
-                    specs.push(("fused_qkv_hfq4g256_wave64",
-                                kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string()));
-                    specs.push(("fused_gate_up_hfq4g256_wave64",
-                                kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string()));
-                    specs.push(("gemv_hfq4g256_moe_gate_up_indexed_wave64",
-                                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC.to_string()));
-                    specs.push(("gemv_hfq4g256_moe_down_indexed_wave64",
-                                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC.to_string()));
+                    specs.push((
+                        "fused_qkvza_hfq4g256_wave64",
+                        kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "fused_qkv_hfq4g256_wave64",
+                        kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "fused_gate_up_hfq4g256_wave64",
+                        kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemv_hfq4g256_moe_gate_up_indexed_wave64",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemv_hfq4g256_moe_down_indexed_wave64",
+                        kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC.to_string(),
+                    ));
                     // Batched (DFlash verify path — hottest).
-                    specs.push(("gemm_qkvza_hfq4g256_wave64",
-                                kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
-                    specs.push(("gemm_qkv_hfq4g256_wave64",
-                                kernels::GEMM_QKV_HFQ4G256_WAVE64_SRC.to_string()));
-                    specs.push(("gemm_hfq4g256_wave64",
-                                kernels::GEMM_HFQ4G256_WAVE64_SRC.to_string()));
-                    specs.push(("gemm_hfq4g256_residual_wave64",
-                                kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC.to_string()));
-                    specs.push(("gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
-                                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC.to_string()));
-                    specs.push(("gemv_hfq4g256_moe_down_indexed_batched_wave64",
-                                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC.to_string()));
+                    specs.push((
+                        "gemm_qkvza_hfq4g256_wave64",
+                        kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemm_qkv_hfq4g256_wave64",
+                        kernels::GEMM_QKV_HFQ4G256_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemm_hfq4g256_wave64",
+                        kernels::GEMM_HFQ4G256_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemm_hfq4g256_residual_wave64",
+                        kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemv_hfq4g256_moe_down_indexed_batched_wave64",
+                        kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC.to_string(),
+                    ));
                 }
                 // gfx1100 multi-row GEMV is opt-in via HIPFIRE_GEMV_ROWS={2,4,8}.
                 // Empirically slower than the single-row kernel on gfx1100 at all
                 // tested matrix sizes (see commit log / multi-row kernel header),
                 // so we only precompile when the env var explicitly requests it.
-                if self.arch_caps.is_rdna3_dgpu()
-                    && self.flags.gemv_rows.unwrap_or(1) > 1
-                {
-                    specs.push(("gemv_hfq4g256_multirow_rdna3",
-                                kernels::GEMV_HFQ4G256_MULTIROW_GFX1100_SRC.to_string()));
-                    specs.push(("gemv_hfq4g256_residual_multirow_rdna3",
-                                kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC.to_string()));
+                if self.arch_caps.is_rdna3_dgpu() && self.flags.gemv_rows.unwrap_or(1) > 1 {
+                    specs.push((
+                        "gemv_hfq4g256_multirow_rdna3",
+                        kernels::GEMV_HFQ4G256_MULTIROW_GFX1100_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemv_hfq4g256_residual_multirow_rdna3",
+                        kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC.to_string(),
+                    ));
                 }
             }
             "mq4" => {
                 // MQ4 = FWHT-rotated HFQ4-G256 — default format for current registry.
                 // Shares the HFQ4 fused kernels (same blob, different dispatch key)
                 // plus MQ-specific rotation kernels.
-                let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
+                let (src, module) =
+                    kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
                 specs.push((module, src.to_string()));
                 specs.push(("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC.to_string()));
-                specs.push(("fused_qkvza_hfq4g256",
-                            kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string()));
-                specs.push(("fused_qkv_hfq4g256",
-                            kernels::FUSED_QKV_HFQ4G256_SRC.to_string()));
-                specs.push(("fused_gate_up_hfq4g256",
-                            kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string()));
-                specs.push(("fused_rmsnorm_mq_rotate",
-                            kernels::FUSED_RMSNORM_MQ_ROTATE_SRC.to_string()));
-                specs.push(("fused_silu_mul_mq_rotate",
-                            kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string()));
+                specs.push((
+                    "fused_qkvza_hfq4g256",
+                    kernels::FUSED_QKVZA_HFQ4G256_SRC.to_string(),
+                ));
+                specs.push((
+                    "fused_qkv_hfq4g256",
+                    kernels::FUSED_QKV_HFQ4G256_SRC.to_string(),
+                ));
+                specs.push((
+                    "fused_gate_up_hfq4g256",
+                    kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string(),
+                ));
+                specs.push((
+                    "fused_rmsnorm_mq_rotate",
+                    kernels::FUSED_RMSNORM_MQ_ROTATE_SRC.to_string(),
+                ));
+                specs.push((
+                    "fused_silu_mul_mq_rotate",
+                    kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string(),
+                ));
                 // gfx906/gfx908/gfx94x wave64 variants — see hfq4 branch for rationale.
                 if self.arch_caps.is_wave64_native() {
                     // Single-token (draft / single-layer paths).
-                    specs.push(("fused_qkvza_hfq4g256_wave64",
-                                kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
-                    specs.push(("fused_qkv_hfq4g256_wave64",
-                                kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string()));
-                    specs.push(("fused_gate_up_hfq4g256_wave64",
-                                kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string()));
-                    specs.push(("gemv_hfq4g256_moe_gate_up_indexed_wave64",
-                                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC.to_string()));
-                    specs.push(("gemv_hfq4g256_moe_down_indexed_wave64",
-                                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC.to_string()));
+                    specs.push((
+                        "fused_qkvza_hfq4g256_wave64",
+                        kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "fused_qkv_hfq4g256_wave64",
+                        kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "fused_gate_up_hfq4g256_wave64",
+                        kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemv_hfq4g256_moe_gate_up_indexed_wave64",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemv_hfq4g256_moe_down_indexed_wave64",
+                        kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC.to_string(),
+                    ));
                     // Batched (DFlash verify path — hottest).
-                    specs.push(("gemm_qkvza_hfq4g256_wave64",
-                                kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
-                    specs.push(("gemm_qkv_hfq4g256_wave64",
-                                kernels::GEMM_QKV_HFQ4G256_WAVE64_SRC.to_string()));
-                    specs.push(("gemm_hfq4g256_wave64",
-                                kernels::GEMM_HFQ4G256_WAVE64_SRC.to_string()));
-                    specs.push(("gemm_hfq4g256_residual_wave64",
-                                kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC.to_string()));
-                    specs.push(("gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
-                                kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC.to_string()));
-                    specs.push(("gemv_hfq4g256_moe_down_indexed_batched_wave64",
-                                kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC.to_string()));
+                    specs.push((
+                        "gemm_qkvza_hfq4g256_wave64",
+                        kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemm_qkv_hfq4g256_wave64",
+                        kernels::GEMM_QKV_HFQ4G256_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemm_hfq4g256_wave64",
+                        kernels::GEMM_HFQ4G256_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemm_hfq4g256_residual_wave64",
+                        kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemv_hfq4g256_moe_down_indexed_batched_wave64",
+                        kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC.to_string(),
+                    ));
                 }
             }
             "q8" => {
@@ -1409,108 +1619,198 @@ self.flags.rocblas_min_batch.unwrap_or(4)
 
         // Embedding kernels — Q8_0 is most common, also cover HFQ4G256/G128 variants
         specs.push(("embedding_q8", kernels::EMBEDDING_Q8_SRC.to_string()));
-        specs.push(("embedding_hfq4g256", kernels::EMBEDDING_HFQ4G256_SRC.to_string()));
-        specs.push(("embedding_hfq4g128", kernels::EMBEDDING_HFQ4G128_SRC.to_string()));
-        specs.push(("embedding_hfq4g256_batched", kernels::EMBEDDING_HFQ4G256_BATCHED_SRC.to_string()));
-        specs.push(("embedding_q8_batched", kernels::EMBEDDING_Q8_BATCHED_SRC.to_string()));
+        specs.push((
+            "embedding_hfq4g256",
+            kernels::EMBEDDING_HFQ4G256_SRC.to_string(),
+        ));
+        specs.push((
+            "embedding_hfq4g128",
+            kernels::EMBEDDING_HFQ4G128_SRC.to_string(),
+        ));
+        specs.push((
+            "embedding_hfq4g256_batched",
+            kernels::EMBEDDING_HFQ4G256_BATCHED_SRC.to_string(),
+        ));
+        specs.push((
+            "embedding_q8_batched",
+            kernels::EMBEDDING_Q8_BATCHED_SRC.to_string(),
+        ));
 
         // DeltaNet kernels
-        specs.push(("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC.to_string()));
+        specs.push((
+            "gated_delta_net_q8",
+            kernels::GATED_DELTA_NET_Q8_SRC.to_string(),
+        ));
 
         // KV cache kernels. asym3 is the current default — always ships flash.
         // q8 is the compat path with its own flash tile+reduce for long context.
         match kv_type {
             "asym4" => {
-                specs.push(("kv_cache_write_asym_k_givens4",
-                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_SRC)));
-                specs.push(("kv_cache_write_asym_k_givens4_batched",
-                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_BATCHED_SRC)));
-                specs.push(("attention_flash_asym4_tile",
-                            assemble_asym(kernels::ATTENTION_FLASH_ASYM4_TILE_SRC)));
-                specs.push(("attention_flash_asym4_tile_batched",
-                            assemble_asym(kernels::ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC)));
-                specs.push(("attention_flash_asym_reduce_batched",
-                            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+                specs.push((
+                    "kv_cache_write_asym_k_givens4",
+                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_SRC),
+                ));
+                specs.push((
+                    "kv_cache_write_asym_k_givens4_batched",
+                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS4_BATCHED_SRC),
+                ));
+                specs.push((
+                    "attention_flash_asym4_tile",
+                    assemble_asym(kernels::ATTENTION_FLASH_ASYM4_TILE_SRC),
+                ));
+                specs.push((
+                    "attention_flash_asym4_tile_batched",
+                    assemble_asym(kernels::ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC),
+                ));
+                specs.push((
+                    "attention_flash_asym_reduce_batched",
+                    kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string(),
+                ));
             }
             "fwht4" => {
                 // Same byte layout as asym4 — just different K-rotation primitive.
-                specs.push(("kv_cache_write_asym_k_fwht4",
-                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT4_SRC)));
-                specs.push(("kv_cache_write_asym_k_fwht4_batched",
-                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT4_BATCHED_SRC)));
-                specs.push(("attention_flash_fwht4_tile",
-                            assemble_asym(kernels::ATTENTION_FLASH_FWHT4_TILE_SRC)));
-                specs.push(("attention_flash_fwht4_tile_batched",
-                            assemble_asym(kernels::ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC)));
-                specs.push(("attention_flash_asym_reduce_batched",
-                            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+                specs.push((
+                    "kv_cache_write_asym_k_fwht4",
+                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT4_SRC),
+                ));
+                specs.push((
+                    "kv_cache_write_asym_k_fwht4_batched",
+                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT4_BATCHED_SRC),
+                ));
+                specs.push((
+                    "attention_flash_fwht4_tile",
+                    assemble_asym(kernels::ATTENTION_FLASH_FWHT4_TILE_SRC),
+                ));
+                specs.push((
+                    "attention_flash_fwht4_tile_batched",
+                    assemble_asym(kernels::ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC),
+                ));
+                specs.push((
+                    "attention_flash_asym_reduce_batched",
+                    kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string(),
+                ));
             }
             "fwht3" => {
                 // Same byte layout as asym3 (single-pass 256-element), FWHT rotation.
-                specs.push(("kv_cache_write_asym_k_fwht3",
-                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_SRC)));
-                specs.push(("kv_cache_write_asym_k_fwht3_batched",
-                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_BATCHED_SRC)));
-                specs.push(("attention_flash_fwht3_tile",
-                            assemble_asym(kernels::ATTENTION_FLASH_FWHT3_TILE_SRC)));
-                specs.push(("attention_flash_fwht3_tile_batched",
-                            assemble_asym(kernels::ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC)));
-                specs.push(("attention_flash_asym_reduce_batched",
-                            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+                specs.push((
+                    "kv_cache_write_asym_k_fwht3",
+                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_SRC),
+                ));
+                specs.push((
+                    "kv_cache_write_asym_k_fwht3_batched",
+                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT3_BATCHED_SRC),
+                ));
+                specs.push((
+                    "attention_flash_fwht3_tile",
+                    assemble_asym(kernels::ATTENTION_FLASH_FWHT3_TILE_SRC),
+                ));
+                specs.push((
+                    "attention_flash_fwht3_tile_batched",
+                    assemble_asym(kernels::ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC),
+                ));
+                specs.push((
+                    "attention_flash_asym_reduce_batched",
+                    kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string(),
+                ));
             }
             "fwht2" => {
                 // Same byte layout as asym2, FWHT rotation. 2-pass over 128.
-                specs.push(("kv_cache_write_asym_k_fwht2",
-                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_SRC)));
-                specs.push(("kv_cache_write_asym_k_fwht2_batched",
-                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_BATCHED_SRC)));
-                specs.push(("attention_flash_fwht2_tile",
-                            assemble_asym(kernels::ATTENTION_FLASH_FWHT2_TILE_SRC)));
-                specs.push(("attention_flash_fwht2_tile_batched",
-                            assemble_asym(kernels::ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC)));
-                specs.push(("attention_flash_asym_reduce_batched",
-                            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+                specs.push((
+                    "kv_cache_write_asym_k_fwht2",
+                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_SRC),
+                ));
+                specs.push((
+                    "kv_cache_write_asym_k_fwht2_batched",
+                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_BATCHED_SRC),
+                ));
+                specs.push((
+                    "attention_flash_fwht2_tile",
+                    assemble_asym(kernels::ATTENTION_FLASH_FWHT2_TILE_SRC),
+                ));
+                specs.push((
+                    "attention_flash_fwht2_tile_batched",
+                    assemble_asym(kernels::ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC),
+                ));
+                specs.push((
+                    "attention_flash_asym_reduce_batched",
+                    kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string(),
+                ));
             }
             "asym3" => {
-                specs.push(("kv_cache_write_asym_k_givens3",
-                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC)));
-                specs.push(("kv_cache_write_asym_k_givens3_batched",
-                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC)));
-                specs.push(("attention_flash_asym3_tile",
-                            assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_SRC)));
-                specs.push(("attention_flash_asym3_tile_batched",
-                            assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC)));
-                specs.push(("attention_flash_asym_reduce_batched",
-                            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+                specs.push((
+                    "kv_cache_write_asym_k_givens3",
+                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC),
+                ));
+                specs.push((
+                    "kv_cache_write_asym_k_givens3_batched",
+                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC),
+                ));
+                specs.push((
+                    "attention_flash_asym3_tile",
+                    assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_SRC),
+                ));
+                specs.push((
+                    "attention_flash_asym3_tile_batched",
+                    assemble_asym(kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC),
+                ));
+                specs.push((
+                    "attention_flash_asym_reduce_batched",
+                    kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string(),
+                ));
             }
             "asym2" => {
-                specs.push(("kv_cache_write_asym_k_givens2",
-                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS2_SRC)));
-                specs.push(("kv_cache_write_asym_k_givens2_batched",
-                            assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS2_BATCHED_SRC)));
-                specs.push(("attention_flash_asym2_tile",
-                            assemble_asym(kernels::ATTENTION_FLASH_ASYM2_TILE_SRC)));
-                specs.push(("attention_flash_asym2_tile_batched",
-                            assemble_asym(kernels::ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC)));
-                specs.push(("attention_flash_asym_reduce_batched",
-                            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+                specs.push((
+                    "kv_cache_write_asym_k_givens2",
+                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS2_SRC),
+                ));
+                specs.push((
+                    "kv_cache_write_asym_k_givens2_batched",
+                    assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS2_BATCHED_SRC),
+                ));
+                specs.push((
+                    "attention_flash_asym2_tile",
+                    assemble_asym(kernels::ATTENTION_FLASH_ASYM2_TILE_SRC),
+                ));
+                specs.push((
+                    "attention_flash_asym2_tile_batched",
+                    assemble_asym(kernels::ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC),
+                ));
+                specs.push((
+                    "attention_flash_asym_reduce_batched",
+                    kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string(),
+                ));
             }
             "q8" | _ => {
-                specs.push(("kv_cache_write_q8_0", kernels::KV_CACHE_WRITE_Q8_0_SRC.to_string()));
-                specs.push(("attention_q8_0_kv",   kernels::ATTENTION_Q8_0_KV_SRC.to_string()));
-                specs.push(("attention_q8_0_kv_batched",
-                            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC.to_string()));
-                specs.push(("kv_cache_write_q8_0_batched",
-                            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC.to_string()));
-                specs.push(("attention_flash_q8_0_tile",
-                            kernels::ATTENTION_FLASH_Q8_0_TILE_SRC.to_string()));
-                specs.push(("attention_flash_q8_0_reduce",
-                            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC.to_string()));
+                specs.push((
+                    "kv_cache_write_q8_0",
+                    kernels::KV_CACHE_WRITE_Q8_0_SRC.to_string(),
+                ));
+                specs.push((
+                    "attention_q8_0_kv",
+                    kernels::ATTENTION_Q8_0_KV_SRC.to_string(),
+                ));
+                specs.push((
+                    "attention_q8_0_kv_batched",
+                    kernels::ATTENTION_Q8_0_KV_BATCHED_SRC.to_string(),
+                ));
+                specs.push((
+                    "kv_cache_write_q8_0_batched",
+                    kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC.to_string(),
+                ));
+                specs.push((
+                    "attention_flash_q8_0_tile",
+                    kernels::ATTENTION_FLASH_Q8_0_TILE_SRC.to_string(),
+                ));
+                specs.push((
+                    "attention_flash_q8_0_reduce",
+                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC.to_string(),
+                ));
             }
         }
 
         // Convert to (&str, &str) for the batch API
-        let batch: Vec<(&str, &str)> = specs.iter()
+        let batch: Vec<(&str, &str)> = specs
+            .iter()
             .map(|(name, src)| (*name, src.as_str()))
             .collect();
         self.compiler.compile_batch(&batch)?;
@@ -1534,7 +1834,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 "conv1d_silu_split_tree" => vec!["conv1d_silu_split_tree_f32"],
                 "gated_delta_net_q8_tree" => vec!["gated_delta_net_q8_tree"],
                 "sigmoid_mul" => vec!["sigmoid_mul_f32"],
-                "topk_logits"  => vec!["topk_logits_f32"],
+                "topk_logits" => vec!["topk_logits_f32"],
                 "scale_f32" => vec!["scale_f32"],
                 "gated_norm" => vec!["gated_norm_f32"],
                 "rope_partial_interleaved" => vec!["rope_partial_interleaved_f32"],
@@ -1558,18 +1858,18 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                     "gemv_hfq4g256_residual_multirow_r4",
                     "gemv_hfq4g256_residual_multirow_r8",
                 ],
-                "gemv_hfq4g256_moe_gate_up_indexed_wave64" => vec![
-                    "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64",
-                ],
-                "gemv_hfq4g256_moe_down_indexed_wave64" => vec![
-                    "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_wave64",
-                ],
-                "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64" => vec![
-                    "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64",
-                ],
-                "gemv_hfq4g256_moe_down_indexed_batched_wave64" => vec![
-                    "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched_wave64",
-                ],
+                "gemv_hfq4g256_moe_gate_up_indexed_wave64" => {
+                    vec!["gemv_hfq4g256_moe_gate_up_k8_indexed_wave64"]
+                }
+                "gemv_hfq4g256_moe_down_indexed_wave64" => {
+                    vec!["gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_wave64"]
+                }
+                "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64" => {
+                    vec!["gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64"]
+                }
+                "gemv_hfq4g256_moe_down_indexed_batched_wave64" => {
+                    vec!["gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched_wave64"]
+                }
                 other => vec![other],
             };
             // Compile and ensure the module is loaded once.
@@ -1592,17 +1892,25 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         Ok(())
     }
 
-
     // ═══════════════════════════════════════════════════════════════════════════
     // Kernel profiler
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Profile all compiled kernels: hardware caps + ISA metadata + occupancy.
-    pub fn profile(&self) -> (crate::profiler::GpuCapability, Vec<crate::profiler::KernelProfile>) {
+    pub fn profile(
+        &self,
+    ) -> (
+        crate::profiler::GpuCapability,
+        Vec<crate::profiler::KernelProfile>,
+    ) {
         self.bind_thread_or_warn();
         let vram = self.hip.get_vram_info().map(|(_, t)| t as u64).unwrap_or(0);
-        let cu_hint = self.hip
-            .get_device_attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, 0)
+        let cu_hint = self
+            .hip
+            .get_device_attribute(
+                crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                0,
+            )
             .ok()
             .filter(|&v| v > 0)
             .map(|v| crate::profiler::hip_mp_count_to_cu_count(&self.arch, v as u32))
@@ -1638,12 +1946,20 @@ mod tests {
         let s2 = gen_fwht_signs(1043, 128);
         assert_eq!(s1.len(), 128);
         assert_eq!(s2.len(), 128);
-        for x in &s1 { assert!(*x == 1.0 || *x == -1.0, "signs1 contains {x}"); }
-        for x in &s2 { assert!(*x == 1.0 || *x == -1.0, "signs2 contains {x}"); }
+        for x in &s1 {
+            assert!(*x == 1.0 || *x == -1.0, "signs1 contains {x}");
+        }
+        for x in &s2 {
+            assert!(*x == 1.0 || *x == -1.0, "signs2 contains {x}");
+        }
         // Reproducibility
         assert_eq!(gen_fwht_signs(43, 128), s1);
         assert_eq!(gen_fwht_signs(1043, 128), s2);
         // Distinct from G256 seeds
-        assert_ne!(gen_fwht_signs(42, 128), s1, "seed 43 should differ from seed 42");
+        assert_ne!(
+            gen_fwht_signs(42, 128),
+            s1,
+            "seed 43 should differ from seed 42"
+        );
     }
 }

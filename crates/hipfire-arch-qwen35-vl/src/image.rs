@@ -23,10 +23,16 @@ const MAX_DIMENSION_PIXELS: usize = 4_000_000;
 /// row/column. Passing any other factor (e.g. the legacy `28` from Qwen2-VL
 /// when patch_size=16) yields odd patch grids on small images and a
 /// merger/LM token-count mismatch downstream.
-pub fn smart_resize(height: usize, width: usize, factor: usize, min_pixels: usize, max_pixels: usize) -> (usize, usize) {
+pub fn smart_resize(
+    height: usize,
+    width: usize,
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> (usize, usize) {
     let h_bar = ((height as f64 / factor as f64).round() as usize) * factor;
     let w_bar = ((width as f64 / factor as f64).round() as usize) * factor;
-    
+
     if h_bar * w_bar > max_pixels {
         let beta = ((height * width) as f64 / max_pixels as f64).sqrt();
         let h_bar = factor.max(((height as f64 / beta / factor as f64).floor() as usize) * factor);
@@ -89,8 +95,8 @@ fn preprocess_dynamic_image(
         for x in 0..w {
             let pixel = rgb.get_pixel(x as u32, y as u32);
             let idx = y * w + x;
-            out[idx] = pixel[0] as f32 / 127.5 - 1.0;             // channel 0 = R
-            out[plane + idx] = pixel[1] as f32 / 127.5 - 1.0;     // channel 1 = G
+            out[idx] = pixel[0] as f32 / 127.5 - 1.0; // channel 0 = R
+            out[plane + idx] = pixel[1] as f32 / 127.5 - 1.0; // channel 1 = G
             out[2 * plane + idx] = pixel[2] as f32 / 127.5 - 1.0; // channel 2 = B
         }
     }
@@ -108,9 +114,13 @@ pub fn load_and_preprocess(
     patch_size: usize,
     spatial_merge_size: usize,
 ) -> Result<(Vec<f32>, usize, usize), String> {
-    let img = image::open(path)
-        .map_err(|e| format!("failed to open image {}: {e}", path.display()))?;
-    Ok(preprocess_dynamic_image(img, patch_size, spatial_merge_size))
+    let img =
+        image::open(path).map_err(|e| format!("failed to open image {}: {e}", path.display()))?;
+    Ok(preprocess_dynamic_image(
+        img,
+        patch_size,
+        spatial_merge_size,
+    ))
 }
 
 /// Load an image from raw bytes (PNG or JPEG), smart-resize, normalize.
@@ -131,9 +141,7 @@ pub fn load_and_preprocess_from_bytes(
         .with_guessed_format()
         .map_err(|e| format!("failed to read image: {e}"))?;
 
-    let (orig_w, orig_h) = reader
-        .into_dimensions()
-        .map_err(map_image_err)?;
+    let (orig_w, orig_h) = reader.into_dimensions().map_err(map_image_err)?;
     let (orig_w, orig_h) = (orig_w as usize, orig_h as usize);
     if orig_w * orig_h > MAX_DIMENSION_PIXELS {
         return Err(format!(
@@ -142,7 +150,11 @@ pub fn load_and_preprocess_from_bytes(
     }
 
     let img = image::load_from_memory(data).map_err(map_image_err)?;
-    Ok(preprocess_dynamic_image(img, patch_size, spatial_merge_size))
+    Ok(preprocess_dynamic_image(
+        img,
+        patch_size,
+        spatial_merge_size,
+    ))
 }
 
 fn map_image_err(e: image::ImageError) -> String {
@@ -198,9 +210,7 @@ pub fn extract_patches(
     let mut patches = vec![0.0f32; n_patches * patch_elems];
 
     assert!(
-        spatial_merge_size >= 1
-            && ph % spatial_merge_size == 0
-            && pw % spatial_merge_size == 0,
+        spatial_merge_size >= 1 && ph % spatial_merge_size == 0 && pw % spatial_merge_size == 0,
         "patch grid {ph}x{pw} not divisible by spatial_merge_size={spatial_merge_size} — \
          smart_resize should guarantee this",
     );
@@ -213,7 +223,8 @@ pub fn extract_patches(
             let sy = py % spatial_merge_size;
             let sx = px % spatial_merge_size;
             // SMS×SMS-block-grouped row-major: ((gy, gx), (sy, sx)) flattened.
-            let patch_out_idx = ((gy * gw + gx) * spatial_merge_size + sy) * spatial_merge_size + sx;
+            let patch_out_idx =
+                ((gy * gw + gx) * spatial_merge_size + sy) * spatial_merge_size + sx;
             let out_base = patch_out_idx * patch_elems;
 
             for c in 0..channels {
@@ -271,7 +282,9 @@ mod tests {
     #[test]
     fn extract_patches_locks_layout_and_order_4x4() {
         let chw = synthetic_chw(3, 4, 4);
-        let patches = extract_patches(&chw, 3, 4, 4, /*patch_size=*/2, /*T=*/2, /*SMS=*/2);
+        let patches = extract_patches(
+            &chw, 3, 4, 4, /*patch_size=*/ 2, /*T=*/ 2, /*SMS=*/ 2,
+        );
         // Per-patch element count: T * C * ph * pw = 2 * 3 * 2 * 2 = 24.
         // Total: 4 patches × 24 = 96.
         assert_eq!(patches.len(), 96);
@@ -281,19 +294,28 @@ mod tests {
         //   patch_out_idx 1 → out_base = 1 * 24 = 24
         // Per-patch layout (C, T, ph, pw): for c=0, t=0, dy=0, dx=0 the source
         // pixel is at (py*ps+dy, px*ps+dx) = (0, 2) so value = 0*10000 + 0*100 + 2 = 2.
-        let v = patches[24 + 0 * 8 + 0 * 4 + 0 * 2 + 0];
-        assert_eq!(v, 2.0, "patch_out_idx=1, c=0,t=0,dy=0,dx=0 should hold (0,2)=2");
+        let v = patches[24];
+        assert_eq!(
+            v, 2.0,
+            "patch_out_idx=1, c=0,t=0,dy=0,dx=0 should hold (0,2)=2"
+        );
         // Same patch, c=2 (B), t=1, dy=1, dx=1:
         //   src = (0*4 + 1) = y=1, x=2*2+1=3, c=2 → 2*10000 + 1*100 + 3 = 20103.
         //   dst offset within patch = 2 * 8 + 1 * 4 + 1 * 2 + 1 = 23.
         let v = patches[24 + 23];
-        assert_eq!(v, 20103.0, "patch_out_idx=1, c=2,t=1,dy=1,dx=1 should hold (2,1,3)");
+        assert_eq!(
+            v, 20103.0,
+            "patch_out_idx=1, c=2,t=1,dy=1,dx=1 should hold (2,1,3)"
+        );
 
         // Patch (py=1, px=0) — bottom-left. out_idx = sy=1, sx=0 = 2.
         // Per-patch c=1, t=0, dy=0, dx=0: src = (y=2, x=0, c=1) → 10000 + 200 + 0 = 10200.
         // dst offset = 1*8 + 0*4 + 0*2 + 0 = 8.
         let v = patches[2 * 24 + 8];
-        assert_eq!(v, 10200.0, "patch_out_idx=2, c=1,t=0,dy=0,dx=0 should hold (1,2,0)");
+        assert_eq!(
+            v, 10200.0,
+            "patch_out_idx=2, c=1,t=0,dy=0,dx=0 should hold (1,2,0)"
+        );
     }
 
     /// 4×6 image, patch_size=2, SMS=2: ph=2, pw=3 — non-square. ph%SMS=0,
@@ -302,7 +324,9 @@ mod tests {
     #[should_panic(expected = "not divisible by spatial_merge_size")]
     fn extract_patches_rejects_indivisible_grid() {
         let chw = synthetic_chw(3, 4, 6);
-        let _ = extract_patches(&chw, 3, 4, 6, /*patch_size=*/2, /*T=*/2, /*SMS=*/2);
+        let _ = extract_patches(
+            &chw, 3, 4, 6, /*patch_size=*/ 2, /*T=*/ 2, /*SMS=*/ 2,
+        );
     }
 
     /// SMS=4 on a 8×8 image: ph=pw=4, divisible. Spot-check the 4x4-grouping
@@ -311,7 +335,9 @@ mod tests {
     #[test]
     fn extract_patches_supports_sms_4() {
         let chw = synthetic_chw(3, 8, 8);
-        let patches = extract_patches(&chw, 3, 8, 8, /*patch_size=*/2, /*T=*/1, /*SMS=*/4);
+        let patches = extract_patches(
+            &chw, 3, 8, 8, /*patch_size=*/ 2, /*T=*/ 1, /*SMS=*/ 4,
+        );
         // ph=pw=4, n=16 patches, patch_elems = 1*3*2*2 = 12.
         assert_eq!(patches.len(), 16 * 12);
         // With SMS=4 the entire 4×4 grid is ONE merge block (mh=mw=1).

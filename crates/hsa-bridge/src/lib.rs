@@ -43,10 +43,7 @@ impl HsaRuntime {
 
     /// Enumerate agents and return the first GPU whose name contains `gfx_arch`.
     /// Pass `None` to get the first GPU agent regardless of arch.
-    pub fn find_gpu_agent(
-        self: &Arc<Self>,
-        gfx_arch: Option<&str>,
-    ) -> HsaResult<HsaAgent> {
+    pub fn find_gpu_agent(self: &Arc<Self>, gfx_arch: Option<&str>) -> HsaResult<HsaAgent> {
         self.find_agent(HSA_DEVICE_TYPE_GPU, gfx_arch)
     }
 
@@ -67,10 +64,7 @@ impl HsaRuntime {
             found: HsaAgentHandle,
         }
 
-        unsafe extern "C" fn visit(
-            agent: HsaAgentHandle,
-            data: *mut c_void,
-        ) -> HsaStatus {
+        unsafe extern "C" fn visit(agent: HsaAgentHandle, data: *mut c_void) -> HsaStatus {
             let ctx = &mut *(data as *mut Ctx);
             let rt = &*ctx.runtime;
             let mut dev_type: u32 = 0;
@@ -157,8 +151,7 @@ impl HsaAgent {
         };
         error::check(st, "agent_get_info(NAME)")?;
         let end = buf.iter().position(|&c| c == 0).unwrap_or(64);
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, end) };
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, end) };
         Ok(std::str::from_utf8(bytes).unwrap_or("").to_string())
     }
 
@@ -208,10 +201,7 @@ impl HsaAgent {
             found: HsaMemoryPoolHandle,
         }
 
-        unsafe extern "C" fn visit(
-            pool: HsaMemoryPoolHandle,
-            data: *mut c_void,
-        ) -> HsaStatus {
+        unsafe extern "C" fn visit(pool: HsaMemoryPoolHandle, data: *mut c_void) -> HsaStatus {
             let ctx = &mut *(data as *mut Ctx);
             let rt = &*ctx.runtime;
             let mut segment: u32 = 0;
@@ -242,9 +232,7 @@ impl HsaAgent {
                 return HSA_STATUS_SUCCESS;
             }
             let matches = match ctx.kind {
-                PoolKind::Kernarg => {
-                    flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT != 0
-                }
+                PoolKind::Kernarg => flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT != 0,
                 PoolKind::FineGrained => {
                     flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED != 0
                         && flags & HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_KERNARG_INIT == 0
@@ -275,7 +263,10 @@ impl HsaAgent {
         if ctx.found == 0 {
             return Err(HsaError::new(
                 st,
-                &format!("find_pool({:?}) did not match any pool on this agent", ctx.kind),
+                &format!(
+                    "find_pool({:?}) did not match any pool on this agent",
+                    ctx.kind
+                ),
             ));
         }
         Ok(HsaMemoryPool {
@@ -365,9 +356,7 @@ unsafe impl Sync for HsaSignal {}
 impl HsaSignal {
     pub fn create(runtime: &Arc<HsaRuntime>, initial: i64) -> HsaResult<Self> {
         let mut handle: HsaSignalHandle = 0;
-        let st = unsafe {
-            (runtime.lib.fn_signal_create)(initial, 0, ptr::null(), &mut handle)
-        };
+        let st = unsafe { (runtime.lib.fn_signal_create)(initial, 0, ptr::null(), &mut handle) };
         error::check(st, "hsa_signal_create")?;
         Ok(Self {
             runtime: runtime.clone(),
@@ -490,23 +479,21 @@ pub struct HsaExecutable {
 impl HsaExecutable {
     /// Parse a `.hsaco` code object from memory and bind it to `agent`.
     /// Must call `freeze()` before using kernels.
-    pub fn from_code_object(
-        agent: &HsaAgent,
-        hsaco_bytes: &[u8],
-    ) -> HsaResult<Self> {
+    pub fn from_code_object(agent: &HsaAgent, hsaco_bytes: &[u8]) -> HsaResult<Self> {
         let runtime = agent.runtime.clone();
 
         // Unwrap Clang offload bundle if present.
-        let bytes: &[u8] = if hsaco_bytes.len() > 24 && &hsaco_bytes[0..24] == b"__CLANG_OFFLOAD_BUNDLE__" {
-            const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
-            if let Some(pos) = hsaco_bytes.windows(4).position(|w| w == ELF_MAGIC) {
-                &hsaco_bytes[pos..]
+        let bytes: &[u8] =
+            if hsaco_bytes.len() > 24 && &hsaco_bytes[0..24] == b"__CLANG_OFFLOAD_BUNDLE__" {
+                const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+                if let Some(pos) = hsaco_bytes.windows(4).position(|w| w == ELF_MAGIC) {
+                    &hsaco_bytes[pos..]
+                } else {
+                    return Err(HsaError::new(0, "clang offload bundle contains no ELF"));
+                }
             } else {
-                return Err(HsaError::new(0, "clang offload bundle contains no ELF"));
-            }
-        } else {
-            hsaco_bytes
-        };
+                hsaco_bytes
+            };
 
         // Create the code object reader.
         let mut reader: HsaCodeObjectReaderHandle = 0;
@@ -564,9 +551,7 @@ impl HsaExecutable {
 
     /// Finalize the executable — required before kernel lookup.
     pub fn freeze(&mut self) -> HsaResult<()> {
-        let st = unsafe {
-            (self.runtime.lib.fn_executable_freeze)(self.handle, ptr::null())
-        };
+        let st = unsafe { (self.runtime.lib.fn_executable_freeze)(self.handle, ptr::null()) };
         error::check(st, "hsa_executable_freeze")?;
         self.frozen = true;
         Ok(())
@@ -577,7 +562,10 @@ impl HsaExecutable {
     /// function appends it if missing (matches standard hipcc output).
     pub fn kernel(&self, agent: &HsaAgent, name: &str) -> HsaResult<HsaKernel> {
         if !self.frozen {
-            return Err(HsaError::new(0, "executable must be frozen before kernel lookup"));
+            return Err(HsaError::new(
+                0,
+                "executable must be frozen before kernel lookup",
+            ));
         }
         let full_name = if name.ends_with(".kd") {
             name.to_string()
@@ -684,8 +672,14 @@ pub fn dispatch_packet_header() -> u16 {
 ///
 /// Sets completion_signal to 0 by default; caller can overwrite it after
 /// this returns.
+///
+/// # Safety
+///
+/// `slot` must be valid and uniquely writable for one
+/// `HsaKernelDispatchPacket`. The caller is responsible for publishing the
+/// packet header after all fields are written.
 #[inline]
-pub fn build_dispatch_packet(
+pub unsafe fn build_dispatch_packet(
     slot: *mut HsaKernelDispatchPacket,
     kernel: &HsaKernel,
     grid: [u32; 3],
@@ -700,31 +694,35 @@ pub fn build_dispatch_packet(
     } else {
         1
     };
-    unsafe {
-        let p = &mut *slot;
-        // Header is written LAST with release ordering; leave it whatever it is
-        // for now (the HSA runtime pre-fills HSA_PACKET_TYPE_INVALID).
-        p.setup = ndims;
-        p.workgroup_size_x = block[0] as u16;
-        p.workgroup_size_y = block[1] as u16;
-        p.workgroup_size_z = block[2] as u16;
-        p.reserved0 = 0;
-        p.grid_size_x = grid[0].saturating_mul(block[0]);
-        p.grid_size_y = grid[1].saturating_mul(block[1]);
-        p.grid_size_z = grid[2].saturating_mul(block[2]);
-        p.private_segment_size = kernel.private_segment_size;
-        p.group_segment_size = kernel.group_segment_size;
-        p.kernel_object = kernel.kernel_object;
-        p.kernarg_address = kernarg_ptr as *mut c_void;
-        p.reserved2 = 0;
-        p.completion_signal = completion_signal;
-    }
+    let p = unsafe { &mut *slot };
+    // Header is written LAST with release ordering; leave it whatever it is
+    // for now (the HSA runtime pre-fills HSA_PACKET_TYPE_INVALID).
+    p.setup = ndims;
+    p.workgroup_size_x = block[0] as u16;
+    p.workgroup_size_y = block[1] as u16;
+    p.workgroup_size_z = block[2] as u16;
+    p.reserved0 = 0;
+    p.grid_size_x = grid[0].saturating_mul(block[0]);
+    p.grid_size_y = grid[1].saturating_mul(block[1]);
+    p.grid_size_z = grid[2].saturating_mul(block[2]);
+    p.private_segment_size = kernel.private_segment_size;
+    p.group_segment_size = kernel.group_segment_size;
+    p.kernel_object = kernel.kernel_object;
+    p.kernarg_address = kernarg_ptr as *mut c_void;
+    p.reserved2 = 0;
+    p.completion_signal = completion_signal;
 }
 
 /// Atomic release-store of the header word. Must be called after the rest
 /// of the packet is filled in. Makes the packet visible to the AQL engine.
+///
+/// # Safety
+///
+/// `slot` must point to a valid AQL packet whose non-header fields are fully
+/// initialized. Publishing the header makes the packet visible to the queue's
+/// AQL engine, so callers must not mutate it after this call.
 #[inline]
-pub fn publish_dispatch_packet(slot: *mut HsaKernelDispatchPacket, header: u16) {
+pub unsafe fn publish_dispatch_packet(slot: *mut HsaKernelDispatchPacket, header: u16) {
     use std::sync::atomic::{fence, AtomicU16, Ordering};
     unsafe {
         fence(Ordering::Release);
