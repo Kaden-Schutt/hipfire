@@ -28,8 +28,9 @@
 
 use crate::hfq::{load_awq_scale, HfqFile};
 use crate::llama::WeightTensor;
-use hip_bridge::HipResult;
+use hip_bridge::{Graph, GraphExec, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::collections::{HashMap, HashSet};
 
 /// Max rows per call into `gemm_dispatch` for the MQ4/MQ3 (FWHT-rotated)
 /// path. The activation rotation scratch (`DflashScratch.mq_x_rot`) is
@@ -417,6 +418,12 @@ pub struct DflashScratch {
     /// reset rebuilds the full prefix in one shot — same cost as a
     /// pre-cache cycle, but amortized thereafter.
     pub draft_ctx_cached_rows: usize,
+
+    /// Per-layer, per-B graph cache for the fixed-shape FFN tail inside
+    /// `draft_forward_opts`. The attention/context part depends on `ctx_len`;
+    /// this FFN subgraph does not, so it can replay across DFlash cycles.
+    pub draft_ffn_graphs: Vec<HashMap<usize, (Graph, GraphExec, Vec<Vec<u8>>)>>,
+    pub draft_ffn_warmed_up: Vec<HashSet<usize>>,
 }
 
 impl DflashScratch {
@@ -480,9 +487,13 @@ impl DflashScratch {
         // = 128 MB. Trivial vs 24 GB VRAM.
         let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
         let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        let mut draft_ffn_graphs = Vec::with_capacity(cfg.n_layers);
+        let mut draft_ffn_warmed_up = Vec::with_capacity(cfg.n_layers);
         for _ in 0..cfg.n_layers {
             k_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
             v_ctx_cached.push(gpu.alloc_tensor(&[l * kvd], DType::F32)?);
+            draft_ffn_graphs.push(HashMap::new());
+            draft_ffn_warmed_up.push(HashSet::new());
         }
 
         Ok(DflashScratch {
@@ -519,6 +530,8 @@ impl DflashScratch {
             k_ctx_cached,
             v_ctx_cached,
             draft_ctx_cached_rows: 0,
+            draft_ffn_graphs,
+            draft_ffn_warmed_up,
         })
     }
 
@@ -546,6 +559,12 @@ impl DflashScratch {
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        for per_layer in self.draft_ffn_graphs {
+            for (_, (graph, exec, _blobs)) in per_layer {
+                let _ = gpu.hip.graph_exec_destroy(exec);
+                let _ = gpu.hip.graph_destroy(graph);
+            }
+        }
         let _ = gpu.free_tensor(self.x);
         let _ = gpu.free_tensor(self.x_norm);
         let _ = gpu.free_tensor(self.q);
@@ -665,7 +684,7 @@ fn gemm_dispatch(
             // `ceil(batch / max_chunk)` times for no extra correctness.
             let scratch = mq_x_rot.expect("MQ3 dispatch requires mq_x_rot scratch");
             let max_chunk = (scratch.shape[0] / w.k).max(1);
-            gpu.fp16_x_source_ptr = std::ptr::null_mut();
+            gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             let mut chunked: HipResult<()> = Ok(());
             let mut row = 0;
             while row < batch {
@@ -707,6 +726,118 @@ fn gemm_dispatch(
             w.gpu_dtype, w.m, w.k, batch, us, bytes / 1024, gbs);
     }
     result
+}
+
+fn begin_draft_ffn_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
+    gpu.graphs.capture_blobs.clear();
+    gpu.graphs.capture_mode = true;
+    let stream = gpu
+        .active_stream
+        .as_ref()
+        .expect("draft FFN graph capture requires an explicit stream");
+    gpu.hip.stream_begin_capture(stream, 0)
+}
+
+fn end_draft_ffn_graph_capture(
+    gpu: &mut Gpu,
+) -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {
+    gpu.graphs.capture_mode = false;
+    let stream = gpu.active_stream.as_ref().unwrap();
+    let graph = gpu.hip.stream_end_capture(stream)?;
+    let exec = gpu.hip.graph_instantiate(&graph)?;
+    let blobs = std::mem::take(&mut gpu.graphs.capture_blobs);
+    Ok((graph, exec, blobs))
+}
+
+fn abort_draft_ffn_graph_capture(gpu: &mut Gpu) {
+    if gpu.graphs.capture_mode {
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            let _ = gpu.hip.stream_end_capture(stream);
+        }
+        gpu.graphs.capture_mode = false;
+    }
+    gpu.graphs.capture_blobs.clear();
+}
+
+fn draft_ffn_layer(
+    gpu: &mut Gpu,
+    layer: &DflashLayerWeights,
+    scratch: &mut DflashScratch,
+    b: usize,
+    h: usize,
+    eps: f32,
+    graph_safe: bool,
+) -> HipResult<()> {
+    if graph_safe {
+        gpu.memcpy_dtod_auto(&scratch.residual_ffn.buf, &scratch.x.buf, (b * h) * 4)?;
+    } else {
+        gpu.hip.memcpy_dtod(&scratch.residual_ffn.buf, &scratch.x.buf, (b * h) * 4)?;
+    }
+
+    gpu.rmsnorm_batched(
+        &scratch.x,
+        &layer.ffn_norm,
+        &scratch.x_norm,
+        b,
+        h,
+        eps,
+    )?;
+    gemm_dispatch(gpu, &scratch.x_norm, &layer.w_gate, &scratch.gate, b, scratch.mq_x_rot.as_ref())?;
+    gemm_dispatch(gpu, &scratch.x_norm, &layer.w_up,   &scratch.up,   b, scratch.mq_x_rot.as_ref())?;
+    gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
+    gemm_dispatch(gpu, &scratch.gate_up, &layer.w_down, &scratch.x, b, scratch.mq_x_rot.as_ref())?;
+    if graph_safe {
+        gpu.add_f32_graph_safe(&scratch.residual_ffn, &scratch.x, &scratch.x)
+    } else {
+        gpu.add_f32(&scratch.residual_ffn, &scratch.x, &scratch.x)
+    }
+}
+
+fn draft_ffn_layer_maybe_graph(
+    gpu: &mut Gpu,
+    layer: &DflashLayerWeights,
+    scratch: &mut DflashScratch,
+    layer_idx: usize,
+    b: usize,
+    h: usize,
+    eps: f32,
+    use_graph: bool,
+) -> HipResult<()> {
+    if !use_graph {
+        return draft_ffn_layer(gpu, layer, scratch, b, h, eps, false);
+    }
+
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+
+    if scratch.draft_ffn_graphs[layer_idx].contains_key(&b) {
+        let stream = gpu.active_stream.as_ref().unwrap();
+        let entry = scratch.draft_ffn_graphs[layer_idx]
+            .get(&b)
+            .unwrap_or_else(|| panic!("missing draft FFN graph for layer={layer_idx} b={b}"));
+        return gpu.hip.graph_launch(&entry.1, stream);
+    }
+
+    if !scratch.draft_ffn_warmed_up[layer_idx].contains(&b) {
+        scratch.draft_ffn_warmed_up[layer_idx].insert(b);
+        return draft_ffn_layer(gpu, layer, scratch, b, h, eps, false);
+    }
+
+    begin_draft_ffn_graph_capture(gpu)?;
+    let r = draft_ffn_layer(gpu, layer, scratch, b, h, eps, true);
+    if r.is_ok() {
+        let entry = end_draft_ffn_graph_capture(gpu)?;
+        scratch.draft_ffn_graphs[layer_idx].insert(b, entry);
+        let stream = gpu.active_stream.as_ref().unwrap();
+        let entry = scratch.draft_ffn_graphs[layer_idx]
+            .get(&b)
+            .unwrap_or_else(|| panic!("missing captured draft FFN graph for layer={layer_idx} b={b}"));
+        gpu.hip.graph_launch(&entry.1, stream)
+    } else {
+        abort_draft_ffn_graph_capture(gpu);
+        r
+    }
 }
 
 /// Upload f32 slice into a GPU tensor (bytes via memcpy_htod).
@@ -766,6 +897,34 @@ pub fn draft_forward(
     block_size: usize,
     ctx_len: usize,
     scratch: &mut DflashScratch,
+) -> HipResult<()> {
+    draft_forward_opts(
+        gpu,
+        weights,
+        cfg,
+        noise_embedding,
+        target_hidden,
+        positions_q,
+        positions_k,
+        block_size,
+        ctx_len,
+        scratch,
+        false,
+    )
+}
+
+pub fn draft_forward_opts(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    cfg: &DflashConfig,
+    noise_embedding: Option<&[f32]>,
+    target_hidden: Option<&[f32]>,
+    positions_q: &[i32],
+    positions_k: &[i32],
+    block_size: usize,
+    ctx_len: usize,
+    scratch: &mut DflashScratch,
+    graph_ffn: bool,
 ) -> HipResult<()> {
     let b = block_size;
     let l = ctx_len;
@@ -1053,15 +1212,21 @@ pub fn draft_forward(
         // x = residual_attn + attn_proj
         gpu.add_f32(&scratch.residual_attn, &scratch.attn_proj, &scratch.x)?;
 
-        // Residual for FFN.
-        gpu.hip.memcpy_dtod(&scratch.residual_ffn.buf, &scratch.x.buf, (b * h) * 4)?;
-
-        // ffn_norm.
-        gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
-
-        // gate = x_norm @ w_gate^T; up = x_norm @ w_up^T
-        gemm_dispatch(gpu, &scratch.x_norm, &layer.w_gate, &scratch.gate, b, scratch.mq_x_rot.as_ref())?;
-        gemm_dispatch(gpu, &scratch.x_norm, &layer.w_up,   &scratch.up,   b, scratch.mq_x_rot.as_ref())?;
+        // Fixed-shape FFN tail. MoE DFlash can optionally capture this as a
+        // per-layer/per-B hipGraph; the attention/context work above is left
+        // direct because `ctx_len` changes every accepted cycle.
+        let graph_ffn_active =
+            graph_ffn && !dbg && !crate::config::get().draft_gemm_dump;
+        draft_ffn_layer_maybe_graph(
+            gpu,
+            layer,
+            scratch,
+            li,
+            b,
+            h,
+            eps,
+            graph_ffn_active,
+        )?;
         // 2026-04-21: tried target's fused gemm_gate_up_hfq4g256 here (shared
         // FP16-X convert + interleaved gate/up GEMMs). Byte-exact A/B neutral
         // on 27B HumanEval (median 76.47 fused vs 76.74 baseline; ±7 % run-to-
@@ -1069,15 +1234,6 @@ pub fn draft_forward(
         // Kept per-weight dispatch for clarity. The real draft perf lever is
         // the ~56 ms of ffn_gemm per cycle (see HIPFIRE_DRAFT_SUBPHASE=1);
         // fusion alone doesn't move that number — kernel engineering does.
-
-        // SiLU(gate) * up → gate_up
-        gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
-
-        // x = w_down @ gate_up^T  (output [B, hidden])
-        gemm_dispatch(gpu, &scratch.gate_up, &layer.w_down, &scratch.x, b, scratch.mq_x_rot.as_ref())?;
-
-        // x = residual_ffn + x
-        gpu.add_f32(&scratch.residual_ffn, &scratch.x, &scratch.x)?;
 
         if let Some(t) = t3 {
             gpu.hip.device_synchronize()?;

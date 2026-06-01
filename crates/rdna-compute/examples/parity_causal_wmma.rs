@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
-//! Parity: WMMA causal flash (f16 K/V) vs scalar attention_causal_batched.
+//! Parity: production WMMA causal flash (f16 K/V) vs scalar attention_causal_batched.
 //! Same prompt batch (b=l) the qwen2 text-prefill path uses. Verdict line PASS
 //! if max-abs-diff under f16 tolerance.
 use rdna_compute::{DType, Gpu};

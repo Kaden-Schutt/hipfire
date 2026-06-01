@@ -13,6 +13,7 @@
 //! Loaded lazily via `libloading`; absence of librocblas is a recoverable
 //! runtime error so the engine still builds + runs without it.
 
+use crate::Stream;
 use libloading::{Library, Symbol};
 use std::ffi::{c_int, c_void};
 use std::os::raw::c_uint;
@@ -70,22 +71,33 @@ pub struct Rocblas {
     _lib: Library,
     handle: RocblasHandle,
 
-    fn_create_handle: unsafe extern "C" fn(*mut RocblasHandle) -> u32,
     fn_destroy_handle: unsafe extern "C" fn(RocblasHandle) -> u32,
     fn_set_stream: unsafe extern "C" fn(RocblasHandle, *mut c_void) -> u32,
     fn_gemm_ex: unsafe extern "C" fn(
         RocblasHandle,
-        c_uint, c_uint,              // transA, transB
-        c_int, c_int, c_int,         // m, n, k
-        *const c_void,               // alpha (pointer to scalar of compute_type)
-        *const c_void, c_uint, c_int,// A, a_type, lda
-        *const c_void, c_uint, c_int,// B, b_type, ldb
-        *const c_void,               // beta
-        *const c_void, c_uint, c_int,// C, c_type, ldc
-        *mut c_void,   c_uint, c_int,// D, d_type, ldd
-        c_uint,                      // compute_type
-        c_uint,                      // algo
-        i32, u32,                    // solution_index, flags
+        c_uint,
+        c_uint, // transA, transB
+        c_int,
+        c_int,
+        c_int,         // m, n, k
+        *const c_void, // alpha (pointer to scalar of compute_type)
+        *const c_void,
+        c_uint,
+        c_int, // A, a_type, lda
+        *const c_void,
+        c_uint,
+        c_int,         // B, b_type, ldb
+        *const c_void, // beta
+        *const c_void,
+        c_uint,
+        c_int, // C, c_type, ldc
+        *mut c_void,
+        c_uint,
+        c_int,  // D, d_type, ldd
+        c_uint, // compute_type
+        c_uint, // algo
+        i32,
+        u32, // solution_index, flags
     ) -> u32,
 }
 
@@ -104,21 +116,24 @@ impl Rocblas {
             "/opt/rocm/lib/librocblas.so.6",
             "/opt/rocm/lib/librocblas.so.5",
         ];
-        let lib = candidates.iter().find_map(|name| {
-            unsafe { Library::new(name).ok() }
-        }).ok_or_else(|| RocblasError {
-            status: 0,
-            context: "dlopen librocblas.so (tried several names) failed".into(),
-        })?;
+        let lib = candidates
+            .iter()
+            .find_map(|name| unsafe { Library::new(name).ok() })
+            .ok_or_else(|| RocblasError {
+                status: 0,
+                context: "dlopen librocblas.so (tried several names) failed".into(),
+            })?;
 
         unsafe {
-            let fn_create_handle: Symbol<unsafe extern "C" fn(*mut RocblasHandle) -> u32> =
-                lib.get(b"rocblas_create_handle").map_err(|e| RocblasError {
+            let fn_create_handle: Symbol<unsafe extern "C" fn(*mut RocblasHandle) -> u32> = lib
+                .get(b"rocblas_create_handle")
+                .map_err(|e| RocblasError {
                     status: 0,
                     context: format!("resolve rocblas_create_handle: {e}"),
                 })?;
-            let fn_destroy_handle: Symbol<unsafe extern "C" fn(RocblasHandle) -> u32> =
-                lib.get(b"rocblas_destroy_handle").map_err(|e| RocblasError {
+            let fn_destroy_handle: Symbol<unsafe extern "C" fn(RocblasHandle) -> u32> = lib
+                .get(b"rocblas_destroy_handle")
+                .map_err(|e| RocblasError {
                     status: 0,
                     context: format!("resolve rocblas_destroy_handle: {e}"),
                 })?;
@@ -127,20 +142,34 @@ impl Rocblas {
                     status: 0,
                     context: format!("resolve rocblas_set_stream: {e}"),
                 })?;
-            let fn_gemm_ex: Symbol<unsafe extern "C" fn(
-                RocblasHandle,
-                c_uint, c_uint,
-                c_int, c_int, c_int,
-                *const c_void,
-                *const c_void, c_uint, c_int,
-                *const c_void, c_uint, c_int,
-                *const c_void,
-                *const c_void, c_uint, c_int,
-                *mut c_void,   c_uint, c_int,
-                c_uint,
-                c_uint,
-                i32, u32,
-            ) -> u32> = lib.get(b"rocblas_gemm_ex").map_err(|e| RocblasError {
+            let fn_gemm_ex: Symbol<
+                unsafe extern "C" fn(
+                    RocblasHandle,
+                    c_uint,
+                    c_uint,
+                    c_int,
+                    c_int,
+                    c_int,
+                    *const c_void,
+                    *const c_void,
+                    c_uint,
+                    c_int,
+                    *const c_void,
+                    c_uint,
+                    c_int,
+                    *const c_void,
+                    *const c_void,
+                    c_uint,
+                    c_int,
+                    *mut c_void,
+                    c_uint,
+                    c_int,
+                    c_uint,
+                    c_uint,
+                    i32,
+                    u32,
+                ) -> u32,
+            > = lib.get(b"rocblas_gemm_ex").map_err(|e| RocblasError {
                 status: 0,
                 context: format!("resolve rocblas_gemm_ex: {e}"),
             })?;
@@ -162,7 +191,6 @@ impl Rocblas {
             Ok(Self {
                 _lib: lib,
                 handle,
-                fn_create_handle,
                 fn_destroy_handle,
                 fn_set_stream,
                 fn_gemm_ex,
@@ -171,11 +199,15 @@ impl Rocblas {
     }
 
     /// Bind this rocBLAS handle to a HIP stream so calls execute on it.
-    /// Passing null stream (default stream) is also valid.
-    pub fn set_stream(&self, stream_handle: *mut c_void) -> RocblasResult<()> {
-        let st = unsafe { (self.fn_set_stream)(self.handle, stream_handle) };
-        if st == ROCBLAS_STATUS_SUCCESS { Ok(()) } else {
-            Err(RocblasError { status: st, context: "rocblas_set_stream".into() })
+    pub fn set_stream(&self, stream: &Stream) -> RocblasResult<()> {
+        let st = unsafe { (self.fn_set_stream)(self.handle, stream.as_raw()) };
+        if st == ROCBLAS_STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(RocblasError {
+                status: st,
+                context: "rocblas_set_stream".into(),
+            })
         }
     }
 
@@ -188,35 +220,69 @@ impl Rocblas {
     /// Note: rocBLAS is column-major. Our engine stores matrices row-major,
     /// so callers flip the operation (A_row · B_row == (B_col^T · A_col^T)^T)
     /// and swap (m, n) / (a, b) / (lda, ldb) / transA, transB when dispatching.
+    ///
+    /// # Safety
+    ///
+    /// All matrix pointers and scalar pointers must be valid for the rocBLAS
+    /// call, point to GPU memory where rocBLAS expects it, and describe buffers
+    /// large enough for the dimensions and leading dimensions passed here.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_ex(
         &self,
-        trans_a: RocblasOperation, trans_b: RocblasOperation,
-        m: i32, n: i32, k: i32,
+        trans_a: RocblasOperation,
+        trans_b: RocblasOperation,
+        m: i32,
+        n: i32,
+        k: i32,
         alpha: *const c_void,
-        a: *const c_void, a_type: RocblasDatatype, lda: i32,
-        b: *const c_void, b_type: RocblasDatatype, ldb: i32,
+        a: *const c_void,
+        a_type: RocblasDatatype,
+        lda: i32,
+        b: *const c_void,
+        b_type: RocblasDatatype,
+        ldb: i32,
         beta: *const c_void,
-        c: *const c_void, c_type: RocblasDatatype, ldc: i32,
-        d: *mut c_void,   d_type: RocblasDatatype, ldd: i32,
+        c: *const c_void,
+        c_type: RocblasDatatype,
+        ldc: i32,
+        d: *mut c_void,
+        d_type: RocblasDatatype,
+        ldd: i32,
         compute_type: RocblasDatatype,
     ) -> RocblasResult<()> {
         let st = (self.fn_gemm_ex)(
             self.handle,
-            trans_a as c_uint, trans_b as c_uint,
-            m, n, k,
+            trans_a as c_uint,
+            trans_b as c_uint,
+            m,
+            n,
+            k,
             alpha,
-            a, a_type as c_uint, lda,
-            b, b_type as c_uint, ldb,
+            a,
+            a_type as c_uint,
+            lda,
+            b,
+            b_type as c_uint,
+            ldb,
             beta,
-            c, c_type as c_uint, ldc,
-            d, d_type as c_uint, ldd,
+            c,
+            c_type as c_uint,
+            ldc,
+            d,
+            d_type as c_uint,
+            ldd,
             compute_type as c_uint,
             RocblasGemmAlgo::Standard as c_uint,
-            0, 0,
+            0,
+            0,
         );
-        if st == ROCBLAS_STATUS_SUCCESS { Ok(()) } else {
-            Err(RocblasError { status: st, context: "rocblas_gemm_ex".into() })
+        if st == ROCBLAS_STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(RocblasError {
+                status: st,
+                context: "rocblas_gemm_ex".into(),
+            })
         }
     }
 }
