@@ -151,6 +151,17 @@ fn rotation_tag_distinguishes_awq_and_batched() {
 }
 
 #[test]
+fn run_rejects_tag_plan_mismatch() {
+    use hipfire_dispatch::families::gemv::{check_rotation_tag, RotationTag};
+    use hipfire_dispatch::types::RotationPlan;
+    let want = RotationTag { plan: RotationPlan::FwhtG256, awq: false, batched: false };
+    let givens = RotationTag { plan: RotationPlan::Givens, awq: false, batched: false };
+    let awq = RotationTag { plan: RotationPlan::FwhtG256, awq: true, batched: false };
+    assert!(check_rotation_tag(want, want).is_ok());
+    assert!(check_rotation_tag(want, givens).is_err(), "plan mismatch must reject");
+    assert!(check_rotation_tag(want, awq).is_err(), "awq mismatch must reject");
+}
+#[test]
 fn rotate_variant_selection() {
     use hipfire_dispatch::families::gemv::select_rotation_variant;
     use hipfire_dispatch::types::{RotationPlan, RotationVariant};

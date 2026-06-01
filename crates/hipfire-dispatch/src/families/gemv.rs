@@ -135,6 +135,17 @@ pub fn select_rotation_variant(plan: RotationPlan, has_norm: bool, has_swiglu: b
     }
 }
 
+/// Verify a pre-rotated input's tag matches what this weight expects.
+pub fn check_rotation_tag(expected: RotationTag, got: RotationTag)
+    -> Result<(), DispatchError>
+{
+    if expected == got { Ok(()) } else {
+        Err(DispatchError::UnsupportedVariant {
+            family: "gemv", variant: "rotation-tag-mismatch", arch: "", quant: "",
+        })
+    }
+}
+
 pub struct GemvFamily {
     registry: KernelRegistry,
     rotation: RotationFamily,
@@ -173,8 +184,8 @@ impl GemvFamily {
 
     /// Run a GEMV with automatic variant selection.
     ///
-    /// Picks `Prerotated` when `dtype_needs_fwht(w.dtype)`, `Plain` otherwise.
-    /// Replaces per-model `gemv_prerotated_or_plain` / `dispatch_gemv` helpers.
+    /// Uses `dtype_post_rotation_variant` so ParoQ4G128 resolves to Plain
+    /// (rotate-then-HFQ4G128) and MQ-family to Prerotated.
     pub fn run_auto(
         &self,
         ctx: &DispatchCtx,
@@ -183,13 +194,46 @@ impl GemvFamily {
         x: &GpuTensor,
         y: &GpuTensor,
     ) -> Result<(), DispatchError> {
-        let variant = if crate::types::dtype_needs_fwht(w.dtype) {
-            GemvVariant::Prerotated
-        } else {
-            GemvVariant::Plain
+        self.run_input(ctx, gpu, w, RotInput::Raw(x), y)
+    }
+
+    /// Run a GEMV with a raw or pre-rotated input.
+    ///
+    /// `RotInput::Raw(x)` — family auto-rotates if the dtype requires it,
+    /// then dispatches the post-rotation variant.
+    ///
+    /// `RotInput::Rotated(h)` — uses the pre-rotated buffer directly,
+    /// validating the rotation tag matches the weight's expected plan.
+    pub fn run_input(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        w: &WeightRef,
+        input: RotInput,
+        y: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        let x_buf = match input {
+            RotInput::Raw(x) => {
+                let plan = crate::types::dtype_rotation_plan(w.dtype);
+                if plan == RotationPlan::None {
+                    GpuTensor { buf: unsafe { x.buf.alias() }, shape: x.shape.clone(), dtype: x.dtype }
+                } else {
+                    let h = self.rotate(ctx, gpu, w, x, &RotateInputs::default())?;
+                    h.into_buf()
+                }
+            }
+            RotInput::Rotated(h) => {
+                let plan = crate::types::dtype_rotation_plan(w.dtype);
+                let expected = RotationTag {
+                    plan, awq: w.awq_scale.is_some(), batched: false,
+                };
+                check_rotation_tag(expected, h.tag())?;
+                h.into_buf()
+            }
         };
+        let variant = crate::types::dtype_post_rotation_variant(w.dtype);
         self.run(ctx, gpu, &GemvParams {
-            w, x, y, variant,
+            w, x: &x_buf, y, variant,
             residual: None, gate: None, up: None,
         })
     }
