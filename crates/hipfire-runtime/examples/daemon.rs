@@ -3152,6 +3152,13 @@ fn load_model_pp(
         spec_state.ensure_compressed_lm_logits(&mut gpus.devices[output_device], cvs)
             .map_err(|e| format!("alloc trunk-side mtp_lm_logits_compressed: {e}"))?;
 
+        // Allocate persistent multi-GPU tape shards for the PP+MTP fast-replay
+        // path. One shard per band, each on its own device. Reused across cycles.
+        let tape_shards = hipfire_arch_qwen35::speculative::GdnTapeShards::new(
+            &mut gpus, &target.config, mtp_k + 1,
+        ).map_err(|e| format!("alloc GdnTapeShards: {e}"))?;
+        spec_state.trunk_gdn_tape_shards = Some(tape_shards);
+
         // Drafter-side state on output_device (= same device as spec state).
         // mtp_scratch.ensure_compressed_logits is called by new_for_slot's
         // caller convention; do it explicitly.
@@ -3270,6 +3277,15 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // weights, so each free targets a still-live owner.
     if m.pp > 1 {
         let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
+        // MTP multi-GPU state (tape shards live across multiple devices).
+        if let Some(mut mtp) = m.mtp {
+            mtp.spec_state.free_gpu_multi(&mut gpus);
+            mtp.spec_state.free_gpu(&mut gpus.devices[gpus.output_device]);
+            mtp.head.free_gpu(&mut gpus.devices[gpus.output_device]);
+            if let Some(ds) = mtp.drafter_state {
+                ds.free_gpu(&mut gpus.devices[gpus.output_device]);
+            }
+        }
         if let Some(scratch_set) = m.pp_scratch_set { scratch_set.free_gpu_multi(&mut gpus); }
         if let Some(kv) = m.kv_cache { kv.free_gpu_multi(&mut gpus); }
         if let Some(dn) = m.dn_state {
@@ -4598,7 +4614,7 @@ fn generate_pp_mtp(m: &mut LoadedModel, ctx: &mut GenerateCtx<'_>) {
             gpus, &weights, &target_config, &new_tokens, start_pos,
             &mut kv_cache, &mut dn_state, &pp_scratch_set,
             Some(&per_tok_hidden_out),
-            None, // gdn_tape — v1 disabled (matches spec_step_mtp_compressed_serial_multi)
+            None, // gdn_tape_shards — prefill doesn't need tape capture
             None, // tree_verify — MTP verify is linear
             false, // needs_last_token_logits: MTP verify uses per_token_hidden_out
         ) {

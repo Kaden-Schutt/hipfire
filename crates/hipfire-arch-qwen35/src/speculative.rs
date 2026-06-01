@@ -1108,6 +1108,141 @@ impl GdnTapeShards {
         Ok(())
     }
 
+    /// Multi-GPU GDN replay: iterate each band, replay only the LA layers
+    /// owned by that band using the shard's captured data + local conv weights
+    /// + local DN state. Avoids the full trunk forward on partial-accept cycles.
+    ///
+    /// Each band's shard already has replay scratch (q_raw, k_raw, etc.)
+    /// allocated on its own device. The shard's `qkv_bufs[la_idx]`,
+    /// `alpha_bufs[la_idx]`, `beta_bufs[la_idx]` hold the captured LA
+    /// projections for layers this band owns (other indices are 1-byte
+    /// placeholders). The conv weights and DN state for each layer also
+    /// live on the owning band's device — so everything is local, no
+    /// peer copies needed.
+    ///
+    /// Caller must have restored the DN snapshot to the pre-verify point
+    /// before calling this.
+    pub fn replay_gdn_multi(
+        &self,
+        gpus: &mut Gpus,
+        weights: &qwen35::Qwen35Weights,
+        config: &qwen35::Qwen35Config,
+        dn_state: &mut qwen35::DeltaNetState,
+        n_steps: usize,
+    ) -> HipResult<()> {
+        assert!(n_steps <= self.shards[0].max_n,
+            "replay_gdn_multi: n_steps {n_steps} > max_n {}", self.shards[0].max_n);
+
+        let n_v_heads = config.linear_num_value_heads;
+        let n_key_heads = config.linear_num_key_heads;
+        let hd = config.linear_key_head_dim;
+        let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+
+        // Iterate bands. For each band, iterate its owned LA layers.
+        // We need the global LA index counter to index into dn_state
+        // (s_matrices, s_scales, conv_states), and the per-band local
+        // counter for the shard's owned-layer entries.
+        let mut global_la_idx = 0usize;
+        for (band_idx, lt) in config.layer_types.iter().enumerate() {
+            if *lt != qwen35::LayerType::LinearAttention {
+                continue;
+            }
+            let owning_band = gpus.device_for_layer(band_idx);
+            let shard = &self.shards[owning_band];
+            let g = &mut gpus.devices[owning_band];
+            g.bind_thread()?;
+
+            // Find this layer's position among the shard's owned layers.
+            // shard_owns[band][global_la_idx] == true for the owning band.
+            let local_la_idx = {
+                let mut count = 0usize;
+                for gi in 0..global_la_idx {
+                    if self.shard_owns[owning_band][gi] {
+                        count += 1;
+                    }
+                }
+                count
+            };
+
+            let conv_weight = match &weights.layers[band_idx] {
+                qwen35::LayerWeights::DeltaNet(l) => &l.conv_weight,
+                qwen35::LayerWeights::DeltaNetMoe(l) => &l.conv_weight,
+                _ => unreachable!("LA layer type mismatch in replay_gdn_multi"),
+            };
+
+            // 1. conv1d + SiLU + split — advances conv_state, writes
+            //    (q_raw, k_raw, v) into scratch.
+            g.conv1d_silu_split_f32_n(
+                &shard.q_raw_scratch,
+                &shard.k_raw_scratch,
+                &shard.v_scratch,
+                &shard.qkv_bufs[global_la_idx],
+                conv_weight,
+                &dn_state.conv_states[global_la_idx],
+                k_dim,
+                v_dim,
+                n_steps,
+            )?;
+
+            // 2. L2 norm(Q) + L2 norm(K) + scale(Q).
+            g.fused_qk_l2_norm_scale_f32_batched(
+                &shard.q_raw_scratch,
+                &shard.k_raw_scratch,
+                n_key_heads,
+                hd,
+                1.0 / (hd as f32).sqrt(),
+                config.norm_eps,
+                n_steps,
+            )?;
+
+            // 3. Repeat-interleave if GQA.
+            if n_key_heads < n_v_heads {
+                let ratio = n_v_heads / n_key_heads;
+                g.repeat_interleave_qk_f32_batched(
+                    &shard.q_raw_scratch,
+                    &shard.k_raw_scratch,
+                    &shard.q_scratch,
+                    &shard.k_scratch,
+                    n_key_heads,
+                    ratio,
+                    hd,
+                    n_steps,
+                )?;
+            } else {
+                let bytes = n_steps * k_dim * 4;
+                g.hip.memcpy_dtod_at(
+                    &shard.q_scratch.buf, 0,
+                    &shard.q_raw_scratch.buf, 0,
+                    bytes,
+                )?;
+                g.hip.memcpy_dtod_at(
+                    &shard.k_scratch.buf, 0,
+                    &shard.k_raw_scratch.buf, 0,
+                    bytes,
+                )?;
+            }
+
+            // 4. GDN recurrence — advances S_state.
+            g.gated_delta_net_q8_batch_seq(
+                &shard.q_scratch,
+                &shard.k_scratch,
+                &shard.v_scratch,
+                &shard.alpha_bufs[global_la_idx],
+                &shard.beta_bufs[global_la_idx],
+                &dn_state.s_matrices[global_la_idx],
+                &dn_state.s_scales[global_la_idx],
+                &shard.attn_scratch,
+                n_steps,
+                n_v_heads,
+                config.linear_value_head_dim,
+            )?;
+
+            global_la_idx += 1;
+        }
+        Ok(())
+    }
+
     pub fn free_gpu(self, gpus: &mut Gpus) {
         for (band, shard) in self.shards.into_iter().enumerate() {
             shard.free_gpu(&mut gpus.devices[band]);

@@ -379,7 +379,15 @@ pub struct MtpSpecState {
 
     /// Innovation tape captured during trunk verify. After rollback, replaying
     /// this advances only the DeltaNet recurrence for the accepted prefix.
+    /// Used by single-GPU `_serial` path.
     pub trunk_gdn_tape: GdnTape,
+
+    /// Multi-GPU GdnTape shards for the PP+MTP `_multi` path. One shard per
+    /// band, each allocated on its own device. Reused across cycles — allocated
+    /// once at MtpSpecState construction. On rollback, `replay_gdn_multi`
+    /// advances DN state per-band from the captured projections without
+    /// re-running the full transformer.
+    pub trunk_gdn_tape_shards: Option<crate::speculative::GdnTapeShards>,
 
     /// MTP head per-call scratch (Task 9). One per slot; reused across cycles.
     pub mtp_scratch: Qwen35MtpHeadScratch,
@@ -599,6 +607,7 @@ impl MtpSpecState {
             trunk_snap_start_event,
             trunk_pbs,
             trunk_gdn_tape,
+            trunk_gdn_tape_shards: None,
             mtp_scratch,
             mtp_kv,
             mtp_t_outs,
@@ -771,6 +780,15 @@ impl MtpSpecState {
         self.trunk_gdn_tape.free_gpu(gpu);
         self.mtp_scratch.free_gpu(gpu);
         self.mtp_kv.free_gpu(gpu);
+        // trunk_gdn_tape_shards freed separately via free_gpu_multi.
+    }
+
+    /// Free the multi-GPU tape shards. Called separately from `free_gpu`
+    /// because the shards live on multiple devices (not the single gpu).
+    pub fn free_gpu_multi(&mut self, gpus: &mut Gpus) {
+        if let Some(shards) = self.trunk_gdn_tape_shards.take() {
+            shards.free_gpu(gpus);
+        }
     }
 }
 
@@ -3242,19 +3260,16 @@ fn drafter_embed_lookup(
 //    branching), so `tree_verify=None` satisfies the `_multi_with_caps`
 //    assert.
 //
-// 2. Fast-path replay disabled. `_hetero`'s rollback path may take
-//    `trunk_gdn_tape.replay_gdn(target_gpu, trunk_weights, ...)` for
-//    cheap GDN-only replay. Under PP, `trunk_weights.layers[i]` for an
-//    LA layer i lives on its owning band — not output_device — so
-//    launching `conv1d_silu_split_f32_n` against `&weights.layers[i].
-//    conv_weight` from output_device's gpu errors with "invalid device
-//    ordinal". We force `tape_captured = false` so replay_gdn is never
-//    called; rollback always takes the slow-path full-trunk replay via
-//    `forward_prefill_batch_multi`. v1 perf cost: ~10 ms per partial-
-//    accept cycle vs ~1 ms for tape replay (~2/3 of cycles at τ≈3 fire
-//    rollback). See plan §5d for the future-work options to recover
-//    this — mirror LA conv weights to output_device (simpler) or thread
-//    Gpus into replay_gdn_inner per-layer (more general).
+// 2. Fast-path replay via per-band GdnTapeShards. The verify forward
+//    captures per-LA-layer QKV + alpha/beta projections into persistent
+//    shards (one per band, each on its own device). On rollback, the
+//    multi-GPU GDN replay iterates bands and advances DN state using
+//    local data only — no cross-device copies, no re-running the full
+//    transformer stack. This eliminates ~10 ms of replay overhead per
+//    partial-accept cycle (~65% of cycles at τ≈3 fire rollback).
+//    Falls back to full-trunk replay via `forward_prefill_batch_multi`
+//    when tape shards are not available (should not happen in normal
+//    operation).
 //
 // Borrow shape: takes `gpus: &mut Gpus` + `output_device: usize`. The
 // chain & sampling rebind a single `&mut Gpu` to `&mut gpus.devices[
@@ -3429,11 +3444,12 @@ pub fn spec_step_mtp_compressed_serial_multi(
         state.trunk_snap.save_from(target_dn, target_gpu)?;
     }
 
-    // v1: force tape_captured = false. See header comment for rationale.
-    // tape_captured is still tracked as a let-binding for clarity vs _hetero.
-    let tape_captured = false;
-    let verify_tape: Option<&mut GdnTape> = None;
-    let _ = verify_tape; // silence unused-mut if tape_captured ever flips
+    // Tape capture enabled: GdnTapeShards captures per-LA-layer QKV +
+    // alpha/beta projections during the verify forward, then on rollback
+    // the multi-GPU GDN replay advances DN state cheaply without re-running
+    // the full transformer stack.
+    let tape_captured = state.trunk_gdn_tape_shards.is_some();
+    let _ = tape_captured; // used below in rollback
 
     // Multi-GPU trunk verify. forward_prefill_batch_multi_with_caps dispatches
     // each layer to its owning band; per_token_hidden_out lands on output_device
@@ -3447,11 +3463,11 @@ pub fn spec_step_mtp_compressed_serial_multi(
         gpus, trunk_weights, target_config, &verify_tokens, cur_pos,
         target_kv, target_dn, pp_scratch_set,
         Some(&state.verify_hidden),
-        None, // gdn_tape — v1 disabled (see header)
+        state.trunk_gdn_tape_shards.as_mut(), // capture into persistent shards (None = no capture)
         None, // tree_verify — MTP verify is linear
         false, // needs_last_token_logits: MTP verify uses per_token_hidden_out,
                // not the last-token logits; skipping saves one rmsnorm + GEMV.
-    )?;
+    )?;;
 
     // ── 2b. lm_head GEMM + argmax (output_device — trunk.output lives there) ──
     let mut accept_count = 0usize;
@@ -3572,8 +3588,9 @@ pub fn spec_step_mtp_compressed_serial_multi(
 
     // ── 3. Rollback / replay on multi-GPU trunk ──
     //
-    // Fast path (replay_gdn) is disabled in v1 — tape_captured forced to
-    // false above. Slow path uses forward_prefill_batch_multi / forward_scratch_multi.
+    // Fast path: GdnTapeShards replay advances DN state per-band without
+    // re-running the full transformer stack. Falls back to full trunk replay
+    // only when tape capture failed (should not happen in normal operation).
     let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
     let replay_skipped = full_accept_no_eos;
     if !full_accept_no_eos {
@@ -3582,22 +3599,25 @@ pub fn spec_step_mtp_compressed_serial_multi(
             target_gpu.bind_thread()?;
             state.trunk_snap.restore_to(target_dn, target_gpu)?;
         }
-        if tape_captured {
-            // Disabled in v1 — see header comment + plan §5d future work.
-            unreachable!("PpMtp v1 forces tape_captured=false; this branch should be unreachable");
+        if tape_captured && advance >= 1 {
+            // Fast path: GDN-only replay from captured tape shards.
+            // Advances DN state by `advance` positions without re-running
+            // the full transformer stack. KV at cur_pos..cur_pos+advance
+            // was already written correctly by the verify forward.
+            state.trunk_gdn_tape_shards.as_mut().expect("tape_captured but shards not initialized").replay_gdn_multi(
+                gpus, trunk_weights, target_config, target_dn, advance,
+            )?;
+        } else if advance >= 2 {
+            let replay = &verify_tokens[..advance];
+            qwen35::forward_prefill_batch_multi(
+                gpus, trunk_weights, target_config, replay, cur_pos,
+                target_kv, target_dn, pp_scratch_set,
+            )?;
         } else {
-            if advance >= 2 {
-                let replay = &verify_tokens[..advance];
-                qwen35::forward_prefill_batch_multi(
-                    gpus, trunk_weights, target_config, replay, cur_pos,
-                    target_kv, target_dn, pp_scratch_set,
-                )?;
-            } else {
-                qwen35::forward_scratch_multi(
-                    gpus, trunk_weights, target_config, verify_tokens[0], cur_pos,
-                    target_kv, target_dn, pp_scratch_set,
-                )?;
-            }
+            qwen35::forward_scratch_multi(
+                gpus, trunk_weights, target_config, verify_tokens[0], cur_pos,
+                target_kv, target_dn, pp_scratch_set,
+            )?;
         }
     }
 

@@ -11002,7 +11002,7 @@ pub fn forward_prefill_batch_multi_with_caps(
     dn_state: &mut DeltaNetState,
     scratch_set: &Qwen35ScratchSet,
     per_token_hidden_out: Option<&GpuTensor>,
-    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    gdn_tape_shards: Option<&mut crate::speculative::GdnTapeShards>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     needs_last_token_logits: bool,
 ) -> HipResult<()> {
@@ -11124,16 +11124,14 @@ pub fn forward_prefill_batch_multi_with_caps(
     let dim_row_bytes = dim * 4;
 
     // GdnTape sharding for PP+MTP: when caller wants tape capture
-    // (gdn_tape.is_some()), allocate one shard per band on its own
-    // device, thread shard[b] into band b's chunk call, then
-    // assemble-into the caller's target tape after the loop. See
-    // GdnTapeShards docstring for the design rationale.
-    let mut gdn_tape_shards: Option<crate::speculative::GdnTapeShards> =
-        if gdn_tape.is_some() {
-            Some(crate::speculative::GdnTapeShards::new(gpus, config, max_batch)?)
-        } else {
-            None
-        };
+    // (gdn_tape_shards.is_some()), thread shard[b] into band b's chunk
+    // call. The shards are caller-owned and persistent — allocated once
+    // at MtpSpecState construction, reused across cycles. No assemble_into
+    // here; the multi-GPU MTP stepper replays directly from the shards
+    // per-band. See GdnTapeShards::replay_gdn_multi.
+    //
+    // Shadow the parameter to avoid borrow conflicts with the closure below.
+    let mut gdn_tape_shards = gdn_tape_shards;
 
     let last_band = n_bands - 1;
 
@@ -11219,17 +11217,9 @@ pub fn forward_prefill_batch_multi_with_caps(
         pbs.free_gpu(g);
     }
 
-    // Assemble shards into the caller's tape, then free the shards.
-    // Only runs if the forward loop succeeded (assembly would copy
-    // garbage on partial failure).
-    if let Some(shards) = gdn_tape_shards.take() {
-        if result.is_ok() {
-            if let Some(target_tape) = gdn_tape {
-                shards.assemble_into(gpus, target_tape)?;
-            }
-        }
-        shards.free_gpu(gpus);
-    }
+    // Shards are caller-owned — no assembly or free here. The caller
+    // (MTP spec stepper) replays directly from shards on rollback via
+    // GdnTapeShards::replay_gdn_multi.
 
     result
 }
