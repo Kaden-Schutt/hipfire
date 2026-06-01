@@ -3298,8 +3298,6 @@ pub fn spec_step_mtp_compressed_serial_multi(
         .expect("spec_step_mtp_compressed_serial_multi: head has no lm_head_draft sidecar; \
                  v1 requires the cvs-compressed .mtp path (bundled full-vocab .mq4-mtp \
                  needs trunk.output mirror, not implemented)");
-    let vocab_map = head.weights.lm_head_draft_vocab_map.as_ref()
-        .expect("multi: compressed head missing vocab_map");
     let cvs = head.weights.compressed_vocab_size
         .expect("multi: compressed head missing compressed_vocab_size");
     let _ = lm_head_draft;
@@ -3319,30 +3317,18 @@ pub fn spec_step_mtp_compressed_serial_multi(
         state.p_min,
     );
 
-    // ── 0. Device-token-chain eligibility ──────────────────────────────
-    //
-    // Reuse the single-GPU eligibility gate (format + greedy + no p_min).
-    // The _multi path already asserts greedy-only and no-p_min above, so the
-    // format gate is the only live check. Do NOT duplicate the eligibility
-    // function — call the existing one to avoid drift (Gemini review 2.3).
-    let use_device_token_chain = mtp_device_token_chain_enabled_from_env()
-        && mtp_device_token_chain_eligible_for(
-            drafter_state.embd_format, false, false,
-        );
-    if use_device_token_chain {
-        assert!(
-            head.weights.lm_head_draft_vocab_map_gpu.is_some(),
-            "multi-GPU device-token chain requires GPU vocab_map"
-        );
-    }
+    // Device-token chain is always active for _multi. The path already
+    // asserts greedy-only and no-p_min, and the embd format check is
+    // enforced by mtp_device_token_chain_eligible_for at this point.
+    assert!(
+        head.weights.lm_head_draft_vocab_map_gpu.is_some(),
+        "multi-GPU device-token chain requires GPU vocab_map"
+    );
 
     // ── 1. K-step draft chain (output_device) ────────────────────────────
     //
-    // Two modes:
-    //   * Device-token-chain ON: embedding lookup + argmax + vocab-remap
-    //     all happen on-GPU. No per-step D2H. Bulk D2H of candidate tokens
-    //     once at the end.
-    //   * Legacy OFF: original per-step host roundtrip (unchanged).
+    // Embedding lookup + argmax + vocab-remap all happen on-GPU.
+    // No per-step D2H. Bulk D2H of candidate tokens once at the end.
     let drafts_generated;
     let mut candidates: Vec<u32>;
     {
@@ -3361,7 +3347,6 @@ pub fn spec_step_mtp_compressed_serial_multi(
                      call drafter_state.mtp_scratch.ensure_compressed_logits(\
                      output_device gpu, cvs)");
 
-        if use_device_token_chain {
             // Seed the chain with last_committed.
             let seed_token = last_committed as i32;
             let seed_bytes: &[u8] =
@@ -3428,52 +3413,6 @@ pub fn spec_step_mtp_compressed_serial_multi(
             }
             candidates.extend(candidate_host.into_iter().map(|t| t as u32));
             drafts_generated = max_n;
-        } else {
-            // ── Legacy per-step host roundtrip (unchanged) ────────────────
-            for k in 0..max_n {
-                let next_tok = if k == 0 { last_committed } else { candidates[k - 1] };
-
-                drafter_embed_lookup(drafter_gpu, drafter_state, next_tok, dim)?;
-
-                if k == 0 {
-                    mtp_head::mtp_head_forward_compressed_with_embed(
-                        drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
-                        &drafter_state.step_embd, &drafter_state.prev_hidden, cur_pos + k,
-                    )?;
-                } else {
-                    let prev_row = drafter_state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-                    mtp_head::mtp_head_forward_compressed_with_embed(
-                        drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
-                        &drafter_state.step_embd, &prev_row, cur_pos + k,
-                    )?;
-                }
-
-                drafter_gpu.argmax_f32_batched(logits_c, &argmax_view, cvs, 1)?;
-                let mut argmax_host: [i32; 1] = [0];
-                {
-                    let bytes: &mut [u8] = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            argmax_host.as_mut_ptr() as *mut u8, 4,
-                        )
-                    };
-                    drafter_gpu.hip.memcpy_dtoh(bytes, &argmax_view.buf)?;
-                }
-                let draft_idx = argmax_host[0] as usize;
-                assert!(draft_idx < cvs,
-                    "drafter argmax {draft_idx} out of cvs {cvs}");
-                let token_id = vocab_map[draft_idx];
-                candidates.push(token_id);
-
-                if k + 1 < max_n {
-                    drafter_gpu.hip.memcpy_dtod_at(
-                        &drafter_state.mtp_t_outs.buf, k * dim_bytes,
-                        &drafter_state.mtp_scratch.t_mtp_out.buf, 0,
-                        dim_bytes,
-                    )?;
-                }
-            }
-            drafts_generated = candidates.len();
-        }
     }
 
     // ── 2. Trunk verify (multi-GPU dispatch via forward_prefill_batch_multi_with_caps) ──
@@ -3573,11 +3512,8 @@ pub fn spec_step_mtp_compressed_serial_multi(
         let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
         target_gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
 
-        // ── GPU-side greedy accept (when device-token-chain is active) ──
-        let use_gpu_accept = use_device_token_chain
-            && mtp_gpu_greedy_accept_enabled_from_env();
-
-        if use_gpu_accept {
+        // ── GPU-side greedy accept ──
+        {
             let candidate_device = drafter_state.mtp_token_chain.sub_offset(1, drafts_generated);
             // ALIASING: accept_result overlaps argmax_v[0..2]; both are views
             // into state.verify_argmax. Safe because greedy_accept is
@@ -3610,40 +3546,6 @@ pub fn spec_step_mtp_compressed_serial_multi(
             committed = accepted.committed;
             accept_count = accepted.accept_count;
             hit_eos = accepted.hit_eos;
-            // argmax_per_pos not materialized in GPU accept path
-        } else {
-            // ── Legacy host-side accept (unchanged) ────────────────────
-            let mut argmax_v_host: Vec<i32> = vec![0; n_verify];
-            {
-                let bytes: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        argmax_v_host.as_mut_ptr() as *mut u8, n_verify * 4,
-                    )
-                };
-                target_gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
-            }
-            let argmax_per_pos: Vec<u32> = argmax_v_host.into_iter().map(|x| x as u32).collect();
-
-            // ── Greedy accept rule (v1 — sampling/p_min NYI) ──
-            for k in 0..drafts_generated {
-                if argmax_per_pos[k] == candidates[k] {
-                    committed.push(candidates[k]);
-                    accept_count += 1;
-                    if candidates[k] == eos_token_id {
-                        hit_eos = true;
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-            if !hit_eos {
-                let bonus = argmax_per_pos[accept_count];
-                committed.push(bonus);
-                if bonus == eos_token_id {
-                    hit_eos = true;
-                }
-            }
         }
     }
 
