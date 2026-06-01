@@ -5257,7 +5257,8 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // docs/plans/gfx10_mq3_prefill.md).
     let mq3_uniform_with_wmma = matches!(dt, DType::MQ3G256)
         && matches!(arch,
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
+            | "gfx1150" | "gfx1151" | "gfx1152"
             | "gfx1200" | "gfx1201"
         );
 
@@ -5278,7 +5279,8 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // (see hipfire_runtime::llama::is_batchable_la).
     let fp4_with_wmma = matches!(dt, DType::HFP4G32 | DType::MFP4G32)
         && matches!(arch,
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
+            | "gfx1150" | "gfx1151" | "gfx1152"
             | "gfx1200" | "gfx1201"
         );
 
@@ -11736,10 +11738,6 @@ mod tests {
         let mq3_dt = DType::MQ3G256;
         let batchable_dt = DType::MQ4G256;
         // Use default F32 as fallback
-        use crate::MoeFfnWeights;
-        // We can't easily construct MoeFfnWeights from test (most fields are GPU tensors).
-        // This test verifies the predicate logic at the DType level.
-        // The actual function requires GPU-backed tensors, so it's tested as a property
-        // of the types, not via constructing full weights.
+        // MoeFfnWeights requires GPU-backed tensors; predicate is tested at DType level.
     }
 }
