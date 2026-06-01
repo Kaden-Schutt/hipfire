@@ -627,7 +627,7 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
     let mut wt = match info.quant_type {
         0 => { // Q4F16G64
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q4F16G64, m, k, row_stride: 0, paro: None, awq_scale: None })
+            Ok::<WeightTensor, HipError>(WeightTensor { buf, gpu_dtype: DType::Q4F16G64, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         3 => { // Q8F16 — same block format as GGML Q8_0 (34 bytes per 32 elements)
             let buf = gpu.upload_raw(data, &[data.len()])?;

@@ -703,8 +703,12 @@ pub fn weight_gemv(
                 givens_scales: Some(&paro.channel_scales),
                 givens_krot: Some(paro.krot as usize),
             }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-            gemv.run_auto(&ctx, gpu, &wr, &xr, y)
-                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+            // After Givens rotation xr is ready; use Plain (HFQ4G128 kernel), not Prerotated.
+            gemv.run(&ctx, gpu, &GemvParams {
+                w: &wr, x: &xr, y,
+                variant: GemvVariant::Plain,
+                residual: None, gate: None, up: None,
+            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
         // All other FWHT-requiring dtypes (MQ4G256, MQ6G256, MQ3G256, MQ2G256,
         // MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd, MFP4G32):

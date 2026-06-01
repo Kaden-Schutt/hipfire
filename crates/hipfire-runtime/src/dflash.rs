@@ -212,7 +212,7 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
             if use_f16 {
                 assert_eq!(data.len(), m * k * 2, "dflash {name} F16 byte-size mismatch");
                 let buf = gpu.upload_raw(data, &[m * k])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None })
+                Ok::<WeightTensor, hip_bridge::HipError>(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None })
             } else {
                 let f32_data: Vec<f32> = data
                     .chunks_exact(2)

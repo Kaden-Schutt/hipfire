@@ -8976,6 +8976,11 @@ fn forward_scratch_layers(
             _ => unreachable!(),
         }
     }
+
+    // Final norm + logits into scratch.logits
+    gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+    weight_gemv(gpu, &weights.output, &s.tmp, &s.logits)?;
+
     Ok(())
 }
 
@@ -9052,6 +9057,17 @@ fn fused_qkvza_dispatch(
     let dt = wqkv.gpu_dtype;
     let same = wz.gpu_dtype == dt && w_beta.gpu_dtype == dt && w_alpha.gpu_dtype == dt;
 
+    // PARO types perform rotation internally per-weight (Givens or sign-prerotate).
+    // rmsnorm_rotate_dispatch returns None for these, so tmp holds the plain rmsnorm
+    // result. Call weight_gemv individually — each call handles its own rotation.
+    if dt == DType::PARO4G128T || dt == DType::ParoQ4G128 {
+        weight_gemv(gpu, wqkv, tmp, dn_qkv)?;
+        weight_gemv(gpu, wz, tmp, dn_z)?;
+        weight_gemv(gpu, w_beta, tmp, dn_beta)?;
+        weight_gemv(gpu, w_alpha, tmp, dn_alpha)?;
+        return Ok(());
+    }
+
     let use_fused = same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
         || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
         || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.has_dot2_f32_f16()));
@@ -9125,6 +9141,13 @@ fn fused_qkv_dispatch(
     let dt = wq.gpu_dtype;
     let same = wk.gpu_dtype == dt && wv.gpu_dtype == dt;
 
+    if dt == DType::PARO4G128T || dt == DType::ParoQ4G128 {
+        weight_gemv(gpu, wq, tmp, fa_q)?;
+        weight_gemv(gpu, wk, tmp, fa_k)?;
+        weight_gemv(gpu, wv, tmp, fa_v)?;
+        return Ok(());
+    }
+
     let use_fused = same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
         || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
         || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.has_dot2_f32_f16()));
@@ -9194,6 +9217,12 @@ fn fused_gate_up_dispatch(
 ) -> HipResult<()> {
     let dt = w_gate.gpu_dtype;
     let same = w_up.gpu_dtype == dt;
+
+    if dt == DType::PARO4G128T || dt == DType::ParoQ4G128 {
+        weight_gemv(gpu, w_gate, tmp, gate_out)?;
+        weight_gemv(gpu, w_up, tmp, up_out)?;
+        return Ok(());
+    }
 
     let use_fused = same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
         || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd

@@ -184,12 +184,9 @@ fn dispatch_plain(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchErro
         Q4F16G64 => hip!(gpu.gemv_q4f16_g64(w.buf, x, y, m, k)),
         Q4F16G32 => hip!(gpu.gemv_q4f16_g32(w.buf, x, y, m, k)),
         PARO4G128 => hip!(gpu.gemv_paro4g128(w.buf, x, y, m, k)),
-        ParoQ4G128 => {
-            Err(DispatchError::UnsupportedVariant {
-                family: "gemv", variant: "plain",
-                arch: "", quant: "paro4g128 (pipeline step requires model-layer ParoRotation)",
-            })
-        }
+        // ParoQ4G128: weights are HFQ4G128 data; caller has already applied Givens
+        // rotation to x, so dispatch to the plain HFQ4G128 GEMV kernel.
+        ParoQ4G128 => hip!(gpu.gemv_hfq4g128(w.buf, x, y, m, k)),
         // MQ-family Plain requires the caller to use Prerotated variant:
         // rotation + prerotated GEMV is a two-step process managed externally.
         _ => Err(DispatchError::UnsupportedVariant {
