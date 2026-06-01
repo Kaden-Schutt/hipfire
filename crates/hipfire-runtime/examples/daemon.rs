@@ -737,13 +737,12 @@ struct MtpState {
     max_n: usize,
     p_min: f32,
     compressed: bool,
-    /// Stage 2 (PP+MTP combo): drafter-side state when running hetero
-    /// MTP. `None` for the single-gpu MTP path. When `Some`, the MTP
-    /// head + scratch + KV + token_embd mirror live on the drafter gpu
+    /// Stage 2 (PP+MTP combo): drafter-side state when running
+    /// multi-GPU MTP. `None` for the single-gpu MTP path. When `Some`, the
+    /// MTP head + scratch + KV + token_embd mirror live on the drafter gpu
     /// indicated by the spec function call (which is `output_device` in
     /// the PP=2 layout); the cycle dispatcher selects
-    /// `spec_step_mtp_compressed_serial_hetero` instead of
-    /// `spec_step_mtp_compressed_serial`.
+    /// `spec_step_mtp_compressed_serial_multi`.
     drafter_state: Option<hipfire_arch_qwen35::mtp_spec::MtpHeteroDrafterState>,
 }
 
