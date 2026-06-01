@@ -545,6 +545,27 @@ impl WeightTensor {
     }
 }
 
+#[cfg(feature = "new-dispatch")]
+impl WeightTensor {
+    /// Logic-free adapter to the dispatch-layer WeightRef. Wires Givens +
+    /// AWQ + row_stride so GemvFamily sees everything a weight needs.
+    pub fn dispatch_ref(&self) -> hipfire_dispatch::families::gemv::WeightRef<'_> {
+        use hipfire_dispatch::families::gemv::{WeightRef, GivensRef};
+        WeightRef {
+            buf: &self.buf,
+            dtype: self.gpu_dtype,
+            m: self.m,
+            k: self.k,
+            row_stride: self.row_stride,
+            rotation: self.paro.as_ref().map(|p| GivensRef {
+                pairs: &p.pairs, theta: &p.theta, scales: &p.channel_scales,
+                krot: p.krot as usize,
+            }),
+            awq_scale: self.awq_scale.as_ref(),
+        }
+    }
+}
+
 /// How the embedding table is stored on GPU.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EmbeddingFormat {
