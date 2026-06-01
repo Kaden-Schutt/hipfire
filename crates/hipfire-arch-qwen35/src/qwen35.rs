@@ -5322,6 +5322,8 @@ fn moe_ffn_decode_impl(
             .experts
             .iter()
             .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
+    let shared_gate_up_mq4 = ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256;
     let routed_mq4 = ffn
         .experts
         .first()
@@ -5493,8 +5495,36 @@ fn moe_ffn_decode_impl(
         // downstream indexed gate_up GEMV when routed_gate_up_mq4 is true.
         weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
         weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
-        weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
-        weight_gemv(gpu, &ffn.shared_expert.up, x_norm, &shared_up)?;
+        if shared_gate_up_mq4 {
+            // Mixed router/scalar dtypes cannot use the 4-way fused gate-side
+            // kernel, but shared gate+up can still share one MQ4 rotation.
+            gpu.ensure_mq_signs()?;
+            let shared_x_rot = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            rotate_x_mq_for(
+                gpu,
+                &ffn.shared_expert.gate,
+                x_norm,
+                &shared_x_rot,
+                ffn.shared_expert.gate.k,
+            )?;
+            gpu.fused_gate_up_hfq4g256(
+                &ffn.shared_expert.gate.buf,
+                &ffn.shared_expert.up.buf,
+                &shared_x_rot,
+                &shared_gate,
+                &shared_up,
+                ffn.shared_expert.gate.m,
+                ffn.shared_expert.up.m,
+                ffn.shared_expert.gate.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
+            weight_gemv(gpu, &ffn.shared_expert.up, x_norm, &shared_up)?;
+        }
     }
 
     // ── 2a. Top-K selection — GPU fast path or CPU fallback ──
