@@ -6763,11 +6763,6 @@ fn ffn_batched(
             )
             .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_8w_k2 gate_up l{layer_idx}: {e:?}"))?;
         } else if use_nosync {
-        // Barrier-free nosync variant (opt-in via =1). Uses the same
-        // grid/block as mmqload but eliminates __syncthreads().
-        let use_nosync = use_mmqload && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
-            .as_deref() == Ok("1");
-        if use_nosync {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
                 gate_up_ptrs,
                 &pbs.moe_expert_tile_ids,
@@ -6944,9 +6939,6 @@ fn ffn_batched(
             )
             .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_8w_k2 down l{layer_idx}: {e:?}"))?;
         } else if use_nosync_down {
-        let use_nosync_down = use_mmqload_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
-            .as_deref() == Ok("1");
-        if use_nosync_down {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
                 w2_ptrs,
                 &pbs.moe_expert_tile_ids,
