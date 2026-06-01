@@ -37,6 +37,22 @@ __device__ __forceinline__ float f16_load(const unsigned char* p) {
     return __int_as_float(f32_bits);
 }
 
+__device__ __forceinline__ int mq8_dot4_i8(int a, int b, int acc) {
+#if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
+    signed char a0 = (signed char)(a & 0xff);
+    signed char a1 = (signed char)((a >> 8) & 0xff);
+    signed char a2 = (signed char)((a >> 16) & 0xff);
+    signed char a3 = (signed char)((a >> 24) & 0xff);
+    signed char b0 = (signed char)(b & 0xff);
+    signed char b1 = (signed char)((b >> 8) & 0xff);
+    signed char b2 = (signed char)((b >> 16) & 0xff);
+    signed char b3 = (signed char)((b >> 24) & 0xff);
+    return acc + (int)a0 * (int)b0 + (int)a1 * (int)b1 + (int)a2 * (int)b2 + (int)a3 * (int)b3;
+#else
+    return __builtin_amdgcn_sdot4(a, b, acc, false);
+#endif
+}
+
 // 4x unrolled dp4a GEMV: 4 groups in-flight, 8 dp4a per iteration.
 // MQ8 is bandwidth-bound (258 B/group) — 4x is the sweet spot.
 __launch_bounds__(32, 16)
@@ -74,8 +90,8 @@ extern "C" __global__ void gemv_mq8g256(
             int wp1 = *(const int*)(wb + w_off + 4); \
             int xp0 = *(const int*)(xb + w_off); \
             int xp1 = *(const int*)(xb + w_off + 4); \
-            int dot = __builtin_amdgcn_sdot4(wp0, xp0, 0, false); \
-            dot = __builtin_amdgcn_sdot4(wp1, xp1, dot, false); \
+            int dot = mq8_dot4_i8(wp0, xp0, 0); \
+            dot = mq8_dot4_i8(wp1, xp1, dot); \
             acc_var += ws * xs * (float)dot; \
         }
 
@@ -94,8 +110,8 @@ extern "C" __global__ void gemv_mq8g256(
         int wp1 = *(const int*)(wb + w_off + 4);
         int xp0 = *(const int*)(xb + w_off);
         int xp1 = *(const int*)(xb + w_off + 4);
-        int dot = __builtin_amdgcn_sdot4(wp0, xp0, 0, false);
-        dot = __builtin_amdgcn_sdot4(wp1, xp1, dot, false);
+        int dot = mq8_dot4_i8(wp0, xp0, 0);
+        dot = mq8_dot4_i8(wp1, xp1, dot);
         acc0 += ws * xs * (float)dot;
     }
 

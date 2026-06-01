@@ -6721,6 +6721,9 @@ fn main() {
                     } else if expert_hfq4 {
                         let q = quantize_hfq4g256(&f32_slice);
                         (q, QuantType::HFQ4G256, 256u32)
+                    } else if use_mq8g256 && supports_g256 {
+                        let q = quantize_mq8g256(&f32_slice, &signs1, &signs2);
+                        (q, QuantType::MQ8G256, 256u32)
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
@@ -6760,6 +6763,8 @@ fn main() {
                 "HFQ6G256"
             } else if expert_hfq4 {
                 "HFQ4G256"
+            } else if use_mq8g256 && supports_g256 {
+                "MQ8G256"
             } else if supports_g256 {
                 "MQ4G256"
             } else {
@@ -7207,6 +7212,11 @@ fn main() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
+                    } else if q8_router && is_q8_tensor(name) {
+                        // Q8 router for MoE: keep mlp.gate.weight and
+                        // shared_expert_gate.weight at Q8 regardless of --format.
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if use_mq8g256 && is_embed {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
@@ -7226,11 +7236,6 @@ fn main() {
                             let q = quantize_q8f16(&f32_data);
                             (q, QuantType::Q8F16, 32u32, "Q8_F16")
                         }
-                    } else if q8_router && is_q8_tensor(name) {
-                        // Q8 router for MoE: keep mlp.gate.weight and
-                        // shared_expert_gate.weight at Q8 regardless of --format.
-                        let q = quantize_q8f16(&f32_data);
-                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if (use_mq4g256
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
