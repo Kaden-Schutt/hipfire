@@ -746,7 +746,7 @@ full-featured path. It already has the #352 device chain.
 | Item | Reason | Where it would go |
 |---|---|---|
 | **Proposal graph capture for PP** | Evaluated as net-negative on single-GPU post-PR5/PR6 (#352). No evidence it helps on PP. | Would need PP-aware graph capture with per-device streams. |
-| **No-replay rollback (Opt 3)** | The biggest architectural lever for PP+MTP decode speed (eliminates the 2nd PP boundary crossing on ~65% of cycles). But requires changes to DeltaNet state management under PP. Independent. | Would modify the rollback section of `_multi` to skip full replay when verify already advanced correctly. |
+| ~~No-replay rollback (Opt 3)~~ | **Implemented in commit 56425127.** Per-band GdnTapeShards replay: +21.7% decode tok/s on 27B (12.0→14.6). See §14. | ~~Would modify the rollback section of `_multi` to skip full replay when verify already advanced correctly.~~ |
 | **Option B: `TrunkForward` unification** | Only worthwhile if a third caller emerges (hetero pp=1 in daemon). Otherwise the enum adds complexity for one production arm. | Would replace `_multi` with `spec_step_mtp_compressed_serial_distributed` + `TrunkForward`. |
 
 ---
@@ -780,3 +780,70 @@ coherence-gate validation + benchmarking.
 | 8 | PP+MTP A/B benchmark (3 runs × 6 cells = 18 runs) | 2 hr |
 | 9 | Devlog with results + decision gate | 30 min |
 | **Total** | | **~8 hr (~1 day)** |
+
+## 14. Opt 3 implementation: per-band GDN tape replay
+
+**Status: COMPLETE** (commit `56425127`)
+
+### Design
+
+Instead of re-running the full transformer stack on partial-accept cycles
+(~10 ms per cycle on 27B), the tape replay advances DeltaNet state using
+pre-captured QKV + alpha/beta projections — conv1d + norm + GDN recurrence
+only, per-band, with all data local (no cross-device copies).
+
+The key insight: after the verify forward, the KV cache at accepted
+positions `cur_pos..cur_pos+advance` was already written correctly. Only
+the DeltaNet recurrent state needs rollback + re-advance. The single-GPU
+path already does this with `GdnTape::replay_gdn`; the multi-GPU path
+uses `GdnTapeShards` to keep each band's data on its own device.
+
+### What changed
+
+| File | Change |
+|---|---|
+| `speculative.rs` | Added `GdnTapeShards::replay_gdn_multi` — iterates LA layers,
+  runs each on its owning device using local shard + local conv weight +
+  local DN state. No peer copies needed. |
+| `qwen35.rs` | `forward_prefill_batch_multi_with_caps` signature changed:
+  `gdn_tape: Option<&mut GdnTape>` → `gdn_tape_shards: Option<&mut GdnTapeShards>`.
+  Caller owns shards; no internal assembly or free. |
+| `mtp_spec.rs` | `MtpSpecState` gets `trunk_gdn_tape_shards: Option<GdnTapeShards>`
+  field. `_multi` enables tape capture and uses fast replay on rollback. |
+| `daemon.rs` | Allocates persistent shards after `MtpSpecState` construction.
+  Frees them in `unload_model` PP branch. |
+
+### Benchmarks
+
+27B qwen3.6, 52,12 split, gfx906+gfx1031, temp=0, max_tokens=64:
+
+| Path | decode tok/s | τ | accept_rate | cycles |
+|---|---|---|---|---|
+| **Slow replay (before)** | 12.0 | 2.74 | 1.83 | 23 |
+| **Tape replay (after)** | 14.6 | 2.74 | 1.83 | 23 |
+| **Delta** | **+21.7%** | 0% | 0% | 0% |
+
+9B model: ~0% delta (replay already fast on small model).
+Correctness: byte-identical output at temp=0 across multiple runs.
+
+### Why it works (per-band, no peer copies)
+
+`GdnTapeShards::new` allocates one `GdnTape` per band on its own device.
+Each shard has:
+- `qkv_bufs[global_la_idx]` — captured QKV projections (only real for
+  layers this band owns; 1-byte placeholder for others)
+- `alpha_bufs`, `beta_bufs` — captured gate values
+- Full replay scratch (`q_raw`, `k_raw`, `v`, `q`, `k`, `attn`)
+
+During replay, `replay_gdn_multi` iterates all LA layers, finds the
+owning band for each, and runs conv1d + norm + GDN on that band's device.
+Everything — tape data, conv weights, DN state — is already local.
+
+### Follow-up from code review (see `multi_gpu_pp_code_rev_consolidated.md`)
+
+1. `bind_thread()` added in all 3 `_multi` verify blocks (commit `9a7aafc8`)
+2. DeltaNetSnapshot cross-device portability — accepted as Major, deferred
+3. BoundaryEvent handle leak — accepted as Minor, deferred
+4. GdnTapeShards async assembly — rejected (cold path, tape replay
+   eliminated the need for `assemble_into`)
+5. Llama PP guard — rejected (guard exists at daemon.rs:2755)
