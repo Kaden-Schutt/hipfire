@@ -14,6 +14,19 @@ and disassembled to:
 v_wmma_i32_16x16x16_iu4 v[8:15], v[1:2], v[3:4], v[8:15] neg_lo:[1,1,0]
 ```
 
+AMD's `amd_matrix_instruction_calculator` agrees that `gfx1151` maps to
+the RDNA3 WMMA table. For RDNA3 it reports:
+
+| Instruction | M | N | K | Ops | Cycles | Ops/WGP/cycle |
+|---|---:|---:|---:|---:|---:|---:|
+| `v_wmma_i32_16x16x16_iu8` | 16 | 16 | 16 | 8192 | 32 | 1024 |
+| `v_wmma_i32_16x16x16_iu4` | 16 | 16 | 16 | 8192 | 16 | 2048 |
+
+So, for gfx1151's native RDNA3 WMMA instructions, IU4 has **2x the
+modeled raw matrix-op throughput** of IU8. The wider
+`v_wmma_i32_16x16x32_iu4` shape is RDNA4-only in this calculator and is
+not available for the gfx1151 scope.
+
 The catch is that this is an **int4-by-int4 -> int32 matrix op**. It is
 not a packed 4-bit weight by fp16/fp32 activation op. Using it for MQ
 requires an activation-quantized Q4/U4 scratch path and a numerical
