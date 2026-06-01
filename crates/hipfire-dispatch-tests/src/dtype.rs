@@ -83,3 +83,37 @@ fn mq_dtypes_are_magnum_quant_formats() {
         assert_eq!(dt.size(), 1, "DType::{dt:?} is MQ-family");
     }
 }
+
+#[test]
+fn rotation_plan_covers_every_dtype() {
+    use hipfire_dispatch::types::{dtype_rotation_plan, RotationPlan};
+    use rdna_compute::DType;
+    assert_eq!(dtype_rotation_plan(DType::F32), RotationPlan::None);
+    assert_eq!(dtype_rotation_plan(DType::HFQ4G256), RotationPlan::None);
+    assert_eq!(dtype_rotation_plan(DType::Q8HFQ), RotationPlan::None);
+    assert_eq!(dtype_rotation_plan(DType::MQ4G256), RotationPlan::FwhtG256);
+    assert_eq!(dtype_rotation_plan(DType::MQ6G256), RotationPlan::FwhtG256);
+    assert_eq!(dtype_rotation_plan(DType::MFP4G32), RotationPlan::FwhtG256);
+    assert_eq!(dtype_rotation_plan(DType::MQ4G128), RotationPlan::FwhtG128);
+    assert_eq!(dtype_rotation_plan(DType::MQ8G256), RotationPlan::Mq8Internal);
+    assert_eq!(dtype_rotation_plan(DType::ParoQ4G128), RotationPlan::Givens);
+}
+
+#[test]
+fn rotation_plan_matches_legacy_needs_fwht() {
+    use hipfire_dispatch::types::{dtype_rotation_plan, dtype_needs_fwht, RotationPlan};
+    for d in QUANTIZED_DTYPES {
+        assert_eq!(
+            dtype_rotation_plan(*d) != RotationPlan::None,
+            dtype_needs_fwht(*d),
+            "rotation_plan/needs_fwht disagree for {:?}", d
+        );
+    }
+    for d in [DType::F32, DType::F16, DType::Q8_0] {
+        assert_eq!(
+            dtype_rotation_plan(d) != RotationPlan::None,
+            dtype_needs_fwht(d),
+            "rotation_plan/needs_fwht disagree for {:?}", d
+        );
+    }
+}

@@ -57,6 +57,31 @@ pub enum RotationVariant {
     WithSwiGLU,
 }
 
+/// Sign-domain / scratch axis of rotation. Orthogonal to RotationVariant
+/// (the fusion axis). Derivable purely from dtype.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum RotationPlan {
+    None,
+    FwhtG256,
+    FwhtG128,
+    Mq8Internal,
+    Givens,
+}
+
+/// Sign-domain plan for a dtype. `None` <=> no activation rotation required.
+pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
+    use DType::*;
+    match dtype {
+        MQ4G256 | MQ3G256 | MQ2G256 | MQ6G256
+        | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
+        | MFP4G32 => RotationPlan::FwhtG256,
+        MQ4G128 => RotationPlan::FwhtG128,
+        MQ8G256 => RotationPlan::Mq8Internal,
+        ParoQ4G128 => RotationPlan::Givens,
+        _ => RotationPlan::None,
+    }
+}
+
 // ── Flat kernel key enum ──────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
