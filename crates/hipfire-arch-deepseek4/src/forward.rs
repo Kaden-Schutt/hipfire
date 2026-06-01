@@ -1447,7 +1447,7 @@ pub fn decode_step(
 /// HIP-graphs-aware decode_step. Opt-in via `HIPFIRE_DEEPSEEK4_GRAPH=1`.
 ///
 /// Three-state machine driven by `state.ar_forward_warmed_up` and
-/// `gpu.graph_exec`:
+/// `gpu.graphs.graph_exec`:
 ///   1. !warmed_up                   → direct dispatch (warmup so JIT
 ///                                       and lazy alloc happen out of
 ///                                       the captured region), set flag
@@ -1524,26 +1524,26 @@ pub fn decode_step_with_graph(
     // replay. We update those host bytes BEFORE launching the graph.
     init_residual_streams(cfg, weights, state, gpu, token_id)?;
 
-    if gpu.graph_exec.is_none() {
+    if gpu.graphs.graph_exec.is_none() {
         // ── Capture phase ──────────────────────────────────────────
         // precompute_positions + precompute_token_id are called INSIDE
         // the capture so the captured memcpy nodes re-read their stable
         // host sources on each replay.
-        gpu.begin_graph_capture()
+        gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
             .map_err(|e| format!("begin_graph_capture: {e:?}"))?;
         precompute_positions(cfg, state, gpu, position)?;
         precompute_token_id(state, gpu, token_id)?;
         let _ = decode_step_body(cfg, weights, state, gpu, token_id, position)?;
-        gpu.end_graph_capture()
+        gpu.graphs.end_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
             .map_err(|e| format!("end_graph_capture: {e:?}"))?;
         // Captured kernels were RECORDED, not executed. Launch the
         // freshly-instantiated graph once so this position's forward
         // actually runs and `state.logits` gets fresh values.
-        gpu.graph_launch()
+        gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
             .map_err(|e| format!("graph_launch (capture-end): {e:?}"))?;
         eprintln!(
             "[DeepSeek V4 hipGraph] captured forward — {} kernarg blobs retained",
-            gpu.capture_blobs.len()
+            gpu.graphs.capture_blobs.len()
         );
     } else {
         // ── Replay phase ───────────────────────────────────────────
@@ -1559,7 +1559,7 @@ pub fn decode_step_with_graph(
         // sees the right pre-increment value.
         update_attn_state_host(cfg, state, state.n_tokens as u32);
         update_token_id_host(state, token_id);
-        gpu.graph_launch()
+        gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
             .map_err(|e| format!("graph_launch (replay): {e:?}"))?;
         state.n_tokens += 1;
     }

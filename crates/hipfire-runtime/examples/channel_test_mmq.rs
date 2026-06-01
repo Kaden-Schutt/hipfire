@@ -443,7 +443,7 @@ fn compare_residual_raw(
         .map_err(|e| format!("alloc y_mmq: {e}"))?;
 
     // Force WMMA/MMQ paths (skip rocBLAS fast path)
-    gpu.capture_mode = true;
+    gpu.graphs.capture_mode = true;
 
     // ── WMMA reference ───────────────────────────────────────────────────
     let r_wmma = gpu.gemm_hfq4g256_residual_wmma(&weight.buf, &x, &y_wmma, m, k, batch_size);
@@ -453,7 +453,7 @@ fn compare_residual_raw(
         let xq: *mut c_void = gpu
             .ensure_q8_1_mmq_x(&x, batch_size, k)
             .map_err(|e| {
-                gpu.capture_mode = false;
+                gpu.graphs.capture_mode = false;
                 format!("ensure_q8_1_mmq_x: {e}")
             })?;
         gpu.gemm_hfq4g256_mmq_set_prequant(&weight.buf, xq, &y_mmq_buf, m, k, batch_size)
@@ -461,7 +461,7 @@ fn compare_residual_raw(
         Ok(())
     };
 
-    gpu.capture_mode = false;
+    gpu.graphs.capture_mode = false;
 
     r_wmma.map_err(|e| format!("gemm_hfq4g256_residual_wmma: {e}"))?;
     r_mmq.map_err(|e| format!("gemm_hfq4g256_mmq_set_prequant: {e}"))?;
@@ -754,7 +754,7 @@ fn run_screen(
     use hipfire_arch_qwen35::qwen35::LayerWeights;
 
     eprintln!("\n=== screen: running mmq_screen_weight on all weight matrices ===");
-    eprintln!("threshold={:.4}", gpu.mmq_screen_threshold);
+    eprintln!("threshold={:.4}", gpu.mmq_screen.threshold);
 
     let mut n_safe = 0usize;
     let mut n_unsafe = 0usize;

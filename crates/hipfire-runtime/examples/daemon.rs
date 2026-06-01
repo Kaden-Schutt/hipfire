@@ -1516,10 +1516,10 @@ fn main() {
                 // weights. Disabled by default; enable with mmq_screen=true
                 // (or HIPFIRE_MMQ_SCREEN=1) when adding new quant formats.
                 if let Some(v) = msg.get("params").and_then(|p| p.get("mmq_screen")).and_then(|v| v.as_bool()) {
-                    gpu.mmq_screen = v;
+                    gpu.mmq_screen.enabled = v;
                 }
                 if let Some(v) = msg.get("params").and_then(|p| p.get("mmq_screen_threshold")).and_then(|v| v.as_f64()) {
-                    gpu.mmq_screen_threshold = v as f32;
+                    gpu.mmq_screen.threshold = v as f32;
                 }
 
                 // ── PFlash load-time params (Phase 4.0 #93) ──────────────
@@ -2841,18 +2841,18 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
 
         // MMQ per-weight screening (#87): pre-screen all weight matrices at
         // load time so the first prefill doesn't pay the screening overhead.
-        // Results are cached by device pointer in gpu.mmq_screen_cache.
+        // Results are cached by device pointer in gpu.mmq_screen.cache.
         // Disabled by default on all arches; opt-in via mmq_screen=true or
         // HIPFIRE_MMQ_SCREEN=1. gfx906 is included for the opt-in case so
         // its ~700 µs/weight screening-reference dispatch doesn't surprise
         // first prefill if a user enables it.
-        if gpu.mmq_screen && matches!(gpu.arch.as_str(), "gfx906" | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152") {
+        if gpu.mmq_screen.enabled && matches!(gpu.arch.as_str(), "gfx906" | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152") {
             let t0 = std::time::Instant::now();
             let (n_safe, n_unsafe) = screen_weights_qwen35(&weights, gpu);
             let elapsed = t0.elapsed();
             eprintln!(
                 "  MMQ screening: {n_safe} safe, {n_unsafe} unsafe (threshold={:.2}, {:.1}ms)",
-                gpu.mmq_screen_threshold, elapsed.as_secs_f64() * 1000.0,
+                gpu.mmq_screen.threshold, elapsed.as_secs_f64() * 1000.0,
             );
         }
 
@@ -3377,7 +3377,7 @@ fn load_model_pp(
 }
 
 /// Pre-screen all Qwen3.5/3.6 weight matrices for MMQ safety (#87).
-/// Returns (n_safe, n_unsafe). Results are cached in gpu.mmq_screen_cache.
+/// Returns (n_safe, n_unsafe). Results are cached in gpu.mmq_screen.cache.
 fn screen_weights_qwen35(weights: &qwen35::Qwen35Weights, gpu: &mut rdna_compute::Gpu) -> (usize, usize) {
     use hipfire_arch_qwen35::qwen35::LayerWeights;
     let mut n_safe = 0usize;

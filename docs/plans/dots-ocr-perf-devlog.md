@@ -501,7 +501,7 @@ overstated impact because DRAM stalls are a smaller fraction on faster BW.
 | 4 | **FP8/MFP4 K/V** | Vision attn | +20-40% attention (2.4-4.8s) | High | Needs accuracy validation; halves DRAM traffic again |
 | 5 | **M=128 two-pass sub-tiling** | Vision attn | +5-15% attention (0.6-1.8s) | Medium | Halves K+V DRAM traffic but less impact on gfx1100; increased LDS/register pressure |
 | 6 | **HIP graph capture** | Decode | +3-5% decode (~1-2s) | High | Stashed code exists; gfx1100 dispatch ~340µs is only 4.5% of decode |
-| 7 | **gfx1100 GQA chunk sweep** | Decode | +0-5% decode (0-1.7s) | Low | Just env var tuning; little data on gfx1100 | 
+| 7 | **gfx1100 GQA chunk sweep** | Decode | +0-5% decode (0-1.7s) | Low | Just env var tuning; little data on gfx1100 |
 | 8 | **Causal WMMA + GQA** (text prefill) | Text prefill | <1% total (<0.5s) | Medium | Prefill already 1.0s; 10× attention speedup saves <0.5s of 60s |
 | 9 | **Fused attention-reduce + o_proj** | Decode | +1-3% decode (~0.3-1s) | Low | Tiny DRAM saving; marginal launch saving |
 | 10 | **F16 KV cache** | Decode (long seq) | +0-5% decode (0-1.7s) | Low | Dispatch-dominated on gfx1100 at seq=5100; may help at 12k+ |

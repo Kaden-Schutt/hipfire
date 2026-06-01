@@ -3135,7 +3135,7 @@ fn moe_ffn_decode_impl(
     } else {
         // Mixed-dtype fallback: four separate `weight_gemv` calls. Each
         // weight_gemv handles its own rotation for MQ4 weights internally
-        // (via `gpu.mq_x_rot`, a distinct scratch from `s.x_rot_local`),
+        // (via `gpu.scratch.mq_x_rot`, a distinct scratch from `s.x_rot_local`),
         // so the externally-computed `x_rot_local` is preserved for the
         // downstream indexed gate_up GEMV when routed_gate_up_mq4 is true.
         weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
@@ -3190,8 +3190,8 @@ fn moe_ffn_decode_impl(
     if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256 {
         gpu.ensure_mq_signs()?;
         let x_rot_alias = GpuTensor {
-            buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-            shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+            buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+            shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
             dtype: DType::F32,
         };
         // F2: AWQ-aware silu_mul+rotate for the shared-expert down input.
@@ -3375,8 +3375,8 @@ fn moe_ffn_decode_impl(
                 let up_view   = slice_f32_view(gate_up_buf, mi, mi);
                 if routed_mq4 {
                     let x_rot_alias = GpuTensor {
-                        buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                        shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                        buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                        shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                         dtype: DType::F32,
                     };
                     // F2: AWQ-aware silu_mul+rotate for this expert's down input.
@@ -4322,7 +4322,7 @@ pub fn forward_scratch(
     // `ar_forward_replay_enabled`, `end_decode_turn()`, `drop_captured_graph()`)
     // is preserved on Gpu so the path can be flipped on once the bug is fixed.
     let use_graph = false;
-    let _ = (graph_enabled, allow_moe, gpu.ar_forward_replay_enabled);  // suppress unused warnings
+    let _ = (graph_enabled, allow_moe, gpu.graphs.ar_forward_replay_enabled);  // suppress unused warnings
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
@@ -4334,19 +4334,22 @@ pub fn forward_scratch(
     }
 
     let pos_i32 = pos as i32;
-    if use_graph && gpu.ar_forward_replay_enabled && gpu.graph_exec.is_some() {
+    if use_graph && gpu.graphs.ar_forward_replay_enabled && gpu.graphs.graph_exec.is_some() {
         // ── Replay path: caller has signalled end_decode_turn() since the
         // last capture AND kernels are not dirty. Cheapest path. ──
         gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-        gpu.graph_launch()?;
-    } else if use_graph && gpu.ar_forward_kernel_dirty {
+        gpu.graphs.graph_launch(
+            &gpu.hip, gpu.device_id,
+            gpu.active_stream.as_ref().unwrap(),
+        )?;
+    } else if use_graph && gpu.graphs.ar_forward_kernel_dirty {
         // ── Direct path (kernel-dirty): kernels are dirty (init or post-
         // model-load). Capture would trip "hipMalloc not permitted under
         // stream capture" on the first inline JIT. Mark clean after a
         // successful direct dispatch so subsequent calls can capture. ──
         gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
-        gpu.ar_forward_kernel_dirty = false;
+        gpu.graphs.ar_forward_kernel_dirty = false;
     } else if use_graph {
         // ── Capture + launch: kernels are clean but caller has not committed
         // a replay yet (or graph_exec is None). Drop any prior captured graph,
@@ -4357,11 +4360,20 @@ pub fn forward_scratch(
             gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
         gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-        gpu.drop_captured_graph();
-        gpu.begin_graph_capture()?;
+        gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
+        gpu.graphs.begin_graph_capture(
+            &gpu.hip, gpu.device_id,
+            gpu.active_stream.as_ref().unwrap(),
+        )?;
         forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
-        gpu.end_graph_capture()?;
-        gpu.graph_launch()?;
+        gpu.graphs.end_graph_capture(
+            &gpu.hip, gpu.device_id,
+            gpu.active_stream.as_ref().unwrap(),
+        )?;
+        gpu.graphs.graph_launch(
+            &gpu.hip, gpu.device_id,
+            gpu.active_stream.as_ref().unwrap(),
+        )?;
     } else {
         // ── Direct path (graph not eligible: arch / MoE config) ──
         gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
@@ -6475,7 +6487,7 @@ fn forward_prefill_chunk(
     // cap instead (LDS sized for the worst case). The kernel still iterates
     // over the actual `positions[b] + 1` per-row seq_len from a device buffer,
     // so correctness is preserved; only the LDS allocation is over-provisioned.
-    let max_ctx_len = if gpu.capture_mode {
+    let max_ctx_len = if gpu.graphs.capture_mode {
         kv_cache.physical_cap
     } else {
         start_pos + n
@@ -9454,7 +9466,7 @@ fn forward_scratch_layers(
                     //   - flash_mode=1 (auto, default): flash at ctx >= 2048.
                     //   - flash_mode=0 (never): non-flash until sanity cap (>15K ctx).
                     //   - >15K: always flash (non-flash VRAM blowup).
-                    let use_flash = gpu.capture_mode
+                    let use_flash = gpu.graphs.capture_mode
                         || s.flash_mode == 2
                         || (s.flash_mode == 1 && pos + 1 >= 2048)
                         || pos + 1 > 15000;
@@ -9965,7 +9977,7 @@ fn forward_scratch_layers(
                 } else if kv_cache.quant_q8 {
                     gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-                    let use_flash = gpu.capture_mode
+                    let use_flash = gpu.graphs.capture_mode
                         || s.flash_mode == 2
                         || (s.flash_mode == 1 && pos + 1 >= 2048)
                         || pos + 1 > 15000;
@@ -10443,7 +10455,7 @@ fn forward_scratch_layers_multi(
                     } else if kv_cache.quant_q8 {
                         gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                         gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-                        let use_flash = gpu.capture_mode
+                        let use_flash = gpu.graphs.capture_mode
                             || s.flash_mode == 2
                             || (s.flash_mode == 1 && pos + 1 >= 2048)
                             || pos + 1 > 15000;
@@ -10833,7 +10845,7 @@ fn forward_scratch_layers_multi(
                     } else if kv_cache.quant_q8 {
                         gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                         gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-                        let use_flash = gpu.capture_mode
+                        let use_flash = gpu.graphs.capture_mode
                             || s.flash_mode == 2
                             || (s.flash_mode == 1 && pos + 1 >= 2048)
                             || pos + 1 > 15000;

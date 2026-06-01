@@ -1766,8 +1766,8 @@ fn mtp_moe_ffn_decode(
     if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256 {
         gpu.ensure_mq_signs()?;
         let x_rot_alias = GpuTensor {
-            buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-            shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+            buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+            shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
             dtype: DType::F32,
         };
         fused_silu_mul_rotate_mq_for(

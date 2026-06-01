@@ -684,7 +684,7 @@ fn gemm_dispatch(
             // `ceil(batch / max_chunk)` times for no extra correctness.
             let scratch = mq_x_rot.expect("MQ3 dispatch requires mq_x_rot scratch");
             let max_chunk = (scratch.shape[0] / w.k).max(1);
-            gpu.fp16_x_source_ptr = std::ptr::null_mut();
+            gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             let mut chunked: HipResult<()> = Ok(());
             let mut row = 0;
             while row < batch {
@@ -729,8 +729,8 @@ fn gemm_dispatch(
 }
 
 fn begin_draft_ffn_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
-    gpu.capture_blobs.clear();
-    gpu.capture_mode = true;
+    gpu.graphs.capture_blobs.clear();
+    gpu.graphs.capture_mode = true;
     let stream = gpu
         .active_stream
         .as_ref()
@@ -741,22 +741,22 @@ fn begin_draft_ffn_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
 fn end_draft_ffn_graph_capture(
     gpu: &mut Gpu,
 ) -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {
-    gpu.capture_mode = false;
+    gpu.graphs.capture_mode = false;
     let stream = gpu.active_stream.as_ref().unwrap();
     let graph = gpu.hip.stream_end_capture(stream)?;
     let exec = gpu.hip.graph_instantiate(&graph)?;
-    let blobs = std::mem::take(&mut gpu.capture_blobs);
+    let blobs = std::mem::take(&mut gpu.graphs.capture_blobs);
     Ok((graph, exec, blobs))
 }
 
 fn abort_draft_ffn_graph_capture(gpu: &mut Gpu) {
-    if gpu.capture_mode {
+    if gpu.graphs.capture_mode {
         if let Some(stream) = gpu.active_stream.as_ref() {
             let _ = gpu.hip.stream_end_capture(stream);
         }
-        gpu.capture_mode = false;
+        gpu.graphs.capture_mode = false;
     }
-    gpu.capture_blobs.clear();
+    gpu.graphs.capture_blobs.clear();
 }
 
 fn draft_ffn_layer(

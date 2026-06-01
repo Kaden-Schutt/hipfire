@@ -955,8 +955,8 @@ fn run_mtp_proposal_graph_body_q8(
 }
 
 fn begin_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
-    gpu.capture_blobs.clear();
-    gpu.capture_mode = true;
+    gpu.graphs.capture_blobs.clear();
+    gpu.graphs.capture_mode = true;
     let stream = gpu
         .active_stream
         .as_ref()
@@ -965,22 +965,22 @@ fn begin_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
 }
 
 fn end_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {
-    gpu.capture_mode = false;
+    gpu.graphs.capture_mode = false;
     let stream = gpu.active_stream.as_ref().unwrap();
     let graph = gpu.hip.stream_end_capture(stream)?;
     let exec = gpu.hip.graph_instantiate(&graph)?;
-    let blobs = std::mem::take(&mut gpu.capture_blobs);
+    let blobs = std::mem::take(&mut gpu.graphs.capture_blobs);
     Ok((graph, exec, blobs))
 }
 
 fn abort_mtp_proposal_graph_capture(gpu: &mut Gpu) {
-    if gpu.capture_mode {
+    if gpu.graphs.capture_mode {
         if let Some(stream) = gpu.active_stream.as_ref() {
             let _ = gpu.hip.stream_end_capture(stream);
         }
-        gpu.capture_mode = false;
+        gpu.graphs.capture_mode = false;
     }
-    gpu.capture_blobs.clear();
+    gpu.graphs.capture_blobs.clear();
 }
 
 fn destroy_mtp_proposal_graph(gpu: &mut Gpu, state: &mut MtpSpecState) {
