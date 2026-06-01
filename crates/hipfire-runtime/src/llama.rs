@@ -3494,6 +3494,31 @@ impl KvCache {
         self.v_mode.bits()
     }
 
+    fn resize_real_tensors_zeroed(
+        gpu: &mut Gpu,
+        tensors: &mut [GpuTensor],
+        elems: usize,
+    ) -> HipResult<()> {
+        let real: Vec<usize> = tensors
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| (t.numel() > 1).then_some(i))
+            .collect();
+        for &i in &real {
+            let placeholder = gpu.zeros(&[1], DType::F32)?;
+            let old = std::mem::replace(&mut tensors[i], placeholder);
+            let _ = gpu.free_tensor(old);
+        }
+        gpu.drain_pool();
+        for &i in &real {
+            let new_tensor = gpu.zeros(&[elems], DType::F32)?;
+            let placeholder = std::mem::replace(&mut tensors[i], new_tensor);
+            let _ = gpu.free_tensor(placeholder);
+        }
+        gpu.drain_pool();
+        Ok(())
+    }
+
     /// Reallocate the V buffers for a new V mode (used by eval/bench to set an
     /// independent V quant after construction). Re-sizes only real KV layers
     /// (placeholder 1-element buffers for non-KV layers are left as-is).
@@ -3536,12 +3561,7 @@ impl KvCache {
         }
         let v_bpp = Self::v_bytes_per_pos(self.n_kv_heads, self.head_dim, v_mode);
         let v_elems = (self.physical_cap * v_bpp + 3) / 4;
-        for t in self.v_gpu.iter_mut() {
-            // 1-element placeholder convention for non-KV layers: see alloc_k_v_filtered
-            if t.numel() > 1 {
-                *t = gpu.zeros(&[v_elems], DType::F32)?;
-            }
-        }
+        Self::resize_real_tensors_zeroed(gpu, &mut self.v_gpu, v_elems)?;
         self.v_mode = v_mode;
         Ok(())
     }
@@ -3604,12 +3624,7 @@ impl KvCache {
         // simply fits fewer positions in this smaller buffer.
         let v_bpp_floor = Self::v_bytes_per_pos(self.n_kv_heads, self.head_dim, v_floor);
         let v_elems = (self.physical_cap * v_bpp_floor + 3) / 4;
-        for t in self.v_gpu.iter_mut() {
-            // 1-element placeholder convention for non-KV layers: see alloc_k_v_filtered
-            if t.numel() > 1 {
-                *t = gpu.zeros(&[v_elems], DType::F32)?;
-            }
-        }
+        Self::resize_real_tensors_zeroed(gpu, &mut self.v_gpu, v_elems)?;
         // v_mode STAYS at its current value (Q8 fast start tier); only the buffer
         // size changed.
 
@@ -3624,12 +3639,7 @@ impl KvCache {
         if k_floor_bph < k_bph_cur {
             let k_bpp_floor = self.n_kv_heads * k_floor_bph;
             let k_elems = (self.physical_cap * k_bpp_floor + 3) / 4;
-            for t in self.k_gpu.iter_mut() {
-                // 1-element placeholder convention for non-KV layers.
-                if t.numel() > 1 {
-                    *t = gpu.zeros(&[k_elems], DType::F32)?;
-                }
-            }
+            Self::resize_real_tensors_zeroed(gpu, &mut self.k_gpu, k_elems)?;
         }
         Ok(())
     }
