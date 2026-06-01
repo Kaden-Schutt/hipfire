@@ -8,10 +8,9 @@
 //   hipfire sidecar-gen <model>       → generate TriAttention calibration sidecar
 
 import { spawn } from "bun";
-import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
+import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, cpSync, rmSync, renameSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
-import { stripVisibleThinking } from "./chat_pure.ts";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
@@ -5136,6 +5135,63 @@ function findDep(binary: string, extraDirs: string[]): string | null {
   return null;
 }
 
+function stripVisibleThinking(content: string, preserveThinking: boolean = false): string {
+  if (preserveThinking) return content.replace(/<\|im_end\|>/g, "").trim();
+  return content
+    .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+    .replace(/<think>[\s\S]*$/, "")
+    .replace(/^\s*<\/think>\s*/, "")
+    .replace(/<\|im_end\|>/g, "")
+    .trim();
+}
+
+function pruneCliRuntimePayload(cliDir: string): void {
+  for (const name of ["node_modules", ".gitignore", "tsconfig.json", "README.md", "bun.lock"]) {
+    rmSync(join(cliDir, name), { recursive: true, force: true });
+  }
+  for (const name of readdirSync(cliDir)) {
+    if (/\.test\.ts$/.test(name) || /^test_.*\.ts$/.test(name) || /^bench_.*\.ts$/.test(name)) {
+      unlinkSync(join(cliDir, name));
+    }
+  }
+}
+
+function syncCliRuntimePayload(repoDir: string): void {
+  const cliSrcDir = join(repoDir, "cli");
+  const cliDstDir = join(HIPFIRE_DIR, "cli");
+  const required = ["registry.json", "index.ts"];
+  for (const file of required) {
+    if (!existsSync(join(cliSrcDir, file))) {
+      console.error(`\nUpdate aborted: cli/${file} missing in repo checkout at`);
+      console.error(`  ${repoDir}`);
+      console.error("Repo may be on a pre-migration commit or in a dirty state. Verify with:");
+      console.error(`  git -C ${repoDir} status && git -C ${repoDir} log -1 --stat`);
+      process.exit(1);
+    }
+  }
+
+  mkdirSync(HIPFIRE_DIR, { recursive: true });
+  const stamp = `${process.pid}-${Date.now()}`;
+  const tmpDir = join(HIPFIRE_DIR, `.cli-update-${stamp}`);
+  const backupDir = join(HIPFIRE_DIR, `.cli-prev-${stamp}`);
+  rmSync(tmpDir, { recursive: true, force: true });
+  rmSync(backupDir, { recursive: true, force: true });
+
+  try {
+    cpSync(cliSrcDir, tmpDir, { recursive: true, force: true });
+    pruneCliRuntimePayload(tmpDir);
+    if (existsSync(cliDstDir)) renameSync(cliDstDir, backupDir);
+    renameSync(tmpDir, cliDstDir);
+    rmSync(backupDir, { recursive: true, force: true });
+  } catch (err) {
+    rmSync(tmpDir, { recursive: true, force: true });
+    if (!existsSync(cliDstDir) && existsSync(backupDir)) {
+      renameSync(backupDir, cliDstDir);
+    }
+    throw err;
+  }
+}
+
 // ─── Main ───────────────────────────────────────────────
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -5562,26 +5618,14 @@ switch (cmd) {
     // config commands keep working. Previously the copy happened after the
     // cargo build, so a build failure left the CLI frozen at its install-time
     // version — users saw "unknown model" for entries added post-install.
-    const { copyFileSync } = await import("fs");
     const exe = process.platform === "win32" ? ".exe" : "";
     const binDir = join(HIPFIRE_DIR, "bin");
-    // Order: registry.json BEFORE index.ts. The new index.ts imports the JSON
-    // at startup; if we copied index.ts first and the JSON copy then failed
-    // (missing in repoDir, IO error, partial git pull), the install would be
-    // stranded — new TS that can't resolve its own data file. Copying JSON
-    // first means a partial failure leaves the CLI in a recoverable state:
-    // either old TS + old JSON, or old TS + new JSON (still loads OK).
-    const registrySrc = join(repoDir, "cli/registry.json");
-    const indexSrc    = join(repoDir, "cli/index.ts");
-    if (!existsSync(registrySrc) || !existsSync(indexSrc)) {
-      console.error("\nUpdate aborted: cli/registry.json or cli/index.ts missing in repo checkout at");
-      console.error(`  ${repoDir}`);
-      console.error("Repo may be on a pre-migration commit or in a dirty state. Verify with:");
-      console.error(`  git -C ${repoDir} status && git -C ${repoDir} log -1 --stat`);
-      process.exit(1);
-    }
-    copyFileSync(registrySrc, join(HIPFIRE_DIR, "cli/registry.json"));
-    copyFileSync(indexSrc,    join(HIPFIRE_DIR, "cli/index.ts"));
+    // Keep index.ts and its sibling runtime modules in lockstep. This mirrors
+    // scripts/install.{sh,ps1}: copy the whole cli/ tree, prune dev/test files,
+    // then swap the staged payload into place. A legacy updater can still copy
+    // only this new index.ts once; keeping index.ts startup-self-contained lets
+    // the user run `hipfire update` again to repair the full payload.
+    syncCliRuntimePayload(repoDir);
     console.error("  CLI updated ✓");
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
