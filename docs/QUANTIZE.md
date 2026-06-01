@@ -8,6 +8,7 @@ Output is a single file the daemon mmaps directly.
 
 | Format | Bitwidth | Rotation | When to use |
 |---|---|---|---|
+| `fp16` | 16-bit | none | Reference/debug artifacts and maximum-quality smoke tests. Large, but preserves every quantizable tensor as raw F16. |
 | `mq4` | 4-bit | FWHT (rotated) | Qwen 3.5+ targets — calibrated for the DeltaNet hybrid attention path. Default for safetensors input. |
 | `mq6` | 6-bit | FWHT (rotated) | Qwen 3.5+ when you can spare +47% file size for quality. |
 | `hf4` | 4-bit | none | Dense models (Llama, Mistral, Gemma, older Qwen). Default for GGUF input. |
@@ -77,8 +78,9 @@ hipfire quantize ./tinyllama.Q4_K_M.gguf \
     --install --register tinyllama:1b-gguf
 ```
 
-Default `--format` for GGUF is `hf4`. Override with `--format mq4` (or
-`mq6`) only when the source is a Qwen 3.5+ family GGUF.
+Default `--format` for GGUF is `hf4`. Override with `--format fp16` for
+a full-F16 reference artifact, or `--format mq4` / `mq6` only when the
+source is a Qwen 3.5+ family GGUF.
 
 GGUF tensor names get translated to HuggingFace safetensors style at
 write time so the engine's standard `load_weights_hfq` consumes the
@@ -103,9 +105,10 @@ Per-tensor format selection in the GGUF pipeline:
 
 | Tensor shape | Format |
 |---|---|
+| Any tensor with `--format fp16` | F16 |
 | 1D norm / scale (`*_norm.weight`) | F16 (precision-sensitive, small) |
 | `token_embd.weight` (the embedding) | Q8F16 (Q4-grade is too lossy) |
-| 2D weight, `K % 256 == 0` | per `--format` (mq4 / mq6 / hf4 / hf6) |
+| 2D weight, `K % 256 == 0` | per `--format` (fp16 / mq4 / mq6 / hf4 / hf6) |
 | 2D weight, K not divisible by 256 | HFQ4-G128 (no rotation fallback) |
 
 Source GGUF dequant types supported:

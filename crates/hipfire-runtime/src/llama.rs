@@ -4528,6 +4528,48 @@ impl KvCache {
         })
     }
 
+    /// FP32 KV cache that skips allocation for layers flagged as non-KV.
+    pub fn new_gpu_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let cache_size = max_seq_len * kv_dim;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_size, cache_size, is_kv_layer)?;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: fp32 ({n_kv}/{} layers carry KV, others placeholder)",
+            is_kv_layer.len()
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap: max_seq_len,
+            n_kv_heads,
+            head_dim,
+            quantized: false,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+        })
+    }
+
     /// Create quantized KV cache (HFQ4-G128). 3.56x smaller than FP32.
     pub fn new_gpu_q4(
         gpu: &mut Gpu,

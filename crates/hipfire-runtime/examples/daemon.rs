@@ -2399,6 +2399,10 @@ fn hfq_parameter_count(hfq: &HfqFile) -> u128 {
         .sum()
 }
 
+fn hfq_has_bf16_weights(hfq: &HfqFile) -> bool {
+    hfq.tensors().iter().any(|t| t.quant_type == 16)
+}
+
 fn warn_tiny_model_state(hfq: &HfqFile, q: hipfire_arch_qwen35::qwen35::StateQuant) {
     use hipfire_arch_qwen35::qwen35::StateQuant;
     const TINY_MODEL_PARAMS: u128 = 2_000_000_000;
@@ -2441,7 +2445,7 @@ fn load_model(
     // Lets the CLI set size-aware defaults — e.g. Qwen3.5-27B prefers asym4
     // since layer-count compounding of asym3 noise flips argmax at decision
     // boundaries on deep stacks.
-    let kv_mode = kv_mode_override
+    let mut kv_mode = kv_mode_override
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
@@ -2453,6 +2457,13 @@ fn load_model(
     }
 
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
+    if is_bf16_artifact {
+        if kv_mode != "fp32" {
+            eprintln!("  BF16 tensors detected: forcing KV cache to fp32");
+        }
+        kv_mode = "fp32".to_string();
+    }
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
@@ -3178,7 +3189,20 @@ fn load_model(
         // All allocators go through the `_capped` entry points with
         // physical_cap derived above. Without eviction, physical_cap==max_seq
         // and these match the back-compat wrappers byte-for-byte.
+        let is_kv_layer: Vec<bool> = config
+            .layer_types
+            .iter()
+            .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
+            .collect();
         let kv = match kv_mode.as_str() {
+            "fp32" | "f32" => llama::KvCache::new_gpu_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                max_seq,
+            )
+            .map_err(|e| format!("{e}"))?,
             "q8" => {
                 eprintln!("  KV cache: Q8");
                 llama::KvCache::new_gpu_q8_capped(
@@ -3233,7 +3257,11 @@ fn load_model(
         };
         // Q8 DeltaNet state can accumulate quality drift on long generation.
         // The load-time override exists for coherence A/B probes.
-        let dn_quant = parse_state_quant(state_quant_override)?;
+        let dn_quant = if is_bf16_artifact {
+            hipfire_arch_qwen35::qwen35::StateQuant::FP32
+        } else {
+            parse_state_quant(state_quant_override)?
+        };
         eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
         warn_tiny_model_state(&hfq, dn_quant);
         let dn =
@@ -3764,11 +3792,18 @@ fn load_model_pp(
     pp: usize,
     _gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
-    let kv_mode = kv_mode_override
+    let mut kv_mode = kv_mode_override
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
+    if is_bf16_artifact {
+        if kv_mode != "fp32" {
+            eprintln!("  BF16 tensors detected: forcing KV cache to fp32");
+        }
+        kv_mode = "fp32".to_string();
+    }
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
@@ -3827,6 +3862,14 @@ fn load_model_pp(
     // KV cache (asym3 default, q8/asym4/asym2/fwht{4,3,2} selectable).
     // physical_cap == max_seq on this path — eviction is refused at load.
     let kv = match kv_mode.as_str() {
+        "fp32" | "f32" => llama::KvCache::new_gpu_multi(
+            &mut gpus,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            max_seq,
+        )
+        .map_err(|e| format!("{e}"))?,
         "q8" => llama::KvCache::new_gpu_q8_capped_multi(
             &mut gpus,
             config.n_layers,
@@ -3906,7 +3949,11 @@ fn load_model_pp(
 
     // Mirror the pp=1 state-mode parser so pp parity probes can force the
     // same DeltaNet state representation.
-    let dn_quant = parse_state_quant(state_quant_override)?;
+    let dn_quant = if is_bf16_artifact {
+        hipfire_arch_qwen35::qwen35::StateQuant::FP32
+    } else {
+        parse_state_quant(state_quant_override)?
+    };
     eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
     warn_tiny_model_state(&hfq, dn_quant);
     let (dn, la_to_device) = DeltaNetState::new_with_quant_multi(&mut gpus, &config, dn_quant)

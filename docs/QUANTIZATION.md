@@ -6,13 +6,15 @@ side. For the user-facing "how do I quantize my model" page, see
 
 ## Weight formats
 
-All weight formats group elements into 256-wide blocks (G256). Each
-block has independent scale + zero-point metadata. The bitwidth and
-whether a Walsh-Hadamard rotation runs before quantization defines the
-four production formats.
+Quantized weight formats group elements into 256-wide blocks (G256).
+Each block has independent scale + zero-point metadata. The bitwidth
+and whether a Walsh-Hadamard rotation runs before quantization defines
+the production formats. `fp16` is the unquantized HFQ-container
+reference path: qt=1 F16 payloads, no grouping, no rotation.
 
 | Format | Bits | Rotation | Bytes / 256 elements | Use case |
 |---|---|---|---|---|
+| F16 | 16 | none | 512 | Reference/debug artifacts and smoke tests |
 | HFQ4-G256 | 4 | none | 136 (8 hdr + 128 data) | Llama / Qwen3 / dense |
 | HFQ6-G256 | 6 | none | 200 | Dense, higher quality |
 | MQ4-G256 | 4 | FWHT | 136 | Qwen 3.5+ hybrid |

@@ -442,6 +442,10 @@ function sizeAwareKvMode(baseMode: string, resolved: HipfireConfig, tag?: string
   return isLarge ? "asym4" : baseMode;
 }
 
+function isBf16ArtifactPath(path: string): boolean {
+  return /(^|[-_.])bf16($|[-_.])/.test(basename(path).toLowerCase());
+}
+
 function buildLoadMessage(path: string, tag?: string | null): any {
   const resolved = resolveModelConfig(tag);
   // Guard: the KV cache must be big enough to hold at least one max_tokens
@@ -463,6 +467,13 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     console.error(`[hipfire] kv_mode bumped for ${tag}: ${baseMode} → ${effectiveMode} (deep stack, asym3 layer-count compounding)`);
   }
   params.kv_mode = effectiveMode;
+  if (isBf16ArtifactPath(path)) {
+    if (params.kv_mode !== "fp32") {
+      console.error(`[hipfire] bf16 artifact detected — forcing kv_mode=fp32 for gold-path verification`);
+    }
+    params.kv_mode = "fp32";
+    params.state_quant = "fp32";
+  }
 
   // Optional DFlash draft. The daemon wires this into a greedy speculative-
   // decode fast path that triggers on temperature==0 requests. Two sources:
@@ -4099,11 +4110,6 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     prefill_drafter_device: {
       label: "prefill_drafter_device",
-      desc: "HIP device for the PFlash drafter. -1 = same device as target; 0+ pins the drafter to that GPU.",
-      range: [-1, 15], step: 1,
-    },
-    prefill_drafter_device: {
-      label: "prefill_drafter_device",
       desc: "HIP device for the PFlash drafter. -1 = same as target (default). Set to a sibling device index for hetero compress.",
       range: [-1, 15], step: 1,
     },
@@ -4116,6 +4122,16 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "prefill_sparse_threshold",
       desc: "Phase 3 sparse-attention threshold (plumbing only; the kernel hasn't shipped). Source-token counts below this would fall back to dense drafter forward. Default 32768.",
       range: [0, 524288], step: 1024,
+    },
+    mtp_mode: {
+      label: "mtp_mode",
+      desc: "MTP speculative decode mode. off = pure target decode, on = force MTP, auto = enable where supported.",
+      options: ["off", "on", "auto"],
+    },
+    mtp_k: {
+      label: "mtp_k",
+      desc: "MTP draft tokens per speculative decode window.",
+      range: [1, 10], step: 1,
     },
   };
 

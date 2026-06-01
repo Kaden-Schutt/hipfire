@@ -225,6 +225,13 @@ fn f32_to_f16(val: f32) -> u16 {
     ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
 }
 
+fn f32_slice_to_f16_bytes(f32_data: &[f32]) -> Vec<u8> {
+    f32_data
+        .iter()
+        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+        .collect()
+}
+
 /// Convert raw tensor bytes to F32 based on dtype string
 fn to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
     match dtype {
@@ -4356,6 +4363,8 @@ fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
 ///
 /// | --format | 2D weights      | embedding | comment                          |
 /// |----------|-----------------|-----------|----------------------------------|
+/// | fp16     | F16             | F16       | reference / maximum-size smoke   |
+/// | bf16     | BF16/F16        | BF16/F16  | source-precision smoke container |
 /// | hfq4     | HFQ4G256        | Q8F16     | dense default — no FWHT, plain   |
 /// | hfq6     | HFQ6G256        | Q8F16     | dense + higher quality           |
 /// | mq4      | MQ4G256         | Q8F16     | Qwen3.5+ (DeltaNet) — FWHT-rot   |
@@ -4370,6 +4379,8 @@ fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
 /// pass `--format mq4` only when the source is a Qwen3.5+ family model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GgufFormat {
+    F16,
+    Bf16,
     Hfq4,
     Hfq6,
     Mq4,
@@ -4386,6 +4397,8 @@ enum GgufFormat {
 impl GgufFormat {
     fn from_flag(flag: &str) -> Option<Self> {
         match flag {
+            "fp16" | "f16" | "float16" => Some(Self::F16),
+            "bf16" | "bfloat16" => Some(Self::Bf16),
             "hfq4" | "hfq4g256" | "hf4" => Some(Self::Hfq4),
             "hfq6" | "hfq6g256" | "hf6" => Some(Self::Hfq6),
             "mq4" | "mq4g256" | "magnum" => Some(Self::Mq4),
@@ -4403,6 +4416,8 @@ impl GgufFormat {
 
     fn label(self) -> &'static str {
         match self {
+            Self::F16 => "F16",
+            Self::Bf16 => "BF16",
             Self::Hfq4 => "HFQ4G256",
             Self::Hfq6 => "HFQ6G256",
             Self::Mq4 => "MQ4G256",
@@ -4415,6 +4430,19 @@ impl GgufFormat {
             Self::Hfp4 => "HFP4G32",
             Self::Mfp4 => "MFP4G32",
         }
+    }
+}
+
+fn source_precision_tensor_bytes(
+    raw_data: &[u8],
+    dtype: &str,
+    f32_data: &[f32],
+) -> (Vec<u8>, QuantType, &'static str) {
+    match dtype {
+        "BF16" => (raw_data.to_vec(), QuantType::BF16, "BF16"),
+        "F16" => (raw_data.to_vec(), QuantType::F16, "F16"),
+        "F32" => (f32_slice_to_f16_bytes(f32_data), QuantType::F16, "F16"),
+        other => panic!("unsupported dtype for source-precision HFQ: {other}"),
     }
 }
 
@@ -4478,7 +4506,7 @@ fn run_gguf_pipeline(
     });
     let metadata_json = serde_json::to_string(&metadata)?;
 
-    // FWHT signs — only used when --format is mq4/mq6. Same seed pair as the
+    // FWHT signs — only used by MQ/MFP formats. Same seed pair as the
     // safetensors path so the engine's runtime FWHT inverse stays identical.
     let needs_signs = matches!(
         format,
@@ -4518,43 +4546,44 @@ fn run_gguf_pipeline(
     // ship-default is the conservative shape per maintainer directive
     // (2026-05-08): never silently change dense quantization. Users who
     // want K-map on dense pass `--kmap-dense` (see flag parsing below).
-    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
-        HashMap::new()
-    } else {
-        let mut map = HashMap::new();
-        let mut counts = [0u32; 4];
-        for info in &gguf.tensors {
-            let out_name =
-                gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
-            let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode);
-            match level {
-                QuantLevel::F16 => counts[0] += 1,
-                QuantLevel::Q8 => counts[1] += 1,
-                QuantLevel::Promote6 => counts[2] += 1,
-                QuantLevel::Override(_) => counts[3] += 1,
-                QuantLevel::Base => counts[3] += 1,
+    let kmap: HashMap<String, QuantLevel> =
+        if format == GgufFormat::F16 || no_kmap || (!is_moe && !kmap_dense) {
+            HashMap::new()
+        } else {
+            let mut map = HashMap::new();
+            let mut counts = [0u32; 4];
+            for info in &gguf.tensors {
+                let out_name =
+                    gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
+                let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode);
+                match level {
+                    QuantLevel::F16 => counts[0] += 1,
+                    QuantLevel::Q8 => counts[1] += 1,
+                    QuantLevel::Promote6 => counts[2] += 1,
+                    QuantLevel::Override(_) => counts[3] += 1,
+                    QuantLevel::Base => counts[3] += 1,
+                }
+                map.insert(out_name, level);
             }
-            map.insert(out_name, level);
-        }
-        if !map.is_empty() {
-            let mode_label = match kmap_mode {
-                0 => "full",
-                1 => "alternating",
-                2 => "typed",
-                _ => "?",
-            };
-            eprintln!(
-                "K-map plan ({} base, {n_layers} layers{}, mode={mode_label}):",
-                format.label(),
-                if is_moe { ", MoE" } else { "" }
-            );
-            eprintln!("  F16:       {:>4} tensors", counts[0]);
-            eprintln!("  Q8:        {:>4} tensors", counts[1]);
-            eprintln!("  Promote6:  {:>4} tensors", counts[2]);
-            eprintln!("  Base:      {:>4} tensors", counts[3]);
-        }
-        map
-    };
+            if !map.is_empty() {
+                let mode_label = match kmap_mode {
+                    0 => "full",
+                    1 => "alternating",
+                    2 => "typed",
+                    _ => "?",
+                };
+                eprintln!(
+                    "K-map plan ({} base, {n_layers} layers{}, mode={mode_label}):",
+                    format.label(),
+                    if is_moe { ", MoE" } else { "" }
+                );
+                eprintln!("  F16:       {:>4} tensors", counts[0]);
+                eprintln!("  Q8:        {:>4} tensors", counts[1]);
+                eprintln!("  Promote6:  {:>4} tensors", counts[2]);
+                eprintln!("  Base:      {:>4} tensors", counts[3]);
+            }
+            map
+        };
 
     let mut hfq_tensors: Vec<HfqTensor> = Vec::with_capacity(gguf.tensors.len());
     let mut total_params: u64 = 0;
@@ -4583,13 +4612,13 @@ fn run_gguf_pipeline(
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
-        let (data, quant_type, group_size, label) = if is_norm || !is_2d {
-            // Norms and 1D tensors always F16 (primary gate)
+        let (data, quant_type, group_size, label) = if format == GgufFormat::F16
+            || is_norm
+            || !is_2d
+        {
+            // Full-F16 artifacts, norms, and 1D tensors use raw half precision.
             let f32_data = gguf_input::tensor_to_f32(info, raw);
-            let f16_bytes: Vec<u8> = f32_data
-                .iter()
-                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                .collect();
+            let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
             (f16_bytes, QuantType::F16, 0u32, "F16")
         } else if kmap_level == QuantLevel::Q8 || is_embed {
             // K-map Q8 or embedding
@@ -4632,6 +4661,10 @@ fn run_gguf_pipeline(
                 GgufFormat::Mq4Lloyd => {
                     let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
+                }
+                GgufFormat::F16 | GgufFormat::Bf16 => {
+                    let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
+                    (f16_bytes, QuantType::F16, 0u32, "F16")
                 }
             }
         } else if let (QuantLevel::Override(override_fmt), true) = (kmap_level, k_dim % 256 == 0) {
@@ -4687,6 +4720,10 @@ fn run_gguf_pipeline(
                     let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
+                GgufFormat::F16 | GgufFormat::Bf16 => {
+                    let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
+                    (f16_bytes, QuantType::F16, 0u32, "F16")
+                }
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
@@ -4740,6 +4777,10 @@ fn run_gguf_pipeline(
                     let k = info.shape[1] as usize;
                     let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
+                }
+                GgufFormat::F16 | GgufFormat::Bf16 => {
+                    let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
+                    (f16_bytes, QuantType::F16, 0u32, "F16")
                 }
             }
         } else {
@@ -4825,7 +4866,7 @@ fn main() {
     });
 
     let output_path = arg_value(&args, "--output")
-        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format q8f16|q4f16]"); std::process::exit(1); });
+        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format bf16|fp16|q8f16|q4f16|mq4]"); std::process::exit(1); });
 
     let chat_template_override =
         arg_value(&args, "--chat-template-file").map(|p| read_chat_template_file(Path::new(p)));
@@ -4862,11 +4903,16 @@ fn main() {
             n_in_sum2, n_counts
         );
     }
+    // bf16 = source-precision container: BF16 tensors stay raw BF16 (qt=16);
+    //        F16 tensors stay F16; F32 tensors fall back to F16.
+    // fp16 = all eligible weights stored as raw F16 (qt=1)
     // q8f16 = all weights Q8 (interleaved blocks)
     // q4f16 = all weights Q4_F16_G64
     // q8-mixed = Q8 attn + Q4_K FFN (best tok/s for VRAM-constrained)
     // q8-fast = Q8 attn + Q4-as-Q8 FFN (all Q8 occupancy, most VRAM)
     // q8hfq = all weights Q8_HFQ (split-metadata, 128B-aligned rows)
+    let use_fp16 = format == "fp16" || format == "f16" || format == "float16";
+    let use_bf16 = format == "bf16" || format == "bfloat16";
     let use_q8 = format == "q8f16" || format == "q8";
     let use_mixed = format == "q8-mixed" || format == "mixed";
     let use_fast = format == "q8-fast" || format == "fast";
@@ -5507,7 +5553,7 @@ fn main() {
 
     // Read tokenizer_config.json (has chat_template)
     let tokenizer_config_path = input_dir.join("tokenizer_config.json");
-    let mut tokenizer_config: Option<serde_json::Value> = if tokenizer_config_path.exists() {
+    let tokenizer_config: Option<serde_json::Value> = if tokenizer_config_path.exists() {
         std::fs::read_to_string(&tokenizer_config_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
@@ -6273,6 +6319,36 @@ fn main() {
             );
             let k = meta.shape[1];
             let m = meta.shape[0];
+            if use_fp16 || use_bf16 {
+                let (q, qt, label) = if use_bf16 {
+                    source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data)
+                } else {
+                    (f32_slice_to_f16_bytes(&f32_data), QuantType::F16, "F16")
+                };
+                let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+                eprintln!(
+                    "  {:>8}: {} {:?} ({:.1} KB -> {:.1} KB)",
+                    label,
+                    name,
+                    meta.shape,
+                    raw_data.len() as f64 / 1024.0,
+                    q.len() as f64 / 1024.0
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: qt,
+                    shape,
+                    group_size: 0,
+                    data: q,
+                    spilled_len: 0,
+                });
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
             if k % 256 == 0 {
                 // AWQ shared-per-layer pre-scaling of the routed experts (--awq +
                 // --imatrix). w1/w3 use s_gate_up (MoE-input channels), w2 uses
@@ -6592,7 +6668,11 @@ fn main() {
                     let slice_off = x * inner_bytes;
                     let slice = &raw_data[slice_off..slice_off + inner_bytes];
                     let f32_slice = to_f32(slice, &dtype);
-                    let (quantized, qt, gs) = if expert_mq3lloyd_native {
+                    let (quantized, qt, gs) = if use_bf16 && dtype == "BF16" {
+                        (slice.to_vec(), QuantType::BF16, 0u32)
+                    } else if use_fp16 || use_bf16 {
+                        (f32_slice_to_f16_bytes(&f32_slice), QuantType::F16, 0u32)
+                    } else if expert_mq3lloyd_native {
                         let q = quantize_mq3g256_lloyd(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ3G256Lloyd, 256u32)
                     } else if expert_mq2lloyd_native {
@@ -6660,7 +6740,11 @@ fn main() {
                 .collect();
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
-            let label = if expert_mq3lloyd_native {
+            let label = if use_bf16 && meta.dtype == "BF16" {
+                "BF16"
+            } else if use_fp16 || use_bf16 {
+                "F16"
+            } else if expert_mq3lloyd_native {
                 "MQ3G256L"
             } else if expert_mq2lloyd_native {
                 if imatrix_per_expert.is_some() {
@@ -6864,7 +6948,14 @@ fn main() {
                 // inference time.
                 let mut awq_sidecar_scales: Option<Vec<f32>> = None;
 
-                let (quantized, qt, gs, label) = if q8_conv1d_default && is_conv1d_tensor(name) {
+                let (quantized, qt, gs, label) = if use_bf16 {
+                    let (data, qt, label) =
+                        source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data);
+                    (data, qt, 0u32, label)
+                } else if use_fp16 {
+                    let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
+                    (f16_bytes, QuantType::F16, 0u32, "F16")
+                } else if q8_conv1d_default && is_conv1d_tensor(name) {
                     // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
@@ -6874,10 +6965,7 @@ fn main() {
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
                 } else if kmap_level == QuantLevel::F16 {
                     // K-map says F16 (should not normally reach here — should_quantize filters first)
-                    let f16_bytes: Vec<u8> = f32_data
-                        .iter()
-                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                        .collect();
+                    let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
                     (f16_bytes, QuantType::F16, 0u32, "F16")
                 } else if kmap_level == QuantLevel::Promote6 {
                     // K-map says promote to 6-bit
@@ -6948,6 +7036,10 @@ fn main() {
                         let signs1 = gen_fwht_signs(42, 256);
                         let signs2 = gen_fwht_signs(1042, 256);
                         match override_fmt {
+                            GgufFormat::F16 | GgufFormat::Bf16 => {
+                                let f16_bytes = f32_slice_to_f16_bytes(&f32_data);
+                                (f16_bytes, QuantType::F16, 0u32, "F16")
+                            }
                             GgufFormat::Mq4 => {
                                 // Inline AWQ + MQ4 dance (mirrors the Base MQ4 arm).
                                 let q = if let (Some(alpha), Some(im_weights)) =
@@ -7692,12 +7784,17 @@ fn main() {
                 data: quantized,
                 spilled_len: 0,
             });
-        } else if is_vision && vision_quant == "bf16" && meta.dtype == "BF16" {
-            // Store vision weights as original BF16 (zero precision loss)
+        } else if (use_bf16 || (is_vision && vision_quant == "bf16")) && meta.dtype == "BF16" {
+            // Store original BF16 bytes losslessly in source-precision containers.
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let scope = if is_vision && vision_quant == "bf16" {
+                "vision/source"
+            } else {
+                "source"
+            };
             eprintln!(
-                "  BF16:       {} {:?} ({} elements, {:.1} KB) [vision, lossless]",
+                "  BF16:       {} {:?} ({} elements, {:.1} KB) [{scope}, lossless]",
                 name,
                 meta.shape,
                 n_elements,
@@ -7711,7 +7808,7 @@ fn main() {
                 data: raw_data.to_vec(),
                 spilled_len: 0,
             });
-        } else if is_vision && vision_quant == "bf16" {
+        } else if use_bf16 || (is_vision && vision_quant == "bf16") {
             // Non-BF16 source (F16/F32) — store as F16
             let data = if meta.dtype == "F16" {
                 raw_data.to_vec()
@@ -7724,8 +7821,13 @@ fn main() {
             };
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let scope = if is_vision && vision_quant == "bf16" {
+                "vision/source fallback"
+            } else {
+                "source fallback"
+            };
             eprintln!(
-                "  F16:        {} {:?} ({:.1} KB) [vision, bf16 fallback]",
+                "  F16:        {} {:?} ({:.1} KB) [{scope}]",
                 name,
                 meta.shape,
                 data.len() as f64 / 1024.0
@@ -9744,6 +9846,18 @@ mod tests {
             updated,
             json!({ "chat_template": "{% for message in messages %}{{ message.content }}{% endfor %}" })
         );
+    }
+
+    #[test]
+    fn gguf_format_accepts_fp16_aliases() {
+        for alias in ["fp16", "f16", "float16"] {
+            assert_eq!(GgufFormat::from_flag(alias), Some(GgufFormat::F16));
+        }
+        assert_eq!(GgufFormat::F16.label(), "F16");
+        for alias in ["bf16", "bfloat16"] {
+            assert_eq!(GgufFormat::from_flag(alias), Some(GgufFormat::Bf16));
+        }
+        assert_eq!(GgufFormat::Bf16.label(), "BF16");
     }
 
     #[test]

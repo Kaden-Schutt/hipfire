@@ -2279,14 +2279,7 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
         qwen35_tensor_data_vec(hfq, name).unwrap_or_else(|| panic!("tensor not found: {name}"));
 
     let f32_data: Vec<f32> = match info.quant_type {
-        1 => data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        2 => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
+        1 | 2 | 16 => hfq_plain_tensor_as_f32(info, &data, name),
         3 => hipfire_runtime::llama::dequantize_q8_0(&data, n),
         14 => {
             // MQ8-G256: [f16 scale][int8 × 256] = 258 bytes per 256 weights
@@ -3170,11 +3163,8 @@ pub fn load_weights(
                     let (embd_meta, embd_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight")
                         .expect("embed_tokens not found");
                     loaded_bytes += embd_data.len();
-                    let f32_data: Vec<f32> = embd_data
-                        .chunks_exact(2)
-                        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                        .collect();
-                    let _ = embd_meta;
+                    let f32_data =
+                        hfq_plain_tensor_as_f32(embd_meta, &embd_data, "embed_tokens.weight");
                     (
                         gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
                         EmbeddingFormat::F32,
@@ -3209,13 +3199,10 @@ pub fn load_weights(
                 EmbeddingFormat::Q8_0,
             )
         } else {
-            let (_, embd_data) =
+            let (embd_meta, embd_data) =
                 qwen35_tensor_data_vec(hfq, "embed_tokens.weight").expect("embed_tokens not found");
             loaded_bytes += embd_data.len();
-            let f32_data: Vec<f32> = embd_data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
+            let f32_data = hfq_plain_tensor_as_f32(embd_meta, &embd_data, "embed_tokens.weight");
             (
                 gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
                 EmbeddingFormat::F32,
@@ -3287,7 +3274,8 @@ pub fn load_weights(
             }
             wt
         } else {
-            let (_, tied_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight").unwrap();
+            let (tied_info, tied_data) =
+                qwen35_tensor_data_vec(hfq, "embed_tokens.weight").unwrap();
             loaded_bytes += tied_data.len();
             if embd_qt == 6 || embd_qt == 7 || embd_qt == 8 {
                 let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
@@ -3340,10 +3328,8 @@ pub fn load_weights(
                     awq_scale: None,
                 }
             } else {
-                let f32_data: Vec<f32> = tied_data
-                    .chunks_exact(2)
-                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                    .collect();
+                let f32_data =
+                    hfq_plain_tensor_as_f32(tied_info, &tied_data, "embed_tokens.weight");
                 let bytes: &[u8] = unsafe {
                     std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
                 };
@@ -4435,11 +4421,7 @@ fn load_token_embd_into(
             EmbeddingFormat::Q8_0,
         )
     } else {
-        let f32_data: Vec<f32> = embd_info
-            .1
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
+        let f32_data = hfq_plain_tensor_as_f32(embd_info.0, embd_info.1, "embed_tokens.weight");
         (
             gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
             EmbeddingFormat::F32,
@@ -4530,10 +4512,7 @@ fn load_output_into(
                 awq_scale: None,
             }
         } else {
-            let f32_data: Vec<f32> = embd_data
-                .chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
+            let f32_data = hfq_plain_tensor_as_f32(embd_info.0, embd_data, "embed_tokens.weight");
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
@@ -5251,6 +5230,19 @@ fn moe_ffn_has_mq3(ffn: &MoeFfnWeights) -> bool {
             .experts
             .iter()
             .any(|e| is_mq3_any(e.gate_up.gpu_dtype) || is_mq3_any(e.down.gpu_dtype))
+}
+
+fn moe_ffn_has_mq3_lloyd(ffn: &MoeFfnWeights) -> bool {
+    let is_lloyd = |dt: DType| matches!(dt, DType::MQ3G256Lloyd);
+    is_lloyd(ffn.router.gpu_dtype)
+        || is_lloyd(ffn.shared_expert_gate.gpu_dtype)
+        || is_lloyd(ffn.shared_expert.gate.gpu_dtype)
+        || is_lloyd(ffn.shared_expert.up.gpu_dtype)
+        || is_lloyd(ffn.shared_expert.down.gpu_dtype)
+        || ffn
+            .experts
+            .iter()
+            .any(|e| is_lloyd(e.gate_up.gpu_dtype) || is_lloyd(e.down.gpu_dtype))
 }
 
 /// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
@@ -7661,11 +7653,10 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     // in `forward_prefill_batch_with_pbs`, so the caller is responsible
     // for ensuring the batched fast-path is valid. Two structural bypasses
     // could land here:
-    //   1. MQ3-weighted model on an arch that lacks the gfx11 wave32 WMMA
-    //      builtin (gfx12, gfx10, gfx906, gfx94x).
-    //   2. MQ3 weights inside a MoE/A3B layer (DeltaNetMoe/FullAttnMoe) —
-    //      the MoE batched branches dispatch through HFQ4-layout kernels
-    //      and would memory-fault on the 104-vs-136 byte stride.
+    //   1. MQ3-weighted dense model on an arch that lacks the gfx11 wave32
+    //      WMMA builtin.
+    //   2. MQ3 weights inside a MoE/A3B layer on an arch without the gfx12
+    //      grouped-MoE HFQ3 kernels, or MQ3-Lloyd MoE, which is still unwired.
     // In production, `daemon.rs`'s DFlash refusal guard blocks both, but
     // dflash_spec_demo and other example callers go through ModelSlot::load
     // directly. We cross-check here so any caller is protected.
@@ -7673,6 +7664,7 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     let mut mq3_in_dense = false;
     let mut mq3_in_moe = false;
     let mut lloyd_in_dense = false;
+    let mut lloyd_in_moe = false;
     // The Lloyd dtype is treated identically to plain MQ3 in this guard:
     // both use 112-vs-104-byte stride that the MoE batched branches'
     // HFQ4-layout dispatch would corrupt, and both depend on the gfx11/12
@@ -7745,6 +7737,15 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
                 {
                     mq3_in_moe = true;
                 }
+                if is_lloyd(l.wqkv.gpu_dtype)
+                    || is_lloyd(l.wz.gpu_dtype)
+                    || is_lloyd(l.w_beta.gpu_dtype)
+                    || is_lloyd(l.w_alpha.gpu_dtype)
+                    || is_lloyd(l.wo.gpu_dtype)
+                    || moe_ffn_has_mq3_lloyd(&l.ffn)
+                {
+                    lloyd_in_moe = true;
+                }
             }
             LayerWeights::FullAttnMoe(l) => {
                 if is_mq3_any(l.wq.gpu_dtype)
@@ -7755,6 +7756,14 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
                 {
                     mq3_in_moe = true;
                 }
+                if is_lloyd(l.wq.gpu_dtype)
+                    || is_lloyd(l.wk.gpu_dtype)
+                    || is_lloyd(l.wv.gpu_dtype)
+                    || is_lloyd(l.wo.gpu_dtype)
+                    || moe_ffn_has_mq3_lloyd(&l.ffn)
+                {
+                    lloyd_in_moe = true;
+                }
             }
         }
     }
@@ -7762,15 +7771,15 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         arch,
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
     );
-    if mq3_in_moe {
+    let mq3_moe_supported = arch.starts_with("gfx12") && !lloyd_in_moe;
+    if mq3_in_moe && !mq3_moe_supported {
         return Err(hip_bridge::HipError::new(
             0,
             "forward_prefill_batch_single_chunk_captured: model has MQ3G256 / \
              MQ3G256Lloyd weights inside a MoE/A3B layer (DeltaNetMoe or \
-             FullAttnMoe). The MoE batched prefill branches dispatch through \
-             HFQ4-layout kernels and would memory-fault on the 104/112-vs-136 \
-             byte stride. Use an MQ4 quantization for MoE/A3B targets, or wait \
-             for the MQ3 MoE branches to land.",
+             FullAttnMoe), but only plain MQ3G256 MoE is wired and only on \
+             gfx12. Use MQ4/MQ6 for this target or run plain MQ3G256 MoE on \
+             gfx12 where the grouped-WMMA routed expert kernels are available.",
         ));
     }
     if mq3_in_dense && !arch_has_wmma {
@@ -7987,21 +7996,13 @@ pub fn forward_prefill_batch_with_pbs_opts(
         return Ok(());
     }
 
-    // Cross-path safety: refuse MQ3 / MQ3-Lloyd weights inside any MoE
-    // layer (attention OR FFN), mirroring the captured-path guard at
-    // `forward_prefill_batch_single_chunk_captured` (line 3367+). Without
-    // this, the eligibility check below would admit a hybrid model with
-    // (e.g.) MQ3 attention + MQ4 MoE FFN onto the batched path, where the
-    // MoE-batched LA/FA bodies would misroute: the QKV matcher drops MQ3
-    // and the wo path is hardcoded to `gemm_hfq4g256_residual` regardless
-    // of `layer.wo.gpu_dtype`. The result is a 104/112 vs 136 byte stride
-    // mismatch and silent-corruption fluent-looking output. Issue #179
-    // documents the matcher half of this; the wo half was uncovered in
-    // review. Wiring both correctly (plus Lloyd) is tracked separately
-    // (see followup issue) — until then we hard-error here so all three
-    // entry points (daemon-DFlash setup, captured prefill, non-captured
-    // prefill) reject MQ3+MoE consistently.
+    // Cross-path safety: only plain MQ3G256 MoE is admitted, and only on
+    // gfx12 where the shared-expert HFQ3 kernels and routed grouped-WMMA
+    // kernels are available. MQ3-Lloyd MoE remains rejected because its
+    // routed expert kernels have not been wired into qwen35's MoE path.
+    let arch = gpu.arch.as_str();
     let is_mq3_any = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
+    let is_lloyd = |dt: DType| matches!(dt, DType::MQ3G256Lloyd);
     let mq3_in_moe = weights.layers.iter().any(|lw| match lw {
         LayerWeights::DeltaNetMoe(l) => {
             is_mq3_any(l.wqkv.gpu_dtype)
@@ -8020,16 +8021,33 @@ pub fn forward_prefill_batch_with_pbs_opts(
         }
         _ => false,
     });
-    if mq3_in_moe {
+    let lloyd_in_moe = weights.layers.iter().any(|lw| match lw {
+        LayerWeights::DeltaNetMoe(l) => {
+            is_lloyd(l.wqkv.gpu_dtype)
+                || is_lloyd(l.wz.gpu_dtype)
+                || is_lloyd(l.w_beta.gpu_dtype)
+                || is_lloyd(l.w_alpha.gpu_dtype)
+                || is_lloyd(l.wo.gpu_dtype)
+                || moe_ffn_has_mq3_lloyd(&l.ffn)
+        }
+        LayerWeights::FullAttnMoe(l) => {
+            is_lloyd(l.wq.gpu_dtype)
+                || is_lloyd(l.wk.gpu_dtype)
+                || is_lloyd(l.wv.gpu_dtype)
+                || is_lloyd(l.wo.gpu_dtype)
+                || moe_ffn_has_mq3_lloyd(&l.ffn)
+        }
+        _ => false,
+    });
+    let mq3_moe_supported = arch.starts_with("gfx12") && !lloyd_in_moe;
+    if mq3_in_moe && !mq3_moe_supported {
         return Err(hip_bridge::HipError::new(
             0,
             "forward_prefill_batch: model has MQ3G256 / MQ3G256Lloyd weights \
-             inside a MoE/A3B layer (DeltaNetMoe or FullAttnMoe). The MoE \
-             batched prefill branches dispatch through HFQ4-layout kernels \
-             (QKV matcher drops MQ3; wo path is hardcoded MQ4) and would \
-             produce silent corruption from the 104/112-vs-136 byte stride \
-             mismatch. Use an MQ4 quantization for MoE/A3B targets, or wait \
-             for the MQ3 MoE branches to land (see followup issue).",
+             inside a MoE/A3B layer (DeltaNetMoe or FullAttnMoe), but only \
+             plain MQ3G256 MoE is wired and only on gfx12. Use MQ4/MQ6 for \
+             this target or run plain MQ3G256 MoE on gfx12 where the grouped \
+             routed expert kernels are available.",
         ));
     }
 
@@ -8426,17 +8444,16 @@ fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipRes
 /// small tensors are never quantized to MQ4 to preserve routing
 /// accuracy). They get a separate `gemm_q8_0_batched_chunked` dispatch
 /// against the *un-rotated* `x_norm_batch` inside
-/// `prefill_moe_ffn_body_batched`. All other weights (shared expert
-/// gate/up/down + every expert gate_up/down) must be MQ4G256 — these are
-/// the ones consumed by the FWHT-rotated `_k8_indexed_batched` and
-/// `gemm_hfq4g256` family, which is stride-136 only.
+/// `prefill_moe_ffn_body_batched`. Other MoE weights are admitted only when
+/// their concrete dtype has matching shared-expert and routed-expert dispatch
+/// branches below.
 ///
 /// Pre-fix this required ALL weights to be MQ4G256, which made every
 /// A3B model fall back to per-token prefill because router is universally
 /// Q8_0. Widening to accept Q8 router + Q8 shared_expert_gate unlocks
 /// uniform-MQ4 A3B variants (Qwen3.5-A3B, qwen3.6-35b-a3b-uniform.mq4).
-/// Mixed-precision Qwen3.6-A3B (MQ6 in 16/40 layers) still falls back —
-/// needs an MQ6 sibling for `_k8_indexed_batched`, follow-up work.
+/// Mixed-precision Qwen3.6-A3B uses the MQ6 branches when its MoE weights are
+/// quantized to MQ6G256.
 /// MoE FFN admit predicate for the batched prefill body
 /// `prefill_moe_ffn_body_batched`. Per-projection MQ4 OR MQ6 admit:
 ///
@@ -8514,8 +8531,8 @@ fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
 
 fn moe_ffn_batched_admissible_for_dtypes(
     dtypes: &MoePrefillDtypes,
-    admit_mq6: bool,
     admit_paro: bool,
+    arch: &str,
 ) -> bool {
     let router_ok = matches!(dtypes.router, DType::MQ4G256 | DType::Q8_0 | DType::F32);
     let shared_gate_ok = matches!(
@@ -8537,27 +8554,21 @@ fn moe_ffn_batched_admissible_for_dtypes(
         return true;
     }
 
-    if admit_mq6 {
-        let shared_gu_ok = matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ6G256)
-            && dtypes.shared_expert_up == dtypes.shared_expert_gate;
-        let shared_dn_ok = matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ6G256);
-        let experts_ok = matches!(dtypes.expert_gate_up, DType::MQ4G256 | DType::MQ6G256)
-            && dtypes.expert_down == dtypes.expert_gate_up;
-        shared_gu_ok && shared_dn_ok && experts_ok
-    } else {
-        dtypes.shared_expert_gate == DType::MQ4G256
-            && dtypes.shared_expert_up == DType::MQ4G256
-            && dtypes.shared_expert_down == DType::MQ4G256
-            && dtypes.expert_gate_up == DType::MQ4G256
-            && dtypes.expert_down == DType::MQ4G256
+    let shared_gu_one_dtype = dtypes.shared_expert_up == dtypes.shared_expert_gate;
+    let experts_one_dtype = dtypes.expert_down == dtypes.expert_gate_up;
+    if !(shared_gu_one_dtype && experts_one_dtype) {
+        return false;
     }
+
+    let shared_and_routed_same_family = dtypes.shared_expert_gate == dtypes.shared_expert_down
+        && dtypes.shared_expert_gate == dtypes.expert_gate_up;
+    if !shared_and_routed_same_family {
+        return false;
+    }
+
+    moe_prefill_quant_family_supported_for_arch(dtypes.expert_gate_up, arch)
 }
 
-/// MQ6 admit is gated behind `HIPFIRE_MOE_MQ6_ADMIT=1` because of a
-/// known correctness regression on AWQ A3B (token attractor `!!!!!`)
-/// when the new MQ6 dispatch path is exercised — the 4 new MQ6 kernels
-/// pass synthetic channel tests at FP16 ULP precision but produce
-/// garbage activations in production. Bisection of the offending
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
 /// dispatch — single-token prefill must not take the batched path.
 const MIN_BATCH: usize = 2;
@@ -8613,7 +8624,7 @@ pub fn prefill_batch_pbs_eligible(
                     && is_batchable_la(l.w_beta.gpu_dtype, arch)
                     && is_batchable_la(l.w_alpha.gpu_dtype, arch)
                     && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_batched_admissible(&l.ffn),
+                    && moe_ffn_batched_admissible(&l.ffn, arch),
             LayerWeights::FullAttnMoe(l) =>
                 moe_topk_ok
                     && moe_router_logits_present
@@ -8621,13 +8632,11 @@ pub fn prefill_batch_pbs_eligible(
                     && is_batchable_la(l.wk.gpu_dtype, arch)
                     && is_batchable_la(l.wv.gpu_dtype, arch)
                     && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_batched_admissible(&l.ffn),
+                    && moe_ffn_batched_admissible(&l.ffn, arch),
         })
 }
 
-/// dispatch site is pending. Default-off preserves the pre-fan-out
-/// behavior (AWQ A3B → per-token fallback, coherent at ~53 tok/s).
-fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
+fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, arch: &str) -> bool {
     let Some(dtypes) = MoePrefillDtypes::from_ffn(ffn) else {
         return false;
     };
@@ -8644,12 +8653,31 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
         paro_batched_admit_enabled_from_env(std::env::var("HIPFIRE_PARO_BATCHED").ok().as_deref())
     });
 
-    // MQ6 admit env gate (default off — see comment above)
-    static MQ6_ADMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let admit_mq6 =
-        *MQ6_ADMIT.get_or_init(|| std::env::var("HIPFIRE_MOE_MQ6_ADMIT").as_deref() == Ok("1"));
+    moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_paro, arch)
+}
 
-    moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, admit_paro)
+fn moe_prefill_quant_family_supported_for_arch(dtype: DType, arch: &str) -> bool {
+    match dtype {
+        DType::MQ4G256 => true,
+        // MQ6 has indexed batched gate_up/down on RDNA and grouped GEMM on
+        // gfx12. The CDNA/gfx9 atomic fallback is still MQ4-only.
+        DType::MQ6G256 => !arch.starts_with("gfx9"),
+        // MQ3 currently has the shared-expert kernels plus grouped-WMMA
+        // routed experts. There is no indexed fallback, so only admit where
+        // grouped-WMMA is guaranteed.
+        DType::MQ3G256 => arch.starts_with("gfx12"),
+        _ => false,
+    }
+}
+
+fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
+    match dtype {
+        DType::MQ4G256 => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
+        DType::MQ6G256 => arch.starts_with("gfx12"),
+        DType::MQ3G256 => arch.starts_with("gfx12"),
+        DType::ParoQ4G128 => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
+        _ => false,
+    }
 }
 
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
@@ -8657,8 +8685,9 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
 /// residual back into the same buffer in-place.
 ///
 /// Preconditions (caller must guarantee):
-/// - `moe_ffn_batched_admissible(ffn)` returns true: router + shared_expert_gate may
-///   be MQ4G256 *or* Q8_0; all other MoE weights must be MQ4G256
+/// - `moe_ffn_batched_admissible(ffn, arch)` returns true: router +
+///   shared_expert_gate may be MQ4G256 or Q8_0; all other MoE weights must
+///   use an arch-supported MoE quant family.
 /// - `pbs.moe_*_batch` tensors are allocated (num_experts > 0 at scratch
 ///   construction time) and sized to max_batch ≥ N
 /// - `config.num_experts_per_tok == 8` and `config.num_experts <= 1024`
@@ -8700,12 +8729,11 @@ fn prefill_moe_ffn_body_batched(
     // as Q8_0 in the quantizer — these tiny tensors lose too much
     // accuracy at 4-bit, so the engine never reduces them. Q8 weights
     // are quantized against the un-rotated rmsnorm output, while the
-    // MQ4 siblings (shared_expert.{gate,up,down} + experts.{gate_up,down})
-    // expect FWHT(rmsnorm(x) / awq_scale). Populate both:
+    // MQ-family siblings (shared_expert.{gate,up,down} +
+    // experts.{gate_up,down}) expect FWHT(rmsnorm(x) / awq_scale). Populate both:
     //   x_norm_batch ← rmsnorm(x_batch)
     //   x_rot_batch  ← FWHT(x_norm_batch / awq_scale)  (only if any
-    //                  downstream MQ weight is present, which moe_ffn_batched_admissible
-    //                  guarantees — shared_expert.gate is always MQ4 here)
+    //                  downstream MQ weight is present)
     //
     // Pick `shared_expert.gate` as the AWQ representative (instead of
     // the previous `ffn.router`). Per the F1 imatrix scope every gate-side
@@ -8809,7 +8837,7 @@ fn prefill_moe_ffn_body_batched(
     // launch count vs back-to-back gemm_hfq*g256 (~75µs/launch × 40
     // MoE layers = ~3ms saved on R9700 A3B prefill at bs=256).
     // Per-projection dispatch: gate AND up share the same dtype (predicate
-    // enforces). MQ4 → HFQ4-layout fused kernel; MQ6 → HFQ6-layout.
+    // enforces). MQ4/MQ3/MQ6 route to their HFQ-layout fused kernels.
     match ffn.shared_expert.gate.gpu_dtype {
         DType::MQ4G256 => gpu.gemm_gate_up_hfq4g256(
             &ffn.shared_expert.gate.buf,
@@ -8823,6 +8851,17 @@ fn prefill_moe_ffn_body_batched(
             n,
         )?,
         DType::MQ6G256 => gpu.gemm_gate_up_hfq6g256(
+            &ffn.shared_expert.gate.buf,
+            &ffn.shared_expert.up.buf,
+            &pbs.x_rot_batch,
+            shared_gate,
+            shared_up,
+            ffn.shared_expert.gate.m,
+            ffn.shared_expert.up.m,
+            ffn.shared_expert.gate.k,
+            n,
+        )?,
+        DType::MQ3G256 => gpu.gemm_gate_up_hfq3g256(
             &ffn.shared_expert.gate.buf,
             &ffn.shared_expert.up.buf,
             &pbs.x_rot_batch,
@@ -8966,8 +9005,7 @@ fn prefill_moe_ffn_body_batched(
     // internally, and += sigmoid(scalar) × (W_down · rot) into
     // pbs.x_batch[token × dim + row]. (Note: HFQ4 sister uses += not
     // atomicAdd; each (bid, row) writes a unique cell.)
-    // Per-projection dispatch: MQ4 → HFQ4 kernel, MQ6 → HFQ6 sister
-    // (shipped via feat/hfq6-sigmoid-scaled-batched).
+    // Per-projection dispatch: MQ4/MQ3/MQ6 route to their HFQ-layout sisters.
     match ffn.shared_expert.down.gpu_dtype {
         DType::MQ4G256 => gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
             &ffn.shared_expert.down.buf,
@@ -8979,6 +9017,15 @@ fn prefill_moe_ffn_body_batched(
             n,
         )?,
         DType::MQ6G256 => gpu.gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched(
+            &ffn.shared_expert.down.buf,
+            shared_rot,
+            &pbs.x_batch,
+            shared_scalar,
+            ffn.shared_expert.down.m,
+            ffn.shared_expert.down.k,
+            n,
+        )?,
+        DType::MQ3G256 => gpu.gemv_hfq3g256_residual_sigmoid_scaled_gpu_batched(
             &ffn.shared_expert.down.buf,
             shared_rot,
             &pbs.x_batch,
@@ -9033,8 +9080,9 @@ fn prefill_moe_ffn_body_batched(
             _ => true,
         }
     });
-    let arch_supported = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
-    let path2_eligible = use_path2 && arch_supported;
+    let path2_required = matches!(ffn.experts[0].gate_up.gpu_dtype, DType::MQ3G256);
+    let path2_eligible = (use_path2 || path2_required)
+        && moe_grouped_gemm_supported_for_dtype(ffn.experts[0].gate_up.gpu_dtype, &gpu.arch);
     // m_total — computed during gate_up scatter, reused for down. Avoids
     // a second dtoh sync per MoE layer.
     let mut path2_m_total: usize = 0;
@@ -9082,8 +9130,8 @@ fn prefill_moe_ffn_body_batched(
         // Stage 2 grouped GEMM (gate_up). Writes Y_grouped[m_total × 2*mi] direct.
         // x_src = x_rot_batch [N × dim], x_row_div = K_TOP.
         // Per-dtype dispatch: experts uniform per layer (admit predicate
-        // enforces). MQ4 → HFQ4-layout grouped WMMA; MQ6 → HFQ6 sister
-        // (shipped via feat/hfq6-moe-grouped-wmma).
+        // enforces). MQ4/MQ3/MQ6 route to their HFQ-layout grouped WMMA
+        // sisters.
         match ffn.experts[0].gate_up.gpu_dtype {
             DType::MQ4G256 => gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
                 &ffn.expert_gate_up_ptrs,
@@ -9098,6 +9146,18 @@ fn prefill_moe_ffn_body_batched(
                 n,
             )?,
             DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
+                &ffn.expert_gate_up_ptrs,
+                tile_ids,
+                sorted,
+                &pbs.x_rot_batch,
+                y_gu_grouped,
+                2 * mi,
+                gate_up_k,
+                k_top,
+                m_total,
+                n,
+            )?,
+            DType::MQ3G256 => gpu.gemm_hfq3g256_moe_grouped_wmma(
                 &ffn.expert_gate_up_ptrs,
                 tile_ids,
                 sorted,
@@ -9208,6 +9268,17 @@ fn prefill_moe_ffn_body_batched(
         // 136 B/group; HFQ4G128/PARO: 72 B/group).
         match ffn.experts[0].gate_up.gpu_dtype {
             DType::MQ4G256 => gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                &ffn.expert_gate_up_ptrs,
+                topk_indices,
+                &pbs.x_rot_batch,
+                gate_batch,
+                up_batch,
+                2 * mi,
+                gate_up_k,
+                k_top,
+                n,
+            )?,
+            DType::MQ6G256 => gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
                 &ffn.expert_gate_up_ptrs,
                 topk_indices,
                 &pbs.x_rot_batch,
@@ -9344,6 +9415,18 @@ fn prefill_moe_ffn_body_batched(
                 m_total,
                 n * k_top,
             )?,
+            DType::MQ3G256 => gpu.gemm_hfq3g256_moe_grouped_wmma(
+                &ffn.expert_down_ptrs,
+                tile_ids,
+                sorted,
+                rot_batch,
+                y_down_grouped,
+                down_m,
+                down_k,
+                1, /* x_row_div */
+                m_total,
+                n * k_top,
+            )?,
             // Phase 4: Path 2 ParoQ4G128 down grouped-WMMA (with i8 MMQ
             // opt-in for gfx1151 — see gate_up arm above). rot_batch was
             // already Givens-rotated by paro_shared.down_* via the PARO
@@ -9424,6 +9507,16 @@ fn prefill_moe_ffn_body_batched(
             // kernel is dtype-keyed; the combine kernel is dtype-agnostic.
             match ffn.experts[0].down.gpu_dtype {
                 DType::MQ4G256 => gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                    &ffn.expert_down_ptrs,
+                    topk_indices,
+                    rot_batch,
+                    down_expanded,
+                    down_m,
+                    down_k,
+                    k_top,
+                    n,
+                )?,
+                DType::MQ6G256 => gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
                     &ffn.expert_down_ptrs,
                     topk_indices,
                     rot_batch,
@@ -12780,11 +12873,9 @@ fn forward_prefill_chunk(
                 // wo + residual. Mirrors the dense FA wo dispatch at
                 // qwen35.rs:5591-5623 — Q8 wo skips rotation (un-rotated
                 // input expected); MQ4/MQ6 wo apply FWHT(awq_scale-adjusted).
-                // MQ6 branch added alongside MQ6_ADMIT (without it, MQ6 wo
-                // bytes get fed to gemm_hfq4g256_residual which reads them
-                // as 136 B/group HFQ4 layout vs the actual 200 B/group MQ6
-                // — catastrophic stride mismatch produces a single-token
-                // attractor on AWQ A3B's 4/40 FA layers with MQ6 wo).
+                // MQ6 wo has its own branch: feeding MQ6 bytes to the MQ4
+                // residual kernel would read 200 B/group data as 136 B/group
+                // HFQ4 layout and catastrophically mis-stride.
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 // Phase 1.6 (PARO FullAttnMoe wo): own Givens rotation table,
@@ -17459,7 +17550,7 @@ pub fn forward_prefill_batch_multi(
                     && is_batchable_la(l.w_beta.gpu_dtype, arch0)
                     && is_batchable_la(l.w_alpha.gpu_dtype, arch0)
                     && is_batchable_la(l.wo.gpu_dtype, arch0)
-                    && moe_ffn_batched_admissible(&l.ffn)
+                    && moe_ffn_batched_admissible(&l.ffn, arch0)
             }
             LayerWeights::FullAttnMoe(l) => {
                 moe_topk_ok
@@ -17467,7 +17558,7 @@ pub fn forward_prefill_batch_multi(
                     && is_batchable_la(l.wk.gpu_dtype, arch0)
                     && is_batchable_la(l.wv.gpu_dtype, arch0)
                     && is_batchable_la(l.wo.gpu_dtype, arch0)
-                    && moe_ffn_batched_admissible(&l.ffn)
+                    && moe_ffn_batched_admissible(&l.ffn, arch0)
             }
         });
 
@@ -17710,36 +17801,70 @@ mod tests {
     #[test]
     fn moe_prefill_admits_mq4_as_known_good_control() {
         let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
-        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1151"
+        ));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx906"
+        ));
     }
 
     #[test]
-    fn moe_prefill_rejects_mq3_before_admission_work() {
-        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
-        dtypes.expert_gate_up = DType::MQ3G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+    fn moe_prefill_quant_matrix_documents_mq2_mq3_mq4_mq6_mq8() {
+        fn moe_body_with_q8_router(dtype: DType) -> MoePrefillDtypes {
+            let mut dtypes = MoePrefillDtypes::uniform(dtype);
+            dtypes.router = DType::Q8_0;
+            dtypes.shared_expert_scalar_gate = DType::Q8_0;
+            dtypes
+        }
 
-        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
-        dtypes.shared_expert_down = DType::MQ3G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        let cases = [
+            ("mq2", DType::MQ2G256, false),
+            ("mq3", DType::MQ3G256, true),
+            ("mq4", DType::MQ4G256, true),
+            ("mq6", DType::MQ6G256, true),
+            ("mq8", DType::MQ8G256, false),
+        ];
+
+        for (label, dtype, expected) in cases {
+            let dtypes = moe_body_with_q8_router(dtype);
+            assert_eq!(
+                moe_ffn_batched_admissible_for_dtypes(&dtypes, false, "gfx1201"),
+                expected,
+                "{label} gfx12 MoE prefill admission"
+            );
+        }
+    }
+
+    #[test]
+    fn moe_prefill_admits_mq3_only_where_grouped_wmma_exists() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ3G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1201"
+        ));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1151"
+        ));
     }
 
     #[test]
     fn moe_prefill_rejects_full_precision_until_batched_kernels_exist() {
         let dtypes = MoePrefillDtypes::uniform(DType::F16);
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false
+            &dtypes, false, "gfx1201"
         ));
 
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.router = DType::F16;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false
+            &dtypes, false, "gfx1201"
         ));
     }
 
     #[test]
-    fn moe_prefill_mq6_requires_explicit_admission() {
+    fn moe_prefill_admits_mq6_by_default() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.shared_expert_scalar_gate = DType::Q8_0;
         dtypes.shared_expert_gate = DType::MQ6G256;
@@ -17747,24 +17872,61 @@ mod tests {
         dtypes.shared_expert_down = DType::MQ6G256;
         dtypes.expert_gate_up = DType::MQ6G256;
         dtypes.expert_down = DType::MQ6G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(
-            &dtypes, false, false
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1201"
         ));
-        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1151"
+        ));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx906"
+        ));
+    }
+
+    #[test]
+    fn moe_prefill_grouped_gemm_routes_mq6_only_where_grouped_kernel_exists() {
+        assert!(moe_grouped_gemm_supported_for_dtype(
+            DType::MQ4G256,
+            "gfx1151"
+        ));
+        assert!(moe_grouped_gemm_supported_for_dtype(
+            DType::MQ4G256,
+            "gfx1201"
+        ));
+        assert!(!moe_grouped_gemm_supported_for_dtype(
+            DType::MQ6G256,
+            "gfx1151"
+        ));
+        assert!(moe_grouped_gemm_supported_for_dtype(
+            DType::MQ6G256,
+            "gfx1201"
+        ));
+        assert!(moe_grouped_gemm_supported_for_dtype(
+            DType::MQ3G256,
+            "gfx1201"
+        ));
+        assert!(!moe_grouped_gemm_supported_for_dtype(
+            DType::MQ3G256,
+            "gfx1151"
+        ));
     }
 
     #[test]
     fn moe_prefill_rejects_mismatched_routed_gate_up_and_down() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.expert_gate_up = DType::MQ6G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1201"
+        ));
     }
 
     #[test]
     fn moe_prefill_shared_gate_up_must_be_one_dtype() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.shared_expert_up = DType::MQ6G256;
-        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1201"
+        ));
     }
 
     #[test]

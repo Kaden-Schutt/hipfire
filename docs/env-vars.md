@@ -119,7 +119,6 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_MMQ_SCREEN` | MMQ | — | `crates/rdna-compute/src/dispatch.rs:633` |
 | `HIPFIRE_MMQ_SCREEN_THRESHOLD` | MMQ | — | `crates/rdna-compute/src/dispatch.rs:648` |
 | `HIPFIRE_MODEL` | DAEMON-RUNTIME | — | `cli/index.ts:1350` |
-| `HIPFIRE_MOE_MQ6_ADMIT` | KERNEL-SELECTOR | off (set to `1` for targeted MoE/MQ6 parity work) | `crates/hipfire-arch-qwen35/src/qwen35.rs` |
 | `HIPFIRE_MW16` | LIB | — | `crates/rdna-compute/src/dispatch.rs:7332` |
 | `HIPFIRE_NGRAM_LOOP_THRESHOLD` | NGRAM-DETECTOR | — | `crates/hipfire-runtime/src/loop_guard.rs:47` |
 | `HIPFIRE_NGRAM_WINDOW` | NGRAM-DETECTOR | — | `crates/hipfire-runtime/src/loop_guard.rs:49` |
@@ -217,7 +216,6 @@ Hot-path kernel choice levers. **All silent today.** Power users who tune for sp
 - `HIPFIRE_LLOYD_GFX12=1` — opt-in dispatch of Lloyd-MQ3 WMMA kernels on gfx12 (RDNA4) inside `is_batchable_la`. Default off because the gfx12 sibling kernels ship code-complete but runtime-unvalidated locally; gfx12 reviewers set this to exercise parity / coherence-gate on RDNA4. Once external CI confirms gfx12 parity, the gate can be dropped or default-flipped. Ships with PR #195 (MQ3-Lloyd WMMA prefill).
 - `HIPFIRE_LM_HEAD_F16` — qt=1 lm_head storage shim. Default `auto`/`native` keeps raw F16 and routes through the native F16 dispatch path; `f32`/`fp32`/`legacy` expands to F32 at load time.
 - `HIPFIRE_LM_HEAD_WMMA` — lm_head dispatch lever.
-- `HIPFIRE_MOE_MQ6_ADMIT` — opt into the MoE/A3B MQ6 batched prefill dispatch for targeted parity work. Default off; MQ4 remains the production control until MQ6 shared batched-prefill parity is proven.
 - `HIPFIRE_PARO_LA_GATES_MQ4G128` — opt-in MQ4G128 encoding of `linear_attn.in_proj_a`/`in_proj_b` weights at load time, dispatching them through `gemv_mq4g128_prerotated` instead of the F32 fallback. Set to `1` to enable; default off on all archs pending fused rotation-GEMV kernel (see `docs/superpowers/specs/2026-05-22-lever1-fused-mq4g128-design.md`). Background: kernel + dispatch + codec are correct end-to-end (round-trip + smoke verified), but un-fused two-launch chain costs more than the F32 single-launch baseline at M=16 — bench on 2026-05-22 measured −0.5% decode tok/s. The default flips back on once the fused kernel ships and reaches ≥+5%.
 - `HIPFIRE_RDNA2_VARIANT` — RDNA2 (gfx10x0) variant override. Plumbed via TUI + `cfg.rdna2_variant`.
 - `HIPFIRE_ROCBLAS_ALL_ARCHS`, `HIPFIRE_ROCBLAS_MIN_BATCH`, `HIPFIRE_ROCBLAS_OFF` — rocBLAS dispatch gates.

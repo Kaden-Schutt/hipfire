@@ -47,6 +47,18 @@ fn main() {
         }
     }
 
+    fn is_bf16_artifact_path(path: &str) -> bool {
+        Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| {
+                s.to_ascii_lowercase()
+                    .split(|c| matches!(c, '-' | '_' | '.'))
+                    .any(|part| part == "bf16")
+            })
+            .unwrap_or(false)
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: run <model.hfq> [--draft-model <path>] [--system \"prompt\"] [--kv givens4|givens2] [--temp F] [--max-seq N] [--fp32-state|--q8-state|--q4-state]");
@@ -110,20 +122,42 @@ fn main() {
         }
         i += 1;
     }
+    if is_bf16_artifact_path(model_path) {
+        if kv_mode_str != "fp32" {
+            eprintln!("BF16 artifact detected: forcing KV cache to fp32");
+        }
+        kv_mode_str = "fp32".to_string();
+        state_quant = qwen35::StateQuant::FP32;
+    }
 
     // Load model
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     eprintln!("Loading {}...", model_path);
 
     use hipfire_arch_qwen35::speculative::{KvMode, ModelSlot, ModelSlotConfig};
+    fn parse_kv_mode(mode: &str) -> KvMode {
+        match mode {
+            "fp32" | "f32" => KvMode::Fp32,
+            "q8" | "" => KvMode::Q8,
+            "asym4" | "turbo4" => KvMode::Asym4,
+            "asym3" | "turbo3" | "turbo" => KvMode::Asym3,
+            "asym2" | "turbo2" => KvMode::Asym2,
+            "fwht4" => KvMode::Fwht4,
+            "fwht3" => KvMode::Fwht3,
+            "fwht2" => KvMode::Fwht2,
+            other => {
+                panic!("unknown --kv {other}; expected fp32|q8|asym4|asym3|asym2|fwht4|fwht3|fwht2")
+            }
+        }
+    }
     match state_quant {
         qwen35::StateQuant::FP32 => eprintln!("DeltaNet state: FP32"),
         qwen35::StateQuant::Q8 => eprintln!("DeltaNet state: Q8"),
         qwen35::StateQuant::Q4 => eprintln!("DeltaNet state: Q4 (half VRAM vs Q8)"),
     }
     warn_tiny_model_state(model_path, state_quant);
-    eprintln!("KV cache: {kv_mode_str}");
-    let target_kv_mode = KvMode::Q8;
+    let target_kv_mode = parse_kv_mode(&kv_mode_str);
+    eprintln!("KV cache: {kv_mode_str} ({target_kv_mode:?})");
     let target_cfg = ModelSlotConfig {
         max_seq,
         kv_mode: target_kv_mode,

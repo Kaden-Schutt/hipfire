@@ -196,15 +196,13 @@ This file holds the *testing playbook* — how to verify v0.1.9-alpha
 works, what to measure, what counts as pass/fail.
 
 **v0.2.0-era default behavior to be aware of:**
-- **MQ4 remains the MoE/A3B correctness control.** Do not admit MQ3 or
-  MQ6 MoE/A3B paths to production on benchmark evidence alone; keep MQ4
-  parity as the reference until shared batched-prefill tests are stable.
+- **MQ4 remains the MoE/A3B correctness control.** MQ6 MoE/A3B batched
+  prefill is admitted by default, but MQ4 parity remains the reference
+  until shared batched-prefill tests are stable.
 - **MQ3 dense paths are production on validated RDNA arches, but MQ3
   inside MoE/A3B is still guarded.** The shared batched MoE prefill path
   has format-specific stride assumptions; add explicit gate/up and
   shared-expert-down parity before broadening admission.
-- **MQ6 MoE/A3B is opt-in for investigation.** Use
-  `HIPFIRE_MOE_MQ6_ADMIT=1` only for targeted parity work.
 - **`dflash_mode=off` remains the default.** Any test exercising DFlash
   still needs `hipfire config set dflash_mode auto` or
   `HIPFIRE_DFLASH_DRAFT=<path>` first.

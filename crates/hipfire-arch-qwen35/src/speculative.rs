@@ -338,6 +338,8 @@ pub fn reset_ddtree_meta_stats() {
 /// Which KV cache layout to use when allocating a slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KvMode {
+    /// Unquantized FP32 K/V cache. Gold-path verification only.
+    Fp32,
     /// INT8 co-located K and V (default).
     Q8,
     /// Asym4: rotated 4-bit K + Q8 V (smaller than Q8, higher-fidelity than asym3).
@@ -447,6 +449,13 @@ impl ModelSlot {
         // backwards-compat, but DFlash verify is KV-bandwidth sensitive at
         // longer contexts — asym3/asym4 cut the verify attention cost.
         let kv_cache = match slot_config.kv_mode {
+            KvMode::Fp32 => KvCache::new_gpu_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
             KvMode::Q8 => KvCache::new_gpu_q8_filtered(
                 gpu,
                 &is_kv_layer,
