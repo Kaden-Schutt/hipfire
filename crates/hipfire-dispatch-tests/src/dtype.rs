@@ -149,3 +149,14 @@ fn rotation_tag_distinguishes_awq_and_batched() {
     assert_ne!(base, bat, "batched vs non-batched must not compare equal");
     assert_eq!(base, RotationTag { plan: RotationPlan::FwhtG256, awq: false, batched: false });
 }
+
+#[test]
+fn rotate_variant_selection() {
+    use hipfire_dispatch::families::gemv::select_rotation_variant;
+    use hipfire_dispatch::types::{RotationPlan, RotationVariant};
+    assert_eq!(select_rotation_variant(RotationPlan::FwhtG256, false, false), RotationVariant::Plain);
+    assert_eq!(select_rotation_variant(RotationPlan::FwhtG256, true,  false), RotationVariant::WithRmsnorm);
+    assert_eq!(select_rotation_variant(RotationPlan::FwhtG256, false, true),  RotationVariant::WithSwiGLU);
+    assert_eq!(select_rotation_variant(RotationPlan::FwhtG128, false, false), RotationVariant::PlainG128);
+    assert_eq!(select_rotation_variant(RotationPlan::Givens,   false, false), RotationVariant::Givens);
+}

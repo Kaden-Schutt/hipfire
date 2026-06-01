@@ -10,6 +10,7 @@
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
+use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::pipeline::{PipelineParams, dispatch_fused};
 use crate::tables::gemv_table;
 use crate::tables::KernelRegistry;
@@ -112,15 +113,39 @@ impl Default for RotateInputs<'_> {
 
 // ── Family ─────────────────────────────────────────────
 
+/// Pure selection of the RotationFamily variant from the sign-domain plan
+/// and the caller's fusion intent. AWQ/batched are NOT part of this — they
+/// are derived inside RotationFamily from awq_scale/batch_size.
+pub fn select_rotation_variant(plan: RotationPlan, has_norm: bool, has_swiglu: bool)
+    -> RotationVariant
+{
+    match plan {
+        RotationPlan::FwhtG128 => RotationVariant::PlainG128,
+        RotationPlan::Givens   => RotationVariant::Givens,
+        RotationPlan::Mq8Internal => {
+            if has_norm { RotationVariant::WithRmsnorm }
+            else { RotationVariant::Plain }
+        }
+        // FwhtG256 shares the fusion axis.
+        _ => {
+            if has_swiglu { RotationVariant::WithSwiGLU }
+            else if has_norm { RotationVariant::WithRmsnorm }
+            else { RotationVariant::Plain }
+        }
+    }
+}
+
 pub struct GemvFamily {
     registry: KernelRegistry,
+    rotation: RotationFamily,
 }
 
 impl GemvFamily {
     pub fn new() -> Self {
         let registry = KernelRegistry::new();
         gemv_table::populate(&registry);
-        Self { registry }
+        let rotation = RotationFamily::new();
+        Self { registry, rotation }
     }
 
     pub fn registry(&self) -> &KernelRegistry {
@@ -212,11 +237,89 @@ impl GemvFamily {
             GemvVariant::WithSwiGLUResidual => dispatch_swiglu_residual(gpu, params),
         }
     }
+
+    /// Rotate an activation vector through RotationFamily. Returns a typed
+    /// RotatedActivation handle whose tag encodes the plan, awq, and batching.
+    pub fn rotate(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        w: &WeightRef,
+        x: &GpuTensor,
+        inputs: &RotateInputs,
+    ) -> Result<RotatedActivation, DispatchError> {
+        let plan = crate::types::dtype_rotation_plan(w.dtype);
+        if plan == RotationPlan::None {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "gemv", variant: "rotate-none", arch: "", quant: "",
+            });
+        }
+        let variant = select_rotation_variant(
+            plan, inputs.norm_weight.is_some(), inputs.swiglu_up.is_some(),
+        );
+        let (x_rot, awq, batched) = prepare_rotation_scratch(gpu, w, inputs)?;
+        let g = w.rotation.as_ref();
+        self.rotation.run(ctx, gpu, RotationParams {
+            x,
+            x_up: inputs.swiglu_up,
+            w_norm: inputs.norm_weight,
+            x_plain: &x_rot,
+            x_rot: &x_rot,
+            awq_scale: w.awq_scale,
+            k: w.k,
+            eps: inputs.eps,
+            batch_size: inputs.batch_size,
+            variant,
+            givens_pairs: g.map(|g| g.pairs),
+            givens_theta: g.map(|g| g.theta),
+            givens_scales: g.map(|g| g.scales),
+            givens_krot: g.map(|g| g.krot),
+        }).map_err(|e| DispatchError::Hip(e.to_string()))?;
+        Ok(RotatedActivation {
+            x_rot,
+            tag: RotationTag { plan, awq, batched },
+        })
+    }
 }
 
 impl KernelFamily for GemvFamily {
     fn name(&self) -> &'static str {
         "gemv"
+    }
+}
+
+// ── Rotation scratch prep (shared by rotate() + legacy callers) ─
+
+fn prepare_rotation_scratch(
+    gpu: &mut Gpu, w: &WeightRef, inputs: &RotateInputs,
+) -> Result<(GpuTensor, bool, bool), DispatchError> {
+    let plan = crate::types::dtype_rotation_plan(w.dtype);
+    let awq = w.awq_scale.is_some();
+    let batched = inputs.batch_size > 1;
+    let mq = |gpu: &mut Gpu| -> Result<GpuTensor, DispatchError> {
+        let buf = unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() };
+        let size = gpu.mq_x_rot.as_ref().unwrap().buf.size();
+        Ok(GpuTensor { buf, shape: vec![size / 4], dtype: DType::F32 })
+    };
+    match plan {
+        RotationPlan::FwhtG256 | RotationPlan::Mq8Internal => {
+            gpu.ensure_mq_signs().map_err(|e| DispatchError::Hip(e.to_string()))?;
+            Ok((mq(gpu)?, awq, batched))
+        }
+        RotationPlan::FwhtG128 => {
+            gpu.ensure_mq_signs_128().map_err(|e| DispatchError::Hip(e.to_string()))?;
+            Ok((mq(gpu)?, awq, batched))
+        }
+        RotationPlan::Givens => {
+            gpu.ensure_paro_scratch(w.k).map_err(|e| DispatchError::Hip(e.to_string()))?;
+            Ok((GpuTensor {
+                buf: unsafe { gpu.paro_x_scratch.as_ref().unwrap().buf.alias() },
+                shape: vec![w.k], dtype: DType::F32,
+            }, awq, batched))
+        }
+        RotationPlan::None => Err(DispatchError::UnsupportedVariant {
+            family: "gemv", variant: "rotate-none", arch: "", quant: "",
+        }),
     }
 }
 
