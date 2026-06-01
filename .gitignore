@@ -1,5 +1,6 @@
 # Build output (not binaries shipped in releases)
 /target
+/target-baseline
 *.o
 *.so
 *.triattn.bin

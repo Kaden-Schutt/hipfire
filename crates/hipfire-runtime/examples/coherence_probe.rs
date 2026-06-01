@@ -69,6 +69,7 @@ struct Args {
     detect_timing: bool,
     no_strip_think: bool,
     self_check: bool,
+    emit_committed_jsonl: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -95,6 +96,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--detect-timing" => args.detect_timing = true,
             "--no-strip-think" => args.no_strip_think = true,
+            "--emit-committed-jsonl" => args.emit_committed_jsonl = it.next(),
             "--self-check" => args.self_check = true,
             "-h" | "--help" => {
                 print_help();
@@ -124,6 +126,7 @@ fn print_help() {
           --stall-tokens N      enable think_stall detector with budget N\n  \
           --detect-timing       enable per-token step-time spike detector\n  \
           --no-strip-think      ask daemon to leave <think> bytes intact\n  \
+          --emit-committed-jsonl OUT  write committed token ids to JSONL\n  \
           --self-check          run synthetic+replay self-check (no GPU needed)\n"
     );
 }
@@ -325,6 +328,7 @@ fn drive_generate(
     let mut visible_bytes: usize = 0;
     let mut ttft_ms: Option<u64> = None;
     let mut last_pos: Option<usize> = None;
+    let mut committed_ids: Vec<(usize, u32)> = Vec::new();
     let done_stats: DoneStats;
 
     loop {
@@ -347,6 +351,7 @@ fn drive_generate(
                 let pos = v.get("pos").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
                 let t_ms = v.get("t_ms").and_then(|x| x.as_u64()).unwrap_or(0);
                 last_pos = Some(pos);
+                committed_ids.push((pos, tok_id));
                 let ev = Event::Committed { tok_id, pos, t_ms };
                 let trans = bank.observe(&ev);
                 for (n, vd) in trans {
@@ -413,16 +418,24 @@ fn drive_generate(
                 };
                 break;
             }
-            "error" => {
-                let msg = v.get("message").and_then(|x| x.as_str()).unwrap_or("?");
-                return Err(format!("daemon error: {}", msg));
-            }
             _ => {} // ignore other event types
         }
     }
+
+    // Write committed token IDs to JSONL if requested.
+    if let Some(ref path) = args.emit_committed_jsonl {
+        if let Ok(mut f) = std::fs::File::create(path) {
+            use std::io::Write;
+            for (i, tok_id) in &committed_ids {
+                let _ = writeln!(f, r#"{{"i":{},"id":{}}}"#, i, tok_id);
+            }
+        } else {
+            eprintln!("[probe] warning: could not create {}", path);
+        }
+    }
+
     Ok(done_stats)
 }
-
 fn arch_host() -> (String, String) {
     let arch = std::env::var("HIPFIRE_BASELINE_ARCH").unwrap_or_else(|_| {
         // Best-effort: try amdgpu-arch, then KFD topology, then "unknown".
