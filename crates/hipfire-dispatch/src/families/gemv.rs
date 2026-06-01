@@ -196,6 +196,7 @@ fn dispatch_plain(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchErro
         HFP4G32 => hip!(gpu.gemv_hfp4g32(w.buf, x, y, m, k)),
         Q4F16G64 => hip!(gpu.gemv_q4f16_g64(w.buf, x, y, m, k)),
         Q4F16G32 => hip!(gpu.gemv_q4f16_g32(w.buf, x, y, m, k)),
+        Q8HFQ => hip!(gpu.gemv_q8hfq(w.buf, x, y, m, k, w.row_stride)),
         // ParoQ4G128: weights are HFQ4G128 data; caller has already applied Givens
         // rotation to x, so dispatch to the plain HFQ4G128 GEMV kernel.
         ParoQ4G128 => hip!(gpu.gemv_hfq4g128(w.buf, x, y, m, k)),
