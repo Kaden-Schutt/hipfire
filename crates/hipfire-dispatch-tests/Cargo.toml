@@ -11,4 +11,5 @@ hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch", optional = true }
 
 [features]
+default = ["new-dispatch"]
 new-dispatch = ["hipfire-dispatch", "hipfire-runtime/new-dispatch"]
