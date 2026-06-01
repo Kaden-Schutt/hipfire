@@ -52,6 +52,9 @@ fn main() {
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
 
+    let _gemv = llama::gemv_family();
+    let _ctx = llama::DispatchCtx::new(&mut gpu);
+
     // Allocate persistent buffers
     let x = gpu.alloc_tensor(&[dim], DType::F32).unwrap();
     let tmp = gpu.alloc_tensor(&[dim], DType::F32).unwrap();
@@ -81,19 +84,19 @@ fn main() {
     // 2. QKV GEMV
     let qkv = gpu.alloc_tensor(&[qkv_dim], DType::F32).unwrap();
     timed!("qkv_gemv", {
-        llama::weight_gemv(&mut gpu, &layer.wqkv, &tmp, &qkv).unwrap();
+        _gemv.run_auto(&_ctx, &mut gpu, &layer.wqkv.dispatch_ref(), &tmp, &qkv).unwrap();
     });
 
     // 3. Z GEMV
     let z = gpu.alloc_tensor(&[d_inner], DType::F32).unwrap();
     timed!("z_gemv", {
-        llama::weight_gemv(&mut gpu, &layer.wz, &tmp, &z).unwrap();
+        _gemv.run_auto(&_ctx, &mut gpu, &layer.wz.dispatch_ref(), &tmp, &z).unwrap();
     });
 
     // 4. Beta GEMV + sigmoid
     let beta_out = gpu.alloc_tensor(&[n_v_heads], DType::F32).unwrap();
     timed!("beta_gemv", {
-        llama::weight_gemv(&mut gpu, &layer.w_beta, &tmp, &beta_out).unwrap();
+        _gemv.run_auto(&_ctx, &mut gpu, &layer.w_beta.dispatch_ref(), &tmp, &beta_out).unwrap();
     });
     timed!("sigmoid", {
         gpu.sigmoid_f32(&beta_out).unwrap();
@@ -102,7 +105,7 @@ fn main() {
     // 5. Alpha GEMV + GPU gate compute
     let alpha_out = gpu.alloc_tensor(&[n_v_heads], DType::F32).unwrap();
     timed!("alpha_gemv", {
-        llama::weight_gemv(&mut gpu, &layer.w_alpha, &tmp, &alpha_out).unwrap();
+        _gemv.run_auto(&_ctx, &mut gpu, &layer.w_alpha.dispatch_ref(), &tmp, &alpha_out).unwrap();
     });
     timed!("alpha_gate_gpu", {
         gpu.alpha_gate_f32(&alpha_out, &layer.dt_bias, &layer.a_log, n_v_heads).unwrap();
@@ -158,7 +161,7 @@ fn main() {
     // 13. Output GEMV
     let o = gpu.alloc_tensor(&[dim], DType::F32).unwrap();
     timed!("out_gemv", {
-        llama::weight_gemv(&mut gpu, &layer.wo, &normed_out, &o).unwrap();
+        _gemv.run_auto(&_ctx, &mut gpu, &layer.wo.dispatch_ref(), &normed_out, &o).unwrap();
     });
 
     // 14. Residual add
@@ -173,10 +176,10 @@ fn main() {
     let gate_buf = gpu.alloc_tensor(&[config.hidden_dim], DType::F32).unwrap();
     let up_buf = gpu.alloc_tensor(&[config.hidden_dim], DType::F32).unwrap();
     timed!("ffn_gate_gemv", {
-        llama::weight_gemv(&mut gpu, &layer.w_gate, &tmp, &gate_buf).unwrap();
+        _gemv.run_auto(&_ctx, &mut gpu, &layer.w_gate.dispatch_ref(), &tmp, &gate_buf).unwrap();
     });
     timed!("ffn_up_gemv", {
-        llama::weight_gemv(&mut gpu, &layer.w_up, &tmp, &up_buf).unwrap();
+        _gemv.run_auto(&_ctx, &mut gpu, &layer.w_up.dispatch_ref(), &tmp, &up_buf).unwrap();
     });
     let ffn_h = gpu.alloc_tensor(&[config.hidden_dim], DType::F32).unwrap();
     timed!("silu_mul", {
@@ -184,7 +187,7 @@ fn main() {
     });
     let ffn_out = gpu.alloc_tensor(&[dim], DType::F32).unwrap();
     timed!("ffn_down_gemv", {
-        llama::weight_gemv(&mut gpu, &layer.w_down, &ffn_h, &ffn_out).unwrap();
+        _gemv.run_auto(&_ctx, &mut gpu, &layer.w_down.dispatch_ref(), &ffn_h, &ffn_out).unwrap();
     });
 
     // Print results

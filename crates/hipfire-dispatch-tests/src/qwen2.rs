@@ -25,6 +25,6 @@ fn qwen2_no_qk_norm_dispatch() {
 #[test]
 fn qwen2_attention_bias_dispatch() {
     // Qwen2 has attention_bias=true on Q/K/V projections.
-    // This adds bias_add_f32 calls after each weight_gemv.
+    // This adds bias_add_f32 calls after each GEMV.
     // The bias add is a separate kernel launch, not fused.
 }

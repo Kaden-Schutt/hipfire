@@ -567,14 +567,16 @@ impl WeightTensor {
 }
 
 #[cfg(feature = "new-dispatch")]
-pub(crate) fn gemv_family() -> &'static hipfire_dispatch::families::gemv::GemvFamily {
+pub fn gemv_family() -> &'static hipfire_dispatch::families::gemv::GemvFamily {
     use std::sync::OnceLock;
     static GEMV: OnceLock<hipfire_dispatch::families::gemv::GemvFamily> = OnceLock::new();
     GEMV.get_or_init(hipfire_dispatch::families::gemv::GemvFamily::new)
 }
 
 #[cfg(feature = "new-dispatch")]
-pub use hipfire_dispatch::families::gemv::{RotInput, RotateInputs};
+pub use hipfire_dispatch::families::gemv::{RotInput, RotateInputs, RotatedActivation};
+#[cfg(feature = "new-dispatch")]
+pub use hipfire_dispatch::context::DispatchCtx;
 #[cfg(feature = "new-dispatch")]
 pub use hipfire_dispatch::types::{GemvVariant, dtype_post_rotation_variant, dtype_rotation_plan};
 

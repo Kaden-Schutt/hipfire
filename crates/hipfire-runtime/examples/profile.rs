@@ -67,7 +67,7 @@ fn main() {
     let q = gpu.zeros(&[q_dim], rdna_compute::DType::F32).unwrap();
     let t = Instant::now();
     for _ in 0..100 {
-        llama::weight_gemv(&mut gpu, &weights.layers[0].wq, &tmp, &q).unwrap();
+        llama::gemv_family().run_auto(&llama::DispatchCtx::new(&mut gpu), &mut gpu, &weights.layers[0].wq.dispatch_ref(), &tmp, &q).unwrap();
     }
     let gemv_ms = t.elapsed().as_secs_f64() * 1000.0 / 100.0;
     eprintln!("Single GEMV wq ({}x{}): {:.2}ms", q_dim, dim, gemv_ms);

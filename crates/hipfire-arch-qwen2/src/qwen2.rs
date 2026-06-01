@@ -29,7 +29,7 @@
 
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, weight_gemv, weight_gemm, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::llama::{f16_to_f32, gemv_family, weight_gemm, DispatchCtx, EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
@@ -810,6 +810,9 @@ fn forward_step_after_x(
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
 
+    let gemv = gemv_family();
+    let ctx = DispatchCtx::new(gpu);
+
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer = &weights.layers[layer_idx];
 
@@ -832,9 +835,9 @@ fn forward_step_after_x(
                 layer.wq.k,
             )?;
         } else {
-            weight_gemv(gpu, &layer.wq, &state.tmp, &state.q)?;
-            weight_gemv(gpu, &layer.wk, &state.tmp, &state.k)?;
-            weight_gemv(gpu, &layer.wv, &state.tmp, &state.v)?;
+            gemv.run_auto(&ctx, gpu, &layer.wq.dispatch_ref(), &state.tmp, &state.q).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            gemv.run_auto(&ctx, gpu, &layer.wk.dispatch_ref(), &state.tmp, &state.k).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            gemv.run_auto(&ctx, gpu, &layer.wv.dispatch_ref(), &state.tmp, &state.v).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         }
 
         // (3) QKV bias. attention_bias=true on Qwen2 — three small adds
@@ -895,17 +898,17 @@ fn forward_step_after_x(
         }
 
         // (7) o_proj (no bias) + (8) residual.
-        weight_gemv(gpu, &layer.wo, &state.attn_out, &state.o)?;
+        gemv.run_auto(&ctx, gpu, &layer.wo.dispatch_ref(), &state.attn_out, &state.o).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         gpu.add_inplace_f32(&state.x, &state.o)?;
 
         // (9) FFN norm.
         gpu.rmsnorm_f32(&state.x, &layer.ffn_norm, &state.tmp, cfg.rms_norm_eps)?;
 
         // (10) SwiGLU: gate = silu(w_gate(x)) * w_up(x); down(...).
-        weight_gemv(gpu, &layer.w_gate, &state.tmp, &state.gate)?;
-        weight_gemv(gpu, &layer.w_up, &state.tmp, &state.up)?;
+        gemv.run_auto(&ctx, gpu, &layer.w_gate.dispatch_ref(), &state.tmp, &state.gate).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        gemv.run_auto(&ctx, gpu, &layer.w_up.dispatch_ref(), &state.tmp, &state.up).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         gpu.silu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
-        weight_gemv(gpu, &layer.w_down, &state.ffn_hidden, &state.ffn_out)?;
+        gemv.run_auto(&ctx, gpu, &layer.w_down.dispatch_ref(), &state.ffn_hidden, &state.ffn_out).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
         // (11) Residual.
         gpu.add_inplace_f32(&state.x, &state.ffn_out)?;
@@ -913,7 +916,7 @@ fn forward_step_after_x(
 
     // Final RMSNorm + lm_head.
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
-    weight_gemv(gpu, &weights.output, &state.tmp, &state.logits)?;
+    gemv.run_auto(&ctx, gpu, &weights.output.dispatch_ref(), &state.tmp, &state.logits).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
     state.next_pos = pos + 1;
     Ok(())
@@ -963,6 +966,9 @@ pub fn forward_prefill_batch_embeds(
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
     let hidden_dim = cfg.intermediate_size;
+
+    let gemv = gemv_family();
+    let ctx = DispatchCtx::new(gpu);
 
     assert_eq!(embeds.len() % dim, 0,
         "forward_prefill_batch_embeds: embeds.len()={} not a multiple of dim={dim}", embeds.len());
@@ -1066,7 +1072,7 @@ pub fn forward_prefill_batch_embeds(
     let last_off = (batch - 1) * dim * 4;
     gpu.hip.memcpy_dtod_at(&state.x.buf, 0, &x_batch.buf, last_off, dim * 4)?;
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
-    weight_gemv(gpu, &weights.output, &state.tmp, &state.logits)?;
+    gemv.run_auto(&ctx, gpu, &weights.output.dispatch_ref(), &state.tmp, &state.logits).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
     state.next_pos = base + batch;
 
