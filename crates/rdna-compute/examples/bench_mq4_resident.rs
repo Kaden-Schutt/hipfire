@@ -129,7 +129,8 @@ fn run_one(
     y: &GpuTensor,
 ) -> (f32, f64, f32, f64) {
     let hfq4_us = time_us(gpu, shape.iters, |gpu| {
-        gpu.gemv_hfq4g256(hfq4, x, y, shape.m, shape.k).unwrap();
+        gpu.gemv_mq4g256_prerotated(hfq4, x, y, shape.m, shape.k)
+            .unwrap();
     });
     let lloyd_us = time_us(gpu, shape.iters, |gpu| {
         gpu.gemv_mq4g256_lloyd(lloyd, x, y, shape.m, shape.k)
