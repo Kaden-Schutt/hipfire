@@ -40,6 +40,9 @@ fn weight_ref<'a>(w: &'a GpuTensor, m: usize, k: usize) -> WeightRef<'a> {
         dtype: w.dtype,
         m,
         k,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
     }
 }
 

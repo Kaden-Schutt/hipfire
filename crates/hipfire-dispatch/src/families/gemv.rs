@@ -18,12 +18,25 @@ use crate::types::*;
 
 // ── Lightweight weight descriptor ──────────────────────
 
-/// Minimal weight reference for dispatch. Carries buffer, dtype, and shape.
+/// Givens rotation metadata for ParoQuant weights (mirrors ParoRotation
+/// fields, which are all rdna_compute::GpuTensor — no circular dep).
+pub struct GivensRef<'a> {
+    pub pairs: &'a GpuTensor,
+    pub theta: &'a GpuTensor,
+    pub scales: &'a GpuTensor,
+    pub krot: usize,
+}
+
+/// Minimal weight reference for dispatch. Carries buffer, dtype, shape,
+/// the padded row stride (Q8HFQ), and rotation metadata.
 pub struct WeightRef<'a> {
     pub buf: &'a GpuTensor,
     pub dtype: DType,
     pub m: usize,
     pub k: usize,
+    pub row_stride: usize,
+    pub rotation: Option<GivensRef<'a>>,
+    pub awq_scale: Option<&'a GpuTensor>,
 }
 
 // ── Dispatch parameters ────────────────────────────────

@@ -619,7 +619,7 @@ pub fn weight_gemv(
     static GEMV: OnceLock<GemvFamily> = OnceLock::new();
     let gemv = GEMV.get_or_init(|| GemvFamily::new());
     let ctx = DispatchCtx::new(gpu);
-    let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k };
+    let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
 
     if !dtype_needs_fwht(w.gpu_dtype) {
         return gemv.run_auto(&ctx, gpu, &wr, x, y)
@@ -1127,21 +1127,21 @@ pub fn weight_gemv_prerotated(
 
     if w.gpu_dtype == DType::MQ8G256 {
         gpu.ensure_mq_signs()?;
-        let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k };
+        let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
         return gemv.run_auto(&ctx, gpu, &wr, x, y)
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
     }
 
     if dtype_needs_fwht(w.gpu_dtype) {
         if let Some(xr) = x_rot {
-            let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k };
+            let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
             return gemv.run_auto(&ctx, gpu, &wr, xr, y)
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
         }
         return weight_gemv(gpu, w, x, y);
     }
 
-    let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k };
+    let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
     gemv.run_auto(&ctx, gpu, &wr, x, y)
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
 }
@@ -1242,7 +1242,7 @@ pub fn weight_gemv_residual(
     static GEMV: OnceLock<GemvFamily> = OnceLock::new();
     let gemv = GEMV.get_or_init(|| GemvFamily::new());
     let ctx = DispatchCtx::new(gpu);
-    let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k };
+    let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
 
     match w.gpu_dtype {
         DType::HFQ4G256 | DType::HFQ3G256 | DType::HFQ6G256 => {
@@ -1381,7 +1381,7 @@ pub fn weight_gemv_swiglu_residual(
     static GEMV: OnceLock<GemvFamily> = OnceLock::new();
     let gemv = GEMV.get_or_init(|| GemvFamily::new());
     let ctx = DispatchCtx::new(gpu);
-    let wr = WeightRef { buf: &w_down.buf, dtype: w_down.gpu_dtype, m: w_down.m, k: w_down.k };
+    let wr = WeightRef { buf: &w_down.buf, dtype: w_down.gpu_dtype, m: w_down.m, k: w_down.k, row_stride: 0, rotation: None, awq_scale: None };
 
     match w_down.gpu_dtype {
         DType::MQ4G256 | DType::MQ3G256 | DType::MQ6G256
