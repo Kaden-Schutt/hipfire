@@ -50,13 +50,14 @@ impl GemmFamily {
         &self,
         dtype: DType,
         ctx: &DispatchCtx,
-    ) -> Result<KernelKey, DispatchError> {
+        shape: Option<&ShapeInfo>,
+    ) -> Result<&KernelVariant, DispatchError> {
         let key = match dtype {
             DType::F32 => KernelKey::GemmF32RegisterTiled,
             DType::F16 => KernelKey::GemmF16XF16Wmma,
             DType::Q8_0 => {
                 let preferred = KernelKey::GemmQ8_0Wmma;
-                if self.registry.resolve(preferred, ctx, None).is_ok() {
+                if self.registry.resolve(preferred, ctx, shape).is_ok() {
                     preferred
                 } else {
                     KernelKey::GemmQ8_0BatchedChunked
@@ -64,7 +65,7 @@ impl GemmFamily {
             }
             DType::HFQ4G256 => {
                 let preferred = KernelKey::GemmHfq4G256Wmma;
-                if self.registry.resolve(preferred, ctx, None).is_ok() {
+                if self.registry.resolve(preferred, ctx, shape).is_ok() {
                     preferred
                 } else {
                     KernelKey::GemmHfq4G256
@@ -78,7 +79,7 @@ impl GemmFamily {
                 })
             }
         };
-        self.registry.resolve(key, ctx, None)
+        self.registry.resolve(key, ctx, shape)
     }
 
     /// Run a GEMM operation.
@@ -91,7 +92,7 @@ impl GemmFamily {
         gpu: &mut Gpu,
         params: &GemmParams,
     ) -> Result<(), DispatchError> {
-        let _resolved = self.resolve(params.w.dtype, ctx)?;
+        let _resolved = self.resolve(params.w.dtype, ctx, None)?;
 
         let w = params.w;
         let x = params.x;

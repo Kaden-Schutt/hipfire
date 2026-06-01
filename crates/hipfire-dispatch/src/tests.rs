@@ -165,7 +165,7 @@ fn registry_resolve_happy_path() {
     let mut reg = KernelRegistry::new();
     reg.register(always_variant(KernelKey::GemvF32));
     let ctx = ctx_rdna1();
-    assert_eq!(reg.resolve(KernelKey::GemvF32, &ctx, None).unwrap(), KernelKey::GemvF32);
+    assert_eq!(reg.resolve(KernelKey::GemvF32, &ctx, None).unwrap().key, KernelKey::GemvF32);
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn registry_resolve_arch_gate_passes_on_capable_arch() {
     reg.register(wmma_variant(KernelKey::GemmHfq4G256Wmma));
     let ctx = ctx_rdna3(); // has WMMA w32
     assert_eq!(
-        reg.resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None).unwrap(),
+        reg.resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None).unwrap().key,
         KernelKey::GemmHfq4G256Wmma,
     );
 }
@@ -205,7 +205,7 @@ fn registry_resolve_falls_through_to_second_variant() {
     reg.register(always_variant(KernelKey::GemmHfq4G256Wmma));
     let ctx = ctx_rdna1();
     assert_eq!(
-        reg.resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None).unwrap(),
+        reg.resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None).unwrap().key,
         KernelKey::GemmHfq4G256Wmma,
     );
 }
@@ -222,7 +222,7 @@ fn registry_resolve_shape_gate_passes_when_shape_matches() {
     });
     let ctx = ctx_rdna1();
     let shape = ShapeInfo { head_dim: 128, ..Default::default() };
-    assert_eq!(reg.resolve(KernelKey::AttnF32, &ctx, Some(&shape)).unwrap(), KernelKey::AttnF32);
+    assert_eq!(reg.resolve(KernelKey::AttnF32, &ctx, Some(&shape)).unwrap().key, KernelKey::AttnF32);
 }
 
 #[test]
@@ -253,7 +253,7 @@ fn registry_resolve_shape_none_bypasses_shape_gate() {
         has_awq: false,
     });
     let ctx = ctx_rdna1();
-    assert_eq!(reg.resolve(KernelKey::AttnF32, &ctx, None).unwrap(), KernelKey::AttnF32);
+    assert_eq!(reg.resolve(KernelKey::AttnF32, &ctx, None).unwrap().key, KernelKey::AttnF32);
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn registry_resolve_shape_gate_fallback_to_ungated_variant() {
     reg.register(always_variant(KernelKey::AttnF32)); // ungated fallback
     let ctx = ctx_rdna1();
     let shape = ShapeInfo { head_dim: 64, ..Default::default() }; // doesn't match gated
-    assert_eq!(reg.resolve(KernelKey::AttnF32, &ctx, Some(&shape)).unwrap(), KernelKey::AttnF32);
+    assert_eq!(reg.resolve(KernelKey::AttnF32, &ctx, Some(&shape)).unwrap().key, KernelKey::AttnF32);
 }
 
 #[test]
@@ -404,39 +404,26 @@ fn dtype_needs_fwht_false_for_hfq_and_scalar() {
 #[test]
 fn gemv_family_resolves_f32_on_all_archs() {
     let fam = GemvFamily::new();
-    assert!(fam.resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna1()).is_ok());
-    assert!(fam.resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna3()).is_ok());
+    assert!(fam.resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna1(), None).is_ok());
+    assert!(fam.resolve(DType::F32, GemvVariant::Plain, false, &ctx_rdna3(), None).is_ok());
 }
 
 #[test]
 fn gemv_family_resolves_hfq4_only_on_dp4a_arch() {
     let fam = GemvFamily::new();
     // RDNA1 has no dp4a → HFQ4G256 plain should fail
-    assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna1()).is_err());
-    // RDNA2 has dp4a → should succeed
-    assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna2()).is_ok());
-    assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna3()).is_ok());
+    assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna1(), None).is_err());
+    assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna2(), None).is_ok());
+    assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna3(), None).is_ok());
 }
 
 #[test]
 fn gemv_family_resolves_mq3_prerotated_only_on_wmma_arch() {
     let fam = GemvFamily::new();
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna2()).is_err());
-    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna3()).is_ok());
-}
-
-#[test]
-fn gemv_family_resolves_mq4g256_prerotated_on_rdna2() {
-    // MQ4G256 uses HasDp4a predicate, available on RDNA2+
-    let fam = GemvFamily::new();
-    assert!(fam.resolve(DType::MQ4G256, GemvVariant::Prerotated, false, &ctx_rdna2()).is_ok());
-}
-
-#[test]
-fn gemv_family_resolve_errors_for_unsupported_dtype_variant() {
-    let fam = GemvFamily::new();
-    // F32 prerotated has no registered kernel
-    assert!(fam.resolve(DType::F32, GemvVariant::Prerotated, false, &ctx_rdna3()).is_err());
+    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_err());
+    assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_ok());
+    assert!(fam.resolve(DType::MQ4G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_ok());
+    assert!(fam.resolve(DType::F32, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_err());
 }
 
 // ── Pipeline::can_satisfy ─────────────────────────────────────────────────────

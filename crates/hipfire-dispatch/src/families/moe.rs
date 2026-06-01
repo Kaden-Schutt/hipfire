@@ -57,13 +57,14 @@ impl MoeFamily {
         &self,
         variant: MoeVariant,
         ctx: &DispatchCtx,
-    ) -> Result<KernelKey, DispatchError> {
+        shape: Option<&ShapeInfo>,
+    ) -> Result<&KernelVariant, DispatchError> {
         let key = match variant {
             MoeVariant::IndexedGateUp => KernelKey::MoeIndexedGateUpLloyd,
             MoeVariant::IndexedDown => KernelKey::MoeIndexedDownLloyd,
             MoeVariant::GroupedGemm => KernelKey::MoeGroupedGemm,
         };
-        self.registry.resolve(key, ctx, None)
+        self.registry.resolve(key, ctx, shape)
     }
 
     /// Run a MoE expert operation.
@@ -78,7 +79,7 @@ impl MoeFamily {
         _gpu: &mut rdna_compute::Gpu,
         params: &MoeParams,
     ) -> Result<(), DispatchError> {
-        let _resolved = self.resolve(params.variant, ctx)?;
+        let _resolved = self.resolve(params.variant, ctx, None)?;
 
         match params.variant {
             MoeVariant::GroupedGemm => Err(DispatchError::UnsupportedVariant {

@@ -34,7 +34,7 @@ impl KernelRegistry {
         key: KernelKey,
         ctx: &DispatchCtx,
         shape: Option<&ShapeInfo>,
-    ) -> Result<KernelKey, DispatchError> {
+    ) -> Result<&KernelVariant, DispatchError> {
         let variants = self.table.get(&key)
             .ok_or(DispatchError::NotFound { key })?;
 
@@ -50,7 +50,7 @@ impl KernelRegistry {
                 }
                 // shape is None → bypass shape gating for this call
             }
-            return Ok(variant.key);
+            return Ok(variant);
         }
 
         Err(DispatchError::MissingImpl { key })

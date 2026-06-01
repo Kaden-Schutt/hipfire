@@ -173,14 +173,15 @@ impl GemvFamily {
         variant: GemvVariant,
         has_awq: bool,
         ctx: &DispatchCtx,
-    ) -> Result<KernelKey, DispatchError> {
+        shape: Option<&ShapeInfo>,
+    ) -> Result<&KernelVariant, DispatchError> {
         let key = match variant {
             GemvVariant::Plain => KernelKey::for_gemv(dtype, variant, has_awq)?,
             GemvVariant::Prerotated => KernelKey::for_gemv_prerotated(dtype)?,
             GemvVariant::WithResidual => KernelKey::for_gemv_residual(dtype)?,
             GemvVariant::WithSwiGLUResidual => KernelKey::for_gemv_swiglu_residual(dtype)?,
         };
-        self.registry.resolve(key, ctx, None)
+        self.registry.resolve(key, ctx, shape)
     }
 
     /// Run a GEMV with automatic variant selection.
@@ -260,7 +261,7 @@ impl GemvFamily {
         gpu: &mut Gpu,
         params: &GemvParams,
     ) -> Result<(), DispatchError> {
-        let _resolved = self.resolve(params.w.dtype, params.variant, false, ctx)?;
+        let _resolved = self.resolve(params.w.dtype, params.variant, false, ctx, None)?;
 
         match params.variant {
             GemvVariant::Plain => dispatch_plain(gpu, params),

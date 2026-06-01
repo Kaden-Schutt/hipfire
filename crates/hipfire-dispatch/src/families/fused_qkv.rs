@@ -34,8 +34,9 @@ impl FusedQkvFamily {
         &self,
         key: KernelKey,
         ctx: &DispatchCtx,
-    ) -> Result<KernelKey, DispatchError> {
-        self.registry.resolve(key, ctx, None)
+        shape: Option<&ShapeInfo>,
+    ) -> Result<&KernelVariant, DispatchError> {
+        self.registry.resolve(key, ctx, shape)
     }
 
     pub fn run(
@@ -44,7 +45,7 @@ impl FusedQkvFamily {
         gpu: &mut Gpu,
         params: &FusedQkvParams,
     ) -> Result<(), DispatchError> {
-        self.resolve(params.kind, ctx)?;
+        self.resolve(params.kind, ctx, None)?;
         dispatch_fused_qkv(gpu, params)
     }
 }

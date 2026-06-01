@@ -266,6 +266,7 @@ pub enum ShapePredicate {
 
 // ── Registry entry ───────────────────────────────────
 
+#[derive(Debug)]
 pub struct KernelVariant {
     pub key: KernelKey,
     pub arch_required: ArchPredicate,

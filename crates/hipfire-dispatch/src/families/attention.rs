@@ -50,8 +50,9 @@ impl AttentionFamily {
         &self,
         key: KernelKey,
         ctx: &DispatchCtx,
-    ) -> Result<KernelKey, DispatchError> {
-        self.registry.resolve(key, ctx, None)
+        shape: Option<&ShapeInfo>,
+    ) -> Result<&KernelVariant, DispatchError> {
+        self.registry.resolve(key, ctx, shape)
     }
 
     pub fn run(
@@ -60,7 +61,7 @@ impl AttentionFamily {
         gpu: &mut Gpu,
         params: &AttnParams,
     ) -> Result<(), DispatchError> {
-        self.resolve(params.kind, ctx)?;
+        self.resolve(params.kind, ctx, None)?;
         dispatch_attention(gpu, params)
     }
 }
