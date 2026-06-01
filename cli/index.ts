@@ -249,9 +249,32 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   mtp_k: 3,
 };
 
+const KV_ADAPTIVE_OPTIONS = [
+  "off",
+  "conservative",
+  "balanced",
+  "aggressive",
+  "advanced:k=fwht4,v=lloyd4",
+  "advanced:k=fwht4,v=lloyd3",
+  "advanced:k=fwht4,v=lloyd2",
+  "advanced:k=fwht3,v=lloyd4",
+  "advanced:k=fwht3,v=lloyd3",
+  "advanced:k=fwht3,v=lloyd2",
+  "advanced:k=fwht2,v=lloyd4",
+  "advanced:k=fwht2,v=lloyd3",
+  "advanced:k=fwht2,v=lloyd2",
+];
+
+function validateKvAdaptiveValue(value: any): boolean {
+  if (typeof value !== "string") return false;
+  if (KV_ADAPTIVE_OPTIONS.includes(value)) return true;
+  return /^advanced:k=(fwht4|fwht3|fwht2),v=(lloyd4|lloyd3|lloyd2)$/.test(value);
+}
+
 function validateConfigValue(key: string, value: any): boolean {
   switch (key) {
     case "kv_cache": return ["auto", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
+    case "kv_adaptive": return validateKvAdaptiveValue(value);
     case "flash_mode": return ["auto", "always", "never"].includes(value);
     case "temperature": return typeof value === "number" && value >= 0 && value <= 2;
     case "top_p": return typeof value === "number" && value > 0 && value <= 1;
@@ -336,7 +359,7 @@ const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 // Fields that make sense to override per-model. host + port + idle_timeout + default_model
 // are serve-wide so they stay global-only.
 const PER_MODEL_KEYS = [
-  "kv_cache", "flash_mode", "temperature", "top_p",
+  "kv_cache", "kv_adaptive", "flash_mode", "temperature", "top_p",
   "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens", "max_total_think_tokens",
   "dflash_adaptive_b", "dflash_mode", "dflash_ngram_block",
   "cask_sidecar", "cask",
@@ -4323,6 +4346,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "KV cache quant (fwht default: FWHT-rotated, more accurate than asym at equal VRAM; q8 = reference)",
       options: ["auto", "q8", "fwht4", "fwht3", "fwht2", "asym4", "asym3", "asym2"],
     },
+    kv_adaptive: {
+      label: "kv_adaptive",
+      desc: "Adaptive KV downshift pattern. Requires fwht K; advanced picks K/V floor tiers explicitly.",
+      options: KV_ADAPTIVE_OPTIONS,
+    },
     flash_mode: {
       label: "flash_mode",
       desc: "Flash attention (Q8: auto=ctx≥2048, always=force, never=disable; asym always flash)",
@@ -6344,6 +6372,7 @@ Examples:
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
           kv_cache: "one of: auto, q8, fwht4, fwht3, fwht2, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 are legacy asym aliases)",
+          kv_adaptive: "one of: off, conservative, balanced, aggressive, advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>",
           flash_mode: "one of: auto, always, never (applies to Q8 path; asym modes are flash-only)",
           temperature: "number between 0 and 2",
           top_p: "number in (0, 1]",
