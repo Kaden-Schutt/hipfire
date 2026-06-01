@@ -183,7 +183,6 @@ fn dispatch_plain(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchErro
         HFP4G32 => hip!(gpu.gemv_hfp4g32(w.buf, x, y, m, k)),
         Q4F16G64 => hip!(gpu.gemv_q4f16_g64(w.buf, x, y, m, k)),
         Q4F16G32 => hip!(gpu.gemv_q4f16_g32(w.buf, x, y, m, k)),
-        PARO4G128 => hip!(gpu.gemv_paro4g128(w.buf, x, y, m, k)),
         // ParoQ4G128: weights are HFQ4G128 data; caller has already applied Givens
         // rotation to x, so dispatch to the plain HFQ4G128 GEMV kernel.
         ParoQ4G128 => hip!(gpu.gemv_hfq4g128(w.buf, x, y, m, k)),
@@ -256,7 +255,6 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),
         MQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x, y, m, k)),
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x, y, m, k)),
-        PARO4G128 => hip!(gpu.gemv_paro4g128_residual(w.buf, x, y, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x, y, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x, y, m, k)),
         _ => Err(DispatchError::UnsupportedVariant {
@@ -297,7 +295,6 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x_in, residual, m, k)),
         MQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x_in, residual, m, k)),
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
-        PARO4G128 => hip!(gpu.gemv_paro4g128_residual(w.buf, x_in, residual, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x_in, residual, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x_in, residual, m, k)),
         _ => Err(DispatchError::UnsupportedVariant {

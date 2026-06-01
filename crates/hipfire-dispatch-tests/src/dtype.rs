@@ -5,7 +5,6 @@ const QUANTIZED_DTYPES: &[DType] = &[
     DType::Q4K, DType::Q6K, DType::Q8_0,
     DType::Q4F16G64, DType::Q4F16G32, DType::Q8HFQ,
     DType::HFQ4G256, DType::HFQ4G128,
-    DType::PARO4G128, DType::PARO4G128T,
     DType::HFQ3G256, DType::HFQ3G128,
     DType::MQ4G256, DType::MQ4G128,
     DType::MQ8G256, DType::MQ6G256,

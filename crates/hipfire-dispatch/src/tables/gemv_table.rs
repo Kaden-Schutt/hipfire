@@ -40,8 +40,6 @@ fn register_plain(registry: &KernelRegistry) {
         DType::MQ4G256Lloyd,
         DType::MFP4G32,
         DType::HFP4G32,
-        DType::PARO4G128,
-        DType::PARO4G128T,
         DType::ParoQ4G128,
         DType::Q4F16G64,
         DType::Q4F16G32,
@@ -96,8 +94,6 @@ fn register_residual(registry: &KernelRegistry) {
         DType::MQ6G256,
         DType::MQ3G256Lloyd,
         DType::MQ4G256Lloyd,
-        DType::PARO4G128,
-        DType::PARO4G128T,
     ];
     for &dtype in dtypes {
         let Ok(key) = KernelKey::for_gemv_residual(dtype) else {
@@ -133,8 +129,6 @@ fn register_swiglu_residual(registry: &KernelRegistry) {
         DType::MQ6G256,
         DType::MQ3G256Lloyd,
         DType::MQ4G256Lloyd,
-        DType::PARO4G128,
-        DType::PARO4G128T,
     ];
     for &dtype in dtypes {
         let Ok(key) = KernelKey::for_gemv_swiglu_residual(dtype) else {

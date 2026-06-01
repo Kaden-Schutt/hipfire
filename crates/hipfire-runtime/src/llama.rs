@@ -663,20 +663,6 @@ pub fn weight_gemv(
             gemv.run_auto(&ctx, gpu, &wr, &xr, y)
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
-        // PARO4G128 plain: no FWHT rotation, uses Plain variant
-        DType::PARO4G128 => {
-            gemv.run(&ctx, gpu, &GemvParams {
-                w: &wr, x, y,
-                variant: GemvVariant::Plain,
-                residual: None, gate: None, up: None,
-            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
-        }
-        // PARO4G128T: model-layer ParoRotation needed
-        DType::PARO4G128T => {
-            gpu.ensure_mq_signs()?;
-            let xr = xr!();
-            gpu.gemv_paro4g128t_with_prerotate(&w.buf, x, y, &xr, w.m, w.k)
-        }
         // ParoQ4G128: Givens rotation (model-layer ParoRotation metadata) +
         // HFQ4-G128 GEMV. Uses RotationFamily::run(Givens) which calls
         // givens_rotate_to (copy_d2d + rotate in one kernel).
@@ -741,16 +727,6 @@ pub fn weight_gemv(
         DType::Q8HFQ => gpu.gemv_q8hfq(&w.buf, x, y, w.m, w.k, w.row_stride),
         DType::HFQ4G256 => gpu.gemv_hfq4g256(&w.buf, x, y, w.m, w.k),
         DType::HFQ4G128 => gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k),
-        DType::PARO4G128 => gpu.gemv_paro4g128(&w.buf, x, y, w.m, w.k),
-        DType::PARO4G128T => {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            gpu.gemv_paro4g128t_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
-        }
         DType::HFP4G32 => gpu.gemv_hfp4g32(&w.buf, x, y, w.m, w.k),
         DType::MFP4G32 => {
             gpu.ensure_mq_signs()?;
@@ -1276,16 +1252,6 @@ pub fn weight_gemv_residual(
                 residual: None, gate: None, up: None,
             }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
-        DType::PARO4G128 => gpu.gemv_paro4g128_residual(&w.buf, x, y, w.m, w.k),
-        DType::PARO4G128T => {
-            gpu.ensure_mq_signs()?;
-            let xr = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            gpu.gemv_paro4g128t_residual_with_prerotate(&w.buf, x, y, &xr, w.m, w.k)
-        }
         DType::MQ6G256 | DType::MQ4G256 | DType::MQ3G256
         | DType::MQ3G256Lloyd | DType::MQ4G256Lloyd => {
             gpu.ensure_mq_signs()?;
@@ -1322,16 +1288,6 @@ pub fn weight_gemv_residual(
 ) -> HipResult<()> {
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
-        DType::PARO4G128 => gpu.gemv_paro4g128_residual(&w.buf, x, y, w.m, w.k),
-        DType::PARO4G128T => {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            gpu.gemv_paro4g128t_residual_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
-        }
         DType::HFQ3G256 => gpu.gemv_hfq3g256_residual(&w.buf, x, y, w.m, w.k),
         DType::HFQ6G256 => gpu.gemv_hfq6g256_residual(&w.buf, x, y, w.m, w.k),
         DType::MQ6G256 => {
@@ -1447,17 +1403,6 @@ pub fn weight_gemv_swiglu_residual(
                 up: None,
             }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
-        DType::PARO4G128T => {
-            gpu.ensure_mq_signs()?;
-            let xr = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            gpu.gemv_paro4g128t_swiglu_residual_with_prerotate(
-                &w_down.buf, gate, up, x, &xr, w_down.m, w_down.k,
-            )
-        }
         _ => {
             gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;
             weight_gemv_residual(gpu, w_down, ffn_hidden_scratch, x)
@@ -1524,23 +1469,6 @@ pub fn weight_gemv_swiglu_residual(
             };
             fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_hfq6g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
-        }
-        DType::PARO4G128T => {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            gpu.gemv_paro4g128t_swiglu_residual_with_prerotate(
-                &w_down.buf,
-                gate,
-                up,
-                x,
-                &x_rot_alias,
-                w_down.m,
-                w_down.k,
-            )
         }
         _ => {
             gpu.silu_mul_f32(gate, up, ffn_hidden_scratch)?;

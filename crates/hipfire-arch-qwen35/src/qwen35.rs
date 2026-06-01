@@ -979,16 +979,6 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        28 => { // PARO4-G128 — ParoQuant rotated-activation W4 probe format
-            assert!(k % 128 == 0, "PARO4G128 weight has K={k} but kernel requires K%128==0");
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::PARO4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
-        }
-        29 => { // PARO4-G128T — ParoQuant engine-tiled W4 probe format
-            assert!(k % 128 == 0, "PARO4G128T weight has K={k} but kernel requires K%128==0");
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::PARO4G128T, m, k, row_stride: 0, paro: None, awq_scale: None })
-        }
         8 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ6G256, m, k, row_stride: 0, paro: None, awq_scale: None })
@@ -8267,9 +8257,6 @@ fn run_fa_layer_body(
     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-    let fused_fa3_paro4t = fa3_same_dtype
-        && dt == DType::PARO4G128T
-        && std::env::var("HIPFIRE_PARO_FA3_FUSED").map(|v| v != "0").unwrap_or(true);
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
     let fused_fa3_hfq6 = fa3_same_dtype
         && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
@@ -8308,15 +8295,6 @@ fn run_fa_layer_body(
             eff_x,
             &s.fa_q_full, &s.fa_k, &s.fa_v,
             layer.wq.m, layer.wk.m, layer.wv.m,
-            layer.wq.k,
-        )?;
-    } else if fused_fa3_paro4t {
-        gpu.fused_qkvza_paro4g128t(
-            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
-            &s.tmp,
-            &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
-            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
-            layer.wq.m, layer.wk.m, layer.wv.m, 0,
             layer.wq.k,
         )?;
     } else {
@@ -8459,11 +8437,6 @@ fn run_fa_layer_body(
     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-    let fused_gu_paro4t = same_dtype
-        && dt_g == DType::PARO4G128T
-        && layer.w_gate.m == layer.w_up.m
-        && layer.w_gate.k == layer.w_up.k
-        && std::env::var("HIPFIRE_PARO_GATE_UP_FUSED").map(|v| v != "0").unwrap_or(true);
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
     let fused_gu_hfq6 = same_dtype
         && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
@@ -8502,17 +8475,6 @@ fn run_fa_layer_body(
             eff_x,
             &s.gate_ffn, &s.up,
             layer.w_gate.m, layer.w_up.m,
-            layer.w_gate.k,
-        )?;
-    } else if fused_gu_paro4t {
-        gpu.fused_gate_up_paro4g128t(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            &s.tmp,
-            &s.gate_ffn,
-            &s.up,
-            &s.x_rot,
-            layer.w_gate.m,
             layer.w_gate.k,
         )?;
     } else {
@@ -9060,7 +9022,7 @@ fn fused_qkvza_dispatch(
     // PARO types perform rotation internally per-weight (Givens or sign-prerotate).
     // rmsnorm_rotate_dispatch returns None for these, so tmp holds the plain rmsnorm
     // result. Call weight_gemv individually — each call handles its own rotation.
-    if dt == DType::PARO4G128T || dt == DType::ParoQ4G128 {
+    if dt == DType::ParoQ4G128 {
         weight_gemv(gpu, wqkv, tmp, dn_qkv)?;
         weight_gemv(gpu, wz, tmp, dn_z)?;
         weight_gemv(gpu, w_beta, tmp, dn_beta)?;
@@ -9141,7 +9103,7 @@ fn fused_qkv_dispatch(
     let dt = wq.gpu_dtype;
     let same = wk.gpu_dtype == dt && wv.gpu_dtype == dt;
 
-    if dt == DType::PARO4G128T || dt == DType::ParoQ4G128 {
+    if dt == DType::ParoQ4G128 {
         weight_gemv(gpu, wq, tmp, fa_q)?;
         weight_gemv(gpu, wk, tmp, fa_k)?;
         weight_gemv(gpu, wv, tmp, fa_v)?;
@@ -9218,7 +9180,7 @@ fn fused_gate_up_dispatch(
     let dt = w_gate.gpu_dtype;
     let same = w_up.gpu_dtype == dt;
 
-    if dt == DType::PARO4G128T || dt == DType::ParoQ4G128 {
+    if dt == DType::ParoQ4G128 {
         weight_gemv(gpu, w_gate, tmp, gate_out)?;
         weight_gemv(gpu, w_up, tmp, up_out)?;
         return Ok(());
@@ -9685,11 +9647,6 @@ fn forward_scratch_layers(
                 let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                 let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
                 let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-                let fused_gu_paro4t = same_dtype
-                    && dt_g == DType::PARO4G128T
-                    && layer.w_gate.m == layer.w_up.m
-                    && layer.w_gate.k == layer.w_up.k
-                    && std::env::var("HIPFIRE_PARO_GATE_UP_FUSED").map(|v| v != "0").unwrap_or(true);
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_gu_hfq6 = same_dtype
                     && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
@@ -9735,17 +9692,6 @@ fn forward_scratch_layers(
                         layer.w_gate.m, layer.w_up.m,
                         layer.w_gate.k,
                     )?;
-                } else if fused_gu_paro4t {
-                    gpu.fused_gate_up_paro4g128t(
-                        &layer.w_gate.buf,
-                        &layer.w_up.buf,
-                        &s.tmp,
-                        &s.gate_ffn,
-                        &s.up,
-                        &s.x_rot,
-                        layer.w_gate.m,
-                        layer.w_gate.k,
-                    )?;
                 } else {
                     weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
                     weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
@@ -9786,9 +9732,6 @@ fn forward_scratch_layers(
                 let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
                 let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-                let fused_fa3_paro4t = fa3_same_dtype
-                    && dt == DType::PARO4G128T
-                    && std::env::var("HIPFIRE_PARO_FA3_FUSED").map(|v| v != "0").unwrap_or(true);
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_fa3_hfq6 = fa3_same_dtype
                     && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
@@ -9832,15 +9775,6 @@ fn forward_scratch_layers(
                         eff_x,
                         &s.fa_q_full, &s.fa_k, &s.fa_v,
                         layer.wq.m, layer.wk.m, layer.wv.m,
-                        layer.wq.k,
-                    )?;
-                } else if fused_fa3_paro4t {
-                    gpu.fused_qkvza_paro4g128t(
-                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
-                        &s.tmp,
-                        &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
-                        &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
-                        layer.wq.m, layer.wk.m, layer.wv.m, 0,
                         layer.wq.k,
                     )?;
                 } else {
@@ -10012,11 +9946,6 @@ fn forward_scratch_layers(
                 let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                 let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
                 let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-                let fused_gu_paro4t = same_dtype
-                    && dt_g == DType::PARO4G128T
-                    && layer.w_gate.m == layer.w_up.m
-                    && layer.w_gate.k == layer.w_up.k
-                    && std::env::var("HIPFIRE_PARO_GATE_UP_FUSED").map(|v| v != "0").unwrap_or(true);
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_gu_hfq6 = same_dtype
                     && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
@@ -10060,17 +9989,6 @@ fn forward_scratch_layers(
                         eff_x,
                         &s.gate_ffn, &s.up,
                         layer.w_gate.m, layer.w_up.m,
-                        layer.w_gate.k,
-                    )?;
-                } else if fused_gu_paro4t {
-                    gpu.fused_gate_up_paro4g128t(
-                        &layer.w_gate.buf,
-                        &layer.w_up.buf,
-                        &s.tmp,
-                        &s.gate_ffn,
-                        &s.up,
-                        &s.x_rot,
-                        layer.w_gate.m,
                         layer.w_gate.k,
                     )?;
                 } else {
@@ -10228,9 +10146,6 @@ fn forward_scratch_layers(
                 let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
                 let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-                let fused_fa3_paro4t = fa3_same_dtype
-                    && dt == DType::PARO4G128T
-                    && std::env::var("HIPFIRE_PARO_FA3_FUSED").map(|v| v != "0").unwrap_or(true);
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_fa3_hfq6 = fa3_same_dtype
                     && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
@@ -10274,15 +10189,6 @@ fn forward_scratch_layers(
                         eff_x,
                         &s.fa_q_full, &s.fa_k, &s.fa_v,
                         layer.wq.m, layer.wk.m, layer.wv.m,
-                        layer.wq.k,
-                    )?;
-                } else if fused_fa3_paro4t {
-                    gpu.fused_qkvza_paro4g128t(
-                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
-                        &s.tmp,
-                        &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
-                        &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
-                        layer.wq.m, layer.wk.m, layer.wv.m, 0,
                         layer.wq.k,
                     )?;
                 } else {
@@ -10627,11 +10533,6 @@ fn forward_scratch_layers_multi(
                     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
                     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-                    let fused_gu_paro4t = same_dtype
-                        && dt_g == DType::PARO4G128T
-                        && layer.w_gate.m == layer.w_up.m
-                        && layer.w_gate.k == layer.w_up.k
-                        && std::env::var("HIPFIRE_PARO_GATE_UP_FUSED").map(|v| v != "0").unwrap_or(true);
                     if fused_gu_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_gate_up_hfq4g256(
@@ -10648,17 +10549,6 @@ fn forward_scratch_layers_multi(
                             eff_x,
                             &s.gate_ffn, &s.up,
                             layer.w_gate.m, layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
-                    } else if fused_gu_paro4t {
-                        gpu.fused_gate_up_paro4g128t(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            &s.tmp,
-                            &s.gate_ffn,
-                            &s.up,
-                            &s.x_rot,
-                            layer.w_gate.m,
                             layer.w_gate.k,
                         )?;
                     } else {
@@ -10681,9 +10571,6 @@ fn forward_scratch_layers_multi(
                     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-                    let fused_fa3_paro4t = fa3_same_dtype
-                        && dt == DType::PARO4G128T
-                        && std::env::var("HIPFIRE_PARO_FA3_FUSED").map(|v| v != "0").unwrap_or(true);
                     if fused_fa3_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_qkv_hfq4g256(
@@ -10700,15 +10587,6 @@ fn forward_scratch_layers_multi(
                             eff_x,
                             &s.fa_q_full, &s.fa_k, &s.fa_v,
                             layer.wq.m, layer.wk.m, layer.wv.m,
-                            layer.wq.k,
-                        )?;
-                    } else if fused_fa3_paro4t {
-                        gpu.fused_qkvza_paro4g128t(
-                            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
-                            &s.tmp,
-                            &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
-                            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
-                            layer.wq.m, layer.wk.m, layer.wv.m, 0,
                             layer.wq.k,
                         )?;
                     } else {
@@ -10845,11 +10723,6 @@ fn forward_scratch_layers_multi(
                     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
                     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-                    let fused_gu_paro4t = same_dtype
-                        && dt_g == DType::PARO4G128T
-                        && layer.w_gate.m == layer.w_up.m
-                        && layer.w_gate.k == layer.w_up.k
-                        && std::env::var("HIPFIRE_PARO_GATE_UP_FUSED").map(|v| v != "0").unwrap_or(true);
                     if fused_gu_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_gate_up_hfq4g256(
@@ -10866,17 +10739,6 @@ fn forward_scratch_layers_multi(
                             eff_x,
                             &s.gate_ffn, &s.up,
                             layer.w_gate.m, layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
-                    } else if fused_gu_paro4t {
-                        gpu.fused_gate_up_paro4g128t(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            &s.tmp,
-                            &s.gate_ffn,
-                            &s.up,
-                            &s.x_rot,
-                            layer.w_gate.m,
                             layer.w_gate.k,
                         )?;
                     } else {
@@ -10996,9 +10858,6 @@ fn forward_scratch_layers_multi(
                     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-                    let fused_fa3_paro4t = fa3_same_dtype
-                        && dt == DType::PARO4G128T
-                        && std::env::var("HIPFIRE_PARO_FA3_FUSED").map(|v| v != "0").unwrap_or(true);
                     if fused_fa3_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_qkv_hfq4g256(
@@ -11015,15 +10874,6 @@ fn forward_scratch_layers_multi(
                             eff_x,
                             &s.fa_q_full, &s.fa_k, &s.fa_v,
                             layer.wq.m, layer.wk.m, layer.wv.m,
-                            layer.wq.k,
-                        )?;
-                    } else if fused_fa3_paro4t {
-                        gpu.fused_qkvza_paro4g128t(
-                            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
-                            &s.tmp,
-                            &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
-                            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
-                            layer.wq.m, layer.wk.m, layer.wv.m, 0,
                             layer.wq.k,
                         )?;
                     } else {

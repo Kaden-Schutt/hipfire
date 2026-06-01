@@ -303,7 +303,6 @@ fn for_gemv_plain_maps_all_scalar_dtypes() {
         (DType::MQ4G256,   KernelKey::GemvMq4G256),
         (DType::MQ3G256,   KernelKey::GemvMq3G256),
         (DType::MFP4G32,   KernelKey::GemvMfp4G32),
-        (DType::PARO4G128, KernelKey::GemvParo4G128),
     ];
     for (dtype, expected) in cases {
         assert_eq!(
@@ -387,7 +386,7 @@ fn for_gemv_rejects_unsupported_variant_combo() {
 fn dtype_needs_fwht_true_for_mq_family() {
     for dtype in [
         DType::MQ4G256, DType::MQ3G256, DType::MQ2G256, DType::MQ6G256,
-        DType::MQ8G256, DType::MQ4G256Lloyd, DType::MFP4G32, DType::PARO4G128,
+        DType::MQ8G256, DType::MQ4G256Lloyd, DType::MFP4G32,
     ] {
         assert!(dtype_needs_fwht(dtype), "{dtype:?} should need FWHT");
     }

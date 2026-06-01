@@ -207,8 +207,6 @@ HFQ_QUANT_TYPE_NAMES = {
     20: "MQ3G256_LLOYD",
     21: "HFP4G32",
     24: "MFP4G32",
-    28: "PARO4G128",
-    29: "PARO4G128T",
 }
 
 HFQ_QUANT_TYPE_FORMATS = {
@@ -224,8 +222,6 @@ HFQ_QUANT_TYPE_FORMATS = {
     "MQ3G256_LLOYD": "mq3",
     "HFP4G32": "hfp4",
     "MFP4G32": "mfp4",
-    "PARO4G128": "paro4",
-    "PARO4G128T": "paro4",
 }
 
 
