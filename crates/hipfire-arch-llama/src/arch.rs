@@ -181,6 +181,10 @@ impl Llama {
                     eps: config.norm_eps,
                     batch_size: 1,
                     variant: RotationVariant::WithRmsnorm,
+                    givens_pairs: None,
+                    givens_theta: None,
+                    givens_scales: None,
+                    givens_krot: None,
                 })?;
                 gemv.run_auto(&ctx, gpu, &WeightRef {
                     buf: &layer.wq.buf, dtype: layer.wq.gpu_dtype, m: layer.wq.m, k: layer.wq.k,
@@ -345,6 +349,10 @@ impl Llama {
                     eps: config.norm_eps,
                     batch_size: 1,
                     variant: RotationVariant::WithRmsnorm,
+                    givens_pairs: None,
+                    givens_theta: None,
+                    givens_scales: None,
+                    givens_krot: None,
                 })?;
                 gemv.run_auto(&ctx, gpu, &WeightRef {
                     buf: &layer.w_gate.buf, dtype: layer.w_gate.gpu_dtype, m: layer.w_gate.m, k: layer.w_gate.k,

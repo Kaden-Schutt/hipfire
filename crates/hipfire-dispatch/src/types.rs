@@ -52,6 +52,7 @@ pub enum MoeVariant {
 pub enum RotationVariant {
     Plain,
     PlainG128,
+    Givens,
     WithRmsnorm,
     WithSwiGLU,
 }
@@ -188,6 +189,25 @@ pub enum KernelKey {
     KvWriteAsym2Fwht,
     KvWriteQ8_0,
     KvWriteF32,
+}
+
+// ── Shape context for predicate evaluation ───────────
+
+/// Runtime tensor shape passed to `KernelRegistry::resolve` so that
+/// `ShapePredicate` gates can evaluate against live dimensions.
+///
+/// Fields that are not relevant for a given call site can be left at 0
+/// (they will only be checked if a registered `KernelVariant` carries a
+/// `ShapePredicate` that references that field).  Pass `None` to
+/// `resolve()` instead to skip all shape gating entirely.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShapeInfo {
+    /// Token-batch size (number of rows being processed in parallel).
+    pub batch_size: usize,
+    /// Attention head dimension in elements.
+    pub head_dim: usize,
+    /// Output rows (M dimension of the weight matrix).
+    pub m: usize,
 }
 
 // ── Arch gating ──────────────────────────────────────

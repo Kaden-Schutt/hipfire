@@ -12,3 +12,6 @@ pub mod resource;
 pub mod tables;
 pub mod traits;
 pub mod types;
+
+#[cfg(test)]
+mod tests;

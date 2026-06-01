@@ -17,6 +17,11 @@ pub struct RotationParams<'a> {
     pub eps: f32,
     pub batch_size: usize,
     pub variant: RotationVariant,
+    // Givens rotation metadata (ParoQuant)
+    pub givens_pairs: Option<&'a GpuTensor>,
+    pub givens_theta: Option<&'a GpuTensor>,
+    pub givens_scales: Option<&'a GpuTensor>,
+    pub givens_krot: Option<usize>,
 }
 
 /// Rotation kernel family — selects and runs FWHT rotation kernels.
@@ -45,20 +50,42 @@ impl RotationFamily {
         let batched = params.batch_size > 1;
 
         match params.variant {
+            RotationVariant::Givens => {
+                let pairs = params.givens_pairs.ok_or_else(|| {
+                    HipError::new(0, "givens_pairs required for Givens rotation")
+                })?;
+                let theta = params.givens_theta.ok_or_else(|| {
+                    HipError::new(0, "givens_theta required for Givens rotation")
+                })?;
+                let scales = params.givens_scales.ok_or_else(|| {
+                    HipError::new(0, "givens_scales required for Givens rotation")
+                })?;
+                let krot = params.givens_krot.ok_or_else(|| {
+                    HipError::new(0, "givens_krot required for Givens rotation")
+                })?;
+                // givens_rotate_to does copy_d2d + rotate in one kernel
+                gpu.givens_rotate_to(
+                    params.x, params.x_rot,
+                    pairs, theta, scales,
+                    1, /* seq_len */
+                    params.k,
+                    krot,
+                )
+            }
             RotationVariant::PlainG128 => {
-                self.registry.resolve(KernelKey::RotateMqG128, ctx)
+                self.registry.resolve(KernelKey::RotateMqG128, ctx, None)
                     .map_err(he)?;
                 // rotate_x_mq_128 internally calls ensure_mq_signs_128()
                 gpu.rotate_x_mq_128(params.x, params.x_rot, params.k)
             }
             RotationVariant::Plain => match (has_awq, batched) {
                 (false, false) => {
-                    self.registry.resolve(KernelKey::RotateMq, ctx)
+                    self.registry.resolve(KernelKey::RotateMq, ctx, None)
                         .map_err(he)?;
                     gpu.rotate_x_mq(params.x, params.x_rot, params.k)
                 }
                 (true, false) => {
-                    self.registry.resolve(KernelKey::RotateMqAwq, ctx)
+                    self.registry.resolve(KernelKey::RotateMqAwq, ctx, None)
                         .map_err(he)?;
                     gpu.rotate_x_mq_awq(
                         params.x,
@@ -68,12 +95,12 @@ impl RotationFamily {
                     )
                 }
                 (false, true) => {
-                    self.registry.resolve(KernelKey::RotateMqBatched, ctx)
+                    self.registry.resolve(KernelKey::RotateMqBatched, ctx, None)
                         .map_err(he)?;
                     gpu.rotate_x_mq(params.x, params.x_rot, params.k)
                 }
                 (true, true) => {
-                    self.registry.resolve(KernelKey::RotateMqAwqBatched, ctx)
+                    self.registry.resolve(KernelKey::RotateMqAwqBatched, ctx, None)
                         .map_err(he)?;
                     gpu.rotate_x_mq_awq(
                         params.x,
@@ -89,7 +116,7 @@ impl RotationFamily {
                 })?;
                 match (has_awq, batched) {
                     (false, false) => {
-                        self.registry.resolve(KernelKey::RmsnormRotateMq, ctx)
+                        self.registry.resolve(KernelKey::RmsnormRotateMq, ctx, None)
                             .map_err(he)?;
                         gpu.fused_rmsnorm_rotate_mq(
                             params.x,
@@ -100,7 +127,7 @@ impl RotationFamily {
                         )
                     }
                     (true, false) => {
-                        self.registry.resolve(KernelKey::RmsnormRotateMqAwq, ctx)
+                        self.registry.resolve(KernelKey::RmsnormRotateMqAwq, ctx, None)
                             .map_err(he)?;
                         gpu.fused_rmsnorm_rotate_mq_awq(
                             params.x,
@@ -112,7 +139,7 @@ impl RotationFamily {
                         )
                     }
                     (false, true) => {
-                        self.registry.resolve(KernelKey::RmsnormRotateMqBatched, ctx)
+                        self.registry.resolve(KernelKey::RmsnormRotateMqBatched, ctx, None)
                             .map_err(he)?;
                         gpu.fused_rmsnorm_rotate_mq_batched(
                             params.x,
@@ -125,7 +152,7 @@ impl RotationFamily {
                     }
                     (true, true) => {
                         self.registry
-                            .resolve(KernelKey::RmsnormRotateMqAwqBatched, ctx)
+                            .resolve(KernelKey::RmsnormRotateMqAwqBatched, ctx, None)
                             .map_err(he)?;
                         gpu.fused_rmsnorm_rotate_mq_awq_batched(
                             params.x,
@@ -145,7 +172,7 @@ impl RotationFamily {
                 })?;
                 match has_awq {
                     false => {
-                        self.registry.resolve(KernelKey::SiluMulRotateMq, ctx)
+                        self.registry.resolve(KernelKey::SiluMulRotateMq, ctx, None)
                             .map_err(he)?;
                         gpu.fused_silu_mul_rotate_mq(
                             params.x,
@@ -155,7 +182,7 @@ impl RotationFamily {
                         )
                     }
                     true => {
-                        self.registry.resolve(KernelKey::SiluMulRotateMqAwq, ctx)
+                        self.registry.resolve(KernelKey::SiluMulRotateMqAwq, ctx, None)
                             .map_err(he)?;
                         gpu.fused_silu_mul_rotate_mq_awq(
                             params.x,

@@ -10,7 +10,7 @@
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
-c use crate::pipeline::{PipelineParams, dispatch_fused};
+use crate::pipeline::{PipelineParams, dispatch_fused};
 use crate::tables::gemv_table;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
@@ -71,7 +71,7 @@ impl GemvFamily {
             GemvVariant::WithResidual => KernelKey::for_gemv_residual(dtype)?,
             GemvVariant::WithSwiGLUResidual => KernelKey::for_gemv_swiglu_residual(dtype)?,
         };
-        self.registry.resolve(key, ctx)
+        self.registry.resolve(key, ctx, None)
     }
 
     /// Run a GEMV with automatic variant selection.
@@ -126,7 +126,7 @@ impl GemvFamily {
                 let dtype = params.w.dtype;
                 if dtype == DType::MFP4G32 {
                     let key = KernelKey::GemvMfp4G32Fused;
-                    if self.registry.resolve(key, ctx).is_ok() {
+                    if self.registry.resolve(key, ctx, None).is_ok() {
                         let pipe_params = PipelineParams {
                             x: params.x, y: params.y, buf: params.w.buf,
                             m: params.w.m, k: params.w.k,

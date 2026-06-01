@@ -56,6 +56,10 @@ pub fn execute_pipeline(
                     awq_scale: None, k: params.k,
                     eps: 1e-6, batch_size: 1,
                     variant: RotationVariant::Plain,
+                    givens_pairs: None,
+                    givens_theta: None,
+                    givens_scales: None,
+                    givens_krot: None,
                 }).map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
             PipelineOp::Gemv => {
@@ -88,7 +92,7 @@ fn find_fused(
         && requested[1] == PipelineOp::Gemv
     {
         let key = KernelKey::GemvMfp4G32Fused;
-        if registry.resolve(key, ctx).is_ok() { return Some(key); }
+        if registry.resolve(key, ctx, None).is_ok() { return Some(key); }
     }
     None
 }

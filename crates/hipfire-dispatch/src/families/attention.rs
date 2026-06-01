@@ -50,7 +50,7 @@ impl AttentionFamily {
         key: KernelKey,
         ctx: &DispatchCtx,
     ) -> Result<KernelKey, DispatchError> {
-        self.registry.resolve(key, ctx)
+        self.registry.resolve(key, ctx, None)
     }
 
     pub fn run(

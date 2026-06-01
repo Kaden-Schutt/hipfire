@@ -55,7 +55,7 @@ impl GemmFamily {
             DType::F16 => KernelKey::GemmF16XF16Wmma,
             DType::Q8_0 => {
                 let preferred = KernelKey::GemmQ8_0Wmma;
-                if self.registry.resolve(preferred, ctx).is_ok() {
+                if self.registry.resolve(preferred, ctx, None).is_ok() {
                     preferred
                 } else {
                     KernelKey::GemmQ8_0BatchedChunked
@@ -63,7 +63,7 @@ impl GemmFamily {
             }
             DType::HFQ4G256 => {
                 let preferred = KernelKey::GemmHfq4G256Wmma;
-                if self.registry.resolve(preferred, ctx).is_ok() {
+                if self.registry.resolve(preferred, ctx, None).is_ok() {
                     preferred
                 } else {
                     KernelKey::GemmHfq4G256
@@ -77,7 +77,7 @@ impl GemmFamily {
                 })
             }
         };
-        self.registry.resolve(key, ctx)
+        self.registry.resolve(key, ctx, None)
     }
 
     /// Run a GEMM operation.
@@ -111,7 +111,7 @@ impl GemmFamily {
             F16 => hip!(gpu.gemm_f16_x_f16_wmma(w.buf, x, y, m, k, batch_size)),
             Q8_0 => {
                 let preferred = KernelKey::GemmQ8_0Wmma;
-                if self.registry.resolve(preferred, ctx).is_ok() {
+                if self.registry.resolve(preferred, ctx, None).is_ok() {
                     hip!(gpu.gemm_q8_0_wmma(w.buf, x, y, m, k, batch_size))
                 } else {
                     hip!(gpu.gemm_q8_0_batched_chunked(w.buf, x, y, m, k, batch_size))
@@ -119,7 +119,7 @@ impl GemmFamily {
             }
             HFQ4G256 => {
                 let preferred = KernelKey::GemmHfq4G256Wmma;
-                if self.registry.resolve(preferred, ctx).is_ok() {
+                if self.registry.resolve(preferred, ctx, None).is_ok() {
                     hip!(gpu.gemm_hfq4g256_wmma(w.buf, x, y, m, k, batch_size))
                 } else {
                     hip!(gpu.gemm_hfq4g256(w.buf, x, y, m, k, batch_size))

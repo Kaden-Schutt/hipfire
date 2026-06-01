@@ -62,7 +62,7 @@ impl MoeFamily {
             MoeVariant::IndexedDown => KernelKey::MoeIndexedDownLloyd,
             MoeVariant::GroupedGemm => KernelKey::MoeGroupedGemm,
         };
-        self.registry.resolve(key, ctx)
+        self.registry.resolve(key, ctx, None)
     }
 
     /// Run a MoE expert operation.

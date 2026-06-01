@@ -23,4 +23,18 @@ impl DispatchCtx {
             resources: ResourceManager::new(gpu),
         }
     }
+
+    /// Construct a `DispatchCtx` for the given arch string without a live GPU.
+    /// Only for use in tests.
+    #[cfg(test)]
+    pub fn for_test(arch: &str) -> Self {
+        use rdna_compute::feature_flags::FeatureFlags;
+        let flags = Arc::new(FeatureFlags::from_env_for_test(arch));
+        let arch_caps = ArchCaps::new(arch, flags.clone());
+        Self {
+            arch: arch_caps,
+            flags,
+            resources: crate::resource::ResourceManager::for_test(),
+        }
+    }
 }

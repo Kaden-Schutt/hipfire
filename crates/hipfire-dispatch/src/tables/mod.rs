@@ -9,7 +9,7 @@ pub mod fused_qkv_table;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use crate::context::DispatchCtx;
-use crate::types::*;
+use crate::types::{ArchPredicate, DispatchError, KernelKey, KernelVariant, ShapeInfo, ShapePredicate};
 
 /// Thread-safe kernel registry. Populated once at init, read-only thereafter.
 pub struct KernelRegistry {
@@ -26,10 +26,16 @@ impl KernelRegistry {
         table.entry(entry.key).or_default().push(entry);
     }
 
+    /// Resolve `key` to the first registered variant that passes both the
+    /// arch predicate and (when provided) the shape predicate.
+    ///
+    /// Pass `shape: None` to bypass shape gating entirely — useful for arch
+    /// probing and validation where tensor dimensions are not yet known.
     pub fn resolve(
         &self,
         key: KernelKey,
         ctx: &DispatchCtx,
+        shape: Option<&ShapeInfo>,
     ) -> Result<KernelKey, DispatchError> {
         let table = self.table.lock().unwrap();
         let variants = table.get(&key)
@@ -40,12 +46,13 @@ impl KernelRegistry {
                 continue;
             }
             if let Some(ref gate) = variant.shape_gate {
-                if !gate.eval() {
-                    continue;
+                if let Some(s) = shape {
+                    if !gate.eval(s) {
+                        continue;
+                    }
                 }
+                // shape is None → bypass shape gating for this call
             }
-            // Return the key itself — the caller maps to the actual fn ptr
-            // through a parallel table, or uses KernelKey dispatch internally.
             return Ok(variant.key);
         }
 
@@ -83,10 +90,11 @@ impl ArchPredicate {
 }
 
 impl ShapePredicate {
-    pub fn eval(&self) -> bool {
-        // Shape predicates need runtime info (batch size, head dim, etc.)
-        // These are evaluated at resolve() time with current shape data.
-        // For now, always true — concrete implementations override.
-        true
+    pub fn eval(&self, shape: &ShapeInfo) -> bool {
+        match self {
+            Self::BatchGt(n) => shape.batch_size > *n,
+            Self::HeadDimEq(n) => shape.head_dim == *n,
+            Self::MLt(n) => shape.m < *n,
+        }
     }
 }

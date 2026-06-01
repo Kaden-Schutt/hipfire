@@ -9,4 +9,9 @@ impl ResourceManager {
     pub fn new(_gpu: &Gpu) -> Self {
         Self { _priv: () }
     }
+
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self { _priv: () }
+    }
 }
