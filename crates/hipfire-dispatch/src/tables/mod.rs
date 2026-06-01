@@ -7,23 +7,21 @@ pub mod attention_table;
 pub mod fused_qkv_table;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use crate::context::DispatchCtx;
 use crate::types::{ArchPredicate, DispatchError, KernelKey, KernelVariant, ShapeInfo, ShapePredicate};
 
-/// Thread-safe kernel registry. Populated once at init, read-only thereafter.
+/// Kernel registry. Built once via `register`, frozen, read-only thereafter.
 pub struct KernelRegistry {
-    table: Mutex<HashMap<KernelKey, Vec<KernelVariant>>>,
+    table: HashMap<KernelKey, Vec<KernelVariant>>,
 }
 
 impl KernelRegistry {
     pub fn new() -> Self {
-        Self { table: Mutex::new(HashMap::new()) }
+        Self { table: HashMap::new() }
     }
 
-    pub fn register(&self, entry: KernelVariant) {
-        let mut table = self.table.lock().unwrap();
-        table.entry(entry.key).or_default().push(entry);
+    pub fn register(&mut self, entry: KernelVariant) {
+        self.table.entry(entry.key).or_default().push(entry);
     }
 
     /// Resolve `key` to the first registered variant that passes both the
@@ -37,8 +35,7 @@ impl KernelRegistry {
         ctx: &DispatchCtx,
         shape: Option<&ShapeInfo>,
     ) -> Result<KernelKey, DispatchError> {
-        let table = self.table.lock().unwrap();
-        let variants = table.get(&key)
+        let variants = self.table.get(&key)
             .ok_or(DispatchError::NotFound { key })?;
 
         for variant in variants {
@@ -60,8 +57,7 @@ impl KernelRegistry {
     }
 
     pub fn validate(&self) -> Result<(), DispatchError> {
-        let table = self.table.lock().unwrap();
-        for (key, variants) in table.iter() {
+        for (key, variants) in self.table.iter() {
             if variants.is_empty() {
                 return Err(DispatchError::EmptyEntry { key: *key });
             }
@@ -70,8 +66,7 @@ impl KernelRegistry {
     }
 
     pub fn all_keys(&self) -> Vec<KernelKey> {
-        let table = self.table.lock().unwrap();
-        table.keys().copied().collect()
+        self.table.keys().copied().collect()
     }
 }
 

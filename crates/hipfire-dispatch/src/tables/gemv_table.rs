@@ -7,7 +7,7 @@ use rdna_compute::DType;
 ///
 /// Covers all 4 variants: Plain, Prerotated, WithResidual, WithSwiGLUResidual.
 /// Each entry pairs a KernelKey with the arch predicate that must be satisfied.
-pub fn populate(registry: &KernelRegistry) {
+pub fn populate(registry: &mut KernelRegistry) {
     register_plain(registry);
     register_prerotated(registry);
     register_residual(registry);
@@ -15,7 +15,7 @@ pub fn populate(registry: &KernelRegistry) {
     register_fused(registry);
 }
 
-fn register_plain(registry: &KernelRegistry) {
+fn register_plain(registry: &mut KernelRegistry) {
     let dtypes: &[DType] = &[
         DType::F32,
         DType::F16,
@@ -59,7 +59,7 @@ fn register_plain(registry: &KernelRegistry) {
     }
 }
 
-fn register_prerotated(registry: &KernelRegistry) {
+fn register_prerotated(registry: &mut KernelRegistry) {
     let dtypes: &[DType] = &[
         DType::MQ4G256,
         DType::MQ3G256,
@@ -85,7 +85,7 @@ fn register_prerotated(registry: &KernelRegistry) {
     }
 }
 
-fn register_residual(registry: &KernelRegistry) {
+fn register_residual(registry: &mut KernelRegistry) {
     let dtypes: &[DType] = &[
         DType::HFQ4G256,
         DType::HFQ3G256,
@@ -110,7 +110,7 @@ fn register_residual(registry: &KernelRegistry) {
     }
 }
 
-fn register_fused(registry: &KernelRegistry) {
+fn register_fused(registry: &mut KernelRegistry) {
     registry.register(KernelVariant {
         key: KernelKey::GemvMfp4G32Fused,
         arch_required: ArchPredicate::HasWmmaW32,
@@ -120,7 +120,7 @@ fn register_fused(registry: &KernelRegistry) {
     });
 }
 
-fn register_swiglu_residual(registry: &KernelRegistry) {
+fn register_swiglu_residual(registry: &mut KernelRegistry) {
     let dtypes: &[DType] = &[
         DType::HFQ4G256,
         DType::HFQ3G256,

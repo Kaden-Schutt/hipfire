@@ -2,7 +2,7 @@
 use crate::tables::KernelRegistry;
 use crate::types::*;
 
-pub fn populate(registry: &KernelRegistry) {
+pub fn populate(registry: &mut KernelRegistry) {
     // ── KV Cache Write ─────────────────────────────────────────
     let kv_write_variants: &[(KernelKey, ArchPredicate)] = &[
         (KernelKey::KvWriteAsym4,    ArchPredicate::Always),

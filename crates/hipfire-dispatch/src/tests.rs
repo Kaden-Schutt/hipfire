@@ -162,7 +162,7 @@ fn arch_has_mmq_on_rdna3_only() {
 
 #[test]
 fn registry_resolve_happy_path() {
-    let reg = KernelRegistry::new();
+    let mut reg = KernelRegistry::new();
     reg.register(always_variant(KernelKey::GemvF32));
     let ctx = ctx_rdna1();
     assert_eq!(reg.resolve(KernelKey::GemvF32, &ctx, None).unwrap(), KernelKey::GemvF32);
@@ -170,7 +170,7 @@ fn registry_resolve_happy_path() {
 
 #[test]
 fn registry_resolve_unregistered_key_returns_not_found() {
-    let reg = KernelRegistry::new();
+    let mut reg = KernelRegistry::new();
     let ctx = ctx_rdna1();
     let err = reg.resolve(KernelKey::GemvF32, &ctx, None).unwrap_err();
     assert!(matches!(err, DispatchError::NotFound { .. }));
@@ -178,7 +178,7 @@ fn registry_resolve_unregistered_key_returns_not_found() {
 
 #[test]
 fn registry_resolve_arch_gate_fails_returns_missing_impl() {
-    let reg = KernelRegistry::new();
+    let mut reg = KernelRegistry::new();
     reg.register(wmma_variant(KernelKey::GemmHfq4G256Wmma));
     let ctx = ctx_rdna1(); // no WMMA
     let err = reg.resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None).unwrap_err();
@@ -187,7 +187,7 @@ fn registry_resolve_arch_gate_fails_returns_missing_impl() {
 
 #[test]
 fn registry_resolve_arch_gate_passes_on_capable_arch() {
-    let reg = KernelRegistry::new();
+    let mut reg = KernelRegistry::new();
     reg.register(wmma_variant(KernelKey::GemmHfq4G256Wmma));
     let ctx = ctx_rdna3(); // has WMMA w32
     assert_eq!(
@@ -200,7 +200,7 @@ fn registry_resolve_arch_gate_passes_on_capable_arch() {
 fn registry_resolve_falls_through_to_second_variant() {
     // Register WMMA variant first, then fallback Always variant for same key.
     // On RDNA1 (no WMMA), the WMMA entry is skipped and fallback is selected.
-    let reg = KernelRegistry::new();
+    let mut reg = KernelRegistry::new();
     reg.register(wmma_variant(KernelKey::GemmHfq4G256Wmma));
     reg.register(always_variant(KernelKey::GemmHfq4G256Wmma));
     let ctx = ctx_rdna1();
@@ -212,7 +212,7 @@ fn registry_resolve_falls_through_to_second_variant() {
 
 #[test]
 fn registry_resolve_shape_gate_passes_when_shape_matches() {
-    let reg = KernelRegistry::new();
+    let mut reg = KernelRegistry::new();
     reg.register(KernelVariant {
         key: KernelKey::AttnF32,
         arch_required: ArchPredicate::Always,
@@ -227,7 +227,7 @@ fn registry_resolve_shape_gate_passes_when_shape_matches() {
 
 #[test]
 fn registry_resolve_shape_gate_skips_when_shape_mismatches() {
-    let reg = KernelRegistry::new();
+    let mut reg = KernelRegistry::new();
     reg.register(KernelVariant {
         key: KernelKey::AttnF32,
         arch_required: ArchPredicate::Always,
@@ -244,7 +244,7 @@ fn registry_resolve_shape_gate_skips_when_shape_mismatches() {
 #[test]
 fn registry_resolve_shape_none_bypasses_shape_gate() {
     // With shape=None, even a shape-gated variant should be selected.
-    let reg = KernelRegistry::new();
+    let mut reg = KernelRegistry::new();
     reg.register(KernelVariant {
         key: KernelKey::AttnF32,
         arch_required: ArchPredicate::Always,
@@ -259,7 +259,7 @@ fn registry_resolve_shape_none_bypasses_shape_gate() {
 #[test]
 fn registry_resolve_shape_gate_fallback_to_ungated_variant() {
     // Shape-gated fast path (head_dim=128) followed by ungated fallback.
-    let reg = KernelRegistry::new();
+    let mut reg = KernelRegistry::new();
     reg.register(KernelVariant {
         key: KernelKey::AttnF32,
         arch_required: ArchPredicate::Always,
@@ -275,14 +275,14 @@ fn registry_resolve_shape_gate_fallback_to_ungated_variant() {
 
 #[test]
 fn registry_validate_succeeds_on_populated_registry() {
-    let reg = KernelRegistry::new();
+    let mut reg = KernelRegistry::new();
     reg.register(always_variant(KernelKey::GemvF32));
     assert!(reg.validate().is_ok());
 }
 
 #[test]
 fn registry_all_keys_returns_registered_keys() {
-    let reg = KernelRegistry::new();
+    let mut reg = KernelRegistry::new();
     reg.register(always_variant(KernelKey::GemvF32));
     reg.register(always_variant(KernelKey::GemvF16));
     let keys = reg.all_keys();

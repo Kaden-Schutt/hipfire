@@ -31,8 +31,9 @@ pub struct GemmFamily {
 
 impl GemmFamily {
     pub fn new() -> Self {
-        let registry = KernelRegistry::new();
-        gemm_table::populate(&registry);
+        let mut registry = KernelRegistry::new();
+        gemm_table::populate(&mut registry);
+        registry.validate().expect("gemm kernel table has empty entries");
         Self { registry }
     }
 

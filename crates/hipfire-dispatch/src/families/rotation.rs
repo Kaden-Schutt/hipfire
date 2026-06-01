@@ -31,8 +31,9 @@ pub struct RotationFamily {
 
 impl RotationFamily {
     pub fn new() -> Self {
-        let registry = KernelRegistry::new();
-        super::super::tables::rotation_table::populate(&registry);
+        let mut registry = KernelRegistry::new();
+        super::super::tables::rotation_table::populate(&mut registry);
+        registry.validate().expect("rotation kernel table has empty entries");
         Self { registry }
     }
 

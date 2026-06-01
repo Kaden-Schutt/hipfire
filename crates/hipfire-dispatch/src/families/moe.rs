@@ -40,8 +40,9 @@ pub struct MoeFamily {
 
 impl MoeFamily {
     pub fn new() -> Self {
-        let registry = KernelRegistry::new();
-        moe_table::populate(&registry);
+        let mut registry = KernelRegistry::new();
+        moe_table::populate(&mut registry);
+        registry.validate().expect("moe kernel table has empty entries");
         Self { registry }
     }
 

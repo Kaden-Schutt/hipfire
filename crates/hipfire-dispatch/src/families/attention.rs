@@ -36,8 +36,9 @@ pub struct AttentionFamily {
 
 impl AttentionFamily {
     pub fn new() -> Self {
-        let registry = KernelRegistry::new();
-        super::super::tables::attention_table::populate(&registry);
+        let mut registry = KernelRegistry::new();
+        super::super::tables::attention_table::populate(&mut registry);
+        registry.validate().expect("attention kernel table has empty entries");
         Self { registry }
     }
 

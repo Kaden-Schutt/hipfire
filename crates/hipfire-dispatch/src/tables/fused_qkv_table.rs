@@ -2,7 +2,7 @@
 use crate::tables::KernelRegistry;
 use crate::types::*;
 
-pub fn populate(registry: &KernelRegistry) {
+pub fn populate(registry: &mut KernelRegistry) {
     // ── Fused QKV (Q, K, V in one launch) ───────────────────────
     let qkv_variants: &[(KernelKey, ArchPredicate)] = &[
         (KernelKey::FusedQkvHfq4G256,     ArchPredicate::HasWmmaW32),

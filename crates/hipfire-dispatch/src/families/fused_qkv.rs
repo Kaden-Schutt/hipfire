@@ -20,8 +20,9 @@ pub struct FusedQkvFamily {
 
 impl FusedQkvFamily {
     pub fn new() -> Self {
-        let registry = KernelRegistry::new();
-        super::super::tables::fused_qkv_table::populate(&registry);
+        let mut registry = KernelRegistry::new();
+        super::super::tables::fused_qkv_table::populate(&mut registry);
+        registry.validate().expect("fused_qkv kernel table has empty entries");
         Self { registry }
     }
 

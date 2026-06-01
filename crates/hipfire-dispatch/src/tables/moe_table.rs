@@ -6,7 +6,7 @@ use crate::types::*;
 ///
 /// Covers all 4 kernel keys: MoeIndexedGateUpLloyd, MoeIndexedDownLloyd,
 /// MoeGroupedGemm, and MoeGroupedI8.
-pub fn populate(registry: &KernelRegistry) {
+pub fn populate(registry: &mut KernelRegistry) {
     registry.register(KernelVariant {
         key: KernelKey::MoeIndexedGateUpLloyd,
         arch_required: ArchPredicate::HasWmmaW32,

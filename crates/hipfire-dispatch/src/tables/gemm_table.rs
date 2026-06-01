@@ -7,7 +7,7 @@ use crate::types::*;
 /// Covers plain batched GEMM for all supported quant formats.
 /// Each entry pairs a KernelKey with the arch predicate that must
 /// be satisfied.
-pub fn populate(registry: &KernelRegistry) {
+pub fn populate(registry: &mut KernelRegistry) {
     registry.register(KernelVariant {
         key: KernelKey::GemmF32RegisterTiled,
         arch_required: ArchPredicate::Always,

@@ -3,7 +3,7 @@ use crate::types::*;
 use crate::tables::KernelRegistry;
 
 /// Populate the registry with rotation kernel variants.
-pub fn populate(registry: &KernelRegistry) {
+pub fn populate(registry: &mut KernelRegistry) {
     macro_rules! reg {
         ($key:ident, $arch:expr, $steps:expr, $awq:expr) => {
             registry.register(KernelVariant {

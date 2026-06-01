@@ -153,8 +153,9 @@ pub struct GemvFamily {
 
 impl GemvFamily {
     pub fn new() -> Self {
-        let registry = KernelRegistry::new();
-        gemv_table::populate(&registry);
+        let mut registry = KernelRegistry::new();
+        gemv_table::populate(&mut registry);
+        registry.validate().expect("gemv kernel table has empty entries");
         let rotation = RotationFamily::new();
         Self { registry, rotation }
     }
