@@ -261,23 +261,24 @@ impl GemvFamily {
         gpu: &mut Gpu,
         params: &GemvParams,
     ) -> Result<(), DispatchError> {
-        let _resolved = self.resolve(params.w.dtype, params.variant, false, ctx, None)?;
-
+        let shape = ShapeInfo { batch_size: 1, head_dim: 0, m: params.w.m };
         match params.variant {
-            GemvVariant::Plain => dispatch_plain(gpu, params),
+            GemvVariant::Plain => {
+                let key = self.resolve(params.w.dtype, params.variant, false, ctx, Some(&shape))?.key;
+                launch(gpu, key, params)
+            }
             GemvVariant::Prerotated => {
-                let dtype = params.w.dtype;
-                if dtype == DType::MFP4G32 {
-                    let key = KernelKey::GemvMfp4G32Fused;
-                    if self.registry.resolve(key, ctx, None).is_ok() {
-                        let pipe_params = PipelineParams {
-                            x: params.x, y: params.y, buf: params.w.buf,
-                            m: params.w.m, k: params.w.k,
-                        };
-                        return dispatch_fused(gpu, KernelKey::GemvMfp4G32Fused, &pipe_params);
-                    }
+                if params.w.dtype == DType::MFP4G32
+                    && self.registry.resolve(KernelKey::GemvMfp4G32Fused, ctx, None).is_ok()
+                {
+                    let pipe_params = PipelineParams {
+                        x: params.x, y: params.y, buf: params.w.buf,
+                        m: params.w.m, k: params.w.k,
+                    };
+                    return dispatch_fused(gpu, KernelKey::GemvMfp4G32Fused, &pipe_params);
                 }
-                dispatch_prerotated(gpu, params)
+                let key = self.resolve(params.w.dtype, params.variant, false, ctx, Some(&shape))?.key;
+                launch(gpu, key, params)
             }
             GemvVariant::WithResidual => dispatch_residual(gpu, params),
             GemvVariant::WithSwiGLUResidual => dispatch_swiglu_residual(gpu, params),
@@ -369,86 +370,42 @@ fn prepare_rotation_scratch(
     }
 }
 
-// ── Plain GEMV dispatch ────────────────────────────────
+// ── Central KernelKey-keyed launch ─────────────────────
 
-fn dispatch_plain(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchError> {
-    let w = params.w;
-    let x = params.x;
-    let y = params.y;
-    let m = w.m;
-    let k = w.k;
-    use DType::*;
-
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
-
-    match w.dtype {
-        F32 => hip!(gpu.gemv_f32(w.buf, x, y)),
-        F16 => {
-            // F16 GEMV uses batched GEMM with batch=1
-            hip!(gpu.gemm_f16_batched_lmhead(w.buf, x, y, m, k, 1))
-        }
-        Q8_0 => hip!(gpu.gemv_q8_0(w.buf, x, y, m, k)),
-        Q4K => hip!(gpu.gemv_q4k(w.buf, x, y, m, k)),
-        Q6K => hip!(gpu.gemv_q6k(w.buf, x, y, m, k)),
-        HFQ4G256 => hip!(gpu.gemv_hfq4g256(w.buf, x, y, m, k)),
-        HFQ4G128 => hip!(gpu.gemv_hfq4g128(w.buf, x, y, m, k)),
-        HFQ3G256 => hip!(gpu.gemv_hfq3g256(w.buf, x, y, m, k)),
-        HFQ3G128 => hip!(gpu.gemv_hfq3g128(w.buf, x, y, m, k)),
-        HFQ2G256 => hip!(gpu.gemv_hfq2g256(w.buf, x, y, m, k)),
-        HFQ2G128 => hip!(gpu.gemv_hfq2g128(w.buf, x, y, m, k)),
-        HFQ6G256 => hip!(gpu.gemv_hfq6g256(w.buf, x, y, m, k)),
-        HFP4G32 => hip!(gpu.gemv_hfp4g32(w.buf, x, y, m, k)),
-        Q4F16G64 => hip!(gpu.gemv_q4f16_g64(w.buf, x, y, m, k)),
-        Q4F16G32 => hip!(gpu.gemv_q4f16_g32(w.buf, x, y, m, k)),
-        Q8HFQ => hip!(gpu.gemv_q8hfq(w.buf, x, y, m, k, w.row_stride)),
-        // ParoQ4G128: weights are HFQ4G128 data; caller has already applied Givens
-        // rotation to x, so dispatch to the plain HFQ4G128 GEMV kernel.
-        ParoQ4G128 => hip!(gpu.gemv_hfq4g128(w.buf, x, y, m, k)),
-        // MQ-family Plain requires the caller to use Prerotated variant:
-        // rotation + prerotated GEMV is a two-step process managed externally.
-        _ => Err(DispatchError::UnsupportedVariant {
-            family: "gemv", variant: "plain",
-            arch: "", quant: "",
-        }),
-    }
-}
-
-// ── Prerotated GEMV dispatch ───────────────────────────
-
-fn dispatch_prerotated(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchError> {
-    let w = params.w;
-    let x = params.x;
-    let y = params.y;
-    let m = w.m;
-    let k = w.k;
-    use DType::*;
-
-    macro_rules! hip {
-        ($e:expr) => {
-            $e.map_err(|e| DispatchError::Hip(e.to_string()))
-        };
-    }
-
-    match w.dtype {
-        MQ4G256 => hip!(gpu.gemv_mq4g256_prerotated(w.buf, x, y, m, k)),
-        MQ3G256 => hip!(gpu.gemv_mq3g256_prerotated(w.buf, x, y, m, k)),
-        MQ2G256 => hip!(gpu.gemv_mq2g256_prerotated(w.buf, x, y, m, k)),
-        MQ6G256 => hip!(gpu.gemv_mq6g256_prerotated(w.buf, x, y, m, k)),
-        MQ4G128 => hip!(gpu.gemv_mq4g128_prerotated(w.buf, x, y, m, k)),
-        // MQ8 prerotated reads x from internal scratch — no x parameter.
-        MQ8G256 => hip!(gpu.gemv_mq8g256_prerotated(w.buf, y, m, k)),
-        MQ2G256Lloyd => hip!(gpu.gemv_mq2g256_lloyd(w.buf, x, y, m, k)),
-        MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd(w.buf, x, y, m, k)),
-        MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd(w.buf, x, y, m, k)),
-        MFP4G32 => hip!(gpu.gemv_mfp4g32_prerotated(w.buf, x, y, m, k)),
-        _ => Err(DispatchError::UnsupportedVariant {
-            family: "gemv", variant: "prerotated",
-            arch: "", quant: "",
-        }),
+/// Launch the concrete GEMV kernel for a resolved key. 1:1 with KernelKey.
+fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchError> {
+    use KernelKey as K;
+    let (w, x, y, m, k) = (p.w, p.x, p.y, p.w.m, p.w.k);
+    macro_rules! hip { ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) }; }
+    match key {
+        K::GemvF32 => hip!(gpu.gemv_f32(w.buf, x, y)),
+        K::GemvF16 => hip!(gpu.gemm_f16_batched_lmhead(w.buf, x, y, m, k, 1)),
+        K::GemvQ8_0 => hip!(gpu.gemv_q8_0(w.buf, x, y, m, k)),
+        K::GemvQ4K => hip!(gpu.gemv_q4k(w.buf, x, y, m, k)),
+        K::GemvQ6K => hip!(gpu.gemv_q6k(w.buf, x, y, m, k)),
+        K::GemvHfq4G256 => hip!(gpu.gemv_hfq4g256(w.buf, x, y, m, k)),
+        K::GemvHfq4G128 | K::GemvParoQ4G128 => hip!(gpu.gemv_hfq4g128(w.buf, x, y, m, k)),
+        K::GemvHfq3G256 => hip!(gpu.gemv_hfq3g256(w.buf, x, y, m, k)),
+        K::GemvHfq3G128 => hip!(gpu.gemv_hfq3g128(w.buf, x, y, m, k)),
+        K::GemvHfq2G256 => hip!(gpu.gemv_hfq2g256(w.buf, x, y, m, k)),
+        K::GemvHfq2G128 => hip!(gpu.gemv_hfq2g128(w.buf, x, y, m, k)),
+        K::GemvHfq6G256 => hip!(gpu.gemv_hfq6g256(w.buf, x, y, m, k)),
+        K::GemvHfp4G32 => hip!(gpu.gemv_hfp4g32(w.buf, x, y, m, k)),
+        K::GemvQ4F16G64 => hip!(gpu.gemv_q4f16_g64(w.buf, x, y, m, k)),
+        K::GemvQ4F16G32 => hip!(gpu.gemv_q4f16_g32(w.buf, x, y, m, k)),
+        K::GemvQ8HFQ => hip!(gpu.gemv_q8hfq(w.buf, x, y, m, k, w.row_stride)),
+        // prerotated
+        K::GemvMq4G256Prerotated => hip!(gpu.gemv_mq4g256_prerotated(w.buf, x, y, m, k)),
+        K::GemvMq3G256Prerotated => hip!(gpu.gemv_mq3g256_prerotated(w.buf, x, y, m, k)),
+        K::GemvMq2G256Prerotated => hip!(gpu.gemv_mq2g256_prerotated(w.buf, x, y, m, k)),
+        K::GemvMq6G256Prerotated => hip!(gpu.gemv_mq6g256_prerotated(w.buf, x, y, m, k)),
+        K::GemvMq4G128 => hip!(gpu.gemv_mq4g128_prerotated(w.buf, x, y, m, k)),
+        K::GemvMq8G256Prerotated => hip!(gpu.gemv_mq8g256_prerotated(w.buf, y, m, k)),
+        K::GemvMq2G256Lloyd | K::GemvMq2G256LloydPrerotated => hip!(gpu.gemv_mq2g256_lloyd(w.buf, x, y, m, k)),
+        K::GemvMq3G256Lloyd | K::GemvMq3G256LloydPrerotated => hip!(gpu.gemv_mq3g256_lloyd(w.buf, x, y, m, k)),
+        K::GemvMq4G256Lloyd | K::GemvMq4G256LloydPrerotated => hip!(gpu.gemv_mq4g256_lloyd(w.buf, x, y, m, k)),
+        K::GemvMfp4G32Prerotated => hip!(gpu.gemv_mfp4g32_prerotated(w.buf, x, y, m, k)),
+        other => return Err(DispatchError::MissingImpl { key: other }),
     }
 }
 
