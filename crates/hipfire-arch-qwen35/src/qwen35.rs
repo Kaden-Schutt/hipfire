@@ -7771,15 +7771,14 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         arch,
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
     );
-    let mq3_moe_supported = arch.starts_with("gfx12") && !lloyd_in_moe;
+    let mq3_moe_supported = arch == "gfx1151" || (arch.starts_with("gfx12") && !lloyd_in_moe);
     if mq3_in_moe && !mq3_moe_supported {
         return Err(hip_bridge::HipError::new(
             0,
             "forward_prefill_batch_single_chunk_captured: model has MQ3G256 / \
              MQ3G256Lloyd weights inside a MoE/A3B layer (DeltaNetMoe or \
-             FullAttnMoe), but only plain MQ3G256 MoE is wired and only on \
-             gfx12. Use MQ4/MQ6 for this target or run plain MQ3G256 MoE on \
-             gfx12 where the grouped-WMMA routed expert kernels are available.",
+             FullAttnMoe), but MQ3-Lloyd MoE is only wired on gfx1151, and plain \
+             MQ3G256 MoE is wired on gfx1151/gfx12. Use MQ4/MQ6 for other targets.",
         ));
     }
     if mq3_in_dense && !arch_has_wmma {
@@ -7997,7 +7996,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
     }
 
     // Cross-path safety: only plain MQ3G256 MoE is admitted, and only on
-    // gfx12 where the shared-expert HFQ3 kernels and routed grouped-WMMA
+    // gfx1151/gfx12 where the shared-expert HFQ3 kernels and routed grouped-WMMA
     // kernels are available. MQ3-Lloyd MoE remains rejected because its
     // routed expert kernels have not been wired into qwen35's MoE path.
     let arch = gpu.arch.as_str();
@@ -8039,15 +8038,14 @@ pub fn forward_prefill_batch_with_pbs_opts(
         }
         _ => false,
     });
-    let mq3_moe_supported = arch.starts_with("gfx12") && !lloyd_in_moe;
+    let mq3_moe_supported = arch == "gfx1151" || (arch.starts_with("gfx12") && !lloyd_in_moe);
     if mq3_in_moe && !mq3_moe_supported {
         return Err(hip_bridge::HipError::new(
             0,
             "forward_prefill_batch: model has MQ3G256 / MQ3G256Lloyd weights \
              inside a MoE/A3B layer (DeltaNetMoe or FullAttnMoe), but only \
-             plain MQ3G256 MoE is wired and only on gfx12. Use MQ4/MQ6 for \
-             this target or run plain MQ3G256 MoE on gfx12 where the grouped \
-             routed expert kernels are available.",
+             MQ3-Lloyd MoE is only wired on gfx1151, and plain MQ3G256 MoE is \
+             wired on gfx1151/gfx12. Use MQ4/MQ6 for other targets.",
         ));
     }
 
@@ -8660,12 +8658,16 @@ fn moe_prefill_quant_family_supported_for_arch(dtype: DType, arch: &str) -> bool
     match dtype {
         DType::MQ4G256 => true,
         // MQ6 has indexed batched gate_up/down on RDNA and grouped GEMM on
-        // gfx12. The CDNA/gfx9 atomic fallback is still MQ4-only.
+        // gfx1151/gfx12. The CDNA/gfx9 atomic fallback is still MQ4-only.
         DType::MQ6G256 => !arch.starts_with("gfx9"),
         // MQ3 currently has the shared-expert kernels plus grouped-WMMA
         // routed experts. There is no indexed fallback, so only admit where
         // grouped-WMMA is guaranteed.
-        DType::MQ3G256 => arch.starts_with("gfx12"),
+        DType::MQ3G256 => arch == "gfx1151" || arch.starts_with("gfx12"),
+        // Scalar batched/indexed bring-up kernels exist for gfx1151 only.
+        DType::MQ2G256 | DType::MQ8G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd => {
+            arch == "gfx1151"
+        }
         _ => false,
     }
 }
@@ -8673,8 +8675,8 @@ fn moe_prefill_quant_family_supported_for_arch(dtype: DType, arch: &str) -> bool
 fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
     match dtype {
         DType::MQ4G256 => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
-        DType::MQ6G256 => arch.starts_with("gfx12"),
-        DType::MQ3G256 => arch.starts_with("gfx12"),
+        DType::MQ6G256 => arch == "gfx1151" || arch.starts_with("gfx12"),
+        DType::MQ3G256 => arch == "gfx1151" || arch.starts_with("gfx12"),
         DType::ParoQ4G128 => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
         _ => false,
     }
@@ -8872,6 +8874,50 @@ fn prefill_moe_ffn_body_batched(
             ffn.shared_expert.gate.k,
             n,
         )?,
+        DType::MQ2G256 => gpu.gemm_gate_up_hfq2g256(
+            &ffn.shared_expert.gate.buf,
+            &ffn.shared_expert.up.buf,
+            &pbs.x_rot_batch,
+            shared_gate,
+            shared_up,
+            ffn.shared_expert.gate.m,
+            ffn.shared_expert.up.m,
+            ffn.shared_expert.gate.k,
+            n,
+        )?,
+        DType::MQ8G256 => gpu.gemm_gate_up_hfq8g256(
+            &ffn.shared_expert.gate.buf,
+            &ffn.shared_expert.up.buf,
+            &pbs.x_rot_batch,
+            shared_gate,
+            shared_up,
+            ffn.shared_expert.gate.m,
+            ffn.shared_expert.up.m,
+            ffn.shared_expert.gate.k,
+            n,
+        )?,
+        DType::MQ2G256Lloyd => gpu.gemm_gate_up_mq2g256_lloyd_batched(
+            &ffn.shared_expert.gate.buf,
+            &ffn.shared_expert.up.buf,
+            &pbs.x_rot_batch,
+            shared_gate,
+            shared_up,
+            ffn.shared_expert.gate.m,
+            ffn.shared_expert.up.m,
+            ffn.shared_expert.gate.k,
+            n,
+        )?,
+        DType::MQ3G256Lloyd => gpu.gemm_gate_up_mq3g256_lloyd_wmma(
+            &ffn.shared_expert.gate.buf,
+            &ffn.shared_expert.up.buf,
+            &pbs.x_rot_batch,
+            shared_gate,
+            shared_up,
+            ffn.shared_expert.gate.m,
+            ffn.shared_expert.up.m,
+            ffn.shared_expert.gate.k,
+            n,
+        )?,
         // Phase 2: PARO shared_expert.gate + up. Each weight has its own
         // Givens rotation table — rotate x_norm_batch into x_rot_batch using
         // gate's tables, GEMM, then re-rotate using up's tables, GEMM. Total
@@ -9026,6 +9072,42 @@ fn prefill_moe_ffn_body_batched(
             n,
         )?,
         DType::MQ3G256 => gpu.gemv_hfq3g256_residual_sigmoid_scaled_gpu_batched(
+            &ffn.shared_expert.down.buf,
+            shared_rot,
+            &pbs.x_batch,
+            shared_scalar,
+            ffn.shared_expert.down.m,
+            ffn.shared_expert.down.k,
+            n,
+        )?,
+        DType::MQ2G256 => gpu.gemv_hfq2g256_residual_sigmoid_scaled_gpu_batched(
+            &ffn.shared_expert.down.buf,
+            shared_rot,
+            &pbs.x_batch,
+            shared_scalar,
+            ffn.shared_expert.down.m,
+            ffn.shared_expert.down.k,
+            n,
+        )?,
+        DType::MQ8G256 => gpu.gemv_hfq8g256_residual_sigmoid_scaled_gpu_batched(
+            &ffn.shared_expert.down.buf,
+            shared_rot,
+            &pbs.x_batch,
+            shared_scalar,
+            ffn.shared_expert.down.m,
+            ffn.shared_expert.down.k,
+            n,
+        )?,
+        DType::MQ2G256Lloyd => gpu.gemv_mq2g256_lloyd_residual_sigmoid_scaled_gpu_batched(
+            &ffn.shared_expert.down.buf,
+            shared_rot,
+            &pbs.x_batch,
+            shared_scalar,
+            ffn.shared_expert.down.m,
+            ffn.shared_expert.down.k,
+            n,
+        )?,
+        DType::MQ3G256Lloyd => gpu.gemv_mq3g256_lloyd_residual_sigmoid_scaled_gpu_batched(
             &ffn.shared_expert.down.buf,
             shared_rot,
             &pbs.x_batch,
@@ -9289,6 +9371,50 @@ fn prefill_moe_ffn_body_batched(
                 k_top,
                 n,
             )?,
+            DType::MQ2G256 => gpu.gemv_hfq2g256_moe_gate_up_k8_indexed_batched(
+                &ffn.expert_gate_up_ptrs,
+                topk_indices,
+                &pbs.x_rot_batch,
+                gate_batch,
+                up_batch,
+                2 * mi,
+                gate_up_k,
+                k_top,
+                n,
+            )?,
+            DType::MQ8G256 => gpu.gemv_hfq8g256_moe_gate_up_k8_indexed_batched(
+                &ffn.expert_gate_up_ptrs,
+                topk_indices,
+                &pbs.x_rot_batch,
+                gate_batch,
+                up_batch,
+                2 * mi,
+                gate_up_k,
+                k_top,
+                n,
+            )?,
+            DType::MQ2G256Lloyd => gpu.gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched(
+                &ffn.expert_gate_up_ptrs,
+                topk_indices,
+                &pbs.x_rot_batch,
+                gate_batch,
+                up_batch,
+                2 * mi,
+                gate_up_k,
+                k_top,
+                n,
+            )?,
+            DType::MQ3G256Lloyd => gpu.gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched(
+                &ffn.expert_gate_up_ptrs,
+                topk_indices,
+                &pbs.x_rot_batch,
+                gate_batch,
+                up_batch,
+                2 * mi,
+                gate_up_k,
+                k_top,
+                n,
+            )?,
             // Phase 3 PARO routed-expert: apply the layer's shared gate_up
             // Givens rotation to x_norm_batch into x_rot_batch ONCE, then
             // dispatch the HFQ4G128 indexed batched kernel. All 256 experts
@@ -9526,6 +9652,48 @@ fn prefill_moe_ffn_body_batched(
                     k_top,
                     n,
                 )?,
+                DType::MQ2G256 => gpu.gemv_hfq2g256_moe_down_k8_indexed_batched_expanded(
+                    &ffn.expert_down_ptrs,
+                    topk_indices,
+                    rot_batch,
+                    down_expanded,
+                    down_m,
+                    down_k,
+                    k_top,
+                    n,
+                )?,
+                DType::MQ8G256 => gpu.gemv_hfq8g256_moe_down_k8_indexed_batched_expanded(
+                    &ffn.expert_down_ptrs,
+                    topk_indices,
+                    rot_batch,
+                    down_expanded,
+                    down_m,
+                    down_k,
+                    k_top,
+                    n,
+                )?,
+                DType::MQ2G256Lloyd => gpu
+                    .gemv_mq2g256_lloyd_moe_down_k8_indexed_batched_expanded(
+                        &ffn.expert_down_ptrs,
+                        topk_indices,
+                        rot_batch,
+                        down_expanded,
+                        down_m,
+                        down_k,
+                        k_top,
+                        n,
+                    )?,
+                DType::MQ3G256Lloyd => gpu
+                    .gemv_mq3g256_lloyd_moe_down_k8_indexed_batched_expanded(
+                        &ffn.expert_down_ptrs,
+                        topk_indices,
+                        rot_batch,
+                        down_expanded,
+                        down_m,
+                        down_k,
+                        k_top,
+                        n,
+                    )?,
                 // Phase 3 PARO down: the layer-shared `down` Givens rotation
                 // has already been applied to rot_batch by the
                 // fused_silu_mul_givens_rotate_f32 call above. The HFQ4G128
@@ -17837,6 +18005,28 @@ mod tests {
     }
 
     #[test]
+    fn moe_prefill_admits_gfx1151_scalar_bringup_families() {
+        for dtype in [
+            DType::MQ2G256,
+            DType::MQ8G256,
+            DType::MQ2G256Lloyd,
+            DType::MQ3G256Lloyd,
+        ] {
+            let mut dtypes = MoePrefillDtypes::uniform(dtype);
+            dtypes.router = DType::Q8_0;
+            dtypes.shared_expert_scalar_gate = DType::Q8_0;
+            assert!(
+                moe_ffn_batched_admissible_for_dtypes(&dtypes, false, "gfx1151"),
+                "{dtype:?} should be admitted for gfx1151 scalar MoE bring-up"
+            );
+            assert!(
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, false, "gfx1201"),
+                "{dtype:?} should remain gfx1151-scoped until arch-specific kernels land"
+            );
+        }
+    }
+
+    #[test]
     fn moe_prefill_admits_mq3_only_where_grouped_wmma_exists() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ3G256);
         dtypes.router = DType::Q8_0;
@@ -17844,7 +18034,7 @@ mod tests {
         assert!(moe_ffn_batched_admissible_for_dtypes(
             &dtypes, false, "gfx1201"
         ));
-        assert!(!moe_ffn_batched_admissible_for_dtypes(
+        assert!(moe_ffn_batched_admissible_for_dtypes(
             &dtypes, false, "gfx1151"
         ));
     }
@@ -17893,7 +18083,7 @@ mod tests {
             DType::MQ4G256,
             "gfx1201"
         ));
-        assert!(!moe_grouped_gemm_supported_for_dtype(
+        assert!(moe_grouped_gemm_supported_for_dtype(
             DType::MQ6G256,
             "gfx1151"
         ));
@@ -17905,8 +18095,12 @@ mod tests {
             DType::MQ3G256,
             "gfx1201"
         ));
-        assert!(!moe_grouped_gemm_supported_for_dtype(
+        assert!(moe_grouped_gemm_supported_for_dtype(
             DType::MQ3G256,
+            "gfx1151"
+        ));
+        assert!(!moe_grouped_gemm_supported_for_dtype(
+            DType::MQ2G256Lloyd,
             "gfx1151"
         ));
     }

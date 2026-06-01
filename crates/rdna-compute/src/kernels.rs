@@ -60,6 +60,8 @@ pub const GEMM_HFQ4G128_MMQ_GFX1151_SRC: &str =
 /// HFQ2-G256: flat 2-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][64B data] = 72 bytes per 256 weights (0.28 B/w).
 pub const GEMV_HFQ2G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2g256.hip");
+pub const MOE_MQ_GFX1151_SCALAR_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/moe_mq_gfx1151_scalar_batched.hip");
 
 /// MQ2G256Lloyd: 2-bit + per-block 4-entry fp16 codebook (72 B/group).
 pub const GEMV_MQ2G256_LLOYD_SRC: &str =
@@ -1347,9 +1349,12 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K4_GFX12_SRC: &str =
 /// + 192 B packed 6-bit). The kernel is dtype-agnostic between HFQ6 and
 /// MQ6 — MQ6G256 uses the identical 200 B layout and the caller applies
 /// the FWHT rotation to X before dispatch, same convention as MQ4/HFQ4.
-/// **gfx12 (RDNA4) only.** Unblocks AWQ A3B prefill (~50% of experts MQ6).
+/// gfx12 and gfx1151 (RDNA3.5). Unblocks AWQ A3B prefill
+/// (~50% of experts MQ6) on the current gfx1151 development target.
 pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma.gfx12.hip");
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma.gfx1151.hip");
 
 /// M-direction 2×1 reg-blocked sister of GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC.
 /// Each warp covers a 32-row × 16-slot output tile (vs 16×16 in v1); per
@@ -1362,7 +1367,7 @@ pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
 pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma_v2.gfx12.hip");
 
-/// gfx12 (RDNA4) HFQ3/MQ3 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC.
+/// gfx12/gfx1151 HFQ3/MQ3 sister of the HFQ4 grouped MoE WMMA kernels.
 /// Same WMMA tile geometry + expert_tile_ids sentinel pattern + kernarg
 /// layout; differs in dequant (HFQ3-G256 = 104 B/group, 8 × 3-bit chunks
 /// packed across 24 bits per 3-byte slice). Same FWHT-rotated 3-bit
@@ -1370,6 +1375,8 @@ pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC: &str =
 /// is applied by the caller, matching the MQ4/HFQ4 dispatch convention).
 pub const GEMM_HFQ3G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq3g256_moe_grouped_wmma.gfx12.hip");
+pub const GEMM_HFQ3G256_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq3g256_moe_grouped_wmma.gfx1151.hip");
 
 /// i8 MMQ sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC for gfx11 dGPUs
 /// (gfx1100/1101/1102/1103 — 7900 XTX, 7800/7700, 7600, Phoenix mobile).
