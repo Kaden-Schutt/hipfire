@@ -5210,6 +5210,20 @@ fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
             .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
 }
 
+/// Mixed Qwen3.5 A3B path where router/scalar still need plain RMSNorm(x)
+/// but routed MQ2-Lloyd experts need FWHT(RMSNorm(x)). Use the plain+rotated
+/// fused norm kernel, then feed `s.tmp` (plain) and `s.moe_x_rot` (rotated)
+/// into `moe_ffn_decode_impl`.
+fn ffn_routed_mq2_lloyd_plain_prerotate_for_moe(ffn: &MoeFfnWeights) -> bool {
+    let Some(first) = ffn.experts.first() else {
+        return false;
+    };
+    first.gate_up.gpu_dtype == DType::MQ2G256Lloyd
+        && first.down.gpu_dtype == DType::MQ2G256Lloyd
+        && first.gate_up.awq_scale.is_none()
+        && first.down.awq_scale.is_none()
+}
+
 /// Detect any MQ3G256 / MQ3G256Lloyd weight inside a MoE FFN block (router,
 /// shared expert gate/up/down, shared_expert_gate router-mix scalar, or any
 /// routed expert's gate_up/down). The MoE batched FFN kernels assume HFQ4
@@ -5264,7 +5278,8 @@ fn moe_ffn_decode_with_scratch(
 /// already populated `scratch.moe_x_rot` with FWHT-rotated post-rmsnorm x
 /// (e.g. via a fused `fused_rmsnorm_rotate_mq` launch at the call site).
 /// For all-MQ4 MoE layers this saves one launch per layer by eliding the
-/// internal `rotate_x_mq`. On non-MQ4 layers this flag is ignored.
+/// internal `rotate_x_mq`. Mixed routed MQ2-Lloyd layers can also use
+/// this path when the caller separately provides the plain RMSNorm output.
 fn moe_ffn_decode_with_scratch_prerotated(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
@@ -5498,29 +5513,45 @@ fn moe_ffn_decode_impl(
         if shared_gate_up_mq4 {
             // Mixed router/scalar dtypes cannot use the 4-way fused gate-side
             // kernel, but shared gate+up can still share one MQ4 rotation.
-            gpu.ensure_mq_signs()?;
-            let shared_x_rot = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            rotate_x_mq_for(
-                gpu,
-                &ffn.shared_expert.gate,
-                x_norm,
-                &shared_x_rot,
-                ffn.shared_expert.gate.k,
-            )?;
-            gpu.fused_gate_up_hfq4g256(
-                &ffn.shared_expert.gate.buf,
-                &ffn.shared_expert.up.buf,
-                &shared_x_rot,
-                &shared_gate,
-                &shared_up,
-                ffn.shared_expert.gate.m,
-                ffn.shared_expert.up.m,
-                ffn.shared_expert.gate.k,
-            )?;
+            if x_rot_prerotated
+                && ffn.shared_expert.gate.awq_scale.is_none()
+                && ffn.shared_expert.up.awq_scale.is_none()
+            {
+                gpu.fused_gate_up_hfq4g256(
+                    &ffn.shared_expert.gate.buf,
+                    &ffn.shared_expert.up.buf,
+                    s.x_rot_local,
+                    &shared_gate,
+                    &shared_up,
+                    ffn.shared_expert.gate.m,
+                    ffn.shared_expert.up.m,
+                    ffn.shared_expert.gate.k,
+                )?;
+            } else {
+                gpu.ensure_mq_signs()?;
+                let shared_x_rot = GpuTensor {
+                    buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                    shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                    dtype: DType::F32,
+                };
+                rotate_x_mq_for(
+                    gpu,
+                    &ffn.shared_expert.gate,
+                    x_norm,
+                    &shared_x_rot,
+                    ffn.shared_expert.gate.k,
+                )?;
+                gpu.fused_gate_up_hfq4g256(
+                    &ffn.shared_expert.gate.buf,
+                    &ffn.shared_expert.up.buf,
+                    &shared_x_rot,
+                    &shared_gate,
+                    &shared_up,
+                    ffn.shared_expert.gate.m,
+                    ffn.shared_expert.up.m,
+                    ffn.shared_expert.gate.k,
+                )?;
+            }
         } else {
             weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
             weight_gemv(gpu, &ffn.shared_expert.up, x_norm, &shared_up)?;
@@ -15496,6 +15527,18 @@ fn forward_scratch_layers(
                         config.norm_eps,
                     )?;
                     moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s)?;
+                } else if ffn_routed_mq2_lloyd_plain_prerotate_for_moe(&layer.ffn) {
+                    gpu.fused_rmsnorm_rotate_mq_plain(
+                        &s.x,
+                        &layer.ffn_norm,
+                        s.moe_x_rot.as_ref().expect("MoE scratch"),
+                        &s.tmp,
+                        config.dim,
+                        config.norm_eps,
+                    )?;
+                    moe_ffn_decode_with_scratch_prerotated(
+                        gpu, &layer.ffn, &s.tmp, &s.x, config, s,
+                    )?;
                 } else {
                     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
                     moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
@@ -15992,6 +16035,18 @@ fn forward_scratch_layers(
                         config.norm_eps,
                     )?;
                     moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s)?;
+                } else if ffn_routed_mq2_lloyd_plain_prerotate_for_moe(&layer.ffn) {
+                    gpu.fused_rmsnorm_rotate_mq_plain(
+                        &s.x,
+                        &layer.ffn_norm,
+                        s.moe_x_rot.as_ref().expect("MoE scratch"),
+                        &s.tmp,
+                        config.dim,
+                        config.norm_eps,
+                    )?;
+                    moe_ffn_decode_with_scratch_prerotated(
+                        gpu, &layer.ffn, &s.tmp, &s.x, config, s,
+                    )?;
                 } else {
                     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
                     moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
@@ -17185,6 +17240,18 @@ fn forward_scratch_layers_multi(
                         moe_ffn_decode_with_scratch_prerotated(
                             gpu, &layer.ffn, &s.x, &s.x, config, s,
                         )?;
+                    } else if ffn_routed_mq2_lloyd_plain_prerotate_for_moe(&layer.ffn) {
+                        gpu.fused_rmsnorm_rotate_mq_plain(
+                            &s.x,
+                            &layer.ffn_norm,
+                            s.moe_x_rot.as_ref().expect("MoE scratch"),
+                            &s.tmp,
+                            config.dim,
+                            config.norm_eps,
+                        )?;
+                        moe_ffn_decode_with_scratch_prerotated(
+                            gpu, &layer.ffn, &s.tmp, &s.x, config, s,
+                        )?;
                     } else {
                         gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
                         moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
@@ -17610,6 +17677,18 @@ fn forward_scratch_layers_multi(
                         )?;
                         moe_ffn_decode_with_scratch_prerotated(
                             gpu, &layer.ffn, &s.x, &s.x, config, s,
+                        )?;
+                    } else if ffn_routed_mq2_lloyd_plain_prerotate_for_moe(&layer.ffn) {
+                        gpu.fused_rmsnorm_rotate_mq_plain(
+                            &s.x,
+                            &layer.ffn_norm,
+                            s.moe_x_rot.as_ref().expect("MoE scratch"),
+                            &s.tmp,
+                            config.dim,
+                            config.norm_eps,
+                        )?;
+                        moe_ffn_decode_with_scratch_prerotated(
+                            gpu, &layer.ffn, &s.tmp, &s.x, config, s,
                         )?;
                     } else {
                         gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
