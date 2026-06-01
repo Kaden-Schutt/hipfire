@@ -223,26 +223,6 @@ extern "C" __global__ void gemv_paro4g128_swiglu_residual(
     gemv_paro4g128_impl<true, true, false, false>(A, gate, up, y, M, K);
 }
 
-__launch_bounds__(32, 8)
-extern "C" __global__ void gemv_paro4g128t_direct(
-    const char* __restrict__ A,
-    const float* __restrict__ x,
-    float* __restrict__ y,
-    int M, int K
-) {
-    gemv_paro4g128_impl<false, false, true, true>(A, x, nullptr, y, M, K);
-}
-
-__launch_bounds__(32, 8)
-extern "C" __global__ void gemv_paro4g128t_direct_residual(
-    const char* __restrict__ A,
-    const float* __restrict__ x,
-    float* __restrict__ y,
-    int M, int K
-) {
-    gemv_paro4g128_impl<true, false, true, true>(A, x, nullptr, y, M, K);
-}
-
 template <bool SWIGLU, bool PRECOMPUTED_TRIG>
 static __device__ void paro4g128_rotate_impl(
     const char* __restrict__ A,

@@ -600,17 +600,6 @@ impl LlamaWeights {
     }
 }
 
-/// Dispatch GEMV for a weight tensor (quantized or F32).
-/// y = W * x where W is the weight tensor, x is F32 input, y is F32 output.
-fn paro_small_direct_limit() -> Option<usize> {
-    let raw = std::env::var_os("HIPFIRE_PARO_SMALL_DIRECT")?;
-    let text = raw.to_string_lossy();
-    if text.is_empty() || text == "1" {
-        return Some(64);
-    }
-    text.parse::<usize>().ok()
-}
-
 
 
 #[cfg(feature = "new-dispatch")]
@@ -680,11 +669,8 @@ pub fn weight_gemv(
                 residual: None, gate: None, up: None,
             }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
-        // PARO4G128T: env-var gated + shape-gated, model-layer ParoRotation needed
+        // PARO4G128T: prerotate then GEMV
         DType::PARO4G128T => {
-            if paro_small_direct_limit().is_some_and(|limit| w.m <= limit) {
-                return gpu.gemv_paro4g128t_direct(&w.buf, x, y, w.m, w.k);
-            }
             gpu.ensure_mq_signs()?;
             let xr = xr!();
             gpu.gemv_paro4g128t_with_prerotate(&w.buf, x, y, &xr, w.m, w.k)
@@ -751,9 +737,6 @@ pub fn weight_gemv(
         DType::HFQ4G128 => gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k),
         DType::PARO4G128 => gpu.gemv_paro4g128(&w.buf, x, y, w.m, w.k),
         DType::PARO4G128T => {
-            if paro_small_direct_limit().is_some_and(|limit| w.m <= limit) {
-                return gpu.gemv_paro4g128t_direct(&w.buf, x, y, w.m, w.k);
-            }
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -1289,9 +1272,6 @@ pub fn weight_gemv_residual(
         }
         DType::PARO4G128 => gpu.gemv_paro4g128_residual(&w.buf, x, y, w.m, w.k),
         DType::PARO4G128T => {
-            if paro_small_direct_limit().is_some_and(|limit| w.m <= limit) {
-                return gpu.gemv_paro4g128t_direct_residual(&w.buf, x, y, w.m, w.k);
-            }
             gpu.ensure_mq_signs()?;
             let xr = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -1338,9 +1318,6 @@ pub fn weight_gemv_residual(
         DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
         DType::PARO4G128 => gpu.gemv_paro4g128_residual(&w.buf, x, y, w.m, w.k),
         DType::PARO4G128T => {
-            if paro_small_direct_limit().is_some_and(|limit| w.m <= limit) {
-                return gpu.gemv_paro4g128t_direct_residual(&w.buf, x, y, w.m, w.k);
-            }
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -5344,16 +5321,6 @@ mod tests {
         for arch in ["gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx942"] {
             assert!(is_batchable_la(DType::Q8_0, arch));
         }
-    }
-
-    // ── ParoQuant dispatch helpers ──────────────────────────────
-
-    #[test]
-    fn paro_small_direct_returns_none_when_unset() {
-        // With env var unset, should return None
-        // (can't clear env in test, but this verifies the conversion logic)
-        // The function returns None when env var is not set (via try_opt)
-        // We test the parsing behavior with a lock
     }
 
     // ── KvCache format dispatch ─────────────────────────────────
