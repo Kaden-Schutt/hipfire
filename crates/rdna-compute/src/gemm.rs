@@ -14922,8 +14922,26 @@ impl Gpu {
         m: usize, k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gemm_f16_wmma_mb8", kernels::GEMM_F16_WMMA_MB8_SRC, "gemm_f16_wmma_mb8")?;
-        let func = &self.functions["gemm_f16_wmma_mb8"];
+        let (kernel_name, kernel_src, symbol) = if self.arch_caps.has_wmma_w32_gfx12() {
+            (
+                "gemm_f16_wmma_mb8_gfx12",
+                kernels::GEMM_F16_WMMA_MB8_GFX12_SRC,
+                "gemm_f16_wmma_mb8_gfx12",
+            )
+        } else if self.arch_caps.has_wmma_w32() {
+            (
+                "gemm_f16_wmma_mb8",
+                kernels::GEMM_F16_WMMA_MB8_SRC,
+                "gemm_f16_wmma_mb8",
+            )
+        } else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("gemm_f16_wmma_mb8 requires wave32 WMMA; arch={} does not support it.", self.arch),
+            ));
+        };
+        self.ensure_kernel(kernel_name, kernel_src, symbol)?;
+        let func = &self.functions[kernel_name];
         let mut wp = w.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();

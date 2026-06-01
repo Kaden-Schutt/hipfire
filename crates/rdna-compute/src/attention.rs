@@ -4102,7 +4102,19 @@ impl Gpu {
             n_heads % n_kv_heads == 0,
             "attention_dflash_wmma_m64_n32_f16kv_v5_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
         );
-        if !self.arch_caps.has_wmma_w32() {
+        let (kernel_name, kernel_src, symbol) = if self.arch_caps.has_wmma_w32_gfx12() {
+            (
+                "attention_dflash_wmma_m64_n32_f16kv_v5_f32_gfx12",
+                kernels::ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V5_GFX12_SRC,
+                "attention_dflash_wmma_m64_n32_f16kv_v5_f32_gfx12",
+            )
+        } else if self.arch_caps.has_wmma_w32() {
+            (
+                "attention_dflash_wmma_m64_n32_f16kv_v5_f32",
+                kernels::ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V5_SRC,
+                "attention_dflash_wmma_m64_n32_f16kv_v5_f32",
+            )
+        } else {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
@@ -4111,13 +4123,9 @@ impl Gpu {
                     self.arch
                 ),
             ));
-        }
-        self.ensure_kernel(
-            "attention_dflash_wmma_m64_n32_f16kv_v5_f32",
-            kernels::ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V5_SRC,
-            "attention_dflash_wmma_m64_n32_f16kv_v5_f32",
-        )?;
-        let func = &self.functions["attention_dflash_wmma_m64_n32_f16kv_v5_f32"];
+        };
+        self.ensure_kernel(kernel_name, kernel_src, symbol)?;
+        let func = &self.functions[kernel_name];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
         let v_tile = 32usize;

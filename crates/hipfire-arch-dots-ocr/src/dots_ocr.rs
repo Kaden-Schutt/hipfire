@@ -724,10 +724,10 @@ pub(crate) fn linear_f16(
     // whole buffer as ONE row of length `n * out_dim` and reads the
     // norm-weight (length out_dim) out of bounds -> sticky HIP fault.
     let y = gpu.alloc_tensor(&[n, out_dim], DType::F32)?;
-    // gfx1100+ (RDNA3 / RDNA3.5) — use the fused-transpose WMMA variant.
+    // gfx11/gfx12 — use the fused-transpose WMMA variant.
     // It writes row-major `[n, out_dim]` directly, dropping the separate
     // transpose_f32 kernel that the older `gemm_f16_wmma` path required.
-    if gpu.arch_caps.has_wmma_w32() {
+    if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() {
         gpu.gemm_f16_wmma_mb8(w, x, &y, out_dim, in_dim, n)?;
     } else {
         let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
@@ -758,7 +758,7 @@ pub(crate) fn linear_f16_no_bias(
     let y = gpu.alloc_tensor(&[n, out_dim], DType::F32)?;
     // See [`linear_f16`] for the fused-transpose WMMA rationale and the
     // 2-D output-shape requirement.
-    if gpu.arch_caps.has_wmma_w32() {
+    if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() {
         gpu.gemm_f16_wmma_mb8(w, x, &y, out_dim, in_dim, n)?;
     } else {
         let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
@@ -882,13 +882,21 @@ pub fn vision_forward(
 
     let t0 = std::time::Instant::now();
     let use_wmma = gpu.arch_caps.has_wmma_w32();
+    let use_gfx12_wmma = gpu.arch_caps.has_wmma_w32_gfx12();
+    let use_dots_v5_wmma = use_wmma || use_gfx12_wmma;
     eprintln!(
         "  vision forward (dots-ocr GPU): {n_patches} patches, {grid_h}×{grid_w} grid, {} blocks",
         cfg.num_hidden_layers,
     );
     eprintln!(
         "  vision kernels: {}",
-        if use_wmma { "rdna3-wmma" } else { "scalar-fallback" },
+        if use_wmma {
+            "rdna3-wmma"
+        } else if use_gfx12_wmma {
+            "rdna4-wmma"
+        } else {
+            "scalar-fallback"
+        },
     );
 
     // HIPFIRE_DOTS_OCR_DUMP_DIR=<path>: dump full per-stage tensor
@@ -1110,7 +1118,7 @@ pub fn vision_forward(
         // For dots.ocr (head_dim=128) use the v5 M=64/V_tile=32 f16-K/V
         // O-register-resident path. V_tile=32 keeps LDS small enough for
         // 2 WG/CU at the smoke-image shape.
-        if use_wmma && head_dim == 128 && n_patches >= 64 {
+        if use_dots_v5_wmma && head_dim == 128 && n_patches >= 64 {
             let k_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             let v_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             gpu.cast_f32_to_f16(&k_buf, &k_f16)?;

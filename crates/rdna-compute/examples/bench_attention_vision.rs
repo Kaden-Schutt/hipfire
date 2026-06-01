@@ -63,6 +63,31 @@ fn main() {
     gpu.cast_f32_to_f16(&d_k, &d_k_f16).unwrap();
     gpu.cast_f32_to_f16(&d_v, &d_v_f16).unwrap();
 
+    if gpu.arch_caps.has_wmma_w32_gfx12() {
+        eprintln!("gfx12: running production dots.ocr v5 path; older gfx11 experiment variants are skipped");
+        gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(
+            &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
+        ).unwrap();
+        gpu.hip.device_synchronize().unwrap();
+
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(
+                &d_q, &d_k_f16, &d_v_f16, &d_out, b, l, n_heads, n_kv_heads, hd,
+            ).unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        eprintln!("M=64 N=32  v5 gfx12 (V_tile=32): {:.1} ms / iter ({iters} iters)", t.elapsed().as_secs_f32() * 1000.0 / iters as f32);
+
+        gpu.free_tensor(d_q).unwrap();
+        gpu.free_tensor(d_k).unwrap();
+        gpu.free_tensor(d_v).unwrap();
+        gpu.free_tensor(d_k_f16).unwrap();
+        gpu.free_tensor(d_v_f16).unwrap();
+        gpu.free_tensor(d_out).unwrap();
+        return;
+    }
+
     // Warm-up.
     gpu.attention_dflash_wmma_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
     gpu.attention_dflash_wmma_m32_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd).unwrap();
