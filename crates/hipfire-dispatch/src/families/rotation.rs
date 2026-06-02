@@ -2,7 +2,6 @@
 use crate::context::DispatchCtx;
 use crate::tables::KernelRegistry;
 use crate::types::*;
-use hip_bridge::HipResult;
 use rdna_compute::{Gpu, GpuTensor};
 
 /// Parameters for a rotation family dispatch call.
