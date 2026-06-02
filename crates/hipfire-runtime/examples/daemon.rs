@@ -2272,6 +2272,9 @@ fn main() {
                         if let Some(ref mut s) = m.deepseek4_state {
                             s.reset();
                         }
+                        if let Some(ref mut ad) = m.kv_adaptive {
+                            ad.reset();
+                        }
                     }
                     if image_base64.is_some() && image.is_some() {
                         eprintln!(
@@ -2525,6 +2528,12 @@ fn main() {
                         // ensures we retrace warmup → capture → replay
                         // rather than jumping straight back to replay.
                         gpu.invalidate_graph_state();
+                    }
+                    // Restore adaptive-KV controller to start tier (q8/fwht4)
+                    // so thresholds fire correctly on the fresh conversation
+                    // instead of staying pinned at the floor tier.
+                    if let Some(ref mut ad) = m.kv_adaptive {
+                        ad.reset();
                     }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
@@ -5694,6 +5703,24 @@ fn generate_dflash(
             m.seq_pos = 0;
             m.conversation_tokens.clear();
             free_checkpoints(&mut m.dflash_checkpoints, gpu);
+            // Zero DeltaNet recurrent state so the next AR turn cold-prefills
+            // over clean buffers. Without this, stale mid-decode recurrent
+            // state from the aborted DFlash run corrupts the next generation
+            // (drift → premature EOS). Mirrors grammar-dflash reset above.
+            if let Some(ref dn) = m.dn_state {
+                for s in &dn.s_matrices {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for s in &dn.s_scales {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for s in &dn.conv_states {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+            }
+            if let Some(kv) = m.kv_cache.as_mut() {
+                kv.compact_offset = 0;
+            }
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -6156,6 +6183,8 @@ fn generate_multi(
         );
         m.seq_pos = 0;
         m.conversation_tokens.clear();
+        free_checkpoints(&mut m.prefill_checkpoints, gpu);
+        free_checkpoints(&mut m.dflash_checkpoints, gpu);
         if let (Some(ref dn), Some(ref mut gpus), Some(ref la)) = (
             m.dn_state.as_ref(),
             m.pp_gpus.as_mut(),
@@ -6179,6 +6208,9 @@ fn generate_multi(
         }
         if let Some(kv) = m.kv_cache.as_mut() {
             kv.compact_offset = 0;
+        }
+        if let Some(ad) = m.kv_adaptive.as_mut() {
+            ad.reset();
         }
     }
 
@@ -7138,6 +7170,8 @@ fn generate(
         );
         m.seq_pos = 0;
         m.conversation_tokens.clear();
+        free_checkpoints(&mut m.prefill_checkpoints, gpu);
+        free_checkpoints(&mut m.dflash_checkpoints, gpu);
         // Zero DeltaNet state on reset
         if let Some(ref dn) = m.dn_state {
             for s in &dn.s_matrices {
@@ -7155,6 +7189,9 @@ fn generate(
         }
         if let Some(kv) = m.llama_kv.as_mut() {
             kv.compact_offset = 0;
+        }
+        if let Some(ad) = m.kv_adaptive.as_mut() {
+            ad.reset();
         }
     }
 
@@ -7950,11 +7987,18 @@ fn generate(
                 // re-quantizes [0, seq_pos) down a tier, freeing room for the next
                 // chunk. `m.kv_adaptive` is disjoint from the live kv/dn borrows.
                 if let Some(ad) = m.kv_adaptive.as_mut() {
-                    for step in ad.maybe_downshift(gpu, kv, m.seq_pos).unwrap() {
-                        eprintln!(
-                            "[adaptive-kv] downshift @ pos {} (prefill): {:?} (K={:?} V={:?})",
-                            m.seq_pos, step, ad.cur_k, ad.cur_v
-                        );
+                    match ad.maybe_downshift(gpu, kv, m.seq_pos) {
+                        Ok(steps) => {
+                            for step in steps {
+                                eprintln!(
+                                    "[adaptive-kv] downshift @ pos {} (prefill): {:?} (K={:?} V={:?})",
+                                    m.seq_pos, step, ad.cur_k, ad.cur_v
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[adaptive-kv] maybe_downshift error @ pos {} (prefill): {:?} — skipping", m.seq_pos, e);
+                        }
                     }
                 }
                 // Snapshot the recurrent state every ckpt_interval() tokens so a
@@ -8013,12 +8057,18 @@ fn generate(
         // decode starts). `kv` (=m.kv_cache) and m.kv_adaptive are distinct
         // fields → NLL splits the borrow.
         if let Some(ad) = m.kv_adaptive.as_mut() {
-            let applied = ad.maybe_downshift(gpu, kv, m.seq_pos).unwrap();
-            for step in &applied {
-                eprintln!(
-                    "[adaptive-kv] downshift @ pos {}: {:?} (K={:?} V={:?})",
-                    m.seq_pos, step, ad.cur_k, ad.cur_v
-                );
+            match ad.maybe_downshift(gpu, kv, m.seq_pos) {
+                Ok(applied) => {
+                    for step in &applied {
+                        eprintln!(
+                            "[adaptive-kv] downshift @ pos {}: {:?} (K={:?} V={:?})",
+                            m.seq_pos, step, ad.cur_k, ad.cur_v
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[adaptive-kv] maybe_downshift error @ pos {} (post-prefill): {:?} — skipping", m.seq_pos, e);
+                }
             }
         }
         m.conversation_tokens.extend_from_slice(&new_tokens);
@@ -8358,12 +8408,18 @@ fn generate(
             // thresholds. `kv` (=m.kv_cache) and m.kv_adaptive are distinct
             // fields → NLL splits the borrow.
             if let Some(ad) = m.kv_adaptive.as_mut() {
-                let applied = ad.maybe_downshift(gpu, kv, m.seq_pos).unwrap();
-                for step in &applied {
-                    eprintln!(
-                        "[adaptive-kv] downshift @ pos {}: {:?} (K={:?} V={:?})",
-                        m.seq_pos, step, ad.cur_k, ad.cur_v
-                    );
+                match ad.maybe_downshift(gpu, kv, m.seq_pos) {
+                    Ok(applied) => {
+                        for step in &applied {
+                            eprintln!(
+                                "[adaptive-kv] downshift @ pos {}: {:?} (K={:?} V={:?})",
+                                m.seq_pos, step, ad.cur_k, ad.cur_v
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[adaptive-kv] maybe_downshift error @ pos {} (decode): {:?} — skipping", m.seq_pos, e);
+                    }
                 }
             }
 
@@ -10499,6 +10555,8 @@ fn generate_vl(
         );
         m.seq_pos = 0;
         m.conversation_tokens.clear();
+        free_checkpoints(&mut m.prefill_checkpoints, gpu);
+        free_checkpoints(&mut m.dflash_checkpoints, gpu);
         if let Some(ref dn) = m.dn_state {
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -10512,6 +10570,9 @@ fn generate_vl(
         }
         if let Some(kv) = m.kv_cache.as_mut() {
             kv.compact_offset = 0;
+        }
+        if let Some(ad) = m.kv_adaptive.as_mut() {
+            ad.reset();
         }
     }
 

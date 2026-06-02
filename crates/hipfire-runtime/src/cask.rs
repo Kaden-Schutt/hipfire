@@ -132,10 +132,14 @@ impl CaskCtx {
         // Scratch GPU buffers for per-layer (indices, weights) table. Small
         // (budget × m × 4 B each), allocated once per call. Reusing across
         // layers to avoid repeated allocs.
+        //
+        // GpuTensor has no Drop impl — bare scope exit leaks device memory.
+        // Capture every fallible exit inside a closure and free on ALL paths.
         let table_len = budget * self.fold_m;
         let indices_dev = gpu.alloc_tensor(&[table_len], rdna_compute::DType::F32)?;
         let weights_dev = gpu.alloc_tensor(&[table_len], rdna_compute::DType::F32)?;
 
+        let inner_result = (|| -> HipResult<()> {
         for (fa_i, &layer_idx) in self.base.fa_layer_ids.iter().enumerate() {
             // 1. TriAttention scoring (GPU), mode-appropriate.
             let offset = fa_i * self.base.centers_per_layer;
@@ -310,6 +314,15 @@ impl CaskCtx {
                 budget * v_row_bytes,
             )?;
         }
+        Ok(())
+        })();
+
+        // Free the per-eviction scratch GPU buffers on EVERY exit path.
+        // GpuTensor has no Drop impl — bare scope exit (including ? returns
+        // inside the closure above) would leak device memory.
+        let _ = gpu.free_tensor(indices_dev);
+        let _ = gpu.free_tensor(weights_dev);
+        inner_result?;
 
         // Output size is always `budget` slots (core_slots + merge_slots = budget).
         kv.compact_offset += current_physical - budget;

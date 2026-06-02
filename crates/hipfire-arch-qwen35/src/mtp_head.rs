@@ -724,10 +724,12 @@ impl Qwen35MtpHeadKvCache {
         Ok(())
     }
 
-    pub fn free_gpu(self, _gpu: &mut Gpu) {
-        // llama::KvCache owns its GpuTensors; they free on Drop.
-        // Explicit method kept for API parity with old callers.
-        drop(self.inner);
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        // llama::KvCache holds GpuTensors with NO Drop impl — dropping it
+        // leaks the k_gpu/v_gpu buffers. Free them explicitly. (The old
+        // "they free on Drop" comment was false; see mtp_spec/mtp_compose
+        // which already bypass this wrapper for the same reason.)
+        self.inner.free_gpu(gpu);
     }
 }
 
