@@ -640,13 +640,11 @@ pub fn weight_gemv(
     x: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
-    use std::sync::OnceLock;
     use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
+    use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
     use hipfire_dispatch::types::{dtype_needs_rotation, GemvVariant};
 
-    static GEMV: OnceLock<GemvFamily> = OnceLock::new();
-    let gemv = GEMV.get_or_init(|| GemvFamily::new());
+    let gemv = crate::llama::gemv_family();
     let ctx = DispatchCtx::new(gpu);
     let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
 
@@ -674,6 +672,7 @@ pub fn weight_gemv(
         }
         // MQ4G128 uses G128 rotation (rotate_x_mq_128, sign seeds 43/1043)
         DType::MQ4G128 => {
+            use std::sync::OnceLock;
             use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
             static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
             let rotation = ROTATION.get_or_init(|| RotationFamily::new());
@@ -696,6 +695,7 @@ pub fn weight_gemv(
         // HFQ4-G128 GEMV. Uses RotationFamily::run(Givens) which calls
         // givens_rotate_to (copy_d2d + rotate in one kernel).
         DType::ParoQ4G128 => {
+            use std::sync::OnceLock;
             use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
             static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
             let rotation = ROTATION.get_or_init(|| RotationFamily::new());
@@ -1000,13 +1000,11 @@ pub fn weight_gemv_prerotated(
     x_rot: Option<&GpuTensor>,
     y: &GpuTensor,
 ) -> HipResult<()> {
-    use std::sync::OnceLock;
     use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::gemv::{GemvFamily, WeightRef};
+    use hipfire_dispatch::families::gemv::WeightRef;
     use hipfire_dispatch::types::dtype_needs_rotation;
 
-    static GEMV: OnceLock<GemvFamily> = OnceLock::new();
-    let gemv = GEMV.get_or_init(|| GemvFamily::new());
+    let gemv = crate::llama::gemv_family();
     let ctx = DispatchCtx::new(gpu);
 
     if w.gpu_dtype == DType::MQ8G256 {
@@ -1117,13 +1115,11 @@ pub fn weight_gemv_residual(
     x: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
-    use std::sync::OnceLock;
     use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
+    use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
     use hipfire_dispatch::types::GemvVariant;
 
-    static GEMV: OnceLock<GemvFamily> = OnceLock::new();
-    let gemv = GEMV.get_or_init(|| GemvFamily::new());
+    let gemv = crate::llama::gemv_family();
     let ctx = DispatchCtx::new(gpu);
     let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
 
@@ -1255,13 +1251,11 @@ pub fn weight_gemv_swiglu_residual(
     ffn_hidden_scratch: &GpuTensor,
     x: &GpuTensor,
 ) -> HipResult<()> {
-    use std::sync::OnceLock;
     use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
+    use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
     use hipfire_dispatch::types::GemvVariant;
 
-    static GEMV: OnceLock<GemvFamily> = OnceLock::new();
-    let gemv = GEMV.get_or_init(|| GemvFamily::new());
+    let gemv = crate::llama::gemv_family();
     let ctx = DispatchCtx::new(gpu);
     let wr = WeightRef { buf: &w_down.buf, dtype: w_down.gpu_dtype, m: w_down.m, k: w_down.k, row_stride: 0, rotation: None, awq_scale: None };
 

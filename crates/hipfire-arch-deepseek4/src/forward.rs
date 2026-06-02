@@ -148,11 +148,9 @@ fn gemv_auto(
     k: usize,
 ) -> Result<(), String> {
     use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::gemv::{GemvFamily, WeightRef};
-    use std::sync::OnceLock;
+    use hipfire_dispatch::families::gemv::WeightRef;
 
-    static GEMV: OnceLock<GemvFamily> = OnceLock::new();
-    let gemv = GEMV.get_or_init(|| GemvFamily::new());
+    let gemv = hipfire_runtime::llama::gemv_family();
     let ctx = DispatchCtx::new(gpu);
     let x = if weight_needs_fwht(weight) { x_rotated } else { x_plain };
     let wr = WeightRef { buf: weight, dtype: weight.dtype, m, k };
