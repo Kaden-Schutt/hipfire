@@ -882,3 +882,5 @@ Key design decisions were informed by the following preliminary analyses
 | `56425127` | Opt 3: per-band GDN tape replay (+21.7% decode tok/s on 27B) |
 | `54d2c68a` | Fix double-semicolon warning |
 | `ff155303` | Update plan with §14 |
+| `61a6653d` | Clean up for PR: delete superseded plans, add attribution |
+| `820897d7` | Re-integrate DeepSeek V4 daemon serving from master |
