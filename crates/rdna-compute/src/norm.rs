@@ -484,6 +484,11 @@ impl Gpu {
         q: &GpuTensor, k: &GpuTensor, positions: &GpuTensor,
         n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot: usize,
         freq_base: f32, batch_size: usize,
+        // Added to each positions[b] for the RoPE angle only (the caller's KV-write
+        // keeps the raw physical positions). Pass kv_cache.compact_offset so batched
+        // Q/K rotate at absolute phase after eviction/compaction; pass 0 when there
+        // is no compaction (the common case) — it's a literal no-op offset then.
+        pos_offset: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Halfsplit is the default since 2026-05-12; HIPFIRE_ROPE_INTERLEAVED_LEGACY=1
@@ -511,6 +516,7 @@ impl Gpu {
         let mut nr = n_rot as i32;
         let mut fb = freq_base;
         let mut bs = batch_size as i32;
+        let mut po = pos_offset;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -521,6 +527,7 @@ impl Gpu {
             &mut nr as *mut _ as *mut c_void,
             &mut fb as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
         ];
         let n_pairs = (n_rot / 2) as u32;
         let block = 32u32.min(n_pairs);
@@ -537,7 +544,7 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(pp);
                 b.push_i32(nhq); b.push_i32(nhk); b.push_i32(hd); b.push_i32(nr);
-                b.push_f32(fb); b.push_i32(bs);
+                b.push_f32(fb); b.push_i32(bs); b.push_i32(po);
                 b
             },
         );

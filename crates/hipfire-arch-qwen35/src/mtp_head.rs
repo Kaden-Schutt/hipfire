@@ -2378,6 +2378,8 @@ pub fn mtp_head_forward_block_batched(
         cfg.n_rot,
         cfg.rope_theta,
         n,
+        // pos_offset=0: MTP head has its own non-compacted KV. Unchanged behavior.
+        0,
     )?;
 
     // ── 6. v1 simplification: per-slot K/V writes + attention = V

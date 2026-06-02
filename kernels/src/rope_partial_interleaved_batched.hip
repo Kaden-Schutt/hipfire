@@ -24,14 +24,17 @@ extern "C" __global__ void rope_partial_interleaved_batched_f32(
     int head_dim,
     int n_rot,          // number of dims to rotate (64 for Qwen3.5)
     float freq_base,
-    int batch_size
+    int batch_size,
+    int pos_offset      // added to positions[b] for the RoPE angle (NOT the KV slot);
+                        // carries kv_cache.compact_offset so post-eviction batched
+                        // Q/K rotate at absolute phase matching cached keys. 0 = no-op.
 ) {
     int pair = blockIdx.x * blockDim.x + threadIdx.x;
     int b = blockIdx.y;
     int n_pairs = n_rot / 2;
     if (pair >= n_pairs || b >= batch_size) return;
 
-    int pos = positions[b];
+    int pos = positions[b] + pos_offset;
 
     // Interleaved: pair i rotates dims (2*i, 2*i+1)
     int d0 = pair * 2;
