@@ -1251,6 +1251,8 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC: &str = include_str!("../../../kern
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_K2X32_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_k2x32.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_K4_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_k4.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit_det.hip");
+pub const GEMM_KSPLIT_DET_FINALIZE_SRC: &str = include_str!("../../../kernels/src/gemm_ksplit_det_finalize.hip");
 // gfx12 (RDNA4) sister of GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC. Same recipe
 // as the qkv / qkvza / gate_up gfx12 ports (PR #56): `_w32_gfx12` builtin,
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping. Closes

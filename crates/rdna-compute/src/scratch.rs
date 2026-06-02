@@ -35,6 +35,10 @@ pub struct ScratchState {
     pub fp8_x_source_ptr: *mut c_void,
     pub q8_1_mmq_x_scratch: Option<DeviceBuffer>,
     pub q8_1_mmq_x_scratch_bytes: usize,
+    /// Partials buffer for the deterministic K-split GEMM (ksplit_det):
+    /// [K_SPLITS][batch_size][M] fp32, grows-never-shrinks.
+    pub ksplit_det_partials: Option<DeviceBuffer>,
+    pub ksplit_det_partials_bytes: usize,
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
@@ -115,6 +119,21 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 // ── ScratchState helpers ────────────────────────────────────────────────
 
 impl ScratchState {
+    /// Ensure the ksplit_det partials scratch is at least `n_bytes`, growing
+    /// (never shrinking). Returns the device pointer. No init needed: every
+    /// valid output cell is written exactly once per K-split before finalize.
+    pub fn ensure_ksplit_det_partials(
+        &mut self,
+        hip: &HipRuntime,
+        n_bytes: usize,
+    ) -> HipResult<*mut c_void> {
+        if self.ksplit_det_partials_bytes < n_bytes {
+            self.ksplit_det_partials = Some(hip.malloc(n_bytes)?);
+            self.ksplit_det_partials_bytes = n_bytes;
+        }
+        Ok(self.ksplit_det_partials.as_ref().unwrap().as_ptr())
+    }
+
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
     pub fn ensure_mq_signs(
         &mut self,
