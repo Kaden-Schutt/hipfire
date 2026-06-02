@@ -668,58 +668,58 @@ impl Qwen35Weights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
         let _ = gpu.free_tensor(self.output_norm);
-        let _ = gpu.free_tensor(self.output.buf);
+        self.output.free_all(gpu);
         for layer in self.layers {
             match layer {
                 LayerWeights::DeltaNet(l) => {
                     let _ = gpu.free_tensor(l.attn_norm);
-                    let _ = gpu.free_tensor(l.wqkv.buf);
-                    let _ = gpu.free_tensor(l.wz.buf);
-                    let _ = gpu.free_tensor(l.w_alpha.buf);
-                    let _ = gpu.free_tensor(l.w_beta.buf);
+                    l.wqkv.free_all(gpu);
+                    l.wz.free_all(gpu);
+                    l.w_alpha.free_all(gpu);
+                    l.w_beta.free_all(gpu);
                     let _ = gpu.free_tensor(l.a_log);
                     let _ = gpu.free_tensor(l.dt_bias);
                     let _ = gpu.free_tensor(l.conv_weight);
                     let _ = gpu.free_tensor(l.norm_weight);
-                    let _ = gpu.free_tensor(l.wo.buf);
+                    l.wo.free_all(gpu);
                     let _ = gpu.free_tensor(l.ffn_norm);
-                    let _ = gpu.free_tensor(l.w_gate.buf);
-                    let _ = gpu.free_tensor(l.w_up.buf);
-                    let _ = gpu.free_tensor(l.w_down.buf);
+                    l.w_gate.free_all(gpu);
+                    l.w_up.free_all(gpu);
+                    l.w_down.free_all(gpu);
                 }
                 LayerWeights::FullAttn(l) => {
                     let _ = gpu.free_tensor(l.attn_norm);
-                    let _ = gpu.free_tensor(l.wq.buf);
-                    let _ = gpu.free_tensor(l.wk.buf);
-                    let _ = gpu.free_tensor(l.wv.buf);
-                    let _ = gpu.free_tensor(l.wo.buf);
+                    l.wq.free_all(gpu);
+                    l.wk.free_all(gpu);
+                    l.wv.free_all(gpu);
+                    l.wo.free_all(gpu);
                     let _ = gpu.free_tensor(l.q_norm);
                     let _ = gpu.free_tensor(l.k_norm);
                     let _ = gpu.free_tensor(l.ffn_norm);
-                    let _ = gpu.free_tensor(l.w_gate.buf);
-                    let _ = gpu.free_tensor(l.w_up.buf);
-                    let _ = gpu.free_tensor(l.w_down.buf);
+                    l.w_gate.free_all(gpu);
+                    l.w_up.free_all(gpu);
+                    l.w_down.free_all(gpu);
                 }
                 LayerWeights::DeltaNetMoe(l) => {
                     let _ = gpu.free_tensor(l.attn_norm);
-                    let _ = gpu.free_tensor(l.wqkv.buf);
-                    let _ = gpu.free_tensor(l.wz.buf);
-                    let _ = gpu.free_tensor(l.w_alpha.buf);
-                    let _ = gpu.free_tensor(l.w_beta.buf);
+                    l.wqkv.free_all(gpu);
+                    l.wz.free_all(gpu);
+                    l.w_alpha.free_all(gpu);
+                    l.w_beta.free_all(gpu);
                     let _ = gpu.free_tensor(l.a_log);
                     let _ = gpu.free_tensor(l.dt_bias);
                     let _ = gpu.free_tensor(l.conv_weight);
                     let _ = gpu.free_tensor(l.norm_weight);
-                    let _ = gpu.free_tensor(l.wo.buf);
+                    l.wo.free_all(gpu);
                     let _ = gpu.free_tensor(l.ffn_norm);
                     free_moe_ffn(gpu, l.ffn);
                 }
                 LayerWeights::FullAttnMoe(l) => {
                     let _ = gpu.free_tensor(l.attn_norm);
-                    let _ = gpu.free_tensor(l.wq.buf);
-                    let _ = gpu.free_tensor(l.wk.buf);
-                    let _ = gpu.free_tensor(l.wv.buf);
-                    let _ = gpu.free_tensor(l.wo.buf);
+                    l.wq.free_all(gpu);
+                    l.wk.free_all(gpu);
+                    l.wv.free_all(gpu);
+                    l.wo.free_all(gpu);
                     let _ = gpu.free_tensor(l.q_norm);
                     let _ = gpu.free_tensor(l.k_norm);
                     let _ = gpu.free_tensor(l.ffn_norm);
@@ -750,60 +750,60 @@ impl Qwen35Weights {
         let _ = gpus.devices[0].free_tensor(self.token_embd);
         let out_dev = gpus.output_device;
         let _ = gpus.devices[out_dev].free_tensor(self.output_norm);
-        let _ = gpus.devices[out_dev].free_tensor(self.output.buf);
+        self.output.free_all(&mut gpus.devices[out_dev]);
         for (i, layer) in self.layers.into_iter().enumerate() {
             let dev_idx = gpus.device_for_layer(i);
             let gpu = &mut gpus.devices[dev_idx];
             match layer {
                 LayerWeights::DeltaNet(l) => {
                     let _ = gpu.free_tensor(l.attn_norm);
-                    let _ = gpu.free_tensor(l.wqkv.buf);
-                    let _ = gpu.free_tensor(l.wz.buf);
-                    let _ = gpu.free_tensor(l.w_alpha.buf);
-                    let _ = gpu.free_tensor(l.w_beta.buf);
+                    l.wqkv.free_all(gpu);
+                    l.wz.free_all(gpu);
+                    l.w_alpha.free_all(gpu);
+                    l.w_beta.free_all(gpu);
                     let _ = gpu.free_tensor(l.a_log);
                     let _ = gpu.free_tensor(l.dt_bias);
                     let _ = gpu.free_tensor(l.conv_weight);
                     let _ = gpu.free_tensor(l.norm_weight);
-                    let _ = gpu.free_tensor(l.wo.buf);
+                    l.wo.free_all(gpu);
                     let _ = gpu.free_tensor(l.ffn_norm);
-                    let _ = gpu.free_tensor(l.w_gate.buf);
-                    let _ = gpu.free_tensor(l.w_up.buf);
-                    let _ = gpu.free_tensor(l.w_down.buf);
+                    l.w_gate.free_all(gpu);
+                    l.w_up.free_all(gpu);
+                    l.w_down.free_all(gpu);
                 }
                 LayerWeights::FullAttn(l) => {
                     let _ = gpu.free_tensor(l.attn_norm);
-                    let _ = gpu.free_tensor(l.wq.buf);
-                    let _ = gpu.free_tensor(l.wk.buf);
-                    let _ = gpu.free_tensor(l.wv.buf);
-                    let _ = gpu.free_tensor(l.wo.buf);
+                    l.wq.free_all(gpu);
+                    l.wk.free_all(gpu);
+                    l.wv.free_all(gpu);
+                    l.wo.free_all(gpu);
                     let _ = gpu.free_tensor(l.q_norm);
                     let _ = gpu.free_tensor(l.k_norm);
                     let _ = gpu.free_tensor(l.ffn_norm);
-                    let _ = gpu.free_tensor(l.w_gate.buf);
-                    let _ = gpu.free_tensor(l.w_up.buf);
-                    let _ = gpu.free_tensor(l.w_down.buf);
+                    l.w_gate.free_all(gpu);
+                    l.w_up.free_all(gpu);
+                    l.w_down.free_all(gpu);
                 }
                 LayerWeights::DeltaNetMoe(l) => {
                     let _ = gpu.free_tensor(l.attn_norm);
-                    let _ = gpu.free_tensor(l.wqkv.buf);
-                    let _ = gpu.free_tensor(l.wz.buf);
-                    let _ = gpu.free_tensor(l.w_alpha.buf);
-                    let _ = gpu.free_tensor(l.w_beta.buf);
+                    l.wqkv.free_all(gpu);
+                    l.wz.free_all(gpu);
+                    l.w_alpha.free_all(gpu);
+                    l.w_beta.free_all(gpu);
                     let _ = gpu.free_tensor(l.a_log);
                     let _ = gpu.free_tensor(l.dt_bias);
                     let _ = gpu.free_tensor(l.conv_weight);
                     let _ = gpu.free_tensor(l.norm_weight);
-                    let _ = gpu.free_tensor(l.wo.buf);
+                    l.wo.free_all(gpu);
                     let _ = gpu.free_tensor(l.ffn_norm);
                     free_moe_ffn(gpu, l.ffn);
                 }
                 LayerWeights::FullAttnMoe(l) => {
                     let _ = gpu.free_tensor(l.attn_norm);
-                    let _ = gpu.free_tensor(l.wq.buf);
-                    let _ = gpu.free_tensor(l.wk.buf);
-                    let _ = gpu.free_tensor(l.wv.buf);
-                    let _ = gpu.free_tensor(l.wo.buf);
+                    l.wq.free_all(gpu);
+                    l.wk.free_all(gpu);
+                    l.wv.free_all(gpu);
+                    l.wo.free_all(gpu);
                     let _ = gpu.free_tensor(l.q_norm);
                     let _ = gpu.free_tensor(l.k_norm);
                     let _ = gpu.free_tensor(l.ffn_norm);
@@ -815,16 +815,16 @@ impl Qwen35Weights {
 }
 
 fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
-    let _ = gpu.free_tensor(ffn.router.buf);
-    let _ = gpu.free_tensor(ffn.shared_expert_gate.buf);
-    let _ = gpu.free_tensor(ffn.shared_expert.gate.buf);
-    let _ = gpu.free_tensor(ffn.shared_expert.up.buf);
-    let _ = gpu.free_tensor(ffn.shared_expert.down.buf);
+    ffn.router.free_all(gpu);
+    ffn.shared_expert_gate.free_all(gpu);
+    ffn.shared_expert.gate.free_all(gpu);
+    ffn.shared_expert.up.free_all(gpu);
+    ffn.shared_expert.down.free_all(gpu);
     let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
     let _ = gpu.free_tensor(ffn.expert_down_ptrs);
     for e in ffn.experts {
-        let _ = gpu.free_tensor(e.gate_up.buf);
-        let _ = gpu.free_tensor(e.down.buf);
+        e.gate_up.free_all(gpu);
+        e.down.free_all(gpu);
     }
     // ParoQuant MoE: free the owning shared sidecars (per-expert `paro` fields
     // alias these and must NOT be freed separately — they're non-owning views).
@@ -12467,32 +12467,63 @@ fn run_fa_layer_body(
     if kv_cache.quant_asym4 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym4_fused(
-            &kv_cache.k_gpu[layer_idx],
-            &kv_cache.v_gpu[layer_idx],
-            &s.fa_k,
-            &s.fa_v,
-            &s.pos_buf,
-            ct,
-            st,
-            config.n_kv_heads,
-            config.head_dim,
-        )?;
-        gpu.attention_flash_asym4(
-            &s.fa_q,
-            &kv_cache.k_gpu[layer_idx],
-            &kv_cache.v_gpu[layer_idx],
-            &s.fa_attn_out,
-            &s.pos_buf,
-            ct,
-            st,
-            pos + 1,
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_cache.physical_cap,
-            &s.flash_partials,
-        )?;
+        if kv_cache.quant_fwht {
+            gpu.kv_cache_write_fwht4_fused(
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &s.fa_k,
+                &s.fa_v,
+                &s.pos_buf,
+                ct,
+                st,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_cache.v_mode_bits(),
+            )?;
+            gpu.attention_flash_fwht4(
+                &s.fa_q,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &s.fa_attn_out,
+                &s.pos_buf,
+                ct,
+                st,
+                pos + 1,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_cache.physical_cap,
+                &s.flash_partials,
+                kv_cache.v_mode_bits(),
+            )?;
+        } else {
+            gpu.kv_cache_write_asym4_fused(
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &s.fa_k,
+                &s.fa_v,
+                &s.pos_buf,
+                ct,
+                st,
+                config.n_kv_heads,
+                config.head_dim,
+            )?;
+            gpu.attention_flash_asym4(
+                &s.fa_q,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &s.fa_attn_out,
+                &s.pos_buf,
+                ct,
+                st,
+                pos + 1,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_cache.physical_cap,
+                &s.flash_partials,
+            )?;
+        }
     } else if kv_cache.quant_asym3 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
