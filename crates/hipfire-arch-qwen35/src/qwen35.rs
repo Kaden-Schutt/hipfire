@@ -13149,12 +13149,14 @@ pub fn run_fa_layer_body(
         if kv_cache.quant_fwht {
             gpu.kv_cache_write_fwht4_fused(
                 &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim,
+                kv_cache.v_mode_bits())?;
             gpu.attention_flash_fwht4(
                 &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                 config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                 &s.flash_partials,
+                kv_cache.v_mode_bits(),
             )?;
         } else {
             gpu.kv_cache_write_asym4_fused(
@@ -13296,7 +13298,7 @@ pub fn run_fa_layer_body(
         // path silently disagree with the single-GPU decode path at ctx > 1
         // (the two attention impls match for a single key but diverge with
         // multiple keys), which broke TP↔single-GPU parity.
-        let use_flash = gpu.capture_mode
+        let use_flash = gpu.graphs.capture_mode
             || s.flash_mode == 2
             || (s.flash_mode == 1 && pos + 1 >= 2048)
             || pos + 1 > 15000;
@@ -13476,7 +13478,7 @@ fn run_fa_moe_attn(
     if kv_cache.quant_q8 {
         gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
         gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-        let use_flash = gpu.capture_mode || s.flash_mode == 2
+        let use_flash = gpu.graphs.capture_mode || s.flash_mode == 2
             || (s.flash_mode == 1 && pos + 1 >= 2048) || pos + 1 > 15000;
         if use_flash {
             gpu.attention_flash_q8_0(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
