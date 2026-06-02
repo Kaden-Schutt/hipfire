@@ -411,6 +411,9 @@ impl Gpu {
             1000.0 * elapsed / n as f32,
             (n as f64 * SCRATCH_BYTES as f64) / (1024.0 * 1024.0 * 1024.0) / elapsed as f64
         );
+        // Free the 256 MB scratch — DeviceBuffer has no Drop, so scope exit
+        // would otherwise leak it for the lifetime of the process.
+        let _ = self.hip.free(scratch);
         Ok(())
     }
 

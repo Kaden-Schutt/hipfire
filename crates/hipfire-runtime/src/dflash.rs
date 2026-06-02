@@ -305,21 +305,24 @@ impl DflashWeights {
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        let _ = gpu.free_tensor(self.fc.buf);
+        // free_all (not .buf) so the awq_scale / paro sidecars are released too —
+        // on an AWQ-trunk drafter every weight carries an awq_scale GpuTensor, so
+        // .buf-only freeing leaks one tensor per weight per layer on each unload.
+        self.fc.free_all(gpu);
         let _ = gpu.free_tensor(self.hidden_norm);
         let _ = gpu.free_tensor(self.norm);
         for l in self.layers {
             let _ = gpu.free_tensor(l.attn_norm);
-            let _ = gpu.free_tensor(l.wq.buf);
-            let _ = gpu.free_tensor(l.wk.buf);
-            let _ = gpu.free_tensor(l.wv.buf);
-            let _ = gpu.free_tensor(l.wo.buf);
+            l.wq.free_all(gpu);
+            l.wk.free_all(gpu);
+            l.wv.free_all(gpu);
+            l.wo.free_all(gpu);
             let _ = gpu.free_tensor(l.q_norm);
             let _ = gpu.free_tensor(l.k_norm);
             let _ = gpu.free_tensor(l.ffn_norm);
-            let _ = gpu.free_tensor(l.w_gate.buf);
-            let _ = gpu.free_tensor(l.w_up.buf);
-            let _ = gpu.free_tensor(l.w_down.buf);
+            l.w_gate.free_all(gpu);
+            l.w_up.free_all(gpu);
+            l.w_down.free_all(gpu);
         }
     }
 }
