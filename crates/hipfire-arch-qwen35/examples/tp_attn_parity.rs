@@ -421,6 +421,7 @@ fn run_prefill(path: &str, prompt_tokens: &[u32], tp: usize) -> Vec<f32> {
     qwen35::forward_prefill_chunk_tp(
         &mut gpus, &shard, &weights, &configs, prompt_tokens, 0,
         &mut kvs, &mut dns, &pbs_vec, &partials, &scratches,
+        None,
     ).expect("warm prefill_tp");
     gpus.devices[0].bind_thread().unwrap();
     gpus.devices[0].hip.device_synchronize().unwrap();
@@ -433,6 +434,7 @@ fn run_prefill(path: &str, prompt_tokens: &[u32], tp: usize) -> Vec<f32> {
     qwen35::forward_prefill_chunk_tp(
         &mut gpus, &shard, &weights, &configs, prompt_tokens, 0,
         &mut kvs, &mut dns, &pbs_vec, &partials, &scratches,
+        None,
     ).expect("prefill_tp");
     // forward_prefill_chunk_tp device-synchronizes rank 0 before returning.
     let secs = t.elapsed().as_secs_f64();

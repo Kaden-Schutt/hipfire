@@ -16125,6 +16125,12 @@ pub fn forward_prefill_chunk_tp(
     pbs: &[PrefillBatchScratch],
     partials: &[GpuTensor],
     scratches: &[Qwen35Scratch],
+    // MTP verify path (Some): fill ALL n post-output-norm hidden rows into this
+    // [>= n*dim] caller buffer (mirrors the single-GPU `per_token_hidden_out`
+    // tail). None: legacy last-token-only path. The final residual `pbs[0].x_batch`
+    // is replicated across ranks after the last all-reduce, so rank 0 produces
+    // the per-position hidden for all ranks.
+    per_token_hidden: Option<&GpuTensor>,
 ) -> HipResult<()> {
     let tp = shard.tp_size;
     let cfg0 = &configs[0];
@@ -16238,17 +16244,28 @@ pub fn forward_prefill_chunk_tp(
         }
     }
 
-    // 3. Final norm + last-token logits on rank 0 (legacy last-token path,
-    //    mirrors forward_prefill_chunk's `do_lm_head` legacy branch). Sync so
-    //    logits are host-visible after this call returns.
+    // 3. Final norm on rank 0. `pbs[0].x_batch` holds the full replicated
+    //    post-final-layer residual for all n positions (every rank identical
+    //    after the last all-reduce). With `per_token_hidden` (MTP verify) run
+    //    output-norm over ALL n rows into the caller buffer + keep the legacy
+    //    last-token logits in `s.logits`; else the legacy last-token-only path.
+    //    Sync so hidden/logits are host-visible after this call returns.
     {
         let gpu = &mut gpus.devices[0];
         gpu.bind_thread()?;
         let s = &scratches[0];
         let last = n - 1;
-        gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs[0].x_batch.buf, last * dim_row_bytes, dim_row_bytes)?;
-        gpu.rmsnorm_f32(&s.x, &weights[0].output_norm, &s.tmp, cfg0.norm_eps)?;
-        weight_gemv(gpu, &weights[0].output, &s.tmp, &s.logits)?;
+        if let Some(vh) = per_token_hidden {
+            let dst = vh.sub_offset(0, n * dim);
+            gpu.rmsnorm_batched(&pbs[0].x_batch, &weights[0].output_norm, &dst, n, dim, cfg0.norm_eps)?;
+            // Legacy last-token logits (seed path / callers that read s.logits).
+            let last_view = vh.sub_offset(last * dim, dim);
+            weight_gemv(gpu, &weights[0].output, &last_view, &s.logits)?;
+        } else {
+            gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs[0].x_batch.buf, last * dim_row_bytes, dim_row_bytes)?;
+            gpu.rmsnorm_f32(&s.x, &weights[0].output_norm, &s.tmp, cfg0.norm_eps)?;
+            weight_gemv(gpu, &weights[0].output, &s.tmp, &s.logits)?;
+        }
         gpu.hip.device_synchronize()?;
     }
     Ok(())

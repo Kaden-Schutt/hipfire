@@ -45,6 +45,12 @@ path = "examples/tp_attn_parity.rs"
 required-features = ["deltanet"]
 
 [[example]]
+name = "tp_mtp_cost"
+path = "examples/tp_mtp_cost.rs"
+required-features = ["deltanet"]
+
+
+[[example]]
 name = "test_qwen35_state_multi"
 path = "examples/test_qwen35_state_multi.rs"
 required-features = ["deltanet"]
