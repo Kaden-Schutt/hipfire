@@ -13373,6 +13373,7 @@ fn run_dn_moe_attn(
     delta_layer_idx: usize,
     dn_state: &mut DeltaNetState,
     s: &Qwen35Scratch,
+    sharded: bool,
 ) -> HipResult<()> {
     let layer = match &weights.layers[layer_idx] {
         LayerWeights::DeltaNetMoe(l) => l,
@@ -13430,12 +13431,19 @@ fn run_dn_moe_attn(
     }
     gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight, &s.dn_normed,
         n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
-    weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+    // 3f sharded: local value heads → PARTIAL wo into s.o (NON-residual), caller
+    // all-reduces. 3e replicated: full → residual into s.x.
+    if sharded {
+        weight_gemv(gpu, &layer.wo, &s.dn_normed, &s.o)?;
+    } else {
+        weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+    }
     Ok(())
 }
 
-/// Replicated FullAttn attention for a `FullAttnMoe` layer → `s.x` (mq4 weights,
-/// q8 or f32 KV). Mirrors `run_fa_layer_body`'s q8 flash dispatch (the 3c gotcha).
+/// FullAttn attention for a `FullAttnMoe` layer → `s.x` (replicated, 3e) or
+/// PARTIAL wo into `s.o` (sharded, 3f). mq4 weights, q8/f32 KV. Mirrors
+/// `run_fa_layer_body`'s q8 flash dispatch (the 3c gotcha).
 fn run_fa_moe_attn(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -13444,6 +13452,7 @@ fn run_fa_moe_attn(
     pos: usize,
     kv_cache: &mut llama::KvCache,
     s: &Qwen35Scratch,
+    sharded: bool,
 ) -> HipResult<()> {
     let layer = match &weights.layers[layer_idx] {
         LayerWeights::FullAttnMoe(l) => l,
@@ -13486,7 +13495,11 @@ fn run_fa_moe_attn(
             kv_cache.physical_cap)?;
     }
     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
-    weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
+    if sharded {
+        weight_gemv(gpu, &layer.wo, &s.fa_attn_out, &s.o)?;
+    } else {
+        weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
+    }
     Ok(())
 }
 
@@ -15867,6 +15880,11 @@ pub fn forward_scratch_tp(
     // FFN is sharded too (TpFfnShard + a 2nd all-reduce). Masks present ⇒
     // replicated (Stage 3): full FFN residual (TpFfn).
     let sharded = fa_masks.is_none();
+    // Stage 3f: shard the MoE-layer ATTENTION (partial wo → all-reduce) instead
+    // of replicating it (3e). Gated by HIPFIRE_EP_SHARD_ATTN — must match the
+    // loader (`load_weights_tp` slices the MoE attention only when set) AND the
+    // harness config (local_attn_config). Off → 3e replicated-attn path.
+    let moe_shard_attn = std::env::var_os("HIPFIRE_EP_SHARD_ATTN").is_some();
 
     // Degenerate TP=1 → single-GPU path (byte-identical to forward_scratch).
     if shard.is_single() {
@@ -15913,16 +15931,20 @@ pub fn forward_scratch_tp(
     for layer_idx in 0..cfg0.n_layers {
         match cfg0.layer_types[layer_idx] {
             LayerType::LinearAttention => {
-                // Stage 3e EP-MoE: DeltaNetMoe layer. Replicated DeltaNet
-                // attention → s.x (identical per rank), then expert-sharded MoE
-                // FFN → s.o partial → all-reduce → add into s.x.
+                // EP-MoE DeltaNetMoe layer. 3e: replicated DeltaNet attention
+                // → s.x. 3f (moe_shard_attn): sharded attention → partial wo in
+                // s.o → all-reduce → s.x. Then expert-sharded MoE FFN → s.o
+                // partial → all-reduce → s.x. (2 all-reduces/layer under 3f.)
                 if matches!(&weights[0].layers[layer_idx], LayerWeights::DeltaNetMoe(_)) {
                     for r in 0..tp {
                         gpus.devices[r].bind_thread()?;
                         run_dn_moe_attn(
                             &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
-                            delta_layer_idx, &mut dn_states[r], &scratches[r],
+                            delta_layer_idx, &mut dn_states[r], &scratches[r], moe_shard_attn,
                         )?;
+                    }
+                    if moe_shard_attn {
+                        tp_allreduce_add(gpus, scratches, tp, dim)?; // attn partial wo → s.x
                     }
                     ep_dbg_nan(gpus, scratches, layer_idx, "DNMoe post-attn")?;
                     for r in 0..tp {
@@ -15977,15 +15999,19 @@ pub fn forward_scratch_tp(
                 delta_layer_idx += 1;
             }
             LayerType::FullAttention => {
-                // Stage 3e EP-MoE: FullAttnMoe layer. Replicated FullAttn
-                // attention → s.x, then expert-sharded MoE FFN → s.o → all-reduce.
+                // EP-MoE FullAttnMoe layer. 3e: replicated FullAttn attention →
+                // s.x. 3f (moe_shard_attn): sharded attention → partial wo in s.o
+                // → all-reduce → s.x. Then expert-sharded MoE FFN → s.o → all-reduce.
                 if matches!(&weights[0].layers[layer_idx], LayerWeights::FullAttnMoe(_)) {
                     for r in 0..tp {
                         gpus.devices[r].bind_thread()?;
                         run_fa_moe_attn(
                             &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
-                            pos, &mut kv_caches[r], &scratches[r],
+                            pos, &mut kv_caches[r], &scratches[r], moe_shard_attn,
                         )?;
+                    }
+                    if moe_shard_attn {
+                        tp_allreduce_add(gpus, scratches, tp, dim)?; // attn partial wo → s.x
                     }
                     ep_dbg_nan(gpus, scratches, layer_idx, "FAMoe post-attn")?;
                     for r in 0..tp {

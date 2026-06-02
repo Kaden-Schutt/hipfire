@@ -203,8 +203,18 @@ fn run_tp(path: &str, prompt_tokens: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<V
     // attention, so heads/hidden are NOT sliced. KV replicated (attention full).
     let is_moe = config.num_experts > 0;
     let slice = std::env::var("HIPFIRE_PARITY_SLICE").is_ok() || is_moe;
+    // Stage 3f: MoE + HIPFIRE_EP_SHARD_ATTN → shard the attention too (local
+    // heads), matching the loader's MoE-attention slicing + forward_scratch_tp's
+    // sharded MoE arms. Without the flag → 3e (replicated attention, full config).
+    let moe_shard_attn = is_moe && std::env::var_os("HIPFIRE_EP_SHARD_ATTN").is_some();
 
-    let shard = ShardConfig::new(TP, is_moe, config.num_experts, ExpertAssign::Stride).unwrap();
+    // tp_kv_replicate: replicate KV heads ONLY when they can't shard cleanly
+    // (n_kv_heads not divisible by tp). The clean KV-shard (replicate=false) is
+    // what 3b/3c validated; replicate=true with sharded Q heads gives a WRONG
+    // GQA head→KV mapping on rank>0 (local Q heads vs full KV heads). For A3B
+    // FA-MoE this matters under 3f sharded attention.
+    let kv_replicate = config.n_kv_heads % TP != 0;
+    let shard = ShardConfig::new(TP, kv_replicate, config.num_experts, ExpertAssign::Stride).unwrap();
     shard.validate(config.n_heads, config.n_kv_heads).unwrap();
     if is_moe {
         shard.validate_moe(config.num_experts).unwrap();
@@ -217,11 +227,24 @@ fn run_tp(path: &str, prompt_tokens: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<V
         dev.active_stream = Some(st);
     }
 
-    // Per-rank config: LOCAL (sliced heads) for dense --slice (3b/3c); FULL for
-    // dense-replicated (Stage 3) AND for MoE EP (attention replicated, experts
-    // sharded by the loader). Drives scratch/kv/dn sizing + forward_scratch_tp.
+    // Per-rank config: LOCAL (sliced heads) for dense --slice (3b/3c) AND for
+    // MoE 3f (moe_shard_attn — sharded attention); FULL for dense-replicated
+    // (Stage 3) and MoE 3e (replicated attention). Drives scratch/kv/dn sizing.
+    // For MoE 3f, keep hidden_dim FULL: it sizes the (unused-by-MoE) dense-FFN
+    // scratch; local_attn_config would shrink it (correct for dense 3c, moot/
+    // risky for MoE since the MoE FFN scratch is sized by num_experts/mi).
     let configs: Vec<qwen35::Qwen35Config> = (0..TP)
-        .map(|_| if slice && !is_moe { qwen35::local_attn_config(&config, &shard) } else { config.clone() })
+        .map(|_| {
+            if moe_shard_attn {
+                let mut c = qwen35::local_attn_config(&config, &shard);
+                c.hidden_dim = config.hidden_dim;
+                c
+            } else if slice && !is_moe {
+                qwen35::local_attn_config(&config, &shard)
+            } else {
+                config.clone()
+            }
+        })
         .collect();
 
     // Per-rank weights/scratch/kv/dn. In --slice mode `weights[r]` is this
