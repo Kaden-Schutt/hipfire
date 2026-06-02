@@ -160,6 +160,16 @@ impl KvAdaptive {
         }
     }
 
+    /// Reset the tier state to the start (Q8/fwht4) position.  Call this
+    /// whenever the KV cache is cold-reset (context-full rollover, explicit
+    /// "reset" command) so the threshold sequence restarts from the beginning
+    /// instead of staying pinned at the floor tier permanently.
+    pub fn reset(&mut self) {
+        self.cur_k = KMode::Fwht4;
+        self.cur_v = crate::llama::VMode::Q8;
+        self.next_step = 0;
+    }
+
     /// Apply ALL downshift steps whose threshold seq_pos has crossed (handles
     /// coincident thresholds — e.g. V→lloyd3 and K→fwht2 sharing a binding
     /// point). Called after each committed token write at the same site as

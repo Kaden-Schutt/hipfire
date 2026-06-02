@@ -754,8 +754,9 @@ impl MtpSpecState {
         let _ = gpu.free_tensor(self.mtp_gather_prob_draft);
         let _ = gpu.free_tensor(self.mtp_gather_idx_verify);
         let _ = gpu.free_tensor(self.mtp_gather_prob_verify);
-        // DeltaNetSnapshot's DeviceBuffers free on drop.
-        drop(self.trunk_snap);
+        // DeltaNetSnapshot holds DeviceBuffers which have no Drop impl —
+        // use free_gpu to release the GPU allocations rather than bare drop.
+        self.trunk_snap.free_gpu(gpu);
         if let Some(event) = self.trunk_snap_start_event {
             let _ = gpu.hip.event_destroy(event);
         }
@@ -765,7 +766,10 @@ impl MtpSpecState {
         self.trunk_pbs.free_gpu(gpu);
         self.trunk_gdn_tape.free_gpu(gpu);
         self.mtp_scratch.free_gpu(gpu);
-        self.mtp_kv.free_gpu(gpu);
+        // Qwen35MtpHeadKvCache::free_gpu does `drop(inner)` which does not
+        // release GPU memory (llama::KvCache has no Drop). Call the inner
+        // KvCache's own free_gpu directly to properly hipFree each tensor.
+        self.mtp_kv.inner.free_gpu(gpu);
     }
 }
 
