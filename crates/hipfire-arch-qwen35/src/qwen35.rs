@@ -6807,9 +6807,10 @@ impl PrefillBatchScratch {
 /// byte-identical to decode. FA layers always use a per-token gather/scatter
 /// fallback — the FA causal attention kernel can't yet be batched (task #71).
 ///
-/// `gated_delta_net_q8` is called N times per LA layer (once per token)
-/// using `gated_delta_net_q8_batch_seq`, preserving the byte-exact
-/// stochastic-rounding trajectory vs decode.
+/// `gated_delta_net_q8_batch_seq` runs one launch per LA layer; the kernel
+/// loops over the N tokens internally and requants the Q8 state after every
+/// token, matching the decode requant cadence (distributionally equivalent to
+/// decode, not byte-identical — the stochastic-rounding frame differs).
 ///
 /// `tokens`: slice of prompt tokens to prefill in order.
 /// `start_pos`: first KV cache / DeltaNet position to write. Positions
