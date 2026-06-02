@@ -10683,9 +10683,15 @@ impl Gpu {
         // ksplit side and M∈{17408} (draft gate/up/down) on the k2 side. lm_head
         // (M=vocab) is always way above threshold → k2.
         //
-        // HIPFIRE_WO_WMMA_VARIANT=ksplit|k2|k2x32|k4|wmma|wmma2 overrides the
-        // auto selection (applies to every call, both target and draft).
-        //   ksplit — K-split + atomicAdd (non-deterministic accum order)
+        // HIPFIRE_WO_WMMA_VARIANT=ksplit_det|ksplit|k2|k2x32|k4|wmma|wmma2
+        // overrides the auto selection (applies to every call, target+draft).
+        //   ksplit_det — K-split occupancy (grid.z) WITHOUT the racing
+        //            atomicAdd: each split writes its partial to scratch, a
+        //            fixed-order finalize sums them → bit-reproducible. Perf
+        //            parity with ksplit across all benched batches (16..1024)
+        //            on gfx1100; default for the CU-starved small-M case.
+        //   ksplit — K-split + atomicAdd (non-deterministic accum order;
+        //            kept as a perf-reference / debug variant — see ksplit_det)
         //   k2     — 2× K-tile pipeline (byte-exact accum order)
         //   k2x32  — 32-row block with shared X fragment per K-tile. Slower
         //            than k2 on gfx1100, but faster on gfx1151 Strix Halo for
@@ -10704,15 +10710,18 @@ impl Gpu {
         //   wmma   — base WMMA         (output-mapping bug — debug only)
         //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
         let is_gfx115x = self.arch_caps.is_rdna3p5();
-        // ksplit's atomicAdd reduction across K_SPLITS partials is fp-non-
-        // associative — order varies with warp scheduling, so output bytes
-        // drift between processes and between cold/hot runs. The drift is
-        // sub-argmax-margin per call but cascades on long greedy decode
-        // (>50 tokens). HIPFIRE_DETERMINISTIC=1 forces k2 (single-block
-        // K reduction) at the cost of ~33% perf on small-batch / small-M.
-        // Required when chasing multi-GPU parity: pp=1 vs pp=2 outputs
-        // can't be compared byte-for-byte when the underlying single-GPU
-        // path itself is non-deterministic.
+        // The CU-starved small-M case (gfx11 RDNA3 discrete, the `else` arm
+        // below) needs K-split occupancy for throughput. The original ksplit
+        // got it via an atomicAdd reduction across K_SPLITS partials, which is
+        // fp-non-associative — order varies with warp scheduling, so output
+        // bytes drift between processes/runs. The drift is sub-argmax-margin
+        // per call but cascades on long greedy decode (>50 tokens), breaking
+        // bit-reproducibility (and multi-GPU pp=1 vs pp=2 parity). `ksplit_det`
+        // keeps the identical grid.z occupancy but replaces the race with a
+        // scratch + fixed-order finalize → deterministic at perf parity
+        // (benched 16..1024 batch on gfx1100), so it is now the default.
+        // HIPFIRE_DETERMINISTIC=1 still forces k2 (single-block K reduction)
+        // for the strictest single-kernel byte-parity escape hatch.
         // Cached — getenv on every decode token would re-parse 6× per layer
         // × N layers per step. Read once at first dispatch.
         static FORCE_DET: OnceLock<bool> = OnceLock::new();
@@ -10728,10 +10737,16 @@ impl Gpu {
         } else if m >= 8192 {
             "k2"
         } else {
-            "ksplit"
+            "ksplit_det"
         };
         let variant_override = self.flags.wo_wmma_variant.clone();
         let variant = variant_override.as_deref().unwrap_or(auto_variant);
+        // Deterministic K-split: same grid.z occupancy as ksplit but writes
+        // partials to scratch + a fixed-order finalize instead of racing
+        // atomicAdd. Two-kernel path → handled separately.
+        if variant == "ksplit_det" {
+            return self.gemm_hfq4g256_residual_wmma_ksplit_det(a_raw, x, y, m, k, batch_size);
+        }
         let (kernel_name, kernel_src, block_size, row_step, k_splits) = match variant {
             "k2"     => ("gemm_hfq4g256_residual_wmma_k2",
                          kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC, 32u32, 16usize, 1u32),
@@ -10804,6 +10819,108 @@ impl Gpu {
                 kernel_name, m, k, batch_size, bytes / 1024, us, gbs);
         }
         result
+    }
+
+    /// Deterministic K-split residual WMMA GEMM. Same K-split occupancy win
+    /// as `ksplit` (grid.z = K_SPLITS = 4 → ~13 blocks/CU on gfx1100), but
+    /// race-free: phase 1 writes each split's partial to its own scratch
+    /// slice (plain store, no atomicAdd, no residual); phase 2 sums the
+    /// K_SPLITS partials + residual into Y in fixed index order. Output is
+    /// bit-reproducible across runs/processes. Caller must initialize Y with
+    /// the residual stream before launching (same contract as ksplit/k2).
+    pub fn gemm_hfq4g256_residual_wmma_ksplit_det(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const K_SPLITS: u32 = 4;
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_wmma_ksplit_det",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC,
+            "gemm_hfq4g256_residual_wmma_ksplit_det",
+        )?;
+        self.ensure_kernel(
+            "gemm_ksplit_det_finalize",
+            kernels::GEMM_KSPLIT_DET_FINALIZE_SRC,
+            "gemm_ksplit_det_finalize",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        // Partials scratch: [K_SPLITS][batch_size][M] fp32.
+        let n_cells = batch_size * m;
+        let partials_ptr = self.ensure_ksplit_det_partials(K_SPLITS as usize * n_cells * 4)?;
+
+        // ── Phase 1: per-split partials (plain store, no atomic) ──
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut p_ptr = partials_ptr;
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params1: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut p_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = ((m + 15) / 16) as u32;
+        let batch_tiles = ((batch_size + 15) / 16) as u32;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_wmma_ksplit_det", bytes);
+        self.launch_maybe_blob(
+            "gemm_hfq4g256_residual_wmma_ksplit_det",
+            [row_tiles, batch_tiles, K_SPLITS],
+            [32, 1, 1],
+            0,
+            &mut params1,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(p_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        )?;
+
+        // ── Phase 2: fixed-order finalize (residual + partials → Y) ──
+        // Pass batch_size + m (not a pre-multiplied cell count): the kernel
+        // computes the z-stride as batch_size*M in long long, matching the
+        // partial kernel's split_base literal and dodging any i32 overflow.
+        let mut y_ptr = y.buf.as_ptr();
+        let mut p_ptr2 = partials_ptr;
+        let mut bs_val2 = batch_size as i32;
+        let mut m_val2 = m as i32;
+        let mut params2: Vec<*mut c_void> = vec![
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut p_ptr2 as *mut _ as *mut c_void,
+            &mut bs_val2 as *mut _ as *mut c_void,
+            &mut m_val2 as *mut _ as *mut c_void,
+        ];
+        let fin_grid = ((n_cells + 255) / 256) as u32;
+        let r = self.launch_maybe_blob(
+            "gemm_ksplit_det_finalize",
+            [fin_grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params2,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(y_ptr); b.push_ptr(p_ptr2);
+                b.push_i32(bs_val2); b.push_i32(m_val2);
+                b
+            },
+        );
+        // Timer spans BOTH phases — finalize GPU time is included in the
+        // ksplit_det perf accounting (else it would undercount vs ksplit).
+        if let Some(t) = timer { t.finish(&self.hip); }
+        r
     }
 
     /// HFQ3-G256 sister of `gemm_hfq4g256_residual_wmma` (basic WMMA

@@ -511,6 +511,8 @@ impl Gpu {
                 fp8_x_source_ptr: std::ptr::null_mut(),
                 q8_1_mmq_x_scratch: None,
                 q8_1_mmq_x_scratch_bytes: 0,
+                ksplit_det_partials: None,
+                ksplit_det_partials_bytes: 0,
             },
             mmq_screen: MmqScreenState {
                 cache: HashMap::new(),
@@ -806,6 +808,14 @@ impl Gpu {
             x,
             n_elems,
         )
+    }
+
+    /// Ensure the deterministic-ksplit partials scratch is at least `n_bytes`.
+    pub(crate) fn ensure_ksplit_det_partials(
+        &mut self,
+        n_bytes: usize,
+    ) -> HipResult<*mut c_void> {
+        self.scratch.ensure_ksplit_det_partials(&self.hip, n_bytes)
     }
 
     /// Convert F32 to F16 without caching. Used when the same x tensor
