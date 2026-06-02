@@ -1302,26 +1302,6 @@ impl Gpu {
 
     /// PARO4-G128T fused SwiGLU activation + Paro pre-rotation.
 
-    /// Lever 1 — Fused RMSNorm + PARO4G128T per-group Givens rotation.
-    ///
-    /// Replaces `rmsnorm_f32(x, weight) -> x_norm` followed by
-    /// `paro4g128t_rotate(A, x_norm) -> x_rot` with a single launch:
-    /// `fused_rmsnorm_paro4g128t_rotate(A, x_pre, weight) -> x_rot, x_norm`.
-    /// Math identity is `(x * weight * rms) * channel_scales -> KROT Givens`,
-    /// numerically equivalent to the separated path within FP16 epsilon
-    /// (float mul reorder is the only difference).
-    ///
-    /// When `x_norm` is `Some`, also emits the post-rmsnorm activation so
-    /// subsequent paro linears in the same residual block can apply their
-    /// own rotation (each linear has different pairs/theta/channel_scales).
-    /// When `None`, x_norm write is skipped — useful when this is the last
-    /// linear in a block, or for byte-equivalence smoke tests.
-    ///
-    /// Layout: 1 workgroup, 256 threads, dynamic LDS = (K + 256) * 4 bytes.
-    /// K must be a multiple of 128 (PARO group size). Engine layout only
-    /// (PARO4G128T, qtype 29) — the kernel assumes the precomputed sincos
-    /// trig payload.
-
     /// PARO4-G128 GEMV over an already materialized Paro-rotated activation.
 
     /// Residual PARO4-G128 GEMV over an already materialized Paro-rotated
