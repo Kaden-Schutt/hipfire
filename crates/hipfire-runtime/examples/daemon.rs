@@ -422,6 +422,11 @@ struct GenerateCtx<'a> {
     /// `pflash_cfg.alpha` echoed by the dflash done event for PRD
     /// §3.1 compliance. `None` when PFlash wasn't requested.
     pflash_alpha: Option<f32>,
+    /// DeepSeek V4 thinking mode (reasoning_effort / thinking_mode
+    /// from the generate request). Only consumed by arch_id=9 today;
+    /// other arches silently ignore it via the `_ = think_mode` sink
+    /// in generate_qwen35's dispatch.
+    think_mode: ThinkMode,
 }
 
 /// Which generate path the dispatcher routes a request to. Step 4 of
@@ -853,6 +858,9 @@ struct LoadedModel {
     /// detection for the DeepSeek V4 family's own MTP subsystem,
     /// but the namespace is intentionally not deepseek4-specific.
     mtp_mode: String,
+    /// Draft tokens per spec-decode window (1-10, default 3).
+    /// Read by generate_deepseek4 via env var fallback → this field → 3.
+    mtp_k: usize,
     /// Whether MTP-capable weights were found during load for the
     /// model (DeepSeek V4 only today). Used by mtp_mode=auto
     /// to decide whether to enable spec-decode.
@@ -1239,6 +1247,7 @@ fn main() {
                             6 => "qwen3_5_moe",
                             7 => "qwen2",
                             8 => "dots-ocr",
+                            9 => "deepseek4",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
@@ -1250,6 +1259,8 @@ fn main() {
                             (c.hidden_size, c.num_hidden_layers, c.vocab_size)
                         } else if let Some(ref c) = m.dots_ocr_config {
                             (c.text.hidden_size, c.text.num_hidden_layers, c.text.vocab_size)
+                        } else if let Some(ref c) = m.deepseek4_config {
+                            (c.hidden_size, c.num_hidden_layers, c.vocab_size)
                         } else { (0, 0, 0) };
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
@@ -1382,6 +1393,7 @@ fn main() {
                         if let Some(ref mut m) = model {
                             if m.arch_id == 9 {
                                 m.mtp_mode = mtp_mode.to_string();
+                                m.mtp_k = mtp_k;
                                 m.mtp_weights_present = m.deepseek4_weights
                                     .as_ref()
                                     .and_then(|w| w.mtp_layer.as_ref())
@@ -1467,9 +1479,29 @@ fn main() {
                     },
                     None => None,
                 };
-                let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
+                // DeepSeek V4 Flash's HF card recommends `temp=1.0, top_p=1.0`
+                // for local deployment, and lower values consistently fall
+                // into block-level attractors on this quantized instruct
+                // model. Pick arch-shaped defaults so a vanilla
+                // `/v1/chat/completions` POST (no sampling fields) works on
+                // both. Explicit per-request values still override either.
+                let (default_temp, default_top_p) = if m.arch_id == 9 {
+                    (1.0_f64, 1.0_f64)
+                } else {
+                    (0.3_f64, 0.8_f64)
+                };
+                let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(default_temp) as f32;
                 let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
-                let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
+                let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(default_top_p) as f32;
+                // OpenAI-compatible `reasoning_effort` (also accept our custom
+                // `thinking_mode` alias) — only consumed by arch_id=9 today.
+                // Default = NonThink, matching the safe HF chat frame.
+                let think_mode = msg
+                    .get("reasoning_effort")
+                    .or_else(|| msg.get("thinking_mode"))
+                    .and_then(|v| v.as_str())
+                    .map(ThinkMode::from_str)
+                    .unwrap_or(ThinkMode::NonThink);
                 // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
                 // and HF transformers `generate(repetition_penalty=1.0)`
                 // defaults. The prior 1.3 default suppressed legitimately
@@ -1647,6 +1679,7 @@ fn main() {
                         pflash_cfg: pf_cfg_owned.as_ref(),
                         pflash_bypass_reason: None,
                         pflash_alpha: None,
+                        think_mode,
                     };
                     generate_qwen35(m, &mut gpu, &mut gen_ctx);
                 }
@@ -1709,8 +1742,16 @@ fn main() {
                     // DeepSeek V4 (arch_id=9) context-overflow hard reset.
                     // DS4 has no eviction path; SWA wraps automatically,
                     // but the state's position counter must be rewound.
+                    // Also tear down any captured V4F decode hipGraph —
+                    // the captured kernarg blobs hold session-1's
+                    // device-buffer pointers; a fresh capture on
+                    // session-2 binds against session-2's pointers and
+                    // host scalars. Without this the replay path crashes
+                    // with "illegal memory access" on the post-launch
+                    // logits D2H.
                     if let Some(ref mut s) = m.deepseek4_state {
-                        let _ = s.reset();
+                        s.reset();
+                        gpu.invalidate_graph_state();
                     }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
@@ -1858,6 +1899,26 @@ fn main() {
                     let mut ok = true;
                     for &tok in &synthetic {
                         if qwen2::forward_step(&mut gpu, weights, config, state, tok).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else if m.arch_id == 9 {
+                    // DeepSeek V4 warm-pass: per-token decode_step. Saturates
+                    // the kernel cache (HC, indexer, compressor,
+                    // attention, MoE) on a short synthetic prompt
+                    // before any user-facing generate. Not the
+                    // production prefill path (that's
+                    // forward_prefill_batch_chunked in `generate`).
+                    let config = m.deepseek4_config.as_ref().unwrap();
+                    let weights = m.deepseek4_weights.as_ref().unwrap();
+                    let state = m.deepseek4_state.as_mut().unwrap();
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if deepseek4::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        ).is_err() {
                             ok = false;
                             break;
                         }
@@ -2243,7 +2304,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
             deepseek4_config: Some(config), deepseek4_weights: Some(weights), deepseek4_state: Some(state),
             deepseek4_pbs: Some(pbs), deepseek4_eos_tok: eos_tok,
-            mtp_mode: "auto".to_string(), mtp_weights_present,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2297,7 +2358,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             chat_template,
 
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_weights_present: false,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
         });
     }
@@ -2345,7 +2406,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             chat_template,
 
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_weights_present: false,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
         });
     }
@@ -2539,7 +2600,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             chat_template,
 
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_weights_present: false,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
         };
 
@@ -2695,7 +2756,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             chat_template,
 
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_weights_present: false,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
         })
     }
@@ -2790,7 +2851,7 @@ fn load_model_safetensors(
             chat_template,
 
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_weights_present: false,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
         });
     }
@@ -2855,7 +2916,7 @@ fn load_model_safetensors(
         chat_template,
 
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_weights_present: false,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
     })
 }
@@ -3059,7 +3120,7 @@ fn load_model_pp(
         chat_template: resolve_chat_template(&hfq, path),
 
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_weights_present: false,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
     };
 
@@ -5471,6 +5532,7 @@ fn generate_qwen35(
     let pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig> = ctx.pflash_cfg;
     let tools: Option<&[serde_json::Value]> = ctx.tools;
     let messages_history: Option<&[hipfire_runtime::prompt_frame::Message]> = ctx.messages_history;
+    let think_mode = ctx.think_mode;
     let mut drafter_gpu = ctx.drafter_gpu.take();
     // ── Step 5b: unified dispatch via pick_path ─────────────────────────
     //
@@ -5491,18 +5553,15 @@ fn generate_qwen35(
     // pick_path() is caught immediately under debug.
     match path {
         SpecPath::Deepseek4 => {
-            // TODO: parse think_mode from the generate request and thread
-            // through GenerateCtx. For now, default to NonThink (matches
-            // HF default for V4-Flash chat).
-            let think_mode = ThinkMode::NonThink;
-            // Also parse the default temperature/top_p for DS4 (HF card
-            // recommends temp=1.0, not 0.0 — override for arch_id=9).
-            let (ds4_temp, ds4_top_p) = if m.arch_id == 9 {
-                (if temp <= 1e-6 { 1.0 } else { temp }, top_p)
-            } else { (temp, top_p) };
+            // Silence the qwen35/llama-only params we deliberately don't
+            // honor on this path. See generate_deepseek4 doc for the
+            // deferral list.
+            let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens,
+                     assistant_prefix, pflash_state, pflash_cfg);
+            let _ = (repeat_penalty, repeat_window);
             generate_deepseek4(
                 m, gpu, stdout, id, prompt, system_prompt,
-                ds4_temp, ds4_top_p, max_tokens,
+                temp, top_p, max_tokens,
                 think_mode,
                 tools, messages_history,
             );
@@ -5538,6 +5597,7 @@ fn generate_qwen35(
                 pflash_cfg,
                 pflash_bypass_reason: None,
                 pflash_alpha: None,
+                think_mode,
             };
             generate_multi(m, gpu, &mut multi_ctx);
             return;
@@ -5561,6 +5621,7 @@ fn generate_qwen35(
                 pflash_cfg,
                 pflash_bypass_reason: None,
                 pflash_alpha: None,
+                think_mode,
             };
             generate_pp_mtp(m, &mut pp_mtp_ctx);
             return;
@@ -5596,6 +5657,7 @@ fn generate_qwen35(
                 pflash_cfg: None,
                 pflash_bypass_reason: dflash_bypass_reason_owned.as_deref(),
                 pflash_alpha: dflash_alpha,
+                think_mode,
             };
             generate_dflash(m, gpu, &mut dflash_ctx);
             // top_p / repeat penalties are AR-only sampling knobs;
@@ -5620,6 +5682,7 @@ fn generate_qwen35(
                 pflash_cfg: None,
                 pflash_bypass_reason: None,
                 pflash_alpha: None,
+                think_mode,
             };
             generate_mtp(m, gpu, &mut mtp_ctx);
             let _ = (budget_alert_at_tok, budget_alert_text, pflash_state, pflash_cfg);
@@ -6849,7 +6912,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 .ok()
                 .and_then(|s| s.parse().ok())
         })
-        .unwrap_or(3);
+        .unwrap_or(m.mtp_k);
 
     let t0 = Instant::now();
 
