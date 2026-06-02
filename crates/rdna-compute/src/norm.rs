@@ -11,6 +11,14 @@ use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 
+/// Monotonic per-launch counter feeding the Q8 GatedDeltaNet state
+/// stochastic-rounding dither. Supplies fresh, data-INDEPENDENT entropy each
+/// requant so the rounding is genuinely unbiased across the recurrence — the
+/// old seed used the state-derived `my_max` with no temporal term, which made
+/// the dither a deterministic, data-correlated function and accumulated a
+/// systematic bias that drifted the recurrent state on long generations.
+static GDN_REQUANT_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 impl Gpu {
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
@@ -1321,13 +1329,16 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
+        // Per-launch monotonic frame for the Q8 state stochastic-rounding
+        // dither (data-INDEPENDENT entropy; see GATED_DELTA_NET_Q8 kernel).
+        let fr = GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
             &vp as *const _ as *mut c_void, &gp as *const _ as *mut c_void,
             &bp as *const _ as *mut c_void, &sp as *const _ as *mut c_void,
             &scp as *const _ as *mut c_void, &op as *const _ as *mut c_void,
             &nt as *const _ as *mut c_void, &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void, &fr as *const _ as *mut c_void,
         ];
         let n_tiles = (128 / 4) as u32;
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
@@ -1339,7 +1350,7 @@ impl Gpu {
                 b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
                 b.push_ptr(gp); b.push_ptr(bp); b.push_ptr(sp);
                 b.push_ptr(scp); b.push_ptr(op);
-                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
+                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(fr);
                 b
             },
         );
@@ -1395,6 +1406,7 @@ impl Gpu {
         let mut nt = n_tokens as i32;
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
+        let mut fr = GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -1407,6 +1419,7 @@ impl Gpu {
             &mut nt as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
+            &mut fr as *mut _ as *mut c_void,
         ];
 
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
@@ -1427,7 +1440,7 @@ impl Gpu {
                 b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
                 b.push_ptr(gp); b.push_ptr(bp);
                 b.push_ptr(sp); b.push_ptr(scp); b.push_ptr(op);
-                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
+                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(fr);
                 b
             },
         );

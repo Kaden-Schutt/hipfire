@@ -123,6 +123,35 @@ impl Gpu {
         repeat_window: usize,
         repeat_penalty: f32,
     ) -> HipResult<(u32, u32)> {
+        // Back-compat shim: no presence/frequency penalties (byte-identical
+        // to the pre-PF kernel, which had `if (repeat_penalty > 1.0f)`).
+        self.sample_top_p_pf(
+            logits, result_buf, repeat_buf, vocab_size, temperature, top_p,
+            rng_state, repeat_window, repeat_penalty, 0.0, 0.0,
+        )
+    }
+
+    /// Like [`sample_top_p`], plus OpenAI-style subtractive `presence_penalty`
+    /// and `frequency_penalty` applied over the same `repeat_window`. Passing
+    /// `0.0` for both is byte-identical to `sample_top_p`. These flat (non
+    /// recency-weighted) penalties break block-level repetition loops the
+    /// recency-weighted multiplicative repeat penalty cannot — provided the
+    /// `repeat_buf` window is large enough to span a full loop period.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_top_p_pf(
+        &mut self,
+        logits: &GpuTensor,
+        result_buf: &GpuTensor,
+        repeat_buf: &GpuTensor,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+        repeat_window: usize,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<(u32, u32)> {
         self.bind_thread()?;
         self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
         let func = &self.functions["sample_top_p"];
@@ -136,6 +165,8 @@ impl Gpu {
         let mut rng = rng_state;
         let mut rw = repeat_window as i32;
         let mut rp = repeat_penalty;
+        let mut pp = presence_penalty;
+        let mut fp = frequency_penalty;
 
         let mut params: Vec<*mut std::ffi::c_void> = vec![
             &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
@@ -147,6 +178,8 @@ impl Gpu {
             &mut rng as *mut _ as *mut std::ffi::c_void,
             &mut rw as *mut _ as *mut std::ffi::c_void,
             &mut rp as *mut _ as *mut std::ffi::c_void,
+            &mut pp as *mut _ as *mut std::ffi::c_void,
+            &mut fp as *mut _ as *mut std::ffi::c_void,
         ];
 
         let block_size = 256u32;
@@ -197,6 +230,9 @@ impl Gpu {
         let mut rng = rng_state;
         let mut rw = repeat_window as i32;
         let mut rp = repeat_penalty;
+        // Graph-capture path does not expose presence/frequency penalties.
+        let mut pp = 0.0f32;
+        let mut fp = 0.0f32;
 
         let mut params: Vec<*mut std::ffi::c_void> = vec![
             &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
@@ -208,6 +244,8 @@ impl Gpu {
             &mut rng as *mut _ as *mut std::ffi::c_void,
             &mut rw as *mut _ as *mut std::ffi::c_void,
             &mut rp as *mut _ as *mut std::ffi::c_void,
+            &mut pp as *mut _ as *mut std::ffi::c_void,
+            &mut fp as *mut _ as *mut std::ffi::c_void,
         ];
 
         let block_size = 256u32;

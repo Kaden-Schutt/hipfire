@@ -160,6 +160,7 @@ fn main() {
         .args(["-f", &args.slice.display().to_string()])
         .args(["-c", &ref_n_ctx.to_string()])
         .args(["-b", &args.n_batch.to_string()])
+        .args(["-ngl", &std::env::var("HIPFIRE_KLD_NGL").unwrap_or_else(|_| "99".to_string())])
         .args(["--kl-divergence-base", &fifo_path.display().to_string()])
         .stderr(Stdio::inherit())
         .stdout(Stdio::inherit())

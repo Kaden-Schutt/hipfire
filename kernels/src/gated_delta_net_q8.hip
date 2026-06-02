@@ -19,7 +19,11 @@ __global__ void gated_delta_net_q8(
     float* __restrict__ output,
     int n_tokens,
     int n_heads,
-    int head_dim
+    int head_dim,
+    unsigned int frame   // per-launch monotonic counter (host-supplied) — fresh,
+                         // data-INDEPENDENT entropy for the stochastic-rounding
+                         // dither. Without it the dither was seeded from my_max
+                         // (state-derived) → correlated, biased over the recurrence.
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -105,11 +109,17 @@ __global__ void gated_delta_net_q8(
         signed char* dst = sq_base + r * HD;
 
         // Stochastic rounding: generate 4 uniform random values in [0, 1).
-        // Seed tied to thread id (was col=tid*4 before); same deterministic
-        // family, different seed values — resulting sequence is equivalently
-        // uniform; no bias.
+        // Seed = spatial location (h, row, tid) + per-launch `frame` counter.
+        // CRITICAL: the dither MUST be independent of the value being rounded
+        // and fresh per requant. The old seed used __float_as_uint(my_max)
+        // (state-derived) and no temporal term — so across the thousands of
+        // per-token decode requants the dither was a deterministic, data-
+        // correlated function, defeating stochastic rounding's unbiasedness
+        // and accumulating a systematic bias that drifts the recurrent state
+        // off-distribution on long generations (length-dependent coherence
+        // collapse). `frame` supplies the missing per-step entropy.
         unsigned int rng = (unsigned int)(h * 1664525u + (row_start + r) * 1013904223u
-                         + tid * 214013u + __float_as_uint(my_max) * 2531011u);
+                         + tid * 214013u + frame * 2531011u);
         #define STOCH_ROUND(val) ({ \
             rng = rng * 1664525u + 1013904223u; \
             float noise = (float)(rng >> 8) * (1.0f / 16777216.0f); \

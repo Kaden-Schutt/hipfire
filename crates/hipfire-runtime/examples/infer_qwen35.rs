@@ -235,6 +235,8 @@ fn main() {
             top_p: sc.top_p,
             repeat_penalty: sc.repeat_penalty,
             repeat_window: repeat_buf_cap.min(sc.repeat_window),
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             blocked_tokens: Vec::new(),
         };
         sampler::sample(
@@ -327,6 +329,8 @@ fn main() {
                 top_p: sc.top_p,
                 repeat_penalty: sc.repeat_penalty,
                 repeat_window: repeat_buf_cap.min(sc.repeat_window),
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
                 blocked_tokens: Vec::new(),
             };
             sampler::sample(

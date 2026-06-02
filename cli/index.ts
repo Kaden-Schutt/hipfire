@@ -2198,9 +2198,15 @@ async function serve(port: number, host: string) {
           type: "generate", id: reqId, prompt: userPrompt,
           temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
           max_tokens: requestMaxTokens,
-          repeat_penalty: body.repeat_penalty ?? (oaiPenaltySet ? 1.0 + oaiPenalty : effective.repeat_penalty),
+          // The daemon now applies OpenAI presence/frequency penalties natively
+          // (subtractive, over the full repeat window) — strictly better than the
+          // old #79 fold into the multiplicative repeat_penalty. Pass them raw.
+          repeat_penalty: body.repeat_penalty ?? effective.repeat_penalty,
+          presence_penalty: Math.max(0, Number(body.presence_penalty) || 0),
+          frequency_penalty: Math.max(0, Number(body.frequency_penalty) || 0),
           top_p: body.top_p ?? effective.top_p,
         };
+        void oaiPenalty; void oaiPenaltySet; // superseded by native presence/frequency
         // Mirror the `hipfire run` path's per-model max_think_tokens
         // propagation. Without this, models with thinking=on can consume
         // the entire max_tokens budget inside a single <think>...</think>
@@ -2240,6 +2246,16 @@ async function serve(port: number, host: string) {
         } else if ((body as any).reasoning?.effort === "none") {
           genParams.assistant_prefix = "closed_think";
           genParams.max_think_tokens = 1;
+        } else {
+          // Thinking is ON (config default, or explicit enable_thinking=true /
+          // reasoning.effort>=minimal). OPEN the <think> block so the model
+          // actually reasons instead of emitting an empty <think></think> and
+          // answering directly. Without this, generic OpenAI clients (which
+          // never send assistant_prefix) get no-think behaviour, which fails
+          // hard reasoning on thinking models like Qwen3.6. Safe for non-
+          // thinking models: the daemon's prompt frame falls back to Plain
+          // when the tokenizer has no `<think>` special token.
+          genParams.assistant_prefix = "open_think";
         }
         if (systemPrompt) genParams.system = systemPrompt;
 
@@ -2677,7 +2693,11 @@ async function serve(port: number, host: string) {
                   }, forceAnswerSecs * 1000)
                 : null;
               try {
-                let inThink = false;
+                // open_think injects the opening <think> into the PROMPT, so the
+                // output begins inside the think span (no <think> token to detect
+                // at 2725). Start in-think so the leading reasoning streams as
+                // reasoning_content and is split off content at the first </think>.
+                let inThink = genParams.assistant_prefix === "open_think";
                 let stripNextLeadingNl = false;
                 // Track whether we've emitted any visible content yet. Used
                 // to detect an orphan `</think>` opener — when the daemon
@@ -3112,7 +3132,7 @@ async function serve(port: number, host: string) {
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
         const strippedContent = content;
-        content = stripVisibleThinking(content, preserveThinking);
+        content = stripVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think");
 
         // Diagnostic: detect empty-after-unclosed-think-strip.
         let thinkWarning: string | null = null;
@@ -5145,8 +5165,15 @@ function findDep(binary: string, extraDirs: string[]): string | null {
   return null;
 }
 
-function stripVisibleThinking(content: string, preserveThinking: boolean = false): string {
+function stripVisibleThinking(content: string, preserveThinking: boolean = false, startedInThink: boolean = false): string {
   if (preserveThinking) return content.replace(/<\|im_end\|>/g, "").trim();
+  // `open_think` injects the opening <think> into the PROMPT, so the output
+  // begins INSIDE the think span and only a dangling </think> appears — none of
+  // the strips below (which key on a `<think>` opener) would fire, leaking the
+  // reasoning + a stray </think> into content. Prepend a synthetic opener so
+  // the closed case (strip the pair, keep the answer) and the unclosed case
+  // (strip <think>..end) are handled identically to a normal think span.
+  if (startedInThink && !content.includes("<think>")) content = "<think>" + content;
   return content
     .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
     .replace(/<think>[\s\S]*$/, "")
