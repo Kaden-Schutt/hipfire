@@ -1705,7 +1705,7 @@ async function serve(port: number, host: string) {
         // prompt, which the model has no way to recover from. Issue #79.
         // Image parts are filtered out (no vision encoder in serve path);
         // matches the daemon's existing text-only behaviour.
-        const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, malformedImage: boolean } => {
+        const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, remoteImageUrl: boolean, malformedImage: boolean } => {
           // OpenAI assistant messages carrying only `tool_calls` send
           // `content: null`. Returning `String(null) === "null"` here
           // (the legacy fallback below) leaked the literal text `null`
@@ -1714,12 +1714,13 @@ async function serve(port: number, host: string) {
           // tool-call turn, which the model reads as "the assistant
           // previously said the word null", not as an empty turn.
           // Treat null/undefined as empty content.
-          if (content == null) return { text: "", images: [], unsupportedImage: false, malformedImage: false };
-          if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, malformedImage: false };
+          if (content == null) return { text: "", images: [], unsupportedImage: false, remoteImageUrl: false, malformedImage: false };
+          if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, remoteImageUrl: false, malformedImage: false };
           if (Array.isArray(content)) {
             const textParts: string[] = [];
             const images: string[] = [];
             let unsupportedImage = false;
+            let remoteImageUrl = false;
             let malformedImage = false;
             for (const p of content) {
               if (p?.type === "text") textParts.push(p.text ?? "");
@@ -1739,15 +1740,21 @@ async function serve(port: number, host: string) {
                       // dropping the part and proceeding as text-only.
                       unsupportedImage = true;
                     }
+                  } else {
+                    // Non-data: URLs (https://, http://, file://, etc.)
+                    // are not supported — hipfire does not fetch remote
+                    // images. Use a separate flag so the error message
+                    // distinguishes "bad format" from "unsupported transport".
+                    remoteImageUrl = true;
                   }
                 } else {
                   malformedImage = true;
                 }
               }
             }
-            return { text: textParts.join(""), images, unsupportedImage, malformedImage };
+            return { text: textParts.join(""), images, unsupportedImage, remoteImageUrl, malformedImage };
           }
-          return { text: String(content), images: [], unsupportedImage: false, malformedImage: false };
+          return { text: String(content), images: [], unsupportedImage: false, remoteImageUrl: false, malformedImage: false };
         };
 
         const extractText = (content: any): string => extractContent(content).text;
@@ -1907,6 +1914,9 @@ async function serve(port: number, host: string) {
             const content = extractContent(m.content);
             if (content.malformedImage) {
               return rejectImage("malformed image part — image_url.url is required");
+            }
+            if (content.remoteImageUrl) {
+              return rejectImage("remote image URLs are not supported — embed images as base64 data: URLs (supported formats: png, jpeg)");
             }
             if (content.unsupportedImage) {
               return rejectImage("unsupported image format — supported: png, jpeg");

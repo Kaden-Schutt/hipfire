@@ -30,16 +30,23 @@ pub fn smart_resize(
     min_pixels: usize,
     max_pixels: usize,
 ) -> (usize, usize) {
+    // Use u64 for pixel-count arithmetic to avoid usize overflow on
+    // 32-bit targets where height * width could exceed 2^32-1.
+    // (Defense-in-depth; callers are already gated by
+    // MAX_DIMENSION_PIXELS, but the arithmetic should be correct
+    // regardless of pointer width.)
     let h_bar = ((height as f64 / factor as f64).round() as usize) * factor;
     let w_bar = ((width as f64 / factor as f64).round() as usize) * factor;
+    let hw = (height as u64) * (width as u64);
+    let hbar_wbar = (h_bar as u64) * (w_bar as u64);
 
-    if h_bar * w_bar > max_pixels {
-        let beta = ((height * width) as f64 / max_pixels as f64).sqrt();
+    if hbar_wbar > max_pixels as u64 {
+        let beta = (hw as f64 / max_pixels as f64).sqrt();
         let h_bar = factor.max(((height as f64 / beta / factor as f64).floor() as usize) * factor);
         let w_bar = factor.max(((width as f64 / beta / factor as f64).floor() as usize) * factor);
         (h_bar, w_bar)
-    } else if h_bar * w_bar < min_pixels {
-        let beta = (min_pixels as f64 / (height * width) as f64).sqrt();
+    } else if hbar_wbar < min_pixels as u64 {
+        let beta = (min_pixels as f64 / hw as f64).sqrt();
         let h_bar = factor.max(((height as f64 * beta / factor as f64).ceil() as usize) * factor);
         let w_bar = factor.max(((width as f64 * beta / factor as f64).ceil() as usize) * factor);
         (h_bar, w_bar)
