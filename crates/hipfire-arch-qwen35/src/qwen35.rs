@@ -3761,8 +3761,9 @@ pub fn load_weights_tp(
 /// `ffn.experts` (so `experts[0]` stays a valid shared-AWQ representative for
 /// `moe_ffn_decode_impl`'s `fused_silu_mul_rotate_mq_batched_for`), and rebuilds
 /// the `[2·n_exp]` device pointer tables: owned global id → its (compacted)
-/// buffer ptr; **non-owned → a shared ZEROED gate_up buffer**. Zeroed HFQ4 bytes
-/// dequant to 0 (symmetric quant, f16 scale 0x0000 = +0.0) → the non-owned
+/// buffer ptr; **non-owned → a shared ZEROED gate_up buffer**. Zeroed quant
+/// bytes dequant to 0 (a zeroed group scale ⇒ +0.0 regardless of MQ/HFQ scale
+/// width) → the non-owned
 /// expert's gate_up output is 0 → silu·mul = 0 → rot = 0 → down output 0, so it
 /// contributes nothing through `moe_down_combine` WITHOUT any masking kernel.
 /// (The non-owned down ptr is irrelevant — its input rot is already 0 — so it
@@ -15802,6 +15803,12 @@ fn tp_allreduce_add(
     for r in 0..tp {
         gpus.devices[r].bind_thread()?;
         let (x, o) = (&scratches[r].x, &scratches[r].o);
+        // The all-reduce reduces `dim` elements but add_f32 folds o.numel()
+        // into x; both are sound only because s.o and s.x are exactly [dim].
+        // Assert so a future scratch resize fails loudly instead of silently
+        // folding a stale tail into the residual.
+        debug_assert_eq!(o.numel(), dim, "tp_allreduce_add: s.o numel != dim");
+        debug_assert_eq!(x.numel(), dim, "tp_allreduce_add: s.x numel != dim");
         gpus.devices[r].add_f32(x, o, x)?;
     }
     Ok(())
