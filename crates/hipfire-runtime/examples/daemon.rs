@@ -1168,7 +1168,9 @@ struct LoadedModel {
     /// the tail — instead of a full cold prefill. Bounded to
     /// `HIPFIRE_CACHE_CKPT_MAX`. Only the recurrent state is snapshotted; the
     /// FullAttention KV[0..seq_pos] stays resident (positional). Cleared on full
-    /// reset / unload (LoadedModel drop frees the GPU snapshots).
+    /// reset / unload — freed via `free_checkpoints`/`truncate_checkpoints` and
+    /// `unload_model` (NOT on `Drop`: `DeviceBuffer` has no `Drop`, so a bare
+    /// `clear()`/`truncate()`/struct-drop leaks the GPU buffers).
     prefill_checkpoints: Vec<(usize, speculative::DeltaNetSnapshot)>,
 
     /// Same ring for the DFlash path (`generate_dflash`), captured during the
@@ -1242,6 +1244,33 @@ fn ckpt_max() -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8)
         .max(1)
+}
+
+/// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
+/// bare `Vec::clear()` orphans each snapshot's GPU buffers — the per-reset leak
+/// that OOMs long-lived serves (hipMalloc-OOM after ~N independent requests).
+/// Routes every drop through `DeltaNetSnapshot::free_gpu`.
+fn free_checkpoints(
+    cks: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    gpu: &mut rdna_compute::Gpu,
+) {
+    for (_, snap) in cks.drain(..) {
+        snap.free_gpu(gpu);
+    }
+}
+
+/// Truncate a checkpoint ring to `keep` slots, freeing the dropped snapshots'
+/// GPU buffers (a bare `Vec::truncate` would leak them).
+fn truncate_checkpoints(
+    cks: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    keep: usize,
+    gpu: &mut rdna_compute::Gpu,
+) {
+    while cks.len() > keep {
+        if let Some((_, snap)) = cks.pop() {
+            snap.free_gpu(gpu);
+        }
+    }
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -2218,8 +2247,8 @@ fn main() {
                         eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
                         m.seq_pos = 0;
                         m.conversation_tokens.clear();
-                        m.prefill_checkpoints.clear();
-                        m.dflash_checkpoints.clear();
+                        free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
+                        free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
                         if let Some(ref dn) = m.dn_state {
                             for s in &dn.s_matrices {
                                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -2417,8 +2446,8 @@ fn main() {
                     }
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
-                    m.prefill_checkpoints.clear();
-                    m.dflash_checkpoints.clear();
+                    free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
+                    free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
                     // Multi-GPU branch: route per-LA-layer memsets through
                     // pp_dn_la_to_device so each buffer is zeroed on its
                     // owning device. The single-GPU `gpu` parameter is left
@@ -4591,6 +4620,15 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(dn) = m.dn_state {
         dn.free_gpu(gpu);
     }
+    // DeltaNet checkpoint rings (prefix-cache resume). `DeviceBuffer` has no
+    // `Drop`, so free explicitly here too — otherwise they leak per load/unload
+    // cycle (same root cause as the per-reset leak fixed at the clear sites).
+    for (_, snap) in m.prefill_checkpoints {
+        snap.free_gpu(gpu);
+    }
+    for (_, snap) in m.dflash_checkpoints {
+        snap.free_gpu(gpu);
+    }
     if let Some(s) = m.q35_scratch {
         s.free_gpu(gpu);
     }
@@ -5177,7 +5215,7 @@ fn generate_dflash(
             }
             m.seq_pos = ckpt;
             m.conversation_tokens.truncate(ckpt);
-            m.dflash_checkpoints.truncate(idx + 1);
+            truncate_checkpoints(&mut m.dflash_checkpoints, idx + 1, gpu);
         }
     }
 
@@ -5367,7 +5405,7 @@ fn generate_dflash(
         // and emit aborted+done events for the CLI's drain loop.
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        m.dflash_checkpoints.clear();
+        free_checkpoints(&mut m.dflash_checkpoints, gpu);
         m.q35_weights = Some(target.weights);
         m.kv_cache = Some(target.kv_cache);
         m.dn_state = Some(target.dn_state);
@@ -5595,6 +5633,15 @@ fn generate_dflash(
         grammar_matcher.advance(&text);
     }
 
+    // First-token EOS guard (mirrors the AR path's post-emit EOS break). The
+    // first token was already emitted above; if it is itself a terminator we must
+    // NOT enter the spec loop, otherwise spec_step_dflash drafts + verifies a whole
+    // block seeded on an already-terminal token before stopping. The committed-tail
+    // check inside the loop applies this identical triple to every subsequent token.
+    let first_token_is_eos = first_token == target.config.eos_token
+        || im_end_token == Some(first_token)
+        || tokenizer.is_terminator(first_token);
+
     let mut rng_state: u64 = 0x13579BDFu64;
 
     // Resolve `HIPFIRE_DDTREE_PATH_C` ONCE before the decode loop. The
@@ -5626,7 +5673,9 @@ fn generate_dflash(
     };
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
-    while generated < max_tokens {
+    // `!first_token_is_eos` short-circuits the entire spec loop when the prefill's
+    // first sampled token was already a terminator (see the guard above).
+    while !first_token_is_eos && generated < max_tokens {
         // Decode-side abort (dflash path). See the matching block in
         // `generate()` for rationale. Without this, a Pi cancel
         // mid-decode leaves the spec-decode loop running for max_tokens
@@ -5644,7 +5693,7 @@ fn generate_dflash(
             m.q35_scratch = Some(target.scratch);
             m.seq_pos = 0;
             m.conversation_tokens.clear();
-            m.dflash_checkpoints.clear();
+            free_checkpoints(&mut m.dflash_checkpoints, gpu);
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -5915,7 +5964,7 @@ fn generate_dflash(
     if grammar_violated {
         eprintln!("[grammar-dflash] grammar violation — forcing full KV/DN reset for next turn");
         m.conversation_tokens.clear();
-        m.dflash_checkpoints.clear();
+        free_checkpoints(&mut m.dflash_checkpoints, gpu);
         m.seq_pos = 0;
         if let Some(ref dn) = m.dn_state {
             for s in &dn.s_matrices {
@@ -6342,8 +6391,8 @@ fn generate_multi(
         () => {{
             m.seq_pos = 0;
             m.conversation_tokens.clear();
-            m.prefill_checkpoints.clear();
-            m.dflash_checkpoints.clear();
+            free_checkpoints(&mut m.prefill_checkpoints, gpu);
+            free_checkpoints(&mut m.dflash_checkpoints, gpu);
             for (i, s) in dn.s_matrices.iter().enumerate() {
                 let g = &mut gpus.devices[dn_la_to_device[i] as usize];
                 let _ = g.bind_thread();
@@ -7611,7 +7660,17 @@ fn generate(
                 rend_tail.chars().take(60).collect::<String>(),
             );
         }
-        if lcp < prior_len {
+        if lcp < prior_len || lcp == rendered.len() {
+            // Divergence OR exact full-match — NOT a pure forward extension.
+            // `lcp == rendered.len()` (⇒ lcp == prior_len) means the request
+            // re-renders byte-identically; re-prefilling the final token (the old
+            // `lcp-1` over-advance in the else-branch) would re-apply its
+            // NON-COMMUTATIVE DeltaNet recurrent update a second time, corrupting
+            // S-matrix/conv_state (temp-0 non-determinism + BF16 divergence on
+            // re-sent prompts). DeltaNet has no rewindable KV (unlike FullAttention),
+            // so the exact-match edge MUST degrade to checkpoint-resume / cold reset —
+            // the strict-`<` HIT predicate the sibling DFlash plan_prompt_cache uses.
+            //
             // Divergence: the client sent a non-extension render (it dropped or
             // edited earlier history, so the prior conversation is no longer a
             // prefix of this prompt). Rather than cold-prefill the whole thing,
@@ -7668,7 +7727,7 @@ fn generate(
                     // seq_pos already points the KV write head at rpos — nothing
                     // to restore (checkpoints are only captured with offset 0).
                     m.conversation_tokens.truncate(rpos);
-                    m.prefill_checkpoints.truncate(idx + 1);
+                    truncate_checkpoints(&mut m.prefill_checkpoints, idx + 1, gpu);
                     cached_tokens_count = rpos;
                     eprintln!(
                         "[qwen-cache resume] rewound to checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
@@ -7690,7 +7749,7 @@ fn generate(
                     // live here; these are disjoint field accesses.
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
-                    m.prefill_checkpoints.clear();
+                    free_checkpoints(&mut m.prefill_checkpoints, gpu);
                     if let Some(ref dn) = m.dn_state {
                         for s in &dn.s_matrices {
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -7712,18 +7771,16 @@ fn generate(
                 }
             }
         } else {
-            // Pure extension or exact-match edge case. Adjust LCP back
-            // by one if the new prompt is byte-identical to the cached
-            // conversation so we always prefill ≥1 token (mirrors V4F's
-            // edge handling).
-            let lcp_adj = if lcp == rendered.len() && lcp > 0 {
-                lcp - 1
-            } else {
-                lcp
-            };
-            m.seq_pos = lcp_adj;
-            cached_tokens_count = lcp_adj;
-            rendered[lcp_adj..].to_vec()
+            // Pure forward extension: `lcp == prior_len && lcp < rendered.len()`.
+            // The prior turn left the recurrent DeltaNet state at exactly
+            // `prior_len`, so reusing KV/DeltaNet[0..lcp] and prefilling the new
+            // suffix `rendered[lcp..]` (≥1 token, since lcp < rendered.len())
+            // advances the state correctly with no rewind and no over-advance.
+            // The exact-match edge (lcp == rendered.len()) no longer reaches here —
+            // it degrades to checkpoint-resume / cold reset above.
+            m.seq_pos = lcp;
+            cached_tokens_count = lcp;
+            rendered[lcp..].to_vec()
         }
     } else {
         new_tokens
@@ -7937,7 +7994,7 @@ fn generate(
             }
             m.seq_pos = 0;
             m.conversation_tokens.clear();
-            m.prefill_checkpoints.clear();
+            free_checkpoints(&mut m.prefill_checkpoints, gpu);
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -8207,7 +8264,7 @@ fn generate(
                 // retained checkpoint now sits on a committed prefix.
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
-                m.prefill_checkpoints.clear();
+                free_checkpoints(&mut m.prefill_checkpoints, gpu);
                 for s in &dn.s_matrices {
                     let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                 }

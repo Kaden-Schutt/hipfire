@@ -6774,6 +6774,19 @@ impl PrefillBatchScratch {
             self.moe_up_batch,
             self.moe_rot_batch,
             self.moe_down_expanded_batch,
+            // Path 2 (grouped-WMMA-GEMM, HIPFIRE_MOE_GROUPED_GEMM, default-on on
+            // gfx11+/gfx12) MoE scratch. These were added when the grouped-GEMM
+            // path landed but never added to this teardown, so they leaked every
+            // prefill — moe_y_gate_up_grouped (~46 MB) + moe_y_down_grouped
+            // (~23 MB) dominate. THIS is the per-request VRAM growth that OOMs
+            // long-lived serves after ~N requests.
+            self.moe_expert_token_counts,
+            self.moe_expert_offsets,
+            self.moe_sorted_slot_index,
+            self.moe_inverse_perm,
+            self.moe_expert_tile_ids,
+            self.moe_y_gate_up_grouped,
+            self.moe_y_down_grouped,
             self.dn_s_tape_q8,
             self.dn_s_tape_scales,
         ] {
