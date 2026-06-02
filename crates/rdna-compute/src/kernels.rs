@@ -177,9 +177,11 @@ pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4.gfx1151.hip");
 
 /// Barrier-free nosync variant of the MQ4-Lloyd fuse gate+up wmma mb4.
-pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_NOSYNC_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync.hip");
+pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_NOSYNC_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync.hip");
 /// gfx1151 K4 barrier-free variant.
-pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_NOSYNC_GFX1151_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync.gfx1151.hip");
+pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_NOSYNC_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync.gfx1151.hip");
 
 /// Returns the MQ4G256Lloyd WMMA residual GEMM kernel source AND module name for
 /// the given arch.
@@ -308,16 +310,20 @@ pub fn gemm_gate_up_mq4g256_lloyd_wmma_for_arch(caps: &ArchCaps) -> (&'static st
     }
 }
 
-pub fn gemm_gate_up_mq4g256_lloyd_wmma_nosync_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+pub fn gemm_gate_up_mq4g256_lloyd_wmma_nosync_for_arch(
+    caps: &ArchCaps,
+) -> (&'static str, &'static str) {
     let arch = caps.arch();
     match arch {
-        "gfx1151" =>
-            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_NOSYNC_GFX1151_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_nosync_k4_gfx1151"),
-        "gfx1100" | "gfx1101" | "gfx1102" =>
-            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_NOSYNC_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_nosync_rdna3"),
-        _ => panic!(
-            "MQ4-Lloyd WMMA gate_up nosync: unsupported arch {arch}."
+        "gfx1151" => (
+            GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_NOSYNC_GFX1151_SRC,
+            "gemm_gate_up_mq4g256_lloyd_wmma_nosync_k4_gfx1151",
         ),
+        "gfx1100" | "gfx1101" | "gfx1102" => (
+            GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_NOSYNC_SRC,
+            "gemm_gate_up_mq4g256_lloyd_wmma_nosync_rdna3",
+        ),
+        _ => panic!("MQ4-Lloyd WMMA gate_up nosync: unsupported arch {arch}."),
     }
 }
 
@@ -388,16 +394,20 @@ pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(
     }
 }
 
-pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync_for_arch(
+    caps: &ArchCaps,
+) -> (&'static str, &'static str) {
     let arch = caps.arch();
     match arch {
-        "gfx1151" =>
-            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_NOSYNC_GFX1151_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync_k4_gfx1151"),
-        "gfx1100" | "gfx1101" | "gfx1102" =>
-            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_NOSYNC_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync_rdna3"),
-        _ => panic!(
-            "MQ4-Lloyd WMMA mb4 gate_up nosync: unsupported arch {arch}."
+        "gfx1151" => (
+            GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_NOSYNC_GFX1151_SRC,
+            "gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync_k4_gfx1151",
         ),
+        "gfx1100" | "gfx1101" | "gfx1102" => (
+            GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_NOSYNC_SRC,
+            "gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync_rdna3",
+        ),
+        _ => panic!("MQ4-Lloyd WMMA mb4 gate_up nosync: unsupported arch {arch}."),
     }
 }
 
@@ -652,14 +662,16 @@ pub fn gemm_gate_up_mq3g256_lloyd_wmma_for_arch(caps: &ArchCaps) -> (&'static st
     }
 }
 
-pub fn gemm_gate_up_mq3g256_lloyd_wmma_nosync_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+pub fn gemm_gate_up_mq3g256_lloyd_wmma_nosync_for_arch(
+    caps: &ArchCaps,
+) -> (&'static str, &'static str) {
     let arch = caps.arch();
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
-            (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_NOSYNC_SRC, "gemm_gate_up_mq3g256_lloyd_wmma_nosync_rdna3"),
-        _ => panic!(
-            "MQ3-Lloyd WMMA gate_up nosync: unsupported arch {arch}."
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" => (
+            GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_NOSYNC_SRC,
+            "gemm_gate_up_mq3g256_lloyd_wmma_nosync_rdna3",
         ),
+        _ => panic!("MQ3-Lloyd WMMA gate_up nosync: unsupported arch {arch}."),
     }
 }
 
@@ -697,11 +709,15 @@ pub fn gemm_gate_up_mq3g256_lloyd_wmma_mb4_for_arch(
     }
 }
 
-pub fn gemm_gate_up_mq3g256_lloyd_wmma_mb4_nosync_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+pub fn gemm_gate_up_mq3g256_lloyd_wmma_mb4_nosync_for_arch(
+    caps: &ArchCaps,
+) -> (&'static str, &'static str) {
     let arch = caps.arch();
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
-            (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_MB4_NOSYNC_SRC, "gemm_gate_up_mq3g256_lloyd_wmma_mb4_nosync_rdna3"),
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" => (
+            GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_MB4_NOSYNC_SRC,
+            "gemm_gate_up_mq3g256_lloyd_wmma_mb4_nosync_rdna3",
+        ),
         _ => panic!("MQ3-Lloyd WMMA mb4 gate_up nosync: unsupported arch {arch}."),
     }
 }
