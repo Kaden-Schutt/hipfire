@@ -4822,6 +4822,9 @@ pub fn spec_step_ddtree_batched(
                 n_rot,
                 target.config.rope_theta,
                 n_positions,
+                // pos_offset=0: tree-mode re-rotation uses committed gather indices
+                // as positions directly (no compact_offset overlay). Unchanged behavior.
+                0,
             )?;
 
             // 3. V gather via the existing kv_compact_gather pattern.

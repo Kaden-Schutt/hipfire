@@ -10187,6 +10187,9 @@ fn forward_prefill_chunk(
                 }
 
                 // 5. Batched partial-interleaved RoPE (per-row positions).
+                // pos_offset = compact_offset so new Q/K rotate at ABSOLUTE phase
+                // after eviction (cached keys are absolute-phased); pbs.positions
+                // stays physical for the KV-write below. 0 when no compaction.
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32_batched(
                     &pbs.fa_q_batch,
@@ -10198,6 +10201,7 @@ fn forward_prefill_chunk(
                     n_rot,
                     config.rope_theta,
                     n,
+                    kv_cache.compact_offset as i32,
                 )?;
 
                 // 6. Batched KV cache writes (per-row positions).
@@ -11752,6 +11756,8 @@ fn forward_prefill_chunk(
                     }
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                // pos_offset = compact_offset (absolute RoPE phase post-eviction);
+                // pbs.positions stays physical for the KV-write. 0 when no compaction.
                 gpu.rope_partial_interleaved_f32_batched(
                     &pbs.fa_q_batch,
                     &pbs.fa_k_batch,
@@ -11762,6 +11768,7 @@ fn forward_prefill_chunk(
                     n_rot,
                     config.rope_theta,
                     n,
+                    kv_cache.compact_offset as i32,
                 )?;
                 if kv_cache.quant_asym4 {
                     let ct = givens_cos_view!().unwrap();
