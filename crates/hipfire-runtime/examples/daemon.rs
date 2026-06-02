@@ -6473,6 +6473,15 @@ fn generate_multi(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let mut total_think_tokens: usize = 0;
+    // Post-latch answer bound. Once the think-cap latches we force-close <think>
+    // and ask the model to answer; but `total_think_tokens` only advances
+    // in-think, so a model that rambles a NON-think answer (or re-opens <think>
+    // in a tight loop the force-close keeps re-closing) never trips the +256 EOS
+    // and runs to max_tokens. Mark the latch position and hard-EOS once
+    // generation runs this many tokens past it — generous for a real final
+    // answer, bounded against runaway.
+    const POST_LATCH_ANSWER_BUDGET: usize = 768;
+    let mut latch_gen_mark: Option<usize> = None;
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
@@ -6563,9 +6572,18 @@ fn generate_multi(
             if max_total_think > 0 && total_think_tokens >= max_total_think {
                 force_answer_latched = true;
             }
+            if force_answer_latched && latch_gen_mark.is_none() {
+                latch_gen_mark = Some(generated);
+            }
             if max_total_think > 0 && in_think && total_think_tokens >= max_total_think + 256 {
                 eprintln!("[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS", id, total_think_tokens, max_total_think);
                 break;
+            }
+            if let Some(mark) = latch_gen_mark {
+                if generated.saturating_sub(mark) >= POST_LATCH_ANSWER_BUDGET {
+                    eprintln!("[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS", id, generated.saturating_sub(mark));
+                    break;
+                }
             }
             if max_think_tokens > 0 {
                 if in_think {
@@ -8153,6 +8171,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         let mut total_think_tokens: usize = 0;
+        // Post-latch answer bound (see the _multi decode path for rationale): the
+        // +256 EOS below only counts in-think tokens, so a non-think ramble or a
+        // re-open loop after the cap latches would run to max_tokens. Hard-EOS
+        // once generation runs this many tokens past the latch.
+        const POST_LATCH_ANSWER_BUDGET: usize = 768;
+        let mut latch_gen_mark: Option<usize> = None;
 
         // N-gram loop detector: track 4-gram token sequences. When any
         // 4-gram repeats more than `ngram_loop_threshold` times in the
@@ -8343,9 +8367,18 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 if max_total_think > 0 && total_think_tokens >= max_total_think {
                     force_answer_latched = true;
                 }
+                if force_answer_latched && latch_gen_mark.is_none() {
+                    latch_gen_mark = Some(generated);
+                }
                 if max_total_think > 0 && in_think && total_think_tokens >= max_total_think + 256 {
                     eprintln!("[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS", id, total_think_tokens, max_total_think);
                     break;
+                }
+                if let Some(mark) = latch_gen_mark {
+                    if generated.saturating_sub(mark) >= POST_LATCH_ANSWER_BUDGET {
+                        eprintln!("[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS", id, generated.saturating_sub(mark));
+                        break;
+                    }
                 }
                 if max_think_tokens > 0 {
                     if in_think {
