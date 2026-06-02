@@ -7407,7 +7407,14 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // `<think></think>` block after the assistant prefix). Each path
     // picks up the signal it needs.
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-    let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
+    // Jinja renders the FULL conversation every turn (stateless full-render,
+    // like generate_dflash) — fire on every turn, not just `seq_pos == 0`.
+    // `render_messages` below replays `messages_history` (all prior turns) and
+    // includes the system prompt, so turn 2+ no longer falls through to the
+    // Plain branch (which dropped the system prompt and lost the Jinja
+    // template). The cold-reset further down (`jinja_active && seq_pos > 0`)
+    // re-prefills this full render from position 0.
+    let try_jinja = jinja_enabled && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -7819,6 +7826,39 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     } else {
         new_tokens
     };
+
+    // Jinja path renders the full conversation each turn (the LCP cache is
+    // disabled when `jinja_active`, above). On turn 2+ (`seq_pos > 0`) cold-reset
+    // BEFORE the budget guard + prefill so the full render writes from position 0
+    // — otherwise it would append to the prior turn's dirty DeltaNet/KV/checkpoint
+    // state (stale recurrent state → drift; the reset that the non-Jinja LCP-miss
+    // path does below was being skipped, and the system prompt was dropped). This
+    // mirrors the unconditional cold reset generate_dflash already does under
+    // Jinja. Uses `free_checkpoints` (NOT a bare `.clear()`) so the checkpoint GPU
+    // buffers are actually freed rather than leaked.
+    if jinja_active && m.seq_pos > 0 {
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        free_checkpoints(&mut m.prefill_checkpoints, gpu);
+        free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        if let Some(ref dn) = m.dn_state {
+            for s in &dn.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+        }
+        if let Some(kv) = m.kv_cache.as_mut() {
+            kv.compact_offset = 0;
+        }
+        if let Some(kv) = m.llama_kv.as_mut() {
+            kv.compact_offset = 0;
+        }
+    }
 
     // KV-budget guard. Without eviction the physical buffer is the hard cap;
     // we must fit prefill + generation + trailer in one allocation. With
