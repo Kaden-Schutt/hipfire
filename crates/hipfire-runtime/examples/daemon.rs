@@ -5633,6 +5633,15 @@ fn generate_dflash(
         grammar_matcher.advance(&text);
     }
 
+    // First-token EOS guard (mirrors the AR path's post-emit EOS break). The
+    // first token was already emitted above; if it is itself a terminator we must
+    // NOT enter the spec loop, otherwise spec_step_dflash drafts + verifies a whole
+    // block seeded on an already-terminal token before stopping. The committed-tail
+    // check inside the loop applies this identical triple to every subsequent token.
+    let first_token_is_eos = first_token == target.config.eos_token
+        || im_end_token == Some(first_token)
+        || tokenizer.is_terminator(first_token);
+
     let mut rng_state: u64 = 0x13579BDFu64;
 
     // Resolve `HIPFIRE_DDTREE_PATH_C` ONCE before the decode loop. The
@@ -5664,7 +5673,9 @@ fn generate_dflash(
     };
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
-    while generated < max_tokens {
+    // `!first_token_is_eos` short-circuits the entire spec loop when the prefill's
+    // first sampled token was already a terminator (see the guard above).
+    while !first_token_is_eos && generated < max_tokens {
         // Decode-side abort (dflash path). See the matching block in
         // `generate()` for rationale. Without this, a Pi cancel
         // mid-decode leaves the spec-decode loop running for max_tokens
@@ -7649,7 +7660,17 @@ fn generate(
                 rend_tail.chars().take(60).collect::<String>(),
             );
         }
-        if lcp < prior_len {
+        if lcp < prior_len || lcp == rendered.len() {
+            // Divergence OR exact full-match — NOT a pure forward extension.
+            // `lcp == rendered.len()` (⇒ lcp == prior_len) means the request
+            // re-renders byte-identically; re-prefilling the final token (the old
+            // `lcp-1` over-advance in the else-branch) would re-apply its
+            // NON-COMMUTATIVE DeltaNet recurrent update a second time, corrupting
+            // S-matrix/conv_state (temp-0 non-determinism + BF16 divergence on
+            // re-sent prompts). DeltaNet has no rewindable KV (unlike FullAttention),
+            // so the exact-match edge MUST degrade to checkpoint-resume / cold reset —
+            // the strict-`<` HIT predicate the sibling DFlash plan_prompt_cache uses.
+            //
             // Divergence: the client sent a non-extension render (it dropped or
             // edited earlier history, so the prior conversation is no longer a
             // prefix of this prompt). Rather than cold-prefill the whole thing,
@@ -7750,18 +7771,16 @@ fn generate(
                 }
             }
         } else {
-            // Pure extension or exact-match edge case. Adjust LCP back
-            // by one if the new prompt is byte-identical to the cached
-            // conversation so we always prefill ≥1 token (mirrors V4F's
-            // edge handling).
-            let lcp_adj = if lcp == rendered.len() && lcp > 0 {
-                lcp - 1
-            } else {
-                lcp
-            };
-            m.seq_pos = lcp_adj;
-            cached_tokens_count = lcp_adj;
-            rendered[lcp_adj..].to_vec()
+            // Pure forward extension: `lcp == prior_len && lcp < rendered.len()`.
+            // The prior turn left the recurrent DeltaNet state at exactly
+            // `prior_len`, so reusing KV/DeltaNet[0..lcp] and prefilling the new
+            // suffix `rendered[lcp..]` (≥1 token, since lcp < rendered.len())
+            // advances the state correctly with no rewind and no over-advance.
+            // The exact-match edge (lcp == rendered.len()) no longer reaches here —
+            // it degrades to checkpoint-resume / cold reset above.
+            m.seq_pos = lcp;
+            cached_tokens_count = lcp;
+            rendered[lcp..].to_vec()
         }
     } else {
         new_tokens
