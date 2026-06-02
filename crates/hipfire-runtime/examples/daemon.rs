@@ -6480,7 +6480,8 @@ fn generate_multi(
     // and runs to max_tokens. Mark the latch position and hard-EOS once
     // generation runs this many tokens past it — generous for a real final
     // answer, bounded against runaway.
-    const POST_LATCH_ANSWER_BUDGET: usize = 768;
+    let post_latch_answer_budget: usize = std::env::var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(768);
     let mut latch_gen_mark: Option<usize> = None;
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
@@ -6580,7 +6581,7 @@ fn generate_multi(
                 break;
             }
             if let Some(mark) = latch_gen_mark {
-                if generated.saturating_sub(mark) >= POST_LATCH_ANSWER_BUDGET {
+                if generated.saturating_sub(mark) >= post_latch_answer_budget {
                     eprintln!("[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS", id, generated.saturating_sub(mark));
                     break;
                 }
@@ -8175,7 +8176,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // +256 EOS below only counts in-think tokens, so a non-think ramble or a
         // re-open loop after the cap latches would run to max_tokens. Hard-EOS
         // once generation runs this many tokens past the latch.
-        const POST_LATCH_ANSWER_BUDGET: usize = 768;
+        let post_latch_answer_budget: usize = std::env::var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(768);
         let mut latch_gen_mark: Option<usize> = None;
 
         // N-gram loop detector: track 4-gram token sequences. When any
@@ -8375,7 +8377,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                     break;
                 }
                 if let Some(mark) = latch_gen_mark {
-                    if generated.saturating_sub(mark) >= POST_LATCH_ANSWER_BUDGET {
+                    if generated.saturating_sub(mark) >= post_latch_answer_budget {
                         eprintln!("[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS", id, generated.saturating_sub(mark));
                         break;
                     }
