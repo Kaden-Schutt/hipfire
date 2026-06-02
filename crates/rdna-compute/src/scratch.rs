@@ -10,6 +10,7 @@ use crate::kernels;
 use crate::{DType, GpuTensor};
 use hip_bridge::{
     DeviceBuffer, Function, HipResult, HipRuntime, KernargBlob, Module, Stream,
+    HIP_ERROR_INVALID_IMAGE,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -59,13 +60,40 @@ pub(crate) fn compile_and_load_kernel(
     let obj_path = compiler.compile(module_name, source)?;
     let obj_path_str = obj_path.to_str().unwrap().to_string();
     if !modules.contains_key(module_name) {
-        let module = hip.module_load(&obj_path_str)?;
+        let module = module_load_or_recompile(hip, compiler, module_name, source, &obj_path_str)?;
         modules.insert(module_name.to_string(), module);
     }
     let module = &modules[module_name];
     let func = hip.module_get_function(module, func_name)?;
     functions.insert(func_name.to_string(), func);
     Ok(())
+}
+
+/// Load a compiled module, self-healing a stale/invalid cached image. If
+/// `hipModuleLoad` rejects the `.hsaco` as an invalid device image
+/// (`HIP_ERROR_INVALID_IMAGE`) — e.g. a cross-build blob left in a shared
+/// `.hipfire_kernels` cache — evict it, recompile from source, and retry once.
+/// Any other error propagates unchanged. (Fix for the bench/run "device kernel
+/// image is invalid" crash when two daemon builds share a cwd kernel cache.)
+pub(crate) fn module_load_or_recompile(
+    hip: &HipRuntime,
+    compiler: &mut crate::compiler::KernelCompiler,
+    module_name: &str,
+    source: &str,
+    obj_path: &str,
+) -> HipResult<Module> {
+    match hip.module_load(obj_path) {
+        Ok(m) => Ok(m),
+        Err(e) if e.code == HIP_ERROR_INVALID_IMAGE => {
+            eprintln!(
+                "  {module_name}: cached kernel image invalid (HIP {}); recompiling from source",
+                e.code
+            );
+            let fresh = compiler.recompile(module_name, source)?;
+            hip.module_load(fresh.to_str().unwrap())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Launch a kernel, routing through the blob path when graph capture or
@@ -91,9 +119,7 @@ pub(crate) fn launch_maybe_blob(
         capture_blobs.push(blob.into_vec());
         let buf = capture_blobs.last_mut().unwrap();
         let func = &functions[func_name];
-        unsafe {
-            hip.launch_kernel_blob(func, grid, block, shared_mem, stream, buf.as_mut_slice())
-        }
+        unsafe { hip.launch_kernel_blob(func, grid, block, shared_mem, stream, buf.as_mut_slice()) }
     } else {
         let func = &functions[func_name];
         unsafe { hip.launch_kernel(func, grid, block, shared_mem, stream, params) }
@@ -639,8 +665,7 @@ impl ScratchState {
             &mut kv as *mut _ as *mut c_void,
         ];
         let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
-        let timer =
-            crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_batched", bytes);
+        let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_batched", bytes);
         let result = launch_maybe_blob(
             hip,
             functions,
@@ -835,8 +860,7 @@ impl ScratchState {
             &mut kv as *mut _ as *mut c_void,
         ];
         let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
-        let timer =
-            crate::profile::begin_timer(hip, "fwht", "rotate_x_mq_awq_batched", bytes);
+        let timer = crate::profile::begin_timer(hip, "fwht", "rotate_x_mq_awq_batched", bytes);
         let result = launch_maybe_blob(
             hip,
             functions,
@@ -919,8 +943,7 @@ impl ScratchState {
             &kv as *const _ as *mut c_void,
         ];
         let bytes = crate::profile::mq_rotate_bytes(k) + k;
-        let timer =
-            crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_dual_fp8", bytes);
+        let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_dual_fp8", bytes);
         let result = launch_maybe_blob(
             hip,
             functions,
@@ -989,7 +1012,14 @@ impl ScratchState {
             &mut kv as *mut _ as *mut c_void,
         ];
         unsafe {
-            hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, stream, &mut params)
+            hip.launch_kernel(
+                rot_func,
+                [n_groups, 1, 1],
+                [32, 1, 1],
+                0,
+                stream,
+                &mut params,
+            )
         }
     }
 }

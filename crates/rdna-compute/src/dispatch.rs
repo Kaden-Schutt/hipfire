@@ -811,10 +811,7 @@ impl Gpu {
     }
 
     /// Ensure the deterministic-ksplit partials scratch is at least `n_bytes`.
-    pub(crate) fn ensure_ksplit_det_partials(
-        &mut self,
-        n_bytes: usize,
-    ) -> HipResult<*mut c_void> {
+    pub(crate) fn ensure_ksplit_det_partials(&mut self, n_bytes: usize) -> HipResult<*mut c_void> {
         self.scratch.ensure_ksplit_det_partials(&self.hip, n_bytes)
     }
 
@@ -1081,7 +1078,13 @@ impl Gpu {
             let obj_path = self.compiler.compile(module_name, source)?;
             let obj_path_str = obj_path.to_str().unwrap().to_string();
             if !self.modules.contains_key(module_name) {
-                let module = self.hip.module_load(&obj_path_str)?;
+                let module = crate::scratch::module_load_or_recompile(
+                    &self.hip,
+                    &mut self.compiler,
+                    module_name,
+                    source,
+                    &obj_path_str,
+                )?;
                 self.modules.insert(module_name.to_string(), module);
             }
             let module = &self.modules[module_name];
@@ -1892,7 +1895,13 @@ impl Gpu {
             let obj_path = self.compiler.compile(name, src)?;
             let obj_path_str = obj_path.to_str().unwrap().to_string();
             if !self.modules.contains_key(*name) {
-                let module = self.hip.module_load(&obj_path_str)?;
+                let module = crate::scratch::module_load_or_recompile(
+                    &self.hip,
+                    &mut self.compiler,
+                    name,
+                    src,
+                    &obj_path_str,
+                )?;
                 self.modules.insert(name.to_string(), module);
             }
             let module = &self.modules[*name];
