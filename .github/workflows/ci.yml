@@ -1,0 +1,91 @@
+name: CI
+
+# GPU-free continuous integration.
+#
+# hipfire loads the HIP/ROCm runtime via dlopen at *runtime* (see
+# crates/hip-bridge — libloading, no build.rs, no link-time -lamdhip64),
+# so the entire workspace compiles and unit-tests on a stock runner with
+# no GPU and no ROCm installed. The GPU-bound gates (test_kernels,
+# coherence-gate.sh, speed-gate.sh) need real RDNA hardware and run on a
+# self-hosted runner instead — see .github/workflows/gpu-gates.yml (TODO).
+#
+# Required vs advisory: `build` and `test` are the load-bearing
+# "is it broken" gates and are intended to be required status checks on
+# master. `fmt` and `clippy` start advisory (not required) because this
+# repo predates CI and carries lint/format debt. rustfmt is enforced on
+# changed Rust files only until the historical workspace-wide churn is paid
+# down; promote the full gate after that cleanup pass.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# Supersede in-flight runs when a PR gets new pushes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # NOTE: deliberately NOT setting `RUSTFLAGS: -D warnings` yet. This repo
+  # predates CI and may carry rustc-warning debt; denying warnings now would
+  # red the build on legacy code. Add it after a warning-cleanup pass.
+
+jobs:
+  build:
+    name: build (workspace, no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace (lib + bins + examples + tests)
+        run: cargo build --release --workspace --all-targets --locked
+      - name: Build daemon example (real shipped binary, arch features on)
+        run: >
+          cargo build --release --locked
+          -p hipfire-runtime --example daemon
+          --features arch-qwen35,arch-qwen35-vl,arch-llama,arch-qwen2,arch-deepseek4,arch-dots-ocr
+
+  test:
+    name: unit tests (lib, no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace lib unit tests
+        # --lib only: unit tests inside library targets are GPU-free
+        # (detector logic, sampler, framing, quant math). Integration
+        # tests / examples that dispatch kernels need the self-hosted
+        # GPU runner and are intentionally excluded here.
+        run: cargo test --lib --workspace --locked
+
+  fmt:
+    name: rustfmt (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: bash scripts/ci-rustfmt-changed.sh
+
+  clippy:
+    name: clippy (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # No -D warnings yet: surface lint debt without blocking. Promote to
+      # `-- -D warnings` (and add to required checks) after a cleanup pass.
+      - run: cargo clippy --workspace --all-targets --locked
