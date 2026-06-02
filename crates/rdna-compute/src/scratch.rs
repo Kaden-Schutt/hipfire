@@ -119,9 +119,7 @@ pub(crate) fn launch_maybe_blob(
         capture_blobs.push(blob.into_vec());
         let buf = capture_blobs.last_mut().unwrap();
         let func = &functions[func_name];
-        unsafe {
-            hip.launch_kernel_blob(func, grid, block, shared_mem, stream, buf.as_mut_slice())
-        }
+        unsafe { hip.launch_kernel_blob(func, grid, block, shared_mem, stream, buf.as_mut_slice()) }
     } else {
         let func = &functions[func_name];
         unsafe { hip.launch_kernel(func, grid, block, shared_mem, stream, params) }
@@ -667,8 +665,7 @@ impl ScratchState {
             &mut kv as *mut _ as *mut c_void,
         ];
         let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
-        let timer =
-            crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_batched", bytes);
+        let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_batched", bytes);
         let result = launch_maybe_blob(
             hip,
             functions,
@@ -863,8 +860,7 @@ impl ScratchState {
             &mut kv as *mut _ as *mut c_void,
         ];
         let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
-        let timer =
-            crate::profile::begin_timer(hip, "fwht", "rotate_x_mq_awq_batched", bytes);
+        let timer = crate::profile::begin_timer(hip, "fwht", "rotate_x_mq_awq_batched", bytes);
         let result = launch_maybe_blob(
             hip,
             functions,
@@ -947,8 +943,7 @@ impl ScratchState {
             &kv as *const _ as *mut c_void,
         ];
         let bytes = crate::profile::mq_rotate_bytes(k) + k;
-        let timer =
-            crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_dual_fp8", bytes);
+        let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_dual_fp8", bytes);
         let result = launch_maybe_blob(
             hip,
             functions,
@@ -1017,7 +1012,14 @@ impl ScratchState {
             &mut kv as *mut _ as *mut c_void,
         ];
         unsafe {
-            hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, stream, &mut params)
+            hip.launch_kernel(
+                rot_func,
+                [n_groups, 1, 1],
+                [32, 1, 1],
+                0,
+                stream,
+                &mut params,
+            )
         }
     }
 }
