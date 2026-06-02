@@ -27,7 +27,7 @@ use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
 #[cfg(feature = "new-dispatch")]
 use hipfire_dispatch::types::RotationVariant;
 #[cfg(feature = "new-dispatch")]
-use hipfire_dispatch::types::dtype_needs_fwht;
+use hipfire_dispatch::types::dtype_needs_rotation;
 use std::sync::OnceLock;
 
 // ─── Config ─────────────────────────────────────────────────────────────
@@ -9065,7 +9065,7 @@ fn fused_qkvza_dispatch(
         }
     } else {
         let mut run = |w: &hipfire_runtime::llama::WeightTensor, y: &GpuTensor| -> HipResult<()> {
-            let x = if dtype_needs_fwht(w.gpu_dtype) {
+            let x = if dtype_needs_rotation(w.gpu_dtype) {
                 eff_rot.ok_or_else(|| {
                     HipError::new(0, "MQ-weight GEMV requires prerotated input")
                 })?
@@ -9145,7 +9145,7 @@ fn fused_qkv_dispatch(
         }
     } else {
         let mut run = |w: &hipfire_runtime::llama::WeightTensor, y: &GpuTensor| -> HipResult<()> {
-            let x = if dtype_needs_fwht(w.gpu_dtype) {
+            let x = if dtype_needs_rotation(w.gpu_dtype) {
                 eff_rot.ok_or_else(|| {
                     HipError::new(0, "MQ-weight GEMV requires prerotated input")
                 })?
@@ -9221,7 +9221,7 @@ fn fused_gate_up_dispatch(
         }
     } else {
         let mut run = |w: &hipfire_runtime::llama::WeightTensor, y: &GpuTensor| -> HipResult<()> {
-            let x = if dtype_needs_fwht(w.gpu_dtype) {
+            let x = if dtype_needs_rotation(w.gpu_dtype) {
                 eff_rot.ok_or_else(|| {
                     HipError::new(0, "MQ-weight GEMV requires prerotated input")
                 })?

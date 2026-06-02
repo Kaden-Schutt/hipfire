@@ -29,7 +29,7 @@ use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
 #[cfg(feature = "new-dispatch")]
 use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
 #[cfg(feature = "new-dispatch")]
-use hipfire_dispatch::types::{dtype_needs_fwht, GemvVariant, RotationVariant};
+use hipfire_dispatch::types::{dtype_needs_rotation, GemvVariant, RotationVariant};
 
 /// Type marker for the LLaMA family — covers `arch_id = 0` (LLaMA /
 /// Mistral) and `arch_id = 1` (plain Qwen3 / Qwen2). All members of
@@ -169,7 +169,7 @@ impl Llama {
                     &scratch.tmp, &scratch.q, &scratch.k, &scratch.v,
                     layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
                 )?;
-            } else if dtype_needs_fwht(layer.wq.gpu_dtype) {
+            } else if dtype_needs_rotation(layer.wq.gpu_dtype) {
                 rotation.run(&ctx, gpu, RotationParams {
                     x: &scratch.x,
                     x_up: None,
@@ -337,7 +337,7 @@ impl Llama {
                     &scratch.tmp, &scratch.gate, &scratch.up,
                     layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
                 )?;
-            } else if dtype_needs_fwht(layer.w_gate.gpu_dtype) {
+            } else if dtype_needs_rotation(layer.w_gate.gpu_dtype) {
                 rotation.run(&ctx, gpu, RotationParams {
                     x: &scratch.x,
                     x_up: None,

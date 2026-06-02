@@ -108,7 +108,7 @@ pub(crate) fn weight_needs_fwht(weight: &GpuTensor) -> bool {
 
 #[cfg(feature = "new-dispatch")]
 pub(crate) fn weight_needs_fwht(weight: &GpuTensor) -> bool {
-    hipfire_dispatch::types::dtype_needs_fwht(weight.dtype)
+    hipfire_dispatch::types::dtype_needs_rotation(weight.dtype)
 }
 
 #[cfg(not(feature = "new-dispatch"))]

@@ -101,18 +101,18 @@ fn rotation_plan_covers_every_dtype() {
 
 #[test]
 fn rotation_plan_matches_legacy_needs_fwht() {
-    use hipfire_dispatch::types::{dtype_rotation_plan, dtype_needs_fwht, RotationPlan};
+    use hipfire_dispatch::types::{dtype_rotation_plan, dtype_needs_rotation, RotationPlan};
     for d in QUANTIZED_DTYPES {
         assert_eq!(
             dtype_rotation_plan(*d) != RotationPlan::None,
-            dtype_needs_fwht(*d),
+            dtype_needs_rotation(*d),
             "rotation_plan/needs_fwht disagree for {:?}", d
         );
     }
     for d in [DType::F32, DType::F16, DType::Q8_0] {
         assert_eq!(
             dtype_rotation_plan(d) != RotationPlan::None,
-            dtype_needs_fwht(d),
+            dtype_needs_rotation(d),
             "rotation_plan/needs_fwht disagree for {:?}", d
         );
     }

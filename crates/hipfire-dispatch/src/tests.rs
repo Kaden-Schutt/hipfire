@@ -6,7 +6,7 @@
 //! - `ArchPredicate::eval_arch` — key arch identities (RDNA1/2/3)
 //! - `KernelRegistry` — register, resolve, arch gating, shape gating, fallback
 //! - `KernelKey::for_gemv*` — dtype/variant → key mapping
-//! - `dtype_needs_fwht` — MQ family true, HFQ/F32 false
+//! - `dtype_needs_rotation` — MQ family true, HFQ/F32 false
 //! - `GemvFamily::resolve` — arch predicate filtering via a real registry
 //! - `Pipeline::can_satisfy` — prefix-match semantics
 
@@ -274,6 +274,25 @@ fn registry_resolve_shape_gate_fallback_to_ungated_variant() {
 }
 
 #[test]
+fn resolve_honors_shape_gate() {
+    let mut reg = KernelRegistry::new();
+    reg.register(KernelVariant {
+        key: KernelKey::GemvF32, arch_required: ArchPredicate::Always,
+        shape_gate: Some(ShapePredicate::BatchGt(1)), steps: &[PipelineOp::Gemv], has_awq: true,
+    });
+    reg.register(KernelVariant {
+        key: KernelKey::GemvF32, arch_required: ArchPredicate::Always,
+        shape_gate: None, steps: &[PipelineOp::Gemv], has_awq: false,
+    });
+    let ctx = ctx_rdna1();
+    let batched = ShapeInfo { batch_size: 8, head_dim: 0, m: 4096 };
+    let scalar  = ShapeInfo { batch_size: 1, head_dim: 0, m: 4096 };
+    assert!(reg.resolve(KernelKey::GemvF32, &ctx, Some(&batched)).unwrap().has_awq);
+    assert!(!reg.resolve(KernelKey::GemvF32, &ctx, Some(&scalar)).unwrap().has_awq);
+    assert!(reg.resolve(KernelKey::GemvF32, &ctx, None).unwrap().has_awq);
+}
+
+#[test]
 fn registry_validate_succeeds_on_populated_registry() {
     let mut reg = KernelRegistry::new();
     reg.register(always_variant(KernelKey::GemvF32));
@@ -380,22 +399,22 @@ fn for_gemv_rejects_unsupported_variant_combo() {
     assert!(KernelKey::for_gemv_residual(DType::F32).is_err());
 }
 
-// ── dtype_needs_fwht ──────────────────────────────────────────────────────────
+// ── dtype_needs_rotation ──────────────────────────────────────────────────────────
 
 #[test]
-fn dtype_needs_fwht_true_for_mq_family() {
+fn dtype_needs_rotation_true_for_mq_family() {
     for dtype in [
         DType::MQ4G256, DType::MQ3G256, DType::MQ2G256, DType::MQ6G256,
         DType::MQ8G256, DType::MQ4G256Lloyd, DType::MFP4G32,
     ] {
-        assert!(dtype_needs_fwht(dtype), "{dtype:?} should need FWHT");
+        assert!(dtype_needs_rotation(dtype), "{dtype:?} should need FWHT");
     }
 }
 
 #[test]
-fn dtype_needs_fwht_false_for_hfq_and_scalar() {
+fn dtype_needs_rotation_false_for_hfq_and_scalar() {
     for dtype in [DType::F32, DType::F16, DType::HFQ4G256, DType::Q8_0, DType::HFP4G32] {
-        assert!(!dtype_needs_fwht(dtype), "{dtype:?} should NOT need FWHT");
+        assert!(!dtype_needs_rotation(dtype), "{dtype:?} should NOT need FWHT");
     }
 }
 

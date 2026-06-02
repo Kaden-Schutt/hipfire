@@ -470,9 +470,9 @@ impl KernelKey {
     }
 }
 
-/// Whether a DType requires FWHT-rotated activations before GEMV.
+/// Whether a DType requires activation rotation (FWHT or Givens) before GEMV.
 /// Replaces per-model `needs_mq_rotation` / `weight_needs_fwht` helpers.
-pub fn dtype_needs_fwht(dtype: DType) -> bool {
+pub fn dtype_needs_rotation(dtype: DType) -> bool {
     use DType::*;
     matches!(
         dtype,

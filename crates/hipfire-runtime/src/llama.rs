@@ -643,14 +643,14 @@ pub fn weight_gemv(
     use std::sync::OnceLock;
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
-    use hipfire_dispatch::types::{dtype_needs_fwht, GemvVariant};
+    use hipfire_dispatch::types::{dtype_needs_rotation, GemvVariant};
 
     static GEMV: OnceLock<GemvFamily> = OnceLock::new();
     let gemv = GEMV.get_or_init(|| GemvFamily::new());
     let ctx = DispatchCtx::new(gpu);
     let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
 
-    if !dtype_needs_fwht(w.gpu_dtype) {
+    if !dtype_needs_rotation(w.gpu_dtype) {
         return gemv.run_auto(&ctx, gpu, &wr, x, y)
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
     }
@@ -1003,7 +1003,7 @@ pub fn weight_gemv_prerotated(
     use std::sync::OnceLock;
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::{GemvFamily, WeightRef};
-    use hipfire_dispatch::types::dtype_needs_fwht;
+    use hipfire_dispatch::types::dtype_needs_rotation;
 
     static GEMV: OnceLock<GemvFamily> = OnceLock::new();
     let gemv = GEMV.get_or_init(|| GemvFamily::new());
@@ -1016,7 +1016,7 @@ pub fn weight_gemv_prerotated(
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
     }
 
-    if dtype_needs_fwht(w.gpu_dtype) {
+    if dtype_needs_rotation(w.gpu_dtype) {
         if let Some(xr) = x_rot {
             let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
             return gemv.run_auto(&ctx, gpu, &wr, xr, y)
