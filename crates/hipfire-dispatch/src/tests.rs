@@ -11,6 +11,7 @@
 //! - `Pipeline::can_satisfy` — prefix-match semantics
 
 use crate::context::DispatchCtx;
+use crate::families::fused_qkv::FusedQkvFamily;
 use crate::families::gemv::GemvFamily;
 use crate::pipeline::Pipeline;
 use crate::tables::KernelRegistry;
@@ -37,6 +38,11 @@ fn ctx_rdna3() -> DispatchCtx {
 /// gfx1200 = RDNA4: has dp4a, WMMA w32 gfx12, no MMQ via gfx11 path.
 fn ctx_rdna4() -> DispatchCtx {
     DispatchCtx::for_test("gfx1200")
+}
+
+/// gfx906 = Vega 20: wave64, sdot4/dp4a, gemv_dp4a_enabled by default.
+fn ctx_gfx906() -> DispatchCtx {
+    DispatchCtx::for_test("gfx906")
 }
 
 fn always_variant(key: KernelKey) -> KernelVariant {
@@ -156,6 +162,27 @@ fn arch_has_mmq_on_rdna3_only() {
     assert!(!ArchPredicate::HasMmq.eval_arch(&ctx_rdna2()));
     assert!(ArchPredicate::HasMmq.eval_arch(&ctx_rdna3()));
     assert!(!ArchPredicate::HasMmq.eval_arch(&ctx_rdna4()));
+}
+
+#[test]
+fn arch_gemv_dp4a_gfx906_only() {
+    assert!(ArchPredicate::GemvDp4a.eval_arch(&ctx_gfx906()));
+    assert!(!ArchPredicate::GemvDp4a.eval_arch(&ctx_rdna2()));
+    assert!(!ArchPredicate::GemvDp4a.eval_arch(&ctx_rdna3()));
+    assert!(!ArchPredicate::GemvDp4a.eval_arch(&ctx_rdna4()));
+}
+
+#[test]
+fn fused_qkv_hfq6_resolved_only_on_gemv_dp4a_arch() {
+    let fam = FusedQkvFamily::new();
+    // gfx906 (gemv_dp4a enabled) → HFQ6 variants resolve
+    assert!(fam.resolve(KernelKey::FusedQkvzaHfq6G256, &ctx_gfx906(), None).is_ok());
+    assert!(fam.resolve(KernelKey::FusedQkvHfq6G256, &ctx_gfx906(), None).is_ok());
+    assert!(fam.resolve(KernelKey::FusedGateUpHfq6G256, &ctx_gfx906(), None).is_ok());
+    // RDNA3 (gemv_dp4a disabled by default) → HFQ6 variants rejected
+    assert!(fam.resolve(KernelKey::FusedQkvzaHfq6G256, &ctx_rdna3(), None).is_err());
+    assert!(fam.resolve(KernelKey::FusedQkvHfq6G256, &ctx_rdna3(), None).is_err());
+    assert!(fam.resolve(KernelKey::FusedGateUpHfq6G256, &ctx_rdna3(), None).is_err());
 }
 
 // ── KernelRegistry ────────────────────────────────────────────────────────────

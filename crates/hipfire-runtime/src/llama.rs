@@ -688,8 +688,17 @@ pub fn weight_gemv(
                 givens_scales: None,
                 givens_krot: None,
             }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-            gemv.run_auto(&ctx, gpu, &wr, &xr, y)
-                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+            // xr is ALREADY FWHT-rotated by rotate_x_mq_for above. Use the
+            // Prerotated GEMV directly — calling run_auto here would re-rotate
+            // (dtype_rotation_plan(MQ*) != None), double-applying the involutory
+            // FWHT and feeding effectively-unrotated activations to the
+            // prerotated kernel (garbage logits). Mirrors master's
+            // rotate_x_mq_for + gemv_*_prerotated.
+            gemv.run(&ctx, gpu, &GemvParams {
+                w: &wr, x: &xr, y,
+                variant: GemvVariant::Prerotated,
+                residual: None, gate: None, up: None,
+            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
         // ParoQ4G128: Givens rotation (model-layer ParoRotation metadata) +
         // HFQ4-G128 GEMV. Uses RotationFamily::run(Givens) which calls
@@ -734,8 +743,17 @@ pub fn weight_gemv(
             gpu.ensure_mq_signs()?;
             let xr = xr!();
             rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
-            gemv.run_auto(&ctx, gpu, &wr, &xr, y)
-                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+            // xr is ALREADY FWHT-rotated by rotate_x_mq_for above. Use the
+            // Prerotated GEMV directly — calling run_auto here would re-rotate
+            // (dtype_rotation_plan(MQ*) != None), double-applying the involutory
+            // FWHT and feeding effectively-unrotated activations to the
+            // prerotated kernel (garbage logits). Mirrors master's
+            // rotate_x_mq_for + gemv_*_prerotated.
+            gemv.run(&ctx, gpu, &GemvParams {
+                w: &wr, x: &xr, y,
+                variant: GemvVariant::Prerotated,
+                residual: None, gate: None, up: None,
+            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
     }
 }

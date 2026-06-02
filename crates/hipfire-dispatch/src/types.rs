@@ -255,6 +255,10 @@ pub enum ArchPredicate {
     HasSdot4,
     HasMmq,
     HasCdna3LdsGemv,
+    /// `gemv_dp4a_enabled()` — gfx906-only by default (env-overridable).
+    /// Gates the gfx906 wave64 sdot4 fused dp4a kernels (HFQ6/MQ6).
+    /// NOT `HasDp4a` (=has_dot2_f32_f16, true on all RDNA2+).
+    GemvDp4a,
 }
 
 #[derive(Clone, Debug)]

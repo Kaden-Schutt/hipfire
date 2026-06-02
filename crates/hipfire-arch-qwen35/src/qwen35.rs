@@ -19,9 +19,9 @@ use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::{HipError, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::families::gemv::{GemvFamily, WeightRef};
+use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
 use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
-use hipfire_dispatch::types::RotationVariant;
+use hipfire_dispatch::types::{GemvVariant, RotationVariant};
 use hipfire_dispatch::types::dtype_needs_rotation;
 use std::sync::OnceLock;
 
@@ -9024,7 +9024,7 @@ fn fused_qkvza_dispatch(
 
     let use_fused = same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
         || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
-        || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.has_dot2_f32_f16()));
+        || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()));
 
     if use_fused {
         let x = eff_rot.unwrap_or(tmp);
@@ -9064,10 +9064,18 @@ fn fused_qkvza_dispatch(
             } else {
                 tmp
             };
-            gemv.run_auto(ctx, gpu,
-                &WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None },
-                x, y,
-            ).map_err(|e| HipError::new(0, &e.to_string()))
+            let wr_i = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
+            if dtype_needs_rotation(w.gpu_dtype) {
+                // `x` is the already-FWHT-rotated eff_rot. Use Prerotated directly;
+                // run_auto would re-rotate (plan != None) → double FWHT → garbage.
+                gemv.run(ctx, gpu, &GemvParams {
+                    w: &wr_i, x, y,
+                    variant: GemvVariant::Prerotated,
+                    residual: None, gate: None, up: None,
+                })
+            } else {
+                gemv.run_auto(ctx, gpu, &wr_i, x, y)
+            }.map_err(|e| HipError::new(0, &e.to_string()))
         };
         run(wqkv, dn_qkv)?;
         run(wz, dn_z)?;
@@ -9103,7 +9111,7 @@ fn fused_qkv_dispatch(
 
     let use_fused = same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
         || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
-        || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.has_dot2_f32_f16()));
+        || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()));
 
     if use_fused {
         let x = eff_rot.unwrap_or(tmp);
@@ -9143,10 +9151,18 @@ fn fused_qkv_dispatch(
             } else {
                 tmp
             };
-            gemv.run_auto(ctx, gpu,
-                &WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None },
-                x, y,
-            ).map_err(|e| HipError::new(0, &e.to_string()))
+            let wr_i = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
+            if dtype_needs_rotation(w.gpu_dtype) {
+                // `x` is the already-FWHT-rotated eff_rot. Use Prerotated directly;
+                // run_auto would re-rotate (plan != None) → double FWHT → garbage.
+                gemv.run(ctx, gpu, &GemvParams {
+                    w: &wr_i, x, y,
+                    variant: GemvVariant::Prerotated,
+                    residual: None, gate: None, up: None,
+                })
+            } else {
+                gemv.run_auto(ctx, gpu, &wr_i, x, y)
+            }.map_err(|e| HipError::new(0, &e.to_string()))
         };
         run(wq, fa_q)?;
         run(wk, fa_k)?;
@@ -9178,7 +9194,7 @@ fn fused_gate_up_dispatch(
 
     let use_fused = same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
         || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
-        || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.has_dot2_f32_f16()));
+        || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()));
 
     if use_fused {
         let x = eff_rot.unwrap_or(tmp);
@@ -9218,10 +9234,18 @@ fn fused_gate_up_dispatch(
             } else {
                 tmp
             };
-            gemv.run_auto(ctx, gpu,
-                &WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None },
-                x, y,
-            ).map_err(|e| HipError::new(0, &e.to_string()))
+            let wr_i = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
+            if dtype_needs_rotation(w.gpu_dtype) {
+                // `x` is the already-FWHT-rotated eff_rot. Use Prerotated directly;
+                // run_auto would re-rotate (plan != None) → double FWHT → garbage.
+                gemv.run(ctx, gpu, &GemvParams {
+                    w: &wr_i, x, y,
+                    variant: GemvVariant::Prerotated,
+                    residual: None, gate: None, up: None,
+                })
+            } else {
+                gemv.run_auto(ctx, gpu, &wr_i, x, y)
+            }.map_err(|e| HipError::new(0, &e.to_string()))
         };
         run(w_gate, gate_out)?;
         run(w_up, up_out)

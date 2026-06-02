@@ -80,6 +80,7 @@ impl ArchPredicate {
             Self::HasSdot4 => ctx.arch.has_hfq3_sdot4(),
             Self::HasMmq => ctx.arch.has_mmq(),
             Self::HasCdna3LdsGemv => ctx.arch.has_cdna3_lds_gemv(),
+            Self::GemvDp4a => ctx.arch.gemv_dp4a_enabled(),
         }
     }
 }
