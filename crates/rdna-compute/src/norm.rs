@@ -68,12 +68,6 @@ impl Gpu {
 
     /// Batched RMSNorm: normalize `batch` vectors of length `n` independently.
     /// x and out can be the same buffer (in-place). Weight is [n], applied per vector.
-    /// TriAttention sidecar calibration: accumulate band statistics for one
-    /// chunk's Q tensor (batched across all tokens in the chunk).
-    ///
-    /// q_batch: [n_tokens, n_heads, head_dim] f32 pre-RoPE Q (already on GPU).
-    /// accs_sum_re/im/abs: [n_layers * n_heads * n_bands] f64 accumulators.
-
     pub fn rmsnorm_batched(
         &mut self,
         x: &GpuTensor, weight: &GpuTensor, out: &GpuTensor,
