@@ -5,11 +5,8 @@ edition.workspace = true
 license.workspace = true
 description = "LLaMA / Mistral / plain-Qwen3 architecture for hipfire"
 
-[features]
-new-dispatch = ["hipfire-dispatch/from-hip-error"]
-
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
-hipfire-dispatch = { path = "../hipfire-dispatch", optional = true }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }

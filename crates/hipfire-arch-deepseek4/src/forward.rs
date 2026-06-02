@@ -101,43 +101,10 @@ mod env_cache {
 /// rotations into `ffn_x_rot` / `silu_rot` / `q_lat_rot` / etc. are
 /// DEAD WORK (kernel runs, output never read). Use this to skip them.
 #[inline]
-#[cfg(not(feature = "new-dispatch"))]
-pub(crate) fn weight_needs_fwht(weight: &GpuTensor) -> bool {
-    !matches!(weight.dtype, DType::F32 | DType::F16 | DType::Q8_0)
-}
-
-#[cfg(feature = "new-dispatch")]
 pub(crate) fn weight_needs_fwht(weight: &GpuTensor) -> bool {
     hipfire_dispatch::types::dtype_needs_rotation(weight.dtype)
 }
 
-#[cfg(not(feature = "new-dispatch"))]
-fn gemv_auto(
-    gpu: &mut Gpu,
-    weight: &GpuTensor,
-    x_rotated: &GpuTensor,
-    x_plain: &GpuTensor,
-    y: &GpuTensor,
-    m: usize,
-    k: usize,
-) -> Result<(), String> {
-    match weight.dtype {
-        DType::F32 => gpu
-            .gemv_f32(weight, x_plain, y)
-            .map_err(|e| format!("gemv_f32: {e:?}")),
-        DType::F16 => gpu
-            .gemv_f16_xf32(weight, x_plain, y, m, k)
-            .map_err(|e| format!("gemv_f16_xf32: {e:?}")),
-        DType::Q8_0 => gpu
-            .gemv_q8_0(weight, x_plain, y, m, k)
-            .map_err(|e| format!("gemv_q8_0: {e:?}")),
-        _ => gpu
-            .gemv_mq4g256_prerotated(weight, x_rotated, y, m, k)
-            .map_err(|e| format!("gemv_mq4g256_prerotated: {e:?}")),
-    }
-}
-
-#[cfg(feature = "new-dispatch")]
 fn gemv_auto(
     gpu: &mut Gpu,
     weight: &GpuTensor,
@@ -153,7 +120,7 @@ fn gemv_auto(
     let gemv = hipfire_runtime::llama::gemv_family();
     let ctx = DispatchCtx::new(gpu);
     let x = if weight_needs_fwht(weight) { x_rotated } else { x_plain };
-    let wr = WeightRef { buf: weight, dtype: weight.dtype, m, k };
+    let wr = WeightRef { buf: weight, dtype: weight.dtype, m, k, row_stride: 0, rotation: None, awq_scale: None };
     gemv.run_auto(&ctx, gpu, &wr, x, y)
         .map_err(|e| format!("gemv dispatch: {e}"))
 }
@@ -180,32 +147,6 @@ fn gemv_auto(
 /// At batch_size == 1 each path reduces to the equivalent of one
 /// sequential gemv_auto call against the same weight; per-row outputs
 /// match within FMA-order ε.
-#[allow(dead_code, clippy::too_many_arguments)]
-#[cfg(not(feature = "new-dispatch"))]
-fn gemv_auto_batched(
-    gpu: &mut Gpu,
-    weight: &GpuTensor,
-    x_rotated_batch: &GpuTensor,
-    x_plain_batch: &GpuTensor,
-    y: &GpuTensor,
-    m: usize,
-    k: usize,
-    batch_size: usize,
-) -> Result<(), String> {
-    gemv_auto_batched_wmma(
-        gpu,
-        weight,
-        x_rotated_batch,
-        x_plain_batch,
-        y,
-        m,
-        k,
-        batch_size,
-        /*x_f16_scratch=*/ None,
-    )
-}
-
-#[cfg(feature = "new-dispatch")]
 fn gemv_auto_batched(
     gpu: &mut Gpu,
     weight: &GpuTensor,
@@ -224,7 +165,7 @@ fn gemv_auto_batched(
     let gemv = GEMV.get_or_init(|| GemvFamily::new());
     let ctx = DispatchCtx::new(gpu);
     let x = if weight_needs_fwht(weight) { x_rotated_batch } else { x_plain_batch };
-    let wr = WeightRef { buf: weight, dtype: weight.dtype, m, k };
+    let wr = WeightRef { buf: weight, dtype: weight.dtype, m, k, row_stride: 0, rotation: None, awq_scale: None };
     gemv.run_auto(&ctx, gpu, &wr, x, y)
         .map_err(|e| format!("gemv batched dispatch: {e}"))
 }
@@ -251,115 +192,6 @@ fn dump_buf(gpu: &mut Gpu, tag: &str, buf: &rdna_compute::GpuTensor) {
     }
 }
 
-#[cfg(not(feature = "new-dispatch"))]
-fn gemv_auto_batched_wmma(
-    gpu: &mut Gpu,
-    weight: &GpuTensor,
-    x_rotated_batch: &GpuTensor,
-    x_plain_batch: &GpuTensor,
-    y: &GpuTensor,
-    m: usize,
-    k: usize,
-    batch_size: usize,
-    x_f16_scratch: Option<&GpuTensor>,
-) -> Result<(), String> {
-    match weight.dtype {
-        DType::F32 => {
-            if std::env::var("HIPFIRE_DEEPSEEK4_F32_TRACE").is_ok() {
-                use std::sync::atomic::{AtomicUsize, Ordering};
-                static N: AtomicUsize = AtomicUsize::new(0);
-                let c = N.fetch_add(1, Ordering::Relaxed);
-                if c < 8 {
-                    eprintln!(
-                        "[F32_TRACE #{c}] m={m} k={k} B={batch_size} weight.shape={:?}",
-                        weight.shape
-                    );
-                }
-            }
-            gpu.gemm_f32_register_tiled(weight, x_plain_batch, y, m, k, batch_size)
-                .map_err(|e| format!("gemm_f32_register_tiled: {e:?}"))
-        }
-        DType::Q8_0 => {
-            // WMMA-Q8 route mirrors the HFQ4 WMMA path: stage F32 input
-            // → F16 once and dispatch `gemm_q8_0_wmma`. 11–30× microbench
-            // speedup over the scalar `gemm_q8_0_batched_chunked` per
-            // bench_q8_wmma_variants. Opt-out via HIPFIRE_DEEPSEEK4_Q8_WMMA=0
-            // for diagnosis or if a future kernel regression surfaces.
-            let wmma_on = std::env::var("HIPFIRE_DEEPSEEK4_Q8_WMMA")
-                .map(|s| s != "0")
-                .unwrap_or(true);
-            if wmma_on {
-                if let Some(scratch) = x_f16_scratch {
-                    let n = (batch_size * k) as i64;
-                    gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
-                        .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
-                    // Shape-gated 4-warp 64×64 WMMA (gemm_q8_0_wmma_4w).
-                    // Routes only the cells `bench_q8_wmma_4w` proved as
-                    // wins on gfx1151 (be57d8d):
-                    //   M=4096  K=4096 B=256   → 1.95×
-                    //   M=4096  K=4096 B=1024  → 2.09×
-                    //   M=32768 K=1536 B=1024  → 3.30× (wq_b shape)
-                    // Any B=64 cell loses (0.27×–0.83×), so the gate
-                    // requires B≥256. Cells with B∈(64,256) or M<4096
-                    // are unmeasured and stay on the single-warp path.
-                    // Kernel hard requires M%64==0, K%32==0, B%64==0.
-                    // Opt out via HIPFIRE_DEEPSEEK4_Q8_4W=0 for diagnosis.
-                    let opt_out = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W")
-                        .as_deref() == Ok("0");
-                    let use_4w = !opt_out
-                        && batch_size >= 256
-                        && m >= 4096
-                        && m % 64 == 0
-                        && k % 32 == 0
-                        && batch_size % 64 == 0;
-                    if use_4w {
-                        return gpu
-                            .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
-                            .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
-                    }
-                    return gpu
-                        .gemm_q8_0_wmma(weight, scratch, y, m, k, batch_size)
-                        .map_err(|e| format!("gemm_q8_0_wmma: {e:?}"));
-                }
-            }
-            gpu.gemm_q8_0_batched_chunked(weight, x_plain_batch, y, m, k, batch_size)
-                .map_err(|e| format!("gemm_q8_0_batched_chunked: {e:?}"))
-        }
-        DType::F16 => {
-            // F16 weight: need to stage F32 input to F16 too, then WMMA.
-            if let Some(scratch) = x_f16_scratch {
-                let n = (batch_size * k) as i64;
-                gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
-                    .map_err(|e| format!("convert_f32_to_f16 (F16 weight): {e:?}"))?;
-                gpu.gemm_f16_x_f16_wmma(weight, scratch, y, m, k, batch_size)
-                    .map_err(|e| format!("gemm_f16_x_f16_wmma: {e:?}"))
-            } else {
-                Err("F16 weight requires WMMA path with x_f16_scratch".to_string())
-            }
-        }
-        _ => {
-            // HFQ4G256/Raw. WMMA route requires F16 input staging.
-            // Note: HFQ4 expects FWHT-rotated input.
-            let wmma_on = std::env::var("HIPFIRE_DEEPSEEK4_HFQ4_WMMA")
-                .map(|s| s != "0")
-                .unwrap_or(true);
-            if wmma_on {
-                if let Some(scratch) = x_f16_scratch {
-                    let n = (batch_size * k) as i64;
-                    gpu.deepseek4_convert_f32_to_f16(x_rotated_batch, scratch, n)
-                        .map_err(|e| format!("convert_f32_to_f16 (HFQ4 WMMA): {e:?}"))?;
-                    return gpu
-                        .gemm_hfq4g256_wmma(weight, scratch, y, m, k, batch_size)
-                        .map_err(|e| format!("gemm_hfq4g256_wmma: {e:?}"));
-                }
-            }
-            gpu.gemm_hfq4g256(weight, x_rotated_batch, y, m, k, batch_size)
-                .map_err(|e| format!("gemm_hfq4g256: {e:?}"))
-        }
-    }
-}
-
-#[cfg(feature = "new-dispatch")]
 fn gemv_auto_batched_wmma(
     gpu: &mut Gpu,
     weight: &GpuTensor,

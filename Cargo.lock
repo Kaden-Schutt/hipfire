@@ -246,6 +246,7 @@ dependencies = [
 name = "hipfire-dispatch-tests"
 version = "0.2.0"
 dependencies = [
+ "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
 ]

@@ -20,15 +20,10 @@ use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use rdna_compute::Gpu;
 
-#[cfg(feature = "new-dispatch")]
 use rdna_compute::DType;
-#[cfg(feature = "new-dispatch")]
 use hipfire_dispatch::context::DispatchCtx;
-#[cfg(feature = "new-dispatch")]
-use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
-#[cfg(feature = "new-dispatch")]
+use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams};
 use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
-#[cfg(feature = "new-dispatch")]
 use hipfire_dispatch::types::{dtype_needs_rotation, GemvVariant, RotationVariant};
 
 /// Type marker for the LLaMA family — covers `arch_id = 0` (LLaMA /
@@ -136,7 +131,6 @@ impl Llama {
     /// All rotation and GEMV dispatch is handled by [`RotationFamily`] and
     /// [`GemvFamily`] through the centralized dispatch tables. KV cache,
     /// attention, and sampling remain unchanged from the legacy path.
-    #[cfg(feature = "new-dispatch")]
     pub fn forward_scratch_layers(
         gpu: &mut Gpu,
         weights: &LlamaWeights,
@@ -186,26 +180,14 @@ impl Llama {
                     givens_scales: None,
                     givens_krot: None,
                 })?;
-                gemv.run_auto(&ctx, gpu, &WeightRef {
-                    buf: &layer.wq.buf, dtype: layer.wq.gpu_dtype, m: layer.wq.m, k: layer.wq.k,
-                }, &scratch.x_rot, &scratch.q)?;
-                gemv.run_auto(&ctx, gpu, &WeightRef {
-                    buf: &layer.wk.buf, dtype: layer.wk.gpu_dtype, m: layer.wk.m, k: layer.wk.k,
-                }, &scratch.x_rot, &scratch.k)?;
-                gemv.run_auto(&ctx, gpu, &WeightRef {
-                    buf: &layer.wv.buf, dtype: layer.wv.gpu_dtype, m: layer.wv.m, k: layer.wv.k,
-                }, &scratch.x_rot, &scratch.v)?;
+                gemv.run_auto(&ctx, gpu, &layer.wq.dispatch_ref(), &scratch.x_rot, &scratch.q)?;
+                gemv.run_auto(&ctx, gpu, &layer.wk.dispatch_ref(), &scratch.x_rot, &scratch.k)?;
+                gemv.run_auto(&ctx, gpu, &layer.wv.dispatch_ref(), &scratch.x_rot, &scratch.v)?;
             } else {
                 gpu.rmsnorm_f32(&scratch.x, &layer.attn_norm, &scratch.tmp, config.norm_eps)?;
-                gemv.run_auto(&ctx, gpu, &WeightRef {
-                    buf: &layer.wq.buf, dtype: layer.wq.gpu_dtype, m: layer.wq.m, k: layer.wq.k,
-                }, &scratch.tmp, &scratch.q)?;
-                gemv.run_auto(&ctx, gpu, &WeightRef {
-                    buf: &layer.wk.buf, dtype: layer.wk.gpu_dtype, m: layer.wk.m, k: layer.wk.k,
-                }, &scratch.tmp, &scratch.k)?;
-                gemv.run_auto(&ctx, gpu, &WeightRef {
-                    buf: &layer.wv.buf, dtype: layer.wv.gpu_dtype, m: layer.wv.m, k: layer.wv.k,
-                }, &scratch.tmp, &scratch.v)?;
+                gemv.run_auto(&ctx, gpu, &layer.wq.dispatch_ref(), &scratch.tmp, &scratch.q)?;
+                gemv.run_auto(&ctx, gpu, &layer.wk.dispatch_ref(), &scratch.tmp, &scratch.k)?;
+                gemv.run_auto(&ctx, gpu, &layer.wv.dispatch_ref(), &scratch.tmp, &scratch.v)?;
             }
 
             // ── QK norm (optional per config) ───────────────────
@@ -325,9 +307,7 @@ impl Llama {
             }
 
             // ── Attention output projection + residual ─────────
-            gemv.run_auto(&ctx, gpu, &WeightRef {
-                buf: &layer.wo.buf, dtype: layer.wo.gpu_dtype, m: layer.wo.m, k: layer.wo.k,
-            }, &scratch.attn_out, &scratch.o)?;
+            gemv.run_auto(&ctx, gpu, &layer.wo.dispatch_ref(), &scratch.attn_out, &scratch.o)?;
             gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
 
             // ── FFN path ────────────────────────────────────────
@@ -354,26 +334,18 @@ impl Llama {
                     givens_scales: None,
                     givens_krot: None,
                 })?;
-                gemv.run_auto(&ctx, gpu, &WeightRef {
-                    buf: &layer.w_gate.buf, dtype: layer.w_gate.gpu_dtype, m: layer.w_gate.m, k: layer.w_gate.k,
-                }, &scratch.x_rot, &scratch.gate)?;
-                gemv.run_auto(&ctx, gpu, &WeightRef {
-                    buf: &layer.w_up.buf, dtype: layer.w_up.gpu_dtype, m: layer.w_up.m, k: layer.w_up.k,
-                }, &scratch.x_rot, &scratch.up)?;
+                gemv.run_auto(&ctx, gpu, &layer.w_gate.dispatch_ref(), &scratch.x_rot, &scratch.gate)?;
+                gemv.run_auto(&ctx, gpu, &layer.w_up.dispatch_ref(), &scratch.x_rot, &scratch.up)?;
             } else {
                 gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
-                gemv.run_auto(&ctx, gpu, &WeightRef {
-                    buf: &layer.w_gate.buf, dtype: layer.w_gate.gpu_dtype, m: layer.w_gate.m, k: layer.w_gate.k,
-                }, &scratch.tmp, &scratch.gate)?;
-                gemv.run_auto(&ctx, gpu, &WeightRef {
-                    buf: &layer.w_up.buf, dtype: layer.w_up.gpu_dtype, m: layer.w_up.m, k: layer.w_up.k,
-                }, &scratch.tmp, &scratch.up)?;
+                gemv.run_auto(&ctx, gpu, &layer.w_gate.dispatch_ref(), &scratch.tmp, &scratch.gate)?;
+                gemv.run_auto(&ctx, gpu, &layer.w_up.dispatch_ref(), &scratch.tmp, &scratch.up)?;
             }
 
             // ── SwiGLU + down projection + residual ─────────────
             gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
             gemv.run(&ctx, gpu, &GemvParams {
-                w: &WeightRef { buf: &layer.w_down.buf, dtype: layer.w_down.gpu_dtype, m: layer.w_down.m, k: layer.w_down.k },
+                w: &layer.w_down.dispatch_ref(),
                 x: &scratch.ffn_hidden,
                 y: &scratch.ffn_out,
                 variant: GemvVariant::WithResidual,
@@ -385,9 +357,7 @@ impl Llama {
 
         // ── Final norm + logits + sampling ──────────────────────
         gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
-        gemv.run_auto(&ctx, gpu, &WeightRef {
-            buf: &weights.output.buf, dtype: weights.output.gpu_dtype, m: weights.output.m, k: weights.output.k,
-        }, &scratch.tmp, &scratch.logits)?;
+        gemv.run_auto(&ctx, gpu, &weights.output.dispatch_ref(), &scratch.tmp, &scratch.logits)?;
 
         gpu.sample_top_p(
             &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
@@ -396,24 +366,4 @@ impl Llama {
         )
     }
 
-    /// Forward pass — legacy path (always available).
-    #[cfg(not(feature = "new-dispatch"))]
-    pub fn forward_scratch_layers(
-        gpu: &mut Gpu,
-        weights: &LlamaWeights,
-        config: &LlamaConfig,
-        pos: usize,
-        kv_cache: &mut KvCache,
-        scratch: &ForwardScratch,
-        temperature: f32,
-        top_p: f32,
-        rng_state: u32,
-        repeat_window: usize,
-        repeat_penalty: f32,
-    ) -> HipResult<(u32, u32)> {
-        crate::llama::forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, scratch,
-            temperature, top_p, rng_state, repeat_window, repeat_penalty,
-        )
-    }
 }
