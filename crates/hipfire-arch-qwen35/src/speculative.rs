@@ -764,6 +764,23 @@ impl DeltaNetSnapshot {
         }
         Ok(())
     }
+
+    /// Free the backup GPU buffers, consuming the snapshot. `DeviceBuffer` has
+    /// no `Drop`, so a bare `Vec::clear()`/`truncate()` on a checkpoint ring
+    /// orphans this device memory — the source of the per-reset GPU-memory leak
+    /// that OOMs long-lived serves (a fresh `hipMalloc` per reset, never freed).
+    /// Every site that drops a snapshot must route through here.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for b in self.s_matrix_bufs {
+            let _ = gpu.hip.free(b);
+        }
+        for b in self.s_scale_bufs {
+            let _ = gpu.hip.free(b);
+        }
+        for b in self.conv_state_bufs {
+            let _ = gpu.hip.free(b);
+        }
+    }
 }
 
 /// A series of `n_slots` `DeltaNetSnapshot` slots, used by the tape-replay
@@ -5527,7 +5544,10 @@ pub fn seed_target_hidden_from_prompt_abortable(
     target.reset_state(gpu);
     target_hidden_host.clear();
     if let Some(cks) = checkpoints.as_deref_mut() {
-        cks.clear(); // fresh cold prefill ⇒ stale checkpoints no longer valid
+        // fresh cold prefill ⇒ stale checkpoints no longer valid; free their GPU buffers
+        for (_, snap) in cks.drain(..) {
+            snap.free_gpu(gpu);
+        }
     }
     let chunk_max = qwen35::PREFILL_MAX_BATCH;
     let mut seq_pos: usize = 0;
@@ -5536,7 +5556,9 @@ pub fn seed_target_hidden_from_prompt_abortable(
             target.reset_state(gpu);
             target_hidden_host.clear();
             if let Some(cks) = checkpoints.as_deref_mut() {
-                cks.clear();
+                for (_, snap) in cks.drain(..) {
+                    snap.free_gpu(gpu);
+                }
             }
             return Ok(true);
         }
