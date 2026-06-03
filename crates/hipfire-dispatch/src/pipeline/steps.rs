@@ -22,6 +22,7 @@ pub struct Step<'a> {
 /// A fusion table entry: an op-pattern that collapses to one kernel.
 /// Phase 1 ships an empty table; Phase 2b populates it (with a full operand
 /// guard layered on top of this op-pattern match).
+/// Entries must have a non-empty `ops` (a zero-length pattern never matches).
 pub struct FusedPattern {
     pub ops: &'static [PipelineOp],
     pub key: KernelKey,
@@ -31,13 +32,13 @@ pub struct FusedPattern {
 /// longest entry whose op-sequence is a prefix of `steps`. **Op-pattern only** —
 /// the full operand guard (shared input, dtype/awq/row_stride homogeneity) is a
 /// Phase-2b concern; in Phase 1 the table is empty so this never fires.
-// Used by tests in Phase 1; Task 2 (execute_steps) will call this from lib code.
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 pub fn match_prefix(table: &[FusedPattern], steps: &[Step]) -> Option<(KernelKey, usize)> {
     table
         .iter()
         .filter(|p| {
-            p.ops.len() <= steps.len()
+            !p.ops.is_empty()
+                && p.ops.len() <= steps.len()
                 && p.ops.iter().zip(steps).all(|(o, s)| *o == s.op)
         })
         .max_by_key(|p| p.ops.len())

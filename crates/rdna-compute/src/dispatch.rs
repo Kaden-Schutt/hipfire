@@ -97,8 +97,19 @@ impl GpuTensor {
         self.numel() * self.dtype.size()
     }
 
-    /// A GpuTensor with a null buffer, for CPU-only unit tests that never touch
-    /// the device (e.g. op-pattern matching that reads only metadata).
+    /// A `GpuTensor` whose buffer is a null pointer of size 0, for CPU-only unit
+    /// tests in **dependent crates** that read only tensor metadata (shape/dtype/op)
+    /// and never touch the device.
+    ///
+    /// CONTRACT: the returned tensor must NEVER be passed to a HIP call — its buffer
+    /// is null and dereferencing it on the GPU is undefined behavior. It exists only
+    /// so cross-crate tests can borrow a `&GpuTensor` for metadata-only logic.
+    ///
+    /// Not `#[cfg(test)]`-gated on purpose: `#[cfg(test)]` here would only be active
+    /// when `rdna-compute`'s own tests build, making this invisible to dependent
+    /// crates' tests (e.g. `hipfire-dispatch`). `#[doc(hidden)]` keeps it out of the
+    /// public API surface while remaining reachable cross-crate, matching the
+    /// `FeatureFlags::from_env_for_test` precedent.
     #[doc(hidden)]
     pub fn null_for_test() -> Self {
         GpuTensor {

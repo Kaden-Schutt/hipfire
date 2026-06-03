@@ -616,8 +616,7 @@ fn moe_res_paro_needs_sidecar() {
 
 // ── op-list interpreter: match_prefix (pure logic) ──────────────────────────
 
-use crate::pipeline::{FusedPattern, Step};
-use crate::pipeline::steps::match_prefix;
+use crate::pipeline::{steps::match_prefix, FusedPattern, Step};
 
 /// Build a Step for op-pattern tests. `match_prefix` reads only `.op`.
 fn gemv_step<'a>(input: &'a rdna_compute::GpuTensor) -> Step<'a> {
@@ -650,4 +649,15 @@ fn match_prefix_no_pattern_longer_than_steps() {
         ops: &[PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF32,
     }];
     assert_eq!(match_prefix(&table, &steps), None);
+}
+
+#[test]
+fn match_prefix_single_op_consumes_one() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let steps = [gemv_step(&dummy), gemv_step(&dummy), gemv_step(&dummy)];
+    let table = [FusedPattern {
+        ops: &[PipelineOp::Gemv], key: KernelKey::GemvF32,
+    }];
+    // a len-1 pattern matches the first step, consuming exactly 1
+    assert_eq!(match_prefix(&table, &steps), Some((KernelKey::GemvF32, 1)));
 }
