@@ -2098,7 +2098,14 @@ pub fn gemv_hfq4g256_for_arch(
                 "cache-aggressive",
             ];
             let name = names.get(variant as usize).unwrap_or(&"baseline-rdna2");
-            eprintln!("  RDNA2 GEMV variant: v{variant} ({name})");
+            // #223: this diagnostic used to print unconditionally on every RDNA2
+            // HFQ4 GEMV kernel selection, leaking `RDNA2 GEMV variant: v1 ...`
+            // into the user's terminal (stderr interleaves with the token
+            // stream). It is only useful when explicitly tuning the variant, so
+            // gate it on the selector env var being set.
+            if std::env::var("HIPFIRE_RDNA2_VARIANT").is_ok() {
+                eprintln!("  RDNA2 GEMV variant: v{variant} ({name})");
+            }
             match variant {
                 2 => (GEMV_HFQ4G256_GFX1030_V2_SRC, "gemv_hfq4g256_rdna2v2"),
                 3 => (GEMV_HFQ4G256_GFX1030_V3_SRC, "gemv_hfq4g256_rdna2v3"),
