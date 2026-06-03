@@ -38,13 +38,12 @@ pub fn execute_pipeline(
     dtype: rdna_compute::DType,
     registry: &KernelRegistry,
 ) -> Result<(), DispatchError> {
-    let params = match params {
-        PipelineParams::Linear(p) => p,
-    };
     if let Some(key) = find_fused(registry, ctx, dtype, steps) {
         return dispatch_fused(gpu, key, params);
     }
-
+    let params = match params {
+        PipelineParams::Linear(p) => p,
+    };
     for &step in steps {
         match step {
             PipelineOp::RotateFwht => {
