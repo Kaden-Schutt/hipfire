@@ -4574,6 +4574,28 @@ fn moe_ffn_decode_impl(
     let smi = config.shared_expert_intermediate_size;
     let k = config.num_experts_per_tok;
     let n_exp = config.num_experts;
+    let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
+        router: ffn.router.gpu_dtype,
+        shared_gate: ffn.shared_expert_gate.gpu_dtype,
+        shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
+        shared_expert_up: ffn.shared_expert.up.gpu_dtype,
+        experts_all_gate_up_mq4: ffn
+            .experts
+            .iter()
+            .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256),
+        routed_gate_up: ffn
+            .experts
+            .first()
+            .map(|e| e.gate_up.gpu_dtype)
+            .unwrap_or(DType::F32),
+        routed_down: ffn
+            .experts
+            .first()
+            .map(|e| e.down.gpu_dtype)
+            .unwrap_or(DType::F32),
+        has_paro_shared: ffn.paro_shared.is_some(),
+    };
+    let moe_res = hipfire_dispatch::families::moe::MoeResolution::resolve(&moe_dtypes, k);
     let _ = hidden;
 
     let router_logits = s.router_logits;
@@ -4584,93 +4606,33 @@ fn moe_ffn_decode_impl(
     let ffn_hidden = s.ffn_hidden;
     let ffn_out = s.ffn_out;
 
-    // Phase 2a-iii: rotate x_norm once per layer and share the rotated
-    // buffer across every MQ4 GEMV that consumes it. Two independent users:
-    //   1. The 4-way fused gate-side GEMV (gate_side_mq4) — requires router,
-    //      shared_expert_gate, shared_expert.{gate,up} all MQ4G256.
-    //   2. The indexed routed-expert gate_up GEMV (routed_gate_up_mq4) — fires
-    //      whenever the routed gate_up family is MQ4G256, independent of the
-    //      gate-side family's dtype.
-    // We compute x_rot_local if EITHER user will fire. Models with a Q8
-    // router (e.g. the post-PR-171 attractor rule for MoE) thus still get
-    // the device-side top-K + indexed expert GEMV path — only the 4-way
-    // fused GEMV falls back to four individual `weight_gemv` calls.
-    let gate_side_mq4 = ffn.router.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
-        && ffn
-            .experts
-            .iter()
-            .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
-    let routed_mq4 = ffn
-        .experts
-        .first()
-        .map(|e| e.down.gpu_dtype == DType::MQ4G256)
-        .unwrap_or(false);
+    let gate_side_mq4 = moe_res.gate_side_mq4;
     let routed_gate_up_mq4 = ffn
         .experts
         .first()
         .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
         .unwrap_or(false);
-    // MQ6-routed eligibility: layers promoted by the alternating kmap
-    // (post-PR-199) carry MQ6G256 experts. The HFQ6 indexed kernels mirror
-    // the HFQ4 ones — same compute shape, different per-group byte layout
-    // (200 vs 136). All routed experts within a layer share the same
-    // promotion decision, so checking experts[0] is sufficient.
-    let routed_mq6 = ffn
+    let routed_mq4 = ffn
         .experts
         .first()
-        .map(|e| e.down.gpu_dtype == DType::MQ6G256)
+        .map(|e| e.down.gpu_dtype == DType::MQ4G256)
         .unwrap_or(false);
     let routed_gate_up_mq6 = ffn
         .experts
         .first()
         .map(|e| e.gate_up.gpu_dtype == DType::MQ6G256)
         .unwrap_or(false);
-    // ParoQuant routed-expert eligibility. shisa-Qwen3.6-A3B-PARO and
-    // friends carry ParoQ4G128 routed experts whose pairs/theta/channel_scales
-    // are shared across all 256 experts via `ffn.paro_shared`. The indexed
-    // HFQ4G128 kernels assume both halves (gate_up and down) live in this
-    // layout — checking experts[0] is sufficient because the loader
-    // (`paro_load_moe_ffn`) builds every expert's `paro` alias from the
-    // same `MoeParoSidecars`.
-    let routed_paro = ffn
-        .experts
-        .first()
-        .map(|e| e.down.gpu_dtype == DType::ParoQ4G128)
-        .unwrap_or(false)
-        && ffn.paro_shared.is_some();
     let routed_gate_up_paro = ffn
         .experts
         .first()
         .map(|e| e.gate_up.gpu_dtype == DType::ParoQ4G128)
         .unwrap_or(false)
         && ffn.paro_shared.is_some();
-    // The indexed gate_up and down kernels live in separate dtype families;
-    // we require the routed gate_up and down dtypes to match (i.e., both
-    // MQ4, both MQ6, or both ParoQ4G128) so the rotated x_rot_local feeds
-    // both consistently. Mixed gate_up/down within a layer is not produced
-    // by the quantizer.
-    let routed_dtype_indexable_mq4 = routed_mq4 && routed_gate_up_mq4;
-    let routed_dtype_indexable_mq6 = routed_mq6 && routed_gate_up_mq6;
-    let routed_dtype_indexable_paro = routed_paro && routed_gate_up_paro;
-    let routed_dtype_indexable =
-        routed_dtype_indexable_mq4 || routed_dtype_indexable_mq6 || routed_dtype_indexable_paro;
-    // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
-    // device and the indexed MoE kernels consume topk_indices /
-    // topk_weights directly — no D2H sync, hipGraph-capture-safe.
-    // Note: this no longer requires `gate_side_mq4`. The device-side
-    // `moe_topk_renorm_k8` kernel and the indexed gate_up/down GEMVs
-    // consume router_logits/topk_indices/topk_weights/x_rot from device
-    // buffers regardless of how router_logits was produced (fused-4 or
-    // individual weight_gemv). Q8 routers (issue-#171 attractor rule)
-    // are now first-class for graph capture. Mixed-kmap A3B layers
-    // promoted to MQ6 dispatch through the HFQ6 indexed kernels instead
-    // of the HFQ4 ones — same control flow, different kernel binary.
-    let use_gpu_topk = k == 8 && routed_dtype_indexable;
-    let needs_x_rot_local =
-        gate_side_mq4 || routed_gate_up_mq4 || routed_gate_up_mq6 || routed_gate_up_paro;
+    let routed_dtype_indexable_mq4 = moe_res.routed_indexable_mq4;
+    let routed_dtype_indexable_mq6 = moe_res.routed_indexable_mq6;
+    let routed_dtype_indexable_paro = moe_res.routed_indexable_paro;
+    let use_gpu_topk = moe_res.use_gpu_topk;
+    let needs_x_rot_local = moe_res.needs_x_rot_local;
     let x_rot_local = if needs_x_rot_local {
         if !routed_gate_up_paro {
             // FWHT-rotated path needs the MQ sign LUT.
