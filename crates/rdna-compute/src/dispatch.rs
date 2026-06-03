@@ -97,6 +97,17 @@ impl GpuTensor {
         self.numel() * self.dtype.size()
     }
 
+    /// A GpuTensor with a null buffer, for CPU-only unit tests that never touch
+    /// the device (e.g. op-pattern matching that reads only metadata).
+    #[doc(hidden)]
+    pub fn null_for_test() -> Self {
+        GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut::<std::ffi::c_void>(), 0) },
+            shape: vec![0],
+            dtype: crate::DType::F32,
+        }
+    }
+
     /// Create a non-owning sub-view at a byte offset. For F32 tensors,
     /// `offset_elems` is the number of f32 elements to skip.
     /// The returned tensor is a view — do NOT free it.

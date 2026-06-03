@@ -613,3 +613,41 @@ fn moe_res_paro_needs_sidecar() {
     assert!(r.routed_indexable_paro);
     assert!(r.use_gpu_topk);
 }
+
+// ── op-list interpreter: match_prefix (pure logic) ──────────────────────────
+
+use crate::pipeline::{FusedPattern, Step};
+use crate::pipeline::steps::match_prefix;
+
+/// Build a Step for op-pattern tests. `match_prefix` reads only `.op`.
+fn gemv_step<'a>(input: &'a rdna_compute::GpuTensor) -> Step<'a> {
+    Step { op: PipelineOp::Gemv, weights: &[], input, outputs: &[] }
+}
+
+#[test]
+fn match_prefix_empty_table_never_fires() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let steps = [gemv_step(&dummy), gemv_step(&dummy), gemv_step(&dummy)];
+    assert_eq!(match_prefix(&[], &steps), None);
+}
+
+#[test]
+fn match_prefix_picks_longest() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let steps = [gemv_step(&dummy), gemv_step(&dummy), gemv_step(&dummy)];
+    let table = [
+        FusedPattern { ops: &[PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF32 },
+        FusedPattern { ops: &[PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF16 },
+    ];
+    assert_eq!(match_prefix(&table, &steps), Some((KernelKey::GemvF16, 3)));
+}
+
+#[test]
+fn match_prefix_no_pattern_longer_than_steps() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let steps = [gemv_step(&dummy)];
+    let table = [FusedPattern {
+        ops: &[PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF32,
+    }];
+    assert_eq!(match_prefix(&table, &steps), None);
+}

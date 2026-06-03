@@ -8,6 +8,9 @@ use std::sync::OnceLock;
 #[allow(unused_imports)]
 use hip_bridge;
 
+pub(crate) mod steps;
+pub use steps::{FusedPattern, Step};
+
 pub struct Pipeline {
     pub ops: &'static [PipelineOp],
 }
