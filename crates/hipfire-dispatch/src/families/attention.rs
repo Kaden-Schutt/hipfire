@@ -27,6 +27,8 @@ pub struct AttnParams<'a> {
     pub givens_sin: Option<&'a GpuTensor>,
     pub flash_mode: Option<usize>,
     pub capture_mode: bool,
+    /// V-quant mode kernarg for fwht KV write/flash (8=Q8, 2/3/4=Lloyd-V).
+    pub v_mode_bits: i32,
     pub output: &'a GpuTensor,
 }
 
@@ -102,7 +104,7 @@ fn dispatch_attention(gpu: &mut Gpu, params: &AttnParams) -> Result<(), Dispatch
             let st = params.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_fwht4_fused(
                 params.k_cache, params.v_cache, params.k, params.v, params.pos_buf,
-                ct, st, params.n_kv_heads, params.head_dim,
+                ct, st, params.n_kv_heads, params.head_dim, params.v_mode_bits,
             ))
         }
         KernelKey::KvWriteAsym3 => {
@@ -118,7 +120,7 @@ fn dispatch_attention(gpu: &mut Gpu, params: &AttnParams) -> Result<(), Dispatch
             let st = params.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_fwht3_fused(
                 params.k_cache, params.v_cache, params.k, params.v, params.pos_buf,
-                ct, st, params.n_kv_heads, params.head_dim,
+                ct, st, params.n_kv_heads, params.head_dim, params.v_mode_bits,
             ))
         }
         KernelKey::KvWriteAsym2 => {
@@ -134,7 +136,7 @@ fn dispatch_attention(gpu: &mut Gpu, params: &AttnParams) -> Result<(), Dispatch
             let st = params.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_fwht2_fused(
                 params.k_cache, params.v_cache, params.k, params.v, params.pos_buf,
-                ct, st, params.n_kv_heads, params.head_dim,
+                ct, st, params.n_kv_heads, params.head_dim, params.v_mode_bits,
             ))
         }
         KernelKey::AttnF32 => {
@@ -166,6 +168,7 @@ fn dispatch_attention(gpu: &mut Gpu, params: &AttnParams) -> Result<(), Dispatch
             hip!(gpu.attention_flash_fwht4(
                 params.q, params.k_cache, params.v_cache, params.output, params.pos_buf,
                 ct, st, seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap, fp,
+                params.v_mode_bits,
             ))
         }
         KernelKey::AttnFlashAsym3 => {
@@ -184,6 +187,7 @@ fn dispatch_attention(gpu: &mut Gpu, params: &AttnParams) -> Result<(), Dispatch
             hip!(gpu.attention_flash_fwht3(
                 params.q, params.k_cache, params.v_cache, params.output, params.pos_buf,
                 ct, st, seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap, fp,
+                params.v_mode_bits,
             ))
         }
         KernelKey::AttnFlashAsym2 => {
@@ -202,6 +206,7 @@ fn dispatch_attention(gpu: &mut Gpu, params: &AttnParams) -> Result<(), Dispatch
             hip!(gpu.attention_flash_fwht2(
                 params.q, params.k_cache, params.v_cache, params.output, params.pos_buf,
                 ct, st, seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap, fp,
+                params.v_mode_bits,
             ))
         }
         KernelKey::AttnGqaFused => {

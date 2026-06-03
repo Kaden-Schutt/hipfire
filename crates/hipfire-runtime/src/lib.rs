@@ -19,6 +19,7 @@ pub mod config;
 pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
+pub mod kv_adaptive;
 pub mod llama;
 pub mod model_source;
 pub mod safetensors_source;

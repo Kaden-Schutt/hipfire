@@ -26,26 +26,30 @@
 // `cargo build --no-default-features` working and matches the gating that
 // was on `engine::qwen35` pre-Phase-2.
 #[cfg(feature = "deltanet")]
-pub mod qwen35;
-#[cfg(feature = "deltanet")]
-pub mod speculative;
-#[cfg(feature = "deltanet")]
-pub mod pflash;
-#[cfg(feature = "deltanet")]
-pub mod mtp_probe;
-#[cfg(feature = "deltanet")]
-pub mod mtp_head;
-#[cfg(feature = "deltanet")]
-pub mod mtp_spec;
+pub mod arch;
 #[cfg(feature = "deltanet")]
 pub mod mtp_compose;
 #[cfg(feature = "deltanet")]
-pub mod arch;
+pub mod mtp_head;
+#[cfg(feature = "deltanet")]
+pub mod mtp_probe;
+#[cfg(feature = "deltanet")]
+pub mod mtp_spec;
+#[cfg(feature = "deltanet")]
+pub mod pflash;
+#[cfg(feature = "deltanet")]
+pub mod qwen35;
+#[cfg(feature = "deltanet")]
+pub mod speculative;
+
+/// Grammar-guided decoding for qwen35 tool-call format. Independent of
+/// the deltanet feature gate — pure data-structure work, no GPU
+/// dependencies. See module docs for design and the Pi turn-12
+/// failure mode this prevents.
+pub mod grammar;
 
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
 
 #[cfg(feature = "deltanet")]
-pub use mtp_compose::{
-    spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState,
-};
+pub use mtp_compose::{spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState};

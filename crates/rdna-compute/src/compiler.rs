@@ -6,8 +6,8 @@
 //! Supports pre-compiled .hsaco blobs for deployment without ROCm SDK.
 
 use hip_bridge::HipResult;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,8 +37,13 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
         let entry = entry?;
         let src = entry.path();
         let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if ext != "hsaco" && ext != "hash" { continue; }
-        let name = match src.file_name() { Some(n) => n, None => continue };
+        if ext != "hsaco" && ext != "hash" {
+            continue;
+        }
+        let name = match src.file_name() {
+            Some(n) => n,
+            None => continue,
+        };
         let dst = hot.join(name);
 
         // Don't clobber a JIT-validated hot pair. A .hash is only written by
@@ -71,6 +76,11 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Cache-key version. Bump when the kernel ABI or hipcc invocation changes in a
+/// way that makes previously-cached `.hsaco` blobs incompatible, to force a clean
+/// recompile instead of loading a stale "invalid device image".
+const KERNEL_CACHE_ABI: u32 = 1;
+
 /// Compiles HIP kernel sources to code objects, with caching.
 /// Tries pre-compiled blobs first (kernels/compiled/{arch}/), falls back to hipcc.
 pub struct KernelCompiler {
@@ -80,6 +90,10 @@ pub struct KernelCompiler {
     precompiled_dir: Option<PathBuf>,
     has_hipcc: bool,
     pub extra_flags: String,
+    /// Toolchain fingerprint (hipcc --version first line). Folded into the cache
+    /// hash so blobs built by a different compiler/ROCm don't get reused across
+    /// builds sharing one `.hipfire_kernels` dir (the "invalid device image" trap).
+    toolchain_id: String,
 }
 
 impl KernelCompiler {
@@ -107,17 +121,27 @@ impl KernelCompiler {
         })?;
 
         // Probe for pre-compiled kernels: exe-relative → CWD-relative → ~/.hipfire/bin/
-        let precompiled_dir = std::env::current_exe().ok()
+        let precompiled_dir = std::env::current_exe()
+            .ok()
             .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
             .map(|dir| dir.join("kernels").join("compiled").join(arch))
             .filter(|p| p.is_dir())
             .or_else(|| {
                 let cwd_path = PathBuf::from("kernels/compiled").join(arch);
-                if cwd_path.is_dir() { Some(cwd_path) } else { None }
+                if cwd_path.is_dir() {
+                    Some(cwd_path)
+                } else {
+                    None
+                }
             })
             .or_else(|| {
-                std::env::var("HOME").ok()
-                    .map(|h| PathBuf::from(h).join(".hipfire/bin/kernels/compiled").join(arch))
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| {
+                        PathBuf::from(h)
+                            .join(".hipfire/bin/kernels/compiled")
+                            .join(arch)
+                    })
                     .filter(|p| p.is_dir())
             });
 
@@ -138,7 +162,14 @@ impl KernelCompiler {
         // Prefer the hot-path (tmpfs) dir when it exists and has contents.
         // This is what the `compile()` lookup uses from here on.
         let effective_precompiled = if hot_dir.is_dir()
-            && std::fs::read_dir(&hot_dir).map(|mut it| it.any(|e| e.map(|e| e.path().extension().map(|x| x == "hsaco").unwrap_or(false)).unwrap_or(false))).unwrap_or(false)
+            && std::fs::read_dir(&hot_dir)
+                .map(|mut it| {
+                    it.any(|e| {
+                        e.map(|e| e.path().extension().map(|x| x == "hsaco").unwrap_or(false))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
         {
             Some(hot_dir.clone())
         } else {
@@ -150,13 +181,23 @@ impl KernelCompiler {
         }
         let precompiled_dir = effective_precompiled;
 
-        // Probe for hipcc once at init, not per-kernel
-        let has_hipcc = Command::new("hipcc").arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
+        // Probe for hipcc once at init, not per-kernel. Capture its version line
+        // as a toolchain fingerprint for the cache hash (Fix #1).
+        let hipcc_out = Command::new("hipcc").arg("--version").output().ok();
+        let has_hipcc = hipcc_out
+            .as_ref()
+            .map(|o| o.status.success())
             .unwrap_or(false);
+        let toolchain_id = hipcc_out
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default();
 
         Ok(Self {
             cache_dir,
@@ -165,12 +206,23 @@ impl KernelCompiler {
             precompiled_dir,
             has_hipcc,
             extra_flags,
+            toolchain_id,
         })
     }
 
     /// Returns a reference to all compiled kernel paths (name → .hsaco path).
     pub fn compiled_kernels(&self) -> &HashMap<String, PathBuf> {
         &self.compiled
+    }
+
+    fn cache_hash(&self, source: &str) -> String {
+        let mut hasher = DefaultHasher::new();
+        source.hash(&mut hasher);
+        self.arch.hash(&mut hasher);
+        self.extra_flags.hash(&mut hasher);
+        self.toolchain_id.hash(&mut hasher);
+        KERNEL_CACHE_ABI.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
     }
 
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
@@ -180,11 +232,11 @@ impl KernelCompiler {
             return Ok(&self.compiled[name]);
         }
 
-        // Hash source + arch for cache validation (used by both pre-compiled and runtime paths)
-        let mut hasher = DefaultHasher::new();
-        source.hash(&mut hasher);
-        self.arch.hash(&mut hasher);
-        let src_hash = format!("{:016x}", hasher.finish());
+        // Hash source + arch + flags + toolchain + ABI for cache validation (used by
+        // both pre-compiled and runtime paths). Flags and toolchain matter: identical
+        // source compiled with different hipcc flags / ROCm versions yields a different
+        // .hsaco, and reusing the wrong one surfaces as "device kernel image is invalid".
+        let src_hash = self.cache_hash(source);
 
         // Try pre-compiled .hsaco first, validating with a .hash sidecar file.
         // If hash is missing/mismatched AND hipcc is available, prefer recompilation.
@@ -218,11 +270,19 @@ impl KernelCompiler {
         let obj_path = self.cache_dir.join(format!("{name}.hsaco"));
         let hash_path = self.cache_dir.join(format!("{name}.hash"));
 
-        let cache_valid = obj_path.exists() && hash_path.exists()
+        let cache_valid = obj_path.exists()
+            && hash_path.exists()
             && std::fs::read_to_string(&hash_path).unwrap_or_default() == src_hash;
 
         if !cache_valid {
-            Self::hipcc_compile(&self.arch, &src_path, &obj_path, name, source, &self.extra_flags)?;
+            Self::hipcc_compile(
+                &self.arch,
+                &src_path,
+                &obj_path,
+                name,
+                source,
+                &self.extra_flags,
+            )?;
             let _ = std::fs::write(&hash_path, &src_hash);
         }
 
@@ -242,6 +302,29 @@ impl KernelCompiler {
 
         self.compiled.insert(name.to_string(), obj_path);
         Ok(&self.compiled[name])
+    }
+
+    /// Force a fresh hipcc recompile, evicting any cached / pre-compiled / seeded
+    /// blob for `name` first. Self-heals a `.hsaco` the driver rejects as an invalid
+    /// device image (a stale cross-build or cross-toolchain blob sitting in a shared
+    /// `.hipfire_kernels` cache). Returns the path to the freshly built object.
+    pub(crate) fn recompile(&mut self, name: &str, source: &str) -> HipResult<PathBuf> {
+        self.compiled.remove(name);
+        let _ = std::fs::remove_file(self.cache_dir.join(format!("{name}.hsaco")));
+        let _ = std::fs::remove_file(self.cache_dir.join(format!("{name}.hash")));
+        if let Some(ref dir) = self.precompiled_dir {
+            let _ = std::fs::remove_file(dir.join(format!("{name}.hsaco")));
+            let _ = std::fs::remove_file(dir.join(format!("{name}.hash")));
+        }
+        if !self.has_hipcc {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{name}: cached kernel image invalid and hipcc unavailable to recompile"),
+            ));
+        }
+        // Cache + blob are now gone → compile() takes the fresh hipcc path.
+        self.compile(name, source)?;
+        Ok(self.compiled[name].clone())
     }
 
     /// Extract per-kernel hipcc flags from magic comments in the source.
@@ -278,7 +361,9 @@ impl KernelCompiler {
     /// non-Windows hosts. Reported as #82.
     #[cfg(target_os = "windows")]
     fn win_short_path_if_needed(p: &str) -> String {
-        if !p.contains(' ') { return p.to_string(); }
+        if !p.contains(' ') {
+            return p.to_string();
+        }
         // Use cmd.exe's `for %A in (LONG) do echo %~sA` to ask the OS for the
         // 8.3 alias. Subprocess approach avoids pulling in a winapi crate dep
         // for this single call site.
@@ -289,7 +374,11 @@ impl KernelCompiler {
         match out {
             Ok(o) if o.status.success() => {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if !s.is_empty() && !s.contains(' ') { s } else { p.to_string() }
+                if !s.is_empty() && !s.contains(' ') {
+                    s
+                } else {
+                    p.to_string()
+                }
             }
             _ => p.to_string(),
         }
@@ -298,10 +387,19 @@ impl KernelCompiler {
     /// No-op on non-Windows: POSIX argv handling preserves embedded spaces
     /// and ROCm's standard `/opt/rocm/include` has no spaces anyway.
     #[cfg(not(target_os = "windows"))]
-    fn win_short_path_if_needed(p: &str) -> String { p.to_string() }
+    fn win_short_path_if_needed(p: &str) -> String {
+        p.to_string()
+    }
 
     /// Run hipcc for a single kernel. Shared by compile() and compile_batch().
-    fn hipcc_compile(arch: &str, src_path: &Path, obj_path: &Path, name: &str, source: &str, extra_flags: &str) -> HipResult<()> {
+    fn hipcc_compile(
+        arch: &str,
+        src_path: &Path,
+        obj_path: &Path,
+        name: &str,
+        source: &str,
+        extra_flags: &str,
+    ) -> HipResult<()> {
         std::fs::write(src_path, source).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to write kernel source: {e}"))
         })?;
@@ -352,9 +450,7 @@ impl KernelCompiler {
         let output = Command::new("hipcc")
             .args(&args)
             .output()
-            .map_err(|e| {
-                hip_bridge::HipError::new(0, &format!("failed to run hipcc: {e}"))
-            })?;
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("failed to run hipcc: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -377,10 +473,7 @@ impl KernelCompiler {
                 continue;
             }
 
-            let mut hasher = DefaultHasher::new();
-            source.hash(&mut hasher);
-            self.arch.hash(&mut hasher);
-            let src_hash = format!("{:016x}", hasher.finish());
+            let src_hash = self.cache_hash(source);
 
             // Check precompiled with valid hash
             if let Some(ref dir) = self.precompiled_dir {
@@ -407,7 +500,8 @@ impl KernelCompiler {
             let hash_path = self.cache_dir.join(format!("{name}.hash"));
             let src_path = self.cache_dir.join(format!("{name}.hip"));
 
-            let cache_valid = obj_path.exists() && hash_path.exists()
+            let cache_valid = obj_path.exists()
+                && hash_path.exists()
                 && std::fs::read_to_string(&hash_path).unwrap_or_default() == src_hash;
 
             if cache_valid {
@@ -429,8 +523,12 @@ impl KernelCompiler {
             }
 
             to_compile.push((
-                name.to_string(), source.to_string(), src_hash,
-                src_path, obj_path, hash_path,
+                name.to_string(),
+                source.to_string(),
+                src_hash,
+                src_path,
+                obj_path,
+                hash_path,
             ));
         }
 
@@ -449,30 +547,40 @@ impl KernelCompiler {
         let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         // Spawn hipcc in parallel threads
-        let results: Vec<_> = to_compile.into_iter().map(|(name, source, src_hash, src_path, obj_path, hash_path)| {
-            let arch = arch.clone();
-            let precompiled_dir = precompiled_dir.clone();
-            let extra_flags = self.extra_flags.clone();
-            let done = std::sync::Arc::clone(&done);
-            let handle = thread::spawn(move || {
-                let result = Self::hipcc_compile(&arch, &src_path, &obj_path, &name, &source, &extra_flags);
-                if result.is_ok() {
-                    let _ = std::fs::write(&hash_path, &src_hash);
-                    // Write back to precompiled dir
-                    if let Some(ref dir) = precompiled_dir {
-                        let pre_hash = dir.join(format!("{name}.hash"));
-                        let pre_hsaco = dir.join(format!("{name}.hsaco"));
-                        let _ = std::fs::copy(&obj_path, &pre_hsaco);
-                        let _ = std::fs::write(&pre_hash, &src_hash);
+        let results: Vec<_> = to_compile
+            .into_iter()
+            .map(|(name, source, src_hash, src_path, obj_path, hash_path)| {
+                let arch = arch.clone();
+                let precompiled_dir = precompiled_dir.clone();
+                let extra_flags = self.extra_flags.clone();
+                let done = std::sync::Arc::clone(&done);
+                let handle = thread::spawn(move || {
+                    let result = Self::hipcc_compile(
+                        &arch,
+                        &src_path,
+                        &obj_path,
+                        &name,
+                        &source,
+                        &extra_flags,
+                    );
+                    if result.is_ok() {
+                        let _ = std::fs::write(&hash_path, &src_hash);
+                        // Write back to precompiled dir
+                        if let Some(ref dir) = precompiled_dir {
+                            let pre_hash = dir.join(format!("{name}.hash"));
+                            let pre_hsaco = dir.join(format!("{name}.hsaco"));
+                            let _ = std::fs::copy(&obj_path, &pre_hsaco);
+                            let _ = std::fs::write(&pre_hash, &src_hash);
+                        }
                     }
-                }
-                let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                let marker = if result.is_ok() { "✓" } else { "✗" };
-                eprintln!("  [{i:>3}/{n}] {marker} {name}");
-                (name, obj_path, result)
-            });
-            handle
-        }).collect();
+                    let i = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let marker = if result.is_ok() { "✓" } else { "✗" };
+                    eprintln!("  [{i:>3}/{n}] {marker} {name}");
+                    (name, obj_path, result)
+                });
+                handle
+            })
+            .collect();
 
         let mut errors = Vec::new();
         for handle in results {
@@ -490,5 +598,40 @@ impl KernelCompiler {
             return Err(e);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_compiler(extra_flags: &str, toolchain_id: &str) -> KernelCompiler {
+        KernelCompiler {
+            cache_dir: PathBuf::from(".test-cache"),
+            arch: "gfx1151".to_string(),
+            compiled: HashMap::new(),
+            precompiled_dir: None,
+            has_hipcc: false,
+            extra_flags: extra_flags.to_string(),
+            toolchain_id: toolchain_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn cache_hash_includes_flags_and_toolchain() {
+        let source = "__global__ void kernel() {}";
+        let base = test_compiler("", "hipcc 7.2").cache_hash(source);
+        let flags_changed = test_compiler("-mllvm -amdgpu-enable-flat-scratch=false", "hipcc 7.2")
+            .cache_hash(source);
+        let toolchain_changed = test_compiler("", "hipcc 7.3").cache_hash(source);
+
+        assert_ne!(
+            base, flags_changed,
+            "cache key must change when hipcc flags change"
+        );
+        assert_ne!(
+            base, toolchain_changed,
+            "cache key must change when hipcc toolchain changes"
+        );
     }
 }

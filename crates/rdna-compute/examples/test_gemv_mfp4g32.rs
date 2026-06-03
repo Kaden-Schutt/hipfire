@@ -261,8 +261,8 @@ fn run_one(gpu: &mut Gpu, groups_per_row: usize, signs1: &[f32], signs2: &[f32])
     // dispatch wrapper rotates x into the GPU's internal scratch for us.
     gpu.ensure_mq_signs().unwrap();
     let x_rot_alias = rdna_compute::GpuTensor {
-        buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-        shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+        buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+        shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
         dtype: DType::F32,
     };
     gpu.gemv_mfp4g32_with_rotate(&d_a, &d_x, &d_y, &x_rot_alias, m, k).unwrap();

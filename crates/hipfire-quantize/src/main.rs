@@ -4010,8 +4010,12 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                     (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
                 }
                 GgufFormat::Mq4Lloyd => {
-                    let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
+                    // Promote6 → MQ6, consistent with default_promote_target
+                    // (Mq4Lloyd→Mq6) and its Lloyd siblings Mq2Lloyd/Mq3Lloyd
+                    // (in the first arm). Previously this stayed at MQ4G256Lloyd
+                    // (4-bit) — no actual promotion under --kmap-promote 6.
+                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
                 }
                 GgufFormat::Hfq4 => {
                     let q = quantize_hfq4g256(&f32_data);

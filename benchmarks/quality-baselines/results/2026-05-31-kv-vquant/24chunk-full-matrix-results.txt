@@ -1,0 +1,15 @@
+# Full 12-cell KLD matrix (24-chunk, qwen3.6-27b.mq4, gfx1100, 2026-05-31)
+## fwht2/fwht4 (Phase 2)
+fwht2-K / q8-V : KLD=0.015053 PPL=3.4508
+fwht2-K / lloyd2-V : KLD=0.018609 PPL=3.4659
+fwht2-K / lloyd3-V : KLD=0.015982 PPL=3.4538
+fwht2-K / lloyd4-V : KLD=0.015367 PPL=3.4520
+fwht4-K / q8-V : KLD=0.010640 PPL=3.4368
+fwht4-K / lloyd2-V : KLD=0.014242 PPL=3.4506
+fwht4-K / lloyd3-V : KLD=0.011555 PPL=3.4392
+fwht4-K / lloyd4-V : KLD=0.011089 PPL=3.4380
+## fwht3 (Phase 1)
+fwht3-K / q8-V : KLD=0.011148 PPL=3.4366
+fwht3-K / lloyd4-V : KLD=0.011487 PPL=3.4374
+fwht3-K / lloyd3-V : KLD=0.012120 PPL=3.4413
+fwht3-K / lloyd2-V : KLD=0.014568 PPL=3.4525

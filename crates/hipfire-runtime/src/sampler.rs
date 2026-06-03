@@ -71,6 +71,15 @@ pub struct SamplerConfig {
     /// Effective window is `min(history.len(), repeat_window)` and is
     /// also clipped to the GPU `repeat_buf` capacity by the caller.
     pub repeat_window: usize,
+    /// OpenAI `presence_penalty`: flat logit subtraction applied once to any
+    /// token that occurred within `repeat_window`. 0.0 = disabled. Unlike the
+    /// recency-weighted `repeat_penalty`, this is constant across the window,
+    /// so it suppresses block-level repetition loops a short recency-weighted
+    /// window cannot see (matches llama.cpp / Lemonade semantics).
+    pub presence_penalty: f32,
+    /// OpenAI `frequency_penalty`: logit subtraction scaled by the token's
+    /// occurrence count within `repeat_window`. 0.0 = disabled.
+    pub frequency_penalty: f32,
     /// Token IDs whose logit is unconditionally set to `-INF` before
     /// sampling. Used for the unclosed-opener attractor block (#111).
     pub blocked_tokens: Vec<u32>,
@@ -85,6 +94,8 @@ impl SamplerConfig {
             top_p: 1.0,
             repeat_penalty: 1.0,
             repeat_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             blocked_tokens: Vec::new(),
         }
     }
@@ -101,6 +112,8 @@ impl Default for SamplerConfig {
             top_p: 0.95,
             repeat_penalty: 1.05,
             repeat_window: 128,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             blocked_tokens: Vec::new(),
         }
     }
@@ -178,7 +191,7 @@ pub fn sample(
     //   - writeback (token_id, new_rng) to `sample_buf`
     //   - 8-byte D2H sync (returned by the wrapper)
     let (tok, new_rng) = gpu
-        .sample_top_p(
+        .sample_top_p_pf(
             logits,
             sample_buf,
             repeat_buf,
@@ -188,6 +201,8 @@ pub fn sample(
             *rng_state,
             scope.len(),
             cfg.repeat_penalty,
+            cfg.presence_penalty,
+            cfg.frequency_penalty,
         )
         .expect("sample_top_p kernel launch / readback failed");
     *rng_state = new_rng;
@@ -206,6 +221,23 @@ pub fn sample(
 pub fn sample_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) -> u32 {
     if cfg.repeat_penalty != 1.0 && cfg.repeat_window > 0 {
         llama::apply_repeat_penalty(logits, history, cfg.repeat_window, cfg.repeat_penalty);
+    }
+    // OpenAI-style subtractive presence/frequency penalties over the same
+    // window (mirrors the GPU `sample_top_p` kernel). logit -= freq*count +
+    // presence, applied once per unique token. Keeps the GPU and CPU
+    // (grammar-active) decode paths consistent.
+    if (cfg.presence_penalty > 0.0 || cfg.frequency_penalty > 0.0) && cfg.repeat_window > 0 {
+        let start = history.len().saturating_sub(cfg.repeat_window);
+        let window = &history[start..];
+        let mut counts: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+        for &t in window {
+            *counts.entry(t).or_insert(0.0) += 1.0;
+        }
+        for (tok, count) in counts {
+            if (tok as usize) < logits.len() {
+                logits[tok as usize] -= cfg.frequency_penalty * count + cfg.presence_penalty;
+            }
+        }
     }
     for &tok in &cfg.blocked_tokens {
         if (tok as usize) < logits.len() {

@@ -344,8 +344,8 @@ fn prepare_rotation_scratch(
     let awq = w.awq_scale.is_some();
     let batched = inputs.batch_size > 1;
     let mq = |gpu: &mut Gpu| -> Result<GpuTensor, DispatchError> {
-        let buf = unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() };
-        let size = gpu.mq_x_rot.as_ref().unwrap().buf.size();
+        let buf = unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() };
+        let size = gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size();
         Ok(GpuTensor { buf, shape: vec![size / 4], dtype: DType::F32 })
     };
     match plan {
@@ -360,7 +360,7 @@ fn prepare_rotation_scratch(
         RotationPlan::Givens => {
             gpu.ensure_paro_scratch(w.k).map_err(|e| DispatchError::Hip(e.to_string()))?;
             Ok((GpuTensor {
-                buf: unsafe { gpu.paro_x_scratch.as_ref().unwrap().buf.alias() },
+                buf: unsafe { gpu.scratch.paro_x_scratch.as_ref().unwrap().buf.alias() },
                 shape: vec![w.k], dtype: DType::F32,
             }, awq, batched))
         }

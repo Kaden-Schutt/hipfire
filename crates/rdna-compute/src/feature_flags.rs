@@ -44,6 +44,7 @@ pub struct FeatureFlags {
     pub fp16_layer_max: Option<usize>,
     pub wo_mmq: bool,
     pub lm_head_wmma_disabled: bool,
+    pub lm_head_overwrite: bool,
 
     // ── MMQ screening ─────────────────────────────────────────────
     pub mmq_screen: bool,
@@ -58,6 +59,7 @@ pub struct FeatureFlags {
     pub hfq3_mmq_layer_max: Option<usize>,
     pub hfq4_mmq_gfx906_y64: bool,
     pub gate_up_variant: Option<String>,
+    pub gate_up_nosync: bool,
     pub gfx942_gemv_v2: Option<bool>,
     pub gfx942_gemv_v3: bool,
     pub gfx942_rmsnorm_split: bool,
@@ -96,14 +98,15 @@ impl FeatureFlags {
         let parse_bool = |name: &str| -> Option<bool> {
             match std::env::var(name).ok().as_deref() {
                 Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON") => Some(true),
-                Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF") => Some(false),
+                Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF") => {
+                    Some(false)
+                }
                 _ => None,
             }
         };
 
-        let parse_usize = |name: &str| -> Option<usize> {
-            std::env::var(name).ok().and_then(|s| s.parse().ok())
-        };
+        let parse_usize =
+            |name: &str| -> Option<usize> { std::env::var(name).ok().and_then(|s| s.parse().ok()) };
 
         let parse_mb4 = |name: &str| -> Option<Mb4Mode> {
             match std::env::var(name).ok().as_deref() {
@@ -133,7 +136,10 @@ impl FeatureFlags {
             gemv_rows: std::env::var("HIPFIRE_GEMV_ROWS")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
-                .map(|r| match r { 1 | 2 | 4 | 8 => r, _ => 1 }),
+                .map(|r| match r {
+                    1 | 2 | 4 | 8 => r,
+                    _ => 1,
+                }),
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
@@ -159,7 +165,9 @@ impl FeatureFlags {
             fp16_layer_min: parse_usize("HIPFIRE_FP16_LAYER_MIN"),
             fp16_layer_max: parse_usize("HIPFIRE_FP16_LAYER_MAX"),
             wo_mmq: std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1"),
-            lm_head_wmma_disabled: std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0"),
+            lm_head_wmma_disabled: std::env::var("HIPFIRE_LM_HEAD_WMMA")
+                .map_or(false, |v| v == "0"),
+            lm_head_overwrite: std::env::var("HIPFIRE_LM_HEAD_OVERWRITE").as_deref() == Ok("1"),
 
             // MMQ screening
             mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN")
@@ -172,7 +180,8 @@ impl FeatureFlags {
                 .unwrap_or(mmq_screen_threshold_default),
             mmq_diag_quantize_only: std::env::var("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY")
                 .ok()
-                .as_deref() == Some("1"),
+                .as_deref()
+                == Some("1"),
 
             // Kernel variant overrides
             lloyd_mb4: parse_mb4("HIPFIRE_LLOYD_MB4"),
@@ -183,6 +192,7 @@ impl FeatureFlags {
             hfq4_mmq_gfx906_y64: std::env::var("HIPFIRE_HFQ4_MMQ_GFX906_Y64")
                 .map_or(false, |v| v == "1"),
             gate_up_variant: std::env::var("HIPFIRE_GATE_UP_VARIANT").ok(),
+            gate_up_nosync: std::env::var("HIPFIRE_GATE_UP_NOSYNC").as_deref() == Ok("1"),
             gfx942_gemv_v2: parse_bool("HIPFIRE_GFX942_GEMV_V2"),
             gfx942_gemv_v3: std::env::var("HIPFIRE_GFX942_GEMV_V3").map_or(false, |v| v == "1"),
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942")
@@ -195,8 +205,8 @@ impl FeatureFlags {
             },
             moe_grouped_i8_k8: std::env::var("HIPFIRE_MOE_GROUPED_I8_K8").as_deref() == Ok("1"),
             moe_grouped_i8_k4: std::env::var("HIPFIRE_MOE_GROUPED_I8_K4").as_deref() == Ok("1"),
-            moe_grouped_i8_k4_gfx12: std::env::var("HIPFIRE_MOE_GROUPED_I8_K4_GFX12")
-                .as_deref() == Ok("1"),
+            moe_grouped_i8_k4_gfx12: std::env::var("HIPFIRE_MOE_GROUPED_I8_K4_GFX12").as_deref()
+                == Ok("1"),
             moe_grouped_m2: std::env::var("HIPFIRE_MOE_GROUPED_M2").as_deref() == Ok("1"),
             moe_hfq6_v2: std::env::var("HIPFIRE_MOE_HFQ6_V2").as_deref() == Ok("1"),
 
@@ -208,20 +218,21 @@ impl FeatureFlags {
             q8_batched_legacy: std::env::var("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1"),
             rope_interleaved_legacy: std::env::var("HIPFIRE_ROPE_INTERLEAVED_LEGACY")
                 .ok()
-                .as_deref() == Some("1"),
+                .as_deref()
+                == Some("1"),
             wo_wmma_variant: std::env::var("HIPFIRE_WO_WMMA_VARIANT").ok(),
 
             // rocBLAS
-            rocblas_all_archs: std::env::var("HIPFIRE_ROCBLAS_ALL_ARCHS")
-                .ok()
-                .as_deref() == Some("1"),
+            rocblas_all_archs: std::env::var("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref()
+                == Some("1"),
             rocblas_off: std::env::var("HIPFIRE_ROCBLAS_OFF").ok().as_deref() == Some("1"),
             rocblas_min_batch: parse_usize("HIPFIRE_ROCBLAS_MIN_BATCH"),
 
             // Kernels.rs
             lloyd_force_baseline: std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE")
                 .ok()
-                .as_deref() == Some("1"),
+                .as_deref()
+                == Some("1"),
             rdna2_variant: std::env::var("HIPFIRE_RDNA2_VARIANT")
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok()),
@@ -242,7 +253,8 @@ impl FeatureFlags {
     }
 
     pub fn gfx942_lds_gemv_enabled(&self) -> bool {
-        self.gfx942_lds_gemv.unwrap_or(self.gfx942_lds_gemv_default_on)
+        self.gfx942_lds_gemv
+            .unwrap_or(self.gfx942_lds_gemv_default_on)
     }
 
     pub fn hfq3_mmq_layer_gate_pass(&self) -> bool {
@@ -252,13 +264,23 @@ impl FeatureFlags {
             return true;
         }
         let layer = super::dispatch::MMQ_CURRENT_LAYER.load(std::sync::atomic::Ordering::Relaxed);
-        if let Some(lo) = lo { if layer < lo { return false; } }
-        if let Some(hi) = hi { if layer > hi { return false; } }
+        if let Some(lo) = lo {
+            if layer < lo {
+                return false;
+            }
+        }
+        if let Some(hi) = hi {
+            if layer > hi {
+                return false;
+            }
+        }
         true
     }
 
     pub fn fp16_disabled_for_current_layer(&self) -> bool {
-        if self.fp16_disabled { return true; }
+        if self.fp16_disabled {
+            return true;
+        }
         let lo = self.fp16_layer_min;
         let hi = self.fp16_layer_max;
         if lo.is_none() && hi.is_none() {
@@ -311,6 +333,7 @@ impl FeatureFlags {
             fp16_layer_max: None,
             wo_mmq: false,
             lm_head_wmma_disabled: false,
+            lm_head_overwrite: false,
             mmq_screen: false,
             mmq_screen_threshold: if is_gfx906 { 0.50 } else { 0.10 },
             mmq_diag_quantize_only: false,
@@ -321,6 +344,7 @@ impl FeatureFlags {
             hfq3_mmq_layer_max: None,
             hfq4_mmq_gfx906_y64: false,
             gate_up_variant: None,
+            gate_up_nosync: false,
             gfx942_gemv_v2: None,
             gfx942_gemv_v3: false,
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942"),

@@ -224,11 +224,25 @@ back to AR silently.
 ```
 qwen35-9b-dflash-mq4.hfq    590f35403cd7f1d634945233234a12b7  557 MB
 qwen35-27b-dflash-mq4.hfq   7b6df2a4ee1c8d933f0a52e187d1860b  919 MB
-qwen36-27b-dflash-mq4.hfq   ecc64877dfe0a1312b6f4066c3920128  919 MB
+qwen36-27b-dflash-mq4.hfq   204c4c4ceab30cb9ebc118fa9d59a446  919 MB
 qwen3.6-27b.mq4             9a6acdc49bcaa6a7b52ac161444cb769   15 GB
 ```
 
-Any mismatch = re-pull or report.
+Any mismatch = re-pull or report. (The `qwen36-27b-dflash-mq4.hfq`
+checksum was refreshed 2026-05-30 from the stale `ecc64877…` — the HF
+file was re-uploaded since the original manifest; verify against the
+current `204c4c4c…`.)
+
+> **Sizes here are decimal (MB = 10⁶ bytes, GB = 10⁹ bytes), matching
+> Hugging Face's reported sizes and the `hipfire pull` progress bar.**
+> `ls -lh` / `du -h` report **binary** units (MiB = 2²⁰, GiB = 2³⁰) but
+> *label them* `M`/`G`, so a 919 MB file shows as `877M` in `ls`
+> (919 × 10⁶ ÷ 2²⁰ ≈ 877 MiB) and a 15 GB file shows as `14G`. This is
+> not a size mismatch or a truncated download — it's the same byte
+> count in two unit systems. When a download looks "smaller than the
+> manifest," divide by 1.048576 (MB→MiB) or 1.073742 (GB→GiB) before
+> assuming corruption; confirm with the md5, not the human-readable
+> size.
 
 ### Build from source (if you're on a dev branch)
 
@@ -483,6 +497,64 @@ For dataclass benches:
 - Bisect to a specific commit (use `scripts/probe_commits.sh COMMIT_BEFORE COMMIT_AFTER`)
 - Confirmation that the regression appears across genres (not just one
   prompt that happens to hit a different distribution)
+
+### Pinned Hugging Face bench fixture
+
+For hiptrx dense Qwen3.6-27B AWQ MTP/DFlash perf work, do not identify
+the canonical trunk by local filename. Local filenames drift and lookalike
+AWQ/MQ4 files are not comparable.
+
+The canonical trunk is whichever local artifact byte-matches the current
+Hugging Face `.mq4` artifact:
+
+- HF repo: `schuttdev/hipfire-qwen3.6-27b`
+- HF file: `qwen3.6-27b.mq4`
+- HF repo commit when pinned: `f9b326a657f14cbc400e384ff84a4b9b4b726ba2`
+- File size: `14984158208`
+- SHA-256 / HF `x-linked-etag`:
+  `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc`
+
+Before reporting dense 3.6 AWQ MTP/DFlash results, verify the candidate
+trunk with `sha256sum` and require the digest above. If Hugging Face has
+published a newer `.mq4`, refresh the HF headers first and pin the new
+`x-linked-etag`/size in the report.
+
+Reports that use a trunk with a different digest are not comparable and
+should be discarded.
+
+### Pinned A3B MoE DFlash fixtures
+
+For hiptrx Qwen3.6-35B-A3B MoE DFlash perf/profiling work, use the
+following command shape and do not substitute other prompts unless the
+user explicitly updates this fixture section:
+
+```bash
+./target/release/examples/dflash_spec_demo \
+  --target /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x \
+  --draft /home/kaden/.hipfire/models/qwen36-35b-a3b-dflash-mq4.hfq \
+  --prompt-file <allowed-prompt> \
+  --max 256 --temp 0.0 --no-chatml --kv-mode q8 --ctx 4096 \
+  --block-size 6 --no-adaptive-b
+```
+
+Pinned artifacts:
+
+- target md5: `edde51ec1dac0f2bd42cff5ef1cb8944`
+- draft md5: `8254bbe1ffe31edf2b38f3889d6325f1`
+
+The only permitted prompt fixtures for this A3B MoE DFlash thread are:
+
+- `benchmarks/prompts/merge_sort_thinking_off.txt`
+  - md5: `253c7ac50857fe6d0e10fb0d2c5e35c0`
+  - best observed post-MoE tape replay fix: `151.00 tok/s`, tau `2.711`,
+    accept rate `0.5422`, `45` cycles, `168` emitted tokens.
+- `benchmarks/prompts/humaneval_3_below_zero.txt`
+  - md5: `37c5aad9f9efe93b5c47f27256bdf149`
+  - best observed before the MoE tape replay optimization: `127.61 tok/s`,
+    tau `3.714`.
+
+Runs using any other prompt are exploratory only and must not be compared
+against the A3B MoE DFlash perfmaxx line.
 
 ---
 

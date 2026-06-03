@@ -45,7 +45,7 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::{KvCache, gemv_family, DispatchCtx};
+    use hipfire_runtime::llama::{DispatchCtx, KvCache, VMode, gemv_family, weight_gemv};
     use rdna_compute::DType;
     use std::fs::File;
     use std::io::{BufReader, BufWriter, Read, Write};
@@ -58,6 +58,7 @@ fn main() {
         ref_path: PathBuf,
         output: PathBuf,
         kv_mode: String,
+        kv_v: String,
         scoring_mode: String,
         max_chunks: Option<usize>,
     }
@@ -66,6 +67,7 @@ fn main() {
     let mut ref_path: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut kv_mode = "asym3".to_string();
+    let mut kv_v = "q8".to_string();
     let mut scoring_mode = "prefill".to_string();
     let mut max_chunks: Option<usize> = None;
     let mut i = 1;
@@ -76,11 +78,20 @@ fn main() {
             "--output" => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
             "--kv-mode" => {
                 let v = argv[i + 1].clone();
-                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4") {
-                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 (got {v})");
+                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4" | "fwht2" | "fwht3" | "fwht4") {
+                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 fwht2 fwht3 fwht4 (got {v})");
                     std::process::exit(1);
                 }
                 kv_mode = v;
+                i += 2;
+            }
+            "--kv-v" => {
+                let v = argv[i + 1].clone();
+                if !matches!(v.as_str(), "q8" | "lloyd2" | "lloyd3" | "lloyd4") {
+                    eprintln!("--kv-v must be one of: q8 lloyd2 lloyd3 lloyd4 (got {v})");
+                    std::process::exit(1);
+                }
+                kv_v = v;
                 i += 2;
             }
             "--scoring-mode" => {
@@ -97,7 +108,7 @@ fn main() {
                 i += 2;
             }
             "-h" | "--help" => {
-                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--scoring-mode prefill] [--max-chunks N]");
+                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill] [--max-chunks N]");
                 std::process::exit(0);
             }
             other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
@@ -108,6 +119,7 @@ fn main() {
         ref_path: ref_path.expect("--ref required"),
         output: output.expect("--output required"),
         kv_mode,
+        kv_v,
         scoring_mode,
         max_chunks,
     };
@@ -136,6 +148,7 @@ fn main() {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         std::env::set_var("HIPFIRE_GRAPH", "0");
         std::env::set_var("HIPFIRE_KV_MODE", &args.kv_mode);
+        std::env::set_var("HIPFIRE_KV_V", &args.kv_v);
         // For prefill scoring, pre-allocate the PrefillBatchScratch via
         // Qwen35Scratch's HIPFIRE_PREFILL_REUSE_PBS hook so the 1175 chunk
         // calls don't each pay 25-tensor alloc/free overhead. (Plan §M1.)
@@ -145,8 +158,8 @@ fn main() {
     }
     eprintln!(
         "eval_hipfire: forced HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 \
-         HIPFIRE_KV_MODE={} scoring_mode={}",
-        args.kv_mode, args.scoring_mode
+         HIPFIRE_KV_MODE={} HIPFIRE_KV_V={} scoring_mode={}",
+        args.kv_mode, args.kv_v, args.scoring_mode
     );
 
     // -------- ref sha256 sanity (M1) --------
@@ -237,6 +250,13 @@ fn main() {
 
     // -------- KV cache + DeltaNet state + scratch --------
     let kv_max = n_ctx + 16;
+    // FWHT KV modes only have layer-filtered ctors; build the FA-layer mask
+    // from layer_types. Filtering is KLD-neutral (DeltaNet layers never read KV).
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == qwen35::LayerType::FullAttention)
+        .collect();
     let mut kv_cache = match args.kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
@@ -250,8 +270,27 @@ fn main() {
         "asym2" => KvCache::new_gpu_asym2(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
         ).unwrap(),
+        "fwht4" => KvCache::new_gpu_fwht4_filtered(
+            &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
+        ).unwrap(),
+        "fwht3" => KvCache::new_gpu_fwht3_filtered(
+            &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
+        ).unwrap(),
+        "fwht2" => KvCache::new_gpu_fwht2_filtered(
+            &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
+        ).unwrap(),
         other => panic!("unknown --kv-mode: {other}"),
     };
+    let v_mode = match args.kv_v.as_str() {
+        "q8" => VMode::Q8,
+        "lloyd2" => VMode::Lloyd2,
+        "lloyd3" => VMode::Lloyd3,
+        "lloyd4" => VMode::Lloyd4,
+        other => panic!("unknown --kv-v: {other}"),
+    };
+    if v_mode != VMode::Q8 {
+        kv_cache.set_v_mode_realloc(&mut gpu, v_mode).unwrap();
+    }
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();
     // DeltaNet state allocated once and reset in place per chunk. Allocating
     // per chunk leaks ~6 MB × n_la_layers/chunk because DeltaNetState has no

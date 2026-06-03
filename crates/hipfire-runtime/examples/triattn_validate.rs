@@ -358,7 +358,7 @@ fn main() {
     // with hipGraph stream capture mode (hipErrorStreamCaptureImplicit).
     // Keeping kernels dirty avoids re-capture while the TriAttn tap performs
     // D2H copies inside the validation forward.
-    gpu.graph_destroy();
+    gpu.graphs.graph_destroy(&gpu.hip, gpu.device_id);
 
     let cap = TriAttnCapture::new(config.n_heads, config.n_kv_heads, config.head_dim);
     triattn::install_capture(cap);
@@ -369,7 +369,7 @@ fn main() {
     for (pos, tid) in val_tokens.iter().take(val_len).enumerate() {
         // Keep forward_scratch on the direct path instead of attempting graph
         // capture, which would fail on the D2H copy inside the TriAttn tap.
-        gpu.mark_kernels_dirty();
+        gpu.graphs.mark_kernels_dirty();
         qwen35::forward_scratch(
             &mut gpu, &weights, &config, *tid, pos,
             &mut kv, &mut dn, &scratch,

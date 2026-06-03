@@ -13,6 +13,10 @@ pub type HipErrorCode = u32;
 /// HIP operation result.
 pub type HipResult<T> = Result<T, HipError>;
 
+/// `hipErrorInvalidImage` — the device code object handed to `hipModuleLoad`
+/// is not valid for this GPU (wrong ISA, or a stale cross-build/cross-toolchain
+/// `.hsaco` left in a shared kernel cache). Recoverable by recompiling from source.
+pub const HIP_ERROR_INVALID_IMAGE: HipErrorCode = 200;
 pub const HIP_ERROR_PEER_ACCESS_UNSUPPORTED: HipErrorCode = 217;
 pub const HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED: HipErrorCode = 704;
 pub const HIP_ERROR_PEER_ACCESS_NOT_ENABLED: HipErrorCode = 705;
@@ -42,7 +46,11 @@ impl HipError {
                 if ptr.is_null() {
                     None
                 } else {
-                    Some(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+                    Some(
+                        unsafe { CStr::from_ptr(ptr) }
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
                 }
             })
             .unwrap_or_else(|| format!("error code {code}"));

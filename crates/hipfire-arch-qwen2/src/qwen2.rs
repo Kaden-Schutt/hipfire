@@ -883,6 +883,12 @@ fn forward_step_after_x(
                 &state.attn_out,
                 pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
             )?;
+        } else if n_kv_heads < n_heads && head_dim == 128 && pos + 1 >= 4096 {
+            gpu.attention_gqa_warp(
+                &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
+                &state.attn_out, &state.attn_partials,
+                pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
+            )?;
         } else if n_kv_heads < n_heads && pos + 1 >= 4096 {
             Gpu::attention_flash_gqa(gpu,
                 &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
@@ -1044,6 +1050,8 @@ pub fn forward_prefill_batch_embeds(
         // Attention: WMMA causal flash when head_dim=128 and batch is
         // large enough to fill the M=64 tile. gfx11 and gfx12 use separate
         // kernel siblings because their WMMA operand layouts differ.
+        // Keep v3-causal in production: the v4-causal V_lds transpose variant
+        // is bench-only until it is fixed for non-128-token prompt lengths.
         if let (Some(k16), Some(v16)) = (&k_f16_batch, &v_f16_batch) {
             gpu.cast_f32_to_f16(&k_batch, k16)?;
             gpu.cast_f32_to_f16(&v_batch, v16)?;

@@ -45,7 +45,7 @@ pub fn execute_pipeline(
                 gpu.ensure_mq_signs().map_err(|e| DispatchError::Hip(e.to_string()))?;
                 let x_rot = unsafe {
                     GpuTensor {
-                        buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
+                        buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
                         shape: vec![params.k],
                         dtype: rdna_compute::DType::F32,
                     }
@@ -110,7 +110,7 @@ pub fn dispatch_fused(
             gpu.ensure_mq_signs().map_err(|e| DispatchError::Hip(e.to_string()))?;
             let x_rot = unsafe {
                 GpuTensor {
-                    buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
+                    buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
                     shape: vec![params.k],
                     dtype: rdna_compute::DType::F32,
                 }

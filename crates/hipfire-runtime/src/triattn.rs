@@ -410,6 +410,15 @@ impl TriAttnCalibStateGpu {
             &self.accs_count,
         )?;
 
+        // Free the GPU accumulators now that they're downloaded — `self` is
+        // consumed by this method and DeviceBuffer has no Drop, so scope exit
+        // would otherwise leak all four calibration buffers. (Partial-move out
+        // of `self` is fine: the Ok(..) below only reads the scalar fields.)
+        let _ = gpu.hip.free(self.accs_sum_re);
+        let _ = gpu.hip.free(self.accs_sum_im);
+        let _ = gpu.hip.free(self.accs_sum_abs);
+        let _ = gpu.hip.free(self.accs_count);
+
         // Same math as BandAccumulator::finalize: mean(re), mean(im), mean(|q|).
         let centers: Vec<BandCenter> = (0..n_accs).map(|i| {
             let c = count[i];

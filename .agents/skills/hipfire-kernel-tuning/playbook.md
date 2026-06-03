@@ -75,6 +75,7 @@ Common matchings:
 | BW-bound on long prefill | WMMA / MFMA (matrix engine throughput beats raw FMA) |
 | L2 misses on hot decode weights | `s_prefetch_data` software prefetch (gfx12 only — see PR #56's gemv_hfq4g256.gfx1201.hip) |
 | Kernel slow only on one arch | Per-chip override `<name>.gfx1100.hip` or family `<name>.gfx12.hip` |
+| Low BW utilization (<10%) + high wave-count from multi-wave WG | Barrier-free syncthreads elimination (levers.md §10) — remove LDS staging, each warp loads from global independently |
 
 ## 4. Implement + compile-check across the arch matrix
 
