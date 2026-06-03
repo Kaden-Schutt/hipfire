@@ -911,8 +911,23 @@ fn forward_step_after_x(
         gpu.rmsnorm_f32(&state.x, &layer.ffn_norm, &state.tmp, cfg.rms_norm_eps)?;
 
         // (10) SwiGLU: gate = silu(w_gate(x)) * w_up(x); down(...).
-        gemv.run_auto(&ctx, gpu, &layer.w_gate.dispatch_ref(), &state.tmp, &state.gate).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-        gemv.run_auto(&ctx, gpu, &layer.w_up.dispatch_ref(), &state.tmp, &state.up).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        // Q8_0 gate+up fuse into one launch (mirrors the fused_qkv_hfq4g256
+        // fast path above); otherwise two individual run_auto GEMVs.
+        if layer.w_gate.gpu_dtype == DType::Q8_0
+            && layer.w_up.gpu_dtype == DType::Q8_0
+            && layer.w_gate.k == layer.w_up.k
+        {
+            gpu.fused_gate_up_q8_0(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &state.tmp,
+                &state.gate, &state.up,
+                layer.w_gate.m, layer.w_up.m,
+                layer.w_gate.k,
+            )?;
+        } else {
+            gemv.run_auto(&ctx, gpu, &layer.w_gate.dispatch_ref(), &state.tmp, &state.gate).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            gemv.run_auto(&ctx, gpu, &layer.w_up.dispatch_ref(), &state.tmp, &state.up).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        }
         gpu.silu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
         gemv.run_auto(&ctx, gpu, &layer.w_down.dispatch_ref(), &state.ffn_hidden, &state.ffn_out).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 

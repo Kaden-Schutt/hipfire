@@ -13356,9 +13356,11 @@ fn rmsnorm_rotate_dispatch<'a>(
             givens_scales: None,
             givens_krot: None,
         })?;
+        trace_finite_if_enabled(gpu, "rmsnorm_rotate", x_rot_scratch)?;
         Ok(Some(x_rot_scratch))
     } else {
         gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
+        trace_finite_if_enabled(gpu, "rmsnorm_rotate", tmp)?;
         Ok(None)
     }
 }
@@ -13401,7 +13403,7 @@ fn fused_qkvza_dispatch(
         || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
         || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()));
 
-    if use_fused {
+    let proj = if use_fused {
         let x = eff_rot.unwrap_or(tmp);
         if dt == DType::MQ4G256 || dt == DType::HFQ4G256 {
             gpu.fused_qkvza_hfq4g256(
@@ -13456,7 +13458,10 @@ fn fused_qkvza_dispatch(
         run(wz, dn_z)?;
         run(w_beta, dn_beta)?;
         run(w_alpha, dn_alpha)
-    }
+    };
+    proj?;
+    trace_finite_if_enabled(gpu, "qkvza", dn_qkv)?;
+    Ok(())
 }
 
 /// Fused QKV (3-way) dispatch for full attention projections.
@@ -13488,7 +13493,7 @@ fn fused_qkv_dispatch(
         || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
         || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()));
 
-    if use_fused {
+    let proj = if use_fused {
         let x = eff_rot.unwrap_or(tmp);
         if dt == DType::MQ4G256 || dt == DType::HFQ4G256 {
             gpu.fused_qkv_hfq4g256(
@@ -13542,7 +13547,10 @@ fn fused_qkv_dispatch(
         run(wq, fa_q)?;
         run(wk, fa_k)?;
         run(wv, fa_v)
-    }
+    };
+    proj?;
+    trace_finite_if_enabled(gpu, "qkv", fa_q)?;
+    Ok(())
 }
 
 /// Fused Gate+Up (2-way) dispatch for the FFN path.
@@ -13571,7 +13579,7 @@ fn fused_gate_up_dispatch(
         || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
         || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()));
 
-    if use_fused {
+    let proj = if use_fused {
         let x = eff_rot.unwrap_or(tmp);
         if dt == DType::MQ4G256 || dt == DType::HFQ4G256 {
             gpu.fused_gate_up_hfq4g256(
@@ -13624,7 +13632,10 @@ fn fused_gate_up_dispatch(
         };
         run(w_gate, gate_out)?;
         run(w_up, up_out)
-    }
+    };
+    proj?;
+    trace_finite_if_enabled(gpu, "gate_up", gate_out)?;
+    Ok(())
 }
 
 /// MoE FFN dispatch — mirrors the two-path logic from the original.
@@ -13636,7 +13647,7 @@ fn moe_ffn_dispatch(
     config: &Qwen35Config,
     s: &Qwen35Scratch,
 ) -> HipResult<()> {
-    if ffn_all_mq4_for_moe(ffn) {
+    let r = if ffn_all_mq4_for_moe(ffn) {
         gpu.fused_rmsnorm_rotate_mq(
             x, ffn_norm,
             s.moe_x_rot.as_ref().expect("MoE scratch"),
@@ -13646,7 +13657,10 @@ fn moe_ffn_dispatch(
     } else {
         gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
         moe_ffn_decode_with_scratch(gpu, ffn, &s.tmp, x, config, s)
-    }
+    };
+    r?;
+    trace_finite_if_enabled(gpu, "moe_ffn", x)?;
+    Ok(())
 }
 
 /// TriAttention tap helper (inline from original forward).
