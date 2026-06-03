@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Kaden Schutt
@@ -84,6 +84,30 @@ case "$OS" in
         ;;
 esac
 echo "OS: $OS ($ARCH)"
+
+# ─── NixOS: redirect to the Nix flake (#162) ─────────────
+# NixOS is non-FHS: ROCm libraries live in /nix/store (invisible to the
+# apt/dnf install paths below) and /bin/bash does not exist, so both the
+# curl | bash flow and the generated `hipfire` wrapper fail with
+# "libamdhip64.so not found" / "bad interpreter: /bin/bash". hipfire has
+# first-class Nix support — send NixOS users to the flake instead of
+# letting them hit those errors. Reported in #162 (flooryyyy).
+if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    os_id=$(. /etc/os-release 2>/dev/null; echo "${ID:-}")
+    if [ "$os_id" = "nixos" ]; then
+        echo ""
+        echo "NixOS detected — the curl | bash installer does not work here"
+        echo "(non-FHS: ROCm lives in /nix/store and /bin/bash is absent)."
+        echo ""
+        echo "Use the first-class Nix flake instead:"
+        echo "  nix profile install github:$GITHUB_REPO   # install into your profile"
+        echo "  nix build           github:$GITHUB_REPO   # build only (./result/bin/hipfire)"
+        echo ""
+        echo "NixOS module + dev shell + GPU-target notes: docs/NIXOS.md"
+        exit 0
+    fi
+fi
 
 # ─── GPU Detection ───────────────────────────────────────
 echo ""
@@ -437,7 +461,7 @@ find "$HIPFIRE_DIR/cli/" -maxdepth 1 -type f \
 # shim dies with "exec: bun: not found" before dep-autodetect inside the
 # TS CLI has a chance to run.
 cat > "$BIN_DIR/hipfire" << 'WRAPPER'
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 if command -v bun >/dev/null 2>&1; then
     BUN=bun
