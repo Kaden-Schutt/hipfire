@@ -527,3 +527,75 @@ fn pipeline_single_op_self_satisfies() {
     assert!(p.can_satisfy(&[PipelineOp::Gemv]));
     assert!(!p.can_satisfy(&[PipelineOp::RotateFwht]));
 }
+
+// ── MoeResolution eligibility lattice (mirrors qwen35.rs:4598-4671) ──
+use crate::families::moe::{MoeDtypes, MoeResolution};
+
+fn dtypes_all_mq4() -> MoeDtypes {
+    MoeDtypes {
+        router: DType::MQ4G256,
+        shared_gate: DType::MQ4G256,
+        shared_expert_gate: DType::MQ4G256,
+        shared_expert_up: DType::MQ4G256,
+        experts_all_gate_up_mq4: true,
+        routed_gate_up: DType::MQ4G256,
+        routed_down: DType::MQ4G256,
+        has_paro_shared: false,
+    }
+}
+
+#[test]
+fn moe_res_all_mq4_k8_uses_gpu_topk_and_xrot() {
+    let r = MoeResolution::resolve(&dtypes_all_mq4(), 8);
+    assert!(r.gate_side_mq4);
+    assert!(r.routed_indexable_mq4);
+    assert!(r.use_gpu_topk);
+    assert!(r.needs_x_rot_local);
+}
+
+#[test]
+fn moe_res_q8_router_still_gpu_topk() {
+    // The non-obvious coupling: a Q8 router disqualifies the 4-way fused
+    // gate-side GEMV (gate_side_mq4=false) but the routed experts are still
+    // MQ4, so the device-side top-K + indexed path stays on (use_gpu_topk=true).
+    let mut d = dtypes_all_mq4();
+    d.router = DType::Q8_0;
+    d.experts_all_gate_up_mq4 = true; // experts unchanged
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(!r.gate_side_mq4);
+    assert!(r.routed_indexable_mq4);
+    assert!(r.use_gpu_topk);
+    assert!(r.needs_x_rot_local); // routed_gate_up_mq4 alone fires x_rot
+}
+
+#[test]
+fn moe_res_k6_disables_gpu_topk_even_when_indexable() {
+    // deepseek-shaped: indexable routed dtype but k != 8 => no GPU fast path
+    let r = MoeResolution::resolve(&dtypes_all_mq4(), 6);
+    assert!(r.routed_indexable_mq4);
+    assert!(!r.use_gpu_topk);
+}
+
+#[test]
+fn moe_res_mq6_routed_indexable() {
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::MQ6G256;
+    d.routed_down = DType::MQ6G256;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(r.routed_indexable_mq6);
+    assert!(!r.routed_indexable_mq4);
+    assert!(r.use_gpu_topk);
+}
+
+#[test]
+fn moe_res_paro_needs_sidecar() {
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::ParoQ4G128;
+    d.routed_down = DType::ParoQ4G128;
+    d.has_paro_shared = false;
+    assert!(!MoeResolution::resolve(&d, 8).routed_indexable_paro);
+    d.has_paro_shared = true;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(r.routed_indexable_paro);
+    assert!(r.use_gpu_topk);
+}
