@@ -661,3 +661,11 @@ fn match_prefix_single_op_consumes_one() {
     // a len-1 pattern matches the first step, consuming exactly 1
     assert_eq!(match_prefix(&table, &steps), Some((KernelKey::GemvF32, 1)));
 }
+
+#[test]
+fn non_phase1_op_is_not_gemv() {
+    // RotateFwht must not be silently treated as a Gemv fallback.
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let step = Step { op: PipelineOp::RotateFwht, weights: &[], input: &dummy, outputs: &[] };
+    assert_ne!(step.op, PipelineOp::Gemv);
+}
