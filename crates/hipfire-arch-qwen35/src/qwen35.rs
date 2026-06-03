@@ -4774,6 +4774,21 @@ fn moe_ffn_decode_impl(
             // 8 experts/layer into a structural attractor on Qwen3.5-A3B
             // and 122B-A10B at MQ4. The new moe_topk_renorm_k8 takes
             // pre-softmaxed probs and uses direct division for renorm.
+            // DIAG: dump MoE router logits BEFORE softmax (per-token)
+            if let Ok(p) = std::env::var("HIPFIRE_DUMP_HIDDEN") {
+                if gpu.hip.device_synchronize().is_ok() {
+                    if let Ok(all) = gpu.download_f32(router_logits) {
+                        use std::io::Write;
+                        let path = format!("{p}.router_raw_p");
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                            let _ = f.write_all(&(0u32).to_le_bytes());
+                            for v in &all[..all.len().min(n_exp * 4 / 4)] {
+                                let _ = f.write_all(&v.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+            }
             gpu.softmax_f32(router_logits)?;
             gpu.moe_topk_renorm_k8(
                 router_logits,
@@ -8033,9 +8048,11 @@ fn prefill_moe_ffn_body_batched(
         )?,
         other => panic!(
             "prefill_moe_ffn_body_batched: unexpected router dtype {other:?} \
-                         — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32"
+                         — moe_ffn_batched_admitted admits MQ4G256, Q8_0, F32"
         ),
     }
+    // DIAG: dump MoE router logits (batched)
+    dump_hidden_localize(gpu, router_logits, n, 0, ffn.router.m, 0, "router_b");
     match ffn.shared_expert_gate.gpu_dtype {
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
             &ffn.shared_expert_gate.buf,
@@ -8769,6 +8786,67 @@ pub(crate) struct PrefillBandCtx<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Debug localization hook (no-op unless `HIPFIRE_DUMP_HIDDEN` is set to a file
+/// prefix). Appends the post-layer hidden row for the target absolute position
+/// to `{HIPFIRE_DUMP_HIDDEN}.{tag}` as `u32 layer_idx` followed by `dim`
+/// little-endian f32. The target absolute position is `HIPFIRE_DUMP_HIDDEN_POS`
+/// (default 0); `abs_pos_of_row0` is the absolute sequence position of row 0 of
+/// `x` (`start_pos` for the batched residual `pbs.x_batch`, `pos` for the
+/// single-row per-token `s.x`). Used to localize the PARO batched-prefill
+/// divergence by diffing `.batched` vs `.pertoken` per layer. Requires
+/// `HIPFIRE_GRAPH=0` (does a synchronous D2H readback, which is illegal under
+/// graph capture).
+fn dump_hidden_localize(
+    gpu: &Gpu,
+    x: &GpuTensor,
+    n_rows: usize,
+    abs_pos_of_row0: usize,
+    dim: usize,
+    layer_idx: usize,
+    tag: &str,
+) {
+    let prefix = match std::env::var("HIPFIRE_DUMP_HIDDEN") {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let target: usize = std::env::var("HIPFIRE_DUMP_HIDDEN_POS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if target < abs_pos_of_row0 {
+        return;
+    }
+    let row = target - abs_pos_of_row0;
+    if row >= n_rows {
+        return;
+    }
+    if gpu.hip.device_synchronize().is_err() {
+        return;
+    }
+    let all = match gpu.download_f32(x) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let off = row * dim;
+    if off + dim > all.len() {
+        return;
+    }
+    use std::io::Write;
+    let path = format!("{prefix}.{tag}");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(&(layer_idx as u32).to_le_bytes());
+        let mut bytes = Vec::with_capacity(dim * 4);
+        for v in &all[off..off + dim] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let _ = f.write_all(&bytes);
+    }
+}
+
 fn forward_prefill_chunk(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -11264,6 +11342,15 @@ fn forward_prefill_chunk(
                         n * k_dim * 4,
                     )?;
                 }
+                // DIAG: dump GDN inputs (batched, MoE branch)
+                if layer_idx == 0 {
+                    let qk_dim = n_v_heads * hd;
+                    dump_hidden_localize(gpu, &pbs.dn_q_batch, n, start_pos, qk_dim, 0, "q_b");
+                    dump_hidden_localize(gpu, &pbs.dn_k_batch, n, start_pos, qk_dim, 0, "k_b");
+                    dump_hidden_localize(gpu, &pbs.dn_v_batch, n, start_pos, v_dim, 0, "v_b");
+                    dump_hidden_localize(gpu, &pbs.dn_alpha_batch, n, start_pos, n_v_heads, 0, "alpha_b");
+                    dump_hidden_localize(gpu, &pbs.dn_beta_batch, n, start_pos, n_v_heads, 0, "beta_b");
+                }
                 if let Some(parents) = tree_parents {
                     let tape_q8 = pbs
                         .dn_s_tape_q8
@@ -11303,6 +11390,8 @@ fn forward_prefill_chunk(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
+                    // DIAG: dump GDN attention output at layer 0
+                    if layer_idx == 0 { dump_hidden_localize(gpu, &pbs.dn_attn_out_batch, n, start_pos, n_v_heads * config.linear_value_head_dim, 0, "gdn_b"); }
                 }
                 gpu.gated_norm_f32_batched(
                     &pbs.dn_attn_out_batch,
@@ -12180,6 +12269,7 @@ fn forward_prefill_chunk(
 
             _ => panic!("layer type mismatch at layer {layer_idx}"),
         }
+        dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
     }
 
     // ── 3. Final output norm + logits ───────────────────────────────────
@@ -13143,6 +13233,7 @@ fn forward_scratch_layers(
                     &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
                 )?;
 
+                // Find GDN call location by dumping after common operations
                 gpu.fused_sigmoid_alpha_gate_f32(
                     &s.dn_beta,
                     &s.dn_alpha,
@@ -13182,6 +13273,16 @@ fn forward_scratch_layers(
                 } else {
                     gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
                     gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+                }
+
+                // DIAG: dump GDN inputs (per-token)
+                if layer_idx == 0 {
+                    let qk_dim = n_v_heads * config.linear_key_head_dim;
+                    dump_hidden_localize(gpu, &s.dn_q, 1, pos, qk_dim, 0, "q_p");
+                    dump_hidden_localize(gpu, &s.dn_k, 1, pos, qk_dim, 0, "k_p");
+                    dump_hidden_localize(gpu, &s.dn_v, 1, pos, v_dim, 0, "v_p");
+                    dump_hidden_localize(gpu, &s.dn_alpha, 1, pos, n_v_heads, 0, "alpha_p");
+                    dump_hidden_localize(gpu, &s.dn_beta, 1, pos, n_v_heads, 0, "beta_p");
                 }
 
                 match dn_state.quant {
@@ -13224,6 +13325,10 @@ fn forward_scratch_layers(
                         config.linear_value_head_dim,
                     )?,
                 }
+                // DIAG: dump GDN attention output (per-token)
+                if layer_idx == 0 {
+                    dump_hidden_localize(gpu, &s.dn_attn_out, 1, pos, n_v_heads * config.linear_value_head_dim, 0, "gdn_p");
+                }
 
                 gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight,
                     &s.dn_normed, n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
@@ -13231,6 +13336,12 @@ fn forward_scratch_layers(
 
                 // ── MoE FFN ──
                 moe_ffn_dispatch(gpu, &layer.ffn, &s.x, &layer.ffn_norm, config, s)?;
+                // DIAG: dump MoE router logits (per-token)
+                if layer_idx == 0 {
+                    if let Some(ref rl) = s.moe_router_logits {
+                        dump_hidden_localize(gpu, rl, 1, pos, config.num_experts, 0, "router_p");
+                    }
+                }
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -13306,6 +13417,7 @@ fn forward_scratch_layers(
             // (the loader guarantees alignment).
             _ => unreachable!(),
         }
+        dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
     }
 
     // Final norm + logits into scratch.logits

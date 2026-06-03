@@ -1407,7 +1407,11 @@ impl Gpu {
         let mut nt = n_tokens as i32;
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
-        let mut fr = GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+        // Reserve n_tokens sequential frame IDs so each token in the
+        // single batched launch gets the same stochastic-rounding dither
+        // seed it would have gotten from n_tokens sequential per-token
+        // launches. The kernel indexes these as `frame + t` (t = 0..n-1).
+        let mut fr = GDN_REQUANT_FRAME.fetch_add(n_tokens as u32, std::sync::atomic::Ordering::Relaxed) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -1425,11 +1429,6 @@ impl Gpu {
 
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8_batch_seq", bytes);
-        // Single launch — the kernel loops over n_tokens internally,
-        // keeping state in F32 LDS across all tokens. Q8 quantization
-        // happens once at the end instead of per-token, reducing noise
-        // accumulation. Not byte-exact with N×1 decode calls but
-        // strictly higher quality.
         let result = self.launch_maybe_blob(
             "gated_delta_net_q8",
             [n_heads as u32, n_tiles, 1],
