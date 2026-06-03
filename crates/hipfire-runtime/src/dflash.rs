@@ -634,7 +634,7 @@ fn gemm_dispatch(
     if dump { gpu.hip.device_synchronize()?; }
     let t0 = if dump { Some(std::time::Instant::now()) } else { None };
     let result = match w.gpu_dtype {
-        DType::F32 => gpu.gemm_f32_batched(x, &w.buf, y, batch, w.k, w.m),
+        DType::F32 => gpu.gemm_f32_batched(&w.buf, x, y, w.m, w.k, batch),
         DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {

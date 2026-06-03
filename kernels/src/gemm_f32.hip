@@ -28,5 +28,5 @@ __global__ void gemm_f32_batched(
         sum += __shfl_down(sum, offset);
 
     if (tid == 0)
-        Y[(size_t)m * N + n] = sum;
+        Y[(size_t)n * M + m] = sum;
 }
