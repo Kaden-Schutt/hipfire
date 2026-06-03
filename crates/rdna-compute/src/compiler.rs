@@ -294,6 +294,16 @@ impl KernelCompiler {
                 stored.trim() == src_hash
             };
             if !pre_valid {
+                // ADVISORY (#31 item 2): this writeback is NOT atomic across
+                // processes. The `.hsaco` blob (fs::copy) and its `.hash`
+                // sidecar (fs::write) are two separate ops with no inter-process
+                // lock, so a second daemon racing the same cold kernel could
+                // briefly observe a blob/hash pair that disagree. The window is
+                // narrow (two daemons must race the same first-compile) and the
+                // failure mode is self-healing (next run sees pre_valid=false and
+                // rewrites), so this is documented rather than guarded; a real
+                // fix would write to temp paths + atomic rename, or hold a
+                // dir-level lockfile across both writes.
                 let pre_hsaco = dir.join(format!("{name}.hsaco"));
                 let _ = std::fs::copy(&obj_path, &pre_hsaco);
                 let _ = std::fs::write(&pre_hash, &src_hash);
