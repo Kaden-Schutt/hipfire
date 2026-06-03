@@ -6540,193 +6540,197 @@ impl PrefillBatchScratch {
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
 
+        // hunt3 H-E residual: this struct literal allocates ~40 GpuTensors via
+        // `?` early-returns. PrefillBatchScratch has no Drop impl (GpuTensor
+        // carries no Gpu handle; free_tensor needs &mut Gpu), so a `?` failure
+        // partway through would drop the already-allocated tensors WITHOUT
+        // freeing them on the device — the exact intra-`new` leak the
+        // cross-band H-E recovery can't reach. OOM during new() is precisely
+        // when a mid-literal failure is most likely. Fix: route every alloc
+        // through a ledger and, on the first error, free everything allocated
+        // so far before propagating. `alloc!` records mandatory tensors;
+        // `alloc_opt!` records the inner tensor of an `if cond { Some(..) }`.
+        //
+        // The ledger stores non-owning aliases (DeviceBuffer has no Drop and
+        // GpuTensor is not Clone), so on success the aliases drop as no-ops and
+        // the real tensors live on in the struct (no double-free); on error we
+        // free each alias once, which releases the same pool buffer the
+        // partially-built (and about-to-be-dropped, never-freed) field held.
+        let mut ledger: Vec<GpuTensor> = Vec::with_capacity(48);
+        macro_rules! alloc {
+            ($shape:expr, $dt:expr) => {
+                match gpu.alloc_tensor($shape, $dt) {
+                    Ok(t) => {
+                        // SAFETY: alias lives only inside `new`; if used it is
+                        // freed in the error arm below (the original field is
+                        // dropped without freeing, no Drop on GpuTensor), and
+                        // on success it is dropped untouched (no Drop on
+                        // DeviceBuffer) while the original is moved into Self.
+                        ledger.push(GpuTensor {
+                            buf: unsafe { t.buf.alias() },
+                            shape: t.shape.clone(),
+                            dtype: t.dtype,
+                        });
+                        t
+                    }
+                    Err(e) => {
+                        for prev in ledger.drain(..) {
+                            let _ = gpu.free_tensor(prev);
+                        }
+                        return Err(e);
+                    }
+                }
+            };
+        }
+        macro_rules! alloc_opt {
+            ($cond:expr, $shape:expr, $dt:expr) => {
+                if $cond {
+                    Some(alloc!($shape, $dt))
+                } else {
+                    None
+                }
+            };
+        }
+
+        // Hoisted grouped-GEMM sizing (same value across the Path-2 fields).
+        let grouped_m_total_max =
+            moe_grouped_m_total_max(max_batch, config.num_experts_per_tok, config.num_experts);
+        let grouped_total_slots_max = max_batch * config.num_experts_per_tok;
+
         Ok(Self {
             max_batch,
-            x_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
-            x_rot_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
-            x_norm_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
-            dn_qkv_batch: gpu.alloc_tensor(&[max_batch * qkv_dim], DType::F32)?,
-            dn_z_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
-            dn_alpha_batch: gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
-            dn_beta_batch: gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
-            dn_q_raw_batch: gpu.alloc_tensor(&[max_batch * k_dim], DType::F32)?,
-            dn_k_raw_batch: gpu.alloc_tensor(&[max_batch * k_dim], DType::F32)?,
-            dn_v_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
-            dn_q_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
-            dn_k_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
-            dn_attn_out_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
-            dn_normed_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
-            gate_ffn_batch: gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
-            up_batch: gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
-            ffn_hidden_batch: gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
-            dn_normed_rot_batch: gpu.alloc_tensor(&[max_batch * v_dim], DType::F32)?,
+            x_batch: alloc!(&[max_batch * dim], DType::F32),
+            x_rot_batch: alloc!(&[max_batch * dim], DType::F32),
+            x_norm_batch: alloc!(&[max_batch * dim], DType::F32),
+            dn_qkv_batch: alloc!(&[max_batch * qkv_dim], DType::F32),
+            dn_z_batch: alloc!(&[max_batch * v_dim], DType::F32),
+            dn_alpha_batch: alloc!(&[max_batch * n_v_heads], DType::F32),
+            dn_beta_batch: alloc!(&[max_batch * n_v_heads], DType::F32),
+            dn_q_raw_batch: alloc!(&[max_batch * k_dim], DType::F32),
+            dn_k_raw_batch: alloc!(&[max_batch * k_dim], DType::F32),
+            dn_v_batch: alloc!(&[max_batch * v_dim], DType::F32),
+            dn_q_batch: alloc!(&[max_batch * v_dim], DType::F32),
+            dn_k_batch: alloc!(&[max_batch * v_dim], DType::F32),
+            dn_attn_out_batch: alloc!(&[max_batch * v_dim], DType::F32),
+            dn_normed_batch: alloc!(&[max_batch * v_dim], DType::F32),
+            gate_ffn_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
+            up_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
+            ffn_hidden_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
+            dn_normed_rot_batch: alloc!(&[max_batch * v_dim], DType::F32),
             // F32 dtype = 4 bytes/element, same layout as i32. The rope /
             // attention / kv_write kernels cast the pointer to `const int*`,
             // so dtype is cosmetic. Upload i32 bits via memcpy_htod.
-            positions: gpu.alloc_tensor(&[max_batch], DType::F32)?,
-            tokens: gpu.alloc_tensor(&[max_batch], DType::F32)?,
-            fa_q_full_batch: gpu.alloc_tensor(&[max_batch * q_dim * 2], DType::F32)?,
-            fa_q_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
-            fa_gate_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
-            fa_k_batch: gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
-            fa_v_batch: gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
-            fa_attn_out_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
-            fa_attn_out_rot_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
-            moe_router_logits_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts], DType::F32)?)
-            } else {
-                None
-            },
-            moe_shared_scalar_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch], DType::F32)?)
-            } else {
-                None
-            },
-            moe_shared_gate_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(
-                    &[max_batch * config.shared_expert_intermediate_size],
-                    DType::F32,
-                )?)
-            } else {
-                None
-            },
-            moe_shared_up_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(
-                    &[max_batch * config.shared_expert_intermediate_size],
-                    DType::F32,
-                )?)
-            } else {
-                None
-            },
-            moe_shared_rot_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(
-                    &[max_batch * config.shared_expert_intermediate_size],
-                    DType::F32,
-                )?)
-            } else {
-                None
-            },
-            moe_topk_indices_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok], DType::F32)?)
-            } else {
-                None
-            },
-            moe_topk_weights_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok], DType::F32)?)
-            } else {
-                None
-            },
-            moe_gate_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(
-                    &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
-                    DType::F32,
-                )?)
-            } else {
-                None
-            },
-            moe_up_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(
-                    &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
-                    DType::F32,
-                )?)
-            } else {
-                None
-            },
-            moe_rot_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(
-                    &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
-                    DType::F32,
-                )?)
-            } else {
-                None
-            },
-            moe_down_expanded_batch: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(
-                    &[max_batch * config.num_experts_per_tok * config.dim],
-                    DType::F32,
-                )?)
-            } else {
-                None
-            },
+            positions: alloc!(&[max_batch], DType::F32),
+            tokens: alloc!(&[max_batch], DType::F32),
+            fa_q_full_batch: alloc!(&[max_batch * q_dim * 2], DType::F32),
+            fa_q_batch: alloc!(&[max_batch * q_dim], DType::F32),
+            fa_gate_batch: alloc!(&[max_batch * q_dim], DType::F32),
+            fa_k_batch: alloc!(&[max_batch * kv_dim], DType::F32),
+            fa_v_batch: alloc!(&[max_batch * kv_dim], DType::F32),
+            fa_attn_out_batch: alloc!(&[max_batch * q_dim], DType::F32),
+            fa_attn_out_rot_batch: alloc!(&[max_batch * q_dim], DType::F32),
+            moe_router_logits_batch: alloc_opt!(
+                config.num_experts > 0,
+                &[max_batch * config.num_experts],
+                DType::F32
+            ),
+            moe_shared_scalar_batch: alloc_opt!(config.num_experts > 0, &[max_batch], DType::F32),
+            moe_shared_gate_batch: alloc_opt!(
+                config.num_experts > 0,
+                &[max_batch * config.shared_expert_intermediate_size],
+                DType::F32
+            ),
+            moe_shared_up_batch: alloc_opt!(
+                config.num_experts > 0,
+                &[max_batch * config.shared_expert_intermediate_size],
+                DType::F32
+            ),
+            moe_shared_rot_batch: alloc_opt!(
+                config.num_experts > 0,
+                &[max_batch * config.shared_expert_intermediate_size],
+                DType::F32
+            ),
+            moe_topk_indices_batch: alloc_opt!(
+                config.num_experts > 0,
+                &[max_batch * config.num_experts_per_tok],
+                DType::F32
+            ),
+            moe_topk_weights_batch: alloc_opt!(
+                config.num_experts > 0,
+                &[max_batch * config.num_experts_per_tok],
+                DType::F32
+            ),
+            moe_gate_batch: alloc_opt!(
+                config.num_experts > 0,
+                &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
+                DType::F32
+            ),
+            moe_up_batch: alloc_opt!(
+                config.num_experts > 0,
+                &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
+                DType::F32
+            ),
+            moe_rot_batch: alloc_opt!(
+                config.num_experts > 0,
+                &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
+                DType::F32
+            ),
+            moe_down_expanded_batch: alloc_opt!(
+                config.num_experts > 0,
+                &[max_batch * config.num_experts_per_tok * config.dim],
+                DType::F32
+            ),
             // Path 2 scatter + grouped-WMMA-GEMM scratch (gated at runtime by
             // HIPFIRE_MOE_GROUPED_GEMM=1). m_total_max = N*K_TOP + E*(BLOCK_M-1).
             // i32 buffers stored as Raw (4 bytes/elem matches; no DType::I32 yet).
-            moe_expert_token_counts: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[config.num_experts * 4], DType::Raw)?)
-            } else {
-                None
-            },
-            moe_expert_offsets: if config.num_experts > 0 {
-                Some(gpu.alloc_tensor(&[(config.num_experts + 1) * 4], DType::Raw)?)
-            } else {
-                None
-            },
-            moe_sorted_slot_index: if config.num_experts > 0 {
-                let m_total_max = moe_grouped_m_total_max(
-                    max_batch,
-                    config.num_experts_per_tok,
-                    config.num_experts,
-                );
-                Some(gpu.alloc_tensor(&[m_total_max * 4], DType::Raw)?)
-            } else {
-                None
-            },
-            moe_inverse_perm: if config.num_experts > 0 {
-                let total_slots_max = max_batch * config.num_experts_per_tok;
-                Some(gpu.alloc_tensor(&[total_slots_max * 4], DType::Raw)?)
-            } else {
-                None
-            },
-            moe_expert_tile_ids: if config.num_experts > 0 {
-                let m_total_max = moe_grouped_m_total_max(
-                    max_batch,
-                    config.num_experts_per_tok,
-                    config.num_experts,
-                );
-                Some(gpu.alloc_tensor(&[(m_total_max / MOE_GROUPED_BLOCK_M) * 4], DType::Raw)?)
-            } else {
-                None
-            },
-            moe_y_gate_up_grouped: if config.num_experts > 0 {
-                let m_total_max = moe_grouped_m_total_max(
-                    max_batch,
-                    config.num_experts_per_tok,
-                    config.num_experts,
-                );
-                Some(gpu.alloc_tensor(
-                    &[m_total_max * 2 * config.moe_intermediate_size],
-                    DType::F32,
-                )?)
-            } else {
-                None
-            },
-            moe_y_down_grouped: if config.num_experts > 0 {
-                let m_total_max = moe_grouped_m_total_max(
-                    max_batch,
-                    config.num_experts_per_tok,
-                    config.num_experts,
-                );
-                Some(gpu.alloc_tensor(&[m_total_max * config.dim], DType::F32)?)
-            } else {
-                None
-            },
-            dn_s_tape_q8: if config.linear_num_value_heads > 0 {
-                let bytes = max_batch
+            moe_expert_token_counts: alloc_opt!(
+                config.num_experts > 0,
+                &[config.num_experts * 4],
+                DType::Raw
+            ),
+            moe_expert_offsets: alloc_opt!(
+                config.num_experts > 0,
+                &[(config.num_experts + 1) * 4],
+                DType::Raw
+            ),
+            moe_sorted_slot_index: alloc_opt!(
+                config.num_experts > 0,
+                &[grouped_m_total_max * 4],
+                DType::Raw
+            ),
+            moe_inverse_perm: alloc_opt!(
+                config.num_experts > 0,
+                &[grouped_total_slots_max * 4],
+                DType::Raw
+            ),
+            moe_expert_tile_ids: alloc_opt!(
+                config.num_experts > 0,
+                &[(grouped_m_total_max / MOE_GROUPED_BLOCK_M) * 4],
+                DType::Raw
+            ),
+            moe_y_gate_up_grouped: alloc_opt!(
+                config.num_experts > 0,
+                &[grouped_m_total_max * 2 * config.moe_intermediate_size],
+                DType::F32
+            ),
+            moe_y_down_grouped: alloc_opt!(
+                config.num_experts > 0,
+                &[grouped_m_total_max * config.dim],
+                DType::F32
+            ),
+            dn_s_tape_q8: alloc_opt!(
+                config.linear_num_value_heads > 0,
+                &[max_batch
                     * config.linear_num_value_heads
                     * config.linear_value_head_dim
-                    * config.linear_value_head_dim;
-                Some(gpu.alloc_tensor(&[bytes], DType::Raw)?)
-            } else {
-                None
-            },
-            dn_s_tape_scales: if config.linear_num_value_heads > 0 {
-                Some(gpu.alloc_tensor(
-                    &[max_batch * config.linear_num_value_heads * config.linear_value_head_dim],
-                    DType::F32,
-                )?)
-            } else {
-                None
-            },
+                    * config.linear_value_head_dim],
+                DType::Raw
+            ),
+            dn_s_tape_scales: alloc_opt!(
+                config.linear_num_value_heads > 0,
+                &[max_batch * config.linear_num_value_heads * config.linear_value_head_dim],
+                DType::F32
+            ),
         })
     }
 
@@ -16244,9 +16248,31 @@ pub fn forward_prefill_batch_multi(
     // own_pbs pattern). Future opt: cache on Qwen35ScratchSet.
     let mut pbs_per_band: Vec<PrefillBatchScratch> = Vec::with_capacity(n_bands);
     for b in 0..n_bands {
-        let g = &mut gpus.devices[b];
-        g.bind_thread()?;
-        pbs_per_band.push(PrefillBatchScratch::new(g, config, max_batch)?);
+        // hunt3 H-E: PrefillBatchScratch has no Drop impl, so a mid-loop OOM
+        // here would silently leak every already-allocated band's ~40 GpuTensors
+        // (incl. tens-of-MB MoE grouped-GEMM scratch). On the first failing
+        // PrefillBatchScratch::new, free the bands pushed so far on their own
+        // devices before propagating the error. Mirrors the single-GPU own_pbs
+        // cleanup pattern (allocation failure must not leak prior allocations).
+        // The intra-`new` partial-literal leak (a `?` failing partway through
+        // the struct literal) is handled inside PrefillBatchScratch::new itself
+        // via its alloc ledger, so the failing band's own allocations are also
+        // freed before its error reaches here.
+        let alloc = {
+            let g = &mut gpus.devices[b];
+            g.bind_thread().and_then(|()| PrefillBatchScratch::new(g, config, max_batch))
+        };
+        match alloc {
+            Ok(pbs) => pbs_per_band.push(pbs),
+            Err(e) => {
+                for (prev_b, prev_pbs) in pbs_per_band.into_iter().enumerate() {
+                    let pg = &mut gpus.devices[prev_b];
+                    let _ = pg.bind_thread();
+                    prev_pbs.free_gpu(pg);
+                }
+                return Err(e);
+            }
+        }
     }
 
     let dim = config.dim;
