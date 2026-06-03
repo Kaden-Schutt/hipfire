@@ -5727,9 +5727,69 @@ pub fn apply_eviction_retain_to_draft(
     Ok(())
 }
 
+/// Compact the CPU-side `target_hidden_host` shadow after a TriAttention/CASK
+/// eviction so it stays in lockstep with the GPU-resident `target_hidden`
+/// (which [`apply_eviction_retain_to_draft`] compacts to `retain_mask.len()`
+/// rows). Applies the identical `retain_mask` scatter — each row is `ne * h`
+/// floats wide — restoring the invariant `target_hidden_host.len() ==
+/// position * ne * h` that every DDTree `spec_step_*` function asserts
+/// unconditionally. Without this, the next DDTree cycle after an eviction
+/// panics ("target_hidden_host size mismatches position", #272).
+///
+/// No-op for the CASK m-fold path where `retain_mask` is empty, matching
+/// `apply_eviction_retain_to_draft`'s early return so the two helpers can be
+/// called as a pair at every eviction site.
+pub fn compact_target_hidden_host(
+    target_hidden_host: &mut Vec<f32>,
+    retain_mask: &[u32],
+    ne: usize,
+    h: usize,
+) {
+    if retain_mask.is_empty() {
+        return;
+    }
+    let row_floats = ne * h;
+    let mut compacted = Vec::with_capacity(retain_mask.len() * row_floats);
+    for &src_idx in retain_mask {
+        let start = src_idx as usize * row_floats;
+        compacted.extend_from_slice(&target_hidden_host[start..start + row_floats]);
+    }
+    *target_hidden_host = compacted;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #272: the CPU shadow compaction must mirror the GPU-side
+    // `apply_eviction_retain_to_draft` scatter exactly — keep the
+    // `retain_mask` rows (each `ne * h` floats), restoring the invariant
+    // `target_hidden_host.len() == position * ne * h` that the DDTree
+    // `spec_step_*` functions assert. GPU-free, so it runs in plain `cargo test`.
+    #[test]
+    fn compact_target_hidden_host_keeps_selected_rows() {
+        let (ne, h) = (1usize, 2usize); // row stride = 2 floats
+        let mut thh = vec![
+            0.0, 1.0, // row 0
+            2.0, 3.0, // row 1
+            4.0, 5.0, // row 2
+            6.0, 7.0, // row 3
+        ];
+        // Evict row 1; keep 0, 2, 3 (as a retain_mask would after eviction).
+        compact_target_hidden_host(&mut thh, &[0, 2, 3], ne, h);
+        assert_eq!(thh, vec![0.0, 1.0, 4.0, 5.0, 6.0, 7.0]);
+        // The exact invariant the spec_step asserts check (position now 3).
+        assert_eq!(thh.len(), 3 * ne * h);
+    }
+
+    #[test]
+    fn compact_target_hidden_host_empty_mask_is_noop() {
+        // CASK m-fold path: empty retain_mask leaves the vec untouched,
+        // matching apply_eviction_retain_to_draft's early return.
+        let mut thh = vec![1.0, 2.0, 3.0, 4.0];
+        compact_target_hidden_host(&mut thh, &[], 2, 1);
+        assert_eq!(thh, vec![1.0, 2.0, 3.0, 4.0]);
+    }
 
     #[test]
     fn dflash_gdn_tape_replay_uses_actual_verify_eligibility() {

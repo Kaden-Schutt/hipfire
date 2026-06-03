@@ -5687,6 +5687,14 @@ fn generate_dflash(
                     df.draft_config.hidden,
                     pre_phys,
                 );
+                // Keep the CPU shadow in lockstep with the GPU compaction so the
+                // DDTree spec_step asserts hold post-eviction (#272).
+                speculative::compact_target_hidden_host(
+                    &mut df.target_hidden_host,
+                    &res.retain_mask,
+                    df.draft_config.num_extract(),
+                    df.draft_config.hidden,
+                );
             }
         }
     }
@@ -6041,6 +6049,14 @@ fn generate_dflash(
                         df.draft_config.num_extract(),
                         df.draft_config.hidden,
                         pre_phys,
+                    );
+                    // Keep the CPU shadow in lockstep with the GPU compaction so
+                    // the DDTree spec_step asserts hold post-eviction (#272).
+                    speculative::compact_target_hidden_host(
+                        &mut df.target_hidden_host,
+                        &res.retain_mask,
+                        df.draft_config.num_extract(),
+                        df.draft_config.hidden,
                     );
                 }
             }
