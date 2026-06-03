@@ -147,6 +147,7 @@ fn gemv_auto(
 /// At batch_size == 1 each path reduces to the equivalent of one
 /// sequential gemv_auto call against the same weight; per-row outputs
 /// match within FMA-order ε.
+#[allow(dead_code, clippy::too_many_arguments)]
 fn gemv_auto_batched(
     gpu: &mut Gpu,
     weight: &GpuTensor,
@@ -155,19 +156,19 @@ fn gemv_auto_batched(
     y: &GpuTensor,
     m: usize,
     k: usize,
-    _batch_size: usize,
+    batch_size: usize,
 ) -> Result<(), String> {
-    use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::gemv::{GemvFamily, WeightRef};
-    use std::sync::OnceLock;
-
-    static GEMV: OnceLock<GemvFamily> = OnceLock::new();
-    let gemv = GEMV.get_or_init(|| GemvFamily::new());
-    let ctx = DispatchCtx::new(gpu);
-    let x = if weight_needs_fwht(weight) { x_rotated_batch } else { x_plain_batch };
-    let wr = WeightRef { buf: weight, dtype: weight.dtype, m, k, row_stride: 0, rotation: None, awq_scale: None };
-    gemv.run_auto(&ctx, gpu, &wr, x, y)
-        .map_err(|e| format!("gemv batched dispatch: {e}"))
+    gemv_auto_batched_wmma(
+        gpu,
+        weight,
+        x_rotated_batch,
+        x_plain_batch,
+        y,
+        m,
+        k,
+        batch_size,
+        /*x_f16_scratch=*/ None,
+    )
 }
 
 /// `gemv_auto_batched` plus an opt-in WMMA path. When `x_f16_scratch`
@@ -201,9 +202,83 @@ fn gemv_auto_batched_wmma(
     m: usize,
     k: usize,
     batch_size: usize,
-    _x_f16_scratch: Option<&GpuTensor>,
+    x_f16_scratch: Option<&GpuTensor>,
 ) -> Result<(), String> {
-    gemv_auto_batched(gpu, weight, x_rotated_batch, x_plain_batch, y, m, k, batch_size)
+    match weight.dtype {
+        DType::F32 => {
+            if std::env::var("HIPFIRE_DEEPSEEK4_F32_TRACE").is_ok() {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let c = N.fetch_add(1, Ordering::Relaxed);
+                if c < 8 {
+                    eprintln!(
+                        "[F32_TRACE #{c}] m={m} k={k} B={batch_size} weight.shape={:?}",
+                        weight.shape
+                    );
+                }
+            }
+            gpu.gemm_f32_register_tiled(weight, x_plain_batch, y, m, k, batch_size)
+                .map_err(|e| format!("gemm_f32_register_tiled: {e:?}"))
+        }
+        DType::Q8_0 => {
+            let wmma_on = std::env::var("HIPFIRE_DEEPSEEK4_Q8_WMMA")
+                .map(|s| s != "0")
+                .unwrap_or(true);
+            if wmma_on && gpu.arch_caps.is_rdna4() {
+                if let Some(scratch) = x_f16_scratch {
+                    let n = (batch_size * k) as i64;
+                    gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
+                        .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
+                    let opt_out = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W")
+                        .as_deref() == Ok("0");
+                    let use_4w = !opt_out
+                        && batch_size >= 256
+                        && m >= 4096
+                        && m % 64 == 0
+                        && k % 32 == 0
+                        && batch_size % 64 == 0;
+                    if use_4w {
+                        return gpu
+                            .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
+                            .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
+                    }
+                    return gpu
+                        .gemm_q8_0_wmma(weight, scratch, y, m, k, batch_size)
+                        .map_err(|e| format!("gemm_q8_0_wmma: {e:?}"));
+                }
+            }
+            gpu.gemm_q8_0_batched_chunked(weight, x_plain_batch, y, m, k, batch_size)
+                .map_err(|e| format!("gemm_q8_0_batched_chunked: {e:?}"))
+        }
+        DType::F16 => {
+            if let Some(scratch) = x_f16_scratch {
+                let n = (batch_size * k) as i64;
+                gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
+                    .map_err(|e| format!("convert_f32_to_f16 (F16 weight): {e:?}"))?;
+                gpu.gemm_f16_x_f16_wmma(weight, scratch, y, m, k, batch_size)
+                    .map_err(|e| format!("gemm_f16_x_f16_wmma: {e:?}"))
+            } else {
+                Err("F16 weight requires WMMA path with x_f16_scratch".to_string())
+            }
+        }
+        _ => {
+            let wmma_on = std::env::var("HIPFIRE_DEEPSEEK4_HFQ4_WMMA")
+                .map(|s| s != "0")
+                .unwrap_or(true);
+            if wmma_on {
+                if let Some(scratch) = x_f16_scratch {
+                    let n = (batch_size * k) as i64;
+                    gpu.deepseek4_convert_f32_to_f16(x_rotated_batch, scratch, n)
+                        .map_err(|e| format!("convert_f32_to_f16 (HFQ4 WMMA): {e:?}"))?;
+                    return gpu
+                        .gemm_hfq4g256_wmma(weight, scratch, y, m, k, batch_size)
+                        .map_err(|e| format!("gemm_hfq4g256_wmma: {e:?}"));
+                }
+            }
+            gpu.gemm_hfq4g256(weight, x_rotated_batch, y, m, k, batch_size)
+                .map_err(|e| format!("gemm_hfq4g256: {e:?}"))
+        }
+    }
 }
 
 /// DeepSeek V4 Compressor decode step (phase 3b scaffold — not yet wired).
