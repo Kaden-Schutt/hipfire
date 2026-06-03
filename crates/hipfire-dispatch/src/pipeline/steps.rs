@@ -78,11 +78,13 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
     match step.op {
         PipelineOp::Gemv => {
             let gemv = GEMV.get_or_init(GemvFamily::new);
+            // INVARIANT: a Gemv step always carries exactly 1 weight + 1 output
+            // (model-constructed; a malformed slice is an internal-invariant bug).
             gemv.run_auto(ctx, gpu, step.weights[0], step.input, step.outputs[0])
         }
         _ => Err(DispatchError::UnsupportedVariant {
-            family: "execute_steps",
-            variant: "op-not-in-phase1",
+            family: "pipeline",
+            variant: "unimplemented-op",
             arch: "",
             quant: "",
         }),
