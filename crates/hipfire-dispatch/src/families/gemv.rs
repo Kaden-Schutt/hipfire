@@ -11,7 +11,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
 use crate::families::rotation::{RotationFamily, RotationParams};
-use crate::pipeline::{PipelineParams, dispatch_fused};
+use crate::pipeline::{LinearParams, PipelineParams, dispatch_fused};
 use crate::tables::gemv_table;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
@@ -271,10 +271,10 @@ impl GemvFamily {
                 if params.w.dtype == DType::MFP4G32
                     && self.registry.resolve(KernelKey::GemvMfp4G32Fused, ctx, None).is_ok()
                 {
-                    let pipe_params = PipelineParams {
+                    let pipe_params = PipelineParams::Linear(LinearParams {
                         x: params.x, y: params.y, buf: params.w.buf,
                         m: params.w.m, k: params.w.k,
-                    };
+                    });
                     return dispatch_fused(gpu, KernelKey::GemvMfp4G32Fused, &pipe_params);
                 }
                 let key = self.resolve(params.w.dtype, params.variant, false, ctx, Some(&shape))?.key;

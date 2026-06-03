@@ -17,12 +17,17 @@ impl Pipeline {
     }
 }
 
-pub struct PipelineParams<'a> {
+pub struct LinearParams<'a> {
     pub x: &'a GpuTensor,
     pub y: &'a GpuTensor,
     pub buf: &'a GpuTensor,
     pub m: usize,
     pub k: usize,
+}
+
+pub enum PipelineParams<'a> {
+    Linear(LinearParams<'a>),
+    // Moe(MoeParams<'a>) added in Task 4
 }
 
 pub fn execute_pipeline(
@@ -33,6 +38,9 @@ pub fn execute_pipeline(
     dtype: rdna_compute::DType,
     registry: &KernelRegistry,
 ) -> Result<(), DispatchError> {
+    let params = match params {
+        PipelineParams::Linear(p) => p,
+    };
     if let Some(key) = find_fused(registry, ctx, dtype, steps) {
         return dispatch_fused(gpu, key, params);
     }
@@ -102,6 +110,9 @@ pub fn dispatch_fused(
     key: KernelKey,
     params: &PipelineParams,
 ) -> Result<(), DispatchError> {
+    let params = match params {
+        PipelineParams::Linear(p) => p,
+    };
     macro_rules! hip {
         ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
     }
