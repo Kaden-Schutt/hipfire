@@ -27,7 +27,7 @@ pub struct LinearParams<'a> {
 
 pub enum PipelineParams<'a> {
     Linear(LinearParams<'a>),
-    // Moe(MoeParams<'a>) added in Task 4
+    Moe(crate::families::moe::MoeParams<'a>),
 }
 
 pub fn execute_pipeline(
@@ -38,11 +38,17 @@ pub fn execute_pipeline(
     dtype: rdna_compute::DType,
     registry: &KernelRegistry,
 ) -> Result<(), DispatchError> {
+    if let PipelineParams::Moe(_) = params {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "pipeline", variant: "moe-not-wired", arch: "", quant: "",
+        });
+    }
     if let Some(key) = find_fused(registry, ctx, dtype, steps) {
         return dispatch_fused(gpu, key, params);
     }
     let params = match params {
         PipelineParams::Linear(p) => p,
+        PipelineParams::Moe(_) => unreachable!(),
     };
     for &step in steps {
         match step {
@@ -111,6 +117,9 @@ pub fn dispatch_fused(
 ) -> Result<(), DispatchError> {
     let params = match params {
         PipelineParams::Linear(p) => p,
+        PipelineParams::Moe(_) => return Err(DispatchError::UnsupportedVariant {
+            family: "pipeline", variant: "moe-not-wired", arch: "", quant: "",
+        }),
     };
     macro_rules! hip {
         ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };

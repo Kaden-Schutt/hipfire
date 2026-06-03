@@ -588,6 +588,20 @@ fn moe_res_mq6_routed_indexable() {
 }
 
 #[test]
+fn moe_decode_oplist_prefix_matches_gate_side() {
+    // The 4-way fused gate-side projection is capturable as a length-1 prefix.
+    let oplist = [
+        PipelineOp::MoeGateSideProj, PipelineOp::Softmax, PipelineOp::TopKRenorm,
+        PipelineOp::SharedExpertDown, PipelineOp::IndexedGateUp,
+        PipelineOp::SiluMulRotate, PipelineOp::IndexedDownExpanded, PipelineOp::MoeCombine,
+    ];
+    let fused = Pipeline::new(&[PipelineOp::MoeGateSideProj]);
+    assert!(fused.can_satisfy(&oplist));
+    let too_long = Pipeline::new(&[PipelineOp::MoeGateSideProj, PipelineOp::TopKRenorm]);
+    assert!(!too_long.can_satisfy(&oplist)); // second op mismatches Softmax
+}
+
+#[test]
 fn moe_res_paro_needs_sidecar() {
     let mut d = dtypes_all_mq4();
     d.routed_gate_up = DType::ParoQ4G128;

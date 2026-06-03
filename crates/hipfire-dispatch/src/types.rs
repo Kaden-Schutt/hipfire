@@ -14,6 +14,16 @@ pub enum PipelineOp {
     ResidualAdd,
     CopyD2D,
     GivensRotate,
+    // MoE decode ops (Phase 1). TopKRenorm / MoeCombine fused impls are
+    // k=8-only today; the variant names are k-agnostic so a future k=6
+    // kernel family can reuse them.
+    MoeGateSideProj,
+    Softmax,
+    TopKRenorm,
+    SharedExpertDown,
+    IndexedGateUp,
+    IndexedDownExpanded,
+    MoeCombine,
 }
 
 // ── Variant enums ─────────────────────────────────────

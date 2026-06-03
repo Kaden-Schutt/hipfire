@@ -18,7 +18,7 @@ use rdna_compute::DType;
 use rdna_compute::GpuTensor;
 
 use crate::context::DispatchCtx;
-use crate::families::gemv::WeightRef;
+use crate::families::gemv::{GivensRef, WeightRef};
 use crate::tables::moe_table;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
@@ -103,11 +103,50 @@ impl MoeResolution {
 
 // ── Dispatch parameters ────────────────────────────────
 
+/// Everything the MoE decode executor arm reads, marshaled by the model from
+/// its weight/config/scratch structs.
 pub struct MoeParams<'a> {
-    pub variant: MoeVariant,
-    pub weights: &'a [&'a WeightRef<'a>],
-    pub x: &'a GpuTensor,
-    pub y: &'a [&'a GpuTensor],
+    pub res: MoeResolution,
+    // dims / config scalars
+    pub hidden: usize,
+    pub mi: usize,
+    pub smi: usize,
+    pub k: usize,
+    pub n_exp: usize,
+    pub norm_topk_prob: bool,
+    pub x_rot_prerotated: bool,
+    // activations / residual
+    pub x_norm: &'a GpuTensor,
+    pub x_residual: &'a GpuTensor,
+    // gate-side weights
+    pub router: WeightRef<'a>,
+    pub shared_expert_gate: WeightRef<'a>,
+    pub shared_gate_w: WeightRef<'a>,
+    pub shared_up_w: WeightRef<'a>,
+    pub shared_down_w: WeightRef<'a>,
+    // routed expert pointer tables + dims
+    pub expert_gate_up_ptrs: &'a GpuTensor,
+    pub expert_down_ptrs: &'a GpuTensor,
+    pub routed_gate_up_k: usize,
+    pub routed_down_m: usize,
+    pub routed_down_k: usize,
+    // paro sidecars
+    pub routed_gate_up_paro: Option<GivensRef<'a>>,
+    pub routed_down_paro: Option<GivensRef<'a>>,
+    // scratch buffers
+    pub router_logits: &'a GpuTensor,
+    pub scalar_buf: &'a GpuTensor,
+    pub x_rot_local: &'a GpuTensor,
+    pub gate_buf: &'a GpuTensor,
+    pub up_buf: &'a GpuTensor,
+    pub ffn_hidden: &'a GpuTensor,
+    pub ffn_out: &'a GpuTensor,
+    pub gate_batch: &'a GpuTensor,
+    pub up_batch: &'a GpuTensor,
+    pub rot_batch: &'a GpuTensor,
+    pub topk_indices: &'a GpuTensor,
+    pub topk_weights: &'a GpuTensor,
+    pub down_expanded: &'a GpuTensor,
 }
 
 // ── Family ─────────────────────────────────────────────
@@ -153,12 +192,10 @@ impl MoeFamily {
     /// This is a placeholder for when fused grouped-expert kernels land.
     pub fn run(
         &self,
-        ctx: &DispatchCtx,
+        _ctx: &DispatchCtx,
         _gpu: &mut rdna_compute::Gpu,
-        params: &MoeParams,
+        _params: &MoeParams,
     ) -> Result<(), DispatchError> {
-        let _key = self.resolve(params.variant, ctx, None)?.key;
-
         Err(DispatchError::UnsupportedVariant {
             family: "moe",
             variant: "all",
