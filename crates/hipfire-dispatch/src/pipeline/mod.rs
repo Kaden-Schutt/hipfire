@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use crate::context::DispatchCtx;
-use crate::families::gemv::GemvFamily;
+use crate::families::gemv::{GemvFamily, WeightRef};
 use crate::tables::KernelRegistry;
 use crate::types::*;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -81,10 +81,18 @@ pub fn execute_pipeline(
                 }).map_err(|e| DispatchError::Hip(e.to_string()))?;
             }
             PipelineOp::Gemv => {
-                return Err(DispatchError::UnsupportedVariant {
-                    family: "pipeline", variant: "gemv_in_pipeline",
-                    arch: "", quant: "",
-                });
+                static GEMV_PIPELINE: OnceLock<GemvFamily> = OnceLock::new();
+                let gemv = GEMV_PIPELINE.get_or_init(GemvFamily::new);
+                let w = WeightRef {
+                    buf: params.buf,
+                    dtype,
+                    m: params.m,
+                    k: params.k,
+                    row_stride: params.k,
+                    rotation: None,
+                    awq_scale: None,
+                };
+                gemv.run_auto(ctx, gpu, &w, params.x, params.y)?;
             }
             _ => {
                 return Err(DispatchError::UnsupportedVariant {

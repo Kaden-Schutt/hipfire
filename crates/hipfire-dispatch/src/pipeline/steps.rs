@@ -6,10 +6,10 @@ use rdna_compute::{Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
-use crate::families::gemv::{GemvFamily, GemvParams, WeightRef};
+use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::types::GemvVariant;
 use crate::families::rotation::{RotationFamily, RotationParams};
-use crate::types::{DispatchError, KernelKey, PipelineOp, RotationVariant};
+use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
 
 /// Rotation disposition of a Gemv's input. Borrows (never owns a RotatedActivation).
 pub enum GemvInput<'a> {
@@ -21,6 +21,15 @@ pub enum Step<'a> {
     Gemv {
         w: &'a WeightRef<'a>,
         input: GemvInput<'a>,
+        out: &'a GpuTensor,
+    },
+    /// GEMV with in-place residual add: `residual += W · input`.
+    /// For MQ-family, `input` must be pre-rotated (Prerotated variant) or the
+    /// Raw variant triggers FWHT rotation before calling the residual kernel.
+    GemvResidual {
+        w: &'a WeightRef<'a>,
+        input: GemvInput<'a>,
+        residual: &'a GpuTensor,
         out: &'a GpuTensor,
     },
     /// Fused rmsnorm + FWHT producer (mirrors rmsnorm_rotate_dispatch's MQ branch
@@ -40,6 +49,7 @@ pub enum Step<'a> {
 fn op_kind(step: &Step) -> PipelineOp {
     match step {
         Step::Gemv { .. } => PipelineOp::Gemv,
+        Step::GemvResidual { .. } => PipelineOp::GemvResidual,
         Step::RmsnormRotateMq { .. } => PipelineOp::RmsnormRotateMq,
     }
 }
@@ -98,6 +108,29 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 w, x: xr, y: out, variant: GemvVariant::Prerotated,
                 residual: None, gate: None, up: None,
             })
+        }
+        Step::GemvResidual { w, input: GemvInput::Prerotated(xr), residual, out: _ } => {
+            let gemv = GEMV.get_or_init(GemvFamily::new);
+            gemv.run(ctx, gpu, &GemvParams {
+                w, x: xr, y: residual, variant: GemvVariant::WithResidual,
+                residual: None, gate: None, up: None,
+            })
+        }
+        Step::GemvResidual { w, input: GemvInput::Raw(x), residual, out: _ } => {
+            let gemv = GEMV.get_or_init(GemvFamily::new);
+            if crate::types::dtype_rotation_plan(w.dtype) != RotationPlan::None {
+                let h = gemv.rotate(ctx, gpu, w, x, &RotateInputs::default())?;
+                let xr = h.into_buf();
+                gemv.run(ctx, gpu, &GemvParams {
+                    w, x: &xr, y: residual, variant: GemvVariant::WithResidual,
+                    residual: None, gate: None, up: None,
+                })
+            } else {
+                gemv.run(ctx, gpu, &GemvParams {
+                    w, x, y: residual, variant: GemvVariant::WithResidual,
+                    residual: None, gate: None, up: None,
+                })
+            }
         }
         Step::RmsnormRotateMq { x, norm_weight, x_plain, out, awq_scale, k, eps } => {
             let rotation = ROTATION.get_or_init(RotationFamily::new);

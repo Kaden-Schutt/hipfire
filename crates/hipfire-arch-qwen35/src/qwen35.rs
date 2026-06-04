@@ -12271,7 +12271,13 @@ fn run_fa_layer_body(
     }
 
     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
-    weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
+    {
+        let ctx = DispatchCtx::new(gpu);
+        let wr = layer.wo.dispatch_ref();
+        execute_steps(gpu, &ctx, &[Step::GemvResidual {
+            w: &wr, input: GemvInput::Raw(&s.fa_attn_out), residual: &s.x, out: &s.x,
+        }]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    }
 
     // FFN: fused rmsnorm + rotate for w_gate/w_up.
     let x_rot = fused_rmsnorm_rotate_for_mq(
@@ -12636,7 +12642,12 @@ fn forward_scratch_layers(
 
                 gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight,
                     &s.dn_normed, n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
-                hipfire_runtime::llama::weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+                {
+                    let wr = layer.wo.dispatch_ref();
+                    execute_steps(gpu, &ctx, &[Step::GemvResidual {
+                        w: &wr, input: GemvInput::Raw(&s.dn_normed), residual: &s.x, out: &s.x,
+                    }]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                }
 
                 // ── FFN ──
                 let x_rot = rmsnorm_rotate_dispatch(
@@ -12723,7 +12734,12 @@ fn forward_scratch_layers(
                 kv_cache_attention_dispatch(gpu, kv_cache, s, config, layer_idx, pos)?;
 
                 gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
-                hipfire_runtime::llama::weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
+                {
+                    let wr = layer.wo.dispatch_ref();
+                    execute_steps(gpu, &ctx, &[Step::GemvResidual {
+                        w: &wr, input: GemvInput::Raw(&s.fa_attn_out), residual: &s.x, out: &s.x,
+                    }]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                }
 
                 // ── FFN ──
                 let x_rot = rmsnorm_rotate_dispatch(
@@ -12868,7 +12884,12 @@ fn forward_scratch_layers(
 
                 gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight,
                     &s.dn_normed, n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
-                hipfire_runtime::llama::weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+                {
+                    let wr = layer.wo.dispatch_ref();
+                    execute_steps(gpu, &ctx, &[Step::GemvResidual {
+                        w: &wr, input: GemvInput::Raw(&s.dn_normed), residual: &s.x, out: &s.x,
+                    }]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                }
 
                 // ── MoE FFN ──
                 moe_ffn_dispatch(gpu, &layer.ffn, &s.x, &layer.ffn_norm, config, s)?;
@@ -12942,7 +12963,12 @@ fn forward_scratch_layers(
                 kv_cache_attention_dispatch(gpu, kv_cache, s, config, layer_idx, pos)?;
 
                 gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
-                hipfire_runtime::llama::weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
+                {
+                    let wr = layer.wo.dispatch_ref();
+                    execute_steps(gpu, &ctx, &[Step::GemvResidual {
+                        w: &wr, input: GemvInput::Raw(&s.fa_attn_out), residual: &s.x, out: &s.x,
+                    }]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                }
 
                 // ── MoE FFN ──
                 moe_ffn_dispatch(gpu, &layer.ffn, &s.x, &layer.ffn_norm, config, s)?;
@@ -13745,7 +13771,13 @@ fn forward_scratch_layers_multi(
                         config.linear_value_head_dim,
                         config.norm_eps,
                     )?;
-                    weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+                    {
+                        let ctx = DispatchCtx::new(gpu);
+                        let wr = layer.wo.dispatch_ref();
+                        execute_steps(gpu, &ctx, &[Step::GemvResidual {
+                            w: &wr, input: GemvInput::Raw(&s.dn_normed), residual: &s.x, out: &s.x,
+                        }]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                    }
 
                     let x_rot = fused_rmsnorm_rotate_for_mq(
                         gpu,
@@ -14166,7 +14198,13 @@ fn forward_scratch_layers_multi(
                     }
 
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
-                    weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
+                    {
+                        let ctx = DispatchCtx::new(gpu);
+                        let wr = layer.wo.dispatch_ref();
+                        execute_steps(gpu, &ctx, &[Step::GemvResidual {
+                            w: &wr, input: GemvInput::Raw(&s.fa_attn_out), residual: &s.x, out: &s.x,
+                        }]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                    }
 
                     let x_rot = fused_rmsnorm_rotate_for_mq(
                         gpu,
@@ -14383,7 +14421,13 @@ fn forward_scratch_layers_multi(
                         config.linear_value_head_dim,
                         config.norm_eps,
                     )?;
-                    weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+                    {
+                        let ctx = DispatchCtx::new(gpu);
+                        let wr = layer.wo.dispatch_ref();
+                        execute_steps(gpu, &ctx, &[Step::GemvResidual {
+                            w: &wr, input: GemvInput::Raw(&s.dn_normed), residual: &s.x, out: &s.x,
+                        }]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                    }
 
                     if ffn_all_mq4_for_moe(&layer.ffn) {
                         gpu.fused_rmsnorm_rotate_mq(
@@ -14761,7 +14805,13 @@ fn forward_scratch_layers_multi(
                     }
 
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
-                    weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
+                    {
+                        let ctx = DispatchCtx::new(gpu);
+                        let wr = layer.wo.dispatch_ref();
+                        execute_steps(gpu, &ctx, &[Step::GemvResidual {
+                            w: &wr, input: GemvInput::Raw(&s.fa_attn_out), residual: &s.x, out: &s.x,
+                        }]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                    }
 
                     if ffn_all_mq4_for_moe(&layer.ffn) {
                         gpu.fused_rmsnorm_rotate_mq(
