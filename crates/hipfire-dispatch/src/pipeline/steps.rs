@@ -60,16 +60,25 @@ fn op_kind(step: &Step) -> PipelineOp {
 pub struct FusedPattern {
     pub ops: &'static [PipelineOp],
     pub key: KernelKey,
+    /// Dtype/arch predicate called after op-kind prefix match. Must return true
+    /// for the entry to fire. Receives the full matched window (all ops.len()
+    /// steps starting at the current position).
+    pub guard: fn(&[Step], &DispatchCtx) -> bool,
 }
 
-/// Greedy longest-prefix op-pattern match. Op-pattern only (Phase 1/2a: empty table).
-pub fn match_prefix(table: &[FusedPattern], steps: &[Step]) -> Option<(KernelKey, usize)> {
+/// Greedy longest-prefix op-pattern match with dtype/arch guard.
+pub fn match_prefix(
+    table: &[FusedPattern],
+    steps: &[Step],
+    ctx: &DispatchCtx,
+) -> Option<(KernelKey, usize)> {
     table
         .iter()
         .filter(|p| {
             !p.ops.is_empty()
                 && p.ops.len() <= steps.len()
                 && p.ops.iter().zip(steps).all(|(o, s)| *o == op_kind(s))
+                && (p.guard)(&steps[..p.ops.len()], ctx)
         })
         .max_by_key(|p| p.ops.len())
         .map(|p| (p.key, p.ops.len()))
@@ -86,7 +95,7 @@ pub fn execute_steps(
 ) -> Result<(), DispatchError> {
     let mut i = 0;
     while i < steps.len() {
-        if let Some((key, len)) = match_prefix(FUSED_TABLE, &steps[i..]) {
+        if let Some((key, len)) = match_prefix(FUSED_TABLE, &steps[i..], ctx) {
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
         } else {

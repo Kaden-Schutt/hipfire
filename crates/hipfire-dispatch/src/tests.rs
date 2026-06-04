@@ -634,7 +634,7 @@ fn match_prefix_empty_table_never_fires() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
     let wr = dummy_wr(&dummy);
     let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
-    assert_eq!(match_prefix(&[], &steps), None);
+    assert_eq!(match_prefix(&[], &steps, &ctx_rdna3()), None);
 }
 
 #[test]
@@ -643,10 +643,10 @@ fn match_prefix_picks_longest() {
     let wr = dummy_wr(&dummy);
     let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
     let table = [
-        FusedPattern { ops: &[PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF32 },
-        FusedPattern { ops: &[PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF16 },
+        FusedPattern { ops: &[PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF32, guard: |_, _| true },
+        FusedPattern { ops: &[PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF16, guard: |_, _| true },
     ];
-    assert_eq!(match_prefix(&table, &steps), Some((KernelKey::GemvF16, 3)));
+    assert_eq!(match_prefix(&table, &steps, &ctx_rdna3()), Some((KernelKey::GemvF16, 3)));
 }
 
 #[test]
@@ -655,9 +655,9 @@ fn match_prefix_no_pattern_longer_than_steps() {
     let wr = dummy_wr(&dummy);
     let steps = [gemv_step(&dummy, &wr)];
     let table = [FusedPattern {
-        ops: &[PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF32,
+        ops: &[PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF32, guard: |_, _| true,
     }];
-    assert_eq!(match_prefix(&table, &steps), None);
+    assert_eq!(match_prefix(&table, &steps, &ctx_rdna3()), None);
 }
 
 #[test]
@@ -666,8 +666,35 @@ fn match_prefix_single_op_consumes_one() {
     let wr = dummy_wr(&dummy);
     let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
     let table = [FusedPattern {
-        ops: &[PipelineOp::Gemv], key: KernelKey::GemvF32,
+        ops: &[PipelineOp::Gemv], key: KernelKey::GemvF32, guard: |_, _| true,
     }];
     // a len-1 pattern matches the first step, consuming exactly 1
-    assert_eq!(match_prefix(&table, &steps), Some((KernelKey::GemvF32, 1)));
+    assert_eq!(match_prefix(&table, &steps, &ctx_rdna3()), Some((KernelKey::GemvF32, 1)));
+}
+
+#[test]
+fn match_prefix_guard_false_blocks_match() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = dummy_wr(&dummy);
+    let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
+    let table = [FusedPattern {
+        ops: &[PipelineOp::Gemv, PipelineOp::Gemv],
+        key: KernelKey::GemvF32,
+        guard: |_, _| false,  // always reject
+    }];
+    assert_eq!(match_prefix(&table, &steps, &ctx_rdna3()), None);
+}
+
+#[test]
+fn match_prefix_guard_receives_correct_window() {
+    // Guard inspects window length — verifies it gets exactly ops.len() steps.
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = dummy_wr(&dummy);
+    let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
+    let table = [FusedPattern {
+        ops: &[PipelineOp::Gemv, PipelineOp::Gemv],
+        key: KernelKey::GemvF32,
+        guard: |window, _| window.len() == 2,  // must see exactly 2 steps
+    }];
+    assert_eq!(match_prefix(&table, &steps, &ctx_rdna3()), Some((KernelKey::GemvF32, 2)));
 }
