@@ -21,8 +21,8 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
 use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
-use hipfire_dispatch::types::{GemvVariant, PipelineOp, RotationVariant};
-use hipfire_dispatch::types::dtype_needs_rotation;
+use hipfire_dispatch::types::{GemvVariant, PipelineOp, RotationPlan, RotationVariant};
+use hipfire_dispatch::types::{dtype_needs_rotation, dtype_rotation_plan};
 use std::sync::OnceLock;
 
 // ─── Config ─────────────────────────────────────────────────────────────
@@ -12650,16 +12650,11 @@ fn forward_scratch_layers(
                 }
 
                 // ── FFN ──
-                let x_rot = rmsnorm_rotate_dispatch(
-                    gpu, &ctx, &rotation, &s.x, &layer.ffn_norm,
-                    &layer.w_gate, &s.tmp, &s.x_rot, config.norm_eps,
-                )?;
-
-                fused_gate_up_dispatch(
-                    gpu, &gemv, &ctx,
-                    &layer.w_gate, &layer.w_up,
-                    &s.tmp, x_rot,
-                    &s.gate_ffn, &s.up,
+                gate_up_via_execute_steps(
+                    gpu, &ctx,
+                    &layer.w_gate, &layer.w_up, &layer.ffn_norm,
+                    &s.x, &s.tmp, &s.x_rot,
+                    &s.gate_ffn, &s.up, config.norm_eps,
                 )?;
 
                 hipfire_runtime::llama::weight_gemv_swiglu_residual(
@@ -12681,24 +12676,12 @@ fn forward_scratch_layers(
             }
 
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
-                if qkv_is_mq(&layer.wq) && !qkv_use_fused(&layer.wq, &layer.wk, &layer.wv, &ctx) {
-                    qkv_interpret_mq(
-                        gpu, &ctx, &layer.wq, &layer.wk, &layer.wv,
-                        &layer.attn_norm, &s.x, &s.tmp, &s.x_rot,
-                        &s.fa_q_full, &s.fa_k, &s.fa_v, config.norm_eps,
-                    )?;
-                } else {
-                    let x_rot = rmsnorm_rotate_dispatch(
-                        gpu, &ctx, &rotation, &s.x, &layer.attn_norm,
-                        &layer.wq, &s.tmp, &s.x_rot, config.norm_eps,
-                    )?;
-                    fused_qkv_dispatch(
-                        gpu, &gemv, &ctx,
-                        &layer.wq, &layer.wk, &layer.wv,
-                        &s.tmp, x_rot,
-                        &s.fa_q_full, &s.fa_k, &s.fa_v,
-                    )?;
-                }
+                qkv_via_execute_steps(
+                    gpu, &ctx,
+                    &layer.wq, &layer.wk, &layer.wv,
+                    &layer.attn_norm, &s.x, &s.tmp, &s.x_rot,
+                    &s.fa_q_full, &s.fa_k, &s.fa_v, config.norm_eps,
+                )?;
 
                 gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate,
                     config.n_heads, config.head_dim)?;
@@ -12742,16 +12725,11 @@ fn forward_scratch_layers(
                 }
 
                 // ── FFN ──
-                let x_rot = rmsnorm_rotate_dispatch(
-                    gpu, &ctx, &rotation, &s.x, &layer.ffn_norm,
-                    &layer.w_gate, &s.tmp, &s.x_rot, config.norm_eps,
-                )?;
-
-                fused_gate_up_dispatch(
-                    gpu, &gemv, &ctx,
-                    &layer.w_gate, &layer.w_up,
-                    &s.tmp, x_rot,
-                    &s.gate_ffn, &s.up,
+                gate_up_via_execute_steps(
+                    gpu, &ctx,
+                    &layer.w_gate, &layer.w_up, &layer.ffn_norm,
+                    &s.x, &s.tmp, &s.x_rot,
+                    &s.gate_ffn, &s.up, config.norm_eps,
                 )?;
 
                 hipfire_runtime::llama::weight_gemv_swiglu_residual(
@@ -12910,24 +12888,12 @@ fn forward_scratch_layers(
             }
 
             (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
-                if qkv_is_mq(&layer.wq) && !qkv_use_fused(&layer.wq, &layer.wk, &layer.wv, &ctx) {
-                    qkv_interpret_mq(
-                        gpu, &ctx, &layer.wq, &layer.wk, &layer.wv,
-                        &layer.attn_norm, &s.x, &s.tmp, &s.x_rot,
-                        &s.fa_q_full, &s.fa_k, &s.fa_v, config.norm_eps,
-                    )?;
-                } else {
-                    let x_rot = rmsnorm_rotate_dispatch(
-                        gpu, &ctx, &rotation, &s.x, &layer.attn_norm,
-                        &layer.wq, &s.tmp, &s.x_rot, config.norm_eps,
-                    )?;
-                    fused_qkv_dispatch(
-                        gpu, &gemv, &ctx,
-                        &layer.wq, &layer.wk, &layer.wv,
-                        &s.tmp, x_rot,
-                        &s.fa_q_full, &s.fa_k, &s.fa_v,
-                    )?;
-                }
+                qkv_via_execute_steps(
+                    gpu, &ctx,
+                    &layer.wq, &layer.wk, &layer.wv,
+                    &layer.attn_norm, &s.x, &s.tmp, &s.x_rot,
+                    &s.fa_q_full, &s.fa_k, &s.fa_v, config.norm_eps,
+                )?;
 
                 gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate,
                     config.n_heads, config.head_dim)?;
@@ -13151,49 +13117,39 @@ fn fused_qkvza_dispatch(
     Ok(())
 }
 
-/// MQ-family check used by both rmsnorm_rotate_dispatch and the interpreter branch.
-fn qkv_is_mq(w: &WeightTensor) -> bool {
-    matches!(w.gpu_dtype,
-        DType::MQ4G256 | DType::MQ3G256 | DType::MQ2G256
-        | DType::MQ6G256 | DType::MQ8G256
-        | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MQ4G256Lloyd
-        | DType::MFP4G32)
-}
-
-/// The QKV fused-eligibility predicate (flag-aware). Extracted from
-/// fused_qkv_dispatch so the caller's interpreter branch uses the SAME condition.
-fn qkv_use_fused(wq: &WeightTensor,
-                 wk: &WeightTensor,
-                 wv: &WeightTensor,
-                 ctx: &DispatchCtx) -> bool {
-    let dt = wq.gpu_dtype;
-    let same = wk.gpu_dtype == dt && wv.gpu_dtype == dt;
-    !ctx.flags.force_unfused && same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
-        || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
-        || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()))
-}
-
-/// Build the MQ 3-way QKV op-list (producer + 3 prerotated Gemvs) and run it.
-/// Byte-mirrors rmsnorm_rotate_dispatch(WithRmsnorm) + fused_qkv_dispatch's
-/// discrete Prerotated arm. MQ-only; caller guards with qkv_is_mq && !use_fused.
+/// Unified QKV projection via execute_steps. Covers all dtypes — the interpreter
+/// selects fused kernels for eligible dtypes via FUSED_TABLE guards; everything
+/// else falls through to per-op dispatch. Replaces qkv_interpret_mq +
+/// fused_qkv_dispatch + their preceding rmsnorm_rotate_dispatch call.
 #[allow(clippy::too_many_arguments)]
-fn qkv_interpret_mq(
-    gpu: &mut Gpu, ctx: &DispatchCtx,
+fn qkv_via_execute_steps(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
     wq: &WeightTensor,
     wk: &WeightTensor,
     wv: &WeightTensor,
-    attn_norm: &GpuTensor, x: &GpuTensor, tmp: &GpuTensor, x_rot: &GpuTensor,
-    fa_q: &GpuTensor, fa_k: &GpuTensor, fa_v: &GpuTensor, eps: f32,
+    attn_norm: &GpuTensor,
+    x: &GpuTensor,
+    tmp: &GpuTensor,    // rmsnorm intermediate scratch (x_plain)
+    x_rot: &GpuTensor,  // rotation output scratch; doubles as rmsnorm output for non-MQ
+    fa_q: &GpuTensor,
+    fa_k: &GpuTensor,
+    fa_v: &GpuTensor,
+    eps: f32,
 ) -> HipResult<()> {
-    debug_assert!(wq.k == wk.k && wq.k == wv.k);
-    let wrq = WeightRef { buf: &wq.buf, dtype: wq.gpu_dtype, m: wq.m, k: wq.k, row_stride: 0, rotation: None, awq_scale: None };
-    let wrk = WeightRef { buf: &wk.buf, dtype: wk.gpu_dtype, m: wk.m, k: wk.k, row_stride: 0, rotation: None, awq_scale: None };
-    let wrv = WeightRef { buf: &wv.buf, dtype: wv.gpu_dtype, m: wv.m, k: wv.k, row_stride: 0, rotation: None, awq_scale: None };
+    let rotation = dtype_rotation_plan(wq.gpu_dtype);
+    let wrq = WeightRef { buf: &wq.buf, dtype: wq.gpu_dtype, m: wq.m, k: wq.k,
+                          row_stride: 0, rotation: None, awq_scale: None };
+    let wrk = WeightRef { buf: &wk.buf, dtype: wk.gpu_dtype, m: wk.m, k: wk.k,
+                          row_stride: 0, rotation: None, awq_scale: None };
+    let wrv = WeightRef { buf: &wv.buf, dtype: wv.gpu_dtype, m: wv.m, k: wv.k,
+                          row_stride: 0, rotation: None, awq_scale: None };
+    // AWQ scale (for rotation) lives in the RmsnormAutomatic step.
+    // WeightRef.awq_scale is None: the fused kernels do not take an AWQ param.
     let steps = [
         Step::RmsnormAutomatic {
             x, norm_weight: attn_norm, x_plain: tmp, out: x_rot,
-            awq_scale: wq.awq_scale.as_ref(), k: wq.k, eps,
-            rotation: hipfire_dispatch::types::dtype_rotation_plan(wq.gpu_dtype),
+            awq_scale: wq.awq_scale.as_ref(), k: wq.k, eps, rotation,
         },
         Step::Gemv { w: &wrq, input: GemvInput::Prerotated(x_rot), out: fa_q },
         Step::Gemv { w: &wrk, input: GemvInput::Prerotated(x_rot), out: fa_k },
@@ -13202,173 +13158,36 @@ fn qkv_interpret_mq(
     execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
 }
 
-/// Fused QKV (3-way) dispatch for full attention projections.
+/// Unified gate+up (FFN) projection via execute_steps. Covers all dtypes.
+/// Replaces fused_gate_up_dispatch + its preceding rmsnorm_rotate_dispatch call.
 #[allow(clippy::too_many_arguments)]
-fn fused_qkv_dispatch(
+fn gate_up_via_execute_steps(
     gpu: &mut Gpu,
-    gemv: &GemvFamily,
     ctx: &DispatchCtx,
-    wq: &hipfire_runtime::llama::WeightTensor,
-    wk: &hipfire_runtime::llama::WeightTensor,
-    wv: &hipfire_runtime::llama::WeightTensor,
+    w_gate: &WeightTensor,
+    w_up: &WeightTensor,
+    ffn_norm: &GpuTensor,
+    x: &GpuTensor,
     tmp: &GpuTensor,
-    eff_rot: Option<&GpuTensor>,
-    fa_q: &GpuTensor,
-    fa_k: &GpuTensor,
-    fa_v: &GpuTensor,
-) -> HipResult<()> {
-    let dt = wq.gpu_dtype;
-
-    if dt == DType::ParoQ4G128 {
-        weight_gemv(gpu, wq, tmp, fa_q)?;
-        weight_gemv(gpu, wk, tmp, fa_k)?;
-        weight_gemv(gpu, wv, tmp, fa_v)?;
-        return Ok(());
-    }
-
-    let proj = if qkv_use_fused(wq, wk, wv, ctx) {
-        let x = eff_rot.unwrap_or(tmp);
-        if dt == DType::MQ4G256 || dt == DType::HFQ4G256 {
-            gpu.fused_qkv_hfq4g256(
-                &wq.buf, &wk.buf, &wv.buf, x,
-                fa_q, fa_k, fa_v,
-                wq.m, wk.m, wv.m, wq.k,
-            )
-        } else if dt == DType::MQ3G256Lloyd {
-            gpu.fused_qkv_mq3g256_lloyd(
-                &wq.buf, &wk.buf, &wv.buf, x,
-                fa_q, fa_k, fa_v,
-                wq.m, wk.m, wv.m, wq.k,
-            )
-        } else if dt == DType::MQ4G256Lloyd {
-            gpu.fused_qkv_mq4g256_lloyd(
-                &wq.buf, &wk.buf, &wv.buf, x,
-                fa_q, fa_k, fa_v,
-                wq.m, wk.m, wv.m, wq.k,
-            )
-        } else if dt == DType::MQ6G256 || dt == DType::HFQ6G256 {
-            gpu.fused_qkv_hfq6g256_dp4a(
-                &wq.buf, &wk.buf, &wv.buf, x,
-                fa_q, fa_k, fa_v,
-                wq.m, wk.m, wv.m, wq.k,
-            )
-        } else {
-            unreachable!()
-        }
-    } else {
-        let mut run = |w: &hipfire_runtime::llama::WeightTensor, y: &GpuTensor| -> HipResult<()> {
-            let x = if dtype_needs_rotation(w.gpu_dtype) {
-                eff_rot.ok_or_else(|| {
-                    HipError::new(0, "MQ-weight GEMV requires prerotated input")
-                })?
-            } else {
-                tmp
-            };
-            let wr_i = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
-            if dtype_needs_rotation(w.gpu_dtype) {
-                // `x` is the already-FWHT-rotated eff_rot. Use Prerotated directly;
-                // run_auto would re-rotate (plan != None) → double FWHT → garbage.
-                gemv.run(ctx, gpu, &GemvParams {
-                    w: &wr_i, x, y,
-                    variant: GemvVariant::Prerotated,
-                    residual: None, gate: None, up: None,
-                })
-            } else {
-                gemv.run_auto(ctx, gpu, &wr_i, x, y)
-            }.map_err(|e| HipError::new(0, &e.to_string()))
-        };
-        run(wq, fa_q)?;
-        run(wk, fa_k)?;
-        run(wv, fa_v)
-    };
-    proj?;
-    trace_finite_if_enabled(gpu, "qkv", fa_q)?;
-    Ok(())
-}
-
-/// Fused Gate+Up (2-way) dispatch for the FFN path.
-#[allow(clippy::too_many_arguments)]
-fn fused_gate_up_dispatch(
-    gpu: &mut Gpu,
-    gemv: &GemvFamily,
-    ctx: &DispatchCtx,
-    w_gate: &hipfire_runtime::llama::WeightTensor,
-    w_up: &hipfire_runtime::llama::WeightTensor,
-    tmp: &GpuTensor,
-    eff_rot: Option<&GpuTensor>,
+    x_rot: &GpuTensor,
     gate_out: &GpuTensor,
     up_out: &GpuTensor,
+    eps: f32,
 ) -> HipResult<()> {
-    let dt = w_gate.gpu_dtype;
-    let same = w_up.gpu_dtype == dt;
-
-    if dt == DType::ParoQ4G128 {
-        weight_gemv(gpu, w_gate, tmp, gate_out)?;
-        weight_gemv(gpu, w_up, tmp, up_out)?;
-        return Ok(());
-    }
-
-    let use_fused = !ctx.flags.force_unfused && same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
-        || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
-        || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()));
-
-    let proj = if use_fused {
-        let x = eff_rot.unwrap_or(tmp);
-        if dt == DType::MQ4G256 || dt == DType::HFQ4G256 {
-            gpu.fused_gate_up_hfq4g256(
-                &w_gate.buf, &w_up.buf, x,
-                gate_out, up_out,
-                w_gate.m, w_up.m, w_gate.k,
-            )
-        } else if dt == DType::MQ3G256Lloyd {
-            gpu.fused_gate_up_mq3g256_lloyd(
-                &w_gate.buf, &w_up.buf, x,
-                gate_out, up_out,
-                w_gate.m, w_up.m, w_gate.k,
-            )
-        } else if dt == DType::MQ4G256Lloyd {
-            gpu.fused_gate_up_mq4g256_lloyd(
-                &w_gate.buf, &w_up.buf, x,
-                gate_out, up_out,
-                w_gate.m, w_up.m, w_gate.k,
-            )
-        } else if dt == DType::MQ6G256 || dt == DType::HFQ6G256 {
-            gpu.fused_gate_up_hfq6g256_dp4a(
-                &w_gate.buf, &w_up.buf, x,
-                gate_out, up_out,
-                w_gate.m, w_up.m, w_gate.k,
-            )
-        } else {
-            unreachable!()
-        }
-    } else {
-        let mut run = |w: &hipfire_runtime::llama::WeightTensor, y: &GpuTensor| -> HipResult<()> {
-            let x = if dtype_needs_rotation(w.gpu_dtype) {
-                eff_rot.ok_or_else(|| {
-                    HipError::new(0, "MQ-weight GEMV requires prerotated input")
-                })?
-            } else {
-                tmp
-            };
-            let wr_i = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
-            if dtype_needs_rotation(w.gpu_dtype) {
-                // `x` is the already-FWHT-rotated eff_rot. Use Prerotated directly;
-                // run_auto would re-rotate (plan != None) → double FWHT → garbage.
-                gemv.run(ctx, gpu, &GemvParams {
-                    w: &wr_i, x, y,
-                    variant: GemvVariant::Prerotated,
-                    residual: None, gate: None, up: None,
-                })
-            } else {
-                gemv.run_auto(ctx, gpu, &wr_i, x, y)
-            }.map_err(|e| HipError::new(0, &e.to_string()))
-        };
-        run(w_gate, gate_out)?;
-        run(w_up, up_out)
-    };
-    proj?;
-    trace_finite_if_enabled(gpu, "gate_up", gate_out)?;
-    Ok(())
+    let rotation = dtype_rotation_plan(w_gate.gpu_dtype);
+    let wrg = WeightRef { buf: &w_gate.buf, dtype: w_gate.gpu_dtype, m: w_gate.m, k: w_gate.k,
+                          row_stride: 0, rotation: None, awq_scale: None };
+    let wru = WeightRef { buf: &w_up.buf, dtype: w_up.gpu_dtype, m: w_up.m, k: w_up.k,
+                          row_stride: 0, rotation: None, awq_scale: None };
+    let steps = [
+        Step::RmsnormAutomatic {
+            x, norm_weight: ffn_norm, x_plain: tmp, out: x_rot,
+            awq_scale: w_gate.awq_scale.as_ref(), k: w_gate.k, eps, rotation,
+        },
+        Step::Gemv { w: &wrg, input: GemvInput::Prerotated(x_rot), out: gate_out },
+        Step::Gemv { w: &wru, input: GemvInput::Prerotated(x_rot), out: up_out },
+    ];
+    execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
 }
 
 /// MoE FFN dispatch — mirrors the two-path logic from the original.
