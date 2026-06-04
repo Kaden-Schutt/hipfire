@@ -325,7 +325,9 @@ now implemented in `hipfire-detect::ngram` as a soft warn.
 
 Any DDTree / spec-decode / slow-path-kill change that claims a τ or tok/s
 improvement MUST pass `scripts/coherence-gate-dflash.sh` (shipped 9883e98)
-before commit. Enhanced three-tier thresholds (as of 2026-04-26):
+before commit. The script's inline detector enforces all three tiers below:
+Tier 1 + Tier 2 are hard fails (non-zero exit), Tier 3 is a soft `FLAG`
+status in the report for human eyeball. Thresholds (as of 2026-04-26):
 
 **Tier 1 — First 128 tokens (hard fail, catches single-token attractors):**
 - `unique_token_ratio < 0.15` OR `max_single_token_frequency > 0.50`
