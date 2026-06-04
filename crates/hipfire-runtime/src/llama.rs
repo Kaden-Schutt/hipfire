@@ -1857,9 +1857,12 @@ fn forward_prefill_chunk(
     let kv_dim = config.n_kv_heads * config.head_dim;
     let dim_row_bytes = dim * 4;
     // Q8 WMMA arch gate — see qwen35.rs q8_wmma_arch for the matching capture
-    // and rationale (gfx11-only; gfx12 needs a `_w32_gfx12` builtin variant
-    // that has not been authored yet, so routing gfx12 here would crash at JIT).
-    let q8_wmma_arch = gpu.arch_caps.has_wmma_w32();
+    // and rationale. RDNA3 (_w32 builtin) AND RDNA4 (_w32_gfx12 builtin): the
+    // fused qkv/gate_up/residual Q8 WMMA helpers route is_rdna4()→_gfx12
+    // internally (gemm_qkv_q8_0_wmma_gfx12 et al., silicon-validated on R9700),
+    // so has_wmma() is the correct gate — matches qwen35.rs:9008. Bare
+    // has_wmma_w32() left RDNA4 on the slower unfused per-projection path.
+    let q8_wmma_arch = gpu.arch_caps.has_wmma();
 
     // 1. Embed N tokens into pbs.x_batch.
     if matches!(
