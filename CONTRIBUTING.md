@@ -137,9 +137,9 @@ the skill end-to-end and shipped a full validated 5-kernel port +
 ### New model architectures
 
 Start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)'s "Two model
-paths" section — `crates/engine/src/llama.rs` is the template for
-dense Llama-style models, `qwen35.rs` is the Qwen 3.5 hybrid path
-with DeltaNet linear attention. Add the architecture string to
+paths" section — `crates/hipfire-runtime/src/llama.rs` is the template
+for dense Llama-style models, `crates/hipfire-arch-qwen35/src/qwen35.rs`
+is the Qwen 3.5 hybrid path with DeltaNet linear attention. Add the architecture string to
 `from_gguf` / `from_hfq` and patch the tensor-shape divergences.
 
 For a new GGUF dequant type (Q5_K, IQ-quants, etc.), port from
