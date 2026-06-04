@@ -135,11 +135,11 @@ fn arch_always_passes_on_all_archs() {
 }
 
 #[test]
-fn arch_has_wmma_w32_requires_rdna3() {
+fn arch_has_wmma_w32_requires_rdna3_or_rdna4() {
     assert!(!ArchPredicate::HasWmmaW32.eval_arch(&ctx_rdna1()));
     assert!(!ArchPredicate::HasWmmaW32.eval_arch(&ctx_rdna2()));
     assert!(ArchPredicate::HasWmmaW32.eval_arch(&ctx_rdna3()));
-    assert!(!ArchPredicate::HasWmmaW32.eval_arch(&ctx_rdna4()));
+    assert!(ArchPredicate::HasWmmaW32.eval_arch(&ctx_rdna4())); // RDNA4 gfx12 WMMA
 }
 
 #[test]
@@ -157,11 +157,11 @@ fn arch_has_dp4a_requires_rdna1p1_or_newer() {
 }
 
 #[test]
-fn arch_has_mmq_on_rdna3_only() {
+fn arch_has_mmq_on_rdna3_or_rdna4() {
     assert!(!ArchPredicate::HasMmq.eval_arch(&ctx_rdna1()));
     assert!(!ArchPredicate::HasMmq.eval_arch(&ctx_rdna2()));
     assert!(ArchPredicate::HasMmq.eval_arch(&ctx_rdna3()));
-    assert!(!ArchPredicate::HasMmq.eval_arch(&ctx_rdna4()));
+    assert!(ArchPredicate::HasMmq.eval_arch(&ctx_rdna4())); // RDNA4 MQ6/HFQ6
 }
 
 #[test]
