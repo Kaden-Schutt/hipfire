@@ -628,6 +628,13 @@ fn main() {
     // i.e. a native imatrix from the same calib forward) for tensors that
     // have a Hessian, instead of the v3-embedded (unsloth-imatrix) scales.
     let mut awq_hessian_diag = false;
+    // When set with --awq-hessian-diag: apply the native-imatrix AWQ
+    // override ONLY to tensors that ALSO carry a v3 AWQ scale (the
+    // 30-tensor overlap). The 37 Hessian-only tensors then get NO AWQ
+    // (plain GPTQ), holding coverage at the v3-184 scope so the delta
+    // vs the v3-anchor isolates DERIVATION (native vs unsloth) from
+    // COVERAGE (184 -> 221). (c) 2026 Kaden Schutt.
+    let mut awq_native_restrict_to_v3 = false;
     let mut awq_alpha = 0.5f64;
     let mut i = 1;
     while i < argv.len() {
@@ -640,6 +647,7 @@ fn main() {
             "--awq-from" => { awq_from = Some(PathBuf::from(&argv[i+1])); i += 2; }
             "--hessian-from" => { hessian_from = Some(PathBuf::from(&argv[i+1])); i += 2; }
             "--awq-hessian-diag" => { awq_hessian_diag = true; i += 1; }
+            "--awq-native-restrict-to-v3" => { awq_native_restrict_to_v3 = true; i += 1; }
             "--awq-alpha" => { awq_alpha = argv[i+1].parse().unwrap(); i += 2; }
             "--match-v3-scope" => { v3_scope = true; i += 1; }
             o => { eprintln!("unknown arg {o}"); std::process::exit(1); }
@@ -787,7 +795,12 @@ fn main() {
             // whose sidecar K differs — fall back to plain).
             // Step-2 native-imatrix override: when --awq-hessian-diag and this
             // tensor has a Hessian, derive s from the Hessian diagonal (E[x^2]).
-            let awq_native: Option<Vec<f32>> = if awq_hessian_diag {
+            // Restrict-to-v3: only override tensors that ALSO have a v3 AWQ
+            // scale (the 30-tensor overlap), so coverage stays at the v3-184
+            // scope and the delta vs the v3-anchor is pure DERIVATION.
+            let in_v3_awq = awq_map.contains_key(&t.name);
+            let awq_native: Option<Vec<f32>> = if awq_hessian_diag
+                && (!awq_native_restrict_to_v3 || in_v3_awq) {
                 hess.map(|blocks| {
                     let im = imatrix_from_unrot_hessian(blocks);
                     awq_scales_from_imatrix(&im, awq_alpha)
