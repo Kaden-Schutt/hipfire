@@ -1,60 +1,71 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Op-list interpreter: a `&[Step]` is walked, fusing runs of ops into single
-//! kernels where a matcher entry covers them, else launching each op via its
-//! per-op fallback. Phase 1: GEMV-only, empty fusion table (all fallback).
+//! Op-list interpreter. Phase 2a: GEMV + a fused rmsnorm-rotate producer; empty
+//! fusion table (all per-op fallback).
 
 use rdna_compute::{Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
-use crate::families::gemv::{GemvFamily, WeightRef};
-use crate::types::{DispatchError, KernelKey, PipelineOp};
+use crate::families::gemv::{GemvFamily, GemvParams, WeightRef};
+use crate::types::GemvVariant;
+use crate::families::rotation::{RotationFamily, RotationParams};
+use crate::types::{DispatchError, KernelKey, PipelineOp, RotationVariant};
 
-/// A single op plus its operand bindings. References borrow into model-owned
-/// tensors and the GPU scratch arena; the interpreter owns no buffers.
-pub struct Step<'a> {
-    pub op: PipelineOp,
-    /// QKV = 3 weights; a plain Gemv = 1.
-    pub weights: &'a [&'a WeightRef<'a>],
-    /// Shared input (QKV/gate-up share one `x`).
-    pub input: &'a GpuTensor,
-    pub outputs: &'a [&'a GpuTensor],
+/// Rotation disposition of a Gemv's input. Borrows (never owns a RotatedActivation).
+pub enum GemvInput<'a> {
+    Raw(&'a GpuTensor),         // launch_op self-rotates via run_auto (plan-aware)
+    Prerotated(&'a GpuTensor),  // already FWHT-rotated; dispatched via Prerotated variant
 }
 
-/// A fusion table entry: an op-pattern that collapses to one kernel.
-/// Phase 1 ships an empty table; Phase 2b populates it (with a full operand
-/// guard layered on top of this op-pattern match).
-/// Entries must have a non-empty `ops` (a zero-length pattern never matches).
+pub enum Step<'a> {
+    Gemv {
+        w: &'a WeightRef<'a>,
+        input: GemvInput<'a>,
+        out: &'a GpuTensor,
+    },
+    /// Fused rmsnorm + FWHT producer (mirrors rmsnorm_rotate_dispatch's MQ branch
+    /// → RotationFamily.run(WithRmsnorm)). Writes the rotated activation to `out`.
+    RmsnormRotateMq {
+        x: &'a GpuTensor,
+        norm_weight: &'a GpuTensor,
+        x_plain: &'a GpuTensor,           // = tmp (rmsnorm intermediate)
+        out: &'a GpuTensor,               // = x_rot scratch
+        awq_scale: Option<&'a GpuTensor>,
+        k: usize,
+        eps: f32,
+    },
+}
+
+/// Op-kind for fusion matching. Total over Step variants.
+fn op_kind(step: &Step) -> PipelineOp {
+    match step {
+        Step::Gemv { .. } => PipelineOp::Gemv,
+        Step::RmsnormRotateMq { .. } => PipelineOp::RmsnormRotateMq,
+    }
+}
+
 pub struct FusedPattern {
     pub ops: &'static [PipelineOp],
     pub key: KernelKey,
 }
 
-/// Greedy longest-prefix op-pattern match. Returns `(key, consumed_len)` for the
-/// longest entry whose op-sequence is a prefix of `steps`. **Op-pattern only** —
-/// the full operand guard (shared input, dtype/awq/row_stride homogeneity) is a
-/// Phase-2b concern; in Phase 1 the table is empty so this never fires.
+/// Greedy longest-prefix op-pattern match. Op-pattern only (Phase 1/2a: empty table).
 pub fn match_prefix(table: &[FusedPattern], steps: &[Step]) -> Option<(KernelKey, usize)> {
     table
         .iter()
         .filter(|p| {
             !p.ops.is_empty()
                 && p.ops.len() <= steps.len()
-                && p.ops.iter().zip(steps).all(|(o, s)| *o == s.op)
+                && p.ops.iter().zip(steps).all(|(o, s)| *o == op_kind(s))
         })
         .max_by_key(|p| p.ops.len())
         .map(|p| (p.key, p.ops.len()))
 }
 
-// ── Executor ────────────────────────────────────────────────────────────────
-
-/// Phase 1: empty. Phase 2b adds `[Gemv,Gemv,Gemv]→FusedQkv*` etc.
 const FUSED_TABLE: &[FusedPattern] = &[];
-
 static GEMV: OnceLock<GemvFamily> = OnceLock::new();
+static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
 
-/// Walk a step list. At each position, greedily fuse the longest matching run
-/// (Phase 1: never matches — table empty), else launch the single op.
 pub fn execute_steps(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
@@ -73,30 +84,35 @@ pub fn execute_steps(
     Ok(())
 }
 
-/// Per-op fallback: the always-correct discrete path. Phase 1 = `Gemv` only.
+/// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
+/// op to have an arm (spec F4 — a missing arm would be a silent runtime error).
 fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), DispatchError> {
-    match step.op {
-        PipelineOp::Gemv => {
+    match step {
+        Step::Gemv { w, input: GemvInput::Raw(x), out } => {
             let gemv = GEMV.get_or_init(GemvFamily::new);
-            // INVARIANT: a Gemv step always carries exactly 1 weight + 1 output
-            // (model-constructed; a malformed slice is an internal-invariant bug).
-            gemv.run_auto(ctx, gpu, step.weights[0], step.input, step.outputs[0])
+            gemv.run_auto(ctx, gpu, w, x, out)
         }
-        _ => Err(DispatchError::UnsupportedVariant {
-            family: "pipeline",
-            variant: "unimplemented-op",
-            arch: "",
-            quant: "",
-        }),
+        Step::Gemv { w, input: GemvInput::Prerotated(xr), out } => {
+            let gemv = GEMV.get_or_init(GemvFamily::new);
+            gemv.run(ctx, gpu, &GemvParams {
+                w, x: xr, y: out, variant: GemvVariant::Prerotated,
+                residual: None, gate: None, up: None,
+            })
+        }
+        Step::RmsnormRotateMq { x, norm_weight, x_plain, out, awq_scale, k, eps } => {
+            let rotation = ROTATION.get_or_init(RotationFamily::new);
+            rotation.run(ctx, gpu, RotationParams {
+                x, x_up: None, w_norm: Some(norm_weight),
+                x_plain, x_rot: out, awq_scale: *awq_scale, k: *k, eps: *eps,
+                batch_size: 1, variant: RotationVariant::WithRmsnorm,
+                givens_pairs: None, givens_theta: None, givens_scales: None, givens_krot: None,
+            }).map_err(|e| DispatchError::Hip(e.to_string()))
+        }
     }
 }
 
-/// Launch one fused kernel for a consumed run. Phase 1 has no entries.
 fn launch_fused(
-    _gpu: &mut Gpu,
-    _ctx: &DispatchCtx,
-    key: KernelKey,
-    _steps: &[Step],
+    _gpu: &mut Gpu, _ctx: &DispatchCtx, key: KernelKey, _steps: &[Step],
 ) -> Result<(), DispatchError> {
     Err(DispatchError::MissingImpl { key })
 }

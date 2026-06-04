@@ -20,7 +20,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
 use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
-use hipfire_dispatch::pipeline::{execute_steps, Step};
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::{GemvVariant, PipelineOp, RotationVariant};
 use hipfire_dispatch::types::dtype_needs_rotation;
 use std::sync::OnceLock;
@@ -5334,12 +5334,7 @@ fn forward_from_x_gpu(
     {
         let ctx = DispatchCtx::new(gpu);
         let wr = weights.output.dispatch_ref();
-        let step = Step {
-            op: PipelineOp::Gemv,
-            weights: &[&wr],
-            input: &tmp,
-            outputs: &[&logits],
-        };
+        let step = Step::Gemv { w: &wr, input: GemvInput::Raw(&tmp), out: &logits };
         execute_steps(gpu, &ctx, &[step])
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
@@ -11816,12 +11811,7 @@ fn forward_prefill_chunk(
                 {
                     let ctx = DispatchCtx::new(gpu);
                     let wr = weights.output.dispatch_ref();
-                    let step = Step {
-                        op: PipelineOp::Gemv,
-                        weights: &[&wr],
-                        input: &last_view,
-                        outputs: &[&s.logits],
-                    };
+                    let step = Step::Gemv { w: &wr, input: GemvInput::Raw(&last_view), out: &s.logits };
                     execute_steps(gpu, &ctx, &[step])
                         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                 }
@@ -11843,12 +11833,7 @@ fn forward_prefill_chunk(
             {
                 let ctx = DispatchCtx::new(gpu);
                 let wr = weights.output.dispatch_ref();
-                let step = Step {
-                    op: PipelineOp::Gemv,
-                    weights: &[&wr],
-                    input: &s.tmp,
-                    outputs: &[&s.logits],
-                };
+                let step = Step::Gemv { w: &wr, input: GemvInput::Raw(&s.tmp), out: &s.logits };
                 execute_steps(gpu, &ctx, &[step])
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
             }
@@ -12964,12 +12949,7 @@ fn forward_scratch_layers(
     {
         let ctx = DispatchCtx::new(gpu);
         let wr = weights.output.dispatch_ref();
-        let step = Step {
-            op: PipelineOp::Gemv,
-            weights: &[&wr],
-            input: &s.tmp,
-            outputs: &[&s.logits],
-        };
+        let step = Step::Gemv { w: &wr, input: GemvInput::Raw(&s.tmp), out: &s.logits };
         execute_steps(gpu, &ctx, &[step])
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
@@ -13061,7 +13041,7 @@ fn fused_qkvza_dispatch(
         return Ok(());
     }
 
-    let use_fused = same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
+    let use_fused = !ctx.flags.force_unfused && same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
         || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
         || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()));
 
@@ -13151,7 +13131,7 @@ fn fused_qkv_dispatch(
         return Ok(());
     }
 
-    let use_fused = same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
+    let use_fused = !ctx.flags.force_unfused && same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
         || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
         || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()));
 
@@ -13237,7 +13217,7 @@ fn fused_gate_up_dispatch(
         return Ok(());
     }
 
-    let use_fused = same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
+    let use_fused = !ctx.flags.force_unfused && same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
         || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
         || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()));
 
@@ -14755,12 +14735,7 @@ fn forward_scratch_layers_multi(
     {
         let ctx = DispatchCtx::new(gpu_last);
         let wr = weights.output.dispatch_ref();
-        let step = Step {
-            op: PipelineOp::Gemv,
-            weights: &[&wr],
-            input: &s_last.tmp,
-            outputs: &[&s_last.logits],
-        };
+        let step = Step::Gemv { w: &wr, input: GemvInput::Raw(&s_last.tmp), out: &s_last.logits };
         execute_steps(gpu_last, &ctx, &[step])
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }

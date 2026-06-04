@@ -24,6 +24,9 @@ pub enum PipelineOp {
     IndexedGateUp,
     IndexedDownExpanded,
     MoeCombine,
+    /// Fused rmsnorm + FWHT rotation (MQ-weight producer step).
+    /// Mirrors `RotationFamily::run(WithRmsnorm)`.
+    RmsnormRotateMq,
 }
 
 // ── Variant enums ─────────────────────────────────────

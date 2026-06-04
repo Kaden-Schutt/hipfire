@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use hip_bridge;
 
 pub(crate) mod steps;
-pub use steps::{execute_steps, FusedPattern, Step};
+pub use steps::{execute_steps, FusedPattern, GemvInput, Step};
 
 pub struct Pipeline {
     pub ops: &'static [PipelineOp],

@@ -91,6 +91,12 @@ pub struct FeatureFlags {
 
     // ── Compiler.rs env reads ──────────────────────────────────────
     pub hipcc_extra_flags: String,
+
+    // ── Interpreter Phase 2a ───────────────────────────────────────
+    /// Force the discrete (un-fused) projection path where supported, for
+    /// fused-vs-unfused validation. Env: HIPFIRE_FORCE_UNFUSED=1. Single-GPU
+    /// decode projection fusions only (see Phase-2a spec §4b honest-scope).
+    pub force_unfused: bool,
 }
 
 impl FeatureFlags {
@@ -239,6 +245,10 @@ impl FeatureFlags {
 
             // Compiler.rs
             hipcc_extra_flags: std::env::var("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default(),
+
+            // Interpreter Phase 2a
+            force_unfused: std::env::var("HIPFIRE_FORCE_UNFUSED")
+                .map(|v| v == "1").unwrap_or(false),
         }
     }
 
@@ -368,6 +378,18 @@ impl FeatureFlags {
             lloyd_force_baseline: false,
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),
+            force_unfused: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn force_unfused_defaults_false_in_test_ctor() {
+        let f = FeatureFlags::from_env_for_test("gfx1151");
+        assert!(!f.force_unfused);
     }
 }

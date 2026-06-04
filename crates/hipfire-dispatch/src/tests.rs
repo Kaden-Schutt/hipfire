@@ -616,24 +616,32 @@ fn moe_res_paro_needs_sidecar() {
 
 // ── op-list interpreter: match_prefix (pure logic) ──────────────────────────
 
-use crate::pipeline::{steps::match_prefix, FusedPattern, Step};
+use crate::families::gemv::WeightRef;
+use crate::pipeline::steps::{match_prefix, GemvInput};
+use crate::pipeline::{FusedPattern, Step};
 
-/// Build a Step for op-pattern tests. `match_prefix` reads only `.op`.
-fn gemv_step<'a>(input: &'a rdna_compute::GpuTensor) -> Step<'a> {
-    Step { op: PipelineOp::Gemv, weights: &[], input, outputs: &[] }
+fn dummy_wr<'a>(t: &'a rdna_compute::GpuTensor) -> WeightRef<'a> {
+    WeightRef { buf: t, dtype: rdna_compute::DType::F32, m: 1, k: 1,
+                row_stride: 0, rotation: None, awq_scale: None }
+}
+
+fn gemv_step<'a>(t: &'a rdna_compute::GpuTensor, wr: &'a WeightRef<'a>) -> Step<'a> {
+    Step::Gemv { w: wr, input: GemvInput::Raw(t), out: t }
 }
 
 #[test]
 fn match_prefix_empty_table_never_fires() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let steps = [gemv_step(&dummy), gemv_step(&dummy), gemv_step(&dummy)];
+    let wr = dummy_wr(&dummy);
+    let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
     assert_eq!(match_prefix(&[], &steps), None);
 }
 
 #[test]
 fn match_prefix_picks_longest() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let steps = [gemv_step(&dummy), gemv_step(&dummy), gemv_step(&dummy)];
+    let wr = dummy_wr(&dummy);
+    let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
     let table = [
         FusedPattern { ops: &[PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF32 },
         FusedPattern { ops: &[PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF16 },
@@ -644,7 +652,8 @@ fn match_prefix_picks_longest() {
 #[test]
 fn match_prefix_no_pattern_longer_than_steps() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let steps = [gemv_step(&dummy)];
+    let wr = dummy_wr(&dummy);
+    let steps = [gemv_step(&dummy, &wr)];
     let table = [FusedPattern {
         ops: &[PipelineOp::Gemv, PipelineOp::Gemv], key: KernelKey::GemvF32,
     }];
@@ -654,18 +663,11 @@ fn match_prefix_no_pattern_longer_than_steps() {
 #[test]
 fn match_prefix_single_op_consumes_one() {
     let dummy = rdna_compute::GpuTensor::null_for_test();
-    let steps = [gemv_step(&dummy), gemv_step(&dummy), gemv_step(&dummy)];
+    let wr = dummy_wr(&dummy);
+    let steps = [gemv_step(&dummy, &wr), gemv_step(&dummy, &wr), gemv_step(&dummy, &wr)];
     let table = [FusedPattern {
         ops: &[PipelineOp::Gemv], key: KernelKey::GemvF32,
     }];
     // a len-1 pattern matches the first step, consuming exactly 1
     assert_eq!(match_prefix(&table, &steps), Some((KernelKey::GemvF32, 1)));
-}
-
-#[test]
-fn non_phase1_op_is_not_gemv() {
-    // RotateFwht must not be silently treated as a Gemv fallback.
-    let dummy = rdna_compute::GpuTensor::null_for_test();
-    let step = Step { op: PipelineOp::RotateFwht, weights: &[], input: &dummy, outputs: &[] };
-    assert_ne!(step.op, PipelineOp::Gemv);
 }
