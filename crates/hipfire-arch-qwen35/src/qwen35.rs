@@ -20,7 +20,8 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
 use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
-use hipfire_dispatch::types::{GemvVariant, RotationVariant};
+use hipfire_dispatch::pipeline::{execute_steps, Step};
+use hipfire_dispatch::types::{GemvVariant, PipelineOp, RotationVariant};
 use hipfire_dispatch::types::dtype_needs_rotation;
 use std::sync::OnceLock;
 
@@ -5330,7 +5331,18 @@ fn forward_from_x_gpu(
     // Final norm + output projection
     gpu.rmsnorm_f32(&x, &weights.output_norm, &tmp, config.norm_eps)?;
     let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
-    weight_gemv(gpu, &weights.output, &tmp, &logits)?;
+    {
+        let ctx = DispatchCtx::new(gpu);
+        let wr = weights.output.dispatch_ref();
+        let step = Step {
+            op: PipelineOp::Gemv,
+            weights: &[&wr],
+            input: &tmp,
+            outputs: &[&logits],
+        };
+        execute_steps(gpu, &ctx, &[step])
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    }
 
     gpu.free_tensor(x)?;
     gpu.free_tensor(tmp)?;
@@ -11801,7 +11813,18 @@ fn forward_prefill_chunk(
                 // callers that rely on it (the legacy prefill post-condition).
                 let last = n - 1;
                 let last_view = dst.sub_offset((offset_rows + last) * dim, dim);
-                weight_gemv(gpu, &weights.output, &last_view, &s.logits)?;
+                {
+                    let ctx = DispatchCtx::new(gpu);
+                    let wr = weights.output.dispatch_ref();
+                    let step = Step {
+                        op: PipelineOp::Gemv,
+                        weights: &[&wr],
+                        input: &last_view,
+                        outputs: &[&s.logits],
+                    };
+                    execute_steps(gpu, &ctx, &[step])
+                        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                }
             }
         } else {
             // Legacy path: only last-token logits.
@@ -11817,7 +11840,18 @@ fn forward_prefill_chunk(
                 dim_row_bytes,
             )?;
             gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
-            weight_gemv(gpu, &weights.output, &s.tmp, &s.logits)?;
+            {
+                let ctx = DispatchCtx::new(gpu);
+                let wr = weights.output.dispatch_ref();
+                let step = Step {
+                    op: PipelineOp::Gemv,
+                    weights: &[&wr],
+                    input: &s.tmp,
+                    outputs: &[&s.logits],
+                };
+                execute_steps(gpu, &ctx, &[step])
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            }
         }
     }
 
@@ -12927,7 +12961,18 @@ fn forward_scratch_layers(
 
     // Final norm + logits into scratch.logits
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
-    weight_gemv(gpu, &weights.output, &s.tmp, &s.logits)?;
+    {
+        let ctx = DispatchCtx::new(gpu);
+        let wr = weights.output.dispatch_ref();
+        let step = Step {
+            op: PipelineOp::Gemv,
+            weights: &[&wr],
+            input: &s.tmp,
+            outputs: &[&s.logits],
+        };
+        execute_steps(gpu, &ctx, &[step])
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    }
 
     Ok(())
 }
@@ -14707,7 +14752,18 @@ fn forward_scratch_layers_multi(
         &s_last.tmp,
         config.norm_eps,
     )?;
-    weight_gemv(gpu_last, &weights.output, &s_last.tmp, &s_last.logits)?;
+    {
+        let ctx = DispatchCtx::new(gpu_last);
+        let wr = weights.output.dispatch_ref();
+        let step = Step {
+            op: PipelineOp::Gemv,
+            weights: &[&wr],
+            input: &s_last.tmp,
+            outputs: &[&s_last.logits],
+        };
+        execute_steps(gpu_last, &ctx, &[step])
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    }
 
     Ok(())
 }
