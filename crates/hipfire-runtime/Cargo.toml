@@ -317,6 +317,13 @@ required-features = []
 name = "build_kld_ref_native"
 required-features = ["arch-qwen35", "deltanet"]
 
+# eval_hipfire_fullvocab (F3) — FULL-VOCAB KLD of a hipfire quant vs the hipfire
+# F32 oracle (dual forward, no ref top-K approx, no GGUF) for parity with
+# llama-perplexity --kl-divergence full-vocab KLD.
+[[example]]
+name = "eval_hipfire_fullvocab"
+required-features = ["arch-qwen35", "deltanet"]
+
 [[example]]
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
