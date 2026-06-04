@@ -311,6 +311,12 @@ required-features = ["arch-qwen35", "deltanet"]
 name = "build_kld_ref"
 required-features = []
 
+# build_kld_ref_native (F2) — llama-FREE KLD ref producer; runs the hipfire
+# F32 oracle forward and writes the SAME HFKLDR format eval_hipfire consumes.
+[[example]]
+name = "build_kld_ref_native"
+required-features = ["arch-qwen35", "deltanet"]
+
 [[example]]
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
