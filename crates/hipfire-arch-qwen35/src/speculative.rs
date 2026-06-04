@@ -1665,21 +1665,10 @@ impl HiddenStateRingBuffer {
     }
 }
 
-/// Single-pass argmax for token sampling. Not SIMD-optimized — the logit
-/// vector is downloaded once per verify step so the CPU scan cost is
-/// negligible relative to GEMV work.
-#[inline]
-fn argmax_u32(logits: &[f32]) -> u32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_v {
-            best_v = v;
-            best = i;
-        }
-    }
-    best as u32
-}
+// Canonical single-pass CPU argmax lives in crate::util (logit vector is
+// downloaded once per verify step, so the CPU scan cost is negligible relative
+// to GEMV work). Imported so the bare argmax_u32(..) call sites stay unchanged.
+use crate::util::argmax_u32;
 
 /// Temperature-scaled softmax. Writes into `out` (reused across calls to
 /// avoid per-position allocation in the rejection-sampling hot loop).

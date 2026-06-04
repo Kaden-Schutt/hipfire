@@ -10,25 +10,9 @@ use std::path::Path;
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
 const HFQ_VERSION: u32 = 1;
 
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exp = ((bits >> 10) & 0x1F) as u32;
-    let frac = (bits & 0x3FF) as u32;
-    if exp == 0 {
-        if frac == 0 { return f32::from_bits(sign << 31); }
-        let mut e = 0i32;
-        let mut f = frac;
-        while f & 0x400 == 0 { f <<= 1; e -= 1; }
-        f &= 0x3FF;
-        let exp32 = (127 - 15 + 1 + e) as u32;
-        return f32::from_bits((sign << 31) | (exp32 << 23) | (f << 13));
-    }
-    if exp == 31 {
-        let frac32 = if frac == 0 { 0 } else { frac << 13 | 1 };
-        return f32::from_bits((sign << 31) | (0xFF << 23) | frac32);
-    }
-    f32::from_bits((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13))
-}
+// Canonical CPU half->f32 conversion lives in rdna_compute::fp16. Re-exported
+// so the bare f16_to_f32 call sites stay unchanged.
+use rdna_compute::f16_to_f32;
 
 // Canonical FWHT/KV-rotation sign generator lives in rdna-compute. Re-exported
 // here so the bare `gen_fwht_signs(..)` call sites below stay unchanged.

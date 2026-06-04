@@ -17,6 +17,7 @@ pub mod scratch;
 mod compiler;
 mod dispatch;
 pub mod feature_flags;
+pub mod fp16;
 mod kernels;
 pub mod pool;
 pub mod profile;
@@ -29,4 +30,5 @@ pub use dispatch::{
     MMQ_CURRENT_LAYER,
 };
 pub use feature_flags::FeatureFlags;
+pub use fp16::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};
 pub use kernels::GEMV_SRC;

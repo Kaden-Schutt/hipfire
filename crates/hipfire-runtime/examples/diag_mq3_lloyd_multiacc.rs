@@ -11,9 +11,10 @@ use rdna_compute::Gpu;
 use hipfire_runtime::hfq::HfqFile;
 use std::path::Path;
 
-fn f16_to_f32(bits: u16) -> f32 {
-    hipfire_runtime::llama::f16_to_f32(bits)
-}
+// Canonical CPU half->f32 conversion lives in rdna_compute::fp16 (re-exported
+// via hipfire_runtime::llama). Imported so the bare f16_to_f32 call sites
+// stay unchanged.
+use hipfire_runtime::llama::f16_to_f32;
 
 fn cpu_gemv_mq3(row_bytes: &[u8], groups_per_row: usize, x: &[f32]) -> f32 {
     let mut acc = 0.0f32;

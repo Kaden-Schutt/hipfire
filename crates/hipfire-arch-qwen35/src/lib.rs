@@ -41,6 +41,8 @@ pub mod pflash;
 pub mod qwen35;
 #[cfg(feature = "deltanet")]
 pub mod speculative;
+#[cfg(feature = "deltanet")]
+pub mod util;
 
 /// Grammar-guided decoding for qwen35 tool-call format. Independent of
 /// the deltanet feature gate — pure data-structure work, no GPU

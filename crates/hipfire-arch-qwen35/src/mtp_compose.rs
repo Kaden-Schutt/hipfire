@@ -581,17 +581,9 @@ pub fn spec_step_dflash_mtp(
 
 // ─── Helpers (module-private) ────────────────────────────────────────────
 
-fn argmax_u32(v: &[f32]) -> u32 {
-    let mut best = 0u32;
-    let mut bv = f32::NEG_INFINITY;
-    for (i, &x) in v.iter().enumerate() {
-        if x > bv {
-            bv = x;
-            best = i as u32;
-        }
-    }
-    best
-}
+// Canonical CPU argmax lives in crate::util. Imported so the bare
+// argmax_u32(..) call sites stay unchanged.
+use crate::util::argmax_u32;
 
 // ─── Per-slot tree composition (Task 11b) ────────────────────────────────
 
