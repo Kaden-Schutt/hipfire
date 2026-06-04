@@ -16,9 +16,11 @@ mod gguf_input;
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::Hasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use twox_hash::XxHash64;
 
 // imatrix lookup populated once in main() when --imatrix is supplied; keyed by
 // ggml-style tensor name (see safetensors_to_ggml_name), value is the
@@ -218,6 +220,13 @@ fn f32_to_f16(val: f32) -> u16 {
         return ((sign << 15) | (f >> shift)) as u16;
     }
     ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
+}
+
+fn f32_slice_to_f16_bytes(f32_data: &[f32]) -> Vec<u8> {
+    f32_data
+        .iter()
+        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+        .collect()
 }
 
 /// Convert raw tensor bytes to F32 based on dtype string
@@ -2909,6 +2918,342 @@ struct HfqTensor {
     spilled_len: u64,
 }
 
+struct HfqInputTensor {
+    name: String,
+    quant_type: u8,
+    shape: Vec<u32>,
+    group_size: u32,
+    data_offset: usize,
+    data_size: usize,
+}
+
+struct HfqInputFile {
+    _file: File,
+    mmap: Mmap,
+    arch_id: u32,
+    metadata_json: String,
+    tensors: Vec<HfqInputTensor>,
+}
+
+impl HfqInputFile {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        if mmap.len() < 32 || &mmap[0..4] != HFQ_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not an HFQM container",
+            ));
+        }
+        let _version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        let arch_id = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
+        let n_tensors = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
+        let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
+        let data_offset = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+
+        if metadata_offset >= data_offset || data_offset > mmap.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid HFQM offsets metadata={metadata_offset} data={data_offset}"),
+            ));
+        }
+
+        let meta_bytes = &mmap[metadata_offset..data_offset];
+        let mut brace_depth = 0i32;
+        let mut in_string = false;
+        let mut escape = false;
+        let mut json_end = None;
+        for (i, &b) in meta_bytes.iter().enumerate() {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if b == b'\\' && in_string {
+                escape = true;
+                continue;
+            }
+            if b == b'"' {
+                in_string = !in_string;
+                continue;
+            }
+            if !in_string {
+                if b == b'{' {
+                    brace_depth += 1;
+                } else if b == b'}' {
+                    brace_depth -= 1;
+                    if brace_depth == 0 {
+                        json_end = Some(i + 1);
+                        break;
+                    }
+                }
+            }
+        }
+        let json_end = json_end.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HFQM metadata JSON did not end",
+            )
+        })?;
+        let metadata_json = String::from_utf8(meta_bytes[..json_end].to_vec()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("HFQM metadata is not UTF-8: {e}"),
+            )
+        })?;
+
+        let mut pos = metadata_offset + json_end;
+        if pos + 4 > data_offset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HFQM index missing tensor count",
+            ));
+        }
+        let idx_n = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()) as usize;
+        if idx_n != n_tensors {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("HFQM index count {idx_n} != header count {n_tensors}"),
+            ));
+        }
+        pos += 4;
+
+        let mut tensors = Vec::with_capacity(n_tensors);
+        let mut cumulative_offset = data_offset;
+        for _ in 0..n_tensors {
+            if pos + 2 > data_offset {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HFQM index truncated at name length",
+                ));
+            }
+            let name_len = u16::from_le_bytes(mmap[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            if pos + name_len + 2 > data_offset {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HFQM index truncated at name/shape header",
+                ));
+            }
+            let name = String::from_utf8(mmap[pos..pos + name_len].to_vec()).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("HFQM tensor name is not UTF-8: {e}"),
+                )
+            })?;
+            pos += name_len;
+            let quant_type = mmap[pos];
+            pos += 1;
+            let n_dims = mmap[pos] as usize;
+            pos += 1;
+            if pos + n_dims * 4 + 12 > data_offset {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HFQM index truncated at shape/data size",
+                ));
+            }
+            let mut shape = Vec::with_capacity(n_dims);
+            for _ in 0..n_dims {
+                shape.push(u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()));
+                pos += 4;
+            }
+            let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            if cumulative_offset + data_size > mmap.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "HFQM tensor {name} range {}..{} exceeds file size {}",
+                        cumulative_offset,
+                        cumulative_offset + data_size,
+                        mmap.len()
+                    ),
+                ));
+            }
+            tensors.push(HfqInputTensor {
+                name,
+                quant_type,
+                shape,
+                group_size,
+                data_offset: cumulative_offset,
+                data_size,
+            });
+            cumulative_offset += data_size;
+        }
+
+        Ok(Self {
+            _file: file,
+            mmap,
+            arch_id,
+            metadata_json,
+            tensors,
+        })
+    }
+
+    fn tensor_data(&self, t: &HfqInputTensor) -> &[u8] {
+        &self.mmap[t.data_offset..t.data_offset + t.data_size]
+    }
+}
+
+// ─── XXH64 provenance hashing ───────────────────────────────────────────────
+
+struct Xxh64 {
+    inner: XxHash64,
+}
+
+impl Xxh64 {
+    fn new(seed: u64) -> Self {
+        Self {
+            inner: XxHash64::with_seed(seed),
+        }
+    }
+
+    fn update(&mut self, input: &[u8]) {
+        self.inner.write(input);
+    }
+
+    fn digest(&self) -> u64 {
+        self.inner.finish()
+    }
+}
+
+#[cfg(test)]
+fn xxh64_hex(bytes: &[u8]) -> String {
+    let mut h = Xxh64::new(0);
+    h.update(bytes);
+    format!("{:016x}", h.digest())
+}
+
+fn xxh64_update_u8(h: &mut Xxh64, v: u8) {
+    h.update(&[v]);
+}
+
+fn xxh64_update_u32(h: &mut Xxh64, v: u32) {
+    h.update(&v.to_le_bytes());
+}
+
+fn xxh64_update_u64(h: &mut Xxh64, v: u64) {
+    h.update(&v.to_le_bytes());
+}
+
+fn hfq_quantization_hash_metadata(
+    tensors: &[HfqTensor],
+    spill: Option<&TensorSpill>,
+) -> std::io::Result<serde_json::Value> {
+    let mut h = Xxh64::new(0);
+    let mut payload_bytes = 0u64;
+    h.update(b"hipfire-hfq-quantized-tensor-payload-v1");
+
+    let mut spill_reader = if let Some(spill) = spill {
+        Some(std::io::BufReader::new(File::open(&spill.path)?))
+    } else {
+        None
+    };
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+
+    for t in tensors {
+        let name_bytes = t.name.as_bytes();
+        xxh64_update_u64(&mut h, name_bytes.len() as u64);
+        h.update(name_bytes);
+        xxh64_update_u8(&mut h, t.quant_type as u8);
+        xxh64_update_u64(&mut h, t.shape.len() as u64);
+        for &dim in &t.shape {
+            xxh64_update_u32(&mut h, dim);
+        }
+        xxh64_update_u32(&mut h, t.group_size);
+        let data_len = if t.spilled_len > 0 {
+            t.spilled_len
+        } else {
+            t.data.len() as u64
+        };
+        xxh64_update_u64(&mut h, data_len);
+        payload_bytes += data_len;
+
+        if t.spilled_len > 0 {
+            let reader = spill_reader
+                .as_mut()
+                .expect("spilled tensor requires spill reader");
+            let mut remaining = t.spilled_len as usize;
+            while remaining > 0 {
+                let chunk = remaining.min(buf.len());
+                use std::io::Read;
+                reader.read_exact(&mut buf[..chunk])?;
+                h.update(&buf[..chunk]);
+                remaining -= chunk;
+            }
+        } else {
+            h.update(&t.data);
+        }
+    }
+
+    Ok(serde_json::json!({
+        "algorithm": "xxh64",
+        "seed": 0,
+        "scope": "hfq_tensor_index_and_payload_v1",
+        "value": format!("{:016x}", h.digest()),
+        "tensor_count": tensors.len(),
+        "payload_bytes": payload_bytes,
+        "producer": {
+            "package": "hipfire-quantize",
+            "hipfire_version": env!("CARGO_PKG_VERSION"),
+            "git_commit": git_commit(),
+            "git_branch": git_branch(),
+            "git_describe": git_describe(),
+            "git_dirty": git_dirty(),
+        },
+    }))
+}
+
+fn metadata_with_quantization_hash(
+    mut metadata: serde_json::Value,
+    tensors: &[HfqTensor],
+    spill: Option<&TensorSpill>,
+) -> std::io::Result<String> {
+    let hash = hfq_quantization_hash_metadata(tensors, spill)?;
+    if let serde_json::Value::Object(ref mut map) = metadata {
+        map.insert("quantization_hash".to_string(), hash);
+    }
+    serde_json::to_string(&metadata)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn git_commit() -> Option<String> {
+    command_stdout("git", &["rev-parse", "HEAD"])
+}
+
+fn git_branch() -> Option<String> {
+    command_stdout("git", &["rev-parse", "--abbrev-ref", "HEAD"])
+}
+
+fn git_describe() -> Option<String> {
+    command_stdout("git", &["describe", "--always", "--dirty", "--tags"])
+}
+
+fn git_dirty() -> Option<bool> {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(!out.stdout.is_empty())
+}
+
 /// Streaming tensor spill file. When the quantizer accumulates more than
 /// `SPILL_THRESHOLD` bytes of tensor data in memory, it flushes completed
 /// tensors to this file. At write_hfq time, spilled data is copied from
@@ -3220,6 +3565,259 @@ fn resolve_model_path(input: &str) -> String {
 /// True if the path points to a `.gguf` file on disk.
 fn is_gguf_input(p: &Path) -> bool {
     p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("gguf")
+}
+
+fn is_hfq_input(p: &Path) -> bool {
+    p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("hfq")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HfqInputFormat {
+    F16,
+    Bf16,
+    Q8F16,
+    Hfq4,
+    Hfq6,
+    Mq4,
+    Mq6,
+    Mq3,
+}
+
+impl HfqInputFormat {
+    fn from_flag(flag: &str) -> Option<Self> {
+        match flag {
+            "fp16" | "f16" | "float16" => Some(Self::F16),
+            "bf16" | "bfloat16" => Some(Self::Bf16),
+            "q8f16" | "q8" => Some(Self::Q8F16),
+            "hfq4" | "hfq4g256" | "hf4" => Some(Self::Hfq4),
+            "hfq6" | "hfq6g256" | "hf6" => Some(Self::Hfq6),
+            "mq4" | "mq4g256" | "magnum" => Some(Self::Mq4),
+            "mq6" | "mq6g256" => Some(Self::Mq6),
+            "mq3" | "mq3g256" => Some(Self::Mq3),
+            _ => None,
+        }
+    }
+}
+
+fn hfq_source_dtype(qt: u8) -> Option<&'static str> {
+    match qt {
+        1 => Some("F16"),
+        2 => Some("F32"),
+        16 => Some("BF16"),
+        _ => None,
+    }
+}
+
+fn hfq_source_to_f32(name: &str, qt: u8, raw: &[u8]) -> Result<Vec<f32>, String> {
+    match qt {
+        1 => Ok(to_f32(raw, "F16")),
+        2 => Ok(to_f32(raw, "F32")),
+        16 => Ok(to_f32(raw, "BF16")),
+        other => Err(format!(
+            "HFQ input tensor '{name}' has quant_type={other}; only source-precision HFQ tensors are supported as quantizer input today (F16=1, F32=2, BF16=16)"
+        )),
+    }
+}
+
+fn source_precision_tensor_bytes(
+    raw_data: &[u8],
+    dtype: &str,
+    f32_data: &[f32],
+) -> (Vec<u8>, QuantType, &'static str) {
+    match dtype {
+        "BF16" => (raw_data.to_vec(), QuantType::BF16, "BF16"),
+        "F16" => (raw_data.to_vec(), QuantType::F16, "F16"),
+        "F32" => (f32_slice_to_f16_bytes(f32_data), QuantType::F16, "F16"),
+        other => panic!("unsupported dtype for source-precision HFQ: {other}"),
+    }
+}
+
+fn quantize_hfq_source_tensor(
+    name: &str,
+    raw: &[u8],
+    src_qt: u8,
+    shape: &[u32],
+    format: HfqInputFormat,
+) -> Result<(Vec<u8>, QuantType, u32, &'static str), String> {
+    let src_dtype = hfq_source_dtype(src_qt).ok_or_else(|| {
+        format!(
+            "HFQ input tensor '{name}' has quant_type={src_qt}; only source-precision HFQ tensors are supported as quantizer input today (F16=1, F32=2, BF16=16)"
+        )
+    })?;
+    let f32_data = hfq_source_to_f32(name, src_qt, raw)?;
+
+    if format == HfqInputFormat::Bf16 {
+        let (data, qt, label) = source_precision_tensor_bytes(raw, src_dtype, &f32_data);
+        return Ok((data, qt, 0, label));
+    }
+    if format == HfqInputFormat::F16 || !should_quantize(name) {
+        let data = match src_dtype {
+            "F16" => raw.to_vec(),
+            _ => f32_slice_to_f16_bytes(&f32_data),
+        };
+        return Ok((data, QuantType::F16, 0, "F16"));
+    }
+    let is_embed = name.contains("embed_tokens");
+    let is_moe_router =
+        name.ends_with("mlp.gate.weight") || name.ends_with("mlp.shared_expert_gate.weight");
+    if is_embed || is_moe_router || is_conv1d_tensor(name) || shape.len() != 2 {
+        return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+    }
+
+    let k = shape[1] as usize;
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+    let out = match format {
+        HfqInputFormat::Q8F16 => (quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"),
+        HfqInputFormat::Hfq4 => {
+            if k % 256 == 0 {
+                (
+                    quantize_hfq4g256(&f32_data),
+                    QuantType::HFQ4G256,
+                    256,
+                    "HFQ4G256",
+                )
+            } else {
+                (
+                    quantize_hfq4g128(&f32_data),
+                    QuantType::HFQ4G128,
+                    128,
+                    "HFQ4G128",
+                )
+            }
+        }
+        HfqInputFormat::Hfq6 => {
+            if k % 256 != 0 {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
+            (
+                quantize_hfq6g256(&f32_data),
+                QuantType::HFQ6G256,
+                256,
+                "HFQ6G256",
+            )
+        }
+        HfqInputFormat::Mq4 => {
+            if k % 256 != 0 {
+                return Ok((
+                    quantize_hfq4g128(&f32_data),
+                    QuantType::HFQ4G128,
+                    128,
+                    "HFQ4G128",
+                ));
+            }
+            (
+                quantize_mq4g256(&f32_data, &signs1, &signs2),
+                QuantType::MQ4G256,
+                256,
+                "MQ4G256",
+            )
+        }
+        HfqInputFormat::Mq6 => {
+            if k % 256 != 0 {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
+            (
+                quantize_mq6g256(&f32_data, &signs1, &signs2),
+                QuantType::MQ6G256,
+                256,
+                "MQ6G256",
+            )
+        }
+        HfqInputFormat::Mq3 => {
+            if k % 256 != 0 {
+                return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
+            }
+            (
+                quantize_mq3g256(&f32_data, &signs1, &signs2),
+                QuantType::MQ3G256,
+                256,
+                "MQ3G256",
+            )
+        }
+        HfqInputFormat::F16 | HfqInputFormat::Bf16 => unreachable!(),
+    };
+    Ok(out)
+}
+
+fn run_hfq_source_pipeline(
+    input: &Path,
+    output: &Path,
+    format: HfqInputFormat,
+) -> Result<(), String> {
+    let hfq = HfqInputFile::open(input).map_err(|e| format!("open HFQ input: {e}"))?;
+    eprintln!(
+        "HFQ input: arch_id={} tensors={} format={format:?}",
+        hfq.arch_id,
+        hfq.tensors.len()
+    );
+
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(&hfq.metadata_json).unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(ref mut map) = metadata {
+        map.insert("source".to_string(), serde_json::json!("hfq"));
+        map.insert(
+            "source_hfq".to_string(),
+            serde_json::json!({
+                "path": input.display().to_string(),
+                "input_arch_id": hfq.arch_id,
+                "accepted_quant_types": ["F16", "F32", "BF16"],
+            }),
+        );
+    }
+
+    let mut hfq_tensors = Vec::with_capacity(hfq.tensors.len());
+    let mut total_params = 0u64;
+    let mut quantized_params = 0u64;
+    for t in &hfq.tensors {
+        let raw = hfq.tensor_data(t);
+        let n_elements = t.shape.iter().map(|&d| d as u64).product::<u64>();
+        total_params += n_elements;
+        let (data, qt, group_size, label) =
+            quantize_hfq_source_tensor(&t.name, raw, t.quant_type, &t.shape, format)?;
+        if qt as u8 != t.quant_type || group_size != t.group_size {
+            quantized_params += n_elements;
+        }
+        eprintln!(
+            "  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB)",
+            t.name,
+            t.shape,
+            n_elements,
+            raw.len() as f64 / 1024.0,
+            data.len() as f64 / 1024.0
+        );
+        hfq_tensors.push(HfqTensor {
+            name: t.name.clone(),
+            quant_type: qt,
+            shape: t.shape.clone(),
+            group_size,
+            data,
+            spilled_len: 0,
+        });
+    }
+
+    let total_bytes: usize = hfq_tensors.iter().map(|t| t.data.len()).sum();
+    eprintln!("\n=== HFQ Input Quantization Summary ===");
+    eprintln!("  Total params:     {total_params}");
+    eprintln!(
+        "  Rewritten params: {quantized_params} ({:.1}%)",
+        if total_params > 0 {
+            100.0 * quantized_params as f64 / total_params as f64
+        } else {
+            0.0
+        }
+    );
+    eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
+    eprintln!("\nWriting: {}", output.display());
+    let metadata_json =
+        metadata_with_quantization_hash(metadata, &hfq_tensors, None).map_err(|e| e.to_string())?;
+    write_hfq(output, hfq.arch_id, &metadata_json, &hfq_tensors, None)
+        .map_err(|e| format!("write HFQ output: {e}"))?;
+    let file_size = std::fs::metadata(output)
+        .map_err(|e| format!("stat HFQ output: {e}"))?
+        .len();
+    eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
+    Ok(())
 }
 
 /// Translate llama.cpp GGUF tensor names to the HuggingFace safetensors
@@ -4688,7 +5286,22 @@ fn main() {
     // `gemv_mq4g256_with_rotate`) but adds runtime rotation overhead
     // with no quality benefit.
     {
-        let raw_input = Path::new(input_dir.as_str());
+        let raw_input = Path::new(input_dir);
+        if is_hfq_input(raw_input) {
+            let hfq_format = HfqInputFormat::from_flag(format).unwrap_or_else(|| {
+                eprintln!(
+                    "HFQ input: --format '{format}' not recognized. \
+                     Supported: bf16, fp16, q8f16, hfq4, hfq6, mq4, mq6, mq3."
+                );
+                std::process::exit(2);
+            });
+            let out = Path::new(output_path);
+            if let Err(e) = run_hfq_source_pipeline(raw_input, out, hfq_format) {
+                eprintln!("HFQ input pipeline failed: {e}");
+                std::process::exit(2);
+            }
+            return;
+        }
         if is_gguf_input(raw_input) {
             let gguf_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
                 eprintln!(
@@ -7690,6 +8303,104 @@ mod hfq_block_diag {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn chat_template_override_replaces_existing_template() {
+        let original = Some(json!({
+            "chat_template": "old",
+            "eos_token": "<|im_end|>"
+        }));
+        let updated = tokenizer_config_with_chat_template(original, "new-template".to_string());
+        assert_eq!(updated["chat_template"], "new-template");
+        assert_eq!(updated["eos_token"], "<|im_end|>");
+    }
+
+    #[test]
+    fn chat_template_override_creates_minimal_config_when_missing() {
+        let updated = tokenizer_config_with_chat_template(None, "{{ messages }}".to_string());
+        assert_eq!(updated, json!({ "chat_template": "{{ messages }}" }));
+    }
+
+    #[test]
+    fn chat_template_override_replaces_non_object_config_with_minimal_object() {
+        let updated = tokenizer_config_with_chat_template(
+            Some(json!("unexpected")),
+            "{% for message in messages %}{{ message.content }}{% endfor %}".to_string(),
+        );
+        assert_eq!(
+            updated,
+            json!({ "chat_template": "{% for message in messages %}{{ message.content }}{% endfor %}" })
+        );
+    }
+
+    #[test]
+    fn gguf_format_accepts_fp16_aliases() {
+        for alias in ["fp16", "f16", "float16"] {
+            assert_eq!(GgufFormat::from_flag(alias), Some(GgufFormat::F16));
+        }
+        assert_eq!(GgufFormat::F16.label(), "F16");
+        for alias in ["bf16", "bfloat16"] {
+            assert_eq!(GgufFormat::from_flag(alias), Some(GgufFormat::Bf16));
+        }
+        assert_eq!(GgufFormat::Bf16.label(), "BF16");
+    }
+
+    #[test]
+    fn format_flags_are_canonicalized_before_dispatch() {
+        assert_eq!(normalize_format_flag(" BF16 "), "bf16");
+        assert_eq!(normalize_format_flag("Mq4G256"), "mq4g256");
+    }
+
+    #[test]
+    fn hfq_input_format_accepts_quantizer_defaults() {
+        assert_eq!(
+            HfqInputFormat::from_flag("q8f16"),
+            Some(HfqInputFormat::Q8F16)
+        );
+        assert_eq!(HfqInputFormat::from_flag("q8"), Some(HfqInputFormat::Q8F16));
+        assert_eq!(HfqInputFormat::from_flag("mq4"), Some(HfqInputFormat::Mq4));
+        assert_eq!(
+            HfqInputFormat::from_flag("bf16"),
+            Some(HfqInputFormat::Bf16)
+        );
+    }
+
+    #[test]
+    fn hfq_input_rejects_already_quantized_source_tensors() {
+        let result = quantize_hfq_source_tensor(
+            "model.layers.0.mlp.down_proj.weight",
+            &[0; 136],
+            QuantType::MQ4G256 as u8,
+            &[1, 256],
+            HfqInputFormat::Mq4,
+        );
+        let err = match result {
+            Ok(_) => panic!("already-quantized HFQ tensor was accepted"),
+            Err(err) => err,
+        };
+        assert!(err.contains("only source-precision HFQ tensors are supported"));
+    }
+
+    #[test]
+    fn source_precision_preserves_bf16_bytes() {
+        let raw = vec![0x34, 0x12, 0x78, 0x56];
+        let f32_data = [1.0, 2.0];
+        let (data, quant_type, label) = source_precision_tensor_bytes(&raw, "BF16", &f32_data);
+        assert_eq!(data, raw);
+        assert_eq!(quant_type as u8, QuantType::BF16 as u8);
+        assert_eq!(label, "BF16");
+    }
+
+    #[test]
+    fn source_precision_preserves_f16_bytes() {
+        let raw = vec![0x00, 0x3c, 0x00, 0x40];
+        let f32_data = [1.0, 2.0];
+        let (data, quant_type, label) = source_precision_tensor_bytes(&raw, "F16", &f32_data);
+        assert_eq!(data, raw);
+        assert_eq!(quant_type as u8, QuantType::F16 as u8);
+        assert_eq!(label, "F16");
+    }
 
     #[test]
     fn e2m1_lookup_matches_ocp_spec() {

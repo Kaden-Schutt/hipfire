@@ -1,7 +1,7 @@
 # Quantize
 
 `hipfire quantize` is a CPU-only tool that converts model weights into
-hipfire's native quantized formats. Three input shapes are supported.
+hipfire's native quantized formats. Four input shapes are supported.
 Output is a single file the daemon mmaps directly.
 
 ## Pick a format
@@ -41,7 +41,8 @@ Useful flags:
 
 | Flag | Purpose |
 |---|---|
-| `--format <fmt>` | Repeatable. Defaults: `mq4` (safetensors), `hf4` (GGUF). |
+| `--format <fmt>` | Repeatable. Defaults: `mq4` (safetensors / source-precision HFQ), `hf4` (GGUF). |
+| `--chat-template-file <path>` | Override the embedded `tokenizer_config.chat_template` for safetensors input. The file is read as UTF-8 and the quantizer fails before writing if it cannot be read. |
 | `--both` | Shorthand for `--format mq4 --format mq6`. |
 | `-o, --output <path>` | Single-format output path. |
 | `--output-dir <dir>` | Multi-format output directory. |
@@ -110,6 +111,30 @@ Q4_0  Q8_0  Q4_K  Q6_K  F16  BF16  F32
 Q5_K, Q5_0, Q5_1, IQ2_*, IQ3_*, IQ4_* are not implemented. The
 quantizer panics on encounter. Adding one is a ~150-line port from
 llama.cpp's `ggml-quants.c` to `crates/hipfire-quantize/src/gguf_input.rs`.
+
+## From source-precision HFQ
+
+```bash
+hipfire quantize ~/.hipfire/models/qwen3.5-0.8b-bf16.hfq \
+    --format mq4 \
+    -o qwen3.5-0.8b-mq4.hfq
+```
+
+HFQ input is supported for source-precision containers: tensor
+`quant_type` must be F16 (`1`), F32 (`2`), or BF16 (`16`). This covers
+BF16 smoke/reference artifacts emitted by hipfire itself and preserves
+the original HFQ metadata and architecture id in the output.
+
+Already-quantized HFQ input is intentionally rejected for now. Files
+containing tensors such as Q8F16, HFQ4, MQ4, MQ6, or Lloyd formats need
+format-specific dequantizers before they can be safely re-quantized; the
+quantizer reports the first unsupported tensor and quant type instead of
+silently accumulating untracked error.
+
+Per-tensor format selection for source-precision HFQ matches the normal
+base-format policy: embeddings, MoE routers, DeltaNet `conv1d`, and
+non-2D tensors use Q8F16 or F16 as appropriate; regular 2D weights use
+the requested format when the `K` dimension is compatible.
 
 ## Quality caveat for GGUF
 
