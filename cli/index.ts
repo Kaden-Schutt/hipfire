@@ -4720,6 +4720,16 @@ function findDep(binary: string, extraDirs: string[]): string | null {
 
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
+  case "eval": {
+    const { runEvalCommand } = await import("./eval.ts");
+    await runEvalCommand(rest);
+    break;
+  }
+  case "host-profile": {
+    const { runHostProfileCommand } = await import("./host_profile.ts");
+    await runHostProfileCommand(rest);
+    break;
+  }
   case "serve": {
     // Parse flags: `hipfire serve [host] [port] [-d|--detach]`.
     // Also accepts `host:port`, e.g. `hipfire serve 0.0.0.0:11435`.
@@ -5166,7 +5176,7 @@ switch (cmd) {
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
-      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "-p", "hipfire-runtime"],
+      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "--bin", "hipfire-eval", "--bin", "hipfire-host-profile", "-p", "hipfire-runtime"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
     if (build.exitCode !== 0) {
@@ -5195,7 +5205,7 @@ switch (cmd) {
       if (existsSync(src)) { copyFileSync(src, dst); }
     }
     // Workspace binaries (e.g. hipfire-quantize) live under target/release/
-    for (const bin of ["hipfire-quantize"]) {
+    for (const bin of ["hipfire-quantize", "hipfire-eval", "hipfire-host-profile"]) {
       const src = join(repoDir, `target/release/${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
@@ -5482,7 +5492,8 @@ switch (cmd) {
     console.log("\nDone.");
     break;
   }
-  case "bench": {
+  case "bench":
+  case "benchmark": {
     const exp = rest.includes("--exp");
     const runsIdx = rest.indexOf("--runs");
     const runs = runsIdx >= 0 && runsIdx + 1 < rest.length ? parseInt(rest[runsIdx + 1]) : 5;
@@ -5495,6 +5506,7 @@ switch (cmd) {
     const benchModel = positional[0];
     if (!benchModel) {
       console.error(`Usage: hipfire bench <model> [--exp] [--runs N] [prompt]
+       hipfire benchmark <model> [--exp] [--runs N] [prompt]
 
   Standard benchmark: measure decode + prefill tok/s over N runs.
   --exp    RDNA2 only: test all 5 kernel variants (occupancy/unroll/cache tradeoffs)
@@ -6107,7 +6119,10 @@ Examples:
                         Start OpenAI-compatible server (-d = background daemon)
   stop                  Stop the background serve daemon
   quantize <hf-id|dir>  Quantize to MQ4/MQ6 (CPU) — with optional HF upload
+  eval <opts>           Run quant admission/model eval harness
+  host-profile [opts]   Measure host, GPU-copy, and ~/.hipfire/models bandwidth
   bench <model> [opts]  Benchmark tok/s (--exp for RDNA2 variant sweep, --runs N)
+  benchmark <model>     Alias for bench
   profile [model]       Kernel efficiency profiler (--json, --kernel <name>)
   list [-r]             Show local models (-r: show available too)
   config                Interactive settings editor (TUI); also: config [list|set|get|reset]

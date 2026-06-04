@@ -12,7 +12,297 @@ use memmap2::Mmap;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+
+pub const HFQM_MAGIC: &[u8; 4] = b"HFQM";
+pub const HFQM_VERSION: u32 = 1;
+/// Reserved `arch_id` for HFQM containers that are not direct model-weight
+/// packages. KLD references, imatrix captures, CASK/TriAttention centers, and
+/// other sidecar-style artifacts should use this value and describe their
+/// semantics through metadata `artifact_kind` plus named package entries.
+pub const HFQM_ARCH_NON_WEIGHT_PACKAGE: u32 = 0;
+
+#[derive(Debug, Clone)]
+pub struct HfqPackageEntry {
+    pub name: String,
+    pub quant_type: u8,
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub data_offset: usize,
+    pub data_size: usize,
+}
+
+pub struct HfqPackage {
+    _file: File,
+    mmap: Mmap,
+    pub version: u32,
+    pub arch_id: u32,
+    pub metadata_json: String,
+    entries: Vec<HfqPackageEntry>,
+    entry_map: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HfqPackageWriteEntry {
+    pub name: String,
+    pub quant_type: u8,
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub source_path: std::path::PathBuf,
+    pub data_size: u64,
+}
+
+fn json_blob_end(bytes: &[u8]) -> Option<usize> {
+    let mut brace_depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if b == b'\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if b == b'"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string {
+            if b == b'{' {
+                brace_depth += 1;
+            } else if b == b'}' {
+                brace_depth -= 1;
+                if brace_depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_hfqm_index(
+    mmap: &[u8],
+    base: usize,
+    metadata_offset: usize,
+    data_offset: usize,
+    n_entries: usize,
+) -> std::io::Result<(String, Vec<HfqPackageEntry>, HashMap<String, usize>)> {
+    if metadata_offset > data_offset || data_offset > mmap.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid HFQM offsets metadata={metadata_offset} data={data_offset}"),
+        ));
+    }
+    let meta_bytes = &mmap[metadata_offset..data_offset];
+    let json_end = json_blob_end(meta_bytes).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQM metadata JSON did not end",
+        )
+    })?;
+    let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
+    let mut pos = metadata_offset + json_end;
+    if pos + 4 > data_offset {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "HFQM index missing tensor count",
+        ));
+    }
+    let idx_n = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()) as usize;
+    if idx_n != n_entries {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("HFQM index count {idx_n} != header count {n_entries}"),
+        ));
+    }
+    pos += 4;
+
+    let mut entries = Vec::with_capacity(n_entries);
+    let mut entry_map = HashMap::new();
+    let mut cumulative_offset = data_offset;
+    for i in 0..n_entries {
+        if pos + 2 > data_offset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "HFQM index truncated at name length",
+            ));
+        }
+        let name_len = u16::from_le_bytes(mmap[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        if pos + name_len + 2 > data_offset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "HFQM index truncated at name/shape header",
+            ));
+        }
+        let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
+        pos += name_len;
+        let quant_type = mmap[pos];
+        pos += 1;
+        let n_dims = mmap[pos] as usize;
+        pos += 1;
+        if pos + n_dims * 4 + 12 > data_offset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "HFQM index truncated at shape/data_size",
+            ));
+        }
+        let mut shape = Vec::with_capacity(n_dims);
+        for _ in 0..n_dims {
+            shape.push(u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()));
+            pos += 4;
+        }
+        let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        if cumulative_offset + data_size > mmap.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "HFQM entry {name} data range {}..{} exceeds file size {}",
+                    cumulative_offset,
+                    cumulative_offset + data_size,
+                    mmap.len()
+                ),
+            ));
+        }
+        entry_map.insert(name.clone(), i);
+        entries.push(HfqPackageEntry {
+            name,
+            quant_type,
+            shape,
+            group_size,
+            data_offset: cumulative_offset - base,
+            data_size,
+        });
+        cumulative_offset += data_size;
+    }
+    Ok((metadata_json, entries, entry_map))
+}
+
+impl HfqPackage {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        if mmap.len() < 32 || &mmap[0..4] != HFQM_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not an HFQM package",
+            ));
+        }
+        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        let arch_id = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
+        let n_entries = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
+        let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
+        let data_offset = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+        let (metadata_json, entries, entry_map) =
+            parse_hfqm_index(&mmap, 0, metadata_offset, data_offset, n_entries)?;
+        Ok(Self {
+            _file: file,
+            mmap,
+            version,
+            arch_id,
+            metadata_json,
+            entries,
+            entry_map,
+        })
+    }
+
+    pub fn entries(&self) -> &[HfqPackageEntry] {
+        &self.entries
+    }
+
+    pub fn entry(&self, name: &str) -> Option<&HfqPackageEntry> {
+        self.entry_map.get(name).map(|&idx| &self.entries[idx])
+    }
+
+    pub fn blob_data(&self, name: &str) -> Option<&[u8]> {
+        let entry = self.entry(name)?;
+        Some(&self.mmap[entry.data_offset..entry.data_offset + entry.data_size])
+    }
+}
+
+pub fn write_hfqm_package_from_files(
+    path: &Path,
+    arch_id: u32,
+    metadata_json: &str,
+    entries: &[HfqPackageWriteEntry],
+) -> std::io::Result<()> {
+    let mut f = File::create(path)?;
+    let metadata_bytes = metadata_json.as_bytes();
+    let metadata_offset = 32u64;
+    let index_offset = metadata_offset + metadata_bytes.len() as u64;
+    let mut index = Vec::new();
+    index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        let name_bytes = entry.name.as_bytes();
+        if name_bytes.len() > u16::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("HFQM entry name too long: {}", entry.name),
+            ));
+        }
+        if entry.shape.len() > u8::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("HFQM entry has too many dims: {}", entry.name),
+            ));
+        }
+        index.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        index.extend_from_slice(name_bytes);
+        index.push(entry.quant_type);
+        index.push(entry.shape.len() as u8);
+        for &dim in &entry.shape {
+            index.extend_from_slice(&dim.to_le_bytes());
+        }
+        index.extend_from_slice(&entry.group_size.to_le_bytes());
+        index.extend_from_slice(&entry.data_size.to_le_bytes());
+    }
+    let data_start_unaligned = index_offset + index.len() as u64;
+    let data_offset = (data_start_unaligned + 4095) & !4095;
+
+    f.write_all(HFQM_MAGIC)?;
+    f.write_all(&HFQM_VERSION.to_le_bytes())?;
+    f.write_all(&arch_id.to_le_bytes())?;
+    f.write_all(&(entries.len() as u32).to_le_bytes())?;
+    f.write_all(&metadata_offset.to_le_bytes())?;
+    f.write_all(&data_offset.to_le_bytes())?;
+    f.write_all(metadata_bytes)?;
+    f.write_all(&index)?;
+    let pad_size = (data_offset - data_start_unaligned) as usize;
+    if pad_size > 0 {
+        f.write_all(&vec![0u8; pad_size])?;
+    }
+    let mut buf = vec![0u8; 16 * 1024 * 1024];
+    for entry in entries {
+        let expected = std::fs::metadata(&entry.source_path)?.len();
+        if expected != entry.data_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HFQM entry {} source size {} != declared {}",
+                    entry.name, expected, entry.data_size
+                ),
+            ));
+        }
+        let mut src = File::open(&entry.source_path)?;
+        src.seek(SeekFrom::Start(0))?;
+        loop {
+            let n = src.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            f.write_all(&buf[..n])?;
+        }
+    }
+    f.flush()?;
+    Ok(())
+}
 
 /// Drop page cache for a file byte range via posix_fadvise(FADV_DONTNEED).
 /// On unified-memory APUs (e.g. Strix Halo), mmap'd model data and
@@ -1261,6 +1551,79 @@ pub fn load_weights_hfq(
         output,
         layers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "hipfire-hfqm-package-test-{}-{name}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn writes_and_reads_non_weight_hfqm_package() {
+        let payload_a = temp_path("tokens.bin");
+        let payload_b = temp_path("values.bin");
+        let package_path = temp_path("ref.kldref.hfq");
+        std::fs::write(&payload_a, [1u8, 2, 3, 4]).unwrap();
+        std::fs::write(&payload_b, [5u8, 6, 7, 8, 9, 10, 11, 12]).unwrap();
+
+        let metadata = serde_json::json!({
+            "artifact_kind": "hipfire.kldref",
+            "package_schema": "hipfire.kldref.v1",
+            "n_ctx": 2,
+            "n_chunk": 1,
+            "top_k": 1
+        })
+        .to_string();
+        let entries = vec![
+            HfqPackageWriteEntry {
+                name: "kldref.tokens".to_string(),
+                quant_type: 0,
+                shape: vec![1, 2],
+                group_size: 0,
+                source_path: payload_a.clone(),
+                data_size: 4,
+            },
+            HfqPackageWriteEntry {
+                name: "kldref.top_log_probs".to_string(),
+                quant_type: 0,
+                shape: vec![1, 1, 2],
+                group_size: 0,
+                source_path: payload_b.clone(),
+                data_size: 8,
+            },
+        ];
+        write_hfqm_package_from_files(
+            &package_path,
+            HFQM_ARCH_NON_WEIGHT_PACKAGE,
+            &metadata,
+            &entries,
+        )
+        .unwrap();
+
+        let package = HfqPackage::open(&package_path).unwrap();
+        assert_eq!(package.version, HFQM_VERSION);
+        assert_eq!(package.arch_id, HFQM_ARCH_NON_WEIGHT_PACKAGE);
+        assert!(package
+            .metadata_json
+            .contains("\"artifact_kind\":\"hipfire.kldref\""));
+        assert_eq!(package.entries().len(), 2);
+        assert_eq!(package.entry("kldref.tokens").unwrap().shape, vec![1, 2]);
+        assert_eq!(package.blob_data("kldref.tokens").unwrap(), &[1, 2, 3, 4]);
+        assert_eq!(
+            package.blob_data("kldref.top_log_probs").unwrap(),
+            &[5, 6, 7, 8, 9, 10, 11, 12]
+        );
+
+        let _ = std::fs::remove_file(payload_a);
+        let _ = std::fs::remove_file(payload_b);
+        let _ = std::fs::remove_file(package_path);
+    }
 }
 
 // ─── ParoQuant safetensors loading (LLaMA / Qwen3 arch) ────────────────────

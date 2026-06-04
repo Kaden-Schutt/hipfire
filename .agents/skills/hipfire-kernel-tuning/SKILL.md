@@ -43,6 +43,12 @@ gfx94x matrix.
    WMMA C-mapping silent-corruption fix. Read these to calibrate
    what a real win looks like vs a measurement artifact.
 
+For WMMA/MFMA operand layouts, register/lane mappings, or instruction
+availability, also use `.agents/skills/hipfire-amd-matrix-calculator/`.
+It wraps the vendored AMD Matrix Instruction Calculator at
+`third_party/amd_matrix_instruction_calculator/matrix_calculator.py` and
+should be preferred over memory-derived mapping guesses.
+
 ## Key rules
 
 - **Trust the speed-gate, not your gut.** Within-session A/B noise
@@ -67,6 +73,9 @@ gfx94x matrix.
   skill covers porting an EXISTING kernel to a new GPU family. This
   skill covers MAKING an existing kernel faster on the archs it
   already runs on.
+- **Matrix-instruction layout lookup** — see
+  `.agents/skills/hipfire-amd-matrix-calculator/` before deriving
+  WMMA/MFMA register mappings by hand.
 - **DFlash spec-decode tuning** — those wins come from algorithm
   changes (n-gram cache, prompt shape, draft retraining), not kernel
   ISA work. See `crates/hipfire-runtime/src/dflash.rs` and the
@@ -84,5 +93,8 @@ gfx94x matrix.
 - [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) — the dispatch
   layering + two-model-paths surface that constrains where new
   variants can plug in.
+- [`.agents/skills/hipfire-amd-matrix-calculator/`](../hipfire-amd-matrix-calculator/SKILL.md) —
+  local workflow for using the vendored AMD Matrix Instruction
+  Calculator on WMMA/MFMA layouts and instruction details.
 - `tests/speed-baselines/<arch>.txt` — the committed perf floor per
   arch. The speed-gate compares against these.

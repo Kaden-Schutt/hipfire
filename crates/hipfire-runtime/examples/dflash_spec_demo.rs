@@ -93,6 +93,270 @@ fn main() {
         }
     }
 
+    fn write_json_pretty(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::to_string_pretty(value)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, format!("{body}\n"))
+    }
+
+    fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+        std::process::Command::new(program)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|stdout| stdout.trim().to_string())
+            .filter(|stdout| !stdout.is_empty())
+    }
+
+    fn git_dirty() -> Option<bool> {
+        command_stdout("git", &["status", "--porcelain"]).map(|stdout| !stdout.is_empty())
+    }
+
+    fn command_digest(tool: &str, path: &Path) -> Option<String> {
+        std::process::Command::new(tool)
+            .arg(path)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|stdout| stdout.split_whitespace().next().map(str::to_string))
+    }
+
+    fn hipfire_runtime_context() -> serde_json::Value {
+        use serde_json::json;
+
+        let binary_path = std::env::current_exe().ok();
+        json!({
+            "schema": 1,
+            "runner": "hipfire-runtime/examples/dflash_spec_demo",
+            "hipfire_version": env!("CARGO_PKG_VERSION"),
+            "git_commit": command_stdout("git", &["rev-parse", "HEAD"]),
+            "git_branch": command_stdout("git", &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "git_describe": command_stdout("git", &["describe", "--always", "--dirty", "--tags"]),
+            "git_dirty": git_dirty(),
+            "binary_path": binary_path.as_ref().map(|path| path.display().to_string()),
+            "binary_hash": binary_path.as_deref().and_then(|path| command_digest("sha256sum", path)),
+        })
+    }
+
+    fn append_evidence_record(
+        dir: &Path,
+        kind: &str,
+        record: serde_json::Value,
+        runtime_context: &serde_json::Value,
+    ) -> std::io::Result<()> {
+        use serde_json::json;
+
+        let path = dir.join(format!("{kind}.json"));
+        let mut records = if path.exists() {
+            let body = std::fs::read_to_string(&path)?;
+            serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| value.get("records").and_then(|v| v.as_array()).cloned())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        records.push(record);
+        write_json_pretty(
+            &path,
+            &json!({
+                "schema": 1,
+                "kind": kind,
+                "hipfire_runtime_context": runtime_context,
+                "records": records,
+            }),
+        )
+    }
+
+    fn write_decode_evidence(
+        dir: &Path,
+        mode: &str,
+        row_label: &str,
+        prompt_tokens: usize,
+        emitted_tokens: usize,
+        prefill_secs: f64,
+        decode_secs: f64,
+        ttft_ms: f64,
+        tau: f64,
+        accept_rate: f64,
+        cycles: usize,
+        committed_tokens: usize,
+        accepted_tokens: usize,
+        vram_used_mb: u64,
+        vram_total_mb: u64,
+    ) -> std::io::Result<()> {
+        use hip_bridge::launch_counters as lc;
+        use serde_json::json;
+
+        let runtime_context = hipfire_runtime_context();
+        let case_id = if row_label.is_empty() {
+            format!("{mode}_anchor")
+        } else {
+            row_label.to_string()
+        };
+        let prefill_tok_s = prompt_tokens as f64 / prefill_secs.max(1e-9);
+        let decode_tok_s = emitted_tokens as f64 / decode_secs.max(1e-9);
+        append_evidence_record(
+            dir,
+            "performance",
+            json!({
+                "case_id": case_id,
+                "mode": mode,
+                "hipfire_runtime_context": runtime_context,
+                "metrics": {
+                    "tok_s": decode_tok_s,
+                    "decode_tok_s": decode_tok_s,
+                    "prefill_tok_s": prefill_tok_s,
+                    "ttft_ms": ttft_ms,
+                    "prompt_tokens": prompt_tokens,
+                    "decode_tokens_emitted": emitted_tokens,
+                }
+            }),
+            &runtime_context,
+        )?;
+        append_evidence_record(
+            dir,
+            "phase_timings",
+            json!({
+                "case_id": case_id,
+                "mode": mode,
+                "hipfire_runtime_context": runtime_context,
+                "metrics": {
+                    "prefill_ms": prefill_secs * 1000.0,
+                    "decode_ms": decode_secs * 1000.0,
+                    "ttft_ms": ttft_ms,
+                }
+            }),
+            &runtime_context,
+        )?;
+        append_evidence_record(
+            dir,
+            "memory",
+            json!({
+                "case_id": case_id,
+                "mode": mode,
+                "hipfire_runtime_context": runtime_context,
+                "metrics": {
+                    "vram_peak_bytes": (vram_used_mb as f64) * 1024.0 * 1024.0,
+                    "vram_used_mb": vram_used_mb,
+                    "vram_total_mb": vram_total_mb,
+                }
+            }),
+            &runtime_context,
+        )?;
+        append_evidence_record(
+            dir,
+            "launch_counts",
+            json!({
+                "case_id": case_id,
+                "mode": mode,
+                "hipfire_runtime_context": runtime_context,
+                "metrics": {
+                    "kernel_launches": lc::launch_kernel::count(),
+                    "graph_launches": lc::graph_launch::count(),
+                    "memcpy_htod_ops": lc::memcpy_htod::count(),
+                    "memcpy_dtoh_ops": lc::memcpy_dtoh::count(),
+                    "memcpy_dtod_ops": lc::memcpy_dtod::count(),
+                    "memcpy_ops": lc::memcpy_htod::count() + lc::memcpy_dtoh::count() + lc::memcpy_dtod::count(),
+                    "memset_ops": lc::memset::count(),
+                    "stream_sync_ops": lc::stream_sync::count(),
+                    "device_sync_ops": lc::device_sync::count(),
+                    "kernel_launch_time_ns": lc::launch_kernel::time_ns(),
+                    "graph_launch_time_ns": lc::graph_launch::time_ns(),
+                    "counting_scope": "hip_bridge_launch_counters_since_row_reset",
+                }
+            }),
+            &runtime_context,
+        )?;
+        append_evidence_record(
+            dir,
+            "dflash_trace",
+            json!({
+                "case_id": case_id,
+                "mode": mode,
+                "hipfire_runtime_context": runtime_context,
+                "metrics": {
+                    "mode": mode,
+                    "tok_s": decode_tok_s,
+                    "ar_tok_s": if mode == "ar" { Some(decode_tok_s) } else { None },
+                    "dflash_tok_s": if mode == "dflash" { Some(decode_tok_s) } else { None },
+                    "tau": tau,
+                    "accept_rate": accept_rate,
+                    "cycles": cycles,
+                    "committed_tokens": committed_tokens,
+                    "accepted_tokens": accepted_tokens,
+                    "decode_tokens_emitted": emitted_tokens,
+                }
+            }),
+            &runtime_context,
+        )
+    }
+
+    fn write_profile_evidence(
+        dir: &Path,
+        row_label: &str,
+        entries: &[rdna_compute::profile::ProfileEntry],
+        profile_cycle_count: usize,
+    ) -> std::io::Result<()> {
+        use serde_json::json;
+        use std::collections::HashMap;
+
+        let mut by_kernel: HashMap<&str, (&str, f64, usize, usize)> = HashMap::new();
+        for entry in entries {
+            let row = by_kernel
+                .entry(entry.kernel)
+                .or_insert((entry.category, 0.0, 0, 0));
+            row.1 += entry.time_us;
+            row.2 += 1;
+            row.3 += entry.bytes;
+        }
+        let mut kernels: Vec<_> = by_kernel.into_iter().collect();
+        kernels.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+        let total_us: f64 = kernels.iter().map(|(_, (_, time_us, _, _))| *time_us).sum();
+        let runtime_context = hipfire_runtime_context();
+        let case_id = if row_label.is_empty() {
+            "dflash_anchor".to_string()
+        } else {
+            row_label.to_string()
+        };
+        for (kernel_name, (category, duration_us, call_count, bytes)) in kernels {
+            let bandwidth_gb_s = if duration_us > 0.0 {
+                bytes as f64 / duration_us / 1.0e3
+            } else {
+                0.0
+            };
+            append_evidence_record(
+                dir,
+                "profiling",
+                json!({
+                    "case_id": case_id,
+                    "mode": "dflash",
+                    "hipfire_runtime_context": runtime_context,
+                    "metrics": {
+                        "kernel_name": kernel_name,
+                        "category": category,
+                        "duration_us": duration_us,
+                        "call_count": call_count,
+                        "avg_duration_us": duration_us / (call_count.max(1) as f64),
+                        "time_pct": if total_us > 0.0 { duration_us / total_us } else { 0.0 },
+                        "bytes": bytes,
+                        "bandwidth_gb_s": bandwidth_gb_s,
+                        "profile_cycle_count": profile_cycle_count,
+                        "profile_entry_count": entries.len(),
+                    }
+                }),
+                &runtime_context,
+            )?;
+        }
+        Ok(())
+    }
+
     // ── Parse args ─────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -203,6 +467,7 @@ fn main() {
     // forward_prefill_batch on committed tokens (byte-exact vs AR when
     // combined with HIPFIRE_PREFILL_BATCHED=0).
     let mut no_tape: bool = false;
+    let mut evidence_dir: Option<String> = std::env::var("HIPFIRE_EVAL_EVIDENCE_DIR").ok();
 
     // FlashCASK: TriAttention scoring + CASK core-aware m-folding merge
     // applied to target.kv_cache between spec_step cycles. Passes the
@@ -411,6 +676,10 @@ fn main() {
             "--no-tape" => {
                 no_tape = true;
                 i += 1;
+            }
+            "--evidence-dir" => {
+                evidence_dir = Some(args[i + 1].clone());
+                i += 2;
             }
             "--cask-sidecar" => {
                 cask_sidecar = Some(args[i + 1].clone());
@@ -1375,6 +1644,27 @@ fn main() {
             let vram_used_mb = ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64
                 / (1024.0 * 1024.0)) as u64;
             let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
+            if let Some(dir) = evidence_dir.as_deref() {
+                if let Err(err) = write_decode_evidence(
+                    Path::new(dir),
+                    "ar",
+                    row_label,
+                    prompt_tokens.len(),
+                    emitted.len(),
+                    prefill_secs,
+                    ar_elapsed,
+                    ar_ttft_ms,
+                    1.0,
+                    1.0,
+                    emitted.len(),
+                    emitted.len(),
+                    0,
+                    vram_used_mb,
+                    vram_total_mb,
+                ) {
+                    eprintln!("warning: failed to write --evidence-dir {dir}: {err}");
+                }
+            }
             eprintln!("=== BENCH METRICS ===");
             eprintln!("prompt_tokens: {}", prompt_tokens.len());
             eprintln!("prefill_secs: {:.4}", prefill_secs);
@@ -1509,6 +1799,16 @@ fn main() {
             {
                 profile_cycle_count = stats.cycles - 1;
                 if let Some(entries) = rdna_compute::profile::stop() {
+                    if let Some(dir) = evidence_dir.as_deref() {
+                        if let Err(err) = write_profile_evidence(
+                            Path::new(dir),
+                            row_label,
+                            &entries,
+                            profile_cycle_count,
+                        ) {
+                            eprintln!("warning: failed to write profiling evidence to --evidence-dir {dir}: {err}");
+                        }
+                    }
                     use std::collections::HashMap;
                     let mut by_kernel: HashMap<&str, (f64, usize, usize)> = HashMap::new();
                     for e in &entries {
@@ -2006,6 +2306,27 @@ fn main() {
         let vram_used_mb =
             ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64 / (1024.0 * 1024.0)) as u64;
         let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
+        if let Some(dir) = evidence_dir.as_deref() {
+            if let Err(err) = write_decode_evidence(
+                Path::new(dir),
+                "dflash",
+                row_label,
+                prompt_tokens.len(),
+                emitted.len(),
+                prefill_secs,
+                elapsed,
+                ttft_ms.unwrap_or(0.0),
+                stats.tau() as f64,
+                accept_rate as f64,
+                stats.cycles,
+                stats.committed_tokens,
+                stats.accepted_tokens,
+                vram_used_mb,
+                vram_total_mb,
+            ) {
+                eprintln!("warning: failed to write --evidence-dir {dir}: {err}");
+            }
+        }
         eprintln!("=== BENCH METRICS ===");
         eprintln!("prompt_tokens: {}", prompt_tokens.len());
         if pflash_path.is_some() {

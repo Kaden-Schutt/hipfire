@@ -550,6 +550,7 @@ impl ModelSlot {
     /// Reset the DeltaNet recurrent state and zero the KV write head.
     /// Does NOT shrink the KV allocation — callers track `seq_pos` separately.
     pub fn reset_state(&mut self, gpu: &mut Gpu) {
+        self.kv_cache.compact_offset = 0;
         // Use stream-ordered memset when an active_stream is set (hot path
         // inside spec_step_dflash) to avoid null-stream host stalls. ~48
         // memsets/cycle on 27B when draft rollback triggers a reset.

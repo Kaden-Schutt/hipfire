@@ -4,8 +4,8 @@
 
 //! eval_hipfire — KLD eval for hipfire quant variants against a BF16 reference.
 //!
-//! Loads a hipfire model, reads the slice (or pre-tokenized tokens), reads
-//! the BF16 reference in hipfire β format (HFKLDR), runs forward inference
+//! Loads a hipfire model, reads the BF16 reference from a metadata-rich HFQM
+//! `hipfire.kldref` package, runs forward inference
 //! chunk-by-chunk over the matched eval tokens, computes per-token KLD via
 //! a top-K-of-reference approximation, bins per-sequence, emits HFKSEQ
 //! output that `kld_reduce.py` aggregates.
@@ -44,7 +44,7 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
-    use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::hfq::{HfqFile, HfqPackage, HFQM_ARCH_NON_WEIGHT_PACKAGE};
     use hipfire_runtime::llama::{weight_gemv, KvCache};
     use rdna_compute::DType;
     use std::fs::File;
@@ -60,6 +60,210 @@ fn main() {
         kv_mode: String,
         scoring_mode: String,
         max_chunks: Option<usize>,
+    }
+
+    enum RefBlockSource {
+        Legacy {
+            reader: BufReader<File>,
+            block_buf: Vec<u8>,
+        },
+        Package {
+            package: HfqPackage,
+            cursor: usize,
+        },
+    }
+
+    impl RefBlockSource {
+        fn next_block(&mut self, top_k: usize) -> (Vec<u32>, Vec<f32>, f32) {
+            match self {
+                RefBlockSource::Legacy { reader, block_buf } => {
+                    reader.read_exact(block_buf).expect("read ref block");
+                    let mut top_indices: Vec<u32> = Vec::with_capacity(top_k);
+                    let mut top_log_probs: Vec<f32> = Vec::with_capacity(top_k);
+                    for j in 0..top_k {
+                        top_indices.push(u32::from_le_bytes(
+                            block_buf[j * 4..j * 4 + 4].try_into().unwrap(),
+                        ));
+                    }
+                    let lp_off = top_k * 4;
+                    for j in 0..top_k {
+                        top_log_probs.push(f32::from_le_bytes(
+                            block_buf[lp_off + j * 4..lp_off + j * 4 + 4]
+                                .try_into()
+                                .unwrap(),
+                        ));
+                    }
+                    let resid_off = top_k * 8;
+                    let residual =
+                        f32::from_le_bytes(block_buf[resid_off..resid_off + 4].try_into().unwrap());
+                    (top_indices, top_log_probs, residual)
+                }
+                RefBlockSource::Package { package, cursor } => {
+                    let top_indices_bytes = package
+                        .blob_data("kldref.top_indices")
+                        .expect("kldref.top_indices payload");
+                    let top_log_probs_bytes = package
+                        .blob_data("kldref.top_log_probs")
+                        .expect("kldref.top_log_probs payload");
+                    let residual_bytes = package
+                        .blob_data("kldref.residual_mass")
+                        .expect("kldref.residual_mass payload");
+                    let idx_off = *cursor * top_k * 4;
+                    let lp_off = *cursor * top_k * 4;
+                    let resid_off = *cursor * 4;
+                    let mut top_indices = Vec::with_capacity(top_k);
+                    let mut top_log_probs = Vec::with_capacity(top_k);
+                    for j in 0..top_k {
+                        let off = idx_off + j * 4;
+                        top_indices.push(u32::from_le_bytes(
+                            top_indices_bytes[off..off + 4].try_into().unwrap(),
+                        ));
+                    }
+                    for j in 0..top_k {
+                        let off = lp_off + j * 4;
+                        top_log_probs.push(f32::from_le_bytes(
+                            top_log_probs_bytes[off..off + 4].try_into().unwrap(),
+                        ));
+                    }
+                    let residual = f32::from_le_bytes(
+                        residual_bytes[resid_off..resid_off + 4].try_into().unwrap(),
+                    );
+                    *cursor += 1;
+                    (top_indices, top_log_probs, residual)
+                }
+            }
+        }
+    }
+
+    struct KldReference {
+        n_ctx: usize,
+        n_vocab: usize,
+        n_chunk: usize,
+        top_k: usize,
+        tokens: Vec<u32>,
+        blocks: RefBlockSource,
+    }
+
+    fn json_u64(meta: &serde_json::Value, key: &str) -> Result<u64, String> {
+        meta.get(key)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("kldref metadata missing integer `{key}`"))
+    }
+
+    fn read_u32_blob(blob: &[u8], name: &str) -> Result<Vec<u32>, String> {
+        if blob.len() % 4 != 0 {
+            return Err(format!(
+                "{name} byte length {} is not u32-aligned",
+                blob.len()
+            ));
+        }
+        Ok(blob
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect())
+    }
+
+    fn load_kld_reference(path: &std::path::Path) -> Result<KldReference, String> {
+        let mut probe =
+            File::open(path).map_err(|e| format!("open ref {}: {e}", path.display()))?;
+        let mut magic4 = [0u8; 4];
+        probe
+            .read_exact(&mut magic4)
+            .map_err(|e| format!("read ref magic: {e}"))?;
+        drop(probe);
+
+        if &magic4 == b"HFQM" {
+            let package = HfqPackage::open(path).map_err(|e| format!("open HFQM kldref: {e}"))?;
+            if package.arch_id != HFQM_ARCH_NON_WEIGHT_PACKAGE {
+                return Err(format!(
+                    "HFQM kldref arch_id={} but non-weight packages must use arch_id={}",
+                    package.arch_id, HFQM_ARCH_NON_WEIGHT_PACKAGE
+                ));
+            }
+            let meta: serde_json::Value = serde_json::from_str(&package.metadata_json)
+                .map_err(|e| format!("parse kldref metadata JSON: {e}"))?;
+            let kind = meta
+                .get("artifact_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if kind != "hipfire.kldref" {
+                return Err(format!("HFQM artifact_kind {kind:?} is not hipfire.kldref"));
+            }
+            let n_ctx = json_u64(&meta, "n_ctx")? as usize;
+            let n_vocab = json_u64(&meta, "n_vocab")? as usize;
+            let n_chunk = json_u64(&meta, "n_chunk")? as usize;
+            let top_k = json_u64(&meta, "top_k")? as usize;
+            for required in [
+                "kldref.tokens",
+                "kldref.top_indices",
+                "kldref.top_log_probs",
+                "kldref.residual_mass",
+            ] {
+                if package.entry(required).is_none() {
+                    return Err(format!("HFQM kldref missing payload `{required}`"));
+                }
+            }
+            let tokens = read_u32_blob(
+                package
+                    .blob_data("kldref.tokens")
+                    .expect("checked kldref.tokens"),
+                "kldref.tokens",
+            )?;
+            if tokens.len() != n_ctx * n_chunk {
+                return Err(format!(
+                    "kldref.tokens count {} != n_ctx*n_chunk {}",
+                    tokens.len(),
+                    n_ctx * n_chunk
+                ));
+            }
+            Ok(KldReference {
+                n_ctx,
+                n_vocab,
+                n_chunk,
+                top_k,
+                tokens,
+                blocks: RefBlockSource::Package { package, cursor: 0 },
+            })
+        } else {
+            let ref_file = File::open(path).map_err(|e| format!("open legacy ref: {e}"))?;
+            let mut ref_in = BufReader::with_capacity(8 * 1024 * 1024, ref_file);
+            let mut magic = [0u8; 8];
+            ref_in
+                .read_exact(&mut magic)
+                .map_err(|e| format!("read legacy ref magic: {e}"))?;
+            if &magic != b"HFKLDR\0\0" {
+                return Err(format!("bad ref magic: {magic:?}"));
+            }
+            let mut hdr = [0u8; 24];
+            ref_in
+                .read_exact(&mut hdr)
+                .map_err(|e| format!("read legacy ref header: {e}"))?;
+            let version = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            if version != 1 {
+                return Err(format!("unsupported legacy ref version {version}"));
+            }
+            let n_ctx = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+            let n_vocab = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+            let n_chunk = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
+            let top_k = u16::from_le_bytes(hdr[16..18].try_into().unwrap()) as usize;
+            let n_tokens = n_ctx * n_chunk;
+            let mut tokens_raw = vec![0u8; n_tokens * 4];
+            ref_in
+                .read_exact(&mut tokens_raw)
+                .map_err(|e| format!("read legacy ref tokens: {e}"))?;
+            let tokens = read_u32_blob(&tokens_raw, "legacy tokens")?;
+            Ok(KldReference {
+                n_ctx,
+                n_vocab,
+                n_chunk,
+                top_k,
+                tokens,
+                blocks: RefBlockSource::Legacy {
+                    reader: ref_in,
+                    block_buf: vec![0u8; 8 + 8 * top_k],
+                },
+            })
+        }
     }
     let argv: Vec<String> = std::env::args().collect();
     let mut model: Option<PathBuf> = None;
@@ -85,8 +289,11 @@ fn main() {
             }
             "--kv-mode" => {
                 let v = argv[i + 1].clone();
-                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4") {
-                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 (got {v})");
+                if !matches!(
+                    v.as_str(),
+                    "fp32" | "f32" | "q8" | "asym2" | "asym3" | "asym4"
+                ) {
+                    eprintln!("--kv-mode must be one of: fp32 q8 asym2 asym3 asym4 (got {v})");
                     std::process::exit(1);
                 }
                 kv_mode = v;
@@ -106,7 +313,7 @@ fn main() {
                 i += 2;
             }
             "-h" | "--help" => {
-                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--scoring-mode prefill] [--max-chunks N]");
+                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode fp32|q8|asym3] [--scoring-mode prefill] [--max-chunks N]");
                 std::process::exit(0);
             }
             other => {
@@ -197,28 +404,18 @@ fn main() {
         (config, weights)
     };
 
-    // -------- read reference (HFKLDR β) header + tokens --------
-    let ref_file = File::open(&args.ref_path).expect("open ref");
-    let mut ref_in = BufReader::with_capacity(8 * 1024 * 1024, ref_file);
-
-    let mut magic = [0u8; 8];
-    ref_in.read_exact(&mut magic).expect("read ref magic");
-    if &magic != b"HFKLDR\0\0" {
-        eprintln!("bad ref magic: {magic:?}");
-        std::process::exit(2);
-    }
-    let mut hdr = [0u8; 24];
-    ref_in.read_exact(&mut hdr).expect("read ref header");
-    let version = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
-    let n_ctx = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
-    let ref_n_vocab = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
-    let n_chunk = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
-    let top_k = u16::from_le_bytes(hdr[16..18].try_into().unwrap()) as usize;
-    let _flags = u16::from_le_bytes(hdr[18..20].try_into().unwrap());
-    if version != 1 {
-        eprintln!("unsupported ref version {version}");
-        std::process::exit(2);
-    }
+    // -------- read reference package/header + tokens --------
+    let mut kld_ref = match load_kld_reference(&args.ref_path) {
+        Ok(r) => r,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            std::process::exit(2);
+        }
+    };
+    let n_ctx = kld_ref.n_ctx;
+    let ref_n_vocab = kld_ref.n_vocab;
+    let n_chunk = kld_ref.n_chunk;
+    let top_k = kld_ref.top_k;
     if ref_n_vocab != config.vocab_size {
         eprintln!(
             "vocab mismatch: ref says {ref_n_vocab}, model says {}",
@@ -249,18 +446,24 @@ fn main() {
         "  scored/chunk={scored_per_chunk}  total_scored={total_scored}  block={per_token_block_bytes}B"
     );
 
-    // Read tokens (n_ctx * n_chunk u32s).
-    let n_tokens = n_ctx * n_chunk;
-    let mut tokens_raw = vec![0u8; n_tokens * 4];
-    ref_in.read_exact(&mut tokens_raw).expect("read ref tokens");
-    let tokens: Vec<u32> = tokens_raw
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-        .collect();
+    let tokens = std::mem::take(&mut kld_ref.tokens);
 
     // -------- KV cache + DeltaNet state + scratch --------
     let kv_max = n_ctx + 16;
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == qwen35::LayerType::FullAttention)
+        .collect();
     let mut kv_cache = match args.kv_mode.as_str() {
+        "fp32" | "f32" => KvCache::new_gpu_filtered(
+            &mut gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "q8" => KvCache::new_gpu_q8(
             &mut gpu,
             config.n_layers,
@@ -322,41 +525,20 @@ fn main() {
     let mut mean_kld_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
     let mut p99_kld_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
     let mut mean_nll_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
-    let mut block_buf = vec![0u8; per_token_block_bytes];
     let t0 = Instant::now();
     let mut total_scored_done = 0usize;
 
     // Per-position KLD + NLL inner body. Reads the next ref block, downloads
     // the candidate logits from scratch.logits (caller is responsible for
     // having populated those), computes top-K-of-ref KLD with residual
-    // cross-term, and returns (kld_token, optional_nll). The closure
-    // explicitly mutates `ref_in` and `block_buf` so per-chunk state stays
-    // outside; the rest is read-only. Same math both modes use.
+    // cross-term, and returns (kld_token, optional_nll). Same math both
+    // scoring modes use.
     let score_position = |gpu: &mut rdna_compute::Gpu,
                           scratch_logits: &rdna_compute::GpuTensor,
-                          ref_in: &mut BufReader<File>,
-                          block_buf: &mut [u8],
+                          ref_blocks: &mut RefBlockSource,
                           actual_next: usize|
      -> (f64, Option<f64>) {
-        ref_in.read_exact(block_buf).expect("read ref block");
-        let mut top_indices: Vec<u32> = Vec::with_capacity(top_k);
-        let mut top_log_probs: Vec<f32> = Vec::with_capacity(top_k);
-        for j in 0..top_k {
-            top_indices.push(u32::from_le_bytes(
-                block_buf[j * 4..j * 4 + 4].try_into().unwrap(),
-            ));
-        }
-        let lp_off = top_k * 4;
-        for j in 0..top_k {
-            top_log_probs.push(f32::from_le_bytes(
-                block_buf[lp_off + j * 4..lp_off + j * 4 + 4]
-                    .try_into()
-                    .unwrap(),
-            ));
-        }
-        let resid_off = top_k * 8;
-        let sum_p_residual =
-            f32::from_le_bytes(block_buf[resid_off..resid_off + 4].try_into().unwrap());
+        let (top_indices, top_log_probs, sum_p_residual) = ref_blocks.next_block(top_k);
 
         let cand_logits = gpu.download_f32(scratch_logits).expect("download logits");
 
@@ -412,6 +594,7 @@ fn main() {
     };
 
     let scoring_start = n_ctx / 2;
+    let ref_blocks = &mut kld_ref.blocks;
     for c in 0..effective_n_chunk {
         // KvCache positions are passed explicitly via `pos` (or `start_pos`)
         // — overwriting from position 0 each chunk is sufficient.
@@ -441,13 +624,7 @@ fn main() {
                     continue;
                 }
                 let actual_next = chunk_tokens[pos + 1] as usize;
-                let (kld, nll) = score_position(
-                    &mut gpu,
-                    &scratch.logits,
-                    &mut ref_in,
-                    &mut block_buf,
-                    actual_next,
-                );
+                let (kld, nll) = score_position(&mut gpu, &scratch.logits, ref_blocks, actual_next);
                 chunk_klds.push(kld);
                 if let Some(n) = nll {
                     chunk_nll_sum += n;
@@ -557,13 +734,7 @@ fn main() {
                 };
                 let pos = scoring_start + j;
                 let actual_next = chunk_tokens[pos + 1] as usize;
-                let (kld, nll) = score_position(
-                    &mut gpu,
-                    &logits_view,
-                    &mut ref_in,
-                    &mut block_buf,
-                    actual_next,
-                );
+                let (kld, nll) = score_position(&mut gpu, &logits_view, ref_blocks, actual_next);
                 chunk_klds.push(kld);
                 if let Some(n) = nll {
                     chunk_nll_sum += n;

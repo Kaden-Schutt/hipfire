@@ -109,3 +109,8 @@ bench/coherence-results/
 result-data.json
 result-table.md
 .rocprofv3/
+
+# Generated hipfire-eval run directories. Curated benchmark writeups under
+# benchmarks/results remain tracked by explicit filename.
+benchmarks/results/eval/
+benchmarks/results/eval-smoke/

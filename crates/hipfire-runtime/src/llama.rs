@@ -634,6 +634,7 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
     match w.gpu_dtype {
         DType::F32 => gpu.gemv_f32(&w.buf, x, y),
         DType::F16 => gpu.gemv_f16_xf32(&w.buf, x, y, w.m, w.k),
+        DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, 1),
         DType::Q4K => gpu.gemv_q4k(&w.buf, x, y, w.m, w.k),
         DType::Q6K => gpu.gemv_q6k(&w.buf, x, y, w.m, w.k),
         DType::Q8_0 => gpu.gemv_q8_0(&w.buf, x, y, w.m, w.k),
@@ -1261,6 +1262,7 @@ pub fn weight_gemv_residual(
     y: &GpuTensor,
 ) -> HipResult<()> {
     match w.gpu_dtype {
+        DType::F16 => gpu.gemv_f16_xf32_residual(&w.buf, x, y, w.m, w.k),
         DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
         DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
             gpu.ensure_mq_signs()?;
@@ -1524,6 +1526,8 @@ pub fn weight_gemm(
     batch_size: usize,
 ) -> HipResult<()> {
     match w.gpu_dtype {
+        DType::F16 => gpu.gemm_f16_x_f32_wmma(&w.buf, x, y, w.m, w.k, batch_size),
+        DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
         _ => {

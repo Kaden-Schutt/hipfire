@@ -1,0 +1,32 @@
+{
+  "name": "hipfire-amd-matrix-calculator",
+  "version": "0.1.0",
+  "description": "Use Hipfire's vendored AMD Matrix Instruction Calculator in ./third_party/amd_matrix_instruction_calculator to inspect WMMA, SWMMAC, MFMA, and SMFMAC instruction details, lane/register mappings, matrix layouts, operand modifiers, and throughput/register-use facts for AMD RDNA/CDNA kernel work.",
+  "triggers": [
+    "AMD Matrix Instruction Calculator",
+    "matrix_calculator.py",
+    "WMMA lane layout",
+    "MFMA lane layout",
+    "register layout",
+    "matrix instruction calculator",
+    "v_wmma",
+    "v_mfma",
+    "BF16 WMMA",
+    "C matrix mapping",
+    "D matrix mapping",
+    "OPSEL",
+    "SWMMAC",
+    "SMFMAC"
+  ],
+  "entry": "./SKILL.md",
+  "interpret": "./SKILL.md",
+  "requires": {
+    "python": "3",
+    "tool": "./third_party/amd_matrix_instruction_calculator/matrix_calculator.py",
+    "hipfire-tree": "checkout of https://github.com/Kaden-Schutt/hipfire with third_party/amd_matrix_instruction_calculator present"
+  },
+  "related": [
+    "hipfire-kernel-tuning",
+    "hipfire-arch-port"
+  ]
+}

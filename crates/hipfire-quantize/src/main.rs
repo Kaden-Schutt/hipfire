@@ -16,9 +16,11 @@ mod gguf_input;
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::Hasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use twox_hash::XxHash64;
 
 // imatrix lookup populated once in main() when --imatrix is supplied; keyed by
 // ggml-style tensor name (see safetensors_to_ggml_name), value is the
@@ -3350,6 +3352,164 @@ struct HfqTensor {
     spilled_len: u64,
 }
 
+// ─── XXH64 provenance hashing ───────────────────────────────────────────────
+
+struct Xxh64 {
+    inner: XxHash64,
+}
+
+impl Xxh64 {
+    fn new(seed: u64) -> Self {
+        Self {
+            inner: XxHash64::with_seed(seed),
+        }
+    }
+
+    fn update(&mut self, input: &[u8]) {
+        self.inner.write(input);
+    }
+
+    fn digest(&self) -> u64 {
+        self.inner.finish()
+    }
+}
+
+#[cfg(test)]
+fn xxh64_hex(bytes: &[u8]) -> String {
+    let mut h = Xxh64::new(0);
+    h.update(bytes);
+    format!("{:016x}", h.digest())
+}
+
+fn xxh64_update_u8(h: &mut Xxh64, v: u8) {
+    h.update(&[v]);
+}
+
+fn xxh64_update_u32(h: &mut Xxh64, v: u32) {
+    h.update(&v.to_le_bytes());
+}
+
+fn xxh64_update_u64(h: &mut Xxh64, v: u64) {
+    h.update(&v.to_le_bytes());
+}
+
+fn hfq_quantization_hash_metadata(
+    tensors: &[HfqTensor],
+    spill: Option<&TensorSpill>,
+) -> std::io::Result<serde_json::Value> {
+    let mut h = Xxh64::new(0);
+    let mut payload_bytes = 0u64;
+    h.update(b"hipfire-hfq-quantized-tensor-payload-v1");
+
+    let mut spill_reader = if let Some(spill) = spill {
+        Some(std::io::BufReader::new(File::open(&spill.path)?))
+    } else {
+        None
+    };
+    let mut buf = vec![0u8; 4 * 1024 * 1024];
+
+    for t in tensors {
+        let name_bytes = t.name.as_bytes();
+        xxh64_update_u64(&mut h, name_bytes.len() as u64);
+        h.update(name_bytes);
+        xxh64_update_u8(&mut h, t.quant_type as u8);
+        xxh64_update_u64(&mut h, t.shape.len() as u64);
+        for &dim in &t.shape {
+            xxh64_update_u32(&mut h, dim);
+        }
+        xxh64_update_u32(&mut h, t.group_size);
+        let data_len = if t.spilled_len > 0 {
+            t.spilled_len
+        } else {
+            t.data.len() as u64
+        };
+        xxh64_update_u64(&mut h, data_len);
+        payload_bytes += data_len;
+
+        if t.spilled_len > 0 {
+            let reader = spill_reader
+                .as_mut()
+                .expect("spilled tensor requires spill reader");
+            let mut remaining = t.spilled_len as usize;
+            while remaining > 0 {
+                let chunk = remaining.min(buf.len());
+                use std::io::Read;
+                reader.read_exact(&mut buf[..chunk])?;
+                h.update(&buf[..chunk]);
+                remaining -= chunk;
+            }
+        } else {
+            h.update(&t.data);
+        }
+    }
+
+    Ok(serde_json::json!({
+        "algorithm": "xxh64",
+        "seed": 0,
+        "scope": "hfq_tensor_index_and_payload_v1",
+        "value": format!("{:016x}", h.digest()),
+        "tensor_count": tensors.len(),
+        "payload_bytes": payload_bytes,
+        "producer": {
+            "package": "hipfire-quantize",
+            "hipfire_version": env!("CARGO_PKG_VERSION"),
+            "git_commit": git_commit(),
+            "git_branch": git_branch(),
+            "git_describe": git_describe(),
+            "git_dirty": git_dirty(),
+        },
+    }))
+}
+
+fn metadata_with_quantization_hash(
+    mut metadata: serde_json::Value,
+    tensors: &[HfqTensor],
+    spill: Option<&TensorSpill>,
+) -> std::io::Result<String> {
+    let hash = hfq_quantization_hash_metadata(tensors, spill)?;
+    if let serde_json::Value::Object(ref mut map) = metadata {
+        map.insert("quantization_hash".to_string(), hash);
+    }
+    serde_json::to_string(&metadata)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn git_commit() -> Option<String> {
+    command_stdout("git", &["rev-parse", "HEAD"])
+}
+
+fn git_branch() -> Option<String> {
+    command_stdout("git", &["rev-parse", "--abbrev-ref", "HEAD"])
+}
+
+fn git_describe() -> Option<String> {
+    command_stdout("git", &["describe", "--always", "--dirty", "--tags"])
+}
+
+fn git_dirty() -> Option<bool> {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(!out.stdout.is_empty())
+}
+
 /// Streaming tensor spill file. When the quantizer accumulates more than
 /// `SPILL_THRESHOLD` bytes of tensor data in memory, it flushes completed
 /// tensors to this file. At write_hfq time, spilled data is copied from
@@ -3677,6 +3837,10 @@ fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .map(|s| s.as_str())
+}
+
+fn normalize_format_flag(flag: &str) -> String {
+    flag.trim().to_ascii_lowercase()
 }
 
 fn read_chat_template_file(path: &Path) -> String {
@@ -4504,7 +4668,6 @@ fn run_gguf_pipeline(
         "config": config_json,
         "gguf_meta": gguf_meta_to_json(&gguf.metadata),
     });
-    let metadata_json = serde_json::to_string(&metadata)?;
 
     // FWHT signs — only used by MQ/MFP formats. Same seed pair as the
     // safetensors path so the engine's runtime FWHT inverse stays identical.
@@ -4829,6 +4992,7 @@ fn run_gguf_pipeline(
         100.0 * total_bytes_out as f64 / total_bytes_in as f64,
     );
 
+    let metadata_json = metadata_with_quantization_hash(metadata, &hfq_tensors, None)?;
     write_hfq(output, arch_id, &metadata_json, &hfq_tensors, None)?;
     eprintln!("\nWrote: {}", output.display());
     Ok(())
@@ -4871,7 +5035,10 @@ fn main() {
     let chat_template_override =
         arg_value(&args, "--chat-template-file").map(|p| read_chat_template_file(Path::new(p)));
 
-    let format = arg_value(&args, "--format").unwrap_or("q8f16");
+    let format_arg = arg_value(&args, "--format").unwrap_or("q8f16");
+    let format_storage = normalize_format_flag(format_arg);
+    let format = format_storage.as_str();
+    eprintln!("Format: {format}");
 
     // Optional imatrix (llama.cpp GGUF format with .in_sum2 / .counts per-tensor).
     // When provided, MQ2-Lloyd quantization uses per-column importance weights
@@ -5611,7 +5778,8 @@ fn main() {
         None
     };
 
-    // Build metadata JSON for .hfq
+    // Build metadata for .hfq. The quantization_hash is added after tensor
+    // production so it covers the final quantized payload bytes.
     let metadata = serde_json::json!({
         "architecture": arch_str,
         "config": config,
@@ -5619,7 +5787,6 @@ fn main() {
         "tokenizer_config": tokenizer_config,
         "generation_config": generation_config,
     });
-    let metadata_json = serde_json::to_string(&metadata).unwrap();
 
     // Load all safetensors files
     let st_files: Vec<SafetensorsFile> = find_safetensors(input_dir)
@@ -7928,6 +8095,8 @@ fn main() {
     if let Some(ref mut s) = spill {
         maybe_spill(&mut hfq_tensors, s, 0); // spill everything remaining
     }
+    let metadata_json =
+        metadata_with_quantization_hash(metadata, &hfq_tensors, spill.as_ref()).unwrap();
     write_hfq(
         output_path,
         arch_id,
@@ -7942,6 +8111,43 @@ fn main() {
 
     let file_size = std::fs::metadata(output_path).unwrap().len();
     eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
+}
+
+#[cfg(test)]
+mod xxh64_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn xxh64_matches_known_vectors() {
+        assert_eq!(xxh64_hex(b""), "ef46db3751d8e999");
+        assert_eq!(xxh64_hex(b"hello"), "26c7827d889f6da3");
+    }
+
+    #[test]
+    fn quantization_hash_is_inserted_into_metadata() {
+        let tensors = vec![HfqTensor {
+            name: "model.layers.0.self_attn.q_proj.weight".to_string(),
+            quant_type: QuantType::MQ4G256,
+            shape: vec![2, 4],
+            group_size: 256,
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            spilled_len: 0,
+        }];
+        let metadata = serde_json::json!({ "architecture": "qwen3" });
+        let metadata_json =
+            metadata_with_quantization_hash(metadata, &tensors, None).expect("metadata");
+        let parsed: serde_json::Value = serde_json::from_str(&metadata_json).unwrap();
+        let hash = &parsed["quantization_hash"];
+        assert_eq!(hash["algorithm"], "xxh64");
+        assert_eq!(hash["scope"], "hfq_tensor_index_and_payload_v1");
+        assert_eq!(hash["tensor_count"], 1);
+        assert_eq!(hash["payload_bytes"], 8);
+        assert!(hash["producer"]["hipfire_version"].is_string());
+        assert!(hash["producer"].get("git_commit").is_some());
+        assert!(hash["producer"].get("git_branch").is_some());
+        assert!(hash["producer"].get("git_describe").is_some());
+        assert!(hash["producer"].get("git_dirty").is_some());
+    }
 }
 
 #[cfg(test)]
@@ -9863,6 +10069,32 @@ mod tests {
             assert_eq!(GgufFormat::from_flag(alias), Some(GgufFormat::Bf16));
         }
         assert_eq!(GgufFormat::Bf16.label(), "BF16");
+    }
+
+    #[test]
+    fn format_flags_are_canonicalized_before_dispatch() {
+        assert_eq!(normalize_format_flag(" BF16 "), "bf16");
+        assert_eq!(normalize_format_flag("Mq4G256"), "mq4g256");
+    }
+
+    #[test]
+    fn source_precision_preserves_bf16_bytes() {
+        let raw = vec![0x34, 0x12, 0x78, 0x56];
+        let f32_data = [1.0, 2.0];
+        let (data, quant_type, label) = source_precision_tensor_bytes(&raw, "BF16", &f32_data);
+        assert_eq!(data, raw);
+        assert_eq!(quant_type as u8, QuantType::BF16 as u8);
+        assert_eq!(label, "BF16");
+    }
+
+    #[test]
+    fn source_precision_preserves_f16_bytes() {
+        let raw = vec![0x00, 0x3c, 0x00, 0x40];
+        let f32_data = [1.0, 2.0];
+        let (data, quant_type, label) = source_precision_tensor_bytes(&raw, "F16", &f32_data);
+        assert_eq!(data, raw);
+        assert_eq!(quant_type as u8, QuantType::F16 as u8);
+        assert_eq!(label, "F16");
     }
 
     #[test]

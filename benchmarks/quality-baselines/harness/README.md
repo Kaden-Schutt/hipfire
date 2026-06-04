@@ -7,8 +7,8 @@ KLD references and produce the result tables.
 
 | File | Purpose | Status |
 |---|---|---|
-| `manifest.json`         | SHA-pinned index of BF16 reference dumps | populated for 9B (qwen3.5); 27B entry pending Step 6 dump completion |
-| `kldref_format.py`      | Reader/writer for the hipfire HFKLDR ref format + HFKSEQ per-sequence sidecar (v2: adds mean_nll for PPL) | done |
+| `manifest.json`         | SHA-pinned index of legacy BF16 reference dumps | legacy `.kldref.bin`; current refs should be regenerated as `.kldref.hfq` |
+| `kldref_format.py`      | Reader/writer for the legacy hipfire HFKLDR ref format + HFKSEQ per-sequence sidecar (v2: adds mean_nll for PPL) | done |
 | `kld_reduce.py`         | Bootstrap CI + result-table emitter (incl. PPL column) | done |
 | `tokenizer_parity.py`   | Step 1.5 tokenizer-parity check (hipfire vs llama.cpp BPE) | done; ran 2026-05-08 — see plan §"Step 1.5 verdict" |
 | `canary.md`             | 11-sequence harness-output reproducibility fixture | sequences populated; expected KLDs land after Step 5's first canary candidate |
@@ -25,17 +25,18 @@ build_kld_ref is GPU-free I/O only).
 
 `scripts/fetch-eval-refs.sh` (at repo root) reads `manifest.json` and
 either verifies (if locally present) or downloads (if `.hf_repo` is
-set) each ref into `../refs/<name>`. Run before any eval if you don't
-already have the ref locally.
+set) each legacy raw ref into `../refs/<name>`. Use this only for
+historical compatibility checks. New baseline-quality claims should use
+locally regenerated HFQM `.kldref.hfq` packages from
+`build_kld_ref_hipfire` with `--kv-mode fp32`.
 
 ## How to add a new quant variant
 
 1. Make sure the BF16 reference for the model exists. If not, run
-   `build_kld_ref` (see plan §"Reference dump methodology") on the
-   gfx1151 host (only host with enough UMA RAM for 27B BF16). Upload
-   to `hipfire-models/hipfire-eval-refs` and add an entry to
-   `manifest.json` with `sha256`, `hf_repo`, `producer_cmd`,
-   `llamacpp_commit`, `slice_md5`, and shape metadata.
+   `build_kld_ref_hipfire` on a local BF16 HFQ artifact with
+   `--kv-mode fp32`. Add or refresh manifest metadata with `sha256`,
+   `producer_cmd`, `source_model_sha256`, `slice_md5`, KV mode,
+   DeltaNet state precision, and shape metadata.
 
 2. Run the candidate against the cached reference:
 
@@ -44,7 +45,7 @@ already have the ref locally.
      cargo run --release -p hipfire-runtime --example eval_hipfire \
        --features deltanet -- \
        --model <path-to-hfq> \
-       --ref ../refs/<model>-bf16.kldref.bin \
+       --ref ../refs/<model>-bf16.kldref.hfq \
        --output ../results/<date>/per-seq/<variant>__<arch>.kldseq \
        --kv-mode asym3
      ```
@@ -58,6 +59,9 @@ already have the ref locally.
        --output ../results/<date>/per-seq/<variant>__<arch>.kldseq \
        --llama-perplexity-bin <path-to-llama-perplexity>
      ```
+     This path still consumes the legacy raw HFKLDR `.bin` reference format.
+     Add HFQM support before using GGUF anchors with regenerated `.kldref.hfq`
+     refs.
 
    Output filename convention: `<variant>__<arch>.kldseq` —
    `kld_reduce.py` parses `rsplit("__", 1)`.
