@@ -12665,17 +12665,24 @@ fn forward_scratch_layers(
             }
 
             (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
-                let x_rot = rmsnorm_rotate_dispatch(
-                    gpu, &ctx, &rotation, &s.x, &layer.attn_norm,
-                    &layer.wq, &s.tmp, &s.x_rot, config.norm_eps,
-                )?;
-
-                fused_qkv_dispatch(
-                    gpu, &gemv, &ctx,
-                    &layer.wq, &layer.wk, &layer.wv,
-                    &s.tmp, x_rot,
-                    &s.fa_q_full, &s.fa_k, &s.fa_v,
-                )?;
+                if qkv_is_mq(&layer.wq) && !qkv_use_fused(&layer.wq, &layer.wk, &layer.wv, &ctx) {
+                    qkv_interpret_mq(
+                        gpu, &ctx, &layer.wq, &layer.wk, &layer.wv,
+                        &layer.attn_norm, &s.x, &s.tmp, &s.x_rot,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v, config.norm_eps,
+                    )?;
+                } else {
+                    let x_rot = rmsnorm_rotate_dispatch(
+                        gpu, &ctx, &rotation, &s.x, &layer.attn_norm,
+                        &layer.wq, &s.tmp, &s.x_rot, config.norm_eps,
+                    )?;
+                    fused_qkv_dispatch(
+                        gpu, &gemv, &ctx,
+                        &layer.wq, &layer.wk, &layer.wv,
+                        &s.tmp, x_rot,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v,
+                    )?;
+                }
 
                 gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate,
                     config.n_heads, config.head_dim)?;
@@ -12877,17 +12884,24 @@ fn forward_scratch_layers(
             }
 
             (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
-                let x_rot = rmsnorm_rotate_dispatch(
-                    gpu, &ctx, &rotation, &s.x, &layer.attn_norm,
-                    &layer.wq, &s.tmp, &s.x_rot, config.norm_eps,
-                )?;
-
-                fused_qkv_dispatch(
-                    gpu, &gemv, &ctx,
-                    &layer.wq, &layer.wk, &layer.wv,
-                    &s.tmp, x_rot,
-                    &s.fa_q_full, &s.fa_k, &s.fa_v,
-                )?;
+                if qkv_is_mq(&layer.wq) && !qkv_use_fused(&layer.wq, &layer.wk, &layer.wv, &ctx) {
+                    qkv_interpret_mq(
+                        gpu, &ctx, &layer.wq, &layer.wk, &layer.wv,
+                        &layer.attn_norm, &s.x, &s.tmp, &s.x_rot,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v, config.norm_eps,
+                    )?;
+                } else {
+                    let x_rot = rmsnorm_rotate_dispatch(
+                        gpu, &ctx, &rotation, &s.x, &layer.attn_norm,
+                        &layer.wq, &s.tmp, &s.x_rot, config.norm_eps,
+                    )?;
+                    fused_qkv_dispatch(
+                        gpu, &gemv, &ctx,
+                        &layer.wq, &layer.wk, &layer.wv,
+                        &s.tmp, x_rot,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v,
+                    )?;
+                }
 
                 gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate,
                     config.n_heads, config.head_dim)?;
@@ -13106,6 +13120,56 @@ fn fused_qkvza_dispatch(
     Ok(())
 }
 
+/// MQ-family check used by both rmsnorm_rotate_dispatch and the interpreter branch.
+fn qkv_is_mq(w: &WeightTensor) -> bool {
+    matches!(w.gpu_dtype,
+        DType::MQ4G256 | DType::MQ3G256 | DType::MQ2G256
+        | DType::MQ6G256 | DType::MQ8G256
+        | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MQ4G256Lloyd
+        | DType::MFP4G32)
+}
+
+/// The QKV fused-eligibility predicate (flag-aware). Extracted from
+/// fused_qkv_dispatch so the caller's interpreter branch uses the SAME condition.
+fn qkv_use_fused(wq: &WeightTensor,
+                 wk: &WeightTensor,
+                 wv: &WeightTensor,
+                 ctx: &DispatchCtx) -> bool {
+    let dt = wq.gpu_dtype;
+    let same = wk.gpu_dtype == dt && wv.gpu_dtype == dt;
+    !ctx.flags.force_unfused && same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
+        || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
+        || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()))
+}
+
+/// Build the MQ 3-way QKV op-list (producer + 3 prerotated Gemvs) and run it.
+/// Byte-mirrors rmsnorm_rotate_dispatch(WithRmsnorm) + fused_qkv_dispatch's
+/// discrete Prerotated arm. MQ-only; caller guards with qkv_is_mq && !use_fused.
+#[allow(clippy::too_many_arguments)]
+fn qkv_interpret_mq(
+    gpu: &mut Gpu, ctx: &DispatchCtx,
+    wq: &WeightTensor,
+    wk: &WeightTensor,
+    wv: &WeightTensor,
+    attn_norm: &GpuTensor, x: &GpuTensor, tmp: &GpuTensor, x_rot: &GpuTensor,
+    fa_q: &GpuTensor, fa_k: &GpuTensor, fa_v: &GpuTensor, eps: f32,
+) -> HipResult<()> {
+    debug_assert!(wq.k == wk.k && wq.k == wv.k);
+    let wrq = WeightRef { buf: &wq.buf, dtype: wq.gpu_dtype, m: wq.m, k: wq.k, row_stride: 0, rotation: None, awq_scale: None };
+    let wrk = WeightRef { buf: &wk.buf, dtype: wk.gpu_dtype, m: wk.m, k: wk.k, row_stride: 0, rotation: None, awq_scale: None };
+    let wrv = WeightRef { buf: &wv.buf, dtype: wv.gpu_dtype, m: wv.m, k: wv.k, row_stride: 0, rotation: None, awq_scale: None };
+    let steps = [
+        Step::RmsnormRotateMq {
+            x, norm_weight: attn_norm, x_plain: tmp, out: x_rot,
+            awq_scale: wq.awq_scale.as_ref(), k: wq.k, eps,
+        },
+        Step::Gemv { w: &wrq, input: GemvInput::Prerotated(x_rot), out: fa_q },
+        Step::Gemv { w: &wrk, input: GemvInput::Prerotated(x_rot), out: fa_k },
+        Step::Gemv { w: &wrv, input: GemvInput::Prerotated(x_rot), out: fa_v },
+    ];
+    execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+}
+
 /// Fused QKV (3-way) dispatch for full attention projections.
 #[allow(clippy::too_many_arguments)]
 fn fused_qkv_dispatch(
@@ -13122,7 +13186,6 @@ fn fused_qkv_dispatch(
     fa_v: &GpuTensor,
 ) -> HipResult<()> {
     let dt = wq.gpu_dtype;
-    let same = wk.gpu_dtype == dt && wv.gpu_dtype == dt;
 
     if dt == DType::ParoQ4G128 {
         weight_gemv(gpu, wq, tmp, fa_q)?;
@@ -13131,11 +13194,7 @@ fn fused_qkv_dispatch(
         return Ok(());
     }
 
-    let use_fused = !ctx.flags.force_unfused && same && (dt == DType::MQ4G256 || dt == DType::HFQ4G256
-        || dt == DType::MQ3G256Lloyd || dt == DType::MQ4G256Lloyd
-        || ((dt == DType::MQ6G256 || dt == DType::HFQ6G256) && ctx.arch.gemv_dp4a_enabled()));
-
-    let proj = if use_fused {
+    let proj = if qkv_use_fused(wq, wk, wv, ctx) {
         let x = eff_rot.unwrap_or(tmp);
         if dt == DType::MQ4G256 || dt == DType::HFQ4G256 {
             gpu.fused_qkv_hfq4g256(
