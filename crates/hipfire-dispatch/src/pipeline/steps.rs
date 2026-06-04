@@ -2,7 +2,7 @@
 //! Op-list interpreter. Phase 2a: GEMV + a fused rmsnorm-rotate producer; empty
 //! fusion table (all per-op fallback).
 
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
@@ -57,6 +57,94 @@ fn op_kind(step: &Step) -> PipelineOp {
     }
 }
 
+// ── Guard helpers ──────────────────────────────────────────────────────────
+
+/// Extract the dtype of the first Gemv step in the window (step index 1,
+/// after the RmsnormAutomatic producer). Returns None if not a Gemv step.
+fn window_gemv_dtype(steps: &[Step]) -> Option<DType> {
+    match steps.get(1)? {
+        Step::Gemv { w, .. } => Some(w.dtype),
+        _ => None,
+    }
+}
+
+/// True if all Gemv steps in the window (indices 1..) have:
+/// - the given dtype
+/// - GemvInput::Prerotated
+/// - awq_scale == None (iff require_no_awq)
+fn gemv_steps_uniform(steps: &[Step], dtype: DType, require_no_awq: bool) -> bool {
+    steps[1..].iter().all(|s| match s {
+        Step::Gemv { w, input: GemvInput::Prerotated(_), .. } => {
+            w.dtype == dtype && (!require_no_awq || w.awq_scale.is_none())
+        }
+        _ => false,
+    })
+}
+
+/// True if ctx has dp4a and !force_unfused.
+fn dp4a_eligible(ctx: &DispatchCtx) -> bool {
+    !ctx.flags.force_unfused && ctx.arch.gemv_dp4a_enabled()
+}
+
+// ── QKV 3-way guards ──
+
+pub(crate) fn guard_qkv_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    steps.len() == 4 && gemv_steps_uniform(steps, DType::MQ4G256Lloyd, true)
+}
+
+pub(crate) fn guard_qkv_mq3g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    steps.len() == 4 && gemv_steps_uniform(steps, DType::MQ3G256Lloyd, true)
+}
+
+/// Covers both DType::MQ4G256 (plain) and DType::HFQ4G256 — both feed
+/// gpu.fused_qkv_hfq4g256 which takes a pre-normalized x.
+pub(crate) fn guard_qkv_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    if steps.len() != 4 { return false; }
+    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
+        && gemv_steps_uniform(steps, dt, true)
+}
+
+/// Covers both DType::HFQ6G256 and DType::MQ6G256 — both use dp4a.
+pub(crate) fn guard_qkv_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if !dp4a_eligible(ctx) { return false; }
+    if steps.len() != 4 { return false; }
+    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    matches!(dt, DType::HFQ6G256 | DType::MQ6G256)
+        && gemv_steps_uniform(steps, dt, true)
+}
+
+// ── Gate+Up 2-way guards ──
+
+pub(crate) fn guard_gate_up_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    steps.len() == 3 && gemv_steps_uniform(steps, DType::MQ4G256Lloyd, true)
+}
+
+pub(crate) fn guard_gate_up_mq3g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    steps.len() == 3 && gemv_steps_uniform(steps, DType::MQ3G256Lloyd, true)
+}
+
+pub(crate) fn guard_gate_up_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    if steps.len() != 3 { return false; }
+    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
+        && gemv_steps_uniform(steps, dt, true)
+}
+
+pub(crate) fn guard_gate_up_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if !dp4a_eligible(ctx) { return false; }
+    if steps.len() != 3 { return false; }
+    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    matches!(dt, DType::HFQ6G256 | DType::MQ6G256)
+        && gemv_steps_uniform(steps, dt, true)
+}
+
 pub struct FusedPattern {
     pub ops: &'static [PipelineOp],
     pub key: KernelKey,
@@ -84,7 +172,27 @@ pub fn match_prefix(
         .map(|p| (p.key, p.ops.len()))
 }
 
-const FUSED_TABLE: &[FusedPattern] = &[];
+const QKV3: &[PipelineOp] = &[
+    PipelineOp::RmsnormAutomatic,
+    PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv,
+];
+const GATE_UP2: &[PipelineOp] = &[
+    PipelineOp::RmsnormAutomatic,
+    PipelineOp::Gemv, PipelineOp::Gemv,
+];
+
+const FUSED_TABLE: &[FusedPattern] = &[
+    // ── QKV 3-way ──────────────────────────────────────────────────────────
+    FusedPattern { ops: QKV3, key: KernelKey::FusedQkvMq4G256Lloyd,  guard: guard_qkv_mq4g256lloyd  },
+    FusedPattern { ops: QKV3, key: KernelKey::FusedQkvMq3G256Lloyd,  guard: guard_qkv_mq3g256lloyd  },
+    FusedPattern { ops: QKV3, key: KernelKey::FusedQkvHfq4G256,      guard: guard_qkv_hfq4g256      },
+    FusedPattern { ops: QKV3, key: KernelKey::FusedQkvHfq6G256,      guard: guard_qkv_hfq6g256      },
+    // ── Gate+Up 2-way ───────────────────────────────────────────────────────
+    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMq4G256Lloyd, guard: guard_gate_up_mq4g256lloyd },
+    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMq3G256Lloyd, guard: guard_gate_up_mq3g256lloyd },
+    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpHfq4G256,     guard: guard_gate_up_hfq4g256     },
+    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpHfq6G256,     guard: guard_gate_up_hfq6g256     },
+];
 static GEMV: OnceLock<GemvFamily> = OnceLock::new();
 static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
 

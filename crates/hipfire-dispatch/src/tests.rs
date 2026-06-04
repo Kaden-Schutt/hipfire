@@ -698,3 +698,145 @@ fn match_prefix_guard_receives_correct_window() {
     }];
     assert_eq!(match_prefix(&table, &steps, &ctx_rdna3()), Some((KernelKey::GemvF32, 2)));
 }
+
+// ── FUSED_TABLE guard tests ──────────────────────────────────────────────────
+
+use crate::pipeline::steps::{
+    guard_qkv_mq4g256lloyd, guard_qkv_mq3g256lloyd,
+    guard_qkv_hfq4g256, guard_qkv_hfq6g256,
+    guard_gate_up_mq4g256lloyd, guard_gate_up_mq3g256lloyd,
+    guard_gate_up_hfq4g256, guard_gate_up_hfq6g256,
+};
+
+fn make_qkv3_steps<'a>(
+    dummy: &'a rdna_compute::GpuTensor,
+    wr: &'a WeightRef<'a>,
+    rotation: RotationPlan,
+) -> Vec<Step<'a>> {
+    vec![
+        Step::RmsnormAutomatic {
+            x: dummy, norm_weight: dummy, x_plain: dummy, out: dummy,
+            awq_scale: None, k: 4096, eps: 1e-6, rotation,
+        },
+        Step::Gemv { w: wr, input: GemvInput::Prerotated(dummy), out: dummy },
+        Step::Gemv { w: wr, input: GemvInput::Prerotated(dummy), out: dummy },
+        Step::Gemv { w: wr, input: GemvInput::Prerotated(dummy), out: dummy },
+    ]
+}
+
+fn make_gate_up2_steps<'a>(
+    dummy: &'a rdna_compute::GpuTensor,
+    wr: &'a WeightRef<'a>,
+    rotation: RotationPlan,
+) -> Vec<Step<'a>> {
+    vec![
+        Step::RmsnormAutomatic {
+            x: dummy, norm_weight: dummy, x_plain: dummy, out: dummy,
+            awq_scale: None, k: 4096, eps: 1e-6, rotation,
+        },
+        Step::Gemv { w: wr, input: GemvInput::Prerotated(dummy), out: dummy },
+        Step::Gemv { w: wr, input: GemvInput::Prerotated(dummy), out: dummy },
+    ]
+}
+
+#[test]
+fn guard_qkv_mq4g256lloyd_fires() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef { buf: &dummy, dtype: DType::MQ4G256Lloyd,
+                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    assert!(guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
+}
+
+#[test]
+fn guard_qkv_mq4g256lloyd_rejects_wrong_dtype() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef { buf: &dummy, dtype: DType::HFQ4G256,
+                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::None);
+    assert!(!guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
+}
+
+#[test]
+fn guard_qkv_mq4g256lloyd_rejects_awq_scale() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef { buf: &dummy, dtype: DType::MQ4G256Lloyd,
+                         m: 4096, k: 4096, row_stride: 0, rotation: None,
+                         awq_scale: Some(&dummy) }; // AWQ present → reject
+    let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    assert!(!guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
+}
+
+#[test]
+fn guard_qkv_mq4g256lloyd_rejects_force_unfused() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef { buf: &dummy, dtype: DType::MQ4G256Lloyd,
+                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    let mut ctx = ctx_rdna3();
+    std::sync::Arc::make_mut(&mut ctx.flags).force_unfused = true;
+    assert!(!guard_qkv_mq4g256lloyd(&steps, &ctx));
+}
+
+#[test]
+fn guard_qkv_hfq4g256_covers_mq4g256() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef { buf: &dummy, dtype: DType::MQ4G256,
+                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    assert!(guard_qkv_hfq4g256(&steps, &ctx_rdna3()));
+}
+
+#[test]
+fn guard_qkv_hfq4g256_covers_hfq4g256() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef { buf: &dummy, dtype: DType::HFQ4G256,
+                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::None);
+    assert!(guard_qkv_hfq4g256(&steps, &ctx_rdna3()));
+}
+
+#[test]
+fn guard_qkv_hfq6g256_dp4a_gated() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr_hfq6 = WeightRef { buf: &dummy, dtype: DType::HFQ6G256,
+                               m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let wr_mq6  = WeightRef { buf: &dummy, dtype: DType::MQ6G256,
+                               m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let steps_hfq6 = make_qkv3_steps(&dummy, &wr_hfq6, RotationPlan::FwhtG256);
+    let steps_mq6  = make_qkv3_steps(&dummy, &wr_mq6,  RotationPlan::FwhtG256);
+
+    // gfx906 has gemv_dp4a enabled → fires
+    assert!(guard_qkv_hfq6g256(&steps_hfq6, &ctx_gfx906()));
+    assert!(guard_qkv_hfq6g256(&steps_mq6,  &ctx_gfx906()));
+    // RDNA1 (gfx1010) has no dp4a → blocked
+    assert!(!guard_qkv_hfq6g256(&steps_hfq6, &ctx_rdna1()));
+    // RDNA3 (gfx1100) has no gemv_dp4a → blocked
+    assert!(!guard_qkv_hfq6g256(&steps_hfq6, &ctx_rdna3()));
+}
+
+#[test]
+fn guard_qkv_rejects_mixed_gemv_input() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef { buf: &dummy, dtype: DType::MQ4G256Lloyd,
+                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let steps = vec![
+        Step::RmsnormAutomatic {
+            x: &dummy, norm_weight: &dummy, x_plain: &dummy, out: &dummy,
+            awq_scale: None, k: 4096, eps: 1e-6, rotation: RotationPlan::FwhtG256,
+        },
+        Step::Gemv { w: &wr, input: GemvInput::Prerotated(&dummy), out: &dummy },
+        Step::Gemv { w: &wr, input: GemvInput::Raw(&dummy), out: &dummy }, // mixed!
+        Step::Gemv { w: &wr, input: GemvInput::Prerotated(&dummy), out: &dummy },
+    ];
+    assert!(!guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
+}
+
+#[test]
+fn guard_gate_up_mq4g256lloyd_fires() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef { buf: &dummy, dtype: DType::MQ4G256Lloyd,
+                         m: 4096, k: 4096, row_stride: 0, rotation: None, awq_scale: None };
+    let steps = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    assert!(guard_gate_up_mq4g256lloyd(&steps, &ctx_rdna3()));
+}
