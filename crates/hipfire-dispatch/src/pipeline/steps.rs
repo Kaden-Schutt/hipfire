@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use crate::context::DispatchCtx;
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::types::GemvVariant;
+use crate::families::fused_qkv::{FusedQkvFamily, FusedQkvParams};
 use crate::families::rotation::{RotationFamily, RotationParams};
 use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
 
@@ -195,6 +196,7 @@ const FUSED_TABLE: &[FusedPattern] = &[
 ];
 static GEMV: OnceLock<GemvFamily> = OnceLock::new();
 static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
+static FUSED_QKV: OnceLock<FusedQkvFamily> = OnceLock::new();
 
 pub fn execute_steps(
     gpu: &mut Gpu,
@@ -273,8 +275,66 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
     }
 }
 
+/// Borrow `out` from a `RmsnormAutomatic` step. The guard has already confirmed
+/// step[0] is RmsnormAutomatic; this panics in debug if called incorrectly.
+fn rmsnorm_out<'a>(step: &'a Step<'a>) -> &'a rdna_compute::GpuTensor {
+    match step {
+        Step::RmsnormAutomatic { out, .. } => out,
+        _ => panic!("launch_fused: expected RmsnormAutomatic at step[0]"),
+    }
+}
+
+/// Borrow `w` and `out` from a `Gemv` step.
+fn gemv_weight_out<'a>(step: &'a Step<'a>) -> (&'a WeightRef<'a>, &'a rdna_compute::GpuTensor) {
+    match step {
+        Step::Gemv { w, out, .. } => (w, out),
+        _ => panic!("launch_fused: expected Gemv step"),
+    }
+}
+
 fn launch_fused(
-    _gpu: &mut Gpu, _ctx: &DispatchCtx, key: KernelKey, _steps: &[Step],
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    key: KernelKey,
+    steps: &[Step],
 ) -> Result<(), DispatchError> {
-    Err(DispatchError::MissingImpl { key })
+    // Step 0 is always RmsnormAutomatic — run it to fill the activated buffer.
+    launch_op(gpu, ctx, &steps[0])?;
+    let activated = rmsnorm_out(&steps[0]);
+    let fused_qkv = FUSED_QKV.get_or_init(FusedQkvFamily::new);
+
+    match key {
+        KernelKey::FusedQkvMq4G256Lloyd
+        | KernelKey::FusedQkvMq3G256Lloyd
+        | KernelKey::FusedQkvHfq4G256
+        | KernelKey::FusedQkvHfq6G256 => {
+            let (wq, q) = gemv_weight_out(&steps[1]);
+            let (wk, k) = gemv_weight_out(&steps[2]);
+            let (wv, v) = gemv_weight_out(&steps[3]);
+            fused_qkv.run(ctx, gpu, &FusedQkvParams {
+                kind: key,
+                weights: &[wq.buf, wk.buf, wv.buf],
+                x: activated,
+                outputs: &[q, k, v],
+                m: &[wq.m, wk.m, wv.m],
+                k: wq.k,
+            })
+        }
+        KernelKey::FusedGateUpMq4G256Lloyd
+        | KernelKey::FusedGateUpMq3G256Lloyd
+        | KernelKey::FusedGateUpHfq4G256
+        | KernelKey::FusedGateUpHfq6G256 => {
+            let (wg, gate) = gemv_weight_out(&steps[1]);
+            let (wu, up)   = gemv_weight_out(&steps[2]);
+            fused_qkv.run(ctx, gpu, &FusedQkvParams {
+                kind: key,
+                weights: &[wg.buf, wu.buf],
+                x: activated,
+                outputs: &[gate, up],
+                m: &[wg.m, wu.m],
+                k: wg.k,
+            })
+        }
+        _ => Err(DispatchError::MissingImpl { key }),
+    }
 }
