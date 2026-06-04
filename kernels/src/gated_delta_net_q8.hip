@@ -118,11 +118,17 @@ __global__ void gated_delta_net_q8(
         // and accumulating a systematic bias that drifts the recurrent state
         // off-distribution on long generations (length-dependent coherence
         // collapse). `frame` supplies the missing per-step entropy.
+        // frame == 0xFFFFFFFF is the host-supplied DETERMINISTIC sentinel:
+        // use a constant noise of 0.5 so floor(x+0.5) == round-to-nearest.
+        // Otherwise use the position+frame LCG dither (stochastic rounding).
+        const bool deterministic = (frame == 0xFFFFFFFFu);
         unsigned int rng = (unsigned int)(h * 1664525u + (row_start + r) * 1013904223u
                          + tid * 214013u + frame * 2531011u);
         #define STOCH_ROUND(val) ({ \
-            rng = rng * 1664525u + 1013904223u; \
-            float noise = (float)(rng >> 8) * (1.0f / 16777216.0f); \
+            float noise; \
+            if (deterministic) { noise = 0.5f; } \
+            else { rng = rng * 1664525u + 1013904223u; \
+                   noise = (float)(rng >> 8) * (1.0f / 16777216.0f); } \
             float scaled = (val) * inv_s; \
             (signed char)fminf(fmaxf(floorf(scaled + noise), -128.0f), 127.0f); \
         })

@@ -2904,6 +2904,17 @@ pub const GATED_DELTA_NET_Q8_TREE_SRC: &str =
 /// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
 /// Symmetric 4-bit: values -8..+7, scale = absmax/7. Per-row scale.
 /// 8x compression vs FP32 (8KB + 512B scales per head vs 64KB).
+/// GDN recurrence with bfloat16 S state in VRAM (2 bytes/elem, no scales).
+/// Loads 16-bit S tile into FP32 LDS, runs the FP32 recurrence, stores bf16.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_BF16_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_bf16.hip");
+
+/// GDN recurrence with IEEE half (fp16) S state in VRAM (2 bytes/elem, no scales).
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_FP16_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_fp16.hip");
+
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_Q4_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_q4.hip");

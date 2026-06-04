@@ -40,7 +40,7 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch, StateQuant};
     use hipfire_arch_qwen35::speculative::HiddenStateRingBuffer;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::KvCache;
@@ -54,6 +54,7 @@ fn main() {
     let mut out_path: Option<PathBuf> = None;
     let mut chunk: usize = 0;
     let mut kv_mode: String = "q8".to_string();
+    let mut state_quant = StateQuant::Q8;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -70,6 +71,9 @@ fn main() {
                 kv_mode = v;
                 i += 2;
             }
+            "--state-quant" => { state_quant = match argv[i+1].as_str() {
+                    "fp32" | "f32" => StateQuant::FP32, "q8" => StateQuant::Q8, "q4" => StateQuant::Q4,
+                    o => { eprintln!("unknown state-quant {o}"); std::process::exit(1); } }; i += 2; }
             "-h" | "--help" => {
                 eprintln!("Usage: dump_qwen35_hidden_states --model <hfq> --ref <kldref> --chunk N --out <path> [--kv-mode q8|asym3|fp32]");
                 std::process::exit(0);
@@ -146,7 +150,8 @@ fn main() {
         other => panic!("unknown --kv-mode: {other}"),
     };
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).expect("scratch");
-    let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn state");
+    eprintln!("DN state quant = {state_quant:?}");
+    let mut dn_state = DeltaNetState::new_with_quant(&mut gpu, &config, state_quant).expect("dn state");
 
     // -------- HiddenStateRingBuffer, overriding extract_layers to all layers --------
     let mut hidden_rb = HiddenStateRingBuffer::new(

@@ -39,8 +39,21 @@ fn main() {
 }
 
 #[cfg(feature = "deltanet")]
+fn parse_sq(s: &str) -> hipfire_arch_qwen35::qwen35::StateQuant {
+    use hipfire_arch_qwen35::qwen35::StateQuant;
+    match s {
+        "fp32" | "f32" => StateQuant::FP32,
+        "q8" => StateQuant::Q8,
+        "q4" => StateQuant::Q4,
+        "bf16" | "bfloat16" => StateQuant::BF16,
+        "fp16" | "f16" | "half" => StateQuant::FP16,
+        o => { eprintln!("unknown state-quant: {o} (fp32|q8|q4|bf16|fp16)"); std::process::exit(1); }
+    }
+}
+
+#[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch, StateQuant};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::KvCache;
     use std::fs::File;
@@ -54,12 +67,18 @@ fn main() {
     let mut candidate: Option<PathBuf> = None;
     let mut ref_path: Option<PathBuf> = None;
     let mut max_chunks: Option<usize> = None;
+    // DN recurrent-state quant. Default Q8 = prior F1/F2/F3 behavior.
+    let mut oracle_sq = StateQuant::Q8;
+    let mut cand_sq = StateQuant::Q8;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
             "--oracle" => { oracle = Some(PathBuf::from(&argv[i + 1])); i += 2; }
             "--candidate" => { candidate = Some(PathBuf::from(&argv[i + 1])); i += 2; }
             "--ref" => { ref_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
+            "--oracle-state-quant" => { oracle_sq = parse_sq(&argv[i + 1]); i += 2; }
+            "--cand-state-quant" => { cand_sq = parse_sq(&argv[i + 1]); i += 2; }
+            "--state-quant" => { let q = parse_sq(&argv[i + 1]); oracle_sq = q; cand_sq = q; i += 2; }
             "--max-chunks" => { max_chunks = Some(argv[i + 1].parse().expect("--max-chunks int")); i += 2; }
             "-h" | "--help" => {
                 eprintln!("Usage: eval_hipfire_fullvocab --oracle <f32.hfq> --candidate <quant.hfq> --ref <hfkldr.bin> [--max-chunks N]");
@@ -135,8 +154,9 @@ fn main() {
     let mut kv_c = KvCache::new_gpu(&mut gpu, cfg_c.n_layers, cfg_c.n_kv_heads, cfg_c.head_dim, kv_max).expect("kv_c");
     let scratch_o = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_max).expect("scratch_o");
     let scratch_c = Qwen35Scratch::new_with_kv_max(&mut gpu, &cfg_c, 128, kv_max).expect("scratch_c");
-    let mut dn_o = DeltaNetState::new(&mut gpu, &config).expect("dn_o");
-    let mut dn_c = DeltaNetState::new(&mut gpu, &cfg_c).expect("dn_c");
+    eprintln!("DN state quant: oracle={oracle_sq:?} candidate={cand_sq:?}");
+    let mut dn_o = DeltaNetState::new_with_quant(&mut gpu, &config, oracle_sq).expect("dn_o");
+    let mut dn_c = DeltaNetState::new_with_quant(&mut gpu, &cfg_c, cand_sq).expect("dn_c");
 
     let t0 = Instant::now();
     let mut kld_sum = 0.0f64;

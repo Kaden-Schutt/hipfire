@@ -321,6 +321,10 @@ required-features = ["arch-qwen35", "deltanet"]
 # F32 oracle (dual forward, no ref top-K approx, no GGUF) for parity with
 # llama-perplexity --kl-divergence full-vocab KLD.
 [[example]]
+name = "oracle_xcheck"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
 name = "eval_hipfire_fullvocab"
 required-features = ["arch-qwen35", "deltanet"]
 
@@ -379,4 +383,12 @@ required-features = []
 [[bin]]
 name = "collect_hessian"
 path = "src/bin/collect_hessian.rs"
+required-features = []
+
+# fakequant_superblock (F6) — round-trips the all-F32 oracle through a chosen
+# super-block-linear weight codec and writes a new all-F32 .hfq whose only
+# injected error is the codec round-trip. Eval-only, stdlib I/O + arithmetic;
+# no GPU/arch features. Paired with eval_hipfire_fullvocab for the KLD.
+[[example]]
+name = "fakequant_superblock"
 required-features = []

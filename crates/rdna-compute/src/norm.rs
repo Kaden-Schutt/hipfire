@@ -19,6 +19,28 @@ use hip_bridge::{DeviceBuffer, HipResult};
 /// systematic bias that drifted the recurrent state on long generations.
 static GDN_REQUANT_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Deterministic round-to-nearest DN-state Q8 requant toggle.
+/// When `HIPFIRE_GDN_Q8_DETERMINISTIC=1`, the single-token
+/// `gated_delta_net_q8` decode path passes the 0xFFFFFFFF sentinel `frame`
+/// so the kernel rounds with a constant 0.5 dither (round-to-nearest)
+/// instead of the per-token stochastic LCG dither. Off by default (prior
+/// behavior). Lets F7 isolate stochastic-vs-deterministic requant.
+fn gdn_q8_deterministic() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static CACHE: AtomicU8 = AtomicU8::new(2); // 2 = uninit
+    match CACHE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var("HIPFIRE_GDN_Q8_DETERMINISTIC")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            CACHE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 impl Gpu {
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
@@ -1309,6 +1331,71 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// GDN recurrence with bfloat16 S state (2 bytes/elem, no scales).
+    /// Same params/grid/block as `gated_delta_net_f32`.
+    #[cfg(feature = "deltanet")]
+    pub fn gated_delta_net_bf16(
+        &mut self, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor,
+        gate: &GpuTensor, beta: &GpuTensor,
+        state: &GpuTensor, output: &GpuTensor,
+        n_tokens: usize, n_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gated_delta_net_bf16", kernels::GATED_DELTA_NET_BF16_SRC, "gated_delta_net_bf16")?;
+        let func = &self.functions["gated_delta_net_bf16"];
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut gp = gate.buf.as_ptr();
+        let mut bp = beta.buf.as_ptr();
+        let mut sp = state.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void, &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        let n_tiles = (128 / 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// GDN recurrence with IEEE half (fp16) S state (2 bytes/elem, no scales).
+    #[cfg(feature = "deltanet")]
+    pub fn gated_delta_net_fp16(
+        &mut self, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor,
+        gate: &GpuTensor, beta: &GpuTensor,
+        state: &GpuTensor, output: &GpuTensor,
+        n_tokens: usize, n_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gated_delta_net_fp16", kernels::GATED_DELTA_NET_FP16_SRC, "gated_delta_net_fp16")?;
+        let func = &self.functions["gated_delta_net_fp16"];
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut gp = gate.buf.as_ptr();
+        let mut bp = beta.buf.as_ptr();
+        let mut sp = state.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void, &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        let n_tiles = (128 / 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// GDN recurrence with Q8-quantized S state — tiled LDS + warp-shuffle.
     #[cfg(feature = "deltanet")]
     pub fn gated_delta_net_q8(
@@ -1332,7 +1419,13 @@ impl Gpu {
         let hd = head_dim as i32;
         // Per-launch monotonic frame for the Q8 state stochastic-rounding
         // dither (data-INDEPENDENT entropy; see GATED_DELTA_NET_Q8 kernel).
-        let fr = GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+        // When deterministic mode is requested, pass the 0xFFFFFFFF sentinel
+        // so the kernel uses constant-0.5 (round-to-nearest) instead.
+        let fr = if gdn_q8_deterministic() {
+            0xFFFF_FFFFu32 as i32
+        } else {
+            GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32
+        };
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
             &vp as *const _ as *mut c_void, &gp as *const _ as *mut c_void,

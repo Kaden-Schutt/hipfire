@@ -847,6 +847,13 @@ pub enum StateQuant {
     FP32,
     Q8,
     Q4,
+    /// bfloat16 DN state (2 bytes/elem, no scales). Same 8-bit exponent as
+    /// fp32 — no overflow risk for the recurrent S matrix — 7-bit mantissa.
+    BF16,
+    /// IEEE half DN state (2 bytes/elem, no scales). 10-bit mantissa, but
+    /// 5-bit exponent (max ~65504) — higher precision than bf16 where the
+    /// state magnitude stays in range.
+    FP16,
 }
 
 pub struct DeltaNetState {
@@ -913,6 +920,19 @@ impl DeltaNetState {
                         dtype: DType::F32,
                     });
                     s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
+                }
+                StateQuant::BF16 | StateQuant::FP16 => {
+                    // 2 bytes/elem, no scales. Zero bit-pattern == 0.0 in
+                    // both bf16 and fp16. dtype tag is not load-bearing here
+                    // (the kernel knows the 16-bit layout), mirror Q8/Q4.
+                    let buf = gpu.hip.malloc(s_size * 2)?;
+                    gpu.hip.memset(&buf, 0, s_size * 2)?;
+                    s_matrices.push(GpuTensor {
+                        buf,
+                        shape: vec![s_size],
+                        dtype: DType::F32,
+                    });
+                    s_scales.push(gpu.zeros(&[1], DType::F32)?);
                 }
             }
             conv_states.push(gpu.zeros(&[conv_state_size], DType::F32)?);
@@ -1027,6 +1047,16 @@ impl DeltaNetState {
                         dtype: DType::F32,
                     });
                     s_scales.push(g.zeros(&[n_heads * s_dim], DType::F32)?);
+                }
+                StateQuant::BF16 | StateQuant::FP16 => {
+                    let buf = g.hip.malloc(s_size * 2)?;
+                    g.hip.memset(&buf, 0, s_size * 2)?;
+                    s_matrices.push(GpuTensor {
+                        buf,
+                        shape: vec![s_size],
+                        dtype: DType::F32,
+                    });
+                    s_scales.push(g.zeros(&[1], DType::F32)?);
                 }
             }
             conv_states.push(g.zeros(&[conv_state_size], DType::F32)?);
@@ -5391,6 +5421,30 @@ fn forward_from_x_gpu(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?,
+                    StateQuant::BF16 => gpu.gated_delta_net_bf16(
+                        &q_gdn,
+                        &k_gdn,
+                        &v_part,
+                        &alpha_out,
+                        &beta_out,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?,
+                    StateQuant::FP16 => gpu.gated_delta_net_fp16(
+                        &q_gdn,
+                        &k_gdn,
+                        &v_part,
+                        &alpha_out,
+                        &beta_out,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?,
                     StateQuant::Q8 => gpu.gated_delta_net_q8(
                         &q_gdn,
                         &k_gdn,
@@ -5687,6 +5741,30 @@ fn forward_from_x_gpu(
                 let attn_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
                 match dn_state.quant {
                     StateQuant::FP32 => gpu.gated_delta_net_f32(
+                        &q_gdn,
+                        &k_gdn,
+                        &v_part,
+                        &alpha_out,
+                        &beta_out,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?,
+                    StateQuant::BF16 => gpu.gated_delta_net_bf16(
+                        &q_gdn,
+                        &k_gdn,
+                        &v_part,
+                        &alpha_out,
+                        &beta_out,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?,
+                    StateQuant::FP16 => gpu.gated_delta_net_fp16(
                         &q_gdn,
                         &k_gdn,
                         &v_part,
@@ -13259,6 +13337,30 @@ fn forward_scratch_layers(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?,
+                    StateQuant::BF16 => gpu.gated_delta_net_bf16(
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?,
+                    StateQuant::FP16 => gpu.gated_delta_net_fp16(
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?,
                     StateQuant::Q8 => gpu.gated_delta_net_q8(
                         &s.dn_q,
                         &s.dn_k,
@@ -14164,6 +14266,30 @@ fn forward_scratch_layers(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?,
+                    StateQuant::BF16 => gpu.gated_delta_net_bf16(
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?,
+                    StateQuant::FP16 => gpu.gated_delta_net_fp16(
+                        &s.dn_q,
+                        &s.dn_k,
+                        &s.dn_v,
+                        &s.dn_alpha,
+                        &s.dn_beta,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &s.dn_attn_out,
+                        1,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?,
                     StateQuant::Q8 => gpu.gated_delta_net_q8(
                         &s.dn_q,
                         &s.dn_k,
@@ -14898,6 +15024,30 @@ fn forward_scratch_layers_multi(
                             n_v_heads,
                             config.linear_value_head_dim,
                         )?,
+                        StateQuant::BF16 => gpu.gated_delta_net_bf16(
+                            &s.dn_q,
+                            &s.dn_k,
+                            &s.dn_v,
+                            &s.dn_alpha,
+                            &s.dn_beta,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &s.dn_attn_out,
+                            1,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?,
+                        StateQuant::FP16 => gpu.gated_delta_net_fp16(
+                            &s.dn_q,
+                            &s.dn_k,
+                            &s.dn_v,
+                            &s.dn_alpha,
+                            &s.dn_beta,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &s.dn_attn_out,
+                            1,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?,
                         StateQuant::Q8 => gpu.gated_delta_net_q8(
                             &s.dn_q,
                             &s.dn_k,
@@ -15587,6 +15737,30 @@ fn forward_scratch_layers_multi(
                     }
                     match dn_state.quant {
                         StateQuant::FP32 => gpu.gated_delta_net_f32(
+                            &s.dn_q,
+                            &s.dn_k,
+                            &s.dn_v,
+                            &s.dn_alpha,
+                            &s.dn_beta,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &s.dn_attn_out,
+                            1,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?,
+                        StateQuant::BF16 => gpu.gated_delta_net_bf16(
+                            &s.dn_q,
+                            &s.dn_k,
+                            &s.dn_v,
+                            &s.dn_alpha,
+                            &s.dn_beta,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &s.dn_attn_out,
+                            1,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?,
+                        StateQuant::FP16 => gpu.gated_delta_net_fp16(
                             &s.dn_q,
                             &s.dn_k,
                             &s.dn_v,

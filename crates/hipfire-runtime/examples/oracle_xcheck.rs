@@ -24,7 +24,7 @@ fn main() { eprintln!("build with --features deltanet"); }
 fn main() {
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::KvCache;
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch, StateQuant};
     use std::io::Write;
     use std::path::Path;
 
@@ -39,6 +39,7 @@ fn main() {
     let mut n_pos: usize = 256;
     let mut out_path: Option<String> = None;
     let mut tokens_csv: Option<String> = None;
+    let mut state_quant = StateQuant::Q8;  // default = prior F1 behavior
     let mut i = 2;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -47,6 +48,9 @@ fn main() {
             "--n-pos"       => { n_pos = argv[i+1].parse().unwrap(); i += 2; }
             "--out"         => { out_path = Some(argv[i+1].clone()); i += 2; }
             "--tokens-csv"  => { tokens_csv = Some(argv[i+1].clone()); i += 2; }
+            "--state-quant" => { state_quant = match argv[i+1].as_str() {
+                    "fp32" | "f32" => StateQuant::FP32, "q8" => StateQuant::Q8, "q4" => StateQuant::Q4,
+                    o => { eprintln!("unknown state-quant {o}"); std::process::exit(1); } }; i += 2; }
             o => { eprintln!("unknown arg {o}"); std::process::exit(1); }
         }
     }
@@ -87,7 +91,8 @@ fn main() {
         "asym3" => KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max).unwrap(),
         o => panic!("unknown HIPFIRE_KV {o}"),
     };
-    let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+    eprintln!("oracle_xcheck: DN state quant = {state_quant:?}");
+    let mut dn_state = DeltaNetState::new_with_quant(&mut gpu, &config, state_quant).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_max).unwrap();
 
     // Per-position forward; capture logits for each position.
