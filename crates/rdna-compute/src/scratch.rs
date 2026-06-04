@@ -127,20 +127,10 @@ pub(crate) fn launch_maybe_blob(
 }
 
 // ── FWHT sign table generation (deterministic LCG) ──────────────────────
-
-fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 {
-                1.0f32
-            } else {
-                -1.0f32
-            }
-        })
-        .collect()
-}
+// Canonical generator lives in `crate::dispatch`. Re-exported here so the bare
+// `gen_fwht_signs(..)` call sites in `ensure_mq_signs` (the production
+// KV-rotation sign-upload path) and the tests below stay unchanged.
+use crate::dispatch::gen_fwht_signs;
 
 // ── ScratchState helpers ────────────────────────────────────────────────
 

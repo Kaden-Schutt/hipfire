@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# rdna-compute provides the canonical `gen_fwht_signs` (FWHT/KV-rotation sign
+# generator). hip-bridge (its transitive dep) is dlopen-based (libloading), so
+# this stays GPU-free and links without a GPU present. As a result
+# hipfire-quantize is no longer a standalone, dependency-free crate.
+rdna-compute = { path = "../rdna-compute" }
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

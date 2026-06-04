@@ -30,13 +30,9 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13))
 }
 
-fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n).map(|_| {
-        state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-        if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
-    }).collect()
-}
+// Canonical FWHT/KV-rotation sign generator lives in rdna-compute. Re-exported
+// here so the bare `gen_fwht_signs(..)` call sites below stay unchanged.
+use rdna_compute::gen_fwht_signs;
 
 fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     assert!(x.len() == 256);

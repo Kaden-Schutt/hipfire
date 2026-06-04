@@ -238,6 +238,7 @@ dependencies = [
  "byteorder",
  "memmap2",
  "rayon",
+ "rdna-compute",
  "serde",
  "serde_json",
 ]

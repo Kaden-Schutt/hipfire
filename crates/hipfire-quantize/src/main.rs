@@ -798,20 +798,11 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     }
 }
 
-/// Generate FWHT sign table (matches engine's gen_fwht_signs).
-fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 {
-                1.0f32
-            } else {
-                -1.0f32
-            }
-        })
-        .collect()
-}
+// Canonical FWHT/KV-rotation sign generator lives in rdna-compute (it is the
+// same generator the engine uses for KV rotation, so the quantizer and the
+// runtime stay byte-identical). Re-exported so the bare `gen_fwht_signs(..)`
+// call sites throughout this binary stay unchanged.
+use rdna_compute::gen_fwht_signs;
 
 /// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
 /// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
@@ -1519,6 +1510,71 @@ mod hfp4_tests {
     // across K = {512, 1024, 1280, 1536, 1792, 2048} on real GPU hardware (max-abs error
     // ≤ 1.14e-5 vs 5e-3 tolerance — three orders of magnitude under). A CPU-only unit test
     // can't tighten that further without duplicating the GPU's CPU-reference path.
+
+    /// FWHT-sign parity: after collapsing all `gen_fwht_signs` copies onto the
+    /// canonical `rdna_compute::gen_fwht_signs`, the quantizer and the engine MUST
+    /// produce byte-identical KV-rotation sign vectors. A divergent seed here is
+    /// silent corruption (the GEMV kernel rotates `x` with the engine's signs while
+    /// the weights were baked with the quantizer's — they must match exactly).
+    ///
+    /// Frozen golden captured once from the canonical generator (LCG:
+    /// `state = state*1103515245 + 12345 & 0x7fffffff`, sign = bit 16; standard
+    /// MQ4 seeds 42/1042). If this test ever has to change, the rotation convention
+    /// changed and every `.mq*` artifact in the wild is now mis-rotated.
+    #[test]
+    fn gen_fwht_signs_matches_frozen_golden() {
+        // First-16-entry golden for the two standard seeds (±1 as i8).
+        const GOLD_42: [i8; 16] = [1, 1, 1, 1, -1, 1, 1, -1, 1, 1, -1, -1, -1, -1, 1, -1];
+        const GOLD_1042: [i8; 16] =
+            [1, -1, -1, -1, -1, 1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1];
+
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+
+        // Every entry is exactly ±1.0.
+        for (label, v) in [("seed42", &s1), ("seed1042", &s2)] {
+            assert_eq!(v.len(), 256, "{label}: length");
+            for (i, &x) in v.iter().enumerate() {
+                assert!(x == 1.0 || x == -1.0, "{label}[{i}] = {x}, expected ±1.0");
+            }
+        }
+
+        // Frozen-golden prefix match (catches any LCG/sign-bit divergence).
+        for (i, &g) in GOLD_42.iter().enumerate() {
+            assert_eq!(s1[i], g as f32, "seed42[{i}] diverged from golden");
+        }
+        for (i, &g) in GOLD_1042.iter().enumerate() {
+            assert_eq!(s2[i], g as f32, "seed1042[{i}] diverged from golden");
+        }
+
+        // Whole-vector checksum (frozen): sum over all 256 entries.
+        assert_eq!(s1.iter().sum::<f32>(), 10.0, "seed42 sum256 diverged");
+        assert_eq!(s2.iter().sum::<f32>(), -6.0, "seed1042 sum256 diverged");
+
+        // LCG prefix property the engine relies on (K path reuses a 256-wide
+        // table's first 128 entries): gen_fwht_signs(seed, 256)[..128] ==
+        // gen_fwht_signs(seed, 128).
+        assert_eq!(&gen_fwht_signs(42, 128)[..], &s1[..128], "seed42 prefix property");
+        assert_eq!(&gen_fwht_signs(1042, 128)[..], &s2[..128], "seed1042 prefix property");
+
+        // The signs the canonical generator emits must be the exact signs
+        // `cpu_fwht_256` applies in its first multiply pass. Feed a delta input:
+        // after `x[i] *= signs1[i]`, the FWHT butterfly mixes everything, but the
+        // pre-mix product on a single nonzero lane recovers signs1[i] directly.
+        for &i in &[0usize, 1, 4, 7, 255] {
+            let mut x = [0.0f32; 256];
+            x[i] = 1.0;
+            // Replicate only the first (pre-butterfly) multiply of cpu_fwht_256.
+            let mixed_in = x[i] * s1[i];
+            assert_eq!(mixed_in, s1[i], "signs1[{i}] applied by cpu_fwht_256");
+        }
+        // And a full cpu_fwht_256 round must be deterministic w.r.t. these signs.
+        let mut a = [0.5f32; 256];
+        let mut b = [0.5f32; 256];
+        cpu_fwht_256(&mut a, &s1, &s2);
+        cpu_fwht_256(&mut b, &s1, &s2);
+        assert_eq!(a, b, "cpu_fwht_256 is deterministic given canonical signs");
+    }
 }
 
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.

@@ -6192,18 +6192,15 @@ impl KvCache {
     }
 
     /// Generate deterministic ±1 sign array for FWHT.
+    ///
+    /// Thin delegate to the canonical `rdna_compute::gen_fwht_signs` so the
+    /// engine's KV-rotation signs stay byte-identical to what the quantizer
+    /// bakes into `.mq*` weights. Kept as a `Self::`-callable shim so the many
+    /// in-crate `Self::gen_fwht_signs` / `KvCache::gen_fwht_signs` call sites do
+    /// not need to change.
+    #[inline]
     pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-        let mut state = seed;
-        (0..n)
-            .map(|_| {
-                state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-                if (state >> 16) & 1 == 1 {
-                    1.0f32
-                } else {
-                    -1.0f32
-                }
-            })
-            .collect()
+        rdna_compute::gen_fwht_signs(seed, n)
     }
 
     /// Free all GPU tensors in this cache. Call before drop to return VRAM.

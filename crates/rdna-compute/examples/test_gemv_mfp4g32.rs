@@ -105,14 +105,10 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     for i in 0..256 { x[i] *= scale * signs2[i]; }
 }
 
-/// Same LCG sign generator MQ4 ships with (`gen_fwht_signs(seed, 256)`).
-fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n).map(|_| {
-        state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-        if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
-    }).collect()
-}
+// Same LCG sign generator MQ4 ships with — now the canonical
+// `rdna_compute::gen_fwht_signs`. Re-exported so the bare `gen_fwht_signs(..)`
+// call sites below stay unchanged.
+use rdna_compute::gen_fwht_signs;
 
 /// Quantize one row of K f32 weights to HFP4G32 byte format with `format_flags=0x05`
 /// (offline FWHT rotation present). The caller is responsible for applying the FWHT

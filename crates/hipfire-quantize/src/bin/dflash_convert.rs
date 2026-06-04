@@ -218,21 +218,10 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     }
 }
 
-/// Generate FWHT sign table matching the engine's gen_fwht_signs.
-/// Standard MQ4 seeds are 42 (signs1) and 1042 (signs2).
-fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 {
-                1.0f32
-            } else {
-                -1.0f32
-            }
-        })
-        .collect()
-}
+// FWHT sign table matching the engine's gen_fwht_signs (standard MQ4 seeds are
+// 42 (signs1) and 1042 (signs2)). Canonical impl lives in rdna-compute;
+// re-exported so the bare `gen_fwht_signs(..)` call sites below stay unchanged.
+use rdna_compute::gen_fwht_signs;
 
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
 /// 104 bytes per 256 weights (0.406 B/w). Same binary layout as HFQ3-G256.

@@ -211,19 +211,9 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     }
 }
 
-fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
-    let mut state = seed;
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 {
-                1.0f32
-            } else {
-                -1.0f32
-            }
-        })
-        .collect()
-}
+// Canonical FWHT/KV-rotation sign generator lives in rdna-compute. Re-exported
+// here so the bare `gen_fwht_signs(..)` call sites below stay unchanged.
+use rdna_compute::gen_fwht_signs;
 
 /// MagnumQuant MQ4-G256: FWHT-rotated 4-bit. 136 B / 256 weights
 /// (0.531 B/w). Layout matches `quantize_mq4g256` in the trunk
