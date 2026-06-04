@@ -7284,7 +7284,12 @@ pub(crate) fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor
 /// layer admitted here is dispatchable end-to-end.
 ///
 fn paro_batched_admit_enabled_from_env(value: Option<&str>) -> bool {
-    value != Some("0")
+    // Default OFF (opt-in via HIPFIRE_PARO_BATCHED=1). The PARO batched prefill
+    // path (ParoQ4G128 wqkv/wz/wo → gemm_hfq4g128 + per-weight Givens) was
+    // only validated for finite logits, not coherence. Per-token fallback
+    // (forward_scratch) is correct and avoids the echo bug. Set =1 to re-enable
+    // for eval/benchmarking, understanding that output may differ from decode.
+    value == Some("1")
 }
 
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
