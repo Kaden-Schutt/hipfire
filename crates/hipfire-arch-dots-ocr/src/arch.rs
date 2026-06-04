@@ -24,8 +24,9 @@
 
 use crate::dots_ocr::{DotsOcrConfig, DotsOcrWeights};
 use hipfire_arch_qwen2::qwen2::Qwen2State;
-use hipfire_runtime::arch::{Architecture, EosFilterOverrides, LoopGuardOverrides,
-                            PromptFrameOverrides, SamplerOverrides};
+use hipfire_runtime::arch::{
+    Architecture, EosFilterOverrides, LoopGuardOverrides, PromptFrameOverrides, SamplerOverrides,
+};
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 
@@ -112,10 +113,7 @@ impl Architecture for DotsOcr {
         // `strip_think = Some(false)` — dots.ocr is an OCR model, not
         // thinking-mode; it does not emit <think> blocks.
         EosFilterOverrides {
-            stop_at: vec![
-                b"<|endofassistant|>".to_vec(),
-                b"<|endoftext|>".to_vec(),
-            ],
+            stop_at: vec![b"<|endofassistant|>".to_vec(), b"<|endoftext|>".to_vec()],
             holdback_prefixes: vec![b"<|end".to_vec()],
             strip_think: Some(false),
         }

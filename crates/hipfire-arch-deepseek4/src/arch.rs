@@ -483,8 +483,10 @@ impl Architecture for DeepseekV4 {
         // N). Layers >= N fall back to shared-only FFN. Each layer's
         // expert blob is ~1.84 GB on the FP4-fixed HFQ (post-unpack
         // logical shape), so 22 layers ≈ 40 GB.
-        let upload_experts =
-            std::env::var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS").ok().as_deref() != Some("0");
+        let upload_experts = std::env::var("HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS")
+            .ok()
+            .as_deref()
+            != Some("0");
         let expert_layer_end: Option<usize> = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END")
             .ok()
             .and_then(|s| s.parse().ok());

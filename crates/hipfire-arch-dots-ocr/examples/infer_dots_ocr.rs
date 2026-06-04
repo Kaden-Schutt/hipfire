@@ -34,8 +34,8 @@
 //! is to add per-stage dumping to `vision_forward` (D3 hint from
 //! rev-glm5 — see Task #69 description) to bisect the divergence.
 
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use hipfire_arch_dots_ocr::{dots_ocr, image as preprocess, rope};
@@ -61,10 +61,22 @@ fn parse_args() -> Result<Args, String> {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--hfq" => { hfq = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--image" => { img = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--reference" => { refd = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "-v" | "--verbose" => { verbose = true; i += 1; }
+            "--hfq" => {
+                hfq = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--image" => {
+                img = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--reference" => {
+                refd = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "-v" | "--verbose" => {
+                verbose = true;
+                i += 1;
+            }
             "--help" | "-h" => {
                 eprintln!("{}", USAGE);
                 std::process::exit(0);
@@ -100,8 +112,7 @@ Usage: infer_dots_ocr --hfq <path.hfq> --image <path.{jpg,png}> \
 // shape we use for the reference captures.
 
 fn load_npy_f32(path: &Path) -> Result<(Vec<usize>, Vec<f32>), String> {
-    let bytes = fs::read(path)
-        .map_err(|e| format!("npy: read {}: {e}", path.display()))?;
+    let bytes = fs::read(path).map_err(|e| format!("npy: read {}: {e}", path.display()))?;
     if bytes.len() < 10 || &bytes[..6] != b"\x93NUMPY" {
         return Err(format!("npy: {} missing magic", path.display()));
     }
@@ -158,9 +169,13 @@ fn extract_bool(header: &str, key: &str) -> Option<bool> {
     let needle = format!("'{key}':");
     let i = header.find(&needle)? + needle.len();
     let rest = header[i..].trim_start();
-    if rest.starts_with("True") { Some(true) }
-    else if rest.starts_with("False") { Some(false) }
-    else { None }
+    if rest.starts_with("True") {
+        Some(true)
+    } else if rest.starts_with("False") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn extract_shape(header: &str) -> Option<Vec<usize>> {
@@ -172,7 +187,9 @@ fn extract_shape(header: &str) -> Option<Vec<usize>> {
     let mut dims = Vec::new();
     for tok in inner.split(',') {
         let t = tok.trim();
-        if t.is_empty() { continue; }
+        if t.is_empty() {
+            continue;
+        }
         dims.push(t.parse::<usize>().ok()?);
     }
     Some(dims)
@@ -184,11 +201,18 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum();
     let na: f64 = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
     let nb: f64 = b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-    if na == 0.0 || nb == 0.0 { 0.0 } else { (dot / (na * nb)) as f32 }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        (dot / (na * nb)) as f32
+    }
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(&x, &y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 // ─── Per-stage tensor stats ───────────────────────────────────────────
@@ -197,9 +221,11 @@ fn print_stats(label: &str, data: &[f32], shape: &[usize]) {
     let mean: f64 = data.iter().map(|&x| x as f64).sum::<f64>() / data.len() as f64;
     let var: f64 = data.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / data.len() as f64;
     let std = var.sqrt();
-    let (mn, mx) = data.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| {
-        (a.min(x), b.max(x))
-    });
+    let (mn, mx) = data
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| {
+            (a.min(x), b.max(x))
+        });
     let nan_count = data.iter().filter(|x| x.is_nan()).count();
     let inf_count = data.iter().filter(|x| x.is_infinite()).count();
     println!(
@@ -227,12 +253,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hfq.arch_id,
         );
     }
-    let cfg = dots_ocr::DotsOcrConfig::from_hfq(&hfq)
-        .map_err(|e| format!("config parse: {e}"))?;
+    let cfg = dots_ocr::DotsOcrConfig::from_hfq(&hfq).map_err(|e| format!("config parse: {e}"))?;
     println!(
         "  arch_id={}, text.layers={}, vision.layers={}, vision.embed_dim={}, vision.heads={}",
-        hfq.arch_id, cfg.text.num_hidden_layers, cfg.vision.num_hidden_layers,
-        cfg.vision.embed_dim, cfg.vision.num_attention_heads,
+        hfq.arch_id,
+        cfg.text.num_hidden_layers,
+        cfg.vision.num_hidden_layers,
+        cfg.vision.embed_dim,
+        cfg.vision.num_attention_heads,
     );
     println!("  ({:.2}s)", t.elapsed().as_secs_f32());
 
@@ -243,14 +271,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ({:.2}s)", t.elapsed().as_secs_f32());
 
     // Load vision-tower weights only.
-    println!("\n[3/5] Load vision weights ({} blocks)", cfg.vision.num_hidden_layers);
+    println!(
+        "\n[3/5] Load vision weights ({} blocks)",
+        cfg.vision.num_hidden_layers
+    );
     let t = Instant::now();
     let weights = dots_ocr::load_vision_weights(&hfq, &cfg.vision, &mut gpu)?;
     // Surface any latent device-side error from the upload bursts before
     // the first compute kernel — otherwise a sticky HIP error from an
     // earlier async op will misattribute to the next hipModuleLoad.
     gpu.hip.device_synchronize()?;
-    println!("  vision weights on GPU ({:.2}s)", t.elapsed().as_secs_f32());
+    println!(
+        "  vision weights on GPU ({:.2}s)",
+        t.elapsed().as_secs_f32()
+    );
 
     // Preprocess image.
     println!("\n[4/5] Preprocess image: {}", args.image_path.display());
@@ -261,7 +295,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "  resized={}x{}, grid={}x{}, n_patches={n_patches}, n_visual_tokens={n_visual_tokens} \
          ({:.2}s)",
-        img.resized_h, img.resized_w, img.grid_h, img.grid_w,
+        img.resized_h,
+        img.resized_w,
+        img.grid_h,
+        img.grid_w,
         t.elapsed().as_secs_f32(),
     );
 
@@ -272,11 +309,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n[5/5] vision_forward");
     let t = Instant::now();
     let merged_gpu = dots_ocr::vision_forward(
-        &mut gpu, &weights, &cfg.vision, &patches_gpu, img.grid_h, img.grid_w,
+        &mut gpu,
+        &weights,
+        &cfg.vision,
+        &patches_gpu,
+        img.grid_h,
+        img.grid_w,
     )?;
     gpu.free_tensor(patches_gpu)?;
     let elapsed = t.elapsed().as_secs_f32();
-    println!("  done in {elapsed:.2}s ({:.1} ms/block)", 1000.0 * elapsed / cfg.vision.num_hidden_layers as f32);
+    println!(
+        "  done in {elapsed:.2}s ({:.1} ms/block)",
+        1000.0 * elapsed / cfg.vision.num_hidden_layers as f32
+    );
 
     // Download + summarise.
     let merged = gpu.download_f32(&merged_gpu)?;
@@ -311,14 +356,25 @@ fn validate_merger(
     // Load + parse index.json to get sample indices.
     let idx_bytes = fs::read_to_string(refd.join("index.json"))?;
     let idx_json: serde_json::Value = serde_json::from_str(&idx_bytes)?;
-    let captures = idx_json["captures"].as_array().ok_or("index.json: no captures")?;
-    let merger_cap = captures.iter()
+    let captures = idx_json["captures"]
+        .as_array()
+        .ok_or("index.json: no captures")?;
+    let merger_cap = captures
+        .iter()
         .find(|c| c["name"] == "merger")
         .ok_or("index.json: no merger capture")?;
-    let full_shape: Vec<usize> = merger_cap["full_shape"].as_array().unwrap()
-        .iter().map(|v| v.as_u64().unwrap() as usize).collect();
-    let sample_indices: Vec<usize> = merger_cap["sample_indices"].as_array().unwrap()
-        .iter().map(|v| v.as_u64().unwrap() as usize).collect();
+    let full_shape: Vec<usize> = merger_cap["full_shape"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
+    let sample_indices: Vec<usize> = merger_cap["sample_indices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
 
     // Shape parity.
     if full_shape[0] != n_visual_tokens || full_shape[1] != out_dim {
@@ -328,7 +384,8 @@ fn validate_merger(
              dims than HF's processor. Check resized_h/resized_w against \
              image_grid_thw in index.json.",
             n_visual_tokens, out_dim, full_shape,
-        ).into());
+        )
+        .into());
     }
 
     // Load reference (sampled rows).
@@ -336,12 +393,18 @@ fn validate_merger(
     if ref_shape != [sample_indices.len(), out_dim] {
         return Err(format!(
             "merger.npy shape {ref_shape:?} != [n_samples={}, {}]",
-            sample_indices.len(), out_dim,
-        ).into());
+            sample_indices.len(),
+            out_dim,
+        )
+        .into());
     }
 
     // Compute per-row stats; report top-N worst by cosine.
-    println!("  Comparing {} sampled rows ({}-dim each) ...", sample_indices.len(), out_dim);
+    println!(
+        "  Comparing {} sampled rows ({}-dim each) ...",
+        sample_indices.len(),
+        out_dim
+    );
     let mut rows: Vec<(usize, usize, f32, f32)> = Vec::with_capacity(sample_indices.len());
     for (s, &row_idx) in sample_indices.iter().enumerate() {
         let our_row = &our_merger[row_idx * out_dim..(row_idx + 1) * out_dim];
@@ -362,7 +425,8 @@ fn validate_merger(
     println!("    mean |Δ|  : {mean_mab:.5}");
 
     // Per-row pass/fail (cosine > 0.999 OR max |Δ| < 1e-2).
-    let mut failed: Vec<&(usize, usize, f32, f32)> = rows.iter()
+    let mut failed: Vec<&(usize, usize, f32, f32)> = rows
+        .iter()
         .filter(|r| r.2 <= 0.999 && r.3 >= 1e-2)
         .collect();
     failed.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
@@ -392,7 +456,8 @@ fn validate_merger(
             "validation FAILED: {n_fail}/{} rows outside tolerance \
              (cos<=0.999 AND |Δ|>=1e-2)",
             rows.len(),
-        ).into());
+        )
+        .into());
     }
 
     println!("  ✓ validation PASSED");

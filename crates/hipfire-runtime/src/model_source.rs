@@ -25,10 +25,10 @@ pub struct TensorInfo {
 /// Quantization config parsed from HFQ metadata or HF config.json.
 #[derive(Debug, Clone, Default)]
 pub struct QuantConfig {
-    pub method: String,        // "paroquant", "awq", "gptq", "" (HFQ native)
-    pub bits: u8,              // 4
-    pub group_size: u32,       // 128
-    pub krot: u8,              // 8 for ParoQuant, 0 otherwise
+    pub method: String,  // "paroquant", "awq", "gptq", "" (HFQ native)
+    pub bits: u8,        // 4
+    pub group_size: u32, // 128
+    pub krot: u8,        // 8 for ParoQuant, 0 otherwise
     /// Regex patterns for layers excluded from quantization (kept FP16).
     pub dynamic_excludes: Vec<String>,
 }
@@ -88,8 +88,7 @@ pub fn open_model(path: &std::path::Path) -> Result<Box<dyn ModelSource>, String
             Err(format!("{}: directory has no config.json", path.display()))
         }
     } else {
-        let hfq = crate::hfq::HfqFile::open(path)
-            .map_err(|e| format!("{e}"))?;
+        let hfq = crate::hfq::HfqFile::open(path).map_err(|e| format!("{e}"))?;
         Ok(Box::new(hfq))
     }
 }

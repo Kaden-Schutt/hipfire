@@ -53,9 +53,19 @@ pub struct CaskCtx {
 
 impl CaskCtx {
     pub fn new(base: EvictionCtx, core_frac: f32, fold_m: usize) -> Self {
-        assert!((0.0..=1.0).contains(&core_frac), "core_frac must be in [0, 1]");
-        assert!(fold_m >= 2, "fold_m must be >= 2 (use plain TriAttention for m=1)");
-        Self { base, core_frac, fold_m }
+        assert!(
+            (0.0..=1.0).contains(&core_frac),
+            "core_frac must be in [0, 1]"
+        );
+        assert!(
+            fold_m >= 2,
+            "fold_m must be >= 2 (use plain TriAttention for m=1)"
+        );
+        Self {
+            base,
+            core_frac,
+            fold_m,
+        }
     }
 
     pub fn eviction_count(&self) -> usize {
@@ -87,15 +97,24 @@ impl CaskCtx {
         // Detect KV mode and layout. V is always Q8_0 across modes (the
         // write path only rotates K), so V fold uses kv_fold_q8 uniformly.
         #[derive(Copy, Clone)]
-        enum KMode { Q8, Asym3, Asym4, Asym2 }
-        let k_mode = if kv.quant_q8 { KMode::Q8 }
-            else if kv.quant_asym3 { KMode::Asym3 }
-            else if kv.quant_asym4 { KMode::Asym4 }
-            else if kv.quant_asym2 { KMode::Asym2 }
-            else {
-                // Unknown quant (e.g. quant_int8 legacy) — fall back to TriAttn.
-                return self.base.maybe_evict(gpu, kv, current_physical);
-            };
+        enum KMode {
+            Q8,
+            Asym3,
+            Asym4,
+            Asym2,
+        }
+        let k_mode = if kv.quant_q8 {
+            KMode::Q8
+        } else if kv.quant_asym3 {
+            KMode::Asym3
+        } else if kv.quant_asym4 {
+            KMode::Asym4
+        } else if kv.quant_asym2 {
+            KMode::Asym2
+        } else {
+            // Unknown quant (e.g. quant_int8 legacy) — fall back to TriAttn.
+            return self.base.maybe_evict(gpu, kv, current_physical);
+        };
 
         let absolute_pos = current_physical + kv.compact_offset;
         let p_q = absolute_pos as f32;
@@ -121,9 +140,9 @@ impl CaskCtx {
         let n_kv = self.base.n_kv_heads;
         let d = self.base.head_dim;
         let n_blocks = d / 32;
-        let v_row_bytes = n_kv * n_blocks * 34;   // V is always Q8_0.
+        let v_row_bytes = n_kv * n_blocks * 34; // V is always Q8_0.
         let k_row_bytes = match k_mode {
-            KMode::Q8    => v_row_bytes,
+            KMode::Q8 => v_row_bytes,
             KMode::Asym3 => n_kv * (4 + (d * 3) / 8),
             KMode::Asym4 => n_kv * (4 + d / 2),
             KMode::Asym2 => n_kv * (4 + d / 4),
@@ -140,181 +159,261 @@ impl CaskCtx {
         let weights_dev = gpu.alloc_tensor(&[table_len], rdna_compute::DType::F32)?;
 
         let inner_result = (|| -> HipResult<()> {
-        for (fa_i, &layer_idx) in self.base.fa_layer_ids.iter().enumerate() {
-            // 1. TriAttention scoring (GPU), mode-appropriate.
-            let offset = fa_i * self.base.centers_per_layer;
-            let centers_layer = self.base.centers_dev
-                .sub_offset(offset, self.base.centers_per_layer);
-            match k_mode {
-                KMode::Q8 => gpu.triattn_score_q8(
-                    &kv.k_gpu[layer_idx], &centers_layer, &self.base.scores_buf,
-                    self.base.n_heads, self.base.n_kv_heads, self.base.head_dim,
-                    self.base.n_rot, self.base.rope_theta, p_q, current_physical,
-                )?,
-                KMode::Asym3 => gpu.triattn_score_asym3(
-                    &kv.k_gpu[layer_idx], &centers_layer,
-                    kv.givens_cos.as_ref().expect("asym3 KV must have cos table"),
-                    kv.givens_sin.as_ref().expect("asym3 KV must have sin table"),
-                    &self.base.scores_buf,
-                    self.base.n_heads, self.base.n_kv_heads, self.base.head_dim,
-                    self.base.n_rot, self.base.rope_theta, p_q, current_physical,
-                )?,
-                KMode::Asym4 => gpu.triattn_score_asym4(
-                    &kv.k_gpu[layer_idx], &centers_layer,
-                    kv.givens_cos.as_ref().expect("asym4 KV must have cos table"),
-                    kv.givens_sin.as_ref().expect("asym4 KV must have sin table"),
-                    &self.base.scores_buf,
-                    self.base.n_heads, self.base.n_kv_heads, self.base.head_dim,
-                    self.base.n_rot, self.base.rope_theta, p_q, current_physical,
-                )?,
-                KMode::Asym2 => gpu.triattn_score_asym2(
-                    &kv.k_gpu[layer_idx], &centers_layer,
-                    kv.givens_cos.as_ref().expect("asym2 KV must have cos table"),
-                    kv.givens_sin.as_ref().expect("asym2 KV must have sin table"),
-                    &self.base.scores_buf,
-                    self.base.n_heads, self.base.n_kv_heads, self.base.head_dim,
-                    self.base.n_rot, self.base.rope_theta, p_q, current_physical,
-                )?,
-            }
-            gpu.hip.device_synchronize()?;
-            let scores = gpu.download_f32(&self.base.scores_buf)?;
+            for (fa_i, &layer_idx) in self.base.fa_layer_ids.iter().enumerate() {
+                // 1. TriAttention scoring (GPU), mode-appropriate.
+                let offset = fa_i * self.base.centers_per_layer;
+                let centers_layer = self
+                    .base
+                    .centers_dev
+                    .sub_offset(offset, self.base.centers_per_layer);
+                match k_mode {
+                    KMode::Q8 => gpu.triattn_score_q8(
+                        &kv.k_gpu[layer_idx],
+                        &centers_layer,
+                        &self.base.scores_buf,
+                        self.base.n_heads,
+                        self.base.n_kv_heads,
+                        self.base.head_dim,
+                        self.base.n_rot,
+                        self.base.rope_theta,
+                        p_q,
+                        current_physical,
+                    )?,
+                    KMode::Asym3 => gpu.triattn_score_asym3(
+                        &kv.k_gpu[layer_idx],
+                        &centers_layer,
+                        kv.givens_cos
+                            .as_ref()
+                            .expect("asym3 KV must have cos table"),
+                        kv.givens_sin
+                            .as_ref()
+                            .expect("asym3 KV must have sin table"),
+                        &self.base.scores_buf,
+                        self.base.n_heads,
+                        self.base.n_kv_heads,
+                        self.base.head_dim,
+                        self.base.n_rot,
+                        self.base.rope_theta,
+                        p_q,
+                        current_physical,
+                    )?,
+                    KMode::Asym4 => gpu.triattn_score_asym4(
+                        &kv.k_gpu[layer_idx],
+                        &centers_layer,
+                        kv.givens_cos
+                            .as_ref()
+                            .expect("asym4 KV must have cos table"),
+                        kv.givens_sin
+                            .as_ref()
+                            .expect("asym4 KV must have sin table"),
+                        &self.base.scores_buf,
+                        self.base.n_heads,
+                        self.base.n_kv_heads,
+                        self.base.head_dim,
+                        self.base.n_rot,
+                        self.base.rope_theta,
+                        p_q,
+                        current_physical,
+                    )?,
+                    KMode::Asym2 => gpu.triattn_score_asym2(
+                        &kv.k_gpu[layer_idx],
+                        &centers_layer,
+                        kv.givens_cos
+                            .as_ref()
+                            .expect("asym2 KV must have cos table"),
+                        kv.givens_sin
+                            .as_ref()
+                            .expect("asym2 KV must have sin table"),
+                        &self.base.scores_buf,
+                        self.base.n_heads,
+                        self.base.n_kv_heads,
+                        self.base.head_dim,
+                        self.base.n_rot,
+                        self.base.rope_theta,
+                        p_q,
+                        current_physical,
+                    )?,
+                }
+                gpu.hip.device_synchronize()?;
+                let scores = gpu.download_f32(&self.base.scores_buf)?;
 
-            // 2. Aggregate (CPU, small): per-head z-score, max across heads.
-            let agg = aggregate_scores(
-                &scores[..self.base.n_heads * current_physical],
-                self.base.n_heads, current_physical,
-            );
+                // 2. Aggregate (CPU, small): per-head z-score, max across heads.
+                let agg = aggregate_scores(
+                    &scores[..self.base.n_heads * current_physical],
+                    self.base.n_heads,
+                    current_physical,
+                );
 
-            // 3. Rank tokens; top `core_slots` = core, next `merge_pool` = scratch.
-            let mut ranked: Vec<(f32, usize)> =
-                agg.iter().copied().enumerate().map(|(i, s)| (s, i)).collect();
-            ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            let core_ranked = &ranked[..core_slots];
-            let scratch_ranked = &ranked[core_slots..core_slots + merge_pool];
+                // 3. Rank tokens; top `core_slots` = core, next `merge_pool` = scratch.
+                let mut ranked: Vec<(f32, usize)> = agg
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(i, s)| (s, i))
+                    .collect();
+                ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                let core_ranked = &ranked[..core_slots];
+                let scratch_ranked = &ranked[core_slots..core_slots + merge_pool];
 
-            let core_idx: Vec<u32> = core_ranked.iter().map(|(_, i)| *i as u32).collect();
-            let scratch_idx: Vec<u32> = scratch_ranked.iter().map(|(_, i)| *i as u32).collect();
-            let scratch_scores: Vec<f32> = scratch_ranked.iter().map(|(s, _)| *s).collect();
+                let core_idx: Vec<u32> = core_ranked.iter().map(|(_, i)| *i as u32).collect();
+                let scratch_idx: Vec<u32> = scratch_ranked.iter().map(|(_, i)| *i as u32).collect();
+                let scratch_scores: Vec<f32> = scratch_ranked.iter().map(|(s, _)| *s).collect();
 
-            // 4. Build per-slot (indices, weights) table. Core slots pad with
-            //    weight=0 for unused entries (kernel skips them). Merge slots
-            //    hold m source positions with softmax weights.
-            //
-            //    Slots are sorted by effective position: core = its own pos,
-            //    merge = weighted-centroid of group. Gives temporal order in
-            //    the compacted cache.
-            let mut entries: Vec<(u32, [(u32, f32); MAX_FOLD_M])> = Vec::with_capacity(budget);
+                // 4. Build per-slot (indices, weights) table. Core slots pad with
+                //    weight=0 for unused entries (kernel skips them). Merge slots
+                //    hold m source positions with softmax weights.
+                //
+                //    Slots are sorted by effective position: core = its own pos,
+                //    merge = weighted-centroid of group. Gives temporal order in
+                //    the compacted cache.
+                let mut entries: Vec<(u32, [(u32, f32); MAX_FOLD_M])> = Vec::with_capacity(budget);
 
-            for &pos in &core_idx {
-                let mut slot = [(0u32, 0.0f32); MAX_FOLD_M];
-                slot[0] = (pos, 1.0);
-                for s in &mut slot[1..self.fold_m] { s.0 = pos; }  // indices safe; weights 0
-                entries.push((pos, slot));
-            }
-
-            if merge_slots > 0 {
-                // For Q8, group by L2-K similarity (K rows downloaded for
-                // dequant-feature extraction). For asym modes, fall back to
-                // rank-based pairing (consecutive scratch tokens by score)
-                // — simpler, no per-mode CPU dequant path. L2 grouping for
-                // asym is a follow-up once the simple version is validated.
-                let groups: Vec<Vec<usize>> = match k_mode {
-                    KMode::Q8 => {
-                        let mut k_all = vec![0u8; current_physical * k_row_bytes];
-                        gpu.hip.memcpy_dtoh(&mut k_all, &kv.k_gpu[layer_idx].buf)?;
-                        greedy_group_by_l2(&k_all, &scratch_idx, n_kv, d, self.fold_m)
-                    }
-                    _ => {
-                        // Rank-based: pair scratch tokens in score-sorted
-                        // order (already given by scratch_idx's order in
-                        // this loop). Consecutive-m groups.
-                        let n = scratch_idx.len();
-                        (0..n).step_by(self.fold_m)
-                            .filter(|&start| start + self.fold_m <= n)
-                            .map(|start| (start..start + self.fold_m).collect())
-                            .collect()
-                    }
-                };
-                for group in &groups {
-                    let abs_positions: Vec<u32> = group.iter().map(|&gi| scratch_idx[gi]).collect();
-                    let raw_scores: Vec<f32> = group.iter().map(|&gi| scratch_scores[gi]).collect();
-                    let weights = softmax(&raw_scores);
-
-                    let centroid: f32 = abs_positions.iter().zip(weights.iter())
-                        .map(|(&p, &w)| p as f32 * w).sum();
+                for &pos in &core_idx {
                     let mut slot = [(0u32, 0.0f32); MAX_FOLD_M];
-                    for i in 0..self.fold_m {
-                        slot[i] = (abs_positions[i], weights[i]);
+                    slot[0] = (pos, 1.0);
+                    for s in &mut slot[1..self.fold_m] {
+                        s.0 = pos;
+                    } // indices safe; weights 0
+                    entries.push((pos, slot));
+                }
+
+                if merge_slots > 0 {
+                    // For Q8, group by L2-K similarity (K rows downloaded for
+                    // dequant-feature extraction). For asym modes, fall back to
+                    // rank-based pairing (consecutive scratch tokens by score)
+                    // — simpler, no per-mode CPU dequant path. L2 grouping for
+                    // asym is a follow-up once the simple version is validated.
+                    let groups: Vec<Vec<usize>> = match k_mode {
+                        KMode::Q8 => {
+                            let mut k_all = vec![0u8; current_physical * k_row_bytes];
+                            gpu.hip.memcpy_dtoh(&mut k_all, &kv.k_gpu[layer_idx].buf)?;
+                            greedy_group_by_l2(&k_all, &scratch_idx, n_kv, d, self.fold_m)
+                        }
+                        _ => {
+                            // Rank-based: pair scratch tokens in score-sorted
+                            // order (already given by scratch_idx's order in
+                            // this loop). Consecutive-m groups.
+                            let n = scratch_idx.len();
+                            (0..n)
+                                .step_by(self.fold_m)
+                                .filter(|&start| start + self.fold_m <= n)
+                                .map(|start| (start..start + self.fold_m).collect())
+                                .collect()
+                        }
+                    };
+                    for group in &groups {
+                        let abs_positions: Vec<u32> =
+                            group.iter().map(|&gi| scratch_idx[gi]).collect();
+                        let raw_scores: Vec<f32> =
+                            group.iter().map(|&gi| scratch_scores[gi]).collect();
+                        let weights = softmax(&raw_scores);
+
+                        let centroid: f32 = abs_positions
+                            .iter()
+                            .zip(weights.iter())
+                            .map(|(&p, &w)| p as f32 * w)
+                            .sum();
+                        let mut slot = [(0u32, 0.0f32); MAX_FOLD_M];
+                        for i in 0..self.fold_m {
+                            slot[i] = (abs_positions[i], weights[i]);
+                        }
+                        entries.push((centroid as u32, slot));
                     }
-                    entries.push((centroid as u32, slot));
                 }
-            }
 
-            entries.sort_by_key(|&(c, _)| c);
+                entries.sort_by_key(|&(c, _)| c);
 
-            // Flatten to two arrays: [budget × m] each.
-            let mut flat_indices = Vec::with_capacity(table_len);
-            let mut flat_weights = Vec::with_capacity(table_len);
-            for (_, slot) in &entries {
-                for i in 0..self.fold_m {
-                    flat_indices.push(slot[i].0 as i32);
-                    flat_weights.push(slot[i].1);
+                // Flatten to two arrays: [budget × m] each.
+                let mut flat_indices = Vec::with_capacity(table_len);
+                let mut flat_weights = Vec::with_capacity(table_len);
+                for (_, slot) in &entries {
+                    for i in 0..self.fold_m {
+                        flat_indices.push(slot[i].0 as i32);
+                        flat_weights.push(slot[i].1);
+                    }
                 }
+
+                // 5. Upload table and run the GPU fold kernel for K and V.
+                //    src → k_compact/v_compact (scratch on EvictionCtx), then
+                //    memcpy back into the cache (matching TriAttn pattern).
+                let idx_bytes: Vec<u8> =
+                    flat_indices.iter().flat_map(|&x| x.to_ne_bytes()).collect();
+                gpu.hip.memcpy_htod(&indices_dev.buf, &idx_bytes)?;
+                let w_bytes: Vec<u8> = flat_weights.iter().flat_map(|&x| x.to_ne_bytes()).collect();
+                gpu.hip.memcpy_htod(&weights_dev.buf, &w_bytes)?;
+
+                // K fold uses the mode-specific kernel. V is always Q8_0
+                // (rotation is K-only in RotorQuant), so V always uses kv_fold_q8.
+                match k_mode {
+                    KMode::Q8 => gpu.kv_fold_q8(
+                        &kv.k_gpu[layer_idx],
+                        &self.base.k_compact,
+                        &indices_dev,
+                        &weights_dev,
+                        n_kv,
+                        n_blocks,
+                        self.fold_m,
+                        budget,
+                    )?,
+                    KMode::Asym3 => gpu.kv_fold_asym3(
+                        &kv.k_gpu[layer_idx],
+                        &self.base.k_compact,
+                        &indices_dev,
+                        &weights_dev,
+                        n_kv,
+                        d,
+                        self.fold_m,
+                        budget,
+                    )?,
+                    KMode::Asym4 => gpu.kv_fold_asym4(
+                        &kv.k_gpu[layer_idx],
+                        &self.base.k_compact,
+                        &indices_dev,
+                        &weights_dev,
+                        n_kv,
+                        d,
+                        self.fold_m,
+                        budget,
+                    )?,
+                    KMode::Asym2 => gpu.kv_fold_asym2(
+                        &kv.k_gpu[layer_idx],
+                        &self.base.k_compact,
+                        &indices_dev,
+                        &weights_dev,
+                        n_kv,
+                        d,
+                        self.fold_m,
+                        budget,
+                    )?,
+                }
+                gpu.kv_fold_q8(
+                    &kv.v_gpu[layer_idx],
+                    &self.base.v_compact,
+                    &indices_dev,
+                    &weights_dev,
+                    n_kv,
+                    n_blocks,
+                    self.fold_m,
+                    budget,
+                )?;
+                gpu.hip.device_synchronize()?;
+
+                gpu.hip.memcpy_dtod_at(
+                    &kv.k_gpu[layer_idx].buf,
+                    0,
+                    &self.base.k_compact.buf,
+                    0,
+                    budget * k_row_bytes,
+                )?;
+                gpu.hip.memcpy_dtod_at(
+                    &kv.v_gpu[layer_idx].buf,
+                    0,
+                    &self.base.v_compact.buf,
+                    0,
+                    budget * v_row_bytes,
+                )?;
             }
-
-            // 5. Upload table and run the GPU fold kernel for K and V.
-            //    src → k_compact/v_compact (scratch on EvictionCtx), then
-            //    memcpy back into the cache (matching TriAttn pattern).
-            let idx_bytes: Vec<u8> = flat_indices.iter()
-                .flat_map(|&x| x.to_ne_bytes()).collect();
-            gpu.hip.memcpy_htod(&indices_dev.buf, &idx_bytes)?;
-            let w_bytes: Vec<u8> = flat_weights.iter()
-                .flat_map(|&x| x.to_ne_bytes()).collect();
-            gpu.hip.memcpy_htod(&weights_dev.buf, &w_bytes)?;
-
-            // K fold uses the mode-specific kernel. V is always Q8_0
-            // (rotation is K-only in RotorQuant), so V always uses kv_fold_q8.
-            match k_mode {
-                KMode::Q8 => gpu.kv_fold_q8(
-                    &kv.k_gpu[layer_idx], &self.base.k_compact,
-                    &indices_dev, &weights_dev,
-                    n_kv, n_blocks, self.fold_m, budget,
-                )?,
-                KMode::Asym3 => gpu.kv_fold_asym3(
-                    &kv.k_gpu[layer_idx], &self.base.k_compact,
-                    &indices_dev, &weights_dev,
-                    n_kv, d, self.fold_m, budget,
-                )?,
-                KMode::Asym4 => gpu.kv_fold_asym4(
-                    &kv.k_gpu[layer_idx], &self.base.k_compact,
-                    &indices_dev, &weights_dev,
-                    n_kv, d, self.fold_m, budget,
-                )?,
-                KMode::Asym2 => gpu.kv_fold_asym2(
-                    &kv.k_gpu[layer_idx], &self.base.k_compact,
-                    &indices_dev, &weights_dev,
-                    n_kv, d, self.fold_m, budget,
-                )?,
-            }
-            gpu.kv_fold_q8(
-                &kv.v_gpu[layer_idx], &self.base.v_compact,
-                &indices_dev, &weights_dev,
-                n_kv, n_blocks, self.fold_m, budget,
-            )?;
-            gpu.hip.device_synchronize()?;
-
-            gpu.hip.memcpy_dtod_at(
-                &kv.k_gpu[layer_idx].buf, 0,
-                &self.base.k_compact.buf, 0,
-                budget * k_row_bytes,
-            )?;
-            gpu.hip.memcpy_dtod_at(
-                &kv.v_gpu[layer_idx].buf, 0,
-                &self.base.v_compact.buf, 0,
-                budget * v_row_bytes,
-            )?;
-        }
-        Ok(())
+            Ok(())
         })();
 
         // Free the per-eviction scratch GPU buffers on EVERY exit path.
@@ -326,11 +425,16 @@ impl CaskCtx {
 
         // Output size is always `budget` slots (core_slots + merge_slots = budget).
         kv.compact_offset += current_physical - budget;
-        self.base.eviction_count.set(self.base.eviction_count.get() + 1);
+        self.base
+            .eviction_count
+            .set(self.base.eviction_count.get() + 1);
         // m-fold merges multiple source positions per output slot — no single
         // retain_mask captures the mapping. Empty mask signals "can't mirror"
         // to callers that shadow the eviction into non-KV buffers.
-        Ok(Some(EvictionResult { new_physical: budget, retain_mask: Vec::new() }))
+        Ok(Some(EvictionResult {
+            new_physical: budget,
+            retain_mask: Vec::new(),
+        }))
     }
 }
 
@@ -343,12 +447,13 @@ pub fn aggregate_scores(scores: &[f32], n_heads: usize, seq_len: usize) -> Vec<f
     for h in 0..n_heads {
         let row = &scores[h * seq_len..(h + 1) * seq_len];
         let mean: f32 = row.iter().sum::<f32>() / seq_len as f32;
-        let var: f32 = row.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>()
-            / seq_len as f32;
+        let var: f32 = row.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / seq_len as f32;
         let std = var.sqrt().max(1e-6);
         for p in 0..seq_len {
             let z = (row[p] - mean) / std;
-            if z > agg[p] { agg[p] = z; }
+            if z > agg[p] {
+                agg[p] = z;
+            }
         }
     }
     agg
@@ -381,7 +486,12 @@ pub fn greedy_group_by_l2(
     let mut feats = vec![0f32; n * feat_dim];
     for (i, &pos) in scratch_idx.iter().enumerate() {
         let row = &k_all[pos as usize * row_bytes..(pos as usize + 1) * row_bytes];
-        dequant_q8_row(row, &mut feats[i * feat_dim..(i + 1) * feat_dim], n_kv, head_dim);
+        dequant_q8_row(
+            row,
+            &mut feats[i * feat_dim..(i + 1) * feat_dim],
+            n_kv,
+            head_dim,
+        );
     }
 
     let mut used = vec![false; n];
@@ -389,7 +499,9 @@ pub fn greedy_group_by_l2(
     let mut groups = Vec::with_capacity(n_groups);
 
     for anchor in 0..n {
-        if used[anchor] || groups.len() == n_groups { continue; }
+        if used[anchor] || groups.len() == n_groups {
+            continue;
+        }
         used[anchor] = true;
         let mut group = vec![anchor];
         let anchor_feat = &feats[anchor * feat_dim..(anchor + 1) * feat_dim];
@@ -399,8 +511,11 @@ pub fn greedy_group_by_l2(
             .filter(|&j| !used[j])
             .map(|j| {
                 let fj = &feats[j * feat_dim..(j + 1) * feat_dim];
-                let d2: f32 = anchor_feat.iter().zip(fj)
-                    .map(|(a, b)| (a - b) * (a - b)).sum();
+                let d2: f32 = anchor_feat
+                    .iter()
+                    .zip(fj)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
                 (d2, j)
             })
             .collect();
@@ -530,7 +645,10 @@ mod tests {
         let agg = aggregate_scores(&scores, 2, 4);
         assert!(agg[0] > agg[1]);
         assert!(agg[3] > agg[2]);
-        assert!((agg[0] - agg[3]).abs() < 1e-5, "symmetric case, endpoints should tie");
+        assert!(
+            (agg[0] - agg[3]).abs() < 1e-5,
+            "symmetric case, endpoints should tie"
+        );
     }
 
     #[test]
@@ -544,7 +662,13 @@ mod tests {
         let mut back = vec![0f32; n_kv * head_dim];
         dequant_q8_row(&packed, &mut back, n_kv, head_dim);
         for i in 0..vals.len() {
-            assert!((vals[i] - back[i]).abs() < 0.02, "dequant drift at {}: {} vs {}", i, vals[i], back[i]);
+            assert!(
+                (vals[i] - back[i]).abs() < 0.02,
+                "dequant drift at {}: {} vs {}",
+                i,
+                vals[i],
+                back[i]
+            );
         }
     }
 
@@ -555,13 +679,19 @@ mod tests {
         let vals: Vec<f32> = (0..n_kv * head_dim).map(|i| (i as f32) * 0.05).collect();
         let row = pack_q8_row(&vals, n_kv, head_dim);
         let mut all = Vec::new();
-        for _ in 0..3 { all.extend_from_slice(&row); }
+        for _ in 0..3 {
+            all.extend_from_slice(&row);
+        }
 
         let merged = weighted_avg_q8(&all, &[0, 1, 2], &[0.2, 0.3, 0.5], n_kv, head_dim);
         let mut back = vec![0f32; n_kv * head_dim];
         dequant_q8_row(&merged, &mut back, n_kv, head_dim);
         for i in 0..vals.len() {
-            assert!((vals[i] - back[i]).abs() < 0.02, "identity merge drift at {}", i);
+            assert!(
+                (vals[i] - back[i]).abs() < 0.02,
+                "identity merge drift at {}",
+                i
+            );
         }
     }
 
@@ -569,8 +699,12 @@ mod tests {
     fn weighted_avg_of_two_orthogonal_is_blend() {
         let n_kv = 1;
         let head_dim = 32;
-        let a: Vec<f32> = (0..head_dim).map(|i| if i < 16 { 1.0 } else { 0.0 }).collect();
-        let b: Vec<f32> = (0..head_dim).map(|i| if i >= 16 { 1.0 } else { 0.0 }).collect();
+        let a: Vec<f32> = (0..head_dim)
+            .map(|i| if i < 16 { 1.0 } else { 0.0 })
+            .collect();
+        let b: Vec<f32> = (0..head_dim)
+            .map(|i| if i >= 16 { 1.0 } else { 0.0 })
+            .collect();
         let mut all = pack_q8_row(&a, n_kv, head_dim);
         all.extend_from_slice(&pack_q8_row(&b, n_kv, head_dim));
 
@@ -579,7 +713,12 @@ mod tests {
         let mut back = vec![0f32; head_dim];
         dequant_q8_row(&merged, &mut back, n_kv, head_dim);
         for i in 0..head_dim {
-            assert!((back[i] - 0.5).abs() < 0.05, "blend drift at {}: {}", i, back[i]);
+            assert!(
+                (back[i] - 0.5).abs() < 0.05,
+                "blend drift at {}: {}",
+                i,
+                back[i]
+            );
         }
     }
 
@@ -592,7 +731,9 @@ mod tests {
         let t0: Vec<f32> = (0..head_dim).map(|i| (i as f32).sin() * 0.5).collect();
         let mut t1 = t0.clone();
         t1[0] += 0.01; // near-duplicate
-        let t2: Vec<f32> = (0..head_dim).map(|i| ((i as f32) * 1.3).cos() * 0.5).collect();
+        let t2: Vec<f32> = (0..head_dim)
+            .map(|i| ((i as f32) * 1.3).cos() * 0.5)
+            .collect();
         let mut t3 = t2.clone();
         t3[0] += 0.01;
 

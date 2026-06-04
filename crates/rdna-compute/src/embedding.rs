@@ -23,7 +23,8 @@ impl Gpu {
         self.bind_thread()?;
         let byte_offset = (token_id as usize) * dim * 4;
         let byte_size = dim * 4;
-        self.hip.memcpy_dtod_offset(&output.buf, &table.buf, byte_offset, byte_size)
+        self.hip
+            .memcpy_dtod_offset(&output.buf, &table.buf, byte_offset, byte_size)
     }
 
     /// Q4_LUT GEMV: 4-bit with LDS codebook lookup. 48 bytes per 32 elements.
@@ -57,7 +58,8 @@ impl Gpu {
         ];
 
         unsafe {
-            self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, None, &mut params)
+            self.hip
+                .launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, None, &mut params)
         }
     }
 
@@ -87,7 +89,8 @@ impl Gpu {
         ];
 
         unsafe {
-            self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, None, &mut params)
+            self.hip
+                .launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, None, &mut params)
         }
     }
 
@@ -100,7 +103,11 @@ impl Gpu {
         dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("embedding_hfq4g256", kernels::EMBEDDING_HFQ4G256_SRC, "embedding_hfq4g256")?;
+        self.ensure_kernel(
+            "embedding_hfq4g256",
+            kernels::EMBEDDING_HFQ4G256_SRC,
+            "embedding_hfq4g256",
+        )?;
         let func = &self.functions["embedding_hfq4g256"];
 
         let mut tp = table.buf.as_ptr();
@@ -116,11 +123,21 @@ impl Gpu {
         ];
 
         let bytes = crate::profile::embedding_hfq4g256_bytes(dim);
-        let timer = crate::profile::begin_timer(&self.hip, "embedding", "embedding_lookup_hfq4g256", bytes);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "embedding", "embedding_lookup_hfq4g256", bytes);
         let result = unsafe {
-            self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         };
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -161,7 +178,10 @@ impl Gpu {
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(tp); b.push_ptr(op); b.push_ptr(tidp); b.push_i32(d);
+                b.push_ptr(tp);
+                b.push_ptr(op);
+                b.push_ptr(tidp);
+                b.push_i32(d);
                 b
             },
         )
@@ -207,7 +227,10 @@ impl Gpu {
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(tp); b.push_ptr(op); b.push_ptr(tidp); b.push_i32(d);
+                b.push_ptr(tp);
+                b.push_ptr(op);
+                b.push_ptr(tidp);
+                b.push_i32(d);
                 b
             },
         )
@@ -222,7 +245,11 @@ impl Gpu {
         dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("embedding_hfq4g128", kernels::EMBEDDING_HFQ4G128_SRC, "embedding_hfq4g128")?;
+        self.ensure_kernel(
+            "embedding_hfq4g128",
+            kernels::EMBEDDING_HFQ4G128_SRC,
+            "embedding_hfq4g128",
+        )?;
         let func = &self.functions["embedding_hfq4g128"];
 
         let mut tp = table.buf.as_ptr();
@@ -238,7 +265,14 @@ impl Gpu {
         ];
 
         unsafe {
-            self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 }

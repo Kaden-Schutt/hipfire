@@ -13,7 +13,7 @@
 //! Phase A acceptance includes logging the actual MQ4 max-abs and confirming it
 //! stays in the same envelope.
 
-use rdna_compute::{Gpu, DType, LLOYD_MQ4_GROUP_BYTES};
+use rdna_compute::{DType, Gpu, LLOYD_MQ4_GROUP_BYTES};
 
 /// f32 → IEEE 754 binary16 little-endian, RTNE on dropped 13 mantissa bits.
 fn f32_to_f16_le(v: f32) -> [u8; 2] {
@@ -115,14 +115,19 @@ fn build_lloyd_row(
 /// CPU reference GEMM with residual. fp64-accumulated; X is f16-roundtripped
 /// to match the GPU's view after `ensure_fp16_x`.
 fn cpu_reference_gemm(
-    m: usize, k: usize, n: usize,
+    m: usize,
+    k: usize,
+    n: usize,
     codebooks_per_row: &[Vec<[f32; 16]>],
     indices_per_row: &[Vec<[u8; 256]>],
     x_fp32: &[f32],
     y_init: &[f32],
 ) -> Vec<f32> {
     let groups_per_row = k / 256;
-    let x_rt: Vec<f32> = x_fp32.iter().map(|&v| f16_le_to_f32(f32_to_f16_le(v))).collect();
+    let x_rt: Vec<f32> = x_fp32
+        .iter()
+        .map(|&v| f16_le_to_f32(f32_to_f16_le(v)))
+        .collect();
     let mut y = y_init.to_vec();
     for col in 0..n {
         for row in 0..m {
@@ -148,12 +153,19 @@ fn cpu_reference_gemm(
 /// `name` is just for the printf. Returns (max_abs, max_rel, rms, us/call).
 fn bench_variant(
     gpu: &mut Gpu,
-    m: usize, _k: usize, n: usize,
+    m: usize,
+    _k: usize,
+    n: usize,
     d_a: &rdna_compute::GpuTensor,
     d_x: &rdna_compute::GpuTensor,
     y_init: &[f32],
     y_ref: &[f32],
-    bench_fn: impl Fn(&mut Gpu, &rdna_compute::GpuTensor, &rdna_compute::GpuTensor, &rdna_compute::GpuTensor),
+    bench_fn: impl Fn(
+        &mut Gpu,
+        &rdna_compute::GpuTensor,
+        &rdna_compute::GpuTensor,
+        &rdna_compute::GpuTensor,
+    ),
 ) -> (f32, f32, f32, f64) {
     let d_y = gpu.upload_f32(y_init, &[n, m]).unwrap();
     bench_fn(gpu, d_a, d_x, &d_y);
@@ -191,10 +203,15 @@ fn bench_variant(
     (max_abs, max_rel, rms_err, elapsed_us_per_call)
 }
 
-fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (
-    (f32, f32, f32, f64),  // _wmma     (Phase A)
-    Option<(f32, f32, f32, f64)>,  // _wmma_mb2 (Phase D experiment)
-    Option<(f32, f32, f32, f64)>,  // _wmma_mb4 (Phase D-A)
+fn run_one(
+    gpu: &mut Gpu,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> (
+    (f32, f32, f32, f64),         // _wmma     (Phase A)
+    Option<(f32, f32, f32, f64)>, // _wmma_mb2 (Phase D experiment)
+    Option<(f32, f32, f32, f64)>, // _wmma_mb4 (Phase D-A)
 ) {
     assert_eq!(k % 256, 0, "K must be a multiple of 256");
     let groups_per_row = k / 256;
@@ -215,7 +232,8 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (
             // Synthetic indices in [0, 16).
             let mut q = [0u8; 256];
             for i in 0..256 {
-                q[i] = ((row.wrapping_mul(31) ^ g.wrapping_mul(53) ^ i.wrapping_mul(7)) & 0xF) as u8;
+                q[i] =
+                    ((row.wrapping_mul(31) ^ g.wrapping_mul(53) ^ i.wrapping_mul(7)) & 0xF) as u8;
             }
             idxs.push(q);
         }
@@ -243,11 +261,19 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (
     let y_ref = cpu_reference_gemm(m, k, n, &codebooks_per_row, &indices_per_row, &x, &y_init);
 
     let phase_a = bench_variant(
-        gpu, m, k, n, &d_a, &d_x, &y_init, &y_ref,
+        gpu,
+        m,
+        k,
+        n,
+        &d_a,
+        &d_x,
+        &y_init,
+        &y_ref,
         |gpu, d_a, d_x, d_y| {
             // Force MB4=0 to skip the size-gated routing.
             std::env::set_var("HIPFIRE_LLOYD_MB4", "0");
-            gpu.gemm_mq4g256_lloyd_residual_wmma(d_a, d_x, d_y, m, k, n).unwrap();
+            gpu.gemm_mq4g256_lloyd_residual_wmma(d_a, d_x, d_y, m, k, n)
+                .unwrap();
             std::env::remove_var("HIPFIRE_LLOYD_MB4");
         },
     );
@@ -255,9 +281,17 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (
     let supports_gfx11_fanout = gpu.arch_caps.has_wmma_w32();
     let phase_d_mb2 = if supports_gfx11_fanout {
         Some(bench_variant(
-            gpu, m, k, n, &d_a, &d_x, &y_init, &y_ref,
+            gpu,
+            m,
+            k,
+            n,
+            &d_a,
+            &d_x,
+            &y_init,
+            &y_ref,
             |gpu, d_a, d_x, d_y| {
-                gpu.gemm_mq4g256_lloyd_residual_wmma_mb2(d_a, d_x, d_y, m, k, n).unwrap();
+                gpu.gemm_mq4g256_lloyd_residual_wmma_mb2(d_a, d_x, d_y, m, k, n)
+                    .unwrap();
             },
         ))
     } else {
@@ -266,9 +300,17 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (
 
     let phase_d_mb4 = if supports_gfx11_fanout {
         Some(bench_variant(
-            gpu, m, k, n, &d_a, &d_x, &y_init, &y_ref,
+            gpu,
+            m,
+            k,
+            n,
+            &d_a,
+            &d_x,
+            &y_init,
+            &y_ref,
             |gpu, d_a, d_x, d_y| {
-                gpu.gemm_mq4g256_lloyd_residual_wmma_mb4(d_a, d_x, d_y, m, k, n).unwrap();
+                gpu.gemm_mq4g256_lloyd_residual_wmma_mb4(d_a, d_x, d_y, m, k, n)
+                    .unwrap();
             },
         ))
     } else {
@@ -285,20 +327,20 @@ fn main() {
     eprintln!("GPU: {}", gpu.arch);
 
     let cases: &[(usize, usize, usize)] = &[
-        (64,   1024,  16),
-        (64,   1024,  64),
-        (256,  1024,  64),
-        (64,   4096,  64),
-        (256,  4096,  16),
-        (256,  4096, 256),
-        (1024, 4096,  64),
-        (1024, 12288, 64),  // qwen3.5-9b mlp.down_proj K dim
+        (64, 1024, 16),
+        (64, 1024, 64),
+        (256, 1024, 64),
+        (64, 4096, 64),
+        (256, 4096, 16),
+        (256, 4096, 256),
+        (1024, 4096, 64),
+        (1024, 12288, 64), // qwen3.5-9b mlp.down_proj K dim
         // Production prefill shapes — the regime where _mb4's 4× weight
         // reuse should pay off. These mirror the per-kernel sizes seen in
         // the gfx1151 9B prefill profile (devlog 2026-05-09).
         (4096, 4096, 256),
         (4096, 12288, 256),
-        (14336, 4096, 256),  // 9B-Lloyd FFN gate/up output dim
+        (14336, 4096, 256), // 9B-Lloyd FFN gate/up output dim
     ];
 
     // Phase A starting tolerance: 1.75e-4 = 3× MQ3 Phase A's observed max-abs
@@ -314,11 +356,18 @@ fn main() {
     let mut total_us_mb2 = 0.0f64;
     let mut total_us_mb4 = 0.0f64;
 
-    println!("{:>5} {:>6} {:>4}  {:>5}  {:>11}  {:>11}  {:>10}  {}",
-             "M", "K", "N", "kern", "max_abs", "rms", "us/call", "verdict");
+    println!(
+        "{:>5} {:>6} {:>4}  {:>5}  {:>11}  {:>11}  {:>10}  {}",
+        "M", "K", "N", "kern", "max_abs", "rms", "us/call", "verdict"
+    );
 
-    let emit_row = |label: &str, m: usize, k: usize, n: usize,
-                    result: (f32, f32, f32, f64), ref_us: f64| -> bool {
+    let emit_row = |label: &str,
+                    m: usize,
+                    k: usize,
+                    n: usize,
+                    result: (f32, f32, f32, f64),
+                    ref_us: f64|
+     -> bool {
         let (max_abs, _max_rel, rms, us_per_call) = result;
         let pass = max_abs < phase_a_tolerance;
         let tag = if pass {
@@ -332,7 +381,9 @@ fn main() {
                     format!("PASS  ({:.2}× slower)", 1.0 / speedup)
                 }
             }
-        } else { "FAIL".to_string() };
+        } else {
+            "FAIL".to_string()
+        };
         println!(
             "{:>5} {:>6} {:>4}  {:>5}  {:>11.3e}  {:>11.3e}  {:>10.1}  {tag}",
             m, k, n, label, max_abs, rms, us_per_call
@@ -365,23 +416,35 @@ fn main() {
         println!();
         total_us_a += phase_a.3;
     }
-    println!("Phase A tolerance (initial)      : {:.3e}", phase_a_tolerance);
+    println!(
+        "Phase A tolerance (initial)      : {:.3e}",
+        phase_a_tolerance
+    );
     println!("Aggregate us/call (_wmma)        : {:.1}", total_us_a);
     if total_us_mb2 > 0.0 {
-        println!("Aggregate us/call (_mb2)         : {:.1}  (vs _wmma: {:.2}×)",
-                 total_us_mb2, total_us_a / total_us_mb2);
+        println!(
+            "Aggregate us/call (_mb2)         : {:.1}  (vs _wmma: {:.2}×)",
+            total_us_mb2,
+            total_us_a / total_us_mb2
+        );
     } else {
         println!("Aggregate us/call (_mb2)         : SKIP  (gfx11-only)");
     }
     if total_us_mb4 > 0.0 {
-        println!("Aggregate us/call (_mb4)         : {:.1}  (vs _wmma: {:.2}×)",
-                 total_us_mb4, total_us_a / total_us_mb4);
+        println!(
+            "Aggregate us/call (_mb4)         : {:.1}  (vs _wmma: {:.2}×)",
+            total_us_mb4,
+            total_us_a / total_us_mb4
+        );
     } else {
         println!("Aggregate us/call (_mb4)         : SKIP  (gfx11-only)");
     }
 
     if !all_pass {
-        eprintln!("\nFAIL: one or more shapes exceeded {:.3e} absolute", phase_a_tolerance);
+        eprintln!(
+            "\nFAIL: one or more shapes exceeded {:.3e} absolute",
+            phase_a_tolerance
+        );
         std::process::exit(1);
     }
     println!("\nALL PASS");

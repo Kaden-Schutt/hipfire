@@ -611,7 +611,8 @@ impl<'a> JinjaChatFrame<'a> {
 
         env.add_template("chat", self.template)
             .map_err(|e| format!("template parse: {e}"))?;
-        let tmpl = env.get_template("chat")
+        let tmpl = env
+            .get_template("chat")
             .map_err(|e| format!("template lookup: {e}"))?;
 
         // Pass bos_token to the template context. Caller may override via
@@ -649,7 +650,8 @@ impl<'a> JinjaChatFrame<'a> {
             documents => Value::from_serialize(&empty_list),
             tool_call_kwargs => kwargs_val,
         };
-        tmpl.render(ctx).map_err(|e| format!("template render: {e}"))
+        tmpl.render(ctx)
+            .map_err(|e| format!("template render: {e}"))
     }
 }
 
@@ -693,8 +695,8 @@ mod tests {
         entries.push(r#""assistant": 6"#.to_string());
         entries.push(r#""\n": 7"#.to_string());
         entries.push(r#""Ġ": 8"#.to_string()); // gpt-2 mode trigger
-        // All 256 GPT-2-byte characters get unique ids 100..356 so
-        // any short string round-trips byte-by-byte.
+                                               // All 256 GPT-2-byte characters get unique ids 100..356 so
+                                               // any short string round-trips byte-by-byte.
         for b in 0u32..=255u32 {
             // Use rust escape; the encoder will look up the GPT-2 char
             // form of each byte directly.
@@ -771,7 +773,10 @@ mod tests {
                 n += 1;
             }
         }
-        let idx = bs.iter().position(|&x| x == b as u32).expect("byte in table");
+        let idx = bs
+            .iter()
+            .position(|&x| x == b as u32)
+            .expect("byte in table");
         char::from_u32(cs[idx]).expect("valid char")
     }
 
@@ -842,13 +847,20 @@ mod tests {
         .build();
         // The test tokenizer always registers `<think>` as a special
         // token, so OpenThink must append exactly `<think>\n`.
-        let think_id = t.special_token_id("<think>")
+        let think_id = t
+            .special_token_id("<think>")
             .expect("test tokenizer registers <think> as special");
         let mut expected = plain.clone();
         expected.push(think_id);
         expected.extend_from_slice(&t.encode("\n"));
-        assert_eq!(opened, expected, "OpenThink should append <think>\\n after the assistant prefix");
-        assert!(opened.len() > plain.len(), "OpenThink output must be strictly longer than Plain");
+        assert_eq!(
+            opened, expected,
+            "OpenThink should append <think>\\n after the assistant prefix"
+        );
+        assert!(
+            opened.len() > plain.len(),
+            "OpenThink output must be strictly longer than Plain"
+        );
     }
 
     #[test]
@@ -870,9 +882,11 @@ mod tests {
             raw: false,
         }
         .build();
-        let think_id = t.special_token_id("<think>")
+        let think_id = t
+            .special_token_id("<think>")
             .expect("test tokenizer registers <think> as special");
-        let close_id = t.special_token_id("</think>")
+        let close_id = t
+            .special_token_id("</think>")
             .expect("test tokenizer registers </think> as special");
         let nl = t.encode("\n");
         let mut expected = plain.clone();
@@ -883,8 +897,14 @@ mod tests {
         expected.push(close_id);
         expected.extend_from_slice(&nl);
         expected.extend_from_slice(&nl);
-        assert_eq!(closed, expected, "ClosedThink should append <think>\\n\\n</think>\\n\\n after the assistant prefix");
-        assert!(closed.len() > plain.len(), "ClosedThink output must be strictly longer than Plain");
+        assert_eq!(
+            closed, expected,
+            "ClosedThink should append <think>\\n\\n</think>\\n\\n after the assistant prefix"
+        );
+        assert!(
+            closed.len() > plain.len(),
+            "ClosedThink output must be strictly longer than Plain"
+        );
     }
 
     #[test]
@@ -907,7 +927,10 @@ mod tests {
             raw: false,
         }
         .build();
-        assert_eq!(closed, plain, "ClosedThink without special tokens must fall back to Plain");
+        assert_eq!(
+            closed, plain,
+            "ClosedThink without special tokens must fall back to Plain"
+        );
     }
 
     #[test]
@@ -928,8 +951,7 @@ mod tests {
     #[test]
     fn build_multi_turn_two_turn_history() {
         let t = make_tokenizer();
-        let history: [(Role, &str); 2] =
-            [(Role::User, "hello"), (Role::Assistant, "hi")];
+        let history: [(Role, &str); 2] = [(Role::User, "hello"), (Role::Assistant, "hi")];
         let frame = ChatFrame {
             tokenizer: &t,
             system: None,
@@ -986,7 +1008,10 @@ mod tests {
         };
         let via_string = frame.build();
         let via_tokens = frame.build_with_user_tokens(&t.encode(user_text));
-        assert_eq!(via_string, via_tokens, "build_with_user_tokens must match build() when tokens align");
+        assert_eq!(
+            via_string, via_tokens,
+            "build_with_user_tokens must match build() when tokens align"
+        );
     }
 
     #[test]
@@ -1144,8 +1169,14 @@ mod tests {
         let out = frame
             .render_messages(&messages, None, None)
             .expect("multi-turn render succeeds");
-        assert!(out.contains("system:be brief;"), "system content visible: {out:?}");
-        assert!(out.contains("user:weather?;"), "user content visible: {out:?}");
+        assert!(
+            out.contains("system:be brief;"),
+            "system content visible: {out:?}"
+        );
+        assert!(
+            out.contains("user:weather?;"),
+            "user content visible: {out:?}"
+        );
         assert!(
             out.contains("assistant:call=get_weather(SF);"),
             "assistant tool_call rendered: {out:?}",

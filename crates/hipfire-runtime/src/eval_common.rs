@@ -47,10 +47,7 @@ pub fn verify_ref_sha256(ref_path: &Path, tool_name: &str) {
     let manifest_file = std::fs::File::open(&manifest_path).expect("open manifest.json");
     let manifest: serde_json::Value =
         serde_json::from_reader(manifest_file).expect("parse manifest.json");
-    let ref_name = ref_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let ref_name = ref_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let expected = manifest
         .get("references")
         .and_then(|r| r.get(ref_name))
@@ -64,7 +61,10 @@ pub fn verify_ref_sha256(ref_path: &Path, tool_name: &str) {
             return;
         }
     };
-    eprintln!("{tool_name}: computing sha256 of {} ...", ref_path.display());
+    eprintln!(
+        "{tool_name}: computing sha256 of {} ...",
+        ref_path.display()
+    );
     let out = Command::new("sha256sum")
         .arg(ref_path)
         .output()
@@ -105,7 +105,10 @@ pub fn verify_slice_md5(slice_path: &Path, tool_name: &str) {
     let expected_line = match std::fs::read_to_string(&md5_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("warning: cannot read {}: {e}; skipping slice md5", md5_path.display());
+            eprintln!(
+                "warning: cannot read {}: {e}; skipping slice md5",
+                md5_path.display()
+            );
             return;
         }
     };
@@ -152,7 +155,11 @@ pub fn verify_llama_commit(bin: &str, pinned: &str, tool_name: &str) {
     // available llama.cpp build differs from the pinned commit (the KLD value
     // is insensitive to the exact llama.cpp commit). Set
     // HIPFIRE_SKIP_LLAMA_COMMIT_CHECK=1 to bypass.
-    if std::env::var("HIPFIRE_SKIP_LLAMA_COMMIT_CHECK").ok().as_deref() == Some("1") {
+    if std::env::var("HIPFIRE_SKIP_LLAMA_COMMIT_CHECK")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!("{tool_name}: HIPFIRE_SKIP_LLAMA_COMMIT_CHECK=1 — skipping llama.cpp commit verification (pinned {pinned})");
         return;
     }

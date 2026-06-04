@@ -928,7 +928,12 @@ impl GdnTape {
         let can_graph = graph_enabled && gpu.active_stream.is_some();
 
         if can_graph && gpu.graphs.replay_has_graph(n_steps) {
-            return gpu.graphs.replay_graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(), n_steps);
+            return gpu.graphs.replay_graph_launch(
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                n_steps,
+            );
         }
 
         if can_graph && gpu.graphs.replay_needs_warmup(n_steps) {
@@ -939,19 +944,27 @@ impl GdnTape {
 
         if can_graph {
             gpu.graphs.begin_replay_graph_capture(
-                &gpu.hip, gpu.device_id,
-                gpu.active_stream.as_ref().unwrap(), n_steps,
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                n_steps,
             )?;
             let r = self.replay_gdn_inner(gpu, weights, config, dn_state, n_steps);
             if r.is_ok() {
                 gpu.graphs.end_replay_graph_capture(
-                    &gpu.hip, gpu.device_id,
+                    &gpu.hip,
+                    gpu.device_id,
                     gpu.active_stream.as_ref().unwrap(),
                 )?;
                 // Same pattern as verify_graph: hipStreamBeginCapture records
                 // without executing, so launch once here to apply this cycle's
                 // state updates.
-                gpu.graphs.replay_graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap(), n_steps)?;
+                gpu.graphs.replay_graph_launch(
+                    &gpu.hip,
+                    gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(),
+                    n_steps,
+                )?;
                 return Ok(());
             } else {
                 let _ = gpu
@@ -2324,8 +2337,10 @@ fn verify_dflash_block_inner(
             // Replay path: kernels read pbs.tokens/pbs.positions/dn_state/
             // kv_cache contents that were freshly updated above + upstream.
             gpu.graphs.verify_graph_launch(
-                &gpu.hip, gpu.device_id,
-                gpu.active_stream.as_ref().unwrap(), b,
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                b,
             )?;
             Ok(())
         } else if gpu.graphs.verify_needs_warmup(b) {
@@ -2364,8 +2379,10 @@ fn verify_dflash_block_inner(
             // Capture path: first call at this B after warmup.
             let capture_lmhead_argmax = moe_lmhead_graph_ok;
             gpu.graphs.begin_verify_graph_capture(
-                &gpu.hip, gpu.device_id,
-                gpu.active_stream.as_ref().unwrap(), b,
+                &gpu.hip,
+                gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(),
+                b,
             )?;
             let r = qwen35::forward_prefill_batch_single_chunk_captured_opts(
                 gpu,
@@ -2400,7 +2417,8 @@ fn verify_dflash_block_inner(
             if r.is_ok() {
                 let blob_count = gpu.graphs.capture_blobs.len();
                 gpu.graphs.end_verify_graph_capture(
-                    &gpu.hip, gpu.device_id,
+                    &gpu.hip,
+                    gpu.device_id,
                     gpu.active_stream.as_ref().unwrap(),
                 )?;
                 if capture_lmhead_argmax {
@@ -2416,8 +2434,10 @@ fn verify_dflash_block_inner(
                 // target_snap.restore_to after verify returns. KV cache
                 // double-write writes the same data to the same positions.
                 gpu.graphs.verify_graph_launch(
-                    &gpu.hip, gpu.device_id,
-                    gpu.active_stream.as_ref().unwrap(), b,
+                    &gpu.hip,
+                    gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(),
+                    b,
                 )?;
                 eprintln!(
                     "[verify-graph] captured for B={} with {} blobs (cache size: {})",
@@ -5574,7 +5594,9 @@ pub fn seed_target_hidden_from_prompt_abortable(
             &mut target.dn_state,
             &target.scratch,
             Some(hidden_rb),
-            None, None, None,
+            None,
+            None,
+            None,
         )?;
         let block = download_hidden_block(gpu, hidden_rb, chunk.len())?;
         target_hidden_host.extend_from_slice(&block);
@@ -5638,7 +5660,9 @@ pub fn seed_target_hidden_suffix_abortable(
             &mut target.dn_state,
             &target.scratch,
             Some(hidden_rb),
-            None, None, None,
+            None,
+            None,
+            None,
         )?;
         pos += chunk.len();
         off = end;

@@ -9,14 +9,19 @@ use image::{ImageBuffer, Rgb};
 fn solid_png_bytes(r: u8, g: u8, b: u8, w: u32, h: u32) -> Vec<u8> {
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(w, h, Rgb([r, g, b]));
     let mut buf = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
+    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .unwrap();
     buf
 }
 
 fn solid_jpeg_bytes(r: u8, g: u8, b: u8, w: u32, h: u32) -> Vec<u8> {
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(w, h, Rgb([r, g, b]));
     let mut buf = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg).unwrap();
+    img.write_to(
+        &mut std::io::Cursor::new(&mut buf),
+        image::ImageFormat::Jpeg,
+    )
+    .unwrap();
     buf
 }
 
@@ -71,8 +76,16 @@ fn output_matches_load_and_preprocess_for_same_input() {
         .expect("load_and_preprocess failed");
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert_eq!((h1, w1), (h2, w2), "dimensions should match between from-bytes and from-path");
-    assert_eq!(from_bytes.len(), from_path.len(), "output length should match");
+    assert_eq!(
+        (h1, w1),
+        (h2, w2),
+        "dimensions should match between from-bytes and from-path"
+    );
+    assert_eq!(
+        from_bytes.len(),
+        from_path.len(),
+        "output length should match"
+    );
     for i in 0..from_bytes.len() {
         assert!(
             (from_bytes[i] - from_path[i]).abs() < 1e-5,
@@ -150,7 +163,10 @@ fn dimension_bomb_rejected() {
 fn dimension_bomb_just_under_limit_passes() {
     let bytes = solid_png_bytes(0, 0, 0, 1999, 1999);
     let result = load_and_preprocess_from_bytes(&bytes, 16, 2);
-    assert!(result.is_ok(), "1999x1999 (3.996M) should be under 4M ceiling: {result:?}");
+    assert!(
+        result.is_ok(),
+        "1999x1999 (3.996M) should be under 4M ceiling: {result:?}"
+    );
 }
 
 #[test]
@@ -160,7 +176,10 @@ fn dimension_bomb_exact_boundary_passes() {
     // behaviour against future drift.
     let bytes = solid_png_bytes(0, 0, 0, 2000, 2000);
     let result = load_and_preprocess_from_bytes(&bytes, 16, 2);
-    assert!(result.is_ok(), "2000x2000 (4M, exactly at limit) should pass: {result:?}");
+    assert!(
+        result.is_ok(),
+        "2000x2000 (4M, exactly at limit) should pass: {result:?}"
+    );
 }
 
 #[test]
@@ -171,14 +190,25 @@ fn smart_resize_divisibility() {
     assert_eq!(h % 16, 0, "height must be divisible by patch_size=16");
     assert_eq!(w % 16, 0, "width must be divisible by patch_size=16");
     let sms = 2;
-    assert_eq!((h / 16) % sms, 0, "grid height must be divisible by spatial_merge_size");
-    assert_eq!((w / 16) % sms, 0, "grid width must be divisible by spatial_merge_size");
+    assert_eq!(
+        (h / 16) % sms,
+        0,
+        "grid height must be divisible by spatial_merge_size"
+    );
+    assert_eq!(
+        (w / 16) % sms,
+        0,
+        "grid width must be divisible by spatial_merge_size"
+    );
 }
 
 #[test]
 fn smart_resize_large_image_downscales() {
     let (h, w) = smart_resize(4096, 4096, 32, 3136, 1_003_520);
-    assert!(h * w <= 1_003_520, "large image should be downscaled to max_pixels");
+    assert!(
+        h * w <= 1_003_520,
+        "large image should be downscaled to max_pixels"
+    );
     assert!(h > 0 && w > 0);
 }
 
@@ -192,7 +222,11 @@ fn smart_resize_tiny_image_upscales() {
 #[test]
 fn smart_resize_normal_image_unchanged() {
     let (h, w) = smart_resize(512, 512, 32, 3136, 1_003_520);
-    assert_eq!((h, w), (512, 512), "512x512 is within bounds and factor-aligned — should be unchanged");
+    assert_eq!(
+        (h, w),
+        (512, 512),
+        "512x512 is within bounds and factor-aligned — should be unchanged"
+    );
 }
 
 #[test]

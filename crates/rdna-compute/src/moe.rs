@@ -20,7 +20,9 @@ impl Gpu {
         expert_outputs: &GpuTensor, // [batch_size × k_top × m] f32
         topk_weights: &GpuTensor,   // [batch_size × k_top] f32
         x_residual: &GpuTensor,     // [batch_size × m] f32 in-place +=
-        m: usize, k_top: usize, batch_size: usize,
+        m: usize,
+        k_top: usize,
+        batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -29,13 +31,13 @@ impl Gpu {
             "moe_down_combine_k8_batched",
         )?;
         let eop = expert_outputs.buf.as_ptr();
-        let wp  = topk_weights.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
         let xrp = x_residual.buf.as_ptr();
         let m_val = m as i32;
         let kt_val = k_top as i32;
         let mut params: Vec<*mut c_void> = vec![
             &eop as *const _ as *mut c_void,
-            &wp  as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
             &xrp as *const _ as *mut c_void,
             &m_val as *const _ as *mut c_void,
             &kt_val as *const _ as *mut c_void,
@@ -43,21 +45,32 @@ impl Gpu {
         // BW: expert_outputs read N*K_TOP*M, topk_weights N*K_TOP, x_residual r+w 2*N*M.
         let bytes = (batch_size * k_top * m + batch_size * k_top + 2 * batch_size * m) * 4;
         let timer = crate::profile::begin_timer(
-            &self.hip, "elementwise", "moe_down_combine_k8_batched", bytes,
+            &self.hip,
+            "elementwise",
+            "moe_down_combine_k8_batched",
+            bytes,
         );
         let block_m: u32 = 256;
         let grid_x = (m as u32 + block_m - 1) / block_m;
         let result = self.launch_maybe_blob(
             "moe_down_combine_k8_batched",
-            [grid_x, batch_size as u32, 1], [block_m, 1, 1], 0, &mut params,
+            [grid_x, batch_size as u32, 1],
+            [block_m, 1, 1],
+            0,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(eop); b.push_ptr(wp); b.push_ptr(xrp);
-                b.push_i32(m_val); b.push_i32(kt_val);
+                b.push_ptr(eop);
+                b.push_ptr(wp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(kt_val);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -91,19 +104,29 @@ impl Gpu {
         let lds_bytes = (num_experts * 4) as u32;
         let bytes = (total_slots + num_experts) * 4;
         let timer = crate::profile::begin_timer(
-            &self.hip, "elementwise", "moe_scatter_histogram_k8", bytes,
+            &self.hip,
+            "elementwise",
+            "moe_scatter_histogram_k8",
+            bytes,
         );
         let result = self.launch_maybe_blob(
             "moe_scatter_histogram_k8",
-            [1, 1, 1], [256, 1, 1], lds_bytes, &mut params,
+            [1, 1, 1],
+            [256, 1, 1],
+            lds_bytes,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ip); b.push_ptr(cp);
-                b.push_i32(ts_val); b.push_i32(ne_val);
+                b.push_ptr(ip);
+                b.push_ptr(cp);
+                b.push_i32(ts_val);
+                b.push_i32(ne_val);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -136,20 +159,26 @@ impl Gpu {
         ];
         let lds_bytes = (num_experts * 4) as u32;
         let bytes = (3 * num_experts + 1) * 4;
-        let timer = crate::profile::begin_timer(
-            &self.hip, "elementwise", "moe_scatter_offsets_k8", bytes,
-        );
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "moe_scatter_offsets_k8", bytes);
         let result = self.launch_maybe_blob(
             "moe_scatter_offsets_k8",
-            [1, 1, 1], [256, 1, 1], lds_bytes, &mut params,
+            [1, 1, 1],
+            [256, 1, 1],
+            lds_bytes,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(cp); b.push_ptr(op);
-                b.push_i32(ne_val); b.push_i32(bm_val);
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_i32(ne_val);
+                b.push_i32(bm_val);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -200,22 +229,31 @@ impl Gpu {
         // BW: topk_indices + offsets + sorted_slot_index (init + writes)
         //     + expert_tile_ids (writes).
         let bytes = (total_slots + num_experts + 2 * m_total + m_total / block_m.max(1)) * 4;
-        let timer = crate::profile::begin_timer(
-            &self.hip, "elementwise", "moe_scatter_permute_k8", bytes,
-        );
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "moe_scatter_permute_k8", bytes);
         let result = self.launch_maybe_blob(
             "moe_scatter_permute_k8",
-            [1, 1, 1], [256, 1, 1], lds_bytes, &mut params,
+            [1, 1, 1],
+            [256, 1, 1],
+            lds_bytes,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ip); b.push_ptr(op); b.push_ptr(sp); b.push_ptr(tp);
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(tp);
                 b.push_ptr(invp);
-                b.push_i32(ts_val); b.push_i32(ne_val);
-                b.push_i32(mt_val); b.push_i32(bm_val);
+                b.push_i32(ts_val);
+                b.push_i32(ne_val);
+                b.push_i32(mt_val);
+                b.push_i32(bm_val);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -266,22 +304,32 @@ impl Gpu {
         ];
         let lds_bytes = (num_experts * 4) as u32;
         let bytes = (total_slots + 2 * num_experts + 2 * total_slots + num_experts) * 4;
-        let timer = crate::profile::begin_timer(
-            &self.hip, "elementwise", "moe_scatter_fused_k8", bytes,
-        );
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "moe_scatter_fused_k8", bytes);
         let result = self.launch_maybe_blob(
             "moe_scatter_fused_k8",
-            [1, 1, 1], [256, 1, 1], lds_bytes, &mut params,
+            [1, 1, 1],
+            [256, 1, 1],
+            lds_bytes,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ip); b.push_ptr(cp); b.push_ptr(op);
-                b.push_ptr(sp); b.push_ptr(tp); b.push_ptr(invp);
-                b.push_i32(ts_val); b.push_i32(ne_val);
-                b.push_i32(mtm_val); b.push_i32(bm_val);
+                b.push_ptr(ip);
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(tp);
+                b.push_ptr(invp);
+                b.push_i32(ts_val);
+                b.push_i32(ne_val);
+                b.push_i32(mtm_val);
+                b.push_i32(bm_val);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -323,19 +371,31 @@ impl Gpu {
         let grid_x = (dim as u32 + block - 1) / block;
         let bytes = (n * dim * 4 * 2 + n * k_top * 4 + n * k_top * 4) as usize;
         let timer = crate::profile::begin_timer(
-            &self.hip, "elementwise", "moe_down_combine_grouped_k8", bytes,
+            &self.hip,
+            "elementwise",
+            "moe_down_combine_grouped_k8",
+            bytes,
         );
         let result = self.launch_maybe_blob(
             "moe_down_combine_grouped_k8",
-            [grid_x, n as u32, 1], [block, 1, 1], 0, &mut params,
+            [grid_x, n as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(yp); b.push_ptr(ip); b.push_ptr(wp); b.push_ptr(xrp);
-                b.push_i32(dim_val); b.push_i32(kt_val);
+                b.push_ptr(yp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(xrp);
+                b.push_i32(dim_val);
+                b.push_i32(kt_val);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -382,19 +442,32 @@ impl Gpu {
         //     + y_up write (m_total*mi*4) + sorted_slot_index (m_total*4).
         let bytes = (m_total * 2 * mi + m_total * 2 * mi + m_total) * 4;
         let timer = crate::profile::begin_timer(
-            &self.hip, "elementwise", "moe_gate_up_unscatter_k8", bytes,
+            &self.hip,
+            "elementwise",
+            "moe_gate_up_unscatter_k8",
+            bytes,
         );
         let result = self.launch_maybe_blob(
             "moe_gate_up_unscatter_k8",
-            [grid_x, m_total as u32, 1], [block, 1, 1], 0, &mut params,
+            [grid_x, m_total as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(yp); b.push_ptr(sp); b.push_ptr(gp); b.push_ptr(up);
-                b.push_i32(mi_val); b.push_i32(kt_val); b.push_i32(mt_val);
+                b.push_ptr(yp);
+                b.push_ptr(sp);
+                b.push_ptr(gp);
+                b.push_ptr(up);
+                b.push_i32(mi_val);
+                b.push_i32(kt_val);
+                b.push_i32(mt_val);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -437,20 +510,32 @@ impl Gpu {
         // write traffic vs the unfused path (no y_up output).
         let bytes = (m_total * 2 * mi + m_total * mi + m_total) * 4;
         let timer = crate::profile::begin_timer(
-            &self.hip, "elementwise", "moe_unscatter_silu_clamp_k8", bytes,
+            &self.hip,
+            "elementwise",
+            "moe_unscatter_silu_clamp_k8",
+            bytes,
         );
         let result = self.launch_maybe_blob(
             "moe_unscatter_silu_clamp_k8",
-            [grid_x, m_total as u32, 1], [block, 1, 1], 0, &mut params,
+            [grid_x, m_total as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(yp); b.push_ptr(sp); b.push_ptr(gp);
-                b.push_i32(mi_val); b.push_i32(kt_val); b.push_i32(mt_val);
+                b.push_ptr(yp);
+                b.push_ptr(sp);
+                b.push_ptr(gp);
+                b.push_i32(mi_val);
+                b.push_i32(kt_val);
+                b.push_i32(mt_val);
                 b.push_f32(swiglu_lim);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
     pub fn hash_router_normalize_f32(
@@ -490,13 +575,23 @@ impl Gpu {
         ];
         let blob_builder = || {
             let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(tp); b.push_ptr(sp); b.push_ptr(ip); b.push_ptr(wp);
-            b.push_i32(tid); b.push_i32(ne); b.push_i32(kv); b.push_f32(rs);
+            b.push_ptr(tp);
+            b.push_ptr(sp);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_i32(tid);
+            b.push_i32(ne);
+            b.push_i32(kv);
+            b.push_f32(rs);
             b
         };
         self.launch_maybe_blob(
             "hash_router_normalize_f32",
-            [1, 1, 1], [1, 1, 1], 0, &mut params, blob_builder,
+            [1, 1, 1],
+            [1, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
         )
     }
     pub fn hash_router_normalize_f32_batched(
@@ -539,15 +634,24 @@ impl Gpu {
         ];
         let blob_builder = || {
             let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(tp); b.push_ptr(sp); b.push_ptr(tb);
-            b.push_ptr(ip); b.push_ptr(wp);
-            b.push_i32(ne); b.push_i32(kv); b.push_f32(rs);
+            b.push_ptr(tp);
+            b.push_ptr(sp);
+            b.push_ptr(tb);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_i32(ne);
+            b.push_i32(kv);
+            b.push_f32(rs);
             b.push_i32(bs);
             b
         };
         self.launch_maybe_blob(
             "hash_router_normalize_f32_batched",
-            [batch_size as u32, 1, 1], [1, 1, 1], 0, &mut params, blob_builder,
+            [batch_size as u32, 1, 1],
+            [1, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
         )
     }
     pub fn hash_router_normalize_f32_buf(
@@ -587,22 +691,31 @@ impl Gpu {
         ];
         let blob_builder = || {
             let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(tp); b.push_ptr(sp); b.push_ptr(tb);
-            b.push_ptr(ip); b.push_ptr(wp);
-            b.push_i32(ne); b.push_i32(kv); b.push_f32(rs);
+            b.push_ptr(tp);
+            b.push_ptr(sp);
+            b.push_ptr(tb);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_i32(ne);
+            b.push_i32(kv);
+            b.push_f32(rs);
             b
         };
         self.launch_maybe_blob(
             "hash_router_normalize_f32_buf",
-            [1, 1, 1], [1, 1, 1], 0, &mut params, blob_builder,
+            [1, 1, 1],
+            [1, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
         )
     }
     pub fn deepseek4_moe_topk_bias_aware_batched_f32(
         &mut self,
-        scores: &GpuTensor,    // [B, n_exp]
-        bias: &GpuTensor,      // [n_exp]
-        indices: &GpuTensor,   // [B, k_top]
-        weights: &GpuTensor,   // [B, k_top]
+        scores: &GpuTensor,  // [B, n_exp]
+        bias: &GpuTensor,    // [n_exp]
+        indices: &GpuTensor, // [B, k_top]
+        weights: &GpuTensor, // [B, k_top]
         n_exp: i32,
         k_top: i32,
         route_scale: f32,
@@ -646,10 +759,10 @@ impl Gpu {
     }
     pub fn deepseek4_moe_topk_bias_aware_f32(
         &mut self,
-        scores: &GpuTensor,    // [n_exp] fp32
-        bias: &GpuTensor,      // [n_exp] fp32 (zero if hash-routed)
-        indices: &GpuTensor,   // [k_top] i32 (typed as F32; raw bytes)
-        weights: &GpuTensor,   // [k_top] fp32
+        scores: &GpuTensor,  // [n_exp] fp32
+        bias: &GpuTensor,    // [n_exp] fp32 (zero if hash-routed)
+        indices: &GpuTensor, // [k_top] i32 (typed as F32; raw bytes)
+        weights: &GpuTensor, // [k_top] fp32
         n_exp: i32,
         k_top: i32,
         route_scale: f32,
@@ -690,9 +803,9 @@ impl Gpu {
     }
     pub fn deepseek4_topk_kv_gather_batched_f32(
         &mut self,
-        kv_cache: &GpuTensor,    // [N_compressed, head_dim] shared
-        topk_idx: &GpuTensor,    // [B, K] i32
-        out: &GpuTensor,         // [B, head_dim, out_stride]
+        kv_cache: &GpuTensor, // [N_compressed, head_dim] shared
+        topk_idx: &GpuTensor, // [B, K] i32
+        out: &GpuTensor,      // [B, head_dim, out_stride]
         k_active: i32,
         head_dim: i32,
         n_compressed: i32,
@@ -748,7 +861,7 @@ impl Gpu {
         out: &GpuTensor,
         k_buf: &GpuTensor,
         n_compressed_buf: &GpuTensor,
-        max_k: i32,         // upper bound on K — sets the captured grid size
+        max_k: i32, // upper bound on K — sets the captured grid size
         head_dim: i32,
         out_stride: i32,
         col_offset: i32,
@@ -782,21 +895,30 @@ impl Gpu {
         ];
         let blob_builder = || {
             let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(cp); b.push_ptr(ip); b.push_ptr(op);
-            b.push_ptr(kbp); b.push_ptr(ncp);
-            b.push_i32(hd); b.push_i32(os); b.push_i32(co); b.push_f32(sc);
+            b.push_ptr(cp);
+            b.push_ptr(ip);
+            b.push_ptr(op);
+            b.push_ptr(kbp);
+            b.push_ptr(ncp);
+            b.push_i32(hd);
+            b.push_i32(os);
+            b.push_i32(co);
+            b.push_f32(sc);
             b
         };
         self.launch_maybe_blob(
             "deepseek4_topk_kv_gather_f32_buf",
-            [max_k as u32, 1, 1], [head_dim as u32, 1, 1], 0,
-            &mut params, blob_builder,
+            [max_k as u32, 1, 1],
+            [head_dim as u32, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
         )
     }
     pub fn deepseek4_topk_kv_gather_identity_batched_f32(
         &mut self,
-        kv_cache: &GpuTensor,    // [N_compressed, head_dim] shared
-        out: &GpuTensor,         // [B, head_dim, out_stride]
+        kv_cache: &GpuTensor, // [N_compressed, head_dim] shared
+        out: &GpuTensor,      // [B, head_dim, out_stride]
         k_active: i32,
         head_dim: i32,
         out_stride: i32,
@@ -863,15 +985,20 @@ impl Gpu {
         ];
         let blob_builder = || {
             let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(cp); b.push_ptr(op); b.push_ptr(kbp);
-            b.push_i32(hd); b.push_i32(os);
+            b.push_ptr(cp);
+            b.push_ptr(op);
+            b.push_ptr(kbp);
+            b.push_i32(hd);
+            b.push_i32(os);
             b
         };
         self.launch_maybe_blob(
             "deepseek4_topk_kv_gather_identity_f32_buf",
-            [max_k as u32, 1, 1], [head_dim as u32, 1, 1], 0,
-            &mut params, blob_builder,
+            [max_k as u32, 1, 1],
+            [head_dim as u32, 1, 1],
+            0,
+            &mut params,
+            blob_builder,
         )
     }
-
 }
