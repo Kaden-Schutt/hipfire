@@ -158,11 +158,15 @@ the 67 Hessian tensors. The npz->unrotated converter (`scripts/npz_to_unrot_hess
 
 The faithful hipfire-native super-block Q4K codec (256-elem super-block, fp16 d+dmin,
 per-32 6-bit scale+min, 4.50 bpw = the EXISTING `Q4K`/`gemv_q4k` layout) with AWQ
-pre-conditioning AND GPTQ rounding **to the Q4K per-32 grid** reaches
-**KLD 0.060288 @ 4.50 bpw** vs GGUF Q4_K_S **0.070983 @ 4.76 bpw** — **-15.1% KLD at
--5.5% bpw**. Non-codebook, no Lloyd, no FWHT-at-runtime, GPU-friendly uniform 256 layout;
-the GEMV (`gemv_q4k`) already exists, so shipping needs only the qwen35 forward-dispatch
-wiring + retargeting the AWQ/GPTQ quant pipeline to Q4K (today they target flat-MQ4G256).
+pre-conditioning AND GPTQ rounding **to the Q4K per-32 grid**:
+- with the IMPORTED v3 unsloth-imatrix AWQ scales: **KLD 0.060288 @ 4.50 bpw** vs GGUF
+  Q4_K_S **0.070983 @ 4.76 bpw** = **-15.1% KLD at -5.5% bpw** (Step 1).
+- with a NATIVE imatrix (this calib forward's E[x^2]): **KLD 0.048449 @ 4.50 bpw** =
+  **-31.7% below GGUF** (Step 2, the best variant).
+
+Non-codebook, no Lloyd, no FWHT-at-runtime, GPU-friendly uniform 256 layout; the GEMV
+(`gemv_q4k`) already exists, so shipping needs only the qwen35 forward-dispatch wiring +
+retargeting the AWQ/GPTQ quant pipeline to Q4K (today they target flat-MQ4G256).
 
 The progression (all 128ch, fp32-DN, same span):
 - flat-G256 PLAIN ........................... 0.147552 (+108% vs GGUF)
