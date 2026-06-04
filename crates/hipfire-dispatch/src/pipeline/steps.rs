@@ -32,16 +32,19 @@ pub enum Step<'a> {
         residual: &'a GpuTensor,
         out: &'a GpuTensor,
     },
-    /// Fused rmsnorm + FWHT producer (mirrors rmsnorm_rotate_dispatch's MQ branch
-    /// → RotationFamily.run(WithRmsnorm)). Writes the rotated activation to `out`.
-    RmsnormRotateMq {
+    /// Fused rmsnorm + optional FWHT rotation. The `rotation` field is derived
+    /// by the caller via `dtype_rotation_plan(w.dtype)`. `out` holds the
+    /// ready-to-use activation (FWHT-rotated for FwhtG256, plain-normed for None).
+    /// All downstream Gemv steps use GemvInput::Prerotated(out).
+    RmsnormAutomatic {
         x: &'a GpuTensor,
         norm_weight: &'a GpuTensor,
-        x_plain: &'a GpuTensor,           // = tmp (rmsnorm intermediate)
-        out: &'a GpuTensor,               // = x_rot scratch
+        x_plain: &'a GpuTensor,   // rmsnorm intermediate scratch (always written)
+        out: &'a GpuTensor,       // final activation output (written by this step)
         awq_scale: Option<&'a GpuTensor>,
         k: usize,
         eps: f32,
+        rotation: RotationPlan,   // FwhtG256 for MQ dtypes, None for HFQ4/others
     },
 }
 
@@ -50,7 +53,7 @@ fn op_kind(step: &Step) -> PipelineOp {
     match step {
         Step::Gemv { .. } => PipelineOp::Gemv,
         Step::GemvResidual { .. } => PipelineOp::GemvResidual,
-        Step::RmsnormRotateMq { .. } => PipelineOp::RmsnormRotateMq,
+        Step::RmsnormAutomatic { .. } => PipelineOp::RmsnormAutomatic,
     }
 }
 
@@ -132,14 +135,23 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 })
             }
         }
-        Step::RmsnormRotateMq { x, norm_weight, x_plain, out, awq_scale, k, eps } => {
-            let rotation = ROTATION.get_or_init(RotationFamily::new);
-            rotation.run(ctx, gpu, RotationParams {
-                x, x_up: None, w_norm: Some(norm_weight),
-                x_plain, x_rot: out, awq_scale: *awq_scale, k: *k, eps: *eps,
-                batch_size: 1, variant: RotationVariant::WithRmsnorm,
-                givens_pairs: None, givens_theta: None, givens_scales: None, givens_krot: None,
-            }).map_err(|e| DispatchError::Hip(e.to_string()))
+        Step::RmsnormAutomatic { x, norm_weight, x_plain, out, awq_scale, k, eps, rotation } => {
+            if *rotation == RotationPlan::None {
+                // HFQ4G256 and other non-FWHT dtypes: plain rmsnorm into `out`.
+                // x_plain is not written in this path (scratch only for FWHT path).
+                gpu.rmsnorm_f32(x, norm_weight, out, *eps)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))
+            } else {
+                let rotation_family = ROTATION.get_or_init(RotationFamily::new);
+                rotation_family.run(ctx, gpu, RotationParams {
+                    x, x_up: None, w_norm: Some(norm_weight),
+                    x_plain, x_rot: out, awq_scale: *awq_scale,
+                    k: *k, eps: *eps, batch_size: 1,
+                    variant: RotationVariant::WithRmsnorm,
+                    givens_pairs: None, givens_theta: None,
+                    givens_scales: None, givens_krot: None,
+                }).map_err(|e| DispatchError::Hip(e.to_string()))
+            }
         }
     }
 }

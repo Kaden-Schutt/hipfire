@@ -13190,9 +13190,10 @@ fn qkv_interpret_mq(
     let wrk = WeightRef { buf: &wk.buf, dtype: wk.gpu_dtype, m: wk.m, k: wk.k, row_stride: 0, rotation: None, awq_scale: None };
     let wrv = WeightRef { buf: &wv.buf, dtype: wv.gpu_dtype, m: wv.m, k: wv.k, row_stride: 0, rotation: None, awq_scale: None };
     let steps = [
-        Step::RmsnormRotateMq {
+        Step::RmsnormAutomatic {
             x, norm_weight: attn_norm, x_plain: tmp, out: x_rot,
             awq_scale: wq.awq_scale.as_ref(), k: wq.k, eps,
+            rotation: hipfire_dispatch::types::dtype_rotation_plan(wq.gpu_dtype),
         },
         Step::Gemv { w: &wrq, input: GemvInput::Prerotated(x_rot), out: fa_q },
         Step::Gemv { w: &wrk, input: GemvInput::Prerotated(x_rot), out: fa_k },
