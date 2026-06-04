@@ -2369,6 +2369,12 @@ pub const ATTENTION_Q8_0_KV_SRC: &str = include_str!("../../../kernels/src/atten
 pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip");
 
+/// Batched counterpart of ATTENTION_SRC for unquantized FP32 KV cache.
+/// Processes N queries in one launch with per-row causal windows from a
+/// positions[] array.
+pub const ATTENTION_F32_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_f32_batched.hip");
+
 /// Phase-timed variant of ATTENTION_Q8_0_KV_SRC. Functionally equivalent
 /// to the baseline kernel but instrumented with wall_clock64() around each
 /// of the 3 internal phases (QK^T, softmax, V-weighted-sum). Writes per-head
@@ -2557,6 +2563,7 @@ pub const SIGMOID_MUL_SRC: &str = include_str!("../../../kernels/src/sigmoid_mul
 pub const TOPK_LOGITS_SRC: &str = include_str!("../../../kernels/src/topk_logits.hip");
 pub const TOPK_LOGSUMEXP_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/topk_logsumexp_batched.hip");
+pub const KLD_TILE_TOPK_LSE_SRC: &str = include_str!("../../../kernels/src/kld_tile_topk_lse.hip");
 
 /// Partial interleaved RoPE: rotate only first n_rot dims, pairs are adjacent (d0,d1),(d2,d3),...
 /// Dims >= n_rot pass through unchanged.
@@ -2691,6 +2698,11 @@ pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_GFX12_SRC: &str =
 /// Standalone f32 → f16 elementwise cast kernel. Block [256], grid
 /// `ceil(n / 256)`. See `kernels/src/cast_f32_to_f16.hip`.
 pub const CAST_F32_TO_F16_SRC: &str = include_str!("../../../kernels/src/cast_f32_to_f16.hip");
+
+/// Standalone f32 → bf16 elementwise cast kernel. Block [256], grid
+/// `ceil(n / 256)`. See `kernels/src/convert_f32_to_bf16.hip`.
+pub const CONVERT_F32_TO_BF16_SRC: &str =
+    include_str!("../../../kernels/src/convert_f32_to_bf16.hip");
 
 /// In-place F32 → bf16 → F32 round-trip. Truncates each F32 to bf16's
 /// 7-bit mantissa with round-to-nearest-even. Used by the dots.ocr
@@ -2861,6 +2873,11 @@ pub const EMBEDDING_HFQ4G256_SRC: &str =
 /// between replays, replay the same graph. Writes into row-major `[N × dim]`.
 pub const EMBEDDING_HFQ4G256_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_hfq4g256_batched.hip");
+
+/// Batched F32 embedding: copy N rows in one launch. Reads token ids from a
+/// device buffer so the launch is hipGraph-captureable.
+pub const EMBEDDING_F32_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/embedding_f32_batched.hip");
 
 /// Batched Q8_0 embedding: same hipGraph-captureable pattern as the HFQ4-G256
 /// variant. 27B MQ4 targets ship with Q8_0-quantized embedding tables, so the
@@ -3085,6 +3102,18 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
 /// F16-weight × F32-input GEMV. Used for full-precision MTP weights where
 /// the WMMA F16×F16 path's F32→F16 input conversion loses precision.
 pub const GEMV_F16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_f16_xf32.hip");
+pub const GEMV_F16_XF32_RESIDUAL_SRC: &str =
+    include_str!("../../../kernels/src/gemv_f16_xf32_residual.hip");
+pub const GEMV_F16_XF32_RESIDUAL_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_f16_xf32_residual_batched.hip");
+pub const FUSED_QKVZA_F16_XF32_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_f16_xf32.hip");
+pub const FUSED_QKVZA_F16_XF32_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/fused_qkvza_f16_xf32_batched.hip");
+pub const FUSED_GATE_UP_F16_XF32_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_f16_xf32.hip");
+pub const FUSED_GATE_UP_F16_XF32_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/fused_gate_up_f16_xf32_batched.hip");
 
 /// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
 /// L = swiglu_limit (DeepSeek V4 config = 10.0).
@@ -3327,6 +3356,12 @@ pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
 pub const GEMM_F16_X_F16_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.hip");
 
+/// WMMA BF16 × BF16 → F32 GEMM with (B, M) output layout.
+/// Targets gfx1100+ wave32 WMMA and consumes raw BF16 weight/input
+/// payloads. See `kernels/src/gemm_bf16_x_bf16_wmma.hip`.
+pub const GEMM_BF16_X_BF16_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_x_bf16_wmma.hip");
+
 /// Bulk F32→F16 conversion for staging WMMA activations. Named
 /// `deepseek4_convert_f32_to_f16` to avoid collision with the embedded
 /// `convert_f32_to_f16` helper in `GEMM_HFQ4G256_RESIDUAL_FP16_SRC`
@@ -3442,6 +3477,12 @@ pub const V4F_ATTN_SWA_BATCHED_DEBUG_SRC: &str =
 /// Replaces gemm_f32_batched for prefill paths.
 pub const GEMM_F32_REGISTER_TILED_SRC: &str =
     include_str!("../../../kernels/src/gemm_f32_register_tiled.hip");
+pub const GEMM_F32_REGISTER_TILED_B16_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_register_tiled_b16.hip");
+pub const GEMM_F32_REGISTER_TILED_B32_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_register_tiled_b32.hip");
+pub const GEMM_F32_REGISTER_TILED_B64_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_register_tiled_b64.hip");
 
 /// Atomic-free MQ2-Lloyd K4 MoE down kernel — writes [N × K_TOP × M]
 /// f32 with no atomicAdd contention. Pair with `moe_down_combine_k8_batched`
