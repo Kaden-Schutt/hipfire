@@ -74,11 +74,17 @@ impl ArchPredicate {
     pub fn eval_arch(&self, ctx: &DispatchCtx) -> bool {
         match self {
             Self::Always => true,
-            Self::HasWmmaW32 => ctx.arch.has_wmma_w32(),
+            // gfx11 wave32 WMMA (has_wmma_w32) OR gfx12/RDNA4 WMMA (has_wmma_w32_gfx12).
+            // Without the gfx12 arm, every WMMA-family quant (MQ3, Lloyd, fused QKV/gate-up,
+            // MoE grouped, GQA-fused attn) resolved to MissingImpl on RDNA4 — these kernels
+            // ship on gfx1201. Equivalent to ArchCaps::has_wmma() for RDNA.
+            Self::HasWmmaW32 => ctx.arch.has_wmma_w32() || ctx.arch.has_wmma_w32_gfx12(),
             Self::HasWmmaW32Gfx12 => ctx.arch.has_wmma_w32_gfx12(),
             Self::HasDp4a => ctx.arch.has_dot2_f32_f16(),
             Self::HasSdot4 => ctx.arch.has_hfq3_sdot4(),
-            Self::HasMmq => ctx.arch.has_mmq(),
+            // MQ6/HFQ6 GEMV ships on RDNA4 (gemv_mq6g256_prerotated has a gfx12 build);
+            // has_mmq is gfx906||rdna3 only, so admit RDNA4 explicitly.
+            Self::HasMmq => ctx.arch.has_mmq() || ctx.arch.is_rdna4(),
             Self::HasCdna3LdsGemv => ctx.arch.has_cdna3_lds_gemv(),
             Self::GemvDp4a => ctx.arch.gemv_dp4a_enabled(),
         }
