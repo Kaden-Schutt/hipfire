@@ -269,3 +269,25 @@ fn q8_and_paro_dispatchable_in_all_used_variants() {
         );
     }
 }
+
+/// LAYER 1d — for_gemv_prerotated must cover EVERY rotation-free dtype. The
+/// run_fa_layer_body migration (and the already-migrated FullAttnMoe path) lower
+/// the unfused QKV/gate_up fallback through GemvVariant::Prerotated; for a
+/// rotation-free dtype "prerotated" == plain, so it MUST resolve (the legacy
+/// run_auto path did). Before the fix HFQ6/HFQ3/F16/F32/Q4K/Q6K/HFP4 hard-errored.
+#[test]
+fn prerotated_covers_rotation_free_dtypes() {
+    for d in [F16, F32, Q4K, Q6K, HFQ3G256, HFQ6G256, HFQ2G256, HFP4G32, Q8_0] {
+        assert!(
+            KernelKey::for_gemv_prerotated(d).is_ok(),
+            "for_gemv_prerotated({:?}) errors — the unfused FA fallback panics where the \
+             legacy run_auto->Plain path worked", d
+        );
+    }
+    // A rotation-NEEDING dtype not explicitly handled must NOT fall through to plain
+    // (the plain path would re-rotate already-rotated input): MQ4G128 stays an Err.
+    assert!(
+        KernelKey::for_gemv_prerotated(MQ4G128).is_err(),
+        "MQ4G128 (FwhtG128) must stay an error — falling to plain would double-rotate"
+    );
+}

@@ -396,10 +396,23 @@ impl KernelKey {
             // dispatches GemvQ8_0 → gpu.gemv_q8_0 and GemvParoQ4G128 → gpu.gemv_hfq4g128.
             Q8_0 => Ok(Self::GemvQ8_0),
             ParoQ4G128 => Ok(Self::GemvParoQ4G128),
-            _ => Err(DispatchError::UnsupportedVariant {
-                family: "gemv", variant: "prerotated",
-                arch: "", quant: "",
-            }),
+            // Any other dtype: if it is rotation-free (RotationPlan::None), its
+            // "prerotated" input IS its plain input (no rotation was applied), so the
+            // plain GEMV kernel is correct — route to for_gemv(Plain), the exact kernel
+            // the legacy weight_gemv_prerotated→run_auto fallback used (e.g. F16/F32/
+            // Q4K/Q6K/HFQ3G256/HFQ6G256/HFQ2G256/HFP4G32). Rotation-needing dtypes not
+            // enumerated above (e.g. MQ4G128 = FwhtG128) MUST NOT fall through — the
+            // plain path would re-rotate already-rotated input — so they stay an Err.
+            _ => {
+                if dtype_rotation_plan(dtype) == RotationPlan::None {
+                    Self::for_gemv(dtype, GemvVariant::Plain, false)
+                } else {
+                    Err(DispatchError::UnsupportedVariant {
+                        family: "gemv", variant: "prerotated",
+                        arch: "", quant: "",
+                    })
+                }
+            }
         }
     }
 
