@@ -509,6 +509,23 @@ fn main() {
         (kld_token, nll)
     };
 
+    let format_eta = |done: usize, total: usize, rate: f64| -> String {
+        if done >= total {
+            "eta 0s".to_string()
+        } else if rate.is_finite() && rate > 1e-9 {
+            let seconds = (total - done) as f64 / rate;
+            if seconds >= 3600.0 {
+                format!("eta {:.1}h", seconds / 3600.0)
+            } else if seconds >= 60.0 {
+                format!("eta {:.1}m", seconds / 60.0)
+            } else {
+                format!("eta {:.1}s", seconds)
+            }
+        } else {
+            "eta unknown".to_string()
+        }
+    };
+
     let scoring_start = n_ctx / 2;
     for c in 0..effective_n_chunk {
         eprintln!(
@@ -576,8 +593,9 @@ fn main() {
                     let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
                     let elapsed = t0.elapsed().as_secs_f64();
                     let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                    let eta = format_eta(total_scored_done, total_scored, rate);
                     eprintln!(
-                        "eval_hipfire: chunk {:4}/{} scored {:8}/{:8} ({:5.1}%, {:.0} tok/s)",
+                        "eval_hipfire: chunk {:4}/{} scored {:8}/{:8} ({:5.1}%, {:.0} tok/s, {eta})",
                         c + 1,
                         effective_n_chunk,
                         total_scored_done,
@@ -730,8 +748,9 @@ fn main() {
                     let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
                     let elapsed = t0.elapsed().as_secs_f64();
                     let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                    let eta = format_eta(total_scored_done, total_scored, rate);
                     eprintln!(
-                        "eval_hipfire: chunk {:4}/{} scored {:8}/{:8} ({:5.1}%, {:.0} tok/s)",
+                        "eval_hipfire: chunk {:4}/{} scored {:8}/{:8} ({:5.1}%, {:.0} tok/s, {eta})",
                         c + 1,
                         effective_n_chunk,
                         total_scored_done,
