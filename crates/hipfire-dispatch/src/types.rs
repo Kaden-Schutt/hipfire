@@ -177,6 +177,15 @@ pub enum KernelKey {
     GemmQ8_0Wmma,
     GemmQ8_0Wmma4W,
     GemmHfq4G256Wmma,
+    // Batched lm_head GEMM wrappers (zero-init Y + residual_wmma / scalar
+    // fallback, self-gating per arch inside the kernel). Distinct from the
+    // plain GEMM keys above: these are the spec-decode DFlash verify/draft
+    // lm_head path (gemm_hfqXg256_batched_lmhead in rdna-compute). Registered
+    // with ArchPredicate::Always because the wrapper picks WMMA vs per-row
+    // GEMV internally — resolve() must succeed on every arch the call reaches.
+    GemmHfq4G256BatchedLmhead,
+    GemmHfq3G256BatchedLmhead,
+    GemmHfq6G256BatchedLmhead,
     GemmF16XF16Wmma,
     GemmF32RegisterTiled,
     // Fused QKV

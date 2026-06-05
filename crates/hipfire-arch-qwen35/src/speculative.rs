@@ -18,6 +18,8 @@
 
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipResult, Stream};
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::gemm::{GemmFamily, GemmLmHeadKernel, GemmLmHeadParams};
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
@@ -58,6 +60,33 @@ fn dflash_gemm_q8_lmhead(
         gpu.gemm_q8_0_batched(&w_out.buf, &x_chunk, &y_chunk, w_out.m, w_out.k, chunk_n)?;
         chunk_start = chunk_end;
     }
+    Ok(())
+}
+
+/// Dispatch a batched lm_head GEMM through `GemmFamily` (Batch-3 dispatch
+/// migration). Byte-identical to the prior direct
+/// `gpu.gemm_hfqXg256_batched_lmhead(buf, x, y, m, k, batch)` call: the family
+/// resolves the matching `GemmHfqXG256BatchedLmhead` key (arch predicate
+/// `Always`) and dispatches the same rdna-compute wrapper. `kernel` names the
+/// kernel family explicitly because MQ4/MQ3/MQ6 weights route to the HFQ4/HFQ3/
+/// HFQ6 kernel (after the caller FWHT-rotates x), independent of `w.gpu_dtype`.
+fn dflash_gemm_batched_lmhead(
+    gpu: &mut Gpu,
+    kernel: GemmLmHeadKernel,
+    w_buf: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch_size: usize,
+) -> HipResult<()> {
+    let ctx = DispatchCtx::new(gpu);
+    let family = GemmFamily::new();
+    family.run_batched_lmhead(
+        &ctx,
+        gpu,
+        &GemmLmHeadParams { kernel, w_buf, x, y, m, k, batch_size },
+    )?;
     Ok(())
 }
 
@@ -128,7 +157,9 @@ fn dflash_enqueue_verify_lm_head(
             dflash_gemm_q8_lmhead(gpu, w_out, final_hidden, &logits_batch, b)?;
         }
         rdna_compute::DType::HFQ4G256 => {
-            gpu.gemm_hfq4g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq4G256,
                 &w_out.buf,
                 final_hidden,
                 &logits_batch,
@@ -146,7 +177,9 @@ fn dflash_enqueue_verify_lm_head(
             );
             let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
             llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
-            gpu.gemm_hfq4g256_batched_lmhead(&w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b)?;
+            dflash_gemm_batched_lmhead(
+                gpu, GemmLmHeadKernel::Hfq4G256, &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
+            )?;
         }
         rdna_compute::DType::MQ3G256 => {
             assert!(
@@ -157,10 +190,14 @@ fn dflash_enqueue_verify_lm_head(
             );
             let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
             llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
-            gpu.gemm_hfq3g256_batched_lmhead(&w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b)?;
+            dflash_gemm_batched_lmhead(
+                gpu, GemmLmHeadKernel::Hfq3G256, &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
+            )?;
         }
         rdna_compute::DType::HFQ6G256 => {
-            gpu.gemm_hfq6g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq6G256,
                 &w_out.buf,
                 final_hidden,
                 &logits_batch,
@@ -178,7 +215,9 @@ fn dflash_enqueue_verify_lm_head(
             );
             let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
             llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
-            gpu.gemm_hfq6g256_batched_lmhead(&w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b)?;
+            dflash_gemm_batched_lmhead(
+                gpu, GemmLmHeadKernel::Hfq6G256, &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
+            )?;
         }
         other => {
             return Err(hip_bridge::HipError::new(
@@ -3042,7 +3081,9 @@ pub fn spec_step_dflash(
                     dflash_gemm_q8_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)?;
                 }
                 rdna_compute::DType::HFQ4G256 => {
-                    gpu.gemm_hfq4g256_batched_lmhead(
+                    dflash_gemm_batched_lmhead(
+                        gpu,
+                        GemmLmHeadKernel::Hfq4G256,
                         &w_out.buf,
                         &hidden_rows,
                         &logits_batch,
@@ -3060,7 +3101,9 @@ pub fn spec_step_dflash(
                     // AWQ-aware rotation; same rationale as the target-verify
                     // arms above.
                     llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                    gpu.gemm_hfq4g256_batched_lmhead(
+                    dflash_gemm_batched_lmhead(
+                        gpu,
+                        GemmLmHeadKernel::Hfq4G256,
                         &w_out.buf,
                         &rotated,
                         &logits_batch,
@@ -3076,7 +3119,9 @@ pub fn spec_step_dflash(
                     );
                     let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                     llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                    gpu.gemm_hfq3g256_batched_lmhead(
+                    dflash_gemm_batched_lmhead(
+                        gpu,
+                        GemmLmHeadKernel::Hfq3G256,
                         &w_out.buf,
                         &rotated,
                         &logits_batch,
@@ -3086,7 +3131,9 @@ pub fn spec_step_dflash(
                     )?;
                 }
                 rdna_compute::DType::HFQ6G256 => {
-                    gpu.gemm_hfq6g256_batched_lmhead(
+                    dflash_gemm_batched_lmhead(
+                        gpu,
+                        GemmLmHeadKernel::Hfq6G256,
                         &w_out.buf,
                         &hidden_rows,
                         &logits_batch,
@@ -3102,7 +3149,9 @@ pub fn spec_step_dflash(
                     );
                     let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                     llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                    gpu.gemm_hfq6g256_batched_lmhead(
+                    dflash_gemm_batched_lmhead(
+                        gpu,
+                        GemmLmHeadKernel::Hfq6G256,
                         &w_out.buf,
                         &rotated,
                         &logits_batch,
@@ -3784,8 +3833,8 @@ fn run_dflash_draft_for_logits(
             // WMMA-residual lm_head wrapper which pre-zeros Y. Same pattern
             // as the verify path — keeps draft and verify byte-identical
             // for MQ3 targets.
-            let r2 = gpu.gemm_hfq3g256_batched_lmhead(
-                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+            let r2 = dflash_gemm_batched_lmhead(
+                gpu, GemmLmHeadKernel::Hfq3G256, &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
             );
             let _ = gpu.free_tensor(rotated);
             r2
@@ -3794,8 +3843,8 @@ fn run_dflash_draft_for_logits(
             // Phase A.4: HFQ6 lm_head batched via gemm_hfq6g256_batched_lmhead
             // (which zeros Y then dispatches the dp4a residual on gfx906 or
             // WMMA / FP16 fallbacks elsewhere).
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
+            dflash_gemm_batched_lmhead(
+                gpu, GemmLmHeadKernel::Hfq6G256, &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
             )
         }
         rdna_compute::DType::MQ6G256 => {
@@ -3806,8 +3855,8 @@ fn run_dflash_draft_for_logits(
                 let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
-            let r2 = gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+            let r2 = dflash_gemm_batched_lmhead(
+                gpu, GemmLmHeadKernel::Hfq6G256, &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
             );
             let _ = gpu.free_tensor(rotated);
             r2
@@ -3945,16 +3994,16 @@ fn run_dflash_draft_for_topk_gpu(
                 let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
-            let r2 = gpu.gemm_hfq3g256_batched_lmhead(
-                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+            let r2 = dflash_gemm_batched_lmhead(
+                gpu, GemmLmHeadKernel::Hfq3G256, &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
             );
             let _ = gpu.free_tensor(rotated);
             r2
         }
         rdna_compute::DType::HFQ6G256 => {
             // Phase A.4: HFQ6 lm_head batched.
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
+            dflash_gemm_batched_lmhead(
+                gpu, GemmLmHeadKernel::Hfq6G256, &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
             )
         }
         rdna_compute::DType::MQ6G256 => {
@@ -3965,8 +4014,8 @@ fn run_dflash_draft_for_topk_gpu(
                 let _ = gpu.free_tensor(logits_batch);
                 return Err(e);
             }
-            let r2 = gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+            let r2 = dflash_gemm_batched_lmhead(
+                gpu, GemmLmHeadKernel::Hfq6G256, &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
             );
             let _ = gpu.free_tensor(rotated);
             r2
