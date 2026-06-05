@@ -74,12 +74,14 @@ impl ArchPredicate {
     pub fn eval_arch(&self, ctx: &DispatchCtx) -> bool {
         match self {
             Self::Always => true,
-            // gfx11 wave32 WMMA (has_wmma_w32) OR gfx12/RDNA4 WMMA (has_wmma_w32_gfx12).
-            // Without the gfx12 arm, every WMMA-family quant (MQ3, Lloyd, fused QKV/gate-up,
-            // MoE grouped, GQA-fused attn) resolved to MissingImpl on RDNA4 — these kernels
-            // ship on gfx1201. Equivalent to ArchCaps::has_wmma() for RDNA.
-            Self::HasWmmaW32 => ctx.arch.has_wmma_w32() || ctx.arch.has_wmma_w32_gfx12(),
-            Self::HasWmmaW32Gfx12 => ctx.arch.has_wmma_w32_gfx12(),
+            // RDNA3 (gfx11) wave32 WMMA or RDNA4 (gfx12) WMMA.
+            // Collapsed from the old HasWmmaW32 / HasWmmaW32Gfx12 pair — the gfx12-only
+            // predicate was dead (zero kernel registrations) and the gfx12-admit fix for
+            // every WMMA-family quant (MQ3, Lloyd, fused QKV/gate-up, MoE grouped,
+            // GQA-fused attn) was the || gfx12 OR on HasWmmaW32. A single HasWmma
+            // predicate backed by ArchCaps::has_wmma() is equivalent and enforces that
+            // a new ArchPredicate variant only lands with the kernel it gates.
+            Self::HasWmma => ctx.arch.has_wmma(),
             Self::HasDp4a => ctx.arch.has_dot2_f32_f16(),
             Self::HasSdot4 => ctx.arch.has_hfq3_sdot4(),
             // MQ6/HFQ6 GEMV ships on RDNA4 (gemv_mq6g256_prerotated has a gfx12 build);

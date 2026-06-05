@@ -24,14 +24,14 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmQ8_0Wmma,
-        arch_required: ArchPredicate::HasWmmaW32,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmQ8_0Wmma4W,
-        arch_required: ArchPredicate::HasWmmaW32,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
@@ -52,14 +52,14 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmHfq4G256Wmma,
-        arch_required: ArchPredicate::HasWmmaW32,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmF16XF16Wmma,
-        arch_required: ArchPredicate::HasWmmaW32,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,

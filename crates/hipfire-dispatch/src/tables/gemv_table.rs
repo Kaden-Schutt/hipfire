@@ -113,7 +113,7 @@ fn register_residual(registry: &mut KernelRegistry) {
 fn register_fused(registry: &mut KernelRegistry) {
     registry.register(KernelVariant {
         key: KernelKey::GemvMfp4G32Fused,
-        arch_required: ArchPredicate::HasWmmaW32,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::RotateFwht, PipelineOp::Gemv],
         has_awq: false,

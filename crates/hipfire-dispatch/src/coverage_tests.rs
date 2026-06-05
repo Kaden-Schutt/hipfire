@@ -84,6 +84,13 @@ const FLEET: &[OpUse] = &[
     OpUse { model: "qwen3.6-35b-a3b.mq4",   role: Role::Plain,    dtype: MQ4G256,      archs: WAVE32 },
     // MQ6-promoted projections (A3B AWQ-attractor mitigation) — gate is HasMmq (must admit gfx12):
     OpUse { model: "qwen3.6-35b-a3b.mq4",   role: Role::Plain,    dtype: MQ6G256,      archs: WAVE32 },
+
+    // ── RDNA4 coverage: same (role, dtype) combos explicitly anchored on gfx12 arch strings ──
+    // Catches reintroduction of an RDNA4-only ArchPredicate that would dead-gate these.
+    OpUse { model: "qwen3.5-27b.mq4-rdna4",   role: Role::Plain,    dtype: MQ4G256,      archs: &["gfx1200", "gfx1201"] },
+    OpUse { model: "qwen3.5-27b.mq3-rdna4",   role: Role::Plain,    dtype: MQ3G256,      archs: &["gfx1200", "gfx1201"] },
+    OpUse { model: "qwen3.6-27b.lloyd-rdna4", role: Role::Plain,    dtype: MQ3G256Lloyd, archs: &["gfx1200", "gfx1201"] },
+    OpUse { model: "a3b-moe-rdna4",           role: Role::Plain,    dtype: MQ6G256,      archs: &["gfx1200", "gfx1201"] },
 ];
 
 /// Does the forward lowering for (role, dtype) have ANY dispatch plan (so it
@@ -126,7 +133,7 @@ fn fleet_ops_have_a_dispatch_plan() {
 /// LAYER 2 — arch coverage (catches the gfx12-dead-gate defect class). For every
 /// shipped dtype × arch it ships on, the dtype's required arch predicate MUST
 /// admit that arch (else resolve() → MissingImpl / scalar fallback). Passes today
-/// (953ea648 fix is in: HasWmmaW32/HasMmq admit gfx12); would have failed before.
+/// (953ea648 fix is in: HasWmma/HasMmq admit gfx12); would have failed before.
 #[test]
 fn fleet_dtypes_resolve_on_every_target_arch() {
     let mut failures = Vec::new();

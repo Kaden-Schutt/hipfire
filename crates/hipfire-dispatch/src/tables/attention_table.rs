@@ -33,7 +33,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::AttnFlashAsym2,     ArchPredicate::Always),
         (KernelKey::AttnFlashAsym2Fwht, ArchPredicate::Always),
         (KernelKey::AttnFlashQ8_0,      ArchPredicate::Always),
-        (KernelKey::AttnGqaFused,       ArchPredicate::HasWmmaW32),
+        (KernelKey::AttnGqaFused,       ArchPredicate::HasWmma),
         (KernelKey::AttnF32,            ArchPredicate::Always),
     ];
     for &(key, arch) in attn_variants {

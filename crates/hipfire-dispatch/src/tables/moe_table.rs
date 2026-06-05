@@ -9,7 +9,7 @@ use crate::types::*;
 pub fn populate(registry: &mut KernelRegistry) {
     registry.register(KernelVariant {
         key: KernelKey::MoeIndexedGateUpLloyd,
-        arch_required: ArchPredicate::HasWmmaW32,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
@@ -17,7 +17,7 @@ pub fn populate(registry: &mut KernelRegistry) {
 
     registry.register(KernelVariant {
         key: KernelKey::MoeIndexedDownLloyd,
-        arch_required: ArchPredicate::HasWmmaW32,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
@@ -25,7 +25,7 @@ pub fn populate(registry: &mut KernelRegistry) {
 
     registry.register(KernelVariant {
         key: KernelKey::MoeGroupedGemm,
-        arch_required: ArchPredicate::HasWmmaW32,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
@@ -33,7 +33,7 @@ pub fn populate(registry: &mut KernelRegistry) {
 
     registry.register(KernelVariant {
         key: KernelKey::MoeGroupedI8,
-        arch_required: ArchPredicate::HasWmmaW32,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,

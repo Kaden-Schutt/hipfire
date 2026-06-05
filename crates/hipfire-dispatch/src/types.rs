@@ -259,8 +259,7 @@ pub struct ShapeInfo {
 #[derive(Clone, Copy, Debug)]
 pub enum ArchPredicate {
     Always,
-    HasWmmaW32,
-    HasWmmaW32Gfx12,
+    HasWmma,
     HasDp4a,
     HasSdot4,
     HasMmq,
@@ -459,9 +458,9 @@ impl KernelKey {
             | HFP4G32 | MFP4G32
             | ParoQ4G128 => ArchPredicate::HasDp4a,
             HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
-            MQ3G256 => ArchPredicate::HasWmmaW32,
+            MQ3G256 => ArchPredicate::HasWmma,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
-            MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWmmaW32,
+            MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWmma,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

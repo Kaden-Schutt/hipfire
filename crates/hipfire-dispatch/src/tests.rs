@@ -30,12 +30,12 @@ fn ctx_rdna2() -> DispatchCtx {
     DispatchCtx::for_test("gfx1030")
 }
 
-/// gfx1100 = RDNA3: has dp4a, WMMA w32, MMQ.
+/// gfx1100 = RDNA3: has dp4a, WMMA, MMQ.
 fn ctx_rdna3() -> DispatchCtx {
     DispatchCtx::for_test("gfx1100")
 }
 
-/// gfx1200 = RDNA4: has dp4a, WMMA w32 gfx12, no MMQ via gfx11 path.
+/// gfx1200 = RDNA4: has dp4a, WMMA, no MMQ via gfx11 path.
 fn ctx_rdna4() -> DispatchCtx {
     DispatchCtx::for_test("gfx1200")
 }
@@ -55,10 +55,10 @@ fn always_variant(key: KernelKey) -> KernelVariant {
     }
 }
 
-fn wmma_variant(key: KernelKey) -> KernelVariant {
+fn has_wmma_variant(key: KernelKey) -> KernelVariant {
     KernelVariant {
         key,
-        arch_required: ArchPredicate::HasWmmaW32,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[],
         has_awq: false,
@@ -135,17 +135,11 @@ fn arch_always_passes_on_all_archs() {
 }
 
 #[test]
-fn arch_has_wmma_w32_requires_rdna3_or_rdna4() {
-    assert!(!ArchPredicate::HasWmmaW32.eval_arch(&ctx_rdna1()));
-    assert!(!ArchPredicate::HasWmmaW32.eval_arch(&ctx_rdna2()));
-    assert!(ArchPredicate::HasWmmaW32.eval_arch(&ctx_rdna3()));
-    assert!(ArchPredicate::HasWmmaW32.eval_arch(&ctx_rdna4())); // RDNA4 gfx12 WMMA
-}
-
-#[test]
-fn arch_has_wmma_w32_gfx12_requires_rdna4() {
-    assert!(!ArchPredicate::HasWmmaW32Gfx12.eval_arch(&ctx_rdna3()));
-    assert!(ArchPredicate::HasWmmaW32Gfx12.eval_arch(&ctx_rdna4()));
+fn arch_has_wmma_requires_rdna3_or_rdna4() {
+    assert!(!ArchPredicate::HasWmma.eval_arch(&ctx_rdna1()));
+    assert!(!ArchPredicate::HasWmma.eval_arch(&ctx_rdna2()));
+    assert!(ArchPredicate::HasWmma.eval_arch(&ctx_rdna3()));
+    assert!(ArchPredicate::HasWmma.eval_arch(&ctx_rdna4()));
 }
 
 #[test]
@@ -206,7 +200,7 @@ fn registry_resolve_unregistered_key_returns_not_found() {
 #[test]
 fn registry_resolve_arch_gate_fails_returns_missing_impl() {
     let mut reg = KernelRegistry::new();
-    reg.register(wmma_variant(KernelKey::GemmHfq4G256Wmma));
+    reg.register(has_wmma_variant(KernelKey::GemmHfq4G256Wmma));
     let ctx = ctx_rdna1(); // no WMMA
     let err = reg.resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None).unwrap_err();
     assert!(matches!(err, DispatchError::MissingImpl { .. }));
@@ -215,7 +209,7 @@ fn registry_resolve_arch_gate_fails_returns_missing_impl() {
 #[test]
 fn registry_resolve_arch_gate_passes_on_capable_arch() {
     let mut reg = KernelRegistry::new();
-    reg.register(wmma_variant(KernelKey::GemmHfq4G256Wmma));
+    reg.register(has_wmma_variant(KernelKey::GemmHfq4G256Wmma));
     let ctx = ctx_rdna3(); // has WMMA w32
     assert_eq!(
         reg.resolve(KernelKey::GemmHfq4G256Wmma, &ctx, None).unwrap().key,
@@ -228,7 +222,7 @@ fn registry_resolve_falls_through_to_second_variant() {
     // Register WMMA variant first, then fallback Always variant for same key.
     // On RDNA1 (no WMMA), the WMMA entry is skipped and fallback is selected.
     let mut reg = KernelRegistry::new();
-    reg.register(wmma_variant(KernelKey::GemmHfq4G256Wmma));
+    reg.register(has_wmma_variant(KernelKey::GemmHfq4G256Wmma));
     reg.register(always_variant(KernelKey::GemmHfq4G256Wmma));
     let ctx = ctx_rdna1();
     assert_eq!(
