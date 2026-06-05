@@ -13446,6 +13446,14 @@ fn forward_scratch_layers_multi(
             let givens_sin_dev = gpus.givens_sin_per_dev.get(dev_idx);
             let gpu = &mut gpus.devices[dev_idx];
 
+            // Dispatch context + families for this device. Owned values
+            // (DispatchCtx::new only reads `&gpu`), so they coexist with the
+            // `&mut gpu` passed to the per-arm helpers — same pattern the
+            // single-GPU `forward_scratch_layers` uses at its top.
+            let ctx = DispatchCtx::new(gpu);
+            let rotation = RotationFamily::new();
+            let gemv = GemvFamily::new();
+
             // Resolve givens lazily — asym{2,3,4} branches use these,
             // others don't. Multi-GPU prefers the per-device replica
             // populated by the KV ctor; fall back to kv_cache.givens_*
@@ -13464,71 +13472,19 @@ fn forward_scratch_layers_multi(
 
             match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
                 (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
-                        gpu,
-                        &layer.wqkv,
-                        &s.x,
-                        &layer.attn_norm,
-                        &s.tmp,
-                        &s.x_rot,
-                        config.norm_eps,
+                    // ── RMSNorm + FWHT rotation ──
+                    let x_rot = rmsnorm_rotate_dispatch(
+                        gpu, &ctx, &rotation, &s.x, &layer.attn_norm,
+                        &layer.wqkv, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
-                    let dt = layer.wqkv.gpu_dtype;
-                    let la4_same_dtype = layer.wz.gpu_dtype == dt
-                        && layer.w_beta.gpu_dtype == dt
-                        && layer.w_alpha.gpu_dtype == dt;
-                    let fused_la4_mq4 =
-                        la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
-                    let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
-                    let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
-                    if fused_la4_mq4 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_qkvza_hfq4g256(
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            eff_x,
-                            &s.dn_qkv,
-                            &s.dn_z,
-                            &s.dn_beta,
-                            &s.dn_alpha,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                        )?;
-                    } else if fused_la4_lloyd_mq3 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_qkvza_mq3g256_lloyd(
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            eff_x,
-                            &s.dn_qkv,
-                            &s.dn_z,
-                            &s.dn_beta,
-                            &s.dn_alpha,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                        )?;
-                    } else {
-                        weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
-                        weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
-                        weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
-                        weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
-                    }
+
+                    // ── Fused QKVZA (4-way) or fallback ──
+                    fused_qkvza_dispatch(
+                        gpu, &gemv, &ctx,
+                        &layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha,
+                        &s.tmp, x_rot,
+                        &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                    )?;
                     gpu.fused_sigmoid_alpha_gate_f32(
                         &s.dn_beta,
                         &s.dn_alpha,
@@ -13626,56 +13582,13 @@ fn forward_scratch_layers_multi(
                         }]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                     }
 
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
-                        gpu,
-                        &layer.w_gate,
-                        &s.x,
-                        &layer.ffn_norm,
-                        &s.tmp,
-                        &s.x_rot,
-                        config.norm_eps,
+                    // ── FFN ──
+                    gate_up_via_execute_steps(
+                        gpu, &ctx,
+                        &layer.w_gate, &layer.w_up, &layer.ffn_norm,
+                        &s.x, &s.tmp, &s.x_rot,
+                        &s.gate_ffn, &s.up, config.norm_eps,
                     )?;
-                    let dt_g = layer.w_gate.gpu_dtype;
-                    let same_dtype = layer.w_up.gpu_dtype == dt_g;
-                    let fused_gu_mq4 =
-                        same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
-                    let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
-                    let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-                    if fused_gu_mq4 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_gate_up_hfq4g256(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            eff_x,
-                            &s.gate_ffn,
-                            &s.up,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
-                    } else if fused_gu_lloyd_mq3 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_gate_up_mq3g256_lloyd(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            eff_x,
-                            &s.gate_ffn,
-                            &s.up,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
-                    } else {
-                        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
-
-                        weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
-                    }
                     weight_gemv_swiglu_residual(
                         gpu,
                         &layer.w_down,
@@ -13688,63 +13601,12 @@ fn forward_scratch_layers_multi(
                 }
 
                 (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
-                        gpu,
-                        &layer.wq,
-                        &s.x,
-                        &layer.attn_norm,
-                        &s.tmp,
-                        &s.x_rot,
-                        config.norm_eps,
+                    qkv_via_execute_steps(
+                        gpu, &ctx,
+                        &layer.wq, &layer.wk, &layer.wv,
+                        &layer.attn_norm, &s.x, &s.tmp, &s.x_rot,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v, config.norm_eps,
                     )?;
-                    let dt = layer.wq.gpu_dtype;
-                    let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
-                    let fused_fa3_mq4 =
-                        fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
-                    let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
-                    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-                    if fused_fa3_mq4 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_qkv_hfq4g256(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            eff_x,
-                            &s.fa_q_full,
-                            &s.fa_k,
-                            &s.fa_v,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                        )?;
-                    } else if fused_fa3_lloyd_mq3 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_qkv_mq3g256_lloyd(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            eff_x,
-                            &s.fa_q_full,
-                            &s.fa_k,
-                            &s.fa_v,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                        )?;
-                    } else {
-                            weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
-
-                        weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
-                        weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
-                    }
                     gpu.deinterleave_f32(
                         &s.fa_q_full,
                         &s.fa_q,
@@ -14053,56 +13915,13 @@ fn forward_scratch_layers_multi(
                         }]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                     }
 
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
-                        gpu,
-                        &layer.w_gate,
-                        &s.x,
-                        &layer.ffn_norm,
-                        &s.tmp,
-                        &s.x_rot,
-                        config.norm_eps,
+                    // ── FFN ──
+                    gate_up_via_execute_steps(
+                        gpu, &ctx,
+                        &layer.w_gate, &layer.w_up, &layer.ffn_norm,
+                        &s.x, &s.tmp, &s.x_rot,
+                        &s.gate_ffn, &s.up, config.norm_eps,
                     )?;
-                    let dt_g = layer.w_gate.gpu_dtype;
-                    let same_dtype = layer.w_up.gpu_dtype == dt_g;
-                    let fused_gu_mq4 =
-                        same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
-                    let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
-                    let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-                    if fused_gu_mq4 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_gate_up_hfq4g256(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            eff_x,
-                            &s.gate_ffn,
-                            &s.up,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
-                    } else if fused_gu_lloyd_mq3 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_gate_up_mq3g256_lloyd(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            eff_x,
-                            &s.gate_ffn,
-                            &s.up,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
-                    } else {
-                        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
-
-                        weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
-                    }
                     weight_gemv_swiglu_residual(
                         gpu,
                         &layer.w_down,
@@ -14114,71 +13933,19 @@ fn forward_scratch_layers_multi(
                 }
 
                 (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
-                        gpu,
-                        &layer.wqkv,
-                        &s.x,
-                        &layer.attn_norm,
-                        &s.tmp,
-                        &s.x_rot,
-                        config.norm_eps,
+                    // ── RMSNorm + FWHT rotation ──
+                    let x_rot = rmsnorm_rotate_dispatch(
+                        gpu, &ctx, &rotation, &s.x, &layer.attn_norm,
+                        &layer.wqkv, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
-                    let dt = layer.wqkv.gpu_dtype;
-                    let la4_same_dtype = layer.wz.gpu_dtype == dt
-                        && layer.w_beta.gpu_dtype == dt
-                        && layer.w_alpha.gpu_dtype == dt;
-                    let fused_la4_mq4 =
-                        la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
-                    let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
-                    let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
-                    if fused_la4_mq4 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_qkvza_hfq4g256(
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            eff_x,
-                            &s.dn_qkv,
-                            &s.dn_z,
-                            &s.dn_beta,
-                            &s.dn_alpha,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                        )?;
-                    } else if fused_la4_lloyd_mq3 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_qkvza_mq3g256_lloyd(
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            eff_x,
-                            &s.dn_qkv,
-                            &s.dn_z,
-                            &s.dn_beta,
-                            &s.dn_alpha,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                        )?;
-                    } else {
-                        weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
-                        weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
-                        weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
-                        weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
-                    }
+
+                    // ── Fused QKVZA (4-way) or fallback ──
+                    fused_qkvza_dispatch(
+                        gpu, &gemv, &ctx,
+                        &layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha,
+                        &s.tmp, x_rot,
+                        &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                    )?;
                     gpu.fused_sigmoid_alpha_gate_f32(
                         &s.dn_beta,
                         &s.dn_alpha,
@@ -14295,63 +14062,12 @@ fn forward_scratch_layers_multi(
                 }
 
                 (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
-                    let x_rot = fused_rmsnorm_rotate_for_mq(
-                        gpu,
-                        &layer.wq,
-                        &s.x,
-                        &layer.attn_norm,
-                        &s.tmp,
-                        &s.x_rot,
-                        config.norm_eps,
+                    qkv_via_execute_steps(
+                        gpu, &ctx,
+                        &layer.wq, &layer.wk, &layer.wv,
+                        &layer.attn_norm, &s.x, &s.tmp, &s.x_rot,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v, config.norm_eps,
                     )?;
-                    let dt = layer.wq.gpu_dtype;
-                    let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
-                    let fused_fa3_mq4 =
-                        fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
-                    let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
-                    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-                    if fused_fa3_mq4 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_qkv_hfq4g256(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            eff_x,
-                            &s.fa_q_full,
-                            &s.fa_k,
-                            &s.fa_v,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                        )?;
-                    } else if fused_fa3_lloyd_mq3 {
-                        let eff_x = match x_rot {
-                            Some(xr) => xr,
-                            None => &s.tmp,
-                        };
-                        gpu.fused_qkv_mq3g256_lloyd(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            eff_x,
-                            &s.fa_q_full,
-                            &s.fa_k,
-                            &s.fa_v,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                        )?;
-                    } else {
-                            weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
-
-                        weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
-                        weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
-                    }
                     gpu.deinterleave_f32(
                         &s.fa_q_full,
                         &s.fa_q,
