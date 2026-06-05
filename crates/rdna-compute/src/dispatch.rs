@@ -246,7 +246,14 @@ impl DType {
         // (flow through rotate_x_mq_for, which applies x/=awq_scale when a sidecar is
         // attached) — see the doc block above. Enables AWQ×Lloyd composition once the
         // quantizer emits sidecars for the Lloyd arms.
-        matches!(self, DType::MQ4G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ3G256Lloyd | DType::MQ2G256Lloyd)
+        matches!(
+            self,
+            DType::MQ4G256
+                | DType::MQ3G256
+                | DType::MQ2G256
+                | DType::MQ3G256Lloyd
+                | DType::MQ2G256Lloyd
+        )
     }
 }
 
@@ -1217,6 +1224,7 @@ impl Gpu {
     /// Drop captured graph state after a live KV layout switch so the next
     /// forward captures the current K/V modes and kernarg blobs.
     pub fn invalidate_for_kv_mode_switch(&mut self) {
+        // bind_thread: skip — delegated to invalidate_graph_state().
         self.invalidate_graph_state();
     }
 
