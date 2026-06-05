@@ -311,6 +311,25 @@ required-features = ["arch-qwen35", "deltanet"]
 name = "build_kld_ref"
 required-features = []
 
+# build_kld_ref_native (F2) — llama-FREE KLD ref producer; runs the hipfire
+# F32 oracle forward and writes the SAME HFKLDR format eval_hipfire consumes.
+[[example]]
+name = "build_kld_ref_native"
+required-features = ["arch-qwen35", "deltanet"]
+
+# eval_hipfire_fullvocab (F3) — FULL-VOCAB KLD of a hipfire quant vs the hipfire
+# F32 oracle (dual forward, no ref top-K approx) for parity with
+# llama-perplexity --kl-divergence full-vocab KLD.
+[[example]]
+name = "eval_hipfire_fullvocab"
+required-features = ["arch-qwen35", "deltanet"]
+
+# oracle_xcheck (F1) — dumps per-token F32-oracle logits over real tokens (true
+# fp32 KV) for cross-checking the native bf16/F32 forward against a reference.
+[[example]]
+name = "oracle_xcheck"
+required-features = ["arch-qwen35", "deltanet"]
+
 [[example]]
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
