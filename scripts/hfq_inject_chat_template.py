@@ -6,7 +6,8 @@ The index stores per-tensor *sizes*; the loader computes offsets cumulatively fr
 header's data_offset (hfq.rs:163 `cumulative_offset = data_offset`). So we only grow the
 metadata, bump data_offset by the delta, and copy the index + tensor bytes through verbatim.
 """
-import struct, json, sys, shutil
+import argparse
+import struct, json, shutil
 
 def find_json_end(buf: bytes) -> int:
     depth = 0; in_str = False; esc = False
@@ -65,4 +66,11 @@ def inject(src: str, dst: str, jinja_path: str) -> bool:
     return True
 
 if __name__ == "__main__":
-    inject(sys.argv[1], sys.argv[2], sys.argv[3])
+    parser = argparse.ArgumentParser(
+        description="Inject chat_template.jinja into an HFQM container without re-quantizing.",
+    )
+    parser.add_argument("src", help="source .hfq/.hfqm file")
+    parser.add_argument("dst", help="destination file to write")
+    parser.add_argument("jinja", help="chat_template.jinja path")
+    args = parser.parse_args()
+    inject(args.src, args.dst, args.jinja)
