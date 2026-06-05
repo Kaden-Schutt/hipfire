@@ -41,7 +41,7 @@ Full key list and tradeoffs in [CONFIG.md](CONFIG.md).
 
 | Command | Purpose |
 |---|---|
-| `hipfire quantize <hf-id\|local-dir\|file.gguf>` | CPU-side quantize from safetensors or GGUF to MQ4 / MQ6 / HF4 / HF6. Optional `--install` puts the result in `~/.hipfire/models/` and `--register <tag>` adds an alias. |
+| `hipfire quantize <hf-id\|local-dir\|file.gguf\|source.hfq>` | CPU-side quantize from safetensors, GGUF, or source-precision HFQ to MQ4 / MQ6 / HF4 / HF6. Optional `--install` puts the result in `~/.hipfire/models/` and `--register <tag>` adds an alias. |
 
 The full quantize how-to (formats, when to pick which, GGUF caveats) is
 in [QUANTIZE.md](QUANTIZE.md).
