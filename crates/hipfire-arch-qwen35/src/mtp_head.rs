@@ -724,10 +724,8 @@ impl Qwen35MtpHeadKvCache {
         Ok(())
     }
 
-    pub fn free_gpu(self, _gpu: &mut Gpu) {
-        // llama::KvCache owns its GpuTensors; they free on Drop.
-        // Explicit method kept for API parity with old callers.
-        drop(self.inner);
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.inner.free_gpu(gpu);
     }
 }
 
@@ -2492,6 +2490,7 @@ pub fn mtp_head_forward_block_batched(
         cfg.n_rot,
         cfg.rope_theta,
         n,
+        0,
     )?;
 
     // ── 6. v1 simplification: per-slot K/V writes + attention = V

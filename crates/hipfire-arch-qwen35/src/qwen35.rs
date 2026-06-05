@@ -5435,83 +5435,48 @@ fn moe_ffn_decode_impl(
     // router (e.g. the post-PR-171 attractor rule for MoE) thus still get
     // the device-side top-K + indexed expert GEMV path — only the 4-way
     // fused GEMV falls back to four individual `weight_gemv` calls.
-    let gate_side_mq4 = ffn.router.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
-        && ffn
-            .experts
-            .iter()
-            .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
-    let shared_gate_up_mq4 = ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256;
-    let routed_mq4 = ffn
-        .experts
-        .first()
-        .map(|e| e.down.gpu_dtype == DType::MQ4G256)
-        .unwrap_or(false);
-    let routed_gate_up_mq4 = ffn
-        .experts
-        .first()
-        .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
-        .unwrap_or(false);
-    // MQ6-routed eligibility: layers promoted by the alternating kmap
-    // (post-PR-199) carry MQ6G256 experts. The HFQ6 indexed kernels mirror
-    // the HFQ4 ones — same compute shape, different per-group byte layout
-    // (200 vs 136). All routed experts within a layer share the same
-    // promotion decision, so checking experts[0] is sufficient.
-    let routed_mq6 = ffn
-        .experts
-        .first()
-        .map(|e| e.down.gpu_dtype == DType::MQ6G256)
-        .unwrap_or(false);
-    let routed_gate_up_mq6 = ffn
-        .experts
-        .first()
-        .map(|e| e.gate_up.gpu_dtype == DType::MQ6G256)
-        .unwrap_or(false);
-    let routed_mq2_lloyd = ffn
-        .experts
-        .first()
-        .map(|e| e.down.gpu_dtype == DType::MQ2G256Lloyd)
-        .unwrap_or(false);
-    let routed_gate_up_mq2_lloyd = ffn
-        .experts
-        .first()
-        .map(|e| e.gate_up.gpu_dtype == DType::MQ2G256Lloyd)
-        .unwrap_or(false);
-    // ParoQuant routed-expert eligibility. shisa-Qwen3.6-A3B-PARO and
-    // friends carry ParoQ4G128 routed experts whose pairs/theta/channel_scales
-    // are shared across all 256 experts via `ffn.paro_shared`. The indexed
-    // HFQ4G128 kernels assume both halves (gate_up and down) live in this
-    // layout — checking experts[0] is sufficient because the loader
-    // (`paro_load_moe_ffn`) builds every expert's `paro` alias from the
-    // same `MoeParoSidecars`.
-    let routed_paro = ffn
-        .experts
-        .first()
-        .map(|e| e.down.gpu_dtype == DType::ParoQ4G128)
-        .unwrap_or(false)
-        && ffn.paro_shared.is_some();
-    let routed_gate_up_paro = ffn
-        .experts
-        .first()
-        .map(|e| e.gate_up.gpu_dtype == DType::ParoQ4G128)
-        .unwrap_or(false)
-        && ffn.paro_shared.is_some();
-    // The indexed gate_up and down kernels live in separate dtype families;
-    // we require the routed gate_up and down dtypes to match (i.e., both
-    // MQ4, both MQ6, both MQ2-Lloyd, or both ParoQ4G128) so the rotated x_rot_local feeds
-    // both consistently. Mixed gate_up/down within a layer is not produced
-    // by the quantizer.
-    let routed_dtype_indexable_mq4 = routed_mq4 && routed_gate_up_mq4;
-    let routed_dtype_indexable_mq6 = routed_mq6 && routed_gate_up_mq6;
-    let routed_dtype_indexable_mq2_lloyd = routed_mq2_lloyd && routed_gate_up_mq2_lloyd;
-    let routed_dtype_indexable_paro = routed_paro && routed_gate_up_paro;
-    let routed_dtype_indexable = routed_dtype_indexable_mq4
-        || routed_dtype_indexable_mq6
-        || routed_dtype_indexable_mq2_lloyd
-        || routed_dtype_indexable_paro;
+    let dispatch_flags = if let Some(dtypes) = MoePrefillDtypes::from_ffn(ffn) {
+        moe_decode_dispatch_flags_for_dtypes(&dtypes, k, ffn.paro_shared.is_some())
+    } else {
+        let gate_side_mq4 = ffn.router.gpu_dtype == DType::MQ4G256
+            && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
+            && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
+            && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
+            && ffn
+                .experts
+                .iter()
+                .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
+        let shared_gate_up_mq4 = ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
+            && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256;
+        MoeDecodeDispatchFlags {
+            gate_side_mq4,
+            shared_gate_up_mq4,
+            routed_mq4: false,
+            routed_mq6: false,
+            routed_mq2_lloyd: false,
+            routed_paro: false,
+            routed_gate_up_mq4: false,
+            routed_gate_up_mq6: false,
+            routed_gate_up_mq2_lloyd: false,
+            routed_gate_up_paro: false,
+            routed_dtype_indexable_mq4: false,
+            routed_dtype_indexable_mq6: false,
+            routed_dtype_indexable_mq2_lloyd: false,
+            routed_dtype_indexable_paro: false,
+            routed_path: MoeDecodeIndexedRoutedPath::None,
+            use_gpu_topk: false,
+            needs_x_rot_local: gate_side_mq4,
+        }
+    };
+    let gate_side_mq4 = dispatch_flags.gate_side_mq4;
+    let shared_gate_up_mq4 = dispatch_flags.shared_gate_up_mq4;
+    let routed_mq4 = dispatch_flags.routed_mq4;
+    let routed_gate_up_mq4 = dispatch_flags.routed_gate_up_mq4;
+    let routed_gate_up_paro = dispatch_flags.routed_gate_up_paro;
+    let routed_dtype_indexable_mq4 = dispatch_flags.routed_dtype_indexable_mq4;
+    let routed_dtype_indexable_mq6 = dispatch_flags.routed_dtype_indexable_mq6;
+    let routed_dtype_indexable_mq2_lloyd = dispatch_flags.routed_dtype_indexable_mq2_lloyd;
+    let routed_dtype_indexable_paro = dispatch_flags.routed_dtype_indexable_paro;
     // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
     // device and the indexed MoE kernels consume topk_indices /
     // topk_weights directly — no D2H sync, hipGraph-capture-safe.
@@ -5523,12 +5488,8 @@ fn moe_ffn_decode_impl(
     // are now first-class for graph capture. Mixed-kmap A3B layers
     // promoted to MQ6 dispatch through the HFQ6 indexed kernels instead
     // of the HFQ4 ones — same control flow, different kernel binary.
-    let use_gpu_topk = k == 8 && routed_dtype_indexable;
-    let needs_x_rot_local = gate_side_mq4
-        || routed_gate_up_mq4
-        || routed_gate_up_mq6
-        || routed_gate_up_mq2_lloyd
-        || routed_gate_up_paro;
+    let use_gpu_topk = dispatch_flags.use_gpu_topk;
+    let needs_x_rot_local = dispatch_flags.needs_x_rot_local;
     let x_rot_local = if needs_x_rot_local {
         if !routed_gate_up_paro {
             // FWHT-rotated path needs the MQ sign LUT.
@@ -7678,6 +7639,13 @@ impl PrefillBatchScratch {
             self.moe_up_batch,
             self.moe_rot_batch,
             self.moe_down_expanded_batch,
+            self.moe_expert_token_counts,
+            self.moe_expert_offsets,
+            self.moe_sorted_slot_index,
+            self.moe_inverse_perm,
+            self.moe_expert_tile_ids,
+            self.moe_y_gate_up_grouped,
+            self.moe_y_down_grouped,
             self.dn_s_tape_q8,
             self.dn_s_tape_scales,
         ] {
@@ -7794,6 +7762,34 @@ fn gemm_f16_x_f32_wmma_residual_batched(
     let scratch_n = scratch.sub_offset(0, n * m);
     gpu.gemm_f16_x_f32_wmma(weight, x, &scratch_n, m, k, n)?;
     gpu.add_inplace_f32(&y_n, &scratch_n)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MoeGroupedPath2Shape {
+    total_slots: usize,
+    m_total_bound: usize,
+    gate_up_x_row_div: usize,
+    gate_up_source_rows: usize,
+    down_x_row_div: usize,
+    down_source_rows: usize,
+}
+
+#[inline]
+fn moe_grouped_path2_shape(n: usize, k_top: usize, n_exp: usize) -> MoeGroupedPath2Shape {
+    let total_slots = n * k_top;
+    MoeGroupedPath2Shape {
+        total_slots,
+        m_total_bound: moe_grouped_m_total_bound(total_slots, n_exp),
+        // Gate/up consumes x_rot_batch [N x dim]. The grouped scatter's
+        // sorted slot encodes token*K_TOP + expert-rank, so the kernel divides
+        // source-row lookup by K_TOP to recover the token row.
+        gate_up_x_row_div: k_top,
+        gate_up_source_rows: n,
+        // Down consumes rot_batch [N*K_TOP x mi]. Sorted slots already index
+        // the flattened routed-expert rows, so no division is required.
+        down_x_row_div: 1,
+        down_source_rows: total_slots,
+    }
 }
 
 /// Host-side helper: upload token ids and positions to a `PrefillBatchScratch`
@@ -8724,6 +8720,14 @@ fn paro_batched_admit_enabled_from_env(value: Option<&str>) -> bool {
     value != Some("0")
 }
 
+fn paro_moe_i8_enabled_for_arch_from_env(arch: &str, value: Option<&str>) -> bool {
+    arch.starts_with("gfx1151") && value != Some("0")
+}
+
+fn paro_moe_i8_k8_enabled_from_env(i8_enabled: bool, value: Option<&str>) -> bool {
+    i8_enabled && value != Some("0")
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MoePrefillDtypes {
     router: DType,
@@ -8772,6 +8776,107 @@ impl MoePrefillDtypes {
                 .iter()
                 .all(|e| e.down.gpu_dtype == first.down.gpu_dtype),
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoeDecodeIndexedRoutedPath {
+    None,
+    Mq4,
+    Mq6,
+    Mq2Lloyd,
+    ParoQ4G128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MoeDecodeDispatchFlags {
+    gate_side_mq4: bool,
+    shared_gate_up_mq4: bool,
+    routed_mq4: bool,
+    routed_mq6: bool,
+    routed_mq2_lloyd: bool,
+    routed_paro: bool,
+    routed_gate_up_mq4: bool,
+    routed_gate_up_mq6: bool,
+    routed_gate_up_mq2_lloyd: bool,
+    routed_gate_up_paro: bool,
+    routed_dtype_indexable_mq4: bool,
+    routed_dtype_indexable_mq6: bool,
+    routed_dtype_indexable_mq2_lloyd: bool,
+    routed_dtype_indexable_paro: bool,
+    routed_path: MoeDecodeIndexedRoutedPath,
+    use_gpu_topk: bool,
+    needs_x_rot_local: bool,
+}
+
+fn moe_decode_dispatch_flags_for_dtypes(
+    dtypes: &MoePrefillDtypes,
+    k_top: usize,
+    paro_shared_present: bool,
+) -> MoeDecodeDispatchFlags {
+    let gate_side_mq4 = dtypes.router == DType::MQ4G256
+        && dtypes.shared_expert_scalar_gate == DType::MQ4G256
+        && dtypes.shared_expert_gate == DType::MQ4G256
+        && dtypes.shared_expert_up == DType::MQ4G256
+        && dtypes.expert_gate_up == DType::MQ4G256
+        && dtypes.expert_gate_up_uniform;
+    let shared_gate_up_mq4 =
+        dtypes.shared_expert_gate == DType::MQ4G256 && dtypes.shared_expert_up == DType::MQ4G256;
+    let routed_mq4 = dtypes.expert_down == DType::MQ4G256 && dtypes.expert_down_uniform;
+    let routed_gate_up_mq4 =
+        dtypes.expert_gate_up == DType::MQ4G256 && dtypes.expert_gate_up_uniform;
+    let routed_mq6 = dtypes.expert_down == DType::MQ6G256 && dtypes.expert_down_uniform;
+    let routed_gate_up_mq6 =
+        dtypes.expert_gate_up == DType::MQ6G256 && dtypes.expert_gate_up_uniform;
+    let routed_mq2_lloyd = dtypes.expert_down == DType::MQ2G256Lloyd && dtypes.expert_down_uniform;
+    let routed_gate_up_mq2_lloyd =
+        dtypes.expert_gate_up == DType::MQ2G256Lloyd && dtypes.expert_gate_up_uniform;
+    let routed_paro = dtypes.expert_down == DType::ParoQ4G128
+        && dtypes.expert_down_uniform
+        && paro_shared_present;
+    let routed_gate_up_paro = dtypes.expert_gate_up == DType::ParoQ4G128
+        && dtypes.expert_gate_up_uniform
+        && paro_shared_present;
+    let routed_dtype_indexable_mq4 = routed_mq4 && routed_gate_up_mq4;
+    let routed_dtype_indexable_mq6 = routed_mq6 && routed_gate_up_mq6;
+    let routed_dtype_indexable_mq2_lloyd = routed_mq2_lloyd && routed_gate_up_mq2_lloyd;
+    let routed_dtype_indexable_paro = routed_paro && routed_gate_up_paro;
+    let routed_path = if routed_dtype_indexable_mq4 {
+        MoeDecodeIndexedRoutedPath::Mq4
+    } else if routed_dtype_indexable_mq6 {
+        MoeDecodeIndexedRoutedPath::Mq6
+    } else if routed_dtype_indexable_mq2_lloyd {
+        MoeDecodeIndexedRoutedPath::Mq2Lloyd
+    } else if routed_dtype_indexable_paro {
+        MoeDecodeIndexedRoutedPath::ParoQ4G128
+    } else {
+        MoeDecodeIndexedRoutedPath::None
+    };
+    let routed_dtype_indexable = routed_path != MoeDecodeIndexedRoutedPath::None;
+    let use_gpu_topk = k_top == 8 && routed_dtype_indexable;
+    let needs_x_rot_local = gate_side_mq4
+        || routed_gate_up_mq4
+        || routed_gate_up_mq6
+        || routed_gate_up_mq2_lloyd
+        || routed_gate_up_paro;
+    MoeDecodeDispatchFlags {
+        gate_side_mq4,
+        shared_gate_up_mq4,
+        routed_mq4,
+        routed_mq6,
+        routed_mq2_lloyd,
+        routed_paro,
+        routed_gate_up_mq4,
+        routed_gate_up_mq6,
+        routed_gate_up_mq2_lloyd,
+        routed_gate_up_paro,
+        routed_dtype_indexable_mq4,
+        routed_dtype_indexable_mq6,
+        routed_dtype_indexable_mq2_lloyd,
+        routed_dtype_indexable_paro,
+        routed_path,
+        use_gpu_topk,
+        needs_x_rot_local,
     }
 }
 
@@ -8941,6 +9046,23 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         DType::ParoQ4G128 => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
         _ => false,
     }
+}
+
+fn moe_grouped_gemm_path2_enabled_from_env(value: Option<&str>) -> bool {
+    match value {
+        Some("0") | Some("off") => false,
+        Some("1") | Some("on") => true,
+        _ => true,
+    }
+}
+
+fn moe_grouped_gemm_path2_required_for_dtype(dtype: DType) -> bool {
+    matches!(dtype, DType::MQ3G256)
+}
+
+fn moe_grouped_gemm_path2_eligible_for_dtype(dtype: DType, arch: &str, use_path2: bool) -> bool {
+    (use_path2 || moe_grouped_gemm_path2_required_for_dtype(dtype))
+        && moe_grouped_gemm_supported_for_dtype(dtype, arch)
 }
 
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
@@ -9429,18 +9551,19 @@ fn prefill_moe_ffn_body_batched(
     // Cached read — getenv on every layer × MoE call adds up.
     static USE_PATH2_GATE_UP: OnceLock<bool> = OnceLock::new();
     let use_path2 = *USE_PATH2_GATE_UP.get_or_init(|| {
-        match std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref() {
-            Some("0") | Some("off") => false,
-            Some("1") | Some("on") => true,
-            _ => true,
-        }
+        moe_grouped_gemm_path2_enabled_from_env(
+            std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref(),
+        )
     });
-    let path2_required = matches!(ffn.experts[0].gate_up.gpu_dtype, DType::MQ3G256);
-    let path2_eligible = (use_path2 || path2_required)
-        && moe_grouped_gemm_supported_for_dtype(ffn.experts[0].gate_up.gpu_dtype, &gpu.arch);
+    let path2_eligible = moe_grouped_gemm_path2_eligible_for_dtype(
+        ffn.experts[0].gate_up.gpu_dtype,
+        &gpu.arch,
+        use_path2,
+    );
     // m_total — computed during gate_up scatter, reused for down. Avoids
     // a second dtoh sync per MoE layer.
     let mut path2_m_total: usize = 0;
+    let path2_shape = moe_grouped_path2_shape(n, k_top, n_exp);
     if path2_eligible {
         // Stage 1 scatter pipeline. The scratch buffers are sized for
         // worst-case max_batch. Runtime launch bounds use the tighter live
@@ -9452,14 +9575,13 @@ fn prefill_moe_ffn_body_batched(
         let inverse_perm = pbs.moe_inverse_perm.as_ref().expect("path2 scratch");
         let tile_ids = pbs.moe_expert_tile_ids.as_ref().expect("path2 scratch");
         let y_gu_grouped = pbs.moe_y_gate_up_grouped.as_ref().expect("path2 scratch");
-        let total_slots = n * k_top;
         // m_total upper bound — scratch is sized in PrefillBatchScratch::new
         // with the all-experts worst case, while this launch only needs slots
         // plus padding for experts that can be non-empty at this N.
         // The scatter fused kernel pre-fills every tile id in this aligned
         // bound with -1; grouped GEMM early-returns on sentinel tiles, so we
         // can skip the m_total dtoh sync entirely. Saves ~50µs/layer.
-        let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
+        let m_total_max = path2_shape.m_total_bound;
 
         // Fused scatter pipeline: one launch replaces histogram + offsets
         // + permute. Saves 2 launches × ~75µs × MoE layers.
@@ -9470,7 +9592,7 @@ fn prefill_moe_ffn_body_batched(
             sorted,
             tile_ids,
             inverse_perm,
-            total_slots,
+            path2_shape.total_slots,
             n_exp,
             m_total_max,
             BLOCK_M,
@@ -9496,9 +9618,9 @@ fn prefill_moe_ffn_body_batched(
                 y_gu_grouped,
                 2 * mi,
                 gate_up_k,
-                k_top,
+                path2_shape.gate_up_x_row_div,
                 m_total,
-                n,
+                path2_shape.gate_up_source_rows,
             )?,
             DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
                 &ffn.expert_gate_up_ptrs,
@@ -9508,9 +9630,9 @@ fn prefill_moe_ffn_body_batched(
                 y_gu_grouped,
                 2 * mi,
                 gate_up_k,
-                k_top,
+                path2_shape.gate_up_x_row_div,
                 m_total,
-                n,
+                path2_shape.gate_up_source_rows,
             )?,
             DType::MQ3G256 => gpu.gemm_hfq3g256_moe_grouped_wmma(
                 &ffn.expert_gate_up_ptrs,
@@ -9520,9 +9642,9 @@ fn prefill_moe_ffn_body_batched(
                 y_gu_grouped,
                 2 * mi,
                 gate_up_k,
-                k_top,
+                path2_shape.gate_up_x_row_div,
                 m_total,
-                n,
+                path2_shape.gate_up_source_rows,
             )?,
             DType::MQ2G256Lloyd => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
                 &ffn.expert_gate_up_ptrs,
@@ -9532,9 +9654,9 @@ fn prefill_moe_ffn_body_batched(
                 y_gu_grouped,
                 2 * mi,
                 gate_up_k,
-                k_top,
+                path2_shape.gate_up_x_row_div,
                 m_total,
-                n,
+                path2_shape.gate_up_source_rows,
             )?,
             // Phase 4: Path 2 ParoQ4G128 grouped-WMMA. All 256 routed
             // experts at this layer share one gate_up Givens rotation
@@ -9567,10 +9689,14 @@ fn prefill_moe_ffn_body_batched(
                 // FP16 WMMA, k8 +2.5% over k2, both validated via PARO gen 100
                 // (clean decode, finite logits) + coherence-gate (MQ4 paths
                 // unchanged). Opt-out via HIPFIRE_MOE_PARO_I8=0 or _K8=0.
-                let use_paro_i8 = gpu.arch.starts_with("gfx1151")
-                    && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() != Ok("0");
-                let use_paro_i8_k8 =
-                    use_paro_i8 && std::env::var("HIPFIRE_MOE_PARO_I8_K8").as_deref() != Ok("0");
+                let use_paro_i8 = paro_moe_i8_enabled_for_arch_from_env(
+                    gpu.arch.as_str(),
+                    std::env::var("HIPFIRE_MOE_PARO_I8").ok().as_deref(),
+                );
+                let use_paro_i8_k8 = paro_moe_i8_k8_enabled_from_env(
+                    use_paro_i8,
+                    std::env::var("HIPFIRE_MOE_PARO_I8_K8").ok().as_deref(),
+                );
                 if use_paro_i8_k8 {
                     gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
                         &ffn.expert_gate_up_ptrs,
@@ -9580,9 +9706,9 @@ fn prefill_moe_ffn_body_batched(
                         y_gu_grouped,
                         2 * mi,
                         gate_up_k,
-                        k_top,
+                        path2_shape.gate_up_x_row_div,
                         m_total,
-                        n,
+                        path2_shape.gate_up_source_rows,
                     )?;
                 } else if use_paro_i8 {
                     gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
@@ -9593,9 +9719,9 @@ fn prefill_moe_ffn_body_batched(
                         y_gu_grouped,
                         2 * mi,
                         gate_up_k,
-                        k_top,
+                        path2_shape.gate_up_x_row_div,
                         m_total,
-                        n,
+                        path2_shape.gate_up_source_rows,
                     )?;
                 } else {
                     gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
@@ -9606,9 +9732,9 @@ fn prefill_moe_ffn_body_batched(
                         y_gu_grouped,
                         2 * mi,
                         gate_up_k,
-                        k_top,
+                        path2_shape.gate_up_x_row_div,
                         m_total,
-                        n,
+                        path2_shape.gate_up_source_rows,
                     )?;
                 }
             }
@@ -9810,9 +9936,9 @@ fn prefill_moe_ffn_body_batched(
                 y_down_grouped,
                 down_m,
                 down_k,
-                1, /* x_row_div */
+                path2_shape.down_x_row_div,
                 m_total,
-                n * k_top,
+                path2_shape.down_source_rows,
             )?,
             DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
                 &ffn.expert_down_ptrs,
@@ -9822,9 +9948,9 @@ fn prefill_moe_ffn_body_batched(
                 y_down_grouped,
                 down_m,
                 down_k,
-                1, /* x_row_div */
+                path2_shape.down_x_row_div,
                 m_total,
-                n * k_top,
+                path2_shape.down_source_rows,
             )?,
             DType::MQ3G256 => gpu.gemm_hfq3g256_moe_grouped_wmma(
                 &ffn.expert_down_ptrs,
@@ -9834,9 +9960,9 @@ fn prefill_moe_ffn_body_batched(
                 y_down_grouped,
                 down_m,
                 down_k,
-                1, /* x_row_div */
+                path2_shape.down_x_row_div,
                 m_total,
-                n * k_top,
+                path2_shape.down_source_rows,
             )?,
             DType::MQ2G256Lloyd => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
                 &ffn.expert_down_ptrs,
@@ -9846,9 +9972,9 @@ fn prefill_moe_ffn_body_batched(
                 y_down_grouped,
                 down_m,
                 down_k,
-                1, /* x_row_div */
+                path2_shape.down_x_row_div,
                 m_total,
-                n * k_top,
+                path2_shape.down_source_rows,
             )?,
             // Phase 4: Path 2 ParoQ4G128 down grouped-WMMA (with i8 MMQ
             // opt-in for gfx1151 — see gate_up arm above). rot_batch was
@@ -9861,10 +9987,14 @@ fn prefill_moe_ffn_body_batched(
                 // FP16 WMMA, k8 +2.5% over k2, both validated via PARO gen 100
                 // (clean decode, finite logits) + coherence-gate (MQ4 paths
                 // unchanged). Opt-out via HIPFIRE_MOE_PARO_I8=0 or _K8=0.
-                let use_paro_i8 = gpu.arch.starts_with("gfx1151")
-                    && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() != Ok("0");
-                let use_paro_i8_k8 =
-                    use_paro_i8 && std::env::var("HIPFIRE_MOE_PARO_I8_K8").as_deref() != Ok("0");
+                let use_paro_i8 = paro_moe_i8_enabled_for_arch_from_env(
+                    gpu.arch.as_str(),
+                    std::env::var("HIPFIRE_MOE_PARO_I8").ok().as_deref(),
+                );
+                let use_paro_i8_k8 = paro_moe_i8_k8_enabled_from_env(
+                    use_paro_i8,
+                    std::env::var("HIPFIRE_MOE_PARO_I8_K8").ok().as_deref(),
+                );
                 if use_paro_i8_k8 {
                     gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
                         &ffn.expert_down_ptrs,
@@ -9874,9 +10004,9 @@ fn prefill_moe_ffn_body_batched(
                         y_down_grouped,
                         down_m,
                         down_k,
-                        1, /* x_row_div */
+                        path2_shape.down_x_row_div,
                         m_total,
-                        n * k_top,
+                        path2_shape.down_source_rows,
                     )?;
                 } else if use_paro_i8 {
                     gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
@@ -9887,9 +10017,9 @@ fn prefill_moe_ffn_body_batched(
                         y_down_grouped,
                         down_m,
                         down_k,
-                        1, /* x_row_div */
+                        path2_shape.down_x_row_div,
                         m_total,
-                        n * k_top,
+                        path2_shape.down_source_rows,
                     )?;
                 } else {
                     gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
@@ -9900,9 +10030,9 @@ fn prefill_moe_ffn_body_batched(
                         y_down_grouped,
                         down_m,
                         down_k,
-                        1, /* x_row_div */
+                        path2_shape.down_x_row_div,
                         m_total,
-                        n * k_top,
+                        path2_shape.down_source_rows,
                     )?;
                 }
             }
@@ -11686,6 +11816,8 @@ fn forward_prefill_chunk(
                 }
 
                 // 5. Batched partial-interleaved RoPE (per-row positions).
+                // pbs.positions stays physical for the KV write below; the
+                // offset rotates new Q/K at absolute phase after compaction.
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 gpu.rope_partial_interleaved_f32_batched(
                     &pbs.fa_q_batch,
@@ -11697,6 +11829,7 @@ fn forward_prefill_chunk(
                     n_rot,
                     config.rope_theta,
                     n,
+                    kv_cache.compact_offset as i32,
                 )?;
 
                 // 6. Batched KV cache writes (per-row positions).
@@ -13342,6 +13475,8 @@ fn forward_prefill_chunk(
                     }
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                // pbs.positions stays physical for the KV write below; the
+                // offset rotates new Q/K at absolute phase after compaction.
                 gpu.rope_partial_interleaved_f32_batched(
                     &pbs.fa_q_batch,
                     &pbs.fa_k_batch,
@@ -13352,6 +13487,7 @@ fn forward_prefill_chunk(
                     n_rot,
                     config.rope_theta,
                     n,
+                    kv_cache.compact_offset as i32,
                 )?;
                 if kv_cache.quant_asym4 {
                     let ct = givens_cos_view!().unwrap();
@@ -14125,32 +14261,61 @@ fn run_fa_layer_body(
     if kv_cache.quant_asym4 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym4_fused(
-            &kv_cache.k_gpu[layer_idx],
-            &kv_cache.v_gpu[layer_idx],
-            &s.fa_k,
-            &s.fa_v,
-            &s.pos_buf,
-            ct,
-            st,
-            config.n_kv_heads,
-            config.head_dim,
-        )?;
-        gpu.attention_flash_asym4(
-            &s.fa_q,
-            &kv_cache.k_gpu[layer_idx],
-            &kv_cache.v_gpu[layer_idx],
-            &s.fa_attn_out,
-            &s.pos_buf,
-            ct,
-            st,
-            pos + 1,
-            config.n_heads,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_cache.physical_cap,
-            &s.flash_partials,
-        )?;
+        if kv_cache.quant_fwht {
+            gpu.kv_cache_write_fwht4_fused(
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &s.fa_k,
+                &s.fa_v,
+                &s.pos_buf,
+                ct,
+                st,
+                config.n_kv_heads,
+                config.head_dim,
+            )?;
+            gpu.attention_flash_fwht4(
+                &s.fa_q,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &s.fa_attn_out,
+                &s.pos_buf,
+                ct,
+                st,
+                pos + 1,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_cache.physical_cap,
+                &s.flash_partials,
+            )?;
+        } else {
+            gpu.kv_cache_write_asym4_fused(
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &s.fa_k,
+                &s.fa_v,
+                &s.pos_buf,
+                ct,
+                st,
+                config.n_kv_heads,
+                config.head_dim,
+            )?;
+            gpu.attention_flash_asym4(
+                &s.fa_q,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &s.fa_attn_out,
+                &s.pos_buf,
+                ct,
+                st,
+                pos + 1,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_cache.physical_cap,
+                &s.flash_partials,
+            )?;
+        }
     } else if kv_cache.quant_asym3 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
@@ -18832,6 +18997,46 @@ mod tests {
     }
 
     #[test]
+    fn dense_prefill_mq6_and_hfq6_are_batchable_in_qwen35() {
+        for arch in [
+            "gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201",
+            "gfx942",
+        ] {
+            assert!(
+                is_batchable_la(DType::MQ6G256, arch),
+                "MQ6 dense prefill should route through the HFQ6 batched family on {arch}"
+            );
+            assert!(
+                is_batchable_la(DType::HFQ6G256, arch),
+                "HFQ6 dense prefill should stay batchable on {arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn moe_prefill_paro_i8_env_policy_is_gfx1151_default_on_with_opt_out() {
+        assert!(paro_moe_i8_enabled_for_arch_from_env("gfx1151", None));
+        assert!(paro_moe_i8_enabled_for_arch_from_env("gfx1151", Some("1")));
+        assert!(paro_moe_i8_enabled_for_arch_from_env(
+            "gfx1151",
+            Some("surprise")
+        ));
+        assert!(!paro_moe_i8_enabled_for_arch_from_env("gfx1151", Some("0")));
+        assert!(!paro_moe_i8_enabled_for_arch_from_env("gfx1201", None));
+        assert!(!paro_moe_i8_enabled_for_arch_from_env("gfx1100", Some("1")));
+    }
+
+    #[test]
+    fn moe_prefill_paro_i8_k8_env_policy_follows_i8_gate_and_allows_opt_out() {
+        assert!(paro_moe_i8_k8_enabled_from_env(true, None));
+        assert!(paro_moe_i8_k8_enabled_from_env(true, Some("1")));
+        assert!(paro_moe_i8_k8_enabled_from_env(true, Some("surprise")));
+        assert!(!paro_moe_i8_k8_enabled_from_env(true, Some("0")));
+        assert!(!paro_moe_i8_k8_enabled_from_env(false, None));
+        assert!(!paro_moe_i8_k8_enabled_from_env(false, Some("1")));
+    }
+
+    #[test]
     fn moe_prefill_topk_shape_requires_k8_and_bounded_experts() {
         assert!(moe_prefill_topk_shape_supported(8, 256));
         assert!(moe_prefill_topk_shape_supported(8, 1024));
@@ -18942,6 +19147,90 @@ mod tests {
     }
 
     #[test]
+    fn moe_decode_routes_mq6_indexed_path_for_k8() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ6G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false);
+
+        assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::Mq6);
+        assert!(flags.routed_dtype_indexable_mq6);
+        assert!(!flags.routed_dtype_indexable_mq4);
+        assert!(flags.use_gpu_topk);
+        assert!(flags.needs_x_rot_local);
+        assert!(!flags.gate_side_mq4);
+    }
+
+    #[test]
+    fn moe_decode_keeps_mq4_control_on_indexed_path() {
+        let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false);
+
+        assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::Mq4);
+        assert!(flags.gate_side_mq4);
+        assert!(flags.shared_gate_up_mq4);
+        assert!(flags.routed_dtype_indexable_mq4);
+        assert!(flags.use_gpu_topk);
+        assert!(flags.needs_x_rot_local);
+    }
+
+    #[test]
+    fn moe_decode_rejects_mismatched_mq6_gate_up_and_down_from_indexed_path() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ6G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        dtypes.expert_down = DType::MQ4G256;
+
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false);
+
+        assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::None);
+        assert!(flags.routed_gate_up_mq6);
+        assert!(!flags.routed_dtype_indexable_mq6);
+        assert!(!flags.use_gpu_topk);
+        assert!(flags.needs_x_rot_local);
+    }
+
+    #[test]
+    fn moe_decode_k8_shape_required_for_gpu_topk() {
+        let dtypes = MoePrefillDtypes::uniform(DType::MQ6G256);
+
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 4, false);
+
+        assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::Mq6);
+        assert!(flags.routed_dtype_indexable_mq6);
+        assert!(!flags.use_gpu_topk);
+    }
+
+    #[test]
+    fn mq3_a3b_prefill_path2_but_moe_decode_lacks_indexed_route() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ3G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1151"
+        ));
+        assert!(moe_grouped_gemm_path2_required_for_dtype(DType::MQ3G256));
+        assert!(moe_grouped_gemm_path2_eligible_for_dtype(
+            DType::MQ3G256,
+            "gfx1151",
+            false
+        ));
+
+        let flags = moe_decode_dispatch_flags_for_dtypes(&dtypes, 8, false);
+
+        assert_eq!(flags.routed_path, MoeDecodeIndexedRoutedPath::None);
+        assert!(!flags.routed_dtype_indexable_mq4);
+        assert!(!flags.routed_dtype_indexable_mq6);
+        assert!(!flags.routed_dtype_indexable_mq2_lloyd);
+        assert!(!flags.routed_dtype_indexable_paro);
+        assert!(!flags.use_gpu_topk);
+        assert!(!flags.needs_x_rot_local);
+    }
+
+    #[test]
     fn moe_prefill_admits_gfx1151_mq2_lloyd_routed_with_mq4_shared() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.router = DType::Q8_0;
@@ -19004,6 +19293,106 @@ mod tests {
             DType::MQ2G256Lloyd,
             "gfx1201"
         ));
+    }
+
+    #[test]
+    fn moe_prefill_path2_env_policy_defaults_on_and_allows_opt_out() {
+        assert!(moe_grouped_gemm_path2_enabled_from_env(None));
+        assert!(moe_grouped_gemm_path2_enabled_from_env(Some("1")));
+        assert!(moe_grouped_gemm_path2_enabled_from_env(Some("on")));
+        assert!(moe_grouped_gemm_path2_enabled_from_env(Some("surprise")));
+        assert!(!moe_grouped_gemm_path2_enabled_from_env(Some("0")));
+        assert!(!moe_grouped_gemm_path2_enabled_from_env(Some("off")));
+    }
+
+    #[test]
+    fn moe_prefill_path2_routes_mq6_on_gfx1151_and_gfx12() {
+        for arch in ["gfx1151", "gfx1200", "gfx1201"] {
+            assert!(
+                moe_grouped_gemm_path2_eligible_for_dtype(DType::MQ6G256, arch, true),
+                "MQ6 should use grouped MoE GEMM when enabled on {arch}"
+            );
+            assert!(
+                !moe_grouped_gemm_path2_eligible_for_dtype(DType::MQ6G256, arch, false),
+                "MQ6 should honor grouped MoE GEMM opt-out on {arch}"
+            );
+        }
+
+        assert!(
+            !moe_grouped_gemm_path2_eligible_for_dtype(DType::MQ6G256, "gfx1100", true),
+            "MQ6 should stay on indexed fallback where no grouped kernel is wired"
+        );
+    }
+
+    #[test]
+    fn moe_prefill_path2_forces_mq3_because_no_indexed_fallback_exists() {
+        assert!(moe_grouped_gemm_path2_required_for_dtype(DType::MQ3G256));
+        assert!(moe_grouped_gemm_path2_eligible_for_dtype(
+            DType::MQ3G256,
+            "gfx1151",
+            false
+        ));
+        assert!(moe_grouped_gemm_path2_eligible_for_dtype(
+            DType::MQ3G256,
+            "gfx1201",
+            false
+        ));
+        assert!(
+            !moe_grouped_gemm_path2_eligible_for_dtype(DType::MQ3G256, "gfx1100", false),
+            "MQ3 cannot force path2 on archs without a grouped MoE kernel"
+        );
+    }
+
+    #[test]
+    fn moe_prefill_mq3_long_prefill_path2_shape_is_production_shaped() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ3G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        assert!(
+            moe_ffn_batched_admissible_for_dtypes(&dtypes, false, "gfx1151"),
+            "MQ3 A3B prefill must stay admitted on gfx1151"
+        );
+        assert!(
+            moe_grouped_gemm_path2_eligible_for_dtype(DType::MQ3G256, "gfx1151", false),
+            "MQ3 has no indexed fallback, so path2 remains required even when the env gate is off"
+        );
+
+        let shape = moe_grouped_path2_shape(256, 8, 256);
+        assert_eq!(shape.total_slots, 2048);
+        assert_eq!(shape.m_total_bound, 5888);
+        assert_eq!(shape.gate_up_x_row_div, 8);
+        assert_eq!(shape.gate_up_source_rows, 256);
+        assert_eq!(shape.down_x_row_div, 1);
+        assert_eq!(shape.down_source_rows, 2048);
+        assert_eq!(shape.m_total_bound % MOE_GROUPED_BLOCK_M, 0);
+    }
+
+    #[test]
+    fn moe_prefill_mq6_path2_shape_is_production_shaped_when_enabled() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ6G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        assert!(
+            moe_ffn_batched_admissible_for_dtypes(&dtypes, false, "gfx1151"),
+            "MQ6 A3B prefill must stay admitted on gfx1151"
+        );
+        assert!(
+            moe_grouped_gemm_path2_eligible_for_dtype(DType::MQ6G256, "gfx1151", true),
+            "MQ6 should use path2 on gfx1151 when grouped MoE GEMM is enabled"
+        );
+        assert!(
+            !moe_grouped_gemm_path2_eligible_for_dtype(DType::MQ6G256, "gfx1151", false),
+            "MQ6 should keep the indexed fallback available when path2 is opted out"
+        );
+
+        let shape = moe_grouped_path2_shape(256, 8, 256);
+        assert_eq!(shape.total_slots, 2048);
+        assert_eq!(shape.m_total_bound, 5888);
+        assert_eq!(shape.gate_up_x_row_div, 8);
+        assert_eq!(shape.gate_up_source_rows, 256);
+        assert_eq!(shape.down_x_row_div, 1);
+        assert_eq!(shape.down_source_rows, 2048);
+        assert_eq!(shape.m_total_bound % MOE_GROUPED_BLOCK_M, 0);
     }
 
     #[test]

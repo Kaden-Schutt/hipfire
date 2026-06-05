@@ -540,7 +540,7 @@ pub fn forward_batch(
         gpu.rope_partial_interleaved_f32_batched(
             &fq, &fk, &pos_array,
             cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
-            cfg.rotary_dim, cfg.rope_theta, b,
+            cfg.rotary_dim, cfg.rope_theta, b, 0,
         )
         .map_err(|e| format!("minimax L{l} batch rope: {e:?}"))?;
         gpu.kv_cache_write_q8_0_batched(

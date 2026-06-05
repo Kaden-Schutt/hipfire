@@ -229,17 +229,23 @@ pub fn sample_from_logits(logits: &[f32], cfg: &MtpSamplingConfig, rng: &mut Mtp
     let mut pairs: Vec<(u32, f64)> = logits
         .iter()
         .enumerate()
+        .filter(|(_, &l)| !l.is_nan())
         .map(|(i, &l)| (i as u32, l as f64 * inv_temp))
         .collect();
+    if pairs.is_empty() {
+        return (0, 0.0);
+    }
 
     // 2. Optional top_k: partial-sort to keep top_k by logit (descending).
     if cfg.top_k > 0 && cfg.top_k < pairs.len() {
-        pairs.select_nth_unstable_by(cfg.top_k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
+        pairs.select_nth_unstable_by(cfg.top_k - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
         pairs.truncate(cfg.top_k);
     }
 
     // 3. Sort by logit descending for top_p and min_p filtering + sampling.
-    pairs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    pairs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // 4. Softmax with max-subtraction stability.
     let max_logit = pairs[0].1;
@@ -772,8 +778,7 @@ impl MtpSpecState {
         let _ = gpu.free_tensor(self.mtp_gather_prob_draft);
         let _ = gpu.free_tensor(self.mtp_gather_idx_verify);
         let _ = gpu.free_tensor(self.mtp_gather_prob_verify);
-        // DeltaNetSnapshot's DeviceBuffers free on drop.
-        drop(self.trunk_snap);
+        self.trunk_snap.free_gpu(gpu);
         if let Some(event) = self.trunk_snap_start_event {
             let _ = gpu.hip.event_destroy(event);
         }
@@ -3648,6 +3653,37 @@ mod tests {
         let tokens = build_trunk_spine_verify_tokens(42, &[7, 8, 9]);
 
         assert_eq!(tokens, vec![42, 7, 8, 9]);
+    }
+
+    #[test]
+    fn sample_from_logits_drops_nan_candidates() {
+        let cfg = MtpSamplingConfig {
+            temp: 1.0,
+            top_k: 2,
+            top_p: 1.0,
+            min_p: 0.0,
+        };
+        let mut rng = MtpRng::new(7);
+        for _ in 0..32 {
+            let (tok, prob) = sample_from_logits(&[f32::NAN, 4.0, 2.0, f32::NAN], &cfg, &mut rng);
+            assert!(tok == 1 || tok == 2);
+            assert!(prob.is_finite());
+        }
+    }
+
+    #[test]
+    fn sample_from_logits_all_nan_returns_zero_without_panic() {
+        let cfg = MtpSamplingConfig {
+            temp: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+        };
+        let mut rng = MtpRng::new(7);
+        assert_eq!(
+            sample_from_logits(&[f32::NAN, f32::NAN], &cfg, &mut rng),
+            (0, 0.0)
+        );
     }
 
     #[test]

@@ -138,7 +138,7 @@ impl MtpComposeState {
         let _ = gpu.free_tensor(self.mtp_lm_logits);
         let _ = gpu.free_tensor(self.mtp_lm_argmax);
         self.mtp_scratch.free_gpu(gpu);
-        self.mtp_kv.free_gpu(gpu);
+        self.mtp_kv.inner.free_gpu(gpu);
     }
 }
 
@@ -711,7 +711,7 @@ impl MtpComposeTreeState {
         let _ = gpu.free_tensor(self.mtp_lm_logits);
         let _ = gpu.free_tensor(self.mtp_lm_argmax);
         self.mtp_scratch.free_gpu(gpu);
-        self.mtp_kv.free_gpu(gpu);
+        self.mtp_kv.inner.free_gpu(gpu);
     }
 }
 

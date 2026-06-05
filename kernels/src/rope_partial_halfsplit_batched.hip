@@ -24,14 +24,16 @@ extern "C" __global__ void rope_partial_halfsplit_batched_f32(
     int head_dim,
     int n_rot,
     float freq_base,
-    int batch_size
+    int batch_size,
+    int pos_offset   // added to positions[b] for RoPE angle only;
+                     // KV writes still use the raw physical slot.
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int b = blockIdx.y;
     int half = n_rot / 2;
     if (i >= half || b >= batch_size) return;
 
-    int pos = positions[b];
+    int pos = positions[b] + pos_offset;
 
     float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)n_rot);
     float angle = (float)pos * freq;

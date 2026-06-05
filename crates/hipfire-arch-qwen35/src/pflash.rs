@@ -546,6 +546,34 @@ impl DrafterKvMode {
     }
 }
 
+#[cfg(feature = "deltanet")]
+fn hfq_parameter_count(hfq: &HfqFile) -> u128 {
+    hfq.tensors()
+        .iter()
+        .map(|t| {
+            t.shape
+                .iter()
+                .fold(1u128, |acc, &dim| acc.saturating_mul(dim as u128))
+        })
+        .sum()
+}
+
+#[cfg(feature = "deltanet")]
+fn parse_drafter_state_quant(
+    mode: Option<&str>,
+    _params: u128,
+) -> Result<qwen35::StateQuant, String> {
+    use qwen35::StateQuant;
+    match mode.unwrap_or("q8").to_ascii_lowercase().as_str() {
+        "" | "auto" | "q8" | "int8" => Ok(StateQuant::Q8),
+        "fp32" | "f32" => Ok(StateQuant::FP32),
+        "q4" | "int4" => Ok(StateQuant::Q4),
+        other => Err(format!(
+            "HIPFIRE_PFLASH_DRAFTER_STATE={other:?} not in {{auto,q8,fp32,q4}}"
+        )),
+    }
+}
+
 pub fn load_drafter(
     state: &mut PflashState,
     gpu: &mut Gpu,
@@ -587,7 +615,15 @@ pub fn load_drafter(
             })?;
             let weights = qwen35::load_weights(&mut hfq, &q35_cfg, gpu)?;
             let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &q35_cfg, 128, max_kv_seq)?;
-            let dn_state = qwen35::DeltaNetState::new(gpu, &q35_cfg)?;
+            let params = hfq_parameter_count(&hfq);
+            let dn_quant = parse_drafter_state_quant(
+                std::env::var("HIPFIRE_PFLASH_DRAFTER_STATE")
+                    .ok()
+                    .as_deref(),
+                params,
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("pflash: {e}")))?;
+            let dn_state = qwen35::DeltaNetState::new_with_quant(gpu, &q35_cfg, dn_quant)?;
             // Hybrid drafter only stores K (and V for chat-path) at
             // FullAttention layers; LinearAttention layers' recurrent
             // state is in dn_state and they don't touch the Q8/asym3 KV
@@ -1792,6 +1828,38 @@ mod tests {
         let tokens = vec![1u32; 5_000];
         let r = decide_bypass(&state, &cfg, &tokens, RequestKind::Text);
         assert_eq!(r, Some(BypassReason::DrafterUnavailable));
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[test]
+    fn drafter_state_quant_defaults_to_q8_with_explicit_overrides() {
+        use qwen35::StateQuant;
+
+        assert_eq!(
+            parse_drafter_state_quant(None, 800_000_000).unwrap(),
+            StateQuant::Q8
+        );
+        assert_eq!(
+            parse_drafter_state_quant(Some("auto"), 800_000_000).unwrap(),
+            StateQuant::Q8
+        );
+        assert_eq!(
+            parse_drafter_state_quant(Some("auto"), 27_000_000_000).unwrap(),
+            StateQuant::Q8
+        );
+        assert_eq!(
+            parse_drafter_state_quant(Some("q8"), 800_000_000).unwrap(),
+            StateQuant::Q8
+        );
+        assert_eq!(
+            parse_drafter_state_quant(Some("fp32"), 27_000_000_000).unwrap(),
+            StateQuant::FP32
+        );
+        assert_eq!(
+            parse_drafter_state_quant(Some("q4"), 27_000_000_000).unwrap(),
+            StateQuant::Q4
+        );
+        assert!(parse_drafter_state_quant(Some("bad"), 800_000_000).is_err());
     }
 
     fn synthetic_loaded(compat: bool) -> PflashState {

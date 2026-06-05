@@ -5212,6 +5212,7 @@ pub fn spec_step_ddtree_batched(
                 n_rot,
                 target.config.rope_theta,
                 n_positions,
+                0,
             )?;
 
             // 3. V gather via the existing kv_compact_gather pattern.
