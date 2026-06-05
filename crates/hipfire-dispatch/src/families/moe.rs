@@ -165,6 +165,50 @@ pub struct MoeParams<'a> {
     pub down_expanded: &'a GpuTensor,
 }
 
+// ── DeepSeek-V4 bias-aware decode parameters ───────────
+
+/// Parameters for the deepseek4 bias-aware MoE decode arm (k=6, MQ2-Lloyd routed
+/// experts). Kept distinct from [`MoeParams`] because the ds4 sub-graph has no
+/// fused gate-side and no shared-expert block: the shared expert is a separate
+/// model-owned step (`ffn_stub`) that runs first and seeds `ffn_out`, and this
+/// arm's routed-down kernel atomic-accumulates into that same buffer.
+///
+/// `scores` is the post-`sqrt_softplus(gate·x)` router output — the model owns
+/// the router GEMV + activation. Selection adds `gate_bias` while the routing
+/// weights use the *unbiased* `scores`; the bias-aware kernel handles that
+/// two-score semantic and folds in `route_scale`, all in one launch. The model
+/// pre-rotates the activation, so `x_rot` is consumed as-is (no re-rotation).
+pub struct MoeBiasAwareParams<'a> {
+    // dims / config scalars
+    pub hidden: usize,
+    pub mi: usize,
+    pub k_top: usize,
+    pub n_exp: usize,
+    pub route_scale: f32,
+    pub swiglu_limit: f32,
+    /// Token-batch width. Decode = 1. A value > 1 must route to the grouped
+    /// prefill executor (Step 8), never this decode arm — guarded in the executor.
+    pub batch_size: usize,
+    // activations / residual
+    /// FWHT-rotated activation (model pre-rotates; this arm does not re-rotate).
+    pub x_rot: &'a GpuTensor,
+    /// Residual stream the routed-down kernel atomic-accumulates into. The
+    /// model's shared-expert step must have run first to seed this buffer.
+    pub ffn_out: &'a GpuTensor,
+    // router
+    pub scores: &'a GpuTensor,    // post-sqrt_softplus gate·x (weights use these)
+    pub gate_bias: &'a GpuTensor, // per-expert routing bias (selection only)
+    // routed expert pointer tables
+    pub expert_gate_up_ptrs: &'a GpuTensor,
+    pub expert_down_ptrs: &'a GpuTensor,
+    // scratch buffers (model-owned)
+    pub topk_indices: &'a GpuTensor,
+    pub topk_weights: &'a GpuTensor,
+    pub gate_batch: &'a GpuTensor,
+    pub up_batch: &'a GpuTensor,
+    pub rot_batch: &'a GpuTensor,
+}
+
 // ── Family ─────────────────────────────────────────────
 
 pub struct MoeFamily {
@@ -216,6 +260,22 @@ impl MoeFamily {
         params: &MoeParams,
     ) -> Result<(), DispatchError> {
         crate::pipeline::run_moe_decode(gpu, params)
+    }
+
+    /// Run a single-token deepseek4 bias-aware MoE decode step (k=6, MQ2-Lloyd
+    /// routed experts). Delegates to [`crate::pipeline::run_moe_decode_bias_aware`].
+    ///
+    /// The model owns the router GEMV + `sqrt_softplus` (producing
+    /// `params.scores`) and the shared expert (`ffn_stub`, which seeds
+    /// `params.ffn_out`); this entry runs only the bias-aware top-k + routed
+    /// MQ2-Lloyd expert sub-graph.
+    pub fn run_bias_aware(
+        &self,
+        _ctx: &DispatchCtx,
+        gpu: &mut rdna_compute::Gpu,
+        params: &MoeBiasAwareParams,
+    ) -> Result<(), DispatchError> {
+        crate::pipeline::run_moe_decode_bias_aware(gpu, params)
     }
 }
 

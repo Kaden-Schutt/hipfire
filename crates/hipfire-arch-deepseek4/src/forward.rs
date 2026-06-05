@@ -2737,68 +2737,43 @@ fn ffn_routed(
             .gate_bias
             .as_ref()
             .ok_or_else(|| format!("ffn_routed l{layer_idx}: gate_bias missing"))?;
-        gpu.deepseek4_moe_topk_bias_aware_f32(
-            scores_dev,
-            bias_dev,
-            topk_idx_dev,
-            topk_w_dev,
-            cfg.n_routed_experts as i32,
-            k_top as i32,
-            route_scale_override,
-        )
-        .map_err(|e| format!("deepseek4_moe_topk_bias_aware l{layer_idx}: {e:?}"))?;
-
         let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
         let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
         let gate_batch = state.moe_gate_batch.as_ref().unwrap();
         let up_batch = state.moe_up_batch.as_ref().unwrap();
         let rot_batch = state.moe_rot_batch.as_ref().unwrap();
 
-        // 1. Fused gate_up GEMV: one launch dispatches all k_top experts'
-        //    gate and up halves in parallel. M = 2*intermediate; the
-        //    kernel splits output rows by r<im → gate, r>=im → up.
-        gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-            gate_up_ptrs,
-            topk_idx_dev,
-            ffn_x_rot,
-            gate_batch,
-            up_batch,
-            2 * im,
-            cfg.hidden_size,
+        // Bias-aware top-k select + the routed MQ2-Lloyd experts now run through
+        // the centralized MoE family (Ship 4.3): bias-aware top-k -> indexed
+        // gate_up -> batched silu*mul*clamp -> batched FWHT rotate -> indexed
+        // down with route-scaled residual accumulation into ffn_out. The router
+        // GEMV + sqrt_softplus (moe_route, above) and the shared expert
+        // (ffn_stub) stay model-owned; ffn_stub must have seeded ffn_out before
+        // this accumulates into it.
+        let moe_params = hipfire_dispatch::families::moe::MoeBiasAwareParams {
+            hidden: cfg.hidden_size,
+            mi: im,
             k_top,
-        )
-        .map_err(|e| format!("fused gate_up l{layer_idx}: {e:?}"))?;
-
-        // 2. Batched silu_clamp + batched FWHT rotate. Each kernel handles
-        //    all k_top streams in one launch (grid.y = k_top), replacing
-        //    2*k_top = 12 small launches with 2.
-        gpu.deepseek4_silu_mul_clamp_f32_batched(
-            gate_batch,
-            up_batch,
-            gate_batch,
-            im,
-            k_top,
-            cfg.swiglu_limit,
-        )
-        .map_err(|e| format!("deepseek4_silu_mul_clamp batched l{layer_idx}: {e:?}"))?;
-        gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
-            .map_err(|e| format!("rotate batched l{layer_idx}: {e:?}"))?;
-
-        // 3. Fused down GEMV: one launch atomicAdds
-        //      Σ_k topk_weights[k] * (W_down[expert_k] · rot_batch[k])
-        //    into ffn_out. Replaces k_top per-expert GEMV + scaled_add
-        //    pairs. The route_scale_override is baked into topk_weights.
-        gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
-            w2_ptrs,
-            topk_idx_dev,
-            topk_w_dev,
-            rot_batch,
+            n_exp: cfg.n_routed_experts,
+            route_scale: route_scale_override,
+            swiglu_limit: cfg.swiglu_limit,
+            batch_size: 1,
+            x_rot: ffn_x_rot,
             ffn_out,
-            cfg.hidden_size,
-            im,
-            k_top,
-        )
-        .map_err(|e| format!("fused down l{layer_idx}: {e:?}"))?;
+            scores: scores_dev,
+            gate_bias: bias_dev,
+            expert_gate_up_ptrs: gate_up_ptrs,
+            expert_down_ptrs: w2_ptrs,
+            topk_indices: topk_idx_dev,
+            topk_weights: topk_w_dev,
+            gate_batch,
+            up_batch,
+            rot_batch,
+        };
+        let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+        hipfire_runtime::llama::moe_family()
+            .run_bias_aware(&ctx, gpu, &moe_params)
+            .map_err(|e| format!("ffn_routed l{layer_idx} dispatch: {e}"))?;
 
         return Ok(());
     }

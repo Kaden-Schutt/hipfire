@@ -465,6 +465,60 @@ fn run_moe_decode_cpu_fallback(
     Ok(())
 }
 
+/// DeepSeek-V4 bias-aware MoE decode executor. Transcribes the routed sub-graph
+/// of `hipfire-arch-deepseek4::forward::ffn_routed` (the fused
+/// `expert_gate_up_blob` branch): bias-aware top-k select → indexed MQ2-Lloyd
+/// gate_up → batched silu·mul·clamp → batched FWHT rotate → indexed MQ2-Lloyd
+/// down with route-scaled residual accumulation into `ffn_out`.
+///
+/// The router GEMV + `sqrt_softplus` (producing `p.scores`) and the shared
+/// expert stay model-owned — the shared expert seeds `p.ffn_out` and this arm
+/// accumulates into it, so the model must run it first. Decode only
+/// (`batch_size == 1`); batched prefill is the grouped executor (Step 8).
+pub fn run_moe_decode_bias_aware(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeBiasAwareParams,
+) -> Result<(), DispatchError> {
+    macro_rules! hip {
+        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+    }
+    if p.batch_size != 1 {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe", variant: "bias-aware-decode-requires-batch-1",
+            arch: "", quant: "",
+        });
+    }
+
+    // 1. Bias-aware top-K: select on (scores + bias), weight on the unbiased
+    //    scores, normalize, then fold in route_scale — all in one launch.
+    hip!(gpu.deepseek4_moe_topk_bias_aware_f32(
+        p.scores, p.gate_bias, p.topk_indices, p.topk_weights,
+        p.n_exp as i32, p.k_top as i32, p.route_scale,
+    ))?;
+
+    // 2. Indexed MQ2-Lloyd gate_up: all k_top experts in one launch
+    //    (M = 2*mi; the kernel splits rows r<mi → gate, r>=mi → up).
+    hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
+        p.expert_gate_up_ptrs, p.topk_indices, p.x_rot,
+        p.gate_batch, p.up_batch, 2 * p.mi, p.hidden, p.k_top,
+    ))?;
+
+    // 3. Batched silu·mul·clamp (in-place into gate_batch) then batched FWHT rotate.
+    hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
+        p.gate_batch, p.up_batch, p.gate_batch, p.mi, p.k_top, p.swiglu_limit,
+    ))?;
+    hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top))?;
+
+    // 4. Indexed MQ2-Lloyd down: atomic-accumulate Σ_k w_k·(W_down[e_k]·rot)
+    //    into ffn_out. route_scale is already baked into topk_weights.
+    hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+        p.expert_down_ptrs, p.topk_indices, p.topk_weights, p.rot_batch,
+        p.ffn_out, p.hidden, p.mi, p.k_top,
+    ))?;
+
+    Ok(())
+}
+
 pub fn dispatch_fused(
     gpu: &mut Gpu,
     key: KernelKey,
