@@ -148,7 +148,12 @@ fn read_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
 /// Load a 1D norm vector (F16/F32) → F32 GpuTensor. MiniMax-M2 uses STANDARD
 /// RMSNorm (`weight * x_normed`, no +1.0 offset — verified against
 /// MiniMaxM2RMSNorm), so no offset is baked in.
-fn load_norm(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> Result<GpuTensor, String> {
+fn load_norm(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    shape: &[usize],
+) -> Result<GpuTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
     let f32_data: Vec<f32> = match qt {
         1 => data
@@ -159,7 +164,11 @@ fn load_norm(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> Resul
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        _ => return Err(format!("minimax: expected F16/F32 norm for {name}, got qt={qt}")),
+        _ => {
+            return Err(format!(
+                "minimax: expected F16/F32 norm for {name}, got qt={qt}"
+            ))
+        }
     };
     gpu.upload_f32(&f32_data, shape)
         .map_err(|e| format!("minimax: upload norm {name}: {e:?}"))
@@ -168,13 +177,21 @@ fn load_norm(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> Resul
 /// Load a MiniMax AWQ shared-scale sidecar (1D F16, length k) → F32 GpuTensor.
 fn load_mm_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Option<GpuTensor> {
     let (qt, data) = read_tensor(hfq, name).ok()?;
-    if qt != 1 { return None; } // 1 = F16
+    if qt != 1 {
+        return None;
+    } // 1 = F16
     if data.len() != k * 2 {
-        eprintln!("minimax AWQ sidecar {name}: {} bytes != {} (k*2); skipping", data.len(), k * 2);
+        eprintln!(
+            "minimax AWQ sidecar {name}: {} bytes != {} (k*2); skipping",
+            data.len(),
+            k * 2
+        );
         return None;
     }
-    let f32_data: Vec<f32> = data.chunks_exact(2)
-        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+    let f32_data: Vec<f32> = data
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
     let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
     gpu.upload_raw(&f32_bytes, &[f32_data.len()]).ok()
 }
@@ -193,7 +210,13 @@ fn load_wt(
 
 /// quant_type → DType mapping (subset used by MiniMax HFQ files; mirrors
 /// qwen35::load_weight_tensor_raw). Uploads raw bytes and tags the dtype.
-fn wt_from_raw(gpu: &mut Gpu, qt: u8, data: &[u8], m: usize, k: usize) -> Result<WeightTensor, String> {
+fn wt_from_raw(
+    gpu: &mut Gpu,
+    qt: u8,
+    data: &[u8],
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
     let dtype = match qt {
         3 => DType::Q8_0,
         6 => DType::HFQ4G256,
@@ -226,16 +249,16 @@ fn wt_from_raw(gpu: &mut Gpu, qt: u8, data: &[u8], m: usize, k: usize) -> Result
 
 /// Per-layer GPU-resident weights.
 pub struct MiniMaxLayerWeights {
-    pub attn_norm: GpuTensor,  // input_layernorm
-    pub ffn_norm: GpuTensor,   // post_attention_layernorm
-    pub q_norm: GpuTensor,     // [n_heads*head_dim]
-    pub k_norm: GpuTensor,     // [n_kv*head_dim]
+    pub attn_norm: GpuTensor, // input_layernorm
+    pub ffn_norm: GpuTensor,  // post_attention_layernorm
+    pub q_norm: GpuTensor,    // [n_heads*head_dim]
+    pub k_norm: GpuTensor,    // [n_kv*head_dim]
     pub wq: WeightTensor,
     pub wk: WeightTensor,
     pub wv: WeightTensor,
     pub wo: WeightTensor,
-    pub router: WeightTensor,        // block_sparse_moe.gate.weight [n_exp, hidden]
-    pub routing_bias: GpuTensor,     // e_score_correction_bias [n_exp] F32
+    pub router: WeightTensor, // block_sparse_moe.gate.weight [n_exp, hidden]
+    pub routing_bias: GpuTensor, // e_score_correction_bias [n_exp] F32
     pub experts: Vec<MiniMaxExpertWeights>,
     pub expert_gate_up_ptrs: GpuTensor, // [2*n_exp] F32 = n_exp u64 device ptrs
     pub expert_down_ptrs: GpuTensor,
@@ -249,7 +272,7 @@ pub struct MiniMaxExpertWeights {
 }
 
 pub struct MiniMaxWeights {
-    pub embed: GpuTensor,     // model.embed_tokens.weight (Q8 raw, for embedding_lookup_q8)
+    pub embed: GpuTensor, // model.embed_tokens.weight (Q8 raw, for embedding_lookup_q8)
     pub final_norm: GpuTensor, // model.norm.weight
     pub lm_head: WeightTensor, // lm_head.weight
     pub layers: Vec<MiniMaxLayerWeights>,
@@ -275,20 +298,57 @@ impl MiniMaxWeights {
         for l in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{l}");
             let attn_norm = load_norm(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[hidden])?;
-            let ffn_norm =
-                load_norm(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[hidden])?;
+            let ffn_norm = load_norm(
+                hfq,
+                gpu,
+                &format!("{p}.post_attention_layernorm.weight"),
+                &[hidden],
+            )?;
             let q_norm = load_norm(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[q_dim])?;
             let k_norm = load_norm(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[kv_dim])?;
-            let wq = load_wt(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_dim, hidden)?;
-            let wk = load_wt(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, hidden)?;
-            let wv = load_wt(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, hidden)?;
-            let wo = load_wt(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), hidden, q_dim)?;
+            let wq = load_wt(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.q_proj.weight"),
+                q_dim,
+                hidden,
+            )?;
+            let wk = load_wt(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.k_proj.weight"),
+                kv_dim,
+                hidden,
+            )?;
+            let wv = load_wt(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.v_proj.weight"),
+                kv_dim,
+                hidden,
+            )?;
+            let wo = load_wt(
+                hfq,
+                gpu,
+                &format!("{p}.self_attn.o_proj.weight"),
+                hidden,
+                q_dim,
+            )?;
 
-            let router =
-                load_wt(hfq, gpu, &format!("{p}.block_sparse_moe.gate.weight"), n_exp, hidden)?;
+            let router = load_wt(
+                hfq,
+                gpu,
+                &format!("{p}.block_sparse_moe.gate.weight"),
+                n_exp,
+                hidden,
+            )?;
             // e_score_correction_bias: [n_exp] F16 → F32 (kept F16 in HFQ).
-            let routing_bias =
-                load_norm(hfq, gpu, &format!("{p}.block_sparse_moe.e_score_correction_bias"), &[n_exp])?;
+            let routing_bias = load_norm(
+                hfq,
+                gpu,
+                &format!("{p}.block_sparse_moe.e_score_correction_bias"),
+                &[n_exp],
+            )?;
 
             // Routed experts: pack ALL experts of this layer into ONE gate_up
             // blob + ONE down blob (deepseek4 `upload_layer_routed_experts`
@@ -342,10 +402,19 @@ impl MiniMaxWeights {
             drop(gu_combined);
             drop(dn_combined);
             gate_up.awq_scale = load_mm_awq_scale(
-                hfq, gpu, &format!("{p}.block_sparse_moe.awq_scale_gate_up.weight"), hidden);
-            if std::env::var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() { // down-AWQ harmful (shared s_down bad approx); opt-in
+                hfq,
+                gpu,
+                &format!("{p}.block_sparse_moe.awq_scale_gate_up.weight"),
+                hidden,
+            );
+            if std::env::var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() {
+                // down-AWQ harmful (shared s_down bad approx); opt-in
                 down.awq_scale = load_mm_awq_scale(
-                    hfq, gpu, &format!("{p}.block_sparse_moe.awq_scale_down.weight"), inter);
+                    hfq,
+                    gpu,
+                    &format!("{p}.block_sparse_moe.awq_scale_down.weight"),
+                    inter,
+                );
             }
             if gate_up.awq_scale.is_some() {
                 eprintln!("minimax: AWQ scales attached at L{l} (shared per-layer)");
@@ -423,11 +492,11 @@ pub struct MiniMaxState {
     pub ar_warmed_up: bool,
 
     // attention scratch
-    pub tmp: GpuTensor,    // [hidden] rmsnorm(h)
-    pub x_rot: GpuTensor,  // [hidden] FWHT scratch (unused for Q8 attn)
-    pub fa_q: GpuTensor,   // [q_dim]
-    pub fa_k: GpuTensor,   // [kv_dim]
-    pub fa_v: GpuTensor,   // [kv_dim]
+    pub tmp: GpuTensor,         // [hidden] rmsnorm(h)
+    pub x_rot: GpuTensor,       // [hidden] FWHT scratch (unused for Q8 attn)
+    pub fa_q: GpuTensor,        // [q_dim]
+    pub fa_k: GpuTensor,        // [kv_dim]
+    pub fa_v: GpuTensor,        // [kv_dim]
     pub fa_attn_out: GpuTensor, // [q_dim]
     pub flash_partials: GpuTensor,
 
@@ -435,8 +504,8 @@ pub struct MiniMaxState {
     pub h: GpuTensor, // [hidden] residual stream
 
     // moe scratch
-    pub ffn_tmp: GpuTensor,    // [hidden] rmsnorm(h)
-    pub ffn_x_rot: GpuTensor,  // [hidden] FWHT(rmsnorm(h)) for MQ4 experts
+    pub ffn_tmp: GpuTensor,       // [hidden] rmsnorm(h)
+    pub ffn_x_rot: GpuTensor,     // [hidden] FWHT(rmsnorm(h)) for MQ4 experts
     pub router_logits: GpuTensor, // [n_exp]
     pub topk_indices: GpuTensor,  // [k] i32-in-F32
     pub topk_weights: GpuTensor,  // [k]

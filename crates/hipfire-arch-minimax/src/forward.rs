@@ -102,13 +102,14 @@ pub fn decode_step_with_graph(
 ) -> Result<Vec<f32>, String> {
     use std::sync::OnceLock;
     static GRAPH_ENV: OnceLock<Option<bool>> = OnceLock::new();
-    let env_override = *GRAPH_ENV.get_or_init(|| {
-        match std::env::var("HIPFIRE_MINIMAX_GRAPH").ok().as_deref() {
-            Some("1") => Some(true),
-            Some("0") => Some(false),
-            _ => None,
-        }
-    });
+    let env_override =
+        *GRAPH_ENV.get_or_init(
+            || match std::env::var("HIPFIRE_MINIMAX_GRAPH").ok().as_deref() {
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                _ => None,
+            },
+        );
     // Default OFF — measured only +1.0% on gfx1151 (the sole arch MiniMax fits);
     // the decode gap is GPU-CP dispatch latency, not host-launch overhead, so
     // hipGraph recovers ~nothing here. Opt in with HIPFIRE_MINIMAX_GRAPH=1.
@@ -240,9 +241,14 @@ fn decode_step_body(
 
         // Partial rotate_half RoPE on the first `rotary_dim` of each head.
         gpu.rope_partial_interleaved_f32(
-            &state.fa_q, &state.fa_k, &state.pos_buf,
-            cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
-            cfg.rotary_dim, cfg.rope_theta,
+            &state.fa_q,
+            &state.fa_k,
+            &state.pos_buf,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.rotary_dim,
+            cfg.rope_theta,
         )
         .map_err(|e| format!("minimax L{l}: rope: {e:?}"))?;
 
@@ -250,16 +256,33 @@ fn decode_step_body(
         // live KV length from `pos_buf[0]+1`; we pass `state.max_seq` as the
         // geometry hint (NOT `seq_len`) so the captured launch grid / shared-mem
         // is sized for the max and stays valid as the cache grows on replay.
-        gpu.kv_cache_write_q8_0(&state.kv.k_gpu[l], &state.fa_k, &state.pos_buf,
-            cfg.num_key_value_heads, cfg.head_dim)
-            .map_err(|e| format!("minimax L{l}: kv write k: {e:?}"))?;
-        gpu.kv_cache_write_q8_0(&state.kv.v_gpu[l], &state.fa_v, &state.pos_buf,
-            cfg.num_key_value_heads, cfg.head_dim)
-            .map_err(|e| format!("minimax L{l}: kv write v: {e:?}"))?;
+        gpu.kv_cache_write_q8_0(
+            &state.kv.k_gpu[l],
+            &state.fa_k,
+            &state.pos_buf,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        )
+        .map_err(|e| format!("minimax L{l}: kv write k: {e:?}"))?;
+        gpu.kv_cache_write_q8_0(
+            &state.kv.v_gpu[l],
+            &state.fa_v,
+            &state.pos_buf,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        )
+        .map_err(|e| format!("minimax L{l}: kv write v: {e:?}"))?;
         gpu.attention_q8_0_kv(
-            &state.fa_q, &state.kv.k_gpu[l], &state.kv.v_gpu[l], &state.fa_attn_out,
-            &state.pos_buf, state.max_seq, cfg.num_attention_heads, cfg.num_key_value_heads,
-            cfg.head_dim, state.kv.physical_cap,
+            &state.fa_q,
+            &state.kv.k_gpu[l],
+            &state.kv.v_gpu[l],
+            &state.fa_attn_out,
+            &state.pos_buf,
+            state.max_seq,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            state.kv.physical_cap,
         )
         .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
 
@@ -269,7 +292,8 @@ fn decode_step_body(
 
         if capture_postattn {
             if let Some(cap) = capture.as_deref_mut() {
-                let h = gpu.download_f32(&state.h)
+                let h = gpu
+                    .download_f32(&state.h)
                     .map_err(|e| format!("minimax L{l}: postattn capture: {e:?}"))?;
                 cap[l].extend_from_slice(&h);
             }
@@ -280,8 +304,14 @@ fn decode_step_body(
         // FWHT(ffn_tmp) (feeds the FWHT-pre-rotated experts).
         gpu.rmsnorm_f32(&state.h, &layer.ffn_norm, &state.ffn_tmp, eps)
             .map_err(|e| format!("minimax L{l}: ffn rmsnorm: {e:?}"))?;
-        rotate_x_mq_for(gpu, &layer.experts[0].gate_up, &state.ffn_tmp, &state.ffn_x_rot, hidden)
-            .map_err(|e| format!("minimax L{l}: ffn rotate: {e:?}"))?;
+        rotate_x_mq_for(
+            gpu,
+            &layer.experts[0].gate_up,
+            &state.ffn_tmp,
+            &state.ffn_x_rot,
+            hidden,
+        )
+        .map_err(|e| format!("minimax L{l}: ffn rotate: {e:?}"))?;
 
         // Router: sigmoid(logits) + bias-aware top-k (gather unbiased + normalize;
         // route_scale = 1.0 — MiniMax-M2 applies no routed-scaling factor).
@@ -290,8 +320,13 @@ fn decode_step_body(
         gpu.sigmoid_f32(&state.router_logits)
             .map_err(|e| format!("minimax L{l}: sigmoid: {e:?}"))?;
         gpu.deepseek4_moe_topk_bias_aware_f32(
-            &state.router_logits, &layer.routing_bias, &state.topk_indices,
-            &state.topk_weights, n_exp as i32, k_top as i32, 1.0,
+            &state.router_logits,
+            &layer.routing_bias,
+            &state.topk_indices,
+            &state.topk_weights,
+            n_exp as i32,
+            k_top as i32,
+            1.0,
         )
         .map_err(|e| format!("minimax L{l}: topk: {e:?}"))?;
 
@@ -305,30 +340,61 @@ fn decode_step_body(
         match edt {
             DType::MQ4G256 | DType::HFQ4G256 => gpu
                 .gemv_hfq4g256_moe_gate_up_k8_indexed(
-                    &layer.expert_gate_up_ptrs, &state.topk_indices, &state.ffn_x_rot,
-                    &state.gate_batch, &state.up_batch, 2 * inter, hidden)
+                    &layer.expert_gate_up_ptrs,
+                    &state.topk_indices,
+                    &state.ffn_x_rot,
+                    &state.gate_batch,
+                    &state.up_batch,
+                    2 * inter,
+                    hidden,
+                )
                 .map_err(|e| format!("minimax L{l}: gate_up hfq4: {e:?}"))?,
             DType::MQ6G256 | DType::HFQ6G256 => gpu
                 .gemv_hfq6g256_moe_gate_up_k8_indexed(
-                    &layer.expert_gate_up_ptrs, &state.topk_indices, &state.ffn_x_rot,
-                    &state.gate_batch, &state.up_batch, 2 * inter, hidden)
+                    &layer.expert_gate_up_ptrs,
+                    &state.topk_indices,
+                    &state.ffn_x_rot,
+                    &state.gate_batch,
+                    &state.up_batch,
+                    2 * inter,
+                    hidden,
+                )
                 .map_err(|e| format!("minimax L{l}: gate_up hfq6: {e:?}"))?,
             DType::MQ2G256Lloyd => gpu
                 .deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-                    &layer.expert_gate_up_ptrs, &state.topk_indices, &state.ffn_x_rot,
-                    &state.gate_batch, &state.up_batch, 2 * inter, hidden, k_top)
+                    &layer.expert_gate_up_ptrs,
+                    &state.topk_indices,
+                    &state.ffn_x_rot,
+                    &state.gate_batch,
+                    &state.up_batch,
+                    2 * inter,
+                    hidden,
+                    k_top,
+                )
                 .map_err(|e| format!("minimax L{l}: gate_up mq2l: {e:?}"))?,
             DType::MQ3G256Lloyd => gpu
                 .deepseek4_gemv_mq3g256_lloyd_moe_gate_up_indexed(
-                    &layer.expert_gate_up_ptrs, &state.topk_indices, &state.ffn_x_rot,
-                    &state.gate_batch, &state.up_batch, 2 * inter, hidden, k_top)
+                    &layer.expert_gate_up_ptrs,
+                    &state.topk_indices,
+                    &state.ffn_x_rot,
+                    &state.gate_batch,
+                    &state.up_batch,
+                    2 * inter,
+                    hidden,
+                    k_top,
+                )
                 .map_err(|e| format!("minimax L{l}: gate_up mq3l: {e:?}"))?,
             other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
         }
 
         fused_silu_mul_rotate_mq_batched_for(
-            gpu, &layer.experts[0].down, &state.gate_batch, &state.up_batch,
-            &state.rot_batch, inter, k_top,
+            gpu,
+            &layer.experts[0].down,
+            &state.gate_batch,
+            &state.up_batch,
+            &state.rot_batch,
+            inter,
+            k_top,
         )
         .map_err(|e| format!("minimax L{l}: silu_mul_rotate: {e:?}"))?;
 
@@ -338,35 +404,75 @@ fn decode_step_body(
         match ddt {
             DType::MQ4G256 | DType::HFQ4G256 => {
                 gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                    &layer.expert_down_ptrs, &state.topk_indices, &state.rot_batch,
-                    &state.down_expanded, hidden, inter, k_top, 1)
-                    .map_err(|e| format!("minimax L{l}: down hfq4: {e:?}"))?;
+                    &layer.expert_down_ptrs,
+                    &state.topk_indices,
+                    &state.rot_batch,
+                    &state.down_expanded,
+                    hidden,
+                    inter,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: down hfq4: {e:?}"))?;
                 gpu.moe_down_combine_k8_batched(
-                    &state.down_expanded, &state.topk_weights, &state.h, hidden, k_top, 1)
-                    .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
+                    &state.down_expanded,
+                    &state.topk_weights,
+                    &state.h,
+                    hidden,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
             }
             DType::MQ6G256 | DType::HFQ6G256 => {
                 gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-                    &layer.expert_down_ptrs, &state.topk_indices, &state.rot_batch,
-                    &state.down_expanded, hidden, inter, k_top, 1)
-                    .map_err(|e| format!("minimax L{l}: down hfq6: {e:?}"))?;
+                    &layer.expert_down_ptrs,
+                    &state.topk_indices,
+                    &state.rot_batch,
+                    &state.down_expanded,
+                    hidden,
+                    inter,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: down hfq6: {e:?}"))?;
                 gpu.moe_down_combine_k8_batched(
-                    &state.down_expanded, &state.topk_weights, &state.h, hidden, k_top, 1)
-                    .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
+                    &state.down_expanded,
+                    &state.topk_weights,
+                    &state.h,
+                    hidden,
+                    k_top,
+                    1,
+                )
+                .map_err(|e| format!("minimax L{l}: combine: {e:?}"))?;
             }
             DType::MQ2G256Lloyd => {
                 // Fused down + weighted residual accumulate (no separate combine).
                 gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
-                    &layer.expert_down_ptrs, &state.topk_indices, &state.topk_weights,
-                    &state.rot_batch, &state.h, hidden, inter, k_top)
-                    .map_err(|e| format!("minimax L{l}: down mq2l: {e:?}"))?;
+                    &layer.expert_down_ptrs,
+                    &state.topk_indices,
+                    &state.topk_weights,
+                    &state.rot_batch,
+                    &state.h,
+                    hidden,
+                    inter,
+                    k_top,
+                )
+                .map_err(|e| format!("minimax L{l}: down mq2l: {e:?}"))?;
             }
             DType::MQ3G256Lloyd => {
                 // Fused down + weighted residual accumulate (no separate combine).
                 gpu.deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed(
-                    &layer.expert_down_ptrs, &state.topk_indices, &state.topk_weights,
-                    &state.rot_batch, &state.h, hidden, inter, k_top)
-                    .map_err(|e| format!("minimax L{l}: down mq3l: {e:?}"))?;
+                    &layer.expert_down_ptrs,
+                    &state.topk_indices,
+                    &state.topk_weights,
+                    &state.rot_batch,
+                    &state.h,
+                    hidden,
+                    inter,
+                    k_top,
+                )
+                .map_err(|e| format!("minimax L{l}: down mq3l: {e:?}"))?;
             }
             other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
         }
@@ -374,7 +480,8 @@ fn decode_step_body(
         // Capture post-layer residual (pre final-norm) for the oracle compare.
         if !capture_postattn {
             if let Some(cap) = capture.as_deref_mut() {
-                let h = gpu.download_f32(&state.h)
+                let h = gpu
+                    .download_f32(&state.h)
                     .map_err(|e| format!("minimax L{l}: capture download: {e:?}"))?;
                 cap[l].extend_from_slice(&h);
             }
@@ -403,7 +510,11 @@ pub fn forward_batch_supported(weights: &MiniMaxWeights) -> bool {
         );
         let down_ok = matches!(
             layer.experts[0].down.gpu_dtype,
-            DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256 | DType::HFQ6G256 | DType::MQ2G256Lloyd
+            DType::MQ4G256
+                | DType::HFQ4G256
+                | DType::MQ6G256
+                | DType::HFQ6G256
+                | DType::MQ2G256Lloyd
         );
         gate_up_ok && down_ok
     })
@@ -442,7 +553,9 @@ pub fn forward_batch(
         return Err("minimax forward_batch: empty token slice".to_string());
     }
     if b > 64 {
-        return Err(format!("minimax forward_batch: B={b} exceeds kernel cap 64"));
+        return Err(format!(
+            "minimax forward_batch: B={b} exceeds kernel cap 64"
+        ));
     }
     let hidden = cfg.hidden_size;
     let q_dim = cfg.q_dim();
@@ -516,9 +629,15 @@ pub fn forward_batch(
                 .map_err(|e| format!("minimax L{l} batch k_norm: {e:?}"))?;
         }
         gpu.rope_partial_interleaved_f32_batched(
-            &fq, &fk, &pos_array,
-            cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
-            cfg.rotary_dim, cfg.rope_theta, b,
+            &fq,
+            &fk,
+            &pos_array,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.rotary_dim,
+            cfg.rope_theta,
+            b,
             // pos_offset (API drift on integration): added to positions[b] for
             // the RoPE angle only. MiniMax prefill does no KV compaction, so 0
             // is the behavior-preserving no-op offset.
@@ -526,17 +645,35 @@ pub fn forward_batch(
         )
         .map_err(|e| format!("minimax L{l} batch rope: {e:?}"))?;
         gpu.kv_cache_write_q8_0_batched(
-            &state.kv.k_gpu[l], &fk, &pos_array, cfg.num_key_value_heads, cfg.head_dim, b,
+            &state.kv.k_gpu[l],
+            &fk,
+            &pos_array,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            b,
         )
         .map_err(|e| format!("minimax L{l} batch kv write k: {e:?}"))?;
         gpu.kv_cache_write_q8_0_batched(
-            &state.kv.v_gpu[l], &fv, &pos_array, cfg.num_key_value_heads, cfg.head_dim, b,
+            &state.kv.v_gpu[l],
+            &fv,
+            &pos_array,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            b,
         )
         .map_err(|e| format!("minimax L{l} batch kv write v: {e:?}"))?;
         gpu.attention_q8_0_kv_batched(
-            &fq, &state.kv.k_gpu[l], &state.kv.v_gpu[l], &attn_out, &pos_array,
-            cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
-            max_seq, max_ctx, b,
+            &fq,
+            &state.kv.k_gpu[l],
+            &state.kv.v_gpu[l],
+            &attn_out,
+            &pos_array,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            max_seq,
+            max_ctx,
+            b,
         )
         .map_err(|e| format!("minimax L{l} batch attention: {e:?}"))?;
         gpu.gemm_q8_0_batched(&layer.wo.buf, &attn_out, &o, hidden, q_dim, b)
@@ -549,15 +686,35 @@ pub fn forward_batch(
             .map_err(|e| format!("minimax L{l} batch ffn rmsnorm: {e:?}"))?;
         // AWQ-aware FWHT rotate (gate_up may carry an AWQ activation scale —
         // MQ2-Lloyd+AWQ); the raw rotate_x_mq_batched would drop it.
-        rotate_x_mq_batched_for(gpu, &layer.experts[0].gate_up, &ffn_tmp, &ffn_x_rot, hidden, b)
-            .map_err(|e| format!("minimax L{l} batch ffn rotate: {e}"))?;
-        gpu.gemm_q8_0_batched(&layer.router.buf, &ffn_tmp, &router_logits, n_exp, hidden, b)
-            .map_err(|e| format!("minimax L{l} batch router: {e:?}"))?;
+        rotate_x_mq_batched_for(
+            gpu,
+            &layer.experts[0].gate_up,
+            &ffn_tmp,
+            &ffn_x_rot,
+            hidden,
+            b,
+        )
+        .map_err(|e| format!("minimax L{l} batch ffn rotate: {e}"))?;
+        gpu.gemm_q8_0_batched(
+            &layer.router.buf,
+            &ffn_tmp,
+            &router_logits,
+            n_exp,
+            hidden,
+            b,
+        )
+        .map_err(|e| format!("minimax L{l} batch router: {e:?}"))?;
         gpu.sigmoid_f32(&router_logits)
             .map_err(|e| format!("minimax L{l} batch sigmoid: {e:?}"))?;
         gpu.deepseek4_moe_topk_bias_aware_batched_f32(
-            &router_logits, &layer.routing_bias, &topk_idx, &topk_w,
-            n_exp as i32, k_top as i32, 1.0, b as i32,
+            &router_logits,
+            &layer.routing_bias,
+            &topk_idx,
+            &topk_w,
+            n_exp as i32,
+            k_top as i32,
+            1.0,
+            b as i32,
         )
         .map_err(|e| format!("minimax L{l} batch topk: {e:?}"))?;
 
@@ -565,13 +722,29 @@ pub fn forward_batch(
         match edt {
             DType::MQ4G256 | DType::HFQ4G256 => gpu
                 .gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                    &layer.expert_gate_up_ptrs, &topk_idx, &ffn_x_rot,
-                    &gate, &up, 2 * inter, hidden, k_top, b)
+                    &layer.expert_gate_up_ptrs,
+                    &topk_idx,
+                    &ffn_x_rot,
+                    &gate,
+                    &up,
+                    2 * inter,
+                    hidden,
+                    k_top,
+                    b,
+                )
                 .map_err(|e| format!("minimax L{l} batch gate_up hfq4: {e:?}"))?,
             DType::MQ2G256Lloyd => gpu
                 .deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
-                    &layer.expert_gate_up_ptrs, &topk_idx, &ffn_x_rot,
-                    &gate, &up, 2 * inter, hidden, k_top, b)
+                    &layer.expert_gate_up_ptrs,
+                    &topk_idx,
+                    &ffn_x_rot,
+                    &gate,
+                    &up,
+                    2 * inter,
+                    hidden,
+                    k_top,
+                    b,
+                )
                 .map_err(|e| format!("minimax L{l} batch gate_up mq2l: {e:?}"))?,
             other => {
                 return Err(format!(
@@ -582,7 +755,13 @@ pub fn forward_batch(
 
         // AWQ-aware silu·mul·rotate (down weight; b*k_top expert streams).
         fused_silu_mul_rotate_mq_batched_for(
-            gpu, &layer.experts[0].down, &gate, &up, &rot, inter, b * k_top,
+            gpu,
+            &layer.experts[0].down,
+            &gate,
+            &up,
+            &rot,
+            inter,
+            b * k_top,
         )
         .map_err(|e| format!("minimax L{l} batch silu_mul_rotate: {e}"))?;
 
@@ -590,21 +769,46 @@ pub fn forward_batch(
         match ddt {
             DType::MQ4G256 | DType::HFQ4G256 => {
                 gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                    &layer.expert_down_ptrs, &topk_idx, &rot, &down_exp, hidden, inter, k_top, b)
-                    .map_err(|e| format!("minimax L{l} batch down hfq4: {e:?}"))?;
+                    &layer.expert_down_ptrs,
+                    &topk_idx,
+                    &rot,
+                    &down_exp,
+                    hidden,
+                    inter,
+                    k_top,
+                    b,
+                )
+                .map_err(|e| format!("minimax L{l} batch down hfq4: {e:?}"))?;
                 gpu.moe_down_combine_k8_batched(&down_exp, &topk_w, &x, hidden, k_top, b)
                     .map_err(|e| format!("minimax L{l} batch combine: {e:?}"))?;
             }
             DType::MQ6G256 | DType::HFQ6G256 => {
                 gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-                    &layer.expert_down_ptrs, &topk_idx, &rot, &down_exp, hidden, inter, k_top, b)
-                    .map_err(|e| format!("minimax L{l} batch down hfq6: {e:?}"))?;
+                    &layer.expert_down_ptrs,
+                    &topk_idx,
+                    &rot,
+                    &down_exp,
+                    hidden,
+                    inter,
+                    k_top,
+                    b,
+                )
+                .map_err(|e| format!("minimax L{l} batch down hfq6: {e:?}"))?;
                 gpu.moe_down_combine_k8_batched(&down_exp, &topk_w, &x, hidden, k_top, b)
                     .map_err(|e| format!("minimax L{l} batch combine: {e:?}"))?;
             }
             DType::MQ2G256Lloyd => gpu
                 .deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
-                    &layer.expert_down_ptrs, &topk_idx, &topk_w, &rot, &x, hidden, inter, k_top, b)
+                    &layer.expert_down_ptrs,
+                    &topk_idx,
+                    &topk_w,
+                    &rot,
+                    &x,
+                    hidden,
+                    inter,
+                    k_top,
+                    b,
+                )
                 .map_err(|e| format!("minimax L{l} batch down mq2l: {e:?}"))?,
             other => {
                 return Err(format!(
@@ -630,8 +834,24 @@ pub fn forward_batch(
         .map_err(|e| format!("forward_batch download logits: {e:?}"))?;
 
     for t in [
-        x, tmp, fq, fk, fv, attn_out, o, ffn_tmp, ffn_x_rot, router_logits, topk_idx, topk_w,
-        gate, up, rot, down_exp, pos_array, x_last,
+        x,
+        tmp,
+        fq,
+        fk,
+        fv,
+        attn_out,
+        o,
+        ffn_tmp,
+        ffn_x_rot,
+        router_logits,
+        topk_idx,
+        topk_w,
+        gate,
+        up,
+        rot,
+        down_exp,
+        pos_array,
+        x_last,
     ] {
         gpu.free_tensor(t).ok();
     }
