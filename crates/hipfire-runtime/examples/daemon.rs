@@ -1564,6 +1564,16 @@ fn main() {
                     .get("repeat_window")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(128) as usize;
+                let presence_penalty = msg
+                    .get("presence_penalty")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0)
+                    .max(0.0) as f32;
+                let frequency_penalty = msg
+                    .get("frequency_penalty")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0)
+                    .max(0.0) as f32;
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
                 // cache so the model "sees" them as part of its own trajectory,
@@ -1788,6 +1798,8 @@ fn main() {
                         max_tokens,
                         repeat_penalty,
                         repeat_window,
+                        presence_penalty,
+                        frequency_penalty,
                         budget_alert_at_tok,
                         &budget_alert_text,
                         max_think_tokens,
@@ -3269,7 +3281,10 @@ fn load_model(
         // Flash partials size with physical_cap (bounds the max_tiles the
         // flash kernel must address). When physical_cap == max_seq this is
         // identical to sizing-by-max_seq; under eviction it's much smaller.
-        let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &config, 128, physical_cap)
+        // Keep the request default at 128, but allocate enough history for
+        // clients that explicitly ask for a wider repeat / OpenAI penalty
+        // window.
+        let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &config, 2048, physical_cap)
             .map_err(|e| format!("{e}"))?;
 
         // Build eviction policy if the operator supplied a sidecar. Qwen3 (arch_id < 5)
@@ -3959,7 +3974,7 @@ fn load_model_pp(
     let (dn, la_to_device) = DeltaNetState::new_with_quant_multi(&mut gpus, &config, dn_quant)
         .map_err(|e| format!("{e}"))?;
 
-    let scratch_set = Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 128, max_seq)
+    let scratch_set = Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 2048, max_seq)
         .map_err(|e| format!("{e}"))?;
 
     // ROCm 6.4.3 gotcha: enable_peer_access AFTER all allocations are live.
@@ -4750,6 +4765,12 @@ fn generate_dflash(
                     df.draft_config.hidden,
                     pre_phys,
                 );
+                speculative::compact_target_hidden_host(
+                    &mut df.target_hidden_host,
+                    &res.retain_mask,
+                    df.draft_config.num_extract(),
+                    df.draft_config.hidden,
+                );
             }
         }
     }
@@ -4777,6 +4798,14 @@ fn generate_dflash(
         let _ = stdout.flush();
     }
     generated += 1;
+
+    // First-token EOS guard. The first token is already emitted above; if
+    // it is itself a terminator, do not seed another drafted/verified block.
+    // The committed-tail check inside the loop applies the same terminator
+    // test to every subsequent token.
+    let first_token_is_eos = first_token == target.config.eos_token
+        || im_end_token == Some(first_token)
+        || tokenizer.is_terminator(first_token);
 
     let mut rng_state: u64 = 0x13579BDFu64;
 
@@ -4809,7 +4838,7 @@ fn generate_dflash(
     };
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
-    while generated < max_tokens {
+    while !first_token_is_eos && generated < max_tokens {
         if position + df.block_size >= ctx_capacity {
             break;
         }
@@ -5002,6 +5031,12 @@ fn generate_dflash(
                         df.draft_config.hidden,
                         pre_phys,
                     );
+                    speculative::compact_target_hidden_host(
+                        &mut df.target_hidden_host,
+                        &res.retain_mask,
+                        df.draft_config.num_extract(),
+                        df.draft_config.hidden,
+                    );
                 }
             }
         }
@@ -5097,7 +5132,9 @@ fn generate_multi(
     top_p: f32,
     max_tokens: usize,
     repeat_penalty: f32,
-    _repeat_window: usize,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
     budget_alert_at_tok: usize,
     budget_alert_text: &str,
     max_think_tokens: usize,
@@ -5346,7 +5383,8 @@ fn generate_multi(
 
     let dev_last = gpus.output_device;
     let vocab_size = config.vocab_size;
-    let repeat_buf_cap = scratch_set.per_device[dev_last].repeat_buf.buf.size() / 4;
+    let repeat_buf_cap =
+        (scratch_set.per_device[dev_last].repeat_buf.buf.size() / 4).min(repeat_window);
 
     if let Err(e) = qwen35::forward_prefill_batch_multi(
         gpus,
@@ -5388,6 +5426,8 @@ fn generate_multi(
         top_p,
         repeat_penalty,
         repeat_window: repeat_buf_cap,
+        presence_penalty,
+        frequency_penalty,
         blocked_tokens: blocked0,
     };
     let tok0 = {
@@ -5594,6 +5634,8 @@ fn generate_multi(
                     top_p,
                     repeat_penalty,
                     repeat_window: repeat_buf_cap,
+                    presence_penalty,
+                    frequency_penalty,
                     blocked_tokens: blocked,
                 };
                 next_token = {
@@ -5691,6 +5733,8 @@ fn generate_multi(
             top_p,
             repeat_penalty,
             repeat_window: repeat_buf_cap,
+            presence_penalty,
+            frequency_penalty,
             blocked_tokens: blocked,
         };
         next_token = {
@@ -5778,6 +5822,8 @@ fn generate(
     max_tokens: usize,
     repeat_penalty: f32,
     repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
     budget_alert_at_tok: usize,
     budget_alert_text: &str,
     max_think_tokens: usize,
@@ -5788,6 +5834,10 @@ fn generate(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
 ) {
+    // Seed the process-global CPU sampler RNG for this request. CPU fallback and
+    // grammar/VL-style sampling should not inherit RNG state from prior requests.
+    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+
     // Compress runs on the PFlash drafter handle when one is set (hetero
     // sibling device), else on the target gpu. The handle is consumed at
     // the seq_pos==0 compress site; decode always uses `gpu`.
@@ -5945,6 +5995,8 @@ fn generate(
             max_tokens,
             repeat_penalty,
             repeat_window,
+            presence_penalty,
+            frequency_penalty,
             budget_alert_at_tok,
             budget_alert_text,
             max_think_tokens,
@@ -6505,7 +6557,7 @@ fn generate(
         // naturally.
         let vocab_size = config.vocab_size;
         let mut rng_state: u32 = 0x13579BDFu32;
-        let repeat_buf_cap = scratch.repeat_buf.buf.size() / 4;
+        let repeat_buf_cap = (scratch.repeat_buf.buf.size() / 4).min(repeat_window);
 
         // Build the list of paired (open, close) attractor pairs once;
         // sampler::collect_unclosed_attractor_blocks decides per-call
@@ -6534,13 +6586,14 @@ fn generate(
             temperature: temp,
             top_p,
             repeat_penalty,
-            // Window is bounded by the GPU repeat_buf capacity (sized
-            // at 64 in ForwardScratch::new). Pre-PR3 code did this
+            // Window is bounded by the GPU repeat_buf capacity. Pre-PR3 code did this
             // bound by setting `scope_start = len - repeat_buf_cap`
             // and passing `scope.len()` to the kernel; we let
             // sampler::sample do the same `min(window, buf_cap)`
             // internally.
             repeat_window: repeat_buf_cap,
+            presence_penalty,
+            frequency_penalty,
             blocked_tokens: blocked0,
         };
         let tok0 = sampler::sample(
@@ -6809,6 +6862,8 @@ fn generate(
                         top_p,
                         repeat_penalty,
                         repeat_window: repeat_buf_cap,
+                        presence_penalty,
+                        frequency_penalty,
                         blocked_tokens: blocked,
                     };
                     next_token = sampler::sample(
@@ -6919,6 +6974,8 @@ fn generate(
                 top_p,
                 repeat_penalty,
                 repeat_window: repeat_buf_cap,
+                presence_penalty,
+                frequency_penalty,
                 blocked_tokens: blocked,
             };
             // GPU sample: reads scratch.logits (already on GPU), writes
@@ -8951,6 +9008,10 @@ fn generate_vl(
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
+    // Keep host-side VL sampling deterministic per request instead of carrying
+    // the global CPU sampler state across daemon calls.
+    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+
     let GenerateVLParams {
         id,
         prompt,
@@ -9232,6 +9293,8 @@ fn generate_vl(
         top_p,
         repeat_penalty: 1.0,
         repeat_window: 0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         blocked_tokens: Vec::new(),
     };
     let vl_cfg = SamplerConfig {
@@ -9239,6 +9302,8 @@ fn generate_vl(
         top_p,
         repeat_penalty,
         repeat_window,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         blocked_tokens: Vec::new(),
     };
     let mut next_token = sampler::sample_cpu(&mut logits, &[], &vl_cfg_first);

@@ -59,17 +59,35 @@ pub fn sample_token(
         return logits
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap()
+            .fold((0usize, f32::NEG_INFINITY), |best, (i, &v)| {
+                if v > best.1 {
+                    (i, v)
+                } else {
+                    best
+                }
+            })
             .0 as u32;
     }
     let n = logits.len();
-    let k = if top_k == 0 || top_k >= n { n } else { top_k };
 
-    // 1. Pick top-k indices by raw logit (descending).
-    let mut idx: Vec<usize> = (0..n).collect();
-    if k < n {
-        idx.select_nth_unstable_by(k - 1, |&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+    // 1. Pick top-k indices by raw logit (descending). NaN logits are not
+    // valid candidates; dropping them matches the GPU argmax path where
+    // `NaN > best` is false and prevents comparator panics.
+    let mut idx: Vec<usize> = (0..n).filter(|&i| !logits[i].is_nan()).collect();
+    if idx.is_empty() {
+        return 0;
+    }
+    let k = if top_k == 0 || top_k >= idx.len() {
+        idx.len()
+    } else {
+        top_k
+    };
+    if k < idx.len() {
+        idx.select_nth_unstable_by(k - 1, |&a, &b| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         idx.truncate(k);
     }
 
@@ -86,9 +104,14 @@ pub fn sample_token(
     if sum <= 0.0 || !sum.is_finite() {
         return idx
             .iter()
-            .max_by(|&&a, &&b| logits[a].partial_cmp(&logits[b]).unwrap())
-            .copied()
-            .unwrap_or(0) as u32;
+            .fold((idx[0], f32::NEG_INFINITY), |best, &i| {
+                if logits[i] > best.1 {
+                    (i, logits[i])
+                } else {
+                    best
+                }
+            })
+            .0 as u32;
     }
     for w in weights.iter_mut() {
         *w /= sum;
@@ -98,7 +121,11 @@ pub fn sample_token(
     //    drop the tail once cumulative mass reaches top_p, renormalise.
     if top_p > 0.0 && top_p < 1.0 {
         let mut order: Vec<usize> = (0..idx.len()).collect();
-        order.sort_unstable_by(|&a, &b| weights[b].partial_cmp(&weights[a]).unwrap());
+        order.sort_unstable_by(|&a, &b| {
+            weights[b]
+                .partial_cmp(&weights[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut cum = 0.0;
         let mut cutoff = order.len();
         for (rank, &j) in order.iter().enumerate() {
@@ -137,4 +164,50 @@ pub fn sample_token(
         }
     }
     idx[idx.len() - 1] as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn greedy_nan_logits_do_not_win() {
+        let mut rng = Xorshift::new(1);
+        assert_eq!(
+            sample_token(&[1.0, 5.0, 3.0, f32::NAN], 0.0, 0, 1.0, &mut rng),
+            1
+        );
+        assert_eq!(
+            sample_token(&[5.0, f32::NAN, 0.1, 2.0], 0.0, 0, 1.0, &mut rng),
+            0
+        );
+    }
+
+    #[test]
+    fn sampled_path_drops_nan_logits() {
+        let mut rng = Xorshift::new(42);
+        for _ in 0..64 {
+            let tok = sample_token(
+                &[1.0, f32::NAN, 3.0, 2.0, f32::NAN, 0.5],
+                1.0,
+                3,
+                0.9,
+                &mut rng,
+            );
+            assert!([0, 2, 3, 5].contains(&tok));
+        }
+    }
+
+    #[test]
+    fn all_nan_logits_return_zero_without_panic() {
+        let mut rng = Xorshift::new(7);
+        assert_eq!(
+            sample_token(&[f32::NAN, f32::NAN], 0.0, 0, 1.0, &mut rng),
+            0
+        );
+        assert_eq!(
+            sample_token(&[f32::NAN, f32::NAN], 1.0, 0, 1.0, &mut rng),
+            0
+        );
+    }
 }

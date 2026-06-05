@@ -31,7 +31,9 @@ extern "C" __global__ void sample_top_p(
     float top_p,
     unsigned int rand_seed,
     int repeat_window,
-    float repeat_penalty
+    float repeat_penalty,
+    float presence_penalty,
+    float frequency_penalty
 ) {
     const int TOP_K = 20;
     extern __shared__ char smem[];
@@ -69,6 +71,23 @@ extern "C" __global__ void sample_top_p(
             if (effective > 1.5f) effective = 1.5f;
             float v = logits[tok];
             logits[tok] = (v > 0.0f) ? (v / effective) : (v * effective);
+        }
+    }
+    if ((presence_penalty > 0.0f || frequency_penalty > 0.0f) && repeat_window > 0) {
+        for (int i = tid; i < repeat_window; i += nthreads) {
+            unsigned int tok = repeat_tokens[i];
+            if ((int)tok >= vocab_size) continue;
+            bool has_later = false;
+            int count = 1;
+            for (int j = 0; j < repeat_window; j++) {
+                if (j == i) continue;
+                if (repeat_tokens[j] == tok) {
+                    if (j > i) { has_later = true; break; }
+                    count++;
+                }
+            }
+            if (has_later) continue;
+            logits[tok] -= frequency_penalty * (float)count + presence_penalty;
         }
     }
     __syncthreads();

@@ -776,6 +776,17 @@ impl DeltaNetSnapshot {
         }
         Ok(())
     }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for buf in self
+            .s_matrix_bufs
+            .into_iter()
+            .chain(self.s_scale_bufs.into_iter())
+            .chain(self.conv_state_bufs.into_iter())
+        {
+            let _ = gpu.hip.free(buf);
+        }
+    }
 }
 
 /// A series of `n_slots` `DeltaNetSnapshot` slots, used by the tape-replay
@@ -5929,9 +5940,52 @@ pub fn apply_eviction_retain_to_draft(
     Ok(())
 }
 
+/// Compact the CPU-side `target_hidden_host` shadow after a TriAttention/CASK
+/// eviction so it stays in lockstep with the GPU-resident `target_hidden`
+/// (which [`apply_eviction_retain_to_draft`] compacts to `retain_mask.len()`
+/// rows).
+pub fn compact_target_hidden_host(
+    target_hidden_host: &mut Vec<f32>,
+    retain_mask: &[u32],
+    ne: usize,
+    h: usize,
+) {
+    if retain_mask.is_empty() {
+        return;
+    }
+    let row_floats = ne * h;
+    let mut compacted = Vec::with_capacity(retain_mask.len() * row_floats);
+    for &src_idx in retain_mask {
+        let start = src_idx as usize * row_floats;
+        compacted.extend_from_slice(&target_hidden_host[start..start + row_floats]);
+    }
+    *target_hidden_host = compacted;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_target_hidden_host_keeps_selected_rows() {
+        let (ne, h) = (1usize, 2usize);
+        let mut thh = vec![
+            0.0, 1.0, // row 0
+            2.0, 3.0, // row 1
+            4.0, 5.0, // row 2
+            6.0, 7.0, // row 3
+        ];
+        compact_target_hidden_host(&mut thh, &[0, 2, 3], ne, h);
+        assert_eq!(thh, vec![0.0, 1.0, 4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(thh.len(), 3 * ne * h);
+    }
+
+    #[test]
+    fn compact_target_hidden_host_empty_mask_is_noop() {
+        let mut thh = vec![1.0, 2.0, 3.0, 4.0];
+        compact_target_hidden_host(&mut thh, &[], 2, 1);
+        assert_eq!(thh, vec![1.0, 2.0, 3.0, 4.0]);
+    }
 
     #[test]
     fn dflash_gdn_tape_replay_uses_actual_verify_eligibility() {

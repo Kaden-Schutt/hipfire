@@ -630,7 +630,80 @@ fn paro_small_direct_limit() -> Option<usize> {
     text.parse::<usize>().ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenseGemvRoute {
+    Mq6RotateThenMq6Prerotated,
+    Hfq6Direct,
+    Unclassified,
+}
+
+fn dense_gemv_route(dtype: DType) -> DenseGemvRoute {
+    match dtype {
+        DType::MQ6G256 => DenseGemvRoute::Mq6RotateThenMq6Prerotated,
+        DType::HFQ6G256 => DenseGemvRoute::Hfq6Direct,
+        _ => DenseGemvRoute::Unclassified,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DensePrerotatedGemvRoute {
+    Mq6Prerotated,
+    Unclassified,
+}
+
+fn dense_prerotated_gemv_route(dtype: DType) -> DensePrerotatedGemvRoute {
+    match dtype {
+        DType::MQ6G256 => DensePrerotatedGemvRoute::Mq6Prerotated,
+        _ => DensePrerotatedGemvRoute::Unclassified,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenseResidualRoute {
+    Mq6RotateThenHfq6Residual,
+    Hfq6ResidualDirect,
+    Unclassified,
+}
+
+fn dense_residual_route(dtype: DType) -> DenseResidualRoute {
+    match dtype {
+        DType::MQ6G256 => DenseResidualRoute::Mq6RotateThenHfq6Residual,
+        DType::HFQ6G256 => DenseResidualRoute::Hfq6ResidualDirect,
+        _ => DenseResidualRoute::Unclassified,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenseSwigluResidualRoute {
+    Mq6RotateThenHfq6Residual,
+    Unclassified,
+}
+
+fn dense_swiglu_residual_route(dtype: DType) -> DenseSwigluResidualRoute {
+    match dtype {
+        DType::MQ6G256 => DenseSwigluResidualRoute::Mq6RotateThenHfq6Residual,
+        _ => DenseSwigluResidualRoute::Unclassified,
+    }
+}
+
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
+    match dense_gemv_route(w.gpu_dtype) {
+        DenseGemvRoute::Mq6RotateThenMq6Prerotated => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            return gpu.gemv_mq6g256_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k);
+        }
+        DenseGemvRoute::Hfq6Direct => {
+            return gpu.gemv_hfq6g256(&w.buf, x, y, w.m, w.k);
+        }
+        DenseGemvRoute::Unclassified => {}
+    }
+
     match w.gpu_dtype {
         DType::F32 => gpu.gemv_f32(&w.buf, x, y),
         DType::F16 => gpu.gemv_f16_xf32(&w.buf, x, y, w.m, w.k),
@@ -721,16 +794,6 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             rotate_x_mq_128_for(gpu, w, x, &x_rot_alias, w.k)?;
             gpu.gemv_mq4g128_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
-        DType::MQ6G256 => {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
-            gpu.gemv_mq6g256_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
-        }
         DType::MQ3G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
@@ -789,7 +852,6 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         DType::HFQ3G128 => gpu.gemv_hfq3g128(&w.buf, x, y, w.m, w.k),
         DType::HFQ2G256 => gpu.gemv_hfq2g256(&w.buf, x, y, w.m, w.k),
         DType::HFQ2G128 => gpu.gemv_hfq2g128(&w.buf, x, y, w.m, w.k),
-        DType::HFQ6G256 => gpu.gemv_hfq6g256(&w.buf, x, y, w.m, w.k),
         DType::Q4F16G64 => gpu.gemv_q4f16_g64(&w.buf, x, y, w.m, w.k),
         DType::Q4F16G32 => gpu.gemv_q4f16_g32(&w.buf, x, y, w.m, w.k),
         DType::ParoQ4G128 => {
@@ -1182,6 +1244,13 @@ pub fn weight_gemv_prerotated(
     x_rot: Option<&GpuTensor>,
     y: &GpuTensor,
 ) -> HipResult<()> {
+    if dense_prerotated_gemv_route(w.gpu_dtype) == DensePrerotatedGemvRoute::Mq6Prerotated {
+        if let Some(xr) = x_rot {
+            return gpu.gemv_mq6g256_prerotated(&w.buf, xr, y, w.m, w.k);
+        }
+        return weight_gemv(gpu, w, x, y);
+    }
+
     match w.gpu_dtype {
         DType::MQ4G256 => {
             if let Some(xr) = x_rot {
@@ -1193,13 +1262,6 @@ pub fn weight_gemv_prerotated(
         DType::MFP4G32 => {
             if let Some(xr) = x_rot {
                 gpu.gemv_mfp4g32_prerotated(&w.buf, xr, y, w.m, w.k)
-            } else {
-                weight_gemv(gpu, w, x, y)
-            }
-        }
-        DType::MQ6G256 => {
-            if let Some(xr) = x_rot {
-                gpu.gemv_mq6g256_prerotated(&w.buf, xr, y, w.m, w.k)
             } else {
                 weight_gemv(gpu, w, x, y)
             }
@@ -1261,6 +1323,29 @@ pub fn weight_gemv_residual(
     x: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
+    match dense_residual_route(w.gpu_dtype) {
+        DenseResidualRoute::Hfq6ResidualDirect => {
+            return gpu.gemv_hfq6g256_residual(&w.buf, x, y, w.m, w.k);
+        }
+        DenseResidualRoute::Mq6RotateThenHfq6Residual => {
+            // FWHT-rotate x into the shared mq_x_rot scratch, then dispatch
+            // hfq6g256_residual against the rotated activations. Saves one
+            // add_inplace_f32 launch per layer per token vs the generic path.
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            // F2: AWQ-aware routing. `w` is the downstream linear that
+            // consumes x_rot; route via _for helper so its awq_scale (if
+            // any) is applied via the AWQ kernel variant.
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            return gpu.gemv_hfq6g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k);
+        }
+        DenseResidualRoute::Unclassified => {}
+    }
+
     match w.gpu_dtype {
         DType::F16 => gpu.gemv_f16_xf32_residual(&w.buf, x, y, w.m, w.k),
         DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
@@ -1287,23 +1372,6 @@ pub fn weight_gemv_residual(
             gpu.gemv_paro4g128t_residual_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
         }
         DType::HFQ3G256 => gpu.gemv_hfq3g256_residual(&w.buf, x, y, w.m, w.k),
-        DType::HFQ6G256 => gpu.gemv_hfq6g256_residual(&w.buf, x, y, w.m, w.k),
-        DType::MQ6G256 => {
-            // FWHT-rotate x into the shared mq_x_rot scratch, then dispatch
-            // hfq6g256_residual against the rotated activations. Saves one
-            // add_inplace_f32 launch per layer per token vs the generic path.
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            // F2: AWQ-aware routing. `w` is the downstream linear that
-            // consumes x_rot; route via _for helper so its awq_scale (if
-            // any) is applied via the AWQ kernel variant.
-            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
-            gpu.gemv_hfq6g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
-        }
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
@@ -1399,6 +1467,23 @@ pub fn weight_gemv_swiglu_residual(
     ffn_hidden_scratch: &GpuTensor,
     x: &GpuTensor,
 ) -> HipResult<()> {
+    if dense_swiglu_residual_route(w_down.gpu_dtype)
+        == DenseSwigluResidualRoute::Mq6RotateThenHfq6Residual
+    {
+        // MQ6 down + residual fusion: same FWHT rotate + fused-residual
+        // pattern as MQ3 / MQ4, dispatched against the HFQ6 kernel.
+        gpu.ensure_mq_signs()?;
+        let x_rot_alias = GpuTensor {
+            buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+            shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+            dtype: DType::F32,
+        };
+        // F2: AWQ-aware routing for the down_proj input stage.
+        // `w_down` IS the downstream weight; route through _for helper.
+        fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
+        return gpu.gemv_hfq6g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k);
+    }
+
     match w_down.gpu_dtype {
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
@@ -1456,20 +1541,6 @@ pub fn weight_gemv_swiglu_residual(
             };
             fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_mq4g256_lloyd_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
-        }
-        DType::MQ6G256 => {
-            // MQ6 down + residual fusion: same FWHT rotate + fused-residual
-            // pattern as MQ3 / MQ4, dispatched against the HFQ6 kernel.
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            // F2: AWQ-aware routing for the down_proj input stage.
-            // `w_down` IS the downstream weight; route through _for helper.
-            fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
-            gpu.gemv_hfq6g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
         DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
             gpu.ensure_mq_signs()?;
@@ -6700,9 +6771,14 @@ pub fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(i, _)| i as u32)
-        .unwrap()
+        .fold((0usize, f32::NEG_INFINITY), |best, (i, &v)| {
+            if v > best.1 {
+                (i, v)
+            } else {
+                best
+            }
+        })
+        .0 as u32
 }
 
 /// Sample the next token using temperature + top-k + top-p (nucleus) sampling.
@@ -7154,6 +7230,12 @@ pub fn sampler_rng_restore(state: u32) {
     SAMPLER_STATE.store(state, Ordering::Relaxed);
 }
 
+/// Reset the CPU sampler RNG to a deterministic per-request seed.
+pub fn reset_cpu_sampler_rng(seed: u32) {
+    use std::sync::atomic::Ordering;
+    SAMPLER_STATE.store(if seed == 0 { 1 } else { seed }, Ordering::Relaxed);
+}
+
 use std::sync::atomic::AtomicU32;
 static SAMPLER_STATE: AtomicU32 = AtomicU32::new(0);
 
@@ -7184,6 +7266,30 @@ fn simple_rand() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn argmax_ignores_nan_logits() {
+        assert_eq!(argmax(&[1.0, 5.0, 3.0, f32::NAN]), 1);
+        assert_eq!(argmax(&[5.0, f32::NAN, 0.1, 2.0]), 0);
+    }
+
+    #[test]
+    fn argmax_all_nan_returns_zero_without_panic() {
+        assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0);
+    }
+
+    #[test]
+    fn cpu_sampler_rng_reset_is_deterministic() {
+        reset_cpu_sampler_rng(123);
+        let first = simple_rand();
+        reset_cpu_sampler_rng(123);
+        let second = simple_rand();
+        assert_eq!(first, second);
+
+        reset_cpu_sampler_rng(0);
+        let zero_seeded = sampler_rng_snapshot();
+        assert_ne!(zero_seeded, 0);
+    }
 
     #[test]
     fn attractor_block_below_threshold() {
@@ -7298,6 +7404,47 @@ mod tests {
         assert!(
             logits[5].is_finite(),
             "older unclosed opens must not count once they leave the window"
+        );
+    }
+
+    #[test]
+    fn mq6_dense_decode_routes_through_hfq6_family() {
+        assert_eq!(
+            dense_gemv_route(DType::MQ6G256),
+            DenseGemvRoute::Mq6RotateThenMq6Prerotated
+        );
+        assert_eq!(
+            dense_gemv_route(DType::HFQ6G256),
+            DenseGemvRoute::Hfq6Direct
+        );
+        assert_eq!(
+            dense_prerotated_gemv_route(DType::MQ6G256),
+            DensePrerotatedGemvRoute::Mq6Prerotated
+        );
+        assert_eq!(
+            dense_residual_route(DType::MQ6G256),
+            DenseResidualRoute::Mq6RotateThenHfq6Residual
+        );
+        assert_eq!(
+            dense_residual_route(DType::HFQ6G256),
+            DenseResidualRoute::Hfq6ResidualDirect
+        );
+        assert_eq!(
+            dense_swiglu_residual_route(DType::MQ6G256),
+            DenseSwigluResidualRoute::Mq6RotateThenHfq6Residual
+        );
+
+        assert_eq!(
+            dense_gemv_route(DType::MQ4G256),
+            DenseGemvRoute::Unclassified
+        );
+        assert_eq!(
+            dense_residual_route(DType::MQ4G256),
+            DenseResidualRoute::Unclassified
+        );
+        assert_eq!(
+            dense_swiglu_residual_route(DType::MQ4G256),
+            DenseSwigluResidualRoute::Unclassified
         );
     }
 
