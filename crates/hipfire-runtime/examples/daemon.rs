@@ -1003,6 +1003,17 @@ fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
     let _ = stdout.flush();
 }
 
+fn vram_done_fragment(gpu: &rdna_compute::Gpu) -> String {
+    let (free, total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+    let free_mb = free / (1024 * 1024);
+    let total_mb = total / (1024 * 1024);
+    let used_mb = total_mb.saturating_sub(free_mb);
+    format!(
+        r#","vram_free_mb":{},"vram_total_mb":{},"vram_used_mb":{}"#,
+        free_mb, total_mb, used_mb,
+    )
+}
+
 enum ImageSource<'a> {
     Path(&'a str),
     Base64(&'a str),
@@ -6125,7 +6136,7 @@ fn generate_dflash(
     };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{},"cached_tokens":{},"finish_reason":"{}"{}{}}}"#,
         // `prefill_tokens` is the NEWLY-prefilled count (the suffix actually fed
         // through the model), NOT the full rendered length — the CLI computes
         // `prompt_tokens = cached + prefill`, so reporting the full length here
@@ -6145,6 +6156,7 @@ fn generate_dflash(
         stats.cycles,
         cached_tokens_dflash,
         finish_reason,
+        vram_done_fragment(gpu),
         pflash_done_field,
     );
     let _ = stdout.flush();
@@ -6959,7 +6971,7 @@ fn generate_multi(
     };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
         id,
         generated,
         tok_s,
@@ -6967,7 +6979,8 @@ fn generate_multi(
         prefill_s * 1000.0,
         prefill_tok_s,
         decode_tok_s,
-        prefill_s * 1000.0
+        prefill_s * 1000.0,
+        vram_done_fragment(gpu),
     );
     let _ = stdout.flush();
 }
@@ -9023,7 +9036,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         };
         let _ = writeln!(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"cached_tokens":{},"finish_reason":"{}"{}{}}}"#,
             id,
             generated,
             tok_s,
@@ -9034,6 +9047,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             prefill_s * 1000.0,
             cached_tokens_count,
             finish_reason,
+            vram_done_fragment(gpu),
             pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
         );
         let _ = stdout.flush();
@@ -9186,7 +9200,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         };
         let _ = writeln!(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}{}}}"#,
             id,
             generated,
             tok_s,
@@ -9195,6 +9209,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             prefill_tok_s,
             decode_tok_s,
             prefill_s * 1000.0,
+            vram_done_fragment(gpu),
             pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
         );
         let _ = stdout.flush();
@@ -10477,8 +10492,8 @@ fn generate_qwen2(
     };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}{}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms, vram_done_fragment(gpu),
     );
     let _ = stdout.flush();
 }
@@ -11004,7 +11019,7 @@ fn generate_vl(
     };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
         id,
         generated,
         tok_s,
@@ -11012,7 +11027,8 @@ fn generate_vl(
         prefill_s * 1000.0,
         prefill_tok_s,
         decode_tok_s,
-        prefill_s * 1000.0
+        prefill_s * 1000.0,
+        vram_done_fragment(gpu),
     );
     let _ = stdout.flush();
 }
@@ -11311,7 +11327,7 @@ fn generate_vl_dots_ocr(
     };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
         id,
         generated,
         tok_s,
@@ -11319,7 +11335,8 @@ fn generate_vl_dots_ocr(
         prefill_s * 1000.0,
         prefill_tok_s,
         decode_tok_s,
-        prefill_s * 1000.0
+        prefill_s * 1000.0,
+        vram_done_fragment(gpu),
     );
     let _ = stdout.flush();
 }

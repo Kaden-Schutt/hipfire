@@ -8,7 +8,7 @@
 //   hipfire sidecar-gen <model>       → generate TriAttention calibration sidecar
 
 import { spawn } from "bun";
-import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, cpSync, rmSync, renameSync } from "fs";
+import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, cpSync, rmSync, renameSync, appendFileSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
 
@@ -949,6 +949,7 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
 
 const SERVE_PID_FILE = join(HIPFIRE_DIR, "serve.pid");
 const SERVE_LOG_FILE = join(HIPFIRE_DIR, "serve.log");
+const SERVE_REQUEST_LOG_FILE = join(HIPFIRE_DIR, "serve-requests.jsonl");
 
 function isPidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
@@ -1089,6 +1090,80 @@ async function runViaHttp(
   const secs = (Date.now() - t0) / 1000;
   if (tokens > 0) console.error(`\n[${tokens} tok, ${(tokens / secs).toFixed(1)} tok/s via serve]`);
   return true;
+}
+
+type ServeRequestSummary = {
+  ts: string;
+  event: "request_done";
+  id: string;
+  method: string;
+  path: string;
+  status: number;
+  model: string;
+  stream: boolean;
+  duration_ms: number;
+  finish_reason?: string | null;
+  error?: string | null;
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  total_tokens?: number | null;
+  max_tokens?: number | null;
+  ttft_ms?: number | null;
+  prefill_ms?: number | null;
+  prefill_tok_s?: number | null;
+  decode_tok_s?: number | null;
+  tok_s?: number | null;
+  vram_used_mb?: number | null;
+  vram_free_mb?: number | null;
+  vram_total_mb?: number | null;
+};
+
+function finiteNumber(v: any): number | null {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function metric(v: any, decimals = 0): string {
+  const n = finiteNumber(v);
+  if (n === null) return "na";
+  return decimals > 0 ? n.toFixed(decimals) : String(Math.round(n));
+}
+
+function statusForDaemonError(message: string | null | undefined): number {
+  const err = String(message || "").toLowerCase();
+  if (err.includes("maximum size") || err.includes("exceeds maximum")) return 413;
+  if (err.includes("no vision encoder") || err.includes("unsupported image format")
+    || err.includes("image dimensions") || err.includes("failed to decode base64")
+    || err.includes("failed to decode image") || err.includes("exceeds loaded kv budget")) {
+    return 400;
+  }
+  return 500;
+}
+
+function logServeRequest(summary: ServeRequestSummary) {
+  try {
+    mkdirSync(HIPFIRE_DIR, { recursive: true });
+    appendFileSync(SERVE_REQUEST_LOG_FILE, JSON.stringify(summary) + "\n");
+  } catch {}
+
+  const line = [
+    summary.ts,
+    summary.event,
+    `id=${summary.id}`,
+    `model=${summary.model || "unknown"}`,
+    `status=${summary.status}`,
+    `stream=${summary.stream ? 1 : 0}`,
+    `finish=${summary.finish_reason || (summary.error ? "error" : "unknown")}`,
+    `ttft_ms=${metric(summary.ttft_ms, 1)}`,
+    `prompt_tok=${metric(summary.prompt_tokens)}`,
+    `reply_tok=${metric(summary.completion_tokens)}`,
+    `prefill_tps=${metric(summary.prefill_tok_s, 1)}`,
+    `decode_tps=${metric(summary.decode_tok_s, 1)}`,
+    `vram_used_mb=${metric(summary.vram_used_mb)}`,
+    `vram_free_mb=${metric(summary.vram_free_mb)}`,
+    `dur_ms=${metric(summary.duration_ms)}`,
+  ].join(" ");
+  console.log(line);
 }
 
 // ─── Daemon IPC ─────────────────────────────────────────
@@ -1630,6 +1705,44 @@ async function serve(port: number, host: string) {
       await acquireLock();
       let lockReleased = false;
       const safeRelease = () => { if (!lockReleased) { lockReleased = true; releaseLock(); } };
+      const requestStartMs = Date.now();
+      const reqId = `chatcmpl-${requestStartMs.toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+      let requestLogged = false;
+      let requestModelForLog = "unknown";
+      let requestStreamForLog = false;
+      const writeRequestLog = (patch: Partial<ServeRequestSummary>) => {
+        if (requestLogged) return;
+        requestLogged = true;
+        const promptTokens = finiteNumber(patch.prompt_tokens);
+        const completionTokens = finiteNumber(patch.completion_tokens);
+        logServeRequest({
+          ts: new Date().toISOString(),
+          event: "request_done",
+          id: reqId,
+          method: req.method,
+          path: url.pathname,
+          status: patch.status ?? 500,
+          model: patch.model || "unknown",
+          stream: patch.stream ?? false,
+          duration_ms: Date.now() - requestStartMs,
+          finish_reason: patch.finish_reason ?? null,
+          error: patch.error ?? null,
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: finiteNumber(patch.total_tokens) ?? (
+            promptTokens !== null && completionTokens !== null ? promptTokens + completionTokens : null
+          ),
+          max_tokens: finiteNumber(patch.max_tokens),
+          ttft_ms: finiteNumber(patch.ttft_ms),
+          prefill_ms: finiteNumber(patch.prefill_ms),
+          prefill_tok_s: finiteNumber(patch.prefill_tok_s),
+          decode_tok_s: finiteNumber(patch.decode_tok_s),
+          tok_s: finiteNumber(patch.tok_s),
+          vram_used_mb: finiteNumber(patch.vram_used_mb),
+          vram_free_mb: finiteNumber(patch.vram_free_mb),
+          vram_total_mb: finiteNumber(patch.vram_total_mb),
+        });
+      };
 
       // If a previous generation was interrupted (client disconnect), drain
       // remaining daemon output before sending new commands.
@@ -1643,6 +1756,8 @@ async function serve(port: number, host: string) {
 
       try {
         const body = (await req.json()) as any;
+        requestModelForLog = body.model || "default";
+        requestStreamForLog = body.stream === true;
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
@@ -1872,6 +1987,13 @@ async function serve(port: number, host: string) {
         // an aggregate across the conversation. Helper unifies the
         // safeRelease + Response.json shape.
         const rejectImage = (message: string) => {
+          writeRequestLog({
+            status: 400,
+            model: body.model || "default",
+            stream: body.stream === true,
+            finish_reason: "error",
+            error: message,
+          });
           safeRelease();
           return Response.json(
             { error: { message, type: "invalid_request_error" } },
@@ -1955,7 +2077,17 @@ async function serve(port: number, host: string) {
         // if the request triggers a reload, so we can't gate on it yet.
 
         const rawPath = findModel(body.model || "default");
-        if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
+        if (!rawPath) {
+          writeRequestLog({
+            status: 404,
+            model: body.model || "default",
+            stream: body.stream === true,
+            finish_reason: "error",
+            error: "model not found",
+          });
+          safeRelease();
+          return Response.json({ error: "model not found" }, { status: 404 });
+        }
         // Normalize to avoid spurious reloads when registry vs fuzzy search give different paths
         const path = resolve(rawPath);
 
@@ -1985,6 +2117,14 @@ async function serve(port: number, host: string) {
             current = null;
             currentMaxSeq = null;
             modelHasVL = false;
+            writeRequestLog({
+              status: 500,
+              model: body.model || "default",
+              stream: body.stream === true,
+              max_tokens: requestMaxTokens,
+              finish_reason: "error",
+              error: `model load failed: ${loadResult.message}`,
+            });
             safeRelease();
             return Response.json({ error: `model load failed: ${loadResult.message}` }, { status: 500 });
           }
@@ -2064,7 +2204,6 @@ async function serve(port: number, host: string) {
           }
         }
 
-        const reqId = `chatcmpl-${Date.now().toString(36)}`;
         const created = Math.floor(Date.now() / 1000);
         const modelName = body.model || "hipfire";
         // Fall back to the user's configured defaults (global or per-model) when
@@ -2261,6 +2400,14 @@ async function serve(port: number, host: string) {
 
         if (requestImages.length === 1) {
           if (!modelHasVL) {
+            writeRequestLog({
+              status: 400,
+              model: modelName,
+              stream: body.stream === true,
+              max_tokens: requestMaxTokens,
+              finish_reason: "error",
+              error: "model has no vision encoder",
+            });
             safeRelease();
             return Response.json(
               { error: { message: "model has no vision encoder", type: "invalid_request_error" } },
@@ -2872,16 +3019,37 @@ async function serve(port: number, host: string) {
                     // wire. Skip the legacy text-buffer parser path and close
                     // out with the OpenAI-correct `finish_reason: "tool_calls"`.
                     if (structuredToolCallsEmitted) {
+                      const finishReason = daemonFR ?? "tool_calls";
+                      const usageForLog = buildUsage(msg, completionTokens);
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                        choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
-                        ...includeUsage && { usage: buildUsage(msg, completionTokens) },
+                        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+                        ...includeUsage && { usage: usageForLog },
                         timings: buildTimings(msg),
                       })}\n\n`));
+                      writeRequestLog({
+                        status: 200,
+                        model: modelName,
+                        stream: true,
+                        max_tokens: requestMaxTokens,
+                        finish_reason: finishReason,
+                        prompt_tokens: usageForLog.prompt_tokens,
+                        completion_tokens: completionTokens,
+                        total_tokens: usageForLog.total_tokens,
+                        ttft_ms: msg.ttft_ms,
+                        prefill_ms: msg.prefill_ms,
+                        prefill_tok_s: msg.prefill_tok_s,
+                        decode_tok_s: msg.decode_tok_s,
+                        tok_s: msg.tok_s,
+                        vram_used_mb: msg.vram_used_mb,
+                        vram_free_mb: msg.vram_free_mb,
+                        vram_total_mb: msg.vram_total_mb,
+                      });
                       ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                       ctrl.close();
                       return;
                     }
+                    let streamFinishReason = daemonFR ?? "stop";
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
                       const parsed = parseToolCalls(accumulated);
@@ -2894,6 +3062,7 @@ async function serve(port: number, host: string) {
                         ? detectToolCallTruncation(accumulated, (msg as any).tokens ?? 0, requestMaxTokens)
                         : null;
                       if (parsed.tool_calls) {
+                        streamFinishReason = daemonFR ?? "tool_calls";
                         if (parsed.content) {
                           ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                             id: reqId, object: "chat.completion.chunk", created, model: modelName,
@@ -2908,7 +3077,7 @@ async function serve(port: number, host: string) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
+                          choices: [{ index: 0, delta: {}, finish_reason: streamFinishReason }],
                           ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                           timings: buildTimings(msg),
                         })}\n\n`));
@@ -2922,6 +3091,7 @@ async function serve(port: number, host: string) {
                         const finishReason = truncation
                           ? "length"
                           : (daemonFR ?? "stop");
+                        streamFinishReason = finishReason;
                         const finalChunk: any = {
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
                           choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
@@ -2942,6 +3112,25 @@ async function serve(port: number, host: string) {
                         timings: buildTimings(msg)
                       })}\n\n`));
                     }
+                    const usageForLog = buildUsage(msg, completionTokens);
+                    writeRequestLog({
+                      status: 200,
+                      model: modelName,
+                      stream: true,
+                      max_tokens: requestMaxTokens,
+                      finish_reason: streamFinishReason,
+                      prompt_tokens: usageForLog.prompt_tokens,
+                      completion_tokens: completionTokens,
+                      total_tokens: usageForLog.total_tokens,
+                      ttft_ms: msg.ttft_ms,
+                      prefill_ms: msg.prefill_ms,
+                      prefill_tok_s: msg.prefill_tok_s,
+                      decode_tok_s: msg.decode_tok_s,
+                      tok_s: msg.tok_s,
+                      vram_used_mb: msg.vram_used_mb,
+                      vram_free_mb: msg.vram_free_mb,
+                      vram_total_mb: msg.vram_total_mb,
+                    });
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                     ctrl.close();
                     return;
@@ -2952,6 +3141,15 @@ async function serve(port: number, host: string) {
                     // normal zero-token "stop" — otherwise clients can't tell a
                     // real failure from a model that just produced no output.
                     const errMsg = msg.message || "generation failed";
+                    writeRequestLog({
+                      status: statusForDaemonError(errMsg),
+                      model: modelName,
+                      stream: true,
+                      max_tokens: requestMaxTokens,
+                      finish_reason: "error",
+                      error: errMsg,
+                      completion_tokens: completionTokens,
+                    });
                     ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                       error: { message: errMsg, type: "invalid_request_error" }
                     })}\n\n`));
@@ -2966,6 +3164,17 @@ async function serve(port: number, host: string) {
                 clearInterval(heartbeat);
                 if (forceAnswerTimer) clearTimeout(forceAnswerTimer);
                 e.generating = false;
+                if (streamCancelled) {
+                  writeRequestLog({
+                    status: 499,
+                    model: modelName,
+                    stream: true,
+                    max_tokens: requestMaxTokens,
+                    finish_reason: "cancelled",
+                    error: "client disconnected",
+                    completion_tokens: completionTokens,
+                  });
+                }
                 safeRelease();
               }
             },
@@ -3034,6 +3243,7 @@ async function serve(port: number, host: string) {
         let promptTokens = 0;
         let cachedTokens = 0;
         let daemonError: string | null = null;
+        let doneMsg: any = null;
         e.generating = true;
         // V4F arm emits structured `tool_calls` events from the DSML
         // StreamParser. Capture them here so the non-streaming chat-
@@ -3061,6 +3271,7 @@ async function serve(port: number, host: string) {
             if (typeof msg.text === "string") reasoningContent += msg.text;
           }
           else if (msg.type === "done") {
+            doneMsg = msg;
             // `prompt_tokens` is the full client-visible prompt size
             // (V4F emits it). When absent, derive as `cached + prefill`
             // — i.e. the total of cached-hit tokens plus the new tokens
@@ -3110,14 +3321,18 @@ async function serve(port: number, host: string) {
         // returning a 200 with empty content — otherwise a client that sent a
         // too-large request can't distinguish failure from a zero-token reply.
         if (daemonError) {
+          const status = statusForDaemonError(daemonError);
+          writeRequestLog({
+            status,
+            model: modelName,
+            stream: false,
+            max_tokens: requestMaxTokens,
+            finish_reason: "error",
+            error: daemonError,
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+          });
           safeRelease();
-          let status = 500;
-          const err = daemonError.toLowerCase();
-          if (err.includes("maximum size") || err.includes("exceeds maximum")) status = 413;
-          else if (err.includes("no vision encoder") || err.includes("unsupported image format")
-            || err.includes("image dimensions") || err.includes("failed to decode base64")
-            || err.includes("failed to decode image") || err.includes("exceeds loaded kv budget"))
-            status = 400;
           return Response.json(
             { error: { message: daemonError, type: "invalid_request_error" } },
             { status }
@@ -3187,6 +3402,24 @@ async function serve(port: number, host: string) {
           (choice as any)._truncation = nonStreamTruncation;
         }
 
+        writeRequestLog({
+          status: 200,
+          model: modelName,
+          stream: false,
+          max_tokens: requestMaxTokens,
+          finish_reason: choice.finish_reason,
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+          ttft_ms: doneMsg?.ttft_ms,
+          prefill_ms: doneMsg?.prefill_ms,
+          prefill_tok_s: doneMsg?.prefill_tok_s,
+          decode_tok_s: doneMsg?.decode_tok_s,
+          tok_s: doneMsg?.tok_s,
+          vram_used_mb: doneMsg?.vram_used_mb,
+          vram_free_mb: doneMsg?.vram_free_mb,
+          vram_total_mb: doneMsg?.vram_total_mb,
+        });
         safeRelease();
         const responseBody: any = {
           id: reqId, object: "chat.completion", created, model: modelName,
@@ -3259,6 +3492,14 @@ async function serve(port: number, host: string) {
           async cancel() {
             console.error(`[hipfire] non-stream client cancelled (reqId=${reqId}) — sending abort to daemon`);
             nsClientAborted = true;
+            writeRequestLog({
+              status: 499,
+              model: modelName,
+              stream: false,
+              max_tokens: requestMaxTokens,
+              finish_reason: "cancelled",
+              error: "client disconnected",
+            });
             try {
               await e.send({ type: "abort", id: reqId });
               console.error(`[hipfire] abort sent (reqId=${reqId})`);
@@ -3269,6 +3510,13 @@ async function serve(port: number, host: string) {
         }), { headers: { "Content-Type": "application/json" } });
         return nsResponse;
       } catch (err: any) {
+        writeRequestLog({
+          status: 500,
+          model: requestModelForLog,
+          stream: requestStreamForLog,
+          finish_reason: "error",
+          error: err?.message || "internal error",
+        });
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });
       }
