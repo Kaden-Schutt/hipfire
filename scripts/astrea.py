@@ -52,6 +52,50 @@ SAFETENSORS_SUMMARY_SCHEMA = "hipfire.astrea.safetensors_summary.v0"
 PARO_PROBE_SCHEMA = "hipfire.astrea.paro_probe.v0"
 PARO_IMPORT_SCHEMA = "hipfire.astrea.paro_import.v0"
 
+PARO_RUNTIME_ENV_BOUNDARY = {
+    "productization_candidate": [
+        {
+            "name": "HIPFIRE_PARO_BATCHED",
+            "default": "on",
+            "disable": "0",
+            "scope": "batched Paro admission",
+        },
+        {
+            "name": "HIPFIRE_MOE_PARO_I8",
+            "default": "on for gfx1151, off elsewhere",
+            "disable": "0",
+            "scope": "gfx1151 grouped-MMQ Paro MoE i8 path",
+        },
+        {
+            "name": "HIPFIRE_MOE_PARO_I8_K8",
+            "default": "on when HIPFIRE_MOE_PARO_I8 is admitted",
+            "disable": "0",
+            "scope": "gfx1151 K=8 grouped-MMQ Paro MoE path",
+        },
+    ],
+    "research_only": [
+        "HIPFIRE_PARO_PREROTATE",
+        "HIPFIRE_PARO_SMALL_DIRECT",
+        "HIPFIRE_PARO_SWIGLU_FUSED",
+        "HIPFIRE_PARO_FUSE_RMSNORM",
+        "HIPFIRE_PARO_FA3_FUSED",
+        "HIPFIRE_PARO_GATE_UP_FUSED",
+        "HIPFIRE_PARO_LA4_FUSED",
+        "HIPFIRE_PARO_LA2_FUSED",
+        "HIPFIRE_PARO_LA_GATES_MQ4G128",
+        "HIPFIRE_PARO_PACK1",
+        "HIPFIRE_PARO_PACK2",
+        "HIPFIRE_PARO_PACK4",
+        "HIPFIRE_PARO_SHARED_PAIRS",
+        "HIPFIRE_PARO_FUSED_PACK2",
+    ],
+    "promotion_report_requirements": [
+        "record effective values for productization-candidate Paro env vars",
+        "exclude research-only knobs from promoted main-path evidence unless each knob has separate artifact-backed validation",
+        "record oracle, finite-logit/NaN, coherence, KLD/PPL, and gfx1151 perf artifacts before promotion",
+    ],
+}
+
 SUPPORTED_FORMATS = {
     "mq3",
     "mq4",
@@ -209,6 +253,7 @@ HFQ_QUANT_TYPE_NAMES = {
     12: "HFQ3G128",
     13: "MQ4G256",
     14: "MQ8G256",
+    15: "MQ6G256",
     17: "MQ3G256",
     18: "MQ2G256",
     19: "MQ2G256_LLOYD",
@@ -217,6 +262,7 @@ HFQ_QUANT_TYPE_NAMES = {
     24: "MFP4G32",
     28: "PARO4G128",
     29: "PARO4G128T",
+    30: "MQ4G256_LLOYD",
 }
 
 HFQ_QUANT_TYPE_FORMATS = {
@@ -228,8 +274,12 @@ HFQ_QUANT_TYPE_FORMATS = {
     "HFQ4G128": "hfq4",
     "HFQ6G256": "hfq6",
     "MQ4G256": "mq4",
+    "MQ6G256": "mq6",
     "MQ3G256": "mq3",
+    "MQ2G256": "mq2",
+    "MQ2G256_LLOYD": "mq2",
     "MQ3G256_LLOYD": "mq3",
+    "MQ4G256_LLOYD": "mq4",
     "HFP4G32": "hfp4",
     "MFP4G32": "mfp4",
     "PARO4G128": "paro4",
@@ -3654,6 +3704,7 @@ def build_bundle_plan(
             "policy_id": policy_id,
             "description": "ParoQuant channel scales and independent pairwise rotation parameters",
             "runtime_status": "deferred_until_loader_and_fused_kernel_exist",
+            "runtime_env_boundary": json.loads(json.dumps(PARO_RUNTIME_ENV_BOUNDARY)),
         }
     if "kv-policy" in include:
         sections["kv.policy"] = {

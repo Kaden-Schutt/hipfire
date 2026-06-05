@@ -314,6 +314,34 @@ class AstreaTests(unittest.TestCase):
         )
         self.assertEqual(result["tensors"][0]["data_offset"], result["data_offset"])
 
+    def test_summarize_hfq_names_current_mq_container_qtypes(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            model = Path(td) / "synthetic-mq-family.hfq"
+            self.write_minimal_hfq(
+                model,
+                tensors=[
+                    ("layers.0.mlp.gate_proj.weight", 15, [1, 256], 256, 200),
+                    ("layers.0.mlp.up_proj.weight", 30, [1, 256], 256, 160),
+                    ("layers.0.mlp.down_proj.weight", 19, [1, 256], 256, 96),
+                ],
+            )
+
+            result = astrea.summarize_hfq(model)
+
+        self.assertEqual(
+            result["quant_type_counts"],
+            {
+                "MQ2G256_LLOYD": 1,
+                "MQ4G256_LLOYD": 1,
+                "MQ6G256": 1,
+            },
+        )
+        by_name = {tensor["name"]: tensor for tensor in result["tensors"]}
+        self.assertEqual(by_name["layers.0.mlp.gate_proj.weight"]["quant_type_name"], "MQ6G256")
+        self.assertEqual(by_name["layers.0.mlp.up_proj.weight"]["quant_type_name"], "MQ4G256_LLOYD")
+        self.assertEqual(by_name["layers.0.mlp.down_proj.weight"]["quant_type_name"], "MQ2G256_LLOYD")
+
     def test_match_imatrix_to_hfq_tensors_uses_qwen35_name_aliases(self):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
@@ -1413,10 +1441,129 @@ class AstreaTests(unittest.TestCase):
         self.assertFalse(plan["external_sidecars_target"])
         self.assertEqual(plan["container"]["format"], "hfq-package-v0")
         self.assertIn("transform.paro", plan["sections"])
+        paro_boundary = plan["sections"]["transform.paro"]["runtime_env_boundary"]
+        product_env = [item["name"] for item in paro_boundary["productization_candidate"]]
+        self.assertIn("HIPFIRE_PARO_BATCHED", product_env)
+        self.assertIn("HIPFIRE_MOE_PARO_I8", product_env)
+        self.assertIn("HIPFIRE_PARO_GATE_UP_FUSED", paro_boundary["research_only"])
+        self.assertIn("HIPFIRE_PARO_FUSED_PACK2", paro_boundary["research_only"])
+        self.assertIn("oracle", " ".join(paro_boundary["promotion_report_requirements"]))
         self.assertIn("kv.policy", plan["sections"])
         self.assertIn("triattn.centers", plan["sections"])
         self.assertEqual(plan["sections"]["triattn.centers"]["source"]["path"], str(triattn))
         self.assertIn("loader", " ".join(plan["deferred_runtime_work"]))
+
+    def test_cli_paro_commands_delegate_to_import_and_oracle_contracts(self):
+        astrea = load_astrea()
+        calls = []
+
+        class ImportStub:
+            @staticmethod
+            def probe_model(model, *, local_only=False, max_modules=None):
+                calls.append(("probe", model, local_only, max_modules))
+                return {
+                    "schema": astrea.PARO_PROBE_SCHEMA,
+                    "model": model,
+                    "local_only": local_only,
+                    "max_modules": max_modules,
+                }
+
+            @staticmethod
+            def import_model(
+                model,
+                output,
+                *,
+                local_only=False,
+                max_modules=None,
+                layout="native",
+                copy_floats="f16",
+            ):
+                calls.append(("import", model, output, local_only, max_modules, layout, copy_floats))
+                return {
+                    "schema": astrea.PARO_IMPORT_SCHEMA,
+                    "model": model,
+                    "output": output,
+                    "layout": layout,
+                    "copy_floats": copy_floats,
+                }
+
+        class OracleStub:
+            @staticmethod
+            def run_oracle(args):
+                calls.append(("oracle", vars(args)))
+                return {
+                    "schema": "hipfire.astrea.paro_oracle.v0",
+                    "source": args.source,
+                    "hfq": args.hfq,
+                    "module": args.module,
+                    "samples": args.samples,
+                    "seed": args.seed,
+                    "input_scale": args.input_scale,
+                    "atol": args.atol,
+                }
+
+        astrea.load_paroquant_import_module = lambda: ImportStub
+        astrea.load_paroquant_oracle_module = lambda: OracleStub
+
+        code, stdout, stderr = astrea.main_for_test(
+            ["paro-probe", "--model", "/tmp/paro-src", "--local-only", "--max-modules", "2"]
+        )
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["schema"], astrea.PARO_PROBE_SCHEMA)
+        self.assertEqual(calls[-1], ("probe", "/tmp/paro-src", True, 2))
+
+        code, stdout, stderr = astrea.main_for_test(
+            [
+                "paro-import",
+                "--model",
+                "/tmp/paro-src",
+                "--output",
+                "/tmp/out.hfq",
+                "--local-only",
+                "--max-modules",
+                "3",
+                "--layout",
+                "engine",
+                "--copy-floats",
+                "q8",
+            ]
+        )
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["schema"], astrea.PARO_IMPORT_SCHEMA)
+        self.assertEqual(payload["layout"], "engine")
+        self.assertEqual(calls[-1], ("import", "/tmp/paro-src", "/tmp/out.hfq", True, 3, "engine", "q8"))
+
+        code, stdout, stderr = astrea.main_for_test(
+            [
+                "paro-oracle",
+                "--source",
+                "/tmp/paro-src",
+                "--hfq",
+                "/tmp/out.hfq",
+                "--module",
+                "model.layers.0.mlp.gate_proj",
+                "--local-only",
+                "--samples",
+                "4",
+                "--seed",
+                "7",
+                "--input-scale",
+                "0.25",
+                "--atol",
+                "0.001",
+            ]
+        )
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["schema"], "hipfire.astrea.paro_oracle.v0")
+        self.assertEqual(payload["module"], "model.layers.0.mlp.gate_proj")
+        oracle_call = calls[-1]
+        self.assertEqual(oracle_call[0], "oracle")
+        self.assertTrue(oracle_call[1]["local_only"])
+        self.assertEqual(oracle_call[1]["samples"], 4)
+        self.assertEqual(oracle_call[1]["seed"], 7)
 
     def test_cli_policy_emits_json(self):
         astrea = load_astrea()
