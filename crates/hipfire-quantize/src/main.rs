@@ -5240,8 +5240,10 @@ fn run_gguf_pipeline(
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
                 GgufFormat::Mq4Lloyd => {
-                    let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
+                    // Promote6 -> MQ6, consistent with default_promote_target
+                    // (Mq4Lloyd -> Mq6) and the Lloyd siblings above.
+                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
                 }
                 GgufFormat::F16 | GgufFormat::Bf16 => {
                     let f16_bytes = f32_slice_to_f16_bytes(&f32_data);

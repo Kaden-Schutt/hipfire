@@ -71,6 +71,7 @@ if [ "$rebuild" -eq 1 ]; then
         exit 2
     fi
 fi
+binary_md5=$(md5sum "$EXE" | awk '{print $1}')
 
 # ── GPU lock ──────────────────────────────────────────────────────────────
 if [ -r "$LOCK_SCRIPT" ]; then
@@ -98,6 +99,7 @@ SHORT_TESTS=(
     # Verifies WMMA prefill family + K4-unroll decode + fused residual all
     # dispatch and stay coherent. Same prompts as the MQ4 rows so output
     # drift between bit-widths is comparable.
+    "qwen3.5-4b.mq3|cap-mq3-4b|What is the capital of France? Answer in one short sentence.|80"
     "qwen3.5-9b.mq3|reason-mq3|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     "qwen3.5-27b.mq3|cap-mq3-27b|What is the capital of France? Answer in one short sentence.|80"
     # LFM2.5-8B-A1B (arch_id 11, hipfire-arch-lfm2moe): hybrid 18 short-conv + 6
@@ -142,6 +144,7 @@ SHORT_TESTS=(
     # defaults don't disturb the mq6 dispatch routing. Skipped if model
     # absent (download via `hipfire pull qwen3.5-9b.mq6`).
     "qwen3.5-9b.mq6|reason-mq6|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    "qwen3.5-27b.mq6|cap-mq6-27b|What is the capital of France? Answer in one short sentence.|80"
     # MQ3-AWQ coverage — regression catcher for the 2026-05-18 loader bug
     # where `qwen35.rs:907` gated AWQ-sidecar attachment on
     # `matches!(wt.gpu_dtype, DType::MQ4G256)` and silently dropped sidecars
@@ -175,6 +178,16 @@ SHORT_TESTS=(
 FULL_EXTRA=(
     "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
     "qwen3.6-35b-a3b.mq4|moe36-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
+    # MQ6 A3B coverage — same prompts as the MQ4 MoE rows. These rows are
+    # the first promotion-facing coherence check for gfx1151 MQ6 routed
+    # expert prefill/decode; they do not prove KLD/PPL or perf parity.
+    "qwen3.5-35b-a3b.mq6|moe-mq6-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
+    "qwen3.6-35b-a3b.mq6|moe36-mq6-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
+    # MQ3 A3B coverage — same prompts as the MQ4/MQ6 MoE rows. These rows
+    # exercise routed-expert prefill/decode for the size-gated MQ3 lane; they
+    # are coherence evidence only and do not prove KLD/PPL or DFlash readiness.
+    "qwen3.5-35b-a3b.mq3|moe-mq3-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
+    "qwen3.6-35b-a3b.mq3|moe36-mq3-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
     "qwen3.6-27b.mq4|tool-call-27b|What does the file /tmp/fibonacci.c contain?|220|tool_call_system.txt"
     # DeepSeek V4 Flash (arch_id=9, hipfire-arch-deepseek4). Loads the
     # 80 GB base from the MTP-sidecar split + the MTP addon via
@@ -205,6 +218,7 @@ hard_errors=0
     echo "- branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
     echo "- date:   $(date -Iseconds)"
     echo "- mode:   $( [ "$FULL" -eq 1 ] && echo full || echo short )"
+    echo "- binary: \`$EXE\` (md5: \`$binary_md5\`)"
     echo
     echo "Review each output for coherence (fluent English, on-topic, not stuck"
     echo "in verbatim loops). Hard errors fail the gate; soft output changes do not."
@@ -226,6 +240,7 @@ for entry in "${tests[@]}"; do
     # are reformatting-sensitive, breaking byte-identical reproduction).
     prompt_md5=""
     prompt_ref=""
+    prompt_path=""
     if [ "${prompt:0:1}" = "@" ]; then
         prompt_ref="${prompt:1}"
         prompt_path="benchmarks/prompts/$prompt_ref"
@@ -233,17 +248,20 @@ for entry in "${tests[@]}"; do
             echo "## $model_file — $prompt_id — SKIPPED (prompt file $prompt_path not found)" >> "$OUT"
             continue
         fi
-        prompt=$(cat "$prompt_path")
         prompt_md5=$(md5sum "$prompt_path" | awk '{print $1}')
+    else
+        prompt_md5=$(printf '%s' "$prompt" | md5sum | awk '{print $1}')
     fi
 
     # Optional system prompt: load from benchmarks/prompts/ if specified
     # in the test entry. Used for tool-call shape coverage (#87) where the
     # system block contains the tools <tools>...</tools> definition.
     system_json=""
+    system_md5=""
     if [ -n "${system_file:-}" ]; then
         system_path="benchmarks/prompts/$system_file"
         if [ -f "$system_path" ]; then
+            system_md5=$(md5sum "$system_path" | awk '{print $1}')
             system_text=$(python3 -c "import sys,json; print(json.dumps(open(sys.argv[1]).read()))" "$system_path")
             system_json=",\"system\":${system_text}"
         else
@@ -260,7 +278,11 @@ for entry in "${tests[@]}"; do
     # those).
     in_file="/tmp/coh_in_$$.jsonl"
     out_file="/tmp/coh_out_$$.log"
-    prompt_json=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$prompt")
+    if [ -n "$prompt_path" ]; then
+        prompt_json=$(python3 -c "import sys,json,pathlib; print(json.dumps(pathlib.Path(sys.argv[1]).read_text()))" "$prompt_path")
+    else
+        prompt_json=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$prompt")
+    fi
     cat > "$in_file" <<JL
 {"type":"load","model":"$model_path","params":{"max_seq":4096}}
 {"type":"generate","id":"r1","prompt":${prompt_json},"temperature":0.0,"max_tokens":$max_tok,"repeat_penalty":1.05${system_json}}
@@ -353,9 +375,17 @@ print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))'
             echo "- stats: \`$done_line\`"
         fi
         if [ -n "$prompt_md5" ]; then
-            echo "- prompt: \`@$prompt_ref\` (md5: \`$prompt_md5\`)"
+            if [ -n "$prompt_ref" ]; then
+                echo "- prompt: \`@$prompt_ref\` (md5: \`$prompt_md5\`)"
+            else
+                echo "- prompt: inline (md5: \`$prompt_md5\`)"
+                echo "- prompt_text: \"$prompt\""
+            fi
         else
             echo "- prompt: \"$prompt\""
+        fi
+        if [ -n "${system_file:-}" ]; then
+            echo "- system: \`@$system_file\` (md5: \`$system_md5\`)"
         fi
         echo
         if [ -n "$panic" ]; then

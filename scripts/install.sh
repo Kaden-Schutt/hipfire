@@ -372,7 +372,7 @@ fi
 
 TARGET_DIR=$(cd "$REPO_DIR" && cargo metadata --format-version 1 | grep -oE '"target_directory" *: *"[^"]+"' | cut -d ':' -f 2- | tr -d '"')
 
-if [ -f "$TARGET_DIR/release/examples/daemon" ]; then
+if [ -f "$TARGET_DIR/release/examples/daemon" ] && [ -f "$TARGET_DIR/release/hipfire-eval" ]; then
     echo "  Pre-built binaries found ✓"
 else
     echo "  No pre-built binaries. Building from source..."

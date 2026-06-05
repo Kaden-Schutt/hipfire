@@ -293,6 +293,8 @@ fn main() {
         top_p,
         repeat_penalty,
         repeat_window: repeat_buf_cap.min(repeat_window),
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         blocked_tokens: Vec::new(),
     };
     let mut rng_state_u32: u32 = rng_state;

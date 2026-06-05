@@ -34,7 +34,7 @@
 use hipfire_arch_qwen35::pflash::{
     self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind,
 };
-use hipfire_arch_qwen35::qwen35::{self, DeltaNetState};
+use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, StateQuant};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
 use std::fs;
@@ -60,6 +60,17 @@ fn md5_hex(bytes: &[u8]) -> String {
 fn md5_file(path: &Path) -> String {
     let bytes = fs::read(path).unwrap_or_default();
     md5_hex(&bytes)
+}
+
+fn parse_state_quant(mode: Option<&str>) -> Result<StateQuant, String> {
+    match mode.unwrap_or("q8").to_ascii_lowercase().as_str() {
+        "" | "auto" | "q8" | "int8" => Ok(StateQuant::Q8),
+        "fp32" | "f32" => Ok(StateQuant::FP32),
+        "q4" | "int4" => Ok(StateQuant::Q4),
+        other => Err(format!(
+            "unsupported --state-quant '{other}' (expected q8|fp32|q4)"
+        )),
+    }
 }
 
 fn extract_string_field(text: &str, key: &str) -> Option<String> {
@@ -273,7 +284,8 @@ fn main() {
     if args.len() < 3 {
         eprintln!(
             "Usage: pflash_niah_bench <model.hfq> <fixture.jsonl> \
-                   [--maxgen N] [--q8kv|--asym3] [--pretok|--write-pretok] \
+                   [--maxgen N] [--q8kv|--asym3] [--state-quant q8|fp32|q4] \
+                   [--pretok|--write-pretok] \
                    [--pflash <drafter.hfq> [--keep-ratio K] [--block-size B] \
                    [--sink-tokens N] [--recent-tokens N]]"
         );
@@ -290,6 +302,14 @@ fn main() {
         Some(name) => name.to_string(),
         None if use_q8 => "q8".to_string(),
         None => "asym3".to_string(),
+    };
+    let state_quant_arg: Option<String> = parse_arg(&args, "--state-quant");
+    let state_quant = match parse_state_quant(state_quant_arg.as_deref()) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("FAIL: {e}");
+            std::process::exit(2);
+        }
     };
     let drafter_path: Option<String> = args
         .iter()
@@ -331,6 +351,7 @@ fn main() {
     eprintln!("fixture: {fixture_path}");
     eprintln!("maxgen:  {max_gen}");
     eprintln!("kv mode: {kv_label}");
+    eprintln!("state:   {state_quant:?}");
     eprintln!("target dev: {target_device}");
     if let Some(d) = &drafter_path {
         eprintln!("drafter: {d}");
@@ -764,7 +785,8 @@ fn main() {
         .expect("kv fwht2"),
         other => panic!("unknown --kv-mode: {other} (q8|asym4|asym3|asym2|fwht4|fwht3|fwht2)"),
     };
-    let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn_state");
+    let mut dn_state =
+        DeltaNetState::new_with_quant(&mut gpu, &config, state_quant).expect("dn_state");
     let scratch =
         qwen35::Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).expect("scratch");
 
