@@ -44,6 +44,9 @@ pub enum FusedQkvVariant {
     Qkv,
     Qkvza,
     GateUp,
+    QkvParo,
+    QkvzaParo,
+    GateUpParo,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -196,6 +199,10 @@ pub enum KernelKey {
     FusedGateUpMq4G256Lloyd,
     FusedGateUpHfq6G256,
     FusedGateUpQ4K,
+    // Fused Paro (4G128T)
+    FusedGateUpParo4G128T,
+    FusedQkvzaParo4G128T,
+    FusedQkvParo4G128T,
     // Rotation
     RotateMq,
     RotateMqG128,

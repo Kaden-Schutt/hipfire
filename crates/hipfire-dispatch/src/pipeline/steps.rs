@@ -82,6 +82,19 @@ fn gemv_steps_uniform(steps: &[Step], dtype: DType, require_no_awq: bool) -> boo
     })
 }
 
+/// True if all Gemv steps in the window (indices 1..) have:
+/// - the given dtype
+/// - GemvInput::Raw (Paro uses Raw because the kernel rotates internally)
+/// - awq_scale == None
+fn gemv_steps_uniform_raw(steps: &[Step], dtype: DType) -> bool {
+    steps[1..].iter().all(|s| match s {
+        Step::Gemv { w, input: GemvInput::Raw(_), .. } => {
+            w.dtype == dtype && w.awq_scale.is_none()
+        }
+        _ => false,
+    })
+}
+
 /// True if ctx has dp4a and !force_unfused.
 fn dp4a_eligible(ctx: &DispatchCtx) -> bool {
     !ctx.flags.force_unfused && ctx.arch.gemv_dp4a_enabled()
@@ -176,6 +189,44 @@ pub(crate) fn guard_gate_up_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool 
         && gemv_steps_uniform(steps, dt, true)
 }
 
+// ── Paro fused guards (Raw input — kernel rotates internally) ──
+
+pub(crate) fn guard_gate_up_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    if steps.len() != 3 { return false; }
+    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    dt == DType::ParoQ4G128
+        && gemv_steps_uniform_raw(steps, DType::ParoQ4G128)
+        && steps[1..].iter().all(|s| match s {
+            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0,
+            _ => false,
+        })
+}
+
+pub(crate) fn guard_qkvza_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    if steps.len() != 5 { return false; }
+    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    dt == DType::ParoQ4G128
+        && gemv_steps_uniform_raw(steps, DType::ParoQ4G128)
+        && steps[1..].iter().all(|s| match s {
+            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0,
+            _ => false,
+        })
+}
+
+pub(crate) fn guard_qkv_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    if steps.len() != 4 { return false; }
+    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    dt == DType::ParoQ4G128
+        && gemv_steps_uniform_raw(steps, DType::ParoQ4G128)
+        && steps[1..].iter().all(|s| match s {
+            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0,
+            _ => false,
+        })
+}
+
 pub struct FusedPattern {
     pub ops: &'static [PipelineOp],
     pub key: KernelKey,
@@ -232,6 +283,10 @@ const FUSED_TABLE: &[FusedPattern] = &[
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMq3G256Lloyd, guard: guard_gate_up_mq3g256lloyd },
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpHfq4G256,     guard: guard_gate_up_hfq4g256     },
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpHfq6G256,     guard: guard_gate_up_hfq6g256     },
+    // ── Paro fused Paro4G128T (dp4a, Raw input) ────────────────────────
+    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpParo4G128T,   guard: guard_gate_up_paro4g128t },
+    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaParo4G128T,     guard: guard_qkvza_paro4g128t },
+    FusedPattern { ops: QKV3,   key: KernelKey::FusedQkvParo4G128T,       guard: guard_qkv_paro4g128t },
 ];
 static GEMV: OnceLock<GemvFamily> = OnceLock::new();
 static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
@@ -424,6 +479,102 @@ fn launch_fused(
                 rot_scratch: &[],
             })
         }
+
+        // ── Paro fused Paro4G128T ────────────────────────────────────────
+        // For all three Paro fused keys, we allocate rotation scratch from
+        // gpu.scratch.paro_fused_scratch (4 × [k] F32 buffers). The QKVZA
+        // path passes all 4; the QKV (3-way) passes 4 with m3=0 via aliasing;
+        // the gate+up path passes 1 (x_rot_gate), with the kernel using
+        // gpu.scratch.mq_x_rot internally for x_rot_up.
+        //
+        // Build aliased GpuTensor descriptors before the mutable borrow of
+        // gpu (fused_qkv.run takes &mut Gpu). DeviceBuffer::alias() creates
+        // an owned descriptor over the same VRAM — no Rust borrow held.
+        KernelKey::FusedGateUpParo4G128T => {
+            let (wg, gate) = gemv_weight_out(&steps[1]);
+            let (wu, up)   = gemv_weight_out(&steps[2]);
+            let k = wg.k;
+            gpu.ensure_paro_fused_scratch(k)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            // Also ensure mq_x_rot >= k (the kernel aliases it for x_rot_up).
+            gpu.ensure_mq_signs()
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            let rot_aliases: Vec<GpuTensor> = gpu.scratch.paro_fused_scratch.as_ref().unwrap()
+                .iter()
+                .map(|t| GpuTensor {
+                    buf: unsafe { t.buf.alias() },
+                    shape: t.shape.clone(),
+                    dtype: t.dtype,
+                })
+                .collect();
+            #[cfg(debug_assertions)]
+            {
+                let gate_buf = &gpu.scratch.paro_fused_scratch.as_ref().unwrap()[0];
+                let up_internal = gpu.scratch.mq_x_rot.as_ref().unwrap();
+                debug_assert!(gate_buf.buf.as_ptr() != up_internal.buf.as_ptr(),
+                    "Paro gate+up: x_rot_gate must not alias mq_x_rot");
+            }
+            fused_qkv.run(ctx, gpu, &FusedQkvParams {
+                kind: key,
+                weights: &[wg.buf, wu.buf],
+                x: activated,
+                outputs: &[gate, up],
+                m: &[wg.m, wu.m],
+                k,
+                rot_scratch: &rot_aliases,
+            })
+        }
+        KernelKey::FusedQkvzaParo4G128T => {
+            let (wqkv, qkv)   = gemv_weight_out(&steps[1]);
+            let (wz, z)       = gemv_weight_out(&steps[2]);
+            let (wb, beta)    = gemv_weight_out(&steps[3]);
+            let (wa, alpha)   = gemv_weight_out(&steps[4]);
+            let k = wqkv.k;
+            gpu.ensure_paro_fused_scratch(k)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            let rot_aliases: Vec<GpuTensor> = gpu.scratch.paro_fused_scratch.as_ref().unwrap()
+                .iter()
+                .map(|t| GpuTensor {
+                    buf: unsafe { t.buf.alias() },
+                    shape: t.shape.clone(),
+                    dtype: t.dtype,
+                })
+                .collect();
+            fused_qkv.run(ctx, gpu, &FusedQkvParams {
+                kind: key,
+                weights: &[wqkv.buf, wz.buf, wb.buf, wa.buf],
+                x: activated,
+                outputs: &[qkv, z, beta, alpha],
+                m: &[wqkv.m, wz.m, wb.m, wa.m],
+                k,
+                rot_scratch: &rot_aliases,
+            })
+        }
+        KernelKey::FusedQkvParo4G128T => {
+            let (wq, q) = gemv_weight_out(&steps[1]);
+            let (wk, k) = gemv_weight_out(&steps[2]);
+            let (wv, v) = gemv_weight_out(&steps[3]);
+            let kk = wq.k;
+            gpu.ensure_paro_fused_scratch(kk)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            let rot_aliases: Vec<GpuTensor> = gpu.scratch.paro_fused_scratch.as_ref().unwrap()
+                .iter()
+                .map(|t| GpuTensor {
+                    buf: unsafe { t.buf.alias() },
+                    shape: t.shape.clone(),
+                    dtype: t.dtype,
+                })
+                .collect();
+            fused_qkv.run(ctx, gpu, &FusedQkvParams {
+                kind: key,
+                weights: &[wq.buf, wk.buf, wv.buf],
+                x: activated,
+                outputs: &[q, k, v],
+                m: &[wq.m, wk.m, wv.m],
+                k: kk,
+                rot_scratch: &rot_aliases,
+            })
+        }
         _ => Err(DispatchError::MissingImpl { key }),
     }
 }
@@ -554,5 +705,55 @@ mod tests {
         // dp4a key: just verify no panic
         let _ = family.resolve(KernelKey::FusedQkvzaHfq6G256, &ctx1100, None);
         let _ = family.resolve(KernelKey::FusedQkvzaHfq6G256, &ctx1201, None);
+    }
+
+    #[test]
+    fn paro_guards_reject_force_unfused() {
+        let ctx = DispatchCtx::for_test("gfx1100");
+        let empty: &[Step] = &[];
+        assert!(!guard_gate_up_paro4g128t(empty, &ctx), "force_unfused must reject gate_up_paro");
+        assert!(!guard_qkvza_paro4g128t(empty, &ctx), "force_unfused must reject qkvza_paro");
+        assert!(!guard_qkv_paro4g128t(empty, &ctx), "force_unfused must reject qkv_paro");
+    }
+
+    #[test]
+    fn paro_guards_require_raw_input_and_alignment() {
+        // Paro guards require GemvInput::Raw (not Prerotated) and m%8==0/k%128==0.
+        // We can't construct real Gemv steps with GPU tensors in a unit test,
+        // but we can verify the guards reject empty/wrong-length slices.
+        let ctx = DispatchCtx::for_test("gfx1100");
+        let empty: &[Step] = &[];
+        assert!(!guard_gate_up_paro4g128t(empty, &ctx));
+        assert!(!guard_qkvza_paro4g128t(empty, &ctx));
+        assert!(!guard_qkv_paro4g128t(empty, &ctx));
+    }
+
+    #[test]
+    fn paro_fused_table_entries_exist() {
+        let keys: Vec<_> = FUSED_TABLE.iter().map(|e| e.key).collect();
+        assert!(keys.contains(&KernelKey::FusedGateUpParo4G128T), "FusedGateUpParo4G128T missing from FUSED_TABLE");
+        assert!(keys.contains(&KernelKey::FusedQkvzaParo4G128T), "FusedQkvzaParo4G128T missing from FUSED_TABLE");
+        assert!(keys.contains(&KernelKey::FusedQkvParo4G128T),   "FusedQkvParo4G128T missing from FUSED_TABLE");
+    }
+
+    #[test]
+    fn paro_fused_table_arch_coverage() {
+        let family = FusedQkvFamily::new();
+        let ctx1100 = DispatchCtx::for_test("gfx1100");
+        let ctx1201 = DispatchCtx::for_test("gfx1201");
+
+        let paro_keys = &[
+            KernelKey::FusedGateUpParo4G128T,
+            KernelKey::FusedQkvzaParo4G128T,
+            KernelKey::FusedQkvParo4G128T,
+        ];
+
+        for &key in paro_keys {
+            // Paro uses dp4a — should resolve on gfx1100 (RDNA3) and gfx1201 (RDNA4).
+            assert!(family.resolve(key, &ctx1100, None).is_ok(),
+                "Paro key {:?} should resolve on gfx1100", key);
+            assert!(family.resolve(key, &ctx1201, None).is_ok(),
+                "Paro key {:?} should resolve on gfx1201", key);
+        }
     }
 }

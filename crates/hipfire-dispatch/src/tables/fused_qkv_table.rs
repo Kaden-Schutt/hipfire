@@ -45,6 +45,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedGateUpMq4G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedGateUpHfq6G256,     ArchPredicate::GemvDp4a),
         (KernelKey::FusedGateUpQ4K,          ArchPredicate::Always),
+        (KernelKey::FusedGateUpParo4G128T,   ArchPredicate::HasDp4a),
     ];
     for &(key, arch) in gate_up_variants {
         registry.register(KernelVariant {
@@ -55,5 +56,32 @@ pub fn populate(registry: &mut KernelRegistry) {
             has_awq: false,
         });
     }
-}
 
+    // ── Fused QKVZA Paro4G128T (dp4a) ────────────────────────────
+    let qkvza_paro_variants: &[(KernelKey, ArchPredicate)] = &[
+        (KernelKey::FusedQkvzaParo4G128T, ArchPredicate::HasDp4a),
+    ];
+    for &(key, arch) in qkvza_paro_variants {
+        registry.register(KernelVariant {
+            key,
+            arch_required: arch,
+            shape_gate: None,
+            steps: &[PipelineOp::Gemv],
+            has_awq: false,
+        });
+    }
+
+    // ── Fused QKV Paro4G128T (3-way FullAttn, dp4a) ─────────────
+    let qkv_paro_variants: &[(KernelKey, ArchPredicate)] = &[
+        (KernelKey::FusedQkvParo4G128T, ArchPredicate::HasDp4a),
+    ];
+    for &(key, arch) in qkv_paro_variants {
+        registry.register(KernelVariant {
+            key,
+            arch_required: arch,
+            shape_gate: None,
+            steps: &[PipelineOp::Gemv],
+            has_awq: false,
+        });
+    }
+}
