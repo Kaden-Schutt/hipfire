@@ -20,6 +20,29 @@ fn main() {
     use std::path::Path;
     use std::time::Instant;
 
+    fn print_usage() {
+        println!(
+            "Usage: run <model.hfq> [options]\n\
+             \n\
+             Options:\n\
+               --draft-model <path>       DFlash/MTP draft model path\n\
+               --system, -s <prompt>      system prompt\n\
+               --kv <q8|givens4|givens2>  KV cache mode (default: q8)\n\
+               --temp <float>             sampling temperature (default: 0.3)\n\
+               --max-seq <n>              context length (default: 4096)\n\
+               --prompt-file <path>       run one prompt non-interactively\n\
+               --max-tokens, --max <n>    max generated tokens for --prompt-file\n\
+               --session-reset-smoke      run the session reset smoke test\n\
+               --fp32-state               use FP32 DeltaNet state\n\
+               --q8-state                 use Q8 DeltaNet state (default)\n\
+               --q4-state                 use Q4 DeltaNet state\n\
+               --speculative              enable speculative draft path\n\
+               --spec-k <n>               speculative draft count (default: 4)\n\
+               --no-penalty               disable repetition penalty\n\
+               --help, -h                 print this help"
+        );
+    }
+
     fn hfq_parameter_count(hfq: &HfqFile) -> u128 {
         hfq.tensors()
             .iter()
@@ -309,8 +332,12 @@ fn main() {
     }
 
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_usage();
+        return;
+    }
     if args.len() < 2 {
-        eprintln!("Usage: run <model.hfq> [--draft-model <path>] [--system \"prompt\"] [--kv givens4|givens2] [--temp F] [--max-seq N] [--prompt-file path --max-tokens N] [--session-reset-smoke] [--fp32-state|--q8-state|--q4-state]");
+        print_usage();
         std::process::exit(1);
     }
     let model_path = &args[1];

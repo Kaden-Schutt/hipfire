@@ -767,6 +767,19 @@ fn report_gpu_init_failure(err: &hip_bridge::HipError) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "Usage: daemon [options]\n\
+             \n\
+             Reads JSON requests from stdin and writes JSON events to stdout.\n\
+             \n\
+             Options:\n\
+               --precompile        compile/cache kernels for the current GPU and exit\n\
+               --help, -h          print this help"
+        );
+        return;
+    }
+
     // --precompile: compile all kernels for this GPU, write hash files, exit.
     // Used by scripts/install.sh and `hipfire update` so first `hipfire run`
     // isn't a 2-minute hipcc wait.
