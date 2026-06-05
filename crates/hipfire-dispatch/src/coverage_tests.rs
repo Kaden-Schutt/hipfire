@@ -25,6 +25,7 @@
 //! #397 Phase-0.4 should adopt — a single coverage gate over (op × dtype × arch).
 
 use crate::context::DispatchCtx;
+use crate::families::moe::{MoeDtypes, MoeResolution};
 use crate::types::*;
 use rdna_compute::DType::{self, *};
 
@@ -173,6 +174,79 @@ fn confirmed_oproj_dtypes_have_a_plan() {
             d
         );
     }
+}
+
+/// LAYER 1d — MoE CPU-top-K fallback coverage (catches the #393 regression).
+/// `run_moe_decode`'s GPU-top-K fast path only serves `k == 8` MoE layers whose
+/// routed experts are `{MQ4G256, MQ6G256, ParoQ4G128}`. Every OTHER MoE layer
+/// (`k != 8`, or a routed dtype like Q8_0) MUST take the generic CPU-top-K
+/// per-expert fallback — #393 deleted that fallback so those layers hit
+/// `UnsupportedVariant{cpu-topk-fallback}` and HARD-PANIC on decode.
+///
+/// GPU-free assertion in two parts, mirroring the runtime guarantees:
+///   (a) The eligibility lattice routes these layers to the fallback, NOT the
+///       k8 indexed path: `MoeResolution::resolve(..).use_gpu_topk == false`.
+///   (b) The fallback's per-expert loop dispatches gate_up + down through
+///       `GemvFamily::run_auto`, so the routed dtype MUST have a plain-GEMV
+///       dispatch plan (else `run_auto` → `UnsupportedVariant`).
+#[test]
+fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
+    // A representative non-indexable / non-k8 MoE matrix the fallback must serve.
+    // (router/shared dtypes don't gate the fallback decision — only k + routed do.)
+    struct MoeUse {
+        name: &'static str,
+        routed_gate_up: DType,
+        routed_down: DType,
+        k: usize,
+    }
+    let mut failures = Vec::new();
+    for u in [
+        // Q8-routed experts, k=8 → not indexable → CPU-top-K fallback.
+        MoeUse { name: "q8-routed-moe (k=8)", routed_gate_up: Q8_0, routed_down: Q8_0, k: 8 },
+        // MQ4 routed but k != 8 → k8 indexed kernels unusable → fallback.
+        MoeUse { name: "mq4-routed-moe (k=4)", routed_gate_up: MQ4G256, routed_down: MQ4G256, k: 4 },
+        // F32 routed experts, k=2 → fallback.
+        MoeUse { name: "f32-routed-moe (k=2)", routed_gate_up: F32, routed_down: F32, k: 2 },
+    ] {
+        let d = MoeDtypes {
+            router: Q8_0,
+            shared_gate: Q8_0,
+            shared_expert_gate: Q8_0,
+            shared_expert_up: Q8_0,
+            experts_all_gate_up_mq4: u.routed_gate_up == MQ4G256,
+            routed_gate_up: u.routed_gate_up,
+            routed_down: u.routed_down,
+            has_paro_shared: false,
+        };
+        let res = MoeResolution::resolve(&d, u.k);
+        // (a) These layers MUST take the fallback, not the k8 indexed path.
+        if res.use_gpu_topk {
+            failures.push(format!(
+                "  {}: resolved to GPU-top-K (use_gpu_topk=true) but routed dtype/k is non-indexable",
+                u.name
+            ));
+        }
+        // (b) The fallback's run_auto needs a plain-GEMV plan for both halves.
+        if !KernelKey::for_gemv(u.routed_gate_up, GemvVariant::Plain, false).is_ok() {
+            failures.push(format!(
+                "  {}: routed gate_up {:?} has no plain GEMV → fallback run_auto → UnsupportedVariant panic",
+                u.name, u.routed_gate_up
+            ));
+        }
+        if !KernelKey::for_gemv(u.routed_down, GemvVariant::Plain, false).is_ok() {
+            failures.push(format!(
+                "  {}: routed down {:?} has no plain GEMV → fallback run_auto → UnsupportedVariant panic",
+                u.name, u.routed_down
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\n{} non-k8 / non-indexable-routed MoE layers would HARD-PANIC \
+         (the #393 cpu-topk-fallback regression):\n{}\n",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 /// LAYER 1c — Q8/Paro were gapped in MULTIPLE GEMV variants: o_proj used Residual,

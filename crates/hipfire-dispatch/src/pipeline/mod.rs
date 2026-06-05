@@ -202,12 +202,20 @@ pub fn run_moe_decode(gpu: &mut Gpu, p: &crate::families::moe::MoeParams) -> Res
         gemv.run_auto(&ctx, gpu, &p.shared_up_w,       p.x_norm, &shared_up).map_err(|e| DispatchError::Hip(e.to_string()))?;
     }
 
-    // ── Top-K (GPU path only in Phase 1) ─────────────────────────────────────
+    // ── Top-K + routed experts: CPU-top-K generic fallback ───────────────────
+    // Fires when `!use_gpu_topk` (k != 8 OR routed dtype not indexable). This
+    // ports master's `moe_ffn_decode_impl` CPU-fallback per-expert loop
+    // (origin/master qwen35.rs, the `else` arm of `if use_gpu_topk`) so MoE
+    // layers outside the {k=8, MQ4G256|MQ6G256|ParoQ4G128-routed} fast path
+    // run instead of hard-panicking. #393 deleted this; restoring it keeps the
+    // dispatch migration behavior-preserving.
+    //
+    // The fallback is self-contained: it does softmax → CPU top-K + renorm →
+    // shared-expert down → generic per-expert routed loop, then returns. It
+    // does NOT fall through to the indexed GPU-top-K path below (which assumes
+    // k=8 + an indexable routed dtype).
     if !res.use_gpu_topk {
-        return Err(DispatchError::UnsupportedVariant {
-            family: "moe", variant: "cpu-topk-fallback",
-            arch: "", quant: "",
-        });
+        return run_moe_decode_cpu_fallback(gpu, p, &shared_gate, &shared_up);
     }
     // DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
     if let Ok(dump_path) = std::env::var("HIPFIRE_DUMP_HIDDEN") {
@@ -328,6 +336,131 @@ pub fn run_moe_decode(gpu: &mut Gpu, p: &crate::families::moe::MoeParams) -> Res
     }
 
     hip!(gpu.moe_down_combine_k8_batched(p.down_expanded, p.topk_weights, p.x_residual, down_m, p.k, 1))?;
+
+    Ok(())
+}
+
+/// Generic CPU-top-K MoE decode fallback. Restores the per-expert loop #393
+/// deleted from `moe_ffn_decode_impl` (origin/master qwen35.rs). Fires for any
+/// MoE layer the GPU-top-K fast path can't serve: `k != 8`, or a routed expert
+/// dtype outside `{MQ4G256, MQ6G256, ParoQ4G128}` (e.g. a Q8-routed MoE).
+///
+/// Sequence mirrors master exactly:
+///   1. softmax(router_logits)
+///   2. download probs → CPU top-K select + sort + renorm
+///   3. shared-expert down (identical to the GPU-top-K path's shared-down block)
+///   4. per-expert routed loop: gate_up GEMV → silu·mul → down GEMV → scaled add
+///
+/// Step 4 uses `GemvFamily::run_auto`, which is the dispatch-crate equivalent of
+/// master's `weight_gemv`: it auto-rotates (FWHT for MQ family / Givens for Paro)
+/// when the routed dtype requires it, and runs plain otherwise — so this single
+/// loop covers every routed dtype, matching master's generic `weight_gemv` arm.
+///
+/// `shared_gate` / `shared_up` are the gate-side GEMV outputs computed by the
+/// caller (`run_moe_decode`), passed through so the shared-expert math is shared.
+fn run_moe_decode_cpu_fallback(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeParams,
+    shared_gate: &GpuTensor,
+    shared_up: &GpuTensor,
+) -> Result<(), DispatchError> {
+    macro_rules! hip {
+        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+    }
+
+    // Per-expert weights are required to iterate (master indexed
+    // `ffn.experts[expert_idx]`). They are empty under paged residency, where
+    // only the indexed GPU-top-K path is supported — same invariant as master.
+    if p.routed_experts.is_empty() {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe", variant: "cpu-topk-fallback-needs-resident-experts",
+            arch: "", quant: "",
+        });
+    }
+
+    let k = p.k;
+    let mi = p.mi;
+    let n_exp = p.n_exp;
+
+    // ── 1+2. softmax → CPU top-K + renorm (verbatim from master) ──────────────
+    hip!(gpu.softmax_f32(p.router_logits))?;
+    let probs = hip!(gpu.download_f32(p.router_logits))?;
+    let mut indices: Vec<usize> = (0..n_exp).collect();
+    indices.select_nth_unstable_by(k - 1, |&a, &b| {
+        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut topk_indices: Vec<usize> = indices.into_iter().take(k).collect();
+    topk_indices.sort_by(|&a, &b| {
+        probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut topk_weights: Vec<f32> = topk_indices.iter().map(|&i| probs[i]).collect();
+    if p.norm_topk_prob {
+        let sum: f32 = topk_weights.iter().sum();
+        if sum > 0.0 {
+            for w in topk_weights.iter_mut() { *w /= sum; }
+        }
+    }
+
+    // ── 3. Shared-expert down (identical to the GPU-top-K shared-down block) ──
+    if p.shared_down_w.dtype == DType::MQ4G256 {
+        hip!(gpu.ensure_mq_signs())?;
+        let x_rot_alias = unsafe { GpuTensor {
+            buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
+            shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+            dtype: DType::F32,
+        }};
+        if let Some(awq) = p.shared_down_w.awq_scale {
+            hip!(gpu.fused_silu_mul_rotate_mq_awq(shared_gate, shared_up, awq, &x_rot_alias, p.smi))?;
+        } else {
+            hip!(gpu.fused_silu_mul_rotate_mq(shared_gate, shared_up, &x_rot_alias, p.smi))?;
+        }
+        hip!(gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
+            &p.shared_down_w.buf, &x_rot_alias, p.x_residual, p.scalar_buf,
+            p.shared_down_w.m, p.shared_down_w.k,
+        ))?;
+    } else {
+        #[cfg(feature = "deltanet")]
+        {
+            hip!(gpu.sigmoid_f32(p.scalar_buf))?;
+            let shared_hid = unsafe { slice_moe_f32_view(p.ffn_hidden, 0, p.smi) };
+            hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
+            static GEMV_DOWN_FB: OnceLock<GemvFamily> = OnceLock::new();
+            let gemv = GEMV_DOWN_FB.get_or_init(GemvFamily::new);
+            let ctx = DispatchCtx::new(gpu);
+            gemv.run_auto(&ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out)?;
+            hip!(gpu.scaled_add_inplace_gpu_scalar_f32(p.x_residual, p.ffn_out, p.scalar_buf))?;
+        }
+        #[cfg(not(feature = "deltanet"))]
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe", variant: "shared-down-non-mq4-requires-deltanet",
+            arch: "", quant: "",
+        });
+    }
+
+    // ── 4. Per-expert routed loop (master's generic `weight_gemv` arm) ────────
+    static GEMV_FB: OnceLock<GemvFamily> = OnceLock::new();
+    let gemv = GEMV_FB.get_or_init(GemvFamily::new);
+
+    for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
+        let (gate_up_w, down_w) = &p.routed_experts[expert_idx];
+
+        // gate_up: y = W·x  (run_auto auto-rotates for MQ/Paro dtypes).
+        {
+            let ctx = DispatchCtx::new(gpu);
+            gemv.run_auto(&ctx, gpu, gate_up_w, p.x_norm, p.gate_up_buf)?;
+        }
+        let gate_view = unsafe { slice_moe_f32_view(p.gate_up_buf, 0, mi) };
+        let up_view = unsafe { slice_moe_f32_view(p.gate_up_buf, mi, mi) };
+
+        // silu(gate)·up → ffn_hidden, then down GEMV, then weighted residual add.
+        let hid_view = unsafe { slice_moe_f32_view(p.ffn_hidden, 0, mi) };
+        hip!(gpu.silu_mul_f32(&gate_view, &up_view, &hid_view))?;
+        {
+            let ctx = DispatchCtx::new(gpu);
+            gemv.run_auto(&ctx, gpu, down_w, &hid_view, p.ffn_out)?;
+        }
+        hip!(gpu.scaled_add_inplace_cpu_scalar_f32(p.x_residual, p.ffn_out, weight))?;
+    }
 
     Ok(())
 }
