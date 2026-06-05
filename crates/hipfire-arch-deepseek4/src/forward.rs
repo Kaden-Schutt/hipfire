@@ -77,12 +77,7 @@ mod env_cache {
     /// debugging or pre-fix-compat builds.
     pub(super) fn mtp_head_hc_on() -> bool {
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| {
-            std::env::var("HIPFIRE_DEEPSEEK4_MTP_HEAD_HC")
-                .ok()
-                .as_deref()
-                != Some("0")
-        })
+        *V.get_or_init(|| std::env::var("HIPFIRE_DEEPSEEK4_MTP_HEAD_HC").ok().as_deref() != Some("0"))
     }
 }
 
@@ -272,7 +267,8 @@ fn gemv_auto_batched_wmma(
                     // are unmeasured and stay on the single-warp path.
                     // Kernel hard requires M%64==0, K%32==0, B%64==0.
                     // Opt out via HIPFIRE_DEEPSEEK4_Q8_4W=0 for diagnosis.
-                    let opt_out = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
+                    let opt_out = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W")
+                        .as_deref() == Ok("0");
                     let use_4w = !opt_out
                         && batch_size >= 256
                         && m >= 4096
@@ -1484,13 +1480,14 @@ pub fn decode_step_with_graph(
     // `HIPFIRE_DEEPSEEK4_GRAPH=0`. Force on for older archs with
     // `HIPFIRE_DEEPSEEK4_GRAPH=1` (untested — beware kernarg-bake regressions).
     static GRAPH_OPT_ENV: OnceLock<Option<bool>> = OnceLock::new();
-    let env_override = *GRAPH_OPT_ENV.get_or_init(|| {
-        match std::env::var("HIPFIRE_DEEPSEEK4_GRAPH").ok().as_deref() {
-            Some("1") => Some(true),
-            Some("0") => Some(false),
-            _ => None,
-        }
-    });
+    let env_override =
+        *GRAPH_OPT_ENV.get_or_init(
+            || match std::env::var("HIPFIRE_DEEPSEEK4_GRAPH").ok().as_deref() {
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                _ => None,
+            },
+        );
     let graph_on = env_override.unwrap_or_else(|| {
         let a = gpu.arch.as_str();
         a.starts_with("gfx11") || a.starts_with("gfx12")
@@ -2197,11 +2194,7 @@ pub fn mtp_forward(
     // purpose there is to write the MTP layer's SWA ring, the logits
     // are never read. Skipping saves the lm_head GEMV + the d2h+sync
     // (line 1991-92 below) that otherwise stalls the stream per call.
-    if std::env::var("HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
+    if std::env::var("HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD").ok().as_deref() == Some("1") {
         return Ok(Vec::new());
     }
     if state.final_norm.is_none() {
@@ -2660,9 +2653,7 @@ fn ffn_stub(
     //      used for shared and routed in upstream model.py.
     if down_needs_fwht {
         gpu.deepseek4_fused_silu_mul_clamp_mq_rotate(gate, up, silu_rot, im, cfg.swiglu_limit)
-            .map_err(|e| {
-                format!("deepseek4_fused_silu_mul_clamp_mq_rotate layer {layer_idx}: {e:?}")
-            })?;
+            .map_err(|e| format!("deepseek4_fused_silu_mul_clamp_mq_rotate layer {layer_idx}: {e:?}"))?;
     } else {
         gpu.deepseek4_silu_mul_clamp_f32(gate, up, gate, cfg.swiglu_limit)
             .map_err(|e| format!("deepseek4_silu_mul_clamp layer {layer_idx}: {e:?}"))?;
@@ -3097,7 +3088,13 @@ fn hc_ffn_mix(
 
 /// We were previously taking ONLY stream 0 for the head — discarding 75%
 /// of the model's output state. This wires the full HC mix.
-fn final_norm_and_head(
+/// Steps 1–4 of the head pipeline (head-HC mix, MTP h_n capture, final
+/// RMSNorm, and the FWHT rotation for an MQ4 head), leaving the pre-lm_head
+/// activation in `state.final_norm` (and `state.final_norm_rot` when the head
+/// needs FWHT). Split out of `final_norm_and_head` so the batched verify path
+/// can run this cheap per-position prologue K times, then issue ONE batched
+/// lm_head GEMV — reading the `[vocab, hidden]` weight once instead of K times.
+fn final_norm_compute(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
@@ -3133,12 +3130,6 @@ fn final_norm_and_head(
                 .map_err(|e| format!("alloc final_norm_rot: {e:?}"))?,
         );
     }
-    if state.logits.is_none() {
-        state.logits = Some(
-            gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)
-                .map_err(|e| format!("alloc logits: {e:?}"))?,
-        );
-    }
     if state.head_hc_pre.is_none() {
         state.head_hc_pre = Some(
             gpu.alloc_tensor(&[cfg.hc_mult], DType::F32)
@@ -3154,7 +3145,6 @@ fn final_norm_and_head(
 
     let final_norm = state.final_norm.as_ref().unwrap();
     let final_norm_rot = state.final_norm_rot.as_ref().unwrap();
-    let logits = state.logits.as_ref().unwrap();
     let head_hc_pre = state.head_hc_pre.as_ref().unwrap();
     let head_hc_out = state.head_hc_out.as_ref().unwrap();
 
@@ -3212,7 +3202,34 @@ fn final_norm_and_head(
             .map_err(|e| format!("rotate_x_mq final_norm: {e:?}"))?;
     }
 
-    // 5. lm_head GEMV. F16 path uses un-rotated final_norm.
+    Ok(())
+}
+
+/// Full per-position head: `final_norm_compute` followed by the lm_head GEMV
+/// into `state.logits`. Behaviour unchanged from before the split.
+fn final_norm_and_head(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    final_norm_compute(cfg, weights, state, gpu)?;
+
+    let head = weights
+        .head
+        .as_ref()
+        .ok_or_else(|| "head not uploaded".to_string())?;
+    if state.logits.is_none() {
+        state.logits = Some(
+            gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)
+                .map_err(|e| format!("alloc logits: {e:?}"))?,
+        );
+    }
+    let final_norm = state.final_norm.as_ref().unwrap();
+    let final_norm_rot = state.final_norm_rot.as_ref().unwrap();
+    let logits = state.logits.as_ref().unwrap();
+
+    // lm_head GEMV. F16 path uses un-rotated final_norm.
     gemv_auto(
         gpu,
         head,
@@ -5339,8 +5356,7 @@ fn attention_block_batched_swa_only(
     // Re-runs the kernel via the debug variant which also writes
     // max_score and sum_exp per (h, b) so we can compare across runs
     // and find which intermediate first diverges.
-    if layer_idx == 0 && std::env::var("HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT").as_deref() == Ok("1")
-    {
+    if layer_idx == 0 && std::env::var("HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT").as_deref() == Ok("1") {
         // Lazy-alloc debug scratch on the GPU on first call.
         let n_h = n_heads;
         let debug_max = gpu
@@ -5435,16 +5451,34 @@ fn attention_block_batched_swa_only(
         DType::Q8_0 => {
             // Q8_0 contract: plain (non-FWHT) input. attn_out_raw_batch
             // is [B, n_heads * head_dim] viewable as [B, G, per_group_in].
-            gpu.wo_per_group_batched_q8_0(
-                wo_a,
-                &pbs.attn_out_raw_batch,
-                &pbs.wo_a_out_batch,
-                n_groups as i32,
-                o_lora_rank as i32,
-                per_group_in as i32,
-                batch_size as i32,
-            )
-            .map_err(|e| format!("wo_per_group_batched_q8_0 l{layer_idx}: {e:?}"))?;
+            // Multi-row variant if HIPFIRE_DEEPSEEK4_WO_MULTIROW=2 or 4.
+            let mr: i32 = std::env::var("HIPFIRE_DEEPSEEK4_WO_MULTIROW")
+                .ok().and_then(|v| v.parse().ok()).filter(|&r| r == 2 || r == 4)
+                .unwrap_or(0);
+            if mr == 0 {
+                gpu.wo_per_group_batched_q8_0(
+                    wo_a,
+                    &pbs.attn_out_raw_batch,
+                    &pbs.wo_a_out_batch,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| format!("wo_per_group_batched_q8_0 l{layer_idx}: {e:?}"))?;
+            } else {
+                gpu.wo_per_group_batched_q8_0_multirow(
+                    wo_a,
+                    &pbs.attn_out_raw_batch,
+                    &pbs.wo_a_out_batch,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    batch_size as i32,
+                    mr,
+                )
+                .map_err(|e| format!("wo_per_group_batched_q8_0_multirow l{layer_idx}: {e:?}"))?;
+            }
         }
         DType::Raw => {
             // MQ4G256 (HFQ4-packed weights, FWHT-rotated input).
@@ -5600,6 +5634,11 @@ fn attention_block_batched_mixed(
     let o_lora_rank = cfg.o_lora_rank;
     let groups_o_lora = n_groups * o_lora_rank;
     let topk_max = cfg.index_topk;
+    let use_topk_direct = ratio == 4
+        && std::env::var("HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT")
+            .map(|s| s != "0")
+            .unwrap_or(gpu.arch == "gfx1151" && batch_size >= 64);
+    let mut topk_direct_n_compressed = 0usize;
 
     // Lazy-alloc SWA rings.
     {
@@ -5697,12 +5736,8 @@ fn attention_block_batched_mixed(
             let n_inputs = (batch_size * hidden) as i64;
             gpu.deepseek4_convert_f32_to_f16(&pbs.tmp_batch, &pbs.tmp_batch_f16, n_inputs)
                 .map_err(|e| format!("convert_f32_to_f16 tmp l{layer_idx}: {e:?}"))?;
-            gpu.deepseek4_convert_f32_to_f16(
-                &pbs.tmp_plain_batch,
-                &pbs.tmp_plain_batch_f16,
-                n_inputs,
-            )
-            .map_err(|e| format!("convert_f32_to_f16 tmp_plain l{layer_idx}: {e:?}"))?;
+            gpu.deepseek4_convert_f32_to_f16(&pbs.tmp_plain_batch, &pbs.tmp_plain_batch_f16, n_inputs)
+                .map_err(|e| format!("convert_f32_to_f16 tmp_plain l{layer_idx}: {e:?}"))?;
             // DeepSeek V4 compressor uses FWHT-rotated input (tmp_batch) when the
             // weight is MQ4-style, and plain input (tmp_plain_batch) when
             // F16/F32. We're on the F16 path → tmp_plain_batch_f16.
@@ -5952,6 +5987,7 @@ fn attention_block_batched_mixed(
             .map(|b| (((start_pos as usize) + b + 1) / ratio).min(max_compressed) as i32)
             .collect();
         let n_max_chunk = *n_per_batch_host.iter().max().unwrap_or(&0) as usize;
+        topk_direct_n_compressed = n_max_chunk;
         if n_max_chunk == 0 {
             // No commits yet — nothing to score/gather. n_active_topk stays 0.
         } else {
@@ -6077,19 +6113,21 @@ fn attention_block_batched_mixed(
                 .main_kv_cache
                 .as_ref()
                 .ok_or_else(|| "main_kv_cache missing".to_string())?;
-            gpu.deepseek4_topk_kv_gather_batched_f32(
-                main_kv_cache,
-                &pbs.idx_topk_indices_batch,
-                &pbs.topk_staged_batch,
-                topk_max as i32,
-                head_dim as i32,
-                n_max_chunk as i32,
-                topk_max as i32,
-                0,
-                /*scale=*/ 1.0,
-                batch_size as i32,
-            )
-            .map_err(|e| format!("deepseek4_topk_kv_gather_batched l{layer_idx}: {e:?}"))?;
+            if !use_topk_direct {
+                gpu.deepseek4_topk_kv_gather_batched_f32(
+                    main_kv_cache,
+                    &pbs.idx_topk_indices_batch,
+                    &pbs.topk_staged_batch,
+                    topk_max as i32,
+                    head_dim as i32,
+                    n_max_chunk as i32,
+                    topk_max as i32,
+                    0,
+                    /*scale=*/ 1.0,
+                    batch_size as i32,
+                )
+                .map_err(|e| format!("deepseek4_topk_kv_gather_batched l{layer_idx}: {e:?}"))?;
+            }
 
             // n_active_topk[b] = min(topk_max, n_per_batch[b]) — top-K
             // returned -1 sentinels past n_per_batch[b], and gather wrote
@@ -6121,9 +6159,7 @@ fn attention_block_batched_mixed(
                 topk_max as i32,
                 batch_size as i32,
             )
-            .map_err(|e| {
-                format!("deepseek4_topk_kv_gather_identity_batched l{layer_idx}: {e:?}")
-            })?;
+            .map_err(|e| format!("deepseek4_topk_kv_gather_identity_batched l{layer_idx}: {e:?}"))?;
             for b in 0..batch_size {
                 let n_b = (((start_pos as usize) + b + 1) / ratio)
                     .min(max_compressed)
@@ -6141,23 +6177,48 @@ fn attention_block_batched_mixed(
         .map_err(|e| format!("htod n_active_topk_arr: {e:?}"))?;
 
     // 4. Batched joint-softmax attention over SWA + topK + sink.
-    gpu.deepseek4_attn_swa_topk_batched_f32(
-        &pbs.q_batch,
-        &pbs.swa_staged_batch,
-        &pbs.swa_staged_batch, // K=V tied
-        &pbs.topk_staged_batch,
-        &pbs.topk_staged_batch,
-        attn_sink,
-        &pbs.n_valid_swa_arr,
-        &pbs.n_active_topk_arr,
-        &pbs.attn_out_raw_batch,
-        n_heads as i32,
-        head_dim as i32,
-        win as i32,
-        topk_max as i32,
-        batch_size as i32,
-    )
-    .map_err(|e| format!("deepseek4_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
+    if use_topk_direct {
+        let main_kv_cache = state._indexer[layer_idx]
+            .main_kv_cache
+            .as_ref()
+            .ok_or_else(|| "main_kv_cache missing".to_string())?;
+        gpu.deepseek4_attn_swa_topk_direct_batched_f32(
+            &pbs.q_batch,
+            &pbs.swa_staged_batch,
+            &pbs.swa_staged_batch, // K=V tied
+            main_kv_cache,
+            &pbs.idx_topk_indices_batch,
+            attn_sink,
+            &pbs.n_valid_swa_arr,
+            &pbs.n_active_topk_arr,
+            &pbs.attn_out_raw_batch,
+            n_heads as i32,
+            head_dim as i32,
+            win as i32,
+            topk_max as i32,
+            topk_direct_n_compressed as i32,
+            batch_size as i32,
+        )
+        .map_err(|e| format!("deepseek4_attn_swa_topk_direct_batched l{layer_idx}: {e:?}"))?;
+    } else {
+        gpu.deepseek4_attn_swa_topk_batched_f32(
+            &pbs.q_batch,
+            &pbs.swa_staged_batch,
+            &pbs.swa_staged_batch, // K=V tied
+            &pbs.topk_staged_batch,
+            &pbs.topk_staged_batch,
+            attn_sink,
+            &pbs.n_valid_swa_arr,
+            &pbs.n_active_topk_arr,
+            &pbs.attn_out_raw_batch,
+            n_heads as i32,
+            head_dim as i32,
+            win as i32,
+            topk_max as i32,
+            batch_size as i32,
+        )
+        .map_err(|e| format!("deepseek4_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
+    }
 
     // 5. Inverse RoPE.
     {
@@ -6213,16 +6274,33 @@ fn attention_block_batched_mixed(
         DType::Q8_0 => {
             // Q8_0 contract: plain (non-FWHT) input. Same layout
             // assumption as the swa-only sibling.
-            gpu.wo_per_group_batched_q8_0(
-                wo_a,
-                &pbs.attn_out_raw_batch,
-                &pbs.wo_a_out_batch,
-                n_groups as i32,
-                o_lora_rank as i32,
-                per_group_in as i32,
-                batch_size as i32,
-            )
-            .map_err(|e| format!("wo_per_group_batched_q8_0 l{layer_idx}: {e:?}"))?;
+            let mr: i32 = std::env::var("HIPFIRE_DEEPSEEK4_WO_MULTIROW")
+                .ok().and_then(|v| v.parse().ok()).filter(|&r| r == 2 || r == 4)
+                .unwrap_or(0);
+            if mr == 0 {
+                gpu.wo_per_group_batched_q8_0(
+                    wo_a,
+                    &pbs.attn_out_raw_batch,
+                    &pbs.wo_a_out_batch,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| format!("wo_per_group_batched_q8_0 l{layer_idx}: {e:?}"))?;
+            } else {
+                gpu.wo_per_group_batched_q8_0_multirow(
+                    wo_a,
+                    &pbs.attn_out_raw_batch,
+                    &pbs.wo_a_out_batch,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    batch_size as i32,
+                    mr,
+                )
+                .map_err(|e| format!("wo_per_group_batched_q8_0_multirow l{layer_idx}: {e:?}"))?;
+            }
         }
         DType::Raw => {
             gpu.wo_per_group_batched_hfq4g256(
@@ -6577,8 +6655,8 @@ fn ffn_batched(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(128);
-    let use_grouped = batch_size >= gate_threshold
-        && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
+    let use_grouped =
+        batch_size >= gate_threshold && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
 
     if use_grouped {
         const BLOCK_M: usize = 16;
@@ -6605,16 +6683,114 @@ fn ffn_batched(
         // Grouped gate_up GEMM: M = 2*im (gate||up concat), K = hidden.
         // x_row_div = k_top because X is per-token ffn_x_rot_batch [B, K].
         //
-        // Opt-in 4-warp 64×16 variant (HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=1):
-        // bit-exact vs the single-warp baseline (`bench_mq2g256_lloyd_moe_4w`
-        // max_abs=0 across all V4F MoE cells). 1.04-1.13× microbench at
-        // PP_BATCH ∈ {128, 256, 1024}. Default OFF — the kernel is
-        // memory-latency / scheduling bound at ~6 GiB/s (well below DRAM
-        // peak), so the tile lever is small here; opt in for tuning.
-        let use_lloyd_4w = std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() == Ok("1")
-            && (2 * im) % 64 == 0
-            && hidden % 256 == 0;
-        if use_lloyd_4w {
+        // RECONCILED (#355 + #356) MQ2-Lloyd grouped MoE dispatch.
+        // 4-warp 64×16 variant (gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2) is
+        // the default ON for gfx11+ — #356 broadened the gate from gfx1151-only
+        // (#355) to gfx11||gfx12 (measured 83.8% vs 43.4% L2 hit, -9% kernel
+        // time on gfx1151). [REVIEWER NOTE: the broader gfx11||gfx12 default
+        // gate is #356's; #355 shipped gfx1151-only. Confirm on gfx11 dGPU.]
+        // Opt out via HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=0. Shape gate: gate_up
+        // M=2*im must be a multiple of 64, K=hidden a multiple of 256.
+        let use_lloyd_4w = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
+            .as_deref()
+        {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
+        } && (2 * im) % 64 == 0
+          && hidden % 256 == 0;
+        // MMQ-style index-pack preload (#356). Reverted to OPT-IN: the preload
+        // hoisted only 8 of 16 weight packs, decoding half the MQ2 weights wrong
+        // → long-context attractor on DS4 mq2lloyd (root-caused by @nwoolmer on
+        // gfx1151; the corrected kernel measured flat, so no reason to default it).
+        let use_mmqload = use_lloyd_4w && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
+            .as_deref() == Ok("1");
+        // Barrier-free nosync variant (#356, opt in via =1).
+        let use_nosync = use_mmqload && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
+            .as_deref() == Ok("1");
+        // Research levers from #355 (all opt-in, default OFF). When set they
+        // take precedence over the mmqload/nosync default path.
+        // Lever 1 (HIPFIRE_DEEPSEEK4_MOE_N32=1): N_TILE=32 tile-pairing on the
+        // 4w kernel — decode the MQ2-Lloyd A-fragment once per same-expert tile
+        // pair, amortizing the dequant ALU across 2 token sub-tiles.
+        let n32_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
+        // Lever 2 (HIPFIRE_DEEPSEEK4_MOE_CND=1): cndmask dequant on the n16 4w
+        // kernel — shorter dependency chain, same occupancy.
+        let cnd_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
+        // Lever 3 (HIPFIRE_DEEPSEEK4_MOE_8W=1): 8-warp variant (shares staged X
+        // across 8 warps; same occupancy as 4w, ~half X-load traffic).
+        let eightw_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
+        if use_lloyd_4w && n32_env {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
+                gate_up_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.ffn_x_rot_batch,
+                &pbs.moe_y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_n32 gate_up l{layer_idx}: {e:?}"))?;
+        } else if use_lloyd_4w && cnd_env {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd(
+                gate_up_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.ffn_x_rot_batch,
+                &pbs.moe_y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_cnd gate_up l{layer_idx}: {e:?}"))?;
+        } else if use_lloyd_4w && eightw_env {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
+                gate_up_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.ffn_x_rot_batch,
+                &pbs.moe_y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_8w_k2 gate_up l{layer_idx}: {e:?}"))?;
+        } else if use_nosync {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
+                gate_up_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.ffn_x_rot_batch,
+                &pbs.moe_y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_nosync gate_up l{layer_idx}: {e:?}"))?;
+        } else if use_mmqload {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
+                gate_up_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.ffn_x_rot_batch,
+                &pbs.moe_y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_mmqload gate_up l{layer_idx}: {e:?}"))?;
+        } else if use_lloyd_4w {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                 gate_up_ptrs,
                 &pbs.moe_expert_tile_ids,
@@ -6627,9 +6803,7 @@ fn ffn_batched(
                 m_total_max,
                 batch_size,
             )
-            .map_err(|e| {
-                format!("gemm_mq2g256_lloyd_moe_grouped_4w gate_up l{layer_idx}: {e:?}")
-            })?;
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w gate_up l{layer_idx}: {e:?}"))?;
         } else {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
                 gate_up_ptrs,
@@ -6653,9 +6827,11 @@ fn ffn_batched(
         // launch-overhead savings cancelled by per-thread overhead, per
         // feedback_kernel_fusion. Default OFF; opt in via
         // HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU=1.
-        let use_fused_unscatter_silu = std::env::var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
-            .map(|s| s != "0")
-            .unwrap_or(false);
+        let use_fused_unscatter_silu = std::env::var(
+            "HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU",
+        )
+        .map(|s| s != "0")
+        .unwrap_or(false);
         if use_fused_unscatter_silu {
             gpu.moe_unscatter_silu_clamp_k8(
                 &pbs.moe_y_gate_up_grouped,
@@ -6705,12 +6881,92 @@ fn ffn_batched(
         // Grouped down GEMM: M = hidden, K = im. x_row_div = 1 because
         // moe_rot_batch is [B × k_top, im] flat — sorted_slot_index[s]
         // already yields the row index directly (b*k_top + krank).
-        // Same 4w shape-gated opt-in as the gate_up GEMM above.
-        let use_lloyd_4w_down = std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref()
-            == Ok("1")
-            && hidden % 64 == 0
-            && im % 256 == 0;
-        if use_lloyd_4w_down {
+        // RECONCILED (#355 + #356): same 4w default + levers as gate_up above.
+        let use_lloyd_4w_down = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
+            .as_deref()
+        {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
+        } && hidden % 64 == 0
+          && im % 256 == 0;
+        // Opt-in (see use_mmqload above — same #356 long-context attractor).
+        let use_mmqload_down = use_lloyd_4w_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
+            .as_deref() == Ok("1");
+        let use_nosync_down = use_mmqload_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
+            .as_deref() == Ok("1");
+        // n32_env / cnd_env / eightw_env reused from the gate_up block above.
+        if use_lloyd_4w_down && n32_env {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_rot_batch,
+                &pbs.moe_y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_n32 down l{layer_idx}: {e:?}"))?;
+        } else if use_lloyd_4w_down && cnd_env {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_rot_batch,
+                &pbs.moe_y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_cnd down l{layer_idx}: {e:?}"))?;
+        } else if use_lloyd_4w_down && eightw_env {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_rot_batch,
+                &pbs.moe_y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_8w_k2 down l{layer_idx}: {e:?}"))?;
+        } else if use_nosync_down {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_rot_batch,
+                &pbs.moe_y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_nosync down l{layer_idx}: {e:?}"))?;
+        } else if use_mmqload_down {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_rot_batch,
+                &pbs.moe_y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_mmqload down l{layer_idx}: {e:?}"))?;
+        } else if use_lloyd_4w_down {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                 w2_ptrs,
                 &pbs.moe_expert_tile_ids,
@@ -6918,28 +7174,145 @@ pub fn final_norm_and_head_all_batched(
         return Err("final_norm_and_head_all_batched: empty batch".to_string());
     }
     let stream_len = cfg.hc_mult * cfg.hidden_size;
+    let hidden = cfg.hidden_size;
+    let vocab = cfg.vocab_size;
+
+    // An MQ4 head needs a per-position FWHT rotation of the normed input that
+    // we don't stage into the batch buffer — keep the scalar per-position loop
+    // for that case. Q8/F16/F32 heads (this build's head is Q8) take the
+    // batched path below.
+    let head_needs_fwht = {
+        let head = weights
+            .head
+            .as_ref()
+            .ok_or_else(|| "head not uploaded".to_string())?;
+        weight_needs_fwht(head)
+    };
+    // Opt-out: HIPFIRE_DEEPSEEK4_BATCH_HEAD=0 forces the legacy per-position
+    // scalar loop — used for A/B measurement and as a safety fallback.
+    let batch_head = std::env::var("HIPFIRE_DEEPSEEK4_BATCH_HEAD")
+        .map(|s| s != "0")
+        .unwrap_or(true);
+    if head_needs_fwht || !batch_head {
+        let orig = state.residual_streams.take();
+        let mut all_logits: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
+        let result: Result<(), String> = (|| {
+            for i in 0..batch_size {
+                let off = i * stream_len;
+                let streams_i = pbs.streams_batch.sub_offset(off, stream_len);
+                state.residual_streams = Some(streams_i);
+                final_norm_and_head(cfg, weights, state, gpu)?;
+                let logits_tensor = state
+                    .logits
+                    .as_ref()
+                    .ok_or_else(|| "logits not allocated".to_string())?;
+                let logits_host = gpu
+                    .download_f32(logits_tensor)
+                    .map_err(|e| format!("download logits @pos {i}: {e:?}"))?;
+                all_logits.push(logits_host);
+            }
+            Ok(())
+        })();
+        state.residual_streams = orig;
+        result?;
+        return Ok(all_logits);
+    }
+
+    // ── Batched lm_head path ──────────────────────────────────────────────
+    // The lm_head weight is `[vocab, hidden]` (~565 MB Q8) and its GEMV is
+    // pure weight-bandwidth-bound (~2.4 ms on gfx1151). The scalar loop above
+    // re-reads that whole weight once PER verify position. Here we run only
+    // the cheap per-position prologue (head-HC + RMSNorm, ~22 µs) into a
+    // `[K, hidden]` buffer, then issue ONE batched GEMV that reads the weight
+    // a single time for all K positions. Buffers are cached on `state` so the
+    // hot spec-decode loop allocates them once.
+    if state
+        .head_norm_batch
+        .as_ref()
+        .map(|t| t.numel() != batch_size * hidden)
+        .unwrap_or(true)
+    {
+        state.head_norm_batch = Some(
+            gpu.alloc_tensor(&[batch_size, hidden], DType::F32)
+                .map_err(|e| format!("alloc head_norm_batch: {e:?}"))?,
+        );
+    }
+    if state
+        .head_x_f16
+        .as_ref()
+        .map(|t| t.numel() != batch_size * hidden)
+        .unwrap_or(true)
+    {
+        state.head_x_f16 = Some(
+            gpu.alloc_tensor(&[batch_size * hidden], DType::F16)
+                .map_err(|e| format!("alloc head_x_f16: {e:?}"))?,
+        );
+    }
+    if state
+        .head_logits_batch
+        .as_ref()
+        .map(|t| t.numel() != batch_size * vocab)
+        .unwrap_or(true)
+    {
+        state.head_logits_batch = Some(
+            gpu.alloc_tensor(&[batch_size, vocab], DType::F32)
+                .map_err(|e| format!("alloc head_logits_batch: {e:?}"))?,
+        );
+    }
+
     let orig = state.residual_streams.take();
-    let mut all_logits: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
     let result: Result<(), String> = (|| {
         for i in 0..batch_size {
             let off = i * stream_len;
             let streams_i = pbs.streams_batch.sub_offset(off, stream_len);
             state.residual_streams = Some(streams_i);
-            final_norm_and_head(cfg, weights, state, gpu)?;
-            let logits_tensor = state
-                .logits
+            final_norm_compute(cfg, weights, state, gpu)?;
+            // Stage this position's plain normed activation into row i of the
+            // `[K, hidden]` batched GEMV input.
+            let fn_i = state
+                .final_norm
                 .as_ref()
-                .ok_or_else(|| "logits not allocated".to_string())?;
-            let logits_host = gpu
-                .download_f32(logits_tensor)
-                .map_err(|e| format!("download logits @pos {i}: {e:?}"))?;
-            all_logits.push(logits_host);
+                .ok_or_else(|| "final_norm not allocated".to_string())?;
+            let dst = state.head_norm_batch.as_ref().unwrap();
+            let dst_row = dst.sub_offset(i * hidden, hidden);
+            gpu.memcpy_dtod_auto(&dst_row.buf, &fn_i.buf, hidden * 4)
+                .map_err(|e| format!("stage final_norm → batch @pos {i}: {e:?}"))?;
         }
         Ok(())
     })();
-    // Restore original residual_streams regardless of success / failure.
     state.residual_streams = orig;
     result?;
+
+    // ONE batched lm_head GEMV over all K positions (weight read once). The
+    // head is Q8/F16/F32 here so `x_rotated_batch` is ignored; pass the plain
+    // batch for both. `Some(x_f16)` selects the proven WMMA route.
+    let head = weights
+        .head
+        .as_ref()
+        .ok_or_else(|| "head not uploaded".to_string())?;
+    let norm_batch = state.head_norm_batch.as_ref().unwrap();
+    let logits_batch = state.head_logits_batch.as_ref().unwrap();
+    let x_f16 = state.head_x_f16.as_ref().unwrap();
+    gemv_auto_batched_wmma(
+        gpu,
+        head,
+        norm_batch,
+        norm_batch,
+        logits_batch,
+        vocab,
+        hidden,
+        batch_size,
+        Some(x_f16),
+    )?;
+
+    // Download the `[K, vocab]` logits block once, split per position.
+    let flat = gpu
+        .download_f32(logits_batch)
+        .map_err(|e| format!("download batched logits: {e:?}"))?;
+    let mut all_logits: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
+    for i in 0..batch_size {
+        all_logits.push(flat[i * vocab..(i + 1) * vocab].to_vec());
+    }
     Ok(all_logits)
 }
 
@@ -7718,7 +8091,11 @@ pub fn prefill_with_mtp_fill(
 /// Production routing goes through the GPU kernel
 /// `deepseek4_moe_topk_bias_aware_f32`; this is kept as a tested reference.
 #[cfg(test)]
-fn bias_aware_topk_weights(scores: &[f32], bias: &[f32], k: usize) -> Option<(Vec<u32>, Vec<f32>)> {
+fn bias_aware_topk_weights(
+    scores: &[f32],
+    bias: &[f32],
+    k: usize,
+) -> Option<(Vec<u32>, Vec<f32>)> {
     let n = scores.len();
     if k == 0 || n == 0 {
         return None;

@@ -2777,6 +2777,10 @@ function findTriAttnValidateBinary(): string | null {
 
 function artifactFormatToken(format: string): string {
   switch (format.toLowerCase()) {
+    case "mq2-lloyd":
+    case "mq2g256-lloyd":
+    case "mq2lloyd":
+      return "mq2lloyd";
     case "hfq4":
     case "hfq4g256":
       return "hf4";
@@ -2799,9 +2803,9 @@ function artifactFileName(stem: string, format: string): string {
 
 function artifactQuantToken(filename: string): string | null {
   const lower = filename.toLowerCase();
-  const canonical = lower.match(/(?:^|[-.])(mq3|mq4|mq6|hf4|hf6|q8|q8f16)(?:\+[^.]*)?\.hfq$/);
+  const canonical = lower.match(/(?:^|[-.])(mq2lloyd|mq3|mq4|mq6|hf4|hf6|q8|q8f16)(?:\+[^.]*)?\.hfq$/);
   if (canonical) return artifactFormatToken(canonical[1]);
-  const legacy = lower.match(/\.(mq3|mq4|mq6|hf4|hf6)$/);
+  const legacy = lower.match(/\.(mq2lloyd|mq3|mq4|mq6|hf4|hf6)$/);
   if (legacy) return artifactFormatToken(legacy[1]);
   return null;
 }
@@ -3098,7 +3102,7 @@ export function findModel(name: string): string | null {
   // WMMA-accelerated on RDNA3+). Fall back to HF4 only if no MQ4 is found
   // so Qwen3 (which currently ships only HF4) still resolves.
   const searchName = name.replace(":", "-");
-  const hasQuantHint = /(?:^|[-.])(hf[46]|mq[346]|q8)(?:\+[^.]*)?(?:\.hfq)?$/i.test(name);
+  const hasQuantHint = /(?:^|[-.])(hf[46]|mq2lloyd|mq[346]|q8)(?:\+[^.]*)?(?:\.hfq)?$/i.test(name);
   const matchesName = (f: string) => f === name || f === searchName
     || f.includes(name) || f.includes(searchName);
   const hasValidExt = (f: string) => !isRoleSidecarArtifact(f)
@@ -3112,9 +3116,10 @@ export function findModel(name: string): string | null {
     if (token === "hf4") return 1;
     if (f.endsWith(".hfq") && !token) return 2; // legacy HF4 naming
     if (token === "mq3") return 3;
-    if (token === "mq6") return 4;
-    if (token === "hf6") return 5;
-    if (token === "q8") return 6;
+    if (token === "mq2lloyd") return 4;
+    if (token === "mq6") return 5;
+    if (token === "hf6") return 6;
+    if (token === "q8") return 7;
     return 99;
   };
 

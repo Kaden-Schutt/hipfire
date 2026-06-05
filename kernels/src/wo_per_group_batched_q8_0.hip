@@ -81,8 +81,8 @@ extern "C" __global__ void wo_per_group_batched_q8_0(
         sum += d * (float)qval * x_row[bi * 32 + tid];
     }
 
-    for (int off = 16; off > 0; off >>= 1)
-        sum += __shfl_down(sum, off);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
     if (tid == 0) {
         y_out[((size_t)b * G + g) * M + r] = sum;
     }
