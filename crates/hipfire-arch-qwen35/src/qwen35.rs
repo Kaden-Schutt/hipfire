@@ -13000,9 +13000,21 @@ fn rmsnorm_rotate_dispatch<'a>(
     x_rot_scratch: &'a GpuTensor,
     eps: f32,
 ) -> HipResult<Option<&'a GpuTensor>> {
+    // MQ8 cannot share LDS to fuse rmsnorm with its rotate+quantize: it produces an
+    // INT8 scratch (mq_x_q8) consumed internally by the downstream MQ8 prerotated
+    // GEMV. Routing it through the FWHT-G256 RotationFamily path (below) keeps the
+    // activation F32 and feeds the MQ8 GEMV the wrong dtype. Match the legacy
+    // fused_rmsnorm_rotate_for_mq MQ8 arm exactly: split rmsnorm_f32 +
+    // rotate_quantize_x_mq8, return None (MQ8 GEMV picks up the internal INT8 buffer).
+    if matches!(sample_weight.gpu_dtype, DType::MQ8G256) {
+        gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
+        gpu.rotate_quantize_x_mq8(tmp, sample_weight.k)?;
+        trace_finite_if_enabled(gpu, "rmsnorm_rotate", tmp)?;
+        return Ok(None);
+    }
     let is_mq = matches!(sample_weight.gpu_dtype,
         DType::MQ4G256 | DType::MQ3G256 | DType::MQ2G256
-        | DType::MQ6G256 | DType::MQ8G256
+        | DType::MQ6G256
         | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MQ4G256Lloyd
         | DType::MFP4G32);
 
