@@ -11882,104 +11882,20 @@ fn run_fa_layer_body(
         _ => unreachable!(),
     };
 
-    // Fused rmsnorm + FWHT rotation for wq/wk/wv (MQ-family).
-    let x_rot = fused_rmsnorm_rotate_for_mq(
-        gpu,
-        &layer.wq,
-        &s.x,
-        &layer.attn_norm,
-        &s.tmp,
-        &s.x_rot,
-        config.norm_eps,
+    let ctx = DispatchCtx::new(gpu);
+
+    // Unified QKV projection: rmsnorm + FWHT rotation + fused/per-op GEMV.
+    // Byte-identical to the prior inline `fused_rmsnorm_rotate_for_mq` + fused-QKV
+    // ladder + `weight_gemv_prerotated` fallback — the FUSED_TABLE guards fire on
+    // exactly the same dtype set (MQ4G256/HFQ4G256, MQ3G256Lloyd, MQ4G256Lloyd,
+    // and MQ6G256/HFQ6G256 under dp4a) and dispatch to the identical fused kernels.
+    // This is the same helper the main decode path (FullAttnMoe) already uses.
+    qkv_via_execute_steps(
+        gpu, &ctx,
+        &layer.wq, &layer.wk, &layer.wv,
+        &layer.attn_norm, &s.x, &s.tmp, &s.x_rot,
+        &s.fa_q_full, &s.fa_k, &s.fa_v, config.norm_eps,
     )?;
-    // Cross-arch fast path: fused 3-way projection for wq+wk+wv.
-    let dt = layer.wq.gpu_dtype;
-    let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
-    let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
-    let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
-    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-    // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
-    let fused_fa3_hfq6 = fa3_same_dtype
-        && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
-        && gpu.arch_caps.gemv_dp4a_enabled();
-    if fused_fa3_mq4 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_qkv_hfq4g256(
-            &layer.wq.buf,
-            &layer.wk.buf,
-            &layer.wv.buf,
-            eff_x,
-            &s.fa_q_full,
-            &s.fa_k,
-            &s.fa_v,
-            layer.wq.m,
-            layer.wk.m,
-            layer.wv.m,
-            layer.wq.k,
-        )?;
-    } else if fused_fa3_lloyd_mq3 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_qkv_mq3g256_lloyd(
-            &layer.wq.buf,
-            &layer.wk.buf,
-            &layer.wv.buf,
-            eff_x,
-            &s.fa_q_full,
-            &s.fa_k,
-            &s.fa_v,
-            layer.wq.m,
-            layer.wk.m,
-            layer.wv.m,
-            layer.wq.k,
-        )?;
-    } else if fused_fa3_lloyd_mq4 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_qkv_mq4g256_lloyd(
-            &layer.wq.buf,
-            &layer.wk.buf,
-            &layer.wv.buf,
-            eff_x,
-            &s.fa_q_full,
-            &s.fa_k,
-            &s.fa_v,
-            layer.wq.m,
-            layer.wk.m,
-            layer.wv.m,
-            layer.wq.k,
-        )?;
-    } else if fused_fa3_hfq6 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_qkv_hfq6g256_dp4a(
-            &layer.wq.buf,
-            &layer.wk.buf,
-            &layer.wv.buf,
-            eff_x,
-            &s.fa_q_full,
-            &s.fa_k,
-            &s.fa_v,
-            layer.wq.m,
-            layer.wk.m,
-            layer.wv.m,
-            layer.wq.k,
-        )?;
-    } else {
-        weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
-        weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
-        weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
-    }
 
     gpu.deinterleave_f32(
         &s.fa_q_full,
@@ -12294,89 +12210,21 @@ fn run_fa_layer_body(
         }]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
 
-    // FFN: fused rmsnorm + rotate for w_gate/w_up.
-    let x_rot = fused_rmsnorm_rotate_for_mq(
-        gpu,
-        &layer.w_gate,
-        &s.x,
-        &layer.ffn_norm,
-        &s.tmp,
-        &s.x_rot,
-        config.norm_eps,
+    // Unified gate+up (FFN) projection: rmsnorm + FWHT rotation + fused/per-op GEMV.
+    // Byte-identical to the prior inline `fused_rmsnorm_rotate_for_mq` + fused-gate+up
+    // ladder + `weight_gemv_prerotated` fallback — the FUSED_TABLE guards fire on the
+    // same dtype set and dispatch to the identical fused kernels. Same helper the main
+    // decode path (forward_scratch_layers FFN) already uses.
+    gate_up_via_execute_steps(
+        gpu, &ctx,
+        &layer.w_gate, &layer.w_up, &layer.ffn_norm,
+        &s.x, &s.tmp, &s.x_rot,
+        &s.gate_ffn, &s.up, config.norm_eps,
     )?;
-    let dt_g = layer.w_gate.gpu_dtype;
-    let same_dtype = layer.w_up.gpu_dtype == dt_g;
-    let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
-    let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
-    let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-    // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
-    let fused_gu_hfq6 = same_dtype
-        && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
-        && gpu.arch_caps.gemv_dp4a_enabled();
-    if fused_gu_mq4 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_gate_up_hfq4g256(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-        )?;
-    } else if fused_gu_lloyd_mq3 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_gate_up_mq3g256_lloyd(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-        )?;
-    } else if fused_gu_lloyd_mq4 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_gate_up_mq4g256_lloyd(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-        )?;
-    } else if fused_gu_hfq6 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_gate_up_hfq6g256_dp4a(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-        )?;
-    } else {
-        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
-        weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
-    }
+    // w_down SwiGLU + residual. Left as-is: `weight_gemv_swiglu_residual` already
+    // routes through GemvFamily (GemvVariant::WithSwiGLUResidual for MQ-family,
+    // silu_mul + weight_gemv_residual otherwise) — identical to the canonical
+    // forward_scratch_layers w_down sites. No migration needed; avoids added risk.
     weight_gemv_swiglu_residual(gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x)?;
 
     Ok(())
