@@ -29,7 +29,10 @@
 
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, fused_qkv_family, gemv_family, weight_gemm, DispatchCtx, EmbeddingFormat, FusedQkvParams, KernelKey, WeightTensor};
+use hipfire_runtime::llama::{f16_to_f32, gemv_family, weight_gemm, EmbeddingFormat, WeightTensor};
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_dispatch::types::dtype_rotation_plan;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
@@ -540,9 +543,10 @@ fn load_weight_tensor(
 /// - **No sampler scratch.** `sample_buf` / `repeat_buf` are unused
 ///   because we drive validation with `argmax_f32` (greedy). Sampling
 ///   wiring is a follow-on when the daemon arm is added (R3).
-/// - **No `x_rot`.** Qwen2 uses HFQ4 weights with no FWHT rotation
-///   per row; the MagnumQuant `x_rot` scratch in `ForwardScratch` is
-///   dead weight here.
+/// - **`x_rot` scratch.** Sized `max(dim, intermediate_size)`, used by
+///   `RmsnormAutomatic` as the rotation output buffer. For HFQ4/Q8_0
+///   (rotation-free dtypes), `RmsnormAutomatic(None)` writes plain rmsnorm
+///   output here; for MQ-family dtypes it would hold FWHT-rotated activations.
 ///
 /// Sizes:
 /// - `x`, `tmp`, `o`, `ffn_out` : `hidden_size` (residual stream)
@@ -560,6 +564,7 @@ fn load_weight_tensor(
 pub struct Qwen2State {
     pub x: GpuTensor,
     pub tmp: GpuTensor,
+    pub x_rot: GpuTensor,  // rotation output scratch (rmsnorm output for non-MQ dtypes)
     pub q: GpuTensor,
     pub k: GpuTensor,
     pub v: GpuTensor,
@@ -618,9 +623,14 @@ impl Qwen2State {
         let n_chunks_max = (max_seq + 127) / 128;
         let attn_partials_len = cfg.num_attention_heads * n_chunks_max * (2 + cfg.head_dim);
 
+        // x_rot scratch: must fit both attention (dim) and FFN (hidden_dim)
+        // rmsnorm/rotation output.
+        let x_rot_len = dim.max(hidden_dim);
+
         Ok(Self {
             x:           gpu.alloc_tensor(&[dim], DType::F32)?,
             tmp:         gpu.alloc_tensor(&[dim], DType::F32)?,
+            x_rot:       gpu.alloc_tensor(&[x_rot_len], DType::F32)?,
             q:           gpu.alloc_tensor(&[q_dim], DType::F32)?,
             k:           gpu.alloc_tensor(&[kv_dim], DType::F32)?,
             v:           gpu.alloc_tensor(&[kv_dim], DType::F32)?,
@@ -655,7 +665,7 @@ impl Qwen2State {
     /// Release every GPU buffer back to the pool. Consumes self.
     /// Mirrors `ForwardScratch::free_gpu` in `hipfire_runtime::llama`.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        for t in [self.x, self.tmp, self.q, self.k, self.v, self.attn_out,
+        for t in [self.x, self.tmp, self.x_rot, self.q, self.k, self.v, self.attn_out,
                   self.o, self.gate, self.up, self.ffn_hidden,
                   self.ffn_out, self.logits, self.attn_partials] {
             let _ = gpu.free_tensor(t);
@@ -810,43 +820,29 @@ fn forward_step_after_x(
     let q_dim = n_heads * head_dim;
     let kv_dim = n_kv_heads * head_dim;
 
-    let gemv = gemv_family();
-    let fused = fused_qkv_family();
     let ctx = DispatchCtx::new(gpu);
 
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer = &weights.layers[layer_idx];
 
-        // (1) RMSNorm(x → tmp) with input_layernorm.
-        gpu.rmsnorm_f32(&state.x, &layer.attn_norm, &state.tmp, cfg.rms_norm_eps)?;
-
-        // (2) QKV projection. fused_qkv_hfq4g256 expects all three weights
-        // to be HFQ4G256; otherwise fall through to three individual
-        // weight_gemv calls. This keeps the bring-up path open for F16
-        // weights (qt=1) while the HFQ4G256 fast path is the default.
-        let all_hfq4g256 = layer.wq.gpu_dtype == DType::HFQ4G256
-            && layer.wk.gpu_dtype == DType::HFQ4G256
-            && layer.wv.gpu_dtype == DType::HFQ4G256;
-        if all_hfq4g256 {
-            // HFQ4G256 QKV → FusedQkvFamily (FusedQkvHfq4G256). Routes to the
-            // identical `gpu.fused_qkv_hfq4g256` kernel with identical args
-            // (byte-identical by construction); arch gate widened to `Always`
-            // in fused_qkv_table to match the kernel's true cross-arch
-            // availability (the prior `HasWmmaW32` was a dead-gate).
-            fused.run(&ctx, gpu, &FusedQkvParams {
-                kind: KernelKey::FusedQkvHfq4G256,
-                weights: &[&layer.wq.buf, &layer.wk.buf, &layer.wv.buf],
-                x: &state.tmp,
-                outputs: &[&state.q, &state.k, &state.v],
-                m: &[layer.wq.m, layer.wk.m, layer.wv.m],
-                k: layer.wq.k,
-                rot_scratch: &[], // non-Paro: family arm ignores it
-            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-        } else {
-            gemv.run_auto(&ctx, gpu, &layer.wq.dispatch_ref(), &state.tmp, &state.q).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-            gemv.run_auto(&ctx, gpu, &layer.wk.dispatch_ref(), &state.tmp, &state.k).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-            gemv.run_auto(&ctx, gpu, &layer.wv.dispatch_ref(), &state.tmp, &state.v).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-        }
+        // (1–2) RMSNorm + QKV projection via execute_steps.
+        // The interpreter selects FusedQkvHfq4G256 / fused-MQ / per-op
+        // based on dtype — no model-side branching.
+        let qkv_rot = dtype_rotation_plan(layer.wq.gpu_dtype);
+        let wrq = layer.wq.dispatch_ref();
+        let wrk = layer.wk.dispatch_ref();
+        let wrv = layer.wv.dispatch_ref();
+        execute_steps(gpu, &ctx, &[
+            Step::RmsnormAutomatic {
+                x: &state.x, norm_weight: &layer.attn_norm,
+                x_plain: &state.tmp, out: &state.x_rot,
+                awq_scale: layer.wq.awq_scale.as_ref(),
+                k: layer.wq.k, eps: cfg.rms_norm_eps, rotation: qkv_rot,
+            },
+            Step::Gemv { w: &wrq, input: GemvInput::Prerotated(&state.x_rot), out: &state.q },
+            Step::Gemv { w: &wrk, input: GemvInput::Prerotated(&state.x_rot), out: &state.k },
+            Step::Gemv { w: &wrv, input: GemvInput::Prerotated(&state.x_rot), out: &state.v },
+        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
         // (3) QKV bias. attention_bias=true on Qwen2 — three small adds
         // per layer (batch=1, n=q_dim or kv_dim). This is **option (a)**
@@ -911,46 +907,48 @@ fn forward_step_after_x(
             )?;
         }
 
-        // (7) o_proj (no bias) + (8) residual.
-        gemv.run_auto(&ctx, gpu, &layer.wo.dispatch_ref(), &state.attn_out, &state.o).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-        gpu.add_inplace_f32(&state.x, &state.o)?;
+        // (7–8) o_proj + residual via execute_steps.
+        let wro = layer.wo.dispatch_ref();
+        execute_steps(gpu, &ctx, &[
+            Step::GemvResidual {
+                w: &wro, input: GemvInput::Raw(&state.attn_out),
+                residual: &state.x, out: &state.o,
+            },
+        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
-        // (9) FFN norm.
-        gpu.rmsnorm_f32(&state.x, &layer.ffn_norm, &state.tmp, cfg.rms_norm_eps)?;
+        // (9–10) FFN norm + gate/up via execute_steps.
+        // The interpreter selects FusedGateUpQ8_0 / FusedGateUpHfq4G256 / per-op.
+        let ffn_rot = dtype_rotation_plan(layer.w_gate.gpu_dtype);
+        let wrg = layer.w_gate.dispatch_ref();
+        let wru = layer.w_up.dispatch_ref();
+        execute_steps(gpu, &ctx, &[
+            Step::RmsnormAutomatic {
+                x: &state.x, norm_weight: &layer.ffn_norm,
+                x_plain: &state.tmp, out: &state.x_rot,
+                awq_scale: layer.w_gate.awq_scale.as_ref(),
+                k: layer.w_gate.k, eps: cfg.rms_norm_eps, rotation: ffn_rot,
+            },
+            Step::Gemv { w: &wrg, input: GemvInput::Prerotated(&state.x_rot), out: &state.gate },
+            Step::Gemv { w: &wru, input: GemvInput::Prerotated(&state.x_rot), out: &state.up },
+        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
-        // (10) SwiGLU: gate = silu(w_gate(x)) * w_up(x); down(...).
-        // Q8_0 gate+up fuse into one launch (mirrors the fused_qkv_hfq4g256
-        // fast path above); otherwise two individual run_auto GEMVs.
-        if layer.w_gate.gpu_dtype == DType::Q8_0
-            && layer.w_up.gpu_dtype == DType::Q8_0
-            && layer.w_gate.k == layer.w_up.k
-        {
-            // Q8_0 gate+up → FusedQkvFamily (FusedGateUpQ8_0). Routes to the
-            // identical `gpu.fused_gate_up_q8_0` kernel; arch gate is `Always`
-            // (the kernel is a plain wave32 launch with no arch requirement).
-            fused.run(&ctx, gpu, &FusedQkvParams {
-                kind: KernelKey::FusedGateUpQ8_0,
-                weights: &[&layer.w_gate.buf, &layer.w_up.buf],
-                x: &state.tmp,
-                outputs: &[&state.gate, &state.up],
-                m: &[layer.w_gate.m, layer.w_up.m],
-                k: layer.w_gate.k,
-                rot_scratch: &[], // non-Paro: family arm ignores it
-            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-        } else {
-            gemv.run_auto(&ctx, gpu, &layer.w_gate.dispatch_ref(), &state.tmp, &state.gate).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-            gemv.run_auto(&ctx, gpu, &layer.w_up.dispatch_ref(), &state.tmp, &state.up).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-        }
+        // SwiGLU activation + w_down + residual.
         gpu.silu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
-        gemv.run_auto(&ctx, gpu, &layer.w_down.dispatch_ref(), &state.ffn_hidden, &state.ffn_out).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
-
-        // (11) Residual.
-        gpu.add_inplace_f32(&state.x, &state.ffn_out)?;
+        let wrd = layer.w_down.dispatch_ref();
+        execute_steps(gpu, &ctx, &[
+            Step::GemvResidual {
+                w: &wrd, input: GemvInput::Raw(&state.ffn_hidden),
+                residual: &state.x, out: &state.ffn_out,
+            },
+        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     }
 
     // Final RMSNorm + lm_head.
     gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
-    gemv.run_auto(&ctx, gpu, &weights.output.dispatch_ref(), &state.tmp, &state.logits).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    let wr_out = weights.output.dispatch_ref();
+    execute_steps(gpu, &ctx, &[
+        Step::Gemv { w: &wr_out, input: GemvInput::Raw(&state.tmp), out: &state.logits },
+    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
     state.next_pos = pos + 1;
     Ok(())
