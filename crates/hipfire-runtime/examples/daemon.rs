@@ -24,6 +24,7 @@
 use base64::Engine;
 use hip_bridge::HipResult;
 use hipfire_arch_deepseek4 as deepseek4;
+use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_llama::Llama;
 use hipfire_arch_qwen2::qwen2;
@@ -1126,6 +1127,17 @@ struct LoadedModel {
     /// Falls back to 1 (DeepSeek family default) if the tokenizer lacks
     /// the special-token entry.
     deepseek4_eos_tok: u32,
+    // LFM2.5-8B-A1B state (arch_id=11 — hipfire-arch-lfm2moe). Hybrid
+    // double-gated LIV short-conv mixers + GQA/QK-norm attention + sigmoid-
+    // bias top-4 MoE FFN. The KV cache (attention layers) and the rolling
+    // conv-state cache (conv layers) both live inside Lfm2MoeState; no
+    // separate field. None on every other arch path.
+    lfm2moe_config: Option<lfm2moe::config::Lfm2MoeConfig>,
+    lfm2moe_weights: Option<lfm2moe::lfm2moe::Lfm2MoeWeights>,
+    lfm2moe_state: Option<lfm2moe::lfm2moe::Lfm2MoeState>,
+    /// EOS token id resolved at load time. LFM2.5 uses the ChatML
+    /// `<|im_end|>`; falls back to common alternates, then 1.
+    lfm2moe_eos_tok: u32,
     /// MTP config — parsed from load-message params, read at generate time.
     /// Arch-agnostic: currently only DeepSeek V4 (arch_id=9) evaluates these,
     /// but the namespace is intentionally not deepseek4-specific.
@@ -1812,6 +1824,7 @@ fn main() {
                             7 => "qwen2",
                             8 => "dots-ocr",
                             9 => "deepseek4",
+                            11 => "lfm2moe",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
@@ -2127,7 +2140,14 @@ fn main() {
                 // model. Pick arch-shaped defaults so a vanilla
                 // `/v1/chat/completions` POST (no sampling fields) works on
                 // both. Explicit per-request values still override either.
-                let (default_temp, default_top_p) = if m.arch_id == 9 {
+                let (default_temp, default_top_p) = if m.arch_id == 11 {
+                    // LFM2.5-MoE (11): Liquid's model card recommends specific
+                    // sampling — temperature=0.2, top_p=0.80 (+ repetition_penalty
+                    // 1.05, set below). Use those exact values, not the generic
+                    // MoE-instruct default — they're tuned for this model and
+                    // keep it on-distribution.
+                    (0.2_f64, 0.80_f64)
+                } else if m.arch_id == 9 {
                     (1.0_f64, 1.0_f64)
                 } else {
                     (0.3_f64, 0.8_f64)
@@ -2155,10 +2175,13 @@ fn main() {
                 // Root cause writeup: issue #258 comment "Bug B root cause"
                 // and docs/investigations/2026-05-15-9b-reasoning-loop/.
                 // Clients can still opt in to a non-1.0 value per request.
+                // LFM2.5-MoE (arch_id 11): Liquid's card recommends
+                // repetition_penalty=1.05; default to it (others stay 1.0/off).
+                let default_repeat_penalty = if m.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
                 let repeat_penalty = msg
                     .get("repeat_penalty")
                     .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0) as f32;
+                    .unwrap_or(default_repeat_penalty) as f32;
                 // OpenAI-compatible `reasoning_effort` (also accept our custom
                 // `thinking_mode` alias) — only consumed by arch_id=9 today.
                 // Default = NonThink, matching the safe HF chat frame.
@@ -2540,6 +2563,13 @@ fn main() {
                         // rather than jumping straight back to replay.
                         gpu.invalidate_graph_state();
                     }
+                    // arch_id=11: rewind the Lfm2MoeState KV + conv-state
+                    // cursors so the next prefill writes from slot 0. Same
+                    // rationale as the qwen2/deepseek4 resets above — without
+                    // it, prior-turn KV/conv residue leaks into the new turn.
+                    if let Some(ref mut s) = m.lfm2moe_state {
+                        let _ = s.reset(&mut gpu);
+                    }
                     // Restore adaptive-KV controller to start tier (q8/fwht4)
                     // so thresholds fire correctly on the fresh conversation
                     // instead of staying pinned at the floor tier.
@@ -2595,6 +2625,7 @@ fn main() {
                         6 => "qwen3_5_moe",
                         7 => "qwen2",
                         9 => "deepseek4",
+                        11 => "lfm2moe",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");
@@ -2783,6 +2814,27 @@ fn main() {
                         }
                     }
                     ok
+                } else if m.arch_id == 11 {
+                    // LFM2.5-MoE warm-pass: per-token decode_step over the
+                    // synthetic prompt. Saturates the conv + GQA + QK-norm +
+                    // RoPE + top-4 MoE kernel set before any user-facing
+                    // generate. This IS the production prefill shape (no
+                    // batched kernel).
+                    let config = m.lfm2moe_config.as_ref().unwrap();
+                    let weights = m.lfm2moe_weights.as_ref().unwrap();
+                    let state = m.lfm2moe_state.as_mut().unwrap();
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if lfm2moe::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
@@ -2818,6 +2870,11 @@ fn main() {
                     for s in &dn.conv_states {
                         let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                     }
+                }
+                // LFM2.5-MoE state carries its own KV + conv-state cache;
+                // reset cursors (takes gpu) so the next request starts cold.
+                if let Some(ref mut s) = m.lfm2moe_state {
+                    let _ = s.reset(&mut gpu);
                 }
 
                 if run_ok {
@@ -3294,6 +3351,10 @@ fn load_model(
             deepseek4_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3370,6 +3431,10 @@ fn load_model(
             deepseek4_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3467,6 +3532,104 @@ fn load_model(
             deepseek4_state: Some(state),
             deepseek4_pbs: Some(pbs),
             deepseek4_eos_tok: eos_tok,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(),
+            dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
+    if hfq.arch_id == 11 {
+        // LFM2.5-8B-A1B (hipfire-arch-lfm2moe). Standalone bring-up — no
+        // eviction, no DFlash drafter, no PFlash, no VL, no pipeline-parallel.
+        // Forward goes through `lfm2moe::forward::decode_step` in the
+        // `generate_lfm2moe` hot path. Free-function load triple (config →
+        // weights → state); the LFM crate does not implement the
+        // `Architecture` trait yet.
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=11 (LFM2.5-MoE). \
+                       Reload without a draft."
+                .to_string());
+        }
+        if cask.sidecar.is_some() {
+            return Err(
+                "CASK eviction not supported on arch_id=11 (LFM2.5-MoE). \
+                       Reload without --cask-sidecar."
+                    .to_string(),
+            );
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        let config = lfm2moe::config::Lfm2MoeConfig::from_hfq(&hfq)?;
+        let weights = lfm2moe::lfm2moe::Lfm2MoeWeights::load(&mut hfq, &config, gpu)?;
+        // Size the KV + conv-state cache to the requested window.
+        let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(gpu, &config, max_seq)
+            .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;
+        // Resolve EOS via the tokenizer. LFM2.5 uses the ChatML `<|im_end|>`;
+        // fall back to common alternates, then 1.
+        let eos_tok: u32 = {
+            let try_one = |s: &str| -> Option<u32> {
+                let ids = tokenizer.encode(s);
+                if ids.len() == 1 {
+                    Some(ids[0])
+                } else {
+                    None
+                }
+            };
+            try_one("<|im_end|>")
+                .or_else(|| try_one("</s>"))
+                .or_else(|| try_one("<|endoftext|>"))
+                .unwrap_or(1)
+        };
+        let chat_template = resolve_chat_template(&hfq, path);
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            kv_cache: None,
+            dn_state: None,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            lfm2moe_config: Some(config),
+            lfm2moe_weights: Some(weights),
+            lfm2moe_state: Some(state),
+            lfm2moe_eos_tok: eos_tok,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3918,6 +4081,10 @@ fn load_model(
             deepseek4_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3984,6 +4151,10 @@ fn load_model(
             deepseek4_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4138,6 +4309,10 @@ fn load_model_safetensors(
             deepseek4_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4272,6 +4447,10 @@ fn load_model_safetensors(
         deepseek4_state: None,
         deepseek4_pbs: None,
         deepseek4_eos_tok: 0,
+        lfm2moe_config: None,
+        lfm2moe_weights: None,
+        lfm2moe_state: None,
+        lfm2moe_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -4503,6 +4682,10 @@ fn load_model_pp(
         deepseek4_state: None,
         deepseek4_pbs: None,
         deepseek4_eos_tok: 0,
+        lfm2moe_config: None,
+        lfm2moe_weights: None,
+        lfm2moe_state: None,
+        lfm2moe_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -7041,6 +7224,37 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             top_p,
             max_tokens,
             think_mode,
+            tools,
+            messages_history,
+        );
+        return;
+    }
+    if m.arch_id == 11 {
+        // arch_id=11 (LFM2.5-8B-A1B). Standalone bring-up — same shape as
+        // the deepseek4 short-circuit above. PFlash / DFlash / VL / multi-GPU
+        // / sampler-budget scaffolding all bypass. We honour `system_prompt`,
+        // `temp`, `top_p`, `tools`, and `messages_history`; everything else
+        // routes through future follow-ups.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            assistant_prefix,
+            pflash_state,
+            pflash_cfg,
+            think_mode,
+        );
+        let _ = (repeat_penalty, repeat_window);
+        generate_lfm2moe(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            max_think_tokens,
             tools,
             messages_history,
         );
@@ -10313,6 +10527,219 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     let _ = writeln!(stdout, "{}", done_envelope);
     let _ = stdout.flush();
 }
+
+fn generate_lfm2moe(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    if m.tokenizer.is_none() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+    if m.lfm2moe_config.is_none() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"lfm2moe_config missing on arch_id=11 generate"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    // ── Prompt build (same two-path branch as the minimax AR path) ──
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                    Some(h) => h,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::System,
+                                content: sys.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                            });
+                        }
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
+                    hipfire_runtime::prompt_frame::ChatFrame {
+                        tokenizer,
+                        system: system_prompt,
+                        user: prompt,
+                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        raw: false,
+                    }
+                    .build()
+                }
+            }
+        } else {
+            hipfire_runtime::prompt_frame::ChatFrame {
+                tokenizer,
+                system: system_prompt,
+                user: prompt,
+                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                raw: false,
+            }
+            .build()
+        }
+    };
+
+    if prompt_ids.is_empty() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    let eos_tok = m.lfm2moe_eos_tok;
+
+    // Capacity guard. No eviction on arch_id=11 — reset the KV + conv-state
+    // cursors when the requested run would overflow the budget.
+    let overflow = {
+        let state = m.lfm2moe_state.as_ref().unwrap();
+        state.n_tokens + prompt_ids.len() + max_tokens > state.max_seq
+    };
+    if overflow {
+        let (n, cap) = {
+            let state = m.lfm2moe_state.as_ref().unwrap();
+            (state.n_tokens, state.max_seq)
+        };
+        eprintln!(
+            "[daemon] arch_id=11 context full ({n}/{cap}) — resetting Lfm2MoeState",
+        );
+        let _ = m.lfm2moe_state.as_mut().unwrap().reset(gpu);
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+
+    let t0 = Instant::now();
+
+    // ── Prefill: decode_step per prompt token. The LAST decode_step's logits
+    // are the predictions for the first generated token. ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    {
+        let cfg = m.lfm2moe_config.as_ref().unwrap();
+        let weights = m.lfm2moe_weights.as_ref().unwrap();
+        let state = m.lfm2moe_state.as_mut().unwrap();
+        let mut position = state.n_tokens as u32;
+        for &tok in &prompt_ids {
+            match lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("lfm2moe prefill failed: {e:?}"));
+                    return;
+                }
+            }
+            position += 1;
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // ── Decode loop. Sample host-side from the running logits vector. ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if next_tok == eos_tok {
+            break;
+        }
+
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        let step = {
+            let cfg = m.lfm2moe_config.as_ref().unwrap();
+            let weights = m.lfm2moe_weights.as_ref().unwrap();
+            let state = m.lfm2moe_state.as_mut().unwrap();
+            let position = state.n_tokens as u32;
+            lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("lfm2moe decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = m.lfm2moe_state.as_ref().unwrap().n_tokens;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms,
+    );
+    let _ = stdout.flush();
+}
+
 
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
 ///

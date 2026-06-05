@@ -1196,6 +1196,59 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// LFM2 LIV double-gated short-conv, single-token decode. Reads the in_proj
+    /// output `bcx` [batch, 3*channels] (B | C_gate | x layout), applies the
+    /// B*x pre-gate, runs the depthwise causal conv over the rolling `state`
+    /// [batch, channels, K-1] history, applies the C_gate post-gate into
+    /// `out_y` [batch, channels], and advances `state` in place. kernel_size K
+    /// is a runtime arg (LFM2 K=3); conv_bias is always false.
+    pub fn conv1d_gated_decode_f32(
+        &mut self,
+        bcx: &GpuTensor,
+        state: &GpuTensor,
+        weight: &GpuTensor,
+        out_y: &GpuTensor,
+        batch: usize,
+        channels: usize,
+        kernel_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv1d_gated_decode",
+            kernels::CONV1D_GATED_DECODE_SRC,
+            "conv1d_gated_decode_f32",
+        )?;
+        let func = &self.functions["conv1d_gated_decode_f32"];
+        let mut bp = bcx.buf.as_ptr();
+        let mut sp = state.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut oyp = out_y.buf.as_ptr();
+        let mut bb = batch as i32;
+        let mut cc = channels as i32;
+        let mut kk = kernel_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut bp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut oyp as *mut _ as *mut c_void,
+            &mut bb as *mut _ as *mut c_void,
+            &mut cc as *mut _ as *mut c_void,
+            &mut kk as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (((batch * channels) as u32) + block - 1) / block;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Gated output norm: rmsnorm(x) * silu(z). Fused kernel.
     #[cfg(feature = "deltanet")]
     pub fn gated_norm_f32(
