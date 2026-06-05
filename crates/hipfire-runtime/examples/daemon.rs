@@ -117,9 +117,9 @@ fn think_continuation() -> String {
 /// force-close / budget-alert site so they stay consistent.
 fn currently_in_think(raw_str: &str, started_in_think: bool) -> bool {
     match (raw_str.rfind("<think>"), raw_str.rfind("</think>")) {
-        (Some(o), Some(c)) => o > c,      // both present: in-think iff opener is latest
-        (Some(_), None) => true,          // generated opener, not yet closed
-        (None, Some(_)) => false,         // closed (e.g. a prompt-injected opener) → answering
+        (Some(o), Some(c)) => o > c, // both present: in-think iff opener is latest
+        (Some(_), None) => true,     // generated opener, not yet closed
+        (None, Some(_)) => false,    // closed (e.g. a prompt-injected opener) → answering
         (None, None) => started_in_think, // no tags generated yet → trust the prompt prefix
     }
 }
@@ -2168,15 +2168,26 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .map(ThinkMode::from_str)
                     .unwrap_or(ThinkMode::NonThink);
-                let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+                let repeat_window = msg
+                    .get("repeat_window")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(128) as usize;
                 // OpenAI subtractive penalties. The CLI forwards raw
                 // `presence_penalty`/`frequency_penalty` (0.0 = off). Unlike the
                 // recency-weighted multiplicative `repeat_penalty`, these are
                 // flat across the (now long) window, which is what breaks the
                 // block-level repetition loops on long reasoning generations.
                 // Clamp negatives to 0 (negative would REWARD repetition).
-                let presence_penalty = (msg.get("presence_penalty").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32).max(0.0);
-                let frequency_penalty = (msg.get("frequency_penalty").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32).max(0.0);
+                let presence_penalty = (msg
+                    .get("presence_penalty")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32)
+                    .max(0.0);
+                let frequency_penalty = (msg
+                    .get("frequency_penalty")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32)
+                    .max(0.0);
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
                 // cache so the model "sees" them as part of its own trajectory,
@@ -2436,10 +2447,23 @@ fn main() {
                         continue;
                     }
                     generate(
-                        m, &mut gpu, pflash_drafter_gpu.as_mut(), &mut stdout, id, prompt, system,
-                        temp, top_p, max_tokens, repeat_penalty, repeat_window,
-                        presence_penalty, frequency_penalty,
-                        budget_alert_at_tok, &budget_alert_text, max_think_tokens,
+                        m,
+                        &mut gpu,
+                        pflash_drafter_gpu.as_mut(),
+                        &mut stdout,
+                        id,
+                        prompt,
+                        system,
+                        temp,
+                        top_p,
+                        max_tokens,
+                        repeat_penalty,
+                        repeat_window,
+                        presence_penalty,
+                        frequency_penalty,
+                        budget_alert_at_tok,
+                        &budget_alert_text,
+                        max_think_tokens,
                         assistant_prefix,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
@@ -2944,7 +2968,11 @@ fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) 
     }
 
     // 3. HFQ-embedded.
-    hfq.chat_template()
+    let tpl = hfq.chat_template();
+    if tpl.is_some() {
+        eprintln!("[chat_template] using HFQ-embedded tokenizer_config.chat_template");
+    }
+    tpl
 }
 
 fn parse_state_quant(
@@ -3787,7 +3815,8 @@ fn load_model(
         // a block-level repetition loop (~150 tok on Qwen3.6-A3B long reasoning),
         // so the anti-repeat machinery literally could not see a full loop to
         // suppress it. 2048 spans the loop period. Buffer is [2048] F32 = 8 KB.
-        let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &config, 2048, physical_cap).map_err(|e| format!("{e}"))?;
+        let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &config, 2048, physical_cap)
+            .map_err(|e| format!("{e}"))?;
 
         // Build eviction policy if the operator supplied a sidecar. Qwen3 (arch_id < 5)
         // lacks the FA/LA hybrid wiring TriAttention needs, so sidecars only take
@@ -4466,7 +4495,8 @@ fn load_model_pp(
     let (dn, la_to_device) = DeltaNetState::new_with_quant_multi(&mut gpus, &config, dn_quant)
         .map_err(|e| format!("{e}"))?;
 
-    let scratch_set = Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 2048, max_seq).map_err(|e| format!("{e}"))?;
+    let scratch_set = Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 2048, max_seq)
+        .map_err(|e| format!("{e}"))?;
 
     // ROCm 6.4.3 gotcha: enable_peer_access AFTER all allocations are live.
     // See multi_gpu.rs::enable_peer_all docstring for the silent-success bug
@@ -5920,10 +5950,17 @@ fn generate_dflash(
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(
                     raw_str,
-                    matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink),
+                    matches!(
+                        assistant_prefix,
+                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                    ),
                 );
-                if in_think && !prev_in_think { think_count = 0; }
-                if in_think { think_count += 1; }
+                if in_think && !prev_in_think {
+                    think_count = 0;
+                }
+                if in_think {
+                    think_count += 1;
+                }
                 prev_in_think = in_think;
 
                 if in_think && think_count >= max_think_tokens {
@@ -6461,7 +6498,8 @@ fn generate_multi(
     // Effective penalty window = request `_repeat_window` (default 128),
     // bounded by repeat_buf capacity (2048). Default stays 128; the wide buffer
     // only enables a larger window when a request explicitly sets one.
-    let repeat_buf_cap = (scratch_set.per_device[dev_last].repeat_buf.buf.size() / 4).min(_repeat_window.max(1));
+    let repeat_buf_cap =
+        (scratch_set.per_device[dev_last].repeat_buf.buf.size() / 4).min(_repeat_window.max(1));
 
     if let Err(e) = qwen35::forward_prefill_batch_multi(
         gpus,
@@ -6562,7 +6600,9 @@ fn generate_multi(
     // generation runs this many tokens past it — generous for a real final
     // answer, bounded against runaway.
     let post_latch_answer_budget: usize = std::env::var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(768);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(768);
     let mut latch_gen_mark: Option<usize> = None;
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
@@ -6648,9 +6688,14 @@ fn generate_multi(
             let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
             let in_think = currently_in_think(
                 raw_str,
-                matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink),
+                matches!(
+                    assistant_prefix,
+                    hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                ),
             );
-            if in_think { total_think_tokens += 1; }
+            if in_think {
+                total_think_tokens += 1;
+            }
             if max_total_think > 0 && total_think_tokens >= max_total_think {
                 force_answer_latched = true;
             }
@@ -6765,7 +6810,10 @@ fn generate_multi(
             let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
             let in_think = currently_in_think(
                 raw_str,
-                matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink),
+                matches!(
+                    assistant_prefix,
+                    hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                ),
             );
             if !in_think {
                 let _ = writeln!(
@@ -6973,7 +7021,31 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode) {
+fn generate(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    drafter_gpu: Option<&mut rdna_compute::Gpu>,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    budget_alert_at_tok: usize,
+    budget_alert_text: &str,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    think_mode: ThinkMode,
+) {
     // Compress runs on the PFlash drafter handle when one is set (hetero
     // sibling device), else on the target gpu. The handle is consumed at
     // the seq_pos==0 compress site; decode always uses `gpu`.
@@ -7051,10 +7123,24 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // doesn't need to thread any of those args through.
     if m.pp > 1 {
         generate_multi(
-            m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
-            temp, top_p, max_tokens, repeat_penalty, repeat_window,
-            presence_penalty, frequency_penalty,
-            budget_alert_at_tok, budget_alert_text, max_think_tokens,
+            m,
+            gpu,
+            pflash_state,
+            pflash_cfg,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+            budget_alert_at_tok,
+            budget_alert_text,
+            max_think_tokens,
             assistant_prefix,
             tools,
             messages_history,
@@ -8324,7 +8410,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // re-open loop after the cap latches would run to max_tokens. Hard-EOS
         // once generation runs this many tokens past the latch.
         let post_latch_answer_budget: usize = std::env::var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(768);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(768);
         let mut latch_gen_mark: Option<usize> = None;
 
         // N-gram loop detector: track 4-gram token sequences. When any
@@ -8510,7 +8598,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(
                     raw_str,
-                    matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink),
+                    matches!(
+                        assistant_prefix,
+                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                    ),
                 );
                 // Total-think bound (re-arm-proof). Count every think token; at the
                 // cap, latch force-answer (force-close + block <think>); a margin
@@ -8663,7 +8754,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let in_think = currently_in_think(
                     raw_str,
-                    matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink),
+                    matches!(
+                        assistant_prefix,
+                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                    ),
                 );
                 if !in_think {
                     let _ = writeln!(
