@@ -58,11 +58,30 @@ cd hipfire
 cargo build --release --features deltanet --example daemon -p hipfire-runtime
 cargo build --release --features deltanet --example test_kernels -p hipfire-runtime
 cargo build --release -p hipfire-quantize
+./scripts/install-hooks.sh
 ```
 
 Requires Rust 1.75+ and ROCm 6+ (the dev workflow needs `hipcc` for
 kernel JIT). Pre-compiled kernel blobs ship for gfx1010 / gfx1030 /
 gfx1100 / gfx1200; other arches JIT-compile on first load.
+
+`scripts/install-hooks.sh` is idempotent; it sets
+`core.hooksPath=.githooks` and makes the local pre-commit hook
+executable.
+
+### No-GPU CI subset
+
+The default CI path intentionally avoids AMD GPU access and model
+downloads:
+
+```bash
+./scripts/no-gpu-ci.sh
+```
+
+It runs `cargo check --workspace --examples`, no-GPU Rust unit tests,
+CPU Python tests, the env/docs drift check, and Bun tests/typecheck
+when Bun is installed. GPU coherence and speed gates remain required
+for kernel, dispatch, quant, forward-pass, and spec-decode changes.
 
 ### GPU kernel correctness check
 
