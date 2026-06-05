@@ -13,7 +13,7 @@
 ### Task 1: Scaffold the binary with arg parsing and model loading
 
 **Files:**
-- Create: `crates/engine/examples/channel_test_mmq.rs`
+- Create: `crates/hipfire-runtime/examples/channel_test_mmq.rs`
 
 - [ ] **Step 1: Create the binary with arg parsing and model load**
 
@@ -115,7 +115,7 @@ If you don't have `qwen3.5-9b.mq4`, use whichever `.mq4` model is available in `
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/engine/examples/channel_test_mmq.rs
+git add crates/hipfire-runtime/examples/channel_test_mmq.rs
 git commit -m "feat(diag): scaffold channel_test_mmq binary for #87 MMQ analysis"
 ```
 
@@ -126,7 +126,7 @@ git commit -m "feat(diag): scaffold channel_test_mmq binary for #87 MMQ analysis
 These are the shared building blocks all three stages use.
 
 **Files:**
-- Modify: `crates/engine/examples/channel_test_mmq.rs`
+- Modify: `crates/hipfire-runtime/examples/channel_test_mmq.rs`
 
 - [ ] **Step 1: Add the comparison stats struct and diff function**
 
@@ -275,7 +275,7 @@ pub fn gemm_hfq4g256_mmq_set_prequant(...)
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/engine/examples/channel_test_mmq.rs crates/rdna-compute/src/dispatch.rs
+git add crates/hipfire-runtime/examples/channel_test_mmq.rs crates/rdna-compute/src/dispatch.rs
 git commit -m "feat(diag): add comparison helpers and synth activation gen for channel_test_mmq"
 ```
 
@@ -284,7 +284,7 @@ git commit -m "feat(diag): add comparison helpers and synth activation gen for c
 ### Task 3: Implement site-scan stage
 
 **Files:**
-- Modify: `crates/engine/examples/channel_test_mmq.rs`
+- Modify: `crates/hipfire-runtime/examples/channel_test_mmq.rs`
 
 - [ ] **Step 1: Implement `site_scan`**
 
@@ -411,7 +411,7 @@ should show non-zero error. Record which sites are worst.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/engine/examples/channel_test_mmq.rs
+git add crates/hipfire-runtime/examples/channel_test_mmq.rs
 git commit -m "feat(diag): implement site-scan stage for channel_test_mmq"
 ```
 
@@ -420,7 +420,7 @@ git commit -m "feat(diag): implement site-scan stage for channel_test_mmq"
 ### Task 4: Implement channel-map stage
 
 **Files:**
-- Modify: `crates/engine/examples/channel_test_mmq.rs`
+- Modify: `crates/hipfire-runtime/examples/channel_test_mmq.rs`
 
 - [ ] **Step 1: Add per-row stats struct and computation**
 
@@ -587,7 +587,7 @@ Expected: Prints per-row error table for layer 0's `wo` projection.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/engine/examples/channel_test_mmq.rs
+git add crates/hipfire-runtime/examples/channel_test_mmq.rs
 git commit -m "feat(diag): implement channel-map stage for channel_test_mmq"
 ```
 
@@ -596,7 +596,7 @@ git commit -m "feat(diag): implement channel-map stage for channel_test_mmq"
 ### Task 5: Implement layer-sweep stage
 
 **Files:**
-- Modify: `crates/engine/examples/channel_test_mmq.rs`
+- Modify: `crates/hipfire-runtime/examples/channel_test_mmq.rs`
 
 - [ ] **Step 1: Implement `layer_sweep`**
 
@@ -694,7 +694,7 @@ Expected: Prints per-layer error for the `residual` site across all layers.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/engine/examples/channel_test_mmq.rs
+git add crates/hipfire-runtime/examples/channel_test_mmq.rs
 git commit -m "feat(diag): implement layer-sweep stage for channel_test_mmq"
 ```
 
@@ -706,7 +706,7 @@ The `match (layer, site) => wt` block is duplicated across `site_scan`, `channel
 and `layer_sweep`. Extract it into a shared function.
 
 **Files:**
-- Modify: `crates/engine/examples/channel_test_mmq.rs`
+- Modify: `crates/hipfire-runtime/examples/channel_test_mmq.rs`
 
 - [ ] **Step 1: Extract `get_weight_for_site`**
 
@@ -777,7 +777,7 @@ Expected: Same output as before.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/engine/examples/channel_test_mmq.rs
+git add crates/hipfire-runtime/examples/channel_test_mmq.rs
 git commit -m "refactor(diag): extract get_weight_for_site helper, DRY site lookups"
 ```
 

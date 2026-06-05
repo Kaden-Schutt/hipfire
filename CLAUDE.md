@@ -325,7 +325,9 @@ now implemented in `hipfire-detect::ngram` as a soft warn.
 
 Any DDTree / spec-decode / slow-path-kill change that claims a τ or tok/s
 improvement MUST pass `scripts/coherence-gate-dflash.sh` (shipped 9883e98)
-before commit. Enhanced three-tier thresholds (as of 2026-04-26):
+before commit. The script's inline detector enforces all three tiers below:
+Tier 1 + Tier 2 are hard fails (non-zero exit), Tier 3 is a soft `FLAG`
+status in the report for human eyeball. Thresholds (as of 2026-04-26):
 
 **Tier 1 — First 128 tokens (hard fail, catches single-token attractors):**
 - `unique_token_ratio < 0.15` OR `max_single_token_frequency > 0.50`
@@ -398,8 +400,8 @@ identically.
 correctness cost. Opt out with `HIPFIRE_NORMALIZE_PROMPT=0` (or
 `prompt_normalize=false` in config) only when raw `\n{3,}` whitespace is
 semantically load-bearing. See:
-- `crates/engine/src/tokenizer.rs:maybe_normalize_prompt()` — engine impl
-- `crates/engine/examples/encode_prompt.rs` — verification utility
+- `crates/hipfire-runtime/src/tokenizer.rs:maybe_normalize_prompt()` — engine impl
+- `crates/hipfire-runtime/examples/encode_prompt.rs` — verification utility
 - commit 9a2c667 — root cause + bench data behind the default flip
 
 **Canonical bench config (post-2026-04-26) for 27B-3.5 LRU code DFlash:**
@@ -417,15 +419,16 @@ only. Drift >5% from the current q8/max256 baseline is a regression
 ## GPU Lock Protocol (Multi-Agent)
 
 When multiple Claude Code agents work in parallel (e.g. via worktrees), they coordinate
-GPU access through `gpu-lock.sh`. **This is enforced automatically via hooks in
-`.claude/settings.json`** — any `cargo` command triggers lock acquire before execution
-and release after completion.
+GPU access through `scripts/gpu-lock.sh`. **Coordination is currently MANUAL** — there is
+no committed hook that auto-acquires the lock. (`.claude/settings.json` is not tracked in
+the repo; if you want `cargo` commands to auto-acquire/release, wire a PreToolUse/PostToolUse
+hook in your own local `.claude/settings.json` that sources `scripts/gpu-lock.sh`.)
 
 - Lock file: `/tmp/hipfire-gpu.lock`
 - Contains a human-readable status like `model-ingestion agent is using the gpu`
 - Agents poll every 5s (configurable via `GPU_POLL_INTERVAL`) when the GPU is busy
-- Manual usage: `source gpu-lock.sh && gpu_acquire "<branch>" && gpu_release`
-- Check status: `source gpu-lock.sh && gpu_status`
+- Manual usage: `source scripts/gpu-lock.sh && gpu_acquire "<branch>" && gpu_release`
+- Check status: `source scripts/gpu-lock.sh && gpu_status`
 
 ## Rules
 

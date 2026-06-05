@@ -58,13 +58,13 @@ hipfire already has several ingredients that make a native version plausible:
 
 | Need | Existing hipfire surface |
 |---|---|
-| Quantized 27B target | HFQ / MQ4 / MQ3 target loading in `crates/engine/src/qwen35.rs` and daemon load path |
+| Quantized 27B target | HFQ / MQ4 / MQ3 target loading in `crates/hipfire-arch-qwen35/src/qwen35.rs` and daemon load path |
 | Fast prefill chunks | `qwen35::forward_prefill_batch` / `forward_prefill_batch_with_pbs` |
-| Spec-decode handoff | `crates/engine/src/dflash.rs`, `crates/engine/src/speculative.rs`, `crates/engine/src/ddtree.rs` |
-| Long-context KV formats | `llama::KvCache` asym2/asym3/asym4/q8 paths in `crates/engine/src/llama.rs` |
-| KV / hidden compaction concepts | TriAttention / CASK scaffolding in `crates/engine/src/triattn.rs` and `crates/engine/src/cask.rs` |
+| Spec-decode handoff | `crates/hipfire-runtime/src/dflash.rs`, `crates/hipfire-arch-qwen35/src/speculative.rs`, `crates/hipfire-runtime/src/ddtree.rs` |
+| Long-context KV formats | `llama::KvCache` asym2/asym3/asym4/q8 paths in `crates/hipfire-runtime/src/llama.rs` |
+| KV / hidden compaction concepts | TriAttention / CASK scaffolding in `crates/hipfire-runtime/src/triattn.rs` and `crates/hipfire-runtime/src/cask.rs` |
 | HIP kernel pipeline | `kernels/src/*.hip`, `crates/rdna-compute/src/kernels.rs`, `crates/rdna-compute/src/dispatch.rs` |
-| Daemon state machine | `crates/engine/examples/daemon.rs` |
+| Daemon state machine | `crates/hipfire-runtime/examples/daemon.rs` |
 
 PFlash should be treated as a **front-of-prefill compression stage**, not as a replacement for DFlash decode. It should produce a shorter token stream that the target prefills normally.
 
@@ -178,7 +178,7 @@ The target sees the compressed stream as the actual prompt. Positions are contig
 Add a new module:
 
 ```text
-crates/engine/src/pflash.rs
+crates/hipfire-arch-qwen35/src/pflash.rs
 ```
 
 Suggested API:
@@ -229,7 +229,7 @@ pub fn maybe_compress_prompt(
 
 Initial drafter target: Qwen3-0.6B.
 
-Because `crates/engine/examples/daemon.rs` currently loads target models from HFQ, the cleanest first implementation is:
+Because `crates/hipfire-runtime/examples/daemon.rs` currently loads target models from HFQ, the cleanest first implementation is:
 
 1. Add or extend quantizer support so `hipfire-quantize` can produce a Qwen3-0.6B BF16 or MQ4 HFQ drafter artifact.
 2. Require tokenizer compatibility with the target:
@@ -277,7 +277,7 @@ benchmarks/longctx/niah/
   niah_64k.jsonl
   niah_128k.jsonl
 
-crates/engine/examples/pflash_niah_bench.rs
+crates/hipfire-runtime/examples/pflash_niah_bench.rs
 ```
 
 Requirements:
@@ -299,16 +299,16 @@ Goal: prove attention-based compression quality before optimizing drafter cost.
 Add:
 
 ```text
-crates/engine/src/pflash.rs
-crates/engine/examples/pflash_compress_demo.rs
+crates/hipfire-arch-qwen35/src/pflash.rs
+crates/hipfire-runtime/examples/pflash_compress_demo.rs
 ```
 
 Modify:
 
 ```text
-crates/engine/src/lib.rs
-crates/engine/src/llama.rs
-crates/engine/examples/daemon.rs   # only enough to load / debug the drafter, not auto-enable
+crates/hipfire-runtime/src/lib.rs
+crates/hipfire-runtime/src/llama.rs
+crates/hipfire-runtime/examples/daemon.rs   # only enough to load / debug the drafter, not auto-enable
 ```
 
 Work:
@@ -374,8 +374,8 @@ kernels/src/attention_pflash_sparse_fwd.hip
 Potentially modify:
 
 ```text
-crates/engine/src/llama.rs
-crates/engine/src/pflash.rs
+crates/hipfire-runtime/src/llama.rs
+crates/hipfire-arch-qwen35/src/pflash.rs
 crates/rdna-compute/src/kernels.rs
 crates/rdna-compute/src/dispatch.rs
 ```
@@ -401,8 +401,8 @@ Goal: make PFlash a user-facing, opt-in feature.
 Modify:
 
 ```text
-crates/engine/examples/daemon.rs
-crates/engine/examples/run.rs
+crates/hipfire-runtime/examples/daemon.rs
+crates/hipfire-runtime/examples/run.rs
 # CLI/config crates if present in the active branch
 # docs/CONFIG.md or equivalent config docs
 ```

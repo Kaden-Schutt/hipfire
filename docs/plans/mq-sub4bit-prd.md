@@ -50,7 +50,7 @@ Prove (or disprove) that `gemv_mq3g256_with_rotate` and `gemv_mq2g256_with_rotat
 
 ### 3.2 Method
 
-- **Harness:** `crates/engine/examples/verify_mq_kernel.rs` (committed 2026-04-30).
+- **Harness:** `crates/hipfire-runtime/examples/verify_mq_kernel.rs` (committed 2026-04-30).
 - **Inputs:** Deterministic pseudo-random weights and activations (`fract_sin` PRNG) at shapes `(4,256)`, `(4,512)`, `(8,1024)`.
 - **CPU reference:**
   1. Rotate `x` with `cpu_fwht_256(signs1, signs2)` matching quantizer math exactly.
