@@ -1,0 +1,3 @@
+[submodule "third_party/KVarN"]
+	path = third_party/KVarN
+	url = https://github.com/huawei-csl/KVarN.git
