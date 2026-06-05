@@ -379,13 +379,21 @@ fn for_gemv_prerotated_maps_mq_family() {
 }
 
 #[test]
-fn for_gemv_prerotated_rejects_non_mq_dtypes() {
+fn for_gemv_prerotated_resolves_rotation_free_dtypes() {
+    // Rotation-free dtypes have no separate "prerotated" kernel — prerotated input ==
+    // plain input — so for_gemv_prerotated routes them to their plain key (the
+    // rotation-free fix). Rotation-needing dtypes without an explicit prerotated arm
+    // (e.g. MQ4G128 = FwhtG128) still Err: plain would re-rotate already-rotated input.
     for dtype in [DType::F32, DType::HFQ4G256, DType::Q8_0] {
         assert!(
-            KernelKey::for_gemv_prerotated(dtype).is_err(),
-            "expected error for {dtype:?}",
+            KernelKey::for_gemv_prerotated(dtype).is_ok(),
+            "rotation-free {dtype:?} prerotated should route to plain",
         );
     }
+    assert!(
+        KernelKey::for_gemv_prerotated(DType::MQ4G128).is_err(),
+        "MQ4G128 (FwhtG128) prerotated must Err — plain would double-rotate",
+    );
 }
 
 #[test]
@@ -420,9 +428,10 @@ fn for_gemv_swiglu_residual_maps_hfq_and_mq() {
 
 #[test]
 fn for_gemv_rejects_unsupported_variant_combo() {
-    // Prerotated for F32 has no kernel.
-    assert!(KernelKey::for_gemv_prerotated(DType::F32).is_err());
-    // Residual for F32 has no kernel.
+    // Prerotated for F32 (rotation-free) routes to the plain GemvF32 key.
+    assert!(KernelKey::for_gemv_prerotated(DType::F32).is_ok());
+    // Residual for F32 has no fused-kernel key — the Step lowering falls back to
+    // plain GEMV + add_inplace instead, so the key constructor still Errs.
     assert!(KernelKey::for_gemv_residual(DType::F32).is_err());
 }
 
@@ -485,7 +494,8 @@ fn gemv_family_resolves_mq3_prerotated_only_on_wmma_arch() {
     assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_err());
     assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_ok());
     assert!(fam.resolve(DType::MQ4G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_ok());
-    assert!(fam.resolve(DType::F32, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_err());
+    // F32 prerotated now resolves (rotation-free → plain GemvF32, Always-arch).
+    assert!(fam.resolve(DType::F32, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_ok());
 }
 
 // ── Pipeline::can_satisfy ─────────────────────────────────────────────────────
