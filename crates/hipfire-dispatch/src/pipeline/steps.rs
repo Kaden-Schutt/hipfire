@@ -279,6 +279,16 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 // x_plain is not written in this path (scratch only for FWHT path).
                 gpu.rmsnorm_f32(x, norm_weight, out, *eps)
                     .map_err(|e| DispatchError::Hip(e.to_string()))
+            } else if *rotation == RotationPlan::Mq8Internal {
+                // MQ8 cannot share LDS with the FWHT-G256 fused kernel: it produces an
+                // INT8 scratch consumed by the downstream gemv_mq8_prerotated kernel.
+                // RotationFamily::WithRmsnorm would route to fused_rmsnorm_rotate_mq
+                // (FWHT, F32 output) — wrong dtype for the MQ8 GEMV. Mirror the fix
+                // from qwen35.rs::rmsnorm_rotate_dispatch (7b35e700).
+                gpu.rmsnorm_f32(x, norm_weight, out, *eps)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gpu.rotate_quantize_x_mq8(out, *k)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))
             } else {
                 let rotation_family = ROTATION.get_or_init(RotationFamily::new);
                 rotation_family.run(ctx, gpu, RotationParams {
