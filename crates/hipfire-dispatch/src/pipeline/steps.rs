@@ -118,6 +118,36 @@ pub(crate) fn guard_qkv_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
         && gemv_steps_uniform(steps, dt, true)
 }
 
+// ── QKVZA 4-way guards (DeltaNet linear attention) ──
+
+pub(crate) fn guard_qkvza_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    steps.len() == 5 && gemv_steps_uniform(steps, DType::MQ4G256Lloyd, true)
+}
+
+pub(crate) fn guard_qkvza_mq3g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    steps.len() == 5 && gemv_steps_uniform(steps, DType::MQ3G256Lloyd, true)
+}
+
+/// Covers both DType::MQ4G256 (plain) and DType::HFQ4G256.
+pub(crate) fn guard_qkvza_hfq4g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    if steps.len() != 5 { return false; }
+    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
+        && gemv_steps_uniform(steps, dt, true)
+}
+
+/// Covers both DType::HFQ6G256 and DType::MQ6G256 — both use dp4a.
+pub(crate) fn guard_qkvza_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if !dp4a_eligible(ctx) { return false; }
+    if steps.len() != 5 { return false; }
+    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
+    matches!(dt, DType::HFQ6G256 | DType::MQ6G256)
+        && gemv_steps_uniform(steps, dt, true)
+}
+
 // ── Gate+Up 2-way guards ──
 
 pub(crate) fn guard_gate_up_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
@@ -177,6 +207,10 @@ const QKV3: &[PipelineOp] = &[
     PipelineOp::RmsnormAutomatic,
     PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv,
 ];
+const QKVZA4: &[PipelineOp] = &[
+    PipelineOp::RmsnormAutomatic,
+    PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv,
+];
 const GATE_UP2: &[PipelineOp] = &[
     PipelineOp::RmsnormAutomatic,
     PipelineOp::Gemv, PipelineOp::Gemv,
@@ -188,6 +222,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
     FusedPattern { ops: QKV3, key: KernelKey::FusedQkvMq3G256Lloyd,  guard: guard_qkv_mq3g256lloyd  },
     FusedPattern { ops: QKV3, key: KernelKey::FusedQkvHfq4G256,      guard: guard_qkv_hfq4g256      },
     FusedPattern { ops: QKV3, key: KernelKey::FusedQkvHfq6G256,      guard: guard_qkv_hfq6g256      },
+    // ── QKVZA 4-way (DeltaNet linear attention) ────────────────────────────
+    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaMq4G256Lloyd,  guard: guard_qkvza_mq4g256lloyd  },
+    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaMq3G256Lloyd,  guard: guard_qkvza_mq3g256lloyd  },
+    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaHfq4G256,      guard: guard_qkvza_hfq4g256      },
+    FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaHfq6G256,      guard: guard_qkvza_hfq6g256      },
     // ── Gate+Up 2-way ───────────────────────────────────────────────────────
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMq4G256Lloyd, guard: guard_gate_up_mq4g256lloyd },
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMq3G256Lloyd, guard: guard_gate_up_mq3g256lloyd },
@@ -364,6 +403,89 @@ fn launch_fused(
                 k: wg.k,
             })
         }
+        // ── QKVZA 4-way (DeltaNet) ──
+        KernelKey::FusedQkvzaHfq4G256
+        | KernelKey::FusedQkvzaMq3G256Lloyd
+        | KernelKey::FusedQkvzaMq4G256Lloyd
+        | KernelKey::FusedQkvzaHfq6G256 => {
+            let (wqkv, qkv)   = gemv_weight_out(&steps[1]);
+            let (wz, z)       = gemv_weight_out(&steps[2]);
+            let (wb, beta)    = gemv_weight_out(&steps[3]);
+            let (wa, alpha)   = gemv_weight_out(&steps[4]);
+            fused_qkv.run(ctx, gpu, &FusedQkvParams {
+                kind: key,
+                weights: &[wqkv.buf, wz.buf, wb.buf, wa.buf],
+                x: activated,
+                outputs: &[qkv, z, beta, alpha],
+                m: &[wqkv.m, wz.m, wb.m, wa.m],
+                k: wqkv.k,
+            })
+        }
         _ => Err(DispatchError::MissingImpl { key }),
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::DispatchCtx;
+    use crate::families::fused_qkv::FusedQkvFamily;
+    use crate::types::KernelKey;
+
+    #[test]
+    fn qkvza_fused_table_entries_exist() {
+        let keys: Vec<_> = FUSED_TABLE.iter().map(|e| e.key).collect();
+        assert!(keys.contains(&KernelKey::FusedQkvzaMq4G256Lloyd), "FusedQkvzaMq4G256Lloyd missing");
+        assert!(keys.contains(&KernelKey::FusedQkvzaMq3G256Lloyd), "FusedQkvzaMq3G256Lloyd missing");
+        assert!(keys.contains(&KernelKey::FusedQkvzaHfq4G256),     "FusedQkvzaHfq4G256 missing");
+        assert!(keys.contains(&KernelKey::FusedQkvzaHfq6G256),     "FusedQkvzaHfq6G256 missing");
+
+        for entry in FUSED_TABLE.iter() {
+            if matches!(entry.key,
+                KernelKey::FusedQkvzaMq4G256Lloyd
+                | KernelKey::FusedQkvzaMq3G256Lloyd
+                | KernelKey::FusedQkvzaHfq4G256
+                | KernelKey::FusedQkvzaHfq6G256
+            ) {
+                assert_eq!(entry.ops.len(), 5, "QKVZA entry {:?} should have 5 ops", entry.key);
+            }
+        }
+    }
+
+    #[test]
+    fn qkvza_guards_reject_short_slices() {
+        let ctx = DispatchCtx::for_test("gfx1100");
+        // Guards must return false for slices shorter than 5 steps.
+        let empty: &[Step] = &[];
+        assert!(!guard_qkvza_mq4g256lloyd(empty, &ctx));
+        assert!(!guard_qkvza_mq3g256lloyd(empty, &ctx));
+        assert!(!guard_qkvza_hfq4g256(empty, &ctx));
+        assert!(!guard_qkvza_hfq6g256(empty, &ctx));
+    }
+
+    #[test]
+    fn qkvza_fused_table_arch_coverage() {
+        let family = FusedQkvFamily::new();
+        let ctx1100 = DispatchCtx::for_test("gfx1100");
+        let ctx1201 = DispatchCtx::for_test("gfx1201");
+
+        let wmma_keys = &[
+            KernelKey::FusedQkvzaMq4G256Lloyd,
+            KernelKey::FusedQkvzaMq3G256Lloyd,
+            KernelKey::FusedQkvzaHfq4G256,
+        ];
+
+        for &key in wmma_keys {
+            assert!(family.resolve(key, &ctx1100, None).is_ok(),
+                "QKVZA {:?} should resolve on gfx1100", key);
+            assert!(family.resolve(key, &ctx1201, None).is_ok(),
+                "QKVZA {:?} should resolve on gfx1201", key);
+        }
+
+        // dp4a key: just verify no panic
+        let _ = family.resolve(KernelKey::FusedQkvzaHfq6G256, &ctx1100, None);
+        let _ = family.resolve(KernelKey::FusedQkvzaHfq6G256, &ctx1201, None);
     }
 }
