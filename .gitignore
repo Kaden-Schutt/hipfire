@@ -1,6 +1,5 @@
 # Build output (not binaries shipped in releases)
 /target
-/target-baseline
 *.o
 *.so
 *.triattn.bin
@@ -108,3 +107,18 @@ bench/coherence-results/
 result-data.json
 result-table.md
 .rocprofv3/
+
+# Regenerable blobs — large calibration corpora and activation captures
+benchmarks/calib/calib-*.txt
+benchmarks/references/*_activations/
+
+# Raw benchmark output (logs, f32 tensors) — keep .md/.json summaries only
+benchmarks/results/**/*.log
+benchmarks/results/**/*.f32
+
+# Investigation source dumps (re-fetchable web/paper archives)
+docs/investigations/*/sources/
+
+# Build scratch
+/logs/
+/.build/
