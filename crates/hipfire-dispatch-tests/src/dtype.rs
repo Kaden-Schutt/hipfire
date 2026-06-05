@@ -54,15 +54,23 @@ fn quantized_dtypes_have_size_1() {
 // ── DType::supports_awq_sidecar() ──────────────────────────────
 
 #[test]
-fn awq_sidecar_only_on_mq4_and_mq3() {
+fn awq_sidecar_on_mq4_mq3_mq2_and_lloyd() {
+    // #415 broadened AWQ-sidecar to the sub-4-bit + Lloyd arms (AWQ×Lloyd).
     assert!(DType::MQ4G256.supports_awq_sidecar());
     assert!(DType::MQ3G256.supports_awq_sidecar());
+    assert!(DType::MQ2G256.supports_awq_sidecar());
+    assert!(DType::MQ3G256Lloyd.supports_awq_sidecar());
+    assert!(DType::MQ2G256Lloyd.supports_awq_sidecar());
 }
 
 #[test]
-fn awq_sidecar_not_on_mq_lloyd_or_hfq() {
+fn awq_sidecar_not_on_non_awq_dtypes() {
+    // AWQ-eligible set after #415: MQ4/MQ3/MQ2/MQ3-Lloyd/MQ2-Lloyd. Everything else off.
     for dt in MAGNUMQUANT_DTYPES {
-        if *dt == DType::MQ4G256 || *dt == DType::MQ3G256 { continue; }
+        if matches!(
+            *dt,
+            DType::MQ4G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ3G256Lloyd | DType::MQ2G256Lloyd
+        ) { continue; }
         assert!(!dt.supports_awq_sidecar(), "DType::{dt:?} should NOT support AWQ");
     }
     for dt in HFQ_DTYPES {
