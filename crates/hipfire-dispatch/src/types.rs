@@ -390,6 +390,12 @@ impl KernelKey {
             MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydPrerotated),
             MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydPrerotated),
             MFP4G32 => Ok(Self::GemvMfp4G32Prerotated),
+            // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
+            // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
+            // input feeds the same gemv_hfq4g128 kernel as its Plain path. launch()
+            // dispatches GemvQ8_0 → gpu.gemv_q8_0 and GemvParoQ4G128 → gpu.gemv_hfq4g128.
+            Q8_0 => Ok(Self::GemvQ8_0),
+            ParoQ4G128 => Ok(Self::GemvParoQ4G128),
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "gemv", variant: "prerotated",
                 arch: "", quant: "",
