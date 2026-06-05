@@ -19,7 +19,13 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [master]
+    # master = release line; integration/** = team staging branches for the
+    # dispatch-unification effort (#393/#397), pushed to directly by the team.
+    # Gating direct pushes catches the dead-gate / missing-arm / broken-test
+    # class (e.g. the 3 stale prerotated tests, gfx12 dead-gate) at push time
+    # via the GPU-free `cargo test --lib --workspace` dispatch coverage gate,
+    # not just on PRs.
+    branches: [master, 'integration/**']
 
 # Supersede in-flight runs when a PR gets new pushes.
 concurrency:
