@@ -10,18 +10,17 @@ use hip_bridge::{HipError, HipResult};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::{
     self, f16_to_f32, fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_mq_batched_for,
-    fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for, rotate_x_mq_batched_for,
-    rotate_x_mq_for, weight_gemv, weight_gemv_prerotated, weight_gemv_residual,
-    weight_gemv_swiglu_residual, EmbeddingFormat, ParoRotation, WeightTensor,
+    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for,
+    weight_gemv_prerotated, weight_gemv_swiglu_residual,
+    EmbeddingFormat, ParoRotation, WeightTensor,
 };
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::{GivensRef, WeightRef};
-use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
-use hipfire_dispatch::types::{PipelineOp, RotationPlan};
+use hipfire_dispatch::types::RotationPlan;
 use hipfire_dispatch::types::dtype_rotation_plan;
 use std::sync::OnceLock;
 
