@@ -368,7 +368,7 @@ const FIXTURES: &[FixtureCheck] = &[
 
 fn build_full_replay_bank() -> DetectorBank {
     use crate::{
-        attractor::{AttractorFirst128, AttractorLast128},
+        attractor::{AttractorFirst128, AttractorLast128, LongStateCollapse},
         eos_immediate::EosImmediate,
         ngram::{LoopGuardMirror, NgramDensity},
         special_leak::SpecialLeak,
@@ -379,6 +379,7 @@ fn build_full_replay_bank() -> DetectorBank {
     let mut bank = DetectorBank::new();
     bank.add(Box::new(AttractorFirst128::new()));
     bank.add(Box::new(AttractorLast128::new()));
+    bank.add(Box::new(LongStateCollapse::new()));
     bank.add(Box::new(NgramDensity::new()));
     bank.add(Box::new(LoopGuardMirror::new()));
     bank.add(Box::new(ThinkEmpty::new()));

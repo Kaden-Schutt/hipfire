@@ -15,6 +15,7 @@ mkdir -p "$RESULTS_DIR"
 PASS=0
 FAIL=0
 MAX_TIER=-1
+HIP_ARCH=""
 
 log() { echo "$1" | tee -a "$RESULT_FILE"; }
 pass() { log "  ✅ PASS: $1"; PASS=$((PASS+1)); MAX_TIER=$2; }
@@ -74,11 +75,12 @@ fi
 # Try rocminfo
 if command -v rocminfo &>/dev/null; then
     ROCMINFO_OUT=$(rocminfo 2>/dev/null || true)
-    if echo "$ROCMINFO_OUT" | grep -i "gfx10" >/dev/null 2>&1; then
-        GFX_ID=$(echo "$ROCMINFO_OUT" | grep -oP "gfx\d+" | head -1)
+    GFX_ID=$(echo "$ROCMINFO_OUT" | sed -nE 's/.*Name:[[:space:]]*(gfx[0-9a-z]+).*/\1/p; s/.*amdgcn-amd-amdhsa--(gfx[0-9a-z]+).*/\1/p' | head -1)
+    if [ -n "$GFX_ID" ]; then
+        HIP_ARCH="$GFX_ID"
         pass "rocminfo detects GPU: ${GFX_ID}" 1
     else
-        fail "rocminfo exists but doesn't detect gfx10 GPU"
+        fail "rocminfo exists but doesn't detect an AMD GPU ISA"
     fi
 else
     log "  ⚠️  rocminfo not installed (skipping)"
@@ -115,6 +117,10 @@ EOF
     if hipcc "$TMPDIR/test.cpp" -o "$TMPDIR/test" 2>/dev/null; then
         HIP_OUT=$("$TMPDIR/test" 2>&1 || true)
         if echo "$HIP_OUT" | grep -q "HIP OK"; then
+            HIP_ARCH_FROM_HIP=$(echo "$HIP_OUT" | sed -nE 's/.*\((gfx[0-9a-z]+)\).*/\1/p' | head -1)
+            if [ -n "$HIP_ARCH_FROM_HIP" ]; then
+                HIP_ARCH="$HIP_ARCH_FROM_HIP"
+            fi
             pass "HIP runtime initialized: ${HIP_OUT}" 2
         else
             fail "HIP compiled but runtime failed: ${HIP_OUT}"
@@ -142,9 +148,24 @@ if command -v hipcc &>/dev/null; then
 int main() {
     float *d_buf, h_buf[1024], h_out[1024];
     for (int i = 0; i < 1024; i++) h_buf[i] = (float)i;
+    memset(h_out, 0, sizeof(h_out));
     hipError_t e1 = hipMalloc(&d_buf, 1024 * sizeof(float));
+    if (e1 != hipSuccess) {
+        printf("MEMTEST: alloc=%d (%s)\n", e1, hipGetErrorString(e1));
+        return 1;
+    }
     hipError_t e2 = hipMemcpy(d_buf, h_buf, 1024 * sizeof(float), hipMemcpyHostToDevice);
+    if (e2 != hipSuccess) {
+        printf("MEMTEST: h2d=%d (%s)\n", e2, hipGetErrorString(e2));
+        hipFree(d_buf);
+        return 1;
+    }
     hipError_t e3 = hipMemcpy(h_out, d_buf, 1024 * sizeof(float), hipMemcpyDeviceToHost);
+    if (e3 != hipSuccess) {
+        printf("MEMTEST: d2h=%d (%s)\n", e3, hipGetErrorString(e3));
+        hipFree(d_buf);
+        return 1;
+    }
     hipFree(d_buf);
     int correct = (memcmp(h_buf, h_out, 1024 * sizeof(float)) == 0);
     printf("MEMTEST: alloc=%d h2d=%d d2h=%d verify=%s\n", e1, e2, e3, correct ? "PASS" : "FAIL");
@@ -181,6 +202,15 @@ if command -v hipcc &>/dev/null; then
 #include <hip/hip_runtime.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdlib.h>
+
+#define CHECK_HIP(call) do { \
+    hipError_t err = (call); \
+    if (err != hipSuccess) { \
+        printf("KERNEL: %s failed: %d (%s), result=FAIL\n", #call, err, hipGetErrorString(err)); \
+        return 1; \
+    } \
+} while (0)
 
 __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -193,18 +223,23 @@ int main() {
     h_a = (float*)malloc(N * sizeof(float));
     h_b = (float*)malloc(N * sizeof(float));
     h_c = (float*)malloc(N * sizeof(float));
+    if (!h_a || !h_b || !h_c) {
+        printf("KERNEL: host allocation failed, result=FAIL\n");
+        return 1;
+    }
     for (int i = 0; i < N; i++) { h_a[i] = (float)i; h_b[i] = (float)(N - i); }
 
-    hipMalloc(&d_a, N * sizeof(float));
-    hipMalloc(&d_b, N * sizeof(float));
-    hipMalloc(&d_c, N * sizeof(float));
-    hipMemcpy(d_a, h_a, N * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_b, h_b, N * sizeof(float), hipMemcpyHostToDevice);
+    CHECK_HIP(hipMalloc(&d_a, N * sizeof(float)));
+    CHECK_HIP(hipMalloc(&d_b, N * sizeof(float)));
+    CHECK_HIP(hipMalloc(&d_c, N * sizeof(float)));
+    CHECK_HIP(hipMemcpy(d_a, h_a, N * sizeof(float), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d_b, h_b, N * sizeof(float), hipMemcpyHostToDevice));
 
     vector_add<<<(N+255)/256, 256>>>(d_a, d_b, d_c, N);
-    hipDeviceSynchronize();
+    CHECK_HIP(hipGetLastError());
+    CHECK_HIP(hipDeviceSynchronize());
 
-    hipMemcpy(h_c, d_c, N * sizeof(float), hipMemcpyDeviceToHost);
+    CHECK_HIP(hipMemcpy(h_c, d_c, N * sizeof(float), hipMemcpyDeviceToHost));
 
     int errors = 0;
     for (int i = 0; i < N; i++) {
@@ -220,14 +255,22 @@ EOF
 )
     TMPDIR=$(mktemp -d)
     echo "$KERNEL_TEST" > "$TMPDIR/kernel.cpp"
-    if hipcc "$TMPDIR/kernel.cpp" -o "$TMPDIR/kernel" --offload-arch=gfx1010 2>/dev/null; then
+    ARCH_FLAGS=()
+    if [ -n "$HIP_ARCH" ]; then
+        ARCH_FLAGS=(--offload-arch="$HIP_ARCH")
+    fi
+    if hipcc "$TMPDIR/kernel.cpp" -o "$TMPDIR/kernel" "${ARCH_FLAGS[@]}" 2>/dev/null; then
         K_OUT=$("$TMPDIR/kernel" 2>&1 || true)
         if echo "$K_OUT" | grep -q "result=PASS"; then
-            pass "Compute kernel correct: ${K_OUT}" 4
+            if [ -n "$HIP_ARCH" ]; then
+                pass "Compute kernel correct (${HIP_ARCH}): ${K_OUT}" 4
+            else
+                pass "Compute kernel correct: ${K_OUT}" 4
+            fi
         else
             fail "Compute kernel wrong results: ${K_OUT}"
         fi
-    elif hipcc "$TMPDIR/kernel.cpp" -o "$TMPDIR/kernel" 2>/dev/null; then
+    elif [ -n "$HIP_ARCH" ] && hipcc "$TMPDIR/kernel.cpp" -o "$TMPDIR/kernel" 2>/dev/null; then
         K_OUT=$("$TMPDIR/kernel" 2>&1 || true)
         if echo "$K_OUT" | grep -q "result=PASS"; then
             pass "Compute kernel correct (default arch): ${K_OUT}" 4
@@ -235,7 +278,7 @@ EOF
             fail "Compute kernel wrong results: ${K_OUT}"
         fi
     else
-        fail "Kernel compilation failed for gfx1010"
+        fail "Kernel compilation failed${HIP_ARCH:+ for ${HIP_ARCH}}"
     fi
     rm -rf "$TMPDIR"
 else

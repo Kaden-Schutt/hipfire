@@ -92,6 +92,7 @@ pub struct TierBudget {
 #[serde(rename_all = "snake_case")]
 pub enum BatteryId {
     Smoke,
+    Coherence,
     Quality,
     Retrieval,
     Speed,
@@ -109,6 +110,7 @@ impl BatteryId {
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw {
             "smoke" => Ok(Self::Smoke),
+            "coherence" | "runtime_coherence" | "runtime-coherence" => Ok(Self::Coherence),
             "quality" => Ok(Self::Quality),
             "retrieval" => Ok(Self::Retrieval),
             "speed" => Ok(Self::Speed),
@@ -127,6 +129,7 @@ impl BatteryId {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Smoke => "smoke",
+            Self::Coherence => "coherence",
             Self::Quality => "quality",
             Self::Retrieval => "retrieval",
             Self::Speed => "speed",
@@ -897,7 +900,7 @@ pub fn usage() -> String {
     "Usage:\n  hipfire-eval --model <model> [--tier fast|medium|long|extensive]\n\n\
      Options:\n\
        --version                print Hipfire eval runner version/git metadata\n\
-       --battery <a,b>          smoke,quality,retrieval,speed,dflash,prompt_shape,structured,barrage,longctx,vision,cask,profile\n\
+       --battery <a,b>          smoke,coherence,quality,retrieval,speed,dflash,prompt_shape,structured,barrage,longctx,vision,cask,profile\n\
        --suite <a,b>            gpqa,lm_eval_micro,humaneval,deep_swe,swe_bench,ruler,nolima,needle_chain,niah,sequential_niah\n\
        --baseline <model>       baseline quantized model for candidate comparison\n\
        --reference <model>      higher precision reference model or fixture\n\
@@ -1016,6 +1019,7 @@ fn parse_f64(raw: &str, flag: &str) -> Result<f64, String> {
 pub fn default_batteries(tier: EvalTier) -> Vec<BatteryId> {
     let mut out = vec![
         BatteryId::Smoke,
+        BatteryId::Coherence,
         BatteryId::Quality,
         BatteryId::Retrieval,
         BatteryId::Speed,
@@ -3379,6 +3383,16 @@ fn write_evidence_artifacts(
             "profiling",
             &["kernel_name", "duration_us", "occupancy", "waves"][..],
         ),
+        (
+            "coherence.json",
+            "coherence",
+            &[
+                "hard_fails",
+                "soft_warns",
+                "detector_count",
+                "coherence_status",
+            ][..],
+        ),
     ];
     let mut out = BTreeMap::new();
     for (file, kind, expected_metrics) in specs {
@@ -3725,6 +3739,7 @@ fn runtime_evidence_paths_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
                     | "phase_timings"
                     | "memory"
                     | "performance"
+                    | "coherence"
                     | "dflash_trace"
                     | "quality"
             )
@@ -3861,12 +3876,14 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
         "memory" => &[],
         "dflash_trace" => &[BatteryId::Dflash],
         "profiling" => &[],
+        "coherence" => &[BatteryId::Coherence, BatteryId::Longctx, BatteryId::Dflash],
         _ => return Vec::new(),
     };
     results
         .iter()
         .filter(|row| {
-            row.status == EvalStatus::Pass
+            (row.status == EvalStatus::Pass
+                || (kind == "coherence" && row.status == EvalStatus::Fail))
                 && if kind == "performance" {
                     has_performance_metric(row)
                 } else if kind == "quality" {
@@ -4521,6 +4538,7 @@ fn observed_admission_evidence(
         "moe_router_histogram",
         "memory",
         "dflash_trace",
+        "coherence",
         "profiling",
     ]
     .into_iter()
@@ -4656,6 +4674,25 @@ fn mock_battery_rows(
                 config.model.clone(),
             ),
         ],
+        BatteryId::Coherence => mock_metric_family_rows(
+            battery,
+            "runtime_detector_canary",
+            prompt("benchmarks/prompts/qwen2_smoke.txt"),
+            config,
+            ctx,
+            |_model| {
+                BTreeMap::from([
+                    ("hard_fails".to_string(), json!(0.0)),
+                    ("soft_warns".to_string(), json!(0.0)),
+                    ("detector_count".to_string(), json!(8.0)),
+                    (
+                        "detector_profile".to_string(),
+                        json!("default_runtime_coherence"),
+                    ),
+                    ("runtime_path".to_string(), json!("daemon_jsonl_mock")),
+                ])
+            },
+        ),
         BatteryId::Quality => mock_metric_family_rows(
             battery,
             "kld_reference_slice",
@@ -5807,6 +5844,7 @@ fn examples_battery_rows(
             ),
             run_direct_session_reset_recall(config, ctx),
         ]),
+        BatteryId::Coherence => Some(vec![run_examples_coherence_anchor(config, ctx)]),
         BatteryId::Speed => Some(
             evaluation_models(config)
                 .into_iter()
@@ -5908,15 +5946,37 @@ fn direct_battery_rows(
 
 fn examples_executor_available_for(battery: BatteryId) -> bool {
     match battery {
+        BatteryId::Coherence => crate::coherence_runtime::daemon_binary_available(),
         BatteryId::Smoke
         | BatteryId::PromptShape
         | BatteryId::Structured
         | BatteryId::Barrage
-        | BatteryId::Longctx
         | BatteryId::Profile => resolve_run_example_bin().is_some(),
+        BatteryId::Longctx => crate::coherence_runtime::daemon_binary_available(),
         BatteryId::Speed | BatteryId::Dflash => resolve_dflash_spec_demo_bin().is_some(),
         _ => false,
     }
+}
+
+fn run_examples_coherence_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalResult {
+    run_daemon_coherence_anchor(
+        BatteryId::Coherence,
+        "runtime_detector_canary",
+        "benchmarks/prompts/qwen2_smoke.txt",
+        prompt("benchmarks/prompts/qwen2_smoke.txt"),
+        config,
+        ctx,
+        config.model.clone(),
+        None,
+        BTreeMap::from([
+            (
+                "detector_profile".to_string(),
+                json!("default_runtime_coherence"),
+            ),
+            ("runtime_path".to_string(), json!("daemon_jsonl")),
+        ]),
+        None,
+    )
 }
 
 fn run_examples_profile_anchor(
@@ -5949,9 +6009,9 @@ fn run_examples_profile_anchor(
 
 fn run_examples_longctx_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalResult {
     match materialize_longctx_prompt(config) {
-        Ok(longctx) => run_examples_run_anchor_with_prompt_ref_for_model(
+        Ok(longctx) => run_daemon_coherence_anchor(
             BatteryId::Longctx,
-            "multidoc_needle_native",
+            "multidoc_needle_long_state",
             &longctx.prompt_path,
             Some(longctx.prompt_ref),
             config,
@@ -5959,6 +6019,7 @@ fn run_examples_longctx_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalRe
             config.model.clone(),
             Some(longctx.max_seq),
             longctx.metrics,
+            Some(crate::coherence_runtime::DetectorProfile::long_state()),
         ),
         Err(err) => row(
             BatteryId::Longctx,
@@ -5974,6 +6035,237 @@ fn run_examples_longctx_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalRe
             0,
         ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_daemon_coherence_anchor(
+    battery: BatteryId,
+    case_id: &str,
+    prompt_path: &str,
+    prompt_ref: Option<PromptRef>,
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: String,
+    max_seq: Option<usize>,
+    mut metrics: BTreeMap<String, Value>,
+    profile: Option<crate::coherence_runtime::DetectorProfile>,
+) -> EvalResult {
+    metrics.insert("executor".to_string(), json!("daemon"));
+    metrics.insert("runtime_path".to_string(), json!("daemon_jsonl"));
+    metrics.insert("implemented".to_string(), json!(true));
+    if !Path::new(&model).exists() {
+        return row_for_model(
+            battery,
+            None,
+            case_id,
+            None,
+            EvalStatus::Skip,
+            Some(
+                "daemon coherence executor requires --model to be a local filesystem path"
+                    .to_string(),
+            ),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            0,
+            model,
+        );
+    }
+    if !crate::coherence_runtime::daemon_binary_available() {
+        return row_for_model(
+            battery,
+            None,
+            case_id,
+            None,
+            EvalStatus::Skip,
+            Some("daemon binary not found; build with `cargo build --release --features deltanet -p hipfire-runtime --example daemon`".to_string()),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            0,
+            model,
+        );
+    }
+    let Some(resolved_prompt) = resolve_repo_path(prompt_path) else {
+        return row_for_model(
+            battery,
+            None,
+            case_id,
+            None,
+            EvalStatus::Fail,
+            Some(format!("prompt not found: {prompt_path}")),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            0,
+            model,
+        );
+    };
+    let prompt_text = match fs::read_to_string(&resolved_prompt) {
+        Ok(text) => text,
+        Err(err) => {
+            return row_for_model(
+                battery,
+                None,
+                case_id,
+                None,
+                EvalStatus::Fail,
+                Some(format!("read prompt {}: {err}", resolved_prompt.display())),
+                metrics,
+                config,
+                ctx,
+                prompt_ref,
+                0,
+                model,
+            );
+        }
+    };
+    let profile = profile.unwrap_or_else(|| {
+        crate::coherence_runtime::DetectorProfile::default_for_prompt(&prompt_text, None)
+    });
+    let run_config = crate::coherence_runtime::CoherenceRunConfig {
+        model: model.clone(),
+        prompt: prompt_text,
+        prompt_label: prompt_path.to_string(),
+        system: None,
+        max_tokens: config.max_tokens,
+        temperature: 0.0,
+        repeat_penalty: None,
+        repeat_window: None,
+        max_seq: max_seq.unwrap_or_else(|| (config.max_tokens + 2048).max(4096)),
+        state: None,
+        profile,
+    };
+    let started = SystemTime::now();
+    let output = match crate::coherence_runtime::run_coherence(&run_config) {
+        Ok(output) => output,
+        Err(err) => {
+            return row_for_model(
+                battery,
+                None,
+                case_id,
+                None,
+                EvalStatus::Fail,
+                Some(format!("daemon coherence probe failed: {err}")),
+                metrics,
+                config,
+                ctx,
+                prompt_ref,
+                elapsed_since_ms(started),
+                model,
+            );
+        }
+    };
+    let elapsed_ms = elapsed_since_ms(started);
+    let artifact_dir = config.out_dir.join("artifacts").join("coherence");
+    if let Err(err) = fs::create_dir_all(&artifact_dir) {
+        return row_for_model(
+            battery,
+            None,
+            case_id,
+            None,
+            EvalStatus::Fail,
+            Some(format!("create coherence artifact dir: {err}")),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            elapsed_ms,
+            model,
+        );
+    }
+    let artifact_name = format!(
+        "{}-{}.json",
+        sanitize_path_component(case_id),
+        stable_hash_bytes(model.as_bytes())
+    );
+    let artifact_path = artifact_dir.join(artifact_name);
+    let artifact_value = output.artifact_value();
+    if let Err(err) = write_json_pretty(&artifact_path, &artifact_value) {
+        return row_for_model(
+            battery,
+            None,
+            case_id,
+            None,
+            EvalStatus::Fail,
+            Some(format!("write coherence artifact: {err}")),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            elapsed_ms,
+            model,
+        );
+    }
+    metrics.insert("hard_fails".to_string(), json!(output.hard_fails() as f64));
+    metrics.insert("soft_warns".to_string(), json!(output.soft_warns() as f64));
+    metrics.insert(
+        "detector_count".to_string(),
+        json!(output.report.rows.len() as f64),
+    );
+    metrics.insert(
+        "detectors".to_string(),
+        json!(crate::coherence_runtime::detector_rows(&output.report)),
+    );
+    metrics.insert(
+        "generated_text_hash".to_string(),
+        json!(stable_hash_bytes(output.generated_text.as_bytes())),
+    );
+    metrics.insert(
+        "generated_visible_bytes".to_string(),
+        json!(output.generated_text.len()),
+    );
+    metrics.insert(
+        "generated_tokens".to_string(),
+        json!(output.token_ids.len()),
+    );
+    metrics.insert("tok_s".to_string(), json!(output.report.header.tok_s));
+    metrics.insert(
+        "gen_tok_s".to_string(),
+        json!(output.report.header.gen_tok_s),
+    );
+    metrics.insert("ttft_ms".to_string(), json!(output.report.header.ttft_ms));
+    metrics.insert(
+        "daemon_prefill_ms".to_string(),
+        json!(output.report.header.daemon_prefill_ms),
+    );
+    metrics.insert(
+        "daemon_decode_tok_s".to_string(),
+        json!(output.report.header.daemon_decode_tok_s),
+    );
+    metrics.insert(
+        "coherence_artifact_path".to_string(),
+        json!(artifact_path.display().to_string()),
+    );
+    metrics.insert(
+        "coherence_status".to_string(),
+        json!(if output.hard_fails() > 0 {
+            "fail"
+        } else {
+            "pass"
+        }),
+    );
+    let status = if output.hard_fails() > 0 {
+        EvalStatus::Fail
+    } else {
+        EvalStatus::Pass
+    };
+    let reason = if output.hard_fails() > 0 {
+        Some(format!(
+            "{} detector hard fail(s); see {}",
+            output.hard_fails(),
+            artifact_path.display()
+        ))
+    } else {
+        None
+    };
+    row_for_model(
+        battery, None, case_id, None, status, reason, metrics, config, ctx, prompt_ref, elapsed_ms,
+        model,
+    )
 }
 
 struct LongctxPrompt {
@@ -8139,6 +8431,7 @@ fn result_cache_prompt_paths(battery: BatteryId) -> Vec<&'static str> {
             "benchmarks/prompts/qwen2_smoke.txt",
             "benchmarks/prompts/trains-meet.txt",
         ],
+        BatteryId::Coherence => vec!["benchmarks/prompts/qwen2_smoke.txt"],
         BatteryId::Quality => vec!["benchmarks/quality-baselines/harness/canary.md"],
         BatteryId::Retrieval => vec!["benchmarks/prompts/trains-meet.txt"],
         BatteryId::Speed => vec![
@@ -8270,6 +8563,16 @@ fn run_battery(
                 prompt("benchmarks/prompts/trains-meet.txt"),
             ),
         ],
+        BatteryId::Coherence => vec![skip_row(
+            battery,
+            None,
+            "runtime_detector_canary",
+            None,
+            "daemon-backed coherence probe is not available in this environment",
+            config,
+            ctx,
+            prompt("benchmarks/prompts/qwen2_smoke.txt"),
+        )],
         BatteryId::Quality => vec![skip_row(
             battery,
             None,
@@ -10832,7 +11135,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
         );
 
         let longctx = examples_battery_rows(BatteryId::Longctx, &cfg, &ctx, &[]).unwrap();
-        assert_eq!(longctx[0].case_id, "multidoc_needle_native");
+        assert_eq!(longctx[0].case_id, "multidoc_needle_long_state");
         assert_eq!(longctx[0].status, EvalStatus::Skip);
         assert!(longctx[0].prompt_hash.is_some());
         assert!(longctx[0]
