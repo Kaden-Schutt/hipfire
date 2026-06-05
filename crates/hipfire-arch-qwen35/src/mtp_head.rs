@@ -798,7 +798,10 @@ pub fn load_mtp_head_bundled(
     let mtp_offset = match detect_bundled_mtp_offset(path) {
         Ok(Some(off)) => off,
         Ok(None) => return Ok(None),
-        Err(e) => panic!("read bundle trailer from {}: {e}", path.display()),
+        // Return Err (not panic): the daemon auto-probes every .mq4 trunk for a
+        // bundled trailer on load; an IO error here must not crash the process.
+        Err(e) => return Err(hip_bridge::HipError::new(0, &format!(
+            "read bundle trailer from {}: {e}", path.display()))),
     };
     let head = load_mtp_head_at_offset(path, gpu, max_seq, mtp_offset)?;
     Ok(Some(head))
@@ -824,22 +827,24 @@ pub fn load_mtp_head_at_offset(
     max_seq: usize,
     base_offset: u64,
 ) -> HipResult<Qwen35MtpHead> {
-    let hfq = HfqFile::open_at_offset(path, base_offset).unwrap_or_else(|e| {
-        panic!(
-            "open .mtp file {} @ offset {base_offset}: {e}",
-            path.display()
-        )
-    });
-    assert_eq!(
-        hfq.arch_id,
-        21,
-        ".mtp file at {} has arch_id={} (expected 21 = QWEN35_MTP_HEAD); \
-         is this actually an MTP head extracted by mtp_extract?",
-        path.display(),
-        hfq.arch_id
-    );
-    let meta: serde_json::Value =
-        serde_json::from_str(&hfq.metadata_json).expect(".mtp metadata JSON parse failed");
+    // MERGE-REVIEW: kept OUR Err-returning load (daemon degrades to AR on bad
+    // .mtp instead of panicking); #352 side only reformatted the panic path.
+    // Return Err (not panic) on operator-facing failures (bad path, wrong
+    // arch, corrupt metadata) so callers like the daemon can degrade to AR
+    // instead of crashing the process.
+    let hfq = HfqFile::open_at_offset(path, base_offset).map_err(|e| {
+        hip_bridge::HipError::new(0, &format!(
+            "open .mtp file {} @ offset {base_offset}: {e}", path.display()))
+    })?;
+    if hfq.arch_id != 21 {
+        return Err(hip_bridge::HipError::new(0, &format!(
+            ".mtp file at {} has arch_id={} (expected 21 = QWEN35_MTP_HEAD); \
+             is this actually an MTP head extracted by mtp_extract?",
+            path.display(), hfq.arch_id)));
+    }
+    let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).map_err(|e| {
+        hip_bridge::HipError::new(0, &format!(".mtp metadata JSON parse failed: {e}"))
+    })?;
     let config = Qwen35MtpHeadConfig::from_metadata(&meta, max_seq);
 
     // ── Norms (F32, 1D) ─────────────────────────────────────────────────
@@ -1313,6 +1318,79 @@ pub fn mtp_head_forward_compressed(
     Ok(())
 }
 
+/// Hetero-MTP variant of [`mtp_head_forward_compressed`]. Identical body,
+/// but lets the caller supply a pre-computed embedding tensor for
+/// `next_token` instead of looking it up via `trunk_weights.token_embd`.
+///
+/// Used when the MTP head lives on a sibling gpu and the trunk's
+/// `token_embd` has been mirrored over (via `peer_clone_tensor`): the
+/// caller runs the embedding lookup against the mirror on the drafter
+/// gpu, then passes the result here. Bypasses the embedding-table
+/// dispatch entirely — `next_token` is unused (caller may pass 0 as
+/// a sentinel) — and `trunk_weights` is unused too.
+///
+/// Identical numerical semantics to [`mtp_head_forward_compressed`]
+/// when `next_token_embed` is the same bytes as `token_embd[next_token]`.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_head_forward_compressed_with_embed(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    scratch: &Qwen35MtpHeadScratch,
+    kv: &mut Qwen35MtpHeadKvCache,
+    next_token_embed: &GpuTensor,
+    prev_hidden: &GpuTensor,
+    pos: usize,
+) -> HipResult<()> {
+    let cfg = &head.config;
+    let w = &head.weights;
+    let lm_head_draft = w.lm_head_draft.as_ref()
+        .expect("mtp_head_forward_compressed_with_embed called but head has no lm_head_draft sidecar");
+    let logits_c = scratch.logits_compressed.as_ref()
+        .expect("mtp_head_forward_compressed_with_embed: scratch.logits_compressed not allocated");
+
+    assert_eq!(
+        lm_head_draft.k, cfg.n_embd,
+        "mtp_head_forward_compressed_with_embed: lm_head_draft.k={} but n_embd={}",
+        lm_head_draft.k, cfg.n_embd,
+    );
+
+    // Block forward with the caller's embedding override. The
+    // `trunk_weights` arg goes unused in this branch (the override
+    // bypasses `embed_lookup_into`) — we still need to satisfy the
+    // existing signature, but the dummy `next_token=0` is fine since
+    // the override path is taken first.
+    //
+    // To avoid plumbing a fake Qwen35Weights here, we re-implement the
+    // override branch inline rather than calling block_only.
+    let n_embd = cfg.n_embd;
+    let dim_bytes = n_embd * 4;
+    assert_eq!(
+        next_token_embed.numel(), n_embd,
+        "mtp_head_forward_compressed_with_embed: next_token_embed has {} elems but expected n_embd={n_embd}",
+        next_token_embed.numel(),
+    );
+
+    // Position scalar upload.
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+
+    // Token embedding = caller-supplied (D2D copy, same-device on the
+    // drafter gpu).
+    gpu.hip.memcpy_dtod_at(&scratch.tok_embd.buf, 0, &next_token_embed.buf, 0, dim_bytes)?;
+
+    // The rest of the function reads ONLY MTP-head-local weights via
+    // `head.weights` (already drafter-resident) and `head.config`. Call
+    // a helper that runs the post-embedding portion of block_only, then
+    // apply the compressed lm_head.
+    mtp_head_block_post_embedding(gpu, head, scratch, kv, prev_hidden, pos)?;
+
+    // Compressed lm_head: shared_head_norm + small GEMV.
+    gpu.rmsnorm_f32(&scratch.t_mtp_out, &w.shared_head_norm, &scratch.tmp, cfg.rms_norm_eps)?;
+    weight_gemv(gpu, lm_head_draft, &scratch.tmp, logits_c)?;
+
+    Ok(())
+}
+
 /// Applies the compressed draft LM head to `scratch.t_mtp_out`.
 ///
 /// This is the shared tail of the host-mediated compressed path and the
@@ -1478,6 +1556,46 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     } else {
         embed_lookup_into(gpu, trunk_weights, &scratch.tok_embd, next_token, n_embd)?;
     }
+
+    // Steps 2-10 are weight-mirror-independent (all reads come from
+    // `head.weights` and `head.config`). Hoisted into a helper so the
+    // hetero entry point can call it without duplicating the body.
+    mtp_head_block_post_embedding(gpu, head, scratch, kv, prev_hidden, pos)
+}
+
+/// Steps 2-10 of [`mtp_head_forward_block_only`]: post-embedding portion
+/// of the MTP head block (rmsnorm both inputs → NextN projection →
+/// attention → FFN → t_mtp_out snapshot). Reads ONLY MTP-head-local
+/// weights from `head.weights` and `head.config`, so it is safe to call
+/// on a sibling gpu where only the head (and possibly mirrored trunk
+/// embedding) lives.
+///
+/// Preconditions:
+/// - `scratch.tok_embd` already populated (either by an embedding lookup
+///   or a D2D copy from a caller-supplied override).
+/// - `scratch` and `kv` are drafter-gpu-resident if running on a sibling.
+#[allow(clippy::too_many_arguments)]
+fn mtp_head_block_post_embedding(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    scratch: &Qwen35MtpHeadScratch,
+    kv: &mut Qwen35MtpHeadKvCache,
+    prev_hidden: &GpuTensor,
+    pos: usize,
+) -> HipResult<()> {
+    let cfg = &head.config;
+    let w = &head.weights;
+    let n_embd = cfg.n_embd;
+    let dim_bytes = n_embd * 4;
+
+    // Self-contained position handling: the merged single-GPU MTP head
+    // reads its position scalar from `scratch.pos_buf` (uploaded by the
+    // caller before invoking this helper) and derives the attention
+    // sequence length from `pos`. (#352's *_with_pos_buf entry threads a
+    // device-resident pos_buf for graph capture; this helper serves both
+    // that entry and our hetero entry, so it stays scratch-relative.)
+    let pos_buf = &scratch.pos_buf;
+    let seq_len_hint = pos + 1;
 
     // ── 2. RMSNorm both inputs to the NextN projection ───────────────────
     gpu.rmsnorm_f32(

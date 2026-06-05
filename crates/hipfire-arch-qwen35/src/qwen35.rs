@@ -18450,6 +18450,41 @@ pub fn forward_prefill_batch_multi(
     dn_state: &mut DeltaNetState,
     scratch_set: &Qwen35ScratchSet,
 ) -> HipResult<()> {
+    forward_prefill_batch_multi_with_caps(
+        gpus,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch_set,
+        None,
+        None,
+        None,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_multi_with_caps(
+    gpus: &mut Gpus,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch_set: &Qwen35ScratchSet,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape_shards: Option<&mut crate::speculative::GdnTapeShards>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    needs_last_token_logits: bool,
+) -> HipResult<()> {
+    assert!(
+        tree_verify.is_none(),
+        "forward_prefill_batch_multi_with_caps: tree_verify under PP is not implemented in v1",
+    );
     let n_total = tokens.len();
     if n_total == 0 {
         return Ok(());
@@ -18595,6 +18630,8 @@ pub fn forward_prefill_batch_multi(
 
     let dim = config.dim;
     let dim_row_bytes = dim * 4;
+    let mut gdn_tape_shards = gdn_tape_shards;
+    let last_band = n_bands - 1;
 
     let result = (|| -> HipResult<()> {
         let mut chunk_start = 0usize;
@@ -18623,6 +18660,13 @@ pub fn forward_prefill_batch_multi(
                     givens_cos,
                     givens_sin,
                 };
+                let pth_for_band = if b == last_band {
+                    per_token_hidden_out.map(|t| (t, chunk_start))
+                } else {
+                    None
+                };
+                let tape_for_band: Option<&mut crate::speculative::GdnTape> =
+                    gdn_tape_shards.as_mut().map(|shards| shards.shard_mut(b));
                 {
                     let pbs_b: &PrefillBatchScratch = &pbs_per_band[b];
                     let s_b = &scratch_set.per_device[b];
@@ -18638,14 +18682,14 @@ pub fn forward_prefill_batch_multi(
                         s_b,
                         pbs_b,
                         None, // hidden_rb: pp=1 only
-                        None, // per_token_hidden_out: pp=1 only
-                        None, // gdn_tape: pp=1 only
+                        pth_for_band,
+                        tape_for_band,
                         0,
                         None,  // tree_verify: pp=1 only
                         false, // pre_uploaded
                         Some(&band_ctx),
                         None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
-                        true, // needs_last_token_logits: preserve multi-GPU post-condition
+                        needs_last_token_logits,
                         None, // max_layer: multi-GPU PP path runs full stack
                     )?;
                 }

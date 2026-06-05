@@ -33,6 +33,7 @@ pub mod host_profile;
 pub mod llama;
 pub mod loop_guard;
 pub mod model_source;
+pub mod mtp_mirror;
 pub mod multi_gpu;
 pub mod prompt_frame;
 pub mod safetensors_source;

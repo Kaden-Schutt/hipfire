@@ -6,6 +6,10 @@ Handles the `pi`-agent traffic-dump shape (one JSON object per line):
                       "content":[{"type":"thinking",...},{"type":"text",...},
                                  {"type":"toolCall","name":...,"arguments":{...}}]}}
   - request record:  {"direction":"request","payload":{"model":...,"messages":[...]}}
+  - completion dump:  {"messages":[...],"response":"<assistant text>","tool_calls":[...]}
+                      (no `direction`; VLM/structured pipelines. `response` is the
+                      final assistant text; image blocks are skipped. Carries no
+                      model tag, so do NOT pass --model-filter for these.)
   - response_headers / other directions are ignored.
 
 Output side only: from each ASSISTANT generation we reconstruct
@@ -162,6 +166,31 @@ def main() -> int:
                     for m in (p.get("messages") or []):
                         if isinstance(m, dict) and m.get("role") == "assistant":
                             outputs.append((_from_openai_msg(m), "req"))
+                elif direction is None and (isinstance(rec.get("response"), str)
+                                            or rec.get("tool_calls")):
+                    # completion-dump shape: {messages, response, tool_calls}
+                    # (VLM/structured pipelines). `response` is the final assistant
+                    # text; image blocks in `messages` are irrelevant to the text
+                    # vocab head. NOTE: these carry no model tag, so --model-filter
+                    # would drop them — leave the filter off for completion dumps.
+                    parts = []
+                    resp = rec.get("response")
+                    # reasoning may arrive in a separate top-level field; wrap it as
+                    # <think> unless it's already inline in `response`.
+                    rc = (rec.get("reasoning_content") or rec.get("reasoning")
+                          or rec.get("thinking"))
+                    if (isinstance(rc, str) and rc.strip()
+                            and "<think>" not in (resp or "")):
+                        parts.append(f"<think>\n{rc}\n</think>")
+                    if isinstance(resp, str) and resp.strip():
+                        parts.append(resp)
+                    for tc in (rec.get("tool_calls") or []):
+                        fn = tc.get("function", tc)
+                        a = fn.get("arguments")
+                        a = a if isinstance(a, str) else json.dumps(a, ensure_ascii=False)
+                        parts.append(f'<tool_call>\n{{"name": "{fn.get("name")}", '
+                                     f'"arguments": {a}}}\n</tool_call>')
+                    outputs.append(("\n".join(p for p in parts if p), "resp"))
                 for text, src in outputs:
                     if not text or not text.strip():
                         continue
