@@ -9,7 +9,6 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedQkvMq3G256Lloyd, ArchPredicate::HasWmmaW32),
         (KernelKey::FusedQkvMq4G256Lloyd, ArchPredicate::HasWmmaW32),
         (KernelKey::FusedQkvHfq6G256,     ArchPredicate::GemvDp4a),
-        (KernelKey::FusedQkvParo4G128T,   ArchPredicate::Always),
         (KernelKey::FusedQkvQ4K,          ArchPredicate::Always),
     ];
     for &(key, arch) in qkv_variants {
@@ -28,7 +27,6 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedQkvzaMq3G256Lloyd, ArchPredicate::HasWmmaW32),
         (KernelKey::FusedQkvzaMq4G256Lloyd, ArchPredicate::HasWmmaW32),
         (KernelKey::FusedQkvzaHfq6G256,     ArchPredicate::GemvDp4a),
-        (KernelKey::FusedQkvzaParo4G128T,   ArchPredicate::Always),
     ];
     for &(key, arch) in qkvza_variants {
         registry.register(KernelVariant {
@@ -46,7 +44,6 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedGateUpMq3G256Lloyd, ArchPredicate::HasWmmaW32),
         (KernelKey::FusedGateUpMq4G256Lloyd, ArchPredicate::HasWmmaW32),
         (KernelKey::FusedGateUpHfq6G256,     ArchPredicate::GemvDp4a),
-        (KernelKey::FusedGateUpParo4G128T,   ArchPredicate::Always),
         (KernelKey::FusedGateUpQ4K,          ArchPredicate::Always),
     ];
     for &(key, arch) in gate_up_variants {

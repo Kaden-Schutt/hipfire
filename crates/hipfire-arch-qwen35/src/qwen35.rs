@@ -18,7 +18,7 @@ use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
+use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, GivensRef, WeightRef};
 use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::{GemvVariant, PipelineOp, RotationPlan, RotationVariant};
@@ -13117,6 +13117,11 @@ fn fused_qkvza_dispatch(
     Ok(())
 }
 
+/// Helper: convert `WeightTensor.paro` (if present) to `GivensRef`.
+fn paro_to_givens(p: &ParoRotation) -> GivensRef<'_> {
+    GivensRef { pairs: &p.pairs, theta: &p.theta, scales: &p.channel_scales, krot: p.krot as usize }
+}
+
 /// Unified QKV projection via execute_steps. Covers all dtypes — the interpreter
 /// selects fused kernels for eligible dtypes via FUSED_TABLE guards; everything
 /// else falls through to per-op dispatch. Replaces qkv_interpret_mq +
@@ -13138,24 +13143,42 @@ fn qkv_via_execute_steps(
     eps: f32,
 ) -> HipResult<()> {
     let rotation = dtype_rotation_plan(wq.gpu_dtype);
-    let wrq = WeightRef { buf: &wq.buf, dtype: wq.gpu_dtype, m: wq.m, k: wq.k,
-                          row_stride: 0, rotation: None, awq_scale: None };
-    let wrk = WeightRef { buf: &wk.buf, dtype: wk.gpu_dtype, m: wk.m, k: wk.k,
-                          row_stride: 0, rotation: None, awq_scale: None };
-    let wrv = WeightRef { buf: &wv.buf, dtype: wv.gpu_dtype, m: wv.m, k: wv.k,
-                          row_stride: 0, rotation: None, awq_scale: None };
-    // AWQ scale (for rotation) lives in the RmsnormAutomatic step.
-    // WeightRef.awq_scale is None: the fused kernels do not take an AWQ param.
-    let steps = [
-        Step::RmsnormAutomatic {
-            x, norm_weight: attn_norm, x_plain: tmp, out: x_rot,
-            awq_scale: wq.awq_scale.as_ref(), k: wq.k, eps, rotation,
-        },
-        Step::Gemv { w: &wrq, input: GemvInput::Prerotated(x_rot), out: fa_q },
-        Step::Gemv { w: &wrk, input: GemvInput::Prerotated(x_rot), out: fa_k },
-        Step::Gemv { w: &wrv, input: GemvInput::Prerotated(x_rot), out: fa_v },
-    ];
-    execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+    if rotation == RotationPlan::Givens {
+        let wrq = WeightRef { buf: &wq.buf, dtype: wq.gpu_dtype, m: wq.m, k: wq.k,
+                              row_stride: 0, rotation: wq.paro.as_ref().map(paro_to_givens), awq_scale: None };
+        let wrk = WeightRef { buf: &wk.buf, dtype: wk.gpu_dtype, m: wk.m, k: wk.k,
+                              row_stride: 0, rotation: wk.paro.as_ref().map(paro_to_givens), awq_scale: None };
+        let wrv = WeightRef { buf: &wv.buf, dtype: wv.gpu_dtype, m: wv.m, k: wv.k,
+                              row_stride: 0, rotation: wv.paro.as_ref().map(paro_to_givens), awq_scale: None };
+        let steps = [
+            Step::RmsnormAutomatic {
+                x, norm_weight: attn_norm, x_plain: tmp, out: x_rot,
+                awq_scale: wq.awq_scale.as_ref(), k: wq.k, eps,
+                rotation: RotationPlan::None,
+            },
+            Step::Gemv { w: &wrq, input: GemvInput::Raw(x_rot), out: fa_q },
+            Step::Gemv { w: &wrk, input: GemvInput::Raw(x_rot), out: fa_k },
+            Step::Gemv { w: &wrv, input: GemvInput::Raw(x_rot), out: fa_v },
+        ];
+        execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+    } else {
+        let wrq = WeightRef { buf: &wq.buf, dtype: wq.gpu_dtype, m: wq.m, k: wq.k,
+                              row_stride: 0, rotation: None, awq_scale: None };
+        let wrk = WeightRef { buf: &wk.buf, dtype: wk.gpu_dtype, m: wk.m, k: wk.k,
+                              row_stride: 0, rotation: None, awq_scale: None };
+        let wrv = WeightRef { buf: &wv.buf, dtype: wv.gpu_dtype, m: wv.m, k: wv.k,
+                              row_stride: 0, rotation: None, awq_scale: None };
+        let steps = [
+            Step::RmsnormAutomatic {
+                x, norm_weight: attn_norm, x_plain: tmp, out: x_rot,
+                awq_scale: wq.awq_scale.as_ref(), k: wq.k, eps, rotation,
+            },
+            Step::Gemv { w: &wrq, input: GemvInput::Prerotated(x_rot), out: fa_q },
+            Step::Gemv { w: &wrk, input: GemvInput::Prerotated(x_rot), out: fa_k },
+            Step::Gemv { w: &wrv, input: GemvInput::Prerotated(x_rot), out: fa_v },
+        ];
+        execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+    }
 }
 
 /// Unified gate+up (FFN) projection via execute_steps. Covers all dtypes.
@@ -13175,19 +13198,36 @@ fn gate_up_via_execute_steps(
     eps: f32,
 ) -> HipResult<()> {
     let rotation = dtype_rotation_plan(w_gate.gpu_dtype);
-    let wrg = WeightRef { buf: &w_gate.buf, dtype: w_gate.gpu_dtype, m: w_gate.m, k: w_gate.k,
-                          row_stride: 0, rotation: None, awq_scale: None };
-    let wru = WeightRef { buf: &w_up.buf, dtype: w_up.gpu_dtype, m: w_up.m, k: w_up.k,
-                          row_stride: 0, rotation: None, awq_scale: None };
-    let steps = [
-        Step::RmsnormAutomatic {
-            x, norm_weight: ffn_norm, x_plain: tmp, out: x_rot,
-            awq_scale: w_gate.awq_scale.as_ref(), k: w_gate.k, eps, rotation,
-        },
-        Step::Gemv { w: &wrg, input: GemvInput::Prerotated(x_rot), out: gate_out },
-        Step::Gemv { w: &wru, input: GemvInput::Prerotated(x_rot), out: up_out },
-    ];
-    execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+    if rotation == RotationPlan::Givens {
+        let wrg = WeightRef { buf: &w_gate.buf, dtype: w_gate.gpu_dtype, m: w_gate.m, k: w_gate.k,
+                              row_stride: 0, rotation: w_gate.paro.as_ref().map(paro_to_givens), awq_scale: None };
+        let wru = WeightRef { buf: &w_up.buf, dtype: w_up.gpu_dtype, m: w_up.m, k: w_up.k,
+                              row_stride: 0, rotation: w_up.paro.as_ref().map(paro_to_givens), awq_scale: None };
+        let steps = [
+            Step::RmsnormAutomatic {
+                x, norm_weight: ffn_norm, x_plain: tmp, out: x_rot,
+                awq_scale: w_gate.awq_scale.as_ref(), k: w_gate.k, eps,
+                rotation: RotationPlan::None,
+            },
+            Step::Gemv { w: &wrg, input: GemvInput::Raw(x_rot), out: gate_out },
+            Step::Gemv { w: &wru, input: GemvInput::Raw(x_rot), out: up_out },
+        ];
+        execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+    } else {
+        let wrg = WeightRef { buf: &w_gate.buf, dtype: w_gate.gpu_dtype, m: w_gate.m, k: w_gate.k,
+                              row_stride: 0, rotation: None, awq_scale: None };
+        let wru = WeightRef { buf: &w_up.buf, dtype: w_up.gpu_dtype, m: w_up.m, k: w_up.k,
+                              row_stride: 0, rotation: None, awq_scale: None };
+        let steps = [
+            Step::RmsnormAutomatic {
+                x, norm_weight: ffn_norm, x_plain: tmp, out: x_rot,
+                awq_scale: w_gate.awq_scale.as_ref(), k: w_gate.k, eps, rotation,
+            },
+            Step::Gemv { w: &wrg, input: GemvInput::Prerotated(x_rot), out: gate_out },
+            Step::Gemv { w: &wru, input: GemvInput::Prerotated(x_rot), out: up_out },
+        ];
+        execute_steps(gpu, ctx, &steps).map_err(|e| HipError::new(0, &e.to_string()))
+    }
 }
 
 /// MoE FFN dispatch — mirrors the two-path logic from the original.

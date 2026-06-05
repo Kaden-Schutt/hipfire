@@ -184,20 +184,17 @@ pub enum KernelKey {
     FusedQkvMq3G256Lloyd,
     FusedQkvMq4G256Lloyd,
     FusedQkvHfq6G256,
-    FusedQkvParo4G128T,
     FusedQkvQ4K,
     // Fused QKVZA (linear attention)
     FusedQkvzaHfq4G256,
     FusedQkvzaMq3G256Lloyd,
     FusedQkvzaMq4G256Lloyd,
     FusedQkvzaHfq6G256,
-    FusedQkvzaParo4G128T,
     // Fused Gate+Up
     FusedGateUpHfq4G256,
     FusedGateUpMq3G256Lloyd,
     FusedGateUpMq4G256Lloyd,
     FusedGateUpHfq6G256,
-    FusedGateUpParo4G128T,
     FusedGateUpQ4K,
     // Rotation
     RotateMq,

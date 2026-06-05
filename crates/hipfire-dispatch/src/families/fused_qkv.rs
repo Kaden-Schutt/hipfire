@@ -155,17 +155,6 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             let [mg, mu] = <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
             hip!(gpu.fused_gate_up_q4k(w_gate, w_up, x, gate, up, mg, mu, k))
         }
-
-        // ── Paro variants need rotation scratch buffers ────
-        KernelKey::FusedQkvParo4G128T
-        | KernelKey::FusedQkvzaParo4G128T
-        | KernelKey::FusedGateUpParo4G128T => Err(DispatchError::UnsupportedVariant {
-            family: "fused_qkv",
-            variant: "paro",
-            arch: "",
-            quant: "",
-        }),
-
         _ => Err(DispatchError::UnsupportedVariant {
             family: "fused_qkv",
             variant: "",
