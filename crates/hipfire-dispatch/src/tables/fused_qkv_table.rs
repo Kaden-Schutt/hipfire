@@ -46,7 +46,13 @@ pub fn populate(registry: &mut KernelRegistry) {
 
     // ── Fused Gate+Up (FFN gate & up projections in one launch) ──
     let gate_up_variants: &[(KernelKey, ArchPredicate)] = &[
-        (KernelKey::FusedGateUpHfq4G256,     ArchPredicate::HasWmma),
+        // HFQ4G256 fused gate+up: `gpu.fused_gate_up_hfq4g256` (+ _dp4a sibling)
+        // is cross-arch precompiled (generic wave32 + CDNA wave64), mirroring the
+        // QKV kernel. The prior `HasWmma` gate was a dead-gate that rejected
+        // RDNA1/RDNA2/CDNA even though the kernel runs there. `Always` matches
+        // the kernel's true cross-arch availability (mirrors FusedQkvHfq4G256
+        // and FusedGateUpQ4K rows).
+        (KernelKey::FusedGateUpHfq4G256,     ArchPredicate::Always),
         (KernelKey::FusedGateUpMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedGateUpMq4G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedGateUpHfq6G256,     ArchPredicate::GemvDp4a),
