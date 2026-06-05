@@ -32,8 +32,9 @@
 
 use crate::mtp_head::{self, Qwen35MtpHead, Qwen35MtpHeadKvCache, Qwen35MtpHeadScratch};
 use crate::qwen35::{self, Qwen35Weights};
-use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
+use crate::speculative::{dflash_gemm_batched_lmhead, DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
+use hipfire_dispatch::families::gemm::GemmLmHeadKernel;
 use hipfire_runtime::llama;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
@@ -1424,7 +1425,9 @@ pub fn spec_step_mtp(
             }
         }
         DType::HFQ4G256 => {
-            gpu.gemm_hfq4g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq4G256,
                 &w_out.buf,
                 &state.verify_hidden,
                 &logits_view,
@@ -1443,7 +1446,9 @@ pub fn spec_step_mtp(
                 w_out.k,
                 n_verify,
             )?;
-            gpu.gemm_hfq4g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq4G256,
                 &w_out.buf,
                 &rot,
                 &logits_view,
@@ -1462,7 +1467,9 @@ pub fn spec_step_mtp(
                 w_out.k,
                 n_verify,
             )?;
-            gpu.gemm_hfq3g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq3G256,
                 &w_out.buf,
                 &rot,
                 &logits_view,
@@ -1472,7 +1479,9 @@ pub fn spec_step_mtp(
             )?;
         }
         DType::HFQ6G256 => {
-            gpu.gemm_hfq6g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq6G256,
                 &w_out.buf,
                 &state.verify_hidden,
                 &logits_view,
@@ -1491,7 +1500,9 @@ pub fn spec_step_mtp(
                 w_out.k,
                 n_verify,
             )?;
-            gpu.gemm_hfq6g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq6G256,
                 &w_out.buf,
                 &rot,
                 &logits_view,
@@ -1853,7 +1864,9 @@ pub fn spec_step_mtp_compressed(
             }
         }
         DType::HFQ4G256 => {
-            gpu.gemm_hfq4g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq4G256,
                 &w_out.buf,
                 &state.verify_hidden,
                 &logits_view,
@@ -1872,7 +1885,9 @@ pub fn spec_step_mtp_compressed(
                 w_out.k,
                 n_verify,
             )?;
-            gpu.gemm_hfq4g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq4G256,
                 &w_out.buf,
                 &rot,
                 &logits_view,
@@ -1891,7 +1906,9 @@ pub fn spec_step_mtp_compressed(
                 w_out.k,
                 n_verify,
             )?;
-            gpu.gemm_hfq3g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq3G256,
                 &w_out.buf,
                 &rot,
                 &logits_view,
@@ -1901,7 +1918,9 @@ pub fn spec_step_mtp_compressed(
             )?;
         }
         DType::HFQ6G256 => {
-            gpu.gemm_hfq6g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq6G256,
                 &w_out.buf,
                 &state.verify_hidden,
                 &logits_view,
@@ -1920,7 +1939,9 @@ pub fn spec_step_mtp_compressed(
                 w_out.k,
                 n_verify,
             )?;
-            gpu.gemm_hfq6g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq6G256,
                 &w_out.buf,
                 &rot,
                 &logits_view,
@@ -2646,7 +2667,9 @@ pub fn spec_step_mtp_compressed_serial(
             }
         }
         DType::HFQ4G256 => {
-            gpu.gemm_hfq4g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq4G256,
                 &w_out.buf,
                 &state.verify_hidden,
                 &logits_view,
@@ -2665,7 +2688,9 @@ pub fn spec_step_mtp_compressed_serial(
                 w_out.k,
                 n_verify,
             )?;
-            gpu.gemm_hfq4g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq4G256,
                 &w_out.buf,
                 &rot,
                 &logits_view,
@@ -2684,7 +2709,9 @@ pub fn spec_step_mtp_compressed_serial(
                 w_out.k,
                 n_verify,
             )?;
-            gpu.gemm_hfq3g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq3G256,
                 &w_out.buf,
                 &rot,
                 &logits_view,
@@ -2694,7 +2721,9 @@ pub fn spec_step_mtp_compressed_serial(
             )?;
         }
         DType::HFQ6G256 => {
-            gpu.gemm_hfq6g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq6G256,
                 &w_out.buf,
                 &state.verify_hidden,
                 &logits_view,
@@ -2713,7 +2742,9 @@ pub fn spec_step_mtp_compressed_serial(
                 w_out.k,
                 n_verify,
             )?;
-            gpu.gemm_hfq6g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq6G256,
                 &w_out.buf,
                 &rot,
                 &logits_view,

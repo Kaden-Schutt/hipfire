@@ -60,7 +60,9 @@
 //!   verify-loop equivalent for MTP would be Task 11.
 
 use crate::qwen35::Qwen35Weights;
+use crate::speculative::dflash_gemm_batched_lmhead;
 use hip_bridge::{DeviceBuffer, HipResult};
+use hipfire_dispatch::families::gemm::GemmLmHeadKernel;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::{
     self, f16_to_f32, fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for,
@@ -1916,7 +1918,9 @@ pub fn mtp_head_apply_lm_head_batched(
             )?;
         }
         DType::HFQ4G256 => {
-            gpu.gemm_hfq4g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq4G256,
                 &lm_head_weights.buf,
                 tmp_batched,
                 &logits_view,
@@ -1935,7 +1939,9 @@ pub fn mtp_head_apply_lm_head_batched(
                 lm_head_weights.k,
                 n,
             )?;
-            gpu.gemm_hfq4g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq4G256,
                 &lm_head_weights.buf,
                 &rot_view,
                 &logits_view,
@@ -1954,7 +1960,9 @@ pub fn mtp_head_apply_lm_head_batched(
                 lm_head_weights.k,
                 n,
             )?;
-            gpu.gemm_hfq3g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq3G256,
                 &lm_head_weights.buf,
                 &rot_view,
                 &logits_view,
@@ -1964,7 +1972,9 @@ pub fn mtp_head_apply_lm_head_batched(
             )?;
         }
         DType::HFQ6G256 => {
-            gpu.gemm_hfq6g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq6G256,
                 &lm_head_weights.buf,
                 tmp_batched,
                 &logits_view,
@@ -1983,7 +1993,9 @@ pub fn mtp_head_apply_lm_head_batched(
                 lm_head_weights.k,
                 n,
             )?;
-            gpu.gemm_hfq6g256_batched_lmhead(
+            dflash_gemm_batched_lmhead(
+                gpu,
+                GemmLmHeadKernel::Hfq6G256,
                 &lm_head_weights.buf,
                 &rot_view,
                 &logits_view,

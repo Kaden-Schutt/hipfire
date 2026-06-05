@@ -70,7 +70,11 @@ fn dflash_gemm_q8_lmhead(
 /// `Always`) and dispatches the same rdna-compute wrapper. `kernel` names the
 /// kernel family explicitly because MQ4/MQ3/MQ6 weights route to the HFQ4/HFQ3/
 /// HFQ6 kernel (after the caller FWHT-rotates x), independent of `w.gpu_dtype`.
-fn dflash_gemm_batched_lmhead(
+///
+/// `pub(crate)` so the MTP modules (`mtp_head`, `mtp_spec`, `mtp_compose`,
+/// `mtp_probe`) reuse the exact same dispatch path for their batched lm_head
+/// sites (Batch-4 dispatch migration).
+pub(crate) fn dflash_gemm_batched_lmhead(
     gpu: &mut Gpu,
     kernel: GemmLmHeadKernel,
     w_buf: &GpuTensor,

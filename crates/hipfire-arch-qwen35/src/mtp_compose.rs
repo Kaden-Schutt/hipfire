@@ -53,10 +53,11 @@ use crate::mtp_head::{
 };
 use crate::qwen35::{self, Qwen35Weights};
 use crate::speculative::{
-    self, DeltaNetSnapshot, DflashVerifyOutput, GdnTape, HiddenStateRingBuffer, ModelSlot,
-    VerifyScratch,
+    self, dflash_gemm_batched_lmhead, DeltaNetSnapshot, DflashVerifyOutput, GdnTape,
+    HiddenStateRingBuffer, ModelSlot, VerifyScratch,
 };
 use hip_bridge::HipResult;
+use hipfire_dispatch::families::gemm::GemmLmHeadKernel;
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::llama;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -294,33 +295,38 @@ pub fn spec_step_dflash_mtp(
                 )?;
             }
             DType::HFQ4G256 => {
-                gpu.gemm_hfq4g256_batched_lmhead(
+                dflash_gemm_batched_lmhead(
+                    gpu, GemmLmHeadKernel::Hfq4G256,
                     &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
             DType::MQ4G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_hfq4g256_batched_lmhead(
+                dflash_gemm_batched_lmhead(
+                    gpu, GemmLmHeadKernel::Hfq4G256,
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
             DType::MQ3G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_hfq3g256_batched_lmhead(
+                dflash_gemm_batched_lmhead(
+                    gpu, GemmLmHeadKernel::Hfq3G256,
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
             DType::HFQ6G256 => {
-                gpu.gemm_hfq6g256_batched_lmhead(
+                dflash_gemm_batched_lmhead(
+                    gpu, GemmLmHeadKernel::Hfq6G256,
                     &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
             DType::MQ6G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_hfq6g256_batched_lmhead(
+                dflash_gemm_batched_lmhead(
+                    gpu, GemmLmHeadKernel::Hfq6G256,
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
@@ -825,26 +831,31 @@ pub fn spec_step_dflash_mtp_tree(
         match w_out.gpu_dtype {
             DType::Q8_0 => gpu.gemm_q8_0_batched(
                 &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?,
-            DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(
+            DType::HFQ4G256 => dflash_gemm_batched_lmhead(
+                gpu, GemmLmHeadKernel::Hfq4G256,
                 &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?,
             DType::MQ4G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_hfq4g256_batched_lmhead(
+                dflash_gemm_batched_lmhead(
+                    gpu, GemmLmHeadKernel::Hfq4G256,
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch)?;
             }
             DType::MQ3G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_hfq3g256_batched_lmhead(
+                dflash_gemm_batched_lmhead(
+                    gpu, GemmLmHeadKernel::Hfq3G256,
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch)?;
             }
-            DType::HFQ6G256 => gpu.gemm_hfq6g256_batched_lmhead(
+            DType::HFQ6G256 => dflash_gemm_batched_lmhead(
+                gpu, GemmLmHeadKernel::Hfq6G256,
                 &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?,
             DType::MQ6G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_hfq6g256_batched_lmhead(
+                dflash_gemm_batched_lmhead(
+                    gpu, GemmLmHeadKernel::Hfq6G256,
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch)?;
             }
             _ => panic!("dflash_mtp_tree: unsupported drafter lm_head dtype"),
