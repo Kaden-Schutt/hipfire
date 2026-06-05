@@ -53,10 +53,7 @@ fn graph_enabled() -> bool {
     use std::sync::OnceLock;
     static ENV: OnceLock<bool> = OnceLock::new();
     *ENV.get_or_init(|| {
-        matches!(
-            std::env::var("HIPFIRE_LFM2_GRAPH").ok().as_deref(),
-            Some("1")
-        )
+        matches!(std::env::var("HIPFIRE_LFM2_GRAPH").ok().as_deref(), Some("1"))
     })
 }
 
@@ -247,14 +244,8 @@ fn decode_step_layers_and_head(
             }
             Ffn::Moe(m) => {
                 // FWHT-rotate the FFN input for the MQ4 experts (router stays plain).
-                rotate_x_mq_for(
-                    gpu,
-                    &m.experts[0].gate_up,
-                    &state.ffn_tmp,
-                    &state.ffn_x_rot,
-                    hidden,
-                )
-                .map_err(|e| format!("lfm2moe L{l}: ffn rotate: {e:?}"))?;
+                rotate_x_mq_for(gpu, &m.experts[0].gate_up, &state.ffn_tmp, &state.ffn_x_rot, hidden)
+                    .map_err(|e| format!("lfm2moe L{l}: ffn rotate: {e:?}"))?;
 
                 // Router: sigmoid(logits) + bias-aware top-k (gather unbiased,
                 // renormalize, scale). expert_bias steers SELECTION only.
@@ -369,13 +360,8 @@ fn decode_step_layers_and_head(
     state.n_tokens = seq_len;
 
     // Final RMSNorm + lm_head (tied to embed_tokens, Q8).
-    gpu.rmsnorm_f32(
-        &state.h,
-        &weights.embedding_norm,
-        &state.final_norm_buf,
-        eps,
-    )
-    .map_err(|e| format!("lfm2moe: final rmsnorm: {e:?}"))?;
+    gpu.rmsnorm_f32(&state.h, &weights.embedding_norm, &state.final_norm_buf, eps)
+        .map_err(|e| format!("lfm2moe: final rmsnorm: {e:?}"))?;
     weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
         .map_err(|e| format!("lfm2moe: lm_head: {e}"))?;
     Ok(())

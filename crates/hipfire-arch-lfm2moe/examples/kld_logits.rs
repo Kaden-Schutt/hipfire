@@ -50,35 +50,17 @@ fn parse_args() -> Args {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--model-a" => {
-                model_a = Some(argv[i + 1].clone());
-                i += 2;
-            }
-            "--model-b" => {
-                model_b = Some(argv[i + 1].clone());
-                i += 2;
-            }
-            "--tokens" => {
-                tokens = Some(argv[i + 1].clone());
-                i += 2;
-            }
-            "--max" => {
-                max = argv[i + 1].parse().expect("--max");
-                i += 2;
-            }
+            "--model-a" => { model_a = Some(argv[i + 1].clone()); i += 2; }
+            "--model-b" => { model_b = Some(argv[i + 1].clone()); i += 2; }
+            "--tokens" => { tokens = Some(argv[i + 1].clone()); i += 2; }
+            "--max" => { max = argv[i + 1].parse().expect("--max"); i += 2; }
             // --dump <file>: run model-a only, write its per-position logits to a
             // binary (u32 n_pos, u32 vocab, then n_pos*vocab f32 LE), and exit.
             // Used to capture each variant's logits for offline KL vs a bf16
             // reference (the true ground truth — Q8 has its own quant error so it
             // must NOT be the reference).
-            "--dump" => {
-                dump = Some(argv[i + 1].clone());
-                i += 2;
-            }
-            other => {
-                eprintln!("unknown arg {other}");
-                std::process::exit(1);
-            }
+            "--dump" => { dump = Some(argv[i + 1].clone()); i += 2; }
+            other => { eprintln!("unknown arg {other}"); std::process::exit(1); }
         }
     }
     Args {
@@ -95,11 +77,7 @@ fn parse_args() -> Args {
 fn dump_logits(path: &str, logits: &[Vec<f32>]) {
     use std::io::Write;
     let n = logits.len() as u32;
-    let vocab = if logits.is_empty() {
-        0
-    } else {
-        logits[0].len()
-    } as u32;
+    let vocab = if logits.is_empty() { 0 } else { logits[0].len() } as u32;
     let mut f = std::io::BufWriter::new(std::fs::File::create(path).expect("create dump"));
     f.write_all(&n.to_le_bytes()).unwrap();
     f.write_all(&vocab.to_le_bytes()).unwrap();
@@ -149,12 +127,8 @@ fn run_lfm2moe(path: &str, args: &Args) -> Vec<Vec<f32>> {
     let cfg = Lfm2MoeConfig::from_hfq(&hfq).expect("config");
     eprintln!(
         "[{}] lfm2moe hidden={} layers={} experts={}/{} vocab={}",
-        path,
-        cfg.hidden_size,
-        cfg.num_hidden_layers,
-        cfg.num_experts,
-        cfg.num_experts_per_tok,
-        cfg.vocab_size
+        path, cfg.hidden_size, cfg.num_hidden_layers, cfg.num_experts,
+        cfg.num_experts_per_tok, cfg.vocab_size
     );
     let weights = Lfm2MoeWeights::load(&mut hfq, &cfg, &mut gpu).expect("weights");
 
@@ -176,17 +150,10 @@ fn run_lfm2moe(path: &str, args: &Args) -> Vec<Vec<f32>> {
 /// stable way (subtract per-vector max before exp).
 #[cfg(feature = "deltanet")]
 fn compute_kl(ref_logits: &[f32], cand_logits: &[f32]) -> f64 {
-    assert_eq!(
-        ref_logits.len(),
-        cand_logits.len(),
-        "logit vector length mismatch"
-    );
+    assert_eq!(ref_logits.len(), cand_logits.len(), "logit vector length mismatch");
 
     let ref_max = ref_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
-    let cand_max = cand_logits
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max) as f64;
+    let cand_max = cand_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
 
     let mut ref_sum = 0.0f64;
     let mut cand_sum = 0.0f64;
@@ -264,10 +231,7 @@ fn main() {
 
     eprintln!("=== model-a (reference): {} ===", args.model_a);
     let ref_logits = run_model(&args.model_a, &args);
-    let model_b = args
-        .model_b
-        .clone()
-        .expect("--model-b required (or use --dump)");
+    let model_b = args.model_b.clone().expect("--model-b required (or use --dump)");
     eprintln!("=== model-b (candidate): {} ===", model_b);
     let cand_logits = run_model(&model_b, &args);
 

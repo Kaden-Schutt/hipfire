@@ -247,6 +247,145 @@ fn main() {
     } else {
         eprintln!("FAIL: 8B dimensions wrong (got {:.4})", out8[0]);
     }
+
+    // Test 5: Flash (tile+reduce online-softmax) vs baseline single-workgroup
+    // parity. The flash path (attention_flash_q8_0) is what minimax uses for
+    // its native context window — its LDS is O(tile+head_dim), independent of
+    // seq_len, where the baseline materializes scores[seq_len] in LDS and caps
+    // at ~16K on gfx11/gfx12. Both compute the same math (different FP
+    // reduction order), so we require cosine ≥ 0.9999 / small max-abs-err at
+    // sizes where the baseline can still run, then prove flash runs (finite,
+    // sane) at a size the baseline cannot.
+    eprintln!("\n=== Flash vs baseline parity (GQA, head_dim=128) ===");
+    let n_h5 = 8usize;
+    let n_kv5 = 2usize;
+    let hd5 = 128usize;
+    let kv_dim5 = n_kv5 * hd5;
+    let tb5 = n_kv5 * (hd5 / 32); // blocks per position
+    let mut seed: u32 = 0x1234_5678;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((seed >> 9) as f32 / 8_388_608.0) - 1.0 // ~[-1, 1)
+    };
+    let to_bytes = |v: &[f32]| -> Vec<u8> {
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4).to_vec() }
+    };
+
+    let mut all_pass = true;
+    for &seq in &[4usize, 64, 512, 2048] {
+        let physical_cap = seq;
+        let cb = physical_cap * tb5 * 34;
+        let ce = (cb + 3) / 4;
+        let d_kc = gpu.zeros(&[ce], rdna_compute::DType::F32).unwrap();
+        let d_vc = gpu.zeros(&[ce], rdna_compute::DType::F32).unwrap();
+        // Reuse one upload buffer per kind; overwrite per position.
+        let dk = gpu.zeros(&[kv_dim5], rdna_compute::DType::F32).unwrap();
+        let dv = gpu.zeros(&[kv_dim5], rdna_compute::DType::F32).unwrap();
+        for p in 0..seq {
+            let kbuf: Vec<f32> = (0..kv_dim5).map(|_| next()).collect();
+            let vbuf: Vec<f32> = (0..kv_dim5).map(|_| next()).collect();
+            gpu.hip.memcpy_htod(&dk.buf, &to_bytes(&kbuf)).unwrap();
+            gpu.hip.memcpy_htod(&dv.buf, &to_bytes(&vbuf)).unwrap();
+            gpu.hip.memcpy_htod(&pos_buf, &(p as i32).to_ne_bytes()).unwrap();
+            gpu.kv_cache_write_q8_0(&d_kc, &dk, &pos_buf, n_kv5, hd5).unwrap();
+            gpu.kv_cache_write_q8_0(&d_vc, &dv, &pos_buf, n_kv5, hd5).unwrap();
+        }
+        let qbuf: Vec<f32> = (0..n_h5 * hd5).map(|_| next()).collect();
+        let dq = gpu.upload_f32(&qbuf, &[n_h5 * hd5]).unwrap();
+        let out_base = gpu.zeros(&[n_h5 * hd5], rdna_compute::DType::F32).unwrap();
+        let out_flash = gpu.zeros(&[n_h5 * hd5], rdna_compute::DType::F32).unwrap();
+        let max_tiles = (physical_cap + 127) / 128;
+        let partials = gpu
+            .zeros(&[n_h5 * max_tiles * (2 + hd5)], rdna_compute::DType::F32)
+            .unwrap();
+        gpu.hip.memcpy_htod(&pos_buf, &((seq - 1) as i32).to_ne_bytes()).unwrap();
+        gpu.attention_q8_0_kv(
+            &dq, &d_kc, &d_vc, &out_base, &pos_buf, seq, n_h5, n_kv5, hd5, physical_cap,
+        )
+        .unwrap();
+        gpu.attention_flash_q8_0(
+            &dq, &d_kc, &d_vc, &out_flash, &pos_buf, seq, n_h5, n_kv5, hd5, physical_cap,
+            &partials,
+        )
+        .unwrap();
+        gpu.hip.device_synchronize().unwrap();
+        let a = gpu.download_f32(&out_base).unwrap();
+        let b = gpu.download_f32(&out_flash).unwrap();
+        let mut dot = 0.0f64;
+        let mut na = 0.0f64;
+        let mut nb = 0.0f64;
+        let mut maxerr = 0.0f32;
+        for i in 0..a.len() {
+            dot += a[i] as f64 * b[i] as f64;
+            na += (a[i] as f64).powi(2);
+            nb += (b[i] as f64).powi(2);
+            maxerr = maxerr.max((a[i] - b[i]).abs());
+        }
+        let cosine = dot / (na.sqrt() * nb.sqrt() + 1e-12);
+        let pass = cosine > 0.9999 && maxerr < 1e-2 && !b.iter().any(|x| x.is_nan());
+        eprintln!(
+            "  seq={seq:>5}: cosine={cosine:.6} max_abs_err={maxerr:.2e} -> {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        all_pass &= pass;
+    }
+
+    // Large-context flash-only: a size the baseline single-workgroup kernel
+    // cannot serve (scores[seq]*4 + ... > 64 KB LDS). All K/V positions get
+    // an identical random vector, so softmax is uniform and the output must
+    // equal that V vector (mean of identical values). Proves flash runs and
+    // is numerically sane far beyond the 16K LDS wall.
+    eprintln!("\n=== Flash-only at >16K (baseline cannot run here) ===");
+    let big_seq = 20000usize;
+    let cbB = big_seq * tb5 * 34;
+    let ceB = (cbB + 3) / 4;
+    let d_kcB = gpu.zeros(&[ceB], rdna_compute::DType::F32).unwrap();
+    let d_vcB = gpu.zeros(&[ceB], rdna_compute::DType::F32).unwrap();
+    let kfix: Vec<f32> = (0..kv_dim5).map(|_| next()).collect();
+    let vfix: Vec<f32> = (0..kv_dim5).map(|_| next()).collect();
+    let dkB = gpu.upload_f32(&kfix, &[kv_dim5]).unwrap();
+    let dvB = gpu.upload_f32(&vfix, &[kv_dim5]).unwrap();
+    for p in 0..big_seq {
+        gpu.hip.memcpy_htod(&pos_buf, &(p as i32).to_ne_bytes()).unwrap();
+        gpu.kv_cache_write_q8_0(&d_kcB, &dkB, &pos_buf, n_kv5, hd5).unwrap();
+        gpu.kv_cache_write_q8_0(&d_vcB, &dvB, &pos_buf, n_kv5, hd5).unwrap();
+    }
+    let qB: Vec<f32> = (0..n_h5 * hd5).map(|_| next()).collect();
+    let dqB = gpu.upload_f32(&qB, &[n_h5 * hd5]).unwrap();
+    let outB = gpu.zeros(&[n_h5 * hd5], rdna_compute::DType::F32).unwrap();
+    let max_tilesB = (big_seq + 127) / 128;
+    let partialsB = gpu
+        .zeros(&[n_h5 * max_tilesB * (2 + hd5)], rdna_compute::DType::F32)
+        .unwrap();
+    gpu.hip.memcpy_htod(&pos_buf, &((big_seq - 1) as i32).to_ne_bytes()).unwrap();
+    gpu.attention_flash_q8_0(
+        &dqB, &d_kcB, &d_vcB, &outB, &pos_buf, big_seq, n_h5, n_kv5, hd5, big_seq, &partialsB,
+    )
+    .unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let ob = gpu.download_f32(&outB).unwrap();
+    // Expected: uniform attention over identical V → out[d] ≈ vfix dequantized.
+    // Compare head 0's first 32 dims against the V block-0 dequant of vfix.
+    let finite = !ob.iter().any(|x| x.is_nan() || x.is_infinite());
+    let mut maxerr_big = 0.0f32;
+    for d in 0..hd5 {
+        maxerr_big = maxerr_big.max((ob[d] - vfix[d]).abs());
+    }
+    let big_pass = finite && maxerr_big < 0.05;
+    eprintln!(
+        "  seq={big_seq}: head0[0..4]={:?} max|out-V|={:.3e} finite={finite} -> {}",
+        &ob[..4],
+        maxerr_big,
+        if big_pass { "PASS" } else { "FAIL" }
+    );
+    all_pass &= big_pass;
+
+    if all_pass {
+        eprintln!("\nPASS: flash parity + large-context flash all correct");
+    } else {
+        eprintln!("\nFAIL: flash parity/large-context check failed");
+        std::process::exit(1);
+    }
 }
 
 fn f16_to_f32(bits: u16) -> f32 {

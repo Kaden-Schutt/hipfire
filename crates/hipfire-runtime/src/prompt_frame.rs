@@ -388,6 +388,21 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Remove HF `{% generation %}` / `{% endgeneration %}` tags (with optional
+/// whitespace-control dashes and the line they sit on) from a chat template.
+/// These mark the assistant-token span for training-data masking and emit
+/// nothing, so dropping the markers keeps inference rendering byte-identical —
+/// while letting minijinja (which has no `generation` block tag) parse the
+/// template instead of erroring. No-op for templates without them.
+fn strip_generation_tags(template: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"[ \t]*\{%-?\s*(?:end)?generation\s*-?%\}\n?").unwrap()
+    });
+    re.replace_all(template, "").into_owned()
+}
+
 impl<'a> JinjaChatFrame<'a> {
     /// Render the template and tokenize the result. Returns `Err` on
     /// any template-side failure so the caller can fall back to
@@ -445,12 +460,21 @@ impl<'a> JinjaChatFrame<'a> {
         use minijinja::{Environment, Error, ErrorKind, Value};
         use minijinja_contrib::pycompat::unknown_method_callback;
 
+        // Chainable-undefined (NOT Strict): chat templates are authored for
+        // Jinja2's lenient semantics and routinely PROBE optional fields —
+        // `system_message.current_date`, `.current_location`, `tools`,
+        // `documents`, etc. Under Strict, probing a key a caller didn't set
+        // raises, and the whole render fails → silent Plain fallback. That's
+        // exactly what broke MiniMax-M2 under an agent (Hermes) that sends a
+        // system message without `current_date`: `{% if system_message and
+        // system_message.current_date %}` errored at template line 37. Chainable
+        // matches Jinja2 (missing keys → falsy/undefined, chained access on
+        // undefined stays undefined) while still surfacing hard render errors
+        // (raise_exception, syntax). The required context vars (messages, tools,
+        // add_generation_prompt, bos_token) are always provided below, so the
+        // PR #175 "missing required var" concern doesn't regress.
         let mut env = Environment::new();
-        // Strict-undefined: a missing context variable raises Err instead of
-        // silently rendering empty/partial output. Without this, malformed
-        // prompts could propagate to the model unnoticed (Codex review on
-        // PR #175 flagged this; we apply it here in the same port).
-        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Chainable);
         // Make Python-style str/list/dict methods (`.startswith`,
         // `.split`, `.rstrip`, `.lstrip`, `|items`, etc.) work on
         // ordinary Jinja values. Required by the Qwen3 family
@@ -465,8 +489,33 @@ impl<'a> JinjaChatFrame<'a> {
         env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
+        // Some HF templates call `tojson(ensure_ascii=False)` (MiniMax-M2's tool
+        // block) or `tojson(indent=…)`. minijinja's builtin `tojson` rejects
+        // unknown kwargs, so the whole template fails to render and we silently
+        // fall back to the Plain frame — the model then never sees its native
+        // tool format (observed e2e on MiniMax-M2: template render failed on
+        // `ensure_ascii`, Plain fallback, model emitted a Qwen-ish `<tool_call>`
+        // instead of `<minimax:tool_call>`). Override `tojson` with a serde_json
+        // serializer that accepts + ignores those kwargs; serde_json emits raw
+        // UTF-8 (== ensure_ascii=False), which is what chat templates want.
+        env.add_filter("tojson", |value: Value, kwargs: minijinja::value::Kwargs| -> Result<Value, Error> {
+            let _ = kwargs.get::<Option<bool>>("ensure_ascii");
+            let _ = kwargs.get::<Option<i64>>("indent");
+            let s = serde_json::to_string(&value)
+                .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("tojson: {e}")))?;
+            Ok(Value::from_safe_string(s))
+        });
 
-        env.add_template("chat", self.template)
+        // Strip HF `{% generation %}` / `{% endgeneration %}` training-mask
+        // tags (and their whitespace-control `{%- … -%}` variants). minijinja
+        // has no `generation` block tag, so a template that uses them (e.g.
+        // LFM2.5) fails to parse and the caller silently falls back to Plain
+        // framing. These tags only delimit the assistant-token span for
+        // training-data masking — they emit nothing — so removing the markers
+        // (including their own line) leaves the rendered output byte-identical
+        // for inference. No-op for templates that don't use them (Qwen/MiniMax).
+        let sanitized = strip_generation_tags(self.template);
+        env.add_template_owned("chat", sanitized)
             .map_err(|e| format!("template parse: {e}"))?;
         let tmpl = env
             .get_template("chat")
@@ -681,6 +730,96 @@ mod tests {
         expected.extend_from_slice(&t.encode("assistant"));
         expected.extend_from_slice(&t.encode("\n"));
         assert_eq!(got, expected, "Plain assistant prefix layout mismatch");
+    }
+
+    #[test]
+    fn strip_generation_tags_removes_markers_keeps_body() {
+        // HF training-mask tags (and their whitespace-control variants) are
+        // dropped; the body between them and everything else is untouched.
+        let tpl = "a\n{%- generation -%}\nBODY\n{%- endgeneration -%}\nb\n{% generation %}X{% endgeneration %}c";
+        let got = strip_generation_tags(tpl);
+        assert!(!got.contains("generation"), "tags not stripped: {got:?}");
+        assert!(got.contains("BODY"), "inner body dropped: {got:?}");
+        assert!(got.contains('X') && got.contains('c'), "non-dashed body dropped: {got:?}");
+        // A template with no generation tags is returned unchanged.
+        let plain = "{{ bos_token }}{%- for m in messages -%}{{ m.role }}{%- endfor -%}";
+        assert_eq!(strip_generation_tags(plain), plain);
+    }
+
+    #[test]
+    fn jinja_render_tolerates_generation_tags() {
+        // A minimal template that uses `{% generation %}` around the assistant
+        // body — minijinja has no such tag, so without the strip this fails to
+        // parse. With the strip it renders the assistant body normally.
+        let t = make_tokenizer();
+        let template = "{%- for message in messages -%}\
+            {{- '<|im_start|>' + message.role + '\\n' -}}\
+            {%- if message.role == 'assistant' -%}{%- generation -%}{{- message.content -}}{%- endgeneration -%}\
+            {%- else -%}{{- message.content -}}{%- endif -%}\
+            {{- '<|im_end|>\\n' -}}\
+            {%- endfor -%}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "hi",
+            enable_thinking: false,
+            bos_token: Some("<|im_start|>"),
+        };
+        let msgs = vec![
+            Message { role: Role::User, content: "hi".into(), tool_calls: vec![], tool_call_id: None },
+            Message { role: Role::Assistant, content: "yo".into(), tool_calls: vec![], tool_call_id: None },
+        ];
+        let rendered = frame.render_messages(&msgs, None, None)
+            .expect("template with generation tags must render after strip");
+        assert_eq!(rendered, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nyo<|im_end|>\n");
+    }
+
+    #[test]
+    fn jinja_tojson_accepts_ensure_ascii_kwarg() {
+        // MiniMax-M2's template calls `tojson(ensure_ascii=False)`; minijinja's
+        // builtin rejects the kwarg → render fails → silent Plain fallback (the
+        // model then never emits its native tool format). Our override must
+        // accept the kwarg and emit raw JSON.
+        let t = make_tokenizer();
+        let template = "{%- for m in messages -%}{{- m.content -}}{%- endfor -%}{{- tools | tojson(ensure_ascii=False) -}}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "hi",
+            enable_thinking: false,
+            bos_token: Some(""),
+        };
+        let msgs = vec![Message { role: Role::User, content: "hi".into(), tool_calls: vec![], tool_call_id: None }];
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "get_weather"}})];
+        let rendered = frame.render_messages(&msgs, Some(&tools), None)
+            .expect("tojson(ensure_ascii=False) must render, not fall back");
+        assert!(rendered.contains("\"get_weather\""), "tool json missing: {rendered}");
+    }
+
+    #[test]
+    fn jinja_chainable_tolerates_missing_optional_field() {
+        // Chat templates probe optional message fields (e.g. MiniMax-M2's
+        // `system_message.current_date`). Under Strict-undefined that raised and
+        // forced a Plain fallback (broke MiniMax under Hermes); Chainable treats a
+        // missing key as falsy like Jinja2, so the probe is a no-op.
+        let t = make_tokenizer();
+        let template = "{%- for m in messages -%}\
+            {%- if m.current_date -%}D:{{ m.current_date }}{%- endif -%}\
+            {{- m.content -}}\
+            {%- endfor -%}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t, template, system: None, user: "hi",
+            enable_thinking: false, bos_token: Some(""),
+        };
+        let msgs = vec![
+            Message { role: Role::System, content: "S".into(), tool_calls: vec![], tool_call_id: None },
+            Message { role: Role::User, content: "U".into(), tool_calls: vec![], tool_call_id: None },
+        ];
+        let rendered = frame.render_messages(&msgs, None, None)
+            .expect("probing a missing optional message field must not raise");
+        assert_eq!(rendered, "SU");
     }
 
     #[test]

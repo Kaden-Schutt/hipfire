@@ -430,6 +430,19 @@ pub struct MiniMaxState {
     pub fa_v: GpuTensor,   // [kv_dim]
     pub fa_attn_out: GpuTensor, // [q_dim]
     pub flash_partials: GpuTensor,
+    /// Flash-attention tri-state for the Q8 decode/prefill attention path.
+    /// Mirrors qwen35's `flash_mode`:
+    ///   0 = never  — single-workgroup `attention_q8_0_kv` until the >15K
+    ///                LDS sanity cap (then forced flash anyway).
+    ///   1 = auto   — flash at ctx >= 2048.
+    ///   2 = always — flash at every ctx.
+    /// Default 2 on graph-capable archs (gfx11/gfx12) so the warmup-eager and
+    /// captured-replay decode steps use the SAME kernel (the single-workgroup
+    /// kernel has variable block_size + variable shared-mem and is NOT
+    /// capture-safe; a mode-1 default would mix kernels direct-vs-graph at
+    /// small ctx and diverge the fp32 reduction order). Override via
+    /// `HIPFIRE_ATTN_FLASH=never|auto|always`.
+    pub flash_mode: u8,
 
     // residual + embedding
     pub h: GpuTensor, // [hidden] residual stream
@@ -492,14 +505,34 @@ impl MiniMaxState {
             g.alloc_tensor(&[n], DType::F32)
                 .map_err(|e| format!("minimax: alloc {label}: {e:?}"))
         };
-        // Flash-attn partials: [n_heads * max_tiles * (2+head_dim)]; max_tiles
-        // bounded by ceil(max_seq/tile). Use a generous tile bound of 64.
-        let max_tiles = (max_seq / 256).max(1) + 1;
+        // Flash-attn partials for the tile+reduce two-kernel path
+        // (`attention_flash_q8_0`). The dispatch uses TILE_SIZE=128 and sizes
+        // the per-head row stride by `max_tiles = ceil(physical_cap/128)`, so
+        // the buffer MUST be `n_heads * ceil(physical_cap/128) * (2+head_dim)`
+        // floats — the prior tile=256 / (max_seq/256+1) sizing UNDER-allocated
+        // by ~2× and would corrupt the reduce read at long context. Decode is
+        // batch=1 (one query position per dispatch) and the long-prefill path
+        // serializes one flash call per row reusing this same buffer, so no
+        // batch multiplier is needed.
+        const FLASH_TILE: usize = 128;
+        let max_tiles = (kv.physical_cap + FLASH_TILE - 1) / FLASH_TILE;
         let flash_partials = alloc(
             gpu,
             cfg.num_attention_heads * max_tiles * (2 + cfg.head_dim),
             "flash_partials",
         )?;
+        // Flash tri-state: default 2 (always flash) on graph-capable archs so
+        // warmup-eager and captured-replay decode use the identical kernel.
+        let flash_mode = match std::env::var("HIPFIRE_ATTN_FLASH").as_deref() {
+            Ok("never") | Ok("0") | Ok("off") => 0u8,
+            Ok("always") | Ok("2") | Ok("force") => 2u8,
+            Ok("auto") | Ok("1") | Ok("on") => 1u8,
+            _ => {
+                let graph_capable_arch =
+                    gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
+                if graph_capable_arch { 2 } else { 1 }
+            }
+        };
 
         Ok(MiniMaxState {
             kv,
@@ -515,6 +548,7 @@ impl MiniMaxState {
             fa_v: alloc(gpu, kv_dim, "fa_v")?,
             fa_attn_out: alloc(gpu, q_dim, "fa_attn_out")?,
             flash_partials,
+            flash_mode,
             h: alloc(gpu, hidden, "h")?,
             ffn_tmp: alloc(gpu, hidden, "ffn_tmp")?,
             ffn_x_rot: alloc(gpu, hidden, "ffn_x_rot")?,

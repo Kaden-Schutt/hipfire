@@ -26,22 +26,10 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--model" => {
-                model = Some(PathBuf::from(&argv[i + 1]));
-                i += 2;
-            }
-            "--prompt" => {
-                prompt = argv[i + 1].clone();
-                i += 2;
-            }
-            "--max" => {
-                max = argv[i + 1].parse().expect("--max");
-                i += 2;
-            }
-            other => {
-                eprintln!("unknown arg {other}");
-                std::process::exit(1);
-            }
+            "--model" => { model = Some(PathBuf::from(&argv[i + 1])); i += 2; }
+            "--prompt" => { prompt = argv[i + 1].clone(); i += 2; }
+            "--max" => { max = argv[i + 1].parse().expect("--max"); i += 2; }
+            other => { eprintln!("unknown arg {other}"); std::process::exit(1); }
         }
     }
     let model = model.expect("--model required");
@@ -51,11 +39,8 @@ fn main() {
     let cfg = Lfm2MoeConfig::from_hfq(&hfq).expect("config");
     eprintln!(
         "lfm2moe hidden={} layers={} experts={}/{} vocab={}",
-        cfg.hidden_size,
-        cfg.num_hidden_layers,
-        cfg.num_experts,
-        cfg.num_experts_per_tok,
-        cfg.vocab_size
+        cfg.hidden_size, cfg.num_hidden_layers, cfg.num_experts,
+        cfg.num_experts_per_tok, cfg.vocab_size
     );
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let t_load = std::time::Instant::now();
@@ -71,10 +56,7 @@ fn main() {
         let mut bi = 0u32;
         let mut bv = f32::NEG_INFINITY;
         for (i, &x) in v.iter().enumerate() {
-            if x > bv {
-                bv = x;
-                bi = i as u32;
-            }
+            if x > bv { bv = x; bi = i as u32; }
         }
         bi
     };
@@ -85,11 +67,7 @@ fn main() {
     for (pos, &t) in prompt_ids.iter().enumerate() {
         logits = decode_step(&cfg, &weights, &mut state, &mut gpu, t, pos as u32).expect("prefill");
     }
-    eprintln!(
-        "prefill {} tok in {:.2}s",
-        prompt_ids.len(),
-        t0.elapsed().as_secs_f64()
-    );
+    eprintln!("prefill {} tok in {:.2}s", prompt_ids.len(), t0.elapsed().as_secs_f64());
 
     // Greedy decode.
     let mut gen = Vec::new();
@@ -99,23 +77,12 @@ fn main() {
         let next = argmax(&logits);
         gen.push(next);
         // LFM2.5 EOS = 124900; also stop on common ids.
-        if matches!(next, 124900 | 124899 | 2) {
-            break;
-        }
-        logits =
-            decode_step(&cfg, &weights, &mut state, &mut gpu, next, pos as u32).expect("decode");
+        if matches!(next, 124900 | 124899 | 2) { break; }
+        logits = decode_step(&cfg, &weights, &mut state, &mut gpu, next, pos as u32).expect("decode");
         pos += 1;
     }
     let dt = t1.elapsed().as_secs_f64();
-    eprintln!(
-        "decoded {} tok in {:.2}s ({:.1} tok/s)",
-        gen.len(),
-        dt,
-        gen.len() as f64 / dt
-    );
-    println!(
-        "=== PROMPT ===\n{prompt}\n=== GENERATION ===\n{}",
-        tok.decode(&gen)
-    );
+    eprintln!("decoded {} tok in {:.2}s ({:.1} tok/s)", gen.len(), dt, gen.len() as f64 / dt);
+    println!("=== PROMPT ===\n{prompt}\n=== GENERATION ===\n{}", tok.decode(&gen));
     eprintln!("token ids: {:?}", &gen[..gen.len().min(40)]);
 }

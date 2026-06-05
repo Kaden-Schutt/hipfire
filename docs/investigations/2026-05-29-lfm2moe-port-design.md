@@ -147,6 +147,61 @@ for a *completion* prompt fed to an *instruct/thinking* model, NOT an arch bug
 (cosine ≥0.999 already proves the forward). The daemon's ChatFrame wraps the turn
 correctly. Use chat framing for this model.
 
+### Chat template — upstream jinja (embedded; `HIPFIRE_JINJA_CHAT=1`)
+
+LiquidAI ships a real `chat_template.jinja` (4621 B; ChatML turns with a leading
+`{{ bos_token }}` = `<|startoftext|>`, `<think>…</think>` reasoning, and a
+`<|tool_call_start|>[py_call(args)]<|tool_call_end|>` tool syntax). The original
+quant was produced from an incomplete HF download that lacked this file, so the
+`.hfq` carried no template and serve fell back to the hand-rolled ChatML `ChatFrame`
+— correct turn structure but (a) **no `<|startoftext|>` BOS** and (b) the wrong tool
+format. Fixed end-to-end (mirrors how MiniMax-M2 serves jinja):
+
+1. **Embedded** the upstream `chat_template.jinja` into every shipped variant
+   (`mq4`/`mq4p`/`mq6e`/`mq4-awq`) via `scripts/hfq_inject_chat_template.py` (no
+   re-quantize — only grows `tokenizer_config.chat_template` in the HFQ metadata).
+   A fresh quantize from a *complete* HF checkout embeds it automatically (the
+   quantizer already folds `chat_template.jinja`).
+2. **`{% generation %}` strip** — the template uses HF's training-mask
+   `{% generation %}…{% endgeneration %}` tags, which minijinja can't parse (would
+   fail → silent Plain fallback). `JinjaChatFrame` now strips these no-op markers
+   before parsing (`strip_generation_tags`, `prompt_frame.rs`) — render output is
+   byte-identical for inference, and it's a no-op for templates without them.
+3. **BOS fix** — `config.json bos_token_id=124894` (`<|startoftext|>`), but our
+   tokenizer's `bos_id` resolves to `<|endoftext|>` (124895). `generate_lfm2moe`
+   pins `JinjaChatFrame.bos_token = Some("<|startoftext|>")` so the template's
+   `{{ bos_token }}` renders the correct token (the Gemma 4 precedent).
+
+Verified: `[chat_template] using HFQ-embedded` fires at load, no render-fallback,
+coherent (Paris / 80 km/h, 244 tok/s) under `HIPFIRE_JINJA_CHAT=1`. The flag is
+opt-in (global default off, same as MiniMax); without it serve uses the Plain
+ChatFrame as before. Upstream template kept verbatim at
+`crates/hipfire-arch-lfm2moe/assets/chat_template.jinja`.
+
+### Tool calls — response parsing (request side via template, response side via CLI)
+
+Tool-call **request** rendering is handled by the embedded template (tools fold
+into the system block as `List of tools: […]`; assistant calls render as
+`<|tool_call_start|>[fn(k=v)]<|tool_call_end|>`). Verified e2e: with a `get_weather`
+tool the model emits `<|tool_call_start|>[get_weather(location="Paris")]<|tool_call_end|>`.
+
+The **response** parser (`cli/index.ts:parseToolCalls`) previously recognised only
+the Qwen/Llama `<tool_call>{json}</tool_call>` shape, so LFM2's bracket-call syntax
+(and MiniMax-M2's `<minimax:tool_call><invoke name>…` XML) were passed through as
+plain content — tool calls did NOT round-trip. DeepSeek V4's DSML is unaffected (it's
+parsed daemon-side into structured `tool_calls` events). Added two format-detecting
+parsers to `parseToolCalls`:
+- **LFM2.5** `<|tool_call_start|>[ name(k=v, …), … ]<|tool_call_end|>` — depth/quote-aware
+  split of the call list + args; `parsePyValue` maps `'s'`/`"s"`/ints/`True`/`False`/
+  `None`/JSON arrays.
+- **MiniMax-M2** `<minimax:tool_call><invoke name="fn"><parameter name="k">v</parameter>…` —
+  per-`<invoke>`/`<parameter>`; values JSON-parsed (typed) with raw-string fallback,
+  matching the template's `v | tojson if v is not string else v`.
+
+8 new cases in `cli/parse_tool_calls.test.ts` (incl. the exact e2e bytes); 26/26 pass.
+Positional args and nested single-quoted Python dicts are best-effort (keyword/scalar
+args — the trained/common shape — are exact).
+
 ## PERF TUNING (gfx1201)
 
 Warm decode baseline (fresh process, `HIPFIRE_DPM_WARMUP_SECS=10`, matched full
