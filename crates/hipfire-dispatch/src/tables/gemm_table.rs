@@ -57,6 +57,33 @@ pub fn populate(registry: &mut KernelRegistry) {
         steps: &[PipelineOp::Gemv],
         has_awq: false,
     });
+    // Batched lm_head wrappers — ArchPredicate::Always: the rdna-compute
+    // `gemm_hfqXg256_batched_lmhead` methods self-select WMMA-residual on
+    // gfx11/gfx12, dp4a-residual on gfx906 (HFQ6), and a per-row GEMV
+    // fallback on every other arch. Gating these on HasWmmaW32 would make
+    // resolve() error on the legitimate scalar-fallback archs and break the
+    // DFlash lm_head call. The kernel is callable everywhere, so Always.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmHfq4G256BatchedLmhead,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmHfq3G256BatchedLmhead,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmHfq6G256BatchedLmhead,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+    });
     registry.register(KernelVariant {
         key: KernelKey::GemmF16XF16Wmma,
         arch_required: ArchPredicate::HasWmmaW32,

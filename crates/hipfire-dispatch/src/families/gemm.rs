@@ -23,6 +23,47 @@ pub struct GemmParams<'a> {
     pub batch_size: usize,
 }
 
+/// Which batched lm_head GEMM kernel family to dispatch.
+///
+/// The lm_head kernel is selected by the *kernel* family (HFQ3 / HFQ4 / HFQ6),
+/// which is NOT the same as the weight's source dtype: MQ4 weights route to the
+/// HFQ4 kernel (after the caller FWHT-rotates x), MQ3 → HFQ3, MQ6 → HFQ6. So the
+/// caller names the kernel explicitly rather than letting `run` infer it from
+/// `WeightRef::dtype`. Each maps to a `gemm_hfqXg256_batched_lmhead` wrapper in
+/// rdna-compute, which zero-inits Y and self-selects WMMA-residual / dp4a /
+/// per-row GEMV per arch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GemmLmHeadKernel {
+    Hfq4G256,
+    Hfq3G256,
+    Hfq6G256,
+}
+
+impl GemmLmHeadKernel {
+    fn key(self) -> KernelKey {
+        match self {
+            GemmLmHeadKernel::Hfq4G256 => KernelKey::GemmHfq4G256BatchedLmhead,
+            GemmLmHeadKernel::Hfq3G256 => KernelKey::GemmHfq3G256BatchedLmhead,
+            GemmLmHeadKernel::Hfq6G256 => KernelKey::GemmHfq6G256BatchedLmhead,
+        }
+    }
+}
+
+/// Parameters for a batched lm_head GEMM dispatch.
+///
+/// `x` is the (already-rotated, when the source weights are MQ) hidden-state
+/// batch; `y` is the `batch * m` logits output. Mirrors the direct
+/// `gpu.gemm_hfqXg256_batched_lmhead(buf, x, y, m, k, batch)` call shape.
+pub struct GemmLmHeadParams<'a> {
+    pub kernel: GemmLmHeadKernel,
+    pub w_buf: &'a GpuTensor,
+    pub x: &'a GpuTensor,
+    pub y: &'a GpuTensor,
+    pub m: usize,
+    pub k: usize,
+    pub batch_size: usize,
+}
+
 // ── Family ─────────────────────────────────────────────
 
 pub struct GemmFamily {
@@ -116,6 +157,49 @@ impl GemmFamily {
             K::GemmHfq4G256Wmma => hip!(gpu.gemm_hfq4g256_wmma(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq4G256 => hip!(gpu.gemm_hfq4g256(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq4G128 => hip!(gpu.gemm_hfq4g128(w.buf, x, y, m, k, batch_size)),
+            other => Err(DispatchError::MissingImpl { key: other }),
+        }
+    }
+
+    /// Run a batched lm_head GEMM (`y[b][row] = A[row] · x[b]`, zero-init Y).
+    ///
+    /// Dispatches the `gemm_hfqXg256_batched_lmhead` wrapper for the named
+    /// kernel family. The wrapper self-selects WMMA-residual / dp4a / per-row
+    /// GEMV per arch, so `resolve` only confirms the key is registered (the
+    /// arch predicate is `Always`). Byte-identical to the prior direct
+    /// `gpu.gemm_hfqXg256_batched_lmhead(...)` calls in the DFlash path.
+    pub fn run_batched_lmhead(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        params: &GemmLmHeadParams,
+    ) -> Result<(), DispatchError> {
+        let key = self.registry.resolve(params.kernel.key(), ctx, None)?.key;
+
+        let w_buf = params.w_buf;
+        let x = params.x;
+        let y = params.y;
+        let m = params.m;
+        let k = params.k;
+        let batch_size = params.batch_size;
+
+        macro_rules! hip {
+            ($e:expr) => {
+                $e.map_err(|e| DispatchError::Hip(e.to_string()))
+            };
+        }
+
+        use KernelKey as K;
+        match key {
+            K::GemmHfq4G256BatchedLmhead => {
+                hip!(gpu.gemm_hfq4g256_batched_lmhead(w_buf, x, y, m, k, batch_size))
+            }
+            K::GemmHfq3G256BatchedLmhead => {
+                hip!(gpu.gemm_hfq3g256_batched_lmhead(w_buf, x, y, m, k, batch_size))
+            }
+            K::GemmHfq6G256BatchedLmhead => {
+                hip!(gpu.gemm_hfq6g256_batched_lmhead(w_buf, x, y, m, k, batch_size))
+            }
             other => Err(DispatchError::MissingImpl { key: other }),
         }
     }
