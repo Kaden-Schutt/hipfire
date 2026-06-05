@@ -25,6 +25,7 @@ use base64::Engine;
 use hip_bridge::HipResult;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
+use hipfire_arch_minimax as minimax;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_llama::Llama;
 use hipfire_arch_qwen2::qwen2;
@@ -1138,6 +1139,17 @@ struct LoadedModel {
     /// EOS token id resolved at load time. LFM2.5 uses the ChatML
     /// `<|im_end|>`; falls back to common alternates, then 1.
     lfm2moe_eos_tok: u32,
+    // MiniMax-M2 state (arch_id=10 — hipfire-arch-minimax). Mixtral-style
+    // MoE: GQA + per-layer QK-norm + partial rotate_half RoPE + sigmoid+bias
+    // 256-expert routing, no shared expert. KV cache lives inside
+    // MiniMaxState; no separate field. None on every other arch path.
+    minimax_config: Option<minimax::MiniMaxConfig>,
+    minimax_weights: Option<minimax::MiniMaxWeights>,
+    minimax_state: Option<minimax::MiniMaxState>,
+    /// EOS token id resolved at load time. MiniMax-M2 does NOT use ChatML —
+    /// its end-of-turn marker is the added token `[e~[`; falls back to common
+    /// alternates, then 1.
+    minimax_eos_tok: u32,
     /// MTP config — parsed from load-message params, read at generate time.
     /// Arch-agnostic: currently only DeepSeek V4 (arch_id=9) evaluates these,
     /// but the namespace is intentionally not deepseek4-specific.
@@ -1824,6 +1836,7 @@ fn main() {
                             7 => "qwen2",
                             8 => "dots-ocr",
                             9 => "deepseek4",
+                            10 => "minimax_m2",
                             11 => "lfm2moe",
                             _ => "qwen3",
                         };
@@ -2147,7 +2160,10 @@ fn main() {
                     // MoE-instruct default — they're tuned for this model and
                     // keep it on-distribution.
                     (0.2_f64, 0.80_f64)
-                } else if m.arch_id == 9 {
+                } else if m.arch_id == 9 || m.arch_id == 10 {
+                    // DeepSeek V4 (9) + MiniMax-M2 (10): quantized instruct
+                    // models that fall into block-level attractors at lower
+                    // temperatures — use the card-recommended temp=1.0/top_p=1.0.
                     (1.0_f64, 1.0_f64)
                 } else {
                     (0.3_f64, 0.8_f64)
@@ -2570,6 +2586,12 @@ fn main() {
                     if let Some(ref mut s) = m.lfm2moe_state {
                         let _ = s.reset(&mut gpu);
                     }
+                    // arch_id=10 (MiniMax-M2): clear the KV cursor between turns.
+                    // No captured hipGraph on this path by default, so no graph
+                    // invalidation needed. reset() takes no gpu (cursor-only).
+                    if let Some(ref mut s) = m.minimax_state {
+                        s.reset();
+                    }
                     // Restore adaptive-KV controller to start tier (q8/fwht4)
                     // so thresholds fire correctly on the fresh conversation
                     // instead of staying pinned at the floor tier.
@@ -2625,6 +2647,7 @@ fn main() {
                         6 => "qwen3_5_moe",
                         7 => "qwen2",
                         9 => "deepseek4",
+                        10 => "minimax_m2",
                         11 => "lfm2moe",
                         _ => "qwen3",
                     })
@@ -2835,6 +2858,26 @@ fn main() {
                         }
                     }
                     ok
+                } else if m.arch_id == 10 {
+                    // MiniMax-M2 warm-pass: per-token decode_step over the
+                    // synthetic prompt. Saturates the GQA + QK-norm + RoPE +
+                    // MoE kernel set before any user-facing generate. This IS
+                    // the production prefill shape (the eager per-token path).
+                    let config = m.minimax_config.as_ref().unwrap();
+                    let weights = m.minimax_weights.as_ref().unwrap();
+                    let state = m.minimax_state.as_mut().unwrap();
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if minimax::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
@@ -2875,6 +2918,11 @@ fn main() {
                 // reset cursors (takes gpu) so the next request starts cold.
                 if let Some(ref mut s) = m.lfm2moe_state {
                     let _ = s.reset(&mut gpu);
+                }
+                // MiniMax-M2 (arch_id=10): KV cache + scratch share MiniMaxState;
+                // reset its cursor (no gpu) for a cold prefill on the next request.
+                if let Some(ref mut s) = m.minimax_state {
+                    s.reset();
                 }
 
                 if run_ok {
@@ -3355,6 +3403,10 @@ fn load_model(
             lfm2moe_weights: None,
             lfm2moe_state: None,
             lfm2moe_eos_tok: 0,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3435,6 +3487,10 @@ fn load_model(
             lfm2moe_weights: None,
             lfm2moe_state: None,
             lfm2moe_eos_tok: 0,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3536,6 +3592,10 @@ fn load_model(
             lfm2moe_weights: None,
             lfm2moe_state: None,
             lfm2moe_eos_tok: 0,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3630,6 +3690,123 @@ fn load_model(
             lfm2moe_weights: Some(weights),
             lfm2moe_state: Some(state),
             lfm2moe_eos_tok: eos_tok,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(),
+            dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
+    if hfq.arch_id == 10 {
+        // MiniMax-M2 (hipfire-arch-minimax). Standalone bring-up — no
+        // eviction, no DFlash drafter, no PFlash, no VL, no spec-decode.
+        // The Architecture trait gives us config + weights + state in three
+        // calls; prefill + decode both go through the per-token
+        // `minimax::forward::decode_step` in the generate hot path. There
+        // is NO PrefillBatchScratch (batched prefill allocates its scratch
+        // per-call inside `forward_batch`).
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=10 (MiniMax-M2). \
+                       Reload without a draft."
+                .to_string());
+        }
+        if cask.sidecar.is_some() {
+            return Err(
+                "CASK eviction not supported on arch_id=10 (MiniMax-M2). \
+                       Reload without --cask-sidecar."
+                    .to_string(),
+            );
+        }
+        if pp > 1 {
+            return Err(
+                "pipeline-parallel (pp>1) not supported on arch_id=10 (MiniMax-M2)."
+                    .to_string(),
+            );
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        use hipfire_runtime::arch::Architecture;
+        let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
+        let weights = <minimax::MiniMaxM2 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        // Size the KV cache to the requested window (the trait's new_state
+        // caps at 8192; honour the caller's max_seq when it's larger/smaller).
+        let state = minimax::MiniMaxState::new_with_max_seq(gpu, &config, max_seq)
+            .map_err(|e| format!("minimax: MiniMaxState::new_with_max_seq failed: {e}"))?;
+        // Resolve EOS via the tokenizer. MiniMax-M2 does NOT use ChatML — its
+        // end-of-turn marker is the added token `[e~[` (id 200020 in the 200k
+        // vocab; generation_config.json eos_token_id = 200020). The ChatML
+        // probes (`<|im_end|>` etc.) are absent from this vocab and silently
+        // fall back to token 1, so generate_minimax never hits EOS: every turn
+        // runs to max_tokens. Probe the real marker first; keep the ChatML
+        // fallbacks for safety on any future tokenizer variant.
+        let eos_tok: u32 = {
+            let try_one = |s: &str| -> Option<u32> {
+                let ids = tokenizer.encode(s);
+                if ids.len() == 1 {
+                    Some(ids[0])
+                } else {
+                    None
+                }
+            };
+            try_one("[e~[")
+                .or_else(|| try_one("<|im_end|>"))
+                .or_else(|| try_one("</s>"))
+                .or_else(|| try_one("<|endoftext|>"))
+                .unwrap_or(1)
+        };
+        let chat_template = resolve_chat_template(&hfq, path);
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            kv_cache: None,
+            dn_state: None,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
+            minimax_config: Some(config),
+            minimax_weights: Some(weights),
+            minimax_state: Some(state),
+            minimax_eos_tok: eos_tok,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4085,6 +4262,10 @@ fn load_model(
             lfm2moe_weights: None,
             lfm2moe_state: None,
             lfm2moe_eos_tok: 0,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4155,6 +4336,10 @@ fn load_model(
             lfm2moe_weights: None,
             lfm2moe_state: None,
             lfm2moe_eos_tok: 0,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4313,6 +4498,10 @@ fn load_model_safetensors(
             lfm2moe_weights: None,
             lfm2moe_state: None,
             lfm2moe_eos_tok: 0,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4451,6 +4640,10 @@ fn load_model_safetensors(
         lfm2moe_weights: None,
         lfm2moe_state: None,
         lfm2moe_eos_tok: 0,
+        minimax_config: None,
+        minimax_weights: None,
+        minimax_state: None,
+        minimax_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -4686,6 +4879,10 @@ fn load_model_pp(
         lfm2moe_weights: None,
         lfm2moe_state: None,
         lfm2moe_eos_tok: 0,
+        minimax_config: None,
+        minimax_weights: None,
+        minimax_state: None,
+        minimax_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -7245,6 +7442,38 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         );
         let _ = (repeat_penalty, repeat_window);
         generate_lfm2moe(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            max_think_tokens,
+            tools,
+            messages_history,
+        );
+        return;
+    }
+    if m.arch_id == 10 {
+        // arch_id=10 (MiniMax-M2). Minimal AR bring-up — same shape as the
+        // deepseek4 / lfm2moe short-circuits above. PFlash / DFlash / VL /
+        // multi-GPU / sampler-budget / grammar / tools-execution all bypass.
+        // We honour `system_prompt`, `temp`, `top_p`, and (via JinjaChatFrame)
+        // `messages_history` + `tools` rendering; spec-decode / MTP / grammar
+        // are out of scope for the scaffold.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            assistant_prefix,
+            pflash_state,
+            pflash_cfg,
+            think_mode,
+        );
+        let _ = (repeat_penalty, repeat_window);
+        generate_minimax(
             m,
             gpu,
             stdout,
@@ -10740,6 +10969,298 @@ fn generate_lfm2moe(
     let _ = stdout.flush();
 }
 
+/// MiniMax-M2 (arch_id=10) generate path — minimal AR bring-up.
+///
+/// Mirrors `generate_lfm2moe`'s shape (prefill loop / chunked batched prefill,
+/// per-token decode loop, JSONL `token` / `done` events) with two differences:
+///
+///   1. Prompt build goes through `JinjaChatFrame` when `HIPFIRE_JINJA_CHAT=1`
+///      and the model carries a chat_template (so MiniMax-M2's own ChatML-ish
+///      template + `tools` / `messages` reach the upstream Jinja branches),
+///      falling back to the hand-rolled `ChatFrame::Plain` scaffold otherwise.
+///   2. `minimax::forward::decode_step` returns the full logits `Vec<f32>`
+///      (the state does NOT stash a greedy next-token), so sampling runs
+///      host-side via `deepseek4::sampling::sample_token` on that vector.
+///
+/// Out of scope for the scaffold (and intentionally NOT wired): spec-decode,
+/// MTP, grammar-constrained decoding, tool-call parsing/execution, repeat
+/// penalty, multi-GPU, eviction/prefix-cache. Correctness first.
+#[allow(clippy::too_many_arguments)]
+fn generate_minimax(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    if m.tokenizer.is_none() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+    if m.minimax_config.is_none() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"minimax_config missing on arch_id=10 generate"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
+    // `primed_think` records whether the rendered prompt actually ended with
+    // the MiniMax `<think>` generation-primer, so we only re-emit the opener
+    // (below) when the model truly begins inside the reasoning block. A jinja
+    // render failure that falls back to the Plain frame leaves it false.
+    let mut primed_think = false;
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                    Some(h) => h,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::System,
+                                content: sys.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                            });
+                        }
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => {
+                    primed_think = rendered.trim_end().ends_with("<think>");
+                    tokenizer.encode(&rendered)
+                }
+                Err(e) => {
+                    eprintln!("[daemon] jinja render failed in minimax path ({e}) — falling back to Plain");
+                    hipfire_runtime::prompt_frame::ChatFrame {
+                        tokenizer,
+                        system: system_prompt,
+                        user: prompt,
+                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        raw: false,
+                    }
+                    .build()
+                }
+            }
+        } else {
+            hipfire_runtime::prompt_frame::ChatFrame {
+                tokenizer,
+                system: system_prompt,
+                user: prompt,
+                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                raw: false,
+            }
+            .build()
+        }
+    };
+
+    if prompt_ids.is_empty() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    let eos_tok = m.minimax_eos_tok;
+
+    // Capacity guard. No eviction on arch_id=10 — reset the KV cursor when
+    // the requested run would overflow the budget. (max_seq + n_tokens live
+    // on the state.)
+    let overflow = {
+        let state = m.minimax_state.as_ref().unwrap();
+        state.n_tokens + prompt_ids.len() + max_tokens > state.max_seq
+    };
+    if overflow {
+        let (n, cap) = {
+            let state = m.minimax_state.as_ref().unwrap();
+            (state.n_tokens, state.max_seq)
+        };
+        eprintln!(
+            "[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",
+        );
+        m.minimax_state.as_mut().unwrap().reset();
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+
+    let t0 = Instant::now();
+
+    // ── Prefill: decode_step per prompt token, or chunked batched prefill.
+    // Disjoint field borrows of `m` (config / weights / state) let us also
+    // push to `m.conversation_tokens` in the same scope. The LAST forward's
+    // logits are the predictions for the first generated token. ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    {
+        let cfg = m.minimax_config.as_ref().unwrap();
+        let weights = m.minimax_weights.as_ref().unwrap();
+        let state = m.minimax_state.as_mut().unwrap();
+        // Batched prefill: process the prompt in chunks of <=64 tokens through
+        // the batched verify forward (one weight read per chunk vs one
+        // decode_step per token) → much lower TTFT. Validated byte-identical to
+        // the sequential path (cosine 1.0). DEFAULT ON when every layer's expert
+        // dtypes have batched kernels; the pre-check routes unsupported tiers
+        // (MQ3-Lloyd etc.) to the sequential path to avoid a mid-pass error.
+        // Force off with HIPFIRE_MINIMAX_BATCH_PREFILL=0.
+        let batch_prefill = std::env::var_os("HIPFIRE_MINIMAX_BATCH_PREFILL")
+            .map_or(true, |v| v != "0")
+            && minimax::forward::forward_batch_supported(weights);
+        if batch_prefill && !prompt_ids.is_empty() {
+            let mut pos = state.n_tokens;
+            for chunk in prompt_ids.chunks(64) {
+                match minimax::forward::forward_batch(cfg, weights, state, gpu, chunk, pos) {
+                    Ok(logits) => last_logits = logits,
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("minimax batch prefill failed: {e:?}"));
+                        return;
+                    }
+                }
+                pos += chunk.len();
+            }
+        } else {
+            let mut position = state.n_tokens as u32;
+            for &tok in &prompt_ids {
+                match minimax::forward::decode_step(cfg, weights, state, gpu, tok, position) {
+                    Ok(logits) => last_logits = logits,
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("minimax prefill failed: {e:?}"));
+                        return;
+                    }
+                }
+                position += 1;
+            }
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // MiniMax-M2's chat template unconditionally primes the assistant turn
+    // with `<think>\n` (chat_template.jinja generation-prompt block), so the
+    // model's GENERATED tokens begin *inside* the reasoning block and it only
+    // ever emits the closing `</think>`. Every downstream `<think>` consumer —
+    // the serve reasoning_content/content split, the run/chat-path stripper,
+    // and the history `stripThinkingInline` — keys on a LEADING `<think>` and
+    // so never engages, leaking the chain-of-thought into `message.content`.
+    // The primer is already in the KV from prefill; re-emit it into the token
+    // stream (display-only, not pushed to state) so the assistant message is a
+    // well-formed `<think>...</think>...` block for every consumer.
+    if primed_think {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"type": "token", "id": id, "text": "<think>\n"}),
+        );
+        let _ = stdout.flush();
+    }
+
+    // ── Decode loop. Sample host-side from the running logits vector.
+    // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
+    // Seed the PRNG from wall-clock nanos so successive same-prompt runs
+    // don't lock-step (greedy is still deterministic). ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        // Sample next token from the most recent logits.
+        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if next_tok == eos_tok {
+            break;
+        }
+
+        // Emit the text fragment. Build through serde_json so a user-supplied
+        // `id` or arbitrary-UTF-8 fragment can't corrupt the JSONL line.
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        // Advance one step on the freshly sampled token.
+        let step = {
+            let cfg = m.minimax_config.as_ref().unwrap();
+            let weights = m.minimax_weights.as_ref().unwrap();
+            let state = m.minimax_state.as_mut().unwrap();
+            let position = state.n_tokens as u32;
+            // hipGraph decode (opt-in via HIPFIRE_MINIMAX_GRAPH=1, default eager
+            // — measured only +1.0% on gfx1151). First call warms up eager, then
+            // captures + replays.
+            minimax::forward::decode_step_with_graph(cfg, weights, state, gpu, next_tok, position)
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("minimax decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = m.minimax_state.as_ref().unwrap().n_tokens;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms,
+    );
+    let _ = stdout.flush();
+}
 
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
 ///

@@ -40,7 +40,7 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr", "arch-lfm2moe", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr", "arch-lfm2moe", "arch-minimax", "deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
@@ -49,6 +49,7 @@ arch-qwen2 = []
 arch-deepseek4 = []
 arch-dots-ocr = []
 arch-lfm2moe = []
+arch-minimax = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
@@ -99,6 +100,7 @@ hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
+hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
 
@@ -113,7 +115,7 @@ hipfire-atlas = { path = "../hipfire-atlas" }
 
 [[example]]
 name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr", "arch-lfm2moe"]
+required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr", "arch-lfm2moe", "arch-minimax"]
 
 [[example]]
 name = "hfq_split"
