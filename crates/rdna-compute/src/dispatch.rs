@@ -260,7 +260,18 @@ impl DType {
     /// quant time — this helper governs only whether the loader
     /// attaches an already-emitted sidecar.
     pub fn supports_awq_sidecar(self) -> bool {
-        matches!(self, DType::MQ4G256 | DType::MQ3G256)
+        // MQ3G256Lloyd / MQ2G256Lloyd added 2026-05-28: they are "forward-path-ready"
+        // (flow through rotate_x_mq_for, which applies x/=awq_scale when a sidecar is
+        // attached) — see the doc block above. Enables AWQ×Lloyd composition once the
+        // quantizer emits sidecars for the Lloyd arms.
+        matches!(
+            self,
+            DType::MQ4G256
+                | DType::MQ3G256
+                | DType::MQ2G256
+                | DType::MQ3G256Lloyd
+                | DType::MQ2G256Lloyd
+        )
     }
 }
 
