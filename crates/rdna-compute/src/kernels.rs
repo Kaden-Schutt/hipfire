@@ -1264,6 +1264,13 @@ pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_HFQ6G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// HFQ6G256 batched gate_up: same kernarg signature + grid (M, K_TOP, N) +
+/// gate/up output split as the HFQ4 batched gate_up kernel, only the per-group
+/// dequant differs (200 B/group, 6-bit). Pairs with the HFQ6 expanded down
+/// kernel for the batched LFM2.5-MoE decode path (MQ6-promoted expert layers).
+pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_k8_indexed_batched.hip");
+
 /// Combine kernel for the atomic-free MoE down path. Sums K_TOP expert
 /// slots per (token, m) with topk_weights applied; accumulates into the
 /// per-token residual row. No cross-token contention.
@@ -2867,6 +2874,13 @@ pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const CONV1D_DECODE_SRC: &str = include_str!("../../../kernels/src/conv1d_decode.hip");
 
+/// LFM2 LIV double-gated short-conv, single-token decode (runtime kernel_size).
+/// Fuses the B*x pre-gate, depthwise causal conv, C*conv_out post-gate, and the
+/// rolling conv-state ring-buffer advance into one launch. conv_bias is always
+/// false for LFM2. See kernels/src/conv1d_gated_decode.hip.
+pub const CONV1D_GATED_DECODE_SRC: &str =
+    include_str!("../../../kernels/src/conv1d_gated_decode.hip");
+
 /// Gated output norm: rmsnorm(x) * silu(z). Fused single kernel.
 /// x and z are [n_heads × head_dim]. weight is [head_dim] (shared across heads).
 #[cfg(feature = "deltanet")]
@@ -3193,6 +3207,16 @@ pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
 
 pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.hip");
+
+/// MQ3-Lloyd MoE indexed family (MiniMax-M2, arch_id=10): routed-experts
+/// gate_up + down with device-side topk routing + per-expert pointer table.
+/// Mirrors the MQ2-Lloyd MoE indexed kernels (3-bit + 8-entry codebook,
+/// 112 B/group). X must be FWHT-pre-rotated by the caller.
+pub const GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_gate_up_indexed.hip");
+
+pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed.hip");
 
 /// Strict superset of fused_rmsnorm_mq_rotate that ALSO writes the
 /// plain (non-FWHT) RMSNormed output to a second buffer. Eliminates the

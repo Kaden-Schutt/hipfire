@@ -163,6 +163,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-lfm2moe"
+version = "0.1.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-llama"
 version = "0.2.0"
 dependencies = [
@@ -170,6 +182,17 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
+]
+
+[[package]]
+name = "hipfire-arch-minimax"
+version = "0.2.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -272,7 +295,9 @@ dependencies = [
  "hip-bridge",
  "hipfire-arch-deepseek4",
  "hipfire-arch-dots-ocr",
+ "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
+ "hipfire-arch-minimax",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",

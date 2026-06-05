@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-arch-minimax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MiniMax-M2 architecture (Mixtral-style MoE: GQA + per-layer QK-norm + partial rotate_half RoPE + sigmoid+bias 256-expert MoE) for hipfire"
+
+[features]
+default = ["deltanet"]
+# partial rotate_half RoPE (rope_partial_interleaved_f32) is deltanet-gated,
+# matching hipfire-arch-qwen35.
+deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

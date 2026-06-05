@@ -11,6 +11,8 @@ members = [
     "crates/hipfire-arch-deepseek4",
     "crates/hipfire-arch-toy",
     "crates/hipfire-arch-qwen2",
+    "crates/hipfire-arch-lfm2moe",
+    "crates/hipfire-arch-minimax",
     "crates/hipfire-arch-dots-ocr",
     "crates/hipfire-quantize",
     "crates/hipfire-detect",

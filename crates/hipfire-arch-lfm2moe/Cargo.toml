@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-arch-lfm2moe"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
+rdna-compute = { path = "../rdna-compute" }
+hip-bridge = { path = "../hip-bridge" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Mirror minimax: rdna-compute host-readback helpers and hybrid-state plumbing
+# live behind `deltanet`. The conv/attention/MoE kernels the forward uses are
+# ungated; the new LFM2 short-conv kernel is ungated too.
+default = ["deltanet"]
+deltanet = ["rdna-compute/deltanet", "hipfire-runtime/deltanet"]
