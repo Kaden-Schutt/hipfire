@@ -4712,12 +4712,16 @@ fn forward_from_x(
 }
 
 /// Shared forward pass — returns logits as GPU tensor (no download).
-/// Caller must free the returned tensor.
 /// Shared forward pass — returns logits as GPU tensor (no download).
 /// Caller must free the returned tensor.
 ///
 /// Delegates to `forward_scratch_layers` via a temporary `Qwen35Scratch`,
 /// ensuring test/demo paths exercise the same pipeline code as production.
+/// NOT production-representative for benchmarking: allocates and frees a full
+/// scratch bundle per call. Use `forward_scratch` with a persistent scratch
+/// for perf measurement. Per-layer `DEBUG_LAYERS` trace and `trace_finite`
+/// "qkvza" checkpoint are not emitted in this path — they are available
+/// via `dump_hidden_localize` in the scratch path under HIPFIRE_DUMP_HIDDEN.
 fn forward_from_x_gpu(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
