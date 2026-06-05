@@ -177,6 +177,7 @@ name = "hipfire-arch-qwen2"
 version = "0.2.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
  "serde_json",
