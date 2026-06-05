@@ -991,6 +991,13 @@ fn acquire_daemon_lock() -> std::fs::File {
 /// IPC. ~40 MB encoded → ~30 MB raw image bytes (4/3 expansion).
 const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
 
+/// hunt3 H-D: upper bound on a request-driven `max_seq` (512K). A defense-in-
+/// depth clamp only — it caps an unvalidated 10M `max_seq` that would otherwise
+/// drive a multi-GB KV allocation and OOM the daemon at load. It is NOT a
+/// VRAM-aware guard: a load that requests exactly this on a non-eviction config
+/// can still OOM at allocation; that VRAM validation is out of scope here.
+const MAX_REQUESTED_SEQ: usize = 512 * 1024;
+
 /// Emit a single-line `{"type":"error","id":"...","message":"..."}` JSON
 /// line on the IPC stream. Uses `serde_json` so user-controlled error
 /// strings (image decoder messages, base64 errors) can't desync the
@@ -1520,11 +1527,25 @@ fn main() {
                 }
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                let max_seq = msg
+                // hunt3 H-D: clamp request-driven max_seq to the config ceiling
+                // (MAX_REQUESTED_SEQ = 512K). Without this an unvalidated 10M
+                // max_seq drives a multi-GB KV allocation and OOMs the daemon at
+                // load. Emit an info event when the clamp actually fires so the
+                // operator sees the truncation rather than silently getting 512K.
+                let requested_max_seq = msg
                     .get("params")
                     .and_then(|p| p.get("max_seq"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(4096) as usize;
+                let max_seq = requested_max_seq.min(MAX_REQUESTED_SEQ);
+                if requested_max_seq > MAX_REQUESTED_SEQ {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"info","message":"requested max_seq {} exceeds ceiling {} — clamped"}}"#,
+                        requested_max_seq, MAX_REQUESTED_SEQ
+                    );
+                    let _ = stdout.flush();
+                }
                 // Optional DFlash draft model path. When supplied AND the target
                 // is a Qwen3.5 arch (5 or 6), we load draft weights + scratch
                 // alongside the target and the temp=0 generate fast path routes
@@ -2145,6 +2166,25 @@ fn main() {
                         },
                         None => None,
                     };
+                // hunt3 M-F: parse user stop sequences (top-level `stop` field on
+                // the generate message; the CLI forwards OpenAI `stop` here, already
+                // normalized to string[], <=4 entries, <=64 chars each). The decode
+                // loops match these against the decoded output suffix and finish
+                // with finish_reason="stop" on a hit. Re-apply the cap defensively
+                // in case a non-hipfire client drives the daemon directly.
+                let stop_seqs: Vec<String> = msg
+                    .get("stop")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|s| s.as_str())
+                            .filter(|s| !s.is_empty())
+                            .take(4)
+                            .map(|s| s.chars().take(64).collect::<String>())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
                 // Sampling defaults differ by arch: qwen35 family was tuned
                 // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
                 // DeepSeek V4 Flash's HF card recommends `temp=1.0, top_p=1.0`
@@ -2485,6 +2525,7 @@ fn main() {
                         tools_json.as_deref(),
                         messages_history.as_deref(),
                         think_mode,
+                        &stop_seqs, // hunt3 M-F
                     );
                 }
             }
@@ -5450,6 +5491,7 @@ fn generate_dflash(
     pflash_alpha: Option<f32>,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    stop: &[String],
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
@@ -5813,6 +5855,30 @@ fn generate_dflash(
         m.kv_cache = Some(target.kv_cache);
         m.dn_state = Some(target.dn_state);
         m.q35_scratch = Some(target.scratch);
+        // hunt3 #5-SLIVER: the suffix/cache_hit seed
+        // (seed_target_hidden_suffix_abortable) partially advances the COMMITTED
+        // dn_state through the new tokens then returns Ok(true) WITHOUT resetting
+        // ("state left as-is; caller must full-reset" per its doc). The next AR
+        // turn cold-prefills at seq_pos=0 but generate()'s DeltaNet memset is
+        // gated on the context-full branch (won't fire after this reset to
+        // seq_pos=0), so it would accumulate over the dirty recurrent state →
+        // drift / premature EOS. Zero it here, mirroring the decode-abort (H1)
+        // handler below. (The cold from_prompt seed already self-resets on
+        // abort, so this is a harmless no-op for that case.)
+        if let Some(ref dn) = m.dn_state {
+            for s in &dn.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+        }
+        if let Some(kv) = m.kv_cache.as_mut() {
+            kv.compact_offset = 0;
+        }
         let _ = writeln!(
             stdout,
             r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#,
@@ -6293,6 +6359,22 @@ fn generate_dflash(
                 break;
             }
 
+            // hunt3 M-F: user stop-sequence match against the decoded output
+            // suffix (DFlash path). Mirrors the AR generate() loop — match on
+            // the full decoded text so a stop string spanning a token boundary
+            // is caught. On a hit we treat it like a natural stop: break out of
+            // both the committed-tail loop and the outer spec-cycle loop via
+            // `hit_eos`, so finish_reason resolves to "stop" below (hit_length_cap
+            // false, no tool_calls). Gated behind `!stop.is_empty()` so the
+            // common bench/serve path pays nothing.
+            if !stop.is_empty() {
+                let decoded_suffix = tokenizer.decode(&streamed_tokens);
+                if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
+                    hit_eos = true;
+                    break;
+                }
+            }
+
             // max_think_tokens enforcement (mirrors the AR path). Track
             // <think>/<⁄think> in decoded text and count tokens inside.
             if max_think_tokens > 0 {
@@ -6562,6 +6644,7 @@ fn generate_multi(
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    stop: &[String],
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
@@ -6697,7 +6780,13 @@ fn generate_multi(
     //      identical to the pp=1 default path so multi-turn behavior
     //      matches between pp=1 and pp>1 when both run the same prompt.
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-    let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
+    // hunt3 H-A: drop the `seq_pos == 0` gate (PR #389 removed it from generate()).
+    // With the gate, turn 2+ fell through to the Plain scaffold, dropping the
+    // system prompt and the full history replay that render_messages provides.
+    // Now Jinja renders the full conversation every turn; the cold-reset block
+    // below (guarded on seq_pos > 0) re-zeros recurrent state so the full render
+    // writes from position 0 instead of appending to the prior turn's KV/DeltaNet.
+    let try_jinja = jinja_enabled && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -6760,6 +6849,49 @@ fn generate_multi(
         }
         .build_with_user_tokens(&q_tokens)
     };
+
+    // hunt3 H-A: under Jinja the full conversation (system + history) is
+    // re-rendered every turn, so turn 2+ must cold-reset BEFORE the budget guard
+    // + prefill — otherwise the full render appends to the prior turn's dirty
+    // KV / DeltaNet / checkpoint state (stale recurrent state → drift; the
+    // system prompt was also being silently dropped on turn 2+). Mirrors the
+    // `reset_pp_uncommitted_state!` semantics, written inline because that macro
+    // is defined later (after kv/dn/gpus are borrowed). Same shape as the
+    // context-full reset at the top of this fn and generate()'s `jinja_active &&
+    // seq_pos > 0` block.
+    if try_jinja && m.seq_pos > 0 {
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        free_checkpoints(&mut m.prefill_checkpoints, gpu);
+        free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        if let (Some(ref dn), Some(ref mut gpus), Some(ref la)) = (
+            m.dn_state.as_ref(),
+            m.pp_gpus.as_mut(),
+            m.pp_dn_la_to_device.as_ref(),
+        ) {
+            for (i, s) in dn.s_matrices.iter().enumerate() {
+                let g = &mut gpus.devices[la[i] as usize];
+                let _ = g.bind_thread();
+                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for (i, s) in dn.s_scales.iter().enumerate() {
+                let g = &mut gpus.devices[la[i] as usize];
+                let _ = g.bind_thread();
+                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for (i, s) in dn.conv_states.iter().enumerate() {
+                let g = &mut gpus.devices[la[i] as usize];
+                let _ = g.bind_thread();
+                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+            }
+        }
+        if let Some(kv) = m.kv_cache.as_mut() {
+            kv.compact_offset = 0;
+        }
+        if let Some(llkv) = m.llama_kv.as_mut() {
+            llkv.compact_offset = 0;
+        }
+    }
 
     let trailer = nl.len();
     if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
@@ -6843,6 +6975,53 @@ fn generate_multi(
     // only enables a larger window when a request explicitly sets one.
     let repeat_buf_cap = (scratch_set.per_device[dev_last].repeat_buf.buf.size() / 4).min(_repeat_window.max(1));
 
+    // hunt3 M-C: grammar-guided decoding for pp>1 (mirrors generate() ~8168).
+    // Without this, a pp>1 + tools request samples unconstrained once the model
+    // commits to <tool_call>, reproducing the ChatML-noise-in-tool_call-body
+    // attractor the single-GPU path masks via the qwen35 Matcher. The decoded
+    // vocab is built into a request-local Vec rather than cached on `m`
+    // (m.decoded_vocab) because `m` is already mutably borrowed here (kv/dn/gpus)
+    // — pp>1 + tools is uncommon, so the per-request decode is acceptable.
+    let grammar_enabled = std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref() != Some("0");
+    let tool_schemas_qwen: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
+        tools
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| {
+                        let func = t.get("function").unwrap_or(t);
+                        let name = func
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())?
+                            .to_string();
+                        let required: Vec<String> = func
+                            .get("parameters")
+                            .and_then(|p| p.get("required"))
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        Some(hipfire_arch_qwen35::grammar::ToolSchema { name, required })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let grammar_active = !tool_schemas_qwen.is_empty();
+    let mut grammar_matcher = hipfire_arch_qwen35::grammar::Matcher::new(tool_schemas_qwen);
+    let grammar_vocab: Vec<String> = if grammar_active {
+        let n = tokenizer.vocab_size();
+        (0..n).map(|id| tokenizer.decode(&[id as u32])).collect()
+    } else {
+        Vec::new()
+    };
+    let mut grammar_mask: Vec<bool> = vec![true; grammar_vocab.len()];
+
     if let Err(e) = qwen35::forward_prefill_batch_multi(
         gpus,
         weights,
@@ -6853,6 +7032,10 @@ fn generate_multi(
         dn,
         scratch_set,
     ) {
+        // hunt3 M-A: a partial-band prefill failure leaves DeltaNet partially
+        // advanced; without resetting, the next cold turn prefills over dirty
+        // recurrent state (drift). Mirror both abort paths, which already reset.
+        reset_pp_uncommitted_state!();
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"forward_prefill_batch_multi: {}"}}"#,
@@ -6903,20 +7086,35 @@ fn generate_multi(
         frequency_penalty,
         blocked_tokens: blocked0,
     };
+    // hunt3 M-C: grammar-gated first sample (GPU fast path when matcher free;
+    // CPU mask-then-sample when constraining). Matches generate()'s tok0 site.
     let tok0 = {
         let s_last = &scratch_set.per_device[dev_last];
         let g_last = &mut gpus.devices[dev_last];
-        sampler::sample(
-            g_last,
-            &s_last.logits,
-            &s_last.sample_buf,
-            &s_last.repeat_buf,
-            vocab_size,
-            ngram_scope,
-            &cfg0,
-            &mut rng_state,
-        )
+        if grammar_active && !grammar_matcher.is_free() {
+            let _ = g_last.bind_thread();
+            let mut logits = g_last
+                .download_f32(&s_last.logits)
+                .unwrap_or_else(|_| vec![0.0f32; vocab_size]);
+            grammar_matcher.token_mask(&grammar_vocab, &mut grammar_mask);
+            hipfire_arch_qwen35::grammar::Matcher::apply_mask_to_logits(&grammar_mask, &mut logits);
+            sampler::sample_cpu(&mut logits, ngram_scope, &cfg0)
+        } else {
+            sampler::sample(
+                g_last,
+                &s_last.logits,
+                &s_last.sample_buf,
+                &s_last.repeat_buf,
+                vocab_size,
+                ngram_scope,
+                &cfg0,
+                &mut rng_state,
+            )
+        }
     };
+    if grammar_active {
+        grammar_matcher.advance(&tokenizer.decode(&[tok0]));
+    }
     let t_prefill = Instant::now();
     let mut next_token = tok0;
 
@@ -6997,6 +7195,10 @@ fn generate_multi(
             dn,
             scratch_set,
         ) {
+            // hunt3 M-A: a decode-step failure leaves DeltaNet advanced past the
+            // (un-baked) conversation_tokens; reset so the next cold turn starts
+            // clean. Mirrors both abort paths.
+            reset_pp_uncommitted_state!();
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"forward_scratch_multi decode: {}"}}"#,
@@ -7015,6 +7217,20 @@ fn generate_multi(
         }
         if tokenizer.is_terminator(next_token) {
             break;
+        }
+
+        // hunt3 M-F: user stop-sequence match against the decoded output suffix
+        // (pp>1 multi-GPU path). Mirrors the AR generate() loop; matches the
+        // full decoded text so a stop string spanning a token boundary is
+        // caught. A plain break exits the `while generated < max_tokens` loop
+        // (this path's `done` event carries no finish_reason field, so there is
+        // no reason to resolve — terminating generation is the contract). Gated
+        // behind `!stop.is_empty()` so the common path pays nothing.
+        if !stop.is_empty() {
+            let decoded_suffix = tokenizer.decode(&streamed_tokens);
+            if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
+                break;
+            }
         }
 
         // max_think_tokens / force-answer enforcement: same decoded-text scan
@@ -7089,6 +7305,13 @@ fn generate_multi(
                     }
                     m.seq_pos += 1;
                     m.conversation_tokens.push(t);
+                    // hunt3 M-C: keep the grammar matcher in sync over force-closed
+                    // </think> tokens, exactly as generate() does (~8591). Without
+                    // this a tools request that force-closes <think> leaves the
+                    // matcher stale → malformed tool calls after the forced close.
+                    if grammar_active {
+                        grammar_matcher.advance(&tokenizer.decode(&[t]));
+                    }
                     streamed_tokens.push(t);
                     emit_committed_event(
                         stdout,
@@ -7177,20 +7400,37 @@ fn generate_multi(
                     frequency_penalty,
                     blocked_tokens: blocked,
                 };
+                // hunt3 M-C: grammar-gated budget-alert resample.
                 next_token = {
                     let s_last = &scratch_set.per_device[dev_last];
                     let g_last = &mut gpus.devices[dev_last];
-                    sampler::sample(
-                        g_last,
-                        &s_last.logits,
-                        &s_last.sample_buf,
-                        &s_last.repeat_buf,
-                        vocab_size,
-                        ngram_scope,
-                        &cfg,
-                        &mut rng_state,
-                    )
+                    if grammar_active && !grammar_matcher.is_free() {
+                        let _ = g_last.bind_thread();
+                        let mut logits = g_last
+                            .download_f32(&s_last.logits)
+                            .unwrap_or_else(|_| vec![0.0f32; vocab_size]);
+                        grammar_matcher.token_mask(&grammar_vocab, &mut grammar_mask);
+                        hipfire_arch_qwen35::grammar::Matcher::apply_mask_to_logits(
+                            &grammar_mask,
+                            &mut logits,
+                        );
+                        sampler::sample_cpu(&mut logits, ngram_scope, &cfg)
+                    } else {
+                        sampler::sample(
+                            g_last,
+                            &s_last.logits,
+                            &s_last.sample_buf,
+                            &s_last.repeat_buf,
+                            vocab_size,
+                            ngram_scope,
+                            &cfg,
+                            &mut rng_state,
+                        )
+                    }
                 };
+                if grammar_active {
+                    grammar_matcher.advance(&tokenizer.decode(&[next_token]));
+                }
                 continue;
             }
             let nudge_tokens = tokenizer.encode(budget_alert_text);
@@ -7281,20 +7521,44 @@ fn generate_multi(
             frequency_penalty,
             blocked_tokens: blocked,
         };
+        // hunt3 M-C: grammar-gated steady-state sample.
         next_token = {
             let s_last = &scratch_set.per_device[dev_last];
             let g_last = &mut gpus.devices[dev_last];
-            sampler::sample(
-                g_last,
-                &s_last.logits,
-                &s_last.sample_buf,
-                &s_last.repeat_buf,
-                vocab_size,
-                ngram_scope,
-                &cfg,
-                &mut rng_state,
-            )
+            if grammar_active && !grammar_matcher.is_free() {
+                let _ = g_last.bind_thread();
+                let mut logits = g_last
+                    .download_f32(&s_last.logits)
+                    .unwrap_or_else(|_| vec![0.0f32; vocab_size]);
+                grammar_matcher.token_mask(&grammar_vocab, &mut grammar_mask);
+                hipfire_arch_qwen35::grammar::Matcher::apply_mask_to_logits(
+                    &grammar_mask,
+                    &mut logits,
+                );
+                sampler::sample_cpu(&mut logits, ngram_scope, &cfg)
+            } else {
+                sampler::sample(
+                    g_last,
+                    &s_last.logits,
+                    &s_last.sample_buf,
+                    &s_last.repeat_buf,
+                    vocab_size,
+                    ngram_scope,
+                    &cfg,
+                    &mut rng_state,
+                )
+            }
         };
+        if grammar_active {
+            let was_detected = grammar_matcher.attractor_detected();
+            grammar_matcher.advance(&tokenizer.decode(&[next_token]));
+            if !was_detected && grammar_matcher.attractor_detected() {
+                eprintln!(
+                    "[grammar-ngram pp] attractor detected in tool_call args at gen={} — forcing close",
+                    generated,
+                );
+            }
+        }
     }
 
     // ChatML \n trailer so the next turn opens cleanly.
@@ -7353,7 +7617,12 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode, stop: &[String]) {
+    // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
+    // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
+    // request and does not carry RNG state across requests. Matches the u32 the
+    // GPU sample path uses (0x13579BDF).
+    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
     // Compress runs on the PFlash drafter handle when one is set (hetero
     // sibling device), else on the target gpu. The handle is consumed at
     // the seq_pos==0 compress site; decode always uses `gpu`.
@@ -7378,6 +7647,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             tools,
             messages_history,
         );
+        let _ = stop; // hunt3 M-F: not wired for arch_id=7 (qwen2 bring-up)
         generate_qwen2(
             m,
             gpu,
@@ -7410,6 +7680,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             pflash_cfg,
         );
         let _ = (repeat_penalty, repeat_window);
+        let _ = stop; // hunt3 M-F: not wired for arch_id=9 (deepseek4 bring-up)
         generate_deepseek4(
             m,
             gpu,
@@ -7501,6 +7772,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             assistant_prefix,
             tools,
             messages_history,
+            stop, // hunt3 M-F: thread user stop sequences into the pp>1 path
         );
         return;
     }
@@ -7574,6 +7846,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             dflash_alpha,
             tools,
             messages_history,
+            stop, // hunt3 M-F: thread user stop sequences into the default DFlash path
         );
         // Silence unused-variable warnings for the params DFlash doesn't
         // consume (top_p / repeat penalties are AR-only sampling knobs;
@@ -8925,6 +9198,18 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             }
             if tokenizer.is_terminator(next_token) {
                 break;
+            }
+
+            // hunt3 M-F: user stop-sequence match against the decoded output
+            // suffix. Matching on the full decoded text (not per-token) handles
+            // stop strings that span a token boundary. On a hit we break out of
+            // the decode loop; finish_reason naturally resolves to "stop" below
+            // (hit_length_cap is false and no tool_calls were emitted).
+            if !stop.is_empty() {
+                let decoded_suffix = tokenizer.decode(&streamed_tokens);
+                if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
+                    break;
+                }
             }
 
             // max_think_tokens enforcement. Track whether we're inside an
@@ -11437,6 +11722,12 @@ fn generate_vl(
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
+    // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
+    // fixed seed. The VL path samples exclusively via sampler::sample_cpu, which
+    // draws from this global; without the per-request reset it carried RNG state
+    // across requests (and across earlier text-path requests) → cross-request
+    // nondeterminism. Matches the GPU path's u32 (0x13579BDF).
+    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU
@@ -11710,6 +12001,13 @@ fn generate_vl(
 
     m.conversation_tokens.extend_from_slice(&prompt_tokens);
 
+    // hunt3 M-D: repeat-penalty / n-gram-block history must be scoped to the
+    // GENERATED tokens only (mirrors the text path's `ngram_scope_start` set to
+    // conversation_tokens.len() after prefill). Passing the full conversation
+    // makes the trailing window prompt-dominated, suppressing the names/numbers
+    // a VL transcription task must reproduce.
+    let vl_ngram_scope_start = m.conversation_tokens.len();
+
     // Generate. CPU-side sampling — VL path predates the GPU sampler
     // and downloads logits each step. The order of ops is preserved
     // from pre-PR3:
@@ -11826,12 +12124,14 @@ fn generate_vl(
             }
         }
         logits = gpu.download_f32(&scratch.logits).unwrap();
-        llama::apply_ngram_block(&mut logits, &m.conversation_tokens);
+        // hunt3 M-D: scope ngram-block + repeat-penalty history to generated-only.
+        let vl_ngram_scope = &m.conversation_tokens[vl_ngram_scope_start..];
+        llama::apply_ngram_block(&mut logits, vl_ngram_scope);
         if let Some((open, close)) = think_pair {
             block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
         }
 
-        next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &vl_cfg);
+        next_token = sampler::sample_cpu(&mut logits, vl_ngram_scope, &vl_cfg);
 
         if max_think_tokens > 0 {
             if let Some((open, close)) = think_pair {
@@ -11870,6 +12170,19 @@ fn generate_vl(
                         }
                         m.conversation_tokens.push(t);
                         streamed_tokens.push(t);
+                        // hunt3 H-F: emit the committed-token event for force-closed
+                        // </think> tokens too, BEFORE `generated += 1`, so the
+                        // committed pos stays in lockstep with the streamed count
+                        // under HIPFIRE_EMIT_TOKEN_IDS=1. The VL main loop uses
+                        // `generated - 1` after its increment; here `generated`
+                        // (pre-increment) is the same value.
+                        emit_committed_event(
+                            stdout,
+                            id,
+                            t,
+                            generated,
+                            t0.elapsed().as_millis() as u64,
+                        );
 
                         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
                         let new_bytes = &all_bytes[emitted_bytes..];
@@ -11907,7 +12220,12 @@ fn generate_vl(
                         20,
                         2,
                     );
-                    next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &vl_cfg);
+                    // hunt3 M-D: generated-only repeat-penalty scope.
+                    next_token = sampler::sample_cpu(
+                        &mut logits,
+                        &m.conversation_tokens[vl_ngram_scope_start..],
+                        &vl_cfg,
+                    );
                 }
             }
         }

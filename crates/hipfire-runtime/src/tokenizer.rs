@@ -594,19 +594,11 @@ impl Tokenizer {
     /// For GPT-2 BPE: collects all bytes first, then does UTF-8 conversion once
     /// (individual tokens can be incomplete UTF-8 sequences in byte-level BPE).
     pub fn decode(&self, tokens: &[u32]) -> String {
-        if self.is_gpt2_bpe {
-            String::from_utf8_lossy(&self.decode_bytes(tokens)).into_owned()
-        } else {
-            let mut result = String::new();
-            for &id in tokens {
-                if let Some(tok) = self.vocab.get(id as usize) {
-                    let decoded = tok.replace('▁', " ");
-                    let decoded = decode_hex_escapes(&decoded);
-                    result.push_str(&decoded);
-                }
-            }
-            result
-        }
+        // hunt3 H-C: delegate to the byte-correct decode_bytes path then
+        // from_utf8_lossy once, so multi-byte chars split across <0xHH>
+        // fallback tokens (e.g. CJK 中 = E4 B8 AD) reassemble instead of
+        // mojibake-ing via `byte as char`. Covers both BPE and SentencePiece.
+        String::from_utf8_lossy(&self.decode_bytes(tokens)).into_owned()
     }
 
     /// Decode tokens to raw bytes (for incremental UTF-8 streaming).
@@ -635,9 +627,10 @@ impl Tokenizer {
                         }
                     }
                 } else {
+                    // hunt3 H-C: byte-correct path — <0xHH> fallback tokens must
+                    // emit raw bytes, not `byte as char` re-UTF8-encoded codepoints.
                     let decoded = tok.replace('▁', " ");
-                    let decoded = decode_hex_escapes(&decoded);
-                    bytes.extend_from_slice(decoded.as_bytes());
+                    bytes.extend_from_slice(&decode_hex_escapes_bytes(&decoded));
                 }
             }
         }
@@ -1077,9 +1070,20 @@ static GPT2_OFFSET_TO_BYTE: [u8; 68] = {
     table
 };
 
-/// Decode SentencePiece hex escapes like <0x0A> to actual bytes.
-fn decode_hex_escapes(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
+/// Decode SentencePiece hex escapes like `<0x0A>` to actual bytes.
+///
+/// Byte-fallback tokens like `<0xE4>` are emitted as the RAW byte 0xE4, NOT as
+/// the Unicode codepoint U+00E4 (which would re-UTF8-encode to two bytes and
+/// mangle CJK / any non-ASCII byte-fallback sequence). Ordinary chars are
+/// encoded as UTF-8. Returns bytes so a multi-byte char split across several
+/// `<0xHH>` tokens (e.g. 中 = E4 B8 AD) reassembles via a single
+/// `from_utf8`/`from_utf8_lossy` at the call site.
+// hunt3 H-C: prior `decode_hex_escapes` did `result.push(byte as char)` which
+// corrupted byte-fallback tokens (0xHH → U+00HH → 2-byte UTF-8); this variant
+// pushes the parsed value as a raw byte instead.
+fn decode_hex_escapes_bytes(s: &str) -> Vec<u8> {
+    let mut result: Vec<u8> = Vec::with_capacity(s.len());
+    let mut buf = [0u8; 4];
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '<' {
@@ -1104,7 +1108,8 @@ fn decode_hex_escapes(s: &str) -> String {
                     if chars.peek() == Some(&'>') && !hex.is_empty() {
                         chars.next(); // consume '>'
                         if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                            result.push(byte as char);
+                            // hunt3 H-C: raw byte, NOT `byte as char`
+                            result.push(byte);
                             matched = true;
                         }
                     }
@@ -1112,11 +1117,11 @@ fn decode_hex_escapes(s: &str) -> String {
             }
             if !matched {
                 for ch in temp {
-                    result.push(ch);
+                    result.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                 }
             }
         } else {
-            result.push(c);
+            result.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
         }
     }
     result
@@ -1799,6 +1804,27 @@ mod sp_tests {
             eot_id: None,
             is_gpt2_bpe: false,
         }
+    }
+
+    #[test]
+    fn sp_decode_byte_fallback_cjk() {
+        // hunt3 H-C regression: SentencePiece byte-fallback emits a CJK char as
+        // a run of <0xHH> tokens. "中" = U+4E2D = bytes E4 B8 AD. The old
+        // `byte as char` path mapped each 0xHH to U+00HH and re-UTF8-encoded it
+        // to 2 bytes → mojibake. decode_bytes must reassemble the raw 3 bytes,
+        // and decode() must from_utf8 them back into "中".
+        let tok = synth_sp(&["<0xE4>", "<0xB8>", "<0xAD>"]);
+        let toks = [0u32, 1, 2];
+        assert_eq!(tok.decode_bytes(&toks), "中".as_bytes());
+        assert_eq!(tok.decode(&toks), "中");
+    }
+
+    #[test]
+    fn sp_decode_hex_escapes_bytes_ascii_and_literal() {
+        // ASCII byte-fallback (<0x0A> = newline) and a non-matching literal
+        // "<0xZZ>" must pass through untouched, encoded as UTF-8.
+        assert_eq!(decode_hex_escapes_bytes("<0x0A>"), vec![b'\n']);
+        assert_eq!(decode_hex_escapes_bytes("a<0xZZ>b"), b"a<0xZZ>b".to_vec());
     }
 
     #[test]

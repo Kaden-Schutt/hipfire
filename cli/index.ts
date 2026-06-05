@@ -1093,8 +1093,25 @@ async function runViaHttp(
 
 // ─── Daemon IPC ─────────────────────────────────────────
 
+// hunt3 H-B: typed error thrown by recv() on daemon EOF in long-lived
+// (serve) mode. One-shot callers (run, bench, etc.) set `oneShot = true`
+// and recv() process.exit()s as before; serve leaves it false and catches
+// this to recover (500 + restart) instead of killing the whole serve for
+// all clients on a single daemon crash.
+class DaemonClosedError extends Error {
+  readonly code: number;
+  constructor(code: number) {
+    super("daemon closed");
+    this.name = "DaemonClosedError";
+    this.code = code;
+  }
+}
+
 class Engine {
   private proc: ReturnType<typeof spawn> | null = null;
+  // hunt3 H-B: one-shot mode (run/bench) → recv() exits on daemon EOF;
+  // long-lived serve leaves this false so recv() throws DaemonClosedError.
+  oneShot = false;
   private reader: {
     read(): Promise<{ done: boolean; value?: Uint8Array }>;
     releaseLock(): void;
@@ -1141,9 +1158,19 @@ class Engine {
         // unsupported environments, see #112) or via a real crash. In either
         // case, the daemon's stderr (which we inherit) already explained
         // what happened, so adding a Bun-rendered stack trace from here on
-        // top is pure noise. Exit cleanly with the daemon's own code (or 1
-        // if it hasn't exited yet) and let stderr stand on its own.
+        // top is pure noise.
         const code = (await this.proc?.exited) ?? 1;
+        // hunt3 H-B: in long-lived serve, a single daemon crash must NOT
+        // process.exit() the whole serve (kills every other client). Throw a
+        // typed error the serve handler catches → 500 + daemon restart. Clear
+        // buffered state and release the reader so a fresh start() is clean.
+        this.lines = [];
+        this.buffer = "";
+        try { this.reader?.releaseLock(); } catch {}
+        this.reader = null;
+        if (!this.oneShot) throw new DaemonClosedError(code);
+        // One-shot mode (run/bench): exit cleanly with the daemon's own code
+        // (or 1 if it hasn't exited yet) and let stderr stand on its own.
         process.exit(code === 0 ? 1 : code);
       }
       this.buffer += new TextDecoder().decode(value);
@@ -1181,15 +1208,36 @@ class Engine {
         new Promise<false>((res) => setTimeout(() => res(false), 10_000)),
       ]);
       drained = result;
-    } catch { /* daemon closed — already clean */ drained = true; }
+    } catch (err: any) {
+      // hunt3 H-B: a long-lived serve recv() throws DaemonClosedError when the
+      // daemon crashed mid-stream. The buffered EOF is NOT "already clean":
+      // recv() nulled this.reader but left this.proc non-null, so the caller's
+      // subsequent reload would send(loadMsg)/recv() against a dead pipe +
+      // null reader → a PLAIN Error("not running") that the request handler's
+      // outer catch does NOT recognize as DaemonClosedError → 500 with no
+      // restart → the daemon stays dead and every following request 500s
+      // forever (the exact "serve dies for everyone" outcome H-B prevents on
+      // the generate paths). Restart here so the caller reloads against a live
+      // daemon. A restart() failure propagates → the handler returns 500 for
+      // this one request, which is the honest outcome when recovery is
+      // genuinely impossible. Any non-DaemonClosedError is treated as the old
+      // best-effort "already clean" (drain is advisory resync, not load-bearing).
+      if (err instanceof DaemonClosedError) {
+        console.error(`[hipfire] daemon closed during drain (code ${err.code}) — restarting daemon`);
+        await this.restart();
+        return;
+      }
+      /* daemon closed — already clean */ drained = true;
+    }
 
     if (!drained) {
       // Timed out — dangling recv() still holds the reader.
       // Kill the daemon to cancel it, then restart fresh.
+      // hunt3 B-2: restart() awaits the killed proc's exit + retries the
+      // respawn with backoff so the new daemon doesn't collide with the old
+      // one's flock during teardown.
       console.error("[hipfire] drain timed out — restarting daemon");
-      await this.stop();
-      await this.start();
-      await this.send({ type: "ping" }); await this.recv();
+      await this.restart();
     }
   }
 
@@ -1197,9 +1245,44 @@ class Engine {
 
   async stop() {
     try { await this.send({ type: "unload" }); } catch {}
-    this.reader?.releaseLock();
+    try { this.reader?.releaseLock(); } catch {}
     this.reader = null;
-    this.proc?.kill();
+    const proc = this.proc;
+    proc?.kill();
+    // hunt3 B-2: AWAIT the killed process's exit before returning. Without
+    // this, start() can respawn while the old daemon still holds the
+    // LOCK_EX|LOCK_NB flock → the new daemon hits "FATAL: already running",
+    // exits immediately, and recv() sees EOF → serve dies. Bound the wait so
+    // a wedged daemon can't hang the restart forever.
+    try {
+      await Promise.race([
+        proc?.exited ?? Promise.resolve(),
+        new Promise<void>((res) => setTimeout(res, 5_000)),
+      ]);
+    } catch {}
+    this.proc = null;
+  }
+
+  /// hunt3 B-2: stop()+start()+ping with retry/backoff to tolerate the
+  /// residual flock-teardown window after a kill. Used by drain()'s timeout
+  /// path and by serve's daemon-crash recovery (hunt3 H-B). Throws if the
+  /// daemon can't be brought back after all retries.
+  async restart() {
+    await this.stop();
+    let lastErr: any = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        await this.start();
+        await this.send({ type: "ping" }); await this.recv();
+        return;
+      } catch (err: any) {
+        lastErr = err;
+        try { await this.stop(); } catch {}
+        // Backoff lets the old daemon's flock release before the next spawn.
+        await new Promise((res) => setTimeout(res, 250 * (attempt + 1)));
+      }
+    }
+    throw lastErr ?? new Error("daemon restart failed");
   }
 }
 
@@ -1391,11 +1474,23 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   if (!useLocal && await isServeUp(cfg.port, cfg.host)) {
     const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     if (ok) return;
-    // runViaHttp logged its own failure reason; fall back to local spawn.
+    // runViaHttp logged its own failure reason.
+    // hunt3 B-6: only fall back to a LOCAL daemon if the serve is now GONE.
+    // If the serve is still up, a local spawn would collide with its
+    // LOCK_EX|LOCK_NB flock → daemon FATAL "already running" → process.exit.
+    // The HTTP request failed for a per-request reason (e.g. a transient
+    // serve error), not because the GPU is free — surface it and bail.
+    if (await isServeUp(cfg.port, cfg.host)) {
+      console.error(`[hipfire] serve is up but the request failed — not spawning a local daemon (would collide with the serve's GPU lock).`);
+      console.error(`  Retry, or stop the serve first: hipfire stop`);
+      process.exit(1);
+    }
+    // Serve went away — safe to fall through to a local spawn.
   }
 
   applyConfigEnv(cfg, model);
   const e = new Engine();
+  e.oneShot = true; // hunt3 H-B: one-shot run — recv() may exit on daemon EOF
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
   await e.send(buildLoadMessage(path, model));
@@ -1477,13 +1572,29 @@ async function serve(port: number, host: string) {
   // spawns an ephemeral daemon, so it doesn't clobber a long-lived `serve -d`.
   const ownsPidFile = !process.env.HIPFIRE_NO_PID_FILE;
   if (ownsPidFile) {
+    // hunt3 B-3: a foreground `serve` run over a running `serve -d` would
+    // overwrite the live daemon's pid file, then (on exit, cleanupPid below)
+    // DELETE it — orphaning the detached daemon's VRAM. Before claiming the
+    // pid file, refuse to start if another serve is already live on this bind.
+    if (await isServeUp(port, host)) {
+      const existing = readServePid();
+      console.error(`hipfire serve already running${existing ? ` (PID ${existing})` : ""} on ${formatServeBind(host, port)}.`);
+      console.error(`  Stop it first: hipfire stop`);
+      process.exit(1);
+    }
     try {
       require("fs").writeFileSync(SERVE_PID_FILE, String(process.pid));
     } catch {}
   }
   const cleanupPid = () => {
     if (!ownsPidFile) return;
-    try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+    // hunt3 B-3: only unlink if the file STILL names us. If a newer serve
+    // (or anything else) has since rewritten it, deleting it would orphan
+    // that live daemon's pid record. Read-back-and-compare.
+    try {
+      const cur = require("fs").readFileSync(SERVE_PID_FILE, "utf-8").trim();
+      if (cur === String(process.pid)) require("fs").unlinkSync(SERVE_PID_FILE);
+    } catch {}
   };
   process.on("exit", cleanupPid);
   process.on("SIGTERM", () => { cleanupPid(); process.exit(0); });
@@ -1534,24 +1645,79 @@ async function serve(port: number, host: string) {
   // since gone idle.
   let lastRequestTime = Date.now();
   const idleTimeoutMs = cfg.idle_timeout * 1000;
+
+  // Serve lock: serializes all daemon stdin/stdout access so only one
+  // caller is mid-send/recv on the single IPC pipe at a time. Declared
+  // BEFORE the eviction interval so the eviction tick can take it too
+  // (hunt3 B-1/B-5). `busy` covers the WHOLE lock-held window (incl. the
+  // model-reload window where e.generating is still false).
+  let busy = false;
+  const queue: Array<{ resolve: () => void }> = [];
+  async function acquireLock() {
+    if (!busy) { busy = true; return; }
+    await new Promise<void>(resolve => queue.push({ resolve }));
+  }
+  function releaseLock() {
+    const next = queue.shift();
+    if (next) next.resolve();
+    else busy = false;
+  }
+
   const evictionInterval = idleTimeoutMs > 0 ? setInterval(async () => {
+    // Cheap pre-checks before paying the lock-wait cost.
     if (!current) return;                              // nothing to unload
     if (e.generating) return;                          // active stream — don't yank
+    if (busy) return;                                  // hunt3 B-5: request holds the lock (incl. reload window) — don't contend
     if (Date.now() - lastRequestTime < idleTimeoutMs) return;
+    // hunt3 B-1: take the serve lock before touching the daemon pipe.
+    // Without it, this send(unload)+recv() races a concurrent request's
+    // recv() on the one stdout — two recv() callers cross-route acks.
+    await acquireLock();
     try {
+      // hunt3 B-1: re-validate the idle precondition AFTER the lock wait —
+      // a request may have arrived (and finished) while we were queued.
+      if (!current) return;
+      if (e.generating) return;
+      if (Date.now() - lastRequestTime < idleTimeoutMs) return;
       console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
       await e.send({ type: "unload" });
       await e.recv();
-    } catch (err: any) {
-      console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
-    } finally {
-      // Reset capability state regardless of whether send/recv threw.
-      // Leaving these stale (e.g. modelHasVL=true after a broken-pipe
-      // eviction) makes the next request forward image_base64 to a
-      // daemon that has nothing loaded.
+      // Reset capability state only on a successful unload.
       current = null;
       currentMaxSeq = null;
       modelHasVL = false;
+      currentArch = null;
+      currentCacheCapable = null;
+    } catch (err: any) {
+      console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
+      // hunt3 B-5: clear capability state on ANY eviction error, not just
+      // DaemonClosedError. An eviction that reached the send(unload)/recv()
+      // (we are past the re-validation guards above, so `current` was set and
+      // we DID attempt the unload) but failed with a non-EOF error — e.g. a
+      // malformed unload-ack, or a plain Error("not running") because the
+      // daemon died without a clean stdout EOF — leaves the daemon in an
+      // unknown/unloaded state. Leaving `current` naming the model makes the
+      // next request compute needReload=false and dispatch a generate to a
+      // dead/unloaded daemon (the outer catch only restarts on
+      // DaemonClosedError, so a non-EOF death just 500s with no recovery).
+      // Resetting forces the next request to reload from scratch.
+      current = null;
+      currentMaxSeq = null;
+      modelHasVL = false;
+      currentArch = null;
+      currentCacheCapable = null;
+      // Only proactively restart on a clean daemon EOF (DaemonClosedError).
+      // For other errors the daemon may still be alive (e.g. it merely sent a
+      // malformed ack); the next request's reload will resync it, and if it is
+      // in fact dead the reload's recv() surfaces a DaemonClosedError that the
+      // generate catch-sites restart from.
+      if (err instanceof DaemonClosedError) {
+        try { await e.restart(); } catch (re: any) {
+          console.error(`[hipfire] daemon restart after eviction failure failed: ${re?.message ?? re}`);
+        }
+      }
+    } finally {
+      releaseLock();
     }
   }, Math.min(60_000, idleTimeoutMs)) : null;
   // Keep process alive irrespective of the interval; clean up on exit.
@@ -1591,18 +1757,6 @@ async function serve(port: number, host: string) {
     }
   }
 
-  let busy = false;
-  const queue: Array<{ resolve: () => void }> = [];
-  async function acquireLock() {
-    if (!busy) { busy = true; return; }
-    await new Promise<void>(resolve => queue.push({ resolve }));
-  }
-  function releaseLock() {
-    const next = queue.shift();
-    if (next) next.resolve();
-    else busy = false;
-  }
-
   console.error(`[hipfire] http://${formatServeBind(host, port)}/v1/chat/completions`);
 
   Bun.serve({
@@ -1628,17 +1782,42 @@ async function serve(port: number, host: string) {
       lastRequestTime = Date.now();
 
       await acquireLock();
+      // hunt3 B-5: re-bump after the lock wait so a request that sat QUEUED
+      // behind a long generation (potentially longer than idle_timeout) does
+      // not let the eviction tick fire the instant it finally begins. The
+      // `busy` lock flag already blocks eviction for the whole lock-held
+      // window (incl. the reload window where e.generating is still false).
+      lastRequestTime = Date.now();
       let lockReleased = false;
       const safeRelease = () => { if (!lockReleased) { lockReleased = true; releaseLock(); } };
 
       // If a previous generation was interrupted (client disconnect), drain
       // remaining daemon output before sending new commands.
-      // If drain restarts the daemon, clear current so model reloads.
+      // If drain restarts the daemon (timeout OR hunt3 H-B daemon-crash path),
+      // clear ALL capability state so the model reloads cleanly — matching the
+      // generate catch-site recovery below.
       if (e.generating) {
-        await e.drain();
+        try {
+          await e.drain();
+        } catch (drainErr: any) {
+          // drain() only throws when its own restart() exhausted retries (the
+          // daemon is unrecoverable). Surface a 500 for THIS request rather
+          // than letting the throw escape the handler — an escaped throw would
+          // skip safeRelease() and leak the serve lock, wedging every client.
+          console.error(`[hipfire] drain/daemon-recovery failed: ${drainErr?.message ?? drainErr}`);
+          e.generating = false;
+          current = null; currentMaxSeq = null; modelHasVL = false;
+          currentArch = null; currentCacheCapable = null;
+          safeRelease();
+          return Response.json(
+            { error: { message: "daemon crashed and could not be restarted; retry the request", type: "server_error" } },
+            { status: 500 },
+          );
+        }
         e.generating = false;
-        current = null; // daemon may have restarted — force model reload
-        currentMaxSeq = null;
+        // daemon may have restarted — force model reload + drop stale caps.
+        current = null; currentMaxSeq = null; modelHasVL = false;
+        currentArch = null; currentCacheCapable = null;
       }
 
       try {
@@ -1965,9 +2144,19 @@ async function serve(port: number, host: string) {
         // beyond currentMaxSeq we MUST reload instead of sending a request
         // the daemon would either reject or, worse, overrun the buffer with.
         const effective = resolveModelConfig(body.model);
-        const requestMaxTokens = body.max_tokens ?? effective.max_tokens;
+        // hunt3 H-D: `??` guards null but NOT type. A JSON-string max_tokens
+        // (e.g. "8192") makes `requestMaxTokens + 1024` STRING-CONCAT to
+        // "81921024", which Math.max coerces to ~80M → bumps load max_seq →
+        // unload-then-OOM. Accept only a sane positive integer; otherwise
+        // fall back to the per-model config value.
+        const rawMt = body.max_tokens;
+        const requestMaxTokens = (typeof rawMt === "number" && Number.isInteger(rawMt) && rawMt >= 1 && rawMt <= 131072)
+          ? rawMt
+          : effective.max_tokens;
         const visualHeadroom = requestImages.length > 0 ? 1024 : 0;
-        const requiredMaxSeq = Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom);
+        // Clamp the KV-cache sizing to a hard ceiling (matches the daemon's
+        // independent max_seq <= 524288 clamp, hunt3 H-D contract).
+        const requiredMaxSeq = Math.min(524288, Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom));
 
         const needReload = current !== path
           || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
@@ -2258,6 +2447,19 @@ async function serve(port: number, host: string) {
           genParams.assistant_prefix = "open_think";
         }
         if (systemPrompt) genParams.system = systemPrompt;
+
+        // hunt3 M-F: forward OpenAI `stop` sequences to the daemon. Accept a
+        // single string or an array of strings; normalize to string[], drop
+        // empties, cap at 4 sequences of <= 64 chars each (the daemon matches
+        // them against the decoded-output suffix and emits finish_reason="stop").
+        {
+          const rawStop = (body as any).stop;
+          let stopSeqs: string[] = [];
+          if (typeof rawStop === "string") stopSeqs = [rawStop];
+          else if (Array.isArray(rawStop)) stopSeqs = rawStop.filter((s: any) => typeof s === "string");
+          stopSeqs = stopSeqs.filter(s => s.length > 0).slice(0, 4).map(s => s.slice(0, 64));
+          if (stopSeqs.length > 0) genParams.stop = stopSeqs;
+        }
 
         if (requestImages.length === 1) {
           if (!modelHasVL) {
@@ -2646,7 +2848,11 @@ async function serve(port: number, host: string) {
           return false;
         }
 
-        if (body.stream) {
+        // hunt3 C-1: OpenAI `stream` is a strict boolean — a JSON string
+        // "false" is JS-truthy and would wrongly select the streaming path.
+        // Match the include_usage===true convention.
+        const wantStream = body.stream === true;
+        if (wantStream) {
           const enc = new TextEncoder();
           let completionTokens = 0;
           let streamCancelled = false;
@@ -2962,6 +3168,26 @@ async function serve(port: number, host: string) {
                 }
                 // Safety: if loop exits without done/error (shouldn't happen), close stream
                 try { ctrl.close(); } catch {}
+              } catch (err: any) {
+                // hunt3 H-B: daemon crashed mid-stream (recv threw
+                // DaemonClosedError). Headers are already sent so we can't
+                // change status; surface the error in the stream body and
+                // restart the daemon so the NEXT request reloads cleanly
+                // instead of writing to a dead stdin.
+                try {
+                  ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                    error: { message: (err instanceof DaemonClosedError) ? "daemon crashed mid-generation" : (err?.message || "internal error"), type: "server_error" }
+                  })}\n\n`));
+                  ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
+                } catch {}
+                try { ctrl.close(); } catch {}
+                if (err instanceof DaemonClosedError) {
+                  current = null; currentMaxSeq = null; modelHasVL = false;
+                  currentArch = null; currentCacheCapable = null;
+                  try { await e.restart(); } catch (re: any) {
+                    console.error(`[hipfire] daemon restart failed: ${re?.message ?? re}`);
+                  }
+                }
               } finally {
                 clearInterval(heartbeat);
                 if (forceAnswerTimer) clearTimeout(forceAnswerTimer);
@@ -3106,22 +3332,26 @@ async function serve(port: number, host: string) {
         e.generating = false;
 
         // If the daemon rejected the request mid-generate (e.g. KV-budget
-        // overrun on a huge system prompt), surface that as a 400 instead of
-        // returning a 200 with empty content — otherwise a client that sent a
-        // too-large request can't distinguish failure from a zero-token reply.
+        // overrun on a huge system prompt), surface that error.
+        //
+        // hunt3 B-4: we are INSIDE the ReadableStream `start(ctrl)`, so the
+        // 200 headers were ALREADY sent (Bun streams the body lazily) — a
+        // `return Response.json(...)` here is silently DISCARDED and, worse,
+        // `start()` returns WITHOUT ctrl.enqueue/close, so the already-open
+        // 200 stream never terminates and the client hangs until the 255s
+        // idle timeout. Emit the error THROUGH the open controller and close
+        // it (status can't change post-headers; the failure rides in the
+        // body's `error` field, matching the streaming branch's convention).
         if (daemonError) {
+          bodyDelivered = true;
           safeRelease();
-          let status = 500;
-          const err = daemonError.toLowerCase();
-          if (err.includes("maximum size") || err.includes("exceeds maximum")) status = 413;
-          else if (err.includes("no vision encoder") || err.includes("unsupported image format")
-            || err.includes("image dimensions") || err.includes("failed to decode base64")
-            || err.includes("failed to decode image") || err.includes("exceeds loaded kv budget"))
-            status = 400;
-          return Response.json(
-            { error: { message: daemonError, type: "invalid_request_error" } },
-            { status }
-          );
+          try {
+            ctrl.enqueue(nsEnc.encode(JSON.stringify(
+              { error: { message: daemonError, type: "invalid_request_error" } }
+            )));
+          } catch {}
+          try { ctrl.close(); } catch {}
+          return;
         }
 
         // Strip think tags and special tokens.
@@ -3231,9 +3461,21 @@ async function serve(port: number, host: string) {
               ctrl.close();
             } catch (err: any) {
               bodyDelivered = true;
+              // hunt3 H-B: daemon crash (DaemonClosedError) mid-generate —
+              // restart so the next request reloads cleanly instead of
+              // writing to a dead stdin. Status stays 200 (header sent); the
+              // error rides in the body (matches the existing convention).
+              e.generating = false;
+              if (err instanceof DaemonClosedError) {
+                current = null; currentMaxSeq = null; modelHasVL = false;
+                currentArch = null; currentCacheCapable = null;
+                try { await e.restart(); } catch (re: any) {
+                  console.error(`[hipfire] daemon restart failed: ${re?.message ?? re}`);
+                }
+              }
               safeRelease();
               try {
-                ctrl.enqueue(nsEnc.encode(JSON.stringify({ error: err?.message || "internal error" })));
+                ctrl.enqueue(nsEnc.encode(JSON.stringify({ error: (err instanceof DaemonClosedError) ? "daemon crashed mid-generation" : (err?.message || "internal error") })));
               } catch {}
               try { ctrl.close(); } catch {}
             } finally {
@@ -3269,6 +3511,31 @@ async function serve(port: number, host: string) {
         }), { headers: { "Content-Type": "application/json" } });
         return nsResponse;
       } catch (err: any) {
+        // hunt3 H-B: a daemon crash now throws DaemonClosedError from recv()
+        // (instead of process.exit-ing the whole serve). Recover for THIS
+        // request only: restart the daemon, clear the loaded-model state so
+        // the next request reloads, and return 500 to this one client. Other
+        // clients' subsequent requests reload cleanly instead of the serve
+        // dying for everyone.
+        e.generating = false;
+        if (err instanceof DaemonClosedError) {
+          console.error(`[hipfire] daemon closed (code ${err.code}) — restarting for next request`);
+          current = null;
+          currentMaxSeq = null;
+          modelHasVL = false;
+          currentArch = null;
+          currentCacheCapable = null;
+          try {
+            await e.restart();
+          } catch (restartErr: any) {
+            console.error(`[hipfire] daemon restart failed: ${restartErr?.message ?? restartErr}`);
+          }
+          safeRelease();
+          return Response.json(
+            { error: { message: "daemon crashed and was restarted; retry the request", type: "server_error" } },
+            { status: 500 },
+          );
+        }
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });
       }
@@ -3778,6 +4045,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
 
   // Start daemon
   const e = new Engine();
+  e.oneShot = true; // hunt3 H-B: one-shot bench — exit on daemon EOF is correct
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
 
@@ -3847,6 +4115,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
       // Restart daemon with variant env var
       process.env.HIPFIRE_RDNA2_VARIANT = String(v.n);
       const ve = new Engine();
+      ve.oneShot = true; // hunt3 H-B: one-shot variant bench — exit on EOF is correct
       let variantOk = false;
       try {
         await ve.start();
@@ -4067,6 +4336,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
 async function profile(modelTag: string | undefined, jsonOutput: boolean, kernelFilter: string | undefined) {
   // Start daemon — we need kernels compiled to profile them
   const e = new Engine();
+  e.oneShot = true; // hunt3 H-B: one-shot profile — exit on daemon EOF is correct
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
 
@@ -5898,6 +6168,7 @@ switch (cmd) {
       console.log("\nProbing GPU via HIP runtime...");
       try {
         const de = new Engine();
+        de.oneShot = true; // hunt3 H-B: one-shot GPU probe — exit on daemon EOF is correct
         await de.start();
         await de.send({ type: "ping" }); await de.recv();
         await de.send({ type: "diag" });
