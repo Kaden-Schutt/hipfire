@@ -224,13 +224,24 @@ pub fn sample_from_logits(logits: &[f32], cfg: &MtpSamplingConfig, rng: &mut Mtp
         .collect();
 
     // 2. Optional top_k: partial-sort to keep top_k by logit (descending).
+    //
+    // hunt3 M-B: a NaN logit makes `partial_cmp` return None; `.unwrap()` would
+    // panic (the panic class M-B exists to remove — matches the deepseek4
+    // sampling.rs sibling sites). `.unwrap_or(Less)` averts the panic. Note a
+    // NaN may NOT sort to the tail (with Less the NaN is ordered toward the
+    // front), so the kept top-k set can transiently include it; it is then
+    // neutralized downstream — exp(NaN)=NaN poisons the softmax sum and the
+    // multinomial loop's `r < acc` stays false, so sampling falls through to
+    // the last surviving candidate (line ~297) instead of panicking.
     if cfg.top_k > 0 && cfg.top_k < pairs.len() {
-        pairs.select_nth_unstable_by(cfg.top_k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
+        pairs.select_nth_unstable_by(cfg.top_k - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less)
+        });
         pairs.truncate(cfg.top_k);
     }
 
     // 3. Sort by logit descending for top_p and min_p filtering + sampling.
-    pairs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    pairs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Less));
 
     // 4. Softmax with max-subtraction stability.
     let max_logit = pairs[0].1;

@@ -56,20 +56,50 @@ pub fn sample_token(
     rng: &mut Xorshift,
 ) -> u32 {
     if temp <= 0.0 {
+        // hunt3 M-B (FinalFix): explicit `>`-based fold mirrors the GPU kernel
+        // (argmax.hip: `if (data[i] > lmax)`, seed -1e30). `v > best` is false
+        // for NaN, so a NaN logit never wins and never displaces the real max —
+        // unlike `max_by(partial_cmp.unwrap_or(Less))`, which keeps a trailing
+        // NaN candidate. Seeded at NEG_INFINITY so the first finite logit wins.
         return logits
             .iter()
             .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap()
+            .fold((0usize, f32::NEG_INFINITY), |best, (i, &v)| {
+                if v > best.1 {
+                    (i, v)
+                } else {
+                    best
+                }
+            })
             .0 as u32;
     }
     let n = logits.len();
-    let k = if top_k == 0 || top_k >= n { n } else { top_k };
 
-    // 1. Pick top-k indices by raw logit (descending).
-    let mut idx: Vec<usize> = (0..n).collect();
-    if k < n {
-        idx.select_nth_unstable_by(k - 1, |&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+    // hunt3 M-B (FinalFix): drop NaN logits up front. A non-total comparator
+    // (NaN compares Less in both directions) makes select_nth_unstable_by /
+    // sort_unstable_by yield an *unspecified* partition — empirically NaNs can
+    // land at the HEAD of the top-k and displace real finalists. Partitioning
+    // NaN out here guarantees no NaN index ever reaches the top-k or the
+    // softmax, matching the GPU kernel's NaN-dropping argmax. The remaining
+    // comparators then only ever see finite values, so partial_cmp is total.
+    let mut idx: Vec<usize> = (0..n).filter(|&i| !logits[i].is_nan()).collect();
+    if idx.is_empty() {
+        // All-NaN logits: nothing finite to sample. Return token 0 rather than
+        // panicking; the recurrent-state guard upstream treats this as a
+        // degenerate request.
+        return 0;
+    }
+    let m = idx.len();
+    let k = if top_k == 0 || top_k >= m { m } else { top_k };
+
+    // 1. Pick top-k indices by raw logit (descending). Only finite logits
+    //    remain, so the comparator is a total order and never panics.
+    if k < m {
+        idx.select_nth_unstable_by(k - 1, |&a, &b| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         idx.truncate(k);
     }
 
@@ -84,11 +114,19 @@ pub fn sample_token(
         .collect();
     let sum: f32 = weights.iter().sum();
     if sum <= 0.0 || !sum.is_finite() {
+        // hunt3 M-B (FinalFix): degenerate-softmax fallback. `idx` holds only
+        // finite-logit indices (NaNs were partitioned out above), but use the
+        // same GPU-parity `>`-based fold for consistency — NaN can never win.
         return idx
             .iter()
-            .max_by(|&&a, &&b| logits[a].partial_cmp(&logits[b]).unwrap())
-            .copied()
-            .unwrap_or(0) as u32;
+            .fold((idx[0], f32::NEG_INFINITY), |best, &i| {
+                if logits[i] > best.1 {
+                    (i, logits[i])
+                } else {
+                    best
+                }
+            })
+            .0 as u32;
     }
     for w in weights.iter_mut() {
         *w /= sum;
@@ -98,7 +136,15 @@ pub fn sample_token(
     //    drop the tail once cumulative mass reaches top_p, renormalise.
     if top_p > 0.0 && top_p < 1.0 {
         let mut order: Vec<usize> = (0..idx.len()).collect();
-        order.sort_unstable_by(|&a, &b| weights[b].partial_cmp(&weights[a]).unwrap());
+        // hunt3 M-B (FinalFix): all weights are finite here — NaN logits were
+        // dropped at the top-k stage and the `!sum.is_finite()` guard above
+        // already returned for any +inf weight, so partial_cmp is total and the
+        // unwrap_or branch is unreachable. Equal is the safe neutral fallback.
+        order.sort_unstable_by(|&a, &b| {
+            weights[b]
+                .partial_cmp(&weights[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut cum = 0.0;
         let mut cutoff = order.len();
         for (rank, &j) in order.iter().enumerate() {
@@ -137,4 +183,69 @@ pub fn sample_token(
         }
     }
     idx[idx.len() - 1] as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // hunt3 M-B (FinalFix): NaN logits must never be selected and must never
+    // displace the true max, mirroring argmax.hip's `data[i] > lmax` semantics.
+
+    #[test]
+    fn greedy_nan_at_last_index_not_selected() {
+        let mut rng = Xorshift::new(1);
+        // GPU kernel returns idx 1 (5.0) for this input; the old max_by idiom
+        // returned idx 3 (the NaN).
+        let logits = [1.0f32, 5.0, 3.0, f32::NAN];
+        assert_eq!(sample_token(&logits, 0.0, 0, 1.0, &mut rng), 1);
+    }
+
+    #[test]
+    fn greedy_nan_does_not_drop_true_max() {
+        let mut rng = Xorshift::new(1);
+        // The true max (5.0) precedes the NaN; the old idiom dropped it.
+        let logits = [5.0f32, f32::NAN, 0.1, 2.0];
+        assert_eq!(sample_token(&logits, 0.0, 0, 1.0, &mut rng), 0);
+    }
+
+    #[test]
+    fn greedy_all_nan_does_not_panic() {
+        let mut rng = Xorshift::new(1);
+        let logits = [f32::NAN, f32::NAN, f32::NAN];
+        // No finite max exists; fold seed (idx 0) is returned, no panic.
+        let _ = sample_token(&logits, 0.0, 0, 1.0, &mut rng);
+    }
+
+    #[test]
+    fn sampled_path_drops_nan_from_topk() {
+        let mut rng = Xorshift::new(42);
+        // Two scattered NaNs around three real finalists. With temp>0 + top_k,
+        // a surviving NaN would make the softmax sum NaN and route to the
+        // fallback. Repeated draws must only ever return a finite-logit index.
+        let logits = [1.0f32, f32::NAN, 3.0, 2.0, f32::NAN, 0.5];
+        let finite: std::collections::HashSet<u32> = [0u32, 2, 3, 5].into_iter().collect();
+        for _ in 0..256 {
+            let tok = sample_token(&logits, 1.0, 3, 0.9, &mut rng);
+            assert!(
+                finite.contains(&tok),
+                "sampler returned a NaN-indexed token: {tok}"
+            );
+        }
+    }
+
+    #[test]
+    fn sampled_path_all_nan_returns_zero() {
+        let mut rng = Xorshift::new(7);
+        let logits = [f32::NAN, f32::NAN];
+        assert_eq!(sample_token(&logits, 1.0, 0, 1.0, &mut rng), 0);
+    }
+
+    #[test]
+    fn greedy_finite_unaffected() {
+        let mut rng = Xorshift::new(1);
+        // Sanity: no NaN → behaves exactly like a plain argmax.
+        let logits = [0.1f32, 0.2, 0.9, 0.3, 0.4];
+        assert_eq!(sample_token(&logits, 0.0, 0, 1.0, &mut rng), 2);
+    }
 }

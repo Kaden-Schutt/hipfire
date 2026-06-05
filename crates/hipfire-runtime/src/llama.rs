@@ -7491,12 +7491,24 @@ fn replicate_fwht_signs_to_all_devices(gpus: &mut Gpus, n_signs: usize) -> HipRe
 
 /// Sample the next token from logits using argmax (greedy).
 pub fn argmax(logits: &[f32]) -> u32 {
+    // hunt3 M-B (FinalFix): explicit `>`-based fold mirrors the GPU kernel
+    // (argmax.hip: `if (data[i] > lmax)`, seed -1e30). `v > best` is false for
+    // NaN, so a NaN logit is never selected and never displaces the real max.
+    // The previous `max_by(partial_cmp.unwrap_or(Less))` kept a trailing NaN
+    // candidate (verified: [1,5,3,NaN] → idx 3) — a NaN-indexed garbage token
+    // on the greedy path poisons the recurrent DeltaNet state. Empty logits
+    // would be a caller bug; fold over an empty slice returns index 0.
     logits
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .map(|(i, _)| i as u32)
-        .unwrap()
+        .fold((0usize, f32::NEG_INFINITY), |best, (i, &v)| {
+            if v > best.1 {
+                (i, v)
+            } else {
+                best
+            }
+        })
+        .0 as u32
 }
 
 /// Sample the next token using temperature + top-k + top-p (nucleus) sampling.
@@ -7948,6 +7960,18 @@ pub fn sampler_rng_restore(state: u32) {
     SAMPLER_STATE.store(state, Ordering::Relaxed);
 }
 
+/// hunt3 M-E: deterministic per-request reset entry point for the CPU sampler
+/// RNG stream. The daemon calls this once at the top of generate()/generate_vl()
+/// with the same per-request seed the GPU sampler uses, so CPU-fallback sampling
+/// is reproducible across requests instead of carrying state from the prior one.
+/// Note: `simple_rand` treats a stored 0 as "seed from time"; we map a 0 seed to
+/// 1 so the reset stays deterministic. The RNG algorithm itself is unchanged.
+pub fn reset_cpu_sampler_rng(seed: u32) {
+    use std::sync::atomic::Ordering;
+    let s = if seed == 0 { 1 } else { seed };
+    SAMPLER_STATE.store(s, Ordering::Relaxed);
+}
+
 use std::sync::atomic::AtomicU32;
 static SAMPLER_STATE: AtomicU32 = AtomicU32::new(0);
 
@@ -7978,6 +8002,29 @@ fn simple_rand() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // hunt3 M-B (FinalFix): greedy argmax must drop NaN like the GPU kernel
+    // (argmax.hip `data[i] > lmax`), never selecting a NaN-indexed token and
+    // never dropping the true max that precedes a NaN.
+
+    #[test]
+    fn argmax_nan_at_last_index_not_selected() {
+        // Old max_by idiom returned idx 3 (NaN); GPU kernel + fix return idx 1.
+        let logits = [1.0f32, 5.0, 3.0, f32::NAN];
+        assert_eq!(argmax(&logits), 1);
+    }
+
+    #[test]
+    fn argmax_nan_does_not_drop_true_max() {
+        let logits = [5.0f32, f32::NAN, 0.1, 2.0];
+        assert_eq!(argmax(&logits), 0);
+    }
+
+    #[test]
+    fn argmax_finite_unaffected() {
+        let logits = [0.1f32, 0.2, 0.9, 0.3];
+        assert_eq!(argmax(&logits), 2);
+    }
 
     #[test]
     fn attractor_block_below_threshold() {
