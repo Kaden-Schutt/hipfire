@@ -828,20 +828,20 @@ fn forward_step_after_x(
             && layer.wk.gpu_dtype == DType::HFQ4G256
             && layer.wv.gpu_dtype == DType::HFQ4G256;
         if all_hfq4g256 {
-            // DEFER (#393/#397): NOT migrated to FusedQkvFamily. The family
-            // arm FusedQkvHfq4G256 is gated `HasWmmaW32` (gfx11/gfx12 only),
-            // but `gpu.fused_qkv_hfq4g256` itself has a generic wave32 path
-            // plus wave64/dp4a siblings that run on RDNA1/RDNA2/CDNA. Routing
-            // through the family would regress non-WMMA archs to
-            // UnsupportedVariant. Re-arch the predicate (or add an Always
-            // generic-fallback arm) in a dedicated batch before migrating.
-            gpu.fused_qkv_hfq4g256(
-                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
-                &state.tmp,
-                &state.q, &state.k, &state.v,
-                layer.wq.m, layer.wk.m, layer.wv.m,
-                layer.wq.k,
-            )?;
+            // HFQ4G256 QKV → FusedQkvFamily (FusedQkvHfq4G256). Routes to the
+            // identical `gpu.fused_qkv_hfq4g256` kernel with identical args
+            // (byte-identical by construction); arch gate widened to `Always`
+            // in fused_qkv_table to match the kernel's true cross-arch
+            // availability (the prior `HasWmmaW32` was a dead-gate).
+            fused.run(&ctx, gpu, &FusedQkvParams {
+                kind: KernelKey::FusedQkvHfq4G256,
+                weights: &[&layer.wq.buf, &layer.wk.buf, &layer.wv.buf],
+                x: &state.tmp,
+                outputs: &[&state.q, &state.k, &state.v],
+                m: &[layer.wq.m, layer.wk.m, layer.wv.m],
+                k: layer.wq.k,
+                rot_scratch: &[], // non-Paro: family arm ignores it
+            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         } else {
             gemv.run_auto(&ctx, gpu, &layer.wq.dispatch_ref(), &state.tmp, &state.q).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
             gemv.run_auto(&ctx, gpu, &layer.wk.dispatch_ref(), &state.tmp, &state.k).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;

@@ -5,7 +5,13 @@ use crate::types::*;
 pub fn populate(registry: &mut KernelRegistry) {
     // ── Fused QKV (Q, K, V in one launch) ───────────────────────
     let qkv_variants: &[(KernelKey, ArchPredicate)] = &[
-        (KernelKey::FusedQkvHfq4G256,     ArchPredicate::HasWmma),
+        // HFQ4G256 fused QKV: `gpu.fused_qkv_hfq4g256` is precompiled on every
+        // arch that uses the HFQ4 weight path (dispatch.rs `"hfq4"`/`"mq4"`
+        // branches — generic wave32 + CDNA wave64 siblings), so the prior
+        // `HasWmma` gate was a dead-gate that rejected RDNA1/RDNA2/CDNA even
+        // though the kernel runs there. `Always` matches the kernel's true
+        // cross-arch availability (mirrors the FusedQkvQ4K row).
+        (KernelKey::FusedQkvHfq4G256,     ArchPredicate::Always),
         (KernelKey::FusedQkvMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvMq4G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvHfq6G256,     ArchPredicate::GemvDp4a),
