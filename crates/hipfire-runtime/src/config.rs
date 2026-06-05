@@ -48,7 +48,7 @@ pub fn init() {
 impl RuntimeConfig {
     pub fn from_env() -> Self {
         let normalize_prompt = match std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref() {
-            Some("0") | Some("false") | Some("off") => false,
+            Some("0") | Some("false") | Some("off") | Some("no") => false,
             _ => true,
         };
 
@@ -113,6 +113,29 @@ impl RuntimeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeConfig;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn normalize_prompt_accepts_no_as_false() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok();
+        std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "no");
+
+        let cfg = RuntimeConfig::from_env();
+        assert!(!cfg.normalize_prompt);
+
+        match prev {
+            Some(value) => std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", value),
+            None => std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT"),
         }
     }
 }

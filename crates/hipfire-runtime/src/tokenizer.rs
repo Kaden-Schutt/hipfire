@@ -1391,7 +1391,7 @@ pub fn strip_trailing_line_ws(s: &str) -> String {
 /// disabled; `Cow::Owned` only on actual rewrite. Each step in the pipeline
 /// is itself a no-op fast-path when its trigger pattern is absent.
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
-    // Default ON. Explicit "0" / "false" / "off" opts out (parsed once in
+    // Default ON. Explicit "0" / "false" / "off" / "no" opts out (parsed once in
     // RuntimeConfig::from_env). Delegates to the flag-parameterized core so the
     // pipeline is unit-testable without the memoized `config::get()` singleton.
     normalize_prompt_with(s, crate::config::get().normalize_prompt)
