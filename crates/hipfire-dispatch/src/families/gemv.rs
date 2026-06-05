@@ -436,18 +436,6 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x, y, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x, y, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x, y, m, k)),
-        // ParoQ4G128: no HFQ4G128 residual kernel exists; gemv + add fallback.
-        // `x` is already Givens-rotated by the caller (launch_op Raw path).
-        ParoQ4G128 => {
-            let tmp = gpu.alloc_tensor(&[m], DType::F32)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            hip!(gpu.gemv_hfq4g128(w.buf, x, &tmp, m, k))?;
-            gpu.add_inplace_f32(y, &tmp)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            gpu.free_tensor(tmp)
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            Ok(())
-        }
         _ => Err(DispatchError::UnsupportedVariant {
             family: "gemv", variant: "residual",
             arch: "", quant: "",

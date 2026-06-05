@@ -261,12 +261,11 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                     })
                 }
             } else {
+                // run_auto applies the dtype's rotation (FWHT/Givens) before the
+                // kernel, so ParoQ4G128 gets its Givens rotation. Plain would skip it.
                 let tmp = gpu.alloc_tensor(&[w.m], DType::F32)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                gemv.run(ctx, gpu, &GemvParams {
-                    w, x, y: &tmp, variant: GemvVariant::Plain,
-                    residual: None, gate: None, up: None,
-                })?;
+                gemv.run_auto(ctx, gpu, w, x, &tmp)?;
                 gpu.add_inplace_f32(residual, &tmp)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 gpu.free_tensor(tmp)
