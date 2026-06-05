@@ -14,11 +14,18 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::ffi::{c_void, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+struct StreamingCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -4972,7 +4979,8 @@ fn run_kld_reference_row(config: &EvalConfig, ctx: &EvalContext, model: String) 
     }
     let command_display = format!("{} {}", bin.display(), args.join(" "));
     let started = SystemTime::now();
-    let output = match Command::new(&bin).args(&args).output() {
+    eprintln!("hipfire-eval: running {command_display}");
+    let output = match run_streaming_command(&bin, &args) {
         Ok(output) => output,
         Err(err) => {
             let mut metrics = base_metrics;
@@ -5072,6 +5080,65 @@ fn run_kld_reference_row(config: &EvalConfig, ctx: &EvalContext, model: String) 
             model,
         ),
     }
+}
+
+fn run_streaming_command(bin: &Path, args: &[String]) -> io::Result<StreamingCommandOutput> {
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("child stdout pipe was not available"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("child stderr pipe was not available"))?;
+    let stdout_thread = stream_child_pipe(stdout, false);
+    let stderr_thread = stream_child_pipe(stderr, true);
+    let status = child.wait()?;
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| io::Error::other("stdout stream thread panicked"))??;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| io::Error::other("stderr stream thread panicked"))??;
+    Ok(StreamingCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn stream_child_pipe<R>(pipe: R, to_stderr: bool) -> thread::JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        let mut captured = Vec::new();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break;
+            }
+            captured.extend_from_slice(&line);
+            if to_stderr {
+                let mut sink = io::stderr().lock();
+                sink.write_all(&line)?;
+                sink.flush()?;
+            } else {
+                let mut sink = io::stdout().lock();
+                sink.write_all(&line)?;
+                sink.flush()?;
+            }
+        }
+        Ok(captured)
+    })
 }
 
 fn parse_hfkseq_metrics(path: &Path) -> Result<BTreeMap<String, Value>, String> {

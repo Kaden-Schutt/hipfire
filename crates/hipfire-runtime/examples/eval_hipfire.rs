@@ -45,7 +45,7 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::{KvCache, VMode, weight_gemv};
+    use hipfire_runtime::llama::{weight_gemv, KvCache, VMode};
     use rdna_compute::DType;
     use std::fs::File;
     use std::io::{BufReader, BufWriter, Read, Write};
@@ -73,12 +73,24 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--model" => { model = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--ref"   => { ref_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--output" => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
+            "--model" => {
+                model = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--ref" => {
+                ref_path = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
             "--kv-mode" => {
                 let v = argv[i + 1].clone();
-                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4" | "fwht2" | "fwht3" | "fwht4") {
+                if !matches!(
+                    v.as_str(),
+                    "q8" | "asym2" | "asym3" | "asym4" | "fwht2" | "fwht3" | "fwht4"
+                ) {
                     eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 fwht2 fwht3 fwht4 (got {v})");
                     std::process::exit(1);
                 }
@@ -111,7 +123,10 @@ fn main() {
                 eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill] [--max-chunks N]");
                 std::process::exit(0);
             }
-            other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
+            other => {
+                eprintln!("unknown arg: {other}");
+                std::process::exit(1);
+            }
         }
     }
     let args = Args {
@@ -163,26 +178,43 @@ fn main() {
     );
 
     // -------- ref sha256 sanity (M1) --------
+    eprintln!(
+        "eval_hipfire: verifying ref sha256 for {}",
+        args.ref_path.display()
+    );
+    let phase_start = Instant::now();
     hipfire_runtime::eval_common::verify_ref_sha256(&args.ref_path, "eval_hipfire");
+    eprintln!(
+        "eval_hipfire: ref sha256 check done in {:.1}s",
+        phase_start.elapsed().as_secs_f64()
+    );
 
     // -------- load model --------
+    eprintln!("eval_hipfire: initializing GPU");
+    let phase_start = Instant::now();
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    eprintln!("eval_hipfire: arch={} model={}", gpu.arch, args.model.display());
+    eprintln!(
+        "eval_hipfire: GPU ready arch={} in {:.1}s",
+        gpu.arch,
+        phase_start.elapsed().as_secs_f64()
+    );
+    eprintln!("eval_hipfire: loading model {}", args.model.display());
     // gfx12 Lloyd kernels are gated by HIPFIRE_LLOYD_GFX12 (see PR #195).
     // Set if running on gfx12; harmless on other arches.
     if gpu.arch.starts_with("gfx12") {
-        unsafe { std::env::set_var("HIPFIRE_LLOYD_GFX12", "1"); }
+        unsafe {
+            std::env::set_var("HIPFIRE_LLOYD_GFX12", "1");
+        }
         eprintln!("eval_hipfire: arch is gfx12; set HIPFIRE_LLOYD_GFX12=1");
     }
 
     // Auto-route safetensors directories (ParoQuant / AWQ / HF native) — mirrors
     // daemon.rs:1500-1504. HFQ files take the canonical HFQ path below.
+    let phase_start = Instant::now();
     let (config, weights) = if args.model.is_dir() {
         use hipfire_runtime::safetensors_source::SafetensorsSource;
-        let source = SafetensorsSource::open(&args.model)
-            .expect("safetensors open");
-        let config = qwen35::config_from_safetensors(&source)
-            .expect("config_from_safetensors");
+        let source = SafetensorsSource::open(&args.model).expect("safetensors open");
+        let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
         eprintln!("  loading via safetensors (ParoQuant path)");
         let weights = qwen35::load_weights_paroquant(&source, &config, &mut gpu)
             .expect("load_weights_paroquant");
@@ -193,15 +225,26 @@ fn main() {
         let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
         (config, weights)
     };
+    eprintln!(
+        "eval_hipfire: model loaded in {:.1}s (layers={} dim={} vocab={} lm_head={:?})",
+        phase_start.elapsed().as_secs_f64(),
+        config.n_layers,
+        config.dim,
+        config.vocab_size,
+        weights.output.gpu_dtype
+    );
 
     // -------- read reference (HFKLDR β) header + tokens --------
+    eprintln!("eval_hipfire: opening ref {}", args.ref_path.display());
+    let phase_start = Instant::now();
     let ref_file = File::open(&args.ref_path).expect("open ref");
     let mut ref_in = BufReader::with_capacity(8 * 1024 * 1024, ref_file);
 
     let mut magic = [0u8; 8];
     ref_in.read_exact(&mut magic).expect("read ref magic");
     if &magic != b"HFKLDR\0\0" {
-        eprintln!("bad ref magic: {magic:?}"); std::process::exit(2);
+        eprintln!("bad ref magic: {magic:?}");
+        std::process::exit(2);
     }
     let mut hdr = [0u8; 24];
     ref_in.read_exact(&mut hdr).expect("read ref header");
@@ -212,10 +255,14 @@ fn main() {
     let top_k = u16::from_le_bytes(hdr[16..18].try_into().unwrap()) as usize;
     let _flags = u16::from_le_bytes(hdr[18..20].try_into().unwrap());
     if version != 1 {
-        eprintln!("unsupported ref version {version}"); std::process::exit(2);
+        eprintln!("unsupported ref version {version}");
+        std::process::exit(2);
     }
     if ref_n_vocab != config.vocab_size {
-        eprintln!("vocab mismatch: ref says {ref_n_vocab}, model says {}", config.vocab_size);
+        eprintln!(
+            "vocab mismatch: ref says {ref_n_vocab}, model says {}",
+            config.vocab_size
+        );
         std::process::exit(2);
     }
     let scored_per_chunk = n_ctx - 1 - n_ctx / 2;
@@ -228,7 +275,9 @@ fn main() {
         None => n_chunk,
     };
     if let Some(m) = args.max_chunks {
-        eprintln!("eval_hipfire: --max-chunks {m} → effective_n_chunk = {effective_n_chunk}/{n_chunk}");
+        eprintln!(
+            "eval_hipfire: --max-chunks {m} → effective_n_chunk = {effective_n_chunk}/{n_chunk}"
+        );
     }
     let total_scored = scored_per_chunk * effective_n_chunk;
     let per_token_block_bytes = 8 + 8 * top_k;
@@ -241,15 +290,28 @@ fn main() {
 
     // Read tokens (n_ctx * n_chunk u32s).
     let n_tokens = n_ctx * n_chunk;
+    eprintln!(
+        "eval_hipfire: reading {n_tokens} ref tokens ({:.1} MiB)",
+        (n_tokens * 4) as f64 / (1024.0 * 1024.0)
+    );
     let mut tokens_raw = vec![0u8; n_tokens * 4];
     ref_in.read_exact(&mut tokens_raw).expect("read ref tokens");
     let tokens: Vec<u32> = tokens_raw
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
         .collect();
+    eprintln!(
+        "eval_hipfire: ref header/tokens ready in {:.1}s",
+        phase_start.elapsed().as_secs_f64()
+    );
 
     // -------- KV cache + DeltaNet state + scratch --------
     let kv_max = n_ctx + 16;
+    eprintln!(
+        "eval_hipfire: allocating KV/scratch (kv_mode={} kv_v={} kv_max={kv_max})",
+        args.kv_mode, args.kv_v
+    );
+    let phase_start = Instant::now();
     // FWHT KV modes only have layer-filtered ctors; build the FA-layer mask
     // from layer_types. Filtering is KLD-neutral (DeltaNet layers never read KV).
     let is_kv_layer: Vec<bool> = config
@@ -259,26 +321,61 @@ fn main() {
         .collect();
     let mut kv_cache = match args.kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym4" => KvCache::new_gpu_asym4(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym2" => KvCache::new_gpu_asym2(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "fwht4" => KvCache::new_gpu_fwht4_filtered(
-            &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "fwht3" => KvCache::new_gpu_fwht3_filtered(
-            &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "fwht2" => KvCache::new_gpu_fwht2_filtered(
-            &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         other => panic!("unknown --kv-mode: {other}"),
     };
     let v_mode = match args.kv_v.as_str() {
@@ -313,10 +410,15 @@ fn main() {
     } else {
         None
     };
+    eprintln!(
+        "eval_hipfire: KV/scratch ready in {:.1}s (hidden_buf={})",
+        phase_start.elapsed().as_secs_f64(),
+        hidden_buf.is_some()
+    );
 
     // -------- per-chunk loop --------
     let mut mean_kld_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
-    let mut p99_kld_per_seq:  Vec<f64> = Vec::with_capacity(n_chunk);
+    let mut p99_kld_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
     let mut mean_nll_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
     let mut block_buf = vec![0u8; per_token_block_bytes];
     let t0 = Instant::now();
@@ -332,17 +434,22 @@ fn main() {
                           scratch_logits: &rdna_compute::GpuTensor,
                           ref_in: &mut BufReader<File>,
                           block_buf: &mut [u8],
-                          actual_next: usize| -> (f64, Option<f64>) {
+                          actual_next: usize|
+     -> (f64, Option<f64>) {
         ref_in.read_exact(block_buf).expect("read ref block");
         let mut top_indices: Vec<u32> = Vec::with_capacity(top_k);
         let mut top_log_probs: Vec<f32> = Vec::with_capacity(top_k);
         for j in 0..top_k {
-            top_indices.push(u32::from_le_bytes(block_buf[j * 4..j * 4 + 4].try_into().unwrap()));
+            top_indices.push(u32::from_le_bytes(
+                block_buf[j * 4..j * 4 + 4].try_into().unwrap(),
+            ));
         }
         let lp_off = top_k * 4;
         for j in 0..top_k {
             top_log_probs.push(f32::from_le_bytes(
-                block_buf[lp_off + j * 4..lp_off + j * 4 + 4].try_into().unwrap(),
+                block_buf[lp_off + j * 4..lp_off + j * 4 + 4]
+                    .try_into()
+                    .unwrap(),
             ));
         }
         let resid_off = top_k * 8;
@@ -353,7 +460,11 @@ fn main() {
 
         // Candidate's log-Z = log Σ exp(logit_i) — fp64 throughout.
         let mut max_logit = f32::NEG_INFINITY;
-        for &v in cand_logits.iter() { if v > max_logit { max_logit = v; } }
+        for &v in cand_logits.iter() {
+            if v > max_logit {
+                max_logit = v;
+            }
+        }
         let mut sum_exp = 0.0f64;
         for &v in cand_logits.iter() {
             sum_exp += ((v - max_logit) as f64).exp();
@@ -366,7 +477,9 @@ fn main() {
         let mut sum_p_cand_at_ref_top = 0.0f64;
         for j in 0..top_k {
             let ref_idx = top_indices[j] as usize;
-            if ref_idx >= cand_logits.len() { continue; }
+            if ref_idx >= cand_logits.len() {
+                continue;
+            }
             let log_p_ref = top_log_probs[j] as f64;
             let log_p_cand = (cand_logits[ref_idx] as f64) - log_z;
             let p_ref = log_p_ref.exp();
@@ -377,8 +490,7 @@ fn main() {
         let sum_p_residual_ref = sum_p_residual as f64;
         let sum_p_residual_cand = (1.0 - sum_p_cand_at_ref_top).max(0.0);
         if sum_p_residual_ref > 1e-9 && sum_p_residual_cand > 1e-9 {
-            kld_token += sum_p_residual_ref
-                * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
+            kld_token += sum_p_residual_ref * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
         }
         // KLD ≥ 0 by Gibbs' inequality. Tiny negatives are fp64 roundoff on
         // ~257-term sums; >1e-9 magnitudes indicate a math bug. debug_assert
@@ -399,9 +511,24 @@ fn main() {
 
     let scoring_start = n_ctx / 2;
     for c in 0..effective_n_chunk {
+        eprintln!(
+            "eval_hipfire: chunk {}/{} start (mode={} scoring_start={} scored={})",
+            c + 1,
+            effective_n_chunk,
+            args.scoring_mode,
+            scoring_start,
+            scored_per_chunk
+        );
         // KvCache positions are passed explicitly via `pos` (or `start_pos`)
         // — overwriting from position 0 each chunk is sufficient.
+        let phase_start = Instant::now();
         dn_state.reset(&mut gpu);
+        eprintln!(
+            "eval_hipfire: chunk {}/{} DeltaNet reset in {:.3}s",
+            c + 1,
+            effective_n_chunk,
+            phase_start.elapsed().as_secs_f64()
+        );
 
         let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
         let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
@@ -411,17 +538,33 @@ fn main() {
         if args.scoring_mode == "per-token" {
             // Canonical per-token path: forward_scratch per position; the
             // scoring window is [scoring_start, n_ctx-2] inclusive.
+            eprintln!(
+                "eval_hipfire: chunk {}/{} per-token forward/scoring start",
+                c + 1,
+                effective_n_chunk
+            );
             for pos in 0..(n_ctx - 1) {
                 qwen35::forward_scratch(
-                    &mut gpu, &weights, &config, chunk_tokens[pos], pos,
-                    &mut kv_cache, &mut dn_state, &scratch,
-                ).expect("forward_scratch");
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    chunk_tokens[pos],
+                    pos,
+                    &mut kv_cache,
+                    &mut dn_state,
+                    &scratch,
+                )
+                .expect("forward_scratch");
                 if pos < scoring_start {
                     continue;
                 }
                 let actual_next = chunk_tokens[pos + 1] as usize;
                 let (kld, nll) = score_position(
-                    &mut gpu, &scratch.logits, &mut ref_in, &mut block_buf, actual_next,
+                    &mut gpu,
+                    &scratch.logits,
+                    &mut ref_in,
+                    &mut block_buf,
+                    actual_next,
                 );
                 chunk_klds.push(kld);
                 if let Some(n) = nll {
@@ -429,13 +572,18 @@ fn main() {
                     chunk_nll_count += 1;
                 }
                 total_scored_done += 1;
-                if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                if total_scored_done % 128 == 0 || total_scored_done == total_scored {
                     let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
                     let elapsed = t0.elapsed().as_secs_f64();
                     let rate = total_scored_done as f64 / elapsed.max(1e-9);
-                    eprint!(
-                        "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                        c + 1, effective_n_chunk, total_scored_done, total_scored, pct, rate
+                    eprintln!(
+                        "eval_hipfire: chunk {:4}/{} scored {:8}/{:8} ({:5.1}%, {:.0} tok/s)",
+                        c + 1,
+                        effective_n_chunk,
+                        total_scored_done,
+                        total_scored,
+                        pct,
+                        rate
                     );
                 }
             }
@@ -447,25 +595,67 @@ fn main() {
 
             // 1. Prefix: positions [0, scoring_start), no logit capture.
             //    Writes KV positions [0, scoring_start).
+            eprintln!(
+                "eval_hipfire: chunk {}/{} prefix prefill start len={}",
+                c + 1,
+                effective_n_chunk,
+                scoring_start
+            );
+            let phase_start = Instant::now();
             qwen35::forward_prefill_batch(
-                &mut gpu, &weights, &config,
+                &mut gpu,
+                &weights,
+                &config,
                 &chunk_tokens[0..scoring_start],
                 0,
-                &mut kv_cache, &mut dn_state, &scratch,
-                None, None, None, None,
-            ).expect("forward_prefill_batch prefix");
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("forward_prefill_batch prefix");
+            eprintln!(
+                "eval_hipfire: chunk {}/{} prefix prefill done in {:.1}s",
+                c + 1,
+                effective_n_chunk,
+                phase_start.elapsed().as_secs_f64()
+            );
 
             // 2. Scored region: tokens [scoring_start, n_ctx-1) at positions
             //    [scoring_start, n_ctx-2]. Captures post-output-norm hidden
             //    state per row. The slice length is scored_per_chunk
             //    (= n_ctx - 1 - n_ctx/2) so h_buf is exactly filled.
+            eprintln!(
+                "eval_hipfire: chunk {}/{} scored prefill start len={}",
+                c + 1,
+                effective_n_chunk,
+                scored_per_chunk
+            );
+            let phase_start = Instant::now();
             qwen35::forward_prefill_batch(
-                &mut gpu, &weights, &config,
+                &mut gpu,
+                &weights,
+                &config,
                 &chunk_tokens[scoring_start..(n_ctx - 1)],
                 scoring_start,
-                &mut kv_cache, &mut dn_state, &scratch,
-                None, Some(h_buf), None, None,
-            ).expect("forward_prefill_batch scored");
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch,
+                None,
+                Some(h_buf),
+                None,
+                None,
+            )
+            .expect("forward_prefill_batch scored");
+            eprintln!(
+                "eval_hipfire: chunk {}/{} scored prefill done in {:.1}s",
+                c + 1,
+                effective_n_chunk,
+                phase_start.elapsed().as_secs_f64()
+            );
 
             // 3. lm_head fan-out + KLD per scored position.
             //
@@ -482,15 +672,31 @@ fn main() {
             // Other lm_head dtypes (Q8, MQ4, etc.) keep the per-position
             // weight_gemv path until a batched variant is wired for each.
             let f16_lmhead = weights.output.gpu_dtype == DType::F16;
+            eprintln!(
+                "eval_hipfire: chunk {}/{} lm_head/KLD start (lm_head={:?} path={})",
+                c + 1,
+                effective_n_chunk,
+                weights.output.gpu_dtype,
+                if f16_lmhead {
+                    "batched_f16_lmhead"
+                } else {
+                    "per_position_weight_gemv"
+                }
+            );
+            let phase_start = Instant::now();
             let batched_logits: Option<rdna_compute::GpuTensor> = if f16_lmhead {
-                let alloc = gpu.alloc_tensor(
-                    &[scored_per_chunk, config.vocab_size],
-                    DType::F32,
-                ).expect("alloc batched lm_head logits");
+                let alloc = gpu
+                    .alloc_tensor(&[scored_per_chunk, config.vocab_size], DType::F32)
+                    .expect("alloc batched lm_head logits");
                 gpu.gemm_f16_batched_lmhead(
-                    &weights.output.buf, h_buf, &alloc,
-                    config.vocab_size, config.dim, scored_per_chunk,
-                ).expect("gemm_f16_batched_lmhead");
+                    &weights.output.buf,
+                    h_buf,
+                    &alloc,
+                    config.vocab_size,
+                    config.dim,
+                    scored_per_chunk,
+                )
+                .expect("gemm_f16_batched_lmhead");
                 Some(alloc)
             } else {
                 None
@@ -508,7 +714,11 @@ fn main() {
                 let pos = scoring_start + j;
                 let actual_next = chunk_tokens[pos + 1] as usize;
                 let (kld, nll) = score_position(
-                    &mut gpu, &logits_view, &mut ref_in, &mut block_buf, actual_next,
+                    &mut gpu,
+                    &logits_view,
+                    &mut ref_in,
+                    &mut block_buf,
+                    actual_next,
                 );
                 chunk_klds.push(kld);
                 if let Some(n) = nll {
@@ -516,16 +726,27 @@ fn main() {
                     chunk_nll_count += 1;
                 }
                 total_scored_done += 1;
-                if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                if total_scored_done % 128 == 0 || total_scored_done == total_scored {
                     let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
                     let elapsed = t0.elapsed().as_secs_f64();
                     let rate = total_scored_done as f64 / elapsed.max(1e-9);
-                    eprint!(
-                        "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                        c + 1, effective_n_chunk, total_scored_done, total_scored, pct, rate
+                    eprintln!(
+                        "eval_hipfire: chunk {:4}/{} scored {:8}/{:8} ({:5.1}%, {:.0} tok/s)",
+                        c + 1,
+                        effective_n_chunk,
+                        total_scored_done,
+                        total_scored,
+                        pct,
+                        rate
                     );
                 }
             }
+            eprintln!(
+                "eval_hipfire: chunk {}/{} lm_head/KLD done in {:.1}s",
+                c + 1,
+                effective_n_chunk,
+                phase_start.elapsed().as_secs_f64()
+            );
 
             if let Some(alloc) = batched_logits {
                 let _ = gpu.free_tensor(alloc);
@@ -546,12 +767,18 @@ fn main() {
         let p99 = sorted[p99_idx];
         let mean_nll = if chunk_nll_count > 0 {
             chunk_nll_sum / chunk_nll_count as f64
-        } else { f64::NAN };
+        } else {
+            f64::NAN
+        };
         mean_kld_per_seq.push(mean);
         p99_kld_per_seq.push(p99);
         mean_nll_per_seq.push(mean_nll);
+        eprintln!(
+            "eval_hipfire: chunk {}/{} done mean_kld={mean:.6} p99_kld={p99:.6} mean_nll={mean_nll:.6}",
+            c + 1,
+            effective_n_chunk
+        );
     }
-    eprintln!();
     eprintln!(
         "eval_hipfire: scored {total_scored_done} tokens in {:.1}s ({:.0} tok/s)",
         t0.elapsed().as_secs_f64(),
@@ -567,10 +794,12 @@ fn main() {
     let out_file = File::create(&args.output).expect("create output");
     let mut out = BufWriter::new(out_file);
     out.write_all(b"HFKSEQ\0\0").unwrap();
-    out.write_all(&2u32.to_le_bytes()).unwrap();             // version = 2
-    out.write_all(&(effective_n_chunk as u32).to_le_bytes()).unwrap(); // n_chunk (post --max-chunks)
-    out.write_all(&0u32.to_le_bytes()).unwrap();             // reserved
-    for ((m, p), n) in mean_kld_per_seq.iter()
+    out.write_all(&2u32.to_le_bytes()).unwrap(); // version = 2
+    out.write_all(&(effective_n_chunk as u32).to_le_bytes())
+        .unwrap(); // n_chunk (post --max-chunks)
+    out.write_all(&0u32.to_le_bytes()).unwrap(); // reserved
+    for ((m, p), n) in mean_kld_per_seq
+        .iter()
         .zip(p99_kld_per_seq.iter())
         .zip(mean_nll_per_seq.iter())
     {
@@ -580,8 +809,13 @@ fn main() {
     }
     out.flush().unwrap();
 
-    let overall_mean: f64 = mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;
-    let nll_finite: Vec<f64> = mean_nll_per_seq.iter().copied().filter(|x| x.is_finite()).collect();
+    let overall_mean: f64 =
+        mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;
+    let nll_finite: Vec<f64> = mean_nll_per_seq
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect();
     let overall_nll: f64 = if nll_finite.is_empty() {
         f64::NAN
     } else {
