@@ -269,9 +269,13 @@ impl MoeFamily {
     /// `params.scores`) and the shared expert (`ffn_stub`, which seeds
     /// `params.ffn_out`); this entry runs only the bias-aware top-k + routed
     /// MQ2-Lloyd expert sub-graph.
+    ///
+    /// Takes no `DispatchCtx`: the bias-aware path dispatches fixed MQ2-Lloyd
+    /// kernels with no arch-gated sub-dispatch, so building a `DispatchCtx`
+    /// per layer per token (an uncached `FeatureFlags::from_env` parse) would
+    /// be pure waste on the decode hot path.
     pub fn run_bias_aware(
         &self,
-        _ctx: &DispatchCtx,
         gpu: &mut rdna_compute::Gpu,
         params: &MoeBiasAwareParams,
     ) -> Result<(), DispatchError> {

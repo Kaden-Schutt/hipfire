@@ -2770,9 +2770,8 @@ fn ffn_routed(
             up_batch,
             rot_batch,
         };
-        let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
         hipfire_runtime::llama::moe_family()
-            .run_bias_aware(&ctx, gpu, &moe_params)
+            .run_bias_aware(gpu, &moe_params)
             .map_err(|e| format!("ffn_routed l{layer_idx} dispatch: {e}"))?;
 
         return Ok(());
