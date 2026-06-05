@@ -12,6 +12,12 @@ pub struct FusedQkvParams<'a> {
     pub outputs: &'a [&'a GpuTensor],
     pub m: &'a [usize],
     pub k: usize,
+    /// Rotation scratch buffers for Paro fused-kernel dispatch.
+    /// 4 × [k] F32 buffers for QKVZA (all 4) and 3-way QKV (first 3 + aliased 4th);
+    /// for gate+up, only [0] is used as `x_rot_gate` (the kernel aliases `mq_x_rot`
+    /// for `x_rot_up` internally). Empty slice for non-Paro keys; existing arms
+    /// ignore it.
+    pub rot_scratch: &'a [GpuTensor],
 }
 
 pub struct FusedQkvFamily {

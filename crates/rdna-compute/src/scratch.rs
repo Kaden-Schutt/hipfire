@@ -28,6 +28,12 @@ pub struct ScratchState {
     pub mq_x_q8: Option<DeviceBuffer>,
     pub mq_x_scales: Option<DeviceBuffer>,
     pub paro_x_scratch: Option<GpuTensor>,
+    /// Rotation scratch buffers for PARO fused-kernel dispatch. 4 × [k] F32
+    /// buffers, lazily allocated and grown on demand. Used by
+    /// `fused_qkvza_paro4g128t` (4 explicit) and `fused_gate_up_paro4g128t`
+    /// (1 explicit + `mq_x_rot` internal). `ensure_paro_fused_scratch`
+    /// allocates/grows; `DeviceBuffer::alias()` builds per-call descriptors.
+    pub paro_fused_scratch: Option<Vec<GpuTensor>>,
     pub fp16_x_scratch: Option<DeviceBuffer>,
     pub fp16_x_scratch_bytes: usize,
     pub fp16_x_source_ptr: *mut c_void,
@@ -245,6 +251,48 @@ impl ScratchState {
             shape: vec![dim],
             dtype: DType::F32,
         });
+        Ok(())
+    }
+
+    /// Ensure 4 rotation scratch buffers for Paro fused-kernel dispatch.
+    /// Each buffer is sized `[k]` F32. On first call, allocates all 4;
+    /// on subsequent calls, grows any buffer whose size is < k.
+    /// Separate from `paro_x_scratch` (single activation buffer) because
+    /// the fused kernels rotate weights internally and need multiple
+    /// independent rotation output buffers.
+    pub fn ensure_paro_fused_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        k: usize,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        let needed_bytes = k * 4; // F32
+        match &mut self.paro_fused_scratch {
+            Some(bufs) => {
+                // Grow any buffer that's too small (never shrinks).
+                for buf in bufs.iter_mut() {
+                    if buf.buf.size() < needed_bytes {
+                        *buf = GpuTensor {
+                            buf: hip.malloc(needed_bytes)?,
+                            shape: vec![k],
+                            dtype: DType::F32,
+                        };
+                    }
+                }
+            }
+            None => {
+                let mut vec = Vec::with_capacity(4);
+                for _ in 0..4 {
+                    vec.push(GpuTensor {
+                        buf: hip.malloc(needed_bytes)?,
+                        shape: vec![k],
+                        dtype: DType::F32,
+                    });
+                }
+                self.paro_fused_scratch = Some(vec);
+            }
+        }
         Ok(())
     }
 

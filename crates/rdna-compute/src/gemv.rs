@@ -504,6 +504,13 @@ impl Gpu {
             .ensure_paro_scratch(&self.hip, self.device_id, dim)
     }
 
+    /// Ensure 4 rotation scratch buffers for Paro fused-kernel dispatch.
+    /// Each buffer is sized [k] F32. Lazily allocated; grows on demand (never shrinks).
+    pub fn ensure_paro_fused_scratch(&mut self, k: usize) -> HipResult<()> {
+        self.scratch
+            .ensure_paro_fused_scratch(&self.hip, self.device_id, k)
+    }
+
     /// PARO4-G128T fused gate/up decode path. Gate and up have distinct
     /// Paro rotations, so this still rotates both, but batches the two
     /// rotations and the two pack4 GEMVs into two launches instead of four.

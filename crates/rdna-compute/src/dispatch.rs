@@ -524,6 +524,7 @@ impl Gpu {
                 mq_x_q8: None,
                 mq_x_scales: None,
                 paro_x_scratch: None,
+                paro_fused_scratch: None,
                 fp16_x_scratch: None,
                 fp16_x_scratch_bytes: 0,
                 fp16_x_source_ptr: std::ptr::null_mut(),
