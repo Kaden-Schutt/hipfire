@@ -1075,8 +1075,36 @@ pub fn weight_gemv_prerotated(
 
     if dtype_needs_rotation(w.gpu_dtype) {
         if let Some(xr) = x_rot {
+            // `xr` is ALREADY FWHT/Givens-rotated by the caller (the whole
+            // point of `weight_gemv_prerotated`: rotate once, reuse across the
+            // Q/K/V or gate/up projections that share this input). It MUST go
+            // straight into the `gemv_*_prerotated` kernel — i.e. through
+            // `run` with `GemvVariant::Prerotated`.
+            //
+            // `run_auto` here would be a DOUBLE-ROTATION bug: it takes
+            // `RotInput::Raw(xr)` and, because every rotation-needing dtype has
+            // a non-None `dtype_rotation_plan`, re-rotates `xr`. FWHT is
+            // involutory → the second rotation silently UN-rotates the
+            // activation, producing wrong-but-non-crashing output (e.g. MQ6
+            // DeltaNet projections in the multi-GPU branch). #393 introduced
+            // this when it swapped master's explicit
+            // `gemv_mq6g256_prerotated(&w.buf, xr, ..)` for `run_auto`.
+            // `GemvVariant::Prerotated` restores master's behavior exactly.
+            debug_assert!(
+                hipfire_dispatch::types::dtype_post_rotation_variant(w.gpu_dtype)
+                    == GemvVariant::Prerotated,
+                "weight_gemv_prerotated: dtype {:?} needs rotation but its \
+                 post-rotation variant is not Prerotated — passing an \
+                 already-rotated xr would double-rotate",
+                w.gpu_dtype,
+            );
             let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
-            return gemv.run_auto(&ctx, gpu, &wr, xr, y)
+            return gemv
+                .run(&ctx, gpu, &hipfire_dispatch::families::gemv::GemvParams {
+                    w: &wr, x: xr, y,
+                    variant: GemvVariant::Prerotated,
+                    residual: None, gate: None, up: None,
+                })
                 .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
         }
         return weight_gemv(gpu, w, x, y);
