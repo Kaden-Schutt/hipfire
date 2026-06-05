@@ -375,7 +375,7 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
     Write-Host "  cargo build --release (this may take several minutes)..."
     Push-Location $RepoDir
     try {
-        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p hipfire-runtime
+        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq --bin hipfire-eval --bin hipfire-host-profile -p hipfire-runtime
     } finally {
         Pop-Location
     }
@@ -398,7 +398,7 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
         Write-Host ""
         Write-Host "  After fixing, re-run this installer or build manually:"
         Write-Host "    cd $RepoDir"
-        Write-Host "    cargo build --release --features deltanet --example daemon -p hipfire-runtime"
+        Write-Host "    cargo build --release --features deltanet --example daemon --bin hipfire-eval --bin hipfire-host-profile -p hipfire-runtime"
         exit 1
     }
     Copy-Item $BuiltExe "$BinDir\daemon.exe" -Force
@@ -408,6 +408,10 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
 # Copy optional helper binaries if present
 foreach ($exe in @("infer.exe", "infer_hfq.exe")) {
     $src = "$TargetDir\release\examples\$exe"
+    if (Test-Path $src) { Copy-Item $src "$BinDir\$exe" -Force }
+}
+foreach ($exe in @("hipfire-eval.exe", "hipfire-host-profile.exe")) {
+    $src = "$TargetDir\release\$exe"
     if (Test-Path $src) { Copy-Item $src "$BinDir\$exe" -Force }
 }
 

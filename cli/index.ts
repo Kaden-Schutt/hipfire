@@ -5233,6 +5233,16 @@ function syncCliRuntimePayload(repoDir: string): void {
 
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
+  case "eval": {
+    const { runEvalCommand } = await import("./eval.ts");
+    await runEvalCommand(rest);
+    break;
+  }
+  case "host-profile": {
+    const { runHostProfileCommand } = await import("./host_profile.ts");
+    await runHostProfileCommand(rest);
+    break;
+  }
   case "serve": {
     // Parse flags: `hipfire serve [host] [port] [-d|--detach]`.
     // Also accepts `host:port`, e.g. `hipfire serve 0.0.0.0:11435`.
@@ -6604,6 +6614,8 @@ Examples:
   quantize <hf-id|dir>  Quantize to MQ4/MQ6 (CPU) — with optional HF upload
   bench <model> [opts]  Benchmark tok/s (--exp for RDNA2 variant sweep, --runs N)
   profile [model]       Kernel efficiency profiler (--json, --kernel <name>)
+  eval <opts>           Run the first-party model evaluation harness
+  host-profile <opts>   Measure host memory/storage/GPU copy capabilities
   list [-r]             Show local models (-r: show available too)
   config                Interactive settings editor (TUI); also: config [list|set|get|reset]
   diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
