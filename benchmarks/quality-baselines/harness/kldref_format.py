@@ -121,7 +121,8 @@ def read_block(f, header: KldRefHeader) -> TokenBlock:
     off += header.top_k * 4
     top_log_probs = list(struct.unpack_from(f"<{header.top_k}f", raw, off))
     off += header.top_k * 4
-    (sum_p_residual,) = struct.unpack_from("<f", raw, off); off += 4
+    (sum_p_residual,) = struct.unpack_from("<f", raw, off)
+    off += 4
     # last 4 bytes are reserved_pad — ignored
     return TokenBlock(
         top_indices=top_indices, top_log_probs=top_log_probs,
@@ -203,7 +204,10 @@ def write_per_seq_kld(
         f.write(SEQKLD_MAGIC)
         f.write(struct.pack("<III", version, n_chunk, 0))
         if version == 2:
-            for m, p, n in zip(mean_kld_per_seq, p99_kld_per_seq, mean_nll_per_seq):
+            nll_per_seq = mean_nll_per_seq
+            if nll_per_seq is None:
+                raise AssertionError("version 2 requires mean_nll_per_seq")
+            for m, p, n in zip(mean_kld_per_seq, p99_kld_per_seq, nll_per_seq):
                 f.write(struct.pack("<ddd", m, p, n))
         else:
             for m, p in zip(mean_kld_per_seq, p99_kld_per_seq):
