@@ -519,6 +519,243 @@ pub fn run_moe_decode_bias_aware(
     Ok(())
 }
 
+/// MQ2-Lloyd grouped-GEMM kernel variant (deepseek4 research levers; default
+/// `Lloyd4w` on gfx11+, `Base` otherwise). Selected once per gate_up/down call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GroupedLloydVariant {
+    N32,
+    Cnd,
+    EightW,
+    Nosync,
+    Mmqload,
+    Lloyd4w,
+    Base,
+}
+
+/// Mirror of `ffn_batched`'s grouped-GEMM if/else-if ladder (priority order:
+/// n32 > cnd > 8w > nosync > mmqload > 4w > base). `n32`/`cnd`/`eightw` apply
+/// only on the 4w path; `use_nosync` ⊂ `use_mmqload` ⊂ `use_lloyd_4w`.
+fn select_grouped_lloyd_variant(
+    use_lloyd_4w: bool,
+    n32: bool,
+    cnd: bool,
+    eightw: bool,
+    use_mmqload: bool,
+    use_nosync: bool,
+) -> GroupedLloydVariant {
+    if use_lloyd_4w && n32 {
+        GroupedLloydVariant::N32
+    } else if use_lloyd_4w && cnd {
+        GroupedLloydVariant::Cnd
+    } else if use_lloyd_4w && eightw {
+        GroupedLloydVariant::EightW
+    } else if use_nosync {
+        GroupedLloydVariant::Nosync
+    } else if use_mmqload {
+        GroupedLloydVariant::Mmqload
+    } else if use_lloyd_4w {
+        GroupedLloydVariant::Lloyd4w
+    } else {
+        GroupedLloydVariant::Base
+    }
+}
+
+/// Dispatch one MQ2-Lloyd grouped GEMM. All seven variants share the signature
+/// `(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows)`, so
+/// this is called identically for gate_up (m=2*im, k=hidden, x_row_div=k_top,
+/// rows=B) and down (m=hidden, k=im, x_row_div=1, rows=B*k_top).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_grouped_lloyd(
+    gpu: &mut Gpu,
+    variant: GroupedLloydVariant,
+    ptrs: &GpuTensor,
+    tile_ids: &GpuTensor,
+    slot_index: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    x_row_div: usize,
+    m_total_max: usize,
+    rows: usize,
+) -> Result<(), DispatchError> {
+    use GroupedLloydVariant as V;
+    let r = match variant {
+        V::N32 => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
+        V::Cnd => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
+        V::EightW => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
+        V::Nosync => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
+        V::Mmqload => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
+        V::Lloyd4w => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
+        V::Base => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(ptrs, tile_ids, slot_index, x, y, m, k, x_row_div, m_total_max, rows),
+    };
+    r.map_err(|e| DispatchError::Hip(e.to_string()))
+}
+
+/// DeepSeek-V4 batched/prefill MoE executor. Transcribes the routed block of
+/// `hipfire-arch-deepseek4::forward::ffn_batched`: routing (hash or bias-aware)
+/// → routed experts (grouped GEMM when `batch_size >= gate`, else scalar K4
+/// indexed) → combine into `p.ffn_out` (the shared expert already seeded it).
+/// Router GEMV + `sqrt_softplus` and the shared expert stay model-owned.
+pub fn run_moe_prefill_bias_aware(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeBiasAwarePrefillParams,
+) -> Result<(), DispatchError> {
+    use crate::families::moe::MoePrefillRouting;
+    macro_rules! hip {
+        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+    }
+    let (hidden, im, n_exp, k_top, batch_size) = (p.hidden, p.mi, p.n_exp, p.k_top, p.batch_size);
+
+    // ── Routing → topk_indices / topk_weights ────────────────────────────────
+    match &p.routing {
+        MoePrefillRouting::Hash { tid2eid, tokens } => {
+            hip!(gpu.hash_router_normalize_f32_batched(
+                tid2eid, p.scores, tokens,
+                p.topk_indices, p.topk_weights,
+                n_exp as i32, k_top as i32, p.route_scale, batch_size as i32,
+            ))?;
+        }
+        MoePrefillRouting::BiasAware { gate_bias } => {
+            hip!(gpu.deepseek4_moe_topk_bias_aware_batched_f32(
+                p.scores, gate_bias,
+                p.topk_indices, p.topk_weights,
+                n_exp as i32, k_top as i32, p.route_scale, batch_size as i32,
+            ))?;
+        }
+    }
+
+    // DIAG: dump per-layer topk indices ([B, k_top] i32) — off by default.
+    if let Ok(path) = std::env::var("HIPFIRE_DEEPSEEK4_DUMP_TOPK") {
+        use std::io::Write;
+        let raw = hip!(gpu.download_f32(p.topk_indices))?;
+        let n = batch_size * k_top;
+        let mut indices: Vec<i32> = Vec::with_capacity(n);
+        for i in 0..n {
+            indices.push(raw[i].to_bits() as i32);
+        }
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+            .map_err(|e| DispatchError::Hip(format!("dump_topk open {path}: {e:?}")))?;
+        let header = [p.layer_idx as i32, batch_size as i32, k_top as i32];
+        let header_bytes = unsafe { std::slice::from_raw_parts(header.as_ptr() as *const u8, 12) };
+        f.write_all(header_bytes).map_err(|e| DispatchError::Hip(format!("dump_topk header: {e:?}")))?;
+        let data_bytes = unsafe { std::slice::from_raw_parts(indices.as_ptr() as *const u8, indices.len() * 4) };
+        f.write_all(data_bytes).map_err(|e| DispatchError::Hip(format!("dump_topk data: {e:?}")))?;
+    }
+
+    // ── Grouped vs scalar gate ────────────────────────────────────────────────
+    let gate_threshold: usize = std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
+    let use_grouped = batch_size >= gate_threshold
+        && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
+
+    // Shared research levers (read once; default 4w on gfx11+).
+    let lloyd_4w_base = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
+        Ok("0") => Some(false),
+        Ok("1") => Some(true),
+        _ => None,
+    };
+    let arch_4w = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
+    let n32 = std::env::var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
+    let cnd = std::env::var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
+    let eightw = std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
+    let mmqload_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
+    let nosync_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
+
+    if use_grouped {
+        const BLOCK_M: usize = 16;
+        let m_total_max = batch_size * k_top + n_exp * BLOCK_M;
+
+        // Scatter: histogram + offsets + permute (single launch).
+        hip!(gpu.moe_scatter_fused_k8(
+            p.topk_indices, p.expert_token_counts, p.expert_offsets,
+            p.sorted_slot_index, p.expert_tile_ids, p.inverse_perm,
+            batch_size * k_top, n_exp, m_total_max, BLOCK_M,
+        ))?;
+
+        // Grouped gate_up GEMM (M=2*im, K=hidden, x_row_div=k_top, rows=B).
+        let use_lloyd_4w_gu = lloyd_4w_base.unwrap_or(arch_4w) && (2 * im) % 64 == 0 && hidden % 256 == 0;
+        let use_mmqload_gu = use_lloyd_4w_gu && mmqload_env;
+        let use_nosync_gu = use_mmqload_gu && nosync_env;
+        let v_gu = select_grouped_lloyd_variant(use_lloyd_4w_gu, n32, cnd, eightw, use_mmqload_gu, use_nosync_gu);
+        dispatch_grouped_lloyd(
+            gpu, v_gu, p.expert_gate_up_ptrs, p.expert_tile_ids, p.sorted_slot_index,
+            p.x_rot, p.y_gate_up_grouped, 2 * im, hidden, k_top, m_total_max, batch_size,
+        )?;
+
+        // Unscatter + SwiGLU·clamp.
+        let use_fused_unscatter_silu = std::env::var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
+            .map(|s| s != "0")
+            .unwrap_or(false);
+        if use_fused_unscatter_silu {
+            hip!(gpu.moe_unscatter_silu_clamp_k8(
+                p.y_gate_up_grouped, p.sorted_slot_index, p.gate_batch,
+                im, k_top, m_total_max, p.swiglu_limit,
+            ))?;
+        } else {
+            hip!(gpu.moe_gate_up_unscatter_k8(
+                p.y_gate_up_grouped, p.sorted_slot_index, p.gate_batch, p.up_batch,
+                im, k_top, m_total_max,
+            ))?;
+            hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
+                p.gate_batch, p.up_batch, p.gate_batch, im, batch_size * k_top, p.swiglu_limit,
+            ))?;
+        }
+
+        // FWHT rotate.
+        hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, im, batch_size * k_top))?;
+
+        // Grouped down GEMM (M=hidden, K=im, x_row_div=1, rows=B*k_top).
+        let use_lloyd_4w_dn = lloyd_4w_base.unwrap_or(arch_4w) && hidden % 64 == 0 && im % 256 == 0;
+        let use_mmqload_dn = use_lloyd_4w_dn && mmqload_env;
+        let use_nosync_dn = use_mmqload_dn && nosync_env;
+        let v_dn = select_grouped_lloyd_variant(use_lloyd_4w_dn, n32, cnd, eightw, use_mmqload_dn, use_nosync_dn);
+        dispatch_grouped_lloyd(
+            gpu, v_dn, p.expert_down_ptrs, p.expert_tile_ids, p.sorted_slot_index,
+            p.rot_batch, p.y_down_grouped, hidden, im, 1, m_total_max, batch_size * k_top,
+        )?;
+
+        // Down-combine: weighted Σ over k_top slots, per (token, m), into ffn_out.
+        hip!(gpu.moe_down_combine_grouped_k8(
+            p.y_down_grouped, p.inverse_perm, p.topk_weights, p.ffn_out,
+            hidden, k_top, batch_size,
+        ))?;
+    } else {
+        // ── Scalar K4 path (batch_size < gate, or grouped opt-out) ──
+        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
+            p.expert_gate_up_ptrs, p.topk_indices, p.x_rot,
+            p.gate_batch, p.up_batch, 2 * im, hidden, k_top, batch_size,
+        ))?;
+        hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
+            p.gate_batch, p.up_batch, p.gate_batch, im, batch_size * k_top, p.swiglu_limit,
+        ))?;
+        hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, im, batch_size * k_top))?;
+
+        // Down: deterministic expanded+combine (default; bit-reproducible for
+        // spec-decode) vs non-deterministic atomic-accumulate.
+        let deterministic =
+            std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+        if deterministic {
+            hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
+                p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expert_outputs,
+                hidden, im, k_top, batch_size,
+            ))?;
+            hip!(gpu.moe_down_combine_k8_batched(
+                p.down_expert_outputs, p.topk_weights, p.ffn_out, hidden, k_top, batch_size,
+            ))?;
+        } else {
+            hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
+                p.expert_down_ptrs, p.topk_indices, p.topk_weights, p.rot_batch, p.ffn_out,
+                hidden, im, k_top, batch_size,
+            ))?;
+        }
+    }
+
+    Ok(())
+}
+
 pub fn dispatch_fused(
     gpu: &mut Gpu,
     key: KernelKey,

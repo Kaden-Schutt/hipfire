@@ -209,6 +209,64 @@ pub struct MoeBiasAwareParams<'a> {
     pub rot_batch: &'a GpuTensor,
 }
 
+// ── DeepSeek-V4 batched/prefill MoE parameters ─────────
+
+/// Router-selection mode for the batched/prefill MoE path. DeepSeek-V4 uses
+/// static hash routing for the first `num_hash_layers` layers and bias-aware
+/// top-k for the rest; the executor branches on this.
+pub enum MoePrefillRouting<'a> {
+    /// Bias-aware batched top-k (select on `scores + gate_bias`, weight on the
+    /// unbiased `scores`, normalize, `*route_scale`).
+    BiasAware { gate_bias: &'a GpuTensor },
+    /// Static `tid2eid` hash routing (layers `0..num_hash_layers`). `tokens` is
+    /// the device-side `[B]` i32 token-id buffer.
+    Hash { tid2eid: &'a GpuTensor, tokens: &'a GpuTensor },
+}
+
+/// Parameters for the deepseek4 batched/prefill MoE (k=6, MQ2-Lloyd). The
+/// model owns RMSNorm, the shared expert, the router GEMV + `sqrt_softplus`
+/// (producing `scores`); this arm runs routing → routed experts → combine,
+/// accumulating into `ffn_out` (the shared expert already seeded it).
+///
+/// Picks the grouped-GEMM path when `batch_size >= HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE`
+/// (default 128), else the scalar K4 indexed path — mirroring `ffn_batched`.
+pub struct MoeBiasAwarePrefillParams<'a> {
+    // dims / config scalars
+    pub hidden: usize,
+    pub mi: usize,
+    pub n_exp: usize,
+    pub k_top: usize,
+    pub batch_size: usize,
+    pub route_scale: f32,
+    pub swiglu_limit: f32,
+    pub layer_idx: usize, // for the optional HIPFIRE_DEEPSEEK4_DUMP_TOPK header
+    // routing
+    pub routing: MoePrefillRouting<'a>,
+    pub scores: &'a GpuTensor,       // post-sqrt_softplus moe_scores_batch [B, n_exp]
+    pub topk_indices: &'a GpuTensor, // [B, k_top] (routing out, expert in)
+    pub topk_weights: &'a GpuTensor, // [B, k_top]
+    // routed expert pointer tables
+    pub expert_gate_up_ptrs: &'a GpuTensor,
+    pub expert_down_ptrs: &'a GpuTensor,
+    // activation / residual
+    pub x_rot: &'a GpuTensor,        // ffn_x_rot_batch [B, hidden]
+    pub ffn_out: &'a GpuTensor,      // ffn_out_batch [B, hidden] (accumulate target)
+    // grouped-path scratch
+    pub expert_token_counts: &'a GpuTensor,
+    pub expert_offsets: &'a GpuTensor,
+    pub sorted_slot_index: &'a GpuTensor,
+    pub expert_tile_ids: &'a GpuTensor,
+    pub inverse_perm: &'a GpuTensor,
+    pub y_gate_up_grouped: &'a GpuTensor,
+    pub y_down_grouped: &'a GpuTensor,
+    // shared scratch (grouped + scalar)
+    pub gate_batch: &'a GpuTensor,
+    pub up_batch: &'a GpuTensor,
+    pub rot_batch: &'a GpuTensor,
+    // scalar-path scratch (expanded deterministic down)
+    pub down_expert_outputs: &'a GpuTensor,
+}
+
 // ── Family ─────────────────────────────────────────────
 
 pub struct MoeFamily {
@@ -280,6 +338,20 @@ impl MoeFamily {
         params: &MoeBiasAwareParams,
     ) -> Result<(), DispatchError> {
         crate::pipeline::run_moe_decode_bias_aware(gpu, params)
+    }
+
+    /// Run a batched/prefill deepseek4 MoE step (k=6, MQ2-Lloyd): routing
+    /// (bias-aware or hash) → routed experts (grouped GEMM when
+    /// `batch_size >= gate`, else scalar K4 indexed) → combine, accumulating
+    /// into `params.ffn_out`. Delegates to
+    /// [`crate::pipeline::run_moe_prefill_bias_aware`]. The model owns RMSNorm,
+    /// the shared expert, and the router GEMV + `sqrt_softplus`.
+    pub fn run_bias_aware_prefill(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        params: &MoeBiasAwarePrefillParams,
+    ) -> Result<(), DispatchError> {
+        crate::pipeline::run_moe_prefill_bias_aware(gpu, params)
     }
 }
 
