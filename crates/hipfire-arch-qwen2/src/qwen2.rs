@@ -29,7 +29,7 @@
 
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, gemv_family, weight_gemm, DispatchCtx, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::llama::{f16_to_f32, fused_qkv_family, gemv_family, weight_gemm, DispatchCtx, EmbeddingFormat, FusedQkvParams, KernelKey, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
@@ -811,6 +811,7 @@ fn forward_step_after_x(
     let kv_dim = n_kv_heads * head_dim;
 
     let gemv = gemv_family();
+    let fused = fused_qkv_family();
     let ctx = DispatchCtx::new(gpu);
 
     for layer_idx in 0..cfg.num_hidden_layers {
@@ -827,6 +828,13 @@ fn forward_step_after_x(
             && layer.wk.gpu_dtype == DType::HFQ4G256
             && layer.wv.gpu_dtype == DType::HFQ4G256;
         if all_hfq4g256 {
+            // DEFER (#393/#397): NOT migrated to FusedQkvFamily. The family
+            // arm FusedQkvHfq4G256 is gated `HasWmmaW32` (gfx11/gfx12 only),
+            // but `gpu.fused_qkv_hfq4g256` itself has a generic wave32 path
+            // plus wave64/dp4a siblings that run on RDNA1/RDNA2/CDNA. Routing
+            // through the family would regress non-WMMA archs to
+            // UnsupportedVariant. Re-arch the predicate (or add an Always
+            // generic-fallback arm) in a dedicated batch before migrating.
             gpu.fused_qkv_hfq4g256(
                 &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                 &state.tmp,
@@ -917,13 +925,17 @@ fn forward_step_after_x(
             && layer.w_up.gpu_dtype == DType::Q8_0
             && layer.w_gate.k == layer.w_up.k
         {
-            gpu.fused_gate_up_q8_0(
-                &layer.w_gate.buf, &layer.w_up.buf,
-                &state.tmp,
-                &state.gate, &state.up,
-                layer.w_gate.m, layer.w_up.m,
-                layer.w_gate.k,
-            )?;
+            // Q8_0 gate+up → FusedQkvFamily (FusedGateUpQ8_0). Routes to the
+            // identical `gpu.fused_gate_up_q8_0` kernel; arch gate is `Always`
+            // (the kernel is a plain wave32 launch with no arch requirement).
+            fused.run(&ctx, gpu, &FusedQkvParams {
+                kind: KernelKey::FusedGateUpQ8_0,
+                weights: &[&layer.w_gate.buf, &layer.w_up.buf],
+                x: &state.tmp,
+                outputs: &[&state.gate, &state.up],
+                m: &[layer.w_gate.m, layer.w_up.m],
+                k: layer.w_gate.k,
+            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
         } else {
             gemv.run_auto(&ctx, gpu, &layer.w_gate.dispatch_ref(), &state.tmp, &state.gate).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
             gemv.run_auto(&ctx, gpu, &layer.w_up.dispatch_ref(), &state.tmp, &state.up).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;

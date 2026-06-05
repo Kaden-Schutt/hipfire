@@ -22,9 +22,10 @@ use rdna_compute::Gpu;
 
 use rdna_compute::DType;
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::fused_qkv::{FusedQkvFamily, FusedQkvParams};
 use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams};
 use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
-use hipfire_dispatch::types::{dtype_needs_rotation, GemvVariant, RotationVariant};
+use hipfire_dispatch::types::{dtype_needs_rotation, GemvVariant, KernelKey, RotationVariant};
 
 /// Type marker for the LLaMA family — covers `arch_id = 0` (LLaMA /
 /// Mistral) and `arch_id = 1` (plain Qwen3 / Qwen2). All members of
@@ -147,6 +148,7 @@ impl Llama {
         let ctx = DispatchCtx::new(gpu);
         let rotation = RotationFamily::new();
         let gemv = GemvFamily::new();
+        let fused = FusedQkvFamily::new();
 
         let n_heads = config.n_heads;
         let n_kv_heads = config.n_kv_heads;
@@ -158,11 +160,16 @@ impl Llama {
 
             // ── Attention QKV path ──────────────────────────────
             if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
-                gpu.fused_qkv_q4k(
-                    &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
-                    &scratch.tmp, &scratch.q, &scratch.k, &scratch.v,
-                    layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
-                )?;
+                // Fused Q4K QKV → FusedQkvFamily (FusedQkvQ4K). Same kernel
+                // (`gpu.fused_qkv_q4k`); arch gate `Always` (plain wave32).
+                fused.run(&ctx, gpu, &FusedQkvParams {
+                    kind: KernelKey::FusedQkvQ4K,
+                    weights: &[&layer.wq.buf, &layer.wk.buf, &layer.wv.buf],
+                    x: &scratch.tmp,
+                    outputs: &[&scratch.q, &scratch.k, &scratch.v],
+                    m: &[layer.wq.m, layer.wk.m, layer.wv.m],
+                    k: layer.wq.k,
+                })?;
             } else if dtype_needs_rotation(layer.wq.gpu_dtype) {
                 rotation.run(&ctx, gpu, RotationParams {
                     x: &scratch.x,
@@ -312,11 +319,16 @@ impl Llama {
 
             // ── FFN path ────────────────────────────────────────
             if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
-                gpu.fused_gate_up_q4k(
-                    &layer.w_gate.buf, &layer.w_up.buf,
-                    &scratch.tmp, &scratch.gate, &scratch.up,
-                    layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
-                )?;
+                // Fused Q4K gate+up → FusedQkvFamily (FusedGateUpQ4K). Same
+                // kernel (`gpu.fused_gate_up_q4k`); arch gate `Always`.
+                fused.run(&ctx, gpu, &FusedQkvParams {
+                    kind: KernelKey::FusedGateUpQ4K,
+                    weights: &[&layer.w_gate.buf, &layer.w_up.buf],
+                    x: &scratch.tmp,
+                    outputs: &[&scratch.gate, &scratch.up],
+                    m: &[layer.w_gate.m, layer.w_up.m],
+                    k: layer.w_gate.k,
+                })?;
             } else if dtype_needs_rotation(layer.w_gate.gpu_dtype) {
                 rotation.run(&ctx, gpu, RotationParams {
                     x: &scratch.x,

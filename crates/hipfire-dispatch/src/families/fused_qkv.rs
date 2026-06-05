@@ -155,6 +155,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             let [mg, mu] = <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
             hip!(gpu.fused_gate_up_q4k(w_gate, w_up, x, gate, up, mg, mu, k))
         }
+        KernelKey::FusedGateUpQ8_0 => {
+            let [w_gate, w_up] = <[&GpuTensor; 2]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [gate, up] = <[&GpuTensor; 2]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, mu] = <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            hip!(gpu.fused_gate_up_q8_0(w_gate, w_up, x, gate, up, mg, mu, k))
+        }
 
         // ── Paro variants need rotation scratch buffers ────
         KernelKey::FusedQkvParo4G128T
