@@ -20,12 +20,9 @@ use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use rdna_compute::Gpu;
 
-use rdna_compute::DType;
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::families::fused_qkv::{FusedQkvFamily, FusedQkvParams};
-use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams};
-use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
-use hipfire_dispatch::types::{dtype_needs_rotation, GemvVariant, KernelKey, RotationVariant};
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_dispatch::types::dtype_rotation_plan;
 
 /// Type marker for the LLaMA family — covers `arch_id = 0` (LLaMA /
 /// Mistral) and `arch_id = 1` (plain Qwen3 / Qwen2). All members of
@@ -146,9 +143,6 @@ impl Llama {
         repeat_penalty: f32,
     ) -> HipResult<(u32, u32)> {
         let ctx = DispatchCtx::new(gpu);
-        let rotation = RotationFamily::new();
-        let gemv = GemvFamily::new();
-        let fused = FusedQkvFamily::new();
 
         let n_heads = config.n_heads;
         let n_kv_heads = config.n_kv_heads;
@@ -159,44 +153,25 @@ impl Llama {
             let layer = &weights.layers[layer_idx];
 
             // ── Attention QKV path ──────────────────────────────
-            if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
-                // Fused Q4K QKV → FusedQkvFamily (FusedQkvQ4K). Same kernel
-                // (`gpu.fused_qkv_q4k`); arch gate `Always` (plain wave32).
-                fused.run(&ctx, gpu, &FusedQkvParams {
-                    kind: KernelKey::FusedQkvQ4K,
-                    weights: &[&layer.wq.buf, &layer.wk.buf, &layer.wv.buf],
-                    x: &scratch.tmp,
-                    outputs: &[&scratch.q, &scratch.k, &scratch.v],
-                    m: &[layer.wq.m, layer.wk.m, layer.wv.m],
-                    k: layer.wq.k,
-                    rot_scratch: &[], // non-Paro: family arm ignores it
-                })?;
-            } else if dtype_needs_rotation(layer.wq.gpu_dtype) {
-                rotation.run(&ctx, gpu, RotationParams {
-                    x: &scratch.x,
-                    x_up: None,
-                    w_norm: Some(&layer.attn_norm),
-                    x_plain: &scratch.tmp,
-                    x_rot: &scratch.x_rot,
+            // Single dynamic sequence via execute_steps — no model-side dtype
+            // branching. The interpreter selects FusedQkvQ4K / fused-MQ / per-op.
+            // This also fixes the F1 rmsnorm bug: RmsnormAutomatic always
+            // normalizes, including the Q4K branch (which previously skipped it).
+            let qkv_rot = dtype_rotation_plan(layer.wq.gpu_dtype);
+            let wrq = layer.wq.dispatch_ref();
+            let wrk = layer.wk.dispatch_ref();
+            let wrv = layer.wv.dispatch_ref();
+            execute_steps(gpu, &ctx, &[
+                Step::RmsnormAutomatic {
+                    x: &scratch.x, norm_weight: &layer.attn_norm,
+                    x_plain: &scratch.tmp, out: &scratch.x_rot,
                     awq_scale: layer.wq.awq_scale.as_ref(),
-                    k: layer.wq.k,
-                    eps: config.norm_eps,
-                    batch_size: 1,
-                    variant: RotationVariant::WithRmsnorm,
-                    givens_pairs: None,
-                    givens_theta: None,
-                    givens_scales: None,
-                    givens_krot: None,
-                })?;
-                gemv.run_auto(&ctx, gpu, &layer.wq.dispatch_ref(), &scratch.x_rot, &scratch.q)?;
-                gemv.run_auto(&ctx, gpu, &layer.wk.dispatch_ref(), &scratch.x_rot, &scratch.k)?;
-                gemv.run_auto(&ctx, gpu, &layer.wv.dispatch_ref(), &scratch.x_rot, &scratch.v)?;
-            } else {
-                gpu.rmsnorm_f32(&scratch.x, &layer.attn_norm, &scratch.tmp, config.norm_eps)?;
-                gemv.run_auto(&ctx, gpu, &layer.wq.dispatch_ref(), &scratch.tmp, &scratch.q)?;
-                gemv.run_auto(&ctx, gpu, &layer.wk.dispatch_ref(), &scratch.tmp, &scratch.k)?;
-                gemv.run_auto(&ctx, gpu, &layer.wv.dispatch_ref(), &scratch.tmp, &scratch.v)?;
-            }
+                    k: layer.wq.k, eps: config.norm_eps, rotation: qkv_rot,
+                },
+                Step::Gemv { w: &wrq, input: GemvInput::Prerotated(&scratch.x_rot), out: &scratch.q },
+                Step::Gemv { w: &wrk, input: GemvInput::Prerotated(&scratch.x_rot), out: &scratch.k },
+                Step::Gemv { w: &wrv, input: GemvInput::Prerotated(&scratch.x_rot), out: &scratch.v },
+            ])?;
 
             // ── QK norm (optional per config) ───────────────────
             if config.has_qk_norm {
@@ -315,63 +290,48 @@ impl Llama {
             }
 
             // ── Attention output projection + residual ─────────
-            gemv.run_auto(&ctx, gpu, &layer.wo.dispatch_ref(), &scratch.attn_out, &scratch.o)?;
-            gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
+            let wro = layer.wo.dispatch_ref();
+            execute_steps(gpu, &ctx, &[
+                Step::GemvResidual {
+                    w: &wro, input: GemvInput::Raw(&scratch.attn_out),
+                    residual: &scratch.x, out: &scratch.o,
+                },
+            ])?;
 
             // ── FFN path ────────────────────────────────────────
-            if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
-                // Fused Q4K gate+up → FusedQkvFamily (FusedGateUpQ4K). Same
-                // kernel (`gpu.fused_gate_up_q4k`); arch gate `Always`.
-                fused.run(&ctx, gpu, &FusedQkvParams {
-                    kind: KernelKey::FusedGateUpQ4K,
-                    weights: &[&layer.w_gate.buf, &layer.w_up.buf],
-                    x: &scratch.tmp,
-                    outputs: &[&scratch.gate, &scratch.up],
-                    m: &[layer.w_gate.m, layer.w_up.m],
-                    k: layer.w_gate.k,
-                    rot_scratch: &[], // non-Paro: family arm ignores it
-                })?;
-            } else if dtype_needs_rotation(layer.w_gate.gpu_dtype) {
-                rotation.run(&ctx, gpu, RotationParams {
-                    x: &scratch.x,
-                    x_up: None,
-                    w_norm: Some(&layer.ffn_norm),
-                    x_plain: &scratch.tmp,
-                    x_rot: &scratch.x_rot,
+            // Single dynamic sequence via execute_steps — no model-side dtype
+            // branching. Fixes the F1 rmsnorm bug for Q4K gate+up.
+            let ffn_rot = dtype_rotation_plan(layer.w_gate.gpu_dtype);
+            let wrg = layer.w_gate.dispatch_ref();
+            let wru = layer.w_up.dispatch_ref();
+            execute_steps(gpu, &ctx, &[
+                Step::RmsnormAutomatic {
+                    x: &scratch.x, norm_weight: &layer.ffn_norm,
+                    x_plain: &scratch.tmp, out: &scratch.x_rot,
                     awq_scale: layer.w_gate.awq_scale.as_ref(),
-                    k: layer.w_gate.k,
-                    eps: config.norm_eps,
-                    batch_size: 1,
-                    variant: RotationVariant::WithRmsnorm,
-                    givens_pairs: None,
-                    givens_theta: None,
-                    givens_scales: None,
-                    givens_krot: None,
-                })?;
-                gemv.run_auto(&ctx, gpu, &layer.w_gate.dispatch_ref(), &scratch.x_rot, &scratch.gate)?;
-                gemv.run_auto(&ctx, gpu, &layer.w_up.dispatch_ref(), &scratch.x_rot, &scratch.up)?;
-            } else {
-                gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
-                gemv.run_auto(&ctx, gpu, &layer.w_gate.dispatch_ref(), &scratch.tmp, &scratch.gate)?;
-                gemv.run_auto(&ctx, gpu, &layer.w_up.dispatch_ref(), &scratch.tmp, &scratch.up)?;
-            }
+                    k: layer.w_gate.k, eps: config.norm_eps, rotation: ffn_rot,
+                },
+                Step::Gemv { w: &wrg, input: GemvInput::Prerotated(&scratch.x_rot), out: &scratch.gate },
+                Step::Gemv { w: &wru, input: GemvInput::Prerotated(&scratch.x_rot), out: &scratch.up },
+            ])?;
 
             // ── SwiGLU + down projection + residual ─────────────
             gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
-            gemv.run(&ctx, gpu, &GemvParams {
-                w: &layer.w_down.dispatch_ref(),
-                x: &scratch.ffn_hidden,
-                y: &scratch.ffn_out,
-                variant: GemvVariant::WithResidual,
-                residual: Some(&scratch.x),
-                gate: None,
-                up: None,
-            })?;
+            let wrd = layer.w_down.dispatch_ref();
+            execute_steps(gpu, &ctx, &[
+                Step::GemvResidual {
+                    w: &wrd, input: GemvInput::Raw(&scratch.ffn_hidden),
+                    residual: &scratch.x, out: &scratch.ffn_out,
+                },
+            ])?;
         }
 
         // ── Final norm + logits + sampling ──────────────────────
         gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
-        gemv.run_auto(&ctx, gpu, &weights.output.dispatch_ref(), &scratch.tmp, &scratch.logits)?;
+        let wr_out = weights.output.dispatch_ref();
+        execute_steps(gpu, &ctx, &[
+            Step::Gemv { w: &wr_out, input: GemvInput::Raw(&scratch.tmp), out: &scratch.logits },
+        ])?;
 
         gpu.sample_top_p(
             &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
