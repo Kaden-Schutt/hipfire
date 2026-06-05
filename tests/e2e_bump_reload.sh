@@ -6,11 +6,17 @@ MODEL=${MODEL:-qwen3.5:0.8b}
 LOG=$(mktemp)
 HIPFIRE_MODEL="$MODEL" bun cli/index.ts serve "$PORT" > "$LOG" 2>&1 &
 PID=$!
-trap "kill -TERM $PID 2>/dev/null; wait $PID 2>/dev/null; rm -f $LOG" EXIT
+# shellcheck disable=SC2329 # invoked by trap
+cleanup() {
+  kill -TERM "${PID:-}" 2>/dev/null || true
+  wait "${PID:-}" 2>/dev/null || true
+  rm -f -- "${LOG:-}"
+}
+trap cleanup EXIT
 
-for i in $(seq 1 90); do
+for _ in $(seq 1 90); do
   if curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then break; fi
-  if ! kill -0 $PID 2>/dev/null; then echo "serve died"; tail "$LOG"; exit 1; fi
+  if ! kill -0 "$PID" 2>/dev/null; then echo "serve died"; tail "$LOG"; exit 1; fi
   sleep 1
 done
 

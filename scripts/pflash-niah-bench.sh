@@ -47,7 +47,7 @@
 # users, thermal). Re-run from a quiet box.
 
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 2
 
 EXE="./target/release/examples/pflash_niah_bench"
 TARGET=""
@@ -114,13 +114,13 @@ stat_line() {
 }
 
 run_once() {
-    local extra=""
-    [ "$PRETOK" = "1" ] && extra="$extra --pretok"
+    local -a extra=()
+    [ "$PRETOK" = "1" ] && extra+=(--pretok)
     if [ -n "$DRAFTER" ]; then
-        extra="$extra --pflash $DRAFTER --keep-ratio $KEEP_RATIO --block-size $BLOCK_SIZE"
+        extra+=(--pflash "$DRAFTER" --keep-ratio "$KEEP_RATIO" --block-size "$BLOCK_SIZE")
     fi
     local out
-    out=$("$EXE" "$TARGET" "$FIXTURE" --maxgen "$MAXGEN" $KV_MODE $extra 2>&1)
+    out=$("$EXE" "$TARGET" "$FIXTURE" --maxgen "$MAXGEN" "$KV_MODE" "${extra[@]}" 2>&1)
     local pass=0
     grep -q "^PASS:" <<< "$out" && pass=1
     local compress prefill decode ttft total
