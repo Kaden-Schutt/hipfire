@@ -201,6 +201,12 @@ pub(crate) fn guard_gate_up_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> boo
             Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0,
             _ => false,
         })
+        // Gate and up must have equal m — the fused kernel takes a single m.
+        && {
+            let m0 = match &steps[1] { Step::Gemv { w, .. } => w.m, _ => return false };
+            let m1 = match &steps[2] { Step::Gemv { w, .. } => w.m, _ => return false };
+            m0 == m1
+        }
 }
 
 pub(crate) fn guard_qkvza_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> bool {
@@ -491,11 +497,11 @@ fn launch_fused(
         // gpu (fused_qkv.run takes &mut Gpu). DeviceBuffer::alias() creates
         // an owned descriptor over the same VRAM — no Rust borrow held.
         KernelKey::FusedGateUpParo4G128T => {
-            #[cfg(debug_assertions)]
-            eprintln!("[dispatch] Paro fused arm fired: {:?}", key);
             let (wg, gate) = gemv_weight_out(&steps[1]);
             let (wu, up)   = gemv_weight_out(&steps[2]);
             let k = wg.k;
+            #[cfg(debug_assertions)]
+            eprintln!("[dispatch] GateUp Paro: k={}, mg={}, mu={}", k, wg.m, wu.m);
             gpu.ensure_paro_fused_scratch(k)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             // Also ensure mq_x_rot >= k (the kernel aliases it for x_rot_up).
@@ -527,13 +533,13 @@ fn launch_fused(
             })
         }
         KernelKey::FusedQkvzaParo4G128T => {
-            #[cfg(debug_assertions)]
-            eprintln!("[dispatch] Paro fused arm fired: {:?}", key);
             let (wqkv, qkv)   = gemv_weight_out(&steps[1]);
             let (wz, z)       = gemv_weight_out(&steps[2]);
             let (wb, beta)    = gemv_weight_out(&steps[3]);
             let (wa, alpha)   = gemv_weight_out(&steps[4]);
             let k = wqkv.k;
+            #[cfg(debug_assertions)]
+            eprintln!("[dispatch] QKVZA Paro: k={}, mqkv={}, mz={}, mbeta={}, malpha={}", k, wqkv.m, wz.m, wb.m, wa.m);
             gpu.ensure_paro_fused_scratch(k)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             let rot_aliases: Vec<GpuTensor> = gpu.scratch.paro_fused_scratch.as_ref().unwrap()
@@ -555,12 +561,12 @@ fn launch_fused(
             })
         }
         KernelKey::FusedQkvParo4G128T => {
-            #[cfg(debug_assertions)]
-            eprintln!("[dispatch] Paro fused arm fired: {:?}", key);
             let (wq, q) = gemv_weight_out(&steps[1]);
             let (wk, k) = gemv_weight_out(&steps[2]);
             let (wv, v) = gemv_weight_out(&steps[3]);
             let kk = wq.k;
+            #[cfg(debug_assertions)]
+            eprintln!("[dispatch] QKV Paro: k={}, mq={}, mk={}, mv={}", kk, wq.m, wk.m, wv.m);
             gpu.ensure_paro_fused_scratch(kk)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             let rot_aliases: Vec<GpuTensor> = gpu.scratch.paro_fused_scratch.as_ref().unwrap()
