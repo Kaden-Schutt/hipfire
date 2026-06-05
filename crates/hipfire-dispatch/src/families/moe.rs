@@ -130,6 +130,16 @@ pub struct MoeParams<'a> {
     pub routed_gate_up_k: usize,
     pub routed_down_m: usize,
     pub routed_down_k: usize,
+    /// Per-expert (gate_up, down) weight refs for the generic CPU-top-K
+    /// fallback (`!use_gpu_topk`: k != 8 OR routed dtype not indexable).
+    /// Master's `moe_ffn_decode_impl` indexed `ffn.experts[expert_idx]` in a
+    /// host loop; the indexed-kernel pointer tables above can't drive that
+    /// path (they assume k=8 + an indexable routed dtype). One ref pair per
+    /// expert, length `n_exp`. **Empty** when the layer is paged (the indexed
+    /// GPU-top-K path is the only mode in paged residency) — the fallback
+    /// asserts non-empty before use, matching master's `ffn.experts[..]`
+    /// indexing (which also required resident experts).
+    pub routed_experts: &'a [(WeightRef<'a>, WeightRef<'a>)],
     // paro sidecars
     pub routed_gate_up_paro: Option<GivensRef<'a>>,
     pub routed_down_paro: Option<GivensRef<'a>>,
@@ -137,6 +147,12 @@ pub struct MoeParams<'a> {
     pub router_logits: &'a GpuTensor,
     pub scalar_buf: &'a GpuTensor,
     pub x_rot_local: &'a GpuTensor,
+    /// Fused [gate||up] scratch of length `2 * max(mi, smi)`. Used by the
+    /// generic CPU-top-K fallback to receive a single routed expert's fused
+    /// gate_up GEMV output (master wrote `expert.gate_up` into one buffer of
+    /// width `2*mi`, then sliced gate/up halves). The GPU-top-K fast path
+    /// does not read this field.
+    pub gate_up_buf: &'a GpuTensor,
     pub gate_buf: &'a GpuTensor,
     pub up_buf: &'a GpuTensor,
     pub ffn_hidden: &'a GpuTensor,

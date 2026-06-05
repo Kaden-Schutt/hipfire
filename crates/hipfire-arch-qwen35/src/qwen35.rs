@@ -4598,6 +4598,19 @@ fn moe_ffn_decode_impl(
     };
     let moe_res = hipfire_dispatch::families::moe::MoeResolution::resolve(&moe_dtypes, k);
 
+    // Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in
+    // `run_moe_decode` (k != 8 OR routed dtype not indexable). Empty in paged
+    // mode (`ffn.experts` is empty — only the indexed GPU-top-K path runs
+    // there), matching master's `ffn.experts[..]` indexing requirement.
+    let routed_experts: Vec<(
+        hipfire_dispatch::families::gemv::WeightRef<'_>,
+        hipfire_dispatch::families::gemv::WeightRef<'_>,
+    )> = ffn
+        .experts
+        .iter()
+        .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
+        .collect();
+
     let moe_params = hipfire_dispatch::families::moe::MoeParams {
         res: moe_res,
         hidden,
@@ -4619,6 +4632,7 @@ fn moe_ffn_decode_impl(
         routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
         routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
         routed_down_k: ffn.experts.first().map_or(0, |e| e.down.k),
+        routed_experts: &routed_experts,
         routed_gate_up_paro: ffn.experts.first().and_then(|e| {
             e.gate_up.paro.as_ref().map(|p| hipfire_dispatch::families::gemv::GivensRef {
                 pairs: &p.pairs, theta: &p.theta, scales: &p.channel_scales, krot: p.krot as usize,
@@ -4632,6 +4646,7 @@ fn moe_ffn_decode_impl(
         router_logits: s.router_logits,
         scalar_buf: s.scalar_buf,
         x_rot_local: s.x_rot_local,
+        gate_up_buf: s.gate_up_buf,
         gate_buf: s.gate_buf,
         up_buf: s.up_buf,
         ffn_hidden: s.ffn_hidden,
