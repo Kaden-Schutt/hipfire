@@ -586,8 +586,19 @@ pub fn gemv_family() -> &'static hipfire_dispatch::families::gemv::GemvFamily {
     GEMV.get_or_init(hipfire_dispatch::families::gemv::GemvFamily::new)
 }
 
+/// Process-global [`FusedQkvFamily`], mirroring [`gemv_family`]. Used by the
+/// dense-arch forward paths to route fused QKV / gate-up launches through the
+/// centralized dispatch tables (arch gating + 1:1 KernelKey→kernel launch).
+pub fn fused_qkv_family() -> &'static hipfire_dispatch::families::fused_qkv::FusedQkvFamily {
+    use std::sync::OnceLock;
+    static FUSED_QKV: OnceLock<hipfire_dispatch::families::fused_qkv::FusedQkvFamily> = OnceLock::new();
+    FUSED_QKV.get_or_init(hipfire_dispatch::families::fused_qkv::FusedQkvFamily::new)
+}
+
+pub use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
 pub use hipfire_dispatch::families::gemv::{RotInput, RotateInputs, RotatedActivation};
 pub use hipfire_dispatch::context::DispatchCtx;
+pub use hipfire_dispatch::types::KernelKey;
 pub use hipfire_dispatch::types::{GemvVariant, dtype_post_rotation_variant, dtype_rotation_plan};
 
 /// How the embedding table is stored on GPU.

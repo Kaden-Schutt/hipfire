@@ -203,6 +203,7 @@ pub enum KernelKey {
     FusedGateUpParo4G128T,
     FusedQkvzaParo4G128T,
     FusedQkvParo4G128T,
+    FusedGateUpQ8_0,
     // Rotation
     RotateMq,
     RotateMqG128,

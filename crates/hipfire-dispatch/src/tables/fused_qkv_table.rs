@@ -46,6 +46,9 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedGateUpHfq6G256,     ArchPredicate::GemvDp4a),
         (KernelKey::FusedGateUpQ4K,          ArchPredicate::Always),
         (KernelKey::FusedGateUpParo4G128T,   ArchPredicate::HasDp4a),
+        // Q8_0 gate+up: plain wave32 kernel (`gpu.fused_gate_up_q8_0`),
+        // no arch gate — mirrors the Q4K row. Used by qwen2 FFN.
+        (KernelKey::FusedGateUpQ8_0,         ArchPredicate::Always),
     ];
     for &(key, arch) in gate_up_variants {
         registry.register(KernelVariant {
