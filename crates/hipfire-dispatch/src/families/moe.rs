@@ -8,11 +8,11 @@
 //!
 //! # Current status
 //!
-//! MoE dispatch is **model-specific** — expert compute is orchestrated through
-//! per-model `moe_ffn_decode_with_scratch` paths (e.g. `qwen35`) that manage
-//! their own per-expert GEMV loops, scatter/gather, and softmax top-k routing.
-//! This family exists as a future entry point for fused grouped-expert kernels.
-//! Today, `run()` returns `UnsupportedVariant` with a clear explanation.
+//! `run()` is the centralized single-token MoE decode entry — it delegates to
+//! [`crate::pipeline::run_moe_decode`] (the GPU top-K fast path plus the generic
+//! CPU-top-K fallback). The model marshals its weights/scratch into `MoeParams`;
+//! scratch stays model-owned. Grouped-GEMM prefill is a future arm (gated on
+//! `ShapeInfo.batch_size`).
 
 use rdna_compute::DType;
 use rdna_compute::GpuTensor;
@@ -200,24 +200,22 @@ impl MoeFamily {
         self.registry.resolve(key, ctx, shape)
     }
 
-    /// Run a MoE expert operation.
+    /// Run a single-token MoE decode step through the centralized executor.
     ///
-    /// Currently returns `UnsupportedVariant` because expert dispatch is
-    /// model-specific — it lives in per-model `moe_ffn_decode_with_scratch`
-    /// paths that handle per-expert GEMV loops, routing, and scratch layout.
-    /// This is a placeholder for when fused grouped-expert kernels land.
+    /// Delegates to [`crate::pipeline::run_moe_decode`], which dispatches the
+    /// GPU top-K fast path (k=8 with an indexable routed dtype ∈ {MQ4G256,
+    /// MQ6G256, ParoQ4G128}) or the generic CPU-top-K fallback (k != 8 or a
+    /// non-indexable routed dtype). Scratch stays model-owned; the model
+    /// marshals it into `params`. `ctx` is currently unused (the executor
+    /// builds its own `DispatchCtx` where a GEMV sub-dispatch needs one) but is
+    /// kept for signature parity with the other families.
     pub fn run(
         &self,
         _ctx: &DispatchCtx,
-        _gpu: &mut rdna_compute::Gpu,
-        _params: &MoeParams,
+        gpu: &mut rdna_compute::Gpu,
+        params: &MoeParams,
     ) -> Result<(), DispatchError> {
-        Err(DispatchError::UnsupportedVariant {
-            family: "moe",
-            variant: "all",
-            arch: "",
-            quant: "",
-        })
+        crate::pipeline::run_moe_decode(gpu, params)
     }
 }
 
