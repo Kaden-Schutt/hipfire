@@ -266,3 +266,5 @@ boundary.
 | Date | Commit | What | Result |
 |---|---|---|---|
 | 2026-06-05 | — | Plan written; Q4K/Q8_0 → Ship 2; folded gemini + glm5 + claude reviews (scratch→`gpu.scratch`, Raw guards, 2-buffer gate+up, Option A 3-way, force-unfused→cosine) | — |
+| 2026-06-05 | `6da3c7bb` | Commit 1: paro_fused_scratch (4×[k] F32) in ScratchState + ensure_paro_fused_scratch + FusedQkvParams.rot_scratch | Clean build, coherence pass, all dispatch tests green |
+| 2026-06-05 | `284c119e` | Commit 2: 3 Paro KernelKeys + guards (Raw-accepting) + FUSED_TABLE entries + launch_fused arms + fused_qkv dispatch + table rows | Clean build, coherence pass, 12 new tests green (paro guards + coverage + arch). GPU verification deferred to coworker (D-11) |

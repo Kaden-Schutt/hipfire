@@ -1,222 +1,207 @@
-# Ship 2.1 — Dense fleet unified (qwen2 + llama through the pipeline)
+# Ship 2.1 — Dense fleet unified (qwen2 + llama through `execute_steps`)
 
 **Branch:** `feature/dispatch-unification`
 **Tracking:** #397 (ship 2)
-**Depends on:** Ships 1.1 + 1.2 (treated as landed) — `execute_steps`, `FUSED_TABLE`,
-guards, `launch_fused` QKV/gate-up/QKVZA arms, `gemv_steps_uniform[_raw]`.
-**Phase 0 contracts:** PR #402 — 0.4 (`HasWmmaW32 → HasWmma`), 0.6 (verification:
-`HIPFIRE_FORCE_UNFUSED`, RDNA4 non-optional, byte-identical token streams).
+**Depends on:** Ships 1.1 + 1.2 (landed on this branch: `execute_steps`,
+`FUSED_TABLE`, guards, `launch_fused` arms, `gemv_steps_uniform[_raw]`, Phase 0.4
+`HasWmma`).
+**Parallel work to reconcile:** `upstream/integration/dispatch-migration` (a different
+dev, divergent off `715f966c`, **not in our history**): `6ded4332` ("migrate llama Q4K
++ qwen2 Q8_0 fused launches onto FusedQkvFamily") and `adfcbc6` ("migrate qwen2
+HFQ4G256 QKV onto FusedQkvFamily + widen dead-gate"). Both use the direct-`fused.run`
+style → stepping stones to convert to `execute_steps`.
+**Target architecture (decided):** **full `execute_steps`**, fleet-consistent with
+qwen35 — *not* the direct-`FusedQkvFamily::run` style `6ded4332` used.
 
-**Goal:** All three dense-only paths (qwen35 done in Ship 1; **qwen2 + llama** here)
-route every projection through `execute_steps`. After 2.1, a new dense quant is a
-`FUSED_TABLE` entry + kernel file across the dense fleet — no model code changes.
-
-> **Folded in:** the Q4K / Q8_0 fused-table work deferred from Ship 1.2. Per the 1.2
-> lesson (no GPU-unexecuted dispatch glue), **each fused entry lands in the same slice
-> as the model that exercises it on GPU**: Q8_0 gate+up ↔ qwen2; Q4K QKV/gate-up ↔
-> llama. This is why llama is in scope here rather than postponed — without it, Q4K
-> would ship untested again.
-
----
-
-## Grounded state (verified at `715f966c` + 1.1/1.2)
-
-### qwen2 — `crates/hipfire-arch-qwen2/src/qwen2.rs`
-
-- Decode is a **single dense path**: `forward_step_after_x` (qwen2.rs:800–944). No
-  DeltaNet/MoE/scratch variants (simpler than qwen35). Prefill =
-  `forward_prefill_batch_embeds` → Ship 5.
-- Already constructs `DispatchCtx::new(gpu)` (814) and uses `gemv.run_auto` for
-  o_proj (907), w_down (932), lm_head (940), and the QKV/gate-up **fallback** arms.
-  So qwen2 already calls `GemvFamily` — it just doesn't use `execute_steps`; it has
-  inline **dtype `if/else` fast paths**:
-  - **QKV (822–841):** `if all HFQ4G256 → gpu.fused_qkv_hfq4g256` else 3× `run_auto`.
-    Producer = plain `rmsnorm_f32(x→tmp)` (820).
-  - **gate+up (914–930):** `if w_gate/w_up == Q8_0 → gpu.fused_gate_up_q8_0` else 2×
-    `run_auto`. Producer = plain `rmsnorm_f32(x→tmp)` (911).
-- o_proj (907) = `run_auto` **then separate** `add_inplace_f32` (908). w_down (932) =
-  `run_auto` then separate residual (935). lm_head (940) = `run_auto`.
-- **Cargo:** qwen2 does **not** depend on `hipfire-dispatch` directly (only
-  `hipfire-runtime` + `rdna-compute`); it reaches dispatch types via runtime
-  re-exports. Needs a direct dep (cleanliness + future-proofing).
-
-> **Correction to the draft Ship 2 text:** it says "Qwen2: Gate+up … →
-> FusedGateUpHfq4G256". **Wrong — qwen2 gate+up is Q8_0** (`fused_gate_up_q8_0`,
-> qwen2.rs:920), so it maps to the **new** `FusedGateUpQ8_0` entry, not the HFQ4 one.
-> qwen2 is precisely the model that closes the Q8_0 gate+up gap.
-
-### llama — `crates/hipfire-arch-llama/src/arch.rs`
-
-- Decode = `forward_scratch_layers` (arch.rs:134), pre-allocated scratch, `ctx` at 147.
-- **Already depends on `hipfire-dispatch`** directly (Cargo:10) — no Cargo change.
-- QKV is **three-way branched** by dtype: `if Q4K → gpu.fused_qkv_q4k` (161); MQ-family
-  prerotated path using `scratch.x_rot` (183–185); plain `rmsnorm→tmp` + 3× `run_auto`
-  (187–190). gate+up mirrors it: `if Q4K → gpu.fused_gate_up_q4k` (315) else MQ/plain
-  `run_auto` (337–342). o_proj (310), lm_head (360) = `run_auto`.
-- So llama is the **only** arch that exercises Q4K (confirmed: `fused_qkv_q4k` /
-  `FusedQkvQ4K` are referenced only by `hipfire-arch-llama` + `hipfire-runtime/llama.rs`).
-
-### Dispatch table state (`steps.rs` / `types.rs` / `fused_qkv_table.rs`)
-
-| Entry | key | family arm | table reg | `FUSED_TABLE` + guard + launch_fused arm | verifier |
-|---|---|---|---|---|---|
-| `FusedQkvHfq4G256` | ✅ | ✅ | ✅ | ✅ (steps.rs:223, 348) | qwen2 QKV (+ qwen35) |
-| `FusedGateUpHfq4G256` | ✅ | ✅ | ✅ | ✅ (steps.rs:233, 364) | (qwen35; qwen2 fallback) |
-| `FusedGateUpQ8_0` | ❌ | ❌ | ❌ | ❌ **add (full stack)** | **qwen2 gate+up** |
-| `FusedQkvQ4K` | ✅ (types.rs:187) | ✅ | ✅ (`Always`) | ❌ **add interpreter** | **llama QKV** |
-| `FusedGateUpQ4K` | ✅ (types.rs:198) | ✅ | ✅ (`Always`) | ❌ **add interpreter** | **llama gate+up** |
+**Goal:** qwen2 + llama route every projection through `execute_steps` (`[Step]` →
+`FUSED_TABLE` → kernel), with **no model-side dtype branching and no model naming a
+kernel key**. After 2.1, a new dense quant is a `FUSED_TABLE` entry + kernel file
+across the whole dense fleet — goals #1 and #3 met.
 
 ---
 
-## Verification-reachability principle (non-negotiable, from the 1.2 lesson)
+## How `6ded4332` changes the starting point
 
-No fused entry merges without a same-PR forward that executes it on GPU under
-byte-parity:
-- **Q8_0 gate+up** is reached only by qwen2 FFN → land it **with** the qwen2
-  migration (Slice A), verified on a qwen2 model whose FFN is Q8_0.
-- **Q4K** is reached only by llama → land it **with** the llama migration (Slice B),
-  verified on a Q4K llama model.
-- GPU-free goldens (resolve + `match_prefix` + `force_unfused` reject incl. RDNA4 row)
-  are **necessary but not sufficient** — they don't execute the kernel.
+`6ded4332` did a **behavior-preserving** rewire of the existing fused fast-path calls
+onto `FusedQkvFamily::run`, **keeping the inline `if dtype == … { fused.run(kind) }
+else { run_auto }` branches**. It centralizes the *kernel implementation* but the
+model still says *how* (picks the key, does the dtype match) — so it does **not** meet
+goals #1/#3 and leaves qwen2/llama inconsistent with qwen35. Under the "full
+execute_steps" decision it is a **stepping stone**, not the destination.
+
+**Reuse, don't redo** (merge these family-layer additions in; they're correct and
+arch-agnostic):
+- `KernelKey::FusedGateUpQ8_0` + its `Always` table row + `FusedQkvFamily::run` arm.
+- `fused_qkv_family()` runtime helper + `FusedQkvParams`/`KernelKey` re-exports via
+  `hipfire_runtime::llama`.
+
+**Discard / supersede** (the parts that conflict with execute_steps):
+- The inline `fused.run(kind: …)` call sites in llama `arch.rs` and qwen2 `qwen2.rs`
+  — replaced by `execute_steps([Step])` (A2/A3 below). The end state has *zero*
+  `fused.run` or `gpu.fused_*` calls in the decode paths.
+
+> Whether we land 2.1 on top of the integration branch (start from `fused.run`) or on
+> our own branch (start from raw `gpu.fused_*`), the destination is identical:
+> `execute_steps`. The intermediate state doesn't change the work below.
 
 ---
 
-## Producer-step decision (resolves the draft's "Step::Rmsnorm vs bare-Gemv")
+## The HFQ4 predicate dead-gate — QKV fixed by `adfcbc6`, gate+up residual
 
-Use **`RmsnormAutomatic(rotation=None)`** for Q4K and Q8_0 — it lowers to a plain
-`gpu.rmsnorm_f32` (steps.rs:258–261), exactly what these non-rotated kernels want
-(both take a pre-normed `x`, no internal rmsnorm). **Do not** add a `Step::Rmsnorm`
-variant: it would duplicate the `rotation=None` branch. `Step::Rmsnorm` belongs to the
-Ship 6 forward-as-pipeline capstone (glm5 F9 on the 1.2 review) — deferred, not
-rejected. Q4K/Q8_0 are not rotated, so their Gemv steps use **`GemvInput::Prerotated`**
-(the buffer holds plain rmsnorm), matching the existing HFQ4 guards
-(`gemv_steps_uniform`, Prerotated) — **no Raw-guard needed** (that was Paro-only).
+`6ded4332` originally deferred qwen2 `fused_qkv_hfq4g256` because the family arm
+`FusedQkvHfq4G256` was `HasWmma`-gated while the kernel is cross-arch precompiled
+(generic wave32 + CDNA wave64), so routing it through the family would resolve to
+`UnsupportedVariant` on non-WMMA archs (RDNA1/RDNA2/CDNA) — CI-enforced via the coverage
+gate's `["gfx1100", "gfx1030", "gfx906"]` rows (`hipfire-dispatch-tests/src/qwen2.rs:12`).
+Phase 0.4's `HasWmma` does **not** fix it (still excludes non-WMMA).
+
+**`adfcbc6` resolved this for QKV:** `FusedQkvHfq4G256` → `ArchPredicate::Always`
+(mirrors the `FusedQkvQ4K` row; correct, since the kernel runs everywhere). So A0-QKV
+is **done** (on the integration branch — pending merge).
+
+**Residual:** `adfcbc6` did **not** widen `FusedGateUpHfq4G256` — still `HasWmma`. The
+gate+up kernel also has cross-arch variants (`fused_gate_up_hfq4g256` +
+`…_dp4a`), so it has the same latent dead-gate. It only bites once a model routes HFQ4
+gate+up through the interpreter on a non-WMMA arch (qwen2 gate+up is Q8_0, llama is
+Q4K/MQ/plain — so not 2.1's primary verifiers, but qwen35 HFQ4 gate+up + the coverage
+matrix make it worth fixing for consistency). → folded into A0 below as the remaining
+item.
+
+**Merge note:** the `FusedQkvHfq4G256` predicate now has a 3-way divergence — base
+`HasWmmaW32`, our branch `HasWmma` (0.4 `dfe7231e`), integration `Always` (`adfcbc6`).
+**Resolve to `Always`.**
 
 ---
 
 ## Plan
 
-### Slice A · qwen2 + `FusedGateUpQ8_0` (verified on qwen2)
+### Commit A0 · HFQ4 fused predicate — QKV done (`adfcbc6`); finish gate+up
 
-#### Commit A1 · `FusedGateUpQ8_0` full dispatch stack
+**QKV: done** — `adfcbc6` set `FusedQkvHfq4G256` → `Always`. On merge, resolve the
+3-way predicate divergence to `Always` (see merge note above).
 
-1. **types.rs:** add `FusedGateUpQ8_0`.
-2. **fused_qkv.rs:** add `run` arm → `gpu.fused_gate_up_q8_0(wg.buf, wu.buf, x, gate,
-   up, wg.m, wu.m, wg.k)` (single `x`, 2 weights, 2 outputs, **no scratch**; matches
-   qwen2.rs:920). Assert `wg.k == wu.k` (the kernel/qwen2 precondition at 918).
-3. **fused_qkv_table.rs:** register with `ArchPredicate::Always` — confirm
-   `fused_gate_up_q8_0` uses no WMMA/dp4a-gated instruction (Q8_0 GEMV is `Always`);
-   if it does, gate accordingly.
-4. **steps.rs:** `GATE_UP2` `FusedPattern` for `FusedGateUpQ8_0` + `guard_gate_up_q8_0`
-   (`force_unfused` early-return → `window_gemv_dtype == Q8_0` → `gemv_steps_uniform`
-   (Prerotated)). Extend the existing 2-way `launch_fused` gate+up arm match list to
-   include the key.
+**Remaining — gate+up:** widen `FusedGateUpHfq4G256` the same way. Confirm
+`gpu.fused_gate_up_hfq4g256` (+ `…_dp4a`) is cross-arch precompiled (it mirrors the QKV
+kernel), then set its predicate to `Always` (or a dp4a-ladder + `Always` fallback if
+the dp4a sibling should be preferred on dp4a archs). This keeps HFQ4 gate+up resolvable
+on non-WMMA archs once it's reached through the interpreter (qwen35 + coverage matrix).
 
-**Verify:** GPU-free golden (resolve + select + force_unfused reject, incl. RDNA4).
-GPU byte-parity comes with A2 (qwen2 executes it).
+**Verify:** coverage golden green for HFQ4 QKV **and gate-up** across `gfx1100,
+gfx1030, gfx906` **and RDNA4** — resolves to a valid path on every row, fused where
+supported.
 
-#### Commit A2 · qwen2 → `execute_steps`; delete inline dtype branches
+### Commit A1 · Interpreter wiring for Q8_0 + Q4K (family layer already exists)
 
-1. **Cargo.toml:** add `hipfire-dispatch = { path = "../hipfire-dispatch", features =
-   ["from-hip-error"] }` (mirror llama).
-2. **forward_step_after_x:** replace the inline fast/fallback branches with
-   `execute_steps`:
-   - **QKV (delete 822–841):** `execute_steps([RmsnormAutomatic(None){x→tmp},
-     Gemv(Prerotated tmp)→q, →k, →v])`. Matcher picks `FusedQkvHfq4G256` for HFQ4,
-     per-op otherwise. Bias (852–854), RoPE, KV write, attention stay inline
-     (attention = Ship 3).
-   - **gate+up (delete 914–930):** `execute_steps([RmsnormAutomatic(None){x→tmp},
-     Gemv(Prerotated tmp)→gate, →up])`. Matcher picks `FusedGateUpQ8_0` for Q8_0,
-     `FusedGateUpHfq4G256` for HFQ4, per-op otherwise.
-   - **o_proj (907–908):** `execute_steps([GemvResidual{attn_out, residual=x}])` —
-     fuses the separate `add_inplace_f32`.
-   - **w_down (932,935):** `execute_steps([GemvResidual{ffn_hidden, residual=x}])`.
-   - **lm_head (940):** `execute_steps([Gemv{tmp→logits}])`.
-3. The explicit `if all_hfq4g256` / `if Q8_0` dtype checks **disappear** — the
-   interpreter does dtype dispatch. This is the "model says *what*, not *how*" win.
+The `FusedGateUpQ8_0` (from `6ded4332`) and `FusedQkvQ4K`/`FusedGateUpQ4K`
+(pre-existing) keys/arms/table rows exist; only the **interpreter** layer is missing.
 
-**Verify (qwen2, on-GPU):**
-- Byte-identical committed token IDs **vs master** (`HIPFIRE_EMIT_TOKEN_IDS=1`, temp
-  0.0, fixed prompt + md5), gfx1100 **and gfx1201**, on a qwen2 model with **HFQ4G256
-  QKV + Q8_0 FFN** (exercises both `FusedQkvHfq4G256` and `FusedGateUpQ8_0`). If the
-  fleet has no such recipe, state the gap and pick the nearest (HFQ4 FFN exercises the
-  HFQ4 gate+up entry; Q8_0 then needs a dedicated fixture).
-- `HIPFIRE_FORCE_UNFUSED` byte-parity (these are Prerotated/non-rotated paths — unlike
-  Paro, fused vs per-op should be byte-identical; if a delta appears, treat as a real
-  divergence, not noise).
-- `probe_commits.sh master HEAD` ±1–3% (o_proj/w_down residual fusion should be neutral
-  or a small win); `coherence-gate.sh` on qwen2 weights.
+1. **steps.rs:** add `FUSED_TABLE` rows — `GATE_UP2`→`FusedGateUpQ8_0`,
+   `QKV3`→`FusedQkvQ4K`, `GATE_UP2`→`FusedGateUpQ4K`.
+2. **guards:** `guard_gate_up_q8_0`, `guard_qkv_q4k`, `guard_gate_up_q4k` —
+   `force_unfused` early-return → `window_gemv_dtype == {Q8_0|Q4K}` →
+   `gemv_steps_uniform` (Prerotated; these are non-rotated, so plain rmsnorm output
+   feeds the kernel — **no Raw-guard**, that was Paro-only).
+3. **launch_fused:** extend the existing `QKV3` and `GATE_UP2` arms' key match-lists to
+   include the three keys (single-`x` extraction, no scratch — same shape as HFQ4).
+4. Producer for all: `RmsnormAutomatic(rotation=None)` (lowers to plain rmsnorm;
+   the kernels take a pre-normed `x`). **No `Step::Rmsnorm`** — deferred to Ship 6.
 
-### Slice B · Q4K interpreter wiring + llama (verified on llama)
+**Verify:** GPU-free coverage goldens (resolve + `match_prefix` select + force_unfused
+reject) incl. RDNA4. GPU byte-parity lands with A2/A3 (the models execute them).
 
-#### Commit B1 · `FusedQkvQ4K` + `FusedGateUpQ4K` interpreter wiring
+### Commit A2 · qwen2 → `execute_steps`; delete inline branches
 
-Keys/family/table already exist — only the interpreter is missing.
-1. **steps.rs:** `QKV3` `FusedPattern` for `FusedQkvQ4K`, `GATE_UP2` for
-   `FusedGateUpQ4K`; `guard_qkv_q4k` / `guard_gate_up_q4k` (`force_unfused` →
-   `window_gemv_dtype == Q4K` → `gemv_steps_uniform` Prerotated). Extend the existing
-   3-way QKV and 2-way gate+up `launch_fused` arms to include the Q4K keys (single-`x`
-   extraction, no scratch — same shape as HFQ4).
+`crates/hipfire-arch-qwen2/src/qwen2.rs::forward_step_after_x`. Add
+`hipfire-dispatch` as a **direct** dep (qwen2 currently reaches it only via
+`hipfire-runtime` re-exports). Replace each projection:
 
-**Verify:** GPU-free golden (incl. RDNA4). GPU parity with B2.
+- **QKV (delete the `if all_hfq4g256 {…} else {…}`):**
+  `execute_steps([RmsnormAutomatic(None){x→tmp}, Gemv(Prerotated tmp)→q,→k,→v])`.
+  Matcher → `FusedQkvHfq4G256` (now resolvable on all archs via A0) or per-op. Bias
+  (852–854), RoPE, KV write, attention stay inline (attention = Ship 3).
+- **gate+up (delete the `if Q8_0 {…} else {…}`):**
+  `execute_steps([RmsnormAutomatic(None){x→tmp}, Gemv(Prerotated tmp)→gate,→up])`.
+  Matcher → `FusedGateUpQ8_0` / `FusedGateUpHfq4G256` / per-op.
+- **o_proj (907–908):** `execute_steps([GemvResidual{attn_out, residual=x}])` (fuses
+  the separate `add_inplace_f32`).
+- **w_down (932,935):** `execute_steps([GemvResidual{ffn_hidden, residual=x}])`.
+- **lm_head (940):** `execute_steps([Gemv{tmp→logits}])`.
 
-#### Commit B2 · llama Q4K call sites → `execute_steps`
+The inline dtype `if` chains disappear — the interpreter does dtype dispatch.
 
-1. **arch.rs QKV (161, 187–190):** replace the `if Q4K → fused_qkv_q4k` branch (and,
-   for a fully-migrated function, the plain `rmsnorm→tmp` branch) with
-   `execute_steps([RmsnormAutomatic(None){x→tmp}, Gemv(Prerotated)→q,→k,→v])`. Matcher
-   picks `FusedQkvQ4K` for Q4K, per-op otherwise.
-2. **arch.rs gate+up (315, 340–342):** `execute_steps([RmsnormAutomatic(None),
-   Gemv×2])` → `FusedGateUpQ4K` / per-op.
-3. **o_proj (310), lm_head (360):** `execute_steps([GemvResidual])` / `([Gemv])`.
-4. **MQ-family prerotated branch (183–185, 337–338):** this is the FWHT/`x_rot` path
-   (rotation ≠ None). Two options:
-   - **B2-min:** migrate **only** the Q4K + plain branches; leave the MQ prerotated
-     branch as-is. Lower risk, but leaves a half-migrated function (the 1.1-review
-     anti-pattern).
-   - **B2-full (recommended if time):** migrate the MQ branch too —
-     `execute_steps([RmsnormAutomatic(rotation=<plan>), Gemv(Prerotated x_rot)×3])`
-     picks the fused MQ QKV/gate-up kernels (a perf *win* for llama MQ, currently 3×
-     `run_auto`). Reuses the qwen35 producer-rotation contract from 1.1.
-   Decide per the A/B and the half-migration tradeoff; default B2-full.
+**Verify (qwen2, on-GPU):** byte-identical token IDs **vs master**
+(`HIPFIRE_EMIT_TOKEN_IDS=1`, temp 0.0, fixed prompt + md5) on gfx1100 + gfx1201, on a
+qwen2 model with **HFQ4G256 QKV + Q8_0 FFN** (exercises both new fused entries — **the
+fixture must exist; confirm before A2**, see Risk 2). `HIPFIRE_FORCE_UNFUSED`
+byte-parity (non-rotated → byte-identical expected). `probe_commits.sh master HEAD`
+±1–3%. `coherence-gate.sh`.
+
+### Commit A3 · llama → `execute_steps`; delete inline branches
+
+`crates/hipfire-arch-llama/src/arch.rs::forward_scratch_layers` (already deps
+`hipfire-dispatch`). llama QKV/gate-up are **three-way branched** (Q4K / MQ-rotated /
+plain) — migrate all three for full coverage (avoid the 1.1-review half-migration smell):
+
+- **QKV (161 Q4K, 183–185 MQ-prerotated, 187–190 plain):**
+  `execute_steps([RmsnormAutomatic(rotation=<plan>){…}, Gemv×3])`. `rotation=None` for
+  Q4K/plain (Prerotated input over plain rmsnorm); `rotation=<MQ plan>` for the MQ
+  branch (reuse the qwen35 1.1 producer-rotation + Prerotated contract). Matcher →
+  `FusedQkvQ4K` / fused MQ QKV (a **win** vs today's 3× `run_auto` on the MQ branch) /
+  per-op.
+- **gate+up (315 Q4K, 337–342 MQ/plain):** same shape, 2-way →
+  `FusedGateUpQ4K` / fused MQ / per-op.
+- **o_proj (310):** `execute_steps([GemvResidual])`. **lm_head (360):**
+  `execute_steps([Gemv])`.
 
 **Verify (llama, on-GPU):** byte-identical vs master on a **Q4K llama** model (gfx1100
-+ gfx1201); `HIPFIRE_FORCE_UNFUSED` byte-parity (non-rotated Q4K → byte-identical
-expected; MQ branch under B2-full → see 1.1/1.2 rotation parity rules);
-`probe_commits.sh master HEAD` ±1–3%; `coherence-gate.sh`.
++ gfx1201); MQ branch parity per the 1.1/1.2 rotation rules (fused-vs-master
+byte-identical; force-unfused coherence/cosine if the MQ fused vs per-op rotation paths
+differ); `probe_commits.sh master HEAD` ±1–3%; `coherence-gate.sh`.
 
-### Commit C · Verification sweep + cleanup
+### Commit A4 · Verification sweep + cleanup + merge reconciliation
 
-- [ ] `(op × dtype × arch)` coverage golden incl. RDNA4 row for `FusedGateUpQ8_0`,
-      `FusedQkvQ4K`, `FusedGateUpQ4K` (Phase 0.4 gate).
+- [ ] Coverage golden incl. RDNA4 + non-WMMA rows (`gfx1030`, `gfx906`) for HFQ4 (A0),
+      Q8_0, Q4K, and the MQ entries newly reachable from llama.
+- [ ] **Grep audit (the goal-#1 gate):** zero `gpu.fused_*` and zero
+      `FusedQkvFamily::run` / `fused.run(` calls remain in qwen2/llama **decode** paths
+      — everything goes through `execute_steps`.
 - [ ] qwen2 + llama coherence gates green on gfx1100 + gfx1201.
-- [ ] Grep audit: no inline `gpu.fused_qkv_hfq4g256` / `gpu.fused_gate_up_q8_0` /
-      `gpu.fused_qkv_q4k` / `gpu.fused_gate_up_q4k` call sites remain in qwen2.rs /
-      arch.rs decode paths (all reach the kernel via `FusedQkvFamily::run`).
-- [ ] Confirm `forward_prefill_batch_embeds` (qwen2) and llama prefill untouched
-      (Ship 5) still pass coherence.
-- [ ] Dev-log which qwen2 / llama model+quant fixtures were used (with prompt md5).
+- [ ] Prefill paths (`forward_prefill_batch_embeds`, llama batched) untouched (Ship 5),
+      still pass coherence.
+- [ ] **Merge reconciliation** with `integration/dispatch-migration`: fold its
+      family-layer additions (`FusedGateUpQ8_0`, `fused_qkv_family()`) and its qwen35
+      MTP/multi-GPU commits (`c87eb0a8`, `4033d594`, `81f4609c`); ensure its
+      `fused.run` call sites (`6ded4332` llama Q4K + qwen2 Q8_0; `adfcbc6` qwen2 HFQ4
+      QKV) are converted to `execute_steps`, not double-applied. **Resolve the
+      `FusedQkvHfq4G256` predicate 3-way conflict (base `HasWmmaW32` / ours `HasWmma`
+      / integration `Always`) → `Always`.**
+- [ ] Dev-log the qwen2/llama fixtures used (model + quant + prompt md5).
 
 ---
 
 ## Risks
 
-1. **Silent perf no-op.** As in 1.2: if a guard fails to fire, output stays correct but
-   the fused kernel never runs. Backstop: `probe_commits.sh` gain-vs-parent (qwen2
-   gate+up Q8_0 and llama Q4K should show the fused win) + a debug-build assert that the
-   intended `launch_fused` arm was reached ≥ once/forward.
-2. **qwen2 verification fixture for Q8_0.** The byte-parity check is only meaningful if
-   the test model's FFN is actually Q8_0. If no fleet qwen2 has Q8_0 FFN, `FusedGateUpQ8_0`
-   reverts to the 1.2 "unverified" problem — must source/confirm a fixture before A1
-   merges. (This is the linchpin; verify it exists first.)
-3. **o_proj / w_down residual fusion** (run_auto + separate add → `GemvResidual`) is a
-   numerics change on paper; for F32 elementwise add it should be byte-identical —
-   confirm under the master byte-parity check, don't assume.
-4. **llama half-migration (B2-min).** Leaving the MQ branch un-migrated reproduces the
-   two-dispatch-styles smell the 1.1 review flagged. Prefer B2-full unless A/B blocks.
-5. **`Always` predicate for Q8_0.** Verify `fused_gate_up_q8_0` truly has no
-   arch-gated instruction before registering `Always` (it's the one new predicate
-   choice here; a wrong `Always` would panic on an arch missing the path).
+1. **A0 mostly landed (`adfcbc6` fixed QKV `Always`); the gate+up residual still
+   precedes any interpreter path that hits HFQ4 gate+up on a non-WMMA arch.** Don't
+   migrate HFQ4 gate+up through the interpreter before widening `FusedGateUpHfq4G256`,
+   or `gfx1030`/`gfx906` coverage goes red.
+2. **Q8_0 verification fixture (linchpin).** The qwen2 byte-parity check only exercises
+   `FusedGateUpQ8_0` if the test model's FFN is actually Q8_0. Confirm such a qwen2
+   fixture exists **before** A2; otherwise Q8_0 reverts to the 1.2 "unverified glue"
+   hole despite the family arm existing.
+3. **Silent perf no-op.** If a guard fails to fire, output stays correct but the fused
+   kernel never runs. Backstop: `probe_commits.sh` gain-vs-parent + a debug assert that
+   the intended `launch_fused` arm was reached ≥ once/forward.
+4. **Merge order with the integration branch.** If `6ded4332` merges first, A2/A3 must
+   *replace* its `fused.run` sites (not leave both). If our branch merges first, we go
+   raw→execute_steps and the integration branch's `fused.run` sites become conflicts to
+   resolve toward execute_steps. Either way, end state = no `fused.run` in decode.
+5. **o_proj/w_down residual fusion** (`run_auto`+separate add → `GemvResidual`): F32
+   elementwise add should be byte-identical — confirm under the master byte-parity
+   check, don't assume.
+6. **llama MQ-branch rotation parity** (A3-full): fused MQ vs per-op may differ in FP
+   order (cf. 1.2 Paro) — use fused-vs-master as the byte oracle, coherence/cosine for
+   force-unfused.
 
 ---
 
@@ -224,12 +209,11 @@ expected; MQ branch under B2-full → see 1.1/1.2 rotation parity rules);
 
 | Item | Ship |
 |---|---|
-| qwen2 / llama **prefill** (`forward_prefill_batch_embeds`, llama batched) | Ship 5 |
+| qwen2 / llama **prefill** | Ship 5 |
 | Attention + KV cache (qwen2 flash/GQA, llama KV) | Ship 3 |
 | `Step::Rmsnorm` variant | Ship 6 (forward-as-pipeline) |
-| qwen2 QKV **bias** fusion (option (c) batched bias-add, qwen2.rs:843–851) | not in dispatch scope |
+| qwen2 QKV **bias** fusion (`qwen2.rs:843–851`) | not in dispatch scope |
 | MoE archs (qwen35 MoE, deepseek4) | Ship 4 |
-| Phase 0.4 `HasWmmaW32 → HasWmma` collapse | Phase 0 cleanup |
 
 ---
 
@@ -237,4 +221,5 @@ expected; MQ branch under B2-full → see 1.1/1.2 rotation parity rules);
 
 | Date | Commit | What | Result |
 |---|---|---|---|
-| 2026-06-05 | — | Plan written; folded Q4K/Q8_0 from 1.2; llama pulled into scope so Q4K has a GPU verifier; corrected draft's qwen2-gate+up-is-Q8_0 error | — |
+| 2026-06-05 | — | Rewrote around parallel work `6ded4332` (family layer done on integration branch) + decision = full execute_steps. Added A0 (HFQ4 predicate re-arch) as prerequisite; A1 now interpreter-only wiring; A2/A3 replace `fused.run`+inline-if with `execute_steps`; added merge reconciliation. | — |
+| 2026-06-05 | — | A0-QKV resolved by `adfcbc6` (`FusedQkvHfq4G256` → `Always`); A0 reduced to the `FusedGateUpHfq4G256` gate+up residual. Noted the 3-way predicate merge conflict (→ `Always`) and `adfcbc6` as another `fused.run` stepping stone to convert. | — |

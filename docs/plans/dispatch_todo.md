@@ -94,3 +94,38 @@ Also safe to clean up in the same pass:
   dispatch crate but not by qwen35.rs directly)
 - Pre-existing unused variables: `kv_layer_idx` in forward_scratch_layers,
   `load_norm_weight_raw`, `slice_f32_view`
+
+### D-9 · Paro weight alignment invariant (Ship 1.2)
+**Source:** Ship 1.2 commit 2 (Paro fused entries)
+**Status:** Verified by code inspection; GPU byte-parity deferred to coworker
+
+ParoQ4G128 group-128 quantization guarantees `k % 128 == 0` by construction
+(128-element groups). `m % 8 == 0` holds for all qwen35 Paro weight matrices
+because the model's hidden dims are multiples of 8. The fused kernel's
+`m%8==0` / `k%128==0` asserts in `fused_qkv_table.rs` / `steps.rs` guards
+mirror the kernel asserts exactly — the guards are optimization gates, not
+the correctness boundary. The per-op fallback (`gemv_hfq4g128`) has its own
+alignment contract that is always satisfied.
+
+### D-10 · Ship 2 handoff: Q4K / Q8_0 fused entries
+**Source:** Ship 1.2 scope change (Q4K/Q8_0 → Ship 2)
+**Ship:** Ship 2
+
+Q4K and Q8_0 fused-table entries (`FusedQkvQ4K`, `FusedGateUpQ4K`,
+`FusedGateUpQ8_0`) were moved to Ship 2 because they need llama/qwen2 model
+integration + GPU byte-parity landing together. The dispatch crate already
+has `FusedQkvQ4K` and `FusedGateUpQ4K` kernel keys, table entries, and
+dispatch arms — what's missing is the step-pattern wiring in `steps.rs`
+(guards + FUSED_TABLE entries + launch_fused arms) and GPU-verified parity.
+
+### D-11 · Paro GPU verification deferred
+**Source:** Ship 1.2 commit 3
+**Status:** Deferred to coworker with Paro model + gfx1100/gfx1201
+
+The following Commit 3 verification items require a Paro model on GPU:
+- Byte-identical-vs-master token IDs on A3B-PARO, gfx1100 + gfx1201
+- Force-unfused: coherence pass + cosine ≥ 0.9999
+- probe_commits.sh master HEAD: parity with master + gain vs parent
+- Multi path (forward_scratch_layers_multi) still works
+The infrastructure is in place and CPU-side tests pass; coworker will run
+the GPU verification and report results.

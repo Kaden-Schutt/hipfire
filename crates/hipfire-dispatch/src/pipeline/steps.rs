@@ -491,6 +491,8 @@ fn launch_fused(
         // gpu (fused_qkv.run takes &mut Gpu). DeviceBuffer::alias() creates
         // an owned descriptor over the same VRAM — no Rust borrow held.
         KernelKey::FusedGateUpParo4G128T => {
+            #[cfg(debug_assertions)]
+            eprintln!("[dispatch] Paro fused arm fired: {:?}", key);
             let (wg, gate) = gemv_weight_out(&steps[1]);
             let (wu, up)   = gemv_weight_out(&steps[2]);
             let k = wg.k;
@@ -525,6 +527,8 @@ fn launch_fused(
             })
         }
         KernelKey::FusedQkvzaParo4G128T => {
+            #[cfg(debug_assertions)]
+            eprintln!("[dispatch] Paro fused arm fired: {:?}", key);
             let (wqkv, qkv)   = gemv_weight_out(&steps[1]);
             let (wz, z)       = gemv_weight_out(&steps[2]);
             let (wb, beta)    = gemv_weight_out(&steps[3]);
@@ -551,6 +555,8 @@ fn launch_fused(
             })
         }
         KernelKey::FusedQkvParo4G128T => {
+            #[cfg(debug_assertions)]
+            eprintln!("[dispatch] Paro fused arm fired: {:?}", key);
             let (wq, q) = gemv_weight_out(&steps[1]);
             let (wk, k) = gemv_weight_out(&steps[2]);
             let (wv, v) = gemv_weight_out(&steps[3]);
