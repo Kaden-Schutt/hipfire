@@ -10,7 +10,7 @@ impl ResourceManager {
         Self { _priv: () }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test() -> Self {
         Self { _priv: () }
     }

@@ -70,3 +70,35 @@ fn llama_runtime_copy_admits_fewer_dtypes_than_qwen35_copy() {
     assert!(!runtime_is_batchable(DType::MQ4G256Lloyd, "gfx1100"),
         "runtime copy should NOT admit MQ4G256Lloyd");
 }
+
+// ─── FusedQkvQ4K / FusedGateUpQ4K coverage (Ship 2.1 A1) ─────────
+
+#[test]
+fn llama_fused_qkv_q4k_resolves_on_all_arches() {
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::fused_qkv::FusedQkvFamily;
+    use hipfire_dispatch::types::KernelKey;
+    let family = FusedQkvFamily::new();
+    for &arch in &["gfx1100", "gfx1030", "gfx906", "gfx1201"] {
+        let ctx = DispatchCtx::for_test(arch);
+        assert!(
+            family.resolve(KernelKey::FusedQkvQ4K, &ctx, None).is_ok(),
+            "FusedQkvQ4K should resolve on {arch} (Always gate)"
+        );
+    }
+}
+
+#[test]
+fn llama_fused_gate_up_q4k_resolves_on_all_arches() {
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::fused_qkv::FusedQkvFamily;
+    use hipfire_dispatch::types::KernelKey;
+    let family = FusedQkvFamily::new();
+    for &arch in &["gfx1100", "gfx1030", "gfx906", "gfx1201"] {
+        let ctx = DispatchCtx::for_test(arch);
+        assert!(
+            family.resolve(KernelKey::FusedGateUpQ4K, &ctx, None).is_ok(),
+            "FusedGateUpQ4K should resolve on {arch} (Always gate)"
+        );
+    }
+}

@@ -191,6 +191,30 @@ pub(crate) fn guard_gate_up_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool 
 
 // ── Paro fused guards (Raw input — kernel rotates internally) ──
 
+// ── Q8_0 / Q4K fused guards (non-rotated, Prerotated input) ──
+// These dtypes have no activation rotation (RotationPlan::None), so the
+// RmsnormAutomatic producer does plain rmsnorm and the fused kernels take
+// the pre-normed x directly. Prerotated input is correct because
+// for_gemv_prerotated(Q8_0/Q4K) falls back to the plain GEMV kernel.
+
+/// Fused QKV with Q4K weights. Used by llama (dense).
+pub(crate) fn guard_qkv_q4k(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    steps.len() == 4 && gemv_steps_uniform(steps, DType::Q4K, true)
+}
+
+/// Fused gate+up with Q4K weights. Used by llama (dense).
+pub(crate) fn guard_gate_up_q4k(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    steps.len() == 3 && gemv_steps_uniform(steps, DType::Q4K, true)
+}
+
+/// Fused gate+up with Q8_0 weights. Used by qwen2 FFN.
+pub(crate) fn guard_gate_up_q8_0(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    if ctx.flags.force_unfused { return false; }
+    steps.len() == 3 && gemv_steps_uniform(steps, DType::Q8_0, true)
+}
+
 pub(crate) fn guard_gate_up_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> bool {
     if ctx.flags.force_unfused { return false; }
     if steps.len() != 3 { return false; }
@@ -289,6 +313,12 @@ const FUSED_TABLE: &[FusedPattern] = &[
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpMq3G256Lloyd, guard: guard_gate_up_mq3g256lloyd },
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpHfq4G256,     guard: guard_gate_up_hfq4g256     },
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpHfq6G256,     guard: guard_gate_up_hfq6g256     },
+    // ── Q8_0 / Q4K fused entries (non-rotated, Always arch gate) ─────────
+    // No FusedQkvQ8_0 entry: neither qwen2 (QKV is HFQ4G256) nor llama (QKV is
+    // Q4K/MQ/plain) uses Q8_0 for QKV — only gate+up.
+    FusedPattern { ops: QKV3,     key: KernelKey::FusedQkvQ4K,          guard: guard_qkv_q4k          },
+    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpQ4K,       guard: guard_gate_up_q4k      },
+    FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpQ8_0,       guard: guard_gate_up_q8_0     },
     // ── Paro fused Paro4G128T (dp4a, Raw input) ────────────────────────
     FusedPattern { ops: GATE_UP2, key: KernelKey::FusedGateUpParo4G128T,   guard: guard_gate_up_paro4g128t },
     FusedPattern { ops: QKVZA4, key: KernelKey::FusedQkvzaParo4G128T,     guard: guard_qkvza_paro4g128t },
@@ -338,12 +368,12 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 residual: None, gate: None, up: None,
             })
         }
-        Step::GemvResidual { w, input: GemvInput::Raw(x), residual, out: _ } => {
+        Step::GemvResidual { w, input: GemvInput::Raw(x), residual, out } => {
             let gemv = GEMV.get_or_init(GemvFamily::new);
             // Dtypes with a fused `gemv_*_residual` kernel use it in one launch.
             // Dtypes without one (Q8_0, ParoQ4G128, …) fall back to plain GEMV into
-            // a scratch temp + `residual += tmp` — the same two-launch path the
-            // legacy `weight_gemv_residual` `_` arm uses. Plain GEMV applies this
+            // the `out` scratch + `residual += out` — reuses the pre-allocated `out`
+            // buffer instead of alloc/free per call. Plain GEMV applies this
             // dtype's own rotation (FWHT / Givens) internally, so this is correct
             // for both no-rotation (Q8) and Givens (Paro) dtypes.
             if KernelKey::for_gemv_residual(w.dtype).is_ok() {
@@ -363,12 +393,10 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             } else {
                 // run_auto applies the dtype's rotation (FWHT/Givens) before the
                 // kernel, so ParoQ4G128 gets its Givens rotation. Plain would skip it.
-                let tmp = gpu.alloc_tensor(&[w.m], DType::F32)
-                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                gemv.run_auto(ctx, gpu, w, x, &tmp)?;
-                gpu.add_inplace_f32(residual, &tmp)
-                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                gpu.free_tensor(tmp)
+                // Reuse `out` as scratch instead of alloc_tensor (eliminates per-call
+                // alloc/free churn and writes `out` for downstream consumers).
+                gemv.run_auto(ctx, gpu, w, x, out)?;
+                gpu.add_inplace_f32(residual, out)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 Ok(())
             }
@@ -436,7 +464,8 @@ fn launch_fused(
         KernelKey::FusedQkvMq4G256Lloyd
         | KernelKey::FusedQkvMq3G256Lloyd
         | KernelKey::FusedQkvHfq4G256
-        | KernelKey::FusedQkvHfq6G256 => {
+        | KernelKey::FusedQkvHfq6G256
+        | KernelKey::FusedQkvQ4K => {
             let (wq, q) = gemv_weight_out(&steps[1]);
             let (wk, k) = gemv_weight_out(&steps[2]);
             let (wv, v) = gemv_weight_out(&steps[3]);
@@ -453,7 +482,9 @@ fn launch_fused(
         KernelKey::FusedGateUpMq4G256Lloyd
         | KernelKey::FusedGateUpMq3G256Lloyd
         | KernelKey::FusedGateUpHfq4G256
-        | KernelKey::FusedGateUpHfq6G256 => {
+        | KernelKey::FusedGateUpHfq6G256
+        | KernelKey::FusedGateUpQ4K
+        | KernelKey::FusedGateUpQ8_0 => {
             let (wg, gate) = gemv_weight_out(&steps[1]);
             let (wu, up)   = gemv_weight_out(&steps[2]);
             fused_qkv.run(ctx, gpu, &FusedQkvParams {

@@ -26,7 +26,7 @@ impl DispatchCtx {
 
     /// Construct a `DispatchCtx` for the given arch string without a live GPU.
     /// Only for use in tests.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(arch: &str) -> Self {
         use rdna_compute::feature_flags::FeatureFlags;
         let flags = Arc::new(FeatureFlags::from_env_for_test(arch));

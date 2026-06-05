@@ -9,6 +9,7 @@ rdna-compute = { path = "../rdna-compute" }
 
 [features]
 default = []
+test-utils = []
 new-rotation = []
 new-gemv = []
 new-gemm = []
