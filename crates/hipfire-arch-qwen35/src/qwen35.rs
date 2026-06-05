@@ -1469,6 +1469,48 @@ fn load_weight_tensor_raw(
                 })
             }
         },
+        2 => {
+            // F32 — native full-precision oracle weights (qt=2). Raw f32 LE
+            // bytes uploaded as-is; the engine forwards through gemv_f32 /
+            // gemm_f32_batched / attention_f32. Part of the F1 native-bf16
+            // reference path (no quantization).
+            let buf = gpu.upload_raw(data, &[m, k])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        16 => {
+            // BF16 — widen losslessly to F32 on host, then upload as F32.
+            // bf16 is the high 16 bits of an f32 (same sign/exp, 7 mantissa
+            // bits), so `from_bits((bf16 as u32) << 16)` is exact. The engine
+            // has no native bf16 GEMV for the text arch; the gfx942 bf16 MFMA
+            // GEMM (kernels/src/gemm_bf16_mfma.gfx942.hip) is the perf path and
+            // is documented as a deferred gap. F32 compute over bf16-rounded
+            // weights is a superset-precision oracle.
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         _ => panic!("unsupported quant_type {} for lm_head", quant_type),
     }
 }
@@ -2626,10 +2668,23 @@ pub fn load_weights(
             EmbeddingFormat::Q8_0,
         )
     } else {
-        let f32_data: Vec<f32> = embd_data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
+        // F1 native-bf16 oracle: embed_tokens may arrive as qt=2 (F32, 4-byte
+        // LE) or qt=16 (BF16, 2-byte high-half of f32). Decode by quant_type
+        // rather than assuming F16. qt=1 (F16) keeps the historical path.
+        let f32_data: Vec<f32> = match embd_qt {
+            2 => embd_data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            16 => embd_data
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect(),
+            _ => embd_data
+                .chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+        };
         (
             gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
             EmbeddingFormat::F32,

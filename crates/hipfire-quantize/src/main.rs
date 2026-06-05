@@ -4233,6 +4233,12 @@ fn main() {
     // q8-fast = Q8 attn + Q4-as-Q8 FFN (all Q8 occupancy, most VRAM)
     // q8hfq = all weights Q8_HFQ (split-metadata, 128B-aligned rows)
     let use_q8 = format == "q8f16" || format == "q8";
+    // F1 native-bf16 oracle: full-precision passthrough. Every tensor stored
+    // as QuantType::F32 (qt=2) -- weights, norms, embeddings. The bf16 source
+    // is widened bf16->f32 (lossless), giving the engine a superset-precision
+    // reference forward for self-sufficient KLD eval.
+    let use_f32_passthrough = format == "f32" || format == "f32-passthrough"
+        || format == "bf16" || format == "oracle";
     let use_mixed = format == "q8-mixed" || format == "mixed";
     let use_fast = format == "q8-fast" || format == "fast";
     let use_q8hfq = format == "q8hfq";
@@ -5012,6 +5018,37 @@ fn main() {
         let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
         let n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
+
+        // ── F1 native-bf16 oracle passthrough ──────────────────────────────
+        // Store EVERY tensor as F32 (qt=2): no quantization, bf16/f16->f32
+        // widened losslessly. This bypasses every per-format branch below so
+        // the produced .hfq is a full-precision reference the qwen35 loader
+        // reads via its qt=2 arm and the engine forwards through the existing
+        // F32 GEMV / attention_f32 path.
+        if use_f32_passthrough {
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name, raw_data, meta, &fp8_scale_for, &st_files,
+            );
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+            quantized_params += n_elements as u64;
+            eprintln!("  {:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [F32 oracle passthrough]",
+                "F32", name, meta.shape, n_elements,
+                raw_data.len() as f64 / 1024.0, bytes.len() as f64 / 1024.0);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::F32,
+                shape,
+                group_size: 0,
+                data: bytes,
+                spilled_len: 0,
+            });
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut sp) = spill {
+                maybe_spill(&mut hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+            }
+            continue;
+        }
 
         // DeepSeek V4's `tid2eid` hash-routing tables: source I64 in safetensors,
         // shape [vocab=129280, k=6]. The values are token-id × expert-id
