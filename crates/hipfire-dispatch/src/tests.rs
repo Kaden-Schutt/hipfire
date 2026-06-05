@@ -373,13 +373,18 @@ fn for_gemv_prerotated_maps_mq_family() {
 }
 
 #[test]
-fn for_gemv_prerotated_rejects_non_mq_dtypes() {
-    for dtype in [DType::F32, DType::HFQ4G256, DType::Q8_0] {
-        assert!(
-            KernelKey::for_gemv_prerotated(dtype).is_err(),
-            "expected error for {dtype:?}",
-        );
-    }
+fn for_gemv_prerotated_falls_back_to_plain_for_non_rotated() {
+    // Rotation-free dtypes (RotationPlan::None) have no separate prerotated kernel —
+    // their prerotated input is their plain input, so for_gemv_prerotated falls through
+    // to for_gemv(Plain). This was changed to support the interpreter's unified
+    // Prerotated input path (Ship 2.1) — previously these returned Err, which
+    // caused a MissingImpl panic at runtime when the interpreter tried to dispatch
+    // a non-rotated dtype through the Prerotated variant.
+    assert_eq!(KernelKey::for_gemv_prerotated(DType::F32).unwrap(), KernelKey::GemvF32);
+    assert_eq!(KernelKey::for_gemv_prerotated(DType::Q8_0).unwrap(), KernelKey::GemvQ8_0);
+    assert_eq!(KernelKey::for_gemv_prerotated(DType::HFQ4G256).unwrap(), KernelKey::GemvHfq4G256);
+    // Rotation-needing dtypes still resolve to dedicated prerotated keys.
+    assert_eq!(KernelKey::for_gemv_prerotated(DType::MQ4G256).unwrap(), KernelKey::GemvMq4G256Prerotated);
 }
 
 #[test]
@@ -414,10 +419,11 @@ fn for_gemv_swiglu_residual_maps_hfq_and_mq() {
 
 #[test]
 fn for_gemv_rejects_unsupported_variant_combo() {
-    // Prerotated for F32 has no kernel.
-    assert!(KernelKey::for_gemv_prerotated(DType::F32).is_err());
     // Residual for F32 has no kernel.
     assert!(KernelKey::for_gemv_residual(DType::F32).is_err());
+    // Prerotated for F32 now falls back to the plain key (rotation-free dtype).
+    // See for_gemv_prerotated_falls_back_to_plain_for_non_rotated.
+    assert!(KernelKey::for_gemv_prerotated(DType::F32).is_ok());
 }
 
 // ── dtype_needs_rotation ──────────────────────────────────────────────────────────
@@ -479,7 +485,9 @@ fn gemv_family_resolves_mq3_prerotated_only_on_wmma_arch() {
     assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_err());
     assert!(fam.resolve(DType::MQ3G256, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_ok());
     assert!(fam.resolve(DType::MQ4G256, GemvVariant::Prerotated, false, &ctx_rdna2(), None).is_ok());
-    assert!(fam.resolve(DType::F32, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_err());
+    // F32 Prerotated now falls back to GemvF32 (rotation-free dtype → plain key).
+    // It resolves on any arch because GemvF32 has no arch gate.
+    assert!(fam.resolve(DType::F32, GemvVariant::Prerotated, false, &ctx_rdna3(), None).is_ok());
 }
 
 // ── Pipeline::can_satisfy ─────────────────────────────────────────────────────

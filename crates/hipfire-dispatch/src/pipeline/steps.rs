@@ -362,6 +362,10 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             })
         }
         Step::GemvResidual { w, input: GemvInput::Prerotated(xr), residual, out: _ } => {
+            // MQ-family with a fused residual kernel: writes `residual` in-place via
+            // GemvVariant::WithResidual. `out` is NOT written — it is scratch for the
+            // fallback path only (see the Raw arm below). Nothing downstream reads
+            // `out` after this step in either qwen2 or llama decode paths.
             let gemv = GEMV.get_or_init(GemvFamily::new);
             gemv.run(ctx, gpu, &GemvParams {
                 w, x: xr, y: residual, variant: GemvVariant::WithResidual,
@@ -369,6 +373,11 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             })
         }
         Step::GemvResidual { w, input: GemvInput::Raw(x), residual, out } => {
+            // For dtypes WITHOUT a fused residual kernel (Q8_0, Q4K, F32), `out` is
+            // used as scratch: run_auto writes GEMV result into `out`, then
+            // add_inplace_f32 adds it to `residual`. `out` is fresh for Q8_0/Q4K
+            // and stale for HFQ4/MQ (which take the is_ok() branch above), but
+            // nothing reads `out` after this step in any model decode path.
             let gemv = GEMV.get_or_init(GemvFamily::new);
             // Dtypes with a fused `gemv_*_residual` kernel use it in one launch.
             // Dtypes without one (Q8_0, ParoQ4G128, …) fall back to plain GEMV into
@@ -798,5 +807,43 @@ mod tests {
             assert!(family.resolve(key, &ctx1201, None).is_ok(),
                 "Paro key {:?} should resolve on gfx1201", key);
         }
+    }
+
+    // ── Q4K / Q8_0 guard tests (Ship 2.1 A1 — Claude F1 / glm5 F2) ──────
+
+    #[test]
+    fn q4k_q8_0_guards_reject_force_unfused() {
+        // All three new guards must return false when force_unfused is set,
+        // even for empty slices (the guard opens with the early-return).
+        use std::sync::Arc;
+        use rdna_compute::feature_flags::FeatureFlags;
+        let mut flags = FeatureFlags::from_env_for_test("gfx1100");
+        flags.force_unfused = true;
+        let ctx = DispatchCtx {
+            arch: rdna_compute::arch_caps::ArchCaps::new("gfx1100", Arc::new(FeatureFlags::from_env_for_test("gfx1100"))),
+            flags: Arc::new(flags),
+            resources: crate::resource::ResourceManager::for_test(),
+        };
+        let empty: &[Step] = &[];
+        assert!(!guard_qkv_q4k(empty, &ctx), "guard_qkv_q4k must reject force_unfused");
+        assert!(!guard_gate_up_q4k(empty, &ctx), "guard_gate_up_q4k must reject force_unfused");
+        assert!(!guard_gate_up_q8_0(empty, &ctx), "guard_gate_up_q8_0 must reject force_unfused");
+    }
+
+    #[test]
+    fn q4k_q8_0_guards_reject_wrong_length() {
+        let ctx = DispatchCtx::for_test("gfx1100");
+        let empty: &[Step] = &[];
+        assert!(!guard_qkv_q4k(empty, &ctx), "Q4K QKV guard needs len==4");
+        assert!(!guard_gate_up_q4k(empty, &ctx), "Q4K gate+up guard needs len==3");
+        assert!(!guard_gate_up_q8_0(empty, &ctx), "Q8_0 gate+up guard needs len==3");
+    }
+
+    #[test]
+    fn q4k_q8_0_fused_table_entries_exist() {
+        let keys: Vec<_> = FUSED_TABLE.iter().map(|e| e.key).collect();
+        assert!(keys.contains(&KernelKey::FusedQkvQ4K), "FusedQkvQ4K missing from FUSED_TABLE");
+        assert!(keys.contains(&KernelKey::FusedGateUpQ4K), "FusedGateUpQ4K missing from FUSED_TABLE");
+        assert!(keys.contains(&KernelKey::FusedGateUpQ8_0), "FusedGateUpQ8_0 missing from FUSED_TABLE");
     }
 }
