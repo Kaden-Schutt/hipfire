@@ -16,12 +16,14 @@
 //!           <out_prefix>.top5.csv — step,rank1_id,rank1_logit,...,rank5_id,rank5_logit
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("build with --features deltanet"); }
+fn main() {
+    eprintln!("build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_runtime::hfq::HfqFile;
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{self, KvCache};
     use std::io::Write;
     use std::path::Path;
@@ -67,7 +69,8 @@ fn main() {
 
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
+    let tokenizer =
+        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
 
     let mut prompt_tokens: Vec<u32> = match mode.as_str() {
         "raw" => tokenizer.encode(&prompt_text),
@@ -185,7 +188,9 @@ fn main() {
         // Partial top-5 via simple linear scan keeping a sorted window.
         let mut best: [(u32, f32); 5] = [(0, f32::NEG_INFINITY); 5];
         for (i, &v) in logits.iter().enumerate() {
-            if v <= best[4].1 { continue; }
+            if v <= best[4].1 {
+                continue;
+            }
             best[4] = (i as u32, v);
             // Bubble up
             for j in (1..5).rev() {
@@ -202,9 +207,16 @@ fn main() {
     // Prefill
     for (pos, &token) in prompt_tokens.iter().enumerate() {
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, token, pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("prefill forward failed");
+            &mut gpu,
+            &weights,
+            &config,
+            token,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("prefill forward failed");
     }
 
     // First token after prefill
@@ -214,28 +226,49 @@ fn main() {
     {
         let t = top5(&logits);
         let margin = t[0].1 - t[1].1;
-        writeln!(out_csv, "0,{},{:.8},{},{:.8},{},{:.8},{},{:.8},{},{:.8},{:.8}",
-            t[0].0, t[0].1, t[1].0, t[1].1, t[2].0, t[2].1, t[3].0, t[3].1, t[4].0, t[4].1, margin).ok();
+        writeln!(
+            out_csv,
+            "0,{},{:.8},{},{:.8},{},{:.8},{},{:.8},{},{:.8},{:.8}",
+            t[0].0, t[0].1, t[1].0, t[1].1, t[2].0, t[2].1, t[3].0, t[3].1, t[4].0, t[4].1, margin
+        )
+        .ok();
     }
     prompt_tokens.push(next_token);
 
     for step in 1..max_gen {
         let pos = prompt_tokens.len() - 1;
-        if pos >= kv_seq { break; }
+        if pos >= kv_seq {
+            break;
+        }
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, next_token, pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("forward failed");
+            &mut gpu,
+            &weights,
+            &config,
+            next_token,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("forward failed");
         logits = gpu.download_f32(&scratch.logits).unwrap();
         next_token = llama::argmax(&logits);
         writeln!(out_tokens, "{next_token}").ok();
         let t = top5(&logits);
         let margin = t[0].1 - t[1].1;
-        writeln!(out_csv, "{step},{},{:.8},{},{:.8},{},{:.8},{},{:.8},{},{:.8},{:.8}",
-            t[0].0, t[0].1, t[1].0, t[1].1, t[2].0, t[2].1, t[3].0, t[3].1, t[4].0, t[4].1, margin).ok();
+        writeln!(
+            out_csv,
+            "{step},{},{:.8},{},{:.8},{},{:.8},{},{:.8},{},{:.8},{:.8}",
+            t[0].0, t[0].1, t[1].0, t[1].1, t[2].0, t[2].1, t[3].0, t[3].1, t[4].0, t[4].1, margin
+        )
+        .ok();
         prompt_tokens.push(next_token);
-        if next_token == config.eos_token { break; }
-        if step % 100 == 0 { eprintln!("  step {step:4}"); }
+        if next_token == config.eos_token {
+            break;
+        }
+        if step % 100 == 0 {
+            eprintln!("  step {step:4}");
+        }
     }
     out_tokens.flush().ok();
     out_csv.flush().ok();
