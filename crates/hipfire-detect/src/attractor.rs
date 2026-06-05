@@ -75,7 +75,9 @@ impl Detector for AttractorFirst128 {
         if window.len() < MIN_WINDOW {
             return Verdict::Ok;
         }
-        verdict_for_window(window, /*hard_unique=*/ 0.15, /*soft_unique=*/ 0.30)
+        verdict_for_window(
+            window, /*hard_unique=*/ 0.15, /*soft_unique=*/ 0.30,
+        )
     }
 }
 
@@ -133,7 +135,9 @@ impl Detector for AttractorLast128 {
         }
         let start = n.saturating_sub(128);
         let window = &self.pre_eot[start..];
-        verdict_for_window(window, /*hard_unique=*/ 0.30, /*soft_unique=*/ 0.40)
+        verdict_for_window(
+            window, /*hard_unique=*/ 0.30, /*soft_unique=*/ 0.40,
+        )
     }
 }
 
@@ -259,13 +263,21 @@ fn verdict_for_window(window: &[u32], hard_unique: f64, soft_unique: f64) -> Ver
     if stats.max_freq > 0.50 || stats.unique_ratio < hard_unique {
         return Verdict::fail(format!(
             "max_freq {:.2} (tok {}), unique_ratio {:.2} over {} tokens (hard: >0.50 OR <{:.2})",
-            stats.max_freq, stats.max_tok, stats.unique_ratio, window.len(), hard_unique
+            stats.max_freq,
+            stats.max_tok,
+            stats.unique_ratio,
+            window.len(),
+            hard_unique
         ));
     }
     if stats.max_freq > 0.40 || stats.unique_ratio < soft_unique {
         return Verdict::warn(format!(
             "max_freq {:.2} (tok {}), unique_ratio {:.2} over {} tokens (soft: >0.40 OR <{:.2})",
-            stats.max_freq, stats.max_tok, stats.unique_ratio, window.len(), soft_unique
+            stats.max_freq,
+            stats.max_tok,
+            stats.unique_ratio,
+            window.len(),
+            soft_unique
         ));
     }
     Verdict::Ok
