@@ -14460,10 +14460,14 @@ mod tests {
     }
 
     #[test]
-    fn paro_batched_admit_defaults_on_and_allows_opt_out() {
-        assert!(paro_batched_admit_enabled_from_env(None));
+    fn paro_batched_admit_defaults_off_and_allows_opt_in() {
+        // PARO batched prefill is default-OFF (the path has a coherence/echo bug;
+        // per-token fallback is correct) — opt in via HIPFIRE_PARO_BATCHED=1.
+        // `paro_batched_admit_enabled_from_env` is `value == Some("1")`, so only
+        // the exact string "1" enables it; everything else (incl. None) is off.
+        assert!(!paro_batched_admit_enabled_from_env(None));
         assert!(paro_batched_admit_enabled_from_env(Some("1")));
-        assert!(paro_batched_admit_enabled_from_env(Some("surprise")));
+        assert!(!paro_batched_admit_enabled_from_env(Some("surprise")));
         assert!(!paro_batched_admit_enabled_from_env(Some("0")));
     }
 
