@@ -5,11 +5,15 @@
 //! Both defects that have already shipped on this branch reduce to a pure assertion
 //! over the existing dispatch API:
 //!
-//!   1. KEY-CONSTRUCTOR GAP — a `KernelKey::for_*` constructor's `_ => UnsupportedVariant`
-//!      arm is hit by a dtype a shipped model actually uses for that op, so the
-//!      forward pass `.unwrap()`s an Err and HARD-PANICS on decode.
-//!      Live example: `for_gemv_residual(Q8_0)` == Err  → qwen3.5-9b.q8f16 and
-//!      qwen3.6-35b-a3b o_proj panic ("unsupported gemv.residual for /").
+//!   1. NO-DISPATCH-PLAN GAP — a forward op (e.g. `Step::GemvResidual` for o_proj)
+//!      has neither a fused kernel nor a fallback path for a dtype a shipped model
+//!      uses, so the lowering hits `_ => UnsupportedVariant` and the forward pass
+//!      `.unwrap()`s an Err → HARD-PANIC on decode.
+//!      Live example (now fixed): `for_gemv_residual(Q8_0)` == Err AND no fallback →
+//!      qwen3.5-9b.q8f16 + qwen3.6-35b-a3b o_proj panicked. The fix routes
+//!      no-fused-kernel residual dtypes through plain-GEMV-into-temp + add_inplace,
+//!      so the invariant is: a residual dtype is dispatchable iff it has a fused
+//!      residual kernel OR a plain GEMV (the fallback).
 //!
 //!   2. ARCH DEAD-GATE — a dtype's required `ArchPredicate` excludes an arch the
 //!      model ships on, so `resolve()` returns MissingImpl / the path silently
@@ -17,8 +21,8 @@
 //!      gated on a gfx11-only predicate, excluding gfx1201/RDNA4.
 //!
 //! Keep `FLEET` in sync with the model loaders' per-op weight dtypes: a new quant
-//! format or shipped tier means new rows here. This is the structural fix #397
-//! Phase-0.4 should adopt — a single coverage gate over (op × dtype × arch).
+//! format or shipped tier means new rows here. This is the structural guardrail
+//! #397 Phase-0.4 should adopt — a single coverage gate over (op × dtype × arch).
 
 use crate::context::DispatchCtx;
 use crate::types::*;
@@ -58,18 +62,21 @@ const ALL: &[&str] = &[
 ];
 
 /// PRODUCTION MATRIX — (model, role, dtype) the wired forward pass hits today.
-/// The Q8_0 `Residual` rows are the ones the live gap panics on.
+/// The Q8_0 `Residual` rows are the ones the live gap panicked on (now fixed via
+/// the plain-GEMV fallback).
 const FLEET: &[OpUse] = &[
-    // ── q8f16: Q8 weights throughout. o_proj PANICS on every arch today ──
+    // ── q8f16: Q8 weights throughout. o_proj reaches Step::GemvResidual on every arch ──
     OpUse { model: "qwen3.5-9b.q8f16", role: Role::Residual, dtype: Q8_0, archs: ALL },
     OpUse { model: "qwen3.5-9b.q8f16", role: Role::Plain,    dtype: Q8_0, archs: ALL },
-    // FFN down is on the legacy path today, but hits swiglu_residual once migrated:
     OpUse { model: "qwen3.5-9b.q8f16", role: Role::SwigluResidual, dtype: Q8_0, archs: ALL },
 
-    // ── qwen3.6-35b-a3b MoE: Q8 attention o_proj (also PANICS today) ──
+    // ── qwen3.6-35b-a3b MoE: Q8 attention o_proj ──
     OpUse { model: "qwen3.6-35b-a3b.mq4", role: Role::Residual, dtype: Q8_0, archs: WAVE32 },
 
-    // ── dense MQ4/MQ3/Lloyd: o_proj IS supported — regression anchors (stay green) ──
+    // ── Paro o_proj (no fused residual kernel → uses the same fallback) ──
+    OpUse { model: "qwen3.5-*.paro4g128", role: Role::Residual, dtype: ParoQ4G128, archs: WAVE32 },
+
+    // ── dense MQ4/MQ3/Lloyd: o_proj has a fused residual kernel — anchors (stay green) ──
     OpUse { model: "qwen3.5-27b.mq4",       role: Role::Residual, dtype: MQ4G256,      archs: WAVE32 },
     OpUse { model: "qwen3.5-27b.mq3",       role: Role::Residual, dtype: MQ3G256,      archs: WAVE32 },
     OpUse { model: "qwen3.6-27b.mq3-lloyd", role: Role::Residual, dtype: MQ3G256Lloyd, archs: WAVE32 },
@@ -78,53 +85,51 @@ const FLEET: &[OpUse] = &[
     OpUse { model: "qwen3.6-35b-a3b.mq4",   role: Role::Plain,    dtype: MQ6G256,      archs: WAVE32 },
 ];
 
-/// Map (role, dtype) to the KernelKey constructor the forward pass calls.
-fn construct_key(role: Role, dtype: DType) -> Result<KernelKey, DispatchError> {
+/// Does the forward lowering for (role, dtype) have ANY dispatch plan (so it
+/// cannot hit an `UnsupportedVariant` panic)? Mirrors the real lowering:
+/// - Plain          → needs a plain GEMV.
+/// - Residual       → fused `gemv_*_residual` kernel OR plain-GEMV-into-temp + add.
+/// - SwigluResidual → fused swiglu-residual kernel OR plain-GEMV fallback.
+fn has_dispatch_plan(role: Role, dtype: DType) -> bool {
+    let plain = KernelKey::for_gemv(dtype, GemvVariant::Plain, false).is_ok();
     match role {
-        Role::Plain          => KernelKey::for_gemv(dtype, GemvVariant::Plain, false),
-        Role::Residual       => KernelKey::for_gemv_residual(dtype),
-        Role::SwigluResidual => KernelKey::for_gemv_swiglu_residual(dtype),
+        Role::Plain          => plain,
+        Role::Residual       => KernelKey::for_gemv_residual(dtype).is_ok() || plain,
+        Role::SwigluResidual => KernelKey::for_gemv_swiglu_residual(dtype).is_ok() || plain,
     }
 }
 
-/// LAYER 1 — key-constructor coverage (catches the Q8-residual defect class).
-/// Every (role, dtype) a shipped model uses MUST construct a key, never hit the
-/// `_ => UnsupportedVariant` arm. FAILS TODAY on the q8f16 / A3B `Residual` Q8_0
-/// rows — that failure IS the bug. Fix = add Q8_0 (+ any other shipped o_proj/down
-/// dtype) to for_gemv_residual / for_gemv_swiglu_residual backed by a real
-/// gemv_q8_0_residual kernel, OR keep o_proj on the legacy weight_gemv_residual path.
+/// LAYER 1 — dispatch-plan coverage (catches the missing-arm panic class). Every
+/// (role, dtype) a shipped model uses MUST have a dispatch plan. Before the
+/// Q8/Paro fix this FAILED on the q8f16/A3B/Paro `Residual` rows (the panic);
+/// after the fix those resolve via the plain-GEMV fallback.
 #[test]
-fn fleet_key_constructors_have_no_gaps() {
+fn fleet_ops_have_a_dispatch_plan() {
     let mut failures = Vec::new();
     for u in FLEET {
-        if let Err(e) = construct_key(u.role, u.dtype) {
+        if !has_dispatch_plan(u.role, u.dtype) {
             failures.push(format!(
-                "  {} / {:?} / {:?}  →  {:?}  (forward .unwrap()s this Err → runtime panic)",
-                u.model, u.role, u.dtype, e
+                "  {} / {:?} / {:?}  →  no dispatch plan (no fused kernel, no plain fallback) → runtime panic",
+                u.model, u.role, u.dtype
             ));
         }
     }
     assert!(
         failures.is_empty(),
-        "\n{} shipped (model, role, dtype) combos hit an UnsupportedVariant key-constructor \
-         arm and HARD-PANIC on decode:\n{}\n",
+        "\n{} shipped (model, role, dtype) combos have NO dispatch plan and HARD-PANIC on decode:\n{}\n",
         failures.len(),
         failures.join("\n")
     );
 }
 
 /// LAYER 2 — arch coverage (catches the gfx12-dead-gate defect class). For every
-/// constructible shipped dtype × arch it ships on, the dtype's required arch
-/// predicate MUST admit that arch (else resolve() → MissingImpl / scalar fallback).
-/// PASSES today (953ea648 fix is in: HasWmmaW32/HasMmq admit gfx12); would have
-/// FAILED before that fix.
+/// shipped dtype × arch it ships on, the dtype's required arch predicate MUST
+/// admit that arch (else resolve() → MissingImpl / scalar fallback). Passes today
+/// (953ea648 fix is in: HasWmmaW32/HasMmq admit gfx12); would have failed before.
 #[test]
 fn fleet_dtypes_resolve_on_every_target_arch() {
     let mut failures = Vec::new();
     for u in FLEET {
-        if construct_key(u.role, u.dtype).is_err() {
-            continue; // Layer 1 owns constructor gaps
-        }
         let pred = KernelKey::dtype_arch_predicate(u.dtype);
         for &arch in u.archs {
             let ctx = DispatchCtx::for_test(arch);
@@ -144,24 +149,49 @@ fn fleet_dtypes_resolve_on_every_target_arch() {
     );
 }
 
-/// LAYER 1b — exhaustive o_proj/down dtype sweep (defense in depth). Reports every
-/// plausible residual dtype the constructor currently rejects, and HARD-asserts the
-/// one confirmed shipped (Q8_0) so the gap can't be reintroduced.
+/// LAYER 1b — o_proj/down dtype sweep (defense in depth). Reports which residual
+/// dtypes still lack a FUSED kernel (use the slower fallback — informational), and
+/// HARD-asserts the confirmed-shipped o_proj dtypes (Q8_0, ParoQ4G128) have a
+/// dispatch plan so the panic can't be reintroduced.
 #[test]
-fn residual_constructor_covers_confirmed_oproj_dtypes() {
+fn confirmed_oproj_dtypes_have_a_plan() {
     const OPROJ_DTYPES: &[DType] = &[
         Q8_0, MQ4G256, MQ3G256, MQ6G256, HFQ4G256, HFQ6G256,
         MQ3G256Lloyd, MQ4G256Lloyd, ParoQ4G128, MFP4G32, Q4K,
     ];
-    let missing: Vec<_> = OPROJ_DTYPES
+    let no_fused: Vec<_> = OPROJ_DTYPES
         .iter()
         .filter(|d| KernelKey::for_gemv_residual(**d).is_err())
         .collect();
-    if !missing.is_empty() {
-        eprintln!("for_gemv_residual currently MISSING arms for: {:?}", missing);
+    if !no_fused.is_empty() {
+        eprintln!("residual dtypes with no FUSED kernel (use plain+add fallback): {:?}", no_fused);
     }
-    assert!(
-        KernelKey::for_gemv_residual(Q8_0).is_ok(),
-        "for_gemv_residual(Q8_0) is the confirmed o_proj panic (q8f16 + A3B) — must be supported"
-    );
+    for d in [Q8_0, ParoQ4G128] {
+        assert!(
+            has_dispatch_plan(Role::Residual, d),
+            "Role::Residual / {:?} has no dispatch plan — the o_proj panic would return",
+            d
+        );
+    }
+}
+
+/// LAYER 1c — Q8/Paro were gapped in MULTIPLE GEMV variants: o_proj used Residual,
+/// then the FFN/qkv used Prerotated (the second panic domino). Lock every variant
+/// these dtypes are actually dispatched through.
+#[test]
+fn q8_and_paro_dispatchable_in_all_used_variants() {
+    for d in [Q8_0, ParoQ4G128] {
+        assert!(
+            KernelKey::for_gemv(d, GemvVariant::Plain, false).is_ok(),
+            "{:?}: plain GEMV missing (lm_head / direct GEMV panics)", d
+        );
+        assert!(
+            KernelKey::for_gemv_prerotated(d).is_ok(),
+            "{:?}: prerotated GEMV missing (FFN / qkv prerotated path panics)", d
+        );
+        assert!(
+            has_dispatch_plan(Role::Residual, d),
+            "{:?}: residual GEMV has no plan (o_proj panics)", d
+        );
+    }
 }

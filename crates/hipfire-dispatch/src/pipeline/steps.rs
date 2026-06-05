@@ -240,18 +240,38 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         }
         Step::GemvResidual { w, input: GemvInput::Raw(x), residual, out: _ } => {
             let gemv = GEMV.get_or_init(GemvFamily::new);
-            if crate::types::dtype_rotation_plan(w.dtype) != RotationPlan::None {
-                let h = gemv.rotate(ctx, gpu, w, x, &RotateInputs::default())?;
-                let xr = h.into_buf();
-                gemv.run(ctx, gpu, &GemvParams {
-                    w, x: &xr, y: residual, variant: GemvVariant::WithResidual,
-                    residual: None, gate: None, up: None,
-                })
+            // Dtypes with a fused `gemv_*_residual` kernel use it in one launch.
+            // Dtypes without one (Q8_0, ParoQ4G128, …) fall back to plain GEMV into
+            // a scratch temp + `residual += tmp` — the same two-launch path the
+            // legacy `weight_gemv_residual` `_` arm uses. Plain GEMV applies this
+            // dtype's own rotation (FWHT / Givens) internally, so this is correct
+            // for both no-rotation (Q8) and Givens (Paro) dtypes.
+            if KernelKey::for_gemv_residual(w.dtype).is_ok() {
+                if crate::types::dtype_rotation_plan(w.dtype) != RotationPlan::None {
+                    let h = gemv.rotate(ctx, gpu, w, x, &RotateInputs::default())?;
+                    let xr = h.into_buf();
+                    gemv.run(ctx, gpu, &GemvParams {
+                        w, x: &xr, y: residual, variant: GemvVariant::WithResidual,
+                        residual: None, gate: None, up: None,
+                    })
+                } else {
+                    gemv.run(ctx, gpu, &GemvParams {
+                        w, x, y: residual, variant: GemvVariant::WithResidual,
+                        residual: None, gate: None, up: None,
+                    })
+                }
             } else {
+                let tmp = gpu.alloc_tensor(&[w.m], DType::F32)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 gemv.run(ctx, gpu, &GemvParams {
-                    w, x, y: residual, variant: GemvVariant::WithResidual,
+                    w, x, y: &tmp, variant: GemvVariant::Plain,
                     residual: None, gate: None, up: None,
-                })
+                })?;
+                gpu.add_inplace_f32(residual, &tmp)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                gpu.free_tensor(tmp)
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                Ok(())
             }
         }
         Step::RmsnormAutomatic { x, norm_weight, x_plain, out, awq_scale, k, eps, rotation } => {
