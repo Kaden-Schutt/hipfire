@@ -65,8 +65,8 @@ impl SafetensorsFile {
         let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
         let header_json = std::str::from_utf8(&mmap[8..8 + header_len])
             .expect("safetensors header is not valid utf8");
-        let raw: serde_json::Value = serde_json::from_str(header_json)
-            .expect("safetensors header JSON parse failed");
+        let raw: serde_json::Value =
+            serde_json::from_str(header_json).expect("safetensors header JSON parse failed");
         let mut tensors = HashMap::new();
         if let serde_json::Value::Object(map) = raw {
             for (k, v) in map {
@@ -189,13 +189,15 @@ fn f32_slice_to_f32_bytes(f32_data: &[f32]) -> Vec<u8> {
     out
 }
 
-// ─── FWHT + MQ4 quantization ──────────────────────────────────────────────
+// ─── FWHT + MQ quantization ───────────────────────────────────────────────
 
 /// CPU-side FWHT on a 256-element group. Matches the GPU-side
 /// fwht_forward_256 in rdna_compute: signs1 → butterfly → scale → signs2.
 fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     assert!(x.len() == 256);
-    for i in 0..256 { x[i] *= signs1[i]; }
+    for i in 0..256 {
+        x[i] *= signs1[i];
+    }
     let mut stride = 1;
     while stride < 256 {
         let mut i = 0;
@@ -211,17 +213,25 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
         stride <<= 1;
     }
     let scale = 0.0625; // 1/sqrt(256) = 1/16
-    for i in 0..256 { x[i] *= scale * signs2[i]; }
+    for i in 0..256 {
+        x[i] *= scale * signs2[i];
+    }
 }
 
 /// Generate FWHT sign table matching the engine's gen_fwht_signs.
 /// Standard MQ4 seeds are 42 (signs1) and 1042 (signs2).
 fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     let mut state = seed;
-    (0..n).map(|_| {
-        state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-        if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
-    }).collect()
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+            if (state >> 16) & 1 == 1 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
+        })
+        .collect()
 }
 
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
@@ -311,6 +321,50 @@ fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     output
 }
 
+/// MagnumQuant MQ6-G256: FWHT-rotated 6-bit quantization.
+/// 200 bytes per 256 weights (0.781 B/w). Same binary layout as HFQ6-G256.
+fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 200;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+
+        let mut group = [0.0f32; 256];
+        let actual_len = end - start;
+        group[..actual_len].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 63.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+
+        for i in (0..256).step_by(4) {
+            let q0 = (((group[i] - min_val) * inv_scale + 0.5) as u8).min(63);
+            let q1 = (((group[i + 1] - min_val) * inv_scale + 0.5) as u8).min(63);
+            let q2 = (((group[i + 2] - min_val) * inv_scale + 0.5) as u8).min(63);
+            let q3 = (((group[i + 3] - min_val) * inv_scale + 0.5) as u8).min(63);
+
+            let byte_off = 8 + (i / 4) * 3;
+            output[out_off + byte_off] = q0 | (q1 << 6);
+            output[out_off + byte_off + 1] = (q1 >> 2) | (q2 << 4);
+            output[out_off + byte_off + 2] = (q2 >> 4) | (q3 << 2);
+        }
+    }
+
+    output
+}
+
 // ─── HFQ File Format ──────────────────────────────────────────────────────
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
@@ -325,6 +379,7 @@ enum QuantType {
     F16 = 1,
     F32 = 2,
     MQ4G256 = 13,
+    MQ6G256 = 15,
     MQ3G256 = 17,
 }
 
@@ -412,9 +467,8 @@ fn resolve_model_path(input: &str) -> String {
             let org = parts[0];
             let name = parts[1];
             let home = std::env::var("HOME").unwrap_or_default();
-            let cache_root = format!(
-                "{home}/.cache/huggingface/hub/models--{org}--{name}/snapshots"
-            );
+            let cache_root =
+                format!("{home}/.cache/huggingface/hub/models--{org}--{name}/snapshots");
             if let Ok(entries) = std::fs::read_dir(&cache_root) {
                 for e in entries.flatten() {
                     let p = e.path();
@@ -444,11 +498,7 @@ fn is_norm_tensor(name: &str) -> bool {
 
 fn parse_int_array(json: &serde_json::Value) -> Vec<i64> {
     json.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_i64())
-                .collect()
-        })
+        .map(|a| a.iter().filter_map(|v| v.as_i64()).collect())
         .unwrap_or_default()
 }
 
@@ -460,6 +510,7 @@ fn main() {
     let mut output_path: Option<String> = None;
     let mut keep_f32 = false;
     let mut use_mq4 = false;
+    let mut use_mq6 = false;
     let mut use_mq3 = false;
 
     let mut i = 1;
@@ -481,13 +532,17 @@ fn main() {
                 use_mq4 = true;
                 i += 1;
             }
+            "--mq6" => {
+                use_mq6 = true;
+                i += 1;
+            }
             "--mq3" => {
                 use_mq3 = true;
                 i += 1;
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq4 | --mq3]"
+                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq3 | --mq4 | --mq6]"
                 );
                 std::process::exit(0);
             }
@@ -497,9 +552,9 @@ fn main() {
             }
         }
     }
-    let n_format_flags = (keep_f32 as u8) + (use_mq4 as u8) + (use_mq3 as u8);
+    let n_format_flags = (keep_f32 as u8) + (use_mq3 as u8) + (use_mq4 as u8) + (use_mq6 as u8);
     if n_format_flags > 1 {
-        eprintln!("--keep-f32, --mq4, and --mq3 are mutually exclusive");
+        eprintln!("--keep-f32, --mq3, --mq4, and --mq6 are mutually exclusive");
         std::process::exit(1);
     }
 
@@ -514,10 +569,12 @@ fn main() {
     eprintln!("  output: {}", output_path.display());
     let dtype_desc = if keep_f32 {
         "F32"
-    } else if use_mq4 {
-        "MQ4-G256 (weights), F32 (norms)"
     } else if use_mq3 {
         "MQ3-G256 (weights), F32 (norms)"
+    } else if use_mq4 {
+        "MQ4-G256 (weights), F32 (norms)"
+    } else if use_mq6 {
+        "MQ6-G256 (weights), F32 (norms)"
     } else {
         "F16 (weights), F32 (norms)"
     };
@@ -596,13 +653,31 @@ fn main() {
     );
 
     // Metadata JSON for the HFQ file.
-    let draft_dtype = if keep_f32 { "f32" } else if use_mq4 { "mq4" } else if use_mq3 { "mq3" } else { "f16" };
-    // FWHT sign tables for MQ4 rotation. Seeds 42/1042 match the engine's
+    let draft_dtype = if keep_f32 {
+        "f32"
+    } else if use_mq3 {
+        "mq3"
+    } else if use_mq4 {
+        "mq4"
+    } else if use_mq6 {
+        "mq6"
+    } else {
+        "f16"
+    };
+    // FWHT sign tables for MQ rotation. Seeds 42/1042 match the engine's
     // `rdna_compute::Gpu::ensure_mq_signs()` so quantized weights here can
     // be dequantized/used correctly on GPU at inference.
-    let needs_fwht = use_mq4 || use_mq3;
-    let signs1: Vec<f32> = if needs_fwht { gen_fwht_signs(42, 256) } else { Vec::new() };
-    let signs2: Vec<f32> = if needs_fwht { gen_fwht_signs(1042, 256) } else { Vec::new() };
+    let needs_fwht = use_mq3 || use_mq4 || use_mq6;
+    let signs1: Vec<f32> = if needs_fwht {
+        gen_fwht_signs(42, 256)
+    } else {
+        Vec::new()
+    };
+    let signs2: Vec<f32> = if needs_fwht {
+        gen_fwht_signs(1042, 256)
+    } else {
+        Vec::new()
+    };
     let metadata = serde_json::json!({
         "architecture": "dflash",
         "config": config,
@@ -632,7 +707,10 @@ fn main() {
         .inspect(|p| eprintln!("  loading: {}", p.display()))
         .map(|p| SafetensorsFile::open(p).expect("safetensors open failed"))
         .collect();
-    assert!(!st_files.is_empty(), "no .safetensors files found in input dir");
+    assert!(
+        !st_files.is_empty(),
+        "no .safetensors files found in input dir"
+    );
 
     let mut name_to_file: Vec<(String, usize)> = Vec::new();
     for (fi, st) in st_files.iter().enumerate() {
@@ -648,7 +726,9 @@ fn main() {
     let mut total_bytes_out = 0usize;
 
     for (name, fi) in &name_to_file {
-        let (meta, raw) = st_files[*fi].tensor_data(name).expect("tensor lookup failed");
+        let (meta, raw) = st_files[*fi]
+            .tensor_data(name)
+            .expect("tensor lookup failed");
         let n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
 
@@ -657,9 +737,9 @@ fn main() {
         // Classification rules:
         //   norms → always F32 (small, precision-critical).
         //   other (projections) → F32 if --keep-f32,
-        //                         MQ4-G256 if --mq4 (and innermost ≥ 256 divisible),
+        //                         MQ{3,4,6}-G256 if requested (and N ≥ 256),
         //                         else F16.
-        // MQ4 divisibility: quantize_mq4g256 pads the final partial group with
+        // MQ divisibility: quantizers pad the final partial group with
         // zeros. That's safe for weights since the padded lanes are never read
         // at inference. We still require N ≥ 256 to ensure a full first group
         // (per-group scale/min carries meaning).
@@ -670,6 +750,9 @@ fn main() {
         } else if use_mq4 && n_elements >= 256 {
             let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ4G256, 256u32, q)
+        } else if use_mq6 && n_elements >= 256 {
+            let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+            (QuantType::MQ6G256, 256u32, q)
         } else if use_mq3 && n_elements >= 256 {
             let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ3G256, 256u32, q)
@@ -692,7 +775,10 @@ fn main() {
         total_params as f64 / 1e9,
         hfq_tensors.len()
     );
-    eprintln!("  total out  : {:.2} MiB", total_bytes_out as f64 / (1024.0 * 1024.0));
+    eprintln!(
+        "  total out  : {:.2} MiB",
+        total_bytes_out as f64 / (1024.0 * 1024.0)
+    );
 
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
