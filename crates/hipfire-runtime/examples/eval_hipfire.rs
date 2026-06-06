@@ -306,7 +306,21 @@ fn main() {
     // per chunk leaks ~6 MB × n_la_layers/chunk because DeltaNetState has no
     // Drop impl (only an explicit free_gpu) — OOM'd at ~chunk 1013/1175 in a
     // prior gfx1100 run with 21.5 GB VRAM.
-    let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+    // Candidate DeltaNet state quant selector (for the native-KLD state-quant
+    // A/B). Default Q8; HIPFIRE_EVAL_STATE_QUANT=fp32|q4 overrides. Q8 + EF is
+    // selected by HIPFIRE_DN_STATE_EF=1 (error-feedback rides inside Q8's
+    // new_with_quant). The reference (--ref) is the fixed fp32 oracle.
+    let cand_sq = match std::env::var("HIPFIRE_EVAL_STATE_QUANT").ok().as_deref() {
+        Some("fp32") => qwen35::StateQuant::FP32,
+        Some("q4") => qwen35::StateQuant::Q4,
+        _ => qwen35::StateQuant::Q8,
+    };
+    eprintln!(
+        "candidate DN state quant: {:?}  EF={}",
+        cand_sq,
+        std::env::var("HIPFIRE_DN_STATE_EF").ok().filter(|v| v != "0").is_some()
+    );
+    let mut dn_state = DeltaNetState::new_with_quant(&mut gpu, &config, cand_sq).unwrap();
 
     // Hidden-state capture buffer for prefill mode. forward_prefill_batch
     // with per_token_hidden_out=Some(buf) writes one row per scored token
