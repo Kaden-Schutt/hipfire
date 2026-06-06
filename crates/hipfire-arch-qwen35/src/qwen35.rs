@@ -9312,325 +9312,56 @@ fn forward_prefill_chunk(
                     kv_cache.compact_offset as i32,
                 )?;
 
-                // 6. Batched KV cache writes (per-row positions).
-                if kv_cache.quant_asym4 {
-                    let ct = givens_cos_view!().unwrap();
-                    let st = givens_sin_view!().unwrap();
-                    if kv_cache.quant_fwht {
-                        gpu.kv_cache_write_fwht4_batched(
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &pbs.fa_k_batch,
-                            &pbs.fa_v_batch,
-                            &pbs.positions,
-                            ct,
-                            st,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            n,
-                            kv_cache.v_mode_bits(),
-                        )?;
-                    } else {
-                        gpu.kv_cache_write_asym4_batched(
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &pbs.fa_k_batch,
-                            &pbs.fa_v_batch,
-                            &pbs.positions,
-                            ct,
-                            st,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            n,
-                        )?;
-                    }
-                } else if kv_cache.quant_asym3 {
-                    let ct = givens_cos_view!().unwrap();
-                    let st = givens_sin_view!().unwrap();
-                    if kv_cache.quant_fwht {
-                        gpu.kv_cache_write_fwht3_batched(
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &pbs.fa_k_batch,
-                            &pbs.fa_v_batch,
-                            &pbs.positions,
-                            ct,
-                            st,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            n,
-                            kv_cache.v_mode_bits(),
-                        )?;
-                    } else {
-                        gpu.kv_cache_write_asym3_batched(
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &pbs.fa_k_batch,
-                            &pbs.fa_v_batch,
-                            &pbs.positions,
-                            ct,
-                            st,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            n,
-                        )?;
-                    }
-                } else if kv_cache.quant_asym2 {
-                    let ct = givens_cos_view!().unwrap();
-                    let st = givens_sin_view!().unwrap();
-                    if kv_cache.quant_fwht {
-                        gpu.kv_cache_write_fwht2_batched(
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &pbs.fa_k_batch,
-                            &pbs.fa_v_batch,
-                            &pbs.positions,
-                            ct,
-                            st,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            n,
-                            kv_cache.v_mode_bits(),
-                        )?;
-                    } else {
-                        gpu.kv_cache_write_asym2_batched(
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &pbs.fa_k_batch,
-                            &pbs.fa_v_batch,
-                            &pbs.positions,
-                            ct,
-                            st,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            n,
-                        )?;
-                    }
-                } else {
-                    gpu.kv_cache_write_q8_0_batched(
-                        &kv_cache.k_gpu[layer_idx],
-                        &pbs.fa_k_batch,
-                        &pbs.positions,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        n,
-                    )?;
-                    gpu.kv_cache_write_q8_0_batched(
-                        &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_v_batch,
-                        &pbs.positions,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        n,
-                    )?;
-                }
-
-                // 7. Batched causal attention (or tree-attention if tree_verify is set).
-                // asym{4,3,2}: batched flash (K rotated-quantized + V Q8 in normal space).
-                // Q8: batched kernel unless ctx > 15K (LDS overflow), then per-position flash.
-                //
-                // Tree-verify mode: `block_start = start_pos`, `block_cols = n`.
-                // The bias buffer is `[n × n]`; each query row applies its
-                // corresponding bias row to in-block keys. Long-context Q8
-                // tiled fallback isn't supported in tree mode (we caught
-                // that as an assert above — tree blocks are small).
-                const LDS_CTX_LIMIT: usize = 15000;
-                let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
+                // 6–7. Batched KV write + flash attention (via dispatch).
+                let is_tree = tree_verify.is_some();
                 let (block_start, block_cols) = match tree_verify.as_ref() {
                     Some(_) => (start_pos, n),
                     None => (0, 0),
                 };
-                if kv_cache.quant_asym4 {
-                    let ct = givens_cos_view!().unwrap();
-                    let st = givens_sin_view!().unwrap();
-                    if kv_cache.quant_fwht {
-                        gpu.attention_flash_fwht4_batched_masked(
-                            &pbs.fa_q_batch,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &pbs.fa_attn_out_batch,
-                            &pbs.positions,
-                            ct,
-                            st,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                            max_ctx_len,
-                            n,
-                            &s.flash_partials,
-                            tree_bias,
-                            block_start,
-                            block_cols,
-                            kv_cache.v_mode_bits(),
-                        )?;
-                    } else {
-                        gpu.attention_flash_asym4_batched_masked(
-                            &pbs.fa_q_batch,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &pbs.fa_attn_out_batch,
-                            &pbs.positions,
-                            ct,
-                            st,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                            max_ctx_len,
-                            n,
-                            &s.flash_partials,
-                            tree_bias,
-                            block_start,
-                            block_cols,
-                        )?;
-                    }
-                } else if kv_cache.quant_asym3 {
-                    let ct = givens_cos_view!().unwrap();
-                    let st = givens_sin_view!().unwrap();
-                    if kv_cache.quant_fwht {
-                        gpu.attention_flash_fwht3_batched_masked(
-                            &pbs.fa_q_batch,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &pbs.fa_attn_out_batch,
-                            &pbs.positions,
-                            ct,
-                            st,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                            max_ctx_len,
-                            n,
-                            &s.flash_partials,
-                            tree_bias,
-                            block_start,
-                            block_cols,
-                            kv_cache.v_mode_bits(),
-                        )?;
-                    } else {
-                        gpu.attention_flash_asym3_batched_masked(
-                            &pbs.fa_q_batch,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &pbs.fa_attn_out_batch,
-                            &pbs.positions,
-                            ct,
-                            st,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                            max_ctx_len,
-                            n,
-                            &s.flash_partials,
-                            tree_bias,
-                            block_start,
-                            block_cols,
-                        )?;
-                    }
-                } else if kv_cache.quant_asym2 {
-                    assert!(
-                        tree_verify.is_none(),
-                        "tree-verify mode not supported on asym2 KV (use asym3)",
-                    );
-                    let ct = givens_cos_view!().unwrap();
-                    let st = givens_sin_view!().unwrap();
-                    if kv_cache.quant_fwht {
-                        gpu.attention_flash_fwht2_batched(
-                            &pbs.fa_q_batch,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &pbs.fa_attn_out_batch,
-                            &pbs.positions,
-                            ct,
-                            st,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                            max_ctx_len,
-                            n,
-                            &s.flash_partials,
-                            kv_cache.v_mode_bits(),
-                        )?;
-                    } else {
-                        gpu.attention_flash_asym2_batched(
-                            &pbs.fa_q_batch,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &pbs.fa_attn_out_batch,
-                            &pbs.positions,
-                            ct,
-                            st,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                            max_ctx_len,
-                            n,
-                            &s.flash_partials,
-                        )?;
-                    }
-                } else if max_ctx_len > LDS_CTX_LIMIT {
-                    assert!(
-                        tree_verify.is_none(),
-                        "tree-verify mode hits the long-context Q8 fallback \
-                         at max_ctx_len={} > {}; tree blocks should stay small",
-                        max_ctx_len,
-                        LDS_CTX_LIMIT,
-                    );
-                    // Per-position flash Q8 attention for long-context prefill.
-                    //
-                    // `pbs.positions` is raw i32 bits in an F32 slot
-                    // (slot-cosmetic, see PrefillBatchScratch::new).
-                    // `download_f32` would reinterpret those bytes as floats —
-                    // i32 15000 = 0x3A98 round-trips through f32 as ~1e-3
-                    // subnormal, which casts to 0. Reconstruct from
-                    // start_pos + b directly; the buffer is always linear.
-                    let q_dim = config.n_heads * config.head_dim;
-                    let pos_buf_tmp = gpu.hip.malloc(4)?;
-                    for b in 0..n {
-                        let pos_b = start_pos + b;
-                        let seq_len_b = pos_b + 1;
-                        let pos_i32 = pos_b as i32;
-                        gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
-                        let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
-                        let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
-                        gpu.attention_flash_q8_0(
-                            &q_b,
-                            &kv_cache.k_gpu[layer_idx],
-                            &kv_cache.v_gpu[layer_idx],
-                            &out_b,
-                            &pos_buf_tmp,
-                            seq_len_b,
-                            config.n_heads,
-                            config.n_kv_heads,
-                            config.head_dim,
-                            kv_cache.physical_cap,
-                            &s.flash_partials,
-                        )?;
-                    }
-                    let _ = gpu.hip.free(pos_buf_tmp);
-                } else {
-                    gpu.attention_q8_0_kv_batched_masked(
-                        &pbs.fa_q_batch,
-                        &kv_cache.k_gpu[layer_idx],
-                        &kv_cache.v_gpu[layer_idx],
-                        &pbs.fa_attn_out_batch,
-                        &pbs.positions,
-                        config.n_heads,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_cache.physical_cap,
-                        max_ctx_len,
-                        n,
-                        tree_bias,
-                        block_start,
-                        block_cols,
-                    )?;
-                }
+                let tree_bias = tree_verify.as_ref().map(|c| c.attn_bias);
+                let plan = KvTierPlan::derive(KvTierInputs {
+                    quant_asym4: kv_cache.quant_asym4,
+                    quant_asym3: kv_cache.quant_asym3,
+                    quant_asym2: kv_cache.quant_asym2,
+                    quant_q8: kv_cache.quant_q8,
+                    quant_fwht: kv_cache.quant_fwht,
+                    v_mode_bits: kv_cache.v_mode_bits(),
+                    pos: start_pos,
+                    flash_mode: s.flash_mode as usize,
+                    capture_mode: gpu.graphs.capture_mode,
+                    batch_size: n,
+                    is_tree,
+                    is_boundary: false,
+                }).map_err(|e| HipError::new(0, &e.to_string()))?;
+                let io = AttnParams {
+                    q: &pbs.fa_q_batch,
+                    k: &pbs.fa_k_batch,
+                    v: &pbs.fa_v_batch,
+                    k_cache: &kv_cache.k_gpu[layer_idx],
+                    v_cache: &kv_cache.v_gpu[layer_idx],
+                    k_scales: None,
+                    v_scales: None,
+                    pos_buf: &s.pos_buf,
+                    pos: start_pos,
+                    positions: Some(&pbs.positions),
+                    n_heads: config.n_heads,
+                    n_kv_heads: config.n_kv_heads,
+                    head_dim: config.head_dim,
+                    physical_cap: kv_cache.physical_cap,
+                    batch_size: n,
+                    max_ctx_len,
+                    flash_partials: Some(&s.flash_partials),
+                    givens_cos: kv_cache.givens_cos.as_ref(),
+                    givens_sin: kv_cache.givens_sin.as_ref(),
+                    tree_bias,
+                    block_start,
+                    block_cols,
+                    output: &pbs.fa_attn_out_batch,
+                };
+                let ctx = DispatchCtx::new(gpu);
+                execute_steps(gpu, &ctx, &[
+                    Step::Attend { plan, io },
+                ]).map_err(|e| HipError::new(0, &e.to_string()))?;
 
                 // 8. Fused sigmoid(gate) * attn_out, element-wise over the
                 // full [N × q_dim] tensor.
