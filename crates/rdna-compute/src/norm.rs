@@ -1598,6 +1598,163 @@ impl Gpu {
         result
     }
 
+    /// FP32 tree-aware GDN recurrence — full-precision counterpart of
+    /// `gated_delta_net_q8_tree_batch_seq`. No scales tape and no per-token
+    /// dequant/requant: `s_f32_init` (pre-block snapshot) and `s_tape_f32`
+    /// (per-node tape) are plain f32. Used by the FP32 `StateQuant`
+    /// spec-decode tree-verify path.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_f32_tree_batch_seq(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_f32_init: &GpuTensor,
+        s_tape_f32: &GpuTensor,
+        parent_indices: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gated_delta_net_f32_tree",
+            kernels::GATED_DELTA_NET_F32_TREE_SRC,
+            "gated_delta_net_f32_tree",
+        )?;
+
+        let n_tiles = (128 / 4) as u32;
+
+        let mut qp = q_batch.buf.as_ptr();
+        let mut kp = k_batch.buf.as_ptr();
+        let mut vp = v_batch.buf.as_ptr();
+        let mut gp = gate_batch.buf.as_ptr();
+        let mut bp = beta_batch.buf.as_ptr();
+        let mut sip = s_f32_init.buf.as_ptr();
+        let mut stp = s_tape_f32.buf.as_ptr();
+        let mut pp = parent_indices.buf.as_ptr();
+        let mut op = output_batch.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp  as *mut _ as *mut c_void,
+            &mut kp  as *mut _ as *mut c_void,
+            &mut vp  as *mut _ as *mut c_void,
+            &mut gp  as *mut _ as *mut c_void,
+            &mut bp  as *mut _ as *mut c_void,
+            &mut sip as *mut _ as *mut c_void,
+            &mut stp as *mut _ as *mut c_void,
+            &mut pp  as *mut _ as *mut c_void,
+            &mut op  as *mut _ as *mut c_void,
+            &mut nt  as *mut _ as *mut c_void,
+            &mut nh  as *mut _ as *mut c_void,
+            &mut hd  as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "deltanet", "gated_delta_net_f32_tree_batch_seq", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_f32_tree",
+            [n_heads as u32, n_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_ptr(gp); b.push_ptr(bp);
+                b.push_ptr(sip);
+                b.push_ptr(stp);
+                b.push_ptr(pp); b.push_ptr(op);
+                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Batched-sequential FP32 GDN recurrence — full-precision, same 32×32-tile
+    /// parallelism as `gated_delta_net_q8_batch_seq`. Use on the FP32
+    /// `StateQuant` batched prefill/verify path instead of the slow
+    /// 128-thread single-token `gated_delta_net`. State advanced in place.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_f32_batch_seq(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_f32: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gated_delta_net_f32_batch_seq",
+            kernels::GATED_DELTA_NET_F32_BATCH_SEQ_SRC,
+            "gated_delta_net_f32_batch_seq",
+        )?;
+
+        let n_tiles = (128 / 4) as u32;
+
+        let mut qp = q_batch.buf.as_ptr();
+        let mut kp = k_batch.buf.as_ptr();
+        let mut vp = v_batch.buf.as_ptr();
+        let mut gp = gate_batch.buf.as_ptr();
+        let mut bp = beta_batch.buf.as_ptr();
+        let mut sp = s_f32.buf.as_ptr();
+        let mut op = output_batch.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "deltanet", "gated_delta_net_f32_batch_seq", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_f32_batch_seq",
+            [n_heads as u32, n_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_ptr(gp); b.push_ptr(bp);
+                b.push_ptr(sp); b.push_ptr(op);
+                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// GDN recurrence with Q4-quantized S state.
     #[cfg(feature = "deltanet")]
     pub fn gated_delta_net_q4(

@@ -2914,6 +2914,21 @@ pub const GATED_DELTA_NET_Q8_SRC: &str =
 pub const GATED_DELTA_NET_Q8_TREE_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_q8_tree.hip");
 
+/// FP32 tree-aware GDN recurrence — full-precision counterpart of
+/// GATED_DELTA_NET_Q8_TREE_SRC (no per-token dequant/requant or scales).
+/// Used by the FP32 `StateQuant` spec-decode tree-verify path.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F32_TREE_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f32_tree.hip");
+
+/// Batched-sequential FP32 GDN recurrence — full-precision counterpart of
+/// the Q8 batch kernel (GATED_DELTA_NET_Q8_SRC), with the same 32×32-tile
+/// parallelism. Replaces the slow 128-thread single-token `gated_delta_net`
+/// on the FP32 `StateQuant` batched prefill/verify path.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F32_BATCH_SEQ_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f32_batch_seq.hip");
+
 /// GDN recurrence with Q4-quantized S state in VRAM.
 /// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
 /// Symmetric 4-bit: values -8..+7, scale = absmax/7. Per-row scale.
