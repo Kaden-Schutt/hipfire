@@ -987,3 +987,35 @@ fn moe_prefill_resolution_paro_i8_opt_out() {
     assert!(!r.use_paro_i8, "moe_paro_i8=0 should disable i8");
     assert!(!r.use_paro_i8_k8);
 }
+
+#[test]
+fn moe_prefill_resolution_mq6_gfx11_falls_back_to_path1() {
+    let arch = crate::context::DispatchCtx::for_test("gfx1100");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
+    assert!(!r.use_path2, "MQ6 on gfx11 should NOT use Path 2 (grouped WMMA is gfx12-only)");
+    assert!(!r.down_path0, "gfx11 is not Path 0");
+}
+
+#[test]
+fn moe_prefill_resolution_mq6_gfx1151_falls_back_to_path1() {
+    let arch = crate::context::DispatchCtx::for_test("gfx1151");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
+    assert!(!r.use_path2, "MQ6 on gfx1151 should NOT use Path 2 (grouped WMMA is gfx12-only)");
+    assert!(!r.down_path0);
+}
+
+#[test]
+fn moe_prefill_resolution_mq6_gfx12_uses_path2() {
+    let arch = crate::context::DispatchCtx::for_test("gfx1200");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
+    assert!(r.use_path2, "MQ6 on gfx12 should use Path 2 (grouped WMMA available)");
+    assert!(!r.down_path0);
+}
+
+#[test]
+fn moe_prefill_resolution_mq4_gfx11_still_path2() {
+    let arch = crate::context::DispatchCtx::for_test("gfx1100");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
+    assert!(r.use_path2, "MQ4 on gfx11 should still use Path 2");
+}
+

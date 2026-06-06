@@ -369,6 +369,13 @@ impl MoePrefillResolution {
     ) -> Self {
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
         let use_path2 = flags.moe_grouped_gemm && arch.has_wmma();
+        // MQ6 grouped-WMMA (`gemm_hfq6g256_moe_grouped_wmma`) is gfx12-only
+        // (no gfx11 variant yet). Fall back to Path 1 (indexed batched GEMV)
+        // on gfx11 to avoid the gfx12-only kernel panic. Path 1 MQ6 indexed
+        // kernels exist on all WMMA archs.
+        let mq6_on_non_gfx12 = d.routed_gate_up == DType::MQ6G256
+            && !(arch.is_gfx1200() || arch.is_gfx1201());
+        let use_path2 = use_path2 && !mq6_on_non_gfx12;
         // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
         // atomics make the atomic GEMV pattern competitive vs expanded scratch.
         let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();

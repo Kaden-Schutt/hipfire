@@ -212,6 +212,29 @@ trigger list — incremental builds could go stale when only dispatch code chang
 **Symptom:** A3B MoE model produced gibberish output after struct layout changes
 until a `cargo clean` + rebuild was performed.
 
+### SF-4.2.1 · HIGH — MQ6 grouped-WMMA kernel for gfx11
+
+`gemm_hfq6g256_moe_grouped_wmma` exists for gfx12 only. On gfx11/gfx1151,
+MQ6 MoE batched prefill falls back to Path 1 (indexed batched GEMV) via
+`MoePrefillResolution` guard. The gfx11 variant of this kernel needs to be
+implemented to unlock Path 2 for MQ6 A3B models on RDNA3/RDNA3.5.
+
+**Action:** Port the gfx12 MQ6 grouped-WMMA kernel to gfx11 (WMMA wave32
+builtin port — follow `gemm_hfq4g256_moe_grouped_wmma_k2` as template).
+**Assignee: Kaden.**
+
+### SF-4.2.2 · HIGH — gfx1201 verification for MQ6 grouped prefill
+
+`qwen3.6-35b-a3b.mq4` has MQ6 FFN weights. The MQ6 grouped-WMMA path (Path 2)
+was never exercised in batched prefill because `mq6_batched_admit_enabled_from_env`
+defaults false on gfx11. On gfx12 it defaults true — but no gfx12 hardware has
+validated this path end-to-end.
+
+**Action:** Run `HIPFIRE_MOE_MQ6_ADMIT=1` + `coherence-gate.sh --full` on gfx1201
+with the A3B model. Verify byte-parity vs gfx1151 Path 1 (indexed batched GEMV).
+**Assignee: Kaden** (has gfx1201 hardware).
+**Blocks:** Phase 0.6 sign-off for MQ6 MoE prefill.
+
 ### SF-4.1.5 · LOW — batch_size guard unit test (GPU-gated)
 
 The `batch_size != 1` runtime guard in `run_moe_decode` is not unit-testable

@@ -32,17 +32,21 @@ Ship 4.2: qwen35 grouped-GEMM MoE prefill → `MoeFamily::run_prefill` (Step 8)
 
 **Root cause**: Model has **MQ6G256** FFN weights (shared_expert.gate/up/down, experts.gate_up/down), not MQ4. Filename `.mq4` = attention weights only. `moe_ffn_batched_admissible` strict-MQ4 rejects MQ6; `admit_mq6` defaults false on gfx1151. **Correctly so**: `gemm_hfq6g256_moe_grouped_wmma` panics: `gfx12-only kernel (current arch = gfx1151)`.
 
-**Ship 4.2 gap**: `MoePrefillResolution` selects Path 2 for MQ6 on gfx11 (`arch.has_wmma()=true`). Should fall back to Path 1 (indexed batched GEMV) when MQ6 grouped kernel unavailable. Path 1 MQ6 kernels DO exist (`gemv_hfq6g256_moe_gate_up_k8_indexed_batched` etc.).
+**Ship 4.2 gap — FIXED**: `MoePrefillResolution::resolve` now forces Path 1 for MQ6 on non-gfx12 archs (`mq6_on_non_gfx12` guard). Path 1 MQ6 kernels exist and are validated.
+
+**Fix commit** (2026-06-06): 4 new GPU-free tests, resolution guard, dispatch_todo.md entries for gfx11 kernel + gfx1201 verification.
 
 ## A3B prefill perf (gfx1151, qwen3.6-35b-a3b.mq4)
 
 | Prefill | Tok/s | Path | Notes |
 |---|---|---|---|
-| 32 | 60.5 | Path 2 (default) | Includes JIT |
-| 32 | 60.5 | Path 1 (MOE_GROUPED_GEMM=0) | Includes JIT |
-| 64 | 41.2 | Path 2 | First run after load (fresh JIT) |
-| 128 | 59.0 | Path 2 | Includes JIT |
-| 256 | 57.0 | Path 2 | VERIFY_GRAPH=0 |
+| 32 | 60.5 | Per-token fallback (default) | MQ6 blocked by admit_mq6=false |
+| 32 | 60.5 | Path 1 (MOE_GROUPED_GEMM=0) | Per-token fallback |
+| 8 | **95.8** | **Path 1 batched (MQ6_ADMIT=1)** | **1.63× faster than per-token** |
+| 8 | 84.6–86.2 | Path 1 batched (determinism) | Two-run md5 identical |
+| 64 | 41.2 | Per-token | First run after load (fresh JIT) |
+| 128 | 59.0 | Per-token | Includes JIT |
+| 256 | 57.0 | Per-token | VERIFY_GRAPH=0 |
 
 ## Notes
 
