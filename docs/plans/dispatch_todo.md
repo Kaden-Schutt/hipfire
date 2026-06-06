@@ -129,3 +129,36 @@ The following Commit 3 verification items require a Paro model on GPU:
 - Multi path (forward_scratch_layers_multi) still works
 The infrastructure is in place and CPU-side tests pass; coworker will run
 the GPU verification and report results.
+
+---
+
+## From Ship 3.3 grounding (vision attention)
+
+### D-12 · dots-ocr vision attention has only an *unoptimized, likely-unvalidated* non-WMMA path
+**Source:** Ship 3.3 grounding (`dots_ocr.rs:1121-1158`)
+**Ship:** Out of dispatch-refactor scope — flagged for a vision-kernel follow-up
+**Status:** Investigated — a fallback **exists**; the defect is its quality/validation, not absence
+
+Original concern was "dots-ocr has no non-WMMA attention kernel." **Corrected by
+inspection:** the dispatch is arch-gated (`use_wmma = gpu.arch_caps.has_wmma_w32()`,
+`dots_ocr.rs:884`); on a non-WMMA arch (gfx906/CDNA, gfx1010/RDNA1, gfx1030/RDNA2)
+all `if use_wmma` branches are skipped and the `else` at `:1154` runs
+`attention_dflash_f32` — a genuine pure-scalar online-softmax kernel
+(`kernels/src/attention_dflash.hip`, **0 WMMA builtins**). So **non-WMMA archs do
+not crash**; they run scalar.
+
+The real (weaker) defect worth tracking:
+- The non-WMMA path is a **single unoptimized reference kernel** — the WMMA side has a
+  5-rung tuned ladder (v5/n128/m32/wmma_f32/+gfx12), the non-WMMA side has exactly one
+  naive scalar kernel. Vision OCR on CDNA/RDNA1/RDNA2 would be slow.
+- It is **almost certainly never correctness-validated on a non-WMMA arch** — the
+  dots-ocr E2E oracle (F1 1.000, 13/13 — `project_dots_ocr_e2e_validated_2026_05_21`)
+  ran only on WMMA archs (gfx1100/gfx1151). The scalar fallback's correctness at the
+  real vision shape (B = L = n_patches ≈ 20k, head_dim 128) is unverified.
+
+**Not** part of the 3.3 dispatch refactor (it's a kernel-coverage/validation gap, not a
+dispatch-surface gap). But 3.3 C2 **must** register `DflashScalar` as the `Always` floor
+of the `AttnFullF16` variant ladder, or non-WMMA archs would resolve to `MissingImpl`
+(a regression from today's working-but-slow scalar path). A proper fix is a tuned
+non-WMMA vision-attention kernel (dp4a on gfx906, scalar-ILP on RDNA1/2) + an E2E OCR
+run on a non-WMMA arch — out of scope here.
