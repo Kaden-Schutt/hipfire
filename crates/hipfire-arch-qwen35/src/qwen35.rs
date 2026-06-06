@@ -6360,6 +6360,13 @@ pub fn forward_prefill_batch_with_pbs_opts(
         arch,
         moe_router_logits_present,
     );
+    // F4 guard: reject batched prefill when KV tier has no batched keys.
+    // F32 KV has only BatchEq(1) → MissingImpl at resolve. asym2 + tree-verify
+    // has no _batched_masked variant → UnsupportedTreeTier. Force per-token
+    // fallback for these cases.
+    let kv_f32 = !kv_cache.quantized && !kv_cache.quant_q8 && !kv_cache.quant_hfq4;
+    let kv_asym2_tree = kv_cache.quant_asym2 && tree_verify.is_some();
+    let eligible = eligible && !kv_f32 && !kv_asym2_tree;
 
     if !eligible {
         assert!(
@@ -8098,6 +8105,7 @@ fn forward_prefill_chunk(
     // tree_verify.pre_rope_k_capture[]. Increments alongside each
     // FullAttention layer iteration regardless of MoE/non-MoE variant.
     let mut fa_layer_idx = band.map(|b| b.fa_layer_offset).unwrap_or(0);
+    let ctx = DispatchCtx::new(gpu);  // hoisted — arch-constant, safe to reuse per-layer
 
     for layer_idx in layer_start..layer_end {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
@@ -9360,7 +9368,6 @@ fn forward_prefill_chunk(
                     block_cols,
                     output: &pbs.fa_attn_out_batch,
                 };
-                let ctx = DispatchCtx::new(gpu);
                 execute_steps(gpu, &ctx, &[
                     Step::Attend { plan, io },
                 ]).map_err(|e| HipError::new(0, &e.to_string()))?;
@@ -10730,7 +10737,6 @@ fn forward_prefill_chunk(
                     block_cols,
                     output: &pbs.fa_attn_out_batch,
                 };
-                let ctx = DispatchCtx::new(gpu);
                 execute_steps(gpu, &ctx, &[
                     Step::Attend { plan, io },
                 ]).map_err(|e| HipError::new(0, &e.to_string()))?;
@@ -10886,7 +10892,6 @@ fn forward_prefill_chunk(
                 let last = n - 1;
                 let last_view = dst.sub_offset((offset_rows + last) * dim, dim);
                 {
-                    let ctx = DispatchCtx::new(gpu);
                     let wr = weights.output.dispatch_ref();
                     let step = Step::Gemv { w: &wr, input: GemvInput::Raw(&last_view), out: &s.logits };
                     execute_steps(gpu, &ctx, &[step])
@@ -10908,7 +10913,6 @@ fn forward_prefill_chunk(
             )?;
             gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
             {
-                let ctx = DispatchCtx::new(gpu);
                 let wr = weights.output.dispatch_ref();
                 let step = Step::Gemv { w: &wr, input: GemvInput::Raw(&s.tmp), out: &s.logits };
                 execute_steps(gpu, &ctx, &[step])
@@ -11122,7 +11126,6 @@ fn run_fa_layer_body(
 
     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
     {
-        let ctx = DispatchCtx::new(gpu);
         let wr = layer.wo.dispatch_ref();
         execute_steps(gpu, &ctx, &[Step::GemvResidual {
             w: &wr, input: GemvInput::Raw(&s.fa_attn_out), residual: &s.x, out: &s.x,
@@ -11557,8 +11560,7 @@ fn forward_scratch_layers(
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                let ctx = DispatchCtx::new(gpu);
-    kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
+                kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
 
                 gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                 {
@@ -11767,8 +11769,7 @@ fn forward_scratch_layers(
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                let ctx = DispatchCtx::new(gpu);
-    kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
+                kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
 
                 gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                 {

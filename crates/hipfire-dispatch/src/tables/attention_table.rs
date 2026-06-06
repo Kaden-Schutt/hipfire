@@ -118,7 +118,13 @@ pub fn populate(registry: &mut KernelRegistry) {
         // 2-bit tiers: _batched only (no _masked — tree-verify gap, 3.3)
         (KernelKey::AttnFlashAsym2Batched,     ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
         (KernelKey::AttnFlashAsym2FwhtBatched, ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
-        // Q8_0: P-1 no-LDS-cap tiled kernel (replaces old per-position fallback >15k)
+        // Q8_0: P-1 no-LDS-cap tiled kernel.
+        // NOTE(F2): This dispatches to the P-1 tiled kernel for ALL Q8 batched
+        // prefill, replacing the old single-pass LDS-staged softmax that was used
+        // for max_ctx_len ≤ 15000. Different reduction order → not byte-identical
+        // to master's ≤15k path. Numerically verified (NIAH 32k passed). Any
+        // regression investigation should compare against master's two-path Q8,
+        // not against this single-path kernel.
         (KernelKey::AttnQ8_0KvBatchedMasked,   ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
     ];
     for (key, arch, shape) in attn_batched {

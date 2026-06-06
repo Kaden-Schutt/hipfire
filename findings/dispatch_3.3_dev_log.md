@@ -86,3 +86,31 @@ name directly.
 ## Commit C5 · Verification sweep + env-gate retirement + cleanup
 
 ### Status: NOT STARTED
+
+### Status: DONE (826b143c)
+
+---
+
+## Post-C5 finding fixes
+
+### F-2: Q8 batched kernel swap documentation
+
+**Context:** Ship 3.2 unified Q8 batched prefill onto `AttnQ8_0KvBatchedMasked`,
+which dispatches to the P-1 tiled kernel (two-pass tile + online-softmax
+reduce). On master, Q8 batched used `attention_q8_0_kv_batched_masked`
+(single-pass LDS-staged softmax) for max_ctx_len ≤ 15000, and only
+switched to the tiled kernel past 15k.
+
+The dispatch migration eliminated the ≤15k path entirely — ALL Q8 batched
+prefill now goes through the P-1 tiled kernel. Different reduction order
+means the output is not byte-identical to master's ≤15k path.
+
+**Numerical verification:** NIAH 32k needle-in-haystack passed on gfx1151.
+No regression in coherence-gate or dflash-gate across C2–C5.
+
+**Action taken:** Added explicit NOTE(F2) comment at the registration in
+`attention_table.rs` documenting the algorithm swap and its implications.
+
+**Acceptance:** This is a deliberate numeric change gated on E2E task output,
+not byte-parity. Future regression investigations should compare against
+master's two-path Q8, not this single-path kernel.
