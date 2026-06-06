@@ -24,6 +24,7 @@ pub fn populate(registry: &mut KernelRegistry) {
             shape_gate: None,
             steps: &[PipelineOp::Gemv],
             has_awq: false,
+            tile: TileImpl::None,
         });
     }
 
@@ -41,6 +42,7 @@ pub fn populate(registry: &mut KernelRegistry) {
             shape_gate: None,
             steps: &[PipelineOp::Gemv],
             has_awq: false,
+            tile: TileImpl::None,
         });
     }
 
@@ -69,6 +71,7 @@ pub fn populate(registry: &mut KernelRegistry) {
             shape_gate: None,
             steps: &[PipelineOp::Gemv],
             has_awq: false,
+            tile: TileImpl::None,
         });
     }
 
@@ -83,6 +86,7 @@ pub fn populate(registry: &mut KernelRegistry) {
             shape_gate: None,
             steps: &[PipelineOp::Gemv],
             has_awq: false,
+            tile: TileImpl::None,
         });
     }
 
@@ -97,6 +101,7 @@ pub fn populate(registry: &mut KernelRegistry) {
             shape_gate: None,
             steps: &[PipelineOp::Gemv],
             has_awq: false,
+            tile: TileImpl::None,
         });
     }
 }

@@ -261,7 +261,7 @@ impl GemvFamily {
         gpu: &mut Gpu,
         params: &GemvParams,
     ) -> Result<(), DispatchError> {
-        let shape = ShapeInfo { batch_size: 1, head_dim: 0, m: params.w.m };
+        let shape = ShapeInfo { batch_size: 1, head_dim: 0, m: params.w.m, is_tree: false };
         match params.variant {
             GemvVariant::Plain => {
                 let key = self.resolve(params.w.dtype, params.variant, false, ctx, Some(&shape))?.key;

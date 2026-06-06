@@ -52,12 +52,30 @@ pub enum FusedQkvVariant {
     GateUpParo,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-pub enum AttentionVariant {
-    Decode,
-    Prefill,
-    FlashDecode,
-    FlashPrefill,
+/// Implementation discriminator for attention tile variants. Attention-specific;
+/// other families use `TileImpl::None` (the `#[default]`). Future families needing
+/// multi-variant dispatch should consider a generic type parameter or opaque index
+/// rather than extending this enum.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+pub enum TileImpl {
+    #[default]
+    None,
+    // WMMA-FA (quantized causal prefill — asym4+Q8-V only)
+    Asym4WmmaTile,
+    Asym4WmmaTileGfx12,
+    // Vision/dflash F16-K/V rungs
+    DflashV5,
+    DflashV5Gfx12,
+    DflashN128,
+    // Vision/dflash F32-K/V rungs
+    DflashM32,
+    DflashWmmaF32,
+    // Causal (F16-K/V rungs)
+    DflashV3Causal,
+    DflashV3CausalGfx12,
+    // Scalar floors — separate for causal vs non-causal
+    DflashScalar,    // non-causal → gpu.attention_dflash_f32
+    CausalScalar,     // causal → gpu.attention_causal_batched
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -245,6 +263,11 @@ pub enum KernelKey {
     AttnFlashAsym2FwhtBatched,   // no _masked — 2-bit tree-verify gap
     AttnQ8_0KvBatchedMasked,     // P-1 no-LDS-cap tiled kernel
     // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
+    // Full attention (no KV cache — vision / dflash cross-attention)
+    AttnFullF16,         // F16 K/V, non-causal
+    AttnFullF32,         // F32 K/V, non-causal
+    AttnFullF16Causal,   // F16 K/V, causal
+    AttnFullF32Causal,   // F32 K/V, causal
     // KV Cache Write
     KvWriteAsym4,
     KvWriteAsym4Fwht,
@@ -276,11 +299,16 @@ pub enum KernelKey {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ShapeInfo {
     /// Token-batch size (number of rows being processed in parallel).
+    /// For attention families, this is the number of query rows (n_patches for vision,
+    /// n tokens for prefill, 1 for decode).
     pub batch_size: usize,
     /// Attention head dimension in elements.
     pub head_dim: usize,
-    /// Output rows (M dimension of the weight matrix).
+    /// Output rows / sequence length (M dimension). For GEMV families, output rows.
+    /// For attention families, seq_len.
     pub m: usize,
+    /// Whether tree-verify is active (shape-level flag for IsTree predicates).
+    pub is_tree: bool,
 }
 
 // ── Arch gating ──────────────────────────────────────
@@ -289,6 +317,7 @@ pub struct ShapeInfo {
 pub enum ArchPredicate {
     Always,
     HasWmma,
+    HasWmmaGfx12,
     HasDp4a,
     HasSdot4,
     HasMmq,
@@ -302,9 +331,15 @@ pub enum ArchPredicate {
 #[derive(Clone, Debug)]
 pub enum ShapePredicate {
     BatchGt(usize),
+    BatchGe(usize),
     BatchEq(usize),
     HeadDimEq(usize),
+    HeadDimLe(usize),
+    HeadDimMultipleOf(usize),
+    HeadDimIn(&'static [usize]),
     MLt(usize),
+    IsTree(bool),
+    And(&'static [ShapePredicate]),
 }
 
 // ── Registry entry ───────────────────────────────────
@@ -316,6 +351,20 @@ pub struct KernelVariant {
     pub shape_gate: Option<ShapePredicate>,
     pub steps: &'static [PipelineOp],
     pub has_awq: bool,
+    pub tile: TileImpl,
+}
+
+impl Default for KernelVariant {
+    fn default() -> Self {
+        Self {
+            key: KernelKey::GemmF32RegisterTiled, // placeholder — must be overridden
+            arch_required: ArchPredicate::Always,
+            shape_gate: None,
+            steps: &[],
+            has_awq: false,
+            tile: TileImpl::None,
+        }
+    }
 }
 
 // ── Error ────────────────────────────────────────────

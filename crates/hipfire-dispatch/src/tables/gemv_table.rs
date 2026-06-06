@@ -55,6 +55,7 @@ fn register_plain(registry: &mut KernelRegistry) {
             shape_gate: None,
             steps: KernelKey::gemv_steps(dtype, GemvVariant::Plain),
             has_awq: dtype == DType::MQ4G256,
+            tile: TileImpl::None,
         });
     }
 }
@@ -81,6 +82,7 @@ fn register_prerotated(registry: &mut KernelRegistry) {
             shape_gate: None,
             steps: KernelKey::gemv_steps(dtype, GemvVariant::Prerotated),
             has_awq: dtype == DType::MQ4G256,
+            tile: TileImpl::None,
         });
     }
 }
@@ -106,6 +108,7 @@ fn register_residual(registry: &mut KernelRegistry) {
             shape_gate: None,
             steps: KernelKey::gemv_steps(dtype, GemvVariant::WithResidual),
             has_awq: dtype == DType::MQ4G256,
+            tile: TileImpl::None,
         });
     }
 }
@@ -117,6 +120,7 @@ fn register_fused(registry: &mut KernelRegistry) {
         shape_gate: None,
         steps: &[PipelineOp::RotateFwht, PipelineOp::Gemv],
         has_awq: false,
+        tile: TileImpl::None,
     });
 }
 
@@ -141,6 +145,7 @@ fn register_swiglu_residual(registry: &mut KernelRegistry) {
             shape_gate: None,
             steps: KernelKey::gemv_steps(dtype, GemvVariant::WithSwiGLUResidual),
             has_awq: dtype == DType::MQ4G256,
+            tile: TileImpl::None,
         });
     }
 }

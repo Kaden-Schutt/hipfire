@@ -21,6 +21,7 @@ pub fn populate(registry: &mut KernelRegistry) {
             shape_gate: shape.clone(),
             steps: &[PipelineOp::Attend],
             has_awq: false,
+            tile: TileImpl::None,
         });
     }
 
@@ -41,6 +42,7 @@ pub fn populate(registry: &mut KernelRegistry) {
             shape_gate: shape.clone(),
             steps: &[PipelineOp::Attend],
             has_awq: false,
+            tile: TileImpl::None,
         });
     }
 
@@ -64,6 +66,7 @@ pub fn populate(registry: &mut KernelRegistry) {
             shape_gate: shape.clone(),
             steps: &[PipelineOp::Attend],
             has_awq: false,
+            tile: TileImpl::None,
         });
     }
 
@@ -86,6 +89,7 @@ pub fn populate(registry: &mut KernelRegistry) {
             shape_gate: shape.clone(),
             steps: &[PipelineOp::Attend],
             has_awq: false,
+            tile: TileImpl::None,
         });
     }
 }

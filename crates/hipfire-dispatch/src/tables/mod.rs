@@ -82,6 +82,7 @@ impl ArchPredicate {
             // predicate backed by ArchCaps::has_wmma() is equivalent and enforces that
             // a new ArchPredicate variant only lands with the kernel it gates.
             Self::HasWmma => ctx.arch.has_wmma(),
+            Self::HasWmmaGfx12 => ctx.arch.has_wmma_w32_gfx12(),
             Self::HasDp4a => ctx.arch.has_dot2_f32_f16(),
             Self::HasSdot4 => ctx.arch.has_hfq3_sdot4(),
             // MQ6/HFQ6 GEMV ships on RDNA4 (gemv_mq6g256_prerotated has a gfx12 build);
@@ -97,9 +98,15 @@ impl ShapePredicate {
     pub fn eval(&self, shape: &ShapeInfo) -> bool {
         match self {
             Self::BatchGt(n) => shape.batch_size > *n,
+            Self::BatchGe(n) => shape.batch_size >= *n,
             Self::BatchEq(n) => shape.batch_size == *n,
             Self::HeadDimEq(n) => shape.head_dim == *n,
+            Self::HeadDimLe(n) => shape.head_dim <= *n,
+            Self::HeadDimMultipleOf(n) => shape.head_dim % *n == 0,
+            Self::HeadDimIn(set) => set.contains(&shape.head_dim),
             Self::MLt(n) => shape.m < *n,
+            Self::IsTree(b) => shape.is_tree == *b,
+            Self::And(preds) => preds.iter().all(|p| p.eval(shape)),
         }
     }
 }

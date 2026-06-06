@@ -14,6 +14,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
+        tile: TileImpl::None,
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmQ8_0BatchedChunked,
@@ -21,6 +22,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
+        tile: TileImpl::None,
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmQ8_0Wmma,
@@ -28,6 +30,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
+        tile: TileImpl::None,
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmQ8_0Wmma4W,
@@ -35,6 +38,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
+        tile: TileImpl::None,
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmHfq4G256,
@@ -42,6 +46,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
+        tile: TileImpl::None,
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmHfq4G128,
@@ -49,6 +54,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
+        tile: TileImpl::None,
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmHfq4G256Wmma,
@@ -56,6 +62,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
+        tile: TileImpl::None,
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmF16XF16Wmma,
@@ -63,5 +70,6 @@ pub fn populate(registry: &mut KernelRegistry) {
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
+        tile: TileImpl::None,
     });
 }

@@ -103,6 +103,7 @@ impl AttentionFamily {
             batch_size: plan.batch_size,
             head_dim: io.head_dim,
             m: 0,
+            is_tree: false,
         };
         self.resolve(plan.write_key, ctx, Some(&shape))?;
         dispatch_kv_write(gpu, plan.write_key, plan, io)?;
@@ -535,7 +536,7 @@ mod tests {
 
         for &key in DISPATCHED_KV_WRITE_KEYS {
             let batch = if is_batched_kv_key(key) { 16 } else { 1 };
-            let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0 };
+            let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0, is_tree: false };
             assert!(
                 family.resolve(key, &ctx, Some(&shape)).is_ok(),
                 "DISPATCHED_KV_WRITE_KEYS contains {:?} but it is NOT registered — stale entry",
@@ -546,7 +547,7 @@ mod tests {
         // Ensure no registered KV write key is missing from the dispatched set.
         for &key in DISPATCHED_KV_WRITE_KEYS {
             let batch = if is_batched_kv_key(key) { 16 } else { 1 };
-            let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0 };
+            let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0, is_tree: false };
             if family.resolve(key, &ctx, Some(&shape)).is_ok() {
                 assert!(
                     dispatched_set.contains(&key),
@@ -584,7 +585,7 @@ mod tests {
         for &key in DISPATCHED_ATTEND_KEYS {
             // Single-token keys resolve at batch_size=1, batched at batch_size>1
             let batch = if is_batched_key(key) { 16 } else { 1 };
-            let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0 };
+            let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0, is_tree: false };
             assert!(
                 family.resolve(key, &ctx, Some(&shape)).is_ok(),
                 "DISPATCHED_ATTEND_KEYS contains {:?} but it is NOT registered — stale entry",
@@ -594,7 +595,7 @@ mod tests {
 
         for &key in DISPATCHED_ATTEND_KEYS {
             let batch = if is_batched_key(key) { 16 } else { 1 };
-            let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0 };
+            let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0, is_tree: false };
             if family.resolve(key, &ctx, Some(&shape)).is_ok() {
                 assert!(
                     dispatched_set.contains(&key),

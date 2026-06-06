@@ -12,6 +12,7 @@ pub fn populate(registry: &mut KernelRegistry) {
                 shape_gate: None,
                 steps: $steps,
                 has_awq: $awq,
+                tile: TileImpl::None,
             });
         };
     }

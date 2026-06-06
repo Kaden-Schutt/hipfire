@@ -52,6 +52,7 @@ fn always_variant(key: KernelKey) -> KernelVariant {
         shape_gate: None,
         steps: &[],
         has_awq: false,
+        tile: TileImpl::None,
     }
 }
 
@@ -62,6 +63,7 @@ fn has_wmma_variant(key: KernelKey) -> KernelVariant {
         shape_gate: None,
         steps: &[],
         has_awq: false,
+        tile: TileImpl::None,
     }
 }
 
@@ -72,6 +74,7 @@ fn dp4a_variant(key: KernelKey) -> KernelVariant {
         shape_gate: None,
         steps: &[],
         has_awq: false,
+        tile: TileImpl::None,
     }
 }
 
@@ -240,6 +243,7 @@ fn registry_resolve_shape_gate_passes_when_shape_matches() {
         shape_gate: Some(ShapePredicate::HeadDimEq(128)),
         steps: &[],
         has_awq: false,
+        tile: TileImpl::None,
     });
     let ctx = ctx_rdna1();
     let shape = ShapeInfo { head_dim: 128, ..Default::default() };
@@ -255,6 +259,7 @@ fn registry_resolve_shape_gate_skips_when_shape_mismatches() {
         shape_gate: Some(ShapePredicate::HeadDimEq(128)),
         steps: &[],
         has_awq: false,
+        tile: TileImpl::None,
     });
     let ctx = ctx_rdna1();
     let shape = ShapeInfo { head_dim: 64, ..Default::default() };
@@ -272,6 +277,7 @@ fn registry_resolve_shape_none_bypasses_shape_gate() {
         shape_gate: Some(ShapePredicate::HeadDimEq(128)),
         steps: &[],
         has_awq: false,
+        tile: TileImpl::None,
     });
     let ctx = ctx_rdna1();
     assert_eq!(reg.resolve(KernelKey::AttnF32, &ctx, None).unwrap().key, KernelKey::AttnF32);
@@ -287,6 +293,7 @@ fn registry_resolve_shape_gate_fallback_to_ungated_variant() {
         shape_gate: Some(ShapePredicate::HeadDimEq(128)),
         steps: &[],
         has_awq: false,
+        tile: TileImpl::None,
     });
     reg.register(always_variant(KernelKey::AttnF32)); // ungated fallback
     let ctx = ctx_rdna1();
@@ -299,15 +306,16 @@ fn resolve_honors_shape_gate() {
     let mut reg = KernelRegistry::new();
     reg.register(KernelVariant {
         key: KernelKey::GemvF32, arch_required: ArchPredicate::Always,
-        shape_gate: Some(ShapePredicate::BatchGt(1)), steps: &[PipelineOp::Gemv], has_awq: true,
+        shape_gate: Some(ShapePredicate::BatchGt(1)), steps: &[PipelineOp::Gemv], has_awq: true, tile: TileImpl::None,
     });
     reg.register(KernelVariant {
         key: KernelKey::GemvF32, arch_required: ArchPredicate::Always,
         shape_gate: None, steps: &[PipelineOp::Gemv], has_awq: false,
+        tile: TileImpl::None,
     });
     let ctx = ctx_rdna1();
-    let batched = ShapeInfo { batch_size: 8, head_dim: 0, m: 4096 };
-    let scalar  = ShapeInfo { batch_size: 1, head_dim: 0, m: 4096 };
+    let batched = ShapeInfo { batch_size: 8, head_dim: 0, m: 4096, is_tree: false };
+    let scalar  = ShapeInfo { batch_size: 1, head_dim: 0, m: 4096, is_tree: false };
     assert!(reg.resolve(KernelKey::GemvF32, &ctx, Some(&batched)).unwrap().has_awq);
     assert!(!reg.resolve(KernelKey::GemvF32, &ctx, Some(&scalar)).unwrap().has_awq);
     assert!(reg.resolve(KernelKey::GemvF32, &ctx, None).unwrap().has_awq);
