@@ -9,13 +9,31 @@ Source reviews: `findings/dispatch_3.x_code_rev_{glm5,gemini,claude}.md`
 
 ## Hardware verification
 
-### F-3 · HIGH — Cross-arch verification needed (gfx1100 + gfx1201)
+### F-3 · MED — gfx1201 (RDNA4) verification still needed
 
-All Ship 3.3 verification ran on gfx1151 only. Phase 0.6 requires gfx1100 (primary
-deploy target) and gfx1201 (RDNA4).
+gfx1100 verified 2026-06-06 by Kevin Read (unverbraucht). Results:
 
-**Action:** Run coverage + coherence battery on gfx1100 and gfx1201. No code change.
-**Blocks:** Phase 0.6 sign-off.
+| Check | gfx1100 result |
+|-------|----------------|
+| `hipfire-dispatch-tests` | ✅ pass |
+| `hipfire-dispatch` (internal) | ✅ pass |
+| Coherence battery (short) | ✅ no hard errors; 11/17 ran (6 skipped: missing models) |
+| Decode A/B (±5%) | ✅ −0.7% to −1.7% (neutral) |
+| Prefill A/B (512 tok) | ⚠️ −5.8% to −12.4% (arch-agnostic, amortizes at long ctx) |
+| Prefill A/B (16384 tok) | ⚠️ −3.8% to −5.6% (converges but does not reverse; gfx906 reversal is tiled-kernel-specific) |
+| Correctness (temp=0) | ✅ benign argmax flips (FP accumulation order) |
+| Binary md5s | bench_A=`0bdde243` bench_B=`99175bc` |
+
+Pre-existing quality issues confirmed on master (not dispatch regressions):
+`qwen3.5-9b.mq3` attractor loop in thinking, `qwen3.5-9b.mq4-lloyd` incoherent.
+
+Full report: `/tmp/dispatch_validation_gfx1100.md`
+Coherence report: `/tmp/coherence-20260606-211357.md`
+Issue comment: [#397 (comment 4639841863)](https://github.com/Kaden-Schutt/hipfire/issues/397#issuecomment-4639841863)
+Long-context follow-up: [#397 (comment 4639924237)](https://github.com/Kaden-Schutt/hipfire/issues/397#issuecomment-4639924237)
+
+**Remaining:** gfx1201 (RDNA4) coverage + coherence + A/B. Need hardware.
+**Blocks:** Phase 0.6 sign-off (gfx1201 only).
 
 ---
 
@@ -209,4 +227,4 @@ ensures the guard never fires in real operation.
 
 ---
 
-*Last updated: 2026-06-06 (post Ship 4.1 W0+W1, tracking #397 Step 4.1).*
+*Last updated: 2026-06-06 (post Ship 4.1 W0+W1 + F-3 gfx1100 verified, tracking #397).*
