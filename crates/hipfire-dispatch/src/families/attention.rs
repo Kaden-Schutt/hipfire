@@ -1,4 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// TODO(F28): `attention_dflash_*` GPU method names conflate the DFlash
+// spec-decode project with the generic tiled online-softmax algorithm.
+// The "DFlash" in `attention_dflash_f32` / `attention_dflash_wmma_f32`
+// is the algorithm family (DFlash = Densely-packed Flash), not the
+// spec-decode path. A future rename (e.g. `attention_tiled_f32`) would
+// resolve the ambiguity. Low priority — no functional impact.
 use crate::context::DispatchCtx;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
@@ -728,6 +735,14 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     KernelKey::AttnQ4Kv,
 ];
 
+/// All `KernelKey` variants handled by `dispatch_full_attention`.
+const DISPATCHED_FULL_ATTENTION_KEYS: &[KernelKey] = &[
+    KernelKey::AttnFullF16,
+    KernelKey::AttnFullF32,
+    KernelKey::AttnFullF16Causal,
+    KernelKey::AttnFullF32Causal,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,6 +929,22 @@ mod tests {
                 dispatched_tiles.contains(tile),
                 "registered tile {:?} has no dispatch arm in dispatch_attend — add an arm or remove the registration",
                 tile
+            );
+        }
+    }
+
+    /// C5 [F24]: DISPATCHED_FULL_ATTENTION_KEYS covers all 4 full-attention keys
+    /// and each is registered in the attention table.
+    #[test]
+    fn dispatched_full_attention_keys_cover_all_variants() {
+        use std::collections::HashSet;
+        let family = AttentionFamily::new();
+        let registered: HashSet<KernelKey> = family.registry().all_keys().into_iter().collect();
+        for key in DISPATCHED_FULL_ATTENTION_KEYS {
+            assert!(
+                registered.contains(key),
+                "DISPATCHED_FULL_ATTENTION_KEYS contains {:?} but it is not registered in the attention table",
+                key
             );
         }
     }

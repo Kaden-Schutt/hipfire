@@ -346,6 +346,9 @@ fn attention_keys_resolve_on_fleet_archs() {
         AttnKeyUse { key: KernelKey::KvWriteAsym3Fwht,      archs: ALL, shape: None },
         AttnKeyUse { key: KernelKey::KvWriteAsym2,          archs: ALL, shape: None },
         AttnKeyUse { key: KernelKey::KvWriteAsym2Fwht,      archs: ALL, shape: None },
+        // Llama legacy KV write — single-token, Always-gated
+        AttnKeyUse { key: KernelKey::KvWriteHfq4,           archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::KvWriteQ4,             archs: ALL, shape: None },
         // KV write — batched, Always-gated, BatchGt(1)
         AttnKeyUse { key: KernelKey::KvWriteAsym4Batched,          archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
         AttnKeyUse { key: KernelKey::KvWriteAsym4FwhtBatched,     archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
@@ -364,6 +367,9 @@ fn attention_keys_resolve_on_fleet_archs() {
         AttnKeyUse { key: KernelKey::AttnFlashAsym3Fwht,    archs: ALL, shape: None },
         AttnKeyUse { key: KernelKey::AttnFlashAsym2,        archs: ALL, shape: None },
         AttnKeyUse { key: KernelKey::AttnFlashAsym2Fwht,    archs: ALL, shape: None },
+        // Llama legacy quant KV — single-token, Always-gated
+        AttnKeyUse { key: KernelKey::AttnHfq4Kv,           archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::AttnQ4Kv,             archs: ALL, shape: None },
         // GQA-fused — HasWmma-gated
         AttnKeyUse { key: KernelKey::AttnGqaFused,          archs: WMMA_ARCHS, shape: None },
         // Attention — batched, Always-gated (scalar fallback), BatchGt(1)
@@ -464,4 +470,94 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// C5 verification: full-attention keys resolve on their intended archs.
+/// AttnFullF16 needs WMMA; AttnFullF32 is Always. Causal variants mirror.
+#[test]
+fn full_attention_keys_resolve_on_fleet_archs() {
+    use crate::families::attention::AttentionFamily;
+
+    struct FullAttnCase {
+        key: KernelKey,
+        archs: &'static [&'static str],
+        shape: ShapeInfo,
+    }
+
+    let cases: &[FullAttnCase] = &[
+        // AttnFullF16: needs HasWmma or HasWmmaGfx12, head_dim=128, batch>=64
+        FullAttnCase {
+            key: KernelKey::AttnFullF16,
+            archs: WMMA_ARCHS,
+            shape: ShapeInfo { batch_size: 64, head_dim: 128, m: 64, is_tree: false },
+        },
+        // AttnFullF32: Always, scalar floor for any head_dim
+        FullAttnCase {
+            key: KernelKey::AttnFullF32,
+            archs: ALL,
+            shape: ShapeInfo { batch_size: 16, head_dim: 128, m: 16, is_tree: false },
+        },
+        // AttnFullF16Causal: HasWmma or HasWmmaGfx12, head_dim=128
+        FullAttnCase {
+            key: KernelKey::AttnFullF16Causal,
+            archs: WMMA_ARCHS,
+            shape: ShapeInfo { batch_size: 16, head_dim: 128, m: 16, is_tree: false },
+        },
+        // AttnFullF32Causal: Always, scalar floor
+        FullAttnCase {
+            key: KernelKey::AttnFullF32Causal,
+            archs: ALL,
+            shape: ShapeInfo { batch_size: 16, head_dim: 128, m: 16, is_tree: false },
+        },
+    ];
+
+    let family = AttentionFamily::new();
+    let mut failures = Vec::new();
+    for case in cases {
+        for &arch in case.archs {
+            let ctx = DispatchCtx::for_test(arch);
+            if family.resolve(case.key, &ctx, Some(&case.shape)).is_err() {
+                failures.push(format!(
+                    "  {:?} dead-gated on {} — resolve() returned Err",
+                    case.key, arch
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\n{} full-attention key × arch combos failed to resolve:\n{}\n",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// C5 verification: scalar floors resolve on non-WMMA archs (gfx906, gfx1030).
+#[test]
+fn scalar_floors_resolve_on_non_wmma_archs() {
+    use crate::families::attention::AttentionFamily;
+    let family = AttentionFamily::new();
+    let non_wmma_archs: &[&str] = &["gfx906", "gfx1030"];
+    let shape = ShapeInfo { batch_size: 16, head_dim: 128, m: 16, is_tree: false };
+
+    for &arch in non_wmma_archs {
+        let ctx = DispatchCtx::for_test(arch);
+        // DflashScalar (AttnFullF32)
+        let r = family.resolve(KernelKey::AttnFullF32, &ctx, Some(&shape));
+        assert!(r.is_ok(), "AttnFullF32 dead-gated on {} — should resolve to DflashScalar", arch);
+        // CausalScalar (AttnFullF32Causal)
+        let r = family.resolve(KernelKey::AttnFullF32Causal, &ctx, Some(&shape));
+        assert!(r.is_ok(), "AttnFullF32Causal dead-gated on {} — should resolve to CausalScalar", arch);
+    }
+}
+
+/// C5 verification: AttnFullF16 MUST NOT resolve on non-WMMA archs.
+#[test]
+fn f16_full_attention_rejected_on_non_wmma_archs() {
+    use crate::families::attention::AttentionFamily;
+    let family = AttentionFamily::new();
+    let ctx = DispatchCtx::for_test("gfx906");
+    let shape = ShapeInfo { batch_size: 64, head_dim: 128, m: 64, is_tree: false };
+    let r = family.resolve(KernelKey::AttnFullF16, &ctx, Some(&shape));
+    assert!(r.is_err(), "AttnFullF16 should NOT resolve on gfx906 — no WMMA");
 }
