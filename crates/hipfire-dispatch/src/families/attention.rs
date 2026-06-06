@@ -103,12 +103,12 @@ impl AttentionFamily {
             batch_size: plan.batch_size,
             head_dim: io.head_dim,
             m: 0,
-            is_tree: false,
+            is_tree: io.tree_bias.is_some(),
         };
-        self.resolve(plan.write_key, ctx, Some(&shape))?;
+        let write_var = self.resolve(plan.write_key, ctx, Some(&shape))?;
         dispatch_kv_write(gpu, plan.write_key, plan, io)?;
-        self.resolve(plan.attend_key, ctx, Some(&shape))?;
-        dispatch_attend(gpu, plan.attend_key, plan, io)
+        let attend_var = self.resolve(plan.attend_key, ctx, Some(&shape))?;
+        dispatch_attend(gpu, plan.attend_key, attend_var.tile, plan, io)
     }
 }
 
@@ -274,10 +274,38 @@ fn dispatch_kv_write(
 fn dispatch_attend(
     gpu: &mut Gpu,
     key: KernelKey,
+    tile: TileImpl,
     plan: &crate::families::kv_tier::KvTierPlan,
     io: &AttnParams,
 ) -> Result<(), DispatchError> {
-    match key {
+    // Tile-first dispatch: tile variants get their own arms, key-only dispatch
+    // lives under TileImpl::None.
+    match tile {
+        TileImpl::Asym4WmmaTile => {
+            debug_assert_eq!(key, KernelKey::AttnFlashAsym4BatchedMasked);
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_asym4_wmma_tile_batched(
+                io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
+                io.physical_cap, io.max_ctx_len, io.batch_size, fp,
+                io.tree_bias, io.block_start, io.block_cols,
+            ))
+        }
+        TileImpl::Asym4WmmaTileGfx12 => {
+            debug_assert_eq!(key, KernelKey::AttnFlashAsym4BatchedMasked);
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_asym4_wmma_tile_batched_gfx12(
+                io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
+                io.physical_cap, io.max_ctx_len, io.batch_size, fp,
+                io.tree_bias, io.block_start, io.block_cols,
+            ))
+        }
+        TileImpl::None => match key {
         // ── Single-token (decode / per-token fallback) ──
         KernelKey::AttnF32 => {
             debug_assert_eq!(plan.batch_size, 1);
@@ -468,7 +496,16 @@ fn dispatch_attend(
             arch: "",
             quant: "",
         }),
-    }
+        }  // close match key
+
+        // Unhandled tile variants (should not reach here without an arm)
+        _ => Err(DispatchError::UnsupportedVariant {
+            family: "attention/attend",
+            variant: "unhandled tile variant",
+            arch: "",
+            quant: "",
+        }),
+    }  // close match tile
 }
 
 // ── Dispatch key constants for completeness tests ──────

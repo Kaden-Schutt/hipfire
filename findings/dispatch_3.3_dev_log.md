@@ -32,7 +32,36 @@ All existing 3.1/3.2 keys resolve identically (`tile=None` path unchanged).
 
 ## Commit C1 · WMMA-FA acceleration of quantized prefill → registry variant
 
-### Status: NOT STARTED
+### 2026-06-06 — C1 complete
+
+Registered WMMA-FA tile variants under `AttnFlashAsym4BatchedMasked` with priority
+ordering: gfx12 → gfx11 → scalar (DO NOT REORDER).
+
+**rdna-compute:**
+- Added `attention_flash_asym4_wmma_tile_batched` (gfx11) and
+  `attention_flash_asym4_wmma_tile_batched_gfx12` (gfx12) public methods
+- Both call `launch_asym_flash_batched` with the WMMA kernel name directly
+  (bypassing the inline env-gated ladder)
+
+**attention_table.rs:**
+- Registered `Asym4WmmaTileGfx12` with `HasWmmaGfx12` + `And(&[HeadDimIn(&[128,256]),
+  BatchGe(16), IsTree(false)])`
+- Registered `Asym4WmmaTile` with `HasWmma` + same shape gate
+- Scalar variant registered after (fallback)
+
+**dispatch_attend:**
+- Now takes `tile: TileImpl` parameter
+- Tile-first dispatch: WMMA tiles → dedicated arms, `None` → existing key-only arms
+- `run_attention` threads `is_tree` into `ShapeInfo` and passes `variant.tile`
+
+The inline WMMA ladder in `launch_asym_flash_batched` is preserved — it still fires
+when called directly. The dispatch path bypasses it by specifying the WMMA kernel
+name directly.
+
+**Verification (gfx1151):**
+- coherence-gate.sh: 5/5, no hard errors
+- coherence-gate-dflash.sh: 4/4, no hard errors
+- 115/115 dispatch tests, 58/58 dispatch-tests
 
 ---
 

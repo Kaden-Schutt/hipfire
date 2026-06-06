@@ -3085,6 +3085,75 @@ impl Gpu {
         )
     }
 
+    /// WMMA-accelerated batched flash attention for asym4 + Q8-V.
+    /// Same parameter layout as `attention_flash_asym4_batched_masked` but uses
+    /// the WMMA tile kernel. Caller must ensure: head_dim in {128, 256},
+    /// tree_bias is None, batch_size >= 16 and divisible by 16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_asym4_wmma_tile_batched(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_asym4_wmma_tile_batched",
+            kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_SRC,
+            "attention_flash_asym4_wmma_tile_batched",
+            q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
+            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+            tree_bias, block_start, block_cols, V_MODE_Q8,
+        )
+    }
+
+    /// WMMA-accelerated batched flash attention for asym4 + Q8-V (gfx12 variant).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_asym4_wmma_tile_batched_gfx12(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_asym4_wmma_tile_batched_gfx12",
+            kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_GFX12_SRC,
+            "attention_flash_asym4_wmma_tile_batched_gfx12",
+            q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
+            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+            tree_bias, block_start, block_cols, V_MODE_Q8,
+        )
+    }
+
     /// Batched flash attention for fwht4 (K FWHT-rotated 4-bit + V Q8_0).
     /// `signs1` and `signs2` occupy the same slots as cos_theta/sin_theta on
     /// the asym4 path — the helper passes them opaquely to the tile kernel.

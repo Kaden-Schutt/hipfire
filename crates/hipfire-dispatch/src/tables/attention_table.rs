@@ -71,6 +71,39 @@ pub fn populate(registry: &mut KernelRegistry) {
     }
 
     // ── Flash Attention — batched prefill / tree-verify ────────
+    // PRIORITY ORDER within each key: gfx12 → gfx11 → scalar — DO NOT REORDER.
+    // resolve() returns the first passing (arch × shape) variant.
+
+    // WMMA-FA: asym4 + Q8-V only. head_dim ∈ {128,256}, tree-verify excluded,
+    // batch >= WMMA_BLOCK_M (16).
+    use crate::types::TileImpl;
+    const WMMA_BLOCK_M: usize = 16;
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFlashAsym4BatchedMasked,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: Some(ShapePredicate::And(&[
+            ShapePredicate::HeadDimIn(&[128, 256]),
+            ShapePredicate::BatchGe(WMMA_BLOCK_M),
+            ShapePredicate::IsTree(false),
+        ])),
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::Asym4WmmaTileGfx12,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFlashAsym4BatchedMasked,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: Some(ShapePredicate::And(&[
+            ShapePredicate::HeadDimIn(&[128, 256]),
+            ShapePredicate::BatchGe(WMMA_BLOCK_M),
+            ShapePredicate::IsTree(false),
+        ])),
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::Asym4WmmaTile,
+    });
+
+    // Scalar batched (fallback when WMMA doesn't apply)
     let attn_batched: &[(KernelKey, ArchPredicate, Option<ShapePredicate>)] = &[
         (KernelKey::AttnFlashAsym4BatchedMasked,     ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
         (KernelKey::AttnFlashAsym4FwhtBatchedMasked, ArchPredicate::Always, Some(ShapePredicate::BatchGt(1))),
