@@ -113,6 +113,52 @@ impl AttentionFamily {
         let attend_var = self.resolve(plan.attend_key, ctx, Some(&shape))?;
         dispatch_attend(gpu, plan.attend_key, attend_var.tile, plan, io)
     }
+
+    /// Full-attention entry point (no KV cache — vision / DFlash cross-attention).
+    /// Resolves under the given key (AttnFullF16 / AttnFullF32 / causal variants)
+    /// and dispatches on the resolved variant's `tile`. The caller is responsible
+    /// for ensuring K/V dtype matches the key (F16 for AttnFullF16*, F32 for
+    /// AttnFullF32*).
+    pub fn run_full_attention(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        io: &FullAttnParams,
+    ) -> Result<(), DispatchError> {
+        let shape = ShapeInfo {
+            // For vision: batch = n_patches, m = seq_len. For DFlash: batch = n, m = seq_len.
+            batch_size: io.n,
+            head_dim: io.head_dim,
+            m: io.seq_len,
+            is_tree: false,
+        };
+        let variant = self.resolve(io.key, ctx, Some(&shape))?;
+        dispatch_full_attention(gpu, io.key, variant.tile, io)
+    }
+}
+
+/// Parameters for full-attention (no KV cache). Used by dots-ocr vision
+/// attention and DFlash draft-decoder cross-attention.
+pub struct FullAttnParams<'a> {
+    /// Determines K/V dtype and causal/non-causal mode:
+    /// - AttnFullF16: F16 K/V, non-causal
+    /// - AttnFullF32: F32 K/V, non-causal
+    /// - AttnFullF16Causal: F16 K/V, causal
+    /// - AttnFullF32Causal: F32 K/V, causal
+    pub key: KernelKey,
+    pub q: &'a GpuTensor,
+    /// K tensor. dtype must match key: F16 for AttnFullF16*, F32 for AttnFullF32*.
+    pub k: &'a GpuTensor,
+    /// V tensor. Same dtype constraint as k.
+    pub v: &'a GpuTensor,
+    pub out: &'a GpuTensor,
+    /// Number of query rows (n_patches for vision, n for DFlash).
+    pub n: usize,
+    /// Sequence length (= n for self-attention).
+    pub seq_len: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
 }
 
 impl KernelFamily for AttentionFamily {
@@ -125,6 +171,85 @@ macro_rules! hip {
     ($e:expr) => {
         $e.map_err(|e| DispatchError::Hip(e.to_string()))
     };
+}
+
+// ── Full attention dispatch (no KV cache — vision / DFlash) ──
+
+fn dispatch_full_attention(
+    gpu: &mut Gpu,
+    key: KernelKey,
+    tile: TileImpl,
+    io: &FullAttnParams,
+) -> Result<(), DispatchError> {
+    use KernelKey::*;
+    match tile {
+        // ── Non-causal, F16 K/V ──
+        TileImpl::DflashV5 | TileImpl::DflashV5Gfx12 => {
+            debug_assert_eq!(key, AttnFullF16);
+            hip!(gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(
+                io.q, io.k, io.v, io.out,
+                io.n, io.seq_len, io.n_heads, io.n_kv_heads, io.head_dim,
+            ))?;
+            Ok(())
+        }
+        TileImpl::DflashN128 => {
+            debug_assert_eq!(key, AttnFullF16);
+            hip!(gpu.attention_dflash_wmma_n128_f16kv_f32(
+                io.q, io.k, io.v, io.out,
+                io.n, io.seq_len, io.n_heads, io.n_kv_heads, io.head_dim,
+            ))?;
+            Ok(())
+        }
+        // ── Non-causal, F32 K/V ──
+        TileImpl::DflashM32 => {
+            debug_assert_eq!(key, AttnFullF32);
+            hip!(gpu.attention_dflash_wmma_m32_f32(
+                io.q, io.k, io.v, io.out,
+                io.n, io.seq_len, io.n_heads, io.n_kv_heads, io.head_dim,
+            ))?;
+            Ok(())
+        }
+        TileImpl::DflashWmmaF32 => {
+            debug_assert_eq!(key, AttnFullF32);
+            hip!(gpu.attention_dflash_wmma_f32(
+                io.q, io.k, io.v, io.out,
+                io.n, io.seq_len, io.n_heads, io.n_kv_heads, io.head_dim,
+            ))?;
+            Ok(())
+        }
+        TileImpl::DflashScalar => {
+            debug_assert!(key == AttnFullF32, "DflashScalar only valid for AttnFullF32");
+            hip!(gpu.attention_dflash_f32(
+                io.q, io.k, io.v, io.out,
+                io.n, io.seq_len, io.n_heads, io.n_kv_heads, io.head_dim,
+            ))?;
+            Ok(())
+        }
+        // ── Causal, F16 K/V ──
+        TileImpl::DflashV3Causal | TileImpl::DflashV3CausalGfx12 => {
+            debug_assert_eq!(key, AttnFullF16Causal);
+            hip!(gpu.attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32(
+                io.q, io.k, io.v, io.out,
+                io.n, io.seq_len, io.n_heads, io.n_kv_heads, io.head_dim,
+            ))?;
+            Ok(())
+        }
+        // ── Causal, F32 K/V ──
+        TileImpl::CausalScalar => {
+            debug_assert_eq!(key, AttnFullF32Causal);
+            hip!(gpu.attention_causal_batched(
+                io.q, io.k, io.v, io.out,
+                io.seq_len, io.n_heads, io.n_kv_heads, io.head_dim,
+            ))?;
+            Ok(())
+        }
+        _ => Err(DispatchError::UnsupportedVariant {
+            family: "attention/full",
+            variant: "unhandled tile variant",
+            arch: "",
+            quant: "",
+        }),
+    }
 }
 
 // ── KV Cache Write dispatch ────────────────────────────
@@ -632,6 +757,15 @@ mod tests {
         )
     }
 
+    /// Helper: is this key a full-attention key (vision / DFlash, no KV cache)?
+    fn is_full_attn_key(key: KernelKey) -> bool {
+        use KernelKey::*;
+        matches!(
+            key,
+            AttnFullF16 | AttnFullF32 | AttnFullF16Causal | AttnFullF32Causal
+        )
+    }
+
     /// Bidirectional completeness check for `dispatch_attend`.
     #[test]
     fn dispatch_attend_has_arms_for_all_registered_keys() {
@@ -656,6 +790,7 @@ mod tests {
         // Reverse: every registered attend key must be in the dispatched set.
         for key in family.registry().all_keys() {
             if is_kv_write_key(key) { continue; }  // skip KV write keys
+            if is_full_attn_key(key) { continue; }  // skip full-attention keys (separate dispatch)
             let batch = if is_batched_key(key) { 16 } else { 1 };
             let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0, is_tree: false };
             if family.resolve(key, &ctx, Some(&shape)).is_ok() {
@@ -708,6 +843,15 @@ mod tests {
         let dispatched_tiles: HashSet<TileImpl> = [
             TileImpl::Asym4WmmaTile,
             TileImpl::Asym4WmmaTileGfx12,
+            TileImpl::DflashV5,
+            TileImpl::DflashV5Gfx12,
+            TileImpl::DflashN128,
+            TileImpl::DflashM32,
+            TileImpl::DflashWmmaF32,
+            TileImpl::DflashScalar,
+            TileImpl::DflashV3Causal,
+            TileImpl::DflashV3CausalGfx12,
+            TileImpl::CausalScalar,
         ].into_iter().collect();
 
         // Forward: every dispatched tile must be registered.

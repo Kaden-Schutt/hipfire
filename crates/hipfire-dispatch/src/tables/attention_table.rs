@@ -125,4 +125,107 @@ pub fn populate(registry: &mut KernelRegistry) {
             tile: TileImpl::None,
         });
     }
+
+    // ── Full attention (no KV cache — vision / DFlash) ─────────
+    // PRIORITY ORDER within each key: gfx12 → gfx11 → scalar — DO NOT REORDER.
+    // resolve() returns the first passing (arch × shape) variant.
+
+    // AttnFullF16: non-causal, F16 K/V
+    // v5 F16-K/V rung (gfx12)
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFullF16,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: Some(ShapePredicate::And(&[
+            ShapePredicate::HeadDimEq(128),
+            ShapePredicate::BatchGe(64),
+        ])),
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::DflashV5Gfx12,
+    });
+    // v5 F16-K/V rung (gfx11)
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFullF16,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: Some(ShapePredicate::And(&[
+            ShapePredicate::HeadDimEq(128),
+            ShapePredicate::BatchGe(64),
+        ])),
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::DflashV5,
+    });
+    // n128 F16-K/V rung (gfx11 only — no gfx12 sibling)
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFullF16,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: Some(ShapePredicate::And(&[
+            ShapePredicate::HeadDimEq(128),
+            ShapePredicate::BatchGe(32),
+        ])),
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::DflashN128,
+    });
+    // No scalar floor for F16 — fall to AttnFullF32 at caller level.
+
+    // AttnFullF32: non-causal, F32 K/V
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFullF32,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: Some(ShapePredicate::And(&[
+            ShapePredicate::HeadDimMultipleOf(16),
+            ShapePredicate::HeadDimLe(128),
+            ShapePredicate::BatchGe(32),
+        ])),
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::DflashM32,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFullF32,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: Some(ShapePredicate::HeadDimMultipleOf(16)),
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::DflashWmmaF32,
+    });
+    // Scalar floor — Always
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFullF32,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::DflashScalar,
+    });
+
+    // AttnFullF16Causal: causal, F16 K/V
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFullF16Causal,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: Some(ShapePredicate::HeadDimEq(128)),
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::DflashV3CausalGfx12,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFullF16Causal,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: Some(ShapePredicate::HeadDimEq(128)),
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::DflashV3Causal,
+    });
+    // No scalar floor for F16 causal — fall to AttnFullF32Causal.
+
+    // AttnFullF32Causal: causal, F32 K/V
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFullF32Causal,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::CausalScalar,
+    });
 }

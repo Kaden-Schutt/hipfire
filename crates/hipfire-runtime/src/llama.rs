@@ -618,8 +618,10 @@ pub fn attention_family() -> &'static hipfire_dispatch::families::attention::Att
 pub use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
 pub use hipfire_dispatch::families::gemv::{RotInput, RotateInputs, RotatedActivation};
 pub use hipfire_dispatch::families::attention::AttnParams;
+pub use hipfire_dispatch::families::attention::FullAttnParams;
 pub use hipfire_dispatch::families::kv_tier::{KvTierPlan, KvTierInputs};
 pub use hipfire_dispatch::context::DispatchCtx;
+pub use hipfire_dispatch::types::ShapeInfo;
 pub use hipfire_dispatch::types::KernelKey;
 pub use hipfire_dispatch::types::{GemvVariant, dtype_post_rotation_variant, dtype_rotation_plan};
 

@@ -41,7 +41,7 @@
 use hip_bridge::HipResult;
 use hipfire_arch_qwen2::qwen2::{Qwen2Config, Qwen2Weights};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
+use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, attention_family, DispatchCtx, FullAttnParams, KernelKey, ShapeInfo};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ─────────────────────────────────────────────────────────────
@@ -883,7 +883,6 @@ pub fn vision_forward(
     let t0 = std::time::Instant::now();
     let use_wmma = gpu.arch_caps.has_wmma_w32();
     let use_gfx12_wmma = gpu.arch_caps.has_wmma_w32_gfx12();
-    let use_dots_v5_wmma = use_wmma || use_gfx12_wmma;
     eprintln!(
         "  vision forward (dots-ocr GPU): {n_patches} patches, {grid_h}×{grid_w} grid, {} blocks",
         cfg.num_hidden_layers,
@@ -1115,46 +1114,54 @@ pub fn vision_forward(
         //   * `attention_dflash_wmma_f32` — M=16, 1 wave. hd ≤ 256.
         //   * `attention_dflash_f32` — scalar online-softmax fallback.
         //
-        // For dots.ocr (head_dim=128) use the v5 M=64/V_tile=32 f16-K/V
-        // O-register-resident path. V_tile=32 keeps LDS small enough for
-        // 2 WG/CU at the smoke-image shape.
-        if use_dots_v5_wmma && head_dim == 128 && n_patches >= 64 {
-            let k_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
-            let v_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
-            gpu.cast_f32_to_f16(&k_buf, &k_f16)?;
-            gpu.cast_f32_to_f16(&v_buf, &v_f16)?;
-            gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(
-                &q_buf, &k_f16, &v_f16, &attn,
-                n_patches, n_patches, n_heads, n_heads, head_dim,
-            )?;
-            gpu.free_tensor(k_f16)?;
-            gpu.free_tensor(v_f16)?;
-        } else if use_wmma && head_dim == 128 && n_patches >= 32 {
-            let k_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
-            let v_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
-            gpu.cast_f32_to_f16(&k_buf, &k_f16)?;
-            gpu.cast_f32_to_f16(&v_buf, &v_f16)?;
-            gpu.attention_dflash_wmma_n128_f16kv_f32(
-                &q_buf, &k_f16, &v_f16, &attn,
-                n_patches, n_patches, n_heads, n_heads, head_dim,
-            )?;
-            gpu.free_tensor(k_f16)?;
-            gpu.free_tensor(v_f16)?;
-        } else if use_wmma && head_dim % 16 == 0 && head_dim <= 128 && n_patches >= 32 {
-            gpu.attention_dflash_wmma_m32_f32(
-                &q_buf, &k_buf, &v_buf, &attn,
-                n_patches, n_patches, n_heads, n_heads, head_dim,
-            )?;
-        } else if use_wmma && head_dim % 16 == 0 {
-            gpu.attention_dflash_wmma_f32(
-                &q_buf, &k_buf, &v_buf, &attn,
-                n_patches, n_patches, n_heads, n_heads, head_dim,
-            )?;
-        } else {
-            gpu.attention_dflash_f32(
-                &q_buf, &k_buf, &v_buf, &attn,
-                n_patches, n_patches, n_heads, n_heads, head_dim,
-            )?;
+        // Vision self-attention via dispatch. Try F16-K/V path first
+        // (v5, n128), fall to F32-K/V (m32, wmma_f32, scalar floor).
+        {
+            let ctx = DispatchCtx::new(gpu);
+            let family = attention_family();
+            let shape = ShapeInfo {
+                batch_size: n_patches,
+                head_dim,
+                m: n_patches,
+                is_tree: false,
+            };
+            if let Ok(_variant) = family.resolve(
+                KernelKey::AttnFullF16, &ctx, Some(&shape)
+            ) {
+                // F16-K/V path: cast K and V, dispatch, free temps.
+                let k_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
+                let v_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
+                gpu.cast_f32_to_f16(&k_buf, &k_f16)?;
+                gpu.cast_f32_to_f16(&v_buf, &v_f16)?;
+                family.run_full_attention(&ctx, gpu, &FullAttnParams {
+                    key: KernelKey::AttnFullF16,
+                    q: &q_buf,
+                    k: &k_f16,
+                    v: &v_f16,
+                    out: &attn,
+                    n: n_patches,
+                    seq_len: n_patches,
+                    n_heads,
+                    n_kv_heads: n_heads,
+                    head_dim,
+                }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                gpu.free_tensor(k_f16)?;
+                gpu.free_tensor(v_f16)?;
+            } else {
+                // F32-K/V path (m32, wmma_f32, or scalar floor).
+                family.run_full_attention(&ctx, gpu, &FullAttnParams {
+                    key: KernelKey::AttnFullF32,
+                    q: &q_buf,
+                    k: &k_buf,
+                    v: &v_buf,
+                    out: &attn,
+                    n: n_patches,
+                    seq_len: n_patches,
+                    n_heads,
+                    n_kv_heads: n_heads,
+                    head_dim,
+                }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            }
         }
         // Dump pre-proj attention output so we can compare to numpy
         // F32 reference (which doesn't include proj).
