@@ -54,6 +54,12 @@ else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
                crates/hipfire-runtime/src/hfq.rs crates/hipfire-runtime/examples/daemon.rs \
                crates/rdna-compute/src/dispatch.rs \
+               crates/hipfire-dispatch/src/families/moe.rs \
+               crates/hipfire-dispatch/src/pipeline/mod.rs \
+               crates/hipfire-dispatch/src/pipeline/steps.rs \
+               crates/hipfire-dispatch/src/families/gemv.rs \
+               crates/hipfire-dispatch/src/families/attention.rs \
+               crates/hipfire-dispatch/src/families/fused_qkv.rs \
                crates/hipfire-arch-deepseek4/src/arch.rs \
                crates/hipfire-arch-deepseek4/src/deepseek4.rs \
                crates/hipfire-arch-deepseek4/src/forward.rs \

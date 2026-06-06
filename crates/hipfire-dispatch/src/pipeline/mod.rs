@@ -46,10 +46,10 @@ pub fn execute_pipeline(
     registry: &KernelRegistry,
 ) -> Result<(), DispatchError> {
     if let PipelineParams::Moe(p) = params {
-        return run_moe_decode(gpu, p);
+        return run_moe_decode(ctx, gpu, p);
     }
     if let Some(key) = find_fused(registry, ctx, dtype, steps) {
-        return dispatch_fused(gpu, key, params);
+        return dispatch_fused(ctx, gpu, key, params);
     }
     let params = match params {
         PipelineParams::Linear(p) => p,
@@ -137,14 +137,29 @@ unsafe fn slice_moe_f32_view(src: &GpuTensor, offset_elems: usize, len_elems: us
 
 /// MoE decode executor. Ports the body of `moe_ffn_decode_impl` verbatim,
 /// substituting `ffn.*`/`config.*`/`s.*` references with `MoeParams` fields.
-/// Phase 1: GPU top-K path only (k=8, indexable routed dtype). The CPU
-/// top-K fallback is not supported here — callers that need it retain the
-/// original qwen35 path.
-pub fn run_moe_decode(gpu: &mut Gpu, p: &crate::families::moe::MoeParams) -> Result<(), DispatchError> {
+/// Resolution is owned here (computed from `MoeDtypes` + k), and `ctx` is
+/// threaded to every inner GEMV so the call site builds one `DispatchCtx`.
+pub fn run_moe_decode(
+    ctx: &DispatchCtx,
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoeParams,
+) -> Result<(), DispatchError> {
+    use crate::families::moe::MoeResolution;
     macro_rules! hip {
         ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
     }
-    let res = p.res;
+
+    // Runtime guard matching the bias-aware decode guard (not debug_assert —
+    // that would be stripped in release). batch_size=1 is the only valid
+    // decode width; >1 must route to grouped prefill (Step 8).
+    if p.batch_size != 1 {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe", variant: "decode-requires-batch-1",
+            arch: "", quant: "",
+        });
+    }
+
+    let res = MoeResolution::resolve(&p.dtypes, p.k);
 
     // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
     let x_rot_local: Option<&GpuTensor> = if res.needs_x_rot_local {
@@ -195,11 +210,10 @@ pub fn run_moe_decode(gpu: &mut Gpu, p: &crate::families::moe::MoeParams) -> Res
     } else {
         static GEMV_GATE: OnceLock<GemvFamily> = OnceLock::new();
         let gemv = GEMV_GATE.get_or_init(GemvFamily::new);
-        let ctx = DispatchCtx::new(gpu);
-        gemv.run_auto(&ctx, gpu, &p.router,            p.x_norm, p.router_logits).map_err(|e| DispatchError::Hip(e.to_string()))?;
-        gemv.run_auto(&ctx, gpu, &p.shared_expert_gate,p.x_norm, p.scalar_buf).map_err(|e| DispatchError::Hip(e.to_string()))?;
-        gemv.run_auto(&ctx, gpu, &p.shared_gate_w,     p.x_norm, &shared_gate).map_err(|e| DispatchError::Hip(e.to_string()))?;
-        gemv.run_auto(&ctx, gpu, &p.shared_up_w,       p.x_norm, &shared_up).map_err(|e| DispatchError::Hip(e.to_string()))?;
+        gemv.run_auto(ctx, gpu, &p.router,            p.x_norm, p.router_logits).map_err(|e| DispatchError::Hip(e.to_string()))?;
+        gemv.run_auto(ctx, gpu, &p.shared_expert_gate,p.x_norm, p.scalar_buf).map_err(|e| DispatchError::Hip(e.to_string()))?;
+        gemv.run_auto(ctx, gpu, &p.shared_gate_w,     p.x_norm, &shared_gate).map_err(|e| DispatchError::Hip(e.to_string()))?;
+        gemv.run_auto(ctx, gpu, &p.shared_up_w,       p.x_norm, &shared_up).map_err(|e| DispatchError::Hip(e.to_string()))?;
     }
 
     // ── Top-K + routed experts: CPU-top-K generic fallback ───────────────────
@@ -215,7 +229,7 @@ pub fn run_moe_decode(gpu: &mut Gpu, p: &crate::families::moe::MoeParams) -> Res
     // does NOT fall through to the indexed GPU-top-K path below (which assumes
     // k=8 + an indexable routed dtype).
     if !res.use_gpu_topk {
-        return run_moe_decode_cpu_fallback(gpu, p, &shared_gate, &shared_up);
+        return run_moe_decode_cpu_fallback(ctx, gpu, p, &shared_gate, &shared_up);
     }
     // DIAG: dump router logits before softmax (mirrors qwen35 HIPFIRE_DUMP_HIDDEN)
     if let Ok(dump_path) = std::env::var("HIPFIRE_DUMP_HIDDEN") {
@@ -264,8 +278,7 @@ pub fn run_moe_decode(gpu: &mut Gpu, p: &crate::families::moe::MoeParams) -> Res
             hip!(gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid))?;
             static GEMV_DOWN: OnceLock<GemvFamily> = OnceLock::new();
             let gemv = GEMV_DOWN.get_or_init(GemvFamily::new);
-            let ctx = DispatchCtx::new(gpu);
-            gemv.run_auto(&ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out).map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gemv.run_auto(ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out).map_err(|e| DispatchError::Hip(e.to_string()))?;
             hip!(gpu.scaled_add_inplace_gpu_scalar_f32(p.x_residual, p.ffn_out, p.scalar_buf))?;
         }
         #[cfg(not(feature = "deltanet"))]
@@ -317,6 +330,7 @@ pub fn run_moe_decode(gpu: &mut Gpu, p: &crate::families::moe::MoeParams) -> Res
     }
 
     // Expanded write
+    // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
     if res.routed_indexable_mq4 {
         hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
             p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
@@ -335,6 +349,7 @@ pub fn run_moe_decode(gpu: &mut Gpu, p: &crate::families::moe::MoeParams) -> Res
         ))?;
     }
 
+    // FIXME(Step 8): replace hardcoded 1 with p.batch_size when grouped prefill lands
     hip!(gpu.moe_down_combine_k8_batched(p.down_expanded, p.topk_weights, p.x_residual, down_m, p.k, 1))?;
 
     Ok(())
@@ -358,7 +373,9 @@ pub fn run_moe_decode(gpu: &mut Gpu, p: &crate::families::moe::MoeParams) -> Res
 ///
 /// `shared_gate` / `shared_up` are the gate-side GEMV outputs computed by the
 /// caller (`run_moe_decode`), passed through so the shared-expert math is shared.
+/// `ctx` is threaded through every inner GEMV (no internal `DispatchCtx::new`).
 fn run_moe_decode_cpu_fallback(
+    ctx: &DispatchCtx,
     gpu: &mut Gpu,
     p: &crate::families::moe::MoeParams,
     shared_gate: &GpuTensor,
@@ -426,8 +443,7 @@ fn run_moe_decode_cpu_fallback(
             hip!(gpu.silu_mul_f32(shared_gate, shared_up, &shared_hid))?;
             static GEMV_DOWN_FB: OnceLock<GemvFamily> = OnceLock::new();
             let gemv = GEMV_DOWN_FB.get_or_init(GemvFamily::new);
-            let ctx = DispatchCtx::new(gpu);
-            gemv.run_auto(&ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out)?;
+            gemv.run_auto(ctx, gpu, &p.shared_down_w, &shared_hid, p.ffn_out)?;
             hip!(gpu.scaled_add_inplace_gpu_scalar_f32(p.x_residual, p.ffn_out, p.scalar_buf))?;
         }
         #[cfg(not(feature = "deltanet"))]
@@ -446,8 +462,7 @@ fn run_moe_decode_cpu_fallback(
 
         // gate_up: y = W·x  (run_auto auto-rotates for MQ/Paro dtypes).
         {
-            let ctx = DispatchCtx::new(gpu);
-            gemv.run_auto(&ctx, gpu, gate_up_w, p.x_norm, p.gate_up_buf)?;
+            gemv.run_auto(ctx, gpu, gate_up_w, p.x_norm, p.gate_up_buf)?;
         }
         let gate_view = unsafe { slice_moe_f32_view(p.gate_up_buf, 0, mi) };
         let up_view = unsafe { slice_moe_f32_view(p.gate_up_buf, mi, mi) };
@@ -456,8 +471,7 @@ fn run_moe_decode_cpu_fallback(
         let hid_view = unsafe { slice_moe_f32_view(p.ffn_hidden, 0, mi) };
         hip!(gpu.silu_mul_f32(&gate_view, &up_view, &hid_view))?;
         {
-            let ctx = DispatchCtx::new(gpu);
-            gemv.run_auto(&ctx, gpu, down_w, &hid_view, p.ffn_out)?;
+            gemv.run_auto(ctx, gpu, down_w, &hid_view, p.ffn_out)?;
         }
         hip!(gpu.scaled_add_inplace_cpu_scalar_f32(p.x_residual, p.ffn_out, weight))?;
     }
@@ -757,13 +771,14 @@ pub fn run_moe_prefill_bias_aware(
 }
 
 pub fn dispatch_fused(
+    ctx: &DispatchCtx,
     gpu: &mut Gpu,
     key: KernelKey,
     params: &PipelineParams,
 ) -> Result<(), DispatchError> {
     let params = match params {
         PipelineParams::Linear(p) => p,
-        PipelineParams::Moe(p) => return run_moe_decode(gpu, p),
+        PipelineParams::Moe(p) => return run_moe_decode(ctx, gpu, p),
     };
     macro_rules! hip {
         ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };

@@ -153,4 +153,60 @@ comments and the completeness tests catch missing arms.
 
 ---
 
-*Last updated: 2026-06-06 (post Ship 3.3 close, tracking #397).*
+## Ship 4.1 — MoE family owns resolution (open verification items)
+
+### SF-4.1.1 · HIGH — gfx1201 cross-arch verification
+
+Ship 4.1 verified on gfx1151 only (gfx11-family). Phase 0.6 requires gfx1201 (RDNA4).
+
+**Action:** Run coherence-gate.sh --full on gfx1201. Byte-identical token IDs vs gfx1151.
+**Blocks:** Phase 0.6 sign-off. **Assignee: Kaden.**
+
+### SF-4.1.2 · MED — k≠8 CPU-top-K fallback fixture
+
+A3B is k=8 only — it exercises only the GPU indexed top-K path. The CPU-top-K
+fallback (`run_moe_decode_cpu_fallback`) was re-plumbed (ctx threaded through
+per-expert loop) but has no on-GPU fixture to validate it.
+
+**Action:** Procure or build a k≠8 MoE model (e.g. k=4 or k=16 variant), or a
+non-MQ4/MQ6/Paro routed-expert model, and run through coherence-gate.sh.
+**Doc:** Document the residual until a fixture is available.
+**Assignee: Kaden** (model procurement); Kevin can validate once fixture exists.
+
+### SF-4.1.3 · LOW — A3B DFlash draft model missing locally
+
+The pinned A3B MoE DFlash fixture (AGENTS.md §"Pinned A3B MoE DFlash fixtures")
+requires `qwen36-35b-a3b-dflash-mq4.hfq` (md5 `8254bbe1`). This file is not present
+locally; the coherence-gate.sh DFlash gate is skipped.
+
+**Action:** Acquire the draft or document the DFlash coverage gap permanently.
+A3B AR (`coherence-gate.sh --full`) covers the MoE decode path without DFlash.
+**Assignee: Kaden** (has HF upload access).
+
+### SF-4.1.4 · LOW — coherence-gate.sh rebuild trigger incomplete for dispatch crate
+
+The coherence-gate.sh timestamp check only covered qwen35.rs, llama.rs, hfq.rs,
+daemon.rs, dispatch.rs, and deepseek4 sources. Dispatch-crate files (moe.rs,
+pipeline/mod.rs, steps.rs, gemv.rs, attention.rs, fused_qkv.rs) were not in the
+trigger list — incremental builds could go stale when only dispatch code changed.
+
+**Fixed in Ship 4.1:** Dispatch-crate files added to trigger list.
+**Symptom:** A3B MoE model produced gibberish output after struct layout changes
+until a `cargo clean` + rebuild was performed.
+
+### SF-4.1.5 · LOW — batch_size guard unit test (GPU-gated)
+
+The `batch_size != 1` runtime guard in `run_moe_decode` is not unit-testable
+without a GPU (MoeParams requires GpuTensor references). The guard fires at the
+top before any GPU access, but constructing a minimal MoeParams requires unsafe
+pointer fabrication.
+
+**Action:** Add a unit test when a GPU-free mock DispatchCtx + scratch pattern
+is available, or validate via a one-shot GPU test (pass batch_size=2, expect
+UnsupportedVariant error).
+**Mitigation:** Guard mirrors the identical bias-aware guard pattern; coherence-gate
+ensures the guard never fires in real operation.
+
+---
+
+*Last updated: 2026-06-06 (post Ship 4.1 W0+W1, tracking #397 Step 4.1).*

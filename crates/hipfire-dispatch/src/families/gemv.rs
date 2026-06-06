@@ -275,7 +275,7 @@ impl GemvFamily {
                         x: params.x, y: params.y, buf: params.w.buf,
                         m: params.w.m, k: params.w.k,
                     });
-                    return dispatch_fused(gpu, KernelKey::GemvMfp4G32Fused, &pipe_params);
+                    return dispatch_fused(ctx, gpu, KernelKey::GemvMfp4G32Fused, &pipe_params);
                 }
                 let key = self.resolve(params.w.dtype, params.variant, false, ctx, Some(&shape))?.key;
                 launch(gpu, key, params)

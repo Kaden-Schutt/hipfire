@@ -4597,7 +4597,8 @@ fn moe_ffn_decode_impl(
             .unwrap_or(DType::F32),
         has_paro_shared: ffn.paro_shared.is_some(),
     };
-    let moe_res = hipfire_dispatch::families::moe::MoeResolution::resolve(&moe_dtypes, k);
+    // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
+    // the dtype snapshot + k; the executor computes MoeResolution from MoeDtypes.
 
     // Per-expert (gate_up, down) refs for the generic CPU-top-K fallback in
     // `run_moe_decode` (k != 8 OR routed dtype not indexable). Empty in paged
@@ -4613,7 +4614,8 @@ fn moe_ffn_decode_impl(
         .collect();
 
     let moe_params = hipfire_dispatch::families::moe::MoeParams {
-        res: moe_res,
+        dtypes: moe_dtypes,
+        batch_size: 1,
         hidden,
         mi,
         smi,
@@ -4659,7 +4661,10 @@ fn moe_ffn_decode_impl(
         topk_weights: s.topk_weights,
         down_expanded: s.down_expanded,
     };
-    hipfire_dispatch::pipeline::run_moe_decode(gpu, &moe_params)
+    // Build one DispatchCtx per token (the family threads it through every
+    // inner GEMV — no internal DispatchCtx::new reconstructions).
+    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+    hipfire_runtime::llama::moe_family().run(&ctx, gpu, &moe_params)
         .map_err(HipError::from)?;
     Ok(())
 }

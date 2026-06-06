@@ -10,9 +10,10 @@
 //!
 //! `run()` is the centralized single-token MoE decode entry — it delegates to
 //! [`crate::pipeline::run_moe_decode`] (the GPU top-K fast path plus the generic
-//! CPU-top-K fallback). The model marshals its weights/scratch into `MoeParams`;
-//! scratch stays model-owned. Grouped-GEMM prefill is a future arm (gated on
-//! `ShapeInfo.batch_size`).
+//! CPU-top-K fallback). The family owns resolution (`MoeDtypes` → `MoeResolution`);
+//! the model passes only the dtype snapshot + k. One `DispatchCtx` is threaded
+//! end-to-end from the call site through every inner GEMV. Scratch stays model-owned.
+//! Grouped-GEMM prefill is a future arm (gated on `ShapeInfo.batch_size`).
 
 use rdna_compute::DType;
 use rdna_compute::GpuTensor;
@@ -104,9 +105,14 @@ impl MoeResolution {
 // ── Dispatch parameters ────────────────────────────────
 
 /// Everything the MoE decode executor arm reads, marshaled by the model from
-/// its weight/config/scratch structs.
+/// its weight/config/scratch structs. Resolution is owned by the family
+/// (the model passes only the dtype snapshot + k); the executor computes
+/// [`MoeResolution`] from [`MoeDtypes`] on entry.
 pub struct MoeParams<'a> {
-    pub res: MoeResolution,
+    pub dtypes: MoeDtypes,
+    /// Token-batch width. Decode = 1. >1 must route to grouped prefill (Step 8).
+    /// Guarded at runtime matching the bias-aware decode guard.
+    pub batch_size: usize,
     // dims / config scalars
     pub hidden: usize,
     pub mi: usize,
@@ -307,17 +313,17 @@ impl MoeFamily {
     /// Delegates to [`crate::pipeline::run_moe_decode`], which dispatches the
     /// GPU top-K fast path (k=8 with an indexable routed dtype ∈ {MQ4G256,
     /// MQ6G256, ParoQ4G128}) or the generic CPU-top-K fallback (k != 8 or a
-    /// non-indexable routed dtype). Scratch stays model-owned; the model
-    /// marshals it into `params`. `ctx` is currently unused (the executor
-    /// builds its own `DispatchCtx` where a GEMV sub-dispatch needs one) but is
-    /// kept for signature parity with the other families.
+    /// non-indexable routed dtype). Resolution is owned here (the family
+    /// resolves [`MoeDtypes`] → [`MoeResolution`]), and `ctx` is threaded
+    /// through every inner GEMV so the call site builds one `DispatchCtx`
+    /// per token (not 6+). Scratch stays model-owned.
     pub fn run(
         &self,
-        _ctx: &DispatchCtx,
+        ctx: &DispatchCtx,
         gpu: &mut rdna_compute::Gpu,
         params: &MoeParams,
     ) -> Result<(), DispatchError> {
-        crate::pipeline::run_moe_decode(gpu, params)
+        crate::pipeline::run_moe_decode(ctx, gpu, params)
     }
 
     /// Run a single-token deepseek4 bias-aware MoE decode step (k=6, MQ2-Lloyd
