@@ -42,3 +42,6 @@ Ship 4.2: qwen35 grouped-GEMM MoE prefill → `MoeFamily::run_prefill` (Step 8)
 - DFlash coherence battery passed (2 cells: 27b-dflash-prose, 27b-dflash-code) — no hard errors.
 - A3B MoE model loads and runs without panics. Prefill=32 tok/s = 60.5 (includes JIT; gfx1151 APU bandwidth-constrained at 21 GiB model).
 - `MOE_GROUPED_BLOCK_M` = 16 constant duplicated between qwen35.rs and dispatch pipeline — both must stay in sync. Grep audit confirms only these two sites.
+- **Determinism check (27B dense, batched prefill)**: Two runs with `HIPFIRE_DUMP_HIDDEN` produce byte-identical `.batched` files (md5 `e647a43...`). The dense batched prefill path (unchanged by 4.2) is deterministic.
+- **A3B MoE batched prefill**: NOT exercised by `bench_qwen35_mq4` — the model falls through to the per-token `forward_scratch` path. The `prefill_batch_pbs_eligible` gate rejects A3B for batched prefill on gfx1151 (root cause TBD — likely `moe_ffn_batched_admissible` strict-MQ4 check or attention weight dtype). The per-token path is unchanged by Ship 4.2 (decode MoE dispatch was migrated in 4.1).
+- **New `run_moe_prefill` code**: Not exercised by either model in this test setup. Needs an A3B model that passes batched eligibility, or a forced-path test with `HIPFIRE_PREFILL_BATCHED=1` + eligibility fix.
