@@ -721,6 +721,20 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   params.mtp_mode = resolved.mtp_mode;
   params.mtp_k = resolved.mtp_k;
 
+  // Auto-discover standalone .mtp sidecar alongside the target model.
+  // Follows the same convention as DFlash draft: look next to the model
+  // for <stem>.mtp. Only activates when mtp_mode is "on" or "auto"
+  // and DFlash is not already configured (mutual exclusion in daemon).
+  const mtpAllowed = resolved.mtp_mode === "on" || resolved.mtp_mode === "auto";
+  const noDflash = !params.draft;
+  if (mtpAllowed && noDflash && !params.mtp_head) {
+    const mtpCandidate = path.replace(/\.mq4$/, ".mtp").replace(/\.mq3$/, ".mtp").replace(/\.mq6$/, ".mtp").replace(/\.hfq4$/, ".mtp").replace(/\.hfq$/, ".mtp");
+    if (mtpCandidate !== path && existsSync(mtpCandidate)) {
+      params.mtp_head = mtpCandidate;
+      console.error(`[hipfire] MTP head detected: ${mtpCandidate}`);
+    }
+  }
+
   return { type: "load", model: path, params };
 }
 
