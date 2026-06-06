@@ -135,6 +135,18 @@ unsafe fn slice_moe_f32_view(src: &GpuTensor, offset_elems: usize, len_elems: us
     }
 }
 
+/// GPU-free unit for the runtime decode batch-size guard (CB5).
+/// Extracted so the guard is testable without a GPU or `MoeParams`.
+pub fn check_moe_decode_batch_size(batch_size: usize) -> Result<(), DispatchError> {
+    if batch_size != 1 {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe", variant: "decode-requires-batch-1",
+            arch: "", quant: "",
+        });
+    }
+    Ok(())
+}
+
 /// MoE decode executor. Ports the body of `moe_ffn_decode_impl` verbatim,
 /// substituting `ffn.*`/`config.*`/`s.*` references with `MoeParams` fields.
 /// Resolution is owned here (computed from `MoeDtypes` + k), and `ctx` is
@@ -152,12 +164,7 @@ pub fn run_moe_decode(
     // Runtime guard matching the bias-aware decode guard (not debug_assert —
     // that would be stripped in release). batch_size=1 is the only valid
     // decode width; >1 must route to grouped prefill (Step 8).
-    if p.batch_size != 1 {
-        return Err(DispatchError::UnsupportedVariant {
-            family: "moe", variant: "decode-requires-batch-1",
-            arch: "", quant: "",
-        });
-    }
+    check_moe_decode_batch_size(p.batch_size)?;
 
     let res = MoeResolution::resolve(&p.dtypes, p.k);
 
@@ -398,6 +405,15 @@ fn run_moe_decode_cpu_fallback(
     let k = p.k;
     let mi = p.mi;
     let n_exp = p.n_exp;
+
+    // Defensive: select_nth_unstable_by(k-1) panics if k > n_exp or k == 0.
+    // No known model violates k ∈ [1, n_exp], but Step 8 brings new families.
+    if k == 0 || k > n_exp {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe", variant: "cpu-topk-k-out-of-range",
+            arch: "", quant: "",
+        });
+    }
 
     // ── 1+2. softmax → CPU top-K + renorm (verbatim from master) ──────────────
     hip!(gpu.softmax_f32(p.router_logits))?;

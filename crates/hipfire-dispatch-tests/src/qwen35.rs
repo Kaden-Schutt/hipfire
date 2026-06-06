@@ -201,3 +201,28 @@ fn moe_resolve_no_rotation_when_all_f32() {
     assert!(!res.needs_x_rot_local);
     assert!(!res.gate_side_mq4);
 }
+
+// ─── batch_size guard (CB5, GPU-free) ────────────────────
+
+#[test]
+fn moe_decode_batch_size_guard_accepts_1() {
+    assert!(hipfire_dispatch::pipeline::check_moe_decode_batch_size(1).is_ok());
+}
+
+#[test]
+fn moe_decode_batch_size_guard_rejects_0() {
+    let err = hipfire_dispatch::pipeline::check_moe_decode_batch_size(0).unwrap_err();
+    assert!(matches!(err, hipfire_dispatch::types::DispatchError::UnsupportedVariant { .. }));
+}
+
+#[test]
+fn moe_decode_batch_size_guard_rejects_2() {
+    let err = hipfire_dispatch::pipeline::check_moe_decode_batch_size(2).unwrap_err();
+    assert!(matches!(err, hipfire_dispatch::types::DispatchError::UnsupportedVariant { .. }));
+}
+
+#[test]
+fn moe_decode_batch_size_guard_rejects_16() {
+    let err = hipfire_dispatch::pipeline::check_moe_decode_batch_size(16).unwrap_err();
+    assert!(matches!(err, hipfire_dispatch::types::DispatchError::UnsupportedVariant { .. }));
+}
