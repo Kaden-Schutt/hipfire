@@ -6762,7 +6762,10 @@ const MIN_BATCH: usize = 2;
 pub fn prefill_batch_pbs_eligible(
     weights: &Qwen35Weights,
     config: &Qwen35Config,
-    dn_state: &DeltaNetState,
+    // Kept for API stability and future state-aware gating. The batched path
+    // now dispatches the GDN recurrence by state quant on the non-tree route,
+    // so it no longer gates eligibility here (see the removed Q8-only check).
+    _dn_state: &DeltaNetState,
     n: usize,
     arch: &str,
     moe_router_logits_present: bool,
@@ -6778,7 +6781,12 @@ pub fn prefill_batch_pbs_eligible(
     );
     !force_fallback
         && n >= MIN_BATCH
-        && dn_state.quant == StateQuant::Q8
+        // State quant no longer gates batched prefill: forward_prefill_chunk
+        // dispatches the GDN recurrence by dn_state.quant on the non-tree path
+        // (FP32 → gated_delta_net_f32_batch_seq, Q8 → _q8_batch_seq, Q4 → _q4),
+        // so FP32/Q4 state is fully batchable here. Was hard-gated to Q8 when
+        // the batched GDN was Q8-only; that's the seed + per-cycle-commit
+        // per-token fallback that made FP32 DFlash ~4.5× slower + 10× TTFT.
         && weights.layers.iter().any(|lw| matches!(
             lw,
             LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),
