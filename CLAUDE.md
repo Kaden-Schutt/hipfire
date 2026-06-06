@@ -193,6 +193,20 @@ gfx1100 is **±1–3%** — anything bigger is a real signal, NOT
 "DPM drift". Real regressions get hand-waived by inflated noise
 claims; treat a 3%+ delta as something worth bisecting.
 
+**JIT tax is per-(config × kernel-shape), and a slowdown that
+SURVIVES a rerun is NOT JIT.** Kernels JIT-compile on first use *per
+distinct shape* (each batch size / B-value / dtype / arch path caches
+separately), so warming one cell of an A/B matrix does NOT warm the
+others — warm EACH cell, and run the whole matrix a throwaway first
+pass before measuring. The trap: seeing one cell slow on pass 1,
+calling "JIT", and moving on. The discriminator is the rerun — if the
+number snaps back toward its neighbour on pass 2 it was JIT; if it
+holds (e.g. fp32-state DFlash stuck at 33 tok/s across both passes
+while q8 went 105→151), it is a REAL kernel-perf gap (here: the
+non-tree FP32 path reusing the single-token `gated_delta_net_f32`
+instead of a batch-tiled `_batch_seq` kernel). Do not file a stable
+cross-rerun slowdown under "JIT".
+
 For cross-commit perf claims, verify across a fresh process with
 `scripts/probe_commits.sh $(git rev-parse HEAD~1) HEAD` (it handles
 warmup + multi-run aggregation correctly). The methodology doc also
