@@ -109,6 +109,9 @@ fn main() {
     let mut ctx_capacity: usize = 512;
     let mut ctx_slice: Option<usize> = None;
     let mut kv_mode_str = String::from("q8");
+    // VALIDATION-ONLY (not part of #417): lets the gate exercise the GdnTape
+    // replay path's FP32/Q4 DeltaNet-state arms. Default q8 = prod behaviour.
+    let mut state_quant_str = String::from("q8");
     let mut block_size_override: Option<usize> = None;
     let mut temp: f32 = 0.0;
     let mut seed: u64 = 42;
@@ -267,6 +270,10 @@ fn main() {
             }
             "--kv-mode" => {
                 kv_mode_str = args[i + 1].clone();
+                i += 2;
+            }
+            "--state-quant" => {
+                state_quant_str = args[i + 1].clone();
                 i += 2;
             }
             "--block-size" => {
@@ -571,6 +578,16 @@ fn main() {
         }
     };
     eprintln!("kv_mode: {:?}", slot_cfg.kv_mode);
+    slot_cfg.state_quant = match state_quant_str.as_str() {
+        "q8" | "int8" => hipfire_arch_qwen35::qwen35::StateQuant::Q8,
+        "fp32" | "f32" => hipfire_arch_qwen35::qwen35::StateQuant::FP32,
+        "q4" | "int4" => hipfire_arch_qwen35::qwen35::StateQuant::Q4,
+        other => {
+            eprintln!("unknown --state-quant: {other}. Valid: q8, fp32, q4");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("state_quant: {:?}", slot_cfg.state_quant);
     let t1 = Instant::now();
     let mut target =
         ModelSlot::load(&mut gpu, Path::new(&target_path), "target", slot_cfg).expect("load target");

@@ -1070,7 +1070,7 @@ impl GdnTape {
 
             // 4. GDN recurrence — advances S_state.
             match dn_state.quant {
-                qwen35::StateQuant::FP32 => gpu.gated_delta_net_f32(
+                qwen35::StateQuant::FP32 => gpu.gated_delta_net_f32_batch_seq(
                     &self.q_scratch,
                     &self.k_scratch,
                     &self.v_scratch,
