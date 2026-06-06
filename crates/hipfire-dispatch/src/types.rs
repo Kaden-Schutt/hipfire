@@ -27,6 +27,9 @@ pub enum PipelineOp {
     /// Fused rmsnorm + optional rotation (MQ-weight producer step).
     /// rotation=FwhtG256 → rmsnorm + FWHT. rotation=None → rmsnorm only.
     RmsnormAutomatic,
+    /// Paired KV-write + flash-attention (Phase 0.3). Not fusible —
+    /// the two ops are inherently coupled via KvTierPlan.
+    Attend,
 }
 
 // ── Variant enums ─────────────────────────────────────

@@ -12828,9 +12828,9 @@ fn kv_cache_attention_dispatch(
         output: &s.fa_attn_out,
     };
     let ctx = DispatchCtx::new(gpu);
-    hipfire_runtime::llama::attention_family()
-        .run_attention(&ctx, gpu, &plan, &io)
-        .map_err(|e| HipError::new(0, &e.to_string()))
+    execute_steps(gpu, &ctx, &[
+        Step::Attend { plan, io },
+    ]).map_err(|e| HipError::new(0, &e.to_string()))
 }
 
 

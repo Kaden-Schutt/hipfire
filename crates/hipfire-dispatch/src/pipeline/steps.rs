@@ -47,6 +47,13 @@ pub enum Step<'a> {
         eps: f32,
         rotation: RotationPlan,   // FwhtG256 for MQ dtypes, None for HFQ4/others
     },
+    /// Paired KV-write + flash-attention (Phase 0.3). Consumes a KvTierPlan
+    /// (derived once per attention step) and AttnParams (tensor borrows).
+    /// Not fusible — the two ops are inherently coupled.
+    Attend {
+        plan: crate::families::kv_tier::KvTierPlan,
+        io: crate::families::attention::AttnParams<'a>,
+    },
 }
 
 /// Op-kind for fusion matching. Total over Step variants.
@@ -55,6 +62,7 @@ fn op_kind(step: &Step) -> PipelineOp {
         Step::Gemv { .. } => PipelineOp::Gemv,
         Step::GemvResidual { .. } => PipelineOp::GemvResidual,
         Step::RmsnormAutomatic { .. } => PipelineOp::RmsnormAutomatic,
+        Step::Attend { .. } => PipelineOp::Attend,
     }
 }
 
@@ -437,6 +445,12 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                     givens_scales: None, givens_krot: None,
                 }).map_err(|e| DispatchError::Hip(e.to_string()))
             }
+        }
+        Step::Attend { plan, io } => {
+            use crate::families::attention::AttentionFamily;
+            static ATTENTION: OnceLock<AttentionFamily> = OnceLock::new();
+            let attn = ATTENTION.get_or_init(AttentionFamily::new);
+            attn.run_attention(ctx, gpu, plan, io)
         }
     }
 }
