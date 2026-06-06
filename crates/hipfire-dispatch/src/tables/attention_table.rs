@@ -13,6 +13,9 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::KvWriteAsym2Fwht, ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
         (KernelKey::KvWriteQ8_0,      ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
         (KernelKey::KvWriteF32,       ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
+        // Llama legacy quant KV write (decode only)
+        (KernelKey::KvWriteHfq4,      ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
+        (KernelKey::KvWriteQ4,        ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
     ];
     for (key, arch, shape) in kv_write_variants {
         registry.register(KernelVariant {
@@ -58,6 +61,9 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::AttnQ8_0Kv,         ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
         (KernelKey::AttnGqaFused,       ArchPredicate::HasWmma, Some(ShapePredicate::BatchEq(1))),
         (KernelKey::AttnF32,            ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
+        // Llama legacy quant KV (decode only)
+        (KernelKey::AttnHfq4Kv,        ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
+        (KernelKey::AttnQ4Kv,          ArchPredicate::Always, Some(ShapePredicate::BatchEq(1))),
     ];
     for (key, arch, shape) in attn_variants {
         registry.register(KernelVariant {

@@ -23,6 +23,7 @@ use rdna_compute::Gpu;
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::dtype_rotation_plan;
+use hipfire_runtime::llama::{attention_family, AttnParams, KvTierInputs, KvTierPlan};
 
 /// Type marker for the LLaMA family — covers `arch_id = 0` (LLaMA /
 /// Mistral) and `arch_id = 1` (plain Qwen3 / Qwen2). All members of
@@ -147,7 +148,7 @@ impl Llama {
         let n_heads = config.n_heads;
         let n_kv_heads = config.n_kv_heads;
         let head_dim = config.head_dim;
-        let kv_dim = n_kv_heads * head_dim;
+        let _kv_dim = n_kv_heads * head_dim; // legacy: only used by non-dispatch paths
 
         for layer_idx in 0..config.n_layers {
             let layer = &weights.layers[layer_idx];
@@ -193,100 +194,60 @@ impl Llama {
                 n_heads, n_kv_heads, head_dim, config.rope_freq_base,
             )?;
 
-            // ── KV cache write + attention ──────────────────────
-            if kv_cache.quant_hfq4 {
-                gpu.kv_cache_write_hfq4(
-                    &kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf,
-                    n_kv_heads, head_dim,
-                )?;
-                gpu.kv_cache_write_hfq4(
-                    &kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf,
-                    n_kv_heads, head_dim,
-                )?;
-                gpu.attention_hfq4_kv(
-                    &scratch.q,
-                    &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &scratch.attn_out, &scratch.pos_buf, pos + 1,
-                    n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
-                )?;
-            } else if kv_cache.quantized
-                && !kv_cache.k_scales.is_empty()
-                && !kv_cache.quant_int8
+            // ── KV cache write + attention (dispatched) ────────
+            // Derive tier plan from KV cache state. Q4 is inferred as
+            // "quantized but not any specific format".
+            let quant_q4 = kv_cache.quantized
+                && !kv_cache.quant_hfq4
                 && !kv_cache.quant_q8
+                && !kv_cache.quant_int8
+                && kv_cache.k_scales.is_empty();
             {
-                gpu.kv_cache_write_hfq8(
-                    &kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx],
-                    &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim,
-                )?;
-                gpu.kv_cache_write_hfq8(
-                    &kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx],
-                    &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim,
-                )?;
-                gpu.attention_hfq8_kv(
-                    &scratch.q,
-                    &kv_cache.k_gpu[layer_idx], &kv_cache.k_scales[layer_idx],
-                    &kv_cache.v_gpu[layer_idx], &kv_cache.v_scales[layer_idx],
-                    &scratch.attn_out, &scratch.pos_buf, pos + 1,
-                    n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
-                )?;
-            } else if kv_cache.quant_int8 {
-                gpu.kv_cache_write_int8c_f16(
-                    &kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf,
-                    n_kv_heads, head_dim,
-                )?;
-                gpu.kv_cache_write_int8c_f16(
-                    &kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf,
-                    n_kv_heads, head_dim,
-                )?;
-                gpu.attention_int8c_f16_kv(
-                    &scratch.q,
-                    &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &scratch.attn_out, &scratch.pos_buf, pos + 1,
-                    n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
-                )?;
-            } else if kv_cache.quantized && kv_cache.quant_q8 {
-                gpu.kv_cache_write_q8_0(
-                    &kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf,
-                    n_kv_heads, head_dim,
-                )?;
-                gpu.kv_cache_write_q8_0(
-                    &kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf,
-                    n_kv_heads, head_dim,
-                )?;
-                gpu.attention_q8_0_kv(
-                    &scratch.q,
-                    &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &scratch.attn_out, &scratch.pos_buf, pos + 1,
-                    n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
-                )?;
-            } else if kv_cache.quantized {
-                gpu.kv_cache_write_q4(
-                    &kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf,
-                    n_kv_heads, head_dim,
-                )?;
-                gpu.kv_cache_write_q4(
-                    &kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf,
-                    n_kv_heads, head_dim,
-                )?;
-                gpu.attention_q4kv(
-                    &scratch.q,
-                    &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &scratch.attn_out, &scratch.pos_buf, pos + 1,
-                    n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
-                )?;
-            } else {
-                gpu.kv_cache_write(
-                    &kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim,
-                )?;
-                gpu.kv_cache_write(
-                    &kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim,
-                )?;
-                gpu.attention_f32(
-                    &scratch.q,
-                    &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &scratch.attn_out, &scratch.pos_buf, pos + 1,
-                    n_heads, n_kv_heads, head_dim, kv_cache.physical_cap,
-                )?;
+                let ctx = DispatchCtx::new(gpu);
+                let family = attention_family();
+                let plan = KvTierPlan::derive(KvTierInputs {
+                    quant_asym4: false,
+                    quant_asym3: false,
+                    quant_asym2: false,
+                    quant_q8: kv_cache.quant_q8,
+                    quant_fwht: false,
+                    quant_hfq4: kv_cache.quant_hfq4,
+                    quant_q4,
+                    v_mode_bits: 8,
+                    pos,
+                    flash_mode: 0,
+                    capture_mode: false,
+                    batch_size: 1,
+                    is_tree: false,
+                    is_boundary: false,
+                }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                let io = AttnParams {
+                    q: &scratch.q,
+                    k: &scratch.k,
+                    v: &scratch.v,
+                    k_cache: &kv_cache.k_gpu[layer_idx],
+                    v_cache: &kv_cache.v_gpu[layer_idx],
+                    k_scales: None,
+                    v_scales: None,
+                    pos_buf: &scratch.pos_buf,
+                    pos,
+                    positions: None,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    physical_cap: kv_cache.physical_cap,
+                    batch_size: 1,
+                    max_ctx_len: 0,
+                    flash_partials: None,
+                    givens_cos: None,
+                    givens_sin: None,
+                    tree_bias: None,
+                    block_start: 0,
+                    block_cols: 0,
+                    output: &scratch.attn_out,
+                };
+                family.run_attention(&ctx, gpu, &plan, &io)
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
             }
 
             // ── Attention output projection + residual ─────────

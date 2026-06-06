@@ -15,6 +15,8 @@ pub struct KvTierInputs {
     pub quant_asym2: bool,
     pub quant_q8: bool,
     pub quant_fwht: bool,
+    pub quant_hfq4: bool,   // llama legacy HFQ4 KV mode
+    pub quant_q4: bool,     // llama legacy Q4 KV mode
     pub v_mode_bits: i32,
     // q8 use_flash heuristic inputs (moved from qwen35.rs:12885)
     pub pos: usize,
@@ -81,6 +83,8 @@ impl KvTierPlan {
             quant_asym2,
             quant_q8,
             quant_fwht,
+            quant_hfq4,
+            quant_q4,
             v_mode_bits,
             pos,
             flash_mode,
@@ -92,7 +96,7 @@ impl KvTierPlan {
 
         // At most one quant tier flag should be set.
         debug_assert!(
-            [quant_asym4, quant_asym3, quant_asym2, quant_q8]
+            [quant_asym4, quant_asym3, quant_asym2, quant_q8, quant_hfq4, quant_q4]
                 .iter()
                 .filter(|&&b| b)
                 .count() <= 1,
@@ -124,6 +128,10 @@ impl KvTierPlan {
         } else if quant_q8 {
             let attend = q8_attend_key(pos, flash_mode, capture_mode);
             (KernelKey::KvWriteQ8_0, attend, false)
+        } else if quant_hfq4 {
+            (KernelKey::KvWriteHfq4, KernelKey::AttnHfq4Kv, false)
+        } else if quant_q4 {
+            (KernelKey::KvWriteQ4, KernelKey::AttnQ4Kv, false)
         } else {
             // F32 fallback
             (KernelKey::KvWriteF32, KernelKey::AttnF32, false)
@@ -251,6 +259,10 @@ fn tiers_match(write: KernelKey, attend: KernelKey) -> bool {
         // q8 single-token
         | (KvWriteQ8_0, AttnFlashQ8_0)
         | (KvWriteQ8_0, AttnQ8_0Kv)
+        // hfq4 single-token (llama legacy)
+        | (KvWriteHfq4, AttnHfq4Kv)
+        // q4 single-token (llama legacy)
+        | (KvWriteQ4, AttnQ4Kv)
         // f32 single-token
         | (KvWriteF32, AttnF32)
         // asym4 batched
@@ -279,6 +291,8 @@ mod tests {
             quant_asym2: false,
             quant_q8: false,
             quant_fwht: false,
+            quant_hfq4: false,
+            quant_q4: false,
             v_mode_bits: 8,
             pos: 0,
             flash_mode: 0,
@@ -334,6 +348,30 @@ mod tests {
         let plan = KvTierPlan::derive(inputs).unwrap();
         assert_eq!(plan.write_key, KernelKey::KvWriteQ8_0);
         assert_eq!(plan.attend_key, KernelKey::AttnFlashQ8_0);
+    }
+
+    #[test]
+    fn hfq4_tier() {
+        let inputs = KvTierInputs {
+            quant_hfq4: true,
+            ..default_inputs()
+        };
+        let plan = KvTierPlan::derive(inputs).unwrap();
+        assert_eq!(plan.write_key, KernelKey::KvWriteHfq4);
+        assert_eq!(plan.attend_key, KernelKey::AttnHfq4Kv);
+        assert!(!plan.uses_givens);
+    }
+
+    #[test]
+    fn q4_tier() {
+        let inputs = KvTierInputs {
+            quant_q4: true,
+            ..default_inputs()
+        };
+        let plan = KvTierPlan::derive(inputs).unwrap();
+        assert_eq!(plan.write_key, KernelKey::KvWriteQ4);
+        assert_eq!(plan.attend_key, KernelKey::AttnQ4Kv);
+        assert!(!plan.uses_givens);
     }
 
     #[test]

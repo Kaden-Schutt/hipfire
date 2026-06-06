@@ -388,6 +388,26 @@ fn dispatch_kv_write(
             ))
         }
 
+        // ── Llama legacy (decode only, no batched variants) ──
+        KernelKey::KvWriteHfq4 => {
+            debug_assert_eq!(plan.batch_size, 1);
+            hip!(gpu.kv_cache_write_hfq4(
+                io.k_cache, io.k, io.pos_buf, io.n_kv_heads, io.head_dim,
+            ))?;
+            hip!(gpu.kv_cache_write_hfq4(
+                io.v_cache, io.v, io.pos_buf, io.n_kv_heads, io.head_dim,
+            ))
+        }
+        KernelKey::KvWriteQ4 => {
+            debug_assert_eq!(plan.batch_size, 1);
+            hip!(gpu.kv_cache_write_q4(
+                io.k_cache, io.k, io.pos_buf, io.n_kv_heads, io.head_dim,
+            ))?;
+            hip!(gpu.kv_cache_write_q4(
+                io.v_cache, io.v, io.pos_buf, io.n_kv_heads, io.head_dim,
+            ))
+        }
+
         _ => Err(DispatchError::UnsupportedVariant {
             family: "attention/kv_write",
             variant: "unhandled key — missing dispatch arm",
@@ -538,6 +558,24 @@ fn dispatch_attend(
             ))
         }
 
+        // ── Llama legacy quant KV (decode only) ──
+        KernelKey::AttnHfq4Kv => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let seq_len = io.pos + 1;
+            hip!(gpu.attention_hfq4_kv(
+                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap,
+            ))
+        }
+        KernelKey::AttnQ4Kv => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let seq_len = io.pos + 1;
+            hip!(gpu.attention_q4kv(
+                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap,
+            ))
+        }
+
         // ── Batched (prefill / tree-verify) ──
         KernelKey::AttnFlashAsym4BatchedMasked => {
             let ct = io.givens_cos.unwrap();
@@ -659,6 +697,9 @@ pub(crate) const DISPATCHED_KV_WRITE_KEYS: &[KernelKey] = &[
     KernelKey::KvWriteAsym2Batched,
     KernelKey::KvWriteAsym2FwhtBatched,
     KernelKey::KvWriteQ8_0Batched,
+    // Llama legacy
+    KernelKey::KvWriteHfq4,
+    KernelKey::KvWriteQ4,
 ];
 
 /// All `KernelKey` variants handled by `dispatch_attend`.
@@ -682,6 +723,9 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     KernelKey::AttnFlashAsym2Batched,
     KernelKey::AttnFlashAsym2FwhtBatched,
     KernelKey::AttnQ8_0KvBatchedMasked,
+    // Llama legacy
+    KernelKey::AttnHfq4Kv,
+    KernelKey::AttnQ4Kv,
 ];
 
 #[cfg(test)]
@@ -739,6 +783,7 @@ mod tests {
             | KvWriteAsym3Batched | KvWriteAsym3FwhtBatched
             | KvWriteAsym2Batched | KvWriteAsym2FwhtBatched
             | KvWriteQ8_0Batched
+            | KvWriteHfq4 | KvWriteQ4
         )
     }
 

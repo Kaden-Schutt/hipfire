@@ -253,6 +253,10 @@ pub enum KernelKey {
     AttnFlashQ8_0,
     AttnQ8_0Kv,    // non-flash short-context Q8_0 decode (ship 3.1 B0)
     AttnGqaFused,
+    // Llama legacy quant KV (decode only — no batched variants)
+    AttnHfq4Kv,       // HFQ4-quantized KV cache attention
+    AttnQ4Kv,         // Q4-quantized KV cache attention
+    // F32 KV (decode only — no batched variant)
     AttnF32,
     // Attention — batched prefill / tree-verify (ship 3.2)
     AttnFlashAsym4BatchedMasked,
@@ -276,6 +280,8 @@ pub enum KernelKey {
     KvWriteAsym2,
     KvWriteAsym2Fwht,
     KvWriteQ8_0,
+    KvWriteHfq4,    // HFQ4-quantized KV write (llama legacy)
+    KvWriteQ4,      // Q4-quantized KV write (llama legacy)
     KvWriteF32,
     // KV Cache Write — batched prefill (ship 3.2)
     KvWriteAsym4Batched,
