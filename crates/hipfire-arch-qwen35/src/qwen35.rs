@@ -12806,7 +12806,10 @@ fn kv_cache_attention_dispatch(
         pos,
         flash_mode: s.flash_mode as usize,
         capture_mode: gpu.graphs.capture_mode,
-    });
+        batch_size: 1,
+        is_tree: false,
+        is_boundary: false, // boundary producer not yet populated
+    }).map_err(|e| HipError::new(0, &e.to_string()))?;
     let io = AttnParams {
         q: &s.fa_q,
         k: &s.fa_k,
@@ -12817,14 +12820,19 @@ fn kv_cache_attention_dispatch(
         v_scales: None,
         pos_buf: &s.pos_buf,
         pos,
+        positions: None,
         n_heads: config.n_heads,
         n_kv_heads: config.n_kv_heads,
         head_dim: config.head_dim,
         physical_cap: kv_cache.physical_cap,
+        batch_size: 1,
+        max_ctx_len: 0,
         flash_partials: Some(&s.flash_partials),
         givens_cos: kv_cache.givens_cos.as_ref(),
         givens_sin: kv_cache.givens_sin.as_ref(),
-        v_mode_bits: kv_cache.v_mode_bits(),
+        tree_bias: None,
+        block_start: 0,
+        block_cols: 0,
         output: &s.fa_attn_out,
     };
     let ctx = DispatchCtx::new(gpu);

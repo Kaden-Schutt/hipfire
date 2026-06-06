@@ -16,20 +16,50 @@ pub struct AttnParams<'a> {
     pub k_scales: Option<&'a GpuTensor>,
     /// TODO(ship 3.1b): llama HFQ8/INT8 attend scales
     pub v_scales: Option<&'a GpuTensor>,
+    // ── Position (dual-type coexistence per D4/F8) ──
+    /// Single-token position buffer. Used when `batch_size == 1`.
+    /// Ignored when `batch_size > 1` (use `positions` instead).
     pub pos_buf: &'a DeviceBuffer,
-    /// 0-based physical position index. `dispatch_attention` internally computes
+    /// 0-based physical position index. `dispatch_*` internally computes
     /// `seq_len = pos + 1`. Callers MUST pass `pos`, never `pos + 1`.
+    /// Used only for single-token (`batch_size == 1`).
     pub pos: usize,
+    /// Batched position tensor `[n]` i32. Used when `batch_size > 1`.
+    /// `None` when `batch_size == 1` (use `pos_buf` instead).
+    pub positions: Option<&'a GpuTensor>,
+    // ── Dimensions ──
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
+    /// Maximum KV cache capacity (= max_seq for batched kernels).
     pub physical_cap: usize,
+    /// Batch size. REQUIRED: `1` for decode/per-token, `>1` for batched prefill.
+    pub batch_size: usize,
+    /// Batched attend loop bound (= start_pos + n). `0` when `batch_size == 1`.
+    pub max_ctx_len: usize,
+    // ── Flash attention scratch ──
     pub flash_partials: Option<&'a GpuTensor>,
     pub givens_cos: Option<&'a GpuTensor>,
     pub givens_sin: Option<&'a GpuTensor>,
-    /// V-quant mode kernarg for fwht KV write/flash (8=Q8, 2/3/4=Lloyd-V).
-    pub v_mode_bits: i32,
+    // ── Tree-verify (spec-decode) ──
+    /// `[n×n]` additive bias matrix. `Some` → tree-verify, `None` → causal.
+    pub tree_bias: Option<&'a GpuTensor>,
+    /// Tree window start (0 for plain causal).
+    pub block_start: usize,
+    /// Tree window cols (0 for plain causal).
+    pub block_cols: usize,
     pub output: &'a GpuTensor,
+}
+
+impl<'a> AttnParams<'a> {
+    /// Returns the batched positions tensor, asserting `batch_size > 1`.
+    pub fn positions(&self) -> &'a GpuTensor {
+        debug_assert!(
+            self.batch_size > 1,
+            "positions() called with batch_size == 1"
+        );
+        self.positions.expect("positions required for batch_size > 1")
+    }
 }
 
 pub struct AttentionFamily {
@@ -57,20 +87,11 @@ impl AttentionFamily {
         self.registry.resolve(key, ctx, shape)
     }
 
-    pub fn run(
-        &self,
-        ctx: &DispatchCtx,
-        gpu: &mut Gpu,
-        key: KernelKey,
-        params: &AttnParams,
-    ) -> Result<(), DispatchError> {
-        self.resolve(key, ctx, None)?;
-        dispatch_attention(gpu, key, params)
-    }
-
     /// Paired write-then-attend entry point (Phase 0.3). Takes a `KvTierPlan`
     /// carrying both the write key and attend key derived from the same
     /// `KvTierInputs`. Enforces the tier-match debug_assert before dispatch.
+    /// Threads `ShapeInfo` derived from `plan.batch_size` into `resolve()`
+    /// so that `BatchGt(1)`/`BatchEq(1)` shape gates actually fire.
     pub fn run_attention(
         &self,
         ctx: &DispatchCtx,
@@ -78,10 +99,15 @@ impl AttentionFamily {
         plan: &crate::families::kv_tier::KvTierPlan,
         io: &AttnParams,
     ) -> Result<(), DispatchError> {
-        self.resolve(plan.write_key, ctx, None)?;
-        dispatch_attention(gpu, plan.write_key, io)?;
-        self.resolve(plan.attend_key, ctx, None)?;
-        dispatch_attention(gpu, plan.attend_key, io)
+        let shape = ShapeInfo {
+            batch_size: plan.batch_size,
+            head_dim: io.head_dim,
+            m: 0,
+        };
+        self.resolve(plan.write_key, ctx, Some(&shape))?;
+        dispatch_kv_write(gpu, plan.write_key, plan, io)?;
+        self.resolve(plan.attend_key, ctx, Some(&shape))?;
+        dispatch_attend(gpu, plan.attend_key, plan, io)
     }
 }
 
@@ -97,150 +123,144 @@ macro_rules! hip {
     };
 }
 
-fn dispatch_attention(gpu: &mut Gpu, key: KernelKey, params: &AttnParams) -> Result<(), DispatchError> {
-    let seq_len = params.pos + 1;
+// ── KV Cache Write dispatch ────────────────────────────
+
+fn dispatch_kv_write(
+    gpu: &mut Gpu,
+    key: KernelKey,
+    plan: &crate::families::kv_tier::KvTierPlan,
+    io: &AttnParams,
+) -> Result<(), DispatchError> {
     match key {
+        // ── Single-token (decode / per-token fallback) ──
         KernelKey::KvWriteF32 => {
-            let kv_dim = params.n_kv_heads * params.head_dim;
-            hip!(gpu.kv_cache_write(params.k_cache, params.k, params.pos_buf, kv_dim))?;
-            hip!(gpu.kv_cache_write(params.v_cache, params.v, params.pos_buf, kv_dim))
+            debug_assert_eq!(plan.batch_size, 1);
+            let kv_dim = io.n_kv_heads * io.head_dim;
+            hip!(gpu.kv_cache_write(io.k_cache, io.k, io.pos_buf, kv_dim))?;
+            hip!(gpu.kv_cache_write(io.v_cache, io.v, io.pos_buf, kv_dim))
         }
         KernelKey::KvWriteQ8_0 => {
-            hip!(gpu.kv_cache_write_q8_0(params.k_cache, params.k, params.pos_buf, params.n_kv_heads, params.head_dim))?;
-            hip!(gpu.kv_cache_write_q8_0(params.v_cache, params.v, params.pos_buf, params.n_kv_heads, params.head_dim))
+            debug_assert_eq!(plan.batch_size, 1);
+            hip!(gpu.kv_cache_write_q8_0(io.k_cache, io.k, io.pos_buf, io.n_kv_heads, io.head_dim))?;
+            hip!(gpu.kv_cache_write_q8_0(io.v_cache, io.v, io.pos_buf, io.n_kv_heads, io.head_dim))
         }
         KernelKey::KvWriteAsym4 => {
-            let ct = params.givens_cos.unwrap();
-            let st = params.givens_sin.unwrap();
+            debug_assert_eq!(plan.batch_size, 1);
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_asym4_fused(
-                params.k_cache, params.v_cache, params.k, params.v, params.pos_buf,
-                ct, st, params.n_kv_heads, params.head_dim,
+                io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
+                ct, st, io.n_kv_heads, io.head_dim,
             ))
         }
         KernelKey::KvWriteAsym4Fwht => {
-            let ct = params.givens_cos.unwrap();
-            let st = params.givens_sin.unwrap();
+            debug_assert_eq!(plan.batch_size, 1);
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_fwht4_fused(
-                params.k_cache, params.v_cache, params.k, params.v, params.pos_buf,
-                ct, st, params.n_kv_heads, params.head_dim, params.v_mode_bits,
+                io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
+                ct, st, io.n_kv_heads, io.head_dim, plan.v_mode_bits,
             ))
         }
         KernelKey::KvWriteAsym3 => {
-            let ct = params.givens_cos.unwrap();
-            let st = params.givens_sin.unwrap();
+            debug_assert_eq!(plan.batch_size, 1);
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_asym3_fused(
-                params.k_cache, params.v_cache, params.k, params.v, params.pos_buf,
-                ct, st, params.n_kv_heads, params.head_dim,
+                io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
+                ct, st, io.n_kv_heads, io.head_dim,
             ))
         }
         KernelKey::KvWriteAsym3Fwht => {
-            let ct = params.givens_cos.unwrap();
-            let st = params.givens_sin.unwrap();
+            debug_assert_eq!(plan.batch_size, 1);
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_fwht3_fused(
-                params.k_cache, params.v_cache, params.k, params.v, params.pos_buf,
-                ct, st, params.n_kv_heads, params.head_dim, params.v_mode_bits,
+                io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
+                ct, st, io.n_kv_heads, io.head_dim, plan.v_mode_bits,
             ))
         }
         KernelKey::KvWriteAsym2 => {
-            let ct = params.givens_cos.unwrap();
-            let st = params.givens_sin.unwrap();
+            debug_assert_eq!(plan.batch_size, 1);
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_asym2_fused(
-                params.k_cache, params.v_cache, params.k, params.v, params.pos_buf,
-                ct, st, params.n_kv_heads, params.head_dim,
+                io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
+                ct, st, io.n_kv_heads, io.head_dim,
             ))
         }
         KernelKey::KvWriteAsym2Fwht => {
-            let ct = params.givens_cos.unwrap();
-            let st = params.givens_sin.unwrap();
+            debug_assert_eq!(plan.batch_size, 1);
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_fwht2_fused(
-                params.k_cache, params.v_cache, params.k, params.v, params.pos_buf,
-                ct, st, params.n_kv_heads, params.head_dim, params.v_mode_bits,
+                io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
+                ct, st, io.n_kv_heads, io.head_dim, plan.v_mode_bits,
             ))
         }
-        KernelKey::AttnF32 => {
-            hip!(gpu.attention_f32(
-                params.q, params.k_cache, params.v_cache, params.output, params.pos_buf,
-                seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap,
+
+        // ── Batched (prefill / tree-verify) ──
+        KernelKey::KvWriteAsym4Batched => {
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            hip!(gpu.kv_cache_write_asym4_batched(
+                io.k_cache, io.v_cache, io.k, io.v, io.positions(),
+                ct, st, io.n_kv_heads, io.head_dim, io.batch_size,
             ))
         }
-        KernelKey::AttnFlashQ8_0 => {
-            let fp = params.flash_partials.unwrap();
-            hip!(gpu.attention_flash_q8_0(
-                params.q, params.k_cache, params.v_cache, params.output, params.pos_buf,
-                seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap, fp,
+        KernelKey::KvWriteAsym4FwhtBatched => {
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            hip!(gpu.kv_cache_write_fwht4_batched(
+                io.k_cache, io.v_cache, io.k, io.v, io.positions(),
+                ct, st, io.n_kv_heads, io.head_dim, io.batch_size, plan.v_mode_bits,
             ))
         }
-        KernelKey::AttnQ8_0Kv => {
-            hip!(gpu.attention_q8_0_kv(
-                params.q, params.k_cache, params.v_cache, params.output, params.pos_buf,
-                seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap,
+        KernelKey::KvWriteAsym3Batched => {
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            hip!(gpu.kv_cache_write_asym3_batched(
+                io.k_cache, io.v_cache, io.k, io.v, io.positions(),
+                ct, st, io.n_kv_heads, io.head_dim, io.batch_size,
             ))
         }
-        KernelKey::AttnFlashAsym4 => {
-            let ct = params.givens_cos.unwrap();
-            let st = params.givens_sin.unwrap();
-            let fp = params.flash_partials.unwrap();
-            hip!(gpu.attention_flash_asym4(
-                params.q, params.k_cache, params.v_cache, params.output, params.pos_buf,
-                ct, st, seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap, fp,
+        KernelKey::KvWriteAsym3FwhtBatched => {
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            hip!(gpu.kv_cache_write_fwht3_batched(
+                io.k_cache, io.v_cache, io.k, io.v, io.positions(),
+                ct, st, io.n_kv_heads, io.head_dim, io.batch_size, plan.v_mode_bits,
             ))
         }
-        KernelKey::AttnFlashAsym4Fwht => {
-            let ct = params.givens_cos.unwrap();
-            let st = params.givens_sin.unwrap();
-            let fp = params.flash_partials.unwrap();
-            hip!(gpu.attention_flash_fwht4(
-                params.q, params.k_cache, params.v_cache, params.output, params.pos_buf,
-                ct, st, seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap, fp,
-                params.v_mode_bits,
+        KernelKey::KvWriteAsym2Batched => {
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            hip!(gpu.kv_cache_write_asym2_batched(
+                io.k_cache, io.v_cache, io.k, io.v, io.positions(),
+                ct, st, io.n_kv_heads, io.head_dim, io.batch_size,
             ))
         }
-        KernelKey::AttnFlashAsym3 => {
-            let ct = params.givens_cos.unwrap();
-            let st = params.givens_sin.unwrap();
-            let fp = params.flash_partials.unwrap();
-            hip!(gpu.attention_flash_asym3(
-                params.q, params.k_cache, params.v_cache, params.output, params.pos_buf,
-                ct, st, seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap, fp,
+        KernelKey::KvWriteAsym2FwhtBatched => {
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            hip!(gpu.kv_cache_write_fwht2_batched(
+                io.k_cache, io.v_cache, io.k, io.v, io.positions(),
+                ct, st, io.n_kv_heads, io.head_dim, io.batch_size, plan.v_mode_bits,
             ))
         }
-        KernelKey::AttnFlashAsym3Fwht => {
-            let ct = params.givens_cos.unwrap();
-            let st = params.givens_sin.unwrap();
-            let fp = params.flash_partials.unwrap();
-            hip!(gpu.attention_flash_fwht3(
-                params.q, params.k_cache, params.v_cache, params.output, params.pos_buf,
-                ct, st, seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap, fp,
-                params.v_mode_bits,
+        KernelKey::KvWriteQ8_0Batched => {
+            // Q8 batched write is called twice (K, then V) — not fused.
+            let pos = io.positions();
+            hip!(gpu.kv_cache_write_q8_0_batched(
+                io.k_cache, io.k, pos, io.n_kv_heads, io.head_dim, io.batch_size,
+            ))?;
+            hip!(gpu.kv_cache_write_q8_0_batched(
+                io.v_cache, io.v, pos, io.n_kv_heads, io.head_dim, io.batch_size,
             ))
         }
-        KernelKey::AttnFlashAsym2 => {
-            let ct = params.givens_cos.unwrap();
-            let st = params.givens_sin.unwrap();
-            let fp = params.flash_partials.unwrap();
-            hip!(gpu.attention_flash_asym2(
-                params.q, params.k_cache, params.v_cache, params.output, params.pos_buf,
-                ct, st, seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap, fp,
-            ))
-        }
-        KernelKey::AttnFlashAsym2Fwht => {
-            let ct = params.givens_cos.unwrap();
-            let st = params.givens_sin.unwrap();
-            let fp = params.flash_partials.unwrap();
-            hip!(gpu.attention_flash_fwht2(
-                params.q, params.k_cache, params.v_cache, params.output, params.pos_buf,
-                ct, st, seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap, fp,
-                params.v_mode_bits,
-            ))
-        }
-        KernelKey::AttnGqaFused => {
-            hip!(gpu.attention_flash_gqa_fused(
-                params.q, params.k_cache, params.v_cache, params.output,
-                seq_len, params.n_heads, params.n_kv_heads, params.head_dim, params.physical_cap,
-            ))
-        }
+
         _ => Err(DispatchError::UnsupportedVariant {
-            family: "attention",
+            family: "attention/kv_write",
             variant: "unhandled key — missing dispatch arm",
             arch: "",
             quant: "",
@@ -248,12 +268,215 @@ fn dispatch_attention(gpu: &mut Gpu, key: KernelKey, params: &AttnParams) -> Res
     }
 }
 
-/// All `KernelKey` variants that `dispatch_attention` handles with dedicated
-/// (non-catch-all) match arms. Used by the dispatch-arm completeness test.
-/// If you add a new attention key and forget to add a dispatch arm, the test
-/// `dispatch_attention_has_arms_for_all_attention_keys` will fail.
-pub(crate) const DISPATCHED_ATTENTION_KEYS: &[KernelKey] = &[
-    // KV write
+// ── Attention dispatch ─────────────────────────────────
+
+fn dispatch_attend(
+    gpu: &mut Gpu,
+    key: KernelKey,
+    plan: &crate::families::kv_tier::KvTierPlan,
+    io: &AttnParams,
+) -> Result<(), DispatchError> {
+    match key {
+        // ── Single-token (decode / per-token fallback) ──
+        KernelKey::AttnF32 => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let seq_len = io.pos + 1;
+            hip!(gpu.attention_f32(
+                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap,
+            ))
+        }
+        KernelKey::AttnFlashQ8_0 => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let seq_len = io.pos + 1;
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_q8_0(
+                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
+            ))
+        }
+        KernelKey::AttnQ8_0Kv => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let seq_len = io.pos + 1;
+            hip!(gpu.attention_q8_0_kv(
+                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap,
+            ))
+        }
+        KernelKey::AttnFlashAsym4 => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let seq_len = io.pos + 1;
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_asym4(
+                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
+            ))
+        }
+        KernelKey::AttnFlashAsym4Fwht => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let seq_len = io.pos + 1;
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_fwht4(
+                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
+                plan.v_mode_bits,
+            ))
+        }
+        KernelKey::AttnFlashAsym3 => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let seq_len = io.pos + 1;
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_asym3(
+                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
+            ))
+        }
+        KernelKey::AttnFlashAsym3Fwht => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let seq_len = io.pos + 1;
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_fwht3(
+                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
+                plan.v_mode_bits,
+            ))
+        }
+        KernelKey::AttnFlashAsym2 => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let seq_len = io.pos + 1;
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_asym2(
+                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
+            ))
+        }
+        KernelKey::AttnFlashAsym2Fwht => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let seq_len = io.pos + 1;
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_fwht2(
+                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
+                plan.v_mode_bits,
+            ))
+        }
+        KernelKey::AttnGqaFused => {
+            debug_assert_eq!(plan.batch_size, 1);
+            let seq_len = io.pos + 1;
+            hip!(gpu.attention_flash_gqa_fused(
+                io.q, io.k_cache, io.v_cache, io.output,
+                seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap,
+            ))
+        }
+
+        // ── Batched (prefill / tree-verify) ──
+        KernelKey::AttnFlashAsym4BatchedMasked => {
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_asym4_batched_masked(
+                io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
+                io.physical_cap, io.max_ctx_len, io.batch_size, fp,
+                io.tree_bias, io.block_start, io.block_cols,
+            ))
+        }
+        KernelKey::AttnFlashAsym4FwhtBatchedMasked => {
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_fwht4_batched_masked(
+                io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
+                io.physical_cap, io.max_ctx_len, io.batch_size, fp,
+                io.tree_bias, io.block_start, io.block_cols, plan.v_mode_bits,
+            ))
+        }
+        KernelKey::AttnFlashAsym3BatchedMasked => {
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_asym3_batched_masked(
+                io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
+                io.physical_cap, io.max_ctx_len, io.batch_size, fp,
+                io.tree_bias, io.block_start, io.block_cols,
+            ))
+        }
+        KernelKey::AttnFlashAsym3FwhtBatchedMasked => {
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_fwht3_batched_masked(
+                io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
+                io.physical_cap, io.max_ctx_len, io.batch_size, fp,
+                io.tree_bias, io.block_start, io.block_cols, plan.v_mode_bits,
+            ))
+        }
+        // 2-bit: _batched only (no _masked — tree-verify gap)
+        KernelKey::AttnFlashAsym2Batched => {
+            debug_assert!(io.tree_bias.is_none(), "asym2 has no _batched_masked variant");
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_asym2_batched(
+                io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
+                io.physical_cap, io.max_ctx_len, io.batch_size, fp,
+            ))
+        }
+        KernelKey::AttnFlashAsym2FwhtBatched => {
+            debug_assert!(io.tree_bias.is_none(), "asym2 fwht has no _batched_masked variant");
+            let ct = io.givens_cos.unwrap();
+            let st = io.givens_sin.unwrap();
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_fwht2_batched(
+                io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
+                io.physical_cap, io.max_ctx_len, io.batch_size, fp,
+                plan.v_mode_bits,
+            ))
+        }
+        // Q8_0: P-1 no-LDS-cap tiled kernel
+        KernelKey::AttnQ8_0KvBatchedMasked => {
+            let fp = io.flash_partials.unwrap();
+            hip!(gpu.attention_flash_q8_0_batched_masked(
+                io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                io.n_heads, io.n_kv_heads, io.head_dim,
+                io.physical_cap, io.max_ctx_len, io.batch_size, fp,
+                io.tree_bias, io.block_start, io.block_cols,
+            ))
+        }
+
+        _ => Err(DispatchError::UnsupportedVariant {
+            family: "attention/attend",
+            variant: "unhandled key — missing dispatch arm",
+            arch: "",
+            quant: "",
+        }),
+    }
+}
+
+// ── Dispatch key constants for completeness tests ──────
+
+/// All `KernelKey` variants handled by `dispatch_kv_write`.
+/// If you add a new KV write key and forget to add a dispatch arm, the
+/// completeness test will fail.
+pub(crate) const DISPATCHED_KV_WRITE_KEYS: &[KernelKey] = &[
+    // Single-token
     KernelKey::KvWriteF32,
     KernelKey::KvWriteQ8_0,
     KernelKey::KvWriteAsym4,
@@ -262,7 +485,19 @@ pub(crate) const DISPATCHED_ATTENTION_KEYS: &[KernelKey] = &[
     KernelKey::KvWriteAsym3Fwht,
     KernelKey::KvWriteAsym2,
     KernelKey::KvWriteAsym2Fwht,
-    // Attention
+    // Batched
+    KernelKey::KvWriteAsym4Batched,
+    KernelKey::KvWriteAsym4FwhtBatched,
+    KernelKey::KvWriteAsym3Batched,
+    KernelKey::KvWriteAsym3FwhtBatched,
+    KernelKey::KvWriteAsym2Batched,
+    KernelKey::KvWriteAsym2FwhtBatched,
+    KernelKey::KvWriteQ8_0Batched,
+];
+
+/// All `KernelKey` variants handled by `dispatch_attend`.
+pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
+    // Single-token
     KernelKey::AttnF32,
     KernelKey::AttnFlashQ8_0,
     KernelKey::AttnQ8_0Kv,
@@ -273,94 +508,115 @@ pub(crate) const DISPATCHED_ATTENTION_KEYS: &[KernelKey] = &[
     KernelKey::AttnFlashAsym2,
     KernelKey::AttnFlashAsym2Fwht,
     KernelKey::AttnGqaFused,
+    // Batched
+    KernelKey::AttnFlashAsym4BatchedMasked,
+    KernelKey::AttnFlashAsym4FwhtBatchedMasked,
+    KernelKey::AttnFlashAsym3BatchedMasked,
+    KernelKey::AttnFlashAsym3FwhtBatchedMasked,
+    KernelKey::AttnFlashAsym2Batched,
+    KernelKey::AttnFlashAsym2FwhtBatched,
+    KernelKey::AttnQ8_0KvBatchedMasked,
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every `KernelKey` registered in the attention table MUST have a dedicated
-    /// dispatch arm. Catches the 953ea648 defect class: a key is registered but
-    /// `dispatch_attention` falls through to the catch-all (silently or with a
-    /// generic error).
-    ///
-    /// Two-way check:
-    ///  (a) Every registered table key appears in `DISPATCHED_ATTENTION_KEYS`.
-    ///  (b) Every key in `DISPATCHED_ATTENTION_KEYS` is registered in the table.
+    /// Bidirectional completeness check for `dispatch_kv_write`.
+    /// Every registered KV write key must have an arm, and every arm key
+    /// must be registered.
     #[test]
-    fn dispatch_attention_has_arms_for_all_attention_keys() {
+    fn dispatch_kv_write_has_arms_for_all_registered_keys() {
         let family = AttentionFamily::new();
         let ctx = DispatchCtx::for_test("gfx1100");
 
-        // Build the set of registered attention keys by probing resolve.
-        let registered: Vec<KernelKey> = DISPATCHED_ATTENTION_KEYS
-            .iter()
-            .filter(|&&k| family.resolve(k, &ctx, None).is_ok())
-            .copied()
-            .collect();
+        let dispatched_set: std::collections::HashSet<KernelKey> =
+            DISPATCHED_KV_WRITE_KEYS.iter().copied().collect();
 
-        // (a) Every registered table key must be in DISPATCHED_ATTENTION_KEYS.
-        //     We check by seeing if the dispatched list covers all registrations.
-        //     Since DISPATCHED_ATTENTION_KEYS is the exhaustive list, any key
-        //     registered in the table but NOT dispatched will fail the (b) check.
-
-        // (b) Every dispatched key must resolve (be registered) on at least gfx1100.
-        //     This catches stale entries in DISPATCHED_ATTENTION_KEYS.
-        for &key in DISPATCHED_ATTENTION_KEYS {
+        for &key in DISPATCHED_KV_WRITE_KEYS {
+            let batch = if is_batched_kv_key(key) { 16 } else { 1 };
+            let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0 };
             assert!(
-                registered.contains(&key),
-                "DISPATCHED_ATTENTION_KEYS contains {:?} but it is NOT registered in the attention table — stale entry",
+                family.resolve(key, &ctx, Some(&shape)).is_ok(),
+                "DISPATCHED_KV_WRITE_KEYS contains {:?} but it is NOT registered — stale entry",
                 key
             );
         }
 
-        // The real power: check that the attention table registrations are a
-        // subset of DISPATCHED_ATTENTION_KEYS. We iterate the attention-family
-        // registry directly.
-        let dispatched_set: std::collections::HashSet<KernelKey> =
-            DISPATCHED_ATTENTION_KEYS.iter().copied().collect();
-
-        // Probe every Attn*/KvWrite* variant against the registry.
-        // If a key resolves but isn't in the dispatched set, it has no arm.
-        let attention_key_candidates: &[KernelKey] = &[
-            KernelKey::KvWriteF32,
-            KernelKey::KvWriteQ8_0,
-            KernelKey::KvWriteAsym4,
-            KernelKey::KvWriteAsym4Fwht,
-            KernelKey::KvWriteAsym3,
-            KernelKey::KvWriteAsym3Fwht,
-            KernelKey::KvWriteAsym2,
-            KernelKey::KvWriteAsym2Fwht,
-            KernelKey::AttnF32,
-            KernelKey::AttnFlashQ8_0,
-            KernelKey::AttnQ8_0Kv,
-            KernelKey::AttnFlashAsym4,
-            KernelKey::AttnFlashAsym4Fwht,
-            KernelKey::AttnFlashAsym3,
-            KernelKey::AttnFlashAsym3Fwht,
-            KernelKey::AttnFlashAsym2,
-            KernelKey::AttnFlashAsym2Fwht,
-            KernelKey::AttnGqaFused,
-        ];
-
-        for &key in attention_key_candidates {
-            if family.resolve(key, &ctx, None).is_ok() {
+        // Ensure no registered KV write key is missing from the dispatched set.
+        for &key in DISPATCHED_KV_WRITE_KEYS {
+            let batch = if is_batched_kv_key(key) { 16 } else { 1 };
+            let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0 };
+            if family.resolve(key, &ctx, Some(&shape)).is_ok() {
                 assert!(
                     dispatched_set.contains(&key),
-                    "attention table registers {:?} but dispatch_attention has no dedicated arm — will hit catch-all",
+                    "registered key {:?} is not in DISPATCHED_KV_WRITE_KEYS — missing arm",
                     key
                 );
             }
         }
+    }
 
-        // Guard: the dispatched list + candidate list must have the same length.
-        // If they differ, either list is out of sync with the other.
-        assert_eq!(
-            DISPATCHED_ATTENTION_KEYS.len(),
-            attention_key_candidates.len(),
-            "DISPATCHED_ATTENTION_KEYS ({} entries) and the candidate probe list ({} entries) are out of sync",
-            DISPATCHED_ATTENTION_KEYS.len(),
-            attention_key_candidates.len(),
-        );
+    /// Helper: is this key a batched KV write key?
+    fn is_batched_kv_key(key: KernelKey) -> bool {
+        use KernelKey::*;
+        matches!(
+            key,
+            KvWriteAsym4Batched
+            | KvWriteAsym4FwhtBatched
+            | KvWriteAsym3Batched
+            | KvWriteAsym3FwhtBatched
+            | KvWriteAsym2Batched
+            | KvWriteAsym2FwhtBatched
+            | KvWriteQ8_0Batched
+        )
+    }
+
+    /// Bidirectional completeness check for `dispatch_attend`.
+    #[test]
+    fn dispatch_attend_has_arms_for_all_registered_keys() {
+        let family = AttentionFamily::new();
+        let ctx = DispatchCtx::for_test("gfx1100");
+
+        let dispatched_set: std::collections::HashSet<KernelKey> =
+            DISPATCHED_ATTEND_KEYS.iter().copied().collect();
+
+        for &key in DISPATCHED_ATTEND_KEYS {
+            // Single-token keys resolve at batch_size=1, batched at batch_size>1
+            let batch = if is_batched_key(key) { 16 } else { 1 };
+            let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0 };
+            assert!(
+                family.resolve(key, &ctx, Some(&shape)).is_ok(),
+                "DISPATCHED_ATTEND_KEYS contains {:?} but it is NOT registered — stale entry",
+                key
+            );
+        }
+
+        for &key in DISPATCHED_ATTEND_KEYS {
+            let batch = if is_batched_key(key) { 16 } else { 1 };
+            let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0 };
+            if family.resolve(key, &ctx, Some(&shape)).is_ok() {
+                assert!(
+                    dispatched_set.contains(&key),
+                    "registered key {:?} is not in DISPATCHED_ATTEND_KEYS — missing arm",
+                    key
+                );
+            }
+        }
+    }
+
+    /// Helper: is this key a batched key (needs batch_size > 1 to resolve)?
+    fn is_batched_key(key: KernelKey) -> bool {
+        use KernelKey::*;
+        matches!(
+            key,
+            AttnFlashAsym4BatchedMasked
+            | AttnFlashAsym4FwhtBatchedMasked
+            | AttnFlashAsym3BatchedMasked
+            | AttnFlashAsym3FwhtBatchedMasked
+            | AttnFlashAsym2Batched
+            | AttnFlashAsym2FwhtBatched
+            | AttnQ8_0KvBatchedMasked
+        )
     }
 }

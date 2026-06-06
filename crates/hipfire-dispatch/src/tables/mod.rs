@@ -97,6 +97,7 @@ impl ShapePredicate {
     pub fn eval(&self, shape: &ShapeInfo) -> bool {
         match self {
             Self::BatchGt(n) => shape.batch_size > *n,
+            Self::BatchEq(n) => shape.batch_size == *n,
             Self::HeadDimEq(n) => shape.head_dim == *n,
             Self::MLt(n) => shape.m < *n,
         }

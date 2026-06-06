@@ -236,6 +236,15 @@ pub enum KernelKey {
     AttnQ8_0Kv,    // non-flash short-context Q8_0 decode (ship 3.1 B0)
     AttnGqaFused,
     AttnF32,
+    // Attention — batched prefill / tree-verify (ship 3.2)
+    AttnFlashAsym4BatchedMasked,
+    AttnFlashAsym4FwhtBatchedMasked,
+    AttnFlashAsym3BatchedMasked,
+    AttnFlashAsym3FwhtBatchedMasked,
+    AttnFlashAsym2Batched,       // no _masked — 2-bit tree-verify gap
+    AttnFlashAsym2FwhtBatched,   // no _masked — 2-bit tree-verify gap
+    AttnQ8_0KvBatchedMasked,     // P-1 no-LDS-cap tiled kernel
+    // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
     // KV Cache Write
     KvWriteAsym4,
     KvWriteAsym4Fwht,
@@ -245,6 +254,14 @@ pub enum KernelKey {
     KvWriteAsym2Fwht,
     KvWriteQ8_0,
     KvWriteF32,
+    // KV Cache Write — batched prefill (ship 3.2)
+    KvWriteAsym4Batched,
+    KvWriteAsym4FwhtBatched,
+    KvWriteAsym3Batched,
+    KvWriteAsym3FwhtBatched,
+    KvWriteAsym2Batched,
+    KvWriteAsym2FwhtBatched,
+    KvWriteQ8_0Batched,
 }
 
 // ── Shape context for predicate evaluation ───────────
@@ -285,6 +302,7 @@ pub enum ArchPredicate {
 #[derive(Clone, Debug)]
 pub enum ShapePredicate {
     BatchGt(usize),
+    BatchEq(usize),
     HeadDimEq(usize),
     MLt(usize),
 }
