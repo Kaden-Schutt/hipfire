@@ -595,6 +595,16 @@ pub fn fused_qkv_family() -> &'static hipfire_dispatch::families::fused_qkv::Fus
     FUSED_QKV.get_or_init(hipfire_dispatch::families::fused_qkv::FusedQkvFamily::new)
 }
 
+/// Process-global [`MoeFamily`], mirroring [`gemv_family`]. The centralized MoE
+/// decode entry (Ship 4): arches route their per-layer MoE decode through
+/// `moe_family().run(..)` so expert dispatch lives in the dispatch crate rather
+/// than per-model kernel calls.
+pub fn moe_family() -> &'static hipfire_dispatch::families::moe::MoeFamily {
+    use std::sync::OnceLock;
+    static MOE: OnceLock<hipfire_dispatch::families::moe::MoeFamily> = OnceLock::new();
+    MOE.get_or_init(hipfire_dispatch::families::moe::MoeFamily::new)
+}
+
 pub use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
 pub use hipfire_dispatch::families::gemv::{RotInput, RotateInputs, RotatedActivation};
 pub use hipfire_dispatch::context::DispatchCtx;

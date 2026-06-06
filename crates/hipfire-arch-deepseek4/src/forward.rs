@@ -2737,68 +2737,42 @@ fn ffn_routed(
             .gate_bias
             .as_ref()
             .ok_or_else(|| format!("ffn_routed l{layer_idx}: gate_bias missing"))?;
-        gpu.deepseek4_moe_topk_bias_aware_f32(
-            scores_dev,
-            bias_dev,
-            topk_idx_dev,
-            topk_w_dev,
-            cfg.n_routed_experts as i32,
-            k_top as i32,
-            route_scale_override,
-        )
-        .map_err(|e| format!("deepseek4_moe_topk_bias_aware l{layer_idx}: {e:?}"))?;
-
         let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
         let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
         let gate_batch = state.moe_gate_batch.as_ref().unwrap();
         let up_batch = state.moe_up_batch.as_ref().unwrap();
         let rot_batch = state.moe_rot_batch.as_ref().unwrap();
 
-        // 1. Fused gate_up GEMV: one launch dispatches all k_top experts'
-        //    gate and up halves in parallel. M = 2*intermediate; the
-        //    kernel splits output rows by r<im → gate, r>=im → up.
-        gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
-            gate_up_ptrs,
-            topk_idx_dev,
-            ffn_x_rot,
-            gate_batch,
-            up_batch,
-            2 * im,
-            cfg.hidden_size,
+        // Bias-aware top-k select + the routed MQ2-Lloyd experts now run through
+        // the centralized MoE family (Ship 4.3): bias-aware top-k -> indexed
+        // gate_up -> batched silu*mul*clamp -> batched FWHT rotate -> indexed
+        // down with route-scaled residual accumulation into ffn_out. The router
+        // GEMV + sqrt_softplus (moe_route, above) and the shared expert
+        // (ffn_stub) stay model-owned; ffn_stub must have seeded ffn_out before
+        // this accumulates into it.
+        let moe_params = hipfire_dispatch::families::moe::MoeBiasAwareParams {
+            hidden: cfg.hidden_size,
+            mi: im,
             k_top,
-        )
-        .map_err(|e| format!("fused gate_up l{layer_idx}: {e:?}"))?;
-
-        // 2. Batched silu_clamp + batched FWHT rotate. Each kernel handles
-        //    all k_top streams in one launch (grid.y = k_top), replacing
-        //    2*k_top = 12 small launches with 2.
-        gpu.deepseek4_silu_mul_clamp_f32_batched(
-            gate_batch,
-            up_batch,
-            gate_batch,
-            im,
-            k_top,
-            cfg.swiglu_limit,
-        )
-        .map_err(|e| format!("deepseek4_silu_mul_clamp batched l{layer_idx}: {e:?}"))?;
-        gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
-            .map_err(|e| format!("rotate batched l{layer_idx}: {e:?}"))?;
-
-        // 3. Fused down GEMV: one launch atomicAdds
-        //      Σ_k topk_weights[k] * (W_down[expert_k] · rot_batch[k])
-        //    into ffn_out. Replaces k_top per-expert GEMV + scaled_add
-        //    pairs. The route_scale_override is baked into topk_weights.
-        gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
-            w2_ptrs,
-            topk_idx_dev,
-            topk_w_dev,
-            rot_batch,
+            n_exp: cfg.n_routed_experts,
+            route_scale: route_scale_override,
+            swiglu_limit: cfg.swiglu_limit,
+            batch_size: 1,
+            x_rot: ffn_x_rot,
             ffn_out,
-            cfg.hidden_size,
-            im,
-            k_top,
-        )
-        .map_err(|e| format!("fused down l{layer_idx}: {e:?}"))?;
+            scores: scores_dev,
+            gate_bias: bias_dev,
+            expert_gate_up_ptrs: gate_up_ptrs,
+            expert_down_ptrs: w2_ptrs,
+            topk_indices: topk_idx_dev,
+            topk_weights: topk_w_dev,
+            gate_batch,
+            up_batch,
+            rot_batch,
+        };
+        hipfire_runtime::llama::moe_family()
+            .run_bias_aware(gpu, &moe_params)
+            .map_err(|e| format!("ffn_routed l{layer_idx} dispatch: {e}"))?;
 
         return Ok(());
     }
@@ -6512,12 +6486,12 @@ fn ffn_batched(
     gpu.sqrt_softplus_f32(&pbs.moe_scores_batch)
         .map_err(|e| format!("sqrt_softplus_f32 moe scores l{layer_idx}: {e:?}"))?;
 
-    if hash_routing {
-        // Hash routing: per-batch GPU-side tid2eid lookup + score gather
-        // + normalize + route_scale, all in one launch. Eliminates the
-        // d2h(scores) + CPU loop + 2× h2d (idx+w) round-trip that the
-        // legacy path used (which stalled the stream per hash layer).
-        // pbs.tokens already holds the chunk's token IDs as [B] i32.
+    // Routing + routed experts + combine now run through the centralized MoE
+    // family (Ship 4.3 prefill). The router GEMV + sqrt_softplus (above) and the
+    // shared expert stay model-owned; the family routes (hash or bias-aware),
+    // runs the experts (grouped GEMM at B>=gate, else scalar K4), and
+    // accumulates into ffn_out_batch (already holding the shared-expert output).
+    let routing = if hash_routing {
         if tokens.len() < batch_size {
             return Err(format!(
                 "ffn_batched l{layer_idx}: tokens len {} < batch_size {}",
@@ -6528,531 +6502,54 @@ fn ffn_batched(
         let tid2eid_dev = layer.tid2eid_dev.as_ref().ok_or_else(|| {
             format!(
                 "ffn_batched hash l{layer_idx}: tid2eid_dev missing (pre-FP4 \
-             quant skipped tid2eid; HFQ load_weights should still populate \
-             the device buffer)"
+                 quant skipped tid2eid; HFQ load_weights should still populate \
+                 the device buffer)"
             )
         })?;
-        gpu.hash_router_normalize_f32_batched(
-            tid2eid_dev,
-            &pbs.moe_scores_batch,
-            &pbs.tokens,
-            &pbs.moe_topk_indices_batch,
-            &pbs.moe_topk_weights_batch,
-            n_exp as i32,
-            k_top as i32,
-            route_scale,
-            batch_size as i32,
-        )
-        .map_err(|e| format!("hash_router_normalize_f32_batched l{layer_idx}: {e:?}"))?;
+        hipfire_dispatch::families::moe::MoePrefillRouting::Hash {
+            tid2eid: tid2eid_dev,
+            tokens: &pbs.tokens,
+        }
     } else {
         let gate_bias = layer
             .gate_bias
             .as_ref()
             .ok_or_else(|| format!("layer {layer_idx} gate.bias missing"))?;
-        // 10. Bias-aware top-K per batch row.
-        gpu.deepseek4_moe_topk_bias_aware_batched_f32(
-            &pbs.moe_scores_batch,
-            gate_bias,
-            &pbs.moe_topk_indices_batch,
-            &pbs.moe_topk_weights_batch,
-            n_exp as i32,
-            k_top as i32,
-            route_scale,
-            batch_size as i32,
-        )
-        .map_err(|e| format!("deepseek4_moe_topk_bias_aware_batched l{layer_idx}: {e:?}"))?;
-    }
+        hipfire_dispatch::families::moe::MoePrefillRouting::BiasAware { gate_bias }
+    };
 
-    // Gate 1 validation (2026-05-22): dump per-layer topk_indices to a
-    // file for routing-distribution analysis. Append mode — one
-    // [B, K_TOP] block of i32 per layer per chunk. Off by default.
-    if let Ok(path) = std::env::var("HIPFIRE_DEEPSEEK4_DUMP_TOPK") {
-        use std::io::Write;
-        let raw = gpu
-            .download_f32(&pbs.moe_topk_indices_batch)
-            .map_err(|e| format!("dump_topk download: {e:?}"))?;
-        // moe_topk_indices_batch is stored i32-in-F32-slots; reinterpret.
-        let n = batch_size * k_top;
-        let mut indices: Vec<i32> = Vec::with_capacity(n);
-        for i in 0..n {
-            indices.push(raw[i].to_bits() as i32);
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| format!("dump_topk open {path}: {e:?}"))?;
-        // Header: layer_idx | batch_size | k_top — 3 i32s
-        let header = [layer_idx as i32, batch_size as i32, k_top as i32];
-        let header_bytes = unsafe { std::slice::from_raw_parts(header.as_ptr() as *const u8, 12) };
-        f.write_all(header_bytes)
-            .map_err(|e| format!("dump_topk write header: {e:?}"))?;
-        let data_bytes =
-            unsafe { std::slice::from_raw_parts(indices.as_ptr() as *const u8, indices.len() * 4) };
-        f.write_all(data_bytes)
-            .map_err(|e| format!("dump_topk write data: {e:?}"))?;
-    }
-
-    // Grouped MoE dispatch: DEFAULT-ON when chunk_size ≥ 128 (validated
-    // crossover on gfx1151, 2026-05-26 — see
-    // project_v4f_l2_bottleneck_2026_05_26 memory).
-    //
-    // Original gate at 256 was set 2026-05-22 (commit 29984e2) based on
-    // theoretical "Gate 1 tile-fill" reasoning, never empirically swept
-    // at lower batch sizes. 2026-05-26 PP_BATCH×gate sweep on
-    // deepseek-v4-flash.mq2lloyd (2100-token prompt, B=16..256, 3 trials
-    // per cell, fresh process) shows the actual crossover is between
-    // B=64 (tied: 40.84 scalar vs 40.29 grouped) and B=128 (grouped wins
-    // 46.02 vs 39.28 = +17.2%). Setting threshold at 128 captures the
-    // win without paying the small-batch padding-overhead cost (-22% at
-    // B=16, -11% at B=32).
-    //
-    // HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE overrides the threshold for
-    // future sweeps. HIPFIRE_DEEPSEEK4_MOE_GROUPED=0 forces the scalar
-    // path at any batch (used for A/B regression debugging).
-    let gate_threshold: usize = std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(128);
-    let use_grouped =
-        batch_size >= gate_threshold && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
-
-    if use_grouped {
-        const BLOCK_M: usize = 16;
-        let m_total_max = batch_size * k_top + n_exp * BLOCK_M;
-
-        // Scatter (single launch): histogram + offsets + permute. Writes
-        // -1 sentinels into expert_tile_ids and sorted_slot_index for
-        // unused slots, so the grouped-GEMM can be launched at the
-        // worst-case tile count without a d2h sync on m_total.
-        gpu.moe_scatter_fused_k8(
-            &pbs.moe_topk_indices_batch,
-            &pbs.moe_expert_token_counts,
-            &pbs.moe_expert_offsets,
-            &pbs.moe_sorted_slot_index,
-            &pbs.moe_expert_tile_ids,
-            &pbs.moe_inverse_perm,
-            batch_size * k_top,
-            n_exp,
-            m_total_max,
-            BLOCK_M,
-        )
-        .map_err(|e| format!("moe_scatter_fused_k8 l{layer_idx}: {e:?}"))?;
-
-        // Grouped gate_up GEMM: M = 2*im (gate||up concat), K = hidden.
-        // x_row_div = k_top because X is per-token ffn_x_rot_batch [B, K].
-        //
-        // RECONCILED (#355 + #356) MQ2-Lloyd grouped MoE dispatch.
-        // 4-warp 64×16 variant (gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2) is
-        // the default ON for gfx11+ — #356 broadened the gate from gfx1151-only
-        // (#355) to gfx11||gfx12 (measured 83.8% vs 43.4% L2 hit, -9% kernel
-        // time on gfx1151). [REVIEWER NOTE: the broader gfx11||gfx12 default
-        // gate is #356's; #355 shipped gfx1151-only. Confirm on gfx11 dGPU.]
-        // Opt out via HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=0. Shape gate: gate_up
-        // M=2*im must be a multiple of 64, K=hidden a multiple of 256.
-        let use_lloyd_4w = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
-            .as_deref()
-        {
-            Ok("0") => false,
-            Ok("1") => true,
-            _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
-        } && (2 * im) % 64 == 0
-          && hidden % 256 == 0;
-        // MMQ-style index-pack preload (#356). Reverted to OPT-IN: the preload
-        // hoisted only 8 of 16 weight packs, decoding half the MQ2 weights wrong
-        // → long-context attractor on DS4 mq2lloyd (root-caused by @nwoolmer on
-        // gfx1151; the corrected kernel measured flat, so no reason to default it).
-        let use_mmqload = use_lloyd_4w && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
-            .as_deref() == Ok("1");
-        // Barrier-free nosync variant (#356, opt in via =1).
-        let use_nosync = use_mmqload && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
-            .as_deref() == Ok("1");
-        // Research levers from #355 (all opt-in, default OFF). When set they
-        // take precedence over the mmqload/nosync default path.
-        // Lever 1 (HIPFIRE_DEEPSEEK4_MOE_N32=1): N_TILE=32 tile-pairing on the
-        // 4w kernel — decode the MQ2-Lloyd A-fragment once per same-expert tile
-        // pair, amortizing the dequant ALU across 2 token sub-tiles.
-        let n32_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
-        // Lever 2 (HIPFIRE_DEEPSEEK4_MOE_CND=1): cndmask dequant on the n16 4w
-        // kernel — shorter dependency chain, same occupancy.
-        let cnd_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
-        // Lever 3 (HIPFIRE_DEEPSEEK4_MOE_8W=1): 8-warp variant (shares staged X
-        // across 8 warps; same occupancy as 4w, ~half X-load traffic).
-        let eightw_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
-        if use_lloyd_4w && n32_env {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
-                gate_up_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.ffn_x_rot_batch,
-                &pbs.moe_y_gate_up_grouped,
-                2 * im,
-                hidden,
-                k_top,
-                m_total_max,
-                batch_size,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_n32 gate_up l{layer_idx}: {e:?}"))?;
-        } else if use_lloyd_4w && cnd_env {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd(
-                gate_up_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.ffn_x_rot_batch,
-                &pbs.moe_y_gate_up_grouped,
-                2 * im,
-                hidden,
-                k_top,
-                m_total_max,
-                batch_size,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_cnd gate_up l{layer_idx}: {e:?}"))?;
-        } else if use_lloyd_4w && eightw_env {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
-                gate_up_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.ffn_x_rot_batch,
-                &pbs.moe_y_gate_up_grouped,
-                2 * im,
-                hidden,
-                k_top,
-                m_total_max,
-                batch_size,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_8w_k2 gate_up l{layer_idx}: {e:?}"))?;
-        } else if use_nosync {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
-                gate_up_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.ffn_x_rot_batch,
-                &pbs.moe_y_gate_up_grouped,
-                2 * im,
-                hidden,
-                k_top,
-                m_total_max,
-                batch_size,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_nosync gate_up l{layer_idx}: {e:?}"))?;
-        } else if use_mmqload {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
-                gate_up_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.ffn_x_rot_batch,
-                &pbs.moe_y_gate_up_grouped,
-                2 * im,
-                hidden,
-                k_top,
-                m_total_max,
-                batch_size,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_mmqload gate_up l{layer_idx}: {e:?}"))?;
-        } else if use_lloyd_4w {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
-                gate_up_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.ffn_x_rot_batch,
-                &pbs.moe_y_gate_up_grouped,
-                2 * im,
-                hidden,
-                k_top,
-                m_total_max,
-                batch_size,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w gate_up l{layer_idx}: {e:?}"))?;
-        } else {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
-                gate_up_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.ffn_x_rot_batch,
-                &pbs.moe_y_gate_up_grouped,
-                2 * im,
-                hidden,
-                k_top,
-                m_total_max,
-                batch_size,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped gate_up l{layer_idx}: {e:?}"))?;
-        }
-
-        // Phase D1 (2026-05-26): fused unscatter + SwiGLU + asymmetric
-        // clamp. One launch instead of two; eliminates `moe_up_batch`
-        // write traffic. Byte-identical output (verified A/B at temp=0).
-        // Measured perf at PP_BATCH=512 / 2.1k-tok prompt: -0.4% prefill —
-        // launch-overhead savings cancelled by per-thread overhead, per
-        // feedback_kernel_fusion. Default OFF; opt in via
-        // HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU=1.
-        let use_fused_unscatter_silu = std::env::var(
-            "HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU",
-        )
-        .map(|s| s != "0")
-        .unwrap_or(false);
-        if use_fused_unscatter_silu {
-            gpu.moe_unscatter_silu_clamp_k8(
-                &pbs.moe_y_gate_up_grouped,
-                &pbs.moe_sorted_slot_index,
-                &pbs.moe_gate_batch,
-                im,
-                k_top,
-                m_total_max,
-                cfg.swiglu_limit,
-            )
-            .map_err(|e| format!("moe_unscatter_silu_clamp_k8 l{layer_idx}: {e:?}"))?;
-        } else {
-            // Unscatter [m_total × 2*im] → [B, k_top, im] gate + up. Padded
-            // slots are dropped (sorted_slot_index == -1 lanes).
-            gpu.moe_gate_up_unscatter_k8(
-                &pbs.moe_y_gate_up_grouped,
-                &pbs.moe_sorted_slot_index,
-                &pbs.moe_gate_batch,
-                &pbs.moe_up_batch,
-                im,
-                k_top,
-                m_total_max,
-            )
-            .map_err(|e| format!("moe_gate_up_unscatter_k8 l{layer_idx}: {e:?}"))?;
-
-            // SwiGLU + clamp (unchanged from scalar path; reads gate,up writes gate).
-            gpu.deepseek4_silu_mul_clamp_f32_batched(
-                &pbs.moe_gate_batch,
-                &pbs.moe_up_batch,
-                &pbs.moe_gate_batch,
-                im,
-                batch_size * k_top,
-                cfg.swiglu_limit,
-            )
-            .map_err(|e| format!("silu_mul_clamp grouped routed l{layer_idx}: {e:?}"))?;
-        }
-
-        // FWHT rotate (unchanged).
-        gpu.rotate_x_mq_batched(
-            &pbs.moe_gate_batch,
-            &pbs.moe_rot_batch,
-            im,
-            batch_size * k_top,
-        )
-        .map_err(|e| format!("rotate_x_mq_batched grouped routed l{layer_idx}: {e:?}"))?;
-
-        // Grouped down GEMM: M = hidden, K = im. x_row_div = 1 because
-        // moe_rot_batch is [B × k_top, im] flat — sorted_slot_index[s]
-        // already yields the row index directly (b*k_top + krank).
-        // RECONCILED (#355 + #356): same 4w default + levers as gate_up above.
-        let use_lloyd_4w_down = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
-            .as_deref()
-        {
-            Ok("0") => false,
-            Ok("1") => true,
-            _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
-        } && hidden % 64 == 0
-          && im % 256 == 0;
-        // Opt-in (see use_mmqload above — same #356 long-context attractor).
-        let use_mmqload_down = use_lloyd_4w_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
-            .as_deref() == Ok("1");
-        let use_nosync_down = use_mmqload_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
-            .as_deref() == Ok("1");
-        // n32_env / cnd_env / eightw_env reused from the gate_up block above.
-        if use_lloyd_4w_down && n32_env {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
-                w2_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.moe_rot_batch,
-                &pbs.moe_y_down_grouped,
-                hidden,
-                im,
-                1,
-                m_total_max,
-                batch_size * k_top,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_n32 down l{layer_idx}: {e:?}"))?;
-        } else if use_lloyd_4w_down && cnd_env {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd(
-                w2_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.moe_rot_batch,
-                &pbs.moe_y_down_grouped,
-                hidden,
-                im,
-                1,
-                m_total_max,
-                batch_size * k_top,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_cnd down l{layer_idx}: {e:?}"))?;
-        } else if use_lloyd_4w_down && eightw_env {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
-                w2_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.moe_rot_batch,
-                &pbs.moe_y_down_grouped,
-                hidden,
-                im,
-                1,
-                m_total_max,
-                batch_size * k_top,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_8w_k2 down l{layer_idx}: {e:?}"))?;
-        } else if use_nosync_down {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
-                w2_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.moe_rot_batch,
-                &pbs.moe_y_down_grouped,
-                hidden,
-                im,
-                1,
-                m_total_max,
-                batch_size * k_top,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_nosync down l{layer_idx}: {e:?}"))?;
-        } else if use_mmqload_down {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
-                w2_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.moe_rot_batch,
-                &pbs.moe_y_down_grouped,
-                hidden,
-                im,
-                1,
-                m_total_max,
-                batch_size * k_top,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_mmqload down l{layer_idx}: {e:?}"))?;
-        } else if use_lloyd_4w_down {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
-                w2_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.moe_rot_batch,
-                &pbs.moe_y_down_grouped,
-                hidden,
-                im,
-                1,
-                m_total_max,
-                batch_size * k_top,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w down l{layer_idx}: {e:?}"))?;
-        } else {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
-                w2_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.moe_rot_batch,
-                &pbs.moe_y_down_grouped,
-                hidden,
-                im,
-                1,
-                m_total_max,
-                batch_size * k_top,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped down l{layer_idx}: {e:?}"))?;
-        }
-
-        // Down-combine: per-(token, m) sum K_TOP slots via inverse_perm,
-        // weighted by topk_weights, accumulated into ffn_out_batch (the
-        // shared-expert output already lives there from step 6 above).
-        gpu.moe_down_combine_grouped_k8(
-            &pbs.moe_y_down_grouped,
-            &pbs.moe_inverse_perm,
-            &pbs.moe_topk_weights_batch,
-            &pbs.ffn_out_batch,
-            hidden,
-            k_top,
-            batch_size,
-        )
-        .map_err(|e| format!("moe_down_combine_grouped_k8 l{layer_idx}: {e:?}"))?;
-    } else {
-        // ── Scalar K4 path (chunk_size < 256, or grouped opt-out) ──
-
-        // 11. Routed expert gate_up (MQ2-Lloyd K4-unrolled indexed batched).
-        gpu.deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
-            gate_up_ptrs,
-            &pbs.moe_topk_indices_batch,
-            &pbs.ffn_x_rot_batch,
-            &pbs.moe_gate_batch,
-            &pbs.moe_up_batch,
-            2 * im,
-            hidden,
-            k_top,
-            batch_size,
-        )
-        .map_err(|e| format!("deepseek4_gemv_gate_up_batched_k4 l{layer_idx}: {e:?}"))?;
-
-        // 12. SwiGLU + clamp over B * k_top streams of length IM.
-        gpu.deepseek4_silu_mul_clamp_f32_batched(
-            &pbs.moe_gate_batch,
-            &pbs.moe_up_batch,
-            &pbs.moe_gate_batch,
-            im,
-            batch_size * k_top,
-            cfg.swiglu_limit,
-        )
-        .map_err(|e| format!("deepseek4_silu_mul_clamp_f32_batched routed l{layer_idx}: {e:?}"))?;
-
-        // 13. FWHT rotate B * k_top vectors of length IM.
-        gpu.rotate_x_mq_batched(
-            &pbs.moe_gate_batch,
-            &pbs.moe_rot_batch,
-            im,
-            batch_size * k_top,
-        )
-        .map_err(|e| format!("rotate_x_mq_batched routed l{layer_idx}: {e:?}"))?;
-
-        // 14. Routed expert down. Two paths:
-        //   - Deterministic (default): expanded write to [B×K_TOP×hidden] +
-        //     non-atomic combine. Bit-reproducible at temp=0; load-bearing
-        //     for spec-decode draft/verify accept (84% K=3 with this on,
-        //     38% with atomicAdd path — FP reduction-order variance makes
-        //     draft/verify logits drift, top1 diverges, spurious rejection).
-        //   - HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=0 (faster ~5–10 % prefill, non-
-        //     deterministic): K4 + atomicAdd directly into ffn_out_batch.
-        //     Acceptable for plain decode benchmarking; do NOT use with
-        //     spec decode.
-        let deterministic =
-            std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
-        if deterministic {
-            gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
-                w2_ptrs,
-                &pbs.moe_topk_indices_batch,
-                &pbs.moe_rot_batch,
-                &pbs.moe_down_expert_outputs,
-                hidden,
-                im,
-                k_top,
-                batch_size,
-            )
-            .map_err(|e| format!("deepseek4_gemv_down_expanded_k4 l{layer_idx}: {e:?}"))?;
-            gpu.moe_down_combine_k8_batched(
-                &pbs.moe_down_expert_outputs,
-                &pbs.moe_topk_weights_batch,
-                &pbs.ffn_out_batch,
-                hidden,
-                k_top,
-                batch_size,
-            )
-            .map_err(|e| format!("moe_down_combine_k8_batched l{layer_idx}: {e:?}"))?;
-        } else {
-            gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed_batched_k4(
-                w2_ptrs,
-                &pbs.moe_topk_indices_batch,
-                &pbs.moe_topk_weights_batch,
-                &pbs.moe_rot_batch,
-                &pbs.ffn_out_batch,
-                hidden,
-                im,
-                k_top,
-                batch_size,
-            )
-            .map_err(|e| format!("deepseek4_gemv_down_batched_k4 l{layer_idx}: {e:?}"))?;
-        }
-    }
+    let moe_params = hipfire_dispatch::families::moe::MoeBiasAwarePrefillParams {
+        hidden,
+        mi: im,
+        n_exp,
+        k_top,
+        batch_size,
+        route_scale,
+        swiglu_limit: cfg.swiglu_limit,
+        layer_idx,
+        routing,
+        scores: &pbs.moe_scores_batch,
+        topk_indices: &pbs.moe_topk_indices_batch,
+        topk_weights: &pbs.moe_topk_weights_batch,
+        expert_gate_up_ptrs: gate_up_ptrs,
+        expert_down_ptrs: w2_ptrs,
+        x_rot: &pbs.ffn_x_rot_batch,
+        ffn_out: &pbs.ffn_out_batch,
+        expert_token_counts: &pbs.moe_expert_token_counts,
+        expert_offsets: &pbs.moe_expert_offsets,
+        sorted_slot_index: &pbs.moe_sorted_slot_index,
+        expert_tile_ids: &pbs.moe_expert_tile_ids,
+        inverse_perm: &pbs.moe_inverse_perm,
+        y_gate_up_grouped: &pbs.moe_y_gate_up_grouped,
+        y_down_grouped: &pbs.moe_y_down_grouped,
+        gate_batch: &pbs.moe_gate_batch,
+        up_batch: &pbs.moe_up_batch,
+        rot_batch: &pbs.moe_rot_batch,
+        down_expert_outputs: &pbs.moe_down_expert_outputs,
+    };
+    hipfire_runtime::llama::moe_family()
+        .run_bias_aware_prefill(gpu, &moe_params)
+        .map_err(|e| format!("ffn_batched l{layer_idx} dispatch: {e}"))?;
 
     Ok(())
 }
