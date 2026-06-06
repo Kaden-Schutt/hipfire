@@ -605,8 +605,20 @@ pub fn moe_family() -> &'static hipfire_dispatch::families::moe::MoeFamily {
     MOE.get_or_init(hipfire_dispatch::families::moe::MoeFamily::new)
 }
 
+/// Process-global [`AttentionFamily`], mirroring [`gemv_family`]. Ship 3:
+/// arches route their per-layer attention decode through
+/// `attention_family().run_attention(..)` so KV-write + flash-attention dispatch
+/// lives in the dispatch crate rather than per-model inline match trees.
+pub fn attention_family() -> &'static hipfire_dispatch::families::attention::AttentionFamily {
+    use std::sync::OnceLock;
+    static ATTENTION: OnceLock<hipfire_dispatch::families::attention::AttentionFamily> = OnceLock::new();
+    ATTENTION.get_or_init(hipfire_dispatch::families::attention::AttentionFamily::new)
+}
+
 pub use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
 pub use hipfire_dispatch::families::gemv::{RotInput, RotateInputs, RotatedActivation};
+pub use hipfire_dispatch::families::attention::AttnParams;
+pub use hipfire_dispatch::families::kv_tier::{KvTierPlan, KvTierInputs};
 pub use hipfire_dispatch::context::DispatchCtx;
 pub use hipfire_dispatch::types::KernelKey;
 pub use hipfire_dispatch::types::{GemvVariant, dtype_post_rotation_variant, dtype_rotation_plan};

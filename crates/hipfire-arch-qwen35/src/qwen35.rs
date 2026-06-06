@@ -19,6 +19,8 @@ use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::{GivensRef, WeightRef};
+use hipfire_dispatch::families::attention::AttnParams;
+use hipfire_dispatch::families::kv_tier::{KvTierPlan, KvTierInputs};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::RotationPlan;
 use hipfire_dispatch::types::dtype_rotation_plan;

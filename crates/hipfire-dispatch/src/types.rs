@@ -230,6 +230,7 @@ pub enum KernelKey {
     AttnFlashAsym2,
     AttnFlashAsym2Fwht,
     AttnFlashQ8_0,
+    AttnQ8_0Kv,    // non-flash short-context Q8_0 decode (ship 3.1 B0)
     AttnGqaFused,
     AttnF32,
     // KV Cache Write

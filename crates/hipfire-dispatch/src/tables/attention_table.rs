@@ -33,6 +33,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::AttnFlashAsym2,     ArchPredicate::Always),
         (KernelKey::AttnFlashAsym2Fwht, ArchPredicate::Always),
         (KernelKey::AttnFlashQ8_0,      ArchPredicate::Always),
+        (KernelKey::AttnQ8_0Kv,          ArchPredicate::Always),
         (KernelKey::AttnGqaFused,       ArchPredicate::HasWmma),
         (KernelKey::AttnF32,            ArchPredicate::Always),
     ];

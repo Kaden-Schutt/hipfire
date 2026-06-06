@@ -50,11 +50,21 @@ struct OpUse {
 }
 
 /// gfx that run wave32 WMMA-class quants — the interesting coverage surface.
+///
+/// **WARNING:** This name is historical and misleading. These archs are WMMA-capable
+/// (gfx11+), NOT merely wave32-capable. RDNA1 (`gfx1010`) and RDNA2 (`gfx1030+`)
+/// are wave32 but do NOT have WMMA (`has_wmma = is_rdna3 || is_rdna4`). New tests
+/// that need WMMA-specific arch lists should use `WMMA_ARCHS` below instead.
 const WAVE32: &[&str] = &[
     "gfx1100", "gfx1101", "gfx1102", // RDNA3 dGPU
     "gfx1150", "gfx1151", "gfx1152", // RDNA3.5 APU
     "gfx1200", "gfx1201",            // RDNA4
 ];
+
+/// Archs with WMMA support (`has_wmma = is_rdna3 || is_rdna4`).
+/// Distinct from wave32: RDNA1/2 are wave32 but lack WMMA.
+const WMMA_ARCHS: &[&str] = WAVE32; // same set today, but semantically distinct
+
 /// Everything incl. RDNA1/2 + CDNA, for dtypes whose arch gate is Always/dp4a.
 const ALL: &[&str] = &[
     "gfx1010", "gfx1030", "gfx1031", "gfx1032",
@@ -296,5 +306,69 @@ fn prerotated_covers_rotation_free_dtypes() {
     assert!(
         KernelKey::for_gemv_prerotated(MQ4G128).is_err(),
         "MQ4G128 (FwhtG128) must stay an error — falling to plain would double-rotate"
+    );
+}
+
+/// LAYER 2b — Attention family key coverage. Every attention key registered in
+/// the attention table MUST resolve on every arch the fleet ships on. Catches:
+///   - A new attention key that is accidentally gated to a narrow arch
+///     (the gfx12 dead-gate pattern from 953ea648).
+///   - The non-flash Q8 key (`AttnQ8_0Kv`) being missing from the table
+///     (the B0 gap — short-context Q8 decode would silently reroute to flash).
+#[test]
+fn attention_keys_resolve_on_fleet_archs() {
+    use crate::families::attention::AttentionFamily;
+
+    /// Attention keys the qwen35 decode path exercises. `HasWmma` keys (GQA-fused)
+    /// only resolve on WMMA-capable archs; all others must resolve everywhere.
+    struct AttnKeyUse {
+        key: KernelKey,
+        /// Archs where this key MUST resolve. `Always`-gated keys use ALL;
+        /// `HasWmma`-gated keys use WAVE32.
+        archs: &'static [&'static str],
+    }
+
+    let attn_fleet: &[AttnKeyUse] = &[
+        // KV write — Always-gated, must resolve on every fleet arch
+        AttnKeyUse { key: KernelKey::KvWriteF32,            archs: ALL },
+        AttnKeyUse { key: KernelKey::KvWriteQ8_0,           archs: ALL },
+        AttnKeyUse { key: KernelKey::KvWriteAsym4,          archs: ALL },
+        AttnKeyUse { key: KernelKey::KvWriteAsym4Fwht,      archs: ALL },
+        AttnKeyUse { key: KernelKey::KvWriteAsym3,          archs: ALL },
+        AttnKeyUse { key: KernelKey::KvWriteAsym3Fwht,      archs: ALL },
+        AttnKeyUse { key: KernelKey::KvWriteAsym2,          archs: ALL },
+        AttnKeyUse { key: KernelKey::KvWriteAsym2Fwht,      archs: ALL },
+        // Attention — Always-gated
+        AttnKeyUse { key: KernelKey::AttnF32,               archs: ALL },
+        AttnKeyUse { key: KernelKey::AttnFlashQ8_0,         archs: ALL },
+        AttnKeyUse { key: KernelKey::AttnQ8_0Kv,            archs: ALL },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym4,        archs: ALL },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym4Fwht,    archs: ALL },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym3,        archs: ALL },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym3Fwht,    archs: ALL },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym2,        archs: ALL },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym2Fwht,    archs: ALL },
+        // GQA-fused — HasWmma-gated, only WMMA-capable archs (NOT just wave32)
+        AttnKeyUse { key: KernelKey::AttnGqaFused,          archs: WMMA_ARCHS },
+    ];
+
+    let family = AttentionFamily::new();
+    let mut failures = Vec::new();
+    for u in attn_fleet {
+        for &arch in u.archs {
+            let ctx = DispatchCtx::for_test(arch);
+            if family.resolve(u.key, &ctx, None).is_err() {
+                failures.push(format!(
+                    "  {:?} dead-gated on {} — resolve() returned Err",
+                    u.key, arch
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\n{} attention key × arch combos failed to resolve:\n{}\n",
+        failures.len(),
+        failures.join("\n")
     );
 }
