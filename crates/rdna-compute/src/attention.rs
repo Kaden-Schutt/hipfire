@@ -1532,6 +1532,61 @@ impl Gpu {
         result
     }
 
+    /// Batched flash attention for Q8_0 KV — tile + reduce two-kernel path.
+    /// No LDS capacity limit: tiles seq_len into chunks of `tile_size` only,
+    /// so shared memory is O(tile_size), not O(max_ctx_len). Replaces the
+    /// old `attention_q8_0_kv_batched_masked` for long contexts (LDS would
+    /// exceed ~64 KB hardware limit past ~15k ctx).
+    ///
+    /// Q8_0 has no per-quad rotation (unlike asym4/fwht), so `cos_theta` and
+    /// `sin_theta` are not needed. The kernel never reads them, so `q` is
+    /// passed as a dummy for both — matching the `launch_asym_flash_batched`
+    /// signature without special-casing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_batched_masked(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_q8_0_tile_batched",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+            "attention_flash_q8_0_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            q, // cos_theta dummy — kernel ignores
+            q, // sin_theta dummy — kernel ignores
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+        )
+    }
+
     /// Flash attention with Q8_0 KV cache — tile + reduce two-kernel path.
     /// Tiles seq_len into chunks of `tile_size`, launches [n_heads, n_tiles]
     /// blocks for the tile kernel, then [n_heads] blocks for the reduce.

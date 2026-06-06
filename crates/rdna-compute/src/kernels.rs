@@ -2511,6 +2511,8 @@ pub const ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym3_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
+pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 
