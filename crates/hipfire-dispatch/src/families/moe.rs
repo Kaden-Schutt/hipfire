@@ -273,6 +273,114 @@ pub struct MoeBiasAwarePrefillParams<'a> {
     pub down_expert_outputs: &'a GpuTensor,
 }
 
+// ── Qwen3.5 softmax-top-k MoE prefill parameters (Ship 4.2) ──
+
+/// Parameters for the qwen35 batched/prefill MoE routed-expert block.
+///
+/// Distinct from [`MoeBiasAwarePrefillParams`] — qwen35 uses softmax top-k
+/// routing (k=8) with MQ4/MQ6/Paro routed experts, a fused gate-side, and a
+/// shared expert that seeds `x_batch` before this arm runs.
+///
+/// The model owns RMSNorm, the router GEMV + softmax top-k (producing
+/// `topk_indices` / `topk_weights`), and the shared expert (which already
+/// accumulated into `x_batch`). This arm runs scatter → gate_up → unscatter →
+/// SwiGLU+rotate → down → combine, accumulating into `x_batch`.
+///
+/// All tensor refs are `&'a GpuTensor` (shared, not `&mut` — GpuTensor is Copy).
+/// Scratch tensors are model-owned; the family holds only references.
+pub struct MoePrefillParams<'a> {
+    // dtype snapshot
+    pub dtypes: MoeDtypes,
+    // dims
+    pub batch_size: usize,
+    pub mi: usize,
+    pub down_m: usize,
+    pub down_k: usize,
+    pub gate_up_k: usize,
+    pub k_top: usize,
+    pub n_exp: usize,
+    /// m_total upper bound pre-computed by the model via
+    /// `moe_grouped_m_total_bound(total_slots, n_exp)`. Used by Path 2
+    /// scatter + grouped GEMM for grid sizing.
+    pub m_total_max: usize,
+    // routing inputs (model-produced)
+    pub topk_indices: &'a GpuTensor,
+    pub topk_weights: &'a GpuTensor,
+    // destination = x_batch (residual; combine accumulates here)
+    pub x_batch: &'a GpuTensor,
+    // activation buffers
+    pub x_norm_batch: &'a GpuTensor,
+    pub x_rot_batch: &'a GpuTensor,
+    // routed gate_up/down pointer tables
+    pub expert_gate_up_ptrs: &'a GpuTensor,
+    pub expert_down_ptrs: &'a GpuTensor,
+    // intermediate buffers
+    pub gate_batch: &'a GpuTensor,
+    pub up_batch: &'a GpuTensor,
+    pub rot_batch: &'a GpuTensor,
+    // Path 1 expanded-down scratch
+    pub down_expanded: &'a GpuTensor,
+    // Path 2 scatter scratch (model-owned)
+    pub expert_token_counts: &'a GpuTensor,
+    pub expert_offsets: &'a GpuTensor,
+    pub sorted_slot_index: &'a GpuTensor,
+    pub expert_tile_ids: &'a GpuTensor,
+    pub inverse_perm: &'a GpuTensor,
+    pub y_gate_up_grouped: &'a GpuTensor,
+    pub y_down_grouped: &'a GpuTensor,
+    // paro sidecars (per-layer shared Givens rotation tables)
+    pub paro_gate_up: Option<GivensRef<'a>>,
+    pub paro_down: Option<GivensRef<'a>>,
+    /// AWQ scale for the routed down weight (experts[0].down.awq_scale).
+    /// Used by the AWQ-aware silu+rotate step. `None` when the routed
+    /// experts are non-AWQ (the common case for A3B).
+    pub down_awq_scale: Option<&'a GpuTensor>,
+}
+
+/// Resolved dispatch plan for the qwen35 batched MoE prefill routed block.
+///
+/// Distinct from [`MoeResolution`] (decode) — prefill adds the Path 0/1/2
+/// grouped-vs-scalar down selection and the Paro i8/k8 levers.
+/// Pure function of [`MoeDtypes`] + arch + [`FeatureFlags`].
+pub struct MoePrefillResolution {
+    /// Gate_up + down via grouped-GEMM scatter pipeline (Path 2).
+    /// Requires WMMA-capable arch (gfx11/gfx12) + `moe_grouped_gemm` flag.
+    pub use_path2: bool,
+    /// Down uses atomic-accumulate GEMV (Path 0) instead of atomic-free
+    /// expanded+combine (Path 1). gfx9* wave64 archs (gfx906/gfx908/gfx94x).
+    pub down_path0: bool,
+    /// gfx1151 Paro i8 MMQ grouped GEMM (Path 2 only).
+    pub use_paro_i8: bool,
+    /// gfx1151 Paro i8 MMQ k8 grouped GEMM (Path 2 only).
+    pub use_paro_i8_k8: bool,
+    /// Routed experts use ParoQ4G128 (determines SwiGLU+rotate kernel selection).
+    pub paro_mode: bool,
+}
+
+impl MoePrefillResolution {
+    /// Resolve the prefill dispatch plan from dtypes, arch, and flags.
+    ///
+    /// Reads MoE prefill env levers from `flags` (parsed once at `Gpu::init`),
+    /// not `std::env` — mid-prefill env mutation is not honored.
+    pub fn resolve(
+        d: &MoeDtypes,
+        arch: &rdna_compute::arch_caps::ArchCaps,
+        flags: &rdna_compute::feature_flags::FeatureFlags,
+    ) -> Self {
+        let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
+        let use_path2 = flags.moe_grouped_gemm && arch.has_wmma();
+        // Path 0: gfx9* wave64 archs (gfx906/gfx908/gfx94x) — cheap HBM
+        // atomics make the atomic GEMV pattern competitive vs expanded scratch.
+        let down_path0 = arch.is_gcn5() || arch.is_cdna1() || arch.is_cdna3();
+        let is_gfx1151 = arch.is_gfx1151();
+        let use_paro_i8 = paro_mode && use_path2 && is_gfx1151
+            && flags.moe_paro_i8.unwrap_or(true);
+        let use_paro_i8_k8 = use_paro_i8
+            && flags.moe_paro_i8_k8.unwrap_or(true);
+        Self { use_path2, down_path0, use_paro_i8, use_paro_i8_k8, paro_mode }
+    }
+}
+
 // ── Family ─────────────────────────────────────────────
 
 pub struct MoeFamily {
@@ -358,6 +466,24 @@ impl MoeFamily {
         params: &MoeBiasAwarePrefillParams,
     ) -> Result<(), DispatchError> {
         crate::pipeline::run_moe_prefill_bias_aware(gpu, params)
+    }
+
+    /// Run a batched/prefill qwen35 MoE routed-expert block (k=8, softmax
+    /// top-k, MQ4/MQ6/Paro routed experts): scatter → gate_up → unscatter →
+    /// SwiGLU+rotate → down → combine, accumulating into `params.x_batch`.
+    ///
+    /// The model owns RMSNorm, the router GEMV + softmax top-k, and the
+    /// shared expert. Family owns resolution (`MoeDtypes` + arch + flags →
+    /// [`MoePrefillResolution`]) and the full routed pipeline. `ctx` is
+    /// decision-only (arch/env) — threaded once per chunk, not per layer.
+    /// Delegates to [`crate::pipeline::run_moe_prefill`].
+    pub fn run_prefill(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut rdna_compute::Gpu,
+        params: &MoePrefillParams,
+    ) -> Result<(), DispatchError> {
+        crate::pipeline::run_moe_prefill(ctx, gpu, params)
     }
 }
 

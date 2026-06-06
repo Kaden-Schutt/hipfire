@@ -855,3 +855,135 @@ fn guard_gate_up_mq4g256lloyd_fires() {
     let steps = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_gate_up_mq4g256lloyd(&steps, &ctx_rdna3()));
 }
+
+// ── MoePrefillResolution cells (Ship 4.2) ─────────────────────────
+
+use crate::families::moe::MoePrefillResolution;
+
+/// Helper: default MoeDtypes for MQ4 routed experts (the common A3B case).
+fn moe_dtypes_mq4() -> MoeDtypes {
+    MoeDtypes {
+        router: DType::Q8_0,
+        shared_gate: DType::Q8_0,
+        shared_expert_gate: DType::MQ4G256,
+        shared_expert_up: DType::MQ4G256,
+        experts_all_gate_up_mq4: true,
+        routed_gate_up: DType::MQ4G256,
+        routed_down: DType::MQ4G256,
+        has_paro_shared: false,
+    }
+}
+
+fn moe_dtypes_mq6() -> MoeDtypes {
+    let mut d = moe_dtypes_mq4();
+    d.routed_gate_up = DType::MQ6G256;
+    d.routed_down = DType::MQ6G256;
+    d.experts_all_gate_up_mq4 = false;
+    d
+}
+
+fn moe_dtypes_paro() -> MoeDtypes {
+    let mut d = moe_dtypes_mq4();
+    d.routed_gate_up = DType::ParoQ4G128;
+    d.routed_down = DType::ParoQ4G128;
+    d.experts_all_gate_up_mq4 = false;
+    d.has_paro_shared = true;
+    d
+}
+
+fn flags_default() -> rdna_compute::feature_flags::FeatureFlags {
+    rdna_compute::feature_flags::FeatureFlags::from_env_for_test("gfx1100")
+}
+
+#[test]
+fn moe_prefill_resolution_path2_gfx11_mq4() {
+    let arch = crate::context::DispatchCtx::for_test("gfx1100");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
+    assert!(r.use_path2, "gfx11 should have Path 2 (WMMA)");
+    assert!(!r.down_path0, "gfx11 should not be Path 0");
+    assert!(!r.paro_mode);
+    assert!(!r.use_paro_i8);
+    assert!(!r.use_paro_i8_k8);
+}
+
+#[test]
+fn moe_prefill_resolution_path2_gfx12_mq4() {
+    let arch = crate::context::DispatchCtx::for_test("gfx1200");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
+    assert!(r.use_path2, "gfx12 should have Path 2 (WMMA)");
+    assert!(!r.down_path0);
+}
+
+#[test]
+fn moe_prefill_resolution_path2_gfx12_mq6() {
+    let arch = crate::context::DispatchCtx::for_test("gfx1200");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq6(), &arch.arch, &arch.flags);
+    assert!(r.use_path2, "gfx12 should have Path 2 for MQ6");
+    assert!(!r.paro_mode);
+}
+
+#[test]
+fn moe_prefill_resolution_path2_gfx11_paro() {
+    let arch = crate::context::DispatchCtx::for_test("gfx1100");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_paro(), &arch.arch, &arch.flags);
+    assert!(r.use_path2, "gfx11 should have Path 2 for Paro");
+    assert!(r.paro_mode);
+    assert!(!r.use_paro_i8, "gfx1100 is not gfx1151 — no i8");
+}
+
+#[test]
+fn moe_prefill_resolution_path2_gfx1151_paro_i8() {
+    let arch = crate::context::DispatchCtx::for_test("gfx1151");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_paro(), &arch.arch, &arch.flags);
+    assert!(r.use_path2);
+    assert!(r.paro_mode);
+    assert!(r.use_paro_i8, "gfx1151 should default to i8 for Paro");
+    assert!(r.use_paro_i8_k8, "gfx1151 should default to i8 k8 for Paro");
+}
+
+#[test]
+fn moe_prefill_resolution_path1_gfx1030() {
+    let arch = crate::context::DispatchCtx::for_test("gfx1030");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
+    assert!(!r.use_path2, "gfx1030 has no WMMA — no Path 2");
+    assert!(!r.down_path0, "gfx1030 is not gfx9 — no Path 0");
+}
+
+#[test]
+fn moe_prefill_resolution_path0_gfx906() {
+    let arch = crate::context::DispatchCtx::for_test("gfx906");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
+    assert!(!r.use_path2, "gfx906 has no WMMA — no Path 2");
+    assert!(r.down_path0, "gfx906 should be Path 0 (atomic GEMV)");
+}
+
+#[test]
+fn moe_prefill_resolution_path0_gfx942() {
+    let arch = crate::context::DispatchCtx::for_test("gfx942");
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &arch.arch, &arch.flags);
+    assert!(!r.use_path2, "gfx942 has no WMMA — no Path 2");
+    assert!(r.down_path0, "gfx942 (CDNA3) should be Path 0");
+}
+
+#[test]
+fn moe_prefill_resolution_grouped_gemm_opt_out() {
+    let mut flags = flags_default();
+    flags.moe_grouped_gemm = false;
+    let flags = std::sync::Arc::new(flags);
+    let caps = rdna_compute::arch_caps::ArchCaps::new("gfx1100", flags.clone());
+    let r = MoePrefillResolution::resolve(&moe_dtypes_mq4(), &caps, &flags);
+    assert!(!r.use_path2, "moe_grouped_gemm=0 should disable Path 2");
+}
+
+#[test]
+fn moe_prefill_resolution_paro_i8_opt_out() {
+    let mut flags = flags_default();
+    flags.moe_paro_i8 = Some(false);
+    let flags = std::sync::Arc::new(flags);
+    let caps = rdna_compute::arch_caps::ArchCaps::new("gfx1151", flags.clone());
+    let r = MoePrefillResolution::resolve(&moe_dtypes_paro(), &caps, &flags);
+    assert!(r.use_path2);
+    assert!(r.paro_mode);
+    assert!(!r.use_paro_i8, "moe_paro_i8=0 should disable i8");
+    assert!(!r.use_paro_i8_k8);
+}

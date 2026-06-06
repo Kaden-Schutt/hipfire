@@ -786,6 +786,266 @@ pub fn run_moe_prefill_bias_aware(
     Ok(())
 }
 
+// ── Qwen3.5 batched MoE prefill (Ship 4.2) ──────────────────────────
+
+/// MoE grouped-GEMM block size (WMMA tile row count). Must match the
+/// constant in qwen35.rs and the scatter kernel.
+const MOE_GROUPED_BLOCK_M: usize = 16;
+
+/// Dispatch one grouped-GEMM for the given routed expert dtype.
+///
+/// Deduplicates the per-dtype×i8×k8 grouped-kernel match for gate_up
+/// and down — the only difference is `x` (gate_up reads `x_rot_batch`
+/// `[N×dim]`, down reads `rot_batch` `[N*k_top×mi]`), `m`, `k`, and
+/// `x_row_div`.
+///
+/// The Paro gate_up `givens_rotate_to` preamble is NOT in this helper —
+/// it stays in the gate_up block above the call site. Down has no
+/// preamble because `rot_batch` is already Givens-rotated by the
+/// silu+rotate step.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_grouped_gemm(
+    gpu: &mut Gpu,
+    dtype: DType,
+    ptrs: &GpuTensor,
+    tile_ids: &GpuTensor,
+    sorted_slot_index: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    x_row_div: usize,
+    m_total: usize,
+    rows: usize,
+    paro_i8: bool,
+    paro_i8_k8: bool,
+) -> Result<(), DispatchError> {
+    macro_rules! hip {
+        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+    }
+    match dtype {
+        DType::MQ4G256 => hip!(gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
+            ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+        )),
+        DType::MQ6G256 => hip!(gpu.gemm_hfq6g256_moe_grouped_wmma(
+            ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+        )),
+        DType::ParoQ4G128 => {
+            if paro_i8_k8 {
+                hip!(gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
+                    ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+                ))
+            } else if paro_i8 {
+                hip!(gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
+                    ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+                ))
+            } else {
+                hip!(gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
+                    ptrs, tile_ids, sorted_slot_index, x, y, m, k, x_row_div, m_total, rows,
+                ))
+            }
+        }
+        _other => Err(DispatchError::UnsupportedVariant {
+            family: "moe", variant: "prefill-grouped-gemm-dtype",
+            arch: "", quant: "other",
+        }),
+    }
+}
+
+/// Qwen3.5 batched MoE prefill routed-expert executor. Verbatim transcription
+/// of the routed block from `prefill_moe_ffn_body_batched` (qwen35.rs:7281).
+///
+/// Sequence: scatter → gate_up (Path 2 grouped / Path 1 indexed) → unscatter →
+/// SwiGLU+rotate → down (Path 2 / Path 1 / Path 0) → combine into `x_batch`.
+///
+/// `ctx` is decision-only (arch/env) — resolution is computed from
+/// `MoeDtypes` + `ArchCaps` + `FeatureFlags` once at entry. The raw
+/// `gpu.gemm_*`/`gpu.gemv_*` kernel calls do not take `ctx`.
+pub fn run_moe_prefill(
+    ctx: &DispatchCtx,
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoePrefillParams,
+) -> Result<(), DispatchError> {
+    use crate::families::moe::MoePrefillResolution;
+    macro_rules! hip {
+        ($e:expr) => { $e.map_err(|e| DispatchError::Hip(e.to_string())) };
+    }
+
+    let res = MoePrefillResolution::resolve(&p.dtypes, &ctx.arch, &ctx.flags);
+    let (n, mi, k_top, n_exp) = (p.batch_size, p.mi, p.k_top, p.n_exp);
+    let (down_m, down_k, gate_up_k) = (p.down_m, p.down_k, p.gate_up_k);
+    let total_slots = n * k_top;
+
+    // ── Path 2 scatter pipeline ───────────────────────────────────────
+    let mut path2_m_total: usize = 0;
+    if res.use_path2 {
+        let m_total_max = p.m_total_max;
+        hip!(gpu.moe_scatter_fused_k8(
+            p.topk_indices,
+            p.expert_token_counts,
+            p.expert_offsets,
+            p.sorted_slot_index,
+            p.expert_tile_ids,
+            p.inverse_perm,
+            total_slots,
+            n_exp,
+            m_total_max,
+            MOE_GROUPED_BLOCK_M,
+        ))?;
+        path2_m_total = m_total_max;
+    }
+
+    // ── Gate_up ────────────────────────────────────────────────────────
+    if res.use_path2 {
+        // Path 2: grouped-WMMA-GEMM. Paro gate_up Givens preamble in-line
+        // (above the helper — D3).
+        if res.paro_mode {
+            let paro = p.paro_gate_up.as_ref()
+                .expect("paro_mode implies paro_gate_up sidecar");
+            hip!(gpu.givens_rotate_to(
+                p.x_norm_batch, p.x_rot_batch,
+                paro.pairs, paro.theta, paro.scales,
+                n, gate_up_k /* hidden dim */, paro.krot,
+            ))?;
+        }
+        dispatch_grouped_gemm(
+            gpu, p.dtypes.routed_gate_up,
+            p.expert_gate_up_ptrs, p.expert_tile_ids, p.sorted_slot_index,
+            p.x_rot_batch, p.y_gate_up_grouped,
+            2 * mi, gate_up_k, k_top, path2_m_total, n,
+            res.use_paro_i8, res.use_paro_i8_k8,
+        )?;
+        // Stage 3 unscatter combine: Y_grouped → gate_batch + up_batch.
+        hip!(gpu.moe_gate_up_unscatter_k8(
+            p.y_gate_up_grouped, p.sorted_slot_index,
+            p.gate_batch, p.up_batch,
+            mi, k_top, path2_m_total,
+        ))?;
+    } else {
+        // Path 1 fallback: per-token indexed GEMV, batched over N tokens.
+        if res.paro_mode {
+            let paro = p.paro_gate_up.as_ref()
+                .expect("paro_mode implies paro_gate_up sidecar");
+            hip!(gpu.givens_rotate_to(
+                p.x_norm_batch, p.x_rot_batch,
+                paro.pairs, paro.theta, paro.scales,
+                n, gate_up_k, paro.krot,
+            ))?;
+            hip!(gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed_batched(
+                p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
+                p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
+            ))?;
+        } else {
+            // MQ4/MQ6 indexed batched GEMV (x_rot_batch is already FWHT-rotated
+            // by the model).
+            let gate_up_result = match p.dtypes.routed_gate_up {
+                DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
+                    p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
+                )),
+                DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
+                    p.expert_gate_up_ptrs, p.topk_indices, p.x_rot_batch,
+                    p.gate_batch, p.up_batch, 2 * mi, gate_up_k, k_top, n,
+                )),
+                _other => return Err(DispatchError::UnsupportedVariant {
+                    family: "moe", variant: "prefill-gate-up-path1-dtype",
+                    arch: "", quant: "other",
+                }),
+            };
+            gate_up_result?;
+        }
+    }
+
+    // ── SwiGLU + rotate over [N*K_TOP × mi] ────────────────────────────
+    if res.paro_mode {
+        let paro = p.paro_down.as_ref()
+            .expect("paro_mode implies paro_down sidecar");
+        hip!(gpu.fused_silu_mul_givens_rotate_f32(
+            p.gate_batch, p.up_batch, p.rot_batch,
+            paro.pairs, paro.theta, paro.scales,
+            total_slots, mi, paro.krot,
+        ))?;
+    } else {
+        // MQ4/MQ6: the silu+rotate kernel is weight-agnostic (reads only
+        // activations, not weight data). AWQ-aware variant when down has AWQ.
+        match p.dtypes.routed_down {
+            DType::MQ4G256 | DType::MQ6G256 => {
+                if let Some(awq) = p.down_awq_scale {
+                    hip!(gpu.fused_silu_mul_rotate_mq_awq_batched(
+                        p.gate_batch, p.up_batch, awq, p.rot_batch, mi, total_slots,
+                    ))?;
+                } else {
+                    hip!(gpu.fused_silu_mul_rotate_mq_batched(
+                        p.gate_batch, p.up_batch, p.rot_batch, mi, total_slots,
+                    ))?;
+                }
+            }
+            _other => return Err(DispatchError::UnsupportedVariant {
+                family: "moe", variant: "prefill-silu-rotate-dtype",
+                arch: "", quant: "other",
+            }),
+        }
+    }
+
+    // ── Down projection ───────────────────────────────────────────────
+    if res.use_path2 {
+        // Path 2: grouped-WMMA-GEMM + non-atomic combine via inverse_perm.
+        dispatch_grouped_gemm(
+            gpu, p.dtypes.routed_down,
+            p.expert_down_ptrs, p.expert_tile_ids, p.sorted_slot_index,
+            p.rot_batch, p.y_down_grouped,
+            down_m, down_k, 1 /* x_row_div */, path2_m_total, total_slots,
+            res.use_paro_i8, res.use_paro_i8_k8,
+        )?;
+        hip!(gpu.moe_down_combine_grouped_k8(
+            p.y_down_grouped, p.inverse_perm, p.topk_weights, p.x_batch,
+            down_m, k_top, n,
+        ))?;
+    } else if res.down_path0 {
+        // Path 0: gfx9* wave64 — residual-scaled atomic GEMV (MQ4 only;
+        // MQ6/Paro never reach here — their admit predicates require WMMA).
+        let down_result = match p.dtypes.routed_down {
+            DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
+                p.expert_down_ptrs, p.topk_indices, p.topk_weights, p.rot_batch, p.x_batch,
+                down_m, down_k, k_top, n,
+            )),
+            _other => return Err(DispatchError::UnsupportedVariant {
+                family: "moe", variant: "prefill-down-path0-dtype",
+                arch: "", quant: "other",
+            }),
+        };
+        down_result?;
+    } else {
+        // Path 1: atomic-free expanded GEMV write + combine.
+        // MQ6 only reaches here on archs where it's admitted without WMMA
+        // (gfx12 via env override); the Gpu method exists.
+        let down_result = match p.dtypes.routed_down {
+            DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
+                down_m, down_k, k_top, n,
+            )),
+            DType::MQ6G256 => hip!(gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
+                down_m, down_k, k_top, n,
+            )),
+            DType::ParoQ4G128 => hip!(gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
+                p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
+                down_m, down_k, k_top, n,
+            )),
+            _other => return Err(DispatchError::UnsupportedVariant {
+                family: "moe", variant: "prefill-down-path1-dtype",
+                arch: "", quant: "other",
+            }),
+        };
+        down_result?;
+        hip!(gpu.moe_down_combine_k8_batched(
+            p.down_expanded, p.topk_weights, p.x_batch, down_m, k_top, n,
+        ))?;
+    }
+
+    Ok(())
+}
+
 pub fn dispatch_fused(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
