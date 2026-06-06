@@ -37,7 +37,7 @@
 //!     coherence_probe --self-check
 
 use hipfire_detect::{
-    attractor::{AttractorFirst128, AttractorLast128},
+    attractor::{AttractorFirst128, AttractorLast128, LongStateCollapse},
     eos_immediate::EosImmediate,
     ngram::{LoopGuardMirror, NgramDensity},
     report::{prompt_md5, Report, ReportHeader},
@@ -62,7 +62,10 @@ struct Args {
     system: Option<String>,
     max_tokens: Option<usize>,
     temperature: Option<f64>,
+    repeat_penalty: Option<f64>,
+    repeat_window: Option<usize>,
     max_seq: Option<usize>,
+    state: Option<String>,
     report_json: Option<String>,
     agentic: bool,
     stall_tokens: Option<usize>,
@@ -85,9 +88,16 @@ fn parse_args() -> Result<Args, String> {
             "--temperature" => {
                 args.temperature = it.next().and_then(|v| v.parse().ok());
             }
+            "--repeat-penalty" => {
+                args.repeat_penalty = it.next().and_then(|v| v.parse().ok());
+            }
+            "--repeat-window" => {
+                args.repeat_window = it.next().and_then(|v| v.parse().ok());
+            }
             "--max-seq" => {
                 args.max_seq = it.next().and_then(|v| v.parse().ok());
             }
+            "--state" => args.state = it.next(),
             "--report-json" => args.report_json = it.next(),
             "--agentic" => args.agentic = true,
             "--stall-tokens" => {
@@ -118,7 +128,10 @@ fn print_help() {
           --system PATH         optional system-prompt file\n  \
           --max-tokens N        max generated tokens (default 200)\n  \
           --temperature F       sampling temperature (default 0.0)\n  \
+          --repeat-penalty F    repeat penalty passed to daemon\n  \
+          --repeat-window N     repeat penalty window passed to daemon\n  \
           --max-seq N           daemon max_seq override (default 4096)\n  \
+          --state q8|fp32|q4       DeltaNet state mode to request from daemon\n  \
           --report-json OUT     also write the report as JSON\n  \
           --agentic             auto-engage tool-call shape detector\n  \
           --stall-tokens N      enable think_stall detector with budget N\n  \
@@ -132,6 +145,7 @@ fn build_bank(args: &Args) -> DetectorBank {
     let mut bank = DetectorBank::new();
     bank.add(Box::new(AttractorFirst128::new()));
     bank.add(Box::new(AttractorLast128::new()));
+    bank.add(Box::new(LongStateCollapse::new()));
     bank.add(Box::new(NgramDensity::new()));
     bank.add(Box::new(LoopGuardMirror::new()));
     bank.add(Box::new(ThinkEmpty::new()));
@@ -236,15 +250,10 @@ fn spawn_daemon(daemon: &PathBuf) -> Result<DaemonChild, String> {
 }
 
 fn send(d: &mut DaemonChild, msg: &serde_json::Value) -> Result<(), String> {
-    let stdin = d
-        .stdin
-        .as_mut()
-        .ok_or("daemon stdin already closed")?;
+    let stdin = d.stdin.as_mut().ok_or("daemon stdin already closed")?;
     let line = serde_json::to_string(msg).map_err(|e| format!("encode: {}", e))?;
     writeln!(stdin, "{}", line).map_err(|e| format!("write daemon: {}", e))?;
-    stdin
-        .flush()
-        .map_err(|e| format!("flush daemon: {}", e))?;
+    stdin.flush().map_err(|e| format!("flush daemon: {}", e))?;
     Ok(())
 }
 
@@ -255,7 +264,10 @@ where
     let mut line = String::new();
     loop {
         line.clear();
-        let n = d.stdout.read_line(&mut line).map_err(|e| format!("read: {}", e))?;
+        let n = d
+            .stdout
+            .read_line(&mut line)
+            .map_err(|e| format!("read: {}", e))?;
         if n == 0 {
             return Err("daemon closed stdout unexpectedly".into());
         }
@@ -283,6 +295,8 @@ where
 struct DoneStats {
     total_tokens: usize,
     total_visible_bytes: usize,
+    generated_text: String,
+    token_ids: Vec<u32>,
     wall_ms: u64,
     ttft_ms: u64,
     /// Daemon-reported authoritative timings from its `done` event. The
@@ -313,16 +327,31 @@ fn drive_generate(
         "temperature": args.temperature.unwrap_or(0.0),
         "max_tokens": args.max_tokens.unwrap_or(200),
     });
+    if let Some(repeat_penalty) = args.repeat_penalty {
+        req.as_object_mut().unwrap().insert(
+            "repeat_penalty".to_string(),
+            serde_json::json!(repeat_penalty),
+        );
+    }
+    if let Some(repeat_window) = args.repeat_window {
+        req.as_object_mut().unwrap().insert(
+            "repeat_window".to_string(),
+            serde_json::json!(repeat_window),
+        );
+    }
     if let Some(sys) = system {
-        req.as_object_mut()
-            .unwrap()
-            .insert("system".to_string(), serde_json::Value::String(sys.to_string()));
+        req.as_object_mut().unwrap().insert(
+            "system".to_string(),
+            serde_json::Value::String(sys.to_string()),
+        );
     }
     send(d, &req)?;
 
     // Stream events until we see {"type":"done"} or {"type":"error"}.
     let t_start = Instant::now();
     let mut visible_bytes: usize = 0;
+    let mut generated_text = String::new();
+    let mut token_ids: Vec<u32> = Vec::new();
     let mut ttft_ms: Option<u64> = None;
     let mut last_pos: Option<usize> = None;
     let done_stats: DoneStats;
@@ -346,6 +375,7 @@ fn drive_generate(
                 let tok_id = v.get("tok_id").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
                 let pos = v.get("pos").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
                 let t_ms = v.get("t_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+                token_ids.push(tok_id);
                 last_pos = Some(pos);
                 let ev = Event::Committed { tok_id, pos, t_ms };
                 let trans = bank.observe(&ev);
@@ -362,6 +392,7 @@ fn drive_generate(
                 let t_ms = t_start.elapsed().as_millis() as u64;
                 if !synthetic {
                     visible_bytes += text.len();
+                    generated_text.push_str(text);
                     if ttft_ms.is_none() {
                         ttft_ms = Some(t_ms);
                     }
@@ -377,10 +408,7 @@ fn drive_generate(
                 }
             }
             "done" => {
-                let total_tokens = v
-                    .get("tokens")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0) as usize;
+                let total_tokens = v.get("tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
                 let wall_ms = t_start.elapsed().as_millis() as u64;
                 let ttft = ttft_ms.unwrap_or(wall_ms);
                 let ev = Event::Done {
@@ -396,13 +424,21 @@ fn drive_generate(
                 // Daemon-authoritative perf metrics from the done event.
                 // Default to 0 if absent (older daemons / non-Qwen35 paths).
                 let daemon_prefill_ms = v.get("prefill_ms").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                let daemon_prefill_tok_s = v.get("prefill_tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                let daemon_decode_tok_s = v.get("decode_tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let daemon_prefill_tok_s = v
+                    .get("prefill_tok_s")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0);
+                let daemon_decode_tok_s = v
+                    .get("decode_tok_s")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0);
                 let daemon_ttft_ms = v.get("ttft_ms").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 let daemon_tok_s = v.get("tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 done_stats = DoneStats {
                     total_tokens,
                     total_visible_bytes: visible_bytes,
+                    generated_text,
+                    token_ids,
                     wall_ms,
                     ttft_ms: ttft,
                     daemon_prefill_ms,
@@ -540,11 +576,7 @@ fn run() -> Result<i32, String> {
             .map(|s| format!(" + {}", s))
             .unwrap_or_default()
     );
-    let combined_for_md5 = format!(
-        "{}\n----\n{}",
-        system.as_deref().unwrap_or(""),
-        prompt
-    );
+    let combined_for_md5 = format!("{}\n----\n{}", system.as_deref().unwrap_or(""), prompt);
     let md5 = prompt_md5(combined_for_md5.as_bytes());
 
     let daemon = find_daemon_binary()?;
@@ -552,10 +584,15 @@ fn run() -> Result<i32, String> {
 
     // Load
     let max_seq = effective_args.max_seq.unwrap_or(4096);
+    let mut params = serde_json::Map::new();
+    params.insert("max_seq".to_string(), serde_json::json!(max_seq));
+    if let Some(state) = effective_args.state.as_deref() {
+        params.insert("state_quant".to_string(), serde_json::json!(state));
+    }
     let load = serde_json::json!({
         "type": "load",
         "model": model,
-        "params": { "max_seq": max_seq },
+        "params": serde_json::Value::Object(params),
     });
     send(&mut child, &load)?;
     let loaded = recv_until(&mut child, |_| {})?;
@@ -634,7 +671,22 @@ fn run() -> Result<i32, String> {
 
     // Optional JSON.
     if let Some(p) = &effective_args.report_json {
-        std::fs::write(p, report.to_json()).map_err(|e| format!("write json: {}", e))?;
+        let artifact = serde_json::json!({
+            "report": report,
+            "generated_text": stats.generated_text,
+            "token_ids": stats.token_ids,
+            "state": effective_args.state,
+            "max_seq": max_seq,
+            "max_tokens": effective_args.max_tokens.unwrap_or(200),
+            "temperature": effective_args.temperature.unwrap_or(0.0),
+            "repeat_penalty": effective_args.repeat_penalty,
+            "repeat_window": effective_args.repeat_window,
+        });
+        std::fs::write(
+            p,
+            serde_json::to_string_pretty(&artifact).map_err(|e| format!("encode json: {}", e))?,
+        )
+        .map_err(|e| format!("write json: {}", e))?;
         eprintln!("[probe] json report: {}", p);
     }
 
