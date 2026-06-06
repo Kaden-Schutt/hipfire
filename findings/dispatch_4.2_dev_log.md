@@ -19,7 +19,7 @@ Ship 4.2: qwen35 grouped-GEMM MoE prefill → `MoeFamily::run_prefill` (Step 8)
 
 | Item | Status | Detail |
 |---|---|---|
-| Prefill byte-parity (hidden-state diff) | PENDING | Requires `HIPFIRE_DUMP_HIDDEN` comparison between pre-4.2 (`31738389` or earlier) and HEAD |
+| Prefill byte-parity (hidden-state diff) | **PASS (dense)** | 27B dense model (`qwen3.6-27b.mq4`): pre-4.2 vs post-4.2 `.batched` hidden states are byte-identical (md5 `e647a43...`). MoE batched prefill: NOT exercised (A3B falls to per-token path). |
 | `probe_commits.sh` prefill tok/s ±1-3% | **PARTIAL** | gfx1151 only (no gfx1100/gfx1201). A3B prefill=256: 57.0 tok/s Path 2 (default), prefill=32: 60.5 tok/s Path 1 (force). JIT-included first runs; post-JIT numbers pending second-run methodology. |
 | `coherence-gate.sh --full` (A3B cells) | **PARTIAL** | Short gate passed (5 cells, no hard errors). Full gate requires `qwen3.5-35b-a3b.mq4` (not present) and `qwen3.6-35b-a3b-paro.hfq` (downloading). A3B v3.6 model tested manually: loads, multi-run decode clean at temp=0. |
 | Path-1 force-smoke (`HIPFIRE_MOE_GROUPED_GEMM=0` on gfx11) | **PASS** | gfx1151 with `HIPFIRE_MOE_GROUPED_GEMM=0`: A3B loads, runs, decode clean. Prefill=32 tok/s ~60.5 (same as Path 2 at small batch — both I/O bound). No panics. |
