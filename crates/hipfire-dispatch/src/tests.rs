@@ -479,12 +479,16 @@ fn gemv_family_resolves_f32_on_all_archs() {
 }
 
 #[test]
-fn gemv_family_resolves_hfq4_only_on_dp4a_arch() {
+fn gemv_family_resolves_hfq4_on_all_archs() {
     let fam = GemvFamily::new();
-    // RDNA1 has no dp4a → HFQ4G256 plain should fail
-    assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna1(), None).is_err());
+    // HFQ4G256 uses generic wave32/wave64 kernels with a fallback for every arch
+    // (gfx906 via dp4a/sdot4, gfx1010 via generic). Previously gated on HasDp4a
+    // (has_dot2_f32_f16 = RDNA1.1+) which excluded gfx906/gfx1010.
+    assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna1(), None).is_ok());
     assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna2(), None).is_ok());
     assert!(fam.resolve(DType::HFQ4G256, GemvVariant::Plain, false, &ctx_rdna3(), None).is_ok());
+    assert!(fam.resolve(DType::MQ4G256,  GemvVariant::Plain, false, &ctx_rdna1(), None).is_ok());
+    assert!(fam.resolve(DType::MQ4G256,  GemvVariant::Plain, false, &ctx_rdna2(), None).is_ok());
 }
 
 #[test]

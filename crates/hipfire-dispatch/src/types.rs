@@ -532,10 +532,22 @@ impl KernelKey {
         use DType::*;
         match dtype {
             F32 | F16 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
+            // HFQ4/MQ4/HFQ2/MQ2/MQ8/HFP4/MFP4/Paro: all use generic wave32/wave64
+            // kernels with no ISA-specific intrinsics. The underlying GEMV
+            // functions (gemv_hfq4g256_for_arch, gemv_hfp4g32_for_arch, etc.)
+            // have arch-specific *tuning* variants but a generic fallback that
+            // runs on every arch including gfx906 and gfx1010.
+            //
+            // Previously gated on HasDp4a (has_dot2_f32_f16 = RDNA1.1+), which
+            // excluded gfx906 where these kernels work fine via the generic path
+            // (gfx906 uses v_dot4_i32_i8/sdot4 internally, NOT dot2_f32_f16).
+            // See issue #397: the HasDp4a name is a misnomer — it maps to
+            // has_dot2_f32_f16 (RDNA1.1+) while AMD "dp4a" = v_dot4_i32_i8
+            // is gfx906-only. The two are unrelated ISA features.
             HFQ4G256 | HFQ4G128 | HFQ2G256 | HFQ2G128
             | MQ4G256 | MQ4G128 | MQ2G256 | MQ8G256
             | HFP4G32 | MFP4G32
-            | ParoQ4G128 => ArchPredicate::HasDp4a,
+            | ParoQ4G128 => ArchPredicate::Always,
             HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
             MQ3G256 => ArchPredicate::HasWmma,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,

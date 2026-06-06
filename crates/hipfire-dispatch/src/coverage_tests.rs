@@ -88,12 +88,17 @@ const FLEET: &[OpUse] = &[
     OpUse { model: "qwen3.5-*.paro4g128", role: Role::Residual, dtype: ParoQ4G128, archs: WAVE32 },
 
     // ── dense MQ4/MQ3/Lloyd: o_proj has a fused residual kernel — anchors (stay green) ──
-    OpUse { model: "qwen3.5-27b.mq4",       role: Role::Residual, dtype: MQ4G256,      archs: WAVE32 },
+    // MQ4/MQ6 work on ALL archs (generic GEMV fallback for gfx906/RDNA1 + arch-tuned
+    // variants for RDNA2/3/4). Previously WAVE32-only (excluded gfx906) because
+    // dtype_arch_predicate returned HasDp4a (=has_dot2_f32_f16=RDNA1.1+), which
+    // excludes gfx906. Fixed: dtype_arch_predicate now returns Always for MQ4G256.
+    OpUse { model: "qwen3.5-9b.mq4",        role: Role::Plain,    dtype: MQ4G256,      archs: ALL },
+    OpUse { model: "qwen3.5-27b.mq4",       role: Role::Residual, dtype: MQ4G256,      archs: ALL },
     OpUse { model: "qwen3.5-27b.mq3",       role: Role::Residual, dtype: MQ3G256,      archs: WAVE32 },
     OpUse { model: "qwen3.6-27b.mq3-lloyd", role: Role::Residual, dtype: MQ3G256Lloyd, archs: WAVE32 },
-    OpUse { model: "qwen3.6-35b-a3b.mq4",   role: Role::Plain,    dtype: MQ4G256,      archs: WAVE32 },
-    // MQ6-promoted projections (A3B AWQ-attractor mitigation) — gate is HasMmq (must admit gfx12):
-    OpUse { model: "qwen3.6-35b-a3b.mq4",   role: Role::Plain,    dtype: MQ6G256,      archs: WAVE32 },
+    OpUse { model: "qwen3.6-35b-a3b.mq4",   role: Role::Plain,    dtype: MQ4G256,      archs: ALL },
+    // MQ6-promoted projections (A3B AWQ-attractor mitigation) — gate is HasMmq (gfx906 + RDNA3 + RDNA4):
+    OpUse { model: "qwen3.6-35b-a3b.mq4",   role: Role::Plain,    dtype: MQ6G256,      archs: &["gfx906", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201"] },
 
     // ── RDNA4 coverage: same (role, dtype) combos explicitly anchored on gfx12 arch strings ──
     // Catches reintroduction of an RDNA4-only ArchPredicate that would dead-gate these.
