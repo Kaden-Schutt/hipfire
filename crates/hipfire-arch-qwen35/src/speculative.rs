@@ -1081,6 +1081,7 @@ impl GdnTape {
                     n_steps,
                     n_v_heads,
                     value_head_dim,
+                    dn_state.ef_residual(la_idx),
                 )?,
                 qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
                     &self.q_scratch,

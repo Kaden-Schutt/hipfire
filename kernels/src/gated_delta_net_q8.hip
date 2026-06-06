@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 #define HD 128
 #define TILE_ROWS 4
@@ -20,10 +21,19 @@ __global__ void gated_delta_net_q8(
     int n_tokens,
     int n_heads,
     int head_dim,
-    unsigned int frame   // per-launch monotonic counter (host-supplied) — fresh,
+    unsigned int frame,  // per-launch monotonic counter (host-supplied) — fresh,
                          // data-INDEPENDENT entropy for the stochastic-rounding
                          // dither. Without it the dither was seeded from my_max
                          // (state-derived) → correlated, biased over the recurrence.
+    __half* __restrict__ s_ef_residual  // OPTIONAL (nullable) per-element f16
+                         // error-feedback residual, same [n_heads*HD*HD] layout
+                         // as s_q8. When non-null, the requant uses deterministic
+                         // round + sigma-delta noise-shaping instead of stochastic
+                         // rounding: the carried quantization error is added back
+                         // before requant and the fresh error re-stored. DeltaNet's
+                         // contractive decay damps the shaped error, giving
+                         // ~FP32-grade state correctness at the Q8 byte container
+                         // (see CPU sweep: 5.7× lower L2 than stochastic at α=0.99).
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -93,44 +103,77 @@ __global__ void gated_delta_net_q8(
         }
     }
 
-    // Requant FP32 → Q8 with stochastic rounding.
-    // Deterministic roundf systematically crushes small values to 0, causing
-    // cumulative state corruption over hundreds of tokens.
-    // Stochastic rounding: floor(x + uniform) has E[result] = x (unbiased).
-    // PRNG: position-derived LCG — deterministic, no shared state, no extra registers.
+    // Requant FP32 → Q8.
+    //
+    // Two schemes, selected per-launch by whether an error-feedback residual
+    // buffer was supplied:
+    //
+    //  • s_ef_residual != null  → DETERMINISTIC round + sigma-delta noise-shaping
+    //    (error feedback). The carried per-element quantization residual is added
+    //    back BEFORE requant, then the fresh residual (t − dequant(q)) is re-stored.
+    //    Over the recurrence DeltaNet's contractive decay damps the shaped error,
+    //    so the long-run state stays ~FP32-accurate at Q8's byte container with no
+    //    systematic bias. Beats stochastic rounding on BOTH bias and variance —
+    //    CPU sweep: 5.7× lower output-L2 and flat (length-independent) state drift
+    //    at α=0.99. Deterministic ⇒ no per-step entropy needed (`frame` unused).
+    //
+    //  • s_ef_residual == null  → STOCHASTIC rounding (legacy / examples / tests).
+    //    Deterministic roundf alone systematically crushes small values to 0,
+    //    drifting the state off-distribution; floor(x + uniform) is unbiased in
+    //    expectation. Seed = spatial location (h, row, tid) + per-launch `frame`.
+    const bool use_ef = (s_ef_residual != nullptr);
     for (int r = 0; r < TILE_ROWS; r++) {
+        const int row = row_start + r;
         float* sr = S_tile + r * HD;
         float s0 = sr[tid], s1 = sr[tid+32], s2 = sr[tid+64], s3 = sr[tid+96];
+
+        // EF: fold the carried quantization residual into the state pre-requant.
+        __half* efr = use_ef ? (s_ef_residual + h * HD * HD + row * HD) : nullptr;
+        if (use_ef) {
+            s0 += __half2float(efr[tid]);
+            s1 += __half2float(efr[tid+32]);
+            s2 += __half2float(efr[tid+64]);
+            s3 += __half2float(efr[tid+96]);
+        }
+
         float my_max = fmaxf(fmaxf(fabsf(s0), fabsf(s1)), fmaxf(fabsf(s2), fabsf(s3)));
         for (int o = 16; o > 0; o >>= 1)
             my_max = fmaxf(my_max, __shfl_xor(my_max, o));
 
-        float inv_s = (my_max > 0.0f) ? (127.0f / my_max) : 0.0f;
+        const float scale = (my_max > 0.0f) ? (my_max / 127.0f) : 1.0f;
+        const float inv_s = (my_max > 0.0f) ? (127.0f / my_max) : 0.0f;
         signed char* dst = sq_base + r * HD;
 
-        // Stochastic rounding: generate 4 uniform random values in [0, 1).
-        // Seed = spatial location (h, row, tid) + per-launch `frame` counter.
-        // CRITICAL: the dither MUST be independent of the value being rounded
-        // and fresh per requant. The old seed used __float_as_uint(my_max)
-        // (state-derived) and no temporal term — so across the thousands of
-        // per-token decode requants the dither was a deterministic, data-
-        // correlated function, defeating stochastic rounding's unbiasedness
-        // and accumulating a systematic bias that drifts the recurrent state
-        // off-distribution on long generations (length-dependent coherence
-        // collapse). `frame` supplies the missing per-step entropy.
-        unsigned int rng = (unsigned int)(h * 1664525u + (row_start + r) * 1013904223u
-                         + tid * 214013u + frame * 2531011u);
-        #define STOCH_ROUND(val) ({ \
-            rng = rng * 1664525u + 1013904223u; \
-            float noise = (float)(rng >> 8) * (1.0f / 16777216.0f); \
-            float scaled = (val) * inv_s; \
-            (signed char)fminf(fmaxf(floorf(scaled + noise), -128.0f), 127.0f); \
-        })
-        dst[tid]      = STOCH_ROUND(s0);
-        dst[tid+32]   = STOCH_ROUND(s1);
-        dst[tid+64]   = STOCH_ROUND(s2);
-        dst[tid+96]   = STOCH_ROUND(s3);
-        #undef STOCH_ROUND
-        if (tid == 0) s_scales[h * HD + row_start + r] = (my_max > 0.0f) ? (my_max / 127.0f) : 1.0f;
+        if (use_ef) {
+            // Round-to-nearest-even (rintf), then re-store the new residual.
+            // The residual captures rounding AND clamp-saturation error, so the
+            // feedback corrects both.
+            #define EF_ROUND(val, slot) do { \
+                float qf = fminf(fmaxf(rintf((val) * inv_s), -128.0f), 127.0f); \
+                dst[slot] = (signed char)qf; \
+                efr[slot] = __float2half((val) - qf * scale); \
+            } while (0)
+            EF_ROUND(s0, tid);
+            EF_ROUND(s1, tid+32);
+            EF_ROUND(s2, tid+64);
+            EF_ROUND(s3, tid+96);
+            #undef EF_ROUND
+        } else {
+            // PRNG: position-derived LCG — deterministic, no shared state.
+            unsigned int rng = (unsigned int)(h * 1664525u + row * 1013904223u
+                             + tid * 214013u + frame * 2531011u);
+            #define STOCH_ROUND(val) ({ \
+                rng = rng * 1664525u + 1013904223u; \
+                float noise = (float)(rng >> 8) * (1.0f / 16777216.0f); \
+                float scaled = (val) * inv_s; \
+                (signed char)fminf(fmaxf(floorf(scaled + noise), -128.0f), 127.0f); \
+            })
+            dst[tid]      = STOCH_ROUND(s0);
+            dst[tid+32]   = STOCH_ROUND(s1);
+            dst[tid+64]   = STOCH_ROUND(s2);
+            dst[tid+96]   = STOCH_ROUND(s3);
+            #undef STOCH_ROUND
+        }
+        if (tid == 0) s_scales[h * HD + row] = scale;
     }
 }

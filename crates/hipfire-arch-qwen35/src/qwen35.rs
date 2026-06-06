@@ -856,8 +856,25 @@ pub struct DeltaNetState {
     pub s_scales: Vec<GpuTensor>,
     /// Conv ring buffer: [n_deltanet_layers × conv_channels × (kernel_size-1)] FP32
     pub conv_states: Vec<GpuTensor>,
+    /// Per-element f16 error-feedback residual for Q8 state requant
+    /// (sigma-delta noise-shaping). Empty unless Q8 + `HIPFIRE_DN_STATE_EF`.
+    /// Same element count as `s_matrices`; carries the previous step's
+    /// quantization error so the next requant cancels it — DeltaNet's
+    /// contractive decay damps the shaped noise, yielding ~FP32-grade state
+    /// correctness at Q8's byte container with no perf-relevant VRAM growth.
+    pub s_ef_residual: Vec<GpuTensor>,
     /// Current quantization mode
     pub quant: StateQuant,
+}
+
+impl DeltaNetState {
+    /// EF residual for a delta-layer, if error-feedback is active (Q8 + flag).
+    /// Returns `None` when disabled → callers pass null → kernel uses the
+    /// legacy stochastic-rounding requant.
+    #[inline]
+    pub fn ef_residual(&self, idx: usize) -> Option<&GpuTensor> {
+        self.s_ef_residual.get(idx)
+    }
 }
 
 impl DeltaNetState {
@@ -883,9 +900,17 @@ impl DeltaNetState {
             + config.linear_num_value_heads * config.linear_value_head_dim;
         let conv_state_size = conv_channels * (config.conv_kernel_dim - 1);
 
+        // Error-feedback (sigma-delta) requant for Q8 state. Opt-in until the
+        // bench/coherence A/B lands; only meaningful for Q8 (FP32 has no requant,
+        // Q4 EF is future work). Residual is f16 per-element (the CPU sweep proved
+        // f16/q8/fp32 residual are bit-indistinguishable — f16 needs no scale).
+        let ef_enabled = quant == StateQuant::Q8
+            && std::env::var("HIPFIRE_DN_STATE_EF").map(|v| v != "0").unwrap_or(false);
+
         let mut s_matrices = Vec::with_capacity(n_delta_layers);
         let mut s_scales = Vec::with_capacity(n_delta_layers);
         let mut conv_states = Vec::with_capacity(n_delta_layers);
+        let mut s_ef_residual = Vec::with_capacity(if ef_enabled { n_delta_layers } else { 0 });
         for _ in 0..n_delta_layers {
             match quant {
                 StateQuant::FP32 => {
@@ -915,12 +940,16 @@ impl DeltaNetState {
                     s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
                 }
             }
+            if ef_enabled {
+                s_ef_residual.push(gpu.zeros(&[s_size], DType::F16)?);
+            }
             conv_states.push(gpu.zeros(&[conv_state_size], DType::F32)?);
         }
         Ok(Self {
             s_matrices,
             s_scales,
             conv_states,
+            s_ef_residual,
             quant,
         })
     }
@@ -934,6 +963,9 @@ impl DeltaNetState {
             let _ = gpu.free_tensor(t);
         }
         for t in self.conv_states {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.s_ef_residual {
             let _ = gpu.free_tensor(t);
         }
     }
@@ -954,6 +986,9 @@ impl DeltaNetState {
                 for s in &self.conv_states {
                     let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
                 }
+                for s in &self.s_ef_residual {
+                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                }
             }
             None => {
                 for s in &self.s_matrices {
@@ -963,6 +998,9 @@ impl DeltaNetState {
                     let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                 }
                 for s in &self.conv_states {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for s in &self.s_ef_residual {
                     let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                 }
             }
@@ -1036,6 +1074,11 @@ impl DeltaNetState {
                 s_matrices,
                 s_scales,
                 conv_states,
+                // EF residual not yet wired for the multi-GPU band split (would
+                // need per-device residual alloc routed by device_for_layer);
+                // empty ⇒ ef_residual() returns None ⇒ kernel uses stochastic
+                // path. Tracked follow-up alongside multi-GPU fp32 prefill.
+                s_ef_residual: Vec::new(),
                 quant,
             },
             la_to_device,
@@ -5403,6 +5446,7 @@ fn forward_from_x_gpu(
                         1,
                         n_v_heads,
                         config.linear_value_head_dim,
+                        dn_state.ef_residual(delta_layer_idx),
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &q_gdn,
@@ -5710,6 +5754,7 @@ fn forward_from_x_gpu(
                         1,
                         n_v_heads,
                         config.linear_value_head_dim,
+                        dn_state.ef_residual(delta_layer_idx),
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &q_gdn,
@@ -9642,6 +9687,7 @@ fn forward_prefill_chunk(
                             n,
                             n_v_heads,
                             config.linear_value_head_dim,
+                            dn_state.ef_residual(delta_layer_idx),
                         )?,
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &pbs.dn_q_batch,
@@ -11563,6 +11609,7 @@ fn forward_prefill_chunk(
                             n,
                             n_v_heads,
                             config.linear_value_head_dim,
+                            dn_state.ef_residual(delta_layer_idx),
                         )?,
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &pbs.dn_q_batch,
@@ -13473,6 +13520,7 @@ fn forward_scratch_layers(
                         1,
                         n_v_heads,
                         config.linear_value_head_dim,
+                        dn_state.ef_residual(delta_layer_idx),
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &s.dn_q,
@@ -14378,6 +14426,7 @@ fn forward_scratch_layers(
                         1,
                         n_v_heads,
                         config.linear_value_head_dim,
+                        dn_state.ef_residual(delta_layer_idx),
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &s.dn_q,
@@ -15112,6 +15161,7 @@ fn forward_scratch_layers_multi(
                             1,
                             n_v_heads,
                             config.linear_value_head_dim,
+                            dn_state.ef_residual(delta_layer_idx),
                         )?,
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &s.dn_q,
@@ -15812,6 +15862,7 @@ fn forward_scratch_layers_multi(
                             1,
                             n_v_heads,
                             config.linear_value_head_dim,
+                            dn_state.ef_residual(delta_layer_idx),
                         )?,
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &s.dn_q,

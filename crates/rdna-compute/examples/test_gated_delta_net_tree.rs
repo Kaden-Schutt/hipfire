@@ -68,7 +68,7 @@ fn main() {
         let g1 = upload_f32(&mut gpu, &gate[t * N_HEADS..(t + 1) * N_HEADS], &[1, N_HEADS]);
         let b1 = upload_f32(&mut gpu, &beta[t * N_HEADS..(t + 1) * N_HEADS], &[1, N_HEADS]);
         let o1 = gpu.zeros(&[1, N_HEADS * HD], DType::F32).unwrap();
-        gpu.gated_delta_net_q8_batch_seq(&q1, &k1, &v1, &g1, &b1, &sq_ref, &sc_ref, &o1, 1, N_HEADS, HD).unwrap();
+        gpu.gated_delta_net_q8_batch_seq(&q1, &k1, &v1, &g1, &b1, &sq_ref, &sc_ref, &o1, 1, N_HEADS, HD, None).unwrap();
         // Scatter o1 back into out_ref[t].
         let row_bytes = N_HEADS * HD * 4;
         gpu.hip.memcpy_dtod_at(&out_ref.buf, t * row_bytes, &o1.buf, 0, row_bytes).unwrap();

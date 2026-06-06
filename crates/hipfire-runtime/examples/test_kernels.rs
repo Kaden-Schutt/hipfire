@@ -166,7 +166,7 @@ fn main() {
             let alpha = gpu.upload_f32(&vec![0.5f32; n_heads], &[n_heads]).map_err(|e| format!("{e}"))?;
             let beta = gpu.upload_f32(&vec![0.5f32; n_heads], &[n_heads]).map_err(|e| format!("{e}"))?;
             let o = gpu.alloc_tensor(&[n_heads * hd], DType::F32).map_err(|e| format!("{e}"))?;
-            gpu.gated_delta_net_q8(&q, &k, &v, &alpha, &beta, &s_q8, &s_scales, &o, 1, n_heads, hd).map_err(|e| format!("{e}"))?;
+            gpu.gated_delta_net_q8(&q, &k, &v, &alpha, &beta, &s_q8, &s_scales, &o, 1, n_heads, hd, None).map_err(|e| format!("{e}"))?;
             let r = gpu.download_f32(&o).map_err(|e| format!("{e}"))?;
             assert!(r[0].is_finite(), "gdn produced NaN");
             for t in [q, k, v, alpha, beta, s_q8, s_scales, o] { gpu.free_tensor(t).map_err(|e| format!("{e}"))?; }
