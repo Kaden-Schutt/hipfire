@@ -20,11 +20,21 @@ Ship 4.2: qwen35 grouped-GEMM MoE prefill → `MoeFamily::run_prefill` (Step 8)
 | Item | Status | Detail |
 |---|---|---|
 | Prefill byte-parity (hidden-state diff) | PENDING | Requires `HIPFIRE_DUMP_HIDDEN` comparison between pre-4.2 (`31738389` or earlier) and HEAD |
-| `probe_commits.sh` prefill tok/s ±1-3% | PENDING | ≥256-token prompt needed; gfx1151 only (no gfx1100 or gfx1201 available) |
-| `coherence-gate.sh --full` (A3B cells) | PENDING | Short gate passed; full gate requires A3B-specific prompts |
+| `probe_commits.sh` prefill tok/s ±1-3% | **PARTIAL** | gfx1151 only (no gfx1100/gfx1201). A3B prefill=256: 57.0 tok/s Path 2 (default), prefill=32: 60.5 tok/s Path 1 (force). JIT-included first runs; post-JIT numbers pending second-run methodology. |
+| `coherence-gate.sh --full` (A3B cells) | **PARTIAL** | Short gate passed (5 cells, no hard errors). Full gate requires `qwen3.5-35b-a3b.mq4` (not present) and `qwen3.6-35b-a3b-paro.hfq` (downloading). A3B v3.6 model tested manually: loads, multi-run decode clean at temp=0. |
 | Path-1 force-smoke (`HIPFIRE_MOE_GROUPED_GEMM=0` on gfx11) | **PASS** | gfx1151 with `HIPFIRE_MOE_GROUPED_GEMM=0`: A3B loads, runs, decode clean. Prefill=32 tok/s ~60.5 (same as Path 2 at small batch — both I/O bound). No panics. |
-| A3B MoE DFlash pinned fixture | SKIP | Draft `qwen36-35b-a3b-dflash-mq4.hfq` not present on this host. Target file present (md5 pending — NFS timeout on 15 GB file). |
-| Paro/MQ6 A3B fixtures | SKIP | No Paro/MQ6 A3B models on this host |
+| A3B MoE DFlash pinned fixture | SKIP | Draft `qwen36-35b-a3b-dflash-mq4.hfq` not present on this host. Target file present at `/local/hipfire/qwen3.6-35b-a3b.mq4` (22.9 GB). |
+| Paro/MQ6 A3B fixtures | PENDING | PARO A3B safetensors downloading to `/local/models/z-lab/Qwen3.6-35B-A3B-PARO/` (0 safetensors so far). No MQ6 A3B models available; `hipfire-quant-eval` repo has MQ6 quant tools at `/home/kread/git/hipfire-quant-eval/`. |
+
+## A3B prefill perf (gfx1151, qwen3.6-35b-a3b.mq4)
+
+| Prefill | Tok/s | Path | Notes |
+|---|---|---|---|
+| 32 | 60.5 | Path 2 (default) | Includes JIT |
+| 32 | 60.5 | Path 1 (MOE_GROUPED_GEMM=0) | Includes JIT |
+| 64 | 41.2 | Path 2 | First run after load (fresh JIT) |
+| 128 | 59.0 | Path 2 | Includes JIT |
+| 256 | 57.0 | Path 2 | VERIFY_GRAPH=0 |
 
 ## Notes
 
