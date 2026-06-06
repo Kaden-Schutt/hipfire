@@ -391,3 +391,71 @@ fn attention_keys_resolve_on_fleet_archs() {
         failures.join("\n")
     );
 }
+
+/// LAYER 2c — Fused QKV/QKVZA/GateUp family key coverage. Every key registered
+/// in the fused_qkv table MUST resolve on every arch the kernel actually runs on.
+/// Catches the same dead-gate class as LAYER 2b but for the fused-kernel family.
+///
+/// Historical defect: `FusedQkvzaHfq4G256` was gated `HasWmma`, excluding gfx906
+/// (dp4a path) and gfx1030/gfx1031 (wave32 generic path) even though the kernel
+/// runs on all three. Found by A/B smoke on gfx906 (2026-06-06).
+#[test]
+fn fused_qkv_keys_resolve_on_fleet_archs() {
+    use crate::families::fused_qkv::FusedQkvFamily;
+
+    struct FusedKeyUse {
+        key: KernelKey,
+        /// Archs where this key MUST resolve.
+        archs: &'static [&'static str],
+    }
+
+    let fused_fleet: &[FusedKeyUse] = &[
+        // ── Cross-arch HFQ4G256 kernels (dp4a on gfx906, wave64 on CDNA, wave32 on RDNA) ──
+        // QKV 3-way
+        FusedKeyUse { key: KernelKey::FusedQkvHfq4G256,     archs: ALL },
+        // QKVZA 4-way (DeltaNet linear attention)
+        FusedKeyUse { key: KernelKey::FusedQkvzaHfq4G256,   archs: ALL },
+        // Gate+Up 2-way
+        FusedKeyUse { key: KernelKey::FusedGateUpHfq4G256,  archs: ALL },
+        // Q4K (llama-format) — cross-arch
+        FusedKeyUse { key: KernelKey::FusedQkvQ4K,          archs: ALL },
+        FusedKeyUse { key: KernelKey::FusedGateUpQ4K,       archs: ALL },
+        // Q8_0 — cross-arch
+        FusedKeyUse { key: KernelKey::FusedGateUpQ8_0,      archs: ALL },
+        // ── dp4a-only kernels (gfx906 sdot4 path) ──
+        FusedKeyUse { key: KernelKey::FusedQkvHfq6G256,     archs: &["gfx906"] },
+        FusedKeyUse { key: KernelKey::FusedQkvzaHfq6G256,   archs: &["gfx906"] },
+        FusedKeyUse { key: KernelKey::FusedGateUpHfq6G256,   archs: &["gfx906"] },
+        // ── WMMA-only kernels (RDNA3/RDNA4) ──
+        FusedKeyUse { key: KernelKey::FusedQkvMq3G256Lloyd,  archs: WMMA_ARCHS },
+        FusedKeyUse { key: KernelKey::FusedQkvMq4G256Lloyd,  archs: WMMA_ARCHS },
+        FusedKeyUse { key: KernelKey::FusedQkvzaMq3G256Lloyd, archs: WMMA_ARCHS },
+        FusedKeyUse { key: KernelKey::FusedQkvzaMq4G256Lloyd, archs: WMMA_ARCHS },
+        FusedKeyUse { key: KernelKey::FusedGateUpMq3G256Lloyd, archs: WMMA_ARCHS },
+        FusedKeyUse { key: KernelKey::FusedGateUpMq4G256Lloyd, archs: WMMA_ARCHS },
+        // ── HasDp4a (RDNA1.1+) kernels ──
+        FusedKeyUse { key: KernelKey::FusedQkvzaParo4G128T,  archs: &["gfx1011", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1200"] },
+        FusedKeyUse { key: KernelKey::FusedQkvParo4G128T,    archs: &["gfx1011", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1200"] },
+        FusedKeyUse { key: KernelKey::FusedGateUpParo4G128T,  archs: &["gfx1011", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1200"] },
+    ];
+
+    let family = FusedQkvFamily::new();
+    let mut failures = Vec::new();
+    for u in fused_fleet {
+        for &arch in u.archs {
+            let ctx = DispatchCtx::for_test(arch);
+            if family.resolve(u.key, &ctx, None).is_err() {
+                failures.push(format!(
+                    "  {:?} dead-gated on {} — resolve() returned Err",
+                    u.key, arch
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\n{} fused-QKV key × arch combos failed to resolve:\n{}\n",
+        failures.len(),
+        failures.join("\n")
+    );
+}

@@ -30,7 +30,13 @@ pub fn populate(registry: &mut KernelRegistry) {
 
     // ── Fused QKVZA (Q, K, V + linear attention Z in one launch) ─
     let qkvza_variants: &[(KernelKey, ArchPredicate)] = &[
-        (KernelKey::FusedQkvzaHfq4G256,     ArchPredicate::HasWmma),
+        // HFQ4G256 fused QKVZA: `gpu.fused_qkvza_hfq4g256` is cross-arch
+        // precompiled (dp4a for gfx906, wave64 for CDNA, wave32 generic for
+        // RDNA1/2/3/4). The prior `HasWmma` gate was a dead-gate that rejected
+        // gfx906/gfx1030/gfx1031 even though the kernel runs there. `Always`
+        // matches the true cross-arch availability (mirrors FusedQkvHfq4G256
+        // and FusedGateUpHfq4G256 rows above).
+        (KernelKey::FusedQkvzaHfq4G256,     ArchPredicate::Always),
         (KernelKey::FusedQkvzaMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvzaMq4G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvzaHfq6G256,     ArchPredicate::GemvDp4a),
