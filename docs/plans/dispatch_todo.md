@@ -1,164 +1,156 @@
-# Dispatch unification — deferred items (out of 1.1 scope)
+# Dispatch unified architecture — open work items
 
-Real findings from the Ship 1.1 plan review that are correct but outside
-our work packet. Each item tracks back to the ship that should address it.
+Tracked findings from the tri-code review (GLM-5 / Gemini 2.5 Pro / Claude Opus 4.8),
+plus architectural items surfaced during Ship 3.3 implementation. Ordered by severity.
 
----
-
-## From Ship 1.1 review
-
-### D-1 · `w_down` Step variant for full pipeline coverage
-**Source:** Gemini §2.1, Claude §2.1 implicit
-**Ship:** Post-1.1 cleanup or Ship 1.2
-
-`weight_gemv_swiglu_residual` is dispatch-internal (calls `GemvFamily::run`
-with `GemvVariant::WithSwiGLUResidual`) but lives in
-`hipfire-runtime/src/llama.rs:1168`. A `Step::GemvSwigluResidual` variant
-would close the last model-code → dispatch-family dependency for `w_down`.
-Low urgency — new quant formats don't require model code changes since the
-function already selects the correct kernel via the dispatch crate.
-
-### D-2 · Multi-GPU `forward_scratch_layers_multi` migration
-**Source:** Gemini §4.1
-**Ship:** Ship 5
-
-`forward_scratch_layers_multi` uses `weight_gemv_prerotated` (not the
-deleted helpers), so 1.1's deletions don't affect it. Migration to
-`execute_steps` is Ship 5 scope alongside `forward_prefill_chunk`.
-
-### D-3 · gfx1201 (RDNA4) hardware verification for QKVZA
-**Source:** Claude §H4
-**Ship:** Pre-merge gate for the dispatch-unification branch
-
-Phase 0.6 makes RDNA4 verification non-optional. The QKVZA table entries
-gate on `HasWmmaW32` which already ORs gfx12 (`tables/mod.rs:81`), so no
-dead-gate risk. But actual `coherence-gate.sh` and `probe_commits.sh` on
-gfx1201 hardware must run before the branch merges. The GPU-free
-`(arch × dtype)` coverage golden is in 1.1 scope; hardware testing is
-hardware-gated.
-
-### D-4 · Same-binary `HIPFIRE_DISPATCH_OLD/_NEW` selector
-**Source:** Claude §M2, Phase 0.6
-**Ship:** Ship 1 or 2 (before mass migration)
-
-Phase 0.6 calls for a temporary selector alive through the migration
-window. For 1.1 (4 call sites), cross-commit comparison is adequate.
-The selector becomes higher-value when Ships 2–5 migrate multiple model
-archs simultaneously. Track as a pre-Ship-3 deliverable.
+Source reviews: `findings/dispatch_3.x_code_rev_{glm5,gemini,claude}.md`
 
 ---
 
-## From broader branch review (not specific to 1.1)
+## Hardware verification
 
-### D-5 · Phase 0.4: collapse `HasWmmaW32` → `HasWmma`, delete `HasWmmaW32Gfx12`
-**Source:** Phase 0.4 decision, #397 roadmap
-**Ship:** Pre-Ship-3 (before new kernels register under stale predicates)
+### F-3 · HIGH — Cross-arch verification needed (gfx1100 + gfx1201)
 
-`HasWmmaW32Gfx12` has zero kernel registrations. The decision is to
-collapse to a single `HasWmma` predicate backed by `ArchCaps::has_wmma()`.
-`HasWmmaW32` currently ORs both gfx11 and gfx12, so functionally correct
-today. The rename is a hygiene fix that prevents future authors from
-registering under a gfx12-only predicate that excludes gfx11.
+All Ship 3.3 verification ran on gfx1151 only. Phase 0.6 requires gfx1100 (primary
+deploy target) and gfx1201 (RDNA4).
 
-### D-6 · `err_wrong_arity` mislabel in `dispatch_fused_qkv`
-**Source:** Ship 1.1 checklist item 1.4
-**Ship:** Ship 1.1 Commit 3 (cleanup) or Ship 1.4
-
-The `err_wrong_arity` function in `families/fused_qkv.rs` labels arity
-errors with the wrong `FusedQkvVariant` for QKVZA keys (reports `Qkv`
-instead of `Qkvza`). Cosmetic but confusing during debugging.
-
-### D-7 · `debug_assert!` on double-rotation probe in `weight_gemv_prerotated`
-**Source:** Ship 1.1 checklist item 1.4
-**Ship:** Ship 1.4 (F1: double-rotation probe)
-
-MQ-family `run_auto` on already-FWHT-rotated input re-rotates. FWHT is
-involutory so the result is effectively un-rotated — silent correctness
-hazard. Add `debug_assert!` probe at `llama.rs:1055` (or equivalent).
-If assert fires in any real run → correctness bug → route through
-`GemvVariant::Prerotated`.
-
-### D-8 · Dead code after dispatch 1.1 migration
-**Source:** Ship 1.1 Commit 2 (forward_from_x_gpu collapse)
-**Ship:** Post-1.1 cleanup or Ship 5
-
-`forward_from_x_gpu` was collapsed to delegate to `forward_scratch_layers`,
-which made `moe_ffn_decode` (the per-call-alloc variant) dead code — all
-MoE paths now go through `moe_ffn_decode_with_scratch` or the `_prerotated`
-variant. `moe_ffn_decode_impl` and the `_with_scratch` variants remain
-alive. Deleting `moe_ffn_decode` is safe once Ship 5 confirms the prefill
-path also uses the scratch variants.
-
-Also safe to clean up in the same pass:
-- `MoeScratchRef::gate_up_buf` field (compiler-flagged dead — read by
-  dispatch crate but not by qwen35.rs directly)
-- Pre-existing unused variables: `kv_layer_idx` in forward_scratch_layers,
-  `load_norm_weight_raw`, `slice_f32_view`
-
-### D-9 · Paro weight alignment invariant (Ship 1.2)
-**Source:** Ship 1.2 commit 2 (Paro fused entries)
-**Status:** Verified by code inspection; GPU byte-parity deferred to coworker
-
-ParoQ4G128 group-128 quantization guarantees `k % 128 == 0` by construction
-(128-element groups). `m % 8 == 0` holds for all qwen35 Paro weight matrices
-because the model's hidden dims are multiples of 8. The fused kernel's
-`m%8==0` / `k%128==0` asserts in `fused_qkv_table.rs` / `steps.rs` guards
-mirror the kernel asserts exactly — the guards are optimization gates, not
-the correctness boundary. The per-op fallback (`gemv_hfq4g128`) has its own
-alignment contract that is always satisfied.
-
-### D-10 · Ship 2 handoff: Q4K / Q8_0 fused entries
-**Source:** Ship 1.2 scope change (Q4K/Q8_0 → Ship 2)
-**Ship:** Ship 2
-
-Q4K and Q8_0 fused-table entries (`FusedQkvQ4K`, `FusedGateUpQ4K`,
-`FusedGateUpQ8_0`) were moved to Ship 2 because they need llama/qwen2 model
-integration + GPU byte-parity landing together. The dispatch crate already
-has `FusedQkvQ4K` and `FusedGateUpQ4K` kernel keys, table entries, and
-dispatch arms — what's missing is the step-pattern wiring in `steps.rs`
-(guards + FUSED_TABLE entries + launch_fused arms) and GPU-verified parity.
-
-### D-11 · Paro GPU verification deferred
-**Source:** Ship 1.2 commit 3
-**Status:** Deferred to coworker with Paro model + gfx1100/gfx1201
-
-The following Commit 3 verification items require a Paro model on GPU:
-- Byte-identical-vs-master token IDs on A3B-PARO, gfx1100 + gfx1201
-- Force-unfused: coherence pass + cosine ≥ 0.9999
-- probe_commits.sh master HEAD: parity with master + gain vs parent
-- Multi path (forward_scratch_layers_multi) still works
-The infrastructure is in place and CPU-side tests pass; coworker will run
-the GPU verification and report results.
+**Action:** Run coverage + coherence battery on gfx1100 and gfx1201. No code change.
+**Blocks:** Phase 0.6 sign-off.
 
 ---
 
-## From Ship 3.3 grounding (vision attention)
+## Integration work (follow-up ships)
 
-### D-12 · dots-ocr vision attention has only an *unoptimized, likely-unvalidated* non-WMMA path
-**Source:** Ship 3.3 grounding (`dots_ocr.rs:1121-1158`)
-**Ship:** Out of dispatch-refactor scope — flagged for a vision-kernel follow-up
-**Status:** Investigated — a fallback **exists**; the defect is its quality/validation, not absence
+### F-8 · MED — Multi-GPU path migration (`forward_scratch_layers_multi`)
 
-Original concern was "dots-ocr has no non-WMMA attention kernel." **Corrected by
-inspection:** the dispatch is arch-gated (`use_wmma = gpu.arch_caps.has_wmma_w32()`,
-`dots_ocr.rs:884`); on a non-WMMA arch (gfx906/CDNA, gfx1010/RDNA1, gfx1030/RDNA2)
-all `if use_wmma` branches are skipped and the `else` at `:1154` runs
-`attention_dflash_f32` — a genuine pure-scalar online-softmax kernel
-(`kernels/src/attention_dflash.hip`, **0 WMMA builtins**). So **non-WMMA archs do
-not crash**; they run scalar.
+38 direct `gpu.kv_cache_write_*` / `gpu.attention_*` calls in an inline match tree
+in `forward_scratch_layers_multi`. No `KvTierPlan` coverage, no LDS-overflow fix,
+divergent Q8 heuristic from the single-GPU path.
 
-The real (weaker) defect worth tracking:
-- The non-WMMA path is a **single unoptimized reference kernel** — the WMMA side has a
-  5-rung tuned ladder (v5/n128/m32/wmma_f32/+gfx12), the non-WMMA side has exactly one
-  naive scalar kernel. Vision OCR on CDNA/RDNA1/RDNA2 would be slow.
-- It is **almost certainly never correctness-validated on a non-WMMA arch** — the
-  dots-ocr E2E oracle (F1 1.000, 13/13 — `project_dots_ocr_e2e_validated_2026_05_21`)
-  ran only on WMMA archs (gfx1100/gfx1151). The scalar fallback's correctness at the
-  real vision shape (B = L = n_patches ≈ 20k, head_dim 128) is unverified.
+**Action:** Mirror the single-GPU dispatch migration (Ship 3.3 C4 pattern) into the
+multi-GPU path. Separate ship — orthogonal to dispatch unification.
+**Scope:** ~38 call sites in `crates/hipfire-arch-qwen35/src/qwen35.rs`.
 
-**Not** part of the 3.3 dispatch refactor (it's a kernel-coverage/validation gap, not a
-dispatch-surface gap). But 3.3 C2 **must** register `DflashScalar` as the `Always` floor
-of the `AttnFullF16` variant ladder, or non-WMMA archs would resolve to `MissingImpl`
-(a regression from today's working-but-slow scalar path). A proper fix is a tuned
-non-WMMA vision-attention kernel (dp4a on gfx906, scalar-ILP on RDNA1/2) + an E2E OCR
-run on a non-WMMA arch — out of scope here.
+### Multi-GPU / MoE attention dispatch
+
+Ship 3.3 only covers single-GPU paths. The multi-GPU band-mode forward pass has its
+own attention ladder that needs dispatch migration independently.
+
+**Action:** Ship 4 / later. Depends on F-8 completion.
+
+### qwen2 text decode/prefill attention
+
+The qwen2 text-side trait impl delegates to `hipfire-arch-qwen2` which has its own
+inline attention ladder. Ship 3.3 migrated qwen35 + dots-ocr + llama + dflash but
+not qwen2 text.
+
+**Action:** Ship 3.1b / 3.2 llama-family follow-up.
+
+---
+
+## Kernel work
+
+### F-19 · LOW — Tile kernel OOB Q read when `head_dim < 256`
+
+The WMMA-FA tile kernels read `head_dim` elements from Q unconditionally. If a model
+has `head_dim < 256`, the read extends past the allocated tensor → potential OOB.
+
+**Action:** Add a `head_dim` guard in the tile kernels (clamp or bounds-check). Requires
+kernel changes + careful testing. Tracked for kernel cleanup pass.
+
+### F-16 · LOW — Q8 batched write is 2 launches vs fused 1
+
+All other quant tiers use a fused K+V write kernel. Q8 uses two separate launches
+(`kv_cache_write_q8_0` called twice). Inherent to Q8 kernel API — no fused variant exists.
+
+**Action:** Would need a new fused Q8 write kernel. Low priority — perf impact is
+minimal (2 cheap launches vs 1). Documented as known asymmetry.
+
+### WMMA-FA for fwht4 / asym3 / fwht3 batched-masked
+
+Only asym4 has a WMMA tile today (via `Asym4WmmaTile`). The fwht4, asym3, and fwht3
+batched-masked paths use scalar kernels.
+
+**Action:** New kernels (future). The scalar paths are correct; WMMA would improve
+prefill throughput.
+
+### 2-bit tree-verify kernel (the 3.2 `UnsupportedTreeTier` gap)
+
+`batched_keys` returns `Err(UnsupportedTreeTier)` for asym2 + tree-verify because no
+`_batched_masked` variant exists. The F-4 guard forces per-token fallback.
+
+**Action:** Future kernel work to add a 2-bit tree-verify masked variant.
+
+---
+
+## Cosmetic / design
+
+### F-18 · LOW — `AttnQ8_0KvBatchedMasked` naming inconsistency
+
+Inconsistent with other `_BatchedMasked` keys (e.g. `AttnFlashAsym4BatchedMasked`).
+The `Q8_0Kv` infix breaks the `{tier}BatchedMasked` pattern.
+
+**Action:** Cosmetic rename to `AttnFlashQ8_0BatchedMasked`. Use `pub use OldName = NewName`
+alias for one release cycle to avoid breaking consumers. Low priority.
+
+### F-14 · LOW — `TileImpl` in shared `types.rs`
+
+30+ sites specify `tile: TileImpl::None`. Could use `#[default]` + struct-update
+syntax (`..Default::default()`) or wrap in `Option<>`.
+
+**Action:** Design cleanup. No functional impact. Consider when adding Ship 4 tile
+variants (append-only enum discipline at Ship 3 ⊥ Ship 4 boundary).
+
+### F-15 · LOW — `HeadDimIn(&'static [usize])` forces compile-time
+
+`ShapePredicate::HeadDimIn` takes `&'static [usize]`, requiring compile-time known
+head dims. Fine for init-time registration but limits dynamic model loading.
+
+**Action:** API design — acceptable for now. Revisit if dynamic head_dim loading
+becomes a requirement.
+
+### F-28 — `attention_dflash_*` naming collision
+
+GPU method names like `attention_dflash_f32` conflate the DFlash spec-decode project
+with the generic tiled online-softmax algorithm family. A rename (e.g. `attention_tiled_f32`)
+would resolve the ambiguity.
+
+**Action:** Future cleanup. Noted as TODO in `attention.rs` header. Low priority —
+no functional impact.
+
+### Priority field in `KernelVariant`
+
+Registration-order-is-priority works but is fragile. An explicit `priority: u32` field
+would make the ordering invariant visible and catch accidental reorderings.
+
+**Action:** Future improvement. Current system works — all tables have `PRIORITY ORDER`
+comments and the completeness tests catch missing arms.
+
+---
+
+## Closed in Ship 3.3
+
+| Finding | Status | Commit |
+|---|---|---|
+| F-1 WMMA grid shape | ✅ FIXED | Bug-fix round |
+| F-2 Q8 kernel swap docs | ✅ FIXED | `53795fbe` |
+| F-4 KV-tier guard | ✅ FIXED | `53795fbe` |
+| F-5 Tile completeness test | ✅ FIXED | Bug-fix round |
+| F-6 Reverse completeness | ✅ FIXED | Bug-fix round |
+| F-7 Coverage gate | ✅ FIXED | Bug-fix round |
+| F-9 DispatchCtx hoisting | ✅ FIXED | `53795fbe` |
+| F-10 ShapeInfo.m | ✅ FIXED | Bug-fix round |
+| F-11 UnsupportedTreeTier batch_size | ✅ FIXED | Bug-fix round |
+| F-12 F32+batched comment | ✅ FIXED | Bug-fix round |
+| F-13 Unused binding | ✅ FIXED | Bug-fix round |
+| F-17 is_boundary comment | ✅ FIXED | Bug-fix round |
+| F-20 Q8 heuristic | ✅ FIXED | Bug-fix round |
+| F-21 Trailing newline | ✅ FIXED | Bug-fix round |
+| F-22 kv_write tile-oblivious | ✅ VERIFIED | C5 sweep |
+| F-23 WMMA draft rung warning | ✅ DOCUMENTED | C3 commit |
+| F-24 Full-attention completeness | ✅ TESTED | C5 sweep |
+| F-28 Naming collision TODO | ✅ NOTED | C5 sweep |
+
+---
+
+*Last updated: 2026-06-06 (post Ship 3.3 close, tracking #397).*
