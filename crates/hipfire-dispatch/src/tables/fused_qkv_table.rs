@@ -14,7 +14,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedQkvHfq4G256,     ArchPredicate::Always),
         (KernelKey::FusedQkvMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvMq4G256Lloyd, ArchPredicate::HasWmma),
-        (KernelKey::FusedQkvHfq6G256,     ArchPredicate::GemvDp4a),
+        (KernelKey::FusedQkvHfq6G256,     ArchPredicate::HasDp4a),
         (KernelKey::FusedQkvQ4K,          ArchPredicate::Always),
     ];
     for &(key, arch) in qkv_variants {
@@ -39,7 +39,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedQkvzaHfq4G256,     ArchPredicate::Always),
         (KernelKey::FusedQkvzaMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvzaMq4G256Lloyd, ArchPredicate::HasWmma),
-        (KernelKey::FusedQkvzaHfq6G256,     ArchPredicate::GemvDp4a),
+        (KernelKey::FusedQkvzaHfq6G256,     ArchPredicate::HasDp4a),
     ];
     for &(key, arch) in qkvza_variants {
         registry.register(KernelVariant {
@@ -63,9 +63,11 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedGateUpHfq4G256,     ArchPredicate::Always),
         (KernelKey::FusedGateUpMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedGateUpMq4G256Lloyd, ArchPredicate::HasWmma),
-        (KernelKey::FusedGateUpHfq6G256,     ArchPredicate::GemvDp4a),
+        (KernelKey::FusedGateUpHfq6G256,     ArchPredicate::HasDp4a),
         (KernelKey::FusedGateUpQ4K,          ArchPredicate::Always),
-        (KernelKey::FusedGateUpParo4G128T,   ArchPredicate::HasDp4a),
+        // Paro4G128T fused: generic wave32 kernels, no ISA-specific intrinsics.
+        // Previously gated on HasDp4a (has_dot2_f32_f16) which excluded gfx906/gfx1010.
+        (KernelKey::FusedGateUpParo4G128T,   ArchPredicate::Always),
         // Q8_0 gate+up: plain wave32 kernel (`gpu.fused_gate_up_q8_0`),
         // no arch gate — mirrors the Q4K row. Used by qwen2 FFN.
         (KernelKey::FusedGateUpQ8_0,         ArchPredicate::Always),
@@ -83,7 +85,8 @@ pub fn populate(registry: &mut KernelRegistry) {
 
     // ── Fused QKVZA Paro4G128T (dp4a) ────────────────────────────
     let qkvza_paro_variants: &[(KernelKey, ArchPredicate)] = &[
-        (KernelKey::FusedQkvzaParo4G128T, ArchPredicate::HasDp4a),
+        // Paro4G128T QKVZA: generic wave32 kernels.
+        (KernelKey::FusedQkvzaParo4G128T, ArchPredicate::Always),
     ];
     for &(key, arch) in qkvza_paro_variants {
         registry.register(KernelVariant {
@@ -98,7 +101,8 @@ pub fn populate(registry: &mut KernelRegistry) {
 
     // ── Fused QKV Paro4G128T (3-way FullAttn, dp4a) ─────────────
     let qkv_paro_variants: &[(KernelKey, ArchPredicate)] = &[
-        (KernelKey::FusedQkvParo4G128T, ArchPredicate::HasDp4a),
+        // Paro4G128T QKV (3-way): generic wave32 kernels.
+        (KernelKey::FusedQkvParo4G128T, ArchPredicate::Always),
     ];
     for &(key, arch) in qkv_paro_variants {
         registry.register(KernelVariant {

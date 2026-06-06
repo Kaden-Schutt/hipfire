@@ -318,14 +318,19 @@ pub enum ArchPredicate {
     Always,
     HasWmma,
     HasWmmaGfx12,
-    HasDp4a,
+    /// `has_dot2_f32_f16()` — RDNA1.1+ (gfx1011, gfx1030+, gfx1100+, gfx1200+).
+    /// Gates the RDNA dot2-F16 codepath used by HFQ3 sdot4 kernels.
+    /// Historically named "HasDp4a" — renamed because AMD "dp4a" in the ISA
+    /// means `v_dot4_i32_i8` (gfx906-only), while this checks `v_dot2_f32_f16`
+    /// (RDNA1.1+). The two are unrelated ISA features.
+    HasDot2F32F16,
     HasSdot4,
     HasMmq,
     HasCdna3LdsGemv,
     /// `gemv_dp4a_enabled()` — gfx906-only by default (env-overridable).
-    /// Gates the gfx906 wave64 sdot4 fused dp4a kernels (HFQ6/MQ6).
-    /// NOT `HasDp4a` (=has_dot2_f32_f16, true on all RDNA2+).
-    GemvDp4a,
+    /// Gates the gfx906 wave64 `v_dot4_i32_i8` (sdot4) fused kernels (HFQ6/MQ6).
+    /// This IS AMD "dp4a" — `v_dot4_i32_i8` INT8 dot4 accumulate, gfx906/gfx908.
+    HasDp4a,
 }
 
 #[derive(Clone, Debug)]

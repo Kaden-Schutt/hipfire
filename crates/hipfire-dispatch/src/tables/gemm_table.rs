@@ -42,7 +42,10 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmHfq4G256,
-        arch_required: ArchPredicate::HasDp4a,
+        // HFQ4G256 batched GEMM: cross-arch (dp4a for gfx906, wave64 for CDNA,
+        // generic for RDNA). Previously gated on HasDp4a (=has_dot2_f32_f16=RDNA1.1+)
+        // which excluded gfx906 where the kernel works via v_dot4_i32_i8.
+        arch_required: ArchPredicate::Always,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
@@ -50,7 +53,8 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmHfq4G128,
-        arch_required: ArchPredicate::HasDp4a,
+        // HFQ4G128 batched GEMM: same cross-arch rationale as HFQ4G256 above.
+        arch_required: ArchPredicate::Always,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,

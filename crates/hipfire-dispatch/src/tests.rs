@@ -70,7 +70,7 @@ fn has_wmma_variant(key: KernelKey) -> KernelVariant {
 fn dp4a_variant(key: KernelKey) -> KernelVariant {
     KernelVariant {
         key,
-        arch_required: ArchPredicate::HasDp4a,
+        arch_required: ArchPredicate::HasDot2F32F16,
         shape_gate: None,
         steps: &[],
         has_awq: false,
@@ -147,10 +147,10 @@ fn arch_has_wmma_requires_rdna3_or_rdna4() {
 
 #[test]
 fn arch_has_dp4a_requires_rdna1p1_or_newer() {
-    assert!(!ArchPredicate::HasDp4a.eval_arch(&ctx_rdna1()));
-    assert!(ArchPredicate::HasDp4a.eval_arch(&ctx_rdna2()));
-    assert!(ArchPredicate::HasDp4a.eval_arch(&ctx_rdna3()));
-    assert!(ArchPredicate::HasDp4a.eval_arch(&ctx_rdna4()));
+    assert!(!ArchPredicate::HasDot2F32F16.eval_arch(&ctx_rdna1()));
+    assert!(ArchPredicate::HasDot2F32F16.eval_arch(&ctx_rdna2()));
+    assert!(ArchPredicate::HasDot2F32F16.eval_arch(&ctx_rdna3()));
+    assert!(ArchPredicate::HasDot2F32F16.eval_arch(&ctx_rdna4()));
 }
 
 #[test]
@@ -163,10 +163,11 @@ fn arch_has_mmq_on_rdna3_or_rdna4() {
 
 #[test]
 fn arch_gemv_dp4a_gfx906_only() {
-    assert!(ArchPredicate::GemvDp4a.eval_arch(&ctx_gfx906()));
-    assert!(!ArchPredicate::GemvDp4a.eval_arch(&ctx_rdna2()));
-    assert!(!ArchPredicate::GemvDp4a.eval_arch(&ctx_rdna3()));
-    assert!(!ArchPredicate::GemvDp4a.eval_arch(&ctx_rdna4()));
+    // HasDp4a (=v_dot4_i32_i8, gfx906-only)
+    assert!(ArchPredicate::HasDp4a.eval_arch(&ctx_gfx906()));
+    assert!(!ArchPredicate::HasDp4a.eval_arch(&ctx_rdna2()));
+    assert!(!ArchPredicate::HasDp4a.eval_arch(&ctx_rdna3()));
+    assert!(!ArchPredicate::HasDp4a.eval_arch(&ctx_rdna4()));
 }
 
 #[test]

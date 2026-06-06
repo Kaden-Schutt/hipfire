@@ -89,13 +89,13 @@ impl ArchPredicate {
             // a new ArchPredicate variant only lands with the kernel it gates.
             Self::HasWmma => ctx.arch.has_wmma(),
             Self::HasWmmaGfx12 => ctx.arch.has_wmma_w32_gfx12(),
-            Self::HasDp4a => ctx.arch.has_dot2_f32_f16(),
+            Self::HasDot2F32F16 => ctx.arch.has_dot2_f32_f16(),
             Self::HasSdot4 => ctx.arch.has_hfq3_sdot4(),
             // MQ6/HFQ6 GEMV ships on RDNA4 (gemv_mq6g256_prerotated has a gfx12 build);
             // has_mmq is gfx906||rdna3 only, so admit RDNA4 explicitly.
             Self::HasMmq => ctx.arch.has_mmq() || ctx.arch.is_rdna4(),
             Self::HasCdna3LdsGemv => ctx.arch.has_cdna3_lds_gemv(),
-            Self::GemvDp4a => ctx.arch.gemv_dp4a_enabled(),
+            Self::HasDp4a => ctx.arch.gemv_dp4a_enabled(),
         }
     }
 }

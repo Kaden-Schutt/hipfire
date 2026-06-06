@@ -90,7 +90,7 @@ const FLEET: &[OpUse] = &[
     // ── dense MQ4/MQ3/Lloyd: o_proj has a fused residual kernel — anchors (stay green) ──
     // MQ4/MQ6 work on ALL archs (generic GEMV fallback for gfx906/RDNA1 + arch-tuned
     // variants for RDNA2/3/4). Previously WAVE32-only (excluded gfx906) because
-    // dtype_arch_predicate returned HasDp4a (=has_dot2_f32_f16=RDNA1.1+), which
+    // dtype_arch_predicate returned HasDot2F32F16 (=has_dot2_f32_f16=RDNA1.1+), which
     // excludes gfx906. Fixed: dtype_arch_predicate now returns Always for MQ4G256.
     OpUse { model: "qwen3.5-9b.mq4",        role: Role::Plain,    dtype: MQ4G256,      archs: ALL },
     OpUse { model: "qwen3.5-27b.mq4",       role: Role::Residual, dtype: MQ4G256,      archs: ALL },
@@ -438,10 +438,11 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
         FusedKeyUse { key: KernelKey::FusedQkvzaMq4G256Lloyd, archs: WMMA_ARCHS },
         FusedKeyUse { key: KernelKey::FusedGateUpMq3G256Lloyd, archs: WMMA_ARCHS },
         FusedKeyUse { key: KernelKey::FusedGateUpMq4G256Lloyd, archs: WMMA_ARCHS },
-        // ── HasDp4a (RDNA1.1+) kernels ──
-        FusedKeyUse { key: KernelKey::FusedQkvzaParo4G128T,  archs: &["gfx1011", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1200"] },
-        FusedKeyUse { key: KernelKey::FusedQkvParo4G128T,    archs: &["gfx1011", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1200"] },
-        FusedKeyUse { key: KernelKey::FusedGateUpParo4G128T,  archs: &["gfx1011", "gfx1030", "gfx1031", "gfx1032", "gfx1100", "gfx1200"] },
+        // ── HasDp4a (gfx906 v_dot4_i32_i8) kernels ──
+        // Paro fused: Always-gated (generic wave32 kernels, no ISA intrinsics)
+        FusedKeyUse { key: KernelKey::FusedQkvzaParo4G128T,  archs: ALL },
+        FusedKeyUse { key: KernelKey::FusedQkvParo4G128T,    archs: ALL },
+        FusedKeyUse { key: KernelKey::FusedGateUpParo4G128T,  archs: ALL },
     ];
 
     let family = FusedQkvFamily::new();
