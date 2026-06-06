@@ -185,10 +185,24 @@ differ); `probe_commits.sh master HEAD` ±1–3%; `coherence-gate.sh`.
    precedes any interpreter path that hits HFQ4 gate+up on a non-WMMA arch.** Don't
    migrate HFQ4 gate+up through the interpreter before widening `FusedGateUpHfq4G256`,
    or `gfx1030`/`gfx906` coverage goes red.
-2. **Q8_0 verification fixture (linchpin).** The qwen2 byte-parity check only exercises
-   `FusedGateUpQ8_0` if the test model's FFN is actually Q8_0. Confirm such a qwen2
-   fixture exists **before** A2; otherwise Q8_0 reverts to the 1.2 "unverified glue"
-   hole despite the family arm existing.
+2. **Q8_0 verification fixture (linchpin) — RESOLVED (option a implemented 2026-06-05).**
+   Key insight: the runtime hfq loader already maps **quant_type 3 (`Q8F16`) → `DType::Q8_0`**
+   (`hfq.rs:632`, "Q8F16 — same block format as GGML Q8_0"), so no new `QuantType` was needed.
+   Added **`--format hfq4-q8ffn`** to `hipfire-quantize` (inverse of `hfq-mixed`): HFQ4 for
+   attn (q/k/v/o), `Q8F16`→`Q8_0` for `mlp.*` + embed/lm_head. This is the exact qwen2 A2
+   recipe — HFQ4 QKV → `FusedQkvHfq4G256`, Q8_0 FFN → `FusedGateUpQ8_0`. *(Earlier "BLOCKED /
+   no QuantType::Q8_0" analysis missed the loader's code-3→Q8_0 mapping; corrected.)*
+
+   **Fixtures built (2026-06-05, dense safetensors → `hipfire-quantize`):**
+   - `/data/hipfire/qwen2-1.5b.hfq4-q8ffn.hfq` (`--format hfq4-q8ffn`, Qwen2-1.5B) → **A2
+     linchpin**: HFQ4 q/k/v/o + Q8_0 mlp → exercises `FusedQkvHfq4G256` **and**
+     `FusedGateUpQ8_0`. Dense Qwen2 (no QK-norm) for the qwen2 crate. mean err 2e-4.
+   - `/data/hipfire/qwen3-0.6b.hfq4.hfq` (`--format hfq4`, Qwen3-0.6B) → `FusedQkvHfq4G256` +
+     `FusedGateUpHfq4G256`; q_norm/k_norm present (`has_qk_norm`), llama arch.
+   - `/data/hipfire/qwen3-0.6b.q4k.hfq` (`--format q4k`, Qwen3-0.6B) → all-Q4_K → **A3**
+     `FusedQkvQ4K` + `FusedGateUpQ4K`. *(Q4K **is** producible via `--format q4k`/`use_q4k_all`.)*
+   All dense (arch_id 1), small enough for fast on-GPU smoke. (A `hfq4-q8ffn` Qwen3-0.6B can be
+   built the same way for the llama-arch HFQ4+Q8 combo if needed.)
 3. **Silent perf no-op.** If a guard fails to fire, output stays correct but the fused
    kernel never runs. Backstop: `probe_commits.sh` gain-vs-parent + a debug assert that
    the intended `launch_fused` arm was reached ≥ once/forward.
