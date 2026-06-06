@@ -6582,6 +6582,12 @@ pub struct PrefillBatchScratch {
     // At max_batch=22, n_v_heads=16, head_dim=128 → 5.77 MB + 180 KB total.
     pub dn_s_tape_q8: Option<GpuTensor>,
     pub dn_s_tape_scales: Option<GpuTensor>,
+    // FP32 per-node tape for the FP32 `StateQuant` tree-verify path. Same
+    // element layout as `dn_s_tape_q8` but f32 (4×), no scales side-table.
+    // TODO: gate allocation on state_quant (needs threading StateQuant into
+    // `new`); currently always allocated when LA layers exist, like the Q8
+    // tape. s_tape_f32: [max_batch × n_v_heads × head_dim × head_dim] f32.
+    pub dn_s_tape_f32: Option<GpuTensor>,
 }
 
 impl PrefillBatchScratch {
@@ -6786,6 +6792,14 @@ impl PrefillBatchScratch {
                 &[max_batch * config.linear_num_value_heads * config.linear_value_head_dim],
                 DType::F32
             ),
+            dn_s_tape_f32: alloc_opt!(
+                config.linear_num_value_heads > 0,
+                &[max_batch
+                    * config.linear_num_value_heads
+                    * config.linear_value_head_dim
+                    * config.linear_value_head_dim],
+                DType::F32
+            ),
         })
     }
 
@@ -6848,6 +6862,7 @@ impl PrefillBatchScratch {
             self.moe_y_down_grouped,
             self.dn_s_tape_q8,
             self.dn_s_tape_scales,
+            self.dn_s_tape_f32,
         ] {
             if let Some(t) = t {
                 let _ = gpu.free_tensor(t);
@@ -9533,40 +9548,107 @@ fn forward_prefill_chunk(
                 // s_tape[parent] (or pre-block s_q8_init at root); linear
                 // variant advances dn_state.s_matrices in place.
                 if let Some(parents) = tree_parents {
-                    let tape_q8 = pbs.dn_s_tape_q8.as_ref()
-                        .expect("tree-aware LA requires dn_s_tape_q8 scratch (check PrefillBatchScratch::new)");
-                    let tape_sc = pbs.dn_s_tape_scales.as_ref()
-                        .expect("tree-aware LA requires dn_s_tape_scales scratch (check PrefillBatchScratch::new)");
-                    gpu.gated_delta_net_q8_tree_batch_seq(
-                        &pbs.dn_q_batch,
-                        &pbs.dn_k_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_alpha_batch,
-                        &pbs.dn_beta_batch,
-                        &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        tape_q8,
-                        tape_sc,
-                        parents,
-                        &pbs.dn_attn_out_batch,
-                        n,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                    )?;
+                    // Tree-verify GDN, dispatched by DeltaNet state quant.
+                    // FP32 uses the full-precision tree-tape kernel (no
+                    // per-node Q8 round-trip); Q8 the original; Q4 tree has
+                    // no kernel (was silently mis-routed to the Q8 tree
+                    // kernel before — now a clean error).
+                    match dn_state.quant {
+                        StateQuant::FP32 => {
+                            let tape_f32 = pbs.dn_s_tape_f32.as_ref().expect(
+                                "FP32 tree-aware LA requires dn_s_tape_f32 scratch (check PrefillBatchScratch::new)",
+                            );
+                            gpu.gated_delta_net_f32_tree_batch_seq(
+                                &pbs.dn_q_batch,
+                                &pbs.dn_k_batch,
+                                &pbs.dn_v_batch,
+                                &pbs.dn_alpha_batch,
+                                &pbs.dn_beta_batch,
+                                &dn_state.s_matrices[delta_layer_idx],
+                                tape_f32,
+                                parents,
+                                &pbs.dn_attn_out_batch,
+                                n,
+                                n_v_heads,
+                                config.linear_value_head_dim,
+                            )?;
+                        }
+                        StateQuant::Q8 => {
+                            let tape_q8 = pbs.dn_s_tape_q8.as_ref()
+                                .expect("tree-aware LA requires dn_s_tape_q8 scratch (check PrefillBatchScratch::new)");
+                            let tape_sc = pbs.dn_s_tape_scales.as_ref()
+                                .expect("tree-aware LA requires dn_s_tape_scales scratch (check PrefillBatchScratch::new)");
+                            gpu.gated_delta_net_q8_tree_batch_seq(
+                                &pbs.dn_q_batch,
+                                &pbs.dn_k_batch,
+                                &pbs.dn_v_batch,
+                                &pbs.dn_alpha_batch,
+                                &pbs.dn_beta_batch,
+                                &dn_state.s_matrices[delta_layer_idx],
+                                &dn_state.s_scales[delta_layer_idx],
+                                tape_q8,
+                                tape_sc,
+                                parents,
+                                &pbs.dn_attn_out_batch,
+                                n,
+                                n_v_heads,
+                                config.linear_value_head_dim,
+                            )?;
+                        }
+                        StateQuant::Q4 => {
+                            return Err(hip_bridge::HipError::new(
+                                0,
+                                "Q4 DeltaNet state + tree-verify (DDTree) is unsupported: \
+                                 there is no Q4 tree-tape GDN kernel. Use Q8 or FP32 state \
+                                 for tree spec-decode.",
+                            ));
+                        }
+                    }
                 } else {
-                    gpu.gated_delta_net_q8_batch_seq(
-                        &pbs.dn_q_batch,
-                        &pbs.dn_k_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_alpha_batch,
-                        &pbs.dn_beta_batch,
-                        &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        &pbs.dn_attn_out_batch,
-                        n,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                    )?;
+                    // EXPERIMENT (not #417): mirror the state-quant dispatch the
+                    // decode siblings already do (forward_scratch_layers:13194),
+                    // so the captured/eager batched prefill honours FP32/Q4 state
+                    // instead of forcing the Q8 kernel onto non-Q8 buffers.
+                    match dn_state.quant {
+                        StateQuant::FP32 => gpu.gated_delta_net_f32_batch_seq(
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_alpha_batch,
+                            &pbs.dn_beta_batch,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &pbs.dn_attn_out_batch,
+                            n,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?,
+                        StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_alpha_batch,
+                            &pbs.dn_beta_batch,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &dn_state.s_scales[delta_layer_idx],
+                            &pbs.dn_attn_out_batch,
+                            n,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?,
+                        StateQuant::Q4 => gpu.gated_delta_net_q4(
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_alpha_batch,
+                            &pbs.dn_beta_batch,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &dn_state.s_scales[delta_layer_idx],
+                            &pbs.dn_attn_out_batch,
+                            n,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?,
+                    }
                 }
 
                 // Batched gated output norm.
@@ -11390,44 +11472,104 @@ fn forward_prefill_chunk(
                     )?;
                 }
                 if let Some(parents) = tree_parents {
-                    let tape_q8 = pbs
-                        .dn_s_tape_q8
-                        .as_ref()
-                        .expect("tree-aware LA requires dn_s_tape_q8 scratch");
-                    let tape_sc = pbs
-                        .dn_s_tape_scales
-                        .as_ref()
-                        .expect("tree-aware LA requires dn_s_tape_scales scratch");
-                    gpu.gated_delta_net_q8_tree_batch_seq(
-                        &pbs.dn_q_batch,
-                        &pbs.dn_k_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_alpha_batch,
-                        &pbs.dn_beta_batch,
-                        &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        tape_q8,
-                        tape_sc,
-                        parents,
-                        &pbs.dn_attn_out_batch,
-                        n,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                    )?;
+                    // MoE-path tree-verify GDN, dispatched by state quant
+                    // (mirror of the dense path above).
+                    match dn_state.quant {
+                        StateQuant::FP32 => {
+                            let tape_f32 = pbs.dn_s_tape_f32.as_ref().expect(
+                                "FP32 tree-aware LA requires dn_s_tape_f32 scratch (check PrefillBatchScratch::new)",
+                            );
+                            gpu.gated_delta_net_f32_tree_batch_seq(
+                                &pbs.dn_q_batch,
+                                &pbs.dn_k_batch,
+                                &pbs.dn_v_batch,
+                                &pbs.dn_alpha_batch,
+                                &pbs.dn_beta_batch,
+                                &dn_state.s_matrices[delta_layer_idx],
+                                tape_f32,
+                                parents,
+                                &pbs.dn_attn_out_batch,
+                                n,
+                                n_v_heads,
+                                config.linear_value_head_dim,
+                            )?;
+                        }
+                        StateQuant::Q8 => {
+                            let tape_q8 = pbs
+                                .dn_s_tape_q8
+                                .as_ref()
+                                .expect("tree-aware LA requires dn_s_tape_q8 scratch");
+                            let tape_sc = pbs
+                                .dn_s_tape_scales
+                                .as_ref()
+                                .expect("tree-aware LA requires dn_s_tape_scales scratch");
+                            gpu.gated_delta_net_q8_tree_batch_seq(
+                                &pbs.dn_q_batch,
+                                &pbs.dn_k_batch,
+                                &pbs.dn_v_batch,
+                                &pbs.dn_alpha_batch,
+                                &pbs.dn_beta_batch,
+                                &dn_state.s_matrices[delta_layer_idx],
+                                &dn_state.s_scales[delta_layer_idx],
+                                tape_q8,
+                                tape_sc,
+                                parents,
+                                &pbs.dn_attn_out_batch,
+                                n,
+                                n_v_heads,
+                                config.linear_value_head_dim,
+                            )?;
+                        }
+                        StateQuant::Q4 => {
+                            return Err(hip_bridge::HipError::new(
+                                0,
+                                "Q4 DeltaNet state + tree-verify (DDTree) is unsupported: \
+                                 there is no Q4 tree-tape GDN kernel. Use Q8 or FP32 state \
+                                 for tree spec-decode.",
+                            ));
+                        }
+                    }
                 } else {
-                    gpu.gated_delta_net_q8_batch_seq(
-                        &pbs.dn_q_batch,
-                        &pbs.dn_k_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_alpha_batch,
-                        &pbs.dn_beta_batch,
-                        &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        &pbs.dn_attn_out_batch,
-                        n,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                    )?;
+                    match dn_state.quant {
+                        StateQuant::FP32 => gpu.gated_delta_net_f32_batch_seq(
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_alpha_batch,
+                            &pbs.dn_beta_batch,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &pbs.dn_attn_out_batch,
+                            n,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?,
+                        StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_alpha_batch,
+                            &pbs.dn_beta_batch,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &dn_state.s_scales[delta_layer_idx],
+                            &pbs.dn_attn_out_batch,
+                            n,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?,
+                        StateQuant::Q4 => gpu.gated_delta_net_q4(
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_alpha_batch,
+                            &pbs.dn_beta_batch,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &dn_state.s_scales[delta_layer_idx],
+                            &pbs.dn_attn_out_batch,
+                            n,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?,
+                    }
                 }
                 gpu.gated_norm_f32_batched(
                     &pbs.dn_attn_out_batch,
