@@ -68,6 +68,12 @@ impl KernelRegistry {
     pub fn all_keys(&self) -> Vec<KernelKey> {
         self.table.keys().copied().collect()
     }
+
+    /// All registered variants for a given key (arch/shape-ungated).
+    /// For completeness tests that need to verify tile coverage.
+    pub fn variants_for(&self, key: KernelKey) -> &[KernelVariant] {
+        self.table.get(&key).map(|v| v.as_slice()).unwrap_or(&[])
+    }
 }
 
 impl ArchPredicate {

@@ -326,30 +326,49 @@ fn attention_keys_resolve_on_fleet_archs() {
         /// Archs where this key MUST resolve. `Always`-gated keys use ALL;
         /// `HasWmma`-gated keys use WAVE32.
         archs: &'static [&'static str],
+        /// Shape to pass. `None` bypasses shape gating. Batched keys need
+        /// `batch_size > 1` to pass `BatchGt(1)` / `BatchEq(1)` gates.
+        shape: Option<ShapeInfo>,
     }
 
     let attn_fleet: &[AttnKeyUse] = &[
-        // KV write — Always-gated, must resolve on every fleet arch
-        AttnKeyUse { key: KernelKey::KvWriteF32,            archs: ALL },
-        AttnKeyUse { key: KernelKey::KvWriteQ8_0,           archs: ALL },
-        AttnKeyUse { key: KernelKey::KvWriteAsym4,          archs: ALL },
-        AttnKeyUse { key: KernelKey::KvWriteAsym4Fwht,      archs: ALL },
-        AttnKeyUse { key: KernelKey::KvWriteAsym3,          archs: ALL },
-        AttnKeyUse { key: KernelKey::KvWriteAsym3Fwht,      archs: ALL },
-        AttnKeyUse { key: KernelKey::KvWriteAsym2,          archs: ALL },
-        AttnKeyUse { key: KernelKey::KvWriteAsym2Fwht,      archs: ALL },
-        // Attention — Always-gated
-        AttnKeyUse { key: KernelKey::AttnF32,               archs: ALL },
-        AttnKeyUse { key: KernelKey::AttnFlashQ8_0,         archs: ALL },
-        AttnKeyUse { key: KernelKey::AttnQ8_0Kv,            archs: ALL },
-        AttnKeyUse { key: KernelKey::AttnFlashAsym4,        archs: ALL },
-        AttnKeyUse { key: KernelKey::AttnFlashAsym4Fwht,    archs: ALL },
-        AttnKeyUse { key: KernelKey::AttnFlashAsym3,        archs: ALL },
-        AttnKeyUse { key: KernelKey::AttnFlashAsym3Fwht,    archs: ALL },
-        AttnKeyUse { key: KernelKey::AttnFlashAsym2,        archs: ALL },
-        AttnKeyUse { key: KernelKey::AttnFlashAsym2Fwht,    archs: ALL },
-        // GQA-fused — HasWmma-gated, only WMMA-capable archs (NOT just wave32)
-        AttnKeyUse { key: KernelKey::AttnGqaFused,          archs: WMMA_ARCHS },
+        // KV write — single-token, Always-gated
+        AttnKeyUse { key: KernelKey::KvWriteF32,            archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::KvWriteQ8_0,           archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::KvWriteAsym4,          archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::KvWriteAsym4Fwht,      archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::KvWriteAsym3,          archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::KvWriteAsym3Fwht,      archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::KvWriteAsym2,          archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::KvWriteAsym2Fwht,      archs: ALL, shape: None },
+        // KV write — batched, Always-gated, BatchGt(1)
+        AttnKeyUse { key: KernelKey::KvWriteAsym4Batched,          archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        AttnKeyUse { key: KernelKey::KvWriteAsym4FwhtBatched,     archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        AttnKeyUse { key: KernelKey::KvWriteAsym3Batched,          archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        AttnKeyUse { key: KernelKey::KvWriteAsym3FwhtBatched,     archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        AttnKeyUse { key: KernelKey::KvWriteAsym2Batched,          archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        AttnKeyUse { key: KernelKey::KvWriteAsym2FwhtBatched,     archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        AttnKeyUse { key: KernelKey::KvWriteQ8_0Batched,           archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        // Attention — single-token, Always-gated
+        AttnKeyUse { key: KernelKey::AttnF32,               archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::AttnFlashQ8_0,         archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::AttnQ8_0Kv,            archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym4,        archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym4Fwht,    archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym3,        archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym3Fwht,    archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym2,        archs: ALL, shape: None },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym2Fwht,    archs: ALL, shape: None },
+        // GQA-fused — HasWmma-gated
+        AttnKeyUse { key: KernelKey::AttnGqaFused,          archs: WMMA_ARCHS, shape: None },
+        // Attention — batched, Always-gated (scalar fallback), BatchGt(1)
+        AttnKeyUse { key: KernelKey::AttnFlashAsym4BatchedMasked,          archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym4FwhtBatchedMasked,     archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym3BatchedMasked,          archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym3FwhtBatchedMasked,     archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym2Batched,                archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        AttnKeyUse { key: KernelKey::AttnFlashAsym2FwhtBatched,           archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
+        AttnKeyUse { key: KernelKey::AttnQ8_0KvBatchedMasked,             archs: ALL, shape: Some(ShapeInfo { batch_size: 16, head_dim: 128, m: 0, is_tree: false }) },
     ];
 
     let family = AttentionFamily::new();
@@ -357,7 +376,7 @@ fn attention_keys_resolve_on_fleet_archs() {
     for u in attn_fleet {
         for &arch in u.archs {
             let ctx = DispatchCtx::for_test(arch);
-            if family.resolve(u.key, &ctx, None).is_err() {
+            if family.resolve(u.key, &ctx, u.shape.as_ref()).is_err() {
                 failures.push(format!(
                     "  {:?} dead-gated on {} — resolve() returned Err",
                     u.key, arch

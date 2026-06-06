@@ -102,10 +102,13 @@ impl AttentionFamily {
         let shape = ShapeInfo {
             batch_size: plan.batch_size,
             head_dim: io.head_dim,
-            m: 0,
+            // seq_len: pos+1 for single-token, max_ctx_len for batched.
+            // No predicate currently gates on m, but populate correctly
+            // so future MLt/Ge predicates don't silently evaluate vs 0.
+            m: if plan.batch_size > 1 { io.max_ctx_len } else { io.pos + 1 },
             is_tree: io.tree_bias.is_some(),
         };
-        let write_var = self.resolve(plan.write_key, ctx, Some(&shape))?;
+        self.resolve(plan.write_key, ctx, Some(&shape))?;  // arch-gate check
         dispatch_kv_write(gpu, plan.write_key, plan, io)?;
         let attend_var = self.resolve(plan.attend_key, ctx, Some(&shape))?;
         dispatch_attend(gpu, plan.attend_key, attend_var.tile, plan, io)
@@ -571,6 +574,7 @@ mod tests {
         let dispatched_set: std::collections::HashSet<KernelKey> =
             DISPATCHED_KV_WRITE_KEYS.iter().copied().collect();
 
+        // Forward: every dispatched key must resolve (no stale entries).
         for &key in DISPATCHED_KV_WRITE_KEYS {
             let batch = if is_batched_kv_key(key) { 16 } else { 1 };
             let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0, is_tree: false };
@@ -581,18 +585,36 @@ mod tests {
             );
         }
 
-        // Ensure no registered KV write key is missing from the dispatched set.
-        for &key in DISPATCHED_KV_WRITE_KEYS {
+        // Reverse: every registered KV write key must be in the dispatched set.
+        for key in family.registry().all_keys() {
+            if !is_kv_write_key(key) { continue; }
             let batch = if is_batched_kv_key(key) { 16 } else { 1 };
             let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0, is_tree: false };
             if family.resolve(key, &ctx, Some(&shape)).is_ok() {
                 assert!(
                     dispatched_set.contains(&key),
-                    "registered key {:?} is not in DISPATCHED_KV_WRITE_KEYS — missing arm",
+                    "registered KV write key {:?} is not in DISPATCHED_KV_WRITE_KEYS — missing dispatch arm",
                     key
                 );
             }
         }
+    }
+
+    /// Helper: is this *any* KV write key (single-token or batched)?
+    fn is_kv_write_key(key: KernelKey) -> bool {
+        use KernelKey::*;
+        matches!(
+            key,
+            KvWriteF32
+            | KvWriteQ8_0
+            | KvWriteAsym4 | KvWriteAsym4Fwht
+            | KvWriteAsym3 | KvWriteAsym3Fwht
+            | KvWriteAsym2 | KvWriteAsym2Fwht
+            | KvWriteAsym4Batched | KvWriteAsym4FwhtBatched
+            | KvWriteAsym3Batched | KvWriteAsym3FwhtBatched
+            | KvWriteAsym2Batched | KvWriteAsym2FwhtBatched
+            | KvWriteQ8_0Batched
+        )
     }
 
     /// Helper: is this key a batched KV write key?
@@ -619,6 +641,7 @@ mod tests {
         let dispatched_set: std::collections::HashSet<KernelKey> =
             DISPATCHED_ATTEND_KEYS.iter().copied().collect();
 
+        // Forward: every dispatched key must resolve (no stale entries).
         for &key in DISPATCHED_ATTEND_KEYS {
             // Single-token keys resolve at batch_size=1, batched at batch_size>1
             let batch = if is_batched_key(key) { 16 } else { 1 };
@@ -630,13 +653,15 @@ mod tests {
             );
         }
 
-        for &key in DISPATCHED_ATTEND_KEYS {
+        // Reverse: every registered attend key must be in the dispatched set.
+        for key in family.registry().all_keys() {
+            if is_kv_write_key(key) { continue; }  // skip KV write keys
             let batch = if is_batched_key(key) { 16 } else { 1 };
             let shape = ShapeInfo { batch_size: batch, head_dim: 128, m: 0, is_tree: false };
             if family.resolve(key, &ctx, Some(&shape)).is_ok() {
                 assert!(
                     dispatched_set.contains(&key),
-                    "registered key {:?} is not in DISPATCHED_ATTEND_KEYS — missing arm",
+                    "registered attend key {:?} is not in DISPATCHED_ATTEND_KEYS — missing dispatch arm",
                     key
                 );
             }
@@ -656,5 +681,51 @@ mod tests {
             | AttnFlashAsym2FwhtBatched
             | AttnQ8_0KvBatchedMasked
         )
+    }
+
+    /// Tile-variant completeness: every registered `(key, tile)` pair must
+    /// have a dispatch arm in `dispatch_attend`. Catches the case where a
+    /// tile variant is registered in the table but `dispatch_attend`'s
+    /// nested `match tile { ... }` has no arm for it.
+    #[test]
+    fn all_registered_tile_variants_have_dispatch_arms() {
+        use std::collections::HashSet;
+        let family = AttentionFamily::new();
+
+        // Collect all tile variants that actually fire (non-None, non-dead).
+        let mut tile_keys: HashSet<TileImpl> = HashSet::new();
+        for key in family.registry().all_keys() {
+            if is_kv_write_key(key) { continue; }
+            for variant in family.registry().variants_for(key) {
+                if variant.tile != TileImpl::None {
+                    tile_keys.insert(variant.tile);
+                }
+            }
+        }
+
+        // Tile variants with dispatch arms. This array must be updated when
+        // new tile variants are registered.
+        let dispatched_tiles: HashSet<TileImpl> = [
+            TileImpl::Asym4WmmaTile,
+            TileImpl::Asym4WmmaTileGfx12,
+        ].into_iter().collect();
+
+        // Forward: every dispatched tile must be registered.
+        for tile in &dispatched_tiles {
+            assert!(
+                tile_keys.contains(tile),
+                "dispatched tile {:?} is not registered in any attention variant",
+                tile
+            );
+        }
+
+        // Reverse: every registered non-None tile must have an arm.
+        for tile in &tile_keys {
+            assert!(
+                dispatched_tiles.contains(tile),
+                "registered tile {:?} has no dispatch arm in dispatch_attend — add an arm or remove the registration",
+                tile
+            );
+        }
     }
 }

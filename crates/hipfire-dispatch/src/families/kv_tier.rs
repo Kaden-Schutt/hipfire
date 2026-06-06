@@ -101,15 +101,7 @@ impl KvTierPlan {
 
         let (write_single, attend_single, uses_givens) = if is_boundary {
             // Boundary layers pin to Q8 regardless of global tier.
-            let use_flash = capture_mode
-                || flash_mode == 2
-                || (flash_mode == 1 && pos + 1 >= 2048)
-                || pos + 1 > 15000;
-            let attend = if use_flash {
-                KernelKey::AttnFlashQ8_0
-            } else {
-                KernelKey::AttnQ8_0Kv
-            };
+            let attend = q8_attend_key(pos, flash_mode, capture_mode);
             (KernelKey::KvWriteQ8_0, attend, false)
         } else if quant_asym4 {
             if quant_fwht {
@@ -130,15 +122,7 @@ impl KvTierPlan {
                 (KernelKey::KvWriteAsym2, KernelKey::AttnFlashAsym2, true)
             }
         } else if quant_q8 {
-            let use_flash = capture_mode
-                || flash_mode == 2
-                || (flash_mode == 1 && pos + 1 >= 2048)
-                || pos + 1 > 15000;
-            let attend = if use_flash {
-                KernelKey::AttnFlashQ8_0
-            } else {
-                KernelKey::AttnQ8_0Kv
-            };
+            let attend = q8_attend_key(pos, flash_mode, capture_mode);
             (KernelKey::KvWriteQ8_0, attend, false)
         } else {
             // F32 fallback
@@ -147,7 +131,7 @@ impl KvTierPlan {
 
         // Select batched keys when batch_size > 1.
         let (write_key, attend_key) = if batch_size > 1 {
-            let (w, a) = batched_keys(write_single, attend_single, is_tree)?;
+            let (w, a) = batched_keys(write_single, attend_single, is_tree, batch_size)?;;
             (w, a)
         } else {
             (write_single, attend_single)
@@ -171,12 +155,28 @@ impl KvTierPlan {
     }
 }
 
+/// Q8 decode attend-key heuristic: select between flash and non-flash Q8
+/// attention based on context length and capture mode. Shared between the
+/// `is_boundary` and `quant_q8` branches of `derive`.
+fn q8_attend_key(pos: usize, flash_mode: usize, capture_mode: bool) -> KernelKey {
+    let use_flash = capture_mode
+        || flash_mode == 2
+        || (flash_mode == 1 && pos + 1 >= 2048)
+        || pos + 1 > 15000;
+    if use_flash {
+        KernelKey::AttnFlashQ8_0
+    } else {
+        KernelKey::AttnQ8_0Kv
+    }
+}
+
 /// Map single-token keys to their batched counterparts.
 /// Returns `Err(UnsupportedTreeTier)` for 2-bit + tree-verify (no _masked kernel).
 fn batched_keys(
     write_single: KernelKey,
     attend_single: KernelKey,
     is_tree: bool,
+    batch_size: usize,
 ) -> Result<(KernelKey, KernelKey), UnsupportedTreeTier> {
     use KernelKey::*;
     match (write_single, attend_single) {
@@ -200,7 +200,7 @@ fn batched_keys(
                 Err(UnsupportedTreeTier {
                     write_key: write_single,
                     attend_key: attend_single,
-                    batch_size: 0,
+                    batch_size,
                 })
             } else {
                 Ok((KvWriteAsym2Batched, AttnFlashAsym2Batched))
@@ -211,7 +211,7 @@ fn batched_keys(
                 Err(UnsupportedTreeTier {
                     write_key: write_single,
                     attend_key: attend_single,
-                    batch_size: 0,
+                    batch_size,
                 })
             } else {
                 Ok((KvWriteAsym2FwhtBatched, AttnFlashAsym2FwhtBatched))
@@ -221,10 +221,11 @@ fn batched_keys(
         (KvWriteQ8_0, AttnFlashQ8_0) | (KvWriteQ8_0, AttnQ8_0Kv) => {
             Ok((KvWriteQ8_0Batched, AttnQ8_0KvBatchedMasked))
         }
-        // F32 → no batched key yet (TODO 3.3)
+        // F32 → no batched keys exist. Returning single-token keys with
+        // batch_size > 1 will cause MissingImpl at resolve (BatchEq(1) gate).
+        // Intentionally fall through to the default arm rather than silently
+        // returning single-token keys that can never resolve batched.
         (KvWriteF32, AttnF32) => {
-            // F32 prefill uses per-token fallback, not batched path.
-            // Return the single-token keys — the caller will loop.
             Ok((KvWriteF32, AttnF32))
         }
         _ => Ok((write_single, attend_single)),

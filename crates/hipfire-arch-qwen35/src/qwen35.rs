@@ -11113,7 +11113,8 @@ fn run_fa_layer_body(
         let phys = pos as i32;
         gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
     }
-    kv_cache_attention_dispatch(gpu, kv_cache, s, config, layer_idx, pos)?;
+    let ctx = DispatchCtx::new(gpu);
+    kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
 
     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
     {
@@ -11552,7 +11553,8 @@ fn forward_scratch_layers(
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                kv_cache_attention_dispatch(gpu, kv_cache, s, config, layer_idx, pos)?;
+                let ctx = DispatchCtx::new(gpu);
+    kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
 
                 gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                 {
@@ -11761,7 +11763,8 @@ fn forward_scratch_layers(
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
                 }
 
-                kv_cache_attention_dispatch(gpu, kv_cache, s, config, layer_idx, pos)?;
+                let ctx = DispatchCtx::new(gpu);
+    kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, layer_idx, pos)?;
 
                 gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                 {
@@ -12043,6 +12046,7 @@ fn triattn_tap(
 
 /// KV cache write + attention dispatch. Inline from original.
 fn kv_cache_attention_dispatch(
+    ctx: &DispatchCtx,
     gpu: &mut Gpu,
     kv_cache: &mut llama::KvCache,
     s: &Qwen35Scratch,
@@ -12062,7 +12066,7 @@ fn kv_cache_attention_dispatch(
         capture_mode: gpu.graphs.capture_mode,
         batch_size: 1,
         is_tree: false,
-        is_boundary: false, // boundary producer not yet populated
+        is_boundary: false, // TODO: boundary producer not yet populated
     }).map_err(|e| HipError::new(0, &e.to_string()))?;
     let io = AttnParams {
         q: &s.fa_q,
@@ -12089,8 +12093,7 @@ fn kv_cache_attention_dispatch(
         block_cols: 0,
         output: &s.fa_attn_out,
     };
-    let ctx = DispatchCtx::new(gpu);
-    execute_steps(gpu, &ctx, &[
+    execute_steps(gpu, ctx, &[
         Step::Attend { plan, io },
     ]).map_err(|e| HipError::new(0, &e.to_string()))
 }

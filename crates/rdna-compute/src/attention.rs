@@ -1583,7 +1583,7 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            V_MODE_Q8,
+            V_MODE_Q8, /*force_wmma_grid=*/ false,
         )
     }
 
@@ -2596,6 +2596,12 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
         v_mode_bits: i32,
+        // When true, use the WMMA grid shape `[n_heads, ceil(chunk/BLOCK_M),
+        // max_tiles]` and omit the `v_mode_bits` kernarg, even if the inline
+        // `wmma_ok` ladder evaluates to false. Set by the WMMA dispatch
+        // wrappers that already know their kernel is WMMA. Scalar callers
+        // pass `false` (original behavior).
+        force_wmma_grid: bool,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         const WMMA_BLOCK_M: usize = 16;
@@ -2633,6 +2639,10 @@ impl Gpu {
             && batch_size >= wmma_fa_min_batch()
             && batch_size % WMMA_BLOCK_M == 0
             && sub_batch % WMMA_BLOCK_M == 0;
+        // `use_wmma_grid` controls grid shape, LDS, and kernarg layout.
+        // True when either the inline env-gated ladder fires (scalar→WMMA
+        // upgrade) OR the dispatch path explicitly routes to a WMMA variant.
+        let use_wmma_grid = wmma_ok || force_wmma_grid;
         let (eff_tile_key, eff_tile_src, eff_tile_func): (
             &'static str,
             &'static str,
@@ -2707,10 +2717,10 @@ impl Gpu {
                     &bs as *const _ as *mut c_void,
                     &bc as *const _ as *mut c_void,
                 ];
-                if !wmma_ok {
+                if !use_wmma_grid {
                     params.push(&vm as *const _ as *mut c_void);
                 }
-                let (grid, lds_bytes): ([u32; 3], u32) = if wmma_ok {
+                let (grid, lds_bytes): ([u32; 3], u32) = if use_wmma_grid {
                     let m_tiles = (chunk + WMMA_BLOCK_M - 1) / WMMA_BLOCK_M;
                     ([n_heads as u32, m_tiles as u32, max_tiles as u32], 0)
                 } else {
@@ -2745,7 +2755,7 @@ impl Gpu {
                         b.push_i32(bo);
                         b.push_i32(bs);
                         b.push_i32(bc);
-                        if !wmma_ok {
+                        if !use_wmma_grid {
                             b.push_i32(vm);
                         }
                         b
@@ -3081,7 +3091,7 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            V_MODE_Q8,
+            V_MODE_Q8, /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3117,7 +3127,7 @@ impl Gpu {
             "attention_flash_asym4_wmma_tile_batched",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols, V_MODE_Q8,
+            tree_bias, block_start, block_cols, V_MODE_Q8, /*force_wmma_grid=*/ true,
         )
     }
 
@@ -3150,7 +3160,7 @@ impl Gpu {
             "attention_flash_asym4_wmma_tile_batched_gfx12",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols, V_MODE_Q8,
+            tree_bias, block_start, block_cols, V_MODE_Q8, /*force_wmma_grid=*/ true,
         )
     }
 
@@ -3244,7 +3254,7 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            v_mode_bits,
+            v_mode_bits, /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3289,7 +3299,7 @@ impl Gpu {
             None,
             0,
             0,
-            V_MODE_Q8,
+            V_MODE_Q8, /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3335,7 +3345,7 @@ impl Gpu {
             None,
             0,
             0,
-            v_mode_bits,
+            v_mode_bits, /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3526,7 +3536,7 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            V_MODE_Q8,
+            V_MODE_Q8, /*force_wmma_grid=*/ false,
         )
     }
 
@@ -3617,7 +3627,7 @@ impl Gpu {
             tree_bias,
             block_start,
             block_cols,
-            v_mode_bits,
+            v_mode_bits, /*force_wmma_grid=*/ false,
         )
     }
 
