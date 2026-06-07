@@ -248,3 +248,164 @@ in daemon after scratch allocation. This fills v_norm_ones_full with 1.0.
 ### Next
 - Remaining quality gap likely from flash attention numerics or Q8 quantization
 - Need HF oracle comparison through all 48 layers
+
+---
+
+## 2026-06-07: Per-layer oracle investigation
+
+### Methodology
+Compared per-layer hidden states (sum of all 3840 elements) between HF bf16
+reference and hipfire HFQ4 model for the "Hello" prompt (BOS + token 9259).
+
+### Results
+
+| Layer | HF sum   | Hipfire sum | Delta |
+|-------|----------|-------------|-------|
+| embed | 21.3     | 21.0        | ~match |
+| L0    | -22.1    | -25.1       | close but diverging |
+| L1    | 60.6     | 36.6        | 2x off |
+| L2    | -77.5    | -25.4       | 3x off |
+| L3    | -73.6    | -6.9        | 10x off |
+| L4    | -18.3    | 79.1        | sign flip! |
+| ...   |          |             |       |
+| L47   | -7.9     | -8.6        | different |
+| final | -82.7    | -508.7      | 6x off |
+
+### Key finding
+Embedding + Q/K/V projections match HF. L0 output is close but not identical.
+Divergence compounds rapidly — by L4 the signs flip. After 48 layers the
+hidden state is completely wrong.
+
+### Attempted fixes (no improvement)
+- Q8 weight quantization: hidden sum=-508 (same magnitude of error)
+- Q8 KV cache for sliding layers: hidden sum=-508 (same)
+- MQ4 weight format: WORSE — produces `<audio|>` attractor tokens
+
+### Root cause narrowed to
+The L0 attention output diverges from HF. Since Q/K/V projections match,
+the divergence is within the attention computation itself:
+- RoPE application
+- KV cache write + read (asym3 quantization)
+- Flash attention kernel numerics
+- o_proj projection
+
+### Next step
+Compare detailed L0 intermediates (post-RoPE, post-attention, post-o_proj)
+between HF and hipfire to find the exact step where divergence starts.
+
+---
+
+## 2026-06-07 (session 2): Critical HF oracle fix + fp32 KV investigation
+
+### Bug found: HF reference was DOUBLE-SCALED
+
+The per-layer HF oracle comparison from session 1 was **completely wrong** due to
+a double-scaling bug in the Python script:
+
+```python
+# WRONG (session 1):
+emb = lm.embed_tokens(input_ids).float() * lm.embed_tokens.embed_scale.float()
+# lm.embed_tokens() ALREADY applies embed_scale internally!
+# This multiplied by scale TWICE: raw * 62 * 62 = raw * 3844
+
+# CORRECT:
+emb = lm.embed_tokens(input_ids).float()  # Already scaled!
+```
+
+This made ALL previous comparisons invalid. The HF "sum=1318" for the Hello
+embedding was actually 1318 = 0.34 * 62 * 62, when the correct scaled value is
+21.3 = 0.34 * 62.
+
+### Corrected per-layer comparison (HFQ4 model, asym3 KV)
+
+With the corrected reference, the per-layer sums are much closer than previously
+believed:
+
+| Step | HF sum | Hipfire sum | Status |
+|------|--------|-------------|--------|
+| embed (scaled) | +21.3 | +21.0 | ✓ match |
+| input_norm | +1040.8 | +1036.4 | ✓ |
+| q_proj | +2137.3 | +2125.4 | ✓ |
+| k_proj | -649.1 | -657.7 | ✓ |
+| v_proj | -1275.7 | -1259.5 | ✓ |
+| q_norm | +51.4 | +51.1 | ✓ |
+| k_norm | +1.3 | +1.2 | ✓ |
+| v_norm | -48.5 | -47.9 | ✓ |
+| scale_q | +822.1 | +818.2 | ✓ |
+| rope_q | +614.4 | +611.2 | ✓ |
+| rope_k | +1.6 | +1.5 | ✓ |
+| **attention** | **-30.8** | **-55.9** | **✗ 1.8x off** |
+| o_proj | -3.0 | -30.7 | ✗ |
+| attn_residual | +200.8 | +175.4 | off |
+| pre_ffn_norm | -46.5 | -55.1 | off |
+| L0 output | -26.8 | -25.1 | close |
+
+Everything matches perfectly through RoPE. The **first divergence is at the
+attention output**. Q/K/V projections + norms + RoPE are all correct.
+
+### Attention output comparison across KV formats
+
+| KV format | L0 attn sum | Delta from HF (-30.8) |
+|-----------|-------------|----------------------|
+| HF exact (bf16) | -30.8 | baseline |
+| fp32 KV | -37.9 | 23% off |
+| Q8 KV | -39.1 | 27% off |
+| asym3 KV | -55.9 | 81% off |
+
+Even fp32 KV (zero quantization error) diverges 23% from HF. This means the
+divergence is NOT solely from KV quantization — there's a difference in the
+attention computation itself.
+
+### Hypotheses
+
+#### H1: Flash attention kernel numerical difference
+The `attention_flash` kernel uses a two-phase tiled softmax (partial + reduce).
+For 2 tokens, there's 1 chunk so the online softmax should be exact. But the
+kernel may use a different accumulation order or precision than PyTorch's exact
+matmul + softmax.
+
+**Test**: Dump per-head attention weights and scores from both HF and hipfire
+fp32 path. If the softmax weights differ, it's a kernel numerics issue.
+
+#### H2: GQA expansion mismatch
+Hipfire uses `n_heads=16, n_kv=8` with GQA ratio=2. The flash kernel handles
+GQA internally. If the head-grouping is wrong (e.g., heads 0,1 share KV0
+instead of heads 0,8 sharing KV0), the attention output would be completely
+wrong for some heads but correct for others.
+
+**Test**: Dump per-head attention output sums and compare with HF. If only
+half the heads diverge, it's a GQA grouping issue.
+
+#### H3: `attention_flash` reads K/V from wrong offset
+The fp32 KV cache is indexed by position. If the kernel reads K/V starting
+from the wrong offset (e.g., it assumes a different memory layout), the
+attention would compute with wrong K/V values.
+
+**Test**: Dump K/V from the fp32 cache after writing and compare with the
+original Q/K/V projections.
+
+#### H4: Scale factor mismatch in flash kernel
+`attention_flash` uses `scale = 1/sqrt(head_dim)`. We pre-scale Q by
+`sqrt(head_dim)`. Net: `sqrt(256) * 1/sqrt(256) = 1.0`. But if the kernel
+applies scale differently (e.g., to K instead of Q), the effective scale
+would be wrong.
+
+**Test**: Dump raw scores (Q·K^T) before softmax from the kernel. If they
+don't match HF's scores, the scale application is wrong.
+
+### Most likely root cause: H2 (GQA head grouping)
+
+The fp32 KV divergence (23% with zero quantization) strongly suggests a
+structural issue in the attention computation, not quantization noise. The
+GQA head grouping is the most likely candidate because:
+- Q/K/V projections match perfectly (individual GEMVs are correct)
+- RoPE matches (applied per-head, correct)
+- The divergence appears ONLY after the flash attention kernel
+- GQA grouping is a subtle indexing issue that would produce "almost right"
+  output (some heads correct, others wrong)
+
+### Next steps
+1. Dump per-head attention output from fp32 path and compare with HF
+2. Check GQA head-grouping convention in `attention_flash` kernel
+3. If H2 confirmed: fix head grouping, re-run coherence test
+4. If H2 ruled out: dump raw scores from flash kernel to test H4

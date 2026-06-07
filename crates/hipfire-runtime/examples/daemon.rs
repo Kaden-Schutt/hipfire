@@ -3968,15 +3968,15 @@ fn load_model(
         gemma4::init_scratch_constants(gpu, &scratch, config.full_head_dim)
             .map_err(|e| format!("gemma4 init_scratch_constants: {e:?}"))?;
 
-        // Dual KV: Q8 for sliding (higher quality), asym3 for full (hd=512 req)
-        let kv_sliding = llama::KvCache::new_gpu_q8(
+        // Dual KV: fp32 for sliding (debug), asym3 for full (hd=512)
+        let kv_sliding = llama::KvCache::new_gpu(
             gpu, config.n_layers, config.sliding_n_kv_heads,
             config.sliding_head_dim, config.sliding_window,
         ).map_err(|e| format!("gemma4 sliding KV alloc: {e:?}"))?;
         let kv_full = llama::KvCache::new_gpu_asym3(
             gpu, config.n_layers, config.full_n_kv_heads,
             config.full_head_dim, max_seq,
-        ).map_err(|e| format!("gemma4 full KV alloc: {e:?}"))?;
+        ).map_err(|e| format!("gemma4 full KV alloc: {e:?}"))?;;
 
         let eos_tok = config.eos_token;
         let chat_template = resolve_chat_template(&hfq, path);

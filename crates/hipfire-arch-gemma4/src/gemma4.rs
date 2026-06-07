@@ -1573,16 +1573,6 @@ pub fn forward_scratch(
     }
     gpu.scale_f32(&scratch.x, config.embed_scale)?;
 
-    // Diagnostic: dump first embedding for quality investigation
-    if std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") {
-        let data = gpu.download_f32(&scratch.x).unwrap_or_default();
-        let sum: f64 = data.iter().map(|&v| v as f64).sum();
-        let min = data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-        let max = data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        eprintln!("[gemma4 diag] pos={pos} token={token} embed first8={:?} sum={sum:.4e} min={min:.4} max={max:.4}",
-            &data[..8.min(data.len())]);
-    }
-
     // hipGraph capture/replay policy.
     //   - DEFAULT-OFF for Gemma 4 (until cross-arch / long-context validation).
     //   - Fixed 2026-05-19 (evening): the earlier diagnosis ("kv_len = pos + 1
@@ -1934,17 +1924,21 @@ fn sliding_layer_decode_impl(
             config.sliding_window as u32,
             0)?;
     } else {
-        // Plain FP32 KV path (kvf16 / kvfp32).
+        // Plain FP32 KV path (kvf16 / kvfp32) — NO sliding window.
+        // Only for debugging; incorrect for seq > window_size.
         let kv_dim = n_kv * head_dim;
         gpu.kv_cache_write(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
         gpu.kv_cache_write(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
-        // No sliding-window support in the plain attention_f32 kernel; this
-        // path is used only for debugging (mostly Qwen3.5 kvf16 mode).
-        return Err(hip_bridge::HipError::new(
-            0,
-            "gemma4 requires a quantized KV cache (asym2/asym3/asym4/q8); kvf16 lacks sliding-window support",
-        ));
+        gpu.attention_flash(
+            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.attn_out, &scratch.flash_partials,
+            pos + 1,
+            n_heads, n_kv, head_dim, kv_cache.max_seq,
+        )?;
     }
+
+    // Dump attention output regardless of KV cache branch.
+    if _dump_on { dbg_dump(gpu, "[v1] L0 after attention", &scratch.attn_out, n_heads * head_dim); }
 
     // o_proj → tmp (reuse tmp, overwriting input_layernorm output).
     weight_gemv(gpu, &lw.o_proj, &scratch.attn_out, &scratch.tmp)?;
