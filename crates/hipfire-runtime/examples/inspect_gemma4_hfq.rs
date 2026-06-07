@@ -14,13 +14,15 @@ fn main() {
                 || hfq.find_tensor_info("lm_head.weight").is_some()
                 || hfq.find_tensor_info("model.lm_head.weight").is_some();
             println!("Has explicit lm_head in HFQ: {}", has_lm_head);
-            if let Some((_info, data)) = hfq.tensor_data("model.language_model.norm.weight") {
+            if let Some((info, data)) = hfq.tensor_data("model.language_model.norm.weight") {
+                println!("model.language_model.norm.weight quant_type: {}", info.quant_type);
                 let f32_data: Vec<f32> = data.chunks_exact(2)
                     .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect();
                 println!("model.language_model.norm.weight (first 10): {:?}", &f32_data[..10.min(f32_data.len())]);
             }
-            if let Some((_info, data)) = hfq.tensor_data("model.language_model.layers.0.input_layernorm.weight") {
+            if let Some((info, data)) = hfq.tensor_data("model.language_model.layers.0.input_layernorm.weight") {
+                println!("layer 0 input_layernorm.weight quant_type: {}", info.quant_type);
                 let f32_data: Vec<f32> = data.chunks_exact(2)
                     .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect();

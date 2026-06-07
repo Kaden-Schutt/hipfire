@@ -1673,6 +1673,15 @@ fn forward_scratch_inner(
     let mut sliding_kv_idx = 0usize;
     let mut full_kv_idx = 0usize;
     for (layer_idx, layer_type) in config.layer_types.iter().copied().enumerate() {
+        // Diagnostic: dump residual before layer
+        if std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") && layer_idx < 2 {
+            let data = gpu.download_f32(&scratch.x).unwrap_or_default();
+            let sum: f64 = data.iter().map(|&v| v as f64).sum();
+            let min = data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+            let max = data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            eprintln!("[gemma4 diag] pos={pos} L{layer_idx} before: first4={:?} sum={sum:.4e} min={min:.4} max={max:.4}",
+                &data[..4.min(data.len())]);
+        }
         match (layer_type, &weights.layers[layer_idx]) {
             (LayerType::Sliding, LayerWeights::Sliding(lw)) => {
                 sliding_layer_decode(gpu, config, lw, pos, kv_sliding, sliding_kv_idx, scratch)?;
@@ -1686,6 +1695,15 @@ fn forward_scratch_inner(
                 0,
                 &format!("Gemma 4 layer {} type/weights mismatch", layer_idx),
             )),
+        }
+        // Diagnostic: dump residual after layer
+        if std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") && layer_idx < 2 {
+            let data = gpu.download_f32(&scratch.x).unwrap_or_default();
+            let sum: f64 = data.iter().map(|&v| v as f64).sum();
+            let min = data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+            let max = data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            eprintln!("[gemma4 diag] pos={pos} L{layer_idx} after:  first4={:?} sum={sum:.4e} min={min:.4} max={max:.4}",
+                &data[..4.min(data.len())]);
         }
     }
 
