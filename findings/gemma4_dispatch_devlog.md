@@ -75,6 +75,46 @@ crates/hipfire-arch-llama/src/arch.rs             — 1 call site
 docs/plans/gemma4_dispatch.md                     — plan audit + corrections
 ```
 
-### Next: Phase 1a — scaffold hipfire-arch-gemma4 crate
-Blocked on: gemma4 branch kernel port, safetensors availability.
-Can start code-only portions (crate skeleton, kernel declarations, arch.rs).
+### Model artifact update (2026-06-07 ~12:44)
+- **12B-it dense**: ✓ Complete. Single `model.safetensors` (23.9 GB, BF16).
+  Config + tokenizer already confirmed.
+- **31B-it dense**: Still empty (incoming).
+- **26B-A4B-it MoE**: Incomplete (shard 2 only in /data/models/; re-download to /local/models/ pending).
+- **E4B/E2B**: Still empty (incoming).
+
+### Next: Phase 0c/1a
+- **Phase 0c**: Quantize 12B to HFQ/MQ4 via `hipfire-quantize`. Need `arch_id=12`
+  wired in quantizer first, or use the gemma4 branch's quantizer path.
+- **Phase 1a**: Port `hipfire-arch-gemma4` crate from `feat/gemma4-128k-ring-buffer`
+  branch. Start with crate skeleton + `arch.rs` (set `arch_id=12`).
+  Code-only — no model weights needed for `cargo check`.
+
+### Decision: 12B dense first
+12B is the simplest forward path (no MoE, single safetensors file, smallest
+filesystem footprint). Start quantization + arch crate in parallel:
+1. Port crate from gemma4 branch → `cargo check`
+2. Wire quantizer for arch_id=12 → quantize 12B
+3. Daemon wiring → coherence gate
+
+---
+
+## 2026-06-07 · Session 2 — Phase 1a scaffold
+
+### Accomplished
+- Created `crates/hipfire-arch-gemma4/` with full forward pass (2654-line gemma4.rs)
+- `arch_id=12` set (qwen2 occupies 7 on dispatch branch)
+- `Architecture` trait impl with `config_from_hfq`, `load_weights`, `new_state`
+- gemma4_vision.rs placeholder
+- Registered in workspace Cargo.toml
+- `crates/rdna-compute/src/gemma4_ext.rs` with stub GPU methods:
+  - _window attention variants, rope_partial_halved_f32, logit_softcap_f32 (Phase 1b)
+  - 8 MoE GEMV stubs + moe_bucket_build (Phase 4)
+
+### Adaptations
+- ar_forward_warmed_up → stubbed
+- cache_capacity args stripped from kv_cache_write_asym3_batched
+- _window method calls preserved as-is
+
+### Gate
+- cargo check --workspace: 0 errors
+- All dispatch tests still pass (139 + 71)

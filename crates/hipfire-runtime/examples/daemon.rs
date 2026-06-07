@@ -24,6 +24,8 @@
 use base64::Engine;
 use hip_bridge::HipResult;
 use hipfire_arch_deepseek4 as deepseek4;
+use hipfire_arch_gemma4::gemma4;
+use hipfire_arch_gemma4::Gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_dots_ocr::dots_ocr;
@@ -1157,6 +1159,21 @@ struct LoadedModel {
     /// its end-of-turn marker is the added token `[e~[`; falls back to common
     /// alternates, then 1.
     minimax_eos_tok: u32,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_scratch: None,
+            gemma4_kv_sliding: None,
+            gemma4_kv_full: None,
+            gemma4_eos_tok: 0,
+    // Gemma4 state (arch_id=12 — hipfire-arch-gemma4). Hybrid sliding+full
+    // attention: two separate KV caches (sliding + full), layer-type dispatch.
+    // None on every other arch path.
+    gemma4_config: Option<gemma4::Gemma4Config>,
+    gemma4_weights: Option<gemma4::Gemma4Weights>,
+    gemma4_scratch: Option<gemma4::Gemma4Scratch>,
+    gemma4_kv_sliding: Option<llama::KvCache>,
+    gemma4_kv_full: Option<llama::KvCache>,
+    gemma4_eos_tok: u32,
     /// MTP config — parsed from load-message params, read at generate time.
     /// Arch-agnostic: currently only DeepSeek V4 (arch_id=9) evaluates these,
     /// but the namespace is intentionally not deepseek4-specific.
@@ -1859,6 +1876,7 @@ fn main() {
                             9 => "deepseek4",
                             10 => "minimax_m2",
                             11 => "lfm2moe",
+                            12 => "gemma4",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
@@ -1933,7 +1951,7 @@ fn main() {
                         // exact failure that left the prompt cache dead when the
                         // installed CLI predated the allowlist. Source of truth
                         // lives here, next to the cache implementation.
-                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9);
+                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 12);
                         let _ = writeln!(
                             stdout,
                             r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{}}}"#,
@@ -2690,6 +2708,7 @@ fn main() {
                         9 => "deepseek4",
                         10 => "minimax_m2",
                         11 => "lfm2moe",
+                        12 => "gemma4",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");
@@ -3448,6 +3467,12 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_scratch: None,
+            gemma4_kv_sliding: None,
+            gemma4_kv_full: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3532,6 +3557,12 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_scratch: None,
+            gemma4_kv_sliding: None,
+            gemma4_kv_full: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3637,6 +3668,12 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_scratch: None,
+            gemma4_kv_sliding: None,
+            gemma4_kv_full: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3735,6 +3772,12 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_scratch: None,
+            gemma4_kv_sliding: None,
+            gemma4_kv_full: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3848,6 +3891,12 @@ fn load_model(
             minimax_weights: Some(weights),
             minimax_state: Some(state),
             minimax_eos_tok: eos_tok,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_scratch: None,
+            gemma4_kv_sliding: None,
+            gemma4_kv_full: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4307,6 +4356,12 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_scratch: None,
+            gemma4_kv_sliding: None,
+            gemma4_kv_full: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4381,6 +4436,12 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_scratch: None,
+            gemma4_kv_sliding: None,
+            gemma4_kv_full: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4543,6 +4604,12 @@ fn load_model_safetensors(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_scratch: None,
+            gemma4_kv_sliding: None,
+            gemma4_kv_full: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4685,6 +4752,12 @@ fn load_model_safetensors(
         minimax_weights: None,
         minimax_state: None,
         minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_scratch: None,
+            gemma4_kv_sliding: None,
+            gemma4_kv_full: None,
+            gemma4_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -4924,6 +4997,12 @@ fn load_model_pp(
         minimax_weights: None,
         minimax_state: None,
         minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_scratch: None,
+            gemma4_kv_sliding: None,
+            gemma4_kv_full: None,
+            gemma4_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
