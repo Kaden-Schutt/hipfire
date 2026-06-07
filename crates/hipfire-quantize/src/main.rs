@@ -4296,6 +4296,7 @@ fn run_gguf_pipeline(
         "llama" => 0,
         "qwen3" | "qwen2" => 1,
         "qwen3moe" => 6,
+        "gemma4" | "gemma" => 12,
         other => {
             eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
             0
@@ -5304,6 +5305,9 @@ fn main() {
         // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
         // per-expert) and are translated when the forward bring-up lands.
         "deepseek_v4" => 9,
+        // Gemma 4 (dense + MoE). arch_id=12 routes to hipfire-arch-gemma4.
+        // 12B-unified uses model_type="gemma4_unified"; 26B-A4B uses "gemma4".
+        "gemma4" | "gemma4_unified" | "gemma4_text" | "gemma4_unified_text" => 12,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -5322,6 +5326,7 @@ fn main() {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
     let is_moe = arch_id == 6;
+    let is_gemma4 = arch_id == 12;
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
