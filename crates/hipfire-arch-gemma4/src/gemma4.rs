@@ -1700,6 +1700,17 @@ fn forward_scratch_inner(
         gpu.logit_softcap_f32(&scratch.logits, config.vocab_size, config.final_logit_softcapping)?;
     }
 
+    // Diagnostic: dump logits
+    if std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") {
+        let data = gpu.download_f32(&scratch.logits).unwrap_or_default();
+        let top5: Vec<(usize, f32)> = {
+            let mut indexed: Vec<(usize, f32)> = data.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            indexed.into_iter().take(5).collect()
+        };
+        eprintln!("[gemma4 diag] pos={pos} logits top5: {:?}", top5);
+    }
+
     Ok(())
 }
 
