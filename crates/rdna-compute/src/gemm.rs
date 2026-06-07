@@ -12085,16 +12085,28 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
+        // gfx12 (RDNA4) uses a separate single-wave 16-row-tile MMQ port; the
+        // RDNA3 LDS-tile source #if-excludes gfx12 (empty stub -> garbage).
+        let is_gfx12 = self.arch_caps.is_rdna4();
+        let kernel_name = if is_gfx12 {
+            // gfx12 port: full_add when the tile is exactly filled (M and N
+            // multiples of 16), else the bounds-clamped residual kernel.
+            if m % 16 == 0 && batch_size % 16 == 0 {
+                "gemm_hfq4g256_residual_mmq_full_add"
+            } else {
+                "gemm_hfq4g256_residual_mmq"
+            }
+        } else if m % 128 == 0 && batch_size % 128 == 0 {
             "gemm_hfq4g256_residual_mmq_full_add"
         } else {
             "gemm_hfq4g256_residual_mmq"
         };
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual_mmq",
-            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
-            kernel_name,
-        )?;
+        let src = if is_gfx12 {
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC
+        } else {
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC
+        };
+        self.ensure_kernel("gemm_hfq4g256_residual_mmq", src, kernel_name)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
@@ -12113,14 +12125,27 @@ impl Gpu {
             &mut add_val as *mut _ as *mut c_void,
         ];
 
-        const MMQ_X: usize = 128;
-        const MMQ_Y: usize = 128;
-        const MMQ_TILE_Y_K: usize = 36;
-        const MMQ_TILE_X_K: usize = 76;
-        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
-        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
-        let shared_mem =
-            ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+        // gfx12: single-wave 16-row × 16-col tile, block [32,1,1], LDS 0.
+        // RDNA3: 128-row × 128-col LDS-staged tile, block [32,8,1].
+        let (grid, block, shared_mem) = if is_gfx12 {
+            let row_tiles = (m + 15) / 16;
+            let col_tiles = (batch_size + 15) / 16;
+            ([row_tiles as u32, col_tiles as u32, 1], [32u32, 1, 1], 0u32)
+        } else {
+            const MMQ_X: usize = 128;
+            const MMQ_Y: usize = 128;
+            const MMQ_TILE_Y_K: usize = 36;
+            const MMQ_TILE_X_K: usize = 76;
+            let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+            let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+            let shared_mem =
+                ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+            (
+                [row_tiles as u32, batch_tiles as u32, 1],
+                [32u32, 8, 1],
+                shared_mem,
+            )
+        };
 
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k + batch_size * m * 4 * 2;
@@ -12128,8 +12153,8 @@ impl Gpu {
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_mmq", bytes);
         let result = self.launch_maybe_blob(
             kernel_name,
-            [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 8, 1],
+            grid,
+            block,
             shared_mem,
             &mut params,
             || {
@@ -12786,16 +12811,24 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
+        let is_gfx12 = self.arch_caps.is_rdna4();
+        let kernel_name = if is_gfx12 {
+            if m % 16 == 0 && batch_size % 16 == 0 {
+                "gemm_hfq4g256_residual_mmq_full_set"
+            } else {
+                "gemm_hfq4g256_residual_mmq"
+            }
+        } else if m % 128 == 0 && batch_size % 128 == 0 {
             "gemm_hfq4g256_residual_mmq_full_set"
         } else {
             "gemm_hfq4g256_residual_mmq"
         };
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual_mmq",
-            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
-            kernel_name,
-        )?;
+        let src = if is_gfx12 {
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC
+        } else {
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC
+        };
+        self.ensure_kernel("gemm_hfq4g256_residual_mmq", src, kernel_name)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
@@ -12803,6 +12836,7 @@ impl Gpu {
         let mut m_val = m as i32;
         let mut k_val = k as i32;
         let mut n_val = batch_size as i32;
+        // For gfx12 the non-full residual kernel also reads `add`; set=0.
         let mut add_val = 0i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut a_ptr as *mut _ as *mut c_void,
@@ -12814,21 +12848,32 @@ impl Gpu {
             &mut add_val as *mut _ as *mut c_void,
         ];
 
-        const MMQ_X: usize = 128;
-        const MMQ_Y: usize = 128;
-        const MMQ_TILE_Y_K: usize = 36;
-        const MMQ_TILE_X_K: usize = 76;
-        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
-        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
-        let shared_mem =
-            ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+        let (grid, block, shared_mem) = if is_gfx12 {
+            let row_tiles = (m + 15) / 16;
+            let col_tiles = (batch_size + 15) / 16;
+            ([row_tiles as u32, col_tiles as u32, 1], [32u32, 1, 1], 0u32)
+        } else {
+            const MMQ_X: usize = 128;
+            const MMQ_Y: usize = 128;
+            const MMQ_TILE_Y_K: usize = 36;
+            const MMQ_TILE_X_K: usize = 76;
+            let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+            let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+            let shared_mem =
+                ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+            (
+                [row_tiles as u32, batch_tiles as u32, 1],
+                [32u32, 8, 1],
+                shared_mem,
+            )
+        };
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_mmq_set", bytes);
         let result = self.launch_maybe_blob(
             kernel_name,
-            [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 8, 1],
+            grid,
+            block,
             shared_mem,
             &mut params,
             || {
@@ -12862,23 +12907,31 @@ impl Gpu {
         if self.arch_caps.is_gfx906() {
             // gfx906 has its own dispatcher (`gemm_hfq4g256_residual_mmq_gfx906`)
             // that handles its own quantize internally, called directly from
-            // mmq_screen_weight on gfx906. _set_prequant is RDNA3-only.
+            // mmq_screen_weight on gfx906. _set_prequant is RDNA3/gfx12-only.
             return Err(hip_bridge::HipError::new(
                 0,
                 "gemm_hfq4g256_mmq_set_prequant is not supported on gfx906; \
                  callers should route to gemm_hfq4g256_residual_mmq_gfx906 directly",
             ));
         }
-        let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
+        let is_gfx12 = self.arch_caps.is_rdna4();
+        let kernel_name = if is_gfx12 {
+            if m % 16 == 0 && batch_size % 16 == 0 {
+                "gemm_hfq4g256_residual_mmq_full_set"
+            } else {
+                "gemm_hfq4g256_residual_mmq"
+            }
+        } else if m % 128 == 0 && batch_size % 128 == 0 {
             "gemm_hfq4g256_residual_mmq_full_set"
         } else {
             "gemm_hfq4g256_residual_mmq"
         };
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual_mmq",
-            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
-            kernel_name,
-        )?;
+        let src = if is_gfx12 {
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC
+        } else {
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC
+        };
+        self.ensure_kernel("gemm_hfq4g256_residual_mmq", src, kernel_name)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
@@ -12897,21 +12950,32 @@ impl Gpu {
             &mut add_val as *mut _ as *mut c_void,
         ];
 
-        const MMQ_X: usize = 128;
-        const MMQ_Y: usize = 128;
-        const MMQ_TILE_Y_K: usize = 36;
-        const MMQ_TILE_X_K: usize = 76;
-        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
-        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
-        let shared_mem =
-            ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+        let (grid, block, shared_mem) = if is_gfx12 {
+            let row_tiles = (m + 15) / 16;
+            let col_tiles = (batch_size + 15) / 16;
+            ([row_tiles as u32, col_tiles as u32, 1], [32u32, 1, 1], 0u32)
+        } else {
+            const MMQ_X: usize = 128;
+            const MMQ_Y: usize = 128;
+            const MMQ_TILE_Y_K: usize = 36;
+            const MMQ_TILE_X_K: usize = 76;
+            let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+            let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+            let shared_mem =
+                ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+            (
+                [row_tiles as u32, batch_tiles as u32, 1],
+                [32u32, 8, 1],
+                shared_mem,
+            )
+        };
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_mmq_set", bytes);
         let result = self.launch_maybe_blob(
             kernel_name,
-            [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 8, 1],
+            grid,
+            block,
             shared_mem,
             &mut params,
             || {
