@@ -223,3 +223,28 @@ random, different each prompt). E2B shows same behavior. Likely causes:
 - Check weight loading dtype (HFQ4G256 vs expected format)
 - Verify embed_scale = sqrt(dim) application
 - Test with MQ4 quantization format
+
+---
+
+## 2026-06-07 · Session 7 — v_norm fix + quality improvement
+
+### Root cause found: v_norm_ones_full never initialized
+- `init_scratch_constants` was defined but never called
+- v_norm_ones_full stayed as zeros → v_norm output = 0 → attention output = 0
+- All subsequent layers received zero attention contribution
+- Model collapsed to `<audio|>` token attractor (258883)
+
+### Fix
+Added `gemma4::init_scratch_constants(gpu, &scratch, config.full_head_dim)` 
+in daemon after scratch allocation. This fills v_norm_ones_full with 1.0.
+
+### Results
+- Layer-0 activations now match HF: input_norm (1036 vs 1041), q/k/v proj within 1%
+- Output: diverse tokens, no more attractor loop
+- Top tokens: "Sne dequeue twig penny..." (real words, not special tokens)
+- HF expects: "1-.," (digits for "Hello1")
+- Remaining discrepancy: o_proj output (-30.7 vs HF 47.9) and final logits
+
+### Next
+- Remaining quality gap likely from flash attention numerics or Q8 quantization
+- Need HF oracle comparison through all 48 layers
