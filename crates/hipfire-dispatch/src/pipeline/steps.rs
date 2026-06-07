@@ -383,11 +383,12 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             })
         }
         Step::GemvResidual { w, input: GemvInput::Raw(x), residual, out } => {
-            // For dtypes WITHOUT a fused residual kernel (Q8_0, Q4K, F32), `out` is
-            // used as scratch: run_auto writes GEMV result into `out`, then
-            // add_inplace_f32 adds it to `residual`. `out` is fresh for Q8_0/Q4K
-            // and stale for HFQ4/MQ (which take the is_ok() branch above), but
-            // nothing reads `out` after this step in any model decode path.
+            // For dtypes WITHOUT a fused residual kernel (Q8_0, Q4K, F32), the
+            // fallback path runs a plain GEMV then `residual += result`. `out` may
+            // be used as scratch ONLY when it does not alias `residual`; when it
+            // does (the common qwen35 o_proj / dn_out case where out == residual ==
+            // &s.x), a fresh temp is allocated instead. See the aliasing guard below.
+            // Nothing reads `out` after this step in any model decode path.
             let gemv = GEMV.get_or_init(GemvFamily::new);
             // Dtypes with a fused `gemv_*_residual` kernel use it in one launch.
             // Dtypes without one (Q8_0, ParoQ4G128, …) fall back to plain GEMV into
@@ -412,11 +413,27 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             } else {
                 // run_auto applies the dtype's rotation (FWHT/Givens) before the
                 // kernel, so ParoQ4G128 gets its Givens rotation. Plain would skip it.
-                // Reuse `out` as scratch instead of alloc_tensor (eliminates per-call
-                // alloc/free churn and writes `out` for downstream consumers).
-                gemv.run_auto(ctx, gpu, w, x, out)?;
-                gpu.add_inplace_f32(residual, out)
-                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                //
+                // ALIASING GUARD: most callers (e.g. qwen35 o_proj / dn_out) pass
+                // `out` == `residual` (both `&s.x`). Reusing `out` as the GEMV scratch
+                // in that case is WRONG: run_auto would overwrite the residual with
+                // `W·x` and the subsequent `residual += out` would then compute
+                // `2·(W·x)` — the residual is lost. Detect the alias by device pointer
+                // and allocate a fresh scratch when they overlap. When `out` is a
+                // genuinely-distinct buffer, reuse it (no alloc churn).
+                if std::ptr::eq(residual, out) || residual.buf.as_ptr() == out.buf.as_ptr() {
+                    let tmp = gpu.alloc_tensor(&[w.m], DType::F32)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    gemv.run_auto(ctx, gpu, w, x, &tmp)?;
+                    gpu.add_inplace_f32(residual, &tmp)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                    gpu.free_tensor(tmp)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                } else {
+                    gemv.run_auto(ctx, gpu, w, x, out)?;
+                    gpu.add_inplace_f32(residual, out)
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                }
                 Ok(())
             }
         }
