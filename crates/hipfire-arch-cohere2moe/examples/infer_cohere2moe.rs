@@ -65,8 +65,13 @@ fn main() {
     let weights = CohereWeights::load(&mut hfq, &cfg, &mut gpu).expect("weights");
     eprintln!("loaded weights in {:.1}s", t_load.elapsed().as_secs_f64());
 
-    let prompt_ids = tok.encode(&prompt);
-    eprintln!("prompt {:?} → {} tokens", prompt, prompt_ids.len());
+    // Cohere prepends BOS (token 2 = <BOS_TOKEN>) and is trained with it always
+    // present — it degenerates without it. hipfire's `encode` does not add it.
+    let mut prompt_ids = tok.encode(&prompt);
+    if prompt_ids.first() != Some(&2) {
+        prompt_ids.insert(0, 2);
+    }
+    eprintln!("prompt {:?} → {} tokens: {:?}", prompt, prompt_ids.len(), prompt_ids);
     if prompt_ids.len() >= cfg.sliding_window {
         eprintln!(
             "WARNING: prompt {} tokens >= sliding_window {} — SWA not yet implemented \
