@@ -30,6 +30,29 @@
 //!   x = norm(x); logits = lm_head(x); logits = logit_softcap(logits, 30)
 //!
 //! All RMSNorm here is plain `x * w` (baked at load — see `load_norm`).
+//!
+//! ## Decode perf levers (gemma4-12B MQ4, hiptrx gfx1201)
+//!
+//! Decode is memory-bandwidth-bound: rocprofv3 attributes ~79% of GPU time to
+//! the weight-reading GEMVs (FFN gate_up/down + attention q/k/v/o + lm_head).
+//! All three levers below are byte-identical to the eager baseline (validated
+//! over multiple prompts) and stack monotonically:
+//!
+//!   * `HIPFIRE_GEMMA4_GRAPH=1` (default OFF) — hipGraph capture/replay of the
+//!     48-layer body + lm_head (`decode_step_with_graph`). +2.6%.
+//!   * `HIPFIRE_GEMMA4_FUSED_FFN` (default ON) — fold pre-FFN rmsnorm+FWHT into
+//!     one launch then gate+up into one (`fused_rmsnorm_rotate_mq` +
+//!     `fused_gate_up_hfq4g256`; MQ4G256 bytes are HFQ4G256-compatible given a
+//!     pre-rotated input). +1.0–1.2%.
+//!   * `HIPFIRE_GEMMA4_FUSED_QK` (default ON) — fuse the Q8 q+k projections into
+//!     one launch (`fused_gate_up_q8_0`, shared rmsnorm input). +1.1%.
+//!
+//! Full stack: 46.8 → 50.7 tok/s (+8.3%). The 70–75 tok/s target is NOT
+//! reachable via fusion/graph alone — it would require reading ~40% fewer
+//! weight bytes/token (lower-bit FFN quant or MQ4 attention), and MQ4 attention
+//! is known to break coherence. No Q8 fused-QKV *decode* kernel exists
+//! (`gemm_qkv_q8_0_wmma` is batched-prefill WMMA only), so q+k is the most that
+//! fuses on the Q8 attention path.
 
 use crate::config::{Gemma4Config, LayerType, RopeType};
 use crate::gemma4::{FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, SlidingLayerWeights};
