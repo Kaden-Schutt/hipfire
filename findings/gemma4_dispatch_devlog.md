@@ -1056,3 +1056,168 @@ head_dim / 128 = 4` (4 iterations of 128 dims each).
 1. Rebuild and run "Hello" — expect coherent output
 2. Run "What is the capital of France?" — expect correct answer
 3. Run coherence-gate-dflash — verify no regression on Qwen models
+
+---
+
+## 2026-06-07 · Session 14 — Reduce fix validated; deeper divergence remains
+
+### Reduce kernel fix applied and confirmed working
+
+The fix (adding `attention_flash_q8_0_reduce` launch after the tile kernel
+in `attention_flash_asym3_hd512`) was applied in the working tree. Build
+succeeded. The `debug_gemma4_attention` example now runs to completion
+without NaN, panic, or garbage values.
+
+### Model output still wrong: logits don't change between positions
+
+**Critical finding**: despite the reduce fix, the model produces nearly
+identical logits at pos=0 (BOS) and pos=1 ("Hello"):
+
+```
+Hipfire pos=0 logits top5: [(532, 18.033), (255999, 16.294), (240494, 15.212), ...]
+Hipfire pos=1 logits top5: [(532, 18.034), (255999, 16.294), (240494, 15.211), ...]
+```
+
+HF reference shows dramatically different logits (cosine similarity = 0.064):
+
+```
+HF pos=0 logits top5: [(532, 18.000), (255999, 16.125), (240494, 15.125), ...]
+HF pos=1 logits top5: [(575, 14.875), (236747, 14.750), (514, 14.750), ...]
+```
+
+Hipfire is essentially regurgitating the BOS-position logits at pos=1,
+meaning the "Hello" token's contribution is not propagating through the
+layers.
+
+### Per-layer hidden state comparison (pos=1)
+
+Comparing first4 elements of hidden state between HF and hipfire at pos=1:
+
+```
+Layer | HF first4[0:2]          | HIP first4[0:2]         | Δ[0]  | Δ[1]  | Type
+L 0   | [-0.7773,  2.4844]      | [-0.4549,  2.2682]      |  0.32 |  0.22 | Sliding
+L 1   | [ 0.0486,  1.3203]      | [ 0.2167,  1.9676]      |  0.17 |  0.65 | Sliding
+L 2   | [-0.1533,  1.5625]      | [-0.0647, -0.2303]      |  0.09 |  1.79 | Sliding
+L 3   | [-0.1196, -0.0282]      | [-0.0661,  2.0908]      |  0.05 |  2.12 | Sliding
+L 4   | [-0.1099, -1.3516]      | [-0.1241, -1.3104]      |  0.01 |  0.04 | Sliding  ← best match
+L 5   | [-0.0083, -1.6016]      | [ 0.0147, -0.7470]      |  0.02 |  0.86 | Full
+L 6   | [-0.4707, -0.1787]      | [-0.3272, -1.4983]      |  0.14 |  1.32 | Sliding
+L 7   | [-0.1836,  0.3242]      | [-0.4316, -1.2499]      |  0.25 |  1.57 | Sliding
+L 8   | [ 0.0352,  1.5625]      | [-0.8700, -1.9601]      |  0.91 |  3.52 | Sliding
+L 9   | [-2.0156,  2.1562]      | [ 0.7172, -1.5170]      |  2.73 |  3.67 | Sliding
+L10   | [-0.2441,  0.4805]      | [ 0.9231,  5.3017]      |  1.17 |  4.82 | Sliding
+L11   | [ 0.0125, -0.0017]      | [-0.0092,  0.0137]      |  0.02 |  0.02 | Full     ← good match
+```
+
+### Key observations
+
+1. **Sliding layers ALSO diverge** — L2, L3 show Δ[1]≈2.0 despite being
+   sliding (hd=256) layers with the well-tested hd256 path. This means the
+   bug is NOT exclusive to the full-layer hd512 attention.
+
+2. **Full layers (L5, L11) are NOT the worst** — L5 has Δ[1]=0.86 and L11
+   has Δ[0]=0.02. The worst divergences are in sliding layers L8-L10.
+
+3. **The pattern is non-monotonic**: L4 (sliding) matches best, then L5
+   (full) diverges moderately, then L6-L10 (sliding) diverge severely.
+   This is NOT a simple "full layers break everything" pattern.
+
+4. **HF reference shows `k_eq_v=False` at the per-layer level** for ALL
+   layers, but the global config says `attention_k_eq_v: True`. The HF
+   model's code likely overrides per-layer: full layers use k_eq_v=True
+   (V = pre-norm K), sliding layers use k_eq_v=False (real v_proj).
+
+5. **Hipfire's hidden states at later layers (L12-L47) are nearly identical
+   between pos=0 and pos=1** — the model "collapses" to the same output
+   regardless of input token. This suggests the attention mechanism is not
+   differentiating between positions, which points to a KV cache issue.
+
+### Suspects for the remaining divergence
+
+1. **Sliding window attention not reading both positions correctly**: The
+   sliding KV cache has `sliding_window=1024`. At pos=1, the attention
+   should attend to both pos=0 and pos=1. If it only sees one position,
+   the softmax is trivially [1.0] and attn_out = V.
+
+2. **Cosine/sin theta buffer for full layers**: The full layers use
+   `full_rope_theta=1000000` vs sliding's `sliding_rope_theta=10000`. If
+   the Givens cos/sin tables are shared or computed with the wrong theta,
+   the KV cache write uses wrong rotations, corrupting the K cache.
+
+3. **KV cache Givens tables initialized per-cache vs per-layer-type**: The
+   `kv_cache.givens_cos/sin` are computed once at cache creation. If the
+   sliding and full KV caches share the same Givens tables, one of them
+   will have wrong rotations.
+
+4. **Sliding window KV cache `physical_cap` too small**: Debug output shows
+   `physical_cap=1024 / max_seq=1024` for the sliding cache. This is
+   `sliding_window=1024`, which is correct. But if the attention kernel
+   interprets `max_seq` differently for sliding vs full, it could truncate.
+
+5. **The `v_norm_ones_full` tensor**: This was the earlier fix (initialized
+   to all-ones for V normalization). If it's sized wrong or applied to the
+   wrong buffer, V normalization could corrupt values.
+
+### HF config details (12B)
+
+```
+text_config:
+  attention_k_eq_v: True              ← global default
+  global_head_dim: 512
+  head_dim: 256
+  num_attention_heads: 16
+  num_global_key_value_heads: 1       ← full layers: 1 KV head
+  num_key_value_heads: 8              ← sliding layers: 8 KV heads
+  sliding_window: 1024
+  layer_types: [S,S,S,S,S,F, S,S,S,S,S,F, ...] (48 total, 8 Full at L5,11,17,23,29,35,41,47)
+```
+
+Per-layer from HF model:
+- Sliding: hd=256, n_kv=8, sw=1024, k_eq_v=False (real v_proj)
+- Full:    hd=512, n_kv=1, sw=None, k_eq_v=False (but global k_eq_v=True?)
+
+The `k_eq_v` semantics: V = pre-k_norm K for full layers only. Sliding
+layers have real v_proj weights. Hipfire handles this via separate
+`LayerWeights::Sliding` (has v_proj) and `LayerWeights::Full` (no v_proj,
+copies K→V before k_norm). This was verified correct earlier.
+
+### Tokenizer issue blocks end-to-end CLI validation
+
+The `hipfire run` and `hipfire serve` CLI commands fail to load the gemma4
+model's tokenizer:
+```
+GPT-2 BPE vocab missing byte symbol: byte 0x90 maps to char 'Ĳ' which is not in token_to_id
+```
+
+Gemma4 uses a 262K-vocab BPE tokenizer (model_type="BPE" in the embedded
+tokenizer JSON), not SentencePiece. The tokenizer loader incorrectly tries
+GPT-2 BPE mode, which expects byte-fallback tokens for all 256 bytes. The
+262K vocab doesn't have these (it's a different BPE variant). This is a
+separate bug from the attention divergence.
+
+### Next steps
+
+1. **Run with HIPFIRE_GEMMA4_DUMP=1 on a longer prompt** (5-10 tokens) to
+   see if the divergence pattern changes with more context. If it does, the
+   KV cache read/write is the issue. If it doesn't, the issue is in the
+   per-layer computation itself.
+
+2. **Verify the Givens cos/sin tables** for the full KV cache. The full
+   layers use `full_rope_theta=1000000`. Check that the KV cache's
+   `givens_cos/sin` are computed with the correct theta for each cache
+   type (sliding vs full).
+
+3. **Dump the actual KV cache contents** for L5 at pos=1 and compare with
+   HF's K/V at the same position. This will isolate whether the write or
+   the read is wrong.
+
+4. **Test with fp32 KV cache** (`--kv-mode fp32`) to bypass all Givens
+   rotation and asym3 quantization. If fp32 KV produces correct output,
+   the bug is in the Givens rotation / asym3 quant, not in the attention
+   computation itself.
+
+5. **Check if sliding attention reads 2 positions**: At pos=1, the sliding
+   attention should have seq_len=2. Dump the partials buffer to verify the
+   tile kernel processes both positions.
+
+6. **Fix the tokenizer** to unblock end-to-end CLI validation.
