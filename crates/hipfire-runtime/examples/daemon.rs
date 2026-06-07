@@ -1159,15 +1159,8 @@ struct LoadedModel {
     /// its end-of-turn marker is the added token `[e~[`; falls back to common
     /// alternates, then 1.
     minimax_eos_tok: u32,
-            gemma4_config: None,
-            gemma4_weights: None,
-            gemma4_scratch: None,
-            gemma4_kv_sliding: None,
-            gemma4_kv_full: None,
-            gemma4_eos_tok: 0,
-    // Gemma4 state (arch_id=12 — hipfire-arch-gemma4). Hybrid sliding+full
-    // attention: two separate KV caches (sliding + full), layer-type dispatch.
-    // None on every other arch path.
+    // Gemma4 state (arch_id=12). Hybrid sliding+full attention: two separate
+    // KV caches (sliding + full), layer-type dispatch. None on other archs.
     gemma4_config: Option<gemma4::Gemma4Config>,
     gemma4_weights: Option<gemma4::Gemma4Weights>,
     gemma4_scratch: Option<gemma4::Gemma4Scratch>,
@@ -3966,45 +3959,46 @@ fn load_model(
         let _ = state_quant_override;
         let config = <Gemma4 as Architecture>::config_from_hfq(&hfq)
             .map_err(|e| e.to_string())?;
-        let mut weights = <Gemma4 as Architecture>::load_weights(&mut hfq, &config, &mut gpu)
+        let weights = <Gemma4 as Architecture>::load_weights(&mut hfq, &config, gpu)
             .map_err(|e| e.to_string())?;
-        let scratch = <Gemma4 as Architecture>::new_state(&mut gpu, &config)
+        let scratch = <Gemma4 as Architecture>::new_state(gpu, &config)
             .map_err(|e| e.to_string())?;
 
-        // Dual KV caches: sliding (ring-buffer) + full (identity)
-        let kv_sliding = llama::KvCache::new(
-            &mut gpu, config.sliding_window, config.sliding_window,
-            config.sliding_n_kv_heads, config.sliding_head_dim, false, false,
-            true, 2, 3, None,
+        // Dual KV caches: sliding (ring-buffer) + full (identity).
+        let kv_sliding = llama::KvCache::new_gpu(
+            gpu, config.n_layers, config.sliding_n_kv_heads,
+            config.sliding_head_dim, config.sliding_window,
         ).map_err(|e| format!("gemma4 sliding KV alloc: {e:?}"))?;
-        let kv_full = llama::KvCache::new(
-            &mut gpu, max_seq, max_seq,
-            config.full_n_kv_heads, config.full_head_dim, false, false,
-            true, 2, 3, None,
+        let kv_full = llama::KvCache::new_gpu(
+            gpu, config.n_layers, config.full_n_kv_heads,
+            config.full_head_dim, max_seq,
         ).map_err(|e| format!("gemma4 full KV alloc: {e:?}"))?;
 
         let eos_tok = config.eos_token;
-        let (default_temp, default_top_p) = (0.7_f64, 0.9_f64);
-        let default_repeat_penalty = 1.0_f64;
+        let chat_template = resolve_chat_template(&hfq, path);
 
         return Ok(LoadedModel {
-            config_json: None,
-            arch_id: 12,
-            quant_type: hfq.quant_type.clone(),
+            arch_id: hfq.arch_id,
+            pp: 1,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
             q35_config: None,
             q35_weights: None,
             q35_scratch: None,
-            dn_state: None,
-            q35_vl: None,
-            q35_mtp: None,
             kv_cache: None,
+            dn_state: None,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
             deepseek4_config: None,
             deepseek4_weights: None,
             deepseek4_state: None,
-            deepseek4_mtp_weights: None,
+            deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
             lfm2moe_config: None,
             lfm2moe_weights: None,
