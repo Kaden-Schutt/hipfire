@@ -189,6 +189,23 @@ SHORT_TESTS=(
 )
 FULL_EXTRA=(
     "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
+    # gfx12/RDNA4 Q8_0-wo MoE coverage — the gate gap that let a9e8dfda
+    # corrupt RDNA4 MoE output for ~100 commits before ae13aa75 fixed it.
+    # a9e8dfda aliased the GemvResidual fallback's `out` onto the residual
+    # buffer; on RDNA4 the Q8_0 wo / dn_out projections (which take that
+    # GemvResidual fallback rather than a fused *_residual_wmma kernel)
+    # then read-after-write the same buffer → silent wrong MoE output.
+    # NONE of the prior FULL_EXTRA rows exercised a *Q8_0* MoE (the only
+    # MoE rows were MQ4), so the aliasing regression slipped every gate.
+    # This row is a qwen3_5_moe (arch) A3B whose router + shared-gate +
+    # wo/dn_out projections are Q8_0, forcing the GemvResidual fallback on
+    # gfx12. A healthy answer states the final number (8); aliasing
+    # corruption produces an attractor / off-topic loop. It is symlink-gated
+    # exactly like the other rows (skipped where the file is absent, so it
+    # is a no-op on boxes without the Q8 A3B trunk). Produce / symlink it:
+    #   ln -s /data/hipfire-models/qwen3.5-35b-a3b.q8f16.hfq \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-35b-a3b.q8f16"
+    "qwen3.5-35b-a3b.q8f16|moe-q8-wo-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
     "qwen3.6-35b-a3b.mq4|moe36-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
     "qwen3.6-27b.mq4|tool-call-27b|What does the file /tmp/fibonacci.c contain?|220|tool_call_system.txt"
     # DeepSeek V4 Flash (arch_id=9, hipfire-arch-deepseek4). Loads the
