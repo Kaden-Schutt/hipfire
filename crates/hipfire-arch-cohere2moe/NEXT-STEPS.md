@@ -27,22 +27,44 @@ oracle, per-layer cosine). Validation box: **hiptrx GPU 3** (gfx1201/RDNA4,
 - `scripts/gen_tiny_cohere2moe.py` — tiny reference oracle (HF transformers).
 - Registered in workspace `Cargo.toml` + `docs/architecture-ids.md` (id 12).
 
-`cargo build -p hipfire-arch-cohere2moe` compiles. The crate does not yet run
-end-to-end because two pieces are unwired (below).
+`cargo build -p hipfire-arch-cohere2moe` compiles.
 
-## Required to run the oracle loop (NOT yet done)
+## FORWARD VALIDATED via tiny oracle (2026-06-07, hiptrx GPU 3 / gfx1201)
 
-1. **hipfire-quantize converter arm** (safetensors → `.hfq`) for `cohere2_moe`.
-   The tiny oracle emits `model.safetensors` (SPLIT expert layout) + flat
-   `config.json`; the converter must map tensor names (the loader reads RAW HF
-   names: `model.layers.{l}.input_layernorm.weight`,
-   `self_attn.{q,k,v,o}_proj.weight`, dense `mlp.{gate,up,down}_proj.weight`,
-   MoE `mlp.gate.weight` + `mlp.experts.{e}.{gate_proj,up_proj,down_proj}.weight`,
-   `model.embed_tokens.weight`, `model.norm.weight`, `lm_head.weight`), quantize
-   experts to MQ4G256/HFQ4G256 (FWHT-rotated) and attn/router/dense to Q8, and
-   emit `arch_id = 12` in the HFQ header.
+Tiny 2-layer random oracle (hidden 256, hd 128, 16 experts top-8, layer-0 dense)
+vs HF transformers `Cohere2MoeForCausalLM` per-layer post-residual cosine:
 
-2. **Daemon dispatch arm** for `arch_id == 12` (load + generate). See
+```
+            MQ4 experts        MQ6 experts
+layer    mean_cos  rel_L2    mean_cos  rel_L2
+  0      0.99588   0.088     0.99851   0.052
+  1      0.99571   0.086     0.99795   0.054
+```
+
+Flat across layers, rms-matched, no crater/compounding → structure correct.
+Error shrinks ∝ precision (MQ4→MQ6) → residual is quant noise on a tiny random
+model, NOT an arch bug (methodology step 5). [T1] routing fix moved layer 1 from
+0.984 → 0.9957 exactly as predicted. Conclusion: parallel block, interleaved
+RoPE, dense layer-0, GQA, sigmoid no-renorm MoE, RMSNorm are all forward-correct.
+
+Repro: HF ref needs transformers `main` (cohere2_moe is NOT in the 5.8 release;
+the model's `transformers_version` tag is misleading and there is no `auto_map`).
+On hiptrx: `python -m venv --system-site-packages ~/cohere-gen-venv &&
+~/cohere-gen-venv/bin/pip install --no-deps -U git+https://github.com/huggingface/transformers.git`.
+Then gen → `hipfire-quantize --input ~/cohere2moe-tiny --output …hfq --format mq4
+--no-kmap` (experts→MQ4G256 FWHT, attn/router→Q8, embed→Q8, norms→F16) →
+`HIP_VISIBLE_DEVICES=3 dump_cohere2moe_hidden_states` → `compare_hidden_states.py`.
+
+## DONE: hipfire-quantize converter arm
+
+`cohere2_moe` → arch_id 12 wired in both arch-detect paths + `is_moe`. Split
+per-expert tensors (`mlp.experts.{e}.{gate,up,down}_proj`) flow through the
+existing 2D quant path → FWHT-rotated MQ4/MQ6; router/attn/dense → Q8; embed →
+Q8; norms → F16. No new quant logic.
+
+## Still required (NOT yet wired)
+
+1. **Daemon dispatch arm** for `arch_id == 12` (load + generate). See
    `docs/architecture-ids.md` "Daemon dispatch sites" — wire the load arm and a
    generate branch calling `forward::decode_step`. Not needed for the oracle
    compare (the dump example calls the forward directly), only for `serve`/CLI.
@@ -74,11 +96,10 @@ Target: per-layer `mean_cos ≥ 0.999` (Q8-grade) / `≥ 0.99` (4-bit experts).
 
 ## Known oracle-loop targets (verify in this order)
 
-- **[T1] Routing renormalization.** `forward.rs` reuses the bias-aware top-k
-  kernel, which renormalizes the top-k weights to sum 1. Cohere2Moe has
-  `norm_topk_prob = false` → it must NOT renormalize (weight = `sigmoid(logit)`
-  of each selected expert, un-normalized). If the MoE layer's per-layer cosine
-  is the first to crater, this is why. Fix = a no-renorm top-k variant.
+- **[T1] Routing renormalization — RESOLVED 2026-06-07.** Now uses
+  `moe_topk_renorm_k8(norm_topk = cfg.norm_topk_prob)` (false), giving
+  un-renormalized sigmoid weights, no bias. Was the bias-aware renormalizing
+  kernel; cost ~0.012 layer-1 cosine on the tiny oracle.
 - **[T3] RoPE layout.** If attention (not MoE) diverges, the Q/K projection may
   need a load-time interleave permute to match `rope_partial_interleaved_f32`.
   Localize with `HIPFIRE_COHERE_CAPTURE_POSTATTN=1` (the dump captures the
