@@ -544,3 +544,314 @@ interact with the kernel.
 Next step: instrument the `attention_flash_partial` kernel to dump
 post-softmax weights and V-weighted sums for a specific head, and compare
 with HF's exact computation.
+
+### E2B model test — ALSO GARBAGE
+
+Tested Gemma4 E2B (n_kv=1, k_eq_v=False, 35 layers, 5.5 GB). Output is
+equally incoherent — random multilingual tokens. The bug affects ALL gemma4
+models, not just 12B.
+
+This rules out:
+- GQA as the issue (E2B has n_kv=1, no GQA)
+- attention_k_eq_v handling (E2B has k_eq_v=False)
+- 12B-specific config issues
+
+The bug must be in something FUNDAMENTAL to the gemma4 forward pass that
+is shared across all model sizes. Candidates:
+1. The RoPE implementation (different theta per layer type)
+2. The sandwich norm structure (4 norms per layer)
+3. The layer_scalar multiplier
+4. The final_logit_softcapping
+5. Something in the basic attention/FFN path
+
+### HF v_norm verification
+- v_norm is `Gemma4UnifiedRMSNorm` with `with_scale=False`
+- This is pure divide-by-RMS — no learned weight
+- Hipfire correctly uses `rmsnorm_batched` with ones buffer ✓
+
+### HF attention_k_eq_v semantics
+- 12B/31B: `attention_k_eq_v=True`, but sliding layers HAVE v_proj
+- Full layers have `v_proj is None` → V = k_proj(x) (pre-k_norm)
+- Hipfire handles both correctly per layer type ✓
+
+### Updated hypothesis list
+The bug must be in something shared across all gemma4 sizes:
+1. **Sandwich norm ordering** — maybe one of the 4 norms is applied wrong
+2. **RoPE per layer type** — different theta for sliding vs full, could be swapped
+3. **FFN activation** — gelu_pytorch_tanh vs some other variant
+4. **The forward pass control flow** — maybe the loop over layers processes
+   layer types in wrong order
+5. **Something in the residual accumulation** — double-add, wrong buffer
+
+---
+
+## 2026-06-07 · Session 10 — Per-layer trace + sub-step bisect (BREAKTHROUGH)
+
+### Changed dump guard from pos==1 to pos==0
+The diagnostic dump was guarded on `pos == 1 && kv_layer_idx == 0`, which
+meant it only triggered at the second token position. For the "Hello" single-
+token prompt (no BOS prepended by the daemon), pos=0 is the only decode
+position. Changed to `pos == 0 && kv_layer_idx == 0` to capture L0
+sub-steps for the single-token case.
+
+### Full per-layer HF reference trace ("Hello" prompt)
+
+Ran HF reference for all 48 layers on "Hello" (single token, no BOS):
+```
+embed:  sum=21.26   [0.82, 0.58, -0.25, 1.27]
+L0 (S): sum=-22.10  [-0.85, 2.95, -0.79, 0.13]
+L5 (F): sum=48.15   [0.03, -0.81, -0.09, 1.06]
+L47(F): sum=-7.90   [0.08, -0.08, 0.01, -0.02]
+```
+
+### Side-by-side first4 comparison (HF vs hipfire, "Hello" pos=0)
+
+```
+Layer  Type   HF[0]  HF[1]  HF[2]  HF[3]  || HIP[0] HIP[1] HIP[2] HIP[3] || Δmax
+L0     S     -0.85   2.95  -0.79   0.13   ||  0.17  -0.15  16.63   0.01  || 17.4  ← HUGE at L0!
+```
+
+Divergence is **already catastrophic at L0** — a sliding layer. This
+invalidates the earlier "L0 is ~6% off, the problem must be in full layers"
+narrative. The 6% was a sum-cancellation artifact (see Claude review §UPDATE).
+
+### Claude review hypotheses 1A/1B/1C checked
+
+**1A: RMSNorm +1 shift — RULED OUT.**
+- HF `Gemma4UnifiedRMSNorm` stores weights initialized at 1.0 and trained
+  (mean≈6.6 for input_layernorm), applies as `normed * weight` (no +1).
+- Hipfire's `rmsnorm_f32(x, weight) = x * rsqrt(mean(x²) + eps) * weight`
+  is correct — no +1 needed.
+- The earlier Gemma convention (zero-centered weights needing +1) does NOT
+  apply to Gemma4.
+
+**1B: Attention scaling = 1.0 — CONFIRMED CORRECT.**
+- HF's `self.scaling = 1.0` hardcoded in `Gemma4UnifiedTextAttention.__init__`.
+- HF computes `Q @ K^T * 1.0` (no 1/√d).
+- Hipfire pre-scales Q by √d to cancel the flash kernel's internal 1/√d,
+  achieving the same net effect of scaling=1.0. ✓
+
+**1C: layer_scalar semantics — APPEARS CORRECT.**
+- HF: `hidden_states *= self.layer_scalar` applied to entire residual at
+  end of each layer.
+- Hipfire: `gpu.scale_f32(&scratch.x, lw.layer_scalar_host)` — same. ✓
+- layer_scalar values are ≈1.0 (learned, close to identity).
+
+**1D: embed_scale precision — CONFIRMED CORRECT, MINOR.**
+- HF casts √3840 to bf16 (61.97 → 62.0) before multiply.
+- Hipfire keeps f32. Small drift, not garbage-output cause.
+
+### Sandwich norm ordering — CONFIRMED CORRECT
+
+HF layer forward:
+```python
+residual = x
+x = input_layernorm(x)
+x = self_attn(x)              # includes o_proj
+x = post_attention_layernorm(x)
+x = residual + x
+
+residual = x
+x = pre_feedforward_layernorm(x)
+x = mlp(x)
+x = post_feedforward_layernorm(x)
+x = residual + x
+
+x *= layer_scalar
+```
+
+Hipfire matches this order exactly. ✓
+
+### L0 sub-step bisect — WHERE THE DIVERGENCE HAPPENS
+
+Dumped 20+ intermediate taps through L0 for "Hello" at pos=0, and matched
+against HF hooked intermediates.
+
+**Steps that MATCH (Δ < 0.3 per element):**
+- embed / scratch.x: HF [0.82, 0.58, -0.25, 1.27] vs HIP [0.81, 0.59, -0.26, 1.27] ✓
+- post_input_norm: HF [13.56, 16.38, 0.00, 19.00] vs HIP [13.39, 16.61, 0.00, 18.94] ✓
+- post_q_proj: HF [-5.78, 6.56, 0.65, 3.42] vs HIP [-5.80, 6.53, 0.80, 3.36] ✓
+- post_k_proj: HF [6.91, 12.88, -16.00, 22.50] vs HIP [6.92, 13.13, -15.88, 22.54] ✓
+- post_v_proj: HF [7.78, 42.00, -3.03, -10.06] vs HIP [7.94, 41.96, -3.18, -10.00] ✓
+
+**Steps that DIVERGE:**
+- post_o_proj: HF [-0.09, 0.12, -3.67, 1.70] vs HIP [-0.79, 0.55, -2.12, 0.09]
+  - Δ = [0.70, 0.42, 1.55, 1.61] — **10× worse than projections**
+
+**Conclusion: the attention layer (from v_norm output to o_proj output) is
+where the divergence originates.** Everything before attention matches
+within HFQ4 quantization error (~1-5%); after attention, the outputs diverge
+by 10-30×.
+
+### Per-head attention output comparison
+
+For single-token decode, softmax has one element → attention output = V.
+HF confirms this: every head pair (h, h+1) is identical (GQA), and each
+head has RMS ≈ 1.0 (from v_norm normalization).
+
+**HF per-head attn output (first2 of each head):**
+```
+head  0 (kv=0): [-0.0884, -0.2930]  sum= -8.41
+head  2 (kv=1): [-1.2734, -1.8906]  sum= -4.08
+head  4 (kv=2): [-3.3125,  0.6055]  sum= -5.65
+head  6 (kv=3): [ 0.4668,  0.7969]  sum= 18.02   ← note positive
+head  8 (kv=4): [ 0.1426,  0.1064]  sum=-23.00
+head 10 (kv=5): [-0.9883,  0.5938]  sum= -8.96
+head 12 (kv=6): [-0.2021, -0.3496]  sum=-11.60
+head 14 (kv=7): [-1.3594,  0.0045]  sum= -5.11
+```
+
+**Hipfire per-head attn output (first2 of each head):**
+```
+head  0 (kv=0): [-0.1065, -0.7027]  sum=-10.72   ← DIFFERENT from HF
+head  2 (kv=1): [-0.4392,  ?]       sum= 10.60   ← OPPOSITE SIGN to HF
+head  4 (kv=2): [-0.7356,  ?]       sum=  6.36   ← OPPOSITE SIGN to HF
+head  6 (kv=3): [ 0.0007,  ?]       sum=-12.14   ← OPPOSITE SIGN to HF (+18 → -12!)
+head  8 (kv=4): [ 0.3837,  ?]       sum= -4.22
+head 10 (kv=5): [-0.1692,  ?]       sum=-13.43
+head 12 (kv=6): [-0.2027,  ?]       sum= -7.05
+head 14 (kv=7): [-0.4279,  ?]       sum= -8.62
+```
+
+Multiple heads show **opposite-sign** outputs vs HF. For single-token decode
+where attn_out = V, this means the V values written to/read from the KV cache
+are fundamentally wrong — not quantization noise.
+
+### CRITICAL: v_proj matches but v_norm output doesn't
+
+Wait — this is the key contradiction:
+- v_proj output matches HF (within quantization error) ✓
+- v_norm is divide-by-RMS-only (no learned weight) ✓
+- Yet attention output ≠ v_norm output in hipfire
+
+For single-token decode, attention output should equal the v_norm output
+(for each KV head). If they don't match, the attention kernel is reading V
+from the wrong KV cache slot, or the KV cache write/read has a layout bug.
+
+Actually, looking more carefully: hipfire's attention output first2 =
+[-0.1065, -0.7027] and hipfire's v_norm first2 = [-0.1065, -0.7027].
+They DO match for head 0. But HF's head 0 first2 = [0.2266, 1.2266].
+
+**So the V values are correct WITHIN hipfire's computation chain but wrong
+vs HF.** The v_proj output differs from HF at pos=0, which means either:
+1. The quantized weight is wrong (but q_proj/k_proj match — why only v_proj?)
+2. The input to v_proj differs subtly (post_input_norm is close but not exact)
+3. The v_proj weight quantization has a systematic error (bad group alignment?)
+
+### Remaining open questions for next session
+
+1. **Why do q_proj/k_proj match HF but v_proj doesn't at pos=0?** All three
+   use the same input (post_input_norm) and the same GEMV kernel. The v_proj
+   weight must be quantized differently or loaded with wrong dims.
+
+2. **Is the weight loading order correct?** v_proj weight shape should be
+   `[n_kv * head_dim, dim]` = `[2048, 3840]`. If it's transposed or has
+   swapped dims, the GEMV would produce wrong results.
+
+3. **Are all projection weights loaded from the correct safetensors keys?**
+   The model uses `model.language_model.layers.{i}.self_attn.v_proj.weight`.
+   A key mapping error could load the wrong weight.
+
+4. **Does the quantizer handle v_proj's row count (2048) differently than
+   q_proj's (4096)?** The group size is 256; 2048 = 8 groups, 4096 = 16
+   groups. If the quantizer misaligns groups for non-power-of-2 group counts,
+   this would explain a v_proj-specific error.
+
+### BOS token handling note
+
+The daemon's gemma4 path at `daemon.rs:11494` says:
+```
+// Raw tokenization. BOS (2) prepended manually — Gemma4 SPM-BPE
+// doesn't auto-prepend.
+```
+But `bos_token: None` is passed to the tokenizer, so BOS is NOT prepended.
+This means "Hello" tokenizes as [9259] with no BOS, and HF's tokenizer also
+doesn't add BOS for `encode()` (only `__call__` auto-prepends). Both sides
+are consistent: single token 9259, no BOS.
+
+---
+
+## 2026-06-07 · Session 11 — BOS token context + Full-layer divergence isolated
+
+### Critical finding: daemon prepends BOS token
+
+The daemon's gemma4 path (`daemon.rs:11494-11496`) prepends BOS (token 2):
+```rust
+let mut ids = vec![2u32]; // BOS
+ids.extend(tokenizer.encode(prompt));
+```
+
+This means "Hello" is tokenized as [2, 9259], not [9259]. All previous
+HF comparisons that used `tok("Hello")` (which returns [9259] without BOS)
+were comparing against different token positions:
+- pos=0 in hipfire = BOS token (not "Hello")
+- pos=1 in hipfire = "Hello" token
+
+This invalidated the pos=0 v_proj comparison (which was BOS, not Hello).
+
+### Proper comparison with matching BOS context
+
+Ran HF with `input_ids = torch.tensor([[2, 9259]])` (BOS + Hello) and
+compared against hipfire's pos=1 dump. Results:
+
+**L0-L4 (sliding layers): ALL MATCH within HFQ4 quantization error:**
+```
+L0: max_Δ = 0.059, ΔΣ = 0.05  ✓
+L1: max_Δ = 0.061, ΔΣ = 0.05  ✓
+L2: max_Δ = 0.058, ΔΣ = 0.00  ✓
+L3: max_Δ = 0.032, ΔΣ = 0.75  ✓
+L4: max_Δ = 0.070, ΔΣ = 0.64  ✓
+```
+
+**L5 (first Full layer): DIVERGENCE JUMPS:**
+```
+L5: max_Δ = 1.148, ΔΣ = 11.35  ← FIRST FULL LAYER
+```
+
+**L6+ (subsequent sliding layers): CATASTROPHIC:**
+```
+L6: max_Δ = 4.934, ΔΣ = 34.99
+L7: max_Δ = 1.471, ΔΣ = 216.02
+```
+
+### Root cause narrowed to Full attention layers
+
+The bug is now definitively isolated to the **Full (global) attention layer
+path** — specifically L5 and every 6th layer thereafter (L5, L11, L17, L23,
+L29, L35, L41, L47). These layers use:
+- `head_dim = 512` (vs 256 for sliding)
+- `n_kv = 1` (vs 8 for sliding)  
+- `partial_rotary_factor = 0.25` (only 128 of 512 dims get RoPE)
+- `full_rope_theta = 1e6` (vs 1e4 for sliding)
+- `attention_k_eq_v = True` (V = k_proj output, no v_proj)
+- hd512 flash attention kernel (`attention_flash_asym3_hd512`)
+
+The sliding attention path is VERIFIED CORRECT. Only the full-layer path
+is broken.
+
+### Sub-step verification at L0 (pos=1, sliding)
+
+Detailed sub-step comparison confirms every sliding-layer operation matches:
+- embed: Δ < 0.01 ✓
+- input_norm: Δ < 0.23 ✓  
+- q/k/v_proj: Δ < 0.16 ✓ (HFQ4 quantization error)
+- attention output: Δ < 0.02 ✓ (single-token decode, attn_out ≈ V)
+- o_proj: Δ < 0.06 ✓
+- post_attn_norm: Δ < 0.23 ✓
+- gate/up_proj: Δ < 0.12 ✓
+- down_proj: Δ < 0.26 ✓
+- layer_scalar = 0.052979 (matches HF exactly) ✓
+
+### Next step: bisect L5 (full layer) sub-steps
+
+Need to dump intermediate values inside the full attention layer and
+compare against HF. Key suspects:
+1. **Partial RoPE** (`rope_partial_halved_f32`) — `partial_rotary_factor=0.25`
+   means only 128 of 512 dimensions rotate. An off-by-2× or wrong-dim
+   split here corrupts every full layer.
+2. **hd512 flash attention kernel** — new, gemma4-only, untested against
+   oracle.
+3. **K=V weight sharing** — V = k_proj output (no v_proj), need to verify
+   memcpy ordering.
+4. **full_rope_theta = 1e6** — different from sliding's 1e4.
+
