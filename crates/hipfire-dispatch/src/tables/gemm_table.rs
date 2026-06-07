@@ -171,20 +171,21 @@ pub fn populate(registry: &mut KernelRegistry) {
         tile: TileImpl::None,
     });
     // HFQ4G256 MMQ set (q8_1 activation-quant + integer tile matmul; uses the
-    // i8-WMMA intrinsic on RDNA3/3.5). EMPIRICALLY VERIFIED on the fleet
-    // (#397 Ship 5.1, 2026-06-06):
-    //   - gfx1100/RDNA3 (k9lin):   correct (NRMSE 0.024% vs WMMA) AND 2.1x FASTER
-    //     than WMMA at prefill — a real promote-over-WMMA candidate for 5.2.
+    // i8-WMMA intrinsic). EMPIRICALLY VERIFIED correct on the full WMMA fleet
+    // (#397 Ship 5, 2026-06-06):
+    //   - gfx1100/RDNA3 (k9lin):   NRMSE 0.024% vs WMMA, ~2.1x FASTER at prefill.
     //   - gfx1151/RDNA3.5 (hipx):  correct (i8-WMMA gated to __gfx1151__).
-    //   - gfx12/RDNA4 (hiptrx):    EMPTY STUB — gemm_hfq4g256_residual_mmq.hip:19
-    //     RDNA3 #if guard excludes gfx12, bodies compile to {} → computes nothing
-    //     (proven garbage, NRMSE ~21000%). MUST NOT admit RDNA4.
-    // Predicate = HasWmmaW32 (RDNA3 + RDNA3.5) = exactly the kernel compile guard.
-    // (Dormant until 5.2 wires GemmFamily; live should_use_mmq already excludes
-    // RDNA4 via has_mmq(), so no live impact today.)
+    //   - gfx1201/RDNA4 (hiptrx):  correct via the NEW gemm_hfq4g256_residual_mmq.gfx12.hip
+    //     (i8-WMMA gfx12 intrinsic), loaded under a distinct module name to dodge the
+    //     cache collision; NRMSE 0.18-0.24% vs CPU oracle, ~2.5x faster than fp16_wave64.
+    // Predicate = HasWmma (has_wmma() = RDNA3 + RDNA3.5 + RDNA4) — exactly the WMMA-
+    // capable arches where this i8-WMMA kernel has a real body. NOT HasMmq: gfx906
+    // has no WMMA (it uses a separate dp4a MMQ kernel), so it must not select this one.
+    // (Still dormant until 5.2 wires GemmFamily; the live should_use_mmq path is
+    // independent. 5.2 follow-up: MMQ is 2-2.5x WMMA at prefill — promote candidate.)
     registry.register(KernelVariant {
         key: KernelKey::GemmHfq4G256MmqSet,
-        arch_required: ArchPredicate::HasWmmaW32,
+        arch_required: ArchPredicate::HasWmma,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
