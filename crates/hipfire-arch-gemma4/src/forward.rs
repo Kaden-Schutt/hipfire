@@ -36,7 +36,8 @@ use crate::gemma4::{FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, 
 use hipfire_runtime::llama::{weight_gemv, KvCache};
 use rdna_compute::Gpu;
 
-/// Decode one token (eager); returns the full logits vector.
+/// Decode one token (eager); returns the full logits vector. Used for prefill,
+/// the warm pass, and as the `HIPFIRE_GEMMA4_GRAPH=0` fallback.
 pub fn decode_step(
     cfg: &Gemma4Config,
     weights: &Gemma4Weights,
@@ -45,13 +46,15 @@ pub fn decode_step(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
-    decode_step_body(cfg, weights, state, gpu, token_id, position, None)?;
+    embed_lookup(cfg, weights, state, gpu, token_id)?;
+    decode_step_body(cfg, weights, state, gpu, position, None)?;
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("gemma4: download logits: {e:?}"))
 }
 
 /// Decode one token, appending each layer's post-residual hidden state (pre
-/// final-norm) to `capture[layer]` — used by the oracle dumper. Eager only.
+/// final-norm) to `capture[layer]` — used by the oracle dumper. Eager only
+/// (the per-layer D2H downloads are incompatible with graph capture).
 pub fn decode_step_capture(
     cfg: &Gemma4Config,
     weights: &Gemma4Weights,
@@ -61,23 +64,119 @@ pub fn decode_step_capture(
     position: u32,
     capture: &mut [Vec<f32>],
 ) -> Result<(), String> {
-    decode_step_body(cfg, weights, state, gpu, token_id, position, Some(capture))
+    embed_lookup(cfg, weights, state, gpu, token_id)?;
+    decode_step_body(cfg, weights, state, gpu, position, Some(capture))
 }
 
-fn decode_step_body(
+/// Decode one token via hipGraph capture/replay. **Opt-in, default OFF**
+/// (`HIPFIRE_GEMMA4_GRAPH=1` to enable). The 48-layer body + final-norm +
+/// lm_head are captured once and replayed per token, recovering the per-token
+/// host launch overhead. This is the biggest launch-bound lever on gemma4
+/// decode (~720 kernel launches/token).
+///
+/// Capture-safety invariants (mirrors the proven MiniMax / DeepSeek-V4 path):
+///   - token_id is per-token → embedding lookup + √dim scale run OUTSIDE the
+///     capture (token_id is baked into the embedding kernarg).
+///   - position is per-token → staged via `state.pos_host` (stable `Box`); the
+///     captured `memcpy_htod_auto` re-reads it on every replay.
+///   - attention launch geometry is sized for `state.max_seq` (constant), not
+///     the live seq_len, so the baked grid/shared-mem stays valid as the KV
+///     length grows (the kernel reads the true length from `pos_buf[0]+1`).
+pub fn decode_step_with_graph(
     cfg: &Gemma4Config,
     weights: &Gemma4Weights,
     state: &mut Gemma4State,
     gpu: &mut Gpu,
     token_id: u32,
     position: u32,
-    mut capture: Option<&mut [Vec<f32>]>,
+) -> Result<Vec<f32>, String> {
+    use std::sync::OnceLock;
+    static GRAPH_ENV: OnceLock<Option<bool>> = OnceLock::new();
+    let env_override =
+        *GRAPH_ENV.get_or_init(|| match std::env::var("HIPFIRE_GEMMA4_GRAPH").ok().as_deref() {
+            Some("1") => Some(true),
+            Some("0") => Some(false),
+            _ => None,
+        });
+    let graph_on = env_override.unwrap_or(false);
+    if !graph_on {
+        return decode_step(cfg, weights, state, gpu, token_id, position);
+    }
+
+    // Warmup: first decode after a fresh load runs eager (JITs kernels + settles
+    // DPM) and drops any stale graph so the next call captures fresh for THIS
+    // model's weight pointers / device buffers.
+    if !state.ar_warmed_up {
+        state.ar_warmed_up = true;
+        gpu.graphs.graph_exec = None;
+        return decode_step(cfg, weights, state, gpu, token_id, position);
+    }
+
+    // Capture + replay both need an explicit (non-null) stream.
+    if gpu.active_stream.is_none() {
+        let s = gpu
+            .hip
+            .stream_create()
+            .map_err(|e| format!("gemma4 graph: stream_create: {e:?}"))?;
+        gpu.active_stream = Some(s);
+    }
+
+    // Embedding lookup + √dim scale OUTSIDE the captured region — token_id is
+    // baked into the embedding kernarg. Runs on the active stream, ordered
+    // before the captured body that reads `state.x`.
+    embed_lookup(cfg, weights, state, gpu, token_id)?;
+
+    if gpu.graphs.graph_exec.is_none() {
+        // ── Capture phase ──────────────────────────────────────────────
+        // decode_step_body stages pos_host → pos_buf via memcpy_htod_auto
+        // INSIDE the capture, so the recorded memcpy node re-reads pos_host
+        // on each replay.
+        gpu.graphs
+            .begin_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+            .map_err(|e| format!("gemma4 begin_graph_capture: {e:?}"))?;
+        decode_step_body(cfg, weights, state, gpu, position, None)?;
+        gpu.graphs
+            .end_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+            .map_err(|e| format!("gemma4 end_graph_capture: {e:?}"))?;
+        // Captured kernels were RECORDED, not run — launch once so this token's
+        // logits actually get produced.
+        gpu.graphs
+            .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+            .map_err(|e| format!("gemma4 graph_launch (capture): {e:?}"))?;
+        eprintln!(
+            "[gemma4 hipGraph] captured decode forward — {} kernarg blobs retained",
+            gpu.graphs.capture_blobs.len()
+        );
+    } else {
+        // ── Replay phase ───────────────────────────────────────────────
+        // Host-only update of the stable position source; the captured memcpy
+        // re-reads it and propagates to pos_buf (read by rope / kv-write /
+        // attention).
+        state.pos_host[0] = position as i32;
+        gpu.graphs
+            .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+            .map_err(|e| format!("gemma4 graph_launch (replay): {e:?}"))?;
+    }
+    state.n_tokens = position as usize + 1;
+
+    // Logits download is outside the captured region (sync dtoh completes after
+    // the captured kernels, which the device observes on the active stream).
+    gpu.download_f32(&state.logits)
+        .map_err(|e| format!("gemma4 graph: download logits: {e:?}"))
+}
+
+/// Embedding lookup → x, then scale by sqrt(dim). Kept separate from the body
+/// so the hipGraph path can run it OUTSIDE the captured region (token_id is
+/// baked into the embedding kernarg).
+fn embed_lookup(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    token_id: u32,
 ) -> Result<(), String> {
     use hipfire_runtime::llama::EmbeddingFormat;
     let dim = cfg.dim;
-    let eps = cfg.norm_eps;
-
-    // 1) Embedding lookup → x, then scale by sqrt(dim).
     match weights.embd_format {
         EmbeddingFormat::HFQ4G256 => gpu
             .embedding_lookup_hfq4g256(&weights.embed_tokens, &state.x, token_id, dim)
@@ -97,14 +196,31 @@ fn decode_step_body(
     }
     gpu.scale_f32(&state.x, cfg.embed_scale)
         .map_err(|e| format!("gemma4: embed scale: {e:?}"))?;
+    Ok(())
+}
 
-    // 2) Update device pos_buf.
-    let pos_i32 = position as i32;
-    gpu.hip
-        .memcpy_htod(&state.pos_buf, &pos_i32.to_ne_bytes())
-        .map_err(|e| format!("gemma4: htod pos: {e:?}"))?;
+fn decode_step_body(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    position: u32,
+    mut capture: Option<&mut [Vec<f32>]>,
+) -> Result<(), String> {
+    let eps = cfg.norm_eps;
 
-    // 3) Per-layer forward.
+    // Device position scalar (i32). Staged from the heap-stable `state.pos_host`
+    // so the captured memcpy re-reads it on replay (memcpy_htod_auto → async on
+    // the capture stream when capturing).
+    state.pos_host[0] = position as i32;
+    {
+        let pos_bytes =
+            unsafe { std::slice::from_raw_parts(state.pos_host.as_ptr() as *const u8, 4) };
+        gpu.memcpy_htod_auto(&state.pos_buf, pos_bytes)
+            .map_err(|e| format!("gemma4: htod pos: {e:?}"))?;
+    }
+
+    // Per-layer forward.
     for layer_idx in 0..cfg.n_layers {
         let slot = state.kv_slot_for_layer[layer_idx];
         match (cfg.layer_types[layer_idx], &weights.layers[layer_idx]) {

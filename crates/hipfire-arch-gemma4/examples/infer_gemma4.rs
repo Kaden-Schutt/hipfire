@@ -20,7 +20,7 @@ fn main() {
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_arch_gemma4::config::Gemma4Config;
-    use hipfire_arch_gemma4::forward::decode_step;
+    use hipfire_arch_gemma4::forward::{decode_step, decode_step_with_graph};
     use hipfire_arch_gemma4::gemma4::{Gemma4State, Gemma4Weights};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::tokenizer::Tokenizer;
@@ -152,8 +152,10 @@ fn main() {
         }
         gen.push(next);
         history.push(next);
-        logits =
-            decode_step(&cfg, &weights, &mut state, &mut gpu, next, pos as u32).expect("decode");
+        // Decode loop uses the hipGraph path when HIPFIRE_GEMMA4_GRAPH=1
+        // (default off → falls through to eager decode_step internally).
+        logits = decode_step_with_graph(&cfg, &weights, &mut state, &mut gpu, next, pos as u32)
+            .expect("decode");
         pos += 1;
     }
     let dt = t1.elapsed().as_secs_f64();
