@@ -170,15 +170,21 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
-    // HFQ4G256 MMQ set (q8_1_mmq quantize + MMQ tile kernel). HasMmq widens to
-    // gfx906 | RDNA3 | RDNA4 in eval_arch. MMQ (+ mmqscreen) is a valuable path
-    // — keep it. TODO(#397 Ship 5.2): empirically validate the gfx12/RDNA4 MMQ
-    // codepath on hiptrx (and RDNA3 on k9lin, RDNA3.5 on hipx) once wired;
-    // narrow the predicate ONLY if a box empirically fails. Do not disable on
-    // uncertainty.
+    // HFQ4G256 MMQ set (q8_1 activation-quant + integer tile matmul; uses the
+    // i8-WMMA intrinsic on RDNA3/3.5). EMPIRICALLY VERIFIED on the fleet
+    // (#397 Ship 5.1, 2026-06-06):
+    //   - gfx1100/RDNA3 (k9lin):   correct (NRMSE 0.024% vs WMMA) AND 2.1x FASTER
+    //     than WMMA at prefill — a real promote-over-WMMA candidate for 5.2.
+    //   - gfx1151/RDNA3.5 (hipx):  correct (i8-WMMA gated to __gfx1151__).
+    //   - gfx12/RDNA4 (hiptrx):    EMPTY STUB — gemm_hfq4g256_residual_mmq.hip:19
+    //     RDNA3 #if guard excludes gfx12, bodies compile to {} → computes nothing
+    //     (proven garbage, NRMSE ~21000%). MUST NOT admit RDNA4.
+    // Predicate = HasWmmaW32 (RDNA3 + RDNA3.5) = exactly the kernel compile guard.
+    // (Dormant until 5.2 wires GemmFamily; live should_use_mmq already excludes
+    // RDNA4 via has_mmq(), so no live impact today.)
     registry.register(KernelVariant {
         key: KernelKey::GemmHfq4G256MmqSet,
-        arch_required: ArchPredicate::HasMmq,
+        arch_required: ArchPredicate::HasWmmaW32,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
