@@ -1573,6 +1573,16 @@ pub fn forward_scratch(
     }
     gpu.scale_f32(&scratch.x, config.embed_scale)?;
 
+    // Diagnostic: dump first embedding for quality investigation
+    if std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") {
+        let data = gpu.download_f32(&scratch.x).unwrap_or_default();
+        let sum: f64 = data.iter().map(|&v| v as f64).sum();
+        let min = data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+        let max = data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        eprintln!("[gemma4 diag] pos={pos} token={token} embed first8={:?} sum={sum:.4e} min={min:.4} max={max:.4}",
+            &data[..8.min(data.len())]);
+    }
+
     // hipGraph capture/replay policy.
     //   - DEFAULT-OFF for Gemma 4 (until cross-arch / long-context validation).
     //   - Fixed 2026-05-19 (evening): the earlier diagnosis ("kv_len = pos + 1

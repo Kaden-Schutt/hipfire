@@ -717,15 +717,11 @@ impl Tokenizer {
     /// `unwrap_or(0)`. Fix is a separate concern from this PR.
     fn encode_sentencepiece(&self, text: &str) -> Vec<u32> {
         let mut tokens = Vec::new();
-        // SentencePiece convention: spaces become ▁, start of text gets ▁.
-        // Single-pass build: the prior `text.replace(...)` + `format!(...)`
-        // allocated twice; iterating chars and pushing into a pre-sized
-        // String allocates once. ▁ is 3 bytes UTF-8, so the worst case
-        // (all-space input) needs `text.len() * 3 + 3` bytes; typical
-        // inputs fit in the lower-bound hint and the String grows only
-        // if needed.
+        // SentencePiece convention: spaces become ▁.
+        // Do NOT prepend ▁ at start of text — that would make every
+        // token a sentence-start variant, which is wrong for arbitrary
+        // encode calls (e.g. Gemma4).
         let mut sp_text = String::with_capacity(text.len() + 3);
-        sp_text.push('\u{2581}');
         for ch in text.chars() {
             sp_text.push(if ch == ' ' { '\u{2581}' } else { ch });
         }

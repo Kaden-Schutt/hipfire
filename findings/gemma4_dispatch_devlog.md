@@ -195,3 +195,31 @@ Full-attention layers use wrong KV cache dimensions:
    (kv_cache_write_asym_k_givens3_hd512, attention_flash_asym3_tile_hd512)
 2. Allocate full KV cache with correct dimensions (hd=512, n_kv=1)
 3. Verify coherence (no attractor loop)
+
+---
+
+## 2026-06-07 · Session 6 — hd512 kernels + quality investigation
+
+### hd512 kernel port
+- Ported attention_flash_asym3_tile_hd512.hip (+ batched)
+- Ported kv_cache_write_asym_k_givens3_hd512.hip (+ batched)
+- Added GPU methods in gemma4_ext.rs with givens-common include prepending
+- Relaxed asym3 head_dim assertion (256→256||512) in llama.rs
+
+### KV cache now correctly dimensioned
+- Full layers: hd=512, n_kv=1, 740 B/head
+- Sliding layers: hd=256, n_kv=8, 372 B/head
+
+### Quality issue
+Model decodes but output is random tokens (not attractor loop — genuinely
+random, different each prompt). E2B shows same behavior. Likely causes:
+1. Weight loading / dtype mismatch in gemma4.rs loader
+2. lm_head / embed_tokens aliasing issues
+3. embed_scale or RoPE parameter mismatch
+4. RMSNorm epsilon or attention scale
+
+### Next investigation
+- Compare reference activations (HF reference vs hipfire)
+- Check weight loading dtype (HFQ4G256 vs expected format)
+- Verify embed_scale = sqrt(dim) application
+- Test with MQ4 quantization format
