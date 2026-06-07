@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
@@ -8,8 +8,17 @@
 //! cross-engine confound (llama.cpp tokenizer disagrees with hipfire on ~46% of
 //! token positions, plus the DeltaNet-port forward gap).
 //!
-//! Sibling of `hessian_io.rs` (HFHS, the GPTQ Hessian). Mirrors the `HF**`
-//! container convention used by `.hfq` (HFQM) and `.hfhs` (HFHS):
+//! This is the **single source of truth** for the HFIM byte format. It is
+//! depended on by both sides:
+//!   - the native collector (writer) — `hipfire-runtime`'s
+//!     `collect_imatrix_native` example runs hipfire's own f32 oracle forward
+//!     and tokenizer over the calibration corpus, accumulating `Σ act²` at the
+//!     input of every linear, then calls [`Imatrix::write_to_file`].
+//!   - the quantizer (reader) — `hipfire-quantize` calls [`Imatrix::open`] and
+//!     feeds [`ImatrixEntry::rms_act`] into the AWQ scale path.
+//!
+//! Sibling of `hipfire-quantize/src/hessian_io.rs` (HFHS, the GPTQ Hessian).
+//! Mirrors the `HF**` container convention used by `.hfq` (HFQM) and `.hfhs`:
 //!
 //! ```text
 //! Header (20 bytes, little-endian):
@@ -26,8 +35,7 @@
 //! ```
 //!
 //! Consumed by `hipfire-quantize` AWQ: `rms_act[j] = sqrt(sum_sq[j] / count)`,
-//! `s[j] = rms_act[j]^α`. Written by the native f32-oracle collector (which
-//! runs hipfire's own forward + tokenizer over the calib corpus).
+//! `s[j] = rms_act[j]^α`.
 
 use byteorder::{ByteOrder, LittleEndian};
 use std::collections::HashMap;
@@ -175,8 +183,34 @@ impl Imatrix {
         out
     }
 
+    /// Write the HFIM to `path` (collector convenience).
+    pub fn write_to_file<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
+        std::fs::write(path, self.to_bytes())
+    }
+
     pub fn get(&self, name: &str) -> Option<&ImatrixEntry> {
         self.tensors.get(name)
+    }
+
+    /// Build an `Imatrix` from a raw accumulator: a map of
+    /// `tensor_name -> (Σ act² as f64 per channel, token count)`. The collector
+    /// keeps f64 sums on the host for accumulation precision; HFIM stores f32
+    /// (the AWQ pow is well-conditioned at f32). `n_tokens` is the total number
+    /// of calibration tokens processed (distinct from per-tensor `count`, which
+    /// equals the number of forward applications of that specific tensor).
+    pub fn from_accum(
+        accum: &HashMap<String, (Vec<f64>, u64)>,
+        n_tokens: u64,
+    ) -> Self {
+        let mut tensors = HashMap::with_capacity(accum.len());
+        for (name, (sum_sq_f64, count)) in accum {
+            let sum_sq: Vec<f32> = sum_sq_f64.iter().map(|&v| v as f32).collect();
+            tensors.insert(
+                name.clone(),
+                ImatrixEntry { in_dim: sum_sq.len() as u32, count: *count, sum_sq },
+            );
+        }
+        Imatrix { n_tokens, tensors }
     }
 }
 
@@ -207,5 +241,17 @@ mod tests {
     fn rejects_bad_magic() {
         let bad = vec![0u8; 20];
         assert!(matches!(Imatrix::from_bytes(&bad), Err(ImatrixError::InvalidMagic(_))));
+    }
+
+    #[test]
+    fn from_accum_builds_entries() {
+        let mut accum: HashMap<String, (Vec<f64>, u64)> = HashMap::new();
+        accum.insert("w.a".to_string(), (vec![2.0, 8.0], 4));
+        let im = Imatrix::from_accum(&accum, 4);
+        let e = im.get("w.a").unwrap();
+        assert_eq!(e.count, 4);
+        assert_eq!(e.sum_sq, vec![2.0f32, 8.0]);
+        // rms = sqrt(8/4) = sqrt(2)
+        assert!((e.rms_act()[1] - 2.0f64.sqrt()).abs() < 1e-9);
     }
 }

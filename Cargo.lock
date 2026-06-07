@@ -232,10 +232,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-imatrix"
+version = "0.2.0"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "hipfire-quantize"
 version = "0.2.0"
 dependencies = [
  "byteorder",
+ "hipfire-imatrix",
  "memmap2",
  "rayon",
  "serde",
@@ -257,6 +265,7 @@ dependencies = [
  "hipfire-arch-qwen35-vl",
  "hipfire-atlas",
  "hipfire-detect",
+ "hipfire-imatrix",
  "libc",
  "memmap2",
  "minijinja",

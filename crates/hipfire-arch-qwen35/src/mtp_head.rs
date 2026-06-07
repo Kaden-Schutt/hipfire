@@ -1133,6 +1133,7 @@ fn weight_tensor_from_raw(
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ4G256,
                 m,
@@ -1147,6 +1148,7 @@ fn weight_tensor_from_raw(
             // GGML Q8_0; existing gemv_q8_0 dispatch works directly.
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::Q8_0,
                 m,
@@ -1168,6 +1170,7 @@ fn weight_tensor_from_raw(
             };
             let buf = gpu.upload_raw(bytes, &[m, k])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::F32,
                 m,
@@ -1181,6 +1184,7 @@ fn weight_tensor_from_raw(
             // F32 raw.
             let buf = gpu.upload_raw(data, &[m, k])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::F32,
                 m,

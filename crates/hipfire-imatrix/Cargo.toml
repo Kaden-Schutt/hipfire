@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-imatrix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HFIM — HipFire native (non-GGUF) imatrix container: per-tensor activation importance (Σ act²) for AWQ scale computation. Shared by the native collector (writer, in hipfire-runtime) and the quantizer (reader, in hipfire-quantize)."
+
+[dependencies]
+byteorder = "1"

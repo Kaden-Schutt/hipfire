@@ -1228,6 +1228,7 @@ fn load_weight_tensor_raw(
         6 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::HFQ4G256,
                 m,
@@ -1240,6 +1241,7 @@ fn load_weight_tensor_raw(
         7 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::HFQ4G128,
                 m,
@@ -1257,6 +1259,7 @@ fn load_weight_tensor_raw(
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::PARO4G128,
                 m,
@@ -1274,6 +1277,7 @@ fn load_weight_tensor_raw(
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::PARO4G128T,
                 m,
@@ -1286,6 +1290,7 @@ fn load_weight_tensor_raw(
         8 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::HFQ6G256,
                 m,
@@ -1298,6 +1303,7 @@ fn load_weight_tensor_raw(
         11 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::HFQ3G256,
                 m,
@@ -1310,6 +1316,7 @@ fn load_weight_tensor_raw(
         12 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::HFQ3G128,
                 m,
@@ -1323,6 +1330,7 @@ fn load_weight_tensor_raw(
             // MQ4-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ4G256,
                 m,
@@ -1336,6 +1344,7 @@ fn load_weight_tensor_raw(
             // MQ8-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ8G256,
                 m,
@@ -1349,6 +1358,7 @@ fn load_weight_tensor_raw(
             // MQ6-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ6G256,
                 m,
@@ -1362,6 +1372,7 @@ fn load_weight_tensor_raw(
             // MQ3-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ3G256,
                 m,
@@ -1375,6 +1386,7 @@ fn load_weight_tensor_raw(
             // MQ2-G256
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ2G256,
                 m,
@@ -1388,6 +1400,7 @@ fn load_weight_tensor_raw(
             // MQ2-G256-Lloyd — 2-bit + 4-entry fp16 codebook (72 bytes/group)
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ2G256Lloyd,
                 m,
@@ -1401,6 +1414,7 @@ fn load_weight_tensor_raw(
             // MQ3-G256-Lloyd — 3-bit + 8-entry fp16 codebook (112 bytes/group)
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ3G256Lloyd,
                 m,
@@ -1415,6 +1429,7 @@ fn load_weight_tensor_raw(
             // Renumbered from qt 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ4G256Lloyd,
                 m,
@@ -1435,6 +1450,7 @@ fn load_weight_tensor_raw(
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::HFP4G32,
                 m,
@@ -1453,6 +1469,7 @@ fn load_weight_tensor_raw(
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MFP4G32,
                 m,
@@ -1465,6 +1482,7 @@ fn load_weight_tensor_raw(
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::Q8_0,
                 m,
@@ -1483,6 +1501,7 @@ fn load_weight_tensor_raw(
                 // HIPFIRE_LM_HEAD_F16=f32 to force the legacy F32 expansion.
                 let buf = gpu.upload_raw(data, &[data.len()])?;
                 Ok(WeightTensor {
+                    name: String::new(),
                     buf,
                     gpu_dtype: DType::F16,
                     m,
@@ -1502,6 +1521,7 @@ fn load_weight_tensor_raw(
                 };
                 let buf = gpu.upload_raw(bytes, &[m, k])?;
                 Ok(WeightTensor {
+                    name: String::new(),
                     buf,
                     gpu_dtype: DType::F32,
                     m,
@@ -1519,6 +1539,7 @@ fn load_weight_tensor_raw(
             // reference path (no quantization).
             let buf = gpu.upload_raw(data, &[m, k])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::F32,
                 m,
@@ -1545,6 +1566,7 @@ fn load_weight_tensor_raw(
             };
             let buf = gpu.upload_raw(bytes, &[m, k])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::F32,
                 m,
@@ -1645,6 +1667,9 @@ fn load_weight_tensor(
                 wt.awq_scale = load_awq_scale_for(hfq, gpu, name, k);
             }
         }
+        // Native imatrix collection keys per-channel Σact² by this canonical
+        // name (== the name the quantizer looks up), so HFIM needs no remap.
+        wt.name = name.to_string();
         return Ok(wt);
     }
     #[cfg(not(unix))]
@@ -1664,6 +1689,7 @@ fn load_weight_tensor(
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
+        wt.name = name.to_string();
         Ok(wt)
     }
 }
@@ -1822,6 +1848,7 @@ fn load_paroquant_weight(
     let channel_scales = gpu.upload_raw(cs_data, &[cs_data.len()])?;
 
     Ok(WeightTensor {
+        name: String::new(),
         buf,
         gpu_dtype: DType::ParoQ4G128,
         m: out_dim,
@@ -1860,6 +1887,7 @@ fn load_fp16_weight_from_source(
         unsafe { std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4) };
     let buf = gpu.upload_raw(bytes, &[m, k])?;
     Ok(WeightTensor {
+        name: String::new(),
         buf,
         gpu_dtype: DType::F32,
         m,
@@ -2078,6 +2106,7 @@ fn paro_load_moe_ffn(
         let down_buf = gpu.upload_raw(&down_bytes, &[down_bytes.len()])?;
 
         let gate_up = WeightTensor {
+            name: String::new(),
             buf: gate_up_buf,
             gpu_dtype: DType::ParoQ4G128,
             m: 2 * mi,
@@ -2093,6 +2122,7 @@ fn paro_load_moe_ffn(
             awq_scale: None,
         };
         let down = WeightTensor {
+            name: String::new(),
             buf: down_buf,
             gpu_dtype: DType::ParoQ4G128,
             m: dim,
@@ -2786,6 +2816,7 @@ pub fn load_weights(
                 _ => unreachable!(),
             };
             WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: dtype,
                 m: config.vocab_size,
@@ -2797,6 +2828,7 @@ pub fn load_weights(
         } else if embd_qt == 13 {
             let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
             WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ4G256,
                 m: config.vocab_size,
@@ -2808,6 +2840,7 @@ pub fn load_weights(
         } else if embd_qt == 14 {
             let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
             WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ8G256,
                 m: config.vocab_size,
@@ -2819,6 +2852,7 @@ pub fn load_weights(
         } else if embd_qt == 3 {
             let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
             WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::Q8_0,
                 m: config.vocab_size,
@@ -2837,6 +2871,7 @@ pub fn load_weights(
             };
             let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
             WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::F32,
                 m: config.vocab_size,
@@ -3387,6 +3422,7 @@ pub fn load_weights_paroquant(
             unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
         let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
         WeightTensor {
+            name: String::new(),
             buf,
             gpu_dtype: DType::F32,
             m: config.vocab_size,
@@ -3919,6 +3955,7 @@ fn load_output_into(
                 _ => unreachable!(),
             };
             WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: dtype,
                 m: config.vocab_size,
@@ -3930,6 +3967,7 @@ fn load_output_into(
         } else if embd_info.0.quant_type == 13 {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
             WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ4G256,
                 m: config.vocab_size,
@@ -3941,6 +3979,7 @@ fn load_output_into(
         } else if embd_info.0.quant_type == 14 {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
             WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ8G256,
                 m: config.vocab_size,
@@ -3952,6 +3991,7 @@ fn load_output_into(
         } else if embd_info.0.quant_type == 3 {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
             WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::Q8_0,
                 m: config.vocab_size,
@@ -3970,6 +4010,7 @@ fn load_output_into(
             };
             let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
             WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::F32,
                 m: config.vocab_size,

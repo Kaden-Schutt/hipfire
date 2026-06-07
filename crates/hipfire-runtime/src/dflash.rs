@@ -230,6 +230,7 @@ fn hfq_weight(
                 );
                 let buf = gpu.upload_raw(data, &[m * k])?;
                 Ok(WeightTensor {
+                    name: String::new(),
                     buf,
                     gpu_dtype: DType::F16,
                     m,
@@ -246,6 +247,7 @@ fn hfq_weight(
                 assert_eq!(f32_data.len(), m * k, "dflash {name} F16 size mismatch");
                 let buf = gpu.upload_f32(&f32_data, &[m * k])?;
                 Ok(WeightTensor {
+                    name: String::new(),
                     buf,
                     gpu_dtype: DType::F32,
                     m,
@@ -264,6 +266,7 @@ fn hfq_weight(
             assert_eq!(f32_data.len(), m * k, "dflash {name} F32 size mismatch");
             let buf = gpu.upload_f32(&f32_data, &[m * k])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::F32,
                 m,
@@ -278,6 +281,7 @@ fn hfq_weight(
             // the engine; the gemm_hfq4g256 kernel reads it directly.
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ4G256,
                 m,
@@ -292,6 +296,7 @@ fn hfq_weight(
             // as MQ4/MQ3; dispatch rotates activations and calls HFQ6 GEMM.
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ6G256,
                 m,
@@ -307,6 +312,7 @@ fn hfq_weight(
             // `rotate_x_mq_batched` + `gemm_hfq3g256_batched_lmhead`.
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
+                name: String::new(),
                 buf,
                 gpu_dtype: DType::MQ3G256,
                 m,

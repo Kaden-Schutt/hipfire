@@ -25,8 +25,8 @@ pub mod profiler;
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{
-    gen_fwht_signs, DType, Gpu, GpuTensor, LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES,
-    MMQ_CURRENT_LAYER,
+    gen_fwht_signs, DType, Gpu, GpuTensor, ImatrixCapture, LLOYD_MQ3_GROUP_BYTES,
+    LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER,
 };
 pub use feature_flags::FeatureFlags;
 pub use kernels::GEMV_SRC;

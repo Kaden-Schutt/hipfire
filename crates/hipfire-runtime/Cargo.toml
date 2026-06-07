@@ -52,6 +52,8 @@ arch-dots-ocr = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+# HFIM native imatrix container — the `collect_imatrix_native` example writes it.
+hipfire-imatrix = { path = "../hipfire-imatrix" }
 memmap2 = "0.9"
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }
@@ -315,6 +317,14 @@ required-features = []
 # F32 oracle forward and writes the SAME HFKLDR format eval_hipfire consumes.
 [[example]]
 name = "build_kld_ref_native"
+required-features = ["arch-qwen35", "deltanet"]
+
+# collect_imatrix_native — hipfire-NATIVE imatrix (HFIM) collector. Runs the
+# f32 oracle forward + hipfire tokenizer over a calibration slice, captures
+# Σ act² per linear input at the weight_gemv chokepoint, writes HFIM consumed by
+# `hipfire-quantize --imatrix-hfim`. Removes the llama.cpp/GGUF imatrix confound.
+[[example]]
+name = "collect_imatrix_native"
 required-features = ["arch-qwen35", "deltanet"]
 
 # eval_hipfire_fullvocab (F3) — FULL-VOCAB KLD of a hipfire quant vs the hipfire

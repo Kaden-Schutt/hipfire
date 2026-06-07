@@ -538,6 +538,14 @@ pub struct WeightTensor {
     /// `None` for tensors that weren't AWQ-pre-scaled — backward-compatible
     /// with all existing .hfq files.
     pub awq_scale: Option<GpuTensor>,
+    /// HipFire-native tensor name (e.g.
+    /// `model.language_model.layers.3.self_attn.q_proj.weight`). Populated by
+    /// the loaders that receive a name; empty (`String::new()`) for inline /
+    /// fused / aliased constructions that carry no canonical name. Used only by
+    /// native imatrix collection (`Gpu.imatrix_capture`) to key per-channel
+    /// `Σ act²` by the same name the quantizer looks up — so HFIM needs no
+    /// GGUF↔safetensors remap. Not on any hot path otherwise.
+    pub name: String,
 }
 
 impl WeightTensor {
@@ -620,6 +628,20 @@ impl LlamaWeights {
 }
 
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
+    // Native imatrix collection (the single chokepoint). Off in production: one
+    // predictable-false `is_some()` branch per call. `x` here is the RAW input
+    // the linear consumes — pre-rotation and pre-AWQ-scale — because FWHT
+    // rotation and the `x/awq_scale` divide happen INSIDE the per-dtype MQ arms
+    // below (or in the fused rmsnorm upstream), NOT for the F32 path the
+    // collector runs. So Σx² captured here is exactly the AWQ basis. Keyed by
+    // the weight's hipfire-native name (== the quantizer's lookup key).
+    if gpu.imatrix_capture.is_some() && !w.name.is_empty() {
+        let xs = gpu.download_f32(x)?;
+        let k = w.k;
+        if let Some(cap) = gpu.imatrix_capture.as_mut() {
+            cap.accumulate(&w.name, &xs, k);
+        }
+    }
     match w.gpu_dtype {
         DType::F32 => gpu.gemv_f32(&w.buf, x, y),
         DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, 1),
@@ -2761,6 +2783,7 @@ pub fn load_weights(
             GgmlType::Q4K => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
                 Ok(WeightTensor {
+                    name: String::new(),
                     buf,
                     gpu_dtype: DType::Q4K,
                     m,
@@ -2773,6 +2796,7 @@ pub fn load_weights(
             GgmlType::Q6K => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
                 Ok(WeightTensor {
+                    name: String::new(),
                     buf,
                     gpu_dtype: DType::Q6K,
                     m,
@@ -2785,6 +2809,7 @@ pub fn load_weights(
             GgmlType::Q8_0 => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
                 Ok(WeightTensor {
+                    name: String::new(),
                     buf,
                     gpu_dtype: DType::Q8_0,
                     m,
@@ -2797,6 +2822,7 @@ pub fn load_weights(
             GgmlType::F32 => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
                 Ok(WeightTensor {
+                    name: String::new(),
                     buf,
                     gpu_dtype: DType::F32,
                     m,
@@ -2814,6 +2840,7 @@ pub fn load_weights(
                 };
                 let buf = gpu.upload_raw(bytes, &[bytes.len()])?;
                 Ok(WeightTensor {
+                    name: String::new(),
                     buf,
                     gpu_dtype: DType::F32,
                     m,
@@ -2856,6 +2883,7 @@ pub fn load_weights(
         let data = load_tensor_f32(gguf, info);
         let buf = gpu.upload_f32(&data, &[config.vocab_size, config.dim])?;
         WeightTensor {
+            name: String::new(),
             buf,
             gpu_dtype: DType::F32,
             m: config.vocab_size,

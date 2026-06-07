@@ -346,6 +346,56 @@ pub struct Gpu {
     /// Only populated on CDNA3 when rocBLAS loaded — 4× VRAM blow-up vs MQ4
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
+
+    /// Native imatrix collection. `None` in production (zero overhead — a
+    /// single `is_some()` branch per `weight_gemv`). The `collect_imatrix_native`
+    /// example sets this to `Some(default)` before running the f32 oracle
+    /// forward; every `weight_gemv` call then accumulates `Σ act²` per input
+    /// channel, keyed by the weight's hipfire-native name. Serialized to HFIM
+    /// (see `hipfire-imatrix`) after the calibration pass. See
+    /// `crates/hipfire-runtime/src/llama.rs::weight_gemv` for the hook.
+    pub imatrix_capture: Option<ImatrixCapture>,
+}
+
+/// Host-side accumulator for native imatrix collection. Lives on `Gpu` so the
+/// single `weight_gemv` chokepoint can reach it without threading a parameter
+/// through every forward path. Pure host data — no GPU resources.
+///
+/// Per-channel sums are kept in f64 for accumulation precision over thousands
+/// of calibration tokens; the HFIM container downcasts to f32 at write time
+/// (the AWQ `rms_act^α` pow is well-conditioned at f32).
+#[derive(Debug, Default)]
+pub struct ImatrixCapture {
+    /// `tensor_name -> (Σ act²[channel] as f64, application count)`. `count` is
+    /// the number of times this specific tensor's `weight_gemv` ran (== tokens
+    /// for a decode pass, since each token applies each weight once).
+    pub entries: HashMap<String, (Vec<f64>, u64)>,
+    /// Total calibration tokens processed (the collector increments this once
+    /// per forward step).
+    pub n_tokens: u64,
+}
+
+impl ImatrixCapture {
+    /// Accumulate one activation vector for `name`. `x` is the raw (pre-rotation,
+    /// pre-AWQ-scale) input the linear consumed; only the first `k` channels are
+    /// used (scratch buffers may be padded beyond the logical input dim).
+    pub fn accumulate(&mut self, name: &str, x: &[f32], k: usize) {
+        let k = k.min(x.len());
+        let entry = self
+            .entries
+            .entry(name.to_string())
+            .or_insert_with(|| (vec![0.0f64; k], 0));
+        // First-seen wins the channel count; guard against a later differently
+        // padded view by extending if needed (should not happen for a fixed K).
+        if entry.0.len() < k {
+            entry.0.resize(k, 0.0);
+        }
+        for j in 0..k {
+            let v = x[j] as f64;
+            entry.0[j] += v * v;
+        }
+        entry.1 += 1;
+    }
 }
 
 /// Generate `n` FWHT sign values (+1.0 / -1.0) from a simple LCG seeded with `seed`.
@@ -575,6 +625,7 @@ impl Gpu {
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            imatrix_capture: None,
         }).map(|mut gpu| {
             if gpu.flags.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");

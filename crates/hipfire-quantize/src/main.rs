@@ -12,7 +12,7 @@
 //! RDNA-native quantized weights.
 
 mod gguf_input;
-mod imatrix_io;
+use hipfire_imatrix as imatrix_io;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -3835,6 +3835,37 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
     map
 }
 
+/// Load a hipfire-native HFIM imatrix into the same `HashMap<name, Σact²>`
+/// shape `load_imatrix` produces, so the rest of the AWQ path is identical.
+///
+/// HFIM stores `sum_sq` (Σ_token act²) + `count` per tensor. The IMATRIX map
+/// value is exactly `Σact²` (the GGUF `.in_sum2` semantics) — `compute_awq_scales`
+/// absorbs the per-tensor `N_tok` constant into its geo-mean normalization, so
+/// passing the raw `sum_sq` is equivalent to passing `sum_sq/count`. Keys are
+/// the canonical hipfire-native tensor names the loader uses, which
+/// `imatrix_weights_for` tries FIRST — direct hit, no remap.
+fn load_imatrix_hfim(path: &Path) -> HashMap<String, Vec<f32>> {
+    let im = imatrix_io::Imatrix::open(path).unwrap_or_else(|e| {
+        eprintln!("error: failed to open HFIM imatrix {}: {e}", path.display());
+        std::process::exit(1);
+    });
+    let mut map: HashMap<String, Vec<f32>> = HashMap::new();
+    for (name, entry) in &im.tensors {
+        map.insert(name.clone(), entry.sum_sq.clone());
+    }
+    if map.is_empty() {
+        eprintln!("error: HFIM imatrix file contains no tensors");
+        std::process::exit(1);
+    }
+    eprintln!(
+        "HFIM imatrix: {} tensors, {} calib tokens, from {}",
+        map.len(),
+        im.n_tokens,
+        path.display(),
+    );
+    map
+}
+
 /// Look up imatrix per-channel weights for a given safetensors tensor name.
 /// Returns `None` (caller falls back to non-imatrix-weighted quantization) if:
 ///   - --imatrix wasn't passed (IMATRIX not initialized), OR
@@ -5068,6 +5099,21 @@ fn main() {
         .position(|a| a == "--imatrix")
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
+    // --imatrix-hfim <path>: load a hipfire-NATIVE HFIM imatrix (produced by
+    // `hipfire-runtime`'s `collect_imatrix_native`, which runs hipfire's own
+    // f32 oracle forward + tokenizer over the calibration corpus). Keyed by the
+    // SAME canonical tensor names the loader uses, so the AWQ lookup
+    // (`imatrix_weights_for`) hits directly — no GGUF↔safetensors remap, which
+    // is the confound HFIM removes. Mutually exclusive with --imatrix.
+    let imatrix_hfim_path = args
+        .iter()
+        .position(|a| a == "--imatrix-hfim")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from);
+    if imatrix_path.is_some() && imatrix_hfim_path.is_some() {
+        eprintln!("error: pass only one of --imatrix (GGUF) or --imatrix-hfim (native)");
+        std::process::exit(1);
+    }
     if let Some(path) = &imatrix_path {
         if !path.exists() {
             eprintln!("error: --imatrix path not found: {}", path.display());
@@ -5078,6 +5124,17 @@ fn main() {
             .set(table)
             .expect("IMATRIX set twice — should not happen");
         eprintln!("imatrix loaded from {}", path.display());
+    }
+    if let Some(path) = &imatrix_hfim_path {
+        if !path.exists() {
+            eprintln!("error: --imatrix-hfim path not found: {}", path.display());
+            std::process::exit(1);
+        }
+        let table = load_imatrix_hfim(path);
+        IMATRIX
+            .set(table)
+            .expect("IMATRIX set twice — should not happen");
+        eprintln!("native HFIM imatrix loaded from {}", path.display());
     }
 
     // ── Phase A Stage A: AWQ (Activation-aware Weight Quantization) ──
