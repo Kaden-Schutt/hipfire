@@ -56,9 +56,20 @@ def parse_args():
 def main():
     args = parse_args()
     torch.manual_seed(args.seed)
-    n_layers, hidden = 2, 256
+    # FAITHFUL tiny dims (so the oracle reproduces real-model bugs the original
+    # 2-layer/2:1 config masked): 8:1 GQA (16 q / 2 kv heads), multi-group FWHT
+    # (hidden 512 = 2× G256), and the 1:3 full:sliding pattern with a NoPE
+    # full-attention MoE layer (L4) plus a force-RoPE dense layer (L0).
+    n_layers, hidden = 5, 512
     moe_inter, dense_inter = 256, 512
     n_exp, k_top = 16, 8  # top-8 matches the hardcoded `_k8` indexed-MoE kernels
+    layer_types = [
+        "full_attention",     # L0 dense → force_rope (prefix_dense pattern==1)
+        "sliding_attention",  # L1 MoE  → RoPE
+        "sliding_attention",  # L2 MoE  → RoPE
+        "sliding_attention",  # L3 MoE  → RoPE
+        "full_attention",     # L4 MoE  → NoPE (global, non-dense)
+    ]
 
     # Build the config defensively: different transformers point-releases name a
     # few fields slightly differently. Start from the known BLS-Mini-Code fields.
@@ -68,12 +79,14 @@ def main():
         intermediate_size=moe_inter,
         prefix_dense_intermediate_size=dense_inter,
         num_hidden_layers=n_layers,
-        num_attention_heads=4,
+        num_attention_heads=16,
         num_key_value_heads=2,
         head_dim=128,
         num_experts=n_exp,
         num_experts_per_tok=k_top,
         first_k_dense_replace=1,
+        prefix_dense_sliding_window_pattern=1,
+        layer_types=layer_types,
         expert_selection_fn="sigmoid",
         norm_topk_prob=False,
         use_parallel_block=True,
@@ -173,12 +186,14 @@ def main():
         intermediate_size=moe_inter,
         prefix_dense_intermediate_size=dense_inter,
         num_hidden_layers=n_layers,
-        num_attention_heads=4,
+        num_attention_heads=16,
         num_key_value_heads=2,
         head_dim=128,
         num_experts=n_exp,
         num_experts_per_tok=k_top,
         first_k_dense_replace=1,
+        prefix_dense_sliding_window_pattern=1,
+        layer_types=layer_types,
         expert_selection_fn="sigmoid",
         norm_topk_prob=False,
         use_parallel_block=True,
