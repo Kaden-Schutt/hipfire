@@ -61,6 +61,13 @@ describe("scheduler policy", () => {
     expect(policy.targetPairTokens).toBe(64);
   });
 
+  test("legacy server batch max feeds worker scheduler max", () => {
+    const policy = schedulerPolicyForPriority(64, {
+      HIPFIRE_SERVER_PREFILL_BATCH_MAX: "2",
+    });
+    expect(policy.maxBatchSize).toBe(2);
+  });
+
   test("legacy batch-wait env maps to interactive and backgrounds to a stable default", () => {
     const legacyOnly = schedulerPolicyForPriority(64, {
       HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS: "9",

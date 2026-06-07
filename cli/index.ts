@@ -1737,7 +1737,7 @@ async function serve(port: number, host: string) {
     );
     if (generateBatchPrefillCapability === "supported") {
       console.error(
-        "[hipfire] daemon generate_batch_prefill serial prefill is available; server dispatch is enabled for single selected sessions (multi-session queue-worker dispatch pending)",
+        "[hipfire] daemon generate_batch_prefill serial prefill is available; server dispatch is enabled for compatible non-streaming batches",
       );
     } else {
       console.error(
@@ -1762,6 +1762,19 @@ async function serve(port: number, host: string) {
   let currentStateMode: string | null = null;
   const workerPrefillSchedulers = new Map<string, PriorityPrefillScheduler>();
   const workerStateCaches = new Map<string, Map<string, PrefixCheckpointManifest>>();
+  type PendingPrefillOutcome = {
+    prefillTokens: number;
+    elapsedMs: number;
+    selectedBatchSize: number;
+  };
+  type PendingPrefillRequest = {
+    session: RequestSessionDraft;
+    prefillSession: any;
+    resolve: (outcome: PendingPrefillOutcome) => void;
+    reject: (err: Error) => void;
+    promise: Promise<PendingPrefillOutcome>;
+  };
+  const pendingPrefillRequests = new Map<string, PendingPrefillRequest>();
   const fallbackStateCacheStore = new Map<string, PrefixCheckpointManifest>();
   const getWorkerId = (workerKey: ModelWorkerKey): string => modelWorkerKeyId(workerKey);
   const getWorkerPrefillScheduler = (workerKey: ModelWorkerKey | null): PriorityPrefillScheduler | undefined => {
@@ -2965,6 +2978,7 @@ async function serve(port: number, host: string) {
         let selectedByScheduler = false;
         let queuePreviewReason: "selected" | "waiting" | "insufficient_queue" | "not_eligible" = "not_eligible";
         let selectedBatchSize = 0;
+        let selectedBatchSessions: RequestSessionDraft[] = [];
         let fallbackReason = "not_applicable";
         let runtimeDispatchSkippedReason = "not_applicable";
         let cacheHit = false;
@@ -2972,6 +2986,7 @@ async function serve(port: number, host: string) {
         let cacheKey: string | null = null;
         let spillable = false;
         let spillReason = "state_cache_disabled";
+        let servingWorkerScheduler: PriorityPrefillScheduler | undefined;
         if (serverPrefillBatch.enabled) {
           prefillBatchMetrics.queued += 1;
           const promptTokens = approximatePromptTokenIds(userPrompt);
@@ -2996,7 +3011,7 @@ async function serve(port: number, host: string) {
             featureFlags: stateFlags,
           };
 
-          const servingWorkerScheduler = getWorkerPrefillScheduler(servingWorkerKey);
+          servingWorkerScheduler = getWorkerPrefillScheduler(servingWorkerKey);
           const servingWorkerStateCache = getWorkerStateCache(servingWorkerKey);
           if (prefillBatchGate.eligible && current !== null) {
             prefillBatchMetrics.eligible += 1;
@@ -3109,6 +3124,7 @@ async function serve(port: number, host: string) {
                   selectedByScheduler = true;
                   queuePreviewReason = "selected";
                   selectedBatchSize = next.sessions.length;
+                  selectedBatchSessions = next.sessions;
                   prefillBatchMetrics.selected += 1;
                 } else {
                   queuePreviewReason = preview ? "waiting" : "insufficient_queue";
@@ -3120,8 +3136,14 @@ async function serve(port: number, host: string) {
                 }
               } else {
                 queuePreviewReason = preview ? "waiting" : "insufficient_queue";
-                prefillBatchMetrics.skipped += 1;
-                servingWorkerScheduler.cancel(reqId);
+                if (
+                  generateBatchPrefillCapability !== "supported" ||
+                  body.stream ||
+                  isResponsesRequest
+                ) {
+                  prefillBatchMetrics.skipped += 1;
+                  servingWorkerScheduler.cancel(reqId);
+                }
               }
             } else {
               queuePreviewReason = "insufficient_queue";
@@ -3165,7 +3187,7 @@ async function serve(port: number, host: string) {
           fallbackReason = `queue_wait:${queuePreviewReason}`;
           lastPrefillQueueWaitReason = queuePreviewReason;
           lastPrefillFallbackReason = fallbackReason;
-          lastSelectedBatchSize = 0;
+          lastSelectedBatchSize = selectedBatchSize;
           if (generateBatchPrefillCapability !== "supported") {
             lastPrefillRuntimeDispatchSkippedReason = prefillBatchRuntimeDispatchStatus(
               true,
@@ -3384,37 +3406,60 @@ async function serve(port: number, host: string) {
 
         if (
           serverPrefillBatch.enabled &&
-          selectedForPrefillBatch &&
           serverPrefillSession &&
           generateBatchPrefillCapability === "supported"
         ) {
-          if (selectedBatchSize === 1) {
-            const runtimeBatchId = `prefill-${reqId}`;
-            const sessionParams: any = {
-              max_tokens: requestMaxTokens,
-              temperature: genParams.temperature,
+          const sessionParams: any = {
+            max_tokens: requestMaxTokens,
+            temperature: genParams.temperature,
+          };
+          if (genParams.assistant_prefix) sessionParams.assistant_prefix = genParams.assistant_prefix;
+          if (typeof genParams.max_think_tokens === "number") {
+            sessionParams.max_think_tokens = genParams.max_think_tokens;
+          }
+          const buildDaemonPrefillSession = (draft: RequestSessionDraft): any => {
+            const payload: any = {
+              id: draft.id,
+              state_handle: {
+                state_kinds: [...draft.stateHandle.stateKinds],
+                logical_position: draft.stateHandle.logicalPosition,
+                cached_prefix_tokens: draft.stateHandle.cachedPrefixTokens,
+              },
+              params: sessionParams,
             };
-            if (genParams.assistant_prefix) sessionParams.assistant_prefix = genParams.assistant_prefix;
-            if (typeof genParams.max_think_tokens === "number") {
-              sessionParams.max_think_tokens = genParams.max_think_tokens;
+            if (draft.cachedPrefixTokens > 0) {
+              payload.suffix_tokens = draft.suffixTokens;
+            } else {
+              payload.prompt = userPrompt;
             }
+            if (systemPrompt) payload.system = systemPrompt;
+            if (Array.isArray(body.tools) && body.tools.length > 0) {
+              payload.tools = body.tools;
+            }
+            if (structuredMessages.length > 0) {
+              payload.messages = structuredMessages;
+            }
+            return payload;
+          };
+
+          if (selectedForPrefillBatch) {
+            const runtimeBatchId = `prefill-${reqId}`;
             try {
-              const prefillSession: any = {
-                id: reqId,
-                prompt: userPrompt,
-                state_handle: {
-                  state_kinds: [...serverPrefillSession.stateHandle.stateKinds],
-                  logical_position: 0,
-                  cached_prefix_tokens: 0,
-                },
-                params: sessionParams,
-              };
-              if (systemPrompt) prefillSession.system = systemPrompt;
-              if (Array.isArray(body.tools) && body.tools.length > 0) {
-                prefillSession.tools = body.tools;
-              }
-              if (structuredMessages.length > 0) {
-                prefillSession.messages = structuredMessages;
+              const currentPrefillSession = buildDaemonPrefillSession(serverPrefillSession);
+              const selectedSessions = selectedBatchSessions.length > 0
+                ? selectedBatchSessions
+                : [serverPrefillSession];
+              const daemonSessions: any[] = [];
+              for (const selected of selectedSessions) {
+                if (selected.id === reqId) {
+                  daemonSessions.push(currentPrefillSession);
+                  continue;
+                }
+                const pending = pendingPrefillRequests.get(selected.id);
+                if (!pending) {
+                  throw new Error(`selected prefill session ${selected.id} is not pending`);
+                }
+                daemonSessions.push(pending.prefillSession);
               }
 
               await e.send({
@@ -3423,10 +3468,11 @@ async function serve(port: number, host: string) {
                 batch_id: runtimeBatchId,
                 worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
                 model: current,
-                sessions: [prefillSession],
+                sessions: daemonSessions,
               });
 
               let prefillDone = false;
+              const sessionPrefillTokens = new Map<string, number>();
               for (let i = 0; i < 8; i++) {
                 const prefillMsg = await e.recv();
                 if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === runtimeBatchId) {
@@ -3440,7 +3486,13 @@ async function serve(port: number, host: string) {
                   }
                   break;
                 }
-                if (prefillMsg?.type === "generate_batch_prefill_started" || prefillMsg?.type === "generate_batch_prefill_session_done") {
+                if (prefillMsg?.type === "generate_batch_prefill_session_done") {
+                  if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.prefill_tokens === "number") {
+                    sessionPrefillTokens.set(prefillMsg.session_id, prefillMsg.prefill_tokens);
+                  }
+                  continue;
+                }
+                if (prefillMsg?.type === "generate_batch_prefill_started") {
                   continue;
                 }
                 if (prefillMsg?.type === "error") {
@@ -3455,6 +3507,18 @@ async function serve(port: number, host: string) {
               genParams.session_id = reqId;
               genParams.prefill_already_done = true;
               lastPrefillRuntimeDispatchSkippedReason = "not_skipped";
+              lastSelectedBatchSize = selectedSessions.length;
+              for (const selected of selectedSessions) {
+                if (selected.id === reqId) continue;
+                const pending = pendingPrefillRequests.get(selected.id);
+                if (!pending) continue;
+                pendingPrefillRequests.delete(selected.id);
+                pending.resolve({
+                  prefillTokens: sessionPrefillTokens.get(selected.id) ?? 0,
+                  elapsedMs: genParams.server_prefill_batch?.daemon_prefill_ms ?? 0,
+                  selectedBatchSize: selectedSessions.length,
+                });
+              }
             } catch (err: any) {
               const reason = err?.message ?? "daemon_serial_prefill_failed";
               if (genParams.server_prefill_batch) {
@@ -3463,13 +3527,72 @@ async function serve(port: number, host: string) {
                 genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "daemon_serial_prefill_failed";
               }
               lastPrefillRuntimeDispatchSkippedReason = "daemon_serial_prefill_failed";
+              for (const selected of selectedBatchSessions) {
+                if (selected.id === reqId) continue;
+                const pending = pendingPrefillRequests.get(selected.id);
+                if (!pending) continue;
+                pendingPrefillRequests.delete(selected.id);
+                pending.reject(new Error(reason));
+              }
               console.error(`[hipfire] generate_batch_prefill failed; falling back to generate: ${reason}`);
             }
-          } else if (genParams.server_prefill_batch) {
-            genParams.server_prefill_batch.runtime_dispatch = "cli_multi_session_batch_dispatch_not_enabled";
-            genParams.server_prefill_batch.runtime_dispatch_reason = "selected_batch_size_gt_1_requires_async_queue_worker";
-            genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "cli_multi_session_batch_dispatch_not_enabled";
-            lastPrefillRuntimeDispatchSkippedReason = "cli_multi_session_batch_dispatch_not_enabled";
+          } else if (
+            !body.stream &&
+            !isResponsesRequest &&
+            prefillBatchGate.eligible &&
+            servingWorkerScheduler &&
+            queuePreviewReason !== "not_eligible"
+          ) {
+            const prefillSession = buildDaemonPrefillSession(serverPrefillSession);
+            let resolvePending!: (outcome: PendingPrefillOutcome) => void;
+            let rejectPending!: (err: Error) => void;
+            const pendingPromise = new Promise<PendingPrefillOutcome>((resolve, reject) => {
+              resolvePending = resolve;
+              rejectPending = reject;
+            });
+            pendingPrefillRequests.set(reqId, {
+              session: serverPrefillSession,
+              prefillSession,
+              resolve: resolvePending,
+              reject: rejectPending,
+              promise: pendingPromise,
+            });
+            const waitMs = Math.max(5, (requestBatchPolicy?.coalesceWaitMs ?? serverPrefillBatch.waitMs) + 50);
+            safeRelease();
+            let pendingOutcome: PendingPrefillOutcome | null = null;
+            try {
+              pendingOutcome = await Promise.race([
+                pendingPromise,
+                new Promise<null>((resolve) => setTimeout(() => resolve(null), waitMs)),
+              ]);
+            } finally {
+              await acquireLock();
+              lockReleased = false;
+            }
+            if (pendingOutcome) {
+              genParams.session_id = reqId;
+              genParams.prefill_already_done = true;
+              if (genParams.server_prefill_batch) {
+                genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill";
+                genParams.server_prefill_batch.runtime_dispatch_reason = "prefill_done_decode_continuation";
+                genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "not_skipped";
+                genParams.server_prefill_batch.daemon_prefill_tokens = pendingOutcome.prefillTokens;
+                genParams.server_prefill_batch.daemon_prefill_ms = pendingOutcome.elapsedMs;
+                genParams.server_prefill_batch.selected_batch_size = pendingOutcome.selectedBatchSize;
+              }
+              lastPrefillRuntimeDispatchSkippedReason = "not_skipped";
+              lastSelectedBatchSize = pendingOutcome.selectedBatchSize;
+            } else {
+              pendingPrefillRequests.delete(reqId);
+              servingWorkerScheduler.cancel(reqId);
+              prefillBatchMetrics.skipped += 1;
+              if (genParams.server_prefill_batch) {
+                genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill_timeout";
+                genParams.server_prefill_batch.runtime_dispatch_reason = "coalesce_wait_elapsed_without_batch";
+                genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "daemon_serial_prefill_timeout";
+              }
+              lastPrefillRuntimeDispatchSkippedReason = "daemon_serial_prefill_timeout";
+            }
           }
         }
 

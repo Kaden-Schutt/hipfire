@@ -122,7 +122,10 @@ export function schedulerPolicyForPriority(
   const priorityClass = schedulerPriorityClass(p);
   const maxBatchSize = Math.max(
     1,
-    Math.min(64, parseInteger(env.HIPFIRE_SCHED_PREFILL_BATCH_MAX, 8)),
+    Math.min(64, parseInteger(
+      env.HIPFIRE_SCHED_PREFILL_BATCH_MAX ?? env.HIPFIRE_SERVER_PREFILL_BATCH_MAX,
+      8,
+    )),
   );
   const legacyInteractiveWait = env.HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS;
   const realtimeWait = Math.max(0, parseInteger(env.HIPFIRE_SCHED_PREFILL_WAIT_MS_REALTIME, 0));

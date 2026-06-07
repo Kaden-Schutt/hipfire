@@ -84,10 +84,10 @@ describe("generate_batch_prefill serialized fallback metadata", () => {
     });
   });
 
-  test("reports daemon serial-prefill support for single-session dispatch", () => {
+  test("reports daemon serial-prefill support for server dispatch", () => {
     expect(prefillBatchRuntimeDispatchStatus(true, "supported")).toEqual({
       runtimeDispatch: "daemon_serial_prefill_available",
-      runtimeDispatchReason: "single_session_dispatch_enabled",
+      runtimeDispatchReason: "server_dispatch_enabled",
     });
   });
 });
