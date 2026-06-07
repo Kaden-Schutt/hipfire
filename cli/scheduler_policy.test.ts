@@ -19,6 +19,7 @@ describe("scheduler priority parsing", () => {
 
   test("uses interactive default priority", () => {
     expect(parseSchedulerPriority(undefined)).toBe(64);
+    expect(parseSchedulerPriority(null)).toBe(64);
     expect(parseDefaultSchedulerPriority({})).toBe(64);
     expect(parseDefaultSchedulerPriority({ HIPFIRE_SCHED_PRIORITY_DEFAULT: "192" })).toBe(192);
     expect(parseSchedulerPriority("not-a-number")).toBe(64);

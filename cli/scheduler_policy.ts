@@ -79,10 +79,10 @@ export function clampSchedulerPriority(value: number): SchedulerPriority {
 }
 
 export function parseSchedulerPriority(
-  value: string | number | undefined,
+  value: string | number | null | undefined,
   fallback = SCHED_PRIORITY_DEFAULT,
 ): SchedulerPriority {
-  if (value === undefined) return clampSchedulerPriority(fallback);
+  if (value == null) return clampSchedulerPriority(fallback);
   if (typeof value === "number") return clampSchedulerPriority(value);
   return clampSchedulerPriority(parseInteger(value, fallback));
 }
