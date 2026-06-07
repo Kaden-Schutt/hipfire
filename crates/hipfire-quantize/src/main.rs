@@ -6212,9 +6212,15 @@ fn main() {
                 // ── K-map override ──────────────────────────────────────────────
                 let mut kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
                 // Gemma4 (arch 13): attention projections are score-precision-
-                // sensitive (MQ4 corrupts QK scores / breaks coherence), so keep
-                // self_attn.{q,k,v,o}_proj at Q8 even when --format is mq4.
-                if arch_id == 13 && name.contains("self_attn.") && name.ends_with("_proj.weight") {
+                // sensitive (MQ4 corrupts QK scores / breaks coherence on random
+                // weights), so keep self_attn.{q,k,v,o}_proj at Q8 even when
+                // --format is mq4. HIPFIRE_GEMMA4_MQ4_ATTN=1 disables this to test
+                // MQ4 attention on real/QAT weights (byte reduction → faster decode).
+                if arch_id == 13
+                    && name.contains("self_attn.")
+                    && name.ends_with("_proj.weight")
+                    && std::env::var_os("HIPFIRE_GEMMA4_MQ4_ATTN").is_none()
+                {
                     kmap_level = QuantLevel::Q8;
                 }
 
