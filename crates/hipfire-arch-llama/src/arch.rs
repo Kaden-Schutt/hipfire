@@ -220,6 +220,8 @@ impl Llama {
                     batch_size: 1,
                     is_tree: false,
                     is_boundary: false,
+                    cache_capacity: 0, // identity (no wrapping)
+                    head_dim: config.head_dim,
                 }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
                 let io = AttnParams {
                     q: &scratch.q,
@@ -236,6 +238,7 @@ impl Llama {
                     n_kv_heads,
                     head_dim,
                     physical_cap: kv_cache.physical_cap,
+                    cache_capacity: 0, // identity (no wrapping)
                     batch_size: 1,
                     max_ctx_len: 0,
                     flash_partials: None,

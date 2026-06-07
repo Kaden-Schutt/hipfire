@@ -42,6 +42,12 @@ pub struct AttnParams<'a> {
     pub head_dim: usize,
     /// Maximum KV cache capacity (= max_seq for batched kernels).
     pub physical_cap: usize,
+    /// Ring-buffer capacity for sliding-window KV caches (from `KvTierPlan`).
+    /// `0` → identity (slot = pos). `> 0` → wrapping (slot = pos % cache_capacity).
+    /// Stored here for future kernel threading; not yet passed to GPU methods
+    /// (deferred to gemma4 kernel port in Phase 1b).
+    #[allow(dead_code)]
+    pub cache_capacity: u32,
     /// Batch size. REQUIRED: `1` for decode/per-token, `>1` for batched prefill.
     pub batch_size: usize,
     /// Batched attend loop bound (= start_pos + n). `0` when `batch_size == 1`.
