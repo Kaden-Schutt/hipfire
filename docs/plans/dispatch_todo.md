@@ -250,4 +250,14 @@ ensures the guard never fires in real operation.
 
 ---
 
-*Last updated: 2026-06-06 (post Ship 4.1 W0+W1 + F-3 gfx1100 verified, tracking #397).*
+## #397 Ship 6(g) — DISPATCH_OLD/NEW selector removal (status)
+
+The temporary `HIPFIRE_DISPATCH_OLD` / `HIPFIRE_DISPATCH_NEW` byte-parity
+selector (planned for deletion in Ship 6 per `dispatch-phase0-decisions.md`)
+is **removed** — grep across the repo finds zero live-code hits for
+`DISPATCH_OLD` / `DISPATCH_NEW` / `HIPFIRE_DISPATCH_OLD` / `HIPFIRE_DISPATCH_NEW`
+(only design-discussion mentions remain). Ship 6(g) satisfied.
+
+---
+
+*Last updated: 2026-06-06 (post Ship 1.4b + 4c + 6g, tracking #397).*
