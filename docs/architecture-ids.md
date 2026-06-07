@@ -14,6 +14,8 @@ file ids it actually loads.
 | 7 | Qwen2 dense (standalone) | `hipfire-arch-qwen2` | rev 0 skeleton; full bring-up in `docs/plans/dots-ocr-prd.md` phase 1 |
 | 8 | Qwen2-VL family (dots.ocr) | `hipfire-arch-dots-ocr` | vision tower + Strategy A E2E OCR validated 2026-05-21; daemon plumbing pending in `docs/plans/dots-ocr-prd.md` phase 3 |
 | 9 | DeepSeek V4 Flash | `hipfire-arch-deepseek4` | Hyper-Connections, compressed-KV indexer, tail-only RoPE, raw SWA; optional `mtp.0.*` MTP layer. |
+| 10 | MiniMax-M2 | `hipfire-arch-minimax` | Mixtral-style 256-expert MoE, per-layer QK-norm, partial rotate_half RoPE. |
+| 13 | Gemma 4 dense text | `hipfire-arch-gemma4` | `google/gemma-4-12B-it` dense. Hybrid 5:1 sliding(hd256)/full(hd512) attn, K=V sharing on full layers, sandwich RMSNorm + per-layer scalar, dual RoPE (θ10000 full-rotate sliding / θ1e6 partial-0.25 full), gelu_pytorch_tanh SwiGLU, √dim embed scale, tied LM head, final logit softcap 30. MoE/E-series/vision dropped. |
 | 0xFF | toy / template | `hipfire-arch-toy` | never shipped; daemon refuses to dispatch |
 
 ## Notes

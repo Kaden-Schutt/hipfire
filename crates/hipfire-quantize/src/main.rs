@@ -5304,6 +5304,10 @@ fn main() {
         // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
         // per-expert) and are translated when the forward bring-up lands.
         "deepseek_v4" => 9,
+        // Gemma4 (google/gemma-4-12B-it): dense unified multimodal; we quantize
+        // ONLY the text decoder (model.language_model.*). GQA + SWA + dual-RoPE +
+        // GeGLU + 4 sandwich norms + logit softcap. Crate: hipfire-arch-gemma4.
+        "gemma4_unified" | "gemma4_unified_text" | "gemma4" => 13,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -5592,6 +5596,14 @@ fn main() {
         // dots.ocr names them `vision_tower.*`. Both fall through to the
         // F16 fallback path (see should_quantize: vision_tower.* is
         // skipped from quantization) when --include-vision is set.
+        // Gemma4 unified (arch 13): text-only bring-up — skip the vision/audio
+        // towers + multimodal projectors; quantize only the text decoder.
+        if arch_id == 13 && !name.starts_with("model.language_model.") {
+            let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n: usize = meta.shape.iter().product();
+            skipped_params += n as u64;
+            continue;
+        }
         let is_vision = name.starts_with("model.visual.")
             || name.starts_with("visual.")
             || name.starts_with("vision_tower.");

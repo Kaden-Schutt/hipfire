@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! hipfire-arch-gemma4: Gemma 4 dense text (`google/gemma-4-12B-it`) for hipfire.
+//!
+//! A DENSE 12B port of the Gemma 4 architecture. Distinguishing features vs a
+//! plain pre-norm transformer:
+//!   - **Hybrid attention**: 5 sliding-window layers (head_dim 256, window
+//!     1024, RoPE θ=10000 full rotate-half) per 1 full layer (head_dim 512,
+//!     partial proportional RoPE θ=1e6 over the first 25% of head_dim). The
+//!     period is READ from the `layer_types` array, not assumed.
+//!   - **K=V sharing** on full layers (`attention_k_eq_v`): no v_proj — V is
+//!     the pre-k_norm output of k_proj, renormed by a weight-less RMSNorm.
+//!   - **Sandwich RMSNorm**: input + post-attention + pre-FFN + post-FFN per
+//!     layer (plain `x * w`, no +1), plus a learned per-layer `layer_scalar`.
+//!   - **Attention scale 1.0** (not 1/√d): Q is pre-scaled by √head_dim so the
+//!     kernel's internal 1/√head_dim cancels.
+//!   - **gelu_pytorch_tanh** SwiGLU MLP; **embed scaled by √hidden_size**;
+//!     **tied LM head**; **final logit softcap** `tanh(x/30)*30`.
+//!
+//! DROPPED from the broader Gemma 4 family (the dense 12B uses none of these):
+//! MoE blocks, the E-series per-layer-embedding / KV-sharing-layer /
+//! double-wide-MLP machinery, and vision/audio.
+//!
+//! arch_id = 13 (see docs/architecture-ids.md). Reuses existing kernels:
+//! `rope_f32` / `rope_partial_halved_f32`, `attention_q8_0_kv_swa`,
+//! `gelu_tanh_f32`, `logit_softcap_f32`, plus the shared GEMV path.
+
+pub mod arch;
+pub mod config;
+pub mod forward;
+pub mod gemma4;
+
+pub use arch::{Gemma4, ARCH_ID};
+pub use config::{Gemma4Config, LayerType, RopeType};
+pub use gemma4::{
+    FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, SlidingLayerWeights,
+};
