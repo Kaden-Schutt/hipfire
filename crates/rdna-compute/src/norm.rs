@@ -205,7 +205,6 @@ impl Gpu {
     pub fn mul_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("mul", kernels::MUL_SRC, "mul_f32")?;
-        let func = &self.functions["mul_f32"];
 
         let n = a.numel() as i32;
         let mut a_ptr = a.buf.as_ptr();
@@ -224,7 +223,22 @@ impl Gpu {
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise_bytes(n as usize);
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", "mul_f32", bytes);
-        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) };
+        // Blob path so this op is hipGraph-capture-safe (gemma4 SwiGLU mul).
+        let result = self.launch_maybe_blob(
+            "mul_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bl = hip_bridge::KernargBlob::new();
+                bl.push_ptr(a_ptr);
+                bl.push_ptr(b_ptr);
+                bl.push_ptr(c_ptr);
+                bl.push_i32(n_val);
+                bl
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -1819,7 +1833,6 @@ impl Gpu {
     pub fn scale_f32(&mut self, x: &GpuTensor, scale: f32) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("scale_f32", kernels::SCALE_F32_SRC, "scale_f32")?;
-        let func = &self.functions["scale_f32"];
         let n = x.numel();
         let mut xp = x.buf.as_ptr();
         let mut nv = n as i32;
@@ -1832,7 +1845,22 @@ impl Gpu {
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise1_bytes(n);
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", "scale_f32", bytes);
-        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
+        // Blob path so this op is hipGraph-capture-safe (gemma4 Q pre-scale +
+        // per-layer learned scalar). Plain launch when not capturing.
+        let result = self.launch_maybe_blob(
+            "scale_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bl = hip_bridge::KernargBlob::new();
+                bl.push_ptr(xp);
+                bl.push_i32(nv);
+                bl.push_f32(sv);
+                bl
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -2160,7 +2188,6 @@ impl Gpu {
     pub fn gelu_tanh_f32(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gelu_tanh_f32", kernels::GELU_TANH_SRC, "gelu_tanh_f32")?;
-        let func = &self.functions["gelu_tanh_f32"];
         let mut xp = x.buf.as_ptr();
         let mut op = out.buf.as_ptr();
         let mut ni = n as i32;
@@ -2170,7 +2197,21 @@ impl Gpu {
             &mut ni as *mut _ as *mut c_void,
         ];
         let blocks = ((n + 255) / 256) as u32;
-        unsafe { self.hip.launch_kernel(func, [blocks, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+        // Blob path so this op is hipGraph-capture-safe (gemma4 FFN activation).
+        self.launch_maybe_blob(
+            "gelu_tanh_f32",
+            [blocks, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut bl = hip_bridge::KernargBlob::new();
+                bl.push_ptr(xp);
+                bl.push_ptr(op);
+                bl.push_i32(ni);
+                bl
+            },
+        )
     }
 
     /// Bias-add: x[batch, n] += bias[n] (in-place, broadcast over batch dim)
