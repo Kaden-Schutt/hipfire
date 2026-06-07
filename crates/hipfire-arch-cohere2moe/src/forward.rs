@@ -30,12 +30,10 @@
 //!   * `logit_scale` = 1.0 (no-op for this checkpoint).
 //!
 //! ── ORACLE-LOOP TODOs (per docs/methodology/arch-port-validation.md) ──
-//!  [T1] Routing renormalization: this scaffold reuses
-//!       `deepseek4_moe_topk_bias_aware_f32` (zero bias, route_scale 1.0), which
-//!       gathers the sigmoid'd top-k weights AND renormalizes them to sum 1.
-//!       Cohere2Moe has `norm_topk_prob = false` → it must NOT renormalize. The
-//!       per-layer cosine will flag this immediately; fix = a no-renorm top-k
-//!       variant (or a `norm_topk_prob` flag on the kernel). VERIFY FIRST.
+//!  [T1] RESOLVED (2026-06-07): routing uses `moe_topk_renorm_k8` with
+//!       `norm_topk = cfg.norm_topk_prob` (false), giving un-renormalized
+//!       sigmoid weights and no bias term — the Cohere2Moe convention. The
+//!       earlier renormalizing kernel cost ~0.012 layer-1 cosine.
 //!  [T2] Sliding-window attention: all layers run FULL causal attention here.
 //!       Correct for prompts < `sliding_window` (4096). Add windowed KV for
 //!       long-context once forward-correctness on short prompts is proven.
@@ -197,21 +195,21 @@ fn decode_step_body(
                 rotate_x_mq_for(gpu, &m.experts[0].gate_up, &state.tmp, &state.ffn_x_rot, hidden)
                     .map_err(|e| format!("cohere2moe L{l}: ffn rotate: {e:?}"))?;
 
-                // Router: sigmoid(n·gate). [T1] zero bias + route_scale 1.0; the
-                // bias-aware kernel RENORMALIZES top-k weights — Cohere2Moe wants
-                // NO renorm (norm_topk_prob=false). Oracle target.
+                // Router: Cohere2Moe = sigmoid activation, select top-k by score,
+                // weight = sigmoid(selected logit). NO routing bias, and
+                // norm_topk_prob = false → NO top-k renormalization. sigmoid is
+                // monotonic, so top-k by sigmoid == top-k by logit (matching the
+                // reference, which top-ks on logits then applies sigmoid).
                 weight_gemv(gpu, &m.router, &state.tmp, &state.router_logits)
                     .map_err(|e| format!("cohere2moe L{l}: router: {e}"))?;
                 gpu.sigmoid_f32(&state.router_logits)
                     .map_err(|e| format!("cohere2moe L{l}: sigmoid: {e:?}"))?;
-                gpu.deepseek4_moe_topk_bias_aware_f32(
+                gpu.moe_topk_renorm_k8(
                     &state.router_logits,
-                    &weights.zero_bias,
                     &state.topk_indices,
                     &state.topk_weights,
-                    n_exp as i32,
-                    k_top as i32,
-                    1.0,
+                    n_exp,
+                    cfg.norm_topk_prob, // false for Cohere2Moe
                 )
                 .map_err(|e| format!("cohere2moe L{l}: topk: {e:?}"))?;
 

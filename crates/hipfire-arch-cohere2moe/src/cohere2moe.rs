@@ -143,9 +143,6 @@ pub struct CohereWeights {
     pub embed: GpuTensor,      // model.embed_tokens.weight (Q8 raw, embedding_lookup_q8)
     pub final_norm: GpuTensor, // model.norm.weight
     pub lm_head: WeightTensor, // lm_head.weight (tied to embed in the checkpoint)
-    /// Shared all-zeros routing bias [n_exp] — Cohere2Moe has no routing-bias
-    /// term, but the bias-aware top-k kernel takes one; zeros make it a no-op.
-    pub zero_bias: GpuTensor,
     pub layers: Vec<CohereLayerWeights>,
 }
 
@@ -165,9 +162,6 @@ impl CohereWeights {
             .map_err(|e| format!("cohere2moe: upload embed: {e:?}"))?;
         let final_norm = load_norm(hfq, gpu, "model.norm.weight", &[hidden])?;
         let lm_head = load_wt(hfq, gpu, "lm_head.weight", cfg.vocab_size, hidden)?;
-        let zero_bias = gpu
-            .upload_f32(&vec![0.0f32; n_exp], &[n_exp])
-            .map_err(|e| format!("cohere2moe: upload zero_bias: {e:?}"))?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
@@ -205,7 +199,6 @@ impl CohereWeights {
             embed,
             final_norm,
             lm_head,
-            zero_bias,
             layers,
         })
     }
