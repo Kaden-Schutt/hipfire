@@ -100,6 +100,11 @@ SHORT_TESTS=(
     "qwen3.5-4b.mq4|code|Write a one-line Python function named square that returns n*n.|180"
     "qwen3.5-9b.mq4|reason|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     "qwen3.5-9b.mq4|tool-call|What does the file /tmp/fibonacci.c contain?|180|tool_call_system.txt"
+    # Gemma 4 (arch_id=12) — hybrid sliding(hd256)+full(hd512) attention, dense
+    # SwiGLU-gelu_tanh FFN. Exercises the hd512 full-attention reduce path (the
+    # 2e36fee2 fix), the <turn|>=106 stop, and the chat-template framing. Skipped
+    # if the model file isn't symlinked into MODELS_DIR.
+    "gemma-4-12B-it-q8.hfq|cap-gemma4|What is the capital of France? Answer in one short sentence.|80"
     # MQ3 coverage (gfx11+gfx12 only — refused on other archs at load).
     # Verifies WMMA prefill family + K4-unroll decode + fused residual all
     # dispatch and stay coherent. Same prompts as the MQ4 rows so output

@@ -853,8 +853,8 @@ Phase 0 contracts as follows:
 | hd512 kernels not precompiled for all archs | 1b/5b | Open (gfx1151 works) | Compile + validate per-arch. |
 | `rope_partial_halved` not in dispatch framework | 2a | Open | Direct GPU call in Phase 1. |
 | MoE GPU methods stubbed | 4 | Open | 26B-A4B cannot run. Deferred to Phase 4. |
-| CLI tokenizer fails for gemma4 262K BPE | 1g | Open | `hipfire run`/`hipfire serve` fail. Direct daemon path works. |
-| Phase gate scripts have no gemma4 rows | 0c | Open | Deferred to Phase 5. |
+| CLI tokenizer fails for gemma4 262K BPE | 1g | ✅ Resolved | Was the **stale prod daemon** (`~/.hipfire/bin/daemon`, predated the SPM-BPE ▁-detection fix), not a code bug. Refreshed binary → `hipfire run gemma-4-12B-it-q8 "..."` → "The capital of France is **Paris**." See [[feedback_hipfire_run_uses_prod_daemon]]. |
+| Phase gate scripts have no gemma4 rows | 0c | ✅ Partial | Added `gemma-4-12B-it-q8.hfq` cap row to `coherence-gate.sh` SHORT_TESTS (skip-if-missing). Exercises hd512 reduce + `<turn\|>` stop + framing. DFlash/A3B rows pending (MoE not portable). |
 | 26B-A4B safetensors incomplete | 0c | Open | Re-download needed. |
 | Graph capture pointer staleness | 2a | Open | Deferred to Phase 2. |
 | Daemon `arch_id` wildcard fallback misroutes | 1e | ✅ Resolved | Explicit `12 =>` arms at all 16+ sites. |
