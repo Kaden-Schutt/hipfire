@@ -2938,6 +2938,26 @@ fn main() {
                         }
                     }
                     ok
+                } else if m.arch_id == 12 {
+                    // Gemma4 warm-pass: per-token decode over synthetic prompt.
+                    let config = m.gemma4_config.as_ref().unwrap();
+                    let weights = m.gemma4_weights.as_ref().unwrap();
+                    let scratch = m.gemma4_scratch.as_mut().unwrap();
+                    let kv_sliding = m.gemma4_kv_sliding.as_mut().unwrap();
+                    let kv_full = m.gemma4_kv_full.as_mut().unwrap();
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if gemma4::forward_scratch(
+                            &mut gpu, weights, config,
+                            tok, i, kv_sliding, kv_full, scratch,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
@@ -3897,6 +3917,109 @@ fn load_model(
             gemma4_kv_sliding: None,
             gemma4_kv_full: None,
             gemma4_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(),
+            dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
+    if hfq.arch_id == 12 {
+        // Gemma 4 (dense + MoE). Hybrid sliding+full attention, dual KV
+        // caches, proportional partial RoPE, logit softcap. Uses old-style
+        // dispatch initially; incremental migration to execute_steps in
+        // Phases 2–4. See docs/plans/gemma4_dispatch.md.
+        use hipfire_arch_gemma4::Gemma4;
+        use hipfire_runtime::arch::Architecture;
+
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=12 (gemma4). \
+                       Reload without a draft."
+                .to_string());
+        }
+        if cask.sidecar.is_some() {
+            return Err("CASK eviction not supported on arch_id=12 (gemma4)."
+                .to_string());
+        }
+        if pp > 1 {
+            return Err("pipeline-parallel not supported on arch_id=12 (gemma4)."
+                .to_string());
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        let config = <Gemma4 as Architecture>::config_from_hfq(&hfq)
+            .map_err(|e| e.to_string())?;
+        let mut weights = <Gemma4 as Architecture>::load_weights(&mut hfq, &config, &mut gpu)
+            .map_err(|e| e.to_string())?;
+        let scratch = <Gemma4 as Architecture>::new_state(&mut gpu, &config)
+            .map_err(|e| e.to_string())?;
+
+        // Dual KV caches: sliding (ring-buffer) + full (identity)
+        let kv_sliding = llama::KvCache::new(
+            &mut gpu, config.sliding_window, config.sliding_window,
+            config.sliding_n_kv_heads, config.sliding_head_dim, false, false,
+            true, 2, 3, None,
+        ).map_err(|e| format!("gemma4 sliding KV alloc: {e:?}"))?;
+        let kv_full = llama::KvCache::new(
+            &mut gpu, max_seq, max_seq,
+            config.full_n_kv_heads, config.full_head_dim, false, false,
+            true, 2, 3, None,
+        ).map_err(|e| format!("gemma4 full KV alloc: {e:?}"))?;
+
+        let eos_tok = config.eos_token;
+        let (default_temp, default_top_p) = (0.7_f64, 0.9_f64);
+        let default_repeat_penalty = 1.0_f64;
+
+        return Ok(LoadedModel {
+            config_json: None,
+            arch_id: 12,
+            quant_type: hfq.quant_type.clone(),
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            dn_state: None,
+            q35_vl: None,
+            q35_mtp: None,
+            kv_cache: None,
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_mtp_weights: None,
+            deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
+            gemma4_config: Some(config),
+            gemma4_weights: Some(weights),
+            gemma4_scratch: Some(scratch),
+            gemma4_kv_sliding: Some(kv_sliding),
+            gemma4_kv_full: Some(kv_full),
+            gemma4_eos_tok: eos_tok,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,

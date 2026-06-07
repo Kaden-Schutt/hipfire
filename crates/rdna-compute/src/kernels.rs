@@ -3677,6 +3677,19 @@ pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_SRC: &str =
 /// to activations in-place. Called before each ParoQ4G128 GEMV.
 pub const GIVENS_ROTATE_SRC: &str = include_str!("../../../kernels/src/givens_rotate.hip");
 
+// ─── Gemma 4 kernels ───────────────────────────────────────────────────
+
+/// Proportional partial RoPE: rotates only the first `n_rot_pairs` of each
+/// head; remaining positions are identity. Used by Gemma4 full-attention
+/// layers (partial_rotary_factor=0.25).
+pub const ROPE_PARTIAL_HALVED_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halved.hip");
+
+/// Final logit softcap: tanh(x/cap)*cap. Applied once per forward pass
+/// before sampling. Gemma4 uses cap=30.0.
+pub const LOGIT_SOFTCAP_SRC: &str =
+    include_str!("../../../kernels/src/logit_softcap.hip");
+
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;

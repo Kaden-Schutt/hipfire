@@ -8,7 +8,8 @@
 //! in Phases 1b (attention/kv), 1d (rope/softcap), and 4 (MoE).
 
 use crate::GpuTensor;
-use hip_bridge::{DeviceBuffer, HipError, HipResult};
+use crate::kernels;
+use hip_bridge::{DeviceBuffer, HipError, HipResult, KernargBlob};
 
 // ─── rope_partial_halved_f32 ───────────────────────────────────────────
 
@@ -22,7 +23,51 @@ impl crate::Gpu {
         n_rot_pairs: usize, rope_theta: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        Err(HipError::new(0, "rope_partial_halved_f32: kernel not yet ported (Phase 1b)"))
+        self.ensure_kernel(
+            "rope_partial_halved",
+            kernels::ROPE_PARTIAL_HALVED_SRC,
+            "rope_partial_halved_f32",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let nhq = n_heads as i32;
+        let nhk = n_kv as i32;
+        let hd = head_dim as i32;
+        let nrp = n_rot_pairs as i32;
+        let fb = rope_theta;
+        let n_pairs = n_rot_pairs as u32;
+        let block = 32u32.min(n_pairs.max(1));
+        let grid = [(n_pairs + block - 1) / block, 1, 1];
+        let mut params: Vec<*mut std::ffi::c_void> = vec![
+            &qp as *const _ as *mut std::ffi::c_void,
+            &kp as *const _ as *mut std::ffi::c_void,
+            &pp as *const _ as *mut std::ffi::c_void,
+            &nhq as *const _ as *mut std::ffi::c_void,
+            &nhk as *const _ as *mut std::ffi::c_void,
+            &hd as *const _ as *mut std::ffi::c_void,
+            &nrp as *const _ as *mut std::ffi::c_void,
+            &fb as *const _ as *mut std::ffi::c_void,
+        ];
+        self.launch_maybe_blob(
+            "rope_partial_halved_f32",
+            grid,
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(pp);
+                b.push_i32(nhq);
+                b.push_i32(nhk);
+                b.push_i32(hd);
+                b.push_i32(nrp);
+                b.push_f32(fb);
+                b
+            },
+        )
     }
 
     #[allow(unused_variables)]
@@ -30,7 +75,35 @@ impl crate::Gpu {
         &mut self, x: &GpuTensor, n: usize, cap: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        Err(HipError::new(0, "logit_softcap_f32: kernel not yet ported (Phase 1b)"))
+        self.ensure_kernel(
+            "logit_softcap_f32",
+            kernels::LOGIT_SOFTCAP_SRC,
+            "logit_softcap_f32",
+        )?;
+        let xp = x.buf.as_ptr();
+        let n_i32 = n as i32;
+        let cap_f = cap;
+        let block = 256u32;
+        let grid = [((n as u32) + block - 1) / block, 1, 1];
+        let mut params: Vec<*mut std::ffi::c_void> = vec![
+            &xp as *const _ as *mut std::ffi::c_void,
+            &n_i32 as *const _ as *mut std::ffi::c_void,
+            &cap_f as *const _ as *mut std::ffi::c_void,
+        ];
+        self.launch_maybe_blob(
+            "logit_softcap_f32",
+            grid,
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_i32(n_i32);
+                b.push_f32(cap_f);
+                b
+            },
+        )
     }
 }
 
