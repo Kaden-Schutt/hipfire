@@ -63,6 +63,7 @@ struct Args {
     max_tokens: Option<usize>,
     temperature: Option<f64>,
     max_seq: Option<usize>,
+    state_quant: Option<String>,
     report_json: Option<String>,
     agentic: bool,
     stall_tokens: Option<usize>,
@@ -88,6 +89,7 @@ fn parse_args() -> Result<Args, String> {
             "--max-seq" => {
                 args.max_seq = it.next().and_then(|v| v.parse().ok());
             }
+            "--state-quant" => args.state_quant = it.next(),
             "--report-json" => args.report_json = it.next(),
             "--agentic" => args.agentic = true,
             "--stall-tokens" => {
@@ -552,10 +554,15 @@ fn run() -> Result<i32, String> {
 
     // Load
     let max_seq = effective_args.max_seq.unwrap_or(4096);
+    let mut params = serde_json::json!({ "max_seq": max_seq });
+    if let Some(sq) = effective_args.state_quant.as_deref() {
+        params["state_quant"] = serde_json::json!(sq);
+        eprintln!("[probe] DeltaNet state_quant = {}", sq);
+    }
     let load = serde_json::json!({
         "type": "load",
         "model": model,
-        "params": { "max_seq": max_seq },
+        "params": params,
     });
     send(&mut child, &load)?;
     let loaded = recv_until(&mut child, |_| {})?;
