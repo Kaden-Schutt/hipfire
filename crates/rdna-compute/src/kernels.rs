@@ -3690,6 +3690,17 @@ pub const ROPE_PARTIAL_HALVED_SRC: &str =
 pub const LOGIT_SOFTCAP_SRC: &str =
     include_str!("../../../kernels/src/logit_softcap.hip");
 
+// ─── Gemma 4 hd512 attention + KV write kernels ─────────────────────────
+
+pub const ATTENTION_FLASH_ASYM3_TILE_HD512_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_asym3_tile_hd512.hip");
+pub const ATTENTION_FLASH_ASYM3_TILE_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_asym3_tile_hd512_batched.hip");
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512.hip");
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512_batched.hip");
+
 #[cfg(test)]
 mod dispatch_tests {
     use super::*;

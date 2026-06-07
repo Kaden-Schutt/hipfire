@@ -3967,15 +3967,14 @@ fn load_model(
             .map_err(|e| e.to_string())?;
 
         // Dual KV caches: sliding (ring-buffer) + full (identity).
-        // Use asym3 for now — full-attention layers (hd=512) only have asym3
-        // kernel variants. Q8/fwht hd512 support pending Phase 1b kernel port.
+        // Full cache uses full_head_dim (512) and full_n_kv_heads (1 for 12B).
         let kv_sliding = llama::KvCache::new_gpu_asym3(
             gpu, config.n_layers, config.sliding_n_kv_heads,
             config.sliding_head_dim, config.sliding_window,
         ).map_err(|e| format!("gemma4 sliding KV alloc: {e:?}"))?;
         let kv_full = llama::KvCache::new_gpu_asym3(
-            gpu, config.n_layers, config.sliding_n_kv_heads,
-            config.sliding_head_dim, max_seq,
+            gpu, config.n_layers, config.full_n_kv_heads,
+            config.full_head_dim, max_seq,
         ).map_err(|e| format!("gemma4 full KV alloc: {e:?}"))?;
 
         let eos_tok = config.eos_token;
@@ -11501,17 +11500,14 @@ fn generate_gemma4(
         return;
     }
 
-    // ── Prompt build (plain only for bring-up) ──
+    // ── Prompt build (raw — no chat scaffolding for bring-up) ──
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_ids: Vec<u32> = {
-        hipfire_runtime::prompt_frame::ChatFrame {
-            tokenizer,
-            system: system_prompt,
-            user: prompt,
-            assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-            raw: false,
-        }
-        .build()
+        // Raw tokenization. BOS (2) prepended manually — Gemma4 SPM-BPE
+        // doesn't auto-prepend. Chat template framing (Jinja) pending.
+        let mut ids = vec![2u32]; // BOS
+        ids.extend(tokenizer.encode(prompt));
+        ids
     };
     if prompt_ids.is_empty() {
         emit_error_with_id(stdout, id, "empty prompt after tokenize".to_string());

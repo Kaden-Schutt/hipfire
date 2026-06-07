@@ -1723,7 +1723,7 @@ impl Gpu {
     }
 
     /// Compile a givens4 kernel — prepends turbo_common + givens_common headers.
-    fn ensure_givens4_kernel(
+    pub(crate) fn ensure_givens4_kernel(
         &mut self,
         name: &str,
         body_src: &str,

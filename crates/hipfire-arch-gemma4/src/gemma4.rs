@@ -2075,9 +2075,15 @@ fn full_layer_decode_impl(
     if kv_cache.quant_asym3 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym3_fused(
-            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        if head_dim == 512 {
+            gpu.kv_cache_write_asym3_hd512(
+                &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+                &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        } else {
+            gpu.kv_cache_write_asym3_fused(
+                &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+                &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
+        }
         gpu.attention_flash_asym3_window(
             &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
             &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,

@@ -171,3 +171,27 @@ filesystem footprint). Start quantization + arch crate in parallel:
 - Tokenizer: Gemma4 uses SPM-BPE with ▁-space. Detection fixed to prioritize ▁ over Ġ.
 - KV cache: asym3 required for hd512 layers (Q8/fwht hd512 kernels not ported).
 - gemma4.rs explicit check refuses Q8 on full-attention (hd=512) layers.
+
+---
+
+## 2026-06-07 · Session 5 — Generate path + token attractor
+
+### Milestone: AR decode works end-to-end
+- Generate path wired: prefill → decode loop → sampling
+- 12B model: 50 tokens at 15.2 tok/s (gfx1151, asym3 KV, temp=0.0)
+- Output: token attractor loop ("and embracing et and embracing et...")
+
+### Root cause of attractor
+Full-attention layers use wrong KV cache dimensions:
+- Sliding layers: hd=256, n_kv=8 — correct
+- Full layers: hd=512, n_global_kv=1 — BUT cache allocated with hd=256/n_kv=8
+  because `KvCache::new_gpu_asym3` panics on hd=512 ("asym3 currently requires
+  head_dim=256")
+- Fix: port hd512 kernel variants from gemma4 branch OR use separate head_dim
+  for full-attention KV allocation
+
+### Next for coherent decode
+1. Port hd512 asym3 KV-write + attention kernels from gemma4 branch
+   (kv_cache_write_asym_k_givens3_hd512, attention_flash_asym3_tile_hd512)
+2. Allocate full KV cache with correct dimensions (hd=512, n_kv=1)
+3. Verify coherence (no attractor loop)
