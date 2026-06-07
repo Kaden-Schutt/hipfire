@@ -11525,6 +11525,21 @@ fn generate_gemma4(
         return;
     }
 
+    // Sliding-window guard. The sliding KV cache is sized at `sliding_window`
+    // and writes use slot=`pos` with NO ring-buffer wrap (cache_capacity not yet
+    // threaded into the kernels). So any position >= sliding_window writes/reads
+    // out of bounds. Refuse a too-long prompt and stop decode before the cap,
+    // rather than corrupting memory. Remove this guard once the ring buffer lands.
+    let sliding_cap = m.gemma4_config.as_ref().unwrap().sliding_window;
+    if prompt_ids.len() >= sliding_cap {
+        emit_error_with_id(stdout, id, format!(
+            "gemma4 prompt is {} tokens but the sliding-window limit is {} \
+             (ring-buffer KV not yet implemented; long-context support pending)",
+            prompt_ids.len(), sliding_cap,
+        ));
+        return;
+    }
+
     let eos_tok = m.gemma4_eos_tok;
     // Stop-token set. `config.eos_token` comes from `eos_token_id` parsed as a
     // scalar, but gemma4's HF config sets it to a LIST `[1, 106]`: `<turn|>`
@@ -11608,6 +11623,14 @@ fn generate_gemma4(
         let _ = stdout.flush();
 
         generated_count += 1;
+
+        // Sliding-window guard: the next forward writes KV at slot=`m.seq_pos`;
+        // forwarding at `pos >= sliding_window` would write out of bounds (no
+        // ring-buffer wrap yet). Stop cleanly here — the just-emitted token is
+        // still valid. Remove once the ring buffer lands.
+        if m.seq_pos >= sliding_cap {
+            break;
+        }
 
         // Forward step for next token
         {

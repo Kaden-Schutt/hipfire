@@ -849,6 +849,7 @@ Phase 0 contracts as follows:
 | Decode looped `<turn|>` forever (no stop) | 1e | ✅ Resolved | `eos_token_id` is `[1,106]` parsed as scalar 1; `generate_gemma4` now stops on a set incl. `<turn|>`=106. 12B-q8 stops cleanly. |
 | "deeper divergence remains" (Session 14) | debug | ✅ Not a bug | Standalone `debug_gemma4_attention` harness has a position-advance bug; daemon battery returns correct distinct answers (Tokyo/42/banana/FR). 4th measurement artifact. |
 | Chat-template framing (empty `<\|channel>thought`) | 1e | ✅ Resolved | `generate_gemma4` frames `<bos><\|turn>user\n{p}<turn\|>\n<\|turn>model\n<\|channel>thought\n<channel\|>` (guarded on the 4 special tokens; raw fallback). Output is now clean: "The capital of France is Paris." / valid haiku / "7 times 6 is 42." |
+| Sliding-window ring buffer not implemented (OOB >1024) | 0a/2b | ⚠️ Guarded | Sliding KV sized at `sliding_window`; writes use `slot=pos` (no wrap). `generate_gemma4` now **refuses prompts ≥ sliding_window and stops decode before the cap** (clean error, not OOB). Full ring buffer (`slot=pos%cap` + hd256 window masking) still pending — needs a >1024-tok oracle. |
 | `gelu_tanh` vs SiLU activation mismatch | 4a | Open | Forked `run_moe_decode_gemma4` executor. |
 | hd512 kernels not precompiled for all archs | 1b/5b | Open (gfx1151 works) | Compile + validate per-arch. |
 | `rope_partial_halved` not in dispatch framework | 2a | Open | Direct GPU call in Phase 1. |
