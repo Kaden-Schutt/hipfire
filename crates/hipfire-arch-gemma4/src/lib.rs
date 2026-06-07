@@ -29,6 +29,7 @@
 
 pub mod arch;
 pub mod config;
+pub mod drafter;
 pub mod forward;
 pub mod gemma4;
 
@@ -36,4 +37,9 @@ pub use arch::{Gemma4, ARCH_ID};
 pub use config::{Gemma4Config, LayerType, RopeType};
 pub use gemma4::{
     FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, SlidingLayerWeights,
+};
+pub use drafter::{
+    drafter_step, drafter_step_from_concat, DrafterLayerWeights, DrafterStepOut,
+    Gemma4DrafterConfig,
+    Gemma4DrafterScratch, Gemma4DrafterWeights, DRAFTER_ARCH_ID,
 };
