@@ -12,6 +12,7 @@
 //! RDNA-native quantized weights.
 
 mod gguf_input;
+mod imatrix_io;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
