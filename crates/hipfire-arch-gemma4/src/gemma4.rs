@@ -1863,6 +1863,14 @@ fn sliding_layer_decode_impl(
     if _dump_on {
         dbg_dump(gpu, "[v1] L0 after rope_q", &scratch.q, n_heads * head_dim);
         dbg_dump(gpu, "[v1] L0 after rope_k", &scratch.k, n_kv * head_dim);
+        // Dump raw Q/K/V after RoPE for score analysis
+        let q_data = gpu.download_f32(&scratch.q).unwrap_or_default();
+        let k_data = gpu.download_f32(&scratch.k).unwrap_or_default();
+        let v_data = gpu.download_f32(&scratch.v).unwrap_or_default();
+        let _ = std::fs::write("/tmp/gemma4_q_rope.bin", unsafe { std::slice::from_raw_parts(q_data.as_ptr() as *const u8, q_data.len() * 4) });
+        let _ = std::fs::write("/tmp/gemma4_k_rope.bin", unsafe { std::slice::from_raw_parts(k_data.as_ptr() as *const u8, k_data.len() * 4) });
+        let _ = std::fs::write("/tmp/gemma4_v.bin", unsafe { std::slice::from_raw_parts(v_data.as_ptr() as *const u8, v_data.len() * 4) });
+        eprintln!("[v1] Dumped post-RoPE Q({}), K({}), V({})", q_data.len(), k_data.len(), v_data.len());
     }
 
     // KV cache write + flash attention with window_size=1024.
@@ -1929,6 +1937,29 @@ fn sliding_layer_decode_impl(
         let kv_dim = n_kv * head_dim;
         gpu.kv_cache_write(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
         gpu.kv_cache_write(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
+        // Diagnostic: dump K/V from cache
+        if _dump_on {
+            let k_data = gpu.download_f32(&kv_cache.k_gpu[kv_layer_idx]).unwrap_or_default();
+            let v_data = gpu.download_f32(&kv_cache.v_gpu[kv_layer_idx]).unwrap_or_default();
+            // pos=1 (Hello token): offset = 1 * kv_dim
+            let k_pos1 = &k_data[kv_dim..kv_dim*2];
+            let v_pos1 = &v_data[kv_dim..kv_dim*2];
+            let k_sum: f64 = k_pos1.iter().map(|&v| v as f64).sum();
+            let v_sum: f64 = v_pos1.iter().map(|&v| v as f64).sum();
+            eprintln!("[v1] FP32 K cache pos=1: sum={k_sum:.4} first4=[{:.4},{:.4},{:.4},{:.4}]",
+                k_pos1[0], k_pos1[1], k_pos1[2], k_pos1[3]);
+            eprintln!("[v1] FP32 V cache pos=1: sum={v_sum:.4} first4=[{:.4},{:.4},{:.4},{:.4}]",
+                v_pos1[0], v_pos1[1], v_pos1[2], v_pos1[3]);
+            // Also pos=0 (BOS)
+            let k_pos0 = &k_data[0..kv_dim];
+            let v_pos0 = &v_data[0..kv_dim];
+            let k0_sum: f64 = k_pos0.iter().map(|&v| v as f64).sum();
+            let v0_sum: f64 = v_pos0.iter().map(|&v| v as f64).sum();
+            eprintln!("[v1] FP32 K cache pos=0: sum={k0_sum:.4} first4=[{:.4},{:.4},{:.4},{:.4}]",
+                k_pos0[0], k_pos0[1], k_pos0[2], k_pos0[3]);
+            eprintln!("[v1] FP32 V cache pos=0: sum={v0_sum:.4} first4=[{:.4},{:.4},{:.4},{:.4}]",
+                v_pos0[0], v_pos0[1], v_pos0[2], v_pos0[3]);
+        }
         gpu.attention_flash(
             &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
             &scratch.attn_out, &scratch.flash_partials,
@@ -1938,7 +1969,18 @@ fn sliding_layer_decode_impl(
     }
 
     // Dump attention output regardless of KV cache branch.
-    if _dump_on { dbg_dump(gpu, "[v1] L0 after attention", &scratch.attn_out, n_heads * head_dim); }
+    if _dump_on {
+        dbg_dump(gpu, "[v1] L0 after attention", &scratch.attn_out, n_heads * head_dim);
+        let data = gpu.download_f32(&scratch.attn_out).unwrap_or_default();
+        let gqa_ratio = n_heads / n_kv;
+        for h in 0..n_heads {
+            let start = h * head_dim;
+            let end = start + head_dim;
+            let h_sum: f64 = data[start..end].iter().map(|&v| v as f64).sum();
+            eprintln!("[v1]   head {:2} (kv={}): sum={:+10.4}  first2=[{:.4}, {:.4}]",
+                h, h / gqa_ratio, h_sum, data[start], data[start + 1]);
+        }
+    }
 
     // o_proj → tmp (reuse tmp, overwriting input_layernorm output).
     weight_gemv(gpu, &lw.o_proj, &scratch.attn_out, &scratch.tmp)?;

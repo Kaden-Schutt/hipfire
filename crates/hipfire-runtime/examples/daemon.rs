@@ -2934,25 +2934,12 @@ fn main() {
                     }
                     ok
                 } else if m.arch_id == 12 {
-                    // Gemma4 warm-pass: per-token decode over synthetic prompt.
-                    let config = m.gemma4_config.as_ref().unwrap();
-                    let weights = m.gemma4_weights.as_ref().unwrap();
-                    let scratch = m.gemma4_scratch.as_mut().unwrap();
-                    let kv_sliding = m.gemma4_kv_sliding.as_mut().unwrap();
-                    let kv_full = m.gemma4_kv_full.as_mut().unwrap();
-                    let mut ok = true;
-                    for (i, &tok) in synthetic.iter().enumerate() {
-                        if gemma4::forward_scratch(
-                            &mut gpu, weights, config,
-                            tok, i, kv_sliding, kv_full, scratch,
-                        )
-                        .is_err()
-                        {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    ok
+                    // Gemma4 warm-pass: SKIPPED — warm-pass writes synthetic K/V
+                    // to positions 0-127, but generate only overwrites 0..N-1.
+                    // First decode at pos=N reads stale synthetic K/V at pos=N.
+                    // TODO: re-enable after adding KV cache zeroing between
+                    // warm-pass and generate.
+                    true
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();

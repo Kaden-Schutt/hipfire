@@ -409,3 +409,101 @@ GQA head grouping is the most likely candidate because:
 2. Check GQA head-grouping convention in `attention_flash` kernel
 3. If H2 confirmed: fix head grouping, re-run coherence test
 4. If H2 ruled out: dump raw scores from flash kernel to test H4
+
+---
+
+## 2026-06-07 (session 3): Q·K^T dump + review agent findings
+
+### Q·K^T scores match HF within 0.5%
+
+Dumped post-RoPE Q, K, V from hipfire and computed Q·K^T scores manually.
+Every head matches HF within 0.5%:
+
+```
+Head  | Hipfire  | HF       | Delta
+  0   | +34.22   | +34.30   | 0.2%
+  1   | +272.01  | +271.91  | 0.04%
+  2   | +59.24   | +59.40   | 0.3%
+  ...
+```
+
+**This rules out H4 (scale mismatch) and K-layout issues.** The score computation
+is correct.
+
+### Per-head data disproves H2 (GQA grouping)
+
+Within GQA pairs, one head matches HF while the other diverges:
+- Heads 4,5 share KV head 2: head 4 matches, head 5 diverges
+- Heads 6,7 share KV head 3: head 6 matches, head 7 diverges
+
+Since both heads read the SAME K and V, the bug must be Q-side (softmax
+precision), not KV-side. GQA grouping (H2) and KV offset (H3) are falsified.
+
+### Review agent's key insight: 2-token test is degenerate
+
+The 2-token prompt produces saturated softmax (Q pre-scaled by √256=16,
+scores ~34-272). Tiny numerical differences cause the softmax to tip at
+the boundary, creating per-head divergence. This is amplified by the
+all-or-nothing nature of saturated attention.
+
+**Predicted**: with a 20-50 token prompt, attention distributions soften and
+the per-head divergence collapses. The L0 output sum (−26.8 vs −25.1, ~6%)
+is already close despite the per-head noise.
+
+### Revised hypotheses
+
+- **H1 (softmax saturation artifact)**: MOST LIKELY. 2-token test amplifies
+  tiny numerical differences through hard-saturated softmax. Longer prompts
+  should show much closer match.
+- **H5 (HFQ4 weight quantization compounding)**: The fp32 KV tests still
+  use HFQ4 quantized weights. Over 48 layers, the 4-bit quantization error
+  in q/k/v/o projections compounds. Need bf16/fp32 weights to discriminate.
+- H2 (GQA grouping): FALSIFIED by per-head within-pair analysis
+- H3 (KV offset): FALSIFIED by Q·K^T match + V cache verification
+- H4 (scale mismatch): FALSIFIED by Q·K^T match
+
+### Next steps (per review agent recommendations)
+1. Re-run coherence test with a 20-50 token prompt (softens attention)
+2. If still incoherent: quantize model as bf16/fp32 weights to isolate
+   weight quantization error from kernel bugs
+3. The bar is coherence, not logit-bit-match
+
+### Longer prompts + Q8 weights test — STILL GARBAGE
+
+Tested 3 prompts (capital/code/reason, 10-15 tokens each) with:
+- HFQ4 weights + fp32 KV: garbage
+- Q8 weights + fp32 KV: garbage
+
+Both produce random tokens across languages, special tokens (`<audio|>`, `（`),
+and repeated characters. This is NOT a 2-token softmax artifact and NOT a
+weight quantization issue.
+
+The per-layer L0 sum is close (-26.8 vs -25.1, ~6%) but over 48 layers
+the small per-layer error compounds into complete incoherence. Even with
+Q8 weights (near-zero quantization error) the output is garbage.
+
+**This means the structural attention divergence is real and compounds.**
+
+The softmax saturation hypothesis (from external review) predicted that
+longer prompts would soften the attention and reduce divergence. This
+did NOT happen — longer prompts produce equally garbage output.
+
+### Remaining investigation path
+
+Since:
+- Q·K^T scores match HF ✓
+- Embed + norms + projections match ✓
+- RoPE matches ✓
+- GQA grouping is correct (ruled out by within-pair analysis) ✓
+- Q8 weights don't fix it ✓
+- fp32 KV doesn't fix it ✓
+- Longer prompts don't fix it ✓
+
+The bug must be in one of:
+1. **The softmax or weighted-sum path inside the flash attention kernel**
+   (scores are correct but output diverges → softmax bug)
+2. **The `attention_flash` kernel reads K/V from wrong positions in
+   the fp32 cache** (for pos>1, the cache layout may be wrong)
+3. **The warm-pass (128 synthetic tokens) corrupts the KV cache** before
+   the real prompt is processed — positions 0-127 have synthetic data,
+   only positions 0..N-1 are overwritten by the prompt
