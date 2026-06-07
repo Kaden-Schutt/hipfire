@@ -541,6 +541,9 @@ pub struct Gemma4State {
     pub x: GpuTensor,        // [dim]
     pub residual: GpuTensor, // [dim]
     pub tmp: GpuTensor,      // [dim] norm / o_proj scratch
+    /// FWHT-rotated rmsnorm output for the fused MQ4 FFN path
+    /// (`fused_rmsnorm_rotate_mq` → `fused_gate_up_hfq4g256`). [dim]
+    pub tmp_rot: GpuTensor,
 
     // attention scratch (sized to max over layer types)
     pub q: GpuTensor,        // [max_q_dim]
@@ -574,6 +577,11 @@ impl Gemma4State {
         max_seq: usize,
     ) -> Result<Self, String> {
         let dim = cfg.dim;
+
+        // FWHT sign LUT must exist before any fused_rmsnorm_rotate_mq /
+        // fused_gate_up_hfq4g256 launch (the MQ4 fused FFN path).
+        gpu.ensure_mq_signs()
+            .map_err(|e| format!("gemma4: ensure_mq_signs: {e:?}"))?;
 
         // Two Q8 KV caches: one slot per layer of the matching type.
         let kv_sliding = KvCache::new_gpu_q8(
@@ -647,6 +655,7 @@ impl Gemma4State {
             x: alloc(gpu, dim, "x")?,
             residual: alloc(gpu, dim, "residual")?,
             tmp: alloc(gpu, dim, "tmp")?,
+            tmp_rot: alloc(gpu, dim, "tmp_rot")?,
             q: alloc(gpu, max_q, "q")?,
             k: alloc(gpu, max_kv, "k")?,
             v: alloc(gpu, max_kv, "v")?,

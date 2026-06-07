@@ -34,7 +34,19 @@
 use crate::config::{Gemma4Config, LayerType, RopeType};
 use crate::gemma4::{FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, SlidingLayerWeights};
 use hipfire_runtime::llama::{weight_gemv, KvCache};
-use rdna_compute::Gpu;
+use rdna_compute::{DType, Gpu};
+
+/// Master switch for the qwen35-mirror fused-projection FFN path
+/// (`fused_rmsnorm_rotate_mq` + `fused_gate_up_hfq4g256`). Default ON; opt out
+/// with `HIPFIRE_GEMMA4_FUSED_FFN=0`. Only fires when the FFN gate/up weights
+/// are MQ4G256 (byte-compatible with the HFQ4G256 fused kernel given a
+/// pre-FWHT-rotated input).
+fn fused_ffn_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_GEMMA4_FUSED_FFN").ok().as_deref(),
+        Some("0") | Some("off") | Some("false")
+    )
+}
 
 /// Decode one token (eager); returns the full logits vector. Used for prefill,
 /// the warm pass, and as the `HIPFIRE_GEMMA4_GRAPH=0` fallback.
@@ -569,16 +581,47 @@ fn finish_attn_and_ffn(
     gpu.memcpy_dtod_auto(&state.residual.buf, &state.x.buf, dim_bytes)
         .map_err(|e| format!("gemma4: save ffn residual: {e:?}"))?;
 
-    // Pre-FFN norm → tmp.
-    gpu.rmsnorm_f32(&state.x, tail.pre_feedforward_layernorm, &state.tmp, eps)
-        .map_err(|e| format!("gemma4: pre_ffn rmsnorm: {e:?}"))?;
-
-    // SwiGLU with gelu_pytorch_tanh: gate = gate_proj(tmp); up = up_proj(tmp);
-    // hidden = gelu_tanh(gate) * up; ffn_out = down_proj(hidden).
-    weight_gemv(gpu, tail.gate_proj, &state.tmp, &state.gate_ffn)
-        .map_err(|e| format!("gemma4: gate_proj: {e}"))?;
-    weight_gemv(gpu, tail.up_proj, &state.tmp, &state.up_ffn)
-        .map_err(|e| format!("gemma4: up_proj: {e}"))?;
+    // SwiGLU FFN with gelu_pytorch_tanh:
+    //   gate = gate_proj(pre_ffn_norm(x)); up = up_proj(pre_ffn_norm(x));
+    //   hidden = gelu_tanh(gate) * up; ffn_out = down_proj(hidden).
+    //
+    // Fused path (MQ4G256 gate/up): fuse the pre-FFN rmsnorm + FWHT rotation
+    // into one launch (fused_rmsnorm_rotate_mq → tmp_rot), then gate+up in one
+    // launch via fused_gate_up_hfq4g256 (MQ4G256 bytes are HFQ4G256-compatible
+    // given a pre-rotated input; the kernel does NOT re-rotate). Mirrors the old
+    // branch's HIPFIRE_GEMMA4_FUSED_PROJ path + qwen35.
+    let fuse_gate_up = fused_ffn_enabled()
+        && tail.gate_proj.gpu_dtype == DType::MQ4G256
+        && tail.up_proj.gpu_dtype == DType::MQ4G256;
+    if fuse_gate_up {
+        gpu.fused_rmsnorm_rotate_mq(
+            &state.x,
+            tail.pre_feedforward_layernorm,
+            &state.tmp_rot,
+            dim,
+            eps,
+        )
+        .map_err(|e| format!("gemma4: fused pre_ffn rmsnorm+rotate: {e:?}"))?;
+        gpu.fused_gate_up_hfq4g256(
+            &tail.gate_proj.buf,
+            &tail.up_proj.buf,
+            &state.tmp_rot,
+            &state.gate_ffn,
+            &state.up_ffn,
+            tail.gate_proj.m,
+            tail.up_proj.m,
+            tail.gate_proj.k,
+        )
+        .map_err(|e| format!("gemma4: fused gate_up: {e:?}"))?;
+    } else {
+        // Eager fallback: plain rmsnorm → two rotation-doing GEMVs.
+        gpu.rmsnorm_f32(&state.x, tail.pre_feedforward_layernorm, &state.tmp, eps)
+            .map_err(|e| format!("gemma4: pre_ffn rmsnorm: {e:?}"))?;
+        weight_gemv(gpu, tail.gate_proj, &state.tmp, &state.gate_ffn)
+            .map_err(|e| format!("gemma4: gate_proj: {e}"))?;
+        weight_gemv(gpu, tail.up_proj, &state.tmp, &state.up_ffn)
+            .map_err(|e| format!("gemma4: up_proj: {e}"))?;
+    }
     gpu.gelu_tanh_f32(&state.gate_ffn, &state.ffn_hidden, ffn_hd)
         .map_err(|e| format!("gemma4: gelu_tanh: {e:?}"))?;
     gpu.mul_f32(&state.ffn_hidden, &state.up_ffn, &state.ffn_hidden)
