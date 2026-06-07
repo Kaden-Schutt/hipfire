@@ -37,11 +37,29 @@ They define the methodology and architectural patterns we're following:
 
 ## Hardware Context
 
-- **GPU:** AMD RX 5700 XT (Navi 10, gfx1010, RDNA 1)
-- **GFX ID:** gfx1010
-- **VRAM:** 8GB GDDR6
-- **Status:** AMD officially refuses ROCm support for RDNA1. Consumer RDNA cards are artificially gated.
-- **Known hack:** `HSA_OVERRIDE_GFX_VERSION=10.3.0` tricks ROCm into treating gfx1010 as gfx1030 (RDNA2). Unreliable, version-dependent, causes segfaults.
+**Origin target (RDNA1 unlock):** AMD RX 5700 XT (Navi 10, **gfx1010**, RDNA1,
+8GB GDDR6) — the card this project was started to unlock. AMD officially refuses
+ROCm support for RDNA1; consumer RDNA cards are artificially gated. The
+`HSA_OVERRIDE_GFX_VERSION=10.3.0` hack (treat gfx1010 as gfx1030) is unreliable,
+version-dependent, and segfaults — per Rule 5 it is NOT a permanent solution.
+The 5700 XT now lives on the **hipx** box (HIP device 0, ~7GB), not k9lin.
+
+**Current dev + validation fleet (RDNA1 → RDNA4, all native — no GFX override):**
+- **k9lin** (primary dev/perf host, local) — **gfx1100 / RX 7900 XTX, 24GB,
+  RDNA3** (Navi 31, `1002:744c`). The canonical perf box: the
+  perf-benchmarking methodology (±1–3% band, Δ≥5% investigate) is calibrated to
+  this card. Fits quantized 9B/27B/A3B; not full MiniMax-class.
+- **hipx** (ssh) — **gfx1151 / Strix Halo, RDNA3.5, ~96GB** carveout (HIP
+  device 1, pin `HIP_VISIBLE_DEVICES=1`) for big models + WMMA; plus the
+  **gfx1010 / RDNA1** 5700 XT (device 0, ~7GB).
+- **hiptrx** (ssh) — **4× AMD Radeon AI PRO R9700 / gfx1201, RDNA4, 32 GiB
+  each** (rocm-smi reports 34,208,743,424 B ≈ 34.2 GB; ~128 GiB aggregate) on a
+  Threadripper 9970X. RDNA4 coverage + multi-GPU pipeline-parallel.
+
+Cross-arch validation (e.g. #397's mandated gfx1100 RDNA3 + gfx1201 RDNA4
+gates, RDNA4 non-optional) maps natively: RDNA1 = hipx/gfx1010, RDNA3 =
+k9lin/gfx1100, RDNA3.5 = hipx/gfx1151, RDNA4 = hiptrx/gfx1201. Per-box
+`gpu-lock.sh` → genuine cross-box parallel validation.
 
 ## Orchestration Model
 
