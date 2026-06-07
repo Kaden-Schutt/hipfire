@@ -2609,4 +2609,119 @@ impl Gpu {
         result
     }
 
+    // ── Gemma 4 ops (final-logit softcap + full-attention partial RoPE) ──
+
+    /// Final-logit soft-capping in-place (Gemma 4): x = tanh(x/cap)*cap.
+    /// Applied to the LM-head output vector (e.g. 262144 floats) before sampling.
+    /// 1D grid over n, block 256.
+    pub fn logit_softcap_f32(&mut self, x: &GpuTensor, n: usize, cap: f32) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("logit_softcap_f32", kernels::LOGIT_SOFTCAP_SRC, "logit_softcap_f32")?;
+        let xp = x.buf.as_ptr();
+        let ni = n as i32;
+        let cp = cap;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+        ];
+        let blocks = ((n + 255) / 256) as u32;
+        let bytes = crate::profile::elementwise1_bytes(n);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "logit_softcap_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "logit_softcap_f32", [blocks, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_i32(ni); b.push_f32(cp);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Gemma 4 full-attention partial RoPE (head_dim=512, n_rot_pairs=64).
+    /// HF `rotate_half` pairing — pair i = (dim i, dim i+head_dim/2); the first
+    /// `n_rot_pairs` pairs rotate, the rest are NoPE pass-through. `pos_buf` is a
+    /// device buffer holding one i32 position (graph-capture-safe). Grid over
+    /// n_rot_pairs, block 256.
+    pub fn rope_partial_halved_f32(
+        &mut self, q: &GpuTensor, k: &GpuTensor, pos_buf: &DeviceBuffer,
+        n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot_pairs: usize, freq_base: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("rope_partial_halved", kernels::ROPE_PARTIAL_HALVED_SRC, "rope_partial_halved_f32")?;
+        let qp = q.buf.as_ptr(); let kp = k.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let nhq = n_heads_q as i32; let nhk = n_heads_k as i32;
+        let hd = head_dim as i32; let nrp = n_rot_pairs as i32; let fb = freq_base;
+        let block = 256u32;
+        let grid = [((n_rot_pairs as u32) + block - 1) / block, 1, 1];
+        let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_halved_f32", bytes);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void, &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
+            &nrp as *const _ as *mut c_void, &fb as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "rope_partial_halved_f32", grid, [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(pp);
+                b.push_i32(nhq); b.push_i32(nhk); b.push_i32(hd); b.push_i32(nrp);
+                b.push_f32(fb);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Batched (N-token) Gemma 4 full-attention partial RoPE — twin of
+    /// `rope_partial_halved_f32`. Reads one i32 position per token from a device
+    /// array. Q/K are [batch × n_heads × head_dim] row-major. Grid over
+    /// n_rot_pairs × batch, block 256.
+    pub fn rope_partial_halved_f32_batched(
+        &mut self, q: &GpuTensor, k: &GpuTensor, positions: &GpuTensor,
+        n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot_pairs: usize,
+        freq_base: f32, batch: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_partial_halved_batched",
+            kernels::ROPE_PARTIAL_HALVED_BATCHED_SRC,
+            "rope_partial_halved_f32_batched",
+        )?;
+        let qp = q.buf.as_ptr(); let kp = k.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let nhq = n_heads_q as i32; let nhk = n_heads_k as i32;
+        let hd = head_dim as i32; let nrp = n_rot_pairs as i32; let fb = freq_base;
+        let bz = batch as i32;
+        let block = 256u32;
+        let grid = [((n_rot_pairs as u32) + block - 1) / block, batch as u32, 1];
+        let bytes = batch * crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_halved_f32_batched", bytes);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void, &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
+            &nrp as *const _ as *mut c_void, &fb as *const _ as *mut c_void,
+            &bz as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "rope_partial_halved_f32_batched", grid, [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(pp);
+                b.push_i32(nhq); b.push_i32(nhk); b.push_i32(hd); b.push_i32(nrp);
+                b.push_f32(fb); b.push_i32(bz);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
 }

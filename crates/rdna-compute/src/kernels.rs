@@ -2888,6 +2888,18 @@ pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str =
 pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip");
 
+/// Gemma 4 full-attention partial RoPE (HF `rotate_half` pairing). head_dim=512
+/// but only the first `n_rot_pairs` pairs (i, i+head_dim/2) rotate; the rest are
+/// NoPE pass-through. Pairs differ from the interleaved/halfsplit variants — see
+/// `kernels/src/rope_partial_halved.hip` for the proportional-RoPE math.
+pub const ROPE_PARTIAL_HALVED_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halved.hip");
+
+/// Batched (N-token) counterpart to `ROPE_PARTIAL_HALVED_SRC`, used by Gemma 4
+/// batched prefill. Reads one i32 position per token from a device array.
+pub const ROPE_PARTIAL_HALVED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halved_batched.hip");
+
 /// 1D causal depthwise convolution (kernel_size=4) with persistent ring buffer state.
 /// For decode: one token at a time. conv_state: [n_channels × 3] ring buffer.
 /// out[c] = w[0]*x[c] + w[1]*state[c][0] + w[2]*state[c][1] + w[3]*state[c][2]
@@ -3160,6 +3172,10 @@ pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip
 
 /// GELU activation (tanh approximation, matches gelu_pytorch_tanh).
 pub const GELU_TANH_SRC: &str = include_str!("../../../kernels/src/gelu_tanh.hip");
+
+/// Gemma 4 final-logit soft-capping (in-place): x = tanh(x/cap)*cap. Applied to
+/// the LM-head output before sampling. Gemma 4 has NO per-attention-layer softcap.
+pub const LOGIT_SOFTCAP_SRC: &str = include_str!("../../../kernels/src/logit_softcap.hip");
 
 /// Transpose: out[c, r] = in[r, c]. Converts [rows, cols] → [cols, rows].
 pub const TRANSPOSE_SRC: &str = include_str!("../../../kernels/src/transpose.hip");
