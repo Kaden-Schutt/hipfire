@@ -143,15 +143,27 @@ fn main() {
         eprintln!("error: no tensors captured — did the oracle load with named weights?");
         std::process::exit(1);
     }
-    // Spot-check a couple of well-known names so a name-mismatch can't pass silently.
-    for probe in [
-        "model.language_model.layers.0.self_attn.q_proj.weight",
-        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
-        "model.language_model.lm_head.weight",
+    // Spot-check by category so a name-mismatch can't pass silently. Names are
+    // the canonical safetensors form (== the quantizer's lookup key): the
+    // transformer body keeps the `model.language_model.` prefix, lm_head is bare.
+    for (label, suffix) in [
+        ("self_attn.q_proj  (full-attn)", "self_attn.q_proj.weight"),
+        ("linear_attn.in_proj_qkv     ", "linear_attn.in_proj_qkv.weight"),
+        ("mlp.down_proj               ", "mlp.down_proj.weight"),
+        ("lm_head                     ", "lm_head.weight"),
     ] {
-        match cap.entries.get(probe) {
-            Some((s, n)) => eprintln!("  ✓ {probe}  (K={}, count={})", s.len(), n),
-            None => eprintln!("  · {probe}  not present (arch may differ — ok if expected)"),
+        let hit = cap
+            .entries
+            .iter()
+            .filter(|(k, _)| k.ends_with(suffix) && !k.starts_with("mtp."))
+            .count();
+        let example = cap
+            .entries
+            .iter()
+            .find(|(k, _)| k.ends_with(suffix) && !k.starts_with("mtp."));
+        match example {
+            Some((k, (s, _))) => eprintln!("  ✓ {label}  ×{hit}  K={}  e.g. {k}", s.len()),
+            None => eprintln!("  · {label}  not present (arch may differ — ok if expected)"),
         }
     }
 

@@ -1667,9 +1667,11 @@ fn load_weight_tensor(
                 wt.awq_scale = load_awq_scale_for(hfq, gpu, name, k);
             }
         }
-        // Native imatrix collection keys per-channel Σact² by this canonical
-        // name (== the name the quantizer looks up), so HFIM needs no remap.
-        wt.name = name.to_string();
+        // Native imatrix collection keys per-channel Σact² by the FULL tensor
+        // name that actually resolved in the .hfq (== the safetensors name the
+        // quantizer looks up), so HFIM needs no remap. `name` is the short
+        // (`layers.N...`) form; `matched` is the canonical full form.
+        wt.name = matched.clone().unwrap_or_else(|| name.to_string());
         return Ok(wt);
     }
     #[cfg(not(unix))]
@@ -1689,7 +1691,7 @@ fn load_weight_tensor(
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
-        wt.name = name.to_string();
+        wt.name = matched_name.clone();
         Ok(wt)
     }
 }
@@ -2882,6 +2884,10 @@ pub fn load_weights(
             }
         }
     };
+    // Native imatrix: lm_head keys under its bare safetensors name (the
+    // quantizer iterates safetensors names; lm_head has no model.language_model
+    // prefix), matching load_awq_scale_for's first candidate below.
+    output.name = "lm_head.weight".to_string();
     // AWQ sidecar attachment for lm_head / tied embed_tokens. Safe now
     // that both decode (`weight_gemv` → `rotate_x_mq_for`) AND spec-
     // decode verify (`speculative.rs::rotate_x_mq_batched_for`) apply
