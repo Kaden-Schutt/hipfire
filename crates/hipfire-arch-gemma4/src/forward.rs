@@ -48,6 +48,49 @@ fn fused_ffn_enabled() -> bool {
     )
 }
 
+/// Master switch for the fused Q8 q+k projection path
+/// (`fused_gate_up_q8_0`, 2 Q8 GEMVs → 1 launch, shared rmsnorm input).
+/// Default ON; opt out with `HIPFIRE_GEMMA4_FUSED_QK=0`. gemma4 attention is
+/// Q8 (no Q8 fused-QKV decode kernel exists), so we fuse q+k via the 2-way
+/// Q8 gate_up fuser and leave v / o separate. Coherence is preserved (the
+/// fused kernel is byte-equivalent to two separate Q8 GEMVs).
+fn fused_qk_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_GEMMA4_FUSED_QK").ok().as_deref(),
+        Some("0") | Some("off") | Some("false")
+    )
+}
+
+/// q = q_proj(x); k = k_proj(x). Fused into one launch via `fused_gate_up_q8_0`
+/// when both are Q8_0 (same input `x`); else two `weight_gemv` calls.
+fn qk_proj(
+    gpu: &mut Gpu,
+    q_proj: &hipfire_runtime::llama::WeightTensor,
+    k_proj: &hipfire_runtime::llama::WeightTensor,
+    x: &rdna_compute::GpuTensor,
+    q_out: &rdna_compute::GpuTensor,
+    k_out: &rdna_compute::GpuTensor,
+) -> Result<(), String> {
+    let both_q8 =
+        q_proj.gpu_dtype == DType::Q8_0 && k_proj.gpu_dtype == DType::Q8_0;
+    if fused_qk_enabled() && both_q8 {
+        gpu.fused_gate_up_q8_0(
+            &q_proj.buf,
+            &k_proj.buf,
+            x,
+            q_out,
+            k_out,
+            q_proj.m,
+            k_proj.m,
+            q_proj.k,
+        )
+        .map_err(|e| format!("gemma4: fused q+k: {e:?}"))
+    } else {
+        weight_gemv(gpu, q_proj, x, q_out).map_err(|e| format!("gemma4: q_proj: {e}"))?;
+        weight_gemv(gpu, k_proj, x, k_out).map_err(|e| format!("gemma4: k_proj: {e}"))
+    }
+}
+
 /// Decode one token (eager); returns the full logits vector. Used for prefill,
 /// the warm pass, and as the `HIPFIRE_GEMMA4_GRAPH=0` fallback.
 pub fn decode_step(
@@ -297,11 +340,8 @@ fn sliding_layer_decode(
     gpu.rmsnorm_f32(&state.x, &lw.input_layernorm, &state.tmp, eps)
         .map_err(|e| format!("gemma4 sliding: input rmsnorm: {e:?}"))?;
 
-    // q/k/v projections.
-    weight_gemv(gpu, &lw.q_proj, &state.tmp, &state.q)
-        .map_err(|e| format!("gemma4 sliding: q_proj: {e}"))?;
-    weight_gemv(gpu, &lw.k_proj, &state.tmp, &state.k)
-        .map_err(|e| format!("gemma4 sliding: k_proj: {e}"))?;
+    // q/k/v projections. q+k fused (shared rmsnorm input) when both Q8.
+    qk_proj(gpu, &lw.q_proj, &lw.k_proj, &state.tmp, &state.q, &state.k)?;
     weight_gemv(gpu, &lw.v_proj, &state.tmp, &state.v)
         .map_err(|e| format!("gemma4 sliding: v_proj: {e}"))?;
 
@@ -379,11 +419,8 @@ fn full_layer_decode(
     gpu.rmsnorm_f32(&state.x, &lw.input_layernorm, &state.tmp, eps)
         .map_err(|e| format!("gemma4 full: input rmsnorm: {e:?}"))?;
 
-    // q/k projections.
-    weight_gemv(gpu, &lw.q_proj, &state.tmp, &state.q)
-        .map_err(|e| format!("gemma4 full: q_proj: {e}"))?;
-    weight_gemv(gpu, &lw.k_proj, &state.tmp, &state.k)
-        .map_err(|e| format!("gemma4 full: k_proj: {e}"))?;
+    // q/k projections — fused (shared rmsnorm input) when both Q8.
+    qk_proj(gpu, &lw.q_proj, &lw.k_proj, &state.tmp, &state.q, &state.k)?;
 
     // V handling:
     //   attention_k_eq_v (12B): V = K's PRE-k_norm output (memcpy k → v BEFORE
