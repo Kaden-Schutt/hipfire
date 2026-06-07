@@ -7015,6 +7015,102 @@ fn run_fused_gate_up_key(
         .map_err(HipError::from)
 }
 
+/// Dispatch a batched-prefill **3-way fused QKV** projection (wq+wk+wv) through
+/// [`FusedQkvFamily`] against an explicit `FusedQkv*` [`KernelKey`]
+/// (`#397 Ship 5.2 slice 3`).
+///
+/// QKV analogue of [`run_fused_gate_up_key`]: three weights (wq, wk, wv), three
+/// outputs (q, k, v), three row-counts. Passing `batch_size: Some(n)` routes the
+/// family's QKV run-arm to the IDENTICAL batched `gpu.gemm_qkv_*(.., n)` method
+/// the direct prefill call used — each method keeps its own internal arch routing
+/// (RDNA4-WMMA / gfx906-dp4a / MMQ / fp16 / scalar) byte-for-byte. The weights,
+/// activation `x` (already rmsnorm[-rotated] by the caller), outputs and m/k/n
+/// args are unchanged at every migrated site. The `FusedQkv*` key carries the
+/// dtype; for HFQ3 the run-arm replicates the call-site WMMA-vs-base arch split
+/// internally via `gpu.arch_caps`. `resolve()` only confirms the entry's
+/// ArchPredicate admits the current arch.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_fused_qkv_key(
+    gpu: &mut Gpu,
+    key: hipfire_dispatch::types::KernelKey,
+    wq: &GpuTensor,
+    wk: &GpuTensor,
+    wv: &GpuTensor,
+    x: &GpuTensor,
+    y_q: &GpuTensor,
+    y_k: &GpuTensor,
+    y_v: &GpuTensor,
+    q_m: usize,
+    k_m: usize,
+    v_m: usize,
+    k: usize,
+    n: usize,
+) -> HipResult<()> {
+    use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
+    let ctx = DispatchCtx::new(gpu);
+    let params = FusedQkvParams {
+        kind: key,
+        weights: &[wq, wk, wv],
+        x,
+        outputs: &[y_q, y_k, y_v],
+        m: &[q_m, k_m, v_m],
+        k,
+        rot_scratch: &[],
+        batch_size: Some(n),
+    };
+    hipfire_runtime::llama::fused_qkv_family()
+        .run(&ctx, gpu, &params)
+        .map_err(HipError::from)
+}
+
+/// Dispatch a batched-prefill **4-way fused QKVZA** projection (DeltaNet linear
+/// attention: wqkv + wz + w_beta + w_alpha) through [`FusedQkvFamily`] against an
+/// explicit `FusedQkvza*` [`KernelKey`] (`#397 Ship 5.2 slice 3`).
+///
+/// QKVZA analogue of [`run_fused_qkv_key`]: four weights, four outputs, four
+/// row-counts. `batch_size: Some(n)` routes the family's QKVZA run-arm to the
+/// IDENTICAL batched `gpu.gemm_qkvza_*(.., n)` method the direct prefill call
+/// used. All operands are passed unchanged; for HFQ3 the run-arm replicates the
+/// call-site WMMA-vs-base arch split internally.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_fused_qkvza_key(
+    gpu: &mut Gpu,
+    key: hipfire_dispatch::types::KernelKey,
+    w_qkv: &GpuTensor,
+    w_z: &GpuTensor,
+    w_beta: &GpuTensor,
+    w_alpha: &GpuTensor,
+    x: &GpuTensor,
+    y_qkv: &GpuTensor,
+    y_z: &GpuTensor,
+    y_beta: &GpuTensor,
+    y_alpha: &GpuTensor,
+    qkv_m: usize,
+    z_m: usize,
+    beta_m: usize,
+    alpha_m: usize,
+    k: usize,
+    n: usize,
+) -> HipResult<()> {
+    use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
+    let ctx = DispatchCtx::new(gpu);
+    let params = FusedQkvParams {
+        kind: key,
+        weights: &[w_qkv, w_z, w_beta, w_alpha],
+        x,
+        outputs: &[y_qkv, y_z, y_beta, y_alpha],
+        m: &[qkv_m, z_m, beta_m, alpha_m],
+        k,
+        rot_scratch: &[],
+        batch_size: Some(n),
+    };
+    hipfire_runtime::llama::fused_qkv_family()
+        .run(&ctx, gpu, &params)
+        .map_err(HipError::from)
+}
+
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
 /// residual stream in `pbs.x_batch` ([N × dim]) and writes the FFN output
 /// residual back into the same buffer in-place.
@@ -7902,7 +7998,9 @@ fn forward_prefill_chunk(
 
                 // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
                 if is_6bit {
-                    gpu.gemm_qkvza_hfq6g256(
+                    run_fused_qkvza_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvzaHfq6G256,
                         &layer.wqkv.buf,
                         &layer.wz.buf,
                         &layer.w_beta.buf,
@@ -7930,7 +8028,9 @@ fn forward_prefill_chunk(
                         && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
                         "LA qkvza Q8 WMMA dispatch requires all of wqkv/wz/w_beta/w_alpha to be Q8_0",
                     );
-                    gpu.gemm_qkvza_q8_0_wmma(
+                    run_fused_qkvza_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvzaQ8_0,
                         &layer.wqkv.buf,
                         &layer.wz.buf,
                         &layer.w_beta.buf,
@@ -7998,7 +8098,9 @@ fn forward_prefill_chunk(
                     )?;
                 } else if is_mq3_lloyd {
                     // 112 B/group Lloyd-MQ3 stride; X is already FWHT-rotated.
-                    gpu.gemm_qkvza_mq3g256_lloyd_wmma(
+                    run_fused_qkvza_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvzaMq3G256Lloyd,
                         &layer.wqkv.buf,
                         &layer.wz.buf,
                         &layer.w_beta.buf,
@@ -8017,44 +8119,29 @@ fn forward_prefill_chunk(
                     )?;
                 } else if is_mq3 {
                     // 104 B/group HFQ3-stride; X is already FWHT-rotated by
-                    // fused_rmsnorm_rotate_mq_batched above.
-                    if arch_has_wmma {
-                        gpu.gemm_qkvza_hfq3g256_wmma(
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            &pbs.x_rot_batch,
-                            &pbs.dn_qkv_batch,
-                            &pbs.dn_z_batch,
-                            &pbs.dn_beta_batch,
-                            &pbs.dn_alpha_batch,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                            n,
-                        )?;
-                    } else {
-                        gpu.gemm_qkvza_hfq3g256(
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            &pbs.x_rot_batch,
-                            &pbs.dn_qkv_batch,
-                            &pbs.dn_z_batch,
-                            &pbs.dn_beta_batch,
-                            &pbs.dn_alpha_batch,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                            n,
-                        )?;
-                    }
+                    // fused_rmsnorm_rotate_mq_batched above. The FusedQkvzaHfq3G256
+                    // run-arm replicates the call-site WMMA-vs-base arch split
+                    // internally (gemm_qkvza_hfq3g256_wmma on has_wmma() else the
+                    // base cross-arch ladder), so the same kernel runs.
+                    run_fused_qkvza_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvzaHfq3G256,
+                        &layer.wqkv.buf,
+                        &layer.wz.buf,
+                        &layer.w_beta.buf,
+                        &layer.w_alpha.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch,
+                        &pbs.dn_z_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        layer.wqkv.m,
+                        layer.wz.m,
+                        layer.w_beta.m,
+                        layer.w_alpha.m,
+                        layer.wqkv.k,
+                        n,
+                    )?;
                 } else if is_fp4 {
                     // HFP4G32: 17-B blocks (vs HFQ4's 136-B groups), per-row 16-B header.
                     // MFP4G32: same storage as HFP4 + offline-FWHT weights; X is already
@@ -8078,7 +8165,9 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else {
-                    gpu.gemm_qkvza_hfq4g256(
+                    run_fused_qkvza_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256,
                         &layer.wqkv.buf,
                         &layer.wz.buf,
                         &layer.w_beta.buf,
@@ -8809,7 +8898,9 @@ fn forward_prefill_chunk(
 
                 // 2. Batched 3-way QKV projection (wq+wk+wv).
                 if qkv_is_6bit && qkv_same_dtype {
-                    gpu.gemm_qkv_hfq6g256(
+                    run_fused_qkv_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvHfq6G256,
                         &layer.wq.buf,
                         &layer.wk.buf,
                         &layer.wv.buf,
@@ -8824,7 +8915,9 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if qkv_is_mq3_lloyd && qkv_same_dtype {
-                    gpu.gemm_qkv_mq3g256_lloyd_wmma(
+                    run_fused_qkv_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvMq3G256Lloyd,
                         &layer.wq.buf,
                         &layer.wk.buf,
                         &layer.wv.buf,
@@ -8840,38 +8933,26 @@ fn forward_prefill_chunk(
                     )?;
                 } else if qkv_is_mq3 && qkv_same_dtype {
                     // X is already FWHT-rotated by fused_rmsnorm_rotate_mq_batched
-                    // above; call the bare HFQ3 GEMM (no second rotation).
-                    if arch_has_wmma {
-                        gpu.gemm_qkv_hfq3g256_wmma(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            &pbs.x_rot_batch,
-                            &pbs.fa_q_full_batch,
-                            &pbs.fa_k_batch,
-                            &pbs.fa_v_batch,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                            n,
-                        )?;
-                    } else {
-                        gpu.gemm_qkv_hfq3g256(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            &pbs.x_rot_batch,
-                            &pbs.fa_q_full_batch,
-                            &pbs.fa_k_batch,
-                            &pbs.fa_v_batch,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                            n,
-                        )?;
-                    }
+                    // above; call the bare HFQ3 GEMM (no second rotation). The
+                    // FusedQkvHfq3G256 run-arm replicates the call-site WMMA-vs-base
+                    // arch split internally (gemm_qkv_hfq3g256_wmma on has_wmma()
+                    // else the base cross-arch ladder), so the same kernel runs.
+                    run_fused_qkv_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvHfq3G256,
+                        &layer.wq.buf,
+                        &layer.wk.buf,
+                        &layer.wv.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        layer.wq.m,
+                        layer.wk.m,
+                        layer.wv.m,
+                        layer.wq.k,
+                        n,
+                    )?;
                 } else if qkv_is_fp4 && qkv_same_dtype {
                     // HFP4G32 / MFP4G32 FP4 batched WMMA. X is already
                     // rotated above for MFP4 (is_mq path) — same kernel
@@ -8896,7 +8977,9 @@ fn forward_prefill_chunk(
                             && matches!(layer.wv.gpu_dtype, DType::Q8_0),
                         "FA qkv Q8 WMMA dispatch requires all of wq/wk/wv to be Q8_0",
                     );
-                    gpu.gemm_qkv_q8_0_wmma(
+                    run_fused_qkv_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvQ8_0,
                         &layer.wq.buf,
                         &layer.wk.buf,
                         &layer.wv.buf,
@@ -8945,7 +9028,9 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if qkv_same_dtype {
-                    gpu.gemm_qkv_hfq4g256(
+                    run_fused_qkv_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvHfq4G256,
                         &layer.wq.buf,
                         &layer.wk.buf,
                         &layer.wv.buf,
@@ -9737,7 +9822,9 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if is_6bit {
-                    gpu.gemm_qkvza_hfq6g256(
+                    run_fused_qkvza_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvzaHfq6G256,
                         &layer.wqkv.buf,
                         &layer.wz.buf,
                         &layer.w_beta.buf,
@@ -9766,7 +9853,9 @@ fn forward_prefill_chunk(
                         && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
                         "DNMoe LA qkvza Q8 WMMA dispatch requires all of wqkv/wz/w_beta/w_alpha to be Q8_0",
                     );
-                    gpu.gemm_qkvza_q8_0_wmma(
+                    run_fused_qkvza_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvzaQ8_0,
                         &layer.wqkv.buf,
                         &layer.wz.buf,
                         &layer.w_beta.buf,
@@ -9831,7 +9920,9 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else {
-                    gpu.gemm_qkvza_hfq4g256(
+                    run_fused_qkvza_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256,
                         &layer.wqkv.buf,
                         &layer.wz.buf,
                         &layer.w_beta.buf,
@@ -10340,7 +10431,9 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if qkv_is_6bit && qkv_same_dtype {
-                    gpu.gemm_qkv_hfq6g256(
+                    run_fused_qkv_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvHfq6G256,
                         &layer.wq.buf,
                         &layer.wk.buf,
                         &layer.wv.buf,
@@ -10360,7 +10453,9 @@ fn forward_prefill_chunk(
                             && matches!(layer.wv.gpu_dtype, DType::Q8_0),
                         "FAMoe qkv Q8 WMMA dispatch requires all of wq/wk/wv to be Q8_0",
                     );
-                    gpu.gemm_qkv_q8_0_wmma(
+                    run_fused_qkv_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvQ8_0,
                         &layer.wq.buf,
                         &layer.wk.buf,
                         &layer.wv.buf,
@@ -10409,7 +10504,9 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if qkv_same_dtype {
-                    gpu.gemm_qkv_hfq4g256(
+                    run_fused_qkv_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedQkvHfq4G256,
                         &layer.wq.buf,
                         &layer.wk.buf,
                         &layer.wv.buf,

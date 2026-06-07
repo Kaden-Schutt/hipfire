@@ -145,14 +145,16 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
 pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
     use KernelKey::*;
     match key {
-        // 3-way Fused QKV (incl. Q4K and the Paro 4G128T QKV synthesis)
+        // 3-way Fused QKV (incl. Q4K, Q8_0/HFQ3 prefill, and the Paro 4G128T QKV synthesis)
         FusedQkvHfq4G256 | FusedQkvMq3G256Lloyd | FusedQkvMq4G256Lloyd
-        | FusedQkvHfq6G256 | FusedQkvQ4K | FusedQkvParo4G128T => {
+        | FusedQkvHfq6G256 | FusedQkvQ4K | FusedQkvQ8_0 | FusedQkvHfq3G256
+        | FusedQkvParo4G128T => {
             Some(FusedQkvVariant::Qkv)
         }
-        // 4-way Fused QKVZA (DeltaNet linear attention, incl. Paro 4G128T)
+        // 4-way Fused QKVZA (DeltaNet linear attention, incl. Q8_0/HFQ3 prefill and Paro 4G128T)
         FusedQkvzaHfq4G256 | FusedQkvzaMq3G256Lloyd | FusedQkvzaMq4G256Lloyd
-        | FusedQkvzaHfq6G256 | FusedQkvzaParo4G128T => Some(FusedQkvVariant::Qkvza),
+        | FusedQkvzaHfq6G256 | FusedQkvzaQ8_0 | FusedQkvzaHfq3G256
+        | FusedQkvzaParo4G128T => Some(FusedQkvVariant::Qkvza),
         // 2-way Fused Gate+Up (FFN, incl. Q8_0, HFQ3, HFP4 and Paro 4G128T)
         FusedGateUpHfq4G256 | FusedGateUpMq3G256Lloyd | FusedGateUpMq4G256Lloyd
         | FusedGateUpHfq6G256 | FusedGateUpQ4K | FusedGateUpQ8_0
@@ -254,11 +256,17 @@ pub enum KernelKey {
     FusedQkvMq4G256Lloyd,
     FusedQkvHfq6G256,
     FusedQkvQ4K,
+    // Fused QKV — prefill dtypes (#397 Ship 5.2 slice 3)
+    FusedQkvQ8_0,
+    FusedQkvHfq3G256,
     // Fused QKVZA (linear attention)
     FusedQkvzaHfq4G256,
     FusedQkvzaMq3G256Lloyd,
     FusedQkvzaMq4G256Lloyd,
     FusedQkvzaHfq6G256,
+    // Fused QKVZA — prefill dtypes (#397 Ship 5.2 slice 3)
+    FusedQkvzaQ8_0,
+    FusedQkvzaHfq3G256,
     // Fused Gate+Up
     FusedGateUpHfq4G256,
     FusedGateUpMq3G256Lloyd,

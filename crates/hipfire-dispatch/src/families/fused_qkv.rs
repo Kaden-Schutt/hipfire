@@ -84,29 +84,53 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
     let k = params.k;
     match params.kind {
         // ── 3-way Fused QKV ────────────────────────────────────
+        //
+        // Each arm is batch-aware via `params.batch_size` (mirrors the gate+up
+        // arms below):
+        //   None    → single-token DECODE → `gpu.fused_qkv_*` (historical;
+        //             the decode pipeline in `pipeline::steps` passes `None`).
+        //   Some(n) → batched PREFILL    → `gpu.gemm_qkv_*(.., n)`, the IDENTICAL
+        //             batched method the qwen35 prefill call site used directly;
+        //             each method keeps its own internal arch routing byte-for-byte.
+        // `#397 Ship 5.2 slice 3` migrates the qwen35 prefill QKV sites onto the
+        // `Some(n)` paths.
         KernelKey::FusedQkvHfq4G256 => {
             let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [mq, mk, mv] = <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
-            hip!(gpu.fused_qkv_hfq4g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k))
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkv_hfq4g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n)),
+                None => hip!(gpu.fused_qkv_hfq4g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+            }
         }
         KernelKey::FusedQkvMq3G256Lloyd => {
             let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [mq, mk, mv] = <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
-            hip!(gpu.fused_qkv_mq3g256_lloyd(wq, wk, wv, x, q, kout, v, mq, mk, mv, k))
+            match params.batch_size {
+                // Prefill mq3-lloyd is WMMA-only (`gemm_qkv_mq3g256_lloyd_wmma`);
+                // arch_required=HasWmma gates the entry.
+                Some(n) => hip!(gpu.gemm_qkv_mq3g256_lloyd_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n)),
+                None => hip!(gpu.fused_qkv_mq3g256_lloyd(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+            }
         }
         KernelKey::FusedQkvMq4G256Lloyd => {
             let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [mq, mk, mv] = <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
-            hip!(gpu.fused_qkv_mq4g256_lloyd(wq, wk, wv, x, q, kout, v, mq, mk, mv, k))
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkv_mq4g256_lloyd_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n)),
+                None => hip!(gpu.fused_qkv_mq4g256_lloyd(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+            }
         }
         KernelKey::FusedQkvHfq6G256 => {
             let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [mq, mk, mv] = <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
-            hip!(gpu.fused_qkv_hfq6g256_dp4a(wq, wk, wv, x, q, kout, v, mq, mk, mv, k))
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkv_hfq6g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n)),
+                None => hip!(gpu.fused_qkv_hfq6g256_dp4a(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+            }
         }
         KernelKey::FusedQkvQ4K => {
             let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 3))?;
@@ -114,31 +138,107 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             let [mq, mk, mv] = <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
             hip!(gpu.fused_qkv_q4k(wq, wk, wv, x, q, kout, v, mq, mk, mv, k))
         }
+        // ── Q8_0 fused QKV — prefill-only key (#397 Ship 5.2 slice 3) ──
+        // No decode `fused_qkv_q8_0` exists; this key is batched-prefill only and
+        // WMMA-only (entry gated HasWmma). `gpu.gemm_qkv_q8_0_wmma` routes the
+        // gfx12 WMMA sibling on RDNA4 internally; no scalar fallback. The qwen35
+        // non-WMMA arch case stays as three plain GemmQ8_0BatchedChunked GEMMs.
+        KernelKey::FusedQkvQ8_0 => {
+            let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [mq, mk, mv] = <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let n = params.batch_size.ok_or(DispatchError::UnsupportedVariant {
+                family: "fused_qkv", variant: "qkv", arch: "", quant: "q8_0 (prefill-only)",
+            })?;
+            hip!(gpu.gemm_qkv_q8_0_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+        }
+        // ── HFQ3G256 fused QKV — prefill-only key (#397 Ship 5.2 slice 3) ──
+        // No decode `fused_qkv_hfq3g256` exists; batched-prefill only. The qwen35
+        // site picks `gemm_qkv_hfq3g256_wmma` on has_wmma() archs else the base
+        // `gemm_qkv_hfq3g256` (full cross-arch ladder). We mirror that arch split
+        // here so the same kernel runs (cf. FusedGateUpHfq3G256).
+        KernelKey::FusedQkvHfq3G256 => {
+            let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [mq, mk, mv] = <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let n = params.batch_size.ok_or(DispatchError::UnsupportedVariant {
+                family: "fused_qkv", variant: "qkv", arch: "", quant: "hfq3g256 (prefill-only)",
+            })?;
+            if gpu.arch_caps.has_wmma() {
+                hip!(gpu.gemm_qkv_hfq3g256_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+            } else {
+                hip!(gpu.gemm_qkv_hfq3g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+            }
+        }
 
         // ── 4-way Fused QKVZA (DeltaNet linear attention) ────
+        //
+        // Batch-aware via `params.batch_size` (same scheme as 3-way QKV):
+        //   None    → DECODE  → `gpu.fused_qkvza_*` (historical).
+        //   Some(n) → PREFILL → `gpu.gemm_qkvza_*(.., n)`, the IDENTICAL batched
+        //             method the qwen35 prefill call site used directly.
         KernelKey::FusedQkvzaHfq4G256 => {
             let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [mqkv, mz, mbeta, malpha] = <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
-            hip!(gpu.fused_qkvza_hfq4g256(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k))
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkvza_hfq4g256(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n)),
+                None => hip!(gpu.fused_qkvza_hfq4g256(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k)),
+            }
         }
         KernelKey::FusedQkvzaMq3G256Lloyd => {
             let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [mqkv, mz, mbeta, malpha] = <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
-            hip!(gpu.fused_qkvza_mq3g256_lloyd(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k))
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkvza_mq3g256_lloyd_wmma(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n)),
+                None => hip!(gpu.fused_qkvza_mq3g256_lloyd(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k)),
+            }
         }
         KernelKey::FusedQkvzaMq4G256Lloyd => {
             let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [mqkv, mz, mbeta, malpha] = <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
-            hip!(gpu.fused_qkvza_mq4g256_lloyd(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k))
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkvza_mq4g256_lloyd_wmma(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n)),
+                None => hip!(gpu.fused_qkvza_mq4g256_lloyd(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k)),
+            }
         }
         KernelKey::FusedQkvzaHfq6G256 => {
             let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [mqkv, mz, mbeta, malpha] = <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
-            hip!(gpu.fused_qkvza_hfq6g256_dp4a(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k))
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkvza_hfq6g256(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n)),
+                None => hip!(gpu.fused_qkvza_hfq6g256_dp4a(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k)),
+            }
+        }
+        // ── Q8_0 fused QKVZA — prefill-only key (#397 Ship 5.2 slice 3) ──
+        // WMMA-only (entry gated HasWmma); no decode `fused_qkvza_q8_0` exists.
+        KernelKey::FusedQkvzaQ8_0 => {
+            let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mbeta, malpha] = <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let n = params.batch_size.ok_or(DispatchError::UnsupportedVariant {
+                family: "fused_qkv", variant: "qkvza", arch: "", quant: "q8_0 (prefill-only)",
+            })?;
+            hip!(gpu.gemm_qkvza_q8_0_wmma(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n))
+        }
+        // ── HFQ3G256 fused QKVZA — prefill-only key (#397 Ship 5.2 slice 3) ──
+        // Arch-split mirror of the qwen35 call site (WMMA on has_wmma() else base
+        // cross-arch ladder). No decode method exists.
+        KernelKey::FusedQkvzaHfq3G256 => {
+            let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mbeta, malpha] = <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let n = params.batch_size.ok_or(DispatchError::UnsupportedVariant {
+                family: "fused_qkv", variant: "qkvza", arch: "", quant: "hfq3g256 (prefill-only)",
+            })?;
+            if gpu.arch_caps.has_wmma() {
+                hip!(gpu.gemm_qkvza_hfq3g256_wmma(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n))
+            } else {
+                hip!(gpu.gemm_qkvza_hfq3g256(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n))
+            }
         }
 
         // ── 2-way Fused Gate+Up (FFN) ────────────────────────

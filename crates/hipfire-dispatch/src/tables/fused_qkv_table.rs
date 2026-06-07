@@ -18,6 +18,25 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedQkvMq4G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvHfq6G256,     ArchPredicate::HasDp4a),
         (KernelKey::FusedQkvQ4K,          ArchPredicate::Always),
+        // Q8_0 fused QKV (#397 Ship 5.2 slice 3). WMMA-only: the run-arm calls
+        // `gpu.gemm_qkv_q8_0_wmma`, which routes to the gfx12 WMMA sibling on
+        // RDNA4 else the gfx11 `_w32` WMMA kernel — there is NO scalar/dp4a
+        // fallback body (UNLIKE the gate+up Q8 row, which is `Always` because it
+        // ALSO has a non-WMMA decode method `fused_gate_up_q8_0`; no such
+        // `fused_qkv_q8_0` decode method exists). The qwen35 prefill site reaches
+        // this arm only when `q8_wmma_arch = has_wmma()`; the non-WMMA arch case
+        // stays as three plain GemmQ8_0BatchedChunked GEMMs (slice 1). HasWmma
+        // (= has_wmma(), includes gfx12) is the correct gate; the gfx12 sibling
+        // is reached INSIDE the method, so HasWmmaW32 (gfx12-excluding) is wrong.
+        (KernelKey::FusedQkvQ8_0,         ArchPredicate::HasWmma),
+        // HFQ3G256 fused QKV (#397 Ship 5.2 slice 3). Always — the qwen35 prefill
+        // site picks `gpu.gemm_qkv_hfq3g256_wmma` on has_wmma() archs and the base
+        // `gpu.gemm_qkv_hfq3g256` otherwise, and the base method itself carries a
+        // full cross-arch internal ladder (MMQ → dp4a → dot2 → fp16 → scalar
+        // gfx1010 fallback). So the dtype runs on every arch (the run-arm picks
+        // WMMA vs base by arch, mirroring the call site). Mirrors the
+        // FusedGateUpHfq3G256 row; NOT HasWmma (the base has a non-WMMA body).
+        (KernelKey::FusedQkvHfq3G256,     ArchPredicate::Always),
     ];
     for &(key, arch) in qkv_variants {
         registry.register(KernelVariant {
@@ -42,6 +61,16 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedQkvzaMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvzaMq4G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvzaHfq6G256,     ArchPredicate::HasDp4a),
+        // Q8_0 fused QKVZA (#397 Ship 5.2 slice 3). WMMA-only — the run-arm calls
+        // `gpu.gemm_qkvza_q8_0_wmma` (gfx12 sibling on RDNA4 else gfx11 `_w32`
+        // WMMA), no scalar/dp4a fallback; no `fused_qkvza_q8_0` decode method
+        // exists. Mirrors the FusedQkvQ8_0 row above. HasWmma (includes gfx12).
+        (KernelKey::FusedQkvzaQ8_0,         ArchPredicate::HasWmma),
+        // HFQ3G256 fused QKVZA (#397 Ship 5.2 slice 3). Always — base
+        // `gpu.gemm_qkvza_hfq3g256` carries the full cross-arch ladder
+        // (MMQ → dot2 → fp16 → scalar); the run-arm picks `_wmma` vs base by arch.
+        // Mirrors FusedQkvHfq3G256 / FusedGateUpHfq3G256.
+        (KernelKey::FusedQkvzaHfq3G256,     ArchPredicate::Always),
     ];
     for &(key, arch) in qkvza_variants {
         registry.register(KernelVariant {

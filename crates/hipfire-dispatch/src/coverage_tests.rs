@@ -514,6 +514,21 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
         // gfx11/gfx12 WMMA siblings, no scalar fallback. Differs from the
         // sibling HFQ4 gate+up (ALL); must NOT resolve on RDNA1/2 or CDNA.
         FusedKeyUse { key: KernelKey::FusedGateUpHfp4G32,     archs: WMMA_ARCHS },
+        // ── #397 Ship 5.2 slice 3: prefill QKV / QKVZA dtypes ──
+        // Q8_0 fused QKV / QKVZA: WMMA-only — the run-arm calls
+        // `gemm_qkv_q8_0_wmma` / `gemm_qkvza_q8_0_wmma` (gfx12 sibling on RDNA4
+        // else gfx11 `_w32` WMMA), NO scalar/dp4a fallback and no decode method.
+        // Differs from the gate+up Q8 row (ALL): that key ALSO has a non-WMMA
+        // `fused_gate_up_q8_0` decode body; the QKV/QKVZA Q8 keys do not. Must
+        // NOT resolve on RDNA1/2 or CDNA.
+        FusedKeyUse { key: KernelKey::FusedQkvQ8_0,           archs: WMMA_ARCHS },
+        FusedKeyUse { key: KernelKey::FusedQkvzaQ8_0,         archs: WMMA_ARCHS },
+        // HFQ3G256 fused QKV / QKVZA: Always — base `gemm_qkv_hfq3g256` /
+        // `gemm_qkvza_hfq3g256` carry a full cross-arch internal ladder
+        // (MMQ→dp4a→dot2→fp16→scalar gfx1010), and the run-arm picks WMMA vs base
+        // by arch, so the dtype runs everywhere (mirrors FusedGateUpHfq3G256).
+        FusedKeyUse { key: KernelKey::FusedQkvHfq3G256,       archs: ALL },
+        FusedKeyUse { key: KernelKey::FusedQkvzaHfq3G256,     archs: ALL },
         // ── HasDp4a (gfx906 v_dot4_i32_i8) kernels ──
         // Paro fused: Always-gated (generic wave32 kernels, no ISA intrinsics)
         FusedKeyUse { key: KernelKey::FusedQkvzaParo4G128T,  archs: ALL },
