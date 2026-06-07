@@ -976,3 +976,83 @@ similar but scaled results).
 
 4. **Dump post-RoPE Q/K values** and verify against HF for the full
    layer to confirm RoPE is correct before blaming attention.
+
+---
+
+## 2026-06-07 · Session 13 — ROOT CAUSE FOUND: hd512 attention missing reduce step
+
+### Bug: `attention_flash_asym3_hd512` never calls the reduce kernel
+
+The `attention_flash_asym3_hd512` function in `gemma4_ext.rs:68-112` only
+launches the **tile** kernel (`attention_flash_asym3_tile_hd512`). It **never
+launches the reduce kernel** (`attention_flash_q8_0_reduce`).
+
+Compare with the working hd256 version `attention_flash_asym3` in
+`attention.rs:3790-3907`:
+```
+attention_flash_asym3 (hd256):
+  1. launch attention_flash_asym3_tile     ← tile kernel
+  2. launch attention_flash_q8_0_reduce    ← REDUCE KERNEL ← PRESENT ✓
+
+attention_flash_asym3_hd512 (hd512):
+  1. launch attention_flash_asym3_tile_hd512  ← tile kernel
+  (returns)                                    ← NO REDUCE ✗
+```
+
+### What the reduce kernel does
+
+`attention_flash_q8_0_reduce` (in `kernels/src/attention_flash_q8_0_reduce.hip`):
+- Takes per-tile partials (tile_max, tile_sum, V-weighted accumulator)
+- Finds global max across all tiles
+- Rescales each tile's accumulator by `exp(tile_max - global_max)`
+- Sums all rescaled accumulators
+- Normalizes by global sum
+- Writes the result to `out`
+
+### What happens without the reduce
+
+The tile kernel writes to `partials` buffer. The `out` tensor (which maps to
+`scratch.attn_out` in the gemma4 forward) is **never written**. It contains
+stale data from the previous layer's sliding attention output. This stale
+data then gets fed through o_proj → post_attn_norm → residual, producing
+garbage.
+
+### Why this wasn't caught earlier
+
+With only 2 tokens (BOS + Hello), there's only 1 tile per head (128 > 2
+positions). The "reduce" of a single tile is trivially `out = partials /
+sum`. But even with 1 tile, the reduce kernel is needed because:
+- The tile kernel writes to `partials[h * max_tiles * (2 + head_dim) + ...]`
+- The reduce kernel reads from partials and writes to `out[h * head_dim + ...]`
+- Without the reduce, `out` is never populated
+
+### Why the hd256 version works
+
+The hd256 `attention_flash_asym3` function correctly launches both tile and
+reduce kernels (confirmed by reading `attention.rs:3790-3907`). All sliding
+layers use the hd256 path → correct. All full layers use the hd512 path →
+missing reduce → garbage from L5 onward.
+
+### Fix
+
+Add the reduce kernel launch to `attention_flash_asym3_hd512`, matching
+the pattern from `attention_flash_asym3` (hd256):
+
+```rust
+// After the tile kernel launch in attention_flash_asym3_hd512:
+self.ensure_kernel(
+    "attention_flash_q8_0_reduce",
+    kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+    "attention_flash_q8_0_reduce",
+)?;
+// ... launch reduce with same params as hd256 version ...
+```
+
+The reduce kernel already handles head_dim=512 correctly via `n_halves =
+head_dim / 128 = 4` (4 iterations of 128 dims each).
+
+### Verification needed after fix
+
+1. Rebuild and run "Hello" — expect coherent output
+2. Run "What is the capital of France?" — expect correct answer
+3. Run coherence-gate-dflash — verify no regression on Qwen models
