@@ -353,6 +353,24 @@ fn attn_q8_swa(
         .map_err(|e| format!("gemma4: kv write k: {e:?}"))?;
     gpu.kv_cache_write_q8_0(&kv.v_gpu[kv_slot], v, pos_buf, n_kv, head_dim)
         .map_err(|e| format!("gemma4: kv write v: {e:?}"))?;
+    // DIAG: HIPFIRE_GEMMA4_BASELINE_ATTN routes through the proven baseline
+    // attention_q8_0_kv (no window) to isolate the new _swa kernel.
+    if std::env::var_os("HIPFIRE_GEMMA4_BASELINE_ATTN").is_some() {
+        return gpu
+            .attention_q8_0_kv(
+                q,
+                &kv.k_gpu[kv_slot],
+                &kv.v_gpu[kv_slot],
+                attn_out,
+                pos_buf,
+                max_seq,
+                n_heads,
+                n_kv,
+                head_dim,
+                kv.physical_cap,
+            )
+            .map_err(|e| format!("gemma4: attention baseline: {e:?}"));
+    }
     gpu.attention_q8_0_kv_swa(
         q,
         &kv.k_gpu[kv_slot],
