@@ -7929,12 +7929,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         return;
     }
     if m.arch_id == 12 {
-        // Gemma4 generate — scaffold. Warm-pass runs during model load;
-        // this generate path is a stub pending full forward-pass validation.
-        let _ = (budget_alert_at_tok, budget_alert_text, assistant_prefix,
-            pflash_state, pflash_cfg, think_mode, repeat_penalty, repeat_window);
-        let _ = writeln!(stdout, r#"{{"type":"error","message":"gemma4 generate not yet wired — use bench_prefill to test warm-pass"}}"#);
-        let _ = stdout.flush();
+        generate_gemma4(m, gpu, stdout, id, prompt, system_prompt, temp, top_p,
+            max_tokens, max_think_tokens, tools, messages_history);
         return;
     }
     if m.arch_id == 10 {
@@ -11480,6 +11476,149 @@ fn generate_lfm2moe(
 /// MTP, grammar-constrained decoding, tool-call parsing/execution, repeat
 /// penalty, multi-GPU, eviction/prefix-cache. Correctness first.
 #[allow(clippy::too_many_arguments)]
+fn generate_gemma4(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    let _ = (max_think_tokens, tools, messages_history);
+
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
+        return;
+    }
+    if m.gemma4_config.is_none() {
+        emit_error_with_id(stdout, id, "gemma4_config missing".to_string());
+        return;
+    }
+
+    // ── Prompt build (plain only for bring-up) ──
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let prompt_ids: Vec<u32> = {
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: system_prompt,
+            user: prompt,
+            assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+            raw: false,
+        }
+        .build()
+    };
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize".to_string());
+        return;
+    }
+
+    let eos_tok = m.gemma4_eos_tok;
+    let t0 = Instant::now();
+
+    // ── Prefill: forward_scratch per prompt token ──
+    {
+        let config = m.gemma4_config.as_ref().unwrap();
+        let weights = m.gemma4_weights.as_ref().unwrap();
+        let scratch = m.gemma4_scratch.as_mut().unwrap();
+        let kv_sliding = m.gemma4_kv_sliding.as_mut().unwrap();
+        let kv_full = m.gemma4_kv_full.as_mut().unwrap();
+        for (i, &tok) in prompt_ids.iter().enumerate() {
+            if let Err(e) = gemma4::forward_scratch(
+                gpu, weights, config, tok, i, kv_sliding, kv_full, scratch,
+            ) {
+                emit_error_with_id(stdout, id, format!("gemma4 prefill failed at token {i}: {e:?}"));
+                return;
+            }
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    m.seq_pos = prompt_ids.len();
+
+    // ── Decode loop ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+
+        // Download logits and sample
+        let next_tok = {
+            let scratch = m.gemma4_scratch.as_ref().unwrap();
+            let logits = match gpu.download_f32(&scratch.logits) {
+                Ok(l) => l,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("logit download failed: {e:?}"));
+                    return;
+                }
+            };
+            deepseek4::sampling::sample_token(&logits, temp, 0, top_p, &mut rng)
+        };
+
+        if next_tok == eos_tok {
+            break;
+        }
+
+        // Emit token
+        let frag = tokenizer.decode(&[next_tok]);
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+            "tok": next_tok,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+
+        generated_count += 1;
+
+        // Forward step for next token
+        {
+            let config = m.gemma4_config.as_ref().unwrap();
+            let weights = m.gemma4_weights.as_ref().unwrap();
+            let scratch = m.gemma4_scratch.as_mut().unwrap();
+            let kv_sliding = m.gemma4_kv_sliding.as_mut().unwrap();
+            let kv_full = m.gemma4_kv_full.as_mut().unwrap();
+            let pos = m.seq_pos;
+            if let Err(e) = gemma4::forward_scratch(
+                gpu, weights, config, next_tok, pos, kv_sliding, kv_full, scratch,
+            ) {
+                emit_error_with_id(stdout, id, format!("gemma4 decode failed: {e:?}"));
+                return;
+            }
+            m.seq_pos += 1;
+            m.conversation_tokens.push(next_tok);
+        }
+    }
+
+    let elapsed = t0.elapsed().as_secs_f64();
+    let tok_s = if elapsed > 0.0 {
+        (prompt_ids.len() + generated_count) as f64 / elapsed
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#,
+        id, generated_count, tok_s
+    );
+    let _ = stdout.flush();
+}
+
 fn generate_minimax(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
