@@ -90,6 +90,9 @@ impl ArchPredicate {
             // predicate backed by ArchCaps::has_wmma() is equivalent and enforces that
             // a new ArchPredicate variant only lands with the kernel it gates.
             Self::HasWmma => ctx.arch.has_wmma(),
+            // gfx11-family wave32 WMMA only (RDNA3 + RDNA3.5), EXCLUDES gfx12/RDNA4 —
+            // for WMMA kernels with no gfx12 source sibling (mb4, q8_0_wmma_x64).
+            Self::HasWmmaW32 => ctx.arch.has_wmma_w32(),
             Self::HasWmmaGfx12 => ctx.arch.has_wmma_w32_gfx12(),
             Self::HasDot2F32F16 => ctx.arch.has_dot2_f32_f16(),
             Self::HasSdot4 => ctx.arch.has_hfq3_sdot4(),

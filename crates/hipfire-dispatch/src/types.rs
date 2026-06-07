@@ -367,6 +367,11 @@ pub struct ShapeInfo {
 pub enum ArchPredicate {
     Always,
     HasWmma,
+    /// `has_wmma_w32()` — gfx11-family wave32 WMMA (RDNA3 + RDNA3.5), EXCLUDING
+    /// gfx12/RDNA4. For WMMA kernels with NO gfx12 source sibling (e.g.
+    /// gemm_f16_wmma_mb4, gemm_q8_0_wmma_x64); RDNA4 must fall through to a
+    /// non-WMMA entry. Restores the arch gate Phase 0.4 collapsed into HasWmma.
+    HasWmmaW32,
     HasWmmaGfx12,
     /// `has_dot2_f32_f16()` — RDNA1.1+ (gfx1011, gfx1030+, gfx1100+, gfx1200+).
     /// Gates the RDNA dot2-F16 codepath used by HFQ3 sdot4 kernels.
