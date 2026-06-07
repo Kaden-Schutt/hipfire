@@ -1818,7 +1818,7 @@ fn sliding_layer_decode_impl(
     } else {
         gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
     }
-    let _dump_on = pos == 0 && kv_layer_idx == 0;
+    let _dump_on = std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") && pos == 1 && kv_layer_idx == 0;
     if _dump_on { dbg_dump(gpu, "[v1] L0 input scratch.x", &scratch.x, dim); }
 
     // tmp = input_layernorm(x)

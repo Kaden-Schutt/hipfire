@@ -3965,6 +3965,8 @@ fn load_model(
             .map_err(|e| e.to_string())?;
         let scratch = <Gemma4 as Architecture>::new_state(gpu, &config)
             .map_err(|e| e.to_string())?;
+        gemma4::init_scratch_constants(gpu, &scratch, config.full_head_dim)
+            .map_err(|e| format!("gemma4 init_scratch_constants: {e:?}"))?;
 
         // Dual KV caches: sliding (ring-buffer) + full (identity).
         // Full cache uses full_head_dim (512) and full_n_kv_heads (1 for 12B).
