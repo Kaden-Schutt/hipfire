@@ -230,6 +230,31 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
     }
 }
 
-fn err_wrong_arity(kind: KernelKey, _expected: usize) -> DispatchError {
-    DispatchError::MissingImpl { key: kind }
+/// Build the dispatch error for a fused-projection call whose operand arity
+/// (weights / outputs / m) did not match the kernel's expectation. The kernel
+/// key already names the quant tier; we additionally report the fused-projection
+/// *family* (qkv / qkvza / gate_up) so the diagnostic distinguishes a 3-way QKV
+/// arity mismatch from a 4-way QKVZA or 2-way Gate+Up one (the three families
+/// expect 3 / 4 / 2 operands respectively). `expected` is the operand count the
+/// kernel arm tried to destructure into.
+fn err_wrong_arity(kind: KernelKey, expected: usize) -> DispatchError {
+    match fused_qkv_variant_for_key(kind) {
+        Some(variant) => {
+            let _ = expected; // family implies arity (qkv=3, qkvza=4, gate_up=2)
+            let label = match variant {
+                FusedQkvVariant::Qkv | FusedQkvVariant::QkvParo => "qkv",
+                FusedQkvVariant::Qkvza | FusedQkvVariant::QkvzaParo => "qkvza",
+                FusedQkvVariant::GateUp | FusedQkvVariant::GateUpParo => "gate_up",
+            };
+            DispatchError::UnsupportedVariant {
+                family: "fused_qkv",
+                variant: label,
+                arch: "",
+                quant: "",
+            }
+        }
+        // Not a fused-projection key (should be unreachable from this family) —
+        // fall back to the bare missing-impl report rather than mislabel it.
+        None => DispatchError::MissingImpl { key: kind },
+    }
 }

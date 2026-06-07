@@ -185,6 +185,35 @@ fn fused_qkv_hfq6_resolved_only_on_gemv_dp4a_arch() {
     assert!(fam.resolve(KernelKey::FusedGateUpHfq6G256, &ctx_rdna3(), None).is_err());
 }
 
+#[test]
+fn fused_qkv_variant_for_key_classifies_by_family() {
+    use KernelKey::*;
+    // 3-way QKV family (incl. Q4K + Paro QKV synthesis).
+    for k in [
+        FusedQkvHfq4G256, FusedQkvMq3G256Lloyd, FusedQkvMq4G256Lloyd,
+        FusedQkvHfq6G256, FusedQkvQ4K, FusedQkvParo4G128T,
+    ] {
+        assert_eq!(fused_qkv_variant_for_key(k), Some(FusedQkvVariant::Qkv), "{k:?}");
+    }
+    // 4-way QKVZA family (incl. Paro).
+    for k in [
+        FusedQkvzaHfq4G256, FusedQkvzaMq3G256Lloyd, FusedQkvzaMq4G256Lloyd,
+        FusedQkvzaHfq6G256, FusedQkvzaParo4G128T,
+    ] {
+        assert_eq!(fused_qkv_variant_for_key(k), Some(FusedQkvVariant::Qkvza), "{k:?}");
+    }
+    // 2-way Gate+Up family (incl. Q8_0 + Q4K + Paro).
+    for k in [
+        FusedGateUpHfq4G256, FusedGateUpMq3G256Lloyd, FusedGateUpMq4G256Lloyd,
+        FusedGateUpHfq6G256, FusedGateUpQ4K, FusedGateUpQ8_0, FusedGateUpParo4G128T,
+    ] {
+        assert_eq!(fused_qkv_variant_for_key(k), Some(FusedQkvVariant::GateUp), "{k:?}");
+    }
+    // Non-fused keys → None.
+    assert_eq!(fused_qkv_variant_for_key(KernelKey::GemvF32), None);
+    assert_eq!(fused_qkv_variant_for_key(KernelKey::GemmHfq4G256), None);
+}
+
 // ── KernelRegistry ────────────────────────────────────────────────────────────
 
 #[test]

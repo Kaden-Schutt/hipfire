@@ -135,6 +135,32 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     }
 }
 
+/// Fused-projection family for a kernel key: which of the QKV / QKVZA / Gate+Up
+/// kernel groups a `KernelKey` belongs to. `None` for keys that are not fused
+/// projections. The Paro4G128T keys carry the family in their name (Qkv/Qkvza/
+/// GateUp) but the *Paro* discriminator variants (QkvParo/QkvzaParo/GateUpParo)
+/// describe the rotation axis, not the projection shape — for error diagnostics
+/// we report the projection family (Qkv/Qkvza/GateUp), which is what determines
+/// the arity (3-way / 4-way / 2-way).
+pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
+    use KernelKey::*;
+    match key {
+        // 3-way Fused QKV (incl. Q4K and the Paro 4G128T QKV synthesis)
+        FusedQkvHfq4G256 | FusedQkvMq3G256Lloyd | FusedQkvMq4G256Lloyd
+        | FusedQkvHfq6G256 | FusedQkvQ4K | FusedQkvParo4G128T => {
+            Some(FusedQkvVariant::Qkv)
+        }
+        // 4-way Fused QKVZA (DeltaNet linear attention, incl. Paro 4G128T)
+        FusedQkvzaHfq4G256 | FusedQkvzaMq3G256Lloyd | FusedQkvzaMq4G256Lloyd
+        | FusedQkvzaHfq6G256 | FusedQkvzaParo4G128T => Some(FusedQkvVariant::Qkvza),
+        // 2-way Fused Gate+Up (FFN, incl. Q8_0 and Paro 4G128T)
+        FusedGateUpHfq4G256 | FusedGateUpMq3G256Lloyd | FusedGateUpMq4G256Lloyd
+        | FusedGateUpHfq6G256 | FusedGateUpQ4K | FusedGateUpQ8_0
+        | FusedGateUpParo4G128T => Some(FusedQkvVariant::GateUp),
+        _ => None,
+    }
+}
+
 // ── Flat kernel key enum ──────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
