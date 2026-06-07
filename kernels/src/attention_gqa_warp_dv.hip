@@ -24,6 +24,8 @@ extern "C" __global__ void attention_gqa_warp_dv(
     int n_heads, int n_kv_heads, int head_dim,
     int max_seq, float scale, int chunk_size
 ) {
+    if (head_dim != 128) return;
+
     const int seq_len = *seq_len_ptr;
 
     const int kv_h   = blockIdx.x;

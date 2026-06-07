@@ -20,7 +20,7 @@
 // score-array LDS needed. Writes partial (m, l, O[d]) for the existing
 // attention_flash_reduce to combine chunks.
 //
-// head_dim must be 128 (4 floats per lane × 32 lanes = 128).
+// head_dim must be 128 (4 floats per lane x 32 lanes = 128).
 extern "C" __global__ void attention_gqa_warp(
     const float* __restrict__ q,           // [n_heads, head_dim]
     const float* __restrict__ k_cache,     // [max_seq, n_kv_heads * head_dim]
@@ -29,6 +29,8 @@ extern "C" __global__ void attention_gqa_warp(
     int seq_len, int n_heads, int n_kv_heads, int head_dim,
     int max_seq, float scale, int chunk_size
 ) {
+    if (head_dim != 128) return;
+
     const int kv_h   = blockIdx.x;
     const int chunk_id = blockIdx.y;
     if (kv_h >= n_kv_heads) return;

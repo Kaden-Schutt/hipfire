@@ -189,6 +189,11 @@ impl Gpu {
         max_seq: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        assert_eq!(
+            head_dim, 128,
+            "attention_gqa_warp: head_dim={head_dim} but this kernel is hard-coded to 128 \
+             (4 floats per lane x 32 lanes). Use attention_flash_gqa for other head dims.",
+        );
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
         // Choose chunk size: aim for 4-16 chunks
@@ -312,6 +317,11 @@ impl Gpu {
         max_seq: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        assert_eq!(
+            head_dim, 128,
+            "attention_gqa_warp_dv: head_dim={head_dim} but this kernel is hard-coded to 128 \
+             (4 floats per lane x 32 lanes). Use attention_flash_gqa for other head dims.",
+        );
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let cs_cap = std::env::var("HIPFIRE_GQA_CHUNK")
             .ok()

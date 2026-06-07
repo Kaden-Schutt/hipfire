@@ -115,6 +115,7 @@ impl GpuTensor {
 pub enum DType {
     F32,
     F16,
+    BF16,
     Q4K,          // 144 bytes per 256 elements
     Q6K,          // 210 bytes per 256 elements
     Q8_0,         // 34 bytes per 32 elements
@@ -157,7 +158,7 @@ impl DType {
     pub fn size(self) -> usize {
         match self {
             DType::F32 => 4,
-            DType::F16 => 2,
+            DType::F16 | DType::BF16 => 2,
             DType::Q4K
             | DType::Q6K
             | DType::Q8_0
@@ -1213,6 +1214,7 @@ impl Gpu {
     /// Drop captured graph state after a live KV layout switch so the next
     /// forward captures the current K/V modes and kernarg blobs.
     pub fn invalidate_for_kv_mode_switch(&mut self) {
+        self.bind_thread_or_warn();
         self.invalidate_graph_state();
     }
 

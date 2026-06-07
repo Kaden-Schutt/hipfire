@@ -35,7 +35,7 @@ use hip_bridge::HipResult;
 // `DType` will be threaded through once the scaffold gains a real load
 // path (Phase 2 — see `load_bf16_model` body TODO). For now, only the
 // types referenced in the function signature + struct fields are imported.
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -51,16 +51,9 @@ pub struct Bf16Tensor {
     /// `GPTQ_TARGET_SUFFIXES` list in `scripts/collect_hessian.py`
     /// determines which of these get a Hessian collected.
     pub name: String,
-    /// Owned device tensor. Always `DType::F16`-tagged for now — the
-    /// rdna-compute layer doesn't have a `BF16` enum arm yet. Phase 2
-    /// adds `DType::BF16` (a 1-line edit in dispatch.rs::DType once we
-    /// have a real BF16 forward path to consume it). For the scaffold,
-    /// we mark the tensor with TODO comments so the downstream wiring
-    /// knows to re-interpret the bytes.
-    ///
-    /// TODO(Phase 2): replace with `DType::BF16` once the dtype enum
-    /// arm lands. The .size() return is still 2 bytes/element — same
-    /// as F16 — so the allocator math is unchanged.
+    /// Owned device tensor. BF16 tensors must stay tagged as `DType::BF16`;
+    /// treating the raw two-byte payload as `DType::F16` silently narrows the
+    /// precision contract for calibration / KLD reference paths.
     pub tensor: GpuTensor,
     /// Tensor shape as stored on disk (e.g. `[out_features, in_features]`
     /// for a Linear weight in PyTorch's `[out, in]` row-major convention).
@@ -101,8 +94,7 @@ pub struct TrunkBF16 {
 ///       `data_offsets`.
 ///    b. Verify `dtype == "BF16"` (reject FP16/FP32 inputs — quantizer
 ///       wants BF16 source-of-truth weights).
-///    c. `gpu.alloc_tensor(&shape, DType::F16 /* TODO: BF16 */)` →
-///       device buffer.
+    ///    c. `gpu.alloc_tensor(&shape, DType::BF16)` → device buffer.
 ///    d. `hipMemcpyHtoD` of the raw 2-byte BF16 payload from mmap'd
 ///       safetensors → device buffer.
 /// 4. Build the `TrunkBF16` map and return.
@@ -121,7 +113,8 @@ pub fn load_bf16_model(_gpu: &mut Gpu, model_dir: &Path) -> HipResult<TrunkBF16>
     // but a runtime caller sees the scaffold panic.
     unimplemented!(
         "load_bf16_model: scaffold only — Phase 2 wires the actual safetensors \
-         parse + device alloc + memcpy. Called with model_dir={}",
+         parse + device alloc + memcpy using dtype={:?}. Called with model_dir={}",
+        DType::BF16,
         model_dir.display()
     );
 }
