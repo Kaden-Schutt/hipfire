@@ -84,31 +84,74 @@ impl Gpu {
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
         let launch_tiles = if self.graphs.capture_mode { max_tiles } else { actual_tiles };
-        let func = &self.functions["attention_flash_asym3_tile_hd512"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let mut qp = q.buf.as_ptr(); let mut kp = k_cache.buf.as_ptr();
-        let mut vp = v_cache.buf.as_ptr(); let mut pp = partials.buf.as_ptr();
-        let mut posp = pos_buf.as_ptr(); let mut ctp = cos_theta.buf.as_ptr();
-        let mut stp = sin_theta.buf.as_ptr();
-        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
-        let mut hd = head_dim as i32; let mut ms = max_seq as i32;
-        let mut sc = scale; let mut ts = TILE_SIZE as i32; let mut mt = max_tiles as i32;
-        let mut ws: i32 = 0; // window_size=0 → full causal (no sliding on full layers)
-        let mut params: Vec<*mut std::ffi::c_void> = vec![
-            &mut qp as *mut _ as *mut std::ffi::c_void, &mut kp as *mut _ as *mut std::ffi::c_void,
-            &mut vp as *mut _ as *mut std::ffi::c_void, &mut pp as *mut _ as *mut std::ffi::c_void,
-            &mut posp as *mut _ as *mut std::ffi::c_void, &mut ctp as *mut _ as *mut std::ffi::c_void,
-            &mut stp as *mut _ as *mut std::ffi::c_void, &mut nh as *mut _ as *mut std::ffi::c_void,
-            &mut nkv as *mut _ as *mut std::ffi::c_void, &mut hd as *mut _ as *mut std::ffi::c_void,
-            &mut ms as *mut _ as *mut std::ffi::c_void, &mut sc as *mut _ as *mut std::ffi::c_void,
-            &mut ts as *mut _ as *mut std::ffi::c_void, &mut mt as *mut _ as *mut std::ffi::c_void,
-            &mut ws as *mut _ as *mut std::ffi::c_void,
-        ];
-        let grid = [n_heads as u32, launch_tiles as u32, 1];
-        let shared = ((TILE_SIZE + head_dim) * 4) as u32;
-        unsafe {
-            self.hip.launch_kernel(func, grid, [32, 1, 1], shared, self.stream_ref(), &mut params)
+        // Phase 1: tile kernel → unnormalized per-tile partials.
+        {
+            let func = &self.functions["attention_flash_asym3_tile_hd512"];
+            let mut qp = q.buf.as_ptr(); let mut kp = k_cache.buf.as_ptr();
+            let mut vp = v_cache.buf.as_ptr(); let mut pp = partials.buf.as_ptr();
+            let mut posp = pos_buf.as_ptr(); let mut ctp = cos_theta.buf.as_ptr();
+            let mut stp = sin_theta.buf.as_ptr();
+            let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32; let mut ms = max_seq as i32;
+            let mut sc = scale; let mut ts = TILE_SIZE as i32; let mut mt = max_tiles as i32;
+            let mut ws: i32 = 0; // window_size=0 → full causal (no sliding on full layers)
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut qp as *mut _ as *mut std::ffi::c_void, &mut kp as *mut _ as *mut std::ffi::c_void,
+                &mut vp as *mut _ as *mut std::ffi::c_void, &mut pp as *mut _ as *mut std::ffi::c_void,
+                &mut posp as *mut _ as *mut std::ffi::c_void, &mut ctp as *mut _ as *mut std::ffi::c_void,
+                &mut stp as *mut _ as *mut std::ffi::c_void, &mut nh as *mut _ as *mut std::ffi::c_void,
+                &mut nkv as *mut _ as *mut std::ffi::c_void, &mut hd as *mut _ as *mut std::ffi::c_void,
+                &mut ms as *mut _ as *mut std::ffi::c_void, &mut sc as *mut _ as *mut std::ffi::c_void,
+                &mut ts as *mut _ as *mut std::ffi::c_void, &mut mt as *mut _ as *mut std::ffi::c_void,
+                &mut ws as *mut _ as *mut std::ffi::c_void,
+            ];
+            let grid = [n_heads as u32, launch_tiles as u32, 1];
+            let shared = ((TILE_SIZE + head_dim) * 4) as u32;
+            unsafe {
+                self.hip.launch_kernel(func, grid, [32, 1, 1], shared, self.stream_ref(), &mut params)?;
+            }
         }
+        // Phase 2: reduce partials → out. WITHOUT THIS, attn_out is never written
+        // and full-attention layers read stale data from the prior sliding layer.
+        // Mirrors the hd256 attention_flash_asym3 reduce (attention.rs). The reduce
+        // kernel handles hd512 unchanged (n_halves = head_dim/128 = 4); partials
+        // stride (2 + head_dim) = 514 matches the tile kernel's per-tile layout.
+        self.ensure_kernel(
+            "attention_flash_q8_0_reduce",
+            kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
+            "attention_flash_q8_0_reduce",
+        )?;
+        {
+            let func = &self.functions["attention_flash_q8_0_reduce"];
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut o_ptr = out.buf.as_ptr();
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut ts = TILE_SIZE as i32;
+            let mut mt = max_tiles as i32;
+            let mut params: Vec<*mut std::ffi::c_void> = vec![
+                &mut p_ptr as *mut _ as *mut std::ffi::c_void,
+                &mut o_ptr as *mut _ as *mut std::ffi::c_void,
+                &mut nh as *mut _ as *mut std::ffi::c_void,
+                &mut hd as *mut _ as *mut std::ffi::c_void,
+                &mut pos_ptr as *mut _ as *mut std::ffi::c_void,
+                &mut ts as *mut _ as *mut std::ffi::c_void,
+                &mut mt as *mut _ as *mut std::ffi::c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [n_heads as u32, 1, 1],
+                    [32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Single-token hd512 KV cache write for asym3 (Gemma4 full-attn layers).
