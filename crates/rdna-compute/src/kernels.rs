@@ -333,7 +333,7 @@ pub fn gemm_qkvza_mq4g256_lloyd_wmma_mb4_for_arch(caps: &ArchCaps) -> (&'static 
 }
 pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(
     caps: &ArchCaps,
-    force_baseline: bool,
+    _force_baseline: bool,
 ) -> (&'static str, &'static str) {
     let arch = caps.arch();
     match arch {
@@ -350,7 +350,7 @@ pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(
 }
 pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(
     caps: &ArchCaps,
-    force_baseline: bool,
+    _force_baseline: bool,
 ) -> (&'static str, &'static str) {
     let arch = caps.arch();
     match arch {
@@ -398,7 +398,6 @@ pub fn gemv_mq4g256_lloyd_residual_for_arch(
     caps: &ArchCaps,
     force_baseline: bool,
 ) -> (&'static str, &'static str) {
-    let arch = caps.arch();
     if force_baseline {
         return (
             GEMV_MQ4G256_LLOYD_RESIDUAL_SRC,
@@ -423,7 +422,6 @@ pub fn fused_gate_up_mq4g256_lloyd_for_arch(
     caps: &ArchCaps,
     force_baseline: bool,
 ) -> (&'static str, &'static str) {
-    let arch = caps.arch();
     if force_baseline {
         return (
             FUSED_GATE_UP_MQ4G256_LLOYD_SRC,
@@ -448,7 +446,6 @@ pub fn fused_qkvza_mq4g256_lloyd_for_arch(
     caps: &ArchCaps,
     force_baseline: bool,
 ) -> (&'static str, &'static str) {
-    let arch = caps.arch();
     if force_baseline {
         return (FUSED_QKVZA_MQ4G256_LLOYD_SRC, "fused_qkvza_mq4g256_lloyd");
     }
@@ -467,7 +464,6 @@ pub fn fused_qkv_mq4g256_lloyd_for_arch(
     caps: &ArchCaps,
     force_baseline: bool,
 ) -> (&'static str, &'static str) {
-    let arch = caps.arch();
     if force_baseline {
         return (FUSED_QKV_MQ4G256_LLOYD_SRC, "fused_qkv_mq4g256_lloyd");
     }
@@ -710,7 +706,6 @@ pub fn gemv_mq3g256_lloyd_residual_for_arch(
     caps: &ArchCaps,
     force_baseline: bool,
 ) -> (&'static str, &'static str) {
-    let arch = caps.arch();
     if force_baseline {
         return (
             GEMV_MQ3G256_LLOYD_RESIDUAL_SRC,
@@ -737,7 +732,6 @@ pub fn fused_gate_up_mq3g256_lloyd_for_arch(
     caps: &ArchCaps,
     force_baseline: bool,
 ) -> (&'static str, &'static str) {
-    let arch = caps.arch();
     if force_baseline {
         return (
             FUSED_GATE_UP_MQ3G256_LLOYD_SRC,
@@ -764,7 +758,6 @@ pub fn fused_qkvza_mq3g256_lloyd_for_arch(
     caps: &ArchCaps,
     force_baseline: bool,
 ) -> (&'static str, &'static str) {
-    let arch = caps.arch();
     if force_baseline {
         return (FUSED_QKVZA_MQ3G256_LLOYD_SRC, "fused_qkvza_mq3g256_lloyd");
     }
@@ -784,7 +777,6 @@ pub fn fused_qkv_mq3g256_lloyd_for_arch(
     caps: &ArchCaps,
     force_baseline: bool,
 ) -> (&'static str, &'static str) {
-    let arch = caps.arch();
     if force_baseline {
         return (FUSED_QKV_MQ3G256_LLOYD_SRC, "fused_qkv_mq3g256_lloyd");
     }
@@ -1377,6 +1369,14 @@ pub const GEMM_HFQ3G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq3g256_moe_grouped_wmma.gfx12.hip");
 pub const GEMM_HFQ3G256_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq3g256_moe_grouped_wmma.gfx1151.hip");
+
+/// gfx1151 full-precision routed MoE grouped GEMM kernels. Same SGLang-style
+/// expert_tile_ids + sorted_slot_index scatter contract as the MQ grouped
+/// kernels, but raw row-major FP16/BF16 weights and staged FP16/BF16 X.
+pub const GEMM_F16_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16_moe_grouped_wmma.gfx1151.hip");
+pub const GEMM_BF16_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_moe_grouped_wmma.gfx1151.hip");
 
 /// i8 MMQ sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC for gfx11 dGPUs
 /// (gfx1100/1101/1102/1103 — 7900 XTX, 7800/7700, 7600, Phoenix mobile).
@@ -3368,8 +3368,9 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_SRC: &str =
 
 /// Barrier-free variant of the mmqload kernel. Eliminates __syncthreads()
 /// and LDS X staging. Each wave loads X directly from global memory.
-pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_NOSYNC_SRC: &str =
-    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync.hip");
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_NOSYNC_SRC: &str = include_str!(
+    "../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync.hip"
+);
 
 /// WMMA Q8_0 GEMM for DeepSeek V4 O-LoRA's strided `[B, G, *]` layout.
 pub const WO_PER_GROUP_BATCHED_Q8_0_WMMA_4W_SRC: &str =

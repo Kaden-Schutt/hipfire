@@ -687,23 +687,17 @@ impl HipRuntime {
     ) -> HipResult<()> {
         assert!(
             dst_offset + size <= dst.size(),
-            "dst_offset ({dst_offset}) + size ({size}) exceeds dst ({})", dst.size(),
+            "dst_offset ({dst_offset}) + size ({size}) exceeds dst ({})",
+            dst.size(),
         );
         assert!(
             src_offset + size <= src.size(),
-            "src_offset ({src_offset}) + size ({size}) exceeds src ({})", src.size(),
+            "src_offset ({src_offset}) + size ({size}) exceeds src ({})",
+            src.size(),
         );
         let dst_ptr = unsafe { (dst.as_ptr() as *mut u8).add(dst_offset) as *mut c_void };
         let src_ptr = unsafe { (src.as_ptr() as *const u8).add(src_offset) as *const c_void };
-        let code = unsafe {
-            (self.fn_memcpy_peer)(
-                dst_ptr,
-                dst_device,
-                src_ptr,
-                src_device,
-                size,
-            )
-        };
+        let code = unsafe { (self.fn_memcpy_peer)(dst_ptr, dst_device, src_ptr, src_device, size) };
         self.check(code, "hipMemcpyPeer (offset)")
     }
 

@@ -45,6 +45,7 @@ use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::time::Instant;
@@ -487,6 +488,456 @@ fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
     let _ = stdout.flush();
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenerateBatchPrefillEnvelope {
+    id: String,
+    batch_id: String,
+    session_count: usize,
+}
+
+fn validate_u32_array(value: &serde_json::Value, field: &str) -> Result<(), String> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| format!("{field} must be an array"))?;
+    if arr.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    for (i, item) in arr.iter().enumerate() {
+        match item.as_u64() {
+            Some(n) if n <= u32::MAX as u64 => {}
+            _ => return Err(format!("{field}[{i}] must be a u32 token id")),
+        }
+    }
+    Ok(())
+}
+
+fn validate_generate_batch_prefill(
+    msg: &serde_json::Value,
+) -> Result<GenerateBatchPrefillEnvelope, String> {
+    let id = msg
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0")
+        .to_string();
+    let batch_id = msg
+        .get("batch_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "generate_batch_prefill.batch_id must be a non-empty string".to_string())?
+        .to_string();
+
+    let has_worker = msg
+        .get("worker_key_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .is_some()
+        || msg
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .is_some();
+    if !has_worker {
+        return Err("generate_batch_prefill requires worker_key_id or model identity".to_string());
+    }
+
+    let sessions = msg
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "generate_batch_prefill.sessions must be an array".to_string())?;
+    if sessions.is_empty() {
+        return Err("generate_batch_prefill.sessions must not be empty".to_string());
+    }
+
+    let mut seen_session_ids = HashSet::new();
+    for (i, session) in sessions.iter().enumerate() {
+        let prefix = format!("generate_batch_prefill.sessions[{i}]");
+        session
+            .as_object()
+            .ok_or_else(|| format!("{prefix} must be an object"))?;
+        let session_id = session
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("{prefix}.id must be a non-empty string"))?;
+        if !seen_session_ids.insert(session_id.to_string()) {
+            return Err(format!(
+                "generate_batch_prefill duplicate session id {session_id}"
+            ));
+        }
+
+        let has_prompt = match session.get("prompt") {
+            Some(v) => {
+                v.as_str()
+                    .ok_or_else(|| format!("{prefix}.prompt must be a string"))?;
+                true
+            }
+            None => false,
+        };
+        let has_suffix = match session.get("suffix_tokens") {
+            Some(v) => {
+                validate_u32_array(v, &format!("{prefix}.suffix_tokens"))?;
+                true
+            }
+            None => false,
+        };
+        if has_prompt == has_suffix {
+            return Err(format!(
+                "{prefix} must include exactly one of prompt or suffix_tokens"
+            ));
+        }
+
+        let state_handle = session
+            .get("state_handle")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| format!("{prefix}.state_handle must be an object"))?;
+        let state_kinds = state_handle
+            .get("state_kinds")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                format!("{prefix}.state_handle.state_kinds must be a non-empty array of strings")
+            })?;
+        if state_kinds.is_empty() {
+            return Err(format!(
+                "{prefix}.state_handle.state_kinds must be a non-empty array"
+            ));
+        }
+        let valid_state_kinds = [
+            "attention_kv",
+            "deltanet_recurrent",
+            "mamba_ssm",
+            "mamba_conv",
+            "architecture_specific",
+        ];
+        for kind in state_kinds.iter() {
+            let kind = kind
+                .as_str()
+                .ok_or_else(|| format!("{prefix}.state_handle.state_kinds must be strings"))?;
+            if !valid_state_kinds.contains(&kind) {
+                return Err(format!(
+                    "{prefix}.state_handle.state_kinds contains unsupported kind {kind}"
+                ));
+            }
+        }
+        state_handle
+            .get("logical_position")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                format!("{prefix}.state_handle.logical_position must be an integer >= 0")
+            })?;
+        if let Some(v) = state_handle.get("cached_prefix_tokens") {
+            v.as_u64().ok_or_else(|| {
+                format!("{prefix}.state_handle.cached_prefix_tokens must be an integer >= 0")
+            })?;
+        }
+        if let Some(params) = session.get("params") {
+            params
+                .as_object()
+                .ok_or_else(|| format!("{prefix}.params must be an object"))?;
+        }
+    }
+
+    Ok(GenerateBatchPrefillEnvelope {
+        id,
+        batch_id,
+        session_count: sessions.len(),
+    })
+}
+
+fn emit_generate_batch_prefill_unsupported(
+    stdout: &mut std::io::Stdout,
+    envelope: &GenerateBatchPrefillEnvelope,
+) {
+    let line = serde_json::json!({
+        "type": "generate_batch_prefill_unsupported",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "sessions": envelope.session_count,
+        "supported": false,
+        "reason": "per_session_runtime_state_unavailable",
+    });
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod generate_batch_prefill_tests {
+    use super::*;
+
+    #[test]
+    fn validates_minimal_prompt_envelope() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-1",
+            "batch_id": "batch-1",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "hello",
+                "state_handle": {
+                    "state_kinds": ["attention_kv"],
+                    "logical_position": 0
+                },
+                "params": {
+                    "max_tokens": 8,
+                    "temperature": 0.0
+                }
+            }]
+        });
+
+        let envelope = validate_generate_batch_prefill(&msg).expect("valid envelope");
+        assert_eq!(envelope.id, "probe-1");
+        assert_eq!(envelope.batch_id, "batch-1");
+        assert_eq!(envelope.session_count, 1);
+    }
+
+    #[test]
+    fn validates_suffix_token_envelope_with_model_identity() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "batch_id": "batch-2",
+            "model": "qwen3.5:9b",
+            "sessions": [{
+                "id": "req-1",
+                "suffix_tokens": [1, 2, 3],
+                "state_handle": {
+                    "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                    "logical_position": 0
+                }
+            }]
+        });
+
+        let envelope = validate_generate_batch_prefill(&msg).expect("valid envelope");
+        assert_eq!(envelope.id, "0");
+        assert_eq!(envelope.batch_id, "batch-2");
+        assert_eq!(envelope.session_count, 1);
+    }
+
+    #[test]
+    fn rejects_missing_worker_identity() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "batch_id": "batch-1",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "hello",
+                "state_handle": {
+                    "state_kinds": ["attention_kv"],
+                    "logical_position": 0
+                }
+            }]
+        });
+
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains("worker_key_id or model"));
+    }
+
+    #[test]
+    fn rejects_malformed_sessions() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "batch_id": "batch-1",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "suffix_tokens": [],
+                "state_handle": {
+                    "state_kinds": ["attention_kv"],
+                    "logical_position": 0
+                }
+            }]
+        });
+
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains("suffix_tokens must not be empty"));
+    }
+
+    #[test]
+    fn rejects_duplicate_session_ids() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-1",
+            "batch_id": "batch-dup",
+            "worker_key_id": "worker-a",
+            "sessions": [
+                {
+                    "id": "req-1",
+                    "prompt": "first",
+                    "state_handle": {
+                        "state_kinds": ["attention_kv"],
+                        "logical_position": 0
+                    }
+                },
+                {
+                    "id": "req-1",
+                    "prompt": "second",
+                    "state_handle": {
+                        "state_kinds": ["attention_kv"],
+                        "logical_position": 0
+                    },
+                    "params": { "max_tokens": 8 }
+                }
+            ]
+        });
+
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains("duplicate session id"));
+    }
+
+    #[test]
+    fn rejects_missing_state_handle_fields() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-2",
+            "batch_id": "batch-missing-state",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "hello"
+            }]
+        });
+
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains(".state_handle must be an object"));
+    }
+
+    #[test]
+    fn rejects_invalid_state_handle_field_values() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-3",
+            "batch_id": "batch-invalid-state",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "hello",
+                "state_handle": {
+                    "state_kinds": ["attention_kv", "bad_kind"],
+                    "logical_position": 0
+                }
+            }]
+        });
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains("unsupported kind"));
+    }
+
+    #[test]
+    fn rejects_state_handle_missing_state_kinds() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-kinds",
+            "batch_id": "batch-missing-state-kinds",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "hello",
+                "state_handle": {
+                    "logical_position": 0
+                }
+            }]
+        });
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains("state_kinds"));
+    }
+
+    #[test]
+    fn rejects_state_handle_negative_cached_prefix_tokens() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-cached",
+            "batch_id": "batch-cached-prefix-negative",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "hello",
+                "state_handle": {
+                    "state_kinds": ["attention_kv"],
+                    "logical_position": 0,
+                    "cached_prefix_tokens": -1
+                }
+            }]
+        });
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains("cached_prefix_tokens"));
+    }
+
+    #[test]
+    fn rejects_state_handle_missing_logical_position() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-logic",
+            "batch_id": "batch-missing-logical-position",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "hello",
+                "state_handle": {
+                    "state_kinds": ["attention_kv", "deltanet_recurrent"]
+                }
+            }]
+        });
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains("logical_position"));
+    }
+
+    #[test]
+    fn rejects_unsupported_params_shape() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-4",
+            "batch_id": "batch-params",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "hello",
+                "state_handle": {
+                    "state_kinds": ["attention_kv"],
+                    "logical_position": 0
+                },
+                "params": ["max_tokens", 32]
+            }]
+        });
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains(".params must be an object"));
+    }
+
+    #[test]
+    fn rejects_prompt_suffix_contract_violations() {
+        let msg_both = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-5",
+            "batch_id": "batch-contract",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "hello",
+                "suffix_tokens": [1],
+                "state_handle": {
+                    "state_kinds": ["attention_kv"],
+                    "logical_position": 0
+                }
+            }]
+        });
+        let err_both = validate_generate_batch_prefill(&msg_both).unwrap_err();
+        assert!(err_both.contains("exactly one"));
+
+        let msg_none = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-6",
+            "batch_id": "batch-contract-2",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "state_handle": {
+                    "state_kinds": ["attention_kv"],
+                    "logical_position": 0
+                }
+            }]
+        });
+        let err_none = validate_generate_batch_prefill(&msg_none).unwrap_err();
+        assert!(err_none.contains("exactly one"));
+    }
+}
+
 enum ImageSource<'a> {
     Path(&'a str),
     Base64(&'a str),
@@ -731,6 +1182,52 @@ struct LoadedModel {
     // Stage 2 partial: AR generate() path only. DFlash, multi-GPU PP>1, and
     // VL paths still hit the Plain scaffold.
     chat_template: Option<String>,
+}
+
+struct Qwen35RequestSessionState {
+    seq_pos: usize,
+    conversation_tokens: Vec<u32>,
+    kv_cache: llama::KvCache,
+    dn_state: DeltaNetState,
+}
+
+impl Qwen35RequestSessionState {
+    fn take_from_loaded(m: &mut LoadedModel) -> Result<Self, &'static str> {
+        if m.kv_cache.is_none() {
+            return Err("qwen35 session missing KV cache");
+        }
+        if m.dn_state.is_none() {
+            return Err("qwen35 session missing DeltaNet state");
+        }
+        Ok(Self {
+            seq_pos: m.seq_pos,
+            conversation_tokens: std::mem::take(&mut m.conversation_tokens),
+            kv_cache: m.kv_cache.take().unwrap(),
+            dn_state: m.dn_state.take().unwrap(),
+        })
+    }
+
+    fn restore_into_loaded(self, m: &mut LoadedModel) {
+        m.seq_pos = self.seq_pos;
+        m.conversation_tokens = self.conversation_tokens;
+        m.kv_cache = Some(self.kv_cache);
+        m.dn_state = Some(self.dn_state);
+    }
+
+    fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
+        self.seq_pos = 0;
+        self.conversation_tokens.clear();
+        for s in &self.dn_state.s_matrices {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
+        for s in &self.dn_state.s_scales {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
+        for s in &self.dn_state.conv_states {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
+        self.kv_cache.compact_offset = 0;
+    }
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -1825,6 +2322,16 @@ fn main() {
                     );
                 }
             }
+
+            "generate_batch_prefill" => match validate_generate_batch_prefill(&msg) {
+                Ok(envelope) => {
+                    emit_generate_batch_prefill_unsupported(&mut stdout, &envelope);
+                }
+                Err(e) => {
+                    let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    emit_error_with_id(&mut stdout, id, e);
+                }
+            },
 
             "reset" => {
                 // Reset conversation state without unloading the model.
@@ -6091,6 +6598,13 @@ fn generate(
         return;
     }
 
+    let is_qwen35_ar = m.arch_id == 5 || m.arch_id == 6;
+    let mut q35_session = if is_qwen35_ar {
+        Some(Qwen35RequestSessionState::take_from_loaded(m).expect("qwen35 request session state"))
+    } else {
+        None
+    };
+
     // Auto-reset on multi-turn rollover. When eviction is active (operator
     // enabled cask_sidecar at load), the physical buffer is bounded by
     // budget+beta+safety regardless of conversation length, so reset never
@@ -6098,30 +6612,20 @@ fn generate(
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
-    if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
+    let current_seq_pos = q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos);
+    if m.eviction.is_none() && current_seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
-            m.seq_pos, m.max_seq
+            current_seq_pos, m.max_seq
         );
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        // Zero DeltaNet state on reset
-        if let Some(ref dn) = m.dn_state {
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        if let Some(session) = q35_session.as_mut() {
+            session.reset(gpu);
+        } else {
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            if let Some(kv) = m.llama_kv.as_mut() {
+                kv.compact_offset = 0;
             }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(kv) = m.kv_cache.as_mut() {
-            kv.compact_offset = 0;
-        }
-        if let Some(kv) = m.llama_kv.as_mut() {
-            kv.compact_offset = 0;
         }
     }
 
@@ -6225,13 +6729,14 @@ fn generate(
         eprintln!(
             "[pflash] gen: state={} cfg-present seq_pos={} q={} drafter_gpu={}",
             pflash_state.is_some(),
-            m.seq_pos,
+            q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos),
             raw_q_tokens.len(),
             drafter_gpu.is_some()
         );
     }
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
-        if m.seq_pos == 0 {
+        let seq_pos = q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos);
+        if seq_pos == 0 {
             let compress_gpu: &mut rdna_compute::Gpu = drafter_gpu.as_deref_mut().unwrap_or(gpu);
             // Sibling-device drafter: bind its device before compress, then
             // restore the target binding for decode. No-op when shared.
@@ -6340,7 +6845,8 @@ fn generate(
     // `<think></think>` block after the assistant prefix). Each path
     // picks up the signal it needs.
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-    let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
+    let seq_pos_for_prompt = q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos);
+    let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -6406,7 +6912,11 @@ fn generate(
     } else {
         hipfire_runtime::prompt_frame::ChatFrame {
             tokenizer,
-            system: if m.seq_pos == 0 { system_prompt } else { None },
+            system: if seq_pos_for_prompt == 0 {
+                system_prompt
+            } else {
+                None
+            },
             user: "", // unused: we pass tokens directly via build_with_user_tokens
             assistant_prefix,
             raw: false,
@@ -6422,22 +6932,28 @@ fn generate(
     // the advertised context window (max_seq) — refuse requests that would
     // overflow it in absolute position terms (current absolute + new).
     let trailer = nl.len();
-    let absolute_pos = m.seq_pos
-        + m.kv_cache.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
-        + m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0);
+    let current_seq_pos = q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos);
+    let absolute_pos = if let Some(session) = q35_session.as_ref() {
+        session.seq_pos + session.kv_cache.compact_offset
+    } else {
+        m.seq_pos + m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
+    };
     if m.eviction.is_none() {
-        if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
+        if current_seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
                 id,
-                m.seq_pos,
+                current_seq_pos,
                 new_tokens.len(),
                 max_tokens,
                 trailer,
                 m.physical_cap
             );
             let _ = stdout.flush();
+            if let Some(session) = q35_session.take() {
+                session.restore_into_loaded(m);
+            }
             return;
         }
     } else if absolute_pos + new_tokens.len() + max_tokens + trailer > m.max_seq {
@@ -6452,6 +6968,9 @@ fn generate(
             m.max_seq
         );
         let _ = stdout.flush();
+        if let Some(session) = q35_session.take() {
+            session.restore_into_loaded(m);
+        }
         return;
     }
 
@@ -6484,12 +7003,13 @@ fn generate(
 
     if m.arch_id == 5 || m.arch_id == 6 {
         // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
-        // continuing from m.seq_pos (KV cache + DeltaNet state are cumulative)
+        // continuing from session.seq_pos (KV cache + DeltaNet state are cumulative)
+        let mut session = q35_session.take().expect("qwen35 request session state");
         let config = m.q35_config.as_ref().unwrap();
         let weights = m.q35_weights.as_ref().unwrap();
         let scratch = m.q35_scratch.as_ref().unwrap();
-        let kv = m.kv_cache.as_mut().unwrap();
-        let dn = m.dn_state.as_mut().unwrap();
+        let kv = &mut session.kv_cache;
+        let dn = &mut session.dn_state;
 
         // Prefill this turn's tokens via the batched prefill entry point.
         // On gfx11+ for MQ4/HFQ4/MQ6/HFQ6 weights this hits the WMMA GEMM
@@ -6514,20 +7034,31 @@ fn generate(
             let window = ev.budget() + ev.beta();
             let mut remaining: &[u32] = &new_tokens;
             while !remaining.is_empty() {
-                let space = window.saturating_sub(m.seq_pos).max(1);
+                let space = window.saturating_sub(session.seq_pos).max(1);
                 let chunk_len = remaining.len().min(space);
                 let (chunk, rest) = remaining.split_at(chunk_len);
                 qwen35::forward_prefill_batch(
-                    gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
+                    gpu,
+                    weights,
+                    config,
+                    chunk,
+                    session.seq_pos,
+                    kv,
+                    dn,
+                    scratch,
+                    None,
+                    None,
+                    None,
+                    None,
                 )
                 .unwrap();
-                m.seq_pos += chunk_len;
+                session.seq_pos += chunk_len;
                 if let Some(hipfire_runtime::triattn::EvictionResult {
                     new_physical: new_phys,
                     ..
-                }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
                 {
-                    m.seq_pos = new_phys;
+                    session.seq_pos = new_phys;
                 }
                 remaining = rest;
             }
@@ -6537,7 +7068,7 @@ fn generate(
                 weights,
                 config,
                 &new_tokens,
-                m.seq_pos,
+                session.seq_pos,
                 kv,
                 dn,
                 scratch,
@@ -6547,9 +7078,9 @@ fn generate(
                 None,
             )
             .unwrap();
-            m.seq_pos += new_tokens.len();
+            session.seq_pos += new_tokens.len();
         }
-        m.conversation_tokens.extend_from_slice(&new_tokens);
+        session.conversation_tokens.extend_from_slice(&new_tokens);
 
         // ngram scope for the repeat penalty: ONLY generated tokens (never the
         // prompt). Prior design included the user's prompt as an anti-loop
@@ -6557,7 +7088,7 @@ fn generate(
         // (names, numbers, facts) under MQ4/MQ6 quantizations that are more
         // RP-sensitive than llama.cpp's Q4_K. First sample: empty scope (no
         // generated tokens yet); subsequent samples: generated-so-far only.
-        let ngram_scope_start = m.conversation_tokens.len();
+        let ngram_scope_start = session.conversation_tokens.len();
 
         // Generate. GPU-side sampling eliminates per-token logits download +
         // CPU softmax + CPU repeat penalty. Closes the 2× gap between raw
@@ -6581,7 +7112,7 @@ fn generate(
             .collect();
 
         // First sample: use conversation so far as scope.
-        let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
+        let ngram_scope = &session.conversation_tokens[ngram_scope_start..];
         // #111 attractor block: empty `ngram_scope` on first sample (no
         // generated tokens yet), so the unclosed-depth is always 0 and
         // `blocked` is empty. Still call collect_* for symmetry with
@@ -6662,7 +7193,7 @@ fn generate(
         // push generated past max_tokens: each loop start rechecks the cap.
         while generated < max_tokens {
             generated += 1;
-            m.conversation_tokens.push(next_token);
+            session.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
             emit_committed_event(
                 stdout,
@@ -6694,20 +7225,29 @@ fn generate(
             // position — the next turn then attended over zero-init K/V
             // at that slot.
             //
-            // Under eviction, m.seq_pos is the *physical* write slot; we
+            // Under eviction, session.seq_pos is the *physical* write slot; we
             // advance and call maybe_evict immediately so the next write
             // never overruns physical_cap. compact_offset bookkeeping on
             // the cache itself keeps RoPE phase correct across evictions.
-            qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch)
-                .unwrap();
-            m.seq_pos += 1;
+            qwen35::forward_scratch(
+                gpu,
+                weights,
+                config,
+                next_token,
+                session.seq_pos,
+                kv,
+                dn,
+                scratch,
+            )
+            .unwrap();
+            session.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
                 if let Some(hipfire_runtime::triattn::EvictionResult {
                     new_physical: new_phys,
                     ..
-                }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
                 {
-                    m.seq_pos = new_phys;
+                    session.seq_pos = new_phys;
                 }
             }
 
@@ -6762,20 +7302,27 @@ fn generate(
                     let take = close_tokens.len().min(budget_left);
                     for &t in &close_tokens[..take] {
                         qwen35::forward_scratch(
-                            gpu, weights, config, t, m.seq_pos, kv, dn, scratch,
+                            gpu,
+                            weights,
+                            config,
+                            t,
+                            session.seq_pos,
+                            kv,
+                            dn,
+                            scratch,
                         )
                         .unwrap();
-                        m.seq_pos += 1;
+                        session.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
                             if let Some(hipfire_runtime::triattn::EvictionResult {
                                 new_physical: new_phys,
                                 ..
-                            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                            }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
                             {
-                                m.seq_pos = new_phys;
+                                session.seq_pos = new_phys;
                             }
                         }
-                        m.conversation_tokens.push(t);
+                        session.conversation_tokens.push(t);
                         streamed_tokens.push(t);
                         emit_committed_event(
                             stdout,
@@ -6861,7 +7408,7 @@ fn generate(
                     );
                     let _ = stdout.flush();
                     // Fall through — resample next token as normal
-                    let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
+                    let ngram_scope = &session.conversation_tokens[ngram_scope_start..];
                     let mut blocked: Vec<u32> = Vec::new();
                     sampler::collect_unclosed_attractor_blocks(
                         ngram_scope,
@@ -6901,10 +7448,10 @@ fn generate(
                 // always holds post-evict), but we still respect the check for
                 // the non-eviction path.
                 let need_kv =
-                    m.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
+                    session.seq_pos + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
                 if nudge_len > 0 && (m.eviction.is_some() || need_kv <= m.physical_cap) {
                     for &tok in &nudge_tokens[..nudge_len] {
-                        m.conversation_tokens.push(tok);
+                        session.conversation_tokens.push(tok);
                         streamed_tokens.push(tok);
                         emit_committed_event(
                             stdout,
@@ -6931,17 +7478,24 @@ fn generate(
                             let _ = stdout.flush();
                         }
                         qwen35::forward_scratch(
-                            gpu, weights, config, tok, m.seq_pos, kv, dn, scratch,
+                            gpu,
+                            weights,
+                            config,
+                            tok,
+                            session.seq_pos,
+                            kv,
+                            dn,
+                            scratch,
                         )
                         .unwrap();
-                        m.seq_pos += 1;
+                        session.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
                             if let Some(hipfire_runtime::triattn::EvictionResult {
                                 new_physical: new_phys,
                                 ..
-                            }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                            }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
                             {
-                                m.seq_pos = new_phys;
+                                session.seq_pos = new_phys;
                             }
                         }
                         generated += 1;
@@ -6973,7 +7527,7 @@ fn generate(
             // cheap when not tripped, ~5 µs per blocked token when
             // tripped (single 4-byte H2D into the logits buffer
             // performed inside sampler::sample).
-            let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
+            let ngram_scope = &session.conversation_tokens[ngram_scope_start..];
             let mut blocked: Vec<u32> = Vec::new();
             sampler::collect_unclosed_attractor_blocks(
                 ngram_scope,
@@ -7005,27 +7559,28 @@ fn generate(
                 &mut rng_state,
             );
         }
-        // m.seq_pos is already the "next physical write slot" — advanced
+        // session.seq_pos is already the "next physical write slot" — advanced
         // per-token in the decode loop above, and evicted back down to
         // `budget` whenever maybe_evict fired. No post-loop fix-up needed.
 
         // ChatML requires \n after <|im_end|>. Run it through forward so KV cache
         // and DeltaNet state stay in sync with seq_pos.
-        if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
+        if im_end_token == Some(*session.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty()
+        {
             for &t in &nl {
-                qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch)
+                qwen35::forward_scratch(gpu, weights, config, t, session.seq_pos, kv, dn, scratch)
                     .unwrap();
-                m.seq_pos += 1;
+                session.seq_pos += 1;
                 if let Some(ref ev) = m.eviction {
                     if let Some(hipfire_runtime::triattn::EvictionResult {
                         new_physical: new_phys,
                         ..
-                    }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
+                    }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
                     {
-                        m.seq_pos = new_phys;
+                        session.seq_pos = new_phys;
                     }
                 }
-                m.conversation_tokens.push(t);
+                session.conversation_tokens.push(t);
             }
         }
 
@@ -7062,6 +7617,7 @@ fn generate(
             pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
         );
         let _ = stdout.flush();
+        session.restore_into_loaded(m);
     } else {
         // Qwen3 / LLaMA path -- multi-turn aware
         let config = m.llama_config.as_ref().unwrap();

@@ -35,8 +35,18 @@ fn parse_args() -> Args {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--target" => target = it.next(),
-            "--trunk-device" => trunk_device = it.next().and_then(|s| s.parse().ok()).expect("--trunk-device N"),
-            "--drafter-device" => drafter_device = it.next().and_then(|s| s.parse().ok()).expect("--drafter-device N"),
+            "--trunk-device" => {
+                trunk_device = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--trunk-device N")
+            }
+            "--drafter-device" => {
+                drafter_device = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .expect("--drafter-device N")
+            }
             other => {
                 eprintln!("usage: mtp_mirror_smoke --target <path> [--trunk-device N] [--drafter-device N]");
                 eprintln!("unknown arg: {other}");
@@ -60,16 +70,28 @@ fn main() {
 
     // ── Init both gpus ─────────────────────────────────────────────────
     let mut trunk_gpu = Gpu::init_with_device(args.trunk_device).expect("trunk gpu init");
-    eprintln!("trunk gpu:   {} (device {})", trunk_gpu.arch, trunk_gpu.device_id);
+    eprintln!(
+        "trunk gpu:   {} (device {})",
+        trunk_gpu.arch, trunk_gpu.device_id
+    );
 
     let mut drafter_gpu = Gpu::init_with_device(args.drafter_device).expect("drafter gpu init");
-    eprintln!("drafter gpu: {} (device {})", drafter_gpu.arch, drafter_gpu.device_id);
+    eprintln!(
+        "drafter gpu: {} (device {})",
+        drafter_gpu.arch, drafter_gpu.device_id
+    );
 
     // ── Enable bidirectional peer access ───────────────────────────────
     trunk_gpu.bind_thread().unwrap();
-    trunk_gpu.hip.enable_peer_access(drafter_gpu.device_id).expect("trunk→drafter peer");
+    trunk_gpu
+        .hip
+        .enable_peer_access(drafter_gpu.device_id)
+        .expect("trunk→drafter peer");
     drafter_gpu.bind_thread().unwrap();
-    drafter_gpu.hip.enable_peer_access(trunk_gpu.device_id).expect("drafter→trunk peer");
+    drafter_gpu
+        .hip
+        .enable_peer_access(trunk_gpu.device_id)
+        .expect("drafter→trunk peer");
     eprintln!("peer access enabled bidirectionally");
 
     // ── VRAM snapshot before load ──────────────────────────────────────
@@ -80,17 +102,20 @@ fn main() {
     eprintln!(
         "before load: trunk free={:.2}/{:.2} GiB, drafter free={:.2}/{:.2} GiB",
         trunk_free_before as f64 / (1u64 << 30) as f64,
-        trunk_total       as f64 / (1u64 << 30) as f64,
+        trunk_total as f64 / (1u64 << 30) as f64,
         drafter_free_before as f64 / (1u64 << 30) as f64,
-        drafter_total       as f64 / (1u64 << 30) as f64,
+        drafter_total as f64 / (1u64 << 30) as f64,
     );
 
     // ── Load trunk on trunk_gpu ────────────────────────────────────────
     let t_load = Instant::now();
     let target = ModelSlot::load(
-        &mut trunk_gpu, Path::new(&args.target), "target",
+        &mut trunk_gpu,
+        Path::new(&args.target),
+        "target",
         ModelSlotConfig::default(),
-    ).expect("load target");
+    )
+    .expect("load target");
     eprintln!("trunk loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     trunk_gpu.bind_thread().unwrap();
@@ -105,7 +130,9 @@ fn main() {
     let src = &target.weights.token_embd;
     eprintln!(
         "\nsource token_embd: shape={:?} dtype={:?} byte_size={} ({:.2} MiB)",
-        src.shape, src.dtype, src.byte_size(),
+        src.shape,
+        src.dtype,
+        src.byte_size(),
         src.byte_size() as f64 / (1u64 << 20) as f64,
     );
 
@@ -142,7 +169,10 @@ fn main() {
     let _ = src_tail;
 
     drafter_gpu.bind_thread().unwrap();
-    drafter_gpu.hip.memcpy_dtoh(&mut mir_head, &mirror.buf).unwrap();
+    drafter_gpu
+        .hip
+        .memcpy_dtoh(&mut mir_head, &mirror.buf)
+        .unwrap();
     let _ = mir_tail;
 
     let mismatch = src_head

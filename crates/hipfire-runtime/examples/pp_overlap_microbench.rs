@@ -111,13 +111,20 @@ struct Band {
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 fn main() {
     let per_device: Vec<usize> = std::env::var("HIPFIRE_PP_LAYERS")
         .ok()
-        .map(|s| s.split(',').map(|x| x.trim().parse::<usize>().unwrap()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().parse::<usize>().unwrap())
+                .collect()
+        })
         .unwrap_or_else(|| vec![48, 16]);
     assert_eq!(per_device.len(), 2, "PP=2 only");
 
@@ -133,8 +140,10 @@ fn main() {
     let mut gpus = Gpus::init_layers(&per_device).expect("init_layers");
     println!(
         "devices: dev0={} ({})  dev1={} ({})",
-        gpus.devices[0].arch, gpus.devices[0].device_id,
-        gpus.devices[1].arch, gpus.devices[1].device_id,
+        gpus.devices[0].arch,
+        gpus.devices[0].device_id,
+        gpus.devices[1].arch,
+        gpus.devices[1].device_id,
     );
 
     // Per-device streams. bind_thread BEFORE stream_create (device-affine).
@@ -146,20 +155,32 @@ fn main() {
 
     let gpr = DIM / GROUP;
     let weight_bytes = synth_hfq4_weights(DIM, gpr);
-    let x_host: Vec<f32> = (0..batch * DIM).map(|i| ((i as f32) * 1e-4) % 1.0 - 0.5).collect();
-    let y_init: Vec<f32> = (0..batch * DIM).map(|i| ((i as f32) * 7e-5) % 0.5 - 0.25).collect();
+    let x_host: Vec<f32> = (0..batch * DIM)
+        .map(|i| ((i as f32) * 1e-4) % 1.0 - 0.5)
+        .collect();
+    let y_init: Vec<f32> = (0..batch * DIM)
+        .map(|i| ((i as f32) * 7e-5) % 0.5 - 0.25)
+        .collect();
 
     let mut bands: Vec<Band> = Vec::with_capacity(2);
     let iters_arr = [iters0, iters1];
     for d in 0..2 {
         let g = &mut gpus.devices[d];
         g.bind_thread().unwrap();
-        let a_raw = g.upload_raw(&weight_bytes, &[DIM * gpr * ROW_BYTES]).expect("a_raw");
+        let a_raw = g
+            .upload_raw(&weight_bytes, &[DIM * gpr * ROW_BYTES])
+            .expect("a_raw");
         let x = g.upload_f32(&x_host, &[batch * DIM]).expect("x");
         let y = g.alloc_tensor(&[batch * DIM], DType::F32).expect("y");
         g.hip.memcpy_htod(&y.buf, bytes_of(&y_init)).unwrap();
         g.hip.device_synchronize().unwrap();
-        bands.push(Band { a_raw, x, y, iters: iters_arr[d], batch });
+        bands.push(Band {
+            a_raw,
+            x,
+            y,
+            iters: iters_arr[d],
+            batch,
+        });
     }
 
     // Run one band's GEMM chain on its device's active_stream (issue only,
@@ -168,7 +189,8 @@ fn main() {
         let g = &mut gpus.devices[d];
         g.bind_thread().unwrap();
         for _ in 0..band.iters {
-            g.gemm_hfq4g256_residual(&band.a_raw, &band.x, &band.y, DIM, DIM, band.batch).unwrap();
+            g.gemm_hfq4g256_residual(&band.a_raw, &band.x, &band.y, DIM, DIM, band.batch)
+                .unwrap();
         }
     };
     let sync_dev = |gpus: &mut Gpus, d: usize| {
@@ -235,7 +257,10 @@ fn main() {
     println!("\n── Per-band alone (median µs) ──");
     println!("  dev0 (gfx906, {iters0} iters): {t_dev0_alone:9.1}");
     println!("  dev1 (gfx1031, {iters1} iters): {t_dev1_alone:9.1}");
-    println!("  sum of alones:                 {:9.1}", t_dev0_alone + t_dev1_alone);
+    println!(
+        "  sum of alones:                 {:9.1}",
+        t_dev0_alone + t_dev1_alone
+    );
 
     println!("\n── Overlap modes (median µs over {MEASURE} iters) ──");
     println!("  A sequential (serialized):  {t_seq:9.1}");

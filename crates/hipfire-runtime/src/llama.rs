@@ -9,7 +9,6 @@ use crate::gguf::{GgmlType, GgufFile, TensorInfo};
 use crate::multi_gpu::Gpus;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
-use std::path::Path;
 
 /// Model architecture type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1693,7 +1692,7 @@ pub fn prefill_forward(
         let layer = &weights.layers[layer_idx];
 
         // Batched RMSNorm: each row of x_batch independently
-        for i in 0..batch {
+        for _i in 0..batch {
             // We need per-row norm — use the batched rmsnorm with batch=batch
             // Actually, rmsnorm_batched already handles this if we set batch=batch, n=dim
         }
@@ -4138,7 +4137,7 @@ pub fn forward(
     let kv_dim = n_kv_heads * head_dim;
 
     // Embedding lookup — GPU-side D2D copy of one row (8KB vs 262MB download)
-    let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
+    let x = gpu.alloc_tensor(&[dim], DType::F32)?;
     match weights.embd_format {
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
@@ -4344,7 +4343,7 @@ fn forward_logits_gpu(
     let n_kv_heads = config.n_kv_heads;
     let head_dim = config.head_dim;
 
-    let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
+    let x = gpu.alloc_tensor(&[dim], DType::F32)?;
     match weights.embd_format {
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,

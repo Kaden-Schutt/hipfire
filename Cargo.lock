@@ -314,6 +314,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "twox-hash",
 ]
 
 [[package]]

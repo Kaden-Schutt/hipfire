@@ -39,8 +39,8 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     let mut hfq = HfqFile::open(Path::new(&path)).expect("open model");
     let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq).expect("config");
-    let weights =
-        <minimax::MiniMaxM2 as Architecture>::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
+    let weights = <minimax::MiniMaxM2 as Architecture>::load_weights(&mut hfq, &config, &mut gpu)
+        .expect("weights");
     let mut state =
         minimax::MiniMaxState::new_with_max_seq(&mut gpu, &config, 4096).expect("state");
 
@@ -58,8 +58,9 @@ fn main() {
 
     for &b in &[1usize, 2, 4, 8] {
         state.reset();
-        let bl = minimax::forward::forward_batch(&config, &weights, &mut state, &mut gpu, &toks[..b], 0)
-            .expect("forward_batch");
+        let bl =
+            minimax::forward::forward_batch(&config, &weights, &mut state, &mut gpu, &toks[..b], 0)
+                .expect("forward_batch");
         let am_b = argmax(&bl);
         let am_s = argmax(&seq_logits[b - 1]);
         let cos = cosine(&bl, &seq_logits[b - 1]);

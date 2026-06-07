@@ -31,7 +31,7 @@
 //! near-miss like `<DSML|invoke>` and we'd rather forward the bytes than
 //! eat them silently.
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 // ── DSML constants — exact strings from the HF docs ─────────────────────
 

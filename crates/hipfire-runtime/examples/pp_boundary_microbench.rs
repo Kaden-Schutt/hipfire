@@ -36,7 +36,7 @@ use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, Gpu};
 use std::time::Instant;
 
-const DIM: usize = 5120;             // qwen3.6-27b hidden size
+const DIM: usize = 5120; // qwen3.6-27b hidden size
 const F32_BYTES: usize = 4;
 const WARMUP_ITERS: usize = 50;
 const MEASURE_ITERS: usize = 1000;
@@ -45,7 +45,11 @@ fn main() {
     // 1) Stand up the same Gpus shape the daemon uses for PP=2.
     let per_device: Vec<usize> = std::env::var("HIPFIRE_PP_LAYERS")
         .ok()
-        .map(|s| s.split(',').map(|x| x.trim().parse::<usize>().unwrap()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().parse::<usize>().unwrap())
+                .collect()
+        })
         .unwrap_or_else(|| vec![48, 16]);
     assert_eq!(per_device.len(), 2, "v1 microbench is PP=2 only");
     println!("PP layout: {:?}", per_device);
@@ -53,8 +57,10 @@ fn main() {
     let mut gpus = Gpus::init_layers(&per_device).expect("init_layers");
     println!(
         "devices: dev 0 = {} ({}); dev 1 = {} ({})",
-        gpus.devices[0].arch, gpus.devices[0].device_id,
-        gpus.devices[1].arch, gpus.devices[1].device_id,
+        gpus.devices[0].arch,
+        gpus.devices[0].device_id,
+        gpus.devices[1].arch,
+        gpus.devices[1].device_id,
     );
 
     // 2) Set up active_streams so boundary_copy takes the async path
@@ -71,8 +77,14 @@ fn main() {
     //    Match the daemon's load_model_pp ordering (peer-access-after-alloc
     //    is the ROCm 6.4.3 gotcha pattern).
     let max_op_bytes = 9 * DIM * F32_BYTES; // largest of the three ops below
-    let src_dev0 = gpus.devices[0].hip.malloc(max_op_bytes).expect("malloc dev 0");
-    let dst_dev1 = gpus.devices[1].hip.malloc(max_op_bytes).expect("malloc dev 1");
+    let src_dev0 = gpus.devices[0]
+        .hip
+        .malloc(max_op_bytes)
+        .expect("malloc dev 0");
+    let dst_dev1 = gpus.devices[1]
+        .hip
+        .malloc(max_op_bytes)
+        .expect("malloc dev 1");
 
     let peer_result = gpus.enable_peer_all().expect("enable_peer_all");
     println!("peer_access enabled bidirectionally: {peer_result}");
@@ -98,7 +110,9 @@ fn main() {
     for (label, n_bytes) in ops.iter() {
         // Warmup.
         for _ in 0..WARMUP_ITERS {
-            let evt = gpus.boundary_copy(0, 1, &src_dev0, &dst_dev1, *n_bytes).unwrap();
+            let evt = gpus
+                .boundary_copy(0, 1, &src_dev0, &dst_dev1, *n_bytes)
+                .unwrap();
             gpus.wait_boundary(evt).unwrap();
         }
 
@@ -106,7 +120,9 @@ fn main() {
         let mut samples: Vec<u128> = Vec::with_capacity(MEASURE_ITERS);
         for _ in 0..MEASURE_ITERS {
             let t = Instant::now();
-            let evt = gpus.boundary_copy(0, 1, &src_dev0, &dst_dev1, *n_bytes).unwrap();
+            let evt = gpus
+                .boundary_copy(0, 1, &src_dev0, &dst_dev1, *n_bytes)
+                .unwrap();
             gpus.wait_boundary(evt).unwrap();
             samples.push(t.elapsed().as_micros());
         }
@@ -125,9 +141,7 @@ fn main() {
         "op", "median", "p99", "min", "max",
     );
     for (label, med, p99, mn, mx) in &results {
-        println!(
-            "  {label:<32} {med:>8} {p99:>8} {mn:>8} {mx:>8}",
-        );
+        println!("  {label:<32} {med:>8} {p99:>8} {mn:>8} {mx:>8}",);
     }
 
     // Re-measure each op WITH a dst device_synchronize, which forces the
@@ -142,7 +156,9 @@ fn main() {
     for (label, n_bytes) in ops.iter() {
         // warmup
         for _ in 0..10 {
-            let evt = gpus.boundary_copy(0, 1, &src_dev0, &dst_dev1, *n_bytes).unwrap();
+            let evt = gpus
+                .boundary_copy(0, 1, &src_dev0, &dst_dev1, *n_bytes)
+                .unwrap();
             gpus.wait_boundary(evt).unwrap();
             gpus.devices[1].bind_thread().unwrap();
             let _ = gpus.devices[1].hip.device_synchronize();
@@ -150,7 +166,9 @@ fn main() {
         let mut samples: Vec<u128> = Vec::with_capacity(MEASURE_ITERS);
         for _ in 0..MEASURE_ITERS {
             let t = Instant::now();
-            let evt = gpus.boundary_copy(0, 1, &src_dev0, &dst_dev1, *n_bytes).unwrap();
+            let evt = gpus
+                .boundary_copy(0, 1, &src_dev0, &dst_dev1, *n_bytes)
+                .unwrap();
             gpus.wait_boundary(evt).unwrap();
             gpus.devices[1].bind_thread().unwrap();
             let _ = gpus.devices[1].hip.device_synchronize();
@@ -162,9 +180,7 @@ fn main() {
         let min = *samples.first().unwrap();
         let max = *samples.last().unwrap();
         let gb_s = (*n_bytes as f64) / (median as f64) * 1e-3; // bytes/µs = MB/s; /1000 = GB/s
-        println!(
-            "  {label:<32} {median:>8} {p99:>8} {min:>8} {max:>8} {gb_s:>10.2}",
-        );
+        println!("  {label:<32} {median:>8} {p99:>8} {min:>8} {max:>8} {gb_s:>10.2}",);
     }
 
     // 6) Decision gate on (B), the steady-state verify boundary cost.

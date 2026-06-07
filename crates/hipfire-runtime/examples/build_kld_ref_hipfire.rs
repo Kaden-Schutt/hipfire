@@ -46,9 +46,12 @@ fn main() {
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
     use std::fs::File;
-    use std::io::{BufWriter, Write};
+    use std::hash::Hasher;
+    use std::io::{BufReader, BufWriter, Read, Write};
     use std::path::{Path, PathBuf};
+    use std::thread;
     use std::time::Instant;
+    use twox_hash::XxHash64;
 
     const KLDREF_SCHEMA_VERSION: u32 = 1;
     const KLDREF_ENTRY_QUANT_TYPE: u8 = 0;
@@ -182,6 +185,61 @@ fn main() {
         }
     }
 
+    fn print_profile_summary(entries: &[rdna_compute::profile::ProfileEntry]) {
+        #[derive(Default)]
+        struct Agg {
+            calls: usize,
+            total_us: f64,
+            total_bytes: usize,
+        }
+
+        let mut by_kernel: std::collections::BTreeMap<(&'static str, &'static str), Agg> =
+            std::collections::BTreeMap::new();
+        let mut total_us = 0.0f64;
+        for entry in entries {
+            let agg = by_kernel
+                .entry((entry.category, entry.kernel))
+                .or_default();
+            agg.calls += 1;
+            agg.total_us += entry.time_us;
+            agg.total_bytes += entry.bytes;
+            total_us += entry.time_us;
+        }
+
+        let mut rows: Vec<_> = by_kernel.into_iter().collect();
+        rows.sort_by(|a, b| b.1.total_us.partial_cmp(&a.1.total_us).unwrap());
+
+        eprintln!(
+            "\n=== KLD PROFILE ({} kernel calls, {:.1}ms total timed kernel work) ===",
+            entries.len(),
+            total_us / 1000.0
+        );
+        eprintln!(
+            "  {:<4} {:<10} {:<48} {:>8} {:>10} {:>10} {:>7} {:>10}",
+            "rank", "category", "kernel", "calls", "total_ms", "us/call", "%", "MiB"
+        );
+        for (rank, ((category, kernel), agg)) in rows.iter().take(24).enumerate() {
+            let avg_us = agg.total_us / agg.calls as f64;
+            let pct = if total_us > 0.0 {
+                agg.total_us * 100.0 / total_us
+            } else {
+                0.0
+            };
+            let mib = agg.total_bytes as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "  {:<4} {:<10} {:<48} {:>8} {:>9.2} {:>10.2} {:>6.1} {:>10.1}",
+                rank + 1,
+                category,
+                kernel,
+                agg.calls,
+                agg.total_us / 1000.0,
+                avg_us,
+                pct,
+                mib
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_kld_prefill(
         gpu: &mut Gpu,
@@ -231,7 +289,9 @@ fn main() {
             ));
         }
         qwen35::upload_prefill_batch_inputs(gpu, pbs, tokens, start_pos)?;
-        if gpu.active_stream.is_none() {
+        let skip_active_stream_debug =
+            std::env::var("HIPFIRE_KLD_NO_ACTIVE_STREAM").ok().as_deref() == Some("1");
+        if gpu.active_stream.is_none() && !skip_active_stream_debug {
             gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
 
@@ -304,6 +364,49 @@ fn main() {
             .split_whitespace()
             .next()
             .map(String::from)
+    }
+
+    #[derive(Debug)]
+    struct SourceModelHash {
+        xxh64: Option<String>,
+        sha256: Option<String>,
+    }
+
+    fn xxh64_file(path: &Path) -> Option<String> {
+        let file = File::open(path).ok()?;
+        let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
+        let mut buf = vec![0u8; 4 * 1024 * 1024];
+        let mut h = XxHash64::with_seed(0);
+        loop {
+            let n = reader.read(&mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            h.write(&buf[..n]);
+        }
+        Some(format!("{:016x}", h.finish()))
+    }
+
+    fn spawn_source_model_hash(
+        path: PathBuf,
+        include_sha256: bool,
+    ) -> thread::JoinHandle<SourceModelHash> {
+        thread::spawn(move || {
+            let xxh64 = xxh64_file(&path);
+            let sha256 = if include_sha256 {
+                command_hash("sha256sum", &path)
+            } else {
+                None
+            };
+            SourceModelHash { xxh64, sha256 }
+        })
+    }
+
+    fn join_source_model_hash(handle: thread::JoinHandle<SourceModelHash>) -> SourceModelHash {
+        handle.join().unwrap_or(SourceModelHash {
+            xxh64: None,
+            sha256: None,
+        })
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -576,8 +679,30 @@ fn main() {
     // graph capture variance. Match `eval_hipfire`'s prompt determinism
     // default; KLD prefill capture is default-on for long reference builds
     // and can be disabled with HIPFIRE_KLD_GRAPH=0 for debugging.
+    let use_kld_direct_f16kv_attn = match std::env::var("HIPFIRE_KLD_DIRECT_WMMA_ATTN")
+        .or_else(|_| std::env::var("HIPFIRE_KLD_DIRECT_F16KV_ATTN"))
+        .ok()
+        .as_deref()
+    {
+        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES") => true,
+        _ => false,
+    };
+    let use_kld_fp32_gqa4_attn = match std::env::var("HIPFIRE_KLD_FP32_GQA4_ATTN")
+        .ok()
+        .as_deref()
+    {
+        Some("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO") => false,
+        _ => true,
+    };
     unsafe {
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
+        if use_kld_direct_f16kv_attn {
+            std::env::set_var("HIPFIRE_KLD_DIRECT_WMMA_ATTN", "1");
+            std::env::set_var("HIPFIRE_KLD_DIRECT_F16KV_ATTN", "1");
+        }
+        if use_kld_fp32_gqa4_attn {
+            std::env::set_var("HIPFIRE_KLD_FP32_GQA4_ATTN", "1");
+        }
         if use_kld_graph {
             std::env::set_var("HIPFIRE_PREFILL_REUSE_PBS", "1");
             if std::env::var_os("HIPFIRE_PREFILL_MAX_BATCH").is_none() {
@@ -641,6 +766,15 @@ fn main() {
             std::env::var("HIPFIRE_PREFILL_MAX_BATCH").unwrap_or_else(|_| "<unset>".to_string())
         );
     }
+    if use_kld_direct_f16kv_attn {
+        eprintln!(
+            "build_kld_ref_hipfire: direct causal WMMA attention enabled for FP32-KV prefill chunks"
+        );
+    } else if use_kld_fp32_gqa4_attn {
+        eprintln!(
+            "build_kld_ref_hipfire: direct FP32 GQA4 attention enabled for eligible KLD prefill chunks"
+        );
+    }
     if all_tokens.len() % args.n_ctx != 0 {
         eprintln!(
             "build_kld_ref_hipfire: dropping tail of {} token(s)",
@@ -697,47 +831,62 @@ fn main() {
     let started = Instant::now();
     let progress_interval = (total_scored / 100).max(1);
     let scoring_start = args.n_ctx / 2;
-    let prefix_hidden_sink = gpu
-        .alloc_tensor(&[scoring_start, slot.config.dim], DType::F32)
-        .expect("alloc prefix_hidden_sink");
-    let hidden_buf = gpu
-        .alloc_tensor(&[scored_per_chunk, slot.config.dim], DType::F32)
-        .expect("alloc hidden_buf");
+    let full_hidden_buf = gpu
+        .alloc_tensor(&[args.n_ctx - 1, slot.config.dim], DType::F32)
+        .expect("alloc full_hidden_buf");
+    let hidden_buf = full_hidden_buf.sub_offset(
+        scoring_start * slot.config.dim,
+        scored_per_chunk * slot.config.dim,
+    );
+    let include_source_sha256 =
+        std::env::var("HIPFIRE_KLD_SOURCE_SHA256").ok().as_deref() == Some("1");
+    let source_model_hash = spawn_source_model_hash(args.model.clone(), include_source_sha256);
     let mut scored_done = 0usize;
+    let do_profile = std::env::var("HIPFIRE_PROFILE").ok().as_deref() == Some("1");
+    let prefill_only_debug =
+        std::env::var("HIPFIRE_KLD_PREFILL_ONLY").ok().as_deref() == Some("1");
     for chunk_idx in 0..n_chunk {
         slot.reset_state(&mut gpu);
         let chunk = &tokens[chunk_idx * args.n_ctx..(chunk_idx + 1) * args.n_ctx];
+        let profile_this_chunk = do_profile && chunk_idx == 0;
+        if profile_this_chunk {
+            rdna_compute::profile::start();
+        }
 
+        let t_prefill = Instant::now();
         forward_kld_prefill(
             &mut gpu,
             &slot.weights,
             &slot.config,
-            &chunk[0..scoring_start],
+            &chunk[0..(args.n_ctx - 1)],
             0,
             &mut slot.kv_cache,
             &mut slot.dn_state,
             &slot.scratch,
             slot.scratch.prefill_batch.as_ref(),
-            &prefix_hidden_sink,
+            &full_hidden_buf,
             0x4b1d_0000usize,
             use_kld_graph,
         )
-        .expect("forward_prefill_batch prefix");
-        forward_kld_prefill(
-            &mut gpu,
-            &slot.weights,
-            &slot.config,
-            &chunk[scoring_start..(args.n_ctx - 1)],
-            scoring_start,
-            &mut slot.kv_cache,
-            &mut slot.dn_state,
-            &slot.scratch,
-            slot.scratch.prefill_batch.as_ref(),
-            &hidden_buf,
-            0x4b1d_0001usize,
-            use_kld_graph,
-        )
-        .expect("forward_prefill_batch scored");
+        .expect("forward_prefill_batch kld chunk");
+        let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+        if prefill_only_debug {
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip
+                    .stream_synchronize(stream)
+                    .expect("prefill-only debug stream sync");
+            } else {
+                gpu.hip
+                    .device_synchronize()
+                    .expect("prefill-only debug device sync");
+            }
+            eprintln!(
+                "build_kld_ref_hipfire: prefill-only debug exit after chunk {} prefill={:.1}ms",
+                chunk_idx + 1,
+                prefill_ms
+            );
+            return;
+        }
 
         let batched_logits = if slot.weights.output.gpu_dtype == DType::F16 {
             let logits = gpu
@@ -793,6 +942,10 @@ fn main() {
             const VOCAB_TILE: usize = 32 * 1024;
             const KLD_GPU_TOPK: usize = 256;
             const KLD_GPU_CHUNK: usize = 2048;
+            let mut lm_head_ms = 0.0f64;
+            let mut gpu_topk_ms = 0.0f64;
+            let mut download_ms = 0.0f64;
+            let mut host_merge_ms = 0.0f64;
             let tile_logits = gpu
                 .alloc_tensor(
                     &[scored_per_chunk, VOCAB_TILE.min(slot.config.vocab_size)],
@@ -812,15 +965,35 @@ fn main() {
                     .buf
                     .sub_offset(vocab_start * slot.config.dim, vocab_tile * slot.config.dim);
                 let logits_tile = tile_logits.sub_offset(0, scored_per_chunk * vocab_tile);
-                gpu.gemm_bf16_x_bf16_wmma(
-                    &output_tile,
-                    &hidden_buf,
-                    &logits_tile,
-                    vocab_tile,
-                    slot.config.dim,
-                    scored_per_chunk,
-                )
-                .expect("gemm_bf16_x_bf16_wmma lm_head tile");
+                let t_lm_head = Instant::now();
+                if gpu.arch == "gfx1151"
+                    && vocab_tile >= 128
+                    && scored_per_chunk >= 16
+                    && slot.config.dim % 16 == 0
+                {
+                    gpu.gemm_bf16_x_bf16_wmma_gfx1151_m128_labeled(
+                        &output_tile,
+                        &hidden_buf,
+                        &logits_tile,
+                        vocab_tile,
+                        slot.config.dim,
+                        scored_per_chunk,
+                        "gemm_bf16_x_bf16_wmma_lm_head_m128",
+                    )
+                    .expect("gemm_bf16_x_bf16_wmma_gfx1151_m128 lm_head tile");
+                } else {
+                    gpu.gemm_bf16_x_bf16_wmma_labeled(
+                        &output_tile,
+                        &hidden_buf,
+                        &logits_tile,
+                        vocab_tile,
+                        slot.config.dim,
+                        scored_per_chunk,
+                        "gemm_bf16_x_bf16_wmma_lm_head",
+                    )
+                    .expect("gemm_bf16_x_bf16_wmma lm_head tile");
+                }
+                lm_head_ms += t_lm_head.elapsed().as_secs_f64() * 1000.0;
                 if use_gpu_tile_topk {
                     let n_tile_chunks = (vocab_tile + KLD_GPU_CHUNK - 1) / KLD_GPU_CHUNK;
                     let top_vals = gpu
@@ -835,6 +1008,7 @@ fn main() {
                     let chunk_sum = gpu
                         .alloc_tensor(&[scored_per_chunk, n_tile_chunks], DType::F32)
                         .expect("alloc kld tile chunk sum");
+                    let t_gpu_topk = Instant::now();
                     gpu.kld_tile_topk_lse_f32(
                         &logits_tile,
                         &top_vals,
@@ -847,6 +1021,8 @@ fn main() {
                         n_tile_chunks,
                     )
                     .expect("kld_tile_topk_lse_f32");
+                    gpu_topk_ms += t_gpu_topk.elapsed().as_secs_f64() * 1000.0;
+                    let t_download = Instant::now();
                     let vals = gpu.download_f32(&top_vals).expect("download kld top vals");
                     let idx = download_i32(&gpu, &top_idx);
                     let maxes = gpu
@@ -855,6 +1031,8 @@ fn main() {
                     let sums = gpu
                         .download_f32(&chunk_sum)
                         .expect("download kld chunk sum");
+                    download_ms += t_download.elapsed().as_secs_f64() * 1000.0;
+                    let t_host_merge = Instant::now();
                     row_acc.par_iter_mut().enumerate().for_each(|(row, acc)| {
                         for chunk_id in 0..n_tile_chunks {
                             let stat = row * n_tile_chunks + chunk_id;
@@ -866,22 +1044,28 @@ fn main() {
                             );
                         }
                     });
+                    host_merge_ms += t_host_merge.elapsed().as_secs_f64() * 1000.0;
                     let _ = gpu.free_tensor(top_vals);
                     let _ = gpu.free_tensor(top_idx);
                     let _ = gpu.free_tensor(chunk_max);
                     let _ = gpu.free_tensor(chunk_sum);
                 } else {
+                    let t_download = Instant::now();
                     let tile = gpu
                         .download_f32(&logits_tile)
                         .expect("download bf16 lm_head tile");
+                    download_ms += t_download.elapsed().as_secs_f64() * 1000.0;
+                    let t_host_merge = Instant::now();
                     row_acc
                         .par_iter_mut()
                         .zip(tile.par_chunks(vocab_tile))
                         .for_each(|(acc, row)| acc.update_tile(row, vocab_start));
+                    host_merge_ms += t_host_merge.elapsed().as_secs_f64() * 1000.0;
                 }
             }
             let _ = gpu.free_tensor(tile_logits);
 
+            let t_finalize = Instant::now();
             let mut chunk_indices = vec![0u32; scored_per_chunk * top_k];
             let mut chunk_log_probs = vec![0.0f32; scored_per_chunk * top_k];
             let mut chunk_residuals = vec![0.0f32; scored_per_chunk];
@@ -893,6 +1077,7 @@ fn main() {
                 .for_each(|(((acc, idx_out), lp_out), residual_out)| {
                     *residual_out = acc.write_final(idx_out, lp_out);
                 });
+            host_merge_ms += t_finalize.elapsed().as_secs_f64() * 1000.0;
             write_u32_slice(&mut indices_out, &chunk_indices);
             write_f32_slice(&mut log_probs_out, &chunk_log_probs);
             write_f32_slice(&mut residual_out, &chunk_residuals);
@@ -909,6 +1094,17 @@ fn main() {
                 pct,
                 rate
             );
+            if profile_this_chunk {
+                eprintln!(
+                    "\nKLD stage wall chunk {}: prefill={:.1}ms lm_head={:.1}ms gpu_topk={:.1}ms download={:.1}ms host_merge_finalize={:.1}ms",
+                    chunk_idx + 1,
+                    prefill_ms,
+                    lm_head_ms,
+                    gpu_topk_ms,
+                    download_ms,
+                    host_merge_ms
+                );
+            }
         } else if slot.weights.output.gpu_dtype == DType::F32 {
             const VOCAB_TILE: usize = 32 * 1024;
             let tile_logits = gpu
@@ -1013,6 +1209,10 @@ fn main() {
         if let Some(logits) = batched_logits {
             let _ = gpu.free_tensor(logits);
         }
+        if profile_this_chunk {
+            let entries = rdna_compute::profile::stop().unwrap_or_default();
+            print_profile_summary(&entries);
+        }
     }
     eprintln!();
     indices_out.flush().unwrap();
@@ -1024,6 +1224,8 @@ fn main() {
 
     let elapsed = started.elapsed().as_secs_f64();
     let producer_cmd = std::env::args().collect::<Vec<_>>().join(" ");
+    let source_model_hash = join_source_model_hash(source_model_hash);
+    let source_model_xxh64 = source_model_hash.xxh64.clone();
 
     let metadata = json!({
         "schema": 1,
@@ -1035,7 +1237,13 @@ fn main() {
         "base_model_id": args.model.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown"),
         "reference_precision": "bf16",
         "model": args.model.display().to_string(),
-        "source_model_sha256": command_hash("sha256sum", &args.model),
+        "source_model_xxh64": source_model_xxh64,
+        "source_model_hash": {
+            "algorithm": "xxh64",
+            "seed": 0,
+            "value": source_model_hash.xxh64,
+        },
+        "source_model_sha256": source_model_hash.sha256,
         "slice": args.slice.display().to_string(),
         "slice_md5": command_hash("md5sum", &args.slice),
         "output": args.output.display().to_string(),
@@ -1046,6 +1254,15 @@ fn main() {
         "kv_mode": format!("{:?}", args.kv_mode),
         "deltanet_state_precision": "fp32",
         "deltanet_state_quant": "FP32",
+        "kld_direct_wmma_attention": use_kld_direct_f16kv_attn,
+        "kld_fp32_gqa4_attention": use_kld_fp32_gqa4_attn,
+        "attention_kv_precision": if use_kld_direct_f16kv_attn {
+            "direct_wmma_f32_kv"
+        } else if use_kld_fp32_gqa4_attn {
+            "direct_fp32_gqa4"
+        } else {
+            "cache_mode"
+        },
         "kld_graph_prefill": use_kld_graph,
         "kld_graph_prefill_max_batch": std::env::var("HIPFIRE_PREFILL_MAX_BATCH").ok(),
         "producer_cmd": producer_cmd,

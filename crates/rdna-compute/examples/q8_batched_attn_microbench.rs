@@ -21,7 +21,10 @@
 use rdna_compute::{DType, Gpu};
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn main() {
@@ -58,16 +61,16 @@ fn main() {
     let v_cache = gpu.upload_raw(&kv, &[cache_bytes]).expect("v upload");
 
     // Q: [n × n_heads × head_dim] f32.
-    let q_data: Vec<f32> = (0..n * nh * hd).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
+    let q_data: Vec<f32> = (0..n * nh * hd)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+        .collect();
     let q = gpu.upload_f32(&q_data, &[n * nh * hd]).expect("q upload");
     let out = gpu.zeros(&[n * nh * hd], DType::F32).expect("out");
 
     // positions: i32 bits in f32 slot — positions[b] = ctx - n + b (the
     // queries sit at the tail of the context, as in real tail-chunk prefill).
     let pos_data: Vec<i32> = (0..n).map(|b| (ctx - n + b) as i32).collect();
-    let pos_bytes = unsafe {
-        std::slice::from_raw_parts(pos_data.as_ptr() as *const u8, n * 4)
-    };
+    let pos_bytes = unsafe { std::slice::from_raw_parts(pos_data.as_ptr() as *const u8, n * 4) };
     let positions = gpu.upload_raw(pos_bytes, &[n]).expect("pos upload");
 
     // flash_partials: [sub_batch × n_heads × max_tiles × (2+head_dim)].
@@ -92,25 +95,30 @@ fn main() {
         // Force tile_batched (fallback) into out_ref.
         std::env::set_var("HIPFIRE_Q8_TOKPAR", "0");
         gpu.attention_flash_q8_0_batched_masked(
-            &q, &k_cache, &v_cache, &out_ref, &positions,
-            nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
-        ).expect("ref");
+            &q, &k_cache, &v_cache, &out_ref, &positions, nh, nkv, hd, ctx, ctx, n, &partials,
+            None, 0, 0,
+        )
+        .expect("ref");
         // Force the candidate into out_tp: W64=1 → dp4a wave64, DP4A=1 →
         // dp4a wave32, else tokpar.
         let use_dp4a = std::env::var("DP4A").as_deref() == Ok("1");
         let use_w64 = std::env::var("W64").as_deref() == Ok("1");
         std::env::set_var("HIPFIRE_Q8_TOKPAR", "0");
         let cand = if use_w64 {
-            std::env::set_var("HIPFIRE_Q8_DP4A_W64", "1"); "dp4a_wave64"
+            std::env::set_var("HIPFIRE_Q8_DP4A_W64", "1");
+            "dp4a_wave64"
         } else if use_dp4a {
-            std::env::set_var("HIPFIRE_Q8_DP4A", "1"); "dp4a"
+            std::env::set_var("HIPFIRE_Q8_DP4A", "1");
+            "dp4a"
         } else {
-            std::env::set_var("HIPFIRE_Q8_TOKPAR", "1"); "tokpar"
+            std::env::set_var("HIPFIRE_Q8_TOKPAR", "1");
+            "tokpar"
         };
         gpu.attention_flash_q8_0_batched_masked(
-            &q, &k_cache, &v_cache, &out_tp, &positions,
-            nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
-        ).expect("candidate");
+            &q, &k_cache, &v_cache, &out_tp, &positions, nh, nkv, hd, ctx, ctx, n, &partials, None,
+            0, 0,
+        )
+        .expect("candidate");
         std::env::remove_var("HIPFIRE_Q8_DP4A");
         std::env::remove_var("HIPFIRE_Q8_DP4A_W64");
         gpu.hip.device_synchronize().unwrap();
@@ -127,7 +135,14 @@ fn main() {
         let ref_norm: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
         println!("\n=== VERIFY {cand} vs tile_batched ===");
         println!("max abs diff: {max_abs:.3e}   max rel diff: {max_rel:.3e}   ref L2 norm: {ref_norm:.3e}");
-        println!("{}", if max_abs < 1e-2 { "PASS (within FP noise)" } else { "FAIL — math mismatch" });
+        println!(
+            "{}",
+            if max_abs < 1e-2 {
+                "PASS (within FP noise)"
+            } else {
+                "FAIL — math mismatch"
+            }
+        );
         std::env::remove_var("HIPFIRE_Q8_TOKPAR");
         return;
     }
@@ -150,17 +165,19 @@ fn main() {
     std::env::set_var("HIPFIRE_Q8_TOKPAR", "0");
     let tile_ms = time(&mut gpu, &|g: &mut Gpu| {
         g.attention_flash_q8_0_batched_masked(
-            &q, &k_cache, &v_cache, &out, &positions,
-            nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
-        ).expect("tile_batched");
+            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials, None, 0,
+            0,
+        )
+        .expect("tile_batched");
     });
     // (A) NEW token-parallel.
     std::env::set_var("HIPFIRE_Q8_TOKPAR", "1");
     let new_ms = time(&mut gpu, &|g: &mut Gpu| {
         g.attention_flash_q8_0_batched_masked(
-            &q, &k_cache, &v_cache, &out, &positions,
-            nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
-        ).expect("tokpar");
+            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials, None, 0,
+            0,
+        )
+        .expect("tokpar");
     });
     std::env::remove_var("HIPFIRE_Q8_TOKPAR");
 
@@ -168,9 +185,10 @@ fn main() {
     std::env::set_var("HIPFIRE_Q8_DP4A", "1");
     let dp4a_ms = time(&mut gpu, &|g: &mut Gpu| {
         g.attention_flash_q8_0_batched_masked(
-            &q, &k_cache, &v_cache, &out, &positions,
-            nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
-        ).expect("dp4a");
+            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials, None, 0,
+            0,
+        )
+        .expect("dp4a");
     });
     std::env::remove_var("HIPFIRE_Q8_DP4A");
 
@@ -178,9 +196,10 @@ fn main() {
     std::env::set_var("HIPFIRE_Q8_DP4A_W64", "1");
     let w64_ms = time(&mut gpu, &|g: &mut Gpu| {
         g.attention_flash_q8_0_batched_masked(
-            &q, &k_cache, &v_cache, &out, &positions,
-            nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
-        ).expect("dp4a_wave64");
+            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials, None, 0,
+            0,
+        )
+        .expect("dp4a_wave64");
     });
     std::env::remove_var("HIPFIRE_Q8_DP4A_W64");
 
@@ -188,7 +207,8 @@ fn main() {
     let pos_single: Vec<Vec<u8>> = (0..n)
         .map(|b| ((ctx - n + b) as i32).to_ne_bytes().to_vec())
         .collect();
-    let pos_bufs: Vec<_> = pos_single.iter()
+    let pos_bufs: Vec<_> = pos_single
+        .iter()
         .map(|bytes| gpu.upload_raw(bytes, &[1]).expect("pos1"))
         .collect();
     let old_ms = time(&mut gpu, &|g: &mut Gpu| {
@@ -197,9 +217,19 @@ fn main() {
             let out_b = out.sub_offset(b * nh * hd, nh * hd);
             let seq_len = ctx - n + b + 1;
             g.attention_flash_q8_0(
-                &q_b, &k_cache, &v_cache, &out_b,
-                &pos_bufs[b].buf, seq_len, nh, nkv, hd, ctx, &partials,
-            ).expect("old per-pos");
+                &q_b,
+                &k_cache,
+                &v_cache,
+                &out_b,
+                &pos_bufs[b].buf,
+                seq_len,
+                nh,
+                nkv,
+                hd,
+                ctx,
+                &partials,
+            )
+            .expect("old per-pos");
         }
     });
 
@@ -221,12 +251,23 @@ fn main() {
     println!("DP4A w64  (v_dot4, 64-lane full wave)    : {w64_ms:8.2} ms");
     println!("TOKPAR    (token-parallel)               : {new_ms:8.2} ms");
     println!("OLD       per-position loop (n={n})       : {old_ms:8.2} ms");
-    println!("speedup DP4A-w64 vs TILE                  : {:.2}x", tile_ms / w64_ms);
-    println!("speedup DP4A-w64 vs DP4A-w32              : {:.2}x", dp4a_ms / w64_ms);
-    println!("speedup DP4A-w64 vs OLD                   : {:.2}x", old_ms / w64_ms);
+    println!(
+        "speedup DP4A-w64 vs TILE                  : {:.2}x",
+        tile_ms / w64_ms
+    );
+    println!(
+        "speedup DP4A-w64 vs DP4A-w32              : {:.2}x",
+        dp4a_ms / w64_ms
+    );
+    println!(
+        "speedup DP4A-w64 vs OLD                   : {:.2}x",
+        old_ms / w64_ms
+    );
     println!("--- NEW kernel BW (upper-bound K/V reads) ---");
-    println!("K/V DRAM read (n_heads×ctx, K+V)         : {:.1} MiB",
-        new_kv_reads / 1048576.0);
+    println!(
+        "K/V DRAM read (n_heads×ctx, K+V)         : {:.1} MiB",
+        new_kv_reads / 1048576.0
+    );
     println!("achieved BW                               : {new_gibs:.1} GiB/s ({:.0}% of ~{PEAK_GIBS:.0} GiB/s peak)",
         100.0 * new_gibs / PEAK_GIBS);
     println!("(>~60% peak ⇒ DRAM-bound ⇒ GQA-reuse is the lever)");

@@ -20,13 +20,17 @@ fn read_f32_bin(path: &PathBuf) -> Vec<f32> {
         eprintln!("failed to read {}: {e}", path.display());
         std::process::exit(2);
     });
-    assert_eq!(bytes.len() % 4, 0, "{} not multiple of 4 bytes", path.display());
+    assert_eq!(
+        bytes.len() % 4,
+        0,
+        "{} not multiple of 4 bytes",
+        path.display()
+    );
     let n = bytes.len() / 4;
     let mut out = vec![0.0f32; n];
     {
-        let dst: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4)
-        };
+        let dst: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n * 4) };
         dst.copy_from_slice(&bytes);
     }
     out
@@ -78,21 +82,28 @@ fn main() {
 
     println!();
     println!("elements:        {n}");
-    println!("bit-equal:       {bit_equal} ({:.2}%)", 100.0 * bit_equal as f64 / n as f64);
+    println!(
+        "bit-equal:       {bit_equal} ({:.2}%)",
+        100.0 * bit_equal as f64 / n as f64
+    );
     println!("nan-skipped:     {nan_count}");
     println!("max abs diff:    {max_abs_diff:.6e}  at idx {max_idx}");
-    println!("                 A[{max_idx}] = {:.6e}  B[{max_idx}] = {:.6e}", a[max_idx], b[max_idx]);
+    println!(
+        "                 A[{max_idx}] = {:.6e}  B[{max_idx}] = {:.6e}",
+        a[max_idx], b[max_idx]
+    );
     println!("mean abs diff:   {mean_abs:.6e}");
     println!("RMS diff:        {rms:.6e}");
 
     // Top-K diverging indices.
-    let mut diffs: Vec<(usize, f32)> = (0..n)
-        .map(|i| (i, (a[i] - b[i]).abs()))
-        .collect();
+    let mut diffs: Vec<(usize, f32)> = (0..n).map(|i| (i, (a[i] - b[i]).abs())).collect();
     diffs.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
     println!("\ntop-10 diverging indices:");
     for (i, d) in diffs.iter().take(10) {
-        println!("  idx={i:>8} diff={d:.6e}  A={:.6e}  B={:.6e}", a[*i], b[*i]);
+        println!(
+            "  idx={i:>8} diff={d:.6e}  A={:.6e}  B={:.6e}",
+            a[*i], b[*i]
+        );
     }
 
     // Argmax (useful for the compressed-logits case — does the picked
@@ -103,8 +114,14 @@ fn main() {
     let mut b_argmax = 0usize;
     let mut b_max = f32::NEG_INFINITY;
     for i in 0..n {
-        if a[i] > a_max { a_max = a[i]; a_argmax = i; }
-        if b[i] > b_max { b_max = b[i]; b_argmax = i; }
+        if a[i] > a_max {
+            a_max = a[i];
+            a_argmax = i;
+        }
+        if b[i] > b_max {
+            b_max = b[i];
+            b_argmax = i;
+        }
     }
     println!("\nargmax: A={a_argmax} (val={a_max:.6e})  B={b_argmax} (val={b_max:.6e})");
     if a_argmax != b_argmax {

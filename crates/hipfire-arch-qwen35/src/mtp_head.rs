@@ -798,8 +798,12 @@ pub fn load_mtp_head_bundled(
         Ok(None) => return Ok(None),
         // Return Err (not panic): the daemon auto-probes every .mq4 trunk for a
         // bundled trailer on load; an IO error here must not crash the process.
-        Err(e) => return Err(hip_bridge::HipError::new(0, &format!(
-            "read bundle trailer from {}: {e}", path.display()))),
+        Err(e) => {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("read bundle trailer from {}: {e}", path.display()),
+            ))
+        }
     };
     let head = load_mtp_head_at_offset(path, gpu, max_seq, mtp_offset)?;
     Ok(Some(head))
@@ -831,14 +835,24 @@ pub fn load_mtp_head_at_offset(
     // arch, corrupt metadata) so callers like the daemon can degrade to AR
     // instead of crashing the process.
     let hfq = HfqFile::open_at_offset(path, base_offset).map_err(|e| {
-        hip_bridge::HipError::new(0, &format!(
-            "open .mtp file {} @ offset {base_offset}: {e}", path.display()))
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "open .mtp file {} @ offset {base_offset}: {e}",
+                path.display()
+            ),
+        )
     })?;
     if hfq.arch_id != 21 {
-        return Err(hip_bridge::HipError::new(0, &format!(
-            ".mtp file at {} has arch_id={} (expected 21 = QWEN35_MTP_HEAD); \
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                ".mtp file at {} has arch_id={} (expected 21 = QWEN35_MTP_HEAD); \
              is this actually an MTP head extracted by mtp_extract?",
-            path.display(), hfq.arch_id)));
+                path.display(),
+                hfq.arch_id
+            ),
+        ));
     }
     let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).map_err(|e| {
         hip_bridge::HipError::new(0, &format!(".mtp metadata JSON parse failed: {e}"))
@@ -1341,9 +1355,12 @@ pub fn mtp_head_forward_compressed_with_embed(
 ) -> HipResult<()> {
     let cfg = &head.config;
     let w = &head.weights;
-    let lm_head_draft = w.lm_head_draft.as_ref()
-        .expect("mtp_head_forward_compressed_with_embed called but head has no lm_head_draft sidecar");
-    let logits_c = scratch.logits_compressed.as_ref()
+    let lm_head_draft = w.lm_head_draft.as_ref().expect(
+        "mtp_head_forward_compressed_with_embed called but head has no lm_head_draft sidecar",
+    );
+    let logits_c = scratch
+        .logits_compressed
+        .as_ref()
         .expect("mtp_head_forward_compressed_with_embed: scratch.logits_compressed not allocated");
 
     assert_eq!(
@@ -1370,11 +1387,18 @@ pub fn mtp_head_forward_compressed_with_embed(
 
     // Position scalar upload.
     let pos_i32 = pos as i32;
-    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+    gpu.hip
+        .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
 
     // Token embedding = caller-supplied (D2D copy, same-device on the
     // drafter gpu).
-    gpu.hip.memcpy_dtod_at(&scratch.tok_embd.buf, 0, &next_token_embed.buf, 0, dim_bytes)?;
+    gpu.hip.memcpy_dtod_at(
+        &scratch.tok_embd.buf,
+        0,
+        &next_token_embed.buf,
+        0,
+        dim_bytes,
+    )?;
 
     // The rest of the function reads ONLY MTP-head-local weights via
     // `head.weights` (already drafter-resident) and `head.config`. Call
@@ -1383,7 +1407,12 @@ pub fn mtp_head_forward_compressed_with_embed(
     mtp_head_block_post_embedding(gpu, head, scratch, kv, prev_hidden, pos)?;
 
     // Compressed lm_head: shared_head_norm + small GEMV.
-    gpu.rmsnorm_f32(&scratch.t_mtp_out, &w.shared_head_norm, &scratch.tmp, cfg.rms_norm_eps)?;
+    gpu.rmsnorm_f32(
+        &scratch.t_mtp_out,
+        &w.shared_head_norm,
+        &scratch.tmp,
+        cfg.rms_norm_eps,
+    )?;
     weight_gemv(gpu, lm_head_draft, &scratch.tmp, logits_c)?;
 
     Ok(())
@@ -1518,13 +1547,13 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     next_token: u32,
     prev_hidden: &GpuTensor,
     next_token_embed: Option<&GpuTensor>,
-    pos_buf: &DeviceBuffer,
+    _pos_buf: &DeviceBuffer,
     pos: usize,
-    seq_len_hint: usize,
+    _seq_len_hint: usize,
     trunk_weights: &Qwen35Weights,
 ) -> HipResult<()> {
     let cfg = &head.config;
-    let w = &head.weights;
+    let _w = &head.weights;
     let n_embd = cfg.n_embd;
 
     assert_eq!(

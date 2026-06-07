@@ -397,9 +397,8 @@ pub struct ToolCall {
 fn strip_generation_tags(template: &str) -> String {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(r"[ \t]*\{%-?\s*(?:end)?generation\s*-?%\}\n?").unwrap()
-    });
+    let re = RE
+        .get_or_init(|| regex::Regex::new(r"[ \t]*\{%-?\s*(?:end)?generation\s*-?%\}\n?").unwrap());
     re.replace_all(template, "").into_owned()
 }
 
@@ -498,13 +497,16 @@ impl<'a> JinjaChatFrame<'a> {
         // instead of `<minimax:tool_call>`). Override `tojson` with a serde_json
         // serializer that accepts + ignores those kwargs; serde_json emits raw
         // UTF-8 (== ensure_ascii=False), which is what chat templates want.
-        env.add_filter("tojson", |value: Value, kwargs: minijinja::value::Kwargs| -> Result<Value, Error> {
-            let _ = kwargs.get::<Option<bool>>("ensure_ascii");
-            let _ = kwargs.get::<Option<i64>>("indent");
-            let s = serde_json::to_string(&value)
-                .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("tojson: {e}")))?;
-            Ok(Value::from_safe_string(s))
-        });
+        env.add_filter(
+            "tojson",
+            |value: Value, kwargs: minijinja::value::Kwargs| -> Result<Value, Error> {
+                let _ = kwargs.get::<Option<bool>>("ensure_ascii");
+                let _ = kwargs.get::<Option<i64>>("indent");
+                let s = serde_json::to_string(&value)
+                    .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("tojson: {e}")))?;
+                Ok(Value::from_safe_string(s))
+            },
+        );
 
         // Strip HF `{% generation %}` / `{% endgeneration %}` training-mask
         // tags (and their whitespace-control `{%- … -%}` variants). minijinja
@@ -740,7 +742,10 @@ mod tests {
         let got = strip_generation_tags(tpl);
         assert!(!got.contains("generation"), "tags not stripped: {got:?}");
         assert!(got.contains("BODY"), "inner body dropped: {got:?}");
-        assert!(got.contains('X') && got.contains('c'), "non-dashed body dropped: {got:?}");
+        assert!(
+            got.contains('X') && got.contains('c'),
+            "non-dashed body dropped: {got:?}"
+        );
         // A template with no generation tags is returned unchanged.
         let plain = "{{ bos_token }}{%- for m in messages -%}{{ m.role }}{%- endfor -%}";
         assert_eq!(strip_generation_tags(plain), plain);
@@ -767,12 +772,26 @@ mod tests {
             bos_token: Some("<|im_start|>"),
         };
         let msgs = vec![
-            Message { role: Role::User, content: "hi".into(), tool_calls: vec![], tool_call_id: None },
-            Message { role: Role::Assistant, content: "yo".into(), tool_calls: vec![], tool_call_id: None },
+            Message {
+                role: Role::User,
+                content: "hi".into(),
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Assistant,
+                content: "yo".into(),
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
         ];
-        let rendered = frame.render_messages(&msgs, None, None)
+        let rendered = frame
+            .render_messages(&msgs, None, None)
             .expect("template with generation tags must render after strip");
-        assert_eq!(rendered, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nyo<|im_end|>\n");
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nyo<|im_end|>\n"
+        );
     }
 
     #[test]
@@ -791,11 +810,21 @@ mod tests {
             enable_thinking: false,
             bos_token: Some(""),
         };
-        let msgs = vec![Message { role: Role::User, content: "hi".into(), tool_calls: vec![], tool_call_id: None }];
-        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "get_weather"}})];
-        let rendered = frame.render_messages(&msgs, Some(&tools), None)
+        let msgs = vec![Message {
+            role: Role::User,
+            content: "hi".into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        }];
+        let tools =
+            vec![serde_json::json!({"type": "function", "function": {"name": "get_weather"}})];
+        let rendered = frame
+            .render_messages(&msgs, Some(&tools), None)
             .expect("tojson(ensure_ascii=False) must render, not fall back");
-        assert!(rendered.contains("\"get_weather\""), "tool json missing: {rendered}");
+        assert!(
+            rendered.contains("\"get_weather\""),
+            "tool json missing: {rendered}"
+        );
     }
 
     #[test]
@@ -810,14 +839,29 @@ mod tests {
             {{- m.content -}}\
             {%- endfor -%}";
         let frame = JinjaChatFrame {
-            tokenizer: &t, template, system: None, user: "hi",
-            enable_thinking: false, bos_token: Some(""),
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "hi",
+            enable_thinking: false,
+            bos_token: Some(""),
         };
         let msgs = vec![
-            Message { role: Role::System, content: "S".into(), tool_calls: vec![], tool_call_id: None },
-            Message { role: Role::User, content: "U".into(), tool_calls: vec![], tool_call_id: None },
+            Message {
+                role: Role::System,
+                content: "S".into(),
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::User,
+                content: "U".into(),
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
         ];
-        let rendered = frame.render_messages(&msgs, None, None)
+        let rendered = frame
+            .render_messages(&msgs, None, None)
             .expect("probing a missing optional message field must not raise");
         assert_eq!(rendered, "SU");
     }

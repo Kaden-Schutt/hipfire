@@ -77,7 +77,12 @@ mod env_cache {
     /// debugging or pre-fix-compat builds.
     pub(super) fn mtp_head_hc_on() -> bool {
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| std::env::var("HIPFIRE_DEEPSEEK4_MTP_HEAD_HC").ok().as_deref() != Some("0"))
+        *V.get_or_init(|| {
+            std::env::var("HIPFIRE_DEEPSEEK4_MTP_HEAD_HC")
+                .ok()
+                .as_deref()
+                != Some("0")
+        })
     }
 }
 
@@ -267,8 +272,7 @@ fn gemv_auto_batched_wmma(
                     // are unmeasured and stay on the single-warp path.
                     // Kernel hard requires M%64==0, K%32==0, B%64==0.
                     // Opt out via HIPFIRE_DEEPSEEK4_Q8_4W=0 for diagnosis.
-                    let opt_out = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W")
-                        .as_deref() == Ok("0");
+                    let opt_out = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
                     let use_4w = !opt_out
                         && batch_size >= 256
                         && m >= 4096
@@ -1480,14 +1484,13 @@ pub fn decode_step_with_graph(
     // `HIPFIRE_DEEPSEEK4_GRAPH=0`. Force on for older archs with
     // `HIPFIRE_DEEPSEEK4_GRAPH=1` (untested — beware kernarg-bake regressions).
     static GRAPH_OPT_ENV: OnceLock<Option<bool>> = OnceLock::new();
-    let env_override =
-        *GRAPH_OPT_ENV.get_or_init(
-            || match std::env::var("HIPFIRE_DEEPSEEK4_GRAPH").ok().as_deref() {
-                Some("1") => Some(true),
-                Some("0") => Some(false),
-                _ => None,
-            },
-        );
+    let env_override = *GRAPH_OPT_ENV.get_or_init(|| {
+        match std::env::var("HIPFIRE_DEEPSEEK4_GRAPH").ok().as_deref() {
+            Some("1") => Some(true),
+            Some("0") => Some(false),
+            _ => None,
+        }
+    });
     let graph_on = env_override.unwrap_or_else(|| {
         let a = gpu.arch.as_str();
         a.starts_with("gfx11") || a.starts_with("gfx12")
@@ -2194,7 +2197,11 @@ pub fn mtp_forward(
     // purpose there is to write the MTP layer's SWA ring, the logits
     // are never read. Skipping saves the lm_head GEMV + the d2h+sync
     // (line 1991-92 below) that otherwise stalls the stream per call.
-    if std::env::var("HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD").ok().as_deref() == Some("1") {
+    if std::env::var("HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         return Ok(Vec::new());
     }
     if state.final_norm.is_none() {
@@ -2653,7 +2660,9 @@ fn ffn_stub(
     //      used for shared and routed in upstream model.py.
     if down_needs_fwht {
         gpu.deepseek4_fused_silu_mul_clamp_mq_rotate(gate, up, silu_rot, im, cfg.swiglu_limit)
-            .map_err(|e| format!("deepseek4_fused_silu_mul_clamp_mq_rotate layer {layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("deepseek4_fused_silu_mul_clamp_mq_rotate layer {layer_idx}: {e:?}")
+            })?;
     } else {
         gpu.deepseek4_silu_mul_clamp_f32(gate, up, gate, cfg.swiglu_limit)
             .map_err(|e| format!("deepseek4_silu_mul_clamp layer {layer_idx}: {e:?}"))?;
@@ -5356,7 +5365,8 @@ fn attention_block_batched_swa_only(
     // Re-runs the kernel via the debug variant which also writes
     // max_score and sum_exp per (h, b) so we can compare across runs
     // and find which intermediate first diverges.
-    if layer_idx == 0 && std::env::var("HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT").as_deref() == Ok("1") {
+    if layer_idx == 0 && std::env::var("HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT").as_deref() == Ok("1")
+    {
         // Lazy-alloc debug scratch on the GPU on first call.
         let n_h = n_heads;
         let debug_max = gpu
@@ -5453,7 +5463,9 @@ fn attention_block_batched_swa_only(
             // is [B, n_heads * head_dim] viewable as [B, G, per_group_in].
             // Multi-row variant if HIPFIRE_DEEPSEEK4_WO_MULTIROW=2 or 4.
             let mr: i32 = std::env::var("HIPFIRE_DEEPSEEK4_WO_MULTIROW")
-                .ok().and_then(|v| v.parse().ok()).filter(|&r| r == 2 || r == 4)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&r| r == 2 || r == 4)
                 .unwrap_or(0);
             if mr == 0 {
                 gpu.wo_per_group_batched_q8_0(
@@ -5736,8 +5748,12 @@ fn attention_block_batched_mixed(
             let n_inputs = (batch_size * hidden) as i64;
             gpu.deepseek4_convert_f32_to_f16(&pbs.tmp_batch, &pbs.tmp_batch_f16, n_inputs)
                 .map_err(|e| format!("convert_f32_to_f16 tmp l{layer_idx}: {e:?}"))?;
-            gpu.deepseek4_convert_f32_to_f16(&pbs.tmp_plain_batch, &pbs.tmp_plain_batch_f16, n_inputs)
-                .map_err(|e| format!("convert_f32_to_f16 tmp_plain l{layer_idx}: {e:?}"))?;
+            gpu.deepseek4_convert_f32_to_f16(
+                &pbs.tmp_plain_batch,
+                &pbs.tmp_plain_batch_f16,
+                n_inputs,
+            )
+            .map_err(|e| format!("convert_f32_to_f16 tmp_plain l{layer_idx}: {e:?}"))?;
             // DeepSeek V4 compressor uses FWHT-rotated input (tmp_batch) when the
             // weight is MQ4-style, and plain input (tmp_plain_batch) when
             // F16/F32. We're on the F16 path → tmp_plain_batch_f16.
@@ -6159,7 +6175,9 @@ fn attention_block_batched_mixed(
                 topk_max as i32,
                 batch_size as i32,
             )
-            .map_err(|e| format!("deepseek4_topk_kv_gather_identity_batched l{layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("deepseek4_topk_kv_gather_identity_batched l{layer_idx}: {e:?}")
+            })?;
             for b in 0..batch_size {
                 let n_b = (((start_pos as usize) + b + 1) / ratio)
                     .min(max_compressed)
@@ -6275,7 +6293,9 @@ fn attention_block_batched_mixed(
             // Q8_0 contract: plain (non-FWHT) input. Same layout
             // assumption as the swa-only sibling.
             let mr: i32 = std::env::var("HIPFIRE_DEEPSEEK4_WO_MULTIROW")
-                .ok().and_then(|v| v.parse().ok()).filter(|&r| r == 2 || r == 4)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&r| r == 2 || r == 4)
                 .unwrap_or(0);
             if mr == 0 {
                 gpu.wo_per_group_batched_q8_0(
@@ -6655,8 +6675,8 @@ fn ffn_batched(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(128);
-    let use_grouped =
-        batch_size >= gate_threshold && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
+    let use_grouped = batch_size >= gate_threshold
+        && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
 
     if use_grouped {
         const BLOCK_M: usize = 16;
@@ -6691,23 +6711,21 @@ fn ffn_batched(
         // gate is #356's; #355 shipped gfx1151-only. Confirm on gfx11 dGPU.]
         // Opt out via HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=0. Shape gate: gate_up
         // M=2*im must be a multiple of 64, K=hidden a multiple of 256.
-        let use_lloyd_4w = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
-            .as_deref()
-        {
+        let use_lloyd_4w = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
             Ok("0") => false,
             Ok("1") => true,
-            _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
+            _ => gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"),
         } && (2 * im) % 64 == 0
-          && hidden % 256 == 0;
+            && hidden % 256 == 0;
         // MMQ-style index-pack preload (#356). Reverted to OPT-IN: the preload
         // hoisted only 8 of 16 weight packs, decoding half the MQ2 weights wrong
         // → long-context attractor on DS4 mq2lloyd (root-caused by @nwoolmer on
         // gfx1151; the corrected kernel measured flat, so no reason to default it).
-        let use_mmqload = use_lloyd_4w && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
-            .as_deref() == Ok("1");
+        let use_mmqload =
+            use_lloyd_4w && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
         // Barrier-free nosync variant (#356, opt in via =1).
-        let use_nosync = use_mmqload && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
-            .as_deref() == Ok("1");
+        let use_nosync =
+            use_mmqload && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
         // Research levers from #355 (all opt-in, default OFF). When set they
         // take precedence over the mmqload/nosync default path.
         // Lever 1 (HIPFIRE_DEEPSEEK4_MOE_N32=1): N_TILE=32 tile-pairing on the
@@ -6733,7 +6751,9 @@ fn ffn_batched(
                 m_total_max,
                 batch_size,
             )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_n32 gate_up l{layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_n32 gate_up l{layer_idx}: {e:?}")
+            })?;
         } else if use_lloyd_4w && cnd_env {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd(
                 gate_up_ptrs,
@@ -6747,7 +6767,9 @@ fn ffn_batched(
                 m_total_max,
                 batch_size,
             )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_cnd gate_up l{layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_cnd gate_up l{layer_idx}: {e:?}")
+            })?;
         } else if use_lloyd_4w && eightw_env {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
                 gate_up_ptrs,
@@ -6761,7 +6783,9 @@ fn ffn_batched(
                 m_total_max,
                 batch_size,
             )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_8w_k2 gate_up l{layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("gemm_mq2g256_lloyd_moe_grouped_8w_k2 gate_up l{layer_idx}: {e:?}")
+            })?;
         } else if use_nosync {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
                 gate_up_ptrs,
@@ -6775,7 +6799,9 @@ fn ffn_batched(
                 m_total_max,
                 batch_size,
             )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_nosync gate_up l{layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("gemm_mq2g256_lloyd_moe_grouped_nosync gate_up l{layer_idx}: {e:?}")
+            })?;
         } else if use_mmqload {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
                 gate_up_ptrs,
@@ -6789,7 +6815,9 @@ fn ffn_batched(
                 m_total_max,
                 batch_size,
             )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_mmqload gate_up l{layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("gemm_mq2g256_lloyd_moe_grouped_mmqload gate_up l{layer_idx}: {e:?}")
+            })?;
         } else if use_lloyd_4w {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                 gate_up_ptrs,
@@ -6803,7 +6831,9 @@ fn ffn_batched(
                 m_total_max,
                 batch_size,
             )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w gate_up l{layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("gemm_mq2g256_lloyd_moe_grouped_4w gate_up l{layer_idx}: {e:?}")
+            })?;
         } else {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
                 gate_up_ptrs,
@@ -6827,11 +6857,9 @@ fn ffn_batched(
         // launch-overhead savings cancelled by per-thread overhead, per
         // feedback_kernel_fusion. Default OFF; opt in via
         // HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU=1.
-        let use_fused_unscatter_silu = std::env::var(
-            "HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU",
-        )
-        .map(|s| s != "0")
-        .unwrap_or(false);
+        let use_fused_unscatter_silu = std::env::var("HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU")
+            .map(|s| s != "0")
+            .unwrap_or(false);
         if use_fused_unscatter_silu {
             gpu.moe_unscatter_silu_clamp_k8(
                 &pbs.moe_y_gate_up_grouped,
@@ -6882,19 +6910,17 @@ fn ffn_batched(
         // moe_rot_batch is [B × k_top, im] flat — sorted_slot_index[s]
         // already yields the row index directly (b*k_top + krank).
         // RECONCILED (#355 + #356): same 4w default + levers as gate_up above.
-        let use_lloyd_4w_down = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
-            .as_deref()
-        {
+        let use_lloyd_4w_down = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").as_deref() {
             Ok("0") => false,
             Ok("1") => true,
-            _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
+            _ => gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"),
         } && hidden % 64 == 0
-          && im % 256 == 0;
+            && im % 256 == 0;
         // Opt-in (see use_mmqload above — same #356 long-context attractor).
-        let use_mmqload_down = use_lloyd_4w_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
-            .as_deref() == Ok("1");
-        let use_nosync_down = use_mmqload_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
-            .as_deref() == Ok("1");
+        let use_mmqload_down = use_lloyd_4w_down
+            && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD").as_deref() == Ok("1");
+        let use_nosync_down =
+            use_mmqload_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC").as_deref() == Ok("1");
         // n32_env / cnd_env / eightw_env reused from the gate_up block above.
         if use_lloyd_4w_down && n32_env {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
@@ -6909,7 +6935,9 @@ fn ffn_batched(
                 m_total_max,
                 batch_size * k_top,
             )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_n32 down l{layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_n32 down l{layer_idx}: {e:?}")
+            })?;
         } else if use_lloyd_4w_down && cnd_env {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd(
                 w2_ptrs,
@@ -6923,7 +6951,9 @@ fn ffn_batched(
                 m_total_max,
                 batch_size * k_top,
             )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_cnd down l{layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("gemm_mq2g256_lloyd_moe_grouped_4w_k2_cnd down l{layer_idx}: {e:?}")
+            })?;
         } else if use_lloyd_4w_down && eightw_env {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
                 w2_ptrs,
@@ -6937,7 +6967,9 @@ fn ffn_batched(
                 m_total_max,
                 batch_size * k_top,
             )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_8w_k2 down l{layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("gemm_mq2g256_lloyd_moe_grouped_8w_k2 down l{layer_idx}: {e:?}")
+            })?;
         } else if use_nosync_down {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
                 w2_ptrs,
@@ -6951,7 +6983,9 @@ fn ffn_batched(
                 m_total_max,
                 batch_size * k_top,
             )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_nosync down l{layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("gemm_mq2g256_lloyd_moe_grouped_nosync down l{layer_idx}: {e:?}")
+            })?;
         } else if use_mmqload_down {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
                 w2_ptrs,
@@ -6965,7 +6999,9 @@ fn ffn_batched(
                 m_total_max,
                 batch_size * k_top,
             )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_mmqload down l{layer_idx}: {e:?}"))?;
+            .map_err(|e| {
+                format!("gemm_mq2g256_lloyd_moe_grouped_mmqload down l{layer_idx}: {e:?}")
+            })?;
         } else if use_lloyd_4w_down {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                 w2_ptrs,
@@ -8091,11 +8127,7 @@ pub fn prefill_with_mtp_fill(
 /// Production routing goes through the GPU kernel
 /// `deepseek4_moe_topk_bias_aware_f32`; this is kept as a tested reference.
 #[cfg(test)]
-fn bias_aware_topk_weights(
-    scores: &[f32],
-    bias: &[f32],
-    k: usize,
-) -> Option<(Vec<u32>, Vec<f32>)> {
+fn bias_aware_topk_weights(scores: &[f32], bias: &[f32], k: usize) -> Option<(Vec<u32>, Vec<f32>)> {
     let n = scores.len();
     if k == 0 || n == 0 {
         return None;

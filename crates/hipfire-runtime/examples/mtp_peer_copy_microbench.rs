@@ -58,13 +58,13 @@ fn main() {
 
     // Buffers.
     hip.set_device(0).unwrap();
-    let trunk_hidden = hip.malloc(HIDDEN_BYTES).unwrap();          // 906 src
-    let trunk_tokens_in = hip.malloc(TOKEN_BYTES).unwrap();        // 906 dst
+    let trunk_hidden = hip.malloc(HIDDEN_BYTES).unwrap(); // 906 src
+    let trunk_tokens_in = hip.malloc(TOKEN_BYTES).unwrap(); // 906 dst
     let trunk_stream = hip.stream_create().unwrap();
 
     hip.set_device(1).unwrap();
-    let drafter_hidden_in = hip.malloc(HIDDEN_BYTES).unwrap();     // 1031 dst
-    let drafter_tokens_out = hip.malloc(TOKEN_BYTES).unwrap();     // 1031 src
+    let drafter_hidden_in = hip.malloc(HIDDEN_BYTES).unwrap(); // 1031 dst
+    let drafter_tokens_out = hip.malloc(TOKEN_BYTES).unwrap(); // 1031 src
     let drafter_scatter_stream = hip.stream_create().unwrap();
     let drafter_main_stream = hip.stream_create().unwrap();
 
@@ -87,10 +87,16 @@ fn main() {
     // ── Warmup ──
     for _ in 0..WARMUP_ITERS {
         run_one_cycle(
-            &hip, &trunk_stream, &drafter_scatter_stream, &drafter_main_stream,
-            &verify_done_evt, &mtp_done_evt,
-            &trunk_hidden, &drafter_hidden_in,
-            &drafter_tokens_out, &trunk_tokens_in,
+            &hip,
+            &trunk_stream,
+            &drafter_scatter_stream,
+            &drafter_main_stream,
+            &verify_done_evt,
+            &mtp_done_evt,
+            &trunk_hidden,
+            &drafter_hidden_in,
+            &drafter_tokens_out,
+            &trunk_tokens_in,
         );
     }
 
@@ -99,10 +105,16 @@ fn main() {
     for _ in 0..MEASURE_ITERS {
         let t = Instant::now();
         run_one_cycle(
-            &hip, &trunk_stream, &drafter_scatter_stream, &drafter_main_stream,
-            &verify_done_evt, &mtp_done_evt,
-            &trunk_hidden, &drafter_hidden_in,
-            &drafter_tokens_out, &trunk_tokens_in,
+            &hip,
+            &trunk_stream,
+            &drafter_scatter_stream,
+            &drafter_main_stream,
+            &verify_done_evt,
+            &mtp_done_evt,
+            &trunk_hidden,
+            &drafter_hidden_in,
+            &drafter_tokens_out,
+            &trunk_tokens_in,
         );
         full_us.push(t.elapsed().as_micros());
     }
@@ -112,11 +124,20 @@ fn main() {
     for _ in 0..MEASURE_ITERS {
         let t = Instant::now();
         hip.set_device(0).unwrap();
-        hip.event_record(&verify_done_evt, Some(&trunk_stream)).unwrap();
+        hip.event_record(&verify_done_evt, Some(&trunk_stream))
+            .unwrap();
         hip.set_device(1).unwrap();
-        hip.stream_wait_event(&drafter_scatter_stream, &verify_done_evt).unwrap();
-        hip.memcpy_peer_async(&drafter_hidden_in, 1, &trunk_hidden, 0,
-                              HIDDEN_BYTES, &drafter_scatter_stream).unwrap();
+        hip.stream_wait_event(&drafter_scatter_stream, &verify_done_evt)
+            .unwrap();
+        hip.memcpy_peer_async(
+            &drafter_hidden_in,
+            1,
+            &trunk_hidden,
+            0,
+            HIDDEN_BYTES,
+            &drafter_scatter_stream,
+        )
+        .unwrap();
         hip.stream_synchronize(&drafter_scatter_stream).unwrap();
         fwd_us.push(t.elapsed().as_micros());
     }
@@ -126,8 +147,15 @@ fn main() {
     for _ in 0..MEASURE_ITERS {
         let t = Instant::now();
         hip.set_device(1).unwrap();
-        hip.memcpy_peer_async(&drafter_hidden_in, 1, &trunk_hidden, 0,
-                              HIDDEN_BYTES, &drafter_scatter_stream).unwrap();
+        hip.memcpy_peer_async(
+            &drafter_hidden_in,
+            1,
+            &trunk_hidden,
+            0,
+            HIDDEN_BYTES,
+            &drafter_scatter_stream,
+        )
+        .unwrap();
         hip.stream_synchronize(&drafter_scatter_stream).unwrap();
         raw_us.push(t.elapsed().as_micros());
     }
@@ -156,7 +184,10 @@ fn main() {
     println!("  raw peer 20KB:        {} µs", median_raw);
     println!("  fwd leg (+ event):    {} µs", median_fwd);
     println!("  full cycle:           {} µs", median_full);
-    println!("  back-leg+sync extra:  {} µs", median_full.saturating_sub(median_fwd));
+    println!(
+        "  back-leg+sync extra:  {} µs",
+        median_full.saturating_sub(median_fwd)
+    );
 
     // Cleanup.
     hip.set_device(0).unwrap();
@@ -185,13 +216,22 @@ fn run_one_cycle(
 ) {
     // 1. Trunk records verify-done on its stream (notional verify just finished).
     hip.set_device(0).unwrap();
-    hip.event_record(verify_done_evt, Some(trunk_stream)).unwrap();
+    hip.event_record(verify_done_evt, Some(trunk_stream))
+        .unwrap();
 
     // 2-3. Drafter scatter stream waits, then pulls hidden 906→1031.
     hip.set_device(1).unwrap();
-    hip.stream_wait_event(drafter_scatter_stream, verify_done_evt).unwrap();
-    hip.memcpy_peer_async(drafter_hidden_in, 1, trunk_hidden, 0,
-                          HIDDEN_BYTES, drafter_scatter_stream).unwrap();
+    hip.stream_wait_event(drafter_scatter_stream, verify_done_evt)
+        .unwrap();
+    hip.memcpy_peer_async(
+        drafter_hidden_in,
+        1,
+        trunk_hidden,
+        0,
+        HIDDEN_BYTES,
+        drafter_scatter_stream,
+    )
+    .unwrap();
 
     // 4. Sync the scatter stream — MTP head would be free to start here.
     //    In a real impl, the main stream would wait_event on scatter_done,
@@ -199,13 +239,21 @@ fn run_one_cycle(
     hip.stream_synchronize(drafter_scatter_stream).unwrap();
 
     // 5. Drafter records mtp-done on main stream (notional MTP just finished).
-    hip.event_record(mtp_done_evt, Some(drafter_main_stream)).unwrap();
+    hip.event_record(mtp_done_evt, Some(drafter_main_stream))
+        .unwrap();
 
     // 6-7. Trunk waits, pulls candidate tokens 1031→906.
     hip.set_device(0).unwrap();
     hip.stream_wait_event(trunk_stream, mtp_done_evt).unwrap();
-    hip.memcpy_peer_async(trunk_tokens_in, 0, drafter_tokens_out, 1,
-                          TOKEN_BYTES, trunk_stream).unwrap();
+    hip.memcpy_peer_async(
+        trunk_tokens_in,
+        0,
+        drafter_tokens_out,
+        1,
+        TOKEN_BYTES,
+        trunk_stream,
+    )
+    .unwrap();
 
     // 8. Trunk sync — verify can resume now.
     hip.stream_synchronize(trunk_stream).unwrap();

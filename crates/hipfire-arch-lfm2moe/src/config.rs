@@ -9,7 +9,7 @@
 //!   layer_types interleave 18 "conv" + 6 "full_attention",
 //!   num_dense_layers 2 (dense SwiGLU MLP), the rest top-4 MoE (32 experts,
 //!   moe_intermediate 1792, sigmoid+expert_bias routing, norm_topk_prob),
-//!   conv_L_cache 3 (depthwise causal short-conv), rope_theta 5e6, eps 1e-5,
+//!   conv_l_cache 3 (depthwise causal short-conv), rope_theta 5e6, eps 1e-5,
 //!   standard RMSNorm (weight * x̂, no +1), tie_word_embeddings.
 
 use hipfire_runtime::hfq::HfqFile;
@@ -18,7 +18,7 @@ use serde::Deserialize;
 /// Per-layer mixer kind, decoded from `layer_types`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MixerKind {
-    /// Double-gated LIV short-convolution (depthwise causal, kernel = conv_L_cache).
+    /// Double-gated LIV short-convolution (depthwise causal, kernel = conv_l_cache).
     Conv,
     /// GQA attention with per-head QK-norm + full-dim rotate_half RoPE.
     Attention,
@@ -33,7 +33,7 @@ pub struct Lfm2MoeConfig {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
-    /// Short-conv kernel size (HF `conv_L_cache`); decode conv-state holds K-1.
+    /// Short-conv kernel size (HF `conv_l_cache`); decode conv-state holds K-1.
     pub conv_kernel_size: usize,
     /// Dense-MLP FFN intermediate size (HF `intermediate_size`).
     pub intermediate_size: usize,
@@ -74,7 +74,7 @@ struct RawLfm2MoeConfig {
     #[serde(default)]
     head_dim: Option<usize>,
     #[serde(default = "default_conv_l")]
-    conv_L_cache: usize,
+    conv_l_cache: usize,
     intermediate_size: usize,
     moe_intermediate_size: usize,
     num_experts: usize,
@@ -167,7 +167,7 @@ impl Lfm2MoeConfig {
             num_attention_heads: raw.num_attention_heads,
             num_key_value_heads: raw.num_key_value_heads,
             head_dim,
-            conv_kernel_size: raw.conv_L_cache,
+            conv_kernel_size: raw.conv_l_cache,
             intermediate_size: raw.intermediate_size,
             moe_intermediate_size: raw.moe_intermediate_size,
             num_experts: raw.num_experts,

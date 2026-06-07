@@ -8,19 +8,196 @@
 //   hipfire sidecar-gen <model>       → generate TriAttention calibration sidecar
 
 import { spawn } from "bun";
-import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
+import {
+  existsSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
+import { createHash, randomUUID } from "crypto";
 import { runEvalCommand } from "./eval";
+import { PriorityPrefillScheduler } from "./worker_scheduler";
+import {
+  parseServerPrefillBatchPolicy,
+  serverPrefillBatchEligibility,
+  createServerPrefillSession,
+} from "./server_prefill_batch";
+import {
+  parseSchedulerPriority,
+  parseServerPrefillPolicyControls,
+  schedulerPolicyForPriority,
+} from "./scheduler_policy";
+import {
+  createPrefixCheckpointManifest,
+  prefixCheckpointCompatible,
+  prefixCheckpointCacheKey,
+  touchPrefixCheckpointManifest,
+  spillEligibility,
+  type PrefixCheckpointManifest,
+  type PrefixCheckpointFingerprint,
+} from "./state_cache";
+import {
+  modelWorkerKeyId,
+  type RequestSessionDraft,
+  type SessionStateKind,
+  type ModelWorkerKey,
+} from "./session_state";
+import { pickServingModelWorker } from "./model_worker_routing";
+import {
+  buildGenerateBatchPrefillProbeMessage,
+  interpretGenerateBatchPrefillProbeResponse,
+  prefillBatchRuntimeDispatchStatus,
+  type GenerateBatchPrefillCapability,
+} from "./generate_batch_prefill_protocol";
+import {
+  buildPrefillBatchHealthPayload,
+  buildBatchHealthPayload,
+  type PrefillBatchHealthInputs,
+  type BatchExecutionMode,
+  type BatchFallbackReason,
+} from "./prefill_batch_health";
+import {
+  isSupportedBatchEndpoint,
+  validateBatchInputForBatch,
+  buildBatchInputErrorArtifact,
+  buildBatchOutputArtifact,
+  type BatchRecord as StoredBatchRecord,
+  type BatchFileRecord,
+  type BatchInputRecord,
+  countUnsupportedModeErrors,
+} from "./batch_api";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
+const API_DATA_DIR = join(HIPFIRE_DIR, "api");
+const BATCH_FILE_DIR = join(API_DATA_DIR, "batch_files");
 const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
 const TEMP_CORRECTION = 0.82;
 
 mkdirSync(MODELS_DIR, { recursive: true });
+mkdirSync(API_DATA_DIR, { recursive: true });
+mkdirSync(BATCH_FILE_DIR, { recursive: true });
+
+function newObjectId(prefix: string): string {
+  return `${prefix}_${randomUUID().replace(/-/g, "")}`;
+}
+
+function nowUnixSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function normalizeLineIdHint(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 48);
+}
+
+function toBatchLineFallbackReason(code: string): BatchFallbackReason {
+  if (code === "streaming_unsupported") return "line_fallback:streaming_unsupported";
+  if (code === "tools_unsupported") return "line_fallback:tools";
+  if (code === "unsupported_content") return "line_fallback:unsupported_content";
+  if (code === "endpoint_mismatch") return "line_fallback:endpoint_mismatch";
+  if (code === "model_mismatch") return "line_fallback:model_mismatch";
+  if (code === "model_missing") return "line_fallback:model_missing";
+  if (code === "invalid_url") return "line_fallback:invalid_url";
+  if (code === "invalid_body") return "line_rejected:invalid_body";
+  if (code === "duplicate_custom_id") return "line_fallback:duplicate_custom_id";
+  if (code === "invalid_custom_id") return "line_rejected:invalid_custom_id";
+  if (code === "invalid_messages") return "line_fallback:invalid_messages";
+  if (code === "invalid_responses_input") return "line_fallback:invalid_responses_input";
+  if (code === "validation_rejected") return "validation_failed";
+  if (code === "batch_validation_rejected") return "batch_validation_rejected";
+  return "line_rejected:unsupported_mode";
+}
+
+type BatchJobRecord = StoredBatchRecord & {
+  metadata?: Record<string, unknown> | null;
+  completion_window?: string;
+};
+
+function batchArtifactPath(fileId: string): string {
+  return join(BATCH_FILE_DIR, fileId);
+}
+
+function readBatchFile(fileId: string): string {
+  const path = batchArtifactPath(fileId);
+  return readFileSync(path, "utf8");
+}
+
+function writeBatchArtifact(fileId: string, content: string): void {
+  writeFileSync(batchArtifactPath(fileId), content, "utf8");
+}
+
+function parseResponsesToChatBody(rawBody: any): any {
+  if (rawBody === null || typeof rawBody !== "object") return rawBody;
+  const messages: any[] = [];
+  const input = rawBody.input;
+  if (Array.isArray(input)) {
+    for (const entry of input) {
+      if (entry && typeof entry === "object" && typeof entry.role === "string") {
+        messages.push({
+          role: entry.role,
+          content: entry.content ?? "",
+        });
+      }
+    }
+  } else if (typeof input === "string") {
+    messages.push({ role: "user", content: input });
+  } else if (input && typeof input === "object" && Array.isArray(input.messages)) {
+    for (const m of input.messages) {
+      if (m && typeof m === "object" && typeof m.role === "string") {
+        messages.push({
+          role: m.role,
+          content: m.content ?? "",
+          tools: m.tools,
+          tool_calls: m.tool_calls,
+        });
+      }
+    }
+  } else {
+    messages.push({ role: "user", content: rawBody.prompt ?? "" });
+  }
+
+  return {
+    model: rawBody.model,
+    temperature: rawBody.temperature ?? 0.0,
+    top_p: rawBody.top_p ?? 1.0,
+    max_tokens: rawBody.max_output_tokens ?? rawBody.max_tokens ?? 16,
+    stream: rawBody.stream ?? false,
+    messages,
+    tools: rawBody.tools ?? [],
+    tool_choice: rawBody.tool_choice ?? null,
+    previous_response_id: rawBody.previous_response_id ?? null,
+    metadata: rawBody.metadata,
+  };
+}
+
+function toResponsesObject(reqId: string, chatResponse: any): any {
+  const firstChoice = chatResponse?.choices?.[0];
+  const content = firstChoice?.message?.content ?? "";
+  const reasoning = firstChoice?.message?.reasoning_content;
+  return {
+    id: `resp_${reqId.replace("chatcmpl_", "")}`,
+    object: "response",
+    created: nowUnixSeconds(),
+    model: chatResponse?.model ?? "",
+    output: [{
+      id: `out_${reqId}`,
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: content, annotations: [] }],
+      reasoning_content: reasoning ?? null,
+    }],
+    usage: chatResponse?.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    status: "completed",
+  };
+}
 
 // ─── Persistent config ─────────────────────────────────
 export interface HipfireConfig {
@@ -1453,6 +1630,67 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   await e.stop();
 }
 
+function stableHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function inferModelArtifactDigest(path: string | null): string {
+  if (!path) return "unknown";
+  try {
+    const size = statSync(path).size;
+    return stableHash(`${resolve(path)}|${size}`);
+  } catch {
+    return stableHash(resolve(path));
+  }
+}
+
+function stableObjectHash(value: Record<string, any>): string {
+  const keys = Object.keys(value).sort();
+  const normalized: Record<string, any> = {};
+  for (const key of keys) {
+    normalized[key] = value[key];
+  }
+  return stableHash(JSON.stringify(normalized));
+}
+
+function approximatePromptTokenIds(prompt: string): readonly number[] {
+  const tokens = prompt.trim().split(/\s+/);
+  const out: number[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const combined = `${tokens[i]}\u0000${i}`;
+    let h = 0;
+    for (let j = 0; j < combined.length; j++) {
+      h = ((h << 5) - h + combined.charCodeAt(j)) | 0;
+    }
+    out.push(Math.abs(h % 500_000));
+  }
+  return out;
+}
+
+function inferQuantFamilyForPath(modelPath: string): string {
+  const lower = modelPath.toLowerCase();
+  const token = artifactQuantToken(lower);
+  if (token) return token;
+  if (lower.includes(".hf4") || lower.includes("-hfq4")) return "hf4";
+  if (lower.includes(".hf6") || lower.includes("-hfq6")) return "hf6";
+  if (lower.includes("mq3")) return "mq3";
+  if (lower.includes("mq6")) return "mq6";
+  if (lower.includes("q8")) return "q8";
+  return "unknown";
+}
+
+function inferStateKindsForServeArch(arch: string | null): readonly SessionStateKind[] {
+  const normalized = (arch ?? "").toLowerCase();
+  const kinds: SessionStateKind[] = ["attention_kv"];
+  if (normalized.includes("qwen") || normalized.includes("deltanet") || normalized.includes("qwen2")) {
+    kinds.push("deltanet_recurrent");
+  }
+  if (normalized.includes("mamba") || normalized.includes("nemotron")) {
+    kinds.push("mamba_ssm", "mamba_conv");
+  }
+  return kinds;
+}
+
 async function serve(port: number, host: string) {
   applyConfigEnv(cfg);
   // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
@@ -1476,6 +1714,33 @@ async function serve(port: number, host: string) {
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
+  const serverPrefillBatch = parseServerPrefillBatchPolicy();
+  const serverPrefillBatchControls = parseServerPrefillPolicyControls();
+  let generateBatchPrefillCapability: GenerateBatchPrefillCapability = "unknown";
+  let generateBatchPrefillCapabilityReason = "not_probed";
+  if (serverPrefillBatch.enabled) {
+    console.error(
+      `[hipfire] server prefill batching enabled: max=${serverPrefillBatch.maxBatch} wait=${serverPrefillBatch.waitMs}ms`,
+    );
+    try {
+      await e.send(buildGenerateBatchPrefillProbeMessage());
+      const probeResponse = await e.recv();
+      const probe = interpretGenerateBatchPrefillProbeResponse(probeResponse);
+      generateBatchPrefillCapability = probe.capability;
+      generateBatchPrefillCapabilityReason = probe.reason;
+    } catch (err: any) {
+      generateBatchPrefillCapability = "unknown";
+      generateBatchPrefillCapabilityReason = err?.message ?? "probe_failed";
+    }
+    console.error(
+      `[hipfire] generate_batch_prefill capability=${generateBatchPrefillCapability} reason=${generateBatchPrefillCapabilityReason}`,
+    );
+    if (generateBatchPrefillCapability !== "supported") {
+      console.error(
+        "[hipfire] server prefill batching runtime dispatch is SKIPPED until daemon adds generate_batch_prefill execution with session state handles",
+      );
+    }
+  }
   let current: string | null = null;
   // Track the `max_seq` the currently-loaded model was loaded with, so we can
   // detect when a live `max_tokens` bump (via `hipfire config set max_tokens`
@@ -1490,6 +1755,390 @@ async function serve(port: number, host: string) {
   // so the legacy Hermes `<tools>` block injection and ChatML
   // conversation rebuild both turn into off-distribution noise.
   let currentArch: string | null = null;
+  let currentStateMode: string | null = null;
+  const workerPrefillSchedulers = new Map<string, PriorityPrefillScheduler>();
+  const workerStateCaches = new Map<string, Map<string, PrefixCheckpointManifest>>();
+  const fallbackStateCacheStore = new Map<string, PrefixCheckpointManifest>();
+  const getWorkerId = (workerKey: ModelWorkerKey): string => modelWorkerKeyId(workerKey);
+  const getWorkerPrefillScheduler = (workerKey: ModelWorkerKey | null): PriorityPrefillScheduler | undefined => {
+    if (!workerKey) return undefined;
+    const key = getWorkerId(workerKey);
+    const existing = workerPrefillSchedulers.get(key);
+    if (existing) return existing;
+    const created = new PriorityPrefillScheduler();
+    workerPrefillSchedulers.set(key, created);
+    return created;
+  };
+  const getWorkerStateCache = (workerKey: ModelWorkerKey | null): Map<string, PrefixCheckpointManifest> => {
+    if (!workerKey) return fallbackStateCacheStore;
+    const key = getWorkerId(workerKey);
+    const existing = workerStateCaches.get(key);
+    if (existing) return existing;
+    const created = new Map<string, PrefixCheckpointManifest>();
+    workerStateCaches.set(key, created);
+    return created;
+  };
+  const prefillBatchMetrics = {
+    eligible: 0,
+    selected: 0,
+    skipped: 0,
+    queued: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+  };
+  const batchFileStore = new Map<string, BatchFileRecord>();
+  const batchControlStore = new Map<string, BatchJobRecord>();
+  let lastPrefillQueueWaitReason: "selected" | "waiting" | "insufficient_queue" | "not_eligible" | "disabled" = "disabled";
+  let lastPrefillFallbackReason = "not_applicable";
+  let lastPrefillRuntimeDispatchSkippedReason = "not_applicable";
+  let lastBatchRuntimeSkippedReason = "not_enabled";
+  let lastBatchFallbackReason = "idle";
+  let lastBatchExecutionMode: BatchExecutionMode = "disabled";
+  let batchValidationErrorCount = 0;
+  let batchStreamingRejectionCount = 0;
+  let batchRuntimeUnsupportedModeCount = 0;
+
+  const batchStats = () => {
+    const records = [...batchControlStore.values()];
+    const queued = records.filter((r) =>
+      r.status === "validating" || r.status === "in_progress" || r.status === "finalizing"
+    ).length;
+    const selected = records.filter((r) => r.status === "in_progress").length;
+    const failed = records.filter((r) => r.status === "failed").length;
+    const cancelled = records.filter((r) => r.status === "cancelled").length;
+    const completed = records.filter((r) => r.status === "completed").length;
+    return { total: records.length, queued, selected, failed, cancelled, completed };
+  };
+
+  const buildBatchArtifactErrorContent = (errors: Parameters<typeof buildBatchInputErrorArtifact>[0], lines: Parameters<typeof buildBatchInputErrorArtifact>[1]) =>
+    buildBatchInputErrorArtifact(errors, lines)
+      .map((line) => JSON.stringify(line))
+      .join("\n") + "\n";
+
+  const batchRecordToResponse = (record: BatchJobRecord) => ({
+    ...record,
+    created_at: record.created_at,
+    in_progress_at: record.in_progress_at,
+    completed_at: record.completed_at,
+    request_count: record.request_count,
+    completed_requests: record.completed_requests ?? 0,
+  });
+
+  const markBatchUnsupportedFallback = (reason: string) => {
+    batchRuntimeUnsupportedModeCount += 1;
+    lastBatchRuntimeSkippedReason = `line_fallback:${reason}`;
+    lastBatchFallbackReason = `line_fallback:${reason}`;
+  };
+
+  const runBatchJob = async (
+    batchId: string,
+    parsedEntries: BatchInputRecord[],
+    preValidationErrors: Parameters<typeof buildBatchInputErrorArtifact>[0] = [],
+  ) => {
+    const batchRecord = batchControlStore.get(batchId);
+    if (!batchRecord) return;
+    if (batchRecord.status === "cancelled" || batchRecord.status === "cancelling" || batchRecord.status === "failed" || batchRecord.status === "completed") return;
+
+    batchRecord.status = "in_progress";
+    batchRecord.in_progress_at = nowUnixSeconds();
+    batchRecord.failed_reason = undefined;
+    lastBatchFallbackReason = "batch_in_progress";
+    batchControlStore.set(batchId, batchRecord);
+
+    try {
+      const outputLines: Array<{ custom_id: string; response: any }> = [];
+      const runtimeErrors: Parameters<typeof buildBatchInputErrorArtifact>[0] = [];
+      const sharedSchedulerPlan: { selected: number; notSelected: number } = {
+        selected: 0,
+        notSelected: 0,
+      };
+      let batchExecutionMode: BatchExecutionMode = serverPrefillBatch.enabled ? "serial_fallback" : "unsupported";
+      let hasSuccessfulLine = false;
+      let hasUnsupportedLine = false;
+      for (let i = 0; i < parsedEntries.length; i++) {
+        const currentBatchRecord = batchControlStore.get(batchId);
+        if (!currentBatchRecord) return;
+        if (currentBatchRecord.status === "cancelling" || currentBatchRecord.status === "cancelled") {
+          currentBatchRecord.status = "cancelled";
+          currentBatchRecord.completed_at = nowUnixSeconds();
+          batchControlStore.set(batchId, currentBatchRecord);
+          return;
+        }
+        const line = parsedEntries[i];
+        const normalizedBody = line.normalized_body ?? line.body;
+        const endpoint = line.url;
+
+        // Build a stable batch execution envelope from the normalized payload.
+        // This is intentionally minimal by design: we do not run full daemon
+        // scheduling here yet, but we preserve per-line state in response/error
+        // artifacts so downstream tooling can validate shape and correlation.
+        const modelHint = normalizedBody.model ?? batchRecord.endpoint;
+        const rawLineModel = typeof modelHint === "string" ? modelHint : "unknown";
+        const lineId = `${batchId}_${normalizeLineIdHint(line.custom_id)}_${i}`;
+        const fallbackReason = (() => {
+          if (!rawLineModel || rawLineModel === "unknown") {
+            return "missing_model";
+          }
+          if (normalizedBody.stream === true) {
+            return "streaming_unsupported";
+          }
+          if (endpoint === "/v1/responses") {
+            if (!Array.isArray(normalizedBody.messages)) {
+              return "responses_input_not_message_sequence";
+            }
+          }
+          return "serial_fallback";
+        })();
+
+        const normalizedMessages = Array.isArray(normalizedBody.messages)
+          ? normalizedBody.messages
+          : [];
+        const isValidMessages = endpoint === "/v1/responses"
+          ? Array.isArray(normalizedMessages)
+          : true;
+
+        if (!isValidMessages || fallbackReason !== "serial_fallback") {
+          runtimeErrors.push({
+            line: i + 1,
+            custom_id: line.custom_id,
+            code: "unsupported_mode",
+            message: `custom_id ${line.custom_id} fallbacked due to ${fallbackReason}`,
+          });
+          hasUnsupportedLine = true;
+          batchExecutionMode = "unsupported";
+          sharedSchedulerPlan.notSelected += 1;
+          markBatchUnsupportedFallback(fallbackReason);
+          continue;
+        }
+
+        const lineModelPath = findModel(rawLineModel);
+        if (!lineModelPath) {
+          runtimeErrors.push({
+            line: i + 1,
+            custom_id: line.custom_id,
+            code: "model_not_found",
+            message: `custom_id ${line.custom_id} model not found: ${rawLineModel}`,
+          });
+          hasUnsupportedLine = true;
+          continue;
+        }
+
+        const lineModelResolved = resolve(lineModelPath);
+        const stateModeForRouting = currentStateMode || "q8";
+        const lineRoute = pickServingModelWorker({
+          requestModelPath: lineModelResolved,
+          currentModelPath: current,
+          currentMaxSeq,
+          requiredMaxSeq: 4096,
+          archId: currentArch ?? "unknown",
+          quantFamily: inferQuantFamilyForPath(lineModelResolved),
+          stateMode: stateModeForRouting,
+          featureFlags: ["serve", "batch_worker"],
+          artifactDigest: inferModelArtifactDigest(lineModelResolved),
+          maxSeqBucket: currentMaxSeq ?? 4096,
+        });
+        const loadedModelPath = lineRoute.canReuseCurrentWorker ? current : null;
+
+        const bodyConfig = resolveModelConfig(rawLineModel);
+        const batchPolicy = schedulerPolicyForPriority(
+          parseSchedulerPriority(undefined, serverPrefillBatch.priority),
+        );
+        const schedulingEligible = serverPrefillBatch.enabled
+          ? serverPrefillBatchEligibility({
+            body: normalizedBody,
+            loadedModelPath,
+            requestModelPath: lineModelResolved,
+            loadedMaxSeq: currentMaxSeq,
+            requiredMaxSeq: 4096,
+            requestImages: [],
+            effectiveConfig: {
+              prefill_compression: bodyConfig.prefill_compression,
+              prefill_drafter: bodyConfig.prefill_drafter,
+            },
+          })
+          : { eligible: false, reason: "disabled" };
+
+        if (!schedulingEligible.eligible) {
+          batchExecutionMode = "unsupported";
+          markBatchUnsupportedFallback(schedulingEligible.reason);
+          hasUnsupportedLine = true;
+          continue;
+        }
+
+        const requestTokens = approximatePromptTokenIds(
+          Array.isArray(normalizedMessages)
+            ? normalizedMessages
+              .map((entry: any) => (typeof entry?.content === "string" ? entry.content : ""))
+              .join("\n")
+            : "",
+        );
+        const workerDraft = createServerPrefillSession({
+          id: lineId,
+          modelPath: lineModelResolved,
+          modelDigest: inferModelArtifactDigest(lineModelResolved),
+          archId: currentArch ?? "unknown",
+          quantFamily: inferQuantFamilyForPath(lineModelResolved),
+          stateMode: stateModeForRouting,
+          maxSeqBucket: Math.max(4096, requestTokens.length),
+          featureFlags: ["serve", "batch_worker", currentArch ?? "unknown", "prefill_batch"],
+          promptTokens: requestTokens,
+          stateKinds: inferStateKindsForServeArch(currentArch),
+          priority: batchPolicy.priority,
+        });
+
+        const servingWorkerKey = pickServingModelWorker({
+          requestModelPath: lineModelResolved,
+          currentModelPath: current,
+          currentMaxSeq,
+          requiredMaxSeq: 4096,
+          archId: currentArch ?? "unknown",
+          quantFamily: inferQuantFamilyForPath(lineModelResolved),
+          stateMode: stateModeForRouting,
+          featureFlags: ["serve", "batch_worker"],
+          artifactDigest: inferModelArtifactDigest(lineModelResolved),
+          maxSeqBucket: currentMaxSeq ?? 4096,
+        }).workerKey;
+
+        const workerScheduler = getWorkerPrefillScheduler(servingWorkerKey);
+        if (schedulingEligible.eligible && serverPrefillBatch.enabled && workerScheduler && generateBatchPrefillCapability === "supported") {
+          const nowMs = Date.now();
+          workerScheduler.enqueue(workerDraft, nowMs);
+          const preview = workerScheduler.previewNextPrefillBatch({
+            nowMs,
+            incomingSession: workerDraft,
+            incomingEnqueuedAtMs: nowMs,
+          });
+          const shouldRunThisBatch = !!preview?.sessions?.some((s) => s.id === workerDraft.id);
+          if (shouldRunThisBatch) {
+            const scheduled = workerScheduler.nextPrefillBatch({ nowMs });
+            if (scheduled?.sessions.some((s) => s.id === workerDraft.id)) {
+              sharedSchedulerPlan.selected += 1;
+              batchExecutionMode = "prefill_batch";
+            } else {
+              sharedSchedulerPlan.notSelected += 1;
+              batchExecutionMode = "serial_fallback";
+              markBatchUnsupportedFallback("prefill_batch_scheduler_miss");
+              workerScheduler.cancel(lineId);
+              hasUnsupportedLine = true;
+            }
+          } else {
+            sharedSchedulerPlan.notSelected += 1;
+            batchExecutionMode = "serial_fallback";
+            markBatchUnsupportedFallback("prefill_batch_preview_reject");
+            workerScheduler.cancel(lineId);
+            hasUnsupportedLine = true;
+          }
+        } else {
+          sharedSchedulerPlan.notSelected += 1;
+          batchExecutionMode = serverPrefillBatch.enabled ? "unsupported" : "serial_fallback";
+          markBatchUnsupportedFallback(serverPrefillBatch.enabled ? "prefill_protocol_not_supported" : "batch_prefill_disabled");
+          hasUnsupportedLine = true;
+        }
+
+        // Deterministic fallback reason for this scaffolded path.
+        const responseBodyForLine = {
+          id: `${line.url === "/v1/responses" ? "chatcmpl" : "chatcmpl"}_${normalizeLineIdHint(line.custom_id)}`,
+          object: line.url === "/v1/responses" ? "response" : "chat.completion",
+          created: nowUnixSeconds(),
+          model: normalizedBody.model ?? batchRecord.endpoint,
+          choices: [{
+            index: 0,
+            message: {
+              role: "assistant",
+              content: `Batch endpoint scaffold placeholder for ${line.custom_id}`,
+            },
+            finish_reason: "stop",
+          }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+        outputLines.push({
+          custom_id: line.custom_id,
+          response: line.url === "/v1/responses"
+            ? toResponsesObject(responseBodyForLine.id, responseBodyForLine)
+            : responseBodyForLine,
+        });
+        hasSuccessfulLine = true;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+
+      const updatedBeforeWrite = batchControlStore.get(batchId);
+      if (!updatedBeforeWrite || updatedBeforeWrite.status !== "in_progress") return;
+      updatedBeforeWrite.status = "finalizing";
+      batchControlStore.set(batchId, updatedBeforeWrite);
+
+      const updated = batchControlStore.get(batchId);
+      if (!updated) return;
+      if (outputLines.length > 0) {
+        const outputFileId = `file_${randomUUID().replace(/-/g, "")}`;
+        writeBatchArtifact(outputFileId, buildBatchOutputArtifact(outputLines));
+        updated.output_file_id = outputFileId;
+      } else {
+        updated.output_file_id = null;
+      }
+      if (preValidationErrors.length > 0) {
+        updated.failed_reason = updated.failed_reason ?? "partial_batch_errors";
+      }
+      if (runtimeErrors.length > 0 || preValidationErrors.length > 0) {
+        const errorFileId = `file_${randomUUID().replace(/-/g, "")}`;
+        writeBatchArtifact(errorFileId, buildBatchArtifactErrorContent(
+          [...preValidationErrors, ...runtimeErrors],
+          parsedEntries,
+        ));
+        updated.error_file_id = errorFileId;
+        if (updated.request_count > outputLines.length) {
+          updated.failed_reason = "partial_batch_errors";
+        }
+      }
+      if (!hasSuccessfulLine && (runtimeErrors.length > 0 || preValidationErrors.length > 0)) {
+        updated.status = "failed";
+        updated.failed_reason = updated.failed_reason ?? "partial_batch_errors";
+      } else {
+        updated.status = "completed";
+      }
+      updated.completed_at = nowUnixSeconds();
+      updated.completed_requests = Math.max(0, outputLines.length);
+      updated.metadata = {
+        prefill_batch_shared_scheduler_selected: sharedSchedulerPlan.selected,
+        prefill_batch_shared_scheduler_not_selected: sharedSchedulerPlan.notSelected,
+        execution_mode: batchExecutionMode,
+      };
+      batchControlStore.set(batchId, updated);
+      lastBatchFallbackReason = preValidationErrors.length > 0
+        ? "completed_with_prevalidation_rejections"
+        : (batchExecutionMode === "prefill_batch"
+          ? "selected_for_dispatch:selected"
+          : batchExecutionMode === "serial_fallback"
+          ? "line_rejected:serial_fallback"
+          : "line_fallback:not_enabled");
+      lastBatchExecutionMode = batchExecutionMode;
+      lastBatchRuntimeSkippedReason = batchExecutionMode === "prefill_batch"
+        ? "not_implemented"
+        : batchExecutionMode === "serial_fallback"
+        ? "not_enabled"
+        : lastBatchRuntimeSkippedReason;
+    } catch (err: any) {
+      const failedBatch = batchControlStore.get(batchId);
+      if (!failedBatch) return;
+      const errorFileId = `file_${randomUUID().replace(/-/g, "")}`;
+      writeBatchArtifact(errorFileId, buildBatchArtifactErrorContent(
+        [
+          ...preValidationErrors,
+          { line: 0, code: "processing_error", message: err?.message ?? "batch processing failed" },
+        ],
+        parsedEntries,
+      ));
+      failedBatch.error_file_id = errorFileId;
+      failedBatch.status = "failed";
+      failedBatch.completed_at = nowUnixSeconds();
+      failedBatch.failed_reason = "processing_error";
+      batchValidationErrorCount += 1;
+      lastBatchFallbackReason = "processing_error";
+      lastBatchRuntimeSkippedReason = "batch_processing_error";
+      batchControlStore.set(batchId, failedBatch);
+    }
+  };
+
+  let lastSelectedBatchSize = 0;
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
@@ -1531,6 +2180,8 @@ async function serve(port: number, host: string) {
       current = null;
       currentMaxSeq = null;
       modelHasVL = false;
+      currentStateMode = null;
+      currentArch = null;
     }
   }, Math.min(60_000, idleTimeoutMs)) : null;
   // Keep process alive irrespective of the interval; clean up on exit.
@@ -1555,6 +2206,7 @@ async function serve(port: number, host: string) {
         await e.send({ type: "reset" }); await e.recv();
         current = warmPath;
         currentMaxSeq = warmLoadMsg.params.max_seq;
+        currentStateMode = warmLoadMsg.params.kv_mode || null;
         modelHasVL = loadResult.vl === true;
         currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
         console.error(`[hipfire] warm-up complete`);
@@ -1589,17 +2241,262 @@ async function serve(port: number, host: string) {
     idleTimeout: 255, // max allowed — model loading can take 30s+
     async fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname === "/health") {
-        return Response.json({
-          status: "ok",
-          model: current,
-          idle_timeout_sec: cfg.idle_timeout,
-          pid: process.pid,
-        });
-      }
+        if (url.pathname === "/health") {
+          const stateCacheBytes = [
+            ...fallbackStateCacheStore.values(),
+            ...[...workerStateCaches.values()].flatMap((cache) => [...cache.values()]),
+          ].reduce((sum, manifest) => sum + manifest.bytes, 0);
+          const stateCacheEntries = [
+            fallbackStateCacheStore.size,
+            ...[...workerStateCaches.values()].map((cache) => cache.size),
+          ].reduce((sum, size) => sum + size, 0);
+          const prefillQueueSize = [...workerPrefillSchedulers.values()].reduce(
+            (sum, scheduler) => sum + scheduler.size,
+            0,
+          );
+          return Response.json({
+            status: "ok",
+            model: current,
+            idle_timeout_sec: cfg.idle_timeout,
+            prefill_batch: serverPrefillBatch.enabled
+              ? buildPrefillBatchHealthPayload({
+                  enabled: true,
+                  queued: prefillBatchMetrics.queued,
+                  eligible: prefillBatchMetrics.eligible,
+                  selected: prefillBatchMetrics.selected,
+                  skipped: prefillBatchMetrics.skipped,
+                  cacheHits: prefillBatchMetrics.cacheHits,
+                  cacheMisses: prefillBatchMetrics.cacheMisses,
+                  queueSize: prefillQueueSize,
+                  generateBatchPrefillCapability,
+                  generateBatchPrefillCapabilityReason,
+                  queueWaitReason: lastPrefillQueueWaitReason,
+                  fallbackReason: lastPrefillFallbackReason,
+                  runtimeDispatchSkippedReason: lastPrefillRuntimeDispatchSkippedReason,
+                  selectedBatchSize: lastSelectedBatchSize,
+                })
+              : { enabled: false },
+            state_cache: serverPrefillBatch.enabled
+              ? {
+                  enabled: serverPrefillBatchControls.stateCacheDisk,
+                  entries: stateCacheEntries,
+                  bytes: stateCacheBytes,
+                }
+              : { enabled: false },
+            batches: {
+              ...buildBatchHealthPayload({
+                enabled: true,
+                queued: batchStats().queued,
+                selected: batchStats().selected,
+                total: batchStats().total,
+                failed: batchStats().failed,
+                cancelled: batchStats().cancelled,
+                completed: batchStats().completed,
+                completion_window_supported: true,
+                supported_endpoints: ["/v1/chat/completions", "/v1/responses"],
+                execution_mode: lastBatchExecutionMode,
+              last_fallback_reason: lastBatchFallbackReason,
+              batch_capability: generateBatchPrefillCapability,
+              batch_capability_reason: generateBatchPrefillCapabilityReason,
+              selected_batch_execution_mode: lastBatchExecutionMode,
+              fallback_reason: lastBatchFallbackReason,
+              runtime_dispatch_skipped_reason: lastBatchRuntimeSkippedReason,
+              unsupported_mode_hits_total: batchRuntimeUnsupportedModeCount,
+              validation_errors_total: batchValidationErrorCount,
+              streaming_rejections_total: batchStreamingRejectionCount,
+            }),
+            },
+            pid: process.pid,
+          });
+        }
       if (url.pathname === "/v1/models") return Response.json({ data: listLocal().map(m => ({ id: m.name })) });
 
-      if (url.pathname !== "/v1/chat/completions" || req.method !== "POST")
+      if (url.pathname === "/v1/files") {
+        if (req.method !== "GET" && req.method !== "POST") {
+          return Response.json({ error: "method not allowed" }, { status: 405 });
+        }
+        if (req.method === "GET") {
+          return Response.json({ data: [...batchFileStore.values()] });
+        }
+        const contentType = req.headers.get("content-type") || "";
+        if (!contentType.startsWith("multipart/form-data")) {
+          return Response.json({ error: "invalid content type; expected multipart/form-data" }, { status: 400 });
+        }
+        const formData = await req.formData();
+        const purposeField = formData.get("purpose");
+        const purpose = typeof purposeField === "string" ? purposeField : String(purposeField ?? "");
+        const rawFile = formData.get("file");
+        if (!rawFile || !(rawFile instanceof Blob) || !(rawFile as any).arrayBuffer) {
+          return Response.json({ error: "missing file" }, { status: 400 });
+        }
+        if (purpose !== "batch") {
+          return Response.json({ error: "only purpose=batch is supported" }, { status: 400 });
+        }
+        const filename = typeof (rawFile as any).name === "string" && (rawFile as any).name.length > 0
+          ? (rawFile as any).name
+          : "batch.jsonl";
+        const bytes = new Uint8Array(await (rawFile as Blob).arrayBuffer());
+        const fileId = `file_${randomUUID().replace(/-/g, "")}`;
+        const fileRecord: BatchFileRecord = {
+          id: fileId,
+          object: "file",
+          filename,
+          bytes: bytes.length,
+          purpose: "batch",
+          created_at: nowUnixSeconds(),
+        };
+        writeBatchArtifact(fileId, Buffer.from(bytes).toString("utf8"));
+        batchFileStore.set(fileId, fileRecord);
+        return Response.json(fileRecord);
+      }
+
+    if (url.pathname.startsWith("/v1/files/")) {
+        const parts = url.pathname.split("/").filter(Boolean);
+        const fileId = parts[2];
+        const fileRecord = batchFileStore.get(fileId);
+        if (!fileRecord) return Response.json({ error: "file not found" }, { status: 404 });
+        if (fileRecord.purpose !== "batch") {
+          return Response.json({ error: "file purpose not supported" }, { status: 400 });
+        }
+        if (req.method === "GET" && parts[3] === "content") {
+          try {
+            const content = readBatchFile(fileId);
+            return new Response(content, {
+              headers: { "content-type": "application/jsonl" },
+            });
+          } catch (err) {
+            return Response.json({ error: "failed to read file" }, { status: 500 });
+          }
+        }
+        if (req.method === "GET") {
+          return Response.json(fileRecord);
+        }
+        if (req.method === "DELETE") {
+          batchFileStore.delete(fileId);
+          unlinkSync(batchArtifactPath(fileId));
+          return Response.json({ id: fileId, object: "file", deleted: true });
+        }
+        return Response.json({ error: "method not allowed" }, { status: 405 });
+      }
+
+      if (url.pathname === "/v1/batches" || url.pathname.startsWith("/v1/batches/")) {
+        if (url.pathname === "/v1/batches" && req.method === "GET") {
+          return Response.json({
+            data: [...batchControlStore.values()]
+              .sort((a, b) => b.created_at - a.created_at)
+              .map(batchRecordToResponse),
+            has_more: false,
+          });
+        }
+        if (url.pathname === "/v1/batches" && req.method === "POST") {
+          let body: any;
+          try {
+            body = await req.json();
+          } catch (err) {
+            return Response.json({ error: { message: "invalid json", type: "invalid_request_error" } }, { status: 400 });
+          }
+        const inputFileId = typeof body?.input_file_id === "string" ? body.input_file_id : "";
+        const endpoint = typeof body?.endpoint === "string" ? body.endpoint : "/v1/chat/completions";
+          const completionWindow = typeof body?.completion_window === "string" ? body.completion_window : "24h";
+          if (completionWindow !== "24h") {
+            return Response.json({ error: { message: `unsupported completion_window ${completionWindow}`, type: "invalid_request_error" } }, { status: 400 });
+          }
+          const fileRecord = batchFileStore.get(inputFileId);
+          if (!fileRecord) {
+            return Response.json({ error: { message: `input file not found: ${inputFileId}`, type: "invalid_request_error" } }, { status: 400 });
+          }
+          if (fileRecord.purpose !== "batch") {
+            return Response.json({ error: { message: `input file ${inputFileId} is not a batch file`, type: "invalid_request_error" } }, { status: 400 });
+          }
+          if (!isSupportedBatchEndpoint(endpoint)) {
+            return Response.json({ error: { message: `unsupported endpoint ${endpoint}`, type: "invalid_request_error" } }, { status: 400 });
+          }
+          const rawInput = readBatchFile(inputFileId);
+          const parsed = validateBatchInputForBatch(rawInput, endpoint);
+          const unsupportedModeErrors = countUnsupportedModeErrors(parsed.errors);
+          batchRuntimeUnsupportedModeCount += unsupportedModeErrors;
+          batchStreamingRejectionCount += parsed.errors.filter((err) => err.code === "streaming_unsupported").length;
+          const preValidationFallbackReason = parsed.errors.length > 0
+            ? toBatchLineFallbackReason(
+              parsed.errors[0]?.code ?? "validation_rejected",
+            )
+            : "idle";
+          const parsedEntries = parsed.entries;
+          const batchId = newObjectId("batch");
+          const requestCount = parsed.totalLineCount;
+          const now = nowUnixSeconds();
+      const batch: BatchJobRecord = {
+            id: batchId,
+            object: "batch",
+            status: "validating",
+            endpoint,
+            completion_window: completionWindow,
+            input_file_id: inputFileId,
+            output_file_id: null,
+            error_file_id: null,
+            request_count: requestCount,
+            created_at: now,
+            ...(parsed.errors.length > 0 && parsedEntries.length === 0
+              ? { failed_reason: parsed.errors[0]?.message }
+              : {}),
+          };
+          batchControlStore.set(batchId, batch);
+
+            if (parsed.errors.length > 0) {
+            const errorFileId = `file_${randomUUID().replace(/-/g, "")}`;
+            writeBatchArtifact(errorFileId, buildBatchArtifactErrorContent(parsed.errors, parsedEntries));
+            batch.error_file_id = errorFileId;
+            batch.output_file_id = null;
+            batch.failed_reason = parsedEntries.length === 0
+              ? (parsed.errors[0]?.message ?? "validation failed")
+              : "partial_batch_errors";
+            batch.status = parsedEntries.length === 0 ? "failed" : "validating";
+            batch.completed_at = parsedEntries.length === 0 ? nowUnixSeconds() : undefined;
+            batchValidationErrorCount += parsed.errors.length;
+            batchControlStore.set(batchId, batch);
+            lastBatchFallbackReason = preValidationFallbackReason;
+            lastBatchRuntimeSkippedReason = preValidationFallbackReason;
+            batchStats();
+            if (parsedEntries.length === 0) {
+              return Response.json({
+                ...batchRecordToResponse(batch),
+                cancelled_at: null,
+                failed_at: batch.completed_at,
+              });
+            }
+          }
+            batch.status = "validating";
+            batchControlStore.set(batchId, batch);
+            void runBatchJob(batchId, parsedEntries, parsed.errors);
+            return Response.json(batchRecordToResponse(batch));
+        }
+
+        const batchPathParts = url.pathname.split("/").filter(Boolean);
+        const batchId = batchPathParts[2];
+        const operation = batchPathParts[3];
+        if (!batchId) {
+          return Response.json({ error: "missing batch id" }, { status: 400 });
+        }
+        const batch = batchControlStore.get(batchId);
+        if (!batch) return Response.json({ error: "batch not found" }, { status: 404 });
+        if (operation === "cancel" && req.method === "POST") {
+          if (batch.status === "completed" || batch.status === "failed") {
+            return Response.json(batchRecordToResponse(batch));
+          }
+          batch.status = batch.status === "validating" ? "cancelling" : "cancelled";
+          batch.failed_reason = batch.status === "cancelling" ? "cancel_requested" : batch.failed_reason;
+          batchControlStore.set(batchId, batch);
+          batch.completed_at = nowUnixSeconds();
+          batchControlStore.set(batchId, batch);
+          return Response.json(batchRecordToResponse(batch));
+        }
+        if (req.method !== "GET") {
+          return Response.json({ error: "method not allowed" }, { status: 405 });
+        }
+        return Response.json(batchRecordToResponse(batch));
+      }
+
+      if (url.pathname !== "/v1/chat/completions" && url.pathname !== "/v1/responses" || req.method !== "POST")
         return Response.json({ error: "not found" }, { status: 404 });
 
       // Update idle timer on every real request (eviction loop checks against this).
@@ -1620,7 +2517,15 @@ async function serve(port: number, host: string) {
       }
 
       try {
-        const body = (await req.json()) as any;
+        const rawBody = (await req.json()) as any;
+        const isResponsesRequest = url.pathname === "/v1/responses";
+        const body = isResponsesRequest ? parseResponsesToChatBody(rawBody) : rawBody;
+        if (isResponsesRequest && body.stream === true) {
+          return Response.json({ error: { message: "streaming responses is unsupported in this scaffold", type: "invalid_request_error" } }, { status: 400 });
+        }
+        if (!body || typeof body !== "object") {
+          return Response.json({ error: { message: "invalid request body", type: "invalid_request_error" } }, { status: 400 });
+        }
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
@@ -1904,9 +2809,30 @@ async function serve(port: number, host: string) {
         const requestMaxTokens = body.max_tokens ?? effective.max_tokens;
         const visualHeadroom = requestImages.length > 0 ? 1024 : 0;
         const requiredMaxSeq = Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom);
+        const requestPriority = parseSchedulerPriority(
+          body.hipfire_priority ?? req.headers.get("x-hipfire-priority"),
+          serverPrefillBatch.priority,
+        );
+        let requestBatchPolicy: ReturnType<typeof schedulerPolicyForPriority> | undefined;
+        let prefillBatchGate: { eligible: boolean; reason: string } = {
+          eligible: false,
+          reason: "disabled",
+        };
 
-        const needReload = current !== path
-          || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
+        const stateModeForRouting = currentStateMode || effective.kv_cache;
+        const initialRoute = pickServingModelWorker({
+          requestModelPath: path,
+          currentModelPath: current,
+          currentMaxSeq,
+          requiredMaxSeq,
+          archId: currentArch ?? "unknown",
+          quantFamily: inferQuantFamilyForPath(path),
+          stateMode: stateModeForRouting,
+          featureFlags: ["serve"],
+          artifactDigest: inferModelArtifactDigest(path),
+          maxSeqBucket: currentMaxSeq ?? requiredMaxSeq,
+        });
+        const needReload = initialRoute.needsReload;
 
         if (needReload) {
           if (current) { await e.send({ type: "unload" }); await e.recv(); }
@@ -1927,7 +2853,63 @@ async function serve(port: number, host: string) {
           current = path;
           currentMaxSeq = loadMsg.params.max_seq;
           modelHasVL = loadResult.vl === true;
+          currentStateMode = loadMsg.params.kv_mode || currentStateMode;
           currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+          requestBatchPolicy = serverPrefillBatch.enabled
+            ? schedulerPolicyForPriority(requestPriority, process.env)
+            : undefined;
+          if (serverPrefillBatch.enabled) {
+            prefillBatchGate = serverPrefillBatchEligibility({
+              body,
+              loadedModelPath: current,
+              requestModelPath: path,
+              loadedMaxSeq: currentMaxSeq,
+              requiredMaxSeq,
+              requestImages,
+              effectiveConfig: effective,
+            });
+          } else {
+            prefillBatchGate = { eligible: false, reason: "disabled" };
+          }
+        }
+
+        if (serverPrefillBatch.enabled && requestBatchPolicy === undefined) {
+          requestBatchPolicy = schedulerPolicyForPriority(requestPriority, process.env);
+        }
+        if (serverPrefillBatch.enabled && prefillBatchGate.reason === "disabled") {
+          prefillBatchGate = serverPrefillBatchEligibility({
+            body,
+            loadedModelPath: current,
+            requestModelPath: path,
+            loadedMaxSeq: currentMaxSeq,
+            requiredMaxSeq,
+            requestImages,
+            effectiveConfig: effective,
+          });
+        }
+
+        const servingWorkerStateMode = currentStateMode || effective.kv_cache;
+        const servingWorkerFeatureFlags = Array.from(new Set([
+          "serve",
+          servingWorkerStateMode,
+          currentArch ?? "unknown",
+          "server_batch",
+        ])).sort();
+        let servingWorkerKey: ModelWorkerKey | null = null;
+        const servingWorkerKinds: readonly SessionStateKind[] = inferStateKindsForServeArch(currentArch);
+        if (current !== null) {
+          servingWorkerKey = pickServingModelWorker({
+            requestModelPath: current,
+            currentModelPath: current,
+            currentMaxSeq,
+            requiredMaxSeq,
+            archId: currentArch ?? "unknown",
+            quantFamily: inferQuantFamilyForPath(current),
+            stateMode: servingWorkerStateMode,
+            featureFlags: servingWorkerFeatureFlags,
+            artifactDigest: inferModelArtifactDigest(current),
+            maxSeqBucket: currentMaxSeq ?? requiredMaxSeq,
+          }).workerKey;
         }
 
         // Now that currentArch reflects the model we're ACTUALLY sending
@@ -1973,6 +2955,220 @@ async function serve(port: number, host: string) {
         }
 
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
+        const requestNowMs = Date.now();
+        let serverPrefillSession: RequestSessionDraft | undefined;
+        let selectedForPrefillBatch = false;
+        let selectedByScheduler = false;
+        let queuePreviewReason: "selected" | "waiting" | "insufficient_queue" | "not_eligible" = "not_eligible";
+        let selectedBatchSize = 0;
+        let fallbackReason = "not_applicable";
+        let runtimeDispatchSkippedReason = "not_applicable";
+        let cacheHit = false;
+        let cachePrefixLen = 0;
+        let cacheKey: string | null = null;
+        let spillable = false;
+        let spillReason = "state_cache_disabled";
+        if (serverPrefillBatch.enabled) {
+          prefillBatchMetrics.queued += 1;
+          const promptTokens = approximatePromptTokenIds(userPrompt);
+          const stateKinds = servingWorkerKinds;
+          const stateMode = servingWorkerStateMode;
+          const stateFlags = servingWorkerFeatureFlags;
+          const modelDigest = inferModelArtifactDigest(current);
+          const cacheKeyFingerprint: PrefixCheckpointFingerprint = {
+            modelArtifactDigest: inferModelArtifactDigest(current),
+            architectureId: currentArch ?? "unknown",
+            tokenizerHash: stableObjectHash({ model: current, arch: currentArch, kv: stateMode }),
+            chatTemplateHash: stableObjectHash({ arch: currentArch, model: current, mode: stateMode }),
+            runtimeConfigHash: stableObjectHash({
+              kv_mode: stateMode,
+              prefill_compression: effective.prefill_compression,
+              prefill_drafter: effective.prefill_drafter,
+              mtp_mode: effective.mtp_mode,
+              mtp_k: effective.mtp_k,
+            }),
+            stateMode,
+            positionPolicy: "rope",
+            featureFlags: stateFlags,
+          };
+
+          const servingWorkerScheduler = getWorkerPrefillScheduler(servingWorkerKey);
+          const servingWorkerStateCache = getWorkerStateCache(servingWorkerKey);
+          if (prefillBatchGate.eligible && current !== null) {
+            prefillBatchMetrics.eligible += 1;
+            const modelArtifactBucket = currentMaxSeq ?? 4096;
+            serverPrefillSession = createServerPrefillSession({
+              id: reqId,
+              modelPath: current,
+              modelDigest,
+              archId: currentArch ?? "unknown",
+              quantFamily: inferQuantFamilyForPath(current),
+              stateMode,
+              maxSeqBucket: modelArtifactBucket,
+              featureFlags: stateFlags,
+              promptTokens,
+              priority: requestPriority,
+              stateKinds,
+            });
+            if (servingWorkerKey !== null) {
+              serverPrefillSession = {
+                ...serverPrefillSession,
+                workerKey: servingWorkerKey,
+                stateHandle: {
+                  ...serverPrefillSession.stateHandle,
+                  workerKey: servingWorkerKey,
+                },
+              };
+            }
+
+            let cacheManifest: PrefixCheckpointManifest | undefined;
+            const cacheLookup = [...servingWorkerStateCache.values()]
+              .filter((manifest) => manifest.prefixLen <= promptTokens.length)
+              .filter((manifest) => {
+                try {
+                  return prefixCheckpointCompatible(manifest, {
+                    fingerprint: cacheKeyFingerprint,
+                    prefixTokens: promptTokens.slice(0, manifest.prefixLen),
+                    requiredStateKinds: stateKinds,
+                  });
+                } catch { return false; }
+              })
+              .sort((a, b) => b.prefixLen - a.prefixLen)[0];
+
+            if (cacheLookup) {
+              cacheHit = true;
+              prefillBatchMetrics.cacheHits += 1;
+              cachePrefixLen = cacheLookup.prefixLen;
+              cacheManifest = touchPrefixCheckpointManifest(cacheLookup, requestNowMs);
+              cacheKey = prefixCheckpointCacheKey(cacheManifest);
+              if (serverPrefillBatchControls.stateCacheDisk) {
+                servingWorkerStateCache.set(cacheKey, cacheManifest);
+              }
+              serverPrefillSession = {
+                ...serverPrefillSession,
+                cachedPrefixTokens: cacheLookup.prefixLen,
+                suffixTokens: promptTokens.slice(cacheLookup.prefixLen),
+                stateHandle: {
+                  ...serverPrefillSession.stateHandle,
+                  cachedPrefixTokens: cacheLookup.prefixLen,
+                  logicalPosition: cacheLookup.prefixLen,
+                },
+              };
+            } else {
+              prefillBatchMetrics.cacheMisses += 1;
+            }
+
+            const checksumLookup: Partial<Record<SessionStateKind, string>> = {};
+            for (const stateKind of stateKinds) {
+              checksumLookup[stateKind] = stableHash(`${cacheKeyFingerprint.modelArtifactDigest}|${stateKind}`);
+            }
+            const manifestPrefixLen = cachePrefixLen > 0 ? cachePrefixLen : promptTokens.length;
+            const manifest = cacheManifest ?? createPrefixCheckpointManifest({
+              fingerprint: cacheKeyFingerprint,
+              prefixTokens: promptTokens.slice(0, manifestPrefixLen),
+              stateKinds,
+              bytes: serverPrefillSession.suffixTokens.length * 16,
+              createdAtMs: requestNowMs,
+              lastUsedAtMs: requestNowMs,
+              hitCount: cacheHit ? 1 : 0,
+              checksums: checksumLookup,
+            });
+            if (!cacheKey) {
+              cacheKey = prefixCheckpointCacheKey(manifest);
+            }
+            if (serverPrefillBatchControls.stateCacheDisk) {
+              const spillProfile = spillEligibility(manifest, {
+                activeSession: false,
+                pinned: false,
+                knownArchitecture: !!currentArch,
+              });
+              spillable = spillProfile.spillable;
+              spillReason = spillProfile.reason;
+              if (spillProfile.spillable) servingWorkerStateCache.set(cacheKey, manifest);
+            } else {
+              spillReason = "state_cache_disk_disabled";
+            }
+
+            // Exercise queueing path (enqueue -> preview -> dequeue) so per-request
+            // session scheduling state remains testable even while runtime dispatch
+            // stays serial until a daemon batch-prefill protocol exists.
+            if (servingWorkerScheduler) {
+              servingWorkerScheduler.enqueue(serverPrefillSession, requestNowMs);
+              const preview = servingWorkerScheduler.previewNextPrefillBatch({
+                nowMs: requestNowMs,
+              });
+              const nextForCurrent = !!preview?.sessions?.some((s) => s.id === reqId);
+              if (nextForCurrent) {
+                const next = servingWorkerScheduler.nextPrefillBatch({ nowMs: requestNowMs });
+                if (next && next.sessions.some((s) => s.id === reqId)) {
+                  selectedForPrefillBatch = true;
+                  selectedByScheduler = true;
+                  queuePreviewReason = "selected";
+                  selectedBatchSize = next.sessions.length;
+                  prefillBatchMetrics.selected += 1;
+                } else {
+                  queuePreviewReason = preview ? "waiting" : "insufficient_queue";
+                  // If preview said this request should run but dequeuing did not
+                  // return it, keep the scheduling state consistent by canceling the
+                  // request before continuing on the serialized execution path.
+                  servingWorkerScheduler.cancel(reqId);
+                  prefillBatchMetrics.skipped += 1;
+                }
+              } else {
+                queuePreviewReason = preview ? "waiting" : "insufficient_queue";
+                prefillBatchMetrics.skipped += 1;
+                servingWorkerScheduler.cancel(reqId);
+              }
+            } else {
+              queuePreviewReason = "insufficient_queue";
+              prefillBatchMetrics.skipped += 1;
+            }
+          } else {
+            prefillBatchMetrics.skipped += 1;
+            queuePreviewReason = "not_eligible";
+          }
+        }
+
+        if (cacheKey == null) {
+          cacheKey = current !== null
+            ? stableHash(`${current}|${inferStateKindsForServeArch(currentArch).join(",")}`)
+            : stableHash("prefetch-disable");
+        }
+        if (!serverPrefillBatch.enabled) {
+          fallbackReason = "batching_disabled";
+          lastPrefillQueueWaitReason = "disabled";
+          lastPrefillFallbackReason = fallbackReason;
+          lastPrefillRuntimeDispatchSkippedReason = "not_enabled";
+          lastSelectedBatchSize = 0;
+          runtimeDispatchSkippedReason = "not_applicable";
+        } else if (!prefillBatchGate.eligible) {
+          fallbackReason = `not_eligible:${prefillBatchGate.reason}`;
+          lastPrefillQueueWaitReason = queuePreviewReason;
+          lastPrefillFallbackReason = fallbackReason;
+          lastPrefillRuntimeDispatchSkippedReason = "not_eligible";
+          lastSelectedBatchSize = 0;
+          runtimeDispatchSkippedReason = "not_eligible";
+        } else if (selectedByScheduler) {
+          fallbackReason = `selected_for_dispatch:${queuePreviewReason}`;
+          lastPrefillQueueWaitReason = queuePreviewReason;
+          lastPrefillFallbackReason = fallbackReason;
+          lastPrefillRuntimeDispatchSkippedReason = runtimeDispatchSkippedReason;
+          lastSelectedBatchSize = selectedBatchSize;
+        } else {
+          fallbackReason = `queue_wait:${queuePreviewReason}`;
+          lastPrefillQueueWaitReason = queuePreviewReason;
+          lastPrefillFallbackReason = fallbackReason;
+          lastSelectedBatchSize = 0;
+          if (generateBatchPrefillCapability !== "supported") {
+            lastPrefillRuntimeDispatchSkippedReason = prefillBatchRuntimeDispatchStatus(
+              true,
+              generateBatchPrefillCapability,
+            ).runtimeDispatchReason;
+          } else {
+            lastPrefillRuntimeDispatchSkippedReason = runtimeDispatchSkippedReason;
+          }
+        }
+
         const created = Math.floor(Date.now() / 1000);
         const modelName = body.model || "hipfire";
         // Fall back to the user's configured defaults (global or per-model) when
@@ -2061,6 +3257,53 @@ async function serve(port: number, host: string) {
           frequency_penalty: frequencyPenalty,
           top_p: body.top_p ?? effective.top_p,
         };
+        if (serverPrefillBatch.enabled) {
+          const runtimeDispatchStatus = prefillBatchRuntimeDispatchStatus(
+            prefillBatchGate.eligible,
+            generateBatchPrefillCapability,
+          );
+          const runtimeDispatch = runtimeDispatchStatus.runtimeDispatch;
+          runtimeDispatchSkippedReason = runtimeDispatch === "available_serial_fallback"
+            ? "not_skipped"
+            : runtimeDispatchStatus.runtimeDispatchReason;
+          const runtimeDispatchReason = prefillBatchGate.eligible
+            ? runtimeDispatchStatus.runtimeDispatchReason
+            : prefillBatchGate.reason;
+          const batchPolicy = requestBatchPolicy ?? {
+            priority: serverPrefillBatch.priority,
+            maxBatchSize: serverPrefillBatch.maxBatch,
+            coalesceWaitMs: serverPrefillBatch.waitMs,
+            targetPairTokens: serverPrefillBatch.targetPairTokens,
+            maxProcessingMs: serverPrefillBatch.maxProcessingMs,
+          };
+          genParams.server_prefill_batch = {
+            eligible: prefillBatchGate.eligible,
+            reason: prefillBatchGate.reason,
+            priority: batchPolicy.priority,
+            max_batch: batchPolicy.maxBatchSize,
+            wait_ms: batchPolicy.coalesceWaitMs,
+            target_pair_tokens: batchPolicy.targetPairTokens,
+            max_processing_ms: batchPolicy.maxProcessingMs,
+            selected_for_dispatch: selectedForPrefillBatch,
+            selected_by_scheduler: selectedByScheduler,
+            queue_preview_reason: queuePreviewReason,
+            queue_wait_reason: queuePreviewReason,
+            fallback_reason: fallbackReason,
+            selected_batch_size: selectedBatchSize,
+            runtime_dispatch_skipped_reason: runtimeDispatchSkippedReason,
+            cache_hit: cacheHit,
+            cache_prefix_len: cachePrefixLen,
+            cache_key: cacheKey,
+            cache_spillable: spillable,
+            cache_spill_reason: spillReason,
+            worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
+            route_reason: initialRoute.reloadReason,
+            generate_batch_prefill_capability: generateBatchPrefillCapability,
+            generate_batch_prefill_capability_reason: generateBatchPrefillCapabilityReason,
+            runtime_dispatch: runtimeDispatch,
+            runtime_dispatch_reason: runtimeDispatchReason,
+          };
+        }
         // Mirror the `hipfire run` path's per-model max_think_tokens
         // propagation. Without this, models with thinking=on can consume
         // the entire max_tokens budget inside a single <think>...</think>
@@ -2336,6 +3579,13 @@ async function serve(port: number, host: string) {
             }
           }
           return null;
+        }
+
+        if (isResponsesRequest) {
+          // responses streaming isn't represented here yet.
+          return Response.json({
+            error: { message: "/v1/responses currently returns non-streaming only", type: "invalid_request_error" },
+          }, { status: 400 });
         }
 
         if (body.stream) {
@@ -2740,6 +3990,10 @@ async function serve(port: number, host: string) {
         };
         if (thinkWarning) {
           responseBody.x_hipfire_warning = thinkWarning;
+        }
+        if (url.pathname === "/v1/responses") {
+          const responseId = responseBody.id || `resp_${newObjectId("resp")}`;
+          return Response.json(toResponsesObject(responseId, responseBody));
         }
         return Response.json(responseBody);
       } catch (err: any) {

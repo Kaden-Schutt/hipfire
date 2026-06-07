@@ -248,8 +248,10 @@ impl Gpus {
             "split_pair_mut: src_i == dst_i ({src_i}) — same-device case is not representable as (&Gpu, &mut Gpu); use single_mut + a same-device helper instead",
         );
         let n = self.devices.len();
-        assert!(src_i < n && dst_i < n,
-            "split_pair_mut: src_i={src_i} or dst_i={dst_i} out of range (n_devices={n})");
+        assert!(
+            src_i < n && dst_i < n,
+            "split_pair_mut: src_i={src_i} or dst_i={dst_i} out of range (n_devices={n})"
+        );
         // Split the underlying slice so the borrow checker sees two
         // disjoint mutable regions; we hand back &Gpu for src and
         // &mut Gpu for dst.

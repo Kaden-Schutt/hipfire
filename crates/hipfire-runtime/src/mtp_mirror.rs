@@ -53,11 +53,15 @@ pub fn peer_clone_tensor(
     // cross-device case. This wrapper kept for backwards compat with
     // any third-party callers; prefer the new primitives going forward.
     if src_gpu.device_id == dst_gpu.device_id {
-        src_gpu.hip.memcpy_dtod_at(&dst.buf, 0, &src.buf, 0, byte_size)?;
+        src_gpu
+            .hip
+            .memcpy_dtod_at(&dst.buf, 0, &src.buf, 0, byte_size)?;
     } else {
         src_gpu.hip.memcpy_peer(
-            &dst.buf, dst_gpu.device_id,
-            &src.buf,  src_gpu.device_id,
+            &dst.buf,
+            dst_gpu.device_id,
+            &src.buf,
+            src_gpu.device_id,
             byte_size,
         )?;
     }
@@ -84,7 +88,8 @@ pub fn clone_tensor_same(gpu: &mut Gpu, src: &GpuTensor) -> HipResult<GpuTensor>
 
     gpu.bind_thread()?;
     let dst = gpu.alloc_tensor(&shape, dtype)?;
-    gpu.hip.memcpy_dtod_at(&dst.buf, 0, &src.buf, 0, byte_size)?;
+    gpu.hip
+        .memcpy_dtod_at(&dst.buf, 0, &src.buf, 0, byte_size)?;
 
     debug_assert_eq!(dst.dtype, dtype);
     debug_assert_eq!(dst.shape, shape);
@@ -118,8 +123,10 @@ pub fn clone_tensor_peer(
     dst_gpu.bind_thread()?;
     let dst = dst_gpu.alloc_tensor(&shape, dtype)?;
     src_gpu.hip.memcpy_peer(
-        &dst.buf, dst_gpu.device_id,
-        &src.buf,  src_gpu.device_id,
+        &dst.buf,
+        dst_gpu.device_id,
+        &src.buf,
+        src_gpu.device_id,
         byte_size,
     )?;
 
@@ -143,7 +150,8 @@ pub fn peer_clone_2d(
         (src.shape.len() == 2 && src.shape[0] == m && src.shape[1] == k)
             || (src.shape.len() == 1 && src.shape[0] == m * k),
         "peer_clone_2d: expected source shape [{m}, {k}] or [{}], got {:?}",
-        m * k, src.shape,
+        m * k,
+        src.shape,
     );
     peer_clone_tensor(src_gpu, dst_gpu, src)
 }
@@ -181,8 +189,7 @@ impl MirroredTrunkWeights {
     /// Size (in bytes) of all mirrored tensors on the drafter side. Useful
     /// for VRAM accounting / pre-flight checks.
     pub fn drafter_bytes(&self) -> usize {
-        self.token_embd.byte_size()
-            + self.output.as_ref().map(|t| t.byte_size()).unwrap_or(0)
+        self.token_embd.byte_size() + self.output.as_ref().map(|t| t.byte_size()).unwrap_or(0)
     }
 
     /// `Some(DType)` of `token_embd`. Tiny helper to make accounting

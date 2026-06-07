@@ -286,9 +286,13 @@ fn main() {
             let vbuf: Vec<f32> = (0..kv_dim5).map(|_| next()).collect();
             gpu.hip.memcpy_htod(&dk.buf, &to_bytes(&kbuf)).unwrap();
             gpu.hip.memcpy_htod(&dv.buf, &to_bytes(&vbuf)).unwrap();
-            gpu.hip.memcpy_htod(&pos_buf, &(p as i32).to_ne_bytes()).unwrap();
-            gpu.kv_cache_write_q8_0(&d_kc, &dk, &pos_buf, n_kv5, hd5).unwrap();
-            gpu.kv_cache_write_q8_0(&d_vc, &dv, &pos_buf, n_kv5, hd5).unwrap();
+            gpu.hip
+                .memcpy_htod(&pos_buf, &(p as i32).to_ne_bytes())
+                .unwrap();
+            gpu.kv_cache_write_q8_0(&d_kc, &dk, &pos_buf, n_kv5, hd5)
+                .unwrap();
+            gpu.kv_cache_write_q8_0(&d_vc, &dv, &pos_buf, n_kv5, hd5)
+                .unwrap();
         }
         let qbuf: Vec<f32> = (0..n_h5 * hd5).map(|_| next()).collect();
         let dq = gpu.upload_f32(&qbuf, &[n_h5 * hd5]).unwrap();
@@ -298,13 +302,33 @@ fn main() {
         let partials = gpu
             .zeros(&[n_h5 * max_tiles * (2 + hd5)], rdna_compute::DType::F32)
             .unwrap();
-        gpu.hip.memcpy_htod(&pos_buf, &((seq - 1) as i32).to_ne_bytes()).unwrap();
+        gpu.hip
+            .memcpy_htod(&pos_buf, &((seq - 1) as i32).to_ne_bytes())
+            .unwrap();
         gpu.attention_q8_0_kv(
-            &dq, &d_kc, &d_vc, &out_base, &pos_buf, seq, n_h5, n_kv5, hd5, physical_cap,
+            &dq,
+            &d_kc,
+            &d_vc,
+            &out_base,
+            &pos_buf,
+            seq,
+            n_h5,
+            n_kv5,
+            hd5,
+            physical_cap,
         )
         .unwrap();
         gpu.attention_flash_q8_0(
-            &dq, &d_kc, &d_vc, &out_flash, &pos_buf, seq, n_h5, n_kv5, hd5, physical_cap,
+            &dq,
+            &d_kc,
+            &d_vc,
+            &out_flash,
+            &pos_buf,
+            seq,
+            n_h5,
+            n_kv5,
+            hd5,
+            physical_cap,
             &partials,
         )
         .unwrap();
@@ -346,9 +370,13 @@ fn main() {
     let dkB = gpu.upload_f32(&kfix, &[kv_dim5]).unwrap();
     let dvB = gpu.upload_f32(&vfix, &[kv_dim5]).unwrap();
     for p in 0..big_seq {
-        gpu.hip.memcpy_htod(&pos_buf, &(p as i32).to_ne_bytes()).unwrap();
-        gpu.kv_cache_write_q8_0(&d_kcB, &dkB, &pos_buf, n_kv5, hd5).unwrap();
-        gpu.kv_cache_write_q8_0(&d_vcB, &dvB, &pos_buf, n_kv5, hd5).unwrap();
+        gpu.hip
+            .memcpy_htod(&pos_buf, &(p as i32).to_ne_bytes())
+            .unwrap();
+        gpu.kv_cache_write_q8_0(&d_kcB, &dkB, &pos_buf, n_kv5, hd5)
+            .unwrap();
+        gpu.kv_cache_write_q8_0(&d_vcB, &dvB, &pos_buf, n_kv5, hd5)
+            .unwrap();
     }
     let qB: Vec<f32> = (0..n_h5 * hd5).map(|_| next()).collect();
     let dqB = gpu.upload_f32(&qB, &[n_h5 * hd5]).unwrap();
@@ -357,7 +385,9 @@ fn main() {
     let partialsB = gpu
         .zeros(&[n_h5 * max_tilesB * (2 + hd5)], rdna_compute::DType::F32)
         .unwrap();
-    gpu.hip.memcpy_htod(&pos_buf, &((big_seq - 1) as i32).to_ne_bytes()).unwrap();
+    gpu.hip
+        .memcpy_htod(&pos_buf, &((big_seq - 1) as i32).to_ne_bytes())
+        .unwrap();
     gpu.attention_flash_q8_0(
         &dqB, &d_kcB, &d_vcB, &outB, &pos_buf, big_seq, n_h5, n_kv5, hd5, big_seq, &partialsB,
     )

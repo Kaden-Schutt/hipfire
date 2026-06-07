@@ -31,9 +31,18 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--model" => { model = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--tokens" => { tokens_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
+            "--model" => {
+                model = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--tokens" => {
+                tokens_path = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            other => {
+                eprintln!("unknown arg: {other}");
+                std::process::exit(1);
+            }
         }
     }
     let model = model.expect("--model required");
@@ -70,8 +79,14 @@ fn main() {
     }
 
     let argmax = |v: &[f32]| -> usize {
-        let mut bi = 0; let mut bv = f32::NEG_INFINITY;
-        for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i; } }
+        let mut bi = 0;
+        let mut bv = f32::NEG_INFINITY;
+        for (i, &x) in v.iter().enumerate() {
+            if x > bv {
+                bv = x;
+                bi = i;
+            }
+        }
         bi
     };
 
@@ -85,12 +100,17 @@ fn main() {
         let (mut dot, mut na, mut nb, mut md) = (0f64, 0f64, 0f64, 0f64);
         for (x, y) in a.iter().zip(b.iter()) {
             let (x, y) = (*x as f64, *y as f64);
-            dot += x * y; na += x * x; nb += y * y;
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
             md = md.max((x - y).abs());
         }
         let cos = dot / (na.sqrt() * nb.sqrt());
-        let am_a = argmax(a); let am_b = argmax(b);
-        if am_a != am_b { argmax_mismatch += 1; }
+        let am_a = argmax(a);
+        let am_b = argmax(b);
+        if am_a != am_b {
+            argmax_mismatch += 1;
+        }
         min_cos = min_cos.min(cos);
         max_abs = max_abs.max(md);
         println!(
