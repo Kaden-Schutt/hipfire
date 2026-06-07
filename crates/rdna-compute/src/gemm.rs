@@ -12106,7 +12106,20 @@ impl Gpu {
         } else {
             kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC
         };
-        self.ensure_kernel("gemm_hfq4g256_residual_mmq", src, kernel_name)?;
+        // Module name must be arch-distinct: `ensure_q8_1_mmq_x` already
+        // compiled+loaded the RDNA3 source under module
+        // "gemm_hfq4g256_residual_mmq" (to grab `quantize_q8_1_mmq_ds4`).
+        // The compiler/module cache is keyed by module NAME only, so loading
+        // the gfx12 source under the same name short-circuits to the RDNA3
+        // module — whose body #if-excludes gfx12, leaving the gemm symbols as
+        // empty stubs (output == input buffer, NRMSE ~100%). Use a distinct
+        // module name for gfx12 while keeping the kernel SYMBOL names constant.
+        let module_name = if is_gfx12 {
+            "gemm_hfq4g256_residual_mmq_gfx12"
+        } else {
+            "gemm_hfq4g256_residual_mmq"
+        };
+        self.ensure_kernel(module_name, src, kernel_name)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
@@ -12828,7 +12841,17 @@ impl Gpu {
         } else {
             kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC
         };
-        self.ensure_kernel("gemm_hfq4g256_residual_mmq", src, kernel_name)?;
+        // Arch-distinct module name on gfx12 — see gemm_hfq4g256_residual_mmq
+        // for the cache-collision rationale (RDNA3 source pre-loaded under the
+        // shared name by ensure_q8_1_mmq_x → gfx12 source short-circuited →
+        // empty-stub symbols). Symbol names stay constant; only the module
+        // cache key differs.
+        let module_name = if is_gfx12 {
+            "gemm_hfq4g256_residual_mmq_gfx12"
+        } else {
+            "gemm_hfq4g256_residual_mmq"
+        };
+        self.ensure_kernel(module_name, src, kernel_name)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
@@ -12931,7 +12954,17 @@ impl Gpu {
         } else {
             kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC
         };
-        self.ensure_kernel("gemm_hfq4g256_residual_mmq", src, kernel_name)?;
+        // Arch-distinct module name on gfx12 — see gemm_hfq4g256_residual_mmq
+        // for the cache-collision rationale (RDNA3 source pre-loaded under the
+        // shared name by ensure_q8_1_mmq_x → gfx12 source short-circuited →
+        // empty-stub symbols). Symbol names stay constant; only the module
+        // cache key differs.
+        let module_name = if is_gfx12 {
+            "gemm_hfq4g256_residual_mmq_gfx12"
+        } else {
+            "gemm_hfq4g256_residual_mmq"
+        };
+        self.ensure_kernel(module_name, src, kernel_name)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
