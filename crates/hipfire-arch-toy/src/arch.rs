@@ -14,8 +14,9 @@
 //! `crates/hipfire-arch-qwen35/src/arch.rs`.
 
 use crate::toy_model::{ToyConfig, ToyState, ToyWeights};
-use hipfire_runtime::arch::{Architecture, EosFilterOverrides, LoopGuardOverrides,
-                            PromptFrameOverrides, SamplerOverrides};
+use hipfire_runtime::arch::{
+    Architecture, EosFilterOverrides, LoopGuardOverrides, PromptFrameOverrides, SamplerOverrides,
+};
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 

@@ -7,8 +7,8 @@
 //! drift on REAL Qwen3.5-9B MQ3-Lloyd weights — directly comparable to
 //! the MQ4-Lloyd diag's output for the same model and tensor name.
 
-use rdna_compute::Gpu;
 use hipfire_runtime::hfq::HfqFile;
+use rdna_compute::Gpu;
 use std::path::Path;
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -30,10 +30,10 @@ fn cpu_gemv_mq3(row_bytes: &[u8], groups_per_row: usize, x: &[f32]) -> f32 {
                 | ((row_bytes[bo + 1] as u32) << 8)
                 | ((row_bytes[bo + 2] as u32) << 16);
             let base = g * 256 + chunk * 8;
-            acc += cb[((pk      ) & 7) as usize] * x[base];
-            acc += cb[((pk >>  3) & 7) as usize] * x[base + 1];
-            acc += cb[((pk >>  6) & 7) as usize] * x[base + 2];
-            acc += cb[((pk >>  9) & 7) as usize] * x[base + 3];
+            acc += cb[((pk) & 7) as usize] * x[base];
+            acc += cb[((pk >> 3) & 7) as usize] * x[base + 1];
+            acc += cb[((pk >> 6) & 7) as usize] * x[base + 2];
+            acc += cb[((pk >> 9) & 7) as usize] * x[base + 3];
             acc += cb[((pk >> 12) & 7) as usize] * x[base + 4];
             acc += cb[((pk >> 15) & 7) as usize] * x[base + 5];
             acc += cb[((pk >> 18) & 7) as usize] * x[base + 6];
@@ -45,7 +45,9 @@ fn cpu_gemv_mq3(row_bytes: &[u8], groups_per_row: usize, x: &[f32]) -> f32 {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let model = args.next().expect("usage: diag_mq3_lloyd_multiacc <model.hfq> <tensor> [--rows N]");
+    let model = args
+        .next()
+        .expect("usage: diag_mq3_lloyd_multiacc <model.hfq> <tensor> [--rows N]");
     let tensor_name = args.next().expect("missing tensor name");
     let mut max_rows: usize = usize::MAX;
     while let Some(flag) = args.next() {
@@ -56,20 +58,34 @@ fn main() {
 
     let hfq = HfqFile::open(Path::new(&model)).expect("open model");
     let (info, bytes) = hfq.tensor_data(&tensor_name).expect("tensor not found");
-    assert_eq!(info.quant_type, 20, "tensor {tensor_name} is qt={}, expected MQ3G256Lloyd (20)", info.quant_type);
-    assert_eq!(info.shape.len(), 2, "expected 2D weight, got {:?}", info.shape);
+    assert_eq!(
+        info.quant_type, 20,
+        "tensor {tensor_name} is qt={}, expected MQ3G256Lloyd (20)",
+        info.quant_type
+    );
+    assert_eq!(
+        info.shape.len(),
+        2,
+        "expected 2D weight, got {:?}",
+        info.shape
+    );
     let m_full = info.shape[0] as usize;
     let k = info.shape[1] as usize;
     let m = m_full.min(max_rows);
     let groups_per_row = k / 256;
     let row_stride = groups_per_row * 112;
-    eprintln!("MQ3-Lloyd Tensor: {tensor_name}  shape=[{}, {}]  testing {m} rows", m_full, k);
+    eprintln!(
+        "MQ3-Lloyd Tensor: {tensor_name}  shape=[{}, {}]  testing {m} rows",
+        m_full, k
+    );
 
     let mut state = 0xC0FFEEu32;
-    let x: Vec<f32> = (0..k).map(|_| {
-        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-        ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.5
-    }).collect();
+    let x: Vec<f32> = (0..k)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.5
+        })
+        .collect();
 
     let t0 = std::time::Instant::now();
     let y_cpu: Vec<f32> = (0..m)
@@ -81,7 +97,10 @@ fn main() {
     eprintln!("  CPU reference: {:.2}s", t0.elapsed().as_secs_f64());
 
     let mut gpu = Gpu::init().expect("GPU init");
-    eprintln!("GPU: {} — running gemv_mq3g256_lloyd (multi-acc fast on gfx1100/1151, slow elsewhere)", gpu.arch);
+    eprintln!(
+        "GPU: {} — running gemv_mq3g256_lloyd (multi-acc fast on gfx1100/1151, slow elsewhere)",
+        gpu.arch
+    );
     let upload_bytes = &bytes[..m * row_stride];
     let d_a = gpu.upload_raw(upload_bytes, &[upload_bytes.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[k]).unwrap();
@@ -89,9 +108,7 @@ fn main() {
     gpu.gemv_mq3g256_lloyd(&d_a, &d_x, &d_y, m, k).unwrap();
     let y_gpu = gpu.download_f32(&d_y).unwrap();
 
-    let mut diffs: Vec<(usize, f32)> = (0..m)
-        .map(|i| (i, (y_gpu[i] - y_cpu[i]).abs()))
-        .collect();
+    let mut diffs: Vec<(usize, f32)> = (0..m).map(|i| (i, (y_gpu[i] - y_cpu[i]).abs())).collect();
     diffs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let max_abs = diffs[0].1;
     let total: f64 = (0..m).map(|i| (y_gpu[i] - y_cpu[i]).abs() as f64).sum();

@@ -17,13 +17,17 @@ fn main() {
         (12288, 4096, "ffn_gate (Qwen3-8B)"),
     ];
 
-    eprintln!("{:<30} {:>8} {:>8} {:>10} {:>8} {:>10} {:>8}",
-        "Name", "M", "K", "Q4K us", "Q4K GB/s", "F32 us", "F32 GB/s");
+    eprintln!(
+        "{:<30} {:>8} {:>8} {:>10} {:>8} {:>10} {:>8}",
+        "Name", "M", "K", "Q4K us", "Q4K GB/s", "F32 us", "F32 GB/s"
+    );
     eprintln!("{}", "-".repeat(90));
 
     for (m, k, name) in &sizes {
         // Skip sizes where K is not multiple of 256
-        if k % 256 != 0 { continue; }
+        if k % 256 != 0 {
+            continue;
+        }
 
         let m = *m;
         let k = *k;
@@ -72,8 +76,10 @@ fn main() {
         let bytes_f32 = (m * k * 4 + k * 4) as f64;
         let bw_f32 = bytes_f32 * n as f64 / (ms_f32 as f64 / 1000.0) / 1e9;
 
-        eprintln!("{:<30} {:>8} {:>8} {:>10.1} {:>8.1} {:>10.1} {:>8.1}",
-            name, m, k, us_q4k, bw_q4k, us_f32, bw_f32);
+        eprintln!(
+            "{:<30} {:>8} {:>8} {:>10.1} {:>8.1} {:>10.1} {:>8.1}",
+            name, m, k, us_q4k, bw_q4k, us_f32, bw_f32
+        );
 
         gpu.free_tensor(d_raw).unwrap();
         gpu.free_tensor(d_x).unwrap();

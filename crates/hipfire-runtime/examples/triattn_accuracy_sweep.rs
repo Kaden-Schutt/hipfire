@@ -17,24 +17,32 @@
 //! clear test failures.
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("build with --features deltanet"); }
+fn main() {
+    eprintln!("build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
     use hipfire_runtime::cask::CaskCtx;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{self, KvCache};
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
     use rdna_compute::Gpu;
     use std::path::Path;
 
-    enum Policy { Plain(EvictionCtx), Cask(CaskCtx) }
+    enum Policy {
+        Plain(EvictionCtx),
+        Cask(CaskCtx),
+    }
     impl Policy {
-        fn maybe_evict(&self, gpu: &mut Gpu, kv: &mut KvCache, physical: usize)
-            -> hip_bridge::HipResult<Option<hipfire_runtime::triattn::EvictionResult>>
-        {
+        fn maybe_evict(
+            &self,
+            gpu: &mut Gpu,
+            kv: &mut KvCache,
+            physical: usize,
+        ) -> hip_bridge::HipResult<Option<hipfire_runtime::triattn::EvictionResult>> {
             match self {
                 Policy::Plain(c) => c.maybe_evict(gpu, kv, physical),
                 Policy::Cask(c) => c.maybe_evict(gpu, kv, physical),
@@ -57,10 +65,22 @@ fn main() {
     let mut i = 1;
     while i < raw_args.len() {
         match raw_args[i].as_str() {
-            "--cask" => { use_cask = true; i += 1; }
-            "--core-frac" => { core_frac = raw_args[i + 1].parse().unwrap(); i += 2; }
-            "--fold-m" => { fold_m = raw_args[i + 1].parse().unwrap(); i += 2; }
-            _ => { positional.push(raw_args[i].clone()); i += 1; }
+            "--cask" => {
+                use_cask = true;
+                i += 1;
+            }
+            "--core-frac" => {
+                core_frac = raw_args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--fold-m" => {
+                fold_m = raw_args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            _ => {
+                positional.push(raw_args[i].clone());
+                i += 1;
+            }
         }
     }
     if positional.len() < 2 {
@@ -104,8 +124,17 @@ fn main() {
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let centers = TriAttnCenters::load(Path::new(sidecar_path)).expect("load sidecar");
-    let fa_layer_ids: Vec<usize> = config.layer_types.iter().enumerate()
-        .filter_map(|(i, t)| if *t == LayerType::FullAttention { Some(i) } else { None })
+    let fa_layer_ids: Vec<usize> = config
+        .layer_types
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            if *t == LayerType::FullAttention {
+                Some(i)
+            } else {
+                None
+            }
+        })
         .collect();
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
 
@@ -114,8 +143,22 @@ fn main() {
 
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");
     let alloc_kv = |gpu: &mut Gpu, seq: usize| match kv_mode.as_str() {
-        "asym3" => KvCache::new_gpu_asym3(gpu, config.n_layers, config.n_kv_heads, config.head_dim, seq).unwrap(),
-        _ => KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, seq).unwrap(),
+        "asym3" => KvCache::new_gpu_asym3(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            seq,
+        )
+        .unwrap(),
+        _ => KvCache::new_gpu_q8(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            seq,
+        )
+        .unwrap(),
     };
 
     let policy_tag = if use_cask {
@@ -123,8 +166,14 @@ fn main() {
     } else {
         "TriAttention".to_string()
     };
-    eprintln!("Accuracy sweep: {} prompts × {} budgets (kv={}, policy={}, gen={})",
-        test_cases.len(), budget_fractions.len(), kv_mode, policy_tag, gen_len);
+    eprintln!(
+        "Accuracy sweep: {} prompts × {} budgets (kv={}, policy={}, gen={})",
+        test_cases.len(),
+        budget_fractions.len(),
+        kv_mode,
+        policy_tag,
+        gen_len
+    );
 
     // results[fraction_idx] = (pass_count, fail_count)
     let mut results: Vec<(usize, usize)> = budget_fractions.iter().map(|_| (0, 0)).collect();
@@ -138,10 +187,18 @@ fn main() {
             // eviction; for frac<1.0 we evict during prefill with
             // beta = budget/4 so a couple of evictions fire on a
             // small prompt.
-            let budget = if frac >= 0.999 { plen + gen_len + 16 } else { (frac * plen as f32).round() as usize };
+            let budget = if frac >= 0.999 {
+                plen + gen_len + 16
+            } else {
+                (frac * plen as f32).round() as usize
+            };
             let beta = (budget / 4).max(4);
             let alloc_seq = (budget + beta + 8).max(plen + gen_len + 16);
-            let tight_seq = if frac >= 0.999 { plen + gen_len + 16 } else { budget + beta + 4 };
+            let tight_seq = if frac >= 0.999 {
+                plen + gen_len + 16
+            } else {
+                budget + beta + 4
+            };
 
             let mut kv = alloc_kv(&mut gpu, tight_seq.max(plen + gen_len + 16).min(alloc_seq));
             // Simpler: allocate big enough for any scenario; eviction still
@@ -156,21 +213,34 @@ fn main() {
 
             let ctx_opt = if frac < 0.999 {
                 let base = EvictionCtx::new(
-                    &mut gpu, &centers, fa_layer_ids.clone(),
-                    budget, beta,
-                    config.n_heads, config.n_kv_heads, config.head_dim,
-                    n_rot, config.rope_theta, kv.max_seq,
-                ).unwrap();
+                    &mut gpu,
+                    &centers,
+                    fa_layer_ids.clone(),
+                    budget,
+                    beta,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_theta,
+                    kv.max_seq,
+                )
+                .unwrap();
                 Some(if use_cask {
                     Policy::Cask(CaskCtx::new(base, core_frac, fold_m))
                 } else {
                     Policy::Plain(base)
                 })
-            } else { None };
+            } else {
+                None
+            };
 
             let mut physical = 0usize;
             for t in ptokens.iter() {
-                qwen35::forward_scratch(&mut gpu, &weights, &config, *t, physical, &mut kv, &mut dn, &scratch).unwrap();
+                qwen35::forward_scratch(
+                    &mut gpu, &weights, &config, *t, physical, &mut kv, &mut dn, &scratch,
+                )
+                .unwrap();
                 physical += 1;
                 if let Some(ctx) = ctx_opt.as_ref() {
                     if let Some(ev) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
@@ -182,7 +252,10 @@ fn main() {
             let mut next = llama::argmax(&logits);
             let mut emitted = vec![next];
             for _ in 0..gen_len {
-                qwen35::forward_scratch(&mut gpu, &weights, &config, next, physical, &mut kv, &mut dn, &scratch).unwrap();
+                qwen35::forward_scratch(
+                    &mut gpu, &weights, &config, next, physical, &mut kv, &mut dn, &scratch,
+                )
+                .unwrap();
                 physical += 1;
                 if let Some(ctx) = ctx_opt.as_ref() {
                     if let Some(ev) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
@@ -192,7 +265,9 @@ fn main() {
                 logits = gpu.download_f32(&scratch.logits).unwrap();
                 next = llama::argmax(&logits);
                 emitted.push(next);
-                if next == config.eos_token { break; }
+                if next == config.eos_token {
+                    break;
+                }
             }
             let text = tok.decode(&emitted).to_lowercase();
             let pass = text.contains(expected);
@@ -205,7 +280,13 @@ fn main() {
             eprintln!(
                 "  p{prompt_i} frac={frac:.2} budget={budget:<3} ev={ev:<2} {}  [{}]",
                 if pass { "✓" } else { "✗" },
-                text.lines().next().unwrap_or("").trim().chars().take(90).collect::<String>(),
+                text.lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .chars()
+                    .take(90)
+                    .collect::<String>(),
             );
         }
     }

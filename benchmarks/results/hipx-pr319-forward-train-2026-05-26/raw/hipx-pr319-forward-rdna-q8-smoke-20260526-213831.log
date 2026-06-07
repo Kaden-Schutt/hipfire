@@ -1,0 +1,278 @@
+
+== gfx1030 (RX_6950_XT) start ==
+commit=6126d41d
+device=ROCR_VISIBLE_DEVICES=2 gfx1030 RX_6950_XT
+prompt_md5=df5dedc8040ce70ba55080c4548e6024
+bin_md5=99ac762a2c9fd2b375bd8a24034c2ebb
+target_md5=31a8d8dc7603226801b08d8319015602
+draft_md5=590f35403cd7f1d634945233234a12b7
+cmd=max256 ctx2048 kv=q8 no-adaptive-b no-chatml
+=== dflash_spec_demo ===
+target: /home/kaden/.hipfire/models/qwen3.5-9b.mq4
+draft:  /home/kaden/.hipfire/models/qwen35-9b-dflash-mq4.hfq
+GPU dev 0: gfx1030 (17.2 GB VRAM, HIP 7.2)
+gpu: gfx1030
+VRAM @ init: used 0.03 GB, free 17.14 GB
+draft: layers=5 hidden=4096 heads=32 kv_heads=8 block=16 target_layers=[1, 8, 15, 22, 29]
+kv_mode: Q8
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+    (Q8_0 raw, 1080 MB)
+  loading output_norm...
+  loading output (separate lm_head, qt=13)...
+  lm_head AWQ sidecar: absent (no-op)
+  loading layer 0/32 (LinearAttention)...
+  loading layer 1/32 (LinearAttention)...
+  loading layer 2/32 (LinearAttention)...
+  loading layer 3/32 (FullAttention)...
+  loading layer 4/32 (LinearAttention)...
+  loading layer 5/32 (LinearAttention)...
+  loading layer 6/32 (LinearAttention)...
+  loading layer 7/32 (FullAttention)...
+  loading layer 8/32 (LinearAttention)...
+  loading layer 9/32 (LinearAttention)...
+  loading layer 10/32 (LinearAttention)...
+  loading layer 11/32 (FullAttention)...
+  loading layer 12/32 (LinearAttention)...
+  loading layer 13/32 (LinearAttention)...
+  loading layer 14/32 (LinearAttention)...
+  loading layer 15/32 (FullAttention)...
+  loading layer 16/32 (LinearAttention)...
+  loading layer 17/32 (LinearAttention)...
+  loading layer 18/32 (LinearAttention)...
+  loading layer 19/32 (FullAttention)...
+  loading layer 20/32 (LinearAttention)...
+  loading layer 21/32 (LinearAttention)...
+  loading layer 22/32 (LinearAttention)...
+  loading layer 23/32 (FullAttention)...
+  loading layer 24/32 (LinearAttention)...
+  loading layer 25/32 (LinearAttention)...
+  loading layer 26/32 (LinearAttention)...
+  loading layer 27/32 (FullAttention)...
+  loading layer 28/32 (LinearAttention)...
+  loading layer 29/32 (LinearAttention)...
+  loading layer 30/32 (LinearAttention)...
+  loading layer 31/32 (FullAttention)...
+KV cache: q8 (8/32 layers carry KV, others placeholder)
+target loaded in 6.04s
+VRAM @ after target load: used 5.79 GB, free 11.37 GB
+draft loaded in 0.23s
+VRAM @ after draft load: used 6.39 GB, free 10.77 GB
+draft: MQ4 weights detected, FWHT rotation scratch enabled
+prompt: "from typing import Optional\n\nclass ListNode:\n    def __init__(self, key: int, value: int):\n        self.key = key\n        self.value = value\n        self.prev: Optional[ListNode] = None\n        self.next: Optional[ListNode] = None\n\nclass LRUCache:\n    def __init__(self, capacity: int):\n        self.capacity = capacity\n        self.cache = {}\n        self.head = ListNode(0, 0)\n        self.tail = ListNode(0, 0)\n        self.head.next = self.tail\n        self.tail.prev = self.head\n\n    def _remove(self, node: ListNode) -> None:\n        prev_node = node.prev\n        next_node = node.next\n        prev_node.next = next_node\n        next_node.prev = prev_node\n\n    def _add_to_front(self, node: ListNode) -> None:\n        node.next = self.head.next\n        node.prev = self.head\n        self.head.next.prev = node\n        self.head.next = node\n\n    def get(self, key: int) -> int:\n"
+prompt tokens (232): [232 tokens]
+seeding target_hidden from prompt (232 tokens)...
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+prefill in 8.19s (28.3 tok/s)
+VRAM @ after_prefill: used 7.44 GB, free 9.73 GB
+decoding (max 256 tokens, block_size 16)...
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+  RDNA2 GEMV variant: v1 (baseline-rdna2)
+eos
+--- OUTPUT ---
+         if key in self.cache:
+             node = self.cache[key]
+             self._remove(node)
+             self._add_to_front(node)
+             return node.value
+         return -1
+
+     def put(self, key: int, value: int) -> None:
+         if key in self.cache:
+             node = self.cache[key]
+             node.value = value
+             self._remove(node)
+             self._add_to_front(node)
+         else:
+             if len(self.cache) == self.capacity:
+                 self._remove(self.tail.prev)
+                 del self.cache[self.tail.prev.key]
+             node = ListNode(key, value)
+             self.cache[key] = node
+             self._add_to_front(node)
+
+if __name__ == "__main__":
+    cache = LRUCache(2)
+    cache.put(1, 1)
+    cache.put(2, 2)
+    print(cache.get(1))
+    cache.put(3, 3)
+    print(cache.get(2))
+    cache.put(4, 4)
+    print(cache.get(1))
+    print(cache.get(3))
+    print(cache.get(4))<|endoftext|>
+--------------
+emitted: 257 tokens in 6.35s  (40.46 tok/s)
+cycles: 33  committed: 289  accepted: 223  τ=6.758  mean_committed=8.758
+=== BENCH METRICS ===
+prompt_tokens: 232
+prefill_secs: 8.1871
+prefill_tok_s: 28.34
+ttft_ms: 12622.81
+decode_tokens_emitted: 257
+decode_secs: 6.3525
+decode_tok_s: 40.46
+decode_tau: 6.7576
+decode_accept_rate: 0.4505
+vram_used_mb: 7122
+vram_total_mb: 16368
+=====================
+accept_rate (accepted / (cycles × (B-1))): 0.451
+histogram: [(0, 2), (1, 1), (2, 6), (3, 0), (4, 4), (5, 2), (6, 2), (7, 0), (8, 2), (9, 4), (10, 4), (11, 1), (12, 0), (13, 2), (14, 2), (15, 1), (16, 0)]
+seed-oracle: cycles=33 full_accept=1 mean_accept_len=6.758 | rej_match=0.000 tail_match=0.061 anypos_match=0.303
+DFlash tokens: [260, 413, 1328, 303, 638, 19474, 25, 198, 1734, 2357, 283, 638, 19474, 7900, 60, 198, 1734, 638, 1385, 5231, 6742, 8, 198, 1734, 638, 1385, 698, 2270, 22213, 6742, 8, 198, 1734, 460, 2357, 2733, 198, 260, 460, 471, 16, 271, 257, 687, 2113, 1153, 11, 1328, 25, 514, 11, 869, 25, 514, 8, 1411, 2168, 25, 198, 260, 413, 1328, 303, 638, 19474, 25, 198, 1734, 2357, 283, 638, 19474, 7900, 60, 198, 1734, 2357, 2733, 283, 869, 198, 1734, 638, 1385, 5231, 6742, 8, 198, 1734, 638, 1385, 698, 2270, 22213, 6742, 8, 198, 260, 745, 25, 198, 1734, 413, 2343, 1153, 19474, 8, 606, 638, 57167, 25, 198, 336, 638, 1385, 5231, 1153, 37429, 28044, 8, 198, 336, 1538, 638, 19474, 13917, 37429, 28044, 4582, 60, 198, 1734, 2357, 283, 19876, 4702, 11, 869, 8, 198, 1734, 638, 19474, 7900, 60, 283, 2357, 198, 1734, 638, 1385, 698, 2270, 22213, 6742, 8, 271, 331, 1259, 591, 548, 606, 12880, 3689, 548, 763, 198, 262, 6297, 283, 43072, 5287, 1714, 7, 17, 8, 198, 262, 6297, 3477, 7, 16, 11, 220, 16, 8, 198, 262, 6297, 3477, 7, 17, 11, 220, 17, 8, 198, 262, 1133, 30883, 652, 7, 16, 578, 198, 262, 6297, 3477, 7, 18, 11, 220, 18, 8, 198, 262, 1133, 30883, 652, 7, 17, 578, 198, 262, 6297, 3477, 7, 19, 11, 220, 19, 8, 198, 262, 1133, 30883, 652, 7, 16, 578, 198, 262, 1133, 30883, 652, 7, 18, 578, 198, 262, 1133, 30883, 652, 7, 19, 578, 248044]
+== gfx1030 status 0 log /tmp/hipx-pr319-forward-gfx1030-q8-max256-20260526-213831.log ==
+
+== gfx1010 (RX_5700_XT) start ==
+commit=6126d41d
+device=ROCR_VISIBLE_DEVICES=0 gfx1010 RX_5700_XT
+prompt_md5=df5dedc8040ce70ba55080c4548e6024
+bin_md5=99ac762a2c9fd2b375bd8a24034c2ebb
+target_md5=31a8d8dc7603226801b08d8319015602
+draft_md5=590f35403cd7f1d634945233234a12b7
+cmd=max256 ctx2048 kv=q8 no-adaptive-b no-chatml
+=== dflash_spec_demo ===
+target: /home/kaden/.hipfire/models/qwen3.5-9b.mq4
+draft:  /home/kaden/.hipfire/models/qwen35-9b-dflash-mq4.hfq
+GPU dev 0: gfx1010 (8.6 GB VRAM, HIP 7.2)
+gpu: gfx1010
+VRAM @ init: used 0.02 GB, free 8.55 GB
+draft: layers=5 hidden=4096 heads=32 kv_heads=8 block=16 target_layers=[1, 8, 15, 22, 29]
+kv_mode: Q8
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+    (Q8_0 raw, 1080 MB)
+  loading output_norm...
+  loading output (separate lm_head, qt=13)...
+  lm_head AWQ sidecar: absent (no-op)
+  loading layer 0/32 (LinearAttention)...
+  loading layer 1/32 (LinearAttention)...
+  loading layer 2/32 (LinearAttention)...
+  loading layer 3/32 (FullAttention)...
+  loading layer 4/32 (LinearAttention)...
+  loading layer 5/32 (LinearAttention)...
+  loading layer 6/32 (LinearAttention)...
+  loading layer 7/32 (FullAttention)...
+  loading layer 8/32 (LinearAttention)...
+  loading layer 9/32 (LinearAttention)...
+  loading layer 10/32 (LinearAttention)...
+  loading layer 11/32 (FullAttention)...
+  loading layer 12/32 (LinearAttention)...
+  loading layer 13/32 (LinearAttention)...
+  loading layer 14/32 (LinearAttention)...
+  loading layer 15/32 (FullAttention)...
+  loading layer 16/32 (LinearAttention)...
+  loading layer 17/32 (LinearAttention)...
+  loading layer 18/32 (LinearAttention)...
+  loading layer 19/32 (FullAttention)...
+  loading layer 20/32 (LinearAttention)...
+  loading layer 21/32 (LinearAttention)...
+  loading layer 22/32 (LinearAttention)...
+  loading layer 23/32 (FullAttention)...
+  loading layer 24/32 (LinearAttention)...
+  loading layer 25/32 (LinearAttention)...
+  loading layer 26/32 (LinearAttention)...
+  loading layer 27/32 (FullAttention)...
+  loading layer 28/32 (LinearAttention)...
+  loading layer 29/32 (LinearAttention)...
+  loading layer 30/32 (LinearAttention)...
+  loading layer 31/32 (FullAttention)...
+KV cache: q8 (8/32 layers carry KV, others placeholder)
+target loaded in 1.45s
+VRAM @ after target load: used 5.79 GB, free 2.79 GB
+draft loaded in 0.09s
+VRAM @ after draft load: used 6.39 GB, free 2.18 GB
+draft: MQ4 weights detected, FWHT rotation scratch enabled
+prompt: "from typing import Optional\n\nclass ListNode:\n    def __init__(self, key: int, value: int):\n        self.key = key\n        self.value = value\n        self.prev: Optional[ListNode] = None\n        self.next: Optional[ListNode] = None\n\nclass LRUCache:\n    def __init__(self, capacity: int):\n        self.capacity = capacity\n        self.cache = {}\n        self.head = ListNode(0, 0)\n        self.tail = ListNode(0, 0)\n        self.head.next = self.tail\n        self.tail.prev = self.head\n\n    def _remove(self, node: ListNode) -> None:\n        prev_node = node.prev\n        next_node = node.next\n        prev_node.next = next_node\n        next_node.prev = prev_node\n\n    def _add_to_front(self, node: ListNode) -> None:\n        node.next = self.head.next\n        node.prev = self.head\n        self.head.next.prev = node\n        self.head.next = node\n\n    def get(self, key: int) -> int:\n"
+prompt tokens (232): [232 tokens]
+seeding target_hidden from prompt (232 tokens)...
+prefill in 8.48s (27.4 tok/s)
+VRAM @ after_prefill: used 7.43 GB, free 1.15 GB
+decoding (max 256 tokens, block_size 16)...
+eos
+--- OUTPUT ---
+         if key in self.cache:
+             node = self.cache[key]
+             self._remove(node)
+             self._add_to_front(node)
+             return node.value
+         return -1
+
+     def put(self, key: int, value: int) -> None:
+         if key in self.cache:
+             node = self.cache[key]
+             node.value = value
+             self._remove(node)
+             self._add_to_front(node)
+         else:
+             if len(self.cache) == self.capacity:
+                 self._remove(self.tail.prev)
+                 del self.cache[self.tail.prev.key]
+             node = ListNode(key, value)
+             self.cache[key] = node
+             self._add_to_front(node)
+
+if __name__ == "__main__":
+    cache = LRUCache(2)
+    cache.put(1, 1)
+    cache.put(2, 2)
+    print(cache.get(1))
+    cache.put(3, 3)
+    print(cache.get(2))
+    cache.put(4, 4)
+    print(cache.get(1))
+    print(cache.get(3))
+    print(cache.get(4))<|endoftext|>
+--------------
+emitted: 257 tokens in 7.99s  (32.17 tok/s)
+cycles: 34  committed: 290  accepted: 222  τ=6.529  mean_committed=8.529
+=== BENCH METRICS ===
+prompt_tokens: 232
+prefill_secs: 8.4790
+prefill_tok_s: 27.36
+ttft_ms: 11733.14
+decode_tokens_emitted: 257
+decode_secs: 7.9900
+decode_tok_s: 32.17
+decode_tau: 6.5294
+decode_accept_rate: 0.4353
+vram_used_mb: 7104
+vram_total_mb: 8176
+=====================
+accept_rate (accepted / (cycles × (B-1))): 0.435
+histogram: [(0, 2), (1, 1), (2, 7), (3, 0), (4, 4), (5, 2), (6, 2), (7, 0), (8, 3), (9, 4), (10, 3), (11, 1), (12, 1), (13, 1), (14, 2), (15, 1), (16, 0)]
+seed-oracle: cycles=34 full_accept=1 mean_accept_len=6.529 | rej_match=0.000 tail_match=0.059 anypos_match=0.324
+DFlash tokens: [260, 413, 1328, 303, 638, 19474, 25, 198, 1734, 2357, 283, 638, 19474, 7900, 60, 198, 1734, 638, 1385, 5231, 6742, 8, 198, 1734, 638, 1385, 698, 2270, 22213, 6742, 8, 198, 1734, 460, 2357, 2733, 198, 260, 460, 471, 16, 271, 257, 687, 2113, 1153, 11, 1328, 25, 514, 11, 869, 25, 514, 8, 1411, 2168, 25, 198, 260, 413, 1328, 303, 638, 19474, 25, 198, 1734, 2357, 283, 638, 19474, 7900, 60, 198, 1734, 2357, 2733, 283, 869, 198, 1734, 638, 1385, 5231, 6742, 8, 198, 1734, 638, 1385, 698, 2270, 22213, 6742, 8, 198, 260, 745, 25, 198, 1734, 413, 2343, 1153, 19474, 8, 606, 638, 57167, 25, 198, 336, 638, 1385, 5231, 1153, 37429, 28044, 8, 198, 336, 1538, 638, 19474, 13917, 37429, 28044, 4582, 60, 198, 1734, 2357, 283, 19876, 4702, 11, 869, 8, 198, 1734, 638, 19474, 7900, 60, 283, 2357, 198, 1734, 638, 1385, 698, 2270, 22213, 6742, 8, 271, 331, 1259, 591, 548, 606, 12880, 3689, 548, 763, 198, 262, 6297, 283, 43072, 5287, 1714, 7, 17, 8, 198, 262, 6297, 3477, 7, 16, 11, 220, 16, 8, 198, 262, 6297, 3477, 7, 17, 11, 220, 17, 8, 198, 262, 1133, 30883, 652, 7, 16, 578, 198, 262, 6297, 3477, 7, 18, 11, 220, 18, 8, 198, 262, 1133, 30883, 652, 7, 17, 578, 198, 262, 6297, 3477, 7, 19, 11, 220, 19, 8, 198, 262, 1133, 30883, 652, 7, 16, 578, 198, 262, 1133, 30883, 652, 7, 18, 578, 198, 262, 1133, 30883, 652, 7, 19, 578, 248044]
+== gfx1010 status 0 log /tmp/hipx-pr319-forward-gfx1010-q8-max256-20260526-213903.log ==

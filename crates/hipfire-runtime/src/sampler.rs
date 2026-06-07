@@ -72,10 +72,7 @@ pub struct SamplerConfig {
     /// also clipped to the GPU `repeat_buf` capacity by the caller.
     pub repeat_window: usize,
     /// OpenAI `presence_penalty`: flat logit subtraction applied once to any
-    /// token that occurred within `repeat_window`. 0.0 = disabled. Unlike the
-    /// recency-weighted `repeat_penalty`, this is constant across the window,
-    /// so it suppresses block-level repetition loops a short recency-weighted
-    /// window cannot see (matches llama.cpp / Lemonade semantics).
+    /// token that occurred within `repeat_window`. 0.0 = disabled.
     pub presence_penalty: f32,
     /// OpenAI `frequency_penalty`: logit subtraction scaled by the token's
     /// occurrence count within `repeat_window`. 0.0 = disabled.
@@ -222,16 +219,11 @@ pub fn sample_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) -> u
     if cfg.repeat_penalty != 1.0 && cfg.repeat_window > 0 {
         llama::apply_repeat_penalty(logits, history, cfg.repeat_window, cfg.repeat_penalty);
     }
-    // OpenAI-style subtractive presence/frequency penalties over the same
-    // window (mirrors the GPU `sample_top_p` kernel). logit -= freq*count +
-    // presence, applied once per unique token. Keeps the GPU and CPU
-    // (grammar-active) decode paths consistent.
     if (cfg.presence_penalty > 0.0 || cfg.frequency_penalty > 0.0) && cfg.repeat_window > 0 {
         let start = history.len().saturating_sub(cfg.repeat_window);
-        let window = &history[start..];
-        let mut counts: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
-        for &t in window {
-            *counts.entry(t).or_insert(0.0) += 1.0;
+        let mut counts = std::collections::HashMap::<u32, f32>::new();
+        for &tok in &history[start..] {
+            *counts.entry(tok).or_insert(0.0) += 1.0;
         }
         for (tok, count) in counts {
             if (tok as usize) < logits.len() {
@@ -301,6 +293,8 @@ mod tests {
         assert_eq!(g.top_p, 1.0);
         assert_eq!(g.repeat_penalty, 1.0);
         assert_eq!(g.repeat_window, 0);
+        assert_eq!(g.presence_penalty, 0.0);
+        assert_eq!(g.frequency_penalty, 0.0);
         assert!(g.blocked_tokens.is_empty());
     }
 
@@ -311,7 +305,28 @@ mod tests {
         assert!((d.top_p - 0.95).abs() < 1e-6);
         assert!((d.repeat_penalty - 1.05).abs() < 1e-6);
         assert_eq!(d.repeat_window, 128);
+        assert_eq!(d.presence_penalty, 0.0);
+        assert_eq!(d.frequency_penalty, 0.0);
         assert!(d.blocked_tokens.is_empty());
+    }
+
+    #[test]
+    fn sample_cpu_applies_presence_and_frequency_penalties() {
+        let mut logits = vec![0.0_f32, 4.0, 3.5, 3.0];
+        let cfg = SamplerConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            repeat_penalty: 1.0,
+            repeat_window: 8,
+            presence_penalty: 1.0,
+            frequency_penalty: 0.5,
+            blocked_tokens: Vec::new(),
+        };
+        let tok = sample_cpu(&mut logits, &[1, 1, 2], &cfg);
+        assert_eq!(tok, 3);
+        assert!((logits[1] - 2.0).abs() < 1e-6);
+        assert!((logits[2] - 2.0).abs() < 1e-6);
+        assert!((logits[3] - 3.0).abs() < 1e-6);
     }
 
     #[test]

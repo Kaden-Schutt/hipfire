@@ -27,9 +27,14 @@ fn f32_to_f16_le(v: f32) -> [u8; 2] {
         let new_exp = (exp - 127 + 15) as u16;
         let m13 = mant & 0x1fff;
         let mut new_mant = (mant >> 13) as u16;
-        if m13 > 0x1000 || (m13 == 0x1000 && (new_mant & 1) != 0) { new_mant += 1; }
+        if m13 > 0x1000 || (m13 == 0x1000 && (new_mant & 1) != 0) {
+            new_mant += 1;
+        }
         let mut exp_bits = new_exp;
-        if new_mant == 0x400 { new_mant = 0; exp_bits += 1; }
+        if new_mant == 0x400 {
+            new_mant = 0;
+            exp_bits += 1;
+        }
         (sign << 15) | (exp_bits << 10) | new_mant
     };
     h.to_le_bytes()
@@ -41,9 +46,15 @@ fn f16_le_to_f32(b: [u8; 2]) -> f32 {
     let exp = ((h >> 10) & 0x1f) as i32;
     let mant = (h & 0x3ff) as u32;
     let bits = if exp == 0 {
-        if mant == 0 { sign << 31 } else {
-            let mut m = mant; let mut e = -1i32;
-            while m & 0x400 == 0 { m <<= 1; e -= 1; }
+        if mant == 0 {
+            sign << 31
+        } else {
+            let mut m = mant;
+            let mut e = -1i32;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
             (sign << 31) | (((e + 127 - 14) as u32) << 23) | ((m & 0x3ff) << 13)
         }
     } else if exp == 0x1f {
@@ -72,7 +83,9 @@ fn pack_4bit_group(qs: &[u8; 256]) -> [u8; 128] {
 /// Group layout: 32 B fp16 codebook (16 entries) + 128 B nibble-pair indices
 /// = 160 B/group.
 fn build_lloyd_matrix(
-    m: usize, k: usize, proj_id: usize,
+    m: usize,
+    k: usize,
+    proj_id: usize,
 ) -> (Vec<u8>, Vec<Vec<[f32; 16]>>, Vec<Vec<[u8; 256]>>) {
     let groups_per_row = k / 256;
     let mut all_bytes = Vec::with_capacity(m * groups_per_row * LLOYD_MQ4_GROUP_BYTES);
@@ -98,8 +111,11 @@ fn build_lloyd_matrix(
 
             let mut q = [0u8; 256];
             for i in 0..256 {
-                q[i] = ((row.wrapping_mul(31) ^ g.wrapping_mul(53) ^ i.wrapping_mul(7)
-                       ^ proj_id.wrapping_mul(101)) & 0xF) as u8;
+                q[i] = ((row.wrapping_mul(31)
+                    ^ g.wrapping_mul(53)
+                    ^ i.wrapping_mul(7)
+                    ^ proj_id.wrapping_mul(101))
+                    & 0xF) as u8;
             }
             let packed = pack_4bit_group(&q);
             all_bytes.extend_from_slice(&packed);
@@ -115,10 +131,12 @@ fn build_lloyd_matrix(
 /// CPU reference: Y[col][row] = sum_k A[row][k] * X[col][k] (no residual —
 /// fused kernels use overwrite semantics).
 fn cpu_reference(
-    m: usize, k: usize, n: usize,
+    m: usize,
+    k: usize,
+    n: usize,
     cbs: &[Vec<[f32; 16]>],
     idxs: &[Vec<[u8; 256]>],
-    x_fp32_rt: &[f32],   // already f16-roundtripped
+    x_fp32_rt: &[f32], // already f16-roundtripped
 ) -> Vec<f32> {
     let groups_per_row = k / 256;
     let mut y = vec![0.0f32; n * m];
@@ -161,34 +179,44 @@ fn diff_metrics(actual: &[f32], expected: &[f32]) -> (f32, f32) {
 
 // ---------- per-kernel runners ----------
 
-const PHASE_A_TOL: f32 = 2.24e-4;  // 3× MQ4 Phase A max-abs at K=12288.
+const PHASE_A_TOL: f32 = 2.24e-4; // 3× MQ4 Phase A max-abs at K=12288.
 
-fn test_qkvza(gpu: &mut Gpu, qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize, k: usize, n: usize) -> bool {
+fn test_qkvza(
+    gpu: &mut Gpu,
+    qkv_m: usize,
+    z_m: usize,
+    beta_m: usize,
+    alpha_m: usize,
+    k: usize,
+    n: usize,
+) -> bool {
     use rdna_compute::DType;
-    println!("--- qkvza M=({}+{}+{}+{}) K={} N={} ---", qkv_m, z_m, beta_m, alpha_m, k, n);
+    println!(
+        "--- qkvza M=({}+{}+{}+{}) K={} N={} ---",
+        qkv_m, z_m, beta_m, alpha_m, k, n
+    );
 
     let (a_qkv_b, cb_qkv, idx_qkv) = build_lloyd_matrix(qkv_m, k, 0);
-    let (a_z_b,   cb_z,   idx_z)   = build_lloyd_matrix(z_m,   k, 1);
+    let (a_z_b, cb_z, idx_z) = build_lloyd_matrix(z_m, k, 1);
     let (a_beta_b, cb_beta, idx_beta) = build_lloyd_matrix(beta_m, k, 2);
     let (a_alpha_b, cb_alpha, idx_alpha) = build_lloyd_matrix(alpha_m, k, 3);
     let (x, x_rt) = make_x(n, k);
 
     let d_a_qkv = gpu.upload_raw(&a_qkv_b, &[a_qkv_b.len()]).unwrap();
-    let d_a_z   = gpu.upload_raw(&a_z_b,   &[a_z_b.len()]).unwrap();
+    let d_a_z = gpu.upload_raw(&a_z_b, &[a_z_b.len()]).unwrap();
     let d_a_beta = gpu.upload_raw(&a_beta_b, &[a_beta_b.len()]).unwrap();
     let d_a_alpha = gpu.upload_raw(&a_alpha_b, &[a_alpha_b.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[n, k]).unwrap();
     let d_y_qkv = gpu.zeros(&[n, qkv_m], DType::F32).unwrap();
-    let d_y_z   = gpu.zeros(&[n, z_m], DType::F32).unwrap();
+    let d_y_z = gpu.zeros(&[n, z_m], DType::F32).unwrap();
     let d_y_beta = gpu.zeros(&[n, beta_m], DType::F32).unwrap();
     let d_y_alpha = gpu.zeros(&[n, alpha_m], DType::F32).unwrap();
 
     gpu.gemm_qkvza_mq4g256_lloyd_wmma(
-        &d_a_qkv, &d_a_z, &d_a_beta, &d_a_alpha,
-        &d_x,
-        &d_y_qkv, &d_y_z, &d_y_beta, &d_y_alpha,
+        &d_a_qkv, &d_a_z, &d_a_beta, &d_a_alpha, &d_x, &d_y_qkv, &d_y_z, &d_y_beta, &d_y_alpha,
         qkv_m, z_m, beta_m, alpha_m, k, n,
-    ).unwrap();
+    )
+    .unwrap();
     let y_qkv_gpu = gpu.download_f32(&d_y_qkv).unwrap();
     let y_z_gpu = gpu.download_f32(&d_y_z).unwrap();
     let y_beta_gpu = gpu.download_f32(&d_y_beta).unwrap();
@@ -206,11 +234,18 @@ fn test_qkvza(gpu: &mut Gpu, qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: u
 
     let max_abs = a_qkv_ma.max(a_z_ma).max(a_beta_ma).max(a_alpha_ma);
     let pass = max_abs < PHASE_A_TOL;
-    println!("  qkv max_abs={:.3e}  z={:.3e}  beta={:.3e}  alpha={:.3e}  {}",
-             a_qkv_ma, a_z_ma, a_beta_ma, a_alpha_ma,
-             if pass { "PASS" } else { "FAIL" });
+    println!(
+        "  qkv max_abs={:.3e}  z={:.3e}  beta={:.3e}  alpha={:.3e}  {}",
+        a_qkv_ma,
+        a_z_ma,
+        a_beta_ma,
+        a_alpha_ma,
+        if pass { "PASS" } else { "FAIL" }
+    );
 
-    for d in [d_a_qkv, d_a_z, d_a_beta, d_a_alpha, d_x, d_y_qkv, d_y_z, d_y_beta, d_y_alpha] {
+    for d in [
+        d_a_qkv, d_a_z, d_a_beta, d_a_alpha, d_x, d_y_qkv, d_y_z, d_y_beta, d_y_alpha,
+    ] {
         gpu.free_tensor(d).unwrap();
     }
     pass
@@ -234,11 +269,9 @@ fn test_qkv(gpu: &mut Gpu, q_m: usize, k_m: usize, v_m: usize, k: usize, n: usiz
     let d_y_v = gpu.zeros(&[n, v_m], DType::F32).unwrap();
 
     gpu.gemm_qkv_mq4g256_lloyd_wmma(
-        &d_a_q, &d_a_k, &d_a_v,
-        &d_x,
-        &d_y_q, &d_y_k, &d_y_v,
-        q_m, k_m, v_m, k, n,
-    ).unwrap();
+        &d_a_q, &d_a_k, &d_a_v, &d_x, &d_y_q, &d_y_k, &d_y_v, q_m, k_m, v_m, k, n,
+    )
+    .unwrap();
     let y_q_gpu = gpu.download_f32(&d_y_q).unwrap();
     let y_k_gpu = gpu.download_f32(&d_y_k).unwrap();
     let y_v_gpu = gpu.download_f32(&d_y_v).unwrap();
@@ -253,8 +286,13 @@ fn test_qkv(gpu: &mut Gpu, q_m: usize, k_m: usize, v_m: usize, k: usize, n: usiz
 
     let max_abs = a_q_ma.max(a_k_ma).max(a_v_ma);
     let pass = max_abs < PHASE_A_TOL;
-    println!("  q max_abs={:.3e}  k={:.3e}  v={:.3e}  {}",
-             a_q_ma, a_k_ma, a_v_ma, if pass { "PASS" } else { "FAIL" });
+    println!(
+        "  q max_abs={:.3e}  k={:.3e}  v={:.3e}  {}",
+        a_q_ma,
+        a_k_ma,
+        a_v_ma,
+        if pass { "PASS" } else { "FAIL" }
+    );
 
     for d in [d_a_q, d_a_k, d_a_v, d_x, d_y_q, d_y_k, d_y_v] {
         gpu.free_tensor(d).unwrap();
@@ -267,21 +305,19 @@ fn test_gate_up(gpu: &mut Gpu, gate_m: usize, up_m: usize, k: usize, n: usize) -
     println!("--- gate_up M=({}+{}) K={} N={} ---", gate_m, up_m, k, n);
 
     let (a_gate_b, cb_gate, idx_gate) = build_lloyd_matrix(gate_m, k, 0);
-    let (a_up_b,   cb_up,   idx_up)   = build_lloyd_matrix(up_m,   k, 1);
+    let (a_up_b, cb_up, idx_up) = build_lloyd_matrix(up_m, k, 1);
     let (x, x_rt) = make_x(n, k);
 
     let d_a_gate = gpu.upload_raw(&a_gate_b, &[a_gate_b.len()]).unwrap();
-    let d_a_up   = gpu.upload_raw(&a_up_b,   &[a_up_b.len()]).unwrap();
+    let d_a_up = gpu.upload_raw(&a_up_b, &[a_up_b.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[n, k]).unwrap();
     let d_y_gate = gpu.zeros(&[n, gate_m], DType::F32).unwrap();
-    let d_y_up   = gpu.zeros(&[n, up_m], DType::F32).unwrap();
+    let d_y_up = gpu.zeros(&[n, up_m], DType::F32).unwrap();
 
     gpu.gemm_gate_up_mq4g256_lloyd_wmma(
-        &d_a_gate, &d_a_up,
-        &d_x,
-        &d_y_gate, &d_y_up,
-        gate_m, up_m, k, n,
-    ).unwrap();
+        &d_a_gate, &d_a_up, &d_x, &d_y_gate, &d_y_up, gate_m, up_m, k, n,
+    )
+    .unwrap();
     let y_gate_gpu = gpu.download_f32(&d_y_gate).unwrap();
     let y_up_gpu = gpu.download_f32(&d_y_up).unwrap();
 
@@ -293,8 +329,12 @@ fn test_gate_up(gpu: &mut Gpu, gate_m: usize, up_m: usize, k: usize, n: usize) -
 
     let max_abs = a_gate_ma.max(a_up_ma);
     let pass = max_abs < PHASE_A_TOL;
-    println!("  gate max_abs={:.3e}  up={:.3e}  {}",
-             a_gate_ma, a_up_ma, if pass { "PASS" } else { "FAIL" });
+    println!(
+        "  gate max_abs={:.3e}  up={:.3e}  {}",
+        a_gate_ma,
+        a_up_ma,
+        if pass { "PASS" } else { "FAIL" }
+    );
 
     for d in [d_a_gate, d_a_up, d_x, d_y_gate, d_y_up] {
         gpu.free_tensor(d).unwrap();
@@ -309,8 +349,8 @@ fn main() {
     let mut all_pass = true;
 
     // qkvza — distinct projection sizes, one shape that straddles boundaries.
-    all_pass &= test_qkvza(&mut gpu, 64, 16, 8, 8, 1024, 16);     // total_m=96, 6 tiles
-    all_pass &= test_qkvza(&mut gpu, 256, 32, 16, 16, 4096, 64);  // larger
+    all_pass &= test_qkvza(&mut gpu, 64, 16, 8, 8, 1024, 16); // total_m=96, 6 tiles
+    all_pass &= test_qkvza(&mut gpu, 256, 32, 16, 16, 4096, 64); // larger
     all_pass &= test_qkvza(&mut gpu, 512, 64, 32, 32, 4096, 32);
 
     // qkv — Q is typically larger than K=V (GQA); test both balanced and asymmetric.

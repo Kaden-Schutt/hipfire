@@ -41,7 +41,7 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / ".dflash-reference"))
 
-from dflash.model import DFlashDraftModel, extract_context_feature, sample  # type: ignore[import-not-found]  # noqa: E402
+from dflash.model import DFlashDraftModel, extract_context_feature, sample  # noqa: E402
 
 
 def parse_args():
@@ -134,7 +134,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     from safetensors.torch import load_file
 
     print(f"[target] loading {args.target_repo}...")

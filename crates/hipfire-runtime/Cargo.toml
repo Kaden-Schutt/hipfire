@@ -40,13 +40,15 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-lfm2moe", "arch-dots-ocr", "deltanet"]
 deltanet = ["rdna-compute/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-llama = []
 arch-qwen2 = []
 arch-deepseek4 = []
+arch-minimax = []
+arch-lfm2moe = []
 arch-dots-ocr = []
 
 [dependencies]
@@ -56,9 +58,12 @@ memmap2 = "0.9"
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+csv = "1"
 base64 = "0.22"
 libc = "0.2"
 rayon = "1"
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
+hipfire-detect = { path = "../hipfire-detect" }
 # GPT-2 / cl100k pre-tokenization for encode_gpt2_bpe. Reference encoders
 # (HF tokenizers, tiktoken) chunk input via regex into ≤10-byte words/runs,
 # then BPE each chunk independently; without that step the merge PQ runs
@@ -96,8 +101,9 @@ hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
+hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
+hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
-hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
 
 # Each example below carries `required-features` listing the cargo
@@ -111,7 +117,7 @@ hipfire-atlas = { path = "../hipfire-atlas" }
 
 [[example]]
 name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr"]
+required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-lfm2moe", "arch-dots-ocr"]
 
 [[example]]
 name = "hfq_split"
@@ -124,6 +130,10 @@ required-features = []
 [[example]]
 name = "gpus_smoke"
 required-features = []
+
+[[example]]
+name = "load_transport_probe"
+required-features = ["deltanet"]
 
 [[example]]
 name = "infer_qwen35"
@@ -311,25 +321,6 @@ required-features = ["arch-qwen35", "deltanet"]
 name = "build_kld_ref"
 required-features = []
 
-# build_kld_ref_native (F2) — llama-FREE KLD ref producer; runs the hipfire
-# F32 oracle forward and writes the SAME HFKLDR format eval_hipfire consumes.
-[[example]]
-name = "build_kld_ref_native"
-required-features = ["arch-qwen35", "deltanet"]
-
-# eval_hipfire_fullvocab (F3) — FULL-VOCAB KLD of a hipfire quant vs the hipfire
-# F32 oracle (dual forward, no ref top-K approx) for parity with
-# llama-perplexity --kl-divergence full-vocab KLD.
-[[example]]
-name = "eval_hipfire_fullvocab"
-required-features = ["arch-qwen35", "deltanet"]
-
-# oracle_xcheck (F1) — dumps per-token F32-oracle logits over real tokens (true
-# fp32 KV) for cross-checking the native bf16/F32 forward against a reference.
-[[example]]
-name = "oracle_xcheck"
-required-features = ["arch-qwen35", "deltanet"]
-
 [[example]]
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
@@ -385,4 +376,14 @@ required-features = []
 [[bin]]
 name = "collect_hessian"
 path = "src/bin/collect_hessian.rs"
+required-features = []
+
+[[bin]]
+name = "hipfire-eval"
+path = "src/bin/hipfire_eval.rs"
+required-features = []
+
+[[bin]]
+name = "hipfire-host-profile"
+path = "src/bin/hipfire_host_profile.rs"
 required-features = []

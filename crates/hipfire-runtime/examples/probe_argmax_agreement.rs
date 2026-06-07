@@ -21,23 +21,34 @@
 //! Usage:
 //!   probe_argmax_agreement <small.mq4> <large.mq4> "<prompt>" [N=128]
 
+use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
-use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::path::Path;
 use std::time::Instant;
 
 fn argmax_u32(logits: &[f32]) -> u32 {
-    logits.iter().enumerate().fold((0u32, f32::NEG_INFINITY), |(b, bv), (i, &v)| {
-        if v > bv { (i as u32, v) } else { (b, bv) }
-    }).0
+    logits
+        .iter()
+        .enumerate()
+        .fold((0u32, f32::NEG_INFINITY), |(b, bv), (i, &v)| {
+            if v > bv {
+                (i as u32, v)
+            } else {
+                (b, bv)
+            }
+        })
+        .0
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: {} <small.mq4> <large.mq4> \"<prompt>\" [N=128]", args[0]);
+        eprintln!(
+            "usage: {} <small.mq4> <large.mq4> \"<prompt>\" [N=128]",
+            args[0]
+        );
         std::process::exit(1);
     }
     let small_path = &args[1];
@@ -52,37 +63,50 @@ fn main() {
     let t0 = Instant::now();
     let mut small_hfq = HfqFile::open(Path::new(small_path)).expect("small hfq");
     let small_cfg = qwen35::config_from_hfq(&small_hfq).expect("small cfg");
-    eprintln!("small: dim={} layers={} heads={} vocab={}",
-        small_cfg.dim, small_cfg.n_layers, small_cfg.n_heads, small_cfg.vocab_size);
-    let small_weights = qwen35::load_weights(&mut small_hfq, &small_cfg, &mut gpu).expect("small load");
+    eprintln!(
+        "small: dim={} layers={} heads={} vocab={}",
+        small_cfg.dim, small_cfg.n_layers, small_cfg.n_heads, small_cfg.vocab_size
+    );
+    let small_weights =
+        qwen35::load_weights(&mut small_hfq, &small_cfg, &mut gpu).expect("small load");
     eprintln!("small loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let t1 = Instant::now();
     let mut large_hfq = HfqFile::open(Path::new(large_path)).expect("large hfq");
     let large_cfg = qwen35::config_from_hfq(&large_hfq).expect("large cfg");
-    eprintln!("large: dim={} layers={} heads={} vocab={}",
-        large_cfg.dim, large_cfg.n_layers, large_cfg.n_heads, large_cfg.vocab_size);
-    assert_eq!(small_cfg.vocab_size, large_cfg.vocab_size,
-        "vocab sizes must match for argmax comparison");
-    let large_weights = qwen35::load_weights(&mut large_hfq, &large_cfg, &mut gpu).expect("large load");
+    eprintln!(
+        "large: dim={} layers={} heads={} vocab={}",
+        large_cfg.dim, large_cfg.n_layers, large_cfg.n_heads, large_cfg.vocab_size
+    );
+    assert_eq!(
+        small_cfg.vocab_size, large_cfg.vocab_size,
+        "vocab sizes must match for argmax comparison"
+    );
+    let large_weights =
+        qwen35::load_weights(&mut large_hfq, &large_cfg, &mut gpu).expect("large load");
     eprintln!("large loaded in {:.1}s", t1.elapsed().as_secs_f32());
 
-    let tokenizer = Tokenizer::from_hfq_metadata(&large_hfq.metadata_json)
-        .expect("tokenizer from large hfq");
+    let tokenizer =
+        Tokenizer::from_hfq_metadata(&large_hfq.metadata_json).expect("tokenizer from large hfq");
 
     // Build prompt tokens.
     let mut prompt_tokens = tokenizer.encode(prompt_text);
     if use_chatml {
         let im_start = tokenizer.encode("<|im_start|>");
-        let im_end   = tokenizer.encode("<|im_end|>");
-        let user     = tokenizer.encode("user");
-        let asst     = tokenizer.encode("assistant");
-        let nl       = tokenizer.encode("\n");
+        let im_end = tokenizer.encode("<|im_end|>");
+        let user = tokenizer.encode("user");
+        let asst = tokenizer.encode("assistant");
+        let nl = tokenizer.encode("\n");
         let mut chat = Vec::new();
-        chat.extend_from_slice(&im_start); chat.extend_from_slice(&user); chat.extend_from_slice(&nl);
+        chat.extend_from_slice(&im_start);
+        chat.extend_from_slice(&user);
+        chat.extend_from_slice(&nl);
         chat.extend_from_slice(&prompt_tokens);
-        chat.extend_from_slice(&im_end); chat.extend_from_slice(&nl);
-        chat.extend_from_slice(&im_start); chat.extend_from_slice(&asst); chat.extend_from_slice(&nl);
+        chat.extend_from_slice(&im_end);
+        chat.extend_from_slice(&nl);
+        chat.extend_from_slice(&im_start);
+        chat.extend_from_slice(&asst);
+        chat.extend_from_slice(&nl);
         prompt_tokens = chat;
     }
     eprintln!("prompt: {} tokens", prompt_tokens.len());
@@ -92,9 +116,26 @@ fn main() {
     let kv_mode_str = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "asym3".into());
     let mk_kv = |gpu: &mut rdna_compute::Gpu, cfg: &qwen35::Qwen35Config| -> llama::KvCache {
         match kv_mode_str.as_str() {
-            "asym3" => llama::KvCache::new_gpu_asym3(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, kv_seq).unwrap(),
-            "asym4" => llama::KvCache::new_gpu_asym4(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, kv_seq).unwrap(),
-            _       => llama::KvCache::new_gpu_q8 (gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, kv_seq).unwrap(),
+            "asym3" => llama::KvCache::new_gpu_asym3(
+                gpu,
+                cfg.n_layers,
+                cfg.n_kv_heads,
+                cfg.head_dim,
+                kv_seq,
+            )
+            .unwrap(),
+            "asym4" => llama::KvCache::new_gpu_asym4(
+                gpu,
+                cfg.n_layers,
+                cfg.n_kv_heads,
+                cfg.head_dim,
+                kv_seq,
+            )
+            .unwrap(),
+            _ => {
+                llama::KvCache::new_gpu_q8(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, kv_seq)
+                    .unwrap()
+            }
         }
     };
     let mut small_kv = mk_kv(&mut gpu, &small_cfg);
@@ -107,10 +148,28 @@ fn main() {
     // Prefill both with prompt tokens (single-token forwards).
     let t_pf = Instant::now();
     for (pos, &tok) in prompt_tokens.iter().enumerate() {
-        qwen35::forward_scratch(&mut gpu, &small_weights, &small_cfg, tok, pos,
-            &mut small_kv, &mut small_dn, &small_scratch).expect("small prefill");
-        qwen35::forward_scratch(&mut gpu, &large_weights, &large_cfg, tok, pos,
-            &mut large_kv, &mut large_dn, &large_scratch).expect("large prefill");
+        qwen35::forward_scratch(
+            &mut gpu,
+            &small_weights,
+            &small_cfg,
+            tok,
+            pos,
+            &mut small_kv,
+            &mut small_dn,
+            &small_scratch,
+        )
+        .expect("small prefill");
+        qwen35::forward_scratch(
+            &mut gpu,
+            &large_weights,
+            &large_cfg,
+            tok,
+            pos,
+            &mut large_kv,
+            &mut large_dn,
+            &large_scratch,
+        )
+        .expect("large prefill");
     }
     eprintln!("prefill: {:.2}s", t_pf.elapsed().as_secs_f32());
 
@@ -139,18 +198,38 @@ fn main() {
 
         // Teacher-force: advance both models with large_tok.
         let pos = prompt_tokens.len() + step;
-        qwen35::forward_scratch(&mut gpu, &small_weights, &small_cfg, large_tok, pos,
-            &mut small_kv, &mut small_dn, &small_scratch).expect("small fwd");
-        qwen35::forward_scratch(&mut gpu, &large_weights, &large_cfg, large_tok, pos,
-            &mut large_kv, &mut large_dn, &large_scratch).expect("large fwd");
+        qwen35::forward_scratch(
+            &mut gpu,
+            &small_weights,
+            &small_cfg,
+            large_tok,
+            pos,
+            &mut small_kv,
+            &mut small_dn,
+            &small_scratch,
+        )
+        .expect("small fwd");
+        qwen35::forward_scratch(
+            &mut gpu,
+            &large_weights,
+            &large_cfg,
+            large_tok,
+            pos,
+            &mut large_kv,
+            &mut large_dn,
+            &large_scratch,
+        )
+        .expect("large fwd");
         large_logits = gpu.download_f32(&large_scratch.logits).unwrap();
         small_logits = gpu.download_f32(&small_scratch.logits).unwrap();
 
         if step < 8 || (step % 16 == 0) {
             let lt = tokenizer.decode(&[large_tok]);
             let st = tokenizer.decode(&[small_tok]);
-            eprintln!("[{:3}] large={:>6} ({:?})  small={:>6} ({:?})  match={}",
-                step, large_tok, lt, small_tok, st, matched);
+            eprintln!(
+                "[{:3}] large={:>6} ({:?})  small={:>6} ({:?})  match={}",
+                step, large_tok, lt, small_tok, st, matched
+            );
         }
     }
 

@@ -12,9 +12,8 @@ name: CI
 # Required vs advisory: `build` and `test` are the load-bearing
 # "is it broken" gates and are intended to be required status checks on
 # master. `fmt` and `clippy` start advisory (not required) because this
-# repo predates CI and carries lint/format debt. rustfmt is enforced on
-# changed Rust files only until the historical workspace-wide churn is paid
-# down; promote the full gate after that cleanup pass.
+# repo predates CI and likely carries lint/format debt; promote them to
+# required after a cleanup pass (flip clippy to `-D warnings`).
 
 on:
   pull_request:
@@ -70,12 +69,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: bash scripts/ci-rustfmt-changed.sh
+      - run: cargo fmt --all --check
 
   clippy:
     name: clippy (advisory)

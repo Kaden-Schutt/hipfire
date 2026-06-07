@@ -13,7 +13,7 @@
 //! Compares GPU output vs CPU reference. Fails if max-abs error > 1e-3 (fp32
 //! summation reorder noise; tighter than the typical decode logits-Δ bar).
 
-use rdna_compute::{Gpu, DType};
+use rdna_compute::{DType, Gpu};
 
 /// f32 → IEEE 754 binary16 little-endian, round-to-nearest-even on the trailing
 /// 13 mantissa bits we drop. Adequate for synthetic test data; doesn't need to
@@ -92,8 +92,8 @@ fn pack_3bit_group(qs: &[u8; 256]) -> [u8; 96] {
             let q = qs[tid * 8 + i] as u32 & 7;
             pk |= q << (3 * i);
         }
-        out[tid * 3]     = (pk        & 0xff) as u8;
-        out[tid * 3 + 1] = ((pk >>  8) & 0xff) as u8;
+        out[tid * 3] = (pk & 0xff) as u8;
+        out[tid * 3 + 1] = ((pk >> 8) & 0xff) as u8;
         out[tid * 3 + 2] = ((pk >> 16) & 0xff) as u8;
     }
     out
@@ -184,7 +184,9 @@ fn run_one(gpu: &mut Gpu, groups_per_row: usize) -> (f32, f32) {
     }
 
     // x in [-0.5, 0.5)
-    let x: Vec<f32> = (0..k).map(|i| ((i as i32 % 13) as f32 - 6.0) * 0.05).collect();
+    let x: Vec<f32> = (0..k)
+        .map(|i| ((i as i32 % 13) as f32 - 6.0) * 0.05)
+        .collect();
 
     // Concatenate rows into one buffer.
     let mut a_flat: Vec<u8> = Vec::with_capacity(m * groups_per_row * 112);
@@ -200,7 +202,14 @@ fn run_one(gpu: &mut Gpu, groups_per_row: usize) -> (f32, f32) {
     gpu.gemv_mq3g256_lloyd(&d_a, &d_x, &d_y, m, k).unwrap();
     let y_gpu = gpu.download_f32(&d_y).unwrap();
 
-    let y_ref = cpu_reference(groups_per_row, m, &a_rows, &x, &codebooks_per_row, &indices_per_row);
+    let y_ref = cpu_reference(
+        groups_per_row,
+        m,
+        &a_rows,
+        &x,
+        &codebooks_per_row,
+        &indices_per_row,
+    );
 
     let mut max_abs = 0f32;
     let mut max_rel = 0f32;
@@ -237,7 +246,9 @@ fn main() {
             "groups_per_row={gpr} K={:5}  max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  {tag}  {g_layout}",
             gpr * 256
         );
-        if !pass { all_pass = false; }
+        if !pass {
+            all_pass = false;
+        }
     }
     if !all_pass {
         eprintln!("\nFAIL: one or more tail cases produced max_abs > 1e-3");

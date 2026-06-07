@@ -12,8 +12,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ATLAS_PATH = REPO_ROOT / "scripts" / "kernel_atlas.py"
 
 spec = importlib.util.spec_from_file_location("kernel_atlas", ATLAS_PATH)
-if spec is None or spec.loader is None:
-    raise RuntimeError(f"failed to load kernel_atlas module from {ATLAS_PATH}")
 kernel_atlas = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(kernel_atlas)
 

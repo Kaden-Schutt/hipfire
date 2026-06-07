@@ -7,25 +7,33 @@ quality). Canonical reference: `docs/plans/issue-113-quant-quality-eval.md`
 This directory holds the eval harness: slice + scripts +
 canary fixture + reference manifest + result tables.
 
-## Quick-start (download BF16 references, then run an eval)
+## Quick-start (regenerate BF16 references, then run an eval)
 
-The two BF16 reference dumps (Qwen3.5-9B and Qwen3.6-27B, ~2.5 GB
-each) live at HF Hub **dataset** repo
-[`hipfire-models/qwen-kldref`](https://huggingface.co/datasets/hipfire-models/qwen-kldref).
-The `manifest.json` in `harness/` is the SHA-pinned index. To pull
-them locally and verify SHA256 in one step:
+Current baseline refs should be generated locally as HFQM
+`.kldref.hfq` packages using Hipfire reference execution with
+`--kv-mode fp32` and FP32 DeltaNet state. Do not use downloaded legacy
+`.kldref.bin` refs for new baseline claims; those remain historical
+artifacts until regenerated or repackaged.
 
 ```bash
-# 1. From the repo root, set up the project venv (one-time).
-python3 -m venv .venv
-.venv/bin/pip install huggingface_hub
-
-# 2. Pull both refs into benchmarks/quality-baselines/refs/.
-./scripts/fetch-eval-refs.sh
+cargo run --release --features deltanet -p hipfire-runtime \
+  --example build_kld_ref_hipfire -- \
+  --model ~/.hipfire/models/qwen3.5-0.8b-bf16.hfq \
+  --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
+  --top-k 256 \
+  --output benchmarks/quality-baselines/refs/qwen3.5-0.8b-bf16.kldref.hfq \
+  --n-ctx 2048 --kv-mode fp32
 ```
 
-What the script does (read `scripts/fetch-eval-refs.sh` for the
-authoritative recipe):
+The package metadata records the source model hash, slice hash, KV mode,
+DeltaNet state precision, top-K shape, and producer command. See
+`docs/hfqm-packages.md`.
+
+### Legacy download path
+
+`scripts/fetch-eval-refs.sh` still knows how to verify and download the
+historical raw `.kldref.bin` refs from the manifest. Treat those as
+compatibility fixtures only:
 
 1. Parses `benchmarks/quality-baselines/harness/manifest.json`.
 2. For each entry under `.references`, checks
@@ -34,40 +42,6 @@ authoritative recipe):
    it via `huggingface_hub.hf_hub_download(repo_id=hf_repo,
    repo_type=hf_repo_type, filename=name)` and then verifies sha256.
 3. Returns non-zero on any SHA256 mismatch or download failure.
-
-The refs are gitignored. After `fetch-eval-refs.sh` succeeds the
-runtime examples (`eval_hipfire`, `eval_gguf`) find them at the
-paths `eval_hipfire --ref benchmarks/quality-baselines/refs/<name>`.
-The examples' internal `verify_ref_sha256` re-checks the SHA on
-each invocation, so a corrupted local ref is caught at run start.
-
-### Alternative download paths
-
-If you only want one ref (e.g. just the 9B), inline Python:
-
-```bash
-.venv/bin/python3 - <<'EOF'
-from huggingface_hub import hf_hub_download
-hf_hub_download(
-    repo_id="hipfire-models/qwen-kldref",
-    repo_type="dataset",
-    filename="qwen3.5-9b-bf16.kldref.bin",
-    local_dir="benchmarks/quality-baselines/refs/",
-)
-EOF
-```
-
-Or via the `hf` CLI (requires `pip install huggingface_hub[cli]`):
-
-```bash
-hf download --repo-type dataset hipfire-models/qwen-kldref \
-  qwen3.5-9b-bf16.kldref.bin qwen3.6-27b-bf16.kldref.bin \
-  --local-dir benchmarks/quality-baselines/refs/
-```
-
-Either way: after the download, verify against the manifest with
-`./scripts/fetch-eval-refs.sh` (re-running it idempotently is the
-intended pattern — files already present + valid SHA are skipped).
 
 ## Layout
 
@@ -83,7 +57,7 @@ benchmarks/quality-baselines/
 │   ├── README.md                # how-to-add-quant
 │   ├── manifest.json            # SHA-pinned reference index
 │   ├── kld_reduce.py            # bootstrap CI + result-table emitter (incl. PPL)
-│   ├── kldref_format.py         # HFKLDR + HFKSEQ-v2 reader/writer
+│   ├── kldref_format.py         # legacy HFKLDR + HFKSEQ-v2 reader/writer
 │   ├── tokenizer_parity.py      # Step 1.5 tokenizer-parity check
 │   └── canary.md                # 11-seq fixture (expected KLDs land after Step 5)
 ├── refs/                        # BF16 ref blobs (gitignored)
@@ -94,9 +68,26 @@ benchmarks/quality-baselines/
 
 The producer / candidate-side binaries are Rust examples in
 `crates/hipfire-runtime/examples/` — `build_kld_ref.rs`,
-`eval_hipfire.rs`, `eval_gguf.rs`, `tokenize_slice.rs`. The harness
-reaches into them via plain `cargo run --release --example <name>`
-invocations; nothing in this directory needs to know their paths.
+`build_kld_ref_hipfire.rs`, `eval_hipfire.rs`, `eval_gguf.rs`,
+`tokenize_slice.rs`. The harness reaches into them via plain
+`cargo run --release --example <name>` invocations; nothing in this
+directory needs to know their paths.
+
+`build_kld_ref.rs` is the historical cross-engine producer: it drives a
+pinned llama.cpp `llama-perplexity` BF16 GGUF and writes legacy HFKLDR.
+For first-party Hipfire references from HFQ/BF16 artifacts, use
+`build_kld_ref_hipfire.rs`, which writes a metadata-rich HFQM package
+documented in `docs/hfqm-packages.md`:
+
+```bash
+cargo run --release --features deltanet -p hipfire-runtime \
+  --example build_kld_ref_hipfire -- \
+  --model ~/.hipfire/models/qwen3.5-0.8b-bf16.hfq \
+  --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt \
+  --top-k 256 \
+  --output benchmarks/quality-baselines/refs/qwen3.5-0.8b-bf16.kldref.hfq \
+  --n-ctx 2048 --kv-mode fp32
+```
 
 ## Workflow (overview)
 

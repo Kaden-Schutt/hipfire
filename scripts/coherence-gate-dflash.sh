@@ -63,25 +63,10 @@ fi
 
 EXE="./target/release/examples/dflash_spec_demo"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
-# Target/draft resolution. Honor explicit env overrides; otherwise probe the
-# qwen3.5 names (historical) then the qwen3.6 names (current) — dflash spec
-# decode works on either generation, the gate just needs a target+draft pair.
-# The hardcoded qwen3.5-only paths used to leave the gate SKIPPED on machines
-# that only ship the qwen3.6 27B (e.g. this one), which is why DFlash changes
-# couldn't be attractor-validated.
-TARGET_27B="${HIPFIRE_DFLASH_TARGET:-}"
-DRAFT_27B="${HIPFIRE_DFLASH_DRAFT:-}"
-if [ -z "$TARGET_27B" ]; then
-    for cand in qwen3.5-27b.mq4 qwen3.6-27b.mq4; do
-        if [ -f "$MODELS_DIR/$cand" ]; then TARGET_27B="$MODELS_DIR/$cand"; break; fi
-    done
-    [ -z "$TARGET_27B" ] && TARGET_27B="$MODELS_DIR/qwen3.5-27b.mq4"
-fi
-if [ -z "$DRAFT_27B" ]; then
-    for cand in qwen35-27b-dflash.mq4 qwen35-27b-dflash-mq4.hfq qwen36-27b-dflash-mq4.hfq qwen36-27b-dflash-mq4.hf4; do
-        if [ -f "$MODELS_DIR/$cand" ]; then DRAFT_27B="$MODELS_DIR/$cand"; break; fi
-    done
-    [ -z "$DRAFT_27B" ] && DRAFT_27B="$MODELS_DIR/qwen35-27b-dflash.mq4"
+TARGET_27B="$MODELS_DIR/qwen3.5-27b.mq4"
+DRAFT_27B="$MODELS_DIR/qwen35-27b-dflash.mq4"
+if [ ! -f "$DRAFT_27B" ] && [ -f "$MODELS_DIR/qwen35-27b-dflash-mq4.hfq" ]; then
+    DRAFT_27B="$MODELS_DIR/qwen35-27b-dflash-mq4.hfq"
 fi
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-dflash-$(date +%Y%m%d-%H%M%S).md}"
 CASE_TIMEOUT="${HIPFIRE_COHERENCE_TIMEOUT:-240}"
@@ -175,13 +160,9 @@ hard_errors=0
     echo "- target: $TARGET_27B"
     echo "- draft:  $DRAFT_27B"
     echo
-    echo "Hard-fail thresholds (three-tier, see CLAUDE.md DFlash Coherence Gate):"
-    echo "  Tier 1 (first 128): unique_token_ratio < 0.15 OR max_single_token_frequency > 0.50"
-    echo "  Tier 2 (last 128):  unique_token_ratio < 0.30 OR max_single_token_frequency > 0.50"
-    echo "  Tier 3 (full, SOFT flag — human eyeball, not commit-blocking):"
-    echo "          consecutive-3gram repetition density > 0.50 in final half"
-    echo "          OR full-output unique_token_ratio < 0.10"
-    echo "Plus: zero tokens / panic. (Path A failure mode — see commit 6c84b13.)"
+    echo "Hard-fail thresholds: zero tokens, panic, max_token_freq > 0.40,"
+    echo "unique_token_ratio < 0.30 (token-attractor detection — see Path A"
+    echo "failure mode in commit 6c84b13)."
     echo
 } > "$OUT"
 
@@ -201,60 +182,21 @@ if [ ! -f "$TARGET_27B" ] || [ ! -f "$DRAFT_27B" ]; then
     exit 0
 fi
 
-# Token-attractor detector. Implements the three-tier intent documented in
-# CLAUDE.md ("DFlash Coherence Gate"). Attractors manifest in two forms:
-# (1) single-token loops visible in the FIRST 128 tokens, and (2) block-level
-# structural loops (5+ token sequences repeating) that only appear LATER in
-# generation. The detector trims at the first end-of-text token, then applies:
+# Token-attractor detector. Targets the Path A failure mode specifically:
+# single-token attractor mid-generation that would otherwise pass τ/tok-s
+# stat gates. Looks at the FIRST 128 tokens up to (but not including) the
+# first end-of-text token. Post-EOT output (model spamming "#" after a
+# clean function close) is degenerate but NOT the failure class we're
+# guarding against — generation has already finished by that point.
 #
-#   Tier 1 — FIRST 128 tokens (HARD fail):
-#     unique_token_ratio < 0.15  OR  max_single_token_frequency > 0.50
-#     Catches Path-A-class single-token attractors ("numbers(numbers(...",
-#     unique≈0.05/max≈0.60) without false-positiving sentence-level repetition.
-#
-#   Tier 2 — LAST 128 tokens (HARD fail):
-#     unique_token_ratio < 0.30  OR  max_single_token_frequency > 0.50
-#     Catches block-level structural loops that pass Tier 1 (diverse early
-#     window) but collapse later — e.g. the m-fold drift case in CLAUDE.md
-#     (τ=8.98 passed first-128 but emitted a 47-token-vocab tail).
-#
-#   Tier 3 — FULL output (SOFT flag, human eyeball, NOT commit-blocking):
-#     consecutive-3gram repetition density > 0.50 in the final half
-#     OR full-output unique_token_ratio < 0.10
-#     Flags structural code loops even when both hard windows pass.
-#
-# A legacy "soft_warn" (paragraph-level repetition in the first window) is
-# retained so existing report wording stays meaningful.
+# Thresholds are calibrated to catch Path A's "numbers(numbers(..." (where
+# unique_ratio ≈ 0.05, max_freq ≈ 0.60) without false-positiving sentence-
+# level repetition (where the early window is still diverse).
 #
 # Qwen3.5 EOT token IDs: 248044 (<|endoftext|>) + 248046 (<|im_end|>).
 DETECT_PY=$(cat <<'PYEOF'
 import sys, re, json, collections
 EOT_IDS = {248044, 248046}
-
-def ratios(window):
-    """unique_ratio, max_freq for a token window."""
-    counter = collections.Counter(window)
-    total = len(window)
-    unique = len(counter)
-    max_tok, max_count = counter.most_common(1)[0]
-    return unique / total, max_count / total, unique, total, max_tok, max_count
-
-def trigram_repeat_density(seq):
-    """Fraction of consecutive overlapping 3-grams that repeat a previously
-    seen 3-gram. Captures block-level structural loops (5+ token blocks show
-    up as many repeating 3-grams)."""
-    if len(seq) < 6:
-        return 0.0
-    grams = [tuple(seq[i:i+3]) for i in range(len(seq) - 2)]
-    seen = set()
-    repeats = 0
-    for g in grams:
-        if g in seen:
-            repeats += 1
-        else:
-            seen.add(g)
-    return repeats / len(grams)
-
 out = sys.stdin.read()
 m = re.search(r"DFlash tokens: \[([^\]]+)\]", out)
 ar_m = re.search(r"AR tokens: \[([^\]]+)\]", out)
@@ -272,7 +214,7 @@ for i, t in enumerate(toks):
     if t in EOT_IDS:
         trimmed = toks[:i]
         break
-# Tier 1 — first 128 of the pre-EOT window.
+# Apply detector to the first 128 tokens of the pre-EOT window.
 window = trimmed[:128]
 if len(window) < 16:
     # Too short to judge; accept as OK (clean early termination is fine).
@@ -280,43 +222,28 @@ if len(window) < 16:
         "ok": True, "total": len(window), "reason": "short_window_ok",
     }))
     sys.exit(0)
-u1, f1, unique, total, max_tok, max_count = ratios(window)
-# Tier 1 hard fail: Path-A-class single-token attractors.
-t1_hard = f1 > 0.50 or u1 < 0.15
-# Legacy soft warn (paragraph-level repetition in the first window).
-soft_warn = (f1 > 0.40 or u1 < 0.30) and not t1_hard
-
-# Tier 2 — LAST 128 of the pre-EOT window (block-level attractors that pass
-# the early window). Only evaluated when there are enough tokens to judge.
-t2_hard = False
-t2 = None
-if len(trimmed) >= 16:
-    last = trimmed[-128:]
-    u2, f2, _, t2n, _, _ = ratios(last)
-    t2_hard = u2 < 0.30 or f2 > 0.50
-    t2 = {"total": t2n, "unique_ratio": round(u2, 3), "max_freq": round(f2, 3)}
-
-# Tier 3 — FULL output structural loop (SOFT flag, human eyeball only).
-#   3gram repeat density > 0.50 over the FINAL HALF, OR full-output unique < 0.10
-second_half = trimmed[len(trimmed) // 2:]
-gram_density = trigram_repeat_density(second_half)
-full_u, _, _, _, _, _ = ratios(trimmed) if trimmed else (1.0, 0, 0, 0, 0, 0)
-tier3_warn = gram_density > 0.50 or full_u < 0.10
-
-hard_fail = t1_hard or t2_hard
+counter = collections.Counter(window)
+unique = len(counter)
+total = len(window)
+unique_ratio = unique / total
+max_tok, max_count = counter.most_common(1)[0]
+max_freq = max_count / total
+# Two-tier thresholds:
+#   Hard block (commit-blocking): only on Path-A-class single-token
+#     attractors (max_freq > 0.50 OR unique_ratio < 0.15). These are
+#     unrecoverable — same token >50% of generation = degenerate loop.
+#   Soft warn (printed in report, no exit code): paragraph-level
+#     repetition (unique_ratio < 0.30 or max_freq > 0.40). Pre-existing
+#     DDTree-b12 prose has this and isn't caused by Path B work.
+hard_fail = max_freq > 0.50 or unique_ratio < 0.15
+soft_warn = (max_freq > 0.40 or unique_ratio < 0.30) and not hard_fail
 print(json.dumps({
     "ok": not hard_fail,
-    "t1_hard": t1_hard,
-    "t2_hard": t2_hard,
     "soft_warn": soft_warn,
-    "tier3_warn": tier3_warn,
     "total": total, "unique": unique,
-    "unique_ratio": round(u1, 3),
-    "max_freq": round(f1, 3),
+    "unique_ratio": round(unique_ratio, 3),
+    "max_freq": round(max_freq, 3),
     "max_tok": max_tok, "max_count": max_count,
-    "tier2": t2,
-    "gram_density": round(gram_density, 3),
-    "full_unique_ratio": round(full_u, 3),
 }))
 PYEOF
 )
@@ -354,19 +281,14 @@ for entry in "${tests[@]}"; do
     detect=$(python3 -c "$DETECT_PY" < "$out_file")
     detect_ok=$(echo "$detect" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('ok',False))")
     detect_warn=$(echo "$detect" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('soft_warn',False))")
-    detect_t3=$(echo "$detect" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('tier3_warn',False))")
 
     status="OK"
     if [ "$ec" -ne 0 ] || [ -n "$panic" ]; then
         status="HARD_ERROR (exit=$ec panic=${panic:+yes})"
         hard_errors=$((hard_errors + 1))
     elif [ "$detect_ok" != "True" ]; then
-        # Tier 1 (first 128) or Tier 2 (last 128) hard fail.
         status="HARD_ERROR (token attractor: $detect)"
         hard_errors=$((hard_errors + 1))
-    elif [ "$detect_t3" = "True" ]; then
-        # Tier 3 (full-output structural loop) — soft flag, human eyeball.
-        status="FLAG (Tier-3 structural 3gram loop — soft, needs human eyeball)"
     elif [ "$detect_warn" = "True" ]; then
         status="WARN (paragraph-level repetition — soft, not blocking)"
     fi

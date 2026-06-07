@@ -52,7 +52,9 @@ fn run_shape(gpu: &mut Gpu, g: usize, m: usize, k: usize, batch: usize, label: &
         .map(|i| ((i % 23) as f32 - 11.0) / 16.0)
         .collect();
 
-    let w = gpu.upload_raw(&w_bytes, &[w_bytes.len()]).expect("upload W");
+    let w = gpu
+        .upload_raw(&w_bytes, &[w_bytes.len()])
+        .expect("upload W");
     let x = gpu.upload_f32(&x, &[batch, g, k]).expect("upload X");
     let y1 = gpu.zeros(&[batch, g, m], DType::F32).expect("alloc Y1");
     let yw = gpu.zeros(&[batch, g, m], DType::F32).expect("alloc YW");
@@ -106,14 +108,30 @@ fn run_shape(gpu: &mut Gpu, g: usize, m: usize, k: usize, batch: usize, label: &
     let one_us = t0.elapsed().as_secs_f64() * 1e6 / TRIALS as f64;
 
     for _ in 0..WARMUP {
-        gpu.wo_per_group_batched_q8_0_wmma_4w(&w, &x, &yw, g as i32, m as i32, k as i32, batch as i32)
-            .unwrap();
+        gpu.wo_per_group_batched_q8_0_wmma_4w(
+            &w,
+            &x,
+            &yw,
+            g as i32,
+            m as i32,
+            k as i32,
+            batch as i32,
+        )
+        .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
     let t0 = Instant::now();
     for _ in 0..TRIALS {
-        gpu.wo_per_group_batched_q8_0_wmma_4w(&w, &x, &yw, g as i32, m as i32, k as i32, batch as i32)
-            .unwrap();
+        gpu.wo_per_group_batched_q8_0_wmma_4w(
+            &w,
+            &x,
+            &yw,
+            g as i32,
+            m as i32,
+            k as i32,
+            batch as i32,
+        )
+        .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
     let wmma_us = t0.elapsed().as_secs_f64() * 1e6 / TRIALS as f64;

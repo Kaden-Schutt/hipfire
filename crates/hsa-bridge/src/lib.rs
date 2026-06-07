@@ -675,9 +675,9 @@ pub fn dispatch_packet_header() -> u16 {
 ///
 /// # Safety
 ///
-/// `slot` must be valid and uniquely writable for one
-/// `HsaKernelDispatchPacket`. The caller is responsible for publishing the
-/// packet header after all fields are written.
+/// `slot` must be a valid, uniquely writable pointer to an AQL dispatch
+/// packet in a queue slot owned by the caller. The caller must not publish the
+/// packet header until this function has returned.
 #[inline]
 pub unsafe fn build_dispatch_packet(
     slot: *mut HsaKernelDispatchPacket,
@@ -715,14 +715,8 @@ pub unsafe fn build_dispatch_packet(
 
 /// Atomic release-store of the header word. Must be called after the rest
 /// of the packet is filled in. Makes the packet visible to the AQL engine.
-///
-/// # Safety
-///
-/// `slot` must point to a valid AQL packet whose non-header fields are fully
-/// initialized. Publishing the header makes the packet visible to the queue's
-/// AQL engine, so callers must not mutate it after this call.
 #[inline]
-pub unsafe fn publish_dispatch_packet(slot: *mut HsaKernelDispatchPacket, header: u16) {
+pub fn publish_dispatch_packet(slot: *mut HsaKernelDispatchPacket, header: u16) {
     use std::sync::atomic::{fence, AtomicU16, Ordering};
     unsafe {
         fence(Ordering::Release);

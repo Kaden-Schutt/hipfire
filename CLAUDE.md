@@ -193,20 +193,6 @@ gfx1100 is **±1–3%** — anything bigger is a real signal, NOT
 "DPM drift". Real regressions get hand-waived by inflated noise
 claims; treat a 3%+ delta as something worth bisecting.
 
-**JIT tax is per-(config × kernel-shape), and a slowdown that
-SURVIVES a rerun is NOT JIT.** Kernels JIT-compile on first use *per
-distinct shape* (each batch size / B-value / dtype / arch path caches
-separately), so warming one cell of an A/B matrix does NOT warm the
-others — warm EACH cell, and run the whole matrix a throwaway first
-pass before measuring. The trap: seeing one cell slow on pass 1,
-calling "JIT", and moving on. The discriminator is the rerun — if the
-number snaps back toward its neighbour on pass 2 it was JIT; if it
-holds (e.g. fp32-state DFlash stuck at 33 tok/s across both passes
-while q8 went 105→151), it is a REAL kernel-perf gap (here: the
-non-tree FP32 path reusing the single-token `gated_delta_net_f32`
-instead of a batch-tiled `_batch_seq` kernel). Do not file a stable
-cross-rerun slowdown under "JIT".
-
 For cross-commit perf claims, verify across a fresh process with
 `scripts/probe_commits.sh $(git rev-parse HEAD~1) HEAD` (it handles
 warmup + multi-run aggregation correctly). The methodology doc also
@@ -339,9 +325,7 @@ now implemented in `hipfire-detect::ngram` as a soft warn.
 
 Any DDTree / spec-decode / slow-path-kill change that claims a τ or tok/s
 improvement MUST pass `scripts/coherence-gate-dflash.sh` (shipped 9883e98)
-before commit. The script's inline detector enforces all three tiers below:
-Tier 1 + Tier 2 are hard fails (non-zero exit), Tier 3 is a soft `FLAG`
-status in the report for human eyeball. Thresholds (as of 2026-04-26):
+before commit. Enhanced three-tier thresholds (as of 2026-04-26):
 
 **Tier 1 — First 128 tokens (hard fail, catches single-token attractors):**
 - `unique_token_ratio < 0.15` OR `max_single_token_frequency > 0.50`
@@ -414,8 +398,8 @@ identically.
 correctness cost. Opt out with `HIPFIRE_NORMALIZE_PROMPT=0` (or
 `prompt_normalize=false` in config) only when raw `\n{3,}` whitespace is
 semantically load-bearing. See:
-- `crates/hipfire-runtime/src/tokenizer.rs:maybe_normalize_prompt()` — engine impl
-- `crates/hipfire-runtime/examples/encode_prompt.rs` — verification utility
+- `crates/engine/src/tokenizer.rs:maybe_normalize_prompt()` — engine impl
+- `crates/engine/examples/encode_prompt.rs` — verification utility
 - commit 9a2c667 — root cause + bench data behind the default flip
 
 **Canonical bench config (post-2026-04-26) for 27B-3.5 LRU code DFlash:**
@@ -433,16 +417,15 @@ only. Drift >5% from the current q8/max256 baseline is a regression
 ## GPU Lock Protocol (Multi-Agent)
 
 When multiple Claude Code agents work in parallel (e.g. via worktrees), they coordinate
-GPU access through `scripts/gpu-lock.sh`. **Coordination is currently MANUAL** — there is
-no committed hook that auto-acquires the lock. (`.claude/settings.json` is not tracked in
-the repo; if you want `cargo` commands to auto-acquire/release, wire a PreToolUse/PostToolUse
-hook in your own local `.claude/settings.json` that sources `scripts/gpu-lock.sh`.)
+GPU access through `gpu-lock.sh`. **This is enforced automatically via hooks in
+`.claude/settings.json`** — any `cargo` command triggers lock acquire before execution
+and release after completion.
 
 - Lock file: `/tmp/hipfire-gpu.lock`
 - Contains a human-readable status like `model-ingestion agent is using the gpu`
 - Agents poll every 5s (configurable via `GPU_POLL_INTERVAL`) when the GPU is busy
-- Manual usage: `source scripts/gpu-lock.sh && gpu_acquire "<branch>" && gpu_release`
-- Check status: `source scripts/gpu-lock.sh && gpu_status`
+- Manual usage: `source gpu-lock.sh && gpu_acquire "<branch>" && gpu_release`
+- Check status: `source gpu-lock.sh && gpu_status`
 
 ## Rules
 

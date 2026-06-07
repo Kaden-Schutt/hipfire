@@ -103,7 +103,9 @@ fn parse_args() -> Args {
                 i += 2;
             }
             "--n-ctx" => {
-                n_ctx = argv[i + 1].parse().expect("--n-ctx must be a positive integer");
+                n_ctx = argv[i + 1]
+                    .parse()
+                    .expect("--n-ctx must be a positive integer");
                 i += 2;
             }
             "--n-sequences" => {

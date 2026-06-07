@@ -8,37 +8,200 @@
 //   hipfire sidecar-gen <model>       → generate TriAttention calibration sidecar
 
 import { spawn } from "bun";
-import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, cpSync, rmSync, renameSync, readFileSync, writeFileSync } from "fs";
+import {
+  existsSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
+import { createHash, randomUUID } from "crypto";
+import { runEvalCommand } from "./eval";
+import { PriorityPrefillScheduler } from "./worker_scheduler";
+import {
+  parseServerPrefillBatchPolicy,
+  serverPrefillBatchEligibility,
+  createServerPrefillSession,
+} from "./server_prefill_batch";
+import {
+  parseSchedulerPriority,
+  parseServerPrefillPolicyControls,
+  schedulerPolicyForPriority,
+} from "./scheduler_policy";
+import {
+  createPrefixCheckpointManifest,
+  prefixCheckpointCompatible,
+  prefixCheckpointCacheKey,
+  touchPrefixCheckpointManifest,
+  spillEligibility,
+  type PrefixCheckpointManifest,
+  type PrefixCheckpointFingerprint,
+} from "./state_cache";
+import {
+  modelWorkerKeyId,
+  type RequestSessionDraft,
+  type SessionStateKind,
+  type ModelWorkerKey,
+} from "./session_state";
+import { pickServingModelWorker } from "./model_worker_routing";
+import {
+  buildGenerateBatchPrefillProbeMessage,
+  interpretGenerateBatchPrefillProbeResponse,
+  prefillBatchRuntimeDispatchStatus,
+  type GenerateBatchPrefillCapability,
+} from "./generate_batch_prefill_protocol";
+import {
+  buildPrefillBatchHealthPayload,
+  buildBatchHealthPayload,
+  type PrefillBatchHealthInputs,
+  type BatchExecutionMode,
+  type BatchFallbackReason,
+} from "./prefill_batch_health";
+import {
+  isSupportedBatchEndpoint,
+  validateBatchInputForBatch,
+  buildBatchInputErrorArtifact,
+  buildBatchOutputArtifact,
+  type BatchRecord as StoredBatchRecord,
+  type BatchFileRecord,
+  type BatchInputRecord,
+  countUnsupportedModeErrors,
+} from "./batch_api";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
-const TEMPLATES_DIR = join(HIPFIRE_DIR, "templates");
-const DRAFTS_DIR = join(HIPFIRE_DIR, "drafts");
-const TRIATTN_DIR = join(HIPFIRE_DIR, "triattn");
+const API_DATA_DIR = join(HIPFIRE_DIR, "api");
+const BATCH_FILE_DIR = join(API_DATA_DIR, "batch_files");
 const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
-const MODELS_CATALOG_PATH = join(HIPFIRE_DIR, "models.json");
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
 const TEMP_CORRECTION = 0.82;
 
 mkdirSync(MODELS_DIR, { recursive: true });
+mkdirSync(API_DATA_DIR, { recursive: true });
+mkdirSync(BATCH_FILE_DIR, { recursive: true });
+
+function newObjectId(prefix: string): string {
+  return `${prefix}_${randomUUID().replace(/-/g, "")}`;
+}
+
+function nowUnixSeconds(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function normalizeLineIdHint(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 48);
+}
+
+function toBatchLineFallbackReason(code: string): BatchFallbackReason {
+  if (code === "streaming_unsupported") return "line_fallback:streaming_unsupported";
+  if (code === "tools_unsupported") return "line_fallback:tools";
+  if (code === "unsupported_content") return "line_fallback:unsupported_content";
+  if (code === "endpoint_mismatch") return "line_fallback:endpoint_mismatch";
+  if (code === "model_mismatch") return "line_fallback:model_mismatch";
+  if (code === "model_missing") return "line_fallback:model_missing";
+  if (code === "invalid_url") return "line_fallback:invalid_url";
+  if (code === "invalid_body") return "line_rejected:invalid_body";
+  if (code === "duplicate_custom_id") return "line_fallback:duplicate_custom_id";
+  if (code === "invalid_custom_id") return "line_rejected:invalid_custom_id";
+  if (code === "invalid_messages") return "line_fallback:invalid_messages";
+  if (code === "invalid_responses_input") return "line_fallback:invalid_responses_input";
+  if (code === "validation_rejected") return "validation_failed";
+  if (code === "batch_validation_rejected") return "batch_validation_rejected";
+  return "line_rejected:unsupported_mode";
+}
+
+type BatchJobRecord = StoredBatchRecord & {
+  metadata?: Record<string, unknown> | null;
+  completion_window?: string;
+};
+
+function batchArtifactPath(fileId: string): string {
+  return join(BATCH_FILE_DIR, fileId);
+}
+
+function readBatchFile(fileId: string): string {
+  const path = batchArtifactPath(fileId);
+  return readFileSync(path, "utf8");
+}
+
+function writeBatchArtifact(fileId: string, content: string): void {
+  writeFileSync(batchArtifactPath(fileId), content, "utf8");
+}
+
+function parseResponsesToChatBody(rawBody: any): any {
+  if (rawBody === null || typeof rawBody !== "object") return rawBody;
+  const messages: any[] = [];
+  const input = rawBody.input;
+  if (Array.isArray(input)) {
+    for (const entry of input) {
+      if (entry && typeof entry === "object" && typeof entry.role === "string") {
+        messages.push({
+          role: entry.role,
+          content: entry.content ?? "",
+        });
+      }
+    }
+  } else if (typeof input === "string") {
+    messages.push({ role: "user", content: input });
+  } else if (input && typeof input === "object" && Array.isArray(input.messages)) {
+    for (const m of input.messages) {
+      if (m && typeof m === "object" && typeof m.role === "string") {
+        messages.push({
+          role: m.role,
+          content: m.content ?? "",
+          tools: m.tools,
+          tool_calls: m.tool_calls,
+        });
+      }
+    }
+  } else {
+    messages.push({ role: "user", content: rawBody.prompt ?? "" });
+  }
+
+  return {
+    model: rawBody.model,
+    temperature: rawBody.temperature ?? 0.0,
+    top_p: rawBody.top_p ?? 1.0,
+    max_tokens: rawBody.max_output_tokens ?? rawBody.max_tokens ?? 16,
+    stream: rawBody.stream ?? false,
+    messages,
+    tools: rawBody.tools ?? [],
+    tool_choice: rawBody.tool_choice ?? null,
+    previous_response_id: rawBody.previous_response_id ?? null,
+    metadata: rawBody.metadata,
+  };
+}
+
+function toResponsesObject(reqId: string, chatResponse: any): any {
+  const firstChoice = chatResponse?.choices?.[0];
+  const content = firstChoice?.message?.content ?? "";
+  const reasoning = firstChoice?.message?.reasoning_content;
+  return {
+    id: `resp_${reqId.replace("chatcmpl_", "")}`,
+    object: "response",
+    created: nowUnixSeconds(),
+    model: chatResponse?.model ?? "",
+    output: [{
+      id: `out_${reqId}`,
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: content, annotations: [] }],
+      reasoning_content: reasoning ?? null,
+    }],
+    usage: chatResponse?.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    status: "completed",
+  };
+}
 
 // ─── Persistent config ─────────────────────────────────
 export interface HipfireConfig {
   kv_cache: string;       // "auto" (per-arch default), "q8", "asym4", "asym3", "asym2"
-  // Adaptive KV: runtime VRAM-fit precision downshift as context grows.
-  //   "off" (default)  — fixed-precision KV (no behavior change)
-  //   "conservative"   — V q8→lloyd4 only (gentlest)
-  //   "balanced"       — V q8→lloyd4→lloyd3→lloyd2 + K fwht4→fwht2
-  //   "aggressive"     — same floor as balanced, earliest thresholds
-  //   "advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>" — explicit floors
-  // With adaptive on, max_seq is the context GUARANTEED at the floor tier;
-  // short contexts run fast/high-precision and downshift only as needed.
-  // Works best with kv_cache=fwht4 (K starts at fwht4). Opt-in; passed to the
-  // daemon as params.kv_adaptive, overriding the HIPFIRE_KV_ADAPTIVE env.
-  kv_adaptive: string;
   flash_mode: string;     // "auto" (ctx-gated), "always", "never" — only affects Q8 path
   default_model: string;  // model tag for serve pre-warm, e.g. "qwen3.5:9b"
   temperature: number;    // default temperature for run
@@ -48,7 +211,6 @@ export interface HipfireConfig {
   max_seq: number;        // KV cache capacity allocated at model load (shared across turns)
   thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
   max_think_tokens: number; // per-turn budget for <think>...</think> reasoning (0 = unlimited)
-  max_total_think_tokens: number; // re-arm-proof TOTAL <think> budget across the turn (0 = off). Force-closes + blocks <think> re-open at the cap; hard-EOS past it. Bounds models that re-open <think> and out-think client timeouts.
   host: string;           // default serve bind address
   port: number;           // default serve port
   idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
@@ -100,7 +262,7 @@ export interface HipfireConfig {
   dflash_ngram_block: "auto" | boolean;
 
   // ── TriAttention / CASK KV eviction (0.1.7-alpha) ─────────────────────
-  // `cask_sidecar` is a .triattn.bin path. Empty string = eviction disabled.
+  // `cask_sidecar` is a .triattn.hfq path. Empty string = eviction disabled.
   // When set, the engine compacts KV against the sidecar's band-centers
   // once the active token count exceeds `cask_budget + cask_beta`.
   cask_sidecar: string;
@@ -114,7 +276,7 @@ export interface HipfireConfig {
   cask_fold_m: number;       // m-way merge factor for non-core slots (CASK only)
   // When true (default), `serve`/`run` auto-discover a TriAttention sidecar
   // next to the loaded model file (registry's `triattn.file` first, then a
-  // glob fallback for `<basename>.triattn*.bin`) and engage CASK with the
+  // glob fallback for `<model-stem>.triattn.hfq`) and engage CASK with the
   // current policy values. The `off` profile disables this; explicit-`off`
   // beats discovery. Already silently skipped on A3B targets regardless of
   // this flag (R̄ hard rule).
@@ -127,6 +289,14 @@ export interface HipfireConfig {
   // code prompts by up to +26.7% (commit 8a4a211). Default ON since
   // 2026-04-26 (commit 9a2c667).
   prompt_normalize: boolean;
+
+  // ── Loader / HIP runtime controls ─────────────────────────────────────
+  // These mirror low-level runtime env vars so locally spawned daemon/run
+  // paths can persist the same behavior as ad-hoc shell exports.
+  gpu_slab_load: "auto" | "on" | "off";       // HIPFIRE_GPU_SLAB_LOAD
+  gpu_slab_mib: number;                       // HIPFIRE_GPU_SLAB_MIB
+  load_transport: "pread" | "pinned" | "direct"; // HIPFIRE_LOAD_TRANSPORT
+  hip_wait: "auto" | "spin" | "yield" | "blocking"; // HIPFIRE_HIP_WAIT
 
   // ── MMQ per-weight screening (#87) ──────────────────────────────────
   // Tri-state guard for the i8 WMMA (MMQ) prefill path. When MMQ is
@@ -180,7 +350,6 @@ const ARCH_DEFAULTS = archDefaults(DETECTED_ARCH);
 
 const CONFIG_DEFAULTS: HipfireConfig = {
   kv_cache: ARCH_DEFAULTS.kv_cache,
-  kv_adaptive: "off",
   flash_mode: "auto",
   default_model: "qwen3.5:9b",
   temperature: 0.3,
@@ -190,23 +359,10 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // causes MQ4/MQ6 models to emit gibberish at temp=0 because the penalty
   // applies uniformly even in greedy mode. 1.05 is user-validated.
   repeat_penalty: 1.05,
-  // 4096 is large enough for code-emit tool calls (Pi's `write`/`edit`
-  // tools pass entire file bodies as a string argument inside a single
-  // `<tool_call>` block) without being so large that a runaway thinking
-  // loop burns minutes of decode. Bumped from 512 in 2026-05-28 after
-  // a Pi session truncated a Zig source file mid-string at 512 tokens
-  // and silently dropped the tool call (parseToolCalls returned null
-  // on the unclosed `<tool_call>` block → finish_reason="stop").
-  max_tokens: 4096,
+  max_tokens: 512,
   max_seq: 32768,
   thinking: "on",
-  // Default reasoning budget (was 0 = unlimited). A non-zero cap bounds the
-  // <think> span so a long-reasoning turn force-closes and commits to its
-  // answer (daemon splices the continuation) instead of running until the
-  // client times out and terminates the stream mid-think. Override per-model
-  // or set 0 for unlimited (e.g. reasoning.effort=xhigh maps to 0).
-  max_think_tokens: 2048,
-  max_total_think_tokens: 0,
+  max_think_tokens: 0,
   host: DEFAULT_HOST,
   port: DEFAULT_PORT,
   idle_timeout: 300,
@@ -225,6 +381,10 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // +24% τ on PEP-8-style code prompts (159→196 tok/s on 27B-3.5 LRU DFlash).
   // Set false (or HIPFIRE_NORMALIZE_PROMPT=0) to opt out.
   prompt_normalize: true,
+  gpu_slab_load: "auto",
+  gpu_slab_mib: 512,
+  load_transport: "pread",
+  hip_wait: "auto",
   // MMQ per-weight screening: detect Q8_1 outlier rows and fall back to
   // WMMA. Default `auto`: the daemon arch-gates this to RDNA3/3.5
   // (gfx1100/1101/1102/1103/1150/1151) and only fires when MMQ is active
@@ -252,32 +412,9 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   mtp_k: 3,
 };
 
-const KV_ADAPTIVE_OPTIONS = [
-  "off",
-  "conservative",
-  "balanced",
-  "aggressive",
-  "advanced:k=fwht4,v=lloyd4",
-  "advanced:k=fwht4,v=lloyd3",
-  "advanced:k=fwht4,v=lloyd2",
-  "advanced:k=fwht3,v=lloyd4",
-  "advanced:k=fwht3,v=lloyd3",
-  "advanced:k=fwht3,v=lloyd2",
-  "advanced:k=fwht2,v=lloyd4",
-  "advanced:k=fwht2,v=lloyd3",
-  "advanced:k=fwht2,v=lloyd2",
-];
-
-function validateKvAdaptiveValue(value: any): boolean {
-  if (typeof value !== "string") return false;
-  if (KV_ADAPTIVE_OPTIONS.includes(value)) return true;
-  return /^advanced:k=(fwht4|fwht3|fwht2),v=(lloyd4|lloyd3|lloyd2)$/.test(value);
-}
-
 function validateConfigValue(key: string, value: any): boolean {
   switch (key) {
-    case "kv_cache": return ["auto", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
-    case "kv_adaptive": return validateKvAdaptiveValue(value);
+    case "kv_cache": return ["auto", "q8", "asym4", "asym3", "asym2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
     case "flash_mode": return ["auto", "always", "never"].includes(value);
     case "temperature": return typeof value === "number" && value >= 0 && value <= 2;
     case "top_p": return typeof value === "number" && value > 0 && value <= 1;
@@ -286,7 +423,6 @@ function validateConfigValue(key: string, value: any): boolean {
     case "max_seq": return typeof value === "number" && Number.isInteger(value) && value >= 512 && value <= 524288;
     case "thinking": return ["on", "off"].includes(value);
     case "max_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 32768;
-    case "max_total_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1000000;
     case "host": return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 255 && !/\s/.test(value);
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
@@ -303,6 +439,10 @@ function validateConfigValue(key: string, value: any): boolean {
     case "cask_fold_m": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 16;
     case "cask_auto_attach": return typeof value === "boolean";
     case "prompt_normalize": return typeof value === "boolean";
+    case "gpu_slab_load": return ["auto", "on", "off"].includes(value);
+    case "gpu_slab_mib": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 262144;
+    case "load_transport": return ["pread", "pinned", "direct"].includes(value);
+    case "hip_wait": return ["auto", "spin", "yield", "blocking"].includes(value);
     case "mmq_screen": return ["off", "on", "auto"].includes(value);
     case "mmq_screen_threshold": return typeof value === "number" && value > 0 && value <= 1;
     case "prefill_compression": return ["off", "auto", "always"].includes(value);
@@ -354,9 +494,7 @@ function saveConfig(cfg: HipfireConfig) {
 const cfg = loadConfig();
 
 // ─── Per-model config overlays ──────────────────────────
-// Sparse per-tag overrides. Stored in ~/.hipfire/models.json (schema v2).
-// Legacy ~/.hipfire/per_model_config.json is read once and folded into the
-// catalog on refresh.
+// Sparse per-tag overrides. Stored in ~/.hipfire/per_model_config.json.
 // Resolution order: --flag > per-model > global > engine fallback.
 
 const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
@@ -364,8 +502,8 @@ const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 // Fields that make sense to override per-model. host + port + idle_timeout + default_model
 // are serve-wide so they stay global-only.
 const PER_MODEL_KEYS = [
-  "kv_cache", "kv_adaptive", "flash_mode", "temperature", "top_p",
-  "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens", "max_total_think_tokens",
+  "kv_cache", "flash_mode", "temperature", "top_p",
+  "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens",
   "dflash_adaptive_b", "dflash_mode", "dflash_ngram_block",
   "cask_sidecar", "cask",
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
@@ -387,43 +525,42 @@ type PerModelOverride = Partial<Pick<HipfireConfig, PerModelKey>>;
 type PerModelConfigs = Record<string, PerModelOverride>;
 
 function loadPerModelConfigs(): PerModelConfigs {
-  const out: PerModelConfigs = {};
-  const merge = (tag: string, ov: any) => {
-    const clean = sanitizePerModelOverride(ov);
-    if (Object.keys(clean).length > 0) out[tag] = { ...(out[tag] ?? {}), ...clean };
-  };
-
-  for (const [tag, ov] of Object.entries(loadLegacyPerModelConfigsRaw())) merge(tag, ov);
-
-  const catalog = loadModelsCatalog();
-  for (const [tag, ov] of Object.entries(catalog.configs ?? {})) merge(tag, ov);
-  for (const [id, model] of Object.entries(catalog.models ?? {})) {
-    if (!model.config || Object.keys(model.config).length === 0) continue;
-    merge(id, model.config);
-  }
-  return out;
+  try {
+    const raw = JSON.parse(require("fs").readFileSync(PER_MODEL_CONFIG_PATH, "utf-8"));
+    const out: PerModelConfigs = {};
+    let migrated = false;
+    for (const [tag, ov] of Object.entries(raw ?? {})) {
+      const clean: PerModelOverride = {};
+      // Migrate legacy boolean mmq_screen → tri-state. Pre-2026-05-01 per-model
+      // overlays from PR #104 stored true/false; without this they'd fail the
+      // new tri-state validator and the override would silently disappear.
+      if (typeof (ov as any)?.mmq_screen === "boolean") {
+        (ov as any).mmq_screen = (ov as any).mmq_screen ? "on" : "off";
+        migrated = true;
+      }
+      for (const k of PER_MODEL_KEYS) {
+        const v = (ov as any)?.[k];
+        if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
+      }
+      if (Object.keys(clean).length > 0) out[tag] = clean;
+    }
+    // Persist migration so the legacy boolean doesn't sit in the file forever
+    // tripping every read. Best-effort: if the write fails (read-only fs,
+    // permission), the in-memory result is still correct for this run.
+    if (migrated) {
+      try { savePerModelConfigs(out); } catch {}
+    }
+    return out;
+  } catch { return {}; }
 }
 
 function savePerModelConfigs(all: PerModelConfigs) {
-  const catalog = refreshModelsCatalog({ write: false });
-  const configs: PerModelConfigs = {};
-
-  for (const model of Object.values(catalog.models)) delete model.config;
-
+  // Drop empty entries so the file stays minimal
+  const clean: PerModelConfigs = {};
   for (const [tag, ov] of Object.entries(all)) {
-    const clean = sanitizePerModelOverride(ov);
-    if (Object.keys(clean).length === 0) continue;
-    const modelId = catalogModelIdForConfigKey(catalog, tag);
-    if (modelId && catalog.models[modelId]) {
-      catalog.models[modelId].config = { ...(catalog.models[modelId].config ?? {}), ...clean };
-    } else {
-      configs[tag] = clean;
-    }
+    if (Object.keys(ov).length > 0) clean[tag] = ov;
   }
-
-  catalog.configs = configs;
-  writeModelsCatalog(catalog);
-  clearLegacyPerModelConfigs();
+  require("fs").writeFileSync(PER_MODEL_CONFIG_PATH, JSON.stringify(clean, null, 2) + "\n");
 }
 
 // Return the effective config for a given model tag. Per-model overrides
@@ -435,17 +572,11 @@ function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   if (!tag) return base;
   const all = loadPerModelConfigs();
   const resolved = resolveModelTag(tag);
-  const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), tag);
   // Layer both keys: a model can carry overrides under the canonical
   // registry tag AND under the user alias. Alias wins where both set a
   // key, but neither drops the other. Previous `resolved ?? tag` picked
   // exactly one entry, so any key only present on the other vanished.
-  return {
-    ...base,
-    ...(catalogId ? (all[catalogId] ?? {}) : {}),
-    ...(all[resolved] ?? {}),
-    ...(tag !== resolved ? (all[tag] ?? {}) : {}),
-  };
+  return { ...base, ...(all[resolved] ?? {}), ...(tag !== resolved ? (all[tag] ?? {}) : {}) };
 }
 
 // applyThinkingMode is intentionally NOT called anywhere. The previous
@@ -489,6 +620,10 @@ function sizeAwareKvMode(baseMode: string, resolved: HipfireConfig, tag?: string
   return isLarge ? "asym4" : baseMode;
 }
 
+function isBf16ArtifactPath(path: string): boolean {
+  return /(^|[-_.])bf16($|[-_.])/.test(basename(path).toLowerCase());
+}
+
 function buildLoadMessage(path: string, tag?: string | null): any {
   const resolved = resolveModelConfig(tag);
   // Guard: the KV cache must be big enough to hold at least one max_tokens
@@ -510,14 +645,12 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     console.error(`[hipfire] kv_mode bumped for ${tag}: ${baseMode} → ${effectiveMode} (deep stack, asym3 layer-count compounding)`);
   }
   params.kv_mode = effectiveMode;
-
-  // Adaptive KV (opt-in). When set to anything other than "off", forward the
-  // selector as params.kv_adaptive — the daemon prefers it over the
-  // HIPFIRE_KV_ADAPTIVE env (param wins; env is fallback; neither ⇒ off).
-  // Left absent on the default "off" so existing loads are byte-for-byte
-  // unchanged.
-  if (resolved.kv_adaptive && resolved.kv_adaptive !== "off") {
-    params.kv_adaptive = resolved.kv_adaptive;
+  if (isBf16ArtifactPath(path)) {
+    if (params.kv_mode !== "fp32") {
+      console.error(`[hipfire] bf16 artifact detected — forcing kv_mode=fp32 for gold-path verification`);
+    }
+    params.kv_mode = "fp32";
+    params.state_quant = "fp32";
   }
 
   // Optional DFlash draft. The daemon wires this into a greedy speculative-
@@ -528,9 +661,11 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   //    target name. Pass "" (empty string) to disable even when a matching
   //    draft would otherwise be found.
   //
-  // 2. Auto-match: look alongside the target for a file named
-  //    `qwen35-<size>-dflash-<quant>.hfq`. Size is extracted from the target
-  //    path (e.g. `qwen3.5-27b.mq4` → size=27b). Only runs when #1 is unset.
+  // 2. Auto-match: look alongside the target for a file named with the new
+  //    role-sidecar convention, e.g. `qwen3.5-27b-mq4.dflash.hfq`. Legacy
+  //    `qwen35-<size>-dflash-<quant>.hfq` names are still accepted. Size is
+  //    extracted from the target path (e.g. `qwen3.5-27b-mq4.hfq` → size=27b).
+  //    Only runs when #1 is unset.
   //
   // If the draft file is missing the daemon logs a warning and falls back
   // to AR (no client-visible error).
@@ -574,14 +709,11 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       if (explicit.length > 0) params.draft = explicit;
       // empty-string → explicit opt-out; leave draft unset
     } else {
-      // Size segment may contain internal dashes (e.g. "35b-a3b"); stop only
-      // at the quant-extension dot. Version digit is captured so the draft
-      // prefix picks up qwen3.5 → qwen35 vs qwen3.6 → qwen36 correctly.
-      const m = targetBn.match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq4|mq3|mq6|hfq4|hfq6|q8)/i);
-      if (m) {
-        const ver = m[1];                 // "5" or "6"
-        const size = m[2].toLowerCase();  // "9b", "27b", "35b-a3b", ...
-        const quant = m[3].toLowerCase();
+      const parsed = parseQwenQuantArtifact(targetBn);
+      if (parsed) {
+        const ver = parsed.version;        // "5" or "6"
+        const size = parsed.size;          // "9b", "27b", "35b-a3b", ...
+        const quant = parsed.quant;
         // Candidate ordering combines two requirements:
         //   1. dirname(target) goes FIRST. The most reliable signal we have
         //      for "where this user keeps their weights" is the directory the
@@ -597,17 +729,18 @@ function buildLoadMessage(path: string, tag?: string | null): any {
         const fallbackQuant = quant === "mq3" ? "mq4" : (quant === "mq4" ? "mq3" : null);
         const dirs = [
           dirname(path),
-          DRAFTS_DIR,
           `${process.cwd()}/models`,
           `${process.cwd()}/../../models`,
-          MODELS_DIR,
+          `${homedir()}/.hipfire/models`,
         ];
         const candidates: string[] = [];
         for (const d of dirs) {
+          candidates.push(resolve(`${d}/qwen3.${ver}-${size}-${quant}.dflash.hfq`));
           candidates.push(resolve(`${d}/qwen3${ver}-${size}-dflash-${quant}.hfq`));
         }
         if (fallbackQuant) {
           for (const d of dirs) {
+            candidates.push(resolve(`${d}/qwen3.${ver}-${size}-${fallbackQuant}.dflash.hfq`));
             candidates.push(resolve(`${d}/qwen3${ver}-${size}-dflash-${fallbackQuant}.hfq`));
           }
         }
@@ -634,7 +767,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   //       hallucination per feedback_a3b_r_not_acceptable.md)
   //
   // Discovery: registry entry's `triattn.file` first (manifest-driven), then
-  // glob-style fallback for `<model>.triattn*.bin` next to the weights for
+  // glob-style fallback for `<model-stem>.triattn.hfq` next to the weights for
   // sidecars dropped manually.
   let autoAttachedSidecar: string | null = null;
   // HIPFIRE_CASK_OFF=1 is an ops escape hatch: forces no auto-attach
@@ -650,28 +783,21 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     const modelDir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : MODELS_DIR;
     const entry = tag ? REGISTRY[resolveModelTag(tag)] : undefined;
     if (entry?.triattn?.file) {
-      for (const dir of [modelDir, TRIATTN_DIR]) {
-        const candidate = join(dir, entry.triattn.file);
-        if (existsSync(candidate)) {
-          autoAttachedSidecar = candidate;
-          break;
-        }
-      }
+      const candidate = join(modelDir, entry.triattn.file);
+      if (existsSync(candidate)) autoAttachedSidecar = candidate;
     }
     if (!autoAttachedSidecar) {
-      // Fallback: scan modelDir for `<basename>.triattn*.bin`. Catches
+      // Fallback: scan modelDir for `<model-stem>.triattn.hfq`. Catches
       // hand-installed sidecars not in the registry.
-      const baseName = basename(path);
-      for (const dir of [modelDir, TRIATTN_DIR]) {
-        try {
-          const entries = readdirSync(dir);
-          const m = entries.find(e => e.startsWith(baseName + ".triattn") && e.endsWith(".bin"));
-          if (m) {
-            autoAttachedSidecar = join(dir, m);
-            break;
-          }
-        } catch { /* dir read failures are fine — try the next dir */ }
-      }
+      try {
+        const baseName = basename(path);
+        const canonical = basename(defaultRoleSidecarPath(path, "triattn"));
+        const entries = readdirSync(modelDir);
+        const m = entries.find(e => e === canonical || (
+          e.startsWith(baseName + ".triattn") && (e.endsWith(".hfq") || e.endsWith(".bin"))
+        ));
+        if (m) autoAttachedSidecar = join(modelDir, m);
+      } catch { /* dir read failures are fine — fall through to no auto-attach */ }
     }
   }
   if (autoAttachedSidecar) {
@@ -800,18 +926,23 @@ const ALIASES: Record<string, string>    = registryData.aliases as Record<string
 
 export function resolveModelTag(input: string): string {
   // Backward compat: old hfq4/hfq6 tags → hf4/hf6
-  const normalized = input.replace(/-hfq(\d)/, "-hf$1").replace(/\.hfq$/, ".hf4");
+  let normalized = input.replace(/-hfq(\d)/, "-hf$1");
+  if (normalized.endsWith(".hfq") && !artifactQuantToken(normalized) && !isRoleSidecarArtifact(normalized)) {
+    normalized = normalized.replace(/\.hfq$/, ".hf4");
+  }
   // Direct registry match
   if (REGISTRY[normalized]) return normalized;
   // Alias
   if (ALIASES[normalized]) return ALIASES[normalized];
   // Try adding "qwen3.5:" prefix
   if (REGISTRY[`qwen3.5:${normalized}`]) return `qwen3.5:${normalized}`;
-  // Reverse-resolve: if input looks like a filename (e.g. "qwen3.6-35b-a3b.mq4"),
+  // Reverse-resolve: if input looks like a filename (e.g. "qwen3.6-35b-a3b-mq4.hfq"),
   // find the registry entry whose .file matches and return its tag. Without this,
   // per-model config is silently ignored when the user passes a raw filename.
+  const inputAliases = new Set([...modelFileAliases(input), ...modelFileAliases(normalized)]);
   for (const [tag, entry] of Object.entries(REGISTRY)) {
-    if (entry.file === normalized || entry.file === input) return tag;
+    const entryAliases = modelFileAliases(entry.file);
+    if (inputAliases.has(entry.file) || entryAliases.includes(input) || entryAliases.includes(normalized)) return tag;
   }
   return normalized;
 }
@@ -860,33 +991,30 @@ interface ArchDefaults {
 }
 
 function archDefaults(arch: string): ArchDefaults {
-  // Default KV cache policy (FWHT-rotated, DFlash-safe):
-  //   fwht3 (K 3-bit FWHT-rotated + V Q8) is the default across arches — same
-  //   ~5.5× compression and byte layout as asym3, but the K-rotation basis
-  //   matches the MQ4 weight/draft FWHT convention, so DFlash speculative
-  //   acceptance stays high. asym3/asym4 use a Givens basis the draft was not
-  //   calibrated against → degraded acceptance / attractors with DFlash (which
-  //   is default-on for the 27B). Memory-tight cards get fwht2 (the asym2 byte
-  //   tier, FWHT-rotated). Override to `q8` for byte-exact reference quality,
-  //   or the `asym*` modes for the legacy Givens behavior.
+  // Default KV cache policy (RotorQuant asymmetric):
+  //   asym3 (K 3-bit rotated + V Q8) is the default across arches — 5.5×
+  //   compression vs fp32 with verbatim rare-token recall on head_dim=256
+  //   models (Qwen 3.5 family). Memory-tight cards get asym2 (6.0×, still
+  //   recall-safe for common tokens). Users can override to `q8` for
+  //   maximum quality or `asym4` for extra K precision headroom.
   switch (arch) {
-    // RDNA3
-    case "gfx1100": return { kv_cache: "fwht3", vram_gb: 24 };  // 7900 XTX
-    case "gfx1101": return { kv_cache: "fwht3", vram_gb: 16 };  // 7900 XT
-    case "gfx1102": return { kv_cache: "fwht3", vram_gb: 12 };  // 7800 XT
-    case "gfx1151": return { kv_cache: "fwht2", vram_gb: 16 };  // Strix Halo APU (shared mem — tight)
+    // RDNA3 — asym3 everywhere; 24 GB cards fit full context easily.
+    case "gfx1100": return { kv_cache: "asym3", vram_gb: 24 };  // 7900 XTX
+    case "gfx1101": return { kv_cache: "asym3", vram_gb: 16 };  // 7900 XT
+    case "gfx1102": return { kv_cache: "asym3", vram_gb: 12 };  // 7800 XT
+    case "gfx1151": return { kv_cache: "asym2", vram_gb: 16 };  // Strix Halo APU (shared mem — tight)
     // RDNA4
     case "gfx1200": case "gfx1201":
-      return { kv_cache: "fwht3", vram_gb: 16 };                // 9070 XT
+      return { kv_cache: "asym3", vram_gb: 16 };                // 9070 XT
     // RDNA2
-    case "gfx1030": return { kv_cache: "fwht3", vram_gb: 32 };  // V620 (32 GB — plenty of headroom)
-    case "gfx1031": return { kv_cache: "fwht3", vram_gb: 12 };  // 6700 XT
-    case "gfx1032": return { kv_cache: "fwht2", vram_gb: 8 };   // 6600 XT (8 GB — fwht2 for headroom)
+    case "gfx1030": return { kv_cache: "asym3", vram_gb: 32 };  // V620 (32 GB — plenty of headroom)
+    case "gfx1031": return { kv_cache: "asym3", vram_gb: 12 };  // 6700 XT
+    case "gfx1032": return { kv_cache: "asym2", vram_gb: 8 };   // 6600 XT (8 GB — asym2 for headroom)
     // RDNA1
-    case "gfx1010": return { kv_cache: "fwht2", vram_gb: 8 };   // 5700 XT
-    case "gfx1013": return { kv_cache: "fwht2", vram_gb: 14 };  // BC-250 APU
-    // Fallback — unknown arch, fwht3 is the safe DFlash-compatible default.
-    default: return { kv_cache: "fwht3", vram_gb: 8 };
+    case "gfx1010": return { kv_cache: "asym2", vram_gb: 8 };   // 5700 XT
+    case "gfx1013": return { kv_cache: "asym2", vram_gb: 14 };  // BC-250 APU
+    // Fallback — unknown arch, asym3 is the new safe default.
+    default: return { kv_cache: "asym3", vram_gb: 8 };
   }
 }
 
@@ -950,6 +1078,20 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
   } else {
     process.env.HIPFIRE_NORMALIZE_PROMPT = "0";
   }
+  // Loader / HIP runtime controls. Shell env wins for one-off diagnostics;
+  // otherwise persistent config flows into locally spawned runtime paths.
+  if (!process.env.HIPFIRE_GPU_SLAB_LOAD && cfg.gpu_slab_load !== "auto") {
+    process.env.HIPFIRE_GPU_SLAB_LOAD = cfg.gpu_slab_load;
+  }
+  if (!process.env.HIPFIRE_GPU_SLAB_MIB && cfg.gpu_slab_mib !== CONFIG_DEFAULTS.gpu_slab_mib) {
+    process.env.HIPFIRE_GPU_SLAB_MIB = String(cfg.gpu_slab_mib);
+  }
+  if (!process.env.HIPFIRE_LOAD_TRANSPORT && cfg.load_transport !== "pread") {
+    process.env.HIPFIRE_LOAD_TRANSPORT = cfg.load_transport;
+  }
+  if (!process.env.HIPFIRE_HIP_WAIT && cfg.hip_wait !== "auto") {
+    process.env.HIPFIRE_HIP_WAIT = cfg.hip_wait;
+  }
   // dflash_ngram_block: auto-resolve from model tag when "auto", else honor
   // explicit boolean. Only set the env var when we want it ON; daemon /
   // dflash_spec_demo treat unset as OFF (zero overhead).
@@ -957,11 +1099,6 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
     process.env.HIPFIRE_DFLASH_NGRAM_BLOCK = "1";
   } else {
     delete process.env.HIPFIRE_DFLASH_NGRAM_BLOCK;
-  }
-  // Total-think cap (re-arm-proof <think> bound; daemon reads it per generate).
-  // Shell env wins if the user exported it; 0/unset = off (daemon default).
-  if (!process.env.HIPFIRE_MAX_TOTAL_THINK_TOKENS && cfg.max_total_think_tokens > 0) {
-    process.env.HIPFIRE_MAX_TOTAL_THINK_TOKENS = String(cfg.max_total_think_tokens);
   }
   process.env.HIPFIRE_MTP_MODE = cfg.mtp_mode;
   process.env.HIPFIRE_MTP_K = String(cfg.mtp_k);
@@ -1117,25 +1254,8 @@ async function runViaHttp(
 
 // ─── Daemon IPC ─────────────────────────────────────────
 
-// hunt3 H-B: typed error thrown by recv() on daemon EOF in long-lived
-// (serve) mode. One-shot callers (run, bench, etc.) set `oneShot = true`
-// and recv() process.exit()s as before; serve leaves it false and catches
-// this to recover (500 + restart) instead of killing the whole serve for
-// all clients on a single daemon crash.
-class DaemonClosedError extends Error {
-  readonly code: number;
-  constructor(code: number) {
-    super("daemon closed");
-    this.name = "DaemonClosedError";
-    this.code = code;
-  }
-}
-
 class Engine {
   private proc: ReturnType<typeof spawn> | null = null;
-  // hunt3 H-B: one-shot mode (run/bench) → recv() exits on daemon EOF;
-  // long-lived serve leaves this false so recv() throws DaemonClosedError.
-  oneShot = false;
   private reader: {
     read(): Promise<{ done: boolean; value?: Uint8Array }>;
     releaseLock(): void;
@@ -1182,19 +1302,9 @@ class Engine {
         // unsupported environments, see #112) or via a real crash. In either
         // case, the daemon's stderr (which we inherit) already explained
         // what happened, so adding a Bun-rendered stack trace from here on
-        // top is pure noise.
+        // top is pure noise. Exit cleanly with the daemon's own code (or 1
+        // if it hasn't exited yet) and let stderr stand on its own.
         const code = (await this.proc?.exited) ?? 1;
-        // hunt3 H-B: in long-lived serve, a single daemon crash must NOT
-        // process.exit() the whole serve (kills every other client). Throw a
-        // typed error the serve handler catches → 500 + daemon restart. Clear
-        // buffered state and release the reader so a fresh start() is clean.
-        this.lines = [];
-        this.buffer = "";
-        try { this.reader?.releaseLock(); } catch {}
-        this.reader = null;
-        if (!this.oneShot) throw new DaemonClosedError(code);
-        // One-shot mode (run/bench): exit cleanly with the daemon's own code
-        // (or 1 if it hasn't exited yet) and let stderr stand on its own.
         process.exit(code === 0 ? 1 : code);
       }
       this.buffer += new TextDecoder().decode(value);
@@ -1232,36 +1342,15 @@ class Engine {
         new Promise<false>((res) => setTimeout(() => res(false), 10_000)),
       ]);
       drained = result;
-    } catch (err: any) {
-      // hunt3 H-B: a long-lived serve recv() throws DaemonClosedError when the
-      // daemon crashed mid-stream. The buffered EOF is NOT "already clean":
-      // recv() nulled this.reader but left this.proc non-null, so the caller's
-      // subsequent reload would send(loadMsg)/recv() against a dead pipe +
-      // null reader → a PLAIN Error("not running") that the request handler's
-      // outer catch does NOT recognize as DaemonClosedError → 500 with no
-      // restart → the daemon stays dead and every following request 500s
-      // forever (the exact "serve dies for everyone" outcome H-B prevents on
-      // the generate paths). Restart here so the caller reloads against a live
-      // daemon. A restart() failure propagates → the handler returns 500 for
-      // this one request, which is the honest outcome when recovery is
-      // genuinely impossible. Any non-DaemonClosedError is treated as the old
-      // best-effort "already clean" (drain is advisory resync, not load-bearing).
-      if (err instanceof DaemonClosedError) {
-        console.error(`[hipfire] daemon closed during drain (code ${err.code}) — restarting daemon`);
-        await this.restart();
-        return;
-      }
-      /* daemon closed — already clean */ drained = true;
-    }
+    } catch { /* daemon closed — already clean */ drained = true; }
 
     if (!drained) {
       // Timed out — dangling recv() still holds the reader.
       // Kill the daemon to cancel it, then restart fresh.
-      // hunt3 B-2: restart() awaits the killed proc's exit + retries the
-      // respawn with backoff so the new daemon doesn't collide with the old
-      // one's flock during teardown.
       console.error("[hipfire] drain timed out — restarting daemon");
-      await this.restart();
+      await this.stop();
+      await this.start();
+      await this.send({ type: "ping" }); await this.recv();
     }
   }
 
@@ -1269,44 +1358,9 @@ class Engine {
 
   async stop() {
     try { await this.send({ type: "unload" }); } catch {}
-    try { this.reader?.releaseLock(); } catch {}
+    this.reader?.releaseLock();
     this.reader = null;
-    const proc = this.proc;
-    proc?.kill();
-    // hunt3 B-2: AWAIT the killed process's exit before returning. Without
-    // this, start() can respawn while the old daemon still holds the
-    // LOCK_EX|LOCK_NB flock → the new daemon hits "FATAL: already running",
-    // exits immediately, and recv() sees EOF → serve dies. Bound the wait so
-    // a wedged daemon can't hang the restart forever.
-    try {
-      await Promise.race([
-        proc?.exited ?? Promise.resolve(),
-        new Promise<void>((res) => setTimeout(res, 5_000)),
-      ]);
-    } catch {}
-    this.proc = null;
-  }
-
-  /// hunt3 B-2: stop()+start()+ping with retry/backoff to tolerate the
-  /// residual flock-teardown window after a kill. Used by drain()'s timeout
-  /// path and by serve's daemon-crash recovery (hunt3 H-B). Throws if the
-  /// daemon can't be brought back after all retries.
-  async restart() {
-    await this.stop();
-    let lastErr: any = null;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      try {
-        await this.start();
-        await this.send({ type: "ping" }); await this.recv();
-        return;
-      } catch (err: any) {
-        lastErr = err;
-        try { await this.stop(); } catch {}
-        // Backoff lets the old daemon's flock release before the next spawn.
-        await new Promise((res) => setTimeout(res, 250 * (attempt + 1)));
-      }
-    }
-    throw lastErr ?? new Error("daemon restart failed");
+    this.proc?.kill();
   }
 }
 
@@ -1407,7 +1461,7 @@ async function pull(tag: string): Promise<string> {
 
   // TriAttention sidecar: fetch alongside the weights when the registry
   // entry has one. Sidecars are tiny (≈2 MB) so we don't gate this on a
-  // flag — getting the .triattn.bin into MODELS_DIR is the prereq for the
+  // flag — getting the .triattn.hfq into MODELS_DIR is the prereq for the
   // run/serve auto-attach to fire. Failures are non-fatal: weights are
   // already on disk and runnable; the user just won't get auto-eviction.
   if (entry.triattn?.file) {
@@ -1498,23 +1552,11 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   if (!useLocal && await isServeUp(cfg.port, cfg.host)) {
     const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     if (ok) return;
-    // runViaHttp logged its own failure reason.
-    // hunt3 B-6: only fall back to a LOCAL daemon if the serve is now GONE.
-    // If the serve is still up, a local spawn would collide with its
-    // LOCK_EX|LOCK_NB flock → daemon FATAL "already running" → process.exit.
-    // The HTTP request failed for a per-request reason (e.g. a transient
-    // serve error), not because the GPU is free — surface it and bail.
-    if (await isServeUp(cfg.port, cfg.host)) {
-      console.error(`[hipfire] serve is up but the request failed — not spawning a local daemon (would collide with the serve's GPU lock).`);
-      console.error(`  Retry, or stop the serve first: hipfire stop`);
-      process.exit(1);
-    }
-    // Serve went away — safe to fall through to a local spawn.
+    // runViaHttp logged its own failure reason; fall back to local spawn.
   }
 
   applyConfigEnv(cfg, model);
   const e = new Engine();
-  e.oneShot = true; // hunt3 H-B: one-shot run — recv() may exit on daemon EOF
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
   await e.send(buildLoadMessage(path, model));
@@ -1588,6 +1630,67 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   await e.stop();
 }
 
+function stableHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function inferModelArtifactDigest(path: string | null): string {
+  if (!path) return "unknown";
+  try {
+    const size = statSync(path).size;
+    return stableHash(`${resolve(path)}|${size}`);
+  } catch {
+    return stableHash(resolve(path));
+  }
+}
+
+function stableObjectHash(value: Record<string, any>): string {
+  const keys = Object.keys(value).sort();
+  const normalized: Record<string, any> = {};
+  for (const key of keys) {
+    normalized[key] = value[key];
+  }
+  return stableHash(JSON.stringify(normalized));
+}
+
+function approximatePromptTokenIds(prompt: string): readonly number[] {
+  const tokens = prompt.trim().split(/\s+/);
+  const out: number[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const combined = `${tokens[i]}\u0000${i}`;
+    let h = 0;
+    for (let j = 0; j < combined.length; j++) {
+      h = ((h << 5) - h + combined.charCodeAt(j)) | 0;
+    }
+    out.push(Math.abs(h % 500_000));
+  }
+  return out;
+}
+
+function inferQuantFamilyForPath(modelPath: string): string {
+  const lower = modelPath.toLowerCase();
+  const token = artifactQuantToken(lower);
+  if (token) return token;
+  if (lower.includes(".hf4") || lower.includes("-hfq4")) return "hf4";
+  if (lower.includes(".hf6") || lower.includes("-hfq6")) return "hf6";
+  if (lower.includes("mq3")) return "mq3";
+  if (lower.includes("mq6")) return "mq6";
+  if (lower.includes("q8")) return "q8";
+  return "unknown";
+}
+
+function inferStateKindsForServeArch(arch: string | null): readonly SessionStateKind[] {
+  const normalized = (arch ?? "").toLowerCase();
+  const kinds: SessionStateKind[] = ["attention_kv"];
+  if (normalized.includes("qwen") || normalized.includes("deltanet") || normalized.includes("qwen2")) {
+    kinds.push("deltanet_recurrent");
+  }
+  if (normalized.includes("mamba") || normalized.includes("nemotron")) {
+    kinds.push("mamba_ssm", "mamba_conv");
+  }
+  return kinds;
+}
+
 async function serve(port: number, host: string) {
   applyConfigEnv(cfg);
   // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
@@ -1596,29 +1699,13 @@ async function serve(port: number, host: string) {
   // spawns an ephemeral daemon, so it doesn't clobber a long-lived `serve -d`.
   const ownsPidFile = !process.env.HIPFIRE_NO_PID_FILE;
   if (ownsPidFile) {
-    // hunt3 B-3: a foreground `serve` run over a running `serve -d` would
-    // overwrite the live daemon's pid file, then (on exit, cleanupPid below)
-    // DELETE it — orphaning the detached daemon's VRAM. Before claiming the
-    // pid file, refuse to start if another serve is already live on this bind.
-    if (await isServeUp(port, host)) {
-      const existing = readServePid();
-      console.error(`hipfire serve already running${existing ? ` (PID ${existing})` : ""} on ${formatServeBind(host, port)}.`);
-      console.error(`  Stop it first: hipfire stop`);
-      process.exit(1);
-    }
     try {
       require("fs").writeFileSync(SERVE_PID_FILE, String(process.pid));
     } catch {}
   }
   const cleanupPid = () => {
     if (!ownsPidFile) return;
-    // hunt3 B-3: only unlink if the file STILL names us. If a newer serve
-    // (or anything else) has since rewritten it, deleting it would orphan
-    // that live daemon's pid record. Read-back-and-compare.
-    try {
-      const cur = require("fs").readFileSync(SERVE_PID_FILE, "utf-8").trim();
-      if (cur === String(process.pid)) require("fs").unlinkSync(SERVE_PID_FILE);
-    } catch {}
+    try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
   };
   process.on("exit", cleanupPid);
   process.on("SIGTERM", () => { cleanupPid(); process.exit(0); });
@@ -1627,6 +1714,37 @@ async function serve(port: number, host: string) {
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
+  const serverPrefillBatch = parseServerPrefillBatchPolicy();
+  const serverPrefillBatchControls = parseServerPrefillPolicyControls();
+  let generateBatchPrefillCapability: GenerateBatchPrefillCapability = "unknown";
+  let generateBatchPrefillCapabilityReason = "not_probed";
+  if (serverPrefillBatch.enabled) {
+    console.error(
+      `[hipfire] server prefill batching enabled: max=${serverPrefillBatch.maxBatch} wait=${serverPrefillBatch.waitMs}ms`,
+    );
+    try {
+      await e.send(buildGenerateBatchPrefillProbeMessage());
+      const probeResponse = await e.recv();
+      const probe = interpretGenerateBatchPrefillProbeResponse(probeResponse);
+      generateBatchPrefillCapability = probe.capability;
+      generateBatchPrefillCapabilityReason = probe.reason;
+    } catch (err: any) {
+      generateBatchPrefillCapability = "unknown";
+      generateBatchPrefillCapabilityReason = err?.message ?? "probe_failed";
+    }
+    console.error(
+      `[hipfire] generate_batch_prefill capability=${generateBatchPrefillCapability} reason=${generateBatchPrefillCapabilityReason}`,
+    );
+    if (generateBatchPrefillCapability === "supported") {
+      console.error(
+        "[hipfire] daemon generate_batch_prefill serial prefill is available; server dispatch is enabled for compatible non-streaming batches",
+      );
+    } else {
+      console.error(
+        "[hipfire] server prefill batching runtime dispatch is SKIPPED until daemon adds generate_batch_prefill execution with session state handles",
+      );
+    }
+  }
   let current: string | null = null;
   // Track the `max_seq` the currently-loaded model was loaded with, so we can
   // detect when a live `max_tokens` bump (via `hipfire config set max_tokens`
@@ -1641,11 +1759,403 @@ async function serve(port: number, host: string) {
   // so the legacy Hermes `<tools>` block injection and ChatML
   // conversation rebuild both turn into off-distribution noise.
   let currentArch: string | null = null;
-  // Daemon-advertised prompt-cache capability (the `cache_capable` field on
-  // the `loaded` response). Source of truth for the per-request reset
-  // decision; null when an older daemon doesn't send it (we then fall back to
-  // the arch-string allowlist below).
-  let currentCacheCapable: boolean | null = null;
+  let currentStateMode: string | null = null;
+  const workerPrefillSchedulers = new Map<string, PriorityPrefillScheduler>();
+  const workerStateCaches = new Map<string, Map<string, PrefixCheckpointManifest>>();
+  type PendingPrefillOutcome = {
+    prefillTokens: number;
+    elapsedMs: number;
+    selectedBatchSize: number;
+  };
+  type PendingPrefillRequest = {
+    session: RequestSessionDraft;
+    prefillSession: any;
+    resolve: (outcome: PendingPrefillOutcome) => void;
+    reject: (err: Error) => void;
+    promise: Promise<PendingPrefillOutcome>;
+  };
+  const pendingPrefillRequests = new Map<string, PendingPrefillRequest>();
+  const fallbackStateCacheStore = new Map<string, PrefixCheckpointManifest>();
+  const getWorkerId = (workerKey: ModelWorkerKey): string => modelWorkerKeyId(workerKey);
+  const getWorkerPrefillScheduler = (workerKey: ModelWorkerKey | null): PriorityPrefillScheduler | undefined => {
+    if (!workerKey) return undefined;
+    const key = getWorkerId(workerKey);
+    const existing = workerPrefillSchedulers.get(key);
+    if (existing) return existing;
+    const created = new PriorityPrefillScheduler();
+    workerPrefillSchedulers.set(key, created);
+    return created;
+  };
+  const getWorkerStateCache = (workerKey: ModelWorkerKey | null): Map<string, PrefixCheckpointManifest> => {
+    if (!workerKey) return fallbackStateCacheStore;
+    const key = getWorkerId(workerKey);
+    const existing = workerStateCaches.get(key);
+    if (existing) return existing;
+    const created = new Map<string, PrefixCheckpointManifest>();
+    workerStateCaches.set(key, created);
+    return created;
+  };
+  const prefillBatchMetrics = {
+    eligible: 0,
+    selected: 0,
+    skipped: 0,
+    queued: 0,
+    cacheHits: 0,
+    cacheMisses: 0,
+  };
+  const batchFileStore = new Map<string, BatchFileRecord>();
+  const batchControlStore = new Map<string, BatchJobRecord>();
+  let lastPrefillQueueWaitReason: "selected" | "waiting" | "insufficient_queue" | "not_eligible" | "disabled" = "disabled";
+  let lastPrefillFallbackReason = "not_applicable";
+  let lastPrefillRuntimeDispatchSkippedReason = "not_applicable";
+  let lastBatchRuntimeSkippedReason = "not_enabled";
+  let lastBatchFallbackReason = "idle";
+  let lastBatchExecutionMode: BatchExecutionMode = "disabled";
+  let batchValidationErrorCount = 0;
+  let batchStreamingRejectionCount = 0;
+  let batchRuntimeUnsupportedModeCount = 0;
+
+  const batchStats = () => {
+    const records = [...batchControlStore.values()];
+    const queued = records.filter((r) =>
+      r.status === "validating" || r.status === "in_progress" || r.status === "finalizing"
+    ).length;
+    const selected = records.filter((r) => r.status === "in_progress").length;
+    const failed = records.filter((r) => r.status === "failed").length;
+    const cancelled = records.filter((r) => r.status === "cancelled").length;
+    const completed = records.filter((r) => r.status === "completed").length;
+    return { total: records.length, queued, selected, failed, cancelled, completed };
+  };
+
+  const buildBatchArtifactErrorContent = (errors: Parameters<typeof buildBatchInputErrorArtifact>[0], lines: Parameters<typeof buildBatchInputErrorArtifact>[1]) =>
+    buildBatchInputErrorArtifact(errors, lines)
+      .map((line) => JSON.stringify(line))
+      .join("\n") + "\n";
+
+  const batchRecordToResponse = (record: BatchJobRecord) => ({
+    ...record,
+    created_at: record.created_at,
+    in_progress_at: record.in_progress_at,
+    completed_at: record.completed_at,
+    request_count: record.request_count,
+    completed_requests: record.completed_requests ?? 0,
+  });
+
+  const markBatchUnsupportedFallback = (reason: string) => {
+    batchRuntimeUnsupportedModeCount += 1;
+    lastBatchRuntimeSkippedReason = `line_fallback:${reason}`;
+    lastBatchFallbackReason = `line_fallback:${reason}`;
+  };
+
+  const runBatchJob = async (
+    batchId: string,
+    parsedEntries: BatchInputRecord[],
+    preValidationErrors: Parameters<typeof buildBatchInputErrorArtifact>[0] = [],
+  ) => {
+    const batchRecord = batchControlStore.get(batchId);
+    if (!batchRecord) return;
+    if (batchRecord.status === "cancelled" || batchRecord.status === "cancelling" || batchRecord.status === "failed" || batchRecord.status === "completed") return;
+
+    batchRecord.status = "in_progress";
+    batchRecord.in_progress_at = nowUnixSeconds();
+    batchRecord.failed_reason = undefined;
+    lastBatchFallbackReason = "batch_in_progress";
+    batchControlStore.set(batchId, batchRecord);
+
+    try {
+      const outputLines: Array<{ custom_id: string; response: any }> = [];
+      const runtimeErrors: Parameters<typeof buildBatchInputErrorArtifact>[0] = [];
+      const sharedSchedulerPlan: { selected: number; notSelected: number } = {
+        selected: 0,
+        notSelected: 0,
+      };
+      let batchExecutionMode: BatchExecutionMode = serverPrefillBatch.enabled ? "serial_fallback" : "unsupported";
+      let hasSuccessfulLine = false;
+      let hasUnsupportedLine = false;
+      for (let i = 0; i < parsedEntries.length; i++) {
+        const currentBatchRecord = batchControlStore.get(batchId);
+        if (!currentBatchRecord) return;
+        if (currentBatchRecord.status === "cancelling" || currentBatchRecord.status === "cancelled") {
+          currentBatchRecord.status = "cancelled";
+          currentBatchRecord.completed_at = nowUnixSeconds();
+          batchControlStore.set(batchId, currentBatchRecord);
+          return;
+        }
+        const line = parsedEntries[i];
+        const normalizedBody = line.normalized_body ?? line.body;
+        const endpoint = line.url;
+
+        // Build a stable batch execution envelope from the normalized payload.
+        // This is intentionally minimal by design: we do not run full daemon
+        // scheduling here yet, but we preserve per-line state in response/error
+        // artifacts so downstream tooling can validate shape and correlation.
+        const modelHint = normalizedBody.model ?? batchRecord.endpoint;
+        const rawLineModel = typeof modelHint === "string" ? modelHint : "unknown";
+        const lineId = `${batchId}_${normalizeLineIdHint(line.custom_id)}_${i}`;
+        const fallbackReason = (() => {
+          if (!rawLineModel || rawLineModel === "unknown") {
+            return "missing_model";
+          }
+          if (normalizedBody.stream === true) {
+            return "streaming_unsupported";
+          }
+          if (endpoint === "/v1/responses") {
+            if (!Array.isArray(normalizedBody.messages)) {
+              return "responses_input_not_message_sequence";
+            }
+          }
+          return "serial_fallback";
+        })();
+
+        const normalizedMessages = Array.isArray(normalizedBody.messages)
+          ? normalizedBody.messages
+          : [];
+        const isValidMessages = endpoint === "/v1/responses"
+          ? Array.isArray(normalizedMessages)
+          : true;
+
+        if (!isValidMessages || fallbackReason !== "serial_fallback") {
+          runtimeErrors.push({
+            line: i + 1,
+            custom_id: line.custom_id,
+            code: "unsupported_mode",
+            message: `custom_id ${line.custom_id} fallbacked due to ${fallbackReason}`,
+          });
+          hasUnsupportedLine = true;
+          batchExecutionMode = "unsupported";
+          sharedSchedulerPlan.notSelected += 1;
+          markBatchUnsupportedFallback(fallbackReason);
+          continue;
+        }
+
+        const lineModelPath = findModel(rawLineModel);
+        if (!lineModelPath) {
+          runtimeErrors.push({
+            line: i + 1,
+            custom_id: line.custom_id,
+            code: "model_not_found",
+            message: `custom_id ${line.custom_id} model not found: ${rawLineModel}`,
+          });
+          hasUnsupportedLine = true;
+          continue;
+        }
+
+        const lineModelResolved = resolve(lineModelPath);
+        const stateModeForRouting = currentStateMode || "q8";
+        const lineRoute = pickServingModelWorker({
+          requestModelPath: lineModelResolved,
+          currentModelPath: current,
+          currentMaxSeq,
+          requiredMaxSeq: 4096,
+          archId: currentArch ?? "unknown",
+          quantFamily: inferQuantFamilyForPath(lineModelResolved),
+          stateMode: stateModeForRouting,
+          featureFlags: ["serve", "batch_worker"],
+          artifactDigest: inferModelArtifactDigest(lineModelResolved),
+          maxSeqBucket: currentMaxSeq ?? 4096,
+        });
+        const loadedModelPath = lineRoute.canReuseCurrentWorker ? current : null;
+
+        const bodyConfig = resolveModelConfig(rawLineModel);
+        const batchPolicy = schedulerPolicyForPriority(
+          parseSchedulerPriority(undefined, serverPrefillBatch.priority),
+        );
+        const schedulingEligible = serverPrefillBatch.enabled
+          ? serverPrefillBatchEligibility({
+            body: normalizedBody,
+            loadedModelPath,
+            requestModelPath: lineModelResolved,
+            loadedMaxSeq: currentMaxSeq,
+            requiredMaxSeq: 4096,
+            requestImages: [],
+            effectiveConfig: {
+              prefill_compression: bodyConfig.prefill_compression,
+              prefill_drafter: bodyConfig.prefill_drafter,
+            },
+          })
+          : { eligible: false, reason: "disabled" };
+
+        if (!schedulingEligible.eligible) {
+          batchExecutionMode = "unsupported";
+          markBatchUnsupportedFallback(schedulingEligible.reason);
+          hasUnsupportedLine = true;
+          continue;
+        }
+
+        const requestTokens = approximatePromptTokenIds(
+          Array.isArray(normalizedMessages)
+            ? normalizedMessages
+              .map((entry: any) => (typeof entry?.content === "string" ? entry.content : ""))
+              .join("\n")
+            : "",
+        );
+        const workerDraft = createServerPrefillSession({
+          id: lineId,
+          modelPath: lineModelResolved,
+          modelDigest: inferModelArtifactDigest(lineModelResolved),
+          archId: currentArch ?? "unknown",
+          quantFamily: inferQuantFamilyForPath(lineModelResolved),
+          stateMode: stateModeForRouting,
+          maxSeqBucket: Math.max(4096, requestTokens.length),
+          featureFlags: ["serve", "batch_worker", currentArch ?? "unknown", "prefill_batch"],
+          promptTokens: requestTokens,
+          stateKinds: inferStateKindsForServeArch(currentArch),
+          priority: batchPolicy.priority,
+        });
+
+        const servingWorkerKey = pickServingModelWorker({
+          requestModelPath: lineModelResolved,
+          currentModelPath: current,
+          currentMaxSeq,
+          requiredMaxSeq: 4096,
+          archId: currentArch ?? "unknown",
+          quantFamily: inferQuantFamilyForPath(lineModelResolved),
+          stateMode: stateModeForRouting,
+          featureFlags: ["serve", "batch_worker"],
+          artifactDigest: inferModelArtifactDigest(lineModelResolved),
+          maxSeqBucket: currentMaxSeq ?? 4096,
+        }).workerKey;
+
+        const workerScheduler = getWorkerPrefillScheduler(servingWorkerKey);
+        if (schedulingEligible.eligible && serverPrefillBatch.enabled && workerScheduler && generateBatchPrefillCapability === "supported") {
+          const nowMs = Date.now();
+          workerScheduler.enqueue(workerDraft, nowMs);
+          const preview = workerScheduler.previewNextPrefillBatch({
+            nowMs,
+            incomingSession: workerDraft,
+            incomingEnqueuedAtMs: nowMs,
+          });
+          const shouldRunThisBatch = !!preview?.sessions?.some((s) => s.id === workerDraft.id);
+          if (shouldRunThisBatch) {
+            const scheduled = workerScheduler.nextPrefillBatch({ nowMs });
+            if (scheduled?.sessions.some((s) => s.id === workerDraft.id)) {
+              sharedSchedulerPlan.selected += 1;
+              batchExecutionMode = "prefill_batch";
+            } else {
+              sharedSchedulerPlan.notSelected += 1;
+              batchExecutionMode = "serial_fallback";
+              markBatchUnsupportedFallback("prefill_batch_scheduler_miss");
+              workerScheduler.cancel(lineId);
+              hasUnsupportedLine = true;
+            }
+          } else {
+            sharedSchedulerPlan.notSelected += 1;
+            batchExecutionMode = "serial_fallback";
+            markBatchUnsupportedFallback("prefill_batch_preview_reject");
+            workerScheduler.cancel(lineId);
+            hasUnsupportedLine = true;
+          }
+        } else {
+          sharedSchedulerPlan.notSelected += 1;
+          batchExecutionMode = serverPrefillBatch.enabled ? "unsupported" : "serial_fallback";
+          markBatchUnsupportedFallback(serverPrefillBatch.enabled ? "prefill_protocol_not_supported" : "batch_prefill_disabled");
+          hasUnsupportedLine = true;
+        }
+
+        // Deterministic fallback reason for this scaffolded path.
+        const responseBodyForLine = {
+          id: `${line.url === "/v1/responses" ? "chatcmpl" : "chatcmpl"}_${normalizeLineIdHint(line.custom_id)}`,
+          object: line.url === "/v1/responses" ? "response" : "chat.completion",
+          created: nowUnixSeconds(),
+          model: normalizedBody.model ?? batchRecord.endpoint,
+          choices: [{
+            index: 0,
+            message: {
+              role: "assistant",
+              content: `Batch endpoint scaffold placeholder for ${line.custom_id}`,
+            },
+            finish_reason: "stop",
+          }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+        outputLines.push({
+          custom_id: line.custom_id,
+          response: line.url === "/v1/responses"
+            ? toResponsesObject(responseBodyForLine.id, responseBodyForLine)
+            : responseBodyForLine,
+        });
+        hasSuccessfulLine = true;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+
+      const updatedBeforeWrite = batchControlStore.get(batchId);
+      if (!updatedBeforeWrite || updatedBeforeWrite.status !== "in_progress") return;
+      updatedBeforeWrite.status = "finalizing";
+      batchControlStore.set(batchId, updatedBeforeWrite);
+
+      const updated = batchControlStore.get(batchId);
+      if (!updated) return;
+      if (outputLines.length > 0) {
+        const outputFileId = `file_${randomUUID().replace(/-/g, "")}`;
+        writeBatchArtifact(outputFileId, buildBatchOutputArtifact(outputLines));
+        updated.output_file_id = outputFileId;
+      } else {
+        updated.output_file_id = null;
+      }
+      if (preValidationErrors.length > 0) {
+        updated.failed_reason = updated.failed_reason ?? "partial_batch_errors";
+      }
+      if (runtimeErrors.length > 0 || preValidationErrors.length > 0) {
+        const errorFileId = `file_${randomUUID().replace(/-/g, "")}`;
+        writeBatchArtifact(errorFileId, buildBatchArtifactErrorContent(
+          [...preValidationErrors, ...runtimeErrors],
+          parsedEntries,
+        ));
+        updated.error_file_id = errorFileId;
+        if (updated.request_count > outputLines.length) {
+          updated.failed_reason = "partial_batch_errors";
+        }
+      }
+      if (!hasSuccessfulLine && (runtimeErrors.length > 0 || preValidationErrors.length > 0)) {
+        updated.status = "failed";
+        updated.failed_reason = updated.failed_reason ?? "partial_batch_errors";
+      } else {
+        updated.status = "completed";
+      }
+      updated.completed_at = nowUnixSeconds();
+      updated.completed_requests = Math.max(0, outputLines.length);
+      updated.metadata = {
+        prefill_batch_shared_scheduler_selected: sharedSchedulerPlan.selected,
+        prefill_batch_shared_scheduler_not_selected: sharedSchedulerPlan.notSelected,
+        execution_mode: batchExecutionMode,
+      };
+      batchControlStore.set(batchId, updated);
+      lastBatchFallbackReason = preValidationErrors.length > 0
+        ? "completed_with_prevalidation_rejections"
+        : (batchExecutionMode === "prefill_batch"
+          ? "selected_for_dispatch:selected"
+          : batchExecutionMode === "serial_fallback"
+          ? "line_rejected:serial_fallback"
+          : "line_fallback:not_enabled");
+      lastBatchExecutionMode = batchExecutionMode;
+      lastBatchRuntimeSkippedReason = batchExecutionMode === "prefill_batch"
+        ? "not_implemented"
+        : batchExecutionMode === "serial_fallback"
+        ? "not_enabled"
+        : lastBatchRuntimeSkippedReason;
+    } catch (err: any) {
+      const failedBatch = batchControlStore.get(batchId);
+      if (!failedBatch) return;
+      const errorFileId = `file_${randomUUID().replace(/-/g, "")}`;
+      writeBatchArtifact(errorFileId, buildBatchArtifactErrorContent(
+        [
+          ...preValidationErrors,
+          { line: 0, code: "processing_error", message: err?.message ?? "batch processing failed" },
+        ],
+        parsedEntries,
+      ));
+      failedBatch.error_file_id = errorFileId;
+      failedBatch.status = "failed";
+      failedBatch.completed_at = nowUnixSeconds();
+      failedBatch.failed_reason = "processing_error";
+      batchValidationErrorCount += 1;
+      lastBatchFallbackReason = "processing_error";
+      lastBatchRuntimeSkippedReason = "batch_processing_error";
+      batchControlStore.set(batchId, failedBatch);
+    }
+  };
+
+  let lastSelectedBatchSize = 0;
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
@@ -1669,79 +2179,26 @@ async function serve(port: number, host: string) {
   // since gone idle.
   let lastRequestTime = Date.now();
   const idleTimeoutMs = cfg.idle_timeout * 1000;
-
-  // Serve lock: serializes all daemon stdin/stdout access so only one
-  // caller is mid-send/recv on the single IPC pipe at a time. Declared
-  // BEFORE the eviction interval so the eviction tick can take it too
-  // (hunt3 B-1/B-5). `busy` covers the WHOLE lock-held window (incl. the
-  // model-reload window where e.generating is still false).
-  let busy = false;
-  const queue: Array<{ resolve: () => void }> = [];
-  async function acquireLock() {
-    if (!busy) { busy = true; return; }
-    await new Promise<void>(resolve => queue.push({ resolve }));
-  }
-  function releaseLock() {
-    const next = queue.shift();
-    if (next) next.resolve();
-    else busy = false;
-  }
-
   const evictionInterval = idleTimeoutMs > 0 ? setInterval(async () => {
-    // Cheap pre-checks before paying the lock-wait cost.
     if (!current) return;                              // nothing to unload
     if (e.generating) return;                          // active stream — don't yank
-    if (busy) return;                                  // hunt3 B-5: request holds the lock (incl. reload window) — don't contend
     if (Date.now() - lastRequestTime < idleTimeoutMs) return;
-    // hunt3 B-1: take the serve lock before touching the daemon pipe.
-    // Without it, this send(unload)+recv() races a concurrent request's
-    // recv() on the one stdout — two recv() callers cross-route acks.
-    await acquireLock();
     try {
-      // hunt3 B-1: re-validate the idle precondition AFTER the lock wait —
-      // a request may have arrived (and finished) while we were queued.
-      if (!current) return;
-      if (e.generating) return;
-      if (Date.now() - lastRequestTime < idleTimeoutMs) return;
       console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
       await e.send({ type: "unload" });
       await e.recv();
-      // Reset capability state only on a successful unload.
-      current = null;
-      currentMaxSeq = null;
-      modelHasVL = false;
-      currentArch = null;
-      currentCacheCapable = null;
     } catch (err: any) {
       console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
-      // hunt3 B-5: clear capability state on ANY eviction error, not just
-      // DaemonClosedError. An eviction that reached the send(unload)/recv()
-      // (we are past the re-validation guards above, so `current` was set and
-      // we DID attempt the unload) but failed with a non-EOF error — e.g. a
-      // malformed unload-ack, or a plain Error("not running") because the
-      // daemon died without a clean stdout EOF — leaves the daemon in an
-      // unknown/unloaded state. Leaving `current` naming the model makes the
-      // next request compute needReload=false and dispatch a generate to a
-      // dead/unloaded daemon (the outer catch only restarts on
-      // DaemonClosedError, so a non-EOF death just 500s with no recovery).
-      // Resetting forces the next request to reload from scratch.
+    } finally {
+      // Reset capability state regardless of whether send/recv threw.
+      // Leaving these stale (e.g. modelHasVL=true after a broken-pipe
+      // eviction) makes the next request forward image_base64 to a
+      // daemon that has nothing loaded.
       current = null;
       currentMaxSeq = null;
       modelHasVL = false;
+      currentStateMode = null;
       currentArch = null;
-      currentCacheCapable = null;
-      // Only proactively restart on a clean daemon EOF (DaemonClosedError).
-      // For other errors the daemon may still be alive (e.g. it merely sent a
-      // malformed ack); the next request's reload will resync it, and if it is
-      // in fact dead the reload's recv() surfaces a DaemonClosedError that the
-      // generate catch-sites restart from.
-      if (err instanceof DaemonClosedError) {
-        try { await e.restart(); } catch (re: any) {
-          console.error(`[hipfire] daemon restart after eviction failure failed: ${re?.message ?? re}`);
-        }
-      }
-    } finally {
-      releaseLock();
     }
   }, Math.min(60_000, idleTimeoutMs)) : null;
   // Keep process alive irrespective of the interval; clean up on exit.
@@ -1766,9 +2223,9 @@ async function serve(port: number, host: string) {
         await e.send({ type: "reset" }); await e.recv();
         current = warmPath;
         currentMaxSeq = warmLoadMsg.params.max_seq;
+        currentStateMode = warmLoadMsg.params.kv_mode || null;
         modelHasVL = loadResult.vl === true;
         currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
-        currentCacheCapable = typeof loadResult.cache_capable === "boolean" ? loadResult.cache_capable : null;
         console.error(`[hipfire] warm-up complete`);
       }
     } catch (err: any) {
@@ -1781,6 +2238,18 @@ async function serve(port: number, host: string) {
     }
   }
 
+  let busy = false;
+  const queue: Array<{ resolve: () => void }> = [];
+  async function acquireLock() {
+    if (!busy) { busy = true; return; }
+    await new Promise<void>(resolve => queue.push({ resolve }));
+  }
+  function releaseLock() {
+    const next = queue.shift();
+    if (next) next.resolve();
+    else busy = false;
+  }
+
   console.error(`[hipfire] http://${formatServeBind(host, port)}/v1/chat/completions`);
 
   Bun.serve({
@@ -1789,63 +2258,291 @@ async function serve(port: number, host: string) {
     idleTimeout: 255, // max allowed — model loading can take 30s+
     async fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname === "/health") {
-        return Response.json({
-          status: "ok",
-          model: current,
-          idle_timeout_sec: cfg.idle_timeout,
-          pid: process.pid,
-        });
-      }
+        if (url.pathname === "/health") {
+          const stateCacheBytes = [
+            ...fallbackStateCacheStore.values(),
+            ...[...workerStateCaches.values()].flatMap((cache) => [...cache.values()]),
+          ].reduce((sum, manifest) => sum + manifest.bytes, 0);
+          const stateCacheEntries = [
+            fallbackStateCacheStore.size,
+            ...[...workerStateCaches.values()].map((cache) => cache.size),
+          ].reduce((sum, size) => sum + size, 0);
+          const prefillQueueSize = [...workerPrefillSchedulers.values()].reduce(
+            (sum, scheduler) => sum + scheduler.size,
+            0,
+          );
+          return Response.json({
+            status: "ok",
+            model: current,
+            idle_timeout_sec: cfg.idle_timeout,
+            prefill_batch: serverPrefillBatch.enabled
+              ? buildPrefillBatchHealthPayload({
+                  enabled: true,
+                  queued: prefillBatchMetrics.queued,
+                  eligible: prefillBatchMetrics.eligible,
+                  selected: prefillBatchMetrics.selected,
+                  skipped: prefillBatchMetrics.skipped,
+                  cacheHits: prefillBatchMetrics.cacheHits,
+                  cacheMisses: prefillBatchMetrics.cacheMisses,
+                  queueSize: prefillQueueSize,
+                  generateBatchPrefillCapability,
+                  generateBatchPrefillCapabilityReason,
+                  queueWaitReason: lastPrefillQueueWaitReason,
+                  fallbackReason: lastPrefillFallbackReason,
+                  runtimeDispatchSkippedReason: lastPrefillRuntimeDispatchSkippedReason,
+                  selectedBatchSize: lastSelectedBatchSize,
+                })
+              : { enabled: false },
+            state_cache: serverPrefillBatch.enabled
+              ? {
+                  enabled: serverPrefillBatchControls.stateCacheDisk,
+                  entries: stateCacheEntries,
+                  bytes: stateCacheBytes,
+                }
+              : { enabled: false },
+            batches: {
+              ...buildBatchHealthPayload({
+                enabled: true,
+                queued: batchStats().queued,
+                selected: batchStats().selected,
+                total: batchStats().total,
+                failed: batchStats().failed,
+                cancelled: batchStats().cancelled,
+                completed: batchStats().completed,
+                completion_window_supported: true,
+                supported_endpoints: ["/v1/chat/completions", "/v1/responses"],
+                execution_mode: lastBatchExecutionMode,
+              last_fallback_reason: lastBatchFallbackReason,
+              batch_capability: generateBatchPrefillCapability,
+              batch_capability_reason: generateBatchPrefillCapabilityReason,
+              selected_batch_execution_mode: lastBatchExecutionMode,
+              fallback_reason: lastBatchFallbackReason,
+              runtime_dispatch_skipped_reason: lastBatchRuntimeSkippedReason,
+              unsupported_mode_hits_total: batchRuntimeUnsupportedModeCount,
+              validation_errors_total: batchValidationErrorCount,
+              streaming_rejections_total: batchStreamingRejectionCount,
+            }),
+            },
+            pid: process.pid,
+          });
+        }
       if (url.pathname === "/v1/models") return Response.json({ data: listLocal().map(m => ({ id: m.name })) });
 
-      if (url.pathname !== "/v1/chat/completions" || req.method !== "POST")
+      if (url.pathname === "/v1/files") {
+        if (req.method !== "GET" && req.method !== "POST") {
+          return Response.json({ error: "method not allowed" }, { status: 405 });
+        }
+        if (req.method === "GET") {
+          return Response.json({ data: [...batchFileStore.values()] });
+        }
+        const contentType = req.headers.get("content-type") || "";
+        if (!contentType.startsWith("multipart/form-data")) {
+          return Response.json({ error: "invalid content type; expected multipart/form-data" }, { status: 400 });
+        }
+        const formData = await req.formData();
+        const purposeField = formData.get("purpose");
+        const purpose = typeof purposeField === "string" ? purposeField : String(purposeField ?? "");
+        const rawFile = formData.get("file");
+        if (!rawFile || !(rawFile instanceof Blob) || !(rawFile as any).arrayBuffer) {
+          return Response.json({ error: "missing file" }, { status: 400 });
+        }
+        if (purpose !== "batch") {
+          return Response.json({ error: "only purpose=batch is supported" }, { status: 400 });
+        }
+        const filename = typeof (rawFile as any).name === "string" && (rawFile as any).name.length > 0
+          ? (rawFile as any).name
+          : "batch.jsonl";
+        const bytes = new Uint8Array(await (rawFile as Blob).arrayBuffer());
+        const fileId = `file_${randomUUID().replace(/-/g, "")}`;
+        const fileRecord: BatchFileRecord = {
+          id: fileId,
+          object: "file",
+          filename,
+          bytes: bytes.length,
+          purpose: "batch",
+          created_at: nowUnixSeconds(),
+        };
+        writeBatchArtifact(fileId, Buffer.from(bytes).toString("utf8"));
+        batchFileStore.set(fileId, fileRecord);
+        return Response.json(fileRecord);
+      }
+
+    if (url.pathname.startsWith("/v1/files/")) {
+        const parts = url.pathname.split("/").filter(Boolean);
+        const fileId = parts[2];
+        const fileRecord = batchFileStore.get(fileId);
+        if (!fileRecord) return Response.json({ error: "file not found" }, { status: 404 });
+        if (fileRecord.purpose !== "batch") {
+          return Response.json({ error: "file purpose not supported" }, { status: 400 });
+        }
+        if (req.method === "GET" && parts[3] === "content") {
+          try {
+            const content = readBatchFile(fileId);
+            return new Response(content, {
+              headers: { "content-type": "application/jsonl" },
+            });
+          } catch (err) {
+            return Response.json({ error: "failed to read file" }, { status: 500 });
+          }
+        }
+        if (req.method === "GET") {
+          return Response.json(fileRecord);
+        }
+        if (req.method === "DELETE") {
+          batchFileStore.delete(fileId);
+          unlinkSync(batchArtifactPath(fileId));
+          return Response.json({ id: fileId, object: "file", deleted: true });
+        }
+        return Response.json({ error: "method not allowed" }, { status: 405 });
+      }
+
+      if (url.pathname === "/v1/batches" || url.pathname.startsWith("/v1/batches/")) {
+        if (url.pathname === "/v1/batches" && req.method === "GET") {
+          return Response.json({
+            data: [...batchControlStore.values()]
+              .sort((a, b) => b.created_at - a.created_at)
+              .map(batchRecordToResponse),
+            has_more: false,
+          });
+        }
+        if (url.pathname === "/v1/batches" && req.method === "POST") {
+          let body: any;
+          try {
+            body = await req.json();
+          } catch (err) {
+            return Response.json({ error: { message: "invalid json", type: "invalid_request_error" } }, { status: 400 });
+          }
+        const inputFileId = typeof body?.input_file_id === "string" ? body.input_file_id : "";
+        const endpoint = typeof body?.endpoint === "string" ? body.endpoint : "/v1/chat/completions";
+          const completionWindow = typeof body?.completion_window === "string" ? body.completion_window : "24h";
+          if (completionWindow !== "24h") {
+            return Response.json({ error: { message: `unsupported completion_window ${completionWindow}`, type: "invalid_request_error" } }, { status: 400 });
+          }
+          const fileRecord = batchFileStore.get(inputFileId);
+          if (!fileRecord) {
+            return Response.json({ error: { message: `input file not found: ${inputFileId}`, type: "invalid_request_error" } }, { status: 400 });
+          }
+          if (fileRecord.purpose !== "batch") {
+            return Response.json({ error: { message: `input file ${inputFileId} is not a batch file`, type: "invalid_request_error" } }, { status: 400 });
+          }
+          if (!isSupportedBatchEndpoint(endpoint)) {
+            return Response.json({ error: { message: `unsupported endpoint ${endpoint}`, type: "invalid_request_error" } }, { status: 400 });
+          }
+          const rawInput = readBatchFile(inputFileId);
+          const parsed = validateBatchInputForBatch(rawInput, endpoint);
+          const unsupportedModeErrors = countUnsupportedModeErrors(parsed.errors);
+          batchRuntimeUnsupportedModeCount += unsupportedModeErrors;
+          batchStreamingRejectionCount += parsed.errors.filter((err) => err.code === "streaming_unsupported").length;
+          const preValidationFallbackReason = parsed.errors.length > 0
+            ? toBatchLineFallbackReason(
+              parsed.errors[0]?.code ?? "validation_rejected",
+            )
+            : "idle";
+          const parsedEntries = parsed.entries;
+          const batchId = newObjectId("batch");
+          const requestCount = parsed.totalLineCount;
+          const now = nowUnixSeconds();
+      const batch: BatchJobRecord = {
+            id: batchId,
+            object: "batch",
+            status: "validating",
+            endpoint,
+            completion_window: completionWindow,
+            input_file_id: inputFileId,
+            output_file_id: null,
+            error_file_id: null,
+            request_count: requestCount,
+            created_at: now,
+            ...(parsed.errors.length > 0 && parsedEntries.length === 0
+              ? { failed_reason: parsed.errors[0]?.message }
+              : {}),
+          };
+          batchControlStore.set(batchId, batch);
+
+            if (parsed.errors.length > 0) {
+            const errorFileId = `file_${randomUUID().replace(/-/g, "")}`;
+            writeBatchArtifact(errorFileId, buildBatchArtifactErrorContent(parsed.errors, parsedEntries));
+            batch.error_file_id = errorFileId;
+            batch.output_file_id = null;
+            batch.failed_reason = parsedEntries.length === 0
+              ? (parsed.errors[0]?.message ?? "validation failed")
+              : "partial_batch_errors";
+            batch.status = parsedEntries.length === 0 ? "failed" : "validating";
+            batch.completed_at = parsedEntries.length === 0 ? nowUnixSeconds() : undefined;
+            batchValidationErrorCount += parsed.errors.length;
+            batchControlStore.set(batchId, batch);
+            lastBatchFallbackReason = preValidationFallbackReason;
+            lastBatchRuntimeSkippedReason = preValidationFallbackReason;
+            batchStats();
+            if (parsedEntries.length === 0) {
+              return Response.json({
+                ...batchRecordToResponse(batch),
+                cancelled_at: null,
+                failed_at: batch.completed_at,
+              });
+            }
+          }
+            batch.status = "validating";
+            batchControlStore.set(batchId, batch);
+            void runBatchJob(batchId, parsedEntries, parsed.errors);
+            return Response.json(batchRecordToResponse(batch));
+        }
+
+        const batchPathParts = url.pathname.split("/").filter(Boolean);
+        const batchId = batchPathParts[2];
+        const operation = batchPathParts[3];
+        if (!batchId) {
+          return Response.json({ error: "missing batch id" }, { status: 400 });
+        }
+        const batch = batchControlStore.get(batchId);
+        if (!batch) return Response.json({ error: "batch not found" }, { status: 404 });
+        if (operation === "cancel" && req.method === "POST") {
+          if (batch.status === "completed" || batch.status === "failed") {
+            return Response.json(batchRecordToResponse(batch));
+          }
+          batch.status = batch.status === "validating" ? "cancelling" : "cancelled";
+          batch.failed_reason = batch.status === "cancelling" ? "cancel_requested" : batch.failed_reason;
+          batchControlStore.set(batchId, batch);
+          batch.completed_at = nowUnixSeconds();
+          batchControlStore.set(batchId, batch);
+          return Response.json(batchRecordToResponse(batch));
+        }
+        if (req.method !== "GET") {
+          return Response.json({ error: "method not allowed" }, { status: 405 });
+        }
+        return Response.json(batchRecordToResponse(batch));
+      }
+
+      if (url.pathname !== "/v1/chat/completions" && url.pathname !== "/v1/responses" || req.method !== "POST")
         return Response.json({ error: "not found" }, { status: 404 });
 
       // Update idle timer on every real request (eviction loop checks against this).
       lastRequestTime = Date.now();
 
       await acquireLock();
-      // hunt3 B-5: re-bump after the lock wait so a request that sat QUEUED
-      // behind a long generation (potentially longer than idle_timeout) does
-      // not let the eviction tick fire the instant it finally begins. The
-      // `busy` lock flag already blocks eviction for the whole lock-held
-      // window (incl. the reload window where e.generating is still false).
-      lastRequestTime = Date.now();
       let lockReleased = false;
       const safeRelease = () => { if (!lockReleased) { lockReleased = true; releaseLock(); } };
 
       // If a previous generation was interrupted (client disconnect), drain
       // remaining daemon output before sending new commands.
-      // If drain restarts the daemon (timeout OR hunt3 H-B daemon-crash path),
-      // clear ALL capability state so the model reloads cleanly — matching the
-      // generate catch-site recovery below.
+      // If drain restarts the daemon, clear current so model reloads.
       if (e.generating) {
-        try {
-          await e.drain();
-        } catch (drainErr: any) {
-          // drain() only throws when its own restart() exhausted retries (the
-          // daemon is unrecoverable). Surface a 500 for THIS request rather
-          // than letting the throw escape the handler — an escaped throw would
-          // skip safeRelease() and leak the serve lock, wedging every client.
-          console.error(`[hipfire] drain/daemon-recovery failed: ${drainErr?.message ?? drainErr}`);
-          e.generating = false;
-          current = null; currentMaxSeq = null; modelHasVL = false;
-          currentArch = null; currentCacheCapable = null;
-          safeRelease();
-          return Response.json(
-            { error: { message: "daemon crashed and could not be restarted; retry the request", type: "server_error" } },
-            { status: 500 },
-          );
-        }
+        await e.drain();
         e.generating = false;
-        // daemon may have restarted — force model reload + drop stale caps.
-        current = null; currentMaxSeq = null; modelHasVL = false;
-        currentArch = null; currentCacheCapable = null;
+        current = null; // daemon may have restarted — force model reload
+        currentMaxSeq = null;
       }
 
       try {
-        const body = (await req.json()) as any;
+        const rawBody = (await req.json()) as any;
+        const isResponsesRequest = url.pathname === "/v1/responses";
+        const body = isResponsesRequest ? parseResponsesToChatBody(rawBody) : rawBody;
+        if (isResponsesRequest && body.stream === true) {
+          return Response.json({ error: { message: "streaming responses is unsupported in this scaffold", type: "invalid_request_error" } }, { status: 400 });
+        }
+        if (!body || typeof body !== "object") {
+          return Response.json({ error: { message: "invalid request body", type: "invalid_request_error" } }, { status: 400 });
+        }
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
@@ -1866,34 +2563,18 @@ async function serve(port: number, host: string) {
         // conversation. For most archs we tell the daemon to reset
         // here so prior turn KV doesn't bleed into this one.
         //
-        // V4F (`deepseek4`) and Qwen3.5/3.6 (`qwen35`) are exceptions.
-        // Their daemon arms run LCP detection (Reasonix-style prefix
-        // caching): if the freshly-tokenized prompt fully extends
-        // `m.conversation_tokens` from the prior turn, the daemon
-        // skips prefill for the matching prefix and only prefills the
-        // suffix — exactly the cache-hit shape Reasonix engineers for
-        // upstream. Calling `reset` here clears `m.conversation_tokens`
-        // and forces lcp=0 every turn, throwing away the cache. Skip
-        // the reset for those arches and let the daemon's auto-LCP
-        // (with strict "fully extends" guards — DeltaNet-non-reversible
-        // for qwen35, SWA-ring safety for deepseek4) decide whether
-        // this is a continuation or a fresh request.
-        // Operators can force the legacy stateless behavior by setting
-        // `HIPFIRE_QWEN_PROMPT_CACHE=0` (qwen35 daemon also honors it,
-        // so reset is harmless when the daemon-side cache is disabled
-        // — we omit reset regardless to keep behavior symmetric).
-        // Prefer the daemon's advertised `cache_capable` flag (source of
-        // truth, next to the cache impl). Fall back to the arch-string
-        // allowlist only for older daemons that don't send the flag.
-        const cacheCapable = currentCacheCapable !== null
-          ? currentCacheCapable
-          : (currentArch === "deepseek4"
-            || currentArch === "qwen3_5"
-            || currentArch === "qwen3_5_moe");
-        if (process.env.HIPFIRE_QWEN_CACHE_TRACE === "1") {
-          console.error(`[cache-route] arch=${JSON.stringify(currentArch)} daemon_cache_capable=${currentCacheCapable} cacheCapable=${cacheCapable} -> ${cacheCapable ? "skip reset (cache)" : "SEND RESET (stateless)"}`);
-        }
-        if (!cacheCapable) {
+        // V4F is the exception. Its daemon arm runs LCP detection
+        // (Reasonix-style prefix caching): if the freshly-tokenized
+        // prompt fully extends `m.conversation_tokens` from the prior
+        // turn, the daemon skips prefill for the matching prefix and
+        // only prefills the suffix — exactly the cache-hit shape
+        // Reasonix engineers for upstream. Calling `reset` here clears
+        // `m.conversation_tokens` and forces lcp=0 every turn, which
+        // is correct stateless behavior but throws away the cache.
+        // Skip the reset for V4F and let the daemon's auto-LCP
+        // (with a strict "fully extends" guard for SWA-ring safety)
+        // decide whether this is a continuation or a fresh request.
+        if (currentArch !== "deepseek4") {
           await e.send({ type: "reset" }); await e.recv();
         }
 
@@ -1908,7 +2589,7 @@ async function serve(port: number, host: string) {
         // prompt, which the model has no way to recover from. Issue #79.
         // Image parts are filtered out (no vision encoder in serve path);
         // matches the daemon's existing text-only behaviour.
-        const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, remoteImageUrl: boolean, malformedImage: boolean } => {
+        const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, malformedImage: boolean } => {
           // OpenAI assistant messages carrying only `tool_calls` send
           // `content: null`. Returning `String(null) === "null"` here
           // (the legacy fallback below) leaked the literal text `null`
@@ -1917,13 +2598,12 @@ async function serve(port: number, host: string) {
           // tool-call turn, which the model reads as "the assistant
           // previously said the word null", not as an empty turn.
           // Treat null/undefined as empty content.
-          if (content == null) return { text: "", images: [], unsupportedImage: false, remoteImageUrl: false, malformedImage: false };
-          if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, remoteImageUrl: false, malformedImage: false };
+          if (content == null) return { text: "", images: [], unsupportedImage: false, malformedImage: false };
+          if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, malformedImage: false };
           if (Array.isArray(content)) {
             const textParts: string[] = [];
             const images: string[] = [];
             let unsupportedImage = false;
-            let remoteImageUrl = false;
             let malformedImage = false;
             for (const p of content) {
               if (p?.type === "text") textParts.push(p.text ?? "");
@@ -1943,21 +2623,15 @@ async function serve(port: number, host: string) {
                       // dropping the part and proceeding as text-only.
                       unsupportedImage = true;
                     }
-                  } else {
-                    // Non-data: URLs (https://, http://, file://, etc.)
-                    // are not supported — hipfire does not fetch remote
-                    // images. Use a separate flag so the error message
-                    // distinguishes "bad format" from "unsupported transport".
-                    remoteImageUrl = true;
                   }
                 } else {
                   malformedImage = true;
                 }
               }
             }
-            return { text: textParts.join(""), images, unsupportedImage, remoteImageUrl, malformedImage };
+            return { text: textParts.join(""), images, unsupportedImage, malformedImage };
           }
-          return { text: String(content), images: [], unsupportedImage: false, remoteImageUrl: false, malformedImage: false };
+          return { text: String(content), images: [], unsupportedImage: false, malformedImage: false };
         };
 
         const extractText = (content: any): string => extractContent(content).text;
@@ -1988,17 +2662,7 @@ async function serve(port: number, host: string) {
           for (const m of msgs) {
             if (!m || typeof m !== "object") continue;
             let role: string = m.role;
-            // Aliases:
-            //   developer        → system (OpenAI o1/o3 alias)
-            //   toolResult       → tool   (Pi/Anthropic-internal alias; Pi's
-            //                              SDK sometimes leaks the internal
-            //                              role name through to OpenAI-style
-            //                              requests, which would otherwise
-            //                              drop the message entirely and
-            //                              break LCP on the next turn)
-            //   tool_result      → tool   (Anthropic spelling, defensive)
             if (role === "developer") role = "system";
-            if (role === "toolResult" || role === "tool_result") role = "tool";
             if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") {
               continue;
             }
@@ -2083,13 +2747,7 @@ async function serve(port: number, host: string) {
         };
         for (let i = 0; i < nonSystem.length; i++) {
           const m = nonSystem[i];
-          // Accept Pi/Anthropic-style aliases for tool messages so the
-          // inline-ChatML reconstruction doesn't silently drop them
-          // (which would corrupt history for legacy non-cacheCapable
-          // arches that only consume the inline `prompt` field).
-          const role = m.role === "toolResult" || m.role === "tool_result"
-            ? "tool"
-            : m.role;
+          const role = m.role;
           let text = "";
 
           if (role === "tool") {
@@ -2117,9 +2775,6 @@ async function serve(port: number, host: string) {
             const content = extractContent(m.content);
             if (content.malformedImage) {
               return rejectImage("malformed image part — image_url.url is required");
-            }
-            if (content.remoteImageUrl) {
-              return rejectImage("remote image URLs are not supported — embed images as base64 data: URLs (supported formats: png, jpeg)");
             }
             if (content.unsupportedImage) {
               return rejectImage("unsupported image format — supported: png, jpeg");
@@ -2168,22 +2823,33 @@ async function serve(port: number, host: string) {
         // beyond currentMaxSeq we MUST reload instead of sending a request
         // the daemon would either reject or, worse, overrun the buffer with.
         const effective = resolveModelConfig(body.model);
-        // hunt3 H-D: `??` guards null but NOT type. A JSON-string max_tokens
-        // (e.g. "8192") makes `requestMaxTokens + 1024` STRING-CONCAT to
-        // "81921024", which Math.max coerces to ~80M → bumps load max_seq →
-        // unload-then-OOM. Accept only a sane positive integer; otherwise
-        // fall back to the per-model config value.
-        const rawMt = body.max_tokens;
-        const requestMaxTokens = (typeof rawMt === "number" && Number.isInteger(rawMt) && rawMt >= 1 && rawMt <= 131072)
-          ? rawMt
-          : effective.max_tokens;
+        const requestMaxTokens = body.max_tokens ?? effective.max_tokens;
         const visualHeadroom = requestImages.length > 0 ? 1024 : 0;
-        // Clamp the KV-cache sizing to a hard ceiling (matches the daemon's
-        // independent max_seq <= 524288 clamp, hunt3 H-D contract).
-        const requiredMaxSeq = Math.min(524288, Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom));
+        const requiredMaxSeq = Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom);
+        const requestPriority = parseSchedulerPriority(
+          body.hipfire_priority ?? req.headers.get("x-hipfire-priority"),
+          serverPrefillBatch.priority,
+        );
+        let requestBatchPolicy: ReturnType<typeof schedulerPolicyForPriority> | undefined;
+        let prefillBatchGate: { eligible: boolean; reason: string } = {
+          eligible: false,
+          reason: "disabled",
+        };
 
-        const needReload = current !== path
-          || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
+        const stateModeForRouting = currentStateMode || effective.kv_cache;
+        const initialRoute = pickServingModelWorker({
+          requestModelPath: path,
+          currentModelPath: current,
+          currentMaxSeq,
+          requiredMaxSeq,
+          archId: currentArch ?? "unknown",
+          quantFamily: inferQuantFamilyForPath(path),
+          stateMode: stateModeForRouting,
+          featureFlags: ["serve"],
+          artifactDigest: inferModelArtifactDigest(path),
+          maxSeqBucket: currentMaxSeq ?? requiredMaxSeq,
+        });
+        const needReload = initialRoute.needsReload;
 
         if (needReload) {
           if (current) { await e.send({ type: "unload" }); await e.recv(); }
@@ -2204,8 +2870,63 @@ async function serve(port: number, host: string) {
           current = path;
           currentMaxSeq = loadMsg.params.max_seq;
           modelHasVL = loadResult.vl === true;
+          currentStateMode = loadMsg.params.kv_mode || currentStateMode;
           currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
-          currentCacheCapable = typeof loadResult.cache_capable === "boolean" ? loadResult.cache_capable : null;
+          requestBatchPolicy = serverPrefillBatch.enabled
+            ? schedulerPolicyForPriority(requestPriority, process.env)
+            : undefined;
+          if (serverPrefillBatch.enabled) {
+            prefillBatchGate = serverPrefillBatchEligibility({
+              body,
+              loadedModelPath: current,
+              requestModelPath: path,
+              loadedMaxSeq: currentMaxSeq,
+              requiredMaxSeq,
+              requestImages,
+              effectiveConfig: effective,
+            });
+          } else {
+            prefillBatchGate = { eligible: false, reason: "disabled" };
+          }
+        }
+
+        if (serverPrefillBatch.enabled && requestBatchPolicy === undefined) {
+          requestBatchPolicy = schedulerPolicyForPriority(requestPriority, process.env);
+        }
+        if (serverPrefillBatch.enabled && prefillBatchGate.reason === "disabled") {
+          prefillBatchGate = serverPrefillBatchEligibility({
+            body,
+            loadedModelPath: current,
+            requestModelPath: path,
+            loadedMaxSeq: currentMaxSeq,
+            requiredMaxSeq,
+            requestImages,
+            effectiveConfig: effective,
+          });
+        }
+
+        const servingWorkerStateMode = currentStateMode || effective.kv_cache;
+        const servingWorkerFeatureFlags = Array.from(new Set([
+          "serve",
+          servingWorkerStateMode,
+          currentArch ?? "unknown",
+          "server_batch",
+        ])).sort();
+        let servingWorkerKey: ModelWorkerKey | null = null;
+        const servingWorkerKinds: readonly SessionStateKind[] = inferStateKindsForServeArch(currentArch);
+        if (current !== null) {
+          servingWorkerKey = pickServingModelWorker({
+            requestModelPath: current,
+            currentModelPath: current,
+            currentMaxSeq,
+            requiredMaxSeq,
+            archId: currentArch ?? "unknown",
+            quantFamily: inferQuantFamilyForPath(current),
+            stateMode: servingWorkerStateMode,
+            featureFlags: servingWorkerFeatureFlags,
+            artifactDigest: inferModelArtifactDigest(current),
+            maxSeqBucket: currentMaxSeq ?? requiredMaxSeq,
+          }).workerKey;
         }
 
         // Now that currentArch reflects the model we're ACTUALLY sending
@@ -2227,47 +2948,20 @@ async function serve(port: number, host: string) {
           systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
         }
 
-        // 1b. Chunked-write nudge: steer the model away from emitting an
-        //     entire large file in ONE `write` tool call. At long-context
-        //     decode rates a ~30K-token single-shot write can't finish
-        //     within the per-turn / client deadline — it gets truncated
-        //     mid-output, the unclosed <tool_call> is dropped (finish=stop),
-        //     and the whole turn's work is lost (observed 2026-05-31: a Pi
-        //     "write the full implementation" turn terminated, then the
-        //     retry's write degraded + EOS'd at 939 tokens, unparseable).
-        //     Only relevant when a file-writing tool is exposed. Opt out
-        //     with HIPFIRE_CHUNK_WRITE_NUDGE=0.
-        const hasWriteTool = tools.some((t: any) => {
-          const n = String(t?.function?.name ?? t?.name ?? "").toLowerCase();
-          return n === "write" || n === "edit" || n === "create"
-            || n.includes("str_replace") || n.includes("write_file") || n.includes("create_file");
-        });
-        if (hasWriteTool && process.env.HIPFIRE_CHUNK_WRITE_NUDGE !== "0") {
-          const chunkNudge = "# Writing large files\n\n"
-            + "When creating or modifying a large file, do NOT emit the entire file in a single `write` "
-            + "call. A tool call that streams thousands of lines often can't be completed in one response "
-            + "and gets cut off mid-output — the truncated call is then discarded and the work is lost. "
-            + "Instead, build large files incrementally: write an initial skeleton or first focused section, "
-            + "then extend it with follow-up `edit` calls (or split the work into several smaller files). "
-            + "Keep each individual tool call bounded to a few hundred lines.";
-          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + chunkNudge : chunkNudge;
-        }
-
-        // 2. `userPrompt` content: cache-capable daemon paths (V4F and
-        //    qwen3.5/3.6 with the prompt-cache active) read multi-turn
-        //    history from the structured `messages` field and treat
-        //    `prompt` as the live user input. Leaving `userPrompt` set
-        //    to the ChatML rebuild of the conversation causes the
-        //    daemon to render history twice — once in arch-canonical
-        //    tokens from `messages`, once in ChatML tokens from
-        //    `prompt`. Replace with just the trailing user message
-        //    (or "" when conversation ends with a tool/assistant turn —
-        //    daemon then continues from the assistant header directly).
+        // 2. `userPrompt` content: V4F's daemon path reads multi-turn
+        //    history from the structured `messages` field and treats
+        //    `prompt` as the live user input. Leaving `userPrompt` set to
+        //    the ChatML rebuild of the conversation causes the daemon to
+        //    render history twice — once in V4F tokens from `messages`,
+        //    once in ChatML tokens from `prompt`. Replace with just the
+        //    trailing user message (or "" when conversation ends with a
+        //    tool/assistant turn — daemon then continues from
+        //    `<｜Assistant｜>` directly).
         //
         //    Legacy arches (Qwen2 in particular) ignore the structured
         //    `messages` field and ONLY read `prompt` — they NEED the
         //    full ChatML rebuild for multi-turn to survive. Don't touch.
-        if (cacheCapable) {
+        if (currentArch === "deepseek4") {
           const last = nonSystem.length > 0 ? nonSystem[nonSystem.length - 1] : null;
           if (last && last.role === "user") {
             const lastContent = extractContent(last.content);
@@ -2278,24 +2972,242 @@ async function serve(port: number, host: string) {
         }
 
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
+        const requestNowMs = Date.now();
+        let serverPrefillSession: RequestSessionDraft | undefined;
+        let selectedForPrefillBatch = false;
+        let selectedByScheduler = false;
+        let queuePreviewReason: "selected" | "waiting" | "insufficient_queue" | "not_eligible" = "not_eligible";
+        let selectedBatchSize = 0;
+        let selectedBatchSessions: RequestSessionDraft[] = [];
+        let fallbackReason = "not_applicable";
+        let runtimeDispatchSkippedReason = "not_applicable";
+        let cacheHit = false;
+        let cachePrefixLen = 0;
+        let cacheKey: string | null = null;
+        let spillable = false;
+        let spillReason = "state_cache_disabled";
+        let servingWorkerScheduler: PriorityPrefillScheduler | undefined;
+        if (serverPrefillBatch.enabled) {
+          prefillBatchMetrics.queued += 1;
+          const promptTokens = approximatePromptTokenIds(userPrompt);
+          const stateKinds = servingWorkerKinds;
+          const stateMode = servingWorkerStateMode;
+          const stateFlags = servingWorkerFeatureFlags;
+          const modelDigest = inferModelArtifactDigest(current);
+          const cacheKeyFingerprint: PrefixCheckpointFingerprint = {
+            modelArtifactDigest: inferModelArtifactDigest(current),
+            architectureId: currentArch ?? "unknown",
+            tokenizerHash: stableObjectHash({ model: current, arch: currentArch, kv: stateMode }),
+            chatTemplateHash: stableObjectHash({ arch: currentArch, model: current, mode: stateMode }),
+            runtimeConfigHash: stableObjectHash({
+              kv_mode: stateMode,
+              prefill_compression: effective.prefill_compression,
+              prefill_drafter: effective.prefill_drafter,
+              mtp_mode: effective.mtp_mode,
+              mtp_k: effective.mtp_k,
+            }),
+            stateMode,
+            positionPolicy: "rope",
+            featureFlags: stateFlags,
+          };
+
+          servingWorkerScheduler = getWorkerPrefillScheduler(servingWorkerKey);
+          const servingWorkerStateCache = getWorkerStateCache(servingWorkerKey);
+          if (prefillBatchGate.eligible && current !== null) {
+            prefillBatchMetrics.eligible += 1;
+            const modelArtifactBucket = currentMaxSeq ?? 4096;
+            serverPrefillSession = createServerPrefillSession({
+              id: reqId,
+              modelPath: current,
+              modelDigest,
+              archId: currentArch ?? "unknown",
+              quantFamily: inferQuantFamilyForPath(current),
+              stateMode,
+              maxSeqBucket: modelArtifactBucket,
+              featureFlags: stateFlags,
+              promptTokens,
+              priority: requestPriority,
+              stateKinds,
+            });
+            if (servingWorkerKey !== null) {
+              serverPrefillSession = {
+                ...serverPrefillSession,
+                workerKey: servingWorkerKey,
+                stateHandle: {
+                  ...serverPrefillSession.stateHandle,
+                  workerKey: servingWorkerKey,
+                },
+              };
+            }
+
+            let cacheManifest: PrefixCheckpointManifest | undefined;
+            const cacheLookup = [...servingWorkerStateCache.values()]
+              .filter((manifest) => manifest.prefixLen <= promptTokens.length)
+              .filter((manifest) => {
+                try {
+                  return prefixCheckpointCompatible(manifest, {
+                    fingerprint: cacheKeyFingerprint,
+                    prefixTokens: promptTokens.slice(0, manifest.prefixLen),
+                    requiredStateKinds: stateKinds,
+                  });
+                } catch { return false; }
+              })
+              .sort((a, b) => b.prefixLen - a.prefixLen)[0];
+
+            if (cacheLookup) {
+              cacheHit = true;
+              prefillBatchMetrics.cacheHits += 1;
+              cachePrefixLen = cacheLookup.prefixLen;
+              cacheManifest = touchPrefixCheckpointManifest(cacheLookup, requestNowMs);
+              cacheKey = prefixCheckpointCacheKey(cacheManifest);
+              if (serverPrefillBatchControls.stateCacheDisk) {
+                servingWorkerStateCache.set(cacheKey, cacheManifest);
+              }
+              serverPrefillSession = {
+                ...serverPrefillSession,
+                cachedPrefixTokens: cacheLookup.prefixLen,
+                suffixTokens: promptTokens.slice(cacheLookup.prefixLen),
+                stateHandle: {
+                  ...serverPrefillSession.stateHandle,
+                  cachedPrefixTokens: cacheLookup.prefixLen,
+                  logicalPosition: cacheLookup.prefixLen,
+                },
+              };
+            } else {
+              prefillBatchMetrics.cacheMisses += 1;
+            }
+
+            const checksumLookup: Partial<Record<SessionStateKind, string>> = {};
+            for (const stateKind of stateKinds) {
+              checksumLookup[stateKind] = stableHash(`${cacheKeyFingerprint.modelArtifactDigest}|${stateKind}`);
+            }
+            const manifestPrefixLen = cachePrefixLen > 0 ? cachePrefixLen : promptTokens.length;
+            const manifest = cacheManifest ?? createPrefixCheckpointManifest({
+              fingerprint: cacheKeyFingerprint,
+              prefixTokens: promptTokens.slice(0, manifestPrefixLen),
+              stateKinds,
+              bytes: serverPrefillSession.suffixTokens.length * 16,
+              createdAtMs: requestNowMs,
+              lastUsedAtMs: requestNowMs,
+              hitCount: cacheHit ? 1 : 0,
+              checksums: checksumLookup,
+            });
+            if (!cacheKey) {
+              cacheKey = prefixCheckpointCacheKey(manifest);
+            }
+            if (serverPrefillBatchControls.stateCacheDisk) {
+              const spillProfile = spillEligibility(manifest, {
+                activeSession: false,
+                pinned: false,
+                knownArchitecture: !!currentArch,
+              });
+              spillable = spillProfile.spillable;
+              spillReason = spillProfile.reason;
+              if (spillProfile.spillable) servingWorkerStateCache.set(cacheKey, manifest);
+            } else {
+              spillReason = "state_cache_disk_disabled";
+            }
+
+            // Exercise queueing path (enqueue -> preview -> dequeue) so per-request
+            // session scheduling state remains testable even while runtime dispatch
+            // stays serial until a daemon batch-prefill protocol exists.
+            if (servingWorkerScheduler) {
+              servingWorkerScheduler.enqueue(serverPrefillSession, requestNowMs);
+              const preview = servingWorkerScheduler.previewNextPrefillBatch({
+                nowMs: requestNowMs,
+              });
+              const nextForCurrent = !!preview?.sessions?.some((s) => s.id === reqId);
+              if (nextForCurrent) {
+                const next = servingWorkerScheduler.nextPrefillBatch({ nowMs: requestNowMs });
+                if (next && next.sessions.some((s) => s.id === reqId)) {
+                  selectedForPrefillBatch = true;
+                  selectedByScheduler = true;
+                  queuePreviewReason = "selected";
+                  selectedBatchSize = next.sessions.length;
+                  selectedBatchSessions = next.sessions;
+                  prefillBatchMetrics.selected += 1;
+                } else {
+                  queuePreviewReason = preview ? "waiting" : "insufficient_queue";
+                  // If preview said this request should run but dequeuing did not
+                  // return it, keep the scheduling state consistent by canceling the
+                  // request before continuing on the serialized execution path.
+                  servingWorkerScheduler.cancel(reqId);
+                  prefillBatchMetrics.skipped += 1;
+                }
+              } else {
+                queuePreviewReason = preview ? "waiting" : "insufficient_queue";
+                if (
+                  generateBatchPrefillCapability !== "supported" ||
+                  body.stream ||
+                  isResponsesRequest
+                ) {
+                  prefillBatchMetrics.skipped += 1;
+                  servingWorkerScheduler.cancel(reqId);
+                }
+              }
+            } else {
+              queuePreviewReason = "insufficient_queue";
+              prefillBatchMetrics.skipped += 1;
+            }
+          } else {
+            prefillBatchMetrics.skipped += 1;
+            queuePreviewReason = "not_eligible";
+          }
+        }
+
+        if (cacheKey == null) {
+          cacheKey = current !== null
+            ? stableHash(`${current}|${inferStateKindsForServeArch(currentArch).join(",")}`)
+            : stableHash("prefetch-disable");
+        }
+        if (!serverPrefillBatch.enabled) {
+          fallbackReason = "batching_disabled";
+          lastPrefillQueueWaitReason = "disabled";
+          lastPrefillFallbackReason = fallbackReason;
+          lastPrefillRuntimeDispatchSkippedReason = "not_enabled";
+          lastSelectedBatchSize = 0;
+          runtimeDispatchSkippedReason = "not_applicable";
+        } else if (!prefillBatchGate.eligible) {
+          fallbackReason = `not_eligible:${prefillBatchGate.reason}`;
+          lastPrefillQueueWaitReason = queuePreviewReason;
+          lastPrefillFallbackReason = fallbackReason;
+          lastPrefillRuntimeDispatchSkippedReason = "not_eligible";
+          lastSelectedBatchSize = 0;
+          runtimeDispatchSkippedReason = "not_eligible";
+        } else if (selectedByScheduler) {
+          fallbackReason = `selected_for_dispatch:${queuePreviewReason}`;
+          lastPrefillQueueWaitReason = queuePreviewReason;
+          lastPrefillFallbackReason = fallbackReason;
+          lastPrefillRuntimeDispatchSkippedReason = prefillBatchRuntimeDispatchStatus(
+            true,
+            generateBatchPrefillCapability,
+          ).runtimeDispatchReason;
+          lastSelectedBatchSize = selectedBatchSize;
+        } else {
+          fallbackReason = `queue_wait:${queuePreviewReason}`;
+          lastPrefillQueueWaitReason = queuePreviewReason;
+          lastPrefillFallbackReason = fallbackReason;
+          lastSelectedBatchSize = selectedBatchSize;
+          if (generateBatchPrefillCapability !== "supported") {
+            lastPrefillRuntimeDispatchSkippedReason = prefillBatchRuntimeDispatchStatus(
+              true,
+              generateBatchPrefillCapability,
+            ).runtimeDispatchReason;
+          } else {
+            lastPrefillRuntimeDispatchSkippedReason = runtimeDispatchSkippedReason;
+          }
+        }
+
         const created = Math.floor(Date.now() / 1000);
         const modelName = body.model || "hipfire";
         // Fall back to the user's configured defaults (global or per-model) when
         // an OpenAI client doesn't set a field. 512 was a hardcoded surprise
         // that ignored `hipfire config set max_tokens …`.
-        // OpenAI repeat-penalty mapping: take the larger of frequency_penalty
-        // and presence_penalty when present. Both are -2..2 in the OpenAI
-        // surface; we map non-negative values to repeat_penalty = 1 + p.
-        // (Negative penalties — boosts — aren't meaningful for hipfire's
-        // multiplicative repeat_penalty kernel, so they're treated as zero.)
-        // Requested by @shilga in #79; previously only frequency_penalty was
-        // honored.
-        const oaiPenalty = Math.max(
-          0,
-          Number(body.frequency_penalty) || 0,
-          Number(body.presence_penalty) || 0,
-        );
-        const oaiPenaltySet = body.frequency_penalty != null || body.presence_penalty != null;
+        // OpenAI-compatible penalties are now native daemon sampler knobs.
+        // Keep repeat_penalty as the hipfire-specific multiplicative control
+        // instead of folding additive OpenAI penalties into it.
+        const presencePenalty = Math.max(0, Number(body.presence_penalty) || 0);
+        const frequencyPenalty = Math.max(0, Number(body.frequency_penalty) || 0);
 
         // chat_template_kwargs (Qwen / DeepSeek / pi-coding-agent extension).
         // Two recognized keys, both per-request overrides on top of
@@ -2319,78 +3231,36 @@ async function serve(port: number, host: string) {
         // https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
         const includeUsage = (body.stream_options && body?.stream_options?.include_usage && body?.stream_options?.include_usage === true);
 
-        // Build the OpenAI-format `usage` object.
+        // Build the OpenAI-format `usage` object. The V4F daemon arm
+        // emits `prompt_tokens` (full client-visible prompt size) and
+        // `cached_tokens` (LCP-hit count from the prefix cache) as
+        // separate fields; legacy arches only emit `prefill_tokens`
+        // (== the number of tokens actually fed through the forward
+        // path) and we fall back to that for `prompt_tokens` so the
+        // total still balances on those paths.
         //
-        // Daemon emits three signals:
-        //   prompt_tokens   — total tokens in the input prompt (V4F only
-        //                     today; absent on qwen35 path, derived below)
-        //   prefill_tokens  — number of new tokens actually fed through
-        //                     the forward path this turn
-        //   cached_tokens   — LCP-hit count from the prefix cache
-        //
-        // Per OpenAI spec, `usage.prompt_tokens` is the TOTAL input
-        // size and `prompt_tokens_details.cached_tokens` is the
-        // already-cached portion of that total. So:
-        //   prompt_tokens   = cached + prefill   (when daemon doesn't emit it)
-        //   completion      = newly decoded tokens
-        //   prompt_tokens_details.cached_tokens = cached
-        //
-        // For Anthropic-compatible clients (Pi, etc.) we also emit
-        // `cache_creation_input_tokens` = prefill_tokens (the new
-        // tokens written through the forward path this turn, which
-        // populate the cache for the NEXT turn). This maps to Pi's
-        // `cacheWrite` field and pairs with `cacheRead` from
-        // `prompt_tokens_details.cached_tokens`.
+        // `usage.prompt_tokens_details.cached_tokens` is the OpenAI
+        // surface DeepSeek / pi-coding-agent / OpenCode read for
+        // cache-hit accounting; we emit it whenever the daemon
+        // reports cached_tokens > 0 (V4F today; other archs when /
+        // if they grow LCP detection).
         const buildUsage = (msg: any, completion: number) => {
-          const prefillTokens: number = typeof msg.prefill_tokens === "number"
-            ? msg.prefill_tokens
-            : 0;
+          const promptTokens: number = typeof msg.prompt_tokens === "number"
+            ? msg.prompt_tokens
+            : (typeof msg.prefill_tokens === "number" ? msg.prefill_tokens : 0);
           const cachedTokens: number = typeof msg.cached_tokens === "number"
             ? msg.cached_tokens
             : 0;
-          const promptTokens: number = typeof msg.prompt_tokens === "number"
-            ? msg.prompt_tokens
-            : cachedTokens + prefillTokens;
           const usage: any = {
             prompt_tokens: promptTokens,
             completion_tokens: completion,
             total_tokens: promptTokens + completion,
-            // Pi's openai-completions adapter reads BOTH cacheRead and
-            // cacheWrite from `prompt_tokens_details` (NOT the
-            // Anthropic-style top-level fields). Per
-            // packages/ai/src/providers/openai-completions.ts in
-            // earendil-works/pi:
-            //   cacheRead  ← prompt_tokens_details.cached_tokens
-            //                (or prompt_cache_hit_tokens)
-            //   cacheWrite ← prompt_tokens_details.cache_write_tokens
-            //   input      ← prompt_tokens − cacheRead − cacheWrite
-            // Emitting these nested fields is what populates Pi's
-            // `cacheWrite` column. Emit them unconditionally (0 when
-            // empty) so clients see a stable shape.
-            prompt_tokens_details: {
-              cached_tokens: cachedTokens,
-              cache_write_tokens: prefillTokens,
-            },
           };
-          // Anthropic-shape top-level mirror (some other multi-provider
-          // clients read these). Harmless to emit alongside the OpenAI
-          // nested shape Pi uses.
-          //   cache_read_input_tokens     ≡ cached_tokens (LCP hit)
-          //   cache_creation_input_tokens ≡ new tokens prefilled this turn
-          usage.cache_read_input_tokens = cachedTokens;
-          usage.cache_creation_input_tokens = prefillTokens;
+          if (cachedTokens > 0) {
+            usage.prompt_tokens_details = { cached_tokens: cachedTokens };
+          }
           return usage;
         };
-        // Per-request perf/spec-decode metrics for the streaming final chunk.
-        // `tau`/`cycles`/`dflash` surface DFlash spec-decode effectiveness (mean
-        // accepted tokens per verify cycle) for benchmarking/observability;
-        // they're absent on the AR path.
-        const buildTimings = (m: any) => ({
-          tokens: m.tokens, tok_s: m.tok_s, prefill_tokens: m.prefill_tokens,
-          prefill_ms: m.prefill_ms, prefill_tok_s: m.prefill_tok_s,
-          decode_tok_s: m.decode_tok_s, ttft_ms: m.ttft_ms,
-          tau: m.tau, cycles: m.cycles, dflash: m.dflash,
-        });
 
         // OpenAI o1/o3-style `reasoning.effort` (none / minimal / low /
         // medium / high / xhigh). Open WebUI, OpenCode, and pi-coding-agent
@@ -2411,15 +3281,56 @@ async function serve(port: number, host: string) {
           type: "generate", id: reqId, prompt: userPrompt,
           temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
           max_tokens: requestMaxTokens,
-          // The daemon now applies OpenAI presence/frequency penalties natively
-          // (subtractive, over the full repeat window) — strictly better than the
-          // old #79 fold into the multiplicative repeat_penalty. Pass them raw.
           repeat_penalty: body.repeat_penalty ?? effective.repeat_penalty,
-          presence_penalty: Math.max(0, Number(body.presence_penalty) || 0),
-          frequency_penalty: Math.max(0, Number(body.frequency_penalty) || 0),
+          presence_penalty: presencePenalty,
+          frequency_penalty: frequencyPenalty,
           top_p: body.top_p ?? effective.top_p,
         };
-        void oaiPenalty; void oaiPenaltySet; // superseded by native presence/frequency
+        if (serverPrefillBatch.enabled) {
+          const runtimeDispatchStatus = prefillBatchRuntimeDispatchStatus(
+            prefillBatchGate.eligible,
+            generateBatchPrefillCapability,
+          );
+          const runtimeDispatch = runtimeDispatchStatus.runtimeDispatch;
+          runtimeDispatchSkippedReason = runtimeDispatchStatus.runtimeDispatchReason;
+          const runtimeDispatchReason = prefillBatchGate.eligible
+            ? runtimeDispatchStatus.runtimeDispatchReason
+            : prefillBatchGate.reason;
+          const batchPolicy = requestBatchPolicy ?? {
+            priority: serverPrefillBatch.priority,
+            maxBatchSize: serverPrefillBatch.maxBatch,
+            coalesceWaitMs: serverPrefillBatch.waitMs,
+            targetPairTokens: serverPrefillBatch.targetPairTokens,
+            maxProcessingMs: serverPrefillBatch.maxProcessingMs,
+          };
+          genParams.server_prefill_batch = {
+            eligible: prefillBatchGate.eligible,
+            reason: prefillBatchGate.reason,
+            priority: batchPolicy.priority,
+            max_batch: batchPolicy.maxBatchSize,
+            wait_ms: batchPolicy.coalesceWaitMs,
+            target_pair_tokens: batchPolicy.targetPairTokens,
+            max_processing_ms: batchPolicy.maxProcessingMs,
+            selected_for_dispatch: selectedForPrefillBatch,
+            selected_by_scheduler: selectedByScheduler,
+            queue_preview_reason: queuePreviewReason,
+            queue_wait_reason: queuePreviewReason,
+            fallback_reason: fallbackReason,
+            selected_batch_size: selectedBatchSize,
+            runtime_dispatch_skipped_reason: runtimeDispatchSkippedReason,
+            cache_hit: cacheHit,
+            cache_prefix_len: cachePrefixLen,
+            cache_key: cacheKey,
+            cache_spillable: spillable,
+            cache_spill_reason: spillReason,
+            worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
+            route_reason: initialRoute.reloadReason,
+            generate_batch_prefill_capability: generateBatchPrefillCapability,
+            generate_batch_prefill_capability_reason: generateBatchPrefillCapabilityReason,
+            runtime_dispatch: runtimeDispatch,
+            runtime_dispatch_reason: runtimeDispatchReason,
+          };
+        }
         // Mirror the `hipfire run` path's per-model max_think_tokens
         // propagation. Without this, models with thinking=on can consume
         // the entire max_tokens budget inside a single <think>...</think>
@@ -2460,30 +3371,9 @@ async function serve(port: number, host: string) {
           genParams.assistant_prefix = "closed_think";
           genParams.max_think_tokens = 1;
         } else {
-          // Thinking is ON (config default, or explicit enable_thinking=true /
-          // reasoning.effort>=minimal). OPEN the <think> block so the model
-          // actually reasons instead of emitting an empty <think></think> and
-          // answering directly. Without this, generic OpenAI clients (which
-          // never send assistant_prefix) get no-think behaviour, which fails
-          // hard reasoning on thinking models like Qwen3.6. Safe for non-
-          // thinking models: the daemon's prompt frame falls back to Plain
-          // when the tokenizer has no `<think>` special token.
           genParams.assistant_prefix = "open_think";
         }
         if (systemPrompt) genParams.system = systemPrompt;
-
-        // hunt3 M-F: forward OpenAI `stop` sequences to the daemon. Accept a
-        // single string or an array of strings; normalize to string[], drop
-        // empties, cap at 4 sequences of <= 64 chars each (the daemon matches
-        // them against the decoded-output suffix and emits finish_reason="stop").
-        {
-          const rawStop = (body as any).stop;
-          let stopSeqs: string[] = [];
-          if (typeof rawStop === "string") stopSeqs = [rawStop];
-          else if (Array.isArray(rawStop)) stopSeqs = rawStop.filter((s: any) => typeof s === "string");
-          stopSeqs = stopSeqs.filter(s => s.length > 0).slice(0, 4).map(s => s.slice(0, 64));
-          if (stopSeqs.length > 0) genParams.stop = stopSeqs;
-        }
 
         if (requestImages.length === 1) {
           if (!modelHasVL) {
@@ -2514,6 +3404,198 @@ async function serve(port: number, host: string) {
           genParams.messages = structuredMessages;
         }
 
+        if (
+          serverPrefillBatch.enabled &&
+          serverPrefillSession &&
+          generateBatchPrefillCapability === "supported"
+        ) {
+          const sessionParams: any = {
+            max_tokens: requestMaxTokens,
+            temperature: genParams.temperature,
+          };
+          if (genParams.assistant_prefix) sessionParams.assistant_prefix = genParams.assistant_prefix;
+          if (typeof genParams.max_think_tokens === "number") {
+            sessionParams.max_think_tokens = genParams.max_think_tokens;
+          }
+          const buildDaemonPrefillSession = (draft: RequestSessionDraft): any => {
+            const payload: any = {
+              id: draft.id,
+              state_handle: {
+                state_kinds: [...draft.stateHandle.stateKinds],
+                logical_position: draft.stateHandle.logicalPosition,
+                cached_prefix_tokens: draft.stateHandle.cachedPrefixTokens,
+              },
+              params: sessionParams,
+            };
+            if (draft.cachedPrefixTokens > 0) {
+              payload.suffix_tokens = draft.suffixTokens;
+            } else {
+              payload.prompt = userPrompt;
+            }
+            if (systemPrompt) payload.system = systemPrompt;
+            if (Array.isArray(body.tools) && body.tools.length > 0) {
+              payload.tools = body.tools;
+            }
+            if (structuredMessages.length > 0) {
+              payload.messages = structuredMessages;
+            }
+            return payload;
+          };
+
+          if (selectedForPrefillBatch) {
+            const runtimeBatchId = `prefill-${reqId}`;
+            try {
+              const currentPrefillSession = buildDaemonPrefillSession(serverPrefillSession);
+              const selectedSessions = selectedBatchSessions.length > 0
+                ? selectedBatchSessions
+                : [serverPrefillSession];
+              const daemonSessions: any[] = [];
+              for (const selected of selectedSessions) {
+                if (selected.id === reqId) {
+                  daemonSessions.push(currentPrefillSession);
+                  continue;
+                }
+                const pending = pendingPrefillRequests.get(selected.id);
+                if (!pending) {
+                  throw new Error(`selected prefill session ${selected.id} is not pending`);
+                }
+                daemonSessions.push(pending.prefillSession);
+              }
+
+              await e.send({
+                type: "generate_batch_prefill",
+                id: `${reqId}-prefill`,
+                batch_id: runtimeBatchId,
+                worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
+                model: current,
+                sessions: daemonSessions,
+              });
+
+              let prefillDone = false;
+              const sessionPrefillTokens = new Map<string, number>();
+              for (let i = 0; i < 8; i++) {
+                const prefillMsg = await e.recv();
+                if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === runtimeBatchId) {
+                  prefillDone = true;
+                  if (genParams.server_prefill_batch) {
+                    genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill";
+                    genParams.server_prefill_batch.runtime_dispatch_reason = "prefill_done_decode_continuation";
+                    genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "not_skipped";
+                    genParams.server_prefill_batch.daemon_prefill_tokens = prefillMsg.prefill_tokens;
+                    genParams.server_prefill_batch.daemon_prefill_ms = prefillMsg.elapsed_ms;
+                  }
+                  break;
+                }
+                if (prefillMsg?.type === "generate_batch_prefill_session_done") {
+                  if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.prefill_tokens === "number") {
+                    sessionPrefillTokens.set(prefillMsg.session_id, prefillMsg.prefill_tokens);
+                  }
+                  continue;
+                }
+                if (prefillMsg?.type === "generate_batch_prefill_started") {
+                  continue;
+                }
+                if (prefillMsg?.type === "error") {
+                  throw new Error(prefillMsg.message || "generate_batch_prefill error");
+                }
+                if (prefillMsg?.type === "generate_batch_prefill_unsupported") {
+                  throw new Error(prefillMsg.reason || "generate_batch_prefill unsupported");
+                }
+                throw new Error(`unexpected generate_batch_prefill response: ${prefillMsg?.type ?? "missing"}`);
+              }
+              if (!prefillDone) throw new Error("generate_batch_prefill did not complete");
+              genParams.session_id = reqId;
+              genParams.prefill_already_done = true;
+              lastPrefillRuntimeDispatchSkippedReason = "not_skipped";
+              lastSelectedBatchSize = selectedSessions.length;
+              for (const selected of selectedSessions) {
+                if (selected.id === reqId) continue;
+                const pending = pendingPrefillRequests.get(selected.id);
+                if (!pending) continue;
+                pendingPrefillRequests.delete(selected.id);
+                pending.resolve({
+                  prefillTokens: sessionPrefillTokens.get(selected.id) ?? 0,
+                  elapsedMs: genParams.server_prefill_batch?.daemon_prefill_ms ?? 0,
+                  selectedBatchSize: selectedSessions.length,
+                });
+              }
+            } catch (err: any) {
+              const reason = err?.message ?? "daemon_serial_prefill_failed";
+              if (genParams.server_prefill_batch) {
+                genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill_failed";
+                genParams.server_prefill_batch.runtime_dispatch_reason = reason;
+                genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "daemon_serial_prefill_failed";
+              }
+              lastPrefillRuntimeDispatchSkippedReason = "daemon_serial_prefill_failed";
+              for (const selected of selectedBatchSessions) {
+                if (selected.id === reqId) continue;
+                const pending = pendingPrefillRequests.get(selected.id);
+                if (!pending) continue;
+                pendingPrefillRequests.delete(selected.id);
+                pending.reject(new Error(reason));
+              }
+              console.error(`[hipfire] generate_batch_prefill failed; falling back to generate: ${reason}`);
+            }
+          } else if (
+            !body.stream &&
+            !isResponsesRequest &&
+            prefillBatchGate.eligible &&
+            servingWorkerScheduler &&
+            queuePreviewReason !== "not_eligible"
+          ) {
+            const prefillSession = buildDaemonPrefillSession(serverPrefillSession);
+            let resolvePending!: (outcome: PendingPrefillOutcome) => void;
+            let rejectPending!: (err: Error) => void;
+            const pendingPromise = new Promise<PendingPrefillOutcome>((resolve, reject) => {
+              resolvePending = resolve;
+              rejectPending = reject;
+            });
+            pendingPrefillRequests.set(reqId, {
+              session: serverPrefillSession,
+              prefillSession,
+              resolve: resolvePending,
+              reject: rejectPending,
+              promise: pendingPromise,
+            });
+            const waitMs = Math.max(5, (requestBatchPolicy?.coalesceWaitMs ?? serverPrefillBatch.waitMs) + 50);
+            safeRelease();
+            let pendingOutcome: PendingPrefillOutcome | null = null;
+            try {
+              pendingOutcome = await Promise.race([
+                pendingPromise,
+                new Promise<null>((resolve) => setTimeout(() => resolve(null), waitMs)),
+              ]);
+            } finally {
+              await acquireLock();
+              lockReleased = false;
+            }
+            if (pendingOutcome) {
+              genParams.session_id = reqId;
+              genParams.prefill_already_done = true;
+              if (genParams.server_prefill_batch) {
+                genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill";
+                genParams.server_prefill_batch.runtime_dispatch_reason = "prefill_done_decode_continuation";
+                genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "not_skipped";
+                genParams.server_prefill_batch.daemon_prefill_tokens = pendingOutcome.prefillTokens;
+                genParams.server_prefill_batch.daemon_prefill_ms = pendingOutcome.elapsedMs;
+                genParams.server_prefill_batch.selected_batch_size = pendingOutcome.selectedBatchSize;
+              }
+              lastPrefillRuntimeDispatchSkippedReason = "not_skipped";
+              lastSelectedBatchSize = pendingOutcome.selectedBatchSize;
+            } else {
+              pendingPrefillRequests.delete(reqId);
+              servingWorkerScheduler.cancel(reqId);
+              prefillBatchMetrics.skipped += 1;
+              if (genParams.server_prefill_batch) {
+                genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill_timeout";
+                genParams.server_prefill_batch.runtime_dispatch_reason = "coalesce_wait_elapsed_without_batch";
+                genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "daemon_serial_prefill_timeout";
+              }
+              lastPrefillRuntimeDispatchSkippedReason = "daemon_serial_prefill_timeout";
+            }
+          }
+        }
+
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
         //
         // Defensive against MQ4 quantization drift on structured-token positions
@@ -2534,39 +3616,6 @@ async function serve(port: number, host: string) {
         // This is a stopgap. The proper fix is MQ4 calibration retraining with
         // tool-call samples weighted on structured tokens; tracked in
         // MANUAL_REVIEW.md against #111.
-        // Detect mid-tool-call truncation. The model emitted `<tool_call>`
-        // (one or more) but the count of `</tool_call>` closers is lower,
-        // meaning the JSON inside an open block was cut off when decode
-        // hit the `max_tokens` cap. The OpenAI-correct signal is
-        // `finish_reason: "length"` (truncation), but without an extra
-        // hint clients can't distinguish "model wrote a long answer that
-        // hit the cap" from "model was midway through a tool call". We
-        // attach a `truncation` object so Pi-style clients can offer the
-        // user a single-click retry with a larger `max_tokens` budget.
-        //
-        // Slack of 4 tokens absorbs daemon-side post-loop trailer emits
-        // (`<|im_end|>\n` etc. that get force-flushed after the decode
-        // loop terminates on cap).
-        function detectToolCallTruncation(
-          text: string,
-          decodedTokens: number,
-          maxTokensCap: number,
-        ): { reason: string; max_tokens_used: number; suggested_max_tokens: number } | null {
-          const opens = (text.match(/<tool_call>/g) || []).length;
-          const closes = (text.match(/<\/tool_call>/g) || []).length;
-          if (opens <= closes) return null;
-          if (decodedTokens < maxTokensCap - 4) return null;
-          return {
-            reason: "max_tokens_in_tool_call",
-            max_tokens_used: decodedTokens,
-            // 4× the requested budget, capped at 32k. Empirically a single
-            // `write` tool call containing a small file (~500 LoC) needs
-            // 2-4k tokens; a 4× bump from the standard 4096 default
-            // covers the typical case without unbounded blow-up.
-            suggested_max_tokens: Math.min(Math.max(maxTokensCap * 4, 4096), 32768),
-          };
-        }
-
         function parseToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
           if (!text.includes("<tool_call>")) return { content: text, tool_calls: null };
           const pattern = /<tool_call>\s*(.*?)\s*<\/tool_call>|<tool_call>\s*(.*)/gs;
@@ -2588,33 +3637,6 @@ async function serve(port: number, host: string) {
             while (raw.startsWith("<tool_call>")) {
               raw = raw.slice("<tool_call>".length).trimStart();
               nestedStripped++;
-            }
-            // Inner-block recovery: when the outer match captured a
-            // garbled prelude with a NESTED `<tool_call>...</tool_call>`
-            // inside it (e.g. qwen3.6:27b sometimes emits
-            // `<tool_call>\n<|im_start|>name: bash\n</think>\n\n<tool_call>\n{json}\n</tool_call>`),
-            // the outer regex matched the OUTER `</tool_call>` and we
-            // got the entire garbled prelude + the inner block as one
-            // payload. Strip up to the LAST `<tool_call>` opener and
-            // try parsing from there — recovers the model's intent
-            // when it self-corrected mid-stream.
-            const lastInnerOpen = raw.lastIndexOf("<tool_call>");
-            if (lastInnerOpen >= 0) {
-              const innerRaw = raw.slice(lastInnerOpen + "<tool_call>".length).trimStart();
-              const innerClose = innerRaw.indexOf("</tool_call>");
-              const candidate = (innerClose >= 0 ? innerRaw.slice(0, innerClose) : innerRaw).trim();
-              if (candidate) {
-                const innerParsed = parseOneToolCall(candidate);
-                if (innerParsed) {
-                  repaired++;
-                  tool_calls.push({
-                    id: `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-                    type: "function",
-                    function: { name: innerParsed.name, arguments: JSON.stringify(innerParsed.arguments || {}) }
-                  });
-                  continue;
-                }
-              }
             }
             if (!raw) continue;
             const parsed = parseOneToolCall(raw);
@@ -2640,20 +3662,7 @@ async function serve(port: number, host: string) {
         // null when the payload is unrecoverable. `repaired === true` means we
         // had to coerce off-spec JSON / XML-tag shapes; valid OpenAI-spec input
         // sets repaired=false.
-        function parseOneToolCall(rawInput: string): { name: string; arguments: any; repaired: boolean } | null {
-          // Sanitize ChatML special-token leakage. qwen3.6:27b occasionally
-          // emits `<|im_start|>` / `<|im_end|>` / `<|endoftext|>` literally
-          // INSIDE the tool-call body (tokenizer quirk where the special-
-          // token boundary glues onto the JSON key). These tokens should
-          // never appear inside a tool call; strip them before any form
-          // probe so the cleaned payload has a chance at JSON.parse.
-          let raw = rawInput
-            .replace(/<\|im_start\|>/g, "")
-            .replace(/<\|im_end\|>/g, "")
-            .replace(/<\|endoftext\|>/g, "")
-            .replace(/<\|im_sep\|>/g, "")
-            .trim();
-          const sanitized = raw !== rawInput.trim();
+        function parseOneToolCall(raw: string): { name: string; arguments: any; repaired: boolean } | null {
           // Form 1: spec-compliant {"name": ..., "arguments": {...}}.
           try {
             const tc = JSON.parse(raw);
@@ -2742,63 +3751,6 @@ async function serve(port: number, host: string) {
             // dropped when only the name is recoverable.
             return { name: nm[1], arguments: {}, repaired: true };
           }
-          // Form 4: last-resort field-level extraction. Some models
-          // (qwen3.6:27b specifically) emit broken-JSON payloads where
-          // the outer `{` is missing and/or special tokens corrupt the
-          // structure (e.g. `<|im_start|>name": "write", "arguments":
-          // {"path": "..."}}`). Pull `name` and `arguments` via regex
-          // independently — if BOTH are present in any form, we can
-          // synthesize a valid tool call.
-          //
-          // Match `"name": "ident"` with the leading/trailing quote
-          // OPTIONAL on the key. qwen3.6:27b's failure mode is the
-          // special token REPLACING the opening `"` of the `name` key
-          // (`<|im_start|>name": "X"` after sanitization leaves
-          // `name": "X"` — note the unbalanced quotes around `name`).
-          // Restrict the captured identifier to JSON-style identifiers
-          // so we don't match arbitrary text after the literal `name`.
-          // `(?<![A-Za-z_])` word-boundary lookbehind so the regex
-          // doesn't match `name` inside other JSON keys like
-          // `firstname`, `displayname`, `parameter_name`. Without it
-          // a payload like `{"firstname":"X","name":"read"}` would
-          // capture "X" as the function name instead of "read". The
-          // daemon's `extract_tool_call_name_fallback` does the same
-          // check via a key-position pre-byte test (`daemon.rs`).
-          const nameMatch = raw.match(/(?<![A-Za-z_])["']?name["']?\s*:\s*["']([A-Za-z_][\w.-]*)["']/);
-          if (nameMatch) {
-            const fname = nameMatch[1];
-            // Try to locate the `"arguments":` key and grab the balanced
-            // object after it. If no such key, fall back to the FIRST
-            // balanced `{...}` in the payload (some shapes have args
-            // inlined as the top-level body).
-            const argsLeader = raw.match(/["']arguments["']\s*:\s*/);
-            let args: any = null;
-            if (argsLeader && argsLeader.index !== undefined) {
-              const tail = raw.slice(argsLeader.index + argsLeader[0].length);
-              args = extractFirstJsonObject(tail);
-            }
-            if (args === null) args = extractFirstJsonObject(raw);
-            if (args === null) {
-              // No strict-valid args object. If a brace-balanced object IS
-              // present, it's a model formatting glitch (trailing comma,
-              // unquoted key, …) — keep the call with empty args (legacy).
-              // Otherwise the call was truncated mid-args (max_tokens / grammar
-              // force-close): drop it so the emission surfaces as content +
-              // finish_reason rather than a phantom `write({})` that fails
-              // schema validation (the write-tool empty-args incident). Mirrors
-              // daemon.rs:extract_tool_calls_from_text.
-              if (jsonObjectIsComplete(raw)) return { name: fname, arguments: {}, repaired: true };
-              return null;
-            }
-            return { name: fname, arguments: args, repaired: true };
-          }
-          if (sanitized) {
-            // Last-ditch: we stripped tokens but couldn't find a name.
-            // Surface the sanitization on stderr so operators see why a
-            // visible `<tool_call>` block in the daemon stream didn't
-            // produce a structured call.
-            console.error(`[hipfire] tool_call: stripped ChatML special tokens but could not extract a name (raw=${rawInput.slice(0, 100).replace(/\n/g, "\\n")})`);
-          }
           return null;
         }
 
@@ -2848,35 +3800,14 @@ async function serve(port: number, host: string) {
           return null;
         }
 
-        // True iff a brace-balanced `{...}` exists in `s` — the object is
-        // COMPLETE (not truncated) even when it isn't strict JSON. Lets Form 4
-        // distinguish a model formatting glitch (trailing comma / unquoted key
-        // — keep the call) from a call cut off mid-args (drop it). Mirrors
-        // daemon.rs:tool_call_args_object_complete.
-        function jsonObjectIsComplete(s: string): boolean {
-          const start = s.indexOf("{");
-          if (start < 0) return false;
-          let depth = 0, inStr = false, escape = false;
-          for (let i = start; i < s.length; i++) {
-            const ch = s[i];
-            if (inStr) {
-              if (escape) { escape = false; continue; }
-              if (ch === "\\") { escape = true; continue; }
-              if (ch === '"') inStr = false;
-              continue;
-            }
-            if (ch === '"') { inStr = true; continue; }
-            if (ch === "{") depth++;
-            else if (ch === "}") { depth--; if (depth === 0) return true; }
-          }
-          return false;
+        if (isResponsesRequest) {
+          // responses streaming isn't represented here yet.
+          return Response.json({
+            error: { message: "/v1/responses currently returns non-streaming only", type: "invalid_request_error" },
+          }, { status: 400 });
         }
 
-        // hunt3 C-1: OpenAI `stream` is a strict boolean — a JSON string
-        // "false" is JS-truthy and would wrongly select the streaming path.
-        // Match the include_usage===true convention.
-        const wantStream = body.stream === true;
-        if (wantStream) {
+        if (body.stream) {
           const enc = new TextEncoder();
           let completionTokens = 0;
           let streamCancelled = false;
@@ -2905,43 +3836,9 @@ async function serve(port: number, host: string) {
                 if (visibleChunkSent || streamCancelled) return;
                 try { ctrl.enqueue(enc.encode(": prefill\n\n")); } catch {}
               }, 10_000);
-              // Force-answer watchdog: if a thinking-heavy turn runs longer
-              // than the budget, ask the daemon to STOP THINKING and commit
-              // to the answer (it splices the think-close continuation) rather
-              // than letting the client give up and terminate the stream
-              // mid-think. One-shot. Disable with HIPFIRE_FORCE_ANSWER_SECS=0.
-              const forceAnswerSecs = parseInt(process.env.HIPFIRE_FORCE_ANSWER_SECS ?? "180", 10);
-              let forceAnswerSent = false;
-              const forceAnswerTimer = forceAnswerSecs > 0
-                ? setTimeout(async () => {
-                    if (forceAnswerSent || streamCancelled) return;
-                    forceAnswerSent = true;
-                    console.error(`[hipfire] force-answer after ${forceAnswerSecs}s (reqId=${reqId}) — asking daemon to close <think> and answer`);
-                    try { await e.send({ type: "force_answer", id: reqId }); } catch (err: any) {
-                      console.error(`[hipfire] force_answer send failed: ${err?.message || err}`);
-                    }
-                  }, forceAnswerSecs * 1000)
-                : null;
               try {
-                // open_think injects the opening <think> into the PROMPT, so the
-                // output begins inside the think span (no <think> token to detect
-                // at 2725). Start in-think so the leading reasoning streams as
-                // reasoning_content and is split off content at the first </think>.
                 let inThink = genParams.assistant_prefix === "open_think";
                 let stripNextLeadingNl = false;
-                // Track whether we've emitted any visible content yet. Used
-                // to detect an orphan `</think>` opener — when the daemon
-                // prefills `<think>\n\n</think>\n\n` for `enable_thinking=false`,
-                // the model often resumes by emitting ANOTHER `</think>\n\n`
-                // (training-distribution artifact, the model learned the
-                // close pattern follows the open). Without an orphan-strip
-                // check, that `</think>` leaks into delta.content and a
-                // client like pi-coding-agent stores it in conversation
-                // history verbatim — which then defeats the asst-turn
-                // cache fingerprint on the next request. (Lookup-side
-                // fingerprint also applies the same strip, so the cache
-                // still hits even if a stale client preserves the orphan.)
-                let firstAssistantChunk = true;
                 // When tools are present, accumulate full output for tool-call parsing
                 let accumulated = hasTool ? "" : null;
                 // V4F arm emits structured `tool_calls` events via the DSML
@@ -2991,18 +3888,6 @@ async function serve(port: number, host: string) {
                     text = text.replace(/<\|im_end\|>/g, "");
                     if (!text) continue;
                     if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
-                    if (firstAssistantChunk) {
-                      // Orphan `</think>` opener strip — see firstAssistantChunk
-                      // comment above. Only fires before any visible content
-                      // has been emitted, so a legitimate `</think>` literal
-                      // later in a code block isn't affected.
-                      const stripped = text.replace(/^\s*<\/think>\s*/, "");
-                      if (stripped !== text) {
-                        text = stripped;
-                        if (!text) continue;
-                      }
-                      firstAssistantChunk = false;
-                    }
                     if (accumulated !== null) {
                       accumulated += text; // buffer for tool-call parsing at end
                     } else {
@@ -3026,40 +3911,11 @@ async function serve(port: number, host: string) {
                       visibleChunkSent = true;
                     }
                   } else if (msg.type === "tool_calls") {
-                    // Daemon-side structured tool_calls events. Two emitters:
-                    //   - V4F's DSML StreamParser (token-by-token)
-                    //   - qwen35 daemon (single event after decode, from
-                    //     `extract_tool_calls_from_text` over the full
-                    //     decoded text — same parser that hashes the
-                    //     asst-turn cache fingerprint, so what we emit
-                    //     here is byte-identical to what Pi echoes back
-                    //     and what we'll look up next turn).
-                    //
-                    // For qwen35 the text tokens streamed BEFORE this
-                    // event include the `<tool_call>{...}</tool_call>`
-                    // markup raw — buffered in `accumulated` but not yet
-                    // sent on the wire. We split the prose (text before
-                    // first `<tool_call>`) and emit it as a single
-                    // content chunk before the structured tool_calls
-                    // chunks, so the SSE order is: prose → tool_calls →
-                    // done (OpenAI canonical). V4F's stream already
-                    // stripped the markup token-side, so the split is a
-                    // no-op in practice for it.
-                    if (accumulated !== null && accumulated.length > 0) {
-                      const tcIdx = accumulated.indexOf("<tool_call>");
-                      const prose = (tcIdx >= 0 ? accumulated.slice(0, tcIdx) : accumulated).trim();
-                      if (prose) {
-                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
-                          id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: { content: prose }, finish_reason: null }]
-                        })}\n\n`));
-                        visibleChunkSent = true;
-                      }
-                      // Mark accumulated as already-flushed for the done
-                      // handler so it doesn't double-emit on the
-                      // structuredToolCallsEmitted path.
-                      accumulated = "";
-                    }
+                    // V4F daemon arm emits structured `tool_calls` events
+                    // from the DSML StreamParser. Convert each call into
+                    // an OpenAI-format tool_call SSE delta. We emit one
+                    // SSE chunk per call so order is preserved; each call
+                    // gets a synthetic `call_<index>` id.
                     const calls = Array.isArray(msg.calls) ? msg.calls : [];
                     for (let i = 0; i < calls.length; i++) {
                       const c = calls[i] as { name: string; arguments: unknown };
@@ -3106,7 +3962,6 @@ async function serve(port: number, host: string) {
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
                         ...includeUsage && { usage: buildUsage(msg, completionTokens) },
-                        timings: buildTimings(msg),
                       })}\n\n`));
                       ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                       ctrl.close();
@@ -3115,14 +3970,6 @@ async function serve(port: number, host: string) {
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
                       const parsed = parseToolCalls(accumulated);
-                      // Check for mid-tool-call truncation BEFORE falling back
-                      // to finish_reason="stop". If parseToolCalls returned no
-                      // tool_calls but the text contains an unclosed
-                      // `<tool_call>` block AND decode hit the cap, this is a
-                      // budget-truncation, not a natural stop.
-                      const truncation = !parsed.tool_calls
-                        ? detectToolCallTruncation(accumulated, (msg as any).tokens ?? 0, requestMaxTokens)
-                        : null;
                       if (parsed.tool_calls) {
                         if (parsed.content) {
                           ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
@@ -3140,7 +3987,6 @@ async function serve(port: number, host: string) {
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
                           choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
                           ...includeUsage && { usage: buildUsage(msg, completionTokens) },
-                          timings: buildTimings(msg),
                         })}\n\n`));
                       } else {
                         if (accumulated) {
@@ -3149,27 +3995,19 @@ async function serve(port: number, host: string) {
                             choices: [{ index: 0, delta: { content: accumulated }, finish_reason: null }]
                           })}\n\n`));
                         }
-                        const finishReason = truncation
-                          ? "length"
-                          : (daemonFR ?? "stop");
-                        const finalChunk: any = {
+                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-                        };
-                        if (includeUsage) finalChunk.usage = buildUsage(msg, completionTokens);
-                        if (truncation) finalChunk.truncation = truncation;
-                        // Surface perf/spec-decode metrics on the tool-call final chunk too
-                        // (matches the plain-text branch) so benchmarks see timings on
-                        // tool-calling turns.
-                        finalChunk.timings = buildTimings(msg);
-                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
+                          choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
+                          ...includeUsage && { usage: buildUsage(msg, completionTokens) },
+                        })}\n\n`));
                       }
                     } else {
+                      const { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms } = msg;
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
                         ...includeUsage && { usage: buildUsage(msg, completionTokens) },
-                        timings: buildTimings(msg)
+                        timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
                       })}\n\n`));
                     }
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
@@ -3192,93 +4030,16 @@ async function serve(port: number, host: string) {
                 }
                 // Safety: if loop exits without done/error (shouldn't happen), close stream
                 try { ctrl.close(); } catch {}
-              } catch (err: any) {
-                // hunt3 H-B: daemon crashed mid-stream (recv threw
-                // DaemonClosedError). Headers are already sent so we can't
-                // change status; surface the error in the stream body and
-                // restart the daemon so the NEXT request reloads cleanly
-                // instead of writing to a dead stdin.
-                try {
-                  ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
-                    error: { message: (err instanceof DaemonClosedError) ? "daemon crashed mid-generation" : (err?.message || "internal error"), type: "server_error" }
-                  })}\n\n`));
-                  ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
-                } catch {}
-                try { ctrl.close(); } catch {}
-                if (err instanceof DaemonClosedError) {
-                  current = null; currentMaxSeq = null; modelHasVL = false;
-                  currentArch = null; currentCacheCapable = null;
-                  try { await e.restart(); } catch (re: any) {
-                    console.error(`[hipfire] daemon restart failed: ${re?.message ?? re}`);
-                  }
-                }
               } finally {
                 clearInterval(heartbeat);
-                if (forceAnswerTimer) clearTimeout(forceAnswerTimer);
                 e.generating = false;
                 safeRelease();
               }
             },
-            // Streaming branch cancel. Set the local flag so the for-await
-            // loop drains daemon events without writing more SSE chunks,
-            // AND send `{type:"abort","id":"<reqId>"}` to the daemon so its
-            // prefill chunk loop bails at the next checkpoint. Same protocol
-            // as the non-stream branch — see project_daemon_abort_protocol
-            // memory + cli/index.ts:3034. Without this, Pi/opencode/etc.
-            // dropping a streaming connection mid-prefill leaves the daemon
-            // burning the full 23K-token re-prefill while no client is
-            // listening, locking out the next request for several minutes.
-            async cancel() {
-              console.error(`[hipfire] stream client cancelled (reqId=${reqId}) — sending abort to daemon`);
-              streamCancelled = true;
-              try {
-                await e.send({ type: "abort", id: reqId });
-                console.error(`[hipfire] abort sent (reqId=${reqId})`);
-              } catch (err: any) {
-                console.error(`[hipfire] stream abort send failed: ${err?.message || err}`);
-              }
-            }
+            cancel() { streamCancelled = true; } // lock released in finally after generation drains
           }), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
         }
 
-        // Non-stream chat-completion with heartbeat. The OpenAI-style
-        // non-streaming response is a single JSON body, but Bun's
-        // server-side connection idleTimeout is capped at 255s — and
-        // on 27B with a 30K+-token agent context the daemon's prefill
-        // (one synchronous device call per chunk, zero events until
-        // first sampled token) sits silent for 3–5 minutes. The Bun
-        // socket then idle-closes and the client (Pi, opencode, etc.)
-        // sees "terminated".
-        //
-        // Fix: deliver the response body via a `ReadableStream` and
-        // emit a single space byte every 10s before the JSON is ready.
-        // JSON RFC 8259 §2 allows whitespace anywhere between value
-        // tokens, so a leading-space prefix parses identically on any
-        // lenient JSON client. Each byte enqueued resets Bun's idle
-        // timer. Errors thrown inside the worker land in the catch
-        // and emit a JSON error body (status stays 200 because the
-        // header has already been sent — clients should check for the
-        // `error` field, matching the existing streaming-error
-        // convention).
-        const nsEnc = new TextEncoder();
-        // `nsClientAborted` is set by the ReadableStream's `cancel()`
-        // callback when the client closes the socket (curl `-m` timeout,
-        // Pi / opencode giving up, etc.). The worker checks this flag in
-        // its event loop and stops processing tokens / building the
-        // response — but it MUST keep draining `e.generate` until the
-        // daemon's `done` event lands. Skipping the drain leaves the
-        // EngineConnection with stale events queued for the NEXT
-        // request, which would corrupt that request's response.
-        // Same pattern as the streaming branch (cli/index.ts:2518).
-        let nsClientAborted = false;
-        const nsResponse = new Response(new ReadableStream({
-          async start(ctrl) {
-            let bodyDelivered = false;
-            const heartbeat = setInterval(() => {
-              if (bodyDelivered) return;
-              try { ctrl.enqueue(nsEnc.encode(" ")); } catch {}
-            }, 10_000);
-            try {
         let content = "";
         let completionTokens = 0;
         let promptTokens = 0;
@@ -3300,7 +4061,6 @@ async function serve(port: number, host: string) {
         let reasoningContent = "";
         let daemonFinishReason: string | null = null;
         for await (const msg of e.generate(genParams)) {
-          if (nsClientAborted) continue; // drain remaining daemon events, don't accumulate
           if (msg.type === "token") { content += msg.text; completionTokens++; }
           else if (msg.type === "reasoning") {
             // V4F's StreamParser splits `<think>…</think>` content out
@@ -3312,21 +4072,16 @@ async function serve(port: number, host: string) {
           }
           else if (msg.type === "done") {
             // `prompt_tokens` is the full client-visible prompt size
-            // (V4F emits it). When absent, derive as `cached + prefill`
-            // — i.e. the total of cached-hit tokens plus the new tokens
-            // actually pushed through the forward path this turn. The
-            // legacy "just use prefill_tokens" fallback was wrong on
-            // cache hits, producing `prompt_tokens < cached_tokens`
-            // which contradicts the OpenAI usage spec.
+            // (V4F emits it). `prefill_tokens` (legacy) is what
+            // actually went through forward — equal to prompt when
+            // cached_tokens is 0. Fall back to prefill_tokens so the
+            // non-V4F paths keep their existing accounting.
+            promptTokens = typeof msg.prompt_tokens === "number"
+              ? msg.prompt_tokens
+              : (msg.prefill_tokens ?? 0);
             cachedTokens = typeof msg.cached_tokens === "number"
               ? msg.cached_tokens
               : 0;
-            const _prefill = typeof msg.prefill_tokens === "number"
-              ? msg.prefill_tokens
-              : 0;
-            promptTokens = typeof msg.prompt_tokens === "number"
-              ? msg.prompt_tokens
-              : cachedTokens + _prefill;
             // V4F daemon emits an authoritative finish_reason. Only
             // accept the three OpenAI-valid values; anything else falls
             // back to the legacy inference below.
@@ -3356,26 +4111,22 @@ async function serve(port: number, host: string) {
         e.generating = false;
 
         // If the daemon rejected the request mid-generate (e.g. KV-budget
-        // overrun on a huge system prompt), surface that error.
-        //
-        // hunt3 B-4: we are INSIDE the ReadableStream `start(ctrl)`, so the
-        // 200 headers were ALREADY sent (Bun streams the body lazily) — a
-        // `return Response.json(...)` here is silently DISCARDED and, worse,
-        // `start()` returns WITHOUT ctrl.enqueue/close, so the already-open
-        // 200 stream never terminates and the client hangs until the 255s
-        // idle timeout. Emit the error THROUGH the open controller and close
-        // it (status can't change post-headers; the failure rides in the
-        // body's `error` field, matching the streaming branch's convention).
+        // overrun on a huge system prompt), surface that as a 400 instead of
+        // returning a 200 with empty content — otherwise a client that sent a
+        // too-large request can't distinguish failure from a zero-token reply.
         if (daemonError) {
-          bodyDelivered = true;
           safeRelease();
-          try {
-            ctrl.enqueue(nsEnc.encode(JSON.stringify(
-              { error: { message: daemonError, type: "invalid_request_error" } }
-            )));
-          } catch {}
-          try { ctrl.close(); } catch {}
-          return;
+          let status = 500;
+          const err = daemonError.toLowerCase();
+          if (err.includes("maximum size") || err.includes("exceeds maximum")) status = 413;
+          else if (err.includes("no vision encoder") || err.includes("unsupported image format")
+            || err.includes("image dimensions") || err.includes("failed to decode base64")
+            || err.includes("failed to decode image") || err.includes("exceeds loaded kv budget"))
+            status = 400;
+          return Response.json(
+            { error: { message: daemonError, type: "invalid_request_error" } },
+            { status }
+          );
         }
 
         // Strip think tags and special tokens.
@@ -3385,8 +4136,18 @@ async function serve(port: number, host: string) {
         // intact in message.content for clients that want a single-string
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
-        const strippedContent = content;
-        content = stripVisibleThinking(content, preserveThinking, genParams.assistant_prefix === "open_think");
+        let strippedContent = content;
+        if (!preserveThinking && genParams.assistant_prefix === "open_think" && !content.includes("<think>")) {
+          content = "<think>" + content;
+          strippedContent = content;
+        }
+        if (preserveThinking) {
+          content = content.replace(/<\|im_end\|>/g, "").trim();
+        } else {
+          content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+            .replace(/<think>[\s\S]*$/, "") // unclosed think block
+            .replace(/<\|im_end\|>/g, "").trim();
+        }
 
         // Diagnostic: detect empty-after-unclosed-think-strip.
         let thinkWarning: string | null = null;
@@ -3395,25 +4156,20 @@ async function serve(port: number, host: string) {
           console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens consumed, all inside unclosed <think> block`);
         }
 
-        // Tool calls. V4F and qwen35 daemon arms yield them as
-        // structured `tool_calls` events (captured above into
-        // `structuredToolCalls`). Legacy arches embed them as text
-        // the parser extracts. Prefer the structured source when it
+        // Tool calls. V4F arm yields them as structured events (captured
+        // above into `structuredToolCalls`); legacy arches embed them as
+        // text the parser extracts. Prefer the structured source when it
         // emitted anything.
         const choice: any = { index: 0 };
         if (structuredToolCalls && structuredToolCalls.length > 0) {
-          // For qwen35 the `content` variable holds the full raw token
-          // stream including the `<tool_call>{...}</tool_call>` markup
-          // (daemon doesn't strip those token-side). Split prose from
-          // markup so `message.content` doesn't double-deliver the
-          // tool_call to the client. V4F already stripped markup
-          // token-side, so the split is a no-op for that arch.
-          const tcIdx = content.indexOf("<tool_call>");
-          const prose = tcIdx >= 0 ? content.slice(0, tcIdx).trim() : content.trim();
+          // V4F's `Token` events outside the `<｜DSML｜tool_calls>` block
+          // already streamed any preceding assistant text. Pass that
+          // through as the message content (trimmed — the model
+          // typically emits trailing `\n\n` after closing `</think>`).
           choice.finish_reason = daemonFinishReason ?? "tool_calls";
           choice.message = {
             role: "assistant",
-            content: prose || null,
+            content: content.trim() || null,
             tool_calls: structuredToolCalls,
           };
           if (reasoningContent) choice.message.reasoning_content = reasoningContent;
@@ -3425,20 +4181,14 @@ async function serve(port: number, host: string) {
           // but if the daemon told us "length" (max_tokens hit), use
           // that even when there's no tool call, so clients can
           // detect truncated replies.
-          const nonStreamTruncation = !parsed.tool_calls
-            ? detectToolCallTruncation(content, completionTokens, requestMaxTokens)
-            : null;
-          choice.finish_reason = nonStreamTruncation
-            ? "length"
-            : (daemonFinishReason ?? (parsed.tool_calls ? "tool_calls" : "stop"));
+          choice.finish_reason = daemonFinishReason
+            ?? (parsed.tool_calls ? "tool_calls" : "stop");
           if (parsed.tool_calls) {
             choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
           } else {
             choice.message = { role: "assistant", content };
           }
           if (reasoningContent) choice.message.reasoning_content = reasoningContent;
-          // Stash for response-builder below.
-          (choice as any)._truncation = nonStreamTruncation;
         }
 
         safeRelease();
@@ -3446,120 +4196,26 @@ async function serve(port: number, host: string) {
           id: reqId, object: "chat.completion", created, model: modelName,
           choices: [choice],
           usage: (() => {
-            const cacheWriteTokens = Math.max(0, promptTokens - cachedTokens);
-            // Pi's openai-completions provider
-            // (packages/ai/src/providers/openai-completions.ts in
-            // earendil-works/pi) reads BOTH cacheRead and cacheWrite
-            // from `prompt_tokens_details`:
-            //   cacheRead  ← prompt_tokens_details.cached_tokens
-            //   cacheWrite ← prompt_tokens_details.cache_write_tokens
-            //   input      ← prompt_tokens − cacheRead − cacheWrite
-            // Emit both nested fields so Pi's display shows non-zero
-            // cacheWrite alongside cacheRead on cache hits.
             const u: any = {
               prompt_tokens: promptTokens,
               completion_tokens: completionTokens,
               total_tokens: promptTokens + completionTokens,
-              prompt_tokens_details: {
-                cached_tokens: cachedTokens,
-                cache_write_tokens: cacheWriteTokens,
-              },
             };
-            // Anthropic-shape top-level mirror for non-Pi multi-provider
-            // clients.
-            u.cache_read_input_tokens = cachedTokens;
-            u.cache_creation_input_tokens = cacheWriteTokens;
+            if (cachedTokens > 0) {
+              u.prompt_tokens_details = { cached_tokens: cachedTokens };
+            }
             return u;
           })(),
         };
         if (thinkWarning) {
           responseBody.x_hipfire_warning = thinkWarning;
         }
-        const nonStreamTrunc = (choice as any)._truncation;
-        if (nonStreamTrunc) {
-          delete (choice as any)._truncation;
-          responseBody.truncation = nonStreamTrunc;
+        if (url.pathname === "/v1/responses") {
+          const responseId = responseBody.id || `resp_${newObjectId("resp")}`;
+          return Response.json(toResponsesObject(responseId, responseBody));
         }
-              bodyDelivered = true;
-              ctrl.enqueue(nsEnc.encode(JSON.stringify(responseBody)));
-              ctrl.close();
-            } catch (err: any) {
-              bodyDelivered = true;
-              // hunt3 H-B: daemon crash (DaemonClosedError) mid-generate —
-              // restart so the next request reloads cleanly instead of
-              // writing to a dead stdin. Status stays 200 (header sent); the
-              // error rides in the body (matches the existing convention).
-              e.generating = false;
-              if (err instanceof DaemonClosedError) {
-                current = null; currentMaxSeq = null; modelHasVL = false;
-                currentArch = null; currentCacheCapable = null;
-                try { await e.restart(); } catch (re: any) {
-                  console.error(`[hipfire] daemon restart failed: ${re?.message ?? re}`);
-                }
-              }
-              safeRelease();
-              try {
-                ctrl.enqueue(nsEnc.encode(JSON.stringify({ error: (err instanceof DaemonClosedError) ? "daemon crashed mid-generation" : (err?.message || "internal error") })));
-              } catch {}
-              try { ctrl.close(); } catch {}
-            } finally {
-              clearInterval(heartbeat);
-            }
-          },
-          // Fires when the HTTP client closes the connection (curl
-          // hit its `-m` cap, Pi / opencode gave up after their own
-          // timeout, etc.).
-          //
-          // Two actions happen here:
-          //   1. Send `{type:"abort","id":"<reqId>"}` to the daemon.
-          //      The daemon's background stdin reader picks this up
-          //      asynchronously and signals the prefill chunk loop
-          //      to bail at the next chunk boundary (~5 s latency
-          //      on gfx1151 at 50 tps). The daemon emits `aborted`
-          //      + `done` events to terminate the generation.
-          //   2. Set `nsClientAborted = true` so the for-await loop
-          //      drains remaining daemon events (the aborted/done)
-          //      WITHOUT accumulating them into the response. This
-          //      keeps the EngineConnection's event queue clean for
-          //      the next request.
-          async cancel() {
-            console.error(`[hipfire] non-stream client cancelled (reqId=${reqId}) — sending abort to daemon`);
-            nsClientAborted = true;
-            try {
-              await e.send({ type: "abort", id: reqId });
-              console.error(`[hipfire] abort sent (reqId=${reqId})`);
-            } catch (err: any) {
-              console.error(`[hipfire] abort send failed: ${err?.message || err}`);
-            }
-          }
-        }), { headers: { "Content-Type": "application/json" } });
-        return nsResponse;
+        return Response.json(responseBody);
       } catch (err: any) {
-        // hunt3 H-B: a daemon crash now throws DaemonClosedError from recv()
-        // (instead of process.exit-ing the whole serve). Recover for THIS
-        // request only: restart the daemon, clear the loaded-model state so
-        // the next request reloads, and return 500 to this one client. Other
-        // clients' subsequent requests reload cleanly instead of the serve
-        // dying for everyone.
-        e.generating = false;
-        if (err instanceof DaemonClosedError) {
-          console.error(`[hipfire] daemon closed (code ${err.code}) — restarting for next request`);
-          current = null;
-          currentMaxSeq = null;
-          modelHasVL = false;
-          currentArch = null;
-          currentCacheCapable = null;
-          try {
-            await e.restart();
-          } catch (restartErr: any) {
-            console.error(`[hipfire] daemon restart failed: ${restartErr?.message ?? restartErr}`);
-          }
-          safeRelease();
-          return Response.json(
-            { error: { message: "daemon crashed and was restarted; retry the request", type: "server_error" } },
-            { status: 500 },
-          );
-        }
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });
       }
@@ -3591,6 +4247,74 @@ function findTriAttnValidateBinary(): string | null {
   // Installed: ~/.hipfire/bin/ (no examples/ subdir — update copies directly)
   const installedCandidates = [join(HIPFIRE_DIR, "bin", `triattn_validate${exe}`)];
   return devCandidates.find(p => existsSync(p)) || installedCandidates.find(p => existsSync(p)) || null;
+}
+
+function artifactFormatToken(format: string): string {
+  switch (format.toLowerCase()) {
+    case "mq2-lloyd":
+    case "mq2g256-lloyd":
+    case "mq2lloyd":
+      return "mq2lloyd";
+    case "hfq4":
+    case "hfq4g256":
+      return "hf4";
+    case "hfq6":
+    case "hfq6g256":
+      return "hf6";
+    case "q8f16":
+      return "q8";
+    default:
+      return format.toLowerCase();
+  }
+}
+
+function artifactFileName(stem: string, format: string): string {
+  const token = artifactFormatToken(format);
+  return new RegExp(`(?:^|[-.])${token}$`, "i").test(stem)
+    ? `${stem}.hfq`
+    : `${stem}-${token}.hfq`;
+}
+
+function artifactQuantToken(filename: string): string | null {
+  const lower = filename.toLowerCase();
+  const canonical = lower.match(/(?:^|[-.])(mq2lloyd|mq3|mq4|mq6|hf4|hf6|q8|q8f16)(?:\+[^.]*)?\.hfq$/);
+  if (canonical) return artifactFormatToken(canonical[1]);
+  const legacy = lower.match(/\.(mq2lloyd|mq3|mq4|mq6|hf4|hf6)$/);
+  if (legacy) return artifactFormatToken(legacy[1]);
+  return null;
+}
+
+function isRoleSidecarArtifact(filename: string): boolean {
+  return /\.(mtp|dflash|triattn)\.hfq$/i.test(filename);
+}
+
+function defaultRoleSidecarPath(modelPath: string, role: string): string {
+  return modelPath.toLowerCase().endsWith(".hfq")
+    ? `${modelPath.slice(0, -4)}.${role}.hfq`
+    : `${modelPath}.${role}.hfq`;
+}
+
+function parseQwenQuantArtifact(filename: string): { version: string; size: string; quant: string } | null {
+  const m = filename.toLowerCase().match(/qwen3[._-]?(5|6)[-_](.+?)(?:[-.])(mq3|mq4|mq6|hf4|hf6|hfq4|hfq6|q8)(?:\+[^.]*)?(?:\.hfq)?$/);
+  if (!m) return null;
+  return {
+    version: m[1],
+    size: m[2],
+    quant: artifactFormatToken(m[3]),
+  };
+}
+
+function modelFileAliases(filename: string): string[] {
+  const aliases = new Set<string>([filename]);
+  const token = artifactQuantToken(filename);
+  if (token && filename.endsWith(`-${token}.hfq`)) {
+    aliases.add(filename.replace(new RegExp(`-${token}\\.hfq$`, "i"), `.${token}`));
+  }
+  if (token && filename.endsWith(`.${token}.hfq`)) {
+    aliases.add(filename.replace(new RegExp(`\\.${token}\\.hfq$`, "i"), `.${token}`));
+  }
+  aliases.add(filename.replace(/\.q4\.hfq$/, ".hf4").replace(/\.hfq6\.hfq$/, ".hf6").replace(/-hfq4\.hfq$/, ".hf4").replace(/\.hfq$/, ".hf4"));
+  return [...aliases];
 }
 
 interface QuantizeOpts {
@@ -3662,8 +4386,8 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
   // GGUF input supports hf4 (default for dense), hf6 (dense, higher
   // quality), mq4 / mq6 (FWHT-rotated, Qwen3.5+ DeltaNet hot path).
   // Q8 / safetensors-only formats are rejected. The format string is also
-  // the file extension — keep it short ("hf4") to match how the rest of
-  // the CLI (resolveModelTag, list/ps enumeration) recognizes models.
+  // the artifact token in names like `<stem>-hf4.hfq`; keep it short ("hf4")
+  // to match how the rest of the CLI recognizes models.
   if (isGgufFile) {
     // Normalize hfq4/hfq4g256 → hf4, hfq6/hfq6g256 → hf6 so the output
     // filename uses the canonical extension that CLI discovery picks up.
@@ -3711,7 +4435,7 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
   for (const format of opts.formats) {
     const out = opts.output
       ? resolve(opts.output)
-      : join(outDir, `${baseName}.${format}`);
+      : join(outDir, artifactFileName(baseName, format));
 
     console.error(`\nQuantizing ${inputForBinary}`);
     console.error(`  → ${out} (${format})`);
@@ -3780,16 +4504,17 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
 
   // Optional: append a local user-alias so the custom tag is addressable.
   if (opts.register) {
+    const aliasPath = join(HIPFIRE_DIR, "models.json");
+    let aliases: Record<string, any> = {};
+    try { aliases = JSON.parse(require("fs").readFileSync(aliasPath, "utf-8")); } catch {}
     const primary = produced.find(p => p.format === "mq4") ?? produced[0];
-    const catalog = refreshModelsCatalog({ write: false });
-    catalog.aliases[opts.register] = {
+    aliases[opts.register] = {
       repo: opts.uploadRepo ?? "",
       file: basename(primary.path),
       local_path: primary.path,
       registered_at: new Date().toISOString(),
     };
-    writeModelsCatalog(catalog);
-    refreshModelsCatalog();
+    require("fs").writeFileSync(aliasPath, JSON.stringify(aliases, null, 2) + "\n");
     console.error(`Registered ${opts.register} → ${basename(primary.path)}`);
     console.error(`  Try: hipfire run ${opts.register} "hello"`);
   }
@@ -3804,319 +4529,19 @@ interface UserAlias {
   registered_at?: string;
 }
 
-interface LocalModelRecord {
-  id: string;
-  file: string;
-  path: string;
-  size_bytes: number;
-  size_gb: number;
-  registry_tag?: string | null;
-  aliases?: string[];
-  chat_templates?: string[];
-  dflash_drafts?: string[];
-  triattn?: string[];
-  config?: PerModelOverride;
-}
-
-interface ModelsCatalog {
-  schema_version: 2;
-  updated_at: string;
-  aliases: Record<string, UserAlias>;
-  configs?: PerModelConfigs;
-  models: Record<string, LocalModelRecord>;
-}
-
-const MODEL_EXT_RE = /\.(hf4|hf6|hfq|mq3|mq4|mq6|mq2lloyd)$/i;
-
-function readJsonFile(path: string): any | null {
-  try {
-    const raw = readFileSync(path, "utf-8").trim();
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch { return null; }
-}
-
-function sanitizePerModelOverride(ov: any): PerModelOverride {
-  const clean: PerModelOverride = {};
-  if (!ov || typeof ov !== "object") return clean;
-  const src = { ...ov };
-  // Migrate legacy boolean mmq_screen -> tri-state.
-  if (typeof src.mmq_screen === "boolean") src.mmq_screen = src.mmq_screen ? "on" : "off";
-  for (const k of PER_MODEL_KEYS) {
-    const v = src[k];
-    if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
-  }
-  return clean;
-}
-
-function normalizeAliasMap(raw: any): Record<string, UserAlias> {
-  const aliases: Record<string, UserAlias> = {};
-  if (!raw || typeof raw !== "object") return aliases;
-  for (const [tag, value] of Object.entries(raw)) {
-    if (!value || typeof value !== "object") continue;
-    const v = value as any;
-    if (typeof v.file !== "string") continue;
-    aliases[tag] = {
-      repo: typeof v.repo === "string" ? v.repo : "",
-      file: v.file,
-      local_path: typeof v.local_path === "string" ? v.local_path : undefined,
-      registered_at: typeof v.registered_at === "string" ? v.registered_at : undefined,
-    };
-  }
-  return aliases;
-}
-
-function emptyModelsCatalog(aliases: Record<string, UserAlias> = {}): ModelsCatalog {
-  return {
-    schema_version: 2,
-    updated_at: new Date().toISOString(),
-    aliases,
-    configs: {},
-    models: {},
-  };
-}
-
-function sanitizePerModelConfigs(raw: any): PerModelConfigs {
-  const out: PerModelConfigs = {};
-  if (!raw || typeof raw !== "object") return out;
-  for (const [tag, ov] of Object.entries(raw)) {
-    const clean = sanitizePerModelOverride(ov);
-    if (Object.keys(clean).length > 0) out[tag] = clean;
-  }
-  return out;
-}
-
-function normalizeCatalogModels(raw: any): Record<string, LocalModelRecord> {
-  const models: Record<string, LocalModelRecord> = {};
-  if (!raw || typeof raw !== "object") return models;
-  for (const [id, value] of Object.entries(raw)) {
-    if (!value || typeof value !== "object") continue;
-    const v = value as any;
-    if (typeof v.path !== "string" || typeof v.file !== "string") continue;
-    models[id] = {
-      id,
-      file: v.file,
-      path: v.path,
-      size_bytes: Number(v.size_bytes) || 0,
-      size_gb: Number(v.size_gb) || 0,
-      registry_tag: typeof v.registry_tag === "string" ? v.registry_tag : null,
-      aliases: Array.isArray(v.aliases) ? v.aliases.filter((x: any) => typeof x === "string") : [],
-      chat_templates: Array.isArray(v.chat_templates) ? v.chat_templates.filter((x: any) => typeof x === "string") : [],
-      dflash_drafts: Array.isArray(v.dflash_drafts) ? v.dflash_drafts.filter((x: any) => typeof x === "string") : [],
-      triattn: Array.isArray(v.triattn) ? v.triattn.filter((x: any) => typeof x === "string") : [],
-      config: sanitizePerModelOverride(v.config),
-    };
-    if (Object.keys(models[id].config ?? {}).length === 0) delete models[id].config;
-  }
-  return models;
-}
-
-function loadModelsCatalog(): ModelsCatalog {
-  const raw = readJsonFile(MODELS_CATALOG_PATH);
-  if (raw?.schema_version === 2) {
-    return {
-      schema_version: 2,
-      updated_at: typeof raw.updated_at === "string" ? raw.updated_at : new Date().toISOString(),
-      aliases: normalizeAliasMap(raw.aliases),
-      configs: sanitizePerModelConfigs(raw.configs),
-      models: normalizeCatalogModels(raw.models),
-    };
-  }
-  // Legacy models.json was a flat alias map written by quantize --register.
-  return emptyModelsCatalog(normalizeAliasMap(raw));
-}
-
-function loadLegacyPerModelConfigsRaw(): Record<string, any> {
-  const raw = readJsonFile(PER_MODEL_CONFIG_PATH);
-  return raw && typeof raw === "object" ? raw : {};
-}
-
-function clearLegacyPerModelConfigs() {
-  try {
-    if (existsSync(PER_MODEL_CONFIG_PATH)) writeFileSync(PER_MODEL_CONFIG_PATH, "{}\n");
-  } catch {}
-}
-
-function writeModelsCatalog(catalog: ModelsCatalog) {
-  mkdirSync(HIPFIRE_DIR, { recursive: true });
-  catalog.schema_version = 2;
-  catalog.updated_at = new Date().toISOString();
-  const tmp = `${MODELS_CATALOG_PATH}.tmp`;
-  writeFileSync(tmp, JSON.stringify(catalog, null, 2) + "\n");
-  renameSync(tmp, MODELS_CATALOG_PATH);
-}
-
-function scanFiles(dir: string, pred: (name: string) => boolean): string[] {
-  try {
-    return readdirSync(dir)
-      .filter(pred)
-      .map(f => join(dir, f))
-      .filter(p => {
-        try { return statSync(p).isFile(); } catch { return false; }
-      })
-      .sort();
-  } catch { return []; }
-}
-
-function registryTagForFile(file: string): string | null {
-  const fNorm = file
-    .replace(/\.q4\.hfq$/i, ".hf4")
-    .replace(/\.hfq6\.hfq$/i, ".hf6")
-    .replace(/-hfq4\.hfq$/i, ".hf4")
-    .replace(/\.hfq$/i, ".hf4");
-  return Object.entries(REGISTRY).find(([_, e]) => e.file === file || e.file === fNorm)?.[0] ?? null;
-}
-
-function modelFamily(id: string): string | null {
-  const lower = id.toLowerCase();
-  const m = lower.match(/^(qwen3(?:\.[56])?|carnice|qwopus|gemma|mistral)/);
-  return m?.[1] ?? null;
-}
-
-function templateMatchesModel(templatePath: string, modelId: string): boolean {
-  const t = basename(templatePath).toLowerCase();
-  const tStem = t.replace(/\.(j2|jinja2|jinja)$/i, "");
-  const lowerId = modelId.toLowerCase();
-  const modelStem = lowerId.replace(/\.(hf4|hf6|hfq|mq3|mq4|mq6|mq2lloyd)$/i, "");
-  if (tStem === lowerId || tStem === modelStem) return true;
-  const family = modelFamily(modelId);
-  if (!family) return false;
-  return tStem === `${family}-chat_template`
-    || tStem === `${family}_chat_template`
-    || tStem === `${family}.chat_template`;
-}
-
-function draftMatchesModel(draftPath: string, modelId: string): boolean {
-  const d = basename(draftPath).toLowerCase();
-  if (!d.endsWith(".hfq")) return false;
-  const m = modelId.toLowerCase().match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq3|mq4|mq6|hf4|hf6|hfq|mq2lloyd)/);
-  if (!m) return false;
-  return d.startsWith(`qwen3${m[1]}-${m[2].toLowerCase()}-dflash-`);
-}
-
-function triattnMatchesModel(sidecarPath: string, modelId: string): boolean {
-  const s = basename(sidecarPath).toLowerCase();
-  return s.startsWith(`${modelId.toLowerCase()}.triattn`) && s.endsWith(".bin");
-}
-
-function catalogModelIdForConfigKey(catalog: ModelsCatalog, key: string): string | null {
-  if (catalog.models[key]) return key;
-  const resolved = resolveModelTag(key);
-  for (const model of Object.values(catalog.models)) {
-    if (model.registry_tag === key || model.registry_tag === resolved) return model.id;
-    if ((model.aliases ?? []).includes(key) || (model.aliases ?? []).includes(resolved)) return model.id;
-  }
-  return null;
-}
-
-function refreshModelsCatalog(opts: { write?: boolean } = {}): ModelsCatalog {
-  const shouldWrite = opts.write !== false;
-  const previous = loadModelsCatalog();
-  const legacyConfigs = sanitizePerModelConfigs(loadLegacyPerModelConfigsRaw());
-  const catalog = emptyModelsCatalog(previous.aliases);
-  const templates = scanFiles(TEMPLATES_DIR, f => /\.(j2|jinja|jinja2)$/i.test(f));
-  const drafts = [
-    ...scanFiles(DRAFTS_DIR, f => f.toLowerCase().endsWith(".hfq")),
-    ...scanFiles(MODELS_DIR, f => /dflash/i.test(f) && f.toLowerCase().endsWith(".hfq")),
-  ];
-  const triattn = [
-    ...scanFiles(TRIATTN_DIR, f => f.toLowerCase().endsWith(".triattn.bin")),
-    ...scanFiles(MODELS_DIR, f => /\.triattn.*\.bin$/i.test(f)),
-  ];
-
-  const existingConfigs: PerModelConfigs = { ...(previous.configs ?? {}), ...legacyConfigs };
-  for (const [id, model] of Object.entries(previous.models ?? {})) {
-    if (model.config && Object.keys(model.config).length > 0) existingConfigs[id] = model.config;
-  }
-
-  const modelPaths = [
-    ...scanFiles(MODELS_DIR, f => MODEL_EXT_RE.test(f)),
-    ...scanFiles(resolve(__dirname, "../models"), f => MODEL_EXT_RE.test(f)),
-  ];
-  const seen = new Set<string>();
-  for (const path of modelPaths) {
-    const file = basename(path);
-    if (seen.has(file)) continue;
-    seen.add(file);
-    let st;
-    try { st = statSync(path); } catch { continue; }
-    const registryTag = registryTagForFile(file);
-    const aliases = Object.entries(catalog.aliases)
-      .filter(([_, a]) => {
-        if (a.local_path && resolve(a.local_path) === resolve(path)) return true;
-        return a.file === file;
-      })
-      .map(([tag]) => tag)
-      .sort();
-
-    const configCandidates = [file, registryTag, ...aliases].filter(Boolean) as string[];
-    let mergedConfig: PerModelOverride = {};
-    for (const key of configCandidates) {
-      mergedConfig = { ...mergedConfig, ...sanitizePerModelOverride(existingConfigs[key]) };
-    }
-
-    const rec: LocalModelRecord = {
-      id: file,
-      file,
-      path: resolve(path),
-      size_bytes: st.size,
-      size_gb: Number((st.size / 1e9).toFixed(3)),
-      registry_tag: registryTag,
-      aliases,
-      chat_templates: templates.filter(t => templateMatchesModel(t, file)),
-      dflash_drafts: drafts.filter(d => draftMatchesModel(d, file)),
-      triattn: triattn.filter(s => triattnMatchesModel(s, file)),
-    };
-    if (Object.keys(mergedConfig).length > 0) rec.config = mergedConfig;
-    catalog.models[file] = rec;
-  }
-
-  const unresolved: PerModelConfigs = {};
-  for (const [key, ov] of Object.entries(existingConfigs)) {
-    if (!catalogModelIdForConfigKey(catalog, key)) {
-      const clean = sanitizePerModelOverride(ov);
-      if (Object.keys(clean).length > 0) unresolved[key] = clean;
-    }
-  }
-  catalog.configs = unresolved;
-
-  if (shouldWrite) {
-    try {
-      writeModelsCatalog(catalog);
-      if (Object.keys(legacyConfigs).length > 0) clearLegacyPerModelConfigs();
-    } catch {}
-  }
-  return catalog;
-}
-
-function catalogModelOptions(): string[] {
-  const catalog = loadModelsCatalog();
-  const values = new Set<string>();
-  for (const model of Object.values(catalog.models)) {
-    values.add(model.id);
-    if (model.registry_tag) values.add(model.registry_tag);
-    for (const alias of model.aliases ?? []) values.add(alias);
-  }
-  return [...values].sort();
-}
-
 function loadUserAliases(): Record<string, UserAlias> {
-  return loadModelsCatalog().aliases;
+  try {
+    return JSON.parse(require("fs").readFileSync(join(HIPFIRE_DIR, "models.json"), "utf-8"));
+  } catch { return {}; }
 }
 
 export function findModel(name: string): string | null {
   // Direct file path
   if (existsSync(name)) return resolve(name);
 
-  const catalog = loadModelsCatalog();
-  const catalogModel = catalog.models[name]
-    ?? catalog.models[resolveModelTag(name)]
-    ?? catalog.models[catalogModelIdForConfigKey(catalog, name) ?? ""];
-  if (catalogModel?.path && existsSync(catalogModel.path)) return resolve(catalogModel.path);
-
   // User aliases (from `hipfire quantize ... --register`) take precedence
   // over the built-in REGISTRY so custom tags always resolve.
-  const userAliases = catalog.aliases;
+  const userAliases = loadUserAliases();
   const alias = userAliases[name] || userAliases[resolveModelTag(name)];
   if (alias) {
     if (alias.local_path && existsSync(alias.local_path)) return resolve(alias.local_path);
@@ -4131,7 +4556,7 @@ export function findModel(name: string): string | null {
     const p = join(MODELS_DIR, entry.file);
     if (existsSync(p)) return p;
     // Backward compat: try old .hfq naming for the SAME quant level only
-    // (only applies to .hf4 / .hf6 — .mq4 has no legacy alias)
+    // (only applies to old .hf4 / .hf6 registry entries).
     if (entry.file.endsWith(".hf4") || entry.file.endsWith(".hf6")) {
       const base = entry.file.replace(/\.(hf4|hf6)$/, "");
       const isHf6 = entry.file.endsWith(".hf6");
@@ -4146,26 +4571,29 @@ export function findModel(name: string): string | null {
   }
 
   // Fuzzy search local dirs (top-level + one level of subdirectories)
-  // If the name includes a quant hint (hf4/hf6/mq4/mq6), match exactly.
-  // Otherwise prefer .mq4 (default quant: FWHT-rotated 4-bit, quality-gated,
-  // WMMA-accelerated on RDNA3+). Fall back to .hf4 only if no .mq4 is found
-  // so Qwen3 (which currently ships only .hf4) still resolves.
+  // If the name includes a quant hint (hf4/hf6/mq3/mq4/mq6/q8), match exactly.
+  // Otherwise prefer MQ4 (default quant: FWHT-rotated 4-bit, quality-gated,
+  // WMMA-accelerated on RDNA3+). Fall back to HF4 only if no MQ4 is found
+  // so Qwen3 (which currently ships only HF4) still resolves.
   const searchName = name.replace(":", "-");
-  const hasQuantHint = /\.(hf[46]|mq[46])$|-(hf[46]|mq[46])$/.test(name);
+  const hasQuantHint = /(?:^|[-.])(hf[46]|mq2lloyd|mq[346]|q8)(?:\+[^.]*)?(?:\.hfq)?$/i.test(name);
   const matchesName = (f: string) => f === name || f === searchName
     || f.includes(name) || f.includes(searchName);
-  const hasValidExt = (f: string) => f.endsWith(".mq4") || f.endsWith(".mq6")
-    || f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq2lloyd");
+  const hasValidExt = (f: string) => !isRoleSidecarArtifact(f)
+    && (artifactQuantToken(f) !== null || f.endsWith(".hfq"));
 
-  // Preference order when no quant hint: .mq4 → .hf4 → .hf6 → .mq6 → .hfq
+  // Preference order when no quant hint: MQ4 → HF4 → legacy HFQ → MQ3 → MQ6 → HF6 → Q8.
   // (MQ6 only if explicitly asked; HF6 ditto — both are larger files.)
   const extPriority = (f: string): number => {
-    if (f.endsWith(".mq4")) return 0;
-    if (f.endsWith(".hf4")) return 1;
-    if (f.endsWith(".hfq")) return 2; // legacy HF4 naming
-    if (f.endsWith(".mq2lloyd")) return 3;
-    if (f.endsWith(".mq6")) return 4;
-    if (f.endsWith(".hf6")) return 5;
+    const token = artifactQuantToken(f);
+    if (token === "mq4") return 0;
+    if (token === "hf4") return 1;
+    if (f.endsWith(".hfq") && !token) return 2; // legacy HF4 naming
+    if (token === "mq3") return 3;
+    if (token === "mq2lloyd") return 4;
+    if (token === "mq6") return 5;
+    if (token === "hf6") return 6;
+    if (token === "q8") return 7;
     return 99;
   };
 
@@ -4177,8 +4605,10 @@ export function findModel(name: string): string | null {
     if (hasQuantHint) return true;
     // No hint: accept any valid extension; extPriority picks the best one.
     // Still filter .hfq to default-q4 flavor (.q4.hfq / -hfq4.hfq stems) so
-    // we don't return an experimental -hfq4g128.hfq instead of a proper .mq4.
+    // we don't return an experimental -hfq4g128.hfq instead of a proper MQ4.
     if (f.endsWith(".hfq")) {
+      const token = artifactQuantToken(f);
+      if (token) return true;
       const stem = f.slice(0, -4);
       const isDefaultQ4 = stem.endsWith(".q4") || stem.endsWith("-hfq4")
         || stem === searchName || stem === name;
@@ -4214,13 +4644,26 @@ export function findModel(name: string): string | null {
 
 function listLocal() {
   const models: { name: string; tag: string; size: string }[] = [];
-  const catalog = loadModelsCatalog();
-  for (const model of Object.values(catalog.models).sort((a, b) => a.id.localeCompare(b.id))) {
-    models.push({
-      name: model.id,
-      tag: model.registry_tag ?? "",
-      size: `${(model.size_bytes / 1e9).toFixed(1)}GB`,
-    });
+  const seen = new Set<string>();
+  for (const dir of [MODELS_DIR, resolve(__dirname, "../models")]) {
+    let entries: string[];
+    try { entries = readdirSync(dir); } catch { continue; }
+    for (const f of entries) {
+      if (!isRoleSidecarArtifact(f) && (artifactQuantToken(f) !== null || f.endsWith(".hfq")) && !seen.has(f)) {
+        seen.add(f);
+        // statSync may throw on dangling symlinks or files removed mid-scan;
+        // skip those individually instead of aborting the rest of the loop
+        // (a previous try/catch wrapping the entire iteration ate everything
+        // after the first stale symlink — see commit log for the bug story).
+        try {
+          const sz = (statSync(join(dir, f)).size / 1e9).toFixed(1);
+          // Find matching registry tag (check new and old naming)
+          const aliases = new Set<string>(modelFileAliases(f));
+          const tag = Object.entries(REGISTRY).find(([_, e]) => aliases.has(e.file))?.[0] || "";
+          models.push({ name: f, tag, size: `${sz}GB` });
+        } catch {}
+      }
+    }
   }
   return models;
 }
@@ -4355,7 +4798,6 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
 
   // Start daemon
   const e = new Engine();
-  e.oneShot = true; // hunt3 H-B: one-shot bench — exit on daemon EOF is correct
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
 
@@ -4425,7 +4867,6 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
       // Restart daemon with variant env var
       process.env.HIPFIRE_RDNA2_VARIANT = String(v.n);
       const ve = new Engine();
-      ve.oneShot = true; // hunt3 H-B: one-shot variant bench — exit on EOF is correct
       let variantOk = false;
       try {
         await ve.start();
@@ -4646,7 +5087,6 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
 async function profile(modelTag: string | undefined, jsonOutput: boolean, kernelFilter: string | undefined) {
   // Start daemon — we need kernels compiled to profile them
   const e = new Engine();
-  e.oneShot = true; // hunt3 H-B: one-shot profile — exit on daemon EOF is correct
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
 
@@ -4797,7 +5237,7 @@ const CASK_PROFILES: Record<string, CaskProfile> = {
     desc: [
       "Default behavior. At load time, scan for a published TriAttention sidecar",
       "next to the model file (registry's `triattn.file` first, then a",
-      "`<basename>.triattn*.bin` glob fallback). When found AND target is not",
+      "`<model-stem>.triattn.hfq` fallback). When found AND target is not",
       "A3B, attach with drop-eviction at the budget below. Otherwise behaves",
       "identical to `off`.",
       "",
@@ -4945,22 +5385,15 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const isOverridden = (k: keyof HipfireConfig): boolean =>
     isPerModel && (overrides as any)[k] !== undefined;
 
-  // Build default_model options from the local catalog so config does not
-  // offer registry-only models that are not actually installed. Fall back to
-  // the registry only on a completely fresh install with no local catalog yet.
-  const modelOptions = catalogModelOptions();
-  if (modelOptions.length === 0) modelOptions.push(...Object.keys(REGISTRY).sort());
+  // Build default_model options from REGISTRY so users can cycle through
+  // known tags without typing. "custom" lets them fall back to free text.
+  const modelOptions = Object.keys(REGISTRY).sort();
 
   const meta: Record<string, FieldMeta> = {
     kv_cache: {
       label: "kv_cache",
-      desc: "KV cache quant (fwht default: FWHT-rotated, more accurate than asym at equal VRAM; q8 = reference)",
-      options: ["auto", "q8", "fwht4", "fwht3", "fwht2", "asym4", "asym3", "asym2"],
-    },
-    kv_adaptive: {
-      label: "kv_adaptive",
-      desc: "Adaptive KV downshift pattern. Requires fwht K; advanced picks K/V floor tiers explicitly.",
-      options: KV_ADAPTIVE_OPTIONS,
+      desc: "KV cache quantization (more bits = higher quality, more VRAM)",
+      options: ["auto", "q8", "asym4", "asym3", "asym2"],
     },
     flash_mode: {
       label: "flash_mode",
@@ -5006,11 +5439,6 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "max_think_tokens",
       desc: "Budget for reasoning inside <think>...</think> (0 = unlimited). Truncates if exceeded.",
       range: [0, 32768], step: 128,
-    },
-    max_total_think_tokens: {
-      label: "max_total_think_tokens",
-      desc: "Re-arm-proof TOTAL <think> budget across the turn (0 = off). At the cap, force-close + block <think> re-open; hard-EOS past it. Bounds models that re-open <think> and out-think client timeouts.",
-      range: [0, 1000000], step: 256,
     },
     host: {
       label: "host",
@@ -5077,13 +5505,33 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     cask_auto_attach: {
       label: "cask_auto_attach",
-      desc: "auto-discover .triattn.bin next to model file at load (true) or never (false). cask-profile=off sets false; non-off profiles set true.",
+      desc: "auto-discover .triattn.hfq next to model file at load (true) or never (false). cask-profile=off sets false; non-off profiles set true.",
       options: ["true", "false"],
     },
     prompt_normalize: {
       label: "prompt_normalize",
-      desc: "collapse \\n{3,} → \\n\\n before encode (lifts τ +26.7% on PEP-8 code prompts; off by default)",
+      desc: "collapse \\n{3,} → \\n\\n before encode (lifts τ +26.7% on PEP-8 code prompts; on by default)",
       options: ["true", "false"],
+    },
+    gpu_slab_load: {
+      label: "gpu_slab_load",
+      desc: "GPU slab model preload. auto = enable on HIP-reported integrated/UMA GPUs, on = force, off = disable.",
+      options: ["auto", "on", "off"],
+    },
+    gpu_slab_mib: {
+      label: "gpu_slab_mib",
+      desc: "GPU slab bank size in MiB for the slab loader. Larger banks reduce bookkeeping; smaller banks reduce allocation spikes.",
+      range: [1, 262144], step: 64,
+    },
+    load_transport: {
+      label: "load_transport",
+      desc: "Paged-weight load transport. pread = heap staging, pinned = HIP pinned host staging, direct = O_DIRECT host staging.",
+      options: ["pread", "pinned", "direct"],
+    },
+    hip_wait: {
+      label: "hip_wait",
+      desc: "HIP host wait policy. auto = HIP default, spin = lowest latency, yield/blocking reduce CPU pressure.",
+      options: ["auto", "spin", "yield", "blocking"],
     },
     mmq_screen: {
       label: "mmq_screen",
@@ -5137,7 +5585,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     prefill_drafter: {
       label: "prefill_drafter",
-      desc: "Path to PFlash drafter HFQ (e.g. ~/.hipfire/models/qwen3-0.6b.hf4). Tokenizer must match the target's. Empty = disabled.",
+      desc: "Path to PFlash drafter HFQ (e.g. ~/.hipfire/models/qwen3-0.6b-hf4.hfq). Tokenizer must match the target's. Empty = disabled.",
     },
     prefill_drafter_device: {
       label: "prefill_drafter_device",
@@ -5156,12 +5604,12 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     mtp_mode: {
       label: "mtp_mode",
-      desc: "Multi-token prediction speculative decode. off = disabled, on = always, auto = arch heuristic.",
+      desc: "MTP speculative decode mode. off = pure target decode, on = force MTP, auto = enable where supported.",
       options: ["off", "on", "auto"],
     },
     mtp_k: {
       label: "mtp_k",
-      desc: "Number of draft tokens per multi-token-prediction spec-decode window (1-10).",
+      desc: "MTP draft tokens per speculative decode window.",
       range: [1, 10], step: 1,
     },
   };
@@ -5305,7 +5753,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     // Cursor home + clear screen
     write("\x1b[H\x1b[2J");
     if (isPerModel) {
-      write(`${C.bold}hipfire config ${C.cyan}${resolvedTag}${C.reset}  ${C.dim}${MODELS_CATALOG_PATH}${C.reset}\n`);
+      write(`${C.bold}hipfire config ${C.cyan}${resolvedTag}${C.reset}  ${C.dim}${PER_MODEL_CONFIG_PATH}${C.reset}\n`);
       write(`${C.dim}per-model overlay — overrides win over global. Use r to remove an override.${C.reset}\n`);
     } else {
       write(`${C.bold}hipfire config${C.reset}  ${C.dim}${CONFIG_PATH}${C.reset}\n`);
@@ -5632,17 +6080,16 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
 }
 
 // Sub-TUI launched from the global config TUI's "[per-model configs]" row.
-// Lists local catalog models, shows which have overrides, and returns the
-// selected model id or null if user escapes.
+// Lists registered models (REGISTRY + any user-registered aliases), shows
+// which have overrides, and returns the selected tag or null if user escapes.
 function modelPickerTui(): Promise<string | null> {
-  const catalog = loadModelsCatalog();
   const tags = [
-    ...Object.keys(catalog.models),
-    ...Object.keys(catalog.configs ?? {}),
+    ...Object.keys(REGISTRY),
+    ...Object.keys(loadUserAliases()),
   ].filter((t, i, arr) => arr.indexOf(t) === i).sort();
 
   if (tags.length === 0) {
-    console.log("No local models. Pull one first: hipfire pull qwen3.5:9b");
+    console.log("No models registered. Pull one first: hipfire pull qwen3.5:9b");
     return Promise.resolve(null);
   }
 
@@ -5665,10 +6112,9 @@ function modelPickerTui(): Promise<string | null> {
       const ov = overlays[tag];
       const cnt = ov ? Object.keys(ov).length : 0;
       const caret = i === selected ? `${C.cyan}▸${C.reset}` : " ";
-      const model = catalog.models[tag];
-      const entry = model?.registry_tag ? REGISTRY[model.registry_tag] : undefined;
-      const desc = entry?.desc ?? (model ? model.path : "(config-only)");
-      const size = model ? `${model.size_gb.toFixed(1)}GB`.padStart(7) : "".padStart(7);
+      const entry = REGISTRY[tag];
+      const desc = entry?.desc ?? "(user-registered)";
+      const size = entry ? `${entry.size_gb}GB`.padStart(7) : "".padStart(7);
       const marker = cnt > 0
         ? `${C.magenta}● ${cnt} override${cnt === 1 ? "" : "s"}${C.reset}`
         : `${C.dim}(no overrides)${C.reset}`;
@@ -5749,76 +6195,20 @@ function findDep(binary: string, extraDirs: string[]): string | null {
   return null;
 }
 
-function stripVisibleThinking(content: string, preserveThinking: boolean = false, startedInThink: boolean = false): string {
-  if (preserveThinking) return content.replace(/<\|im_end\|>/g, "").trim();
-  // `open_think` injects the opening <think> into the PROMPT, so the output
-  // begins INSIDE the think span and only a dangling </think> appears — none of
-  // the strips below (which key on a `<think>` opener) would fire, leaking the
-  // reasoning + a stray </think> into content. Prepend a synthetic opener so
-  // the closed case (strip the pair, keep the answer) and the unclosed case
-  // (strip <think>..end) are handled identically to a normal think span.
-  if (startedInThink && !content.includes("<think>")) content = "<think>" + content;
-  return content
-    .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-    .replace(/<think>[\s\S]*$/, "")
-    .replace(/^\s*<\/think>\s*/, "")
-    .replace(/<\|im_end\|>/g, "")
-    .trim();
-}
-
-function pruneCliRuntimePayload(cliDir: string): void {
-  for (const name of ["node_modules", ".gitignore", "tsconfig.json", "README.md", "bun.lock"]) {
-    rmSync(join(cliDir, name), { recursive: true, force: true });
-  }
-  for (const name of readdirSync(cliDir)) {
-    if (/\.test\.ts$/.test(name) || /^test_.*\.ts$/.test(name) || /^bench_.*\.ts$/.test(name)) {
-      unlinkSync(join(cliDir, name));
-    }
-  }
-}
-
-function syncCliRuntimePayload(repoDir: string): void {
-  const cliSrcDir = join(repoDir, "cli");
-  const cliDstDir = join(HIPFIRE_DIR, "cli");
-  const required = ["registry.json", "index.ts"];
-  for (const file of required) {
-    if (!existsSync(join(cliSrcDir, file))) {
-      console.error(`\nUpdate aborted: cli/${file} missing in repo checkout at`);
-      console.error(`  ${repoDir}`);
-      console.error("Repo may be on a pre-migration commit or in a dirty state. Verify with:");
-      console.error(`  git -C ${repoDir} status && git -C ${repoDir} log -1 --stat`);
-      process.exit(1);
-    }
-  }
-
-  mkdirSync(HIPFIRE_DIR, { recursive: true });
-  const stamp = `${process.pid}-${Date.now()}`;
-  const tmpDir = join(HIPFIRE_DIR, `.cli-update-${stamp}`);
-  const backupDir = join(HIPFIRE_DIR, `.cli-prev-${stamp}`);
-  rmSync(tmpDir, { recursive: true, force: true });
-  rmSync(backupDir, { recursive: true, force: true });
-
-  try {
-    cpSync(cliSrcDir, tmpDir, { recursive: true, force: true });
-    pruneCliRuntimePayload(tmpDir);
-    if (existsSync(cliDstDir)) renameSync(cliDstDir, backupDir);
-    renameSync(tmpDir, cliDstDir);
-    rmSync(backupDir, { recursive: true, force: true });
-  } catch (err) {
-    rmSync(tmpDir, { recursive: true, force: true });
-    if (!existsSync(cliDstDir) && existsSync(backupDir)) {
-      renameSync(backupDir, cliDstDir);
-    }
-    throw err;
-  }
-}
-
 // ─── Main ───────────────────────────────────────────────
-
-refreshModelsCatalog();
 
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
+  case "eval": {
+    const { runEvalCommand } = await import("./eval.ts");
+    await runEvalCommand(rest);
+    break;
+  }
+  case "host-profile": {
+    const { runHostProfileCommand } = await import("./host_profile.ts");
+    await runHostProfileCommand(rest);
+    break;
+  }
   case "serve": {
     // Parse flags: `hipfire serve [host] [port] [-d|--detach]`.
     // Also accepts `host:port`, e.g. `hipfire serve 0.0.0.0:11435`.
@@ -6125,6 +6515,10 @@ switch (cmd) {
     await profile(profileModel, jsonFlag, kernelFilter);
     break;
   }
+  case "eval": {
+    await runEvalCommand(rest);
+    break;
+  }
   case "update": {
     console.error("Updating hipfire...");
     const srcDir = join(HIPFIRE_DIR, "src");
@@ -6241,19 +6635,31 @@ switch (cmd) {
     // config commands keep working. Previously the copy happened after the
     // cargo build, so a build failure left the CLI frozen at its install-time
     // version — users saw "unknown model" for entries added post-install.
+    const { copyFileSync } = await import("fs");
     const exe = process.platform === "win32" ? ".exe" : "";
     const binDir = join(HIPFIRE_DIR, "bin");
-    // Keep index.ts and its sibling runtime modules in lockstep. This mirrors
-    // scripts/install.{sh,ps1}: copy the whole cli/ tree, prune dev/test files,
-    // then swap the staged payload into place. A legacy updater can still copy
-    // only this new index.ts once; keeping index.ts startup-self-contained lets
-    // the user run `hipfire update` again to repair the full payload.
-    syncCliRuntimePayload(repoDir);
+    // Order: registry.json BEFORE index.ts. The new index.ts imports the JSON
+    // at startup; if we copied index.ts first and the JSON copy then failed
+    // (missing in repoDir, IO error, partial git pull), the install would be
+    // stranded — new TS that can't resolve its own data file. Copying JSON
+    // first means a partial failure leaves the CLI in a recoverable state:
+    // either old TS + old JSON, or old TS + new JSON (still loads OK).
+    const registrySrc = join(repoDir, "cli/registry.json");
+    const indexSrc    = join(repoDir, "cli/index.ts");
+    if (!existsSync(registrySrc) || !existsSync(indexSrc)) {
+      console.error("\nUpdate aborted: cli/registry.json or cli/index.ts missing in repo checkout at");
+      console.error(`  ${repoDir}`);
+      console.error("Repo may be on a pre-migration commit or in a dirty state. Verify with:");
+      console.error(`  git -C ${repoDir} status && git -C ${repoDir} log -1 --stat`);
+      process.exit(1);
+    }
+    copyFileSync(registrySrc, join(HIPFIRE_DIR, "cli/registry.json"));
+    copyFileSync(indexSrc,    join(HIPFIRE_DIR, "cli/index.ts"));
     console.error("  CLI updated ✓");
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
-      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "-p", "hipfire-runtime"],
+      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "--bin", "hipfire-eval", "--bin", "hipfire-host-profile", "-p", "hipfire-runtime"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
     if (build.exitCode !== 0) {
@@ -6282,7 +6688,7 @@ switch (cmd) {
       if (existsSync(src)) { copyFileSync(src, dst); }
     }
     // Workspace binaries (e.g. hipfire-quantize) live under target/release/
-    for (const bin of ["hipfire-quantize"]) {
+    for (const bin of ["hipfire-quantize", "hipfire-eval", "hipfire-host-profile"]) {
       const src = join(repoDir, `target/release/${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
@@ -6327,17 +6733,20 @@ switch (cmd) {
         console.error(`  Updated ${gpuArch} kernels ✓ (cache cleared)`);
       }
     }
-    // Rename legacy .hfq model files to .hf4/.hf6
+    // Rename legacy .hfq model files to -hf4.hfq/-hf6.hfq. New convention files such
+    // as <stem>-mq4.hfq and role sidecars such as <stem>.triattn.hfq are
+    // already canonical and must not be touched.
     const { renameSync } = await import("fs");
     try {
       for (const f of readdirSync(MODELS_DIR)) {
         if (!f.endsWith(".hfq")) continue;
+        if (artifactQuantToken(f) || isRoleSidecarArtifact(f)) continue;
         let newName = "";
-        if (f.endsWith(".q4.hfq")) newName = f.replace(/\.q4\.hfq$/, ".hf4");
-        else if (f.endsWith(".hfq6.hfq")) newName = f.replace(/\.hfq6\.hfq$/, ".hf6");
-        else if (f.match(/-hfq4\.hfq$/)) newName = f.replace(/-hfq4\.hfq$/, ".hf4");
+        if (f.endsWith(".q4.hfq")) newName = f.replace(/\.q4\.hfq$/, "-hf4.hfq");
+        else if (f.endsWith(".hfq6.hfq")) newName = f.replace(/\.hfq6\.hfq$/, "-hf6.hfq");
+        else if (f.match(/-hfq4\.hfq$/)) newName = f.replace(/-hfq4\.hfq$/, "-hf4.hfq");
         else if (f.match(/-hfq4g\d+\.hfq$/)) continue; // skip experimental variants
-        else newName = f.replace(/\.hfq$/, ".hf4"); // bare .hfq → assume hf4
+        else newName = f.replace(/\.hfq$/, "-hf4.hfq"); // bare .hfq → assume hf4
         if (newName && newName !== f && !existsSync(join(MODELS_DIR, newName))) {
           renameSync(join(MODELS_DIR, f), join(MODELS_DIR, newName));
           console.error(`  Renamed ${f} → ${newName}`);
@@ -6484,7 +6893,6 @@ switch (cmd) {
       console.log("\nProbing GPU via HIP runtime...");
       try {
         const de = new Engine();
-        de.oneShot = true; // hunt3 H-B: one-shot GPU probe — exit on daemon EOF is correct
         await de.start();
         await de.send({ type: "ping" }); await de.recv();
         await de.send({ type: "diag" });
@@ -6567,7 +6975,8 @@ switch (cmd) {
     console.log("\nDone.");
     break;
   }
-  case "bench": {
+  case "bench":
+  case "benchmark": {
     const exp = rest.includes("--exp");
     const runsIdx = rest.indexOf("--runs");
     const runs = runsIdx >= 0 && runsIdx + 1 < rest.length ? parseInt(rest[runsIdx + 1]) : 5;
@@ -6580,6 +6989,7 @@ switch (cmd) {
     const benchModel = positional[0];
     if (!benchModel) {
       console.error(`Usage: hipfire bench <model> [--exp] [--runs N] [prompt]
+       hipfire benchmark <model> [--exp] [--runs N] [prompt]
 
   Standard benchmark: measure decode + prefill tok/s over N runs.
   --exp    RDNA2 only: test all 5 kernel variants (occupancy/unroll/cache tradeoffs)
@@ -6635,10 +7045,10 @@ Q4_0 / Q6_K / F16 / BF16 / F32) and re-quantized to the chosen
 format. Pick by model architecture:
 
   hf4 / hf6:   dense (Llama / Mistral / Gemma / older Qwen). DEFAULT.
-               Output extensions: .hf4 / .hf6.
+               Output names: <stem>-hf4.hfq / <stem>-hf6.hfq.
   mq4 / mq6:   Qwen3.5+ family (DeltaNet hot path). Override only when
                the source GGUF is a Qwen3.5+ model.
-               Output extensions: .mq4 / .mq6.
+               Output names: <stem>-mq4.hfq / <stem>-mq6.hfq.
 
 Quality is lower than quantizing from full-precision safetensors due
 to the double-quant roundtrip; raise to hf6 / mq6 if you can spare
@@ -6651,11 +7061,11 @@ Examples:
       --install --register qwopus:4b
 
   # Local fine-tune → MQ4:
-  hipfire quantize ./my-finetune --format mq4 -o finetune.mq4
+  hipfire quantize ./my-finetune --format mq4 -o finetune-mq4.hfq
 
   # GGUF → HF4 (one-shot, install into ~/.hipfire/models):
   hipfire quantize ./tinyllama.Q4_K_M.gguf --install --register tinyllama:1b-gguf
-  # → ~/.hipfire/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.hf4
+  # → ~/.hipfire/models/tinyllama-1.1b-chat-v1.0.Q4_K_M-hf4.hfq
 
   # Qwen3.5+ GGUF → MQ4 (DeltaNet hot path):
   hipfire quantize ./qwen3.5.Q4_K_M.gguf --format mq4 --install --register q35:9b-gguf
@@ -6744,11 +7154,11 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
     if (!tag || tag === "-h" || tag === "--help") {
       console.error(`Usage: hipfire sidecar-gen <model> [flags]
 
-Generate a TriAttention calibration sidecar (.triattn.bin) for the given model.
+Generate a TriAttention calibration sidecar (.triattn.hfq) for the given model.
 The sidecar enables automatic KV-cache eviction and is required for CASK
 generation on large-context models (e.g. 27B with >16K max_position_embeddings).
 
-The sidecar file is saved next to the model file (same directory as the .mq4/.hf4)
+The sidecar file is saved next to the model file (same directory as the .hfq)
 so the daemon auto-discovers it.
 
 Model:
@@ -6761,13 +7171,13 @@ Flags:
   --chunk-len N          Chunk length in tokens (default: 256)
   --gpu-calib            Use GPU kernel triattn_accumulate (faster on MI300X / RDNA3+)
   --cpu-calib            Force CPU calibration path
-  -o, --output PATH      Output sidecar file path (default: <model>.triattn.bin next to model)
+  -o, --output PATH      Output sidecar file path (default: <model-stem>.triattn.hfq next to model)
   --skip-validation      Skip Phase 2 validation — faster for sidecar generation only
 
 Examples:
   hipfire sidecar-gen qwen3.5:9b
-  hipfire sidecar-gen ./my-model.mq4 --corpus wikipedia.txt --max-tokens 100000
-  hipfire sidecar-gen ~/.hipfire/models/qwen3.6-27b.mq4 -o /tmp/sidecar.bin`);
+  hipfire sidecar-gen ./my-model-mq4.hfq --corpus wikipedia.txt --max-tokens 100000
+  hipfire sidecar-gen ~/.hipfire/models/qwen3.6-27b-mq4.hfq -o /tmp/qwen3.6-27b-mq4.triattn.hfq`);
       process.exit(tag ? 0 : 1);
     }
     let corpusPath: string | undefined;
@@ -6810,8 +7220,8 @@ Examples:
       process.exit(1);
     }
 
-    // Determine output path — default is <model>.triattn.bin next to the model file.
-    const sidecarPath = output ?? `${resolved}.triattn.bin`;
+    // Determine output path — default is <model-stem>.triattn.hfq next to the model file.
+    const sidecarPath = output ?? defaultRoleSidecarPath(resolved, "triattn");
 
     console.error(`Generating TriAttention calibration sidecar for: ${tag}`);
     console.error(`  Model:        ${resolved}`);
@@ -6923,16 +7333,15 @@ Examples:
     // `hipfire config <model:tag> list|get|set|reset ...` → per-model scripting
     // `hipfire config <model:tag> cask-profile <name>`   → per-model bundle setter
     //
-    // Disambiguate: first arg is a model tag if it maps to a local catalog
-    // model, a known REGISTRY entry, or matches the `name:tag` shape.
-    // Otherwise treat as action.
+    // Disambiguate: first arg is a model tag if it's a known REGISTRY entry
+    // (resolved) or matches the `name:tag` shape. Otherwise treat as action.
     let [firstArg, maybeKey, ...valueArgs] = rest;
     let modelScope: string | null = null;
     if (firstArg && !["list", "get", "set", "reset", "cask-profile"].includes(firstArg)) {
+      // If looks like a tag, scope to that model
       const resolved = resolveModelTag(firstArg);
-      const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), firstArg);
-      if (catalogId || REGISTRY[resolved] || firstArg.includes(":")) {
-        modelScope = catalogId ?? resolved;
+      if (REGISTRY[resolved] || firstArg.includes(":")) {
+        modelScope = resolved;
         [firstArg, maybeKey, ...valueArgs] = rest.slice(1);
       }
     }
@@ -6991,7 +7400,7 @@ Examples:
       if (modelScope) {
         const ov = loadPerModelConfigs()[modelScope] ?? {};
         const merged = resolveModelConfig(modelScope);
-        console.log(`Per-model config: ${modelScope}  (${MODELS_CATALOG_PATH})\n`);
+        console.log(`Per-model config: ${modelScope}  (${PER_MODEL_CONFIG_PATH})\n`);
         for (const k of validKeys) {
           if (!(PER_MODEL_KEYS as readonly string[]).includes(k)) continue;
           const v = (merged as any)[k];
@@ -7040,8 +7449,7 @@ Examples:
       if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
-          kv_cache: "one of: auto, q8, fwht4, fwht3, fwht2, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 are legacy asym aliases)",
-          kv_adaptive: "one of: off, conservative, balanced, aggressive, advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>",
+          kv_cache: "one of: auto, q8, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 aliases also accepted)",
           flash_mode: "one of: auto, always, never (applies to Q8 path; asym modes are flash-only)",
           temperature: "number between 0 and 2",
           top_p: "number in (0, 1]",
@@ -7054,6 +7462,10 @@ Examples:
           port: "integer between 1 and 65535",
           idle_timeout: "seconds of inactivity before serve unloads the model (0 = never, max 86400)",
           default_model: "non-empty model tag",
+          gpu_slab_load: "one of: auto, on, off",
+          gpu_slab_mib: "integer MiB between 1 and 262144",
+          load_transport: "one of: pread, pinned, direct",
+          hip_wait: "one of: auto, spin, yield, blocking",
         };
         console.error(`${key} must be ${hints[key] || "valid"}`); process.exit(1);
       }
@@ -7147,7 +7559,7 @@ Examples:
       if (!sidecarSet && profileName !== "off" && profileName !== "auto") {
         console.log(`note: cask_sidecar is not set. The profile is configured, but eviction`);
         console.log(`      only engages when a sidecar path is loaded. Set with:`);
-        console.log(`      hipfire config${modelScope ? ` ${modelScope}` : ""} set cask_sidecar /path/to/<model>.triattn.bin`);
+        console.log(`      hipfire config${modelScope ? ` ${modelScope}` : ""} set cask_sidecar /path/to/<model>.triattn.hfq`);
       }
       if (profileName === "auto" && !sidecarSet) {
         console.log(`note: auto-attach will scan for a sidecar next to the model file at load.`);
@@ -7190,14 +7602,18 @@ Examples:
                         Start OpenAI-compatible server (-d = background daemon)
   stop                  Stop the background serve daemon
   quantize <hf-id|dir>  Quantize to MQ4/MQ6 (CPU) — with optional HF upload
+  eval <opts>           Run quant admission/model eval harness
+  host-profile [opts]   Measure host, GPU-copy, and ~/.hipfire/models bandwidth
   bench <model> [opts]  Benchmark tok/s (--exp for RDNA2 variant sweep, --runs N)
+  benchmark <model>     Alias for bench
   profile [model]       Kernel efficiency profiler (--json, --kernel <name>)
+  eval --model <model>  Run eval harness tiers (fast default)
   list [-r]             Show local models (-r: show available too)
   config                Interactive settings editor (TUI); also: config [list|set|get|reset]
   diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
   ps                    Show running hipfire processes (serve, quantize, uploads)
   rm <model>            Delete model
-  sidecar-gen <model>   Generate TriAttention calibration sidecar (.triattn.bin)
+  sidecar-gen <model>   Generate TriAttention calibration sidecar (.triattn.hfq)
   update                Pull latest code, rebuild, update kernels
 
 Models (MQ4 default: FWHT-rotated 4-bit, quality-gated):
@@ -7220,7 +7636,7 @@ Quantize any Qwen 3.5 HF model (or local dir) — one-shot download + upload:
   hipfire quantize Jackrong/Qwopus3.5-4B-v3 --both \\
         --upload schuttdev/hipfire-qwopus-4b --create-repo \\
         --install --register qwopus:4b
-  hipfire quantize ./my-finetune --format mq6 -o my-finetune.mq6`);
+  hipfire quantize ./my-finetune --format mq6 -o my-finetune-mq6.hfq`);
     break;
   }
 }

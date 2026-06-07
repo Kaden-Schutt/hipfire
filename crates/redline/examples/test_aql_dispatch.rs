@@ -6,7 +6,7 @@
 //! Dispatches vector_add without any syscall in the hot path.
 
 use redline::device::Device;
-use redline::dispatch::{KernargBuilder, Kernel};
+use redline::dispatch::Kernel;
 use redline::kfd::AqlQueue;
 
 fn main() {
@@ -37,10 +37,21 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
 "#;
     std::fs::write("/tmp/redline_aql_va.hip", hip_src).unwrap();
     let out = std::process::Command::new("hipcc")
-        .args(["--genco", &format!("--offload-arch={arch}"), "-O3",
-               "-o", "/tmp/redline_aql_va.hsaco", "/tmp/redline_aql_va.hip"])
-        .output().expect("hipcc");
-    assert!(out.status.success(), "hipcc: {}", String::from_utf8_lossy(&out.stderr));
+        .args([
+            "--genco",
+            &format!("--offload-arch={arch}"),
+            "-O3",
+            "-o",
+            "/tmp/redline_aql_va.hsaco",
+            "/tmp/redline_aql_va.hip",
+        ])
+        .output()
+        .expect("hipcc");
+    assert!(
+        out.status.success(),
+        "hipcc: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let module = dev.load_module_file("/tmp/redline_aql_va.hsaco").unwrap();
     let kernel = Kernel::find(&module, "vector_add").expect("vector_add not found");
@@ -72,11 +83,11 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     // Hidden args at offset 32
     let groups = (n + 255) / 256;
     ka[32..36].copy_from_slice(&groups.to_le_bytes()); // block_count_x
-    ka[36..40].copy_from_slice(&1u32.to_le_bytes());   // block_count_y
-    ka[40..44].copy_from_slice(&1u32.to_le_bytes());   // block_count_z
-    ka[44..46].copy_from_slice(&256u16.to_le_bytes());  // group_size_x
-    ka[46..48].copy_from_slice(&1u16.to_le_bytes());    // group_size_y
-    ka[48..50].copy_from_slice(&1u16.to_le_bytes());    // group_size_z
+    ka[36..40].copy_from_slice(&1u32.to_le_bytes()); // block_count_y
+    ka[40..44].copy_from_slice(&1u32.to_le_bytes()); // block_count_z
+    ka[44..46].copy_from_slice(&256u16.to_le_bytes()); // group_size_x
+    ka[46..48].copy_from_slice(&1u16.to_le_bytes()); // group_size_y
+    ka[48..50].copy_from_slice(&1u16.to_le_bytes()); // group_size_z
 
     // Upload kernarg to VRAM
     let ka_buf = dev.alloc_vram(4096).unwrap();
@@ -90,7 +101,9 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     let mut c_raw = vec![0u8; nbytes];
     dev.download(&c_buf, &mut c_raw).unwrap();
     let c: &[f32] = unsafe { std::slice::from_raw_parts(c_raw.as_ptr() as *const f32, n as usize) };
-    let bad = (0..n as usize).filter(|&i| (c[i] - (i as f32) * 3.0).abs() > 0.001).count();
+    let bad = (0..n as usize)
+        .filter(|&i| (c[i] - (i as f32) * 3.0).abs() > 0.001)
+        .count();
 
     if bad == 0 {
         eprintln!("\n=== AQL DISPATCH PASSED — {} elements correct ===", n);
@@ -103,7 +116,7 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     aql.destroy();
 }
 
-fn kernel_kd_offset(module: &redline::dispatch::LoadedModule, name: &str) -> u64 {
+fn kernel_kd_offset(_module: &redline::dispatch::LoadedModule, name: &str) -> u64 {
     // The Kernel struct has code_va but for AQL we need kd_va.
     // We need the kd_offset from the hsaco module.
     // Re-parse to get it.

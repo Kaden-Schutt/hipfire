@@ -73,10 +73,7 @@ impl Detector for StepTimeSpike {
                         && median > 0.0
                         && (delta as f64) > RATIO * median
                     {
-                        let prev_max = self
-                            .biggest_spike
-                            .map(|(d, _)| d)
-                            .unwrap_or(0);
+                        let prev_max = self.biggest_spike.map(|(d, _)| d).unwrap_or(0);
                         if delta > prev_max {
                             self.biggest_spike = Some((delta, median.round() as u64));
                         }

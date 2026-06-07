@@ -103,10 +103,18 @@ fn run_one(
     let ab_bytes = build_hfq4g256(beta_m, k, 0xC3);
     let aa_bytes = build_hfq4g256(alpha_m, k, 0xD4);
 
-    let aq = gpu.upload_raw(&aq_bytes, &[qkv_m, k]).map_err(|e| format!("upload aq: {e}"))?;
-    let az = gpu.upload_raw(&az_bytes, &[z_m, k]).map_err(|e| format!("upload az: {e}"))?;
-    let ab = gpu.upload_raw(&ab_bytes, &[beta_m, k]).map_err(|e| format!("upload ab: {e}"))?;
-    let aa = gpu.upload_raw(&aa_bytes, &[alpha_m, k]).map_err(|e| format!("upload aa: {e}"))?;
+    let aq = gpu
+        .upload_raw(&aq_bytes, &[qkv_m, k])
+        .map_err(|e| format!("upload aq: {e}"))?;
+    let az = gpu
+        .upload_raw(&az_bytes, &[z_m, k])
+        .map_err(|e| format!("upload az: {e}"))?;
+    let ab = gpu
+        .upload_raw(&ab_bytes, &[beta_m, k])
+        .map_err(|e| format!("upload ab: {e}"))?;
+    let aa = gpu
+        .upload_raw(&aa_bytes, &[alpha_m, k])
+        .map_err(|e| format!("upload aa: {e}"))?;
 
     let x_f32: Vec<f32> = (0..(n * k))
         .map(|i| {
@@ -115,41 +123,72 @@ fn run_one(
             ((b * 7 + kk * 11) % 31 - 15) as f32 * 0.05
         })
         .collect();
-    let x = gpu.upload_f32(&x_f32, &[n, k]).map_err(|e| format!("upload x: {e}"))?;
+    let x = gpu
+        .upload_f32(&x_f32, &[n, k])
+        .map_err(|e| format!("upload x: {e}"))?;
 
-    let yq_ref = gpu.alloc_tensor(&[n, qkv_m], DType::F32).map_err(|e| format!("alloc yq_ref: {e}"))?;
-    let yz_ref = gpu.alloc_tensor(&[n, z_m], DType::F32).map_err(|e| format!("alloc yz_ref: {e}"))?;
-    let yb_ref = gpu.alloc_tensor(&[n, beta_m], DType::F32).map_err(|e| format!("alloc yb_ref: {e}"))?;
-    let ya_ref = gpu.alloc_tensor(&[n, alpha_m], DType::F32).map_err(|e| format!("alloc ya_ref: {e}"))?;
+    let yq_ref = gpu
+        .alloc_tensor(&[n, qkv_m], DType::F32)
+        .map_err(|e| format!("alloc yq_ref: {e}"))?;
+    let yz_ref = gpu
+        .alloc_tensor(&[n, z_m], DType::F32)
+        .map_err(|e| format!("alloc yz_ref: {e}"))?;
+    let yb_ref = gpu
+        .alloc_tensor(&[n, beta_m], DType::F32)
+        .map_err(|e| format!("alloc yb_ref: {e}"))?;
+    let ya_ref = gpu
+        .alloc_tensor(&[n, alpha_m], DType::F32)
+        .map_err(|e| format!("alloc ya_ref: {e}"))?;
 
     gpu.gemm_qkvza_hfq4g256_dot2(
-        &aq, &az, &ab, &aa, &x,
-        &yq_ref, &yz_ref, &yb_ref, &ya_ref,
-        qkv_m, z_m, beta_m, alpha_m, k, n,
+        &aq, &az, &ab, &aa, &x, &yq_ref, &yz_ref, &yb_ref, &ya_ref, qkv_m, z_m, beta_m, alpha_m, k,
+        n,
     )
     .map_err(|e| format!("dot2: {e}"))?;
 
-    let ref_q = gpu.download_f32(&yq_ref).map_err(|e| format!("download yq_ref: {e}"))?;
-    let ref_z = gpu.download_f32(&yz_ref).map_err(|e| format!("download yz_ref: {e}"))?;
-    let ref_b = gpu.download_f32(&yb_ref).map_err(|e| format!("download yb_ref: {e}"))?;
-    let ref_a = gpu.download_f32(&ya_ref).map_err(|e| format!("download ya_ref: {e}"))?;
+    let ref_q = gpu
+        .download_f32(&yq_ref)
+        .map_err(|e| format!("download yq_ref: {e}"))?;
+    let ref_z = gpu
+        .download_f32(&yz_ref)
+        .map_err(|e| format!("download yz_ref: {e}"))?;
+    let ref_b = gpu
+        .download_f32(&yb_ref)
+        .map_err(|e| format!("download yb_ref: {e}"))?;
+    let ref_a = gpu
+        .download_f32(&ya_ref)
+        .map_err(|e| format!("download ya_ref: {e}"))?;
 
-    let yq = gpu.alloc_tensor(&[n, qkv_m], DType::F32).map_err(|e| format!("alloc yq: {e}"))?;
-    let yz = gpu.alloc_tensor(&[n, z_m], DType::F32).map_err(|e| format!("alloc yz: {e}"))?;
-    let yb = gpu.alloc_tensor(&[n, beta_m], DType::F32).map_err(|e| format!("alloc yb: {e}"))?;
-    let ya = gpu.alloc_tensor(&[n, alpha_m], DType::F32).map_err(|e| format!("alloc ya: {e}"))?;
+    let yq = gpu
+        .alloc_tensor(&[n, qkv_m], DType::F32)
+        .map_err(|e| format!("alloc yq: {e}"))?;
+    let yz = gpu
+        .alloc_tensor(&[n, z_m], DType::F32)
+        .map_err(|e| format!("alloc yz: {e}"))?;
+    let yb = gpu
+        .alloc_tensor(&[n, beta_m], DType::F32)
+        .map_err(|e| format!("alloc yb: {e}"))?;
+    let ya = gpu
+        .alloc_tensor(&[n, alpha_m], DType::F32)
+        .map_err(|e| format!("alloc ya: {e}"))?;
 
     gpu.gemm_qkvza_hfq4g256_wmma_gfx12(
-        &aq, &az, &ab, &aa, &x,
-        &yq, &yz, &yb, &ya,
-        qkv_m, z_m, beta_m, alpha_m, k, n,
+        &aq, &az, &ab, &aa, &x, &yq, &yz, &yb, &ya, qkv_m, z_m, beta_m, alpha_m, k, n,
     )
     .map_err(|e| format!("wmma_gfx12: {e}"))?;
 
-    let cand_q = gpu.download_f32(&yq).map_err(|e| format!("download yq: {e}"))?;
-    let cand_z = gpu.download_f32(&yz).map_err(|e| format!("download yz: {e}"))?;
-    let cand_b = gpu.download_f32(&yb).map_err(|e| format!("download yb: {e}"))?;
-    let cand_a = gpu.download_f32(&ya).map_err(|e| format!("download ya: {e}"))?;
+    let cand_q = gpu
+        .download_f32(&yq)
+        .map_err(|e| format!("download yq: {e}"))?;
+    let cand_z = gpu
+        .download_f32(&yz)
+        .map_err(|e| format!("download yz: {e}"))?;
+    let cand_b = gpu
+        .download_f32(&yb)
+        .map_err(|e| format!("download yb: {e}"))?;
+    let cand_a = gpu
+        .download_f32(&ya)
+        .map_err(|e| format!("download ya: {e}"))?;
 
     gpu.free_tensor(aq).ok();
     gpu.free_tensor(az).ok();
@@ -204,8 +243,12 @@ fn compare_proj(
             let b = refr[idx];
             let abs = (a - b).abs();
             let rel = abs / b.abs().max(1e-3);
-            if abs > max_abs { max_abs = abs; }
-            if rel > max_rel { max_rel = rel; }
+            if abs > max_abs {
+                max_abs = abs;
+            }
+            if rel > max_rel {
+                max_rel = rel;
+            }
             if abs > abs_tol && rel > rel_tol {
                 n_bad += 1;
                 hist_row_mod16[row % 16] += 1;

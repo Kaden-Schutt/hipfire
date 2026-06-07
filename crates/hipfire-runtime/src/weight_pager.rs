@@ -47,6 +47,8 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::hfq::HfqFile;
 
+const DIRECT_IO_ALIGN: usize = 4096;
+
 // ---------------------------------------------------------------------------
 // Identity: WeightId
 // ---------------------------------------------------------------------------
@@ -67,10 +69,7 @@ pub enum WeightId {
         role: ExpertRole,
     },
     /// Always-on shared expert (one per layer).
-    SharedExpert {
-        layer: u16,
-        role: SharedRole,
-    },
+    SharedExpert { layer: u16, role: SharedRole },
     /// Per-layer router weight (small, always-resident in v0.1, but tracked
     /// here so future commits can page it for very large MoE configs).
     Router { layer: u16 },
@@ -199,6 +198,32 @@ pub struct PreadH2DTransport {
     next_handle: u64,
 }
 
+/// Experimental transport: pread directly into HIP page-locked host memory,
+/// then copy to device memory with `hipMemcpyAsync` on the default stream.
+///
+/// This removes Rust heap staging from the pager path and is the first A/B
+/// step before attempting io_uring + dma-buf direct-to-VRAM reads.
+pub struct PinnedH2DTransport {
+    file: File,
+    path: std::path::PathBuf,
+    staging: Option<hip_bridge::HostBuffer>,
+    staging_len: usize,
+    next_handle: u64,
+}
+
+/// Experimental direct-I/O transport: read aligned ranges with `O_DIRECT`
+/// into a reusable aligned host buffer, then copy the requested subrange to
+/// device memory. This bypasses page cache behavior while still staging
+/// through host memory.
+pub struct DirectH2DTransport {
+    file: File,
+    path: std::path::PathBuf,
+    file_len: usize,
+    staging: Option<AlignedHostBuffer>,
+    staging_len: usize,
+    next_handle: u64,
+}
+
 impl PreadH2DTransport {
     /// Open the HFQ file at `path` for paged reads.
     pub fn open(path: &Path) -> std::io::Result<Self> {
@@ -211,7 +236,7 @@ impl PreadH2DTransport {
         {
             use std::os::unix::io::AsRawFd;
             unsafe {
-                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
             }
         }
         Ok(Self {
@@ -246,7 +271,8 @@ impl PreadH2DTransport {
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
-            self.file.read_exact_at(&mut self.staging[..len], offset as u64)?;
+            self.file
+                .read_exact_at(&mut self.staging[..len], offset as u64)?;
         }
         #[cfg(not(unix))]
         {
@@ -254,6 +280,180 @@ impl PreadH2DTransport {
             self.file.seek(SeekFrom::Start(offset as u64))?;
             self.file.read_exact(&mut self.staging[..len])?;
         }
+        Ok(())
+    }
+}
+
+impl PinnedH2DTransport {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+            }
+        }
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            staging: None,
+            staging_len: 0,
+            next_handle: 0,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn next_handle(&mut self) -> TransferHandle {
+        let h = TransferHandle(self.next_handle);
+        self.next_handle += 1;
+        h
+    }
+
+    fn ensure_staging(&mut self, len: usize, gpu: &mut Gpu) -> HipResult<()> {
+        if self.staging_len >= len {
+            return Ok(());
+        }
+        let buf = gpu.hip.host_malloc(len, 0)?;
+        self.staging = Some(buf);
+        self.staging_len = len;
+        Ok(())
+    }
+
+    fn pread_into_staging(&mut self, offset: usize, len: usize) -> std::io::Result<()> {
+        let staging = self
+            .staging
+            .as_mut()
+            .expect("PinnedH2DTransport staging must be allocated before pread");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            let dst = unsafe { &mut staging.as_mut_slice()[..len] };
+            self.file.read_exact_at(dst, offset as u64)?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let dst = unsafe { &mut staging.as_mut_slice()[..len] };
+            self.file.seek(SeekFrom::Start(offset as u64))?;
+            self.file.read_exact(dst)?;
+        }
+        Ok(())
+    }
+}
+
+impl DirectH2DTransport {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)?
+        };
+        #[cfg(not(unix))]
+        let file = {
+            let _ = path;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "DirectH2DTransport requires unix O_DIRECT",
+            ));
+        };
+        let file_len = file.metadata()?.len() as usize;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            file_len,
+            staging: None,
+            staging_len: 0,
+            next_handle: 0,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn next_handle(&mut self) -> TransferHandle {
+        let h = TransferHandle(self.next_handle);
+        self.next_handle += 1;
+        h
+    }
+
+    fn ensure_staging(&mut self, len: usize) -> std::io::Result<()> {
+        if self.staging_len >= len {
+            return Ok(());
+        }
+        self.staging = Some(AlignedHostBuffer::new(
+            len.max(DIRECT_IO_ALIGN),
+            DIRECT_IO_ALIGN,
+        )?);
+        self.staging_len = len.max(DIRECT_IO_ALIGN);
+        Ok(())
+    }
+
+    fn read_into_staging(&mut self, offset: usize, len: usize) -> std::io::Result<(usize, usize)> {
+        let start = align_down(offset, DIRECT_IO_ALIGN);
+        let end = offset.checked_add(len).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "range overflow")
+        })?;
+        let direct_len = align_up(end, DIRECT_IO_ALIGN) - start;
+        let rel = offset - start;
+        self.ensure_staging(direct_len)?;
+        let staging = self
+            .staging
+            .as_mut()
+            .expect("DirectH2DTransport staging must be allocated before read");
+        let got =
+            read_direct_allow_eof(&self.file, staging.as_mut_slice(direct_len), start as u64)?;
+        if got < rel + len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "short O_DIRECT read at offset {offset} len {len}: got {got}, need {}",
+                    rel + len
+                ),
+            ));
+        }
+        Ok((rel, len))
+    }
+}
+
+impl Transport for DirectH2DTransport {
+    fn fetch(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<(GpuTensor, TransferHandle)> {
+        let (rel, copy_len) = self.read_into_staging(hfq_offset, len).map_err(|e| {
+            hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "direct read {} bytes at offset {} from {:?} (file_len={}): {}",
+                    len, hfq_offset, self.path, self.file_len, e
+                ),
+            )
+        })?;
+        let staging = self.staging.as_ref().expect("direct staging");
+        let src = &staging.as_slice()[rel..rel + copy_len];
+        let buf = gpu.hip.malloc(len)?;
+        gpu.hip.memcpy_htod(&buf, src)?;
+        Ok((
+            GpuTensor {
+                buf,
+                shape: vec![len],
+                dtype: DType::Raw,
+            },
+            self.next_handle(),
+        ))
+    }
+
+    fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
         Ok(())
     }
 }
@@ -266,13 +466,12 @@ impl Transport for PreadH2DTransport {
         gpu: &mut Gpu,
     ) -> HipResult<(GpuTensor, TransferHandle)> {
         // 1. Host: pread the bytes into our staging buffer.
-        self.pread_into_staging(hfq_offset, len)
-            .map_err(|e| {
-                hip_bridge::HipError::new(0, &format!(
-                    "pread {} bytes at offset {}: {}",
-                    len, hfq_offset, e
-                ))
-            })?;
+        self.pread_into_staging(hfq_offset, len).map_err(|e| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("pread {} bytes at offset {}: {}", len, hfq_offset, e),
+            )
+        })?;
         // 2. GPU: alloc + memcpy_htod via the existing rdna-compute helper.
         //    `dtype: Raw` because the pager doesn't care about element layout
         //    — that interpretation belongs to `WeightTensor` at the call site.
@@ -283,6 +482,112 @@ impl Transport for PreadH2DTransport {
     fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
         // Transfers complete synchronously inside `fetch` in v0.1.
         Ok(())
+    }
+}
+
+impl Transport for PinnedH2DTransport {
+    fn fetch(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<(GpuTensor, TransferHandle)> {
+        self.ensure_staging(len, gpu)?;
+        self.pread_into_staging(hfq_offset, len).map_err(|e| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("pinned pread {} bytes at offset {}: {}", len, hfq_offset, e),
+            )
+        })?;
+        let buf = gpu.hip.malloc(len)?;
+        let src = &self.staging.as_ref().unwrap().as_slice()[..len];
+        let stream = hip_bridge::Stream::null();
+        gpu.hip.memcpy_htod_async(&buf, src, &stream)?;
+        gpu.hip.stream_synchronize(&stream)?;
+        Ok((
+            GpuTensor {
+                buf,
+                shape: vec![len],
+                dtype: DType::Raw,
+            },
+            self.next_handle(),
+        ))
+    }
+
+    fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
+        Ok(())
+    }
+}
+
+fn align_down(v: usize, align: usize) -> usize {
+    v & !(align - 1)
+}
+
+fn align_up(v: usize, align: usize) -> usize {
+    (v + align - 1) & !(align - 1)
+}
+
+fn read_direct_allow_eof(file: &File, dst: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        let mut done = 0usize;
+        while done < dst.len() {
+            let remaining = dst.len() - done;
+            let n = file.read_at(&mut dst[done..], offset + done as u64)?;
+            if n == 0 {
+                break;
+            }
+            done += n;
+            if n < remaining {
+                break;
+            }
+        }
+        Ok(done)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, dst, offset);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "direct I/O requires unix",
+        ))
+    }
+}
+
+struct AlignedHostBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for AlignedHostBuffer {}
+
+impl AlignedHostBuffer {
+    fn new(len: usize, align: usize) -> std::io::Result<Self> {
+        let mut ptr = std::ptr::null_mut();
+        let rc = unsafe { libc::posix_memalign(&mut ptr, align, len.max(1)) };
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc));
+        }
+        Ok(Self {
+            ptr: ptr.cast(),
+            len,
+        })
+    }
+
+    fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
+        assert!(len <= self.len);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, len) }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for AlignedHostBuffer {
+    fn drop(&mut self) {
+        unsafe { libc::free(self.ptr.cast()) };
     }
 }
 
@@ -399,6 +704,36 @@ impl WeightPager {
         Ok(Self::new(Box::new(transport), config))
     }
 
+    /// Convenience: open `hfq_path` with the experimental pinned-host staging
+    /// transport (`pread` into `hipHostMalloc` memory, then `hipMemcpyAsync`).
+    pub fn with_pinned_transport(hfq_path: &Path, config: PagerConfig) -> std::io::Result<Self> {
+        let transport = PinnedH2DTransport::open(hfq_path)?;
+        Ok(Self::new(Box::new(transport), config))
+    }
+
+    /// Convenience: open `hfq_path` with the experimental `O_DIRECT`
+    /// host-staged transport.
+    pub fn with_direct_transport(hfq_path: &Path, config: PagerConfig) -> std::io::Result<Self> {
+        let transport = DirectH2DTransport::open(hfq_path)?;
+        Ok(Self::new(Box::new(transport), config))
+    }
+
+    /// Select a transport from `HIPFIRE_LOAD_TRANSPORT`.
+    ///
+    /// Supported values:
+    /// - `pread` (default): Rust heap staging + synchronous H2D
+    /// - `pinned`: HIP pinned host staging + async H2D
+    /// - `direct`: O_DIRECT aligned host staging + synchronous H2D
+    pub fn with_env_transport(hfq_path: &Path, config: PagerConfig) -> std::io::Result<Self> {
+        match std::env::var("HIPFIRE_LOAD_TRANSPORT").ok().as_deref() {
+            Some("pinned") | Some("pinned-h2d") => Self::with_pinned_transport(hfq_path, config),
+            Some("direct") | Some("direct-h2d") | Some("odirect") => {
+                Self::with_direct_transport(hfq_path, config)
+            }
+            _ => Self::with_pread_transport(hfq_path, config),
+        }
+    }
+
     /// Register that `id` lives at `range` in the HFQ file. Called by the
     /// loader when it walks the tensor index. Must be called before any
     /// `ensure_resident(id)` for that id.
@@ -424,11 +759,7 @@ impl WeightPager {
     /// - Cold (registered but not resident) → if adding `id` would exceed
     ///   `config.vram_budget_bytes`, evict LRU residents until enough room.
     ///   Then fetch via transport, populate, track residency.
-    pub fn ensure_resident(
-        &mut self,
-        id: WeightId,
-        gpu: &mut Gpu,
-    ) -> Result<(), WeightPagerError> {
+    pub fn ensure_resident(&mut self, id: WeightId, gpu: &mut Gpu) -> Result<(), WeightPagerError> {
         if self.resident.contains_key(&id) {
             self.touch_lru(id);
             return Ok(());
@@ -455,7 +786,13 @@ impl WeightPager {
         }
         let (tensor, _handle) = self.transport.fetch(range.offset, range.len, gpu)?;
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
-        self.resident.insert(id, Resident { tensor, bytes: need });
+        self.resident.insert(
+            id,
+            Resident {
+                tensor,
+                bytes: need,
+            },
+        );
         self.lru.push_back(id);
         if self.config.trace {
             eprintln!(
@@ -490,8 +827,16 @@ impl WeightPager {
         gpu: &mut Gpu,
     ) -> HipResult<()> {
         for &idx in top_indices {
-            let gate_up_id = WeightId::Expert { layer, expert: idx, role: ExpertRole::GateUp };
-            let down_id = WeightId::Expert { layer, expert: idx, role: ExpertRole::Down };
+            let gate_up_id = WeightId::Expert {
+                layer,
+                expert: idx,
+                role: ExpertRole::GateUp,
+            };
+            let down_id = WeightId::Expert {
+                layer,
+                expert: idx,
+                role: ExpertRole::Down,
+            };
             let gate_up_tensor = self
                 .resident
                 .get(&gate_up_id)
@@ -504,8 +849,10 @@ impl WeightPager {
             let gate_up_ptr = gate_up_tensor.tensor.buf.as_ptr() as u64;
             let down_ptr = down_tensor.tensor.buf.as_ptr() as u64;
             let offset = (idx as usize) * 8;
-            gpu.hip.memcpy_htod_offset(&gate_up_ptrs.buf, offset, &gate_up_ptr.to_le_bytes())?;
-            gpu.hip.memcpy_htod_offset(&down_ptrs.buf, offset, &down_ptr.to_le_bytes())?;
+            gpu.hip
+                .memcpy_htod_offset(&gate_up_ptrs.buf, offset, &gate_up_ptr.to_le_bytes())?;
+            gpu.hip
+                .memcpy_htod_offset(&down_ptrs.buf, offset, &down_ptr.to_le_bytes())?;
         }
         Ok(())
     }
@@ -558,7 +905,10 @@ impl WeightPager {
                 // LRU without inserting into `resident`, or removed without
                 // updating LRU. In release this is a silent drop; debug
                 // builds catch the invariant violation.
-                debug_assert!(false, "weight_pager: LRU contained {id:?} but residency map did not");
+                debug_assert!(
+                    false,
+                    "weight_pager: LRU contained {id:?} but residency map did not"
+                );
             }
         }
         Ok(())
@@ -657,7 +1007,11 @@ impl std::fmt::Display for WeightPagerError {
         match self {
             Self::NotRegistered(id) => write!(f, "weight not registered: {id:?}"),
             Self::Hip(e) => write!(f, "hip error: {e}"),
-            Self::BudgetExhausted { need_bytes, in_use, budget } => write!(
+            Self::BudgetExhausted {
+                need_bytes,
+                in_use,
+                budget,
+            } => write!(
                 f,
                 "weight pager: cannot evict to fit {need_bytes} bytes \
                  (in_use={in_use}, budget={budget}); raise vram_budget_bytes \
@@ -698,8 +1052,16 @@ mod tests {
     #[test]
     fn weight_id_is_hashable() {
         let mut map = HashMap::new();
-        let a = WeightId::Expert { layer: 0, expert: 0, role: ExpertRole::GateUp };
-        let b = WeightId::Expert { layer: 0, expert: 0, role: ExpertRole::Down };
+        let a = WeightId::Expert {
+            layer: 0,
+            expert: 0,
+            role: ExpertRole::GateUp,
+        };
+        let b = WeightId::Expert {
+            layer: 0,
+            expert: 0,
+            role: ExpertRole::Down,
+        };
         map.insert(a, 1u32);
         map.insert(b, 2u32);
         assert_eq!(map.get(&a), Some(&1));
@@ -715,7 +1077,10 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("hipfire-pager-test-{}.bin", std::process::id()));
         let payload: Vec<u8> = (0..1024u32).flat_map(|i| (i as u8).to_le_bytes()).collect();
-        std::fs::File::create(&path).unwrap().write_all(&payload).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&payload)
+            .unwrap();
 
         let mut t = PreadH2DTransport::open(&path).unwrap();
         // Read [256..768) — should match payload[256..768].
@@ -732,7 +1097,10 @@ mod tests {
     fn pager_starts_empty() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("hipfire-pager-empty-{}.bin", std::process::id()));
-        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         let pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
         assert_eq!(pager.registered_count(), 0);
         assert_eq!(pager.vram_used_bytes(), 0);
@@ -743,10 +1111,16 @@ mod tests {
     fn register_then_get_returns_none_until_resident() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("hipfire-pager-reg-{}.bin", std::process::id()));
-        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
-        let mut pager =
-            WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
-        let id = WeightId::Expert { layer: 0, expert: 0, role: ExpertRole::GateUp };
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let mut pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+        let id = WeightId::Expert {
+            layer: 0,
+            expert: 0,
+            role: ExpertRole::GateUp,
+        };
         pager.register(id, ByteRange { offset: 0, len: 1 });
         assert_eq!(pager.registered_count(), 1);
         // Catalog hit, not yet resident → get returns None.
@@ -765,10 +1139,16 @@ mod tests {
     fn would_fit_rejects_need_bigger_than_budget() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("hipfire-pager-budget-{}.bin", std::process::id()));
-        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         let pager = WeightPager::with_pread_transport(
             &path,
-            PagerConfig { vram_budget_bytes: 100, trace: false },
+            PagerConfig {
+                vram_budget_bytes: 100,
+                trace: false,
+            },
         )
         .unwrap();
         // need <= budget → ok
@@ -776,7 +1156,11 @@ mod tests {
         assert!(pager.would_fit(100).is_ok());
         // need > budget → BudgetExhausted, even on an empty pager
         match pager.would_fit(1000) {
-            Err(WeightPagerError::BudgetExhausted { need_bytes, in_use, budget }) => {
+            Err(WeightPagerError::BudgetExhausted {
+                need_bytes,
+                in_use,
+                budget,
+            }) => {
                 assert_eq!(need_bytes, 1000);
                 assert_eq!(in_use, 0);
                 assert_eq!(budget, 100);
@@ -792,7 +1176,10 @@ mod tests {
     fn would_fit_accepts_anything_when_budget_unlimited() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("hipfire-pager-unlim-{}.bin", std::process::id()));
-        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         let pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
         // Default is u64::MAX; even u64::MAX - 1 fits.
         assert!(pager.would_fit(u64::MAX - 1).is_ok());

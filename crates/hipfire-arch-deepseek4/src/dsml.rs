@@ -31,7 +31,9 @@
 //! near-miss like `<DSML|invoke>` and we'd rather forward the bytes than
 //! eat them silently.
 
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 
 // ── DSML constants — exact strings from the HF docs ─────────────────────
 
@@ -456,8 +458,12 @@ pub fn parse_tool_calls_body(body: &str) -> Vec<ToolCall> {
         // (canonical, per HF encoder) or `<｜DSML｜tool name="` (variant
         // observed from the V4F MQ2-Lloyd checkpoint — see comment on
         // TOOL_OPEN_PREFIX_ALT). Whichever appears first wins.
-        let invoke_hit = body[cursor..].find(INVOKE_OPEN_PREFIX).map(|i| (i, INVOKE_OPEN_PREFIX.len(), INVOKE_CLOSE));
-        let tool_hit = body[cursor..].find(TOOL_OPEN_PREFIX_ALT).map(|i| (i, TOOL_OPEN_PREFIX_ALT.len(), TOOL_CLOSE_ALT));
+        let invoke_hit = body[cursor..]
+            .find(INVOKE_OPEN_PREFIX)
+            .map(|i| (i, INVOKE_OPEN_PREFIX.len(), INVOKE_CLOSE));
+        let tool_hit = body[cursor..]
+            .find(TOOL_OPEN_PREFIX_ALT)
+            .map(|i| (i, TOOL_OPEN_PREFIX_ALT.len(), TOOL_CLOSE_ALT));
         let (open_rel, open_len, close_marker) = match (invoke_hit, tool_hit) {
             (Some(a), Some(b)) if a.0 <= b.0 => a,
             (Some(_), Some(b)) => b,
@@ -484,8 +490,12 @@ pub fn parse_tool_calls_body(body: &str) -> Vec<ToolCall> {
         // Whichever appears FIRST in the body wins so a generic close
         // inside a string param value can't terminate the invoke
         // prematurely if the matched form precedes it.
-        let matched_at = body[body_start..].find(close_marker).map(|i| (i, close_marker.len()));
-        let generic_at = body[body_start..].find(GENERIC_CLOSE).map(|i| (i, GENERIC_CLOSE.len()));
+        let matched_at = body[body_start..]
+            .find(close_marker)
+            .map(|i| (i, close_marker.len()));
+        let generic_at = body[body_start..]
+            .find(GENERIC_CLOSE)
+            .map(|i| (i, GENERIC_CLOSE.len()));
         let (rel_off, used_close_len) = match (matched_at, generic_at) {
             (Some(a), Some(b)) if a.0 <= b.0 => a,
             (Some(_), Some(b)) => b,
@@ -502,7 +512,10 @@ pub fn parse_tool_calls_body(body: &str) -> Vec<ToolCall> {
         let invoke_close = body_start + rel_off;
         let invoke_body = &body[body_start..invoke_close];
         let args = parse_parameters(invoke_body);
-        out.push(ToolCall { name, arguments: args });
+        out.push(ToolCall {
+            name,
+            arguments: args,
+        });
         cursor = invoke_close + used_close_len;
     }
     out

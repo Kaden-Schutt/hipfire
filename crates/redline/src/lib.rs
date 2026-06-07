@@ -2,6 +2,16 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+#![allow(
+    clippy::identity_op,
+    clippy::manual_c_str_literals,
+    clippy::manual_checked_ops,
+    clippy::manual_div_ceil,
+    clippy::manual_range_patterns,
+    clippy::new_without_default,
+    clippy::unnecessary_cast
+)]
+
 //! Redline — direct-KMD GPU compute engine for AMD RDNA GPUs.
 //!
 //! Bypasses the HIP runtime entirely. Talks to /dev/dri/renderD128 via
@@ -37,9 +47,9 @@
 //! | hipDeviceSynchronize      | Sync::drain()                 | WAIT_CS (all)         |
 //! | hipMemGetInfo             | Device::vram_info()           | DRM_AMDGPU_INFO       |
 
-pub mod drm;
 pub mod device;
 pub mod dispatch;
+pub mod drm;
 pub mod hsaco;
 pub mod kfd;
 pub mod pm4;

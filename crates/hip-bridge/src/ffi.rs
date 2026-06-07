@@ -110,8 +110,12 @@ type HipFunction = *mut c_void;
 type HipEvent = *mut c_void;
 type HipGraph = *mut c_void;
 type HipGraphExec = *mut c_void;
+type HipHostMallocFn = unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32;
+type HipHostFreeFn = unsafe extern "C" fn(*mut c_void) -> u32;
 
 const HIP_SUCCESS: u32 = 0;
+/// `hipDeviceAttributeIntegrated` in HIP's cuda-compatible attribute block.
+const HIP_DEVICE_ATTRIBUTE_INTEGRATED: c_int = 16;
 
 /// `hipPointerAttribute_t` per ROCm 6.4.3 layout. ROCm 5.x not supported.
 #[repr(C)]
@@ -165,6 +169,8 @@ pub struct HipRuntime {
     // Memory
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
     fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
+    fn_host_malloc: Option<HipHostMallocFn>,
+    fn_host_free: Option<HipHostFreeFn>,
     fn_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32,
     fn_memcpy_async:
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
@@ -232,6 +238,15 @@ macro_rules! load_fn {
             .get($name.as_bytes())
             .map_err(|e| HipError::new(0, &format!("failed to load symbol {}: {e}", $name)))?;
         *sym.into_raw()
+    }};
+}
+
+macro_rules! load_optional_fn {
+    ($lib:expr, $name:expr, $ty:ty) => {{
+        match $lib.get::<$ty>($name.as_bytes()) {
+            Ok(sym) => Some(*sym),
+            Err(_) => None,
+        }
     }};
 }
 
@@ -356,6 +371,9 @@ impl HipRuntime {
                     unsafe extern "C" fn(*mut *mut c_void, usize) -> u32
                 ),
                 fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
+                fn_host_malloc: load_optional_fn!(lib, "hipHostMalloc", HipHostMallocFn),
+                fn_host_free: load_optional_fn!(lib, "hipHostFree", HipHostFreeFn)
+                    .or_else(|| load_optional_fn!(lib, "hipFreeHost", HipHostFreeFn)),
                 fn_memcpy: load_fn!(
                     lib,
                     "hipMemcpy",
@@ -652,6 +670,37 @@ impl HipRuntime {
         self.check(code, "hipMemcpyPeer")
     }
 
+    /// Cross-device peer copy with per-buffer byte offsets. `dst_offset`
+    /// and `src_offset` slide the start of each side; `size` is the bytes
+    /// transferred. Both ranges must lie within the respective buffer.
+    /// Synchronous (uses hipMemcpyPeer under the hood).
+    #[allow(clippy::too_many_arguments)]
+    pub fn memcpy_peer_offset(
+        &self,
+        dst: &DeviceBuffer,
+        dst_offset: usize,
+        dst_device: i32,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        src_device: i32,
+        size: usize,
+    ) -> HipResult<()> {
+        assert!(
+            dst_offset + size <= dst.size(),
+            "dst_offset ({dst_offset}) + size ({size}) exceeds dst ({})",
+            dst.size(),
+        );
+        assert!(
+            src_offset + size <= src.size(),
+            "src_offset ({src_offset}) + size ({size}) exceeds src ({})",
+            src.size(),
+        );
+        let dst_ptr = unsafe { (dst.as_ptr() as *mut u8).add(dst_offset) as *mut c_void };
+        let src_ptr = unsafe { (src.as_ptr() as *const u8).add(src_offset) as *const c_void };
+        let code = unsafe { (self.fn_memcpy_peer)(dst_ptr, dst_device, src_ptr, src_device, size) };
+        self.check(code, "hipMemcpyPeer (offset)")
+    }
+
     /// Stream must belong to one of the two devices involved.
     pub fn memcpy_peer_async(
         &self,
@@ -699,6 +748,32 @@ impl HipRuntime {
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
         self.check(code, "hipMalloc")?;
         Ok(DeviceBuffer { ptr, size })
+    }
+
+    /// Allocate page-locked host memory through HIP. This is the staging
+    /// allocation to use when callers want `hipMemcpyAsync` to route through
+    /// the fast pinned-memory path instead of pageable Rust heap memory.
+    pub fn host_malloc(&self, size: usize, flags: u32) -> HipResult<HostBuffer> {
+        let host_malloc = self.fn_host_malloc.ok_or_else(|| {
+            HipError::new(
+                0,
+                "hipHostMalloc symbol not available in loaded HIP runtime",
+            )
+        })?;
+        let host_free = self.fn_host_free.ok_or_else(|| {
+            HipError::new(
+                0,
+                "hipHostFree/hipFreeHost symbol not available in loaded HIP runtime",
+            )
+        })?;
+        let mut ptr: *mut c_void = ptr::null_mut();
+        let code = unsafe { host_malloc(&mut ptr, size, flags as c_uint) };
+        self.check(code, "hipHostMalloc")?;
+        Ok(HostBuffer {
+            ptr,
+            size,
+            host_free,
+        })
     }
 
     /// # Safety
@@ -1319,6 +1394,14 @@ impl HipRuntime {
         Ok(value as i32)
     }
 
+    /// True when HIP reports the device as an integrated GPU. For hipfire's
+    /// loader policy this is the practical UMA signal: CPU and GPU memory draw
+    /// from the same physical pool, so file-backed mmap/page-cache pressure and
+    /// allocation granularity matter differently than on a discrete card.
+    pub fn is_integrated_device(&self, device_id: i32) -> HipResult<bool> {
+        Ok(self.get_device_attribute(HIP_DEVICE_ATTRIBUTE_INTEGRATED, device_id)? != 0)
+    }
+
     /// Get VRAM info: (free_bytes, total_bytes).
     pub fn get_vram_info(&self) -> HipResult<(usize, usize)> {
         let mut free: usize = 0;
@@ -1333,12 +1416,59 @@ impl HipRuntime {
 
 /// GPU stream handle.
 pub struct Stream(HipStream);
+unsafe impl Send for Stream {}
+
 impl Stream {
-    pub fn as_raw(&self) -> *mut c_void {
-        self.0
+    /// Null/default HIP stream wrapper. Useful for APIs that accept a stream
+    /// handle but where callers deliberately want default-stream semantics.
+    pub fn null() -> Self {
+        Self(ptr::null_mut())
     }
 }
-unsafe impl Send for Stream {}
+
+/// HIP page-locked host allocation.
+pub struct HostBuffer {
+    ptr: *mut c_void,
+    size: usize,
+    host_free: HipHostFreeFn,
+}
+
+impl HostBuffer {
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn as_ptr(&self) -> *const c_void {
+        self.ptr as *const c_void
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.ptr
+    }
+
+    /// # Safety
+    /// Caller must ensure no GPU operation is concurrently reading this host
+    /// allocation while the returned slice is mutated.
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+        std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.size)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.size) }
+    }
+}
+
+unsafe impl Send for HostBuffer {}
+
+impl Drop for HostBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            let _ = unsafe { (self.host_free)(self.ptr) };
+            self.ptr = ptr::null_mut();
+            self.size = 0;
+        }
+    }
+}
 
 /// Loaded GPU module (compiled kernels).
 pub struct Module(HipModule);

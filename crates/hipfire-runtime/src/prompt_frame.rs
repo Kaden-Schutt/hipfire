@@ -201,7 +201,6 @@ struct ChatScaffold<'a> {
     system_role: Vec<u32>,
     user_role: Vec<u32>,
     assistant_role: Vec<u32>,
-    tool_role: Vec<u32>,
     /// `<think>` opener (if the tokenizer recognizes it as a single
     /// special token). When `None`, `OpenThink` falls back to `Plain`
     /// — see `append_assistant_prefix`.
@@ -222,7 +221,6 @@ impl<'a> ChatScaffold<'a> {
             system_role: t.encode("system"),
             user_role: t.encode("user"),
             assistant_role: t.encode("assistant"),
-            tool_role: t.encode("tool"),
             think_open: t.special_token_id("<think>"),
             think_close: t.special_token_id("</think>"),
         }
@@ -257,30 +255,6 @@ impl<'a> ChatScaffold<'a> {
         let body = self.tokenizer.encode(content);
         out.extend_from_slice(&self.im_start);
         out.extend_from_slice(&self.assistant_role);
-        out.extend_from_slice(&self.nl);
-        out.extend_from_slice(&body);
-        out.extend_from_slice(&self.im_end);
-        out.extend_from_slice(&self.nl);
-    }
-
-    /// Append an assistant turn where the body is already tokenized
-    /// (typically a verbatim replay from the daemon's
-    /// `asst_turn_cache`). Distinct from `append_assistant_turn` so
-    /// callers don't have to detour through a tokenizer round-trip
-    /// that BPE isn't bijective under for the model's emitted tokens.
-    fn append_assistant_turn_tokens(&self, out: &mut Vec<u32>, body: &[u32]) {
-        out.extend_from_slice(&self.im_start);
-        out.extend_from_slice(&self.assistant_role);
-        out.extend_from_slice(&self.nl);
-        out.extend_from_slice(body);
-        out.extend_from_slice(&self.im_end);
-        out.extend_from_slice(&self.nl);
-    }
-
-    fn append_tool_turn(&self, out: &mut Vec<u32>, content: &str) {
-        let body = self.tokenizer.encode(content);
-        out.extend_from_slice(&self.im_start);
-        out.extend_from_slice(&self.tool_role);
         out.extend_from_slice(&self.nl);
         out.extend_from_slice(&body);
         out.extend_from_slice(&self.im_end);
@@ -323,123 +297,6 @@ impl<'a> ChatScaffold<'a> {
             AssistantPrefix::Plain => {}
         }
     }
-}
-
-/// Build a multi-turn token stream from structured history, splicing
-/// cached verbatim token sequences for any historical assistant turn
-/// that `cache_lookup` returns `Some` for. Used by the daemon's Qwen
-/// prompt-cache path so that the rendered prefix is byte-identical to
-/// what was written into KV by prior turns — required for an LCP-based
-/// suffix prefill to extend through historical assistant turns (BPE is
-/// not bijective; re-encoding `msg.content` may produce a different
-/// token sequence than the one the model actually emitted).
-///
-/// Format mirrors the inline ChatML format consumed by the daemon
-/// today (`<|im_start|>{role}\n{content}<|im_end|>\n`):
-///   - System turn emitted once at top when `system.is_some()`
-///   - User turn: `<|im_start|>user\n{content}<|im_end|>\n`
-///   - Tool turn: `<|im_start|>tool\n<tool_response>\n{content}\n</tool_response><|im_end|>\n`
-///   - Assistant turn: `<|im_start|>assistant\n{body}<|im_end|>\n` where
-///     `body` is either the cached verbatim sequence or
-///     `tokenizer.encode(msg.content) + tool_calls_as_text` on miss.
-///
-/// `live_user_tokens` is appended as the trailing user turn (the
-/// request's live prompt). `assistant_prefix` adds the
-/// `<|im_start|>assistant\n[<think>...]` trailer the model decodes from.
-pub fn build_cached_history(
-    tokenizer: &Tokenizer,
-    system: Option<&str>,
-    history: &[Message],
-    live_user_tokens: &[u32],
-    assistant_prefix: AssistantPrefix,
-    mut cache_lookup: impl FnMut(&Message) -> Option<Vec<u32>>,
-) -> Vec<u32> {
-    let scaffold = ChatScaffold::for_tokenizer(tokenizer);
-    let mut out: Vec<u32> = Vec::new();
-    if let Some(sys) = system {
-        scaffold.append_system(&mut out, sys);
-    }
-    // If the trailing history message is a User, treat its content as
-    // the live prompt and drop it here — caller already passes the
-    // live user via `live_user_tokens`. Without this trim, the live
-    // user turn gets rendered twice (once from history, once from
-    // `live_user_tokens`). Mirrors V4F's daemon-side renderer at
-    // `crates/hipfire-runtime/examples/daemon.rs:5163`.
-    let trim_end = if matches!(history.last().map(|m| &m.role), Some(Role::User)) {
-        1
-    } else {
-        0
-    };
-    let history = &history[..history.len().saturating_sub(trim_end)];
-    for msg in history {
-        match msg.role {
-            // System messages in history are emitted via the top-level
-            // `system` parameter above. Embedded system turns in
-            // `history` are ignored to avoid duplication.
-            Role::System => {}
-            Role::User => scaffold.append_user_turn(&mut out, &msg.content),
-            Role::Tool => {
-                let wrapped = format!("<tool_response>\n{}\n</tool_response>", msg.content);
-                scaffold.append_tool_turn(&mut out, &wrapped);
-            }
-            Role::Assistant => {
-                // Emit `<|im_start|>assistant\n` plus the same
-                // `assistant_prefix` scaffolding the daemon used as the
-                // prompt-side prefix when this turn was originally
-                // generated (e.g. `<think>\n\n</think>\n\n` for
-                // thinking-off `ClosedThink`). Without it the cached
-                // body sits at the wrong KV offset and LCP fails right
-                // at the assistant turn boundary. Assumes the
-                // assistant_prefix has stayed constant across the
-                // conversation — true for typical OpenAI clients that
-                // don't toggle `chat_template_kwargs.enable_thinking`
-                // mid-session; turns with a mid-session toggle simply
-                // degrade to cache miss (LCP detects the divergence).
-                scaffold.append_assistant_prefix(&mut out, assistant_prefix);
-                if let Some(cached) = cache_lookup(msg) {
-                    out.extend_from_slice(&cached);
-                } else {
-                    // Cache miss — render the turn via tokenizer.encode
-                    // of the content + tool_calls. The resulting token
-                    // sequence may diverge from what the model originally
-                    // emitted (BPE non-bijectivity for the boundaries),
-                    // which is fine: the LCP check downstream will
-                    // detect divergence and trigger a full reset.
-                    if !msg.content.is_empty() && msg.content != "null" {
-                        out.extend(tokenizer.encode(&msg.content));
-                    }
-                    for tc in &msg.tool_calls {
-                        let payload = serde_json::json!({
-                            "name": tc.name,
-                            "arguments": tc.arguments,
-                        });
-                        let rendered = format!(
-                            "\n<tool_call>\n{}\n</tool_call>",
-                            serde_json::to_string(&payload).unwrap_or_default(),
-                        );
-                        out.extend(tokenizer.encode(&rendered));
-                    }
-                }
-                out.extend_from_slice(&scaffold.im_end);
-                out.extend_from_slice(&scaffold.nl);
-            }
-        }
-    }
-    // Skip the trailing user turn when there's no live user content
-    // (happens when the agent loop is continuing after a tool result
-    // and the caller doesn't supply a new user message — OpenAI's
-    // tool-use flow lets the model decode directly from the tool
-    // response). Without this guard we emit an empty
-    // `<|im_start|>user\n<|im_end|>\n` wrap which (a) is off-distribution
-    // for the model and (b) gets baked into conversation_tokens,
-    // breaking the LCP on the NEXT turn because the renderer then
-    // includes that empty user in its historical replay while the
-    // newer turn's history doesn't have it.
-    if !live_user_tokens.is_empty() {
-        scaffold.append_user_turn_tokens(&mut out, live_user_tokens);
-    }
-    scaffold.append_assistant_prefix(&mut out, assistant_prefix);
-    out
 }
 
 // ─── Jinja path — render upstream HF chat_template ──────────────────────────
@@ -531,6 +388,20 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Remove HF `{% generation %}` / `{% endgeneration %}` tags (with optional
+/// whitespace-control dashes and the line they sit on) from a chat template.
+/// These mark the assistant-token span for training-data masking and emit
+/// nothing, so dropping the markers keeps inference rendering byte-identical —
+/// while letting minijinja (which has no `generation` block tag) parse the
+/// template instead of erroring. No-op for templates without them.
+fn strip_generation_tags(template: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE
+        .get_or_init(|| regex::Regex::new(r"[ \t]*\{%-?\s*(?:end)?generation\s*-?%\}\n?").unwrap());
+    re.replace_all(template, "").into_owned()
+}
+
 impl<'a> JinjaChatFrame<'a> {
     /// Render the template and tokenize the result. Returns `Err` on
     /// any template-side failure so the caller can fall back to
@@ -588,12 +459,21 @@ impl<'a> JinjaChatFrame<'a> {
         use minijinja::{Environment, Error, ErrorKind, Value};
         use minijinja_contrib::pycompat::unknown_method_callback;
 
+        // Chainable-undefined (NOT Strict): chat templates are authored for
+        // Jinja2's lenient semantics and routinely PROBE optional fields —
+        // `system_message.current_date`, `.current_location`, `tools`,
+        // `documents`, etc. Under Strict, probing a key a caller didn't set
+        // raises, and the whole render fails → silent Plain fallback. That's
+        // exactly what broke MiniMax-M2 under an agent (Hermes) that sends a
+        // system message without `current_date`: `{% if system_message and
+        // system_message.current_date %}` errored at template line 37. Chainable
+        // matches Jinja2 (missing keys → falsy/undefined, chained access on
+        // undefined stays undefined) while still surfacing hard render errors
+        // (raise_exception, syntax). The required context vars (messages, tools,
+        // add_generation_prompt, bos_token) are always provided below, so the
+        // PR #175 "missing required var" concern doesn't regress.
         let mut env = Environment::new();
-        // Strict-undefined: a missing context variable raises Err instead of
-        // silently rendering empty/partial output. Without this, malformed
-        // prompts could propagate to the model unnoticed (Codex review on
-        // PR #175 flagged this; we apply it here in the same port).
-        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Chainable);
         // Make Python-style str/list/dict methods (`.startswith`,
         // `.split`, `.rstrip`, `.lstrip`, `|items`, etc.) work on
         // ordinary Jinja values. Required by the Qwen3 family
@@ -608,10 +488,39 @@ impl<'a> JinjaChatFrame<'a> {
         env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
+        // Some HF templates call `tojson(ensure_ascii=False)` (MiniMax-M2's tool
+        // block) or `tojson(indent=…)`. minijinja's builtin `tojson` rejects
+        // unknown kwargs, so the whole template fails to render and we silently
+        // fall back to the Plain frame — the model then never sees its native
+        // tool format (observed e2e on MiniMax-M2: template render failed on
+        // `ensure_ascii`, Plain fallback, model emitted a Qwen-ish `<tool_call>`
+        // instead of `<minimax:tool_call>`). Override `tojson` with a serde_json
+        // serializer that accepts + ignores those kwargs; serde_json emits raw
+        // UTF-8 (== ensure_ascii=False), which is what chat templates want.
+        env.add_filter(
+            "tojson",
+            |value: Value, kwargs: minijinja::value::Kwargs| -> Result<Value, Error> {
+                let _ = kwargs.get::<Option<bool>>("ensure_ascii");
+                let _ = kwargs.get::<Option<i64>>("indent");
+                let s = serde_json::to_string(&value)
+                    .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("tojson: {e}")))?;
+                Ok(Value::from_safe_string(s))
+            },
+        );
 
-        env.add_template("chat", self.template)
+        // Strip HF `{% generation %}` / `{% endgeneration %}` training-mask
+        // tags (and their whitespace-control `{%- … -%}` variants). minijinja
+        // has no `generation` block tag, so a template that uses them (e.g.
+        // LFM2.5) fails to parse and the caller silently falls back to Plain
+        // framing. These tags only delimit the assistant-token span for
+        // training-data masking — they emit nothing — so removing the markers
+        // (including their own line) leaves the rendered output byte-identical
+        // for inference. No-op for templates that don't use them (Qwen/MiniMax).
+        let sanitized = strip_generation_tags(self.template);
+        env.add_template_owned("chat", sanitized)
             .map_err(|e| format!("template parse: {e}"))?;
-        let tmpl = env.get_template("chat")
+        let tmpl = env
+            .get_template("chat")
             .map_err(|e| format!("template lookup: {e}"))?;
 
         // Pass bos_token to the template context. Caller may override via
@@ -649,7 +558,8 @@ impl<'a> JinjaChatFrame<'a> {
             documents => Value::from_serialize(&empty_list),
             tool_call_kwargs => kwargs_val,
         };
-        tmpl.render(ctx).map_err(|e| format!("template render: {e}"))
+        tmpl.render(ctx)
+            .map_err(|e| format!("template render: {e}"))
     }
 }
 
@@ -693,8 +603,8 @@ mod tests {
         entries.push(r#""assistant": 6"#.to_string());
         entries.push(r#""\n": 7"#.to_string());
         entries.push(r#""Ġ": 8"#.to_string()); // gpt-2 mode trigger
-        // All 256 GPT-2-byte characters get unique ids 100..356 so
-        // any short string round-trips byte-by-byte.
+                                               // All 256 GPT-2-byte characters get unique ids 100..356 so
+                                               // any short string round-trips byte-by-byte.
         for b in 0u32..=255u32 {
             // Use rust escape; the encoder will look up the GPT-2 char
             // form of each byte directly.
@@ -771,7 +681,10 @@ mod tests {
                 n += 1;
             }
         }
-        let idx = bs.iter().position(|&x| x == b as u32).expect("byte in table");
+        let idx = bs
+            .iter()
+            .position(|&x| x == b as u32)
+            .expect("byte in table");
         char::from_u32(cs[idx]).expect("valid char")
     }
 
@@ -822,6 +735,138 @@ mod tests {
     }
 
     #[test]
+    fn strip_generation_tags_removes_markers_keeps_body() {
+        // HF training-mask tags (and their whitespace-control variants) are
+        // dropped; the body between them and everything else is untouched.
+        let tpl = "a\n{%- generation -%}\nBODY\n{%- endgeneration -%}\nb\n{% generation %}X{% endgeneration %}c";
+        let got = strip_generation_tags(tpl);
+        assert!(!got.contains("generation"), "tags not stripped: {got:?}");
+        assert!(got.contains("BODY"), "inner body dropped: {got:?}");
+        assert!(
+            got.contains('X') && got.contains('c'),
+            "non-dashed body dropped: {got:?}"
+        );
+        // A template with no generation tags is returned unchanged.
+        let plain = "{{ bos_token }}{%- for m in messages -%}{{ m.role }}{%- endfor -%}";
+        assert_eq!(strip_generation_tags(plain), plain);
+    }
+
+    #[test]
+    fn jinja_render_tolerates_generation_tags() {
+        // A minimal template that uses `{% generation %}` around the assistant
+        // body — minijinja has no such tag, so without the strip this fails to
+        // parse. With the strip it renders the assistant body normally.
+        let t = make_tokenizer();
+        let template = "{%- for message in messages -%}\
+            {{- '<|im_start|>' + message.role + '\\n' -}}\
+            {%- if message.role == 'assistant' -%}{%- generation -%}{{- message.content -}}{%- endgeneration -%}\
+            {%- else -%}{{- message.content -}}{%- endif -%}\
+            {{- '<|im_end|>\\n' -}}\
+            {%- endfor -%}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "hi",
+            enable_thinking: false,
+            bos_token: Some("<|im_start|>"),
+        };
+        let msgs = vec![
+            Message {
+                role: Role::User,
+                content: "hi".into(),
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Assistant,
+                content: "yo".into(),
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
+        ];
+        let rendered = frame
+            .render_messages(&msgs, None, None)
+            .expect("template with generation tags must render after strip");
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nyo<|im_end|>\n"
+        );
+    }
+
+    #[test]
+    fn jinja_tojson_accepts_ensure_ascii_kwarg() {
+        // MiniMax-M2's template calls `tojson(ensure_ascii=False)`; minijinja's
+        // builtin rejects the kwarg → render fails → silent Plain fallback (the
+        // model then never emits its native tool format). Our override must
+        // accept the kwarg and emit raw JSON.
+        let t = make_tokenizer();
+        let template = "{%- for m in messages -%}{{- m.content -}}{%- endfor -%}{{- tools | tojson(ensure_ascii=False) -}}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "hi",
+            enable_thinking: false,
+            bos_token: Some(""),
+        };
+        let msgs = vec![Message {
+            role: Role::User,
+            content: "hi".into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        }];
+        let tools =
+            vec![serde_json::json!({"type": "function", "function": {"name": "get_weather"}})];
+        let rendered = frame
+            .render_messages(&msgs, Some(&tools), None)
+            .expect("tojson(ensure_ascii=False) must render, not fall back");
+        assert!(
+            rendered.contains("\"get_weather\""),
+            "tool json missing: {rendered}"
+        );
+    }
+
+    #[test]
+    fn jinja_chainable_tolerates_missing_optional_field() {
+        // Chat templates probe optional message fields (e.g. MiniMax-M2's
+        // `system_message.current_date`). Under Strict-undefined that raised and
+        // forced a Plain fallback (broke MiniMax under Hermes); Chainable treats a
+        // missing key as falsy like Jinja2, so the probe is a no-op.
+        let t = make_tokenizer();
+        let template = "{%- for m in messages -%}\
+            {%- if m.current_date -%}D:{{ m.current_date }}{%- endif -%}\
+            {{- m.content -}}\
+            {%- endfor -%}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "hi",
+            enable_thinking: false,
+            bos_token: Some(""),
+        };
+        let msgs = vec![
+            Message {
+                role: Role::System,
+                content: "S".into(),
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::User,
+                content: "U".into(),
+                tool_calls: vec![],
+                tool_call_id: None,
+            },
+        ];
+        let rendered = frame
+            .render_messages(&msgs, None, None)
+            .expect("probing a missing optional message field must not raise");
+        assert_eq!(rendered, "SU");
+    }
+
+    #[test]
     fn open_think_appends_think_newline_when_special_present() {
         let t = make_tokenizer();
         let plain = ChatFrame {
@@ -842,13 +887,20 @@ mod tests {
         .build();
         // The test tokenizer always registers `<think>` as a special
         // token, so OpenThink must append exactly `<think>\n`.
-        let think_id = t.special_token_id("<think>")
+        let think_id = t
+            .special_token_id("<think>")
             .expect("test tokenizer registers <think> as special");
         let mut expected = plain.clone();
         expected.push(think_id);
         expected.extend_from_slice(&t.encode("\n"));
-        assert_eq!(opened, expected, "OpenThink should append <think>\\n after the assistant prefix");
-        assert!(opened.len() > plain.len(), "OpenThink output must be strictly longer than Plain");
+        assert_eq!(
+            opened, expected,
+            "OpenThink should append <think>\\n after the assistant prefix"
+        );
+        assert!(
+            opened.len() > plain.len(),
+            "OpenThink output must be strictly longer than Plain"
+        );
     }
 
     #[test]
@@ -870,9 +922,11 @@ mod tests {
             raw: false,
         }
         .build();
-        let think_id = t.special_token_id("<think>")
+        let think_id = t
+            .special_token_id("<think>")
             .expect("test tokenizer registers <think> as special");
-        let close_id = t.special_token_id("</think>")
+        let close_id = t
+            .special_token_id("</think>")
             .expect("test tokenizer registers </think> as special");
         let nl = t.encode("\n");
         let mut expected = plain.clone();
@@ -883,8 +937,14 @@ mod tests {
         expected.push(close_id);
         expected.extend_from_slice(&nl);
         expected.extend_from_slice(&nl);
-        assert_eq!(closed, expected, "ClosedThink should append <think>\\n\\n</think>\\n\\n after the assistant prefix");
-        assert!(closed.len() > plain.len(), "ClosedThink output must be strictly longer than Plain");
+        assert_eq!(
+            closed, expected,
+            "ClosedThink should append <think>\\n\\n</think>\\n\\n after the assistant prefix"
+        );
+        assert!(
+            closed.len() > plain.len(),
+            "ClosedThink output must be strictly longer than Plain"
+        );
     }
 
     #[test]
@@ -907,7 +967,10 @@ mod tests {
             raw: false,
         }
         .build();
-        assert_eq!(closed, plain, "ClosedThink without special tokens must fall back to Plain");
+        assert_eq!(
+            closed, plain,
+            "ClosedThink without special tokens must fall back to Plain"
+        );
     }
 
     #[test]
@@ -928,8 +991,7 @@ mod tests {
     #[test]
     fn build_multi_turn_two_turn_history() {
         let t = make_tokenizer();
-        let history: [(Role, &str); 2] =
-            [(Role::User, "hello"), (Role::Assistant, "hi")];
+        let history: [(Role, &str); 2] = [(Role::User, "hello"), (Role::Assistant, "hi")];
         let frame = ChatFrame {
             tokenizer: &t,
             system: None,
@@ -986,7 +1048,10 @@ mod tests {
         };
         let via_string = frame.build();
         let via_tokens = frame.build_with_user_tokens(&t.encode(user_text));
-        assert_eq!(via_string, via_tokens, "build_with_user_tokens must match build() when tokens align");
+        assert_eq!(
+            via_string, via_tokens,
+            "build_with_user_tokens must match build() when tokens align"
+        );
     }
 
     #[test]
@@ -1144,8 +1209,14 @@ mod tests {
         let out = frame
             .render_messages(&messages, None, None)
             .expect("multi-turn render succeeds");
-        assert!(out.contains("system:be brief;"), "system content visible: {out:?}");
-        assert!(out.contains("user:weather?;"), "user content visible: {out:?}");
+        assert!(
+            out.contains("system:be brief;"),
+            "system content visible: {out:?}"
+        );
+        assert!(
+            out.contains("user:weather?;"),
+            "user content visible: {out:?}"
+        );
         assert!(
             out.contains("assistant:call=get_weather(SF);"),
             "assistant tool_call rendered: {out:?}",

@@ -24,12 +24,14 @@
 //! actual decode hot path at that context length.
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("build with --features deltanet"); }
+fn main() {
+    eprintln!("build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_runtime::hfq::HfqFile;
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{self, KvCache};
     use rdna_compute::profile;
     use std::collections::BTreeMap;
@@ -38,7 +40,9 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: profile_qwen35_mq4 <model.hfq> [--prefill N] [--warmup N] [--profile-steps N]");
+        eprintln!(
+            "Usage: profile_qwen35_mq4 <model.hfq> [--prefill N] [--warmup N] [--profile-steps N]"
+        );
         std::process::exit(1);
     }
     let model_path = &args[1];
@@ -49,10 +53,22 @@ fn main() {
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--prefill"       => { prefill_len    = args[i + 1].parse().unwrap(); i += 2; }
-            "--warmup"        => { warmup_len     = args[i + 1].parse().unwrap(); i += 2; }
-            "--profile-steps" => { profile_steps  = args[i + 1].parse().unwrap(); i += 2; }
-            other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
+            "--prefill" => {
+                prefill_len = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--warmup" => {
+                warmup_len = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--profile-steps" => {
+                profile_steps = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            other => {
+                eprintln!("unknown arg: {other}");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -62,8 +78,10 @@ fn main() {
 
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
-    eprintln!("Config: dim={} layers={} heads={} kv_heads={}",
-        config.dim, config.n_layers, config.n_heads, config.n_kv_heads);
+    eprintln!(
+        "Config: dim={} layers={} heads={} kv_heads={}",
+        config.dim, config.n_layers, config.n_heads, config.n_kv_heads
+    );
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("GPU: {}", gpu.arch);
@@ -74,8 +92,13 @@ fn main() {
 
     let kv_seq = (prefill_len + warmup_len + profile_steps + 16).max(512);
     let mut kv_cache = KvCache::new_gpu_q8(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
-    ).unwrap();
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        kv_seq,
+    )
+    .unwrap();
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
@@ -84,11 +107,24 @@ fn main() {
     eprintln!("\nPrefill {prefill_len} tokens (batched, untimed)...");
     let t_prefill = Instant::now();
     qwen35::forward_prefill_batch(
-        &mut gpu, &weights, &config, &prompt_tokens, 0,
-        &mut kv_cache, &mut dn_state, &scratch,
-        None, None, None, None,
-    ).expect("prefill forward failed");
-    eprintln!("  prefill: {:.1}ms", t_prefill.elapsed().as_secs_f64() * 1000.0);
+        &mut gpu,
+        &weights,
+        &config,
+        &prompt_tokens,
+        0,
+        &mut kv_cache,
+        &mut dn_state,
+        &scratch,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("prefill forward failed");
+    eprintln!(
+        "  prefill: {:.1}ms",
+        t_prefill.elapsed().as_secs_f64() * 1000.0
+    );
     let logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
 
@@ -96,32 +132,54 @@ fn main() {
     for step in 0..warmup_len {
         let pos = prompt_tokens.len() + step;
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, next_token, pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("warmup forward failed");
+            &mut gpu,
+            &weights,
+            &config,
+            next_token,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("warmup forward failed");
         let logits = gpu.download_f32(&scratch.logits).unwrap();
         next_token = llama::argmax(&logits);
     }
 
     // === PROFILED PHASE ===
-    eprintln!("\n=== profiled run: {profile_steps} gen steps at ctx ~{} ===",
-        prompt_tokens.len() + warmup_len);
+    eprintln!(
+        "\n=== profiled run: {profile_steps} gen steps at ctx ~{} ===",
+        prompt_tokens.len() + warmup_len
+    );
     profile::start();
     let t_profile = Instant::now();
     for step in 0..profile_steps {
         let pos = prompt_tokens.len() + warmup_len + step;
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, next_token, pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("profile forward failed");
+            &mut gpu,
+            &weights,
+            &config,
+            next_token,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("profile forward failed");
         let logits = gpu.download_f32(&scratch.logits).unwrap();
         next_token = llama::argmax(&logits);
     }
     let profile_wall_ms = t_profile.elapsed().as_secs_f64() * 1000.0;
     let entries = profile::stop().unwrap_or_default();
-    eprintln!("Captured {} profile entries over {} steps", entries.len(), profile_steps);
-    eprintln!("Wall time under profiling: {profile_wall_ms:.1}ms ({:.2}ms/step)",
-        profile_wall_ms / profile_steps as f64);
+    eprintln!(
+        "Captured {} profile entries over {} steps",
+        entries.len(),
+        profile_steps
+    );
+    eprintln!(
+        "Wall time under profiling: {profile_wall_ms:.1}ms ({:.2}ms/step)",
+        profile_wall_ms / profile_steps as f64
+    );
 
     // Aggregate by (category, kernel)
     #[derive(Default)]
@@ -157,15 +215,22 @@ fn main() {
         let avg_us = a.total_us / a.calls as f64;
         let mib = a.total_bytes as f64 / (1024.0 * 1024.0);
         let gbps = if a.total_us > 0.0 {
-            (a.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-                / (a.total_us / 1_000_000.0)
+            (a.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)) / (a.total_us / 1_000_000.0)
         } else {
             0.0
         };
         let pct = a.total_us * 100.0 / total_us;
         println!(
             "{:<4} {:<10} {:<36} {:>8} {:>10.1}us {:>9.2}us {:>10.1} MiB {:>8.1}  ({:.1}%)",
-            rank + 1, cat, name, a.calls, a.total_us, avg_us, mib, gbps, pct
+            rank + 1,
+            cat,
+            name,
+            a.calls,
+            a.total_us,
+            avg_us,
+            mib,
+            gbps,
+            pct
         );
     }
     println!("{:-<105}", "");
@@ -183,7 +248,12 @@ fn main() {
     println!();
     println!("Per-step (averaged over {profile_steps} profiled steps):");
     println!("  kernel time: {:.2}ms", per_step_us / 1000.0);
-    println!("  wall time:   {:.2}ms (profiling serializes launches)", profile_wall_ms / profile_steps as f64);
-    println!("  kernel/wall overhead factor: {:.2}x",
-        (profile_wall_ms / profile_steps as f64) / (per_step_us / 1000.0));
+    println!(
+        "  wall time:   {:.2}ms (profiling serializes launches)",
+        profile_wall_ms / profile_steps as f64
+    );
+    println!(
+        "  kernel/wall overhead factor: {:.2}x",
+        (profile_wall_ms / profile_steps as f64) / (per_step_us / 1000.0)
+    );
 }

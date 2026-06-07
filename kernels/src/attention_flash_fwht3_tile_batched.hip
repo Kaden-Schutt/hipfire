@@ -2,8 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Batched flash attention tile — fwht3 KV (K FWHT-rotated 3-bit; V at Q8_0
-// OR lloyd3 FWHT-rotated centroid, gated by v_mode).
+// Batched flash attention tile — fwht3 KV (K FWHT-rotated 3-bit, V Q8_0).
 // Single-pass 256-element signed-FWHT on Q to match the K-write rotation.
 // Partials layout: [sub_batch × n_heads × max_tiles × (2+head_dim)].
 //
@@ -32,8 +31,7 @@ __global__ void attention_flash_fwht3_tile_batched(
     int max_tiles,
     int batch_offset,
     int block_start,
-    int block_cols,
-    int v_mode          // 8 = legacy Q8_0 V; 3 = lloyd3 FWHT-rotated centroid V
+    int block_cols
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -56,6 +54,11 @@ __global__ void attention_flash_fwht3_tile_batched(
     const int k_bytes_per_head = 4 + (head_dim * 3) / 8;
     const int k_bytes_per_pos  = n_kv_heads * k_bytes_per_head;
     const int k_head_off       = kv_h * k_bytes_per_head;
+
+    const int v_blocks_per_head = head_dim / 32;
+    const int v_total_blocks    = n_kv_heads * v_blocks_per_head;
+    const int v_kv_head_blk     = kv_h * v_blocks_per_head;
+    const int v_row_stride      = v_total_blocks * 34;
 
     extern __shared__ float sdata[];
     float* scores = sdata;
@@ -116,56 +119,20 @@ __global__ void attention_flash_fwht3_tile_batched(
     __syncthreads();
 
     float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-    if (v_mode == 8) {
-        // Legacy Q8_0 V (normal space) — unchanged behavior.
-        const int v_blocks_per_head = head_dim / 32;
-        const int v_total_blocks    = n_kv_heads * v_blocks_per_head;
-        const int v_kv_head_blk     = kv_h * v_blocks_per_head;
-        const int v_row_stride      = v_total_blocks * 34;
-        for (int t_local = 0; t_local < tile_len; t_local++) {
-            float w = scores[t_local];
-            int t = tile_start + t_local;
-            const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
-            #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                const int d = d0 + i;
-                const int bi = d / 32;
-                const int bj = d % 32;
-                const int v_blk_off = (v_kv_head_blk + bi) * 34;
-                const unsigned char* vbh = vb + v_blk_off;
-                float vs = (float)*((const _Float16*)vbh);
-                out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
-            }
+    for (int t_local = 0; t_local < tile_len; t_local++) {
+        float w = scores[t_local];
+        int t = tile_start + t_local;
+        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int d = d0 + i;
+            const int bi = d / 32;
+            const int bj = d % 32;
+            const int v_blk_off = (v_kv_head_blk + bi) * 34;
+            const unsigned char* vbh = vb + v_blk_off;
+            float vs = (float)*((const _Float16*)vbh);
+            out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
         }
-    } else {
-        // lloyd2/3/4: 256-wide FWHT-rotated centroid V. v_mode = bit width.
-        // Layout: 4B cnorm + (tid * v_mode) bytes packed (8 indices, LSB-first, i*v_mode shift).
-        const int v_bytes_per_head = 4 + (head_dim * v_mode) / 8;
-        const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
-        const int v_head_off       = kv_h * v_bytes_per_head;
-        for (int t_local = 0; t_local < tile_len; t_local++) {
-            float w = scores[t_local];
-            int t = tile_start + t_local;
-            const unsigned char* vb = v_cache + (size_t)t * v_bytes_per_pos + v_head_off;
-            float cnorm = *(const float*)vb;
-            const unsigned char* base = vb + 4 + tid * v_mode;   // v_mode bytes/thread
-            unsigned int packed = (unsigned int)base[0];
-            if (v_mode >= 2) packed |= ((unsigned int)base[1] << 8);
-            if (v_mode >= 3) packed |= ((unsigned int)base[2] << 16);
-            if (v_mode >= 4) packed |= ((unsigned int)base[3] << 24);
-            #pragma unroll
-            for (int i = 0; i < 8; i++) {
-                float c;
-                if (v_mode == 2)      c = TURBO_C2_256[(packed >> (i * 2)) & 3];
-                else if (v_mode == 3) c = TURBO_C3_256[(packed >> (i * 3)) & 7];
-                else                  c = TURBO_C4_256[(packed >> (i * 4)) & 15];
-                out_vec[i] += w * (cnorm * c);
-            }
-        }
-        // V accumulated in ROTATED space (out_vec ≈ H·Σw·v). The inverse FWHT
-        // is deferred to the dedicated lloyd reduce kernel, which applies it
-        // once after the cross-tile combine (inverse is linear, so it commutes
-        // with the weighted-sum + scalar normalize the reduce performs).
     }
 
     float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)

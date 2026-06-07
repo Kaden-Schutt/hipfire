@@ -65,23 +65,39 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--model" => { model = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--n-ctx" => { n_ctx = argv[i + 1].parse().expect("--n-ctx"); i += 2; }
+            "--model" => {
+                model = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--n-ctx" => {
+                n_ctx = argv[i + 1].parse().expect("--n-ctx");
+                i += 2;
+            }
             "--kv-mode" => {
                 let v = argv[i + 1].clone();
                 if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4") {
                     eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 (got {v})");
                     std::process::exit(1);
                 }
-                kv_mode = v; i += 2;
+                kv_mode = v;
+                i += 2;
             }
-            "--warmup-iters" => { warmup_iters = argv[i + 1].parse().expect("--warmup-iters"); i += 2; }
-            "--measure-iters" => { measure_iters = argv[i + 1].parse().expect("--measure-iters"); i += 2; }
+            "--warmup-iters" => {
+                warmup_iters = argv[i + 1].parse().expect("--warmup-iters");
+                i += 2;
+            }
+            "--measure-iters" => {
+                measure_iters = argv[i + 1].parse().expect("--measure-iters");
+                i += 2;
+            }
             "-h" | "--help" => {
                 eprintln!("Usage: prefill_microbench --model <path> [--n-ctx 2048] [--kv-mode asym3] [--warmup-iters 1] [--measure-iters 3]");
                 std::process::exit(0);
             }
-            other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
+            other => {
+                eprintln!("unknown arg: {other}");
+                std::process::exit(1);
+            }
         }
     }
     let args = Args {
@@ -114,9 +130,15 @@ fn main() {
     let mut hfq = HfqFile::open(&args.model).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    eprintln!("prefill_microbench: arch={} model={}", gpu.arch, args.model.display());
+    eprintln!(
+        "prefill_microbench: arch={} model={}",
+        gpu.arch,
+        args.model.display()
+    );
     if gpu.arch.starts_with("gfx12") {
-        unsafe { std::env::set_var("HIPFIRE_LLOYD_GFX12", "1"); }
+        unsafe {
+            std::env::set_var("HIPFIRE_LLOYD_GFX12", "1");
+        }
     }
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
@@ -124,17 +146,37 @@ fn main() {
     let kv_max = args.n_ctx + 16;
     let mut kv_cache = match args.kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym4" => KvCache::new_gpu_asym4(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym2" => KvCache::new_gpu_asym2(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         other => panic!("unknown --kv-mode: {other}"),
     };
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();
@@ -170,15 +212,23 @@ fn main() {
     let per_token_path = |gpu: &mut rdna_compute::Gpu,
                           kv_cache: &mut KvCache,
                           dn_state: &mut DeltaNetState,
-                          tokens: &[u32]| -> f64 {
+                          tokens: &[u32]|
+     -> f64 {
         // Reset DN; KV is overwritten in place from pos 0 per token.
         dn_state.reset(gpu);
         let t0 = Instant::now();
         for pos in 0..tokens.len() {
             qwen35::forward_scratch(
-                gpu, &weights, &config, tokens[pos], pos,
-                kv_cache, dn_state, &scratch,
-            ).expect("forward_scratch");
+                gpu,
+                &weights,
+                &config,
+                tokens[pos],
+                pos,
+                kv_cache,
+                dn_state,
+                &scratch,
+            )
+            .expect("forward_scratch");
         }
         // One trailing sync to ensure all GPU work is done before we stop
         // the clock. Hipfire's forward_scratch already synchronises at the
@@ -190,20 +240,23 @@ fn main() {
     let prefill_path = |gpu: &mut rdna_compute::Gpu,
                         kv_cache: &mut KvCache,
                         dn_state: &mut DeltaNetState,
-                        tokens: &[u32]| -> f64 {
+                        tokens: &[u32]|
+     -> f64 {
         dn_state.reset(gpu);
         let t0 = Instant::now();
         qwen35::forward_prefill_batch(
-            gpu, &weights, &config, tokens, 0,
-            kv_cache, dn_state, &scratch,
-            None, None, None, None,
-        ).expect("forward_prefill_batch");
+            gpu, &weights, &config, tokens, 0, kv_cache, dn_state, &scratch, None, None, None, None,
+        )
+        .expect("forward_prefill_batch");
         gpu.hip.device_synchronize().expect("sync");
         t0.elapsed().as_secs_f64()
     };
 
     // -------- warmup --------
-    eprintln!("prefill_microbench: warmup ({} iters each path)", args.warmup_iters);
+    eprintln!(
+        "prefill_microbench: warmup ({} iters each path)",
+        args.warmup_iters
+    );
     for _ in 0..args.warmup_iters {
         let _ = per_token_path(&mut gpu, &mut kv_cache, &mut dn_state, &tokens);
         let _ = prefill_path(&mut gpu, &mut kv_cache, &mut dn_state, &tokens);
@@ -236,16 +289,29 @@ fn main() {
     let speedup_best = pt_min / pb_min;
 
     eprintln!();
-    eprintln!("===== prefill_microbench summary (n_ctx={}, kv_mode={}) =====", args.n_ctx, args.kv_mode);
+    eprintln!(
+        "===== prefill_microbench summary (n_ctx={}, kv_mode={}) =====",
+        args.n_ctx, args.kv_mode
+    );
     eprintln!(
         "per-token forward_scratch × {} : min {:.3}s  mean {:.3}s  max {:.3}s  ({:.1} tok/s mean)",
-        args.n_ctx, pt_min, pt_mean, pt_max, args.n_ctx as f64 / pt_mean,
+        args.n_ctx,
+        pt_min,
+        pt_mean,
+        pt_max,
+        args.n_ctx as f64 / pt_mean,
     );
     eprintln!(
         "forward_prefill_batch          : min {:.3}s  mean {:.3}s  max {:.3}s  ({:.1} tok/s mean)",
-        pb_min, pb_mean, pb_max, args.n_ctx as f64 / pb_mean,
+        pb_min,
+        pb_mean,
+        pb_max,
+        args.n_ctx as f64 / pb_mean,
     );
-    eprintln!("speedup (per-token / prefill) : mean {:.2}×  best {:.2}×", speedup_mean, speedup_best);
+    eprintln!(
+        "speedup (per-token / prefill) : mean {:.2}×  best {:.2}×",
+        speedup_mean, speedup_best
+    );
     eprintln!();
     eprintln!("Decision rule (docs/plans/issue-113-quant-quality-eval.md §5):");
     eprintln!("  ≥ 4×    : continue with rev-2 plan as designed");

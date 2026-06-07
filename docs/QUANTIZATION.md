@@ -6,13 +6,15 @@ side. For the user-facing "how do I quantize my model" page, see
 
 ## Weight formats
 
-All weight formats group elements into 256-wide blocks (G256). Each
-block has independent scale + zero-point metadata. The bitwidth and
-whether a Walsh-Hadamard rotation runs before quantization defines the
-four production formats.
+Quantized weight formats group elements into 256-wide blocks (G256).
+Each block has independent scale + zero-point metadata. The bitwidth
+and whether a Walsh-Hadamard rotation runs before quantization defines
+the production formats. `fp16` is the unquantized HFQ-container
+reference path: qt=1 F16 payloads, no grouping, no rotation.
 
 | Format | Bits | Rotation | Bytes / 256 elements | Use case |
 |---|---|---|---|---|
+| F16 | 16 | none | 512 | Reference/debug artifacts and smoke tests |
 | HFQ4-G256 | 4 | none | 136 (8 hdr + 128 data) | Llama / Qwen3 / dense |
 | HFQ6-G256 | 6 | none | 200 | Dense, higher quality |
 | MQ4-G256 | 4 | FWHT | 136 | Qwen 3.5+ hybrid |
@@ -110,23 +112,10 @@ impact on long-context inference.
 mode      K layout                              V layout
 ─────────────────────────────────────────────────────────
 q8        Q8_0 (32-element blocks)              Q8_0
-fwht4     FWHT-rotated 4-bit                    Q8_0
-fwht3     FWHT-rotated 3-bit  (default*)        Q8_0
-fwht2     FWHT-rotated 2-bit  (default*)        Q8_0
-asym4     Lloyd-Max (Givens) rotated 4-bit      Q8_0   (legacy)
-asym3     Lloyd-Max (Givens) rotated 3-bit      Q8_0   (legacy)
-asym2     Givens-rotated 2-bit                  Q8_0   (legacy)
+asym4     Lloyd-Max rotated 4-bit               Q8_0
+asym3     Lloyd-Max rotated 3-bit  (default)    Q8_0
+asym2     rotated 2-bit                         Q8_0
 ```
-
-\* The live default is `fwht3` on most arches and `fwht2` on the
-tight-memory parts — see the per-arch table below. The `fwhtN` modes
-share the byte layout of the legacy `asymN` Givens modes but rotate K on
-the FWHT basis the MQ4 weights/draft are calibrated against, which keeps
-DFlash speculative acceptance high (the Givens `asym*` basis degrades it
-→ attractors under DFlash). The `asym*` modes remain available for the
-legacy Givens behavior. An adaptive runtime-downshift policy
-(`kv_adaptive`) can lower these tiers further as context grows — see
-`docs/CONFIG.md`.
 
 K and V are quantized differently because they have different
 sensitivities. K participates in the softmax — small numerical errors
@@ -145,34 +134,25 @@ not a uniform scale + zero. The codebook is two floats (min / max)
 plus 2^K codes implied uniformly between them — same storage cost as
 asymmetric uniform, slightly better fit on the actual K distribution.
 
-The rotation basis differs by mode family: the live default `fwhtN`
-modes rotate K on the FWHT (Walsh-Hadamard) basis the MQ4 weights/draft
-are calibrated against; the legacy `asymN` modes use a Givens rotation
-with the Lloyd-Max codebook described above. Same K-bitwidth byte cost
-either way.
-
-## KV cache per-arch defaults
+## Asym KV per arch defaults
 
 Set in `cli/index.ts::archDefaults`. Override with `hipfire config set
 kv_cache <mode>` or `HIPFIRE_KV_MODE=<mode>` env.
 
 | Arch | Default | Reason |
 |---|---|---|
-| gfx1100 (7900 XTX) | fwht3 | 24 GB VRAM affords it; quality matches Q8 |
-| gfx1101 (7900 XT) | fwht3 | Same |
-| gfx1102 (7800 XT) | fwht3 | Same |
-| gfx1030 (V620 / 6800 XT) | fwht3 | 32 GB on V620 — plenty of headroom |
-| gfx1031 (6700 XT) | fwht3 | 12 GB |
-| gfx1032 (6600 XT) | fwht2 | 8 GB — tighter quant for headroom |
-| gfx1010 (5700 XT) | fwht2 | 8 GB |
-| gfx1013 (BC-250 APU) | fwht2 | 14 GB shared, prioritize ctx length |
-| gfx1151 (Strix Halo APU) | fwht2 | shared LPDDR5x — tight |
-| gfx1200 (9070 XT) | fwht3 | 16 GB |
-| gfx1201 (9070 XT / R9700) | fwht3 | 16 GB |
-| (default fall-through) | fwht3 | Includes gfx94x / MI300X — override to `q8` if you have spare HBM |
+| gfx1100 (7900 XTX) | asym3 | 24 GB VRAM affords it; quality matches Q8 |
+| gfx1101 (7900 XT) | asym3 | Same |
+| gfx1102 (7800 XT) | asym3 | Same |
+| gfx1030 (V620 / 6800 XT) | asym3 | 32 GB on V620 — plenty of headroom |
+| gfx1031 (6700 XT) | asym3 | 12 GB |
+| gfx1032 (6600 XT) | asym2 | 8 GB — tighter quant for headroom |
+| gfx1010 (5700 XT) | asym2 | 8 GB |
+| gfx1013 (BC-250 APU) | asym2 | 14 GB shared, prioritize ctx length |
+| gfx1151 (Strix Halo APU) | asym2 | 16 GB shared |
+| gfx1200 (9070 XT) | asym3 | 16 GB |
+| (default fall-through) | asym3 | Includes gfx94x / MI300X — override to `q8` if you have spare HBM |
 
-The `fwhtN` defaults replaced the legacy `asymN` Givens modes (same byte
-layout, FWHT-rotated K) so DFlash speculative acceptance stays high.
 Override with `hipfire config set kv_cache <mode>` or
 `HIPFIRE_KV_MODE=<mode>` env.
 

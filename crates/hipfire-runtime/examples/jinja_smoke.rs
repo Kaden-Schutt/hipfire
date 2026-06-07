@@ -23,11 +23,11 @@
 //! GPU device is selected via ROCR_VISIBLE_DEVICES on the parent
 //! process — this binary itself doesn't manage device selection.
 
+use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
 use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role, ToolCall};
 use hipfire_runtime::tokenizer::Tokenizer;
-use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
@@ -171,10 +171,18 @@ fn enable_thinking_for(s: Scenario) -> bool {
 
 /// Window stats for coherence scoring.
 fn window_stats(toks: &[u32], window: usize) -> (f32, f32) {
-    let slice: &[u32] = if toks.len() <= window { toks } else { &toks[toks.len() - window..] };
-    if slice.is_empty() { return (0.0, 0.0); }
+    let slice: &[u32] = if toks.len() <= window {
+        toks
+    } else {
+        &toks[toks.len() - window..]
+    };
+    if slice.is_empty() {
+        return (0.0, 0.0);
+    }
     let mut counts: HashMap<u32, u32> = HashMap::new();
-    for &t in slice { *counts.entry(t).or_insert(0) += 1; }
+    for &t in slice {
+        *counts.entry(t).or_insert(0) += 1;
+    }
     let max_freq = (*counts.values().max().unwrap_or(&0) as f32) / (slice.len() as f32);
     let unique_ratio = (counts.len() as f32) / (slice.len() as f32);
     (max_freq, unique_ratio)
@@ -189,11 +197,25 @@ fn parse_args() -> (String, Scenario, String, usize) {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--model" => { model = args.get(i+1).cloned(); i += 2; }
-            "--scenario" => { scenario = args.get(i+1).and_then(|s| parse_scenario(s)); i += 2; }
-            "--output" => { output = args.get(i+1).cloned(); i += 2; }
-            "--max-gen" => { max_gen = args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(4096); i += 2; }
-            _ => { i += 1; }
+            "--model" => {
+                model = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--scenario" => {
+                scenario = args.get(i + 1).and_then(|s| parse_scenario(s));
+                i += 2;
+            }
+            "--output" => {
+                output = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--max-gen" => {
+                max_gen = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(4096);
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
     let model = model.expect("--model PATH required");
@@ -212,8 +234,8 @@ fn main() {
 
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let template = hfq.chat_template().expect("model lacks chat_template");
-    let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .expect("tokenizer not in HFQ metadata");
+    let tokenizer =
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer not in HFQ metadata");
 
     let (messages, tools) = build_messages(scenario);
     let enable_thinking = enable_thinking_for(scenario);
@@ -245,7 +267,11 @@ fn main() {
         }
     };
     let render_ms = t_render.elapsed().as_millis();
-    eprintln!("render_ms: {} | rendered_len: {} bytes", render_ms, rendered.len());
+    eprintln!(
+        "render_ms: {} | rendered_len: {} bytes",
+        render_ms,
+        rendered.len()
+    );
 
     let prompt_tokens = tokenizer.encode(&rendered);
     eprintln!("prompt_tokens: {}", prompt_tokens.len());
@@ -263,8 +289,13 @@ fn main() {
     // and A3B per the existing config.
     let kv_seq = (prompt_tokens.len() + max_gen + 64).max(2048);
     let mut kv_cache = KvCache::new_gpu_asym3(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
-    ).expect("kv cache");
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        kv_seq,
+    )
+    .expect("kv cache");
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn state");
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");
 
@@ -273,23 +304,47 @@ fn main() {
     let t_prefill = Instant::now();
     let mut logits = vec![0.0f32; config.vocab_size];
     for (pos, &tok) in prompt_tokens.iter().enumerate() {
-        qwen35::forward_scratch(&mut gpu, &weights, &config, tok, pos, &mut kv_cache, &mut dn_state, &scratch)
-            .expect("prefill forward");
+        qwen35::forward_scratch(
+            &mut gpu,
+            &weights,
+            &config,
+            tok,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("prefill forward");
         if pos == prompt_tokens.len() - 1 {
             logits = gpu.download_f32(&scratch.logits).expect("download logits");
         }
     }
     let prefill_ms = t_prefill.elapsed().as_millis();
-    eprintln!("prefill: {}ms ({:.0} tok/s)", prefill_ms,
-        prompt_tokens.len() as f64 * 1000.0 / (prefill_ms as f64).max(1.0));
+    eprintln!(
+        "prefill: {}ms ({:.0} tok/s)",
+        prefill_ms,
+        prompt_tokens.len() as f64 * 1000.0 / (prefill_ms as f64).max(1.0)
+    );
 
     let im_end = tokenizer.encode("<|im_end|>");
-    let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    let im_end_token = if im_end.len() == 1 {
+        Some(im_end[0])
+    } else {
+        None
+    };
     let endoftext = tokenizer.encode("<|endoftext|>");
-    let endoftext_token = if endoftext.len() == 1 { Some(endoftext[0]) } else { None };
+    let endoftext_token = if endoftext.len() == 1 {
+        Some(endoftext[0])
+    } else {
+        None
+    };
 
     let sc = llama::SamplingConfig::text_thinking();
-    let temp = if enable_thinking { sc.think_temp } else { sc.answer_temp };
+    let temp = if enable_thinking {
+        sc.think_temp
+    } else {
+        sc.answer_temp
+    };
 
     let t_decode = Instant::now();
     let mut generated: Vec<u32> = Vec::new();
@@ -312,13 +367,28 @@ fn main() {
     for _ in 0..max_gen {
         generated.push(next_token);
         token_history.push(next_token);
-        if Some(next_token) == im_end_token { break; }
-        if Some(next_token) == endoftext_token { break; }
-        if next_token == config.eos_token { break; }
+        if Some(next_token) == im_end_token {
+            break;
+        }
+        if Some(next_token) == endoftext_token {
+            break;
+        }
+        if next_token == config.eos_token {
+            break;
+        }
 
         let pos = prompt_tokens.len() + generated.len() - 1;
-        qwen35::forward_scratch(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache, &mut dn_state, &scratch)
-            .expect("decode forward");
+        qwen35::forward_scratch(
+            &mut gpu,
+            &weights,
+            &config,
+            next_token,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("decode forward");
         logits = gpu.download_f32(&scratch.logits).expect("download logits");
         next_token = sample_one(&mut logits, &token_history);
     }
@@ -366,8 +436,18 @@ fn main() {
     writeln!(out, "{}", rec).expect("write output");
 
     eprintln!("=== summary ===");
-    eprintln!("generated: {} tokens, {:.0} tok/s", generated.len(), decode_tok_s);
-    eprintln!("max_freq first/last: {:.3} / {:.3}", max_freq_first, max_freq_last);
-    eprintln!("unique_ratio first/last: {:.3} / {:.3}", unique_first, unique_last);
+    eprintln!(
+        "generated: {} tokens, {:.0} tok/s",
+        generated.len(),
+        decode_tok_s
+    );
+    eprintln!(
+        "max_freq first/last: {:.3} / {:.3}",
+        max_freq_first, max_freq_last
+    );
+    eprintln!(
+        "unique_ratio first/last: {:.3} / {:.3}",
+        unique_first, unique_last
+    );
     eprintln!("output: {}", output_path);
 }

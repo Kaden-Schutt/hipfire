@@ -11,13 +11,15 @@
 //!   measure: number of forward passes to aggregate into the tables (default 1)
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("Build with --features deltanet"); }
+fn main() {
+    eprintln!("Build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama;
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use rdna_compute::profile;
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -44,18 +46,31 @@ fn main() {
 
     let max_seq = 2048usize;
     let mut kv_cache = llama::KvCache::new_gpu_q8(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq,
-    ).unwrap();
-    let mut dn_state = DeltaNetState::new_with_quant(
-        &mut gpu, &config, qwen35::StateQuant::Q8,
-    ).unwrap();
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        max_seq,
+    )
+    .unwrap();
+    let mut dn_state =
+        DeltaNetState::new_with_quant(&mut gpu, &config, qwen35::StateQuant::Q8).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
     // Warmup: no profiling. Fills KV cache and hot kernel cache.
     let probe_token: u32 = 1;
     for pos in 0..warmup {
-        qwen35::forward_scratch(&mut gpu, &weights, &config, probe_token, pos,
-            &mut kv_cache, &mut dn_state, &scratch).unwrap();
+        qwen35::forward_scratch(
+            &mut gpu,
+            &weights,
+            &config,
+            probe_token,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
 
@@ -63,8 +78,17 @@ fn main() {
     profile::start();
     let start_pos = warmup;
     for i in 0..measure {
-        qwen35::forward_scratch(&mut gpu, &weights, &config, probe_token, start_pos + i,
-            &mut kv_cache, &mut dn_state, &scratch).unwrap();
+        qwen35::forward_scratch(
+            &mut gpu,
+            &weights,
+            &config,
+            probe_token,
+            start_pos + i,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
     let entries = profile::stop().unwrap_or_default();
@@ -97,15 +121,25 @@ fn main() {
 
     let total_time_us: f64 = by_category.values().map(|c| c.time_us).sum();
     let total_bytes: u128 = by_category.values().map(|c| c.bytes).sum();
-    let total_per_fwd_us = total_time_us / measure as f64;
+    let _total_per_fwd_us = total_time_us / measure as f64;
 
     // ─── Table 1: category breakdown ──────────────────────────────────────
-    println!("\n=== Bandwidth breakdown: {} (measured over {} forward passes) ===",
-        Path::new(model_path).file_name().and_then(|s| s.to_str()).unwrap_or(model_path),
-        measure);
-    println!("Peak DRAM bandwidth (gfx1100 assumed): {:.0} GB/s\n", PEAK_BW_GBS);
-    println!("{:<15} | {:>10} | {:>8} | {:>10} | {:>10} | {:>7}",
-        "Category", "Time (ms)", "% fwd", "Bytes (MB)", "BW (GB/s)", "Util %");
+    println!(
+        "\n=== Bandwidth breakdown: {} (measured over {} forward passes) ===",
+        Path::new(model_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(model_path),
+        measure
+    );
+    println!(
+        "Peak DRAM bandwidth (gfx1100 assumed): {:.0} GB/s\n",
+        PEAK_BW_GBS
+    );
+    println!(
+        "{:<15} | {:>10} | {:>8} | {:>10} | {:>10} | {:>7}",
+        "Category", "Time (ms)", "% fwd", "Bytes (MB)", "BW (GB/s)", "Util %"
+    );
     println!("{}", "-".repeat(80));
 
     for (cat, s) in &by_category {
@@ -114,35 +148,47 @@ fn main() {
         let bytes_mb = s.bytes as f64 / 1e6 / measure as f64;
         let bw_gbs = if s.time_us > 0.0 {
             (s.bytes as f64) / (s.time_us / 1e6) / 1e9
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let util = bw_gbs / PEAK_BW_GBS * 100.0;
-        println!("{:<15} | {:>10.3} | {:>7.1}% | {:>10.2} | {:>10.1} | {:>6.1}%",
-            cat, time_ms, pct, bytes_mb, bw_gbs, util);
+        println!(
+            "{:<15} | {:>10.3} | {:>7.1}% | {:>10.2} | {:>10.1} | {:>6.1}%",
+            cat, time_ms, pct, bytes_mb, bw_gbs, util
+        );
     }
     println!("{}", "-".repeat(80));
     let total_time_ms = total_time_us / 1000.0 / measure as f64;
     let total_bytes_mb = total_bytes as f64 / 1e6 / measure as f64;
     let total_bw = if total_time_us > 0.0 {
         (total_bytes as f64) / (total_time_us / 1e6) / 1e9
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     let total_util = total_bw / PEAK_BW_GBS * 100.0;
-    println!("{:<15} | {:>10.3} | {:>7.1}% | {:>10.2} | {:>10.1} | {:>6.1}%",
-        "TOTAL", total_time_ms, 100.0, total_bytes_mb, total_bw, total_util);
-    println!("Effective tok/s (summed per-kernel wall time): {:.1}",
-        1000.0 / total_time_ms);
+    println!(
+        "{:<15} | {:>10.3} | {:>7.1}% | {:>10.2} | {:>10.1} | {:>6.1}%",
+        "TOTAL", total_time_ms, 100.0, total_bytes_mb, total_bw, total_util
+    );
+    println!(
+        "Effective tok/s (summed per-kernel wall time): {:.1}",
+        1000.0 / total_time_ms
+    );
 
     // ─── Table 2: kernel breakdown within GEMV category ───────────────────
     println!("\n=== GEMV kernel breakdown (sorted by time) ===");
-    let mut gemv_kernels: Vec<(&&'static str, &CatStats)> = by_kernel.iter()
+    let mut gemv_kernels: Vec<(&&'static str, &CatStats)> = by_kernel
+        .iter()
         .filter(|(name, _)| {
-            by_kernel.contains_key(*name) &&
-            ["gemv_hfq4g256", "gemm_hfq4g256"].contains(name)
+            by_kernel.contains_key(*name) && ["gemv_hfq4g256", "gemm_hfq4g256"].contains(name)
         })
         .collect();
     gemv_kernels.sort_by(|a, b| b.1.time_us.partial_cmp(&a.1.time_us).unwrap());
 
-    println!("{:<28} | {:>12} | {:>10} | {:>8} | {:>10} | {:>7} | {:>8}",
-        "Kernel", "Avg µs", "Total ms", "Count", "Bytes MB", "BW GB/s", "Util %");
+    println!(
+        "{:<28} | {:>12} | {:>10} | {:>8} | {:>10} | {:>7} | {:>8}",
+        "Kernel", "Avg µs", "Total ms", "Count", "Bytes MB", "BW GB/s", "Util %"
+    );
     println!("{}", "-".repeat(96));
     for (name, s) in &gemv_kernels {
         let avg_us = s.time_us / s.count as f64;
@@ -150,16 +196,26 @@ fn main() {
         let bytes_mb = s.bytes as f64 / 1e6 / measure as f64;
         let bw = (s.bytes as f64) / (s.time_us / 1e6) / 1e9;
         let util = bw / PEAK_BW_GBS * 100.0;
-        println!("{:<28} | {:>12.2} | {:>10.3} | {:>8} | {:>10.2} | {:>7.1} | {:>7.1}%",
-            name, avg_us, total_ms, s.count / measure.max(1), bytes_mb, bw, util);
+        println!(
+            "{:<28} | {:>12.2} | {:>10.3} | {:>8} | {:>10.2} | {:>7.1} | {:>7.1}%",
+            name,
+            avg_us,
+            total_ms,
+            s.count / measure.max(1),
+            bytes_mb,
+            bw,
+            util
+        );
     }
 
     // ─── Table 3: all kernels by total time (top 20) ──────────────────────
     println!("\n=== Top kernels by total time (all categories) ===");
     let mut all_kernels: Vec<(&&'static str, &CatStats)> = by_kernel.iter().collect();
     all_kernels.sort_by(|a, b| b.1.time_us.partial_cmp(&a.1.time_us).unwrap());
-    println!("{:<28} | {:>12} | {:>10} | {:>8} | {:>10} | {:>7} | {:>8}",
-        "Kernel", "Avg µs", "Total ms", "Count", "Bytes MB", "BW GB/s", "Util %");
+    println!(
+        "{:<28} | {:>12} | {:>10} | {:>8} | {:>10} | {:>7} | {:>8}",
+        "Kernel", "Avg µs", "Total ms", "Count", "Bytes MB", "BW GB/s", "Util %"
+    );
     println!("{}", "-".repeat(96));
     for (name, s) in all_kernels.iter().take(20) {
         let avg_us = s.time_us / s.count as f64;
@@ -167,7 +223,15 @@ fn main() {
         let bytes_mb = s.bytes as f64 / 1e6 / measure as f64;
         let bw = (s.bytes as f64) / (s.time_us / 1e6) / 1e9;
         let util = bw / PEAK_BW_GBS * 100.0;
-        println!("{:<28} | {:>12.2} | {:>10.3} | {:>8} | {:>10.2} | {:>7.1} | {:>7.1}%",
-            name, avg_us, total_ms, s.count / measure.max(1), bytes_mb, bw, util);
+        println!(
+            "{:<28} | {:>12.2} | {:>10.3} | {:>8} | {:>10.2} | {:>7.1} | {:>7.1}%",
+            name,
+            avg_us,
+            total_ms,
+            s.count / measure.max(1),
+            bytes_mb,
+            bw,
+            util
+        );
     }
 }

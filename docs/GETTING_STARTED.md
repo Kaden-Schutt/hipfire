@@ -88,8 +88,7 @@ hipfire config qwen3.5:9b                        # per-model overlay
 ```
 
 Common overrides: `temperature` (default 0.30), `kv_cache` (default
-`auto` → per-arch: `fwht3` on most arches, `fwht2` on tight-memory
-parts), `dflash_mode` (default `auto`). Full key list in
+`asym3`), `dflash_mode` (default `auto`). Full key list in
 [CONFIG.md](CONFIG.md).
 
 ## Long context: KV cache eviction

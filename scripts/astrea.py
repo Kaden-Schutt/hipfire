@@ -41,6 +41,7 @@ METRICS_SCHEMA = "hipfire.astrea.metrics.v0"
 REPORT_SCHEMA = "hipfire.astrea.report.v0"
 ENGINE_SCHEMA = "hipfire.astrea.engine_fingerprint.v0"
 POLICY_SCHEMA = "hipfire.astrea.policy.v0"
+MIXED_POLICY_SCHEMA = "hipfire.astrea.mixed_policy.v0"
 PROMOTION_SCHEMA = "hipfire.astrea.promotion.v0"
 KV_PROFILE_SCHEMA = "hipfire.astrea.kv_profile.v0"
 BUNDLE_PLAN_SCHEMA = "hipfire.astrea.bundle_plan.v0"
@@ -50,6 +51,50 @@ IMATRIX_HFQ_JOIN_SCHEMA = "hipfire.astrea.imatrix_hfq_join.v0"
 SAFETENSORS_SUMMARY_SCHEMA = "hipfire.astrea.safetensors_summary.v0"
 PARO_PROBE_SCHEMA = "hipfire.astrea.paro_probe.v0"
 PARO_IMPORT_SCHEMA = "hipfire.astrea.paro_import.v0"
+
+PARO_RUNTIME_ENV_BOUNDARY = {
+    "productization_candidate": [
+        {
+            "name": "HIPFIRE_PARO_BATCHED",
+            "default": "on",
+            "disable": "0",
+            "scope": "batched Paro admission",
+        },
+        {
+            "name": "HIPFIRE_MOE_PARO_I8",
+            "default": "on for gfx1151, off elsewhere",
+            "disable": "0",
+            "scope": "gfx1151 grouped-MMQ Paro MoE i8 path",
+        },
+        {
+            "name": "HIPFIRE_MOE_PARO_I8_K8",
+            "default": "on when HIPFIRE_MOE_PARO_I8 is admitted",
+            "disable": "0",
+            "scope": "gfx1151 K=8 grouped-MMQ Paro MoE path",
+        },
+    ],
+    "research_only": [
+        "HIPFIRE_PARO_PREROTATE",
+        "HIPFIRE_PARO_SMALL_DIRECT",
+        "HIPFIRE_PARO_SWIGLU_FUSED",
+        "HIPFIRE_PARO_FUSE_RMSNORM",
+        "HIPFIRE_PARO_FA3_FUSED",
+        "HIPFIRE_PARO_GATE_UP_FUSED",
+        "HIPFIRE_PARO_LA4_FUSED",
+        "HIPFIRE_PARO_LA2_FUSED",
+        "HIPFIRE_PARO_LA_GATES_MQ4G128",
+        "HIPFIRE_PARO_PACK1",
+        "HIPFIRE_PARO_PACK2",
+        "HIPFIRE_PARO_PACK4",
+        "HIPFIRE_PARO_SHARED_PAIRS",
+        "HIPFIRE_PARO_FUSED_PACK2",
+    ],
+    "promotion_report_requirements": [
+        "record effective values for productization-candidate Paro env vars",
+        "exclude research-only knobs from promoted main-path evidence unless each knob has separate artifact-backed validation",
+        "record oracle, finite-logit/NaN, coherence, KLD/PPL, and gfx1151 perf artifacts before promotion",
+    ],
+}
 
 SUPPORTED_FORMATS = {
     "mq3",
@@ -156,6 +201,13 @@ SUPPORTED_BUNDLE_INCLUDES = {
     "evidence",
 }
 
+MIXED_G256_BYTES_PER_GROUP = {
+    "mq2": 72,
+    "mq3": 104,
+    "mq4": 136,
+    "mq6": 200,
+}
+
 ENGINE_HASH_PATHS = [
     "crates/rdna-compute/src/dispatch.rs",
     "crates/rdna-compute/src/kernels.rs",
@@ -201,6 +253,7 @@ HFQ_QUANT_TYPE_NAMES = {
     12: "HFQ3G128",
     13: "MQ4G256",
     14: "MQ8G256",
+    15: "MQ6G256",
     17: "MQ3G256",
     18: "MQ2G256",
     19: "MQ2G256_LLOYD",
@@ -209,6 +262,7 @@ HFQ_QUANT_TYPE_NAMES = {
     24: "MFP4G32",
     28: "PARO4G128",
     29: "PARO4G128T",
+    30: "MQ4G256_LLOYD",
 }
 
 HFQ_QUANT_TYPE_FORMATS = {
@@ -220,8 +274,12 @@ HFQ_QUANT_TYPE_FORMATS = {
     "HFQ4G128": "hfq4",
     "HFQ6G256": "hfq6",
     "MQ4G256": "mq4",
+    "MQ6G256": "mq6",
     "MQ3G256": "mq3",
+    "MQ2G256": "mq2",
+    "MQ2G256_LLOYD": "mq2",
     "MQ3G256_LLOYD": "mq3",
+    "MQ4G256_LLOYD": "mq4",
     "HFP4G32": "hfp4",
     "MFP4G32": "mfp4",
     "PARO4G128": "paro4",
@@ -2984,6 +3042,241 @@ def load_imatrix_sensitivity(model, imatrix):
     }
 
 
+def normalize_mixed_g256_formats(formats=None, *, allow_mq2=False):
+    formats = formats or ["mq3", "mq4", "mq6"]
+    normalized = []
+    for fmt in formats:
+        item = str(fmt).lower()
+        if "lloyd" in item:
+            raise ValueError("mixed G256 v1 refuses them: Lloyd formats need their own codebook contract")
+        if item == "mq2" and not allow_mq2:
+            raise ValueError("mixed G256 mq2 requires --allow-mq2 research opt-in")
+        if item not in MIXED_G256_BYTES_PER_GROUP:
+            raise ValueError(f"unsupported mixed G256 format: {fmt}")
+        if item not in normalized:
+            normalized.append(item)
+    if not normalized:
+        raise ValueError("mixed G256 requires at least one format")
+    return normalized
+
+
+def mixed_g256_awq_eligible(fmt, name):
+    return str(fmt).lower() in {"mq3", "mq4"} and awq_runtime_eligible(name)
+
+
+def mixed_g256_groups_for_tensor(tensor):
+    shape = tensor.get("shape") or []
+    if len(shape) != 2:
+        return None
+    rows, k = int(shape[0]), int(shape[1])
+    if rows <= 0 or k <= 0 or k % 256 != 0:
+        return None
+    return rows, k // 256
+
+
+def rank_formats_for_scores(group_scores, formats):
+    if not group_scores:
+        return []
+    if len(formats) == 1:
+        return [formats[0] for _ in group_scores]
+    order = sorted((float(score), idx) for idx, score in enumerate(group_scores))
+    ranks = [0.0] * len(group_scores)
+    pos = 0
+    denom = max(1, len(group_scores) - 1)
+    while pos < len(order):
+        end = pos + 1
+        while end < len(order) and order[end][0] == order[pos][0]:
+            end += 1
+        avg_rank = ((pos + end - 1) / 2.0) / denom
+        for _, idx in order[pos:end]:
+            ranks[idx] = avg_rank
+        pos = end
+    out = []
+    for rank in ranks:
+        bucket = min(len(formats) - 1, int(rank * len(formats)))
+        out.append(formats[bucket])
+    return out
+
+
+def coalesce_mixed_g256_segments(assignments, *, rows):
+    segments = []
+    start = 0
+    while start < len(assignments):
+        fmt = assignments[start]
+        end = start + 1
+        while end < len(assignments) and assignments[end] == fmt:
+            end += 1
+        group_count = end - start
+        segments.append(
+            {
+                "k_group_start": start,
+                "group_count": group_count,
+                "quant_format": fmt,
+                "payload_len": rows * group_count * MIXED_G256_BYTES_PER_GROUP[fmt],
+                "awq_eligible": False,
+            }
+        )
+        start = end
+    return segments
+
+
+def mixed_g256_scores_from_json(path):
+    payload = load_json(path)
+    groups = payload.get("groups") if isinstance(payload, dict) else None
+    if not isinstance(groups, list):
+        raise ValueError("mixed G256 sensitivity JSON requires a 'groups' array")
+    by_tensor = {}
+    aliases = {}
+    for row in groups:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("hfq_name") or row.get("name") or row.get("tensor")
+        if not name or row.get("k_group") is None:
+            continue
+        score = row.get("score")
+        if score is None:
+            score = row.get("sensitivity", row.get("importance", 0.0))
+        group = int(row["k_group"])
+        by_tensor.setdefault(name, {})[group] = max(float(score), 0.0)
+        aliases[name] = row.get("alias") or name
+    return {
+        "source": "json",
+        "path": str(path),
+        "by_tensor": by_tensor,
+        "aliases": aliases,
+    }
+
+
+def mixed_g256_scores_from_imatrix(model, imatrix):
+    join = match_imatrix_to_hfq(model, imatrix, max_tensors=0)
+    by_tensor = {}
+    aliases = {}
+    errors = []
+    for item in join["matches"]:
+        try:
+            importance = read_gguf_f32_tensor(imatrix, f"{item['imatrix_name']}.in_sum2")
+            counts = read_gguf_f32_tensor(imatrix, f"{item['imatrix_name']}.counts")
+        except Exception as exc:
+            errors.append({"imatrix_name": item["imatrix_name"], "error": str(exc)})
+            continue
+        denom = counts[0] if counts and counts[0] > 0.0 else 1.0
+        k = int(item.get("hfq_k") or item.get("imatrix_k") or 0)
+        group_count = k // 256 if k and k % 256 == 0 else len(importance) // 256
+        scores = {}
+        for group in range(group_count):
+            chunk = importance[group * 256 : (group + 1) * 256]
+            if not chunk:
+                continue
+            normalized = [max(float(value) / denom, 0.0) for value in chunk]
+            scores[group] = sum(normalized) / len(normalized)
+        by_tensor[item["hfq_name"]] = scores
+        aliases[item["hfq_name"]] = item["imatrix_name"]
+    return {
+        "source": "imatrix",
+        "path": str(imatrix),
+        "matched_count": join["matched_count"],
+        "unmatched_count": join["unmatched_count"],
+        "errors": errors[:16],
+        "by_tensor": by_tensor,
+        "aliases": aliases,
+    }
+
+
+def build_mixed_policy(
+    *,
+    model,
+    sensitivity_json=None,
+    imatrix=None,
+    formats=None,
+    allow_mq2=False,
+    target_arch=None,
+    policy_id=None,
+):
+    if not sensitivity_json and not imatrix:
+        raise ValueError("mixed policy requires --sensitivity-json or --imatrix")
+    formats = normalize_mixed_g256_formats(formats, allow_mq2=allow_mq2)
+    hfq_summary, hfq_tensors = read_hfq_index(model, max_tensors=32)
+    sensitivity = (
+        mixed_g256_scores_from_json(sensitivity_json)
+        if sensitivity_json
+        else mixed_g256_scores_from_imatrix(model, imatrix)
+    )
+
+    tensors = []
+    skipped = []
+    for name, tensor in sorted(hfq_tensors.items()):
+        group_info = mixed_g256_groups_for_tensor(tensor)
+        if group_info is None:
+            skipped.append({"hfq_name": name, "reason": "not_2d_g256_tensor"})
+            continue
+        rows, groups_per_row = group_info
+        tensor_scores = sensitivity["by_tensor"].get(name)
+        if tensor_scores is None:
+            skipped.append({"hfq_name": name, "reason": "unscored"})
+            continue
+        group_scores = [float(tensor_scores.get(i, 0.0)) for i in range(groups_per_row)]
+        assignments = rank_formats_for_scores(group_scores, formats)
+        segments = coalesce_mixed_g256_segments(assignments, rows=rows)
+        for segment in segments:
+            segment["awq_eligible"] = mixed_g256_awq_eligible(segment["quant_format"], name)
+        tensors.append(
+            {
+                "hfq_name": name,
+                "sensitivity_alias": sensitivity.get("aliases", {}).get(name),
+                "quant_type_name": tensor["quant_type_name"],
+                "shape": tensor["shape"],
+                "rows": rows,
+                "groups_per_row": groups_per_row,
+                "group_scores": group_scores,
+                "segments": segments,
+                "payload_len": sum(segment["payload_len"] for segment in segments),
+            }
+        )
+
+    model_name = Path(model).name.replace(".", "-").replace("/", "-")
+    return {
+        "schema": MIXED_POLICY_SCHEMA,
+        "policy_id": policy_id or f"astrea-mixed-g256-{model_name}-{int(time.time())}",
+        "created_at_utc": utc_now(),
+        "host": socket.gethostname(),
+        "git": git_sha(),
+        "model": model,
+        "target_arch": target_arch,
+        "hfq": {
+            "tensor_count": hfq_summary["tensor_count"],
+            "quant_type_counts": hfq_summary["quant_type_counts"],
+            "tensor_names_md5": hfq_summary["tensor_names_md5"],
+        },
+        "granularity": {
+            "mode": "g256",
+            "group_size": 256,
+        },
+        "formats": formats,
+        "sensitivity": {
+            key: value
+            for key, value in sensitivity.items()
+            if key not in {"by_tensor", "aliases"}
+        },
+        "selection": {
+            "method": "ranked_group_terciles",
+            "uses_wave_size_as_quality_signal": False,
+            "notes": [
+                "Group scores choose quant format only; runtime arch is recorded for follow-up perf gates.",
+                "This policy is a writer contract, not proof that MQMIXG256 is loadable.",
+            ],
+        },
+        "writer_contract": {
+            "container_quant_type": "MQMIXG256",
+            "runtime_status": "deferred_until_loader_and_kernel_support_exist",
+        },
+        "tensor_count": len(tensors),
+        "skipped_count": len(skipped),
+        "tensors": tensors,
+        "skipped": skipped[:64],
+        "next_step": "implement MQMIXG256 writer/loader, then run KLD/PPL and Atlas AR/DFlash gates",
+    }
+
+
 def build_ingress_summary(hfq_tensors, model_family=None):
     family = (model_family or "").lower()
     expert_names = []
@@ -3411,6 +3704,7 @@ def build_bundle_plan(
             "policy_id": policy_id,
             "description": "ParoQuant channel scales and independent pairwise rotation parameters",
             "runtime_status": "deferred_until_loader_and_fused_kernel_exist",
+            "runtime_env_boundary": json.loads(json.dumps(PARO_RUNTIME_ENV_BOUNDARY)),
         }
     if "kv-policy" in include:
         sections["kv.policy"] = {
@@ -3451,7 +3745,7 @@ def build_bundle_plan(
         "deferred_runtime_work": [
             "loader must parse and validate the package section table",
             "runtime must reject transform or KV policy sections when required kernels are unavailable",
-            "CLI pull/run should prefer embedded triattn.centers over loose .triattn.bin files",
+            "CLI pull/run should prefer embedded triattn.centers over loose .triattn.hfq files",
             "Atlas must record AR and DFlash perf rows before package promotion",
         ],
         "next_step": "treat this as a package contract artifact; do not write a packaged model until loader support exists",

@@ -20,10 +20,7 @@ __global__ void gated_delta_net_q8(
     int n_tokens,
     int n_heads,
     int head_dim,
-    unsigned int frame   // per-launch monotonic counter (host-supplied) — fresh,
-                         // data-INDEPENDENT entropy for the stochastic-rounding
-                         // dither. Without it the dither was seeded from my_max
-                         // (state-derived) → correlated, biased over the recurrence.
+    unsigned int frame
 ) {
     const int h = blockIdx.x;
     const int tile = blockIdx.y;
@@ -109,15 +106,8 @@ __global__ void gated_delta_net_q8(
         signed char* dst = sq_base + r * HD;
 
         // Stochastic rounding: generate 4 uniform random values in [0, 1).
-        // Seed = spatial location (h, row, tid) + per-launch `frame` counter.
-        // CRITICAL: the dither MUST be independent of the value being rounded
-        // and fresh per requant. The old seed used __float_as_uint(my_max)
-        // (state-derived) and no temporal term — so across the thousands of
-        // per-token decode requants the dither was a deterministic, data-
-        // correlated function, defeating stochastic rounding's unbiasedness
-        // and accumulating a systematic bias that drifts the recurrent state
-        // off-distribution on long generations (length-dependent coherence
-        // collapse). `frame` supplies the missing per-step entropy.
+        // Seed = spatial location plus a host-supplied per-launch frame so the
+        // dither is fresh and independent of the state value being rounded.
         unsigned int rng = (unsigned int)(h * 1664525u + (row_start + r) * 1013904223u
                          + tid * 214013u + frame * 2531011u);
         #define STOCH_ROUND(val) ({ \

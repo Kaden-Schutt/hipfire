@@ -31,10 +31,12 @@
 //! of kept token IDs, so no peer-copy plumbing is required. ROCR_VISIBLE_DEVICES
 //! controls which physical GPUs the device indices resolve to.
 
+use hipfire_arch_qwen35::pflash::{
+    self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind,
+};
+use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, StateQuant};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
-use hipfire_arch_qwen35::pflash::{self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind};
-use hipfire_arch_qwen35::qwen35::{self, DeltaNetState};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -58,6 +60,17 @@ fn md5_hex(bytes: &[u8]) -> String {
 fn md5_file(path: &Path) -> String {
     let bytes = fs::read(path).unwrap_or_default();
     md5_hex(&bytes)
+}
+
+fn parse_state_quant(mode: Option<&str>) -> Result<StateQuant, String> {
+    match mode.unwrap_or("q8").to_ascii_lowercase().as_str() {
+        "" | "auto" | "q8" | "int8" => Ok(StateQuant::Q8),
+        "fp32" | "f32" => Ok(StateQuant::FP32),
+        "q4" | "int4" => Ok(StateQuant::Q4),
+        other => Err(format!(
+            "unsupported --state-quant '{other}' (expected q8|fp32|q4)"
+        )),
+    }
 }
 
 fn extract_string_field(text: &str, key: &str) -> Option<String> {
@@ -105,11 +118,17 @@ fn extract_string_array(text: &str, key: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     while j < bytes.len() {
         // Skip whitespace + commas
-        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b',' || bytes[j] == b'\n' || bytes[j] == b'\t') {
+        while j < bytes.len()
+            && (bytes[j] == b' ' || bytes[j] == b',' || bytes[j] == b'\n' || bytes[j] == b'\t')
+        {
             j += 1;
         }
-        if j >= bytes.len() || bytes[j] == b']' { break; }
-        if bytes[j] != b'"' { return None; }
+        if j >= bytes.len() || bytes[j] == b']' {
+            break;
+        }
+        if bytes[j] != b'"' {
+            return None;
+        }
         j += 1;
         let mut s = String::new();
         while j < bytes.len() {
@@ -152,10 +171,8 @@ fn extract_usize_field(text: &str, key: &str) -> Option<usize> {
 /// `min_recovered=1`. Multi-needle records carry `expected_answer_substrings`
 /// (plural) and `min_recovered` directly.
 fn parse_jsonl_record(text: &str) -> (String, String, Vec<String>, usize) {
-    let filler = extract_string_field(text, "filler_text")
-        .expect("missing filler_text");
-    let question = extract_string_field(text, "question")
-        .expect("missing question");
+    let filler = extract_string_field(text, "filler_text").expect("missing filler_text");
+    let question = extract_string_field(text, "question").expect("missing question");
     if let Some(arr) = extract_string_array(text, "expected_answer_substrings") {
         let min_recovered = extract_usize_field(text, "min_recovered").unwrap_or(arr.len());
         (filler, question, arr, min_recovered)
@@ -194,7 +211,8 @@ fn wrap_chatml(tokenizer: &hipfire_runtime::tokenizer::Tokenizer, prompt: &str) 
 }
 
 fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
-    args.iter().position(|a| a == flag)
+    args.iter()
+        .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok())
 }
@@ -216,7 +234,9 @@ fn encode_token_array(tokens: &[u32]) -> String {
     let mut s = String::with_capacity(tokens.len() * 6 + 2);
     s.push('[');
     for (i, t) in tokens.iter().enumerate() {
-        if i > 0 { s.push(','); }
+        if i > 0 {
+            s.push(',');
+        }
         s.push_str(&t.to_string());
     }
     s.push(']');
@@ -227,7 +247,9 @@ fn encode_token_array(tokens: &[u32]) -> String {
 /// writer is `encode_token_array`, so we only need to parse `[N,N,...,N]`.
 fn parse_token_array(text: &str) -> Vec<u32> {
     let needle = "\"tokens\":";
-    let i = text.find(needle).expect("missing tokens field in pretok jsonl");
+    let i = text
+        .find(needle)
+        .expect("missing tokens field in pretok jsonl");
     let rest = &text[i + needle.len()..];
     let lb = rest.find('[').expect("expected [ for tokens array");
     let rb = rest.find(']').expect("expected ] for tokens array");
@@ -248,7 +270,9 @@ fn parse_string_field(text: &str, key: &str) -> Option<String> {
     let mut out = String::new();
     while j < bytes.len() {
         let b = bytes[j];
-        if b == b'"' { break; }
+        if b == b'"' {
+            break;
+        }
         out.push(b as char);
         j += 1;
     }
@@ -258,10 +282,13 @@ fn parse_string_field(text: &str, key: &str) -> Option<String> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: pflash_niah_bench <model.hfq> <fixture.jsonl> \
-                   [--maxgen N] [--q8kv|--asym3] [--pretok|--write-pretok] \
+        eprintln!(
+            "Usage: pflash_niah_bench <model.hfq> <fixture.jsonl> \
+                   [--maxgen N] [--q8kv|--asym3] [--state-quant q8|fp32|q4] \
+                   [--pretok|--write-pretok] \
                    [--pflash <drafter.hfq> [--keep-ratio K] [--block-size B] \
-                   [--sink-tokens N] [--recent-tokens N]]");
+                   [--sink-tokens N] [--recent-tokens N]]"
+        );
         std::process::exit(2);
     }
     let model_path = &args[1];
@@ -276,8 +303,19 @@ fn main() {
         None if use_q8 => "q8".to_string(),
         None => "asym3".to_string(),
     };
-    let drafter_path: Option<String> = args.iter().position(|a| a == "--pflash")
-        .and_then(|i| args.get(i + 1)).cloned();
+    let state_quant_arg: Option<String> = parse_arg(&args, "--state-quant");
+    let state_quant = match parse_state_quant(state_quant_arg.as_deref()) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("FAIL: {e}");
+            std::process::exit(2);
+        }
+    };
+    let drafter_path: Option<String> = args
+        .iter()
+        .position(|a| a == "--pflash")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let keep_ratio: f32 = parse_arg(&args, "--keep-ratio").unwrap_or(0.30);
     let block_size: usize = parse_arg(&args, "--block-size").unwrap_or(64);
     let sink_tokens: usize = parse_arg(&args, "--sink-tokens").unwrap_or(16);
@@ -295,23 +333,36 @@ fn main() {
     let use_pretok = args.iter().any(|a| a == "--pretok");
     let write_pretok = args.iter().any(|a| a == "--write-pretok");
     if use_pretok && write_pretok {
-        eprintln!("FAIL: --pretok and --write-pretok are mutually exclusive \
+        eprintln!(
+            "FAIL: --pretok and --write-pretok are mutually exclusive \
                    (one reads cached tokens, the other generates them; combining \
-                   them would re-author the cache against itself)");
+                   them would re-author the cache against itself)"
+        );
         std::process::exit(2);
     }
 
-    let mode_label = if drafter_path.is_some() { "PFlash compressed" } else { "full prefill" };
+    let mode_label = if drafter_path.is_some() {
+        "PFlash compressed"
+    } else {
+        "full prefill"
+    };
     eprintln!("=== PFlash NIAH ({mode_label}) ===");
     eprintln!("model:   {model_path}");
     eprintln!("fixture: {fixture_path}");
     eprintln!("maxgen:  {max_gen}");
     eprintln!("kv mode: {kv_label}");
+    eprintln!("state:   {state_quant:?}");
     eprintln!("target dev: {target_device}");
     if let Some(d) = &drafter_path {
         eprintln!("drafter: {d}");
-        eprintln!("drafter dev: {drafter_device}{}",
-            if drafter_device != target_device { " (cross-device PFlash)" } else { "" });
+        eprintln!(
+            "drafter dev: {drafter_device}{}",
+            if drafter_device != target_device {
+                " (cross-device PFlash)"
+            } else {
+                ""
+            }
+        );
         eprintln!("pflash:  keep_ratio={keep_ratio} block={block_size} sink={sink_tokens} recent={recent_tokens}");
     }
 
@@ -324,8 +375,10 @@ fn main() {
     let pretok_path = pretok_companion_path(Path::new(fixture_path));
     let pretok_available = use_pretok && pretok_path.exists();
     if use_pretok && !pretok_available {
-        eprintln!("FAIL: --pretok requested but {} does not exist (run --write-pretok first)",
-            pretok_path.display());
+        eprintln!(
+            "FAIL: --pretok requested but {} does not exist (run --write-pretok first)",
+            pretok_path.display()
+        );
         std::process::exit(2);
     }
 
@@ -338,25 +391,38 @@ fn main() {
     let source_raw_md5 = md5_hex(source_raw.as_bytes());
     eprintln!("source fixture md5: {source_raw_md5}");
 
-    let (raw, raw_md5, filler, question, expected_substrings, min_recovered, pretok_tokens, pretok_sig) =
-    if pretok_available {
+    let (
+        raw,
+        raw_md5,
+        filler,
+        question,
+        expected_substrings,
+        min_recovered,
+        pretok_tokens,
+        pretok_sig,
+    ) = if pretok_available {
         let raw = fs::read_to_string(&pretok_path).expect("read pretok fixture");
         let raw_md5 = md5_hex(raw.as_bytes());
         eprintln!("pretok fixture: {} ({raw_md5})", pretok_path.display());
         // Stale-pretok guard: the pretok records the source md5 it was
         // authored against; if the source has changed since, fail loudly
         // rather than encode-with-old / verdict-against-new.
-        let recorded_source_md5 = parse_string_field(&raw, "source_fixture_md5")
-            .expect("missing source_fixture_md5 in pretok jsonl (was it written by an old --write-pretok?)");
+        let recorded_source_md5 = parse_string_field(&raw, "source_fixture_md5").expect(
+            "missing source_fixture_md5 in pretok jsonl (was it written by an old --write-pretok?)",
+        );
         if recorded_source_md5 != source_raw_md5 {
-            eprintln!("FAIL: pretok source_fixture_md5 {recorded_source_md5} != \
+            eprintln!(
+                "FAIL: pretok source_fixture_md5 {recorded_source_md5} != \
                        current source fixture md5 {source_raw_md5}; \
-                       re-run --write-pretok against the current source");
+                       re-run --write-pretok against the current source"
+            );
             std::process::exit(2);
         }
         let question = parse_string_field(&raw, "question").expect("question");
         // Plural form preferred (multi-needle); fall back to singular.
-        let (expected_arr, min_rec) = if let Some(arr) = extract_string_array(&raw, "expected_answer_substrings") {
+        let (expected_arr, min_rec) = if let Some(arr) =
+            extract_string_array(&raw, "expected_answer_substrings")
+        {
             let mr = extract_usize_field(&raw, "min_recovered").unwrap_or(arr.len());
             (arr, mr)
         } else {
@@ -365,12 +431,33 @@ fn main() {
         };
         let sig = parse_string_field(&raw, "tokenizer_signature").expect("tokenizer_signature");
         let toks = parse_token_array(&raw);
-        eprintln!("pretok tokens: {} (sig {sig}, source md5 verified)", toks.len());
-        (raw, raw_md5, String::new(), question, expected_arr, min_rec, Some(toks), Some(sig))
+        eprintln!(
+            "pretok tokens: {} (sig {sig}, source md5 verified)",
+            toks.len()
+        );
+        (
+            raw,
+            raw_md5,
+            String::new(),
+            question,
+            expected_arr,
+            min_rec,
+            Some(toks),
+            Some(sig),
+        )
     } else {
         eprintln!("fixture md5: {source_raw_md5}");
         let (filler, question, expected, min_rec) = parse_jsonl_record(&source_raw);
-        (source_raw.clone(), source_raw_md5.clone(), filler, question, expected, min_rec, None, None)
+        (
+            source_raw.clone(),
+            source_raw_md5.clone(),
+            filler,
+            question,
+            expected,
+            min_rec,
+            None,
+            None,
+        )
     };
     let prompt_text = if pretok_tokens.is_some() {
         // pretok mode never reconstructs a prompt string -- the tokens
@@ -381,7 +468,11 @@ fn main() {
     };
     let prompt_md5 = md5_hex(prompt_text.as_bytes());
     eprintln!("prompt md5:  {prompt_md5}");
-    eprintln!("expected ({}/{} req): {expected_substrings:?}", min_recovered, expected_substrings.len());
+    eprintln!(
+        "expected ({}/{} req): {expected_substrings:?}",
+        min_recovered,
+        expected_substrings.len()
+    );
     let _ = raw; // keep raw alive for any later debug; main path doesn't need it.
 
     let model_md5 = md5_file(Path::new(model_path));
@@ -394,9 +485,14 @@ fn main() {
         .expect("tokenizer");
     let mut gpu = rdna_compute::Gpu::init_with_device(target_device).expect("target GPU init");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
-    eprintln!("loaded in {:.1}s | dim={} layers={} heads={} kv_heads={}",
+    eprintln!(
+        "loaded in {:.1}s | dim={} layers={} heads={} kv_heads={}",
         t_load_start.elapsed().as_secs_f64(),
-        config.dim, config.n_layers, config.n_heads, config.n_kv_heads);
+        config.dim,
+        config.n_layers,
+        config.n_heads,
+        config.n_kv_heads
+    );
 
     let t_tok = Instant::now();
     let source_tokens: Vec<u32> = if let Some(pretok) = pretok_tokens {
@@ -418,7 +514,11 @@ fn main() {
     } else {
         wrap_chatml(&tokenizer, &prompt_text)
     };
-    let tok_ms = if pretok_available { 0 } else { t_tok.elapsed().as_millis() };
+    let tok_ms = if pretok_available {
+        0
+    } else {
+        t_tok.elapsed().as_millis()
+    };
     if !pretok_available {
         eprintln!("tokenize:    {tok_ms} ms ({} tokens)", source_tokens.len());
     }
@@ -439,17 +539,27 @@ fn main() {
         let sig = pflash::tokenizer_compat_signature(&tokenizer).to_string();
         let mut line = String::with_capacity(source_tokens.len() * 6 + 256);
         line.push('{');
-        line.push_str(&format!("\"source_fixture\":\"{}\",", fixture_path.replace('"', "")));
+        line.push_str(&format!(
+            "\"source_fixture\":\"{}\",",
+            fixture_path.replace('"', "")
+        ));
         line.push_str(&format!("\"source_fixture_md5\":\"{raw_md5}\","));
         line.push_str(&format!("\"tokenizer_signature\":\"{sig}\","));
-        line.push_str(&format!("\"question\":\"{}\",", question.replace('"', "\\\"")));
+        line.push_str(&format!(
+            "\"question\":\"{}\",",
+            question.replace('"', "\\\"")
+        ));
         if expected_substrings.len() == 1 && min_recovered == 1 {
-            line.push_str(&format!("\"expected_answer_substring\":\"{}\",",
-                expected_substrings[0].replace('"', "\\\"")));
+            line.push_str(&format!(
+                "\"expected_answer_substring\":\"{}\",",
+                expected_substrings[0].replace('"', "\\\"")
+            ));
         } else {
             line.push_str("\"expected_answer_substrings\":[");
             for (i, s) in expected_substrings.iter().enumerate() {
-                if i > 0 { line.push(','); }
+                if i > 0 {
+                    line.push(',');
+                }
                 line.push_str(&format!("\"{}\"", s.replace('"', "\\\"")));
             }
             line.push_str("],");
@@ -461,7 +571,11 @@ fn main() {
         line.push_str(&encode_token_array(&source_tokens));
         line.push_str("}\n");
         fs::write(&pretok_path, line).expect("write pretok jsonl");
-        eprintln!("wrote pretok: {} ({} tokens)", pretok_path.display(), source_tokens.len());
+        eprintln!(
+            "wrote pretok: {} ({} tokens)",
+            pretok_path.display(),
+            source_tokens.len()
+        );
     }
 
     // ── PFlash compression (optional) ────────────────────────────────────
@@ -508,20 +622,36 @@ fn main() {
             };
             let t_load_drafter = Instant::now();
             pflash::load_drafter(
-                &mut state, drafter_gpu, Path::new(drafter_path_str), &tokenizer, drafter_max_kv,
-            ).expect("load_drafter");
-            eprintln!("drafter loaded: {:.1}s | tokenizer_compat={}",
-                t_load_drafter.elapsed().as_secs_f64(), state.tokenizer_compat);
+                &mut state,
+                drafter_gpu,
+                Path::new(drafter_path_str),
+                &tokenizer,
+                drafter_max_kv,
+            )
+            .expect("load_drafter");
+            eprintln!(
+                "drafter loaded: {:.1}s | tokenizer_compat={}",
+                t_load_drafter.elapsed().as_secs_f64(),
+                state.tokenizer_compat
+            );
             if !state.tokenizer_compat {
-                eprintln!("FAIL: drafter tokenizer incompatible with target -- cannot compress safely");
+                eprintln!(
+                    "FAIL: drafter tokenizer incompatible with target -- cannot compress safely"
+                );
                 state.unload_drafter(drafter_gpu);
                 std::process::exit(2);
             }
 
             let t_compress = Instant::now();
             let decision = pflash::maybe_compress_prompt(
-                drafter_gpu, &mut state, &pflash_cfg, &source_tokens, RequestKind::Text, &[],
-            ).expect("maybe_compress_prompt");
+                drafter_gpu,
+                &mut state,
+                &pflash_cfg,
+                &source_tokens,
+                RequestKind::Text,
+                &[],
+            )
+            .expect("maybe_compress_prompt");
             compress_ms = t_compress.elapsed().as_millis();
 
             let kept = match decision {
@@ -530,16 +660,29 @@ fn main() {
                     select_ms = cp.timings.select_ms as u128;
                     gather_ms = cp.timings.gather_ms as u128;
                     eprintln!("compress:    {compress_ms} ms (score={score_ms}ms select={select_ms}ms gather={gather_ms}ms)");
-                    eprintln!("compressed:  {} -> {} tokens (ratio {:.3}, alpha implicit)",
-                        cp.source_tokens, cp.kept_tokens,
-                        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32);
+                    eprintln!(
+                        "compressed:  {} -> {} tokens (ratio {:.3}, alpha implicit)",
+                        cp.source_tokens,
+                        cp.kept_tokens,
+                        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32
+                    );
                     eprintln!("source_md5:    {}", cp.source_md5);
                     eprintln!("compressed_md5:{}", cp.compressed_md5);
-                    eprintln!("kept_spans:  {} ranges (first={:?} last={:?})",
-                        cp.kept_spans.len(), cp.kept_spans.first(), cp.kept_spans.last());
+                    eprintln!(
+                        "kept_spans:  {} ranges (first={:?} last={:?})",
+                        cp.kept_spans.len(),
+                        cp.kept_spans.first(),
+                        cp.kept_spans.last()
+                    );
                     cp.token_ids
                 }
-                PflashDecision::Bypass { reason: BypassReason::BelowThreshold { source_tokens: st, threshold } } => {
+                PflashDecision::Bypass {
+                    reason:
+                        BypassReason::BelowThreshold {
+                            source_tokens: st,
+                            threshold,
+                        },
+                } => {
                     eprintln!("bypass(BelowThreshold): {st} tokens, threshold {threshold}");
                     eprintln!("(compression would keep entire prompt -- running full prefill)");
                     source_tokens.clone()
@@ -578,27 +721,74 @@ fn main() {
     eprintln!("prefill tokens md5: {tokens_md5} ({} tokens)", tokens.len());
 
     let kv_seq = (tokens.len() + max_gen + 256).next_power_of_two().max(2048);
-    let is_kv_layer: Vec<bool> = config.layer_types.iter()
-        .map(|t| *t == qwen35::LayerType::FullAttention).collect();
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == qwen35::LayerType::FullAttention)
+        .collect();
     let mut kv = match kv_label.as_str() {
-        "q8" => KvCache::new_gpu_q8_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
-            .expect("kv q8"),
-        "asym4" => KvCache::new_gpu_asym4_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
-            .expect("kv asym4"),
-        "asym3" => KvCache::new_gpu_asym3_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
-            .expect("kv asym3"),
-        "asym2" => KvCache::new_gpu_asym2_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
-            .expect("kv asym2"),
-        "fwht4" => KvCache::new_gpu_fwht4_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
-            .expect("kv fwht4"),
-        "fwht3" => KvCache::new_gpu_fwht3_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
-            .expect("kv fwht3"),
-        "fwht2" => KvCache::new_gpu_fwht2_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
-            .expect("kv fwht2"),
+        "q8" => KvCache::new_gpu_q8_filtered(
+            &mut gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .expect("kv q8"),
+        "asym4" => KvCache::new_gpu_asym4_filtered(
+            &mut gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .expect("kv asym4"),
+        "asym3" => KvCache::new_gpu_asym3_filtered(
+            &mut gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .expect("kv asym3"),
+        "asym2" => KvCache::new_gpu_asym2_filtered(
+            &mut gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .expect("kv asym2"),
+        "fwht4" => KvCache::new_gpu_fwht4_filtered(
+            &mut gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .expect("kv fwht4"),
+        "fwht3" => KvCache::new_gpu_fwht3_filtered(
+            &mut gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .expect("kv fwht3"),
+        "fwht2" => KvCache::new_gpu_fwht2_filtered(
+            &mut gpu,
+            &is_kv_layer,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .expect("kv fwht2"),
         other => panic!("unknown --kv-mode: {other} (q8|asym4|asym3|asym2|fwht4|fwht3|fwht2)"),
     };
-    let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn_state");
-    let scratch = qwen35::Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).expect("scratch");
+    let mut dn_state =
+        DeltaNetState::new_with_quant(&mut gpu, &config, state_quant).expect("dn_state");
+    let scratch =
+        qwen35::Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).expect("scratch");
 
     // HIP kernel launches are async. Without an explicit synchronize,
     // `t_pre.elapsed()` would only measure host-side launch time and the
@@ -608,12 +798,27 @@ fn main() {
     // first-decode-step bucket.
     let t_pre = Instant::now();
     qwen35::forward_prefill_batch(
-        &mut gpu, &weights, &config, &tokens, 0, &mut kv, &mut dn_state, &scratch,
-        None, None, None, None,
-    ).expect("forward_prefill_batch");
+        &mut gpu,
+        &weights,
+        &config,
+        &tokens,
+        0,
+        &mut kv,
+        &mut dn_state,
+        &scratch,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("forward_prefill_batch");
     gpu.hip.device_synchronize().expect("sync after prefill");
     let prefill_ms = t_pre.elapsed().as_millis();
-    let prefill_tok_s = if prefill_ms > 0 { tokens.len() as f64 / (prefill_ms as f64 / 1000.0) } else { 0.0 };
+    let prefill_tok_s = if prefill_ms > 0 {
+        tokens.len() as f64 / (prefill_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
     eprintln!("prefill:     {prefill_ms} ms ({prefill_tok_s:.0} tok/s)");
 
     // First decoded token comes directly from prefill logits. With the
@@ -639,8 +844,16 @@ fn main() {
         }
         let pos = tokens.len() + generated.len() - 1;
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, next_token, pos, &mut kv, &mut dn_state, &scratch,
-        ).expect("forward_scratch");
+            &mut gpu,
+            &weights,
+            &config,
+            next_token,
+            pos,
+            &mut kv,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("forward_scratch");
         let logits = gpu.download_f32(&scratch.logits).expect("download logits");
         next_token = llama::argmax(&logits);
         generated.push(next_token);
@@ -649,7 +862,9 @@ fn main() {
     let decode_ms = t_dec.elapsed().as_millis();
     let decode_tok_s = if decode_ms > 0 && decode_steps > 0 {
         decode_steps as f64 / (decode_ms as f64 / 1000.0)
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     let answer = tokenizer.decode(&generated);
     eprintln!("decode:      {decode_ms} ms ({decode_steps} forward_scratch calls, {decode_tok_s:.1} tok/s)");
 
@@ -666,23 +881,42 @@ fn main() {
     eprintln!("decode rest: {decode_ms} ms");
     eprintln!("total:       {total_ms} ms");
 
-    let recovered: Vec<&String> = expected_substrings.iter()
+    let recovered: Vec<&String> = expected_substrings
+        .iter()
         .filter(|s| answer.contains(s.as_str()))
         .collect();
     let pass = recovered.len() >= min_recovered;
     eprintln!("--- ANSWER ---");
     eprintln!("{answer}");
     eprintln!("--- VERDICT ---");
-    eprintln!("recovered: {} / {} (min_recovered={})", recovered.len(), expected_substrings.len(), min_recovered);
+    eprintln!(
+        "recovered: {} / {} (min_recovered={})",
+        recovered.len(),
+        expected_substrings.len(),
+        min_recovered
+    );
     for s in &expected_substrings {
-        let mark = if answer.contains(s.as_str()) { "+" } else { "-" };
+        let mark = if answer.contains(s.as_str()) {
+            "+"
+        } else {
+            "-"
+        };
         eprintln!("  [{mark}] {s:?}");
     }
     if pass {
-        eprintln!("PASS: {} substring(s) found, min_recovered={}", recovered.len(), min_recovered);
+        eprintln!(
+            "PASS: {} substring(s) found, min_recovered={}",
+            recovered.len(),
+            min_recovered
+        );
         std::process::exit(0);
     } else {
-        eprintln!("FAIL: {} of {} substrings recovered, need {}", recovered.len(), expected_substrings.len(), min_recovered);
+        eprintln!(
+            "FAIL: {} of {} substrings recovered, need {}",
+            recovered.len(),
+            expected_substrings.len(),
+            min_recovered
+        );
         std::process::exit(1);
     }
 }

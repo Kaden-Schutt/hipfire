@@ -23,7 +23,6 @@ import {
   historyUp,
   historyDown,
   historySubmit,
-  stripVisibleThinking,
 } from "./chat_pure.ts";
 
 // ─── graphemes ──────────────────────────────────────────────────────────────
@@ -103,14 +102,6 @@ describe("sanitizePaste", () => {
 
   test("preserves Unicode (multi-byte chars are >= 0x20)", () => {
     expect(sanitizePaste("hello 你好 😀")).toBe("hello 你好 😀");
-  });
-});
-
-// ─── Visible thinking cleanup ───────────────────────────────────────────────
-
-describe("stripVisibleThinking", () => {
-  test("strips leading orphan think closer before visible answer", () => {
-    expect(stripVisibleThinking("</think>\n\n```python\ndef add(): pass")).toBe("```python\ndef add(): pass");
   });
 });
 

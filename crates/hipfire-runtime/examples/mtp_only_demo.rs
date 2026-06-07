@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! mtp_only_demo: standalone Qwen3.5 MTP-only spec-decode bench harness.
 //!
 //! Loads a Qwen3.5 trunk (.hfq / .mq4 / etc.) and a native MTP head (.mtp,
@@ -10,6 +14,14 @@
 //!                 (--prompt "Hello" | --prompt-file <path>) \
 //!                 [--max 64] [--ctx 4096] [--temp 0.0] [--max-n 4]
 //!                 [--no-chatml]
+
+// MERGE-REVIEW(mtp_only_demo): took OUR multi-GPU/hetero demo wholesale for all 5
+// conflict hunks (adds --mtp-device, head_load_gpu, hetero drafter_state, and the
+// spec_step_mtp_compressed_serial_hetero dispatch — our unique value). #352 added a
+// `--trunk-spine` demo flag + spec_step_mtp_trunk_spine dispatch to THIS example;
+// that demo wiring is DROPPED here (the real spec_step_mtp_trunk_spine fn still
+// exists in mtp_spec.rs and is reachable via the daemon). Re-add the demo flag by
+// hand if the standalone example needs to exercise trunk-spine.
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -43,7 +55,6 @@ fn main() {
     let mut chatml: bool = true;
     let mut compressed: bool = false;
     let mut compressed_serial: bool = false;
-    let mut trunk_spine: bool = false;
     let mut kv_mode_str: String = String::from("q8");
     let mut p_min: f32 = 0.0;
     // Sampling parameters (Unsloth-recommended for Qwen3.5/3.6 MTP):
@@ -54,7 +65,6 @@ fn main() {
     let mut top_k: usize = 0;
     let mut min_p: f32 = 0.0;
     let mut seed: u64 = 42;
-
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -65,6 +75,10 @@ fn main() {
             "--mtp-head" => {
                 mtp_path = Some(args[i + 1].clone());
                 i += 2;
+            }
+            "--mtp-device" => {
+                eprintln!("error: --mtp-device removed; use the daemon's PP+MTP path (pp=2 + mtp_head) instead.");
+                std::process::exit(2);
             }
             "--prompt" => {
                 prompt_str = Some(args[i + 1].clone());
@@ -107,12 +121,6 @@ fn main() {
                 compressed_serial = true;
                 i += 1;
             }
-            "--trunk-spine" => {
-                trunk_spine = true;
-                compressed = true;
-                compressed_serial = true;
-                i += 1;
-            }
             "--kv-mode" => {
                 kv_mode_str = args[i + 1].clone();
                 i += 2;
@@ -142,13 +150,11 @@ fn main() {
                     "Usage: mtp_only_demo --target <trunk.hfq> --mtp-head <head.mtp> \\\n\
                      \t(--prompt \"Hello\" | --prompt-file <path>) \\\n\
                      \t[--max 64] [--ctx 4096] [--temp 0.0] [--max-n 4] \\\n\
-                     \t[--no-chatml] [--compressed] [--compressed-serial] [--trunk-spine]\n\
+                     \t[--no-chatml] [--compressed]\n\
                      \n\
                      --compressed: use FastMTP-style compressed lm_head_draft (K=1 path).\n\
                                    Requires .mtp head built with --vocab-sidecar.\n\
-                                   Forces max_n=1 since the compressed spec is K=1 only.\n\
-                     --compressed-serial: discrete-token serial MTP spine without prompt MTP fill.\n\
-                     --trunk-spine: DS4-style Qwen spine: prompt MTP fill + discrete-token serial verify."
+                                   Forces max_n=1 since the compressed spec is K=1 only."
                 );
                 std::process::exit(0);
             }
@@ -200,7 +206,7 @@ fn main() {
         std::process::exit(2);
     }
     assert!(max_n >= 1 && max_n <= 8, "--max-n must be in [1,8]");
-    if compressed && !compressed_serial && max_n > 1 {
+    if compressed && max_n > 1 {
         eprintln!(
             "compressed K={max_n}: chains K block forwards with lossy embedding \
                    override (same OOD risk as plain K-step path). Batched compressed \
@@ -220,13 +226,22 @@ fn main() {
             .unwrap_or("<bundled in target .mq4-mtp>")
     );
     eprintln!("prompt md5: {prompt_hash}");
-    eprintln!(
-        "max={max_tokens} ctx={ctx_capacity} max_n={max_n} chatml={chatml} trunk_spine={trunk_spine}"
-    );
+    eprintln!("max={max_tokens} ctx={ctx_capacity} max_n={max_n} chatml={chatml}");
 
     // ── Init GPU + load trunk + load MTP head ──────────────────────────
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("gpu: {}", gpu.arch);
+
+    // Hetero mode: second gpu hosts the MTP head + scratch + mirrored
+    // trunk.token_embd. Per-cycle peer copy of verify_hidden bridges the two.
+    // Requires the compressed-sidecar .mtp head (--compressed-serial) since
+    // v1 doesn't mirror trunk.output.
+    //
+    // ROCm 6.4.3 gotcha (see daemon.rs:2441): hipDeviceEnablePeerAccess MUST
+    // be called AFTER all allocations are live. Enabling early "succeeds" but
+    // subsequent kernel launches on the just-enabled peer fail with
+    // hipModuleLaunchKernel: invalid device ordinal.
+    // (drafter_gpu + hetero_mode removed — use daemon PP+MTP path instead)
 
     let mut slot_cfg = ModelSlotConfig::default();
     // Worst case per cycle: max_n + 1 KV slots written by trunk verify;
@@ -240,21 +255,22 @@ fn main() {
         .expect("load target");
     eprintln!("trunk loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
-    // MTP head's max_seq mirrors the trunk's. The head's KV cache is one
-    // single layer, so even max_seq = 100K is only ~250 MB at dim=5120.
+    // MTP head's max_seq mirrors the trunk's.
+    let head_load_gpu: &mut rdna_compute::Gpu = &mut gpu;
     let t_mtp = Instant::now();
     let head = if let Some(ref mp) = mtp_path {
         // Explicit --mtp-head: standalone .mtp file (legacy path).
-        mtp_head::load_mtp_head(Path::new(mp), &mut gpu, max_seq_total).expect("load mtp head")
+        mtp_head::load_mtp_head(Path::new(mp), head_load_gpu, max_seq_total).expect("load mtp head")
     } else {
         // Bundled .mq4-mtp: load MTP section embedded in target file.
-        mtp_head::load_mtp_head_bundled(Path::new(&target_path), &mut gpu, max_seq_total)
+        mtp_head::load_mtp_head_bundled(Path::new(&target_path), head_load_gpu, max_seq_total)
             .expect("load bundled mtp head")
             .expect(
                 "target ends in .mq4-mtp but no MTP bundle trailer found; \
                      was the file produced by mq4_merge_mtp?",
             )
     };
+    let _ = head_load_gpu; // borrow ends here
     let head_source = if mtp_path.is_some() {
         "standalone .mtp"
     } else {
@@ -325,8 +341,8 @@ fn main() {
         MtpSpecState::new_for_slot_with_kv_mode(&mut gpu, &target, &head, max_n, kv_mode)
             .expect("alloc MtpSpecState");
     if p_min > 0.0 {
-        if !compressed_serial && !trunk_spine {
-            eprintln!("warning: --mtp-p-min only affects --compressed-serial/--trunk-spine path; ignored for the other two");
+        if !compressed_serial {
+            eprintln!("warning: --mtp-p-min only affects --compressed-serial path; ignored for the other two");
         }
         state.set_p_min(p_min);
         eprintln!(
@@ -360,32 +376,21 @@ fn main() {
                 state
                     .mtp_scratch
                     .ensure_compressed_logits(&mut gpu, cvs)
-                    .expect("alloc logits_compressed");
+                    .expect("alloc logits_compressed (trunk)");
                 state
                     .ensure_compressed_lm_logits(&mut gpu, cvs)
                     .expect("alloc mtp_lm_logits_compressed");
-                if trunk_spine {
-                    eprintln!("trunk-spine: ON (sidecar draft lm_head, cvs={cvs}, K={max_n})");
-                } else {
-                    eprintln!("compressed: ON (cvs={cvs}, K={max_n}, mode=sidecar)");
-                }
+                eprintln!("compressed: ON (cvs={cvs}, K={max_n}, mode=sidecar)");
             }
             None if compressed_serial => {
                 // Full-vocab discrete-token chain via trunk's lm_head.
                 // spec_step_mtp_compressed_serial dispatches against
                 // trunk_weights.output and writes into state.mtp_lm_logits.
-                if trunk_spine {
-                    eprintln!(
-                        "trunk-spine: ON (full-vocab draft lm_head, K={max_n}, vocab={})",
-                        target.config.vocab_size
-                    );
-                } else {
-                    eprintln!(
-                        "compressed: ON (mode=full-vocab, K={max_n}, vocab={}) — \
-                         trunk lm_head used per-step",
-                        target.config.vocab_size
-                    );
-                }
+                eprintln!(
+                    "compressed: ON (mode=full-vocab, K={max_n}, vocab={}) — \
+                     trunk lm_head used per-step",
+                    target.config.vocab_size
+                );
             }
             None => {
                 eprintln!(
@@ -398,6 +403,8 @@ fn main() {
             }
         }
     }
+
+    // (hetero drafter state removed — use daemon PP+MTP path instead)
 
     let eos_token = target.config.eos_token;
 
@@ -412,63 +419,31 @@ fn main() {
     // on 232-token canonical prompt at 36 tok/s). Batched path runs the
     // same 232 tokens at ~540 tok/s (~0.43s), reclaiming ~6s of bench
     // wall time per run.
-    if trunk_spine {
-        eprintln!(
-            "prefilling {} tokens (batched trunk + MTP cache fill)...",
-            prompt_tokens.len()
-        );
-    } else {
-        eprintln!("prefilling {} tokens (batched)...", prompt_tokens.len());
-    }
+    eprintln!("prefilling {} tokens (batched)...", prompt_tokens.len());
     let t_prefill = Instant::now();
-    let mut trunk_prefill_secs: Option<f64> = None;
-    let mut mtp_prompt_fill_secs: Option<f64> = None;
-    if trunk_spine {
-        let timings = mtp_spec::prefill_trunk_and_mtp_cache(
-            &mut gpu,
-            &mut target,
-            &head,
-            &mut state,
-            &prompt_tokens,
-            0,
-        )
-        .expect("prefill trunk + mtp cache");
-        trunk_prefill_secs = Some(timings.trunk_prefill_secs);
-        mtp_prompt_fill_secs = Some(timings.mtp_prompt_fill_secs);
-    } else {
-        hipfire_arch_qwen35::qwen35::forward_prefill_batch(
-            &mut gpu,
-            &target.weights,
-            &target.config,
-            &prompt_tokens,
-            0,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            None, // hidden_rb (not needed — MTP demo doesn't use ring buffer)
-            None, // per_token_hidden_out (not needed for MTP seed)
-            None, // gdn_tape
-            None, // tree_verify
-        )
-        .expect("prefill forward_prefill_batch");
-    }
+    hipfire_arch_qwen35::qwen35::forward_prefill_batch(
+        &mut gpu,
+        &target.weights,
+        &target.config,
+        &prompt_tokens,
+        0,
+        &mut target.kv_cache,
+        &mut target.dn_state,
+        &target.scratch,
+        None, // hidden_rb (not needed — MTP demo doesn't use ring buffer)
+        None, // per_token_hidden_out (not needed for MTP seed)
+        None, // gdn_tape
+        None, // tree_verify
+    )
+    .expect("prefill forward_prefill_batch");
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
     let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
     eprintln!("prefill: {:.2}s ({:.1} tok/s)", prefill_secs, prefill_tok_s);
-    if let (Some(trunk_secs), Some(mtp_secs)) = (trunk_prefill_secs, mtp_prompt_fill_secs) {
-        let trunk_tok_s = prompt_tokens.len() as f64 / trunk_secs.max(1e-9);
-        eprintln!(
-            "prefill split: trunk={:.3}s ({:.1} tok/s) mtp_prompt_fill={:.3}s total={:.3}s",
-            trunk_secs, trunk_tok_s, mtp_secs, prefill_secs
-        );
-    }
 
     // Snapshot trunk's prev_hidden (post-output-norm at last prefill position).
-    if !trunk_spine {
-        state
-            .capture_prev_hidden_from_scratch_tmp(&gpu, &target.scratch.tmp, target.config.dim)
-            .expect("capture prev_hidden");
-    }
+    state
+        .capture_prev_hidden_from_scratch_tmp(&gpu, &target.scratch.tmp, target.config.dim)
+        .expect("capture prev_hidden");
 
     // Pick the seed_token: argmax of the trunk's logits for the last prefill
     // position. This becomes cycle 0's `last_committed`.
@@ -533,18 +508,7 @@ fn main() {
             eprintln!("hit max_seq {}; stopping", max_seq_total);
             break;
         }
-        let result = if trunk_spine {
-            mtp_spec::spec_step_mtp_trunk_spine(
-                &mut gpu,
-                &mut target,
-                &head,
-                &mut state,
-                cur_pos,
-                last_committed,
-                eos_token,
-            )
-            .expect("spec_step_mtp_trunk_spine")
-        } else if compressed_serial {
+        let result = if compressed_serial {
             mtp_spec::spec_step_mtp_compressed_serial(
                 &mut gpu,
                 &mut target,
@@ -714,12 +678,6 @@ fn main() {
     println!("tau:                  {:.4}", tau);
     println!("prefill_secs:         {:.3}", prefill_secs);
     println!("prefill_tok_s:        {:.2}", prefill_tok_s);
-    if let (Some(trunk_secs), Some(mtp_secs)) = (trunk_prefill_secs, mtp_prompt_fill_secs) {
-        let trunk_tok_s = prompt_tokens.len() as f64 / trunk_secs.max(1e-9);
-        println!("trunk_prefill_secs:   {:.3}", trunk_secs);
-        println!("trunk_prefill_tok_s:  {:.2}", trunk_tok_s);
-        println!("mtp_prompt_fill_secs: {:.3}", mtp_secs);
-    }
     println!("decode_secs:          {:.3}", decode_secs);
     println!("tok_s:                {:.2}", tok_per_s);
     println!("eos_hit:              {}", if hit_eos { "y" } else { "n" });

@@ -49,28 +49,3 @@ python3 scripts/aureth_to_corpus.py \
   benchmarks/calib/aureth-raw/compiled_corpus.jsonl \
   benchmarks/calib/aureth-corpus.txt
 ```
-
-## Regenerating `calib-1m.txt` and `calib-5m.txt`
-
-These files are gitignored (large, regenerable). To recreate from HuggingFace:
-
-```bash
-# Requires: pip install datasets
-python3 - <<'EOF'
-from datasets import load_dataset
-ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
-text = "\n".join(ds["text"])
-
-with open("benchmarks/calib/calib-5m.txt", "w") as f:
-    f.write(text[:19_996_814])   # ~5M tokens prefix
-
-with open("benchmarks/calib/calib-1m.txt", "w") as f:
-    f.write(text[:4_798_009])    # ~1.2M tokens prefix
-EOF
-```
-
-Expected md5 after generation:
-- `calib-1m.txt`: `c1879341cb2d4bcf06ead9d1c02ef5fa`
-- `calib-5m.txt`: `5dc7dc29676eb591869378b3ddc17815`
-
-Verify with `md5sum benchmarks/calib/calib-*.txt` before use in cross-session A/B.

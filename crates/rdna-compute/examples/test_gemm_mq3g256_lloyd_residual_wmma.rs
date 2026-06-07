@@ -13,7 +13,7 @@
 //! tolerance is logged-then-set empirically per Phase A acceptance criterion
 //! (plan §"Phase A": "tolerance is measured-and-set, not specified upfront").
 
-use rdna_compute::{Gpu, DType};
+use rdna_compute::Gpu;
 
 /// f32 → IEEE 754 binary16 little-endian, RTNE on dropped 13 mantissa bits.
 /// Matches gemv_mq3g256_lloyd_tail's helper exactly so f16-roundtripped values
@@ -82,8 +82,8 @@ fn pack_3bit_group(qs: &[u8; 256]) -> [u8; 96] {
             let q = qs[tid * 8 + i] as u32 & 7;
             pk |= q << (3 * i);
         }
-        out[tid * 3]     = (pk        & 0xff) as u8;
-        out[tid * 3 + 1] = ((pk >>  8) & 0xff) as u8;
+        out[tid * 3] = (pk & 0xff) as u8;
+        out[tid * 3 + 1] = ((pk >> 8) & 0xff) as u8;
         out[tid * 3 + 2] = ((pk >> 16) & 0xff) as u8;
     }
     out
@@ -118,7 +118,9 @@ fn build_lloyd_row(
 /// Inner accumulation in f64 for a clean ground truth; X is also f16-roundtripped
 /// to match what the GPU sees after fp32→fp16 conversion in `ensure_fp16_x`.
 fn cpu_reference_gemm(
-    m: usize, k: usize, n: usize,
+    m: usize,
+    k: usize,
+    n: usize,
     codebooks_per_row: &[Vec<[f32; 8]>],
     indices_per_row: &[Vec<[u8; 256]>],
     x_fp32: &[f32],
@@ -126,7 +128,10 @@ fn cpu_reference_gemm(
 ) -> Vec<f32> {
     let groups_per_row = k / 256;
     // Roundtrip X through f16 to match the GPU's view.
-    let x_rt: Vec<f32> = x_fp32.iter().map(|&v| f16_le_to_f32(f32_to_f16_le(v))).collect();
+    let x_rt: Vec<f32> = x_fp32
+        .iter()
+        .map(|&v| f16_le_to_f32(f32_to_f16_le(v)))
+        .collect();
     let mut y = y_init.to_vec();
     for col in 0..n {
         for row in 0..m {
@@ -196,7 +201,8 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (f32, f32, f32) {
     let d_x = gpu.upload_f32(&x, &[n, k]).unwrap();
     let d_y = gpu.upload_f32(&y_init, &[n, m]).unwrap();
 
-    gpu.gemm_mq3g256_lloyd_residual_wmma(&d_a, &d_x, &d_y, m, k, n).unwrap();
+    gpu.gemm_mq3g256_lloyd_residual_wmma(&d_a, &d_x, &d_y, m, k, n)
+        .unwrap();
     let y_gpu = gpu.download_f32(&d_y).unwrap();
 
     let y_ref = cpu_reference_gemm(m, k, n, &codebooks_per_row, &indices_per_row, &x, &y_init);
@@ -228,14 +234,14 @@ fn main() {
     // {64, 256, 1024} × {1024, 4096, 12288} × {16, 64, 256}). Selected to cover
     // small/medium/large extents without exploding total kernel time.
     let cases: &[(usize, usize, usize)] = &[
-        (64,   1024,  16),  // smallest — single tile
-        (64,   1024,  64),  // canonical small
-        (256,  1024,  64),  // wider M
-        (64,   4096,  64),  // longer K
-        (256,  4096,  16),
-        (256,  4096, 256),  // 16×16 tile sweep
-        (1024, 4096,  64),  // wider M
-        (1024, 12288, 64),  // qwen3.5-9b mlp.down_proj K dim
+        (64, 1024, 16),  // smallest — single tile
+        (64, 1024, 64),  // canonical small
+        (256, 1024, 64), // wider M
+        (64, 4096, 64),  // longer K
+        (256, 4096, 16),
+        (256, 4096, 256),  // 16×16 tile sweep
+        (1024, 4096, 64),  // wider M
+        (1024, 12288, 64), // qwen3.5-9b mlp.down_proj K dim
     ];
 
     // Tightened post-Phase-A from the initial 5e-3 budget. Worst observed
@@ -249,8 +255,10 @@ fn main() {
 
     let mut all_pass = true;
     let mut global_max_abs = 0f32;
-    println!("{:>5} {:>6} {:>4}  {:>11}  {:>11}  {:>11}  {}",
-             "M", "K", "N", "max_abs", "max_rel", "rms", "verdict");
+    println!(
+        "{:>5} {:>6} {:>4}  {:>11}  {:>11}  {:>11}  {}",
+        "M", "K", "N", "max_abs", "max_rel", "rms", "verdict"
+    );
 
     for &(m, k, n) in cases {
         let (max_abs, max_rel, rms) = run_one(&mut gpu, m, k, n);
@@ -260,15 +268,22 @@ fn main() {
             "{:>5} {:>6} {:>4}  {:>11.3e}  {:>11.3e}  {:>11.3e}  {tag}",
             m, k, n, max_abs, max_rel, rms
         );
-        if !pass { all_pass = false; }
-        if max_abs > global_max_abs { global_max_abs = max_abs; }
+        if !pass {
+            all_pass = false;
+        }
+        if max_abs > global_max_abs {
+            global_max_abs = max_abs;
+        }
     }
     println!();
     println!("Max-abs across all shapes  : {:.3e}", global_max_abs);
     println!("Phase A tolerance (initial): {:.3e}", phase_a_tolerance);
 
     if !all_pass {
-        eprintln!("\nFAIL: one or more shapes exceeded {} absolute", phase_a_tolerance);
+        eprintln!(
+            "\nFAIL: one or more shapes exceeded {} absolute",
+            phase_a_tolerance
+        );
         std::process::exit(1);
     }
     println!("\nALL PASS");

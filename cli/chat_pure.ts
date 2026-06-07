@@ -126,16 +126,6 @@ export function stripAnsi(s: string): string {
     .replace(SGR_RE, "");
 }
 
-export function stripVisibleThinking(content: string, preserveThinking: boolean = false): string {
-  if (preserveThinking) return content.replace(/<\|im_end\|>/g, "").trim();
-  return content
-    .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-    .replace(/<think>[\s\S]*$/, "")
-    .replace(/^\s*<\/think>\s*/, "")
-    .replace(/<\|im_end\|>/g, "")
-    .trim();
-}
-
 // ─── Markdown rendering ─────────────────────────────────────────────────────
 
 // Phase 1 markdown: fenced code blocks, inline code, bold, italic. ANSI SGR

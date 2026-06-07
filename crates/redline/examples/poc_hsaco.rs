@@ -25,7 +25,10 @@ fn main() {
         }
     };
 
-    eprintln!("  .text offset: 0x{:x} ({} bytes)", module.text_offset, module.text_size);
+    eprintln!(
+        "  .text offset: 0x{:x} ({} bytes)",
+        module.text_offset, module.text_size
+    );
     eprintln!("  Kernels found: {}\n", module.kernels.len());
 
     for k in &module.kernels {
@@ -39,13 +42,18 @@ fn main() {
         eprintln!("    VGPRs:                 {}", vgprs);
         eprintln!("    SGPRs:                 {}", sgprs);
         eprintln!("    group_segment (LDS):   {} bytes", k.group_segment_size);
-        eprintln!("    private_segment:       {} bytes", k.private_segment_size);
+        eprintln!(
+            "    private_segment:       {} bytes",
+            k.private_segment_size
+        );
         eprintln!("    kernarg_size:          {} bytes", k.kernarg_size);
         eprintln!();
     }
 
     if module.kernels.is_empty() {
-        eprintln!("WARNING: no kernel descriptors found. The .hsaco may use a different symbol format.");
+        eprintln!(
+            "WARNING: no kernel descriptors found. The .hsaco may use a different symbol format."
+        );
     } else {
         eprintln!("=== PASSED — kernel metadata extracted ===");
     }

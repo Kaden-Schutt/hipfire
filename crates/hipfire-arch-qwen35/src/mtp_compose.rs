@@ -138,9 +138,6 @@ impl MtpComposeState {
         let _ = gpu.free_tensor(self.mtp_lm_logits);
         let _ = gpu.free_tensor(self.mtp_lm_argmax);
         self.mtp_scratch.free_gpu(gpu);
-        // Qwen35MtpHeadKvCache::free_gpu does `drop(inner)` which does not
-        // release GPU memory (llama::KvCache has no Drop). Call the inner
-        // KvCache's own free_gpu directly to properly hipFree each tensor.
         self.mtp_kv.inner.free_gpu(gpu);
     }
 }
@@ -247,7 +244,10 @@ pub fn spec_step_dflash_mtp(
     }
 
     // Positions (no eviction support — this is a v1 path, no FlashCASK).
-    let effective_ctx_len = draft_scratch.target_hidden_abs_positions.len().min(position);
+    let effective_ctx_len = draft_scratch
+        .target_hidden_abs_positions
+        .len()
+        .min(position);
     let co = target.kv_cache.compact_offset as i32;
     let positions_q: Vec<i32> =
         ((position as i32 + co)..(position as i32 + b as i32 + co)).collect();
@@ -283,54 +283,83 @@ pub fn spec_step_dflash_mtp(
         assert!(
             batch <= verify_scratch.max_n,
             "verify_scratch max_n {} < draft batch {}",
-            verify_scratch.max_n, batch,
+            verify_scratch.max_n,
+            batch,
         );
         let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
         match w_out.gpu_dtype {
             DType::Q8_0 => {
                 gpu.gemm_q8_0_batched(
-                    &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
+                    &w_out.buf,
+                    &hidden_rows,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    batch,
                 )?;
             }
             DType::HFQ4G256 => {
                 gpu.gemm_hfq4g256_batched_lmhead(
-                    &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
+                    &w_out.buf,
+                    &hidden_rows,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    batch,
                 )?;
             }
             DType::MQ4G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq4g256_batched_lmhead(
-                    &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+                    &w_out.buf,
+                    &rotated,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    batch,
                 )?;
             }
             DType::MQ3G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq3g256_batched_lmhead(
-                    &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+                    &w_out.buf,
+                    &rotated,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    batch,
                 )?;
             }
             DType::HFQ6G256 => {
                 gpu.gemm_hfq6g256_batched_lmhead(
-                    &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
+                    &w_out.buf,
+                    &hidden_rows,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    batch,
                 )?;
             }
             DType::MQ6G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq6g256_batched_lmhead(
-                    &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+                    &w_out.buf,
+                    &rotated,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    batch,
                 )?;
             }
             _ => {
                 // Fallback per-row gemv.
                 for i in 1..b {
                     let hidden_row = draft_scratch.x.sub_offset(i * h, h);
-                    llama::weight_gemv(
-                        gpu, w_out, &hidden_row, &target.scratch.logits,
-                    )?;
+                    llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
                     let logits = gpu.download_f32(&target.scratch.logits)?;
                     drafted.push(argmax_u32(&logits));
                 }
@@ -378,7 +407,8 @@ pub fn spec_step_dflash_mtp(
     assert!(
         mtp_pos_base + mtp_k <= state.mtp_kv.max_seq,
         "mtp_pos_base + mtp_k ({}) > mtp_kv.max_seq ({})",
-        mtp_pos_base + mtp_k, state.mtp_kv.max_seq,
+        mtp_pos_base + mtp_k,
+        state.mtp_kv.max_seq,
     );
 
     for k in 0..mtp_k {
@@ -457,10 +487,12 @@ pub fn spec_step_dflash_mtp(
     // MoE-aware: tape capture is lossy on MoE per the spec_step_dflash
     // comment block. Preserve the same gate.
     let mut gdn_tape_opt = gdn_tape;
-    let target_has_moe = target.weights.layers.iter().any(|lw| matches!(
-        lw,
-        qwen35::LayerWeights::DeltaNetMoe(_) | qwen35::LayerWeights::FullAttnMoe(_),
-    ));
+    let target_has_moe = target.weights.layers.iter().any(|lw| {
+        matches!(
+            lw,
+            qwen35::LayerWeights::DeltaNetMoe(_) | qwen35::LayerWeights::FullAttnMoe(_),
+        )
+    });
     if target_has_moe {
         gdn_tape_opt = None;
     }
@@ -636,10 +668,16 @@ impl MtpComposeTreeState {
         assert!(max_k >= 1, "MtpComposeTreeState: max_k must be >= 1");
         let dim = target.config.dim;
         let vocab = target.config.vocab_size;
-        assert_eq!(head.config.n_embd, dim,
-            "MtpComposeTreeState: trunk dim={dim} but head n_embd={}", head.config.n_embd);
-        assert_eq!(head.config.vocab_size, vocab,
-            "MtpComposeTreeState: trunk vocab={vocab} but head vocab={}", head.config.vocab_size);
+        assert_eq!(
+            head.config.n_embd, dim,
+            "MtpComposeTreeState: trunk dim={dim} but head n_embd={}",
+            head.config.n_embd
+        );
+        assert_eq!(
+            head.config.vocab_size, vocab,
+            "MtpComposeTreeState: trunk vocab={vocab} but head vocab={}",
+            head.config.vocab_size
+        );
 
         let max_n = max_b * max_k;
         let mtp_scratch = Qwen35MtpHeadBatchedScratch::new(gpu, &head.config, max_n)?;
@@ -673,9 +711,6 @@ impl MtpComposeTreeState {
         let _ = gpu.free_tensor(self.mtp_lm_logits);
         let _ = gpu.free_tensor(self.mtp_lm_argmax);
         self.mtp_scratch.free_gpu(gpu);
-        // Qwen35MtpHeadKvCache::free_gpu does `drop(inner)` which does not
-        // release GPU memory (llama::KvCache has no Drop). Call the inner
-        // KvCache's own free_gpu directly to properly hipFree each tensor.
         self.mtp_kv.inner.free_gpu(gpu);
     }
 }
@@ -759,7 +794,11 @@ pub fn spec_step_dflash_mtp_tree(
     assert!(b >= 2, "dflash block size must be >= 2");
     assert!(mtp_k >= 1, "mtp_k must be >= 1");
     assert!(b <= state.max_b, "b={b} > state.max_b={}", state.max_b);
-    assert!(mtp_k <= state.max_k, "mtp_k={mtp_k} > state.max_k={}", state.max_k);
+    assert!(
+        mtp_k <= state.max_k,
+        "mtp_k={mtp_k} > state.max_k={}",
+        state.max_k
+    );
 
     let h = draft_cfg.hidden;
     assert_eq!(h, dim, "drafter hidden ({h}) must match trunk dim ({dim})");
@@ -793,7 +832,10 @@ pub fn spec_step_dflash_mtp_tree(
         }
     }
 
-    let effective_ctx_len = draft_scratch.target_hidden_abs_positions.len().min(position);
+    let effective_ctx_len = draft_scratch
+        .target_hidden_abs_positions
+        .len()
+        .min(position);
     let co = target.kv_cache.compact_offset as i32;
     let positions_q: Vec<i32> =
         ((position as i32 + co)..(position as i32 + b as i32 + co)).collect();
@@ -809,8 +851,16 @@ pub fn spec_step_dflash_mtp_tree(
     };
 
     dflash::draft_forward(
-        gpu, draft_weights, draft_cfg, None, None,
-        &positions_q, &positions_k, b, effective_ctx_len, draft_scratch,
+        gpu,
+        draft_weights,
+        draft_cfg,
+        None,
+        None,
+        &positions_q,
+        &positions_k,
+        b,
+        effective_ctx_len,
+        draft_scratch,
     )?;
 
     // Drafter lm_head over slots 1..B → drafted candidates.
@@ -818,34 +868,74 @@ pub fn spec_step_dflash_mtp_tree(
     let mut drafted: Vec<u32> = vec![seed_token];
     {
         let batch = b - 1;
-        assert!(batch <= verify_scratch.max_n,
-            "verify_scratch max_n {} < draft batch {}", verify_scratch.max_n, batch);
+        assert!(
+            batch <= verify_scratch.max_n,
+            "verify_scratch max_n {} < draft batch {}",
+            verify_scratch.max_n,
+            batch
+        );
         let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
         match w_out.gpu_dtype {
             DType::Q8_0 => gpu.gemm_q8_0_batched(
-                &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?,
+                &w_out.buf,
+                &hidden_rows,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            )?,
             DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?,
+                &w_out.buf,
+                &hidden_rows,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            )?,
             DType::MQ4G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq4g256_batched_lmhead(
-                    &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch)?;
+                    &w_out.buf,
+                    &rotated,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    batch,
+                )?;
             }
             DType::MQ3G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq3g256_batched_lmhead(
-                    &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch)?;
+                    &w_out.buf,
+                    &rotated,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    batch,
+                )?;
             }
             DType::HFQ6G256 => gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?,
+                &w_out.buf,
+                &hidden_rows,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            )?,
             DType::MQ6G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq6g256_batched_lmhead(
-                    &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch)?;
+                    &w_out.buf,
+                    &rotated,
+                    &logits_batch,
+                    w_out.m,
+                    w_out.k,
+                    batch,
+                )?;
             }
             _ => panic!("dflash_mtp_tree: unsupported drafter lm_head dtype"),
         }
@@ -894,23 +984,26 @@ pub fn spec_step_dflash_mtp_tree(
     // Stack drafter hiddens for slots 1..B as MTP prev_hidden inputs.
     // draft_scratch.x[i*h..] is slot i's hidden; we need rows 1..B.
     gpu.hip.memcpy_dtod_at(
-        &state.prev_hiddens_stacked.buf, 0,
-        &draft_scratch.x.buf, dim_bytes,
+        &state.prev_hiddens_stacked.buf,
+        0,
+        &draft_scratch.x.buf,
+        dim_bytes,
         n_mtp_forwards * dim_bytes,
     )?;
 
     // Per-MTP-slot positions: mtp_c{i} sits at position + i + 1 (one beyond
     // the dflash slot it attaches to, which lives at position + i).
-    let mtp_positions: Vec<i32> =
-        (0..n_mtp_forwards).map(|i| (mtp_pos_base + i) as i32).collect();
-    let mtp_next_tokens: Vec<u32> =
-        (0..n_mtp_forwards).map(|i| drafted[i + 1]).collect();
+    let mtp_positions: Vec<i32> = (0..n_mtp_forwards)
+        .map(|i| (mtp_pos_base + i) as i32)
+        .collect();
+    let mtp_next_tokens: Vec<u32> = (0..n_mtp_forwards).map(|i| drafted[i + 1]).collect();
 
     // Bound check vs MTP cache.
     assert!(
         mtp_pos_base + n_mtp_forwards <= state.mtp_kv.max_seq,
         "MTP cache too small: pos_base + n = {} > max_seq {}",
-        mtp_pos_base + n_mtp_forwards, state.mtp_kv.max_seq,
+        mtp_pos_base + n_mtp_forwards,
+        state.mtp_kv.max_seq,
     );
 
     mtp_head::mtp_head_forward_block_batched(
@@ -927,13 +1020,21 @@ pub fn spec_step_dflash_mtp_tree(
     )?;
 
     // ── 3. Batched MTP lm_head + top-K extraction ─────────────────────────
-    let t_outs_view = state.mtp_scratch.t_mtp_outs.sub_offset(0, n_mtp_forwards * dim);
+    let t_outs_view = state
+        .mtp_scratch
+        .t_mtp_outs
+        .sub_offset(0, n_mtp_forwards * dim);
     let lm_tmp_view = state.mtp_lm_tmp.sub_offset(0, n_mtp_forwards * dim);
     let lm_rot_view = state.mtp_lm_rot.sub_offset(0, n_mtp_forwards * dim);
     let lm_logits_view = state.mtp_lm_logits.sub_offset(0, n_mtp_forwards * vocab);
     mtp_head::mtp_head_apply_lm_head_batched(
-        gpu, head, &trunk_weights.output,
-        &t_outs_view, &lm_tmp_view, &lm_rot_view, &lm_logits_view,
+        gpu,
+        head,
+        &trunk_weights.output,
+        &t_outs_view,
+        &lm_tmp_view,
+        &lm_rot_view,
+        &lm_logits_view,
         n_mtp_forwards,
     )?;
 
@@ -1008,20 +1109,29 @@ pub fn spec_step_dflash_mtp_tree(
     }
 
     // Upload mask + parent_indices into the DdtreeScratch buffers.
-    assert!(n_total <= ddtree_scratch.max_n,
-        "tree size {} exceeds ddtree_scratch.max_n {}", n_total, ddtree_scratch.max_n);
+    assert!(
+        n_total <= ddtree_scratch.max_n,
+        "tree size {} exceeds ddtree_scratch.max_n {}",
+        n_total,
+        ddtree_scratch.max_n
+    );
     {
         let mask_bytes = unsafe {
             std::slice::from_raw_parts(mask_host.as_ptr() as *const u8, mask_host.len() * 4)
         };
-        gpu.hip.memcpy_htod(&ddtree_scratch.attn_bias.buf, mask_bytes)?;
+        gpu.hip
+            .memcpy_htod(&ddtree_scratch.attn_bias.buf, mask_bytes)?;
     }
     let use_tree_la = std::env::var("HIPFIRE_DDTREE_TREE_LA").ok().as_deref() != Some("0");
     if use_tree_la {
         let parent_bytes = unsafe {
-            std::slice::from_raw_parts(parent_indices.as_ptr() as *const u8, parent_indices.len() * 4)
+            std::slice::from_raw_parts(
+                parent_indices.as_ptr() as *const u8,
+                parent_indices.len() * 4,
+            )
         };
-        gpu.hip.memcpy_htod(&ddtree_scratch.parent_indices.buf, parent_bytes)?;
+        gpu.hip
+            .memcpy_htod(&ddtree_scratch.parent_indices.buf, parent_bytes)?;
     }
 
     // ── 5. Tree verify ────────────────────────────────────────────────────
@@ -1029,10 +1139,12 @@ pub fn spec_step_dflash_mtp_tree(
 
     // MoE-aware tape gate (mirrors spec_step_dflash).
     let mut gdn_tape_opt = gdn_tape;
-    let target_has_moe = target.weights.layers.iter().any(|lw| matches!(
-        lw,
-        qwen35::LayerWeights::DeltaNetMoe(_) | qwen35::LayerWeights::FullAttnMoe(_),
-    ));
+    let target_has_moe = target.weights.layers.iter().any(|lw| {
+        matches!(
+            lw,
+            qwen35::LayerWeights::DeltaNetMoe(_) | qwen35::LayerWeights::FullAttnMoe(_),
+        )
+    });
     if target_has_moe {
         gdn_tape_opt = None;
     }
@@ -1042,12 +1154,21 @@ pub fn spec_step_dflash_mtp_tree(
     let ctx = qwen35::TreeVerifyCtx {
         positions: &tree_positions,
         attn_bias: &attn_bias_view,
-        parent_indices: if use_tree_la { Some(&parent_view) } else { None },
+        parent_indices: if use_tree_la {
+            Some(&parent_view)
+        } else {
+            None
+        },
         pre_rope_k_capture: None,
     };
 
     let verify_out: DflashVerifyOutput = speculative::verify_dflash_block_tree(
-        gpu, target, &tree_tokens, position, hidden_rb, gdn_tape_opt.as_deref_mut(),
+        gpu,
+        target,
+        &tree_tokens,
+        position,
+        hidden_rb,
+        gdn_tape_opt.as_deref_mut(),
         false, // greedy / temp=0
         ctx,
         verify_scratch,
@@ -1134,8 +1255,12 @@ pub fn spec_step_dflash_mtp_tree(
     // context. Same scatter pattern as spec_step_dflash_mtp's accept_len+1.
     let rows_to_keep = accept_dflash + 1; // committed dflash prefix only (drafter doesn't see MTP rows yet)
     speculative::scatter_hidden_block_to_interleaved(
-        gpu, hidden_rb, &draft_scratch.target_hidden,
-        position, n_total, rows_to_keep,
+        gpu,
+        hidden_rb,
+        &draft_scratch.target_hidden,
+        position,
+        n_total,
+        rows_to_keep,
     )?;
     draft_scratch.uploaded_target_hidden_rows = position + rows_to_keep;
     for p in 0..rows_to_keep {
@@ -1158,24 +1283,45 @@ pub fn spec_step_dflash_mtp_tree(
         // MTP was accepted.
         if accept_mtp == 0 {
             tape.replay_gdn(
-                gpu, &target.weights, &target.config, &mut target.dn_state,
+                gpu,
+                &target.weights,
+                &target.config,
+                &mut target.dn_state,
                 accept_dflash + 1,
             )?;
         } else {
             // Replay via prefill_batch (one extra forward but correct).
             let replay_tokens = &committed[..n_replay];
             qwen35::forward_prefill_batch(
-                gpu, &target.weights, &target.config, replay_tokens, position,
-                &mut target.kv_cache, &mut target.dn_state, &target.scratch,
-                None, None, None, None,
+                gpu,
+                &target.weights,
+                &target.config,
+                replay_tokens,
+                position,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                None,
+                None,
+                None,
+                None,
             )?;
         }
     } else {
         let replay_tokens = &committed[..n_replay];
         qwen35::forward_prefill_batch(
-            gpu, &target.weights, &target.config, replay_tokens, position,
-            &mut target.kv_cache, &mut target.dn_state, &target.scratch,
-            None, None, None, None,
+            gpu,
+            &target.weights,
+            &target.config,
+            replay_tokens,
+            position,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            None,
+            None,
+            None,
+            None,
         )?;
     }
 
@@ -1207,7 +1353,9 @@ fn topk_indices(logits: &[f32], k: usize) -> Vec<u32> {
     impl Eq for Item {}
     impl Ord for Item {
         fn cmp(&self, other: &Self) -> Ordering {
-            self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal)
+            self.0
+                .partial_cmp(&other.0)
+                .unwrap_or(Ordering::Equal)
                 .then(self.1.cmp(&other.1))
         }
     }

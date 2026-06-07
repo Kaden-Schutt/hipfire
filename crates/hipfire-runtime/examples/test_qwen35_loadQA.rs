@@ -143,7 +143,9 @@ fn run(path: &str) -> Result<String, Outcome> {
 fn is_qwen35_candidate(model_type: &str, hfq: &HfqFile) -> bool {
     model_type.starts_with("qwen3_5")
         || model_type == "qwen3.5"
-        || hfq.tensor_data("model.language_model.embed_tokens.weight").is_some()
+        || hfq
+            .tensor_data("model.language_model.embed_tokens.weight")
+            .is_some()
 }
 
 fn load_tokenizer(hfq: &HfqFile) -> Result<(Tokenizer, String), Outcome> {

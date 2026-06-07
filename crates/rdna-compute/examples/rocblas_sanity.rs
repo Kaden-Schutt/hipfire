@@ -28,7 +28,10 @@ fn main() {
     if gpu.rocblas.is_none() {
         match hip_bridge::Rocblas::load() {
             Ok(rb) => {
-                println!("[sanity] forcing rocBLAS load for non-CDNA3 (arch={})", gpu.arch);
+                println!(
+                    "[sanity] forcing rocBLAS load for non-CDNA3 (arch={})",
+                    gpu.arch
+                );
                 gpu.rocblas = Some(rb);
             }
             Err(e) => {
@@ -52,14 +55,11 @@ fn main() {
     const N: usize = 2;
 
     let w_host: Vec<f32> = vec![
-        1., 0., 0., 0., 0., 0., 0., 0.,
-        0., 1., 0., 0., 0., 0., 0., 0.,
-        0., 0., 1., 0., 0., 0., 0., 0.,
-        0., 0., 0., 1., 0., 0., 0., 0.,
+        1., 0., 0., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 0., 0., 0., 0., 0., 1., 0., 0., 0., 0.,
+        0., 0., 0., 0., 1., 0., 0., 0., 0.,
     ];
     let x_host: Vec<f32> = vec![
-        1., 2., 3., 4., 5., 6., 7., 8.,
-        8., 7., 6., 5., 4., 3., 2., 1.,
+        1., 2., 3., 4., 5., 6., 7., 8., 8., 7., 6., 5., 4., 3., 2., 1.,
     ];
 
     // Convert to f16 on host (using `half` crate would be cleaner, but the
@@ -72,10 +72,14 @@ fn main() {
         let mant = (bits & 0x7fffff) as u32;
         if exp <= 0 {
             // subnormal / zero — acceptable for our 0s + small ints
-            if v == 0.0 { return sign; }
+            if v == 0.0 {
+                return sign;
+            }
             return sign;
         }
-        if exp >= 31 { return sign | 0x7c00; } // inf
+        if exp >= 31 {
+            return sign | 0x7c00;
+        } // inf
         sign | ((exp as u16) << 10) | ((mant >> 13) as u16)
     }
 
@@ -100,16 +104,19 @@ fn main() {
 
     // Download Y and check
     let mut y_bytes = vec![0u8; N * M * 4];
-    gpu.hip.memcpy_dtoh(&mut y_bytes, &y_gpu).expect("copy Y back");
-    let y_host: &[f32] = unsafe {
-        std::slice::from_raw_parts(y_bytes.as_ptr() as *const f32, N * M)
-    };
+    gpu.hip
+        .memcpy_dtoh(&mut y_bytes, &y_gpu)
+        .expect("copy Y back");
+    let y_host: &[f32] =
+        unsafe { std::slice::from_raw_parts(y_bytes.as_ptr() as *const f32, N * M) };
 
     let expected = [1.0f32, 2., 3., 4., 8., 7., 6., 5.];
     let mut max_err = 0.0f32;
     for (i, (&got, &want)) in y_host.iter().zip(expected.iter()).enumerate() {
         let err = (got - want).abs();
-        if err > max_err { max_err = err; }
+        if err > max_err {
+            max_err = err;
+        }
         println!("  Y[{i:2}] = {got:.4}  (expected {want:.4}, err {err:.4e})");
     }
     if max_err > 1e-2 {

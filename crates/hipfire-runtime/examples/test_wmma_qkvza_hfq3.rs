@@ -112,28 +112,52 @@ fn run_one(
     let ref_b = cpu_gemm(&ab_bytes, beta_m, k, &x_f32, n);
     let ref_a = cpu_gemm(&aa_bytes, alpha_m, k, &x_f32, n);
 
-    let aq = gpu.upload_raw(&aq_bytes, &[qkv_m, k]).map_err(|e| format!("upload aq: {e}"))?;
-    let az = gpu.upload_raw(&az_bytes, &[z_m, k]).map_err(|e| format!("upload az: {e}"))?;
-    let ab = gpu.upload_raw(&ab_bytes, &[beta_m, k]).map_err(|e| format!("upload ab: {e}"))?;
-    let aa = gpu.upload_raw(&aa_bytes, &[alpha_m, k]).map_err(|e| format!("upload aa: {e}"))?;
-    let x = gpu.upload_f32(&x_f32, &[n, k]).map_err(|e| format!("upload x: {e}"))?;
+    let aq = gpu
+        .upload_raw(&aq_bytes, &[qkv_m, k])
+        .map_err(|e| format!("upload aq: {e}"))?;
+    let az = gpu
+        .upload_raw(&az_bytes, &[z_m, k])
+        .map_err(|e| format!("upload az: {e}"))?;
+    let ab = gpu
+        .upload_raw(&ab_bytes, &[beta_m, k])
+        .map_err(|e| format!("upload ab: {e}"))?;
+    let aa = gpu
+        .upload_raw(&aa_bytes, &[alpha_m, k])
+        .map_err(|e| format!("upload aa: {e}"))?;
+    let x = gpu
+        .upload_f32(&x_f32, &[n, k])
+        .map_err(|e| format!("upload x: {e}"))?;
 
-    let yq = gpu.alloc_tensor(&[n, qkv_m], DType::F32).map_err(|e| format!("alloc yq: {e}"))?;
-    let yz = gpu.alloc_tensor(&[n, z_m], DType::F32).map_err(|e| format!("alloc yz: {e}"))?;
-    let yb = gpu.alloc_tensor(&[n, beta_m], DType::F32).map_err(|e| format!("alloc yb: {e}"))?;
-    let ya = gpu.alloc_tensor(&[n, alpha_m], DType::F32).map_err(|e| format!("alloc ya: {e}"))?;
+    let yq = gpu
+        .alloc_tensor(&[n, qkv_m], DType::F32)
+        .map_err(|e| format!("alloc yq: {e}"))?;
+    let yz = gpu
+        .alloc_tensor(&[n, z_m], DType::F32)
+        .map_err(|e| format!("alloc yz: {e}"))?;
+    let yb = gpu
+        .alloc_tensor(&[n, beta_m], DType::F32)
+        .map_err(|e| format!("alloc yb: {e}"))?;
+    let ya = gpu
+        .alloc_tensor(&[n, alpha_m], DType::F32)
+        .map_err(|e| format!("alloc ya: {e}"))?;
 
     gpu.gemm_qkvza_hfq3g256_wmma(
-        &aq, &az, &ab, &aa, &x,
-        &yq, &yz, &yb, &ya,
-        qkv_m, z_m, beta_m, alpha_m, k, n,
+        &aq, &az, &ab, &aa, &x, &yq, &yz, &yb, &ya, qkv_m, z_m, beta_m, alpha_m, k, n,
     )
     .map_err(|e| format!("wmma: {e}"))?;
 
-    let cand_q = gpu.download_f32(&yq).map_err(|e| format!("download yq: {e}"))?;
-    let cand_z = gpu.download_f32(&yz).map_err(|e| format!("download yz: {e}"))?;
-    let cand_b = gpu.download_f32(&yb).map_err(|e| format!("download yb: {e}"))?;
-    let cand_a = gpu.download_f32(&ya).map_err(|e| format!("download ya: {e}"))?;
+    let cand_q = gpu
+        .download_f32(&yq)
+        .map_err(|e| format!("download yq: {e}"))?;
+    let cand_z = gpu
+        .download_f32(&yz)
+        .map_err(|e| format!("download yz: {e}"))?;
+    let cand_b = gpu
+        .download_f32(&yb)
+        .map_err(|e| format!("download yb: {e}"))?;
+    let cand_a = gpu
+        .download_f32(&ya)
+        .map_err(|e| format!("download ya: {e}"))?;
 
     // Intentionally NOT freeing tensors here — the GPU allocator can
     // recycle freed addresses, and `ensure_fp16_x` keys its conversion
@@ -162,8 +186,11 @@ fn run_one(
                 writeln!(
                     &mut report,
                     "      [b={b} r={r}] cand={:.4}  ref={:.4}  diff={:.4e}",
-                    cand_q[idx], ref_q[idx], cand_q[idx] - ref_q[idx]
-                ).ok();
+                    cand_q[idx],
+                    ref_q[idx],
+                    cand_q[idx] - ref_q[idx]
+                )
+                .ok();
             }
         }
         Err(report)
@@ -255,8 +282,12 @@ fn compare_proj(
             let b = refr[idx];
             let abs = (a - b).abs();
             let rel = abs / b.abs().max(1e-3);
-            if abs > max_abs { max_abs = abs; }
-            if rel > max_rel { max_rel = rel; }
+            if abs > max_abs {
+                max_abs = abs;
+            }
+            if rel > max_rel {
+                max_rel = rel;
+            }
             if abs > abs_tol && rel > rel_tol {
                 n_bad += 1;
                 hist_row_mod16[row % 16] += 1;

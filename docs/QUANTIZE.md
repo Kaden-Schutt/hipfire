@@ -1,13 +1,14 @@
 # Quantize
 
 `hipfire quantize` is a CPU-only tool that converts model weights into
-hipfire's native quantized formats. Three input shapes are supported.
+hipfire's native quantized formats. Four input shapes are supported.
 Output is a single file the daemon mmaps directly.
 
 ## Pick a format
 
 | Format | Bitwidth | Rotation | When to use |
 |---|---|---|---|
+| `fp16` | 16-bit | none | Reference/debug artifacts and maximum-quality smoke tests. Large, but preserves every quantizable tensor as raw F16. |
 | `mq4` | 4-bit | FWHT (rotated) | Qwen 3.5+ targets — calibrated for the DeltaNet hybrid attention path. Default for safetensors input. |
 | `mq6` | 6-bit | FWHT (rotated) | Qwen 3.5+ when you can spare +47% file size for quality. |
 | `hf4` | 4-bit | none | Dense models (Llama, Mistral, Gemma, older Qwen). Default for GGUF input. |
@@ -41,7 +42,8 @@ Useful flags:
 
 | Flag | Purpose |
 |---|---|
-| `--format <fmt>` | Repeatable. Defaults: `mq4` (safetensors), `hf4` (GGUF). |
+| `--format <fmt>` | Repeatable. Defaults: `mq4` (safetensors / source-precision HFQ), `hf4` (GGUF). |
+| `--chat-template-file <path>` | Override the embedded `tokenizer_config.chat_template` for safetensors input. The file is read as UTF-8 and the quantizer fails before writing if it cannot be read. |
 | `--both` | Shorthand for `--format mq4 --format mq6`. |
 | `-o, --output <path>` | Single-format output path. |
 | `--output-dir <dir>` | Multi-format output directory. |
@@ -63,6 +65,12 @@ files. Architectures the engine actually loads at inference: `llama`,
 architecture — the file just won't run if the engine has no matching
 loader.
 
+If a finetune ships a stale or missing chat template, pass
+`--chat-template-file ./template.jinja`. The template replaces
+`tokenizer_config.chat_template` in the emitted HFQ metadata; if
+`tokenizer_config.json` is absent, the quantizer writes a minimal
+`tokenizer_config` object containing only `chat_template`.
+
 ## From GGUF
 
 ```bash
@@ -70,8 +78,9 @@ hipfire quantize ./tinyllama.Q4_K_M.gguf \
     --install --register tinyllama:1b-gguf
 ```
 
-Default `--format` for GGUF is `hf4`. Override with `--format mq4` (or
-`mq6`) only when the source is a Qwen 3.5+ family GGUF.
+Default `--format` for GGUF is `hf4`. Override with `--format fp16` for
+a full-F16 reference artifact, or `--format mq4` / `mq6` only when the
+source is a Qwen 3.5+ family GGUF.
 
 GGUF tensor names get translated to HuggingFace safetensors style at
 write time so the engine's standard `load_weights_hfq` consumes the
@@ -96,9 +105,10 @@ Per-tensor format selection in the GGUF pipeline:
 
 | Tensor shape | Format |
 |---|---|
+| Any tensor with `--format fp16` | F16 |
 | 1D norm / scale (`*_norm.weight`) | F16 (precision-sensitive, small) |
 | `token_embd.weight` (the embedding) | Q8F16 (Q4-grade is too lossy) |
-| 2D weight, `K % 256 == 0` | per `--format` (mq4 / mq6 / hf4 / hf6) |
+| 2D weight, `K % 256 == 0` | per `--format` (fp16 / mq4 / mq6 / hf4 / hf6) |
 | 2D weight, K not divisible by 256 | HFQ4-G128 (no rotation fallback) |
 
 Source GGUF dequant types supported:
@@ -110,6 +120,30 @@ Q4_0  Q8_0  Q4_K  Q6_K  F16  BF16  F32
 Q5_K, Q5_0, Q5_1, IQ2_*, IQ3_*, IQ4_* are not implemented. The
 quantizer panics on encounter. Adding one is a ~150-line port from
 llama.cpp's `ggml-quants.c` to `crates/hipfire-quantize/src/gguf_input.rs`.
+
+## From source-precision HFQ
+
+```bash
+hipfire quantize ~/.hipfire/models/qwen3.5-0.8b-bf16.hfq \
+    --format mq4 \
+    -o qwen3.5-0.8b-mq4.hfq
+```
+
+HFQ input is supported for source-precision containers: tensor
+`quant_type` must be F16 (`1`), F32 (`2`), or BF16 (`16`). This covers
+BF16 smoke/reference artifacts emitted by hipfire itself and preserves
+the original HFQ metadata and architecture id in the output.
+
+Already-quantized HFQ input is intentionally rejected for now. Files
+containing tensors such as Q8F16, HFQ4, MQ4, MQ6, or Lloyd formats need
+format-specific dequantizers before they can be safely re-quantized; the
+quantizer reports the first unsupported tensor and quant type instead of
+silently accumulating untracked error.
+
+Per-tensor format selection for source-precision HFQ matches the normal
+base-format policy: embeddings, MoE routers, DeltaNet `conv1d`, and
+non-2D tensors use Q8F16 or F16 as appropriate; regular 2D weights use
+the requested format when the `K` dimension is compatible.
 
 ## Quality caveat for GGUF
 

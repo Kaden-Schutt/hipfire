@@ -18,8 +18,8 @@ Goal: flip GPU-default at production chunk_len, plus targeted kernel-side optimi
 
 ## Reference
 
-- `crates/hipfire-runtime/examples/triattn_validate.rs` — calibration harness, owns the CPU-vs-GPU dispatch.
-- `crates/hipfire-runtime/src/triattn.rs` — TriAttention scoring + accumulator kernels.
+- `crates/engine/examples/triattn_validate.rs` — calibration harness, owns the CPU-vs-GPU dispatch.
+- `crates/engine/src/triattn.rs` — TriAttention scoring + accumulator kernels.
 - `kernels/src/triattn_score_*.hip` — per-arch score-extract kernels.
 - Phase B/C measurements: `project/mi300x_phase_b_done_phase_c_running_2026_04_26.md`.
 - rocBLAS / MFMA validation: `project_rocblas_mfma_validation.md` (MI300X 4.46× prefill, default-on for CDNA3).

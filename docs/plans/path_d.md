@@ -186,7 +186,7 @@ if convenient.
 
 #### D0a — `commit_staging_to_ring` async-on-stream
 
-**File:** `crates/hipfire-arch-qwen35/src/speculative.rs:1302-1338`
+**File:** `crates/engine/src/speculative.rs:1302-1338`
 
 Today the function host-blocks on `stream_synchronize(active_stream)` (line
 1311) and then issues sync `memcpy_dtod_at` calls (lines 1316-1333), all on
@@ -220,7 +220,7 @@ within ±2 % on speed-gate (per-class).
 
 #### D0b — `scatter_hidden_block_to_interleaved` async-on-stream
 
-**File:** `crates/hipfire-arch-qwen35/src/speculative.rs:2238-2273`
+**File:** `crates/engine/src/speculative.rs:2238-2273`
 
 Today the function uses sync `memcpy_dtod_at` (line 2263) inside a 2D loop.
 Add a new variant:
@@ -247,7 +247,7 @@ unchanged.
 
 #### D0c — Thread `stream_override: Option<&Stream>` through `draft_forward`
 
-**File:** `crates/hipfire-runtime/src/dflash.rs:663` plus every kernel/memset callee.
+**File:** `crates/engine/src/dflash.rs:663` plus every kernel/memset callee.
 
 Today `draft_forward(gpu: &mut Gpu, ...)` rides on `gpu.active_stream`
 implicitly. Add a `stream_override: Option<&Stream>` parameter and route every
@@ -316,7 +316,7 @@ set, `gpu.draft_stream.is_some()` becomes true after the first
 
 ### D2 — DflashScratchPair + draft lm_head scratch
 
-**File:** `crates/hipfire-runtime/src/dflash.rs:304-393`
+**File:** `crates/engine/src/dflash.rs:304-393`
 
 Path D needs two `DflashScratch` instances so cycle N can write while cycle
 N+1 reads. Add:
@@ -392,7 +392,7 @@ this is split into two PR commits on top of the D0 refactors.
 
 #### D3a — Hoist commit out of `verify_dflash_block_inner`
 
-**File:** `crates/hipfire-arch-qwen35/src/speculative.rs:2057`
+**File:** `crates/engine/src/speculative.rs:2057`
 
 The commit at speculative.rs:2057 lives **inside** `verify_dflash_block_inner`,
 not at the top-level cycle scope. The pipelined cycle structure needs to
@@ -410,7 +410,7 @@ This is a small, byte-exact-at-default refactor. Land it before D3b.
 
 #### D3b — `spec_step_dflash` mode flag (refactor, not mirror)
 
-**File:** `crates/hipfire-arch-qwen35/src/speculative.rs:2384`
+**File:** `crates/engine/src/speculative.rs:2384`
 
 **Update from v1:** *do not mirror* `spec_step_dflash` into a sibling 700 LOC
 function. Instead, refactor `spec_step_dflash` to take a `pipeline_mode: bool`
@@ -489,7 +489,7 @@ of the 779 LOC core.
 
 ### D4 — Adaptive bypass (τ guard)
 
-**File:** `crates/hipfire-arch-qwen35/src/speculative.rs` (within `spec_step_dflash`,
+**File:** `crates/engine/src/speculative.rs` (within `spec_step_dflash`,
 pipelined branch).
 
 Telemetry already tracks accept-length per cycle (drives adaptive-B). Add a
@@ -581,10 +581,10 @@ Sequence (each step blocks on the previous):
 
 | File | Change |
 |------|--------|
-| `crates/hipfire-arch-qwen35/src/speculative.rs:1302-1338` | D0a — `commit_staging_to_ring_on_stream(&Stream)` async variant; thin wrapper preserves old API |
-| `crates/hipfire-arch-qwen35/src/speculative.rs:2238-2273` | D0b — `scatter_hidden_block_to_interleaved_on_stream(&Stream, head_snapshot)` async variant |
-| `crates/hipfire-runtime/src/dflash.rs:663` | D0c — `stream_override: Option<&Stream>` parameter on `draft_forward`; thread through callees |
-| `crates/hipfire-runtime/src/dflash.rs` (helpers) | D0c — propagate `stream_override` to upload_slice_f32 path, memset_async helper, kernel launches |
+| `crates/engine/src/speculative.rs:1302-1338` | D0a — `commit_staging_to_ring_on_stream(&Stream)` async variant; thin wrapper preserves old API |
+| `crates/engine/src/speculative.rs:2238-2273` | D0b — `scatter_hidden_block_to_interleaved_on_stream(&Stream, head_snapshot)` async variant |
+| `crates/engine/src/dflash.rs:663` | D0c — `stream_override: Option<&Stream>` parameter on `draft_forward`; thread through callees |
+| `crates/engine/src/dflash.rs` (helpers) | D0c — propagate `stream_override` to upload_slice_f32 path, memset_async helper, kernel launches |
 
 ### Phase D1–D5 (Path D PR, on top of D0)
 
@@ -592,12 +592,12 @@ Sequence (each step blocks on the previous):
 |------|--------|
 | `crates/rdna-compute/src/dispatch.rs:226-227` | D1 — delete `verify_stream` field; keep only `draft_stream` |
 | `crates/rdna-compute/src/dispatch.rs:434-435` | D1 — `init_pipeline_streams()`, DPM warmup hook for draft stream, `Drop` cleanup |
-| `crates/hipfire-runtime/src/dflash.rs:304-393` | D2 — `DflashScratchPair` struct (gated env=1 alloc, drop_unused_half, draft_lm_head buffers) + ctor |
-| `crates/hipfire-arch-qwen35/src/speculative.rs` (verify_dflash_block_inner) | D3a — `skip_internal_commit: bool` parameter |
-| `crates/hipfire-arch-qwen35/src/speculative.rs:2384` | D3b — `pipeline_mode: bool` branch in `spec_step_dflash`; snapshot-head, async scatter, cross-stream events |
-| `crates/hipfire-arch-qwen35/src/speculative.rs` (top) | D4 — rolling-τ helper, per-class baseline cache, bypass state |
-| `crates/hipfire-runtime/examples/dflash_spec_demo.rs` | D1–D5 — thread env-flag to scratch alloc + step selection |
-| `crates/hipfire-runtime/examples/daemon.rs` | D1–D5 — same threading; daemon path also calls `spec_step_dflash` (line 1717) and was missed in v1 touch list |
+| `crates/engine/src/dflash.rs:304-393` | D2 — `DflashScratchPair` struct (gated env=1 alloc, drop_unused_half, draft_lm_head buffers) + ctor |
+| `crates/engine/src/speculative.rs` (verify_dflash_block_inner) | D3a — `skip_internal_commit: bool` parameter |
+| `crates/engine/src/speculative.rs:2384` | D3b — `pipeline_mode: bool` branch in `spec_step_dflash`; snapshot-head, async scatter, cross-stream events |
+| `crates/engine/src/speculative.rs` (top) | D4 — rolling-τ helper, per-class baseline cache, bypass state |
+| `crates/engine/examples/dflash_spec_demo.rs` | D1–D5 — thread env-flag to scratch alloc + step selection |
+| `crates/engine/examples/daemon.rs` | D1–D5 — same threading; daemon path also calls `spec_step_dflash` (line 1717) and was missed in v1 touch list |
 | `crates/hip-bridge/src/ffi.rs` | (none — APIs already exposed) |
 | `docs/methodology/perf-benchmarking.md` | D5 — bench-matrix results, baseline update, bandwidth-contention finding |
 

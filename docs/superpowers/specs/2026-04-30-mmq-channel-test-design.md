@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-30
 **Ref:** Kaden-Schutt/hipfire#87 (auto-MMQ regression on tool-call output, gfx1151)
-**Deliverable:** `crates/hipfire-runtime/examples/channel_test_mmq.rs`
+**Deliverable:** `crates/engine/examples/channel_test_mmq.rs`
 
 ## Problem
 
@@ -182,7 +182,7 @@ Layer | MaxErr   | MeanErr  | >Thresh
 
 ## Implementation plan
 
-### Single file: `crates/hipfire-runtime/examples/channel_test_mmq.rs`
+### Single file: `crates/engine/examples/channel_test_mmq.rs`
 
 Estimated ~350-450 lines. Structure:
 

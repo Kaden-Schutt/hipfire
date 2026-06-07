@@ -510,7 +510,7 @@ final streaming chunk before `[DONE]`.
 |---|---|
 | `engine/src/image.rs` | Add `load_and_preprocess_from_bytes()` with `Result` return; extract shared `preprocess_dynamic_image(DynamicImage, ...)` helper; add dimension ceiling check; add format-specific error messages |
 | `engine/Cargo.toml` | Add `base64 = "0.22"` dependency |
-| `crates/hipfire-runtime/examples/daemon.rs` | Parse `image_base64` in generate dispatch; refactor `generate_vl` to take `GenerateVLParams` struct with `ImageSource` enum; decode base64 + from-bytes path; move capacity guard below preprocess; fix log line for bytes path; error on `image` + non-VL model (was silent-ignore) |
+| `crates/engine/examples/daemon.rs` | Parse `image_base64` in generate dispatch; refactor `generate_vl` to take `GenerateVLParams` struct with `ImageSource` enum; decode base64 + from-bytes path; move capacity guard below preprocess; fix log line for bytes path; error on `image` + non-VL model (was silent-ignore) |
 | `cli/index.ts` | Add `extractContent()` (keep `extractText` as wrapper); MIME validation on `data:` URIs; multi-turn VL rejection (400); multi-image rejection (400); track `modelHasVL` at 3 write sites; add `image_base64` to `genParams`; remove both image guards (787 + 1123); bump `requiredMaxSeq` for visual tokens; map daemon errors to HTTP status codes |
 
 ---

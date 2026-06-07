@@ -36,9 +36,15 @@ fn main() {
     eprintln!("text bytes: {}", text.len());
     eprintln!("token count: {}", ids.len());
     let mut counts = std::collections::HashMap::<u32, usize>::new();
-    for id in &ids { *counts.entry(*id).or_insert(0) += 1; }
+    for id in &ids {
+        *counts.entry(*id).or_insert(0) += 1;
+    }
     let nl_ids = [198u32, 271, 1358];
     eprintln!("newline-id counts:");
-    for nl in nl_ids { eprintln!("  id {:>5}: {}", nl, counts.get(&nl).copied().unwrap_or(0)); }
-    for id in ids { println!("{id}"); }
+    for nl in nl_ids {
+        eprintln!("  id {:>5}: {}", nl, counts.get(&nl).copied().unwrap_or(0));
+    }
+    for id in ids {
+        println!("{id}");
+    }
 }

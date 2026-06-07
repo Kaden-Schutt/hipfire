@@ -82,10 +82,8 @@ Profiling:
 
 Result output:
 
-- Default output directory when run from the repo:
-  `benchmarks/results/eval/<utc>-<model-stem>-<tier>/`.
-- Default output directory outside the repo:
-  `~/.hipfire/eval/results/<utc>-<model-stem>-<tier>/`.
+- Default output directory:
+  `~/.hipfire/eval-results/runs/<utc>-<model-stem>-<tier>/`.
 - Write `manifest.json`, `results.jsonl`, `summary.md`, and optional
   `artifacts/`.
 - Every prompt used by scored batteries must have a recorded hash; canonical

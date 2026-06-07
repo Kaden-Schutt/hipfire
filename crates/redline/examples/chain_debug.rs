@@ -17,14 +17,14 @@ fn main() {
     let ib = dev.alloc_vram(4096).unwrap();
     // Build PM4: just RELEASE_MEM writing 0xDEAD to fence
     let pm4: Vec<u32> = vec![
-        0xC0064900,         // PACKET3(RELEASE_MEM, 6) — NO SHADER_TYPE
-        0x06603514,         // DW1: event + GCR
-        0x20000000,         // DW2: DATA_SEL(1)
-        fence.gpu_addr as u32,  // DW3: addr lo
+        0xC0064900,                    // PACKET3(RELEASE_MEM, 6) — NO SHADER_TYPE
+        0x06603514,                    // DW1: event + GCR
+        0x20000000,                    // DW2: DATA_SEL(1)
+        fence.gpu_addr as u32,         // DW3: addr lo
         (fence.gpu_addr >> 32) as u32, // DW4: addr hi
-        0x0000DEAD,         // DW5: fence value
-        0,                  // DW6: 0
-        0,                  // DW7: 0
+        0x0000DEAD,                    // DW5: fence value
+        0,                             // DW6: 0
+        0,                             // DW7: 0
     ];
     let ib_bytes: Vec<u8> = pm4.iter().flat_map(|d| d.to_le_bytes()).collect();
     dev.upload(&ib, &ib_bytes).unwrap();
@@ -35,7 +35,11 @@ fn main() {
             let mut fb = vec![0u8; 4];
             dev.download(&fence, &mut fb).unwrap();
             let val = u32::from_le_bytes([fb[0], fb[1], fb[2], fb[3]]);
-            eprintln!("  fence=0x{:x} (expect 0xDEAD) — {}", val, if val == 0xDEAD { "OK" } else { "FAIL" });
+            eprintln!(
+                "  fence=0x{:x} (expect 0xDEAD) — {}",
+                val,
+                if val == 0xDEAD { "OK" } else { "FAIL" }
+            );
         }
         Err(e) => eprintln!("  FAIL: {e}"),
     }
@@ -45,16 +49,22 @@ fn main() {
     dev.upload(&fence, &vec![0u8; 64]).unwrap();
     let pm4_2: Vec<u32> = vec![
         // RELEASE_MEM
-        0xC0064900, 0x06603514, 0x20000000,
-        fence.gpu_addr as u32, (fence.gpu_addr >> 32) as u32,
-        1, 0, 0,  // fence value = 1
+        0xC0064900,
+        0x06603514,
+        0x20000000,
+        fence.gpu_addr as u32,
+        (fence.gpu_addr >> 32) as u32,
+        1,
+        0,
+        0, // fence value = 1
         // WAIT_REG_MEM
-        0xC0053C00,  // PACKET3(WAIT_REG_MEM, 5) — NO SHADER_TYPE
-        0x00000013,  // MEM_SPACE=1(mem) | FUNCTION=3(equal)
-        fence.gpu_addr as u32, (fence.gpu_addr >> 32) as u32,
-        1,           // reference = 1
-        0xFFFFFFFF,  // mask
-        4,           // poll interval
+        0xC0053C00, // PACKET3(WAIT_REG_MEM, 5) — NO SHADER_TYPE
+        0x00000013, // MEM_SPACE=1(mem) | FUNCTION=3(equal)
+        fence.gpu_addr as u32,
+        (fence.gpu_addr >> 32) as u32,
+        1,          // reference = 1
+        0xFFFFFFFF, // mask
+        4,          // poll interval
     ];
     let ib_bytes_2: Vec<u8> = pm4_2.iter().flat_map(|d| d.to_le_bytes()).collect();
     dev.upload(&ib, &ib_bytes_2).unwrap();
@@ -68,8 +78,16 @@ fn main() {
     let hip_src = "#include <hip/hip_runtime.h>\nextern \"C\" __launch_bounds__(256)\n__global__ void vector_add(const float* a, const float* b, float* c, int n) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i < n) c[i] = a[i] + b[i];\n}\n";
     std::fs::write("/tmp/redline_chain.hip", hip_src).unwrap();
     let out = std::process::Command::new("hipcc")
-        .args(["--genco", "--offload-arch=gfx1010", "-O3", "-o", "/tmp/redline_chain.hsaco", "/tmp/redline_chain.hip"])
-        .output().expect("hipcc");
+        .args([
+            "--genco",
+            "--offload-arch=gfx1010",
+            "-O3",
+            "-o",
+            "/tmp/redline_chain.hsaco",
+            "/tmp/redline_chain.hip",
+        ])
+        .output()
+        .expect("hipcc");
     assert!(out.status.success());
     let module = dev.load_module_file("/tmp/redline_chain.hsaco").unwrap();
     let kernel = Kernel::find(&module, "vector_add").unwrap();
@@ -117,8 +135,14 @@ fn main() {
         Ok(()) => {
             let c_val = rf32(&dev, &c);
             let e_val = rf32(&dev, &e);
-            let wrong = e_val[..n as usize].iter().filter(|&&v| (v - 13.0).abs() > 0.001).count();
-            eprintln!("  c[0]={} e[0]={} e[255]={} wrong={}/{}", c_val[0], e_val[0], e_val[255], wrong, n);
+            let wrong = e_val[..n as usize]
+                .iter()
+                .filter(|&&v| (v - 13.0).abs() > 0.001)
+                .count();
+            eprintln!(
+                "  c[0]={} e[0]={} e[255]={} wrong={}/{}",
+                c_val[0], e_val[0], e_val[255], wrong, n
+            );
             if wrong == 0 {
                 eprintln!("\n=== CHAINED DISPATCH WITH BARRIER: ALL CORRECT ===");
             }
@@ -128,17 +152,21 @@ fn main() {
     fd.destroy(&dev);
 }
 
-fn f32_bytes(v: &[f32]) -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() }
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
 fn wh(d: &mut [u8], off: usize, groups: u32, block: u16) {
-    d[off..off+4].copy_from_slice(&groups.to_le_bytes());
-    d[off+4..off+8].copy_from_slice(&1u32.to_le_bytes());
-    d[off+8..off+12].copy_from_slice(&1u32.to_le_bytes());
-    d[off+12..off+14].copy_from_slice(&block.to_le_bytes());
-    d[off+14..off+16].copy_from_slice(&1u16.to_le_bytes());
-    d[off+16..off+18].copy_from_slice(&1u16.to_le_bytes());
+    d[off..off + 4].copy_from_slice(&groups.to_le_bytes());
+    d[off + 4..off + 8].copy_from_slice(&1u32.to_le_bytes());
+    d[off + 8..off + 12].copy_from_slice(&1u32.to_le_bytes());
+    d[off + 12..off + 14].copy_from_slice(&block.to_le_bytes());
+    d[off + 14..off + 16].copy_from_slice(&1u16.to_le_bytes());
+    d[off + 16..off + 18].copy_from_slice(&1u16.to_le_bytes());
 }
 fn rf32(dev: &Device, buf: &redline::device::GpuBuffer) -> Vec<f32> {
     let mut r = vec![0u8; buf.size as usize];
     dev.download(buf, &mut r).unwrap();
-    r.chunks(4).map(|c| f32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect()
+    r.chunks(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }

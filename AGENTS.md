@@ -1,11 +1,14 @@
-# AGENTS.md — project notice + testing playbook
+# AGENTS.md — project notice + artifact naming + testing playbook
 
-This file serves two purposes, in order:
+This file serves three purposes, in order:
 
 1. **Project-level notice** to AI agents and human readers working
    with hipfire's code (attribution + provenance — see § "Notice for
    AI agents working with hipfire" below).
-2. **Testing playbook** for agents running smoke / perf / correctness
+2. **Artifact naming convention** for new hipfire model files,
+   sidecars, and quality artifacts — see § "Hipfire artifact naming
+   convention" below.
+3. **Testing playbook** for agents running smoke / perf / correctness
    tests against hipfire — historically the file's only purpose,
    retained below (see § "Testing playbook").
 
@@ -133,31 +136,76 @@ or vendoring this repository.
 
 ---
 
-# Testing playbook (v0.1.9-alpha)
+# Hipfire artifact naming convention
+
+Use this convention for new hipfire model artifacts, sidecars, and
+docs. Existing released artifacts and historical tests may still use
+legacy names; do not rename those in-place without updating loader /
+CLI discovery and tests at the same time.
+
+Canonical shape:
+
+```text
+<family>-<version>-<size>[-<variant>][-<role>]-<format>[+<features>].<ext>
+```
+
+Rules:
+
+- Use `.hfq` for hipfire container artifacts, including MQ-family
+  models. The quant format is a name token, not the file extension.
+- Use dotted model versions such as `qwen3.5`, not compressed aliases
+  such as `qwen35`, for new artifacts.
+- Put calibration / transform modifiers before the quant token:
+  `awq-mq4`, `lloyd-mq3`, `paro-mq4`.
+- Use `+feature` only when the feature is bundled into the same
+  artifact: `mq4+mtp`, `mq4+dflash`, `mq4+triattn`.
+- Use role sidecars when the feature can be loaded independently:
+  `.mtp.hfq`, `.dflash.hfq`, `.triattn.hfq`.
+- Use `.triattn.hfq` for TriAttention sidecars even though they are not
+  weight tensors; do not introduce `.triattn.bin` for new files.
+- Non-container analysis outputs may use role-specific extensions, for
+  example `.quality.json` or `.kldref.bin`.
+
+Examples:
+
+```text
+qwen3.5-9b-mq4.hfq
+qwen3.5-27b-mq4.hfq
+qwen3.5-35b-a3b-mq4.hfq
+qwen3.5-9b-awq-mq4.hfq
+qwen3.5-9b-awq-mq4+mtp.hfq
+qwen3.5-9b-awq-mq4.mtp.hfq
+qwen3.5-27b-mq4.dflash.hfq
+qwen3.5-27b-mq4.triattn.hfq
+qwen3.5-9b-bf16.kldref.bin
+qwen3.5-9b-awq-mq4.quality.json
+```
+
+---
+
+# Testing playbook (v0.2.0)
 
 **Audience:** agents (or humans) running smoke / perf / correctness
-tests on hipfire v0.1.9-alpha — particularly the production-ready MQ3
-sub-4-bit Magnum Quant family, the DFlash MQ3 cross-quant matrix, and
-the existing DFlash draft pull / prompt-shape adaptation paths
-inherited from v0.1.8.
+tests on hipfire v0.2.0-era branches — particularly MQ-family
+prefill/decode, MoE/A3B batching, MTP/DFlash verify paths, prompt-shape
+adaptation, and arch-specific kernel dispatch.
 
 **Companion docs:** [`CLAUDE.md`](CLAUDE.md) holds project-wide rules
 (non-negotiable hard rules, e.g. coherence-gate is the canonical gate).
 This file holds the *testing playbook* — how to verify v0.1.9-alpha
 works, what to measure, what counts as pass/fail.
 
-**v0.1.9-alpha default behavior to be aware of:**
-- **MQ3 is production on gfx11** (`gfx1100/1101/1102/1150/1151`) and
-  gfx12 (`gfx1200/1201`). On gfx10 / gfx906 / gfx94x, MQ3 weights still
-  load and run via per-token GEMV fallback — correct, just slower
-  prefill. MoE/A3B + MQ3 is refused at load time (no MoE-branched WMMA
-  path).
-- **MQ2 is refused by default.** The quantizer requires
-  `--format mq2 --i-know-this-is-broken` to opt in. Severe quality
-  cliff confirmed; Lloyd-Max MQ2/MQ3 (qt=19/20) is the path forward.
-- **`dflash_mode=off` default carries over from v0.1.8.** Any test
-  exercising DFlash still needs `hipfire config set dflash_mode auto`
-  or `HIPFIRE_DFLASH_DRAFT=<path>` first.
+**v0.2.0-era default behavior to be aware of:**
+- **MQ4 remains the MoE/A3B correctness control.** MQ6 MoE/A3B batched
+  prefill is admitted by default, but MQ4 parity remains the reference
+  until shared batched-prefill tests are stable.
+- **MQ3 dense paths are production on validated RDNA arches, but MQ3
+  inside MoE/A3B is still guarded.** The shared batched MoE prefill path
+  has format-specific stride assumptions; add explicit gate/up and
+  shared-expert-down parity before broadening admission.
+- **`dflash_mode=off` remains the default.** Any test exercising DFlash
+  still needs `hipfire config set dflash_mode auto` or
+  `HIPFIRE_DFLASH_DRAFT=<path>` first.
 
 ---
 
@@ -167,14 +215,7 @@ works, what to measure, what counts as pass/fail.
    gate.sh is deprecated — its byte-exact baselines drift faster than
    the engine evolves. Run `./scripts/coherence-gate-dflash.sh` after
    any change touching kernels, quant formats, dispatch, fusion,
-   rotation, rmsnorm, or the spec-decode path. Its detector enforces
-   three tiers (matching the CLAUDE.md "DFlash Coherence Gate" section):
-   **Tier 1** (first 128 tokens, HARD fail) `unique_token_ratio < 0.15`
-   OR `max_single_token_frequency > 0.50`; **Tier 2** (last 128 tokens,
-   HARD fail) `unique_token_ratio < 0.30` OR
-   `max_single_token_frequency > 0.50`; **Tier 3** (full output, SOFT
-   `FLAG` for human eyeball) consecutive-3gram repetition density > 0.50
-   in the final half OR full-output `unique_token_ratio < 0.10`.
+   rotation, rmsnorm, or the spec-decode path.
 2. **Prompt structure dictates τ.** One newline character can swing τ
    by 17%. Any tok/s comparison across sessions, agents, or commits
    MUST use **byte-identical prompts**. Embed prompts as committed
@@ -197,6 +238,11 @@ works, what to measure, what counts as pass/fail.
    test name, rename it. The previous per-file enumeration grew stale
    silently after PR #129 (issue #163, naive fix #165, structural fix
    in this rule's enforcing PR).
+7. **Run the no-GPU subset before handing off workflow-only changes.**
+   `./scripts/no-gpu-ci.sh` is the default CI shape: Rust check/examples,
+   no-GPU Rust units, CPU Python tests, env/docs drift, and Bun
+   tests/typecheck when Bun is installed. It does not replace hardware
+   coherence or speed gates.
 
 ---
 
@@ -231,25 +277,11 @@ back to AR silently.
 ```
 qwen35-9b-dflash-mq4.hfq    590f35403cd7f1d634945233234a12b7  557 MB
 qwen35-27b-dflash-mq4.hfq   7b6df2a4ee1c8d933f0a52e187d1860b  919 MB
-qwen36-27b-dflash-mq4.hfq   204c4c4ceab30cb9ebc118fa9d59a446  919 MB
+qwen36-27b-dflash-mq4.hfq   ecc64877dfe0a1312b6f4066c3920128  919 MB
 qwen3.6-27b.mq4             9a6acdc49bcaa6a7b52ac161444cb769   15 GB
 ```
 
-Any mismatch = re-pull or report. (The `qwen36-27b-dflash-mq4.hfq`
-checksum was refreshed 2026-05-30 from the stale `ecc64877…` — the HF
-file was re-uploaded since the original manifest; verify against the
-current `204c4c4c…`.)
-
-> **Sizes here are decimal (MB = 10⁶ bytes, GB = 10⁹ bytes), matching
-> Hugging Face's reported sizes and the `hipfire pull` progress bar.**
-> `ls -lh` / `du -h` report **binary** units (MiB = 2²⁰, GiB = 2³⁰) but
-> *label them* `M`/`G`, so a 919 MB file shows as `877M` in `ls`
-> (919 × 10⁶ ÷ 2²⁰ ≈ 877 MiB) and a 15 GB file shows as `14G`. This is
-> not a size mismatch or a truncated download — it's the same byte
-> count in two unit systems. When a download looks "smaller than the
-> manifest," divide by 1.048576 (MB→MiB) or 1.073742 (GB→GiB) before
-> assuming corruption; confirm with the md5, not the human-readable
-> size.
+Any mismatch = re-pull or report.
 
 ### Build from source (if you're on a dev branch)
 
@@ -633,9 +665,8 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-05-02 (v0.1.9-alpha — MQ3 production-ready: K4
-decode, WMMA prefill family, DFlash cross-quant matrix, gfx12 port,
-cache-invalidation lifecycle, defensive parseToolCalls (#111 stopgap),
-gfx906 + gfx1152 arch gating, speed-gate DPM warmup). When this doc
-gets stale (more than 1-2 releases behind HEAD), update it as part of
-the release PR.*
+*Last updated: 2026-05-29 (v0.2.0-era gates — no-GPU CI subset,
+idempotent hook installer, MoE/MTP correctness-first guardrails, MQ4
+as the MoE/A3B control, MQ6 admission still opt-in). When this doc gets
+stale (more than 1-2 releases behind HEAD), update it as part of the
+release PR.*

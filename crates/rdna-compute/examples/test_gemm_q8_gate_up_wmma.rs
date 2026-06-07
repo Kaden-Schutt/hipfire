@@ -16,7 +16,8 @@ fn main() {
     let arch = gpu.arch.clone();
     eprintln!("=== test_gemm_q8_gate_up_wmma ===\n  arch = {arch}");
     if !arch.starts_with("gfx11") && !arch.starts_with("gfx12") {
-        eprintln!("  SKIPPED: needs gfx11/12, got {arch}"); std::process::exit(0);
+        eprintln!("  SKIPPED: needs gfx11/12, got {arch}");
+        std::process::exit(0);
     }
 
     // (gate_m, up_m, K, label) — gate_m == up_m for Qwen3.5.
@@ -54,16 +55,26 @@ fn main() {
             let ur = d_yu_r.sub_offset(0, n * up_m);
 
             if arch.starts_with("gfx12") {
-                gpu.gemm_gate_up_q8_0_wmma_gfx12(&d_g, &d_u, &x_n, &gw, &uw, gate_m, up_m, k, n).unwrap();
+                gpu.gemm_gate_up_q8_0_wmma_gfx12(&d_g, &d_u, &x_n, &gw, &uw, gate_m, up_m, k, n)
+                    .unwrap();
             } else {
-                gpu.gemm_gate_up_q8_0_wmma(&d_g, &d_u, &x_n, &gw, &uw, gate_m, up_m, k, n).unwrap();
+                gpu.gemm_gate_up_q8_0_wmma(&d_g, &d_u, &x_n, &gw, &uw, gate_m, up_m, k, n)
+                    .unwrap();
             }
-            gpu.gemm_q8_0_batched_chunked(&d_g, &x_n, &gr, gate_m, k, n).unwrap();
-            gpu.gemm_q8_0_batched_chunked(&d_u, &x_n, &ur, up_m, k, n).unwrap();
+            gpu.gemm_q8_0_batched_chunked(&d_g, &x_n, &gr, gate_m, k, n)
+                .unwrap();
+            gpu.gemm_q8_0_batched_chunked(&d_u, &x_n, &ur, up_m, k, n)
+                .unwrap();
 
             let s = [
-                compare(&gpu.download_f32(&gw).unwrap(), &gpu.download_f32(&gr).unwrap()),
-                compare(&gpu.download_f32(&uw).unwrap(), &gpu.download_f32(&ur).unwrap()),
+                compare(
+                    &gpu.download_f32(&gw).unwrap(),
+                    &gpu.download_f32(&gr).unwrap(),
+                ),
+                compare(
+                    &gpu.download_f32(&uw).unwrap(),
+                    &gpu.download_f32(&ur).unwrap(),
+                ),
             ];
             // Threshold tightened 2026-05-13 from max_rel < 5e-2 → 3.5e-2.
             // Production 9B sweep tops at 1.98e-2; small synthetic shapes
@@ -72,7 +83,12 @@ fn main() {
             // 3.5e-2 keeps a ~30% margin above the synthetic worst case
             // while still being 30% tighter than the original 5e-2 bound.
             let pass = s.iter().all(|x| x.mean_rel < 2e-3 && x.max_rel < 3.5e-2);
-            let mark = if pass { "PASS" } else { total_fail += 1; "FAIL" };
+            let mark = if pass {
+                "PASS"
+            } else {
+                total_fail += 1;
+                "FAIL"
+            };
             eprintln!(
                 "  N={n:4}  {mark}   gate: mean={:.2e}/max={:.2e}  up: {:.2e}/{:.2e}",
                 s[0].mean_rel, s[0].max_rel, s[1].mean_rel, s[1].max_rel,
@@ -84,7 +100,10 @@ fn main() {
 }
 
 // (helpers identical to test_gemm_q8_qkvza_wmma.rs)
-struct Stats { mean_rel: f64, max_rel: f64 }
+struct Stats {
+    mean_rel: f64,
+    max_rel: f64,
+}
 fn compare(a: &[f32], b: &[f32]) -> Stats {
     let max_ref = b.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
     let thr = max_ref * 0.01;
@@ -92,10 +111,17 @@ fn compare(a: &[f32], b: &[f32]) -> Stats {
     for (x, y) in a.iter().zip(b.iter()) {
         if y.abs() > thr {
             let r = ((x - y).abs() / y.abs()) as f64;
-            sum += r; if r > max_r { max_r = r; } n += 1;
+            sum += r;
+            if r > max_r {
+                max_r = r;
+            }
+            n += 1;
         }
     }
-    Stats { mean_rel: if n == 0 { 0.0 } else { sum / n as f64 }, max_rel: max_r }
+    Stats {
+        mean_rel: if n == 0 { 0.0 } else { sum / n as f64 },
+        max_rel: max_r,
+    }
 }
 fn synth_x(i: usize) -> f32 {
     let v = ((i as i64).wrapping_mul(1103515245).wrapping_add(12345)) as f32;

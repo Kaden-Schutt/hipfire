@@ -177,6 +177,44 @@ class AstreaTests(unittest.TestCase):
             buf += payload
         path.write_bytes(buf)
 
+    def write_g256_imatrix_gguf(self, path, logical_name, group_scores):
+        def gguf_string(text):
+            raw = text.encode("utf-8")
+            return struct.pack("<Q", len(raw)) + raw
+
+        k = 256 * len(group_scores)
+        names = [f"{logical_name}.in_sum2", f"{logical_name}.counts"]
+        values = []
+        for score in group_scores:
+            values.extend([float(score)] * 256)
+        payloads = [
+            b"".join(struct.pack("<f", value) for value in values),
+            struct.pack("<f", 1.0),
+        ]
+        offsets = [0, len(payloads[0])]
+
+        buf = bytearray()
+        buf += b"GGUF"
+        buf += struct.pack("<I", 3)
+        buf += struct.pack("<Q", len(names))
+        buf += struct.pack("<Q", 1)
+        buf += gguf_string("general.alignment")
+        buf += struct.pack("<I", 4)
+        buf += struct.pack("<I", 32)
+        for name, offset in zip(names, offsets):
+            shape = [k] if name.endswith(".in_sum2") else [1]
+            buf += gguf_string(name)
+            buf += struct.pack("<I", len(shape))
+            for dim in shape:
+                buf += struct.pack("<Q", dim)
+            buf += struct.pack("<I", 0)
+            buf += struct.pack("<Q", offset)
+        pad = (-len(buf)) % 32
+        buf += b"\0" * pad
+        for payload in payloads:
+            buf += payload
+        path.write_bytes(buf)
+
     def write_expert_imatrix_gguf(self, path, logical_name, k, n_experts):
         def gguf_string(text):
             raw = text.encode("utf-8")
@@ -275,6 +313,34 @@ class AstreaTests(unittest.TestCase):
             "model.language_model.layers.0.mlp.gate_proj.weight",
         )
         self.assertEqual(result["tensors"][0]["data_offset"], result["data_offset"])
+
+    def test_summarize_hfq_names_current_mq_container_qtypes(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            model = Path(td) / "synthetic-mq-family.hfq"
+            self.write_minimal_hfq(
+                model,
+                tensors=[
+                    ("layers.0.mlp.gate_proj.weight", 15, [1, 256], 256, 200),
+                    ("layers.0.mlp.up_proj.weight", 30, [1, 256], 256, 160),
+                    ("layers.0.mlp.down_proj.weight", 19, [1, 256], 256, 96),
+                ],
+            )
+
+            result = astrea.summarize_hfq(model)
+
+        self.assertEqual(
+            result["quant_type_counts"],
+            {
+                "MQ2G256_LLOYD": 1,
+                "MQ4G256_LLOYD": 1,
+                "MQ6G256": 1,
+            },
+        )
+        by_name = {tensor["name"]: tensor for tensor in result["tensors"]}
+        self.assertEqual(by_name["layers.0.mlp.gate_proj.weight"]["quant_type_name"], "MQ6G256")
+        self.assertEqual(by_name["layers.0.mlp.up_proj.weight"]["quant_type_name"], "MQ4G256_LLOYD")
+        self.assertEqual(by_name["layers.0.mlp.down_proj.weight"]["quant_type_name"], "MQ2G256_LLOYD")
 
     def test_match_imatrix_to_hfq_tensors_uses_qwen35_name_aliases(self):
         astrea = load_astrea()
@@ -707,7 +773,7 @@ class AstreaTests(unittest.TestCase):
             root = Path(td)
             source_dir = root / "source"
             source_dir.mkdir()
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             candidate = root / "synthetic.ls.mq4.hfq"
             imatrix = root / "imatrix.gguf"
             plan_path = root / "plan.json"
@@ -766,7 +832,7 @@ class AstreaTests(unittest.TestCase):
             root = Path(td)
             source_dir = root / "source"
             source_dir.mkdir()
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             candidate = root / "synthetic.awq.mq4.hfq"
             imatrix = root / "imatrix.gguf"
             plan_path = root / "plan.json"
@@ -925,6 +991,99 @@ class AstreaTests(unittest.TestCase):
         })
         self.assertTrue(selected["sensitivity_alias"])
         self.assertEqual(selected["extra_bytes"], 136)
+
+    def test_mixed_policy_emits_g256_segments_from_imatrix(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "synthetic.mq4.hfq"
+            imatrix = root / "imatrix.gguf"
+            tensor_name = "model.language_model.layers.0.mlp.gate_proj.weight"
+            self.write_minimal_hfq(
+                model,
+                tensors=[(tensor_name, 13, [2, 768], 256, 816)],
+            )
+            self.write_g256_imatrix_gguf(imatrix, "blk.0.ffn_gate.weight", [1.0, 10.0, 100.0])
+
+            policy = astrea.build_mixed_policy(
+                model=str(model),
+                imatrix=str(imatrix),
+                target_arch="gfx1151",
+                policy_id="mixed-g256-smoke",
+            )
+
+        self.assertEqual(policy["schema"], "hipfire.astrea.mixed_policy.v0")
+        self.assertEqual(policy["policy_id"], "mixed-g256-smoke")
+        self.assertEqual(policy["granularity"]["mode"], "g256")
+        self.assertEqual(policy["formats"], ["mq3", "mq4", "mq6"])
+        self.assertFalse(policy["selection"]["uses_wave_size_as_quality_signal"])
+        self.assertEqual(policy["writer_contract"]["container_quant_type"], "MQMIXG256")
+        tensor = policy["tensors"][0]
+        self.assertEqual(tensor["groups_per_row"], 3)
+        self.assertEqual(
+            [segment["quant_format"] for segment in tensor["segments"]],
+            ["mq3", "mq4", "mq6"],
+        )
+        self.assertEqual([segment["payload_len"] for segment in tensor["segments"]], [208, 272, 400])
+
+    def test_mixed_policy_coalesces_adjacent_equal_format_groups(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "synthetic.mq4.hfq"
+            sensitivity = root / "groups.json"
+            tensor_name = "model.language_model.layers.0.mlp.up_proj.weight"
+            self.write_minimal_hfq(
+                model,
+                tensors=[(tensor_name, 13, [1, 1280], 256, 680)],
+            )
+            sensitivity.write_text(
+                json.dumps(
+                    {
+                        "groups": [
+                            {"name": tensor_name, "k_group": 0, "score": 1.0},
+                            {"name": tensor_name, "k_group": 1, "score": 1.0},
+                            {"name": tensor_name, "k_group": 2, "score": 10.0},
+                            {"name": tensor_name, "k_group": 3, "score": 10.0},
+                            {"name": tensor_name, "k_group": 4, "score": 100.0},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            policy = astrea.build_mixed_policy(
+                model=str(model),
+                sensitivity_json=str(sensitivity),
+            )
+
+        segments = policy["tensors"][0]["segments"]
+        self.assertEqual(
+            [(s["k_group_start"], s["group_count"], s["quant_format"]) for s in segments],
+            [(0, 2, "mq3"), (2, 2, "mq4"), (4, 1, "mq6")],
+        )
+
+    def test_mixed_policy_mq2_requires_research_opt_in(self):
+        astrea = load_astrea()
+        with self.assertRaisesRegex(ValueError, "allow-mq2"):
+            astrea.normalize_mixed_g256_formats(["mq2", "mq3"], allow_mq2=False)
+        self.assertEqual(
+            astrea.normalize_mixed_g256_formats(["mq2", "mq3"], allow_mq2=True),
+            ["mq2", "mq3"],
+        )
+
+    def test_mixed_policy_refuses_lloyd_formats_in_v1(self):
+        astrea = load_astrea()
+        with self.assertRaisesRegex(ValueError, "refuses them"):
+            astrea.normalize_mixed_g256_formats(["mq3", "mq3-lloyd"], allow_mq2=False)
+
+    def test_mixed_policy_awq_eligibility_is_mq3_mq4_only(self):
+        astrea = load_astrea()
+        name = "model.language_model.layers.0.mlp.gate_proj.weight"
+        self.assertFalse(astrea.mixed_g256_awq_eligible("mq2", name))
+        self.assertTrue(astrea.mixed_g256_awq_eligible("mq3", name))
+        self.assertTrue(astrea.mixed_g256_awq_eligible("mq4", name))
+        self.assertFalse(astrea.mixed_g256_awq_eligible("mq6", name))
 
     def test_policy_q8_cost_model_matches_q8_0_storage(self):
         astrea = load_astrea()
@@ -1237,7 +1396,7 @@ class AstreaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             model = root / "synthetic.mq4.hfq"
-            triattn = root / "synthetic.mq4.hfq.triattn.bin"
+            triattn = root / "synthetic-mq4.triattn.hfq"
             self.write_minimal_hfq(model)
             triattn.write_bytes(b"TRIA" + b"\0" * 32)
 
@@ -1264,13 +1423,13 @@ class AstreaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             model = root / "synthetic.mq4.hfq"
-            triattn = root / "synthetic.mq4.hfq.triattn.bin"
+            triattn = root / "synthetic-mq4.triattn.hfq"
             self.write_minimal_hfq(model)
             triattn.write_bytes(b"TRIA" + b"\0" * 32)
 
             plan = astrea.build_bundle_plan(
                 model=str(model),
-                output=str(root / "synthetic.mq4.astrea.hfq"),
+                output=str(root / "synthetic-mq4.astrea.hfq"),
                 include=["weights", "paro", "kv-policy", "triattn"],
                 triattn=str(triattn),
                 policy_id="combined-policy-smoke",
@@ -1282,16 +1441,135 @@ class AstreaTests(unittest.TestCase):
         self.assertFalse(plan["external_sidecars_target"])
         self.assertEqual(plan["container"]["format"], "hfq-package-v0")
         self.assertIn("transform.paro", plan["sections"])
+        paro_boundary = plan["sections"]["transform.paro"]["runtime_env_boundary"]
+        product_env = [item["name"] for item in paro_boundary["productization_candidate"]]
+        self.assertIn("HIPFIRE_PARO_BATCHED", product_env)
+        self.assertIn("HIPFIRE_MOE_PARO_I8", product_env)
+        self.assertIn("HIPFIRE_PARO_GATE_UP_FUSED", paro_boundary["research_only"])
+        self.assertIn("HIPFIRE_PARO_FUSED_PACK2", paro_boundary["research_only"])
+        self.assertIn("oracle", " ".join(paro_boundary["promotion_report_requirements"]))
         self.assertIn("kv.policy", plan["sections"])
         self.assertIn("triattn.centers", plan["sections"])
         self.assertEqual(plan["sections"]["triattn.centers"]["source"]["path"], str(triattn))
         self.assertIn("loader", " ".join(plan["deferred_runtime_work"]))
 
+    def test_cli_paro_commands_delegate_to_import_and_oracle_contracts(self):
+        astrea = load_astrea()
+        calls = []
+
+        class ImportStub:
+            @staticmethod
+            def probe_model(model, *, local_only=False, max_modules=None):
+                calls.append(("probe", model, local_only, max_modules))
+                return {
+                    "schema": astrea.PARO_PROBE_SCHEMA,
+                    "model": model,
+                    "local_only": local_only,
+                    "max_modules": max_modules,
+                }
+
+            @staticmethod
+            def import_model(
+                model,
+                output,
+                *,
+                local_only=False,
+                max_modules=None,
+                layout="native",
+                copy_floats="f16",
+            ):
+                calls.append(("import", model, output, local_only, max_modules, layout, copy_floats))
+                return {
+                    "schema": astrea.PARO_IMPORT_SCHEMA,
+                    "model": model,
+                    "output": output,
+                    "layout": layout,
+                    "copy_floats": copy_floats,
+                }
+
+        class OracleStub:
+            @staticmethod
+            def run_oracle(args):
+                calls.append(("oracle", vars(args)))
+                return {
+                    "schema": "hipfire.astrea.paro_oracle.v0",
+                    "source": args.source,
+                    "hfq": args.hfq,
+                    "module": args.module,
+                    "samples": args.samples,
+                    "seed": args.seed,
+                    "input_scale": args.input_scale,
+                    "atol": args.atol,
+                }
+
+        astrea.load_paroquant_import_module = lambda: ImportStub
+        astrea.load_paroquant_oracle_module = lambda: OracleStub
+
+        code, stdout, stderr = astrea.main_for_test(
+            ["paro-probe", "--model", "/tmp/paro-src", "--local-only", "--max-modules", "2"]
+        )
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["schema"], astrea.PARO_PROBE_SCHEMA)
+        self.assertEqual(calls[-1], ("probe", "/tmp/paro-src", True, 2))
+
+        code, stdout, stderr = astrea.main_for_test(
+            [
+                "paro-import",
+                "--model",
+                "/tmp/paro-src",
+                "--output",
+                "/tmp/out.hfq",
+                "--local-only",
+                "--max-modules",
+                "3",
+                "--layout",
+                "engine",
+                "--copy-floats",
+                "q8",
+            ]
+        )
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["schema"], astrea.PARO_IMPORT_SCHEMA)
+        self.assertEqual(payload["layout"], "engine")
+        self.assertEqual(calls[-1], ("import", "/tmp/paro-src", "/tmp/out.hfq", True, 3, "engine", "q8"))
+
+        code, stdout, stderr = astrea.main_for_test(
+            [
+                "paro-oracle",
+                "--source",
+                "/tmp/paro-src",
+                "--hfq",
+                "/tmp/out.hfq",
+                "--module",
+                "model.layers.0.mlp.gate_proj",
+                "--local-only",
+                "--samples",
+                "4",
+                "--seed",
+                "7",
+                "--input-scale",
+                "0.25",
+                "--atol",
+                "0.001",
+            ]
+        )
+        self.assertEqual(code, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertEqual(payload["schema"], "hipfire.astrea.paro_oracle.v0")
+        self.assertEqual(payload["module"], "model.layers.0.mlp.gate_proj")
+        oracle_call = calls[-1]
+        self.assertEqual(oracle_call[0], "oracle")
+        self.assertTrue(oracle_call[1]["local_only"])
+        self.assertEqual(oracle_call[1]["samples"], 4)
+        self.assertEqual(oracle_call[1]["seed"], 7)
+
     def test_cli_policy_emits_json(self):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             sensitivity = root / "sensitivity.json"
             self.write_minimal_hfq(
                 model,
@@ -1343,7 +1621,7 @@ class AstreaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             model = root / "synthetic.mq4.hfq"
-            triattn = root / "synthetic.mq4.hfq.triattn.bin"
+            triattn = root / "synthetic-mq4.triattn.hfq"
             self.write_minimal_hfq(model)
             triattn.write_bytes(b"TRIA" + b"\0" * 32)
 

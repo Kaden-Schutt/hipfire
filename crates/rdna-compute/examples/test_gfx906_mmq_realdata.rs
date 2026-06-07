@@ -21,16 +21,16 @@
 //! Ours: starts from y_in, runs gemm_hfq4g256_residual_mmq_gfx906, compares
 //! to y_out.
 
-use rdna_compute::{DType, Gpu};
+use rdna_compute::Gpu;
 use std::path::Path;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = args.get(1).map(|s| s.as_str()).unwrap_or("/tmp/mmq_dump_0");
 
-    let shape_str = std::fs::read_to_string(format!("{dir}/shape.txt"))
-        .expect("read shape.txt");
-    let dims: Vec<usize> = shape_str.split_whitespace()
+    let shape_str = std::fs::read_to_string(format!("{dir}/shape.txt")).expect("read shape.txt");
+    let dims: Vec<usize> = shape_str
+        .split_whitespace()
         .filter_map(|s| s.parse().ok())
         .collect();
     assert_eq!(dims.len(), 3, "shape.txt must have 3 numbers");
@@ -43,32 +43,51 @@ fn main() {
 
     let weight_bytes = std::fs::read(format!("{dir}/a_raw.bin")).expect("read a_raw.bin");
     let expected_w_bytes = m * (k / 256) * 136;
-    assert_eq!(weight_bytes.len(), expected_w_bytes,
-        "weight file size mismatch: got {} expected {}", weight_bytes.len(), expected_w_bytes);
+    assert_eq!(
+        weight_bytes.len(),
+        expected_w_bytes,
+        "weight file size mismatch: got {} expected {}",
+        weight_bytes.len(),
+        expected_w_bytes
+    );
 
     let x_host = read_f32(&format!("{dir}/x.f32"), n * k);
     let y_in_host = read_f32(&format!("{dir}/y_in.f32"), n * m);
     let y_ref_host = read_f32(&format!("{dir}/y_out.f32"), n * m);
 
-    eprintln!("x range:    [{:.4e}, {:.4e}]",
+    eprintln!(
+        "x range:    [{:.4e}, {:.4e}]",
         x_host.iter().copied().fold(f32::INFINITY, f32::min),
-        x_host.iter().copied().fold(f32::NEG_INFINITY, f32::max));
-    eprintln!("y_in range: [{:.4e}, {:.4e}]",
+        x_host.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    );
+    eprintln!(
+        "y_in range: [{:.4e}, {:.4e}]",
         y_in_host.iter().copied().fold(f32::INFINITY, f32::min),
-        y_in_host.iter().copied().fold(f32::NEG_INFINITY, f32::max));
-    eprintln!("y_ref range:[{:.4e}, {:.4e}]",
+        y_in_host.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    );
+    eprintln!(
+        "y_ref range:[{:.4e}, {:.4e}]",
         y_ref_host.iter().copied().fold(f32::INFINITY, f32::min),
-        y_ref_host.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+        y_ref_host.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    );
 
     // Spot-check a few weight scale/zp values
     eprintln!("\n--- Weight scale/zp samples (row 0..3, group 0) ---");
     for row in 0..4.min(m) {
         let gp = row * (k / 256) * 136;
-        let scale = f32::from_le_bytes([weight_bytes[gp], weight_bytes[gp+1],
-            weight_bytes[gp+2], weight_bytes[gp+3]]);
-        let zp = f32::from_le_bytes([weight_bytes[gp+4], weight_bytes[gp+5],
-            weight_bytes[gp+6], weight_bytes[gp+7]]);
-        let nibbles_first_byte = weight_bytes[gp+8];
+        let scale = f32::from_le_bytes([
+            weight_bytes[gp],
+            weight_bytes[gp + 1],
+            weight_bytes[gp + 2],
+            weight_bytes[gp + 3],
+        ]);
+        let zp = f32::from_le_bytes([
+            weight_bytes[gp + 4],
+            weight_bytes[gp + 5],
+            weight_bytes[gp + 6],
+            weight_bytes[gp + 7],
+        ]);
+        let nibbles_first_byte = weight_bytes[gp + 8];
         eprintln!("  row {row}: scale={scale:.4e}  zp={zp:.4e}  byte0=0x{nibbles_first_byte:02x}");
     }
 
@@ -79,11 +98,15 @@ fn main() {
         std::process::exit(0);
     }
 
-    let a_raw = gpu.upload_raw(&weight_bytes, &[weight_bytes.len()]).expect("upload weights");
+    let a_raw = gpu
+        .upload_raw(&weight_bytes, &[weight_bytes.len()])
+        .expect("upload weights");
     let x_tensor = gpu.upload_f32(&x_host, &[n * k]).expect("upload x");
 
     // Run MMQ kernel starting from y_in.
-    let y_mmq = gpu.upload_f32(&y_in_host, &[n * m]).expect("upload y_in for mmq");
+    let y_mmq = gpu
+        .upload_f32(&y_in_host, &[n * m])
+        .expect("upload y_in for mmq");
     eprintln!("\n--- Running gemm_hfq4g256_residual_mmq_gfx906 ---");
     gpu.gemm_hfq4g256_residual_mmq_gfx906(&a_raw, &x_tensor, &y_mmq, m, k, n)
         .expect("mmq gfx906 launch");
@@ -126,8 +149,10 @@ fn main() {
 
     let worst_col = worst_idx / m;
     let worst_row = worst_idx % m;
-    eprintln!("worst at (col,row)=({worst_col},{worst_row}): ref={:.4e} mmq={:.4e}",
-        worst_pair.0, worst_pair.1);
+    eprintln!(
+        "worst at (col,row)=({worst_col},{worst_row}): ref={:.4e} mmq={:.4e}",
+        worst_pair.0, worst_pair.1
+    );
 
     // Histogram of per-element errors to find hot spots
     eprintln!("\n--- Error histogram (abs error) ---");
@@ -136,26 +161,32 @@ fn main() {
     for i in 0..n * m {
         let e = (y_ref_host[i] - y_mmq_host[i]).abs();
         for (b, &edge) in edges.iter().enumerate() {
-            if e < edge { bins[b] += 1; break; }
+            if e < edge {
+                bins[b] += 1;
+                break;
+            }
         }
     }
     let total = (n * m) as f64;
     for (b, &edge) in edges.iter().enumerate() {
         let count = bins[b];
         let pct = count as f64 / total * 100.0;
-        let lo = if b == 0 { 0.0 } else { edges[b-1] };
+        let lo = if b == 0 { 0.0 } else { edges[b - 1] };
         eprintln!("  [{:.0e}, {:.0e}): {:>10} ({:5.2}%)", lo, edge, count, pct);
     }
 
     // Per-row max abs error
     eprintln!("\n--- Per-row max abs error (top 20 worst rows) ---");
     let mut row_max = vec![0f32; m];
-    for i in 0..n*m {
+    for i in 0..n * m {
         let row = i % m;
         let e = (y_ref_host[i] - y_mmq_host[i]).abs();
-        if e > row_max[row] { row_max[row] = e; }
+        if e > row_max[row] {
+            row_max[row] = e;
+        }
     }
-    let mut rows_sorted: Vec<(usize, f32)> = row_max.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    let mut rows_sorted: Vec<(usize, f32)> =
+        row_max.iter().enumerate().map(|(i, &v)| (i, v)).collect();
     rows_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     for (rank, &(row, err)) in rows_sorted.iter().take(20).enumerate() {
         eprintln!("  #{rank}: row={row} max_err={err:.4e}");
@@ -163,15 +194,17 @@ fn main() {
 
     // Show a few cells with absolute error >0.01
     eprintln!("\n--- Top 10 worst-error cells (col, row, ref, mmq, abs_err) ---");
-    let mut errs: Vec<(usize, f32)> = (0..n*m)
+    let mut errs: Vec<(usize, f32)> = (0..n * m)
         .map(|i| (i, (y_ref_host[i] - y_mmq_host[i]).abs()))
         .collect();
     errs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     for (rank, &(i, e)) in errs.iter().take(10).enumerate() {
         let col = i / m;
         let row = i % m;
-        eprintln!("  #{rank}: col={col} row={row} ref={:.4e} mmq={:.4e} err={:.4e}",
-            y_ref_host[i], y_mmq_host[i], e);
+        eprintln!(
+            "  #{rank}: col={col} row={row} ref={:.4e} mmq={:.4e} err={:.4e}",
+            y_ref_host[i], y_mmq_host[i], e
+        );
     }
 
     eprintln!("\n--- First 16 rows, col=0 ---");
@@ -179,8 +212,10 @@ fn main() {
         let r = y_ref_host[row];
         let q = y_mmq_host[row];
         let yi = y_in_host[row];
-        eprintln!("  row {row}: y_in={yi:.4e}  ref={r:.4e}  mmq={q:.4e}  diff={:.4e}",
-            (r - q).abs());
+        eprintln!(
+            "  row {row}: y_in={yi:.4e}  ref={r:.4e}  mmq={q:.4e}  diff={:.4e}",
+            (r - q).abs()
+        );
     }
 
     if nrmse > 1e-2 {
@@ -193,14 +228,26 @@ fn main() {
 
 fn read_f32(path: &str, n: usize) -> Vec<f32> {
     let bytes = std::fs::read(path).unwrap_or_else(|_| panic!("read {path}"));
-    assert_eq!(bytes.len(), n * 4, "size mismatch on {path}: got {} expected {}",
-        bytes.len(), n * 4);
+    assert_eq!(
+        bytes.len(),
+        n * 4,
+        "size mismatch on {path}: got {} expected {}",
+        bytes.len(),
+        n * 4
+    );
     let mut out = vec![0f32; n];
     for i in 0..n {
-        out[i] = f32::from_le_bytes([bytes[4*i], bytes[4*i+1], bytes[4*i+2], bytes[4*i+3]]);
+        out[i] = f32::from_le_bytes([
+            bytes[4 * i],
+            bytes[4 * i + 1],
+            bytes[4 * i + 2],
+            bytes[4 * i + 3],
+        ]);
     }
     out
 }
 
 #[allow(dead_code)]
-fn _path_check(p: &str) -> bool { Path::new(p).exists() }
+fn _path_check(p: &str) -> bool {
+    Path::new(p).exists()
+}

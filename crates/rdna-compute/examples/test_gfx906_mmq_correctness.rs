@@ -18,7 +18,7 @@
 //!
 //! Defaults: M=128, K=256, N=64 (one full MMQ tile).
 
-use rdna_compute::{DType, Gpu};
+use rdna_compute::Gpu;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -48,7 +48,9 @@ fn main() {
 
     // ── Random HFQ4-G256 weights (deterministic).
     let weight_bytes = synth_hfq4g256_weights(m, groups_per_row, 0xC0DE_FACEu64);
-    let a_raw = gpu.upload_raw(&weight_bytes, &[m * row_bytes]).expect("upload weights");
+    let a_raw = gpu
+        .upload_raw(&weight_bytes, &[m * row_bytes])
+        .expect("upload weights");
 
     // ── Random activations.
     let x_host: Vec<f32> = (0..n * k)
@@ -79,12 +81,16 @@ fn main() {
     // For set-mode, prefill the MMQ output with garbage so we can verify
     // it actually overwrites (catches a "write-back skipped" bug).
     let y_mmq_init: Vec<f32> = if set_mode {
-        (0..n * m).map(|i| 1e3 * ((i as f32) * 0.123).sin()).collect()
+        (0..n * m)
+            .map(|i| 1e3 * ((i as f32) * 0.123).sin())
+            .collect()
     } else {
         y_init_host.clone()
     };
     let y_mmq = gpu.upload_f32(&y_mmq_init, &[n * m]).expect("alloc y_mmq");
-    let y_fp16 = gpu.upload_f32(&y_init_host, &[n * m]).expect("alloc y_fp16");
+    let y_fp16 = gpu
+        .upload_f32(&y_init_host, &[n * m])
+        .expect("alloc y_fp16");
 
     let n_iter = std::env::var("HFQ_TEST_N_ITER")
         .ok()
@@ -102,7 +108,9 @@ fn main() {
     if set_mode {
         eprintln!("--- Running gemm_hfq4g256_mmq_set_gfx906 (set, add=0) ---");
         // gemm_hfq4g256_mmq_set_gfx906 takes a pre-quantized Q8_1 X pointer.
-        let xq_ptr = gpu.ensure_q8_1_mmq_x(&x_tensor, n, k).expect("quantize x → q8_1");
+        let xq_ptr = gpu
+            .ensure_q8_1_mmq_x(&x_tensor, n, k)
+            .expect("quantize x → q8_1");
         for _ in 0..n_iter {
             gpu.gemm_hfq4g256_mmq_set_gfx906(&a_raw, xq_ptr, &y_mmq, m, k, n)
                 .expect("mmq set gfx906 launch");
@@ -160,14 +168,21 @@ fn main() {
     eprintln!("rms_ref      = {:.6e}", rms_ref);
     eprintln!("NRMSE        = {:.4}%", nrmse * 100.0);
     eprintln!("worst (col,row) = ({worst_col}, {worst_row})");
-    eprintln!("                  fp16={:.6e}  mmq={:.6e}", worst_pair.0, worst_pair.1);
+    eprintln!(
+        "                  fp16={:.6e}  mmq={:.6e}",
+        worst_pair.0, worst_pair.1
+    );
     eprintln!("ref range:  [{ref_min:.4e}, {ref_max:.4e}]");
     eprintln!("mmq range:  [{mmq_min:.4e}, {mmq_max:.4e}]");
 
     eprintln!("\n--- First 16 output cells (col=0, rows=0..15) ---");
     for i in 0..16.min(m) {
-        eprintln!("  row {i}: fp16={:.6e}  mmq={:.6e}  diff={:.6e}",
-            fp16_out[i], mmq_out[i], (fp16_out[i] - mmq_out[i]).abs());
+        eprintln!(
+            "  row {i}: fp16={:.6e}  mmq={:.6e}  diff={:.6e}",
+            fp16_out[i],
+            mmq_out[i],
+            (fp16_out[i] - mmq_out[i]).abs()
+        );
     }
 
     // Pass criteria:
@@ -181,7 +196,9 @@ fn main() {
     } else {
         eprintln!("\nFAIL");
         if !mmq_nonzero {
-            eprintln!("  mmq output is all-zero — kernel may not have run, or wrote to wrong location");
+            eprintln!(
+                "  mmq output is all-zero — kernel may not have run, or wrote to wrong location"
+            );
         }
         if nrmse >= 1e-2 {
             eprintln!("  NRMSE {:.4}% exceeds 1% threshold", nrmse * 100.0);
@@ -195,7 +212,9 @@ fn synth_hfq4g256_weights(m: usize, groups_per_row: usize, seed: u64) -> Vec<u8>
     let mut out = vec![0u8; total];
     let mut state = seed;
     let mut next = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
 

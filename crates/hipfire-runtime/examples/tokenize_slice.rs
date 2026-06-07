@@ -31,14 +31,26 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--model"  => { model = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--slice"  => { slice = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--output" => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
+            "--model" => {
+                model = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--slice" => {
+                slice = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
             "-h" | "--help" => {
                 eprintln!("Usage: tokenize_slice --model <path-to-hfq> --slice <path-to-text> --output <path-to-bin>");
                 std::process::exit(0);
             }
-            other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
+            other => {
+                eprintln!("unknown arg: {other}");
+                std::process::exit(1);
+            }
         }
     }
     let model = model.expect("--model required");
@@ -46,11 +58,15 @@ fn main() {
     let output = output.expect("--output required");
 
     let hfq = HfqFile::open(&model).expect("open model");
-    let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .expect("load tokenizer from hfq metadata");
+    let tokenizer =
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("load tokenizer from hfq metadata");
     let text = std::fs::read_to_string(&slice).expect("read slice");
-    eprintln!("tokenize_slice: model={} slice={} ({} bytes)",
-              model.display(), slice.display(), text.len());
+    eprintln!(
+        "tokenize_slice: model={} slice={} ({} bytes)",
+        model.display(),
+        slice.display(),
+        text.len()
+    );
 
     let ids: Vec<u32> = tokenizer.encode(&text);
     eprintln!("tokenize_slice: produced {} tokens", ids.len());
@@ -58,5 +74,9 @@ fn main() {
     let mut out = std::fs::File::create(&output).expect("create output");
     let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
     out.write_all(&bytes).expect("write tokens");
-    eprintln!("tokenize_slice: wrote {} bytes to {}", bytes.len(), output.display());
+    eprintln!(
+        "tokenize_slice: wrote {} bytes to {}",
+        bytes.len(),
+        output.display()
+    );
 }

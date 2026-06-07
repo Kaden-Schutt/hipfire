@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+#![allow(clippy::double_ended_iterator_last)]
+
 //! Kernel Atlas: typed schema + JSONL writer + analysis helpers for the
 //! hipfire bench corpus.
 //!
@@ -26,6 +28,4 @@ pub mod suggest;
 pub mod task;
 
 pub use profile_report::{AtlasProfileReport, AtlasRocprofKernel};
-pub use schema::{
-    load_row, load_rows, truncate_jsonl, value_object, AtlasRow, ATLAS_SCHEMA,
-};
+pub use schema::{load_row, load_rows, truncate_jsonl, value_object, AtlasRow, ATLAS_SCHEMA};

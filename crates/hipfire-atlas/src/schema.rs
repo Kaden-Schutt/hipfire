@@ -70,7 +70,11 @@ impl AtlasRow {
         self
     }
 
-    pub fn set_metric_str(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
+    pub fn set_metric_str(
+        &mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> &mut Self {
         self.metrics.insert(key.into(), Value::String(value.into()));
         self
     }
@@ -100,10 +104,7 @@ impl AtlasRow {
     /// The file is opened in append mode so concurrent writers from
     /// independent processes coexist without overwriting each other.
     pub fn append_to_jsonl(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         let line = serde_json::to_string(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         writeln!(file, "{line}")?;
@@ -114,7 +115,8 @@ impl AtlasRow {
 /// Load all rows from a JSONL (or single-line JSON, or JSON array) file.
 pub fn load_rows(path: impl AsRef<Path>) -> Result<Vec<AtlasRow>, String> {
     let path = path.as_ref();
-    let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let trimmed = text.trim_start();
     if trimmed.starts_with('[') {
         serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))

@@ -64,21 +64,58 @@ fn parse_args() -> Args {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--candidate-gguf" => { candidate_gguf = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--ref"            => { ref_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--slice"          => { slice = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--output"         => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--n-batch"        => { n_batch = argv[i + 1].parse().expect("--n-batch must be u32"); i += 2; }
-            "--llama-perplexity-bin" => { llama_perplexity_bin = argv[i + 1].clone(); i += 2; }
-            "-h" | "--help"    => { print_usage(); std::process::exit(0); }
-            other              => { eprintln!("unknown arg: {other}"); print_usage(); std::process::exit(1); }
+            "--candidate-gguf" => {
+                candidate_gguf = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--ref" => {
+                ref_path = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--slice" => {
+                slice = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--n-batch" => {
+                n_batch = argv[i + 1].parse().expect("--n-batch must be u32");
+                i += 2;
+            }
+            "--llama-perplexity-bin" => {
+                llama_perplexity_bin = argv[i + 1].clone();
+                i += 2;
+            }
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("unknown arg: {other}");
+                print_usage();
+                std::process::exit(1);
+            }
         }
     }
     Args {
-        candidate_gguf: candidate_gguf.unwrap_or_else(|| { print_usage(); std::process::exit(1); }),
-        ref_path: ref_path.unwrap_or_else(|| { print_usage(); std::process::exit(1); }),
-        slice: slice.unwrap_or_else(|| { print_usage(); std::process::exit(1); }),
-        output: output.unwrap_or_else(|| { print_usage(); std::process::exit(1); }),
+        candidate_gguf: candidate_gguf.unwrap_or_else(|| {
+            print_usage();
+            std::process::exit(1);
+        }),
+        ref_path: ref_path.unwrap_or_else(|| {
+            print_usage();
+            std::process::exit(1);
+        }),
+        slice: slice.unwrap_or_else(|| {
+            print_usage();
+            std::process::exit(1);
+        }),
+        output: output.unwrap_or_else(|| {
+            print_usage();
+            std::process::exit(1);
+        }),
         n_batch,
         llama_perplexity_bin,
     }
@@ -96,7 +133,9 @@ fn main() {
 
     // ---------- Sanity (H1 + M1 + M4) ----------
     hipfire_runtime::eval_common::verify_llama_commit(
-        &args.llama_perplexity_bin, PINNED_LLAMACPP_COMMIT, "eval_gguf",
+        &args.llama_perplexity_bin,
+        PINNED_LLAMACPP_COMMIT,
+        "eval_gguf",
     );
     hipfire_runtime::eval_common::verify_slice_md5(&args.slice, "eval_gguf");
     hipfire_runtime::eval_common::verify_ref_sha256(&args.ref_path, "eval_gguf");
@@ -119,7 +158,8 @@ fn main() {
     let ref_n_chunk = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
     let top_k = u16::from_le_bytes(hdr[16..18].try_into().unwrap()) as usize;
     if version != 1 {
-        eprintln!("unsupported ref version {version}"); std::process::exit(2);
+        eprintln!("unsupported ref version {version}");
+        std::process::exit(2);
     }
     let ref_per_token_bytes = 8 + 8 * top_k;
     let scored_per_chunk = ref_n_ctx - 1 - ref_n_ctx / 2;
@@ -140,7 +180,10 @@ fn main() {
     ref_in.read_exact(&mut ref_tokens).expect("read ref tokens");
 
     // ---------- Set up FIFO + spawn llama-perplexity on the candidate ----------
-    let fifo_path = PathBuf::from(format!("/tmp/hipfire-eval-gguf-{}.fifo", std::process::id()));
+    let fifo_path = PathBuf::from(format!(
+        "/tmp/hipfire-eval-gguf-{}.fifo",
+        std::process::id()
+    ));
     let _ = fs::remove_file(&fifo_path);
     let status = Command::new("mkfifo")
         .arg(&fifo_path)
@@ -153,14 +196,16 @@ fn main() {
     let _fifo_guard = FifoGuard(fifo_path.clone());
     eprintln!("eval_gguf: created FIFO {}", fifo_path.display());
 
-    eprintln!("eval_gguf: spawning {} on candidate {}...",
-              args.llama_perplexity_bin, args.candidate_gguf.display());
+    eprintln!(
+        "eval_gguf: spawning {} on candidate {}...",
+        args.llama_perplexity_bin,
+        args.candidate_gguf.display()
+    );
     let mut child = Command::new(&args.llama_perplexity_bin)
         .args(["-m", &args.candidate_gguf.display().to_string()])
         .args(["-f", &args.slice.display().to_string()])
         .args(["-c", &ref_n_ctx.to_string()])
         .args(["-b", &args.n_batch.to_string()])
-        .args(["-ngl", &std::env::var("HIPFIRE_KLD_NGL").unwrap_or_else(|_| "99".to_string())])
         .args(["--kl-divergence-base", &fifo_path.display().to_string()])
         .stderr(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -173,19 +218,21 @@ fn main() {
     let mut cand_in = BufReader::with_capacity(8 * 1024 * 1024, cand_file);
 
     let mut cand_magic = [0u8; 8];
-    cand_in.read_exact(&mut cand_magic).expect("read cand llama magic");
+    cand_in
+        .read_exact(&mut cand_magic)
+        .expect("read cand llama magic");
     if &cand_magic != LLAMA_MAGIC {
         eprintln!("bad llama.cpp magic from candidate: {:?}", cand_magic);
         std::process::exit(2);
     }
     let mut cand_hdr = [0u8; 12];
-    cand_in.read_exact(&mut cand_hdr).expect("read cand llama header");
+    cand_in
+        .read_exact(&mut cand_hdr)
+        .expect("read cand llama header");
     let cand_n_ctx = u32::from_le_bytes(cand_hdr[0..4].try_into().unwrap()) as usize;
     let cand_n_vocab = i32::from_le_bytes(cand_hdr[4..8].try_into().unwrap()) as usize;
     let cand_n_chunk = i32::from_le_bytes(cand_hdr[8..12].try_into().unwrap()) as usize;
-    eprintln!(
-        "eval_gguf: cand n_ctx={cand_n_ctx} n_vocab={cand_n_vocab} n_chunk={cand_n_chunk}"
-    );
+    eprintln!("eval_gguf: cand n_ctx={cand_n_ctx} n_vocab={cand_n_vocab} n_chunk={cand_n_chunk}");
 
     if cand_n_ctx != ref_n_ctx {
         eprintln!("ERROR: cand n_ctx {cand_n_ctx} != ref n_ctx {ref_n_ctx}");
@@ -207,11 +254,17 @@ fn main() {
     // case every subsequent KLD is meaningless.
     let cand_tokens_bytes = cand_n_ctx * cand_n_chunk * 4;
     let mut cand_tokens = vec![0u8; cand_tokens_bytes];
-    cand_in.read_exact(&mut cand_tokens).expect("read cand tokens");
+    cand_in
+        .read_exact(&mut cand_tokens)
+        .expect("read cand tokens");
     if ref_tokens != cand_tokens {
         // Find first diverging position (in u32 space) for diagnostics.
         let mut first_diff = None;
-        for (i, (r, c)) in ref_tokens.chunks_exact(4).zip(cand_tokens.chunks_exact(4)).enumerate() {
+        for (i, (r, c)) in ref_tokens
+            .chunks_exact(4)
+            .zip(cand_tokens.chunks_exact(4))
+            .enumerate()
+        {
             if r != c {
                 let r_id = u32::from_le_bytes(r.try_into().unwrap());
                 let c_id = u32::from_le_bytes(c.try_into().unwrap());
@@ -280,26 +333,37 @@ fn main() {
 
         for j in 0..scored_per_chunk {
             // Read candidate's per-token block
-            cand_in.read_exact(&mut cand_block_buf).expect("read cand block");
+            cand_in
+                .read_exact(&mut cand_block_buf)
+                .expect("read cand block");
 
             // First 8 bytes: scale + min_log_prob (fp32 each, packed as 2× uint16)
             let cand_scale = f32::from_le_bytes(cand_block_buf[0..4].try_into().unwrap());
             let cand_min_log_prob = f32::from_le_bytes(cand_block_buf[4..8].try_into().unwrap());
 
             // Read ref's per-token block
-            ref_in.read_exact(&mut ref_block_buf).expect("read ref block");
+            ref_in
+                .read_exact(&mut ref_block_buf)
+                .expect("read ref block");
             // Parse β block: u32 indices[K] | f32 log_probs[K] | f32 residual | f32 pad
             let mut ref_top_indices: Vec<u32> = Vec::with_capacity(top_k);
             let mut ref_top_log_probs: Vec<f32> = Vec::with_capacity(top_k);
             for j in 0..top_k {
-                ref_top_indices.push(u32::from_le_bytes(ref_block_buf[j * 4..j * 4 + 4].try_into().unwrap()));
+                ref_top_indices.push(u32::from_le_bytes(
+                    ref_block_buf[j * 4..j * 4 + 4].try_into().unwrap(),
+                ));
             }
             let lp_off = top_k * 4;
             for j in 0..top_k {
-                ref_top_log_probs.push(f32::from_le_bytes(ref_block_buf[lp_off + j * 4..lp_off + j * 4 + 4].try_into().unwrap()));
+                ref_top_log_probs.push(f32::from_le_bytes(
+                    ref_block_buf[lp_off + j * 4..lp_off + j * 4 + 4]
+                        .try_into()
+                        .unwrap(),
+                ));
             }
             let resid_off = top_k * 8;
-            let ref_sum_p_residual = f32::from_le_bytes(ref_block_buf[resid_off..resid_off + 4].try_into().unwrap());
+            let ref_sum_p_residual =
+                f32::from_le_bytes(ref_block_buf[resid_off..resid_off + 4].try_into().unwrap());
 
             // KLD math (mirrors eval_hipfire.rs):
             //   Σ_{i in ref_top_K} P_ref(i) * (log_p_ref(i) - log_p_cand(i))
@@ -319,7 +383,9 @@ fn main() {
                 }
                 let stored_off = 8 + ref_idx * 2;
                 let stored = u16::from_le_bytes(
-                    cand_block_buf[stored_off..stored_off + 2].try_into().unwrap()
+                    cand_block_buf[stored_off..stored_off + 2]
+                        .try_into()
+                        .unwrap(),
                 );
                 let log_p_cand = (cand_scale as f64) * (stored as f64) + (cand_min_log_prob as f64);
                 let log_p_ref = ref_top_log_probs[j] as f64;
@@ -332,8 +398,8 @@ fn main() {
             let sum_p_residual_ref = ref_sum_p_residual as f64;
             let sum_p_residual_cand = (1.0 - sum_p_cand_at_ref_top).max(0.0);
             if sum_p_residual_ref > 1e-9 && sum_p_residual_cand > 1e-9 {
-                kld_token += sum_p_residual_ref
-                    * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
+                kld_token +=
+                    sum_p_residual_ref * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
             }
             // KLD ≥ 0 by Gibbs' inequality. Same rationale as eval_hipfire.rs.
             debug_assert!(
@@ -348,7 +414,9 @@ fn main() {
             if actual_next < cand_n_vocab {
                 let stored_off = 8 + actual_next * 2;
                 let stored = u16::from_le_bytes(
-                    cand_block_buf[stored_off..stored_off + 2].try_into().unwrap()
+                    cand_block_buf[stored_off..stored_off + 2]
+                        .try_into()
+                        .unwrap(),
                 );
                 let log_p_cand = (cand_scale as f64) * (stored as f64) + (cand_min_log_prob as f64);
                 chunk_nll_sum += -log_p_cand;
@@ -364,7 +432,12 @@ fn main() {
                 let rate = total_done as f64 / elapsed.max(1e-9);
                 eprint!(
                     "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                    c + 1, ref_n_chunk, total_done, total_scored, pct, rate
+                    c + 1,
+                    ref_n_chunk,
+                    total_done,
+                    total_scored,
+                    pct,
+                    rate
                 );
             }
         }
@@ -383,7 +456,9 @@ fn main() {
         let p99 = sorted[p99_idx];
         let mean_nll = if chunk_nll_count > 0 {
             chunk_nll_sum / chunk_nll_count as f64
-        } else { f64::NAN };
+        } else {
+            f64::NAN
+        };
         mean_kld_per_seq.push(mean);
         p99_kld_per_seq.push(p99);
         mean_nll_per_seq.push(mean_nll);
@@ -399,10 +474,11 @@ fn main() {
     let out_file = File::create(&args.output).expect("create output");
     let mut out = BufWriter::new(out_file);
     out.write_all(SEQKLD_MAGIC).unwrap();
-    out.write_all(&2u32.to_le_bytes()).unwrap();                  // version = 2
-    out.write_all(&(ref_n_chunk as u32).to_le_bytes()).unwrap();   // n_chunk
-    out.write_all(&0u32.to_le_bytes()).unwrap();                  // reserved
-    for ((m, p), n) in mean_kld_per_seq.iter()
+    out.write_all(&2u32.to_le_bytes()).unwrap(); // version = 2
+    out.write_all(&(ref_n_chunk as u32).to_le_bytes()).unwrap(); // n_chunk
+    out.write_all(&0u32.to_le_bytes()).unwrap(); // reserved
+    for ((m, p), n) in mean_kld_per_seq
+        .iter()
         .zip(p99_kld_per_seq.iter())
         .zip(mean_nll_per_seq.iter())
     {
@@ -412,8 +488,13 @@ fn main() {
     }
     out.flush().unwrap();
 
-    let overall_mean: f64 = mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;
-    let nll_finite: Vec<f64> = mean_nll_per_seq.iter().copied().filter(|x| x.is_finite()).collect();
+    let overall_mean: f64 =
+        mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;
+    let nll_finite: Vec<f64> = mean_nll_per_seq
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect();
     let overall_nll: f64 = if nll_finite.is_empty() {
         f64::NAN
     } else {
@@ -423,7 +504,8 @@ fn main() {
     let elapsed = t0.elapsed().as_secs_f64();
     eprintln!(
         "eval_gguf: scored {total_done} tokens in {:.1}s ({:.0} tok/s)",
-        elapsed, total_done as f64 / elapsed.max(1e-9)
+        elapsed,
+        total_done as f64 / elapsed.max(1e-9)
     );
     eprintln!(
         "eval_gguf: slice-mean KLD = {:.6}  mean NLL = {:.6}  PPL = {:.4}",

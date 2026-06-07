@@ -31,13 +31,28 @@ fn main() {
 
     // Quantize to HFQ6-G256
     let quantized = quantize_hfq6g256(&f32_weights);
-    eprintln!("Quantized {} floats → {} bytes (expect {})", f32_weights.len(), quantized.len(), m * 200);
+    eprintln!(
+        "Quantized {} floats → {} bytes (expect {})",
+        f32_weights.len(),
+        quantized.len(),
+        m * 200
+    );
 
     // Verify scale/zero
     for row in 0..m {
         let off = row * 200;
-        let scale = f32::from_le_bytes([quantized[off], quantized[off+1], quantized[off+2], quantized[off+3]]);
-        let zero = f32::from_le_bytes([quantized[off+4], quantized[off+5], quantized[off+6], quantized[off+7]]);
+        let scale = f32::from_le_bytes([
+            quantized[off],
+            quantized[off + 1],
+            quantized[off + 2],
+            quantized[off + 3],
+        ]);
+        let zero = f32::from_le_bytes([
+            quantized[off + 4],
+            quantized[off + 5],
+            quantized[off + 6],
+            quantized[off + 7],
+        ]);
         eprintln!("Row {}: scale={:.6}, zero={:.6}", row, scale, zero);
 
         // CPU dequant first 8 weights (2 groups of 4 from 6 bytes)
@@ -54,8 +69,15 @@ fn main() {
             for (i, q) in [q0, q1, q2, q3].iter().enumerate() {
                 let dequant = scale * q + zero;
                 let orig = f32_weights[row * k + base + i];
-                eprintln!("  w[{}][{}]: orig={:.4}, q={:.0}, dequant={:.4}, err={:.4}",
-                    row, base + i, orig, q, dequant, (dequant - orig).abs());
+                eprintln!(
+                    "  w[{}][{}]: orig={:.4}, q={:.0}, dequant={:.4}, err={:.4}",
+                    row,
+                    base + i,
+                    orig,
+                    q,
+                    dequant,
+                    (dequant - orig).abs()
+                );
             }
         }
     }
@@ -76,8 +98,18 @@ fn main() {
     let mut y_cpu = vec![0.0f32; m];
     for row in 0..m {
         let off = row * 200;
-        let scale = f32::from_le_bytes([quantized[off], quantized[off+1], quantized[off+2], quantized[off+3]]);
-        let zero = f32::from_le_bytes([quantized[off+4], quantized[off+5], quantized[off+6], quantized[off+7]]);
+        let scale = f32::from_le_bytes([
+            quantized[off],
+            quantized[off + 1],
+            quantized[off + 2],
+            quantized[off + 3],
+        ]);
+        let zero = f32::from_le_bytes([
+            quantized[off + 4],
+            quantized[off + 5],
+            quantized[off + 6],
+            quantized[off + 7],
+        ]);
         for i in (0..k).step_by(4) {
             let bo = off + 8 + (i / 4) * 3;
             let b0 = quantized[bo] as u32;
@@ -94,13 +126,18 @@ fn main() {
         }
     }
 
-    eprintln!("\n{:<6} {:>12} {:>12} {:>12} {:>12}", "Row", "F32 ref", "CPU dequant", "GPU dequant", "GPU-CPU err");
+    eprintln!(
+        "\n{:<6} {:>12} {:>12} {:>12} {:>12}",
+        "Row", "F32 ref", "CPU dequant", "GPU dequant", "GPU-CPU err"
+    );
     let mut max_err = 0.0f32;
     for row in 0..m {
         let err = (y_gpu[row] - y_cpu[row]).abs();
         max_err = max_err.max(err);
-        eprintln!("{:<6} {:>12.4} {:>12.4} {:>12.4} {:>12.6}",
-            row, y_ref[row], y_cpu[row], y_gpu[row], err);
+        eprintln!(
+            "{:<6} {:>12.4} {:>12.4} {:>12.4} {:>12.6}",
+            row, y_ref[row], y_cpu[row], y_gpu[row], err
+        );
     }
     eprintln!("\nMax GPU-CPU error: {:.6}", max_err);
     if max_err > 0.1 {
@@ -134,17 +171,33 @@ fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
 
         let actual_len = end - start;
         for i in (0..256).step_by(4) {
-            let q0 = if i < actual_len { ((group[i] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q1 = if i + 1 < actual_len { ((group[i+1] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q2 = if i + 2 < actual_len { ((group[i+2] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q3 = if i + 3 < actual_len { ((group[i+3] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
+            let q0 = if i < actual_len {
+                ((group[i] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q1 = if i + 1 < actual_len {
+                ((group[i + 1] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q2 = if i + 2 < actual_len {
+                ((group[i + 2] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q3 = if i + 3 < actual_len {
+                ((group[i + 3] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
             let q0 = q0.min(63);
             let q1 = q1.min(63);
             let q2 = q2.min(63);
             let q3 = q3.min(63);
 
             let byte_off = 8 + (i / 4) * 3;
-            output[out_off + byte_off]     = q0 | (q1 << 6);
+            output[out_off + byte_off] = q0 | (q1 << 6);
             output[out_off + byte_off + 1] = (q1 >> 2) | (q2 << 4);
             output[out_off + byte_off + 2] = (q2 >> 4) | (q3 << 2);
         }

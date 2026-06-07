@@ -12,7 +12,7 @@
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_grouped_mmq_gfx1151
 
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 fn lcg(state: &mut u32) -> u32 {
     *state = state.wrapping_mul(1103515245).wrapping_add(12345);
@@ -28,9 +28,8 @@ fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
 }
 
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len()], DType::F32)
         .expect("alloc_tensor f32");
@@ -39,9 +38,8 @@ fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
 }
 
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len() * 4], DType::Raw)
         .expect("alloc_tensor i32");
@@ -50,9 +48,8 @@ fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
 }
 
 fn upload_u64(gpu: &mut Gpu, data: &[u64]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
     let t = gpu
         .alloc_tensor(&[data.len() * 8], DType::Raw)
         .expect("alloc_tensor u64");
@@ -68,10 +65,11 @@ fn alloc_f32_zeros(gpu: &mut Gpu, n: usize) -> GpuTensor {
 
 fn download_f32(gpu: &Gpu, tensor: &GpuTensor, n: usize) -> Vec<f32> {
     let mut data = vec![0f32; n];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &tensor.buf).expect("memcpy_dtoh f32");
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
+    gpu.hip
+        .memcpy_dtoh(bytes, &tensor.buf)
+        .expect("memcpy_dtoh f32");
     data
 }
 
@@ -118,15 +116,21 @@ fn run_case(
     k: usize,
     m_total: usize,
     num_experts: usize,
+    x_row_div: usize,
+    sparse: bool,
     seed_w: u32,
     seed_x: u32,
     rtol: f32,
     atol: f32,
 ) {
-    println!("=== {} | M={} K={} m_total={} E={} ===", label, m, k, m_total, num_experts);
+    println!(
+        "=== {} | M={} K={} m_total={} E={} x_row_div={} sparse={} ===",
+        label, m, k, m_total, num_experts, x_row_div, sparse
+    );
     assert!(m % 16 == 0, "M must be a multiple of 16");
     assert!(m_total % 16 == 0, "m_total must be a multiple of 16");
     assert!(k % 256 == 0, "K must be a multiple of 256");
+    assert!(x_row_div > 0, "x_row_div must be non-zero");
 
     let mut gpu = Gpu::init().expect("Gpu::init");
     let arch = gpu.arch.clone();
@@ -146,16 +150,37 @@ fn run_case(
     }
     let expert_weight_ptrs = upload_u64(&mut gpu, &expert_ptrs);
 
-    // sorted_slot_index: identity (slot s → x_row s). tile_y → expert (tile_y % E).
-    let sorted: Vec<i32> = (0..m_total as i32).collect();
+    let x_src_rows = if sparse {
+        m_total.saturating_sub(num_experts * 15) / x_row_div
+    } else {
+        m_total / x_row_div
+    }
+    .max(1);
+    let (sorted, tile_ids): (Vec<i32>, Vec<i32>) = if sparse {
+        let total_slots = x_src_rows * x_row_div;
+        let mut sorted = vec![-1i32; m_total];
+        let mut tile_ids = vec![-1i32; m_total / 16];
+        for flat in 0..total_slots {
+            let expert = flat % num_experts;
+            let tile_y = expert;
+            let lane = flat / num_experts;
+            if tile_y < tile_ids.len() && lane < 16 {
+                tile_ids[tile_y] = expert as i32;
+                sorted[tile_y * 16 + lane] = flat as i32;
+            }
+        }
+        (sorted, tile_ids)
+    } else {
+        let sorted: Vec<i32> = (0..m_total as i32).collect();
+        let tile_ids: Vec<i32> = (0..(m_total / 16))
+            .map(|tile_y| (tile_y % num_experts) as i32)
+            .collect();
+        (sorted, tile_ids)
+    };
     let sorted_slot_index = upload_i32(&mut gpu, &sorted);
-    let tile_ids: Vec<i32> = (0..(m_total / 16))
-        .map(|tile_y| (tile_y % num_experts) as i32)
-        .collect();
     let expert_tile_ids = upload_i32(&mut gpu, &tile_ids);
 
-    // X: m_total rows × K, identity gather (x_row_div = 1).
-    let x_f32 = build_x_f32(m_total, k, seed_x);
+    let x_f32 = build_x_f32(x_src_rows, k, seed_x);
     let x_src = upload_f32(&mut gpu, &x_f32);
 
     let y_fp16 = alloc_f32_zeros(&mut gpu, m_total * m);
@@ -171,10 +196,11 @@ fn run_case(
         &y_fp16,
         m,
         k,
-        1,       // x_row_div
+        x_row_div,
         m_total,
-        m_total, // x_src_rows
-    ).expect("FP16 kernel launch");
+        x_src_rows,
+    )
+    .expect("FP16 kernel launch");
     gpu.hip.device_synchronize().expect("sync after FP16");
 
     // Run i8 MMQ path (gated to gfx1151 only — explicit direct call so the
@@ -187,10 +213,11 @@ fn run_case(
         &y_i8,
         m,
         k,
-        1,
+        x_row_div,
         m_total,
-        m_total,
-    ).expect("i8 MMQ kernel launch");
+        x_src_rows,
+    )
+    .expect("i8 MMQ kernel launch");
     gpu.hip.device_synchronize().expect("sync after i8 MMQ");
     std::env::remove_var("HIPFIRE_MOE_GROUPED_I8");
 
@@ -207,15 +234,23 @@ fn run_case(
     for (i, (a, b)) in y_fp16_v.iter().zip(y_i8_v.iter()).enumerate() {
         let d = (a - b).abs();
         let r = if a.abs() > 1e-6 { d / a.abs() } else { d };
-        if d > max_abs { max_abs = d; argmax_abs = i; }
-        if r > max_rel { max_rel = r; argmax_rel = i; }
+        if d > max_abs {
+            max_abs = d;
+            argmax_abs = i;
+        }
+        if r > max_rel {
+            max_rel = r;
+            argmax_rel = i;
+        }
         sum_sq_err += (d as f64) * (d as f64);
         sum_sq_ref += (*a as f64) * (*a as f64);
     }
     let rmse = (sum_sq_err / (m_total * m) as f64).sqrt() as f32;
     let nrmse = if sum_sq_ref > 0.0 {
         (sum_sq_err.sqrt() / sum_sq_ref.sqrt()) as f32
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     println!(
         "  max_abs_diff = {:.6e} (at {}: fp16={:.6}, i8={:.6})",
@@ -242,13 +277,113 @@ fn run_case(
 
 fn main() {
     // Toy: 1 expert, single tile_y, M=16 K=256 m_total=16.
-    run_case("toy", 16, 256, 16, 1, 0xDEAD_BEEF, 0xCAFE_BABE, 0.05, 0.05);
+    run_case(
+        "toy",
+        16,
+        256,
+        16,
+        1,
+        1,
+        false,
+        0xDEAD_BEEF,
+        0xCAFE_BABE,
+        0.05,
+        0.05,
+    );
     // Small: 2 experts, 2 tile_y, M=64 K=512 m_total=32.
-    run_case("small", 64, 512, 32, 2, 0x1234_5678, 0x8765_4321, 0.05, 0.05);
+    run_case(
+        "small",
+        64,
+        512,
+        32,
+        2,
+        1,
+        false,
+        0x1234_5678,
+        0x8765_4321,
+        0.05,
+        0.05,
+    );
+    run_case(
+        "gate-up-div8",
+        64,
+        1024,
+        128,
+        4,
+        8,
+        false,
+        0x1357_2468,
+        0x2468_1357,
+        0.05,
+        0.05,
+    );
     // Medium: 4 experts, 4 tile_y, M=128 K=1024 m_total=64.
-    run_case("medium", 128, 1024, 64, 4, 0x0F0F_0F0F, 0xF0F0_F0F0, 0.05, 0.05);
+    run_case(
+        "medium",
+        128,
+        1024,
+        64,
+        4,
+        1,
+        false,
+        0x0F0F_0F0F,
+        0xF0F0_F0F0,
+        0.05,
+        0.05,
+    );
+    run_case(
+        "sparse-N2-K8-E256",
+        16,
+        512,
+        2 * 8 + 256 * 15,
+        256,
+        8,
+        true,
+        0x4400_0002,
+        0x5500_0002,
+        0.05,
+        0.05,
+    );
+    run_case(
+        "sparse-N4-K8-E256",
+        16,
+        512,
+        4 * 8 + 256 * 15,
+        256,
+        8,
+        true,
+        0x4400_0004,
+        0x5500_0004,
+        0.05,
+        0.05,
+    );
+    run_case(
+        "sparse-N16-K8-E256",
+        16,
+        512,
+        16 * 8 + 256 * 15,
+        256,
+        8,
+        true,
+        0x4400_0016,
+        0x5500_0016,
+        0.05,
+        0.05,
+    );
     // A3B-shaped slice: M=768 (per-expert gate_up/2), K=7168, m_total=256.
-    run_case("a3b-slice", 768, 7168, 256, 8, 0x4242_4242, 0x2424_2424, 0.05, 0.05);
+    run_case(
+        "a3b-slice",
+        768,
+        7168,
+        256,
+        8,
+        1,
+        false,
+        0x4242_4242,
+        0x2424_2424,
+        0.05,
+        0.05,
+    );
 
     println!("\nAll cases PASS.");
 }

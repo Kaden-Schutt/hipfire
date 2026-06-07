@@ -2,6 +2,17 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::if_same_then_else,
+    clippy::manual_div_ceil,
+    clippy::manual_is_multiple_of,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unnecessary_map_or
+)]
+
 //! dflash_convert: Convert a HuggingFace DFlash draft safetensors + config.json
 //! into a hipfire `.hfq` file with a dflash metadata section.
 //!

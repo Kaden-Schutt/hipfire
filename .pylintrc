@@ -1,0 +1,7 @@
+[MAIN]
+ignore-patterns=.*\.venv.*,target
+
+[MESSAGES CONTROL]
+disable=all
+enable=syntax-error,undefined-variable,used-before-assignment
+

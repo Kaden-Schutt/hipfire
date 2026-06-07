@@ -17,7 +17,7 @@
 //! Fails if max-abs error > 5e-3 (fp32 summation reorder noise scales with K;
 //! K=12288 has ~3× more accumulation than the MQ3 test's K=2048).
 
-use rdna_compute::{Gpu, DType};
+use rdna_compute::{DType, Gpu};
 
 fn f32_to_f16_le(v: f32) -> [u8; 2] {
     let bits = v.to_bits();
@@ -80,7 +80,7 @@ fn f16_le_to_f32(b: [u8; 2]) -> f32 {
 fn pack_4bit_group(qs: &[u8; 256]) -> [u8; 128] {
     let mut out = [0u8; 128];
     for i in 0..128 {
-        let lo = qs[2 * i]     & 0x0F;
+        let lo = qs[2 * i] & 0x0F;
         let hi = qs[2 * i + 1] & 0x0F;
         out[i] = lo | (hi << 4);
     }
@@ -154,7 +154,8 @@ fn run_one(gpu: &mut Gpu, groups_per_row: usize) -> (f32, f32) {
             // Synthetic indices in [0, 16).
             let mut q = [0u8; 256];
             for i in 0..256 {
-                q[i] = ((row.wrapping_mul(31) ^ g.wrapping_mul(53) ^ i.wrapping_mul(7)) & 0xF) as u8;
+                q[i] =
+                    ((row.wrapping_mul(31) ^ g.wrapping_mul(53) ^ i.wrapping_mul(7)) & 0xF) as u8;
             }
             idxs.push(q);
         }
@@ -164,7 +165,9 @@ fn run_one(gpu: &mut Gpu, groups_per_row: usize) -> (f32, f32) {
         indices_per_row.push(idxs);
     }
 
-    let x: Vec<f32> = (0..k).map(|i| ((i as i32 % 13) as f32 - 6.0) * 0.05).collect();
+    let x: Vec<f32> = (0..k)
+        .map(|i| ((i as i32 % 13) as f32 - 6.0) * 0.05)
+        .collect();
 
     let mut a_flat: Vec<u8> = Vec::with_capacity(m * groups_per_row * 160);
     for row in &a_rows {
@@ -204,11 +207,11 @@ fn main() {
 
     let mut all_pass = true;
     let cases: &[(usize, &str)] = &[
-        (4,  "K= 1024  (1 quad,  0 tail)"),
-        (5,  "K= 1280  (1 quad,  1 tail)"),
-        (6,  "K= 1536  (1 quad,  2 tail)"),
-        (7,  "K= 1792  (1 quad,  3 tail)"),
-        (8,  "K= 2048  (2 quads, 0 tail)"),
+        (4, "K= 1024  (1 quad,  0 tail)"),
+        (5, "K= 1280  (1 quad,  1 tail)"),
+        (6, "K= 1536  (1 quad,  2 tail)"),
+        (7, "K= 1792  (1 quad,  3 tail)"),
+        (8, "K= 2048  (2 quads, 0 tail)"),
         (16, "K= 4096  (4 quads, 0 tail)  ← Qwen3.5-9B attn proj K"),
         (48, "K=12288  (12 quads, 0 tail) ← Qwen3.5-9B FFN K"),
     ];
@@ -219,7 +222,9 @@ fn main() {
         println!(
             "groups_per_row={gpr:2}  max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  {verdict}  {tag}",
         );
-        if !pass { all_pass = false; }
+        if !pass {
+            all_pass = false;
+        }
     }
     if !all_pass {
         eprintln!("\nFAIL: one or more cases produced max_abs > 5e-3");

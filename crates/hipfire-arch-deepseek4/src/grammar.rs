@@ -233,7 +233,8 @@ impl Matcher {
                 .map(|t| format!("{}\">\n", t.name))
                 .collect(),
             State::InInvokeName {
-                tool_idx: Some(idx), ..
+                tool_idx: Some(idx),
+                ..
             } => vec![format!("{}\">\n", self.tools[*idx].name)],
             State::InInvokeBody {
                 tool_idx,
@@ -269,10 +270,9 @@ impl Matcher {
                 param_idx: Some(idx),
                 ..
             } => vec![format!("{}\"", self.tools[*tool_idx].params[*idx])],
-            State::InParamAttr { .. } => vec![
-                ATTR_STRING_TRUE.to_string(),
-                ATTR_STRING_FALSE.to_string(),
-            ],
+            State::InParamAttr { .. } => {
+                vec![ATTR_STRING_TRUE.to_string(), ATTR_STRING_FALSE.to_string()]
+            }
         }
     }
 
@@ -498,10 +498,7 @@ impl Matcher {
     /// alternative match. Driven by the HF reference renderer which
     /// emits `\n` between sibling tags.
     fn state_allows_leading_ws(&self) -> bool {
-        matches!(
-            self.state,
-            State::InToolCalls | State::InInvokeBody { .. }
-        )
+        matches!(self.state, State::InToolCalls | State::InInvokeBody { .. })
     }
 
     /// Length in bytes of the leading whitespace run (`\n` or ` `) in
@@ -560,10 +557,7 @@ impl Matcher {
     /// drop the matched bytes. If at least one is still a prefix
     /// candidate, stay. If none is a prefix anymore (corrupt), fall
     /// back to `Out` (recovery).
-    fn transition_from_alternatives(
-        &mut self,
-        alternatives: &[(&str, State)],
-    ) -> Transition {
+    fn transition_from_alternatives(&mut self, alternatives: &[(&str, State)]) -> Transition {
         for (needle, next) in alternatives {
             if self.partial_buf.starts_with(needle) {
                 self.partial_buf.drain(..needle.len());
@@ -1093,23 +1087,32 @@ mod tests {
         let mut m = Matcher::new(schema_read_write());
         m.advance("<｜DSML｜tool_calls>");
         let vocab = vec![
-            "<".to_string(),                            // ✓ prefix of all opens
-            "</".to_string(),                           // ✓ prefix of close
-            "<｜".to_string(),                          // ✓ prefix
-            "<｜DSML｜".to_string(),                    // ✓ prefix
-            "<｜DSML｜invoke name=\"".to_string(),      // ✓ full open-invoke
-            "<｜DSML｜tool name=\"".to_string(),        // ✓ full open-tool-variant
-            "</｜DSML｜tool_calls>".to_string(),        // ✓ full close
-            "tool_cbl".to_string(),                     // ✗ not a prefix
-            "calling".to_string(),                      // ✗ invented tag
-            "hello world".to_string(),                  // ✗ random text
-            "<bad>".to_string(),                        // ✗ wrong open form
+            "<".to_string(),                       // ✓ prefix of all opens
+            "</".to_string(),                      // ✓ prefix of close
+            "<｜".to_string(),                     // ✓ prefix
+            "<｜DSML｜".to_string(),               // ✓ prefix
+            "<｜DSML｜invoke name=\"".to_string(), // ✓ full open-invoke
+            "<｜DSML｜tool name=\"".to_string(),   // ✓ full open-tool-variant
+            "</｜DSML｜tool_calls>".to_string(),   // ✓ full close
+            "tool_cbl".to_string(),                // ✗ not a prefix
+            "calling".to_string(),                 // ✗ invented tag
+            "hello world".to_string(),             // ✗ random text
+            "<bad>".to_string(),                   // ✗ wrong open form
         ];
         let mut mask = vec![false; vocab.len()];
         m.token_mask(&vocab, &mut mask);
         // First 7 should be allowed, last 4 rejected.
-        for (i, expected) in [true, true, true, true, true, true, true, false, false, false, false].iter().enumerate() {
-            assert_eq!(mask[i], *expected, "vocab[{i}]={:?} expected {expected}", vocab[i]);
+        for (i, expected) in [
+            true, true, true, true, true, true, true, false, false, false, false,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(
+                mask[i], *expected,
+                "vocab[{i}]={:?} expected {expected}",
+                vocab[i]
+            );
         }
     }
 
@@ -1138,9 +1141,9 @@ mod tests {
         // Commit "r" — now only `read` is the active candidate; `w` is locked out.
         m.advance("r");
         let vocab2 = vec![
-            "ead\">\n".to_string(),  // ✓ completes "read\">\n"
-            "ite\">\n".to_string(),  // ✗ would be "write"
-            "x".to_string(),         // ✗ random
+            "ead\">\n".to_string(), // ✓ completes "read\">\n"
+            "ite\">\n".to_string(), // ✗ would be "write"
+            "x".to_string(),        // ✗ random
         ];
         let mut mask2 = vec![false; vocab2.len()];
         m.token_mask(&vocab2, &mut mask2);

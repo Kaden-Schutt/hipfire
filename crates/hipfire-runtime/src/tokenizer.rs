@@ -614,11 +614,19 @@ impl Tokenizer {
     /// For GPT-2 BPE: collects all bytes first, then does UTF-8 conversion once
     /// (individual tokens can be incomplete UTF-8 sequences in byte-level BPE).
     pub fn decode(&self, tokens: &[u32]) -> String {
-        // hunt3 H-C: delegate to the byte-correct decode_bytes path then
-        // from_utf8_lossy once, so multi-byte chars split across <0xHH>
-        // fallback tokens (e.g. CJK 中 = E4 B8 AD) reassemble instead of
-        // mojibake-ing via `byte as char`. Covers both BPE and SentencePiece.
-        String::from_utf8_lossy(&self.decode_bytes(tokens)).into_owned()
+        if self.is_gpt2_bpe {
+            String::from_utf8_lossy(&self.decode_bytes(tokens)).into_owned()
+        } else {
+            let mut result = String::new();
+            for &id in tokens {
+                if let Some(tok) = self.vocab.get(id as usize) {
+                    let decoded = tok.replace('▁', " ");
+                    let decoded = decode_hex_escapes(&decoded);
+                    result.push_str(&decoded);
+                }
+            }
+            result
+        }
     }
 
     /// Decode tokens to raw bytes (for incremental UTF-8 streaming).
@@ -647,10 +655,9 @@ impl Tokenizer {
                         }
                     }
                 } else {
-                    // hunt3 H-C: byte-correct path — <0xHH> fallback tokens must
-                    // emit raw bytes, not `byte as char` re-UTF8-encoded codepoints.
                     let decoded = tok.replace('▁', " ");
-                    bytes.extend_from_slice(&decode_hex_escapes_bytes(&decoded));
+                    let decoded = decode_hex_escapes(&decoded);
+                    bytes.extend_from_slice(decoded.as_bytes());
                 }
             }
         }
@@ -1087,20 +1094,9 @@ static GPT2_OFFSET_TO_BYTE: [u8; 68] = {
     table
 };
 
-/// Decode SentencePiece hex escapes like `<0x0A>` to actual bytes.
-///
-/// Byte-fallback tokens like `<0xE4>` are emitted as the RAW byte 0xE4, NOT as
-/// the Unicode codepoint U+00E4 (which would re-UTF8-encode to two bytes and
-/// mangle CJK / any non-ASCII byte-fallback sequence). Ordinary chars are
-/// encoded as UTF-8. Returns bytes so a multi-byte char split across several
-/// `<0xHH>` tokens (e.g. 中 = E4 B8 AD) reassembles via a single
-/// `from_utf8`/`from_utf8_lossy` at the call site.
-// hunt3 H-C: prior `decode_hex_escapes` did `result.push(byte as char)` which
-// corrupted byte-fallback tokens (0xHH → U+00HH → 2-byte UTF-8); this variant
-// pushes the parsed value as a raw byte instead.
-fn decode_hex_escapes_bytes(s: &str) -> Vec<u8> {
-    let mut result: Vec<u8> = Vec::with_capacity(s.len());
-    let mut buf = [0u8; 4];
+/// Decode SentencePiece hex escapes like <0x0A> to actual bytes.
+fn decode_hex_escapes(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '<' {
@@ -1125,8 +1121,7 @@ fn decode_hex_escapes_bytes(s: &str) -> Vec<u8> {
                     if chars.peek() == Some(&'>') && !hex.is_empty() {
                         chars.next(); // consume '>'
                         if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                            // hunt3 H-C: raw byte, NOT `byte as char`
-                            result.push(byte);
+                            result.push(byte as char);
                             matched = true;
                         }
                     }
@@ -1134,11 +1129,11 @@ fn decode_hex_escapes_bytes(s: &str) -> Vec<u8> {
             }
             if !matched {
                 for ch in temp {
-                    result.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    result.push(ch);
                 }
             }
         } else {
-            result.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            result.push(c);
         }
     }
     result
@@ -1447,21 +1442,15 @@ pub fn strip_trailing_line_ws(s: &str) -> String {
 /// disabled; `Cow::Owned` only on actual rewrite. Each step in the pipeline
 /// is itself a no-op fast-path when its trigger pattern is absent.
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
-    // Default ON. Explicit "0" / "false" / "off" / "no" opts out (parsed once in
-    // RuntimeConfig::from_env). Delegates to the flag-parameterized core so the
-    // pipeline is unit-testable without the memoized `config::get()` singleton.
-    normalize_prompt_with(s, crate::config::get().normalize_prompt)
-}
-
-/// Core prompt-normalization pipeline, parameterized on the enable flag.
-/// `maybe_normalize_prompt` is the production entry point; tests call this
-/// directly with an explicit flag. (The global `config::get()` is a memoized
-/// `OnceLock`, so toggling `HIPFIRE_NORMALIZE_PROMPT` per-call can't drive it
-/// in a shared test process — that mismatch is what silently broke the
-/// opt-out tests until CI surfaced it.)
-fn normalize_prompt_with(s: &str, enabled: bool) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
-    if !enabled {
+    // Default ON. Explicit "0" / "false" / "off" / "no" opts out.
+    if matches!(
+        std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    ) {
+        return Cow::Borrowed(s);
+    }
+    if !crate::config::get().normalize_prompt {
         return Cow::Borrowed(s);
     }
 
@@ -1885,27 +1874,6 @@ mod sp_tests {
     }
 
     #[test]
-    fn sp_decode_byte_fallback_cjk() {
-        // hunt3 H-C regression: SentencePiece byte-fallback emits a CJK char as
-        // a run of <0xHH> tokens. "中" = U+4E2D = bytes E4 B8 AD. The old
-        // `byte as char` path mapped each 0xHH to U+00HH and re-UTF8-encoded it
-        // to 2 bytes → mojibake. decode_bytes must reassemble the raw 3 bytes,
-        // and decode() must from_utf8 them back into "中".
-        let tok = synth_sp(&["<0xE4>", "<0xB8>", "<0xAD>"]);
-        let toks = [0u32, 1, 2];
-        assert_eq!(tok.decode_bytes(&toks), "中".as_bytes());
-        assert_eq!(tok.decode(&toks), "中");
-    }
-
-    #[test]
-    fn sp_decode_hex_escapes_bytes_ascii_and_literal() {
-        // ASCII byte-fallback (<0x0A> = newline) and a non-matching literal
-        // "<0xZZ>" must pass through untouched, encoded as UTF-8.
-        assert_eq!(decode_hex_escapes_bytes("<0x0A>"), vec![b'\n']);
-        assert_eq!(decode_hex_escapes_bytes("a<0xZZ>b"), b"a<0xZZ>b".to_vec());
-    }
-
-    #[test]
     fn sp_encode_longest_match_ascii() {
         // Vocab has the full "▁hello" plus shorter prefixes. sp_text is
         // "▁hello"; greedy starts at end=6 (full string) and matches
@@ -1948,13 +1916,6 @@ mod sp_tests {
 #[cfg(test)]
 mod prompt_norm_tests {
     use super::*;
-
-    // The flag-routing tests below call `normalize_prompt_with(s, enabled)`
-    // directly instead of toggling `HIPFIRE_NORMALIZE_PROMPT` and going through
-    // `maybe_normalize_prompt`. The env var is consumed once by the memoized
-    // `config::get()` singleton, so per-call toggling can't drive it in a
-    // shared test process — testing the parameterized core keeps these
-    // deterministic and parallel-safe.
 
     #[test]
     fn collapse_three_to_two() {
@@ -2007,28 +1968,31 @@ mod prompt_norm_tests {
     }
 
     #[test]
-    fn enabled_collapses_newline_runs() {
-        // Enabled (the production default) → `\n{3,}` collapses to `\n\n`.
+    fn default_on_collapses_when_env_unset() {
+        // Default flipped to ON 2026-04-26 — env unset → still collapses.
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "a\n\n\nb";
-        let out = normalize_prompt_with(s, true);
+        let out = maybe_normalize_prompt(s);
         assert!(matches!(out, std::borrow::Cow::Owned(_)));
         assert_eq!(out.as_ref(), "a\n\nb");
     }
 
     #[test]
-    fn disabled_passes_through_borrowed() {
-        // Opt-out (HIPFIRE_NORMALIZE_PROMPT=0 → enabled=false) → input untouched.
+    fn explicit_zero_opts_out() {
+        std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         let s = "a\n\n\nb";
-        let out = normalize_prompt_with(s, false);
+        let out = maybe_normalize_prompt(s);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), "a\n\n\nb");
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
     }
 
     #[test]
     fn cow_borrowed_when_no_runs() {
-        // Even enabled, no `\n{3,}` runs means no rewrite needed → Borrowed.
+        // Even with default-ON, no `\n{3,}` runs means no rewrite needed.
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "a\n\nb"; // already single-blank
-        let out = normalize_prompt_with(s, true);
+        let out = maybe_normalize_prompt(s);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), "a\n\nb");
     }
@@ -2201,8 +2165,9 @@ mod prompt_norm_tests {
     #[test]
     fn pipeline_crlf_and_trailing_ws() {
         // Windows-pasted snippet with trailing whitespace.
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "def foo():   \r\n    return 1   \r\n";
-        let out = normalize_prompt_with(s, true);
+        let out = maybe_normalize_prompt(s);
         assert_eq!(out.as_ref(), "def foo():\n    return 1\n");
     }
 
@@ -2211,34 +2176,38 @@ mod prompt_norm_tests {
         // Indented blank line between top-level defs:
         //   "a\n    \n\nb" — line 2 is whitespace-only, lines 2-3 form a `\n\n\n`
         //   run after stripping. Collapse should reduce to `\n\n`.
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "a\n    \n\nb";
-        let out = normalize_prompt_with(s, true);
+        let out = maybe_normalize_prompt(s);
         assert_eq!(out.as_ref(), "a\n\nb");
     }
 
     #[test]
     fn pipeline_nbsp_in_prose() {
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "Use\u{00A0}foo()\u{00A0}for\u{00A0}this.";
-        let out = normalize_prompt_with(s, true);
+        let out = maybe_normalize_prompt(s);
         assert_eq!(out.as_ref(), "Use foo() for this.");
     }
 
     #[test]
     fn pipeline_clean_input_is_borrowed() {
         // No CRLF, no NBSP, no trailing ws, no \n{3,} — must stay Borrowed.
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "Plain prompt.\nSecond line.\n\nThird paragraph.\n";
-        let out = normalize_prompt_with(s, true);
+        let out = maybe_normalize_prompt(s);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), s);
     }
 
     #[test]
     fn pipeline_explicit_opt_out_skips_all_rules() {
-        // Opt-out (enabled=false) must skip CRLF/NBSP/trailing-ws too, not just
-        // newline collapse.
+        // Opt-out must skip CRLF/NBSP/trailing-ws too, not just newline collapse.
+        std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         let s = "a\r\nb\u{00A0}c   \nd\n\n\ne";
-        let out = normalize_prompt_with(s, false);
+        let out = maybe_normalize_prompt(s);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), s);
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
     }
 }

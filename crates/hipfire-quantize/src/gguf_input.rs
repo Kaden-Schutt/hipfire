@@ -117,12 +117,6 @@ impl MetaValue {
             _ => None,
         }
     }
-    pub fn as_f32(&self) -> Option<f32> {
-        match self {
-            MetaValue::F32(v) => Some(*v),
-            _ => None,
-        }
-    }
     pub fn as_str(&self) -> Option<&str> {
         match self {
             MetaValue::String(s) => Some(s),
@@ -204,7 +198,12 @@ impl GgufFile {
                 )
             })?;
             let offset = cursor.read_u64::<LittleEndian>()? as usize;
-            tensors.push(TensorInfo { name, shape, dtype, offset });
+            tensors.push(TensorInfo {
+                name,
+                shape,
+                dtype,
+                offset,
+            });
         }
 
         let alignment = metadata
@@ -232,12 +231,6 @@ impl GgufFile {
 
     pub fn meta(&self, key: &str) -> Option<&MetaValue> {
         self.metadata.get(key)
-    }
-    pub fn meta_u32(&self, key: &str) -> Option<u32> {
-        self.meta(key).and_then(|v| v.as_u32())
-    }
-    pub fn meta_f32(&self, key: &str) -> Option<f32> {
-        self.meta(key).and_then(|v| v.as_f32())
     }
     pub fn meta_str(&self, key: &str) -> Option<&str> {
         self.meta(key).and_then(|v| v.as_str())
@@ -500,10 +493,18 @@ fn dequant_q6_k(data: &[u8], n: usize) -> Vec<f32> {
                 let idx1 = y_off + l + 32;
                 let idx2 = y_off + l + 64;
                 let idx3 = y_off + l + 96;
-                if idx0 < n { out[idx0] = d * sc[is] as i8 as f32 * q1 as f32; }
-                if idx1 < n { out[idx1] = d * sc[is + 2] as i8 as f32 * q2 as f32; }
-                if idx2 < n { out[idx2] = d * sc[is + 4] as i8 as f32 * q3 as f32; }
-                if idx3 < n { out[idx3] = d * sc[is + 6] as i8 as f32 * q4 as f32; }
+                if idx0 < n {
+                    out[idx0] = d * sc[is] as i8 as f32 * q1 as f32;
+                }
+                if idx1 < n {
+                    out[idx1] = d * sc[is + 2] as i8 as f32 * q2 as f32;
+                }
+                if idx2 < n {
+                    out[idx2] = d * sc[is + 4] as i8 as f32 * q3 as f32;
+                }
+                if idx3 < n {
+                    out[idx3] = d * sc[is + 6] as i8 as f32 * q4 as f32;
+                }
             }
             ql = &ql[64..];
             qh = &qh[32..];

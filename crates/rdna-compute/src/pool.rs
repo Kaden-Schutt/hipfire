@@ -39,7 +39,11 @@ impl GpuPool {
     /// is no VRAM padding waste.
     fn bucket_key(size: usize) -> usize {
         const MIN: usize = 256;
-        if size <= MIN { MIN } else { size.next_power_of_two() }
+        if size <= MIN {
+            MIN
+        } else {
+            size.next_power_of_two()
+        }
     }
 
     /// Get a buffer of at least `size` bytes. Reuses from the free-list

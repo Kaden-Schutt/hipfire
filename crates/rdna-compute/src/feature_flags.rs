@@ -59,7 +59,6 @@ pub struct FeatureFlags {
     pub hfq3_mmq_layer_max: Option<usize>,
     pub hfq4_mmq_gfx906_y64: bool,
     pub gate_up_variant: Option<String>,
-    pub gate_up_nosync: bool,
     pub gfx942_gemv_v2: Option<bool>,
     pub gfx942_gemv_v3: bool,
     pub gfx942_rmsnorm_split: bool,
@@ -192,7 +191,6 @@ impl FeatureFlags {
             hfq4_mmq_gfx906_y64: std::env::var("HIPFIRE_HFQ4_MMQ_GFX906_Y64")
                 .map_or(false, |v| v == "1"),
             gate_up_variant: std::env::var("HIPFIRE_GATE_UP_VARIANT").ok(),
-            gate_up_nosync: std::env::var("HIPFIRE_GATE_UP_NOSYNC").as_deref() == Ok("1"),
             gfx942_gemv_v2: parse_bool("HIPFIRE_GFX942_GEMV_V2"),
             gfx942_gemv_v3: std::env::var("HIPFIRE_GFX942_GEMV_V3").map_or(false, |v| v == "1"),
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942")
@@ -344,7 +342,6 @@ impl FeatureFlags {
             hfq3_mmq_layer_max: None,
             hfq4_mmq_gfx906_y64: false,
             gate_up_variant: None,
-            gate_up_nosync: false,
             gfx942_gemv_v2: None,
             gfx942_gemv_v3: false,
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942"),

@@ -13,9 +13,9 @@
 //! verdict. Exit 0 on PASS (loaded + compat), 1 on tokenizer mismatch, 2 on
 //! load failure.
 
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_arch_qwen35::pflash::{self, PflashConfig, PflashState};
 use hipfire_arch_qwen35::qwen35;
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::path::Path;
 use std::time::Instant;
@@ -37,11 +37,14 @@ fn main() {
     // target is already running in production by the time the daemon calls
     // load_drafter, so this smoke just needs the tokenizer.
     let target_hfq = HfqFile::open(Path::new(target_path)).expect("open target HFQ");
-    let target_tokenizer = Tokenizer::from_hfq_metadata(&target_hfq.metadata_json)
-        .expect("target tokenizer");
+    let target_tokenizer =
+        Tokenizer::from_hfq_metadata(&target_hfq.metadata_json).expect("target tokenizer");
     let target_cfg = qwen35::config_from_hfq(&target_hfq).expect("target qwen35 config");
     eprintln!("target tokenizer: {} tokens", target_tokenizer.vocab_size());
-    eprintln!("target arch: dim={} layers={} heads={}", target_cfg.dim, target_cfg.n_layers, target_cfg.n_heads);
+    eprintln!(
+        "target arch: dim={} layers={} heads={}",
+        target_cfg.dim, target_cfg.n_layers, target_cfg.n_heads
+    );
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
 
@@ -57,8 +60,10 @@ fn main() {
     } else {
         ("unknown", 0, 0)
     };
-    eprintln!("drafter family: {} ({} layers × {} hidden, max_kv_seq={max_kv_seq})",
-        est_layers_hidden.0, est_layers_hidden.1, est_layers_hidden.2);
+    eprintln!(
+        "drafter family: {} ({} layers × {} hidden, max_kv_seq={max_kv_seq})",
+        est_layers_hidden.0, est_layers_hidden.1, est_layers_hidden.2
+    );
     drop(drafter_hfq_peek);
 
     // Build a minimal config to construct PflashState, then load.
@@ -70,7 +75,11 @@ fn main() {
 
     let t_load = Instant::now();
     let res = pflash::load_drafter(
-        &mut state, &mut gpu, Path::new(drafter_path), &target_tokenizer, max_kv_seq,
+        &mut state,
+        &mut gpu,
+        Path::new(drafter_path),
+        &target_tokenizer,
+        max_kv_seq,
     );
     let load_ms = t_load.elapsed().as_millis();
     match res {
@@ -84,10 +93,17 @@ fn main() {
     eprintln!("drafter_loaded:    {}", state.drafter_loaded);
     eprintln!("tokenizer_compat:  {}", state.tokenizer_compat);
     if let Some(ref m) = state.drafter_model {
-        eprintln!("drafter variant: {} (layers={} kv_heads={} head_dim={})",
-            m.variant_name(), m.n_layers(), m.n_kv_heads(), m.head_dim());
-        eprintln!("auto score_layer_idx: {:?} (None = no FullAttention layer)",
-            m.score_layer_idx());
+        eprintln!(
+            "drafter variant: {} (layers={} kv_heads={} head_dim={})",
+            m.variant_name(),
+            m.n_layers(),
+            m.n_kv_heads(),
+            m.head_dim()
+        );
+        eprintln!(
+            "auto score_layer_idx: {:?} (None = no FullAttention layer)",
+            m.score_layer_idx()
+        );
     }
     if let Some(ref t) = state.drafter_tokenizer {
         eprintln!("drafter tokenizer: {} tokens", t.vocab_size());
@@ -95,7 +111,10 @@ fn main() {
 
     // Demonstrate the gating result that the daemon will see.
     use hipfire_arch_qwen35::pflash::{decide_bypass, PflashMode, RequestKind};
-    let demo_cfg = PflashConfig { mode: PflashMode::Always, ..cfg.clone() };
+    let demo_cfg = PflashConfig {
+        mode: PflashMode::Always,
+        ..cfg.clone()
+    };
     let probe_tokens = vec![1u32; 100];
     let bypass = decide_bypass(&state, &demo_cfg, &probe_tokens, RequestKind::Text);
     eprintln!("decide_bypass (Always, 100 tok, Text): {bypass:?}");
@@ -129,25 +148,39 @@ fn main() {
             ..cfg.clone()
         };
         match hipfire_arch_qwen35::pflash::maybe_compress_prompt(
-            &mut gpu, &mut state, &demo_cfg2, &toy_prompt, RequestKind::Text, &[],
+            &mut gpu,
+            &mut state,
+            &demo_cfg2,
+            &toy_prompt,
+            RequestKind::Text,
+            &[],
         ) {
             Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
-                eprintln!("maybe_compress_prompt: source={} kept={} ratio={:.3}",
-                    cp.source_tokens, cp.kept_tokens,
-                    cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32);
+                eprintln!(
+                    "maybe_compress_prompt: source={} kept={} ratio={:.3}",
+                    cp.source_tokens,
+                    cp.kept_tokens,
+                    cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32
+                );
                 eprintln!("source_md5    = {}", cp.source_md5);
                 eprintln!("compressed_md5= {}", cp.compressed_md5);
                 eprintln!("kept_spans    = {:?}", cp.kept_spans);
-                eprintln!("timings: score={}ms select={}ms gather={}ms total={}ms",
-                    cp.timings.score_ms, cp.timings.select_ms,
-                    cp.timings.gather_ms, cp.timings.total_ms);
+                eprintln!(
+                    "timings: score={}ms select={}ms gather={}ms total={}ms",
+                    cp.timings.score_ms,
+                    cp.timings.select_ms,
+                    cp.timings.gather_ms,
+                    cp.timings.total_ms
+                );
 
                 let span_total: usize = cp.kept_spans.iter().map(|(s, e)| e - s).sum();
                 let length_ok = cp.kept_tokens == span_total
                     && cp.kept_tokens == cp.token_ids.len()
                     && cp.kept_tokens < cp.source_tokens;
                 let spans_disjoint = cp.kept_spans.windows(2).all(|w| w[0].1 < w[1].0);
-                let monotone_tokens = cp.kept_spans.iter()
+                let monotone_tokens = cp
+                    .kept_spans
+                    .iter()
                     .flat_map(|&(s, e)| (s..e).map(|i| toy_prompt[i]))
                     .eq(cp.token_ids.iter().copied());
                 let md5_present = !cp.source_md5.is_empty() && !cp.compressed_md5.is_empty();
@@ -163,20 +196,32 @@ fn main() {
                 // should agree to within numerical tolerance. If they don't,
                 // the new HIP kernel is wrong.
                 let scorer_health_ok = {
-                    let mut probe_state = state.drafter_loaded;
+                    let probe_state = state.drafter_loaded;
                     if probe_state {
                         let cpu = hipfire_arch_qwen35::pflash::compute_scores_batched(
-                            &mut state, &mut gpu, &toy_prompt, demo_cfg2.block_size,
+                            &mut state,
+                            &mut gpu,
+                            &toy_prompt,
+                            demo_cfg2.block_size,
                         );
                         let gpu_res = hipfire_arch_qwen35::pflash::compute_scores_batched_gpu(
-                            &mut state, &mut gpu, &toy_prompt, demo_cfg2.block_size,
+                            &mut state,
+                            &mut gpu,
+                            &toy_prompt,
+                            demo_cfg2.block_size,
                         );
                         match (cpu, gpu_res) {
                             (Ok(c), Ok(g)) => {
-                                let max_err: f32 = c.scores.iter().zip(g.scores.iter())
-                                    .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-                                eprintln!("scorer xcheck: cpu={:?} gpu={:?} max_abs_err={:.3e}",
-                                    c.scores, g.scores, max_err);
+                                let max_err: f32 = c
+                                    .scores
+                                    .iter()
+                                    .zip(g.scores.iter())
+                                    .map(|(a, b)| (a - b).abs())
+                                    .fold(0.0f32, f32::max);
+                                eprintln!(
+                                    "scorer xcheck: cpu={:?} gpu={:?} max_abs_err={:.3e}",
+                                    c.scores, g.scores, max_err
+                                );
                                 let any_nonzero = g.scores.iter().any(|s| s.abs() > 1e-6);
                                 let all_finite = g.scores.iter().all(|s| s.is_finite());
                                 eprintln!("scorer health: any_nonzero={any_nonzero} all_finite={all_finite}");
@@ -190,7 +235,6 @@ fn main() {
                             }
                             (Err(e), _) | (_, Err(e)) => {
                                 eprintln!("scorer probe errored: {e:?}");
-                                probe_state = false;
                                 false
                             }
                         }
@@ -199,9 +243,11 @@ fn main() {
                         false
                     }
                 };
-                eprintln!("length_ok={length_ok} spans_disjoint={spans_disjoint} \
+                eprintln!(
+                    "length_ok={length_ok} spans_disjoint={spans_disjoint} \
                            monotone={monotone_tokens} md5_present={md5_present} \
-                           scorer_health_ok={scorer_health_ok}");
+                           scorer_health_ok={scorer_health_ok}"
+                );
                 length_ok && spans_disjoint && monotone_tokens && md5_present && scorer_health_ok
             }
             Ok(hipfire_arch_qwen35::pflash::PflashDecision::Bypass { reason }) => {

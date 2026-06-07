@@ -31,13 +31,20 @@ __global__ void probe_wmma(float* __restrict__ out) {
 }
 "#;
 
-    gpu.ensure_kernel_public("probe_wmma", src, "probe_wmma").unwrap();
+    gpu.ensure_kernel_public("probe_wmma", src, "probe_wmma")
+        .unwrap();
 
     let d_out = gpu.zeros(&[32 * 8], rdna_compute::DType::F32).unwrap();
     let mut kernargs = hip_bridge::KernargBlob::new();
     kernargs.push_ptr(d_out.buf.as_ptr());
-    gpu.launch_kernel_blob("probe_wmma", [1, 1, 1], [32, 1, 1], 0, kernargs.as_mut_slice())
-        .unwrap();
+    gpu.launch_kernel_blob(
+        "probe_wmma",
+        [1, 1, 1],
+        [32, 1, 1],
+        0,
+        kernargs.as_mut_slice(),
+    )
+    .unwrap();
 
     let out = gpu.download_f32(&d_out).unwrap();
 
@@ -55,7 +62,9 @@ __global__ void probe_wmma(float* __restrict__ out) {
         let half = tid >> 4;
         // Decode: value = (n+1)*100, so n = value/100 - 1
         let cols: Vec<i32> = vals.iter().map(|&v| (v / 100.0 + 0.5) as i32 - 1).collect();
-        eprintln!("  tid={tid:2} (row={row:2}, half={half}): values={:.0?} → cols={cols:?}",
-            vals.iter().map(|v| *v as i32).collect::<Vec<_>>());
+        eprintln!(
+            "  tid={tid:2} (row={row:2}, half={half}): values={:.0?} → cols={cols:?}",
+            vals.iter().map(|v| *v as i32).collect::<Vec<_>>()
+        );
     }
 }

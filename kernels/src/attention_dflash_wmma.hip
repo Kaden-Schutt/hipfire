@@ -67,7 +67,8 @@ __global__ void attention_dflash_wmma_f32(
     const float* __restrict__ v,
     float* __restrict__ out,
     int B, int L, int n_heads, int n_kv_heads, int head_dim,
-    float scale
+    float scale,
+    int is_causal
 ) {
     const int head = blockIdx.x;
     const int qt = blockIdx.y;
@@ -127,6 +128,7 @@ __global__ void attention_dflash_wmma_f32(
 
     // ─── Loop over K-tiles ────────────────────────────────────────────
     for (int kt_start = 0; kt_start < L; kt_start += 16) {
+        if (is_causal && kt_start >= q_start + 16) continue;
         int kt_size = L - kt_start;
         if (kt_size > 16) kt_size = 16;
 
@@ -171,6 +173,7 @@ __global__ void attention_dflash_wmma_f32(
             int s_row = 2 * j + half_id;
             float s_val = s_acc[j] * scale;
             if (!col_valid) s_val = -INFINITY;
+            if (is_causal && (kt_start + s_col > q_start + s_row)) s_val = -INFINITY;
             S_lds[s_row * 16 + s_col] = s_val;
         }
 

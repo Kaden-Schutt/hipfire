@@ -83,6 +83,22 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_down_expanded_k4(
             +  cb[b1 >> 6]       * x[base + 7];
     };
 
+    if (groups_per_row == 2) {
+        const char* gp0 = row_ptr;
+        const char* gp1 = gp0 + 72;
+        group_fma(gp0, xoff,       acc0);
+        group_fma(gp1, xoff + 256, acc1);
+
+        float acc = acc0 + acc1;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc += __shfl_down(acc, offset);
+
+        if (tid == 0) {
+            expert_outputs[(long long)bid * K_TOP * M + (long long)krank * M + row] = acc;
+        }
+        return;
+    }
+
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const char* gp0 = row_ptr + g * 72;

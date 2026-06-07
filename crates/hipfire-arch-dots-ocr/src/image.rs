@@ -137,21 +137,15 @@ fn smart_resize_inner(
     let h_round = ((h / factor_f).round() as usize) * factor;
     let w_round = ((w / factor_f).round() as usize) * factor;
 
-    // Use u64 for pixel-count comparisons to avoid usize overflow on
-    // 32-bit targets. (Defense-in-depth; callers gate dimensions.)
-    let hround_wround = (h_round as u64) * (w_round as u64);
-
-    let (h_out, w_out) = if hround_wround > max_pixels as u64 {
+    let (h_out, w_out) = if h_round * w_round > max_pixels {
         // Down-scale: shrink by sqrt(h*w / max_pixels), then floor to factor.
-        let hw = h * w;
-        let beta = (hw / max_pixels as f64).sqrt();
+        let beta = (h * w / max_pixels as f64).sqrt();
         let h_scaled = factor.max(((h / beta / factor_f).floor() as usize) * factor);
         let w_scaled = factor.max(((w / beta / factor_f).floor() as usize) * factor);
         (h_scaled, w_scaled)
-    } else if hround_wround < min_pixels as u64 {
+    } else if h_round * w_round < min_pixels {
         // Up-scale: grow by sqrt(min_pixels / (h*w)), then ceil to factor.
-        let hw = h * w;
-        let beta = (min_pixels as f64 / hw).sqrt();
+        let beta = (min_pixels as f64 / (h * w)).sqrt();
         let h_scaled = factor.max(((h * beta / factor_f).ceil() as usize) * factor);
         let w_scaled = factor.max(((w * beta / factor_f).ceil() as usize) * factor);
         // Edge case from `dots_ocr/utils/image_utils.py:56-61`: the
@@ -162,9 +156,8 @@ fn smart_resize_inner(
         // dots.ocr's MIN=3136 / MAX=11_289_600 the ratio (~3600×) makes
         // this branch effectively unreachable, but we mirror the source
         // exactly to keep the byte-identity claim with HF.
-        let hs_ws = (h_scaled as u64) * (w_scaled as u64);
-        if hs_ws > max_pixels as u64 {
-            let beta = (hs_ws as f64 / max_pixels as f64).sqrt();
+        if h_scaled * w_scaled > max_pixels {
+            let beta = ((h_scaled * w_scaled) as f64 / max_pixels as f64).sqrt();
             let h_re = factor.max(((h_scaled as f64 / beta / factor_f).floor() as usize) * factor);
             let w_re = factor.max(((w_scaled as f64 / beta / factor_f).floor() as usize) * factor);
             (h_re, w_re)

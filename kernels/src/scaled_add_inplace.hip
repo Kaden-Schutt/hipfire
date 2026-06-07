@@ -13,6 +13,9 @@
 //                which is what you want when c was computed on-device
 //                (e.g. sigmoid of a small gate projection) so you can
 //                skip the otherwise-synchronous D2H download.
+//   _gpu_sigmoid_rows: c_buf[row] is sigmoid-transformed and applied to
+//                each element in that row. Used by batched MoE shared
+//                experts where each token has its own scalar gate.
 
 extern "C" __global__ void scaled_add_inplace_cpu_scalar_f32(
     float* __restrict__ y,
@@ -35,4 +38,19 @@ extern "C" __global__ void scaled_add_inplace_gpu_scalar_f32(
     const float c = c_buf[0];
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] += c * x[i];
+}
+
+extern "C" __global__ void scaled_add_inplace_gpu_sigmoid_rows_f32(
+    float* __restrict__ y,
+    const float* __restrict__ x,
+    const float* __restrict__ c_buf,
+    int row_width,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int row = i / row_width;
+    const float z = c_buf[row];
+    const float c = 1.0f / (1.0f + __expf(-z));
+    y[i] += c * x[i];
 }

@@ -10,12 +10,14 @@
 //! dequant error + differing trig intrinsic implementations).
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("build with --features deltanet"); }
+fn main() {
+    eprintln!("build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_runtime::triattn::{self, BandCenter, TriAttnCenters};
     use hipfire_runtime::llama::f16_to_f32;
+    use hipfire_runtime::triattn::{self, BandCenter, TriAttnCenters};
     use rdna_compute::{DType, Gpu};
 
     // ── Fixed synthetic config ─────────────────────────────────────────
@@ -32,7 +34,9 @@ fn main() {
 
     // Deterministic "random" via LCG so CPU and GPU see identical bytes.
     fn lcg(seed: &mut u64) -> f32 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // Map top 24 bits to [-1, 1).
         let bits = (*seed >> 40) as u32;
         let uniform = bits as f32 / (1u32 << 24) as f32;
@@ -40,17 +44,20 @@ fn main() {
     }
 
     // ── Build centers ──────────────────────────────────────────────────
-    let mut centers = TriAttnCenters::new(
-        1, n_heads, head_dim, rope_theta, partial_rotary_factor,
-    );
+    let mut centers = TriAttnCenters::new(1, n_heads, head_dim, rope_theta, partial_rotary_factor);
     let mut seed = 0xdeadbeefu64;
     for h in 0..n_heads {
         for f in 0..n_bands {
-            centers.set(0, h, f, BandCenter {
-                eq_re: 0.3 * lcg(&mut seed),
-                eq_im: 0.3 * lcg(&mut seed),
-                e_abs_q: 0.5 + 0.3 * lcg(&mut seed).abs(),
-            });
+            centers.set(
+                0,
+                h,
+                f,
+                BandCenter {
+                    eq_re: 0.3 * lcg(&mut seed),
+                    eq_im: 0.3 * lcg(&mut seed),
+                    e_abs_q: 0.5 + 0.3 * lcg(&mut seed).abs(),
+                },
+            );
         }
     }
 
@@ -93,18 +100,30 @@ fn main() {
         let tmp = gpu.upload_f32(&row, &[kv_dim]).unwrap();
         let pos_bytes = (pos as i32).to_ne_bytes();
         gpu.hip.memcpy_htod(&pos_dev, &pos_bytes).unwrap();
-        gpu.kv_cache_write_q8_0(&k_cache, &tmp, &pos_dev, n_kv_heads, head_dim).unwrap();
+        gpu.kv_cache_write_q8_0(&k_cache, &tmp, &pos_dev, n_kv_heads, head_dim)
+            .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
 
     // ── GPU scoring ────────────────────────────────────────────────────
     let scores_gpu = gpu.alloc_tensor(&[n_heads * seq_len], DType::F32).unwrap();
-    let centers_dev = gpu.upload_f32(&centers_flat, &[n_heads * n_bands * 3]).unwrap();
+    let centers_dev = gpu
+        .upload_f32(&centers_flat, &[n_heads * n_bands * 3])
+        .unwrap();
 
     gpu.triattn_score_q8(
-        &k_cache, &centers_dev, &scores_gpu,
-        n_heads, n_kv_heads, head_dim, n_rot, rope_theta, p_q, seq_len,
-    ).unwrap();
+        &k_cache,
+        &centers_dev,
+        &scores_gpu,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        n_rot,
+        rope_theta,
+        p_q,
+        seq_len,
+    )
+    .unwrap();
     gpu.hip.device_synchronize().unwrap();
 
     let gpu_scores = gpu.download_f32(&scores_gpu).unwrap();
@@ -119,7 +138,9 @@ fn main() {
     let k_cache_bytes = {
         let floats = gpu.download_f32(&k_cache).unwrap();
         let mut bytes = Vec::with_capacity(floats.len() * 4);
-        for v in &floats { bytes.extend_from_slice(&v.to_ne_bytes()); }
+        for v in &floats {
+            bytes.extend_from_slice(&v.to_ne_bytes());
+        }
         bytes
     };
 
@@ -138,7 +159,7 @@ fn main() {
             let pos_base = pos * bytes_per_pos + h_kv * blocks_per_head * 34;
             let mut k_dequant = vec![0.0f32; head_dim];
             for b in 0..blocks_per_head {
-                let blk = &k_cache_bytes[pos_base + b * 34 .. pos_base + (b + 1) * 34];
+                let blk = &k_cache_bytes[pos_base + b * 34..pos_base + (b + 1) * 34];
                 let scale_bits = u16::from_le_bytes([blk[0], blk[1]]);
                 // Q8 stores scale as f16 (cast from float in the kernel).
                 let scale = f16_to_f32(scale_bits);
@@ -154,10 +175,14 @@ fn main() {
 
             let g = gpu_scores[h * seq_len + pos];
             let diff = (s - g).abs();
-            if diff > max_abs { max_abs = diff; }
+            if diff > max_abs {
+                max_abs = diff;
+            }
             let denom = s.abs().max(g.abs()).max(1e-6);
             let rel = diff / denom;
-            if rel > max_rel { max_rel = rel; }
+            if rel > max_rel {
+                max_rel = rel;
+            }
         }
     }
 
@@ -175,10 +200,16 @@ fn main() {
     for i in (0..4).chain(cpu_scores.len().saturating_sub(4)..cpu_scores.len()) {
         let h = i / seq_len;
         let pos = i % seq_len;
-        eprintln!("  h={h} pos={pos}: cpu={} gpu={}", cpu_scores[i], gpu_scores[i]);
+        eprintln!(
+            "  h={h} pos={pos}: cpu={} gpu={}",
+            cpu_scores[i], gpu_scores[i]
+        );
     }
 
-    eprintln!("GPU vs CPU parity over {n_heads} heads × {seq_len} positions = {} scores", n_heads * seq_len);
+    eprintln!(
+        "GPU vs CPU parity over {n_heads} heads × {seq_len} positions = {} scores",
+        n_heads * seq_len
+    );
     eprintln!("  max |Δ|  = {max_abs:.2e}");
     eprintln!("  max rel  = {max_rel:.2e}");
     eprintln!("  mean |Δ| = {mean_abs:.2e}");

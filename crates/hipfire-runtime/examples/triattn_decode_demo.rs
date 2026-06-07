@@ -14,13 +14,15 @@
 //! 7. Report both outputs so we can eyeball coherence.
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("build with --features deltanet"); }
+fn main() {
+    eprintln!("build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{self, KvCache};
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{self, TriAttnCenters};
     use rdna_compute::{DType, Gpu};
@@ -52,8 +54,17 @@ fn main() {
     let n_bands = config.head_dim / 2;
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
 
-    let fa_layer_ids: Vec<usize> = config.layer_types.iter().enumerate()
-        .filter_map(|(i, t)| if *t == LayerType::FullAttention { Some(i) } else { None })
+    let fa_layer_ids: Vec<usize> = config
+        .layer_types
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            if *t == LayerType::FullAttention {
+                Some(i)
+            } else {
+                None
+            }
+        })
         .collect();
     eprintln!("FA layers: {:?}", fa_layer_ids);
     eprintln!("budget={budget} prefill={prefill_len} gen={gen_len}");
@@ -77,28 +88,47 @@ fn main() {
             }
         }
     }
-    let centers_dev = gpu.upload_f32(&centers_flat, &[centers_flat.len()]).unwrap();
+    let centers_dev = gpu
+        .upload_f32(&centers_flat, &[centers_flat.len()])
+        .unwrap();
     let centers_per_layer = config.n_heads * n_bands * 3;
 
     // ── Tokenize ───────────────────────────────────────────────────────
     let prompt_tokens = tok.encode(prompt);
     let prompt_len = prompt_tokens.len().min(prefill_len);
-    eprintln!("prompt: {} tokens (using first {})", prompt_tokens.len(), prompt_len);
+    eprintln!(
+        "prompt: {} tokens (using first {})",
+        prompt_tokens.len(),
+        prompt_len
+    );
 
     // ── Run 1: reference (no eviction) ─────────────────────────────────
     let (ref_tokens, ref_text) = {
         let mut kv = match kv_mode.as_str() {
             "asym3" => KvCache::new_gpu_asym3(
-                &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
-            ).unwrap(),
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            )
+            .unwrap(),
             _ => KvCache::new_gpu_q8(
-                &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
-            ).unwrap(),
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            )
+            .unwrap(),
         };
         let mut dn = DeltaNetState::new(&mut gpu, &config).unwrap();
 
         for (p, t) in prompt_tokens.iter().take(prompt_len).enumerate() {
-            qwen35::forward_scratch(&mut gpu, &weights, &config, *t, p, &mut kv, &mut dn, &scratch).unwrap();
+            qwen35::forward_scratch(
+                &mut gpu, &weights, &config, *t, p, &mut kv, &mut dn, &scratch,
+            )
+            .unwrap();
         }
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
         let mut next = llama::argmax(&logits);
@@ -106,7 +136,10 @@ fn main() {
         emitted.push(next);
         for step in 0..gen_len {
             let pos = prompt_len + step;
-            qwen35::forward_scratch(&mut gpu, &weights, &config, next, pos, &mut kv, &mut dn, &scratch).unwrap();
+            qwen35::forward_scratch(
+                &mut gpu, &weights, &config, next, pos, &mut kv, &mut dn, &scratch,
+            )
+            .unwrap();
             logits = gpu.download_f32(&scratch.logits).unwrap();
             next = llama::argmax(&logits);
             emitted.push(next);
@@ -119,16 +152,29 @@ fn main() {
     let (evict_tokens, evict_text, retain_sample) = {
         let mut kv = match kv_mode.as_str() {
             "asym3" => KvCache::new_gpu_asym3(
-                &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
-            ).unwrap(),
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            )
+            .unwrap(),
             _ => KvCache::new_gpu_q8(
-                &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
-            ).unwrap(),
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            )
+            .unwrap(),
         };
         let mut dn = DeltaNetState::new(&mut gpu, &config).unwrap();
 
         for (p, t) in prompt_tokens.iter().take(prompt_len).enumerate() {
-            qwen35::forward_scratch(&mut gpu, &weights, &config, *t, p, &mut kv, &mut dn, &scratch).unwrap();
+            qwen35::forward_scratch(
+                &mut gpu, &weights, &config, *t, p, &mut kv, &mut dn, &scratch,
+            )
+            .unwrap();
         }
 
         // Last-query position for scoring = absolute pos of the last token.
@@ -148,7 +194,9 @@ fn main() {
         // One temp compact buffer for the gather per stream (reused across layers).
         let k_compact = gpu.zeros(&[k_compact_floats], DType::F32).unwrap();
         let v_compact = gpu.zeros(&[v_compact_floats], DType::F32).unwrap();
-        let scores_buf = gpu.alloc_tensor(&[config.n_heads * prompt_len], DType::F32).unwrap();
+        let scores_buf = gpu
+            .alloc_tensor(&[config.n_heads * prompt_len], DType::F32)
+            .unwrap();
         let retain_dev = gpu.alloc_tensor(&[budget], DType::F32).unwrap();
 
         let mut retain_sample: Option<Vec<u32>> = None;
@@ -157,39 +205,93 @@ fn main() {
             let offset = fa_i * centers_per_layer;
             let centers_layer = centers_dev.sub_offset(offset, centers_per_layer);
             match kv_mode.as_str() {
-                "asym3" => gpu.triattn_score_asym3(
-                    &kv.k_gpu[layer_idx], &centers_layer,
-                    kv.givens_cos.as_ref().unwrap(),
-                    kv.givens_sin.as_ref().unwrap(),
-                    &scores_buf,
-                    config.n_heads, config.n_kv_heads, config.head_dim,
-                    n_rot, config.rope_theta, p_q, prompt_len,
-                ).unwrap(),
-                _ => gpu.triattn_score_q8(
-                    &kv.k_gpu[layer_idx], &centers_layer, &scores_buf,
-                    config.n_heads, config.n_kv_heads, config.head_dim,
-                    n_rot, config.rope_theta, p_q, prompt_len,
-                ).unwrap(),
+                "asym3" => gpu
+                    .triattn_score_asym3(
+                        &kv.k_gpu[layer_idx],
+                        &centers_layer,
+                        kv.givens_cos.as_ref().unwrap(),
+                        kv.givens_sin.as_ref().unwrap(),
+                        &scores_buf,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n_rot,
+                        config.rope_theta,
+                        p_q,
+                        prompt_len,
+                    )
+                    .unwrap(),
+                _ => gpu
+                    .triattn_score_q8(
+                        &kv.k_gpu[layer_idx],
+                        &centers_layer,
+                        &scores_buf,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n_rot,
+                        config.rope_theta,
+                        p_q,
+                        prompt_len,
+                    )
+                    .unwrap(),
             }
             gpu.hip.device_synchronize().unwrap();
             let scores_host = gpu.download_f32(&scores_buf).unwrap();
             let retain = triattn::compute_retain_indices(
                 &scores_host[..config.n_heads * prompt_len],
-                config.n_heads, prompt_len, budget,
+                config.n_heads,
+                prompt_len,
+                budget,
             );
-            if retain_sample.is_none() && fa_i == 0 { retain_sample = Some(retain.clone()); }
+            if retain_sample.is_none() && fa_i == 0 {
+                retain_sample = Some(retain.clone());
+            }
 
-            let retain_bytes: Vec<u8> = retain.iter().flat_map(|&x| (x as i32).to_ne_bytes()).collect();
+            let retain_bytes: Vec<u8> = retain
+                .iter()
+                .flat_map(|&x| (x as i32).to_ne_bytes())
+                .collect();
             gpu.hip.memcpy_htod(&retain_dev.buf, &retain_bytes).unwrap();
 
             // Compact K and V (different bytes_per_pos in asym3 since K
             // packs 3-bit + cnorm while V is still Q8_0-shaped).
-            gpu.kv_compact_gather(&kv.k_gpu[layer_idx], &k_compact, &retain_dev, k_bytes_per_pos, budget).unwrap();
-            gpu.kv_compact_gather(&kv.v_gpu[layer_idx], &v_compact, &retain_dev, v_bytes_per_pos, budget).unwrap();
+            gpu.kv_compact_gather(
+                &kv.k_gpu[layer_idx],
+                &k_compact,
+                &retain_dev,
+                k_bytes_per_pos,
+                budget,
+            )
+            .unwrap();
+            gpu.kv_compact_gather(
+                &kv.v_gpu[layer_idx],
+                &v_compact,
+                &retain_dev,
+                v_bytes_per_pos,
+                budget,
+            )
+            .unwrap();
             gpu.hip.device_synchronize().unwrap();
 
-            gpu.hip.memcpy_dtod_at(&kv.k_gpu[layer_idx].buf, 0, &k_compact.buf, 0, budget * k_bytes_per_pos).unwrap();
-            gpu.hip.memcpy_dtod_at(&kv.v_gpu[layer_idx].buf, 0, &v_compact.buf, 0, budget * v_bytes_per_pos).unwrap();
+            gpu.hip
+                .memcpy_dtod_at(
+                    &kv.k_gpu[layer_idx].buf,
+                    0,
+                    &k_compact.buf,
+                    0,
+                    budget * k_bytes_per_pos,
+                )
+                .unwrap();
+            gpu.hip
+                .memcpy_dtod_at(
+                    &kv.v_gpu[layer_idx].buf,
+                    0,
+                    &v_compact.buf,
+                    0,
+                    budget * v_bytes_per_pos,
+                )
+                .unwrap();
         }
         kv.compact_offset = prompt_len - budget;
         eprintln!("compact_offset set to {}", kv.compact_offset);
@@ -203,7 +305,10 @@ fn main() {
         emitted.push(next);
         for step in 0..gen_len {
             let pos = budget + step;
-            qwen35::forward_scratch(&mut gpu, &weights, &config, next, pos, &mut kv, &mut dn, &scratch).unwrap();
+            qwen35::forward_scratch(
+                &mut gpu, &weights, &config, next, pos, &mut kv, &mut dn, &scratch,
+            )
+            .unwrap();
             logits = gpu.download_f32(&scratch.logits).unwrap();
             next = llama::argmax(&logits);
             emitted.push(next);
@@ -217,15 +322,23 @@ fn main() {
     eprintln!("{}", ref_text);
     eprintln!("tokens: {:?}", ref_tokens);
     eprintln!("\n=== WITH TRIATTN EVICTION (budget {budget}/{prompt_len}) ===");
-    eprintln!("layer0 retained positions (first 16 of {}): {:?}",
-        retain_sample.len(), &retain_sample[..retain_sample.len().min(16)]);
+    eprintln!(
+        "layer0 retained positions (first 16 of {}): {:?}",
+        retain_sample.len(),
+        &retain_sample[..retain_sample.len().min(16)]
+    );
     eprintln!("{}", evict_text);
     eprintln!("tokens: {:?}", evict_tokens);
 
-    let first_div = ref_tokens.iter().zip(evict_tokens.iter())
+    let first_div = ref_tokens
+        .iter()
+        .zip(evict_tokens.iter())
         .position(|(a, b)| a != b);
     match first_div {
-        Some(i) => eprintln!("\nfirst divergent token at step {i} (of {})", ref_tokens.len()),
+        Some(i) => eprintln!(
+            "\nfirst divergent token at step {i} (of {})",
+            ref_tokens.len()
+        ),
         None => eprintln!("\nno divergence — outputs identical"),
     }
 }

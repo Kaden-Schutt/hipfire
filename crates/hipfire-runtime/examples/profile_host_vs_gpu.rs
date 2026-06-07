@@ -25,13 +25,15 @@
 //! Usage: profile_host_vs_gpu <model.hfq> [iters=200]
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("build with --features deltanet"); }
+fn main() {
+    eprintln!("build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama;
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use std::path::Path;
     use std::time::Instant;
 
@@ -52,18 +54,31 @@ fn main() {
 
     let max_seq = 2048;
     let mut kv_cache = llama::KvCache::new_gpu_q8(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq,
-    ).unwrap();
-    let mut dn_state = DeltaNetState::new_with_quant(
-        &mut gpu, &config, qwen35::StateQuant::Q8,
-    ).unwrap();
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        max_seq,
+    )
+    .unwrap();
+    let mut dn_state =
+        DeltaNetState::new_with_quant(&mut gpu, &config, qwen35::StateQuant::Q8).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
     // Warmup
     let probe = 1u32;
     for pos in 0..32 {
-        qwen35::forward_scratch(&mut gpu, &weights, &config, probe, pos,
-            &mut kv_cache, &mut dn_state, &scratch).unwrap();
+        qwen35::forward_scratch(
+            &mut gpu,
+            &weights,
+            &config,
+            probe,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
 
@@ -86,8 +101,17 @@ fn main() {
         hip_bridge::launch_counters::reset();
 
         let t1 = Instant::now();
-        qwen35::forward_scratch(&mut gpu, &weights, &config, probe, 32 + i,
-            &mut kv_cache, &mut dn_state, &scratch).unwrap();
+        qwen35::forward_scratch(
+            &mut gpu,
+            &weights,
+            &config,
+            probe,
+            32 + i,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .unwrap();
         let forward = t1.elapsed();
 
         launch_us.push(hip_bridge::launch_counters::launch_kernel::time_ns() as f64 / 1000.0);
@@ -116,8 +140,8 @@ fn main() {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         sorted[sorted.len() / 2]
     };
-    let mean = |v: &[f64]| -> f64 { v.iter().sum::<f64>() / v.len() as f64 };
-    let p99 = |v: &[f64]| -> f64 {
+    let _mean = |v: &[f64]| -> f64 { v.iter().sum::<f64>() / v.len() as f64 };
+    let _p99 = |v: &[f64]| -> f64 {
         let mut sorted = v.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         sorted[(sorted.len() as f64 * 0.99) as usize]
@@ -136,14 +160,27 @@ fn main() {
     let n_memset = med_count(&memset_count);
 
     println!("\n=== Phase 3a Option C+: host bookkeeping breakdown ===");
-    println!("Model: {}", Path::new(model_path).file_name().and_then(|s| s.to_str()).unwrap_or(model_path));
+    println!(
+        "Model: {}",
+        Path::new(model_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(model_path)
+    );
     println!("Iters: {iters}");
     println!();
 
-    println!("{:<32} | {:>9} | {:>10} | {:>10}", "API", "calls", "median µs", "µs/call");
+    println!(
+        "{:<32} | {:>9} | {:>10} | {:>10}",
+        "API", "calls", "median µs", "µs/call"
+    );
     println!("{}", "-".repeat(72));
 
-    let total_us: Vec<f64> = forward_us.iter().zip(sync_us.iter()).map(|(f, s)| f + s).collect();
+    let total_us: Vec<f64> = forward_us
+        .iter()
+        .zip(sync_us.iter())
+        .map(|(f, s)| f + s)
+        .collect();
 
     let print_api = |label: &str, t: &[f64], n: u64| {
         let med = median(t);
@@ -168,28 +205,70 @@ fn main() {
     let med_total = median(&total_us);
     let med_other_host = med_forward - total_ffi;
 
-    println!("{:<32} | {:>9} | {:>10.1} |", "  → all HIP FFI", n_launch + n_dtod + n_htod + n_dtoh + n_memset, total_ffi);
+    println!(
+        "{:<32} | {:>9} | {:>10.1} |",
+        "  → all HIP FFI",
+        n_launch + n_dtod + n_htod + n_dtoh + n_memset,
+        total_ffi
+    );
     println!();
 
     println!("{:<32} | {:>10}", "Phase", "median µs");
     println!("{}", "-".repeat(72));
-    println!("{:<32} | {:>10.1}", "forward_scratch (host wall)", med_forward);
+    println!(
+        "{:<32} | {:>10.1}",
+        "forward_scratch (host wall)", med_forward
+    );
     println!("{:<32} | {:>10.1}", "  → all HIP FFI", total_ffi);
-    println!("{:<32} | {:>10.1}", "  → Rust-only (no FFI)", med_other_host);
+    println!(
+        "{:<32} | {:>10.1}",
+        "  → Rust-only (no FFI)", med_other_host
+    );
     println!("{:<32} | {:>10.1}", "device_synchronize after", med_sync);
     println!("{:<32} | {:>10.1}", "TOTAL", med_total);
     println!();
     println!("Wall-clock attribution:");
-    println!("  HIP FFI calls:           {:6.0} µs  ({:5.1}%)", total_ffi, total_ffi / med_total * 100.0);
-    println!("    └ launch_kernel:       {:6.0} µs  ({:5.1}%)", med_launch, med_launch / med_total * 100.0);
-    println!("    └ memcpy D2D:          {:6.0} µs  ({:5.1}%)", med_dtod, med_dtod / med_total * 100.0);
-    println!("    └ memcpy H2D+D2H:      {:6.0} µs  ({:5.1}%)", med_htod + med_dtoh, (med_htod + med_dtoh) / med_total * 100.0);
-    println!("    └ memset:              {:6.0} µs  ({:5.1}%)", med_memset, med_memset / med_total * 100.0);
-    println!("  Rust dispatch path:      {:6.0} µs  ({:5.1}%)", med_other_host, med_other_host / med_total * 100.0);
-    println!("  device_sync wait (GPU):  {:6.0} µs  ({:5.1}%)", med_sync, med_sync / med_total * 100.0);
+    println!(
+        "  HIP FFI calls:           {:6.0} µs  ({:5.1}%)",
+        total_ffi,
+        total_ffi / med_total * 100.0
+    );
+    println!(
+        "    └ launch_kernel:       {:6.0} µs  ({:5.1}%)",
+        med_launch,
+        med_launch / med_total * 100.0
+    );
+    println!(
+        "    └ memcpy D2D:          {:6.0} µs  ({:5.1}%)",
+        med_dtod,
+        med_dtod / med_total * 100.0
+    );
+    println!(
+        "    └ memcpy H2D+D2H:      {:6.0} µs  ({:5.1}%)",
+        med_htod + med_dtoh,
+        (med_htod + med_dtoh) / med_total * 100.0
+    );
+    println!(
+        "    └ memset:              {:6.0} µs  ({:5.1}%)",
+        med_memset,
+        med_memset / med_total * 100.0
+    );
+    println!(
+        "  Rust dispatch path:      {:6.0} µs  ({:5.1}%)",
+        med_other_host,
+        med_other_host / med_total * 100.0
+    );
+    println!(
+        "  device_sync wait (GPU):  {:6.0} µs  ({:5.1}%)",
+        med_sync,
+        med_sync / med_total * 100.0
+    );
     println!();
 
     let tok_per_s = iters as f64 / total_outer.as_secs_f64();
-    println!("Effective throughput: {:.1} tok/s ({:.2} ms/tok)",
-        tok_per_s, total_outer.as_secs_f64() * 1000.0 / iters as f64);
+    println!(
+        "Effective throughput: {:.1} tok/s ({:.2} ms/tok)",
+        tok_per_s,
+        total_outer.as_secs_f64() * 1000.0 / iters as f64
+    );
 }

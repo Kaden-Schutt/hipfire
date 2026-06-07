@@ -25,9 +25,8 @@ extern "C" __global__ void rope_partial_halfsplit_batched_f32(
     int n_rot,
     float freq_base,
     int batch_size,
-    int pos_offset   // added to positions[b] for the RoPE angle (NOT the KV slot);
-                     // carries kv_cache.compact_offset so post-eviction batched
-                     // Q/K rotate at absolute phase matching the cached keys. 0 = no-op.
+    int pos_offset   // added to positions[b] for RoPE angle only;
+                     // KV writes still use the raw physical slot.
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int b = blockIdx.y;

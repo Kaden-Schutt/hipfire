@@ -284,11 +284,7 @@ pub fn elementwise1_bytes(n: usize) -> usize {
 
 /// DeltaNet Q8 recurrence: roughly state in + state out + Q/K/V + gate/beta +
 /// output. Dominated by state read+write.
-pub fn gated_delta_net_q8_bytes(
-    n_tokens: usize,
-    n_heads: usize,
-    head_dim: usize,
-) -> usize {
+pub fn gated_delta_net_q8_bytes(n_tokens: usize, n_heads: usize, head_dim: usize) -> usize {
     let state_bytes = n_heads * head_dim * head_dim; // Q8: 1 byte each
     let state_scales = n_heads * head_dim * 4;
     let qkv = 3 * n_tokens * n_heads * head_dim * 4;
@@ -296,6 +292,16 @@ pub fn gated_delta_net_q8_bytes(
     let out = n_tokens * n_heads * head_dim * 4;
     // State is read + written
     2 * state_bytes + 2 * state_scales + qkv + gate_beta + out
+}
+
+/// DeltaNet FP32 recurrence: state in + state out + Q/K/V + gate/beta +
+/// output. Dominated by the FP32 state read+write.
+pub fn gated_delta_net_f32_bytes(n_tokens: usize, n_heads: usize, head_dim: usize) -> usize {
+    let state_bytes = n_heads * head_dim * head_dim * 4;
+    let qkv = 3 * n_tokens * n_heads * head_dim * 4;
+    let gate_beta = 2 * n_tokens * n_heads * 4;
+    let out = n_tokens * n_heads * head_dim * 4;
+    2 * state_bytes + qkv + gate_beta + out
 }
 
 /// Q8_0 KV attention: read Q, read K+V caches, write output.
@@ -311,6 +317,20 @@ pub fn attention_q8_0_kv_bytes(
     // For general head_dim, approximate as head_dim + 4 per head per position.
     let kv_bytes_per_pos = n_kv_heads * (head_dim + 4);
     let kv_bytes = 2 * kv_len * kv_bytes_per_pos;
+    let out_bytes = n_heads * head_dim * 4;
+    q_bytes + kv_bytes + out_bytes
+}
+
+/// FP32 KV attention: read Q, read K+V caches, write output.
+/// `kv_len` = current sequence length.
+pub fn attention_f32_kv_bytes(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+) -> usize {
+    let q_bytes = n_heads * head_dim * 4;
+    let kv_bytes = 2 * kv_len * n_kv_heads * head_dim * 4;
     let out_bytes = n_heads * head_dim * 4;
     q_bytes + kv_bytes + out_bytes
 }
@@ -334,7 +354,7 @@ pub fn conv1d_silu_bytes(n_channels: usize) -> usize {
         + n_channels * state_slots * 4     // state read
         + n_channels * kernel_size * 4     // weight
         + n_channels * 4                   // output
-        + n_channels * state_slots * 4     // state write
+        + n_channels * state_slots * 4 // state write
 }
 
 /// KV cache write (Q8_0 flavor, per token position).

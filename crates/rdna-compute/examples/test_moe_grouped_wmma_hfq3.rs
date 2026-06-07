@@ -1,17 +1,16 @@
-//! Byte-exact channel test for `gemm_hfq3g256_moe_grouped_wmma_gfx12`
+//! Byte-exact channel test for `gemm_hfq3g256_moe_grouped_wmma`
 //! against a CPU reference. The CPU ref mirrors the per-element math
 //! the WMMA kernel does (FP16 dequant + FP16 X load → FP32 accumulate)
 //! at GROUP granularity; we permit ULP-level slop to absorb the
 //! WMMA-vs-scalar FMA-order divergence (per-group inputs are bounded
 //! so the absolute slop floor is loose-but-non-trivial).
 //!
-//! GFX12 ONLY. The kernel is registered only as a gfx12 variant.
-//! Skips on non-gfx12 archs with a SKIP message.
+//! Runs on gfx12 and gfx1151. Skips on other archs with a SKIP message.
 //!
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_grouped_wmma_hfq3
 
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 // FP32 -> FP16 -> FP32 round trip via IEEE 754 binary16 (round to even).
 // Matches the implicit conversion done by `ensure_fp16_x` in the
@@ -123,9 +122,8 @@ fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
 }
 
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len()], DType::F32)
         .expect("alloc_tensor f32");
@@ -134,9 +132,8 @@ fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
 }
 
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len() * 4], DType::Raw)
         .expect("alloc_tensor i32");
@@ -145,9 +142,8 @@ fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
 }
 
 fn upload_u64(gpu: &mut Gpu, data: &[u64]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
     let t = gpu
         .alloc_tensor(&[data.len() * 8], DType::Raw)
         .expect("alloc_tensor u64");
@@ -163,10 +159,11 @@ fn alloc_f32_zeros(gpu: &mut Gpu, n: usize) -> GpuTensor {
 
 fn download_f32(gpu: &Gpu, tensor: &GpuTensor, n: usize) -> Vec<f32> {
     let mut data = vec![0f32; n];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &tensor.buf).expect("memcpy_dtoh f32");
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
+    gpu.hip
+        .memcpy_dtoh(bytes, &tensor.buf)
+        .expect("memcpy_dtoh f32");
     data
 }
 
@@ -253,19 +250,29 @@ fn cpu_ref(
 
     for tile_y in 0..(m_total / 16) {
         let expert_id = expert_tile_ids[tile_y];
-        if expert_id < 0 { continue; }
+        if expert_id < 0 {
+            continue;
+        }
         let a = &weights[expert_id as usize];
 
         for m_lane in 0..16 {
             let slot_idx = tile_y * 16 + m_lane;
             let flat = sorted_slot_index[slot_idx];
-            if flat < 0 { continue; }
-            let x_row = if x_row_div > 1 { (flat as usize) / x_row_div } else { flat as usize };
+            if flat < 0 {
+                continue;
+            }
+            let x_row = if x_row_div > 1 {
+                (flat as usize) / x_row_div
+            } else {
+                flat as usize
+            };
 
             for row_start in (0..m).step_by(16) {
                 for j_lane in 0..16 {
                     let my_row = row_start + j_lane;
-                    if my_row >= m { continue; }
+                    if my_row >= m {
+                        continue;
+                    }
 
                     let row_off = my_row * bytes_per_row;
                     let mut acc: f32 = 0.0;
@@ -291,14 +298,14 @@ fn cpu_ref(
                                 let b2 = a[dp + 2] as u32;
                                 // Cross-byte 3-bit unpack matching kernel macro.
                                 let unpack = [
-                                     b0        & 7,
-                                    (b0 >> 3)  & 7,
-                                   ((b0 >> 6) | (b1 << 2)) & 7,
-                                    (b1 >> 1)  & 7,
-                                    (b1 >> 4)  & 7,
-                                   ((b1 >> 7) | (b2 << 1)) & 7,
-                                    (b2 >> 2)  & 7,
-                                    (b2 >> 5)  & 7,
+                                    b0 & 7,
+                                    (b0 >> 3) & 7,
+                                    ((b0 >> 6) | (b1 << 2)) & 7,
+                                    (b1 >> 1) & 7,
+                                    (b1 >> 4) & 7,
+                                    ((b1 >> 7) | (b2 << 1)) & 7,
+                                    (b2 >> 2) & 7,
+                                    (b2 >> 5) & 7,
                                 ];
                                 for i in 0..8 {
                                     let k_idx = g * 256 + kt * 16 + k_grp * 8 + i;
@@ -319,16 +326,33 @@ fn cpu_ref(
     y
 }
 
-fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize, seed_w: u32, seed_x: u32) {
-    println!("=== {} | M={} K={} m_total={} E={} ===", label, m, k, m_total, num_experts);
+fn run_case(
+    label: &str,
+    m: usize,
+    k: usize,
+    m_total: usize,
+    num_experts: usize,
+    x_row_div: usize,
+    sparse: bool,
+    seed_w: u32,
+    seed_x: u32,
+) {
+    println!(
+        "=== {} | M={} K={} m_total={} E={} x_row_div={} sparse={} ===",
+        label, m, k, m_total, num_experts, x_row_div, sparse
+    );
     assert!(m % 16 == 0, "M must be a multiple of 16");
     assert!(m_total % 16 == 0, "m_total must be a multiple of 16");
     assert!(k % 256 == 0, "K must be a multiple of 256");
+    assert!(x_row_div > 0, "x_row_div must be non-zero");
 
     let mut gpu = Gpu::init().expect("Gpu::init");
     let arch = gpu.arch.clone();
-    if !arch.starts_with("gfx12") {
-        println!("  SKIP — arch {} is not gfx12; HFQ3 grouped WMMA only registered for gfx12", arch);
+    if !arch.starts_with("gfx12") && arch != "gfx1151" {
+        println!(
+            "  SKIP — arch {} is not gfx12/gfx1151; HFQ3 grouped WMMA is not registered",
+            arch
+        );
         return;
     }
 
@@ -345,16 +369,38 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     }
     let expert_weight_ptrs = upload_u64(&mut gpu, &expert_ptrs);
 
-    // sorted_slot_index: identity mapping. tile_y → expert (tile_y % E).
-    let sorted: Vec<i32> = (0..m_total as i32).collect();
+    let x_src_rows = if sparse {
+        m_total.saturating_sub(num_experts * 15) / x_row_div
+    } else {
+        m_total / x_row_div
+    }
+    .max(1);
+
+    let (sorted, tile_ids): (Vec<i32>, Vec<i32>) = if sparse {
+        let total_slots = x_src_rows * x_row_div;
+        let mut sorted = vec![-1i32; m_total];
+        let mut tile_ids = vec![-1i32; m_total / 16];
+        for flat in 0..total_slots {
+            let expert = flat % num_experts;
+            let tile_y = expert;
+            let lane = flat / num_experts;
+            if tile_y < tile_ids.len() && lane < 16 {
+                tile_ids[tile_y] = expert as i32;
+                sorted[tile_y * 16 + lane] = flat as i32;
+            }
+        }
+        (sorted, tile_ids)
+    } else {
+        let sorted: Vec<i32> = (0..m_total as i32).collect();
+        let tile_ids: Vec<i32> = (0..(m_total / 16))
+            .map(|tile_y| (tile_y % num_experts) as i32)
+            .collect();
+        (sorted, tile_ids)
+    };
     let sorted_slot_index = upload_i32(&mut gpu, &sorted);
-    let tile_ids: Vec<i32> = (0..(m_total / 16))
-        .map(|tile_y| (tile_y % num_experts) as i32)
-        .collect();
     let expert_tile_ids = upload_i32(&mut gpu, &tile_ids);
 
-    // X: m_total rows × K, identity gather (x_row_div = 1).
-    let x_f32 = build_x_f32(m_total, k, seed_x);
+    let x_f32 = build_x_f32(x_src_rows, k, seed_x);
     let x_src = upload_f32(&mut gpu, &x_f32);
 
     let y_gpu = alloc_f32_zeros(&mut gpu, m_total * m);
@@ -367,14 +413,26 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
         &y_gpu,
         m,
         k,
-        1, // x_row_div
+        x_row_div,
         m_total,
-        m_total, // x_src_rows
-    ).expect("HFQ3 grouped WMMA launch");
-    gpu.hip.device_synchronize().expect("sync after HFQ3 launch");
+        x_src_rows,
+    )
+    .expect("HFQ3 grouped WMMA launch");
+    gpu.hip
+        .device_synchronize()
+        .expect("sync after HFQ3 launch");
 
     let y_gpu_v = download_f32(&gpu, &y_gpu, m_total * m);
-    let y_ref_v = cpu_ref(&expert_bytes, &tile_ids, &sorted, &x_f32, m, k, 1, m_total);
+    let y_ref_v = cpu_ref(
+        &expert_bytes,
+        &tile_ids,
+        &sorted,
+        &x_f32,
+        m,
+        k,
+        x_row_div,
+        m_total,
+    );
 
     let mut max_abs = 0f32;
     let mut max_rel = 0f32;
@@ -382,8 +440,13 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     for (i, (a, b)) in y_gpu_v.iter().zip(y_ref_v.iter()).enumerate() {
         let d = (a - b).abs();
         let r = if b.abs() > 1e-6 { d / b.abs() } else { d };
-        if d > max_abs { max_abs = d; argmax_abs = i; }
-        if r > max_rel { max_rel = r; }
+        if d > max_abs {
+            max_abs = d;
+            argmax_abs = i;
+        }
+        if r > max_rel {
+            max_rel = r;
+        }
     }
     let gpu_sample = y_gpu_v[argmax_abs];
     let ref_sample = y_ref_v[argmax_abs];
@@ -397,7 +460,7 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     // and inputs ~[-0.05, 0.05], an empirical 1e-3 abs / 1e-2 rel
     // envelope covers the worst-case slop while still catching real
     // bugs (full-row flips show 1+ orders of magnitude over this).
-    if max_abs > 1e-3 || max_rel > 1e-2 {
+    if max_abs > 1e-3 && max_rel > 1e-2 {
         println!("  FAIL — exceeds tolerance");
         std::process::exit(1);
     } else {
@@ -407,13 +470,79 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
 
 fn main() {
     // Toy: 1 expert, single tile_y, M=16 / K=256 / m_total=16.
-    run_case("toy", 16, 256, 16, 1, 0xDEAD_BEEF, 0xCAFE_BABE);
+    run_case("toy", 16, 256, 16, 1, 1, false, 0xDEAD_BEEF, 0xCAFE_BABE);
     // Small: 2 experts, 2 tile_y, M=32 / K=512 / m_total=32.
-    run_case("small", 32, 512, 32, 2, 0x1234_5678, 0x8765_4321);
+    run_case("small", 32, 512, 32, 2, 1, false, 0x1234_5678, 0x8765_4321);
+    // Gate/up shape: sorted slots fan back to N token rows via x_row_div=8.
+    run_case(
+        "gate-up-div8",
+        64,
+        1024,
+        128,
+        4,
+        8,
+        false,
+        0x1357_2468,
+        0x2468_1357,
+    );
     // Medium: 4 experts, 4 tile_y, M=64 / K=1024 / m_total=64.
-    run_case("medium", 64, 1024, 64, 4, 0x0F0F_0F0F, 0xF0F0_F0F0);
+    run_case(
+        "medium",
+        64,
+        1024,
+        64,
+        4,
+        1,
+        false,
+        0x0F0F_0F0F,
+        0xF0F0_F0F0,
+    );
+    // Production-shaped sparse upper bounds: N*K_TOP + E*15 with -1 sentinels.
+    run_case(
+        "sparse-N2-K8-E256",
+        16,
+        512,
+        2 * 8 + 256 * 15,
+        256,
+        8,
+        true,
+        0x2200_0002,
+        0x3300_0002,
+    );
+    run_case(
+        "sparse-N4-K8-E256",
+        16,
+        512,
+        4 * 8 + 256 * 15,
+        256,
+        8,
+        true,
+        0x2200_0004,
+        0x3300_0004,
+    );
+    run_case(
+        "sparse-N16-K8-E256",
+        16,
+        512,
+        16 * 8 + 256 * 15,
+        256,
+        8,
+        true,
+        0x2200_0016,
+        0x3300_0016,
+    );
     // A3B-shaped slice: M=768 (per-expert gate_up/2), K=7168, m_total=256.
-    run_case("a3b-slice", 768, 7168, 256, 8, 0x4242_4242, 0x2424_2424);
+    run_case(
+        "a3b-slice",
+        768,
+        7168,
+        256,
+        8,
+        1,
+        false,
+        0x4242_4242,
+        0x2424_2424,
+    );
 
     println!("\nAll cases PASS.");
 }

@@ -5,7 +5,7 @@
 //! Benchmark: profile where time is spent in the forward pass.
 
 use hipfire_runtime::gguf::GgufFile;
-use hipfire_runtime::llama::{self, LlamaConfig, KvCache};
+use hipfire_runtime::llama::{self, KvCache, LlamaConfig};
 use std::path::Path;
 use std::time::Instant;
 
@@ -17,18 +17,39 @@ fn main() {
     eprintln!("=== hipfire baseline benchmark ===");
     let gguf = GgufFile::open(Path::new(&model_path)).unwrap();
     let config = LlamaConfig::from_gguf(&gguf).unwrap();
-    eprintln!("Model: {} (dim={}, layers={}, heads={}, kv_heads={}, vocab={})",
-        config.arch as u8, config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size);
+    eprintln!(
+        "Model: {} (dim={}, layers={}, heads={}, kv_heads={}, vocab={})",
+        config.arch as u8,
+        config.dim,
+        config.n_layers,
+        config.n_heads,
+        config.n_kv_heads,
+        config.vocab_size
+    );
 
     let mut gpu = rdna_compute::Gpu::init().unwrap();
     eprintln!("Loading weights...");
     let weights = llama::load_weights(&gguf, &config, &mut gpu).unwrap();
 
-    let kv_dim = config.n_kv_heads * config.head_dim;
-    let mut kv_cache = KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, config.max_seq_len).unwrap();
+    let _kv_dim = config.n_kv_heads * config.head_dim;
+    let mut kv_cache = KvCache::new_gpu(
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        config.max_seq_len,
+    )
+    .unwrap();
 
     // Warmup: 2 tokens
-    let _ = llama::forward(&mut gpu, &weights, &config, config.bos_token, 0, &mut kv_cache);
+    let _ = llama::forward(
+        &mut gpu,
+        &weights,
+        &config,
+        config.bos_token,
+        0,
+        &mut kv_cache,
+    );
     let _ = llama::forward(&mut gpu, &weights, &config, 15043, 1, &mut kv_cache);
 
     // Benchmark: generate 20 tokens, measure each
@@ -40,7 +61,8 @@ fn main() {
     for i in 0..n_tokens {
         let pos = 2 + i;
         let t = Instant::now();
-        let logits = llama::forward(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache).unwrap();
+        let logits =
+            llama::forward(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache).unwrap();
         let elapsed = t.elapsed().as_secs_f64() * 1000.0;
         times_ms.push(elapsed);
         next_token = llama::argmax(&logits);
@@ -62,7 +84,9 @@ fn main() {
     eprintln!("\nPer-token times (ms):");
     for (i, &t) in times_ms.iter().enumerate() {
         eprint!("  pos={}: {t:.1}", 2 + i);
-        if (i + 1) % 5 == 0 { eprintln!(); }
+        if (i + 1) % 5 == 0 {
+            eprintln!();
+        }
     }
     eprintln!();
 

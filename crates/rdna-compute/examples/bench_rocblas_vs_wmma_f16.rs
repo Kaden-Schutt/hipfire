@@ -18,7 +18,12 @@ use std::time::Instant;
 const WARMUP: usize = 8;
 const TRIALS: usize = 60;
 
-fn wrap_buf(raw_ptr: *mut std::ffi::c_void, bytes: usize, shape: Vec<usize>, dtype: DType) -> GpuTensor {
+fn wrap_buf(
+    raw_ptr: *mut std::ffi::c_void,
+    bytes: usize,
+    shape: Vec<usize>,
+    dtype: DType,
+) -> GpuTensor {
     GpuTensor {
         buf: unsafe { hip_bridge::DeviceBuffer::from_raw(raw_ptr, bytes) },
         shape,
@@ -73,12 +78,14 @@ fn main() {
 
             // ── rocBLAS path (uses DeviceBuffer directly via rocblas_gemm_hfq4_prefill)
             for _ in 0..WARMUP {
-                gpu.rocblas_gemm_hfq4_prefill(&w_gpu_buf, &x_gpu_buf, &y_gpu_buf, m, b, k).unwrap();
+                gpu.rocblas_gemm_hfq4_prefill(&w_gpu_buf, &x_gpu_buf, &y_gpu_buf, m, b, k)
+                    .unwrap();
             }
             gpu.hip.device_synchronize().unwrap();
             let t0 = Instant::now();
             for _ in 0..TRIALS {
-                gpu.rocblas_gemm_hfq4_prefill(&w_gpu_buf, &x_gpu_buf, &y_gpu_buf, m, b, k).unwrap();
+                gpu.rocblas_gemm_hfq4_prefill(&w_gpu_buf, &x_gpu_buf, &y_gpu_buf, m, b, k)
+                    .unwrap();
             }
             gpu.hip.device_synchronize().unwrap();
             let rocblas_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
@@ -89,12 +96,14 @@ fn main() {
             let x_tensor = wrap_buf(x_ptr, b * k * 2, vec![b, k], DType::F16);
             let y_tensor = wrap_buf(y_ptr, b * m * 4, vec![b, m], DType::F32);
             for _ in 0..WARMUP {
-                gpu.gemm_f16_x_f16_wmma(&w_tensor, &x_tensor, &y_tensor, m, k, b).unwrap();
+                gpu.gemm_f16_x_f16_wmma(&w_tensor, &x_tensor, &y_tensor, m, k, b)
+                    .unwrap();
             }
             gpu.hip.device_synchronize().unwrap();
             let t0 = Instant::now();
             for _ in 0..TRIALS {
-                gpu.gemm_f16_x_f16_wmma(&w_tensor, &x_tensor, &y_tensor, m, k, b).unwrap();
+                gpu.gemm_f16_x_f16_wmma(&w_tensor, &x_tensor, &y_tensor, m, k, b)
+                    .unwrap();
             }
             gpu.hip.device_synchronize().unwrap();
             let wmma_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
@@ -114,7 +123,11 @@ fn main() {
                 "  B={b:4}  rocBLAS: {rocblas_us:7.1} µs ({rocblas_gflops:6.1} GFLOPS)  \
                  WMMA: {wmma_us:7.1} µs ({wmma_gflops:6.1} GFLOPS)  \
                  winner: {winner} ({:.2}×)",
-                if speedup > 1.0 { speedup } else { 1.0 / speedup }
+                if speedup > 1.0 {
+                    speedup
+                } else {
+                    1.0 / speedup
+                }
             );
         }
     }

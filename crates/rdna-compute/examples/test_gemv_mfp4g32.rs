@@ -16,11 +16,10 @@
 //! Sweeps groups_per_row ∈ {2, 4, 5, 6, 7, 8} (K = groups_per_row × 256) to exercise
 //! the same kernel paths as the HFP4 anchor test, including all 3 tail-by-g%4 paths.
 
-use rdna_compute::{Gpu, DType};
+use rdna_compute::{DType, Gpu};
 
 const E2M1_LUT: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
 fn e2m1_round(x: f32) -> u8 {
@@ -68,10 +67,15 @@ fn f16_le_bits_to_f32(h: u16) -> f32 {
     let exp = ((h >> 10) & 0x1f) as i32;
     let mant = (h & 0x3ff) as u32;
     let bits = if exp == 0 {
-        if mant == 0 { sign << 31 }
-        else {
-            let mut m = mant; let mut e = -1i32;
-            while m & 0x400 == 0 { m <<= 1; e -= 1; }
+        if mant == 0 {
+            sign << 31
+        } else {
+            let mut m = mant;
+            let mut e = -1i32;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
             (sign << 31) | (((e + 127 - 14) as u32) << 23) | ((m & 0x3ff) << 13)
         }
     } else if exp == 0x1f {
@@ -86,7 +90,9 @@ fn f16_le_bits_to_f32(h: u16) -> f32 {
 /// the GPU `mq_rotate_x` kernel: signs1 → butterfly → 1/sqrt(256) scale → signs2.
 fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     assert_eq!(x.len(), 256);
-    for i in 0..256 { x[i] *= signs1[i]; }
+    for i in 0..256 {
+        x[i] *= signs1[i];
+    }
     let mut stride = 1usize;
     while stride < 256 {
         let mut i = 0;
@@ -102,16 +108,24 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
         stride <<= 1;
     }
     let scale = 0.0625; // 1/sqrt(256) = 1/16
-    for i in 0..256 { x[i] *= scale * signs2[i]; }
+    for i in 0..256 {
+        x[i] *= scale * signs2[i];
+    }
 }
 
 /// Same LCG sign generator MQ4 ships with (`gen_fwht_signs(seed, 256)`).
 fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     let mut state = seed;
-    (0..n).map(|_| {
-        state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-        if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
-    }).collect()
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+            if (state >> 16) & 1 == 1 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
+        })
+        .collect()
 }
 
 /// Quantize one row of K f32 weights to HFP4G32 byte format with `format_flags=0x05`
@@ -125,8 +139,16 @@ fn quantize_row_with_rotation_flag(row: &[f32]) -> Vec<u8> {
     let mut out = vec![0u8; row_bytes];
 
     let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
-    let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
-    let inv_row = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+    let row_scale_a = if row_max_abs > 0.0 {
+        row_max_abs / 6.0
+    } else {
+        1.0
+    };
+    let inv_row = if row_max_abs > 0.0 {
+        1.0 / row_scale_a
+    } else {
+        0.0
+    };
 
     out[0..2].copy_from_slice(&f32_to_f16_le_bits(row_scale_a).to_le_bytes());
     out[2..4].copy_from_slice(&0u16.to_le_bytes());
@@ -142,10 +164,16 @@ fn quantize_row_with_rotation_flag(row: &[f32]) -> Vec<u8> {
             let log_ratio = (block_max_normalized / 6.0).log2();
             let e_signed = log_ratio.ceil() as i32 + 127;
             e_signed.clamp(0, 254) as u8
-        } else { 0u8 };
+        } else {
+            0u8
+        };
 
         let block_scale_factor = ((block_e as i32 - 127) as f32).exp2();
-        let inv_block = if block_scale_factor > 0.0 { 1.0 / block_scale_factor } else { 0.0 };
+        let inv_block = if block_scale_factor > 0.0 {
+            1.0 / block_scale_factor
+        } else {
+            0.0
+        };
 
         let off = 16 + b * 17;
         out[off] = block_e;
@@ -174,7 +202,7 @@ fn dequant_row(packed: &[u8], k: usize) -> Vec<f32> {
             let byte = packed[off + 1 + i];
             let lo = (byte & 0x0F) as usize;
             let hi = ((byte >> 4) & 0x0F) as usize;
-            out[b * 32 + 2 * i]     = scale * E2M1_LUT[lo];
+            out[b * 32 + 2 * i] = scale * E2M1_LUT[lo];
             out[b * 32 + 2 * i + 1] = scale * E2M1_LUT[hi];
         }
     }
@@ -199,9 +227,13 @@ fn build_test_matrix(
     for _r in 0..m {
         let mut row = Vec::with_capacity(k);
         for _ in 0..(k / 2) {
-            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
             let u1 = ((state & 0xFFFFFF) as f32 / 0x1000000 as f32).max(1e-7);
-            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
             let u2 = ((state & 0xFFFFFF) as f32 / 0x1000000 as f32).max(1e-7);
             let r_mag = (-2.0 * u1.ln()).sqrt();
             let theta = 2.0 * std::f32::consts::PI * u2;
@@ -232,19 +264,28 @@ fn cpu_reference(seen: &[f32], x_rot: &[f32], m: usize, k: usize) -> Vec<f32> {
     y
 }
 
-fn run_one(gpu: &mut Gpu, groups_per_row: usize, signs1: &[f32], signs2: &[f32]) -> (usize, f32, f32) {
+fn run_one(
+    gpu: &mut Gpu,
+    groups_per_row: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> (usize, f32, f32) {
     let m = 64;
     let k = groups_per_row * 256;
 
     let (packed, seen_w_rot) = build_test_matrix(
-        m, k,
+        m,
+        k,
         0xc0ffee_dead_c0ffeeu64.wrapping_add(k as u64),
-        signs1, signs2,
+        signs1,
+        signs2,
     );
 
     // Original (UN-rotated) x — this is what callers pass to gemv_mfp4g32_with_rotate.
     // Same shape as the HFP4 anchor's x for direct comparability.
-    let x: Vec<f32> = (0..k).map(|i| ((i as i32 % 13) as f32 - 6.0) * 0.05).collect();
+    let x: Vec<f32> = (0..k)
+        .map(|i| ((i as i32 % 13) as f32 - 6.0) * 0.05)
+        .collect();
 
     // CPU-side rotation of x (per-256-element FWHT) — gives the activation that the
     // GPU kernel sees after `mq_rotate_x` runs internally.
@@ -261,11 +302,12 @@ fn run_one(gpu: &mut Gpu, groups_per_row: usize, signs1: &[f32], signs2: &[f32])
     // dispatch wrapper rotates x into the GPU's internal scratch for us.
     gpu.ensure_mq_signs().unwrap();
     let x_rot_alias = rdna_compute::GpuTensor {
-        buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
-        shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+        buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+        shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
         dtype: DType::F32,
     };
-    gpu.gemv_mfp4g32_with_rotate(&d_a, &d_x, &d_y, &x_rot_alias, m, k).unwrap();
+    gpu.gemv_mfp4g32_with_rotate(&d_a, &d_x, &d_y, &x_rot_alias, m, k)
+        .unwrap();
     let y_gpu = gpu.download_f32(&d_y).unwrap();
 
     let y_ref = cpu_reference(&seen_w_rot, &x_rot, m, k);
@@ -274,10 +316,14 @@ fn run_one(gpu: &mut Gpu, groups_per_row: usize, signs1: &[f32], signs2: &[f32])
     let mut max_rel = 0.0f32;
     for r in 0..m {
         let abs = (y_gpu[r] - y_ref[r]).abs();
-        if abs > max_abs { max_abs = abs; }
+        if abs > max_abs {
+            max_abs = abs;
+        }
         let denom = y_ref[r].abs().max(1.0);
         let rel = abs / denom;
-        if rel > max_rel { max_rel = rel; }
+        if rel > max_rel {
+            max_rel = rel;
+        }
     }
     (k, max_abs, max_rel)
 }
@@ -297,9 +343,13 @@ fn main() {
         // in the same magnitude band as un-rotated random data.
         let pass = max_abs < 5e-3 && max_rel < 5e-3;
         let tag = if pass { "PASS" } else { "FAIL" };
-        println!("[{}] groups_per_row={} K={} max_abs={:.6e} max_rel={:.6e}",
-                 tag, groups_per_row, k, max_abs, max_rel);
-        if !pass { any_fail = true; }
+        println!(
+            "[{}] groups_per_row={} K={} max_abs={:.6e} max_rel={:.6e}",
+            tag, groups_per_row, k, max_abs, max_rel
+        );
+        if !pass {
+            any_fail = true;
+        }
     }
 
     if any_fail {

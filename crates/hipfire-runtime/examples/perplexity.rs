@@ -15,16 +15,20 @@
 //! 2K tokens is enough to see sub-4-bit deltas (single decimal of ppl);
 //! 8K+ if you want stable second-decimal numbers.
 
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
 use std::path::Path;
 use std::time::Instant;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let model_path = args.next().expect("usage: perplexity <model> <corpus> [--ctx N] [--warmup N] [--offset N]");
-    let corpus_path = args.next().expect("usage: perplexity <model> <corpus> [--ctx N] [--warmup N] [--offset N]");
+    let model_path = args
+        .next()
+        .expect("usage: perplexity <model> <corpus> [--ctx N] [--warmup N] [--offset N]");
+    let corpus_path = args
+        .next()
+        .expect("usage: perplexity <model> <corpus> [--ctx N] [--warmup N] [--offset N]");
 
     let mut ctx_len: usize = 2048;
     let mut warmup: usize = 8;
@@ -41,7 +45,10 @@ fn main() {
             _ => panic!("unknown flag: {flag}"),
         }
     }
-    assert!(ctx_len > warmup + 4, "ctx must exceed warmup by enough to score");
+    assert!(
+        ctx_len > warmup + 4,
+        "ctx must exceed warmup by enough to score"
+    );
 
     // Tokenizer.encode is O(N) at best, often slow on multi-MB inputs.
     // Read enough chars to safely cover offset+ctx tokens at ~3 char/token,
@@ -50,7 +57,11 @@ fn main() {
     let raw = std::fs::read(&corpus_path).expect("read corpus");
     let take = want_bytes.min(raw.len());
     let corpus = String::from_utf8_lossy(&raw[..take]).to_string();
-    eprintln!("Corpus: {} bytes (of {}) from {corpus_path}", corpus.len(), raw.len());
+    eprintln!(
+        "Corpus: {} bytes (of {}) from {corpus_path}",
+        corpus.len(),
+        raw.len()
+    );
 
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
@@ -60,16 +71,22 @@ fn main() {
     eprintln!("Tokenizing...");
     let t_tok = Instant::now();
     let all_tokens: Vec<u32> = tokenizer.encode(&corpus);
-    eprintln!("Tokenized: {} tokens in {:.2}s",
-              all_tokens.len(), t_tok.elapsed().as_secs_f64());
+    eprintln!(
+        "Tokenized: {} tokens in {:.2}s",
+        all_tokens.len(),
+        t_tok.elapsed().as_secs_f64()
+    );
 
     let end = (offset + ctx_len).min(all_tokens.len());
     if end <= offset + warmup + 4 {
         panic!("not enough tokens past offset={offset} for warmup={warmup} + scoring");
     }
     let window = &all_tokens[offset..end];
-    eprintln!("Window: offset={offset} ctx={} (warmup {warmup}, scoring {})",
-              window.len(), window.len() - warmup - 1);
+    eprintln!(
+        "Window: offset={offset} ctx={} (warmup {warmup}, scoring {})",
+        window.len(),
+        window.len() - warmup - 1
+    );
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
     let arch = gpu.arch.clone();
@@ -81,43 +98,92 @@ fn main() {
     eprintln!("KV mode: {kv_mode}");
     let mut kv_cache = match kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym4" => KvCache::new_gpu_asym4(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym2" => {
-            let is_kv_layer: Vec<bool> = config.layer_types.iter()
-                .map(|t| *t == qwen35::LayerType::FullAttention).collect();
+            let is_kv_layer: Vec<bool> = config
+                .layer_types
+                .iter()
+                .map(|t| *t == qwen35::LayerType::FullAttention)
+                .collect();
             KvCache::new_gpu_asym2_filtered(
-                &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
-            ).unwrap()
+                &mut gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap()
         }
         "fwht4" => {
-            let is_kv_layer: Vec<bool> = config.layer_types.iter()
-                .map(|t| *t == qwen35::LayerType::FullAttention).collect();
+            let is_kv_layer: Vec<bool> = config
+                .layer_types
+                .iter()
+                .map(|t| *t == qwen35::LayerType::FullAttention)
+                .collect();
             KvCache::new_gpu_fwht4_filtered(
-                &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
-            ).unwrap()
+                &mut gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap()
         }
         "fwht3" => {
-            let is_kv_layer: Vec<bool> = config.layer_types.iter()
-                .map(|t| *t == qwen35::LayerType::FullAttention).collect();
+            let is_kv_layer: Vec<bool> = config
+                .layer_types
+                .iter()
+                .map(|t| *t == qwen35::LayerType::FullAttention)
+                .collect();
             KvCache::new_gpu_fwht3_filtered(
-                &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
-            ).unwrap()
+                &mut gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap()
         }
         "fwht2" => {
-            let is_kv_layer: Vec<bool> = config.layer_types.iter()
-                .map(|t| *t == qwen35::LayerType::FullAttention).collect();
+            let is_kv_layer: Vec<bool> = config
+                .layer_types
+                .iter()
+                .map(|t| *t == qwen35::LayerType::FullAttention)
+                .collect();
             KvCache::new_gpu_fwht2_filtered(
-                &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
-            ).unwrap()
+                &mut gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap()
         }
-        other => panic!("unknown --kv-mode: {other} (q8, asym4, asym3, asym2, fwht4, fwht3, fwht2)"),
+        other => {
+            panic!("unknown --kv-mode: {other} (q8, asym4, asym3, asym2, fwht4, fwht3, fwht2)")
+        }
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();
@@ -128,11 +194,20 @@ fn main() {
 
     for (pos, &tok) in window.iter().enumerate().take(window.len() - 1) {
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, tok, pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("forward");
+            &mut gpu,
+            &weights,
+            &config,
+            tok,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("forward");
 
-        if pos < warmup { continue; }
+        if pos < warmup {
+            continue;
+        }
 
         let logits = gpu.download_f32(&scratch.logits).unwrap();
         let target = window[pos + 1] as usize;
@@ -150,23 +225,37 @@ fn main() {
             let rate = scored as f64 / elapsed.max(1e-9);
             eprintln!(
                 "  pos={:5} scored={:5} nll/tok={:.4} ppl={:.3} ({:.1} tok/s)",
-                pos, scored, avg_nll, avg_nll.exp(), rate,
+                pos,
+                scored,
+                avg_nll,
+                avg_nll.exp(),
+                rate,
             );
         }
     }
 
-    let avg_nll = if scored > 0 { total_nll / scored as f64 } else { 0.0 };
+    let avg_nll = if scored > 0 {
+        total_nll / scored as f64
+    } else {
+        0.0
+    };
     let ppl = avg_nll.exp();
     let elapsed = t0.elapsed().as_secs_f64();
     println!();
     println!("Model:    {model_path}");
     println!("Corpus:   {corpus_path}");
-    println!("Tokens:   offset={offset} ctx={} warmup={warmup}", window.len());
+    println!(
+        "Tokens:   offset={offset} ctx={} warmup={warmup}",
+        window.len()
+    );
     println!("Scored:   {scored}");
     println!("NLL/tok:  {:.10}", avg_nll);
     println!("PPL:      {:.4}", ppl);
-    println!("Elapsed:  {:.1}s ({:.1} tok/s)", elapsed,
-             scored as f64 / elapsed.max(1e-9));
+    println!(
+        "Elapsed:  {:.1}s ({:.1} tok/s)",
+        elapsed,
+        scored as f64 / elapsed.max(1e-9)
+    );
 }
 
 fn neg_log_softmax_at(logits: &[f32], target: usize) -> f32 {
@@ -174,9 +263,15 @@ fn neg_log_softmax_at(logits: &[f32], target: usize) -> f32 {
         return f32::NAN;
     }
     let mut max = f32::NEG_INFINITY;
-    for &v in logits { if v > max { max = v; } }
+    for &v in logits {
+        if v > max {
+            max = v;
+        }
+    }
     let mut sum = 0.0f64;
-    for &v in logits { sum += ((v - max) as f64).exp(); }
+    for &v in logits {
+        sum += ((v - max) as f64).exp();
+    }
     let log_sum = max as f64 + sum.ln();
     (log_sum - logits[target] as f64) as f32
 }

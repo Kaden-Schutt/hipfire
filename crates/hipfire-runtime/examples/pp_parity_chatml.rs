@@ -43,8 +43,15 @@ fn argmax(logits: &[f32]) -> u32 {
 
 fn top_k(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
     let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal));
-    idx.into_iter().take(k).map(|i| (i as u32, logits[i])).collect()
+    idx.sort_by(|&a, &b| {
+        logits[b]
+            .partial_cmp(&logits[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    idx.into_iter()
+        .take(k)
+        .map(|i| (i as u32, logits[i]))
+        .collect()
 }
 
 fn build_prompt_tokens(tok: &Tokenizer) -> Vec<u32> {
@@ -73,7 +80,12 @@ fn run_single_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>
     let mut gpu = Gpu::init().expect("Gpu::init");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights");
     let mut kv = KvCache::new_gpu_asym3_capped(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, 4096, 4096,
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        4096,
+        4096,
     )
     .expect("kv");
     let mut dn = DeltaNetState::new_with_quant(&mut gpu, &config, StateQuant::Q8).expect("dn");
@@ -84,8 +96,10 @@ fn run_single_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>
     // because pp=2 has no batched analogue yet — same kernel path).
     let mut all_logits: Vec<Vec<f32>> = Vec::new();
     for (i, &tok) in prompt_tokens.iter().enumerate() {
-        qwen35::forward_scratch(&mut gpu, &weights, &config, tok, i, &mut kv, &mut dn, &scratch)
-            .expect("forward_scratch prefill");
+        qwen35::forward_scratch(
+            &mut gpu, &weights, &config, tok, i, &mut kv, &mut dn, &scratch,
+        )
+        .expect("forward_scratch prefill");
     }
     let mut tokens = Vec::with_capacity(N_DECODE);
     let mut tok = {
@@ -97,8 +111,10 @@ fn run_single_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>
     tokens.push(tok);
     for step in 1..N_DECODE {
         let pos = prompt_tokens.len() + step - 1;
-        qwen35::forward_scratch(&mut gpu, &weights, &config, tok, pos, &mut kv, &mut dn, &scratch)
-            .expect("forward_scratch decode");
+        qwen35::forward_scratch(
+            &mut gpu, &weights, &config, tok, pos, &mut kv, &mut dn, &scratch,
+        )
+        .expect("forward_scratch decode");
         let logits = gpu.download_f32(&scratch.logits).expect("download logits");
         tok = argmax(&logits);
         tokens.push(tok);
@@ -116,24 +132,34 @@ fn run_multi_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>)
     let hfq = HfqFile::open(Path::new(path)).expect("open hfq");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let mut gpus = Gpus::init_uniform(2, config.n_layers).expect("init_uniform");
-    let weights =
-        qwen35::load_weights_multi(&hfq, &config, &mut gpus).expect("load_weights_multi");
-    let scratch_set = Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 64, 4096)
-        .expect("scratch_set");
+    let weights = qwen35::load_weights_multi(&hfq, &config, &mut gpus).expect("load_weights_multi");
+    let scratch_set =
+        Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 64, 4096).expect("scratch_set");
     let mut kv = KvCache::new_gpu_asym3_capped_multi(
-        &mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, 4096, 4096,
+        &mut gpus,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        4096,
+        4096,
     )
     .expect("kv multi");
     let (mut dn, _la_to_device) =
-        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8)
-            .expect("dn multi");
+        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("dn multi");
     let _ = gpus.enable_peer_all().expect("enable_peer_all");
 
     let dev_last = gpus.output_device;
     let mut all_logits: Vec<Vec<f32>> = Vec::new();
     for (i, &tok) in prompt_tokens.iter().enumerate() {
         qwen35::forward_scratch_multi(
-            &mut gpus, &weights, &config, tok, i, &mut kv, &mut dn, &scratch_set,
+            &mut gpus,
+            &weights,
+            &config,
+            tok,
+            i,
+            &mut kv,
+            &mut dn,
+            &scratch_set,
         )
         .expect("forward_scratch_multi prefill");
     }
@@ -151,7 +177,14 @@ fn run_multi_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>)
     for step in 1..N_DECODE {
         let pos = prompt_tokens.len() + step - 1;
         qwen35::forward_scratch_multi(
-            &mut gpus, &weights, &config, tok, pos, &mut kv, &mut dn, &scratch_set,
+            &mut gpus,
+            &weights,
+            &config,
+            tok,
+            pos,
+            &mut kv,
+            &mut dn,
+            &scratch_set,
         )
         .expect("forward_scratch_multi decode");
         let s_last = &scratch_set.per_device[dev_last];
@@ -172,8 +205,7 @@ fn main() {
     std::env::set_var("HIPFIRE_DETERMINISTIC", "1");
     let path = std::env::args().nth(1).expect("Usage: ... <model.mq4>");
     let hfq = HfqFile::open(Path::new(&path)).expect("open hfq");
-    let tokenizer =
-        Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
+    let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let prompt_tokens = build_prompt_tokens(&tokenizer);
     println!("prompt: {:?}  (len={})", PROMPT, prompt_tokens.len());
 
@@ -196,33 +228,63 @@ fn main() {
             for (a, b) in logits1.iter().zip(logits2.iter()) {
                 for (x, y) in a.iter().zip(b.iter()) {
                     let d = (x - y).abs();
-                    if d > max_abs { max_abs = d; }
+                    if d > max_abs {
+                        max_abs = d;
+                    }
                     sum_abs += d;
                 }
             }
             let n = logits1.len() * logits1[0].len();
-            println!("max |Δlogit| = {:.3e}, mean |Δlogit| = {:.3e}", max_abs, sum_abs / n as f32);
+            println!(
+                "max |Δlogit| = {:.3e}, mean |Δlogit| = {:.3e}",
+                max_abs,
+                sum_abs / n as f32
+            );
         }
         Some(i) => {
             println!("first diff at decode step {i}:");
-            println!("  PP=1 picked token {} ({:?})", toks1[i], tokenizer.decode_bytes(&[toks1[i]]));
-            println!("  PP=2 picked token {} ({:?})", toks2[i], tokenizer.decode_bytes(&[toks2[i]]));
+            println!(
+                "  PP=1 picked token {} ({:?})",
+                toks1[i],
+                tokenizer.decode_bytes(&[toks1[i]])
+            );
+            println!(
+                "  PP=2 picked token {} ({:?})",
+                toks2[i],
+                tokenizer.decode_bytes(&[toks2[i]])
+            );
             let l1 = &logits1[i];
             let l2 = &logits2[i];
             let t1 = top_k(l1, TOP_K);
             let t2 = top_k(l2, TOP_K);
             println!("  PP=1 top-{TOP_K}:");
             for (id, v) in &t1 {
-                println!("    {:>6}  {:>12.6}  {:?}", id, v, tokenizer.decode_bytes(&[*id]));
+                println!(
+                    "    {:>6}  {:>12.6}  {:?}",
+                    id,
+                    v,
+                    tokenizer.decode_bytes(&[*id])
+                );
             }
             println!("  PP=2 top-{TOP_K}:");
             for (id, v) in &t2 {
-                println!("    {:>6}  {:>12.6}  {:?}", id, v, tokenizer.decode_bytes(&[*id]));
+                println!(
+                    "    {:>6}  {:>12.6}  {:?}",
+                    id,
+                    v,
+                    tokenizer.decode_bytes(&[*id])
+                );
             }
             let delta_top1 = (l1[toks1[i] as usize] - l2[toks1[i] as usize]).abs();
             let delta_top2 = (l1[toks2[i] as usize] - l2[toks2[i] as usize]).abs();
-            println!("  |Δlogit| at PP=1 winner ({}): {:.3e}", toks1[i], delta_top1);
-            println!("  |Δlogit| at PP=2 winner ({}): {:.3e}", toks2[i], delta_top2);
+            println!(
+                "  |Δlogit| at PP=1 winner ({}): {:.3e}",
+                toks1[i], delta_top1
+            );
+            println!(
+                "  |Δlogit| at PP=2 winner ({}): {:.3e}",
+                toks2[i], delta_top2
+            );
             // Margin = winner − runner-up on each side. Tiny margin + tiny
             // |Δlogit| means we crossed an argmax razor's edge — diagnostic
             // signature of pure floating-point accumulation, not a bug.
@@ -233,6 +295,10 @@ fn main() {
         }
     }
 
-    let common = toks1.iter().zip(toks2.iter()).take_while(|(a, b)| a == b).count();
+    let common = toks1
+        .iter()
+        .zip(toks2.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
     println!("\nmatched {common}/{N_DECODE} decode tokens before divergence");
 }

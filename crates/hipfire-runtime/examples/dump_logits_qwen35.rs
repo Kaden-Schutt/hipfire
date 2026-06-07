@@ -22,9 +22,9 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::KvCache;
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use std::io::Write;
     use std::path::Path;
 
@@ -54,7 +54,10 @@ fn main() {
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    eprintln!("dump_logits_qwen35: arch={} prefill_len={}", gpu.arch, prefill_len);
+    eprintln!(
+        "dump_logits_qwen35: arch={} prefill_len={}",
+        gpu.arch, prefill_len
+    );
 
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
@@ -62,19 +65,35 @@ fn main() {
     let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
     let mut kv_cache = match kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
         )
         .unwrap(),
         "asym4" | "turbo4" => KvCache::new_gpu_asym4(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
         )
         .unwrap(),
         "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
         )
         .unwrap(),
         "asym2" | "turbo2" => KvCache::new_gpu_asym2(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
         )
         .unwrap(),
         other => panic!("unknown HIPFIRE_KV_MODE: {other}"),
@@ -103,7 +122,11 @@ fn main() {
     gpu.hip.device_synchronize().expect("sync");
 
     let logits = gpu.download_f32(&scratch.logits).expect("download logits");
-    eprintln!("logits len={} (expected ~vocab_size={})", logits.len(), config.vocab_size);
+    eprintln!(
+        "logits len={} (expected ~vocab_size={})",
+        logits.len(),
+        config.vocab_size
+    );
 
     let mut out = std::fs::File::create(out_path).expect("create out file");
     let bytes: &[u8] = unsafe {

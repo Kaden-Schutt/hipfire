@@ -95,16 +95,28 @@ pub struct TriAttnCenters {
 }
 
 impl TriAttnCenters {
-    pub fn new(n_layers: usize, n_heads: usize, head_dim: usize, rope_theta: f32, partial_rotary_factor: f32) -> Self {
+    pub fn new(
+        n_layers: usize,
+        n_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+        partial_rotary_factor: f32,
+    ) -> Self {
         let n_bands = head_dim / 2;
         Self {
-            n_layers, n_heads, head_dim, rope_theta, partial_rotary_factor,
+            n_layers,
+            n_heads,
+            head_dim,
+            rope_theta,
+            partial_rotary_factor,
             centers: vec![BandCenter::default(); n_layers * n_heads * n_bands],
         }
     }
 
     #[inline]
-    pub fn n_bands(&self) -> usize { self.head_dim / 2 }
+    pub fn n_bands(&self) -> usize {
+        self.head_dim / 2
+    }
 
     #[inline]
     pub fn get(&self, layer: usize, head: usize, band: usize) -> BandCenter {
@@ -122,7 +134,9 @@ impl TriAttnCenters {
     /// Bands beyond d_rot/2 are unrotated (ω=0 → phase contribution 0).
     pub fn omega(&self, band: usize) -> f32 {
         let d_rot = (self.head_dim as f32 * self.partial_rotary_factor) as usize;
-        if band * 2 >= d_rot { return 0.0; }
+        if band * 2 >= d_rot {
+            return 0.0;
+        }
         let exponent = -2.0f32 * band as f32 / d_rot as f32;
         self.rope_theta.powf(exponent)
     }
@@ -150,25 +164,48 @@ impl TriAttnCenters {
         let mut magic = [0u8; 4];
         f.read_exact(&mut magic)?;
         if &magic != b"TRIA" {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "not a TRIA sidecar"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "not a TRIA sidecar",
+            ));
         }
         let mut u32buf = [0u8; 4];
-        f.read_exact(&mut u32buf)?; let _ver = u32::from_le_bytes(u32buf);
-        f.read_exact(&mut u32buf)?; let n_layers = u32::from_le_bytes(u32buf) as usize;
-        f.read_exact(&mut u32buf)?; let n_heads = u32::from_le_bytes(u32buf) as usize;
-        f.read_exact(&mut u32buf)?; let head_dim = u32::from_le_bytes(u32buf) as usize;
-        f.read_exact(&mut u32buf)?; let rope_theta = f32::from_le_bytes(u32buf);
-        f.read_exact(&mut u32buf)?; let partial_rotary_factor = f32::from_le_bytes(u32buf);
+        f.read_exact(&mut u32buf)?;
+        let _ver = u32::from_le_bytes(u32buf);
+        f.read_exact(&mut u32buf)?;
+        let n_layers = u32::from_le_bytes(u32buf) as usize;
+        f.read_exact(&mut u32buf)?;
+        let n_heads = u32::from_le_bytes(u32buf) as usize;
+        f.read_exact(&mut u32buf)?;
+        let head_dim = u32::from_le_bytes(u32buf) as usize;
+        f.read_exact(&mut u32buf)?;
+        let rope_theta = f32::from_le_bytes(u32buf);
+        f.read_exact(&mut u32buf)?;
+        let partial_rotary_factor = f32::from_le_bytes(u32buf);
         let n_bands = head_dim / 2;
         let n = n_layers * n_heads * n_bands;
         let mut centers = Vec::with_capacity(n);
         for _ in 0..n {
-            f.read_exact(&mut u32buf)?; let eq_re = f32::from_le_bytes(u32buf);
-            f.read_exact(&mut u32buf)?; let eq_im = f32::from_le_bytes(u32buf);
-            f.read_exact(&mut u32buf)?; let e_abs_q = f32::from_le_bytes(u32buf);
-            centers.push(BandCenter { eq_re, eq_im, e_abs_q });
+            f.read_exact(&mut u32buf)?;
+            let eq_re = f32::from_le_bytes(u32buf);
+            f.read_exact(&mut u32buf)?;
+            let eq_im = f32::from_le_bytes(u32buf);
+            f.read_exact(&mut u32buf)?;
+            let e_abs_q = f32::from_le_bytes(u32buf);
+            centers.push(BandCenter {
+                eq_re,
+                eq_im,
+                e_abs_q,
+            });
         }
-        Ok(Self { n_layers, n_heads, head_dim, rope_theta, partial_rotary_factor, centers })
+        Ok(Self {
+            n_layers,
+            n_heads,
+            head_dim,
+            rope_theta,
+            partial_rotary_factor,
+            centers,
+        })
     }
 }
 
@@ -220,10 +257,20 @@ pub struct TriAttnCalibState {
 }
 
 impl TriAttnCalibState {
-    pub fn new(n_layers: usize, n_heads: usize, head_dim: usize, rope_theta: f32, partial_rotary_factor: f32) -> Self {
+    pub fn new(
+        n_layers: usize,
+        n_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+        partial_rotary_factor: f32,
+    ) -> Self {
         let n_bands = head_dim / 2;
         Self {
-            n_layers, n_heads, head_dim, rope_theta, partial_rotary_factor,
+            n_layers,
+            n_heads,
+            head_dim,
+            rope_theta,
+            partial_rotary_factor,
             accs: vec![BandAccumulator::default(); n_layers * n_heads * n_bands],
         }
     }
@@ -242,8 +289,13 @@ impl TriAttnCalibState {
         let n_bands = self.head_dim / 2;
         let head_dim = self.head_dim;
         let n_heads = self.n_heads;
-        assert_eq!(q.len(), n_heads * head_dim,
-            "sample length {} != n_heads * head_dim = {}", q.len(), n_heads * head_dim);
+        assert_eq!(
+            q.len(),
+            n_heads * head_dim,
+            "sample length {} != n_heads * head_dim = {}",
+            q.len(),
+            n_heads * head_dim
+        );
         let base_idx = layer * n_heads * n_bands;
         self.accs[base_idx..base_idx + n_heads * n_bands]
             .par_chunks_mut(n_bands)
@@ -314,7 +366,12 @@ pub struct TriAttnCapture {
 
 impl TriAttnCapture {
     pub fn new(n_heads: usize, n_kv_heads: usize, head_dim: usize) -> Self {
-        Self { n_heads, n_kv_heads, head_dim, ..Default::default() }
+        Self {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ..Default::default()
+        }
     }
 
     /// Call after each full forward pass (one token) to commit the
@@ -347,17 +404,20 @@ pub struct TriAttnCalibStateGpu {
     pub head_dim: usize,
     pub rope_theta: f32,
     pub partial_rotary_factor: f32,
-    pub accs_sum_re: hip_bridge::DeviceBuffer,   // n_layers*n_heads*n_bands × f64
+    pub accs_sum_re: hip_bridge::DeviceBuffer, // n_layers*n_heads*n_bands × f64
     pub accs_sum_im: hip_bridge::DeviceBuffer,
     pub accs_sum_abs: hip_bridge::DeviceBuffer,
-    pub accs_count: hip_bridge::DeviceBuffer,    // u64
+    pub accs_count: hip_bridge::DeviceBuffer, // u64
 }
 
 impl TriAttnCalibStateGpu {
     pub fn new(
         gpu: &mut rdna_compute::Gpu,
-        n_layers: usize, n_heads: usize, head_dim: usize,
-        rope_theta: f32, partial_rotary_factor: f32,
+        n_layers: usize,
+        n_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+        partial_rotary_factor: f32,
     ) -> hip_bridge::HipResult<Self> {
         let n_bands = head_dim / 2;
         let n_accs = n_layers * n_heads * n_bands;
@@ -372,8 +432,15 @@ impl TriAttnCalibStateGpu {
         gpu.hip.memset(&accs_sum_abs, 0, bytes)?;
         gpu.hip.memset(&accs_count, 0, bytes)?;
         Ok(Self {
-            n_layers, n_heads, head_dim, rope_theta, partial_rotary_factor,
-            accs_sum_re, accs_sum_im, accs_sum_abs, accs_count,
+            n_layers,
+            n_heads,
+            head_dim,
+            rope_theta,
+            partial_rotary_factor,
+            accs_sum_re,
+            accs_sum_im,
+            accs_sum_abs,
+            accs_count,
         })
     }
 
@@ -390,49 +457,38 @@ impl TriAttnCalibStateGpu {
         let mut sum_abs = vec![0.0f64; n_accs];
         let mut count = vec![0u64; n_accs];
         gpu.hip.memcpy_dtoh(
-            unsafe { std::slice::from_raw_parts_mut(
-                sum_re.as_mut_ptr() as *mut u8, n_accs * 8) },
+            unsafe { std::slice::from_raw_parts_mut(sum_re.as_mut_ptr() as *mut u8, n_accs * 8) },
             &self.accs_sum_re,
         )?;
         gpu.hip.memcpy_dtoh(
-            unsafe { std::slice::from_raw_parts_mut(
-                sum_im.as_mut_ptr() as *mut u8, n_accs * 8) },
+            unsafe { std::slice::from_raw_parts_mut(sum_im.as_mut_ptr() as *mut u8, n_accs * 8) },
             &self.accs_sum_im,
         )?;
         gpu.hip.memcpy_dtoh(
-            unsafe { std::slice::from_raw_parts_mut(
-                sum_abs.as_mut_ptr() as *mut u8, n_accs * 8) },
+            unsafe { std::slice::from_raw_parts_mut(sum_abs.as_mut_ptr() as *mut u8, n_accs * 8) },
             &self.accs_sum_abs,
         )?;
         gpu.hip.memcpy_dtoh(
-            unsafe { std::slice::from_raw_parts_mut(
-                count.as_mut_ptr() as *mut u8, n_accs * 8) },
+            unsafe { std::slice::from_raw_parts_mut(count.as_mut_ptr() as *mut u8, n_accs * 8) },
             &self.accs_count,
         )?;
 
-        // Free the GPU accumulators now that they're downloaded — `self` is
-        // consumed by this method and DeviceBuffer has no Drop, so scope exit
-        // would otherwise leak all four calibration buffers. (Partial-move out
-        // of `self` is fine: the Ok(..) below only reads the scalar fields.)
-        let _ = gpu.hip.free(self.accs_sum_re);
-        let _ = gpu.hip.free(self.accs_sum_im);
-        let _ = gpu.hip.free(self.accs_sum_abs);
-        let _ = gpu.hip.free(self.accs_count);
-
         // Same math as BandAccumulator::finalize: mean(re), mean(im), mean(|q|).
-        let centers: Vec<BandCenter> = (0..n_accs).map(|i| {
-            let c = count[i];
-            if c == 0 {
-                BandCenter::default()
-            } else {
-                let n = c as f64;
-                BandCenter {
-                    eq_re: (sum_re[i] / n) as f32,
-                    eq_im: (sum_im[i] / n) as f32,
-                    e_abs_q: (sum_abs[i] / n) as f32,
+        let centers: Vec<BandCenter> = (0..n_accs)
+            .map(|i| {
+                let c = count[i];
+                if c == 0 {
+                    BandCenter::default()
+                } else {
+                    let n = c as f64;
+                    BandCenter {
+                        eq_re: (sum_re[i] / n) as f32,
+                        eq_im: (sum_im[i] / n) as f32,
+                        e_abs_q: (sum_abs[i] / n) as f32,
+                    }
                 }
-            }
-        }).collect();
+            })
+            .collect();
 
         Ok(TriAttnCenters {
             n_layers: self.n_layers,
@@ -502,8 +558,14 @@ pub fn record_prerope_q_batch_gpu_if_applicable(
     };
     gpu.triattn_accumulate(
         q_batch,
-        &s.accs_sum_re, &s.accs_sum_im, &s.accs_sum_abs, &s.accs_count,
-        n_tokens, n_heads, head_dim, layer_idx,
+        &s.accs_sum_re,
+        &s.accs_sum_im,
+        &s.accs_sum_abs,
+        &s.accs_count,
+        n_tokens,
+        n_heads,
+        head_dim,
+        layer_idx,
     )?;
     Ok(true)
 }
@@ -545,7 +607,9 @@ pub fn take_capture() -> Option<TriAttnCapture> {
 /// flush pending per-layer rows into the per-token history. No-op for
 /// calibration or when the tap is disabled.
 pub fn capture_finish_token() {
-    if !TAP_ENABLED.load(Ordering::Relaxed) { return; }
+    if !TAP_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     if let Some(TapState::Capture(c)) = TAP_STATE.lock().unwrap().as_mut() {
         c.finish_token();
     }
@@ -562,7 +626,9 @@ pub fn tap_enabled() -> bool {
 /// the CPU fallback path; small but real win on the GPU path too if the
 /// caller can avoid building K at all.
 pub fn tap_needs_k() -> bool {
-    if !TAP_ENABLED.load(Ordering::Relaxed) { return false; }
+    if !TAP_ENABLED.load(Ordering::Relaxed) {
+        return false;
+    }
     matches!(
         TAP_STATE.lock().unwrap().as_ref(),
         Some(TapState::Capture(_)),
@@ -577,7 +643,9 @@ pub fn record_prerope_q(layer_idx: usize, q: &[f32]) {
 }
 
 pub fn record_prerope_qk(layer_idx: usize, q: &[f32], k_opt: Option<&[f32]>) {
-    if !TAP_ENABLED.load(Ordering::Relaxed) { return; }
+    if !TAP_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     let mut guard = TAP_STATE.lock().unwrap();
     match guard.as_mut() {
         Some(TapState::Calibrate(state)) => {
@@ -604,7 +672,8 @@ pub fn record_prerope_qk(layer_idx: usize, q: &[f32], k_opt: Option<&[f32]>) {
         Some(TapState::Capture(cap)) => {
             cap.pending_layer_ids.push(layer_idx);
             cap.pending_q.push(q.to_vec());
-            cap.pending_k.push(k_opt.map(|k| k.to_vec()).unwrap_or_default());
+            cap.pending_k
+                .push(k_opt.map(|k| k.to_vec()).unwrap_or_default());
         }
         None => {}
     }
@@ -698,7 +767,9 @@ pub fn compute_retain_indices(
     budget: usize,
 ) -> Vec<u32> {
     assert_eq!(scores.len(), n_heads * seq_len, "scores shape mismatch");
-    if seq_len == 0 { return Vec::new(); }
+    if seq_len == 0 {
+        return Vec::new();
+    }
     let b = budget.min(seq_len);
 
     // 1. Per-head z-score
@@ -706,20 +777,19 @@ pub fn compute_retain_indices(
     for h in 0..n_heads {
         let row = &scores[h * seq_len..(h + 1) * seq_len];
         let mean: f32 = row.iter().sum::<f32>() / seq_len as f32;
-        let var: f32 = row.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>()
-            / seq_len as f32;
+        let var: f32 = row.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / seq_len as f32;
         let std = var.sqrt().max(1e-6);
         // 2. Max across heads
         for p in 0..seq_len {
             let z = (row[p] - mean) / std;
-            if z > agg[p] { agg[p] = z; }
+            if z > agg[p] {
+                agg[p] = z;
+            }
         }
     }
 
     // 3. Top-b by score, then sort ascending by position
-    let mut indexed: Vec<(f32, usize)> = agg.into_iter().enumerate()
-        .map(|(i, v)| (v, i))
-        .collect();
+    let mut indexed: Vec<(f32, usize)> = agg.into_iter().enumerate().map(|(i, v)| (v, i)).collect();
     indexed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     indexed.truncate(b);
     indexed.sort_by_key(|&(_, i)| i);
@@ -795,7 +865,10 @@ impl EvictionCtx {
         // physical_cap == max_seq so the two were interchangeable; now that
         // eviction-aware allocators decouple them, the meaningful invariant is
         // the physical cap (checked at maybe_evict time against the supplied kv).
-        assert!(max_seq >= budget + beta, "max_seq < budget+beta; eviction can never fire");
+        assert!(
+            max_seq >= budget + beta,
+            "max_seq < budget+beta; eviction can never fire"
+        );
         let n_bands = head_dim / 2;
         let centers_per_layer = n_heads * n_bands * 3;
 
@@ -828,9 +901,21 @@ impl EvictionCtx {
         let retain_dev = gpu.alloc_tensor(&[budget], DType::F32)?;
 
         Ok(Self {
-            centers_dev, fa_layer_ids, centers_per_layer,
-            budget, beta, n_heads, n_kv_heads, head_dim, n_rot, rope_theta, max_seq,
-            scores_buf, k_compact, v_compact, retain_dev,
+            centers_dev,
+            fa_layer_ids,
+            centers_per_layer,
+            budget,
+            beta,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            n_rot,
+            rope_theta,
+            max_seq,
+            scores_buf,
+            k_compact,
+            v_compact,
+            retain_dev,
             eviction_count: std::cell::Cell::new(0),
         })
     }
@@ -851,7 +936,12 @@ impl EvictionCtx {
         let absolute_pos = current_physical + kv.compact_offset;
         let p_q = absolute_pos as f32;
 
-        enum Mode { Q8, Asym2, Asym3, Asym4 }
+        enum Mode {
+            Q8,
+            Asym2,
+            Asym3,
+            Asym4,
+        }
         let (mode, k_bytes_per_pos) = if kv.quant_asym3 {
             (Mode::Asym3, self.n_kv_heads * (4 + (self.head_dim * 3) / 8))
         } else if kv.quant_asym4 {
@@ -871,33 +961,70 @@ impl EvictionCtx {
             let centers_layer = self.centers_dev.sub_offset(offset, self.centers_per_layer);
             match mode {
                 Mode::Asym3 => gpu.triattn_score_asym3(
-                    &kv.k_gpu[layer_idx], &centers_layer,
-                    kv.givens_cos.as_ref().expect("asym3 KV must have cos table"),
-                    kv.givens_sin.as_ref().expect("asym3 KV must have sin table"),
+                    &kv.k_gpu[layer_idx],
+                    &centers_layer,
+                    kv.givens_cos
+                        .as_ref()
+                        .expect("asym3 KV must have cos table"),
+                    kv.givens_sin
+                        .as_ref()
+                        .expect("asym3 KV must have sin table"),
                     &self.scores_buf,
-                    self.n_heads, self.n_kv_heads, self.head_dim,
-                    self.n_rot, self.rope_theta, p_q, current_physical,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.n_rot,
+                    self.rope_theta,
+                    p_q,
+                    current_physical,
                 )?,
                 Mode::Asym4 => gpu.triattn_score_asym4(
-                    &kv.k_gpu[layer_idx], &centers_layer,
-                    kv.givens_cos.as_ref().expect("asym4 KV must have cos table"),
-                    kv.givens_sin.as_ref().expect("asym4 KV must have sin table"),
+                    &kv.k_gpu[layer_idx],
+                    &centers_layer,
+                    kv.givens_cos
+                        .as_ref()
+                        .expect("asym4 KV must have cos table"),
+                    kv.givens_sin
+                        .as_ref()
+                        .expect("asym4 KV must have sin table"),
                     &self.scores_buf,
-                    self.n_heads, self.n_kv_heads, self.head_dim,
-                    self.n_rot, self.rope_theta, p_q, current_physical,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.n_rot,
+                    self.rope_theta,
+                    p_q,
+                    current_physical,
                 )?,
                 Mode::Asym2 => gpu.triattn_score_asym2(
-                    &kv.k_gpu[layer_idx], &centers_layer,
-                    kv.givens_cos.as_ref().expect("asym2 KV must have cos table"),
-                    kv.givens_sin.as_ref().expect("asym2 KV must have sin table"),
+                    &kv.k_gpu[layer_idx],
+                    &centers_layer,
+                    kv.givens_cos
+                        .as_ref()
+                        .expect("asym2 KV must have cos table"),
+                    kv.givens_sin
+                        .as_ref()
+                        .expect("asym2 KV must have sin table"),
                     &self.scores_buf,
-                    self.n_heads, self.n_kv_heads, self.head_dim,
-                    self.n_rot, self.rope_theta, p_q, current_physical,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.n_rot,
+                    self.rope_theta,
+                    p_q,
+                    current_physical,
                 )?,
                 Mode::Q8 => gpu.triattn_score_q8(
-                    &kv.k_gpu[layer_idx], &centers_layer, &self.scores_buf,
-                    self.n_heads, self.n_kv_heads, self.head_dim,
-                    self.n_rot, self.rope_theta, p_q, current_physical,
+                    &kv.k_gpu[layer_idx],
+                    &centers_layer,
+                    &self.scores_buf,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.n_rot,
+                    self.rope_theta,
+                    p_q,
+                    current_physical,
                 )?,
             }
             gpu.hip.device_synchronize()?;
@@ -905,23 +1032,55 @@ impl EvictionCtx {
             let scores = gpu.download_f32(&self.scores_buf)?;
             let retain = compute_retain_indices(
                 &scores[..self.n_heads * current_physical],
-                self.n_heads, current_physical, self.budget,
+                self.n_heads,
+                current_physical,
+                self.budget,
             );
-            let retain_bytes: Vec<u8> = retain.iter().flat_map(|&x| (x as i32).to_ne_bytes()).collect();
+            let retain_bytes: Vec<u8> = retain
+                .iter()
+                .flat_map(|&x| (x as i32).to_ne_bytes())
+                .collect();
             gpu.hip.memcpy_htod(&self.retain_dev.buf, &retain_bytes)?;
 
-            gpu.kv_compact_gather(&kv.k_gpu[layer_idx], &self.k_compact, &self.retain_dev, k_bytes_per_pos, self.budget)?;
-            gpu.kv_compact_gather(&kv.v_gpu[layer_idx], &self.v_compact, &self.retain_dev, v_bytes_per_pos, self.budget)?;
+            gpu.kv_compact_gather(
+                &kv.k_gpu[layer_idx],
+                &self.k_compact,
+                &self.retain_dev,
+                k_bytes_per_pos,
+                self.budget,
+            )?;
+            gpu.kv_compact_gather(
+                &kv.v_gpu[layer_idx],
+                &self.v_compact,
+                &self.retain_dev,
+                v_bytes_per_pos,
+                self.budget,
+            )?;
             gpu.hip.device_synchronize()?;
 
-            gpu.hip.memcpy_dtod_at(&kv.k_gpu[layer_idx].buf, 0, &self.k_compact.buf, 0, self.budget * k_bytes_per_pos)?;
-            gpu.hip.memcpy_dtod_at(&kv.v_gpu[layer_idx].buf, 0, &self.v_compact.buf, 0, self.budget * v_bytes_per_pos)?;
+            gpu.hip.memcpy_dtod_at(
+                &kv.k_gpu[layer_idx].buf,
+                0,
+                &self.k_compact.buf,
+                0,
+                self.budget * k_bytes_per_pos,
+            )?;
+            gpu.hip.memcpy_dtod_at(
+                &kv.v_gpu[layer_idx].buf,
+                0,
+                &self.v_compact.buf,
+                0,
+                self.budget * v_bytes_per_pos,
+            )?;
             last_retain = retain;
         }
 
         kv.compact_offset += current_physical - self.budget;
         self.eviction_count.set(self.eviction_count.get() + 1);
-        Ok(Some(EvictionResult { new_physical: self.budget, retain_mask: last_retain }))
+        Ok(Some(EvictionResult {
+            new_physical: self.budget,
+            retain_mask: last_retain,
+        }))
     }
 
     /// Release all GPU buffers held by the context. Consumed by value;
@@ -940,7 +1099,9 @@ impl EvictionCtx {
 pub fn pearson(x: &[f32], y: &[f32]) -> f32 {
     assert_eq!(x.len(), y.len());
     let n = x.len() as f32;
-    if n < 2.0 { return 0.0; }
+    if n < 2.0 {
+        return 0.0;
+    }
     let mx: f32 = x.iter().sum::<f32>() / n;
     let my: f32 = y.iter().sum::<f32>() / n;
     let mut cov = 0.0f32;
@@ -954,7 +1115,11 @@ pub fn pearson(x: &[f32], y: &[f32]) -> f32 {
         vy += dy * dy;
     }
     let denom = (vx * vy).sqrt();
-    if denom > 1e-20 { cov / denom } else { 0.0 }
+    if denom > 1e-20 {
+        cov / denom
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
@@ -993,7 +1158,11 @@ mod tests {
             a.add(theta.cos(), theta.sin());
         }
         let c = a.finalize();
-        assert!(c.mrl() < 1e-4, "got mrl={} for uniformly-dispersed samples", c.mrl());
+        assert!(
+            c.mrl() < 1e-4,
+            "got mrl={} for uniformly-dispersed samples",
+            c.mrl()
+        );
     }
 
     #[test]
@@ -1002,7 +1171,10 @@ mod tests {
         // ω_0 = 1 (no rotation), ω_{d/2-1} = very small.
         assert!((c.omega(0) - 1.0).abs() < 1e-5);
         for f in 1..128 {
-            assert!(c.omega(f) < c.omega(f - 1), "omega should decrease with band");
+            assert!(
+                c.omega(f) < c.omega(f - 1),
+                "omega should decrease with band"
+            );
         }
     }
 
@@ -1013,11 +1185,16 @@ mod tests {
         for l in 0..c.n_layers {
             for h in 0..c.n_heads {
                 for f in 0..c.n_bands() {
-                    c.set(l, h, f, BandCenter {
-                        eq_re: (l * 100 + h * 10 + f) as f32,
-                        eq_im: -((l * 100 + h * 10 + f) as f32),
-                        e_abs_q: (l + h + f) as f32 + 1.0,
-                    });
+                    c.set(
+                        l,
+                        h,
+                        f,
+                        BandCenter {
+                            eq_re: (l * 100 + h * 10 + f) as f32,
+                            eq_im: -((l * 100 + h * 10 + f) as f32),
+                            e_abs_q: (l + h + f) as f32 + 1.0,
+                        },
+                    );
                 }
             }
         }
@@ -1044,8 +1221,7 @@ mod tests {
         let seq = 6;
         let scores = vec![
             // head 0
-            0.0, 2.0, 0.0, 3.0, 0.0, 2.5,
-            // head 1
+            0.0, 2.0, 0.0, 3.0, 0.0, 2.5, // head 1
             3.0, 0.0, 0.0, 2.5, 0.0, 0.0,
         ];
         let kept = super::compute_retain_indices(&scores, 2, seq, 3);
@@ -1077,10 +1253,19 @@ mod tests {
         let theta = 0.7f32;
         let k_mag = 1.0f32;
         let k_phase = theta;
-        let centers_slice = &[BandCenter { eq_re: 1.0, eq_im: 0.0, e_abs_q: 1.0 }];
+        let centers_slice = &[BandCenter {
+            eq_re: 1.0,
+            eq_im: 0.0,
+            e_abs_q: 1.0,
+        }];
         let k_bands = &[(k_mag, k_phase)];
         let s = s_trig(centers_slice, k_bands, 0.0, |f| c.omega(f));
         let expected = theta.cos();
-        assert!((s - expected).abs() < 1e-5, "s_trig={}, expected={}", s, expected);
+        assert!(
+            (s - expected).abs() < 1e-5,
+            "s_trig={}, expected={}",
+            s,
+            expected
+        );
     }
 }

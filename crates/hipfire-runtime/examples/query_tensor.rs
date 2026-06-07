@@ -22,8 +22,12 @@ use std::path::Path;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: query_tensor <path.hfq> <tensor_name>");
-    let target = args.next().expect("usage: query_tensor <path.hfq> <tensor_name>");
+    let path = args
+        .next()
+        .expect("usage: query_tensor <path.hfq> <tensor_name>");
+    let target = args
+        .next()
+        .expect("usage: query_tensor <path.hfq> <tensor_name>");
     let hfq = HfqFile::open(Path::new(&path)).expect("open .hfq");
     for t in hfq.tensors() {
         if t.name == target {

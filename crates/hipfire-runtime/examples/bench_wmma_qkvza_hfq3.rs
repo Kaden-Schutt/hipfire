@@ -53,8 +53,12 @@ fn main() {
 
 fn run_bench(
     gpu: &mut Gpu,
-    qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
-    k: usize, n: usize,
+    qkv_m: usize,
+    z_m: usize,
+    beta_m: usize,
+    alpha_m: usize,
+    k: usize,
+    n: usize,
 ) {
     // Allocate inputs. Random fp16 X, deterministic HFQ3 weights.
     let aq = upload_random_hfq3(gpu, qkv_m, k, 0xA1);
@@ -75,10 +79,9 @@ fn run_bench(
     // Warmup x3
     for _ in 0..3 {
         gpu.gemm_qkvza_hfq3g256_wmma(
-            &aq, &az, &ab, &aa, &x,
-            &yq, &yz, &yb, &ya,
-            qkv_m, z_m, beta_m, alpha_m, k, n,
-        ).unwrap();
+            &aq, &az, &ab, &aa, &x, &yq, &yz, &yb, &ya, qkv_m, z_m, beta_m, alpha_m, k, n,
+        )
+        .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
 
@@ -87,10 +90,9 @@ fn run_bench(
     let t0 = Instant::now();
     for _ in 0..runs {
         gpu.gemm_qkvza_hfq3g256_wmma(
-            &aq, &az, &ab, &aa, &x,
-            &yq, &yz, &yb, &ya,
-            qkv_m, z_m, beta_m, alpha_m, k, n,
-        ).unwrap();
+            &aq, &az, &ab, &aa, &x, &yq, &yz, &yb, &ya, qkv_m, z_m, beta_m, alpha_m, k, n,
+        )
+        .unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
     let wmma_us = t0.elapsed().as_micros() as f64 / runs as f64;
@@ -107,44 +109,63 @@ fn run_bench(
 
     // Warmup
     for _ in 0..2 {
-        do_gemv_fallback(gpu, &aq, &az, &ab, &aa, &x, &yqg, &yzg, &ybg, &yag,
-                        qkv_m, z_m, beta_m, alpha_m, k, n);
+        do_gemv_fallback(
+            gpu, &aq, &az, &ab, &aa, &x, &yqg, &yzg, &ybg, &yag, qkv_m, z_m, beta_m, alpha_m, k, n,
+        );
     }
     gpu.hip.device_synchronize().unwrap();
 
     let t0 = Instant::now();
     for _ in 0..runs {
-        do_gemv_fallback(gpu, &aq, &az, &ab, &aa, &x, &yqg, &yzg, &ybg, &yag,
-                        qkv_m, z_m, beta_m, alpha_m, k, n);
+        do_gemv_fallback(
+            gpu, &aq, &az, &ab, &aa, &x, &yqg, &yzg, &ybg, &yag, qkv_m, z_m, beta_m, alpha_m, k, n,
+        );
     }
     gpu.hip.device_synchronize().unwrap();
     let gemv_us = t0.elapsed().as_micros() as f64 / runs as f64;
 
     let total_m = qkv_m + z_m + beta_m + alpha_m;
     let groups_per_row = k / 256;
-    let weight_bytes = total_m * groups_per_row * 104;  // HFQ3 storage
-    let xbytes = n * k * 2;  // fp16 X
-    let ybytes = n * total_m * 4;  // fp32 Y
+    let weight_bytes = total_m * groups_per_row * 104; // HFQ3 storage
+    let xbytes = n * k * 2; // fp16 X
+    let ybytes = n * total_m * 4; // fp32 Y
     let bytes_total = weight_bytes + xbytes + ybytes;
 
     let wmma_gibs = bytes_total as f64 / 1024.0 / 1024.0 / 1024.0 / (wmma_us * 1e-6);
     let gemv_gibs = bytes_total as f64 / 1024.0 / 1024.0 / 1024.0 / (gemv_us * 1e-6);
     let speedup = gemv_us / wmma_us;
 
-    eprintln!("  WMMA new : {:8.1} µs  /call  →  {:6.1} GiB/s effective", wmma_us, wmma_gibs);
-    eprintln!("  GEMV old : {:8.1} µs  /call  →  {:6.1} GiB/s effective", gemv_us, gemv_gibs);
-    eprintln!("  speedup  : {:6.2}×  (WMMA vs per-row GEMV fallback)", speedup);
+    eprintln!(
+        "  WMMA new : {:8.1} µs  /call  →  {:6.1} GiB/s effective",
+        wmma_us, wmma_gibs
+    );
+    eprintln!(
+        "  GEMV old : {:8.1} µs  /call  →  {:6.1} GiB/s effective",
+        gemv_us, gemv_gibs
+    );
+    eprintln!(
+        "  speedup  : {:6.2}×  (WMMA vs per-row GEMV fallback)",
+        speedup
+    );
 }
 
 fn do_gemv_fallback(
     gpu: &mut Gpu,
-    aq: &rdna_compute::GpuTensor, az: &rdna_compute::GpuTensor,
-    ab: &rdna_compute::GpuTensor, aa: &rdna_compute::GpuTensor,
+    aq: &rdna_compute::GpuTensor,
+    az: &rdna_compute::GpuTensor,
+    ab: &rdna_compute::GpuTensor,
+    aa: &rdna_compute::GpuTensor,
     x: &rdna_compute::GpuTensor,
-    yq: &rdna_compute::GpuTensor, yz: &rdna_compute::GpuTensor,
-    yb: &rdna_compute::GpuTensor, ya: &rdna_compute::GpuTensor,
-    qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
-    k: usize, n: usize,
+    yq: &rdna_compute::GpuTensor,
+    yz: &rdna_compute::GpuTensor,
+    yb: &rdna_compute::GpuTensor,
+    ya: &rdna_compute::GpuTensor,
+    qkv_m: usize,
+    z_m: usize,
+    beta_m: usize,
+    alpha_m: usize,
+    k: usize,
+    n: usize,
 ) {
     // Per-row GEMV: each batch row is a separate call. This mirrors
     // what `forward_prefill_batch` falls back to when the eligibility
@@ -167,7 +188,9 @@ fn upload_random_hfq3(gpu: &mut Gpu, m: usize, k: usize, seed: u8) -> rdna_compu
     let bytes_per_row = groups_per_row * 104;
     let mut out = vec![0u8; m * bytes_per_row];
     let mix = |x: u64| {
-        let h = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let h = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((h ^ (h >> 33)).wrapping_mul(0xff51afd7ed558ccd)) ^ (h >> 28)
     };
     let s0 = seed as u64;

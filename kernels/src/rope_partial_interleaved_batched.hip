@@ -10,7 +10,8 @@
 //
 // Grid: [ceil(n_rot/2 / block), batch_size, 1]
 // Each thread handles one (pair, batch) combination: rotates dims (2p, 2p+1)
-// of every Q and K head for batch row b, using angle = positions[b] * freq.
+// of every Q and K head for batch row b, using angle =
+// (positions[b] + pos_offset) * freq.
 //
 // Byte-exact with rope_partial_interleaved_f32 for batch_size=1 + pos=positions[0].
 // Q/K are [batch_size × n_heads × head_dim] row-major.
@@ -25,9 +26,8 @@ extern "C" __global__ void rope_partial_interleaved_batched_f32(
     int n_rot,          // number of dims to rotate (64 for Qwen3.5)
     float freq_base,
     int batch_size,
-    int pos_offset      // added to positions[b] for the RoPE angle (NOT the KV slot);
-                        // carries kv_cache.compact_offset so post-eviction batched
-                        // Q/K rotate at absolute phase matching cached keys. 0 = no-op.
+    int pos_offset      // added to positions[b] for RoPE angle only;
+                        // KV writes still use the raw physical slot.
 ) {
     int pair = blockIdx.x * blockDim.x + threadIdx.x;
     int b = blockIdx.y;

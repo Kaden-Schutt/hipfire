@@ -13,7 +13,6 @@
 //! Loaded lazily via `libloading`; absence of librocblas is a recoverable
 //! runtime error so the engine still builds + runs without it.
 
-use crate::Stream;
 use libloading::{Library, Symbol};
 use std::ffi::{c_int, c_void};
 use std::os::raw::c_uint;
@@ -61,6 +60,7 @@ pub enum RocblasDatatype {
 #[derive(Debug, Clone, Copy)]
 pub enum RocblasGemmAlgo {
     Standard = 160,
+    #[allow(dead_code)]
     SolutionIndex = 161,
 }
 
@@ -71,6 +71,7 @@ pub struct Rocblas {
     _lib: Library,
     handle: RocblasHandle,
 
+    _fn_create_handle: unsafe extern "C" fn(*mut RocblasHandle) -> u32,
     fn_destroy_handle: unsafe extern "C" fn(RocblasHandle) -> u32,
     fn_set_stream: unsafe extern "C" fn(RocblasHandle, *mut c_void) -> u32,
     fn_gemm_ex: unsafe extern "C" fn(
@@ -191,6 +192,7 @@ impl Rocblas {
             Ok(Self {
                 _lib: lib,
                 handle,
+                _fn_create_handle: fn_create_handle,
                 fn_destroy_handle,
                 fn_set_stream,
                 fn_gemm_ex,
@@ -199,8 +201,9 @@ impl Rocblas {
     }
 
     /// Bind this rocBLAS handle to a HIP stream so calls execute on it.
-    pub fn set_stream(&self, stream: &Stream) -> RocblasResult<()> {
-        let st = unsafe { (self.fn_set_stream)(self.handle, stream.as_raw()) };
+    /// Passing null stream (default stream) is also valid.
+    pub fn set_stream(&self, stream_handle: *mut c_void) -> RocblasResult<()> {
+        let st = unsafe { (self.fn_set_stream)(self.handle, stream_handle) };
         if st == ROCBLAS_STATUS_SUCCESS {
             Ok(())
         } else {
@@ -220,12 +223,6 @@ impl Rocblas {
     /// Note: rocBLAS is column-major. Our engine stores matrices row-major,
     /// so callers flip the operation (A_row · B_row == (B_col^T · A_col^T)^T)
     /// and swap (m, n) / (a, b) / (lda, ldb) / transA, transB when dispatching.
-    ///
-    /// # Safety
-    ///
-    /// All matrix pointers and scalar pointers must be valid for the rocBLAS
-    /// call, point to GPU memory where rocBLAS expects it, and describe buffers
-    /// large enough for the dimensions and leading dimensions passed here.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_ex(
         &self,

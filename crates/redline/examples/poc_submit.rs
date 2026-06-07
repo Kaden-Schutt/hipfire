@@ -12,7 +12,11 @@ fn main() {
 
     // Step 1: Open device
     let dev = redline::device::Device::open(None).expect("failed to open GPU");
-    eprintln!("GPU: {} ({:.1} GB VRAM)\n", dev.info.gfx_arch, dev.info.vram_total_bytes as f64 / 1e9);
+    eprintln!(
+        "GPU: {} ({:.1} GB VRAM)\n",
+        dev.info.gfx_arch,
+        dev.info.vram_total_bytes as f64 / 1e9
+    );
 
     // Step 2: Create compute queue
     let queue = redline::queue::ComputeQueue::new(&dev).expect("failed to create compute queue");
@@ -20,8 +24,8 @@ fn main() {
     // Step 3: Build a trivial PM4 buffer — just a NOP packet
     // PKT3_NOP (opcode 0x10): the GPU reads and discards it
     let nop_packet: [u32; 2] = [
-        (3 << 30) | (0x10 << 8) | 0,  // PKT3 header: NOP, 1 dword body
-        0xDEADBEEF,                     // body (ignored)
+        (3 << 30) | (0x10 << 8) | 0, // PKT3 header: NOP, 1 dword body
+        0xDEADBEEF,                  // body (ignored)
     ];
 
     // Upload PM4 buffer to VRAM

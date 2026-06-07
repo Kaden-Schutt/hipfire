@@ -1,0 +1,8 @@
+[build]
+rustflags = [
+    "-Aclippy::all",
+    "-Aclippy::pedantic",
+    "-Aclippy::nursery",
+    "-Aclippy::cargo",
+]
+

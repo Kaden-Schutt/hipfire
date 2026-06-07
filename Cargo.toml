@@ -9,6 +9,8 @@ members = [
     "crates/hipfire-arch-qwen35-vl",
     "crates/hipfire-arch-llama",
     "crates/hipfire-arch-deepseek4",
+    "crates/hipfire-arch-minimax",
+    "crates/hipfire-arch-lfm2moe",
     "crates/hipfire-arch-toy",
     "crates/hipfire-arch-qwen2",
     "crates/hipfire-arch-dots-ocr",
@@ -21,4 +23,4 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-license = "MIT"
+license = "MIT OR Apache-2.0"
