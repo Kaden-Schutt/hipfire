@@ -44,7 +44,14 @@ def rope(x, half_split=True):  # x [npos, heads, hd]
         r1, r2 = x1*cos - x2*sin, x2*cos + x1*sin
         out = np.empty_like(x); out[..., 0::2] = r1; out[..., 1::2] = r2; return out
 
-def layer0(qk_norm=True, v_norm=True, do_rope=True, half=True, scale=1.0, embed_scale=True):
+def q8_0(x):  # quantize last-dim in 32-elem blocks (Q8_0): int8 * (max|x|/127)
+    d = x.shape[-1]; o = x.copy().reshape(*x.shape[:-1], d//32, 32)
+    sc = np.abs(o).max(-1, keepdims=True) / 127.0
+    sc = np.where(sc == 0, 1.0, sc)
+    o = np.round(o / sc) * sc
+    return o.reshape(x.shape)
+
+def layer0(qk_norm=True, v_norm=True, do_rope=True, half=True, scale=1.0, embed_scale=True, q8_kv=False):
     emb = w("embed_tokens.weight")[toks]
     if embed_scale: emb = emb * np.sqrt(H)
     L = "layers.0."
@@ -58,6 +65,8 @@ def layer0(qk_norm=True, v_norm=True, do_rope=True, half=True, scale=1.0, embed_
     if v_norm: v = rms(v)
     if do_rope:
         q = rope(q, half); k = rope(k, half)
+    if q8_kv:
+        k = q8_0(k); v = q8_0(v)
     g = nh//nkv
     kk = np.repeat(k, g, axis=1); vv = np.repeat(v, g, axis=1)  # [npos, nh, hd]
     out = np.zeros((nctx, nh, hd))
@@ -88,6 +97,8 @@ variants = {
     "no rope": dict(do_rope=False),
     "scale=1/sqrt(hd)": dict(scale=1.0/np.sqrt(hd)),
     "no embed_scale": dict(embed_scale=False),
+    "Q8 KV": dict(q8_kv=True),
+    "Q8 KV + no qk_norm": dict(q8_kv=True, qk_norm=False),
 }
 print(f"{'variant':32} {'cos_vs_HF':>10} {'cos_vs_hipfire':>14}")
 for name, kw in variants.items():
