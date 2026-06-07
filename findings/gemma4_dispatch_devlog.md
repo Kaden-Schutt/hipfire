@@ -1221,3 +1221,49 @@ separate bug from the attention divergence.
    tile kernel processes both positions.
 
 6. **Fix the tokenizer** to unblock end-to-end CLI validation.
+
+---
+
+## 2026-06-07 · Session 15 — hd512 reduce fix lands; stop-token fix; coherence confirmed
+
+### hd512 attention reduce (root cause of L5+ garbage) — FIXED + COMMITTED
+`attention_flash_asym3_hd512` launched only the tile kernel (writes unnormalized
+per-tile partials) and **never the `attention_flash_q8_0_reduce`** that divides by
+the softmax sum and writes `out`. So `attn_out` was never populated on full
+(global, hd=512) layers — it read stale data from the prior sliding layer. Mirrored
+the hd256 two-kernel pattern (scoped the tile launch so its `&self.functions` borrow
+ends, then ensure+launch the reduce; reduce handles hd512 via `n_halves=512/128=4`).
+Commit `2e36fee2`.
+
+### Session 14's "deeper divergence" was a 4th harness artifact
+The standalone `debug_gemma4_attention` example claimed post-fix the model still
+collapses (pos0≈pos1 logits, cosine-to-HF 0.064). **Falsified by the real daemon
+path:** a 4-prompt battery on 12B-q8 returns correct, *distinct*, input-dependent
+answers (`Tokyo`/`42`/banana/French). Session 14's own data shows hipfire pos=0
+matching HF but pos=1 not updating → a position-advance bug **in the harness**, not
+the model. Trust the daemon generate path; the standalone harness gives false
+negatives (same class as the earlier double-scale / sum-metric / BOS oracle bugs).
+
+### Stop-token fix (decode looped `<turn|>` forever) — FIXED + VERIFIED
+`config.eos_token` is `eos_token_id` parsed as a scalar (→1), but gemma4's HF config
+sets it to a LIST `[1, 106]`; `<turn|>`=106 (end-of-turn) is the real conversational
+stop and was dropped. `generate_gemma4` now builds a `stop_set` = {`<eos>`,
+`<turn|>` via `special_token_id` + documented 106}. Result:
+```
+"capital of France?" → "...The capital of France is Paris."   (stops, 12 tok)
+"capital of Japan?"  → "...Tokyo"                              (stops, 6 tok)
+```
+(Was looping `<turn|><turn|>…` to max_tokens.)
+
+### Remaining (priority order)
+1. **Chat-template framing** — output still prefixes an empty `<|channel>thought\n
+   <channel|>` because the prompt is raw (no turn scaffolding). Frame as
+   `<bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>`
+   (ids 105/106 + channel ids) so the model emits a clean answer. (In progress.)
+2. **CLI tokenizer bug** — `hipfire run`/`serve` mis-load the 262K BPE as GPT-2 BPE
+   (`missing byte symbol 0x90`); daemon JSONL path tokenizes fine.
+3. **Prefill/batched full layers** — `attention_flash_asym3_batched_window` routes
+   hd512→hd256; the hd512-batched kernel is unwired and would need its own reduce.
+4. Backlog: MoE stubbed (26B-A4B can't run), sliding-window ring buffer no-op
+   (`cache_capacity` dead), dead code (`forward_prefill_batch_v1`, unreachable
+   graph-capture branch), no unit tests, missing copyright header on `gemma4.rs`.

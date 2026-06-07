@@ -846,6 +846,9 @@ Phase 0 contracts as follows:
 | SPM-BPE encoder prepended `▁` | 1g | ✅ Resolved (`5ffd0314`) | Removed erroneous prepend. |
 | hd512 attention missing reduce kernel | 1d | ✅ Resolved (`2e36fee2`) | Added reduce kernel launch after tile. |
 | HF reference double-scaled | debug | ✅ Resolved | `embed_tokens` already scales; oracle corrected. |
+| Decode looped `<turn|>` forever (no stop) | 1e | ✅ Resolved | `eos_token_id` is `[1,106]` parsed as scalar 1; `generate_gemma4` now stops on a set incl. `<turn|>`=106. 12B-q8 stops cleanly. |
+| "deeper divergence remains" (Session 14) | debug | ✅ Not a bug | Standalone `debug_gemma4_attention` harness has a position-advance bug; daemon battery returns correct distinct answers (Tokyo/42/banana/FR). 4th measurement artifact. |
+| Chat-template framing (empty `<\|channel>thought`) | 1e | Open (in progress) | Raw prompt → model improvises turn/channel structure. Frame `<\|turn>user…<turn\|><\|turn>model\n<\|channel>thought\n<channel\|>`. |
 | `gelu_tanh` vs SiLU activation mismatch | 4a | Open | Forked `run_moe_decode_gemma4` executor. |
 | hd512 kernels not precompiled for all archs | 1b/5b | Open (gfx1151 works) | Compile + validate per-arch. |
 | `rope_partial_halved` not in dispatch framework | 2a | Open | Direct GPU call in Phase 1. |

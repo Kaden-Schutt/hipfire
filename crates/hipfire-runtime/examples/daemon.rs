@@ -11503,6 +11503,22 @@ fn generate_gemma4(
     }
 
     let eos_tok = m.gemma4_eos_tok;
+    // Stop-token set. `config.eos_token` comes from `eos_token_id` parsed as a
+    // scalar, but gemma4's HF config sets it to a LIST `[1, 106]`: `<turn|>`
+    // (106, end-of-turn) is the real conversational stop and was being dropped,
+    // so decode looped `<turn|>` forever. Include `<eos>` plus the end-of-turn
+    // token (looked up by content, with the documented gemma4 id 106 as fallback).
+    let stop_set: Vec<u32> = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        let mut s = vec![eos_tok];
+        for name in ["<turn|>", "<end_of_turn>"] {
+            if let Some(tid) = tk.special_token_id(name) {
+                if !s.contains(&tid) { s.push(tid); }
+            }
+        }
+        if !s.contains(&106) { s.push(106); } // gemma4 <turn|> end-of-turn
+        s
+    };
     let t0 = Instant::now();
 
     // ── Prefill: forward_scratch per prompt token ──
@@ -11553,7 +11569,7 @@ fn generate_gemma4(
             deepseek4::sampling::sample_token(&logits, temp, 0, top_p, &mut rng)
         };
 
-        if next_tok == eos_tok {
+        if stop_set.contains(&next_tok) {
             break;
         }
 
