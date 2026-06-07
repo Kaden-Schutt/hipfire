@@ -25,6 +25,7 @@ fn main() {
     let mut model: Option<PathBuf> = None;
     let mut prompt = "The capital of France is".to_string();
     let mut max: usize = 64;
+    let mut rep_penalty: f32 = 1.3;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -38,6 +39,10 @@ fn main() {
             }
             "--max" => {
                 max = argv[i + 1].parse().expect("--max");
+                i += 2;
+            }
+            "--rep-penalty" => {
+                rep_penalty = argv[i + 1].parse().expect("--rep-penalty");
                 i += 2;
             }
             other => {
@@ -107,11 +112,23 @@ fn main() {
         t0.elapsed().as_secs_f64()
     );
 
-    // Greedy decode. Cohere EOS = 255001 (<|END_OF_TURN_TOKEN|>); bos=2, pad=0.
+    // Greedy decode with a repetition penalty (greedy alone loops on small code
+    // models). Penalize logits of already-seen tokens (prompt + generated) once
+    // each: divide if positive, multiply if negative (CTRL/HF convention).
+    // Cohere EOS = 255001 (<|END_OF_TURN_TOKEN|>); bos=2, pad=0.
     let mut gen = Vec::new();
     let mut pos = prompt_ids.len();
     let t1 = std::time::Instant::now();
     for _ in 0..max {
+        if rep_penalty != 1.0 {
+            let mut seen: std::collections::HashSet<u32> =
+                prompt_ids.iter().copied().collect();
+            seen.extend(gen.iter().copied());
+            for &t in &seen {
+                let v = &mut logits[t as usize];
+                *v = if *v > 0.0 { *v / rep_penalty } else { *v * rep_penalty };
+            }
+        }
         let next = argmax(&logits);
         gen.push(next);
         if matches!(next, 255001 | 0) {
