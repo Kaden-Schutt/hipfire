@@ -170,22 +170,24 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
-    // HFQ4G256 MMQ set (q8_1 activation-quant + integer tile matmul; uses the
-    // i8-WMMA intrinsic). EMPIRICALLY VERIFIED correct on the full WMMA fleet
-    // (#397 Ship 5, 2026-06-06):
-    //   - gfx1100/RDNA3 (k9lin):   NRMSE 0.024% vs WMMA, ~2.1x FASTER at prefill.
-    //   - gfx1151/RDNA3.5 (hipx):  correct (i8-WMMA gated to __gfx1151__).
-    //   - gfx1201/RDNA4 (hiptrx):  correct via the NEW gemm_hfq4g256_residual_mmq.gfx12.hip
-    //     (i8-WMMA gfx12 intrinsic), loaded under a distinct module name to dodge the
-    //     cache collision; NRMSE 0.18-0.24% vs CPU oracle, ~2.5x faster than fp16_wave64.
-    // Predicate = HasWmma (has_wmma() = RDNA3 + RDNA3.5 + RDNA4) — exactly the WMMA-
-    // capable arches where this i8-WMMA kernel has a real body. NOT HasMmq: gfx906
-    // has no WMMA (it uses a separate dp4a MMQ kernel), so it must not select this one.
-    // (Still dormant until 5.2 wires GemmFamily; the live should_use_mmq path is
-    // independent. 5.2 follow-up: MMQ is 2-2.5x WMMA at prefill — promote candidate.)
+    // HFQ4G256 MMQ set (q8_1 activation-quant + integer tile matmul; i8-WMMA).
+    // Kernel correct on ALL WMMA arches, but PER-ARCH PERF differs (#397 Ship 5,
+    // 2026-06-06, fleet-measured):
+    //   - gfx1100/RDNA3 (k9lin):   correct (NRMSE 0.024%) AND ~2.1x FASTER than WMMA.
+    //   - gfx1151/RDNA3.5 (hipx):  correct; mixed (WMMA wins small tiles, MMQ wins large).
+    //   - gfx1201/RDNA4 (hiptrx):  correct (NRMSE 0.18-0.24%) BUT a measured PREFILL
+    //     REGRESSION vs the live gemm_hfq4g256_residual_wmma_gfx12 (K2-unroll):
+    //     -11% (0.8B) / -34.5% (27B) e2e, AND it tips a marginal 0.8B+code prompt into
+    //     a 4-gram attractor that WMMA does not. (The earlier "2.5x" was vs fp16_wave64,
+    //     the WRONG baseline — vs the real gfx12 WMMA kernel MMQ LOSES.)
+    // => Predicate = HasWmmaW32 (RDNA3 + RDNA3.5): the arches where MMQ can WIN. RDNA4
+    // stays on WMMA — MMQ is correct there but never worth selecting. NOT HasMmq (gfx906
+    // has no WMMA; uses a separate dp4a MMQ kernel). The gfx12 MMQ kernel is kept in-tree
+    // (validated, dormant) but excluded here. Do NOT enable has_mmq()+rdna4 / promote MMQ
+    // on RDNA4 (measured loss; feat/rdna4-mmq-live left unmerged).
     registry.register(KernelVariant {
         key: KernelKey::GemmHfq4G256MmqSet,
-        arch_required: ArchPredicate::HasWmma,
+        arch_required: ArchPredicate::HasWmmaW32,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
