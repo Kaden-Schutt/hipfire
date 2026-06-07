@@ -169,15 +169,16 @@ fn dot2_f32_f16_coverage() {
 }
 
 #[test]
-fn mmq_is_gcn5_or_rdna3() {
+fn mmq_is_gcn5_or_rdna3_or_rdna4() {
     assert!(make_caps("gfx906").has_mmq());
     for &arch in &["gfx1100", "gfx1101", "gfx1102", "gfx1103",
-                    "gfx1150", "gfx1151", "gfx1152"] {
+                    "gfx1150", "gfx1151", "gfx1152",
+                    // RDNA4 (gfx12): live HFQ4G256 MMQ enabled.
+                    "gfx1200", "gfx1201"] {
         assert!(make_caps(arch).has_mmq(), "{arch} should have MMQ");
     }
     assert!(!make_caps("gfx1030").has_mmq());
     assert!(!make_caps("gfx1010").has_mmq());
-    assert!(!make_caps("gfx1200").has_mmq());
     assert!(!make_caps("gfx940").has_mmq());
 }
 

@@ -125,7 +125,15 @@ impl ArchCaps {
         let has_wmma_w32 = is_rdna3;
         let has_wmma_w32_gfx12 = is_rdna4;
         let has_dot2_f32_f16 = is_rdna1p1 || is_rdna2 || is_rdna3 || is_rdna4;
-        let has_mmq = is_gfx906 || is_rdna3;
+        // RDNA4 (gfx12) added: the gfx12 HFQ4G256 MMQ kernel
+        // (gemm_hfq4g256_residual_mmq.gfx12.hip) is validated correct + ~2.5×
+        // fp16 in microbench, but stayed dormant because has_mmq gated only
+        // gfx906||rdna3 — so should_use_mmq()/HIPFIRE_MMQ=1 could never route
+        // the live HFQ4G256 prefill through gemm_hfq4g256_residual_mmq on gfx12
+        // (it fell through to the single-warp WMMA fallback). Including rdna4
+        // here flips the default cutover (B≥128 via should_use_mmq) and lets
+        // HIPFIRE_MMQ=1 force it.
+        let has_mmq = is_gfx906 || is_rdna3 || is_rdna4;
         let is_gcn5_wave64 = is_gfx906 || (is_gfx908 && flags.gcn5_wave64_hybrid.unwrap_or(false));
         let is_wave32 = is_rdna1 || is_rdna1p1 || is_rdna2 || is_rdna3 || is_rdna4;
         let is_wave64_native = is_gfx906 || is_gfx908 || is_cdna3;
@@ -527,8 +535,10 @@ mod tests {
         assert!(make_caps("gfx906").has_mmq());
         assert!(make_caps("gfx1100").has_mmq());
         assert!(make_caps("gfx1150").has_mmq());
+        // RDNA4 (gfx12) now has live MMQ for HFQ4G256.
+        assert!(make_caps("gfx1200").has_mmq());
+        assert!(make_caps("gfx1201").has_mmq());
         assert!(!make_caps("gfx1030").has_mmq());
-        assert!(!make_caps("gfx1200").has_mmq());
     }
 
     #[test]
