@@ -11488,13 +11488,36 @@ fn generate_gemma4(
         return;
     }
 
-    // ── Prompt build (raw — no chat scaffolding for bring-up) ──
+    // ── Prompt build ──
+    // Apply the gemma4 chat-template framing (matches templates/gemma-4-it.jinja
+    // generation prompt) when the four turn/channel special tokens are present in
+    // the tokenizer; otherwise fall back to raw tokenization (cannot regress).
+    // Framing:
+    //   <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>
+    // (optional `<|turn>system\n{system}<turn|>\n` before the user turn). The empty
+    // thought channel is pre-filled so the model emits the answer directly instead
+    // of improvising the `<|channel>thought…<channel|>` scaffold itself. `encode()`
+    // segments on the special tokens; BOS (2) is prepended manually (SPM-BPE doesn't).
     let tokenizer = m.tokenizer.as_ref().unwrap();
+    let framed_ok = ["<|turn>", "<turn|>", "<|channel>", "<channel|>"]
+        .iter()
+        .all(|t| tokenizer.special_token_id(t).is_some());
     let prompt_ids: Vec<u32> = {
-        // Raw tokenization. BOS (2) prepended manually — Gemma4 SPM-BPE
-        // doesn't auto-prepend. Chat template framing (Jinja) pending.
         let mut ids = vec![2u32]; // BOS
-        ids.extend(tokenizer.encode(prompt));
+        if framed_ok {
+            let mut s = String::new();
+            if let Some(sys) = system_prompt {
+                if !sys.is_empty() {
+                    s.push_str(&format!("<|turn>system\n{sys}<turn|>\n"));
+                }
+            }
+            s.push_str(&format!(
+                "<|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+            ));
+            ids.extend(tokenizer.encode(&s));
+        } else {
+            ids.extend(tokenizer.encode(prompt));
+        }
         ids
     };
     if prompt_ids.is_empty() {
