@@ -231,6 +231,22 @@ pub enum KernelKey {
     GemmHfq4G256Wmma,
     GemmF16XF16Wmma,
     GemmF32RegisterTiled,
+    // GEMM — plain-family catalog (#397 Ship 5.1). These all take the
+    // canonical plain-GEMM signature `(a, x, y, m, k, batch_size)` and are
+    // dispatchable through GemmFamily::run. Methods whose signatures carry
+    // extra params (bias / prequantized x ptr) or that belong to the fused /
+    // residual / moe / lmhead families are NOT here — they are owned by their
+    // own families (FusedQkv*, Moe*, etc.). See gemm_table.rs.
+    GemmF16,
+    GemmF16Tiled,
+    GemmF16WmmaMb4,
+    GemmF16WmmaMb8,
+    GemmF32Batched,
+    GemmQ8_0WmmaX64,
+    GemmQ8_0ResidualWmma,
+    GemmQ8_0ResidualWmmaGfx12,
+    GemmHfq4G256Dp4a,
+    GemmHfq4G256MmqSet,
     // Fused QKV
     FusedQkvHfq4G256,
     FusedQkvMq3G256Lloyd,

@@ -118,6 +118,19 @@ impl GemmFamily {
             K::GemmHfq4G256Wmma => hip!(gpu.gemm_hfq4g256_wmma(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq4G256 => hip!(gpu.gemm_hfq4g256(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq4G128 => hip!(gpu.gemm_hfq4g128(w.buf, x, y, m, k, batch_size)),
+            // #397 Ship 5.1: plain-GEMM catalog. Each arm maps the registered
+            // KernelKey to the exact rdna-compute method with the canonical
+            // `(a, x, y, m, k, batch_size)` signature.
+            K::GemmF16 => hip!(gpu.gemm_f16(w.buf, x, y, m, k, batch_size)),
+            K::GemmF16Tiled => hip!(gpu.gemm_f16_tiled(w.buf, x, y, m, k, batch_size)),
+            K::GemmF16WmmaMb4 => hip!(gpu.gemm_f16_wmma_mb4(w.buf, x, y, m, k, batch_size)),
+            K::GemmF16WmmaMb8 => hip!(gpu.gemm_f16_wmma_mb8(w.buf, x, y, m, k, batch_size)),
+            K::GemmF32Batched => hip!(gpu.gemm_f32_batched(w.buf, x, y, m, k, batch_size)),
+            K::GemmQ8_0WmmaX64 => hip!(gpu.gemm_q8_0_wmma_x64(w.buf, x, y, m, k, batch_size)),
+            K::GemmQ8_0ResidualWmma => hip!(gpu.gemm_q8_0_residual_wmma(w.buf, x, y, m, k, batch_size)),
+            K::GemmQ8_0ResidualWmmaGfx12 => hip!(gpu.gemm_q8_0_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size)),
+            K::GemmHfq4G256Dp4a => hip!(gpu.gemm_hfq4g256_dp4a(w.buf, x, y, m, k, batch_size)),
+            K::GemmHfq4G256MmqSet => hip!(gpu.gemm_hfq4g256_mmq_set(w.buf, x, y, m, k, batch_size)),
             other => Err(DispatchError::MissingImpl { key: other }),
         }
     }
