@@ -6210,7 +6210,13 @@ fn main() {
                 });
             } else {
                 // ── K-map override ──────────────────────────────────────────────
-                let kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
+                let mut kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
+                // Gemma4 (arch 13): attention projections are score-precision-
+                // sensitive (MQ4 corrupts QK scores / breaks coherence), so keep
+                // self_attn.{q,k,v,o}_proj at Q8 even when --format is mq4.
+                if arch_id == 13 && name.contains("self_attn.") && name.ends_with("_proj.weight") {
+                    kmap_level = QuantLevel::Q8;
+                }
 
                 // AWQ sidecar scales for this tensor — populated only inside the
                 // MQ4G256 arm when --awq is enabled and an imatrix entry exists
