@@ -119,18 +119,23 @@ fn decode_step_body(
         weight_gemv(gpu, &layer.wv, &state.tmp, &state.fa_v)
             .map_err(|e| format!("cohere2moe L{l}: v_proj: {e}"))?;
 
-        // Interleaved RoPE over the FULL head_dim (rotary_dim = head_dim).
-        gpu.rope_partial_interleaved_f32(
-            &state.fa_q,
-            &state.fa_k,
-            &state.pos_buf,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            cfg.head_dim, // full-dim rotation
-            cfg.rope_theta,
-        )
-        .map_err(|e| format!("cohere2moe L{l}: rope: {e:?}"))?;
+        // RoPE is per-layer gated: Cohere2Moe is NoPE on full-attention (global)
+        // layers and RoPE on sliding-window (local) layers; prefix dense layers
+        // force RoPE (see `Cohere2MoeConfig::apply_rope`). Interleaved over the
+        // FULL head_dim (rotary_dim = head_dim) when applied.
+        if cfg.apply_rope(l) {
+            gpu.rope_partial_interleaved_f32(
+                &state.fa_q,
+                &state.fa_k,
+                &state.pos_buf,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                cfg.head_dim, // full-dim rotation
+                cfg.rope_theta,
+            )
+            .map_err(|e| format!("cohere2moe L{l}: rope: {e:?}"))?;
+        }
 
         gpu.kv_cache_write_q8_0(
             &state.kv.k_gpu[l],

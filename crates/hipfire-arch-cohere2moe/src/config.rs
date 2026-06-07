@@ -57,6 +57,10 @@ pub struct Cohere2MoeConfig {
     pub rms_norm_eps: f32,
     pub max_position_embeddings: usize,
     pub sliding_window: usize,
+    /// When 1, the prefix dense layers force RoPE even though they are
+    /// full-attention (HF `prefix_dense_sliding_window_pattern`; drives
+    /// `force_rope`). See `apply_rope`.
+    pub prefix_dense_sliding_window_pattern: usize,
     /// Renormalize the top-k gathered router weights to sum 1 (HF
     /// `norm_topk_prob`). Cohere2Moe = false.
     pub norm_topk_prob: bool,
@@ -99,6 +103,8 @@ struct RawCohere2MoeConfig {
     max_position_embeddings: usize,
     #[serde(default = "default_sliding_window")]
     sliding_window: usize,
+    #[serde(default = "default_one")]
+    prefix_dense_sliding_window_pattern: usize,
     #[serde(default)]
     norm_topk_prob: bool,
     #[serde(default = "default_selection")]
@@ -130,6 +136,9 @@ fn default_max_pos() -> usize {
 }
 fn default_sliding_window() -> usize {
     4096
+}
+fn default_one() -> usize {
+    1
 }
 fn default_selection() -> String {
     "sigmoid".to_string()
@@ -198,6 +207,7 @@ impl Cohere2MoeConfig {
             rms_norm_eps: raw.rms_norm_eps,
             max_position_embeddings: raw.max_position_embeddings,
             sliding_window: raw.sliding_window,
+            prefix_dense_sliding_window_pattern: raw.prefix_dense_sliding_window_pattern,
             norm_topk_prob: raw.norm_topk_prob,
             expert_selection_fn: raw.expert_selection_fn,
             logit_scale: raw.logit_scale,
@@ -222,5 +232,19 @@ impl Cohere2MoeConfig {
     }
     pub fn attn_kind(&self, layer: usize) -> AttnKind {
         self.layer_types[layer]
+    }
+
+    /// Whether RoPE is applied at `layer`. Cohere2Moe is **NoPE on
+    /// full-attention (global) layers** and RoPE on sliding-window (local)
+    /// layers — except the prefix dense layers force RoPE when
+    /// `prefix_dense_sliding_window_pattern == 1`. Mirrors the reference gate
+    /// `if self.sliding_window is not None or self.force_rope`.
+    pub fn apply_rope(&self, layer: usize) -> bool {
+        match self.attn_kind(layer) {
+            AttnKind::Sliding => true,
+            AttnKind::Full => {
+                self.is_dense_ffn(layer) && self.prefix_dense_sliding_window_pattern == 1
+            }
+        }
     }
 }
