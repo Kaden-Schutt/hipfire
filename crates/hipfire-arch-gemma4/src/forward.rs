@@ -278,8 +278,7 @@ fn sliding_layer_decode(
     let dim_bytes = dim * 4;
 
     // residual = x
-    gpu.hip
-        .memcpy_dtod(&state.residual.buf, &state.x.buf, dim_bytes)
+    gpu.memcpy_dtod_auto(&state.residual.buf, &state.x.buf, dim_bytes)
         .map_err(|e| format!("gemma4 sliding: save residual: {e:?}"))?;
 
     // n1 = input_layernorm(x) → tmp.
@@ -361,8 +360,7 @@ fn full_layer_decode(
     let kv_bytes = n_kv * head_dim * 4;
 
     // residual = x
-    gpu.hip
-        .memcpy_dtod(&state.residual.buf, &state.x.buf, dim_bytes)
+    gpu.memcpy_dtod_auto(&state.residual.buf, &state.x.buf, dim_bytes)
         .map_err(|e| format!("gemma4 full: save residual: {e:?}"))?;
 
     // n1 = input_layernorm(x) → tmp.
@@ -386,8 +384,7 @@ fn full_layer_decode(
         }
         None => {
             // CRITICAL ordering: capture V from the PRE-k_norm K output.
-            gpu.hip
-                .memcpy_dtod(&state.v.buf, &state.k.buf, kv_bytes)
+            gpu.memcpy_dtod_auto(&state.v.buf, &state.k.buf, kv_bytes)
                 .map_err(|e| format!("gemma4 full: k→v copy: {e:?}"))?;
         }
     }
@@ -563,15 +560,13 @@ fn finish_attn_and_ffn(
         .map_err(|e| format!("gemma4: post_attn rmsnorm: {e:?}"))?;
 
     // x = residual + tmp.
-    gpu.hip
-        .memcpy_dtod(&state.x.buf, &state.residual.buf, dim_bytes)
+    gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
         .map_err(|e| format!("gemma4: reset x: {e:?}"))?;
     gpu.add_inplace_f32(&state.x, &state.tmp)
         .map_err(|e| format!("gemma4: attn residual add: {e:?}"))?;
 
     // residual = x (FFN residual stream).
-    gpu.hip
-        .memcpy_dtod(&state.residual.buf, &state.x.buf, dim_bytes)
+    gpu.memcpy_dtod_auto(&state.residual.buf, &state.x.buf, dim_bytes)
         .map_err(|e| format!("gemma4: save ffn residual: {e:?}"))?;
 
     // Pre-FFN norm → tmp.
@@ -596,8 +591,7 @@ fn finish_attn_and_ffn(
         .map_err(|e| format!("gemma4: post_ffn rmsnorm: {e:?}"))?;
 
     // x = residual + tmp.
-    gpu.hip
-        .memcpy_dtod(&state.x.buf, &state.residual.buf, dim_bytes)
+    gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
         .map_err(|e| format!("gemma4: reset x (ffn): {e:?}"))?;
     gpu.add_inplace_f32(&state.x, &state.tmp)
         .map_err(|e| format!("gemma4: ffn residual add: {e:?}"))?;
