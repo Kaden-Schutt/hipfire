@@ -161,7 +161,15 @@ impl CohereWeights {
             .upload_raw(&embed_bytes, &[embed_bytes.len()])
             .map_err(|e| format!("cohere2moe: upload embed: {e:?}"))?;
         let final_norm = load_norm(hfq, gpu, "model.norm.weight", &[hidden])?;
-        let lm_head = load_wt(hfq, gpu, "lm_head.weight", cfg.vocab_size, hidden)?;
+        // lm_head is tied to embed_tokens in Cohere2Moe. Real checkpoints store
+        // ONLY embed_tokens (no separate lm_head.weight); fall back to loading the
+        // embed matrix as a Q8 GEMV weight. (The tiny oracle saves a distinct
+        // lm_head clone, so the direct name is tried first.)
+        let lm_head = if hfq.tensor_data_vec("lm_head.weight").is_some() {
+            load_wt(hfq, gpu, "lm_head.weight", cfg.vocab_size, hidden)?
+        } else {
+            load_wt(hfq, gpu, "model.embed_tokens.weight", cfg.vocab_size, hidden)?
+        };
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
