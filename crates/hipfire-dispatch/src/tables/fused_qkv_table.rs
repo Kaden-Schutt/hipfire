@@ -67,6 +67,25 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedGateUpMq4G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedGateUpHfq6G256,     ArchPredicate::HasDp4a),
         (KernelKey::FusedGateUpQ4K,          ArchPredicate::Always),
+        // HFQ3G256 fused gate+up (#397 Ship 5.2 slice 2). The qwen35 prefill
+        // site routes this dtype to `gpu.gemm_gate_up_hfq3g256_wmma` on
+        // has_wmma() archs and to the base `gpu.gemm_gate_up_hfq3g256` otherwise
+        // — and the base method itself carries a full cross-arch internal ladder
+        // (MMQ → dp4a → dot2 → fp16 → scalar gfx1010 fallback). So the *dtype*
+        // runs on every arch (the run-arm picks WMMA vs base by arch, mirroring
+        // the call site). `Always` matches that true cross-arch availability —
+        // NOT HasWmma: unlike the GEMV-side MQ3 key (which has no scalar GEMM
+        // fallback), the gate_up prefill kernel has a non-WMMA body.
+        (KernelKey::FusedGateUpHfq3G256,     ArchPredicate::Always),
+        // HFP4G32 fused gate+up (#397 Ship 5.2 slice 2). FLAGGED: differs from the
+        // sibling FusedGateUpHfq4G256 (`Always`) row. `gpu.gemm_gate_up_hfp4g32`
+        // dispatches ONLY to WMMA kernels — `gemm_gate_up_hfp4g32_wmma_gfx12` on
+        // has_wmma_w32_gfx12() (RDNA4) else `gemm_gate_up_hfp4g32_wmma` (gfx11
+        // RDNA3) — with NO scalar/dp4a fallback body. So the real arch support is
+        // WMMA-only (RDNA3 + RDNA4). HasWmma (= has_wmma(), which includes gfx12)
+        // is the correct gate; the gfx12 sibling is reached inside the method, so
+        // HasWmmaW32 (gfx12-excluding) would be wrong.
+        (KernelKey::FusedGateUpHfp4G32,      ArchPredicate::HasWmma),
         // Paro4G128T fused: generic wave32 kernels, no ISA-specific intrinsics.
         // Previously gated on HasDp4a (has_dot2_f32_f16) which excluded gfx906/gfx1010.
         (KernelKey::FusedGateUpParo4G128T,   ArchPredicate::Always),

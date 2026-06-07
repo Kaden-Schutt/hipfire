@@ -153,9 +153,10 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         // 4-way Fused QKVZA (DeltaNet linear attention, incl. Paro 4G128T)
         FusedQkvzaHfq4G256 | FusedQkvzaMq3G256Lloyd | FusedQkvzaMq4G256Lloyd
         | FusedQkvzaHfq6G256 | FusedQkvzaParo4G128T => Some(FusedQkvVariant::Qkvza),
-        // 2-way Fused Gate+Up (FFN, incl. Q8_0 and Paro 4G128T)
+        // 2-way Fused Gate+Up (FFN, incl. Q8_0, HFQ3, HFP4 and Paro 4G128T)
         FusedGateUpHfq4G256 | FusedGateUpMq3G256Lloyd | FusedGateUpMq4G256Lloyd
         | FusedGateUpHfq6G256 | FusedGateUpQ4K | FusedGateUpQ8_0
+        | FusedGateUpHfq3G256 | FusedGateUpHfp4G32
         | FusedGateUpParo4G128T => Some(FusedQkvVariant::GateUp),
         _ => None,
     }
@@ -264,6 +265,8 @@ pub enum KernelKey {
     FusedGateUpMq4G256Lloyd,
     FusedGateUpHfq6G256,
     FusedGateUpQ4K,
+    FusedGateUpHfq3G256,
+    FusedGateUpHfp4G32,
     // Fused Paro (4G128T)
     FusedGateUpParo4G128T,
     FusedQkvzaParo4G128T,

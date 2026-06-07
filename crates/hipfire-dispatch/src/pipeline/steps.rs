@@ -519,6 +519,7 @@ fn launch_fused(
                 m: &[wq.m, wk.m, wv.m],
                 k: wq.k,
                 rot_scratch: &[],
+                batch_size: None,
             })
         }
         KernelKey::FusedGateUpMq4G256Lloyd
@@ -537,6 +538,7 @@ fn launch_fused(
                 m: &[wg.m, wu.m],
                 k: wg.k,
                 rot_scratch: &[],
+                batch_size: None,
             })
         }
         // ── QKVZA 4-way (DeltaNet) ──
@@ -556,6 +558,7 @@ fn launch_fused(
                 m: &[wqkv.m, wz.m, wb.m, wa.m],
                 k: wqkv.k,
                 rot_scratch: &[],
+                batch_size: None,
             })
         }
 
@@ -603,6 +606,7 @@ fn launch_fused(
                 m: &[wg.m, wu.m],
                 k,
                 rot_scratch: &rot_aliases,
+                batch_size: None,
             })
         }
         KernelKey::FusedQkvzaParo4G128T => {
@@ -631,6 +635,7 @@ fn launch_fused(
                 m: &[wqkv.m, wz.m, wb.m, wa.m],
                 k,
                 rot_scratch: &rot_aliases,
+                batch_size: None,
             })
         }
         KernelKey::FusedQkvParo4G128T => {
@@ -658,6 +663,7 @@ fn launch_fused(
                 m: &[wq.m, wk.m, wv.m],
                 k: kk,
                 rot_scratch: &rot_aliases,
+                batch_size: None,
             })
         }
         _ => Err(DispatchError::MissingImpl { key }),

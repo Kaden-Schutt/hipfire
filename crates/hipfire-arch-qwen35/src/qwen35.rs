@@ -6966,6 +6966,55 @@ fn run_plain_gemm_key(
         .map_err(HipError::from)
 }
 
+/// #397 Ship 5.2 slice 2: route a single BATCHED-prefill FUSED gate+up GEMM
+/// through [`FusedQkvFamily`] against an explicit `FusedGateUp*` [`KernelKey`].
+///
+/// This is the gate+up analogue of [`run_plain_gemm_key`]. Unlike a plain GEMM,
+/// gate+up carries TWO weights (gate, up) and writes TWO outputs in one fused
+/// launch, so it goes through `FusedQkvFamily` (the gate+up variant) rather than
+/// `GemmFamily`. Passing `batch_size: Some(n)` makes the family's gate+up run-arm
+/// dispatch to the IDENTICAL batched `gpu.gemm_gate_up_*(.., n)` method the direct
+/// prefill call used — each method keeps its own internal arch routing
+/// (RDNA4-WMMA / gfx906-dp4a / MMQ / fp16 / scalar) byte-for-byte. The weights,
+/// activation `x` (already rmsnorm-rotated by the caller), outputs and m/k/n args
+/// are unchanged at every migrated site.
+///
+/// The `FusedGateUp*` key carries the dtype; the run-arm replicates any
+/// call-site arch split (e.g. HFQ3 WMMA-vs-base) internally via `gpu.arch_caps`,
+/// so the same kernel runs. `resolve()` only confirms the entry's ArchPredicate
+/// admits the current arch — it does NOT front-run the kernel's internal dispatch.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_fused_gate_up_key(
+    gpu: &mut Gpu,
+    key: hipfire_dispatch::types::KernelKey,
+    w_gate: &GpuTensor,
+    w_up: &GpuTensor,
+    x: &GpuTensor,
+    y_gate: &GpuTensor,
+    y_up: &GpuTensor,
+    gate_m: usize,
+    up_m: usize,
+    k: usize,
+    n: usize,
+) -> HipResult<()> {
+    use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
+    let ctx = DispatchCtx::new(gpu);
+    let params = FusedQkvParams {
+        kind: key,
+        weights: &[w_gate, w_up],
+        x,
+        outputs: &[y_gate, y_up],
+        m: &[gate_m, up_m],
+        k,
+        rot_scratch: &[],
+        batch_size: Some(n),
+    };
+    hipfire_runtime::llama::fused_qkv_family()
+        .run(&ctx, gpu, &params)
+        .map_err(HipError::from)
+}
+
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
 /// residual stream in `pbs.x_batch` ([N × dim]) and writes the FFN output
 /// residual back into the same buffer in-place.
@@ -7144,7 +7193,11 @@ fn prefill_moe_ffn_body_batched(
     // Per-projection dispatch: gate AND up share the same dtype (predicate
     // enforces). MQ4 → HFQ4-layout fused kernel; MQ6 → HFQ6-layout.
     match ffn.shared_expert.gate.gpu_dtype {
-        DType::MQ4G256 => gpu.gemm_gate_up_hfq4g256(
+        // #397 Ship 5.2 slice 2: shared-expert fused gate+up → FusedQkvFamily
+        // (batched-prefill gate+up variant). Same batched kernel, behavior-preserving.
+        DType::MQ4G256 => run_fused_gate_up_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::FusedGateUpHfq4G256,
             &ffn.shared_expert.gate.buf,
             &ffn.shared_expert.up.buf,
             &pbs.x_rot_batch,
@@ -7155,7 +7208,9 @@ fn prefill_moe_ffn_body_batched(
             ffn.shared_expert.gate.k,
             n,
         )?,
-        DType::MQ6G256 => gpu.gemm_gate_up_hfq6g256(
+        DType::MQ6G256 => run_fused_gate_up_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::FusedGateUpHfq6G256,
             &ffn.shared_expert.gate.buf,
             &ffn.shared_expert.up.buf,
             &pbs.x_rot_batch,
@@ -8447,8 +8502,16 @@ fn forward_prefill_chunk(
                 }
 
                 // Batched gate+up projection.
+                // #397 Ship 5.2 slice 2: fused gate+up dtypes → FusedQkvFamily
+                // (batched-prefill gate+up variant) via run_fused_gate_up_key.
+                // The Q8-non-WMMA case stays as two plain GemmQ8_0BatchedChunked
+                // GEMMs (not a fused kernel — slice 1). The HFQ3 WMMA-vs-base
+                // split is folded into the FusedGateUpHfq3G256 run-arm, which
+                // re-derives it from gpu.arch_caps.has_wmma() (== arch_has_wmma).
                 if ffn_is_6bit {
-                    gpu.gemm_gate_up_hfq6g256(
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpHfq6G256,
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -8464,7 +8527,9 @@ fn forward_prefill_chunk(
                         matches!(layer.w_up.gpu_dtype, DType::Q8_0),
                         "LA FFN Q8 WMMA dispatch requires both w_gate and w_up to be Q8_0",
                     );
-                    gpu.gemm_gate_up_q8_0_wmma(
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpQ8_0,
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -8499,7 +8564,9 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if ffn_is_mq3_lloyd {
-                    gpu.gemm_gate_up_mq3g256_lloyd_wmma(
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpMq3G256Lloyd,
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -8511,33 +8578,23 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if ffn_is_mq3 {
-                    if arch_has_wmma {
-                        gpu.gemm_gate_up_hfq3g256_wmma(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            &pbs.x_rot_batch,
-                            &pbs.gate_ffn_batch,
-                            &pbs.up_batch,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                            n,
-                        )?;
-                    } else {
-                        gpu.gemm_gate_up_hfq3g256(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            &pbs.x_rot_batch,
-                            &pbs.gate_ffn_batch,
-                            &pbs.up_batch,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                            n,
-                        )?;
-                    }
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpHfq3G256,
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        layer.w_gate.m,
+                        layer.w_up.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
                 } else if ffn_is_fp4 {
-                    gpu.gemm_gate_up_hfp4g32(
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpHfp4G32,
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -8549,7 +8606,9 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else {
-                    gpu.gemm_gate_up_hfq4g256(
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpHfq4G256,
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -9245,8 +9304,14 @@ fn forward_prefill_chunk(
                         config.norm_eps,
                     )?;
                 }
+                // #397 Ship 5.2 slice 2: FA-FFN fused gate+up → FusedQkvFamily
+                // (batched-prefill gate+up variant), mirroring the LA-FFN block
+                // above. Q8-non-WMMA stays as two plain GEMMs; HFQ3 WMMA-vs-base
+                // is folded into the FusedGateUpHfq3G256 run-arm.
                 if fa_ffn_is_6bit {
-                    gpu.gemm_gate_up_hfq6g256(
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpHfq6G256,
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -9262,7 +9327,9 @@ fn forward_prefill_chunk(
                         matches!(layer.w_up.gpu_dtype, DType::Q8_0),
                         "FA FFN Q8 WMMA dispatch requires both w_gate and w_up to be Q8_0",
                     );
-                    gpu.gemm_gate_up_q8_0_wmma(
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpQ8_0,
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -9297,7 +9364,9 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if fa_ffn_is_mq3_lloyd {
-                    gpu.gemm_gate_up_mq3g256_lloyd_wmma(
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpMq3G256Lloyd,
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -9309,33 +9378,23 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if fa_ffn_is_mq3 {
-                    if arch_has_wmma {
-                        gpu.gemm_gate_up_hfq3g256_wmma(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            &pbs.x_rot_batch,
-                            &pbs.gate_ffn_batch,
-                            &pbs.up_batch,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                            n,
-                        )?;
-                    } else {
-                        gpu.gemm_gate_up_hfq3g256(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            &pbs.x_rot_batch,
-                            &pbs.gate_ffn_batch,
-                            &pbs.up_batch,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                            n,
-                        )?;
-                    }
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpHfq3G256,
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        layer.w_gate.m,
+                        layer.w_up.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
                 } else if fa_ffn_is_fp4 {
-                    gpu.gemm_gate_up_hfp4g32(
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpHfp4G32,
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -9347,7 +9406,9 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else {
-                    gpu.gemm_gate_up_hfq4g256(
+                    run_fused_gate_up_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::FusedGateUpHfq4G256,
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
