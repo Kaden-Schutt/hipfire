@@ -37,6 +37,8 @@ def parse_args():
     p.add_argument("--out", default="/workspace/gemma4-tiny")
     p.add_argument("--n-ctx", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--sliding-window", type=int, default=8,
+                   help="small (<n_ctx) exercises SWA; large (>=n_ctx) makes it a no-op")
     return p.parse_args()
 
 
@@ -57,7 +59,7 @@ def main():
         num_global_key_value_heads=1,  # full layers = MQA (1 KV head)
         head_dim=256, global_head_dim=512, attention_k_eq_v=True,
         hidden_activation="gelu_pytorch_tanh", rms_norm_eps=1e-6,
-        sliding_window=8,  # < n_ctx → exercises SWA windowing
+        sliding_window=args.sliding_window,  # < n_ctx exercises SWA windowing
         final_logit_softcapping=30.0, layer_types=layer_types,
         rope_parameters=rope_parameters, tie_word_embeddings=True,
         attention_bias=False, num_kv_shared_layers=0, use_double_wide_mlp=False,
