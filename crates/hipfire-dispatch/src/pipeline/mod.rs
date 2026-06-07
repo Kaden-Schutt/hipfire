@@ -149,6 +149,53 @@ pub fn check_moe_decode_batch_size(batch_size: usize) -> Result<(), DispatchErro
     Ok(())
 }
 
+/// GPU-free pre-guard for MoE decode (#397 Ship 4c). Rejects the two
+/// truly-unsupported cases up front — *before* any GPU work — so the caller
+/// gets a clean [`DispatchError`] instead of a deep panic in the CPU-top-K
+/// fallback (`select_nth_unstable_by(k-1)` panics when `k == 0 || k > n_exp`)
+/// or in a kernel launch with no expert to run.
+///
+/// IMPORTANT: `k != 8` is NOT itself an error. The CPU-top-K fallback
+/// (`run_moe_decode_cpu_fallback`) legitimately handles any `k ∈ [1, n_exp]`
+/// (k=4 for MQ4, k=2 for an F32 router, etc.). This guard must only reject:
+///
+/// - **(a)** `k` outside `[1, n_exp]` — invalid for top-K selection on either
+///   the GPU-top-K fast path or the CPU fallback.
+/// - **(b)** a routed dtype that neither path supports: the dtype is not on the
+///   GPU-top-K fast path (`!use_gpu_topk`) *and* there are no resident per-expert
+///   weights for the CPU fallback to iterate. (When the routed dtype is the only
+///   issue but experts are resident, the fallback runs it and its inner
+///   `gemv.run_auto` surfaces any genuinely-unsupported dtype as its own clean
+///   `DispatchError` — so we must NOT reject that case here.)
+///
+/// `routed_experts_resident` mirrors `!MoeParams::routed_experts.is_empty()`
+/// (false under paged residency, where only the GPU-top-K path is available).
+pub fn check_moe_decode_supported(
+    use_gpu_topk: bool,
+    k: usize,
+    n_exp: usize,
+    routed_experts_resident: bool,
+) -> Result<(), DispatchError> {
+    // (a) k-range — required by BOTH the GPU-top-K path and the CPU fallback's
+    // `select_nth_unstable_by(k-1)`. Universal precondition, not a k==8 check.
+    if k == 0 || k > n_exp {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe", variant: "decode-k-out-of-range",
+            arch: "", quant: "",
+        });
+    }
+    // (b) routed dtype on neither path: not GPU-top-K-indexable AND no resident
+    // experts to drive the CPU fallback. A non-fast-path dtype WITH resident
+    // experts is a valid fallback case (do not reject it here).
+    if !use_gpu_topk && !routed_experts_resident {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe", variant: "decode-routed-dtype-unsupported-no-fallback",
+            arch: "", quant: "",
+        });
+    }
+    Ok(())
+}
+
 /// MoE decode executor. Ports the body of `moe_ffn_decode_impl` verbatim,
 /// substituting `ffn.*`/`config.*`/`s.*` references with `MoeParams` fields.
 /// Resolution is owned here (computed from `MoeDtypes` + k), and `ctx` is
@@ -169,6 +216,18 @@ pub fn run_moe_decode(
     check_moe_decode_batch_size(p.batch_size)?;
 
     let res = MoeResolution::resolve(&p.dtypes, p.k);
+
+    // Pre-guard (#397 Ship 4c): reject out-of-range k and routed dtypes that
+    // neither the GPU-top-K fast path nor the CPU fallback can run, BEFORE any
+    // GPU work. `resolve` is a pure, side-effect-free function of dtypes + k, so
+    // running it first then guarding is equivalent to guarding pre-resolve while
+    // letting us key the dtype check off `res.use_gpu_topk`. This turns the
+    // deep `select_nth_unstable_by` panic in the fallback into a clean error.
+    // NOTE: k != 8 is intentionally NOT rejected — the fallback handles k ∈
+    // [1, n_exp] (MQ4 k=4, F32 k=2, …).
+    check_moe_decode_supported(
+        res.use_gpu_topk, p.k, p.n_exp, !p.routed_experts.is_empty(),
+    )?;
 
     // ── Activation rotation (mirrors qwen35.rs x_rot_local block) ──────────
     let x_rot_local: Option<&GpuTensor> = if res.needs_x_rot_local {

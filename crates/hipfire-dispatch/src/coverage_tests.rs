@@ -273,6 +273,65 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
     );
 }
 
+/// LAYER 1e — MoE decode pre-guard (#397 Ship 4c). `run_moe_decode` now calls
+/// `check_moe_decode_supported` BEFORE any GPU work, turning the two deep-fallback
+/// failure modes into clean `DispatchError`s:
+///   - `k` out of `[1, n_exp]` → the CPU fallback's `select_nth_unstable_by(k-1)`
+///     panics; the pre-guard must reject it gracefully.
+///   - a routed dtype on neither path (not GPU-top-K-indexable AND no resident
+///     experts) → no kernel can run it; the pre-guard must reject it gracefully.
+/// CRITICAL: the canonical fallback case `(op=moe, dtype=MQ4G256, k=4)` with
+/// resident experts MUST pass the guard cleanly — `k != 8` is NOT an error.
+#[test]
+fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
+    use crate::pipeline::check_moe_decode_supported;
+
+    // The canonical MoE coverage row this task asks for:
+    // (op=moe, dtype=MQ4G256, k=4) → resolves to the CPU fallback, NOT GPU-top-K.
+    let mq4_k4 = MoeDtypes {
+        router: Q8_0, shared_gate: Q8_0,
+        shared_expert_gate: Q8_0, shared_expert_up: Q8_0,
+        experts_all_gate_up_mq4: true,
+        routed_gate_up: MQ4G256, routed_down: MQ4G256,
+        has_paro_shared: false,
+    };
+    let res_k4 = MoeResolution::resolve(&mq4_k4, 4);
+    assert!(
+        !res_k4.use_gpu_topk,
+        "MQ4G256 k=4 must route to the CPU-top-K fallback (k != 8), not GPU-top-K"
+    );
+    // With resident experts the fallback can run it → guard MUST pass cleanly.
+    assert!(
+        check_moe_decode_supported(res_k4.use_gpu_topk, 4, /*n_exp=*/64, /*resident=*/true).is_ok(),
+        "MQ4G256 k=4 with resident experts is a VALID fallback case — guard must not reject it"
+    );
+
+    // The GPU-top-K fast path (k=8 + indexable routed dtype) is also admitted.
+    let mq4_k8 = MoeDtypes { routed_gate_up: MQ4G256, routed_down: MQ4G256, ..mq4_k4 };
+    let res_k8 = MoeResolution::resolve(&mq4_k8, 8);
+    assert!(res_k8.use_gpu_topk, "MQ4G256 k=8 must be GPU-top-K-indexable");
+    assert!(
+        check_moe_decode_supported(res_k8.use_gpu_topk, 8, 64, /*resident=*/false).is_ok(),
+        "GPU-top-K path is valid even under paged (non-resident) residency"
+    );
+
+    // (a) out-of-range k errors gracefully (no panic): k == 0 and k > n_exp.
+    assert!(
+        check_moe_decode_supported(false, 0, 64, true).is_err(),
+        "k == 0 must be rejected (would panic select_nth_unstable_by(k-1))"
+    );
+    assert!(
+        check_moe_decode_supported(false, 65, 64, true).is_err(),
+        "k > n_exp must be rejected (would panic select_nth_unstable_by(k-1))"
+    );
+
+    // (b) routed dtype on NEITHER path: not GPU-top-K AND no resident experts.
+    assert!(
+        check_moe_decode_supported(/*use_gpu_topk=*/false, 4, 64, /*resident=*/false).is_err(),
+        "non-fast-path dtype with no resident experts has no runnable path — reject gracefully"
+    );
+}
+
 /// LAYER 1c — Q8/Paro were gapped in MULTIPLE GEMV variants: o_proj used Residual,
 /// then the FFN/qkv used Prerotated (the second panic domino). Lock every variant
 /// these dtypes are actually dispatched through.
