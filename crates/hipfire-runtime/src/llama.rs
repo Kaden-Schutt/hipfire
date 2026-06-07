@@ -586,6 +586,17 @@ pub fn gemv_family() -> &'static hipfire_dispatch::families::gemv::GemvFamily {
     GEMV.get_or_init(hipfire_dispatch::families::gemv::GemvFamily::new)
 }
 
+/// Process-global [`GemmFamily`], mirroring [`gemv_family`]. #397 Ship 5.2:
+/// arches route their batched-prefill plain-GEMM launches through
+/// `gemm_family().run_key(..)` so the dispatcher-entry kernel selection lives in
+/// the dispatch crate. `run_key` (explicit KernelKey) preserves the direct
+/// `gpu.gemm_*` call's own internal arch dispatch byte-for-byte.
+pub fn gemm_family() -> &'static hipfire_dispatch::families::gemm::GemmFamily {
+    use std::sync::OnceLock;
+    static GEMM: OnceLock<hipfire_dispatch::families::gemm::GemmFamily> = OnceLock::new();
+    GEMM.get_or_init(hipfire_dispatch::families::gemm::GemmFamily::new)
+}
+
 /// Process-global [`FusedQkvFamily`], mirroring [`gemv_family`]. Used by the
 /// dense-arch forward paths to route fused QKV / gate-up launches through the
 /// centralized dispatch tables (arch gating + 1:1 KernelKey→kernel launch).

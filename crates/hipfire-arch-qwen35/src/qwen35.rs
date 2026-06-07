@@ -7014,35 +7014,54 @@ fn prefill_moe_ffn_body_batched(
     // is not applicable when router/shared_expert_gate are Q8 (mixed
     // strides). Four separate launches; +3 per MoE layer over the fused
     // ideal, acceptable for the structural unlock.
-    match ffn.router.gpu_dtype {
-        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
-            &ffn.router.buf,
-            &pbs.x_norm_batch,
-            router_logits,
-            ffn.router.m,
-            ffn.router.k,
-            n,
-        )?,
-        DType::MQ4G256 => gpu.gemm_hfq4g256(
-            &ffn.router.buf,
-            &pbs.x_rot_batch,
-            router_logits,
-            ffn.router.m,
-            ffn.router.k,
-            n,
-        )?,
-        DType::F32 => gpu.gemm_f32_batched(
-            &ffn.router.buf,
-            &pbs.x_norm_batch,
-            router_logits,
-            ffn.router.m,
-            ffn.router.k,
-            n,
-        )?,
-        other => panic!(
-            "prefill_moe_ffn_body_batched: unexpected router dtype {other:?} \
+    // #397 Ship 5.2 PILOT: route the router GEMM through GemmFamily::run_key.
+    // Each arm uses the *dispatcher-entry* KernelKey (GemmQ8_0BatchedChunked /
+    // GemmHfq4G256 / GemmF32Batched) so run_key dispatches to the IDENTICAL
+    // gpu.gemm_* method the prior direct call used — preserving each method's
+    // own internal arch routing (RDNA4-WMMA / gfx906-dp4a / CDNA-rocBLAS / …)
+    // byte-for-byte. The x input still differs per dtype (Q8/F32 read
+    // x_norm_batch; MQ4 reads x_rot_batch), exactly as before. The three keys
+    // are registered ArchPredicate::Always, so run_key never rejects.
+    {
+        use hipfire_dispatch::families::gemm::GemmParams;
+        let ctx = DispatchCtx::new(gpu);
+        let (key, x_in): (hipfire_dispatch::types::KernelKey, &GpuTensor) =
+            match ffn.router.gpu_dtype {
+                DType::Q8_0 => (
+                    hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                    &pbs.x_norm_batch,
+                ),
+                DType::MQ4G256 => (
+                    hipfire_dispatch::types::KernelKey::GemmHfq4G256,
+                    &pbs.x_rot_batch,
+                ),
+                DType::F32 => (
+                    hipfire_dispatch::types::KernelKey::GemmF32Batched,
+                    &pbs.x_norm_batch,
+                ),
+                other => panic!(
+                    "prefill_moe_ffn_body_batched: unexpected router dtype {other:?} \
                          — moe_ffn_batched_admitted admits MQ4G256, Q8_0, F32"
-        ),
+                ),
+            };
+        let w = WeightRef {
+            buf: &ffn.router.buf,
+            dtype: ffn.router.gpu_dtype,
+            m: ffn.router.m,
+            k: ffn.router.k,
+            row_stride: ffn.router.k,
+            rotation: None,
+            awq_scale: None,
+        };
+        let params = GemmParams {
+            w: &w,
+            x: x_in,
+            y: router_logits,
+            batch_size: n,
+        };
+        hipfire_runtime::llama::gemm_family()
+            .run_key(key, &ctx, gpu, &params)
+            .map_err(HipError::from)?;
     }
     // DIAG: dump MoE router logits (batched)
     dump_hidden_localize(gpu, router_logits, n, 0, ffn.router.m, 0, "router_b");

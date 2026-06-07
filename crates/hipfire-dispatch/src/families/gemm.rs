@@ -95,6 +95,38 @@ impl GemmFamily {
         params: &GemmParams,
     ) -> Result<(), DispatchError> {
         let key = self.resolve(params.w.dtype, ctx, None)?.key;
+        self.run_key(key, ctx, gpu, params)
+    }
+
+    /// Run a GEMM operation against an *explicit* [`KernelKey`], bypassing the
+    /// dtype-keyed WMMA-preference heuristic in [`resolve`].
+    ///
+    /// This is the behavior-preserving migration primitive for prefill call
+    /// sites that historically invoked a *specific* `gpu.gemm_*` method whose
+    /// own internal arch dispatch (e.g. `gemm_hfq4g256` routing to dp4a /
+    /// rocBLAS / WMMA, or `gemm_q8_0_batched_chunked` routing to RDNA4 WMMA)
+    /// must be preserved exactly. Passing the dispatcher-entry key
+    /// (`GemmHfq4G256`, `GemmQ8_0BatchedChunked`, `GemmF32Batched`, …) routes to
+    /// the identical `gpu.gemm_*` method the direct call used, so output is
+    /// byte-identical on every (dtype × arch × shape).
+    ///
+    /// `resolve` (dtype-keyed) would instead *front-run* the kernel's internal
+    /// dispatch by preferring a single WMMA variant, which can diverge from the
+    /// direct call on some arches — so it is NOT appropriate for migrating a
+    /// site that called the dispatcher entry point directly. Use this method for
+    /// those; use [`run`] only where the dtype-keyed heuristic matches the
+    /// site's prior behavior.
+    pub fn run_key(
+        &self,
+        key: KernelKey,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        params: &GemmParams,
+    ) -> Result<(), DispatchError> {
+        // Validate the explicit key is registered and arch-admissible. The
+        // dispatcher-entry keys used at migrated prefill sites are registered
+        // `ArchPredicate::Always`, so this never rejects on a supported build.
+        let key = self.registry.resolve(key, ctx, None)?.key;
 
         let w = params.w;
         let x = params.x;
