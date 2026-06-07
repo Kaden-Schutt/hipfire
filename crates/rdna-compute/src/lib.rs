@@ -8,6 +8,7 @@ pub mod arch_caps;
 pub mod attention;
 pub mod embedding;
 pub mod gemm;
+pub mod gemma4_ext;
 pub mod gemv;
 pub mod graph;
 pub mod moe;

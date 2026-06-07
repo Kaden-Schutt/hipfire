@@ -6,6 +6,7 @@ members = [
     "crates/rdna-compute",
     "crates/hipfire-runtime",
     "crates/hipfire-arch-qwen35",
+    "crates/hipfire-arch-gemma4",
     "crates/hipfire-arch-qwen35-vl",
     "crates/hipfire-arch-llama",
     "crates/hipfire-arch-deepseek4",
