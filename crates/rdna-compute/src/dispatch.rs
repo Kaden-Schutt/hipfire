@@ -1823,6 +1823,10 @@ impl Gpu {
                     kernels::ATTENTION_Q8_0_KV_SRC.to_string(),
                 ));
                 specs.push((
+                    "attention_q8_0_kv_swa",
+                    kernels::ATTENTION_Q8_0_KV_SWA_SRC.to_string(),
+                ));
+                specs.push((
                     "attention_q8_0_kv_batched",
                     kernels::ATTENTION_Q8_0_KV_BATCHED_SRC.to_string(),
                 ));

@@ -2448,6 +2448,13 @@ pub const KV_CACHE_WRITE_Q8_0_SRC: &str =
 /// K and V caches stored as [max_seq × n_kv_heads × blocks_per_head × 34].
 pub const ATTENTION_Q8_0_KV_SRC: &str = include_str!("../../../kernels/src/attention_q8_0_kv.hip");
 
+/// Sliding-window variant of ATTENTION_Q8_0_KV_SRC. Adds a `window`
+/// parameter: 0 = full causal (identical to the baseline), >0 = attend only
+/// to the last `window` keys ([max(0, seq_len - window), seq_len)). Used by
+/// Gemma 4 sliding layers (window=1024); full layers call with window=0.
+pub const ATTENTION_Q8_0_KV_SWA_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_kv_swa.hip");
+
 /// Batched counterpart of ATTENTION_Q8_0_KV_SRC. Processes N queries in
 /// one launch with per-row causal windows from a positions[] array.
 pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =

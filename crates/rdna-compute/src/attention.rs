@@ -4622,6 +4622,95 @@ impl Gpu {
         result
     }
 
+    /// Sliding-window variant of [`Self::attention_q8_0_kv`] for the
+    /// single-token decode path. Identical to the baseline kernel except for
+    /// the extra `window` parameter:
+    ///
+    /// * `window == 0` — full causal attention over `[0, seq_len)`
+    ///   (byte-identical behavior to `attention_q8_0_kv`, modulo the distinct
+    ///   kernel module). Use this for Gemma 4 *full* layers (head_dim=512).
+    /// * `window > 0` — attend only to the last `window` keys, i.e. the range
+    ///   `[max(0, seq_len - window), seq_len)`. For a decode query at position
+    ///   `p` (0-indexed, `seq_len = pos_buf[0] + 1 = p + 1`) this is the
+    ///   inclusive key range `[max(0, p - window + 1), p]` — the last `window`
+    ///   keys, inclusive of the current position. Use this for Gemma 4
+    ///   *sliding* layers (head_dim=256, window=1024). The full KV cache is
+    ///   retained; only the attention *range* is windowed (no ring buffer),
+    ///   matching the `t_lo` semantics of the gemma4 SWA flash path.
+    ///
+    /// `head_dim` is generic (256 and 512 both supported). Existing callers of
+    /// `attention_q8_0_kv` (cohere/minimax/qwen35/llama) are untouched.
+    pub fn attention_q8_0_kv_swa(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        window: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_q8_0_kv_swa",
+            kernels::ATTENTION_Q8_0_KV_SWA_SRC,
+            "attention_q8_0_kv_swa",
+        )?;
+        let func = &self.functions["attention_q8_0_kv_swa"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = pos_buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ms = max_seq as i32;
+        let mut sc = scale;
+        let mut win = window as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut win as *mut _ as *mut c_void,
+        ];
+        let block_size = (seq_len_hint.max(head_dim) as u32)
+            .next_power_of_two()
+            .min(256);
+        // Extra shared mem for Q head vector preloaded into shared memory
+        let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
+        let bytes =
+            crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, seq_len_hint);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv_swa", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, 1, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Phase-instrumented variant of attention_q8_0_kv. Identical to the
     /// baseline kernel but additionally writes per-head cycle counts for
     /// each internal phase into `cycle_counts` (layout: [n_heads * 3],
