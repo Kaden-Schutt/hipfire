@@ -31,6 +31,7 @@ fn main() {
     let mut prompt = "The capital of France is".to_string();
     let mut max: usize = 64;
     let mut rep_pen: f32 = 1.3;
+    let mut token_ids: Option<Vec<u32>> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -40,6 +41,18 @@ fn main() {
             }
             "--prompt" => {
                 prompt = argv[i + 1].clone();
+                i += 2;
+            }
+            // Bypass the tokenizer: feed comma-separated input token ids (e.g.
+            // HF-tokenized). Output token ids are printed for external decode.
+            "--token-ids" => {
+                token_ids = Some(
+                    argv[i + 1]
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.trim().parse::<u32>().expect("--token-ids"))
+                        .collect(),
+                );
                 i += 2;
             }
             "--max" => {
@@ -70,13 +83,21 @@ fn main() {
         cfg.vocab_size,
         cfg.final_logit_softcapping
     );
-    let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
+    // Tokenizer only needed for text encode/decode; --token-ids bypasses it.
+    let tok = if token_ids.is_none() {
+        Some(Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer"))
+    } else {
+        None
+    };
     let t_load = std::time::Instant::now();
     let weights = Gemma4Weights::load(&hfq, &cfg, &mut gpu).expect("weights");
     eprintln!("loaded weights in {:.1}s", t_load.elapsed().as_secs_f64());
 
     // Prepend BOS (2) if absent.
-    let mut prompt_ids = tok.encode(&prompt);
+    let mut prompt_ids = match token_ids {
+        Some(ids) => ids,
+        None => tok.as_ref().unwrap().encode(&prompt),
+    };
     if prompt_ids.first() != Some(&cfg.bos_token) {
         prompt_ids.insert(0, cfg.bos_token);
     }
@@ -142,9 +163,12 @@ fn main() {
         dt,
         gen.len() as f64 / dt
     );
-    println!(
-        "=== PROMPT ===\n{prompt}\n=== GENERATION ===\n{}",
-        tok.decode(&gen)
-    );
-    eprintln!("token ids: {:?}", &gen[..gen.len().min(40)]);
+    match &tok {
+        Some(t) => println!(
+            "=== PROMPT ===\n{prompt}\n=== GENERATION ===\n{}",
+            t.decode(&gen)
+        ),
+        None => println!("=== GENERATION token ids ===\n{:?}", gen),
+    }
+    eprintln!("token ids: {:?}", &gen[..gen.len().min(60)]);
 }
