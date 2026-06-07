@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
 //! KV-tier paired plan type (Phase 0.3). Derived once per attention step from
 //! the live KV-cache state. Carries both the write key and attend key together
 //! so they can never diverge (the #30-class drift guard).

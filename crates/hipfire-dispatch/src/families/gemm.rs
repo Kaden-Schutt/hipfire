@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Björn Bösel
+// hipfire — see LICENSE and NOTICE in the project root.
 //! GEMM kernel family: dispatching batched matrix-matrix multiply across quant formats.
 //!
 //! GEMM is a single-variant family (no Prerotated / WithResidual distinction —

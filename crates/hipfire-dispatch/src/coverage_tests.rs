@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
 //! Dispatch coverage guardrail — catches the two recurring "missing dispatch arm"
 //! defect classes at CI time, GPU-FREE (no kernels, no device, no GPU lock).
 //!

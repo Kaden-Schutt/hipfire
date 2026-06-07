@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Björn Bösel
+// hipfire — see LICENSE and NOTICE in the project root.
 // Qwen3.5 model-specific kernel extensions.
 //
 // These operations are unique to Qwen3.5's linear attention layers (DeltaNet):

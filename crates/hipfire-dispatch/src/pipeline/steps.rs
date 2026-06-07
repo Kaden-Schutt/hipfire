@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Björn Bösel
+// hipfire — see LICENSE and NOTICE in the project root.
 //! Op-list interpreter. Phase 2a: GEMV + a fused rmsnorm-rotate producer; empty
 //! fusion table (all per-op fallback).
 

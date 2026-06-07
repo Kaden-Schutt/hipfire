@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Björn Bösel
+// hipfire — see LICENSE and NOTICE in the project root.
 // hipfire-dispatch: unified kernel dispatch abstraction.
 //
 // One entry point per kernel family. Models never match on DType.
