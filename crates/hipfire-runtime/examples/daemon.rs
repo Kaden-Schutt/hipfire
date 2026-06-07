@@ -488,27 +488,68 @@ fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
     let _ = stdout.flush();
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn generate_batch_prefill_is_probe(envelope: &GenerateBatchPrefillEnvelope) -> bool {
+    envelope.id == "prefill-batch-probe" && envelope.batch_id == "prefill-batch-probe"
+}
+
 struct GenerateBatchPrefillEnvelope {
     id: String,
     batch_id: String,
     session_count: usize,
+    sessions: Vec<GenerateBatchPrefillSession>,
 }
 
-fn validate_u32_array(value: &serde_json::Value, field: &str) -> Result<(), String> {
+impl std::fmt::Debug for GenerateBatchPrefillEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenerateBatchPrefillEnvelope")
+            .field("id", &self.id)
+            .field("batch_id", &self.batch_id)
+            .field("session_count", &self.session_count)
+            .finish()
+    }
+}
+
+struct GenerateBatchPrefillSession {
+    id: String,
+    prompt: Option<String>,
+    suffix_tokens: Option<Vec<u32>>,
+    system_prompt: Option<String>,
+    tools: Option<Vec<serde_json::Value>>,
+    messages_history: Option<Vec<hipfire_runtime::prompt_frame::Message>>,
+    assistant_prefix: String,
+    max_think_tokens: usize,
+    state_handle: GenerateBatchPrefillStateHandle,
+}
+
+struct GenerateBatchPrefillStateHandle {
+    state_kinds: Vec<String>,
+    logical_position: usize,
+    cached_prefix_tokens: usize,
+}
+
+fn parse_assistant_prefix_label(label: Option<&str>) -> hipfire_runtime::prompt_frame::AssistantPrefix {
+    match label.unwrap_or("plain") {
+        "open_think" => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
+        "closed_think" => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
+        _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+    }
+}
+
+fn parse_u32_array(value: &serde_json::Value, field: &str) -> Result<Vec<u32>, String> {
     let arr = value
         .as_array()
         .ok_or_else(|| format!("{field} must be an array"))?;
     if arr.is_empty() {
         return Err(format!("{field} must not be empty"));
     }
+    let mut out = Vec::with_capacity(arr.len());
     for (i, item) in arr.iter().enumerate() {
         match item.as_u64() {
-            Some(n) if n <= u32::MAX as u64 => {}
+            Some(n) if n <= u32::MAX as u64 => out.push(n as u32),
             _ => return Err(format!("{field}[{i}] must be a u32 token id")),
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 fn validate_generate_batch_prefill(
@@ -549,6 +590,7 @@ fn validate_generate_batch_prefill(
     }
 
     let mut seen_session_ids = HashSet::new();
+    let mut parsed_sessions = Vec::with_capacity(sessions.len());
     for (i, session) in sessions.iter().enumerate() {
         let prefix = format!("generate_batch_prefill.sessions[{i}]");
         session
@@ -575,7 +617,7 @@ fn validate_generate_batch_prefill(
         };
         let has_suffix = match session.get("suffix_tokens") {
             Some(v) => {
-                validate_u32_array(v, &format!("{prefix}.suffix_tokens"))?;
+                parse_u32_array(v, &format!("{prefix}.suffix_tokens"))?;
                 true
             }
             None => false,
@@ -608,6 +650,7 @@ fn validate_generate_batch_prefill(
             "mamba_conv",
             "architecture_specific",
         ];
+        let mut parsed_state_kinds = Vec::with_capacity(state_kinds.len());
         for kind in state_kinds.iter() {
             let kind = kind
                 .as_str()
@@ -617,43 +660,103 @@ fn validate_generate_batch_prefill(
                     "{prefix}.state_handle.state_kinds contains unsupported kind {kind}"
                 ));
             }
+            parsed_state_kinds.push(kind.to_string());
         }
-        state_handle
+        let logical_position = state_handle
             .get("logical_position")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| {
                 format!("{prefix}.state_handle.logical_position must be an integer >= 0")
-            })?;
-        if let Some(v) = state_handle.get("cached_prefix_tokens") {
+            })? as usize;
+        let cached_prefix_tokens = if let Some(v) = state_handle.get("cached_prefix_tokens") {
             v.as_u64().ok_or_else(|| {
                 format!("{prefix}.state_handle.cached_prefix_tokens must be an integer >= 0")
-            })?;
-        }
+            })? as usize
+        } else {
+            0
+        };
         if let Some(params) = session.get("params") {
             params
                 .as_object()
                 .ok_or_else(|| format!("{prefix}.params must be an object"))?;
         }
+        let system_prompt = match session.get("system") {
+            Some(v) => Some(
+                v.as_str()
+                    .ok_or_else(|| format!("{prefix}.system must be a string"))?
+                    .to_string(),
+            ),
+            None => None,
+        };
+        let tools = match session.get("tools") {
+            Some(v) => Some(
+                serde_json::from_value::<Vec<serde_json::Value>>(v.clone())
+                    .map_err(|e| format!("{prefix}.tools invalid: {e}"))?,
+            ),
+            None => None,
+        };
+        let messages_history = match session.get("messages") {
+            Some(v) => Some(
+                serde_json::from_value::<Vec<hipfire_runtime::prompt_frame::Message>>(v.clone())
+                    .map_err(|e| format!("{prefix}.messages invalid: {e}"))?,
+            ),
+            None => None,
+        };
+        let assistant_prefix = session
+            .get("params")
+            .and_then(|p| p.get("assistant_prefix"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("plain")
+            .to_string();
+        let max_think_tokens = session
+            .get("params")
+            .and_then(|p| p.get("max_think_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        parsed_sessions.push(GenerateBatchPrefillSession {
+            id: session_id.to_string(),
+            prompt: session
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            suffix_tokens: match session.get("suffix_tokens") {
+                Some(v) => Some(parse_u32_array(v, &format!("{prefix}.suffix_tokens"))?),
+                None => None,
+            },
+            system_prompt,
+            tools,
+            messages_history,
+            assistant_prefix,
+            max_think_tokens,
+            state_handle: GenerateBatchPrefillStateHandle {
+                state_kinds: parsed_state_kinds,
+                logical_position,
+                cached_prefix_tokens,
+            },
+        });
     }
 
     Ok(GenerateBatchPrefillEnvelope {
         id,
         batch_id,
         session_count: sessions.len(),
+        sessions: parsed_sessions,
     })
 }
 
-fn emit_generate_batch_prefill_unsupported(
+fn emit_generate_batch_prefill_ready(
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchPrefillEnvelope,
 ) {
     let line = serde_json::json!({
-        "type": "generate_batch_prefill_unsupported",
+        "type": "generate_batch_prefill_ready",
         "id": envelope.id,
         "batch_id": envelope.batch_id,
         "sessions": envelope.session_count,
-        "supported": false,
-        "reason": "per_session_runtime_state_unavailable",
+        "supported": true,
+        "mode": "qwen35_serial_exact_token_prefill",
+        "reason": "qwen35_serial_exact_token_prefill_available",
     });
     let _ = writeln!(stdout, "{line}");
     let _ = stdout.flush();
@@ -1034,6 +1137,10 @@ struct LoadedModel {
     q35_scratch: Option<qwen35::Qwen35Scratch>,
     kv_cache: Option<llama::KvCache>,
     dn_state: Option<DeltaNetState>,
+    q35_kv_mode: Option<String>,
+    q35_state_quant: Option<hipfire_arch_qwen35::qwen35::StateQuant>,
+    q35_sessions: std::collections::HashMap<String, Qwen35RequestSessionState>,
+    q35_active_session_id: Option<String>,
     // Qwen3 state
     llama_config: Option<llama::LlamaConfig>,
     llama_weights: Option<llama::LlamaWeights>,
@@ -1184,6 +1291,8 @@ struct LoadedModel {
     chat_template: Option<String>,
 }
 
+const QWEN35_LEGACY_SESSION_ID: &str = "__legacy_generate__";
+
 struct Qwen35RequestSessionState {
     seq_pos: usize,
     conversation_tokens: Vec<u32>,
@@ -1228,6 +1337,447 @@ impl Qwen35RequestSessionState {
         }
         self.kv_cache.compact_offset = 0;
     }
+
+}
+
+fn qwen35_session_resident(m: &LoadedModel, session_id: &str) -> bool {
+    m.q35_active_session_id.as_deref() == Some(session_id)
+        || m.q35_sessions.contains_key(session_id)
+}
+
+fn qwen35_active_logical_position(m: &LoadedModel) -> Result<usize, String> {
+    let compact_offset = m
+        .kv_cache
+        .as_ref()
+        .ok_or_else(|| "qwen35 active session missing KV cache".to_string())?
+        .compact_offset;
+    Ok(m.seq_pos + compact_offset)
+}
+
+fn qwen35_allocate_session_state(
+    m: &LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<Qwen35RequestSessionState, String> {
+    let config = m
+        .q35_config
+        .as_ref()
+        .ok_or_else(|| "qwen35 config missing".to_string())?;
+    let kv_mode = m
+        .q35_kv_mode
+        .as_deref()
+        .ok_or_else(|| "qwen35 KV mode missing; reload model before batch prefill".to_string())?;
+    let kv_cache = match kv_mode {
+        "fp32" | "f32" => {
+            let is_kv_layer: Vec<bool> = config
+                .layer_types
+                .iter()
+                .map(|t| *t == LayerType::FullAttention)
+                .collect();
+            llama::KvCache::new_gpu_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                m.max_seq,
+            )
+            .map_err(|e| format!("{e}"))?
+        }
+        "q8" => llama::KvCache::new_gpu_q8_capped(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            m.max_seq,
+            m.physical_cap,
+        )
+        .map_err(|e| format!("{e}"))?,
+        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            m.max_seq,
+            m.physical_cap,
+        )
+        .map_err(|e| format!("{e}"))?,
+        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            m.max_seq,
+            m.physical_cap,
+        )
+        .map_err(|e| format!("{e}"))?,
+        "asym3" | "turbo3" | "turbo" if config.head_dim == 256 => {
+            llama::KvCache::new_gpu_asym3_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                m.max_seq,
+                m.physical_cap,
+            )
+            .map_err(|e| format!("{e}"))?
+        }
+        "auto" | "" if config.head_dim == 256 => llama::KvCache::new_gpu_asym3_capped(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            m.max_seq,
+            m.physical_cap,
+        )
+        .map_err(|e| format!("{e}"))?,
+        "auto" | "" => llama::KvCache::new_gpu_q8_capped(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            m.max_seq,
+            m.physical_cap,
+        )
+        .map_err(|e| format!("{e}"))?,
+        "asym3" | "turbo3" | "turbo" => {
+            return Err(format!(
+                "qwen35 batch-prefill KV mode {kv_mode} requires head_dim=256 (got {})",
+                config.head_dim
+            ));
+        }
+        other => {
+            eprintln!("  batch-prefill KV cache: unrecognized '{other}', defaulting to asym3");
+            llama::KvCache::new_gpu_asym3_capped(
+                gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                m.max_seq,
+                m.physical_cap,
+            )
+            .map_err(|e| format!("{e}"))?
+        }
+    };
+    let dn_quant = m
+        .q35_state_quant
+        .ok_or_else(|| "qwen35 DeltaNet state quant missing; reload model before batch prefill".to_string())?;
+    let dn_state = DeltaNetState::new_with_quant(gpu, config, dn_quant)
+        .map_err(|e| format!("DeltaNetState::new_with_quant: {e:?}"))?;
+    Ok(Qwen35RequestSessionState {
+        seq_pos: 0,
+        conversation_tokens: Vec::new(),
+        kv_cache,
+        dn_state,
+    })
+}
+
+fn qwen35_save_active_session(m: &mut LoadedModel) -> Result<(), String> {
+    if let Some(active_id) = m.q35_active_session_id.take() {
+        let session = Qwen35RequestSessionState::take_from_loaded(m)
+            .map_err(|e| format!("failed to save active qwen35 session: {e}"))?;
+        m.q35_sessions.insert(active_id, session);
+    }
+    Ok(())
+}
+
+fn qwen35_activate_session(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    session_id: &str,
+) -> Result<bool, String> {
+    if m.q35_active_session_id.as_deref() == Some(session_id) {
+        return Ok(false);
+    }
+    let existed = m.q35_sessions.contains_key(session_id);
+    qwen35_save_active_session(m)?;
+    let session = match m.q35_sessions.remove(session_id) {
+        Some(session) => session,
+        None => qwen35_allocate_session_state(m, gpu)?,
+    };
+    session.restore_into_loaded(m);
+    m.q35_active_session_id = Some(session_id.to_string());
+    Ok(!existed)
+}
+
+fn qwen35_reset_active_session(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), String> {
+    let mut session = Qwen35RequestSessionState::take_from_loaded(m)
+        .map_err(|e| format!("failed to reset qwen35 session: {e}"))?;
+    session.reset(gpu);
+    session.restore_into_loaded(m);
+    Ok(())
+}
+
+fn qwen35_prefill_active_session(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    tokens: &[u32],
+) -> Result<usize, String> {
+    if tokens.is_empty() {
+        return Ok(0);
+    }
+    if m.seq_pos + tokens.len() > m.physical_cap {
+        return Err(format!(
+            "generate_batch_prefill exceeds loaded KV budget: seq_pos={} + prefill={} > physical_cap={}",
+            m.seq_pos,
+            tokens.len(),
+            m.physical_cap
+        ));
+    }
+    let config = m
+        .q35_config
+        .as_ref()
+        .ok_or_else(|| "qwen35 config missing".to_string())?;
+    let weights = m
+        .q35_weights
+        .as_ref()
+        .ok_or_else(|| "qwen35 weights missing".to_string())?;
+    let scratch = m
+        .q35_scratch
+        .as_ref()
+        .ok_or_else(|| "qwen35 scratch missing; PP batch-prefill is not supported".to_string())?;
+    let kv = m
+        .kv_cache
+        .as_mut()
+        .ok_or_else(|| "qwen35 active session missing KV cache".to_string())?;
+    let dn = m
+        .dn_state
+        .as_mut()
+        .ok_or_else(|| "qwen35 active session missing DeltaNet state".to_string())?;
+    let pos = m.seq_pos;
+    qwen35::forward_prefill_batch(
+        gpu, weights, config, tokens, pos, kv, dn, scratch, None, None, None, None,
+    )
+    .map_err(|e| format!("qwen35 forward_prefill_batch failed: {e:?}"))?;
+    m.seq_pos += tokens.len();
+    m.conversation_tokens.extend_from_slice(tokens);
+    Ok(tokens.len())
+}
+
+fn qwen35_materialize_batch_prefill_prompt(
+    m: &LoadedModel,
+    session: &GenerateBatchPrefillSession,
+) -> Result<Vec<u32>, String> {
+    let tokenizer = m
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| "tokenizer not loaded".to_string())?;
+    let prompt = session.prompt.as_deref().unwrap_or("");
+    let prompt_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(prompt);
+    let prompt = prompt_norm.as_ref();
+    let raw_q_tokens = tokenizer.encode(prompt);
+    let seq_pos_for_prompt = m.seq_pos;
+    let assistant_prefix = parse_assistant_prefix_label(Some(&session.assistant_prefix));
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
+    let system_prompt = session.system_prompt.as_deref();
+    let tools = session.tools.as_deref();
+    let messages_history = session.messages_history.as_deref();
+
+    if try_jinja {
+        let template = m.chat_template.as_ref().unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: session.max_think_tokens != 1,
+            bos_token: None,
+        };
+        let render_result = if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(m) => m,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
+            Ok(rendered) => Ok(tokenizer.encode(&rendered)),
+            Err(e) => {
+                eprintln!("[daemon] batch-prefill jinja render failed ({e}) -- falling back to Plain");
+                Ok(hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: "",
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build_with_user_tokens(&raw_q_tokens))
+            }
+        }
+    } else {
+        Ok(hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: if seq_pos_for_prompt == 0 {
+                system_prompt
+            } else {
+                None
+            },
+            user: "",
+            assistant_prefix,
+            raw: false,
+        }
+        .build_with_user_tokens(&raw_q_tokens))
+    }
+}
+
+fn run_generate_batch_prefill_serial_qwen35(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    envelope: &GenerateBatchPrefillEnvelope,
+    pflash_active: bool,
+) -> Result<(), String> {
+    if !(m.arch_id == 5 || m.arch_id == 6) {
+        return Err(format!(
+            "generate_batch_prefill currently supports qwen35/qwen35-moe only (arch_id={})",
+            m.arch_id
+        ));
+    }
+    if m.pp > 1 {
+        return Err("generate_batch_prefill does not support pipeline-parallel models yet".to_string());
+    }
+    if m.dflash.is_some() {
+        return Err("generate_batch_prefill does not support DFlash-loaded models yet".to_string());
+    }
+    if m.eviction.is_some() {
+        return Err("generate_batch_prefill does not support CASK/TriAttention eviction yet".to_string());
+    }
+    if pflash_active {
+        return Err("generate_batch_prefill does not support PFlash compression yet".to_string());
+    }
+
+    let started = serde_json::json!({
+        "type": "generate_batch_prefill_started",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "sessions": envelope.session_count,
+        "mode": "serial_prefill",
+    });
+    let _ = writeln!(stdout, "{started}");
+    let _ = stdout.flush();
+
+    let t0 = Instant::now();
+    let mut total_prefill_tokens = 0usize;
+    for session in &envelope.sessions {
+        if !session
+            .state_handle
+            .state_kinds
+            .iter()
+            .any(|kind| kind == "attention_kv")
+        {
+            return Err(format!(
+                "generate_batch_prefill session {} missing attention_kv state kind",
+                session.id
+            ));
+        }
+        if !session
+            .state_handle
+            .state_kinds
+            .iter()
+            .any(|kind| kind == "deltanet_recurrent")
+        {
+            return Err(format!(
+                "generate_batch_prefill session {} missing deltanet_recurrent state kind",
+                session.id
+            ));
+        }
+
+        let resident = qwen35_session_resident(m, &session.id);
+        if !resident
+            && (session.state_handle.logical_position > 0
+                || session.state_handle.cached_prefix_tokens > 0)
+        {
+            return Err(format!(
+                "generate_batch_prefill session {} references cached state at logical_position={} cached_prefix_tokens={} but no resident session exists",
+                session.id,
+                session.state_handle.logical_position,
+                session.state_handle.cached_prefix_tokens
+            ));
+        }
+
+        let created = qwen35_activate_session(m, gpu, &session.id)?;
+        let tokens: Vec<u32> = if session.prompt.is_some() {
+            if session.state_handle.logical_position != 0
+                || session.state_handle.cached_prefix_tokens != 0
+            {
+                return Err(format!(
+                    "generate_batch_prefill prompt session {} must start at logical_position=0 cached_prefix_tokens=0 in the first slice",
+                    session.id
+                ));
+            }
+            let _ = created;
+            qwen35_reset_active_session(m, gpu)?;
+            qwen35_materialize_batch_prefill_prompt(m, session)?
+        } else {
+            let current_position = qwen35_active_logical_position(m)?;
+            if created && session.state_handle.logical_position != 0 {
+                return Err(format!(
+                    "generate_batch_prefill suffix session {} is new but logical_position={} (expected 0)",
+                    session.id, session.state_handle.logical_position
+                ));
+            }
+            if !created && current_position != session.state_handle.logical_position {
+                return Err(format!(
+                    "generate_batch_prefill session {} logical_position mismatch: request={} resident={}",
+                    session.id, session.state_handle.logical_position, current_position
+                ));
+            }
+            session.suffix_tokens.clone().unwrap_or_default()
+        };
+
+        let prefilled = qwen35_prefill_active_session(m, gpu, &tokens)?;
+        total_prefill_tokens += prefilled;
+        let logical_position = qwen35_active_logical_position(m)?;
+        let line = serde_json::json!({
+            "type": "generate_batch_prefill_session_done",
+            "id": envelope.id,
+            "batch_id": envelope.batch_id,
+            "session_id": session.id,
+            "prefill_tokens": prefilled,
+            "logical_position": logical_position,
+            "cached_prefix_tokens": session.state_handle.cached_prefix_tokens,
+            "mode": "serial_prefill",
+        });
+        let _ = writeln!(stdout, "{line}");
+        let _ = stdout.flush();
+    }
+
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let done = serde_json::json!({
+        "type": "generate_batch_prefill_done",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "sessions": envelope.session_count,
+        "prefill_tokens": total_prefill_tokens,
+        "elapsed_ms": elapsed_ms,
+        "mode": "serial_prefill",
+    });
+    let _ = writeln!(stdout, "{done}");
+    let _ = stdout.flush();
+    Ok(())
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -1939,8 +2489,29 @@ fn main() {
                         continue;
                     }
                 };
-
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+                let session_id = msg
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                let prefill_already_done = msg
+                    .get("prefill_already_done")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if (m.arch_id == 5 || m.arch_id == 6) && m.pp == 1 {
+                    let target_session_id = session_id.unwrap_or(QWEN35_LEGACY_SESSION_ID);
+                    if let Err(e) = qwen35_activate_session(m, &mut gpu, target_session_id) {
+                        emit_error_with_id(&mut stdout, id, e);
+                        continue;
+                    }
+                } else if session_id.is_some() || prefill_already_done {
+                    emit_error_with_id(
+                        &mut stdout,
+                        id,
+                        "session_id/prefill_already_done are only supported for single-GPU qwen35/qwen35-moe",
+                    );
+                    continue;
+                }
                 let prompt = msg
                     .get("prompt")
                     .and_then(|v| v.as_str())
@@ -2319,13 +2890,33 @@ fn main() {
                         tools_json.as_deref(),
                         messages_history.as_deref(),
                         think_mode,
+                        prefill_already_done,
                     );
                 }
             }
 
             "generate_batch_prefill" => match validate_generate_batch_prefill(&msg) {
                 Ok(envelope) => {
-                    emit_generate_batch_prefill_unsupported(&mut stdout, &envelope);
+                    if generate_batch_prefill_is_probe(&envelope) {
+                        emit_generate_batch_prefill_ready(&mut stdout, &envelope);
+                        continue;
+                    }
+                    let m = match model.as_mut() {
+                        Some(m) => m,
+                        None => {
+                            emit_error_with_id(&mut stdout, &envelope.id, "no model loaded");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = run_generate_batch_prefill_serial_qwen35(
+                        m,
+                        &mut gpu,
+                        &mut stdout,
+                        &envelope,
+                        pflash_state.is_some(),
+                    ) {
+                        emit_error_with_id(&mut stdout, &envelope.id, e);
+                    }
                 }
                 Err(e) => {
                     let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -2340,6 +2931,12 @@ fn main() {
                 if let Some(ref mut m) = model {
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
+                    m.q35_sessions.clear();
+                    m.q35_active_session_id = if (m.arch_id == 5 || m.arch_id == 6) && m.pp == 1 {
+                        Some(QWEN35_LEGACY_SESSION_ID.to_string())
+                    } else {
+                        None
+                    };
                     // Multi-GPU branch: route per-LA-layer memsets through
                     // pp_dn_la_to_device so each buffer is zeroed on its
                     // owning device. The single-GPU `gpu` parameter is left
@@ -3171,6 +3768,10 @@ fn load_model(
             q35_scratch: None,
             kv_cache: None,
             dn_state: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_sessions: std::collections::HashMap::new(),
+            q35_active_session_id: None,
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
@@ -3256,6 +3857,10 @@ fn load_model(
             q35_scratch: None,
             kv_cache: None,
             dn_state: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_sessions: std::collections::HashMap::new(),
+            q35_active_session_id: None,
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
@@ -3362,6 +3967,10 @@ fn load_model(
             q35_scratch: None,
             kv_cache: None,
             dn_state: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_sessions: std::collections::HashMap::new(),
+            q35_active_session_id: None,
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
@@ -3474,6 +4083,10 @@ fn load_model(
             q35_scratch: None,
             kv_cache: None,
             dn_state: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_sessions: std::collections::HashMap::new(),
+            q35_active_session_id: None,
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
@@ -3599,6 +4212,10 @@ fn load_model(
                 q35_scratch: None,
                 kv_cache: None,
                 dn_state: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_sessions: std::collections::HashMap::new(),
+            q35_active_session_id: None,
                 llama_config: None,
                 llama_weights: None,
                 llama_scratch: None,
@@ -3924,6 +4541,10 @@ fn load_model(
             q35_scratch: Some(scratch),
             kv_cache: Some(kv),
             dn_state: Some(dn),
+            q35_kv_mode: Some(kv_mode.clone()),
+            q35_state_quant: Some(dn_quant),
+            q35_sessions: std::collections::HashMap::new(),
+            q35_active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
@@ -3999,6 +4620,10 @@ fn load_model(
             q35_scratch: None,
             kv_cache: None,
             dn_state: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_sessions: std::collections::HashMap::new(),
+            q35_active_session_id: None,
             llama_config: Some(config),
             llama_weights: Some(weights),
             llama_scratch: Some(scratch),
@@ -4165,6 +4790,10 @@ fn load_model_safetensors(
             dots_ocr_weights: None,
             kv_cache: None,
             dn_state: None,
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_sessions: std::collections::HashMap::new(),
+            q35_active_session_id: None,
             llama_config: Some(config),
             llama_weights: Some(weights),
             llama_scratch: Some(scratch),
@@ -4272,6 +4901,10 @@ fn load_model_safetensors(
         dots_ocr_weights: None,
         kv_cache: Some(kv_cache),
         dn_state: Some(dn_state),
+        q35_kv_mode: Some(kv_mode.to_string()),
+        q35_state_quant: Some(hipfire_arch_qwen35::qwen35::StateQuant::Q8),
+        q35_sessions: std::collections::HashMap::new(),
+        q35_active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
         llama_config: None,
         llama_weights: None,
         llama_scratch: None,
@@ -4520,6 +5153,10 @@ fn load_model_pp(
         q35_scratch: None,
         kv_cache: Some(kv),
         dn_state: Some(dn),
+            q35_kv_mode: None,
+            q35_state_quant: None,
+            q35_sessions: std::collections::HashMap::new(),
+            q35_active_session_id: None,
         llama_config: None,
         llama_weights: None,
         llama_scratch: None,
@@ -6353,6 +6990,7 @@ fn generate(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
+    prefill_already_done: bool,
 ) {
     // Seed the process-global CPU sampler RNG for this request. CPU fallback and
     // grammar/VL-style sampling should not inherit RNG state from prior requests.
@@ -6381,6 +7019,7 @@ fn generate(
             pflash_cfg,
             tools,
             messages_history,
+            prefill_already_done,
         );
         generate_qwen2(
             m,
@@ -6540,6 +7179,23 @@ fn generate(
             assistant_prefix,
             hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
         );
+    if prefill_already_done && m.dflash.is_some() {
+        write_error(
+            stdout,
+            id,
+            "prefill_already_done is not supported on DFlash-loaded models",
+        );
+        return;
+    }
+    if prefill_already_done && pflash_state.is_some() {
+        write_error(
+            stdout,
+            id,
+            "prefill_already_done is not supported when PFlash state is loaded",
+        );
+        return;
+    }
+
     if m.dflash.is_some()
         && temp <= 1e-6
         && (m.arch_id == 5 || m.arch_id == 6)
@@ -6613,7 +7269,10 @@ fn generate(
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
     let current_seq_pos = q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos);
-    if m.eviction.is_none() && current_seq_pos + prompt_est + max_tokens > m.max_seq {
+    if !prefill_already_done
+        && m.eviction.is_none()
+        && current_seq_pos + prompt_est + max_tokens > m.max_seq
+    {
         eprintln!(
             "[daemon] context full ({}/{}) — resetting conversation",
             current_seq_pos, m.max_seq
@@ -6845,7 +7504,11 @@ fn generate(
     // `<think></think>` block after the assistant prefix). Each path
     // picks up the signal it needs.
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-    let seq_pos_for_prompt = q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos);
+    let seq_pos_for_prompt = if prefill_already_done {
+        0
+    } else {
+        q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos)
+    };
     let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
@@ -6933,19 +7596,24 @@ fn generate(
     // overflow it in absolute position terms (current absolute + new).
     let trailer = nl.len();
     let current_seq_pos = q35_session.as_ref().map(|s| s.seq_pos).unwrap_or(m.seq_pos);
+    let budget_prefill_tokens = if prefill_already_done {
+        0
+    } else {
+        new_tokens.len()
+    };
     let absolute_pos = if let Some(session) = q35_session.as_ref() {
         session.seq_pos + session.kv_cache.compact_offset
     } else {
         m.seq_pos + m.llama_kv.as_ref().map(|kv| kv.compact_offset).unwrap_or(0)
     };
     if m.eviction.is_none() {
-        if current_seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
+        if current_seq_pos + budget_prefill_tokens + max_tokens + trailer > m.physical_cap {
             let _ = writeln!(
                 stdout,
                 r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq"}}"#,
                 id,
                 current_seq_pos,
-                new_tokens.len(),
+                budget_prefill_tokens,
                 max_tokens,
                 trailer,
                 m.physical_cap
@@ -6956,13 +7624,13 @@ fn generate(
             }
             return;
         }
-    } else if absolute_pos + new_tokens.len() + max_tokens + trailer > m.max_seq {
+    } else if absolute_pos + budget_prefill_tokens + max_tokens + trailer > m.max_seq {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"request exceeds advertised context window: absolute={} + prefill={} + max_tokens={} + trailer={} > max_seq={}"}}"#,
             id,
             absolute_pos,
-            new_tokens.len(),
+            budget_prefill_tokens,
             max_tokens,
             trailer,
             m.max_seq
@@ -7005,6 +7673,22 @@ fn generate(
         // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
         // continuing from session.seq_pos (KV cache + DeltaNet state are cumulative)
         let mut session = q35_session.take().expect("qwen35 request session state");
+        if prefill_already_done {
+            let current_position = session.seq_pos + session.kv_cache.compact_offset;
+            if current_position != new_tokens.len() {
+                write_error(
+                    stdout,
+                    id,
+                    &format!(
+                        "prefill_already_done requested but active session position {} does not match prompt token count {}",
+                        current_position,
+                        new_tokens.len()
+                    ),
+                );
+                session.restore_into_loaded(m);
+                return;
+            }
+        }
         let config = m.q35_config.as_ref().unwrap();
         let weights = m.q35_weights.as_ref().unwrap();
         let scratch = m.q35_scratch.as_ref().unwrap();
@@ -7030,18 +7714,45 @@ fn generate(
         // physical_cap. Chunk size caps out at physical capacity available —
         // when physical is at post-evict `budget`, a full `beta`-sized chunk
         // can run before the next eviction fires.
-        if let Some(ref ev) = m.eviction {
-            let window = ev.budget() + ev.beta();
-            let mut remaining: &[u32] = &new_tokens;
-            while !remaining.is_empty() {
-                let space = window.saturating_sub(session.seq_pos).max(1);
-                let chunk_len = remaining.len().min(space);
-                let (chunk, rest) = remaining.split_at(chunk_len);
+        if !prefill_already_done {
+            if let Some(ref ev) = m.eviction {
+                let window = ev.budget() + ev.beta();
+                let mut remaining: &[u32] = &new_tokens;
+                while !remaining.is_empty() {
+                    let space = window.saturating_sub(session.seq_pos).max(1);
+                    let chunk_len = remaining.len().min(space);
+                    let (chunk, rest) = remaining.split_at(chunk_len);
+                    qwen35::forward_prefill_batch(
+                        gpu,
+                        weights,
+                        config,
+                        chunk,
+                        session.seq_pos,
+                        kv,
+                        dn,
+                        scratch,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    session.seq_pos += chunk_len;
+                    if let Some(hipfire_runtime::triattn::EvictionResult {
+                        new_physical: new_phys,
+                        ..
+                    }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
+                    {
+                        session.seq_pos = new_phys;
+                    }
+                    remaining = rest;
+                }
+            } else {
                 qwen35::forward_prefill_batch(
                     gpu,
                     weights,
                     config,
-                    chunk,
+                    &new_tokens,
                     session.seq_pos,
                     kv,
                     dn,
@@ -7052,35 +7763,10 @@ fn generate(
                     None,
                 )
                 .unwrap();
-                session.seq_pos += chunk_len;
-                if let Some(hipfire_runtime::triattn::EvictionResult {
-                    new_physical: new_phys,
-                    ..
-                }) = ev.maybe_evict(gpu, kv, session.seq_pos).unwrap()
-                {
-                    session.seq_pos = new_phys;
-                }
-                remaining = rest;
+                session.seq_pos += new_tokens.len();
             }
-        } else {
-            qwen35::forward_prefill_batch(
-                gpu,
-                weights,
-                config,
-                &new_tokens,
-                session.seq_pos,
-                kv,
-                dn,
-                scratch,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-            session.seq_pos += new_tokens.len();
+            session.conversation_tokens.extend_from_slice(&new_tokens);
         }
-        session.conversation_tokens.extend_from_slice(&new_tokens);
 
         // ngram scope for the repeat penalty: ONLY generated tokens (never the
         // prompt). Prior design included the user's prompt as an anti-loop

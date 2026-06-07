@@ -1735,7 +1735,11 @@ async function serve(port: number, host: string) {
     console.error(
       `[hipfire] generate_batch_prefill capability=${generateBatchPrefillCapability} reason=${generateBatchPrefillCapabilityReason}`,
     );
-    if (generateBatchPrefillCapability !== "supported") {
+    if (generateBatchPrefillCapability === "supported") {
+      console.error(
+        "[hipfire] daemon generate_batch_prefill serial prefill is available; server dispatch is enabled for single selected sessions (multi-session queue-worker dispatch pending)",
+      );
+    } else {
       console.error(
         "[hipfire] server prefill batching runtime dispatch is SKIPPED until daemon adds generate_batch_prefill execution with session state handles",
       );
@@ -3152,7 +3156,10 @@ async function serve(port: number, host: string) {
           fallbackReason = `selected_for_dispatch:${queuePreviewReason}`;
           lastPrefillQueueWaitReason = queuePreviewReason;
           lastPrefillFallbackReason = fallbackReason;
-          lastPrefillRuntimeDispatchSkippedReason = runtimeDispatchSkippedReason;
+          lastPrefillRuntimeDispatchSkippedReason = prefillBatchRuntimeDispatchStatus(
+            true,
+            generateBatchPrefillCapability,
+          ).runtimeDispatchReason;
           lastSelectedBatchSize = selectedBatchSize;
         } else {
           fallbackReason = `queue_wait:${queuePreviewReason}`;
@@ -3263,9 +3270,7 @@ async function serve(port: number, host: string) {
             generateBatchPrefillCapability,
           );
           const runtimeDispatch = runtimeDispatchStatus.runtimeDispatch;
-          runtimeDispatchSkippedReason = runtimeDispatch === "available_serial_fallback"
-            ? "not_skipped"
-            : runtimeDispatchStatus.runtimeDispatchReason;
+          runtimeDispatchSkippedReason = runtimeDispatchStatus.runtimeDispatchReason;
           const runtimeDispatchReason = prefillBatchGate.eligible
             ? runtimeDispatchStatus.runtimeDispatchReason
             : prefillBatchGate.reason;
@@ -3375,6 +3380,97 @@ async function serve(port: number, host: string) {
         const structuredMessages = mapMessagesToStructured(messages);
         if (structuredMessages.length > 0) {
           genParams.messages = structuredMessages;
+        }
+
+        if (
+          serverPrefillBatch.enabled &&
+          selectedForPrefillBatch &&
+          serverPrefillSession &&
+          generateBatchPrefillCapability === "supported"
+        ) {
+          if (selectedBatchSize === 1) {
+            const runtimeBatchId = `prefill-${reqId}`;
+            const sessionParams: any = {
+              max_tokens: requestMaxTokens,
+              temperature: genParams.temperature,
+            };
+            if (genParams.assistant_prefix) sessionParams.assistant_prefix = genParams.assistant_prefix;
+            if (typeof genParams.max_think_tokens === "number") {
+              sessionParams.max_think_tokens = genParams.max_think_tokens;
+            }
+            try {
+              const prefillSession: any = {
+                id: reqId,
+                prompt: userPrompt,
+                state_handle: {
+                  state_kinds: [...serverPrefillSession.stateHandle.stateKinds],
+                  logical_position: 0,
+                  cached_prefix_tokens: 0,
+                },
+                params: sessionParams,
+              };
+              if (systemPrompt) prefillSession.system = systemPrompt;
+              if (Array.isArray(body.tools) && body.tools.length > 0) {
+                prefillSession.tools = body.tools;
+              }
+              if (structuredMessages.length > 0) {
+                prefillSession.messages = structuredMessages;
+              }
+
+              await e.send({
+                type: "generate_batch_prefill",
+                id: `${reqId}-prefill`,
+                batch_id: runtimeBatchId,
+                worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
+                model: current,
+                sessions: [prefillSession],
+              });
+
+              let prefillDone = false;
+              for (let i = 0; i < 8; i++) {
+                const prefillMsg = await e.recv();
+                if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === runtimeBatchId) {
+                  prefillDone = true;
+                  if (genParams.server_prefill_batch) {
+                    genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill";
+                    genParams.server_prefill_batch.runtime_dispatch_reason = "prefill_done_decode_continuation";
+                    genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "not_skipped";
+                    genParams.server_prefill_batch.daemon_prefill_tokens = prefillMsg.prefill_tokens;
+                    genParams.server_prefill_batch.daemon_prefill_ms = prefillMsg.elapsed_ms;
+                  }
+                  break;
+                }
+                if (prefillMsg?.type === "generate_batch_prefill_started" || prefillMsg?.type === "generate_batch_prefill_session_done") {
+                  continue;
+                }
+                if (prefillMsg?.type === "error") {
+                  throw new Error(prefillMsg.message || "generate_batch_prefill error");
+                }
+                if (prefillMsg?.type === "generate_batch_prefill_unsupported") {
+                  throw new Error(prefillMsg.reason || "generate_batch_prefill unsupported");
+                }
+                throw new Error(`unexpected generate_batch_prefill response: ${prefillMsg?.type ?? "missing"}`);
+              }
+              if (!prefillDone) throw new Error("generate_batch_prefill did not complete");
+              genParams.session_id = reqId;
+              genParams.prefill_already_done = true;
+              lastPrefillRuntimeDispatchSkippedReason = "not_skipped";
+            } catch (err: any) {
+              const reason = err?.message ?? "daemon_serial_prefill_failed";
+              if (genParams.server_prefill_batch) {
+                genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill_failed";
+                genParams.server_prefill_batch.runtime_dispatch_reason = reason;
+                genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "daemon_serial_prefill_failed";
+              }
+              lastPrefillRuntimeDispatchSkippedReason = "daemon_serial_prefill_failed";
+              console.error(`[hipfire] generate_batch_prefill failed; falling back to generate: ${reason}`);
+            }
+          } else if (genParams.server_prefill_batch) {
+            genParams.server_prefill_batch.runtime_dispatch = "cli_multi_session_batch_dispatch_not_enabled";
+            genParams.server_prefill_batch.runtime_dispatch_reason = "selected_batch_size_gt_1_requires_async_queue_worker";
+            genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "cli_multi_session_batch_dispatch_not_enabled";
+            lastPrefillRuntimeDispatchSkippedReason = "cli_multi_session_batch_dispatch_not_enabled";
+          }
         }
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>

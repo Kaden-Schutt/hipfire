@@ -78,8 +78,8 @@ export function prefillBatchRuntimeDispatchStatus(
   }
   if (capability === "supported") {
     return {
-      runtimeDispatch: "available_serial_fallback",
-      runtimeDispatchReason: "execution_path_not_enabled",
+      runtimeDispatch: "daemon_serial_prefill_available",
+      runtimeDispatchReason: "single_session_dispatch_enabled",
     };
   }
   return {

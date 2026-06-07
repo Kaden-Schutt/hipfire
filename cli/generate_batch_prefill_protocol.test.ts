@@ -28,7 +28,7 @@ describe("generate_batch_prefill protocol probe", () => {
     });
   });
 
-  test("detects daemon scaffold as known but unsupported", () => {
+  test("detects old daemon scaffold as known but unsupported", () => {
     expect(interpretGenerateBatchPrefillProbeResponse({
       type: "generate_batch_prefill_unsupported",
       id: "prefill-batch-probe",
@@ -51,13 +51,13 @@ describe("generate_batch_prefill protocol probe", () => {
     });
   });
 
-  test("recognizes future supported daemon responses", () => {
+  test("recognizes daemon serial-prefill support", () => {
     expect(interpretGenerateBatchPrefillProbeResponse({
       type: "generate_batch_prefill_ready",
-      reason: "ready",
+      reason: "qwen35_serial_exact_token_prefill_available",
     })).toEqual({
       capability: "supported",
-      reason: "ready",
+      reason: "qwen35_serial_exact_token_prefill_available",
     });
   });
 });
@@ -84,10 +84,10 @@ describe("generate_batch_prefill serialized fallback metadata", () => {
     });
   });
 
-  test("still reports serial fallback for future supported daemons", () => {
+  test("reports daemon serial-prefill support for single-session dispatch", () => {
     expect(prefillBatchRuntimeDispatchStatus(true, "supported")).toEqual({
-      runtimeDispatch: "available_serial_fallback",
-      runtimeDispatchReason: "execution_path_not_enabled",
+      runtimeDispatch: "daemon_serial_prefill_available",
+      runtimeDispatchReason: "single_session_dispatch_enabled",
     });
   });
 });
