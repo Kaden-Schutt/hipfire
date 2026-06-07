@@ -156,7 +156,10 @@ def main():
             for e in range(n_exp):
                 split[f"{pre}mlp.experts.{e}.down_proj.weight"] = t[e].contiguous()
         else:
-            split[name] = t  # attn / norms / router / dense MLP / embed / lm_head
+            # .clone() breaks tied-weight storage sharing (lm_head ↔
+            # embed_tokens), which safetensors.save_file refuses to serialize.
+            # The HFQ then carries lm_head + embed as distinct (identical) tensors.
+            split[name] = t.clone()  # attn / norms / router / dense MLP / embed / lm_head
 
     save_file(split, str(out / "model.safetensors"))
     print(f"re-split → {len(split)} tensors", flush=True)
