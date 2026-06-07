@@ -4296,6 +4296,7 @@ fn run_gguf_pipeline(
         "llama" => 0,
         "qwen3" | "qwen2" => 1,
         "qwen3moe" => 6,
+        "cohere2_moe" => 12,
         other => {
             eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
             0
@@ -4352,7 +4353,7 @@ fn run_gguf_pipeline(
     };
 
     // K-map setup for GGUF path
-    let is_moe = arch_id == 6;
+    let is_moe = arch_id == 6 || arch_id == 12;
     let n_layers: usize = config_json
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
@@ -5304,6 +5305,11 @@ fn main() {
         // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
         // per-expert) and are translated when the forward bring-up lands.
         "deepseek_v4" => 9,
+        // Cohere2Moe (CohereLabs BLS-Mini-Code): GQA + parallel decoder block,
+        // dense layer-0 (first_k_dense_replace) + 128-expert top-8 sigmoid MoE.
+        // Crate: hipfire-arch-cohere2moe. Routed experts ship split per-expert
+        // (mlp.experts.{e}.{gate,up,down}_proj) → standard 2D quant path.
+        "cohere2_moe" | "cohere2moe" => 12,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -5321,7 +5327,7 @@ fn main() {
     } else {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
-    let is_moe = arch_id == 6;
+    let is_moe = arch_id == 6 || arch_id == 12;
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
