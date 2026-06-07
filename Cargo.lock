@@ -139,6 +139,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-cohere2moe"
+version = "0.1.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-deepseek4"
 version = "0.2.0"
 dependencies = [
