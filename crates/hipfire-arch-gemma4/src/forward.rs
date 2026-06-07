@@ -56,8 +56,8 @@
 
 use crate::config::{Gemma4Config, LayerType, RopeType};
 use crate::gemma4::{FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, SlidingLayerWeights};
-use hipfire_runtime::llama::{weight_gemv, KvCache};
-use rdna_compute::{DType, Gpu};
+use hipfire_runtime::llama::{rotate_x_mq_batched_for, weight_gemv, KvCache, WeightTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Master switch for the qwen35-mirror fused-projection FFN path
 /// (`fused_rmsnorm_rotate_mq` + `fused_gate_up_hfq4g256`). Default ON; opt out
@@ -703,6 +703,607 @@ fn finish_attn_and_ffn(
     if tail.layer_scalar_host != 1.0 {
         gpu.scale_f32(&state.x, tail.layer_scalar_host)
             .map_err(|e| format!("gemma4: layer_scalar: {e:?}"))?;
+    }
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Batched verify forward — `forward_batch`
+// ════════════════════════════════════════════════════════════════════════
+//
+// Verifies B tokens [tokens[0..B]] starting at absolute position `start_pos`
+// in ONE pass (weights read once). The spec-decode keystone: returns the LAST
+// token's logits, byte/argmax-identical to running B sequential `decode_step`
+// calls, and leaves the two KV caches in the same state the sequential path
+// would (so attention over history is correct for the next token).
+//
+// Structure mirrors the eager `decode_step_body` exactly, batched across B:
+//   - embed lookup per token → x[B,dim] → ×√dim
+//   - per layer (sliding / full), the same sandwich-norm + dual-RoPE +
+//     k_eq_v pipeline, batched
+//   - attention via `attention_q8_0_kv_batched_masked` with a per-row
+//     causal+sliding-window additive mask ([B × seq_len], 0 = visible,
+//     -inf = masked); block_start=0, block_cols=seq_len gives full per-row
+//     control for BOTH layer types
+//   - last row → final norm → tied lm_head → logit_softcap(30) → return logits
+//
+// ADDITIVE: does not touch `decode_step` / `decode_step_with_graph`. The eager
+// path is unchanged.
+
+/// One projection GEMM, batched, dispatched by weight dtype. Mirrors the
+/// dtypes `weight_gemv` handles on the gemma4 weight set:
+///   - Q8_0      → `gemm_q8_0_batched` (no rotation)
+///   - F32       → `gemm_q8_0_batched` would be wrong; F32 weights are only
+///                 produced for tiny norm-like tensors, never projections here,
+///                 so this is an error (projections are Q8/MQ4 in both HFQs).
+///   - MQ4G256   → FWHT-rotate x (batched) then `gemm_hfq4g256_batched_lmhead`
+///                 (MQ4G256 bytes are HFQ4G256-compatible given a pre-rotated
+///                 input — same equivalence the eager fused FFN path relies on).
+///
+/// `x` is [B, k] row-major, `y` is [B, m] row-major. `x_rot` is a [B, k]
+/// scratch used only on the MQ4 path. Both buffers must be ≥ the needed size.
+#[allow(clippy::too_many_arguments)]
+fn proj_gemm_batched(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    x_rot: &GpuTensor,
+    b: usize,
+    label: &str,
+) -> Result<(), String> {
+    match w.gpu_dtype {
+        DType::Q8_0 => gpu
+            .gemm_q8_0_batched(&w.buf, x, y, w.m, w.k, b)
+            .map_err(|e| format!("gemma4 batch {label} (q8): {e:?}")),
+        DType::MQ4G256 | DType::HFQ4G256 => {
+            // FWHT-rotate the shared input once, then run the prerotated GEMM.
+            // rotate_x_mq_batched_for handles the AWQ-aware branch (no-op AWQ
+            // on these HFQs → plain rotate_x_mq_batched).
+            rotate_x_mq_batched_for(gpu, w, x, x_rot, w.k, b)
+                .map_err(|e| format!("gemma4 batch {label} rotate: {e:?}"))?;
+            gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
+                .map_err(|e| format!("gemma4 batch {label} (mq4): {e:?}"))
+        }
+        other => Err(format!(
+            "gemma4 batch {label}: dtype {other:?} has no batched proj kernel"
+        )),
+    }
+}
+
+/// Batched verify forward. See module-level note above. `tokens.len()` = B
+/// (1..=64, the `gemm_q8_0_batched` / batched-attention kernel cap). Returns
+/// the LAST token's logits. Side effect: writes both KV caches for positions
+/// [start_pos, start_pos+B) and sets `state.n_tokens = start_pos + B`.
+pub fn forward_batch(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    start_pos: usize,
+) -> Result<Vec<f32>, String> {
+    let b = tokens.len();
+    if b == 0 {
+        return Err("gemma4 forward_batch: empty token slice".to_string());
+    }
+    if b > 64 {
+        return Err(format!("gemma4 forward_batch: B={b} exceeds kernel cap 64"));
+    }
+    let dim = cfg.dim;
+    let eps = cfg.norm_eps;
+    let ffn_hd = cfg.hidden_dim;
+    let max_q = cfg.max_q_dim();
+    let max_kv = cfg.max_kv_dim();
+    // seq_len after this batch = absolute positions [start_pos, start_pos+B).
+    let seq_len = start_pos + b;
+
+    let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
+        g.alloc_tensor(&[n], DType::F32)
+            .map_err(|e| format!("gemma4 forward_batch alloc {label}: {e:?}"))
+    };
+
+    // ── Batched scratch (per call; verify is not the hot per-kernel loop). ──
+    let x = alloc(gpu, b * dim, "x")?;
+    let residual = alloc(gpu, b * dim, "residual")?;
+    let nrm = alloc(gpu, b * dim, "nrm")?; // rmsnorm output / shared proj input
+    let x_rot = alloc(gpu, b * dim, "x_rot")?; // FWHT scratch (MQ4 proj path)
+    let q = alloc(gpu, b * max_q, "q")?;
+    let k = alloc(gpu, b * max_kv, "k")?;
+    let v = alloc(gpu, b * max_kv, "v")?;
+    let attn_out = alloc(gpu, b * max_q, "attn_out")?;
+    let o = alloc(gpu, b * dim, "o")?;
+    let gate_ffn = alloc(gpu, b * ffn_hd, "gate_ffn")?;
+    let up_ffn = alloc(gpu, b * ffn_hd, "up_ffn")?;
+    let ffn_hidden = alloc(gpu, b * ffn_hd, "ffn_hidden")?;
+    let ffn_out = alloc(gpu, b * dim, "ffn_out")?;
+    // FFN rotation scratch must hold B*ffn_hd for the down_proj input.
+    let ffn_rot = alloc(gpu, b * ffn_hd, "ffn_rot")?;
+
+    // positions [B] i32 (kernels read this buffer as i32).
+    let pos_data: Vec<i32> = (0..b).map(|i| (start_pos + i) as i32).collect();
+    let pos_bytes: Vec<u8> = pos_data.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    let pos_array = alloc(gpu, b, "pos_array")?;
+    gpu.hip
+        .memcpy_htod(&pos_array.buf, &pos_bytes)
+        .map_err(|e| format!("gemma4 forward_batch htod pos: {e:?}"))?;
+
+    // ── Per-row attention mask [B × seq_len]: 0.0 = visible, -inf = masked. ──
+    // Built per layer type (sliding has a window; full is plain causal). Two
+    // host masks are uploaded to two device buffers and reused across layers of
+    // the matching type. block_start=0, block_cols=seq_len so the kernel applies
+    // the bias to every key (full per-row control).
+    let build_mask = |window: usize| -> Vec<f32> {
+        let mut m = vec![0.0f32; b * seq_len];
+        for row in 0..b {
+            let pos = start_pos + row; // absolute query position
+            let lo = if window > 0 {
+                pos.saturating_sub(window - 1)
+            } else {
+                0
+            };
+            for t in 0..seq_len {
+                // Visible iff lo <= t <= pos (causal + optional sliding window).
+                let visible = t >= lo && t <= pos;
+                m[row * seq_len + t] = if visible { 0.0 } else { f32::NEG_INFINITY };
+            }
+        }
+        m
+    };
+    let upload_mask = |g: &mut Gpu, host: &[f32], label: &str| -> Result<GpuTensor, String> {
+        let t = g
+            .alloc_tensor(&[host.len()], DType::F32)
+            .map_err(|e| format!("gemma4 forward_batch mask alloc {label}: {e:?}"))?;
+        let bytes =
+            unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4) };
+        g.hip
+            .memcpy_htod(&t.buf, bytes)
+            .map_err(|e| format!("gemma4 forward_batch mask htod {label}: {e:?}"))?;
+        Ok(t)
+    };
+    let has_sliding = cfg.layer_types.iter().any(|&t| t == LayerType::Sliding);
+    let has_full = cfg.layer_types.iter().any(|&t| t == LayerType::Full);
+    let sliding_mask = if has_sliding {
+        Some(upload_mask(gpu, &build_mask(cfg.sliding_window), "sliding")?)
+    } else {
+        None
+    };
+    let full_mask = if has_full {
+        Some(upload_mask(gpu, &build_mask(0), "full")?)
+    } else {
+        None
+    };
+
+    // ── Embedding: per-token lookup into x[B,dim], then ×√dim over all rows. ──
+    {
+        let x_single = alloc(gpu, dim, "x_single")?;
+        for (i, &tok) in tokens.iter().enumerate() {
+            embed_lookup_row(cfg, weights, gpu, &x_single, tok)?;
+            gpu.hip
+                .memcpy_dtod_at(&x.buf, i * dim * 4, &x_single.buf, 0, dim * 4)
+                .map_err(|e| format!("gemma4 forward_batch embed copy: {e:?}"))?;
+        }
+        gpu.free_tensor(x_single).ok();
+    }
+    // √dim scale on the whole [B*dim] buffer (uniform — matches eager scale_f32).
+    gpu.scale_f32(&x, cfg.embed_scale)
+        .map_err(|e| format!("gemma4 forward_batch embed scale: {e:?}"))?;
+
+    for layer_idx in 0..cfg.n_layers {
+        let slot = state.kv_slot_for_layer[layer_idx];
+        match (cfg.layer_types[layer_idx], &weights.layers[layer_idx]) {
+            (LayerType::Sliding, LayerWeights::Sliding(lw)) => {
+                let hd = cfg.sliding_head_dim;
+                let n_kv = cfg.sliding_n_kv_heads;
+                batch_attn_block(
+                    gpu,
+                    cfg,
+                    state,
+                    BatchAttn {
+                        b,
+                        hd,
+                        n_kv,
+                        slot,
+                        seq_len,
+                        is_full: false,
+                        rope: RopeKind::Full(cfg.sliding_rope_theta),
+                        q_proj: &lw.q_proj,
+                        k_proj: &lw.k_proj,
+                        v_proj: Some(&lw.v_proj),
+                        o_proj: &lw.o_proj,
+                        q_norm: &lw.q_norm,
+                        k_norm: &lw.k_norm,
+                        input_layernorm: &lw.input_layernorm,
+                        post_attention_layernorm: &lw.post_attention_layernorm,
+                        mask: sliding_mask.as_ref().unwrap(),
+                    },
+                    &x,
+                    &residual,
+                    &nrm,
+                    &x_rot,
+                    &q,
+                    &k,
+                    &v,
+                    &attn_out,
+                    &o,
+                    &pos_array,
+                )?;
+                batch_ffn_block(
+                    gpu,
+                    cfg,
+                    state,
+                    &lw_common_sliding(lw),
+                    b,
+                    &x,
+                    &residual,
+                    &nrm,
+                    &gate_ffn,
+                    &up_ffn,
+                    &ffn_hidden,
+                    &ffn_out,
+                    &ffn_rot,
+                )?;
+            }
+            (LayerType::Full, LayerWeights::Full(lw)) => {
+                let hd = cfg.full_head_dim;
+                let n_kv = cfg.full_n_kv_heads;
+                let n_rot_pairs = match cfg.full_rope_type {
+                    RopeType::Proportional => {
+                        ((hd as f32) * cfg.full_partial_rotary_factor * 0.5) as usize
+                    }
+                    RopeType::Default => hd / 2,
+                };
+                batch_attn_block(
+                    gpu,
+                    cfg,
+                    state,
+                    BatchAttn {
+                        b,
+                        hd,
+                        n_kv,
+                        slot,
+                        seq_len,
+                        is_full: true,
+                        rope: RopeKind::PartialHalved(cfg.full_rope_theta, n_rot_pairs),
+                        q_proj: &lw.q_proj,
+                        k_proj: &lw.k_proj,
+                        v_proj: lw.v_proj.as_ref(),
+                        o_proj: &lw.o_proj,
+                        q_norm: &lw.q_norm,
+                        k_norm: &lw.k_norm,
+                        input_layernorm: &lw.input_layernorm,
+                        post_attention_layernorm: &lw.post_attention_layernorm,
+                        mask: full_mask.as_ref().unwrap(),
+                    },
+                    &x,
+                    &residual,
+                    &nrm,
+                    &x_rot,
+                    &q,
+                    &k,
+                    &v,
+                    &attn_out,
+                    &o,
+                    &pos_array,
+                )?;
+                batch_ffn_block(
+                    gpu,
+                    cfg,
+                    state,
+                    &lw_common_full(lw),
+                    b,
+                    &x,
+                    &residual,
+                    &nrm,
+                    &gate_ffn,
+                    &up_ffn,
+                    &ffn_hidden,
+                    &ffn_out,
+                    &ffn_rot,
+                )?;
+            }
+            _ => return Err(format!("gemma4 forward_batch L{layer_idx} type/weights mismatch")),
+        }
+    }
+    state.n_tokens = start_pos + b;
+
+    // ── Final RMSNorm + tied lm_head on the LAST row only (verify needs the
+    //    last position's logits). ──
+    let x_last = alloc(gpu, dim, "x_last")?;
+    gpu.hip
+        .memcpy_dtod_at(&x_last.buf, 0, &x.buf, (b - 1) * dim * 4, dim * 4)
+        .map_err(|e| format!("gemma4 forward_batch last copy: {e:?}"))?;
+    gpu.rmsnorm_f32(&x_last, &weights.final_norm, &state.tmp, eps)
+        .map_err(|e| format!("gemma4 forward_batch final rmsnorm: {e:?}"))?;
+    weight_gemv(gpu, &weights.lm_head, &state.tmp, &state.logits)
+        .map_err(|e| format!("gemma4 forward_batch lm_head: {e}"))?;
+    if cfg.final_logit_softcapping > 0.0 {
+        gpu.logit_softcap_f32(&state.logits, cfg.vocab_size, cfg.final_logit_softcapping)
+            .map_err(|e| format!("gemma4 forward_batch logit softcap: {e:?}"))?;
+    }
+    let logits = gpu
+        .download_f32(&state.logits)
+        .map_err(|e| format!("gemma4 forward_batch download logits: {e:?}"))?;
+
+    // Free batched scratch.
+    let mut frees = vec![
+        x, residual, nrm, x_rot, q, k, v, attn_out, o, gate_ffn, up_ffn, ffn_hidden, ffn_out,
+        ffn_rot, pos_array, x_last,
+    ];
+    if let Some(m) = sliding_mask {
+        frees.push(m);
+    }
+    if let Some(m) = full_mask {
+        frees.push(m);
+    }
+    for t in frees {
+        gpu.free_tensor(t).ok();
+    }
+    Ok(logits)
+}
+
+/// Embedding lookup for one token into a [dim] buffer (no √dim scale — the
+/// caller applies it once over the whole batch). Mirrors `embed_lookup`'s
+/// format dispatch.
+fn embed_lookup_row(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    gpu: &mut Gpu,
+    dst: &GpuTensor,
+    token_id: u32,
+) -> Result<(), String> {
+    use hipfire_runtime::llama::EmbeddingFormat;
+    let dim = cfg.dim;
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => gpu
+            .embedding_lookup_hfq4g256(&weights.embed_tokens, dst, token_id, dim)
+            .map_err(|e| format!("gemma4 forward_batch embed hfq4g256: {e:?}")),
+        EmbeddingFormat::HFQ4G128 => gpu
+            .embedding_lookup_hfq4g128(&weights.embed_tokens, dst, token_id, dim)
+            .map_err(|e| format!("gemma4 forward_batch embed hfq4g128: {e:?}")),
+        EmbeddingFormat::Q8_0 => gpu
+            .embedding_lookup_q8(&weights.embed_tokens, dst, token_id, dim)
+            .map_err(|e| format!("gemma4 forward_batch embed q8: {e:?}")),
+        EmbeddingFormat::F32 => gpu
+            .embedding_lookup(&weights.embed_tokens, dst, token_id, dim)
+            .map_err(|e| format!("gemma4 forward_batch embed f32: {e:?}")),
+        EmbeddingFormat::Q4K => Err("gemma4 forward_batch: Q4K embedding unsupported".to_string()),
+    }
+}
+
+/// RoPE flavour for a batched layer.
+enum RopeKind {
+    /// Full rotate-half over the whole head_dim (sliding layers). theta.
+    Full(f32),
+    /// Partial proportional rotate-half (full layers). (theta, n_rot_pairs).
+    PartialHalved(f32, usize),
+}
+
+/// Bundled batched-attention inputs for one layer (keeps arg count sane).
+struct BatchAttn<'a> {
+    b: usize,
+    hd: usize,
+    n_kv: usize,
+    slot: usize,
+    seq_len: usize,
+    is_full: bool,
+    rope: RopeKind,
+    q_proj: &'a WeightTensor,
+    k_proj: &'a WeightTensor,
+    v_proj: Option<&'a WeightTensor>,
+    o_proj: &'a WeightTensor,
+    q_norm: &'a GpuTensor,
+    k_norm: &'a GpuTensor,
+    input_layernorm: &'a GpuTensor,
+    post_attention_layernorm: &'a GpuTensor,
+    mask: &'a GpuTensor,
+}
+
+/// Batched attention sub-block: residual save, input rmsnorm, q/k/v proj,
+/// q/k/v norms, q-scale, RoPE, KV write, masked attention, o_proj, residual
+/// add. Mirrors `sliding_layer_decode` / `full_layer_decode` (attention half)
+/// batched across B. On exit `x += o_proj(attn)` per row.
+#[allow(clippy::too_many_arguments)]
+fn batch_attn_block(
+    gpu: &mut Gpu,
+    cfg: &Gemma4Config,
+    state: &mut Gemma4State,
+    a: BatchAttn,
+    x: &GpuTensor,
+    residual: &GpuTensor,
+    nrm: &GpuTensor,
+    x_rot: &GpuTensor,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    attn_out: &GpuTensor,
+    o: &GpuTensor,
+    pos_array: &GpuTensor,
+) -> Result<(), String> {
+    let b = a.b;
+    let dim = cfg.dim;
+    let hd = a.hd;
+    let n_heads = cfg.n_heads;
+    let n_kv = a.n_kv;
+    let eps = cfg.norm_eps;
+    let kv_dim = n_kv * hd;
+
+    // residual = x
+    gpu.hip
+        .memcpy_dtod_at(&residual.buf, 0, &x.buf, 0, b * dim * 4)
+        .map_err(|e| format!("gemma4 batch attn save residual: {e:?}"))?;
+
+    // n1 = input_layernorm(x) → nrm. (per-row, batch over B)
+    gpu.rmsnorm_batched(x, a.input_layernorm, nrm, b, dim, eps)
+        .map_err(|e| format!("gemma4 batch attn input rmsnorm: {e:?}"))?;
+
+    // q / k projections (shared nrm input).
+    proj_gemm_batched(gpu, a.q_proj, nrm, q, x_rot, b, "q_proj")?;
+    proj_gemm_batched(gpu, a.k_proj, nrm, k, x_rot, b, "k_proj")?;
+
+    // V:
+    //   full + attention_k_eq_v (v_proj None): V = K's PRE-k_norm output
+    //     (copy whole batched K → V before k_norm). Else: V = v_proj(nrm).
+    match a.v_proj {
+        Some(vw) => {
+            proj_gemm_batched(gpu, vw, nrm, v, x_rot, b, "v_proj")?;
+        }
+        None => {
+            gpu.hip
+                .memcpy_dtod_at(&v.buf, 0, &k.buf, 0, b * kv_dim * 4)
+                .map_err(|e| format!("gemma4 batch attn k→v copy: {e:?}"))?;
+        }
+    }
+
+    // Per-head q_norm / k_norm over head_dim (batch over B*heads), weight-less
+    // V norm (ones). The flat [B, heads, head_dim] layout makes B*heads rows.
+    gpu.rmsnorm_batched(q, a.q_norm, q, b * n_heads, hd, eps)
+        .map_err(|e| format!("gemma4 batch attn q_norm: {e:?}"))?;
+    gpu.rmsnorm_batched(k, a.k_norm, k, b * n_kv, hd, eps)
+        .map_err(|e| format!("gemma4 batch attn k_norm: {e:?}"))?;
+    gpu.rmsnorm_batched(v, &state.v_norm_ones, v, b * n_kv, hd, eps)
+        .map_err(|e| format!("gemma4 batch attn v_norm: {e:?}"))?;
+
+    // Pre-scale Q by √head_dim (cancels the kernel's 1/√head_dim).
+    gpu.scale_f32(q, (hd as f32).sqrt())
+        .map_err(|e| format!("gemma4 batch attn q scale: {e:?}"))?;
+
+    // RoPE (per-row positions).
+    match a.rope {
+        RopeKind::Full(theta) => {
+            gpu.rope_batched_f32(q, k, pos_array, n_heads, n_kv, hd, theta, b)
+                .map_err(|e| format!("gemma4 batch attn rope (full-rot): {e:?}"))?;
+        }
+        RopeKind::PartialHalved(theta, n_rot_pairs) => {
+            gpu.rope_partial_halved_f32_batched(
+                q, k, pos_array, n_heads, n_kv, hd, n_rot_pairs, theta, b,
+            )
+            .map_err(|e| format!("gemma4 batch attn rope (partial): {e:?}"))?;
+        }
+    }
+
+    // KV write (Q8) for all B positions.
+    let kv = if a.is_full {
+        &state.kv_full
+    } else {
+        &state.kv_sliding
+    };
+    let physical_cap = kv.physical_cap;
+    let k_cache = unsafe { kv.k_gpu[a.slot].buf.alias() };
+    let v_cache = unsafe { kv.v_gpu[a.slot].buf.alias() };
+    let k_cache_t = GpuTensor {
+        buf: k_cache,
+        shape: kv.k_gpu[a.slot].shape.clone(),
+        dtype: kv.k_gpu[a.slot].dtype,
+    };
+    let v_cache_t = GpuTensor {
+        buf: v_cache,
+        shape: kv.v_gpu[a.slot].shape.clone(),
+        dtype: kv.v_gpu[a.slot].dtype,
+    };
+    gpu.kv_cache_write_q8_0_batched(&k_cache_t, k, pos_array, n_kv, hd, b)
+        .map_err(|e| format!("gemma4 batch attn kv write k: {e:?}"))?;
+    gpu.kv_cache_write_q8_0_batched(&v_cache_t, v, pos_array, n_kv, hd, b)
+        .map_err(|e| format!("gemma4 batch attn kv write v: {e:?}"))?;
+
+    // Masked batched attention: tree-bias mode with block_start=0,
+    // block_cols=seq_len → the per-row mask is applied to EVERY key, giving
+    // exact causal+window control for both layer types. seq_len passed as
+    // max_ctx_len so the kernel's scores[] LDS slice is sized for the full
+    // context, and as block_cols so the bias index covers all keys.
+    gpu.attention_q8_0_kv_batched_masked(
+        q,
+        &k_cache_t,
+        &v_cache_t,
+        attn_out,
+        pos_array,
+        n_heads,
+        n_kv,
+        hd,
+        physical_cap,
+        a.seq_len,
+        b,
+        Some(a.mask),
+        0,
+        a.seq_len,
+    )
+    .map_err(|e| format!("gemma4 batch attn masked: {e:?}"))?;
+
+    // o_proj(attn_out) → o.  (Mirrors finish_attn_and_ffn's o_proj.)
+    proj_gemm_batched(gpu, a.o_proj, attn_out, o, x_rot, b, "o_proj")?;
+
+    // Sandwich post-attention norm (in-place on o), then x = residual + o.
+    gpu.rmsnorm_batched(o, a.post_attention_layernorm, o, b, dim, eps)
+        .map_err(|e| format!("gemma4 batch attn post_attn rmsnorm: {e:?}"))?;
+    gpu.hip
+        .memcpy_dtod_at(&x.buf, 0, &residual.buf, 0, b * dim * 4)
+        .map_err(|e| format!("gemma4 batch attn reset x: {e:?}"))?;
+    gpu.add_inplace_f32(x, o)
+        .map_err(|e| format!("gemma4 batch attn residual add: {e:?}"))?;
+    Ok(())
+}
+
+/// Batched FFN sub-block. On entry `x` holds the post-attention residual
+/// stream (written by `batch_attn_block`). Mirrors the FFN half of
+/// `finish_attn_and_ffn` batched across B: pre-FFN norm, gate/up proj,
+/// gelu_tanh·mul, down proj, post-FFN norm, residual add, layer_scalar.
+#[allow(clippy::too_many_arguments)]
+fn batch_ffn_block(
+    gpu: &mut Gpu,
+    cfg: &Gemma4Config,
+    _state: &mut Gemma4State,
+    tail: &LayerTail,
+    b: usize,
+    x: &GpuTensor,
+    residual: &GpuTensor,
+    nrm: &GpuTensor,
+    gate_ffn: &GpuTensor,
+    up_ffn: &GpuTensor,
+    ffn_hidden: &GpuTensor,
+    ffn_out: &GpuTensor,
+    ffn_rot: &GpuTensor,
+) -> Result<(), String> {
+    let dim = cfg.dim;
+    let eps = cfg.norm_eps;
+    let ffn_hd = cfg.hidden_dim;
+
+    // 1) pre-FFN norm over the post-attention residual stream `x`.
+    gpu.rmsnorm_batched(x, tail.pre_feedforward_layernorm, nrm, b, dim, eps)
+        .map_err(|e| format!("gemma4 batch ffn pre rmsnorm: {e:?}"))?;
+
+    // residual = x (FFN residual stream).
+    gpu.hip
+        .memcpy_dtod_at(&residual.buf, 0, &x.buf, 0, b * dim * 4)
+        .map_err(|e| format!("gemma4 batch ffn save residual: {e:?}"))?;
+
+    // 2) gate / up projections (shared nrm input).
+    proj_gemm_batched(gpu, tail.gate_proj, nrm, gate_ffn, ffn_rot, b, "gate_proj")?;
+    proj_gemm_batched(gpu, tail.up_proj, nrm, up_ffn, ffn_rot, b, "up_proj")?;
+
+    // 3) hidden = gelu_tanh(gate) * up  (elementwise over B*ffn_hd).
+    gpu.gelu_tanh_f32(gate_ffn, ffn_hidden, b * ffn_hd)
+        .map_err(|e| format!("gemma4 batch ffn gelu_tanh: {e:?}"))?;
+    gpu.mul_f32(ffn_hidden, up_ffn, ffn_hidden)
+        .map_err(|e| format!("gemma4 batch ffn silu mul: {e:?}"))?;
+
+    // 4) down_proj(hidden) → ffn_out.
+    proj_gemm_batched(gpu, tail.down_proj, ffn_hidden, ffn_out, ffn_rot, b, "down_proj")?;
+
+    // 5) post-FFN norm (ffn_out → nrm).
+    gpu.rmsnorm_batched(ffn_out, tail.post_feedforward_layernorm, nrm, b, dim, eps)
+        .map_err(|e| format!("gemma4 batch ffn post rmsnorm: {e:?}"))?;
+
+    // 6) x = residual + nrm.
+    gpu.hip
+        .memcpy_dtod_at(&x.buf, 0, &residual.buf, 0, b * dim * 4)
+        .map_err(|e| format!("gemma4 batch ffn reset x: {e:?}"))?;
+    gpu.add_inplace_f32(x, nrm)
+        .map_err(|e| format!("gemma4 batch ffn residual add: {e:?}"))?;
+
+    // 7) learned per-layer scalar.
+    if tail.layer_scalar_host != 1.0 {
+        gpu.scale_f32(x, tail.layer_scalar_host)
+            .map_err(|e| format!("gemma4 batch ffn layer_scalar: {e:?}"))?;
     }
     Ok(())
 }
