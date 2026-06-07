@@ -12,6 +12,29 @@ Methodology: `docs/methodology/arch-port-validation.md` (tiny random-weight
 oracle, per-layer cosine). Validation box: **hiptrx GPU 3** (gfx1201/RDNA4,
 32 GB; pin `HIP_VISIBLE_DEVICES=3`). The tiny-oracle phase needs **no GPU**.
 
+## STATUS: WORKING (bring-up complete, 2026-06-07)
+
+Generates coherent code from the real model on gfx1201 — plausibly the first
+engine to infer `cohere2_moe` (it is transformers-`main`-only; no llama.cpp/vLLM
+support yet). **Recommended conversion recipe (best without an imatrix):**
+
+```
+hipfire-quantize --input <bls-mini-code> --output <out>.hfq --format mq4 --kmap-mode 2
+```
+
+`--kmap-mode 2` promotes ffn_down + gate + attn_v to MQ6 (the high-energy
+down-projection is the key lever); attention q/k/o stay Q8, embed/router Q8,
+norms F16. Decode **~92 tok/s** on one gfx1201 (vs ~109 for flat MQ4 — the MQ6
+experts cost ~16%, memory-bound). Run with a repetition penalty (`infer_cohere2moe
+--rep-penalty 1.3`) — greedy alone loops. Prepend BOS (token 2) — handled in the
+infer demo. Per-layer cosine vs HF bf16: ~0.98 mid, 0.989 late.
+
+**Quality ceiling is outliers, not bits** (flat MQ6 ≈ flat MQ4). The clean-output
+lever is **AWQ + imatrix**, currently BLOCKED: no public imatrix for this model,
+and hipfire native imatrix is in R&D. Revisit when native imatrix lands. (F16
+attention was tried — `weight_gemv` has no working F16 GEMV path, it produced
+garbage; not pursued.)
+
 ## What this scaffold contains (DONE)
 
 - `config.rs` — `Cohere2MoeConfig` parse (flat or `config`-wrapped HFQ metadata).

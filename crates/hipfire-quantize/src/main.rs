@@ -5045,10 +5045,6 @@ fn main() {
     // keep conv1d at the same quant as the rest of the model.
     let q8_conv1d_default = !args.iter().any(|a| a == "--no-q8-conv1d");
     let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
-    // Keep self-attention q/k/v/o projections in F16 (highest fidelity) instead
-    // of the kmap base level — for probing the attention-precision floor (e.g.
-    // Cohere2Moe's layer-0 Q8-attention gap). weight_gemv handles F16 directly.
-    let f16_attn = args.iter().any(|a| a == "--f16-attn");
 
     // ── imatrix loader (consumed by AWQ pre-scaling) ──
     // --imatrix <path>: load an llama-imatrix-produced GGUF (per `examples/
@@ -6208,11 +6204,7 @@ fn main() {
                 });
             } else {
                 // ── K-map override ──────────────────────────────────────────────
-                let mut kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
-                // --f16-attn: force self-attention projections to F16.
-                if f16_attn && name.contains("self_attn.") && name.ends_with("_proj.weight") {
-                    kmap_level = QuantLevel::F16;
-                }
+                let kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
 
                 // AWQ sidecar scales for this tensor — populated only inside the
                 // MQ4G256 arm when --awq is enabled and an imatrix entry exists
