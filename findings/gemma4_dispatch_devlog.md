@@ -507,3 +507,40 @@ The bug must be in one of:
 3. **The warm-pass (128 synthetic tokens) corrupts the KV cache** before
    the real prompt is processed — positions 0-127 have synthetic data,
    only positions 0..N-1 are overwritten by the prompt
+
+### Warm-pass contamination — ruled out
+
+Disabled the warm-pass for gemma4 (arch_id==12). Output is byte-identical
+to the warm-pass-enabled run. The warm-pass does not affect the generate
+path because:
+1. The generate prefill overwrites positions 0..N-1
+2. For fp32 KV, uninitialized positions are zero (memset at allocation)
+3. Zero K/V values don't contribute to attention (dot product = 0)
+
+### Summary of ruled-out hypotheses
+
+| Hypothesis | Status | Evidence |
+|---|---|---|
+| H1: Tokenizer ▁ prepend | FIXED | Tokenizer fix commit |
+| H2: v_norm uninitialized | FIXED | init_scratch_constants commit |
+| H3: Double-scaled HF oracle | FIXED | Removed second embed_scale multiply |
+| H4: Scale mismatch | FALSIFIED | Q·K^T matches within 0.5% |
+| H5: GQA grouping | FALSIFIED | Within-pair head divergence |
+| H6: KV offset/layout | FALSIFIED | fp32 cache dump matches expected |
+| H7: Weight quantization | FALSIFIED | Q8 weights also garbage |
+| H8: 2-token softmax artifact | FALSIFIED | Longer prompts also garbage |
+| H9: Warm-pass contamination | FALSIFIED | Disabling gives identical output |
+| H10: Embed scale not applied | FALSIFIED | Confirmed scale=61.97 applied correctly |
+
+### Current status: stuck
+
+All hypotheses have been ruled out. The attention output diverges from HF
+even though Q·K^T scores match. The remaining suspect is the softmax or
+weighted-sum computation inside the `attention_flash` kernel itself. This
+kernel is shared with Qwen3.5 which works correctly, so the bug must be
+in how gemma4's specific parameters (n_heads=16, n_kv=8, head_dim=256)
+interact with the kernel.
+
+Next step: instrument the `attention_flash_partial` kernel to dump
+post-softmax weights and V-weighted sums for a specific head, and compare
+with HF's exact computation.
