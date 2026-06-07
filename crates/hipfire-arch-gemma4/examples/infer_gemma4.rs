@@ -29,7 +29,7 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let mut model: Option<PathBuf> = None;
     let mut prompt = "The capital of France is".to_string();
-    let mut max: usize = 64;
+    let mut max: usize = 8192;
     let mut rep_pen: f32 = 1.3;
     let mut token_ids: Option<Vec<u32>> = None;
     let mut i = 1;

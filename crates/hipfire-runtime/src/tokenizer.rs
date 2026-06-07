@@ -423,7 +423,13 @@ impl Tokenizer {
             _ => None,
         };
 
-        let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ");
+        // GPT-2 byte-level BPE uses Ġ-prefixed space tokens (Qwen); SentencePiece
+        // BPE uses ▁ (Gemma, LLaMA). A single stray "Ġ" token is NOT enough to
+        // call it GPT-2 — decide by which space-marker DOMINATES (Gemma has 1 Ġ
+        // token but ~137k ▁ tokens, and must take the SP path or byte-coverage fails).
+        let n_gpt2 = token_to_id.keys().filter(|t| t.starts_with('Ġ')).count();
+        let n_sp = token_to_id.keys().filter(|t| t.starts_with('▁')).count();
+        let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || n_gpt2 > n_sp;
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {
