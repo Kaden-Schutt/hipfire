@@ -6920,6 +6920,52 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool) -> bool {
     }
 }
 
+/// #397 Ship 5.2 slice 1: route a single PLAIN-batched prefill GEMM through
+/// [`GemmFamily::run_key`] against an *explicit* dispatcher-entry [`KernelKey`].
+///
+/// This is the behavior-preserving migration primitive proved by the Ship 5.2
+/// pilot (028ac9f3): passing the dispatcher-entry key (e.g.
+/// `GemmQ8_0BatchedChunked`, `GemmHfq4G256`, `GemmHfq4G128`, `GemmF32Batched`)
+/// makes `run_key` dispatch to the IDENTICAL `gpu.gemm_*` method the direct
+/// call used, so each method's own internal arch routing (RDNA4-WMMA /
+/// gfx906-dp4a / CDNA-rocBLAS / …) is preserved byte-for-byte on every
+/// (dtype × arch × shape). `resolve()` is deliberately NOT used here — it
+/// front-runs the kernel's internal dispatch with a dtype-keyed WMMA preference
+/// and can diverge from a direct dispatcher-entry call on some arches.
+///
+/// Only the four PLAIN-batched dispatcher-entry keys with existing table
+/// entries are valid here. Residual-fused kernels (`gemm_*_residual*`) and the
+/// fused QKVZA / gate+up kernels are NOT plain GEMMs and are migrated in later
+/// slices (they need new table entries).
+#[inline]
+fn run_plain_gemm_key(
+    gpu: &mut Gpu,
+    key: hipfire_dispatch::types::KernelKey,
+    w_buf: &GpuTensor,
+    w_dtype: DType,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> HipResult<()> {
+    use hipfire_dispatch::families::gemm::GemmParams;
+    let ctx = DispatchCtx::new(gpu);
+    let w = WeightRef {
+        buf: w_buf,
+        dtype: w_dtype,
+        m,
+        k,
+        row_stride: k,
+        rotation: None,
+        awq_scale: None,
+    };
+    let params = GemmParams { w: &w, x, y, batch_size: n };
+    hipfire_runtime::llama::gemm_family()
+        .run_key(key, &ctx, gpu, &params)
+        .map_err(HipError::from)
+}
+
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
 /// residual stream in `pbs.x_batch` ([N × dim]) and writes the FFN output
 /// residual back into the same buffer in-place.
@@ -7065,35 +7111,32 @@ fn prefill_moe_ffn_body_batched(
     }
     // DIAG: dump MoE router logits (batched)
     dump_hidden_localize(gpu, router_logits, n, 0, ffn.router.m, 0, "router_b");
-    match ffn.shared_expert_gate.gpu_dtype {
-        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
-            &ffn.shared_expert_gate.buf,
-            &pbs.x_norm_batch,
-            shared_scalar,
-            ffn.shared_expert_gate.m,
-            ffn.shared_expert_gate.k,
-            n,
-        )?,
-        DType::MQ4G256 => gpu.gemm_hfq4g256(
-            &ffn.shared_expert_gate.buf,
-            &pbs.x_rot_batch,
-            shared_scalar,
-            ffn.shared_expert_gate.m,
-            ffn.shared_expert_gate.k,
-            n,
-        )?,
-        DType::F32 => gpu.gemm_f32_batched(
-            &ffn.shared_expert_gate.buf,
-            &pbs.x_norm_batch,
-            shared_scalar,
-            ffn.shared_expert_gate.m,
-            ffn.shared_expert_gate.k,
-            n,
-        )?,
-        other => panic!(
-            "prefill_moe_ffn_body_batched: unexpected shared_expert_gate dtype {other:?} \
+    // #397 Ship 5.2 slice1: route the shared-expert-gate GEMM through
+    // GemmFamily::run_key. Same dtype-routed dispatcher-entry keys as the router
+    // match above (Q8/F32 read x_norm_batch, MQ4 reads x_rot_batch) → identical
+    // gpu.gemm_* method, byte-for-byte.
+    {
+        use hipfire_dispatch::types::KernelKey;
+        let (key, x_in): (KernelKey, &GpuTensor) = match ffn.shared_expert_gate.gpu_dtype {
+            DType::Q8_0 => (KernelKey::GemmQ8_0BatchedChunked, &pbs.x_norm_batch),
+            DType::MQ4G256 => (KernelKey::GemmHfq4G256, &pbs.x_rot_batch),
+            DType::F32 => (KernelKey::GemmF32Batched, &pbs.x_norm_batch),
+            other => panic!(
+                "prefill_moe_ffn_body_batched: unexpected shared_expert_gate dtype {other:?} \
                          — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32"
-        ),
+            ),
+        };
+        run_plain_gemm_key(
+            gpu,
+            key,
+            &ffn.shared_expert_gate.buf,
+            ffn.shared_expert_gate.gpu_dtype,
+            x_in,
+            shared_scalar,
+            ffn.shared_expert_gate.m,
+            ffn.shared_expert_gate.k,
+            n,
+        )?;
     }
     // Fused gate+up dispatch for the shared expert — halves the kernel
     // launch count vs back-to-back gemm_hfq*g256 (~75µs/launch × 40
@@ -7154,8 +7197,11 @@ fn prefill_moe_ffn_body_batched(
                 dim,
                 paro_gate.krot as usize,
             )?;
-            gpu.gemm_hfq4g128(
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq4G128,
                 &ffn.shared_expert.gate.buf,
+                ffn.shared_expert.gate.gpu_dtype,
                 &pbs.x_rot_batch,
                 shared_gate,
                 ffn.shared_expert.gate.m,
@@ -7173,8 +7219,11 @@ fn prefill_moe_ffn_body_batched(
                 dim,
                 paro_up.krot as usize,
             )?;
-            gpu.gemm_hfq4g128(
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq4G128,
                 &ffn.shared_expert.up.buf,
+                ffn.shared_expert.up.gpu_dtype,
                 &pbs.x_rot_batch,
                 shared_up,
                 ffn.shared_expert.up.m,
@@ -7844,32 +7893,48 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if is_q8 {
-                    gpu.gemm_q8_0_batched_chunked(
+                    // #397 Ship 5.2 slice1: four plain Q8 batched GEMMs
+                    // (wqkv/wz/w_beta/w_alpha) → GemmFamily::run_key with the
+                    // GemmQ8_0BatchedChunked dispatcher-entry key → identical
+                    // gpu.gemm_q8_0_batched_chunked method, byte-for-byte.
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wqkv.buf,
+                        layer.wqkv.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.dn_qkv_batch,
                         layer.wqkv.m,
                         layer.wqkv.k,
                         n,
                     )?;
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wz.buf,
+                        layer.wz.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.dn_z_batch,
                         layer.wz.m,
                         layer.wz.k,
                         n,
                     )?;
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.w_beta.buf,
+                        layer.w_beta.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.dn_beta_batch,
                         layer.w_beta.m,
                         layer.w_beta.k,
                         n,
                     )?;
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.w_alpha.buf,
+                        layer.w_alpha.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.dn_alpha_batch,
                         layer.w_alpha.m,
@@ -8281,8 +8346,11 @@ fn forward_prefill_chunk(
                     // scratch (safe — next consumer is the FFN rmsnorm), then
                     // add into residual.
                     let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wo.buf,
+                        layer.wo.gpu_dtype,
                         wo_input,
                         &scratch,
                         layer.wo.m,
@@ -8408,16 +8476,22 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if ffn_is_q8 {
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.w_gate.buf,
+                        layer.w_gate.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.gate_ffn_batch,
                         layer.w_gate.m,
                         layer.w_gate.k,
                         n,
                     )?;
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.w_up.buf,
+                        layer.w_up.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.up_batch,
                         layer.w_up.m,
@@ -8546,8 +8620,11 @@ fn forward_prefill_chunk(
                     )?;
                 } else if w_down_is_q8 {
                     let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.w_down.buf,
+                        layer.w_down.gpu_dtype,
                         &pbs.ffn_hidden_batch,
                         &scratch,
                         layer.w_down.m,
@@ -8775,24 +8852,33 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if qkv_is_q8 && qkv_same_dtype {
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wq.buf,
+                        layer.wq.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.fa_q_full_batch,
                         layer.wq.m,
                         layer.wq.k,
                         n,
                     )?;
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wk.buf,
+                        layer.wk.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.fa_k_batch,
                         layer.wk.m,
                         layer.wk.k,
                         n,
                     )?;
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wv.buf,
+                        layer.wv.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.fa_v_batch,
                         layer.wv.m,
@@ -9058,8 +9144,11 @@ fn forward_prefill_chunk(
                     )?;
                 } else if fa_wo_is_q8 {
                     let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wo.buf,
+                        layer.wo.gpu_dtype,
                         fa_wo_input,
                         &scratch,
                         layer.wo.m,
@@ -9185,16 +9274,22 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if fa_ffn_is_q8 {
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.w_gate.buf,
+                        layer.w_gate.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.gate_ffn_batch,
                         layer.w_gate.m,
                         layer.w_gate.k,
                         n,
                     )?;
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.w_up.buf,
+                        layer.w_up.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.up_batch,
                         layer.w_up.m,
@@ -9314,8 +9409,11 @@ fn forward_prefill_chunk(
                     )?;
                 } else if fa_w_down_is_q8 {
                     let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.w_down.buf,
+                        layer.w_down.gpu_dtype,
                         &pbs.ffn_hidden_batch,
                         &scratch,
                         layer.w_down.m,
@@ -9521,8 +9619,11 @@ fn forward_prefill_chunk(
                         dim,
                         paro_wqkv.krot as usize,
                     )?;
-                    gpu.gemm_hfq4g128(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq4G128,
                         &layer.wqkv.buf,
+                        layer.wqkv.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.dn_qkv_batch,
                         layer.wqkv.m,
@@ -9540,8 +9641,11 @@ fn forward_prefill_chunk(
                         dim,
                         paro_wz.krot as usize,
                     )?;
-                    gpu.gemm_hfq4g128(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq4G128,
                         &layer.wz.buf,
+                        layer.wz.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.dn_z_batch,
                         layer.wz.m,
@@ -9549,16 +9653,22 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                     // w_alpha / w_beta: F32, no rotation, direct batched GEMM.
-                    gpu.gemm_f32_batched(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmF32Batched,
                         &layer.w_alpha.buf,
+                        layer.w_alpha.gpu_dtype,
                         &pbs.x_norm_batch,
                         &pbs.dn_alpha_batch,
                         layer.w_alpha.m,
                         layer.w_alpha.k,
                         n,
                     )?;
-                    gpu.gemm_f32_batched(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmF32Batched,
                         &layer.w_beta.buf,
+                        layer.w_beta.gpu_dtype,
                         &pbs.x_norm_batch,
                         &pbs.dn_beta_batch,
                         layer.w_beta.m,
@@ -9613,32 +9723,46 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if is_q8 {
-                    gpu.gemm_q8_0_batched_chunked(
+                    // #397 Ship 5.2 slice1: four plain Q8 batched GEMMs
+                    // (wqkv/wz/w_beta/w_alpha), sibling DeltaNet QKVZA path.
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wqkv.buf,
+                        layer.wqkv.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.dn_qkv_batch,
                         layer.wqkv.m,
                         layer.wqkv.k,
                         n,
                     )?;
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wz.buf,
+                        layer.wz.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.dn_z_batch,
                         layer.wz.m,
                         layer.wz.k,
                         n,
                     )?;
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.w_beta.buf,
+                        layer.w_beta.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.dn_beta_batch,
                         layer.w_beta.m,
                         layer.w_beta.k,
                         n,
                     )?;
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.w_alpha.buf,
+                        layer.w_alpha.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.dn_alpha_batch,
                         layer.w_alpha.m,
@@ -9950,8 +10074,11 @@ fn forward_prefill_chunk(
                     // Reuse `dn_normed_rot_batch` (free since the MQ4 rotate
                     // path didn't run here) as the GEMM scratch.
                     let scratch = pbs.dn_normed_rot_batch.sub_offset(0, n * layer.wo.m);
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wo.buf,
+                        layer.wo.gpu_dtype,
                         dn_wo_input,
                         &scratch,
                         layer.wo.m,
@@ -9966,8 +10093,11 @@ fn forward_prefill_chunk(
                     // this point — used earlier for the QKVZA stage; not
                     // needed for the rest of this layer) as the scratch.
                     let scratch = pbs.x_norm_batch.sub_offset(0, n * layer.wo.m);
-                    gpu.gemm_hfq4g128(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq4G128,
                         &layer.wo.buf,
+                        layer.wo.gpu_dtype,
                         dn_wo_input,
                         &scratch,
                         layer.wo.m,
@@ -10093,8 +10223,11 @@ fn forward_prefill_chunk(
                         dim,
                         paro_wq.krot as usize,
                     )?;
-                    gpu.gemm_hfq4g128(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq4G128,
                         &layer.wq.buf,
+                        layer.wq.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.fa_q_full_batch,
                         layer.wq.m,
@@ -10112,8 +10245,11 @@ fn forward_prefill_chunk(
                         dim,
                         paro_wk.krot as usize,
                     )?;
-                    gpu.gemm_hfq4g128(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq4G128,
                         &layer.wk.buf,
+                        layer.wk.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.fa_k_batch,
                         layer.wk.m,
@@ -10131,8 +10267,11 @@ fn forward_prefill_chunk(
                         dim,
                         paro_wv.krot as usize,
                     )?;
-                    gpu.gemm_hfq4g128(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq4G128,
                         &layer.wv.buf,
+                        layer.wv.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.fa_v_batch,
                         layer.wv.m,
@@ -10175,24 +10314,33 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 } else if qkv_is_q8 && qkv_same_dtype {
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wq.buf,
+                        layer.wq.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.fa_q_full_batch,
                         layer.wq.m,
                         layer.wq.k,
                         n,
                     )?;
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wk.buf,
+                        layer.wk.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.fa_k_batch,
                         layer.wk.m,
                         layer.wk.k,
                         n,
                     )?;
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wv.buf,
+                        layer.wv.gpu_dtype,
                         &pbs.x_rot_batch,
                         &pbs.fa_v_batch,
                         layer.wv.m,
@@ -10441,8 +10589,11 @@ fn forward_prefill_chunk(
                     // Reuse `fa_attn_out_rot_batch` (free since MQ4 rotate
                     // didn't run here) as scratch.
                     let scratch = pbs.fa_attn_out_rot_batch.sub_offset(0, n * layer.wo.m);
-                    gpu.gemm_q8_0_batched_chunked(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                         &layer.wo.buf,
+                        layer.wo.gpu_dtype,
                         fa_wo_input,
                         &scratch,
                         layer.wo.m,
@@ -10457,8 +10608,11 @@ fn forward_prefill_chunk(
                     // QKVZA is done — the MoE FFN body below rewrites it
                     // as its first action) as the gemm output scratch.
                     let scratch = pbs.x_norm_batch.sub_offset(0, n * layer.wo.m);
-                    gpu.gemm_hfq4g128(
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmHfq4G128,
                         &layer.wo.buf,
+                        layer.wo.gpu_dtype,
                         fa_wo_input,
                         &scratch,
                         layer.wo.m,
@@ -10950,7 +11104,17 @@ fn batched_gemm_single_weight(
     n: usize,
 ) -> HipResult<()> {
     match w.gpu_dtype {
-        DType::MQ4G256 | DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, n),
+        DType::MQ4G256 | DType::HFQ4G256 => run_plain_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmHfq4G256,
+            &w.buf,
+            w.gpu_dtype,
+            x,
+            y,
+            w.m,
+            w.k,
+            n,
+        ),
         DType::MQ6G256 | DType::HFQ6G256 => {
             // No non-residual batched MQ6/HFQ6 GEMM exists. Zero Y then
             // accumulate. The zero MUST be ordered on the same stream as
@@ -10988,7 +11152,17 @@ fn batched_gemm_single_weight(
             // to gate the `fused_rmsnorm_rotate_*_for(...)` call on
             // `is_mq` and fall through to `gpu.rmsnorm_batched(...)` for
             // Q8 (see DNMoe LA preamble for a representative).
-            gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, n)
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
         }
         other => Err(hip_bridge::HipError::new(
             0,
