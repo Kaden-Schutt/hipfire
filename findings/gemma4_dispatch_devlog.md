@@ -855,3 +855,124 @@ compare against HF. Key suspects:
    memcpy ordering.
 4. **full_rope_theta = 1e6** — different from sliding's 1e4.
 
+
+---
+
+## 2026-06-07 · Session 12 — L5 full-layer sub-step bisect: attention output is wrong
+
+### Added diagnostic dumps to full layer path
+
+Added `_fdump` (gated on `pos==1 && kv_layer_idx==0`) to
+`full_layer_decode_impl` in `gemma4.rs`, dumping 12 intermediate taps:
+input, post_input_norm, q/k_proj, q/k/v_norm, post_rope_q/k,
+post_attn_out, post_o_proj.
+
+### CORRECTION: earlier q_norm comparison was invalid
+
+The earlier "q_norm diverges" finding was an indexing artifact. HF's
+hooked q_norm output is a 4D tensor `[batch, seq, n_heads, head_dim]` =
+`[1, 2, 16, 512]`. I was comparing hipfire's flat first4 against HF's
+flattened 4D tensor which interleaved heads. After correctly extracting
+HF head 0's first4 from the 4D tensor:
+
+```
+HF head 0 q_norm: [4.1250, 0.4180, 2.2656, -3.5312]
+HIP head 0 q_norm: [4.1269, 0.3942, 2.2824, -3.4937]
+max_Δ = 0.0375  ✓
+```
+
+q_norm matches within quantization noise, as expected.
+
+### L5 sub-step comparison (all at pos=1, "Hello" token)
+
+| Stage | HF first4 | HIP first4 | max_Δ | Status |
+|---|---|---|---|---|
+| input scratch.x | L4 output | L4 output | < 0.01 | ✓ |
+| post_input_norm | [-3.75, -2.84, 1.44, -2.61] | [-3.86, -2.72, 1.55, -2.44] | 0.17 | ✓ |
+| post_q_proj | [26.25, 2.67, 14.50, -22.50] | [26.40, 2.52, 14.60, -22.35] | 0.15 | ✓ |
+| post_k_proj | [-1.85, 1.90, 3.63, -2.05] | [-1.85, 1.85, 3.67, -2.06] | 0.05 | ✓ |
+| post_q_norm (head 0) | [4.13, 0.42, 2.27, -3.53] | [4.13, 0.39, 2.28, -3.49] | 0.04 | ✓ |
+| post_k_norm | [-0.024, 0.025, 0.047, -0.027] | [-0.024, 0.024, 0.048, -0.027] | 0.001 | ✓ |
+| post_v_norm | [-0.398, 0.410, 0.781, -0.441] | [-0.400, 0.399, 0.792, -0.445] | 0.012 | ✓ |
+| **post_attn_out** | **[-0.160, 0.072, 0.029, -0.053]** | **[-0.081, -0.696, 0.958, 0.483]** | **1.18** | **✗** |
+| post_o_proj | [-0.205, -1.617, -1.789, -2.031] | [0.912, 2.333, -1.192, 0.015] | 3.95 | ✗ |
+
+### Root cause: hd512 attention kernel output is wrong
+
+Everything before the attention kernel matches (q/k/v projections, norms,
+RoPE). The divergence originates **inside the attention computation itself**
+for head_dim=512, n_kv=1.
+
+HF head 0 (first 4 of 512): [-0.160, 0.072, 0.029, -0.053]
+HIP head 0 (first 4 of 512): [-0.081, -0.696, 0.958, 0.483]
+
+These are completely different values — not a scale issue, not a sign
+flip, but structurally wrong attention output.
+
+### Suspects for the hd512 attention bug
+
+1. **`attention_flash_asym3_tile_hd512` kernel** — gemma4-only, never
+   validated against an oracle. Uses TILE_SIZE=128 and the same
+   online-softmax pattern as the hd256 variant. Could have:
+   - Wrong stride for head_dim=512 (K/V cache row stride)
+   - Wrong GQA handling for n_kv=1 (all 16 query heads share 1 KV head)
+   - Buffer overflow (512-dim head exceeds expected partials buffer)
+
+2. **`kv_cache_write_asym3_hd512` kernel** — writes K and V into the
+   quantized KV cache. If the write stride is wrong, the attention
+   kernel reads garbage K/V from cache.
+
+3. **Partials buffer sizing** — `scratch.flash_partials` may be sized
+   for head_dim=256, not 512. The hd512 kernel writes larger partial
+   sums per tile.
+
+4. **K=V sharing with n_kv=1** — hipfire copies k→v before k_norm,
+   then applies v_norm (divide-only). With n_kv=1, the single KV head's
+   V is 512-dim. If the attention kernel's GQA expansion (repeat 16×)
+   or the V cache slot stride is wrong, it reads from the wrong offset.
+
+### HF attention output details (for debugging)
+
+HF L5 pos=1 per-head attention output (pre-o_proj):
+```
+head  0: sum= 20.21 norm= 22.02 first4=[-0.1602, 0.0723, 0.0293, -0.0525]
+head  1: sum= 18.16 norm= 20.66 first4=[-0.1885, 0.1123, 0.1187, -0.0986]
+head  2: sum= 16.96 norm= 20.01 first4=[-0.2041, 0.1348, 0.1689, -0.1245]
+head  3: sum= 12.34 norm= 18.76 first4=[-0.2676, 0.2256, 0.3711, -0.2295]
+head  4: sum=  6.62 norm= 20.09 first4=[-0.3457, 0.3359, 0.6133, -0.3555]
+head  5: sum= 12.02 norm= 18.75 first4=[-0.2734, 0.2334, 0.3867, -0.2373]
+head  6: sum= 17.41 norm= 20.23 first4=[-0.1982, 0.1270, 0.1504, -0.1152]
+head  7: sum= 20.73 norm= 22.41 first4=[-0.1533, 0.0630, 0.0085, -0.0417]
+head  8: sum= 18.63 norm= 20.93 first4=[-0.1816, 0.1040, 0.0996, -0.0889]
+head  9: sum= 16.19 norm= 19.65 first4=[-0.2148, 0.1514, 0.2041, -0.1426]
+head 10: sum= 16.47 norm= 19.77 first4=[-0.2119, 0.1455, 0.1924, -0.1367]
+head 11: sum= 11.45 norm= 18.76 first4=[-0.2812, 0.2441, 0.4102, -0.2500]
+head 12: sum=  3.27 norm= 22.24 first4=[-0.3926, 0.4004, 0.7578, -0.4297]
+head 13: sum= 19.41 norm= 21.42 first4=[-0.1729, 0.0903, 0.0693, -0.0732]
+head 14: sum= 14.40 norm= 19.07 first4=[-0.2402, 0.1855, 0.2812, -0.1836]
+head 15: sum=  7.40 norm= 19.75 first4=[-0.3359, 0.3203, 0.5820, -0.3379]
+```
+
+All heads have norm ≈ 20 and show a consistent pattern: first element
+negative, second positive. This is the signature of the single-KV-head
+attention output (all 16 query heads attend to the same V, producing
+similar but scaled results).
+
+### Next steps
+
+1. **Read the hd512 attention kernel source** (`attention_flash_asym3_tile_hd512.hip`)
+   and compare with the hd256 variant. Focus on:
+   - GQA n_kv=1 handling
+   - K/V cache stride for head_dim=512
+   - Partials buffer size expectations
+   - Output write stride (should be n_heads * head_dim = 8192)
+
+2. **Test with fp32 KV cache** to rule out the asym3 quantized KV
+   write kernel. If fp32 KV also produces wrong attention output,
+   the bug is in the attention kernel, not the KV write.
+
+3. **Verify partials buffer allocation** in `Gemma4Scratch` — is it
+   sized for head_dim=512 or only 256?
+
+4. **Dump post-RoPE Q/K values** and verify against HF for the full
+   layer to confirm RoPE is correct before blaming attention.
