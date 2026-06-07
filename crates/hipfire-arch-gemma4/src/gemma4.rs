@@ -1697,12 +1697,12 @@ fn forward_scratch_inner(
             )),
         }
         // Diagnostic: dump residual after layer
-        if std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") && layer_idx < 2 {
+        if std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") {
             let data = gpu.download_f32(&scratch.x).unwrap_or_default();
             let sum: f64 = data.iter().map(|&v| v as f64).sum();
             let min = data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
             let max = data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            eprintln!("[gemma4 diag] pos={pos} L{layer_idx} after:  first4={:?} sum={sum:.4e} min={min:.4} max={max:.4}",
+            eprintln!("[gemma4 diag] pos={pos} L{layer_idx} hidden: first4={:?} sum={sum:.4e} min={min:.4} max={max:.4}",
                 &data[..4.min(data.len())]);
         }
     }
