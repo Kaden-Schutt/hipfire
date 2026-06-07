@@ -1885,6 +1885,8 @@ fn main() {
                                 c.text.num_hidden_layers,
                                 c.text.vocab_size,
                             )
+                        } else if let Some(ref c) = m.gemma4_config {
+                            (c.dim, c.n_layers, c.vocab_size)
                         } else {
                             (0, 0, 0)
                         };
@@ -3965,13 +3967,15 @@ fn load_model(
             .map_err(|e| e.to_string())?;
 
         // Dual KV caches: sliding (ring-buffer) + full (identity).
-        let kv_sliding = llama::KvCache::new_gpu(
+        // Use asym3 for now — full-attention layers (hd=512) only have asym3
+        // kernel variants. Q8/fwht hd512 support pending Phase 1b kernel port.
+        let kv_sliding = llama::KvCache::new_gpu_asym3(
             gpu, config.n_layers, config.sliding_n_kv_heads,
             config.sliding_head_dim, config.sliding_window,
         ).map_err(|e| format!("gemma4 sliding KV alloc: {e:?}"))?;
-        let kv_full = llama::KvCache::new_gpu(
-            gpu, config.n_layers, config.full_n_kv_heads,
-            config.full_head_dim, max_seq,
+        let kv_full = llama::KvCache::new_gpu_asym3(
+            gpu, config.n_layers, config.sliding_n_kv_heads,
+            config.sliding_head_dim, max_seq,
         ).map_err(|e| format!("gemma4 full KV alloc: {e:?}"))?;
 
         let eos_tok = config.eos_token;
@@ -7922,6 +7926,15 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             tools,
             messages_history,
         );
+        return;
+    }
+    if m.arch_id == 12 {
+        // Gemma4 generate — scaffold. Warm-pass runs during model load;
+        // this generate path is a stub pending full forward-pass validation.
+        let _ = (budget_alert_at_tok, budget_alert_text, assistant_prefix,
+            pflash_state, pflash_cfg, think_mode, repeat_penalty, repeat_window);
+        let _ = writeln!(stdout, r#"{{"type":"error","message":"gemma4 generate not yet wired — use bench_prefill to test warm-pass"}}"#);
+        let _ = stdout.flush();
         return;
     }
     if m.arch_id == 10 {

@@ -423,7 +423,13 @@ impl Tokenizer {
             _ => None,
         };
 
-        let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ");
+        // Detect tokenizer type: GPT-2 BPE uses Ġ (U+0120) as space prefix;
+        // SentencePiece uses ▁ (U+2581). Both may appear in the vocab of
+        // hybrid tokenizers (e.g. Gemma4). SentencePiece takes priority
+        // because its encoding rules differ fundamentally from BPE.
+        let has_sp = token_to_id.contains_key("▁");
+        let has_gpt2 = token_to_id.contains_key("Ġ");
+        let is_gpt2_bpe = has_gpt2 && !has_sp;
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {

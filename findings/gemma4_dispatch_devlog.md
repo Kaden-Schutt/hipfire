@@ -118,3 +118,56 @@ filesystem footprint). Start quantization + arch crate in parallel:
 ### Gate
 - cargo check --workspace: 0 errors
 - All dispatch tests still pass (139 + 71)
+
+---
+
+## 2026-06-07 · Session 3 — Kernels + daemon load path
+
+### Accomplished
+- Ported `rope_partial_halved.hip` and `logit_softcap.hip` from gemma4 branch
+- Added kernel declarations in `kernels.rs`
+- Replaced gemma4_ext.rs stubs with real GPU method implementations
+- Daemon arch_id=12 load path via Architecture trait
+- Dual KV cache allocation (sliding + full)
+- Warm-pass dispatch for arch_id=12
+- Daemon builds with 0 errors
+
+### Commits
+- `12eb950d`: rope/softcap kernels + daemon load path
+- `c4853e0c`: fix daemon compilation (reborrow, struct fields)
+
+### Status
+- Daemon: builds, loads arch_id=12 models
+- Kernels: rope_partial_halved, logit_softcap ported (JIT at first use)
+- Attention: _window stubs delegate to real flash attention
+- 12B model: quantized (12.7 GB), symlinked to ~/.hipfire/models/
+
+### Remaining for decode
+- Test daemon warm-pass with 12B model
+- Add generate dispatch for arch_id=12
+- Port hd512 attention kernel variants (currently fall back to hd256)
+- Wire sliding-window behavior (cache_capacity threading)
+
+---
+
+## 2026-06-07 · Session 4 — Model loads and decodes!
+
+### Milestone: gemma4 12B model loads and decodes on hipfire!
+- Model loads via Architecture trait with correct dims (3840/48/262144)
+- Warm-pass: 128 tokens at 14.9 tok/s (gfx1151, asym3 KV, hd=256 both caches)
+- KV: asym3 (deprecated). Q8/fwht3/fwht4 hd512 support pending kernel port.
+
+### Open topics (for follow-up PRs)
+1. **hd512 kernel variants for Q8/fwht KV modes** — full-attention layers currently
+   limited to asym3. Q8/fwht3/fwht4 hd512 kernels need porting from gemma4 branch.
+2. **hd512 KV cache allocation** — full-attention layers currently use hd=256
+   cache (borrowed from sliding config). Need proper hd512 cache once kernels exist.
+3. **Sliding-window behavior** — cache_capacity threading through GPU methods
+   (Phase 0a follow-up) needed for actual ring-buffer sliding window.
+4. **Asym3 deprecation** — user preference is Q8 or fwht3/fwht4 for new models.
+   Asym3 is acceptable for bring-up but should be replaced.
+
+### Debugging notes
+- Tokenizer: Gemma4 uses SPM-BPE with ▁-space. Detection fixed to prioritize ▁ over Ġ.
+- KV cache: asym3 required for hd512 layers (Q8/fwht hd512 kernels not ported).
+- gemma4.rs explicit check refuses Q8 on full-attention (hd=512) layers.
