@@ -5308,6 +5308,17 @@ fn main() {
         // ONLY the text decoder (model.language_model.*). GQA + SWA + dual-RoPE +
         // GeGLU + 4 sandwich norms + logit softcap. Crate: hipfire-arch-gemma4.
         "gemma4_unified" | "gemma4_unified_text" | "gemma4" => 13,
+        // Gemma4 EAGLE drafter (google/gemma-4-12B-it-assistant): the 422M
+        // single-block speculative-decode draft head for the arch-13 target.
+        // FLAT `model.*` names (NOT `model.language_model.`-prefixed) + two
+        // top-level projections (pre_projection / post_projection). Text-only:
+        // no vision/audio tower to skip. 5 decoder layers, hybrid 3:1
+        // sliding(hd256)/full(hd512) attn, tied lm_head, per-layer scalar.
+        // Quantize everything Q8 (`--format q8`): it is a tiny draft model and
+        // draft accuracy directly gates spec-decode acceptance. arch_id 22 is
+        // the next free slot after 21 (Qwen3.5 MTP head). Crate (future):
+        // hipfire-arch-gemma4 drafter loader.
+        "gemma4_unified_assistant" => 22,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -6216,7 +6227,7 @@ fn main() {
                 // weights), so keep self_attn.{q,k,v,o}_proj at Q8 even when
                 // --format is mq4. HIPFIRE_GEMMA4_MQ4_ATTN=1 disables this to test
                 // MQ4 attention on real/QAT weights (byte reduction → faster decode).
-                if arch_id == 13
+                if (arch_id == 13 || arch_id == 22)
                     && name.contains("self_attn.")
                     && name.ends_with("_proj.weight")
                     && std::env::var_os("HIPFIRE_GEMMA4_MQ4_ATTN").is_none()
