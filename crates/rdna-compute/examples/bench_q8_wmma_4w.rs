@@ -69,6 +69,7 @@ fn f32_to_f16_bytes(f: &[f32]) -> Vec<u8> {
     out
 }
 
+#[allow(dead_code)]
 fn cpu_gemm(a: &[f32], x: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let mut y = vec![0f32; n * m];
     for ni in 0..n {

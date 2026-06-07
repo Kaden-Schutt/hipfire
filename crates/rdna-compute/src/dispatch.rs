@@ -12,7 +12,7 @@ use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Arc, OnceLock};
 
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
@@ -53,6 +53,7 @@ thread_local! {
 pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
 
 /// Per-launch entropy for Q8 GatedDeltaNet stochastic rounding.
+#[allow(dead_code)]
 static GDN_REQUANT_FRAME: AtomicU32 = AtomicU32::new(0);
 
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
@@ -30897,6 +30898,60 @@ impl Gpu {
         result
     }
 
+    /// Batched flash attention for Q8_0 KV cache.
+    ///
+    /// This is the no-LDS-cap replacement for the old per-position
+    /// `attention_flash_q8_0` loop in long-context prefill. The Q8 tile kernel
+    /// shares the asym-family batched launcher ABI; the cos/sin slots are
+    /// ignored by the kernel, so `q` is passed as a harmless non-null tensor.
+    ///
+    /// TODO: route `HIPFIRE_Q8_TOKPAR` / `HIPFIRE_Q8_DP4A*` benchmark variants
+    /// through their specialized kernels. This wrapper intentionally restores
+    /// the production tile-batched path first so examples and no-GPU CI compile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_batched_masked(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_q8_0_tile_batched",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+            "attention_flash_q8_0_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            q,
+            q,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+        )
+    }
+
     /// Flash attention with Q8_0 KV cache — tile + reduce two-kernel path.
     /// Tiles seq_len into chunks of `tile_size`, launches [n_heads, n_tiles]
     /// blocks for the tile kernel, then [n_heads] blocks for the reduce.
@@ -36004,7 +36059,7 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
-        let fr = GDN_REQUANT_FRAME.fetch_add(1, Ordering::Relaxed) as i32;
+        let fr = GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
             &kp as *const _ as *mut c_void,
@@ -36106,7 +36161,8 @@ impl Gpu {
         let mut nt = n_tokens as i32;
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
-        let mut fr = GDN_REQUANT_FRAME.fetch_add(1, Ordering::Relaxed) as i32;
+        let mut fr =
+            GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,

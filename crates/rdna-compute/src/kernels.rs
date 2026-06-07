@@ -887,6 +887,7 @@ pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g2
 pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g128.hip");
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
+#[allow(dead_code)]
 pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
@@ -2433,6 +2434,8 @@ pub const ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym3_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
+pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 
@@ -3007,6 +3010,7 @@ pub const DEINTERLEAVE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deinterleave_batched.hip");
 
 /// Single-token repeat-interleave Q and K key heads up to value heads count.
+#[allow(dead_code)]
 pub const REPEAT_INTERLEAVE_QK_SRC: &str =
     include_str!("../../../kernels/src/repeat_interleave_qk.hip");
 
@@ -3174,6 +3178,7 @@ pub const V4F_ATTN_SWA_BUF_SRC: &str =
 
 /// DeepSeek V4 mHC pre+post sigmoid/scale fusion — replaces 3 element-wise
 /// launches (sigmoid(pre), sigmoid(post), scale(post)) with 1.
+#[allow(dead_code)]
 pub const HC_PRE_POST_SIGMOID_SCALE_SRC: &str =
     include_str!("../../../kernels/src/hc_pre_post_sigmoid_scale.hip");
 

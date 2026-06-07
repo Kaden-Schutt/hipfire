@@ -361,39 +361,49 @@ fn main() {
     // is numerically sane far beyond the 16K LDS wall.
     eprintln!("\n=== Flash-only at >16K (baseline cannot run here) ===");
     let big_seq = 20000usize;
-    let cbB = big_seq * tb5 * 34;
-    let ceB = (cbB + 3) / 4;
-    let d_kcB = gpu.zeros(&[ceB], rdna_compute::DType::F32).unwrap();
-    let d_vcB = gpu.zeros(&[ceB], rdna_compute::DType::F32).unwrap();
+    let cb_big = big_seq * tb5 * 34;
+    let ce_big = (cb_big + 3) / 4;
+    let d_kc_big = gpu.zeros(&[ce_big], rdna_compute::DType::F32).unwrap();
+    let d_vc_big = gpu.zeros(&[ce_big], rdna_compute::DType::F32).unwrap();
     let kfix: Vec<f32> = (0..kv_dim5).map(|_| next()).collect();
     let vfix: Vec<f32> = (0..kv_dim5).map(|_| next()).collect();
-    let dkB = gpu.upload_f32(&kfix, &[kv_dim5]).unwrap();
-    let dvB = gpu.upload_f32(&vfix, &[kv_dim5]).unwrap();
+    let dk_big = gpu.upload_f32(&kfix, &[kv_dim5]).unwrap();
+    let dv_big = gpu.upload_f32(&vfix, &[kv_dim5]).unwrap();
     for p in 0..big_seq {
         gpu.hip
             .memcpy_htod(&pos_buf, &(p as i32).to_ne_bytes())
             .unwrap();
-        gpu.kv_cache_write_q8_0(&d_kcB, &dkB, &pos_buf, n_kv5, hd5)
+        gpu.kv_cache_write_q8_0(&d_kc_big, &dk_big, &pos_buf, n_kv5, hd5)
             .unwrap();
-        gpu.kv_cache_write_q8_0(&d_vcB, &dvB, &pos_buf, n_kv5, hd5)
+        gpu.kv_cache_write_q8_0(&d_vc_big, &dv_big, &pos_buf, n_kv5, hd5)
             .unwrap();
     }
-    let qB: Vec<f32> = (0..n_h5 * hd5).map(|_| next()).collect();
-    let dqB = gpu.upload_f32(&qB, &[n_h5 * hd5]).unwrap();
-    let outB = gpu.zeros(&[n_h5 * hd5], rdna_compute::DType::F32).unwrap();
-    let max_tilesB = (big_seq + 127) / 128;
-    let partialsB = gpu
-        .zeros(&[n_h5 * max_tilesB * (2 + hd5)], rdna_compute::DType::F32)
+    let q_big: Vec<f32> = (0..n_h5 * hd5).map(|_| next()).collect();
+    let dq_big = gpu.upload_f32(&q_big, &[n_h5 * hd5]).unwrap();
+    let out_big = gpu.zeros(&[n_h5 * hd5], rdna_compute::DType::F32).unwrap();
+    let max_tiles_big = (big_seq + 127) / 128;
+    let partials_big = gpu
+        .zeros(&[n_h5 * max_tiles_big * (2 + hd5)], rdna_compute::DType::F32)
         .unwrap();
     gpu.hip
         .memcpy_htod(&pos_buf, &((big_seq - 1) as i32).to_ne_bytes())
         .unwrap();
     gpu.attention_flash_q8_0(
-        &dqB, &d_kcB, &d_vcB, &outB, &pos_buf, big_seq, n_h5, n_kv5, hd5, big_seq, &partialsB,
+        &dq_big,
+        &d_kc_big,
+        &d_vc_big,
+        &out_big,
+        &pos_buf,
+        big_seq,
+        n_h5,
+        n_kv5,
+        hd5,
+        big_seq,
+        &partials_big,
     )
     .unwrap();
     gpu.hip.device_synchronize().unwrap();
-    let ob = gpu.download_f32(&outB).unwrap();
+    let ob = gpu.download_f32(&out_big).unwrap();
     // Expected: uniform attention over identical V → out[d] ≈ vfix dequantized.
     // Compare head 0's first 32 dims against the V block-0 dequant of vfix.
     let finite = !ob.iter().any(|x| x.is_nan() || x.is_infinite());

@@ -36,6 +36,7 @@ fn f32_to_f16_bits(v: f32) -> u16 {
     sign | ((exp as u16) << 10) | ((mant >> 13) as u16)
 }
 
+#[allow(dead_code)]
 fn f32_to_f16_bytes(f: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(f.len() * 2);
     for &v in f {

@@ -157,9 +157,9 @@ fn main() {
     // Download the first and last 4 KB of both tensors and compare.
     let sample_bytes = 4096.min(src.byte_size());
     let mut src_head = vec![0u8; sample_bytes];
-    let mut src_tail = vec![0u8; sample_bytes];
+    let src_tail = vec![0u8; sample_bytes];
     let mut mir_head = vec![0u8; sample_bytes];
-    let mut mir_tail = vec![0u8; sample_bytes];
+    let mir_tail = vec![0u8; sample_bytes];
 
     trunk_gpu.bind_thread().unwrap();
     trunk_gpu.hip.memcpy_dtoh(&mut src_head, &src.buf).unwrap();
