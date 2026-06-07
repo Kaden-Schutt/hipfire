@@ -32,6 +32,7 @@ pub mod config;
 pub mod drafter;
 pub mod forward;
 pub mod gemma4;
+pub mod speculative;
 
 pub use arch::{Gemma4, ARCH_ID};
 pub use config::{Gemma4Config, LayerType, RopeType};
@@ -43,3 +44,5 @@ pub use drafter::{
     Gemma4DrafterConfig,
     Gemma4DrafterScratch, Gemma4DrafterWeights, DRAFTER_ARCH_ID,
 };
+pub use speculative::{spec_step_gemma4_eagle, Gemma4SpecScratch, SpecStepOut};
+pub use forward::{forward_batch, forward_batch_spec};

@@ -771,10 +771,27 @@ fn proj_gemm_batched(
     }
 }
 
+/// argmax over a logits row (spec-decode greedy per-position prediction).
+fn argmax_f32_row(v: &[f32]) -> u32 {
+    let mut bi = 0u32;
+    let mut bv = f32::NEG_INFINITY;
+    for (i, &x) in v.iter().enumerate() {
+        if x > bv {
+            bv = x;
+            bi = i as u32;
+        }
+    }
+    bi
+}
+
 /// Batched verify forward. See module-level note above. `tokens.len()` = B
 /// (1..=64, the `gemm_q8_0_batched` / batched-attention kernel cap). Returns
 /// the LAST token's logits. Side effect: writes both KV caches for positions
 /// [start_pos, start_pos+B) and sets `state.n_tokens = start_pos + B`.
+///
+/// Thin wrapper over `forward_batch_spec` with both spec out-params off:
+/// behaviour is BYTE-IDENTICAL to the original `forward_batch` (the eager /
+/// verify path). All existing callers stay on this signature unchanged.
 pub fn forward_batch(
     cfg: &Gemma4Config,
     weights: &Gemma4Weights,
@@ -782,6 +799,37 @@ pub fn forward_batch(
     gpu: &mut Gpu,
     tokens: &[u32],
     start_pos: usize,
+) -> Result<Vec<f32>, String> {
+    forward_batch_spec(cfg, weights, state, gpu, tokens, start_pos, None, None)
+}
+
+/// Batched verify forward with optional spec-decode out-params (Part A of the
+/// EAGLE wiring). Identical body to `forward_batch`; the two optional outputs
+/// are computed ADDITIVELY after the layer loop and do not alter the returned
+/// last-token logits, the KV writes, or `state.n_tokens`.
+///
+/// * `per_token_hidden_out` — when `Some`, receives each of the B positions'
+///   POST-`model.norm` hidden ([B × dim], row-major). Row `i` is exactly the
+///   hidden that the eager `decode_step` leaves in `state.tmp` after
+///   `final_norm` (the lm_head input). Used to seed the drafter for the next
+///   spec round at the accepted-bonus row.
+/// * `per_pos_argmax_out` — when `Some`, receives the target's greedy argmax at
+///   each block position ([B], `argmax_per_pos[i]` = the target's prediction
+///   AFTER block position `i`). Computed by running the SAME lm_head + final
+///   logit softcap the eager path uses, per row. Required for greedy accept.
+///
+/// When BOTH are `None` this is byte-identical to `forward_batch` (only the
+/// last-row final-norm + lm_head + softcap + download runs, as before).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_spec(
+    cfg: &Gemma4Config,
+    weights: &Gemma4Weights,
+    state: &mut Gemma4State,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    start_pos: usize,
+    per_token_hidden_out: Option<&GpuTensor>,
+    per_pos_argmax_out: Option<&mut Vec<u32>>,
 ) -> Result<Vec<f32>, String> {
     let b = tokens.len();
     if b == 0 {
@@ -1006,6 +1054,73 @@ pub fn forward_batch(
         }
     }
     state.n_tokens = start_pos + b;
+
+    // ── Spec-decode out-params (ADDITIVE; both default-off). ──
+    // `x` here holds the [B, dim] post-residual hidden for all B positions.
+    //
+    // (1) per_token_hidden_out: batched final-norm over all B rows → the
+    //     caller's [B, dim] buffer. Row i is exactly what the eager
+    //     decode_step leaves in state.tmp (the lm_head input) at that position.
+    // (2) per_pos_argmax_out: batched lm_head over all B rows → [B, vocab],
+    //     final logit softcap (elementwise over B*vocab), per-row argmax on host.
+    //     Uses the SAME batched proj path (`proj_gemm_batched`) the verify
+    //     forward uses for its other projections, so the MQ4 lm_head rotation is
+    //     handled with explicit scratch (NOT weight_gemv's internal mq_x_rot,
+    //     which the batched path never sizes → would fault on MQ4 lm_head).
+    //
+    // Both use a [B, dim] normed-hidden buffer. When (1) is requested we write
+    // straight into it; otherwise we allocate a local one only if (2) needs it.
+    let want_hidden = per_token_hidden_out.is_some();
+    let want_argmax = per_pos_argmax_out.is_some();
+    if want_hidden || want_argmax {
+        // Normed hidden destination: the caller's buffer if provided, else a
+        // local scratch sized [B, dim].
+        let local_hidden = if want_hidden {
+            None
+        } else {
+            Some(alloc(gpu, b * dim, "spec_normed")?)
+        };
+        let normed_hidden: &GpuTensor = match per_token_hidden_out {
+            Some(h) => h,
+            None => local_hidden.as_ref().unwrap(),
+        };
+        // Batched final RMSNorm over all B rows.
+        gpu.rmsnorm_batched(&x, &weights.final_norm, normed_hidden, b, dim, eps)
+            .map_err(|e| format!("gemma4 forward_batch_spec final rmsnorm: {e:?}"))?;
+
+        if let Some(out) = per_pos_argmax_out {
+            // Per-row lm_head via the SCALAR `weight_gemv` (exactly the eager
+            // decode_step / the last-row path below). This is the proven path on
+            // both Q8 and MQ4 targets. We deliberately do NOT use the batched
+            // `proj_gemm_batched` here: for an MQ4 lm_head (m=vocab≈262144) it
+            // routes through `gemm_hfq4g256_residual_wmma[_gfx12]`, whose b>1
+            // path faults (illegal access) at this output width on gfx12 — a
+            // pre-existing batched-MQ4-WMMA limitation, unrelated to spec wiring.
+            // `weight_gemv` (per-row, b=1) sidesteps it entirely.
+            out.clear();
+            out.reserve(b);
+            for i in 0..b {
+                let hidden_row = normed_hidden.sub_offset(i * dim, dim);
+                weight_gemv(gpu, &weights.lm_head, &hidden_row, &state.logits)
+                    .map_err(|e| format!("gemma4 forward_batch_spec lm_head row {i}: {e}"))?;
+                if cfg.final_logit_softcapping > 0.0 {
+                    gpu.logit_softcap_f32(
+                        &state.logits,
+                        cfg.vocab_size,
+                        cfg.final_logit_softcapping,
+                    )
+                    .map_err(|e| format!("gemma4 forward_batch_spec softcap row {i}: {e:?}"))?;
+                }
+                let row = gpu
+                    .download_f32(&state.logits)
+                    .map_err(|e| format!("gemma4 forward_batch_spec download row {i}: {e:?}"))?;
+                out.push(argmax_f32_row(&row));
+            }
+        }
+        if let Some(t) = local_hidden {
+            gpu.free_tensor(t).ok();
+        }
+    }
 
     // ── Final RMSNorm + tied lm_head on the LAST row only (verify needs the
     //    last position's logits). ──
