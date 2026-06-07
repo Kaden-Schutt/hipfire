@@ -3968,9 +3968,8 @@ fn load_model(
         gemma4::init_scratch_constants(gpu, &scratch, config.full_head_dim)
             .map_err(|e| format!("gemma4 init_scratch_constants: {e:?}"))?;
 
-        // Dual KV caches: sliding (ring-buffer) + full (identity).
-        // Full cache uses full_head_dim (512) and full_n_kv_heads (1 for 12B).
-        let kv_sliding = llama::KvCache::new_gpu_asym3(
+        // Dual KV: Q8 for sliding (higher quality), asym3 for full (hd=512 req)
+        let kv_sliding = llama::KvCache::new_gpu_q8(
             gpu, config.n_layers, config.sliding_n_kv_heads,
             config.sliding_head_dim, config.sliding_window,
         ).map_err(|e| format!("gemma4 sliding KV alloc: {e:?}"))?;

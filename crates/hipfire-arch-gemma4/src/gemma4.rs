@@ -1710,6 +1710,16 @@ fn forward_scratch_inner(
     // 4) Final RMSNorm.
     gpu.rmsnorm_f32(&scratch.x, &weights.final_norm, &scratch.tmp, config.norm_eps)?;
 
+    // Diagnostic: dump hidden state before lm_head
+    if std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") {
+        let data = gpu.download_f32(&scratch.tmp).unwrap_or_default();
+        let sum: f64 = data.iter().map(|&v| v as f64).sum();
+        let min = data.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+        let max = data.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        eprintln!("[gemma4 diag] pos={pos} hidden pre-lm_head: first4={:?} sum={sum:.4e} min={min:.4} max={max:.4}",
+            &data[..4.min(data.len())]);
+    }
+
     // 5) LM head → logits (reads tied embed bytes via lm_head.buf alias).
     weight_gemv(gpu, &weights.lm_head, &scratch.tmp, &scratch.logits)?;
 
