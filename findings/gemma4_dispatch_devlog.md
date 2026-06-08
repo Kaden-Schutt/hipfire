@@ -1718,3 +1718,56 @@ the dispatch-table rows.
 Cleared `~/.hipfire_kernels/` after kernel parameter changes (asym4/asym2 tiles
 gained 2 new params). Without this, old hsaco loads with misaligned kernargs,
 producing silent corruption.
+
+## Session 20 — Phase 2 gate + Phase 3 prefill migration (2026-06-08)
+
+### Phase 2 formal gate
+
+Clean builds (full `cargo clean` + `rm -rf ~/.hipfire_kernels/`) for both
+Phase 1 baseline and Phase 2 binaries.
+
+**Oracle results (1200 tokens, gemma4_oracle):**
+- Phase 1: argmax=236761, top5=[(236761, 11.5273), (31164, 10.5697), (532, 10.4242), ...]
+- Phase 2: argmax=236761, top5=[(236761, 11.5273), (31164, 10.5697), (532, 10.4242), ...]
+- **Byte-identical top-20 logits.**
+
+**Fix during gate:** `AttnF32` dispatch arm was calling non-windowed
+`attention_f32` for all fp32 paths. Gemma4 sliding layers need window
+masking even in fp32 (oracle path). Fixed: when `plan.window_size > 0`,
+route to `attention_flash` (windowed fp32 flash kernel). Commit `e468a2e0`.
+
+**Speed:** decode 14.7 tok/s warm (Phase 1: 14.6–15.6) — within ±3%.
+**Phase 2 gate: PASS** (`e468a2e0`).
+
+### Phase 3 — prefill migration
+
+Two sub-steps:
+
+**§3a — GEMM through `GemmFamily::run_key()`:**
+- Added `run_prefill_gemm` helper (mirrors qwen35's `run_plain_gemm_key`)
+- Routes through dispatcher-entry keys: `GemmHfq4G256`, `GemmHfq4G128`
+- Fallback for non-batched dtypes: repeated GEMV loop (preserved from
+  `weight_gemm`)
+- Replaced all 15 `weight_gemm` calls in prefill path
+
+**§3b — Batched attention through `AttentionFamily`:**
+- Sliding + full layer KV-write + attention migrated to `Step::Attend`
+  with `batch_size = n_batch`
+- Dispatch routes to `AttnFlashAsym3BatchedMasked(tree_bias=None)`
+- Same underlying HIP kernel (`attention_flash_asym3_tile_batched`)
+- 4 direct GPU calls → 2 `Step::Attend` calls
+
+**Validated:** short + long context coherent, identical output to Phase 2.
+Commit `61de8cae`.
+
+### Status
+
+| Phase | Status |
+|-------|--------|
+| Phase 0 | ✅ Done |
+| Phase 1 | ✅ Done |
+| Phase 1.5 | ✅ Done |
+| Phase 2 | ✅ Done + gated |
+| Phase 3 | ✅ Done |
+| Phase 4 | 🔲 MoE migration |
+| Phase 5 | 🔲 Validation |

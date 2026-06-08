@@ -1007,30 +1007,24 @@ old-style branches to `gemma4.rs`:
 
 ---
 
-## 6 · Phase 3 — Migrate prefill path 🔲 NOT STARTED
+## 6 · Phase 3 — Migrate prefill path ✅ DONE
 
 **Goal:** batched prefill uses `GemmFamily` for GEMM projections and
-`AttentionFamily` for batched attention. Preserve the v2 prefill structure
-(`forward_prefill_batch_v2`) — it was the result of significant optimization
-(token-batched projections, bucketed MoE GEMM, batched flash-attention
-with dual KV caches and hd512). Adapt dispatchers within the existing
-structure rather than rewriting to the qwen35 prefill template.
+`AttentionFamily` for batched attention.
 
-### 3a · GEMM through `GemmFamily::run_key()`
+**All sub-steps complete:**
+- §3a GEMM through `GemmFamily::run_key()` — `run_prefill_gemm` helper
+  routes 15 `weight_gemm` calls through the dispatch framework with
+  explicit dispatcher-entry keys (GemmHfq4G256 / GemmHfq4G128).
+- §3b Batched attention through `AttentionFamily` — sliding and full
+  layer KV-write + attention migrated to `Step::Attend` with
+  `batch_size = n_batch`. Dispatch routes to
+  `AttnFlashAsym3BatchedMasked(tree_bias=None)` which calls the same
+  underlying `attention_flash_asym3_tile_batched` HIP kernel.
 
-Convert `weight_gemm()` calls to `GemmFamily::resolve()` + `run()`.
-
-The MQ4G256 batched GEMM path (FWHT-rotate input batch → `gemm_hfq4g256`)
-must be registered as a `GemmFamily` variant with the pre-rotate expressed
-as a separate `PipelineOp` or handled by the family's `run()` method.
-
-### 3b · Batched attention
-
-Wire through `AttentionFamily` with `batch_size > 1`, `positions` tensor,
-`max_ctx_len`. The `cache_capacity` param threads through `KvTierPlan`
-into both write and attend kernels. Sliding layers use
-`cache_capacity = sliding_window` (ring-buffer wrap); full layers use
-`cache_capacity = physical_cap` (no wrap).
+**Preserved:** the v2 prefill structure (token-batched projections,
+per-head Q/K/V norms, dual KV caches, hd512). No structural changes
+— only the dispatch routing changed.
 
 ### Phase 3 gate
 
