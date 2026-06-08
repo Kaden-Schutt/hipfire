@@ -10,9 +10,14 @@ All accepted findings incorporated below.
 **Config-audited:** 2026-06-07 against real BF16 safetensors + configs from HuggingFace
 (`google/gemma-4-12B-it`, `google/gemma-4-26B-A4B-it`). Corrections applied inline.
 
-**Status (2026-06-07):** Phase 0 + Phase 1 substantially complete. 12B dense model
-decodes coherently (confirmed by Claude Opus 4.8). 25+ commits on branch.
-Debug history in `findings/gemma4_dispatch_devlog.md`.
+**Status (2026-06-08):** Phase 0 + Phase 1 complete; **Phase 1.5 (long-context)
+in progress**. 12B dense decodes coherently and is a usable chat model (stop
+token + chat framing + CLI tokenizer all working). **>1024 correctness confirmed
+fixed** via the asym3 windowed path — `gemma4_oracle` argmax matches HF at 1200
+tokens (the earlier ">1024 collapse" was a fp32-debug-KV-path artifact, now also
+fixed at the kernel level, `41bd5d87`). Ring-buffer KV (memory/128k) is the
+remaining Phase 1.5 piece. Debug history in `findings/gemma4_dispatch_devlog.md`
+(1567 lines, 16 sessions).
 
 ---
 
@@ -31,8 +36,9 @@ Two branches converge here:
 
 ### 1.1 · Gemma 4 model variants (from real configs)
 
-BF16 safetensors land in `/local/models/google/` (four variants). Only configs
-examined below — MoE shards are incomplete and being re-downloaded.
+BF16 safetensors land in `/local/models/google/` (four variants). The 26B-A4B
+MoE safetensors are now **complete** (both shards present, ~49 GB) — the MoE
+model can be quantized and validated once Phase 4 lands.
 
 | Variant | HF repo | Layers | `hidden_size` | `intermediate_size` | MoE | Heads (Q / KV / global-KV) | Vision | Audio |
 |---|---|---|---|---|---|---|---|---|
@@ -97,7 +103,7 @@ All models land in `/local/models/google/`. Status as of 2026-06-07:
 | Variant | Config | Tokenizer | Safetensors |
 |---|---|---|---|
 | 12B-it | ✓ | ✓ (GemmaTokenizer, SPM-BPE, 262K vocab, 32 MB) | Incoming |
-| 26B-A4B-it | ✓ | ✓ | **Incomplete** — only shard 2/2 present; needs re-download |
+| 26B-A4B-it | ✓ | ✓ | ✅ **Complete** — both shards (~49 GB) at `/local/models/google/gemma-4-26B-A4B-it` (2026-06-08) |
 | 31B-it | — | — | Incoming |
 | E4B-it | — | — | Incoming |
 | E2B-it | — | — | Incoming |
@@ -181,7 +187,13 @@ function in `rdna-compute/src/attention.rs`, to `KvTierInputs`, to
 to ~40 kernel launch sites and 2 struct definitions — no behavioral change
 for existing archs.
 
-**Blast radius:**
+> **Revised in Phase 1.5 (§4.5.2):** the struct-level fields below landed, but the
+> GPU-method/kernel threading is now done via a **sibling method** for high-fan-out
+> calls (`kv_cache_write_q8_0`, 46 callers) + extend-signature for low-fan-out ones,
+> rather than a uniform 40-site change. And **windowing — not the ring buffer — is
+> the >1024 correctness fix**; the ring buffer is a memory-only follow-up.
+
+**Blast radius (struct-level — done; GPU-method threading per §4.5.2):**
 - `crates/rdna-compute/src/attention.rs` — every `kv_cache_write_*` and
   `attention_flash_*` method signature
 - `kernels/src/` — every asym2/3/4, q8_0, fwht, and batched KV kernel
@@ -220,9 +232,8 @@ also Q8 (12.7 GB) and MQ4 (6.9 GB) variants. Files at `/local/models/google/`.
 Gate script rows not yet added — deferred to Phase 5.
 
 Before any phase gate can run, we need:
-1. Wait for complete BF16 safetensors to land in `/local/models/google/`
-   (26B-A4B is incomplete — shard 2 only; needs re-download. 12B, 31B,
-   E4B, E2B are incoming.)
+1. ✅ Complete BF16 safetensors present for 12B and **26B-A4B (both shards,
+   ~49 GB, 2026-06-08)**. 31B / E4B / E2B still incoming.
 2. Quantize gemma4 model weights to HFQ/MQ4 format via `hipfire-quantize`
    with `arch_id=12`
 3. Symlink quantized artifacts into `~/.hipfire/models/`
@@ -272,8 +283,8 @@ gemma4 weights, measured independently before proceeding.
 **Goal:** bring gemma4 crate, kernel files, and rdna-compute additions over
 using old dispatch patterns. Gemma4 decodes coherently on gfx1100 + gfx1201.
 
-**Status:** 12B dense model decodes coherently. 25+ commits on branch.
-Debug history documented in `findings/gemma4_dispatch_devlog.md`.
+**Status:** 12B dense model decodes coherently and is a usable chat model.
+Debug history documented in `findings/gemma4_dispatch_devlog.md` (16 sessions).
 
 **Exit criterion (mergeable checkpoint):** gemma4 decodes coherently at
 ≥90% of the gemma4 branch's tok/s baseline. Phase 1 is intended for merge
@@ -463,17 +474,20 @@ Relaxed `asym3 head_dim==256` assertion to also accept `head_dim==512`.
 - Weight loading: add `Gemma4Weights` load path through `Gemma4::load_weights()`
 - KV cache alloc: sliding KV sized at `sliding_window` (ring buffer), full KV at `max_seq`
 
-### 1g · Wire GemmaTokenizer (SPM-BPE) support ⚠️ PARTIAL
+### 1g · Wire GemmaTokenizer (SPM-BPE) support ✅ DONE (tool-call parsing pending)
 
 Commit `5ffd0314`. SPM-BPE encoder fixed (removed erroneous `▁` prepend).
 `"Hello"` now encodes to 9259 matching HF.
 
-**Remaining issue:** CLI `hipfire run` / `hipfire serve` fail to load the
-tokenizer with error: `GPT-2 BPE vocab missing byte symbol: byte 0x90`.
-The 262K-vocab BPE variant in the HFQ file is not recognized correctly by
-the tokenizer loader. The daemon's direct-load path works (used by
-`debug_gemma4_attention` example). Full CLI tokenizer support needs a fix
-in the tokenizer detection logic (`tokenizer.rs`).
+**CLI tokenizer resolved:** the earlier `hipfire run`/`serve` failure
+(`GPT-2 BPE vocab missing byte symbol: byte 0x90`) was the **stale prod daemon**
+(`~/.hipfire/bin/daemon` predated the SPM-BPE ▁-detection fix), not a code bug —
+the tokenizer detection (`▁` over `Ġ`) is correct. Refreshing the binary makes
+`hipfire run gemma-4-12B-it-q8 "..."` produce clean output. Standing gotcha:
+refresh the prod daemon after any runtime change.
+
+**Still pending:** the `gemma4-tool-call` regex parser arm (below) — not on the
+≤Phase-1 critical path.
 
 In `crates/hipfire-runtime/src/tokenizer.rs`:
 - Gemma 4 uses `GemmaTokenizer` — a SentencePiece BPE tokenizer with
@@ -525,7 +539,220 @@ The path to coherent decode involved 12+ debug sessions, documented in
    `embed_scale` internally; the Python oracle was multiplying by it again.
    Corrected oracle confirmed embedding + all projections + norms match HF.
 
-Session-by-session detail in `findings/gemma4_dispatch_devlog.md` (700+ lines).
+Session-by-session detail in `findings/gemma4_dispatch_devlog.md` (1567 lines, 16 sessions).
+
+---
+
+## 4.5 · Phase 1.5 — Long-context: sliding-window correctness + ring-buffer KV
+
+**Goal:** correct gemma4 generation for sequences **>`sliding_window` (1024)**,
+then make it **memory-scalable** to 128k context. These are two distinct pieces:
+windowing is a **correctness** fix (mostly done); the ring buffer is a **memory**
+optimization layered on top.
+
+### 4.5.0 · What we learned (Session 16–17b)
+
+- The original ">1024 collapse" was a **measurement artifact**, not a model bug:
+  the debug oracle (`examples/gemma4_oracle.rs`) allocated the sliding KV via
+  `KvCache::new_gpu` = the **fp32 KV path**, whose `attention_flash` branch had
+  **no window masking** (it attended to all positions). That path is the debug
+  branch (`// incorrect for seq > window_size`). It collapsed at exactly 1024.
+  **Now fixed** (`41bd5d87`): the fp32 `attention_flash_partial` kernel gained a
+  `kv_window` param (same chunk-clamping pattern as the asym3 tile kernel).
+- The **asym3 KV path** (the production path) **does** window: it routes through
+  `attention_flash_asym3_window` → `attention_flash_asym3` with a `kv_window`
+  param (ported from `upstream/feat/sliding-window-fa`: clamp `tile_start` up to
+  `seq_len - kv_window`, skip out-of-window sub-tiles; `kv_window=0` = full causal,
+  byte-identical, so qwen35/dispatch callers are unaffected).
+- **Confirmed via the per-token-ids oracle:** with the asym3 windowed path at
+  1200 tokens, **hipfire argmax matches HF (236761)** — collapse gone. Residual
+  per-layer Δ 0.5–1.8 from ~L19 is HFQ4/q8 quantization noise compounding across
+  48 layers; it does **not** flip the argmax. So **windowing is the correctness fix.**
+- The window-only path sizes the sliding cache at `max_seq` (correct, but defeats
+  the 128k memory goal). The ring buffer keeps it at `sliding_window` via modular
+  slot indexing — same math, less memory.
+
+**Oracle infrastructure (built, committed):** `scripts/oracle_gemma4.py` (HF
+reference, f32; a GPU path exists via `.venv-rocm` torch 2.9.1+rocm6.4 which drives
+gfx1151) + `examples/gemma4_oracle.rs` (hipfire side). Both read a **token-ids
+file** so they compare byte-identical inputs (no tokenizer drift). Self-gate
+`[2,9259]` matches HF (real-token argmax 575). This is the gate for all
+long-context work.
+
+### 4.5.1 · Step A — enable windowed asym3 long-context (correctness)
+
+Mostly landed (`feat(gemma4): sliding-window flash-attn infra` commit). Remaining:
+
+1. ✅ **fp32 sliding path fixed (`41bd5d87`)** — added `kv_window` masking to the
+   fp32 `attention_flash` kernel (root cause in `8de8d1eb`), so the debug path can't
+   silently mislead a future investigation (it cost one cycle). The oracle can stay
+   on either KV path now; asym3 remains the production path.
+2. **Enable >1024 in the daemon** once the oracle is green: size the sliding cache
+   at `max_seq` (window-only) + keep the `kv_window` path + drop the
+   `>= sliding_window` refusal guard. Validate decode + coherence at >1024.
+
+**Gate (Step A):** `gemma4_oracle` argmax + top-k match HF at 1100/1200 tokens
+(real tokens <256000; the q8 lm_head artifact on the multimodal block ≥256000 is
+expected — compare on real tokens). Coherence on a >1024 prompt.
+
+### 4.5.2 · Step B — ring-buffer KV (memory; enables 128k)
+
+The window-only `max_seq` sliding cache scales linearly with context (wasteful for
+128k). The ring buffer keeps the sliding cache at `sliding_window=1024` slots:
+**write `slot = pos % cache_capacity`, read `slot = t % cache_capacity`**, with the
+same window mask. Mathematically identical to window-only — it's a memory rewrite.
+
+**⚠ Do NOT merge `feat/gemma4-128k-ring-buffer` into this branch.** That branch
+predates the dispatch framework (`hipfire-dispatch/`), deletes `kv_tier.rs`,
+uses different GPU method signatures, and **reverts** the fp32 `attention_flash`
+window fix (`41bd5d87`). The correct approach is to **cherry-pick only the 3 HIP
+kernel diffs** and write the Rust integration fresh per the sibling-method design
+below.
+
+The proven kernel HIP diffs apply cleanly from `feat/gemma4-128k-ring-buffer`
+(verified: 184 lines across 3 files, no textual conflicts with this branch's
+kernel sources):
+- `kv_cache_write_asym_k_givens3.hip` (K): `slot = cap>0 ? pos%cap : pos`
+- `kv_cache_write_q8_0.hip` (V): same
+- `attention_flash_asym3_tile.hip`: read `slot = cap>0 ? t%cap : t` (composes with
+  the `kv_window` mask already added)
+
+`cache_capacity = 0` is the identity (slot = pos / t), so every non-gemma path is
+byte-identical. The default `u32` value of 0 gives the safe identity — any caller
+that forgets to set it gets correct (non-wrapping) behavior.
+
+#### Rust integration — sibling method vs. extend signature
+
+**Rust has no method overloading** (unlike Java/C++): you cannot have two methods
+named `kv_cache_write_q8_0` with different arities — it's a duplicate-definition
+error. Match the tool to the call-site fan-out:
+
+- **High fan-out → sibling method with a *distinct name*** that delegates with `0`.
+  `kv_cache_write_q8_0` has **46 callers** (other arch crates, examples, tests).
+  Keep its signature; add `kv_cache_write_q8_0_cap(.., cache_capacity: u32)`:
+  ```rust
+  // Existing API — UNCHANGED; all 46 callers stay byte-identical.
+  pub fn kv_cache_write_q8_0(&mut self, dst, src, pos_buf, n_kv, head_dim) -> HipResult<()> {
+      self.kv_cache_write_q8_0_cap(dst, src, pos_buf, n_kv, head_dim, 0)
+  }
+  // Ring-aware variant — gemma sliding layers call this.
+  pub fn kv_cache_write_q8_0_cap(&mut self, dst, src, pos_buf, n_kv, head_dim,
+                                 cache_capacity: u32) -> HipResult<()> { /* launch with cap */ }
+  ```
+  This is *the* idiomatic substitute for overloading (cf. `Vec::new` vs
+  `Vec::with_capacity`). Make the wrapper a one-line delegation + a doc comment
+  ("`cap=0` shorthand of `_cap`") so it doesn't read as accidental duplication.
+- **Low fan-out → extend the signature.** `kv_cache_write_asym3_fused` (~7 callers)
+  and `attention_flash_asym3` (5 callers — *already* carries `kv_window`) just take
+  an added `cache_capacity` arg; the handful of non-gemma callers pass `0`. Two
+  siblings where you don't need them is its own smell.
+
+**Correctness invariant:** the write (`pos%cap`) and the read (`t%cap`) **must use
+the same `cap`**. Derive it once (see dispatch integration) so they cannot drift —
+a mismatch is the #30-class silent-wrong-precision bug.
+
+#### Daemon sliding KV: must switch from fp32 to asym3
+
+The daemon currently allocates the sliding KV via `KvCache::new_gpu` (fp32). The
+ring-buffer write kernels only exist for the **asym3** path
+(`kv_cache_write_asym_k_givens3`, `kv_cache_write_q8_0`). Without this switch,
+Step B would leave the daemon's fp32 sliding path still writing `slot = pos` and
+OOBing at >1024.
+
+**Pre-Step B prerequisite:** change `daemon.rs`'s gemma4 load path from:
+```rust
+let kv_sliding = KvCache::new_gpu(gpu, n_layers, sliding_n_kv, sliding_head_dim, sliding_window);
+```
+to:
+```rust
+let kv_sliding = KvCache::new_gpu_asym3(gpu, n_layers, sliding_n_kv, sliding_head_dim, sliding_window);
+```
+This aligns the daemon's sliding path with the production asym3 pipeline that the
+ring-buffer kernels target. After this switch, the sliding layer code will take the
+asym3 branch (already windowed via `attention_flash_asym3_window`) for both read
+and write.
+
+> **Memory note:** sizing the fp32 sliding cache at `max_seq` for Step A's
+> window-only path causes a transient VRAM spike at large `max_seq` (48 layers ×
+> 8 heads × 256 dim × 4 bytes × 128k ≈ 6 GB). Step B's ring buffer shrinks it back
+> to 1024 rows. This grow-then-shrink is architecturally fine but plan for the
+> spike when testing Step A at large contexts.
+
+#### Dispatch integration (the "unified" part)
+
+`cache_capacity` already exists on `KvTierInputs` → `KvTierPlan` → `AttnParams`
+(Phase 0a, struct-level only). Wire it the rest of the way:
+- Derive `cache_capacity` once in `KvTierPlan::derive` (= `sliding_window` for
+  gemma sliding tiers, `0` otherwise) so write+read share one value.
+  **Open question:** `KvTierPlan::derive` currently has no arch-specific dispatch —
+  it doesn't know which model is loaded or which tiers are sliding. The gemma4
+  crate must either (a) pass `cache_capacity` as an input to `derive`, or
+  (b) the daemon/gemma4 code sets `cache_capacity` on the plan after derivation.
+  Option (b) is simpler and avoids threading the config through the dispatch
+  crate.
+- Flow it from the plan to the GPU methods (the `_cap` sibling / extended args).
+- Near-term, gemma's `gemma4_ext` wrappers already accept `cache_capacity: u32`
+  but stub it out with `let _ = cache_capacity`. Remove the stubs and pass it to
+  the kernel launches. The full gemma→`AttentionFamily` migration (Phase 2)
+  inherits it for free.
+
+#### Concrete touch-point list
+
+| File | What | Strategy |
+|------|------|----------|
+| `kernels/src/kv_cache_write_asym_k_givens3.hip` | Add `cache_capacity` param; `slot = cap>0 ? pos%cap : pos` | Cherry-pick from ring-buffer branch |
+| `kernels/src/kv_cache_write_q8_0.hip` | Same | Cherry-pick |
+| `kernels/src/attention_flash_asym3_tile.hip` | Add `cache_capacity` param; read `slot = cap>0 ? t%cap : t` | Cherry-pick |
+| `crates/rdna-compute/src/attention.rs` `kv_cache_write_q8_0` | Sibling `kv_cache_write_q8_0_cap(.., cache_capacity: u32)` | New method, existing delegates to it with `0` |
+| `crates/rdna-compute/src/attention.rs` `kv_cache_write_asym3_fused` | Extend with `cache_capacity: u32` (7 callers pass `0`) | Extend signature |
+| `crates/rdna-compute/src/attention.rs` `kv_cache_write_asym_k_givens3_hd512` | **No change** — full layers don't wrap | — |
+| `crates/rdna-compute/src/attention.rs` `attention_flash_asym3` | Already has `kv_window`; add `cache_capacity: u32` (5 callers pass `0`) | Extend signature |
+| `crates/rdna-compute/src/attention.rs` `attention_flash_asym3_tile_hd512` | **No change** — full layers don't wrap | — |
+| `crates/rdna-compute/src/gemma4_ext.rs` all `_window` wrappers | Remove `let _ = cache_capacity` stubs; thread to underlying methods | Remove stub |
+| `crates/hipfire-arch-gemma4/src/gemma4.rs` sliding writes | Pass `cache_capacity = sliding_window` | Model-crate edit |
+
+**Correctness invariant:** the write (`pos%cap`) and the read (`t%cap`) **must
+use the same `cap`**. Derive it once in the plan so they cannot drift — a mismatch
+is the #30-class silent-wrong-precision bug.
+
+> **Revises §0a.** §0a proposed adding `cache_capacity` to *every* KV-write/flash
+> method as a "mechanical file-wide" 40-site change with all callers passing
+> `physical_cap`. The sibling-for-high-fan-out + extend-for-low-fan-out split above
+> is less invasive (the 46 `kv_cache_write_q8_0` callers don't change) and is the
+> recommended approach. §0a's struct-level fields stand; only the GPU-method
+> threading strategy changes.
+
+### 4.5.3 · Step C — validation
+
+- **Ring == window-only:** `gemma4_oracle` logits with the ring buffer must equal
+  the window-only `max_seq` logits at **>1024 tokens** (1100/1200; below 1024 the
+  ring buffer is never exercised). Same math; any divergence is a wrap-indexing
+  bug. This is the cheapest, sharpest gate.
+- **vs HF:** argmax + top-k match (real tokens <256000) at >1024.
+- **Coherence:** a long (>1024-token) coherent-output prompt.
+- **Memory:** confirm the sliding cache stays at `sliding_window` slots regardless
+  of context (the whole point); spot-check VRAM at a large `max_seq`.
+
+### 4.5.4 · Scope / sequencing
+
+- **Step A (windowed asym3 + oracle-on-asym3 + drop guard)** delivers correct
+  long-context now and is independently shippable.
+- **Step B (ring buffer)** is a memory follow-up — needed for 128k, not for
+  correctness. Do it after Step A is green, gated on "ring == window-only."
+- The `kv_window` kernel work (`attention_flash_asym3_tile`) is lineage-grafted
+  from `sliding-window-fa`; Step B's ring indexing is lineage-matched to the
+  original gemma branch. Both compose (window mask + modular slot).
+
+**Stale-kernel-cache caution:** changing `kernels/src/*.hip` requires clearing
+`.hipfire_kernels/{arch}/` (the on-disk hsaco cache keys by name, not source hash)
+**and** refreshing `~/.hipfire/bin/daemon` — a stale cache served the pre-window
+kernel and produced a phantom "window has no effect" result for a full cycle.
+
+**⚠ Adding parameters to an existing kernel name is the highest-risk scenario.**
+The old hsaco loads silently (same kernel name) but the kernarg buffer is
+misaligned — garbage parameters, silent corruption, no clean error. Either clear
+the cache directory or **rename the kernel** when changing its parameter
+signature. Session 16 hit this exact failure mode with the `kv_window` addition.
 
 ---
 
@@ -692,8 +919,12 @@ Prefill tok/s within ±3% of Phase 1 baseline on gfx1100 + gfx1201.
 
 ## 7 · Phase 4 — MoE path migration 🔲 NOT STARTED
 
-**Note:** MoE GPU methods are stubbed (return `HipError`) in Phase 1. The
-26B-A4B model cannot run. All 8 MoE GEMV stubs need real implementations.
+**Note:** MoE GPU methods are stubbed (return `HipError`) in Phase 1, so the
+26B-A4B model cannot run *yet* — all 8 MoE GEMV stubs need real implementations.
+The **artifact is no longer a blocker**: the full 26B-A4B BF16 safetensors are
+present (`/local/models/google/gemma-4-26B-A4B-it`, both shards, ~49 GB, 2026-06-08).
+First Phase-4 step is to quantize it (`hipfire-quantize`, `arch_id=12`, MoE expert
+table handling) and symlink it for the coherence gate; then implement the stubs.
 
 **Goal:** gemma4 MoE (26B-A4B: 128 experts, k=8, per-expert SwiGLU FFN
 with `gelu_tanh` activation) goes through `MoeFamily` /
@@ -849,14 +1080,15 @@ Phase 0 contracts as follows:
 | Decode looped `<turn|>` forever (no stop) | 1e | ✅ Resolved | `eos_token_id` is `[1,106]` parsed as scalar 1; `generate_gemma4` now stops on a set incl. `<turn|>`=106. 12B-q8 stops cleanly. |
 | "deeper divergence remains" (Session 14) | debug | ✅ Not a bug | Standalone `debug_gemma4_attention` harness has a position-advance bug; daemon battery returns correct distinct answers (Tokyo/42/banana/FR). 4th measurement artifact. |
 | Chat-template framing (empty `<\|channel>thought`) | 1e | ✅ Resolved | `generate_gemma4` frames `<bos><\|turn>user\n{p}<turn\|>\n<\|turn>model\n<\|channel>thought\n<channel\|>` (guarded on the 4 special tokens; raw fallback). Output is now clean: "The capital of France is Paris." / valid haiku / "7 times 6 is 42." |
-| Sliding-window ring buffer not implemented (OOB >1024) | 0a/2b | ⚠️ Guarded | Sliding KV sized at `sliding_window`; writes use `slot=pos` (no wrap). `generate_gemma4` now **refuses prompts ≥ sliding_window and stops decode before the cap** (clean error, not OOB). Full ring buffer (`slot=pos%cap` + hd256 window masking) still pending — needs a >1024-tok oracle. |
+| >1024 correctness (sliding window) | 4.5.1 | ✅ Confirmed fixed | The ">1024 collapse" was an oracle artifact (fp32 KV debug path has no windowing); the **asym3 windowed path** (`kv_window`, ported from `sliding-window-fa`) is correct — `gemma4_oracle` argmax matches HF (236761) at 1200 tok. Daemon still **guarded** at `sliding_window` pending oracle-on-asym3 + dropping the guard (Phase 1.5 Step A). |
+| Sliding-window **ring buffer** (memory, 128k) | 4.5.2 | 🔲 Planned | Memory-only follow-up (cache stays at `sliding_window` via `slot=pos%cap`). NOT a correctness fix. **Pre-req:** switch daemon's `kv_sliding` from fp32 to asym3 (current fp32 path has no ring-buffer kernels). Sibling-method Rust integration + dispatch `cache_capacity` plumbing — see Phase 1.5 §4.5.2. Gate: ring logits == window-only logits at >1024. **Do NOT merge `feat/gemma4-128k-ring-buffer`** — cherry-pick HIP diffs only. |
 | `gelu_tanh` vs SiLU activation mismatch | 4a | Open | Forked `run_moe_decode_gemma4` executor. |
 | hd512 kernels not precompiled for all archs | 1b/5b | Open (gfx1151 works) | Compile + validate per-arch. |
 | `rope_partial_halved` not in dispatch framework | 2a | Open | Direct GPU call in Phase 1. |
 | MoE GPU methods stubbed | 4 | Open | 26B-A4B cannot run. Deferred to Phase 4. |
 | CLI tokenizer fails for gemma4 262K BPE | 1g | ✅ Resolved | Was the **stale prod daemon** (`~/.hipfire/bin/daemon`, predated the SPM-BPE ▁-detection fix), not a code bug. Refreshed binary → `hipfire run gemma-4-12B-it-q8 "..."` → "The capital of France is **Paris**." See [[feedback_hipfire_run_uses_prod_daemon]]. |
 | Phase gate scripts have no gemma4 rows | 0c | ✅ Partial | Added `gemma-4-12B-it-q8.hfq` cap row to `coherence-gate.sh` SHORT_TESTS (skip-if-missing). Exercises hd512 reduce + `<turn\|>` stop + framing. DFlash/A3B rows pending (MoE not portable). |
-| 26B-A4B safetensors incomplete | 0c | Open | Re-download needed. |
+| 26B-A4B safetensors incomplete | 0c | ✅ Resolved | Full BF16 (both shards, ~49 GB) present at `/local/models/google/gemma-4-26B-A4B-it` (2026-06-08). MoE blocker is now code (stubs), not artifact. |
 | Graph capture pointer staleness | 2a | Open | Deferred to Phase 2. |
 | Daemon `arch_id` wildcard fallback misroutes | 1e | ✅ Resolved | Explicit `12 =>` arms at all 16+ sites. |
 | SPM-BPE tokenizer conflicts with dots-ocr | 1g | ✅ Resolved | No conflicts observed. |
@@ -870,14 +1102,14 @@ Phase 0 contracts as follows:
 - Phase 0 contracts: [#402](https://github.com/Kaden-Schutt/hipfire/pull/402)
 - Canonical branch: `Kaden-Schutt/hipfire:integration/dispatch-unification`
 - Gemma4 branch: `feat/gemma4-128k-ring-buffer` (merged to master @ `9b206438`)
-- Working branch: `feat/dispatch-unification-gemma4` (25+ commits, tip `0e262753`)
+- Working branch: `feat/dispatch-unification-gemma4` (tip `41bd5d87` as of 2026-06-08)
 - Consolidated adversarial review: `findings/gemma4_dispatch_plan_consolidated_rev.md`
 - Individual reviews: `findings/gemm4_dispatch_plan_rev_gemini.md`,
   `findings/gemm4_dispatch_plan_rev_claude.md`,
   `findings/gemma4_dispatch_plan_rev_glm5.md`
 - Code review (Claude): `findings/gemma4_dispatch_code_rev_claude.md`
 - Code review (Gemini): `findings/gemma4_dispatch_code_rev_gemini.md`
-- Debug log: `findings/gemma4_dispatch_devlog.md` (700+ lines, 14 sessions)
+- Debug log: `findings/gemma4_dispatch_devlog.md` (1567 lines, 16 sessions)
 - Model sources (HuggingFace):
   - `google/gemma-4-12B-it` — 12B dense, unified (audio+vision+text)
   - `google/gemma-4-26B-A4B-it` — 26B MoE A4B, text+vision
