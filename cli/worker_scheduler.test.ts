@@ -198,6 +198,19 @@ describe("priority prefill scheduler", () => {
     expect(ids(scheduler.nextPrefillBatch({ nowMs: 10 }))).toEqual(["incoming"]);
   });
 
+  test("idempotent enqueue keeps already-waiting request queued once", () => {
+    const scheduler = new PriorityPrefillScheduler({
+      HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE: "0",
+      HIPFIRE_SCHED_PREFILL_BATCH_MAX: "2",
+    });
+    const waiting = session("waiting", { priority: 64 });
+
+    expect(scheduler.enqueueIfAbsent(waiting, 10)).toBe(true);
+    expect(scheduler.enqueueIfAbsent(waiting, 20)).toBe(false);
+    expect(scheduler.size).toBe(1);
+    expect(ids(scheduler.nextPrefillBatch({ nowMs: 20 }))).toEqual(["waiting"]);
+  });
+
   test("deadline aging lets starved compatible work bypass an unready higher-priority bucket", () => {
     const scheduler = new PriorityPrefillScheduler({
       HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE: "1000",

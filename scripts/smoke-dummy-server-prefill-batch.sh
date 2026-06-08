@@ -3,9 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON="${DAEMON:-$ROOT/target/release/examples/daemon}"
-MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4.hfq}"
-MAX_SEQ="${MAX_SEQ:-512}"
-EXPECTED_DAEMON_PREFILL_BACKEND="${EXPECTED_DAEMON_PREFILL_BACKEND:-fused_dense}"
 
 if [[ ! -x "$DAEMON" ]]; then
   echo "missing daemon binary: $DAEMON" >&2
@@ -13,12 +10,7 @@ if [[ ! -x "$DAEMON" ]]; then
   exit 2
 fi
 
-if [[ ! -f "$MODEL" ]]; then
-  echo "missing model: $MODEL" >&2
-  exit 2
-fi
-
-python3 - "$ROOT" "$DAEMON" "$MODEL" "$MAX_SEQ" "$EXPECTED_DAEMON_PREFILL_BACKEND" <<'PY'
+python3 - "$ROOT" "$DAEMON" <<'PY'
 import concurrent.futures
 import json
 import os
@@ -31,8 +23,8 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-root, daemon, model, max_seq_s, expected_daemon_prefill_backend = sys.argv[1:]
-max_seq = int(max_seq_s)
+root, daemon = sys.argv[1:]
+model = "hipfire:dummy"
 
 
 def pick_port() -> int:
@@ -68,16 +60,14 @@ def wait_health(base_url: str, proc: subprocess.Popen[str], log_path: str) -> di
     raise RuntimeError(f"server did not become healthy; last_err={last_err}; log={log_path}")
 
 
-def chat_request(base_url: str, label: str) -> dict[str, Any]:
+def chat_request(base_url: str, label: str, max_tokens: int = 2) -> dict[str, Any]:
     body = {
         "model": model,
-        "messages": [
-            {"role": "user", "content": f"Return one short word for {label}."},
-        ],
+        "messages": [{"role": "user", "content": f"dummy prompt for {label}"}],
         "stream": False,
         "temperature": 0,
         "top_p": 1,
-        "max_tokens": 1,
+        "max_tokens": max_tokens,
     }
     try:
         out = fetch_json(f"{base_url}/v1/chat/completions", body, timeout=120.0)
@@ -86,18 +76,16 @@ def chat_request(base_url: str, label: str) -> dict[str, Any]:
         raise RuntimeError(f"{label}: HTTP {err.code}: {detail}") from err
     if "error" in out:
         raise RuntimeError(f"{label}: response error: {out['error']}")
-    choices = out.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise RuntimeError(f"{label}: malformed response: {out}")
+    content = out.get("choices", [{}])[0].get("message", {}).get("content", "")
+    if "dummy:" not in content:
+        raise RuntimeError(f"{label}: missing dummy counter tokens in response: {out}")
     return out
 
 
 def streaming_chat_request(base_url: str, label: str) -> str:
     body = {
         "model": model,
-        "messages": [
-            {"role": "user", "content": f"Return one short word for streaming {label}."},
-        ],
+        "messages": [{"role": "user", "content": f"dummy streaming prompt for {label}"}],
         "stream": True,
         "temperature": 0,
         "top_p": 1,
@@ -116,28 +104,26 @@ def streaming_chat_request(base_url: str, label: str) -> str:
     except urllib.error.HTTPError as err:
         detail = err.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"{label}: streaming HTTP {err.code}: {detail}") from err
-    if "data:" not in raw:
-        raise RuntimeError(f"{label}: malformed streaming response: {raw!r}")
+    if "data:" not in raw or "dummy:" not in raw:
+        raise RuntimeError(f"{label}: malformed streaming dummy response: {raw!r}")
     return raw
 
 
 port = pick_port()
 base_url = f"http://127.0.0.1:{port}"
-log_file = tempfile.NamedTemporaryFile("w", prefix="hipfire-server-prefill-", suffix=".log", delete=False)
+log_file = tempfile.NamedTemporaryFile("w", prefix="hipfire-dummy-prefill-", suffix=".log", delete=False)
 log_path = log_file.name
 
 env = os.environ.copy()
 env.update({
     "HIPFIRE_DAEMON_BIN": daemon,
     "HIPFIRE_MODEL": model,
-    "HIPFIRE_KV_MODE": "q8",
     "HIPFIRE_NO_PID_FILE": "1",
     "HIPFIRE_SERVER_PREFILL_BATCH": "1",
     "HIPFIRE_SERVER_PREFILL_BATCH_MAX": "2",
     "HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS": "25",
     "HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE": "25",
-    "HIPFIRE_MAX_SEQ": str(max_seq),
-    "HIPFIRE_DFLASH_DRAFT": "",
+    "HIPFIRE_DUMMY_PREFILL_DELAY_MS": "50",
 })
 
 proc = subprocess.Popen(
@@ -154,42 +140,27 @@ try:
     initial = wait_health(base_url, proc, log_path)
     prefill = initial.get("prefill_batch", {})
     if prefill.get("generate_batch_prefill_capability") != "supported":
-        raise RuntimeError(f"server prefill capability not supported after warmup: {prefill}; log={log_path}")
+        raise RuntimeError(f"dummy server prefill capability not supported after warmup: {prefill}; log={log_path}")
 
-    single_response = chat_request(base_url, "single-timeout")
+    chat_request(base_url, "single-timeout", max_tokens=1)
     single_health = fetch_json(f"{base_url}/health", timeout=10.0)
     single_prefill = single_health.get("prefill_batch", {})
     if single_prefill.get("runtime_dispatch_skipped_reason") != "daemon_serial_prefill_timeout":
-        raise RuntimeError(
-            "single request did not exercise prefill timeout fallback: "
-            f"{single_prefill}; log={log_path}"
-        )
+        raise RuntimeError(f"single request did not exercise timeout fallback: {single_prefill}; log={log_path}")
     if int(single_prefill.get("pending_requests") or 0) != 0:
-        raise RuntimeError(
-            "single request left pending prefill waiters after timeout: "
-            f"{single_prefill}; log={log_path}"
-        )
-
-    streaming_chat_request(base_url, "mixed-mode-stream")
-    stream_health = fetch_json(f"{base_url}/health", timeout=10.0)
-    stream_prefill = stream_health.get("prefill_batch", {})
-    if int(stream_prefill.get("pending_requests") or 0) != 0:
-        raise RuntimeError(
-            "streaming request was incorrectly left in the prefill wait queue: "
-            f"{stream_prefill}; log={log_path}"
-        )
-    if int(stream_prefill.get("resident_runtime_sessions") or 0) != 0:
-        raise RuntimeError(
-            "streaming request created a resident runtime prefill session: "
-            f"{stream_prefill}; log={log_path}"
-        )
+        raise RuntimeError(f"single request left pending requests: {single_prefill}; log={log_path}")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         futures = [
-            pool.submit(chat_request, base_url, "request-a"),
-            pool.submit(chat_request, base_url, "request-b"),
+            pool.submit(chat_request, base_url, "request-a", 2),
+            pool.submit(chat_request, base_url, "request-b", 2),
         ]
         responses = [future.result() for future in futures]
+
+    for response in responses:
+        content = response["choices"][0]["message"]["content"]
+        if content.count("dummy:") < 2:
+            raise RuntimeError(f"dummy response did not contain two counter tokens: {response}")
 
     health = fetch_json(f"{base_url}/health", timeout=10.0)
     prefill = health.get("prefill_batch", {})
@@ -198,37 +169,31 @@ try:
         "selected_batch_size": prefill.get("selected_batch_size"),
         "daemon_prefill_backend": prefill.get("daemon_prefill_backend"),
         "daemon_prefill_plan": prefill.get("daemon_prefill_plan"),
-        "queue_size": prefill.get("queue_size"),
-        "total_batches": prefill.get("total_batches"),
-        "fused_batches": prefill.get("fused_batches"),
-        "last_prefill_tok_s": prefill.get("last_prefill_tok_s"),
         "pending_requests": prefill.get("pending_requests"),
         "resident_runtime_sessions": prefill.get("resident_runtime_sessions"),
     }
     if checks["runtime_dispatch_skipped_reason"] != "not_skipped":
-        raise RuntimeError(f"server prefill did not dispatch: {checks}; log={log_path}")
+        raise RuntimeError(f"dummy prefill did not dispatch: {checks}; log={log_path}")
     if checks["selected_batch_size"] != 2:
-        raise RuntimeError(f"server prefill did not select a 2-request batch: {checks}; log={log_path}")
-    if checks["daemon_prefill_backend"] != expected_daemon_prefill_backend:
-        raise RuntimeError(f"unexpected daemon prefill backend: {checks}; log={log_path}")
-    if checks["daemon_prefill_plan"] != "fused_dense_qwen35_candidate":
-        raise RuntimeError(f"unexpected daemon prefill plan: {checks}; log={log_path}")
-    if int(checks["total_batches"] or 0) < 1:
-        raise RuntimeError(f"server prefill did not record batch telemetry: {checks}; log={log_path}")
-    if int(checks["fused_batches"] or 0) < 1:
-        raise RuntimeError(f"server prefill did not record fused batch telemetry: {checks}; log={log_path}")
-    if float(checks["last_prefill_tok_s"] or 0) <= 0:
-        raise RuntimeError(f"server prefill did not record positive prefill tok/s: {checks}; log={log_path}")
+        raise RuntimeError(f"dummy prefill did not select a 2-request batch: {checks}; log={log_path}")
+    if checks["daemon_prefill_backend"] != "dummy_delay":
+        raise RuntimeError(f"unexpected dummy backend: {checks}; log={log_path}")
+    if checks["daemon_prefill_plan"] != "dummy_counter":
+        raise RuntimeError(f"unexpected dummy plan: {checks}; log={log_path}")
     if int(checks["pending_requests"] or 0) != 0:
-        raise RuntimeError(f"server prefill left pending requests behind: {checks}; log={log_path}")
+        raise RuntimeError(f"dummy prefill left pending requests: {checks}; log={log_path}")
     if int(checks["resident_runtime_sessions"] or 0) != 0:
-        raise RuntimeError(f"server prefill left resident runtime sessions behind: {checks}; log={log_path}")
+        raise RuntimeError(f"dummy prefill left resident runtime sessions: {checks}; log={log_path}")
 
-    print(
-        "server prefill coalescing smoke passed: "
-        f"responses={len(responses) + 2} selected_batch_size={checks['selected_batch_size']} "
-        f"backend={checks['daemon_prefill_backend']} plan={checks['daemon_prefill_plan']}"
-    )
+    streaming_chat_request(base_url, "stream")
+    stream_health = fetch_json(f"{base_url}/health", timeout=10.0)
+    stream_prefill = stream_health.get("prefill_batch", {})
+    if int(stream_prefill.get("pending_requests") or 0) != 0:
+        raise RuntimeError(f"streaming request left pending requests: {stream_prefill}; log={log_path}")
+    if int(stream_prefill.get("resident_runtime_sessions") or 0) != 0:
+        raise RuntimeError(f"streaming request left resident sessions: {stream_prefill}; log={log_path}")
+
+    print("dummy server prefill smoke passed")
 finally:
     proc.terminate()
     try:

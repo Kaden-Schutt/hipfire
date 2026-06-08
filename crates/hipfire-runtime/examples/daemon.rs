@@ -45,7 +45,7 @@ use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::time::Instant;
@@ -305,6 +305,202 @@ fn emit_error_with_id(stdout: &mut std::io::Stdout, id: &str, message: impl std:
     });
     let _ = writeln!(stdout, "{}", envelope);
     let _ = stdout.flush();
+}
+
+#[derive(Default)]
+struct DummyModelState {
+    sessions: HashMap<String, usize>,
+}
+
+impl DummyModelState {
+    fn reset(&mut self) {
+        self.sessions.clear();
+    }
+
+    fn release_sessions(&mut self, sessions: &[String]) -> usize {
+        sessions
+            .iter()
+            .filter(|session| self.sessions.remove(*session).is_some())
+            .count()
+    }
+
+    fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    fn prompt_token_count(text: &str) -> usize {
+        text.trim()
+            .split_whitespace()
+            .filter(|s| !s.is_empty())
+            .count()
+    }
+
+    fn consume_prefill_session(&mut self, session: &GenerateBatchPrefillSession) -> usize {
+        let consumed = match (&session.prompt, &session.suffix_tokens) {
+            (Some(prompt), None) => {
+                Self::prompt_token_count(prompt)
+                    + session
+                        .system_prompt
+                        .as_deref()
+                        .map(Self::prompt_token_count)
+                        .unwrap_or(0)
+            }
+            (None, Some(tokens)) => tokens.len(),
+            _ => 0,
+        };
+        let counter = self
+            .sessions
+            .entry(session.id.clone())
+            .or_insert(session.state_handle.logical_position);
+        *counter += consumed;
+        consumed
+    }
+
+    fn generate(
+        &mut self,
+        stdout: &mut std::io::Stdout,
+        id: &str,
+        session_id: &str,
+        prompt: &str,
+        prefill_already_done: bool,
+        max_tokens: usize,
+    ) {
+        let counter = self.sessions.entry(session_id.to_string()).or_insert(0);
+        if !prefill_already_done {
+            *counter += Self::prompt_token_count(prompt);
+        }
+        let started_at = Instant::now();
+        for i in 0..max_tokens {
+            let token = format!("dummy:{}", *counter);
+            *counter += 1;
+            let line = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": if i == 0 { token } else { format!(" {token}") },
+            });
+            let _ = writeln!(stdout, "{line}");
+            let _ = stdout.flush();
+        }
+        let elapsed = started_at.elapsed().as_secs_f64().max(0.000_001);
+        let done = serde_json::json!({
+            "type": "done",
+            "id": id,
+            "tokens": max_tokens,
+            "prefill_tokens": if prefill_already_done { 0 } else { Self::prompt_token_count(prompt) },
+            "tok_s": (max_tokens as f64) / elapsed,
+            "finish_reason": "length",
+        });
+        let _ = writeln!(stdout, "{done}");
+        let _ = stdout.flush();
+    }
+}
+
+fn dummy_prefill_delay_ms() -> u64 {
+    std::env::var("HIPFIRE_DUMMY_PREFILL_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(0)
+        .clamp(0, 5000) as u64
+}
+
+fn emit_dummy_generate_batch_prefill_ready(
+    stdout: &mut std::io::Stdout,
+    envelope: &GenerateBatchPrefillEnvelope,
+) {
+    let line = serde_json::json!({
+        "type": "generate_batch_prefill_ready",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "sessions": envelope.session_count,
+        "supported": true,
+        "mode": "dummy_counter",
+        "reason": "dummy_generate_batch_prefill_available",
+        "target_model": "hipfire:dummy",
+        "target_module": "dummy_prefill",
+    });
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
+fn run_generate_batch_prefill_dummy(
+    dummy: &mut DummyModelState,
+    stdout: &mut std::io::Stdout,
+    envelope: &GenerateBatchPrefillEnvelope,
+) -> Result<(), String> {
+    let delay_ms = dummy_prefill_delay_ms();
+    let started = serde_json::json!({
+        "type": "generate_batch_prefill_started",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "sessions": envelope.session_count,
+        "mode": "dummy_counter",
+        "plan": "dummy_counter",
+        "backend": "dummy_delay",
+        "delay_ms": delay_ms,
+        "target_model": "hipfire:dummy",
+        "target_module": "dummy_prefill",
+        "state_kinds": ["attention_kv"],
+    });
+    let _ = writeln!(stdout, "{started}");
+    let _ = stdout.flush();
+
+    if delay_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+
+    let t0 = Instant::now();
+    let mut total_prefill_tokens = 0usize;
+    for session in &envelope.sessions {
+        let consumed = dummy.consume_prefill_session(session);
+        total_prefill_tokens += consumed;
+        let logical_position = *dummy.sessions.get(&session.id).unwrap_or(&0);
+        let line = serde_json::json!({
+            "type": "generate_batch_prefill_session_done",
+            "id": envelope.id,
+            "batch_id": envelope.batch_id,
+            "session_id": session.id,
+            "prefill_tokens": consumed,
+            "logical_position": logical_position,
+            "cached_prefix_tokens": session.state_handle.cached_prefix_tokens,
+            "state_handle": {
+                "kind": "dummy_session",
+                "runtime_state": "resident",
+                "session_id": session.id,
+                "logical_position": logical_position,
+                "cached_prefix_tokens": session.state_handle.cached_prefix_tokens,
+                "state_kinds": session.state_handle.state_kinds,
+            },
+            "mode": "dummy_counter",
+            "plan": "dummy_counter",
+            "backend": "dummy_delay",
+            "delay_ms": delay_ms,
+            "target_model": "hipfire:dummy",
+            "target_module": "dummy_prefill",
+            "state_kinds": session.state_handle.state_kinds,
+        });
+        let _ = writeln!(stdout, "{line}");
+        let _ = stdout.flush();
+    }
+
+    let done = serde_json::json!({
+        "type": "generate_batch_prefill_done",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "sessions": envelope.session_count,
+        "prefill_tokens": total_prefill_tokens,
+        "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0 + delay_ms as f64,
+        "mode": "dummy_counter",
+        "plan": "dummy_counter",
+        "backend": "dummy_delay",
+        "resident_sessions": dummy.session_count(),
+        "delay_ms": delay_ms,
+        "target_model": "hipfire:dummy",
+        "target_module": "dummy_prefill",
+        "state_kinds": ["attention_kv"],
+    });
+    let _ = writeln!(stdout, "{done}");
+    let _ = stdout.flush();
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1232,6 +1428,48 @@ mod generate_batch_prefill_tests {
             plan_generate_batch_prefill_qwen35(6, &moe),
             GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate
         );
+    }
+
+    #[test]
+    fn dummy_state_counter_increments_across_prefill_and_generate() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "prefill",
+            "batch_id": "batch",
+            "worker_key_id": "dummy-worker",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "one two three",
+                "state_handle": {
+                    "state_kinds": ["attention_kv"],
+                    "logical_position": 0
+                }
+            }]
+        });
+        let envelope = validate_generate_batch_prefill(&msg).expect("valid envelope");
+        let mut dummy = DummyModelState::default();
+        let consumed = dummy.consume_prefill_session(&envelope.sessions[0]);
+        assert_eq!(consumed, 3);
+        assert_eq!(dummy.sessions.get("req-1").copied(), Some(3));
+
+        let counter = dummy.sessions.entry("req-1".to_string()).or_insert(0);
+        let emitted = *counter;
+        *counter += 1;
+        assert_eq!(emitted, 3);
+        assert_eq!(dummy.sessions.get("req-1").copied(), Some(4));
+    }
+
+    #[test]
+    fn dummy_release_sessions_removes_state() {
+        let mut dummy = DummyModelState::default();
+        dummy.sessions.insert("keep".to_string(), 1);
+        dummy.sessions.insert("drop".to_string(), 2);
+
+        let released = dummy.release_sessions(&["drop".to_string(), "missing".to_string()]);
+        assert_eq!(released, 1);
+        assert_eq!(dummy.session_count(), 1);
+        assert!(dummy.sessions.contains_key("keep"));
+        assert!(!dummy.sessions.contains_key("drop"));
     }
 
     #[test]
@@ -3112,6 +3350,7 @@ fn main() {
     // routes maybe_compress_prompt to this handle, decode stays on target.
     // None means the drafter shares the target gpu (single-card, unchanged).
     let mut pflash_drafter_gpu: Option<rdna_compute::Gpu> = None;
+    let mut dummy_model: Option<DummyModelState> = None;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -3162,8 +3401,29 @@ fn main() {
                 if let Some(m) = model.take() {
                     unload_model(m, &mut gpu);
                 }
+                dummy_model = None;
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                let dummy_requested = msg
+                    .get("params")
+                    .and_then(|p| p.get("dummy_model"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if dummy_requested {
+                    dummy_model = Some(DummyModelState::default());
+                    let line = serde_json::json!({
+                        "type": "loaded",
+                        "arch": "qwen35_dummy",
+                        "dim": 16,
+                        "layers": 1,
+                        "vocab": 1024,
+                        "vl": false,
+                    });
+                    let _ = writeln!(stdout, "{line}");
+                    let _ = stdout.flush();
+                    continue;
+                }
+
                 let max_seq = msg
                     .get("params")
                     .and_then(|p| p.get("max_seq"))
@@ -3684,6 +3944,35 @@ fn main() {
             }
 
             "generate" => {
+                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+                let session_id = msg
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(id);
+                let prefill_already_done = msg
+                    .get("prefill_already_done")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if let Some(dummy) = dummy_model.as_mut() {
+                    let prompt = msg
+                        .get("prompt")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Hello");
+                    let max_tokens = msg
+                        .get("max_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(512) as usize;
+                    dummy.generate(
+                        &mut stdout,
+                        id,
+                        session_id,
+                        prompt,
+                        prefill_already_done,
+                        max_tokens,
+                    );
+                    continue;
+                }
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {
@@ -3693,7 +3982,6 @@ fn main() {
                         continue;
                     }
                 };
-                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
                 let session_id = msg
                     .get("session_id")
                     .and_then(|v| v.as_str())
@@ -4102,6 +4390,10 @@ fn main() {
             "generate_batch_prefill" => match validate_generate_batch_prefill(&msg) {
                 Ok(envelope) => {
                     if generate_batch_prefill_is_probe(&envelope) {
+                        if dummy_model.is_some() {
+                            emit_dummy_generate_batch_prefill_ready(&mut stdout, &envelope);
+                            continue;
+                        }
                         match model.as_ref() {
                             Some(m) if (m.arch_id == 5 || m.arch_id == 6) && m.pp == 1 => {
                                 emit_generate_batch_prefill_ready(&mut stdout, &envelope);
@@ -4124,6 +4416,14 @@ fn main() {
                                     "no model loaded",
                                 );
                             }
+                        }
+                        continue;
+                    }
+                    if let Some(dummy) = dummy_model.as_mut() {
+                        if let Err(e) =
+                            run_generate_batch_prefill_dummy(dummy, &mut stdout, &envelope)
+                        {
+                            emit_error_with_id(&mut stdout, &envelope.id, e);
                         }
                         continue;
                     }
@@ -4166,6 +4466,19 @@ fn main() {
                         continue;
                     }
                 };
+                if let Some(dummy) = dummy_model.as_mut() {
+                    let released = dummy.release_sessions(&sessions);
+                    let done = serde_json::json!({
+                        "type": "release_sessions_done",
+                        "id": id,
+                        "requested": sessions.len(),
+                        "released": released,
+                        "resident_sessions": dummy.session_count(),
+                    });
+                    let _ = writeln!(stdout, "{done}");
+                    let _ = stdout.flush();
+                    continue;
+                }
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {
@@ -4191,6 +4504,12 @@ fn main() {
 
             "reset" => {
                 // Reset conversation state without unloading the model.
+                if let Some(dummy) = dummy_model.as_mut() {
+                    dummy.reset();
+                    let _ = writeln!(stdout, r#"{{"type":"reset"}}"#);
+                    let _ = stdout.flush();
+                    continue;
+                }
                 // Under eviction, also zero the compact_offset so absolute
                 // RoPE phase restarts from zero for the fresh conversation.
                 if let Some(ref mut m) = model {
@@ -4322,6 +4641,7 @@ fn main() {
                 if let Some(m) = model.take() {
                     unload_model(m, &mut gpu);
                 }
+                dummy_model = None;
                 let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
                 let _ = stdout.flush();
             }

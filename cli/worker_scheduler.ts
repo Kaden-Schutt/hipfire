@@ -40,6 +40,10 @@ export class PriorityPrefillScheduler {
     return this.queuedCount;
   }
 
+  hasQueued(id: string): boolean {
+    return this.queuedIds.has(id);
+  }
+
   enqueue(session: RequestSessionDraft, enqueuedAtMs: number): void {
     const maxQueued = this.maxQueuedRequests();
     if (maxQueued > 0 && this.queuedCount >= maxQueued) {
@@ -51,6 +55,12 @@ export class PriorityPrefillScheduler {
     this.buckets[session.priority].push({ session, enqueuedAtMs });
     this.queuedIds.add(session.id);
     this.queuedCount += 1;
+  }
+
+  enqueueIfAbsent(session: RequestSessionDraft, enqueuedAtMs: number): boolean {
+    if (this.hasQueued(session.id)) return false;
+    this.enqueue(session, enqueuedAtMs);
+    return true;
   }
 
   cancel(id: string): boolean {

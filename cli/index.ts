@@ -75,6 +75,12 @@ import {
   type BatchInputRecord,
   countUnsupportedModeErrors,
 } from "./batch_api";
+import {
+  buildDummyLoadMessage,
+  DUMMY_MODEL_SENTINEL_PATH,
+  isDummyModelPath,
+  resolveDummyModelPath,
+} from "./dummy_model";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
@@ -629,6 +635,10 @@ function isBf16ArtifactPath(path: string): boolean {
 }
 
 function buildLoadMessage(path: string, tag?: string | null): any {
+  if (isDummyModelPath(path)) {
+    return buildDummyLoadMessage();
+  }
+
   const resolved = resolveModelConfig(tag);
   // Guard: the KV cache must be big enough to hold at least one max_tokens
   // response plus a little prompt headroom; otherwise the daemon panics mid-
@@ -1722,6 +1732,7 @@ function stableHash(value: string): string {
 
 function inferModelArtifactDigest(path: string | null): string {
   if (!path) return "unknown";
+  if (isDummyModelPath(path)) return stableHash(DUMMY_MODEL_SENTINEL_PATH);
   try {
     const size = statSync(path).size;
     return stableHash(`${resolve(path)}|${size}`);
@@ -1754,6 +1765,7 @@ function approximatePromptTokenIds(prompt: string): readonly number[] {
 }
 
 function inferQuantFamilyForPath(modelPath: string): string {
+  if (isDummyModelPath(modelPath)) return "dummy";
   const lower = modelPath.toLowerCase();
   const token = artifactQuantToken(lower);
   if (token) return token;
@@ -1767,6 +1779,7 @@ function inferQuantFamilyForPath(modelPath: string): string {
 
 function inferStateKindsForServeArch(arch: string | null): readonly SessionStateKind[] {
   const normalized = (arch ?? "").toLowerCase();
+  if (normalized.includes("dummy")) return ["attention_kv"];
   const kinds: SessionStateKind[] = ["attention_kv"];
   if (normalized.includes("qwen") || normalized.includes("deltanet") || normalized.includes("qwen2")) {
     kinds.push("deltanet_recurrent");
@@ -2132,7 +2145,7 @@ async function serve(port: number, host: string) {
         const workerScheduler = getWorkerPrefillScheduler(servingWorkerKey);
         if (schedulingEligible.eligible && serverPrefillBatch.enabled && workerScheduler && generateBatchPrefillCapability === "supported") {
           const nowMs = Date.now();
-          workerScheduler.enqueue(workerDraft, nowMs);
+          workerScheduler.enqueueIfAbsent(workerDraft, nowMs);
           const preview = workerScheduler.previewNextPrefillBatch({
             nowMs,
             incomingSession: workerDraft,
@@ -2342,7 +2355,7 @@ async function serve(port: number, host: string) {
   // Pre-warm: load default model and compile kernels before accepting requests
   const defaultModel = process.env.HIPFIRE_MODEL || cfg.default_model;
   const rawWarmPath = findModel(defaultModel);
-  const warmPath = rawWarmPath ? resolve(rawWarmPath) : null;
+  const warmPath = rawWarmPath ? (isDummyModelPath(rawWarmPath) ? rawWarmPath : resolve(rawWarmPath)) : null;
   if (warmPath) {
     try {
       console.error(`[hipfire] pre-warming ${defaultModel}...`);
@@ -2974,7 +2987,7 @@ async function serve(port: number, host: string) {
         const rawPath = findModel(body.model || "default");
         if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
         // Normalize to avoid spurious reloads when registry vs fuzzy search give different paths
-        const path = resolve(rawPath);
+        const path = isDummyModelPath(rawPath) ? rawPath : resolve(rawPath);
 
         // Resolve effective config FIRST so we can size the KV cache against
         // the actual per-request max_tokens (body.max_tokens or config). The
@@ -3298,7 +3311,7 @@ async function serve(port: number, host: string) {
             // session activation; true fused GPU microbatching is the next
             // runtime step.
             if (servingWorkerScheduler) {
-              servingWorkerScheduler.enqueue(serverPrefillSession, requestNowMs);
+              servingWorkerScheduler.enqueueIfAbsent(serverPrefillSession, requestNowMs);
               const preview = servingWorkerScheduler.previewNextPrefillBatch({
                 nowMs: requestNowMs,
               });
@@ -3544,7 +3557,9 @@ async function serve(port: number, host: string) {
         // The Jinja path uses max_think_tokens==1 as the signal for
         // enable_thinking=false (daemon.rs line 3099). For the legacy
         // ChatFrame path, assistant_prefix="closed_think" is sufficient.
-        if (effective.thinking === "off") {
+        if (currentArch === "qwen35_dummy") {
+          genParams.assistant_prefix = "plain";
+        } else if (effective.thinking === "off") {
           genParams.assistant_prefix = "closed_think";
         } else if ((body as any).chat_template_kwargs?.enable_thinking === false) {
           genParams.assistant_prefix = "closed_think";
@@ -3823,7 +3838,7 @@ async function serve(port: number, host: string) {
                 : 0;
             } else {
               pendingPrefillRequests.delete(reqId);
-              servingWorkerScheduler.cancel(reqId);
+              servingWorkerScheduler?.cancel(reqId);
               prefillBatchMetrics.skipped += 1;
               if (genParams.server_prefill_batch) {
                 genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill_timeout";
@@ -4790,6 +4805,9 @@ function loadUserAliases(): Record<string, UserAlias> {
 }
 
 export function findModel(name: string): string | null {
+  const dummy = resolveDummyModelPath(name);
+  if (dummy) return dummy;
+
   // Direct file path
   if (existsSync(name)) return resolve(name);
 

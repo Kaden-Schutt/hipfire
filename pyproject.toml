@@ -16,3 +16,10 @@ ignore = [
     "F541",
     "F841",
 ]
+
+[tool.pytest.ini_options]
+norecursedirs = ["third_party"]
+testpaths = [
+    "tests",
+    "scripts/test_astrea.py",
+]

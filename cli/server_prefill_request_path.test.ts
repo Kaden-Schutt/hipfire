@@ -49,4 +49,21 @@ describe("server request-path prefill batching guard", () => {
       queuePreviewReason: "not_eligible",
     })).toBe(false);
   });
+
+  test("does not create pending waiters without an eligible scheduler path", () => {
+    expect(shouldQueueServerPrefillPending({
+      ...base,
+      eligible: false,
+      hasScheduler: true,
+      stream: false,
+      responsesRequest: false,
+    })).toBe(false);
+    expect(shouldQueueServerPrefillPending({
+      ...base,
+      eligible: true,
+      hasScheduler: false,
+      stream: false,
+      responsesRequest: false,
+    })).toBe(false);
+  });
 });
