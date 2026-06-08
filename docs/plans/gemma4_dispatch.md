@@ -10,14 +10,15 @@ All accepted findings incorporated below.
 **Config-audited:** 2026-06-07 against real BF16 safetensors + configs from HuggingFace
 (`google/gemma-4-12B-it`, `google/gemma-4-26B-A4B-it`). Corrections applied inline.
 
-**Status (2026-06-08):** Phase 0 + Phase 1 complete; **Phase 1.5 (long-context)
-in progress**. 12B dense decodes coherently and is a usable chat model (stop
-token + chat framing + CLI tokenizer all working). **>1024 correctness confirmed
-fixed** via the asym3 windowed path — `gemma4_oracle` argmax matches HF at 1200
-tokens (the earlier ">1024 collapse" was a fp32-debug-KV-path artifact, now also
-fixed at the kernel level, `41bd5d87`). Ring-buffer KV (memory/128k) is the
-remaining Phase 1.5 piece. Debug history in `findings/gemma4_dispatch_devlog.md`
-(1567 lines, 16 sessions).
+**Status (2026-06-08):** Phase 0 + Phase 1 complete; **Phase 1.5 Step A done**
+(`876c1158`). 12B dense decodes coherently at arbitrary context length (daemon
+sized at `max_seq`, `kv_window` masking active). **>1024 correctness confirmed**
+via the asym3 windowed path — `gemma4_oracle` argmax matches HF at 1200 tokens
+(the earlier ">1024 collapse" was a fp32-debug-KV-path artifact, now also
+fixed at the kernel level, `41bd5d87`). Daemon validated: 1266-token prompt
+produces coherent 3-sentence summary at 10.8 tok/s.
+**Phase 1.5 Step B (ring-buffer KV, memory/128k)** is the next open piece.
+Debug history in `findings/gemma4_dispatch_devlog.md`.
 
 ---
 
@@ -579,17 +580,19 @@ file** so they compare byte-identical inputs (no tokenizer drift). Self-gate
 `[2,9259]` matches HF (real-token argmax 575). This is the gate for all
 long-context work.
 
-### 4.5.1 · Step A — enable windowed asym3 long-context (correctness)
+### 4.5.1 · Step A — enable windowed long-context (correctness) ✅ DONE
 
-Mostly landed (`feat(gemma4): sliding-window flash-attn infra` commit). Remaining:
+Landed in three commits:
 
 1. ✅ **fp32 sliding path fixed (`41bd5d87`)** — added `kv_window` masking to the
    fp32 `attention_flash` kernel (root cause in `8de8d1eb`), so the debug path can't
    silently mislead a future investigation (it cost one cycle). The oracle can stay
    on either KV path now; asym3 remains the production path.
-2. **Enable >1024 in the daemon** once the oracle is green: size the sliding cache
-   at `max_seq` (window-only) + keep the `kv_window` path + drop the
-   `>= sliding_window` refusal guard. Validate decode + coherence at >1024.
+2. ✅ **Daemon >1024 enabled (`876c1158`)** — sliding KV sized at `max_seq` (window-only),
+   `kv_window` masking active in attention, `>= sliding_window` refusal guard replaced
+   with a `max_seq` context-length guard. Validated: 1266-token prompt → coherent
+   3-sentence summary (104 tok @ 10.8 tok/s).
+3. ✅ **Oracle gate passed** — argmax matches HF (236761) at 1200 tokens.
 
 **Gate (Step A):** `gemma4_oracle` argmax + top-k match HF at 1100/1200 tokens
 (real tokens <256000; the q8 lm_head artifact on the multimodal block ≥256000 is
@@ -1080,7 +1083,7 @@ Phase 0 contracts as follows:
 | Decode looped `<turn|>` forever (no stop) | 1e | ✅ Resolved | `eos_token_id` is `[1,106]` parsed as scalar 1; `generate_gemma4` now stops on a set incl. `<turn|>`=106. 12B-q8 stops cleanly. |
 | "deeper divergence remains" (Session 14) | debug | ✅ Not a bug | Standalone `debug_gemma4_attention` harness has a position-advance bug; daemon battery returns correct distinct answers (Tokyo/42/banana/FR). 4th measurement artifact. |
 | Chat-template framing (empty `<\|channel>thought`) | 1e | ✅ Resolved | `generate_gemma4` frames `<bos><\|turn>user\n{p}<turn\|>\n<\|turn>model\n<\|channel>thought\n<channel\|>` (guarded on the 4 special tokens; raw fallback). Output is now clean: "The capital of France is Paris." / valid haiku / "7 times 6 is 42." |
-| >1024 correctness (sliding window) | 4.5.1 | ✅ Confirmed fixed | The ">1024 collapse" was an oracle artifact (fp32 KV debug path has no windowing); the **asym3 windowed path** (`kv_window`, ported from `sliding-window-fa`) is correct — `gemma4_oracle` argmax matches HF (236761) at 1200 tok. Daemon still **guarded** at `sliding_window` pending oracle-on-asym3 + dropping the guard (Phase 1.5 Step A). |
+| >1024 correctness (sliding window) | 4.5.1 | ✅ Done (`876c1158`) | fp32 `attention_flash` window fix (`41bd5d87`) + daemon sliding KV sized at `max_seq` + refusal guard dropped. 1266-token prompt coherent. Oracle argmax=236761 matches HF at 1200 tok. |
 | Sliding-window **ring buffer** (memory, 128k) | 4.5.2 | 🔲 Planned | Memory-only follow-up (cache stays at `sliding_window` via `slot=pos%cap`). NOT a correctness fix. **Pre-req:** switch daemon's `kv_sliding` from fp32 to asym3 (current fp32 path has no ring-buffer kernels). Sibling-method Rust integration + dispatch `cache_capacity` plumbing — see Phase 1.5 §4.5.2. Gate: ring logits == window-only logits at >1024. **Do NOT merge `feat/gemma4-128k-ring-buffer`** — cherry-pick HIP diffs only. |
 | `gelu_tanh` vs SiLU activation mismatch | 4a | Open | Forked `run_moe_decode_gemma4` executor. |
 | hd512 kernels not precompiled for all archs | 1b/5b | Open (gfx1151 works) | Compile + validate per-arch. |

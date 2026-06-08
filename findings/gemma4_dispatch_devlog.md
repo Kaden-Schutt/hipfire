@@ -1565,3 +1565,53 @@ The daemon allocates the sliding KV as asym3 (quantized), which takes the
 `attention_flash_asym3_window` path with `sliding_cap = sliding_window`.
 The daemon also has the OOB guard (`generate_gemma4` refuses >1024 tokens).
 So production paths are safe. Only the oracle's debug fp32 path is broken.
+
+---
+
+## 2026-06-08 · Session 18 — Phase 1.5 Step A complete, plan review + fixes
+
+### fp32 attention_flash window masking (root cause fix)
+
+Root-caused the >1024 collapse to the fp32 KV path having no window masking.
+Per-layer oracle showed L0-L11 matched HF (Δ<0.1), L19 first warning (Δ=0.83),
+L20 first divergence (Δ=2.4, Sliding layer). Token-count scan showed collapse
+at exactly 1024 = sliding_window.
+
+Fixed by adding `kv_window` param to `attention_flash_partial` kernel (same
+chunk-clamping pattern as asym3 tile kernel). 3 HIP + 3 Rust + 1 bench changes.
+After fix: 1200-token oracle argmax=236761 matching HF.
+
+Commits: `8de8d1eb` (root cause doc), `41bd5d87` (fix).
+
+### Adversarial review of §4.5 plan
+
+Found 4 issues (written up in `findings/gemma4_phase15_review.md`):
+1. HIGH: ring-buffer branch not mergeable (predates dispatch, reverts fp32 fix)
+2. MEDIUM: daemon's sliding KV is fp32, not asym3 — ring-buffer kernels only for asym3
+3. MEDIUM: plumbing surface understated, derive logic missing
+4. LOW: stale kernel cache caution underspecified
+
+All four fixed in the plan document.
+
+### Daemon >1024 long-context enabled
+
+Sized sliding KV at `max_seq` instead of `sliding_window`. Dropped the refusal
+guard (replaced with a max_seq context-length guard). fp32 `attention_flash`
+now applies `kv_window` masking so only the last 1024 positions contribute.
+
+Validated: 1266-token prompt → coherent 3-sentence summary (104 tok @ 10.8 tok/s).
+
+Commit: `876c1158`.
+
+### Plan status update
+
+§4.5.1 Step A marked DONE. Status line updated. Risk register updated.
+
+### Next: Phase 1.5 Step B (ring-buffer KV)
+
+Pre-reqs per updated plan:
+1. Switch daemon's `kv_sliding` from fp32 to asym3 (`new_gpu_asym3`)
+2. Cherry-pick 3 HIP kernel diffs from `feat/gemma4-128k-ring-buffer`
+3. Write Rust sibling methods (`_cap`) and extend low-fan-out signatures
+4. Remove `let _ = cache_capacity` stubs in `gemma4_ext.rs`
+5. Gate: ring logits == window-only logits at >1024 tokens
