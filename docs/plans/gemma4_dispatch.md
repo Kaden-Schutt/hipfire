@@ -834,14 +834,21 @@ restoring proven kernels and closes the regression. Goal B (fwht3/fwht4) is a
 
 ---
 
-## 5 · Phase 2 — Migrate decode path to dispatch framework 🔲 IN PROGRESS
+## 5 · Phase 2 — Migrate decode path to dispatch framework ✅ DONE
 
 **Goal:** gemma4 single-token decode uses `execute_steps` and `AttentionFamily`
 for every projection. Old `weight_gemv` direct calls removed from the decode
 hot path.
 
-**Status:** §2b (attention) + §2c (hd512 routing) DONE. §2a (GEMV) and §2e
-(asym4/asym2 wiring) remain.
+**All sub-steps complete:**
+- §2a GEMV projections — `Step::Gemv` for all decode-path projections
+- §2b Attention — `Step::Attend` for sliding + full layers
+- §2c hd512 routing — dispatch branches on `head_dim==512` for asym3
+- §2d Fused QKV — non-goal (per-head norms prevent fusion)
+- §2e asym4/asym2 — completed implicitly by threading commit: dispatch
+  arms for all four quant modes (q8/asym3/asym4/asym2) already route
+  through `_cap` GPU methods. No model-crate branches needed —
+  `KvTierPlan::derive` selects the right keys automatically.
 
 **Goal:** gemma4 single-token decode uses `execute_steps` and `AttentionFamily`
 for every projection. Old `weight_gemv` direct calls removed from the decode
