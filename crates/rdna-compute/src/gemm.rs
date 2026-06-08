@@ -16858,6 +16858,15 @@ impl Gpu {
             kernels::GEMM_Q8_0_WMMA_GFX12_SRC,
             "gemm_q8_0_wmma_gfx12",
         )?;
+        // The pointer-keyed fp16-x cache in ensure_fp16_x skips reconversion when
+        // the source x pointer matches the last converted source. Callers routinely
+        // reuse the SAME x buffer with NEW contents across calls (the Q8 lm_head over
+        // batched verify rows; prefill x_rot_batch across layers; DFlash hidden reuse),
+        // which would serve STALE fp16 activations -> wrong matmul (lm_head attractor).
+        // Stomp the cache pointer to force reconversion. Mirrors the HFQ4 lm_head guard
+        // (gemm_hfq4g256_batched_lmhead). Cheap: the convert kernel is bandwidth-bound
+        // on b*k elems, negligible vs the GEMM.
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut a_p = a.buf.as_ptr();
