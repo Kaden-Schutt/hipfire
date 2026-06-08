@@ -834,7 +834,14 @@ restoring proven kernels and closes the regression. Goal B (fwht3/fwht4) is a
 
 ---
 
-## 5 · Phase 2 — Migrate decode path to dispatch framework 🔲 NOT STARTED
+## 5 · Phase 2 — Migrate decode path to dispatch framework 🔲 IN PROGRESS
+
+**Goal:** gemma4 single-token decode uses `execute_steps` and `AttentionFamily`
+for every projection. Old `weight_gemv` direct calls removed from the decode
+hot path.
+
+**Status:** §2b (attention) + §2c (hd512 routing) DONE. §2a (GEMV) and §2e
+(asym4/asym2 wiring) remain.
 
 **Goal:** gemma4 single-token decode uses `execute_steps` and `AttentionFamily`
 for every projection. Old `weight_gemv` direct calls removed from the decode
