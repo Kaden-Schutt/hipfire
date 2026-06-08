@@ -1032,7 +1032,7 @@ Prefill tok/s within ±3% of Phase 1 baseline on gfx1100 + gfx1201.
 
 ---
 
-## 7 · Phase 4 — MoE path migration 🔲 NOT STARTED
+## 7 · Phase 4 — MoE path migration 🔄 IN PROGRESS
 
 **Note:** MoE GPU methods are stubbed (return `HipError`) in Phase 1, so the
 26B-A4B model cannot run *yet* — all 8 MoE GEMV stubs need real implementations.
@@ -1040,6 +1040,15 @@ The **artifact is no longer a blocker**: the full 26B-A4B BF16 safetensors are
 present (`/local/models/google/gemma-4-26B-A4B-it`, both shards, ~49 GB, 2026-06-08).
 First Phase-4 step is to quantize it (`hipfire-quantize`, `arch_id=12`, MoE expert
 table handling) and symlink it for the coherence gate; then implement the stubs.
+
+**Status:**
+- Quantizer support: ✅ (expert 3D split, router Q8, router.scale fix)
+- 26B-A4B quantized: ✅ (15.6 GB, `/local/models/google/gemma-4-26B-A4B-it-mq4.hfq`)
+- Model loads: ✅ (~3 min, 30 layers × 128 experts)
+- MoE decode via legacy path: ✅ (per-expert CPU loop, 11.6 tok/s)
+- MoE prefill via legacy path: ✅ (per-token loop, slow but correct)
+- Output quality: ❓ (garbled — needs investigation)
+- Fused MoE GEMV kernels: 🔲 (stubs remain, deferred)
 
 **Goal:** gemma4 MoE (26B-A4B: 128 experts, k=8, per-expert SwiGLU FFN
 with `gelu_tanh` activation) goes through `MoeFamily` /

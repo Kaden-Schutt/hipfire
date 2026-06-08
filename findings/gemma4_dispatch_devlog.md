@@ -1771,3 +1771,52 @@ Commit `61de8cae`.
 | Phase 3 | ✅ Done |
 | Phase 4 | 🔲 MoE migration |
 | Phase 5 | 🔲 Validation |
+
+## Session 21 — Phase 4 MoE bring-up (2026-06-08)
+
+### Quantizer fixes for 26B-A4B
+
+Three quantizer changes needed:
+
+1. **Expert 3D split**: Extended the gate from `is_moe && name.contains("mlp.experts.")`
+   to name-suffix matching gated on `is_moe || is_gemma4`. Applied upstream's
+   approach from commit `918c4ed6` (jukefr branch).
+
+2. **Router Q8**: Added `is_gemma4` to `is_moe_like` + added `router.proj.weight`
+   to input-projection and `is_q8_tensor` lists.
+
+3. **router.scale skip**: The `.scale` suffix was unconditionally treated as
+   FP8 scale sibling and excluded from `all_tensors`. Gemma4's `router.scale`
+   is a real weight. Added exclusion for names containing `router.scale`.
+
+Quantized: `/local/models/google/gemma-4-26B-A4B-it-mq4.hfq` (15.6 GB, 25.8B params).
+
+### MoE decode + prefill
+
+The fused MoE GEMV kernels (`gemv_mq4g256_moe_gate_up_k8_indexed`,
+`gemv_hfq4g128_moe_down_residual_scaled_k8_indexed`, etc.) remain stubs.
+
+Both decode and prefill now use the **legacy per-expert CPU loop**:
+- Decode: 8-expert `weight_gemv` loop with D2H topk index download
+- Prefill: per-token outer loop × per-expert inner loop = n_batch × 8 GEMVs
+
+This matches the upstream's `apply_moe_branch` legacy path.
+
+### Results
+
+- Model loads in ~3 minutes
+- Decode at 11.6 tok/s (legacy path with D2H syncs)
+- Dense-only bypass at 66.6 tok/s
+- Output is garbled — quality investigation needed
+
+### Status
+
+| Phase | Status |
+|-------|--------|
+| Phase 0 | ✅ Done |
+| Phase 1 | ✅ Done |
+| Phase 1.5 | ✅ Done |
+| Phase 2 | ✅ Gated |
+| Phase 3 | ✅ Done |
+| Phase 4 | 🔄 Legacy path works, quality TBD, fused kernels deferred |
+| Phase 5 | 🔲 Validation |
