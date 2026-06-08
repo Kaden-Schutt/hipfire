@@ -21,6 +21,7 @@ export interface PrefixCheckpointManifest {
   stateKinds: readonly SessionStateKind[];
   runtimeState: "metadata_only" | "resident" | "attachable";
   runtimeStateHandle?: string;
+  runtimeLogicalPosition?: number;
   bytes: number;
   createdAtMs: number;
   lastUsedAtMs: number;
@@ -35,6 +36,7 @@ export interface CreatePrefixCheckpointManifestInput {
   bytes: number;
   runtimeState?: "metadata_only" | "resident" | "attachable";
   runtimeStateHandle?: string;
+  runtimeLogicalPosition?: number;
   createdAtMs: number;
   lastUsedAtMs?: number;
   hitCount?: number;
@@ -92,6 +94,7 @@ export function createPrefixCheckpointManifest(
     stateKinds: normalizeStateKinds(input.stateKinds),
     runtimeState: input.runtimeState ?? "metadata_only",
     runtimeStateHandle: input.runtimeStateHandle,
+    runtimeLogicalPosition: input.runtimeLogicalPosition,
     bytes: Math.max(0, Math.floor(input.bytes)),
     createdAtMs: input.createdAtMs,
     lastUsedAtMs: input.lastUsedAtMs ?? input.createdAtMs,

@@ -109,6 +109,32 @@ describe("prefix state cache keys", () => {
     expect(prefixCheckpointAttachable(resident)).toBe(false);
     expect(prefixCheckpointAttachable(attachable)).toBe(true);
   });
+
+  test("preserves runtime logical position without changing cache identity", () => {
+    const base = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [1, 2, 3],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      runtimeState: "attachable",
+      runtimeStateHandle: "qwen35-checkpoint:req",
+      runtimeLogicalPosition: 7,
+      createdAtMs: 10,
+    });
+    const sameKeyDifferentRuntimePosition = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [1, 2, 3],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      runtimeState: "attachable",
+      runtimeStateHandle: "qwen35-checkpoint:req",
+      runtimeLogicalPosition: 8,
+      createdAtMs: 10,
+    });
+
+    expect(base.runtimeLogicalPosition).toBe(7);
+    expect(prefixCheckpointCacheKey(base)).toBe(prefixCheckpointCacheKey(sameKeyDifferentRuntimePosition));
+  });
 });
 
 describe("state cache spill guardrails", () => {

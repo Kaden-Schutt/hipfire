@@ -747,6 +747,7 @@ struct GenerateBatchPrefillStateHandle {
     state_kinds: Vec<String>,
     logical_position: usize,
     cached_prefix_tokens: usize,
+    runtime_state_handle: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -987,6 +988,19 @@ fn validate_generate_batch_prefill(
         } else {
             0
         };
+        let runtime_state_handle = match state_handle.get("runtime_state_handle") {
+            Some(v) => Some(
+                v.as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        format!(
+                            "{prefix}.state_handle.runtime_state_handle must be a non-empty string"
+                        )
+                    })?
+                    .to_string(),
+            ),
+            None => None,
+        };
         if let Some(params) = session.get("params") {
             params
                 .as_object()
@@ -1045,6 +1059,7 @@ fn validate_generate_batch_prefill(
                 state_kinds: parsed_state_kinds,
                 logical_position,
                 cached_prefix_tokens,
+                runtime_state_handle,
             },
         });
     }
@@ -1142,6 +1157,34 @@ mod generate_batch_prefill_tests {
         assert_eq!(envelope.id, "0");
         assert_eq!(envelope.batch_id, "batch-2");
         assert_eq!(envelope.session_count, 1);
+    }
+
+    #[test]
+    fn validates_runtime_state_handle_for_attachable_prefix() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "batch_id": "batch-attach",
+            "model": "qwen3.5:9b",
+            "sessions": [{
+                "id": "req-1",
+                "suffix_tokens": [4, 5],
+                "state_handle": {
+                    "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                    "logical_position": 12,
+                    "cached_prefix_tokens": 12,
+                    "runtime_state_handle": "qwen35-checkpoint:req-0"
+                }
+            }]
+        });
+
+        let envelope = validate_generate_batch_prefill(&msg).expect("valid envelope");
+        assert_eq!(
+            envelope.sessions[0]
+                .state_handle
+                .runtime_state_handle
+                .as_deref(),
+            Some("qwen35-checkpoint:req-0")
+        );
     }
 
     #[test]
@@ -1290,6 +1333,28 @@ mod generate_batch_prefill_tests {
         });
         let err = validate_generate_batch_prefill(&msg).unwrap_err();
         assert!(err.contains("cached_prefix_tokens"));
+    }
+
+    #[test]
+    fn rejects_empty_runtime_state_handle() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-runtime-handle",
+            "batch_id": "batch-runtime-handle",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "suffix_tokens": [1],
+                "state_handle": {
+                    "state_kinds": ["attention_kv"],
+                    "logical_position": 1,
+                    "cached_prefix_tokens": 1,
+                    "runtime_state_handle": ""
+                }
+            }]
+        });
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains("runtime_state_handle"));
     }
 
     #[test]
@@ -2064,6 +2129,91 @@ struct Qwen35FusedDensePrefillBatchContract<'a> {
 }
 
 impl Qwen35RequestSessionState {
+    fn clone_gpu_tensor(
+        gpu: &mut rdna_compute::Gpu,
+        tensor: &rdna_compute::GpuTensor,
+        label: &str,
+    ) -> Result<rdna_compute::GpuTensor, String> {
+        hipfire_runtime::mtp_mirror::clone_tensor_same(gpu, tensor)
+            .map_err(|e| format!("clone qwen35 checkpoint {label}: {e:?}"))
+    }
+
+    fn clone_gpu_tensor_vec(
+        gpu: &mut rdna_compute::Gpu,
+        tensors: &[rdna_compute::GpuTensor],
+        label: &str,
+    ) -> Result<Vec<rdna_compute::GpuTensor>, String> {
+        tensors
+            .iter()
+            .enumerate()
+            .map(|(i, tensor)| Self::clone_gpu_tensor(gpu, tensor, &format!("{label}[{i}]")))
+            .collect()
+    }
+
+    fn clone_kv_cache(
+        gpu: &mut rdna_compute::Gpu,
+        kv: &llama::KvCache,
+    ) -> Result<llama::KvCache, String> {
+        Ok(llama::KvCache {
+            k_gpu: Self::clone_gpu_tensor_vec(gpu, &kv.k_gpu, "kv.k_gpu")?,
+            v_gpu: Self::clone_gpu_tensor_vec(gpu, &kv.v_gpu, "kv.v_gpu")?,
+            k_scales: Self::clone_gpu_tensor_vec(gpu, &kv.k_scales, "kv.k_scales")?,
+            v_scales: Self::clone_gpu_tensor_vec(gpu, &kv.v_scales, "kv.v_scales")?,
+            kv_dim: kv.kv_dim,
+            max_seq: kv.max_seq,
+            physical_cap: kv.physical_cap,
+            n_kv_heads: kv.n_kv_heads,
+            head_dim: kv.head_dim,
+            quantized: kv.quantized,
+            quant_q8: kv.quant_q8,
+            quant_int8: kv.quant_int8,
+            quant_hfq4: kv.quant_hfq4,
+            quant_asym4: kv.quant_asym4,
+            quant_asym3: kv.quant_asym3,
+            quant_asym2: kv.quant_asym2,
+            boundary_layers: kv.boundary_layers,
+            givens_cos: kv
+                .givens_cos
+                .as_ref()
+                .map(|tensor| Self::clone_gpu_tensor(gpu, tensor, "kv.givens_cos"))
+                .transpose()?,
+            givens_sin: kv
+                .givens_sin
+                .as_ref()
+                .map(|tensor| Self::clone_gpu_tensor(gpu, tensor, "kv.givens_sin"))
+                .transpose()?,
+            quant_fwht: kv.quant_fwht,
+            layer_is_boundary: kv.layer_is_boundary.clone(),
+            compact_offset: kv.compact_offset,
+        })
+    }
+
+    fn clone_dn_state(
+        gpu: &mut rdna_compute::Gpu,
+        dn: &DeltaNetState,
+    ) -> Result<DeltaNetState, String> {
+        Ok(DeltaNetState {
+            s_matrices: Self::clone_gpu_tensor_vec(gpu, &dn.s_matrices, "dn.s_matrices")?,
+            s_scales: Self::clone_gpu_tensor_vec(gpu, &dn.s_scales, "dn.s_scales")?,
+            conv_states: Self::clone_gpu_tensor_vec(gpu, &dn.conv_states, "dn.conv_states")?,
+            quant: dn.quant,
+        })
+    }
+
+    fn fork_from(
+        gpu: &mut rdna_compute::Gpu,
+        source: &Qwen35RequestSessionState,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            seq_pos: source.seq_pos,
+            conversation_tokens: source.conversation_tokens.clone(),
+            kv_cache: Self::clone_kv_cache(gpu, &source.kv_cache)?,
+            dn_state: Self::clone_dn_state(gpu, &source.dn_state)?,
+            logits: Self::clone_gpu_tensor(gpu, &source.logits, "logits")?,
+            prefilled_generated_suffix_len: source.prefilled_generated_suffix_len,
+        })
+    }
+
     fn take_from_loaded(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<Self, String> {
         if m.kv_cache.is_none() {
             return Err("qwen35 session missing KV cache".to_string());
@@ -2342,6 +2492,24 @@ fn qwen35_activate_session(
     Ok(!existed)
 }
 
+fn qwen35_fork_session_state(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    source_session_id: &str,
+    dest_session_id: &str,
+) -> Result<(), String> {
+    if source_session_id == dest_session_id {
+        return Ok(());
+    }
+    qwen35_save_active_session(m, gpu)?;
+    let source = m.q35_sessions.get(source_session_id).ok_or_else(|| {
+        format!("qwen35 checkpoint source session {source_session_id} is not resident")
+    })?;
+    let forked = Qwen35RequestSessionState::fork_from(gpu, source)?;
+    m.q35_sessions.insert(dest_session_id.to_string(), forked);
+    Ok(())
+}
+
 fn qwen35_reset_active_session(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -2367,6 +2535,14 @@ fn qwen35_restore_or_error(
             &format!("failed to restore qwen35 request session: {e}"),
         );
     }
+}
+
+fn qwen35_checkpoint_session_id(
+    batch_id: &str,
+    session_id: &str,
+    logical_position: usize,
+) -> String {
+    format!("qwen35-checkpoint:{batch_id}:{session_id}:{logical_position}")
 }
 
 fn qwen35_prefill_active_session(
@@ -3151,6 +3327,15 @@ fn run_generate_batch_prefill_serial_qwen35(
             ));
         }
 
+        if let Some(runtime_state_handle) = session.state_handle.runtime_state_handle.as_deref() {
+            qwen35_fork_session_state(m, gpu, runtime_state_handle, &session.id).map_err(|e| {
+                format!(
+                    "generate_batch_prefill session {} failed to attach checkpoint {}: {}",
+                    session.id, runtime_state_handle, e
+                )
+            })?;
+        }
+
         let resident = qwen35_session_resident(m, &session.id);
         if !resident
             && (session.state_handle.logical_position > 0
@@ -3204,6 +3389,14 @@ fn run_generate_batch_prefill_serial_qwen35(
 
     let result = qwen35_prefill_suffix_batch(m, gpu, &prepared, plan, backend)?;
     for session in &result.sessions {
+        let checkpoint_id =
+            qwen35_checkpoint_session_id(&envelope.batch_id, &session.id, session.logical_position);
+        qwen35_fork_session_state(m, gpu, &session.id, &checkpoint_id).map_err(|e| {
+            format!(
+                "generate_batch_prefill session {} failed to create checkpoint {}: {}",
+                session.id, checkpoint_id, e
+            )
+        })?;
         let mut line = serde_json::json!({
             "type": "generate_batch_prefill_session_done",
             "id": envelope.id,
@@ -3216,6 +3409,8 @@ fn run_generate_batch_prefill_serial_qwen35(
                 "kind": "qwen35_session",
                 "runtime_state": "resident",
                 "session_id": session.id,
+                "checkpoint_id": checkpoint_id,
+                "checkpoint_runtime_state": "attachable",
                 "logical_position": session.logical_position,
                 "cached_prefix_tokens": session.cached_prefix_tokens,
             },

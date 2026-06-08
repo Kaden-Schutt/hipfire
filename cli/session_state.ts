@@ -28,6 +28,7 @@ export interface SessionStateHandle {
   stateKinds: readonly SessionStateKind[];
   logicalPosition: number;
   cachedPrefixTokens: number;
+  runtimeStateHandle?: string;
 }
 
 export interface RequestSessionDraft {

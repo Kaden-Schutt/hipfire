@@ -1884,6 +1884,8 @@ async function serve(port: number, host: string) {
     plan?: string;
     backend?: string;
     runtimeStateHandle?: string;
+    checkpointStateHandle?: string;
+    checkpointLogicalPosition?: number;
     runtimeStateEvicted?: boolean;
   };
   type PendingPrefillRequest = {
@@ -3221,6 +3223,33 @@ async function serve(port: number, host: string) {
         let spillReason = "state_cache_disabled";
         let servingWorkerScheduler: PriorityPrefillScheduler | undefined;
         let releaseRuntimeSessionId: string | null = null;
+        const prefillPromptTokens = approximatePromptTokenIds(userPrompt);
+        const stateKinds = servingWorkerKinds;
+        const stateMode = servingWorkerStateMode;
+        const stateFlags = servingWorkerFeatureFlags;
+        const modelDigest = inferModelArtifactDigest(current);
+        const cacheKeyFingerprint: PrefixCheckpointFingerprint = {
+          modelArtifactDigest: inferModelArtifactDigest(current),
+          architectureId: currentArch ?? "unknown",
+          tokenizerHash: stableObjectHash({ model: current, arch: currentArch, kv: stateMode }),
+          chatTemplateHash: stableObjectHash({ arch: currentArch, model: current, mode: stateMode }),
+          runtimeConfigHash: stableObjectHash({
+            kv_mode: stateMode,
+            prefill_compression: effective.prefill_compression,
+            prefill_drafter: effective.prefill_drafter,
+            mtp_mode: effective.mtp_mode,
+            mtp_k: effective.mtp_k,
+            prompt_cache_key: body.prompt_cache_key ?? null,
+          }),
+          stateMode,
+          positionPolicy: "rope",
+          featureFlags: stateFlags,
+        };
+        const checksumLookup: Partial<Record<SessionStateKind, string>> = {};
+        for (const stateKind of stateKinds) {
+          checksumLookup[stateKind] = stableHash(`${cacheKeyFingerprint.modelArtifactDigest}|${stateKind}`);
+        }
+        const servingWorkerStateCache = getWorkerStateCache(servingWorkerKey);
         const requestPrefillDispatchStatus = prefillBatchRequestDispatchStatus({
           eligible: prefillBatchGate.eligible,
           capability: generateBatchPrefillCapability,
@@ -3229,31 +3258,7 @@ async function serve(port: number, host: string) {
         const requestCanUseDaemonPrefillBatch = requestPrefillDispatchStatus.canDispatch;
         if (serverPrefillBatch.enabled) {
           prefillBatchMetrics.queued += 1;
-          const promptTokens = approximatePromptTokenIds(userPrompt);
-          const stateKinds = servingWorkerKinds;
-          const stateMode = servingWorkerStateMode;
-          const stateFlags = servingWorkerFeatureFlags;
-          const modelDigest = inferModelArtifactDigest(current);
-          const cacheKeyFingerprint: PrefixCheckpointFingerprint = {
-            modelArtifactDigest: inferModelArtifactDigest(current),
-            architectureId: currentArch ?? "unknown",
-            tokenizerHash: stableObjectHash({ model: current, arch: currentArch, kv: stateMode }),
-            chatTemplateHash: stableObjectHash({ arch: currentArch, model: current, mode: stateMode }),
-            runtimeConfigHash: stableObjectHash({
-              kv_mode: stateMode,
-              prefill_compression: effective.prefill_compression,
-              prefill_drafter: effective.prefill_drafter,
-              mtp_mode: effective.mtp_mode,
-              mtp_k: effective.mtp_k,
-              prompt_cache_key: body.prompt_cache_key ?? null,
-            }),
-            stateMode,
-            positionPolicy: "rope",
-            featureFlags: stateFlags,
-          };
-
           servingWorkerScheduler = getWorkerPrefillScheduler(servingWorkerKey);
-          const servingWorkerStateCache = getWorkerStateCache(servingWorkerKey);
           if (prefillBatchGate.eligible && current !== null) {
             prefillBatchMetrics.eligible += 1;
             const modelArtifactBucket = currentMaxSeq ?? 4096;
@@ -3268,7 +3273,7 @@ async function serve(port: number, host: string) {
               acceleratorKind: serverAcceleratorKind,
               deviceId: serverDeviceId,
               featureFlags: stateFlags,
-              promptTokens,
+              promptTokens: prefillPromptTokens,
               priority: requestPriority,
               stateKinds,
             });
@@ -3285,12 +3290,12 @@ async function serve(port: number, host: string) {
 
             let cacheManifest: PrefixCheckpointManifest | undefined;
             const compatibleCacheLookup = [...servingWorkerStateCache.values()]
-              .filter((manifest) => manifest.prefixLen <= promptTokens.length)
+              .filter((manifest) => manifest.prefixLen <= prefillPromptTokens.length)
               .filter((manifest) => {
                 try {
                   return prefixCheckpointCompatible(manifest, {
                     fingerprint: cacheKeyFingerprint,
-                    prefixTokens: promptTokens.slice(0, manifest.prefixLen),
+                    prefixTokens: prefillPromptTokens.slice(0, manifest.prefixLen),
                     requiredStateKinds: stateKinds,
                   });
                 } catch { return false; }
@@ -3313,11 +3318,12 @@ async function serve(port: number, host: string) {
               serverPrefillSession = {
                 ...serverPrefillSession,
                 cachedPrefixTokens: cacheLookup.prefixLen,
-                suffixTokens: promptTokens.slice(cacheLookup.prefixLen),
+                suffixTokens: prefillPromptTokens.slice(cacheLookup.prefixLen),
                 stateHandle: {
                   ...serverPrefillSession.stateHandle,
                   cachedPrefixTokens: cacheLookup.prefixLen,
-                  logicalPosition: cacheLookup.prefixLen,
+                  logicalPosition: cacheLookup.runtimeLogicalPosition ?? cacheLookup.prefixLen,
+                  runtimeStateHandle: cacheLookup.runtimeStateHandle,
                 },
               };
             } else {
@@ -3328,14 +3334,10 @@ async function serve(port: number, host: string) {
               prefillBatchMetrics.cacheMisses += 1;
             }
 
-            const checksumLookup: Partial<Record<SessionStateKind, string>> = {};
-            for (const stateKind of stateKinds) {
-              checksumLookup[stateKind] = stableHash(`${cacheKeyFingerprint.modelArtifactDigest}|${stateKind}`);
-            }
-            const manifestPrefixLen = cachePrefixLen > 0 ? cachePrefixLen : promptTokens.length;
+            const manifestPrefixLen = cachePrefixLen > 0 ? cachePrefixLen : prefillPromptTokens.length;
             const manifest = cacheManifest ?? createPrefixCheckpointManifest({
               fingerprint: cacheKeyFingerprint,
-              prefixTokens: promptTokens.slice(0, manifestPrefixLen),
+              prefixTokens: prefillPromptTokens.slice(0, manifestPrefixLen),
               stateKinds,
               bytes: serverPrefillSession.suffixTokens.length * 16,
               createdAtMs: requestNowMs,
@@ -3699,6 +3701,9 @@ async function serve(port: number, host: string) {
               },
               params: sessionParams,
             };
+            if (draft.stateHandle.runtimeStateHandle) {
+              payload.state_handle.runtime_state_handle = draft.stateHandle.runtimeStateHandle;
+            }
             if (draft.cachedPrefixTokens > 0) {
               payload.suffix_tokens = draft.suffixTokens;
             } else {
@@ -3747,6 +3752,8 @@ async function serve(port: number, host: string) {
               let prefillDone = false;
               const sessionPrefillTokens = new Map<string, number>();
               const runtimeStateHandlesBySession = new Map<string, string>();
+              const checkpointStateHandlesBySession = new Map<string, string>();
+              const logicalPositionsBySession = new Map<string, number>();
               for (let i = 0; i < 8; i++) {
                 const prefillMsg = await e.recv();
                 if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === runtimeBatchId) {
@@ -3778,6 +3785,20 @@ async function serve(port: number, host: string) {
                   ) {
                     runtimeStateHandlesBySession.set(prefillMsg.session_id, stateHandle.session_id);
                     residentRuntimeSessions.add(stateHandle.session_id);
+                  }
+                  if (
+                    typeof prefillMsg.session_id === "string" &&
+                    typeof prefillMsg.logical_position === "number"
+                  ) {
+                    logicalPositionsBySession.set(prefillMsg.session_id, prefillMsg.logical_position);
+                  }
+                  if (
+                    typeof prefillMsg.session_id === "string" &&
+                    stateHandle &&
+                    typeof stateHandle.checkpoint_id === "string"
+                  ) {
+                    checkpointStateHandlesBySession.set(prefillMsg.session_id, stateHandle.checkpoint_id);
+                    residentRuntimeSessions.add(stateHandle.checkpoint_id);
                   }
                   continue;
                 }
@@ -3817,6 +3838,37 @@ async function serve(port: number, host: string) {
                 stateCacheEvictionsTotal += evictedRuntimeHandles.length;
                 stateCacheRecomputeRequiredTotal += evictedRuntimeHandles.length;
               }
+              const storeAttachableCheckpoint = (
+                draft: RequestSessionDraft,
+                checkpointHandle: string | undefined,
+                runtimeLogicalPosition: number | undefined,
+              ) => {
+                if (!serverPrefillBatchControls.stateCacheDisk || !checkpointHandle) return;
+                const prefixLen = Math.min(
+                  draft.promptTokens.length,
+                  Math.max(0, draft.cachedPrefixTokens + draft.suffixTokens.length),
+                );
+                if (prefixLen <= 0) return;
+                const checkpointManifest = createPrefixCheckpointManifest({
+                  fingerprint: cacheKeyFingerprint,
+                  prefixTokens: draft.promptTokens.slice(0, prefixLen),
+                  stateKinds: draft.stateHandle.stateKinds,
+                  bytes: Math.max(1, prefixLen) * 16,
+                  runtimeState: "attachable",
+                  runtimeStateHandle: checkpointHandle,
+                  runtimeLogicalPosition,
+                  createdAtMs: requestNowMs,
+                  lastUsedAtMs: Date.now(),
+                  hitCount: 0,
+                  checksums: checksumLookup,
+                });
+                servingWorkerStateCache.set(prefixCheckpointCacheKey(checkpointManifest), checkpointManifest);
+              };
+              storeAttachableCheckpoint(
+                serverPrefillSession,
+                checkpointStateHandlesBySession.get(reqId),
+                logicalPositionsBySession.get(reqId),
+              );
               if (evictedSessionIds.has(reqId)) {
                 genParams.prefill_already_done = false;
                 releaseRuntimeSessionId = null;
@@ -3854,6 +3906,8 @@ async function serve(port: number, host: string) {
                   plan: genParams.server_prefill_batch?.daemon_prefill_plan,
                   backend: genParams.server_prefill_batch?.daemon_prefill_backend,
                   runtimeStateHandle: runtimeStateEvicted ? undefined : runtimeStateHandle,
+                  checkpointStateHandle: checkpointStateHandlesBySession.get(selected.id),
+                  checkpointLogicalPosition: logicalPositionsBySession.get(selected.id),
                   runtimeStateEvicted,
                 });
               }
@@ -3947,6 +4001,32 @@ async function serve(port: number, host: string) {
                 if (pendingOutcome.backend) genParams.server_prefill_batch.daemon_prefill_backend = pendingOutcome.backend;
                 if (pendingOutcome.runtimeStateHandle) {
                   genParams.server_prefill_batch.runtime_state_handle = pendingOutcome.runtimeStateHandle;
+                }
+              }
+              if (
+                serverPrefillBatchControls.stateCacheDisk &&
+                pendingOutcome.checkpointStateHandle &&
+                serverPrefillSession
+              ) {
+                const prefixLen = Math.min(
+                  prefillPromptTokens.length,
+                  Math.max(0, serverPrefillSession.cachedPrefixTokens + serverPrefillSession.suffixTokens.length),
+                );
+                if (prefixLen > 0) {
+                  const checkpointManifest = createPrefixCheckpointManifest({
+                    fingerprint: cacheKeyFingerprint,
+                    prefixTokens: prefillPromptTokens.slice(0, prefixLen),
+                    stateKinds,
+                    bytes: Math.max(1, prefixLen) * 16,
+                    runtimeState: "attachable",
+                    runtimeStateHandle: pendingOutcome.checkpointStateHandle,
+                    runtimeLogicalPosition: pendingOutcome.checkpointLogicalPosition,
+                    createdAtMs: requestNowMs,
+                    lastUsedAtMs: Date.now(),
+                    hitCount: 0,
+                    checksums: checksumLookup,
+                  });
+                  servingWorkerStateCache.set(prefixCheckpointCacheKey(checkpointManifest), checkpointManifest);
                 }
               }
               releaseRuntimeSessionId = pendingOutcome.runtimeStateEvicted

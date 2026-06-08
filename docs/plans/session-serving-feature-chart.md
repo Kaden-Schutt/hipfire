@@ -28,7 +28,7 @@ Status legend:
 | Server two-request coalescing | COMPLETE | Two compatible non-streaming HTTP requests coalesce, timeout fallback cleans pending waiters, daemon prefill runs, both decode with `prefill_already_done`, and runtime sessions are released. | `scripts/smoke-server-prefill-batch.sh` | Add live client-abort coverage when the harness can do it without flake. |
 | Qwen35 MoE/A3B grouped fused prefill | COMPLETE | Grouped MoE candidate and fused grouped backend pass 2/4/8 MQ4 control smokes including generated-suffix replay. Auto backend selects `fused_grouped_moe` for eligible grouped-MoE candidate plans. | `qwen35::forward_prefill_grouped_moe_session_batch`, daemon backend selection, `scripts/smoke-generate-batch-prefill.sh` | Add BF16/MQ variant coverage. |
 | Unsupported architecture fallback | COMPLETE | Non-Qwen35 architectures report unsupported cleanly for `generate_batch_prefill`. | `scripts/smoke-generate-batch-prefill.sh` | Add arch-specific ports when their session-state contracts exist. |
-| Prefix checkpoint metadata | IN PROGRESS | Fingerprint, prefix hash, manifest, compatibility, runtime-state classification, touch, and spill guardrails exist. Metadata-only hits are counted but not reused. | `cli/state_cache.ts`, `cli/state_cache.test.ts` | Add real attach/fork for runtime checkpoints. |
+| Prefix checkpoint attach/fork | IN PROGRESS | Fingerprint, prefix hash, manifest compatibility, runtime-state classification, and spill guardrails exist. Qwen35 single-GPU prefill now returns attachable checkpoint handles; compatible cache hits pass those handles back to the daemon for forked suffix prefill. | `cli/state_cache.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs` | Add runtime lifecycle caps/eviction and genericize beyond Qwen35 resident checkpoints. |
 | Prefix-cache health/telemetry shell | IN PROGRESS | `/health` exposes batching/cache metadata, metadata-only hits, runtime hits, and resident runtime session count when server prefill batching is enabled. | `cli/index.ts`, `cli/prefill_batch_health.ts`, `cli/prefill_batch_health.test.ts` | Add cached-token, rehydrate, and spill counters after runtime attach exists. |
 | Startup accelerator inventory | COMPLETE | Server startup probes HIP GPU inventory and best-effort NPU/XDNA presence, logs counts, and exposes inventory through `/health`. | `cli/index.ts` | Replace best-effort sysfs inventory with daemon/HIP-owned placement when multi-worker residency starts. |
 | Multi-model worker registry | BLOCKED | Request routing still uses one current loaded model and reloads globally. Worker-key metadata exists, but no resident worker registry. | `cli/index.ts`, `cli/session_state.ts` | Implement daemon/server model worker registry and residency policy. |
@@ -72,7 +72,7 @@ Status legend:
 | Generic `ModelWorker` abstraction | BLOCKED | Trait exists only in plan text; worker keys now carry placement identity but no multi-worker runtime registry exists. |
 | Multiple resident workers | BLOCKED | Server/daemon still center around one loaded model at a time. |
 | Generic sequence-state arena | BLOCKED | Needed for reusable prefix cache, multi-model sessions, Mamba hybrids, and decode batching. |
-| Runtime prefix checkpoint attach | BLOCKED | Metadata exists and cannot be used unless classified as attachable; no runtime page attach/copy-on-write machinery exists yet. |
+| Qwen35 runtime prefix checkpoint attach | IN PROGRESS | Single-GPU Qwen35 prefill checkpoints can be forked from resident daemon state for cache-hit suffix prefill. Generic page attach/copy-on-write is still absent. |
 | Mamba/Nemotron-H state support | BLOCKED | Requires state layout derivation and recurrent state arena. |
 | Native stateful surfaces | DEFERRED | `/v1/responses`, conversations, or native sessions are additive future work. |
 
@@ -93,10 +93,10 @@ Recent focused validation for this status:
 
 | Priority | Slice | Why |
 |---|---|---|
-| 1 | Add Qwen35 runtime checkpoint attach/fork or explicitly keep cache metadata-only. | The server now refuses metadata-only prefix reuse; real reuse needs a safe runtime state operation. |
-| 2 | Start generic runtime `ModelWorker`/state arena design in code. | This unblocks true multi-model residency, disk spill, Mamba hybrids, and decode batching. |
-| 3 | Replace CLI-only accelerator placement with daemon-owned device placement. | Worker keys are device-aware, but execution is still one selected HIP GPU. |
-| 4 | Add live client-abort server coverage when practical. | Timeout cleanup is covered; abort still needs a reliable harness. |
+| 1 | Add checkpoint lifecycle caps plus release/eviction for stale attachable handles. | Attach/fork now creates resident checkpoint sessions; the next risk is unbounded VRAM growth under varied prefixes. |
+| 2 | Add live cache-reuse smoke/parity coverage. | Unit tests cover protocol parsing; we still need a daemon/server smoke proving second request skips prefix prefill and preserves first-token parity. |
+| 3 | Start generic runtime `ModelWorker`/state arena design in code. | This unblocks true multi-model residency, disk spill, Mamba hybrids, and decode batching. |
+| 4 | Replace CLI-only accelerator placement with daemon-owned device placement. | Worker keys are device-aware, but execution is still one selected HIP GPU. |
 | 5 | Add BF16/MQ variant coverage for MoE/A3B grouped fused prefill. | MQ4 control is covered at 2/4/8; dtype/format breadth remains. |
 
 ## Retired Goal File Coverage
