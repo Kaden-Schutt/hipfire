@@ -148,13 +148,15 @@ fn main() {
 
     let m_state = zeros_like(&mut gpu, &net);
     let v_state = zeros_like(&mut gpu, &net);
+    gpu.pool_begin_scope(); // persistent tensors above; per-step allocs released below
     let (lr, b1, b2, eps_a, wd) = (2e-3f32, 0.9f32, 0.999f32, 1e-8f32, 0.0f32);
-    let steps = 100usize;
+    let steps = 300usize;
     println!("overfit ONE real block (p={p}, n_ctx={n_ctx}); ln(vocab)={:.3}", (vocab as f32).ln());
     let wsum: f32 = weights.iter().sum();
     let mut first = 0f32;
 
     for step in 1..=steps {
+        let ck = gpu.pool_checkpoint();
         // forward
         let body_in = dt::lin(&mut gpu, &embed_in_g, &net.in_proj_v, bsz, d_tgt, d);
         let ctx = dt::lin(&mut gpu, &ctxh_g, &net.fc, n_ctx, fc_in, d);
@@ -188,6 +190,7 @@ fn main() {
             let n = ps[i].numel();
             gpu.adam_step_f32(ps[i], gs[i], ms[i], vs[i], lr, b1, b2, eps_a, wd, bc1, bc2, n).unwrap();
         }
+        gpu.pool_release_to(ck); // return this step's allocations to the pool
     }
 
     // final eval + argmax

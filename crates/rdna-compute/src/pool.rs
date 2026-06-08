@@ -20,6 +20,11 @@ pub struct GpuPool {
     pub total_allocated: usize,
     pub total_reused: usize,
     pub total_new: usize,
+    // Training scope: record handed-out (addr,size) so release_to can return a
+    // whole step's allocations to the free-list at once. DeviceBuffer has no Drop,
+    // so reconstructing via from_raw and pooling it is safe.
+    scoping: bool,
+    scoped: Vec<(usize, usize)>,
 }
 
 impl GpuPool {
@@ -29,6 +34,8 @@ impl GpuPool {
             total_allocated: 0,
             total_reused: 0,
             total_new: 0,
+            scoping: false,
+            scoped: Vec::new(),
         }
     }
 
@@ -62,6 +69,7 @@ impl GpuPool {
             while let Some(buf) = list.pop() {
                 if buf.size() >= size {
                     self.total_reused += 1;
+                    if self.scoping { self.scoped.push((buf.as_ptr() as usize, buf.size())); }
                     return Ok(buf);
                 }
                 let _ = hip.free(buf);
@@ -73,7 +81,20 @@ impl GpuPool {
         let actual = if size < MIN_ALLOC { MIN_ALLOC } else { size };
         self.total_new += 1;
         self.total_allocated += actual;
-        hip.malloc(actual)
+        let buf = hip.malloc(actual)?;
+        if self.scoping { self.scoped.push((buf.as_ptr() as usize, buf.size())); }
+        Ok(buf)
+    }
+
+    pub fn begin_scope(&mut self) { self.scoping = true; }
+    pub fn checkpoint(&self) -> usize { self.scoped.len() }
+    pub fn release_to(&mut self, mark: usize) {
+        let drained: Vec<(usize, usize)> = self.scoped.split_off(mark);
+        for (addr, size) in drained {
+            let buf = unsafe { DeviceBuffer::from_raw(addr as *mut std::ffi::c_void, size) };
+            let bucket = Self::bucket_key(size);
+            self.free_lists.entry(bucket).or_default().push(buf);
+        }
     }
 
     /// Return a buffer to the pool for reuse. The buffer's ACTUAL

@@ -1,0 +1,290 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+//
+// DFlash FR3/FR4: streaming trainer for the LFM2.5-350M DFlash drafter on REAL
+// data — warm-start body + real Qwen3.6-27B target hiddens (context) + faithful
+// frozen lm_head + real tokens. Multi-sequence/multi-block sampling, block-
+// diffusion position-weighted CE, AdamW with warmup+cosine, pool-scoped memory
+// (stable over thousands of steps), periodic PROXY-τ eval (mean accepted prefix
+// = argmax-vs-target leading run on held-out blocks ≈ spec-decode acceptance),
+// and checkpointing.
+//
+//   dflash_train_run <embed.f32> <lmhead.f32> <data_dir> <kldref> <out_ckpt>
+//     [steps] [lr] [n_train_chunks]
+// data_dir holds chunk{c}.hfhs (5-layer dumps); kldref provides tokens per chunk.
+
+use hipfire_arch_lfm2moe::dflash_train as dt;
+use rdna_compute::{DType, Gpu, GpuTensor};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+const SEL: [usize; 5] = [2, 16, 31, 46, 61];
+
+fn read_head(path: &str) -> (usize, usize, Vec<f32>) {
+    let mut f = std::fs::File::open(path).expect("head");
+    let mut hdr = [0u8; 16]; f.read_exact(&mut hdr).unwrap();
+    assert_eq!(&hdr[0..8], b"DFHEAD\0\0");
+    let vocab = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+    let dim = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
+    let mut raw = Vec::new(); f.read_to_end(&mut raw).unwrap();
+    (vocab, dim, raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+fn read_hfhs(path: &str) -> (usize, usize, Vec<Vec<f32>>) {
+    let mut f = std::fs::File::open(path).unwrap_or_else(|_| panic!("hfhs {path}"));
+    let mut hdr = [0u8; 24]; f.read_exact(&mut hdr).unwrap();
+    assert_eq!(&hdr[0..8], b"HFHS\0\0\0\0");
+    let n_layers = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+    let n_pos = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
+    let hidden = u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as usize;
+    let lb = n_pos * hidden * 4;
+    let mut out = Vec::new();
+    for &l in &SEL {
+        assert!(l < n_layers);
+        f.seek(SeekFrom::Start(24 + (l * lb) as u64)).unwrap();
+        let mut raw = vec![0u8; lb]; f.read_exact(&mut raw).unwrap();
+        out.push(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect());
+    }
+    (n_pos, hidden, out)
+}
+fn read_toks(path: &str) -> Vec<u32> {
+    let mut f = std::fs::File::open(path).unwrap_or_else(|_| panic!("toks {path}"));
+    let mut raw = Vec::new(); f.read_to_end(&mut raw).unwrap();
+    raw.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+fn up(gpu: &mut Gpu, v: &[f32], sh: &[usize]) -> GpuTensor { gpu.upload_f32(v, sh).unwrap() }
+fn zt(gpu: &mut Gpu, n: usize) -> GpuTensor { gpu.zeros(&[n], DType::F32).unwrap() }
+fn rndv(gpu: &mut Gpu, rows: usize, cols: usize, seed: usize, sc: f32) -> GpuTensor {
+    let v: Vec<f32> = (0..rows * cols).map(|i| (((i.wrapping_mul(2654435761).wrapping_add(seed)) % 2000) as f32 / 1000.0 - 1.0) * sc).collect();
+    up(gpu, &v, &[rows, cols])
+}
+fn zeros_like(gpu: &mut Gpu, src: &dt::Net) -> dt::Net {
+    let mk = |g: &mut Gpu, t: &GpuTensor| g.zeros(&[t.numel()], DType::F32).unwrap();
+    let layers = src.layers.iter().map(|l| dt::LW {
+        op_norm: mk(gpu, &l.op_norm), ffn_norm: mk(gpu, &l.ffn_norm),
+        in_proj: l.in_proj.as_ref().map(|t| mk(gpu, t)), conv_w: l.conv_w.as_ref().map(|t| mk(gpu, t)),
+        out_proj: l.out_proj.as_ref().map(|t| mk(gpu, t)),
+        wq: l.wq.as_ref().map(|t| mk(gpu, t)), wk: l.wk.as_ref().map(|t| mk(gpu, t)),
+        wv: l.wv.as_ref().map(|t| mk(gpu, t)), wo: l.wo.as_ref().map(|t| mk(gpu, t)),
+        q_norm: l.q_norm.as_ref().map(|t| mk(gpu, t)), k_norm: l.k_norm.as_ref().map(|t| mk(gpu, t)),
+        w1: mk(gpu, &l.w1), w3: mk(gpu, &l.w3), w2: mk(gpu, &l.w2),
+    }).collect();
+    dt::Net { layers, in_proj_v: mk(gpu, &src.in_proj_v), out_proj_v: mk(gpu, &src.out_proj_v), fc: mk(gpu, &src.fc), final_norm: mk(gpu, &src.final_norm) }
+}
+
+// deterministic xorshift PRNG (Math.random unavailable; seedable + replayable)
+struct Rng(u64);
+impl Rng { fn next(&mut self) -> u64 { let mut x = self.0; x ^= x << 13; x ^= x >> 7; x ^= x << 17; self.0 = x; x } fn usize(&mut self, n: usize) -> usize { (self.next() % n as u64) as usize } }
+
+struct Seq { layers5: Vec<Vec<f32>>, tokens: Vec<u32>, n_pos: usize }
+
+fn main() {
+    let a: Vec<String> = std::env::args().collect();
+    let embed_path = a.get(1).map(|s| s.as_str()).unwrap_or("/workspace/qwen3.6-27b.head.f32");
+    let lmhead_path = a.get(2).map(|s| s.as_str()).unwrap_or("/workspace/qwen3.6-27b.lmhead.f32");
+    let data_dir = a.get(3).map(|s| s.as_str()).unwrap_or("/workspace/dflash-regen");
+    let kldref = a.get(4).map(|s| s.as_str()).unwrap_or("/workspace/qwen3.6-27b-native.kldref.bin");
+    let out_ckpt = a.get(5).map(|s| s.to_string()).unwrap_or("/workspace/lfm2-dflash-draft.dfnet".to_string());
+    let steps: usize = a.get(6).and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let lr_max: f32 = a.get(7).and_then(|s| s.parse().ok()).unwrap_or(2e-4);
+    let n_chunks: usize = a.get(8).and_then(|s| s.parse().ok()).unwrap_or(16);
+    let st_path = "/root/.cache/huggingface/hub/models--LiquidAI--LFM2.5-350M-Base/snapshots/9960764e30892e01f29a6dc23df2533fcd8bd5ae/model.safetensors";
+
+    let mut gpu = Gpu::init().expect("gpu");
+    let (vocab, d_tgt, embed) = read_head(embed_path);
+    let (lvocab, ldim, lmhead) = read_head(lmhead_path);
+    assert_eq!((lvocab, ldim), (vocab, d_tgt), "lmhead/embed dim mismatch");
+    let cfg = dt::Cfg::lfm2_350m(d_tgt, vocab, 5);
+    let d = cfg.d; let fc_in = 5 * d_tgt; let ws = 1.0 / (d as f32).sqrt();
+    println!("vocab={vocab} d_tgt={d_tgt} d={d} steps={steps} lr_max={lr_max} chunks={n_chunks}");
+
+    // load sequences (chunk{c}.hfhs + tokens)
+    let mut seqs = Vec::new();
+    for c in 0..n_chunks {
+        let hp = format!("{data_dir}/chunk{c}.hfhs");
+        if !Path::new(&hp).exists() { eprintln!("  (missing {hp}, stopping at {c} chunks)"); break; }
+        let tp = format!("{data_dir}/chunk{c}.toks");
+        if !Path::new(&tp).exists() { eprintln!("  (missing {tp}, stopping at {c} chunks)"); break; }
+        let (n_pos, hidden, layers5) = read_hfhs(&hp);
+        assert_eq!(hidden, d_tgt);
+        let tokens = read_toks(&tp);
+        let _ = kldref;
+        seqs.push(Seq { layers5, tokens, n_pos });
+    }
+    let n_seq = seqs.len();
+    assert!(n_seq >= 2, "need >=2 sequences (got {n_seq})");
+    let n_eval = 2.min(n_seq - 1);
+    let n_tr = n_seq - n_eval;
+    println!("loaded {n_seq} sequences ({n_tr} train, {n_eval} eval)");
+
+    // frozen head on GPU (faithful lm_head)
+    let lm_head_g = up(&mut gpu, &lmhead, &[vocab, d_tgt]);
+    // warm-start net + fresh adapters
+    let (body_layers, final_norm) = dt::load_lfm2_warmstart(&mut gpu, &cfg, Path::new(st_path)).expect("warm-start");
+    let net = dt::Net {
+        layers: body_layers,
+        in_proj_v: rndv(&mut gpu, d, d_tgt, 1, 1.0 / (d_tgt as f32).sqrt()),
+        out_proj_v: rndv(&mut gpu, d_tgt, d, 2, ws),
+        fc: rndv(&mut gpu, d, fc_in, 3, 1.0 / (fc_in as f32).sqrt()),
+        final_norm,
+    };
+    let m_state = zeros_like(&mut gpu, &net);
+    let v_state = zeros_like(&mut gpu, &net);
+
+    let bsz = 16usize; let n_ctx = 32usize; let mask_id = 0usize; let gamma = 8.0f32;
+    let warmup = (steps / 20).max(20);
+    let (b1, b2, eps_a, wd) = (0.9f32, 0.999f32, 1e-8f32, 0.01f32);
+    // seed-anchor: position 0 is the revealed seed (weight 0); predict 1..B with w_k
+    let weights: Vec<f32> = (0..bsz).map(|k| if k == 0 { 0.0 } else { (-((k - 1) as f32) / gamma).exp() }).collect();
+    let wsum: f32 = weights.iter().sum();
+    let weights_g = up(&mut gpu, &weights, &[bsz]);
+    let block_pos: Vec<i32> = (0..bsz).map(|i| (n_ctx + i) as i32).collect();
+    let mut full: Vec<i32> = (0..n_ctx).map(|i| i as i32).collect(); full.extend(block_pos.iter().copied());
+    let block_pos_g = dt::upos(&mut gpu, &block_pos);
+    let full_pos_g = dt::upos(&mut gpu, &full);
+    let conv_state = gpu.zeros(&[d, cfg.conv_k - 1], DType::F32).unwrap();
+    // mask-token embedding row (constant input for masked positions)
+    let mask_emb: Vec<f32> = embed[mask_id * d_tgt..(mask_id + 1) * d_tgt].to_vec();
+
+    // build a [n_ctx, fc_in] context-hidden host buffer for a given (seq, p)
+    let ctx_hiddens = |s: &Seq, p: usize| -> Vec<f32> {
+        let mut c = vec![0f32; n_ctx * fc_in];
+        for (ci, pos) in (p - n_ctx..p).enumerate() {
+            for (li, layer) in s.layers5.iter().enumerate() {
+                c[ci * fc_in + li * d_tgt..ci * fc_in + (li + 1) * d_tgt].copy_from_slice(&layer[pos * d_tgt..(pos + 1) * d_tgt]);
+            }
+        }
+        c
+    };
+
+    let mut rng = Rng(0x9E3779B97F4A7C15);
+    gpu.pool_begin_scope();
+    let mut running = 0f32;
+    for step in 1..=steps {
+        let ck = gpu.pool_checkpoint();
+        // sample a train block
+        let si = rng.usize(n_tr);
+        let s = &seqs[si];
+        let p = n_ctx + rng.usize(s.n_pos - n_ctx - bsz);
+        let ctxh = ctx_hiddens(s, p);
+        let targets: Vec<i32> = (0..bsz).map(|i| s.tokens[p + i] as i32).collect();
+        // all-masked block input
+        let mut embed_in = vec![0f32; bsz * d_tgt];
+        let seed_tok = s.tokens[p] as usize; // block pos 0 = committed seed (revealed)
+        embed_in[0..d_tgt].copy_from_slice(&embed[seed_tok * d_tgt..(seed_tok + 1) * d_tgt]);
+        for b in 1..bsz { embed_in[b * d_tgt..(b + 1) * d_tgt].copy_from_slice(&mask_emb); }
+        let ctxh_g = up(&mut gpu, &ctxh, &[n_ctx, fc_in]);
+        let embed_in_g = up(&mut gpu, &embed_in, &[bsz, d_tgt]);
+        let targets_g = dt::ui32(&mut gpu, &targets);
+        // lr schedule: linear warmup then cosine
+        let lr = if step <= warmup { lr_max * step as f32 / warmup as f32 }
+                 else { let t = (step - warmup) as f32 / (steps - warmup).max(1) as f32; 0.5 * lr_max * (1.0 + (std::f32::consts::PI * t).cos()) };
+        // forward
+        let body_in = dt::lin(&mut gpu, &embed_in_g, &net.in_proj_v, bsz, d_tgt, d);
+        let ctx = dt::lin(&mut gpu, &ctxh_g, &net.fc, n_ctx, fc_in, d);
+        let (body_out, tape) = dt::body_forward(&mut gpu, &cfg, &net.layers, &body_in, &ctx, &block_pos_g, &full_pos_g, &conv_state, bsz, n_ctx);
+        let fn2 = gpu.zeros(&[bsz, d], DType::F32).unwrap();
+        gpu.rmsnorm_batched(&body_out, &net.final_norm, &fn2, bsz, d, cfg.eps).unwrap();
+        let out = dt::lin(&mut gpu, &fn2, &net.out_proj_v, bsz, d, d_tgt);
+        let logits = dt::lin(&mut gpu, &out, &lm_head_g, bsz, d_tgt, vocab);
+        let dlogits = gpu.zeros(&[bsz, vocab], DType::F32).unwrap();
+        let loss_t = gpu.zeros(&[bsz], DType::F32).unwrap();
+        gpu.ce_loss_bwd_f32(&logits, &targets_g, &weights_g, &dlogits, &loss_t, bsz, vocab).unwrap();
+        let loss: f32 = gpu.download_f32(&loss_t).unwrap().iter().sum::<f32>() / wsum;
+        running = if step == 1 { loss } else { 0.98 * running + 0.02 * loss };
+        // backward
+        let d_out = dt::lin_dx(&mut gpu, &dlogits, &lm_head_g, bsz, d_tgt, vocab);
+        let d_fn2 = dt::lin_dx(&mut gpu, &d_out, &net.out_proj_v, bsz, d, d_tgt);
+        let g_out_proj_v = dt::lin_dw(&mut gpu, &d_out, &fn2, bsz, d, d_tgt);
+        let d_body_out = zt(&mut gpu, bsz * d); let g_final_norm = zt(&mut gpu, d);
+        gpu.rmsnorm_bwd_f32(&body_out, &net.final_norm, &d_fn2, &d_body_out, &g_final_norm, bsz, d, cfg.eps).unwrap();
+        let (d_body_in, d_ctx, glayers) = dt::body_backward(&mut gpu, &cfg, &net.layers, &tape, &d_body_out, &ctx, &block_pos_g, &full_pos_g, &conv_state, bsz, n_ctx);
+        let g_in_proj_v = dt::lin_dw(&mut gpu, &d_body_in, &embed_in_g, bsz, d_tgt, d);
+        let g_fc = dt::lin_dw(&mut gpu, &d_ctx, &ctxh_g, n_ctx, fc_in, d);
+        let grad = dt::Net { layers: glayers, in_proj_v: g_in_proj_v, out_proj_v: g_out_proj_v, fc: g_fc, final_norm: g_final_norm };
+        let bc1 = 1.0 / (1.0 - b1.powi(step as i32)); let bc2 = 1.0 / (1.0 - b2.powi(step as i32));
+        let ps = dt::net_tensors(&net); let gs = dt::net_tensors(&grad); let ms = dt::net_tensors(&m_state); let vs = dt::net_tensors(&v_state);
+        for i in 0..ps.len() { let n = ps[i].numel(); gpu.adam_step_f32(ps[i], gs[i], ms[i], vs[i], lr, b1, b2, eps_a, wd, bc1, bc2, n).unwrap(); }
+        gpu.pool_release_to(ck);
+
+        if step % 100 == 0 || step == 1 {
+            println!("  step {step:5}/{steps}  loss={loss:.4} (ema {running:.4})  lr={lr:.2e}");
+        }
+        // proxy-τ eval (mean accepted prefix) on held-out blocks
+        if step % 500 == 0 || step == steps {
+            let ck2 = gpu.pool_checkpoint();
+            let mut acc_sum = 0f32; let mut nb = 0;
+            for ei in n_tr..n_seq {
+                let s = &seqs[ei];
+                for bi in 0..8 {
+                    let p = n_ctx + bi * ((s.n_pos - n_ctx - bsz) / 8).max(1);
+                    if p + bsz > s.n_pos { break; }
+                    let ctxh = ctx_hiddens(s, p);
+                    let targets: Vec<i32> = (0..bsz).map(|i| s.tokens[p + i] as i32).collect();
+                    let mut embed_in = vec![0f32; bsz * d_tgt];
+                    for b in 0..bsz { embed_in[b * d_tgt..(b + 1) * d_tgt].copy_from_slice(&mask_emb); }
+                    let ctxh_g = up(&mut gpu, &ctxh, &[n_ctx, fc_in]);
+                    let embed_in_g = up(&mut gpu, &embed_in, &[bsz, d_tgt]);
+                    let body_in = dt::lin(&mut gpu, &embed_in_g, &net.in_proj_v, bsz, d_tgt, d);
+                    let ctx = dt::lin(&mut gpu, &ctxh_g, &net.fc, n_ctx, fc_in, d);
+                    let (body_out, _t) = dt::body_forward(&mut gpu, &cfg, &net.layers, &body_in, &ctx, &block_pos_g, &full_pos_g, &conv_state, bsz, n_ctx);
+                    let fn2 = gpu.zeros(&[bsz, d], DType::F32).unwrap();
+                    gpu.rmsnorm_batched(&body_out, &net.final_norm, &fn2, bsz, d, cfg.eps).unwrap();
+                    let out = dt::lin(&mut gpu, &fn2, &net.out_proj_v, bsz, d, d_tgt);
+                    let logits = dt::lin(&mut gpu, &out, &lm_head_g, bsz, d_tgt, vocab);
+                    let lg = gpu.download_f32(&logits).unwrap();
+                    // accepted prefix = leading run (positions 1..B; pos 0 is the seed)
+                    // where drafter argmax == target's own next token = greedy-τ
+                    let mut acc = 0;
+                    for i in 1..bsz {
+                        let row = &lg[i * vocab..(i + 1) * vocab];
+                        let am = row.iter().enumerate().max_by(|x, y| x.1.partial_cmp(y.1).unwrap()).unwrap().0;
+                        if am as i32 == targets[i] { acc += 1; } else { break; }
+                    }
+                    acc_sum += acc as f32; nb += 1;
+                }
+            }
+            let proxy_tau = if nb > 0 { acc_sum / nb as f32 } else { 0.0 };
+            println!("  [eval step {step}] proxy_tau(mean accepted prefix) = {proxy_tau:.3} over {nb} held-out blocks  (baseline tau~6.3)");
+            gpu.pool_release_to(ck2);
+        }
+    }
+
+    // save checkpoint (DFNET: simple flat fp32 tensor container)
+    save_net(&mut gpu, &net, &cfg, &out_ckpt);
+    println!("saved drafter -> {out_ckpt}");
+    println!("dflash_train_run: DONE ({steps} steps, final ema loss {running:.4})");
+}
+
+// DFNET container: magic + n_tensors + per tensor (name_len u32, name, numel u32, f32 data)
+fn save_net(gpu: &mut Gpu, net: &dt::Net, cfg: &dt::Cfg, path: &str) {
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path).expect("ckpt"));
+    let mut entries: Vec<(String, Vec<f32>)> = Vec::new();
+    for (li, l) in net.layers.iter().enumerate() {
+        entries.push((format!("layers.{li}.op_norm"), gpu.download_f32(&l.op_norm).unwrap()));
+        entries.push((format!("layers.{li}.ffn_norm"), gpu.download_f32(&l.ffn_norm).unwrap()));
+        for (nm, o) in [("in_proj", &l.in_proj), ("conv_w", &l.conv_w), ("out_proj", &l.out_proj), ("wq", &l.wq), ("wk", &l.wk), ("wv", &l.wv), ("wo", &l.wo), ("q_norm", &l.q_norm), ("k_norm", &l.k_norm)] {
+            if let Some(t) = o { entries.push((format!("layers.{li}.{nm}"), gpu.download_f32(t).unwrap())); }
+        }
+        entries.push((format!("layers.{li}.w1"), gpu.download_f32(&l.w1).unwrap()));
+        entries.push((format!("layers.{li}.w3"), gpu.download_f32(&l.w3).unwrap()));
+        entries.push((format!("layers.{li}.w2"), gpu.download_f32(&l.w2).unwrap()));
+    }
+    for (nm, t) in [("in_proj_v", &net.in_proj_v), ("out_proj_v", &net.out_proj_v), ("fc", &net.fc), ("final_norm", &net.final_norm)] {
+        entries.push((nm.to_string(), gpu.download_f32(t).unwrap()));
+    }
+    f.write_all(b"DFNET\0\0\0").unwrap();
+    f.write_all(&(entries.len() as u32).to_le_bytes()).unwrap();
+    // config line: d, n_layers, nh, nkv, hd, conv_k, inter, d_tgt, vocab
+    for v in [cfg.d, cfg.n_layers(), cfg.nh, cfg.nkv, cfg.hd, cfg.conv_k, cfg.inter, cfg.d_tgt, cfg.vocab] {
+        f.write_all(&(v as u32).to_le_bytes()).unwrap();
+    }
+    for (name, data) in &entries {
+        f.write_all(&(name.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(name.as_bytes()).unwrap();
+        f.write_all(&(data.len() as u32).to_le_bytes()).unwrap();
+        let raw: &[u8] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        f.write_all(raw).unwrap();
+    }
+    f.flush().unwrap();
+}

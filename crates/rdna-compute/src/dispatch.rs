@@ -1192,6 +1192,13 @@ impl Gpu {
 
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
+    // Training-loop memory scope: pool_begin_scope once, then per step
+    // let ck = pool_checkpoint(); ...; pool_release_to(ck);  (memory-stable).
+    // Persistent tensors (weights, optimizer state) alloc BEFORE begin_scope.
+    pub fn pool_begin_scope(&mut self) { self.pool.begin_scope(); }
+    pub fn pool_checkpoint(&mut self) -> usize { self.pool.checkpoint() }
+    pub fn pool_release_to(&mut self, mark: usize) { self.pool.release_to(mark); }
+
     pub fn drain_pool(&mut self) {
         self.bind_thread_or_warn();
         self.pool.drain(&self.hip);
