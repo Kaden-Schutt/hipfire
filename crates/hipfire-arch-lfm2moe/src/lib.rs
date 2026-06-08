@@ -20,6 +20,7 @@
 pub mod config;
 pub mod forward;
 pub mod lfm2moe;
+pub mod dflash_train;
 
 pub use config::{Lfm2MoeConfig, MixerKind};
 pub use forward::{decode_step, decode_step_capture};
