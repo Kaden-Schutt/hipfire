@@ -2902,6 +2902,16 @@ pub const CONV1D_DECODE_SRC: &str = include_str!("../../../kernels/src/conv1d_de
 pub const CONV1D_GATED_DECODE_SRC: &str =
     include_str!("../../../kernels/src/conv1d_gated_decode.hip");
 
+/// Block-parallel (Bb positions) LFM2 gated short-conv: forward +
+/// race-free state-advance. See kernels/src/conv1d_gated_batched.hip.
+pub const CONV1D_GATED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/conv1d_gated_batched.hip");
+
+/// DFlash trainer fp32 forward primitives: clean row-major dense linear
+/// + naive GQA block-attention with context KV-injection.
+pub const DFLASH_TRAIN_SRC: &str =
+    include_str!("../../../kernels/src/dflash_train.hip");
+
 /// Gated output norm: rmsnorm(x) * silu(z). Fused single kernel.
 /// x and z are [n_heads × head_dim]. weight is [head_dim] (shared across heads).
 #[cfg(feature = "deltanet")]
