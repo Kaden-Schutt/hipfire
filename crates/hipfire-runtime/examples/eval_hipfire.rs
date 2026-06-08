@@ -352,6 +352,8 @@ fn main() {
     // cross-term, and returns (kld_token, optional_nll). The closure
     // explicitly mutates `ref_in` and `block_buf` so per-chunk state stays
     // outside; the rest is read-only. Same math both modes use.
+    let top1_agree = std::cell::Cell::new(0u64);
+    let top1_total = std::cell::Cell::new(0u64);
     let score_position = |gpu: &mut rdna_compute::Gpu,
                           scratch_logits: &rdna_compute::GpuTensor,
                           ref_in: &mut BufReader<File>,
@@ -377,7 +379,10 @@ fn main() {
 
         // Candidate's log-Z = log Σ exp(logit_i) — fp64 throughout.
         let mut max_logit = f32::NEG_INFINITY;
-        for &v in cand_logits.iter() { if v > max_logit { max_logit = v; } }
+        let mut cand_argmax = 0usize;
+        for (ci, &v) in cand_logits.iter().enumerate() { if v > max_logit { max_logit = v; cand_argmax = ci; } }
+        top1_total.set(top1_total.get() + 1);
+        if !top_indices.is_empty() && cand_argmax as u32 == top_indices[0] { top1_agree.set(top1_agree.get() + 1); }
         let mut sum_exp = 0.0f64;
         for &v in cand_logits.iter() {
             sum_exp += ((v - max_logit) as f64).exp();
@@ -615,6 +620,12 @@ fn main() {
     eprintln!(
         "eval_hipfire: slice-mean KLD = {:.6}  mean NLL = {:.6}  PPL = {:.4}",
         overall_mean, overall_nll, overall_ppl
+    );
+    let _t1a = top1_agree.get();
+    let _t1t = top1_total.get();
+    eprintln!(
+        "eval_hipfire: top-1 agreement (mq4 argmax == f32 oracle argmax) = {:.4}  ({}/{})",
+        if _t1t > 0 { _t1a as f64 / _t1t as f64 } else { 0.0 }, _t1a, _t1t
     );
     eprintln!("eval_hipfire: wrote {}", args.output.display());
 }
