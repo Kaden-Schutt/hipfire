@@ -2189,16 +2189,18 @@ fn full_layer_decode_impl(
             0, // window_size: full causal,
             0,
         )?;
-    } else if kv_cache.quant_asym4 || kv_cache.quant_asym2 || kv_cache.quant_q8 {
-        let mode = if kv_cache.quant_asym4 { "asym4" }
-                   else if kv_cache.quant_asym2 { "asym2" }
-                   else { "q8" };
-        return Err(hip_bridge::HipError::new(
-            0,
-            &format!("gemma4 full-attn layer (hd=512): kv-mode={} not yet ported. \
-                     Use --kv-mode asym3 or fp32. Tracked in spec doc as port-blocked \
-                     on missing asym2/asym4/q8 hd=512 kernels.", mode),
-        ));
+    } else if kv_cache.quant_q8 {
+        // Q8_0 KV: same tile kernel handles both hd256 and hd512 via n_halves.
+        // Full layers: no window, no ring. Sliding layers: windowed via _window wrapper.
+        gpu.kv_cache_write_q8_0_cap(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, n_kv, head_dim, 0)?;
+        gpu.kv_cache_write_q8_0_cap(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, n_kv, head_dim, 0)?;
+        gpu.attention_flash_q8_0_cap(
+            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
+            &scratch.attn_out, &scratch.pos_buf, pos + 1,
+            n_heads, n_kv, head_dim, kv_cache.max_seq,
+            &scratch.flash_partials,
+            0, 0,
+        )?;
     } else {
         // FP32 KV path (kvf16 / kvfp32). attention_f32 bakes in
         // scale=1/sqrt(head_dim); the pre-scale of Q above cancels it, giving

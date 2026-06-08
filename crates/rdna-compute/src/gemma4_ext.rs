@@ -250,8 +250,7 @@ impl Gpu {
     }
 
     pub fn attention_flash_q8_0_window(&mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor, out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize, partials: &GpuTensor, window_size: u32, cache_capacity: u32) -> HipResult<()> {
-        let _ = (window_size, cache_capacity);
-        self.attention_flash_q8_0(q, k_cache, v_cache, out, pos_buf, seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials)
+        self.attention_flash_q8_0_cap(q, k_cache, v_cache, out, pos_buf, seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials, window_size, cache_capacity)
     }
 
     pub fn attention_flash_asym3_batched_window(&mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor, out: &GpuTensor, positions: &GpuTensor, cos_theta: &GpuTensor, sin_theta: &GpuTensor, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize, max_ctx_len: usize, n_batch: usize, partials: &GpuTensor, window_size: u32, cache_capacity: u32) -> HipResult<()> {

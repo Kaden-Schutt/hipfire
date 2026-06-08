@@ -1615,6 +1615,7 @@ impl Gpu {
     /// blocks for the tile kernel, then [n_heads] blocks for the reduce.
     /// Requires a pre-allocated `partials` buffer of size
     /// n_heads * max_tiles * (2 + head_dim) floats.
+    /// Q8_0 flash attention (cap=0 shorthand of `_cap`).
     pub fn attention_flash_q8_0(
         &mut self,
         q: &GpuTensor,
@@ -1628,6 +1629,27 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
         partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.attention_flash_q8_0_cap(q, k_cache, v_cache, out, pos_buf,
+            seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials, 0, 0)
+    }
+
+    /// Q8_0 flash attention with optional window + ring-buffer wrapping.
+    pub fn attention_flash_q8_0_cap(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        window_size: u32,
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -1661,6 +1683,8 @@ impl Gpu {
             let ms = max_seq as i32;
             let sc = scale;
             let ts = TILE_SIZE as i32;
+            let ws = window_size as i32;
+            let cc = cache_capacity as i32;
             let grid = [n_heads as u32, launch_tiles as u32, 1];
             let shared = ((TILE_SIZE + head_dim) * 4) as u32;
             let mut params: Vec<*mut c_void> = vec![
@@ -1675,6 +1699,8 @@ impl Gpu {
                 &ms as *const _ as *mut c_void,
                 &sc as *const _ as *mut c_void,
                 &ts as *const _ as *mut c_void,
+                &ws as *const _ as *mut c_void,
+                &cc as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob(
                 "attention_flash_q8_0_tile",
@@ -1695,6 +1721,8 @@ impl Gpu {
                     b.push_i32(ms);
                     b.push_f32(sc);
                     b.push_i32(ts);
+                    b.push_i32(ws);
+                    b.push_i32(cc);
                     b
                 },
             )?;
