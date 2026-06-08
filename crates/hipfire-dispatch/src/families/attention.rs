@@ -481,10 +481,21 @@ fn dispatch_attend(
         KernelKey::AttnF32 => {
             debug_assert_eq!(plan.batch_size, 1);
             let seq_len = io.pos + 1;
-            hip!(gpu.attention_f32(
-                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
-                seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap,
-            ))
+            if plan.window_size > 0 {
+                // Sliding-window fp32: use flash kernel with kv_window masking.
+                // Needs partials buffer (same as flash q8/asym paths).
+                let fp = io.flash_partials.unwrap();
+                hip!(gpu.attention_flash(
+                    io.q, io.k_cache, io.v_cache, io.output, fp,
+                    seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap,
+                    plan.window_size as usize,
+                ))
+            } else {
+                hip!(gpu.attention_f32(
+                    io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                    seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap,
+                ))
+            }
         }
         KernelKey::AttnFlashQ8_0 => {
             debug_assert_eq!(plan.batch_size, 1);
