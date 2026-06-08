@@ -3564,6 +3564,8 @@ fn is_q8_tensor(name: &str) -> bool {
         // both at Q8 even in Q4-bulk modes.
         || name.ends_with("mlp.gate.weight")
         || name.ends_with("mlp.shared_expert_gate.weight")
+        // Gemma4 26B-A4B MoE router.
+        || name.ends_with("router.proj.weight")
 }
 
 /// Qwen3.5 DeltaNet conv1d weight: `{prefix}.linear_attn.conv1d.weight`,
@@ -4037,7 +4039,10 @@ fn awq_eligible(name: &str) -> bool {
         // correctness. `router.weight` would be a non-HF naming an
         // arch might choose; kept for safety.
         || name.ends_with("mlp.gate.weight")
-        || name.ends_with("router.weight");
+        || name.ends_with("router.weight")
+        // Gemma4 26B-A4B MoE router: `router.proj.weight` (hidden_size × num_experts).
+        // Same precision-sensitivity as Qwen3.5's `mlp.gate.weight`.
+        || name.ends_with("router.proj.weight");
     if f1_only {
         return f1_match;
     }
@@ -4354,6 +4359,7 @@ fn run_gguf_pipeline(
 
     // K-map setup for GGUF path
     let is_moe = arch_id == 6;
+    let is_gemma4 = arch_id == 12;
     let n_layers: usize = config_json
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
@@ -5335,7 +5341,7 @@ fn main() {
     // the standard 2D quant path; the routing fan-out into top-k experts
     // happens at forward time, not quant time.
     let is_deepseek4 = arch_id == 9;
-    let is_moe_like = is_moe || is_deepseek4;
+    let is_moe_like = is_moe || is_deepseek4 || is_gemma4;
     // Q8 router: always on for MoE-class models.
     let q8_router = is_moe_like || q8_router_flag;
     if is_moe {
@@ -5430,9 +5436,16 @@ fn main() {
     for (fi, st) in st_files.iter().enumerate() {
         for name in st.tensor_names() {
             if let Some(stem) = name.strip_suffix(".scale") {
-                // Sibling weight name (drop `.scale`, add `.weight`).
-                let w_name = format!("{stem}.weight");
-                fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                // FP8 scale siblings: `foo.scale` is the per-tensor scale for
+                // `foo.weight`. Skip from quantization; attach at quant time.
+                // Exception: Gemma4's `router.scale` is a real model weight
+                // (multiplicative scale on router input), NOT an FP8 scale.
+                if name.contains("router.scale") {
+                    all_tensors.push((name, fi));
+                } else {
+                    let w_name = format!("{stem}.weight");
+                    fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                }
                 continue;
             }
             all_tensors.push((name, fi));
@@ -5782,11 +5795,16 @@ fn main() {
             // Fall through to standard path for non-MQ2 formats.
         }
 
-        if is_moe
-            && name.contains("mlp.experts.")
-            && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
-            && meta.shape.len() == 3
-        {
+        // Gemma 4 26B-A4B uses the SAME layout but at a different prefix
+        // (no `mlp.` — tensors live directly under `.experts.`):
+        //   model.language_model.layers.{N}.experts.gate_up_proj
+        //   model.language_model.layers.{N}.experts.down_proj
+        // Name-suffix match + shape check handles both qwen3.5 (mlp.experts.*)
+        // and gemma4 (experts.*) without prefix-specific conditions.
+        let is_moe_expert_3d = (is_moe || is_gemma4)
+            && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
+            && meta.shape.len() == 3;
+        if is_moe_expert_3d {
             let n_experts = meta.shape[0];
             let inner_n: usize = meta.shape[1..].iter().product();
             let elem_size = match meta.dtype.as_str() {
