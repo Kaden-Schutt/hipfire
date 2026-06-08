@@ -56,7 +56,9 @@
 
 use crate::config::{Gemma4Config, LayerType, RopeType};
 use crate::gemma4::{FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, SlidingLayerWeights};
-use hipfire_runtime::llama::{rotate_x_mq_batched_for, weight_gemv, KvCache, WeightTensor};
+use hipfire_runtime::llama::{
+    rotate_x_mq_batched_for, weight_gemv, weight_gemv_prerotated, KvCache, WeightTensor,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Master switch for the qwen35-mirror fused-projection FFN path
@@ -111,6 +113,76 @@ fn qk_proj(
     } else {
         weight_gemv(gpu, q_proj, x, q_out).map_err(|e| format!("gemma4: q_proj: {e}"))?;
         weight_gemv(gpu, k_proj, x, k_out).map_err(|e| format!("gemma4: k_proj: {e}"))
+    }
+}
+
+/// Master switch for the fused attention-input norm path. Default ON; opt out
+/// with `HIPFIRE_GEMMA4_FUSED_ATTN_NORM=0`. Only fires when q/k/v are MQ4G256
+/// (this model's attention projections), folding the pre-attention
+/// `input_layernorm` rmsnorm + the shared FWHT rotate into ONE launch
+/// (`fused_rmsnorm_rotate_mq` -> tmp_rot), then feeding the prerotated input to
+/// each projection's prerotated GEMV (rotate ONCE, reuse across q/k/v). This
+/// removes the per-layer input `rmsnorm_f32` launch and collapses the 3
+/// redundant per-projection rotates (q/k/v each re-rotated the identical input)
+/// into 1. Byte-equivalent: `fused_rmsnorm_rotate_mq` + `gemv_*_prerotated` is
+/// the exact same math as `rmsnorm_f32` + rotation-doing `weight_gemv`, fused.
+fn fused_attn_norm_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_GEMMA4_FUSED_ATTN_NORM").ok().as_deref(),
+        Some("0") | Some("off") | Some("false")
+    )
+}
+
+/// input_layernorm(x) -> q/k(/v) projections. Fused norm+rotate when MQ4G256
+/// (see `fused_attn_norm_enabled`); else plain rmsnorm -> rotation-doing GEMVs.
+///
+/// `v_proj = None` => k_eq_v (the caller copies v from the PRE-k_norm k output
+/// AFTER this returns); we only project q+k in that case. When `Some`, v is
+/// projected here from the same (pre)normed input.
+#[allow(clippy::too_many_arguments)]
+fn attn_input_qkv(
+    gpu: &mut Gpu,
+    input_ln: &rdna_compute::GpuTensor,
+    tmp: &rdna_compute::GpuTensor,
+    tmp_rot: &rdna_compute::GpuTensor,
+    q_proj: &WeightTensor,
+    k_proj: &WeightTensor,
+    v_proj: Option<&WeightTensor>,
+    x: &rdna_compute::GpuTensor,
+    q_out: &rdna_compute::GpuTensor,
+    k_out: &rdna_compute::GpuTensor,
+    v_out: &rdna_compute::GpuTensor,
+    dim: usize,
+    eps: f32,
+    label: &str,
+) -> Result<(), String> {
+    let all_mq4 = q_proj.gpu_dtype == DType::MQ4G256
+        && k_proj.gpu_dtype == DType::MQ4G256
+        && v_proj.map_or(true, |w| w.gpu_dtype == DType::MQ4G256);
+    if fused_attn_norm_enabled() && all_mq4 {
+        // One launch: rmsnorm(x, input_ln) then FWHT-rotate -> tmp_rot.
+        gpu.fused_rmsnorm_rotate_mq(x, input_ln, tmp_rot, dim, eps)
+            .map_err(|e| format!("gemma4 {label}: fused input rmsnorm+rotate: {e:?}"))?;
+        // Prerotated GEMVs share tmp_rot (NO re-rotation -- byte-identical math).
+        weight_gemv_prerotated(gpu, q_proj, x, Some(tmp_rot), q_out)
+            .map_err(|e| format!("gemma4 {label}: q_proj (prerot): {e}"))?;
+        weight_gemv_prerotated(gpu, k_proj, x, Some(tmp_rot), k_out)
+            .map_err(|e| format!("gemma4 {label}: k_proj (prerot): {e}"))?;
+        if let Some(vw) = v_proj {
+            weight_gemv_prerotated(gpu, vw, x, Some(tmp_rot), v_out)
+                .map_err(|e| format!("gemma4 {label}: v_proj (prerot): {e}"))?;
+        }
+        Ok(())
+    } else {
+        // Eager fallback: plain rmsnorm -> tmp, then rotation-doing GEMVs.
+        gpu.rmsnorm_f32(x, input_ln, tmp, eps)
+            .map_err(|e| format!("gemma4 {label}: input rmsnorm: {e:?}"))?;
+        qk_proj(gpu, q_proj, k_proj, tmp, q_out, k_out)?;
+        if let Some(vw) = v_proj {
+            weight_gemv(gpu, vw, tmp, v_out)
+                .map_err(|e| format!("gemma4 {label}: v_proj: {e}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -360,14 +432,24 @@ fn sliding_layer_decode(
     gpu.memcpy_dtod_auto(&state.residual.buf, &state.x.buf, dim_bytes)
         .map_err(|e| format!("gemma4 sliding: save residual: {e:?}"))?;
 
-    // n1 = input_layernorm(x) → tmp.
-    gpu.rmsnorm_f32(&state.x, &lw.input_layernorm, &state.tmp, eps)
-        .map_err(|e| format!("gemma4 sliding: input rmsnorm: {e:?}"))?;
-
-    // q/k/v projections. q+k fused (shared rmsnorm input) when both Q8.
-    qk_proj(gpu, &lw.q_proj, &lw.k_proj, &state.tmp, &state.q, &state.k)?;
-    weight_gemv(gpu, &lw.v_proj, &state.tmp, &state.v)
-        .map_err(|e| format!("gemma4 sliding: v_proj: {e}"))?;
+    // n1 = input_layernorm(x) -> q/k/v. Fused (norm+rotate+prerotated GEMVs,
+    // shared rotate) when MQ4G256; else plain rmsnorm -> rotation-doing GEMVs.
+    attn_input_qkv(
+        gpu,
+        &lw.input_layernorm,
+        &state.tmp,
+        &state.tmp_rot,
+        &lw.q_proj,
+        &lw.k_proj,
+        Some(&lw.v_proj),
+        &state.x,
+        &state.q,
+        &state.k,
+        &state.v,
+        dim,
+        eps,
+        "sliding",
+    )?;
 
     // Per-head q_norm / k_norm over head_dim, and weight-less V RMSNorm (ones).
     // (V uses the no-scale RMS pattern — matches full layers and the HF
@@ -439,27 +521,34 @@ fn full_layer_decode(
     gpu.memcpy_dtod_auto(&state.residual.buf, &state.x.buf, dim_bytes)
         .map_err(|e| format!("gemma4 full: save residual: {e:?}"))?;
 
-    // n1 = input_layernorm(x) → tmp.
-    gpu.rmsnorm_f32(&state.x, &lw.input_layernorm, &state.tmp, eps)
-        .map_err(|e| format!("gemma4 full: input rmsnorm: {e:?}"))?;
+    // n1 = input_layernorm(x) -> q/k(/v). Fused (norm+rotate+prerotated GEMVs,
+    // shared rotate) when MQ4G256; else plain rmsnorm -> rotation-doing GEMVs.
+    // When v_proj is Some, v is projected inside the helper from the same
+    // (pre)normed input; when None (k_eq_v) the helper projects only q+k and we
+    // capture V below from the PRE-k_norm k output.
+    attn_input_qkv(
+        gpu,
+        &lw.input_layernorm,
+        &state.tmp,
+        &state.tmp_rot,
+        &lw.q_proj,
+        &lw.k_proj,
+        lw.v_proj.as_ref(),
+        &state.x,
+        &state.q,
+        &state.k,
+        &state.v,
+        dim,
+        eps,
+        "full",
+    )?;
 
-    // q/k projections — fused (shared rmsnorm input) when both Q8.
-    qk_proj(gpu, &lw.q_proj, &lw.k_proj, &state.tmp, &state.q, &state.k)?;
-
-    // V handling:
-    //   attention_k_eq_v (12B): V = K's PRE-k_norm output (memcpy k → v BEFORE
-    //     applying k_norm). Then weight-less RMSNorm on V.
-    //   else: V = v_proj(n1).
-    match &lw.v_proj {
-        Some(vw) => {
-            weight_gemv(gpu, vw, &state.tmp, &state.v)
-                .map_err(|e| format!("gemma4 full: v_proj: {e}"))?;
-        }
-        None => {
-            // CRITICAL ordering: capture V from the PRE-k_norm K output.
-            gpu.memcpy_dtod_auto(&state.v.buf, &state.k.buf, kv_bytes)
-                .map_err(|e| format!("gemma4 full: k→v copy: {e:?}"))?;
-        }
+    // V handling for the k_eq_v (12B) case: V = K's PRE-k_norm output (memcpy
+    // k -> v BEFORE applying k_norm). Then weight-less RMSNorm on V (below).
+    if lw.v_proj.is_none() {
+        // CRITICAL ordering: capture V from the PRE-k_norm K output.
+        gpu.memcpy_dtod_auto(&state.v.buf, &state.k.buf, kv_bytes)
+            .map_err(|e| format!("gemma4 full: k->v copy: {e:?}"))?;
     }
 
     // q_norm / k_norm over head_dim, weight-less V RMSNorm.
