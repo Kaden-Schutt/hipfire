@@ -144,12 +144,13 @@ export class PriorityPrefillScheduler {
   ): PrefillBatchSelection | undefined {
     const first = bucket[0];
     const policy = schedulerPolicyForPriority(first.session.priority, this.env);
+    const selectionLimit = this.selectionLimit(policy);
     const compatible = bucket
       .filter((entry) => sessionsCompatibleForPrefill({
         a: first.session,
         b: entry.session,
       }))
-      .slice(0, policy.maxBatchSize);
+      .slice(0, selectionLimit);
     const totalSuffixTokens = compatible.reduce(
       (sum, entry) => sum + entry.session.suffixTokens.length,
       0,
@@ -165,7 +166,7 @@ export class PriorityPrefillScheduler {
     }
 
     const waitedMs = nowMs - first.enqueuedAtMs;
-    if (compatible.length >= policy.maxBatchSize || waitedMs >= policy.coalesceWaitMs) {
+    if (compatible.length >= selectionLimit || waitedMs >= policy.coalesceWaitMs) {
       return this.selection(compatible, policy);
     }
     return undefined;
@@ -191,12 +192,13 @@ export class PriorityPrefillScheduler {
       const firstAged = bucket.find((entry) => nowMs - entry.enqueuedAtMs >= agingMs);
       if (!firstAged) continue;
       const policy = schedulerPolicyForPriority(firstAged.session.priority, this.env);
+      const selectionLimit = this.selectionLimit(policy);
       const compatible = bucket
         .filter((entry) => sessionsCompatibleForPrefill({
           a: firstAged.session,
           b: entry.session,
         }))
-        .slice(0, policy.maxBatchSize);
+        .slice(0, selectionLimit);
       return this.selection(compatible, policy);
     }
 
@@ -208,6 +210,12 @@ export class PriorityPrefillScheduler {
       if (this.buckets[p].length > 0) return true;
     }
     return false;
+  }
+
+  private selectionLimit(policy: SchedulerPriorityPolicy): number {
+    return policy.diskSpillAllowed
+      ? Math.max(policy.maxBatchSize, policy.spillableBatchMax)
+      : policy.maxBatchSize;
   }
 
   private selection(

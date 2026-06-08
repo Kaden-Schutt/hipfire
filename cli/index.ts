@@ -1879,6 +1879,7 @@ async function serve(port: number, host: string) {
     plan?: string;
     backend?: string;
     runtimeStateHandle?: string;
+    runtimeStateEvicted?: boolean;
   };
   type PendingPrefillRequest = {
     session: RequestSessionDraft;
@@ -1940,6 +1941,8 @@ async function serve(port: number, host: string) {
   let lastStateCacheDisk = false;
   let lastStateCacheDiskMinPriority = 128;
   let lastDiskSpillAllowed = false;
+  let stateCacheEvictionsTotal = 0;
+  let stateCacheRecomputeRequiredTotal = 0;
   let lastBatchRuntimeSkippedReason = "not_enabled";
   let lastBatchFallbackReason = "idle";
   let lastBatchExecutionMode: BatchExecutionMode = "disabled";
@@ -2479,6 +2482,8 @@ async function serve(port: number, host: string) {
                   stateCacheDisk: lastStateCacheDisk,
                   stateCacheDiskMinPriority: lastStateCacheDiskMinPriority,
                   diskSpillAllowed: lastDiskSpillAllowed,
+                  stateCacheEvictionsTotal,
+                  stateCacheRecomputeRequiredTotal,
                   generateBatchPrefillCapability,
                   generateBatchPrefillCapabilityReason,
                   queueWaitReason: lastPrefillQueueWaitReason,
@@ -2499,6 +2504,8 @@ async function serve(port: number, host: string) {
                   bytes: stateCacheBytes,
                   metadata_hits: prefillBatchMetrics.metadataCacheHits,
                   runtime_hits: prefillBatchMetrics.runtimeCacheHits,
+                  evictions_total: stateCacheEvictionsTotal,
+                  recompute_required_total: stateCacheRecomputeRequiredTotal,
                 }
               : { enabled: false },
             batches: {
@@ -3721,6 +3728,7 @@ async function serve(port: number, host: string) {
 
               let prefillDone = false;
               const sessionPrefillTokens = new Map<string, number>();
+              const runtimeStateHandlesBySession = new Map<string, string>();
               for (let i = 0; i < 8; i++) {
                 const prefillMsg = await e.recv();
                 if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === runtimeBatchId) {
@@ -3750,10 +3758,8 @@ async function serve(port: number, host: string) {
                     stateHandle &&
                     typeof stateHandle.session_id === "string"
                   ) {
+                    runtimeStateHandlesBySession.set(prefillMsg.session_id, stateHandle.session_id);
                     residentRuntimeSessions.add(stateHandle.session_id);
-                    if (prefillMsg.session_id === reqId) {
-                      releaseRuntimeSessionId = stateHandle.session_id;
-                    }
                   }
                   continue;
                 }
@@ -3769,9 +3775,46 @@ async function serve(port: number, host: string) {
                 throw new Error(`unexpected generate_batch_prefill response: ${prefillMsg?.type ?? "missing"}`);
               }
               if (!prefillDone) throw new Error("generate_batch_prefill did not complete");
-              genParams.session_id = reqId;
-              genParams.prefill_already_done = true;
-              lastPrefillRuntimeDispatchSkippedReason = "not_skipped";
+              const residentStateLimit = Number(genParams.server_prefill_batch?.resident_state_limit ?? selectedSessions.length);
+              const diskSpillAllowed = genParams.server_prefill_batch?.disk_spill_allowed === true;
+              const residentSessionIds = new Set(
+                selectedSessions.slice(0, Math.max(0, residentStateLimit)).map((session) => session.id),
+              );
+              const evictedSessionIds = diskSpillAllowed
+                ? new Set(selectedSessions.filter((session) => !residentSessionIds.has(session.id)).map((session) => session.id))
+                : new Set<string>();
+              const evictedRuntimeHandles = [...evictedSessionIds]
+                .map((sessionId) => runtimeStateHandlesBySession.get(sessionId))
+                .filter((handle): handle is string => typeof handle === "string" && handle.length > 0);
+              if (evictedRuntimeHandles.length > 0) {
+                await e.send({
+                  type: "release_sessions",
+                  id: `${reqId}-spill-release`,
+                  sessions: evictedRuntimeHandles,
+                });
+                const releaseMsg = await e.recv();
+                if (releaseMsg?.type === "release_sessions_done") {
+                  for (const handle of evictedRuntimeHandles) residentRuntimeSessions.delete(handle);
+                }
+                stateCacheEvictionsTotal += evictedRuntimeHandles.length;
+                stateCacheRecomputeRequiredTotal += evictedRuntimeHandles.length;
+              }
+              if (evictedSessionIds.has(reqId)) {
+                genParams.prefill_already_done = false;
+                releaseRuntimeSessionId = null;
+                if (genParams.server_prefill_batch) {
+                  genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill_evicted";
+                  genParams.server_prefill_batch.runtime_dispatch_reason = "prefill_state_evicted_recompute";
+                  genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "prefill_state_evicted_recompute";
+                }
+              } else {
+                genParams.session_id = runtimeStateHandlesBySession.get(reqId) ?? reqId;
+                genParams.prefill_already_done = true;
+                releaseRuntimeSessionId = genParams.session_id;
+              }
+              lastPrefillRuntimeDispatchSkippedReason = evictedSessionIds.has(reqId)
+                ? "prefill_state_evicted_recompute"
+                : "not_skipped";
               recordPrefillBatchDispatch(
                 selectedSessions.length,
                 Number(genParams.server_prefill_batch?.daemon_prefill_tokens ?? 0),
@@ -3784,13 +3827,16 @@ async function serve(port: number, host: string) {
                 const pending = pendingPrefillRequests.get(selected.id);
                 if (!pending) continue;
                 pendingPrefillRequests.delete(selected.id);
+                const runtimeStateHandle = runtimeStateHandlesBySession.get(selected.id);
+                const runtimeStateEvicted = evictedSessionIds.has(selected.id);
                 pending.resolve({
                   prefillTokens: sessionPrefillTokens.get(selected.id) ?? 0,
                   elapsedMs: genParams.server_prefill_batch?.daemon_prefill_ms ?? 0,
                   selectedBatchSize: selectedSessions.length,
                   plan: genParams.server_prefill_batch?.daemon_prefill_plan,
                   backend: genParams.server_prefill_batch?.daemon_prefill_backend,
-                  runtimeStateHandle: selected.id,
+                  runtimeStateHandle: runtimeStateEvicted ? undefined : runtimeStateHandle,
+                  runtimeStateEvicted,
                 });
               }
             } catch (err: any) {
@@ -3861,12 +3907,22 @@ async function serve(port: number, host: string) {
               }
             }
             if (pendingOutcome) {
-              genParams.session_id = reqId;
-              genParams.prefill_already_done = true;
+              if (pendingOutcome.runtimeStateEvicted) {
+                genParams.prefill_already_done = false;
+              } else {
+                genParams.session_id = pendingOutcome.runtimeStateHandle ?? reqId;
+                genParams.prefill_already_done = true;
+              }
               if (genParams.server_prefill_batch) {
-                genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill";
-                genParams.server_prefill_batch.runtime_dispatch_reason = "prefill_done_decode_continuation";
-                genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "not_skipped";
+                genParams.server_prefill_batch.runtime_dispatch = pendingOutcome.runtimeStateEvicted
+                  ? "daemon_serial_prefill_evicted"
+                  : "daemon_serial_prefill";
+                genParams.server_prefill_batch.runtime_dispatch_reason = pendingOutcome.runtimeStateEvicted
+                  ? "prefill_state_evicted_recompute"
+                  : "prefill_done_decode_continuation";
+                genParams.server_prefill_batch.runtime_dispatch_skipped_reason = pendingOutcome.runtimeStateEvicted
+                  ? "prefill_state_evicted_recompute"
+                  : "not_skipped";
                 genParams.server_prefill_batch.daemon_prefill_tokens = pendingOutcome.prefillTokens;
                 genParams.server_prefill_batch.daemon_prefill_ms = pendingOutcome.elapsedMs;
                 genParams.server_prefill_batch.selected_batch_size = pendingOutcome.selectedBatchSize;
@@ -3876,8 +3932,12 @@ async function serve(port: number, host: string) {
                   genParams.server_prefill_batch.runtime_state_handle = pendingOutcome.runtimeStateHandle;
                 }
               }
-              releaseRuntimeSessionId = pendingOutcome.runtimeStateHandle ?? reqId;
-              lastPrefillRuntimeDispatchSkippedReason = "not_skipped";
+              releaseRuntimeSessionId = pendingOutcome.runtimeStateEvicted
+                ? null
+                : pendingOutcome.runtimeStateHandle ?? reqId;
+              lastPrefillRuntimeDispatchSkippedReason = pendingOutcome.runtimeStateEvicted
+                ? "prefill_state_evicted_recompute"
+                : "not_skipped";
               lastSelectedBatchSize = pendingOutcome.selectedBatchSize;
               if (pendingOutcome.plan) lastPrefillDaemonPlan = pendingOutcome.plan;
               if (pendingOutcome.backend) lastPrefillDaemonBackend = pendingOutcome.backend;

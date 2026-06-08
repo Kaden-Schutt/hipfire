@@ -95,6 +95,29 @@ describe("priority prefill scheduler", () => {
     expect(ids(scheduler.nextPrefillBatch({ nowMs: 200 }))).toEqual(["c", "d", "e"]);
   });
 
+  test("spillable low-priority work can select beyond the resident batch cap", () => {
+    const scheduler = new PriorityPrefillScheduler({
+      HIPFIRE_SCHED_PREFILL_BATCH_MAX: "2",
+      HIPFIRE_SCHED_RESIDENT_STATE_MAX: "1",
+      HIPFIRE_SCHED_SPILLABLE_BATCH_MAX: "4",
+      HIPFIRE_SCHED_STATE_CACHE_DISK: "1",
+      HIPFIRE_SCHED_STATE_CACHE_DISK_MIN_PRIORITY: "128",
+      HIPFIRE_SCHED_PREFILL_WAIT_MS_BACKGROUND: "0",
+    });
+
+    scheduler.enqueue(session("a", { priority: 128 }), 0);
+    scheduler.enqueue(session("b", { priority: 128 }), 0);
+    scheduler.enqueue(session("c", { priority: 128 }), 0);
+    scheduler.enqueue(session("d", { priority: 128 }), 0);
+
+    const batch = scheduler.nextPrefillBatch({ nowMs: 0 });
+    expect(ids(batch)).toEqual(["a", "b", "c", "d"]);
+    expect(batch?.policy.maxBatchSize).toBe(2);
+    expect(batch?.policy.residentStateMax).toBe(1);
+    expect(batch?.policy.spillableBatchMax).toBe(4);
+    expect(batch?.policy.diskSpillAllowed).toBe(true);
+  });
+
   test("does not batch incompatible model workers or state kinds", () => {
     const scheduler = new PriorityPrefillScheduler({
       HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE: "0",

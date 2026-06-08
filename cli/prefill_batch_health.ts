@@ -39,6 +39,8 @@ export interface PrefillBatchHealthInputs {
   stateCacheDisk?: boolean;
   stateCacheDiskMinPriority?: number;
   diskSpillAllowed?: boolean;
+  stateCacheEvictionsTotal?: number;
+  stateCacheRecomputeRequiredTotal?: number;
   generateBatchPrefillCapability: GenerateBatchPrefillCapability;
   generateBatchPrefillCapabilityReason: string;
   queueWaitReason: PrefillQueueWaitReason;
@@ -75,6 +77,8 @@ export interface PrefillBatchHealthPayload {
   state_cache_disk?: boolean;
   state_cache_disk_min_priority?: number;
   disk_spill_allowed?: boolean;
+  state_cache_evictions_total?: number;
+  state_cache_recompute_required_total?: number;
   generate_batch_prefill_capability?: GenerateBatchPrefillCapability;
   generate_batch_prefill_capability_reason?: string;
   queue_wait_reason?: PrefillQueueWaitReason;
@@ -162,6 +166,8 @@ export function buildPrefillBatchHealthPayload(
     state_cache_disk: input.stateCacheDisk ?? false,
     state_cache_disk_min_priority: input.stateCacheDiskMinPriority ?? 128,
     disk_spill_allowed: input.diskSpillAllowed ?? false,
+    state_cache_evictions_total: input.stateCacheEvictionsTotal ?? 0,
+    state_cache_recompute_required_total: input.stateCacheRecomputeRequiredTotal ?? 0,
     generate_batch_prefill_capability: input.generateBatchPrefillCapability,
     generate_batch_prefill_capability_reason: input.generateBatchPrefillCapabilityReason,
     queue_wait_reason: input.queueWaitReason,
