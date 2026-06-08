@@ -20,14 +20,37 @@ Hipfire metadata/config and defaults to interactive user traffic.
 |---|---|---|---|
 | 1. 256-level policy surface + deterministic classes + env controls | DONE | `cli/scheduler_policy.ts`, `cli/scheduler_policy.test.ts` | Classes, clamp/parse logic, and env names are implemented. |
 | 2. Per-worker queueing, enqueue/dequeue/cancel, policy selection | DONE | `cli/worker_scheduler.ts`, `cli/worker_scheduler.test.ts` | Priority buckets, compatibility filtering, opportunistic dispatch policy in one worker-local scheduler. |
-| 3. Model/session foundations and request/session compatibility | DONE | `cli/session_state.ts`, `cli/session_state.test.ts` | Includes `ModelWorkerKey`, `RequestSessionDraft`, `SessionStateHandle`, and same-worker/state-kind compatibility. |
-| 4. Server-side prefill batching integration (same-worker/session compatibility, no cross-model batching) | PARTIAL | `cli/server_prefill_batch.ts`, `cli/server_prefill_batch.test.ts`, `cli/index.ts` | Policy parsing, eligibility gate, and session adapter are implemented; runtime dispatch remains serialized. |
-| 5. Prefix/state cache metadata + safety telemetry | PARTIAL | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts` | Fingerprint, manifest keying, compatibility, and spill guardrails exist; daemon/runtime hookup and telemetry counters not yet wired. |
-| Blocker | SKIPPED | `crates/hipfire-runtime/examples/daemon.rs` lacks a session-batched protocol | True multi-request dispatch requires `generate_batch_prefill` and per-request state isolation in runtime worker before enabling microbatch execution. |
+| 3. Model/session foundations and request/session compatibility | DONE | `cli/session_state.ts`, `cli/session_state.test.ts` | Includes `ModelWorkerKey`, accelerator/device placement identity, `RequestSessionDraft`, `SessionStateHandle`, and same-worker/state-kind compatibility. |
+| 4. Server-side prefill batching integration (same-worker/session compatibility, no cross-model batching) | DONE FOR QWEN35 | `cli/server_prefill_batch.ts`, `cli/server_prefill_batch.test.ts`, `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-generate-batch-prefill.sh`, `scripts/smoke-server-prefill-batch.sh` | Policy parsing, eligibility gate, scheduler selection, session adapter, daemon `generate_batch_prefill` dispatch, Qwen35 resident state handles, session release, dense fused prefill, and grouped-MoE fused prefill are implemented. Remaining work is generic worker residency beyond Qwen35. |
+| 5. Prefix/state cache metadata + safety telemetry | IN PROGRESS | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts`, `/health.prefill_batch`, `/health.state_cache` | Fingerprint, manifest keying, compatibility, spill guardrails, metadata-hit/runtime-hit telemetry, and metadata-only safety refusal are wired. Runtime attach/fork is still pending. |
+| 6. Scheduler starvation/backpressure hardening | DONE | `cli/worker_scheduler.ts`, `cli/worker_scheduler.test.ts` | Optional queue cap and deadline-aging selection prevent unbounded queue growth and strict-priority starvation. |
+| Blocker | PARTIAL | `crates/hipfire-runtime/examples/daemon.rs` implements Qwen35 fused prefill plus state-handle lifecycle and release protocol | Generic multi-model residency, decode batching, and non-Qwen35 worker-owned session arenas remain future work. |
 
 ### SKIPPED Slice Notes
 
-- Slice 4/5 true multi-request prefill batching is explicitly blocked until the daemon exposes batched prefill execution and per-session KV/state ownership. Current server code only sends metadata and preserves current serialized behavior.
+- Slice 4/5 now has queueing, compatible-batch selection, Qwen35 dense fused
+  prefill, Qwen35 grouped-MoE fused prefill, Qwen35 state handles, and release
+  telemetry. Generic fused worker APIs for other architectures remain future
+  work.
+
+### Current Scope Boundary
+
+The active implementation slice covers compatible same-worker text-only AR
+prefill batches, plus the scheduler and telemetry scaffolding needed to share
+that path with future OpenAI-style batch jobs. It does not claim decode
+batching, MTP/DFlash verify batching, multi-resident model serving, generic
+cross-architecture session arenas, or disk state-cache spill/reload.
+
+Completion evidence for this plan should stay tied to observable request
+lifecycle behavior:
+
+- contract tests for `generate_batch_prefill` envelopes and stable session IDs,
+- fallback tests proving deterministic rejection reasons and telemetry counting,
+- mixed-mode batch tests proving invalid work does not disturb valid work,
+- execution-path tests proving queued requests move through selected, prefilled,
+  decoded, released, and failed/cancelled states correctly,
+- `/health` tests proving selected backend, fallback reason, unsupported counters,
+  state-cache counters, and resident-session counts are coherent.
 
 ## Defined Goals
 
@@ -74,6 +97,8 @@ Priority controls:
 ```text
 HIPFIRE_SCHED_PRIORITY_DEFAULT=64
 HIPFIRE_SCHED_PREFILL_BATCH_MAX=8
+HIPFIRE_SCHED_PREFILL_MAX_QUEUED=0
+HIPFIRE_SCHED_DEADLINE_AGING_MS=0
 HIPFIRE_SCHED_PREFILL_WAIT_MS_REALTIME=0
 HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE=5
 HIPFIRE_SCHED_PREFILL_WAIT_MS_BACKGROUND=25

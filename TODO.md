@@ -4,6 +4,16 @@
 
 ### Active
 
+- Extend startup device inventory into daemon-owned placement and scheduler
+  routing:
+  - server startup now exposes basic accelerator inventory and worker identity
+    carries accelerator kind/device id;
+  - enumerate all HIP GPUs at daemon startup, not just selected device 0;
+  - report per-device id, arch, VRAM, integrated/discrete class, and HIP
+    runtime from the daemon as well as the server;
+  - probe available NPUs/XDNA devices separately when present;
+  - make the priority microbatching scheduler route by worker/device capability
+    instead of using a single server-selected HIP placement.
 - Regenerate quality KLD references as first-party HFQM `.kldref.hfq`
   packages. Do not trust previously downloaded raw `.kldref.bin` files for
   baseline claims. Regeneration must use Hipfire reference execution with

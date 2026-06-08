@@ -22,20 +22,56 @@ The required structural change is to split **model residency** from
 | Goal item | Status | Evidence | Notes |
 |---|---|---|---|
 | 1) Keep OpenAI-compatible request shape | DONE | `cli/index.ts` existing request parsing and response path | No external API change introduced by these slices. |
-| 2) multi-model worker selection by request model | SKIPPED | `cli/index.ts` still routes to a single currently-loaded model path | Current model routing is `findModel(...)` + global reload; per-worker registry not yet added in daemon architecture. |
-| 3) `RequestSession` extraction with request/session state handles | DONE | `cli/session_state.ts`, `cli/session_state.test.ts`, `cli/server_prefill_batch.ts` | Session drafts now carry worker keys, priorities, suffix split, and state-kinds. |
-| 4) Per-session state arena (attention + recurrent + Mamba) | SKIPPED | Runtime model state remains process-global in `crates/hipfire-runtime/examples/daemon.rs` | Requires splitting seq_pos/conversation/KV/DN/mamba into per-session handles. |
-| 5) Prefix cache foundations (token/state manifest + compatibility) | PARTIAL | `cli/state_cache.ts`, `cli/state_cache.test.ts` | In-memory fingerprint/caching metadata is present; runtime cache index/integration still pending. |
-| 6) Same-model prefill batching integration | PARTIAL | `cli/server_prefill_batch.ts`, `cli/index.ts` | Eligibility + metadata is emitted, but no dispatch path to batched daemon call yet. |
+| 2) multi-model worker selection by request model | SKIPPED | `cli/index.ts` still routes to a single currently-loaded model path | Current model routing is `findModel(...)` + global reload; per-worker registry not yet added in daemon architecture. Worker keys now include accelerator kind/device id so the later registry has a placement-safe identity. |
+| 3) `RequestSession` extraction with request/session state handles | DONE | `cli/session_state.ts`, `cli/session_state.test.ts`, `cli/server_prefill_batch.ts` | Session drafts now carry worker keys, placement identity, priorities, suffix split, and state-kinds. |
+| 4) Per-session state arena (attention + recurrent + Mamba) | IN PROGRESS | `crates/hipfire-runtime/examples/daemon.rs` | Qwen35 serving has a state-handle v0 and release protocol for resident sessions. Generic attention/recurrent/Mamba arenas remain pending. |
+| 5) Prefix cache foundations (token/state manifest + compatibility) | IN PROGRESS | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts` | In-memory fingerprint/caching metadata is present. Metadata-only matches are now telemetry-only misses; runtime reuse requires an attachable manifest with a runtime state handle. |
+| 6) Same-model prefill batching integration | DONE FOR QWEN35 | `cli/server_prefill_batch.ts`, `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-generate-batch-prefill.sh`, `scripts/smoke-server-prefill-batch.sh` | Server can form compatible batches and call daemon `generate_batch_prefill`; Qwen35 dense fused prefill and grouped-MoE fused prefill are implemented, and resident session handles are returned/released. Generic non-Qwen35 workers remain deferred. |
 | 7) No-cross-model batching guarantees | DONE | `sessionsCompatibleForPrefill` in `cli/session_state.ts` | Compatibility uses `ModelWorkerKey` identity and state kind equality. |
 | 8) State cache spill/touch telemetry | SKIPPED | `cli/state_cache.ts` defines spill guardrails only | End-to-end telemetry emission not wired to request loop yet. |
-| Blocker | SKIPPED | `crates/hipfire-runtime/examples/daemon.rs` has only single-request `generate` flow | `generate_batch_prefill` protocol and session API do not exist. |
+| Blocker | PARTIAL | `crates/hipfire-runtime/examples/daemon.rs` implements `generate_batch_prefill` validation/probe plus Qwen35 serial and fused execution | Remaining blocker is generic worker-owned session arenas beyond the Qwen35 serving slice. |
 
 ### SKIPPED Slice Notes
 
-- Slice 2/3 (single-worker registry + state arena) are intentionally blocked by missing runtime session state ownership in daemon.
-- Slice 5 (runtime prefix cache) cannot be completed end-to-end until daemon receives per-request state handles and prefix manifest attachment.
-- Slice 6 (worker-local prefill microbatching) is deferred until the above runtime primitives are available.
+- Slice 2/3 (single-worker registry + generic state arena) are still blocked by
+  missing runtime worker/session ownership beyond the Qwen35 serving slice.
+- Slice 5 (runtime prefix cache) is now safe but intentionally conservative:
+  metadata-only manifests are counted but refused for runtime reuse until daemon
+  attach/fork support exists.
+- Slice 6 (worker-local prefill microbatching) has server queueing, a daemon
+  protocol, Qwen35 dense fused prefill, Qwen35 grouped-MoE fused prefill,
+  Qwen35 resident state handles, and release telemetry. Generic runtime workers
+  for other architecture families still need explicit per-session state pages.
+
+### Active Compatibility Track
+
+The retired `goal.md` tracked the compatibility work needed to move
+OpenAI-style batch jobs, `/v1/responses` batch inputs, and server prefill
+batching toward one scheduler/session execution path. That tracking now lives
+in this plan, the priority scheduler plan, and the feature chart.
+
+The useful dependency shape is:
+
+```mermaid
+flowchart TD
+    A["generate_batch_prefill contract/probe"] --> B["batch and Responses adapters"]
+    B --> C["shared scheduler/session execution path"]
+    A --> C
+    D["unsupported-mode and fallback behavior"] --> C
+    C --> E["health capability and state-cache telemetry"]
+    D --> E
+    B --> E
+```
+
+Current status by compatibility area:
+
+| Area | Status | Notes |
+|---|---|---|
+| `generate_batch_prefill` contract/probe | COMPLETE FOR QWEN35 | Daemon probe, validation, ready/unsupported/error handling, session-done, and done events exist. |
+| Unsupported-mode and fallback behavior | IN PROGRESS | Fallback counters and runtime reasons are exposed; richer endpoint-level mixed-mode tests remain useful. |
+| `/v1/responses` parser/adaptor | DEFERRED FOR BATCH PREFILL | Responses inputs can be normalized elsewhere, but this path is explicitly excluded from `generate_batch_prefill` until equivalent non-streaming session semantics exist. |
+| Shared scheduler/session execution path | COMPLETE FOR QWEN35 PREFILL | CLI scheduler selection drives daemon prefill and `prefill_already_done` decode continuation for compatible Qwen35 requests. |
+| `/health` capability flags | IN PROGRESS | Batching/cache capability and counters are exposed; runtime checkpoint attach, rehydrate, and spill counters wait on real state-cache runtime support. |
 
 External API compatibility should stay simple: `/v1/chat/completions`
 remains stateless and OpenAI-compatible. Internally, every request becomes a
@@ -508,10 +544,12 @@ HIPFIRE_SERVER_PREFIX_CACHE_MB=<N>    default conservative
 
 The current JSON-lines daemon protocol can evolve in two steps.
 
-### Scheduler-to-Daemon Contract (Scaffolded `generate_batch_prefill`)
+### Scheduler-to-Daemon Contract (`generate_batch_prefill`)
 
-The scheduler currently targets a scaffold-only `generate_batch_prefill` protocol
-to avoid GPU hot-path changes in this goal.
+The scheduler targets `generate_batch_prefill` for compatible same-worker
+prefill groups. The daemon currently supports probe/validation and Qwen35
+serial/fused execution under per-session activation; generic worker APIs for
+other architecture families are still follow-up.
 
 - **Request envelope** (`type: "generate_batch_prefill"`):
   - `id` (optional): client correlation ID returned on protocol responses
@@ -549,7 +587,7 @@ to avoid GPU hot-path changes in this goal.
     (`pflash`, `cask`, unsupported max-seq growth, etc.)
   - request-level routing compatibility with current loaded worker
 
-- **Fallback/unsupported metadata path (currently active behavior)**:
+- **Fallback/unsupported metadata path**:
   - Ineligible or unsupported requests are still sent through
     serialized `generate`.
   - `generate_batch_prefill_runtime` dispatch reasons are surfaced via
@@ -561,7 +599,7 @@ to avoid GPU hot-path changes in this goal.
   - `/health` publishes aggregate counters and last observed queue/runtime/fallback
     values through `prefill_batch`.
 
-- **Unsupported contract response shape** (daemon-side scaffold):
+- **Unsupported contract response shape**:
 
 ```json
 {
@@ -575,6 +613,9 @@ to avoid GPU hot-path changes in this goal.
 ```
 
 CLI interprets this as a stable capability state and keeps execution serialized.
+When the daemon returns `generate_batch_prefill_ready`, CLI may dispatch the
+selected batch and then continue each request through `generate` with
+`prefill_already_done`.
 
 ### Step 1 - Worker-Aware Single Generate
 
