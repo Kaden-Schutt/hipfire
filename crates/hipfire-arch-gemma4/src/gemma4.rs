@@ -1877,104 +1877,61 @@ fn sliding_layer_decode_impl(
         eprintln!("[v1] Dumped post-RoPE Q({}), K({}), V({})", q_data.len(), k_data.len(), v_data.len());
     }
 
-    // KV cache write + flash attention with window_size=1024.
-    // Branch on cache quant mode, same as qwen35::run_fa_layer_body.
-    if kv_cache.quant_asym3 {
-        let ct = kv_cache.givens_cos.as_ref().unwrap();
-        let st = kv_cache.givens_sin.as_ref().unwrap();
-        // Ring-buffer cache_capacity = sliding_window: writes wrap into a
-        // sliding_window-sized cache; reads address slots via (t % cap). This
-        // lets the sliding KV cache stay at constant size regardless of seq
-        // length — required to fit 128k context on a 17 GB GPU.
-        let sliding_cap = config.sliding_window as u32;
-        gpu.kv_cache_write_asym3_fused(
-            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
-        gpu.attention_flash_asym3_window(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
-            n_heads, n_kv, head_dim, kv_cache.max_seq,
-            &scratch.flash_partials,
-            sliding_cap,
-            sliding_cap,
-        )?;
-        if _dump_on { dbg_dump(gpu, "[v1] L0 after attention", &scratch.attn_out, n_heads * head_dim); }
-    } else if kv_cache.quant_asym4 {
-        let ct = kv_cache.givens_cos.as_ref().unwrap();
-        let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym4_fused(
-            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
-        gpu.attention_flash_asym4_window(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
-            n_heads, n_kv, head_dim, kv_cache.max_seq,
-            &scratch.flash_partials,
-            config.sliding_window as u32,
-            0)?;
-    } else if kv_cache.quant_asym2 {
-        let ct = kv_cache.givens_cos.as_ref().unwrap();
-        let st = kv_cache.givens_sin.as_ref().unwrap();
-        gpu.kv_cache_write_asym2_fused(
-            &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
-        gpu.attention_flash_asym2_window(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
-            n_heads, n_kv, head_dim, kv_cache.max_seq,
-            &scratch.flash_partials,
-            config.sliding_window as u32,
-            0)?;
-    } else if kv_cache.quant_q8 {
-        let sliding_cap = config.sliding_window as u32;
-        gpu.kv_cache_write_q8_0_cap(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, n_kv, head_dim, sliding_cap)?;
-        gpu.kv_cache_write_q8_0_cap(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, n_kv, head_dim, sliding_cap)?;
-        gpu.attention_flash_q8_0_cap(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.attn_out, &scratch.pos_buf, pos + 1,
-            n_heads, n_kv, head_dim, kv_cache.max_seq,
-            &scratch.flash_partials,
-            sliding_cap,
-            sliding_cap,
-        )?;
-    } else {
-        // Plain FP32 KV path (kvf16 / kvfp32) — NO sliding window.
-        // Only for debugging; incorrect for seq > window_size.
-        let kv_dim = n_kv * head_dim;
-        gpu.kv_cache_write(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
-        gpu.kv_cache_write(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
-        // Diagnostic: dump K/V from cache
-        if _dump_on {
-            let k_data = gpu.download_f32(&kv_cache.k_gpu[kv_layer_idx]).unwrap_or_default();
-            let v_data = gpu.download_f32(&kv_cache.v_gpu[kv_layer_idx]).unwrap_or_default();
-            // pos=1 (Hello token): offset = 1 * kv_dim
-            let k_pos1 = &k_data[kv_dim..kv_dim*2];
-            let v_pos1 = &v_data[kv_dim..kv_dim*2];
-            let k_sum: f64 = k_pos1.iter().map(|&v| v as f64).sum();
-            let v_sum: f64 = v_pos1.iter().map(|&v| v as f64).sum();
-            eprintln!("[v1] FP32 K cache pos=1: sum={k_sum:.4} first4=[{:.4},{:.4},{:.4},{:.4}]",
-                k_pos1[0], k_pos1[1], k_pos1[2], k_pos1[3]);
-            eprintln!("[v1] FP32 V cache pos=1: sum={v_sum:.4} first4=[{:.4},{:.4},{:.4},{:.4}]",
-                v_pos1[0], v_pos1[1], v_pos1[2], v_pos1[3]);
-            // Also pos=0 (BOS)
-            let k_pos0 = &k_data[0..kv_dim];
-            let v_pos0 = &v_data[0..kv_dim];
-            let k0_sum: f64 = k_pos0.iter().map(|&v| v as f64).sum();
-            let v0_sum: f64 = v_pos0.iter().map(|&v| v as f64).sum();
-            eprintln!("[v1] FP32 K cache pos=0: sum={k0_sum:.4} first4=[{:.4},{:.4},{:.4},{:.4}]",
-                k_pos0[0], k_pos0[1], k_pos0[2], k_pos0[3]);
-            eprintln!("[v1] FP32 V cache pos=0: sum={v0_sum:.4} first4=[{:.4},{:.4},{:.4},{:.4}]",
-                v_pos0[0], v_pos0[1], v_pos0[2], v_pos0[3]);
-        }
-        gpu.attention_flash(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.attn_out, &scratch.flash_partials,
-            pos + 1,
-            n_heads, n_kv, head_dim, kv_cache.max_seq,
-            config.sliding_window,
-        )?;
+    // KV cache write + flash attention via dispatch framework (Step::Attend).
+    // flash_mode=2 (forced) because sliding layers always need flash for window masking.
+    let sliding_cap = kv_cache.physical_cap as u32;
+    {
+        let tier_inputs = KvTierInputs {
+            quant_asym4: kv_cache.quant_asym4,
+            quant_asym3: kv_cache.quant_asym3,
+            quant_asym2: kv_cache.quant_asym2,
+            quant_q8: kv_cache.quant_q8,
+            quant_fwht: kv_cache.quant_fwht,
+            quant_hfq4: false,
+            quant_q4: false,
+            v_mode_bits: kv_cache.v_mode_bits(),
+            pos,
+            flash_mode: 2, // forced flash — sliding layers need window masking
+            capture_mode: gpu.graphs.capture_mode,
+            batch_size: 1,
+            is_tree: false,
+            is_boundary: false,
+            cache_capacity: sliding_cap,
+            head_dim,
+            window_size: config.sliding_window as u32,
+        };
+        let plan = KvTierPlan::derive(tier_inputs)
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
+        let io = AttnParams {
+            q: &scratch.q,
+            k: &scratch.k,
+            v: &scratch.v,
+            k_cache: &kv_cache.k_gpu[kv_layer_idx],
+            v_cache: &kv_cache.v_gpu[kv_layer_idx],
+            k_scales: None,
+            v_scales: None,
+            pos_buf: &scratch.pos_buf,
+            pos,
+            positions: None,
+            n_heads,
+            n_kv_heads: n_kv,
+            head_dim,
+            physical_cap: kv_cache.max_seq,
+            cache_capacity: sliding_cap,
+            window_size: config.sliding_window as u32,
+            batch_size: 1,
+            max_ctx_len: 0,
+            flash_partials: Some(&scratch.flash_partials),
+            givens_cos: kv_cache.givens_cos.as_ref(),
+            givens_sin: kv_cache.givens_sin.as_ref(),
+            tree_bias: None,
+            block_start: 0,
+            block_cols: 0,
+            output: &scratch.attn_out,
+        };
+        let ctx = DispatchCtx::new(gpu);
+        execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])?;
     }
-
     // Dump attention output regardless of KV cache branch.
     if _dump_on {
         dbg_dump(gpu, "[v1] L0 after attention", &scratch.attn_out, n_heads * head_dim);
