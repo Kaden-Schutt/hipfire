@@ -227,13 +227,20 @@ impl Gpu {
         head_dim: usize, max_seq: usize, partials: &GpuTensor,
         window_size: u32, cache_capacity: u32,
     ) -> HipResult<()> {
-        let _ = (window_size, cache_capacity);
+        // `cache_capacity` (ring-buffer wrap) is not yet wired — we window the
+        // read instead (the sliding KV cache is sized at max_seq). The window
+        // mask matches HF's sliding-window attention; the ring-buffer memory
+        // optimization is a follow-up that also needs the KV-write wrap.
+        let _ = cache_capacity;
         if head_dim == 512 {
+            // Full (global) layers: no sliding window (full causal).
             self.attention_flash_asym3_hd512(q, k_cache, v_cache, out, pos_buf,
                 cos_theta, sin_theta, seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials)
         } else {
+            // Sliding layers: window the lookback to `window_size`.
             self.attention_flash_asym3(q, k_cache, v_cache, out, pos_buf,
-                cos_theta, sin_theta, seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials)
+                cos_theta, sin_theta, seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials,
+                window_size as usize)
         }
     }
 

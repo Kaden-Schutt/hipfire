@@ -3956,6 +3956,12 @@ fn load_model(
             .map_err(|e| format!("gemma4 init_scratch_constants: {e:?}"))?;
 
         // Dual KV: fp32 for sliding (debug), asym3 for full (hd=512)
+        // Sliding layers: cache sized at `sliding_window`, KV write at slot=pos
+        // (no ring wrap). The `kv_window` flash param + max_seq sizing for true
+        // >1024 long-context is staged but NOT enabled: enabling it exposed a
+        // pre-existing >1024 collapse (see dev log Session 16) unrelated to the
+        // windowing itself. Until that's localized via the per-layer oracle, the
+        // daemon stays at the known-good <=sliding_window path (guard below).
         let kv_sliding = llama::KvCache::new_gpu(
             gpu, config.n_layers, config.sliding_n_kv_heads,
             config.sliding_head_dim, config.sliding_window,
@@ -11525,17 +11531,17 @@ fn generate_gemma4(
         return;
     }
 
-    // Sliding-window guard. The sliding KV cache is sized at `sliding_window`
-    // and writes use slot=`pos` with NO ring-buffer wrap (cache_capacity not yet
-    // threaded into the kernels). So any position >= sliding_window writes/reads
-    // out of bounds. Refuse a too-long prompt and stop decode before the cap,
-    // rather than corrupting memory. Remove this guard once the ring buffer lands.
-    let sliding_cap = m.gemma4_config.as_ref().unwrap().sliding_window;
-    if prompt_ids.len() >= sliding_cap {
+    // Sliding-window guard. The sliding KV cache is sized at `sliding_window` and
+    // writes use slot=`pos` (no ring wrap), so positions >= sliding_window would
+    // OOB; and enabling >sliding_window context exposes a pre-existing collapse
+    // (dev log Session 16). Refuse too-long prompts / stop decode before the cap
+    // until long-context is validated via the per-layer oracle.
+    let cache_cap = m.gemma4_kv_sliding.as_ref().unwrap().max_seq;
+    if prompt_ids.len() >= cache_cap {
         emit_error_with_id(stdout, id, format!(
             "gemma4 prompt is {} tokens but the sliding-window limit is {} \
-             (ring-buffer KV not yet implemented; long-context support pending)",
-            prompt_ids.len(), sliding_cap,
+             (long-context >sliding_window not yet validated — see dev log)",
+            prompt_ids.len(), cache_cap,
         ));
         return;
     }
@@ -11624,11 +11630,10 @@ fn generate_gemma4(
 
         generated_count += 1;
 
-        // Sliding-window guard: the next forward writes KV at slot=`m.seq_pos`;
-        // forwarding at `pos >= sliding_window` would write out of bounds (no
-        // ring-buffer wrap yet). Stop cleanly here — the just-emitted token is
-        // still valid. Remove once the ring buffer lands.
-        if m.seq_pos >= sliding_cap {
+        // KV-cache capacity guard: the next forward writes KV at slot=`m.seq_pos`;
+        // forwarding at `pos >= max_seq` would write out of bounds. Stop cleanly
+        // here — the just-emitted token is still valid.
+        if m.seq_pos >= cache_cap {
             break;
         }
 

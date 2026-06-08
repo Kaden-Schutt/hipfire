@@ -12758,6 +12758,7 @@ fn forward_scratch_layers_multi(
                                 config.head_dim,
                                 kv_cache.physical_cap,
                                 &s.flash_partials,
+                                0, // kv_window: 0 = full causal (qwen3.5 asym3)
                             )?;
                         }
                     } else if kv_cache.quant_asym2 {
@@ -13365,6 +13366,7 @@ fn forward_scratch_layers_multi(
                                 config.head_dim,
                                 kv_cache.physical_cap,
                                 &s.flash_partials,
+                                0, // kv_window: 0 = full causal (qwen3.5 asym3)
                             )?;
                         }
                     } else if kv_cache.quant_asym2 {

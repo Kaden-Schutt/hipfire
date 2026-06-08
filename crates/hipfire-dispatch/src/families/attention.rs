@@ -527,6 +527,7 @@ fn dispatch_attend(
             hip!(gpu.attention_flash_asym3(
                 io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
                 ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
+                0, // kv_window: 0 = full causal (non-gemma asym3)
             ))
         }
         KernelKey::AttnFlashAsym3Fwht => {

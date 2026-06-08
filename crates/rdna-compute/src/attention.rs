@@ -3802,6 +3802,9 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
         partials: &GpuTensor,
+        // Sliding-window lookback. 0 = full causal (qwen35 and other callers).
+        // Gemma 4 sliding layers pass `sliding_window` (1024).
+        kv_window: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -3835,6 +3838,7 @@ impl Gpu {
             let mut sc = scale;
             let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
+            let mut kw = kv_window as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -3850,6 +3854,7 @@ impl Gpu {
                 &mut sc as *mut _ as *mut c_void,
                 &mut ts as *mut _ as *mut c_void,
                 &mut mt as *mut _ as *mut c_void,
+                &mut kw as *mut _ as *mut c_void,
             ];
             unsafe {
                 self.hip.launch_kernel(

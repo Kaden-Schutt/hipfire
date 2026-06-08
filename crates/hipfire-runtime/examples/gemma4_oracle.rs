@@ -44,7 +44,7 @@ fn main() {
     let max_seq = ids.len().max(2);
     let mut kv_sliding = KvCache::new_gpu(
         &mut gpu, config.n_layers, config.sliding_n_kv_heads,
-        config.sliding_head_dim, config.sliding_window,
+        config.sliding_head_dim, max_seq,
     ).expect("kv sliding alloc");
     let mut kv_full = KvCache::new_gpu_asym3(
         &mut gpu, config.n_layers, config.full_n_kv_heads,
