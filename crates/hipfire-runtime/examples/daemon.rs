@@ -11510,6 +11510,7 @@ fn generate_gemma4(
     let framed_ok = ["<|turn>", "<turn|>", "<|channel>", "<channel|>"]
         .iter()
         .all(|t| tokenizer.special_token_id(t).is_some());
+    eprintln!("[gemma4 chat] framed_ok={framed_ok}");
     let prompt_ids: Vec<u32> = {
         let mut ids = vec![2u32]; // BOS
         if framed_ok {
@@ -11532,6 +11533,7 @@ fn generate_gemma4(
         emit_error_with_id(stdout, id, "empty prompt after tokenize".to_string());
         return;
     }
+    eprintln!("[gemma4 prompt] {} tokens: {:?}", prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(30)]);
 
     // Context-length guard. Both the sliding and full KV caches are sized at
     // `max_seq`; writing at pos >= max_seq would OOB. Refuse too-long prompts.

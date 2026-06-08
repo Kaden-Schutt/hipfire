@@ -4725,6 +4725,10 @@ fn main() {
         .map(|i| args[i + 1].as_str())
         .unwrap_or("q8f16");
 
+    // Force Q8 quantization for MoE expert weights regardless of --format.
+    // Avoids the MQ4G256 quality cliff on small-magnitude expert weights.
+    let expert_q8_override = args.iter().any(|a| a == "--expert-q8");
+
     // Optional imatrix (llama.cpp GGUF format with .in_sum2 / .counts per-tensor).
     // When provided, MQ2-Lloyd quantization uses per-column importance weights
     // to bias centroid placement. See `quantize_mq2g256_lloyd_weighted`.
@@ -6008,6 +6012,14 @@ fn main() {
                     } else if expert_hfq4 {
                         let q = quantize_hfq4g256(&f32_slice);
                         (q, QuantType::HFQ4G256, 256u32)
+                    } else if use_q8 || expert_q8_override {
+                        // Q8 for all expert weights when --format q8f16 or --expert-q8.
+                        // Avoids MQ4G256 quality cliff on gate_up AND fixes
+                        // HFQ4G128 ragged-group bug on down_proj (K=704 not
+                        // divisible by 128). On 128 GB VRAM, Q8 experts add
+                        // ~12 GB over MQ4 — easily fits.
+                        let q = quantize_q8f16(&f32_slice);
+                        (q, QuantType::Q8F16, 256u32)
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
@@ -6043,6 +6055,8 @@ fn main() {
                 "HFQ6G256"
             } else if expert_hfq4 {
                 "HFQ4G256"
+            } else if use_q8 || expert_q8_override {
+                "Q8_0"
             } else if supports_g256 {
                 "MQ4G256"
             } else {

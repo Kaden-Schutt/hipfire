@@ -455,6 +455,10 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> HipResult<Vec<f
             0, &format!("shape mismatch for {name}: expected {expected_n}, got {n}"),
         ));
     }
+    if std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") && data.len() <= 4 && name.contains("layer_scalar") {
+        eprintln!("[gemma4] load_f32_vec({name}): qt={}, shape={:?}, raw_bytes={:02x?}",
+            info.quant_type, info.shape, &data[..data.len().min(4)]);
+    }
     let f32_data = match info.quant_type {
         1 => data.chunks_exact(2)
                  .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -771,6 +775,7 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                 let q_dim = config.n_heads * hd;
                 let (layer_scalar, layer_scalar_host) =
                     load_layer_scalar(hfq, gpu, &format!("{p}.layer_scalar"))?;
+                if i == 0 { eprintln!("[gemma4] L0 sliding layer_scalar = {layer_scalar_host}"); }
                 let moe = if config.enable_moe_block {
                     Some(load_moe_layer_extras(hfq, gpu, &p, config)?)
                 } else { None };
@@ -812,6 +817,7 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
                 let q_dim = config.n_heads * hd;
                 let (layer_scalar, layer_scalar_host) =
                     load_layer_scalar(hfq, gpu, &format!("{p}.layer_scalar"))?;
+                if i <= 6 { eprintln!("[gemma4] L{i} full layer_scalar = {layer_scalar_host}"); }
                 let moe = if config.enable_moe_block {
                     Some(load_moe_layer_extras(hfq, gpu, &p, config)?)
                 } else { None };
@@ -1268,6 +1274,18 @@ fn apply_moe_branch(
     gpu.rmsnorm_f32(attn_out, &moe.pre_feedforward_layernorm_2,
         &scratch.moe_pre2, config.norm_eps)?;
 
+    // Dump moe_pre2 on first call
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static PRE2_DUMP: AtomicUsize = AtomicUsize::new(0);
+        let pc = PRE2_DUMP.fetch_add(1, Ordering::Relaxed);
+        if pc == 0 {
+            if let Ok(data) = gpu.download_f32(&scratch.moe_pre2) {
+                let sum: f64 = data.iter().map(|&v| v as f64).sum();
+                eprintln!("[moe pre2] first4={:?} sum={sum:.4}", &data[..4.min(data.len())]);
+            }
+        }
+    }
     // 3) Router input: rmsnorm(attn_out, router_scale) / sqrt(dim).
     //    Equivalent to ref `rms_norm(x) * router_scale / sqrt(dim)` since
     //    rmsnorm_f32(x, w) = w * x / sqrt(mean(x²) + eps) — elementwise commutative.
@@ -1394,6 +1412,17 @@ fn apply_moe_branch(
         } else {
             gpu.hip.memset(&scratch.moe_cur_moe.buf, 0, dim_bytes)?;
         }
+        // Dump router info for first MoE layer
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static CALL: AtomicUsize = AtomicUsize::new(0);
+            let c = CALL.fetch_add(1, Ordering::Relaxed);
+            if c == 0 {
+            eprintln!("[moe diag] first call: topk_indices={:?} topk_weights={:?}\n  per_expert_scale[0..8]={:?}",
+                    &topk_indices[..k_top], &topk_weights[..k_top],
+                    &moe.per_expert_scale_host[..8.min(n_exp)]);
+        }
+        }
         for ki in 0..k_top {
             let e = topk_indices[ki];
             let weight = topk_weights[ki] * moe.per_expert_scale_host[e];
@@ -1405,10 +1434,54 @@ fn apply_moe_branch(
             gpu.mul_f32(&scratch.moe_expert_hidden, &up, &scratch.moe_expert_hidden)?;
             weight_gemv(gpu, &expert.down_proj, &scratch.moe_expert_hidden, &scratch.moe_expert_out)?;
             gpu.scaled_add_inplace_cpu_scalar_f32(&scratch.moe_cur_moe, &scratch.moe_expert_out, weight)?;
+            // Dump first expert's contribution
+            if ki == 0 {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static EXPERT_CALL: AtomicUsize = AtomicUsize::new(0);
+                let ec = EXPERT_CALL.fetch_add(1, Ordering::Relaxed);
+                if ec == 0 {
+                    // gate_up output
+                    if let Ok(gu_data) = gpu.download_f32(&scratch.moe_expert_gate_up) {
+                        let sum: f64 = gu_data.iter().map(|&v| v as f64).sum();
+                        let gate_sum: f64 = gu_data[..mi].iter().map(|&v| v as f64).sum();
+                        let up_sum: f64 = gu_data[mi..].iter().map(|&v| v as f64).sum();
+                        eprintln!("[moe expert] expert={e} GATE_UP: gate_first4={:?} gate_sum={gate_sum:.4} up_first4={:?} up_sum={up_sum:.4}",
+                            &gu_data[..4.min(mi)], &gu_data[mi..mi+4.min(mi)],
+                        );
+                    }
+                    // gate-up shape: gate_up_proj m=2*mi=1408, k=dim=2816
+                    eprintln!("[moe expert] expert={e} gate_up_proj m={} k={} dtype={:?}",
+                        expert.gate_up_proj.m, expert.gate_up_proj.k,
+                        expert.gate_up_proj.gpu_dtype);
+                    // down_proj output
+                    if let Ok(data) = gpu.download_f32(&scratch.moe_expert_out) {
+                        let sum: f64 = data.iter().map(|&v| v as f64).sum();
+                        eprintln!("[moe expert] expert={e} weight={weight:.6} down_dtype={:?} expert_out_sum={sum:.4} first4={:?}",
+                            expert.down_proj.gpu_dtype,
+                            &data[..4.min(data.len())]);
+                    }
+                }
+            }
         }
     }
 
     // 9) cur_moe = post_feedforward_layernorm_2(cur_moe) — in-place
+    // Dump MoE branch intermediates on first call
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static MOE_END: AtomicUsize = AtomicUsize::new(0);
+        let mc = MOE_END.fetch_add(1, Ordering::Relaxed);
+        if mc == 0 {
+            if let Ok(mlp_data) = gpu.download_f32(&scratch.moe_cur_mlp) {
+                let sum: f64 = mlp_data.iter().map(|&v| v as f64).sum();
+                eprintln!("[moe branch] cur_mlp first4={:?} sum={sum:.4}", &mlp_data[..4.min(mlp_data.len())]);
+            }
+            if let Ok(moe_data) = gpu.download_f32(&scratch.moe_cur_moe) {
+                let sum: f64 = moe_data.iter().map(|&v| v as f64).sum();
+                eprintln!("[moe branch] cur_moe (before norm2) first4={:?} sum={sum:.4}", &moe_data[..4.min(moe_data.len())]);
+            }
+        }
+    }
     gpu.rmsnorm_f32(&scratch.moe_cur_moe, &moe.post_feedforward_layernorm_2,
         &scratch.moe_cur_moe, config.norm_eps)?;
 

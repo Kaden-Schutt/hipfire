@@ -1820,3 +1820,499 @@ This matches the upstream's `apply_moe_branch` legacy path.
 | Phase 3 | ✅ Done |
 | Phase 4 | 🔄 Legacy path works, quality TBD, fused kernels deferred |
 | Phase 5 | 🔲 Validation |
+
+---
+
+## Session 22 — 26B-A4B garbled output investigation (2026-06-08)
+
+### Symptom
+
+The 26B-A4B MoE model generates garbled output:
+```
+"The capital of France is" → "- el de\n\n\n\nの\n的\n고 true 、... la capital de France est ______"
+"Hello" → "la * * el de aed de la ______"
+```
+
+Top-k logits at early positions show multi-lingual gibberish tokens instead of coherent English.
+
+### What's ruled out
+
+#### ❌ Tokenizer
+12B dense model uses the same tokenizer and produces coherent output. Same arch crate, same tokenizer code path.
+
+#### ❌ MoE branch specifically
+`HIPFIRE_MOE_BYPASS=1` (dense-only path, no MoE experts) ALSO produces garbled output. The problem is in the base attention/FFN computation, not the MoE expert loop.
+
+#### ❌ Chat template framing
+Diagnostic confirmed `framed_ok=true` — all four special tokens (`<|turn>`, `<turn|>`, `<|channel>`, `<channel|>`) are found and the prompt is correctly framed as:
+```
+<bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>
+```
+Token IDs: `[2, 105, 2364, 107, 818, 5279, 529, 7001, 563, 106, 107, 105, 4368, 107, 100, 45518, 107, 101]`
+
+#### ❌ Layer scalar corruption (initially suspected, later confirmed correct)
+Initially thought `layer_scalar` values were wrong because HF reference BF16 `0xb7e9` ≠ hipfire FP16. But re-reading the safetensors correctly showed:
+- 12B L0: BF16 `0x3d59` = 0.05298 → hipfire FP16 matches
+- 26B L0: BF16 `0x3d90` = 0.07031 → hipfire FP16 matches
+Values are correctly stored in the HFQ file and loaded.
+
+#### ❌ Router top-k logic
+First MoE call diagnostic shows reasonable router output:
+```
+topk_indices=[79, 102, 114, 19, 54, 46, 58, 84]
+topk_weights=[0.393, 0.323, 0.057, 0.048, 0.047, 0.046, 0.044, 0.041]
+per_expert_scale[0..8]=[0.984, 1.016, 0.996, 1.016, 0.992, 0.996, 1.000, 1.008]
+```
+
+#### ❌ NaN/Inf
+All hidden state dumps show reasonable magnitudes, no NaN or Inf. L0 hidden states propagate through all 30 layers with normal range.
+
+#### ❌ Logit softcapping
+Kernel is trivially correct: `x[i] = tanhf(x[i] / cap) * cap`. Value `cap=30.0` loaded from config.
+
+#### ❌ Expert 3D split in quantizer
+Verified HFQ file contains correctly split per-expert 2D tensors:
+```
+model.language_model.layers.0.experts.0.gate_up_proj.weight: qt=13 shape=[1408, 2816] gs=256
+model.language_model.layers.0.experts.0.down_proj.weight: qt=7 shape=[2816, 704] gs=128
+```
+
+### What's still suspicious / open theories
+
+#### 🔶 Theory A: Embedding quantization error too large for 26B's small dim
+26B has `hidden_size=2816` vs 12B's `hidden_size=3840`. The embedding is stored as Q8 (quant_type=3, Q8F16). For 12B the BOS embedding values range ~[-0.01, 0.01] with max abs ~0.01, and Q8 step size is small enough. For 26B, the BOS embedding has max abs 0.71 — much larger dynamic range — but also 2816 elements. Q8 quantization error is ~0.4% per group of 32, which should be acceptable.
+
+Evidence: hipfire's BOS embedding first4 = [0.089, -0.044, 0.622, 0.356] vs HF reference = [0.074, -0.055, 0.615, 0.342]. The differences (~15-20% on small values) come from Q8 quantization. This is within expected Q8 error bounds.
+
+#### 🔶 Theory B: Q8 embedding error amplified by small model (2816 dim)
+The 26B model has a much smaller hidden dimension (2816) than the 12B (3840). Q8 quantization error on the embedding lookup could be proportionally more impactful. But this should cause quality degradation, not complete garbling.
+
+#### 🔶 Theory C: Hidden dimension mismatch in attention/FFN
+26B config: `n_heads=16, n_kv_heads=8, head_dim=256, global_n_kv=2, global_head_dim=512`.
+GQA ratio = 16/8 = 2 for sliding, 16/2 = 8 for full attention.
+
+The V1 diagnostic shows attention head sums at L0:
+```
+head  0 (kv=0): sum=+28.55
+head  1 (kv=0): sum=+28.55  ← SAME as head 0!
+head  2 (kv=1): sum=-12.13
+head  3 (kv=1): sum=-12.13  ← SAME as head 2!
+...
+```
+**Head pairs sharing the same KV head produce IDENTICAL output sums.** This is expected for GQA at pos=0 (single KV token → all Q heads attend to the same K,V → same attention weights). At pos=1+ they should diverge due to RoPE. At pos=1 they DO diverge (head 0 = +28.53, head 1 = +28.50 — close but different). So attention is working correctly.
+
+#### 🔶 Theory D: Full-attention layer (hd=512) issues
+26B has `num_global_key_value_heads=2` with `global_head_dim=512`. The hd512 attention path was ported for the 12B model which has `num_global_key_value_heads=1`. Having 2 KV heads instead of 1 changes the KV cache layout.
+
+The KV write kernel grid is `[n_kv_heads]`, so for n_kv=2 the grid has 2 blocks. Each block writes one head's worth of hd512 data. The attention kernel grid is `[n_heads, tiles]` = `[16, ...]` with GQA mapping `kv_head = h / 8`. This seems correct — 16 query heads map to 2 KV heads via 8:1 GQA.
+
+But: need to verify the KV cache stride calculations are correct for n_kv_heads=2. The bytes_per_head = 196, bytes_per_pos = n_kv_heads * bytes_per_head = 2 * 196 = 392. The attention kernel reads `k_cache + pos * bytes_per_pos + kv_head * bytes_per_head`. This seems correct.
+
+#### 🔶 Theory E: Pre-attention norm or post-attention residual flow error in full-attention layers
+The full-attention decode path (layers 5, 11, 17, 23, 29) uses a different code path than sliding layers. The residual flow is:
+1. `x = residual + o_proj(rmsnorm(attn_out))` (post-attn residual)
+2. `residual = x`
+3. `tmp = rmsnorm(x)` (pre-FFN norm)
+4. `ffn_out = down_proj(gelu_tanh(gate_proj(tmp)) * up_proj(tmp))`
+5. MoE or post_feedforward_layernorm
+6. `x = residual + tmp` (FFN residual)
+
+This is identical to the sliding layer path. Verified by code inspection.
+
+#### 🔶 Theory F: `weight_gemv` MQ4 rotation for expert weights
+Expert gate_up is MQ4G256 (quant_type=13). The legacy MoE loop calls `weight_gemv(gpu, &expert.gate_up_proj, &scratch.moe_pre2, ...)`. Inside `weight_gemv`, MQ4G256 hits the `_ => { ... }` arm which does `rotate_x_mq_for` + `Prerotated` GEMV. But the input is `moe_pre2` (already rmsnorm'd attn_out), not the pre-rotation x. The rotation is applied correctly inside `weight_gemv` — it rotates the input, then calls the prerotated kernel.
+
+But wait — **the pool-based expert views might have wrong metadata.** The pool allocates all experts contiguously, and per-expert `WeightTensor` views use `sub_offset`. Let me check:
+- `gate_up_pool`: uploaded as raw bytes, each expert is `gate_up_bytes` apart
+- Expert view: `buf = pool.sub_offset(x * gate_up_bytes, gate_up_bytes)`, `m=1408, k=2816`
+- The `gpu_dtype` is set to the pool's dtype (MQ4G256 for gate_up, HFQ4G128 for down)
+
+This should be correct as long as `sub_offset` gives a valid view into the pool buffer.
+
+#### 🔴 Theory G: **Embedding lookup format mismatch** (MOST PROMISING)
+The embedding is stored as Q8 (quant_type=3, which maps to `DType::Q8_0` in the loader). But the loader's `load_gemma4_weight` function maps quant_type to DType. Let me check what quant_type 3 maps to:
+
+```rust
+3 => DType::Q8_0,
+```
+
+But the quantizer stores embeddings as `QuantType::Q8F16` (the Q8-FP16 hybrid). Is `QuantType::Q8F16` serialized as quant_type=3? Need to verify. If there's a mismatch between how the quantizer serializes and how the loader deserializes, the embedding lookup kernel would read garbage.
+
+Actually, looking at the quantizer: `QuantType::Q8F16` is the enum variant used for all Q8 storage. The loader maps `qt=3` to `DType::Q8_0`. The `embedding_lookup_q8` kernel expects Q8_0 format (32 weights + 2-byte scale per group of 32). The quantizer's `quantize_q8f16` produces exactly that layout. So this should be correct.
+
+But the BOS embedding values from hipfire don't exactly match HF:
+- HF: [0.074, -0.055, 0.615, 0.342]
+- hipfire: [0.089, -0.044, 0.622, 0.356]
+- Relative error: ~15-20% on small values, ~1% on large values
+
+This is expected Q8 quantization error. Not enough to cause complete garbling.
+
+#### 🔴 Theory H: **Embedding lookup for vocab_size=262K**
+26B has vocab_size=262144 (262K BPE). 12B also has vocab_size=262144. Both use the same tokenizer. The Q8 embedding tensor is the same shape. The `embedding_lookup_q8` kernel reads row `token_id` from the embedding table. This should work regardless of vocab size.
+
+But — is the `lm_head` correctly aliased to `embed_tokens` for tied weights? The 26B config has `tie_word_embeddings: true`. Let me verify the loader sets `lm_head` to alias `embed_tokens`.
+
+#### 🔴 Theory I: **RoPE parameters different for 26B**
+26B config:
+```json
+"rope_parameters": {
+  "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional"},
+  "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}
+}
+```
+12B has the same config. The loader needs to parse `rope_type: "proportional"` correctly and set `partial_rotary_factor = 0.25`. If this is wrong, RoPE would be incorrect for full-attention layers.
+
+#### 🔴 Theory J: **`rope_partial_halved` kernel bug for n_kv_heads > 1**
+The 12B model has `num_global_key_value_heads=1` and the hd512 RoPE was tested only with that. The 26B has `num_global_key_value_heads=2`. The `rope_partial_halved_f32` kernel writes K vectors for n_kv_heads heads. If the stride or head indexing is wrong for n_kv > 1, K values would be corrupted.
+
+### What to investigate next
+
+1. **Verify `rope_partial_halved` for n_kv=2**: Dump K values after RoPE for 26B vs HF at pos=0. If they diverge, RoPE is the bug.
+
+2. **Full per-layer hidden state comparison**: Dump hidden states at every layer boundary for both 12B and 26B at the same prompt. Find the first layer where 26B diverges from expected behavior.
+
+3. **Verify the MoE branch is truly the issue by comparing dense-only vs MoE**: If `HIPFIRE_MOE_BYPASS=1` output is *different garbled* from MoE output, the MoE branch is changing things (possibly helping or hurting). If identical, MoE is a noop.
+
+4. **Re-quantize with higher quality (Q8 for everything)**: Eliminate quantization error as a variable. If Q8 model is still garbled, it's a compute bug.
+
+5. **Build a CPU oracle for L0 forward pass**: Compute embedding → rmsnorm → Q/K/V projection → attention → o_proj → residual → pre-FFN norm → gate/up/down → MoE branch in Python using HF weights, compare with hipfire's per-layer dumps.
+
+6. **Check `lm_head` aliasing**: Verify `weights.lm_head.buf` actually points to the same GPU memory as `weights.embed_tokens.buf` for the 26B model.
+
+### Diagnostic data collected
+
+**26B pos=0, L0 sliding layer (full dump with HIPFIRE_GEMMA4_DUMP=1):**
+```
+L0 input:     sum=+4.46e0  first4=[0.089, -0.044, 0.622, 0.356]
+L0 after norm: sum=+1.40e2  first4=[0.152, -0.080, 1.171, 0.704]
+L0 after q:   sum=+7.05e2  first4=[21.20, 58.49, 9.07, 11.65]
+L0 after k:   sum=-2.28e3  first4=[119.17, 23.13, -16.36, 0.31]
+L0 after v:   sum=-1.10e3  first4=[-4.17, 6.95, -7.77, -0.17]
+L0 after attn: sum=-3.34e1 first4=[-0.247, 0.395, -0.444, 0.000]
+L0 after o:   sum=-2.56e2  first4=[-1.050, -3.236, 5.195, 0.014]
+L0 after res: sum=-2.15e2  first4=[-0.122, -0.554, 0.840, 0.359]
+L0 after gate:sum=-5.20e3  first4=[-5.966, -3.524, -0.581, -0.715]
+L0 after down:sum=-1.14e2  first4=[-16.14, 49.87, -9.769, 32.27]
+L0 hidden:    sum=-3.80e1  first4=[-0.019, -0.123, 0.120, 0.444]
+```
+
+**26B logits progression:**
+```
+pos=0: top5=[(726, 17.80), (1623, 17.65), (236775, 14.96), ...]
+pos=1: top5=[(623, 7.16), (236772, 5.17), ...]
+pos=2: top5=[(1707, 13.55), (108, 13.31), ...]
+pos=3: top5=[(3292, 4.18), ...]
+pos=7: top5=[(108, 20.94), (621, 20.41), ...] ← 108 = "\n\n"
+pos=17: top5=[(236772, 19.90), (569, 19.23), ...] ← 236772 = "-"
+```
+
+The logits are high-confidence multi-lingual tokens. The model is "sure" about its wrong answers.
+
+**12B logits for comparison (same prompt):**
+```
+pos=17: top5=[(818, 22.65), (50429, 17.22), ...] ← 818 = "Paris"
+```
+
+12B correctly predicts "Paris" at pos=17. 26B predicts `-` (236772).
+
+### Key config comparison (12B vs 26B)
+
+| Param | 12B | 26B |
+|-------|-----|-----|
+| hidden_size | 3840 | 2816 |
+| n_heads | 32 | 16 |
+| n_kv_heads | 8 | 8 |
+| head_dim | 256 | 256 |
+| global_n_kv | 1 | **2** |
+| global_head_dim | 512 | 512 |
+| sliding_window | 1024 | 1024 |
+| n_layers | 48 | 30 |
+| intermediate | 15360 | 2112 |
+| vocab | 262144 | 262144 |
+| moe | no | yes |
+| moe_intermediate | - | 704 |
+| n_experts | - | 128 |
+| top_k | - | 8 |
+| layer_types | 5 sliding + 43 full | 25 sliding + 5 full |
+
+**`global_n_kv=2` is the main architectural difference** (12B has 1). This affects hd512 KV cache layout and attention GQA ratio (8:1 for 26B vs 32:1 for 12B).
+
+---
+
+## Session 23 — second-opinion review of the 26B garble investigation (2026-06-08, claude)
+
+Took over to audit Session 22's reasoning against the actual code + the HF
+reference modeling code (`.venv/.../transformers/models/gemma4/modeling_gemma4.py`,
+`Gemma4TextDecoderLayer.forward` @ 1399-1456) and the real 26B tensor layout.
+**I disagree with one of the eliminations and with the theory ranking.** Net:
+stop theory-rouletting embeddings/RoPE and run a per-op oracle. Details below.
+
+### 🔴 Correction 1 — strike the "❌ MoE branch specifically" elimination
+
+Session 22 ruled out the MoE branch because `HIPFIRE_MOE_BYPASS=1` is *also*
+garbled, concluding "the problem is in the base attention/FFN, not the MoE
+expert loop." **This elimination is invalid.** Bypass is a non-physical path on
+this model:
+
+- Every one of the 30 layers is an MoE layer (`enable_moe_block=True` for all;
+  each layer carries both `mlp.*` dense weights AND `experts.*`).
+- `HIPFIRE_MOE_BYPASS=1` takes the `_ =>` arm: decode `gemma4.rs:2325`, prefill
+  `gemma4.rs:2879`. That arm computes `residual + post_feedforward_layernorm(
+  dense_mlp(pre_feedforward_layernorm(residual)))` — it **drops the entire MoE
+  branch and skips `post_feedforward_layernorm_1`.**
+- The HF reference has **no dense-only path**. Every MoE layer is
+  `h = residual + post_ffn_norm( post_ffn_norm_1(mlp(pre_ffn_norm(r)))
+  + post_ffn_norm_2(experts(pre_ffn_norm_2(r))) )` (modeling_gemma4.py:1425-1444).
+
+So bypass is **garbled by construction** and rules out *nothing*. The bug can
+absolutely live in the MoE branch/router/expert path. Do not treat bypass as a
+clean dense baseline — it isn't one.
+
+### ✅ What I confirmed is actually faithful (so stop suspecting these)
+
+- **MoE FFN wiring** (`apply_moe_branch` / `apply_moe_branch_batched`,
+  gemma4.rs:1250-1438): matches the reference dual-branch exactly —
+  `cur_mlp = post_ffn_norm_1(ffn_out)`, `pre2 = pre_ffn_norm_2(attn_out)`,
+  router on `attn_out`, `cur_moe = post_ffn_norm_2(experts)`,
+  `tmp = post_ffn_norm(cur_mlp + cur_moe)`, then `residual + tmp`, `*layer_scalar`.
+  The dense output is **not** discarded in the real path (it's `cur_mlp`); my
+  first read that it was discarded was wrong — that only happens in the
+  non-physical bypass path.
+- **Router math** (1277-1294 + legacy loop 1414-1424): `rmsnorm(attn_out,
+  router_scale)/sqrt(dim)` → proj → softmax-topk-**renorm** → `*per_expert_scale
+  [e]` applied per-expert in the loop. Matches reference order (renorm *then*
+  per-expert-scale, modeling_gemma4.py:1362-1365). ✓
+- **embed_scale** IS applied: `gpu.scale_f32(&scratch.x, config.embed_scale)`
+  at gemma4.rs:1659, `embed_scale = sqrt(dim) = sqrt(2816) ≈ 53.07`. So
+  Theories A/B/G/H (embedding-quant) are doubly weak: the residual *does* carry
+  the ×53, and the same Q8-embed code runs on the working 12B. **De-prioritize
+  all embedding-quant theories.** (One caveat to verify in the oracle: the
+  Session 22 "L0 input first4=[0.089,…]" dump looks like *raw* unscaled
+  embedding magnitude, not ×53 — confirm the dump point is pre-scale and not a
+  sign the scale is being applied to the wrong buffer.)
+- **RoPE params** (Theory I): identical config to 12B; 12B works. De-prioritize.
+
+### 🎯 Reframed hypothesis space — the bug is in 26B-exclusive code
+
+The working 12B is **dense** (`enable_moe_block=False`), so it never executes
+the MoE branch and runs `global_n_kv=1`. Everything the 12B exercises is
+proven. The garble must be in code the 12B never touches. There are exactly
+two such families:
+
+- **(α) The MoE branch kernels/views** — none exercised by 12B:
+  - per-expert `WeightTensor` views: `moe.experts[e].gate_up_proj` /
+    `down_proj`. Verify each expert's `sub_offset`/stride/dtype actually points
+    at expert `e`'s bytes (an off-by-stride routes to the wrong expert → high-
+    confidence garbage that still "looks like logits").
+  - **`weight_gemv` on MQ4G256 expert gate_up** (1418): hits the
+    `rotate_x_mq_for` + prerotated-GEMV arm. The FWHT rotation seed/size must
+    match what the *quantizer* used for the `[1408,2816]` expert tensors. A
+    hadamard-size or seed mismatch between quant and runtime = garbage. This is
+    Theory F and it's underweighted — promote it.
+  - `moe_softmax_topk_renorm_k8` + index dtype (i32 reinterpret @ 1387-1389).
+- **(β) `global_n_kv=2` full-attention (hd512)** — 12B has `=1`:
+  KV-cache `bytes_per_pos = n_kv*bytes_per_head`, `kv_head = h/8` GQA mapping,
+  and `rope_partial_halved` writing 2 KV heads. Theories D/J — keep, but they're
+  one of two families, not the headline.
+
+### ✅ What to do next — binary search, not more theories
+
+**Priority 1 — build the 26B per-op oracle (do this before any more dumping).**
+`scripts/oracle_gemma4.py` already loads HF with `output_hidden_states=True` and
+dumps per-layer hidden states; it's hardcoded to the 12B (`MODEL=` line 21).
+Repoint it to `/local/models/google/gemma-4-26B-A4B-it`, feed a **short fixed id
+sequence** (e.g. `[2, 105, …]`, ~4-8 tokens — token-ids-as-contract), and add
+forward hooks to capture the sub-layer tensors the reference computes:
+post-attn residual, `h1 = post_ffn_norm_1(mlp(...))`, `h2 =
+post_ffn_norm_2(experts(...))`, `h1+h2`, and the layer output. Match against
+hipfire's `HIPFIRE_GEMMA4_DUMP` at the **same** points (run the single-token
+**decode** path at pos 0 first — simplest, no batching). The **first op that
+diverges** localizes the bug to (α) or (β) in one run and ends the guessing.
+
+**Two cheap isolated tests to run first (minutes each, each kills a family):**
+
+1. **Router isolation (kills/【confirms α-router).** Dump HF's `top_k_index` +
+   `top_k_weights` for L0's post-attention hidden at pos 0; compare to hipfire's
+   already-captured `topk_indices=[79,102,114,19,54,46,58,84]`,
+   `topk_weights=[0.393,0.323,0.057,…]`. **Indices differ →** router.proj /
+   router_scale / softmax-topk bug. **Indices match →** router is fine; the
+   garble is downstream in the **expert GEMV / per-expert views / MQ4 rotation**
+   (α-experts). This single comparison splits α cleanly.
+2. **Full-layer neutralization (kills/confirms β).** Compare pos-0 logits with
+   the 5 full-attention layers' attention output zeroed (or all layers forced
+   sliding). If the garble substantially clears → β (`global_n_kv=2` hd512). If
+   unchanged → β is not it; focus on α.
+
+**Priority 2 — if α-experts is implicated**, the fastest discriminator is to
+**re-quantize the experts to Q8** (or temporarily run experts dense from the HF
+safetensors) and re-test. If Q8 experts fix it → the MQ4G256 expert rotation
+(seed/size) is the bug. If still garbled → expert-view stride/indexing.
+
+### Why I'm confident this is the right order
+
+Session 22's list (A-J) is 8 theories, 6 of which the working 12B already
+disproves (shared embedding/RoPE/sliding-attn/layer_scalar code), and its one
+"elimination" (bypass) is invalid. The per-op oracle replaces all of it with a
+single localizing measurement, and the router/full-layer isolation tests are
+each a few minutes and each collapse half the remaining space. Spend the time
+on the oracle, not on theory N+1.
+
+(Did not touch `gemma4.rs` — it holds the other agent's uncommitted diagnostic
+dumps. All findings above are read-only code/reference audit.)
+
+---
+
+## Session 24 — Per-layer oracle localizes bug to MoE expert GEMV (2026-06-08)
+
+### Breakthrough: per-layer oracle comparison
+
+Ran the 26B HF oracle (bfloat16 CPU) with the same 18-token prompt as hipfire, and compared per-layer hidden states at pos=17 (last prompt position). Then ran BOS-only (pos=0) for a cleaner signal.
+
+**Result: The attention + dense MLP are correct. The MoE branch is the bug.**
+
+#### pos=0 (BOS token) step-by-step comparison:
+
+| Step | HF first4 | hipfire first4 | Match? |
+|------|-----------|----------------|--------|
+| Embedding | [0.074, -0.055, 0.613, 0.342] | [0.089, -0.044, 0.622, 0.356] | ✅ (Q8 error) |
+| After o_proj | [-1.031, -3.203, 5.219, -0.021] | [-1.050, -3.236, 5.195, 0.014] | ✅ (Q8 error) |
+| After MLP | [-16.88, 50.50, -9.25, 31.25] | [-16.14, 49.87, -9.77, 32.27] | ✅ (Q8 error) |
+| **L0 hidden** | **[-0.011, 0.287, -0.059, 0.072]** | **[-0.019, -0.123, 0.120, 0.444]** | **❌** |
+
+The o_proj and MLP outputs match within Q8 quantization error, but the final L0 hidden state diverges completely. Since both attention and dense MLP are correct, the divergence must come from the **MoE branch** that runs in every layer.
+
+#### MoE branch diagnostics (first expert, pos=0):
+
+```
+[moe diag] topk_indices=[79, 102, 114, 19, 54, 46, 58, 84]
+[moe diag] topk_weights=[0.393, 0.323, 0.057, 0.048, 0.047, 0.046, 0.044, 0.041]
+[moe expert] expert=79 weight=0.399 gate_up_dtype=MQ4G256 down_dtype=HFQ4G128
+  expert_out first4=[-1.913, -9.458, 15.954, 21.394] sum=-617.4
+[moe branch] cur_mlp first4=[-0.005, 0.125, -0.123, 1.101] sum=-786.2
+[moe branch] cur_moe first4=[-0.412, -3.283, 6.269, 8.247] sum=-244.7
+```
+
+The expert output has very large values (sum=-617) for a single expert's down_proj output. With 8 experts weighted and summed, `cur_moe` reaches sum=-245. After `post_feedforward_layernorm_2`, `cur_mlp + cur_moe` produces the wrong combined result, and the final L0 hidden diverges.
+
+### Agent review incorporation
+
+Both reviewer agents (claude and DS4) correctly identified:
+
+1. **`HIPFIRE_MOE_BYPASS=1` does NOT eliminate MoE as suspect** — every 26B layer has MoE. Bypass skips the entire MoE contribution, producing garbage by construction. My earlier elimination was invalid.
+
+2. **Per-layer oracle should be #1 priority** — I should have done this before any theory-hunting. Both agents said this. They were right.
+
+3. **Theory ranking should have prioritized MoE (α) and hd512 (β)** — the 12B never exercises MoE or `global_n_kv=2`. Both families needed checking, and α was higher priority since every layer has MoE.
+
+### Current status
+
+The bug is **in the MoE expert GEMV computation**. Specifically one of:
+- Expert `gate_up_proj` MQ4G256 `weight_gemv` with FWHT rotation (seed/size mismatch between quantizer and runtime)
+- Expert `down_proj` HFQ4G128 `weight_gemv` 
+- Expert `sub_offset` into the pool buffer (wrong stride → reading wrong expert's data)
+- The `moe_pre2` input to experts (pre-feedforward_layernorm_2 output)
+
+Next step: Dump `moe_pre2` and compare with HF's `pre_feedforward_layernorm_2(hidden_states)` output. If that matches, the issue is in the expert GEMV itself.
+
+### Root cause identified: MQ4G256 quantization error on MoE expert weights
+
+The per-layer oracle comparison localized the divergence:
+
+1. **Embedding**: matches ✅ (Q8 quantization error only)
+2. **After o_proj**: matches ✅ 
+3. **After post_attn_norm**: matches ✅
+4. **After attn_residual**: matches ✅
+5. **Dense MLP output**: matches ✅ (post_ffn_norm_1 output matches HF)
+6. **MoE input (moe_pre2)**: matches ✅ (rmsnorm of same residual, same norm weight)
+7. **MoE expert GATE_UP output**: **20-35% per-element error** ❌
+8. **MoE expert DOWN output**: **3.7× total error** ❌ (error amplified through nonlinear + down_proj)
+9. **L0 hidden state**: completely wrong ❌
+
+The chain of causation:
+```
+MQ4G256 gate_up_proj (abs_mean=0.023) 
+→ 4-bit quant step ≈ 0.01, per-element error ≈ 0.005
+→ gate output error per element ≈ sqrt(2816) * 0.005 ≈ 0.27 (observed: 0.26)
+→ gelu(gate) * up produces spiky hidden (std=17.5, max=464)
+→ small relative error on gate → large absolute error on hidden → corrupted down_proj output
+→ corrupted cur_moe → corrupted L0 hidden state
+→ garbage text after 30 layers of error accumulation
+```
+
+The MQ4G256 format is appropriate for larger weight magnitudes (like the 12B model's dense FFN with abs_mean ≈ 0.03-0.05) but the 26B MoE expert weights are extremely small (abs_mean ≈ 0.023 for gate_up, 0.035 for down) making 4-bit quantization insufficient.
+
+**Fix: re-quantize MoE expert weights at higher precision (Q8 or MQ8G256)**
+
+### CRITICAL: VRAM constraint was wrong — 128 GB available
+
+I repeatedly assumed a 24 GB VRAM constraint throughout this session, leading to
+unnecessary optimization of expert quantization (trying to fit MQ4+partial-Q8 in
+24 GB). The actual GPU is **gfx1151 with 137.4 GB VRAM**. All expert weights can
+and should be Q8 (or higher) for quality. The 27 GB Q8-expert model fits easily.
+
+This is the second time I've made this mistake. The daemon startup line clearly says:
+```
+GPU dev 0: gfx1151 (137.4 GB VRAM, HIP 7.13)
+```
+
+**Rule: always check `GPU dev 0` line from daemon output before making VRAM budget decisions.**
+
+### DEFINITIVE ROOT CAUSE: HFQ4G128 ragged-group bug on K not divisible by 128
+
+The garbled output was caused by **two** independent bugs, both with the same root cause:
+
+**Bug 1: Expert `down_proj` — K=704, 704 % 128 = 64 (ragged)**
+**Bug 2: Dense FFN `down_proj` — K=2112, 2112 % 128 = 64 (ragged)**
+
+The `gemv_hfq4g128.hip` kernel computes `groups_per_row = K / 128` (integer division).
+When K=704, it processes 5 groups (640 elements) and silently skips the last 64 elements.
+When K=2112, it processes 16 groups (2048 elements) and skips the last 64.
+
+Both the expert MoE `down_proj` [2816, 704] and the dense FFN `down_proj` [2816, 2112]
+have K dimensions that are NOT divisible by 128. The HFQ4G128 quantizer produces data
+for all K elements, but the GEMV kernel only reads the first `floor(K/128)*128` elements.
+
+The MQ4G256 expert `gate_up_proj` was also a secondary issue (4-bit quality cliff on
+small-magnitude weights), but the primary corruption was the ragged-group down_proj bug.
+
+**Fix: re-quantize with `--format q8f16` (27.5 GB, fits easily in 128 GB VRAM)**
+
+With all-Q8 quantization, the model produces coherent, accurate output:
+- "The capital of France is **Paris**." ✅
+- "Explain TCP vs UDP" → accurate 3-sentence technical explanation ✅
+- 28.9 tok/s decode speed (legacy per-expert CPU loop)
+
+**Longer-term fixes needed:**
+1. HFQ4G128 kernel should handle ragged K (or refuse to load models with K%128≠0)
+2. Quantizer should refuse to produce HFQ4G128 when K%128≠0, fall back to Q8
+3. MQ4G256 expert weights should use higher quality for small-magnitude weights
+4. Port fused indexed MoE GEMV kernels for decode speed
+
+### 26B-A4B COHERENT — Session 24 final status
+
+**Model**: `gemma-4-26B-A4B-it-q8.hfq` (27.5 GB, all-Q8)
+**Result**: Coherent, accurate output. Oracle argmax match confirmed.
+**Speed**: 28.9 tok/s decode (legacy per-expert CPU loop — not yet optimized)
+
+**Root cause chain** (two independent bugs, same root cause):
+1. HFQ4G128 `gemv_hfq4g128.hip` computes `groups_per_row = K / 128` (integer division).
+   When K % 128 ≠ 0, the last `K % 128` elements of each row are silently skipped.
+2. Gemma 4 26B has intermediate_size=2112 and moe_intermediate=704, both with 2112%128=64
+   and 704%128=64. Every `down_proj` in every layer is affected.
+3. The skipped 64 elements cause systematic per-row error in the dense FFN and expert
+   down_proj outputs, corrupting the residual stream at every layer.
+4. After 30 layers, the corruption produces multi-lingual gibberish.
+
+**Secondary issue**: MQ4G256 on expert gate_up introduces 20-35% per-element error
+on small-magnitude weights (abs_mean ≈ 0.023). This amplifies through gelu*up → down_proj.
+Less critical than the ragged-group bug but still degrades quality.
+
+**Files changed this session**:
+- `crates/hipfire-quantize/src/main.rs`: Added `--expert-q8` flag, Q8 fallback for experts
+- `crates/hipfire-arch-gemma4/src/gemma4.rs`: Diagnostic dumps for MoE branch intermediates
+
+**Remaining TODO**:
+- [ ] Fix HFQ4G128 kernel to handle ragged K (or validate K%128==0 at load)
+- [ ] Production quant format: MQ4G256 for attn + gate/up, Q8 for down_proj
+- [ ] Port fused indexed MoE GEMV for decode speed (currently 3.8 tok/s)
+- [ ] Phase 5 formal validation (coherence gates, perf A/B)
