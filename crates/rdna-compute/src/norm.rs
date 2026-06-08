@@ -1445,7 +1445,7 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [m as u32, n as u32, 1],
+                [n as u32, m as u32, 1],
                 [32, 1, 1],
                 0,
                 self.stream_ref(),

@@ -22,8 +22,8 @@ extern "C" __global__ void linear_fwd_f32(
     float* __restrict__ Y,
     int M, int K, int N)
 {
-    int m = blockIdx.x;
-    int n = blockIdx.y;
+    int n = blockIdx.x;               // large dim on grid.x (grid.y caps at 65535)
+    int m = blockIdx.y;
     if (m >= M || n >= N) return;
     int lane = threadIdx.x;            // 0..31
     const float* xr = X + (size_t)m * K;
