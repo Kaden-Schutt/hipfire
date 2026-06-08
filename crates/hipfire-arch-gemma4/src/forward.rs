@@ -38,7 +38,7 @@
 //! All three levers below are byte-identical to the eager baseline (validated
 //! over multiple prompts) and stack monotonically:
 //!
-//!   * `HIPFIRE_GEMMA4_GRAPH=1` (default OFF) — hipGraph capture/replay of the
+//!   * `HIPFIRE_GEMMA4_GRAPH` (default ON; set =0 to disable) — hipGraph
 //!     48-layer body + lm_head (`decode_step_with_graph`). +2.6%.
 //!   * `HIPFIRE_GEMMA4_FUSED_FFN` (default ON) — fold pre-FFN rmsnorm+FWHT into
 //!     one launch then gate+up into one (`fused_rmsnorm_rotate_mq` +
@@ -146,8 +146,9 @@ pub fn decode_step_capture(
     decode_step_body(cfg, weights, state, gpu, position, Some(capture))
 }
 
-/// Decode one token via hipGraph capture/replay. **Opt-in, default OFF**
-/// (`HIPFIRE_GEMMA4_GRAPH=1` to enable). The 48-layer body + final-norm +
+/// Decode one token via hipGraph capture/replay. **Default ON**
+/// (`HIPFIRE_GEMMA4_GRAPH=0` to disable; +2.9% vs eager, byte-identical).
+/// The 48-layer body + final-norm +
 /// lm_head are captured once and replayed per token, recovering the per-token
 /// host launch overhead. This is the biggest launch-bound lever on gemma4
 /// decode (~720 kernel launches/token).
@@ -176,7 +177,7 @@ pub fn decode_step_with_graph(
             Some("0") => Some(false),
             _ => None,
         });
-    let graph_on = env_override.unwrap_or(false);
+    let graph_on = env_override.unwrap_or(true);
     if !graph_on {
         return decode_step(cfg, weights, state, gpu, token_id, position);
     }
