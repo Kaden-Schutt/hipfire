@@ -121,6 +121,10 @@ name = "hfq_split"
 required-features = []
 
 [[example]]
+name = "gemma4_oracle"
+required-features = []
+
+[[example]]
 name = "coherence_probe"
 required-features = []
 
