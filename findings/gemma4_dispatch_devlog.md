@@ -1652,3 +1652,69 @@ kernel-optimization follow-up task covering:
 - hsaco extraction + objdump analysis for VGPR spills, LDS usage
 - rocprofv3 micro-benchmarks for tile kernels across hd256/hd512
 - General kernel speed-up pass (all quant formats)
+
+---
+
+## Session 19 — §4.5.5 Goal A infrastructure + Step B ring-buffer daemon switch
+
+**Date:** 2026-06-08
+
+### What landed
+
+1. **asym4/asym2 HIP tile kernels: `window_size` + `cache_capacity` + hd512**
+   - `attention_flash_asym4_tile.hip`: added sliding-window tile-skip (tiles
+     entirely below `t_lo` write sentinel partials and return early), ring-buffer
+     slot indexing (`k_slot = (cache_capacity > 0) ? (t % cache_capacity) : t`),
+     enlarged `mq[8]` → `mq[16]` and `out_vec[8]` → `out_vec[16]` for hd512
+     (n_halves up to 4).
+   - `attention_flash_asym2_tile.hip`: identical treatment.
+   - `kv_cache_write_asym_k_givens4.hip` + `kv_cache_write_asym_k_givens2.hip`:
+     added `cache_capacity` param, `slot = (cache_capacity > 0) ? (pos % cache_capacity) : pos`.
+
+2. **Rust `_cap` siblings with `launch_maybe_blob`**
+   - `attention_flash_asym4_cap`, `attention_flash_asym2_cap`: new methods with
+     `window_size` + `cache_capacity` params. Converted from raw `launch_kernel`
+     to `launch_maybe_blob` + `KernargBlob` for graph-capture correctness.
+     Old methods delegate with `0`.
+   - Reduce kernels also converted to `launch_maybe_blob`.
+
+3. **`_window` wrappers fixed** in `gemma4_ext.rs`
+   - `attention_flash_asym4_window` and `attention_flash_asym2_window` now
+     delegate to `_cap` with actual window/cap params (previously dropped them).
+
+4. **asym4/asym2 model-crate wiring DEFERRED to Phase 2 step 2e**
+   - Per dispatch-unification principle (#397), adding old-style branches in
+     `gemma4.rs` for asym4/asym2 is not in the spirit of the plan. The right
+     home is `AttentionFamily` → `dispatch_attend`. Phase 2 step 2e added to
+     plan with explicit wiring instructions.
+
+5. **Phase 1.5 Step B: daemon sliding KV switched to q8 ring-buffer**
+   - `daemon.rs`: `KvCache::new_gpu` → `KvCache::new_gpu_q8_capped(physical_cap=sliding_window)`
+   - `gemma4.rs` q8 sliding branch: uses `_cap` variants with `cache_capacity=sliding_window`
+   - Sliding cache now constant ~300 MB regardless of context (was scaling linearly
+     to 6 GB at 128k with fp32 max_seq path).
+
+### Validation
+
+- **Coherent output at 1266 tokens:** daemon produces "Based on the text provided,
+  here is a summary of the history and current state of artificial intelligence..."
+  — full coherent summary, 80 tokens at 13.7 tok/s.
+- **Short prompt also coherent:** "Hello world" → "Hello! How can I help you today?"
+  9 tokens at 15.6 tok/s.
+- **Oracle unchanged:** `gemma4_oracle` argmax=236761 (full-layer asym3 path not
+  affected by sliding cache change).
+- **Build clean:** `cargo check --workspace` 0 errors.
+
+### Key decision
+
+asym4/asym2 model-crate wiring deferred to Phase 2. Rationale: the dispatch-
+unification plan (#397) explicitly phases out old-style `gemma4.rs` branching
+in favor of `execute_steps`/`AttentionFamily`. Adding branches now means doing
+the work twice. The kernel + Rust infra is the real value — Phase 2 just needs
+the dispatch-table rows.
+
+### Stale-kernel-cache note
+
+Cleared `~/.hipfire_kernels/` after kernel parameter changes (asym4/asym2 tiles
+gained 2 new params). Without this, old hsaco loads with misaligned kernargs,
+producing silent corruption.

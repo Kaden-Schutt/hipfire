@@ -3957,14 +3957,17 @@ fn load_model(
 
         // Dual KV: fp32 for sliding, asym3 for full (hd=512).
         // Sliding layers: cache sized at `max_seq` with `kv_window` masking in
-        // the attention kernel (only the last `sliding_window` positions
-        // contribute). This is the "window-only" long-context path (correct, but
-        // the cache occupies max_seq rows; the ring buffer in Phase 1.5 Step B
-        // will shrink it back to sliding_window rows via slot=pos%cap).
-        let kv_sliding = llama::KvCache::new_gpu(
+        // ── Sliding KV cache: ring-buffered at sliding_window slots ──
+        // Q8_0 quantized with physical_cap = sliding_window (1024).
+        // max_seq stays at the full context length for tile-grid sizing;
+        // the ring-buffer kernels wrap writes/reads via (pos % cap).
+        // This keeps the sliding cache at constant ~300 MB regardless of
+        // context length, vs the fp32 max_seq path that scales linearly
+        // (6 GB at 128k). Phase 1.5 Step B.
+        let kv_sliding = llama::KvCache::new_gpu_q8_capped(
             gpu, config.n_layers, config.sliding_n_kv_heads,
-            config.sliding_head_dim, max_seq,
-        ).map_err(|e| format!("gemma4 sliding KV alloc: {e:?}"))?;
+            config.sliding_head_dim, max_seq, config.sliding_window,
+        ).map_err(|e| format!("gemma4 sliding KV alloc (q8 ring): {e:?}"))?;
         let kv_full = llama::KvCache::new_gpu_asym3(
             gpu, config.n_layers, config.full_n_kv_heads,
             config.full_head_dim, max_seq,

@@ -11,13 +11,14 @@ All accepted findings incorporated below.
 (`google/gemma-4-12B-it`, `google/gemma-4-26B-A4B-it`). Corrections applied inline.
 
 **Status (2026-06-08):** Phase 0 + Phase 1 complete; **Phase 1.5 Step A done**
-(`876c1158`). 12B dense decodes coherently at arbitrary context length (daemon
-sized at `max_seq`, `kv_window` masking active). **>1024 correctness confirmed**
-via the asym3 windowed path — `gemma4_oracle` argmax matches HF at 1200 tokens
-(the earlier ">1024 collapse" was a fp32-debug-KV-path artifact, now also
-fixed at the kernel level, `41bd5d87`). Daemon validated: 1266-token prompt
-produces coherent 3-sentence summary at 10.8 tok/s.
-**Phase 1.5 Step B (ring-buffer KV, memory/128k)** is the next open piece.
+(`876c1158`). **Phase 1.5 Step B done** — daemon sliding KV switched from
+fp32 to q8 ring-buffer (`physical_cap=sliding_window=1024`), constant ~300 MB
+regardless of context length. Coherent output confirmed at 1266 tokens.
+**Phase 1.5 §4.5.5 Goal A infrastructure done** — all HIP tile
+kernels (q8/asym4/asym2) have `window_size`+`cache_capacity`+hd512 support;
+Rust `_cap` siblings use `launch_maybe_blob` for graph-capture correctness.
+asym4/asym2 model-crate wiring deferred to Phase 2 step 2e (dispatch-unification
+principle — old-style branches in `gemma4.rs` are phased out, not expanded).
 Debug history in `findings/gemma4_dispatch_devlog.md`.
 
 ---
@@ -598,7 +599,7 @@ Landed in three commits:
 (real tokens <256000; the q8 lm_head artifact on the multimodal block ≥256000 is
 expected — compare on real tokens). Coherence on a >1024 prompt.
 
-### 4.5.2 · Step B — ring-buffer KV (memory; enables 128k)
+### 4.5.2 · Step B — ring-buffer KV (memory; enables 128k) ✅ DONE
 
 The window-only `max_seq` sliding cache scales linearly with context (wasteful for
 128k). The ring buffer keeps the sliding cache at `sliding_window=1024` slots:
@@ -757,6 +758,79 @@ misaligned — garbage parameters, silent corruption, no clean error. Either cle
 the cache directory or **rename the kernel** when changing its parameter
 signature. Session 16 hit this exact failure mode with the `kv_window` addition.
 
+### 4.5.5 · KV-mode coverage (q8 / asym4 / asym2 re-port; fwht3/fwht4 follow-up)
+
+The gemma4 forward branches on **five** KV modes (asym3, asym4, asym2, q8, fp32),
+but the dispatch migration left coverage uneven — only asym3 (+ fp32) actually
+window correctly. Current state:
+
+| Mode | Sliding (hd256) window/ring | Full (hd512) | Notes |
+|---|---|---|---|
+| **asym3** | ✅ window + ring | ✅ | the reference path |
+| **fp32** | ✅ window (no ring) | ✅ (`attention_f32`) | daemon's sliding default (`new_gpu`) |
+| **q8** | ✅ sliding window + ring done (`7204d471`) | ✅ full done — `attention_flash_q8_0_cap` (window=0/cap=0) | complete |
+| **asym4** | ⚠️ kernel infra done, wiring deferred to Phase 2 step 2e | ⚠️ kernel infra done (n_halves=4), wiring deferred to Phase 2 step 2e | HIP tile + Rust `_cap` + `launch_maybe_blob` landed |
+| **asym2** | ⚠️ same as asym4 | ⚠️ same as asym4 | same treatment |
+| **fwht3/4/2** | ❌ no branch | ❌ no branch | never wired into gemma4; Goal B (follow-up PR) |
+
+**The original `feat/gemma4-128k-ring-buffer` branch had q8/asym4/asym2 windowed +
+ring** (window threaded through 7 `attention_flash_*.hip` files; fp32 errored).
+The dispatch port stripped the window/cap args from those three `_window` wrappers
+down to `let _ = (window_size, cache_capacity)`. The re-port restores this via
+kernel infrastructure (Phase 1.5 ✅) and dispatch-framework wiring (Phase 2 step 2e).
+
+#### Goal A — restore q8 / asym4 / asym2 (re-port; split across Phase 1.5 + Phase 2)
+
+Bring the three quantized modes back to full window + ring parity with asym3.
+Work split into **infrastructure** (Phase 1.5) and **model-crate wiring** (Phase 2)
+per the dispatch-unification principle — old-style branches in `gemma4.rs` are
+intentionally avoided; that routing belongs in `AttentionFamily`.
+
+**Phase 1.5 (done): kernel + Rust GPU-method infrastructure**
+
+| Piece | Status | Details |
+|-------|--------|--------|
+| q8 tile: `window_size` + `cache_capacity` | ✅ Done | `attention_flash_q8_0_tile.hip` + `_cap` sibling |
+| asym4 tile: `window_size` + `cache_capacity` + hd512 | ✅ Done | `attention_flash_asym4_tile.hip` — `mq[16]`/`out_vec[16]`, n_halves=4, ring slot indexing, `launch_maybe_blob` |
+| asym2 tile: `window_size` + `cache_capacity` + hd512 | ✅ Done | `attention_flash_asym2_tile.hip` — same treatment |
+| givens4 K-write: `cache_capacity` ring | ✅ Done | `kv_cache_write_asym_k_givens4.hip` — slot = cap>0 ? pos%cap : pos |
+| givens2 K-write: `cache_capacity` ring | ✅ Done | `kv_cache_write_asym_k_givens2.hip` — same |
+| Rust `_cap` siblings (asym4/asym2) | ✅ Done | `attention_flash_asym4_cap`, `attention_flash_asym2_cap` — `launch_maybe_blob` + `KernargBlob` for graph-capture correctness |
+| Rust `_window` wrappers (asym4/asym2) | ✅ Done | Delegate to `_cap` with window+cap params |
+| q8 full-layer wiring in `gemma4.rs` | ✅ Done | Uses `_cap` with window=0/cap=0 for full-attention layers |
+| asym4/asym2 full-layer wiring in `gemma4.rs` | ❌ Deferred | Belongs in Phase 2 `execute_steps`/`AttentionFamily` — see §5 step 2e |
+
+**Phase 2 (step 2e): model-crate wiring through dispatch framework**
+
+Instead of adding `} else if kv_cache.quant_asym4 {` / `quant_asym2 {` branches
+in `gemma4.rs`'s full-layer decode function (old-style dispatch), the routing
+for these quant modes goes into `AttentionFamily` → `dispatch_attend`. The
+infrastructure above ensures the kernels and Rust entry points are ready;
+Phase 2 just needs the dispatch-table rows.
+
+See §5 step 2e for the concrete migration.
+
+#### Goal B — implement fwht3 / fwht4 for gemma4 (FOLLOW-UP, net-new)
+
+Unlike A, fwht is **not a re-port** — gemma4's forward has never branched on
+`quant_fwht`, and there are no gemma4 fwht hd512 kernels. The dispatch branch has
+fwht KV machinery for qwen35, and the daemon already has gemma4-reachable
+`new_gpu_fwht3_*` / `new_gpu_fwht4_*` alloc paths — so the cache side exists, but
+the **forward + kernels do not**. Scope:
+
+1. Add `quant_fwht3` / `quant_fwht4` branches to `sliding_layer_decode_impl` and
+   `full_layer_decode_impl`, with windowed `_window` wrappers (window + ring).
+2. Provide **windowed fwht3/fwht4 tile kernels** (adapt qwen35's fwht KV kernels,
+   adding the `window_size` + `cache_capacity` args) for hd256 sliding.
+3. Provide **hd512 fwht3/fwht4 KV-write + flash variants** for the full layers.
+4. Gate: oracle parity + coherence per mode; KLD vs asym3/q8 to confirm fwht's
+   quality benefit on gemma4's KV (the motivation for the more-modern formats).
+
+**Sequencing:** Goal A (re-port q8/asym4/asym2) lands with Phase 1.5 — it's
+restoring proven kernels and closes the regression. Goal B (fwht3/fwht4) is a
+**separate follow-up PR after Phase 1.5**, since it's genuinely new gemma4 surface
+(new branches + new kernels), not a port.
+
 ---
 
 ## 5 · Phase 2 — Migrate decode path to dispatch framework 🔲 NOT STARTED
@@ -874,11 +948,40 @@ in Phase 0b) flows through `KvTierPlan` and `AttnParams`, and
 `dispatch_kv_write`/`dispatch_attend` branch on `io.head_dim` to launch
 the hd512 kernel when needed.
 
+For asym4 and asym2, the tile kernels already handle hd512 via `n_halves`
+(up to 4 for 512-dim heads) — no separate `*_hd512` kernel variant needed.
+`ShapePredicate::HeadDimGe(128)` (or unconditional) is sufficient since
+`n_halves = head_dim / 128` is computed inside the kernel.
+
 ### 2d · Fused QKV entries
 
 Gemma4 uses Q/K norms *after* projection (batched per-head rmsnorm), so
 QKV fusion is unlikely — the fused kernel bypasses per-head norms. Mark
 as non-goal.
+
+### 2e · Wire asym4 / asym2 through `AttentionFamily` (deferred from Phase 1.5)
+
+The kernel infrastructure (window+ring+hd512 tile kernels, `launch_maybe_blob`
+Rust `_cap` siblings, givens4/2 K-write ring slots) landed in Phase 1.5 §4.5.5
+Goal A. This step wires it into the dispatch framework instead of adding
+old-style branches to `gemma4.rs`:
+
+1. **Register asym4/asym2 in `dispatch_kv_write`**: add `KvWriteAsym4` /
+   `KvWriteAsym2` arms that call `kv_cache_write_asym4_fused` /
+   `kv_cache_write_asym2_fused` (these already exist as GPU methods). The K-side
+   ring-buffer `cache_capacity` threads through `AttnParams.physical_cap`.
+2. **Register asym4/asym2 in `dispatch_attend`**: add `AttnFlashAsym4` /
+   `AttnFlashAsym2` arms that call `attention_flash_asym4_cap` /
+   `attention_flash_asym2_cap` with `window_size` + `cache_capacity` from
+   `AttnParams`. The hd512 case needs no special handling — `n_halves` is
+   computed inside the tile kernel.
+3. **Remove the `// NOTE: asym4/asym2 full-layer branches intentionally omitted`
+   comment** from `gemma4.rs` full-layer decode — those modes now route
+   through `Step::Attend` like asym3/q8/fp32.
+4. **Sliding layers**: same `AttentionFamily` path, just with
+   `cache_capacity = sliding_window` and `window_size = sliding_window`.
+5. **Gate**: `gemma4_oracle` logits match fp32 path at 1200 tokens for both
+   asym4 and asym2; coherence gate pass.
 
 ### Phase 2 gate
 
@@ -1037,6 +1140,101 @@ assert_resolves(KernelKey::MoeGroupedGemv, ArchPredicate::Always, gfx1100);
 
 ---
 
+## 8.5 · Phase 6 — gemma4 kernel performance (FOLLOW-UP)
+
+A dedicated optimization pass on the gemma4-specific kernels, distinct from the
+correctness/regression perf gates in Phase 5. Follow
+`docs/methodology/perf-benchmarking.md` throughout (warm DPM + kernel cache; warm
+each A/B cell; `scripts/probe_commits.sh` across fresh processes; ±1–3% band;
+Δ≥5% is real signal).
+
+### 6.0 · Baseline from jukefr's perf work (issue #270)
+
+jukefr profiled the **original** `feat/gemma4-128k-ring-buffer` branch on **RDNA4
+(gfx1201), 26B-A4B MoE, MQ4** — the most complete prior perf data. Final state vs
+llama.cpp:
+
+| Test | llama.cpp | hipfire (jukefr) | gap |
+|---|---|---|---|
+| **tg128 (decode)** | 77 t/s | **71 t/s** | ~0.92× — competitive |
+| **pp1270 (prefill)** | 3925 t/s | **342 t/s** | **~0.09× — 11× behind** |
+
+Key takeaways that **reframe this phase**:
+- **Decode is NOT the problem on capable HW.** 71 vs 77 t/s on RDNA4 is close to
+  parity. The ~15 tok/s seen on gfx1151/12B-q8 is mostly the Strix Halo APU's
+  ~4× lower memory bandwidth (115 GB/s LPDDR5X vs RDNA4 GDDR6) — **not directly
+  comparable**, and per [[project_gfx1100_is_primary_deploy_target]] perf should be
+  judged on gfx1100/gfx1201, not gfx1151. Re-baseline decode on gfx1100/1201 before
+  treating it as subpar.
+- **Prefill is the dominant gap (11×).** jukefr took prefill 60→342 t/s via
+  **token-batched prefill wiring (+38.5%)**, **batched dense projections (+55%)**,
+  and **sliding-layer batching (→300, →350 with full-attention batching)**. The
+  dispatch daemon currently does **per-token prefill** (`forward_scratch` loop) —
+  i.e. it **regressed jukefr's batched prefill**. Recovering it (Phase 3) is the
+  single biggest perf win, not a follow-up nicety.
+- jukefr's numbers were MoE/MQ4 on the original branch; reproduce on the dispatch
+  branch + dense 12B before/after each change.
+
+### 6a · Occupancy audit after the kernel extensions ⚠️ do first
+
+The hot attention kernels were **extended in place** during the long-context work
+(`attention_flash_asym3_tile` gained `window_size` + `cache_capacity` params, an
+out-of-window predicate, an early-return tile path, and `slot = t % cap` indexing;
+the same will land on the q8/asym4/asym2 tiles in §4.5.5 Goal A). Added registers
+and branches can raise VGPR pressure → lower occupancy → slower decode, or cause
+spills. **Audit before assuming the extension was free.**
+
+Use the **`gfx-kernel-metadata` skill** to extract VGPR/SGPR/LDS/spill counts from
+the compiled `.hsaco` and compute theoretical occupancy, for each extended kernel:
+- `attention_flash_asym3_tile` (+ the hd512 variant) — pre vs post `kv_window`/`cache_capacity`.
+- `attention_flash_q8_0` (now `_cap`, n_halves path), asym4/asym2 tiles after Goal A.
+- `kv_cache_write_*` ring siblings.
+
+**Requirements:** **zero spills**; occupancy not regressed vs the pre-extension
+baseline. If VGPR pressure rose, consider hoisting the window/cap math out of the
+inner loop, `__launch_bounds__` tuning, or splitting a windowed kernel variant from
+the full-causal one rather than branching at runtime (avoids the always-resident
+predicate cost on the hot ≤1024 path).
+
+### 6b · Speed-up — prefill first, then decode kernels
+
+**Priority 1 — prefill, in two milestones.** The 11× gap is the headline.
+
+- **Milestone 1 — recover jukefr's state (~342 t/s).** Wire Phase 3's batched
+  prefill (`forward_prefill_batch_v2`) into the daemon and re-port jukefr's
+  optimizations (token-batched prefill, batched dense projections, sliding-layer +
+  full-attention batching → ~342 t/s on the original branch). The dispatch daemon's
+  per-token prefill is the regression; this is the immediate win. Gated on the
+  batched full-layer kernels (Phase 3 §3b).
+- **Milestone 2 — close to within 10% of llama.cpp (FOLLOW-UP).** ~342 t/s is still
+  only ~9% of llama.cpp's ~3925 t/s (pp1270, RDNA4). Target **≥ ~3530 t/s** (within
+  10%) — a further ~10× over Milestone 1, a major optimization effort distinct from
+  the recovery. Likely levers: **WMMA/MFMA-accelerated prefill GEMMs** (QKV, gate/up/down,
+  MoE grouped-GEMM — the prefill is GEMM-bound, and llama.cpp's RDNA4 throughput
+  implies hardware-matmul utilization hipfire's `gemm_hfq4g256`/indexed-MoE path may
+  not be reaching), larger effective batch / better tiling + occupancy, kernel fusion
+  to cut launch + memory traffic, and attention-prefill (PFlash-style) tiling. Profile
+  to find whether the gap is GEMM efficiency, attention, or MoE routing before
+  committing. Gate each step with `probe_commits.sh` on gfx1100/1201 + coherence.
+
+**Priority 2 — decode kernels (re-baseline on gfx1100/1201 first; likely close to
+parity already).** Profile (`rocprof` / gfx1151 PMC per `project_gfx1151_pmc_works`,
+but **judge on gfx1100/1201**) and attack bottlenecks only if a real gap remains:
+- **hd512 full-attention** (`attention_flash_asym3_hd512` + reduce) — 512-dim heads,
+  2560 B LDS; check tile size / occupancy / bandwidth utilization.
+- **Per-head Q/K/V norms** (`rmsnorm_batched` ×3/layer) and **RoPE** (`rope_f32` /
+  `rope_partial_halved_f32`) — many small launches/token; fusion/batching
+  opportunities (the "stay as direct GPU calls" ops from §2a).
+- **Per-token dispatch overhead** — 48 forward_scratch calls/token with per-layer
+  KV-mode branching; quantify launch overhead vs compute.
+
+**Gate:** report tok/s deltas with prompt md5 + warm-cache protocol; reproduce on
+the dispatch branch + dense 12B; any win must pass `coherence-gate.sh` (a tok/s
+gain that ships an attractor is not a win — see the perf methodology's
+synth-win→prod-falsify log).
+
+---
+
 ## 9 · Phase 0 contracts compliance
 
 Gemma4 participates in the [#402](https://github.com/Kaden-Schutt/hipfire/pull/402)
@@ -1085,6 +1283,12 @@ Phase 0 contracts as follows:
 | Chat-template framing (empty `<\|channel>thought`) | 1e | ✅ Resolved | `generate_gemma4` frames `<bos><\|turn>user\n{p}<turn\|>\n<\|turn>model\n<\|channel>thought\n<channel\|>` (guarded on the 4 special tokens; raw fallback). Output is now clean: "The capital of France is Paris." / valid haiku / "7 times 6 is 42." |
 | >1024 correctness (sliding window) | 4.5.1 | ✅ Done (`876c1158`) | fp32 `attention_flash` window fix (`41bd5d87`) + daemon sliding KV sized at `max_seq` + refusal guard dropped. 1266-token prompt coherent. Oracle argmax=236761 matches HF at 1200 tok. |
 | Sliding-window **ring buffer** (memory, 128k) | 4.5.2 | 🔲 Planned | Memory-only follow-up (cache stays at `sliding_window` via `slot=pos%cap`). NOT a correctness fix. **Pre-req:** switch daemon's `kv_sliding` from fp32 to asym3 (current fp32 path has no ring-buffer kernels). Sibling-method Rust integration + dispatch `cache_capacity` plumbing — see Phase 1.5 §4.5.2. Gate: ring logits == window-only logits at >1024. **Do NOT merge `feat/gemma4-128k-ring-buffer`** — cherry-pick HIP diffs only. |
+| q8 / asym4 / asym2 window dropped >1024 | 4.5.5 | 🔲 In progress (re-port) | Dispatch port stripped `window_size`/`cache_capacity` from the asym4/asym2/q8 sliding `_window` wrappers (`let _ = (…)`) → correct ≤1024 but **silently wrong >1024**. q8 **full layers fixed** (`attention_flash_q8_0_cap`, n_halves hd512); asym4/asym2 full still hard-`Err`. Sliding window for all three pending — re-port kernel deltas (§4.5.5 Goal A). |
+| fwht3 / fwht4 KV not wired for gemma4 | 4.5.5 | 🔲 Follow-up | gemma4 forward never branches on `quant_fwht`; no gemma4 fwht hd512 kernels. Net-new (not a re-port): new forward branches + windowed fwht tile kernels + hd512 variants. Daemon `new_gpu_fwht{3,4}_*` alloc already exists. Separate PR after Phase 1.5 (§4.5.5 Goal B). |
+| Kernel-extension occupancy regression | 6a | 🔲 Follow-up | `attention_flash_asym3_tile` (+ q8/asym4/asym2 after Goal A) gained params/branches in place; verify no VGPR spills / occupancy drop via the `gfx-kernel-metadata` skill before assuming free. §8.5 Phase 6a. |
+| gemma4 prefill: recover jukefr (~342 t/s) | 6b | 🔲 Follow-up | Milestone 1. Dispatch daemon regressed to per-token prefill — wire Phase 3 batched prefill + re-port jukefr's batching (#270). §8.5 Phase 6b. |
+| gemma4 prefill: within 10% of llama.cpp | 6b | 🔲 Follow-up | Milestone 2 (separate, ambitious). Target ≥ ~3530 t/s (pp1270) vs jukefr's 342 — a further ~10×. Needs WMMA/MFMA prefill GEMMs + MoE grouped-GEMM + fusion/tiling. **Dominant perf gap.** §8.5 Phase 6b. |
+| gemma4 decode perf (re-baseline needed) | 6b | 🔲 Verify | ~15 tok/s on gfx1151/12B-q8, but jukefr shows **71 vs 77 t/s (near parity)** on RDNA4/26B — the gfx1151 number is mostly the APU's 4× lower bandwidth. Re-baseline on gfx1100/1201 before treating decode as subpar. §8.5 Phase 6.0. |
 | `gelu_tanh` vs SiLU activation mismatch | 4a | Open | Forked `run_moe_decode_gemma4` executor. |
 | hd512 kernels not precompiled for all archs | 1b/5b | Open (gfx1151 works) | Compile + validate per-arch. |
 | `rope_partial_halved` not in dispatch framework | 2a | Open | Direct GPU call in Phase 1. |

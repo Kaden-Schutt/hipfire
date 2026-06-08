@@ -1922,15 +1922,17 @@ fn sliding_layer_decode_impl(
             config.sliding_window as u32,
             0)?;
     } else if kv_cache.quant_q8 {
-        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, n_kv, head_dim)?;
-        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, n_kv, head_dim)?;
-        gpu.attention_flash_q8_0_window(
+        let sliding_cap = config.sliding_window as u32;
+        gpu.kv_cache_write_q8_0_cap(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, n_kv, head_dim, sliding_cap)?;
+        gpu.kv_cache_write_q8_0_cap(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, n_kv, head_dim, sliding_cap)?;
+        gpu.attention_flash_q8_0_cap(
             &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
             &scratch.attn_out, &scratch.pos_buf, pos + 1,
             n_heads, n_kv, head_dim, kv_cache.max_seq,
             &scratch.flash_partials,
-            config.sliding_window as u32,
-            0)?;
+            sliding_cap,
+            sliding_cap,
+        )?;
     } else {
         // Plain FP32 KV path (kvf16 / kvfp32) — NO sliding window.
         // Only for debugging; incorrect for seq > window_size.
@@ -2164,11 +2166,14 @@ fn full_layer_decode_impl(
     if _fdump { dbg_dump(gpu, "[FL] L5 post_rope_q", &scratch.q, n_heads * head_dim); }
     if _fdump { dbg_dump(gpu, "[FL] L5 post_rope_k", &scratch.k, n_kv * head_dim); }
 
-    // KV cache write + attention. Full-attn layers (head_dim=512) route to
-    // the asym3 hd=512 kernels (origin/gemma4 6f5cb8b + f724be6, ported in
-    // D2.5). asym2/asym4/q8 hd=512 siblings are not yet ported — those modes
-    // hard-fail here so users hit a loud, specific error rather than silent
-    // truncation. window_size=0 = full causal (no sliding on global layers).
+    // KV cache write + attention for full-attention layers (head_dim=512).
+    //
+    // Supported: asym3 (hd512 kernels), q8 (n_halves tile kernel), fp32.
+    // NOT wired: asym4, asym2 — their HIP tile kernels + Rust _cap siblings
+    // support hd512, but the model-crate wiring belongs in Phase 2
+    // (execute_steps / AttentionFamily) per the dispatch-unification plan.
+    // Do not add branches here; migrate to AttentionFamily instead.
+    // window_size=0 = full causal (no sliding on global layers).
     if kv_cache.quant_asym3 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
         let st = kv_cache.givens_sin.as_ref().unwrap();
@@ -2189,6 +2194,11 @@ fn full_layer_decode_impl(
             0, // window_size: full causal,
             0,
         )?;
+    // NOTE: asym4/asym2 full-layer branches intentionally omitted here.
+    // Those quant modes for hd=512 full-attention layers belong in Phase 2
+    // (execute_steps / AttentionFamily routing), not in old-style dispatch.
+    // The HIP tile kernels + Rust _cap siblings already support hd512;
+    // this is just the wiring question. See plan §5 step 2c.
     } else if kv_cache.quant_q8 {
         // Q8_0 KV: same tile kernel handles both hd256 and hd512 via n_halves.
         // Full layers: no window, no ring. Sliding layers: windowed via _window wrapper.

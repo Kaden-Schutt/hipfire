@@ -240,13 +240,15 @@ impl Gpu {
     }
 
     pub fn attention_flash_asym4_window(&mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor, out: &GpuTensor, pos_buf: &DeviceBuffer, cos_theta: &GpuTensor, sin_theta: &GpuTensor, seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize, partials: &GpuTensor, window_size: u32, cache_capacity: u32) -> HipResult<()> {
-        let _ = (window_size, cache_capacity);
-        self.attention_flash_asym4(q, k_cache, v_cache, out, pos_buf, cos_theta, sin_theta, seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials)
+        self.attention_flash_asym4_cap(q, k_cache, v_cache, out, pos_buf,
+            cos_theta, sin_theta, seq_len_hint, n_heads, n_kv_heads, head_dim,
+            max_seq, partials, window_size, cache_capacity)
     }
 
     pub fn attention_flash_asym2_window(&mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor, out: &GpuTensor, pos_buf: &DeviceBuffer, cos_theta: &GpuTensor, sin_theta: &GpuTensor, seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize, partials: &GpuTensor, window_size: u32, cache_capacity: u32) -> HipResult<()> {
-        let _ = (window_size, cache_capacity);
-        self.attention_flash_asym2(q, k_cache, v_cache, out, pos_buf, cos_theta, sin_theta, seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials)
+        self.attention_flash_asym2_cap(q, k_cache, v_cache, out, pos_buf,
+            cos_theta, sin_theta, seq_len_hint, n_heads, n_kv_heads, head_dim,
+            max_seq, partials, window_size, cache_capacity)
     }
 
     pub fn attention_flash_q8_0_window(&mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor, out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize, partials: &GpuTensor, window_size: u32, cache_capacity: u32) -> HipResult<()> {
