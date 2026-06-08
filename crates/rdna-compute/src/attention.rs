@@ -187,6 +187,7 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         max_seq: usize,
+        kv_window: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -213,6 +214,7 @@ impl Gpu {
         let ms = max_seq as i32;
         let sc = scale;
         let cs = chunk_size as i32;
+        let kw = kv_window as i32;
 
         let mut params1: Vec<*mut c_void> = vec![
             &q_ptr as *const _ as *mut c_void,
@@ -226,6 +228,7 @@ impl Gpu {
             &ms as *const _ as *mut c_void,
             &sc as *const _ as *mut c_void,
             &cs as *const _ as *mut c_void,
+            &kw as *const _ as *mut c_void,
         ];
 
         let block_size = 128u32.min(chunk_size as u32).next_power_of_two();
@@ -250,6 +253,7 @@ impl Gpu {
                 b.push_i32(ms);
                 b.push_f32(sc);
                 b.push_i32(cs);
+                b.push_i32(kw);
                 b
             },
         )?;

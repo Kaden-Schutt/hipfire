@@ -55,11 +55,11 @@ fn main() {
     gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes()).unwrap();
 
     // attention_flash (split-K)
-    gpu.attention_flash(&d_q, &d_k, &d_v, &d_out, &d_part, seq_len, n_heads, n_kv_heads, head_dim, max_seq).unwrap();
+    gpu.attention_flash(&d_q, &d_k, &d_v, &d_out, &d_part, seq_len, n_heads, n_kv_heads, head_dim, max_seq, 0).unwrap();
     gpu.hip.device_synchronize().unwrap();
     let t = std::time::Instant::now();
     for _ in 0..iters {
-        gpu.attention_flash(&d_q, &d_k, &d_v, &d_out, &d_part, seq_len, n_heads, n_kv_heads, head_dim, max_seq).unwrap();
+        gpu.attention_flash(&d_q, &d_k, &d_v, &d_out, &d_part, seq_len, n_heads, n_kv_heads, head_dim, max_seq, 0).unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
     eprintln!("attention_flash:  {:.1} us/call", t.elapsed().as_secs_f64() * 1e6 / iters as f64);
@@ -95,7 +95,7 @@ fn main() {
 
     // attention_flash_gqa (one K/V load per kv_head, reused across group)
     let d_out2 = gpu.zeros(&[q_dim], DType::F32).unwrap();
-    gpu.attention_flash(&d_q, &d_k, &d_v, &d_out, &d_part, seq_len, n_heads, n_kv_heads, head_dim, max_seq).unwrap();
+    gpu.attention_flash(&d_q, &d_k, &d_v, &d_out, &d_part, seq_len, n_heads, n_kv_heads, head_dim, max_seq, 0).unwrap();
     gpu.attention_flash_gqa(&d_q, &d_k, &d_v, &d_out2, &d_part, seq_len, n_heads, n_kv_heads, head_dim, max_seq).unwrap();
     gpu.hip.device_synchronize().unwrap();
     let a = gpu.download_f32(&d_out).unwrap();

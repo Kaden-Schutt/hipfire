@@ -1818,7 +1818,7 @@ fn sliding_layer_decode_impl(
     } else {
         gpu.hip.memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, dim_bytes)?;
     }
-    let _dump_on = std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") && pos == 1 && kv_layer_idx == 0;
+    let _dump_on = std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") && (pos == 0 || pos == 1) && kv_layer_idx == 0;
     if _dump_on { dbg_dump(gpu, "[v1] L0 input scratch.x", &scratch.x, dim); }
 
     // tmp = input_layernorm(x)
@@ -1965,6 +1965,7 @@ fn sliding_layer_decode_impl(
             &scratch.attn_out, &scratch.flash_partials,
             pos + 1,
             n_heads, n_kv, head_dim, kv_cache.max_seq,
+            config.sliding_window,
         )?;
     }
 
@@ -2126,9 +2127,15 @@ fn full_layer_decode_impl(
     // tmp = input_layernorm(x)
     gpu.rmsnorm_f32(&scratch.x, &lw.input_layernorm, &scratch.tmp, config.norm_eps)?;
 
+    let _fdump = std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") && pos == 1 && kv_layer_idx == 0;
+    if _fdump { dbg_dump(gpu, "[FL] L5 input scratch.x", &scratch.x, dim); }
+    if _fdump { dbg_dump(gpu, "[FL] L5 post_input_norm", &scratch.tmp, dim); }
+
     // Q + K projections. V is derived from K's pre-norm output below.
     weight_gemv(gpu, &lw.q_proj, &scratch.tmp, &scratch.q)?;
     weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
+    if _fdump { dbg_dump(gpu, "[FL] L5 post_q_proj", &scratch.q, n_heads * head_dim); }
+    if _fdump { dbg_dump(gpu, "[FL] L5 post_k_proj", &scratch.k, n_kv * head_dim); }
 
     // CRITICAL: capture pre-k_norm bytes as V before applying k_norm.
     if let Some(s) = gpu.active_stream.as_ref() {
@@ -2142,6 +2149,9 @@ fn full_layer_decode_impl(
     gpu.rmsnorm_batched(&scratch.k, &lw.k_norm, &scratch.k, n_kv, head_dim, config.norm_eps)?;
     gpu.rmsnorm_batched(&scratch.v, &scratch.v_norm_ones_full, &scratch.v,
         n_kv, head_dim, config.norm_eps)?;
+    if _fdump { dbg_dump(gpu, "[FL] L5 post_q_norm", &scratch.q, n_heads * head_dim); }
+    if _fdump { dbg_dump(gpu, "[FL] L5 post_k_norm", &scratch.k, n_kv * head_dim); }
+    if _fdump { dbg_dump(gpu, "[FL] L5 post_v_norm", &scratch.v, n_kv * head_dim); }
 
     // Pre-scale Q by sqrt(head_dim=512) so the flash kernel's 1/sqrt(head_dim)
     // cancels (Gemma 4 attention scaling is 1.0).
@@ -2151,6 +2161,8 @@ fn full_layer_decode_impl(
     let n_rot_pairs = ((head_dim as f32) * config.full_partial_rotary_factor * 0.5) as usize;
     gpu.rope_partial_halved_f32(&scratch.q, &scratch.k, &scratch.pos_buf,
         n_heads, n_kv, head_dim, n_rot_pairs, config.full_rope_theta)?;
+    if _fdump { dbg_dump(gpu, "[FL] L5 post_rope_q", &scratch.q, n_heads * head_dim); }
+    if _fdump { dbg_dump(gpu, "[FL] L5 post_rope_k", &scratch.k, n_kv * head_dim); }
 
     // KV cache write + attention. Full-attn layers (head_dim=512) route to
     // the asym3 hd=512 kernels (origin/gemma4 6f5cb8b + f724be6, ported in
@@ -2203,6 +2215,8 @@ fn full_layer_decode_impl(
 
     // o_proj → tmp.
     weight_gemv(gpu, &lw.o_proj, &scratch.attn_out, &scratch.tmp)?;
+    if _fdump { dbg_dump(gpu, "[FL] L5 post_attn_out", &scratch.attn_out, n_heads * head_dim); }
+    if _fdump { dbg_dump(gpu, "[FL] L5 post_o_proj", &scratch.tmp, dim); }
 
     // Sandwich post-attn norm.
     gpu.rmsnorm_f32(&scratch.tmp, &lw.post_attention_layernorm, &scratch.tmp, config.norm_eps)?;

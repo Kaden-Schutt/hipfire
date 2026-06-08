@@ -904,6 +904,7 @@ fn forward_step_after_x(
                 &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
                 &state.attn_out, &state.attn_partials,
                 pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
+                0, // no sliding window
             )?;
         }
 
