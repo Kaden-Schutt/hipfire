@@ -1304,7 +1304,9 @@ fn apply_moe_branch(
     let gate_ok = first.gate_up_proj.gpu_dtype == rdna_compute::DType::MQ4G256;
     let down_q8  = first.down_proj.gpu_dtype == rdna_compute::DType::Q8_0;
     let down_hfq4g128 = first.down_proj.gpu_dtype == rdna_compute::DType::HFQ4G128;
-    let fast = gate_ok && (down_q8 || down_hfq4g128);
+    let fast = false; // TODO(Phase 4): enable indexed-fast path once MoE GEMV kernels are ported
+    // Original condition: gate_ok && (down_q8 || down_hfq4g128);
+    let _ = (gate_ok, down_q8, down_hfq4g128);
     {
         use std::sync::OnceLock;
         static LOGGED: OnceLock<()> = OnceLock::new();
@@ -1456,15 +1458,10 @@ fn apply_moe_branch_batched(
         "n_batch={n_batch} > MAX_PREFILL_BATCH={}", scratch.max_prefill_batch);
 
     let first = &moe.experts[0];
-    let gate_ok = first.gate_up_proj.gpu_dtype == rdna_compute::DType::MQ4G256;
-    let down_hfq4g128 = first.down_proj.gpu_dtype == rdna_compute::DType::HFQ4G128;
-    if !gate_ok || !down_hfq4g128 {
-        return Err(hip_bridge::HipError::new(
-            0, &format!("apply_moe_branch_batched: unsupported quant mix \
-                (gate_up={:?} down={:?}). Only MQ4G256+HFQ4G128 wired for batch.",
-                first.gate_up_proj.gpu_dtype, first.down_proj.gpu_dtype),
-        ));
-    }
+    let _gate_dtype = first.gate_up_proj.gpu_dtype;
+    let _down_dtype = first.down_proj.gpu_dtype;
+    // TODO(Phase 4): fused batched MoE kernels not yet ported.
+    // Using per-token expert loop (correct but slow for prefill).
 
     // 1) cur_mlp_batch = post_feedforward_layernorm_1(pb_ffn_out)
     gpu.rmsnorm_batched(&scratch.pb_ffn_out, &moe.post_feedforward_layernorm_1,
@@ -1516,69 +1513,86 @@ fn apply_moe_branch_batched(
         )?;
     }
 
-    // 6) Pre-rotate pre2_batch via FWHT (MQ4 indexed gate_up expects rotated x).
-    gpu.rotate_x_mq_batched(&scratch.pb_moe_pre2, &scratch.pb_moe_pre2_rot,
-        dim, n_batch)?;
-
-    // 7) Bucketed (or indexed_batched fallback) gate_up — one launch.
-    if use_bucketed {
-        gpu.gemv_mq4g256_moe_gate_up_bucketed(
-            &moe.experts_gate_up_ptrs,
-            &scratch.pb_moe_expert_offsets,
-            &scratch.pb_moe_expert_token_list,
-            &scratch.pb_moe_pre2_rot,
-            &scratch.pb_moe_gate_batch,
-            &scratch.pb_moe_up_batch,
-            2 * mi, dim, k_top, n_exp,
-        )?;
-    } else {
-        gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-            &moe.experts_gate_up_ptrs,
-            &scratch.pb_moe_topk_indices,
-            &scratch.pb_moe_pre2_rot,
-            &scratch.pb_moe_gate_batch,
-            &scratch.pb_moe_up_batch,
-            2 * mi, dim, k_top, n_batch,
-        )?;
-    }
-
-    // 8) Batched gelu_tanh + mul over [N × K_TOP × MI].
-    gpu.gelu_tanh_f32(&scratch.pb_moe_gate_batch,
-        &scratch.pb_moe_hidden_batch, n_batch * k_top * mi)?;
-    gpu.mul_f32(&scratch.pb_moe_hidden_batch,
-        &scratch.pb_moe_up_batch,
-        &scratch.pb_moe_hidden_batch)?;
-
-    // 9) Zero cur_moe_batch accumulator.
+    // 6-13) Per-token expert loop (Phase 4 fallback until fused kernels ported).
+    // For each token: extract per-token topk indices/weights,
+    // run 8 expert GEMVs, accumulate into pb_moe_cur_moe.
     let dim_bytes = dim * 4;
+    let topk_idx_host = gpu.download_f32(&scratch.pb_moe_topk_indices)?;
+    let topk_wt_host = gpu.download_f32(&scratch.pb_moe_topk_weights)?;
+    let topk_indices_batch: Vec<Vec<usize>> = (0..n_batch).map(|b| {
+        unsafe {
+            std::slice::from_raw_parts(
+                topk_idx_host.as_ptr().add(b * k_top) as *const i32, k_top)
+        }.iter().map(|&i| i as usize).collect()
+    }).collect();
+    let topk_weights_batch: Vec<Vec<f32>> = (0..n_batch).map(|b| {
+        topk_wt_host[b * k_top..(b + 1) * k_top].to_vec()
+    }).collect();
+
+    // Zero cur_moe_batch accumulator.
     if let Some(s) = gpu.active_stream.as_ref() {
         gpu.hip.memset_async(&scratch.pb_moe_cur_moe.buf, 0, n_batch * dim_bytes, s)?;
     } else {
         gpu.hip.memset(&scratch.pb_moe_cur_moe.buf, 0, n_batch * dim_bytes)?;
     }
 
-    // 10) Bucketed (or indexed_batched fallback) down + scaled residual.
-    if use_bucketed {
-        gpu.gemv_hfq4g128_moe_down_residual_scaled_bucketed(
-            &moe.experts_down_ptrs,
-            &scratch.pb_moe_expert_offsets,
-            &scratch.pb_moe_expert_token_list,
-            &scratch.pb_moe_topk_weights,
-            &moe.per_expert_scale,
-            &scratch.pb_moe_hidden_batch,
-            &scratch.pb_moe_cur_moe,
-            dim, mi, k_top, n_exp,
-        )?;
-    } else {
-        gpu.gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched(
-            &moe.experts_down_ptrs,
-            &scratch.pb_moe_topk_indices,
-            &scratch.pb_moe_topk_weights,
-            &moe.per_expert_scale,
-            &scratch.pb_moe_hidden_batch,
-            &scratch.pb_moe_cur_moe,
-            dim, mi, k_top, n_batch,
-        )?;
+    for b in 0..n_batch {
+        for ki in 0..k_top {
+            let e = topk_indices_batch[b][ki];
+            let weight = topk_weights_batch[b][ki] * moe.per_expert_scale_host[e];
+            let expert = &moe.experts[e];
+
+            // Copy this token's pre2 row into scratch.moe_pre2
+            if let Some(s) = gpu.active_stream.as_ref() {
+                gpu.hip.memcpy_dtod_async_at(
+                    &scratch.moe_pre2.buf, 0,
+                    &scratch.pb_moe_pre2.buf, b * dim_bytes,
+                    dim_bytes, s)?;
+            } else {
+                gpu.hip.memcpy_dtod_at(
+                    &scratch.moe_pre2.buf, 0,
+                    &scratch.pb_moe_pre2.buf, b * dim_bytes,
+                    dim_bytes)?;
+            }
+
+            // gate_up = expert.gate_up_proj @ pre2
+            weight_gemv(gpu, &expert.gate_up_proj, &scratch.moe_pre2,
+                &scratch.moe_expert_gate_up)?;
+            let gate = scratch.moe_expert_gate_up.sub_offset(0, mi);
+            let up   = scratch.moe_expert_gate_up.sub_offset(mi, mi);
+            // hidden = gelu_tanh(gate) * up
+            gpu.gelu_tanh_f32(&gate, &scratch.moe_expert_hidden, mi)?;
+            gpu.mul_f32(&scratch.moe_expert_hidden, &up,
+                &scratch.moe_expert_hidden)?;
+            // expert_out = expert.down_proj @ hidden
+            weight_gemv(gpu, &expert.down_proj, &scratch.moe_expert_hidden,
+                &scratch.moe_expert_out)?;
+            // scaled_add into the correct row of pb_moe_cur_moe
+            if let Some(s) = gpu.active_stream.as_ref() {
+                gpu.hip.memcpy_dtod_async_at(
+                    &scratch.tmp.buf, 0,
+                    &scratch.pb_moe_cur_moe.buf, b * dim_bytes,
+                    dim_bytes, s)?;
+            } else {
+                gpu.hip.memcpy_dtod_at(
+                    &scratch.tmp.buf, 0,
+                    &scratch.pb_moe_cur_moe.buf, b * dim_bytes,
+                    dim_bytes)?;
+            }
+            gpu.scaled_add_inplace_cpu_scalar_f32(
+                &scratch.tmp, &scratch.moe_expert_out, weight)?;
+            if let Some(s) = gpu.active_stream.as_ref() {
+                gpu.hip.memcpy_dtod_async_at(
+                    &scratch.pb_moe_cur_moe.buf, b * dim_bytes,
+                    &scratch.tmp.buf, 0,
+                    dim_bytes, s)?;
+            } else {
+                gpu.hip.memcpy_dtod_at(
+                    &scratch.pb_moe_cur_moe.buf, b * dim_bytes,
+                    &scratch.tmp.buf, 0,
+                    dim_bytes)?;
+            }
+        }
     }
 
     // 11) post_feedforward_layernorm_2(cur_moe) in-place batched.
