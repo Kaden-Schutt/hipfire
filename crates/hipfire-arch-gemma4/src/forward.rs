@@ -1093,32 +1093,72 @@ pub fn forward_batch_spec(
             .map_err(|e| format!("gemma4 forward_batch_spec final rmsnorm: {e:?}"))?;
 
         if let Some(out) = per_pos_argmax_out {
-            // Per-row lm_head via the SCALAR `weight_gemv` (exactly the eager
-            // decode_step / the last-row path below). This is the proven path on
-            // both Q8 and MQ4 targets. We deliberately do NOT use the batched
-            // `proj_gemm_batched` here: for an MQ4 lm_head (m=vocab≈262144) it
-            // routes through `gemm_hfq4g256_residual_wmma[_gfx12]`, whose b>1
-            // path faults (illegal access) at this output width on gfx12 — a
-            // pre-existing batched-MQ4-WMMA limitation, unrelated to spec wiring.
-            // `weight_gemv` (per-row, b=1) sidesteps it entirely.
             out.clear();
             out.reserve(b);
-            for i in 0..b {
-                let hidden_row = normed_hidden.sub_offset(i * dim, dim);
-                weight_gemv(gpu, &weights.lm_head, &hidden_row, &state.logits)
-                    .map_err(|e| format!("gemma4 forward_batch_spec lm_head row {i}: {e}"))?;
-                if cfg.final_logit_softcapping > 0.0 {
-                    gpu.logit_softcap_f32(
-                        &state.logits,
-                        cfg.vocab_size,
-                        cfg.final_logit_softcapping,
-                    )
-                    .map_err(|e| format!("gemma4 forward_batch_spec softcap row {i}: {e:?}"))?;
+            let vocab = cfg.vocab_size;
+            if weights.lm_head.gpu_dtype == DType::Q8_0 {
+                // FAST PATH (the spec-verify perf lever): a single batched Q8 WMMA
+                // lm_head reads the ~1 GB Q8 weight ONCE for all B rows, instead of
+                // the per-row weight_gemv that re-streamed the whole weight B times
+                // (~90% of the verify, ~4× off roofline). On gfx12 (RDNA4)
+                // `gemm_q8_0_batched_chunked` auto-routes to the WMMA Q8 GEMM (now
+                // correct after the stale-fp16-cache fix); elsewhere it sub-batches
+                // the scalar Q8 GEMM — either way Y[B, vocab] row-major.
+                //
+                // Softcap is SKIPPED: it's a strictly-monotonic per-element map
+                // (tanh-scaled), so argmax(softcap(z)) == argmax(z). The accept
+                // decision is an argmax, so this is bit-exact in the decision.
+                let logits_b = alloc(gpu, b * vocab, "spec_logits_b")?;
+                gpu.gemm_q8_0_batched_chunked(
+                    &weights.lm_head.buf,
+                    normed_hidden,
+                    &logits_b,
+                    weights.lm_head.m,
+                    weights.lm_head.k,
+                    b,
+                )
+                .map_err(|e| format!("gemma4 forward_batch_spec batched lm_head: {e:?}"))?;
+                // GPU per-row argmax over [B, vocab]; only B indices land on PCIe.
+                let idx_buf = alloc(gpu, b, "spec_argmax_idx")?;
+                gpu.argmax_f32_batched(&logits_b, &idx_buf, vocab, b)
+                    .map_err(|e| format!("gemma4 forward_batch_spec batched argmax: {e:?}"))?;
+                let mut idx_i32 = vec![0i32; b];
+                let idx_bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(idx_i32.as_mut_ptr() as *mut u8, b * 4)
+                };
+                gpu.hip
+                    .memcpy_dtoh(idx_bytes, &idx_buf.buf)
+                    .map_err(|e| format!("gemma4 forward_batch_spec argmax dtoh: {e:?}"))?;
+                for v in idx_i32 {
+                    out.push(v as u32);
                 }
-                let row = gpu
-                    .download_f32(&state.logits)
-                    .map_err(|e| format!("gemma4 forward_batch_spec download row {i}: {e:?}"))?;
-                out.push(argmax_f32_row(&row));
+                gpu.free_tensor(logits_b).ok();
+                gpu.free_tensor(idx_buf).ok();
+            } else {
+                // FALLBACK (non-Q8 lm_head, e.g. MQ4): per-row SCALAR `weight_gemv`
+                // (exactly the eager decode_step / the last-row path below). We
+                // deliberately do NOT use the batched MQ4 path here: for an MQ4
+                // lm_head (m=vocab≈262144) it routes through
+                // `gemm_hfq4g256_residual_wmma[_gfx12]`, whose b>1 path faults
+                // (illegal access) at this output width on gfx12. `weight_gemv`
+                // (per-row, b=1) sidesteps it entirely.
+                for i in 0..b {
+                    let hidden_row = normed_hidden.sub_offset(i * dim, dim);
+                    weight_gemv(gpu, &weights.lm_head, &hidden_row, &state.logits)
+                        .map_err(|e| format!("gemma4 forward_batch_spec lm_head row {i}: {e}"))?;
+                    if cfg.final_logit_softcapping > 0.0 {
+                        gpu.logit_softcap_f32(
+                            &state.logits,
+                            vocab,
+                            cfg.final_logit_softcapping,
+                        )
+                        .map_err(|e| format!("gemma4 forward_batch_spec softcap row {i}: {e:?}"))?;
+                    }
+                    let row = gpu
+                        .download_f32(&state.logits)
+                        .map_err(|e| format!("gemma4 forward_batch_spec download row {i}: {e:?}"))?;
+                    out.push(argmax_f32_row(&row));
+                }
             }
         }
         if let Some(t) = local_hidden {
