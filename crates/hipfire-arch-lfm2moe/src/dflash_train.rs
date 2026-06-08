@@ -352,3 +352,64 @@ pub fn body_backward(gpu: &mut Gpu, cfg: &Cfg, w: &[LW], tape: &[LT], dh_out: &G
     }
     (dh, d_ctx, glayers.into_iter().map(|o| o.unwrap()).collect())
 }
+
+// ---- DFNET checkpoint loader (mirror of dflash_train_run::save_net) ----
+/// Load a trained drafter checkpoint (DFNET container) into a `Net`. Shapes are
+/// derived from `cfg` + tensor name. Pairs with the saver in
+/// `examples/dflash_train_run.rs`.
+pub fn load_net(gpu: &mut Gpu, cfg: &Cfg, path: &Path) -> std::io::Result<Net> {
+    use std::collections::HashMap;
+    let bytes = std::fs::read(path)?;
+    assert_eq!(&bytes[0..8], b"DFNET\0\0\0", "bad DFNET magic");
+    let n = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    // 9 cfg ints follow (d,n_layers,nh,nkv,hd,conv_k,inter,d_tgt,vocab) — skip.
+    let mut off = 12 + 9 * 4;
+    let mut map: HashMap<String, Vec<f32>> = HashMap::new();
+    for _ in 0..n {
+        let nl = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize; off += 4;
+        let name = String::from_utf8(bytes[off..off + nl].to_vec()).unwrap(); off += nl;
+        let numel = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize; off += 4;
+        let data: Vec<f32> = bytes[off..off + numel * 4].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        off += numel * 4;
+        map.insert(name, data);
+    }
+    let (d, qd, kvd, k, inter, d_tgt) = (cfg.d, cfg.qd(), cfg.kvd(), cfg.conv_k, cfg.inter, cfg.d_tgt);
+    let fc_in = cfg.n_tgt_layers * d_tgt;
+    let g = |gpu: &mut Gpu, map: &HashMap<String, Vec<f32>>, name: &str, sh: &[usize]| -> GpuTensor {
+        let v = map.get(name).unwrap_or_else(|| panic!("DFNET missing {name}"));
+        up(gpu, v, sh)
+    };
+    let mut layers = Vec::new();
+    for li in 0..cfg.n_layers() {
+        let pfx = format!("layers.{li}");
+        let op_norm = g(gpu, &map, &format!("{pfx}.op_norm"), &[d]);
+        let ffn_norm = g(gpu, &map, &format!("{pfx}.ffn_norm"), &[d]);
+        let w1 = g(gpu, &map, &format!("{pfx}.w1"), &[inter, d]);
+        let w3 = g(gpu, &map, &format!("{pfx}.w3"), &[inter, d]);
+        let w2 = g(gpu, &map, &format!("{pfx}.w2"), &[d, inter]);
+        let lw = if cfg.is_attn[li] {
+            LW { op_norm, ffn_norm, in_proj: None, conv_w: None, out_proj: None,
+                wq: Some(g(gpu, &map, &format!("{pfx}.wq"), &[qd, d])),
+                wk: Some(g(gpu, &map, &format!("{pfx}.wk"), &[kvd, d])),
+                wv: Some(g(gpu, &map, &format!("{pfx}.wv"), &[kvd, d])),
+                wo: Some(g(gpu, &map, &format!("{pfx}.wo"), &[d, qd])),
+                q_norm: Some(g(gpu, &map, &format!("{pfx}.q_norm"), &[cfg.hd])),
+                k_norm: Some(g(gpu, &map, &format!("{pfx}.k_norm"), &[cfg.hd])),
+                w1, w3, w2 }
+        } else {
+            LW { op_norm, ffn_norm,
+                in_proj: Some(g(gpu, &map, &format!("{pfx}.in_proj"), &[3 * d, d])),
+                conv_w: Some(g(gpu, &map, &format!("{pfx}.conv_w"), &[d, k])),
+                out_proj: Some(g(gpu, &map, &format!("{pfx}.out_proj"), &[d, d])),
+                wq: None, wk: None, wv: None, wo: None, q_norm: None, k_norm: None, w1, w3, w2 }
+        };
+        layers.push(lw);
+    }
+    Ok(Net {
+        layers,
+        in_proj_v: g(gpu, &map, "in_proj_v", &[d, d_tgt]),
+        out_proj_v: g(gpu, &map, "out_proj_v", &[d_tgt, d]),
+        fc: g(gpu, &map, "fc", &[d, fc_in]),
+        final_norm: g(gpu, &map, "final_norm", &[d]),
+    })
+}

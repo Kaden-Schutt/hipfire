@@ -38,7 +38,10 @@ fn read_hfhs(path: &str) -> (usize, usize, Vec<Vec<f32>>) {
     let hidden = u32::from_le_bytes(hdr[16..20].try_into().unwrap()) as usize;
     let lb = n_pos * hidden * 4;
     let mut out = Vec::new();
-    for &l in &SEL {
+    // 5-layer bulk dumps store the SEL layers as indices 0..5; legacy 64-layer
+    // dumps need SEL indexing.
+    let sel: Vec<usize> = if n_layers == SEL.len() { (0..SEL.len()).collect() } else { SEL.to_vec() };
+    for &l in &sel {
         assert!(l < n_layers);
         f.seek(SeekFrom::Start(24 + (l * lb) as u64)).unwrap();
         let mut raw = vec![0u8; lb]; f.read_exact(&mut raw).unwrap();
@@ -98,19 +101,28 @@ fn main() {
     let d = cfg.d; let fc_in = 5 * d_tgt; let ws = 1.0 / (d as f32).sqrt();
     println!("vocab={vocab} d_tgt={d_tgt} d={d} steps={steps} lr_max={lr_max} chunks={n_chunks}");
 
-    // load sequences (chunk{c}.hfhs + tokens)
+    // load sequences (glob *.hfhs; works for seq{i} bulk + chunk{c}). Filter
+    // out degenerate greedy generations (low unique-token ratio = loops).
+    let _ = kldref;
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(data_dir).unwrap()
+        .filter_map(|e| e.ok()).map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |x| x == "hfhs")).collect();
+    paths.sort();
+    let uniq_min = 0.20f32;
     let mut seqs = Vec::new();
-    for c in 0..n_chunks {
-        let hp = format!("{data_dir}/chunk{c}.hfhs");
-        if !Path::new(&hp).exists() { eprintln!("  (missing {hp}, stopping at {c} chunks)"); break; }
-        let tp = format!("{data_dir}/chunk{c}.toks");
-        if !Path::new(&tp).exists() { eprintln!("  (missing {tp}, stopping at {c} chunks)"); break; }
-        let (n_pos, hidden, layers5) = read_hfhs(&hp);
+    let mut skipped = 0;
+    for hp in &paths {
+        let tp = hp.with_extension("toks");
+        if !tp.exists() { continue; }
+        let tokens = read_toks(tp.to_str().unwrap());
+        let uniq: std::collections::HashSet<u32> = tokens.iter().copied().collect();
+        if (uniq.len() as f32 / tokens.len() as f32) < uniq_min { skipped += 1; continue; }
+        let (n_pos, hidden, layers5) = read_hfhs(hp.to_str().unwrap());
         assert_eq!(hidden, d_tgt);
-        let tokens = read_toks(&tp);
-        let _ = kldref;
         seqs.push(Seq { layers5, tokens, n_pos });
+        if seqs.len() >= n_chunks { break; }
     }
+    eprintln!("loaded {} coherent seqs ({skipped} degenerate skipped, uniq<{uniq_min})", seqs.len());
     let n_seq = seqs.len();
     assert!(n_seq >= 2, "need >=2 sequences (got {n_seq})");
     let n_eval = 2.min(n_seq - 1);
@@ -147,9 +159,12 @@ fn main() {
     let mask_emb: Vec<f32> = embed[mask_id * d_tgt..(mask_id + 1) * d_tgt].to_vec();
 
     // build a [n_ctx, fc_in] context-hidden host buffer for a given (seq, p)
+    // context = the n_ctx committed hiddens ENDING AT the seed position p
+    // (inclusive). Including p's hidden is critical: it's the target state that
+    // predicts the first block token p+1.
     let ctx_hiddens = |s: &Seq, p: usize| -> Vec<f32> {
         let mut c = vec![0f32; n_ctx * fc_in];
-        for (ci, pos) in (p - n_ctx..p).enumerate() {
+        for (ci, pos) in (p + 1 - n_ctx..p + 1).enumerate() {
             for (li, layer) in s.layers5.iter().enumerate() {
                 c[ci * fc_in + li * d_tgt..ci * fc_in + (li + 1) * d_tgt].copy_from_slice(&layer[pos * d_tgt..(pos + 1) * d_tgt]);
             }
@@ -213,7 +228,7 @@ fn main() {
         // proxy-τ eval (mean accepted prefix) on held-out blocks
         if step % 500 == 0 || step == steps {
             let ck2 = gpu.pool_checkpoint();
-            let mut acc_sum = 0f32; let mut nb = 0;
+            let mut acc_sum = 0f32; let mut nb = 0; let mut hit_sum = 0f32; let mut pos_total = 0f32;
             for ei in n_tr..n_seq {
                 let s = &seqs[ei];
                 for bi in 0..8 {
@@ -233,20 +248,30 @@ fn main() {
                     let out = dt::lin(&mut gpu, &fn2, &net.out_proj_v, bsz, d, d_tgt);
                     let logits = dt::lin(&mut gpu, &out, &lm_head_g, bsz, d_tgt, vocab);
                     let lg = gpu.download_f32(&logits).unwrap();
-                    // accepted prefix = leading run (positions 1..B; pos 0 is the seed)
-                    // where drafter argmax == target's own next token = greedy-τ
-                    let mut acc = 0;
-                    for i in 1..bsz {
+                    // argmax per block position (1..B; pos 0 is the seed)
+                    let am: Vec<i32> = (1..bsz).map(|i| {
                         let row = &lg[i * vocab..(i + 1) * vocab];
-                        let am = row.iter().enumerate().max_by(|x, y| x.1.partial_cmp(y.1).unwrap()).unwrap().0;
-                        if am as i32 == targets[i] { acc += 1; } else { break; }
-                    }
-                    acc_sum += acc as f32; nb += 1;
+                        row.iter().enumerate().max_by(|x, y| x.1.partial_cmp(y.1).unwrap()).unwrap().0 as i32
+                    }).collect();
+                    // accepted prefix = leading run of matches = greedy-τ
+                    let mut acc = 0;
+                    for (k, &a) in am.iter().enumerate() { if a == targets[k + 1] { acc += 1; } else { break; } }
+                    // per-position top-1 accuracy (no break) = learning diagnostic
+                    let hits = am.iter().enumerate().filter(|(k, &a)| a == targets[k + 1]).count();
+                    acc_sum += acc as f32; nb += 1; hit_sum += hits as f32; pos_total += (bsz - 1) as f32;
                 }
             }
             let proxy_tau = if nb > 0 { acc_sum / nb as f32 } else { 0.0 };
-            println!("  [eval step {step}] proxy_tau(mean accepted prefix) = {proxy_tau:.3} over {nb} held-out blocks  (baseline tau~6.3)");
+            let per_pos = if pos_total > 0.0 { hit_sum / pos_total } else { 0.0 };
+            println!("  [eval step {step}] proxy_tau(accepted prefix) = {proxy_tau:.3} | per_pos_acc = {per_pos:.3} | {nb} blocks  (baseline tau~6.3)");
             gpu.pool_release_to(ck2);
+        }
+        // periodic checkpoint (long run safety)
+        if step % 5000 == 0 {
+            let ck3 = gpu.pool_checkpoint();
+            save_net(&mut gpu, &net, &cfg, &out_ckpt);
+            gpu.pool_release_to(ck3);
+            println!("  [ckpt step {step}] saved {out_ckpt}");
         }
     }
 
