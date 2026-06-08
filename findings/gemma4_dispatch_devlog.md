@@ -1489,3 +1489,79 @@ what the previous agent recommended.
 If the divergence starts at a sliding layer, suspect #3 (sliding KV OOB)
 or #4 (RoPE). If it starts at a full layer, suspect #1 (reduce at higher
   tiles) or #2 (asym3 KV layout).
+
+---
+
+## 2026-06-08 · Session 17b — >1024 collapse ROOT CAUSE: fp32 KV path has no window masking
+
+### Per-layer oracle localization
+
+Ran the 1200-token oracle on both sides with per-layer hidden state dumps.
+Key results (corrected HF indexing — HF `hidden_states[li+1]` = after layer `li`):
+
+```
+L0-L11:  Δ[1] < 0.09  — excellent match (HFQ4 noise)
+L12-L18: Δ[1] 0.0-0.26 — gradual drift  
+L19:     Δ[1] = 0.83  — first warning
+L20:     Δ[1] = 2.40  — FIRST DIVERGE (Sliding layer!)
+L20-L26: Δ[1] 1.2-2.7 — severe
+L27-L29: Δ[1] 0.5-0.7 — partial recovery
+L30-L34: Δ[1] 0.3-1.4 — oscillating
+L35-L47: Δ[1] 0.05-0.7 — partially recovered
+```
+
+### Token-count threshold scan
+
+```
+ 500 tok: argmax=618     top1=16.21  ✓
+ 700 tok: argmax=4681    top1=15.55  ✓
+ 900 tok: argmax=11327   top1=17.22  ✓
+1000 tok: argmax=529     top1=16.69  ✓
+1050 tok: argmax=236783  top1=3.65   COLLAPSED
+1100 tok: argmax=4699    top1=12.13  partially recovered?
+1200 tok: argmax=532     top1=14.40  (wrong but not fully collapsed)
+```
+
+The collapse starts at exactly ~1024 tokens — the `sliding_window` boundary.
+
+### ROOT CAUSE: fp32 KV path has no sliding window masking
+
+The oracle (`gemma4_oracle.rs`) allocates the sliding KV cache as:
+```rust
+let mut kv_sliding = KvCache::new_gpu(  // fp32, NOT asym3
+    &mut gpu, config.n_layers, config.sliding_n_kv_heads,
+    config.sliding_head_dim, max_seq,  // max_seq = 1200
+)
+```
+
+This takes the **fp32 KV path** in `sliding_layer_decode_impl`, which has
+this comment:
+```rust
+// Plain FP32 KV path (kvf16 / kvfp32) — NO sliding window.
+// Only for debugging; incorrect for seq > window_size.
+```
+
+The `attention_flash` function (fp32 path) attends to ALL positions from
+0 to seq_len-1. For sequences >1024, this means the sliding attention
+sees tokens that should be outside the 1024-position window. The asym3
+path correctly passes `sliding_cap` (=1024) to `attention_flash_asym3_window`,
+but the fp32 path has no windowing.
+
+**This explains the collapse threshold at exactly 1024 tokens.**
+
+The fix is straightforward: either:
+1. Add window masking to the fp32 `attention_flash` kernel
+2. Change the oracle to use asym3 KV cache (`new_gpu_asym3`) instead of
+   fp32 (`new_gpu`)
+3. Use the windowed `attention_flash_asym3` path even for fp32 caches
+
+Option 2 is simplest — the asym3 path already has correct window masking.
+The daemon's production path uses asym3 and works correctly for ≤1024.
+The oracle was using fp32 for "purity" but hit this known limitation.
+
+### Note: the daemon is NOT affected
+
+The daemon allocates the sliding KV as asym3 (quantized), which takes the
+`attention_flash_asym3_window` path with `sliding_cap = sliding_window`.
+The daemon also has the OOB guard (`generate_gemma4` refuses >1024 tokens).
+So production paths are safe. Only the oracle's debug fp32 path is broken.
