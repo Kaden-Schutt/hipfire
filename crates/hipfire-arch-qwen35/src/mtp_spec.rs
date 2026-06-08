@@ -520,12 +520,39 @@ impl MtpSpecState {
         max_n: usize,
         kv_mode: crate::mtp_head::MtpKvMode,
     ) -> HipResult<Self> {
+        Self::new_for_config_with_kv_mode(
+            gpu,
+            &target.config,
+            &target.dn_state,
+            head,
+            max_n,
+            kv_mode,
+        )
+    }
+
+    /// Like [`Self::new_for_slot_with_kv_mode`] but takes a bare
+    /// [`qwen35::Qwen35Config`] + a sample [`qwen35::DeltaNetState`] (for
+    /// snapshot sizing) instead of a single-GPU [`ModelSlot`]. Used by the
+    /// tensor-parallel MTP path ([`spec_step_mtp_tp`]), which has no
+    /// `ModelSlot` — its trunk is a per-rank set of weights/configs/dn_states.
+    /// `dim`/`vocab` are global even in a per-rank `local_attn_config`, so all
+    /// the dev0 draft+verify scratch is identical to the slot path. `dn_state`
+    /// is rank 0's; the TP step uses its own per-rank snapshots, so the
+    /// `trunk_snap`/`trunk_pbs` allocated here go unused on the TP path.
+    pub fn new_for_config_with_kv_mode(
+        gpu: &mut Gpu,
+        config: &qwen35::Qwen35Config,
+        dn_state: &qwen35::DeltaNetState,
+        head: &Qwen35MtpHead,
+        max_n: usize,
+        kv_mode: crate::mtp_head::MtpKvMode,
+    ) -> HipResult<Self> {
         assert!(
             max_n >= 1,
-            "MtpSpecState::new_for_slot: max_n must be ≥ 1 (chain depth)"
+            "MtpSpecState::new_for_config: max_n must be ≥ 1 (chain depth)"
         );
-        let dim = target.config.dim;
-        let vocab = target.config.vocab_size;
+        let dim = config.dim;
+        let vocab = config.vocab_size;
         assert_eq!(
             head.config.n_embd, dim,
             "MtpSpecState: trunk dim={dim} but head n_embd={}",
@@ -542,7 +569,7 @@ impl MtpSpecState {
         let verify_logits = gpu.alloc_tensor(&[(max_n + 1) * vocab], DType::F32)?;
         let verify_rot = gpu.alloc_tensor(&[(max_n + 1) * dim], DType::F32)?;
         let verify_argmax = gpu.alloc_tensor(&[max_n + 1], DType::F32)?;
-        let trunk_snap = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
+        let trunk_snap = DeltaNetSnapshot::new_for(gpu, dn_state)?;
         // Snapshot overlap resources are construction-time only; set the env
         // before creating MtpSpecState when comparing the opt-in path.
         let (trunk_snap_stream, trunk_snap_start_event) = if mtp_snapshot_overlap_enabled_from_env()
@@ -554,8 +581,8 @@ impl MtpSpecState {
         } else {
             (None, None)
         };
-        let trunk_pbs = qwen35::PrefillBatchScratch::new(gpu, &target.config, max_n + 1)?;
-        let trunk_gdn_tape = GdnTape::new_for_config(gpu, &target.config, max_n + 1)?;
+        let trunk_pbs = qwen35::PrefillBatchScratch::new(gpu, config, max_n + 1)?;
+        let trunk_gdn_tape = GdnTape::new_for_config(gpu, config, max_n + 1)?;
         let mtp_scratch = Qwen35MtpHeadScratch::new(gpu, &head.config)?;
         let mtp_kv = Qwen35MtpHeadKvCache::new_with_kv_mode(gpu, &head.config, kv_mode)?;
 
@@ -1634,6 +1661,239 @@ pub fn spec_step_mtp(
     // (k+1)-th formerly-stale slot before its attention reads it. The
     // chain progresses left-to-right, overwriting stale slots in-order
     // exactly as needed. NO explicit rollback required.
+
+    Ok(MtpSpecResult {
+        committed,
+        accept_count,
+        hit_eos,
+        advance,
+        drafts_generated: state.max_n,
+        chain_truncated: false,
+        replay_skipped: false,
+    })
+}
+
+/// Tensor-parallel MTP speculative-decode cycle — the TP analogue of
+/// [`spec_step_mtp`].
+///
+/// The MTP draft chain, batched draft lm_head, per-position verify lm_head and
+/// accept logic all run on **rank 0** (`gpus.devices[0]`): under TP the
+/// embedding table and the output (lm_head) projection are replicated, so
+/// `weights[0]` holds the full tied `token_embd` + `output` exactly like a
+/// single-GPU trunk. Only the two trunk forwards change — the **verify** of
+/// `[last_committed, c_1..c_max_n]` and the **replay** of the accepted prefix
+/// dispatch across all `shard.tp_size` ranks via
+/// [`qwen35::forward_prefill_chunk_tp`] — and the DeltaNet snapshot/rollback is
+/// **per-rank**: each card owns its head-shard of the DN state and snapshots it
+/// locally (no cross-device copy, unlike the PP DFlash path).
+///
+/// Greedy / lossless: identical accept rule to [`spec_step_mtp`] — commit an
+/// MTP candidate only when it equals the trunk argmax at that slot; always
+/// commit the bonus argmax. (temp>0 sampling is not wired on this path yet.)
+///
+/// `state` holds the dev0 draft+verify scratch (build via
+/// [`MtpSpecState::new_for_config_with_kv_mode`]); `snaps` / `pbs` / `partials`
+/// / `scratches` / `kv_caches` / `dn_states` are the per-rank trunk resources.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_mtp_tp(
+    gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+    shard: &hipfire_runtime::tp_shard::ShardConfig,
+    weights: &[Qwen35Weights],
+    configs: &[qwen35::Qwen35Config],
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [qwen35::DeltaNetState],
+    pbs: &[qwen35::PrefillBatchScratch],
+    partials: &[GpuTensor],
+    scratches: &[qwen35::Qwen35Scratch],
+    snaps: &mut [DeltaNetSnapshot],
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+) -> HipResult<MtpSpecResult> {
+    let tp = shard.tp_size;
+    let max_n = state.max_n;
+    let dim = configs[0].dim;
+    let vocab = configs[0].vocab_size;
+    let dim_bytes = dim * 4;
+
+    // Ensure dev0 has a stream for async memsets (MTP head kernels assume it).
+    gpus.devices[0].bind_thread()?;
+    if gpus.devices[0].active_stream.is_none() {
+        gpus.devices[0].active_stream = Some(gpus.devices[0].hip.stream_create()?);
+    }
+
+    // ── 1. MTP candidate chain + batched draft lm_head on rank 0 ─────────
+    //
+    // Identical to spec_step_mtp's steps 1/1b; rank-0 weights hold the full
+    // tied token_embd + output projection. Lossy K-step chain (step k>0 feeds
+    // the previous t_mtp_out as both prev_hidden and embedding override);
+    // any wrong candidate is caught by the trunk verify below.
+    let candidates: Vec<u32> = {
+        let gpu = &mut gpus.devices[0];
+        let trunk_weights: &Qwen35Weights = &weights[0];
+        for k in 0..max_n {
+            if k == 0 {
+                mtp_head::mtp_head_forward_block_only(
+                    gpu, head, &state.mtp_scratch, &mut state.mtp_kv,
+                    last_committed, &state.prev_hidden, None, cur_pos + k, trunk_weights,
+                )?;
+            } else {
+                let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                mtp_head::mtp_head_forward_block_only(
+                    gpu, head, &state.mtp_scratch, &mut state.mtp_kv,
+                    0, &prev_row, Some(&prev_row), cur_pos + k, trunk_weights,
+                )?;
+            }
+            gpu.hip.memcpy_dtod_at(
+                &state.mtp_t_outs.buf, k * dim_bytes,
+                &state.mtp_scratch.t_mtp_out.buf, 0, dim_bytes,
+            )?;
+        }
+        let t_outs_view = state.mtp_t_outs.sub_offset(0, max_n * dim);
+        let lm_tmp_view = state.mtp_lm_tmp.sub_offset(0, max_n * dim);
+        let lm_rot_view = state.mtp_lm_rot.sub_offset(0, max_n * dim);
+        let lm_logits_view = state.mtp_lm_logits.sub_offset(0, max_n * vocab);
+        mtp_head::mtp_head_apply_lm_head_batched(
+            gpu, head, &trunk_weights.output,
+            &t_outs_view, &lm_tmp_view, &lm_rot_view, &lm_logits_view, max_n,
+        )?;
+        let lm_argmax_view = state.mtp_lm_argmax.sub_offset(0, max_n);
+        gpu.argmax_f32_batched(&lm_logits_view, &lm_argmax_view, vocab, max_n)?;
+        let mut argmax_host: Vec<i32> = vec![0; max_n];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, max_n * 4)
+            };
+            gpu.hip.memcpy_dtoh(bytes, &lm_argmax_view.buf)?;
+        }
+        argmax_host.into_iter().map(|x| x as u32).collect()
+    };
+
+    // ── 2. Build trunk verify input: [last_committed, c1, ..., c_max_n] ──
+    let mut verify_tokens: Vec<u32> = Vec::with_capacity(max_n + 1);
+    verify_tokens.push(last_committed);
+    verify_tokens.extend_from_slice(&candidates);
+
+    // ── 3. Snapshot per-rank DN state (rollback target before verify) ────
+    // Each card owns its head-shard; snapshot is a local D2D copy per rank.
+    for r in 0..tp {
+        gpus.devices[r].bind_thread()?;
+        snaps[r].save_from(&dn_states[r], &mut gpus.devices[r])?;
+    }
+
+    // ── 4. TP batched verify, capturing per-position hidden on rank 0 ────
+    // forward_prefill_chunk_tp fills state.verify_hidden (dev0) with the
+    // post-output-norm hidden for ALL max_n+1 positions; trunk KV + per-rank
+    // dn_states advance by max_n+1.
+    qwen35::forward_prefill_chunk_tp(
+        gpus, shard, weights, configs, &verify_tokens, cur_pos,
+        kv_caches, dn_states, pbs, partials, scratches,
+        Some(&state.verify_hidden),
+    )?;
+
+    // ── 5. Per-position verify lm_head + batched argmax on rank 0 ────────
+    let n_verify = max_n + 1;
+    let argmax_per_pos: Vec<u32> = {
+        let gpu = &mut gpus.devices[0];
+        gpu.bind_thread()?;
+        let w_out = &weights[0].output;
+        let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
+        match w_out.gpu_dtype {
+            DType::Q8_0 => {
+                if mtp_q8_verify_wmma_enabled_from_env() {
+                    gpu.gemm_q8_0_batched_chunked(&w_out.buf, &state.verify_hidden, &logits_view, w_out.m, w_out.k, n_verify)?;
+                } else {
+                    gpu.gemm_q8_0_batched(&w_out.buf, &state.verify_hidden, &logits_view, w_out.m, w_out.k, n_verify)?;
+                }
+            }
+            DType::HFQ4G256 => {
+                gpu.gemm_hfq4g256_batched_lmhead(&w_out.buf, &state.verify_hidden, &logits_view, w_out.m, w_out.k, n_verify)?;
+            }
+            DType::MQ4G256 => {
+                let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+                llama::rotate_x_mq_batched_for(gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
+                gpu.gemm_hfq4g256_batched_lmhead(&w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify)?;
+            }
+            DType::MQ3G256 => {
+                let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+                llama::rotate_x_mq_batched_for(gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
+                gpu.gemm_hfq3g256_batched_lmhead(&w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify)?;
+            }
+            DType::HFQ6G256 => {
+                gpu.gemm_hfq6g256_batched_lmhead(&w_out.buf, &state.verify_hidden, &logits_view, w_out.m, w_out.k, n_verify)?;
+            }
+            DType::MQ6G256 => {
+                let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+                llama::rotate_x_mq_batched_for(gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
+                gpu.gemm_hfq6g256_batched_lmhead(&w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify)?;
+            }
+            _ => {
+                for i in 0..n_verify {
+                    let row = state.verify_hidden.sub_offset(i * dim, dim);
+                    let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
+                    llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
+                }
+            }
+        }
+        let argmax_view = state.verify_argmax.sub_offset(0, n_verify);
+        gpu.argmax_f32_batched(&logits_view, &argmax_view, vocab, n_verify)?;
+        let mut argmax_host: Vec<i32> = vec![0; n_verify];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, n_verify * 4)
+            };
+            gpu.hip.memcpy_dtoh(bytes, &argmax_view.buf)?;
+        }
+        argmax_host.into_iter().map(|x| x as u32).collect()
+    };
+
+    // ── 6. Accept-prefix (greedy, lossless) ──────────────────────────────
+    let mut accept_count = 0usize;
+    let mut hit_eos = false;
+    let mut committed: Vec<u32> = Vec::with_capacity(max_n + 1);
+    for k in 0..max_n {
+        if argmax_per_pos[k] == candidates[k] {
+            committed.push(candidates[k]);
+            accept_count += 1;
+            if candidates[k] == eos_token_id {
+                hit_eos = true;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if !hit_eos {
+        let bonus = argmax_per_pos[accept_count];
+        committed.push(bonus);
+        if bonus == eos_token_id {
+            hit_eos = true;
+        }
+    }
+    let advance = committed.len();
+    debug_assert!(advance >= 1 && advance <= max_n + 1);
+
+    // ── 7. Capture prev_hidden for next cycle (rank 0, slot advance-1) ───
+    state.capture_prev_hidden_from_verify_row(&gpus.devices[0], advance - 1, dim)?;
+
+    // ── 8. Per-rank DN rollback + TP replay of accepted prefix ───────────
+    // Restore each rank's DN to cur_pos, then replay the first `advance`
+    // verify tokens (idempotent KV rewrite + DN recurrence). The trunk KV
+    // stale slots [cur_pos+advance, cur_pos+max_n+1) are overwritten by the
+    // next cycle's verify before being read (same rolling-overwrite semantics
+    // as spec_step_mtp). advance==1 replays just the seed — forward_chunk_tp
+    // handles n=1 without the standalone-pbs OOB.
+    for r in 0..tp {
+        gpus.devices[r].bind_thread()?;
+        snaps[r].restore_to(&mut dn_states[r], &mut gpus.devices[r])?;
+    }
+    qwen35::forward_prefill_chunk_tp(
+        gpus, shard, weights, configs, &verify_tokens[..advance], cur_pos,
+        kv_caches, dn_states, pbs, partials, scratches,
+        None,
+    )?;
 
     Ok(MtpSpecResult {
         committed,

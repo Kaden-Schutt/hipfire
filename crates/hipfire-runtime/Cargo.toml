@@ -186,6 +186,10 @@ name = "mtp_only_demo"
 required-features = ["arch-qwen35"]
 
 [[example]]
+name = "tp_mtp_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
 name = "dump_logits_qwen35"
 required-features = ["arch-qwen35"]
 
