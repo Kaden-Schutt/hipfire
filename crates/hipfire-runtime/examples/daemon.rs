@@ -3955,16 +3955,15 @@ fn load_model(
         gemma4::init_scratch_constants(gpu, &scratch, config.full_head_dim)
             .map_err(|e| format!("gemma4 init_scratch_constants: {e:?}"))?;
 
-        // Dual KV: fp32 for sliding (debug), asym3 for full (hd=512)
-        // Sliding layers: cache sized at `sliding_window`, KV write at slot=pos
-        // (no ring wrap). The `kv_window` flash param + max_seq sizing for true
-        // >1024 long-context is staged but NOT enabled: enabling it exposed a
-        // pre-existing >1024 collapse (see dev log Session 16) unrelated to the
-        // windowing itself. Until that's localized via the per-layer oracle, the
-        // daemon stays at the known-good <=sliding_window path (guard below).
+        // Dual KV: fp32 for sliding, asym3 for full (hd=512).
+        // Sliding layers: cache sized at `max_seq` with `kv_window` masking in
+        // the attention kernel (only the last `sliding_window` positions
+        // contribute). This is the "window-only" long-context path (correct, but
+        // the cache occupies max_seq rows; the ring buffer in Phase 1.5 Step B
+        // will shrink it back to sliding_window rows via slot=pos%cap).
         let kv_sliding = llama::KvCache::new_gpu(
             gpu, config.n_layers, config.sliding_n_kv_heads,
-            config.sliding_head_dim, config.sliding_window,
+            config.sliding_head_dim, max_seq,
         ).map_err(|e| format!("gemma4 sliding KV alloc: {e:?}"))?;
         let kv_full = llama::KvCache::new_gpu_asym3(
             gpu, config.n_layers, config.full_n_kv_heads,
@@ -11531,16 +11530,12 @@ fn generate_gemma4(
         return;
     }
 
-    // Sliding-window guard. The sliding KV cache is sized at `sliding_window` and
-    // writes use slot=`pos` (no ring wrap), so positions >= sliding_window would
-    // OOB; and enabling >sliding_window context exposes a pre-existing collapse
-    // (dev log Session 16). Refuse too-long prompts / stop decode before the cap
-    // until long-context is validated via the per-layer oracle.
-    let cache_cap = m.gemma4_kv_sliding.as_ref().unwrap().max_seq;
+    // Context-length guard. Both the sliding and full KV caches are sized at
+    // `max_seq`; writing at pos >= max_seq would OOB. Refuse too-long prompts.
+    let cache_cap = m.gemma4_kv_full.as_ref().unwrap().max_seq;
     if prompt_ids.len() >= cache_cap {
         emit_error_with_id(stdout, id, format!(
-            "gemma4 prompt is {} tokens but the sliding-window limit is {} \
-             (long-context >sliding_window not yet validated — see dev log)",
+            "gemma4 prompt is {} tokens but max_seq is {}",
             prompt_ids.len(), cache_cap,
         ));
         return;
