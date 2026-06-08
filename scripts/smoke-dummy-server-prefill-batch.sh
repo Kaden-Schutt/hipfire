@@ -121,9 +121,10 @@ env.update({
     "HIPFIRE_NO_PID_FILE": "1",
     "HIPFIRE_SERVER_PREFILL_BATCH": "1",
     "HIPFIRE_SERVER_PREFILL_BATCH_MAX": "2",
-    "HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS": "25",
-    "HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE": "25",
+    "HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS": "250",
+    "HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE": "250",
     "HIPFIRE_DUMMY_PREFILL_DELAY_MS": "50",
+    "HIPFIRE_DUMMY_GENERATE_DELAY_MS": "8",
 })
 
 proc = subprocess.Popen(
@@ -171,6 +172,11 @@ try:
         "daemon_prefill_plan": prefill.get("daemon_prefill_plan"),
         "pending_requests": prefill.get("pending_requests"),
         "resident_runtime_sessions": prefill.get("resident_runtime_sessions"),
+        "resident_state_limit": prefill.get("resident_state_limit"),
+        "spillable_batch_max": prefill.get("spillable_batch_max"),
+        "spillable_sessions": prefill.get("spillable_sessions"),
+        "state_cache_disk": prefill.get("state_cache_disk"),
+        "disk_spill_allowed": prefill.get("disk_spill_allowed"),
     }
     if checks["runtime_dispatch_skipped_reason"] != "not_skipped":
         raise RuntimeError(f"dummy prefill did not dispatch: {checks}; log={log_path}")
@@ -184,6 +190,14 @@ try:
         raise RuntimeError(f"dummy prefill left pending requests: {checks}; log={log_path}")
     if int(checks["resident_runtime_sessions"] or 0) != 0:
         raise RuntimeError(f"dummy prefill left resident runtime sessions: {checks}; log={log_path}")
+    if int(checks["resident_state_limit"] or 0) != 2:
+        raise RuntimeError(f"dummy prefill reported wrong resident state limit: {checks}; log={log_path}")
+    if int(checks["spillable_batch_max"] or 0) != 2:
+        raise RuntimeError(f"dummy prefill reported wrong spillable batch max: {checks}; log={log_path}")
+    if int(checks["spillable_sessions"] or 0) != 0:
+        raise RuntimeError(f"dummy prefill reported spillable sessions by default: {checks}; log={log_path}")
+    if checks["state_cache_disk"] is not False or checks["disk_spill_allowed"] is not False:
+        raise RuntimeError(f"dummy prefill enabled disk spill by default: {checks}; log={log_path}")
 
     streaming_chat_request(base_url, "stream")
     stream_health = fetch_json(f"{base_url}/health", timeout=10.0)

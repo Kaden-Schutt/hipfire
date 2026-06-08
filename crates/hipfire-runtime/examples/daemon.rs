@@ -369,6 +369,16 @@ impl DummyModelState {
         if !prefill_already_done {
             *counter += Self::prompt_token_count(prompt);
         }
+        let generate_delay_ms = dummy_generate_delay_ms();
+        if generate_delay_ms > 0 {
+            tracing::debug!(
+                request_id = id,
+                session_id,
+                delay_ms = generate_delay_ms,
+                "dummy generate delay"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(generate_delay_ms));
+        }
         let started_at = Instant::now();
         for i in 0..max_tokens {
             let token = format!("dummy:{}", *counter);
@@ -401,6 +411,22 @@ fn dummy_prefill_delay_ms() -> u64 {
         .and_then(|raw| raw.parse::<i64>().ok())
         .unwrap_or(0)
         .clamp(0, 5000) as u64
+}
+
+fn dummy_generate_delay_ms() -> u64 {
+    let max_ms = std::env::var("HIPFIRE_DUMMY_GENERATE_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(8)
+        .clamp(0, 250) as u64;
+    if max_ms == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos % (max_ms + 1)
 }
 
 fn emit_dummy_generate_batch_prefill_ready(
@@ -3326,6 +3352,7 @@ fn main() {
     // because they'd been reparented to PID 1 after their bun parent died).
     // Kept in a binding so the fd lives for the full process lifetime.
     let _daemon_lock = acquire_daemon_lock();
+    hipfire_runtime::logging::init_stderr_logging("daemon");
 
     let mut gpu = match rdna_compute::Gpu::init() {
         Ok(g) => g,
@@ -3411,6 +3438,11 @@ fn main() {
                     .unwrap_or(false);
                 if dummy_requested {
                     dummy_model = Some(DummyModelState::default());
+                    tracing::info!(
+                        model = "hipfire:dummy",
+                        arch = "qwen35_dummy",
+                        "dummy model loaded"
+                    );
                     let line = serde_json::json!({
                         "type": "loaded",
                         "arch": "qwen35_dummy",
@@ -3963,6 +3995,13 @@ fn main() {
                         .get("max_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(512) as usize;
+                    tracing::debug!(
+                        request_id = id,
+                        session_id,
+                        max_tokens,
+                        prefill_already_done,
+                        "dummy generate"
+                    );
                     dummy.generate(
                         &mut stdout,
                         id,
@@ -4420,6 +4459,12 @@ fn main() {
                         continue;
                     }
                     if let Some(dummy) = dummy_model.as_mut() {
+                        tracing::info!(
+                            request_id = envelope.id,
+                            batch_id = envelope.batch_id,
+                            sessions = envelope.session_count,
+                            "dummy generate_batch_prefill"
+                        );
                         if let Err(e) =
                             run_generate_batch_prefill_dummy(dummy, &mut stdout, &envelope)
                         {

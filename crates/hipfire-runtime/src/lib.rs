@@ -32,6 +32,7 @@ pub mod gguf;
 pub mod hfq;
 pub mod host_profile;
 pub mod llama;
+pub mod logging;
 pub mod loop_guard;
 pub mod model_source;
 pub mod mtp_mirror;

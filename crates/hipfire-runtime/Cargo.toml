@@ -63,6 +63,8 @@ base64 = "0.22"
 libc = "0.2"
 rayon = "1"
 twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 hipfire-detect = { path = "../hipfire-detect" }
 # GPT-2 / cl100k pre-tokenization for encode_gpt2_bpe. Reference encoders
 # (HF tokenizers, tiktoken) chunk input via regex into ≤10-byte words/runs,

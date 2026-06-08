@@ -110,6 +110,39 @@ The existing `HIPFIRE_SERVER_PREFILL_BATCH*` knobs can remain as compatibility
 aliases during migration, but new scheduler code should use the
 `HIPFIRE_SCHED_*` names.
 
+### Disk-Eviction Policy Note
+
+The scheduler should eventually separate execution batch limits from state
+residency limits. A selected prefill batch may be safe to execute at a larger
+size than the number of completed session states we want to keep resident.
+
+Planned distinction:
+
+- `prefill_batch_max`: maximum sessions sent through one
+  `generate_batch_prefill` call.
+- `resident_state_max`: maximum completed session states kept resident after
+  prefill.
+- `spillable_batch_max`: larger low-priority/background/opportunistic batch
+  limit when disk state-cache spill is enabled.
+
+Disk spill should be priority-gated. Realtime, high, and default interactive
+requests should remain resident-only by default. Background, bulk, and
+opportunistic requests may opt into larger batches where overflow states are
+eligible for disk spill or recompute. This keeps interactive latency stable
+while still allowing low-priority work to harvest larger prefill batches.
+
+Candidate future controls:
+
+```text
+HIPFIRE_SCHED_RESIDENT_STATE_MAX=8
+HIPFIRE_SCHED_SPILLABLE_BATCH_MAX=32
+HIPFIRE_SCHED_STATE_CACHE_DISK_MIN_PRIORITY=128
+```
+
+The selected batch plan and `/health.prefill_batch` telemetry should surface
+the effective resident limit, spillable session count, and disk-cache decision
+so large low-priority batches are auditable rather than implicit.
+
 ## Scheduler Data Model
 
 ```text

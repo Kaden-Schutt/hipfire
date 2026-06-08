@@ -66,6 +66,8 @@ describe("scheduler policy", () => {
       HIPFIRE_SERVER_PREFILL_BATCH_MAX: "2",
     });
     expect(policy.maxBatchSize).toBe(2);
+    expect(policy.residentStateMax).toBe(2);
+    expect(policy.spillableBatchMax).toBe(2);
   });
 
   test("legacy batch-wait env maps to interactive and backgrounds to a stable default", () => {
@@ -89,6 +91,58 @@ describe("scheduler policy", () => {
     expect(policy.coalesceWaitMs).toBe(80);
     expect(policy.targetPairTokens).toBe(512);
     expect(policy.maxProcessingMs).toBeGreaterThan(schedulerPolicyForPriority(128, {}).maxProcessingMs);
+  });
+
+  test("state residency defaults to the effective class batch limit", () => {
+    const realtime = schedulerPolicyForPriority(0, {
+      HIPFIRE_SCHED_PREFILL_BATCH_MAX: "16",
+    });
+    expect(realtime.maxBatchSize).toBe(1);
+    expect(realtime.residentStateMax).toBe(1);
+    expect(realtime.spillableBatchMax).toBe(1);
+
+    const high = schedulerPolicyForPriority(1, {
+      HIPFIRE_SCHED_PREFILL_BATCH_MAX: "16",
+    });
+    expect(high.maxBatchSize).toBe(4);
+    expect(high.residentStateMax).toBe(4);
+    expect(high.spillableBatchMax).toBe(4);
+  });
+
+  test("disk spill is priority gated when state-cache disk is enabled", () => {
+    expect(schedulerPolicyForPriority(64, {
+      HIPFIRE_SCHED_STATE_CACHE_DISK: "1",
+    }).diskSpillAllowed).toBe(false);
+
+    expect(schedulerPolicyForPriority(128, {
+      HIPFIRE_SCHED_STATE_CACHE_DISK: "1",
+    }).diskSpillAllowed).toBe(true);
+
+    expect(schedulerPolicyForPriority(255, {
+      HIPFIRE_SERVER_PREFILL_BATCH_STATE_CACHE_DISK: "true",
+    }).diskSpillAllowed).toBe(true);
+  });
+
+  test("state residency and spillable batch limits are configurable and clamped", () => {
+    const policy = schedulerPolicyForPriority(64, {
+      HIPFIRE_SCHED_PREFILL_BATCH_MAX: "8",
+      HIPFIRE_SCHED_RESIDENT_STATE_MAX: "3",
+      HIPFIRE_SCHED_SPILLABLE_BATCH_MAX: "12",
+      HIPFIRE_SCHED_STATE_CACHE_DISK: "1",
+      HIPFIRE_SCHED_STATE_CACHE_DISK_MIN_PRIORITY: "64",
+    });
+    expect(policy.maxBatchSize).toBe(8);
+    expect(policy.residentStateMax).toBe(3);
+    expect(policy.spillableBatchMax).toBe(12);
+    expect(policy.diskSpillMinPriority).toBe(64);
+    expect(policy.diskSpillAllowed).toBe(true);
+
+    const clamped = schedulerPolicyForPriority(64, {
+      HIPFIRE_SCHED_RESIDENT_STATE_MAX: "80",
+      HIPFIRE_SCHED_SPILLABLE_BATCH_MAX: "2",
+    });
+    expect(clamped.residentStateMax).toBe(64);
+    expect(clamped.spillableBatchMax).toBe(64);
   });
 });
 

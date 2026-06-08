@@ -1934,6 +1934,12 @@ async function serve(port: number, host: string) {
   let lastPrefillTokens = 0;
   let lastPrefillMs = 0;
   let lastPrefillTokS = 0;
+  let lastResidentStateLimit = 0;
+  let lastSpillableBatchMax = 0;
+  let lastSpillableSessions = 0;
+  let lastStateCacheDisk = false;
+  let lastStateCacheDiskMinPriority = 128;
+  let lastDiskSpillAllowed = false;
   let lastBatchRuntimeSkippedReason = "not_enabled";
   let lastBatchFallbackReason = "idle";
   let lastBatchExecutionMode: BatchExecutionMode = "disabled";
@@ -2282,6 +2288,23 @@ async function serve(port: number, host: string) {
   };
 
   let lastSelectedBatchSize = 0;
+  const recordPrefillStatePolicy = (
+    residentStateLimit: number,
+    spillableBatchMax: number,
+    selectedSize: number,
+    stateCacheDisk: boolean,
+    stateCacheDiskMinPriority: number,
+    diskSpillAllowed: boolean,
+  ) => {
+    lastResidentStateLimit = Math.max(0, Math.floor(residentStateLimit));
+    lastSpillableBatchMax = Math.max(lastResidentStateLimit, Math.floor(spillableBatchMax));
+    lastSpillableSessions = diskSpillAllowed
+      ? Math.max(0, Math.floor(selectedSize) - lastResidentStateLimit)
+      : 0;
+    lastStateCacheDisk = stateCacheDisk;
+    lastStateCacheDiskMinPriority = Math.max(0, Math.min(255, Math.floor(stateCacheDiskMinPriority)));
+    lastDiskSpillAllowed = diskSpillAllowed;
+  };
   const recordPrefillBatchDispatch = (
     selectedSize: number,
     prefillTokens: number,
@@ -2450,6 +2473,12 @@ async function serve(port: number, host: string) {
                   queueSize: prefillQueueSize,
                   pendingRequests: pendingPrefillRequests.size,
                   residentRuntimeSessions: residentRuntimeSessions.size,
+                  residentStateLimit: lastResidentStateLimit,
+                  spillableBatchMax: lastSpillableBatchMax,
+                  spillableSessions: lastSpillableSessions,
+                  stateCacheDisk: lastStateCacheDisk,
+                  stateCacheDiskMinPriority: lastStateCacheDiskMinPriority,
+                  diskSpillAllowed: lastDiskSpillAllowed,
                   generateBatchPrefillCapability,
                   generateBatchPrefillCapabilityReason,
                   queueWaitReason: lastPrefillQueueWaitReason,
@@ -3494,15 +3523,36 @@ async function serve(port: number, host: string) {
           const batchPolicy = requestBatchPolicy ?? {
             priority: serverPrefillBatch.priority,
             maxBatchSize: serverPrefillBatch.maxBatch,
+            residentStateMax: serverPrefillBatch.maxBatch,
+            spillableBatchMax: serverPrefillBatch.maxBatch,
+            diskSpillAllowed: false,
+            diskSpillMinPriority: 128,
             coalesceWaitMs: serverPrefillBatch.waitMs,
             targetPairTokens: serverPrefillBatch.targetPairTokens,
             maxProcessingMs: serverPrefillBatch.maxProcessingMs,
           };
+          const spillableSessions = batchPolicy.diskSpillAllowed
+            ? Math.max(0, selectedBatchSize - batchPolicy.residentStateMax)
+            : 0;
+          recordPrefillStatePolicy(
+            batchPolicy.residentStateMax,
+            batchPolicy.spillableBatchMax,
+            selectedBatchSize,
+            serverPrefillBatchControls.stateCacheDisk,
+            batchPolicy.diskSpillMinPriority,
+            batchPolicy.diskSpillAllowed,
+          );
           genParams.server_prefill_batch = {
             eligible: prefillBatchGate.eligible,
             reason: prefillBatchGate.reason,
             priority: batchPolicy.priority,
             max_batch: batchPolicy.maxBatchSize,
+            resident_state_limit: batchPolicy.residentStateMax,
+            spillable_batch_max: batchPolicy.spillableBatchMax,
+            spillable_sessions: spillableSessions,
+            state_cache_disk: serverPrefillBatchControls.stateCacheDisk,
+            state_cache_disk_min_priority: batchPolicy.diskSpillMinPriority,
+            disk_spill_allowed: batchPolicy.diskSpillAllowed,
             wait_ms: batchPolicy.coalesceWaitMs,
             target_pair_tokens: batchPolicy.targetPairTokens,
             max_processing_ms: batchPolicy.maxProcessingMs,

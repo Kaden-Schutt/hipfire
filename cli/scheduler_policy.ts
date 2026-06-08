@@ -31,6 +31,10 @@ export interface SchedulerPriorityPolicy {
   priorityClass: SchedulerPriorityClass;
   coalesceWaitMs: number;
   maxBatchSize: number;
+  residentStateMax: number;
+  spillableBatchMax: number;
+  diskSpillAllowed: boolean;
+  diskSpillMinPriority: number;
   targetPairTokens: number;
   maxProcessingMs: number;
 }
@@ -38,6 +42,10 @@ export interface SchedulerPriorityPolicy {
 export interface SchedulerPolicyEnv {
   HIPFIRE_SCHED_PRIORITY_DEFAULT?: string;
   HIPFIRE_SCHED_PREFILL_BATCH_MAX?: string;
+  HIPFIRE_SCHED_RESIDENT_STATE_MAX?: string;
+  HIPFIRE_SCHED_SPILLABLE_BATCH_MAX?: string;
+  HIPFIRE_SCHED_STATE_CACHE_DISK?: string;
+  HIPFIRE_SCHED_STATE_CACHE_DISK_MIN_PRIORITY?: string;
   HIPFIRE_SCHED_PREFILL_WAIT_MS_REALTIME?: string;
   HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE?: string;
   HIPFIRE_SCHED_PREFILL_WAIT_MS_BACKGROUND?: string;
@@ -127,6 +135,29 @@ export function schedulerPolicyForPriority(
       8,
     )),
   );
+  const diskSpillMinPriority = clampSchedulerPriority(parseInteger(
+    env.HIPFIRE_SCHED_STATE_CACHE_DISK_MIN_PRIORITY,
+    128,
+  ));
+  const diskSpillAllowed =
+    parseServerPrefillPolicyControls(env).stateCacheDisk &&
+    p >= diskSpillMinPriority;
+  const statePolicyForMax = (effectiveMaxBatchSize: number) => {
+    const residentStateMax = Math.max(
+      1,
+      Math.min(64, parseInteger(env.HIPFIRE_SCHED_RESIDENT_STATE_MAX, effectiveMaxBatchSize)),
+    );
+    const spillableBatchMax = Math.max(
+      residentStateMax,
+      Math.min(64, parseInteger(env.HIPFIRE_SCHED_SPILLABLE_BATCH_MAX, effectiveMaxBatchSize)),
+    );
+    return {
+      residentStateMax,
+      spillableBatchMax,
+      diskSpillAllowed,
+      diskSpillMinPriority,
+    };
+  };
   const legacyInteractiveWait = env.HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS;
   const realtimeWait = Math.max(0, parseInteger(env.HIPFIRE_SCHED_PREFILL_WAIT_MS_REALTIME, 0));
   const interactiveWait = Math.max(
@@ -156,24 +187,29 @@ export function schedulerPolicyForPriority(
         priorityClass,
         coalesceWaitMs: realtimeWait,
         maxBatchSize: 1,
+        ...statePolicyForMax(1),
         targetPairTokens: 1,
         maxProcessingMs: 25,
       };
-    case "high":
+    case "high": {
+      const highMaxBatchSize = Math.min(maxBatchSize, 4);
       return {
         priority: p,
         priorityClass,
         coalesceWaitMs: Math.min(interactiveWait, 2),
-        maxBatchSize: Math.min(maxBatchSize, 4),
+        maxBatchSize: highMaxBatchSize,
+        ...statePolicyForMax(highMaxBatchSize),
         targetPairTokens: 32,
         maxProcessingMs: 50,
       };
+    }
     case "interactive":
       return {
         priority: p,
         priorityClass,
         coalesceWaitMs: interactiveWait,
         maxBatchSize,
+        ...statePolicyForMax(maxBatchSize),
         targetPairTokens: 64,
         maxProcessingMs: 100,
       };
@@ -183,6 +219,7 @@ export function schedulerPolicyForPriority(
         priorityClass,
         coalesceWaitMs: backgroundWait,
         maxBatchSize,
+        ...statePolicyForMax(maxBatchSize),
         targetPairTokens: 128,
         maxProcessingMs: 250,
       };
@@ -192,6 +229,7 @@ export function schedulerPolicyForPriority(
         priorityClass,
         coalesceWaitMs: backgroundWait * 2,
         maxBatchSize,
+        ...statePolicyForMax(maxBatchSize),
         targetPairTokens: opportunisticPairTokens,
         maxProcessingMs: 500,
       };
@@ -201,6 +239,7 @@ export function schedulerPolicyForPriority(
         priorityClass,
         coalesceWaitMs: opportunisticBackgroundWait * 4,
         maxBatchSize,
+        ...statePolicyForMax(maxBatchSize),
         targetPairTokens: opportunisticPairTokens,
         maxProcessingMs: 1000,
       };

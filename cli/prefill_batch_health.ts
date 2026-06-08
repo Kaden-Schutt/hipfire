@@ -33,6 +33,12 @@ export interface PrefillBatchHealthInputs {
   queueSize: number;
   pendingRequests?: number;
   residentRuntimeSessions?: number;
+  residentStateLimit?: number;
+  spillableBatchMax?: number;
+  spillableSessions?: number;
+  stateCacheDisk?: boolean;
+  stateCacheDiskMinPriority?: number;
+  diskSpillAllowed?: boolean;
   generateBatchPrefillCapability: GenerateBatchPrefillCapability;
   generateBatchPrefillCapabilityReason: string;
   queueWaitReason: PrefillQueueWaitReason;
@@ -63,6 +69,12 @@ export interface PrefillBatchHealthPayload {
   queue_size?: number;
   pending_requests?: number;
   resident_runtime_sessions?: number;
+  resident_state_limit?: number;
+  spillable_batch_max?: number;
+  spillable_sessions?: number;
+  state_cache_disk?: boolean;
+  state_cache_disk_min_priority?: number;
+  disk_spill_allowed?: boolean;
   generate_batch_prefill_capability?: GenerateBatchPrefillCapability;
   generate_batch_prefill_capability_reason?: string;
   queue_wait_reason?: PrefillQueueWaitReason;
@@ -144,6 +156,12 @@ export function buildPrefillBatchHealthPayload(
     queue_size: input.queueSize,
     pending_requests: input.pendingRequests ?? 0,
     resident_runtime_sessions: input.residentRuntimeSessions ?? 0,
+    resident_state_limit: input.residentStateLimit ?? 0,
+    spillable_batch_max: input.spillableBatchMax ?? input.residentStateLimit ?? 0,
+    spillable_sessions: input.spillableSessions ?? 0,
+    state_cache_disk: input.stateCacheDisk ?? false,
+    state_cache_disk_min_priority: input.stateCacheDiskMinPriority ?? 128,
+    disk_spill_allowed: input.diskSpillAllowed ?? false,
     generate_batch_prefill_capability: input.generateBatchPrefillCapability,
     generate_batch_prefill_capability_reason: input.generateBatchPrefillCapabilityReason,
     queue_wait_reason: input.queueWaitReason,
