@@ -9,13 +9,15 @@ extern "C" __global__ void kv_cache_write_q8_0(
     const float* __restrict__ src,       // [kv_dim] FP32 KV vector
     const int* __restrict__ pos_buf,
     int n_kv_heads,
-    int head_dim
+    int head_dim,
+    int cache_capacity   // ring-buffer size; 0 = no wrap (direct pos addressing)
 ) {
     // Grid: [n_kv_heads × blocks_per_head, 1, 1]. Block: [32, 1, 1].
     // Each threadblock quantizes one Q8_0 block (32 elements).
     const int gid = blockIdx.x;
     const int tid = threadIdx.x;  // 0..31
     const int pos = pos_buf[0];
+    const int slot = (cache_capacity > 0) ? (pos % cache_capacity) : pos;
 
     const int blocks_per_head = head_dim / 32;
     const int total_blocks = n_kv_heads * blocks_per_head;
@@ -37,8 +39,8 @@ extern "C" __global__ void kv_cache_write_q8_0(
     int q = __float2int_rn(val * inv_scale);
     q = max(-127, min(127, q));
 
-    // Output: pos * total_blocks * 34 + gid * 34
-    unsigned char* out = dst + (size_t)pos * total_blocks * 34 + gid * 34;
+    // Output: slot * total_blocks * 34 + gid * 34
+    unsigned char* out = dst + (size_t)slot * total_blocks * 34 + gid * 34;
 
     // Thread 0 writes the f16 scale
     if (tid == 0) {

@@ -1328,6 +1328,7 @@ impl Gpu {
     }
 
     /// Write KV vector to Q8_0 quantized cache (same format as GGML Q8_0).
+    /// Write a single KV row in Q8_0 format (cap=0 shorthand of `_cap`).
     pub fn kv_cache_write_q8_0(
         &mut self,
         dst: &GpuTensor,
@@ -1335,6 +1336,21 @@ impl Gpu {
         pos_buf: &DeviceBuffer,
         n_kv_heads: usize,
         head_dim: usize,
+    ) -> HipResult<()> {
+        self.kv_cache_write_q8_0_cap(dst, src, pos_buf, n_kv_heads, head_dim, 0)
+    }
+
+    /// Write a single KV row in Q8_0 format with optional ring-buffer wrapping.
+    /// `cache_capacity > 0` enables `slot = pos % cap` (gemma4 sliding layers);
+    /// `0` = identity (all other callers).
+    pub fn kv_cache_write_q8_0_cap(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_kv_heads: usize,
+        head_dim: usize,
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -1347,12 +1363,14 @@ impl Gpu {
         let p = pos_buf.as_ptr();
         let nkv = n_kv_heads as i32;
         let hd = head_dim as i32;
+        let cc = cache_capacity as i32;
         let mut params: Vec<*mut c_void> = vec![
             &d as *const _ as *mut c_void,
             &s as *const _ as *mut c_void,
             &p as *const _ as *mut c_void,
             &nkv as *const _ as *mut c_void,
             &hd as *const _ as *mut c_void,
+            &cc as *const _ as *mut c_void,
         ];
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
         let bytes = crate::profile::kv_cache_write_q8_0_bytes(n_kv_heads, head_dim);
@@ -1371,6 +1389,7 @@ impl Gpu {
                 b.push_ptr(p);
                 b.push_i32(nkv);
                 b.push_i32(hd);
+                b.push_i32(cc);
                 b
             },
         );
@@ -1886,6 +1905,7 @@ impl Gpu {
     /// Fused K+V write for asym3: K at 3-bit rotated (RotorQuant "planar3"), V at Q8_0.
     /// Best-quality rotated K per RotorQuant paper. Head geometry: 32 threads × 8
     /// values = 256 dims single-pass. 100 bytes/head for hd=256.
+    /// Fused asym3 K+V write (cap=0 shorthand of `_cap`).
     pub fn kv_cache_write_asym3_fused(
         &mut self,
         k_dst: &GpuTensor,
@@ -1897,6 +1917,24 @@ impl Gpu {
         sin_theta: &GpuTensor,
         n_kv_heads: usize,
         head_dim: usize,
+    ) -> HipResult<()> {
+        self.kv_cache_write_asym3_fused_cap(k_dst, v_dst, k_src, v_src, pos_buf,
+            cos_theta, sin_theta, n_kv_heads, head_dim, 0)
+    }
+
+    /// Fused asym3 K+V write with optional ring-buffer wrapping.
+    pub fn kv_cache_write_asym3_fused_cap(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_givens4_kernel(
@@ -1913,6 +1951,7 @@ impl Gpu {
             let mut stp = sin_theta.buf.as_ptr();
             let mut nkv = n_kv_heads as i32;
             let mut hd = head_dim as i32;
+            let mut cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut kdp as *mut _ as *mut c_void,
                 &mut ksp as *mut _ as *mut c_void,
@@ -1921,6 +1960,7 @@ impl Gpu {
                 &mut stp as *mut _ as *mut c_void,
                 &mut nkv as *mut _ as *mut c_void,
                 &mut hd as *mut _ as *mut c_void,
+                &mut cc as *mut _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
             unsafe {
@@ -1934,7 +1974,7 @@ impl Gpu {
                 )?;
             }
         }
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        self.kv_cache_write_q8_0_cap(v_dst, v_src, pos_buf, n_kv_heads, head_dim, cache_capacity)
     }
 
     /// Launch the fwht3 rotated-centroid write kernel on an arbitrary KV buffer.
@@ -3791,7 +3831,31 @@ impl Gpu {
         Ok(())
     }
 
+    /// Asym3 flash attention (cap=0 shorthand of `_cap`).
     pub fn attention_flash_asym3(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        kv_window: usize,
+    ) -> HipResult<()> {
+        self.attention_flash_asym3_cap(q, k_cache, v_cache, out, pos_buf,
+            cos_theta, sin_theta, seq_len_hint, n_heads, n_kv_heads, head_dim,
+            max_seq, partials, kv_window, 0)
+    }
+
+    /// Asym3 flash attention with optional ring-buffer wrapping.
+    pub fn attention_flash_asym3_cap(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -3809,6 +3873,9 @@ impl Gpu {
         // Sliding-window lookback. 0 = full causal (qwen35 and other callers).
         // Gemma 4 sliding layers pass `sliding_window` (1024).
         kv_window: usize,
+        // Ring-buffer cache capacity. 0 = no wrap. Gemma 4 sliding layers pass
+        // `sliding_window`; all other callers pass 0.
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -3843,6 +3910,7 @@ impl Gpu {
             let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
             let mut kw = kv_window as i32;
+            let mut cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -3859,6 +3927,7 @@ impl Gpu {
                 &mut ts as *mut _ as *mut c_void,
                 &mut mt as *mut _ as *mut c_void,
                 &mut kw as *mut _ as *mut c_void,
+                &mut cc as *mut _ as *mut c_void,
             ];
             unsafe {
                 self.hip.launch_kernel(
