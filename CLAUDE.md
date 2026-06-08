@@ -402,15 +402,53 @@ semantically load-bearing. See:
 - `crates/engine/examples/encode_prompt.rs` — verification utility
 - commit 9a2c667 — root cause + bench data behind the default flip
 
-**Canonical bench config (post-2026-04-26) for 27B-3.5 LRU code DFlash:**
+**Canonical DFlash bench config (post-2026-06-02). The LRU prompt is RETIRED
+— do NOT use it for DFlash perf (its τ is low/noisy; it's "dead").** The blessed
+winning config comes from localmaxxing; use the committed `merge_sort` prompt:
 ```
-max=256 --no-chatml --kv-mode q8
-PEP-8 strict prompt (\n\n\n between top-level defs)
-prompt_normalize=true (default)
+./target/release/examples/dflash_spec_demo \
+  --target ~/.hipfire/models/qwen3.6-27b-awq.mq4 \
+  --draft  ~/.hipfire/models/qwen36-27b-dflash-mq4.hf4 \
+  --prompt-file benchmarks/prompts/merge_sort_thinking_off.txt \
+  --max 256 --temp 0.0 --no-chatml --kv-mode q8 --ctx 4096
 ```
+Reference (localmaxxing, Radeon AI PRO R9700): **254.8 tok/s**, prompt md5
+253c7ac5... . τ≈11.4, accept ≈76%, block locks at B=16. Wrong/unstructured
+prompts collapse τ to 2.5–5.5 (the prompt-structure τ sensitivity above — that's
+WHY the prompt is pinned, not the LRU one).
+
+**FIXED (2026-06-02, branch `fix/dflash-wmma-lmhead` @ 9b1821a3 off origin/master
+→ 174 to 254 tok/s, byte-identical output): one-line gate bug.** In gemm.rs,
+`gemm_hfq4g256_batched_lmhead` / `gemm_hfq6g256_batched_lmhead` gated the WMMA
+residual path on `has_wmma_w32()` alone (the gfx11 cap, FALSE on gfx12/R9700), so
+gfx1201 fell through to the scalar `gemm_hfq4g256` lm-head despite the body
+already handling gfx12. The sibling MQ4-Lloyd gate already used `(has_wmma_w32()
+|| has_wmma_w32_gfx12())`; the two lm-head gates were missed. Fix = broaden both
+to match. (Root cause: the gfx12-WMMA-lmhead work on `feat/dense-dflash-perfmaxx`
+— 6 commits ahead, never landed — was dropped by the codex #352 reland ed7b9656.)
+Original analysis below kept for the diagnostic trail.
+
+**RESOLVED (2026-06-02): the 254-vs-174 tok/s gap is a BUILD difference — the
+DFlash WMMA-lm-head perfmaxx is UNMERGED on `feat/dense-dflash-perfmaxx`, not in
+origin/master.** Same R9700, same models (target md5 e42a489e, draft 204c4c4c),
+BIT-IDENTICAL τ=11.3846 → pure kernel-throughput gap. Built dflash_spec_demo on
+`feat/dense-dflash-perfmaxx` (747c3759, contains 3730b58b) → reproduces 254 tok/s;
+origin/master(+TP) = 174. rocprof GPU-active time (not wall — rocprof inflates
+wall): master 447 ms vs perfmaxx 321 ms (−28%). The culprit kernel: master runs
+the DFlash lm-head (over the 248k vocab) as the NON-WMMA `gemm_hfq4g256` (161 ms,
+its single biggest kernel); perfmaxx routes it through gfx12 WMMA
+(`gemm_hfq4g256_residual_wmma_gfx12`), eliminating that 161 ms. Commits
+ca30ca21/3730b58b/480257d5 ("enable hfq4 lmhead wmma on gfx12"). The
+`HIPFIRE_LM_HEAD_WMMA`/`_OVERWRITE` flags EXIST on master but are NO-OP there (the
+impl isn't merged) — setting them doesn't help; you need the perfmaxx branch.
+FALSE LEADS ruled out en route (don't re-chase): NOT DPM clock (forcing `high`
+did nothing), NOT sync hipMemcpy/host-gaps (HIP-API counts identical between
+builds), NOT graph capture (verify graph captures in both). Implication: BOTH the
+DFlash WMMA-lmhead perfmaxx AND the TP work are unmerged on master — production
+DFlash(+TP) perf needs them reconciled onto master.
 DFlash perf gates must use `q8` or an FWHT KV mode. Do not use `asym*` KV modes
 for DFlash perf/gate claims; older pre-q8 DFlash perf numbers are historical
-only. Drift >5% from the current q8/max256 baseline is a regression
+only. Drift >5% from this q8/max256/merge_sort baseline is a regression
 — start with `git bisect` against this rule, not against session-recalled
 "peak" numbers.
 
