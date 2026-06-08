@@ -86,6 +86,19 @@ fn fused_qk_enabled() -> bool {
     )
 }
 
+/// Master switch for the fused sandwich-postnorm + residual-add path
+/// (`rmsnorm_residual_add_f32`, gemma4 L4). Fuses post_attention_layernorm and
+/// post_feedforward_layernorm each from 3 launches (rmsnorm + memcpy(x<-res) +
+/// add_inplace) down to 1, removing ~96 tiny launches/token. Default ON; opt
+/// out with `HIPFIRE_GEMMA4_FUSED_POSTNORM=0`. Not byte-identical (the residual
+/// add rounds inside the norm kernel) -- coherence-validated.
+fn fused_postnorm_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_GEMMA4_FUSED_POSTNORM").ok().as_deref(),
+        Some("0") | Some("off") | Some("false")
+    )
+}
+
 /// q = q_proj(x); k = k_proj(x). Fused into one launch via `fused_gate_up_q8_0`
 /// when both are Q8_0 (same input `x`); else two `weight_gemv` calls.
 fn qk_proj(
@@ -717,15 +730,28 @@ fn finish_attn_and_ffn(
     weight_gemv(gpu, tail.o_proj, &state.attn_out, &state.tmp)
         .map_err(|e| format!("gemma4: o_proj: {e}"))?;
 
-    // Sandwich post-attn norm (in-place on tmp).
-    gpu.rmsnorm_f32(&state.tmp, tail.post_attention_layernorm, &state.tmp, eps)
-        .map_err(|e| format!("gemma4: post_attn rmsnorm: {e:?}"))?;
+    // Sandwich post-attn norm + residual add: x = residual + post_attn_norm(tmp).
+    // Fused (L4) into one launch; eager fallback = rmsnorm + memcpy + add.
+    if fused_postnorm_enabled() {
+        gpu.rmsnorm_residual_add_f32(
+            &state.tmp,
+            tail.post_attention_layernorm,
+            &state.residual,
+            &state.x,
+            eps,
+        )
+        .map_err(|e| format!("gemma4: fused post_attn norm+residual: {e:?}"))?;
+    } else {
+        // Sandwich post-attn norm (in-place on tmp).
+        gpu.rmsnorm_f32(&state.tmp, tail.post_attention_layernorm, &state.tmp, eps)
+            .map_err(|e| format!("gemma4: post_attn rmsnorm: {e:?}"))?;
 
-    // x = residual + tmp.
-    gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
-        .map_err(|e| format!("gemma4: reset x: {e:?}"))?;
-    gpu.add_inplace_f32(&state.x, &state.tmp)
-        .map_err(|e| format!("gemma4: attn residual add: {e:?}"))?;
+        // x = residual + tmp.
+        gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
+            .map_err(|e| format!("gemma4: reset x: {e:?}"))?;
+        gpu.add_inplace_f32(&state.x, &state.tmp)
+            .map_err(|e| format!("gemma4: attn residual add: {e:?}"))?;
+    }
 
     // residual = x (FFN residual stream).
     gpu.memcpy_dtod_auto(&state.residual.buf, &state.x.buf, dim_bytes)
@@ -779,15 +805,28 @@ fn finish_attn_and_ffn(
     weight_gemv(gpu, tail.down_proj, &state.ffn_hidden, &state.ffn_out)
         .map_err(|e| format!("gemma4: down_proj: {e}"))?;
 
-    // Sandwich post-FFN norm (ffn_out → tmp).
-    gpu.rmsnorm_f32(&state.ffn_out, tail.post_feedforward_layernorm, &state.tmp, eps)
-        .map_err(|e| format!("gemma4: post_ffn rmsnorm: {e:?}"))?;
+    // Sandwich post-FFN norm + residual add: x = residual + post_ffn_norm(ffn_out).
+    // Fused (L4) into one launch; eager fallback = rmsnorm + memcpy + add.
+    if fused_postnorm_enabled() {
+        gpu.rmsnorm_residual_add_f32(
+            &state.ffn_out,
+            tail.post_feedforward_layernorm,
+            &state.residual,
+            &state.x,
+            eps,
+        )
+        .map_err(|e| format!("gemma4: fused post_ffn norm+residual: {e:?}"))?;
+    } else {
+        // Sandwich post-FFN norm (ffn_out → tmp).
+        gpu.rmsnorm_f32(&state.ffn_out, tail.post_feedforward_layernorm, &state.tmp, eps)
+            .map_err(|e| format!("gemma4: post_ffn rmsnorm: {e:?}"))?;
 
-    // x = residual + tmp.
-    gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
-        .map_err(|e| format!("gemma4: reset x (ffn): {e:?}"))?;
-    gpu.add_inplace_f32(&state.x, &state.tmp)
-        .map_err(|e| format!("gemma4: ffn residual add: {e:?}"))?;
+        // x = residual + tmp.
+        gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
+            .map_err(|e| format!("gemma4: reset x (ffn): {e:?}"))?;
+        gpu.add_inplace_f32(&state.x, &state.tmp)
+            .map_err(|e| format!("gemma4: ffn residual add: {e:?}"))?;
+    }
 
     // Learned per-layer scalar multiplier (no-op = 1.0 when tensor absent).
     if tail.layer_scalar_host != 1.0 {

@@ -77,6 +77,11 @@ fn main() {
                 prompt = argv[i + 1].clone();
                 i += 2;
             }
+            "--prompt-file" => {
+                prompt = std::fs::read_to_string(&argv[i + 1])
+                    .expect("--prompt-file: read");
+                i += 2;
+            }
             "--token-ids" => {
                 token_ids = Some(
                     argv[i + 1]

@@ -111,6 +111,72 @@ impl Gpu {
         result
     }
 
+    /// Fused sandwich post-norm + residual-add (gemma4 L4):
+    ///   out[r,i] = residual[r,i] + rmsnorm(x[r,i], weight[i])
+    /// Collapses the (rmsnorm_f32 -> memcpy(out<-residual) -> add_inplace_f32)
+    /// 3-launch pattern into ONE launch. One block per row. `out` MUST NOT alias
+    /// `x` (read after the reduction) or `residual`; gemma4 uses distinct
+    /// scratch (x=tmp/ffn_out, residual=residual, out=state.x). hipGraph-safe
+    /// via launch_maybe_blob. Not byte-identical to the unfused path (the
+    /// residual add rounds in the same kernel) -- coherence-validated.
+    pub fn rmsnorm_residual_add_f32(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        residual: &GpuTensor,
+        out: &GpuTensor,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rmsnorm_residual_add",
+            kernels::RMSNORM_RESIDUAL_ADD_SRC,
+            "rmsnorm_residual_add_f32",
+        )?;
+
+        let batch = if x.shape.len() > 1 { x.shape[0] } else { 1 };
+        let n = x.shape.last().copied().unwrap() as i32;
+
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = weight.buf.as_ptr();
+        let res_ptr = residual.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_val = n;
+        let eps_val = eps;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &res_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &eps_val as *const _ as *mut c_void,
+        ];
+
+        let block_size = 256u32.min(n as u32);
+        let shared_mem = block_size * 4;
+
+        let bytes = crate::profile::rmsnorm_bytes(batch * n as usize);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "rmsnorm", "rmsnorm_residual_add_f32", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "rmsnorm_residual_add_f32",
+            [batch as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr); b.push_ptr(w_ptr); b.push_ptr(res_ptr);
+                b.push_ptr(out_ptr); b.push_i32(n_val); b.push_f32(eps_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// c = a + b (element-wise)
     pub fn add_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
