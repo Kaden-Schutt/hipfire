@@ -18,7 +18,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, weight_gemm, WeightTensor, EmbeddingFormat};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
-use hipfire_dispatch::pipeline::{execute_steps, Step};
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::context::DispatchCtx;
@@ -1715,7 +1715,11 @@ fn forward_scratch_inner(
     }
 
     // 5) LM head → logits (reads tied embed bytes via lm_head.buf alias).
-    weight_gemv(gpu, &weights.lm_head, &scratch.tmp, &scratch.logits)?;
+    let ctx = DispatchCtx::new(gpu);
+    let wr_lm = weights.lm_head.dispatch_ref();
+    execute_steps(gpu, &ctx, &[
+        Step::Gemv { w: &wr_lm, input: GemvInput::Raw(&scratch.tmp), out: &scratch.logits },
+    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
 
     // 6) Final logit softcap (Gemma 4): logits = tanh(logits / cap) * cap.
     if config.final_logit_softcapping > 0.0 {
@@ -1824,14 +1828,19 @@ fn sliding_layer_decode_impl(
     }
     let _dump_on = std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") && (pos == 0 || pos == 1) && kv_layer_idx == 0;
     if _dump_on { dbg_dump(gpu, "[v1] L0 input scratch.x", &scratch.x, dim); }
+    let ctx = DispatchCtx::new(gpu);
 
     // tmp = input_layernorm(x)
     gpu.rmsnorm_f32(&scratch.x, &lw.input_layernorm, &scratch.tmp, config.norm_eps)?;
     if _dump_on { dbg_dump(gpu, "[v1] L0 after input_norm", &scratch.tmp, dim); }
 
     // Q/K/V projections: q[n_heads*head_dim], k/v[n_kv*head_dim].
-    weight_gemv(gpu, &lw.q_proj, &scratch.tmp, &scratch.q)?;
-    weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
+    let wr_q = lw.q_proj.dispatch_ref();
+    let wr_k = lw.k_proj.dispatch_ref();
+    execute_steps(gpu, &ctx, &[
+        Step::Gemv { w: &wr_q, input: GemvInput::Raw(&scratch.tmp), out: &scratch.q },
+        Step::Gemv { w: &wr_k, input: GemvInput::Raw(&scratch.tmp), out: &scratch.k },
+    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     weight_gemv(gpu, &lw.v_proj, &scratch.tmp, &scratch.v)?;
     if _dump_on {
         dbg_dump(gpu, "[v1] L0 after q_proj", &scratch.q, n_heads * head_dim);
@@ -1929,7 +1938,6 @@ fn sliding_layer_decode_impl(
             block_cols: 0,
             output: &scratch.attn_out,
         };
-        let ctx = DispatchCtx::new(gpu);
         execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])?;
     }
     // Dump attention output regardless of KV cache branch.
@@ -1947,7 +1955,10 @@ fn sliding_layer_decode_impl(
     }
 
     // o_proj → tmp (reuse tmp, overwriting input_layernorm output).
-    weight_gemv(gpu, &lw.o_proj, &scratch.attn_out, &scratch.tmp)?;
+    let wr_o = lw.o_proj.dispatch_ref();
+    execute_steps(gpu, &ctx, &[
+        Step::Gemv { w: &wr_o, input: GemvInput::Raw(&scratch.attn_out), out: &scratch.tmp },
+    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     if _dump_on { dbg_dump(gpu, "[v1] L0 after o_proj", &scratch.tmp, dim); }
 
     // Sandwich post-attn norm (in-place on tmp).
@@ -1975,8 +1986,12 @@ fn sliding_layer_decode_impl(
     if _dump_on { dbg_dump(gpu, "[v1] L0 after pre_ffn_norm", &scratch.tmp, dim); }
 
     // SwiGLU(gelu_pytorch_tanh): gate_proj, up_proj, gelu_tanh(gate) * up → down_proj.
-    weight_gemv(gpu, &lw.gate_proj, &scratch.tmp, &scratch.gate_ffn)?;
-    weight_gemv(gpu, &lw.up_proj, &scratch.tmp, &scratch.up_ffn)?;
+    let wr_gate = lw.gate_proj.dispatch_ref();
+    let wr_up = lw.up_proj.dispatch_ref();
+    execute_steps(gpu, &ctx, &[
+        Step::Gemv { w: &wr_gate, input: GemvInput::Raw(&scratch.tmp), out: &scratch.gate_ffn },
+        Step::Gemv { w: &wr_up, input: GemvInput::Raw(&scratch.tmp), out: &scratch.up_ffn },
+    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     if _dump_on {
         dbg_dump(gpu, "[v1] L0 after gate_proj", &scratch.gate_ffn, config.hidden_dim);
         dbg_dump(gpu, "[v1] L0 after up_proj", &scratch.up_ffn, config.hidden_dim);
@@ -1984,7 +1999,10 @@ fn sliding_layer_decode_impl(
     gpu.gelu_tanh_f32(&scratch.gate_ffn, &scratch.ffn_hidden, config.hidden_dim)?;
     gpu.mul_f32(&scratch.ffn_hidden, &scratch.up_ffn, &scratch.ffn_hidden)?;
     if _dump_on { dbg_dump(gpu, "[v1] L0 after gelu*up", &scratch.ffn_hidden, config.hidden_dim); }
-    weight_gemv(gpu, &lw.down_proj, &scratch.ffn_hidden, &scratch.ffn_out)?;
+    let wr_down = lw.down_proj.dispatch_ref();
+    execute_steps(gpu, &ctx, &[
+        Step::Gemv { w: &wr_down, input: GemvInput::Raw(&scratch.ffn_hidden), out: &scratch.ffn_out },
+    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
     if _dump_on { dbg_dump(gpu, "[v1] L0 after down_proj", &scratch.ffn_out, dim); }
 
     // Batched prefill hand-off point: caller wants to batch the MoE branch
@@ -2078,6 +2096,7 @@ fn full_layer_decode_impl(
     let n_heads = config.n_heads;
     let n_kv = config.full_n_kv_heads;
     let dim_bytes = dim * 4;
+    let ctx = DispatchCtx::new(gpu);
     let kv_bytes = n_kv * head_dim * 4;
 
     // residual = x
@@ -2178,7 +2197,6 @@ fn full_layer_decode_impl(
             block_cols: 0,
             output: &scratch.attn_out,
         };
-        let ctx = DispatchCtx::new(gpu);
         execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])?;
     }
 
