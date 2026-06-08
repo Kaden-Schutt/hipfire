@@ -2786,6 +2786,89 @@ impl Gpu {
         result
     }
 
+    /// gemma4 L3: fused per-head weighted q/k RMSNorm + q prescale + dual RoPE
+    /// in ONE launch. Replaces:
+    ///   rmsnorm_batched(q, q_norm_w, n_heads, head_dim)
+    ///   rmsnorm_batched(k, k_norm_w, n_kv,    head_dim)
+    ///   scale_f32(q, q_scale)
+    ///   rope_partial_halved_f32(q, k, .., n_rot_pairs, freq_base)
+    /// V is untouched (caller keeps v_norm + k_eq_v k->v capture outside).
+    /// Decode-only (single position). Grid [n_heads], block 32 (wave32);
+    /// requires n_kv <= n_heads. hipGraph-safe via launch_maybe_blob. Not
+    /// byte-identical to the unfused chain -- coherence-validated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_gemma4_qk_norm_rope_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        q_norm_w: &GpuTensor,
+        k_norm_w: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        n_rot_pairs: usize,
+        q_scale: f32,
+        freq_base: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "fused_gemma4_qk_norm_rope",
+            kernels::FUSED_GEMMA4_QK_NORM_ROPE_SRC,
+            "fused_gemma4_qk_norm_rope_f32",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let qnw = q_norm_w.buf.as_ptr();
+        let knw = k_norm_w.buf.as_ptr();
+        let pp = pos_buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv as i32;
+        let hd = head_dim as i32;
+        let nrp = n_rot_pairs as i32;
+        let qs = q_scale;
+        let fb = freq_base;
+        let ep = eps;
+        let block = 32u32;
+        let grid = [n_heads as u32, 1, 1];
+        let bytes = crate::profile::rope_bytes(n_heads, n_kv, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "rope", "fused_gemma4_qk_norm_rope_f32", bytes,
+        );
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &qnw as *const _ as *mut c_void,
+            &knw as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &nrp as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "fused_gemma4_qk_norm_rope_f32",
+            grid,
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(qnw); b.push_ptr(knw);
+                b.push_ptr(pp);
+                b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(nrp);
+                b.push_f32(qs); b.push_f32(fb); b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Batched (N-token) Gemma 4 full-attention partial RoPE — twin of
     /// `rope_partial_halved_f32`. Reads one i32 position per token from a device
     /// array. Q/K are [batch × n_heads × head_dim] row-major. Grid over

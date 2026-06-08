@@ -2295,6 +2295,11 @@ pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
 pub const RMSNORM_RESIDUAL_ADD_SRC: &str =
     include_str!("../../../kernels/src/rmsnorm_residual_add.hip");
 
+/// gemma4 L3: fused per-head weighted q/k RMSNorm + q prescale + dual RoPE.
+/// Collapses (q_norm + k_norm + scale_f32(q) + rope) 4 launches into 1.
+pub const FUSED_GEMMA4_QK_NORM_ROPE_SRC: &str =
+    include_str!("../../../kernels/src/fused_gemma4_qk_norm_rope.hip");
+
 /// TriAttention sidecar calibration: GPU band-statistics accumulator.
 /// Replaces the CPU BandAccumulator loop (99% of sidecar cal wall time).
 pub const TRIATTN_ACCUMULATE_SRC: &str =

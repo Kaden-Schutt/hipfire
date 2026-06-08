@@ -99,6 +99,19 @@ fn fused_postnorm_enabled() -> bool {
     )
 }
 
+/// Master switch for the fused per-head weighted q/k RMSNorm + q prescale +
+/// dual RoPE path (`fused_gemma4_qk_norm_rope_f32`, gemma4 L3). Collapses
+/// (q_norm + k_norm + scale_f32(q) + rope) from 4 launches to 1 on the AR
+/// decode path; V's weight-less RMSNorm and the k_eq_v k->v capture stay
+/// separate. Default ON; opt out with `HIPFIRE_GEMMA4_FUSED_QK_ROPE=0`. Not
+/// byte-identical (fused rsqrt/rope rounds differently) -- coherence-validated.
+fn fused_qk_rope_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_GEMMA4_FUSED_QK_ROPE").ok().as_deref(),
+        Some("0") | Some("off") | Some("false")
+    )
+}
+
 /// q = q_proj(x); k = k_proj(x). Fused into one launch via `fused_gate_up_q8_0`
 /// when both are Q8_0 (same input `x`); else two `weight_gemv` calls.
 fn qk_proj(
@@ -464,32 +477,49 @@ fn sliding_layer_decode(
         "sliding",
     )?;
 
-    // Per-head q_norm / k_norm over head_dim, and weight-less V RMSNorm (ones).
-    // (V uses the no-scale RMS pattern — matches full layers and the HF
-    // sliding-layer Vcur = rms_norm(Vcur) on the v_norm path.)
-    gpu.rmsnorm_batched(&state.q, &lw.q_norm, &state.q, n_heads, head_dim, eps)
-        .map_err(|e| format!("gemma4 sliding: q_norm: {e:?}"))?;
-    gpu.rmsnorm_batched(&state.k, &lw.k_norm, &state.k, n_kv, head_dim, eps)
-        .map_err(|e| format!("gemma4 sliding: k_norm: {e:?}"))?;
+    // Weight-less V RMSNorm (ones). V is independent of q/k here (own v_proj),
+    // so it normalizes outside the fused q/k path either way.
     gpu.rmsnorm_batched(&state.v, &state.v_norm_ones, &state.v, n_kv, head_dim, eps)
         .map_err(|e| format!("gemma4 sliding: v_norm: {e:?}"))?;
 
-    // Pre-scale Q by sqrt(head_dim) so the kernel's 1/sqrt(head_dim) cancels →
-    // effective Gemma 4 scale of 1.0.
-    gpu.scale_f32(&state.q, (head_dim as f32).sqrt())
-        .map_err(|e| format!("gemma4 sliding: q scale: {e:?}"))?;
-
-    // RoPE: full rotate-half over the whole head_dim, theta = 10000.
-    gpu.rope_f32(
-        &state.q,
-        &state.k,
-        &state.pos_buf,
-        n_heads,
-        n_kv,
-        head_dim,
-        cfg.sliding_rope_theta,
-    )
-    .map_err(|e| format!("gemma4 sliding: rope: {e:?}"))?;
+    // Per-head q_norm/k_norm (weighted RMS) + q prescale (sqrt(head_dim) so the
+    // attn kernel's 1/sqrt(head_dim) cancels → effective Gemma4 scale 1.0) +
+    // full rotate-half RoPE (n_rot_pairs = head_dim/2, theta = 10000). Fused
+    // (L3) into one launch; eager fallback = 4 separate launches.
+    if fused_qk_rope_enabled() {
+        gpu.fused_gemma4_qk_norm_rope_f32(
+            &state.q,
+            &state.k,
+            &lw.q_norm,
+            &lw.k_norm,
+            &state.pos_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            head_dim / 2, // full rotate-half
+            (head_dim as f32).sqrt(),
+            cfg.sliding_rope_theta,
+            eps,
+        )
+        .map_err(|e| format!("gemma4 sliding: fused qk norm+rope: {e:?}"))?;
+    } else {
+        gpu.rmsnorm_batched(&state.q, &lw.q_norm, &state.q, n_heads, head_dim, eps)
+            .map_err(|e| format!("gemma4 sliding: q_norm: {e:?}"))?;
+        gpu.rmsnorm_batched(&state.k, &lw.k_norm, &state.k, n_kv, head_dim, eps)
+            .map_err(|e| format!("gemma4 sliding: k_norm: {e:?}"))?;
+        gpu.scale_f32(&state.q, (head_dim as f32).sqrt())
+            .map_err(|e| format!("gemma4 sliding: q scale: {e:?}"))?;
+        gpu.rope_f32(
+            &state.q,
+            &state.k,
+            &state.pos_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            cfg.sliding_rope_theta,
+        )
+        .map_err(|e| format!("gemma4 sliding: rope: {e:?}"))?;
+    }
 
     // KV write (Q8) + windowed attention (window = sliding_window).
     attn_q8_swa(
@@ -564,17 +594,10 @@ fn full_layer_decode(
             .map_err(|e| format!("gemma4 full: k->v copy: {e:?}"))?;
     }
 
-    // q_norm / k_norm over head_dim, weight-less V RMSNorm.
-    gpu.rmsnorm_batched(&state.q, &lw.q_norm, &state.q, n_heads, head_dim, eps)
-        .map_err(|e| format!("gemma4 full: q_norm: {e:?}"))?;
-    gpu.rmsnorm_batched(&state.k, &lw.k_norm, &state.k, n_kv, head_dim, eps)
-        .map_err(|e| format!("gemma4 full: k_norm: {e:?}"))?;
+    // Weight-less V RMSNorm (ones). For k_eq_v, V was already captured from the
+    // PRE-k_norm K above, so this is safe to run before the fused q/k path.
     gpu.rmsnorm_batched(&state.v, &state.v_norm_ones, &state.v, n_kv, head_dim, eps)
         .map_err(|e| format!("gemma4 full: v_norm: {e:?}"))?;
-
-    // Pre-scale Q by sqrt(head_dim=512).
-    gpu.scale_f32(&state.q, (head_dim as f32).sqrt())
-        .map_err(|e| format!("gemma4 full: q scale: {e:?}"))?;
 
     // Proportional / partial RoPE: rotate the first `partial_rotary_factor ×
     // head_dim` dims; theta = full_rope_theta. n_rot_pairs = factor*head_dim/2.
@@ -586,17 +609,45 @@ fn full_layer_decode(
         // n_rot_pairs = head_dim/2 == full rotate-half.
         RopeType::Default => head_dim / 2,
     };
-    gpu.rope_partial_halved_f32(
-        &state.q,
-        &state.k,
-        &state.pos_buf,
-        n_heads,
-        n_kv,
-        head_dim,
-        n_rot_pairs,
-        cfg.full_rope_theta,
-    )
-    .map_err(|e| format!("gemma4 full: rope: {e:?}"))?;
+
+    // Per-head q_norm/k_norm (weighted RMS) + q prescale (sqrt(head_dim)) +
+    // partial rotate-half RoPE (n_rot_pairs, theta = full_rope_theta). Fused
+    // (L3) into one launch; eager fallback = 4 separate launches.
+    if fused_qk_rope_enabled() {
+        gpu.fused_gemma4_qk_norm_rope_f32(
+            &state.q,
+            &state.k,
+            &lw.q_norm,
+            &lw.k_norm,
+            &state.pos_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            n_rot_pairs,
+            (head_dim as f32).sqrt(),
+            cfg.full_rope_theta,
+            eps,
+        )
+        .map_err(|e| format!("gemma4 full: fused qk norm+rope: {e:?}"))?;
+    } else {
+        gpu.rmsnorm_batched(&state.q, &lw.q_norm, &state.q, n_heads, head_dim, eps)
+            .map_err(|e| format!("gemma4 full: q_norm: {e:?}"))?;
+        gpu.rmsnorm_batched(&state.k, &lw.k_norm, &state.k, n_kv, head_dim, eps)
+            .map_err(|e| format!("gemma4 full: k_norm: {e:?}"))?;
+        gpu.scale_f32(&state.q, (head_dim as f32).sqrt())
+            .map_err(|e| format!("gemma4 full: q scale: {e:?}"))?;
+        gpu.rope_partial_halved_f32(
+            &state.q,
+            &state.k,
+            &state.pos_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            n_rot_pairs,
+            cfg.full_rope_theta,
+        )
+        .map_err(|e| format!("gemma4 full: rope: {e:?}"))?;
+    }
 
     // KV write (Q8) + full causal attention (window = 0).
     attn_q8_swa(
