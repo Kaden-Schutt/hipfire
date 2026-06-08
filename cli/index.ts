@@ -74,6 +74,8 @@ import {
   type BatchFileRecord,
   type BatchInputRecord,
   countUnsupportedModeErrors,
+  normalizePromptCacheKey,
+  normalizePromptCacheRetention,
 } from "./batch_api";
 import {
   buildDummyLoadMessage,
@@ -183,6 +185,9 @@ function parseResponsesToChatBody(rawBody: any): any {
     tools: rawBody.tools ?? [],
     tool_choice: rawBody.tool_choice ?? null,
     previous_response_id: rawBody.previous_response_id ?? null,
+    conversation: rawBody.conversation ?? null,
+    prompt_cache_key: normalizePromptCacheKey(rawBody.prompt_cache_key),
+    prompt_cache_retention: normalizePromptCacheRetention(rawBody.prompt_cache_retention),
     metadata: rawBody.metadata,
   };
 }
@@ -2744,7 +2749,20 @@ async function serve(port: number, host: string) {
       try {
         const rawBody = (await req.json()) as any;
         const isResponsesRequest = url.pathname === "/v1/responses";
+        const promptCacheRetention = normalizePromptCacheRetention(rawBody?.prompt_cache_retention);
+        if (rawBody?.prompt_cache_retention !== undefined && promptCacheRetention === undefined) {
+          return Response.json({
+            error: {
+              message: "prompt_cache_retention must be 'in_memory' or '24h'",
+              type: "invalid_request_error",
+            },
+          }, { status: 400 });
+        }
         const body = isResponsesRequest ? parseResponsesToChatBody(rawBody) : rawBody;
+        if (!isResponsesRequest && body && typeof body === "object") {
+          body.prompt_cache_key = normalizePromptCacheKey(body.prompt_cache_key);
+          body.prompt_cache_retention = promptCacheRetention;
+        }
         if (isResponsesRequest && body.stream === true) {
           return Response.json({ error: { message: "streaming responses is unsupported in this scaffold", type: "invalid_request_error" } }, { status: 400 });
         }
@@ -3207,7 +3225,6 @@ async function serve(port: number, host: string) {
           eligible: prefillBatchGate.eligible,
           capability: generateBatchPrefillCapability,
           stream: body.stream === true,
-          responsesRequest: isResponsesRequest,
         });
         const requestCanUseDaemonPrefillBatch = requestPrefillDispatchStatus.canDispatch;
         if (serverPrefillBatch.enabled) {
@@ -3228,6 +3245,7 @@ async function serve(port: number, host: string) {
               prefill_drafter: effective.prefill_drafter,
               mtp_mode: effective.mtp_mode,
               mtp_k: effective.mtp_k,
+              prompt_cache_key: body.prompt_cache_key ?? null,
             }),
             stateMode,
             positionPolicy: "rope",
@@ -3858,7 +3876,6 @@ async function serve(port: number, host: string) {
             }
           } else if (shouldQueueServerPrefillPending({
             stream: body.stream,
-            responsesRequest: isResponsesRequest,
             eligible: prefillBatchGate.eligible,
             hasScheduler: Boolean(servingWorkerScheduler),
             queuePreviewReason,

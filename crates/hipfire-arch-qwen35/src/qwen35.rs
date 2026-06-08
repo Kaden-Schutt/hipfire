@@ -37,6 +37,19 @@ pub struct MoeRouterHistogram {
     pub topk_histogram: Vec<u64>,
     pub weight_sums: Vec<f64>,
     pub dropped_indices: u64,
+    pub per_layer: Vec<MoeRouterLayerHistogram>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MoeRouterLayerHistogram {
+    pub layer_idx: usize,
+    pub routed_tokens: u64,
+    pub routed_slots: u64,
+    pub top1_histogram: Vec<u64>,
+    pub topk_histogram: Vec<u64>,
+    pub weight_sums: Vec<f64>,
+    pub dropped_indices: u64,
+    pub cooccurrence: HashMap<u64, u64>,
 }
 
 impl MoeRouterHistogram {
@@ -50,7 +63,25 @@ impl MoeRouterHistogram {
             topk_histogram: vec![0; num_experts],
             weight_sums: vec![0.0; num_experts],
             dropped_indices: 0,
+            per_layer: Vec::new(),
         }
+    }
+
+    fn ensure_layer(&mut self, layer_idx: usize) -> &mut MoeRouterLayerHistogram {
+        while self.per_layer.len() <= layer_idx {
+            let next = self.per_layer.len();
+            self.per_layer.push(MoeRouterLayerHistogram {
+                layer_idx: next,
+                routed_tokens: 0,
+                routed_slots: 0,
+                top1_histogram: vec![0; self.num_experts],
+                topk_histogram: vec![0; self.num_experts],
+                weight_sums: vec![0.0; self.num_experts],
+                dropped_indices: 0,
+                cooccurrence: HashMap::new(),
+            });
+        }
+        &mut self.per_layer[layer_idx]
     }
 }
 
@@ -68,25 +99,51 @@ pub fn take_moe_router_histogram() -> Option<MoeRouterHistogram> {
     MOE_ROUTER_HISTOGRAM.with(|hist| hist.borrow_mut().take())
 }
 
-fn record_moe_router_selection(indices: &[usize], weights: &[f32]) {
+fn record_moe_router_selection(layer_idx: usize, indices: &[usize], weights: &[f32]) {
     MOE_ROUTER_HISTOGRAM.with(|hist| {
         let mut hist = hist.borrow_mut();
         let Some(hist) = hist.as_mut() else {
             return;
         };
         hist.routed_tokens += 1;
-        for (rank, &expert_idx) in indices.iter().take(hist.k_top).enumerate() {
-            if expert_idx >= hist.num_experts {
+        let num_experts = hist.num_experts;
+        let k_top = hist.k_top;
+        let mut valid_experts = Vec::with_capacity(k_top);
+        let mut layer_updates = Vec::with_capacity(k_top);
+        let mut dropped_indices = 0u64;
+        for (rank, &expert_idx) in indices.iter().take(k_top).enumerate() {
+            if expert_idx >= num_experts {
                 hist.dropped_indices += 1;
+                dropped_indices += 1;
                 continue;
             }
+            let weight = weights.get(rank).copied().unwrap_or(0.0);
             if rank == 0 {
                 hist.top1_histogram[expert_idx] += 1;
             }
             hist.topk_histogram[expert_idx] += 1;
             hist.routed_slots += 1;
-            if let Some(weight) = weights.get(rank) {
-                hist.weight_sums[expert_idx] += *weight as f64;
+            hist.weight_sums[expert_idx] += weight as f64;
+            valid_experts.push(expert_idx);
+            layer_updates.push((rank, expert_idx, weight));
+        }
+        let layer = hist.ensure_layer(layer_idx);
+        layer.routed_tokens += 1;
+        layer.dropped_indices += dropped_indices;
+        for (rank, expert_idx, weight) in layer_updates {
+            if rank == 0 {
+                layer.top1_histogram[expert_idx] += 1;
+            }
+            layer.topk_histogram[expert_idx] += 1;
+            layer.routed_slots += 1;
+            layer.weight_sums[expert_idx] += weight as f64;
+        }
+        for i in 0..valid_experts.len() {
+            for j in (i + 1)..valid_experts.len() {
+                let a = valid_experts[i].min(valid_experts[j]);
+                let b = valid_experts[i].max(valid_experts[j]);
+                let key = (a as u64) * (num_experts as u64) + b as u64;
+                *layer.cooccurrence.entry(key).or_insert(0) += 1;
             }
         }
     });
@@ -5250,6 +5307,7 @@ fn moe_ffn_decode(
     x_norm: &GpuTensor,
     x_residual: &GpuTensor,
     config: &Qwen35Config,
+    layer_idx: usize,
 ) -> HipResult<()> {
     let hidden = config.dim;
     let mi = config.moe_intermediate_size;
@@ -5289,7 +5347,9 @@ fn moe_ffn_decode(
         topk_weights: &topk_weights,
         down_expanded: &down_expanded,
     };
-    let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false);
+    let result = moe_ffn_decode_impl(
+        gpu, ffn, x_norm, x_residual, config, &refs, false, layer_idx,
+    );
 
     for t in [
         router_logits,
@@ -5385,9 +5445,12 @@ fn moe_ffn_decode_with_scratch(
     x_residual: &GpuTensor,
     config: &Qwen35Config,
     scratch: &Qwen35Scratch,
+    layer_idx: usize,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false)
+    moe_ffn_decode_impl(
+        gpu, ffn, x_norm, x_residual, config, &refs, false, layer_idx,
+    )
 }
 
 /// Same as `moe_ffn_decode_with_scratch` but expects the caller to have
@@ -5403,9 +5466,10 @@ fn moe_ffn_decode_with_scratch_prerotated(
     x_residual: &GpuTensor,
     config: &Qwen35Config,
     scratch: &Qwen35Scratch,
+    layer_idx: usize,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, true)
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, true, layer_idx)
 }
 
 fn download_i32_tensor(gpu: &Gpu, tensor: &GpuTensor, len: usize) -> HipResult<Vec<i32>> {
@@ -5426,6 +5490,7 @@ fn moe_ffn_decode_impl(
     config: &Qwen35Config,
     s: &MoeScratchRef<'_>,
     x_rot_prerotated: bool,
+    layer_idx: usize,
 ) -> HipResult<()> {
     let hidden = config.dim;
     let mi = config.moe_intermediate_size;
@@ -5669,7 +5734,7 @@ fn moe_ffn_decode_impl(
                     .map(router_index_i32_to_usize)
                     .collect::<Vec<_>>();
                 let weights = gpu.download_f32(s.topk_weights)?;
-                record_moe_router_selection(&indices, &weights);
+                record_moe_router_selection(layer_idx, &indices, &weights);
             }
             (None, None)
         } else {
@@ -5697,7 +5762,7 @@ fn moe_ffn_decode_impl(
                     }
                 }
             }
-            record_moe_router_selection(&topk_indices, &topk_weights);
+            record_moe_router_selection(layer_idx, &topk_indices, &topk_weights);
             (Some(topk_indices), Some(topk_weights))
         };
 
@@ -6580,7 +6645,7 @@ fn forward_from_x_gpu(
 
                 // ── MoE FFN (only difference from dense) ──
                 gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
-                moe_ffn_decode(gpu, &layer.ffn, &tmp, &x, config)?;
+                moe_ffn_decode(gpu, &layer.ffn, &tmp, &x, config, layer_idx)?;
 
                 for t in [
                     qkv, z, beta_out, alpha_out, conv_out, q_part, k_part, v_part, q_gdn, k_gdn,
@@ -6695,7 +6760,7 @@ fn forward_from_x_gpu(
 
                 // ── MoE FFN (only difference from dense) ──
                 gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
-                moe_ffn_decode(gpu, &layer.ffn, &tmp, &x, config)?;
+                moe_ffn_decode(gpu, &layer.ffn, &tmp, &x, config, layer_idx)?;
 
                 for t in [q_full, q, gate_vec, k, v, attn_out, o] {
                     gpu.free_tensor(t)?;
@@ -9841,6 +9906,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                     config,
                     pbs,
                     row_count,
+                    layer_idx,
                 )?;
                 delta_layer_idx += 1;
             }
@@ -10051,6 +10117,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
                     config,
                     pbs,
                     row_count,
+                    layer_idx,
                 )?;
             }
             _ => {
@@ -12157,6 +12224,7 @@ fn prefill_moe_ffn_body_batched(
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
     n: usize,
+    layer_idx: usize,
 ) -> HipResult<()> {
     let dim = config.dim;
     let mi = config.moe_intermediate_size;
@@ -12542,7 +12610,7 @@ fn prefill_moe_ffn_body_batched(
         for token_idx in 0..n {
             let start = token_idx * k_top;
             let end = start + k_top;
-            record_moe_router_selection(&indices[start..end], &weights[start..end]);
+            record_moe_router_selection(layer_idx, &indices[start..end], &weights[start..end]);
         }
     }
 
@@ -16681,7 +16749,15 @@ fn forward_prefill_chunk(
                 if debug_stop_after_la_layer == Some(layer_idx) {
                     return Ok(());
                 }
-                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n)?;
+                prefill_moe_ffn_body_batched(
+                    gpu,
+                    &layer.ffn,
+                    &layer.ffn_norm,
+                    config,
+                    pbs,
+                    n,
+                    layer_idx,
+                )?;
 
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
@@ -17489,7 +17565,15 @@ fn forward_prefill_chunk(
                 }
 
                 // Batched MoE FFN.
-                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n)?;
+                prefill_moe_ffn_body_batched(
+                    gpu,
+                    &layer.ffn,
+                    &layer.ffn_norm,
+                    config,
+                    pbs,
+                    n,
+                    layer_idx,
+                )?;
 
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
@@ -19904,7 +19988,9 @@ fn forward_scratch_layers(
                         config.dim,
                         config.norm_eps,
                     )?;
-                    moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s)?;
+                    moe_ffn_decode_with_scratch_prerotated(
+                        gpu, &layer.ffn, &s.x, &s.x, config, s, layer_idx,
+                    )?;
                 } else if ffn_routed_mq2_lloyd_plain_prerotate_for_moe(&layer.ffn) {
                     gpu.fused_rmsnorm_rotate_mq_plain(
                         &s.x,
@@ -19915,11 +20001,13 @@ fn forward_scratch_layers(
                         config.norm_eps,
                     )?;
                     moe_ffn_decode_with_scratch_prerotated(
-                        gpu, &layer.ffn, &s.tmp, &s.x, config, s,
+                        gpu, &layer.ffn, &s.tmp, &s.x, config, s, layer_idx,
                     )?;
                 } else {
                     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                    moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
+                    moe_ffn_decode_with_scratch(
+                        gpu, &layer.ffn, &s.tmp, &s.x, config, s, layer_idx,
+                    )?;
                 }
 
                 if let Some(ref rb) = hidden_rb {
@@ -20412,7 +20500,9 @@ fn forward_scratch_layers(
                         config.dim,
                         config.norm_eps,
                     )?;
-                    moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s)?;
+                    moe_ffn_decode_with_scratch_prerotated(
+                        gpu, &layer.ffn, &s.x, &s.x, config, s, layer_idx,
+                    )?;
                 } else if ffn_routed_mq2_lloyd_plain_prerotate_for_moe(&layer.ffn) {
                     gpu.fused_rmsnorm_rotate_mq_plain(
                         &s.x,
@@ -20423,11 +20513,13 @@ fn forward_scratch_layers(
                         config.norm_eps,
                     )?;
                     moe_ffn_decode_with_scratch_prerotated(
-                        gpu, &layer.ffn, &s.tmp, &s.x, config, s,
+                        gpu, &layer.ffn, &s.tmp, &s.x, config, s, layer_idx,
                     )?;
                 } else {
                     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                    moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
+                    moe_ffn_decode_with_scratch(
+                        gpu, &layer.ffn, &s.tmp, &s.x, config, s, layer_idx,
+                    )?;
                 }
 
                 if let Some(ref rb) = hidden_rb {
@@ -21619,7 +21711,7 @@ fn forward_scratch_layers_multi(
                             config.norm_eps,
                         )?;
                         moe_ffn_decode_with_scratch_prerotated(
-                            gpu, &layer.ffn, &s.x, &s.x, config, s,
+                            gpu, &layer.ffn, &s.x, &s.x, config, s, layer_idx,
                         )?;
                     } else if ffn_routed_mq2_lloyd_plain_prerotate_for_moe(&layer.ffn) {
                         gpu.fused_rmsnorm_rotate_mq_plain(
@@ -21631,11 +21723,13 @@ fn forward_scratch_layers_multi(
                             config.norm_eps,
                         )?;
                         moe_ffn_decode_with_scratch_prerotated(
-                            gpu, &layer.ffn, &s.tmp, &s.x, config, s,
+                            gpu, &layer.ffn, &s.tmp, &s.x, config, s, layer_idx,
                         )?;
                     } else {
                         gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                        moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
+                        moe_ffn_decode_with_scratch(
+                            gpu, &layer.ffn, &s.tmp, &s.x, config, s, layer_idx,
+                        )?;
                     }
                     delta_layer_idx += 1;
                 }
@@ -22057,7 +22151,7 @@ fn forward_scratch_layers_multi(
                             config.norm_eps,
                         )?;
                         moe_ffn_decode_with_scratch_prerotated(
-                            gpu, &layer.ffn, &s.x, &s.x, config, s,
+                            gpu, &layer.ffn, &s.x, &s.x, config, s, layer_idx,
                         )?;
                     } else if ffn_routed_mq2_lloyd_plain_prerotate_for_moe(&layer.ffn) {
                         gpu.fused_rmsnorm_rotate_mq_plain(
@@ -22069,11 +22163,13 @@ fn forward_scratch_layers_multi(
                             config.norm_eps,
                         )?;
                         moe_ffn_decode_with_scratch_prerotated(
-                            gpu, &layer.ffn, &s.tmp, &s.x, config, s,
+                            gpu, &layer.ffn, &s.tmp, &s.x, config, s, layer_idx,
                         )?;
                     } else {
                         gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                        moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
+                        moe_ffn_decode_with_scratch(
+                            gpu, &layer.ffn, &s.tmp, &s.x, config, s, layer_idx,
+                        )?;
                     }
                 }
 
@@ -22568,8 +22664,8 @@ mod tests {
     fn moe_router_histogram_records_top1_topk_weights_and_drops() {
         reset_moe_router_histogram(4, 2);
 
-        record_moe_router_selection(&[1, 2, 3], &[0.75, 0.25, 0.0]);
-        record_moe_router_selection(&[8, 2], &[0.6, 0.4]);
+        record_moe_router_selection(3, &[1, 2, 3], &[0.75, 0.25, 0.0]);
+        record_moe_router_selection(3, &[8, 2], &[0.6, 0.4]);
 
         let hist = take_moe_router_histogram().expect("histogram should be collected");
         assert_eq!(hist.num_experts, 4);
@@ -22581,6 +22677,20 @@ mod tests {
         assert!((hist.weight_sums[1] - 0.75).abs() < f64::EPSILON);
         assert!((hist.weight_sums[2] - 0.65).abs() < 1e-6);
         assert_eq!(hist.dropped_indices, 1);
+        assert_eq!(hist.per_layer.len(), 4);
+        let layer = &hist.per_layer[3];
+        assert_eq!(layer.layer_idx, 3);
+        assert_eq!(layer.routed_tokens, 2);
+        assert_eq!(layer.routed_slots, 3);
+        assert_eq!(layer.top1_histogram, vec![0, 1, 0, 0]);
+        assert_eq!(layer.topk_histogram, vec![0, 1, 2, 0]);
+        assert!((layer.weight_sums[1] - 0.75).abs() < f64::EPSILON);
+        assert!((layer.weight_sums[2] - 0.65).abs() < 1e-6);
+        assert_eq!(layer.dropped_indices, 1);
+        assert_eq!(
+            layer.cooccurrence.get(&(1 * hist.num_experts as u64 + 2)),
+            Some(&1)
+        );
         assert!(take_moe_router_histogram().is_none());
     }
 

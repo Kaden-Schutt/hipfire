@@ -12,7 +12,6 @@ describe("server request-path prefill batching guard", () => {
     expect(shouldQueueServerPrefillPending({
       ...base,
       stream: false,
-      responsesRequest: false,
     })).toBe(true);
   });
 
@@ -20,23 +19,20 @@ describe("server request-path prefill batching guard", () => {
     expect(shouldQueueServerPrefillPending({
       ...base,
       stream: true,
-      responsesRequest: false,
     })).toBe(false);
   });
 
-  test("never queues /v1/responses requests for generate_batch_prefill", () => {
+  test("allows compatible non-streaming responses requests to wait for coalescing", () => {
     expect(shouldQueueServerPrefillPending({
       ...base,
       stream: false,
-      responsesRequest: true,
-    })).toBe(false);
+    })).toBe(true);
   });
 
   test("does not create pending waiters when the scheduler already selected this request", () => {
     expect(shouldQueueServerPrefillPending({
       ...base,
       stream: false,
-      responsesRequest: false,
       queuePreviewReason: "selected",
     })).toBe(false);
   });
@@ -45,7 +41,6 @@ describe("server request-path prefill batching guard", () => {
     expect(shouldQueueServerPrefillPending({
       ...base,
       stream: false,
-      responsesRequest: false,
       queuePreviewReason: "not_eligible",
     })).toBe(false);
   });
@@ -56,14 +51,12 @@ describe("server request-path prefill batching guard", () => {
       eligible: false,
       hasScheduler: true,
       stream: false,
-      responsesRequest: false,
     })).toBe(false);
     expect(shouldQueueServerPrefillPending({
       ...base,
       eligible: true,
       hasScheduler: false,
       stream: false,
-      responsesRequest: false,
     })).toBe(false);
   });
 });

@@ -104,15 +104,14 @@ describe("generate_batch_prefill serialized fallback metadata", () => {
     });
   });
 
-  test("blocks responses requests even when daemon serial prefill is supported", () => {
+  test("admits non-streaming responses requests when daemon serial prefill is supported", () => {
     expect(prefillBatchRequestDispatchStatus({
       eligible: true,
       capability: "supported",
-      responsesRequest: true,
     })).toEqual({
-      canDispatch: false,
-      runtimeDispatch: "not_selected",
-      runtimeDispatchReason: "responses_not_supported_for_generate_batch_prefill",
+      canDispatch: true,
+      runtimeDispatch: "daemon_serial_prefill_available",
+      runtimeDispatchReason: "server_dispatch_enabled",
     });
   });
 
@@ -121,7 +120,6 @@ describe("generate_batch_prefill serialized fallback metadata", () => {
       eligible: true,
       capability: "supported",
       stream: false,
-      responsesRequest: false,
     })).toEqual({
       canDispatch: true,
       runtimeDispatch: "daemon_serial_prefill_available",

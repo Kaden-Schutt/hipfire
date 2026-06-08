@@ -92,7 +92,6 @@ export function prefillBatchRequestDispatchStatus(input: {
   eligible: boolean;
   capability: GenerateBatchPrefillCapability;
   stream?: boolean;
-  responsesRequest?: boolean;
 }): {
   canDispatch: boolean;
   runtimeDispatch: string;
@@ -110,13 +109,6 @@ export function prefillBatchRequestDispatchStatus(input: {
       canDispatch: false,
       runtimeDispatch: "not_selected",
       runtimeDispatchReason: "streaming_not_supported_for_generate_batch_prefill",
-    };
-  }
-  if (input.responsesRequest) {
-    return {
-      canDispatch: false,
-      runtimeDispatch: "not_selected",
-      runtimeDispatchReason: "responses_not_supported_for_generate_batch_prefill",
     };
   }
   return {

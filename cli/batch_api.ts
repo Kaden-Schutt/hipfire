@@ -54,6 +54,11 @@ export interface BatchResponsesNormalizedBody {
   messages: unknown[];
   input: unknown;
   prompt?: string;
+  previous_response_id?: string;
+  conversation?: string | Record<string, any>;
+  prompt_cache_key?: string;
+  prompt_cache_retention?: PromptCacheRetentionPolicy;
+  metadata?: Record<string, any>;
 }
 
 export interface BatchResponsesNormalizeResult {
@@ -114,6 +119,33 @@ export interface BatchRecord {
 }
 
 const SUPPORTED_ENDPOINTS: ReadonlySet<string> = new Set(["/v1/chat/completions", "/v1/responses"]);
+export type PromptCacheRetentionPolicy = "in_memory" | "24h";
+
+export interface ResponsesCacheControls {
+  prompt_cache_key?: string;
+  prompt_cache_retention?: PromptCacheRetentionPolicy;
+}
+
+export function normalizePromptCacheKey(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+export function normalizePromptCacheRetention(value: unknown): PromptCacheRetentionPolicy | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (value === "in_memory" || value === "24h") return value;
+  return undefined;
+}
+
+export function normalizeResponsesCacheControls(
+  body: Record<string, any>,
+): ResponsesCacheControls {
+  return {
+    prompt_cache_key: normalizePromptCacheKey(body.prompt_cache_key),
+    prompt_cache_retention: normalizePromptCacheRetention(body.prompt_cache_retention),
+  };
+}
 
 function isResponsesInput(value: unknown): value is string | Record<string, any> | any[] {
   if (typeof value === "string") return true;
@@ -181,6 +213,14 @@ export function normalizeResponsesBatchInputBody(
   customId?: string,
 ): BatchResponsesNormalizeResult {
   const errors: BatchInputValidationError[] = [];
+  if (body.prompt_cache_retention !== undefined && normalizePromptCacheRetention(body.prompt_cache_retention) === undefined) {
+    errors.push({
+      line: 0,
+      custom_id: customId,
+      code: "invalid_prompt_cache_retention",
+      message: `custom_id ${customId ?? "<unknown>"} has invalid prompt_cache_retention`,
+    });
+  }
   const input = body.input;
   if (!isResponsesInput(input)) {
     errors.push({
@@ -240,6 +280,7 @@ export function normalizeResponsesBatchInputBody(
     });
   }
 
+  const cacheControls = normalizeResponsesCacheControls(body);
   return {
     ok: errors.length === 0,
     body: {
@@ -251,6 +292,11 @@ export function normalizeResponsesBatchInputBody(
       messages: normalizedMessages as Array<any>,
       input,
       prompt: typeof input === "string" ? input : undefined,
+      previous_response_id: typeof body.previous_response_id === "string" ? body.previous_response_id : undefined,
+      conversation: typeof body.conversation === "string" || isJSONObject(body.conversation) ? body.conversation : undefined,
+      prompt_cache_key: cacheControls.prompt_cache_key,
+      prompt_cache_retention: cacheControls.prompt_cache_retention,
+      metadata: isJSONObject(body.metadata) ? body.metadata : undefined,
     },
     errors,
   };

@@ -6,6 +6,8 @@ import {
   countUnsupportedModeErrors,
   buildBatchOutputArtifact,
   parseBatchErrorLinesToJsonl,
+  normalizePromptCacheKey,
+  normalizePromptCacheRetention,
 } from "./batch_api";
 
 describe("batch input JSONL validation", () => {
@@ -143,6 +145,54 @@ describe("batch input JSONL validation", () => {
     expect(parsed.entries[0]?.normalized_body?.messages).toEqual([{ role: "user", content: "hello" }]);
     expect(parsed.entries[0]?.normalized_body?.max_tokens).toBe(256);
     expect(parsed.entries[0]?.normalized_body?.stream).toBe(false);
+  });
+
+  test("preserves responses prompt-cache controls in normalized body", () => {
+    const raw = JSON.stringify({
+      custom_id: "responses-cache",
+      method: "POST",
+      url: "/v1/responses",
+      body: {
+        model: "qwen3.5:9b",
+        input: [{ role: "user", content: "hello" }],
+        previous_response_id: "resp_prev",
+        conversation: "conv_123",
+        prompt_cache_key: " tenant-a ",
+        prompt_cache_retention: "24h",
+        metadata: { trace: "abc" },
+      },
+    });
+    const parsed = validateBatchInputForBatch(raw, "/v1/responses");
+    expect(parsed.ok).toBe(true);
+    expect(parsed.entries[0]?.normalized_body?.previous_response_id).toBe("resp_prev");
+    expect(parsed.entries[0]?.normalized_body?.conversation).toBe("conv_123");
+    expect(parsed.entries[0]?.normalized_body?.prompt_cache_key).toBe("tenant-a");
+    expect(parsed.entries[0]?.normalized_body?.prompt_cache_retention).toBe("24h");
+    expect(parsed.entries[0]?.normalized_body?.metadata).toEqual({ trace: "abc" });
+  });
+
+  test("rejects invalid responses prompt-cache retention", () => {
+    const raw = JSON.stringify({
+      custom_id: "responses-cache-bad",
+      method: "POST",
+      url: "/v1/responses",
+      body: {
+        model: "qwen3.5:9b",
+        input: [{ role: "user", content: "hello" }],
+        prompt_cache_retention: "forever",
+      },
+    });
+    const parsed = validateBatchInputForBatch(raw, "/v1/responses");
+    expect(parsed.ok).toBe(false);
+    expect(parsed.errors.some((e) => e.code === "invalid_prompt_cache_retention")).toBe(true);
+  });
+
+  test("normalizes prompt-cache helper values", () => {
+    expect(normalizePromptCacheKey(" tenant-a ")).toBe("tenant-a");
+    expect(normalizePromptCacheKey("   ")).toBeUndefined();
+    expect(normalizePromptCacheRetention("in_memory")).toBe("in_memory");
+    expect(normalizePromptCacheRetention("24h")).toBe("24h");
+    expect(normalizePromptCacheRetention("forever")).toBeUndefined();
   });
 
   test("preserves stable custom_id in responses normalization output", () => {

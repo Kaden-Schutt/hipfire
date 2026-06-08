@@ -292,6 +292,62 @@ fn main() {
             .sum()
     }
 
+    fn router_cooccurrence_object(
+        cooccurrence: &std::collections::HashMap<u64, u64>,
+        num_experts: usize,
+    ) -> serde_json::Value {
+        use serde_json::json;
+
+        let mut entries = cooccurrence
+            .iter()
+            .filter(|(_, &count)| count > 0)
+            .map(|(&key, &count)| {
+                let a = key / num_experts as u64;
+                let b = key % num_experts as u64;
+                (a, b, count)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|a, b| {
+            b.2.cmp(&a.2)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
+        let mut object = serde_json::Map::new();
+        for (a, b, count) in entries {
+            object.insert(format!("{a},{b}"), json!(count));
+        }
+        serde_json::Value::Object(object)
+    }
+
+    fn per_layer_router_histograms(hist: &qwen35::MoeRouterHistogram) -> serde_json::Value {
+        use serde_json::json;
+
+        let layers = hist
+            .per_layer
+            .iter()
+            .filter(|layer| layer.routed_slots > 0 || layer.dropped_indices > 0)
+            .map(|layer| {
+                json!({
+                    "layer_idx": layer.layer_idx,
+                    "expert_hits": histogram_object_u64(&layer.topk_histogram),
+                    "router_top1_histogram": histogram_object_u64(&layer.top1_histogram),
+                    "router_topk_histogram": histogram_object_u64(&layer.topk_histogram),
+                    "router_weight_sums": histogram_object_f64(&layer.weight_sums),
+                    "router_entropy": histogram_entropy(&layer.topk_histogram),
+                    "router_dropped_tokens": layer.dropped_indices,
+                    "routed_tokens": layer.routed_tokens,
+                    "routed_slots": layer.routed_slots,
+                    "topk_cooccurrence": router_cooccurrence_object(
+                        &layer.cooccurrence,
+                        hist.num_experts,
+                    ),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!(layers)
+    }
+
     fn write_moe_router_evidence(
         dir: &Path,
         prompt_file: &str,
@@ -324,6 +380,7 @@ fn main() {
                         "routed_slots": hist.routed_slots,
                         "num_experts": hist.num_experts,
                         "k_top": hist.k_top,
+                        "per_layer_router_histograms": per_layer_router_histograms(&hist),
                         "collection_scope": "qwen35_moe_decode_and_prefill_forward_calls",
                     }
                 }]

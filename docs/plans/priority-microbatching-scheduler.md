@@ -21,8 +21,8 @@ Hipfire metadata/config and defaults to interactive user traffic.
 | 1. 256-level policy surface + deterministic classes + env controls | DONE | `cli/scheduler_policy.ts`, `cli/scheduler_policy.test.ts` | Classes, clamp/parse logic, and env names are implemented. |
 | 2. Per-worker queueing, enqueue/dequeue/cancel, policy selection | DONE | `cli/worker_scheduler.ts`, `cli/worker_scheduler.test.ts` | Priority buckets, compatibility filtering, opportunistic dispatch policy in one worker-local scheduler. |
 | 3. Model/session foundations and request/session compatibility | DONE | `cli/session_state.ts`, `cli/session_state.test.ts` | Includes `ModelWorkerKey`, accelerator/device placement identity, `RequestSessionDraft`, `SessionStateHandle`, and same-worker/state-kind compatibility. |
-| 4. Server-side prefill batching integration (same-worker/session compatibility, no cross-model batching) | DONE FOR QWEN35 | `cli/server_prefill_batch.ts`, `cli/server_prefill_batch.test.ts`, `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-generate-batch-prefill.sh`, `scripts/smoke-server-prefill-batch.sh` | Policy parsing, eligibility gate, scheduler selection, session adapter, daemon `generate_batch_prefill` dispatch, Qwen35 resident state handles, session release, dense fused prefill, and grouped-MoE fused prefill are implemented. Remaining work is generic worker residency beyond Qwen35. |
-| 5. Prefix/state cache metadata + safety telemetry | IN PROGRESS | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts`, `/health.prefill_batch`, `/health.state_cache` | Fingerprint, manifest keying, compatibility, spill guardrails, metadata-hit/runtime-hit telemetry, and metadata-only safety refusal are wired. Runtime attach/fork is still pending. |
+| 4. Server-side prefill batching integration (same-worker/session compatibility, no cross-model batching) | DONE FOR QWEN35 | `cli/server_prefill_batch.ts`, `cli/server_prefill_batch.test.ts`, `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-generate-batch-prefill.sh`, `scripts/smoke-server-prefill-batch.sh` | Policy parsing, eligibility gate, scheduler selection, session adapter, daemon `generate_batch_prefill` dispatch, Qwen35 resident state handles, session release, dense fused prefill, grouped-MoE fused prefill, and non-streaming text-only `/v1/responses` normalization are implemented. Remaining work is generic worker residency beyond Qwen35. |
+| 5. Prefix/state cache metadata + safety telemetry | IN PROGRESS | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts`, `/health.prefill_batch`, `/health.state_cache` | Fingerprint, manifest keying, compatibility, `prompt_cache_key` namespace support, spill guardrails, metadata-hit/runtime-hit telemetry, and metadata-only safety refusal are wired. Runtime attach/fork is still pending. |
 | 6. Scheduler starvation/backpressure hardening | DONE | `cli/worker_scheduler.ts`, `cli/worker_scheduler.test.ts` | Optional queue cap and deadline-aging selection prevent unbounded queue growth and strict-priority starvation. |
 | Blocker | PARTIAL | `crates/hipfire-runtime/examples/daemon.rs` implements Qwen35 fused prefill plus state-handle lifecycle and release protocol | Generic multi-model residency, decode batching, and non-Qwen35 worker-owned session arenas remain future work. |
 
@@ -142,6 +142,11 @@ HIPFIRE_SCHED_STATE_CACHE_DISK_MIN_PRIORITY=128
 The selected batch plan and `/health.prefill_batch` telemetry should surface
 the effective resident limit, spillable session count, and disk-cache decision
 so large low-priority batches are auditable rather than implicit.
+
+This policy is for session state, not model weight modules. Chaingun routed
+expert residency needs a separate model-module cache with pinned router/shared
+components, hot routed experts, warm GTT/UMA expert modules, and cold disk
+fallback. See [Chaingun MoE Module Layout Notes](chaingun-moe-module-layout.md).
 
 ## Scheduler Data Model
 
