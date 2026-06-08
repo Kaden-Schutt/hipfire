@@ -168,3 +168,19 @@ export function touchPrefixCheckpointManifest(
     lastUsedAtMs: nowMs,
   };
 }
+
+export function selectResidentCheckpointEvictions(
+  manifests: Iterable<PrefixCheckpointManifest>,
+  maxCheckpoints: number,
+): PrefixCheckpointManifest[] {
+  const limit = Math.max(0, Math.floor(maxCheckpoints));
+  const attachable = [...manifests].filter(prefixCheckpointAttachable);
+  if (attachable.length <= limit) return [];
+  return attachable
+    .sort((a, b) => {
+      const byLastUsed = a.lastUsedAtMs - b.lastUsedAtMs;
+      if (byLastUsed !== 0) return byLastUsed;
+      return a.createdAtMs - b.createdAtMs;
+    })
+    .slice(0, attachable.length - limit);
+}

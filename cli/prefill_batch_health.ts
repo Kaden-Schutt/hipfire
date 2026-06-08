@@ -33,6 +33,10 @@ export interface PrefillBatchHealthInputs {
   queueSize: number;
   pendingRequests?: number;
   residentRuntimeSessions?: number;
+  residentDecodeSessions?: number;
+  residentCheckpoints?: number;
+  residentCheckpointMax?: number;
+  residentStateCache?: boolean;
   residentStateLimit?: number;
   spillableBatchMax?: number;
   spillableSessions?: number;
@@ -71,6 +75,10 @@ export interface PrefillBatchHealthPayload {
   queue_size?: number;
   pending_requests?: number;
   resident_runtime_sessions?: number;
+  resident_decode_sessions?: number;
+  resident_checkpoints?: number;
+  resident_checkpoint_max?: number;
+  resident_state_cache?: boolean;
   resident_state_limit?: number;
   spillable_batch_max?: number;
   spillable_sessions?: number;
@@ -160,6 +168,10 @@ export function buildPrefillBatchHealthPayload(
     queue_size: input.queueSize,
     pending_requests: input.pendingRequests ?? 0,
     resident_runtime_sessions: input.residentRuntimeSessions ?? 0,
+    resident_decode_sessions: input.residentDecodeSessions ?? input.residentRuntimeSessions ?? 0,
+    resident_checkpoints: input.residentCheckpoints ?? 0,
+    resident_checkpoint_max: input.residentCheckpointMax ?? 0,
+    resident_state_cache: input.residentStateCache ?? false,
     resident_state_limit: input.residentStateLimit ?? 0,
     spillable_batch_max: input.spillableBatchMax ?? input.residentStateLimit ?? 0,
     spillable_sessions: input.spillableSessions ?? 0,

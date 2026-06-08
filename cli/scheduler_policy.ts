@@ -46,6 +46,10 @@ export interface SchedulerPolicyEnv {
   HIPFIRE_SCHED_SPILLABLE_BATCH_MAX?: string;
   HIPFIRE_SCHED_STATE_CACHE_DISK?: string;
   HIPFIRE_SCHED_STATE_CACHE_DISK_MIN_PRIORITY?: string;
+  HIPFIRE_SERVER_PREFILL_STATE_CACHE?: string;
+  HIPFIRE_SCHED_STATE_CACHE_RESIDENT?: string;
+  HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS?: string;
+  HIPFIRE_SERVER_PREFILL_STATE_CACHE_MAX?: string;
   HIPFIRE_SCHED_PREFILL_WAIT_MS_REALTIME?: string;
   HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE?: string;
   HIPFIRE_SCHED_PREFILL_WAIT_MS_BACKGROUND?: string;
@@ -62,6 +66,8 @@ export interface OpportunisticDispatchInput {
 }
 
 export interface ServerPrefillPolicyControls {
+  residentStateCache: boolean;
+  residentCheckpointMax: number;
   stateCacheDisk: boolean;
 }
 
@@ -114,12 +120,27 @@ export function schedulerPriorityClass(priority: SchedulerPriority): SchedulerPr
 export function parseServerPrefillPolicyControls(
   env: SchedulerPolicyEnv = process.env,
 ): ServerPrefillPolicyControls {
+  const residentStateCache = parseBoolean(
+    env.HIPFIRE_SERVER_PREFILL_STATE_CACHE,
+    parseBoolean(env.HIPFIRE_SCHED_STATE_CACHE_RESIDENT, false),
+  );
+  const residentCheckpointMax = Math.max(
+    0,
+    Math.min(64, parseInteger(
+      env.HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS ?? env.HIPFIRE_SERVER_PREFILL_STATE_CACHE_MAX,
+      4,
+    )),
+  );
   const stateCacheDisk = parseBoolean(
     env.HIPFIRE_SCHED_STATE_CACHE_DISK,
     parseBoolean(env.HIPFIRE_SERVER_PREFILL_BATCH_STATE_CACHE_DISK, false),
   );
   const legacyStateCacheDisk = parseBoolean(env.HIPFIRE_SERVER_PREFILL_BATCH_STATE_CACHE_DISK, false);
-  return { stateCacheDisk: stateCacheDisk || legacyStateCacheDisk };
+  return {
+    residentStateCache,
+    residentCheckpointMax,
+    stateCacheDisk: stateCacheDisk || legacyStateCacheDisk,
+  };
 }
 
 export function schedulerPolicyForPriority(

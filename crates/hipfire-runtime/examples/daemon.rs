@@ -852,9 +852,6 @@ fn parse_u32_array(value: &serde_json::Value, field: &str) -> Result<Vec<u32>, S
     let arr = value
         .as_array()
         .ok_or_else(|| format!("{field} must be an array"))?;
-    if arr.is_empty() {
-        return Err(format!("{field} must not be empty"));
-    }
     let mut out = Vec::with_capacity(arr.len());
     for (i, item) in arr.iter().enumerate() {
         match item.as_u64() {
@@ -1207,7 +1204,7 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
-    fn rejects_malformed_sessions() {
+    fn accepts_empty_suffix_for_attached_checkpoint_reuse() {
         let msg = serde_json::json!({
             "type": "generate_batch_prefill",
             "batch_id": "batch-1",
@@ -1216,14 +1213,17 @@ mod generate_batch_prefill_tests {
                 "id": "req-1",
                 "suffix_tokens": [],
                 "state_handle": {
-                    "state_kinds": ["attention_kv"],
-                    "logical_position": 0
+                    "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                    "logical_position": 4,
+                    "cached_prefix_tokens": 4,
+                    "runtime_state_handle": "qwen35-checkpoint:batch-0:req-0:4"
                 }
             }]
         });
 
-        let err = validate_generate_batch_prefill(&msg).unwrap_err();
-        assert!(err.contains("suffix_tokens must not be empty"));
+        let envelope = validate_generate_batch_prefill(&msg).expect("valid envelope");
+        assert_eq!(envelope.sessions[0].suffix_tokens.as_ref().unwrap().len(), 0);
+        assert_eq!(envelope.sessions[0].state_handle.cached_prefix_tokens, 4);
     }
 
     #[test]

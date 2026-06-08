@@ -5,6 +5,7 @@ import {
   prefixTokensHash,
   prefixCheckpointCompatible,
   prefixCheckpointAttachable,
+  selectResidentCheckpointEvictions,
   spillEligibility,
   touchPrefixCheckpointManifest,
   type PrefixCheckpointFingerprint,
@@ -227,5 +228,51 @@ describe("state cache spill guardrails", () => {
     expect(touched.hitCount).toBe(manifest.hitCount + 1);
     expect(touched.lastUsedAtMs).toBe(999);
     expect(touched.createdAtMs).toBe(manifest.createdAtMs);
+  });
+
+  test("selects least-recently-used attachable checkpoints for resident cap eviction", () => {
+    const metadataOnly = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [9],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      createdAtMs: 1,
+      lastUsedAtMs: 1,
+    });
+    const cold = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [1],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      runtimeState: "attachable",
+      runtimeStateHandle: "cold",
+      createdAtMs: 2,
+      lastUsedAtMs: 10,
+    });
+    const warm = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [2],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      runtimeState: "attachable",
+      runtimeStateHandle: "warm",
+      createdAtMs: 3,
+      lastUsedAtMs: 20,
+    });
+    const hot = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [3],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      runtimeState: "attachable",
+      runtimeStateHandle: "hot",
+      createdAtMs: 4,
+      lastUsedAtMs: 30,
+    });
+
+    expect(selectResidentCheckpointEvictions([metadataOnly, cold, warm, hot], 2).map((m) => m.runtimeStateHandle))
+      .toEqual(["cold"]);
+    expect(selectResidentCheckpointEvictions([metadataOnly, cold, warm, hot], 0).map((m) => m.runtimeStateHandle))
+      .toEqual(["cold", "warm", "hot"]);
   });
 });

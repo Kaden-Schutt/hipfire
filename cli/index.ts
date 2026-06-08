@@ -39,6 +39,7 @@ import {
   prefixCheckpointCompatible,
   prefixCheckpointAttachable,
   prefixCheckpointCacheKey,
+  selectResidentCheckpointEvictions,
   touchPrefixCheckpointManifest,
   spillEligibility,
   type PrefixCheckpointManifest,
@@ -1897,7 +1898,8 @@ async function serve(port: number, host: string) {
     promise: Promise<PendingPrefillOutcome>;
   };
   const pendingPrefillRequests = new Map<string, PendingPrefillRequest>();
-  const residentRuntimeSessions = new Set<string>();
+  const residentDecodeSessions = new Set<string>();
+  const residentCheckpointHandles = new Set<string>();
   const fallbackStateCacheStore = new Map<string, PrefixCheckpointManifest>();
   const getWorkerId = (workerKey: ModelWorkerKey): string => modelWorkerKeyId(workerKey);
   const getWorkerPrefillScheduler = (workerKey: ModelWorkerKey | null): PriorityPrefillScheduler | undefined => {
@@ -1917,6 +1919,86 @@ async function serve(port: number, host: string) {
     const created = new Map<string, PrefixCheckpointManifest>();
     workerStateCaches.set(key, created);
     return created;
+  };
+  const allStateCacheMaps = (): Map<string, PrefixCheckpointManifest>[] => [
+    fallbackStateCacheStore,
+    ...workerStateCaches.values(),
+  ];
+  const removeAttachableManifestsByHandle = (handle: string): number => {
+    let removed = 0;
+    for (const cache of allStateCacheMaps()) {
+      for (const [key, manifest] of cache.entries()) {
+        if (manifest.runtimeStateHandle === handle) {
+          cache.delete(key);
+          removed += 1;
+        }
+      }
+    }
+    residentCheckpointHandles.delete(handle);
+    return removed;
+  };
+  const clearResidentPrefixState = (reason: string) => {
+    const entries = allStateCacheMaps().reduce((sum, cache) => sum + cache.size, 0);
+    fallbackStateCacheStore.clear();
+    workerStateCaches.clear();
+    residentDecodeSessions.clear();
+    residentCheckpointHandles.clear();
+    if (entries > 0) {
+      console.error(`[hipfire] cleared resident prefix state (${reason}; entries=${entries})`);
+    }
+  };
+  const releaseRuntimeHandles = async (handles: Iterable<string>, reason: string): Promise<number> => {
+    const unique = [...new Set([...handles].filter((handle) => handle.length > 0))];
+    if (unique.length === 0) return 0;
+    try {
+      await e.send({
+        type: "release_sessions",
+        id: `release-${Date.now().toString(36)}`,
+        sessions: unique,
+      });
+      const releaseMsg = await e.recv();
+      if (releaseMsg?.type === "release_sessions_done") {
+        for (const handle of unique) {
+          residentDecodeSessions.delete(handle);
+          residentCheckpointHandles.delete(handle);
+        }
+        return unique.length;
+      }
+      console.error(`[hipfire] release_sessions returned ${releaseMsg?.type ?? "missing"} while releasing ${reason}`);
+    } catch (err: any) {
+      console.error(`[hipfire] failed to release ${reason}: ${err?.message ?? err}`);
+    }
+    return 0;
+  };
+  const releaseResidentCheckpointHandles = async (handles: Iterable<string>, reason: string): Promise<number> => {
+    const unique = [...new Set([...handles].filter((handle) => handle.length > 0))];
+    if (unique.length === 0) return 0;
+    for (const handle of unique) removeAttachableManifestsByHandle(handle);
+    return releaseRuntimeHandles(unique, reason);
+  };
+  const invalidateAttachFailure = async (handle: string | undefined, reason: string) => {
+    if (!handle) return;
+    const removed = removeAttachableManifestsByHandle(handle);
+    if (removed > 0) {
+      stateCacheEvictionsTotal += removed;
+      stateCacheRecomputeRequiredTotal += removed;
+      console.error(`[hipfire] invalidated stale prefix checkpoint ${handle}: ${reason}`);
+    }
+  };
+  const enforceResidentCheckpointCap = async () => {
+    const maxCheckpoints = serverPrefillBatchControls.residentCheckpointMax;
+    const manifests = allStateCacheMaps().flatMap((cache) => [...cache.values()]);
+    const evictions = selectResidentCheckpointEvictions(manifests, maxCheckpoints);
+    const evictedHandles = evictions
+      .map((manifest) => manifest.runtimeStateHandle)
+      .filter((handle): handle is string => typeof handle === "string" && handle.length > 0);
+    if (evictedHandles.length === 0) return;
+    const released = await releaseResidentCheckpointHandles(evictedHandles, "resident checkpoint cap");
+    stateCacheEvictionsTotal += evictions.length;
+    stateCacheRecomputeRequiredTotal += evictions.length;
+    if (released > 0) {
+      console.error(`[hipfire] evicted ${released} resident prefix checkpoint(s); cap=${maxCheckpoints}`);
+    }
   };
   const prefillBatchMetrics = {
     eligible: 0,
@@ -1945,6 +2027,8 @@ async function serve(port: number, host: string) {
   let lastResidentStateLimit = 0;
   let lastSpillableBatchMax = 0;
   let lastSpillableSessions = 0;
+  let lastResidentStateCache = serverPrefillBatchControls.residentStateCache;
+  let lastResidentCheckpointMax = serverPrefillBatchControls.residentCheckpointMax;
   let lastStateCacheDisk = false;
   let lastStateCacheDiskMinPriority = 128;
   let lastDiskSpillAllowed = false;
@@ -2302,6 +2386,8 @@ async function serve(port: number, host: string) {
     residentStateLimit: number,
     spillableBatchMax: number,
     selectedSize: number,
+    residentStateCache: boolean,
+    residentCheckpointMax: number,
     stateCacheDisk: boolean,
     stateCacheDiskMinPriority: number,
     diskSpillAllowed: boolean,
@@ -2311,6 +2397,8 @@ async function serve(port: number, host: string) {
     lastSpillableSessions = diskSpillAllowed
       ? Math.max(0, Math.floor(selectedSize) - lastResidentStateLimit)
       : 0;
+    lastResidentStateCache = residentStateCache;
+    lastResidentCheckpointMax = Math.max(0, Math.floor(residentCheckpointMax));
     lastStateCacheDisk = stateCacheDisk;
     lastStateCacheDiskMinPriority = Math.max(0, Math.min(255, Math.floor(stateCacheDiskMinPriority)));
     lastDiskSpillAllowed = diskSpillAllowed;
@@ -2380,6 +2468,7 @@ async function serve(port: number, host: string) {
       modelHasVL = false;
       currentStateMode = null;
       currentArch = null;
+      clearResidentPrefixState("idle unload");
     }
   }, Math.min(60_000, idleTimeoutMs)) : null;
   // Keep process alive irrespective of the interval; clean up on exit.
@@ -2402,6 +2491,7 @@ async function serve(port: number, host: string) {
           if (msg.type === "done") break;
         }
         await e.send({ type: "reset" }); await e.recv();
+        clearResidentPrefixState("pre-warm reset");
         current = warmPath;
         currentMaxSeq = warmLoadMsg.params.max_seq;
         currentStateMode = warmLoadMsg.params.kv_mode || null;
@@ -2421,6 +2511,7 @@ async function serve(port: number, host: string) {
       console.error(`[hipfire] pre-warm failed: ${err?.message} — restarting daemon`);
       current = null;
       currentMaxSeq = null;
+      clearResidentPrefixState("pre-warm daemon restart");
       try { await e.stop(); } catch {}
       await e.start();
       await e.send({ type: "ping" }); await e.recv();
@@ -2482,7 +2573,11 @@ async function serve(port: number, host: string) {
                   runtimeCacheHits: prefillBatchMetrics.runtimeCacheHits,
                   queueSize: prefillQueueSize,
                   pendingRequests: pendingPrefillRequests.size,
-                  residentRuntimeSessions: residentRuntimeSessions.size,
+                  residentRuntimeSessions: residentDecodeSessions.size + residentCheckpointHandles.size,
+                  residentDecodeSessions: residentDecodeSessions.size,
+                  residentCheckpoints: residentCheckpointHandles.size,
+                  residentCheckpointMax: lastResidentCheckpointMax,
+                  residentStateCache: lastResidentStateCache,
                   residentStateLimit: lastResidentStateLimit,
                   spillableBatchMax: lastSpillableBatchMax,
                   spillableSessions: lastSpillableSessions,
@@ -2506,7 +2601,11 @@ async function serve(port: number, host: string) {
               : { enabled: false },
             state_cache: serverPrefillBatch.enabled
               ? {
-                  enabled: serverPrefillBatchControls.stateCacheDisk,
+                  enabled: serverPrefillBatchControls.residentStateCache || serverPrefillBatchControls.stateCacheDisk,
+                  resident_enabled: serverPrefillBatchControls.residentStateCache,
+                  resident_checkpoints: residentCheckpointHandles.size,
+                  resident_checkpoint_max: serverPrefillBatchControls.residentCheckpointMax,
+                  disk_enabled: serverPrefillBatchControls.stateCacheDisk,
                   entries: stateCacheEntries,
                   bytes: stateCacheBytes,
                   metadata_hits: prefillBatchMetrics.metadataCacheHits,
@@ -2746,6 +2845,7 @@ async function serve(port: number, host: string) {
         e.generating = false;
         current = null; // daemon may have restarted — force model reload
         currentMaxSeq = null;
+        clearResidentPrefixState("interrupted generation drain");
       }
 
       try {
@@ -2802,9 +2902,9 @@ async function serve(port: number, host: string) {
         // Skip the reset for V4F and let the daemon's auto-LCP
         // (with a strict "fully extends" guard for SWA-ring safety)
         // decide whether this is a continuation or a fresh request.
-        if (currentArch !== "deepseek4") {
-          await e.send({ type: "reset" }); await e.recv();
-        }
+        // Stateless reset happens after reload and batching eligibility are
+        // known. Resident prefix checkpoints live in the daemon session arena,
+        // so an unconditional reset here would erase them before cache lookup.
 
         // Build prompt from messages with proper role handling
         let systemPrompt = "";
@@ -3080,7 +3180,10 @@ async function serve(port: number, host: string) {
         const needReload = initialRoute.needsReload;
 
         if (needReload) {
-          if (current) { await e.send({ type: "unload" }); await e.recv(); }
+          if (current) {
+            await e.send({ type: "unload" }); await e.recv();
+            clearResidentPrefixState("model reload unload");
+          }
           const loadMsg = buildLoadMessage(path, body.model);
           if (requiredMaxSeq > loadMsg.params.max_seq) {
             console.error(`[hipfire] request max_tokens=${requestMaxTokens} needs max_seq >= ${requiredMaxSeq} — bumping load (was ${loadMsg.params.max_seq})`);
@@ -3092,6 +3195,7 @@ async function serve(port: number, host: string) {
             current = null;
             currentMaxSeq = null;
             modelHasVL = false;
+            clearResidentPrefixState("model load failed");
             safeRelease();
             return Response.json({ error: `model load failed: ${loadResult.message}` }, { status: 500 });
           }
@@ -3136,6 +3240,20 @@ async function serve(port: number, host: string) {
             requestImages,
             effectiveConfig: effective,
           });
+        }
+
+        const requestPromptCacheRetention = normalizePromptCacheRetention(body.prompt_cache_retention);
+        const requestAllowsResidentPrefixCache = serverPrefillBatchControls.residentStateCache
+          || requestPromptCacheRetention === "in_memory"
+          || requestPromptCacheRetention === "24h";
+        const preserveDaemonStateForResidentCache = serverPrefillBatch.enabled
+          && requestAllowsResidentPrefixCache
+          && prefillBatchGate.eligible
+          && body.stream !== true
+          && generateBatchPrefillCapability === "supported";
+        if (currentArch !== "deepseek4" && !preserveDaemonStateForResidentCache) {
+          await e.send({ type: "reset" }); await e.recv();
+          clearResidentPrefixState("request reset");
         }
 
         const servingWorkerStateMode = currentStateMode || effective.kv_cache;
@@ -3205,6 +3323,22 @@ async function serve(port: number, host: string) {
             userPrompt = "";
           }
         }
+        const structuredMessages = mapMessagesToStructured(messages);
+        const renderInputHash = stableObjectHash({
+          arch: currentArch,
+          model: current,
+          system: systemPrompt || null,
+          prompt: userPrompt,
+          messages: structuredMessages,
+          tools: Array.isArray(body.tools) ? body.tools : [],
+          assistant_prefix_inputs: {
+            thinking: effective.thinking,
+            max_think_tokens: effective.max_think_tokens,
+            chat_template_kwargs: (body as any).chat_template_kwargs ?? null,
+            reasoning: (body as any).reasoning ?? null,
+          },
+          jinja_chat: process.env.HIPFIRE_JINJA_CHAT === "1",
+        });
 
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
         const requestNowMs = Date.now();
@@ -3240,6 +3374,8 @@ async function serve(port: number, host: string) {
             mtp_mode: effective.mtp_mode,
             mtp_k: effective.mtp_k,
             prompt_cache_key: body.prompt_cache_key ?? null,
+            prompt_cache_retention: requestPromptCacheRetention ?? null,
+            render_input_hash: renderInputHash,
           }),
           stateMode,
           positionPolicy: "rope",
@@ -3301,7 +3437,9 @@ async function serve(port: number, host: string) {
                 } catch { return false; }
               })
               .sort((a, b) => b.prefixLen - a.prefixLen)[0];
-            const cacheLookup = compatibleCacheLookup && prefixCheckpointAttachable(compatibleCacheLookup)
+            const cacheLookup = requestAllowsResidentPrefixCache
+              && compatibleCacheLookup
+              && prefixCheckpointAttachable(compatibleCacheLookup)
               ? compatibleCacheLookup
               : undefined;
 
@@ -3312,7 +3450,7 @@ async function serve(port: number, host: string) {
               cachePrefixLen = cacheLookup.prefixLen;
               cacheManifest = touchPrefixCheckpointManifest(cacheLookup, requestNowMs);
               cacheKey = prefixCheckpointCacheKey(cacheManifest);
-              if (serverPrefillBatchControls.stateCacheDisk) {
+              if (requestAllowsResidentPrefixCache || serverPrefillBatchControls.stateCacheDisk) {
                 servingWorkerStateCache.set(cacheKey, cacheManifest);
               }
               serverPrefillSession = {
@@ -3358,7 +3496,9 @@ async function serve(port: number, host: string) {
               spillReason = spillProfile.reason;
               if (spillProfile.spillable) servingWorkerStateCache.set(cacheKey, manifest);
             } else {
-              spillReason = "state_cache_disk_disabled";
+              spillReason = requestAllowsResidentPrefixCache
+                ? "resident_state_cache_only"
+                : "state_cache_disabled";
             }
 
             // Exercise the queueing path (enqueue -> preview -> dequeue) for
@@ -3565,6 +3705,8 @@ async function serve(port: number, host: string) {
             batchPolicy.residentStateMax,
             batchPolicy.spillableBatchMax,
             selectedBatchSize,
+            requestAllowsResidentPrefixCache,
+            serverPrefillBatchControls.residentCheckpointMax,
             serverPrefillBatchControls.stateCacheDisk,
             batchPolicy.diskSpillMinPriority,
             batchPolicy.diskSpillAllowed,
@@ -3577,6 +3719,8 @@ async function serve(port: number, host: string) {
             resident_state_limit: batchPolicy.residentStateMax,
             spillable_batch_max: batchPolicy.spillableBatchMax,
             spillable_sessions: spillableSessions,
+            resident_state_cache: requestAllowsResidentPrefixCache,
+            resident_checkpoint_max: serverPrefillBatchControls.residentCheckpointMax,
             state_cache_disk: serverPrefillBatchControls.stateCacheDisk,
             state_cache_disk_min_priority: batchPolicy.diskSpillMinPriority,
             disk_spill_allowed: batchPolicy.diskSpillAllowed,
@@ -3673,7 +3817,6 @@ async function serve(port: number, host: string) {
         if (Array.isArray(body.tools) && body.tools.length > 0) {
           genParams.tools = body.tools;
         }
-        const structuredMessages = mapMessagesToStructured(messages);
         if (structuredMessages.length > 0) {
           genParams.messages = structuredMessages;
         }
@@ -3784,7 +3927,7 @@ async function serve(port: number, host: string) {
                     typeof stateHandle.session_id === "string"
                   ) {
                     runtimeStateHandlesBySession.set(prefillMsg.session_id, stateHandle.session_id);
-                    residentRuntimeSessions.add(stateHandle.session_id);
+                    residentDecodeSessions.add(stateHandle.session_id);
                   }
                   if (
                     typeof prefillMsg.session_id === "string" &&
@@ -3798,7 +3941,6 @@ async function serve(port: number, host: string) {
                     typeof stateHandle.checkpoint_id === "string"
                   ) {
                     checkpointStateHandlesBySession.set(prefillMsg.session_id, stateHandle.checkpoint_id);
-                    residentRuntimeSessions.add(stateHandle.checkpoint_id);
                   }
                   continue;
                 }
@@ -3833,17 +3975,17 @@ async function serve(port: number, host: string) {
                 });
                 const releaseMsg = await e.recv();
                 if (releaseMsg?.type === "release_sessions_done") {
-                  for (const handle of evictedRuntimeHandles) residentRuntimeSessions.delete(handle);
+                  for (const handle of evictedRuntimeHandles) residentDecodeSessions.delete(handle);
                 }
                 stateCacheEvictionsTotal += evictedRuntimeHandles.length;
                 stateCacheRecomputeRequiredTotal += evictedRuntimeHandles.length;
               }
-              const storeAttachableCheckpoint = (
+              const storeAttachableCheckpoint = async (
                 draft: RequestSessionDraft,
                 checkpointHandle: string | undefined,
                 runtimeLogicalPosition: number | undefined,
               ) => {
-                if (!serverPrefillBatchControls.stateCacheDisk || !checkpointHandle) return;
+                if (!requestAllowsResidentPrefixCache || !checkpointHandle) return;
                 const prefixLen = Math.min(
                   draft.promptTokens.length,
                   Math.max(0, draft.cachedPrefixTokens + draft.suffixTokens.length),
@@ -3862,13 +4004,32 @@ async function serve(port: number, host: string) {
                   hitCount: 0,
                   checksums: checksumLookup,
                 });
-                servingWorkerStateCache.set(prefixCheckpointCacheKey(checkpointManifest), checkpointManifest);
+                const key = prefixCheckpointCacheKey(checkpointManifest);
+                const previous = servingWorkerStateCache.get(key);
+                if (
+                  previous?.runtimeStateHandle &&
+                  previous.runtimeStateHandle !== checkpointHandle
+                ) {
+                  await releaseResidentCheckpointHandles(
+                    [previous.runtimeStateHandle],
+                    "resident checkpoint replacement",
+                  );
+                }
+                residentCheckpointHandles.add(checkpointHandle);
+                servingWorkerStateCache.set(key, checkpointManifest);
+                await enforceResidentCheckpointCap();
               };
-              storeAttachableCheckpoint(
+              await storeAttachableCheckpoint(
                 serverPrefillSession,
                 checkpointStateHandlesBySession.get(reqId),
                 logicalPositionsBySession.get(reqId),
               );
+              if (!requestAllowsResidentPrefixCache) {
+                await releaseRuntimeHandles(
+                  checkpointStateHandlesBySession.values(),
+                  "unused prefix checkpoints",
+                );
+              }
               if (evictedSessionIds.has(reqId)) {
                 genParams.prefill_already_done = false;
                 releaseRuntimeSessionId = null;
@@ -3913,6 +4074,16 @@ async function serve(port: number, host: string) {
               }
             } catch (err: any) {
               const reason = err?.message ?? "daemon_serial_prefill_failed";
+              if (
+                reason.includes("failed to attach checkpoint") ||
+                reason.includes("checkpoint source session") ||
+                reason.includes("no resident session exists")
+              ) {
+                await invalidateAttachFailure(
+                  serverPrefillSession.stateHandle.runtimeStateHandle,
+                  reason,
+                );
+              }
               if (genParams.server_prefill_batch) {
                 genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill_failed";
                 genParams.server_prefill_batch.runtime_dispatch_reason = reason;
@@ -4004,7 +4175,7 @@ async function serve(port: number, host: string) {
                 }
               }
               if (
-                serverPrefillBatchControls.stateCacheDisk &&
+                requestAllowsResidentPrefixCache &&
                 pendingOutcome.checkpointStateHandle &&
                 serverPrefillSession
               ) {
@@ -4026,7 +4197,20 @@ async function serve(port: number, host: string) {
                     hitCount: 0,
                     checksums: checksumLookup,
                   });
-                  servingWorkerStateCache.set(prefixCheckpointCacheKey(checkpointManifest), checkpointManifest);
+                  const key = prefixCheckpointCacheKey(checkpointManifest);
+                  const previous = servingWorkerStateCache.get(key);
+                  if (
+                    previous?.runtimeStateHandle &&
+                    previous.runtimeStateHandle !== pendingOutcome.checkpointStateHandle
+                  ) {
+                    await releaseResidentCheckpointHandles(
+                      [previous.runtimeStateHandle],
+                      "resident checkpoint replacement",
+                    );
+                  }
+                  residentCheckpointHandles.add(pendingOutcome.checkpointStateHandle);
+                  servingWorkerStateCache.set(key, checkpointManifest);
+                  await enforceResidentCheckpointCap();
                 }
               }
               releaseRuntimeSessionId = pendingOutcome.runtimeStateEvicted
@@ -4501,6 +4685,15 @@ async function serve(port: number, host: string) {
           }), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
         }
 
+        if (
+          currentArch !== "deepseek4" &&
+          preserveDaemonStateForResidentCache &&
+          genParams.prefill_already_done !== true
+        ) {
+          await e.send({ type: "reset" }); await e.recv();
+          clearResidentPrefixState("prefill fallback reset");
+        }
+
         let content = "";
         let completionTokens = 0;
         let promptTokens = 0;
@@ -4579,7 +4772,7 @@ async function serve(port: number, host: string) {
             });
             const releaseMsg = await e.recv();
             if (releaseMsg?.type === "release_sessions_done") {
-              residentRuntimeSessions.delete(releaseRuntimeSessionId);
+              residentDecodeSessions.delete(releaseRuntimeSessionId);
             }
           } catch (err: any) {
             console.error(`[hipfire] failed to release runtime session ${releaseRuntimeSessionId}: ${err?.message ?? err}`);

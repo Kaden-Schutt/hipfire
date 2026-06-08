@@ -42,17 +42,42 @@ describe("server prefill batching policy", () => {
     });
   });
 
-  test("legacy cache-control env enables state cache disk when new and old toggles are parsed", () => {
+  test("resident cache controls are separate from disk spill controls", () => {
+    expect(parseServerPrefillPolicyControls({})).toEqual({
+      residentStateCache: false,
+      residentCheckpointMax: 4,
+      stateCacheDisk: false,
+    });
+    expect(parseServerPrefillPolicyControls({
+      HIPFIRE_SERVER_PREFILL_STATE_CACHE: "1",
+      HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS: "12",
+    })).toEqual({
+      residentStateCache: true,
+      residentCheckpointMax: 12,
+      stateCacheDisk: false,
+    });
     expect(parseServerPrefillPolicyControls({
       HIPFIRE_SCHED_STATE_CACHE_DISK: "1",
-    })).toEqual({ stateCacheDisk: true });
+    })).toEqual({
+      residentStateCache: false,
+      residentCheckpointMax: 4,
+      stateCacheDisk: true,
+    });
     expect(parseServerPrefillPolicyControls({
       HIPFIRE_SERVER_PREFILL_BATCH_STATE_CACHE_DISK: "1",
-    })).toEqual({ stateCacheDisk: true });
+    })).toEqual({
+      residentStateCache: false,
+      residentCheckpointMax: 4,
+      stateCacheDisk: true,
+    });
     expect(parseServerPrefillPolicyControls({
       HIPFIRE_SERVER_PREFILL_BATCH_STATE_CACHE_DISK: "1",
       HIPFIRE_SCHED_STATE_CACHE_DISK: "0",
-    })).toEqual({ stateCacheDisk: true });
+    })).toEqual({
+      residentStateCache: false,
+      residentCheckpointMax: 4,
+      stateCacheDisk: true,
+    });
   });
 
   test("pending wait covers coalescing plus expected prefill processing", () => {

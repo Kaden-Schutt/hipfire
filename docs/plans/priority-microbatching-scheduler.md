@@ -22,7 +22,7 @@ Hipfire metadata/config and defaults to interactive user traffic.
 | 2. Per-worker queueing, enqueue/dequeue/cancel, policy selection | DONE | `cli/worker_scheduler.ts`, `cli/worker_scheduler.test.ts` | Priority buckets, compatibility filtering, opportunistic dispatch policy in one worker-local scheduler. |
 | 3. Model/session foundations and request/session compatibility | DONE | `cli/session_state.ts`, `cli/session_state.test.ts` | Includes `ModelWorkerKey`, accelerator/device placement identity, `RequestSessionDraft`, `SessionStateHandle`, and same-worker/state-kind compatibility. |
 | 4. Server-side prefill batching integration (same-worker/session compatibility, no cross-model batching) | DONE FOR QWEN35 | `cli/server_prefill_batch.ts`, `cli/server_prefill_batch.test.ts`, `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-generate-batch-prefill.sh`, `scripts/smoke-server-prefill-batch.sh` | Policy parsing, eligibility gate, scheduler selection, session adapter, daemon `generate_batch_prefill` dispatch, Qwen35 resident state handles, session release, dense fused prefill, grouped-MoE fused prefill, and non-streaming text-only `/v1/responses` normalization are implemented. Remaining work is generic worker residency beyond Qwen35. |
-| 5. Prefix/state cache metadata + safety telemetry | IN PROGRESS | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts`, `/health.prefill_batch`, `/health.state_cache` | Fingerprint, manifest keying, compatibility, `prompt_cache_key` namespace support, spill guardrails, metadata-hit/runtime-hit telemetry, and metadata-only safety refusal are wired. Runtime attach/fork is still pending. |
+| 5. Prefix/state cache metadata + safety telemetry | DONE FOR QWEN35 V1 | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts`, `/health.prefill_batch`, `/health.state_cache`, `scripts/smoke-server-prefix-checkpoint-reuse.sh` | Fingerprint, manifest keying, compatibility, `prompt_cache_key` namespace support, spill guardrails, metadata/runtime-hit telemetry, Qwen35 resident attach/fork, lifecycle invalidation, and capped in-memory checkpoint residency are wired. Partial-prefix reuse remains exact-render-input only until the daemon exposes a token-hash preflight. |
 | 6. Scheduler starvation/backpressure hardening | DONE | `cli/worker_scheduler.ts`, `cli/worker_scheduler.test.ts` | Optional queue cap and deadline-aging selection prevent unbounded queue growth and strict-priority starvation. |
 | Blocker | PARTIAL | `crates/hipfire-runtime/examples/daemon.rs` implements Qwen35 fused prefill plus state-handle lifecycle and release protocol | Generic multi-model residency, decode batching, and non-Qwen35 worker-owned session arenas remain future work. |
 
@@ -103,12 +103,20 @@ HIPFIRE_SCHED_PREFILL_WAIT_MS_REALTIME=0
 HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE=5
 HIPFIRE_SCHED_PREFILL_WAIT_MS_BACKGROUND=25
 HIPFIRE_SCHED_OPPORTUNISTIC_MIN_PAIR_TOKENS=256
+HIPFIRE_SERVER_PREFILL_STATE_CACHE=0
+HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS=4
 HIPFIRE_SCHED_STATE_CACHE_DISK=0
 ```
 
 The existing `HIPFIRE_SERVER_PREFILL_BATCH*` knobs can remain as compatibility
 aliases during migration, but new scheduler code should use the
 `HIPFIRE_SCHED_*` names.
+
+Resident in-memory prefix checkpoint reuse is intentionally controlled by
+`HIPFIRE_SERVER_PREFILL_STATE_CACHE`, not by the disk-spill flag. Requests can
+also opt into the resident cache with `prompt_cache_retention=in_memory` or
+`prompt_cache_retention=24h`; `24h` is accepted as OpenAI-compatible intent but
+is treated as in-memory until serialization/rehydrate exists.
 
 ### Disk-Eviction Policy Note
 
@@ -147,6 +155,20 @@ This policy is for session state, not model weight modules. Chaingun routed
 expert residency needs a separate model-module cache with pinned router/shared
 components, hot routed experts, warm GTT/UMA expert modules, and cold disk
 fallback. See [Chaingun MoE Module Layout Notes](chaingun-moe-module-layout.md).
+
+### Resident Checkpoint Policy Note
+
+Qwen35 V1 resident prefix reuse keeps attachable checkpoints in daemon memory
+only. The CLI tracks resident checkpoint handles separately from active decode
+session handles, releases decode sessions after generation, and evicts LRU
+checkpoints above `HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS` with `release_sessions`.
+Daemon reset, unload, reload, interrupted-generation drain, and stale attach
+failures clear the corresponding CLI manifests so a dead handle is not retried
+as a cache hit.
+
+This is deliberately narrower than disk spill. `HIPFIRE_SCHED_STATE_CACHE_DISK`
+is reserved for future checkpoint serialization and rehydrate; it must not be
+used as the in-memory resident reuse flag.
 
 ## Scheduler Data Model
 
