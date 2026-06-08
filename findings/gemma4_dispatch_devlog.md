@@ -1615,3 +1615,40 @@ Pre-reqs per updated plan:
 3. Write Rust sibling methods (`_cap`) and extend low-fan-out signatures
 4. Remove `let _ = cache_capacity` stubs in `gemma4_ext.rs`
 5. Gate: ring logits == window-only logits at >1024 tokens
+
+---
+
+## 2026-06-08 · Session 18b — q8 KV window/ring + hd512 full-layer support
+
+### q8 tile kernel window + ring-buffer
+
+Added `window_size` + `cache_capacity` params to `attention_flash_q8_0_tile.hip`,
+same pattern as the asym3 tile kernel:
+- Per-position `out_of_window` guard: scores set to -1e30, V accumulation skipped
+- Ring-buffer slot indexing: `k_slot = cap>0 ? t%cap : t` for both K and V
+- Tile-level early exit for tiles fully below window
+
+Rust side: `attention_flash_q8_0_cap` sibling method (zero caller changes).
+`gemma4_ext.rs` wrapper threads args through instead of dropping.
+
+### q8 hd512 full-layer support
+
+The q8 tile kernel already handles arbitrary head_dim via `n_halves`
+(n_halves=4 for hd512, LDS = (128+512)*4 = 2560 B — well within limits).
+Removed the hard `Err` for q8 full layers; now calls `attention_flash_q8_0_cap`
+with window=0/cap=0.
+
+Gate: oracle argmax=236761 at 1200 tokens, byte-identical logits.
+
+### hsaco analysis deferred
+
+Attempted VGPR/LDS analysis via llvm-objdump on the hsaco. The .hsaco files
+are clang offload bundles (not raw ELF); need clang-offload-bundler to
+extract the amdgcn target before disassembly. The atlas tool's ISA extraction
+also fails because `llvm-objdump` isn't on PATH by default.
+
+This is a tooling gap, not a kernel issue. Deferring to a dedicated
+kernel-optimization follow-up task covering:
+- hsaco extraction + objdump analysis for VGPR spills, LDS usage
+- rocprofv3 micro-benchmarks for tile kernels across hd256/hd512
+- General kernel speed-up pass (all quant formats)
