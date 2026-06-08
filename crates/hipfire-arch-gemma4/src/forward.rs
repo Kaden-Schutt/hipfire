@@ -855,7 +855,11 @@ pub fn forward_batch_spec(
     let x = alloc(gpu, b * dim, "x")?;
     let residual = alloc(gpu, b * dim, "residual")?;
     let nrm = alloc(gpu, b * dim, "nrm")?; // rmsnorm output / shared proj input
-    let x_rot = alloc(gpu, b * dim, "x_rot")?; // FWHT scratch (MQ4 proj path)
+    // x_rot is the SHARED FWHT-rotate scratch for every projection in the layer
+    // (proj_gemm_batched rotates b*w.k floats into it). The largest w.k is the
+    // o_proj on FULL attention layers: k = n_heads*full_head_dim (= max_q here),
+    // which exceeds dim. Size for the max so the o_proj rotation can't OOB-write.
+    let x_rot = alloc(gpu, b * max_q.max(dim), "x_rot")?; // FWHT scratch (MQ4 proj path)
     let q = alloc(gpu, b * max_q, "q")?;
     let k = alloc(gpu, b * max_kv, "k")?;
     let v = alloc(gpu, b * max_kv, "v")?;
