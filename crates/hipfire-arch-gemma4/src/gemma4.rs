@@ -15,13 +15,63 @@
 //!   • Embed scale: sqrt(hidden_size) multiplied onto every embedding row lookup.
 
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, weight_gemm, WeightTensor, EmbeddingFormat};
+use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, WeightTensor, EmbeddingFormat};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::gemm::GemmParams;
+use hipfire_dispatch::families::gemv::WeightRef;
+
+/// #397 Ship 5.2: route a single PLAIN-batched prefill GEMM through
+/// [`GemmFamily::run_key`] against an explicit dispatcher-entry key.
+///
+/// Byte-identical to the old `weight_gemm()` call for every (dtype × arch).
+/// Only HFQ4G256, HFQ4G128 have batched kernels; other dtypes fall back to
+/// the repeated-GEMV loop (same as `weight_gemm`'s fallback).
+#[inline]
+fn run_prefill_gemm(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    batch_size: usize,
+) -> HipResult<()> {
+    let key = match w.gpu_dtype {
+        DType::HFQ4G256 => hipfire_dispatch::types::KernelKey::GemmHfq4G256,
+        DType::HFQ4G128 => hipfire_dispatch::types::KernelKey::GemmHfq4G128,
+        // No batched GEMM kernel for this dtype — fall back to repeated GEMV.
+        // This matches the old `weight_gemm()` fallback path.
+        _ => {
+            let x_tok = gpu.alloc_tensor(&[w.k], DType::F32)?;
+            let y_tok = gpu.alloc_tensor(&[w.m], DType::F32)?;
+            for b in 0..batch_size {
+                gpu.hip.memcpy_dtod_at(&x_tok.buf, 0, &x.buf, b * w.k * 4, w.k * 4)?;
+                weight_gemv(gpu, w, &x_tok, &y_tok)?;
+                gpu.hip.memcpy_dtod_at(&y.buf, b * w.m * 4, &y_tok.buf, 0, w.m * 4)?;
+            }
+            gpu.free_tensor(x_tok)?;
+            gpu.free_tensor(y_tok)?;
+            return Ok(());
+        }
+    };
+    let ctx = DispatchCtx::new(gpu);
+    let w_ref = WeightRef {
+        buf: &w.buf,
+        dtype: w.gpu_dtype,
+        m: w.m,
+        k: w.k,
+        row_stride: w.k,
+        rotation: None,
+        awq_scale: None,
+    };
+    let params = GemmParams { w: &w_ref, x, y, batch_size };
+    llama::gemm_family()
+        .run_key(key, &ctx, gpu, &params)
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+}
 
 /// Env-gated dump helper for v1-vs-v2 root-cause work.
 /// Set HIPFIRE_GEMMA4_DUMP=1 to enable. Prints first 4 floats + sum + nan/inf count.
@@ -1432,7 +1482,7 @@ fn apply_moe_branch_batched(
     // every element, which is what we want (each row is divided by sqrt(dim)).
 
     // 4) Router GEMM → logits [N × n_exp]
-    weight_gemm(gpu, &moe.router_proj, &scratch.pb_moe_router_in,
+    run_prefill_gemm(gpu, &moe.router_proj, &scratch.pb_moe_router_in,
         &scratch.pb_moe_router_logits, n_batch)?;
 
     // 5) Batched top-K softmax + renorm.
@@ -2521,9 +2571,9 @@ fn forward_prefill_batch_v2(
                 gpu.rmsnorm_batched(&scratch.pb_residual, &lw.input_layernorm,
                     &scratch.pb_tmp, n_batch, dim, config.norm_eps)?;
                 if _dump_on { dbg_dump(gpu, "[v2] L0 after input_norm", &scratch.pb_tmp, dim); }
-                weight_gemm(gpu, &lw.q_proj, &scratch.pb_tmp, &scratch.pb_q, n_batch)?;
-                weight_gemm(gpu, &lw.k_proj, &scratch.pb_tmp, &scratch.pb_k, n_batch)?;
-                weight_gemm(gpu, &lw.v_proj, &scratch.pb_tmp, &scratch.pb_v, n_batch)?;
+                run_prefill_gemm(gpu, &lw.q_proj, &scratch.pb_tmp, &scratch.pb_q, n_batch)?;
+                run_prefill_gemm(gpu, &lw.k_proj, &scratch.pb_tmp, &scratch.pb_k, n_batch)?;
+                run_prefill_gemm(gpu, &lw.v_proj, &scratch.pb_tmp, &scratch.pb_v, n_batch)?;
                 if _dump_on {
                     dbg_dump(gpu, "[v2] L0 after q_proj", &scratch.pb_q, q_dim);
                     dbg_dump(gpu, "[v2] L0 after k_proj", &scratch.pb_k, kv_dim);
@@ -2549,38 +2599,67 @@ fn forward_prefill_batch_v2(
                     dbg_dump(gpu, "[v2] L0 after rope_k", &scratch.pb_k, kv_dim);
                 }
 
-                // 2026-05-19: replaced the per-token attention loop with a single
-                // batched kv_cache_write + attention dispatch. Eliminates
-                // ~30 × n_batch micro-launches per chunk (was 30 layers × 128
-                // tokens × (pos_buf htod + 3 memcpy + kv_write + attn + memcpy) =
-                // ~15,000 launches per 128-token chunk). The batched kernels
-                // accept pb_positions (host-staged i32 array) + cache_capacity
-                // (ring-buffer modulo for sliding KV).
+                // Batched KV write + attention via dispatch framework.
+                // Step::Attend combines kv_cache_write + flash attention
+                // into a single dispatch through AttentionFamily.
                 let ct = kv_sliding.givens_cos.as_ref().unwrap();
                 let st = kv_sliding.givens_sin.as_ref().unwrap();
                 let sliding_cap = config.sliding_window as u32;
-                gpu.kv_cache_write_asym3_batched(
-                    &kv_sliding.k_gpu[sliding_kv_idx], &kv_sliding.v_gpu[sliding_kv_idx],
-                    &scratch.pb_k, &scratch.pb_v, &scratch.pb_positions,
-                    ct, st, n_kv, head_dim, n_batch)?;
-                // max_ctx_len = upper bound on observed seq_len for max_tiles
-                // sizing. Use start_pos + n_batch (the highest pos this chunk
-                // touches) so attention reduce sweeps the right tile count.
                 let max_ctx_len = start_pos + n_batch;
-                gpu.attention_flash_asym3_batched_window(
-                    &scratch.pb_q,                                         // q [n_batch × q_dim]
-                    &kv_sliding.k_gpu[sliding_kv_idx], &kv_sliding.v_gpu[sliding_kv_idx],
-                    &scratch.pb_q,                                         // out aliases q (safe — tile reads q first, reduce writes out last)
-                    &scratch.pb_positions, ct, st,
-                    n_heads, n_kv, head_dim,
-                    kv_sliding.max_seq, max_ctx_len, n_batch,
-                    &scratch.flash_partials,
-                    sliding_cap, sliding_cap,
-                )?;
+                {
+                    let plan = KvTierPlan::derive(KvTierInputs {
+                        quant_asym4: false,
+                        quant_asym3: true,
+                        quant_asym2: false,
+                        quant_q8: false,
+                        quant_fwht: false,
+                        quant_hfq4: false,
+                        quant_q4: false,
+                        v_mode_bits: 8, // Q8_0 V for asym3
+                        pos: start_pos,
+                        flash_mode: 2,
+                        capture_mode: false,
+                        batch_size: n_batch,
+                        is_tree: false,
+                        is_boundary: false,
+                        cache_capacity: sliding_cap,
+                        head_dim,
+                        window_size: sliding_cap,
+                    }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                    let io = AttnParams {
+                        q: &scratch.pb_q,
+                        k: &scratch.pb_k,
+                        v: &scratch.pb_v,
+                        k_cache: &kv_sliding.k_gpu[sliding_kv_idx],
+                        v_cache: &kv_sliding.v_gpu[sliding_kv_idx],
+                        k_scales: None,
+                        v_scales: None,
+                        pos_buf: &scratch.pos_buf,
+                        pos: start_pos,
+                        positions: Some(&scratch.pb_positions),
+                        n_heads,
+                        n_kv_heads: n_kv,
+                        head_dim,
+                        physical_cap: kv_sliding.max_seq,
+                        cache_capacity: plan.cache_capacity,
+                        window_size: plan.window_size,
+                        batch_size: n_batch,
+                        max_ctx_len,
+                        flash_partials: Some(&scratch.flash_partials),
+                        givens_cos: Some(ct),
+                        givens_sin: Some(st),
+                        tree_bias: None,
+                        block_start: 0,
+                        block_cols: 0,
+                        output: &scratch.pb_q, // out aliases q (safe)
+                    };
+                    let ctx = DispatchCtx::new(gpu);
+                    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])?;
+                }
                 sliding_kv_idx += 1;
                 if _dump_on { dbg_dump(gpu, "[v2] L0 after attention (pb_q)", &scratch.pb_q, q_dim); }
 
-                weight_gemm(gpu, &lw.o_proj, &scratch.pb_q, &scratch.pb_attn_out, n_batch)?;
+                run_prefill_gemm(gpu, &lw.o_proj, &scratch.pb_q, &scratch.pb_attn_out, n_batch)?;
                 if _dump_on { dbg_dump(gpu, "[v2] L0 after o_proj", &scratch.pb_attn_out, dim); }
                 gpu.rmsnorm_batched(&scratch.pb_attn_out, &lw.post_attention_layernorm,
                     &scratch.pb_attn_out, n_batch, dim, config.norm_eps)?;
@@ -2599,8 +2678,8 @@ fn forward_prefill_batch_v2(
 
                 gpu.rmsnorm_batched(&scratch.pb_residual, &lw.input_layernorm,
                     &scratch.pb_tmp, n_batch, dim, config.norm_eps)?;
-                weight_gemm(gpu, &lw.q_proj, &scratch.pb_tmp, &scratch.pb_q, n_batch)?;
-                weight_gemm(gpu, &lw.k_proj, &scratch.pb_tmp, &scratch.pb_k, n_batch)?;
+                run_prefill_gemm(gpu, &lw.q_proj, &scratch.pb_tmp, &scratch.pb_q, n_batch)?;
+                run_prefill_gemm(gpu, &lw.k_proj, &scratch.pb_tmp, &scratch.pb_k, n_batch)?;
                 if let Some(s) = gpu.active_stream.as_ref() {
                     gpu.hip.memcpy_dtod_async_at(&scratch.pb_v.buf, 0,
                         &scratch.pb_k.buf, 0, n_batch * kv_dim_bytes, s)?;
@@ -2649,29 +2728,64 @@ fn forward_prefill_batch_v2(
                     }
                 }
 
-                // Batched KV write + attention for full layer (hd=512).
-                // cache_capacity=0 — full layers don't ring-buffer; they
-                // address KV slots directly by absolute position.
+                // Batched KV write + attention for full layer (hd=512)
+                // via dispatch framework. No ring-buffer or window masking.
                 let ct = kv_full.givens_cos.as_ref().unwrap();
                 let st = kv_full.givens_sin.as_ref().unwrap();
-                gpu.kv_cache_write_asym3_batched(
-                    &kv_full.k_gpu[full_kv_idx], &kv_full.v_gpu[full_kv_idx],
-                    &scratch.pb_k, &scratch.pb_v, &scratch.pb_positions,
-                    ct, st, n_kv, head_dim, n_batch)?;
                 let max_ctx_len = start_pos + n_batch;
-                gpu.attention_flash_asym3_batched_window(
-                    &scratch.pb_q,
-                    &kv_full.k_gpu[full_kv_idx], &kv_full.v_gpu[full_kv_idx],
-                    &scratch.pb_q,
-                    &scratch.pb_positions, ct, st,
-                    n_heads, n_kv, head_dim,
-                    kv_full.max_seq, max_ctx_len, n_batch,
-                    &scratch.flash_partials,
-                    0, 0, // window_size=0, cache_capacity=0
-                )?;
+                {
+                    let plan = KvTierPlan::derive(KvTierInputs {
+                        quant_asym4: false,
+                        quant_asym3: true,
+                        quant_asym2: false,
+                        quant_q8: false,
+                        quant_fwht: false,
+                        quant_hfq4: false,
+                        quant_q4: false,
+                        v_mode_bits: 8, // Q8_0 V for asym3
+                        pos: start_pos,
+                        flash_mode: 2,
+                        capture_mode: false,
+                        batch_size: n_batch,
+                        is_tree: false,
+                        is_boundary: false,
+                        cache_capacity: 0,
+                        head_dim,
+                        window_size: 0,
+                    }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                    let io = AttnParams {
+                        q: &scratch.pb_q,
+                        k: &scratch.pb_k,
+                        v: &scratch.pb_v,
+                        k_cache: &kv_full.k_gpu[full_kv_idx],
+                        v_cache: &kv_full.v_gpu[full_kv_idx],
+                        k_scales: None,
+                        v_scales: None,
+                        pos_buf: &scratch.pos_buf,
+                        pos: start_pos,
+                        positions: Some(&scratch.pb_positions),
+                        n_heads,
+                        n_kv_heads: n_kv,
+                        head_dim,
+                        physical_cap: kv_full.max_seq,
+                        cache_capacity: plan.cache_capacity,
+                        window_size: plan.window_size,
+                        batch_size: n_batch,
+                        max_ctx_len,
+                        flash_partials: Some(&scratch.flash_partials),
+                        givens_cos: Some(ct),
+                        givens_sin: Some(st),
+                        tree_bias: None,
+                        block_start: 0,
+                        block_cols: 0,
+                        output: &scratch.pb_q, // out aliases q (safe)
+                    };
+                    let ctx = DispatchCtx::new(gpu);
+                    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])?;
+                }
                 full_kv_idx += 1;
 
-                weight_gemm(gpu, &lw.o_proj, &scratch.pb_q, &scratch.pb_attn_out, n_batch)?;
+                run_prefill_gemm(gpu, &lw.o_proj, &scratch.pb_q, &scratch.pb_attn_out, n_batch)?;
                 gpu.rmsnorm_batched(&scratch.pb_attn_out, &lw.post_attention_layernorm,
                     &scratch.pb_attn_out, n_batch, dim, config.norm_eps)?;
                 gpu.add_inplace_f32(&scratch.pb_residual, &scratch.pb_attn_out)?;
@@ -2695,8 +2809,8 @@ fn forward_prefill_batch_v2(
                 gpu.rmsnorm_batched(&scratch.pb_residual, &lw.pre_feedforward_layernorm,
                     &scratch.pb_tmp, n_batch, dim, config.norm_eps)?;
                 if _dump_ffn { dbg_dump(gpu, "[v2] L0 after pre_ffn_norm", &scratch.pb_tmp, dim); }
-                weight_gemm(gpu, &lw.gate_proj, &scratch.pb_tmp, &scratch.pb_gate, n_batch)?;
-                weight_gemm(gpu, &lw.up_proj, &scratch.pb_tmp, &scratch.pb_up, n_batch)?;
+                run_prefill_gemm(gpu, &lw.gate_proj, &scratch.pb_tmp, &scratch.pb_gate, n_batch)?;
+                run_prefill_gemm(gpu, &lw.up_proj, &scratch.pb_tmp, &scratch.pb_up, n_batch)?;
                 if _dump_ffn {
                     dbg_dump(gpu, "[v2] L0 after gate_proj", &scratch.pb_gate, config.hidden_dim);
                     dbg_dump(gpu, "[v2] L0 after up_proj", &scratch.pb_up, config.hidden_dim);
@@ -2705,18 +2819,18 @@ fn forward_prefill_batch_v2(
                     n_batch * config.hidden_dim)?;
                 gpu.mul_f32(&scratch.pb_ffn_hidden, &scratch.pb_up, &scratch.pb_ffn_hidden)?;
                 if _dump_ffn { dbg_dump(gpu, "[v2] L0 after gelu*up", &scratch.pb_ffn_hidden, config.hidden_dim); }
-                weight_gemm(gpu, &lw.down_proj, &scratch.pb_ffn_hidden, &scratch.pb_ffn_out, n_batch)?;
+                run_prefill_gemm(gpu, &lw.down_proj, &scratch.pb_ffn_hidden, &scratch.pb_ffn_out, n_batch)?;
                 if _dump_ffn { dbg_dump(gpu, "[v2] L0 after down_proj", &scratch.pb_ffn_out, dim); }
             }
             (LayerType::Full, LayerWeights::Full(lw)) => {
                 gpu.rmsnorm_batched(&scratch.pb_residual, &lw.pre_feedforward_layernorm,
                     &scratch.pb_tmp, n_batch, dim, config.norm_eps)?;
-                weight_gemm(gpu, &lw.gate_proj, &scratch.pb_tmp, &scratch.pb_gate, n_batch)?;
-                weight_gemm(gpu, &lw.up_proj, &scratch.pb_tmp, &scratch.pb_up, n_batch)?;
+                run_prefill_gemm(gpu, &lw.gate_proj, &scratch.pb_tmp, &scratch.pb_gate, n_batch)?;
+                run_prefill_gemm(gpu, &lw.up_proj, &scratch.pb_tmp, &scratch.pb_up, n_batch)?;
                 gpu.gelu_tanh_f32(&scratch.pb_gate, &scratch.pb_ffn_hidden,
                     n_batch * config.hidden_dim)?;
                 gpu.mul_f32(&scratch.pb_ffn_hidden, &scratch.pb_up, &scratch.pb_ffn_hidden)?;
-                weight_gemm(gpu, &lw.down_proj, &scratch.pb_ffn_hidden, &scratch.pb_ffn_out, n_batch)?;
+                run_prefill_gemm(gpu, &lw.down_proj, &scratch.pb_ffn_hidden, &scratch.pb_ffn_out, n_batch)?;
             }
             _ => unreachable!(),
         }
