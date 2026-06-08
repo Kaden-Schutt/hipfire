@@ -22,6 +22,8 @@ export interface PrefixCheckpointManifest {
   runtimeState: "metadata_only" | "resident" | "attachable";
   runtimeStateHandle?: string;
   runtimeLogicalPosition?: number;
+  daemonPrefixHash?: string;
+  daemonPrefixLen?: number;
   bytes: number;
   createdAtMs: number;
   lastUsedAtMs: number;
@@ -37,6 +39,8 @@ export interface CreatePrefixCheckpointManifestInput {
   runtimeState?: "metadata_only" | "resident" | "attachable";
   runtimeStateHandle?: string;
   runtimeLogicalPosition?: number;
+  daemonPrefixHash?: string;
+  daemonPrefixLen?: number;
   createdAtMs: number;
   lastUsedAtMs?: number;
   hitCount?: number;
@@ -95,6 +99,8 @@ export function createPrefixCheckpointManifest(
     runtimeState: input.runtimeState ?? "metadata_only",
     runtimeStateHandle: input.runtimeStateHandle,
     runtimeLogicalPosition: input.runtimeLogicalPosition,
+    daemonPrefixHash: input.daemonPrefixHash,
+    daemonPrefixLen: input.daemonPrefixLen,
     bytes: Math.max(0, Math.floor(input.bytes)),
     createdAtMs: input.createdAtMs,
     lastUsedAtMs: input.lastUsedAtMs ?? input.createdAtMs,
@@ -106,7 +112,12 @@ export function createPrefixCheckpointManifest(
 export function prefixCheckpointAttachable(manifest: PrefixCheckpointManifest): boolean {
   return manifest.runtimeState === "attachable"
     && typeof manifest.runtimeStateHandle === "string"
-    && manifest.runtimeStateHandle.length > 0;
+    && manifest.runtimeStateHandle.length > 0
+    && typeof manifest.daemonPrefixHash === "string"
+    && /^[0-9a-f]{32}$/.test(manifest.daemonPrefixHash)
+    && typeof manifest.daemonPrefixLen === "number"
+    && Number.isInteger(manifest.daemonPrefixLen)
+    && manifest.daemonPrefixLen >= 0;
 }
 
 export function prefixCheckpointCacheKey(

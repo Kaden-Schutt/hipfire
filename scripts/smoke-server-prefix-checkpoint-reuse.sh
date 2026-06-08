@@ -5,6 +5,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON="${DAEMON:-$ROOT/target/release/examples/daemon}"
 MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4.hfq}"
 MAX_SEQ="${MAX_SEQ:-512}"
+SERVER_SMOKE_LOCK="${HIPFIRE_SERVER_SMOKE_LOCK:-${TMPDIR:-/tmp}/hipfire-server-smoke.lock}"
+SERVER_SMOKE_LOCK_WAIT="${HIPFIRE_SERVER_SMOKE_LOCK_WAIT:-300}"
+
+exec 9>"$SERVER_SMOKE_LOCK"
+if ! flock -w "$SERVER_SMOKE_LOCK_WAIT" 9; then
+  echo "timed out waiting for server smoke lock: $SERVER_SMOKE_LOCK" >&2
+  exit 2
+fi
 
 if [[ ! -x "$DAEMON" ]]; then
   echo "missing daemon binary: $DAEMON" >&2
@@ -89,71 +97,44 @@ def chat_request(base_url: str, label: str) -> dict[str, Any]:
     return out
 
 
-port = pick_port()
-base_url = f"http://127.0.0.1:{port}"
-log_file = tempfile.NamedTemporaryFile("w", prefix="hipfire-server-prefix-cache-", suffix=".log", delete=False)
-log_path = log_file.name
+def start_server(corrupt_prefix_hash_once: bool = False) -> tuple[str, subprocess.Popen[str], Any, str]:
+    port = pick_port()
+    base_url = f"http://127.0.0.1:{port}"
+    log_file = tempfile.NamedTemporaryFile("w", prefix="hipfire-server-prefix-cache-", suffix=".log", delete=False)
+    log_path = log_file.name
 
-env = os.environ.copy()
-env.update({
-    "HIPFIRE_DAEMON_BIN": daemon,
-    "HIPFIRE_MODEL": model,
-    "HIPFIRE_KV_MODE": "q8",
-    "HIPFIRE_NO_PID_FILE": "1",
-    "HIPFIRE_SERVER_PREFILL_BATCH": "1",
-    "HIPFIRE_SERVER_PREFILL_BATCH_MAX": "1",
-    "HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS": "0",
-    "HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE": "0",
-    "HIPFIRE_SERVER_PREFILL_STATE_CACHE": "1",
-    "HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS": "4",
-    "HIPFIRE_MAX_SEQ": str(max_seq),
-    "HIPFIRE_DFLASH_DRAFT": "",
-    "HIPFIRE_QWEN35_PREFILL_SESSION_BATCH": "serial",
-})
+    env = os.environ.copy()
+    env.update({
+        "HIPFIRE_DAEMON_BIN": daemon,
+        "HIPFIRE_MODEL": model,
+        "HIPFIRE_KV_MODE": "q8",
+        "HIPFIRE_NO_PID_FILE": "1",
+        "HIPFIRE_SERVER_PREFILL_BATCH": "1",
+        "HIPFIRE_SERVER_PREFILL_BATCH_MAX": "1",
+        "HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS": "0",
+        "HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE": "0",
+        "HIPFIRE_SERVER_PREFILL_STATE_CACHE": "1",
+        "HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS": "4",
+        "HIPFIRE_MAX_SEQ": str(max_seq),
+        "HIPFIRE_DFLASH_DRAFT": "",
+        "HIPFIRE_QWEN35_PREFILL_SESSION_BATCH": "serial",
+    })
+    if corrupt_prefix_hash_once:
+        env["HIPFIRE_DEBUG_CORRUPT_PREFIX_HASH_ONCE"] = "1"
 
-proc = subprocess.Popen(
-    ["bun", os.path.join(root, "cli", "index.ts"), "serve", "127.0.0.1", str(port)],
-    cwd=root,
-    stdin=subprocess.DEVNULL,
-    stdout=log_file,
-    stderr=log_file,
-    text=True,
-    env=env,
-)
-
-try:
-    initial = wait_health(base_url, proc, log_path)
-    prefill = initial.get("prefill_batch", {})
-    if prefill.get("generate_batch_prefill_capability") != "supported":
-        raise RuntimeError(f"server prefill capability not supported after warmup: {prefill}; log={log_path}")
-
-    first = chat_request(base_url, "first")
-    first_health = fetch_json(f"{base_url}/health", timeout=10.0)
-    first_prefill = first_health.get("prefill_batch", {})
-    if int(first_prefill.get("resident_checkpoints") or 0) < 1:
-        raise RuntimeError(f"first request did not leave a resident checkpoint: {first_prefill}; log={log_path}")
-    if int(first_prefill.get("runtime_cache_hits") or 0) != 0:
-        raise RuntimeError(f"first request unexpectedly reported a runtime cache hit: {first_prefill}; log={log_path}")
-
-    second = chat_request(base_url, "second")
-    second_health = fetch_json(f"{base_url}/health", timeout=10.0)
-    second_prefill = second_health.get("prefill_batch", {})
-    if int(second_prefill.get("runtime_cache_hits") or 0) < 1:
-        raise RuntimeError(f"second request did not attach resident checkpoint: {second_prefill}; log={log_path}")
-    if int(second_prefill.get("resident_decode_sessions") or 0) != 0:
-        raise RuntimeError(f"decode session leaked after cached request: {second_prefill}; log={log_path}")
-    if first.get("choices", [{}])[0].get("message", {}).get("content") is None:
-        raise RuntimeError(f"first response missing content: {first}")
-    if second.get("choices", [{}])[0].get("message", {}).get("content") is None:
-        raise RuntimeError(f"second response missing content: {second}")
-
-    print(
-        "server prefix checkpoint reuse smoke passed: "
-        f"runtime_cache_hits={second_prefill.get('runtime_cache_hits')} "
-        f"resident_checkpoints={second_prefill.get('resident_checkpoints')} "
-        f"log={log_path}"
+    proc = subprocess.Popen(
+        ["bun", os.path.join(root, "cli", "index.ts"), "serve", "127.0.0.1", str(port)],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=log_file,
+        text=True,
+        env=env,
     )
-finally:
+    return base_url, proc, log_file, log_path
+
+
+def stop_server(proc: subprocess.Popen[str], log_file: Any) -> None:
     proc.terminate()
     try:
         proc.wait(timeout=5)
@@ -161,4 +142,103 @@ finally:
         proc.kill()
         proc.wait()
     log_file.close()
+
+
+def assert_response_content(label: str, response: dict[str, Any]) -> None:
+    if response.get("choices", [{}])[0].get("message", {}).get("content") is None:
+        raise RuntimeError(f"{label} response missing content: {response}")
+
+
+def run_reuse_scenario() -> str:
+    base_url, proc, log_file, log_path = start_server()
+    try:
+        initial = wait_health(base_url, proc, log_path)
+        prefill = initial.get("prefill_batch", {})
+        if prefill.get("generate_batch_prefill_capability") != "supported":
+            raise RuntimeError(f"server prefill capability not supported after warmup: {prefill}; log={log_path}")
+
+        first = chat_request(base_url, "reuse first")
+        first_health = fetch_json(f"{base_url}/health", timeout=10.0)
+        first_prefill = first_health.get("prefill_batch", {})
+        first_state_cache = first_health.get("state_cache", {})
+        if int(first_prefill.get("resident_checkpoints") or 0) < 1:
+            raise RuntimeError(f"first request did not leave a resident checkpoint: {first_prefill}; log={log_path}")
+        if int(first_prefill.get("runtime_cache_hits") or 0) != 0:
+            raise RuntimeError(f"first request unexpectedly reported a runtime cache hit: {first_prefill}; log={log_path}")
+        if first_state_cache.get("daemon_prefix_hash") is not True:
+            raise RuntimeError(f"first request did not expose daemon prefix hash telemetry: {first_state_cache}; log={log_path}")
+
+        second = chat_request(base_url, "reuse second")
+        second_health = fetch_json(f"{base_url}/health", timeout=10.0)
+        second_prefill = second_health.get("prefill_batch", {})
+        if int(second_prefill.get("runtime_cache_hits") or 0) < 1:
+            raise RuntimeError(f"second request did not attach resident checkpoint: {second_prefill}; log={log_path}")
+        if int(second_prefill.get("resident_decode_sessions") or 0) != 0:
+            raise RuntimeError(f"decode session leaked after cached request: {second_prefill}; log={log_path}")
+        assert_response_content("reuse first", first)
+        assert_response_content("reuse second", second)
+        return (
+            "reuse: "
+            f"runtime_cache_hits={second_prefill.get('runtime_cache_hits')} "
+            f"resident_checkpoints={second_prefill.get('resident_checkpoints')} "
+            f"log={log_path}"
+        )
+    finally:
+        stop_server(proc, log_file)
+
+
+def run_mismatch_scenario() -> str:
+    base_url, proc, log_file, log_path = start_server(corrupt_prefix_hash_once=True)
+    try:
+        initial = wait_health(base_url, proc, log_path)
+        prefill = initial.get("prefill_batch", {})
+        if prefill.get("generate_batch_prefill_capability") != "supported":
+            raise RuntimeError(f"server prefill capability not supported after warmup: {prefill}; log={log_path}")
+
+        first = chat_request(base_url, "mismatch first")
+        first_health = fetch_json(f"{base_url}/health", timeout=10.0)
+        first_prefill = first_health.get("prefill_batch", {})
+        first_state_cache = first_health.get("state_cache", {})
+        if int(first_prefill.get("resident_checkpoints") or 0) < 1:
+            raise RuntimeError(f"mismatch setup did not leave a resident checkpoint: {first_prefill}; log={log_path}")
+        if first_state_cache.get("daemon_prefix_hash") is not True:
+            raise RuntimeError(f"mismatch setup did not expose daemon prefix hash telemetry: {first_state_cache}; log={log_path}")
+
+        second = chat_request(base_url, "mismatch second")
+        second_health = fetch_json(f"{base_url}/health", timeout=10.0)
+        second_prefill = second_health.get("prefill_batch", {})
+        second_state_cache = second_health.get("state_cache", {})
+        hits_after_mismatch = int(second_prefill.get("runtime_cache_hits") or 0)
+        evictions_after_mismatch = int(second_state_cache.get("evictions_total") or 0)
+        if hits_after_mismatch < 1:
+            raise RuntimeError(f"corrupted hash did not attempt a runtime attach: {second_prefill}; log={log_path}")
+        if evictions_after_mismatch < 1:
+            raise RuntimeError(f"corrupted hash did not invalidate the cached manifest: {second_state_cache}; log={log_path}")
+
+        third = chat_request(base_url, "mismatch third")
+        third_health = fetch_json(f"{base_url}/health", timeout=10.0)
+        third_prefill = third_health.get("prefill_batch", {})
+        hits_after_third = int(third_prefill.get("runtime_cache_hits") or 0)
+        if hits_after_third != hits_after_mismatch:
+            raise RuntimeError(
+                "stale corrupted manifest was retried: "
+                f"hits_after_mismatch={hits_after_mismatch} hits_after_third={hits_after_third}; "
+                f"prefill={third_prefill}; log={log_path}"
+            )
+        assert_response_content("mismatch first", first)
+        assert_response_content("mismatch second", second)
+        assert_response_content("mismatch third", third)
+        return (
+            "mismatch: "
+            f"runtime_cache_hits={hits_after_third} "
+            f"evictions_total={evictions_after_mismatch} "
+            f"log={log_path}"
+        )
+    finally:
+        stop_server(proc, log_file)
+
+
+reuse_summary = run_reuse_scenario()
+mismatch_summary = run_mismatch_scenario()
+print(f"server prefix checkpoint reuse smoke passed: {reuse_summary}; {mismatch_summary}")
 PY

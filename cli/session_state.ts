@@ -29,6 +29,8 @@ export interface SessionStateHandle {
   logicalPosition: number;
   cachedPrefixTokens: number;
   runtimeStateHandle?: string;
+  daemonPrefixHash?: string;
+  daemonPrefixLen?: number;
 }
 
 export interface RequestSessionDraft {

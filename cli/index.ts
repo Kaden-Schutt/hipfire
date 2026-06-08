@@ -1887,6 +1887,8 @@ async function serve(port: number, host: string) {
     runtimeStateHandle?: string;
     checkpointStateHandle?: string;
     checkpointLogicalPosition?: number;
+    checkpointDaemonPrefixHash?: string;
+    checkpointDaemonPrefixLen?: number;
     runtimeStateEvicted?: boolean;
   };
   type PendingPrefillRequest = {
@@ -1900,6 +1902,7 @@ async function serve(port: number, host: string) {
   const pendingPrefillRequests = new Map<string, PendingPrefillRequest>();
   const residentDecodeSessions = new Set<string>();
   const residentCheckpointHandles = new Set<string>();
+  let debugCorruptNextPrefixHash = process.env.HIPFIRE_DEBUG_CORRUPT_PREFIX_HASH_ONCE === "1";
   const fallbackStateCacheStore = new Map<string, PrefixCheckpointManifest>();
   const getWorkerId = (workerKey: ModelWorkerKey): string => modelWorkerKeyId(workerKey);
   const getWorkerPrefillScheduler = (workerKey: ModelWorkerKey | null): PriorityPrefillScheduler | undefined => {
@@ -2547,6 +2550,10 @@ async function serve(port: number, host: string) {
             fallbackStateCacheStore.size,
             ...[...workerStateCaches.values()].map((cache) => cache.size),
           ].reduce((sum, size) => sum + size, 0);
+          const stateCacheDaemonPrefixEntries = [
+            ...fallbackStateCacheStore.values(),
+            ...[...workerStateCaches.values()].flatMap((cache) => [...cache.values()]),
+          ].filter((manifest) => typeof manifest.daemonPrefixHash === "string").length;
           const prefillQueueSize = [...workerPrefillSchedulers.values()].reduce(
             (sum, scheduler) => sum + scheduler.size,
             0,
@@ -2606,6 +2613,8 @@ async function serve(port: number, host: string) {
                   resident_checkpoints: residentCheckpointHandles.size,
                   resident_checkpoint_max: serverPrefillBatchControls.residentCheckpointMax,
                   disk_enabled: serverPrefillBatchControls.stateCacheDisk,
+                  daemon_prefix_hash: stateCacheDaemonPrefixEntries > 0,
+                  daemon_prefix_hash_entries: stateCacheDaemonPrefixEntries,
                   entries: stateCacheEntries,
                   bytes: stateCacheBytes,
                   metadata_hits: prefillBatchMetrics.metadataCacheHits,
@@ -3462,6 +3471,8 @@ async function serve(port: number, host: string) {
                   cachedPrefixTokens: cacheLookup.prefixLen,
                   logicalPosition: cacheLookup.runtimeLogicalPosition ?? cacheLookup.prefixLen,
                   runtimeStateHandle: cacheLookup.runtimeStateHandle,
+                  daemonPrefixHash: cacheLookup.daemonPrefixHash,
+                  daemonPrefixLen: cacheLookup.daemonPrefixLen,
                 },
               };
             } else {
@@ -3846,6 +3857,21 @@ async function serve(port: number, host: string) {
             };
             if (draft.stateHandle.runtimeStateHandle) {
               payload.state_handle.runtime_state_handle = draft.stateHandle.runtimeStateHandle;
+              if (draft.stateHandle.daemonPrefixHash && draft.stateHandle.daemonPrefixLen !== undefined) {
+                let prefixHashValue = draft.stateHandle.daemonPrefixHash;
+                if (debugCorruptNextPrefixHash) {
+                  prefixHashValue = prefixHashValue === "00000000000000000000000000000000"
+                    ? "11111111111111111111111111111111"
+                    : "00000000000000000000000000000000";
+                  debugCorruptNextPrefixHash = false;
+                }
+                payload.state_handle.prefix_hash = {
+                  algorithm: "xxh128",
+                  value: prefixHashValue,
+                  prefix_len: draft.stateHandle.daemonPrefixLen,
+                };
+                payload.state_handle.prefix_len = draft.stateHandle.daemonPrefixLen;
+              }
             }
             if (draft.cachedPrefixTokens > 0) {
               payload.suffix_tokens = draft.suffixTokens;
@@ -3896,6 +3922,7 @@ async function serve(port: number, host: string) {
               const sessionPrefillTokens = new Map<string, number>();
               const runtimeStateHandlesBySession = new Map<string, string>();
               const checkpointStateHandlesBySession = new Map<string, string>();
+              const checkpointDaemonPrefixHashesBySession = new Map<string, { hash: string; len: number }>();
               const logicalPositionsBySession = new Map<string, number>();
               for (let i = 0; i < 8; i++) {
                 const prefillMsg = await e.recv();
@@ -3941,6 +3968,24 @@ async function serve(port: number, host: string) {
                     typeof stateHandle.checkpoint_id === "string"
                   ) {
                     checkpointStateHandlesBySession.set(prefillMsg.session_id, stateHandle.checkpoint_id);
+                    const prefixHash = stateHandle.prefix_hash;
+                    const prefixLen = typeof stateHandle.prefix_len === "number"
+                      ? stateHandle.prefix_len
+                      : prefixHash?.prefix_len;
+                    if (
+                      prefixHash &&
+                      prefixHash.algorithm === "xxh128" &&
+                      typeof prefixHash.value === "string" &&
+                      /^[0-9a-f]{32}$/.test(prefixHash.value) &&
+                      typeof prefixLen === "number" &&
+                      Number.isInteger(prefixLen) &&
+                      prefixLen >= 0
+                    ) {
+                      checkpointDaemonPrefixHashesBySession.set(prefillMsg.session_id, {
+                        hash: prefixHash.value,
+                        len: prefixLen,
+                      });
+                    }
                   }
                   continue;
                 }
@@ -3984,8 +4029,9 @@ async function serve(port: number, host: string) {
                 draft: RequestSessionDraft,
                 checkpointHandle: string | undefined,
                 runtimeLogicalPosition: number | undefined,
+                daemonPrefix: { hash: string; len: number } | undefined,
               ) => {
-                if (!requestAllowsResidentPrefixCache || !checkpointHandle) return;
+                if (!requestAllowsResidentPrefixCache || !checkpointHandle || !daemonPrefix) return;
                 const prefixLen = Math.min(
                   draft.promptTokens.length,
                   Math.max(0, draft.cachedPrefixTokens + draft.suffixTokens.length),
@@ -3999,6 +4045,8 @@ async function serve(port: number, host: string) {
                   runtimeState: "attachable",
                   runtimeStateHandle: checkpointHandle,
                   runtimeLogicalPosition,
+                  daemonPrefixHash: daemonPrefix.hash,
+                  daemonPrefixLen: daemonPrefix.len,
                   createdAtMs: requestNowMs,
                   lastUsedAtMs: Date.now(),
                   hitCount: 0,
@@ -4023,6 +4071,7 @@ async function serve(port: number, host: string) {
                 serverPrefillSession,
                 checkpointStateHandlesBySession.get(reqId),
                 logicalPositionsBySession.get(reqId),
+                checkpointDaemonPrefixHashesBySession.get(reqId),
               );
               if (!requestAllowsResidentPrefixCache) {
                 await releaseRuntimeHandles(
@@ -4069,6 +4118,8 @@ async function serve(port: number, host: string) {
                   runtimeStateHandle: runtimeStateEvicted ? undefined : runtimeStateHandle,
                   checkpointStateHandle: checkpointStateHandlesBySession.get(selected.id),
                   checkpointLogicalPosition: logicalPositionsBySession.get(selected.id),
+                  checkpointDaemonPrefixHash: checkpointDaemonPrefixHashesBySession.get(selected.id)?.hash,
+                  checkpointDaemonPrefixLen: checkpointDaemonPrefixHashesBySession.get(selected.id)?.len,
                   runtimeStateEvicted,
                 });
               }
@@ -4076,6 +4127,7 @@ async function serve(port: number, host: string) {
               const reason = err?.message ?? "daemon_serial_prefill_failed";
               if (
                 reason.includes("failed to attach checkpoint") ||
+                reason.includes("prefix hash mismatch") ||
                 reason.includes("checkpoint source session") ||
                 reason.includes("no resident session exists")
               ) {
@@ -4083,12 +4135,20 @@ async function serve(port: number, host: string) {
                   serverPrefillSession.stateHandle.runtimeStateHandle,
                   reason,
                 );
+                if (preserveDaemonStateForResidentCache) {
+                  await e.send({ type: "reset" });
+                  await e.recv();
+                  clearResidentPrefixState("prefill attach failure reset");
+                }
               }
               if (genParams.server_prefill_batch) {
                 genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill_failed";
                 genParams.server_prefill_batch.runtime_dispatch_reason = reason;
                 genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "daemon_serial_prefill_failed";
               }
+              delete genParams.session_id;
+              genParams.prefill_already_done = false;
+              releaseRuntimeSessionId = null;
               lastPrefillRuntimeDispatchSkippedReason = "daemon_serial_prefill_failed";
               for (const selected of selectedBatchSessions) {
                 if (selected.id === reqId) continue;
@@ -4177,6 +4237,8 @@ async function serve(port: number, host: string) {
               if (
                 requestAllowsResidentPrefixCache &&
                 pendingOutcome.checkpointStateHandle &&
+                pendingOutcome.checkpointDaemonPrefixHash &&
+                pendingOutcome.checkpointDaemonPrefixLen !== undefined &&
                 serverPrefillSession
               ) {
                 const prefixLen = Math.min(
@@ -4192,6 +4254,8 @@ async function serve(port: number, host: string) {
                     runtimeState: "attachable",
                     runtimeStateHandle: pendingOutcome.checkpointStateHandle,
                     runtimeLogicalPosition: pendingOutcome.checkpointLogicalPosition,
+                    daemonPrefixHash: pendingOutcome.checkpointDaemonPrefixHash,
+                    daemonPrefixLen: pendingOutcome.checkpointDaemonPrefixLen,
                     createdAtMs: requestNowMs,
                     lastUsedAtMs: Date.now(),
                     hitCount: 0,

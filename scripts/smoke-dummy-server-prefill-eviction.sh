@@ -4,6 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${HIPFIRE_DUMMY_EVICTION_PORT:-11438}"
 LOG_PATH="${TMPDIR:-/tmp}/hipfire-dummy-prefill-eviction-${PORT}.log"
+SERVER_SMOKE_LOCK="${HIPFIRE_SERVER_SMOKE_LOCK:-${TMPDIR:-/tmp}/hipfire-server-smoke.lock}"
+SERVER_SMOKE_LOCK_WAIT="${HIPFIRE_SERVER_SMOKE_LOCK_WAIT:-300}"
+
+exec 9>"$SERVER_SMOKE_LOCK"
+if ! flock -w "$SERVER_SMOKE_LOCK_WAIT" 9; then
+  echo "timed out waiting for server smoke lock: $SERVER_SMOKE_LOCK" >&2
+  exit 2
+fi
 
 python3 - "$ROOT" "$PORT" "$LOG_PATH" <<'PY'
 import concurrent.futures

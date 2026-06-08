@@ -104,11 +104,23 @@ describe("prefix state cache keys", () => {
       createdAtMs: 10,
       runtimeState: "attachable",
       runtimeStateHandle: "qwen35-checkpoint:req",
+      daemonPrefixHash: "0123456789abcdef0123456789abcdef",
+      daemonPrefixLen: 3,
+    });
+    const attachableWithoutDaemonHash = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [1, 2, 3],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      createdAtMs: 10,
+      runtimeState: "attachable",
+      runtimeStateHandle: "qwen35-checkpoint:req",
     });
 
     expect(prefixCheckpointAttachable(metadataOnly)).toBe(false);
     expect(prefixCheckpointAttachable(resident)).toBe(false);
     expect(prefixCheckpointAttachable(attachable)).toBe(true);
+    expect(prefixCheckpointAttachable(attachableWithoutDaemonHash)).toBe(false);
   });
 
   test("preserves runtime logical position without changing cache identity", () => {
@@ -120,6 +132,8 @@ describe("prefix state cache keys", () => {
       runtimeState: "attachable",
       runtimeStateHandle: "qwen35-checkpoint:req",
       runtimeLogicalPosition: 7,
+      daemonPrefixHash: "0123456789abcdef0123456789abcdef",
+      daemonPrefixLen: 3,
       createdAtMs: 10,
     });
     const sameKeyDifferentRuntimePosition = createPrefixCheckpointManifest({
@@ -130,6 +144,8 @@ describe("prefix state cache keys", () => {
       runtimeState: "attachable",
       runtimeStateHandle: "qwen35-checkpoint:req",
       runtimeLogicalPosition: 8,
+      daemonPrefixHash: "fedcba9876543210fedcba9876543210",
+      daemonPrefixLen: 3,
       createdAtMs: 10,
     });
 
@@ -246,6 +262,8 @@ describe("state cache spill guardrails", () => {
       bytes: 1024,
       runtimeState: "attachable",
       runtimeStateHandle: "cold",
+      daemonPrefixHash: "00000000000000000000000000000001",
+      daemonPrefixLen: 1,
       createdAtMs: 2,
       lastUsedAtMs: 10,
     });
@@ -256,6 +274,8 @@ describe("state cache spill guardrails", () => {
       bytes: 1024,
       runtimeState: "attachable",
       runtimeStateHandle: "warm",
+      daemonPrefixHash: "00000000000000000000000000000002",
+      daemonPrefixLen: 1,
       createdAtMs: 3,
       lastUsedAtMs: 20,
     });
@@ -266,6 +286,8 @@ describe("state cache spill guardrails", () => {
       bytes: 1024,
       runtimeState: "attachable",
       runtimeStateHandle: "hot",
+      daemonPrefixHash: "00000000000000000000000000000003",
+      daemonPrefixLen: 1,
       createdAtMs: 4,
       lastUsedAtMs: 30,
     });

@@ -3,6 +3,14 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON="${DAEMON:-$ROOT/target/release/examples/daemon}"
+SERVER_SMOKE_LOCK="${HIPFIRE_SERVER_SMOKE_LOCK:-${TMPDIR:-/tmp}/hipfire-server-smoke.lock}"
+SERVER_SMOKE_LOCK_WAIT="${HIPFIRE_SERVER_SMOKE_LOCK_WAIT:-300}"
+
+exec 9>"$SERVER_SMOKE_LOCK"
+if ! flock -w "$SERVER_SMOKE_LOCK_WAIT" 9; then
+  echo "timed out waiting for server smoke lock: $SERVER_SMOKE_LOCK" >&2
+  exit 2
+fi
 
 if [[ ! -x "$DAEMON" ]]; then
   echo "missing daemon binary: $DAEMON" >&2

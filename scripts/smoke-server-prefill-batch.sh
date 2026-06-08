@@ -6,6 +6,14 @@ DAEMON="${DAEMON:-$ROOT/target/release/examples/daemon}"
 MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4.hfq}"
 MAX_SEQ="${MAX_SEQ:-512}"
 EXPECTED_DAEMON_PREFILL_BACKEND="${EXPECTED_DAEMON_PREFILL_BACKEND:-fused_dense}"
+SERVER_SMOKE_LOCK="${HIPFIRE_SERVER_SMOKE_LOCK:-${TMPDIR:-/tmp}/hipfire-server-smoke.lock}"
+SERVER_SMOKE_LOCK_WAIT="${HIPFIRE_SERVER_SMOKE_LOCK_WAIT:-300}"
+
+exec 9>"$SERVER_SMOKE_LOCK"
+if ! flock -w "$SERVER_SMOKE_LOCK_WAIT" 9; then
+  echo "timed out waiting for server smoke lock: $SERVER_SMOKE_LOCK" >&2
+  exit 2
+fi
 
 if [[ ! -x "$DAEMON" ]]; then
   echo "missing daemon binary: $DAEMON" >&2
@@ -26,6 +34,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -134,8 +143,8 @@ env.update({
     "HIPFIRE_NO_PID_FILE": "1",
     "HIPFIRE_SERVER_PREFILL_BATCH": "1",
     "HIPFIRE_SERVER_PREFILL_BATCH_MAX": "2",
-    "HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS": "25",
-    "HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE": "25",
+    "HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS": "250",
+    "HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE": "250",
     "HIPFIRE_MAX_SEQ": str(max_seq),
     "HIPFIRE_DFLASH_DRAFT": "",
 })
@@ -184,11 +193,18 @@ try:
             f"{stream_prefill}; log={log_path}"
         )
 
+    start_barrier = threading.Barrier(3)
+
+    def synchronized_chat_request(label: str) -> dict[str, Any]:
+        start_barrier.wait(timeout=10.0)
+        return chat_request(base_url, label)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         futures = [
-            pool.submit(chat_request, base_url, "request-a"),
-            pool.submit(chat_request, base_url, "request-b"),
+            pool.submit(synchronized_chat_request, "request-a"),
+            pool.submit(synchronized_chat_request, "request-b"),
         ]
+        start_barrier.wait(timeout=10.0)
         responses = [future.result() for future in futures]
 
     health = fetch_json(f"{base_url}/health", timeout=10.0)

@@ -748,6 +748,14 @@ struct GenerateBatchPrefillStateHandle {
     logical_position: usize,
     cached_prefix_tokens: usize,
     runtime_state_handle: Option<String>,
+    prefix_hash: Option<GenerateBatchPrefillPrefixHash>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GenerateBatchPrefillPrefixHash {
+    algorithm: String,
+    value: String,
+    prefix_len: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -860,6 +868,50 @@ fn parse_u32_array(value: &serde_json::Value, field: &str) -> Result<Vec<u32>, S
         }
     }
     Ok(out)
+}
+
+fn parse_prefix_hash(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<GenerateBatchPrefillPrefixHash, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| format!("{field} must be an object"))?;
+    let algorithm = obj
+        .get("algorithm")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("{field}.algorithm must be a string"))?;
+    if algorithm != "xxh128" {
+        return Err(format!("{field}.algorithm must be 'xxh128'"));
+    }
+    let hash_value = obj
+        .get("value")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("{field}.value must be a string"))?;
+    if hash_value.len() != 32
+        || !hash_value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(format!("{field}.value must be 32 lowercase hex characters"));
+    }
+    let prefix_len =
+        obj.get("prefix_len")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("{field}.prefix_len must be an integer >= 0"))? as usize;
+    Ok(GenerateBatchPrefillPrefixHash {
+        algorithm: algorithm.to_string(),
+        value: hash_value.to_string(),
+        prefix_len,
+    })
+}
+
+fn generate_prefix_hash_json(hash: &GenerateBatchPrefillPrefixHash) -> serde_json::Value {
+    serde_json::json!({
+        "algorithm": hash.algorithm,
+        "value": hash.value,
+        "prefix_len": hash.prefix_len,
+    })
 }
 
 fn validate_generate_batch_prefill(
@@ -998,6 +1050,18 @@ fn validate_generate_batch_prefill(
             ),
             None => None,
         };
+        let prefix_hash = match state_handle.get("prefix_hash") {
+            Some(v) => Some(parse_prefix_hash(
+                v,
+                &format!("{prefix}.state_handle.prefix_hash"),
+            )?),
+            None => None,
+        };
+        if prefix_hash.is_some() && runtime_state_handle.is_none() {
+            return Err(format!(
+                "{prefix}.state_handle.prefix_hash requires runtime_state_handle"
+            ));
+        }
         if let Some(params) = session.get("params") {
             params
                 .as_object()
@@ -1057,6 +1121,7 @@ fn validate_generate_batch_prefill(
                 logical_position,
                 cached_prefix_tokens,
                 runtime_state_handle,
+                prefix_hash,
             },
         });
     }
@@ -1185,6 +1250,85 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
+    fn validates_runtime_prefix_hash_for_attachable_prefix() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "batch_id": "batch-1",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "suffix_tokens": [4, 5],
+                "state_handle": {
+                    "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                    "logical_position": 3,
+                    "cached_prefix_tokens": 3,
+                    "runtime_state_handle": "qwen35-checkpoint:req-0",
+                    "prefix_hash": {
+                        "algorithm": "xxh128",
+                        "value": "0123456789abcdef0123456789abcdef",
+                        "prefix_len": 3
+                    }
+                }
+            }]
+        });
+
+        let envelope = validate_generate_batch_prefill(&msg).expect("valid envelope");
+        let hash = envelope.sessions[0]
+            .state_handle
+            .prefix_hash
+            .as_ref()
+            .expect("prefix hash parsed");
+        assert_eq!(hash.algorithm, "xxh128");
+        assert_eq!(hash.prefix_len, 3);
+    }
+
+    #[test]
+    fn rejects_malformed_runtime_prefix_hash() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "batch_id": "batch-1",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "suffix_tokens": [4, 5],
+                "state_handle": {
+                    "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                    "logical_position": 3,
+                    "cached_prefix_tokens": 3,
+                    "runtime_state_handle": "qwen35-checkpoint:req-0",
+                    "prefix_hash": {
+                        "algorithm": "xxh128",
+                        "value": "ABC",
+                        "prefix_len": 3
+                    }
+                }
+            }]
+        });
+
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains("32 lowercase hex"));
+    }
+
+    #[test]
+    fn qwen35_prefix_hash_is_domain_separated() {
+        let kinds = vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()];
+        let reordered = vec!["deltanet_recurrent".to_string(), "attention_kv".to_string()];
+        let base = compute_qwen35_prefix_hash(5, Some("q8"), &kinds, "plain", 0, &[1, 2, 3]);
+        let same = compute_qwen35_prefix_hash(5, Some("q8"), &reordered, "plain", 0, &[1, 2, 3]);
+        let different_tokens =
+            compute_qwen35_prefix_hash(5, Some("q8"), &kinds, "plain", 0, &[1, 2, 4]);
+        let different_think =
+            compute_qwen35_prefix_hash(5, Some("q8"), &kinds, "open_think", 0, &[1, 2, 3]);
+
+        assert_eq!(base, same);
+        assert_eq!(base.algorithm, "xxh128");
+        assert_eq!(base.value.len(), 32);
+        assert_eq!(base.prefix_len, 3);
+        assert_ne!(base, different_tokens);
+        assert_ne!(base, different_think);
+    }
+
+    #[test]
     fn rejects_missing_worker_identity() {
         let msg = serde_json::json!({
             "type": "generate_batch_prefill",
@@ -1222,7 +1366,10 @@ mod generate_batch_prefill_tests {
         });
 
         let envelope = validate_generate_batch_prefill(&msg).expect("valid envelope");
-        assert_eq!(envelope.sessions[0].suffix_tokens.as_ref().unwrap().len(), 0);
+        assert_eq!(
+            envelope.sessions[0].suffix_tokens.as_ref().unwrap().len(),
+            0
+        );
         assert_eq!(envelope.sessions[0].state_handle.cached_prefix_tokens, 4);
     }
 
@@ -1654,6 +1801,9 @@ mod generate_batch_prefill_tests {
             tokens: vec![1, 2, 3],
             cached_prefix_tokens: 0,
             replay_as_generated_suffix: false,
+            state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+            assistant_prefix: "plain".to_string(),
+            max_think_tokens: 0,
         }];
 
         let err = validate_qwen35_fused_dense_prefill_batch_preflight(
@@ -1672,12 +1822,18 @@ mod generate_batch_prefill_tests {
                 tokens: Vec::new(),
                 cached_prefix_tokens: 0,
                 replay_as_generated_suffix: true,
+                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+                assistant_prefix: "plain".to_string(),
+                max_think_tokens: 0,
             },
             Qwen35PreparedPrefillSession {
                 id: "req-2".to_string(),
                 tokens: vec![4],
                 cached_prefix_tokens: 0,
                 replay_as_generated_suffix: true,
+                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+                assistant_prefix: "plain".to_string(),
+                max_think_tokens: 0,
             },
         ];
 
@@ -1696,6 +1852,9 @@ mod generate_batch_prefill_tests {
             tokens: vec![1, 2, 3],
             cached_prefix_tokens: 0,
             replay_as_generated_suffix: false,
+            state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+            assistant_prefix: "plain".to_string(),
+            max_think_tokens: 0,
         }];
 
         let err = validate_qwen35_fused_dense_prefill_batch_preflight(
@@ -1714,12 +1873,18 @@ mod generate_batch_prefill_tests {
                 tokens: vec![1, 2, 3],
                 cached_prefix_tokens: 0,
                 replay_as_generated_suffix: false,
+                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+                assistant_prefix: "plain".to_string(),
+                max_think_tokens: 0,
             },
             Qwen35PreparedPrefillSession {
                 id: "req-2".to_string(),
                 tokens: vec![4],
                 cached_prefix_tokens: 16,
                 replay_as_generated_suffix: true,
+                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+                assistant_prefix: "plain".to_string(),
+                max_think_tokens: 0,
             },
         ];
 
@@ -1739,12 +1904,18 @@ mod generate_batch_prefill_tests {
                 tokens: vec![1, 2, 3],
                 cached_prefix_tokens: 0,
                 replay_as_generated_suffix: false,
+                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+                assistant_prefix: "plain".to_string(),
+                max_think_tokens: 0,
             },
             Qwen35PreparedPrefillSession {
                 id: "req-2".to_string(),
                 tokens: vec![4],
                 cached_prefix_tokens: 0,
                 replay_as_generated_suffix: false,
+                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+                assistant_prefix: "plain".to_string(),
+                max_think_tokens: 0,
             },
         ];
 
@@ -1769,12 +1940,18 @@ mod generate_batch_prefill_tests {
                 tokens: vec![1, 2, 3],
                 cached_prefix_tokens: 0,
                 replay_as_generated_suffix: false,
+                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+                assistant_prefix: "plain".to_string(),
+                max_think_tokens: 0,
             },
             Qwen35PreparedPrefillSession {
                 id: "req-2".to_string(),
                 tokens: vec![4, 5],
                 cached_prefix_tokens: 0,
                 replay_as_generated_suffix: false,
+                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+                assistant_prefix: "plain".to_string(),
+                max_think_tokens: 0,
             },
         ];
 
@@ -1800,12 +1977,18 @@ mod generate_batch_prefill_tests {
                 tokens: vec![11],
                 cached_prefix_tokens: 8,
                 replay_as_generated_suffix: true,
+                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+                assistant_prefix: "plain".to_string(),
+                max_think_tokens: 0,
             },
             Qwen35PreparedPrefillSession {
                 id: "req-2".to_string(),
                 tokens: vec![12, 13],
                 cached_prefix_tokens: 8,
                 replay_as_generated_suffix: true,
+                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+                assistant_prefix: "plain".to_string(),
+                max_think_tokens: 0,
             },
         ];
 
@@ -2080,6 +2263,7 @@ const QWEN35_LEGACY_SESSION_ID: &str = "__legacy_generate__";
 struct Qwen35RequestSessionState {
     seq_pos: usize,
     conversation_tokens: Vec<u32>,
+    prefix_hash: Option<GenerateBatchPrefillPrefixHash>,
     kv_cache: llama::KvCache,
     dn_state: DeltaNetState,
     logits: rdna_compute::GpuTensor,
@@ -2091,6 +2275,9 @@ struct Qwen35PreparedPrefillSession {
     tokens: Vec<u32>,
     cached_prefix_tokens: usize,
     replay_as_generated_suffix: bool,
+    state_kinds: Vec<String>,
+    assistant_prefix: String,
+    max_think_tokens: usize,
 }
 
 struct Qwen35PrefillSessionResult {
@@ -2098,6 +2285,7 @@ struct Qwen35PrefillSessionResult {
     prefill_tokens: usize,
     logical_position: usize,
     cached_prefix_tokens: usize,
+    prefix_hash: GenerateBatchPrefillPrefixHash,
     debug_sample_token: Option<u32>,
 }
 
@@ -2120,6 +2308,9 @@ struct Qwen35FusedDensePrefillSessionSpec<'a> {
     tokens: &'a [u32],
     cached_prefix_tokens: usize,
     replay_as_generated_suffix: bool,
+    state_kinds: &'a [String],
+    assistant_prefix: &'a str,
+    max_think_tokens: usize,
 }
 
 struct Qwen35FusedDensePrefillBatchContract<'a> {
@@ -2207,6 +2398,7 @@ impl Qwen35RequestSessionState {
         Ok(Self {
             seq_pos: source.seq_pos,
             conversation_tokens: source.conversation_tokens.clone(),
+            prefix_hash: source.prefix_hash.clone(),
             kv_cache: Self::clone_kv_cache(gpu, &source.kv_cache)?,
             dn_state: Self::clone_dn_state(gpu, &source.dn_state)?,
             logits: Self::clone_gpu_tensor(gpu, &source.logits, "logits")?,
@@ -2233,6 +2425,7 @@ impl Qwen35RequestSessionState {
         Ok(Self {
             seq_pos: m.seq_pos,
             conversation_tokens: std::mem::take(&mut m.conversation_tokens),
+            prefix_hash: None,
             kv_cache: m.kv_cache.take().unwrap(),
             dn_state: m.dn_state.take().unwrap(),
             logits,
@@ -2255,6 +2448,9 @@ impl Qwen35RequestSessionState {
         }
         m.seq_pos = self.seq_pos;
         m.conversation_tokens = self.conversation_tokens;
+        // Prefix hash metadata is kept with saved Qwen35 request sessions.
+        // The loaded singleton path computes it when checkpointable prefill
+        // sessions are saved back into the session map.
         m.kv_cache = Some(self.kv_cache);
         m.dn_state = Some(self.dn_state);
         m.q35_active_prefilled_generated_suffix_len = self.prefilled_generated_suffix_len;
@@ -2264,6 +2460,7 @@ impl Qwen35RequestSessionState {
     fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
         self.seq_pos = 0;
         self.conversation_tokens.clear();
+        self.prefix_hash = None;
         self.prefilled_generated_suffix_len = 0;
         for s in &self.dn_state.s_matrices {
             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -2452,6 +2649,7 @@ fn qwen35_allocate_session_state(
     Ok(Qwen35RequestSessionState {
         seq_pos: 0,
         conversation_tokens: Vec::new(),
+        prefix_hash: None,
         kv_cache,
         dn_state,
         logits: gpu
@@ -2497,16 +2695,53 @@ fn qwen35_fork_session_state(
     gpu: &mut rdna_compute::Gpu,
     source_session_id: &str,
     dest_session_id: &str,
+    requested_prefix_hash: Option<&GenerateBatchPrefillPrefixHash>,
 ) -> Result<(), String> {
     if source_session_id == dest_session_id {
         return Ok(());
     }
+    let source_is_active = m.q35_active_session_id.as_deref() == Some(source_session_id);
+    if !source_is_active {
+        qwen35_validate_prefix_hash(m, source_session_id, requested_prefix_hash)?;
+    }
     qwen35_save_active_session(m, gpu)?;
+    if source_is_active {
+        if let Err(err) = qwen35_validate_prefix_hash(m, source_session_id, requested_prefix_hash) {
+            let _ = qwen35_activate_session(m, gpu, source_session_id);
+            return Err(err);
+        }
+    }
     let source = m.q35_sessions.get(source_session_id).ok_or_else(|| {
         format!("qwen35 checkpoint source session {source_session_id} is not resident")
     })?;
     let forked = Qwen35RequestSessionState::fork_from(gpu, source)?;
     m.q35_sessions.insert(dest_session_id.to_string(), forked);
+    Ok(())
+}
+
+fn qwen35_validate_prefix_hash(
+    m: &LoadedModel,
+    source_session_id: &str,
+    requested: Option<&GenerateBatchPrefillPrefixHash>,
+) -> Result<(), String> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let source = m.q35_sessions.get(source_session_id).ok_or_else(|| {
+        format!("qwen35 checkpoint source session {source_session_id} is not resident")
+    })?;
+    let stored = source.prefix_hash.as_ref().ok_or_else(|| {
+        format!("qwen35 checkpoint source session {source_session_id} has no prefix hash")
+    })?;
+    if stored != requested {
+        return Err(format!(
+            "prefix hash mismatch for checkpoint {source_session_id}: request={} len={} stored={} len={}",
+            requested.value,
+            requested.prefix_len,
+            stored.value,
+            stored.prefix_len
+        ));
+    }
     Ok(())
 }
 
@@ -2543,6 +2778,48 @@ fn qwen35_checkpoint_session_id(
     logical_position: usize,
 ) -> String {
     format!("qwen35-checkpoint:{batch_id}:{session_id}:{logical_position}")
+}
+
+fn push_hash_field(buf: &mut Vec<u8>, label: &str, value: &str) {
+    buf.extend_from_slice(label.as_bytes());
+    buf.push(b'=');
+    buf.extend_from_slice(value.as_bytes());
+    buf.push(0);
+}
+
+fn compute_qwen35_prefix_hash(
+    arch_id: u32,
+    kv_mode: Option<&str>,
+    state_kinds: &[String],
+    assistant_prefix: &str,
+    max_think_tokens: usize,
+    tokens: &[u32],
+) -> GenerateBatchPrefillPrefixHash {
+    let mut buf = Vec::with_capacity(128 + tokens.len() * 4);
+    push_hash_field(
+        &mut buf,
+        "domain",
+        "hipfire.generate_batch_prefill.prefix.v1",
+    );
+    push_hash_field(&mut buf, "algorithm", "xxh128");
+    push_hash_field(&mut buf, "arch_id", &arch_id.to_string());
+    push_hash_field(&mut buf, "kv_mode", kv_mode.unwrap_or("unknown"));
+    push_hash_field(&mut buf, "assistant_prefix", assistant_prefix);
+    push_hash_field(&mut buf, "max_think_tokens", &max_think_tokens.to_string());
+    let mut normalized_kinds = state_kinds.to_vec();
+    normalized_kinds.sort();
+    normalized_kinds.dedup();
+    push_hash_field(&mut buf, "state_kinds", &normalized_kinds.join("+"));
+    push_hash_field(&mut buf, "token_encoding", "u32le");
+    for token in tokens {
+        buf.extend_from_slice(&token.to_le_bytes());
+    }
+    let value = twox_hash::XxHash3_128::oneshot(&buf);
+    GenerateBatchPrefillPrefixHash {
+        algorithm: "xxh128".to_string(),
+        value: format!("{value:032x}"),
+        prefix_len: tokens.len(),
+    }
 }
 
 fn qwen35_prefill_active_session(
@@ -2874,11 +3151,21 @@ fn qwen35_prefill_suffix_batch_fused_grouped_moe(
         } else {
             None
         };
+        let prefix_hash = compute_qwen35_prefix_hash(
+            m.arch_id,
+            m.q35_kv_mode.as_deref(),
+            &spec.state_kinds,
+            &spec.assistant_prefix,
+            spec.max_think_tokens,
+            &state.conversation_tokens,
+        );
+        state.prefix_hash = Some(prefix_hash.clone());
         sessions.push(Qwen35PrefillSessionResult {
             id: id.clone(),
             prefill_tokens: spec.tokens.len(),
             logical_position,
             cached_prefix_tokens: spec.cached_prefix_tokens,
+            prefix_hash,
             debug_sample_token,
         });
         m.q35_sessions.insert(id, state);
@@ -3089,11 +3376,21 @@ fn qwen35_prefill_suffix_batch_fused_dense(
         } else {
             None
         };
+        let prefix_hash = compute_qwen35_prefix_hash(
+            m.arch_id,
+            m.q35_kv_mode.as_deref(),
+            spec.state_kinds,
+            spec.assistant_prefix,
+            spec.max_think_tokens,
+            &state.conversation_tokens,
+        );
+        state.prefix_hash = Some(prefix_hash.clone());
         sessions.push(Qwen35PrefillSessionResult {
             id: id.clone(),
             prefill_tokens: spec.tokens.len(),
             logical_position,
             cached_prefix_tokens: spec.cached_prefix_tokens,
+            prefix_hash,
             debug_sample_token,
         });
         m.q35_sessions.insert(id, state);
@@ -3169,6 +3466,9 @@ fn build_qwen35_fused_dense_prefill_batch_contract<'a>(
                 tokens: &session.tokens,
                 cached_prefix_tokens: session.cached_prefix_tokens,
                 replay_as_generated_suffix: session.replay_as_generated_suffix,
+                state_kinds: &session.state_kinds,
+                assistant_prefix: &session.assistant_prefix,
+                max_think_tokens: session.max_think_tokens,
             }
         })
         .collect();
@@ -3237,12 +3537,29 @@ fn qwen35_prefill_suffix_batch_serial_reference(
             None
         };
         qwen35_save_active_session(m, gpu)?;
+        let prefix_hash = {
+            let saved = m.q35_sessions.get(&session.id).ok_or_else(|| {
+                format!("qwen35 session {} missing after prefill save", session.id)
+            })?;
+            compute_qwen35_prefix_hash(
+                m.arch_id,
+                m.q35_kv_mode.as_deref(),
+                &session.state_kinds,
+                &session.assistant_prefix,
+                session.max_think_tokens,
+                &saved.conversation_tokens,
+            )
+        };
+        if let Some(saved) = m.q35_sessions.get_mut(&session.id) {
+            saved.prefix_hash = Some(prefix_hash.clone());
+        }
         total_prefill_tokens += prefilled;
         results.push(Qwen35PrefillSessionResult {
             id: session.id.clone(),
             prefill_tokens: prefilled,
             logical_position,
             cached_prefix_tokens: session.cached_prefix_tokens,
+            prefix_hash,
             debug_sample_token,
         });
     }
@@ -3328,7 +3645,14 @@ fn run_generate_batch_prefill_serial_qwen35(
         }
 
         if let Some(runtime_state_handle) = session.state_handle.runtime_state_handle.as_deref() {
-            qwen35_fork_session_state(m, gpu, runtime_state_handle, &session.id).map_err(|e| {
+            qwen35_fork_session_state(
+                m,
+                gpu,
+                runtime_state_handle,
+                &session.id,
+                session.state_handle.prefix_hash.as_ref(),
+            )
+            .map_err(|e| {
                 format!(
                     "generate_batch_prefill session {} failed to attach checkpoint {}: {}",
                     session.id, runtime_state_handle, e
@@ -3384,6 +3708,9 @@ fn run_generate_batch_prefill_serial_qwen35(
             tokens,
             cached_prefix_tokens: session.state_handle.cached_prefix_tokens,
             replay_as_generated_suffix: session.suffix_tokens.is_some(),
+            state_kinds: session.state_handle.state_kinds.clone(),
+            assistant_prefix: session.assistant_prefix.clone(),
+            max_think_tokens: session.max_think_tokens,
         });
     }
 
@@ -3391,7 +3718,7 @@ fn run_generate_batch_prefill_serial_qwen35(
     for session in &result.sessions {
         let checkpoint_id =
             qwen35_checkpoint_session_id(&envelope.batch_id, &session.id, session.logical_position);
-        qwen35_fork_session_state(m, gpu, &session.id, &checkpoint_id).map_err(|e| {
+        qwen35_fork_session_state(m, gpu, &session.id, &checkpoint_id, None).map_err(|e| {
             format!(
                 "generate_batch_prefill session {} failed to create checkpoint {}: {}",
                 session.id, checkpoint_id, e
@@ -3413,6 +3740,8 @@ fn run_generate_batch_prefill_serial_qwen35(
                 "checkpoint_runtime_state": "attachable",
                 "logical_position": session.logical_position,
                 "cached_prefix_tokens": session.cached_prefix_tokens,
+                "prefix_hash": generate_prefix_hash_json(&session.prefix_hash),
+                "prefix_len": session.prefix_hash.prefix_len,
             },
             "mode": result.mode,
             "plan": result.plan.as_str(),
