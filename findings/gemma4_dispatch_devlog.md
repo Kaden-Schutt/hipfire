@@ -1255,15 +1255,237 @@ stop and was dropped. `generate_gemma4` now builds a `stop_set` = {`<eos>`,
 ```
 (Was looping `<turn|><turn|>…` to max_tokens.)
 
+### Chat-template framing — FIXED + VERIFIED
+`generate_gemma4` now frames the prompt as
+`<bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>`
+(optional system turn first), guarded on all four turn/channel special tokens being
+present (raw fallback otherwise — `encode()` segments on the special-token list).
+Pre-filling the empty thought channel makes the model emit the answer directly
+instead of improvising the scaffold. Output is now clean + properly terminated:
+```
+"capital of France?"   → "The capital of France is Paris."            (7 tok)
+"haiku about ocean"    → "Blue waves kiss the shore, / Deep and endless
+                          rolling tides, / Salt spray fills the air."  (20 tok)
+"7 times 6?"           → "7 times 6 is 42."                            (9 tok)
+```
+**12B-q8 gemma4 is now a usable chat model** (correct, clean, stops correctly).
+
+### CLI tokenizer "bug" — was the STALE PROD DAEMON, not code
+`hipfire run`/`serve` use `~/.hipfire/bin/daemon` (was May-26, predating the gemma4
+SPM-BPE ▁-detection fix) → mis-detected the 262K vocab as GPT-2 BPE → "missing byte
+symbol 0x90". Refreshed the prod binary; `hipfire run gemma-4-12B-it-q8 "What is the
+capital of France?"` → **"The capital of France is **Paris**."** (8 tok, 14.4 tok/s,
+clean stop). Tokenizer code was always correct (daemon JSONL path proved it). Gotcha:
+refresh the prod daemon after any runtime change.
+
+### Coherence-gate row added
+`coherence-gate.sh` SHORT_TESTS now has a `gemma-4-12B-it-q8.hfq` cap row
+(skip-if-missing) — protects the hd512 reduce + `<turn|>` stop + framing against
+regression.
+
+### Long-prompt validation + sliding-window OOB guard
+Validated the per-token-prefill path on realistic prompts (12B-q8): a multi-step
+task ("…already watered the plants… how many remain" → "1. Buy groceries / 2. Call
+the dentist / 2 tasks remain.") and a correct iterative `fib(n)` with docstring +
+complexity notes. Reasoning and code are correct and well-formatted.
+
+Confirmed a **latent OOB**: the sliding KV cache is sized at `sliding_window`=1024
+(`KvCache::new_gpu(.., sliding_window)`) and writes use `slot=pos` with no ring-buffer
+wrap, so any position ≥1024 writes out of bounds. Added a guard in `generate_gemma4`:
+refuse prompts ≥ `sliding_window` and stop decode before `m.seq_pos` reaches the cap
+(clean error / clean stop, not memory corruption). Verified: short prompt → "Rome";
+2013-tok prompt → clean error "sliding-window limit is 1024…". Full ring buffer
+(`slot=pos%cap` + hd256 window masking) remains the deferred long-context work and
+needs a >1024-token oracle.
+
 ### Remaining (priority order)
-1. **Chat-template framing** — output still prefixes an empty `<|channel>thought\n
-   <channel|>` because the prompt is raw (no turn scaffolding). Frame as
-   `<bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>`
-   (ids 105/106 + channel ids) so the model emits a clean answer. (In progress.)
-2. **CLI tokenizer bug** — `hipfire run`/`serve` mis-load the 262K BPE as GPT-2 BPE
-   (`missing byte symbol 0x90`); daemon JSONL path tokenizes fine.
-3. **Prefill/batched full layers** — `attention_flash_asym3_batched_window` routes
+1. **Sliding-window ring buffer** (long context >1024) — guarded against OOB; full
+   impl needs hd256 window masking + `slot=pos%cap` wrap + a >1024-tok oracle.
+2. **Prefill/batched full layers** — `attention_flash_asym3_batched_window` routes
    hd512→hd256; the hd512-batched kernel is unwired and would need its own reduce.
-4. Backlog: MoE stubbed (26B-A4B can't run), sliding-window ring buffer no-op
+   **Latent**: the daemon does *per-token* prefill (`forward_scratch` loop), so it
+   doesn't hit this — only matters when batched `forward_prefill_batch_v2` is wired
+   (a prefill-speed optimization).
+3. Backlog: MoE stubbed (26B-A4B can't run), sliding-window ring buffer no-op
    (`cache_capacity` dead), dead code (`forward_prefill_batch_v1`, unreachable
    graph-capture branch), no unit tests, missing copyright header on `gemma4.rs`.
+
+---
+
+## 2026-06-08 · Session 16 — Long-context oracle + sliding-window attempt
+
+### Oracle infrastructure (built + committed)
+Two-sided HF-vs-hipfire oracle keyed on byte-identical **token IDs**:
+- `scripts/oracle_gemma4.py` — HF reference (f32 CPU; ROCm torch 2.3.1+rocm5.7 in
+  vllm_env can't drive gfx1151, and rocm6.4 install was in flight, so CPU). Dumps
+  final-position top-k logits + per-layer last-hidden.
+- `examples/gemma4_oracle.rs` — hipfire side via `forward_scratch` (daemon's exact
+  per-token path).
+- **Self-gate ([2,9259]) PASSES**: hipfire real-token argmax 575 = HF (top-10
+  overlap 8/10). Lone special-block token 258882 is a q8 lm_head artifact on the
+  multimodal vocab ≥256000; compare on real tokens <256000.
+
+### Sliding-window attention (ported, but does NOT fix >1024)
+Ported the **`upstream/feat/sliding-window-fa`** kernel approach (cleaner + more
+optimized than the original ring branch: tile-clamp `tile_start = max(raw,
+kv_start)` skips out-of-window sub-tiles; `kv_window=0` = byte-identical so qwen35
+untouched; no kv-write churn). Threaded `kv_window` through
+`attention_flash_asym3` + 5 callers (gemma passes `sliding_window`, others 0),
+sized the sliding KV cache at `max_seq` (window the *read*, not a ring wrap yet).
+
+### >1024 collapse — NOT the window (deeper pre-existing bug)
+Validated against the 1200-token HF reference (argmax **4083**, top1 +0.76 — a
+clear, confident winner). hipfire **collapses**: argmax 236764, all logits ~−10.
+Discriminator:
+```
+1000 tok (window inactive, seq<1024): argmax 524  top1 +4.53  HEALTHY
+1100 tok (window active):             argmax 2036 top1 −1.55  degraded
+1200 tok:                             argmax 236764 top1 −10.10 COLLAPSED
+```
+- Stale **JIT kernel cache** (`.hipfire_kernels/gfx1151/attention_flash_asym3_tile`)
+  was serving the pre-window kernel — cleared it (the include_str! gotcha applies to
+  the on-disk hsaco cache too).
+- After recompiling the windowed kernel, **window-on == window-off (identical
+  236764/−10.10)** → the collapse is independent of windowing. The model was never
+  run past `sliding_window` before (the guard blocked it), so this is a **pre-existing
+  >1024 bug** (suspects: sliding KV at high pos, full-layer hd512 at higher tile
+  counts, or RoPE/position handling >1024) — exposed, not caused, by enabling >1024.
+
+### Decision: restore known-good ≤1024 daemon; keep oracle + window infra
+The window kernel is correct (kv_window=0 identity; ≤1024 unaffected) but doesn't
+fix >1024, and removing the guard would regress a clean ">1024 refused" into a
+garbage collapse. So: daemon sliding cache + guard reverted to `sliding_window`
+(known-good ≤1024); oracle keeps `max_seq` for future >1024 debugging; window
+kernel stays as staged infra. >1024 long-context remains open, needs the per-layer
+oracle (now available) to localize the collapse to a specific layer.
+
+---
+
+## 2026-06-08 · Session 17 — Read-through of Sessions 15–16 (Claude's work)
+
+### Context
+
+Another agent (Claude Opus 4.8) took over after Session 14 and completed
+Sessions 15–16, landing 6 commits (`65e4c116..0168df24`). This session is a
+read-only review of that work to sync understanding before continuing.
+
+### Session 15 summary (commits `65e4c116`..`ad41307c`)
+
+1. **Stop-token fix** (`65e4c116`): EOS config parsed as scalar (1), but
+   gemma4's HF config has `eos_token_id: [1, 106]`. Added `<turn|>`=106
+   to stop set. Fixes infinite `<turn|>` loop.
+
+2. **Chat-template framing** (`76d07dfb`): Wraps prompts in
+   `<bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>`.
+   Produces clean conversational output. Confirmed with "capital of France?"
+   → "The capital of France is Paris." (7 tok).
+
+3. **CLI tokenizer resolution** (`b607fbda`): The "byte 0x90" error was a
+   stale prod daemon binary (May-26), not a code bug. Refreshed binary;
+   `hipfire run` works.
+
+4. **Sliding-window OOB guard** (`ad41307c`): The sliding KV cache is sized
+   at `sliding_window`=1024 and writes use `slot=pos` (no ring wrap). Any
+   position ≥1024 writes out of bounds. Guard added: refuse prompts ≥
+   `sliding_window`, stop decode before `seq_pos` reaches cap.
+
+### Session 16 summary (commits `a800580e`, `0168df24`)
+
+1. **Long-context oracle** (`a800580e`): Two-sided HF-vs-hipfire oracle
+   keyed on byte-identical token IDs (not tokenized text — eliminates
+   tokenizer differences):
+   - `scripts/oracle_gemma4.py` — HF reference, dumps final logits top-k
+     + per-layer last-position hidden states
+   - `examples/gemma4_oracle.rs` — hipfire side, runs `forward_scratch`
+     (daemon's exact per-token path)
+   - Self-gate `[2,9259]` passes: hipfire argmax 575 = HF.
+
+2. **Sliding-window flash-attn kernel** (`0168df24`): Ported the
+   `upstream/feat/sliding-window-fa` kernel approach into the shared
+   `attention_flash_asym3_tile.hip`: added `kv_window` param that clamps
+   `tile_start` to skip out-of-window sub-tiles. `kv_window=0` is full
+   causal (byte-identical for qwen35). Threaded through
+   `attention_flash_asym3` + callers; gemma passes `sliding_window` for
+   hd256 sliding layers.
+
+3. **>1024 collapse discovered**: Turning on >1024 context exposed a
+   **pre-existing** collapse that is independent of windowing:
+   ```
+   1000 tok (window inactive): argmax 524, top1 +4.53  HEALTHY
+   1100 tok (window active):   argmax 2036, top1 −1.55  degraded
+   1200 tok:                   argmax 236764, top1 −10.10 COLLAPSED
+   ```
+   After clearing stale JIT kernel cache, window-on == window-off
+   (identical 236764/−10.10). The model was never run past
+   `sliding_window` before (guard blocked it).
+
+4. **Decision**: Daemon reverted to known-good ≤1024 path. Window kernel
+   stays as staged infra. >1024 needs per-layer oracle localization.
+
+### Current codebase state (post-Session 16)
+
+- **Daemon**: ≤1024 tokens only (guard in `generate_gemma4`). Produces
+  coherent, correct output on short prompts.
+- **Sliding KV cache**: allocated at `sliding_window` (1024) in daemon,
+  `max_seq` in oracle. No ring-buffer wrap (`slot=pos`).
+- **Full KV cache**: allocated at `max_seq` in both. Uses asym3 (Givens
+  rotated 3-bit K, Q8_0 V) with hd512 tile+reduce.
+- **Partials buffer**: sized for `n_heads * max_tiles_full * (2 + 512)`,
+  `max_tiles_full = (max_kv_seq + 127) / 128`, default `max_kv_seq=32768`.
+  Sufficient for >1024.
+- **Sliding attention**: fp32 KV path (no quantization) in oracle; asym3
+  in daemon when quantized. Both go through `attention_flash_asym3` with
+  `kv_window=sliding_window` (daemon) or 0 (oracle, no windowing yet).
+- **Full attention**: asym3 tile_hd512 + reduce. `seq_len_hint = pos + 1`.
+  At pos=1199, `seq_len=1200`, tiles = `(1200+127)/128 = 10`. The reduce
+  kernel handles this via `n_halves = 512/128 = 4`.
+
+### >1024 collapse analysis — suspects
+
+The collapse is **position-dependent**, not token-dependent. It happens
+regardless of windowing. Suspects:
+
+1. **Full-layer hd512 attention at higher tile counts**: At >1024 tokens,
+  the full layers have ≥9 tiles (vs 1 tile at 2 tokens). The
+  `attention_flash_q8_0_reduce` kernel processes all tiles and combines
+  them. If the reduce has a bug at higher tile counts (e.g., incorrect
+  `n_tiles` computation, overflow in accumulation), it would only appear
+  at longer sequences.
+
+2. **Asym3 KV cache layout at high positions**: The K cache uses
+  `k_bytes_per_pos = n_kv_heads * (4 + head_dim*3/8)`. For hd512, n_kv=1,
+  that's `4 + 192 = 196` bytes per position. At position 1200, offset =
+  `1200 * 196 = 235,200` bytes. If the cache allocation is smaller than
+  `max_seq * 196`, this writes out of bounds. Need to verify allocation
+  size vs actual usage.
+
+3. **Sliding KV cache OOB (even in oracle)**: The oracle allocates
+  `max_seq = ids.len()` for the sliding KV cache. But `kv_cache_write`
+  uses `slot = pos_buf[0]` with no wrapping. If the cache is allocated
+  correctly at `max_seq`, this should be fine — but the sliding KV is
+  `new_gpu` (fp32), not `new_gpu_asym3`. Need to verify that `new_gpu`
+  allocates enough rows.
+
+4. **RoPE at high positions**: `rope_f32` and `rope_partial_halved_f32`
+  compute cos/sin inline from position. At pos=1200 with theta=10000
+  (sliding) or theta=1e6 (full), the rotation angles should be well-behaved.
+  Unlikely to cause collapse unless there's a precision issue in the
+  kernel.
+
+5. **Givens cos/sin tables for the full KV cache**: These are precomputed
+  at cache creation time for the asym3 quantized K write. If they're sized
+  for a smaller `max_seq` than actually used, the KV write kernel reads
+  out-of-bounds cos/sin values, corrupting the K cache.
+
+### Recommended next step
+
+Use the per-layer oracle to localize the collapse: dump per-layer hidden
+states at the last position (pos=1199) from both HF and hipfire, then
+binary-search which layer first diverges. The HF oracle already dumps
+`layers[].first8` and `layers[].norm`. Add the same to the hipfire oracle
+(`gemma4_oracle.rs` currently only dumps final logits). This is exactly
+what the previous agent recommended.
+
+If the divergence starts at a sliding layer, suspect #3 (sliding KV OOB)
+or #4 (RoPE). If it starts at a full layer, suspect #1 (reduce at higher
+  tiles) or #2 (asym3 KV layout).
