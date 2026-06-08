@@ -9298,6 +9298,7 @@ fn forward_prefill_chunk(
                     is_boundary: false,
                     cache_capacity: 0, // identity (no wrapping)
                     head_dim: config.head_dim,
+                    window_size: 0,
                 }).map_err(|e| HipError::new(0, &e.to_string()))?;
                 let io = AttnParams {
                     q: &pbs.fa_q_batch,
@@ -9313,6 +9314,7 @@ fn forward_prefill_chunk(
                     n_heads: config.n_heads,
                     n_kv_heads: config.n_kv_heads,
                     head_dim: config.head_dim,
+                    window_size: 0,
                     physical_cap: kv_cache.physical_cap,
                     cache_capacity: 0, // identity (no wrapping)
                     batch_size: n,
@@ -10797,6 +10799,7 @@ fn forward_prefill_chunk(
                     is_boundary: false,
                     cache_capacity: 0, // identity (no wrapping)
                     head_dim: config.head_dim,
+                    window_size: 0,
                 }).map_err(|e| HipError::new(0, &e.to_string()))?;
                 let io = AttnParams {
                     q: &pbs.fa_q_batch,
@@ -10812,6 +10815,7 @@ fn forward_prefill_chunk(
                     n_heads: config.n_heads,
                     n_kv_heads: config.n_kv_heads,
                     head_dim: config.head_dim,
+                    window_size: 0,
                     physical_cap: kv_cache.physical_cap,
                     cache_capacity: 0, // identity (no wrapping)
                     batch_size: n,
@@ -12216,8 +12220,9 @@ fn kv_cache_attention_dispatch(
         batch_size: 1,
         is_tree: false,
         is_boundary: false,
-                    cache_capacity: 0, // identity (no wrapping) // TODO: boundary producer not yet populated
-                    head_dim: config.head_dim,
+        cache_capacity: 0, // identity (no wrapping) // TODO: boundary producer not yet populated
+        head_dim: config.head_dim,
+        window_size: 0,
     }).map_err(|e| HipError::new(0, &e.to_string()))?;
     let io = AttnParams {
         q: &s.fa_q,
@@ -12233,6 +12238,7 @@ fn kv_cache_attention_dispatch(
         n_heads: config.n_heads,
         n_kv_heads: config.n_kv_heads,
         head_dim: config.head_dim,
+        window_size: 0,
         physical_cap: kv_cache.physical_cap,
                     cache_capacity: 0, // identity (no wrapping)
         batch_size: 1,

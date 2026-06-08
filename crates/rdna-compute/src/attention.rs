@@ -1812,6 +1812,7 @@ impl Gpu {
 
     /// Fused K+V write for asym4: K at givens4 (rotated 4-bit), V at Q8_0 (normal space).
     /// Launches two kernels — K-only givens4 writer + standard Q8_0 writer.
+    /// Asym4 fused K+V write (cap=0 shorthand of `_cap`).
     pub fn kv_cache_write_asym4_fused(
         &mut self,
         k_dst: &GpuTensor,
@@ -1824,6 +1825,24 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
     ) -> HipResult<()> {
+        self.kv_cache_write_asym4_fused_cap(k_dst, v_dst, k_src, v_src, pos_buf,
+            cos_theta, sin_theta, n_kv_heads, head_dim, 0)
+    }
+
+    /// Fused asym4 K+V write with optional ring-buffer wrapping.
+    pub fn kv_cache_write_asym4_fused_cap(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        cache_capacity: u32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         // K: rotated 4-bit
         self.ensure_givens4_kernel(
@@ -1832,37 +1851,47 @@ impl Gpu {
             "kv_cache_write_asym_k_givens4",
         )?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens4"];
-            let mut kdp = k_dst.buf.as_ptr();
-            let mut ksp = k_src.buf.as_ptr();
-            let mut pp = pos_buf.as_ptr();
-            let mut ctp = cos_theta.buf.as_ptr();
-            let mut stp = sin_theta.buf.as_ptr();
-            let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32;
+            let kdp = k_dst.buf.as_ptr();
+            let ksp = k_src.buf.as_ptr();
+            let pp = pos_buf.as_ptr();
+            let ctp = cos_theta.buf.as_ptr();
+            let stp = sin_theta.buf.as_ptr();
+            let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
-                &mut kdp as *mut _ as *mut c_void,
-                &mut ksp as *mut _ as *mut c_void,
-                &mut pp as *mut _ as *mut c_void,
-                &mut ctp as *mut _ as *mut c_void,
-                &mut stp as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
+                &kdp as *const _ as *mut c_void,
+                &ksp as *const _ as *mut c_void,
+                &pp as *const _ as *mut c_void,
+                &ctp as *const _ as *mut c_void,
+                &stp as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &cc as *const _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_kv_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    shared_mem,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "kv_cache_write_asym_k_givens4",
+                [n_kv_heads as u32, 1, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(ctp);
+                    b.push_ptr(stp);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(cc);
+                    b
+                },
+            )?;
         }
-        // V: standard Q8_0
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        // V: standard Q8_0 with same ring-buffer cap
+        self.kv_cache_write_q8_0_cap(v_dst, v_src, pos_buf, n_kv_heads, head_dim, cache_capacity)
     }
 
     /// Fused K+V write for fwht4: K at signed-FWHT-rotated 4-bit, V at Q8_0.
@@ -4007,6 +4036,7 @@ impl Gpu {
     }
 
     /// Fused K+V write for asym2: K at givens2 (rotated 2-bit), V at Q8_0 (normal space).
+    /// Asym2 fused K+V write (cap=0 shorthand of `_cap`).
     pub fn kv_cache_write_asym2_fused(
         &mut self,
         k_dst: &GpuTensor,
@@ -4019,6 +4049,24 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
     ) -> HipResult<()> {
+        self.kv_cache_write_asym2_fused_cap(k_dst, v_dst, k_src, v_src, pos_buf,
+            cos_theta, sin_theta, n_kv_heads, head_dim, 0)
+    }
+
+    /// Fused asym2 K+V write with optional ring-buffer wrapping.
+    pub fn kv_cache_write_asym2_fused_cap(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        cache_capacity: u32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_givens4_kernel(
             "kv_cache_write_asym_k_givens2",
@@ -4026,36 +4074,46 @@ impl Gpu {
             "kv_cache_write_asym_k_givens2",
         )?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens2"];
-            let mut kdp = k_dst.buf.as_ptr();
-            let mut ksp = k_src.buf.as_ptr();
-            let mut pp = pos_buf.as_ptr();
-            let mut ctp = cos_theta.buf.as_ptr();
-            let mut stp = sin_theta.buf.as_ptr();
-            let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32;
+            let kdp = k_dst.buf.as_ptr();
+            let ksp = k_src.buf.as_ptr();
+            let pp = pos_buf.as_ptr();
+            let ctp = cos_theta.buf.as_ptr();
+            let stp = sin_theta.buf.as_ptr();
+            let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
-                &mut kdp as *mut _ as *mut c_void,
-                &mut ksp as *mut _ as *mut c_void,
-                &mut pp as *mut _ as *mut c_void,
-                &mut ctp as *mut _ as *mut c_void,
-                &mut stp as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
+                &kdp as *const _ as *mut c_void,
+                &ksp as *const _ as *mut c_void,
+                &pp as *const _ as *mut c_void,
+                &ctp as *const _ as *mut c_void,
+                &stp as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &cc as *const _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_kv_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    shared_mem,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "kv_cache_write_asym_k_givens2",
+                [n_kv_heads as u32, 1, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(ctp);
+                    b.push_ptr(stp);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(cc);
+                    b
+                },
+            )?;
         }
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        self.kv_cache_write_q8_0_cap(v_dst, v_src, pos_buf, n_kv_heads, head_dim, cache_capacity)
     }
 
     /// Fused K+V write for fwht2: K at FWHT-rotated 2-bit, V at Q8_0.

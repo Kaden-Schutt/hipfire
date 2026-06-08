@@ -44,10 +44,11 @@ pub struct AttnParams<'a> {
     pub physical_cap: usize,
     /// Ring-buffer capacity for sliding-window KV caches (from `KvTierPlan`).
     /// `0` → identity (slot = pos). `> 0` → wrapping (slot = pos % cache_capacity).
-    /// Stored here for future kernel threading; not yet passed to GPU methods
-    /// (deferred to gemma4 kernel port in Phase 1b).
-    #[allow(dead_code)]
+    /// Threaded through to _cap GPU methods by dispatch_kv_write / dispatch_attend.
     pub cache_capacity: u32,
+    /// Sliding-window lookback. `0` = full causal. `> 0` → only attend to the
+    /// last `window_size` positions. Threaded to flash attention kernels.
+    pub window_size: u32,
     /// Batch size. REQUIRED: `1` for decode/per-token, `>1` for batched prefill.
     pub batch_size: usize,
     /// Batched attend loop bound (= start_pos + n). `0` when `batch_size == 1`.
@@ -285,16 +286,16 @@ fn dispatch_kv_write(
         }
         KernelKey::KvWriteQ8_0 => {
             debug_assert_eq!(plan.batch_size, 1);
-            hip!(gpu.kv_cache_write_q8_0(io.k_cache, io.k, io.pos_buf, io.n_kv_heads, io.head_dim))?;
-            hip!(gpu.kv_cache_write_q8_0(io.v_cache, io.v, io.pos_buf, io.n_kv_heads, io.head_dim))
+            hip!(gpu.kv_cache_write_q8_0_cap(io.k_cache, io.k, io.pos_buf, io.n_kv_heads, io.head_dim, plan.cache_capacity))?;
+            hip!(gpu.kv_cache_write_q8_0_cap(io.v_cache, io.v, io.pos_buf, io.n_kv_heads, io.head_dim, plan.cache_capacity))
         }
         KernelKey::KvWriteAsym4 => {
             debug_assert_eq!(plan.batch_size, 1);
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
-            hip!(gpu.kv_cache_write_asym4_fused(
+            hip!(gpu.kv_cache_write_asym4_fused_cap(
                 io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
-                ct, st, io.n_kv_heads, io.head_dim,
+                ct, st, io.n_kv_heads, io.head_dim, plan.cache_capacity,
             ))
         }
         KernelKey::KvWriteAsym4Fwht => {
@@ -310,9 +311,9 @@ fn dispatch_kv_write(
             debug_assert_eq!(plan.batch_size, 1);
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
-            hip!(gpu.kv_cache_write_asym3_fused(
+            hip!(gpu.kv_cache_write_asym3_fused_cap(
                 io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
-                ct, st, io.n_kv_heads, io.head_dim,
+                ct, st, io.n_kv_heads, io.head_dim, plan.cache_capacity,
             ))
         }
         KernelKey::KvWriteAsym3Fwht => {
@@ -328,9 +329,9 @@ fn dispatch_kv_write(
             debug_assert_eq!(plan.batch_size, 1);
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
-            hip!(gpu.kv_cache_write_asym2_fused(
+            hip!(gpu.kv_cache_write_asym2_fused_cap(
                 io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
-                ct, st, io.n_kv_heads, io.head_dim,
+                ct, st, io.n_kv_heads, io.head_dim, plan.cache_capacity,
             ))
         }
         KernelKey::KvWriteAsym2Fwht => {
@@ -482,9 +483,10 @@ fn dispatch_attend(
             debug_assert_eq!(plan.batch_size, 1);
             let seq_len = io.pos + 1;
             let fp = io.flash_partials.unwrap();
-            hip!(gpu.attention_flash_q8_0(
+            hip!(gpu.attention_flash_q8_0_cap(
                 io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
                 seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
+                plan.window_size, plan.cache_capacity,
             ))
         }
         KernelKey::AttnQ8_0Kv => {
@@ -501,9 +503,10 @@ fn dispatch_attend(
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
             let fp = io.flash_partials.unwrap();
-            hip!(gpu.attention_flash_asym4(
+            hip!(gpu.attention_flash_asym4_cap(
                 io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
                 ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
+                plan.window_size, plan.cache_capacity,
             ))
         }
         KernelKey::AttnFlashAsym4Fwht => {
@@ -524,10 +527,10 @@ fn dispatch_attend(
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
             let fp = io.flash_partials.unwrap();
-            hip!(gpu.attention_flash_asym3(
+            hip!(gpu.attention_flash_asym3_cap(
                 io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
                 ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
-                0, // kv_window: 0 = full causal (non-gemma asym3)
+                plan.window_size as usize, plan.cache_capacity,
             ))
         }
         KernelKey::AttnFlashAsym3Fwht => {
@@ -548,9 +551,10 @@ fn dispatch_attend(
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
             let fp = io.flash_partials.unwrap();
-            hip!(gpu.attention_flash_asym2(
+            hip!(gpu.attention_flash_asym2_cap(
                 io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
                 ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
+                plan.window_size, plan.cache_capacity,
             ))
         }
         KernelKey::AttnFlashAsym2Fwht => {
