@@ -311,10 +311,17 @@ fn dispatch_kv_write(
             debug_assert_eq!(plan.batch_size, 1);
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
-            hip!(gpu.kv_cache_write_asym3_fused_cap(
-                io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
-                ct, st, io.n_kv_heads, io.head_dim, plan.cache_capacity,
-            ))
+            if io.head_dim == 512 {
+                hip!(gpu.kv_cache_write_asym3_hd512(
+                    io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
+                    ct, st, io.n_kv_heads, io.head_dim,
+                ))
+            } else {
+                hip!(gpu.kv_cache_write_asym3_fused_cap(
+                    io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
+                    ct, st, io.n_kv_heads, io.head_dim, plan.cache_capacity,
+                ))
+            }
         }
         KernelKey::KvWriteAsym3Fwht => {
             debug_assert_eq!(plan.batch_size, 1);
@@ -527,11 +534,21 @@ fn dispatch_attend(
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
             let fp = io.flash_partials.unwrap();
-            hip!(gpu.attention_flash_asym3_cap(
-                io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
-                ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
-                plan.window_size as usize, plan.cache_capacity,
-            ))
+            if io.head_dim == 512 {
+                // Gemma4 full-attention layers: dedicated hd512 kernel
+                // (no window/ring — full causal, no wrapping)
+                hip!(gpu.attention_flash_asym3_hd512(
+                    io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                    ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap,
+                    fp,
+                ))
+            } else {
+                hip!(gpu.attention_flash_asym3_cap(
+                    io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
+                    ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
+                    plan.window_size as usize, plan.cache_capacity,
+                ))
+            }
         }
         KernelKey::AttnFlashAsym3Fwht => {
             debug_assert_eq!(plan.batch_size, 1);

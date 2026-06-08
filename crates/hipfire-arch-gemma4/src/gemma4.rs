@@ -18,6 +18,10 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, weight_gemm, WeightTensor, EmbeddingFormat};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use hipfire_dispatch::pipeline::{execute_steps, Step};
+use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
+use hipfire_dispatch::families::attention::AttnParams;
+use hipfire_dispatch::context::DispatchCtx;
 
 /// Env-gated dump helper for v1-vs-v2 root-cause work.
 /// Set HIPFIRE_GEMMA4_DUMP=1 to enable. Prints first 4 floats + sum + nan/inf count.
@@ -2166,63 +2170,59 @@ fn full_layer_decode_impl(
     if _fdump { dbg_dump(gpu, "[FL] L5 post_rope_q", &scratch.q, n_heads * head_dim); }
     if _fdump { dbg_dump(gpu, "[FL] L5 post_rope_k", &scratch.k, n_kv * head_dim); }
 
-    // KV cache write + attention for full-attention layers (head_dim=512).
-    //
-    // Supported: asym3 (hd512 kernels), q8 (n_halves tile kernel), fp32.
-    // NOT wired: asym4, asym2 — their HIP tile kernels + Rust _cap siblings
-    // support hd512, but the model-crate wiring belongs in Phase 2
-    // (execute_steps / AttentionFamily) per the dispatch-unification plan.
-    // Do not add branches here; migrate to AttentionFamily instead.
-    // window_size=0 = full causal (no sliding on global layers).
-    if kv_cache.quant_asym3 {
-        let ct = kv_cache.givens_cos.as_ref().unwrap();
-        let st = kv_cache.givens_sin.as_ref().unwrap();
-        if head_dim == 512 {
-            gpu.kv_cache_write_asym3_hd512(
-                &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-                &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
-        } else {
-            gpu.kv_cache_write_asym3_fused(
-                &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-                &scratch.k, &scratch.v, &scratch.pos_buf, ct, st, n_kv, head_dim)?;
-        }
-        gpu.attention_flash_asym3_window(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
-            n_heads, n_kv, head_dim, kv_cache.max_seq,
-            &scratch.flash_partials,
-            0, // window_size: full causal,
-            0,
-        )?;
-    // NOTE: asym4/asym2 full-layer branches intentionally omitted here.
-    // Those quant modes for hd=512 full-attention layers belong in Phase 2
-    // (execute_steps / AttentionFamily routing), not in old-style dispatch.
-    // The HIP tile kernels + Rust _cap siblings already support hd512;
-    // this is just the wiring question. See plan §5 step 2c.
-    } else if kv_cache.quant_q8 {
-        // Q8_0 KV: same tile kernel handles both hd256 and hd512 via n_halves.
-        // Full layers: no window, no ring. Sliding layers: windowed via _window wrapper.
-        gpu.kv_cache_write_q8_0_cap(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, n_kv, head_dim, 0)?;
-        gpu.kv_cache_write_q8_0_cap(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, n_kv, head_dim, 0)?;
-        gpu.attention_flash_q8_0_cap(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.attn_out, &scratch.pos_buf, pos + 1,
-            n_heads, n_kv, head_dim, kv_cache.max_seq,
-            &scratch.flash_partials,
-            0, 0,
-        )?;
-    } else {
-        // FP32 KV path (kvf16 / kvfp32). attention_f32 bakes in
-        // scale=1/sqrt(head_dim); the pre-scale of Q above cancels it, giving
-        // the Gemma 4 scale=1.0 semantics.
-        let kv_dim = n_kv * head_dim;
-        gpu.kv_cache_write(&kv_cache.k_gpu[kv_layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
-        gpu.kv_cache_write(&kv_cache.v_gpu[kv_layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
-        gpu.attention_f32(
-            &scratch.q, &kv_cache.k_gpu[kv_layer_idx], &kv_cache.v_gpu[kv_layer_idx],
-            &scratch.attn_out, &scratch.pos_buf, pos + 1,
-            n_heads, n_kv, head_dim, kv_cache.max_seq,
-        )?;
+    // KV cache write + attention via dispatch framework (Step::Attend).
+    // Full-attention layers: window_size=0 (full causal), cache_capacity=0.
+    {
+        let tier_inputs = KvTierInputs {
+            quant_asym4: kv_cache.quant_asym4,
+            quant_asym3: kv_cache.quant_asym3,
+            quant_asym2: kv_cache.quant_asym2,
+            quant_q8: kv_cache.quant_q8,
+            quant_fwht: kv_cache.quant_fwht,
+            quant_hfq4: false,
+            quant_q4: false,
+            v_mode_bits: kv_cache.v_mode_bits(),
+            pos,
+            flash_mode: 2,
+            capture_mode: gpu.graphs.capture_mode,
+            batch_size: 1,
+            is_tree: false,
+            is_boundary: false,
+            cache_capacity: 0,
+            head_dim,
+            window_size: 0,
+        };
+        let plan = KvTierPlan::derive(tier_inputs)
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
+        let io = AttnParams {
+            q: &scratch.q,
+            k: &scratch.k,
+            v: &scratch.v,
+            k_cache: &kv_cache.k_gpu[kv_layer_idx],
+            v_cache: &kv_cache.v_gpu[kv_layer_idx],
+            k_scales: None,
+            v_scales: None,
+            pos_buf: &scratch.pos_buf,
+            pos,
+            positions: None,
+            n_heads,
+            n_kv_heads: n_kv,
+            head_dim,
+            physical_cap: kv_cache.max_seq,
+            cache_capacity: 0,
+            window_size: 0,
+            batch_size: 1,
+            max_ctx_len: 0,
+            flash_partials: Some(&scratch.flash_partials),
+            givens_cos: kv_cache.givens_cos.as_ref(),
+            givens_sin: kv_cache.givens_sin.as_ref(),
+            tree_bias: None,
+            block_start: 0,
+            block_cols: 0,
+            output: &scratch.attn_out,
+        };
+        let ctx = DispatchCtx::new(gpu);
+        execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])?;
     }
 
     // o_proj → tmp.
