@@ -179,4 +179,41 @@ describe("priority prefill scheduler", () => {
     expect(ids(scheduler.nextPrefillBatch({ nowMs: 0 }))).toEqual([]);
     expect(ids(scheduler.nextPrefillBatch({ nowMs: 0 }))).toEqual([]);
   });
+
+  test("does not duplicate an incoming session that is already queued", () => {
+    const scheduler = new PriorityPrefillScheduler({
+      HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE: "0",
+      HIPFIRE_SCHED_PREFILL_BATCH_MAX: "2",
+    });
+    const incoming = session("incoming", { priority: 64 });
+    scheduler.enqueue(incoming, 10);
+
+    const preview = scheduler.previewNextPrefillBatch({
+      nowMs: 10,
+      incomingSession: incoming,
+      incomingEnqueuedAtMs: 10,
+    });
+
+    expect(ids(preview)).toEqual(["incoming"]);
+    expect(ids(scheduler.nextPrefillBatch({ nowMs: 10 }))).toEqual(["incoming"]);
+  });
+
+  test("deadline aging lets starved compatible work bypass an unready higher-priority bucket", () => {
+    const scheduler = new PriorityPrefillScheduler({
+      HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE: "1000",
+      HIPFIRE_SCHED_DEADLINE_AGING_MS: "50",
+    });
+    scheduler.enqueue(session("high-waiting", { priority: 32 }), 100);
+    scheduler.enqueue(session("aged-low", { priority: 128 }), 0);
+
+    expect(ids(scheduler.nextPrefillBatch({ nowMs: 60 }))).toEqual(["aged-low"]);
+  });
+
+  test("backpressure rejects new queue entries above the configured limit", () => {
+    const scheduler = new PriorityPrefillScheduler({
+      HIPFIRE_SCHED_PREFILL_MAX_QUEUED: "1",
+    });
+    scheduler.enqueue(session("first"), 0);
+    expect(() => scheduler.enqueue(session("second"), 0)).toThrow("backpressure");
+  });
 });

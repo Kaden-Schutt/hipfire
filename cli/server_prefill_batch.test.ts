@@ -4,6 +4,7 @@ import {
   createServerPrefillSession,
   parseServerPrefillBatchPolicy,
   serverPrefillBatchEligibility,
+  serverPrefillPendingWaitMs,
 } from "./server_prefill_batch";
 import { parseServerPrefillPolicyControls } from "./scheduler_policy";
 
@@ -52,6 +53,17 @@ describe("server prefill batching policy", () => {
       HIPFIRE_SERVER_PREFILL_BATCH_STATE_CACHE_DISK: "1",
       HIPFIRE_SCHED_STATE_CACHE_DISK: "0",
     })).toEqual({ stateCacheDisk: true });
+  });
+
+  test("pending wait covers coalescing plus expected prefill processing", () => {
+    expect(serverPrefillPendingWaitMs({
+      coalesceWaitMs: 5,
+      maxProcessingMs: 100,
+    })).toBe(355);
+    expect(serverPrefillPendingWaitMs({
+      coalesceWaitMs: 80,
+      maxProcessingMs: 100,
+    })).toBe(430);
   });
 });
 

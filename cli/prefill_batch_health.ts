@@ -22,15 +22,28 @@ export interface PrefillBatchHealthInputs {
   eligible: number;
   selected: number;
   skipped: number;
+  totalBatches?: number;
+  fusedBatches?: number;
+  fallbackBatches?: number;
+  batchSizeHistogram?: Record<string, number>;
   cacheHits: number;
   cacheMisses: number;
+  metadataCacheHits?: number;
+  runtimeCacheHits?: number;
   queueSize: number;
+  pendingRequests?: number;
+  residentRuntimeSessions?: number;
   generateBatchPrefillCapability: GenerateBatchPrefillCapability;
   generateBatchPrefillCapabilityReason: string;
   queueWaitReason: PrefillQueueWaitReason;
   fallbackReason: string;
   runtimeDispatchSkippedReason: string;
   selectedBatchSize: number;
+  lastPrefillTokens?: number;
+  lastPrefillMs?: number;
+  lastPrefillTokS?: number;
+  daemonPrefillPlan?: string;
+  daemonPrefillBackend?: string;
 }
 
 export interface PrefillBatchHealthPayload {
@@ -39,15 +52,28 @@ export interface PrefillBatchHealthPayload {
   eligible?: number;
   selected?: number;
   skipped?: number;
+  total_batches?: number;
+  fused_batches?: number;
+  fallback_batches?: number;
+  batch_size_histogram?: Record<string, number>;
   cache_hits?: number;
   cache_misses?: number;
+  metadata_cache_hits?: number;
+  runtime_cache_hits?: number;
   queue_size?: number;
+  pending_requests?: number;
+  resident_runtime_sessions?: number;
   generate_batch_prefill_capability?: GenerateBatchPrefillCapability;
   generate_batch_prefill_capability_reason?: string;
   queue_wait_reason?: PrefillQueueWaitReason;
   fallback_reason?: string;
   runtime_dispatch_skipped_reason?: string;
   selected_batch_size?: number;
+  last_prefill_tokens?: number;
+  last_prefill_ms?: number;
+  last_prefill_tok_s?: number;
+  daemon_prefill_plan?: string;
+  daemon_prefill_backend?: string;
 }
 
 export interface BatchHealthInputs {
@@ -107,15 +133,28 @@ export function buildPrefillBatchHealthPayload(
     eligible: input.eligible,
     selected: input.selected,
     skipped: input.skipped,
+    total_batches: input.totalBatches ?? 0,
+    fused_batches: input.fusedBatches ?? 0,
+    fallback_batches: input.fallbackBatches ?? 0,
+    batch_size_histogram: input.batchSizeHistogram ?? {},
     cache_hits: input.cacheHits,
     cache_misses: input.cacheMisses,
+    metadata_cache_hits: input.metadataCacheHits ?? 0,
+    runtime_cache_hits: input.runtimeCacheHits ?? input.cacheHits,
     queue_size: input.queueSize,
+    pending_requests: input.pendingRequests ?? 0,
+    resident_runtime_sessions: input.residentRuntimeSessions ?? 0,
     generate_batch_prefill_capability: input.generateBatchPrefillCapability,
     generate_batch_prefill_capability_reason: input.generateBatchPrefillCapabilityReason,
     queue_wait_reason: input.queueWaitReason,
     fallback_reason: input.fallbackReason,
     runtime_dispatch_skipped_reason: input.runtimeDispatchSkippedReason,
     selected_batch_size: input.selectedBatchSize,
+    last_prefill_tokens: input.lastPrefillTokens ?? 0,
+    last_prefill_ms: input.lastPrefillMs ?? 0,
+    last_prefill_tok_s: input.lastPrefillTokS ?? 0,
+    daemon_prefill_plan: input.daemonPrefillPlan,
+    daemon_prefill_backend: input.daemonPrefillBackend,
   };
 }
 

@@ -19,6 +19,8 @@ export interface PrefixCheckpointManifest {
   tokenPrefixHash: string;
   prefixLen: number;
   stateKinds: readonly SessionStateKind[];
+  runtimeState: "metadata_only" | "resident" | "attachable";
+  runtimeStateHandle?: string;
   bytes: number;
   createdAtMs: number;
   lastUsedAtMs: number;
@@ -31,6 +33,8 @@ export interface CreatePrefixCheckpointManifestInput {
   prefixTokens: readonly number[];
   stateKinds: readonly SessionStateKind[];
   bytes: number;
+  runtimeState?: "metadata_only" | "resident" | "attachable";
+  runtimeStateHandle?: string;
   createdAtMs: number;
   lastUsedAtMs?: number;
   hitCount?: number;
@@ -86,12 +90,20 @@ export function createPrefixCheckpointManifest(
     tokenPrefixHash: prefixTokensHash(input.prefixTokens),
     prefixLen: input.prefixTokens.length,
     stateKinds: normalizeStateKinds(input.stateKinds),
+    runtimeState: input.runtimeState ?? "metadata_only",
+    runtimeStateHandle: input.runtimeStateHandle,
     bytes: Math.max(0, Math.floor(input.bytes)),
     createdAtMs: input.createdAtMs,
     lastUsedAtMs: input.lastUsedAtMs ?? input.createdAtMs,
     hitCount: Math.max(0, Math.floor(input.hitCount ?? 0)),
     checksums: input.checksums ?? {},
   };
+}
+
+export function prefixCheckpointAttachable(manifest: PrefixCheckpointManifest): boolean {
+  return manifest.runtimeState === "attachable"
+    && typeof manifest.runtimeStateHandle === "string"
+    && manifest.runtimeStateHandle.length > 0;
 }
 
 export function prefixCheckpointCacheKey(

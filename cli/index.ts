@@ -26,7 +26,9 @@ import {
   parseServerPrefillBatchPolicy,
   serverPrefillBatchEligibility,
   createServerPrefillSession,
+  serverPrefillPendingWaitMs,
 } from "./server_prefill_batch";
+import { shouldQueueServerPrefillPending } from "./server_prefill_request_path";
 import {
   parseSchedulerPriority,
   parseServerPrefillPolicyControls,
@@ -35,6 +37,7 @@ import {
 import {
   createPrefixCheckpointManifest,
   prefixCheckpointCompatible,
+  prefixCheckpointAttachable,
   prefixCheckpointCacheKey,
   touchPrefixCheckpointManifest,
   spillEligibility,
@@ -51,6 +54,7 @@ import { pickServingModelWorker } from "./model_worker_routing";
 import {
   buildGenerateBatchPrefillProbeMessage,
   interpretGenerateBatchPrefillProbeResponse,
+  prefillBatchRequestDispatchStatus,
   prefillBatchRuntimeDispatchStatus,
   type GenerateBatchPrefillCapability,
 } from "./generate_batch_prefill_protocol";
@@ -985,6 +989,88 @@ function detectGpuArch(): string {
   return "unknown";
 }
 
+type AcceleratorInventory = {
+  hip_gpus: Array<{
+    id: number;
+    node: string;
+    arch: string;
+    vram_bytes: number | null;
+    integrated: boolean | null;
+  }>;
+  npus: Array<{
+    id: string;
+    source: string;
+    path: string;
+  }>;
+};
+
+function readTextIfExists(path: string): string | null {
+  try {
+    if (!existsSync(path)) return null;
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function parseKfdNodeProperties(raw: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of raw.split("\n")) {
+    const m = line.trim().match(/^([a-zA-Z0-9_]+)\s+(.+)$/);
+    if (m) out[m[1]] = m[2].trim();
+  }
+  return out;
+}
+
+function detectAcceleratorInventory(): AcceleratorInventory {
+  const hip_gpus: AcceleratorInventory["hip_gpus"] = [];
+  const topologyRoot = "/sys/class/kfd/kfd/topology/nodes";
+  try {
+    for (const node of readdirSync(topologyRoot).sort()) {
+      const propsRaw = readTextIfExists(join(topologyRoot, node, "properties"));
+      if (!propsRaw) continue;
+      const props = parseKfdNodeProperties(propsRaw);
+      const gfxTarget = Number.parseInt(props.gfx_target_version ?? "", 10);
+      if (!Number.isFinite(gfxTarget) || gfxTarget <= 0) continue;
+      let vramBytes: number | null = null;
+      const memRoot = join(topologyRoot, node, "mem_banks");
+      try {
+        for (const bank of readdirSync(memRoot)) {
+          const memProps = parseKfdNodeProperties(readTextIfExists(join(memRoot, bank, "properties")) ?? "");
+          const size = Number.parseInt(memProps.size_in_bytes ?? "0", 10);
+          if (Number.isFinite(size) && size > 0) vramBytes = (vramBytes ?? 0) + size;
+        }
+      } catch {}
+      const nodeProps = Object.values(props).join(" ").toLowerCase();
+      hip_gpus.push({
+        id: hip_gpus.length,
+        node,
+        arch: gfxTargetVersionToArch(gfxTarget),
+        vram_bytes: vramBytes,
+        integrated: nodeProps.includes("apu") ? true : null,
+      });
+    }
+  } catch {}
+
+  const npus: AcceleratorInventory["npus"] = [];
+  try {
+    if (existsSync("/sys/class/accel")) {
+      for (const entry of readdirSync("/sys/class/accel").sort()) {
+        npus.push({ id: entry, source: "sysfs_accel", path: join("/sys/class/accel", entry) });
+      }
+    }
+  } catch {}
+  try {
+    if (existsSync("/dev/accel")) {
+      for (const entry of readdirSync("/dev/accel").sort()) {
+        npus.push({ id: entry, source: "dev_accel", path: join("/dev/accel", entry) });
+      }
+    }
+  } catch {}
+
+  return { hip_gpus, npus };
+}
+
 interface ArchDefaults {
   kv_cache: string;        // best KV mode for this hardware
   vram_gb: number;         // approximate VRAM
@@ -1714,24 +1800,35 @@ async function serve(port: number, host: string) {
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
+  const acceleratorInventory = detectAcceleratorInventory();
+  const serverAcceleratorKind = "hip";
+  const serverDeviceId = acceleratorInventory.hip_gpus[0]?.id ?? 0;
+  console.error(
+    `[hipfire] accelerator inventory: hip_gpus=${acceleratorInventory.hip_gpus.length} npus=${acceleratorInventory.npus.length}`,
+  );
   const serverPrefillBatch = parseServerPrefillBatchPolicy();
   const serverPrefillBatchControls = parseServerPrefillPolicyControls();
   let generateBatchPrefillCapability: GenerateBatchPrefillCapability = "unknown";
   let generateBatchPrefillCapabilityReason = "not_probed";
+  const probeGenerateBatchPrefillCapability = async () => {
+    try {
+      await e.send(buildGenerateBatchPrefillProbeMessage());
+      const probeResponse = await e.recv();
+      return interpretGenerateBatchPrefillProbeResponse(probeResponse);
+    } catch (err: any) {
+      return {
+        capability: "unknown" as GenerateBatchPrefillCapability,
+        reason: err?.message ?? "probe_failed",
+      };
+    }
+  };
   if (serverPrefillBatch.enabled) {
     console.error(
       `[hipfire] server prefill batching enabled: max=${serverPrefillBatch.maxBatch} wait=${serverPrefillBatch.waitMs}ms`,
     );
-    try {
-      await e.send(buildGenerateBatchPrefillProbeMessage());
-      const probeResponse = await e.recv();
-      const probe = interpretGenerateBatchPrefillProbeResponse(probeResponse);
-      generateBatchPrefillCapability = probe.capability;
-      generateBatchPrefillCapabilityReason = probe.reason;
-    } catch (err: any) {
-      generateBatchPrefillCapability = "unknown";
-      generateBatchPrefillCapabilityReason = err?.message ?? "probe_failed";
-    }
+    const probe = await probeGenerateBatchPrefillCapability();
+    generateBatchPrefillCapability = probe.capability;
+    generateBatchPrefillCapabilityReason = probe.reason;
     console.error(
       `[hipfire] generate_batch_prefill capability=${generateBatchPrefillCapability} reason=${generateBatchPrefillCapabilityReason}`,
     );
@@ -1766,15 +1863,20 @@ async function serve(port: number, host: string) {
     prefillTokens: number;
     elapsedMs: number;
     selectedBatchSize: number;
+    plan?: string;
+    backend?: string;
+    runtimeStateHandle?: string;
   };
   type PendingPrefillRequest = {
     session: RequestSessionDraft;
     prefillSession: any;
+    selected: boolean;
     resolve: (outcome: PendingPrefillOutcome) => void;
     reject: (err: Error) => void;
     promise: Promise<PendingPrefillOutcome>;
   };
   const pendingPrefillRequests = new Map<string, PendingPrefillRequest>();
+  const residentRuntimeSessions = new Set<string>();
   const fallbackStateCacheStore = new Map<string, PrefixCheckpointManifest>();
   const getWorkerId = (workerKey: ModelWorkerKey): string => modelWorkerKeyId(workerKey);
   const getWorkerPrefillScheduler = (workerKey: ModelWorkerKey | null): PriorityPrefillScheduler | undefined => {
@@ -1802,12 +1904,23 @@ async function serve(port: number, host: string) {
     queued: 0,
     cacheHits: 0,
     cacheMisses: 0,
+    metadataCacheHits: 0,
+    runtimeCacheHits: 0,
+    totalBatches: 0,
+    fusedBatches: 0,
+    fallbackBatches: 0,
+    batchSizeHistogram: {} as Record<string, number>,
   };
   const batchFileStore = new Map<string, BatchFileRecord>();
   const batchControlStore = new Map<string, BatchJobRecord>();
   let lastPrefillQueueWaitReason: "selected" | "waiting" | "insufficient_queue" | "not_eligible" | "disabled" = "disabled";
   let lastPrefillFallbackReason = "not_applicable";
   let lastPrefillRuntimeDispatchSkippedReason = "not_applicable";
+  let lastPrefillDaemonPlan: string | undefined;
+  let lastPrefillDaemonBackend: string | undefined;
+  let lastPrefillTokens = 0;
+  let lastPrefillMs = 0;
+  let lastPrefillTokS = 0;
   let lastBatchRuntimeSkippedReason = "not_enabled";
   let lastBatchFallbackReason = "idle";
   let lastBatchExecutionMode: BatchExecutionMode = "disabled";
@@ -2156,6 +2269,28 @@ async function serve(port: number, host: string) {
   };
 
   let lastSelectedBatchSize = 0;
+  const recordPrefillBatchDispatch = (
+    selectedSize: number,
+    prefillTokens: number,
+    elapsedMs: number,
+    plan?: string,
+    backend?: string,
+  ) => {
+    prefillBatchMetrics.totalBatches += 1;
+    if (backend?.startsWith("fused")) {
+      prefillBatchMetrics.fusedBatches += 1;
+    } else {
+      prefillBatchMetrics.fallbackBatches += 1;
+    }
+    const sizeKey = String(selectedSize);
+    prefillBatchMetrics.batchSizeHistogram[sizeKey] = (prefillBatchMetrics.batchSizeHistogram[sizeKey] ?? 0) + 1;
+    lastSelectedBatchSize = selectedSize;
+    lastPrefillTokens = Number.isFinite(prefillTokens) ? prefillTokens : 0;
+    lastPrefillMs = Number.isFinite(elapsedMs) ? elapsedMs : 0;
+    lastPrefillTokS = lastPrefillMs > 0 ? (lastPrefillTokens * 1000) / lastPrefillMs : 0;
+    if (plan) lastPrefillDaemonPlan = plan;
+    if (backend) lastPrefillDaemonBackend = backend;
+  };
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
@@ -2226,6 +2361,14 @@ async function serve(port: number, host: string) {
         currentStateMode = warmLoadMsg.params.kv_mode || null;
         modelHasVL = loadResult.vl === true;
         currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+        if (serverPrefillBatch.enabled) {
+          const probe = await probeGenerateBatchPrefillCapability();
+          generateBatchPrefillCapability = probe.capability;
+          generateBatchPrefillCapabilityReason = probe.reason;
+          console.error(
+            `[hipfire] generate_batch_prefill capability=${generateBatchPrefillCapability} reason=${generateBatchPrefillCapabilityReason}`,
+          );
+        }
         console.error(`[hipfire] warm-up complete`);
       }
     } catch (err: any) {
@@ -2275,6 +2418,7 @@ async function serve(port: number, host: string) {
             status: "ok",
             model: current,
             idle_timeout_sec: cfg.idle_timeout,
+            accelerators: acceleratorInventory,
             prefill_batch: serverPrefillBatch.enabled
               ? buildPrefillBatchHealthPayload({
                   enabled: true,
@@ -2282,15 +2426,28 @@ async function serve(port: number, host: string) {
                   eligible: prefillBatchMetrics.eligible,
                   selected: prefillBatchMetrics.selected,
                   skipped: prefillBatchMetrics.skipped,
+                  totalBatches: prefillBatchMetrics.totalBatches,
+                  fusedBatches: prefillBatchMetrics.fusedBatches,
+                  fallbackBatches: prefillBatchMetrics.fallbackBatches,
+                  batchSizeHistogram: prefillBatchMetrics.batchSizeHistogram,
                   cacheHits: prefillBatchMetrics.cacheHits,
                   cacheMisses: prefillBatchMetrics.cacheMisses,
+                  metadataCacheHits: prefillBatchMetrics.metadataCacheHits,
+                  runtimeCacheHits: prefillBatchMetrics.runtimeCacheHits,
                   queueSize: prefillQueueSize,
+                  pendingRequests: pendingPrefillRequests.size,
+                  residentRuntimeSessions: residentRuntimeSessions.size,
                   generateBatchPrefillCapability,
                   generateBatchPrefillCapabilityReason,
                   queueWaitReason: lastPrefillQueueWaitReason,
                   fallbackReason: lastPrefillFallbackReason,
                   runtimeDispatchSkippedReason: lastPrefillRuntimeDispatchSkippedReason,
                   selectedBatchSize: lastSelectedBatchSize,
+                  lastPrefillTokens,
+                  lastPrefillMs,
+                  lastPrefillTokS,
+                  daemonPrefillPlan: lastPrefillDaemonPlan,
+                  daemonPrefillBackend: lastPrefillDaemonBackend,
                 })
               : { enabled: false },
             state_cache: serverPrefillBatch.enabled
@@ -2298,6 +2455,8 @@ async function serve(port: number, host: string) {
                   enabled: serverPrefillBatchControls.stateCacheDisk,
                   entries: stateCacheEntries,
                   bytes: stateCacheBytes,
+                  metadata_hits: prefillBatchMetrics.metadataCacheHits,
+                  runtime_hits: prefillBatchMetrics.runtimeCacheHits,
                 }
               : { enabled: false },
             batches: {
@@ -2872,6 +3031,11 @@ async function serve(port: number, host: string) {
           modelHasVL = loadResult.vl === true;
           currentStateMode = loadMsg.params.kv_mode || currentStateMode;
           currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+          if (serverPrefillBatch.enabled) {
+            const probe = await probeGenerateBatchPrefillCapability();
+            generateBatchPrefillCapability = probe.capability;
+            generateBatchPrefillCapabilityReason = probe.reason;
+          }
           requestBatchPolicy = serverPrefillBatch.enabled
             ? schedulerPolicyForPriority(requestPriority, process.env)
             : undefined;
@@ -2926,6 +3090,8 @@ async function serve(port: number, host: string) {
             featureFlags: servingWorkerFeatureFlags,
             artifactDigest: inferModelArtifactDigest(current),
             maxSeqBucket: currentMaxSeq ?? requiredMaxSeq,
+            acceleratorKind: serverAcceleratorKind,
+            deviceId: serverDeviceId,
           }).workerKey;
         }
 
@@ -2987,6 +3153,14 @@ async function serve(port: number, host: string) {
         let spillable = false;
         let spillReason = "state_cache_disabled";
         let servingWorkerScheduler: PriorityPrefillScheduler | undefined;
+        let releaseRuntimeSessionId: string | null = null;
+        const requestPrefillDispatchStatus = prefillBatchRequestDispatchStatus({
+          eligible: prefillBatchGate.eligible,
+          capability: generateBatchPrefillCapability,
+          stream: body.stream === true,
+          responsesRequest: isResponsesRequest,
+        });
+        const requestCanUseDaemonPrefillBatch = requestPrefillDispatchStatus.canDispatch;
         if (serverPrefillBatch.enabled) {
           prefillBatchMetrics.queued += 1;
           const promptTokens = approximatePromptTokenIds(userPrompt);
@@ -3024,6 +3198,8 @@ async function serve(port: number, host: string) {
               quantFamily: inferQuantFamilyForPath(current),
               stateMode,
               maxSeqBucket: modelArtifactBucket,
+              acceleratorKind: serverAcceleratorKind,
+              deviceId: serverDeviceId,
               featureFlags: stateFlags,
               promptTokens,
               priority: requestPriority,
@@ -3041,7 +3217,7 @@ async function serve(port: number, host: string) {
             }
 
             let cacheManifest: PrefixCheckpointManifest | undefined;
-            const cacheLookup = [...servingWorkerStateCache.values()]
+            const compatibleCacheLookup = [...servingWorkerStateCache.values()]
               .filter((manifest) => manifest.prefixLen <= promptTokens.length)
               .filter((manifest) => {
                 try {
@@ -3053,10 +3229,14 @@ async function serve(port: number, host: string) {
                 } catch { return false; }
               })
               .sort((a, b) => b.prefixLen - a.prefixLen)[0];
+            const cacheLookup = compatibleCacheLookup && prefixCheckpointAttachable(compatibleCacheLookup)
+              ? compatibleCacheLookup
+              : undefined;
 
             if (cacheLookup) {
               cacheHit = true;
               prefillBatchMetrics.cacheHits += 1;
+              prefillBatchMetrics.runtimeCacheHits += 1;
               cachePrefixLen = cacheLookup.prefixLen;
               cacheManifest = touchPrefixCheckpointManifest(cacheLookup, requestNowMs);
               cacheKey = prefixCheckpointCacheKey(cacheManifest);
@@ -3074,6 +3254,10 @@ async function serve(port: number, host: string) {
                 },
               };
             } else {
+              if (compatibleCacheLookup) {
+                prefillBatchMetrics.metadataCacheHits += 1;
+                cacheKey = prefixCheckpointCacheKey(touchPrefixCheckpointManifest(compatibleCacheLookup, requestNowMs));
+              }
               prefillBatchMetrics.cacheMisses += 1;
             }
 
@@ -3108,16 +3292,18 @@ async function serve(port: number, host: string) {
               spillReason = "state_cache_disk_disabled";
             }
 
-            // Exercise queueing path (enqueue -> preview -> dequeue) so per-request
-            // session scheduling state remains testable even while runtime dispatch
-            // stays serial until a daemon batch-prefill protocol exists.
+            // Exercise the queueing path (enqueue -> preview -> dequeue) for
+            // compatible non-streaming requests. The daemon currently executes
+            // selected Qwen35 sessions through serial prefill under explicit
+            // session activation; true fused GPU microbatching is the next
+            // runtime step.
             if (servingWorkerScheduler) {
               servingWorkerScheduler.enqueue(serverPrefillSession, requestNowMs);
               const preview = servingWorkerScheduler.previewNextPrefillBatch({
                 nowMs: requestNowMs,
               });
               const nextForCurrent = !!preview?.sessions?.some((s) => s.id === reqId);
-              if (nextForCurrent) {
+              if (nextForCurrent && requestCanUseDaemonPrefillBatch) {
                 const next = servingWorkerScheduler.nextPrefillBatch({ nowMs: requestNowMs });
                 if (next && next.sessions.some((s) => s.id === reqId)) {
                   selectedForPrefillBatch = true;
@@ -3137,9 +3323,7 @@ async function serve(port: number, host: string) {
               } else {
                 queuePreviewReason = preview ? "waiting" : "insufficient_queue";
                 if (
-                  generateBatchPrefillCapability !== "supported" ||
-                  body.stream ||
-                  isResponsesRequest
+                  !requestCanUseDaemonPrefillBatch
                 ) {
                   prefillBatchMetrics.skipped += 1;
                   servingWorkerScheduler.cancel(reqId);
@@ -3193,6 +3377,8 @@ async function serve(port: number, host: string) {
               true,
               generateBatchPrefillCapability,
             ).runtimeDispatchReason;
+          } else if (!requestCanUseDaemonPrefillBatch) {
+            lastPrefillRuntimeDispatchSkippedReason = requestPrefillDispatchStatus.runtimeDispatchReason;
           } else {
             lastPrefillRuntimeDispatchSkippedReason = runtimeDispatchSkippedReason;
           }
@@ -3287,14 +3473,10 @@ async function serve(port: number, host: string) {
           top_p: body.top_p ?? effective.top_p,
         };
         if (serverPrefillBatch.enabled) {
-          const runtimeDispatchStatus = prefillBatchRuntimeDispatchStatus(
-            prefillBatchGate.eligible,
-            generateBatchPrefillCapability,
-          );
-          const runtimeDispatch = runtimeDispatchStatus.runtimeDispatch;
-          runtimeDispatchSkippedReason = runtimeDispatchStatus.runtimeDispatchReason;
+          const runtimeDispatch = requestPrefillDispatchStatus.runtimeDispatch;
+          runtimeDispatchSkippedReason = requestPrefillDispatchStatus.runtimeDispatchReason;
           const runtimeDispatchReason = prefillBatchGate.eligible
-            ? runtimeDispatchStatus.runtimeDispatchReason
+            ? runtimeDispatchSkippedReason
             : prefillBatchGate.reason;
           const batchPolicy = requestBatchPolicy ?? {
             priority: serverPrefillBatch.priority,
@@ -3407,7 +3589,7 @@ async function serve(port: number, host: string) {
         if (
           serverPrefillBatch.enabled &&
           serverPrefillSession &&
-          generateBatchPrefillCapability === "supported"
+          requestCanUseDaemonPrefillBatch
         ) {
           const sessionParams: any = {
             max_tokens: requestMaxTokens,
@@ -3459,6 +3641,7 @@ async function serve(port: number, host: string) {
                 if (!pending) {
                   throw new Error(`selected prefill session ${selected.id} is not pending`);
                 }
+                pending.selected = true;
                 daemonSessions.push(pending.prefillSession);
               }
 
@@ -3483,12 +3666,29 @@ async function serve(port: number, host: string) {
                     genParams.server_prefill_batch.runtime_dispatch_skipped_reason = "not_skipped";
                     genParams.server_prefill_batch.daemon_prefill_tokens = prefillMsg.prefill_tokens;
                     genParams.server_prefill_batch.daemon_prefill_ms = prefillMsg.elapsed_ms;
+                    if (typeof prefillMsg.plan === "string") {
+                      genParams.server_prefill_batch.daemon_prefill_plan = prefillMsg.plan;
+                    }
+                    if (typeof prefillMsg.backend === "string") {
+                      genParams.server_prefill_batch.daemon_prefill_backend = prefillMsg.backend;
+                    }
                   }
                   break;
                 }
                 if (prefillMsg?.type === "generate_batch_prefill_session_done") {
                   if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.prefill_tokens === "number") {
                     sessionPrefillTokens.set(prefillMsg.session_id, prefillMsg.prefill_tokens);
+                  }
+                  const stateHandle = (prefillMsg as any).state_handle;
+                  if (
+                    typeof prefillMsg.session_id === "string" &&
+                    stateHandle &&
+                    typeof stateHandle.session_id === "string"
+                  ) {
+                    residentRuntimeSessions.add(stateHandle.session_id);
+                    if (prefillMsg.session_id === reqId) {
+                      releaseRuntimeSessionId = stateHandle.session_id;
+                    }
                   }
                   continue;
                 }
@@ -3507,7 +3707,13 @@ async function serve(port: number, host: string) {
               genParams.session_id = reqId;
               genParams.prefill_already_done = true;
               lastPrefillRuntimeDispatchSkippedReason = "not_skipped";
-              lastSelectedBatchSize = selectedSessions.length;
+              recordPrefillBatchDispatch(
+                selectedSessions.length,
+                Number(genParams.server_prefill_batch?.daemon_prefill_tokens ?? 0),
+                Number(genParams.server_prefill_batch?.daemon_prefill_ms ?? 0),
+                genParams.server_prefill_batch?.daemon_prefill_plan,
+                genParams.server_prefill_batch?.daemon_prefill_backend,
+              );
               for (const selected of selectedSessions) {
                 if (selected.id === reqId) continue;
                 const pending = pendingPrefillRequests.get(selected.id);
@@ -3517,6 +3723,9 @@ async function serve(port: number, host: string) {
                   prefillTokens: sessionPrefillTokens.get(selected.id) ?? 0,
                   elapsedMs: genParams.server_prefill_batch?.daemon_prefill_ms ?? 0,
                   selectedBatchSize: selectedSessions.length,
+                  plan: genParams.server_prefill_batch?.daemon_prefill_plan,
+                  backend: genParams.server_prefill_batch?.daemon_prefill_backend,
+                  runtimeStateHandle: selected.id,
                 });
               }
             } catch (err: any) {
@@ -3536,13 +3745,13 @@ async function serve(port: number, host: string) {
               }
               console.error(`[hipfire] generate_batch_prefill failed; falling back to generate: ${reason}`);
             }
-          } else if (
-            !body.stream &&
-            !isResponsesRequest &&
-            prefillBatchGate.eligible &&
-            servingWorkerScheduler &&
-            queuePreviewReason !== "not_eligible"
-          ) {
+          } else if (shouldQueueServerPrefillPending({
+            stream: body.stream,
+            responsesRequest: isResponsesRequest,
+            eligible: prefillBatchGate.eligible,
+            hasScheduler: Boolean(servingWorkerScheduler),
+            queuePreviewReason,
+          })) {
             const prefillSession = buildDaemonPrefillSession(serverPrefillSession);
             let resolvePending!: (outcome: PendingPrefillOutcome) => void;
             let rejectPending!: (err: Error) => void;
@@ -3553,11 +3762,15 @@ async function serve(port: number, host: string) {
             pendingPrefillRequests.set(reqId, {
               session: serverPrefillSession,
               prefillSession,
+              selected: false,
               resolve: resolvePending,
               reject: rejectPending,
               promise: pendingPromise,
             });
-            const waitMs = Math.max(5, (requestBatchPolicy?.coalesceWaitMs ?? serverPrefillBatch.waitMs) + 50);
+            const waitMs = serverPrefillPendingWaitMs({
+              coalesceWaitMs: requestBatchPolicy?.coalesceWaitMs ?? serverPrefillBatch.waitMs,
+              maxProcessingMs: requestBatchPolicy?.maxProcessingMs ?? serverPrefillBatch.maxProcessingMs,
+            });
             safeRelease();
             let pendingOutcome: PendingPrefillOutcome | null = null;
             try {
@@ -3569,6 +3782,19 @@ async function serve(port: number, host: string) {
               await acquireLock();
               lockReleased = false;
             }
+            if (pendingOutcome === null) {
+              const pendingAfterWait = pendingPrefillRequests.get(reqId);
+              if (!pendingAfterWait || pendingAfterWait.selected) {
+                try {
+                  pendingOutcome = await Promise.race([
+                    pendingPromise,
+                    new Promise<null>((resolve) => setTimeout(() => resolve(null), waitMs)),
+                  ]);
+                } catch {
+                  pendingOutcome = null;
+                }
+              }
+            }
             if (pendingOutcome) {
               genParams.session_id = reqId;
               genParams.prefill_already_done = true;
@@ -3579,9 +3805,22 @@ async function serve(port: number, host: string) {
                 genParams.server_prefill_batch.daemon_prefill_tokens = pendingOutcome.prefillTokens;
                 genParams.server_prefill_batch.daemon_prefill_ms = pendingOutcome.elapsedMs;
                 genParams.server_prefill_batch.selected_batch_size = pendingOutcome.selectedBatchSize;
+                if (pendingOutcome.plan) genParams.server_prefill_batch.daemon_prefill_plan = pendingOutcome.plan;
+                if (pendingOutcome.backend) genParams.server_prefill_batch.daemon_prefill_backend = pendingOutcome.backend;
+                if (pendingOutcome.runtimeStateHandle) {
+                  genParams.server_prefill_batch.runtime_state_handle = pendingOutcome.runtimeStateHandle;
+                }
               }
+              releaseRuntimeSessionId = pendingOutcome.runtimeStateHandle ?? reqId;
               lastPrefillRuntimeDispatchSkippedReason = "not_skipped";
               lastSelectedBatchSize = pendingOutcome.selectedBatchSize;
+              if (pendingOutcome.plan) lastPrefillDaemonPlan = pendingOutcome.plan;
+              if (pendingOutcome.backend) lastPrefillDaemonBackend = pendingOutcome.backend;
+              lastPrefillTokens = pendingOutcome.prefillTokens;
+              lastPrefillMs = pendingOutcome.elapsedMs;
+              lastPrefillTokS = pendingOutcome.elapsedMs > 0
+                ? (pendingOutcome.prefillTokens * 1000) / pendingOutcome.elapsedMs
+                : 0;
             } else {
               pendingPrefillRequests.delete(reqId);
               servingWorkerScheduler.cancel(reqId);
@@ -4109,6 +4348,21 @@ async function serve(port: number, host: string) {
           }
         }
         e.generating = false;
+        if (releaseRuntimeSessionId) {
+          try {
+            await e.send({
+              type: "release_sessions",
+              id: `${reqId}-release`,
+              sessions: [releaseRuntimeSessionId],
+            });
+            const releaseMsg = await e.recv();
+            if (releaseMsg?.type === "release_sessions_done") {
+              residentRuntimeSessions.delete(releaseRuntimeSessionId);
+            }
+          } catch (err: any) {
+            console.error(`[hipfire] failed to release runtime session ${releaseRuntimeSessionId}: ${err?.message ?? err}`);
+          }
+        }
 
         // If the daemon rejected the request mid-generate (e.g. KV-budget
         // overrun on a huge system prompt), surface that as a 400 instead of

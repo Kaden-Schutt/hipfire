@@ -19,6 +19,11 @@ export interface ServerPrefillBatchPolicy {
   maxProcessingMs: number;
 }
 
+export interface ServerPrefillPendingWaitInput {
+  coalesceWaitMs: number;
+  maxProcessingMs: number;
+}
+
 export interface ServerPrefillBatchEffectiveConfig {
   prefill_compression: string;
   prefill_drafter: string;
@@ -42,6 +47,8 @@ export interface ServerPrefillSessionInput {
   quantFamily: string;
   stateMode: string;
   maxSeqBucket: number;
+  acceleratorKind?: string;
+  deviceId?: number | string;
   featureFlags?: readonly string[];
   promptTokens: readonly number[];
   cachedPrefixTokens?: number;
@@ -70,6 +77,17 @@ export function parseServerPrefillBatchPolicy(
     targetPairTokens: schedulerPolicy.targetPairTokens,
     maxProcessingMs: schedulerPolicy.maxProcessingMs,
   };
+}
+
+export function serverPrefillPendingWaitMs(
+  input: ServerPrefillPendingWaitInput,
+): number {
+  return Math.max(
+    250,
+    Math.max(0, input.coalesceWaitMs) +
+      Math.max(0, input.maxProcessingMs) +
+      250,
+  );
 }
 
 export function serverPrefillBatchEligibility(
@@ -107,6 +125,8 @@ export function buildServerPrefillWorkerKey(
     quantFamily: input.quantFamily,
     stateMode: input.stateMode,
     maxSeqBucket: input.maxSeqBucket,
+    acceleratorKind: input.acceleratorKind,
+    deviceId: input.deviceId,
     featureFlags: input.featureFlags ?? [],
   });
 }

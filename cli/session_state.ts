@@ -18,6 +18,8 @@ export interface ModelWorkerKey {
   quantFamily: string;
   stateMode: string;
   maxSeqBucket: number;
+  acceleratorKind?: string;
+  deviceId?: number | string;
   featureFlags: readonly string[];
 }
 
@@ -59,6 +61,8 @@ export function normalizeFeatureFlags(flags: readonly string[]): readonly string
 export function normalizeModelWorkerKey(key: ModelWorkerKey): ModelWorkerKey {
   return {
     ...key,
+    acceleratorKind: key.acceleratorKind ?? "hip",
+    deviceId: key.deviceId ?? 0,
     featureFlags: normalizeFeatureFlags(key.featureFlags),
   };
 }
@@ -71,6 +75,8 @@ export function modelWorkerKeyId(key: ModelWorkerKey): string {
     normalized.quantFamily,
     normalized.stateMode,
     normalized.maxSeqBucket,
+    normalized.acceleratorKind ?? "hip",
+    normalized.deviceId ?? 0,
     normalized.featureFlags.join("+"),
   ].join("|");
 }

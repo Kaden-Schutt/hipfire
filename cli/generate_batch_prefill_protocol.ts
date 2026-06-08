@@ -87,3 +87,40 @@ export function prefillBatchRuntimeDispatchStatus(
     runtimeDispatchReason: "missing_generate_batch_prefill",
   };
 }
+
+export function prefillBatchRequestDispatchStatus(input: {
+  eligible: boolean;
+  capability: GenerateBatchPrefillCapability;
+  stream?: boolean;
+  responsesRequest?: boolean;
+}): {
+  canDispatch: boolean;
+  runtimeDispatch: string;
+  runtimeDispatchReason: string;
+} {
+  const base = prefillBatchRuntimeDispatchStatus(input.eligible, input.capability);
+  if (!input.eligible || input.capability !== "supported") {
+    return {
+      canDispatch: false,
+      ...base,
+    };
+  }
+  if (input.stream) {
+    return {
+      canDispatch: false,
+      runtimeDispatch: "not_selected",
+      runtimeDispatchReason: "streaming_not_supported_for_generate_batch_prefill",
+    };
+  }
+  if (input.responsesRequest) {
+    return {
+      canDispatch: false,
+      runtimeDispatch: "not_selected",
+      runtimeDispatchReason: "responses_not_supported_for_generate_batch_prefill",
+    };
+  }
+  return {
+    canDispatch: true,
+    ...base,
+  };
+}

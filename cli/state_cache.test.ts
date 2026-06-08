@@ -4,6 +4,7 @@ import {
   prefixCheckpointCacheKey,
   prefixTokensHash,
   prefixCheckpointCompatible,
+  prefixCheckpointAttachable,
   spillEligibility,
   touchPrefixCheckpointManifest,
   type PrefixCheckpointFingerprint,
@@ -47,6 +48,7 @@ describe("prefix state cache keys", () => {
     });
 
     expect(a.stateKinds).toEqual(["attention_kv", "deltanet_recurrent"]);
+    expect(a.runtimeState).toBe("metadata_only");
     expect(prefixCheckpointCacheKey(a)).not.toBe(prefixCheckpointCacheKey(b));
   });
 
@@ -74,6 +76,38 @@ describe("prefix state cache keys", () => {
       prefixTokens: [10, 11, 12, 14],
       requiredStateKinds: ["attention_kv", "deltanet_recurrent"],
     })).toBe(false);
+  });
+
+  test("distinguishes metadata-only, resident, and attachable runtime state", () => {
+    const metadataOnly = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [1, 2, 3],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      createdAtMs: 10,
+    });
+    const resident = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [1, 2, 3],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      createdAtMs: 10,
+      runtimeState: "resident",
+      runtimeStateHandle: "qwen35-session:req",
+    });
+    const attachable = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [1, 2, 3],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      createdAtMs: 10,
+      runtimeState: "attachable",
+      runtimeStateHandle: "qwen35-checkpoint:req",
+    });
+
+    expect(prefixCheckpointAttachable(metadataOnly)).toBe(false);
+    expect(prefixCheckpointAttachable(resident)).toBe(false);
+    expect(prefixCheckpointAttachable(attachable)).toBe(true);
   });
 });
 

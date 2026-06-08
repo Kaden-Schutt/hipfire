@@ -11,6 +11,8 @@ describe("model worker routing", () => {
     quantFamily: "mq4",
     stateMode: "q8",
     featureFlags: ["serve", "prefill_batch"],
+    acceleratorKind: "hip",
+    deviceId: 0,
   };
 
   test("reuses current worker when model and max-seq are compatible", () => {
@@ -39,5 +41,13 @@ describe("model worker routing", () => {
     expect(decision.needsReload).toBe(true);
     expect(decision.canReuseCurrentWorker).toBe(false);
     expect(decision.reloadReason).toBe("max_seq_growth");
+  });
+
+  test("carries accelerator placement into worker identity", () => {
+    const dev0 = pickServingModelWorker(base);
+    const dev1 = pickServingModelWorker({ ...base, deviceId: 1 });
+    expect(dev0.workerKey.deviceId).toBe(0);
+    expect(dev1.workerKey.deviceId).toBe(1);
+    expect(dev0.workerKey).not.toEqual(dev1.workerKey);
   });
 });

@@ -19,6 +19,8 @@ export interface ServingModelWorkerInput {
   featureFlags: readonly string[];
   artifactDigest?: string;
   maxSeqBucket?: number;
+  acceleratorKind?: string;
+  deviceId?: number | string;
 }
 
 export interface ServingModelWorkerDecision {
@@ -41,6 +43,8 @@ export function pickServingModelWorker(input: ServingModelWorkerInput): ServingM
     quantFamily: input.quantFamily,
     stateMode: input.stateMode,
     maxSeqBucket: input.maxSeqBucket ?? input.currentMaxSeq ?? input.requiredMaxSeq,
+    acceleratorKind: input.acceleratorKind,
+    deviceId: input.deviceId,
     featureFlags: input.featureFlags,
   });
 

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildGenerateBatchPrefillProbeMessage,
   interpretGenerateBatchPrefillProbeResponse,
+  prefillBatchRequestDispatchStatus,
   prefillBatchRuntimeDispatchStatus,
 } from "./generate_batch_prefill_protocol";
 
@@ -86,6 +87,43 @@ describe("generate_batch_prefill serialized fallback metadata", () => {
 
   test("reports daemon serial-prefill support for server dispatch", () => {
     expect(prefillBatchRuntimeDispatchStatus(true, "supported")).toEqual({
+      runtimeDispatch: "daemon_serial_prefill_available",
+      runtimeDispatchReason: "server_dispatch_enabled",
+    });
+  });
+
+  test("blocks streaming requests even when daemon serial prefill is supported", () => {
+    expect(prefillBatchRequestDispatchStatus({
+      eligible: true,
+      capability: "supported",
+      stream: true,
+    })).toEqual({
+      canDispatch: false,
+      runtimeDispatch: "not_selected",
+      runtimeDispatchReason: "streaming_not_supported_for_generate_batch_prefill",
+    });
+  });
+
+  test("blocks responses requests even when daemon serial prefill is supported", () => {
+    expect(prefillBatchRequestDispatchStatus({
+      eligible: true,
+      capability: "supported",
+      responsesRequest: true,
+    })).toEqual({
+      canDispatch: false,
+      runtimeDispatch: "not_selected",
+      runtimeDispatchReason: "responses_not_supported_for_generate_batch_prefill",
+    });
+  });
+
+  test("admits non-streaming chat requests when daemon serial prefill is supported", () => {
+    expect(prefillBatchRequestDispatchStatus({
+      eligible: true,
+      capability: "supported",
+      stream: false,
+      responsesRequest: false,
+    })).toEqual({
+      canDispatch: true,
       runtimeDispatch: "daemon_serial_prefill_available",
       runtimeDispatchReason: "server_dispatch_enabled",
     });

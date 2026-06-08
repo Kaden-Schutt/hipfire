@@ -41,6 +41,10 @@ export class PriorityPrefillScheduler {
   }
 
   enqueue(session: RequestSessionDraft, enqueuedAtMs: number): void {
+    const maxQueued = this.maxQueuedRequests();
+    if (maxQueued > 0 && this.queuedCount >= maxQueued) {
+      throw new Error(`prefill scheduler backpressure: queued=${this.queuedCount} max=${maxQueued}`);
+    }
     if (this.queuedIds.has(session.id)) {
       throw new Error(`request session is already queued: ${session.id}`);
     }
@@ -65,6 +69,12 @@ export class PriorityPrefillScheduler {
   }
 
   nextPrefillBatch(input: NextPrefillBatchInput): PrefillBatchSelection | undefined {
+    const aged = this.selectAgedCandidate(input.nowMs);
+    if (aged) {
+      this.removeSelected(aged.sessions);
+      return aged;
+    }
+
     for (let priority = 0; priority < this.buckets.length; priority += 1) {
       const bucket = this.buckets[priority];
       if (bucket.length === 0) continue;
@@ -87,7 +97,14 @@ export class PriorityPrefillScheduler {
   ): PrefillBatchSelection | undefined {
     for (let priority = 0; priority < this.buckets.length; priority += 1) {
       const bucket = [...this.buckets[priority]];
-      if (input.incomingSession && input.incomingSession.priority === priority) {
+      const alreadyQueuedIncoming =
+        input.incomingSession &&
+        bucket.some((entry) => entry.session.id === input.incomingSession!.id);
+      if (
+        input.incomingSession &&
+        input.incomingSession.priority === priority &&
+        !alreadyQueuedIncoming
+      ) {
         bucket.push({
           session: input.incomingSession,
           enqueuedAtMs: input.incomingEnqueuedAtMs ?? input.nowMs,
@@ -141,6 +158,38 @@ export class PriorityPrefillScheduler {
     if (compatible.length >= policy.maxBatchSize || waitedMs >= policy.coalesceWaitMs) {
       return this.selection(compatible, policy);
     }
+    return undefined;
+  }
+
+  private maxQueuedRequests(): number {
+    const raw = Number.parseInt(String(this.env.HIPFIRE_SCHED_PREFILL_MAX_QUEUED ?? "0"), 10);
+    return Number.isFinite(raw) && raw > 0 ? raw : 0;
+  }
+
+  private agingMs(): number {
+    const raw = Number.parseInt(String(this.env.HIPFIRE_SCHED_DEADLINE_AGING_MS ?? "0"), 10);
+    return Number.isFinite(raw) && raw > 0 ? raw : 0;
+  }
+
+  private selectAgedCandidate(nowMs: number): PrefillBatchSelection | undefined {
+    const agingMs = this.agingMs();
+    if (agingMs <= 0) return undefined;
+
+    for (let priority = 0; priority < this.buckets.length; priority += 1) {
+      const bucket = this.buckets[priority];
+      if (bucket.length === 0) continue;
+      const firstAged = bucket.find((entry) => nowMs - entry.enqueuedAtMs >= agingMs);
+      if (!firstAged) continue;
+      const policy = schedulerPolicyForPriority(firstAged.session.priority, this.env);
+      const compatible = bucket
+        .filter((entry) => sessionsCompatibleForPrefill({
+          a: firstAged.session,
+          b: entry.session,
+        }))
+        .slice(0, policy.maxBatchSize);
+      return this.selection(compatible, policy);
+    }
+
     return undefined;
   }
 

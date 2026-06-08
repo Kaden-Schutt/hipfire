@@ -14,6 +14,8 @@ const baseWorker: ModelWorkerKey = {
   quantFamily: "mq4",
   stateMode: "q8+deltanet",
   maxSeqBucket: 4096,
+  acceleratorKind: "hip",
+  deviceId: 0,
   featureFlags: ["prefill_batch", "qwen35"],
 };
 
@@ -32,6 +34,18 @@ describe("model worker keys", () => {
       ...baseWorker,
       artifactDigest: "sha256:dense",
       artifactPath: "/models/qwen3.6-27b-mq4.hfq",
+    })).toBe(false);
+  });
+
+  test("separates identical models assigned to different accelerator placements", () => {
+    expect(sameModelWorkerKey(baseWorker, {
+      ...baseWorker,
+      deviceId: 1,
+    })).toBe(false);
+    expect(sameModelWorkerKey(baseWorker, {
+      ...baseWorker,
+      acceleratorKind: "npu",
+      deviceId: "accel0",
     })).toBe(false);
   });
 });
