@@ -30673,6 +30673,198 @@ impl Gpu {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_f32_routed_batched(
+        &mut self,
+        q: &GpuTensor,
+        k_ptrs: &GpuTensor,
+        v_ptrs: &GpuTensor,
+        out: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        positions: &GpuTensor,
+        ptr_layer_stride: usize,
+        layer_index: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_f32_routed_batched",
+            kernels::ATTENTION_F32_ROUTED_BATCHED_SRC,
+            "attention_f32_routed_batched",
+        )?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q_ptr = q.buf.as_ptr();
+        let k_ptrs_ptr = k_ptrs.buf.as_ptr();
+        let v_ptrs_ptr = v_ptrs.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let row_session_indices_ptr = row_session_indices.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let ptr_stride = ptr_layer_stride as i32;
+        let layer = layer_index as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let ms = max_seq as i32;
+        let sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &q_ptr as *const _ as *mut c_void,
+            &k_ptrs_ptr as *const _ as *mut c_void,
+            &v_ptrs_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &row_session_indices_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &ptr_stride as *const _ as *mut c_void,
+            &layer as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ms as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+        ];
+        let block_size = (max_ctx_len.max(head_dim) as u32)
+            .next_power_of_two()
+            .min(256);
+        let shared_mem = ((max_ctx_len + block_size as usize + head_dim) * 4) as u32;
+        let bytes =
+            crate::profile::attention_f32_kv_bytes(n_heads, n_kv_heads, head_dim, max_ctx_len)
+                * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_f32_routed_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "attention_f32_routed_batched",
+            [n_heads as u32, batch_size as u32, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptrs_ptr);
+                b.push_ptr(v_ptrs_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(row_session_indices_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(ptr_stride);
+                b.push_i32(layer);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_routed_batched(
+        &mut self,
+        q: &GpuTensor,
+        k_ptrs: &GpuTensor,
+        v_ptrs: &GpuTensor,
+        out: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        positions: &GpuTensor,
+        ptr_layer_stride: usize,
+        layer_index: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_q8_0_routed_batched",
+            kernels::ATTENTION_Q8_0_ROUTED_BATCHED_SRC,
+            "attention_q8_0_routed_batched",
+        )?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q_ptr = q.buf.as_ptr();
+        let k_ptrs_ptr = k_ptrs.buf.as_ptr();
+        let v_ptrs_ptr = v_ptrs.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let row_session_indices_ptr = row_session_indices.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let ptr_stride = ptr_layer_stride as i32;
+        let layer = layer_index as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let ms = max_seq as i32;
+        let sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &q_ptr as *const _ as *mut c_void,
+            &k_ptrs_ptr as *const _ as *mut c_void,
+            &v_ptrs_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &row_session_indices_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &ptr_stride as *const _ as *mut c_void,
+            &layer as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ms as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+        ];
+        let block_size = (max_ctx_len.max(head_dim) as u32)
+            .next_power_of_two()
+            .min(256);
+        let shared_mem = ((max_ctx_len + block_size as usize + head_dim) * 4) as u32;
+        let bytes =
+            crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, max_ctx_len)
+                * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_q8_0_routed_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "attention_q8_0_routed_batched",
+            [n_heads as u32, batch_size as u32, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptrs_ptr);
+                b.push_ptr(v_ptrs_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(row_session_indices_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(ptr_stride);
+                b.push_i32(layer);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// FP32 causal attention specialized for GQA groups where four query heads
     /// share one KV head. This is a full-precision KLD prefill fast path: it
     /// preserves FP32 score/output arithmetic and only reduces redundant K/V
@@ -34014,6 +34206,188 @@ impl Gpu {
         )
     }
 
+    /// Routed batched F32 KV-cache write: scatter `batch_size` rows of `src`
+    /// (`[batch_size * kv_dim]`) into per-session F32 cache pointers selected
+    /// by `row_session_indices` (`[batch_size]` i32), at absolute `positions`
+    /// (`[batch_size]` i32), in one launch.
+    ///
+    /// Session-batched prefill uses this instead of `kv_cache_write_f32_batched`
+    /// so rows from independent request sessions do not share one KV cache.
+    pub fn kv_cache_write_f32_routed_batched(
+        &mut self,
+        dst_ptrs: &GpuTensor,
+        src: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        positions: &GpuTensor,
+        ptr_layer_stride: usize,
+        layer_index: usize,
+        kv_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kv_cache_write_f32_routed_batched",
+            kernels::KV_CACHE_WRITE_F32_ROUTED_BATCHED_SRC,
+            "kv_cache_write_f32_routed_batched",
+        )?;
+
+        let dst_ptrs_ptr = dst_ptrs.buf.as_ptr();
+        let src_ptr = src.buf.as_ptr();
+        let row_session_indices_ptr = row_session_indices.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let ptr_stride = ptr_layer_stride as i32;
+        let layer = layer_index as i32;
+        let kd = kv_dim as i32;
+        let bs = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &dst_ptrs_ptr as *const _ as *mut c_void,
+            &src_ptr as *const _ as *mut c_void,
+            &row_session_indices_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &ptr_stride as *const _ as *mut c_void,
+            &layer as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid_x = (kv_dim as u32 + block - 1) / block;
+        self.launch_maybe_blob(
+            "kv_cache_write_f32_routed_batched",
+            [grid_x, batch_size as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(dst_ptrs_ptr);
+                b.push_ptr(src_ptr);
+                b.push_ptr(row_session_indices_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(ptr_stride);
+                b.push_i32(layer);
+                b.push_i32(kd);
+                b.push_i32(bs);
+                b
+            },
+        )
+    }
+
+    /// Routed batched Q8_0 KV-cache write: quantize `batch_size` rows of
+    /// `src` into per-session Q8_0 cache pointers selected by
+    /// `row_session_indices`, at absolute `positions`.
+    pub fn kv_cache_write_q8_0_routed_batched(
+        &mut self,
+        dst_ptrs: &GpuTensor,
+        src: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        positions: &GpuTensor,
+        ptr_layer_stride: usize,
+        layer_index: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "kv_cache_write_q8_0_routed_batched",
+            kernels::KV_CACHE_WRITE_Q8_0_ROUTED_BATCHED_SRC,
+            "kv_cache_write_q8_0_routed_batched",
+        )?;
+
+        let dst_ptrs_ptr = dst_ptrs.buf.as_ptr();
+        let src_ptr = src.buf.as_ptr();
+        let row_session_indices_ptr = row_session_indices.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let ptr_stride = ptr_layer_stride as i32;
+        let layer = layer_index as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let bs = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &dst_ptrs_ptr as *const _ as *mut c_void,
+            &src_ptr as *const _ as *mut c_void,
+            &row_session_indices_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &ptr_stride as *const _ as *mut c_void,
+            &layer as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
+        ];
+        let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        self.launch_maybe_blob(
+            "kv_cache_write_q8_0_routed_batched",
+            [total_blocks, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(dst_ptrs_ptr);
+                b.push_ptr(src_ptr);
+                b.push_ptr(row_session_indices_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(ptr_stride);
+                b.push_i32(layer);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b
+            },
+        )
+    }
+
+    pub fn scatter_session_last_logits_f32(
+        &mut self,
+        batch_logits: &GpuTensor,
+        logits_ptrs: &GpuTensor,
+        session_last_row_indices: &GpuTensor,
+        vocab_size: usize,
+        sessions: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "scatter_session_last_logits",
+            kernels::SCATTER_SESSION_LAST_LOGITS_SRC,
+            "scatter_session_last_logits_f32",
+        )?;
+
+        let batch_logits_ptr = batch_logits.buf.as_ptr();
+        let logits_ptrs_ptr = logits_ptrs.buf.as_ptr();
+        let session_last_row_indices_ptr = session_last_row_indices.buf.as_ptr();
+        let vocab = vocab_size as i32;
+        let ns = sessions as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &batch_logits_ptr as *const _ as *mut c_void,
+            &logits_ptrs_ptr as *const _ as *mut c_void,
+            &session_last_row_indices_ptr as *const _ as *mut c_void,
+            &vocab as *const _ as *mut c_void,
+            &ns as *const _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid_x = (vocab_size as u32 + block - 1) / block;
+        self.launch_maybe_blob(
+            "scatter_session_last_logits_f32",
+            [grid_x, sessions as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(batch_logits_ptr);
+                b.push_ptr(logits_ptrs_ptr);
+                b.push_ptr(session_last_row_indices_ptr);
+                b.push_i32(vocab);
+                b.push_i32(ns);
+                b
+            },
+        )
+    }
+
     /// GPU-side top-K + top-P sampling. Returns (token_id, new_rng_state).
     /// Eliminates 600KB logits download per token.
     pub fn sample_top_p(
@@ -36014,6 +36388,196 @@ impl Gpu {
         result
     }
 
+    #[cfg(feature = "deltanet")]
+    pub fn gated_delta_net_f32_routed_batch_seq(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        gate: &GpuTensor,
+        beta: &GpuTensor,
+        state_ptrs: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        output: &GpuTensor,
+        ptr_layer_stride: usize,
+        delta_layer_index: usize,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_sessions: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        Self::ensure_gdn_hd128(head_dim)?;
+        self.ensure_kernel(
+            "gated_delta_net_f32_routed_batch_seq",
+            kernels::GATED_DELTA_NET_F32_ROUTED_BATCH_SEQ_SRC,
+            "gated_delta_net_f32_routed_batch_seq",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let spp = state_ptrs.buf.as_ptr();
+        let rsp = row_session_indices.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let ptr_stride = ptr_layer_stride as i32;
+        let layer = delta_layer_index as i32;
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &spp as *const _ as *mut c_void,
+            &rsp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ptr_stride as *const _ as *mut c_void,
+            &layer as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gated_delta_net_f32_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_f32_routed_batch_seq",
+            bytes,
+        );
+        let n_tiles = (128 / 4) as u32;
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_f32_routed_batch_seq",
+            [n_heads as u32, n_tiles, n_sessions as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(spp);
+                b.push_ptr(rsp);
+                b.push_ptr(op);
+                b.push_i32(ptr_stride);
+                b.push_i32(layer);
+                b.push_i32(nt);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_q8_routed_batch_seq(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        gate: &GpuTensor,
+        beta: &GpuTensor,
+        state_ptrs: &GpuTensor,
+        scale_ptrs: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        output: &GpuTensor,
+        ptr_layer_stride: usize,
+        delta_layer_index: usize,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        n_sessions: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        Self::ensure_gdn_hd128(head_dim)?;
+        self.ensure_kernel(
+            "gated_delta_net_q8_routed_batch_seq",
+            kernels::GATED_DELTA_NET_Q8_ROUTED_BATCH_SEQ_SRC,
+            "gated_delta_net_q8_routed_batch_seq",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let spp = state_ptrs.buf.as_ptr();
+        let scpp = scale_ptrs.buf.as_ptr();
+        let rsp = row_session_indices.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let ptr_stride = ptr_layer_stride as i32;
+        let layer = delta_layer_index as i32;
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let fr = GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &spp as *const _ as *mut c_void,
+            &scpp as *const _ as *mut c_void,
+            &rsp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ptr_stride as *const _ as *mut c_void,
+            &layer as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &fr as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_q8_routed_batch_seq",
+            bytes,
+        );
+        let n_tiles = (128 / 4) as u32;
+        let result = self.launch_maybe_blob(
+            "gated_delta_net_q8_routed_batch_seq",
+            [n_heads as u32, n_tiles, n_sessions as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(spp);
+                b.push_ptr(scpp);
+                b.push_ptr(rsp);
+                b.push_ptr(op);
+                b.push_i32(ptr_stride);
+                b.push_i32(layer);
+                b.push_i32(nt);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(fr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// GDN recurrence with Q8-quantized S state — tiled LDS + warp-shuffle.
     #[cfg(feature = "deltanet")]
     pub fn gated_delta_net_q8(
@@ -36764,6 +37328,95 @@ impl Gpu {
                 b.push_ptr(ip);
                 b.push_ptr(wp);
                 b.push_ptr(sp);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(nt);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_silu_split_routed_f32_n(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state_ptrs: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        ptr_layer_stride: usize,
+        delta_layer_index: usize,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+        n_sessions: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv1d_silu_split_routed",
+            kernels::CONV1D_SILU_SPLIT_ROUTED_SRC,
+            "conv1d_silu_split_routed_f32",
+        )?;
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state_ptrs.buf.as_ptr();
+        let rsp = row_session_indices.buf.as_ptr();
+        let ptr_stride = ptr_layer_stride as i32;
+        let layer = delta_layer_index as i32;
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let nt = n_tokens as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &rsp as *const _ as *mut c_void,
+            &ptr_stride as *const _ as *mut c_void,
+            &layer as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        let n_channels = 2 * k_dim + v_dim;
+        let block = 256u32;
+        let grid = ((n_channels as u32) + block - 1) / block;
+        let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "conv1d_silu_split_routed_f32_n",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "conv1d_silu_split_routed_f32",
+            [grid, n_sessions as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(rsp);
+                b.push_i32(ptr_stride);
+                b.push_i32(layer);
                 b.push_i32(kd);
                 b.push_i32(vd);
                 b.push_i32(nt);

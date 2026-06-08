@@ -7412,6 +7412,2785 @@ pub struct PrefillBatchScratch {
     pub dn_s_tape_scales: Option<GpuTensor>,
 }
 
+/// One independent dense-Qwen35 request/session row for the future fused
+/// server-prefill worker.
+///
+/// This is intentionally NOT the same shape as `forward_prefill_batch`: that
+/// function consumes one token stream, one KV cache, and one DeltaNet state.
+/// Server microbatching needs multiple independent streams, each with its own
+/// mutable recurrent state, while sharing weights and batched layer scratch.
+pub struct DensePrefillSessionBatchRow<'a> {
+    pub tokens: &'a [u32],
+    pub start_pos: usize,
+    pub kv_cache: &'a mut llama::KvCache,
+    pub dn_state: &'a mut DeltaNetState,
+    pub logits: &'a GpuTensor,
+}
+
+pub struct DensePrefillSessionBatchInput<'a> {
+    pub tokens: &'a [u32],
+    pub start_pos: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchRoundRow {
+    pub session_index: usize,
+    pub token_index: usize,
+    pub token: u32,
+    pub position: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchRound {
+    pub rows: Vec<DensePrefillSessionBatchRoundRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DensePrefillSessionBatchRoundStateRoute {
+    SingleSession { session_index: usize },
+    MultiSession { session_indices: Vec<usize> },
+}
+
+impl DensePrefillSessionBatchRound {
+    pub fn state_route(&self) -> DensePrefillSessionBatchRoundStateRoute {
+        let mut session_indices: Vec<usize> =
+            self.rows.iter().map(|row| row.session_index).collect();
+        session_indices.sort_unstable();
+        session_indices.dedup();
+        if session_indices.len() == 1 {
+            DensePrefillSessionBatchRoundStateRoute::SingleSession {
+                session_index: session_indices[0],
+            }
+        } else {
+            DensePrefillSessionBatchRoundStateRoute::MultiSession { session_indices }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchExecutionPlan {
+    pub rounds: Vec<DensePrefillSessionBatchRound>,
+    pub state_routes: Vec<DensePrefillSessionBatchRoundStateRoute>,
+    pub total_rows: usize,
+    pub max_rows_per_round: usize,
+    pub multi_state_rounds: usize,
+    pub multi_state_prefix_rounds: usize,
+    pub multi_state_prefix_rows: usize,
+    pub singleton_tail: Option<DensePrefillSessionBatchSingletonTail>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchSingletonTail {
+    pub start_round: usize,
+    pub session_index: usize,
+    pub rows: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchRowShape {
+    pub tokens: usize,
+    pub logits_numel: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DensePrefillSessionBatchStateSignature {
+    pub kv_physical_cap: usize,
+    pub kv_compact_offset: usize,
+    pub kv_quantized: bool,
+    pub kv_quant_q8: bool,
+    pub kv_quant_asym2: bool,
+    pub kv_quant_asym3: bool,
+    pub kv_quant_asym4: bool,
+    pub kv_quant_fwht: bool,
+    pub dn_quant: StateQuant,
+}
+
+pub struct DensePrefillSessionKvStateRoute<'a> {
+    pub k_gpu: &'a [GpuTensor],
+    pub v_gpu: &'a [GpuTensor],
+    pub physical_cap: usize,
+    pub compact_offset: usize,
+}
+
+pub struct DensePrefillSessionDeltaStateRoute<'a> {
+    pub s_matrices: &'a [GpuTensor],
+    pub s_scales: &'a [GpuTensor],
+    pub conv_states: &'a [GpuTensor],
+    pub quant: StateQuant,
+}
+
+pub struct DensePrefillSessionStateRoute<'a> {
+    pub kv: DensePrefillSessionKvStateRoute<'a>,
+    pub delta: DensePrefillSessionDeltaStateRoute<'a>,
+    pub logits: &'a GpuTensor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DensePrefillSessionStateRouteShape {
+    pub kv_k_layers: usize,
+    pub kv_v_layers: usize,
+    pub dn_s_layers: usize,
+    pub dn_scale_layers: usize,
+    pub dn_conv_layers: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchPointerTableShape {
+    pub sessions: usize,
+    pub multi_state_prefix_rounds: usize,
+    pub multi_state_prefix_rows: usize,
+    pub max_rows_per_round: usize,
+    pub kv_k_ptrs: usize,
+    pub kv_v_ptrs: usize,
+    pub dn_s_ptrs: usize,
+    pub dn_scale_ptrs: usize,
+    pub dn_conv_ptrs: usize,
+    pub logits_ptrs: usize,
+    pub session_last_row_indices: usize,
+    pub row_session_indices: usize,
+    pub row_tokens: usize,
+    pub row_positions: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchPointerTableIndex {
+    pub kv_k_offset: usize,
+    pub kv_v_offset: usize,
+    pub dn_s_offset: usize,
+    pub dn_scale_offset: usize,
+    pub dn_conv_offset: usize,
+    pub logits_offset: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchLayerPointerSlot {
+    pub session_index: usize,
+    pub layer_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchDeltaPointerSlot {
+    pub session_index: usize,
+    pub delta_layer_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchPrefixRowSlot {
+    pub round_index: usize,
+    pub round_row_index: usize,
+    pub session_index: usize,
+    pub token_index: usize,
+    pub token: u32,
+    pub position: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchPointerTablePlan {
+    pub shape: DensePrefillSessionBatchPointerTableShape,
+    pub kv_layer_slots: Vec<DensePrefillSessionBatchLayerPointerSlot>,
+    pub dn_layer_slots: Vec<DensePrefillSessionBatchDeltaPointerSlot>,
+    pub logits_slots: Vec<usize>,
+    pub prefix_rows: Vec<DensePrefillSessionBatchPrefixRowSlot>,
+    pub session_last_row_indices: Vec<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchHostPointerTables {
+    pub kv_k_ptrs: Vec<u64>,
+    pub kv_v_ptrs: Vec<u64>,
+    pub dn_s_ptrs: Vec<u64>,
+    pub dn_scale_ptrs: Vec<u64>,
+    pub dn_conv_ptrs: Vec<u64>,
+    pub logits_ptrs: Vec<u64>,
+    pub session_last_row_indices: Vec<i32>,
+    pub row_session_indices: Vec<i32>,
+    pub row_tokens: Vec<i32>,
+    pub row_positions: Vec<i32>,
+}
+
+pub struct DensePrefillSessionBatchDevicePointerTables {
+    pub kv_k_ptrs: GpuTensor,
+    pub kv_v_ptrs: GpuTensor,
+    pub dn_s_ptrs: GpuTensor,
+    pub dn_scale_ptrs: GpuTensor,
+    pub dn_conv_ptrs: GpuTensor,
+    pub logits_ptrs: GpuTensor,
+    pub session_last_row_indices: GpuTensor,
+    pub row_session_indices: GpuTensor,
+    pub row_tokens: GpuTensor,
+    pub row_positions: GpuTensor,
+}
+
+impl DensePrefillSessionBatchHostPointerTables {
+    pub fn validate_shape(
+        &self,
+        shape: DensePrefillSessionBatchPointerTableShape,
+    ) -> Result<(), String> {
+        let checks = [
+            ("kv_k_ptrs", self.kv_k_ptrs.len(), shape.kv_k_ptrs),
+            ("kv_v_ptrs", self.kv_v_ptrs.len(), shape.kv_v_ptrs),
+            ("dn_s_ptrs", self.dn_s_ptrs.len(), shape.dn_s_ptrs),
+            (
+                "dn_scale_ptrs",
+                self.dn_scale_ptrs.len(),
+                shape.dn_scale_ptrs,
+            ),
+            ("dn_conv_ptrs", self.dn_conv_ptrs.len(), shape.dn_conv_ptrs),
+            ("logits_ptrs", self.logits_ptrs.len(), shape.logits_ptrs),
+            (
+                "session_last_row_indices",
+                self.session_last_row_indices.len(),
+                shape.session_last_row_indices,
+            ),
+            (
+                "row_session_indices",
+                self.row_session_indices.len(),
+                shape.row_session_indices,
+            ),
+            ("row_tokens", self.row_tokens.len(), shape.row_tokens),
+            (
+                "row_positions",
+                self.row_positions.len(),
+                shape.row_positions,
+            ),
+        ];
+        for (name, got, expected) in checks {
+            if got != expected {
+                return Err(format!(
+                    "dense session prefill host pointer table {name} has {got} entries, expected {expected}",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DensePrefillSessionBatchDevicePointerTables {
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.kv_k_ptrs);
+        let _ = gpu.free_tensor(self.kv_v_ptrs);
+        let _ = gpu.free_tensor(self.dn_s_ptrs);
+        let _ = gpu.free_tensor(self.dn_scale_ptrs);
+        let _ = gpu.free_tensor(self.dn_conv_ptrs);
+        let _ = gpu.free_tensor(self.logits_ptrs);
+        let _ = gpu.free_tensor(self.session_last_row_indices);
+        let _ = gpu.free_tensor(self.row_session_indices);
+        let _ = gpu.free_tensor(self.row_tokens);
+        let _ = gpu.free_tensor(self.row_positions);
+    }
+}
+
+fn u64_slice_as_bytes(values: &[u64]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 8) }
+}
+
+fn i32_slice_as_bytes(values: &[i32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) }
+}
+
+fn alloc_and_upload_u64_table(gpu: &mut Gpu, values: &[u64]) -> HipResult<GpuTensor> {
+    // F32 dtype is cosmetic here: it gives a 4-byte element size, so two
+    // elements hold one raw device pointer. Kernels consume these buffers as
+    // `const uint64_t*`.
+    let tensor = gpu.alloc_tensor(&[values.len() * 2], DType::F32)?;
+    gpu.hip
+        .memcpy_htod(&tensor.buf, u64_slice_as_bytes(values))?;
+    Ok(tensor)
+}
+
+fn alloc_and_upload_i32_table(gpu: &mut Gpu, values: &[i32]) -> HipResult<GpuTensor> {
+    // F32 dtype is cosmetic here: the row-routing kernels consume these
+    // buffers as `const int*`.
+    let tensor = gpu.alloc_tensor(&[values.len()], DType::F32)?;
+    gpu.hip
+        .memcpy_htod(&tensor.buf, i32_slice_as_bytes(values))?;
+    Ok(tensor)
+}
+
+pub fn upload_dense_prefill_session_batch_pointer_tables(
+    gpu: &mut Gpu,
+    shape: DensePrefillSessionBatchPointerTableShape,
+    host: &DensePrefillSessionBatchHostPointerTables,
+) -> HipResult<DensePrefillSessionBatchDevicePointerTables> {
+    host.validate_shape(shape)
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    Ok(DensePrefillSessionBatchDevicePointerTables {
+        kv_k_ptrs: alloc_and_upload_u64_table(gpu, &host.kv_k_ptrs)?,
+        kv_v_ptrs: alloc_and_upload_u64_table(gpu, &host.kv_v_ptrs)?,
+        dn_s_ptrs: alloc_and_upload_u64_table(gpu, &host.dn_s_ptrs)?,
+        dn_scale_ptrs: alloc_and_upload_u64_table(gpu, &host.dn_scale_ptrs)?,
+        dn_conv_ptrs: alloc_and_upload_u64_table(gpu, &host.dn_conv_ptrs)?,
+        logits_ptrs: alloc_and_upload_u64_table(gpu, &host.logits_ptrs)?,
+        session_last_row_indices: alloc_and_upload_i32_table(gpu, &host.session_last_row_indices)?,
+        row_session_indices: alloc_and_upload_i32_table(gpu, &host.row_session_indices)?,
+        row_tokens: alloc_and_upload_i32_table(gpu, &host.row_tokens)?,
+        row_positions: alloc_and_upload_i32_table(gpu, &host.row_positions)?,
+    })
+}
+
+pub fn dense_prefill_session_batch_write_f32_kv_layer(
+    gpu: &mut Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    kv_layer_index: usize,
+    k_src: &GpuTensor,
+    v_src: &GpuTensor,
+    kv_dim: usize,
+    row_count: usize,
+) -> HipResult<()> {
+    if kv_layer_index >= route_shape.kv_k_layers || kv_layer_index >= route_shape.kv_v_layers {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dense session prefill routed KV write layer {kv_layer_index} out of range for route shape {:?}",
+                route_shape,
+            ),
+        ));
+    }
+    gpu.kv_cache_write_f32_routed_batched(
+        &device_tables.kv_k_ptrs,
+        k_src,
+        &device_tables.row_session_indices,
+        &device_tables.row_positions,
+        route_shape.kv_k_layers,
+        kv_layer_index,
+        kv_dim,
+        row_count,
+    )?;
+    gpu.kv_cache_write_f32_routed_batched(
+        &device_tables.kv_v_ptrs,
+        v_src,
+        &device_tables.row_session_indices,
+        &device_tables.row_positions,
+        route_shape.kv_v_layers,
+        kv_layer_index,
+        kv_dim,
+        row_count,
+    )
+}
+
+pub fn grouped_moe_prefill_session_batch_write_q8_kv_layer(
+    gpu: &mut Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    kv_layer_index: usize,
+    k_src: &GpuTensor,
+    v_src: &GpuTensor,
+    n_kv_heads: usize,
+    head_dim: usize,
+    row_count: usize,
+) -> HipResult<()> {
+    if kv_layer_index >= route_shape.kv_k_layers || kv_layer_index >= route_shape.kv_v_layers {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "grouped MoE session prefill routed Q8 KV write layer {kv_layer_index} out of range for route shape {:?}",
+                route_shape,
+            ),
+        ));
+    }
+    gpu.kv_cache_write_q8_0_routed_batched(
+        &device_tables.kv_k_ptrs,
+        k_src,
+        &device_tables.row_session_indices,
+        &device_tables.row_positions,
+        route_shape.kv_k_layers,
+        kv_layer_index,
+        n_kv_heads,
+        head_dim,
+        row_count,
+    )?;
+    gpu.kv_cache_write_q8_0_routed_batched(
+        &device_tables.kv_v_ptrs,
+        v_src,
+        &device_tables.row_session_indices,
+        &device_tables.row_positions,
+        route_shape.kv_v_layers,
+        kv_layer_index,
+        n_kv_heads,
+        head_dim,
+        row_count,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dense_prefill_session_batch_attention_f32_layer(
+    gpu: &mut Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    kv_layer_index: usize,
+    q_batch: &GpuTensor,
+    out_batch: &GpuTensor,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+    max_ctx_len: usize,
+    row_count: usize,
+) -> HipResult<()> {
+    if kv_layer_index >= route_shape.kv_k_layers || kv_layer_index >= route_shape.kv_v_layers {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dense session prefill routed attention layer {kv_layer_index} out of range for route shape {:?}",
+                route_shape,
+            ),
+        ));
+    }
+    gpu.attention_f32_routed_batched(
+        q_batch,
+        &device_tables.kv_k_ptrs,
+        &device_tables.kv_v_ptrs,
+        out_batch,
+        &device_tables.row_session_indices,
+        &device_tables.row_positions,
+        route_shape.kv_k_layers,
+        kv_layer_index,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_seq,
+        max_ctx_len,
+        row_count,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_moe_prefill_session_batch_attention_q8_layer(
+    gpu: &mut Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    kv_layer_index: usize,
+    q_batch: &GpuTensor,
+    out_batch: &GpuTensor,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+    max_ctx_len: usize,
+    row_count: usize,
+) -> HipResult<()> {
+    if kv_layer_index >= route_shape.kv_k_layers || kv_layer_index >= route_shape.kv_v_layers {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "grouped MoE session prefill routed Q8 attention layer {kv_layer_index} out of range for route shape {:?}",
+                route_shape,
+            ),
+        ));
+    }
+    gpu.attention_q8_0_routed_batched(
+        q_batch,
+        &device_tables.kv_k_ptrs,
+        &device_tables.kv_v_ptrs,
+        out_batch,
+        &device_tables.row_session_indices,
+        &device_tables.row_positions,
+        route_shape.kv_k_layers,
+        kv_layer_index,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        max_seq,
+        max_ctx_len,
+        row_count,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
+    gpu: &mut Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    sessions: usize,
+    delta_layer_index: usize,
+    q_batch: &GpuTensor,
+    k_batch: &GpuTensor,
+    v_batch: &GpuTensor,
+    gate_batch: &GpuTensor,
+    beta_batch: &GpuTensor,
+    out_batch: &GpuTensor,
+    row_count: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> HipResult<()> {
+    if delta_layer_index >= route_shape.dn_s_layers
+        || delta_layer_index >= route_shape.dn_scale_layers
+    {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "grouped MoE session prefill routed Q8 DeltaNet layer {delta_layer_index} out of range for route shape {:?}",
+                route_shape,
+            ),
+        ));
+    }
+    gpu.gated_delta_net_q8_routed_batch_seq(
+        q_batch,
+        k_batch,
+        v_batch,
+        gate_batch,
+        beta_batch,
+        &device_tables.dn_s_ptrs,
+        &device_tables.dn_scale_ptrs,
+        &device_tables.row_session_indices,
+        out_batch,
+        route_shape.dn_s_layers,
+        delta_layer_index,
+        row_count,
+        n_heads,
+        head_dim,
+        sessions,
+    )
+}
+
+pub fn dense_prefill_session_batch_scatter_last_logits(
+    gpu: &mut Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    batch_logits: &GpuTensor,
+    vocab_size: usize,
+    sessions: usize,
+) -> HipResult<()> {
+    gpu.scatter_session_last_logits_f32(
+        batch_logits,
+        &device_tables.logits_ptrs,
+        &device_tables.session_last_row_indices,
+        vocab_size,
+        sessions,
+    )
+}
+
+pub fn dense_prefill_session_batch_final_logits_full_precision(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    row_count: usize,
+    sessions: usize,
+) -> HipResult<()> {
+    if row_count == 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "dense session prefill final logits requires at least one prefix row",
+        ));
+    }
+    if row_count > pbs.max_batch {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "dense session prefill final logits row_count exceeds PrefillBatchScratch max_batch",
+        ));
+    }
+
+    let normed_rows = pbs.x_norm_batch.sub_offset(0, row_count * config.dim);
+    gpu.rmsnorm_batched(
+        &pbs.x_batch,
+        &weights.output_norm,
+        &normed_rows,
+        row_count,
+        config.dim,
+        config.norm_eps,
+    )?;
+
+    let batch_logits = gpu.alloc_tensor(&[row_count * config.vocab_size], DType::F32)?;
+    let result = match weights.output.gpu_dtype {
+        DType::F32 => gpu.gemm_f32_register_tiled(
+            &weights.output.buf,
+            &normed_rows,
+            &batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        DType::F16 | DType::BF16 | DType::Raw => gemm_fp16_or_bf16_x_f32_wmma(
+            gpu,
+            &weights.output.buf,
+            &normed_rows,
+            &batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        other => Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dense session prefill final logits does not yet support lm_head dtype {other:?}; use serial_reference backend"
+            ),
+        )),
+    }
+    .and_then(|()| {
+        dense_prefill_session_batch_scatter_last_logits(
+            gpu,
+            device_tables,
+            &batch_logits,
+            config.vocab_size,
+            sessions,
+        )
+    });
+    let _ = gpu.free_tensor(batch_logits);
+    result
+}
+
+pub fn grouped_moe_prefill_session_batch_final_logits(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    row_count: usize,
+    sessions: usize,
+) -> HipResult<()> {
+    if row_count == 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "grouped MoE session prefill final logits requires at least one prefix row",
+        ));
+    }
+    if row_count > pbs.max_batch {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "grouped MoE session prefill final logits row_count exceeds PrefillBatchScratch max_batch",
+        ));
+    }
+
+    let normed_rows = pbs.x_norm_batch.sub_offset(0, row_count * config.dim);
+    gpu.rmsnorm_batched(
+        &pbs.x_batch,
+        &weights.output_norm,
+        &normed_rows,
+        row_count,
+        config.dim,
+        config.norm_eps,
+    )?;
+
+    let batch_logits = gpu.alloc_tensor(&[row_count * config.vocab_size], DType::F32)?;
+    let result = match weights.output.gpu_dtype {
+        DType::F32 => gpu.gemm_f32_register_tiled(
+            &weights.output.buf,
+            &normed_rows,
+            &batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        DType::F16 | DType::Raw => gpu.gemm_f16_batched_lmhead(
+            &weights.output.buf,
+            &normed_rows,
+            &batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(
+            &weights.output.buf,
+            &normed_rows,
+            &batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
+            &weights.output.buf,
+            &normed_rows,
+            &batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        DType::MQ4G256 => {
+            let rotated = pbs.x_rot_batch.sub_offset(0, row_count * config.dim);
+            rotate_x_mq_batched_for(
+                gpu,
+                &weights.output,
+                &normed_rows,
+                &rotated,
+                config.dim,
+                row_count,
+            )?;
+            gpu.gemm_hfq4g256(
+                &weights.output.buf,
+                &rotated,
+                &batch_logits,
+                weights.output.m,
+                weights.output.k,
+                row_count,
+            )
+        }
+        DType::MQ6G256 => {
+            let rotated = pbs.x_rot_batch.sub_offset(0, row_count * config.dim);
+            rotate_x_mq_batched_for(
+                gpu,
+                &weights.output,
+                &normed_rows,
+                &rotated,
+                config.dim,
+                row_count,
+            )?;
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &weights.output.buf,
+                &rotated,
+                &batch_logits,
+                weights.output.m,
+                weights.output.k,
+                row_count,
+            )
+        }
+        DType::MQ3G256 => {
+            let rotated = pbs.x_rot_batch.sub_offset(0, row_count * config.dim);
+            rotate_x_mq_batched_for(
+                gpu,
+                &weights.output,
+                &normed_rows,
+                &rotated,
+                config.dim,
+                row_count,
+            )?;
+            gpu.gemm_hfq3g256_batched_lmhead(
+                &weights.output.buf,
+                &rotated,
+                &batch_logits,
+                weights.output.m,
+                weights.output.k,
+                row_count,
+            )
+        }
+        other => Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "grouped MoE session prefill final logits does not yet support lm_head dtype {other:?}; use serial_reference backend"
+            ),
+        )),
+    }
+    .and_then(|()| {
+        dense_prefill_session_batch_scatter_last_logits(
+            gpu,
+            device_tables,
+            &batch_logits,
+            config.vocab_size,
+            sessions,
+        )
+    });
+    let _ = gpu.free_tensor(batch_logits);
+    result
+}
+
+pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
+    config: &Qwen35Config,
+    signatures: &[DensePrefillSessionBatchStateSignature],
+    execution_plan: &DensePrefillSessionBatchExecutionPlan,
+) -> Result<(), String> {
+    if config.num_experts != 0 || config.has_shared_expert {
+        return Err(
+            "dense session fused prefix currently supports dense Qwen35 only; MoE/A3B stays on serial_reference"
+                .to_string(),
+        );
+    }
+    if execution_plan.multi_state_prefix_rows == 0 {
+        return Err(
+            "dense session fused prefix requires at least one multi-session prefix row".to_string(),
+        );
+    }
+    validate_dense_prefill_session_batch_state_signatures(signatures)?;
+    for (idx, signature) in signatures.iter().enumerate() {
+        if signature.kv_compact_offset != 0 {
+            return Err(format!(
+                "dense session fused prefix row {idx} has compacted KV offset {}; eviction/compaction is not fused yet",
+                signature.kv_compact_offset,
+            ));
+        }
+        if signature.kv_quantized
+            || signature.kv_quant_q8
+            || signature.kv_quant_asym2
+            || signature.kv_quant_asym3
+            || signature.kv_quant_asym4
+            || signature.kv_quant_fwht
+        {
+            return Err(format!(
+                "dense session fused prefix row {idx} has quantized KV state; first fused target is FP32 KV"
+            ));
+        }
+        if signature.dn_quant != StateQuant::FP32 {
+            return Err(format!(
+                "dense session fused prefix row {idx} has {:?} DeltaNet state; first fused target is FP32 DeltaNet state",
+                signature.dn_quant,
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_grouped_moe_prefill_session_batch_q8_state_contract(
+    config: &Qwen35Config,
+    signatures: &[DensePrefillSessionBatchStateSignature],
+    execution_plan: &DensePrefillSessionBatchExecutionPlan,
+    arch: &str,
+) -> Result<(), String> {
+    if config.num_experts == 0 || !config.has_shared_expert {
+        return Err(
+            "grouped MoE session fused prefix requires Qwen35 MoE/A3B weights; dense Qwen35 should use fused_dense"
+                .to_string(),
+        );
+    }
+    if !arch.starts_with("gfx11") && !arch.starts_with("gfx12") {
+        return Err(format!(
+            "grouped MoE session fused prefix requires an RDNA grouped-MoE target, got arch={arch}"
+        ));
+    }
+    if config.num_experts_per_tok != 8 {
+        return Err(format!(
+            "grouped MoE session fused prefix currently requires K_TOP=8, got {}",
+            config.num_experts_per_tok,
+        ));
+    }
+    if execution_plan.multi_state_prefix_rows == 0 {
+        return Err(
+            "grouped MoE session fused prefix requires at least one multi-session prefix row"
+                .to_string(),
+        );
+    }
+    validate_dense_prefill_session_batch_state_signatures(signatures)?;
+    for (idx, signature) in signatures.iter().enumerate() {
+        if signature.kv_compact_offset != 0 {
+            return Err(format!(
+                "grouped MoE session fused prefix row {idx} has compacted KV offset {}; eviction/compaction is not fused yet",
+                signature.kv_compact_offset,
+            ));
+        }
+        if !signature.kv_quantized || !signature.kv_quant_q8 {
+            return Err(format!(
+                "grouped MoE session fused prefix row {idx} must use Q8 KV state for the MQ4 control path"
+            ));
+        }
+        if signature.kv_quant_asym2
+            || signature.kv_quant_asym3
+            || signature.kv_quant_asym4
+            || signature.kv_quant_fwht
+        {
+            return Err(format!(
+                "grouped MoE session fused prefix row {idx} has unsupported KV quantization flags; first MoE target is plain Q8 KV"
+            ));
+        }
+        if signature.dn_quant != StateQuant::Q8 {
+            return Err(format!(
+                "grouped MoE session fused prefix row {idx} has {:?} DeltaNet state; first MoE target is Q8 DeltaNet state",
+                signature.dn_quant,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn dense_prefill_weight_full_precision_supported(weight: &WeightTensor) -> bool {
+    matches!(
+        weight.gpu_dtype,
+        DType::F32 | DType::F16 | DType::BF16 | DType::Raw
+    )
+}
+
+pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(
+    weights: &Qwen35Weights,
+) -> Result<(), String> {
+    if !matches!(
+        weights.embd_format,
+        EmbeddingFormat::F32 | EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ4G256
+    ) {
+        return Err(format!(
+            "dense session fused prefix does not support embedding format {:?} yet",
+            weights.embd_format,
+        ));
+    }
+    if !dense_prefill_weight_full_precision_supported(&weights.output) {
+        return Err(format!(
+            "dense session fused prefix does not support lm_head dtype {:?} yet",
+            weights.output.gpu_dtype,
+        ));
+    }
+    for (layer_idx, layer) in weights.layers.iter().enumerate() {
+        let supported = match layer {
+            LayerWeights::DeltaNet(layer) => {
+                dense_prefill_weight_full_precision_supported(&layer.wqkv)
+                    && dense_prefill_weight_full_precision_supported(&layer.wz)
+                    && dense_prefill_weight_full_precision_supported(&layer.w_alpha)
+                    && dense_prefill_weight_full_precision_supported(&layer.w_beta)
+                    && dense_prefill_weight_full_precision_supported(&layer.wo)
+                    && dense_prefill_weight_full_precision_supported(&layer.w_gate)
+                    && dense_prefill_weight_full_precision_supported(&layer.w_up)
+                    && dense_prefill_weight_full_precision_supported(&layer.w_down)
+            }
+            LayerWeights::FullAttn(layer) => {
+                dense_prefill_weight_full_precision_supported(&layer.wq)
+                    && dense_prefill_weight_full_precision_supported(&layer.wk)
+                    && dense_prefill_weight_full_precision_supported(&layer.wv)
+                    && dense_prefill_weight_full_precision_supported(&layer.wo)
+                    && dense_prefill_weight_full_precision_supported(&layer.w_gate)
+                    && dense_prefill_weight_full_precision_supported(&layer.w_up)
+                    && dense_prefill_weight_full_precision_supported(&layer.w_down)
+            }
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => false,
+        };
+        if !supported {
+            return Err(format!(
+                "dense session fused prefix layer {layer_idx} has unsupported dense/MoE weight dtypes; first target is dense full-precision weights"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dense_prefill_session_batch_gated_delta_net_f32_layer(
+    gpu: &mut Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    sessions: usize,
+    delta_layer_index: usize,
+    q_batch: &GpuTensor,
+    k_batch: &GpuTensor,
+    v_batch: &GpuTensor,
+    gate_batch: &GpuTensor,
+    beta_batch: &GpuTensor,
+    output_batch: &GpuTensor,
+    row_count: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> HipResult<()> {
+    if delta_layer_index >= route_shape.dn_s_layers {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dense session prefill routed DeltaNet layer {delta_layer_index} out of range for route shape {:?}",
+                route_shape,
+            ),
+        ));
+    }
+    gpu.gated_delta_net_f32_routed_batch_seq(
+        q_batch,
+        k_batch,
+        v_batch,
+        gate_batch,
+        beta_batch,
+        &device_tables.dn_s_ptrs,
+        &device_tables.row_session_indices,
+        output_batch,
+        route_shape.dn_s_layers,
+        delta_layer_index,
+        row_count,
+        n_heads,
+        head_dim,
+        sessions,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dense_prefill_session_batch_conv1d_silu_split_layer(
+    gpu: &mut Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    sessions: usize,
+    delta_layer_index: usize,
+    q_out: &GpuTensor,
+    k_out: &GpuTensor,
+    v_out: &GpuTensor,
+    input: &GpuTensor,
+    weight: &GpuTensor,
+    k_dim: usize,
+    v_dim: usize,
+    row_count: usize,
+) -> HipResult<()> {
+    if delta_layer_index >= route_shape.dn_conv_layers {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dense session prefill routed conv layer {delta_layer_index} out of range for route shape {:?}",
+                route_shape,
+            ),
+        ));
+    }
+    gpu.conv1d_silu_split_routed_f32_n(
+        q_out,
+        k_out,
+        v_out,
+        input,
+        weight,
+        &device_tables.dn_conv_ptrs,
+        &device_tables.row_session_indices,
+        route_shape.dn_conv_layers,
+        delta_layer_index,
+        k_dim,
+        v_dim,
+        row_count,
+        sessions,
+    )
+}
+
+impl DensePrefillSessionBatchPointerTableShape {
+    pub fn index_for_session_layer(
+        self,
+        session_index: usize,
+        kv_layer_index: usize,
+        dn_layer_index: usize,
+    ) -> Result<DensePrefillSessionBatchPointerTableIndex, String> {
+        if session_index >= self.sessions {
+            return Err(format!(
+                "dense session prefill pointer table session_index {session_index} out of range for sessions={}",
+                self.sessions,
+            ));
+        }
+        let kv_layers = self.kv_k_ptrs.checked_div(self.sessions).unwrap_or(0);
+        let dn_layers = self.dn_s_ptrs.checked_div(self.sessions).unwrap_or(0);
+        if kv_layer_index >= kv_layers {
+            return Err(format!(
+                "dense session prefill pointer table kv_layer_index {kv_layer_index} out of range for kv_layers={kv_layers}",
+            ));
+        }
+        if dn_layer_index >= dn_layers {
+            return Err(format!(
+                "dense session prefill pointer table dn_layer_index {dn_layer_index} out of range for dn_layers={dn_layers}",
+            ));
+        }
+        Ok(DensePrefillSessionBatchPointerTableIndex {
+            kv_k_offset: session_index * kv_layers + kv_layer_index,
+            kv_v_offset: session_index * kv_layers + kv_layer_index,
+            dn_s_offset: session_index * dn_layers + dn_layer_index,
+            dn_scale_offset: session_index * dn_layers + dn_layer_index,
+            dn_conv_offset: session_index * dn_layers + dn_layer_index,
+            logits_offset: session_index,
+        })
+    }
+
+    pub fn index_for_prefix_row(
+        self,
+        prefix_row_index: usize,
+    ) -> Result<(usize, usize, usize), String> {
+        if prefix_row_index >= self.multi_state_prefix_rows {
+            return Err(format!(
+                "dense session prefill pointer table prefix_row_index {prefix_row_index} out of range for multi_state_prefix_rows={}",
+                self.multi_state_prefix_rows,
+            ));
+        }
+        Ok((prefix_row_index, prefix_row_index, prefix_row_index))
+    }
+
+    pub fn validate_prefix_row_metadata(
+        self,
+        plan: &DensePrefillSessionBatchPointerTablePlan,
+    ) -> Result<(), String> {
+        if plan.prefix_rows.len() != self.multi_state_prefix_rows {
+            return Err(format!(
+                "dense session prefill pointer table has {} prefix rows, expected {}",
+                plan.prefix_rows.len(),
+                self.multi_state_prefix_rows,
+            ));
+        }
+        if plan.session_last_row_indices.len() != self.sessions {
+            return Err(format!(
+                "dense session prefill pointer table has {} session-last-row entries, expected {}",
+                plan.session_last_row_indices.len(),
+                self.sessions,
+            ));
+        }
+        for (session_index, &row_index) in plan.session_last_row_indices.iter().enumerate() {
+            if row_index < 0 {
+                return Err(format!(
+                    "dense session prefill pointer table session {session_index} has no fused prefix row",
+                ));
+            }
+            let row_index = row_index as usize;
+            if row_index >= self.multi_state_prefix_rows {
+                return Err(format!(
+                    "dense session prefill pointer table session {session_index} last row {row_index} out of range for prefix rows {}",
+                    self.multi_state_prefix_rows,
+                ));
+            }
+            let row = &plan.prefix_rows[row_index];
+            if row.session_index != session_index {
+                return Err(format!(
+                    "dense session prefill pointer table session {session_index} last row {row_index} belongs to session {}",
+                    row.session_index,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn dense_prefill_session_batch_pointer_table_plan(
+    execution_plan: &DensePrefillSessionBatchExecutionPlan,
+    route_shape: DensePrefillSessionStateRouteShape,
+    sessions: usize,
+) -> DensePrefillSessionBatchPointerTablePlan {
+    let shape =
+        dense_prefill_session_batch_pointer_table_shape(execution_plan, route_shape, sessions);
+    let mut kv_layer_slots = Vec::with_capacity(shape.kv_k_ptrs);
+    for session_index in 0..sessions {
+        for layer_index in 0..route_shape.kv_k_layers {
+            kv_layer_slots.push(DensePrefillSessionBatchLayerPointerSlot {
+                session_index,
+                layer_index,
+            });
+        }
+    }
+    let mut dn_layer_slots = Vec::with_capacity(shape.dn_s_ptrs);
+    for session_index in 0..sessions {
+        for delta_layer_index in 0..route_shape.dn_s_layers {
+            dn_layer_slots.push(DensePrefillSessionBatchDeltaPointerSlot {
+                session_index,
+                delta_layer_index,
+            });
+        }
+    }
+    let logits_slots = (0..sessions).collect();
+    let mut prefix_rows = Vec::with_capacity(shape.multi_state_prefix_rows);
+    let mut session_last_row_indices = vec![-1; sessions];
+    for (round_index, round) in execution_plan
+        .rounds
+        .iter()
+        .take(execution_plan.multi_state_prefix_rounds)
+        .enumerate()
+    {
+        for (round_row_index, row) in round.rows.iter().enumerate() {
+            let prefix_row_index = prefix_rows.len() as i32;
+            session_last_row_indices[row.session_index] = prefix_row_index;
+            prefix_rows.push(DensePrefillSessionBatchPrefixRowSlot {
+                round_index,
+                round_row_index,
+                session_index: row.session_index,
+                token_index: row.token_index,
+                token: row.token,
+                position: row.position,
+            });
+        }
+    }
+    DensePrefillSessionBatchPointerTablePlan {
+        shape,
+        kv_layer_slots,
+        dn_layer_slots,
+        logits_slots,
+        prefix_rows,
+        session_last_row_indices,
+    }
+}
+
+pub fn dense_prefill_session_batch_host_pointer_tables(
+    plan: &DensePrefillSessionBatchPointerTablePlan,
+    routes: &[DensePrefillSessionStateRoute<'_>],
+) -> Result<DensePrefillSessionBatchHostPointerTables, String> {
+    if routes.len() != plan.shape.sessions {
+        return Err(format!(
+            "dense session prefill pointer table has {} routes, expected {}",
+            routes.len(),
+            plan.shape.sessions,
+        ));
+    }
+    let mut kv_k_ptrs = Vec::with_capacity(plan.shape.kv_k_ptrs);
+    let mut kv_v_ptrs = Vec::with_capacity(plan.shape.kv_v_ptrs);
+    for slot in &plan.kv_layer_slots {
+        let route = routes.get(slot.session_index).ok_or_else(|| {
+            format!(
+                "dense session prefill KV slot references missing session {}",
+                slot.session_index,
+            )
+        })?;
+        let k = route.kv.k_gpu.get(slot.layer_index).ok_or_else(|| {
+            format!(
+                "dense session prefill KV K slot references missing layer {}",
+                slot.layer_index,
+            )
+        })?;
+        let v = route.kv.v_gpu.get(slot.layer_index).ok_or_else(|| {
+            format!(
+                "dense session prefill KV V slot references missing layer {}",
+                slot.layer_index,
+            )
+        })?;
+        kv_k_ptrs.push(k.buf.as_ptr() as u64);
+        kv_v_ptrs.push(v.buf.as_ptr() as u64);
+    }
+
+    let mut dn_s_ptrs = Vec::with_capacity(plan.shape.dn_s_ptrs);
+    let mut dn_scale_ptrs = Vec::with_capacity(plan.shape.dn_scale_ptrs);
+    let mut dn_conv_ptrs = Vec::with_capacity(plan.shape.dn_conv_ptrs);
+    for slot in &plan.dn_layer_slots {
+        let route = routes.get(slot.session_index).ok_or_else(|| {
+            format!(
+                "dense session prefill DeltaNet slot references missing session {}",
+                slot.session_index,
+            )
+        })?;
+        let s = route
+            .delta
+            .s_matrices
+            .get(slot.delta_layer_index)
+            .ok_or_else(|| {
+                format!(
+                    "dense session prefill DeltaNet S slot references missing layer {}",
+                    slot.delta_layer_index,
+                )
+            })?;
+        let conv = route
+            .delta
+            .conv_states
+            .get(slot.delta_layer_index)
+            .ok_or_else(|| {
+                format!(
+                    "dense session prefill DeltaNet conv slot references missing layer {}",
+                    slot.delta_layer_index,
+                )
+            })?;
+        dn_s_ptrs.push(s.buf.as_ptr() as u64);
+        dn_conv_ptrs.push(conv.buf.as_ptr() as u64);
+        if plan.shape.dn_scale_ptrs != 0 {
+            let scale = route
+                .delta
+                .s_scales
+                .get(slot.delta_layer_index)
+                .ok_or_else(|| {
+                    format!(
+                        "dense session prefill DeltaNet scale slot references missing layer {}",
+                        slot.delta_layer_index,
+                    )
+                })?;
+            dn_scale_ptrs.push(scale.buf.as_ptr() as u64);
+        }
+    }
+
+    let mut logits_ptrs = Vec::with_capacity(plan.shape.logits_ptrs);
+    for &session_index in &plan.logits_slots {
+        let route = routes.get(session_index).ok_or_else(|| {
+            format!("dense session prefill logits slot references missing session {session_index}")
+        })?;
+        logits_ptrs.push(route.logits.buf.as_ptr() as u64);
+    }
+
+    let row_session_indices = plan
+        .prefix_rows
+        .iter()
+        .map(|row| row.session_index as i32)
+        .collect();
+    let row_tokens = plan
+        .prefix_rows
+        .iter()
+        .map(|row| row.token as i32)
+        .collect();
+    let row_positions = plan
+        .prefix_rows
+        .iter()
+        .map(|row| row.position as i32)
+        .collect();
+
+    let tables = DensePrefillSessionBatchHostPointerTables {
+        kv_k_ptrs,
+        kv_v_ptrs,
+        dn_s_ptrs,
+        dn_scale_ptrs,
+        dn_conv_ptrs,
+        logits_ptrs,
+        session_last_row_indices: plan.session_last_row_indices.clone(),
+        row_session_indices,
+        row_tokens,
+        row_positions,
+    };
+    tables.validate_shape(plan.shape)?;
+    Ok(tables)
+}
+
+pub fn dense_prefill_session_batch_prefix_tokens_positions(
+    plan: &DensePrefillSessionBatchPointerTablePlan,
+) -> Result<(Vec<u32>, Vec<usize>), String> {
+    plan.shape.validate_prefix_row_metadata(plan)?;
+    let tokens = plan.prefix_rows.iter().map(|row| row.token).collect();
+    let positions = plan.prefix_rows.iter().map(|row| row.position).collect();
+    Ok((tokens, positions))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DensePrefillSessionBatchShape {
+    pub sessions: usize,
+    pub total_tokens: usize,
+    pub max_tokens_per_session: usize,
+}
+
+pub fn validate_dense_prefill_session_batch_shape(
+    rows: &[DensePrefillSessionBatchRowShape],
+    max_batch: usize,
+) -> Result<DensePrefillSessionBatchShape, String> {
+    if rows.len() < 2 {
+        return Err(
+            "dense session prefill batch requires at least two independent sessions".to_string(),
+        );
+    }
+    let mut total_tokens = 0usize;
+    let mut max_tokens_per_session = 0usize;
+    for (idx, row) in rows.iter().enumerate() {
+        if row.tokens == 0 {
+            return Err(format!(
+                "dense session prefill batch row {idx} has an empty token slice"
+            ));
+        }
+        if row.tokens > max_batch {
+            return Err(format!(
+                "dense session prefill batch row {idx} has {} tokens, exceeding PrefillBatchScratch max_batch={}",
+                row.tokens,
+                max_batch,
+            ));
+        }
+        if row.logits_numel == 0 {
+            return Err(format!(
+                "dense session prefill batch row {idx} has an empty logits tensor"
+            ));
+        }
+        total_tokens += row.tokens;
+        max_tokens_per_session = max_tokens_per_session.max(row.tokens);
+    }
+    Ok(DensePrefillSessionBatchShape {
+        sessions: rows.len(),
+        total_tokens,
+        max_tokens_per_session,
+    })
+}
+
+pub fn validate_dense_prefill_session_batch_state_signatures(
+    signatures: &[DensePrefillSessionBatchStateSignature],
+) -> Result<(), String> {
+    if signatures.len() < 2 {
+        return Err(
+            "dense session prefill batch requires at least two independent session state signatures"
+                .to_string(),
+        );
+    }
+    let expected = signatures[0];
+    for (idx, signature) in signatures.iter().enumerate().skip(1) {
+        if *signature != expected {
+            return Err(format!(
+                "dense session prefill batch row {idx} has incompatible KV/DeltaNet state signature: expected {:?}, got {:?}",
+                expected,
+                signature,
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_dense_prefill_session_state_route_shapes(
+    shapes: &[DensePrefillSessionStateRouteShape],
+    expected_sessions: usize,
+) -> Result<(), String> {
+    if shapes.len() != expected_sessions {
+        return Err(format!(
+            "dense session prefill batch has {} state routes, expected {expected_sessions}",
+            shapes.len(),
+        ));
+    }
+    if shapes.len() < 2 {
+        return Err(
+            "dense session prefill batch requires at least two independent state routes"
+                .to_string(),
+        );
+    }
+    let expected = shapes[0];
+    if expected.kv_k_layers == 0
+        || expected.kv_v_layers == 0
+        || expected.dn_s_layers == 0
+        || expected.dn_conv_layers == 0
+    {
+        return Err(format!(
+            "dense session prefill batch row 0 has incomplete KV/DeltaNet route shape: {:?}",
+            expected,
+        ));
+    }
+    if expected.kv_k_layers != expected.kv_v_layers {
+        return Err(format!(
+            "dense session prefill batch row 0 has mismatched KV K/V layers: {:?}",
+            expected,
+        ));
+    }
+    if expected.dn_s_layers != expected.dn_conv_layers {
+        return Err(format!(
+            "dense session prefill batch row 0 has mismatched DeltaNet S/conv layers: {:?}",
+            expected,
+        ));
+    }
+    if expected.dn_scale_layers != 0 && expected.dn_scale_layers != expected.dn_s_layers {
+        return Err(format!(
+            "dense session prefill batch row 0 has mismatched DeltaNet scale layers: {:?}",
+            expected,
+        ));
+    }
+    for (idx, shape) in shapes.iter().enumerate().skip(1) {
+        if *shape != expected {
+            return Err(format!(
+                "dense session prefill batch row {idx} has incompatible state route shape: expected {:?}, got {:?}",
+                expected,
+                shape,
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn expected_dense_prefill_session_state_route_shape(
+    config: &Qwen35Config,
+) -> DensePrefillSessionStateRouteShape {
+    let dn_layers = config
+        .layer_types
+        .iter()
+        .filter(|layer_type| **layer_type == LayerType::LinearAttention)
+        .count();
+    DensePrefillSessionStateRouteShape {
+        kv_k_layers: config.n_layers,
+        kv_v_layers: config.n_layers,
+        dn_s_layers: dn_layers,
+        dn_scale_layers: dn_layers,
+        dn_conv_layers: dn_layers,
+    }
+}
+
+pub fn validate_dense_prefill_session_state_route_shapes_for_config(
+    shapes: &[DensePrefillSessionStateRouteShape],
+    config: &Qwen35Config,
+) -> Result<(), String> {
+    validate_dense_prefill_session_state_route_shapes(shapes, shapes.len())?;
+    let expected = expected_dense_prefill_session_state_route_shape(config);
+    for (idx, shape) in shapes.iter().enumerate() {
+        if *shape != expected {
+            return Err(format!(
+                "dense session prefill batch row {idx} has state route shape {:?}, expected model shape {:?}",
+                shape,
+                expected,
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn dense_prefill_session_batch_pointer_table_shape(
+    execution_plan: &DensePrefillSessionBatchExecutionPlan,
+    route_shape: DensePrefillSessionStateRouteShape,
+    sessions: usize,
+) -> DensePrefillSessionBatchPointerTableShape {
+    DensePrefillSessionBatchPointerTableShape {
+        sessions,
+        multi_state_prefix_rounds: execution_plan.multi_state_prefix_rounds,
+        multi_state_prefix_rows: execution_plan.multi_state_prefix_rows,
+        max_rows_per_round: execution_plan.max_rows_per_round,
+        kv_k_ptrs: sessions * route_shape.kv_k_layers,
+        kv_v_ptrs: sessions * route_shape.kv_v_layers,
+        dn_s_ptrs: sessions * route_shape.dn_s_layers,
+        dn_scale_ptrs: sessions * route_shape.dn_scale_layers,
+        dn_conv_ptrs: sessions * route_shape.dn_conv_layers,
+        logits_ptrs: sessions,
+        session_last_row_indices: sessions,
+        row_session_indices: execution_plan.multi_state_prefix_rows,
+        row_tokens: execution_plan.multi_state_prefix_rows,
+        row_positions: execution_plan.multi_state_prefix_rows,
+    }
+}
+
+pub fn validate_dense_prefill_session_batch_rows(
+    rows: &[DensePrefillSessionBatchRow<'_>],
+    pbs: &PrefillBatchScratch,
+) -> Result<DensePrefillSessionBatchShape, String> {
+    let shapes: Vec<DensePrefillSessionBatchRowShape> = rows
+        .iter()
+        .map(|row| DensePrefillSessionBatchRowShape {
+            tokens: row.tokens.len(),
+            logits_numel: row.logits.numel(),
+        })
+        .collect();
+    let shape = validate_dense_prefill_session_batch_shape(&shapes, pbs.max_batch)?;
+    let signatures: Vec<DensePrefillSessionBatchStateSignature> = rows
+        .iter()
+        .map(|row| DensePrefillSessionBatchStateSignature {
+            kv_physical_cap: row.kv_cache.physical_cap,
+            kv_compact_offset: row.kv_cache.compact_offset,
+            kv_quantized: row.kv_cache.quantized,
+            kv_quant_q8: row.kv_cache.quant_q8,
+            kv_quant_asym2: row.kv_cache.quant_asym2,
+            kv_quant_asym3: row.kv_cache.quant_asym3,
+            kv_quant_asym4: row.kv_cache.quant_asym4,
+            kv_quant_fwht: row.kv_cache.quant_fwht,
+            dn_quant: row.dn_state.quant,
+        })
+        .collect();
+    validate_dense_prefill_session_batch_state_signatures(&signatures)?;
+    let route_shapes: Vec<DensePrefillSessionStateRouteShape> = rows
+        .iter()
+        .map(|row| DensePrefillSessionStateRouteShape {
+            kv_k_layers: row.kv_cache.k_gpu.len(),
+            kv_v_layers: row.kv_cache.v_gpu.len(),
+            dn_s_layers: row.dn_state.s_matrices.len(),
+            dn_scale_layers: row.dn_state.s_scales.len(),
+            dn_conv_layers: row.dn_state.conv_states.len(),
+        })
+        .collect();
+    validate_dense_prefill_session_state_route_shapes(&route_shapes, rows.len())?;
+    Ok(shape)
+}
+
+pub fn validate_dense_prefill_session_batch_rows_for_config(
+    rows: &[DensePrefillSessionBatchRow<'_>],
+    pbs: &PrefillBatchScratch,
+    config: &Qwen35Config,
+) -> Result<DensePrefillSessionBatchShape, String> {
+    let shape = validate_dense_prefill_session_batch_rows(rows, pbs)?;
+    let route_shapes: Vec<DensePrefillSessionStateRouteShape> = rows
+        .iter()
+        .map(|row| DensePrefillSessionStateRouteShape {
+            kv_k_layers: row.kv_cache.k_gpu.len(),
+            kv_v_layers: row.kv_cache.v_gpu.len(),
+            dn_s_layers: row.dn_state.s_matrices.len(),
+            dn_scale_layers: row.dn_state.s_scales.len(),
+            dn_conv_layers: row.dn_state.conv_states.len(),
+        })
+        .collect();
+    validate_dense_prefill_session_state_route_shapes_for_config(&route_shapes, config)?;
+    Ok(shape)
+}
+
+pub fn build_dense_prefill_session_batch_rounds(
+    inputs: &[DensePrefillSessionBatchInput<'_>],
+    max_batch: usize,
+) -> Result<Vec<DensePrefillSessionBatchRound>, String> {
+    if inputs.len() < 2 {
+        return Err(
+            "dense session prefill batch requires at least two independent sessions".to_string(),
+        );
+    }
+    if inputs.len() > max_batch {
+        return Err(format!(
+            "dense session prefill batch has {} sessions, exceeding PrefillBatchScratch max_batch={max_batch}",
+            inputs.len(),
+        ));
+    }
+
+    let mut max_tokens_per_session = 0usize;
+    for (idx, input) in inputs.iter().enumerate() {
+        if input.tokens.is_empty() {
+            return Err(format!(
+                "dense session prefill batch row {idx} has an empty token slice"
+            ));
+        }
+        max_tokens_per_session = max_tokens_per_session.max(input.tokens.len());
+    }
+
+    let mut rounds = Vec::with_capacity(max_tokens_per_session);
+    for token_index in 0..max_tokens_per_session {
+        let mut rows = Vec::with_capacity(inputs.len());
+        for (session_index, input) in inputs.iter().enumerate() {
+            if let Some(&token) = input.tokens.get(token_index) {
+                rows.push(DensePrefillSessionBatchRoundRow {
+                    session_index,
+                    token_index,
+                    token,
+                    position: input.start_pos + token_index,
+                });
+            }
+        }
+        if !rows.is_empty() {
+            rounds.push(DensePrefillSessionBatchRound { rows });
+        }
+    }
+    Ok(rounds)
+}
+
+pub fn build_dense_prefill_session_batch_execution_plan(
+    inputs: &[DensePrefillSessionBatchInput<'_>],
+    max_batch: usize,
+) -> Result<DensePrefillSessionBatchExecutionPlan, String> {
+    let rounds = build_dense_prefill_session_batch_rounds(inputs, max_batch)?;
+    let mut total_rows = 0usize;
+    let mut max_rows_per_round = 0usize;
+    let mut multi_state_rounds = 0usize;
+    let mut state_routes = Vec::with_capacity(rounds.len());
+    let mut last_multi_state_round = None;
+    for round in &rounds {
+        total_rows += round.rows.len();
+        max_rows_per_round = max_rows_per_round.max(round.rows.len());
+        let route = round.state_route();
+        if matches!(
+            route,
+            DensePrefillSessionBatchRoundStateRoute::MultiSession { .. }
+        ) {
+            multi_state_rounds += 1;
+            last_multi_state_round = Some(state_routes.len());
+        }
+        state_routes.push(route);
+    }
+    let multi_state_prefix_rounds = last_multi_state_round.map(|idx| idx + 1).unwrap_or(0);
+    let multi_state_prefix_rows: usize = rounds[..multi_state_prefix_rounds]
+        .iter()
+        .map(|round| round.rows.len())
+        .sum();
+    let singleton_tail =
+        last_multi_state_round.and_then(|last_multi| {
+            let start_round = last_multi + 1;
+            if start_round >= state_routes.len() {
+                return None;
+            }
+            let session_index = match state_routes[start_round] {
+                DensePrefillSessionBatchRoundStateRoute::SingleSession { session_index } => {
+                    session_index
+                }
+                DensePrefillSessionBatchRoundStateRoute::MultiSession { .. } => return None,
+            };
+            let mut rows = 0usize;
+            for route in &state_routes[start_round..] {
+                match route {
+                    DensePrefillSessionBatchRoundStateRoute::SingleSession {
+                        session_index: idx,
+                    } if *idx == session_index => rows += 1,
+                    _ => return None,
+                }
+            }
+            Some(DensePrefillSessionBatchSingletonTail {
+                start_round,
+                session_index,
+                rows,
+            })
+        });
+    Ok(DensePrefillSessionBatchExecutionPlan {
+        rounds,
+        state_routes,
+        total_rows,
+        max_rows_per_round,
+        multi_state_rounds,
+        multi_state_prefix_rounds,
+        multi_state_prefix_rows,
+        singleton_tail,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_dense_session_batch_prefix_full_precision(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    row_count: usize,
+    sessions: usize,
+    max_ctx_len: usize,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
+            &weights.token_embd,
+            &pbs.x_batch,
+            &pbs.tokens,
+            row_count,
+            dim,
+        )?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+            &weights.token_embd,
+            &pbs.x_batch,
+            &pbs.tokens,
+            row_count,
+            dim,
+        )?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(
+            &weights.token_embd,
+            &pbs.x_batch,
+            &pbs.tokens,
+            row_count,
+            dim,
+        )?,
+        other => {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("dense session fused prefix does not support embedding format {other:?}"),
+            ));
+        }
+    }
+
+    let mut delta_layer_idx = 0usize;
+    for layer_idx in 0..config.n_layers {
+        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
+            (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                gpu.rmsnorm_batched(
+                    &pbs.x_batch,
+                    &layer.attn_norm,
+                    &pbs.x_rot_batch,
+                    row_count,
+                    dim,
+                    config.norm_eps,
+                )?;
+                dense_session_prefill_gemm_full_precision(
+                    gpu,
+                    &layer.wqkv,
+                    &pbs.x_rot_batch,
+                    &pbs.dn_qkv_batch,
+                    row_count,
+                )?;
+                dense_session_prefill_gemm_full_precision(
+                    gpu,
+                    &layer.wz,
+                    &pbs.x_rot_batch,
+                    &pbs.dn_z_batch,
+                    row_count,
+                )?;
+                dense_session_prefill_gemm_full_precision(
+                    gpu,
+                    &layer.w_beta,
+                    &pbs.x_rot_batch,
+                    &pbs.dn_beta_batch,
+                    row_count,
+                )?;
+                dense_session_prefill_gemm_full_precision(
+                    gpu,
+                    &layer.w_alpha,
+                    &pbs.x_rot_batch,
+                    &pbs.dn_alpha_batch,
+                    row_count,
+                )?;
+
+                gpu.fused_sigmoid_alpha_gate_f32_batched(
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    &layer.dt_bias,
+                    &layer.a_log,
+                    n_v_heads,
+                    row_count,
+                )?;
+                dense_prefill_session_batch_conv1d_silu_split_layer(
+                    gpu,
+                    device_tables,
+                    route_shape,
+                    sessions,
+                    delta_layer_idx,
+                    &pbs.dn_q_raw_batch,
+                    &pbs.dn_k_raw_batch,
+                    &pbs.dn_v_batch,
+                    &pbs.dn_qkv_batch,
+                    &layer.conv_weight,
+                    k_dim,
+                    v_dim,
+                    row_count,
+                )?;
+                gpu.fused_qk_l2_norm_scale_f32_batched(
+                    &pbs.dn_q_raw_batch,
+                    &pbs.dn_k_raw_batch,
+                    config.linear_num_key_heads,
+                    hd,
+                    1.0 / (hd as f32).sqrt(),
+                    config.norm_eps,
+                    row_count,
+                )?;
+                if config.linear_num_key_heads < n_v_heads {
+                    let ratio = n_v_heads / config.linear_num_key_heads;
+                    gpu.repeat_interleave_qk_f32_batched(
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        config.linear_num_key_heads,
+                        ratio,
+                        hd,
+                        row_count,
+                    )?;
+                } else {
+                    gpu.memcpy_dtod_auto(
+                        &pbs.dn_q_batch.buf,
+                        &pbs.dn_q_raw_batch.buf,
+                        row_count * k_dim * 4,
+                    )?;
+                    gpu.memcpy_dtod_auto(
+                        &pbs.dn_k_batch.buf,
+                        &pbs.dn_k_raw_batch.buf,
+                        row_count * k_dim * 4,
+                    )?;
+                }
+                dense_prefill_session_batch_gated_delta_net_f32_layer(
+                    gpu,
+                    device_tables,
+                    route_shape,
+                    sessions,
+                    delta_layer_idx,
+                    &pbs.dn_q_batch,
+                    &pbs.dn_k_batch,
+                    &pbs.dn_v_batch,
+                    &pbs.dn_alpha_batch,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_attn_out_batch,
+                    row_count,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                )?;
+                gpu.gated_norm_f32_batched(
+                    &pbs.dn_attn_out_batch,
+                    &pbs.dn_z_batch,
+                    &layer.norm_weight,
+                    &pbs.dn_normed_batch,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    config.norm_eps,
+                    row_count,
+                )?;
+                dense_session_prefill_gemm_full_precision_residual(
+                    gpu,
+                    &layer.wo,
+                    &pbs.dn_normed_batch,
+                    &pbs.x_batch,
+                    &pbs.x_rot_batch,
+                    row_count,
+                )?;
+
+                gpu.rmsnorm_batched(
+                    &pbs.x_batch,
+                    &layer.ffn_norm,
+                    &pbs.x_rot_batch,
+                    row_count,
+                    dim,
+                    config.norm_eps,
+                )?;
+                dense_session_prefill_gemm_full_precision(
+                    gpu,
+                    &layer.w_gate,
+                    &pbs.x_rot_batch,
+                    &pbs.gate_ffn_batch,
+                    row_count,
+                )?;
+                dense_session_prefill_gemm_full_precision(
+                    gpu,
+                    &layer.w_up,
+                    &pbs.x_rot_batch,
+                    &pbs.up_batch,
+                    row_count,
+                )?;
+                gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+                dense_session_prefill_gemm_full_precision_residual(
+                    gpu,
+                    &layer.w_down,
+                    &pbs.ffn_hidden_batch,
+                    &pbs.x_batch,
+                    &pbs.x_rot_batch,
+                    row_count,
+                )?;
+                delta_layer_idx += 1;
+            }
+            (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
+                let kv_dim = config.n_kv_heads * config.head_dim;
+                gpu.rmsnorm_batched(
+                    &pbs.x_batch,
+                    &layer.attn_norm,
+                    &pbs.x_rot_batch,
+                    row_count,
+                    dim,
+                    config.norm_eps,
+                )?;
+                dense_session_prefill_gemm_full_precision(
+                    gpu,
+                    &layer.wq,
+                    &pbs.x_rot_batch,
+                    &pbs.fa_q_full_batch,
+                    row_count,
+                )?;
+                dense_session_prefill_gemm_full_precision(
+                    gpu,
+                    &layer.wk,
+                    &pbs.x_rot_batch,
+                    &pbs.fa_k_batch,
+                    row_count,
+                )?;
+                dense_session_prefill_gemm_full_precision(
+                    gpu,
+                    &layer.wv,
+                    &pbs.x_rot_batch,
+                    &pbs.fa_v_batch,
+                    row_count,
+                )?;
+                gpu.deinterleave_f32_batched(
+                    &pbs.fa_q_full_batch,
+                    &pbs.fa_q_batch,
+                    &pbs.fa_gate_batch,
+                    config.n_heads,
+                    config.head_dim,
+                    row_count,
+                )?;
+                gpu.rmsnorm_batched(
+                    &pbs.fa_q_batch,
+                    &layer.q_norm,
+                    &pbs.fa_q_batch,
+                    row_count * config.n_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
+                gpu.rmsnorm_batched(
+                    &pbs.fa_k_batch,
+                    &layer.k_norm,
+                    &pbs.fa_k_batch,
+                    row_count * config.n_kv_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
+                let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                gpu.rope_partial_interleaved_f32_batched(
+                    &pbs.fa_q_batch,
+                    &pbs.fa_k_batch,
+                    &pbs.positions,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_theta,
+                    row_count,
+                    0,
+                )?;
+                dense_prefill_session_batch_write_f32_kv_layer(
+                    gpu,
+                    device_tables,
+                    route_shape,
+                    layer_idx,
+                    &pbs.fa_k_batch,
+                    &pbs.fa_v_batch,
+                    kv_dim,
+                    row_count,
+                )?;
+                dense_prefill_session_batch_attention_f32_layer(
+                    gpu,
+                    device_tables,
+                    route_shape,
+                    layer_idx,
+                    &pbs.fa_q_batch,
+                    &pbs.fa_attn_out_batch,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    max_ctx_len,
+                    max_ctx_len,
+                    row_count,
+                )?;
+                gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+                dense_session_prefill_gemm_full_precision_residual(
+                    gpu,
+                    &layer.wo,
+                    &pbs.fa_attn_out_batch,
+                    &pbs.x_batch,
+                    &pbs.x_rot_batch,
+                    row_count,
+                )?;
+
+                gpu.rmsnorm_batched(
+                    &pbs.x_batch,
+                    &layer.ffn_norm,
+                    &pbs.x_rot_batch,
+                    row_count,
+                    dim,
+                    config.norm_eps,
+                )?;
+                dense_session_prefill_gemm_full_precision(
+                    gpu,
+                    &layer.w_gate,
+                    &pbs.x_rot_batch,
+                    &pbs.gate_ffn_batch,
+                    row_count,
+                )?;
+                dense_session_prefill_gemm_full_precision(
+                    gpu,
+                    &layer.w_up,
+                    &pbs.x_rot_batch,
+                    &pbs.up_batch,
+                    row_count,
+                )?;
+                gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+                dense_session_prefill_gemm_full_precision_residual(
+                    gpu,
+                    &layer.w_down,
+                    &pbs.ffn_hidden_batch,
+                    &pbs.x_batch,
+                    &pbs.x_rot_batch,
+                    row_count,
+                )?;
+            }
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "dense session fused prefix encountered a layer that is not dense Qwen35",
+                ));
+            }
+        }
+    }
+
+    dense_prefill_session_batch_final_logits_full_precision(
+        gpu,
+        weights,
+        config,
+        pbs,
+        device_tables,
+        row_count,
+        sessions,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_dense_session_batch(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    rows: &mut [DensePrefillSessionBatchRow<'_>],
+    _scratch: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+) -> HipResult<DensePrefillSessionBatchShape> {
+    let shape = validate_dense_prefill_session_batch_rows_for_config(rows, pbs, config)
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    let inputs: Vec<DensePrefillSessionBatchInput<'_>> = rows
+        .iter()
+        .map(|row| DensePrefillSessionBatchInput {
+            tokens: row.tokens,
+            start_pos: row.start_pos,
+        })
+        .collect();
+    let execution_plan = build_dense_prefill_session_batch_execution_plan(&inputs, pbs.max_batch)
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    let signatures: Vec<DensePrefillSessionBatchStateSignature> = rows
+        .iter()
+        .map(|row| DensePrefillSessionBatchStateSignature {
+            kv_physical_cap: row.kv_cache.physical_cap,
+            kv_compact_offset: row.kv_cache.compact_offset,
+            kv_quantized: row.kv_cache.quantized,
+            kv_quant_q8: row.kv_cache.quant_q8,
+            kv_quant_asym2: row.kv_cache.quant_asym2,
+            kv_quant_asym3: row.kv_cache.quant_asym3,
+            kv_quant_asym4: row.kv_cache.quant_asym4,
+            kv_quant_fwht: row.kv_cache.quant_fwht,
+            dn_quant: row.dn_state.quant,
+        })
+        .collect();
+    validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
+        config,
+        &signatures,
+        &execution_plan,
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(weights)
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    let route_shape = expected_dense_prefill_session_state_route_shape(config);
+    let pointer_table_plan =
+        dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, rows.len());
+    if execution_plan.multi_state_prefix_rows > pbs.max_batch {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dense session prefill fused prefix has {} rows, exceeding PrefillBatchScratch max_batch={}",
+                execution_plan.multi_state_prefix_rows, pbs.max_batch,
+            ),
+        ));
+    }
+    let (prefix_tokens, prefix_positions) =
+        dense_prefill_session_batch_prefix_tokens_positions(&pointer_table_plan)
+            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    upload_prefill_batch_inputs_with_positions(gpu, pbs, &prefix_tokens, &prefix_positions)?;
+    let routes: Vec<DensePrefillSessionStateRoute<'_>> = rows
+        .iter()
+        .map(|row| DensePrefillSessionStateRoute {
+            kv: DensePrefillSessionKvStateRoute {
+                k_gpu: &row.kv_cache.k_gpu,
+                v_gpu: &row.kv_cache.v_gpu,
+                physical_cap: row.kv_cache.physical_cap,
+                compact_offset: row.kv_cache.compact_offset,
+            },
+            delta: DensePrefillSessionDeltaStateRoute {
+                s_matrices: &row.dn_state.s_matrices,
+                s_scales: &row.dn_state.s_scales,
+                conv_states: &row.dn_state.conv_states,
+                quant: row.dn_state.quant,
+            },
+            logits: row.logits,
+        })
+        .collect();
+    let host_pointer_tables =
+        dense_prefill_session_batch_host_pointer_tables(&pointer_table_plan, &routes)
+            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    drop(routes);
+    let device_pointer_tables = upload_dense_prefill_session_batch_pointer_tables(
+        gpu,
+        pointer_table_plan.shape,
+        &host_pointer_tables,
+    )?;
+    let max_ctx_len = prefix_positions
+        .iter()
+        .copied()
+        .max()
+        .map(|pos| pos + 1)
+        .unwrap_or(1);
+    for (idx, row) in rows.iter().enumerate() {
+        let row_end = row.start_pos + row.tokens.len();
+        if row_end > row.kv_cache.physical_cap {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "dense session fused prefix row {idx} ends at position {row_end}, exceeding KV physical_cap={}",
+                    row.kv_cache.physical_cap,
+                ),
+            ));
+        }
+    }
+    let result = forward_prefill_dense_session_batch_prefix_full_precision(
+        gpu,
+        weights,
+        config,
+        pbs,
+        &device_pointer_tables,
+        route_shape,
+        execution_plan.multi_state_prefix_rows,
+        rows.len(),
+        max_ctx_len,
+    );
+    device_pointer_tables.free_gpu(gpu);
+    result.map(|()| shape)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_grouped_moe_session_batch_prefix_q8_control(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    row_count: usize,
+    sessions: usize,
+    max_ctx_len: usize,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    let q8_wmma_arch = gpu.arch_caps.has_wmma();
+
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(
+            &weights.token_embd,
+            &pbs.x_batch,
+            &pbs.tokens,
+            row_count,
+            dim,
+        )?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(
+            &weights.token_embd,
+            &pbs.x_batch,
+            &pbs.tokens,
+            row_count,
+            dim,
+        )?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(
+            &weights.token_embd,
+            &pbs.x_batch,
+            &pbs.tokens,
+            row_count,
+            dim,
+        )?,
+        other => {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "grouped MoE session fused prefix does not support embedding format {other:?}"
+                ),
+            ));
+        }
+    }
+
+    let mut delta_layer_idx = 0usize;
+    for layer_idx in 0..config.n_layers {
+        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
+            (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
+                let attn_is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0)
+                    && matches!(layer.wz.gpu_dtype, DType::Q8_0)
+                    && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0)
+                    && matches!(layer.w_beta.gpu_dtype, DType::Q8_0);
+                let attn_is_mq4 = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256)
+                    && matches!(layer.wz.gpu_dtype, DType::MQ4G256)
+                    && matches!(layer.w_alpha.gpu_dtype, DType::MQ4G256)
+                    && matches!(layer.w_beta.gpu_dtype, DType::MQ4G256);
+                if !attn_is_q8 && !attn_is_mq4 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "grouped MoE session fused prefix currently supports Q8 or MQ4 DeltaNet-MoE attention weights only; use serial_reference",
+                    ));
+                }
+                if attn_is_mq4 {
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu,
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &layer.wqkv,
+                        &pbs.x_rot_batch,
+                        dim,
+                        config.norm_eps,
+                        row_count,
+                    )?;
+                } else {
+                    gpu.rmsnorm_batched(
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &pbs.x_rot_batch,
+                        row_count,
+                        dim,
+                        config.norm_eps,
+                    )?;
+                }
+                if attn_is_mq4 {
+                    gpu.gemm_qkvza_hfq4g256(
+                        &layer.wqkv.buf,
+                        &layer.wz.buf,
+                        &layer.w_beta.buf,
+                        &layer.w_alpha.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch,
+                        &pbs.dn_z_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        layer.wqkv.m,
+                        layer.wz.m,
+                        layer.w_beta.m,
+                        layer.w_alpha.m,
+                        layer.wqkv.k,
+                        row_count,
+                    )?;
+                } else if q8_wmma_arch {
+                    gpu.gemm_qkvza_q8_0_wmma(
+                        &layer.wqkv.buf,
+                        &layer.wz.buf,
+                        &layer.w_beta.buf,
+                        &layer.w_alpha.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch,
+                        &pbs.dn_z_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        layer.wqkv.m,
+                        layer.wz.m,
+                        layer.w_beta.m,
+                        layer.w_alpha.m,
+                        layer.wqkv.k,
+                        row_count,
+                    )?;
+                } else {
+                    gpu.gemm_q8_0_batched_chunked(
+                        &layer.wqkv.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch,
+                        layer.wqkv.m,
+                        layer.wqkv.k,
+                        row_count,
+                    )?;
+                    gpu.gemm_q8_0_batched_chunked(
+                        &layer.wz.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_z_batch,
+                        layer.wz.m,
+                        layer.wz.k,
+                        row_count,
+                    )?;
+                    gpu.gemm_q8_0_batched_chunked(
+                        &layer.w_beta.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_beta_batch,
+                        layer.w_beta.m,
+                        layer.w_beta.k,
+                        row_count,
+                    )?;
+                    gpu.gemm_q8_0_batched_chunked(
+                        &layer.w_alpha.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_alpha_batch,
+                        layer.w_alpha.m,
+                        layer.w_alpha.k,
+                        row_count,
+                    )?;
+                }
+                gpu.fused_sigmoid_alpha_gate_f32_batched(
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    &layer.dt_bias,
+                    &layer.a_log,
+                    n_v_heads,
+                    row_count,
+                )?;
+                dense_prefill_session_batch_conv1d_silu_split_layer(
+                    gpu,
+                    device_tables,
+                    route_shape,
+                    sessions,
+                    delta_layer_idx,
+                    &pbs.dn_q_raw_batch,
+                    &pbs.dn_k_raw_batch,
+                    &pbs.dn_v_batch,
+                    &pbs.dn_qkv_batch,
+                    &layer.conv_weight,
+                    k_dim,
+                    v_dim,
+                    row_count,
+                )?;
+                gpu.fused_qk_l2_norm_scale_f32_batched(
+                    &pbs.dn_q_raw_batch,
+                    &pbs.dn_k_raw_batch,
+                    config.linear_num_key_heads,
+                    hd,
+                    1.0 / (hd as f32).sqrt(),
+                    config.norm_eps,
+                    row_count,
+                )?;
+                if config.linear_num_key_heads < n_v_heads {
+                    let ratio = n_v_heads / config.linear_num_key_heads;
+                    gpu.repeat_interleave_qk_f32_batched(
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        config.linear_num_key_heads,
+                        ratio,
+                        hd,
+                        row_count,
+                    )?;
+                } else {
+                    gpu.memcpy_dtod_auto(
+                        &pbs.dn_q_batch.buf,
+                        &pbs.dn_q_raw_batch.buf,
+                        row_count * k_dim * 4,
+                    )?;
+                    gpu.memcpy_dtod_auto(
+                        &pbs.dn_k_batch.buf,
+                        &pbs.dn_k_raw_batch.buf,
+                        row_count * k_dim * 4,
+                    )?;
+                }
+                grouped_moe_prefill_session_batch_gated_delta_net_q8_layer(
+                    gpu,
+                    device_tables,
+                    route_shape,
+                    sessions,
+                    delta_layer_idx,
+                    &pbs.dn_q_batch,
+                    &pbs.dn_k_batch,
+                    &pbs.dn_v_batch,
+                    &pbs.dn_alpha_batch,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_attn_out_batch,
+                    row_count,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                )?;
+                gpu.gated_norm_f32_batched(
+                    &pbs.dn_attn_out_batch,
+                    &pbs.dn_z_batch,
+                    &layer.norm_weight,
+                    &pbs.dn_normed_batch,
+                    n_v_heads,
+                    config.linear_value_head_dim,
+                    config.norm_eps,
+                    row_count,
+                )?;
+                if matches!(layer.wo.gpu_dtype, DType::MQ4G256) {
+                    rotate_x_mq_batched_for(
+                        gpu,
+                        &layer.wo,
+                        &pbs.dn_normed_batch,
+                        &pbs.dn_normed_rot_batch,
+                        layer.wo.k,
+                        row_count,
+                    )?;
+                    gpu.gemm_hfq4g256_residual(
+                        &layer.wo.buf,
+                        &pbs.dn_normed_rot_batch,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        row_count,
+                    )?;
+                } else if matches!(layer.wo.gpu_dtype, DType::Q8_0) && q8_wmma_arch {
+                    let x_n = pbs.x_batch.sub_offset(0, row_count * layer.wo.m);
+                    gpu.gemm_q8_0_residual_wmma(
+                        &layer.wo.buf,
+                        &pbs.dn_normed_batch,
+                        &x_n,
+                        layer.wo.m,
+                        layer.wo.k,
+                        row_count,
+                    )?;
+                } else if matches!(layer.wo.gpu_dtype, DType::Q8_0) {
+                    let scratch = pbs
+                        .dn_normed_rot_batch
+                        .sub_offset(0, row_count * layer.wo.m);
+                    gpu.gemm_q8_0_batched_chunked(
+                        &layer.wo.buf,
+                        &pbs.dn_normed_batch,
+                        &scratch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        row_count,
+                    )?;
+                    let x_n = pbs.x_batch.sub_offset(0, row_count * layer.wo.m);
+                    gpu.add_inplace_f32(&x_n, &scratch)?;
+                } else {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "grouped MoE session fused prefix currently supports Q8 or MQ4 DeltaNet-MoE wo weights only; use serial_reference",
+                    ));
+                }
+                prefill_moe_ffn_body_batched(
+                    gpu,
+                    &layer.ffn,
+                    &layer.ffn_norm,
+                    config,
+                    pbs,
+                    row_count,
+                )?;
+                delta_layer_idx += 1;
+            }
+            (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
+                let attn_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0)
+                    && matches!(layer.wk.gpu_dtype, DType::Q8_0)
+                    && matches!(layer.wv.gpu_dtype, DType::Q8_0);
+                let attn_is_mq4 = matches!(layer.wq.gpu_dtype, DType::MQ4G256)
+                    && matches!(layer.wk.gpu_dtype, DType::MQ4G256)
+                    && matches!(layer.wv.gpu_dtype, DType::MQ4G256);
+                if !attn_is_q8 && !attn_is_mq4 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "grouped MoE session fused prefix currently supports Q8 or MQ4 FullAttention-MoE attention weights only; use serial_reference",
+                    ));
+                }
+                if attn_is_mq4 {
+                    fused_rmsnorm_rotate_mq_batched_for(
+                        gpu,
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &layer.wq,
+                        &pbs.x_rot_batch,
+                        dim,
+                        config.norm_eps,
+                        row_count,
+                    )?;
+                } else {
+                    gpu.rmsnorm_batched(
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &pbs.x_rot_batch,
+                        row_count,
+                        dim,
+                        config.norm_eps,
+                    )?;
+                }
+                if attn_is_mq4 {
+                    gpu.gemm_qkv_hfq4g256(
+                        &layer.wq.buf,
+                        &layer.wk.buf,
+                        &layer.wv.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        layer.wq.m,
+                        layer.wk.m,
+                        layer.wv.m,
+                        layer.wq.k,
+                        row_count,
+                    )?;
+                } else if q8_wmma_arch {
+                    gpu.gemm_qkv_q8_0_wmma(
+                        &layer.wq.buf,
+                        &layer.wk.buf,
+                        &layer.wv.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch,
+                        &pbs.fa_k_batch,
+                        &pbs.fa_v_batch,
+                        layer.wq.m,
+                        layer.wk.m,
+                        layer.wv.m,
+                        layer.wq.k,
+                        row_count,
+                    )?;
+                } else {
+                    gpu.gemm_q8_0_batched_chunked(
+                        &layer.wq.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch,
+                        layer.wq.m,
+                        layer.wq.k,
+                        row_count,
+                    )?;
+                    gpu.gemm_q8_0_batched_chunked(
+                        &layer.wk.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_k_batch,
+                        layer.wk.m,
+                        layer.wk.k,
+                        row_count,
+                    )?;
+                    gpu.gemm_q8_0_batched_chunked(
+                        &layer.wv.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_v_batch,
+                        layer.wv.m,
+                        layer.wv.k,
+                        row_count,
+                    )?;
+                }
+                gpu.deinterleave_f32_batched(
+                    &pbs.fa_q_full_batch,
+                    &pbs.fa_q_batch,
+                    &pbs.fa_gate_batch,
+                    config.n_heads,
+                    config.head_dim,
+                    row_count,
+                )?;
+                gpu.rmsnorm_batched(
+                    &pbs.fa_q_batch,
+                    &layer.q_norm,
+                    &pbs.fa_q_batch,
+                    row_count * config.n_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
+                gpu.rmsnorm_batched(
+                    &pbs.fa_k_batch,
+                    &layer.k_norm,
+                    &pbs.fa_k_batch,
+                    row_count * config.n_kv_heads,
+                    config.head_dim,
+                    config.norm_eps,
+                )?;
+                let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                gpu.rope_partial_interleaved_f32_batched(
+                    &pbs.fa_q_batch,
+                    &pbs.fa_k_batch,
+                    &pbs.positions,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_theta,
+                    row_count,
+                    0,
+                )?;
+                grouped_moe_prefill_session_batch_write_q8_kv_layer(
+                    gpu,
+                    device_tables,
+                    route_shape,
+                    layer_idx,
+                    &pbs.fa_k_batch,
+                    &pbs.fa_v_batch,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    row_count,
+                )?;
+                grouped_moe_prefill_session_batch_attention_q8_layer(
+                    gpu,
+                    device_tables,
+                    route_shape,
+                    layer_idx,
+                    &pbs.fa_q_batch,
+                    &pbs.fa_attn_out_batch,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    max_ctx_len,
+                    max_ctx_len,
+                    row_count,
+                )?;
+                gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+                if matches!(layer.wo.gpu_dtype, DType::MQ4G256) {
+                    rotate_x_mq_batched_for(
+                        gpu,
+                        &layer.wo,
+                        &pbs.fa_attn_out_batch,
+                        &pbs.fa_attn_out_rot_batch,
+                        layer.wo.k,
+                        row_count,
+                    )?;
+                    gpu.gemm_hfq4g256_residual(
+                        &layer.wo.buf,
+                        &pbs.fa_attn_out_rot_batch,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        row_count,
+                    )?;
+                } else if matches!(layer.wo.gpu_dtype, DType::Q8_0) && q8_wmma_arch {
+                    let x_n = pbs.x_batch.sub_offset(0, row_count * layer.wo.m);
+                    gpu.gemm_q8_0_residual_wmma(
+                        &layer.wo.buf,
+                        &pbs.fa_attn_out_batch,
+                        &x_n,
+                        layer.wo.m,
+                        layer.wo.k,
+                        row_count,
+                    )?;
+                } else if matches!(layer.wo.gpu_dtype, DType::Q8_0) {
+                    let scratch = pbs
+                        .fa_attn_out_rot_batch
+                        .sub_offset(0, row_count * layer.wo.m);
+                    gpu.gemm_q8_0_batched_chunked(
+                        &layer.wo.buf,
+                        &pbs.fa_attn_out_batch,
+                        &scratch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        row_count,
+                    )?;
+                    let x_n = pbs.x_batch.sub_offset(0, row_count * layer.wo.m);
+                    gpu.add_inplace_f32(&x_n, &scratch)?;
+                } else {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "grouped MoE session fused prefix currently supports Q8 or MQ4 FullAttention-MoE wo weights only; use serial_reference",
+                    ));
+                }
+                prefill_moe_ffn_body_batched(
+                    gpu,
+                    &layer.ffn,
+                    &layer.ffn_norm,
+                    config,
+                    pbs,
+                    row_count,
+                )?;
+            }
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "grouped MoE session fused prefix encountered unsupported layer {layer_idx}; use serial_reference"
+                    ),
+                ));
+            }
+        }
+    }
+
+    grouped_moe_prefill_session_batch_final_logits(
+        gpu,
+        weights,
+        config,
+        pbs,
+        device_tables,
+        row_count,
+        sessions,
+    )
+}
+
+pub fn forward_prefill_grouped_moe_session_batch(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    rows: &mut [DensePrefillSessionBatchRow<'_>],
+    _scratch: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+) -> HipResult<DensePrefillSessionBatchShape> {
+    let shape = validate_dense_prefill_session_batch_rows_for_config(rows, pbs, config)
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    let inputs: Vec<DensePrefillSessionBatchInput<'_>> = rows
+        .iter()
+        .map(|row| DensePrefillSessionBatchInput {
+            tokens: row.tokens,
+            start_pos: row.start_pos,
+        })
+        .collect();
+    let execution_plan = build_dense_prefill_session_batch_execution_plan(&inputs, pbs.max_batch)
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    let signatures: Vec<DensePrefillSessionBatchStateSignature> = rows
+        .iter()
+        .map(|row| DensePrefillSessionBatchStateSignature {
+            kv_physical_cap: row.kv_cache.physical_cap,
+            kv_compact_offset: row.kv_cache.compact_offset,
+            kv_quantized: row.kv_cache.quantized,
+            kv_quant_q8: row.kv_cache.quant_q8,
+            kv_quant_asym2: row.kv_cache.quant_asym2,
+            kv_quant_asym3: row.kv_cache.quant_asym3,
+            kv_quant_asym4: row.kv_cache.quant_asym4,
+            kv_quant_fwht: row.kv_cache.quant_fwht,
+            dn_quant: row.dn_state.quant,
+        })
+        .collect();
+    validate_grouped_moe_prefill_session_batch_q8_state_contract(
+        config,
+        &signatures,
+        &execution_plan,
+        gpu.arch.as_str(),
+    )
+    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    let route_shape = expected_dense_prefill_session_state_route_shape(config);
+    let pointer_table_plan =
+        dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, rows.len());
+    if execution_plan.multi_state_prefix_rows > pbs.max_batch {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "grouped MoE session prefill fused prefix has {} rows, exceeding PrefillBatchScratch max_batch={}",
+                execution_plan.multi_state_prefix_rows, pbs.max_batch,
+            ),
+        ));
+    }
+    let (prefix_tokens, prefix_positions) =
+        dense_prefill_session_batch_prefix_tokens_positions(&pointer_table_plan)
+            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    upload_prefill_batch_inputs_with_positions(gpu, pbs, &prefix_tokens, &prefix_positions)?;
+    let routes: Vec<DensePrefillSessionStateRoute<'_>> = rows
+        .iter()
+        .map(|row| DensePrefillSessionStateRoute {
+            kv: DensePrefillSessionKvStateRoute {
+                k_gpu: &row.kv_cache.k_gpu,
+                v_gpu: &row.kv_cache.v_gpu,
+                physical_cap: row.kv_cache.physical_cap,
+                compact_offset: row.kv_cache.compact_offset,
+            },
+            delta: DensePrefillSessionDeltaStateRoute {
+                s_matrices: &row.dn_state.s_matrices,
+                s_scales: &row.dn_state.s_scales,
+                conv_states: &row.dn_state.conv_states,
+                quant: row.dn_state.quant,
+            },
+            logits: row.logits,
+        })
+        .collect();
+    let host_pointer_tables =
+        dense_prefill_session_batch_host_pointer_tables(&pointer_table_plan, &routes)
+            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    let device_pointer_tables = upload_dense_prefill_session_batch_pointer_tables(
+        gpu,
+        pointer_table_plan.shape,
+        &host_pointer_tables,
+    )?;
+    let max_ctx_len = prefix_positions
+        .iter()
+        .copied()
+        .max()
+        .map(|pos| pos + 1)
+        .unwrap_or(1);
+    for (idx, row) in rows.iter().enumerate() {
+        let row_end = row.start_pos + row.tokens.len();
+        if row_end > row.kv_cache.physical_cap {
+            device_pointer_tables.free_gpu(gpu);
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "grouped MoE session fused prefix row {idx} ends at position {row_end}, exceeding KV physical_cap={}",
+                    row.kv_cache.physical_cap,
+                ),
+            ));
+        }
+    }
+    let result = forward_prefill_grouped_moe_session_batch_prefix_q8_control(
+        gpu,
+        weights,
+        config,
+        pbs,
+        &device_pointer_tables,
+        route_shape,
+        execution_plan.multi_state_prefix_rows,
+        rows.len(),
+        max_ctx_len,
+    );
+    device_pointer_tables.free_gpu(gpu);
+    result.map(|()| shape)
+}
+
 impl PrefillBatchScratch {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_batch: usize) -> HipResult<Self> {
         let dim = config.dim;
@@ -7947,6 +10726,67 @@ fn gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
     }
 }
 
+fn dense_session_prefill_gemm_full_precision(
+    gpu: &mut Gpu,
+    weight: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    match weight.gpu_dtype {
+        DType::F32 => gpu.gemm_f32_register_tiled(&weight.buf, x, y, weight.m, weight.k, n),
+        DType::F16 | DType::BF16 | DType::Raw => {
+            gemm_fp16_or_bf16_x_f32_wmma(gpu, &weight.buf, x, y, weight.m, weight.k, n)
+        }
+        other => Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dense session fused prefix full-precision GEMM does not support dtype {other:?}"
+            ),
+        )),
+    }
+}
+
+fn dense_session_prefill_gemm_full_precision_residual(
+    gpu: &mut Gpu,
+    weight: &WeightTensor,
+    x: &GpuTensor,
+    y_residual: &GpuTensor,
+    scratch: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    match weight.gpu_dtype {
+        DType::F32 => gemm_f32_residual_batched(
+            gpu,
+            &weight.buf,
+            x,
+            y_residual,
+            scratch,
+            weight.m,
+            weight.k,
+            n,
+        ),
+        DType::F16 | DType::BF16 | DType::Raw => {
+            gemm_fp16_or_bf16_x_f32_wmma_residual_batched(
+                gpu,
+                &weight.buf,
+                x,
+                y_residual,
+                scratch,
+                weight.m,
+                weight.k,
+                n,
+            )
+        }
+        other => Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "dense session fused prefix full-precision residual GEMM does not support dtype {other:?}"
+            ),
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MoeGroupedPath2Shape {
     total_slots: usize,
@@ -7987,11 +10827,34 @@ pub fn upload_prefill_batch_inputs(
     start_pos: usize,
 ) -> HipResult<()> {
     let n = tokens.len();
+    let positions_host: Vec<usize> = (0..n).map(|i| start_pos + i).collect();
+    upload_prefill_batch_inputs_with_positions(gpu, pbs, tokens, &positions_host)
+}
+
+pub fn upload_prefill_batch_inputs_with_positions(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    tokens: &[u32],
+    positions: &[usize],
+) -> HipResult<()> {
+    let n = tokens.len();
+    if positions.len() != n {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "upload_prefill_batch_inputs_with_positions: tokens and positions length mismatch",
+        ));
+    }
+    if n > pbs.max_batch {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "upload_prefill_batch_inputs_with_positions: token count exceeds PrefillBatchScratch max_batch",
+        ));
+    }
     let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
     let tokens_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
     gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
-    let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
+    let positions_host: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
     let positions_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
     gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
@@ -8288,6 +11151,7 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
         None, // band: full-stack single-GPU path
         None, // mask_override: captured-prefill caller does not use the MTP probe hook
+        None, // positions_override: captured-prefill uses linear positions
         needs_last_token_logits,
         debug_max_layer, // max_layer: default full stack; env is for graph-fault bisection only
     )
@@ -8676,6 +11540,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 false, // pre_uploaded: default path uploads inside
                 None,  // band: full-stack single-GPU path
                 mo_for_chunk,
+                None, // positions_override: default path uses linear positions
                 needs_last_token_logits,
                 max_layer,
             )?;
@@ -10585,6 +13450,7 @@ fn forward_prefill_chunk(
     pre_uploaded: bool,
     band: Option<&PrefillBandCtx<'_>>,
     mask_override: Option<MaskEmbedOverride<'_>>,
+    positions_override: Option<&[usize]>,
     needs_last_token_logits: bool,
     max_layer: Option<usize>,
 ) -> HipResult<()> {
@@ -10774,11 +13640,13 @@ fn forward_prefill_chunk(
     // ── 1b. Upload positions array ────────────────────────────────────────
     //
     // Positions is the per-row RoPE angle AND the physical KV cache slot (the
-    // batched kv_write kernels use the same index for both). We always use
-    // flat linear `start_pos .. start_pos + n`. Siblings in DDTree mode get
-    // DISTINCT slots this way — no write race — and the stored K carries a
-    // RoPE angle that matches the physical slot, which keeps subsequent
-    // cycles' attention reads consistent.
+    // batched kv_write kernels use the same index for both). Default callers
+    // use flat linear `start_pos .. start_pos + n`; the dense server-prefill
+    // session-batch worker can pass explicit per-row positions for independent
+    // sessions. Siblings in DDTree mode get DISTINCT slots via the default
+    // linear path — no write race — and the stored K carries a RoPE angle that
+    // matches the physical slot, which keeps subsequent cycles' attention
+    // reads consistent.
     //
     // Semantic trade vs. the original depth-based scheme (paper): tree
     // siblings that represent "alternative futures at the same time step"
@@ -10791,7 +13659,18 @@ fn forward_prefill_chunk(
     // compatibility but ignored — the DdNode depths it carries are only
     // used by `linearize_tree` to build the attn_bias mask.
     if !pre_uploaded {
-        let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
+        let positions_host: Vec<i32> = if let Some(positions) = positions_override {
+            assert_eq!(
+                positions.len(),
+                n,
+                "positions_override length {} must equal tokens.len() {}",
+                positions.len(),
+                n,
+            );
+            positions.iter().map(|&p| p as i32).collect()
+        } else {
+            (0..n).map(|i| (start_pos + i) as i32).collect()
+        };
         let positions_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
         gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
@@ -10851,8 +13730,15 @@ fn forward_prefill_chunk(
     // so correctness is preserved; only the LDS allocation is over-provisioned.
     let max_ctx_len = if gpu.capture_mode {
         kv_cache.physical_cap
+    } else if let Some(positions) = positions_override {
+        positions.iter().copied().max().unwrap_or(start_pos) + 1
     } else {
         start_pos + n
+    };
+    let position_at_row = |row: usize| -> usize {
+        positions_override
+            .map(|p| p[row])
+            .unwrap_or(start_pos + row)
     };
 
     // ── 2. Per-layer loop ────────────────────────────────────────────────
@@ -12452,6 +15338,23 @@ fn forward_prefill_chunk(
                             n,
                         )?;
                     }
+                } else if kv_cache.quant_q8 {
+                    gpu.kv_cache_write_q8_0_batched(
+                        &kv_cache.k_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.positions,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
+                    )?;
+                    gpu.kv_cache_write_q8_0_batched(
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
+                    )?;
                 } else if !use_kld_direct_f16kv_attention && !use_kld_fp32_gqa4_attention {
                     gpu.kv_cache_write_f32_batched(
                         &kv_cache.k_gpu[layer_idx],
@@ -12653,12 +15556,12 @@ fn forward_prefill_chunk(
                     // (slot-cosmetic, see PrefillBatchScratch::new).
                     // `download_f32` would reinterpret those bytes as floats —
                     // i32 15000 = 0x3A98 round-trips through f32 as ~1e-3
-                    // subnormal, which casts to 0. Reconstruct from
-                    // start_pos + b directly; the buffer is always linear.
+                    // subnormal, which casts to 0. Reconstruct from the
+                    // host-side row position directly.
                     let q_dim = config.n_heads * config.head_dim;
                     let pos_buf_tmp = gpu.hip.malloc(4)?;
                     for b in 0..n {
-                        let pos_b = start_pos + b;
+                        let pos_b = position_at_row(b);
                         let seq_len_b = pos_b + 1;
                         let pos_i32 = pos_b as i32;
                         gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
@@ -13639,19 +16542,6 @@ fn forward_prefill_chunk(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
-                } else if matches!(dn_state.quant, StateQuant::FP32) {
-                    gpu.gated_delta_net_f32_batch_seq(
-                        &pbs.dn_q_batch,
-                        &pbs.dn_k_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_alpha_batch,
-                        &pbs.dn_beta_batch,
-                        &dn_state.s_matrices[delta_layer_idx],
-                        &pbs.dn_attn_out_batch,
-                        n,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                    )?;
                 } else {
                     gpu.gated_delta_net_q8_batch_seq(
                         &pbs.dn_q_batch,
@@ -14228,6 +17118,23 @@ fn forward_prefill_chunk(
                             n,
                         )?;
                     }
+                } else if kv_cache.quant_q8 {
+                    gpu.kv_cache_write_q8_0_batched(
+                        &kv_cache.k_gpu[layer_idx],
+                        &pbs.fa_k_batch,
+                        &pbs.positions,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
+                    )?;
+                    gpu.kv_cache_write_q8_0_batched(
+                        &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_v_batch,
+                        &pbs.positions,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n,
+                    )?;
                 } else if !use_kld_direct_f16kv_attention && !use_kld_fp32_gqa4_attention {
                     gpu.kv_cache_write_f32_batched(
                         &kv_cache.k_gpu[layer_idx],
@@ -14414,11 +17321,12 @@ fn forward_prefill_chunk(
                         LDS_CTX_LIMIT,
                     );
                     // See dense FullAttn branch above for the i32-vs-f32 slot
-                    // rationale; reconstruct positions from start_pos + b.
+                    // rationale; reconstruct positions from the host-side row
+                    // position directly.
                     let q_dim_local = config.n_heads * config.head_dim;
                     let pos_buf_tmp = gpu.hip.malloc(4)?;
                     for b in 0..n {
-                        let pos_b = start_pos + b;
+                        let pos_b = position_at_row(b);
                         let seq_len_b = pos_b + 1;
                         let pos_i32 = pos_b as i32;
                         gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
@@ -19528,6 +22436,7 @@ pub fn forward_prefill_batch_multi_with_caps(
                         false, // pre_uploaded
                         Some(&band_ctx),
                         None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
+                        None, // positions_override: PP path uses linear positions
                         needs_last_token_logits,
                         None, // max_layer: multi-GPU PP path runs full stack
                     )?;
@@ -19613,6 +22522,47 @@ pub fn forward_with_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_qwen35_config_with_layers(layer_types: Vec<LayerType>) -> Qwen35Config {
+        Qwen35Config {
+            dim: 16,
+            n_layers: layer_types.len(),
+            vocab_size: 32,
+            norm_eps: 1e-6,
+            eos_token: 0,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 8,
+            rope_theta: 1_000_000.0,
+            partial_rotary_factor: 0.25,
+            is_vl_text: false,
+            mrope_interleaved: false,
+            mrope_section: [0, 0, 0],
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_key_head_dim: 8,
+            linear_value_head_dim: 8,
+            conv_kernel_dim: 4,
+            hidden_dim: 32,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            has_shared_expert: false,
+            norm_topk_prob: false,
+            layer_types,
+            paged_experts: false,
+            vram_budget_bytes: u64::MAX,
+        }
+    }
+
+    fn fake_tensor(ptr: usize) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, 4) },
+            shape: vec![1],
+            dtype: DType::F32,
+        }
+    }
 
     #[test]
     fn moe_router_histogram_records_top1_topk_weights_and_drops() {
@@ -19738,6 +22688,1086 @@ mod tests {
                 "BF16 dense prefill must stay on the batched BF16 WMMA-capable path on {arch}"
             );
         }
+    }
+
+    #[test]
+    fn dense_session_prefill_batch_shape_accepts_independent_rows() {
+        let shape = validate_dense_prefill_session_batch_shape(
+            &[
+                DensePrefillSessionBatchRowShape {
+                    tokens: 3,
+                    logits_numel: 151_936,
+                },
+                DensePrefillSessionBatchRowShape {
+                    tokens: 5,
+                    logits_numel: 151_936,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session batch shape");
+        assert_eq!(
+            shape,
+            DensePrefillSessionBatchShape {
+                sessions: 2,
+                total_tokens: 8,
+                max_tokens_per_session: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn dense_session_prefill_batch_shape_rejects_non_batchable_shapes() {
+        let one_row = validate_dense_prefill_session_batch_shape(
+            &[DensePrefillSessionBatchRowShape {
+                tokens: 3,
+                logits_numel: 151_936,
+            }],
+            8,
+        )
+        .unwrap_err();
+        assert!(one_row.contains("at least two independent sessions"));
+
+        let empty_tokens = validate_dense_prefill_session_batch_shape(
+            &[
+                DensePrefillSessionBatchRowShape {
+                    tokens: 0,
+                    logits_numel: 151_936,
+                },
+                DensePrefillSessionBatchRowShape {
+                    tokens: 1,
+                    logits_numel: 151_936,
+                },
+            ],
+            8,
+        )
+        .unwrap_err();
+        assert!(empty_tokens.contains("empty token slice"));
+
+        let too_wide = validate_dense_prefill_session_batch_shape(
+            &[
+                DensePrefillSessionBatchRowShape {
+                    tokens: 9,
+                    logits_numel: 151_936,
+                },
+                DensePrefillSessionBatchRowShape {
+                    tokens: 1,
+                    logits_numel: 151_936,
+                },
+            ],
+            8,
+        )
+        .unwrap_err();
+        assert!(too_wide.contains("exceeding PrefillBatchScratch max_batch=8"));
+
+        let empty_logits = validate_dense_prefill_session_batch_shape(
+            &[
+                DensePrefillSessionBatchRowShape {
+                    tokens: 3,
+                    logits_numel: 0,
+                },
+                DensePrefillSessionBatchRowShape {
+                    tokens: 1,
+                    logits_numel: 151_936,
+                },
+            ],
+            8,
+        )
+        .unwrap_err();
+        assert!(empty_logits.contains("empty logits tensor"));
+    }
+
+    #[test]
+    fn dense_session_prefill_state_signatures_must_match() {
+        let q8 = DensePrefillSessionBatchStateSignature {
+            kv_physical_cap: 512,
+            kv_compact_offset: 0,
+            kv_quantized: true,
+            kv_quant_q8: true,
+            kv_quant_asym2: false,
+            kv_quant_asym3: false,
+            kv_quant_asym4: false,
+            kv_quant_fwht: false,
+            dn_quant: StateQuant::Q8,
+        };
+        validate_dense_prefill_session_batch_state_signatures(&[q8, q8])
+            .expect("matching signatures are batchable");
+
+        let mut different_compact_offset = q8;
+        different_compact_offset.kv_compact_offset = 16;
+        let err =
+            validate_dense_prefill_session_batch_state_signatures(&[q8, different_compact_offset])
+                .unwrap_err();
+        assert!(err.contains("incompatible KV/DeltaNet state signature"));
+
+        let mut different_dn_quant = q8;
+        different_dn_quant.dn_quant = StateQuant::FP32;
+        let err = validate_dense_prefill_session_batch_state_signatures(&[q8, different_dn_quant])
+            .unwrap_err();
+        assert!(err.contains("incompatible KV/DeltaNet state signature"));
+    }
+
+    #[test]
+    fn dense_session_prefill_state_route_shapes_must_match() {
+        let shape = DensePrefillSessionStateRouteShape {
+            kv_k_layers: 12,
+            kv_v_layers: 12,
+            dn_s_layers: 16,
+            dn_scale_layers: 16,
+            dn_conv_layers: 16,
+        };
+        validate_dense_prefill_session_state_route_shapes(&[shape, shape], 2)
+            .expect("matching route shapes are batchable");
+
+        let wrong_count =
+            validate_dense_prefill_session_state_route_shapes(&[shape, shape], 3).unwrap_err();
+        assert!(wrong_count.contains("expected 3"));
+
+        let mut missing_kv = shape;
+        missing_kv.kv_k_layers = 0;
+        let err = validate_dense_prefill_session_state_route_shapes(&[missing_kv, missing_kv], 2)
+            .unwrap_err();
+        assert!(err.contains("incomplete KV/DeltaNet route shape"));
+
+        let mut mismatched_kv = shape;
+        mismatched_kv.kv_v_layers = 11;
+        let err =
+            validate_dense_prefill_session_state_route_shapes(&[mismatched_kv, mismatched_kv], 2)
+                .unwrap_err();
+        assert!(err.contains("mismatched KV K/V layers"));
+
+        let mut mismatched_delta = shape;
+        mismatched_delta.dn_conv_layers = 15;
+        let err = validate_dense_prefill_session_state_route_shapes(
+            &[mismatched_delta, mismatched_delta],
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("mismatched DeltaNet S/conv layers"));
+
+        let mut incompatible = shape;
+        incompatible.dn_s_layers = 15;
+        incompatible.dn_scale_layers = 15;
+        incompatible.dn_conv_layers = 15;
+        let err = validate_dense_prefill_session_state_route_shapes(&[shape, incompatible], 2)
+            .unwrap_err();
+        assert!(err.contains("incompatible state route shape"));
+    }
+
+    #[test]
+    fn dense_session_prefill_state_route_shape_matches_qwen35_config() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let expected = expected_dense_prefill_session_state_route_shape(&config);
+        assert_eq!(
+            expected,
+            DensePrefillSessionStateRouteShape {
+                kv_k_layers: 4,
+                kv_v_layers: 4,
+                dn_s_layers: 2,
+                dn_scale_layers: 2,
+                dn_conv_layers: 2,
+            }
+        );
+        validate_dense_prefill_session_state_route_shapes_for_config(
+            &[expected, expected],
+            &config,
+        )
+        .expect("matching model route shapes are valid");
+
+        let mut wrong = expected;
+        wrong.kv_k_layers = 2;
+        let err = validate_dense_prefill_session_state_route_shapes_for_config(
+            &[expected, wrong],
+            &config,
+        )
+        .unwrap_err();
+        assert!(err.contains("incompatible state route shape"));
+
+        let mut matching_but_wrong_for_model = expected;
+        matching_but_wrong_for_model.dn_s_layers = 1;
+        matching_but_wrong_for_model.dn_scale_layers = 1;
+        matching_but_wrong_for_model.dn_conv_layers = 1;
+        let err = validate_dense_prefill_session_state_route_shapes_for_config(
+            &[matching_but_wrong_for_model, matching_but_wrong_for_model],
+            &config,
+        )
+        .unwrap_err();
+        assert!(err.contains("expected model shape"));
+    }
+
+    #[test]
+    fn dense_session_prefill_rounds_are_round_major_with_independent_positions() {
+        let rounds = build_dense_prefill_session_batch_rounds(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10, 11, 12],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[30, 31],
+                    start_pos: 2,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session rounds");
+
+        assert_eq!(rounds.len(), 3);
+        assert_eq!(
+            rounds[0].rows,
+            vec![
+                DensePrefillSessionBatchRoundRow {
+                    session_index: 0,
+                    token_index: 0,
+                    token: 10,
+                    position: 4,
+                },
+                DensePrefillSessionBatchRoundRow {
+                    session_index: 1,
+                    token_index: 0,
+                    token: 20,
+                    position: 9,
+                },
+                DensePrefillSessionBatchRoundRow {
+                    session_index: 2,
+                    token_index: 0,
+                    token: 30,
+                    position: 2,
+                },
+            ]
+        );
+        assert_eq!(
+            rounds[1].rows,
+            vec![
+                DensePrefillSessionBatchRoundRow {
+                    session_index: 0,
+                    token_index: 1,
+                    token: 11,
+                    position: 5,
+                },
+                DensePrefillSessionBatchRoundRow {
+                    session_index: 2,
+                    token_index: 1,
+                    token: 31,
+                    position: 3,
+                },
+            ]
+        );
+        assert_eq!(
+            rounds[2].rows,
+            vec![DensePrefillSessionBatchRoundRow {
+                session_index: 0,
+                token_index: 2,
+                token: 12,
+                position: 6,
+            }]
+        );
+    }
+
+    #[test]
+    fn dense_session_prefill_rounds_reject_non_batchable_inputs() {
+        let one_row = build_dense_prefill_session_batch_rounds(
+            &[DensePrefillSessionBatchInput {
+                tokens: &[10],
+                start_pos: 0,
+            }],
+            8,
+        )
+        .unwrap_err();
+        assert!(one_row.contains("at least two independent sessions"));
+
+        let too_many = build_dense_prefill_session_batch_rounds(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[1],
+                    start_pos: 0,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[2],
+                    start_pos: 0,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[3],
+                    start_pos: 0,
+                },
+            ],
+            2,
+        )
+        .unwrap_err();
+        assert!(too_many.contains("exceeding PrefillBatchScratch max_batch=2"));
+
+        let empty = build_dense_prefill_session_batch_rounds(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[],
+                    start_pos: 0,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[2],
+                    start_pos: 0,
+                },
+            ],
+            8,
+        )
+        .unwrap_err();
+        assert!(empty.contains("empty token slice"));
+    }
+
+    #[test]
+    fn dense_session_prefill_execution_plan_marks_multi_state_rounds() {
+        let plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10, 11, 12],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[30, 31],
+                    start_pos: 2,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+
+        assert_eq!(plan.total_rows, 6);
+        assert_eq!(plan.max_rows_per_round, 3);
+        assert_eq!(plan.multi_state_rounds, 2);
+        assert_eq!(plan.multi_state_prefix_rounds, 2);
+        assert_eq!(plan.multi_state_prefix_rows, 5);
+        assert_eq!(
+            plan.singleton_tail,
+            Some(DensePrefillSessionBatchSingletonTail {
+                start_round: 2,
+                session_index: 0,
+                rows: 1,
+            })
+        );
+        assert_eq!(plan.rounds.len(), 3);
+        assert_eq!(plan.rounds[0].rows.len(), 3);
+        assert_eq!(plan.rounds[1].rows.len(), 2);
+        assert_eq!(plan.rounds[2].rows.len(), 1);
+        assert_eq!(
+            plan.state_routes,
+            vec![
+                DensePrefillSessionBatchRoundStateRoute::MultiSession {
+                    session_indices: vec![0, 1, 2],
+                },
+                DensePrefillSessionBatchRoundStateRoute::MultiSession {
+                    session_indices: vec![0, 2],
+                },
+                DensePrefillSessionBatchRoundStateRoute::SingleSession { session_index: 0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn dense_session_prefill_execution_plan_has_no_tail_for_equal_lengths() {
+        let plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10, 11],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20, 21],
+                    start_pos: 9,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+
+        assert_eq!(plan.total_rows, 4);
+        assert_eq!(plan.max_rows_per_round, 2);
+        assert_eq!(plan.multi_state_rounds, 2);
+        assert_eq!(plan.multi_state_prefix_rounds, 2);
+        assert_eq!(plan.multi_state_prefix_rows, 4);
+        assert_eq!(plan.singleton_tail, None);
+        assert_eq!(
+            plan.state_routes,
+            vec![
+                DensePrefillSessionBatchRoundStateRoute::MultiSession {
+                    session_indices: vec![0, 1],
+                },
+                DensePrefillSessionBatchRoundStateRoute::MultiSession {
+                    session_indices: vec![0, 1],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dense_session_fused_prefix_contract_accepts_dense_fp32_state() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10, 11],
+                    start_pos: 0,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 0,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+        let signatures = vec![
+            DensePrefillSessionBatchStateSignature {
+                kv_physical_cap: 512,
+                kv_compact_offset: 0,
+                kv_quantized: false,
+                kv_quant_q8: false,
+                kv_quant_asym2: false,
+                kv_quant_asym3: false,
+                kv_quant_asym4: false,
+                kv_quant_fwht: false,
+                dn_quant: StateQuant::FP32,
+            },
+            DensePrefillSessionBatchStateSignature {
+                kv_physical_cap: 512,
+                kv_compact_offset: 0,
+                kv_quantized: false,
+                kv_quant_q8: false,
+                kv_quant_asym2: false,
+                kv_quant_asym3: false,
+                kv_quant_asym4: false,
+                kv_quant_fwht: false,
+                dn_quant: StateQuant::FP32,
+            },
+        ];
+
+        validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
+            &config,
+            &signatures,
+            &plan,
+        )
+        .expect("dense FP32-state prefix should be eligible");
+    }
+
+    #[test]
+    fn dense_session_fused_prefix_contract_rejects_moe_and_quantized_state() {
+        let mut moe_config = test_qwen35_config_with_layers(vec![LayerType::LinearAttention]);
+        moe_config.num_experts = 128;
+        moe_config.has_shared_expert = true;
+        let plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10],
+                    start_pos: 0,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 0,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+        let fp32_sig = DensePrefillSessionBatchStateSignature {
+            kv_physical_cap: 512,
+            kv_compact_offset: 0,
+            kv_quantized: false,
+            kv_quant_q8: false,
+            kv_quant_asym2: false,
+            kv_quant_asym3: false,
+            kv_quant_asym4: false,
+            kv_quant_fwht: false,
+            dn_quant: StateQuant::FP32,
+        };
+
+        let moe_err = validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
+            &moe_config,
+            &[fp32_sig, fp32_sig],
+            &plan,
+        )
+        .unwrap_err();
+        assert!(moe_err.contains("dense Qwen35 only"));
+
+        let compacted = DensePrefillSessionBatchStateSignature {
+            kv_compact_offset: 8,
+            ..fp32_sig
+        };
+        let compact_err =
+            validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
+                &test_qwen35_config_with_layers(vec![LayerType::LinearAttention]),
+                &[compacted, compacted],
+                &plan,
+            )
+            .unwrap_err();
+        assert!(compact_err.contains("compacted KV offset"));
+
+        let q8_dn = DensePrefillSessionBatchStateSignature {
+            dn_quant: StateQuant::Q8,
+            ..fp32_sig
+        };
+        let q8_err = validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
+            &test_qwen35_config_with_layers(vec![LayerType::LinearAttention]),
+            &[q8_dn, q8_dn],
+            &plan,
+        )
+        .unwrap_err();
+        assert!(q8_err.contains("DeltaNet state"));
+    }
+
+    #[test]
+    fn grouped_moe_session_fused_prefix_contract_accepts_q8_state_control_path() {
+        let mut config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        config.num_experts = 256;
+        config.num_experts_per_tok = 8;
+        config.has_shared_expert = true;
+        let plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10, 11],
+                    start_pos: 0,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 0,
+                },
+            ],
+            8,
+        )
+        .expect("valid session execution plan");
+        let q8_sig = DensePrefillSessionBatchStateSignature {
+            kv_physical_cap: 512,
+            kv_compact_offset: 0,
+            kv_quantized: true,
+            kv_quant_q8: true,
+            kv_quant_asym2: false,
+            kv_quant_asym3: false,
+            kv_quant_asym4: false,
+            kv_quant_fwht: false,
+            dn_quant: StateQuant::Q8,
+        };
+
+        validate_grouped_moe_prefill_session_batch_q8_state_contract(
+            &config,
+            &[q8_sig, q8_sig],
+            &plan,
+            "gfx1151",
+        )
+        .expect("A3B MQ4 control path uses grouped MoE with Q8 state");
+    }
+
+    #[test]
+    fn grouped_moe_session_fused_prefix_contract_rejects_wrong_model_or_state() {
+        let mut moe_config = test_qwen35_config_with_layers(vec![LayerType::LinearAttention]);
+        moe_config.num_experts = 256;
+        moe_config.num_experts_per_tok = 8;
+        moe_config.has_shared_expert = true;
+        let dense_config = test_qwen35_config_with_layers(vec![LayerType::LinearAttention]);
+        let plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10],
+                    start_pos: 0,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 0,
+                },
+            ],
+            8,
+        )
+        .expect("valid session execution plan");
+        let q8_sig = DensePrefillSessionBatchStateSignature {
+            kv_physical_cap: 512,
+            kv_compact_offset: 0,
+            kv_quantized: true,
+            kv_quant_q8: true,
+            kv_quant_asym2: false,
+            kv_quant_asym3: false,
+            kv_quant_asym4: false,
+            kv_quant_fwht: false,
+            dn_quant: StateQuant::Q8,
+        };
+
+        let dense_err = validate_grouped_moe_prefill_session_batch_q8_state_contract(
+            &dense_config,
+            &[q8_sig, q8_sig],
+            &plan,
+            "gfx1151",
+        )
+        .unwrap_err();
+        assert!(dense_err.contains("requires Qwen35 MoE/A3B weights"));
+
+        let fp32_kv = DensePrefillSessionBatchStateSignature {
+            kv_quantized: false,
+            kv_quant_q8: false,
+            dn_quant: StateQuant::FP32,
+            ..q8_sig
+        };
+        let fp32_err = validate_grouped_moe_prefill_session_batch_q8_state_contract(
+            &moe_config,
+            &[fp32_kv, fp32_kv],
+            &plan,
+            "gfx1151",
+        )
+        .unwrap_err();
+        assert!(fp32_err.contains("must use Q8 KV state"));
+
+        let asym_kv = DensePrefillSessionBatchStateSignature {
+            kv_quant_asym3: true,
+            ..q8_sig
+        };
+        let asym_err = validate_grouped_moe_prefill_session_batch_q8_state_contract(
+            &moe_config,
+            &[asym_kv, asym_kv],
+            &plan,
+            "gfx1151",
+        )
+        .unwrap_err();
+        assert!(asym_err.contains("unsupported KV quantization flags"));
+
+        let arch_err = validate_grouped_moe_prefill_session_batch_q8_state_contract(
+            &moe_config,
+            &[q8_sig, q8_sig],
+            &plan,
+            "gfx942",
+        )
+        .unwrap_err();
+        assert!(arch_err.contains("requires an RDNA grouped-MoE target"));
+    }
+
+    #[test]
+    fn dense_session_prefill_pointer_table_shape_sizes_prefix_tables() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let route_shape = expected_dense_prefill_session_state_route_shape(&config);
+        let plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10, 11, 12],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[30, 31],
+                    start_pos: 2,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+
+        assert_eq!(
+            dense_prefill_session_batch_pointer_table_shape(&plan, route_shape, 3),
+            DensePrefillSessionBatchPointerTableShape {
+                sessions: 3,
+                multi_state_prefix_rounds: 2,
+                multi_state_prefix_rows: 5,
+                max_rows_per_round: 3,
+                kv_k_ptrs: 12,
+                kv_v_ptrs: 12,
+                dn_s_ptrs: 6,
+                dn_scale_ptrs: 6,
+                dn_conv_ptrs: 6,
+                logits_ptrs: 3,
+                session_last_row_indices: 3,
+                row_session_indices: 5,
+                row_tokens: 5,
+                row_positions: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn dense_session_prefill_pointer_table_plan_maps_slots_to_sessions_and_rows() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let route_shape = expected_dense_prefill_session_state_route_shape(&config);
+        let plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10, 11, 12],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[30, 31],
+                    start_pos: 2,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+        let tables = dense_prefill_session_batch_pointer_table_plan(&plan, route_shape, 3);
+
+        assert_eq!(tables.kv_layer_slots.len(), 12);
+        assert_eq!(
+            tables.kv_layer_slots[7],
+            DensePrefillSessionBatchLayerPointerSlot {
+                session_index: 1,
+                layer_index: 3,
+            }
+        );
+        assert_eq!(tables.dn_layer_slots.len(), 6);
+        assert_eq!(
+            tables.dn_layer_slots[4],
+            DensePrefillSessionBatchDeltaPointerSlot {
+                session_index: 2,
+                delta_layer_index: 0,
+            }
+        );
+        assert_eq!(tables.logits_slots, vec![0, 1, 2]);
+        assert_eq!(
+            tables.prefix_rows,
+            vec![
+                DensePrefillSessionBatchPrefixRowSlot {
+                    round_index: 0,
+                    round_row_index: 0,
+                    session_index: 0,
+                    token_index: 0,
+                    token: 10,
+                    position: 4,
+                },
+                DensePrefillSessionBatchPrefixRowSlot {
+                    round_index: 0,
+                    round_row_index: 1,
+                    session_index: 1,
+                    token_index: 0,
+                    token: 20,
+                    position: 9,
+                },
+                DensePrefillSessionBatchPrefixRowSlot {
+                    round_index: 0,
+                    round_row_index: 2,
+                    session_index: 2,
+                    token_index: 0,
+                    token: 30,
+                    position: 2,
+                },
+                DensePrefillSessionBatchPrefixRowSlot {
+                    round_index: 1,
+                    round_row_index: 0,
+                    session_index: 0,
+                    token_index: 1,
+                    token: 11,
+                    position: 5,
+                },
+                DensePrefillSessionBatchPrefixRowSlot {
+                    round_index: 1,
+                    round_row_index: 1,
+                    session_index: 2,
+                    token_index: 1,
+                    token: 31,
+                    position: 3,
+                },
+            ]
+        );
+        assert_eq!(tables.session_last_row_indices, vec![3, 1, 4]);
+        let (tokens, positions) =
+            dense_prefill_session_batch_prefix_tokens_positions(&tables).unwrap();
+        assert_eq!(tokens, vec![10, 20, 30, 11, 31]);
+        assert_eq!(positions, vec![4, 9, 2, 5, 3]);
+    }
+
+    #[test]
+    fn dense_session_prefill_prefix_metadata_rejects_bad_last_row() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let route_shape = expected_dense_prefill_session_state_route_shape(&config);
+        let plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10, 11],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+        let mut tables = dense_prefill_session_batch_pointer_table_plan(&plan, route_shape, 2);
+
+        tables.session_last_row_indices[0] = 1;
+        let err = dense_prefill_session_batch_prefix_tokens_positions(&tables).unwrap_err();
+        assert!(err.contains("last row 1 belongs to session 1"));
+
+        tables.session_last_row_indices[0] = 9;
+        let err = dense_prefill_session_batch_prefix_tokens_positions(&tables).unwrap_err();
+        assert!(err.contains("last row 9 out of range"));
+    }
+
+    #[test]
+    fn dense_session_prefill_host_pointer_tables_materialize_real_route_order() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let route_shape = expected_dense_prefill_session_state_route_shape(&config);
+        let execution_plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10, 11],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+        let table_plan =
+            dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, 2);
+
+        let s0_k = vec![
+            fake_tensor(0x1000),
+            fake_tensor(0x1001),
+            fake_tensor(0x1002),
+            fake_tensor(0x1003),
+        ];
+        let s0_v = vec![
+            fake_tensor(0x2000),
+            fake_tensor(0x2001),
+            fake_tensor(0x2002),
+            fake_tensor(0x2003),
+        ];
+        let s0_dn_s = vec![fake_tensor(0x3000), fake_tensor(0x3001)];
+        let s0_dn_sc = vec![fake_tensor(0x4000), fake_tensor(0x4001)];
+        let s0_dn_conv = vec![fake_tensor(0x5000), fake_tensor(0x5001)];
+        let s0_logits = fake_tensor(0x6000);
+
+        let s1_k = vec![
+            fake_tensor(0x7000),
+            fake_tensor(0x7001),
+            fake_tensor(0x7002),
+            fake_tensor(0x7003),
+        ];
+        let s1_v = vec![
+            fake_tensor(0x8000),
+            fake_tensor(0x8001),
+            fake_tensor(0x8002),
+            fake_tensor(0x8003),
+        ];
+        let s1_dn_s = vec![fake_tensor(0x9000), fake_tensor(0x9001)];
+        let s1_dn_sc = vec![fake_tensor(0xA000), fake_tensor(0xA001)];
+        let s1_dn_conv = vec![fake_tensor(0xB000), fake_tensor(0xB001)];
+        let s1_logits = fake_tensor(0xC000);
+
+        let routes = vec![
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &s0_k,
+                    v_gpu: &s0_v,
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &s0_dn_s,
+                    s_scales: &s0_dn_sc,
+                    conv_states: &s0_dn_conv,
+                    quant: StateQuant::Q8,
+                },
+                logits: &s0_logits,
+            },
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &s1_k,
+                    v_gpu: &s1_v,
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &s1_dn_s,
+                    s_scales: &s1_dn_sc,
+                    conv_states: &s1_dn_conv,
+                    quant: StateQuant::Q8,
+                },
+                logits: &s1_logits,
+            },
+        ];
+
+        let tables = dense_prefill_session_batch_host_pointer_tables(&table_plan, &routes)
+            .expect("host pointer tables");
+
+        assert_eq!(
+            tables.kv_k_ptrs,
+            vec![0x1000, 0x1001, 0x1002, 0x1003, 0x7000, 0x7001, 0x7002, 0x7003,]
+        );
+        assert_eq!(
+            tables.kv_v_ptrs,
+            vec![0x2000, 0x2001, 0x2002, 0x2003, 0x8000, 0x8001, 0x8002, 0x8003,]
+        );
+        assert_eq!(tables.dn_s_ptrs, vec![0x3000, 0x3001, 0x9000, 0x9001]);
+        assert_eq!(tables.dn_scale_ptrs, vec![0x4000, 0x4001, 0xA000, 0xA001]);
+        assert_eq!(tables.dn_conv_ptrs, vec![0x5000, 0x5001, 0xB000, 0xB001]);
+        assert_eq!(tables.logits_ptrs, vec![0x6000, 0xC000]);
+        assert_eq!(tables.session_last_row_indices, vec![0, 1]);
+        assert_eq!(tables.row_session_indices, vec![0, 1]);
+        assert_eq!(tables.row_tokens, vec![10, 20]);
+        assert_eq!(tables.row_positions, vec![4, 9]);
+    }
+
+    #[test]
+    fn dense_session_prefill_host_pointer_tables_reject_missing_scale_route() {
+        let config = test_qwen35_config_with_layers(vec![
+            LayerType::LinearAttention,
+            LayerType::FullAttention,
+        ]);
+        let route_shape = expected_dense_prefill_session_state_route_shape(&config);
+        let execution_plan = build_dense_prefill_session_batch_execution_plan(
+            &[
+                DensePrefillSessionBatchInput {
+                    tokens: &[10],
+                    start_pos: 4,
+                },
+                DensePrefillSessionBatchInput {
+                    tokens: &[20],
+                    start_pos: 9,
+                },
+            ],
+            8,
+        )
+        .expect("valid dense session execution plan");
+        let table_plan =
+            dense_prefill_session_batch_pointer_table_plan(&execution_plan, route_shape, 2);
+
+        let s0_k = vec![fake_tensor(0x1000), fake_tensor(0x1001)];
+        let s0_v = vec![fake_tensor(0x2000), fake_tensor(0x2001)];
+        let s0_dn_s = vec![fake_tensor(0x3000)];
+        let s0_dn_conv = vec![fake_tensor(0x5000)];
+        let s0_logits = fake_tensor(0x6000);
+
+        let s1_k = vec![fake_tensor(0x7000), fake_tensor(0x7001)];
+        let s1_v = vec![fake_tensor(0x8000), fake_tensor(0x8001)];
+        let s1_dn_s = vec![fake_tensor(0x9000)];
+        let s1_dn_sc = vec![fake_tensor(0xA000)];
+        let s1_dn_conv = vec![fake_tensor(0xB000)];
+        let s1_logits = fake_tensor(0xC000);
+
+        let routes = vec![
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &s0_k,
+                    v_gpu: &s0_v,
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &s0_dn_s,
+                    s_scales: &[],
+                    conv_states: &s0_dn_conv,
+                    quant: StateQuant::Q8,
+                },
+                logits: &s0_logits,
+            },
+            DensePrefillSessionStateRoute {
+                kv: DensePrefillSessionKvStateRoute {
+                    k_gpu: &s1_k,
+                    v_gpu: &s1_v,
+                    physical_cap: 512,
+                    compact_offset: 0,
+                },
+                delta: DensePrefillSessionDeltaStateRoute {
+                    s_matrices: &s1_dn_s,
+                    s_scales: &s1_dn_sc,
+                    conv_states: &s1_dn_conv,
+                    quant: StateQuant::Q8,
+                },
+                logits: &s1_logits,
+            },
+        ];
+
+        let err =
+            dense_prefill_session_batch_host_pointer_tables(&table_plan, &routes).unwrap_err();
+        assert!(err.contains("DeltaNet scale slot references missing layer 0"));
+    }
+
+    #[test]
+    fn dense_session_prefill_pointer_table_indices_are_deterministic() {
+        let shape = DensePrefillSessionBatchPointerTableShape {
+            sessions: 3,
+            multi_state_prefix_rounds: 2,
+            multi_state_prefix_rows: 5,
+            max_rows_per_round: 3,
+            kv_k_ptrs: 12,
+            kv_v_ptrs: 12,
+            dn_s_ptrs: 6,
+            dn_scale_ptrs: 6,
+            dn_conv_ptrs: 6,
+            logits_ptrs: 3,
+            session_last_row_indices: 3,
+            row_session_indices: 5,
+            row_tokens: 5,
+            row_positions: 5,
+        };
+
+        assert_eq!(
+            shape.index_for_session_layer(2, 3, 1).unwrap(),
+            DensePrefillSessionBatchPointerTableIndex {
+                kv_k_offset: 11,
+                kv_v_offset: 11,
+                dn_s_offset: 5,
+                dn_scale_offset: 5,
+                dn_conv_offset: 5,
+                logits_offset: 2,
+            }
+        );
+        assert_eq!(shape.index_for_prefix_row(4).unwrap(), (4, 4, 4));
+
+        assert!(shape
+            .index_for_session_layer(3, 0, 0)
+            .unwrap_err()
+            .contains("session_index 3 out of range"));
+        assert!(shape
+            .index_for_session_layer(0, 4, 0)
+            .unwrap_err()
+            .contains("kv_layer_index 4 out of range"));
+        assert!(shape
+            .index_for_session_layer(0, 0, 2)
+            .unwrap_err()
+            .contains("dn_layer_index 2 out of range"));
+        assert!(shape
+            .index_for_prefix_row(5)
+            .unwrap_err()
+            .contains("prefix_row_index 5 out of range"));
     }
 
     #[test]

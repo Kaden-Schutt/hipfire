@@ -2370,11 +2370,23 @@ pub const ATTENTION_Q8_0_KV_SRC: &str = include_str!("../../../kernels/src/atten
 pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip");
 
+/// Routed batched counterpart of ATTENTION_Q8_0_KV_SRC. Processes independent
+/// request-session rows via per-session K/V pointer tables and per-row causal
+/// windows from a positions[] array.
+pub const ATTENTION_Q8_0_ROUTED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_routed_batched.hip");
+
 /// Batched counterpart of ATTENTION_SRC for unquantized FP32 KV cache.
 /// Processes N queries in one launch with per-row causal windows from a
 /// positions[] array.
 pub const ATTENTION_F32_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_f32_batched.hip");
+
+/// Routed batched counterpart of ATTENTION_SRC for unquantized FP32 KV cache.
+/// Processes independent request-session rows via per-session K/V pointer
+/// tables and per-row causal windows from a positions[] array.
+pub const ATTENTION_F32_ROUTED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_f32_routed_batched.hip");
 
 /// Phase-timed variant of ATTENTION_Q8_0_KV_SRC. Functionally equivalent
 /// to the baseline kernel but instrumented with wall_clock64() around each
@@ -2754,12 +2766,26 @@ pub const GATED_NORM_SRC: &str = include_str!("../../../kernels/src/gated_norm.h
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_delta_net.hip");
 
+/// Routed FP32 Gated Delta Net for independent request sessions. One block per
+/// session/head/S-tile scans round-major prefix rows and updates only that
+/// session's recurrent S state.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_F32_ROUTED_BATCH_SEQ_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_f32_routed_batch_seq.hip");
+
 /// GDN Q8 — tiled LDS + warp-shuffle. Dequant tile into LDS, recurrence, requant back.
 /// Tile = TILE_ROWS × 128 × 4B = 4KB. Same tiling as FP32 variant.
 /// Grid: [n_heads, HD/TILE_ROWS]. Block: [32].
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_Q8_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_q8.hip");
+
+/// Routed Q8 Gated Delta Net for independent request sessions. One block per
+/// session/head/S-tile scans round-major prefix rows and updates only that
+/// session's recurrent Q8 S state.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_Q8_ROUTED_BATCH_SEQ_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_q8_routed_batch_seq.hip");
 
 /// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
 /// to a caller-owned tape buffer, so sibling tokens read the parent's
@@ -2802,6 +2828,11 @@ pub const CONV1D_SILU_SRC: &str = include_str!("../../../kernels/src/conv1d_silu
 #[cfg(feature = "deltanet")]
 pub const CONV1D_SILU_SPLIT_SRC: &str = include_str!("../../../kernels/src/conv1d_silu_split.hip");
 
+/// Routed conv1d + SiLU + Q/K/V split for independent request sessions.
+#[cfg(feature = "deltanet")]
+pub const CONV1D_SILU_SPLIT_ROUTED_SRC: &str =
+    include_str!("../../../kernels/src/conv1d_silu_split_routed.hip");
+
 /// Tree-aware variant of conv1d_silu_split. Each in-block token walks its
 /// ancestor chain via parent_indices[] for the 3-tap causal window, falling
 /// back to pre-block conv_state when the chain exits the block. Leaves
@@ -2824,6 +2855,17 @@ pub const KV_CACHE_WRITE_SRC: &str = include_str!("../../../kernels/src/kv_cache
 pub const KV_CACHE_WRITE_F32_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_f32_batched.hip");
 
+/// Routed batched F32 KV cache write: scatter `batch_size` rows into
+/// per-session cache pointers selected by row_session_indices. Used by
+/// session-batched prefill.
+pub const KV_CACHE_WRITE_F32_ROUTED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_f32_routed_batched.hip");
+
+/// Routed batched Q8_0 KV cache write: quantize `batch_size` rows into
+/// per-session Q8_0 cache pointers selected by row_session_indices.
+pub const KV_CACHE_WRITE_Q8_0_ROUTED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_q8_0_routed_batched.hip");
+
 /// GPU-side top-K + top-P sampling. Eliminates 600KB logits download per token.
 /// Single block, 256 threads. Returns token ID + RNG state (8 bytes vs 600KB).
 ///
@@ -2831,6 +2873,11 @@ pub const KV_CACHE_WRITE_F32_BATCHED_SRC: &str =
 /// Phase 2: Threshold filter — collect candidates within 30*temp of max (atomic shared counter).
 /// Phase 3: Thread 0 softmax + sort + top-p + sample on the small candidate set.
 pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top_p.hip");
+
+/// Scatter final per-session logits rows from a batch logits tensor into
+/// persistent session logits snapshots.
+pub const SCATTER_SESSION_LAST_LOGITS_SRC: &str =
+    include_str!("../../../kernels/src/scatter_session_last_logits.hip");
 
 /// Per-row temperature-scaled softmax probability gather. For each row r,
 /// returns the softmax prob of `indices[r]` under temp-scaled row logits.

@@ -527,6 +527,94 @@ struct GenerateBatchPrefillStateHandle {
     cached_prefix_tokens: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerateBatchPrefillPlan {
+    SerialExact,
+    FusedDenseQwen35Candidate,
+    GroupedMoeQwen35Candidate,
+}
+
+impl GenerateBatchPrefillPlan {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SerialExact => "serial_exact",
+            Self::FusedDenseQwen35Candidate => "fused_dense_qwen35_candidate",
+            Self::GroupedMoeQwen35Candidate => "grouped_moe_qwen35_candidate",
+        }
+    }
+}
+
+fn plan_generate_batch_prefill_qwen35(
+    arch_id: u32,
+    envelope: &GenerateBatchPrefillEnvelope,
+) -> GenerateBatchPrefillPlan {
+    match (arch_id, envelope.session_count > 1) {
+        (5, true) => GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+        (6, true) => GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
+        _ => GenerateBatchPrefillPlan::SerialExact,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Qwen35PrefillBatchBackend {
+    SerialReference,
+    FusedDense,
+    FusedGroupedMoe,
+}
+
+impl Qwen35PrefillBatchBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SerialReference => "serial_reference",
+            Self::FusedDense => "fused_dense",
+            Self::FusedGroupedMoe => "fused_grouped_moe",
+        }
+    }
+}
+
+fn select_qwen35_prefill_batch_backend(
+    plan: GenerateBatchPrefillPlan,
+    requested: Option<&str>,
+) -> Result<Qwen35PrefillBatchBackend, String> {
+    match requested.unwrap_or("auto") {
+        "auto" | "" => match plan {
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate => {
+                Ok(Qwen35PrefillBatchBackend::FusedDense)
+            }
+            GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate => {
+                Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
+            }
+            GenerateBatchPrefillPlan::SerialExact => Ok(Qwen35PrefillBatchBackend::SerialReference),
+        },
+        "serial" | "serial_reference" => Ok(Qwen35PrefillBatchBackend::SerialReference),
+        "fused" | "fused_dense" => {
+            if plan == GenerateBatchPrefillPlan::FusedDenseQwen35Candidate {
+                Ok(Qwen35PrefillBatchBackend::FusedDense)
+            } else if plan == GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
+                Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
+            } else {
+                Err(format!(
+                    "qwen35 fused prefill-session batch requested, but plan={} is not fused-eligible",
+                    plan.as_str()
+                ))
+            }
+        }
+        "fused_moe" | "grouped_moe" | "fused_grouped_moe" => {
+            if plan == GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
+                Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
+            } else {
+                Err(format!(
+                    "qwen35 grouped-MoE fused prefill-session batch requested, but plan={} is not grouped-MoE eligible",
+                    plan.as_str()
+                ))
+            }
+        }
+        other => Err(format!(
+            "unsupported HIPFIRE_QWEN35_PREFILL_SESSION_BATCH={other}; expected auto, serial, fused, or fused_moe"
+        )),
+    }
+}
+
 fn parse_assistant_prefix_label(
     label: Option<&str>,
 ) -> hipfire_runtime::prompt_frame::AssistantPrefix {
@@ -759,6 +847,23 @@ fn emit_generate_batch_prefill_ready(
         "supported": true,
         "mode": "qwen35_serial_exact_token_prefill",
         "reason": "qwen35_serial_exact_token_prefill_available",
+    });
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
+fn emit_generate_batch_prefill_unsupported(
+    stdout: &mut std::io::Stdout,
+    envelope: &GenerateBatchPrefillEnvelope,
+    reason: &str,
+) {
+    let line = serde_json::json!({
+        "type": "generate_batch_prefill_unsupported",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "sessions": envelope.session_count,
+        "supported": false,
+        "reason": reason,
     });
     let _ = writeln!(stdout, "{line}");
     let _ = stdout.flush();
@@ -1041,6 +1146,353 @@ mod generate_batch_prefill_tests {
         let err_none = validate_generate_batch_prefill(&msg_none).unwrap_err();
         assert!(err_none.contains("exactly one"));
     }
+
+    #[test]
+    fn plans_dense_qwen35_multi_session_as_fused_candidate() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "prefill",
+            "batch_id": "batch",
+            "worker_key_id": "worker-a",
+            "sessions": [
+                {
+                    "id": "req-1",
+                    "prompt": "hello",
+                    "state_handle": {
+                        "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                        "logical_position": 0
+                    }
+                },
+                {
+                    "id": "req-2",
+                    "prompt": "world",
+                    "state_handle": {
+                        "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                        "logical_position": 0
+                    }
+                }
+            ]
+        });
+
+        let envelope = validate_generate_batch_prefill(&msg).expect("valid envelope");
+        assert_eq!(
+            plan_generate_batch_prefill_qwen35(5, &envelope),
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate
+        );
+    }
+
+    #[test]
+    fn keeps_singletons_serial_and_marks_moe_as_grouped_candidate() {
+        let singleton = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "prefill",
+            "batch_id": "batch",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "hello",
+                "state_handle": {
+                    "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                    "logical_position": 0
+                }
+            }]
+        });
+        let singleton = validate_generate_batch_prefill(&singleton).expect("valid envelope");
+        assert_eq!(
+            plan_generate_batch_prefill_qwen35(5, &singleton),
+            GenerateBatchPrefillPlan::SerialExact
+        );
+
+        let moe = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "prefill",
+            "batch_id": "batch",
+            "worker_key_id": "worker-a",
+            "sessions": [
+                {
+                    "id": "req-1",
+                    "prompt": "hello",
+                    "state_handle": {
+                        "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                        "logical_position": 0
+                    }
+                },
+                {
+                    "id": "req-2",
+                    "prompt": "world",
+                    "state_handle": {
+                        "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                        "logical_position": 0
+                    }
+                }
+            ]
+        });
+        let moe = validate_generate_batch_prefill(&moe).expect("valid envelope");
+        assert_eq!(
+            plan_generate_batch_prefill_qwen35(6, &moe),
+            GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate
+        );
+    }
+
+    #[test]
+    fn selects_fused_backend_by_default_for_fused_candidate_plans() {
+        assert_eq!(
+            select_qwen35_prefill_batch_backend(
+                GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+                None,
+            )
+            .unwrap(),
+            Qwen35PrefillBatchBackend::FusedDense
+        );
+        assert_eq!(
+            select_qwen35_prefill_batch_backend(
+                GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
+                None,
+            )
+            .unwrap(),
+            Qwen35PrefillBatchBackend::FusedGroupedMoe
+        );
+        assert_eq!(
+            select_qwen35_prefill_batch_backend(
+                GenerateBatchPrefillPlan::SerialExact,
+                Some("auto")
+            )
+            .unwrap(),
+            Qwen35PrefillBatchBackend::SerialReference
+        );
+    }
+
+    #[test]
+    fn admits_fused_backend_only_for_dense_fused_candidate_plan() {
+        assert_eq!(
+            select_qwen35_prefill_batch_backend(
+                GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+                Some("fused"),
+            )
+            .unwrap(),
+            Qwen35PrefillBatchBackend::FusedDense
+        );
+        let err = select_qwen35_prefill_batch_backend(
+            GenerateBatchPrefillPlan::SerialExact,
+            Some("fused"),
+        )
+        .unwrap_err();
+        assert!(err.contains("not fused-eligible"));
+        let moe_err = select_qwen35_prefill_batch_backend(
+            GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
+            Some("fused"),
+        )
+        .unwrap();
+        assert_eq!(moe_err, Qwen35PrefillBatchBackend::FusedGroupedMoe);
+    }
+
+    #[test]
+    fn admits_explicit_grouped_moe_backend_only_for_grouped_candidate_plan() {
+        assert_eq!(
+            select_qwen35_prefill_batch_backend(
+                GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
+                Some("fused_moe"),
+            )
+            .unwrap(),
+            Qwen35PrefillBatchBackend::FusedGroupedMoe
+        );
+        assert_eq!(
+            select_qwen35_prefill_batch_backend(
+                GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
+                Some("grouped_moe"),
+            )
+            .unwrap(),
+            Qwen35PrefillBatchBackend::FusedGroupedMoe
+        );
+        let dense_err = select_qwen35_prefill_batch_backend(
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+            Some("fused_moe"),
+        )
+        .unwrap_err();
+        assert!(dense_err.contains("not grouped-MoE eligible"));
+        let serial_err = select_qwen35_prefill_batch_backend(
+            GenerateBatchPrefillPlan::SerialExact,
+            Some("grouped_moe"),
+        )
+        .unwrap_err();
+        assert!(serial_err.contains("not grouped-MoE eligible"));
+    }
+
+    #[test]
+    fn fused_dense_preflight_rejects_non_fused_candidate_plan() {
+        let prepared = vec![Qwen35PreparedPrefillSession {
+            id: "req-1".to_string(),
+            tokens: vec![1, 2, 3],
+            cached_prefix_tokens: 0,
+            replay_as_generated_suffix: false,
+        }];
+
+        let err = validate_qwen35_fused_dense_prefill_batch_preflight(
+            &prepared,
+            GenerateBatchPrefillPlan::SerialExact,
+        )
+        .unwrap_err();
+        assert!(err.contains("requires plan=fused_dense_qwen35_candidate"));
+    }
+
+    #[test]
+    fn fused_dense_preflight_rejects_empty_session_token_slices() {
+        let prepared = vec![
+            Qwen35PreparedPrefillSession {
+                id: "req-1".to_string(),
+                tokens: Vec::new(),
+                cached_prefix_tokens: 0,
+                replay_as_generated_suffix: true,
+            },
+            Qwen35PreparedPrefillSession {
+                id: "req-2".to_string(),
+                tokens: vec![4],
+                cached_prefix_tokens: 0,
+                replay_as_generated_suffix: true,
+            },
+        ];
+
+        let err = validate_qwen35_fused_dense_prefill_batch_preflight(
+            &prepared,
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+        )
+        .unwrap_err();
+        assert!(err.contains("requires non-empty session token slices"));
+    }
+
+    #[test]
+    fn fused_dense_preflight_rejects_single_session_batches() {
+        let prepared = vec![Qwen35PreparedPrefillSession {
+            id: "req-1".to_string(),
+            tokens: vec![1, 2, 3],
+            cached_prefix_tokens: 0,
+            replay_as_generated_suffix: false,
+        }];
+
+        let err = validate_qwen35_fused_dense_prefill_batch_preflight(
+            &prepared,
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+        )
+        .unwrap_err();
+        assert!(err.contains("requires at least two sessions"));
+    }
+
+    #[test]
+    fn fused_dense_preflight_rejects_mixed_prompt_and_suffix_batches() {
+        let prepared = vec![
+            Qwen35PreparedPrefillSession {
+                id: "req-1".to_string(),
+                tokens: vec![1, 2, 3],
+                cached_prefix_tokens: 0,
+                replay_as_generated_suffix: false,
+            },
+            Qwen35PreparedPrefillSession {
+                id: "req-2".to_string(),
+                tokens: vec![4],
+                cached_prefix_tokens: 16,
+                replay_as_generated_suffix: true,
+            },
+        ];
+
+        let err = validate_qwen35_fused_dense_prefill_batch_preflight(
+            &prepared,
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot mix full-prompt prefill and generated-suffix replay"));
+    }
+
+    #[test]
+    fn fused_grouped_moe_preflight_uses_grouped_candidate_plan() {
+        let prepared = vec![
+            Qwen35PreparedPrefillSession {
+                id: "req-1".to_string(),
+                tokens: vec![1, 2, 3],
+                cached_prefix_tokens: 0,
+                replay_as_generated_suffix: false,
+            },
+            Qwen35PreparedPrefillSession {
+                id: "req-2".to_string(),
+                tokens: vec![4],
+                cached_prefix_tokens: 0,
+                replay_as_generated_suffix: false,
+            },
+        ];
+
+        validate_qwen35_fused_grouped_moe_prefill_batch_preflight(
+            &prepared,
+            GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
+        )
+        .expect("valid grouped-MoE preflight");
+        let err = validate_qwen35_fused_grouped_moe_prefill_batch_preflight(
+            &prepared,
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+        )
+        .unwrap_err();
+        assert!(err.contains("requires plan=grouped_moe_qwen35_candidate"));
+    }
+
+    #[test]
+    fn builds_dense_fused_worker_contract_for_prompt_batch() {
+        let prepared = vec![
+            Qwen35PreparedPrefillSession {
+                id: "req-1".to_string(),
+                tokens: vec![1, 2, 3],
+                cached_prefix_tokens: 0,
+                replay_as_generated_suffix: false,
+            },
+            Qwen35PreparedPrefillSession {
+                id: "req-2".to_string(),
+                tokens: vec![4, 5],
+                cached_prefix_tokens: 0,
+                replay_as_generated_suffix: false,
+            },
+        ];
+
+        let contract = build_qwen35_fused_dense_prefill_batch_contract(
+            &prepared,
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+        )
+        .expect("valid fused dense contract");
+        assert_eq!(contract.total_tokens, 5);
+        assert_eq!(
+            contract.input_kind,
+            Qwen35FusedDensePrefillInputKind::FullPrompt
+        );
+        assert_eq!(contract.sessions[0].id, "req-1");
+        assert_eq!(contract.sessions[1].tokens, &[4, 5]);
+    }
+
+    #[test]
+    fn builds_dense_fused_worker_contract_for_suffix_batch() {
+        let prepared = vec![
+            Qwen35PreparedPrefillSession {
+                id: "req-1".to_string(),
+                tokens: vec![11],
+                cached_prefix_tokens: 8,
+                replay_as_generated_suffix: true,
+            },
+            Qwen35PreparedPrefillSession {
+                id: "req-2".to_string(),
+                tokens: vec![12, 13],
+                cached_prefix_tokens: 8,
+                replay_as_generated_suffix: true,
+            },
+        ];
+
+        let contract = build_qwen35_fused_dense_prefill_batch_contract(
+            &prepared,
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+        )
+        .expect("valid fused dense suffix contract");
+        assert_eq!(contract.total_tokens, 3);
+        assert_eq!(
+            contract.input_kind,
+            Qwen35FusedDensePrefillInputKind::GeneratedSuffixReplay
+        );
+        assert_eq!(contract.sessions[0].cached_prefix_tokens, 8);
+        assert!(contract.sessions[1].replay_as_generated_suffix);
+    }
 }
 
 enum ImageSource<'a> {
@@ -1143,6 +1595,7 @@ struct LoadedModel {
     q35_state_quant: Option<hipfire_arch_qwen35::qwen35::StateQuant>,
     q35_sessions: std::collections::HashMap<String, Qwen35RequestSessionState>,
     q35_active_session_id: Option<String>,
+    q35_active_prefilled_generated_suffix_len: usize,
     // Qwen3 state
     llama_config: Option<llama::LlamaConfig>,
     llama_weights: Option<llama::LlamaWeights>,
@@ -1300,34 +1753,104 @@ struct Qwen35RequestSessionState {
     conversation_tokens: Vec<u32>,
     kv_cache: llama::KvCache,
     dn_state: DeltaNetState,
+    logits: rdna_compute::GpuTensor,
+    prefilled_generated_suffix_len: usize,
+}
+
+struct Qwen35PreparedPrefillSession {
+    id: String,
+    tokens: Vec<u32>,
+    cached_prefix_tokens: usize,
+    replay_as_generated_suffix: bool,
+}
+
+struct Qwen35PrefillSessionResult {
+    id: String,
+    prefill_tokens: usize,
+    logical_position: usize,
+    cached_prefix_tokens: usize,
+    debug_sample_token: Option<u32>,
+}
+
+struct Qwen35PrefillBatchResult {
+    mode: &'static str,
+    plan: GenerateBatchPrefillPlan,
+    backend: Qwen35PrefillBatchBackend,
+    total_prefill_tokens: usize,
+    sessions: Vec<Qwen35PrefillSessionResult>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Qwen35FusedDensePrefillInputKind {
+    FullPrompt,
+    GeneratedSuffixReplay,
+}
+
+struct Qwen35FusedDensePrefillSessionSpec<'a> {
+    id: &'a str,
+    tokens: &'a [u32],
+    cached_prefix_tokens: usize,
+    replay_as_generated_suffix: bool,
+}
+
+struct Qwen35FusedDensePrefillBatchContract<'a> {
+    input_kind: Qwen35FusedDensePrefillInputKind,
+    total_tokens: usize,
+    sessions: Vec<Qwen35FusedDensePrefillSessionSpec<'a>>,
 }
 
 impl Qwen35RequestSessionState {
-    fn take_from_loaded(m: &mut LoadedModel) -> Result<Self, &'static str> {
+    fn take_from_loaded(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<Self, String> {
         if m.kv_cache.is_none() {
-            return Err("qwen35 session missing KV cache");
+            return Err("qwen35 session missing KV cache".to_string());
         }
         if m.dn_state.is_none() {
-            return Err("qwen35 session missing DeltaNet state");
+            return Err("qwen35 session missing DeltaNet state".to_string());
         }
+        let scratch = m
+            .q35_scratch
+            .as_ref()
+            .ok_or_else(|| "qwen35 session missing scratch/logits".to_string())?;
+        let logits = gpu
+            .alloc_tensor(&scratch.logits.shape, scratch.logits.dtype)
+            .map_err(|e| format!("alloc qwen35 session logits snapshot: {e:?}"))?;
+        gpu.memcpy_dtod_auto(&logits.buf, &scratch.logits.buf, scratch.logits.buf.size())
+            .map_err(|e| format!("save qwen35 session logits snapshot: {e:?}"))?;
         Ok(Self {
             seq_pos: m.seq_pos,
             conversation_tokens: std::mem::take(&mut m.conversation_tokens),
             kv_cache: m.kv_cache.take().unwrap(),
             dn_state: m.dn_state.take().unwrap(),
+            logits,
+            prefilled_generated_suffix_len: m.q35_active_prefilled_generated_suffix_len,
         })
     }
 
-    fn restore_into_loaded(self, m: &mut LoadedModel) {
+    fn restore_into_loaded(
+        self,
+        m: &mut LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> Result<(), String> {
+        if let Some(scratch) = m.q35_scratch.as_ref() {
+            gpu.memcpy_dtod_auto(
+                &scratch.logits.buf,
+                &self.logits.buf,
+                scratch.logits.buf.size(),
+            )
+            .map_err(|e| format!("restore qwen35 session logits snapshot: {e:?}"))?;
+        }
         m.seq_pos = self.seq_pos;
         m.conversation_tokens = self.conversation_tokens;
         m.kv_cache = Some(self.kv_cache);
         m.dn_state = Some(self.dn_state);
+        m.q35_active_prefilled_generated_suffix_len = self.prefilled_generated_suffix_len;
+        Ok(())
     }
 
     fn reset(&mut self, gpu: &mut rdna_compute::Gpu) {
         self.seq_pos = 0;
         self.conversation_tokens.clear();
+        self.prefilled_generated_suffix_len = 0;
         for s in &self.dn_state.s_matrices {
             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
         }
@@ -1344,6 +1867,55 @@ impl Qwen35RequestSessionState {
 fn qwen35_session_resident(m: &LoadedModel, session_id: &str) -> bool {
     m.q35_active_session_id.as_deref() == Some(session_id)
         || m.q35_sessions.contains_key(session_id)
+}
+
+fn qwen35_request_session_count(m: &LoadedModel) -> usize {
+    let saved = m
+        .q35_sessions
+        .keys()
+        .filter(|id| id.as_str() != QWEN35_LEGACY_SESSION_ID)
+        .count();
+    let active = usize::from(
+        m.q35_active_session_id
+            .as_deref()
+            .is_some_and(|id| id != QWEN35_LEGACY_SESSION_ID),
+    );
+    saved + active
+}
+
+fn qwen35_release_sessions(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    session_ids: &[String],
+) -> Result<usize, String> {
+    if !(m.arch_id == 5 || m.arch_id == 6) || m.pp != 1 {
+        return Err(format!(
+            "release_sessions currently supports single-GPU qwen35/qwen35-moe only (arch_id={} pp={})",
+            m.arch_id, m.pp
+        ));
+    }
+
+    let mut released = 0usize;
+    for session_id in session_ids {
+        if session_id == QWEN35_LEGACY_SESSION_ID {
+            continue;
+        }
+        if m.q35_active_session_id.as_deref() == Some(session_id.as_str()) {
+            qwen35_save_active_session(m, gpu)?;
+        }
+        if m.q35_sessions.remove(session_id).is_some() {
+            released += 1;
+        }
+    }
+
+    if m.q35_active_session_id.is_none() {
+        let created = qwen35_activate_session(m, gpu, QWEN35_LEGACY_SESSION_ID)?;
+        if created {
+            qwen35_reset_active_session(m, gpu)?;
+        }
+    }
+
+    Ok(released)
 }
 
 fn qwen35_active_logical_position(m: &LoadedModel) -> Result<usize, String> {
@@ -1468,12 +2040,19 @@ fn qwen35_allocate_session_state(
         conversation_tokens: Vec::new(),
         kv_cache,
         dn_state,
+        logits: gpu
+            .alloc_tensor(&[config.vocab_size], rdna_compute::DType::F32)
+            .map_err(|e| format!("alloc qwen35 session logits snapshot: {e:?}"))?,
+        prefilled_generated_suffix_len: 0,
     })
 }
 
-fn qwen35_save_active_session(m: &mut LoadedModel) -> Result<(), String> {
+fn qwen35_save_active_session(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), String> {
     if let Some(active_id) = m.q35_active_session_id.take() {
-        let session = Qwen35RequestSessionState::take_from_loaded(m)
+        let session = Qwen35RequestSessionState::take_from_loaded(m, gpu)
             .map_err(|e| format!("failed to save active qwen35 session: {e}"))?;
         m.q35_sessions.insert(active_id, session);
     }
@@ -1489,12 +2068,12 @@ fn qwen35_activate_session(
         return Ok(false);
     }
     let existed = m.q35_sessions.contains_key(session_id);
-    qwen35_save_active_session(m)?;
+    qwen35_save_active_session(m, gpu)?;
     let session = match m.q35_sessions.remove(session_id) {
         Some(session) => session,
         None => qwen35_allocate_session_state(m, gpu)?,
     };
-    session.restore_into_loaded(m);
+    session.restore_into_loaded(m, gpu)?;
     m.q35_active_session_id = Some(session_id.to_string());
     Ok(!existed)
 }
@@ -1503,17 +2082,34 @@ fn qwen35_reset_active_session(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<(), String> {
-    let mut session = Qwen35RequestSessionState::take_from_loaded(m)
+    let mut session = Qwen35RequestSessionState::take_from_loaded(m, gpu)
         .map_err(|e| format!("failed to reset qwen35 session: {e}"))?;
     session.reset(gpu);
-    session.restore_into_loaded(m);
+    session.restore_into_loaded(m, gpu)?;
     Ok(())
+}
+
+fn qwen35_restore_or_error(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    session: Qwen35RequestSessionState,
+) {
+    if let Err(e) = session.restore_into_loaded(m, gpu) {
+        write_error(
+            stdout,
+            id,
+            &format!("failed to restore qwen35 request session: {e}"),
+        );
+    }
 }
 
 fn qwen35_prefill_active_session(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     tokens: &[u32],
+    replay_as_generated_suffix: bool,
 ) -> Result<usize, String> {
     if tokens.is_empty() {
         return Ok(0);
@@ -1546,13 +2142,30 @@ fn qwen35_prefill_active_session(
         .dn_state
         .as_mut()
         .ok_or_else(|| "qwen35 active session missing DeltaNet state".to_string())?;
-    let pos = m.seq_pos;
-    qwen35::forward_prefill_batch(
-        gpu, weights, config, tokens, pos, kv, dn, scratch, None, None, None, None,
-    )
-    .map_err(|e| format!("qwen35 forward_prefill_batch failed: {e:?}"))?;
-    m.seq_pos += tokens.len();
-    m.conversation_tokens.extend_from_slice(tokens);
+    if replay_as_generated_suffix {
+        for &token in tokens {
+            m.conversation_tokens.push(token);
+            qwen35::forward_scratch(gpu, weights, config, token, m.seq_pos, kv, dn, scratch)
+                .map_err(|e| format!("qwen35 forward_scratch suffix replay failed: {e:?}"))?;
+            m.seq_pos += 1;
+        }
+    } else {
+        let pos = m.seq_pos;
+        qwen35::forward_prefill_batch(
+            gpu, weights, config, tokens, pos, kv, dn, scratch, None, None, None, None,
+        )
+        .map_err(|e| format!("qwen35 forward_prefill_batch failed: {e:?}"))?;
+        m.seq_pos += tokens.len();
+        m.conversation_tokens.extend_from_slice(tokens);
+    }
+    gpu.hip
+        .device_synchronize()
+        .map_err(|e| format!("qwen35 batch-prefill session sync failed: {e:?}"))?;
+    m.q35_active_prefilled_generated_suffix_len = if replay_as_generated_suffix {
+        tokens.len()
+    } else {
+        0
+    };
     Ok(tokens.len())
 }
 
@@ -1646,6 +2259,563 @@ fn qwen35_materialize_batch_prefill_prompt(
     }
 }
 
+fn qwen35_prefill_suffix_batch(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    prepared: &[Qwen35PreparedPrefillSession],
+    plan: GenerateBatchPrefillPlan,
+    backend: Qwen35PrefillBatchBackend,
+) -> Result<Qwen35PrefillBatchResult, String> {
+    match backend {
+        Qwen35PrefillBatchBackend::SerialReference => {
+            qwen35_prefill_suffix_batch_serial_reference(m, gpu, prepared, plan, backend)
+        }
+        Qwen35PrefillBatchBackend::FusedDense => {
+            qwen35_prefill_suffix_batch_fused_dense(m, gpu, prepared, plan, backend)
+        }
+        Qwen35PrefillBatchBackend::FusedGroupedMoe => {
+            qwen35_prefill_suffix_batch_fused_grouped_moe(m, gpu, prepared, plan, backend)
+        }
+    }
+}
+
+fn qwen35_prefill_suffix_batch_fused_grouped_moe(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    prepared: &[Qwen35PreparedPrefillSession],
+    plan: GenerateBatchPrefillPlan,
+    backend: Qwen35PrefillBatchBackend,
+) -> Result<Qwen35PrefillBatchResult, String> {
+    if plan != GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
+        return Err(format!(
+            "qwen35 grouped-MoE fused prefill-session batch worker requires plan={}, got {}",
+            GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate.as_str(),
+            plan.as_str()
+        ));
+    }
+    validate_qwen35_fused_grouped_moe_prefill_batch_preflight(prepared, plan)?;
+    qwen35_save_active_session(m, gpu)?;
+    let config = m
+        .q35_config
+        .as_ref()
+        .ok_or_else(|| "qwen35 config missing".to_string())?;
+    if config.num_experts == 0 || !config.has_shared_expert {
+        return Err(
+            "qwen35 grouped-MoE fused prefill-session batch requires MoE/A3B weights".to_string(),
+        );
+    }
+    let weights = m
+        .q35_weights
+        .as_ref()
+        .ok_or_else(|| "qwen35 weights missing".to_string())?;
+    let mut owned_sessions: Vec<(String, Qwen35RequestSessionState)> =
+        Vec::with_capacity(prepared.len());
+    for spec in prepared {
+        let state = match m.q35_sessions.remove(&spec.id) {
+            Some(state) => state,
+            None => match qwen35_allocate_session_state(m, gpu) {
+                Ok(state) => state,
+                Err(e) => {
+                    for (restore_id, restore_state) in owned_sessions {
+                        m.q35_sessions.insert(restore_id, restore_state);
+                    }
+                    return Err(e);
+                }
+            },
+        };
+        if state.seq_pos + spec.tokens.len() > m.physical_cap {
+            let id = spec.id.to_string();
+            let seq_pos = state.seq_pos;
+            m.q35_sessions.insert(id.clone(), state);
+            for (restore_id, restore_state) in owned_sessions {
+                m.q35_sessions.insert(restore_id, restore_state);
+            }
+            return Err(format!(
+                "generate_batch_prefill exceeds loaded KV budget for session {}: seq_pos={} + prefill={} > physical_cap={}",
+                id,
+                seq_pos,
+                spec.tokens.len(),
+                m.physical_cap
+            ));
+        }
+        owned_sessions.push((spec.id.to_string(), state));
+    }
+
+    let worker_result = {
+        let scratch = m.q35_scratch.as_mut().ok_or_else(|| {
+            "qwen35 scratch missing; grouped-MoE fused prefill is pp=1 only".to_string()
+        })?;
+        let total_tokens = prepared.iter().map(|spec| spec.tokens.len()).sum::<usize>();
+        if scratch.prefill_batch.is_none() {
+            let max_batch = std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| v >= total_tokens)
+                .unwrap_or(total_tokens.max(256));
+            scratch.prefill_batch = Some(
+                qwen35::PrefillBatchScratch::new(gpu, config, max_batch).map_err(|e| {
+                    format!("allocate qwen35 grouped-MoE fused prefill scratch: {e:?}")
+                })?,
+            );
+        }
+        let pbs_max_batch = scratch.prefill_batch.as_ref().unwrap().max_batch;
+        if pbs_max_batch < total_tokens {
+            return Err(format!(
+                "qwen35 grouped-MoE fused prefill scratch max_batch={pbs_max_batch} is smaller than required fused rows {}; increase HIPFIRE_PREFILL_MAX_BATCH or restart the daemon",
+                total_tokens,
+            ));
+        }
+        let pbs = scratch.prefill_batch.as_ref().unwrap();
+        let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> = owned_sessions
+            .iter_mut()
+            .zip(prepared.iter())
+            .map(|((_, state), spec)| qwen35::DensePrefillSessionBatchRow {
+                tokens: &spec.tokens,
+                start_pos: state.seq_pos,
+                kv_cache: &mut state.kv_cache,
+                dn_state: &mut state.dn_state,
+                logits: &state.logits,
+            })
+            .collect();
+        qwen35::forward_prefill_grouped_moe_session_batch(
+            gpu, weights, config, &mut rows, scratch, pbs,
+        )
+    };
+
+    let shape = match worker_result {
+        Ok(shape) => shape,
+        Err(e) => {
+            for (id, state) in owned_sessions {
+                m.q35_sessions.insert(id, state);
+            }
+            return Err(format!(
+                "qwen35 grouped-MoE fused prefill-session batch backend failed: {e:?}; \
+                 use HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=auto or serial"
+            ));
+        }
+    };
+
+    let mut sessions = Vec::with_capacity(owned_sessions.len());
+    for ((id, mut state), spec) in owned_sessions.into_iter().zip(prepared.iter()) {
+        state.seq_pos += spec.tokens.len();
+        state.conversation_tokens.extend_from_slice(&spec.tokens);
+        state.prefilled_generated_suffix_len = if spec.replay_as_generated_suffix {
+            spec.tokens.len()
+        } else {
+            0
+        };
+        let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+        let debug_sample_token = if spec.replay_as_generated_suffix
+            && std::env::var_os("HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE").is_some()
+        {
+            let scratch = m.q35_scratch.as_ref().ok_or_else(|| {
+                "qwen35 scratch missing; fused grouped-MoE debug sampling unavailable".to_string()
+            })?;
+            let mut rng_state = 0x13579BDFu32;
+            let cfg = SamplerConfig {
+                temperature: 0.0,
+                top_p: 1.0,
+                repeat_window: 0,
+                repeat_penalty: 1.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                blocked_tokens: Vec::new(),
+            };
+            Some(sampler::sample(
+                gpu,
+                &state.logits,
+                &scratch.sample_buf,
+                &scratch.repeat_buf,
+                config.vocab_size,
+                &spec.tokens,
+                &cfg,
+                &mut rng_state,
+            ))
+        } else {
+            None
+        };
+        sessions.push(Qwen35PrefillSessionResult {
+            id: id.clone(),
+            prefill_tokens: spec.tokens.len(),
+            logical_position,
+            cached_prefix_tokens: spec.cached_prefix_tokens,
+            debug_sample_token,
+        });
+        m.q35_sessions.insert(id, state);
+    }
+
+    Ok(Qwen35PrefillBatchResult {
+        mode: if prepared[0].replay_as_generated_suffix {
+            "qwen35_fused_grouped_moe_suffix_replay"
+        } else {
+            "qwen35_fused_grouped_moe_prefill"
+        },
+        plan,
+        backend,
+        total_prefill_tokens: shape.total_tokens,
+        sessions,
+    })
+}
+
+fn validate_qwen35_fused_grouped_moe_prefill_batch_preflight(
+    prepared: &[Qwen35PreparedPrefillSession],
+    plan: GenerateBatchPrefillPlan,
+) -> Result<(), String> {
+    if plan != GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
+        return Err(format!(
+            "qwen35 grouped-MoE fused prefill-session batch worker requires plan={}, got {}",
+            GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate.as_str(),
+            plan.as_str()
+        ));
+    }
+    if prepared.len() < 2 {
+        return Err(
+            "qwen35 grouped-MoE fused prefill-session batch worker requires at least two sessions"
+                .to_string(),
+        );
+    }
+    if prepared.iter().any(|session| session.tokens.is_empty()) {
+        return Err(
+            "qwen35 grouped-MoE fused prefill-session batch worker requires non-empty session token slices"
+                .to_string(),
+        );
+    }
+    let replay_as_generated_suffix = prepared[0].replay_as_generated_suffix;
+    if prepared
+        .iter()
+        .any(|session| session.replay_as_generated_suffix != replay_as_generated_suffix)
+    {
+        return Err(
+            "qwen35 grouped-MoE fused prefill-session batch worker cannot mix full-prompt prefill and generated-suffix replay sessions"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn qwen35_prefill_suffix_batch_fused_dense(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    prepared: &[Qwen35PreparedPrefillSession],
+    plan: GenerateBatchPrefillPlan,
+    backend: Qwen35PrefillBatchBackend,
+) -> Result<Qwen35PrefillBatchResult, String> {
+    let contract = build_qwen35_fused_dense_prefill_batch_contract(prepared, plan)?;
+
+    // Worker API seam for the real dense implementation:
+    //
+    //   prefill_suffix_batch(&mut [&mut RequestSession])
+    //
+    // The serial-reference worker below owns the correctness oracle: every
+    // session has isolated KV, DeltaNet recurrent state, conversation tokens,
+    // and logits. The fused worker must preserve the same ownership contract.
+    //
+    // Do not call qwen35::forward_prefill_batch over concatenated session
+    // tokens here. That function batches rows inside ONE causal sequence and
+    // ONE DeltaNetState; using it across independent request sessions would
+    // leak KV/DN state and produce numerically plausible but wrong continuations.
+    //
+    // The next implementation step is an arch-level dense-Qwen35 session batch
+    // worker that accepts per-session KV/DN/logits handles and writes one
+    // independent result row per session.
+    qwen35_save_active_session(m, gpu)?;
+    let config = m
+        .q35_config
+        .as_ref()
+        .ok_or_else(|| "qwen35 config missing".to_string())?;
+    let weights = m
+        .q35_weights
+        .as_ref()
+        .ok_or_else(|| "qwen35 weights missing".to_string())?;
+    let mut owned_sessions: Vec<(String, Qwen35RequestSessionState)> =
+        Vec::with_capacity(contract.sessions.len());
+    for spec in &contract.sessions {
+        let state = match m.q35_sessions.remove(spec.id) {
+            Some(state) => state,
+            None => match qwen35_allocate_session_state(m, gpu) {
+                Ok(state) => state,
+                Err(e) => {
+                    for (restore_id, restore_state) in owned_sessions {
+                        m.q35_sessions.insert(restore_id, restore_state);
+                    }
+                    return Err(e);
+                }
+            },
+        };
+        if state.seq_pos + spec.tokens.len() > m.physical_cap {
+            let id = spec.id.to_string();
+            let seq_pos = state.seq_pos;
+            m.q35_sessions.insert(id.clone(), state);
+            for (restore_id, restore_state) in owned_sessions {
+                m.q35_sessions.insert(restore_id, restore_state);
+            }
+            return Err(format!(
+                "generate_batch_prefill exceeds loaded KV budget for session {}: seq_pos={} + prefill={} > physical_cap={}",
+                id,
+                seq_pos,
+                spec.tokens.len(),
+                m.physical_cap
+            ));
+        }
+        owned_sessions.push((spec.id.to_string(), state));
+    }
+
+    let worker_result = {
+        let scratch = m.q35_scratch.as_mut().ok_or_else(|| {
+            "qwen35 scratch missing; fused dense prefill is pp=1 only".to_string()
+        })?;
+        if scratch.prefill_batch.is_none() {
+            let max_batch = std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&v| v >= contract.total_tokens)
+                .unwrap_or(contract.total_tokens.max(256));
+            scratch.prefill_batch = Some(
+                qwen35::PrefillBatchScratch::new(gpu, config, max_batch)
+                    .map_err(|e| format!("allocate qwen35 fused dense prefill scratch: {e:?}"))?,
+            );
+        }
+        let pbs_max_batch = scratch.prefill_batch.as_ref().unwrap().max_batch;
+        if pbs_max_batch < contract.total_tokens {
+            return Err(format!(
+                "qwen35 fused dense prefill scratch max_batch={pbs_max_batch} is smaller than required fused rows {}; increase HIPFIRE_PREFILL_MAX_BATCH or restart the daemon",
+                contract.total_tokens,
+            ));
+        }
+        let pbs = scratch.prefill_batch.as_ref().unwrap();
+        let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> = owned_sessions
+            .iter_mut()
+            .zip(contract.sessions.iter())
+            .map(|((_, state), spec)| qwen35::DensePrefillSessionBatchRow {
+                tokens: spec.tokens,
+                start_pos: state.seq_pos,
+                kv_cache: &mut state.kv_cache,
+                dn_state: &mut state.dn_state,
+                logits: &state.logits,
+            })
+            .collect();
+        qwen35::forward_prefill_dense_session_batch(gpu, weights, config, &mut rows, scratch, pbs)
+    };
+
+    let shape = match worker_result {
+        Ok(shape) => shape,
+        Err(e) => {
+            for (id, state) in owned_sessions {
+                m.q35_sessions.insert(id, state);
+            }
+            return Err(format!(
+                "qwen35 fused dense prefill-session batch backend failed: {e:?}; \
+                 use HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=auto or serial"
+            ));
+        }
+    };
+
+    let mut sessions = Vec::with_capacity(owned_sessions.len());
+    for ((id, mut state), spec) in owned_sessions.into_iter().zip(contract.sessions.iter()) {
+        state.seq_pos += spec.tokens.len();
+        state.conversation_tokens.extend_from_slice(spec.tokens);
+        state.prefilled_generated_suffix_len = if spec.replay_as_generated_suffix {
+            spec.tokens.len()
+        } else {
+            0
+        };
+        let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+        let debug_sample_token = if spec.replay_as_generated_suffix
+            && std::env::var_os("HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE").is_some()
+        {
+            let scratch = m.q35_scratch.as_ref().ok_or_else(|| {
+                "qwen35 scratch missing; fused dense debug sampling unavailable".to_string()
+            })?;
+            let mut rng_state = 0x13579BDFu32;
+            let cfg = SamplerConfig {
+                temperature: 0.0,
+                top_p: 1.0,
+                repeat_window: 0,
+                repeat_penalty: 1.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                blocked_tokens: Vec::new(),
+            };
+            Some(sampler::sample(
+                gpu,
+                &state.logits,
+                &scratch.sample_buf,
+                &scratch.repeat_buf,
+                config.vocab_size,
+                spec.tokens,
+                &cfg,
+                &mut rng_state,
+            ))
+        } else {
+            None
+        };
+        sessions.push(Qwen35PrefillSessionResult {
+            id: id.clone(),
+            prefill_tokens: spec.tokens.len(),
+            logical_position,
+            cached_prefix_tokens: spec.cached_prefix_tokens,
+            debug_sample_token,
+        });
+        m.q35_sessions.insert(id, state);
+    }
+
+    Ok(Qwen35PrefillBatchResult {
+        mode: match contract.input_kind {
+            Qwen35FusedDensePrefillInputKind::FullPrompt => "qwen35_fused_dense_prefill",
+            Qwen35FusedDensePrefillInputKind::GeneratedSuffixReplay => {
+                "qwen35_fused_dense_suffix_replay"
+            }
+        },
+        plan,
+        backend,
+        total_prefill_tokens: shape.total_tokens,
+        sessions,
+    })
+}
+
+fn validate_qwen35_fused_dense_prefill_batch_preflight(
+    prepared: &[Qwen35PreparedPrefillSession],
+    plan: GenerateBatchPrefillPlan,
+) -> Result<(), String> {
+    if plan != GenerateBatchPrefillPlan::FusedDenseQwen35Candidate {
+        return Err(format!(
+            "qwen35 fused dense prefill-session batch worker requires plan={}, got {}",
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate.as_str(),
+            plan.as_str()
+        ));
+    }
+    if prepared.len() < 2 {
+        return Err(
+            "qwen35 fused dense prefill-session batch worker requires at least two sessions"
+                .to_string(),
+        );
+    }
+    if prepared.iter().any(|session| session.tokens.is_empty()) {
+        return Err(
+            "qwen35 fused dense prefill-session batch worker requires non-empty session token slices"
+                .to_string(),
+        );
+    }
+    let replay_as_generated_suffix = prepared[0].replay_as_generated_suffix;
+    if prepared
+        .iter()
+        .any(|session| session.replay_as_generated_suffix != replay_as_generated_suffix)
+    {
+        return Err(
+            "qwen35 fused dense prefill-session batch worker cannot mix full-prompt prefill and generated-suffix replay sessions"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn build_qwen35_fused_dense_prefill_batch_contract<'a>(
+    prepared: &'a [Qwen35PreparedPrefillSession],
+    plan: GenerateBatchPrefillPlan,
+) -> Result<Qwen35FusedDensePrefillBatchContract<'a>, String> {
+    validate_qwen35_fused_dense_prefill_batch_preflight(prepared, plan)?;
+    let input_kind = if prepared[0].replay_as_generated_suffix {
+        Qwen35FusedDensePrefillInputKind::GeneratedSuffixReplay
+    } else {
+        Qwen35FusedDensePrefillInputKind::FullPrompt
+    };
+    let mut total_tokens = 0usize;
+    let sessions = prepared
+        .iter()
+        .map(|session| {
+            total_tokens += session.tokens.len();
+            Qwen35FusedDensePrefillSessionSpec {
+                id: &session.id,
+                tokens: &session.tokens,
+                cached_prefix_tokens: session.cached_prefix_tokens,
+                replay_as_generated_suffix: session.replay_as_generated_suffix,
+            }
+        })
+        .collect();
+    Ok(Qwen35FusedDensePrefillBatchContract {
+        input_kind,
+        total_tokens,
+        sessions,
+    })
+}
+
+fn qwen35_prefill_suffix_batch_serial_reference(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    prepared: &[Qwen35PreparedPrefillSession],
+    plan: GenerateBatchPrefillPlan,
+    backend: Qwen35PrefillBatchBackend,
+) -> Result<Qwen35PrefillBatchResult, String> {
+    // Reference implementation: exact serial activation/prefill over isolated
+    // per-session KV + DeltaNet state. This is the correctness oracle for the
+    // future fused dense-Qwen35 path. Do not replace this with concatenating
+    // sessions into one `forward_prefill_batch` call: that would share one
+    // DeltaNet recurrent state and one causal sequence across independent
+    // requests.
+    let mut total_prefill_tokens = 0usize;
+    let mut results = Vec::with_capacity(prepared.len());
+    for session in prepared {
+        qwen35_activate_session(m, gpu, &session.id)?;
+        let prefilled = qwen35_prefill_active_session(
+            m,
+            gpu,
+            &session.tokens,
+            session.replay_as_generated_suffix,
+        )?;
+        let logical_position = qwen35_active_logical_position(m)?;
+        let debug_sample_token = if session.replay_as_generated_suffix
+            && std::env::var_os("HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE").is_some()
+        {
+            let config = m
+                .q35_config
+                .as_ref()
+                .ok_or_else(|| "qwen35 config missing".to_string())?;
+            let scratch = m.q35_scratch.as_ref().ok_or_else(|| {
+                "qwen35 scratch missing; PP batch-prefill is not supported".to_string()
+            })?;
+            let mut rng_state = 0x13579BDFu32;
+            let cfg = SamplerConfig {
+                temperature: 0.0,
+                top_p: 1.0,
+                repeat_window: 0,
+                repeat_penalty: 1.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                blocked_tokens: Vec::new(),
+            };
+            Some(sampler::sample(
+                gpu,
+                &scratch.logits,
+                &scratch.sample_buf,
+                &scratch.repeat_buf,
+                config.vocab_size,
+                &session.tokens,
+                &cfg,
+                &mut rng_state,
+            ))
+        } else {
+            None
+        };
+        qwen35_save_active_session(m, gpu)?;
+        total_prefill_tokens += prefilled;
+        results.push(Qwen35PrefillSessionResult {
+            id: session.id.clone(),
+            prefill_tokens: prefilled,
+            logical_position,
+            cached_prefix_tokens: session.cached_prefix_tokens,
+            debug_sample_token,
+        });
+    }
+
+    Ok(Qwen35PrefillBatchResult {
+        mode: "serial_prefill",
+        plan,
+        backend,
+        total_prefill_tokens,
+        sessions: results,
+    })
+}
+
 fn run_generate_batch_prefill_serial_qwen35(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -1676,18 +2846,23 @@ fn run_generate_batch_prefill_serial_qwen35(
         return Err("generate_batch_prefill does not support PFlash compression yet".to_string());
     }
 
+    let plan = plan_generate_batch_prefill_qwen35(m.arch_id, envelope);
+    let requested_backend = std::env::var("HIPFIRE_QWEN35_PREFILL_SESSION_BATCH").ok();
+    let backend = select_qwen35_prefill_batch_backend(plan, requested_backend.as_deref())?;
     let started = serde_json::json!({
         "type": "generate_batch_prefill_started",
         "id": envelope.id,
         "batch_id": envelope.batch_id,
         "sessions": envelope.session_count,
         "mode": "serial_prefill",
+        "plan": plan.as_str(),
+        "backend": backend.as_str(),
     });
     let _ = writeln!(stdout, "{started}");
     let _ = stdout.flush();
 
     let t0 = Instant::now();
-    let mut total_prefill_tokens = 0usize;
+    let mut prepared = Vec::with_capacity(envelope.sessions.len());
     for session in &envelope.sessions {
         if !session
             .state_handle
@@ -1755,19 +2930,38 @@ fn run_generate_batch_prefill_serial_qwen35(
             session.suffix_tokens.clone().unwrap_or_default()
         };
 
-        let prefilled = qwen35_prefill_active_session(m, gpu, &tokens)?;
-        total_prefill_tokens += prefilled;
-        let logical_position = qwen35_active_logical_position(m)?;
-        let line = serde_json::json!({
+        prepared.push(Qwen35PreparedPrefillSession {
+            id: session.id.clone(),
+            tokens,
+            cached_prefix_tokens: session.state_handle.cached_prefix_tokens,
+            replay_as_generated_suffix: session.suffix_tokens.is_some(),
+        });
+    }
+
+    let result = qwen35_prefill_suffix_batch(m, gpu, &prepared, plan, backend)?;
+    for session in &result.sessions {
+        let mut line = serde_json::json!({
             "type": "generate_batch_prefill_session_done",
             "id": envelope.id,
             "batch_id": envelope.batch_id,
             "session_id": session.id,
-            "prefill_tokens": prefilled,
-            "logical_position": logical_position,
-            "cached_prefix_tokens": session.state_handle.cached_prefix_tokens,
-            "mode": "serial_prefill",
+            "prefill_tokens": session.prefill_tokens,
+            "logical_position": session.logical_position,
+            "cached_prefix_tokens": session.cached_prefix_tokens,
+            "state_handle": {
+                "kind": "qwen35_session",
+                "runtime_state": "resident",
+                "session_id": session.id,
+                "logical_position": session.logical_position,
+                "cached_prefix_tokens": session.cached_prefix_tokens,
+            },
+            "mode": result.mode,
+            "plan": result.plan.as_str(),
+            "backend": result.backend.as_str(),
         });
+        if let Some(debug_sample_token) = session.debug_sample_token {
+            line["debug_sample_token"] = serde_json::json!(debug_sample_token);
+        }
         let _ = writeln!(stdout, "{line}");
         let _ = stdout.flush();
     }
@@ -1778,9 +2972,12 @@ fn run_generate_batch_prefill_serial_qwen35(
         "id": envelope.id,
         "batch_id": envelope.batch_id,
         "sessions": envelope.session_count,
-        "prefill_tokens": total_prefill_tokens,
+        "prefill_tokens": result.total_prefill_tokens,
         "elapsed_ms": elapsed_ms,
-        "mode": "serial_prefill",
+        "mode": result.mode,
+        "plan": result.plan.as_str(),
+        "backend": result.backend.as_str(),
+        "resident_sessions": qwen35_request_session_count(m),
     });
     let _ = writeln!(stdout, "{done}");
     let _ = stdout.flush();
@@ -2905,7 +4102,29 @@ fn main() {
             "generate_batch_prefill" => match validate_generate_batch_prefill(&msg) {
                 Ok(envelope) => {
                     if generate_batch_prefill_is_probe(&envelope) {
-                        emit_generate_batch_prefill_ready(&mut stdout, &envelope);
+                        match model.as_ref() {
+                            Some(m) if (m.arch_id == 5 || m.arch_id == 6) && m.pp == 1 => {
+                                emit_generate_batch_prefill_ready(&mut stdout, &envelope);
+                            }
+                            Some(m) => {
+                                let reason = format!(
+                                    "generate_batch_prefill currently supports qwen35/qwen35-moe only (arch_id={})",
+                                    m.arch_id
+                                );
+                                emit_generate_batch_prefill_unsupported(
+                                    &mut stdout,
+                                    &envelope,
+                                    &reason,
+                                );
+                            }
+                            None => {
+                                emit_generate_batch_prefill_unsupported(
+                                    &mut stdout,
+                                    &envelope,
+                                    "no model loaded",
+                                );
+                            }
+                        }
                         continue;
                     }
                     let m = match model.as_mut() {
@@ -2930,6 +4149,45 @@ fn main() {
                     emit_error_with_id(&mut stdout, id, e);
                 }
             },
+
+            "release_sessions" => {
+                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("release");
+                let sessions: Vec<String> = match msg.get("sessions").and_then(|v| v.as_array()) {
+                    Some(values) => values
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect(),
+                    None => {
+                        emit_error_with_id(
+                            &mut stdout,
+                            id,
+                            "release_sessions.sessions must be an array of session ids",
+                        );
+                        continue;
+                    }
+                };
+                let m = match model.as_mut() {
+                    Some(m) => m,
+                    None => {
+                        emit_error_with_id(&mut stdout, id, "no model loaded");
+                        continue;
+                    }
+                };
+                match qwen35_release_sessions(m, &mut gpu, &sessions) {
+                    Ok(released) => {
+                        let done = serde_json::json!({
+                            "type": "release_sessions_done",
+                            "id": id,
+                            "requested": sessions.len(),
+                            "released": released,
+                            "resident_sessions": qwen35_request_session_count(m),
+                        });
+                        let _ = writeln!(stdout, "{done}");
+                        let _ = stdout.flush();
+                    }
+                    Err(e) => emit_error_with_id(&mut stdout, id, e),
+                }
+            }
 
             "reset" => {
                 // Reset conversation state without unloading the model.
@@ -3779,6 +5037,7 @@ fn load_model(
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: None,
+            q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
@@ -3868,6 +5127,7 @@ fn load_model(
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: None,
+            q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
@@ -3978,6 +5238,7 @@ fn load_model(
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: None,
+            q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
@@ -4094,6 +5355,7 @@ fn load_model(
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: None,
+            q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
@@ -4223,6 +5485,7 @@ fn load_model(
                 q35_state_quant: None,
                 q35_sessions: std::collections::HashMap::new(),
                 q35_active_session_id: None,
+                q35_active_prefilled_generated_suffix_len: 0,
                 llama_config: None,
                 llama_weights: None,
                 llama_scratch: None,
@@ -4552,6 +5815,7 @@ fn load_model(
             q35_state_quant: Some(dn_quant),
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
+            q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
             llama_scratch: None,
@@ -4631,6 +5895,7 @@ fn load_model(
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: None,
+            q35_active_prefilled_generated_suffix_len: 0,
             llama_config: Some(config),
             llama_weights: Some(weights),
             llama_scratch: Some(scratch),
@@ -4801,6 +6066,7 @@ fn load_model_safetensors(
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: None,
+            q35_active_prefilled_generated_suffix_len: 0,
             llama_config: Some(config),
             llama_weights: Some(weights),
             llama_scratch: Some(scratch),
@@ -4912,6 +6178,7 @@ fn load_model_safetensors(
         q35_state_quant: Some(hipfire_arch_qwen35::qwen35::StateQuant::Q8),
         q35_sessions: std::collections::HashMap::new(),
         q35_active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
+        q35_active_prefilled_generated_suffix_len: 0,
         llama_config: None,
         llama_weights: None,
         llama_scratch: None,
@@ -5164,6 +6431,7 @@ fn load_model_pp(
         q35_state_quant: None,
         q35_sessions: std::collections::HashMap::new(),
         q35_active_session_id: None,
+        q35_active_prefilled_generated_suffix_len: 0,
         llama_config: None,
         llama_weights: None,
         llama_scratch: None,
@@ -7263,7 +8531,13 @@ fn generate(
 
     let is_qwen35_ar = m.arch_id == 5 || m.arch_id == 6;
     let mut q35_session = if is_qwen35_ar {
-        Some(Qwen35RequestSessionState::take_from_loaded(m).expect("qwen35 request session state"))
+        match Qwen35RequestSessionState::take_from_loaded(m, gpu) {
+            Ok(session) => Some(session),
+            Err(e) => {
+                write_error(stdout, id, &format!("qwen35 request session state: {e}"));
+                return;
+            }
+        }
     } else {
         None
     };
@@ -7622,7 +8896,7 @@ fn generate(
             );
             let _ = stdout.flush();
             if let Some(session) = q35_session.take() {
-                session.restore_into_loaded(m);
+                qwen35_restore_or_error(stdout, id, m, gpu, session);
             }
             return;
         }
@@ -7634,7 +8908,7 @@ fn generate(
         );
         let _ = stdout.flush();
         if let Some(session) = q35_session.take() {
-            session.restore_into_loaded(m);
+            qwen35_restore_or_error(stdout, id, m, gpu, session);
         }
         return;
     }
@@ -7682,7 +8956,7 @@ fn generate(
                         new_tokens.len()
                     ),
                 );
-                session.restore_into_loaded(m);
+                qwen35_restore_or_error(stdout, id, m, gpu, session);
                 return;
             }
         }
@@ -7771,7 +9045,15 @@ fn generate(
         // (names, numbers, facts) under MQ4/MQ6 quantizations that are more
         // RP-sensitive than llama.cpp's Q4_K. First sample: empty scope (no
         // generated tokens yet); subsequent samples: generated-so-far only.
-        let ngram_scope_start = session.conversation_tokens.len();
+        let ngram_scope_start = if prefill_already_done {
+            session
+                .conversation_tokens
+                .len()
+                .saturating_sub(session.prefilled_generated_suffix_len)
+        } else {
+            session.conversation_tokens.len()
+        };
+        session.prefilled_generated_suffix_len = 0;
 
         // Generate. GPU-side sampling eliminates per-token logits download +
         // CPU softmax + CPU repeat penalty. Closes the 2× gap between raw
@@ -8300,7 +9582,7 @@ fn generate(
             pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
         );
         let _ = stdout.flush();
-        session.restore_into_loaded(m);
+        qwen35_restore_or_error(stdout, id, m, gpu, session);
     } else {
         // Qwen3 / LLaMA path -- multi-turn aware
         let config = m.llama_config.as_ref().unwrap();
