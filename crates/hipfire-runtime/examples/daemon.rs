@@ -11668,17 +11668,34 @@ fn generate_gemma4(
             gemma4::LayerWeights::Sliding(l) => l.moe.is_some(),
             gemma4::LayerWeights::Full(l) => l.moe.is_some(),
         });
-        let use_batched = (gemma4::wmma_prefill_enabled() || gemma4::batched_prefill_enabled())
+        // Chunking lets >128-token prompts use batched projections instead of the
+        // CPU-submission-bound per-token forward_scratch path. The scalar batched
+        // path is coherent at any length (verified on the 1279-token prompt). The
+        // WMMA path's F16 projections corrupt the KV cache over multi-chunk prefill
+        // → attractor (verified: scalar-chunked coherent, wmma-chunked not), so
+        // WMMA is restricted to single-chunk (≤max_prefill_batch); longer WMMA
+        // prompts fall back to per-token (coherent). Long-context speedup is via
+        // HIPFIRE_BATCHED_PREFILL=1 (scalar) until the F16 precision issue is fixed.
+        let wmma = gemma4::wmma_prefill_enabled();
+        let single_chunk = prompt_ids.len() <= scratch.max_prefill_batch;
+        let use_batched = (wmma || gemma4::batched_prefill_enabled())
             && prompt_ids.len() >= 4
-            && prompt_ids.len() <= scratch.max_prefill_batch
-            && !has_moe;
+            && !has_moe
+            && (single_chunk || !wmma);
         if use_batched {
-            if let Err(e) = gemma4::forward_prefill_batch(
-                gpu, weights, config, &prompt_ids, 0,
-                kv_sliding, kv_full, scratch,
-            ) {
-                emit_error_with_id(stdout, id, format!("gemma4 batched prefill failed: {e:?}"));
-                return;
+            let chunk = scratch.max_prefill_batch.max(1);
+            let mut off = 0usize;
+            while off < prompt_ids.len() {
+                let end = (off + chunk).min(prompt_ids.len());
+                if let Err(e) = gemma4::forward_prefill_batch(
+                    gpu, weights, config, &prompt_ids[off..end], off,
+                    kv_sliding, kv_full, scratch,
+                ) {
+                    emit_error_with_id(stdout, id,
+                        format!("gemma4 batched prefill failed at chunk [{off}..{end}]: {e:?}"));
+                    return;
+                }
+                off = end;
             }
         } else {
             for (i, &tok) in prompt_ids.iter().enumerate() {
