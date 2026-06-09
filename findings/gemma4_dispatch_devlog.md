@@ -2708,3 +2708,68 @@ fall back to per-token decode. Per-token decode still coherent.
 where projections dominate. For long contexts (>512 tokens), per-token
 attention is the bottleneck. Next perf step: batched attention kernels
 for the long-context case.
+
+### Prefill timing measurements (12B-Q8, gfx1151)
+
+Added `prefill_ms`, `prefill_tok_s`, `decode_tok_s`, `ttft_ms` to the
+gemma4 done JSON output.
+
+**Short prompt (17 tokens, "What is France?"):**
+
+| Path | Prefill time | Prefill tok/s | Decode tok/s | TTFT |
+|---|---|---|---|---|
+| Per-token decode | 1041ms | 16.3 | 13.9 | 1041ms |
+| Batched scalar | 876ms | 19.4 | 15.7 | 876ms |
+| **WMMA batched** | **160ms** | **106.2** | **16.9** | **160ms** |
+
+WMMA is **6.5× faster** for short prefill. The TTFT drops from 1.04s
+to 0.16s. This is the headline result.
+
+**Long prompt (1279 tokens):**
+
+| Path | Prefill time | Prefill tok/s | Decode tok/s | TTFT |
+|---|---|---|---|---|
+| Per-token decode | 93610ms | 13.7 | 10.6 | 93.6s |
+| Batched scalar | 93659ms | 13.7 | 10.6 | 93.7s |
+| WMMA batched | 93668ms | 13.7 | 10.5 | 93.7s |
+
+No measurable improvement for long prefill. The per-token attention
+loop (1279 tokens × 48 layers × ~5 attention kernels each) dominates.
+Batched attention kernels are needed for long-context prefill perf.
+
+**rocprof kernel launch counts (short prompt):**
+
+| | Baseline | WMMA |
+|---|---|---|
+| Total launches | 36,934 | 15,304 |
+| GEMV/GEMM | 8,554 | 658 (330 GEMV + 328 WMMA) |
+| Attention | 2,496 | 2,496 |
+
+WMMA replaces 8,224 per-token GEMV launches with 328 batched GEMM
+launches. Attention is unchanged.
+
+**rocprof kernel profile (1279-token prompt):**
+
+| Category | Calls | Time (ms) | % |
+|---|---|---|---|
+| GEMV/GEMM (projections) | 134,561 | 23,870 | 85.0% |
+| Attention (flash/reduce) | 39,264 | 2,966 | 10.6% |
+| Normalization | 137,833 | 826 | 2.9% |
+| Other | - | 413 | 1.5% |
+
+Even at 1279 tokens, projections are 85%. But the per-token attention
+launch count (39K) creates CPU-side launch overhead that adds up.
+Batched attention would reduce this to ~48×7 = ~336 launches.
+
+### Commit log
+
+- `d1b1a488` fix: 3 critical WMMA prefill bugs
+- `3aaafadc` findings: preflight profile — 93.6% in gemv_q8_0
+- `8b7fb86e` findings: incorporate Gemini + Claude review findings
+- `31c19645` docs: revise WMMA prefill plan after profiling
+- `ce894d6b` feat: batched prefill v2 with per-token attention + WMMA gate
+- `44ed2bf8` feat: F16 cache invalidation between layers
+- `3712eae6` feat: add final logits to v2 prefill + gate MoE models out
+- `d41061d5` docs: update devlog
+- `d3ef9994` docs: update devlog with prefill perf results
+- `89342681` feat: add prefill timing to gemma4 done message
