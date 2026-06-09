@@ -2414,3 +2414,79 @@ All 4 test cases produce identical token ID sequences between legacy and lowered
 | 26B-A4B MoE | 8.4 | 8.4 |
 
 Zero overhead from the lowered super-op dispatch.
+
+---
+
+## Session 27 — WMMA critical bug fixes + prefill profiling (2026-06-09)
+
+### Prefill profiling results
+
+Ran `rocprofv3 --kernel-trace` on gemma4 12B Q8 per-token decode (20 tokens). Results:
+
+| Category | Calls | Time (ms) | % of GPU |
+|---|---|---|---|
+| **GEMV/GEMM (projections)** | 9,212 | 1,629.5 | **93.6%** |
+| Normalization (rmsnorm) | 9,436 | 52.6 | 3.0% |
+| Attention (tile + reduce) | 2,688 | 29.1 | 1.7% |
+| Memory (copy/fill) | 6,214 | 9.2 | 0.5% |
+| Elementwise | 8,092 | 9.0 | 0.5% |
+| RoPE | 1,344 | 5.9 | 0.3% |
+| KV cache write | 2,688 | 4.7 | 0.3% |
+
+**Key finding: projections dominate at 93.6%.** WMMA batched GEMM is the correct optimization target. Per-token attention at 1.7% is negligible for short prefill.
+
+This invalidates the review finding that "attention launches dominate" — it's true for B>1024 contexts, but for typical short prefill the GEMV launch overhead and memory bandwidth are 93.6% of GPU time.
+
+Written to `findings/gemma4_prefill_profile_12b_q8.md`.
+
+### Critical bug fixes (3 bugs)
+
+**Bug 1 (CRITICAL): `gemm_hfq4g256_wmma` had no F32→F16 conversion.**
+The GPU method took `x_f16` by name but never verified or performed the
+conversion. Callers passing F32 data (via GemmFamily dispatch) would
+silently produce garbage — F32 bytes reinterpreted as F16.
+
+Fix: Added `ensure_fp16_x` conversion (mirrors `gemm_q8_0_wmma` pattern).
+Also added `launch_maybe_blob` + `KernargBlob` for graph-capture compatibility
+and a profiling timer.
+
+**Bug 2 (CRITICAL): `GemmFamily::resolve` had no arm for `DType::MQ4G256`.**
+The dispatch arm would return `UnsupportedVariant` and crash on the
+26B-A4B production model (MQ4G256 weights).
+
+Fix: Added `DType::MQ4G256 → GemmHfq4G256Wmma / GemmHfq4G256` mapping.
+MQ4G256 uses the same 136-byte/group layout as HFQ4G256, so the kernel
+binary is shared.
+
+**Bug 3 (CRITICAL): WMMA not byte-identical to scalar.**
+F16 input quantization loses ~3 mantissa bits. Original plan proposed default-ON.
+Fix: Added `HIPFIRE_WMMA_PREFILL` env var gate, default OFF. Set to `1` to opt in.
+
+### Also added to `run_prefill_gemm`
+
+- WMMA path via `GemmFamily::run()` when `HIPFIRE_WMMA_PREFILL=1`
+- Explicit key path for `MQ4G256`, `Q8_0` in scalar fallback
+- Both paths tested and passing coherence
+
+### Cross-review consolidation
+
+Incorporated findings from Gemini 3.5 Flash and Claude Opus 4.8 adversarial
+reviews into `findings/gemma4_prefill_wmma_plan_rev_glm5.md` (Appendix A).
+
+Rejected 3 Gemini claims:
+- G1: v1 garbage from hardcoded asym3 → WRONG (v1 reads cache dynamically)
+- G2: no batched proportional RoPE → WRONG (kernels exist in norm.rs)
+- G5: MoE graph capture incompatibility → NON-ISSUE (prefill doesn't capture)
+
+Confirmed 5 new findings:
+- C4: Reframe Step 2 as v2 adaptation, not greenfield
+- G3: Stale F16 cache → use `convert_fp16_x_uncached`
+- G6: Add lm_head to prefill, eliminate redundant re-run
+- C5: Drop 26B-A4B from Milestone 1 success criteria
+- C8: Add gfx1100 correctness gate
+
+### Commits
+
+- `8b7fb86e` findings: incorporate Gemini + Claude review findings
+- `3aaafadc` findings: preflight profile — 93.6% in gemv_q8_0
+- `d1b1a488` fix: 3 critical WMMA prefill bugs
