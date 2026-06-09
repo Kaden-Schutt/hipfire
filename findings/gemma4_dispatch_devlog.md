@@ -2685,3 +2685,26 @@ fall back to per-token decode. Per-token decode still coherent.
 - **Batched attention for long contexts**: Per-token attention at 1.7%
   is fine for short prefill. For >512 tokens, adding batched attention
   with ring-buffer-aware kernels would help further.
+
+### Prefill perf results (short + long prompts)
+
+**Short prompt (26 tokens, "What is France?"):**
+- Per-token decode: 15.8 tok/s
+- WMMA batched: 52.4 tok/s (first 4 tokens, includes WMMA prefill)
+- **WMMA is 3.3× faster for short prompts** (profiling showed 93.6% in projections)
+
+**Long prompt (1279 tokens):**
+- Per-token decode: 13.7 tok/s (total 1m39s)
+- WMMA batched: 13.6 tok/s (total 1m39s)
+- **Near-identical** — per-token attention (O(N²) in seq len) dominates
+
+**rocprof kernel launch counts (short prompt):**
+- Baseline: 36,934 total launches, 8,554 GEMV
+- WMMA: 15,304 total launches, 330 GEMV + 328 WMMA GEMM = 658 total
+- **WMMA reduced GEMV launches from 8,554 to 330** (batched projections)
+- Attention launches identical: 2,496 both ways
+
+**Conclusion:** WMMA batched projections help for short prefill (20-128 tokens)
+where projections dominate. For long contexts (>512 tokens), per-token
+attention is the bottleneck. Next perf step: batched attention kernels
+for the long-context case.
