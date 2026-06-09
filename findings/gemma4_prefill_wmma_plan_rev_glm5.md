@@ -208,4 +208,60 @@ The existing v2 code handles this (gemma4.rs:2820-2900). The plan should acknowl
 
 ---
 
-*Review completed 2026-06-09. Plan at `docs/plans/gemma4_prefill_wmma.md`.*
+---
+
+## Appendix A — Cross-review consolidation
+
+Two additional adversarial reviews were produced in parallel:
+- `findings/gemma4_prefill_wmma_plan_rev_gemini.md` (Gemini 3.5 Flash)
+- `findings/gemma4_prefill_wmma_plan_rev_claude.md` (Claude Opus 4.8)
+
+Each raised additional claims. Below: each claim validated ✅ or rejected ❌ against
+source.
+
+### Gemini findings
+
+| # | Claim | Verdict | Notes |
+|---|---|---|---|
+| G1 | v1/v2 garbage root-caused by hardcoded `quant_asym3:true` in `KvTierInputs` | ❌ **PARTIALLY WRONG** | Only **v2** hardcodes `quant_asym3:true` (gemma4.rs:2722, 2849). **v1** calls `sliding_layer_decode_impl` which reads `kv_cache.quant_q8` dynamically (gemma4.rs:2053-2060). The v1 garbage has a DIFFERENT root cause, still unknown. Gemini conflates v1 and v2 bugs. |
+| G2 | No batched proportional RoPE kernel exists for full layers | ❌ **WRONG** | `rope_partial_interleaved_f32_batched` and `rope_partial_halfsplit_batched_f32` exist in `norm.rs:500-525` and `kernels/src/rope_partial_*_batched.hip`. They're just not wired for gemma4's full layers. The claim that they don't exist is false. |
+| G3 | `ensure_fp16_x` pointer cache serves stale data across layers | ✅ **CONFIRMED** | Same as my Finding 6. `scratch.rs:337` caches by `src_ptr`. Reusing `pb_tmp` across layers → stale F16 on layers 1+. Must use `convert_fp16_x_uncached` or invalidate per-layer. |
+| G4 | CPU launch overhead cliff for per-token attention | ✅ **CONFIRMED** | Same as my Finding 5. 128 × 6 launches/layer × 48 layers = ~37K launches. |
+| G5 | MoE branch incompatible with graph capture (synchronous D2H) | ❌ **NON-ISSUE** | `apply_moe_branch_batched` does `download_f32` (gemma4.rs:1608-1609). But prefill **never runs under graph capture** — graph capture is for DFlash speculative decode verify cycles, which happen AFTER prefill. Prefill is a one-shot operation. This is a valid concern for decode-path MoE, but irrelevant for this prefill plan. |
+| G6 | Redundant logit computation (prefill + daemon re-run) | ✅ **CONFIRMED, WORTH FIXING** | If `forward_prefill_batch_wmma` computes final norm + lm_head on the last token (writing to `scratch.logits`), the daemon's "last token re-run through `forward_scratch`" is redundant. Saves one full decode pass. The existing v2 skips lm_head; adding it to the prefill function eliminates the re-run. |
+
+### Claude findings
+
+| # | Claim | Verdict | Notes |
+|---|---|---|---|
+| C1 | §3.3 F32→F16 bug in `gemm_hfq4g256_wmma` | ✅ **CONFIRMED** | Same as my Finding 1. GPU method takes `x_f16` with no conversion. |
+| C2 | "byte-identical" / "default ON" is false | ✅ **CONFIRMED** | Same as my Finding 3. F16 precision loss means different numerical results. |
+| C3 | Plan inherits v2's hardcoded asym3 KV bug | ✅ **CONFIRMED** | v2 hardcodes `quant_asym3:true` at gemma4.rs:2722 and :2849. Any new function modeled on v2 will inherit this unless explicitly fixed. |
+| C4 | Scope is overstated — v2 already exists, don't rewrite | ✅ **CONFIRMED, IMPORTANT REFRAMING** | `forward_prefill_batch_v2` (gemma4.rs:2612) already has batched projections, rmsnorm_batched, rope_batched, per-token attention. The "new function" should be reframed as: fix v2's KvTierInputs + swap `run_prefill_gemm` → WMMA. Saves ~2 hours of Step 2. |
+| C5 | 26B-A4B sees little WMMA win (MoE dominates FLOPs) | ✅ **CONFIRMED** | Expert FFN GEMMs stay per-token/scalar. Only dense q/k/v/o/router projections move to WMMA. A4B perf expectation should be "small" not "5-10×". |
+| C6 | Q8_0 `gemm_q8_0_wmma` asserts `K % 32 == 0` — verify gemma4 shapes | ✅ **VERIFIED, ALL PASS** | 12B: all K dims are multiples of 32 (3840, 4096, 15360). hd=512 path: K=3840, 8192. No assertion failures. |
+| C7 | Perf numbers are unsourced, not cross-comparable | ✅ **CONFIRMED** | The ~4 tok/s on gfx1151 is uncited. Jukefr's 130→342 is different GPU/model. 11-30× is microbench. Step 5 needs committed prompt files + md5s + same-hardware comparison. |
+| C8 | Wrong primary target (gfx1151 vs gfx1100) | ✅ **CONFIRMED** | CLAUDE.md says gfx1100 is primary deploy target. Plan measures only gfx1151. Need at minimum a gfx1100 correctness pass. |
+| C9 | Timeline too short — 30 min Step 0 will surface the F32→F16 bug | ✅ **CONFIRMED** | Step 0 with an HFQ4 weight will surface the CRITICAL bug, requiring kernel edit + recompile + re-validate. Realistic timeline is ~1 day, not 7 hours. |
+
+### Consolidated finding count
+
+| Severity | My review | Gemini (new) | Claude (new) | Total unique |
+|---|---|---|---|---|
+| 🔴 CRITICAL | 3 | 0 | 0 | 3 |
+| 🟠 MAJOR | 3 | 1 (G3) | 0 | 4 |
+| 🟡 MEDIUM | 0 | 0 | 3 (C4, C5, C7) | 3 |
+| 🟢 MINOR | 5 | 1 (G6) | 2 (C8, C9) | 8 |
+| ❌ REJECTED | 0 | 3 (G1, G2, G5) | 0 | 3 |
+
+### Key new actions from cross-review
+
+1. **C4 — Reframe Step 2 as v2 adaptation, not greenfield.** Fix v2's `KvTierInputs` to read from cache descriptors + swap `run_prefill_gemm` for WMMA. This saves ~2 hours and avoids divergent reimplementation.
+2. **G3 / Finding 6 — Use `convert_fp16_x_uncached`, not cached `ensure_fp16_x`.** The pointer-keyed cache is wrong for reused activation buffers. Or invalidate `fp16_x_source_ptr` between layers.
+3. **G6 — Add final norm + lm_head to prefill function.** Eliminates the redundant last-token re-run.
+4. **C5 — Drop 26B-A4B from Milestone 1 success criteria.** Expect "small" gain only; MoE batching is Milestone 2.
+5. **C8 — Add gfx1100 correctness gate.** Primary deploy target must be validated.
+
+---
+
+*Review completed 2026-06-09. Plan at `docs/plans/gemma4_prefill_wmma.md`. Cross-reviews: `findings/gemma4_prefill_wmma_plan_rev_gemini.md`, `findings/gemma4_prefill_wmma_plan_rev_claude.md`.*
