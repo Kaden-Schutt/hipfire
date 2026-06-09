@@ -5126,6 +5126,7 @@ pub fn spec_step_ddtree_batched(
                     n_kv_heads,
                     head_dim,
                     n_positions,
+                    0,
                 )?;
                 // V byte-gather: read pre-quantized V from raced slots
                 // [position+0, position+1+acc[0], ...] into a contiguous

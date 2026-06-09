@@ -373,7 +373,7 @@ fn dispatch_kv_write(
             let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_asym3_batched(
                 io.k_cache, io.v_cache, io.k, io.v, io.positions(),
-                ct, st, io.n_kv_heads, io.head_dim, io.batch_size,
+                ct, st, io.n_kv_heads, io.head_dim, io.batch_size, plan.cache_capacity as usize,
             ))
         }
         KernelKey::KvWriteAsym3FwhtBatched => {
@@ -404,10 +404,10 @@ fn dispatch_kv_write(
             // Q8 batched write is called twice (K, then V) — not fused.
             let pos = io.positions();
             hip!(gpu.kv_cache_write_q8_0_batched(
-                io.k_cache, io.k, pos, io.n_kv_heads, io.head_dim, io.batch_size,
+                io.k_cache, io.k, pos, io.n_kv_heads, io.head_dim, io.batch_size, plan.cache_capacity as usize,
             ))?;
             hip!(gpu.kv_cache_write_q8_0_batched(
-                io.v_cache, io.v, pos, io.n_kv_heads, io.head_dim, io.batch_size,
+                io.v_cache, io.v, pos, io.n_kv_heads, io.head_dim, io.batch_size, plan.cache_capacity as usize,
             ))
         }
 
@@ -656,6 +656,7 @@ fn dispatch_attend(
                 ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
                 io.physical_cap, io.max_ctx_len, io.batch_size, fp,
                 io.tree_bias, io.block_start, io.block_cols,
+                plan.window_size as usize, plan.cache_capacity as usize,
             ))
         }
         KernelKey::AttnFlashAsym3FwhtBatchedMasked => {
@@ -701,6 +702,7 @@ fn dispatch_attend(
                 io.n_heads, io.n_kv_heads, io.head_dim,
                 io.physical_cap, io.max_ctx_len, io.batch_size, fp,
                 io.tree_bias, io.block_start, io.block_cols,
+                plan.window_size as usize, plan.cache_capacity as usize,
             ))
         }
 

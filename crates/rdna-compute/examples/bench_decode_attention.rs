@@ -82,8 +82,8 @@ fn main() {
     let pos_all: Vec<u8> = (0..max_seq as i32).flat_map(|p| p.to_ne_bytes()).collect();
     let pos_all_t = gpu.alloc_tensor(&[max_seq], DType::F32).unwrap();
     gpu.hip.memcpy_htod(&pos_all_t.buf, &pos_all).unwrap();
-    gpu.kv_cache_write_q8_0_batched(&d_kq8, &d_k, &pos_all_t, n_kv_heads, head_dim, max_seq).unwrap();
-    gpu.kv_cache_write_q8_0_batched(&d_vq8, &d_v, &pos_all_t, n_kv_heads, head_dim, max_seq).unwrap();
+    gpu.kv_cache_write_q8_0_batched(&d_kq8, &d_k, &pos_all_t, n_kv_heads, head_dim, max_seq, 0).unwrap();
+    gpu.kv_cache_write_q8_0_batched(&d_vq8, &d_v, &pos_all_t, n_kv_heads, head_dim, max_seq, 0).unwrap();
     gpu.attention_q8_0_kv(&d_q, &d_kq8, &d_vq8, &d_out, &pos_buf, seq_len, n_heads, n_kv_heads, head_dim, max_seq).unwrap();
     gpu.hip.device_synchronize().unwrap();
     let t = std::time::Instant::now();

@@ -915,6 +915,7 @@ pub fn forward_batch(
             cfg.num_key_value_heads,
             cfg.head_dim,
             b,
+            0,
         )
         .map_err(|e| format!("minimax L{l} batch kv write k: {e:?}"))?;
         gpu.kv_cache_write_q8_0_batched(
@@ -924,6 +925,7 @@ pub fn forward_batch(
             cfg.num_key_value_heads,
             cfg.head_dim,
             b,
+            0,
         )
         .map_err(|e| format!("minimax L{l} batch kv write v: {e:?}"))?;
         gpu.attention_q8_0_kv_batched(
