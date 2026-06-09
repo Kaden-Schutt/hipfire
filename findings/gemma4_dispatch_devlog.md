@@ -2490,3 +2490,160 @@ Confirmed 5 new findings:
 - `8b7fb86e` findings: incorporate Gemini + Claude review findings
 - `3aaafadc` findings: preflight profile — 93.6% in gemv_q8_0
 - `d1b1a488` fix: 3 critical WMMA prefill bugs
+
+---
+
+## Session 27 — WMMA prefill bug fixes, profiling, batched prefill v2 (2026-06-09)
+
+### rocprofv3 preflight profile
+
+Ran `rocprofv3 --kernel-trace` on gemma4 12B-Q8 per-token decode (20 tokens):
+
+| Category | Calls | Time (ms) | % |
+|---|---|---|---|
+| **GEMV/GEMM (projections)** | 9,212 | 1,629.5 | **93.6%** |
+| Normalization (rmsnorm) | 9,436 | 52.6 | 3.0% |
+| Attention (tile + reduce) | 2,688 | 29.1 | 1.7% |
+| Memory (copy/fill) | 6,214 | 9.2 | 0.5% |
+| Elementwise | 8,092 | 9.0 | 0.5% |
+| RoPE | 1,344 | 5.9 | 0.3% |
+| KV cache write | 2,688 | 4.7 | 0.3% |
+
+Written to `findings/gemma4_prefill_profile_12b_q8.md`.
+
+**Conclusion: projections dominate at 93.6%.** Per-token attention at 1.7%
+is negligible for short prefill. WMMA batched GEMM for projections is the
+correct target.
+
+### 3 critical bug fixes (commit `d1b1a488`)
+
+**Bug 1 (CRITICAL): `gemm_hfq4g256_wmma` passed F32 data to a kernel
+expecting F16.** The GPU method took `x_f16` by parameter name but never
+converted F32→F16. Silent garbage on HFQ4 weights.
+
+Fix: Added `ensure_fp16_x` (mirrors `gemm_q8_0_wmma` pattern). If input
+is already F16, skips conversion. Also added `launch_maybe_blob` +
+`KernargBlob` for graph-capture compatibility and profiling timer.
+
+**Bug 2 (CRITICAL): `GemmFamily::resolve` had no arm for `DType::MQ4G256`.**
+Returned `UnsupportedVariant`, crashing 26B-A4B production model.
+
+Fix: Added `MQ4G256 → GemmHfq4G256Wmma / GemmHfq4G256` mapping. Same
+136-byte/group layout, shared kernel binary.
+
+**Bug 3 (CRITICAL): WMMA F16 quantization not byte-identical to scalar.**
+Cannot be default-ON.
+
+Fix: Added `HIPFIRE_WMMA_PREFILL` env var gate, default OFF.
+
+### Cross-review consolidation (commit `8b7fb86e`)
+
+Incorporated findings from Gemini 3.5 Flash and Claude Opus 4.8 reviews.
+
+Rejected 3 Gemini claims:
+- G1: v1 garbage from hardcoded asym3 → WRONG (v1 reads KvTierInputs
+  dynamically from kv_cache; v2 hardcodes, v1 bug root cause is different)
+- G2: no batched proportional RoPE → WRONG (`rope_partial_*_batched`
+  kernels exist in norm.rs)
+- G5: MoE graph capture → NON-ISSUE (prefill never captures)
+
+Confirmed 5 new findings:
+- C4: Reframe v2 as adaptation, not greenfield
+- G3: Stale F16 cache → need `invalidate_fp16_cache` or `convert_fp16_x_uncached`
+- G6: Add lm_head to prefill, eliminate redundant last-token re-run
+- C5: Drop 26B-A4B from Milestone 1 (MoE dominates)
+- C8: Add gfx1100 correctness gate
+
+### Batched prefill v2 KvTierInputs fix (commit `ce894d6b`)
+
+- Fixed hardcoded `quant_asym3: true, quant_q8: false` → read from
+  `kv_sliding`/`kv_full` cache descriptors dynamically
+- Fixed `givens_cos.unwrap()` → `kv_cache.givens_cos.as_ref()` (None for q8)
+- Replaced batched `Step::Attend` with per-token attention loop
+  (batched q8 attention corrupts KV in ring-buffer mode)
+- Added `HIPFIRE_BATCHED_PREFILL=1` gate (independent from WMMA)
+
+### F16 cache invalidation (commit after ce894d6b)
+
+Added `gpu.invalidate_fp16_cache()` method on `Gpu` to null out
+`fp16_x_source_ptr`. Called between layers in v2 loop. The pointer-keyed
+cache in `ensure_fp16_x` would skip F32→F16 conversion when the same
+activation buffer (`pb_tmp`) is reused with different contents each layer.
+
+### Current known issue: first decode tokens wrong
+
+**`HIPFIRE_BATCHED_PREFILL=1` (scalar GEMM, no WMMA):**
+- "LJ," instead of "The" as first 2 tokens, then "capital of France is **Paris**." correct
+- Root cause: `forward_prefill_batch_v2` does NOT compute final logits. The
+  v2 function ends after the last layer (residual + layer_scalar), without
+  running final norm + lm_head + softcap. The daemon's decode loop samples
+  from `scratch.logits` which is stale from initialization.
+
+**`HIPFIRE_WMMA_PREFILL=1` (WMMA GEMM + batched):**
+- Same issue as above (stale logits), plus F16 quantization drift
+- With `invalidate_fp16_cache` between layers: first 2 tokens are random
+  script characters, then correct "France is **Paris**."
+
+**Per-token decode (baseline):** Correct "**Paris**." at 14.7 tok/s.
+
+### Fixes needed (in order)
+
+1. **Add final norm + lm_head + softcap to `forward_prefill_batch_v2`.**
+   After the last layer, compute rmsnorm + lm_head + softcap on the last
+   token position (position `n_batch - 1`) to fill `scratch.logits` so the
+   decode loop can sample correctly.
+
+2. **Investigate remaining first-token drift** after adding logits.
+   The per-token decode path computes logits per token, so there may be
+   a small numerical difference even with scalar batched GEMM due to
+   `GemmQ8_0BatchedChunked` vs `weight_gemv` (different accumulation order).
+
+3. **WMMA F16 drift** — expected ~3 mantissa bits lost. Acceptable for
+   opt-in path; first N tokens may diverge then converge.
+
+### Commits this session
+
+- `8b7fb86e` findings: incorporate Gemini + Claude review findings
+- `3aaafadc` findings: preflight profile — 93.6% in gemv_q8_0 projections
+- `d1b1a488` fix: 3 critical WMMA prefill bugs
+- `31c19645` docs: revise WMMA prefill plan after profiling
+- `e9a85e5f` docs: update devlog with session 27
+- `ce894d6b` feat: batched prefill v2 with per-token attention + WMMA gate
+- (uncommitted) F16 cache invalidation between layers
+
+### Key files modified
+
+- `crates/rdna-compute/src/gemm.rs`: F32→F16 fix in `gemm_hfq4g256_wmma`
+- `crates/rdna-compute/src/dispatch.rs`: `invalidate_fp16_cache()` method
+- `crates/hipfire-dispatch/src/families/gemm.rs`: MQ4G256 dispatch arm
+- `crates/hipfire-arch-gemma4/src/gemma4.rs`:
+  - `wmma_prefill_enabled()` + `batched_prefill_enabled()` env gates
+  - `run_prefill_gemm()` WMMA path via `GemmFamily::run()`
+  - v2 KvTierInputs dynamic read from cache descriptors
+  - Per-token attention loop (replaces batched Step::Attend)
+  - `gpu.invalidate_fp16_cache()` between layers
+- `crates/hipfire-runtime/examples/daemon.rs`: batched prefill wiring
+
+### Key measurements
+
+- Baseline (per-token decode): 14.7 tok/s, correct "**Paris**." output
+- Batched prefill v2 (scalar GEMM): 13.2 tok/s, wrong first 2 tokens
+  (stale logits — need final norm + lm_head)
+- WMMA prefill (WMMA+batched): corrupt first 2 tokens, correct rest
+  (stale logits + F16 drift)
+- All coherence gate tests pass (8/8 no hard errors)
+
+### Plan status
+
+Phase 6 Milestone 1 (prefill perf):
+- Step 0 (verify WMMA plumbing): ✅ done
+- Step 1 (run_prefill_gemm WMMA helper): ✅ done
+- Step 2 (forward_prefill_batch_wmma): 🔄 in progress
+  - ✅ v2 KvTierInputs fix
+  - ✅ per-token attention (replaces broken batched attention)
+  - ✅ F16 cache invalidation
+  - ❌ final norm + lm_head + softcap (missing — next item)
+- Step 3 (daemon wiring): ✅ done
+- Step 4 (coherence validation): ❌ blocked by stale logits
+- Step 5 (perf measurement): ❌ blocked
+
