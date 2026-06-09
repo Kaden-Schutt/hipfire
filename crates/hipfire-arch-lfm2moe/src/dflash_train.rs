@@ -47,6 +47,7 @@ pub struct LW {
     pub in_proj: Option<GpuTensor>, pub conv_w: Option<GpuTensor>, pub out_proj: Option<GpuTensor>,
     pub wq: Option<GpuTensor>, pub wk: Option<GpuTensor>, pub wv: Option<GpuTensor>, pub wo: Option<GpuTensor>,
     pub q_norm: Option<GpuTensor>, pub k_norm: Option<GpuTensor>,
+    pub w_c: Option<GpuTensor>, // conv-gate-injection [d,d] (conv layers; None = off)
     pub w1: GpuTensor, pub w3: GpuTensor, pub w2: GpuTensor,
 }
 /// Whole trainable net (body layers + vocab/context adapters). Reused for
@@ -60,7 +61,7 @@ pub struct Net {
 }
 pub fn lw_tensors(lw: &LW) -> Vec<&GpuTensor> {
     let mut v = vec![&lw.op_norm, &lw.ffn_norm];
-    for o in [&lw.in_proj, &lw.conv_w, &lw.out_proj, &lw.wq, &lw.wk, &lw.wv, &lw.wo, &lw.q_norm, &lw.k_norm] {
+    for o in [&lw.in_proj, &lw.conv_w, &lw.out_proj, &lw.wq, &lw.wk, &lw.wv, &lw.wo, &lw.q_norm, &lw.k_norm, &lw.w_c] {
         if let Some(t) = o { v.push(t); }
     }
     v.push(&lw.w1); v.push(&lw.w3); v.push(&lw.w2);
@@ -189,6 +190,7 @@ pub fn load_lfm2_warmstart(gpu: &mut Gpu, cfg: &Cfg, st_path: &Path) -> std::io:
                 wo: Some(g(gpu, &st, &format!("{p}.self_attn.out_proj.weight"), &[d, qd])),
                 q_norm: Some(g(gpu, &st, &format!("{p}.self_attn.q_layernorm.weight"), &[cfg.hd])),
                 k_norm: Some(g(gpu, &st, &format!("{p}.self_attn.k_layernorm.weight"), &[cfg.hd])),
+                w_c: None,
                 w1, w3, w2,
             }
         } else {
@@ -198,6 +200,7 @@ pub fn load_lfm2_warmstart(gpu: &mut Gpu, cfg: &Cfg, st_path: &Path) -> std::io:
                 conv_w: Some(g(gpu, &st, &format!("{p}.conv.conv.weight"), &[d, k])), // [d,1,k] flat == [d,k]
                 out_proj: Some(g(gpu, &st, &format!("{p}.conv.out_proj.weight"), &[d, d])),
                 wq: None, wk: None, wv: None, wo: None, q_norm: None, k_norm: None,
+                w_c: None,
                 w1, w3, w2,
             }
         };
@@ -214,6 +217,13 @@ pub fn body_forward(gpu: &mut Gpu, cfg: &Cfg, w: &[LW], h_in0: &GpuTensor, ctx: 
     let (d, nh, nkv, hd, qd, kvd) = (cfg.d, cfg.nh, cfg.nkv, cfg.hd, cfg.qd(), cfg.kvd());
     let l = n_ctx + b; let scale = 1.0 / (hd as f32).sqrt();
     let mut tape = Vec::new();
+    // conv-gate-injection: pool the target context (SUM) once if any conv
+    // layer carries W_c. inj = W_c . ctx_pooled added into the conv C_gate.
+    let ctx_pooled = if n_ctx > 0 && w.iter().any(|l| l.w_c.is_some()) {
+        let cp = gpu.zeros(&[d], DType::F32).unwrap();
+        gpu.colsum_strided_f32(ctx, &cp, n_ctx, d, 0, d, 1.0).unwrap();
+        Some(cp)
+    } else { None };
     let mut h = dup(gpu, h_in0, b * d);
     for li in 0..cfg.n_layers() {
         let lw = &w[li]; let mut t = LT::default();
@@ -244,6 +254,10 @@ pub fn body_forward(gpu: &mut Gpu, cfg: &Cfg, w: &[LW], h_in0: &GpuTensor, ctx: 
             t.vfull = Some(vfull); t.attn_out = Some(attn_out);
         } else {
             let bcx = lin(gpu, &xn, lw.in_proj.as_ref().unwrap(), b, d, 3 * d);
+            if let (Some(wc), Some(cp)) = (lw.w_c.as_ref(), ctx_pooled.as_ref()) {
+                let inj = lin(gpu, cp, wc, 1, d, d); // [1,d] = W_c . ctx_pooled
+                gpu.cgate_add_f32(&bcx, &inj, b, d).unwrap();
+            }
             let cy = gpu.zeros(&[b, d], DType::F32).unwrap();
             gpu.conv1d_gated_batched_f32(&bcx, conv_state, lw.conv_w.as_ref().unwrap(), &cy, b, d, cfg.conv_k).unwrap();
             mixer_out = lin(gpu, &cy, lw.out_proj.as_ref().unwrap(), b, d, d);
@@ -274,6 +288,13 @@ pub fn body_backward(gpu: &mut Gpu, cfg: &Cfg, w: &[LW], tape: &[LT], dh_out: &G
     let l = n_ctx + b; let scale = 1.0 / (hd as f32).sqrt(); let nl = cfg.n_layers();
     let mut glayers: Vec<Option<LW>> = (0..nl).map(|_| None).collect();
     let d_ctx = zt(gpu, n_ctx.max(1) * d);
+    let conv_inject = n_ctx > 0 && w.iter().any(|l| l.w_c.is_some());
+    let ctx_pooled = if conv_inject {
+        let cp = gpu.zeros(&[d], DType::F32).unwrap();
+        gpu.colsum_strided_f32(ctx, &cp, n_ctx, d, 0, d, 1.0).unwrap();
+        Some(cp)
+    } else { None };
+    let d_ctx_pooled = if conv_inject { Some(zt(gpu, d)) } else { None };
     let mut dh = dup(gpu, dh_out, b * d);
     for li in (0..nl).rev() {
         let lw = &w[li]; let t = &tape[li];
@@ -290,7 +311,7 @@ pub fn body_backward(gpu: &mut Gpu, cfg: &Cfg, w: &[LW], tape: &[LT], dh_out: &G
         gpu.rmsnorm_bwd_f32(t.h_mid.as_ref().unwrap(), &lw.ffn_norm, &dfnorm, &dhmid_n, &dffn_norm, b, d, cfg.eps).unwrap();
         let dh_mid = add_new(gpu, &dh, &dhmid_n, b * d);
         let d_xn;
-        let (mut g_inproj, mut g_convw, mut g_outproj) = (None, None, None);
+        let (mut g_inproj, mut g_convw, mut g_outproj, mut g_wc) = (None, None, None, None);
         let (mut g_wq, mut g_wk, mut g_wv, mut g_wo, mut g_qn, mut g_kn) = (None, None, None, None, None, None);
         if cfg.is_attn[li] {
             let d_attn_out = lin_dx(gpu, &dh_mid, lw.wo.as_ref().unwrap(), b, qd, d);
@@ -337,6 +358,15 @@ pub fn body_backward(gpu: &mut Gpu, cfg: &Cfg, w: &[LW], tape: &[LT], dh_out: &G
             let dxn = lin_dx(gpu, &d_bcx, lw.in_proj.as_ref().unwrap(), b, d, 3 * d);
             let dinproj = lin_dw(gpu, &d_bcx, t.xn.as_ref().unwrap(), b, d, 3 * d);
             d_xn = dxn;
+            // conv-gate-injection backward: d_inj = colsum of d_bcx C_gate slice
+            if let (Some(wc), Some(cp), Some(dcp)) = (lw.w_c.as_ref(), ctx_pooled.as_ref(), d_ctx_pooled.as_ref()) {
+                let d_inj = zt(gpu, d);
+                gpu.colsum_strided_f32(&d_bcx, &d_inj, b, 3 * d, d, d, 1.0).unwrap();
+                let dwc = lin_dw(gpu, &d_inj, cp, 1, d, d); // [d,d]
+                let dcp_l = lin_dx(gpu, &d_inj, wc, 1, d, d); // [1,d]
+                addv(gpu, dcp, &dcp_l);
+                g_wc = Some(dwc);
+            }
             g_inproj = Some(dinproj); g_convw = Some(d_conv_w); g_outproj = Some(dwout);
         }
         let dhin_n = zt(gpu, b * d); let dop_norm = zt(gpu, d);
@@ -346,9 +376,13 @@ pub fn body_backward(gpu: &mut Gpu, cfg: &Cfg, w: &[LW], tape: &[LT], dh_out: &G
             op_norm: dop_norm, ffn_norm: dffn_norm,
             in_proj: g_inproj, conv_w: g_convw, out_proj: g_outproj,
             wq: g_wq, wk: g_wk, wv: g_wv, wo: g_wo, q_norm: g_qn, k_norm: g_kn,
+            w_c: g_wc,
             w1: dw1, w3: dw3, w2: dw2,
         });
         dh = dh_in;
+    }
+    if let Some(dcp) = d_ctx_pooled.as_ref() {
+        gpu.bias_add_f32(&d_ctx, dcp, n_ctx, d).unwrap();
     }
     (dh, d_ctx, glayers.into_iter().map(|o| o.unwrap()).collect())
 }
@@ -395,13 +429,15 @@ pub fn load_net(gpu: &mut Gpu, cfg: &Cfg, path: &Path) -> std::io::Result<Net> {
                 wo: Some(g(gpu, &map, &format!("{pfx}.wo"), &[d, qd])),
                 q_norm: Some(g(gpu, &map, &format!("{pfx}.q_norm"), &[cfg.hd])),
                 k_norm: Some(g(gpu, &map, &format!("{pfx}.k_norm"), &[cfg.hd])),
-                w1, w3, w2 }
+                w_c: None, w1, w3, w2 }
         } else {
             LW { op_norm, ffn_norm,
                 in_proj: Some(g(gpu, &map, &format!("{pfx}.in_proj"), &[3 * d, d])),
                 conv_w: Some(g(gpu, &map, &format!("{pfx}.conv_w"), &[d, k])),
                 out_proj: Some(g(gpu, &map, &format!("{pfx}.out_proj"), &[d, d])),
-                wq: None, wk: None, wv: None, wo: None, q_norm: None, k_norm: None, w1, w3, w2 }
+                wq: None, wk: None, wv: None, wo: None, q_norm: None, k_norm: None,
+                w_c: { let nm = format!("{pfx}.w_c"); if map.contains_key(&nm) { Some(g(gpu, &map, &nm, &[d, d])) } else { None } },
+                w1, w3, w2 }
         };
         layers.push(lw);
     }

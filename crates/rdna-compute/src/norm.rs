@@ -1642,6 +1642,38 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// Add inj[d] (broadcast over block) into the C_gate slice of bcx [block,3d].
+    pub fn cgate_add_f32(&mut self, bcx: &GpuTensor, inj: &GpuTensor, block: usize, d: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "cgate_add_f32")?;
+        let func = &self.functions["cgate_add_f32"];
+        let mut bp = bcx.buf.as_ptr(); let mut ip = inj.buf.as_ptr();
+        let mut bl = block as i32; let mut dd = d as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut bp as *mut _ as *mut c_void, &mut ip as *mut _ as *mut c_void,
+            &mut bl as *mut _ as *mut c_void, &mut dd as *mut _ as *mut c_void,
+        ];
+        let blk = 256u32; let grid = (((block * d) as u32) + blk - 1) / blk;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [blk, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Strided column-sum: out[c] = scale * sum_j x[j*row_stride + col_off + c].
+    #[allow(clippy::too_many_arguments)]
+    pub fn colsum_strided_f32(&mut self, x: &GpuTensor, out: &GpuTensor, rows: usize, row_stride: usize, col_off: usize, d: usize, scale: f32) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "colsum_strided_f32")?;
+        let func = &self.functions["colsum_strided_f32"];
+        let mut xp = x.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut rw = rows as i32; let mut rs = row_stride as i32; let mut co = col_off as i32; let mut dd = d as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut rw as *mut _ as *mut c_void, &mut rs as *mut _ as *mut c_void,
+            &mut co as *mut _ as *mut c_void, &mut dd as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        let blk = 256u32; let grid = ((d as u32) + blk - 1) / blk;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [blk, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     pub fn conv1d_gated_decode_f32(
         &mut self,
         bcx: &GpuTensor,

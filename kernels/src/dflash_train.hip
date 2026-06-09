@@ -355,3 +355,36 @@ extern "C" __global__ void adam_step_f32(
     float vh = vi * bc2;
     w[i] -= lr * (mh / (sqrtf(vh) + eps) + wd * w[i]);
 }
+
+// ===================================================================
+// DFlash conv-gate-injection (the conv analog of GQA KV-injection): add a
+// per-conv-layer projection of the pooled target context into the conv output
+// gate C_gate, so conv layers see the target context directly (not only via the
+// residual). Forward: bcx[:, C_gate] += W_c . mean(ctx). Two tiny ops below;
+// the matvec (W_c) + mean reuse the existing linear / colsum kernels.
+// ===================================================================
+
+// Add inj[d] (broadcast over block) to the C_gate slice of bcx [block, 3d]
+// (layout B_gate|C_gate|xin). C_gate occupies columns [d, 2d).
+extern "C" __global__ void cgate_add_f32(
+    float* __restrict__ bcx, const float* __restrict__ inj, int block, int d)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= block * d) return;
+    int j = idx / d, c = idx % d;
+    bcx[(size_t)j * 3 * d + d + c] += inj[c];
+}
+
+// Strided column-sum: out[c] = scale * sum_j x[j*row_stride + col_off + c].
+// Used for ctx mean (row_stride=d, col_off=0, scale=1/n_ctx) AND the conv-inject
+// backward d_inj (x=d_bcx, row_stride=3d, col_off=d, scale=1).
+extern "C" __global__ void colsum_strided_f32(
+    const float* __restrict__ x, float* __restrict__ out,
+    int rows, int row_stride, int col_off, int d, float scale)
+{
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= d) return;
+    float s = 0.0f;
+    for (int j = 0; j < rows; j++) s += x[(size_t)j * row_stride + col_off + c];
+    out[c] = s * scale;
+}

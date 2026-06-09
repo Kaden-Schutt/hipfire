@@ -78,6 +78,7 @@ fn zeros_like(gpu: &mut Gpu, src: &dt::Net) -> dt::Net {
         wq: l.wq.as_ref().map(|t| mk(gpu, t)), wk: l.wk.as_ref().map(|t| mk(gpu, t)),
         wv: l.wv.as_ref().map(|t| mk(gpu, t)), wo: l.wo.as_ref().map(|t| mk(gpu, t)),
         q_norm: l.q_norm.as_ref().map(|t| mk(gpu, t)), k_norm: l.k_norm.as_ref().map(|t| mk(gpu, t)),
+        w_c: l.w_c.as_ref().map(|t| mk(gpu, t)),
         w1: mk(gpu, &l.w1), w3: mk(gpu, &l.w3), w2: mk(gpu, &l.w2),
     }).collect();
     dt::Net { layers, in_proj_v: mk(gpu, &src.in_proj_v), out_proj_v: mk(gpu, &src.out_proj_v), fc: mk(gpu, &src.fc), final_norm: mk(gpu, &src.final_norm) }

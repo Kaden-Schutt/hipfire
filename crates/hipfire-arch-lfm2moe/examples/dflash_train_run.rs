@@ -84,6 +84,7 @@ fn zeros_like(gpu: &mut Gpu, src: &dt::Net) -> dt::Net {
         wq: l.wq.as_ref().map(|t| mk(gpu, t)), wk: l.wk.as_ref().map(|t| mk(gpu, t)),
         wv: l.wv.as_ref().map(|t| mk(gpu, t)), wo: l.wo.as_ref().map(|t| mk(gpu, t)),
         q_norm: l.q_norm.as_ref().map(|t| mk(gpu, t)), k_norm: l.k_norm.as_ref().map(|t| mk(gpu, t)),
+        w_c: l.w_c.as_ref().map(|t| mk(gpu, t)),
         w1: mk(gpu, &l.w1), w3: mk(gpu, &l.w3), w2: mk(gpu, &l.w2),
     }).collect();
     dt::Net { layers, in_proj_v: mk(gpu, &src.in_proj_v), out_proj_v: mk(gpu, &src.out_proj_v), fc: mk(gpu, &src.fc), final_norm: mk(gpu, &src.final_norm) }
@@ -150,7 +151,12 @@ fn main() {
     gpu.transpose_f32(&lm_head_g, &lm_head_T_g, vocab, d_tgt).unwrap();
     eprintln!("lm_head transposed for tiled bwd (+{} GB)", (d_tgt * vocab * 4) / 1_000_000_000);
     // warm-start net + fresh adapters
-    let (body_layers, final_norm) = dt::load_lfm2_warmstart(&mut gpu, &cfg, Path::new(st_path)).expect("warm-start");
+    let (mut body_layers, final_norm) = dt::load_lfm2_warmstart(&mut gpu, &cfg, Path::new(st_path)).expect("warm-start");
+    if std::env::var("HIPFIRE_CONV_INJECT").ok().as_deref() == Some("1") {
+        let mut nc = 0;
+        for li in 0..cfg.n_layers() { if !cfg.is_attn[li] { body_layers[li].w_c = Some(rndv(&mut gpu, d, d, 9100 + li, 0.01)); nc += 1; } }
+        eprintln!("CONV-INJECT ON: W_c added to {nc} conv layers");
+    } else { eprintln!("CONV-INJECT OFF (GQA-only injection)"); }
     let net = dt::Net {
         layers: body_layers,
         in_proj_v: rndv(&mut gpu, d, d_tgt, 1, 1.0 / (d_tgt as f32).sqrt()),
@@ -306,7 +312,7 @@ fn save_net(gpu: &mut Gpu, net: &dt::Net, cfg: &dt::Cfg, path: &str) {
     for (li, l) in net.layers.iter().enumerate() {
         entries.push((format!("layers.{li}.op_norm"), gpu.download_f32(&l.op_norm).unwrap()));
         entries.push((format!("layers.{li}.ffn_norm"), gpu.download_f32(&l.ffn_norm).unwrap()));
-        for (nm, o) in [("in_proj", &l.in_proj), ("conv_w", &l.conv_w), ("out_proj", &l.out_proj), ("wq", &l.wq), ("wk", &l.wk), ("wv", &l.wv), ("wo", &l.wo), ("q_norm", &l.q_norm), ("k_norm", &l.k_norm)] {
+        for (nm, o) in [("in_proj", &l.in_proj), ("conv_w", &l.conv_w), ("out_proj", &l.out_proj), ("wq", &l.wq), ("wk", &l.wk), ("wv", &l.wv), ("wo", &l.wo), ("q_norm", &l.q_norm), ("k_norm", &l.k_norm), ("w_c", &l.w_c)] {
             if let Some(t) = o { entries.push((format!("layers.{li}.{nm}"), gpu.download_f32(t).unwrap())); }
         }
         entries.push((format!("layers.{li}.w1"), gpu.download_f32(&l.w1).unwrap()));
