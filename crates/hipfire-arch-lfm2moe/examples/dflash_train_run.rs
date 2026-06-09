@@ -61,6 +61,20 @@ fn rndv(gpu: &mut Gpu, rows: usize, cols: usize, seed: usize, sc: f32) -> GpuTen
     let v: Vec<f32> = (0..rows * cols).map(|i| (((i.wrapping_mul(2654435761).wrapping_add(seed)) % 2000) as f32 / 1000.0 - 1.0) * sc).collect();
     up(gpu, &v, &[rows, cols])
 }
+// lm_head GEMM over vocab=248K is the training bottleneck. Use the register-
+// tiled kernel (reads each 5GB weight row once per 8-batch-tile, ~8x less
+// bandwidth) — validated bit-equal to the naive linear (test_lmhead_tiled).
+fn lmhead_fwd(gpu: &mut Gpu, out: &GpuTensor, lmhead: &GpuTensor, b: usize, d_tgt: usize, vocab: usize) -> GpuTensor {
+    let logits = gpu.zeros(&[b, vocab], DType::F32).unwrap();
+    gpu.gemm_f32_register_tiled(lmhead, out, &logits, vocab, d_tgt, b).unwrap();
+    logits
+}
+fn lmhead_bwd(gpu: &mut Gpu, dlogits: &GpuTensor, lmhead_t: &GpuTensor, b: usize, d_tgt: usize, vocab: usize) -> GpuTensor {
+    let d_out = gpu.zeros(&[b, d_tgt], DType::F32).unwrap();
+    gpu.gemm_f32_register_tiled(lmhead_t, dlogits, &d_out, d_tgt, vocab, b).unwrap();
+    d_out
+}
+
 fn zeros_like(gpu: &mut Gpu, src: &dt::Net) -> dt::Net {
     let mk = |g: &mut Gpu, t: &GpuTensor| g.zeros(&[t.numel()], DType::F32).unwrap();
     let layers = src.layers.iter().map(|l| dt::LW {
@@ -131,6 +145,10 @@ fn main() {
 
     // frozen head on GPU (faithful lm_head)
     let lm_head_g = up(&mut gpu, &lmhead, &[vocab, d_tgt]);
+    // transposed copy for the backward GEMM (d_out = dlogits . lmhead)
+    let lm_head_T_g = gpu.zeros(&[d_tgt, vocab], DType::F32).unwrap();
+    gpu.transpose_f32(&lm_head_g, &lm_head_T_g, vocab, d_tgt).unwrap();
+    eprintln!("lm_head transposed for tiled bwd (+{} GB)", (d_tgt * vocab * 4) / 1_000_000_000);
     // warm-start net + fresh adapters
     let (body_layers, final_norm) = dt::load_lfm2_warmstart(&mut gpu, &cfg, Path::new(st_path)).expect("warm-start");
     let net = dt::Net {
@@ -144,7 +162,7 @@ fn main() {
     let v_state = zeros_like(&mut gpu, &net);
 
     let bsz = 16usize; let n_ctx = 32usize; let mask_id = 0usize; let gamma = 8.0f32;
-    let warmup = (steps / 20).max(20);
+    let warmup = (steps / 60).max(500).min(1500);
     let (b1, b2, eps_a, wd) = (0.9f32, 0.999f32, 1e-8f32, 0.01f32);
     // seed-anchor: position 0 is the revealed seed (weight 0); predict 1..B with w_k
     let weights: Vec<f32> = (0..bsz).map(|k| if k == 0 { 0.0 } else { (-((k - 1) as f32) / gamma).exp() }).collect();
@@ -201,14 +219,14 @@ fn main() {
         let fn2 = gpu.zeros(&[bsz, d], DType::F32).unwrap();
         gpu.rmsnorm_batched(&body_out, &net.final_norm, &fn2, bsz, d, cfg.eps).unwrap();
         let out = dt::lin(&mut gpu, &fn2, &net.out_proj_v, bsz, d, d_tgt);
-        let logits = dt::lin(&mut gpu, &out, &lm_head_g, bsz, d_tgt, vocab);
+        let logits = lmhead_fwd(&mut gpu, &out, &lm_head_g, bsz, d_tgt, vocab);
         let dlogits = gpu.zeros(&[bsz, vocab], DType::F32).unwrap();
         let loss_t = gpu.zeros(&[bsz], DType::F32).unwrap();
         gpu.ce_loss_bwd_f32(&logits, &targets_g, &weights_g, &dlogits, &loss_t, bsz, vocab).unwrap();
         let loss: f32 = gpu.download_f32(&loss_t).unwrap().iter().sum::<f32>() / wsum;
         running = if step == 1 { loss } else { 0.98 * running + 0.02 * loss };
         // backward
-        let d_out = dt::lin_dx(&mut gpu, &dlogits, &lm_head_g, bsz, d_tgt, vocab);
+        let d_out = lmhead_bwd(&mut gpu, &dlogits, &lm_head_T_g, bsz, d_tgt, vocab);
         let d_fn2 = dt::lin_dx(&mut gpu, &d_out, &net.out_proj_v, bsz, d, d_tgt);
         let g_out_proj_v = dt::lin_dw(&mut gpu, &d_out, &fn2, bsz, d, d_tgt);
         let d_body_out = zt(&mut gpu, bsz * d); let g_final_norm = zt(&mut gpu, d);
@@ -246,7 +264,7 @@ fn main() {
                     let fn2 = gpu.zeros(&[bsz, d], DType::F32).unwrap();
                     gpu.rmsnorm_batched(&body_out, &net.final_norm, &fn2, bsz, d, cfg.eps).unwrap();
                     let out = dt::lin(&mut gpu, &fn2, &net.out_proj_v, bsz, d, d_tgt);
-                    let logits = dt::lin(&mut gpu, &out, &lm_head_g, bsz, d_tgt, vocab);
+                    let logits = lmhead_fwd(&mut gpu, &out, &lm_head_g, bsz, d_tgt, vocab);
                     let lg = gpu.download_f32(&logits).unwrap();
                     // argmax per block position (1..B; pos 0 is the seed)
                     let am: Vec<i32> = (1..bsz).map(|i| {
