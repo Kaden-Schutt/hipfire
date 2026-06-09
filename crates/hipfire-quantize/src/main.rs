@@ -2977,6 +2977,10 @@ fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
 /// Quantize F32 weights to HFQ4-G128: flat 4-bit with 128-weight groups.
 /// Block: [f32 scale][f32 zero][64B nibbles] = 72 bytes per 128 weights (0.5625 B/w).
 /// 14 VGPRs, 100% occupancy. Better quality for small K dimensions.
+///
+/// **Panics** if called when the ragged-group kernel fix is not in place
+/// and k_dim % 128 != 0. Use `quantize_hfq4g128_or_q8` for the safe
+/// fallback.
 fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
     let group_size = 128;
     let block_bytes = 72;
@@ -3023,6 +3027,23 @@ fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
     }
 
     output
+}
+
+/// Quantize a 2D weight tensor, choosing HFQ4G128 when k_dim is aligned
+/// to 128, or falling back to Q8_0 (32-byte blocks, always aligned) when
+/// k_dim % 128 != 0. Avoids the ragged-group kernel bug where whole-tensor
+/// packing disagrees with per-row stride for non-aligned K.
+///
+/// Returns (quantized_bytes, quant_type, group_size, label_str).
+fn quantize_fallback_g128_or_q8(f32_data: &[f32], k_dim: usize) -> (Vec<u8>, QuantType, u32, &'static str) {
+    if k_dim % 128 == 0 {
+        (quantize_hfq4g128(f32_data), QuantType::HFQ4G128, 128u32, "HFQ4G128")
+    } else {
+        eprintln!(
+            "  NOTE: K={k_dim} not divisible by 128, falling back to Q8_0 (group-quant ragged-K protection)"
+        );
+        (quantize_q8f16(f32_data), QuantType::Q8F16, 32u32, "Q8_0")
+    }
 }
 
 // ─── HFQ File Format ────────────────────────────────────────────────────────
@@ -4629,14 +4650,29 @@ fn run_gguf_pipeline(
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
             }
-        } else {
-            // K not divisible by 256 — fall back to HFQ4-G128 (no rotation).
-            // This branch fires for the rare ragged dim; ignores --format
-            // (no G128 variant of mq4/mq6 exists).
+        } else if k_dim % 128 == 0 {
+            // K not divisible by 256 but divisible by 128 — fall back to
+            // HFQ4-G128 (no rotation, no G256 variant of mq4/mq6 exists).
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let q = quantize_hfq4g128(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+        } else {
+            // K not divisible by 128 either — group-quantized formats would
+            // produce misaligned groups (whole-tensor packing vs per-row
+            // stride). Fall back to Q8_0 which has 32-byte blocks and works
+            // for any K divisible by 32.
+            //
+            // Fires for: Gemma4 26B dense FFN down_proj (K=2112, 2112%128=64),
+            // and any future architecture with non-aligned intermediate dims.
+            eprintln!(
+                "  NOTE: K={k_dim} not divisible by 128, falling back to Q8_0 for {}",
+                info.name
+            );
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let q = quantize_q8f16(&f32_data);
+            quant_params += n_elements as u64;
+            (q, QuantType::Q8F16, 32u32, "Q8_0")
         };
 
         total_bytes_out += data.len() as u64;
@@ -5834,6 +5870,7 @@ fn main() {
             let signs2 = gen_fwht_signs(1042, 256);
             let inner_k = inner_shape[1] as usize;
             let supports_g256 = inner_k % 256 == 0;
+            let supports_g128 = inner_k % 128 == 0;
             // K-map: check the parent tensor name directly. The parent
             // (e.g. "...mlp.experts.gate_up_proj") contains "mlp.experts."
             // so kmap_resolve rule 4 matches it. The kmap HashMap was built
@@ -6023,9 +6060,15 @@ fn main() {
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
-                    } else {
+                    } else if supports_g128 {
                         let q = quantize_hfq4g128(&f32_slice);
                         (q, QuantType::HFQ4G128, 128u32)
+                    } else {
+                        // K not divisible by 128 — Q8_0 fallback.
+                        // Avoids ragged-group bug for expert down_proj
+                        // (e.g. Gemma4 26B expert K=704, 704%128=64).
+                        let q = quantize_q8f16(&f32_slice);
+                        (q, QuantType::Q8F16, 32u32)
                     };
                     HfqTensor {
                         name: format!("{parent_owned}{x}.{base_owned}.weight"),
@@ -6059,8 +6102,10 @@ fn main() {
                 "Q8_0"
             } else if supports_g256 {
                 "MQ4G256"
-            } else {
+            } else if supports_g128 {
                 "HFQ4G128"
+            } else {
+                "Q8_0"
             };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
@@ -6463,8 +6508,8 @@ fn main() {
                                 let q = quantize_hfq4g256(&f32_data);
                                 (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                             } else {
-                                let q = quantize_hfq4g128(&f32_data);
-                                (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                                let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                                (q, qt, gs, lbl)
                             }
                         }
                     } else if use_hfq6 {
@@ -6493,8 +6538,8 @@ fn main() {
                             (q, QuantType::HFQ2G256, 256u32, "HFQ2G256")
                         } else {
                             // Fallback to HFQ4 for non-256-aligned
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_mq8g256 && is_embed {
                         let q = quantize_q8f16(&f32_data);
@@ -6603,8 +6648,8 @@ fn main() {
                             (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                         } else {
                             // Fallback to standard HFQ4-G128 for non-256-aligned
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_hfp4 && is_embed {
                         // HFP4 embeddings stay Q8F16 (matches MQ4 / HFQ4 pattern — embedding lookup is
@@ -6623,8 +6668,8 @@ fn main() {
                             (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                         } else {
                             // Fallback to HFQ4-G128 for non-32-aligned ragged dims (rare).
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_mfp4 && is_embed {
                         // MFP4 embeddings stay Q8F16 (same rationale as HFP4 / MQ4).
@@ -6645,8 +6690,8 @@ fn main() {
                         } else {
                             // Fallback to HFQ4-G128 for non-256-aligned ragged dims (rotation
                             // requires 256-element segments). Matches MQ4's ragged fallback.
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_mq6g256 && is_embed {
                         let q = quantize_q8f16(&f32_data);
@@ -6689,8 +6734,8 @@ fn main() {
                             (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
                         } else {
                             // Fallback to HFQ4-G128 for non-256-aligned (no rotation).
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_mq3g256_lloyd {
                         let k_dim = if meta.shape.len() == 2 {
@@ -6876,8 +6921,8 @@ fn main() {
                             let q = quantize_hfq4g256(&f32_data);
                             (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                         } else {
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_hfq4g256 {
                         // Auto-select G128 vs G256 based on K dimension
@@ -6892,12 +6937,12 @@ fn main() {
                             let q = quantize_hfq4g256(&f32_data);
                             (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                         } else if k_dim % 128 == 0 {
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         } else {
                             // Pad to 128-element boundary
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if this_q8 {
                         let q = quantize_q8f16(&f32_data);
@@ -7048,15 +7093,19 @@ fn main() {
             };
             let (quantized, gs) = if k_dim % 256 == 0 {
                 (quantize_hfq4g256(&f32_data), 256u32)
-            } else {
+            } else if k_dim % 128 == 0 {
                 (quantize_hfq4g128(&f32_data), 128u32)
+            } else {
+                (quantize_q8f16(&f32_data), 32u32)
             };
             let qt = if gs == 256 {
                 QuantType::HFQ4G256
-            } else {
+            } else if gs == 128 {
                 QuantType::HFQ4G128
+            } else {
+                QuantType::Q8F16
             };
-            let label = if gs == 256 { "HFQ4G256" } else { "HFQ4G128" };
+            let label = if gs == 256 { "HFQ4G256" } else if gs == 128 { "HFQ4G128" } else { "Q8_0" };
             eprintln!(
                 "  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [vision]",
                 name,
