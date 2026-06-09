@@ -11766,6 +11766,20 @@ fn generate_gemma4(
         }
     }
 
+    // Measure prefill + decode separately for perf reporting.
+    let prefill_ms = decode_t0.duration_since(t0).as_millis();
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let prefill_tok_s = if prefill_ms > 0 {
+        prompt_ids.len() as f64 / (prefill_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_ms > 0 {
+        generated_count as f64 / (decode_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
     let elapsed = t0.elapsed().as_secs_f64();
     let tok_s = if elapsed > 0.0 {
         (prompt_ids.len() + generated_count) as f64 / elapsed
@@ -11774,8 +11788,9 @@ fn generate_gemma4(
     };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#,
-        id, generated_count, tok_s
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        id, generated_count, tok_s,
+        prompt_ids.len(), prefill_ms, prefill_tok_s, decode_tok_s, prefill_ms
     );
     let _ = stdout.flush();
 }
