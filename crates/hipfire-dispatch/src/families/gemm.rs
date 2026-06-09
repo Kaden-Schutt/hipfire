@@ -74,6 +74,18 @@ impl GemmFamily {
                 }
             }
             DType::HFQ4G128 => KernelKey::GemmHfq4G128,
+            // MQ4G256 uses the same 136-byte/group layout as HFQ4G256;
+            // the kernel binary is shared. The difference is the input
+            // rotation (FWHT applied before the GEMM), which the caller
+            // handles. WMMA is preferred where available.
+            DType::MQ4G256 => {
+                let preferred = KernelKey::GemmHfq4G256Wmma;
+                if self.registry.resolve(preferred, ctx, shape).is_ok() {
+                    preferred
+                } else {
+                    KernelKey::GemmHfq4G256
+                }
+            }
             _ => {
                 return Err(DispatchError::UnsupportedVariant {
                     family: "gemm", variant: "plain",

@@ -36,6 +36,29 @@ use hipfire_dispatch::families::gemv::WeightRef;
 /// Only HFQ4G256, HFQ4G128 have batched kernels; other dtypes fall back to
 /// the repeated-GEMV loop (same as `weight_gemm`'s fallback).
 #[inline]
+/// Env gate for WMMA prefill. Default OFF because WMMA F16 input quantization
+/// loses ~3 mantissa bits vs F32 scalar, so WMMA results are NOT byte-identical
+/// to the scalar GEMV path. Set HIPFIRE_WMMA_PREFILL=1 to opt in.
+fn wmma_prefill_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| std::env::var("HIPFIRE_WMMA_PREFILL").map_or(false, |v| v == "1"))
+}
+
+/// Batched GEMM for prefill projections.
+///
+/// Scalar path: routes through `GemmFamily::run_key` with the appropriate
+/// kernel key for the weight dtype.
+///
+/// WMMA path (opt-in via `HIPFIRE_WMMA_PREFILL=1`): routes through
+/// `GemmFamily::run` which resolves WMMA-eligible dtypes to their WMMA
+/// kernel variant. The WMMA path converts F32 input to F16 automatically
+/// (Bug 1 fix: `gemm_hfq4g256_wmma` now calls `ensure_fp16_x`).
+///
+/// MQ4G256 weights (Bug 2 fix): `GemmFamily::resolve` now maps
+/// `DType::MQ4G256` → `GemmHfq4G256Wmma` / `GemmHfq4G256`, sharing the
+/// same kernel binary since the layout is identical (136 B/group).
+///
+/// For dtypes that have no GEMM kernel, falls back to per-token GEMV.
 fn run_prefill_gemm(
     gpu: &mut Gpu,
     w: &WeightTensor,
@@ -43,9 +66,36 @@ fn run_prefill_gemm(
     y: &GpuTensor,
     batch_size: usize,
 ) -> HipResult<()> {
+    let ctx = DispatchCtx::new(gpu);
+    let w_ref = WeightRef {
+        buf: &w.buf,
+        dtype: w.gpu_dtype,
+        m: w.m,
+        k: w.k,
+        row_stride: w.k,
+        rotation: None,
+        awq_scale: None,
+    };
+    let params = GemmParams { w: &w_ref, x, y, batch_size };
+    let family = llama::gemm_family();
+
+    if wmma_prefill_enabled() {
+        // WMMA path: use GemmFamily::run which resolves the best kernel
+        // for each dtype (WMMA where available, scalar fallback otherwise).
+        // The F32→F16 conversion is handled inside the kernel methods.
+        if family.run(&ctx, gpu, &params).is_ok() {
+            return Ok(());
+        }
+        // If GemmFamily::run returns UnsupportedVariant, fall through to
+        // the explicit key path below.
+    }
+
+    // Scalar path (default) or fallback for unsupported WMMA dtypes.
     let key = match w.gpu_dtype {
         DType::HFQ4G256 => hipfire_dispatch::types::KernelKey::GemmHfq4G256,
         DType::HFQ4G128 => hipfire_dispatch::types::KernelKey::GemmHfq4G128,
+        DType::MQ4G256 => hipfire_dispatch::types::KernelKey::GemmHfq4G256, // same kernel, layout-identical
+        DType::Q8_0 => hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
         // No batched GEMM kernel for this dtype — fall back to repeated GEMV.
         // This matches the old `weight_gemm()` fallback path.
         _ => {
@@ -61,18 +111,7 @@ fn run_prefill_gemm(
             return Ok(());
         }
     };
-    let ctx = DispatchCtx::new(gpu);
-    let w_ref = WeightRef {
-        buf: &w.buf,
-        dtype: w.gpu_dtype,
-        m: w.m,
-        k: w.k,
-        row_stride: w.k,
-        rotation: None,
-        awq_scale: None,
-    };
-    let params = GemmParams { w: &w_ref, x, y, batch_size };
-    llama::gemm_family()
+    family
         .run_key(key, &ctx, gpu, &params)
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
 }
