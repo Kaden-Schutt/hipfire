@@ -1,295 +1,247 @@
-# Adversarial review: HFQ4G128 ragged-kernel fix options
+# Review of updated ragged-kernel fix plan (rev 2026-06-09)
 
-**Review of:** `findings/gemma4_ragged_kernel.md` (2026-06-08)  
-**Reviewer:** DS4 agent, adversarial pass  
-**Date:** 2026-06-08
+**Review of:** `findings/gemma4_ragged_kernel.md` (rev 2026-06-09)  
+**Reviewer:** DS4 agent (session 24b)  
+**Date:** 2026-06-09
 
-## Summary
+## Verdict
 
-The original document correctly identifies the root cause (`K/128`
-truncating division in `gemv_hfq4g128.hip` line 18) and the affected
-dimensions. However, it understates the kernel-change complexity, omits
-a quantize-time defense option, and understates the scope of the bug
-(which affects **~75 group-quantized kernel files**, not just 4).
+The corrected root-cause model is **right** and materially changes the
+fix approach. My earlier analysis (ceiling-division + x-padding, no
+re-quant) was wrong because it assumed per-row `ceil`-packing. The
+quantizer packs the whole `[M*K]` tensor as a flat group stream; the
+kernel strides per-row with `floor(K/g)*block`. When `K%g≠0` these
+disagree and the stride error accumulates across rows → whole-row
+corruption for rows > 0. This matches the 3.7× oracle error.
 
-The recommended approach is still **fix the kernels** (ceiling division
-+ x-padding in callers), but the mechanics differ from what the document
-describes.
-
----
-
-## Flaw 1 — Option A understates kernel-change complexity
-
-The document says "~5 lines each" and proposes an OOB guard on x[]
-reads:
-
-```c
-float load_x(int idx, int K, const float* x) {
-    return (idx < K) ? x[idx] : 0.0f;
-}
-```
-
-This doesn't address the **quad-unrolled loop structure** in the 3
-ParoQuant indexed variants (`gemv_paro_q4g128_moe_gate_up_indexed.hip`,
-etc.). Those kernels unroll groups into quads-of-4 with tail handling:
-
-```c
-const int quads = groups_per_row >> 2;   // groups / 4
-const int tail = groups_per_row & 3;     // groups % 4
-```
-
-For K=704, `ceil(704/128)=6`, `quads=1`, `tail=2`. Groups 0-3 go
-through the quad loop (all full — no OOB issue). Groups 4-5 are handled
-by the `if (tail >= 1)` / `if (tail >= 2)` tail blocks. Group 5 is the
-partial group (real elements 640-703, padded 704-767). Threads 16-31
-(tid×4 = 64-124) in that group have all-4-elements past-end.
-
-The guarding must go into the `TAIL_DOG` macro or each tail block.
-That's not "~5 lines" — it requires either:
-
-**(a)** A guarded variant of the macro (doubles the macro surface):  
-```c
-#define TAIL_DOG_GUARDED(b0, b1, sc, zp, base_idx, a, K) \
-    (a) += (idx< K ? (sc*(float)((b0)&0xFu)+zp)*x[(base_idx)] : 0.0f) + ...
-```
-plus conditionals to select the right macro per tail block.
-
-**(b)** A `bool partial = ((K % 128) != 0)` and branching inside each
-tail block to pick guarded vs. unguarded loads.
-
-Either way, **15-25 lines per variant, not 5**. The simple
-`gemv_hfq4g128.hip` (plain for-loop) is the easy case.
-
-### Simpler alternative not considered: x-padding in caller
-
-A cleaner approach is:
-
-1. **Kernel:** change `K/128` → `(K+127)/128`. **No loop body changes.**
-   No guards, no macro variants, no tail modifications.
-
-2. **Rust caller:** zero-pad the x vector to `ceil(K/128)*128` before
-   dispatch. For single-token decode, this is ≤508 bytes (127 floats) —
-   negligible. For batched variants, each row of the activation batch
-   gets padded.
-
-3. **Why this works:** padded nibbles dequantize to `zero = min_val`
-   (not 0.0f — see Flaw 2). Padded x positions are exactly `0.0f`.
-   Contribution: `min_val * 0.0f = 0.0f`. ✓
-
-The kernel diff reduces to literally one line per file: `s/K \/ 128/(K + 127) \/ 128/`.
-No loop nesting changes, no macro variants, no branch divergence concerns.
-
-The Rust-side change is 2-3 lines per call site: compute `padded_k =
-(k + 127) / 128 * 128`, zero-pad x.
-
-**Recommendation:** use x-padding, not OOB guards. It's mechanically
-simpler across all kernel variants and has zero GPU-side branch cost.
+I agree with the expanded scope, the priority ordering (A→B→C→D), and
+the rejection of no-re-quant approaches. Below are the items I think
+need correction or strengthening.
 
 ---
 
-## Flaw 2 — Option A misstates padded nibble dequantization
+## ✅ Things the updated plan gets right
 
-The document says:
+1. **Root cause is whole-tensor vs per-row mismatch.** Verified:
+   `quantize_hfq4g128` operates on `f32_data.len()` = M\*K flat slice.
+   `dequant_hfq4` in `dots_ocr.rs:670` walks `n_groups =
+   n_elements.div_ceil(group_size)` continuously. The kernel strides
+   with `floor(K/128)*72`. These disagree for K%128≠0. ✓
 
-> Padded nibbles are `0` → dequant to `zero` (= `min_val`). Guarded x
-> reads return `0.0` for OOB indices. Contribution of padded elements:
-> `min_val × 0.0 = 0.0`.
+2. **Re-quant is mandatory.** You cannot fix this with kernel-only
+   changes because the on-disk bytes are whole-tensor packed. No amount
+   of ceiling division, x-padding, or metadata helps when the group
+   boundaries don't align with row boundaries. ✓
 
-The first sentence is correct — but dequant of nibble 0 is `zero`, and
-`zero` is `min_val`, **not 0.0**. The document then uses `0.0` for x
-(guarded) which makes `min_val × 0.0 = 0.0`. This is arithmetically
-correct but conceptually conflates two different zeros:
+3. **3.7× error is consistent with whole-row corruption, not 9% loss.**
+   If only the last group were dropped per row, the error would be
+   bounded by the last group's contribution (~9%). The observed 3.7×
+   error across ALL expert down_proj output is only possible if later
+   rows are reading misaligned scale/zero/nibbles. ✓
 
-| Source | Value | Reason |
-|--------|-------|--------|
-| Padded weight nibble → dequant | `min_val` | Nibble 0 → scale×0 + zero = zero = min_val |
-| Guarded/OOB x read | `0.0f` | Branch returns 0.0 for idx ≥ K |
-| Product | `0.0f` | Anything × 0.0 = 0.0 |
+4. **MQ\* rotated format caveat.** FWHT rotation operates on
+   fixed-size segments; a ragged tail changes the rotation basis.
+   Keeping the fallback to Q8 for rotated formats on non-aligned K is
+   the right call. ✓
 
-This matters because if someone were to implement protection via a
-saturating clamp (`idx = min(idx, K-1)`) instead of zeroing, they'd get
-`min_val × x[K-1]` — a systematic positive bias that passes most tests
-but silently corrupts that column. The document should explicitly say:
-**zero the contribution, do not clamp the index**.
+5. **Option C should be both quantize-time and load-time.**
+   Quantize-time auto-fallback to Q8 is strictly better UX than
+   load-time refusal. ✓
 
----
-
-## Flaw 3 — Option B silently degrades model quality
-
-> Pad f32 weight rows to next_multiple_of_128(K) with zeros before quantizing.
-
-Zero-padding weights with 0.0f changes the group min/max computation for
-the last group. If real weights are e.g. [0.3, 0.8], padding with 0.0
-extends the range from [0.3, 0.8] to [0.0, 0.8], consuming an extra
-(0.3 / 15.0) of the 4-bit quantization range on dead values. Every
-*real* weight in that group loses ~0.02 effective bits of precision.
-
-For the Gemma4 expert down_proj (K=704, group=128), the 6th group has 64
-real weights. If their range is e.g. [0.02, 0.35] and zero-pad extends
-min to 0.0, the resolution loss is `(0.02 / (0.35-0.0)) / (0.02 /
-(0.35-0.02))` ≈ 6% worse quantization error for 64 weights — on top of
-the 4-bit quantization error already present. This is a per-group
-quality regression, not a "mathematically clean" solution as the
-document claims.
-
-**Verdict:** avoid Option B. Quantizing zero-padded rows introduces a
-quality regression with no compensating benefit over Option A.
+6. **Rejection of whole-tensor-aware kernel.** Trying to make the
+   kernel understand the flat layout would require group-boundary
+   cross-referencing per row — impractical for a GEMV inner loop. ✓
 
 ---
 
-## Flaw 4 — Scope is ~75 kernel files, not 4
+## ⚠️ Items that need correction
 
-The document lists only the 4 G128 ParoQuant variant files. But the grep
-in the codebase reveals **every group-quantized kernel** — HFQ4G256,
-MQ4G256, MQ3G256, HFQ3G256, HFQ2G128, HFQ6G256, etc. — uses the same
-`K / group_size` truncating pattern. That's ~75 HIP files.
+### 1. `profile.rs` does NOT under-allocate GPU buffers
 
-| Family | Group size | File count (approx) | Affected by K%group_size≠0? |
-|--------|-----------|---------------------|---------------------------|
-| HFQ4G128 | 128 | 4 | ✅ (Gemma4 down_proj) |
-| ParoQ4G128 | 128 | 3 | ✅ (same shapes) |
-| HFQ4G256 | 256 | ~40 | ✅ (Gemma4 down_proj 704%256=192, 2112%256=64) |
-| MQ4G256 | 256 | ~8 | ✅ (ditto) |
-| MQ3G256 | 256 | ~4 | ✅ |
-| HFQ3G256 | 256 | ~4 | ✅ |
-| MQ2G256 | 256 | ~6 | ✅ |
-| HFQ6G256 | 256 | ~6 | ✅ |
-| HFQ2G128 | 128 | 1 | ✅ |
-| HFQ4G1024 | 1024 | 1 | ✅ (K%1024 check) |
-| HFQ4G512 | 512 | 1 | ✅ |
+The document states:
 
-**Verdict:** the bug is pervasive and systematic. The fix (whether
-ceiling-division or metadata or refusal) should cover ALL group-quantized
-kernels, not just G128. The document should be retitled to reflect this
-scope.
+> The runtime byte allocator truncates too — `profile.rs:157` /
+> `profile.rs:188` use `k / 128` — so it under-sizes the weight buffer
+> relative to the (larger) continuous on-disk blob.
 
-The good news: for currently-shipping models (Qwen3.5/3.6, LLaMA arch),
-all intermediate/hidden dimensions happen to be multiples of common
-group sizes, so the bug is latent. It only manifests with Gemma4's
-unusual `moe_intermediate=704`. But it **will** manifest again for any
-future architecture with non-aligned dimensions.
+This is **incorrect.** The `profile.rs` functions
+(`hfq4g128_weight_bytes`, `gemv_hfq4g128_bytes`, etc.) are used **only
+for performance counter byte-counting** (`begin_timer` in `gemv.rs`).
+They estimate the bytes transferred so the profiler can report
+bandwidth. They are never used for GPU allocation.
 
----
-
-## Flaw 5 — Option C is a valid defense-in-depth but too narrow
-
-> Add a validation gate: when loading a model, check if any HFQ4G128
-> tensor has K % 128 ≠ 0.
-
-This check should cover **all group-quantized formats**, not just
-HFQ4G128. The gate should be keyed off the format's group size, which is
-already known at load time:
+The actual allocation path is:
 
 ```rust
-fn validate_group_alignment(dtype: DType, k: usize) -> Result<()> {
-    let g = dtype.group_size();  // 128 for HFQ4G128, 256 for MQ4G256, etc.
-    if g > 0 && k % g != 0 {
-        return Err(format!("K={k} not multiple of group_size={g} for {dtype:?}"));
-    }
-    Ok(())
-}
+// crates/hipfire-runtime/src/hfq.rs:633 (and gemma4.rs:553)
+let buf = gpu.upload_raw(data, &[data.len()])?;
 ```
 
-Additionally: this check should happen at **quantize time**, not just
-load time. The quantizer should refuse to produce group-quantized
-weights for K%group_size≠0 and fall back to Q8 (which has no group
-constraint). This is better UX than a load-time refusal — the user gets
-a working model with Q8 for the non-aligned tensors.
+`upload_raw` (`dispatch.rs:1176`) does `self.hip.malloc(data.len())`
+— the full on-disk blob size. No truncation. The GPU buffer contains
+the entire whole-tensor-packed weight data.
 
-The `--expert-q8` quantizer flag (commit `f9f0c574`) partially
-implements this for expert weights, but doesn't cover dense FFN
-down_proj (K=2112, 2112%128=64, 2112%256=64) or arbitrary future shapes.
+**Impact on the plan:** Option A step 3 says "fix `profile.rs:157`
+and `:188` (`k / group`) to `ceil`, or they under-size the
+re-quantized weight → OOB device read." After re-quantization to
+per-row packing, the kernel's per-row stride will be correct, and the
+GPU buffer will still be fully uploaded. The `profile.rs` fix is a
+nice-to-have for accurate bandwidth reporting but is NOT a correctness
+requirement. It should be reclassified as a cleanup, not a ship-blocker.
 
----
+### 2. CPU dequant path must also be updated
 
-## Flaw 6 — Missing option: store groups_per_row in model metadata
+The plan's Option A focuses on the quantizer and GPU kernels but
+doesn't mention the CPU dequantization paths. After per-row
+re-quantization, the on-disk layout changes from whole-tensor-flat to
+per-row-grouped. Any code that reads the weight data using the old
+flat-layout assumption will break.
 
-The quantizer already knows the exact group count (`n_blocks`). Storing
-it per-tensor in the model metadata would eliminate the computation
-error entirely:
+Known CPU consumers:
 
-```rust
-struct TensorMeta {
-    dtype: DType,
-    shape: [usize; 2],  // [M, K]
-    groups_per_row: u32,  // = ceil(K / group_size), stored at quantize time
-    ...
-}
-```
+- `dequant_hfq4()` in `crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:670`
+  — walks `n_groups = n_elements.div_ceil(group_size)` continuously.
+  **Will produce wrong results** after per-row re-quant unless updated
+  to stride per-row.
 
-The kernel receives `groups_per_row` as a parameter instead of deriving
-it from `K / group_size`. This:
-- Eliminates the bug at the root (no computation, no error)
-- Works for any group size, any K
-- No ceiling division, no x-padding, no OOB guards
-- Backward-compatible: add field to metadata, kernels that ignore it use
-  the old K/group_size formula (still buggy, but a per-kernel rollout)
+- `repack_awq_to_hfq4g128()` in `crates/hipfire-runtime/src/hfq.rs:930`
+  — this one IS already per-row (`groups_per_row = in_dim / group_size`,
+  `bytes_per_row = groups_per_row * 72`). **Already correct** after
+  re-quant (assuming truncating division is also fixed to ceil for
+  ragged K). But note: this function uses truncating division for
+  `groups_per_row` — same class of bug if K%128≠0 and the input is AWQ.
+  Not urgent (AWQ weights tend to have aligned K) but worth noting.
 
-**Verdict:** this is the cleanest long-term fix and should be adopted as
-the canonical approach. Existing kernels can be mechanically patched
-(ceiling division) as the fast path.
+- The `load_gemma4_weight` / `load_weight_tensor` functions — these
+  upload raw bytes without interpreting the layout, so they're layout-
+  agnostic. No change needed.
 
----
+**Recommendation:** Add a step to Option A: audit and update all CPU
+dequant paths to use per-row stride = `ceil(K/g) * block_bytes`.
 
-## Updated Recommendation
+### 3. Format version bump or layout flag needed
 
-**Phase 1 (immediate, fix the bug):** Ceiling-division + x-padding.
+Per-row re-quantization changes the on-disk binary layout. Old models
+(whole-tensor-packed) will be misinterpreted by new code (per-row-
+stride), and vice versa. The plan doesn't address backward
+compatibility.
 
-- Change `K / group_size` → `(K + group_size - 1) / group_size` in all
-  group-quantized GEMV kernels (~75 files, mechanical sed).
-- For each Rust call site, zero-pad x to `ceil(K/group_size) * group_size`.
-  This is 2-3 lines per GPU method, concentrated in the `gemv.rs` dispatch.
-- This fixes correctness for all current and future models with zero
-  kernel loop-body changes.
+Options:
 
-**Phase 2 (load-time defense):** Group-alignment validation gate.
+- **Bump `HFQ_VERSION`** from 1 to 2. Old code refuses v2 models with
+  "unsupported format version." New code reads v2 with per-row stride.
+  Old v1 models are still loadable by new code (detect version, use
+  flat stride). This is the safest approach.
 
-- At model load, for every group-quantized tensor, assert
-  `K % dtype.group_size() == 0`. Refuse to load with a clear error if
-  the kernel fix hasn't been deployed to all kernels yet. Once Phase 1
-  covers all kernels, this gate becomes a defense-in-depth check.
+- **Add a per-tensor layout flag** (whole-tensor vs per-row) in the
+  metadata. More granular but more complex.
 
-**Phase 3 (quantize-time defense):** Auto-fallback in quantizer.
+**Recommendation:** bump `HFQ_VERSION` to 2 and handle v1/v2 in the
+load path. Old models (v1) continue to work (using the old stride,
+which is correct for their layout since all v1 dims were aligned). New
+models with ragged K get v2 layout and per-row stride.
 
-- In the quantizer, when a weight tensor has `K % group_size ≠ 0`,
-  auto-fallback to Q8 for that tensor instead of silently producing
-  a ragged group. This is better UX than load-time refusal.
+### 4. Weight file size change is understated
 
-**Phase 4 (long-term):** Store `groups_per_row` in model metadata.
+The plan says "weight files grow by ≤ g-1 extra nibbles per row." The
+actual growth is per-row tail groups: for K=704 with g=128, each row
+gains 1 full group (72 bytes) — not just a few nibbles.
 
-- Add `groups_per_row: u32` to the per-tensor metadata. Kernels receive
-  it as a parameter, eliminating the `K / group_size` computation
-  entirely. Roll out per-kernel-family. Backward-compatible (old kernels
-  ignore the metadata field; old models without the field use ceiling
-  division).
+For the 26B-A4B expert down_proj per layer:
+- 128 experts × M=2816 rows × ceil(704/128)=6 groups × 72 B = 155.6 MB
+- Old: 128 × 2816 × ceil(2816×704/128)×72 / 2816 ≈ 128 × 1115136 = 142.7 MB
+- Delta: ~13 MB per layer's expert down_proj
 
----
-
-## Items the original document got right
-
-- Root cause identification: `K / 128` truncating division, quantizer
-  writes `ceil(K/128)` groups. ✓
-- Affected dimensions correctly identified (704, 2112). ✓
-- Recognition that Q8_0 (32-byte blocks) is immune. ✓
-- Recommendation of Option A (kernel fix) + Option C (validation gate)
-  as defense-in-depth. ✓ (though the mechanics need refinement)
-- Option D accurately characterized as a workaround, not a fix. ✓
+Over 30 layers: ~390 MB total growth across all expert down_proj
+tensors. For dense down_proj: ~3.4 MB per layer, ~102 MB over 30
+layers. Total model growth: ~500 MB (from ~15.6 GB to ~16.1 GB). Small
+but worth stating precisely.
 
 ---
 
-## Items the original document missed
+## ⚠️ Items that need strengthening
 
-1. The quad-unrolled loop structure in ParoQuant kernels makes OOB
-   guarding more invasive than stated.
-2. Padded nibble dequant is `min_val`, not `0.0f` — the distinction
-   matters for implementation correctness.
-3. Option B (zero-pad weights) introduces a per-group quality regression
-   by altering the last group's min/max range.
-4. ~75 kernel files have the same pattern, not just 4.
-5. Validation gate should cover all group-quantized formats, not just
-   HFQ4G128.
-6. Quantize-time auto-fallback to Q8 is better UX than load-time refusal.
-7. Storing `groups_per_row` in model metadata is the cleanest long-term
-   fix and eliminates the class of bug entirely.
-8. x-padding in callers is mechanically simpler than OOB guards and
-   should be the recommended implementation of Option A.
+### 5. The quantizer change should be a separate function, not in-place
+
+The plan says to change the quantizer to pack per-row. Rather than
+modifying the existing `quantize_hfq4g128` in-place (which would break
+the CPU dequant for dots_ocr and any other consumer), introduce a new
+function like `quantize_hfq4g128_per_row(f32_data: &[f32], m: usize,
+k: usize) -> Vec<u8>` that takes shape information and groups within
+rows. Keep the old function for backward compat (or gate on version).
+
+### 6. The "dense FFN down_proj runs for every token" observation deserves more emphasis
+
+The plan correctly notes:
+
+> Dense FFN down_proj (K=2112) runs for every token, not just routed
+> experts — likely the higher-impact corruption, despite the MoE framing.
+
+This is an important insight. The dense FFN is on ALL 30 layers and
+processes EVERY token. If it's corrupted, the entire model output is
+garbage — not just the MoE branch. The expert down_proj only activates
+for routed tokens, so its corruption is partially masked by the dense
+FFN path. The dense FFN down_proj corruption (K=2112, 2112%128=64) is
+the PRIMARY source of model-level garbage, not the expert weights.
+
+This should be reflected in the priority: if we fix only the quantizer
+and re-quantize only dense FFN down_proj to Q8, we might already get a
+coherent model even with broken expert HFQ4G128. (The all-Q8 model's
+coherence confirms this — Q8 dense FFN + Q8 experts works.)
+
+### 7. Quad-unrolled kernel tail handling complexity is real but manageable
+
+The plan acknowledges "~15–25 lines per variant, not '~5 lines'" for
+the ParoQuant indexed kernels. This is accurate. However, it should
+also note that after per-row re-quantization, the kernel's ceiling
+division + OOB guard is still needed because the per-row tail group
+exists (it's just properly padded now). The tail group has padded
+nibbles (→ min_val) and the kernel must zero the contribution of those
+elements. The x-padding approach (zero-pad activation to
+`ceil(K/g)*g`) is still the cleanest kernel-side implementation — one
+line per kernel, no tail block modifications.
+
+---
+
+## Items I now retract from my earlier adversarial review
+
+- **"Scope is ~75 kernel files"** — I stand by the number but the
+  updated plan correctly distinguishes "raw file count" from "genuinely
+  affected reachable kernels." The actual affected set depends on which
+  formats reach which weights with ragged K. Not all 75 files will fire
+  for any given model.
+
+- **"x-padding in caller is simplest"** — still true mechanically
+  (one-line kernel change), but now that re-quant is mandatory anyway,
+  the x-padding benefit is smaller relative to the total change. The
+  OOB guard approach is equally valid in the context of a full re-quant.
+
+---
+
+## Revised priority list
+
+1. **Quantizer:** new `quantize_hfq4g128_per_row` function. Gate on
+   `HFQ_VERSION=2`. Handle the per-row tail group correctly (stats over
+   real elements only, pad nibbles to zero-point).
+
+2. **HFQ_VERSION bump:** v2 = per-row layout. v1 loader unchanged.
+   New code handles both.
+
+3. **Re-quantize 26B-A4B** with the new per-row quantizer for
+   down_proj tensors (dense K=2112, expert K=704).
+
+4. **Kernel ceiling division + OOB handling** in the GEMV/GEMM kernels
+   that will touch the re-quantized weights. For Gemma4 26B:
+   `gemv_hfq4g128.hip` and the 3 ParoQuant indexed variants.
+
+5. **CPU dequant audit:** update `dequant_hfq4` and any other flat-
+   layout consumer to use per-row stride.
+
+6. **profile.rs cleanup:** fix bandwidth estimation (truncating → ceil).
+   Not correctness-critical.
+
+7. **Load-time validation gate** (Option C): refuse ragged-K group-
+   quant tensors that haven't been re-quantized. Defense-in-depth.
+
+8. **Quantize-time auto-fallback:** when K%g≠0, auto-select Q8 for that
+   tensor instead of producing a potentially-broken HFQ4.
