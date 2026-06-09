@@ -194,3 +194,46 @@ Expected: 5–10× improvement on projection-dominated path. Actual speedup depe
 ---
 
 *Revised 2026-06-09 after profiling and bug fixes. Profile data in `findings/gemma4_prefill_profile_12b_q8.md`. Adversarial reviews in `findings/gemma4_prefill_wmma_plan_rev_glm5.md`, `findings/gemma4_prefill_wmma_plan_rev_gemini.md`, `findings/gemma4_prefill_wmma_plan_rev_claude.md`. Bug fixes in commit `d1b1a488`.*
+## 8 · Measured perf results (2026-06-09)
+
+### Short prompt (17 tokens, "What is France?")
+
+| Path | Prefill time | Prefill tok/s | Decode tok/s | TTFT |
+|---|---|---|---|---|
+| Per-token decode | 1041ms | 16.3 | 13.9 | 1041ms |
+| Batched scalar | 876ms | 19.4 | 15.7 | 876ms |
+| **WMMA batched** | **160ms** | **106.2** | **16.9** | **160ms** |
+
+**6.5× prefill speedup for short prompts.** TTFT drops from 1.04s to 0.16s.
+
+### Long prompt (1279 tokens)
+
+| Path | Prefill time | Prefill tok/s | Decode tok/s | TTFT |
+|---|---|---|---|---|
+| Per-token decode | 93,610ms | 13.7 | 10.6 | 93.6s |
+| Batched scalar | 93,659ms | 13.7 | 10.6 | 93.7s |
+| WMMA batched | 93,668ms | 13.7 | 10.5 | 93.7s |
+
+**0× improvement.** Per-token attention dominates wall-clock time at long contexts.
+
+### Root cause: GPU utilization
+
+rocprof on 1279-token prompt:
+- GPU compute: 26,836ms (GEMV 23,870 + attn 2,966)
+- Wall time: 93,610ms
+- **GPU utilization: 28.7%** — the CPU is the bottleneck
+
+The per-token attention loop issues ~700K HIP operations (1279 tokens × 48 layers × ~12 calls each). The GPU is idle 71% of the time waiting for the CPU to stage the next dispatch. Batched GEMM helps projections but doesn't reduce the attention dispatch count.
+
+### Revised milestone plan
+
+**Milestone 1 (SHIPPED):** WMMA batched projections for short/medium prefill. 6.5× for ≤32 tokens, diminishing returns for longer contexts. `HIPFIRE_WMMA_PREFILL=1` and `HIPFIRE_BATCHED_PREFILL=1` gates.
+
+**Milestone 2 (NEXT):** Batched attention for long-context prefill. This is the critical missing piece for 1279+ token contexts. Options:
+- **a)** Batched q8 KV write + batched flash attention (new ring-buffer-aware kernels)
+- **b)** CPU-side pipelining — overlap attention dispatch with GEMV computation
+- **c)** CuDNN-style flash attention with batched inputs (leverage ROCm library)
+
+Each approach needs ring-buffer cache_capacity support for q8 sliding KV.
+
+**Milestone 3:** 26B-A4B MoE batched prefill (currently gated out due to `apply_moe_branch_batched` token attractor).
