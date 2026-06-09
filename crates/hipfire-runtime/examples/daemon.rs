@@ -833,6 +833,192 @@ impl Qwen35PrefillBatchBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Qwen35DecodeBatchBackend {
+    SerialReference,
+    FusedDenseLayerChunked,
+}
+
+impl Qwen35DecodeBatchBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SerialReference => "serial_reference",
+            Self::FusedDenseLayerChunked => "fused_dense_layer_chunked",
+        }
+    }
+}
+
+fn select_qwen35_decode_batch_backend(
+    requested: &str,
+    arch_id: u32,
+    session_count: usize,
+) -> Result<Qwen35DecodeBatchBackend, String> {
+    match requested {
+        "" | "auto" | "serial" | "serial_reference" => {
+            Ok(Qwen35DecodeBatchBackend::SerialReference)
+        }
+        "off" => Err(
+            "generate_batch_decode_step disabled by HIPFIRE_QWEN35_DECODE_BATCH=off".to_string(),
+        ),
+        "fused" | "fused_dense" | "fused_dense_layer_chunked" => {
+            if arch_id != 5 {
+                return Err(format!(
+                    "qwen35 fused dense decode batch requested, but arch_id={arch_id} is not dense Qwen35"
+                ));
+            }
+            if session_count < 2 {
+                return Err(
+                    "qwen35 fused dense decode batch requires at least two sessions".to_string(),
+                );
+            }
+            Ok(Qwen35DecodeBatchBackend::FusedDenseLayerChunked)
+        }
+        "fused_grouped_moe" | "grouped_moe" => {
+            Err("qwen35 grouped-MoE fused decode batch is not implemented yet".to_string())
+        }
+        other => Err(format!(
+            "unsupported HIPFIRE_QWEN35_DECODE_BATCH={other}; expected auto, serial, fused, or off"
+        )),
+    }
+}
+
+fn qwen35_fused_dense_decode_signature(
+    state: &Qwen35RequestSessionState,
+) -> qwen35::DensePrefillSessionBatchStateSignature {
+    qwen35::DensePrefillSessionBatchStateSignature {
+        kv_physical_cap: state.kv_cache.physical_cap,
+        kv_compact_offset: state.kv_cache.compact_offset,
+        kv_quantized: state.kv_cache.quantized,
+        kv_quant_q8: state.kv_cache.quant_q8,
+        kv_quant_asym2: state.kv_cache.quant_asym2,
+        kv_quant_asym3: state.kv_cache.quant_asym3,
+        kv_quant_asym4: state.kv_cache.quant_asym4,
+        kv_quant_fwht: state.kv_cache.quant_fwht,
+        dn_quant: state.dn_state.quant,
+    }
+}
+
+fn validate_qwen35_fused_dense_decode_session_signatures(
+    config: &qwen35::Qwen35Config,
+    signatures: &[qwen35::DensePrefillSessionBatchStateSignature],
+    session_count: usize,
+) -> Result<(), String> {
+    let execution_plan = qwen35::DensePrefillSessionBatchExecutionPlan {
+        rounds: Vec::new(),
+        state_routes: Vec::new(),
+        total_rows: session_count,
+        max_rows_per_round: session_count,
+        multi_state_rounds: 1,
+        multi_state_prefix_rounds: 1,
+        multi_state_prefix_rows: session_count,
+        singleton_tail: None,
+    };
+    qwen35::validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
+        config,
+        signatures,
+        &execution_plan,
+    )
+}
+
+fn validate_qwen35_fused_dense_decode_model_capability(
+    m: &LoadedModel,
+    session_count: usize,
+) -> Result<(), String> {
+    if m.arch_id != 5 {
+        return Err(format!(
+            "qwen35 fused dense decode requires dense Qwen35 arch_id=5; loaded arch_id={}",
+            m.arch_id
+        ));
+    }
+    if session_count < 2 {
+        return Err("qwen35 fused dense decode requires at least two sessions".to_string());
+    }
+    let config = m
+        .q35_config
+        .as_ref()
+        .ok_or_else(|| "qwen35 fused dense decode requires qwen35 config".to_string())?;
+    if config.num_experts != 0 || config.has_shared_expert {
+        return Err(
+            "qwen35 fused dense decode supports dense Qwen35 only; grouped-MoE stays serial_reference"
+                .to_string(),
+        );
+    }
+    let kv_mode = m
+        .q35_kv_mode
+        .as_deref()
+        .ok_or_else(|| "qwen35 fused dense decode requires known KV mode".to_string())?;
+    if !matches!(kv_mode, "fp32" | "f32") {
+        return Err(format!(
+            "qwen35 fused dense decode requires FP32 KV state; loaded kv_mode={kv_mode}; use HIPFIRE_QWEN35_DECODE_BATCH=serial"
+        ));
+    }
+    let state_quant = m.q35_state_quant.ok_or_else(|| {
+        "qwen35 fused dense decode requires known DeltaNet state quant".to_string()
+    })?;
+    if state_quant != qwen35::StateQuant::FP32 {
+        return Err(format!(
+            "qwen35 fused dense decode requires FP32 DeltaNet state; loaded state={state_quant:?}; use HIPFIRE_QWEN35_DECODE_BATCH=serial"
+        ));
+    }
+    let weights = m
+        .q35_weights
+        .as_ref()
+        .ok_or_else(|| "qwen35 fused dense decode requires qwen35 weights".to_string())?;
+    qwen35::validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(weights)
+        .map_err(|e| format!("qwen35 fused dense decode unsupported weights: {e}"))?;
+    if m.q35_scratch.is_none() {
+        return Err("qwen35 fused dense decode requires single-GPU qwen35 scratch".to_string());
+    }
+    Ok(())
+}
+
+fn validate_qwen35_fused_dense_decode_step_bounds(
+    envelope: &GenerateBatchDecodeEnvelope,
+) -> Result<(), String> {
+    for session in &envelope.sessions {
+        if session.max_tokens_remaining > 1 {
+            return Err(format!(
+                "qwen35 fused dense decode currently supports final one-token steps only; session {} has max_tokens_remaining={}; use HIPFIRE_QWEN35_DECODE_BATCH=serial",
+                session.session_id, session.max_tokens_remaining,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_qwen35_fused_dense_decode_resident_sessions(
+    m: &LoadedModel,
+    envelope: &GenerateBatchDecodeEnvelope,
+) -> Result<(), String> {
+    let config = m
+        .q35_config
+        .as_ref()
+        .ok_or_else(|| "qwen35 fused dense decode requires qwen35 config".to_string())?;
+    let mut signatures = Vec::with_capacity(envelope.sessions.len());
+    for session in &envelope.sessions {
+        let state = m.q35_sessions.get(&session.session_id).ok_or_else(|| {
+            format!(
+                "decode session {} is not resident for fused dense decode",
+                session.session_id
+            )
+        })?;
+        let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+        if logical_position != session.logical_position {
+            return Err(format!(
+                "decode session {} logical_position mismatch: expected={} resident={}",
+                session.session_id, session.logical_position, logical_position
+            ));
+        }
+        signatures.push(qwen35_fused_dense_decode_signature(state));
+    }
+    validate_qwen35_fused_dense_decode_session_signatures(
+        config,
+        &signatures,
+        envelope.session_count,
+    )
+    .map_err(|e| format!("qwen35 fused dense decode unsupported resident state: {e}"))
+}
+
 fn select_qwen35_prefill_batch_backend(
     plan: GenerateBatchPrefillPlan,
     requested: Option<&str>,
@@ -1349,6 +1535,53 @@ fn emit_generate_batch_prefill_unsupported(
 #[cfg(test)]
 mod generate_batch_prefill_tests {
     use super::*;
+
+    fn test_dense_qwen35_config() -> qwen35::Qwen35Config {
+        qwen35::Qwen35Config {
+            dim: 16,
+            n_layers: 2,
+            vocab_size: 32,
+            norm_eps: 1e-6,
+            eos_token: 0,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 8,
+            rope_theta: 1_000_000.0,
+            partial_rotary_factor: 0.25,
+            is_vl_text: false,
+            mrope_interleaved: false,
+            mrope_section: [0, 0, 0],
+            linear_num_key_heads: 2,
+            linear_num_value_heads: 2,
+            linear_key_head_dim: 8,
+            linear_value_head_dim: 8,
+            conv_kernel_dim: 4,
+            hidden_dim: 32,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            has_shared_expert: false,
+            norm_topk_prob: false,
+            layer_types: vec![LayerType::FullAttention, LayerType::LinearAttention],
+            paged_experts: false,
+            vram_budget_bytes: u64::MAX,
+        }
+    }
+
+    fn fp32_decode_state_signature() -> qwen35::DensePrefillSessionBatchStateSignature {
+        qwen35::DensePrefillSessionBatchStateSignature {
+            kv_physical_cap: 128,
+            kv_compact_offset: 0,
+            kv_quantized: false,
+            kv_quant_q8: false,
+            kv_quant_asym2: false,
+            kv_quant_asym3: false,
+            kv_quant_asym4: false,
+            kv_quant_fwht: false,
+            dn_quant: qwen35::StateQuant::FP32,
+        }
+    }
 
     #[test]
     fn validates_minimal_prompt_envelope() {
@@ -2097,6 +2330,88 @@ mod generate_batch_prefill_tests {
             .unwrap(),
             Qwen35PrefillBatchBackend::SerialReference
         );
+    }
+
+    #[test]
+    fn selects_dense_layer_chunked_decode_backend_only_for_dense_batches() {
+        assert_eq!(
+            select_qwen35_decode_batch_backend("auto", 5, 2).unwrap(),
+            Qwen35DecodeBatchBackend::SerialReference
+        );
+        assert_eq!(
+            select_qwen35_decode_batch_backend("fused", 5, 2).unwrap(),
+            Qwen35DecodeBatchBackend::FusedDenseLayerChunked
+        );
+        let singleton_err = select_qwen35_decode_batch_backend("fused", 5, 1).unwrap_err();
+        assert!(singleton_err.contains("requires at least two sessions"));
+        let moe_err = select_qwen35_decode_batch_backend("fused", 6, 2).unwrap_err();
+        assert!(moe_err.contains("not dense Qwen35"));
+        let grouped_err =
+            select_qwen35_decode_batch_backend("fused_grouped_moe", 6, 2).unwrap_err();
+        assert!(grouped_err.contains("grouped-MoE fused decode batch is not implemented"));
+    }
+
+    #[test]
+    fn fused_dense_decode_accepts_only_fp32_uncompacted_state_signatures() {
+        let config = test_dense_qwen35_config();
+        let fp32 = fp32_decode_state_signature();
+        validate_qwen35_fused_dense_decode_session_signatures(&config, &[fp32, fp32], 2)
+            .expect("fp32 dense decode state should be admitted");
+
+        let mut compacted = fp32;
+        compacted.kv_compact_offset = 8;
+        let err = validate_qwen35_fused_dense_decode_session_signatures(
+            &config,
+            &[compacted, compacted],
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("compacted KV offset"));
+
+        let mut quantized_kv = fp32;
+        quantized_kv.kv_quantized = true;
+        quantized_kv.kv_quant_q8 = true;
+        let err = validate_qwen35_fused_dense_decode_session_signatures(
+            &config,
+            &[quantized_kv, quantized_kv],
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("quantized KV state"));
+
+        let mut q8_dn = fp32;
+        q8_dn.dn_quant = qwen35::StateQuant::Q8;
+        let err =
+            validate_qwen35_fused_dense_decode_session_signatures(&config, &[q8_dn, q8_dn], 2)
+                .unwrap_err();
+        assert!(err.contains("Q8 DeltaNet state"));
+    }
+
+    #[test]
+    fn fused_dense_decode_rejects_non_final_decode_steps() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_decode_step",
+            "id": "decode-1",
+            "batch_id": "decode-batch-1",
+            "worker_key_id": "worker-a",
+            "sessions": [
+                {
+                    "id": "req-1",
+                    "session_id": "sess-1",
+                    "logical_position": 8,
+                    "max_tokens_remaining": 1
+                },
+                {
+                    "id": "req-2",
+                    "session_id": "sess-2",
+                    "logical_position": 8,
+                    "max_tokens_remaining": 2
+                }
+            ]
+        });
+        let envelope = validate_generate_batch_decode(&msg).expect("valid decode envelope");
+        let err = validate_qwen35_fused_dense_decode_step_bounds(&envelope).unwrap_err();
+        assert!(err.contains("final one-token steps only"));
     }
 
     #[test]
@@ -4841,26 +5156,15 @@ fn run_generate_batch_decode_step_qwen35(
     }
     let requested_backend =
         std::env::var("HIPFIRE_QWEN35_DECODE_BATCH").unwrap_or_else(|_| "auto".to_string());
-    let backend = match requested_backend.as_str() {
-        "" | "auto" | "serial" | "serial_reference" => "serial_reference",
-        "off" => {
-            return Err(
-                "generate_batch_decode_step disabled by HIPFIRE_QWEN35_DECODE_BATCH=off"
-                    .to_string(),
-            )
-        }
-        "fused" | "fused_dense" | "fused_grouped_moe" => {
-            return Err(
-                "qwen35 fused decode batch backend is not implemented; use HIPFIRE_QWEN35_DECODE_BATCH=serial"
-                    .to_string(),
-            )
-        }
-        other => {
-            return Err(format!(
-                "unsupported HIPFIRE_QWEN35_DECODE_BATCH={other}; expected auto, serial, fused, or off"
-            ))
-        }
-    };
+    let backend = select_qwen35_decode_batch_backend(
+        requested_backend.as_str(),
+        m.arch_id,
+        envelope.session_count,
+    )?;
+    if backend == Qwen35DecodeBatchBackend::FusedDenseLayerChunked {
+        validate_qwen35_fused_dense_decode_step_bounds(envelope)?;
+        validate_qwen35_fused_dense_decode_model_capability(m, envelope.session_count)?;
+    }
     let im_end = {
         let tokenizer = m
             .tokenizer
@@ -4874,6 +5178,75 @@ fn run_generate_batch_decode_step_qwen35(
         None
     };
     let t0 = Instant::now();
+    let session_lines = match backend {
+        Qwen35DecodeBatchBackend::SerialReference => {
+            qwen35_decode_step_serial_reference(m, gpu, stdout, envelope, im_end_token)?
+        }
+        Qwen35DecodeBatchBackend::FusedDenseLayerChunked => {
+            qwen35_decode_step_fused_dense_layer_chunked(m, gpu, envelope, im_end_token)?
+        }
+    };
+    for line in session_lines {
+        let _ = writeln!(stdout, "{line}");
+    }
+    let worker = loaded_model_worker_runtime_view(m);
+    let done = serde_json::json!({
+        "type": "generate_batch_decode_step_done",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "sessions": envelope.session_count,
+        "backend": backend.as_str(),
+        "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0,
+        "resident_sessions": loaded_model_state_arena_backend(m).resident_session_count(m),
+        "model_worker": model_worker_runtime_view_json(&worker),
+    });
+    let _ = writeln!(stdout, "{done}");
+    let _ = stdout.flush();
+    Ok(())
+}
+
+struct Qwen35DecodeTokenOutcome {
+    token: u32,
+    text: String,
+    stop: bool,
+}
+
+fn qwen35_decode_token_outcome(
+    m: &LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    logits: &rdna_compute::GpuTensor,
+    max_tokens_remaining: usize,
+    im_end_token: Option<u32>,
+) -> Result<Qwen35DecodeTokenOutcome, String> {
+    let config = m
+        .q35_config
+        .as_ref()
+        .ok_or_else(|| "qwen35 config missing".to_string())?;
+    let tokenizer = m
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| "generate_batch_decode_step requires a tokenizer".to_string())?;
+    let token = gpu
+        .argmax_f32(logits, config.vocab_size)
+        .map_err(|e| format!("qwen35 decode argmax: {e:?}"))?;
+    let is_terminator =
+        token == config.eos_token || im_end_token == Some(token) || tokenizer.is_terminator(token);
+    let stop = is_terminator || max_tokens_remaining <= 1;
+    let text = if is_terminator {
+        String::new()
+    } else {
+        tokenizer.decode(&[token])
+    };
+    Ok(Qwen35DecodeTokenOutcome { token, text, stop })
+}
+
+fn qwen35_decode_step_serial_reference(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    envelope: &GenerateBatchDecodeEnvelope,
+    im_end_token: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
     let mut session_lines = Vec::with_capacity(envelope.sessions.len());
     for session in &envelope.sessions {
         qwen35_activate_session(m, gpu, &session.session_id)?;
@@ -4886,51 +5259,18 @@ fn run_generate_batch_decode_step_qwen35(
                 session.session_id, session.logical_position, logical_position
             ));
         }
-        let token = {
-            let config = m
-                .q35_config
-                .as_ref()
-                .ok_or_else(|| "qwen35 config missing".to_string())?;
-            let scratch = m
-                .q35_scratch
-                .as_ref()
-                .ok_or_else(|| "qwen35 scratch missing".to_string())?;
-            gpu.argmax_f32(&scratch.logits, config.vocab_size)
-                .map_err(|e| format!("qwen35 decode argmax: {e:?}"))?
-        };
-        let stop = {
-            let tokenizer = m
-                .tokenizer
-                .as_ref()
-                .ok_or_else(|| "generate_batch_decode_step requires a tokenizer".to_string())?;
-            let config = m
-                .q35_config
-                .as_ref()
-                .ok_or_else(|| "qwen35 config missing".to_string())?;
-            token == config.eos_token
-                || im_end_token == Some(token)
-                || tokenizer.is_terminator(token)
-                || session.max_tokens_remaining <= 1
-        };
-        let text = {
-            let tokenizer = m
-                .tokenizer
-                .as_ref()
-                .ok_or_else(|| "generate_batch_decode_step requires a tokenizer".to_string())?;
-            let config = m
-                .q35_config
-                .as_ref()
-                .ok_or_else(|| "qwen35 config missing".to_string())?;
-            if token == config.eos_token
-                || im_end_token == Some(token)
-                || tokenizer.is_terminator(token)
-            {
-                String::new()
-            } else {
-                tokenizer.decode(&[token])
-            }
-        };
-        state.conversation_tokens.push(token);
+        let scratch = m
+            .q35_scratch
+            .as_ref()
+            .ok_or_else(|| "qwen35 scratch missing".to_string())?;
+        let outcome = qwen35_decode_token_outcome(
+            m,
+            gpu,
+            &scratch.logits,
+            session.max_tokens_remaining,
+            im_end_token,
+        )?;
+        state.conversation_tokens.push(outcome.token);
         {
             let config = m
                 .q35_config
@@ -4948,7 +5288,7 @@ fn run_generate_batch_decode_step_qwen35(
                 gpu,
                 weights,
                 config,
-                token,
+                outcome.token,
                 state.seq_pos,
                 &mut state.kv_cache,
                 &mut state.dn_state,
@@ -4965,29 +5305,160 @@ fn run_generate_batch_decode_step_qwen35(
             "batch_id": envelope.batch_id,
             "session_id": session.id,
             "runtime_state_handle": session.session_id,
-            "token": token,
-            "text": text,
-            "stop": stop,
+            "token": outcome.token,
+            "text": outcome.text,
+            "stop": outcome.stop,
             "logical_position": new_logical_position,
         }));
     }
-    for line in session_lines {
-        let _ = writeln!(stdout, "{line}");
+    Ok(session_lines)
+}
+
+fn qwen35_decode_step_fused_dense_layer_chunked(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    envelope: &GenerateBatchDecodeEnvelope,
+    im_end_token: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    validate_qwen35_fused_dense_decode_step_bounds(envelope)?;
+    qwen35_save_active_session(m, gpu)?;
+    validate_qwen35_fused_dense_decode_resident_sessions(m, envelope)?;
+
+    struct OwnedDecodeSession {
+        request_id: String,
+        runtime_state_handle: String,
+        state: Qwen35RequestSessionState,
+        outcome: Qwen35DecodeTokenOutcome,
     }
-    let worker = loaded_model_worker_runtime_view(m);
-    let done = serde_json::json!({
-        "type": "generate_batch_decode_step_done",
-        "id": envelope.id,
-        "batch_id": envelope.batch_id,
-        "sessions": envelope.session_count,
-        "backend": backend,
-        "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0,
-        "resident_sessions": loaded_model_state_arena_backend(m).resident_session_count(m),
-        "model_worker": model_worker_runtime_view_json(&worker),
-    });
-    let _ = writeln!(stdout, "{done}");
-    let _ = stdout.flush();
-    Ok(())
+
+    let mut outcomes = Vec::with_capacity(envelope.sessions.len());
+    for session in &envelope.sessions {
+        let state = m.q35_sessions.get(&session.session_id).ok_or_else(|| {
+            format!(
+                "decode session {} is not resident for fused dense decode",
+                session.session_id
+            )
+        })?;
+        let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+        if logical_position != session.logical_position {
+            return Err(format!(
+                "decode session {} logical_position mismatch: expected={} resident={}",
+                session.session_id, session.logical_position, logical_position
+            ));
+        }
+        outcomes.push(qwen35_decode_token_outcome(
+            m,
+            gpu,
+            &state.logits,
+            session.max_tokens_remaining,
+            im_end_token,
+        )?);
+    }
+
+    let mut owned = Vec::with_capacity(envelope.sessions.len());
+    for (session, outcome) in envelope.sessions.iter().zip(outcomes.into_iter()) {
+        let state = m.q35_sessions.remove(&session.session_id).ok_or_else(|| {
+            format!(
+                "decode session {} disappeared before fused dense decode",
+                session.session_id
+            )
+        })?;
+        owned.push(OwnedDecodeSession {
+            request_id: session.id.clone(),
+            runtime_state_handle: session.session_id.clone(),
+            state,
+            outcome,
+        });
+    }
+
+    let token_rows: Vec<[u32; 1]> = owned
+        .iter()
+        .map(|session| [session.outcome.token])
+        .collect();
+
+    let worker_result = {
+        let config = m
+            .q35_config
+            .as_ref()
+            .ok_or_else(|| "qwen35 config missing".to_string())?;
+        let weights = m
+            .q35_weights
+            .as_ref()
+            .ok_or_else(|| "qwen35 weights missing".to_string())?;
+        let scratch = m
+            .q35_scratch
+            .as_mut()
+            .ok_or_else(|| "qwen35 scratch missing".to_string())?;
+        let requested_max_batch = std::env::var("HIPFIRE_QWEN35_DECODE_BATCH_MAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(owned.len());
+        // Current fused decode uses the dense session-prefill worker with one
+        // token per selected session. The env var is only a scratch sizing
+        // hint until the worker can split one decode batch into smaller
+        // per-layer chunks.
+        let required_max_batch = requested_max_batch.max(owned.len());
+        let needs_new_pbs = scratch
+            .prefill_batch
+            .as_ref()
+            .map(|pbs| pbs.max_batch < required_max_batch)
+            .unwrap_or(true);
+        if needs_new_pbs {
+            scratch.prefill_batch = Some(
+                qwen35::PrefillBatchScratch::new(gpu, config, required_max_batch)
+                    .map_err(|e| format!("allocate qwen35 decode batch scratch: {e:?}"))?,
+            );
+        }
+        let pbs = scratch.prefill_batch.as_ref().unwrap();
+        let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> = owned
+            .iter_mut()
+            .zip(token_rows.iter())
+            .map(|(session, token_row)| qwen35::DensePrefillSessionBatchRow {
+                tokens: &token_row[..],
+                start_pos: session.state.seq_pos,
+                kv_cache: &mut session.state.kv_cache,
+                dn_state: &mut session.state.dn_state,
+                logits: &session.state.logits,
+            })
+            .collect();
+        qwen35::forward_prefill_dense_session_batch(gpu, weights, config, &mut rows, scratch, pbs)
+    };
+
+    if let Err(err) = worker_result {
+        for session in owned {
+            m.q35_sessions
+                .insert(session.runtime_state_handle, session.state);
+        }
+        return Err(format!(
+            "qwen35 fused dense layer-chunked decode backend failed: {err:?}; \
+             use HIPFIRE_QWEN35_DECODE_BATCH=serial"
+        ));
+    }
+
+    let mut session_lines = Vec::with_capacity(owned.len());
+    for mut session in owned {
+        session
+            .state
+            .conversation_tokens
+            .push(session.outcome.token);
+        session.state.seq_pos += 1;
+        let new_logical_position = session.state.seq_pos + session.state.kv_cache.compact_offset;
+        session_lines.push(serde_json::json!({
+            "type": "generate_batch_decode_step_session_done",
+            "id": envelope.id,
+            "batch_id": envelope.batch_id,
+            "session_id": session.request_id,
+            "runtime_state_handle": session.runtime_state_handle,
+            "token": session.outcome.token,
+            "text": session.outcome.text,
+            "stop": session.outcome.stop,
+            "logical_position": new_logical_position,
+        }));
+        m.q35_sessions
+            .insert(session.runtime_state_handle, session.state);
+    }
+    Ok(session_lines)
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
