@@ -3438,10 +3438,23 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
         };
         res.map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
     }
-    fn run_moe(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
-        Err(hipfire_dispatch::types::DispatchError::Hip(format!(
-            "gemma4 run_moe opcode {} not yet implemented (Step 5)", op_code(_op)
-        )))
+    fn run_moe(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let moe = match self.layer {
+            LayerWeights::Sliding(lw) => lw.moe.as_ref(),
+            LayerWeights::Full(lw) => lw.moe.as_ref(),
+        };
+        let moe = match moe {
+            Some(m) => m,
+            None => return Err(hipfire_dispatch::types::DispatchError::Hip(
+                "MOE_BRANCH on layer without MoE extras".into())),
+        };
+        let post_ffn_norm = match self.layer {
+            LayerWeights::Sliding(lw) => &lw.post_feedforward_layernorm,
+            LayerWeights::Full(lw) => &lw.post_feedforward_layernorm,
+        };
+        apply_moe_branch(gpu, self.config, self.scratch, moe,
+            post_ffn_norm, &self.scratch.residual)
+            .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
     }
     fn run_recurrent(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
         Err(hipfire_dispatch::types::DispatchError::Hip("gemma4 has no recurrent ops".into()))
