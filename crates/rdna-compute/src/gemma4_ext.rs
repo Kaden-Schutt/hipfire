@@ -197,10 +197,83 @@ impl Gpu {
 // ─── MoE GPU method stubs (Phase 4) ────────────────────────────────────
 
 impl Gpu {
-    #[allow(unused_variables)]
     /// Indexed MoE gate_up GEMV for MQ4G256 expert weights.
-    /// Requires FWHT-pre-rotated input (x_rot).
-    pub fn gemv_mq4g256_moe_gate_up_k8_indexed(&mut self, expert_ptrs: &GpuTensor, topk_indices: &GpuTensor, x_rot: &GpuTensor, y_gate: &GpuTensor, y_up: &GpuTensor, m: usize, k: usize) -> HipResult<()> { Err(HipError::new(0, "MoE MQ4G256 indexed kernel not yet ported (Phase 4)")) }
+    /// MQ4G256 has the same 136-byte/group layout as HFQ4G256, so this
+    /// delegates to the same kernel — the only difference is that the
+    /// input must be FWHT-pre-rotated (x_rot) by the caller.
+    pub fn gemv_mq4g256_moe_gate_up_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        use std::os::raw::c_void;
+        self.bind_thread()?;
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
+        let (func_name, block, grid_x) = if cdna_wave64 {
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_gate_up_indexed_wave64",
+                crate::kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC,
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64",
+            )?;
+            (
+                "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64",
+                [64u32, 1, 1],
+                ((m as u32) + 1) / 2,
+            )
+        } else {
+            self.ensure_kernel(
+                "gemv_hfq4g256_moe_gate_up_indexed",
+                crate::kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC,
+                "gemv_hfq4g256_moe_gate_up_k8_indexed",
+            )?;
+            (
+                "gemv_hfq4g256_moe_gate_up_k8_indexed",
+                [32u32, 1, 1],
+                m as u32,
+            )
+        };
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x_rot.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_mq4g256_moe_gate_up_k8_indexed", bytes,
+        );
+        let result =
+            self.launch_maybe_blob(func_name, [grid_x, 8, 1], block, 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
 
     /// Indexed MoE gate_up GEMV for Q8_0 expert weights (no FWHT rotation needed).
     /// Reads expert pointers from device, computes gate + up projections,

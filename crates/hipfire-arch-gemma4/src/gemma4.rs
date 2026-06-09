@@ -1323,9 +1323,7 @@ fn apply_moe_branch(
     let gate_q8  = first.gate_up_proj.gpu_dtype == rdna_compute::DType::Q8_0;
     let down_q8  = first.down_proj.gpu_dtype == rdna_compute::DType::Q8_0;
     let down_hfq4g128 = first.down_proj.gpu_dtype == rdna_compute::DType::HFQ4G128;
-    let fast = gate_q8 && down_q8;
-    // MQ4G256 indexed gate_up kernel is still a stub — only enable for Q8.
-    // Future: fast = (gate_mq4 || gate_q8) && down_q8 once MQ4G256 indexed lands.
+    let fast = (gate_mq4 || gate_q8) && down_q8;
     let _ = (gate_mq4, down_hfq4g128);
     {
         use std::sync::OnceLock;
