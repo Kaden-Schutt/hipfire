@@ -39,6 +39,7 @@ from typing import Any
 
 root, daemon, model, max_seq_s = sys.argv[1:]
 max_seq = int(max_seq_s)
+require_prefix_preflight = os.environ.get("HIPFIRE_REQUIRE_PREFIX_PREFLIGHT") == "1"
 
 
 def pick_port() -> int:
@@ -171,8 +172,14 @@ def run_reuse_scenario() -> str:
         second = chat_request(base_url, "reuse second")
         second_health = fetch_json(f"{base_url}/health", timeout=10.0)
         second_prefill = second_health.get("prefill_batch", {})
+        second_state_cache = second_health.get("state_cache", {})
         if int(second_prefill.get("runtime_cache_hits") or 0) < 1:
             raise RuntimeError(f"second request did not attach resident checkpoint: {second_prefill}; log={log_path}")
+        if require_prefix_preflight:
+            if int(second_state_cache.get("prefix_hash_preflight_requests") or 0) < 1:
+                raise RuntimeError(f"second request did not run prefix hash preflight: {second_state_cache}; log={log_path}")
+            if int(second_state_cache.get("prefix_hash_preflight_matches") or 0) < 1:
+                raise RuntimeError(f"second request did not match through prefix hash preflight: {second_state_cache}; log={log_path}")
         if int(second_prefill.get("resident_decode_sessions") or 0) != 0:
             raise RuntimeError(f"decode session leaked after cached request: {second_prefill}; log={log_path}")
         assert_response_content("reuse first", first)

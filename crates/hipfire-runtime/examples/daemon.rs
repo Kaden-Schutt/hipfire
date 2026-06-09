@@ -731,6 +731,7 @@ impl std::fmt::Debug for GenerateBatchPrefillEnvelope {
     }
 }
 
+#[derive(Clone)]
 struct GenerateBatchPrefillSession {
     id: String,
     prompt: Option<String>,
@@ -743,6 +744,19 @@ struct GenerateBatchPrefillSession {
     state_handle: GenerateBatchPrefillStateHandle,
 }
 
+struct PrefixHashPreflightEnvelope {
+    id: String,
+    boundary_policy: String,
+    session: GenerateBatchPrefillSession,
+}
+
+struct PrefixHashPreflightCandidate {
+    hash: GenerateBatchPrefillPrefixHash,
+    boundary: String,
+    boundary_index: usize,
+}
+
+#[derive(Clone)]
 struct GenerateBatchPrefillStateHandle {
     state_kinds: Vec<String>,
     logical_position: usize,
@@ -1134,6 +1148,63 @@ fn validate_generate_batch_prefill(
     })
 }
 
+fn validate_prefix_hash_preflight(
+    msg: &serde_json::Value,
+) -> Result<PrefixHashPreflightEnvelope, String> {
+    let id = msg
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("prefix-hash-preflight")
+        .to_string();
+    let boundary_policy = msg
+        .get("boundary_policy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("semantic_chat_template")
+        .to_string();
+    if boundary_policy != "semantic_chat_template" {
+        return Err(
+            "prefix_hash_preflight.boundary_policy must be semantic_chat_template".to_string(),
+        );
+    }
+    let session = msg
+        .get("session")
+        .ok_or_else(|| "prefix_hash_preflight.session must be an object".to_string())?;
+    let worker_key = msg.get("worker_key_id").cloned();
+    let model = msg.get("model").cloned();
+    let mut generated = serde_json::json!({
+        "type": "generate_batch_prefill",
+        "id": id,
+        "batch_id": id,
+        "sessions": [session.clone()],
+    });
+    if let Some(worker_key) = worker_key {
+        generated["worker_key_id"] = worker_key;
+    }
+    if let Some(model) = model {
+        generated["model"] = model;
+    }
+    let envelope = validate_generate_batch_prefill(&generated)
+        .map_err(|e| format!("prefix_hash_preflight.{e}"))?;
+    let session = envelope
+        .sessions
+        .into_iter()
+        .next()
+        .ok_or_else(|| "prefix_hash_preflight.session missing after validation".to_string())?;
+    if session.prompt.is_none() {
+        return Err("prefix_hash_preflight.session must include prompt".to_string());
+    }
+    if session.state_handle.runtime_state_handle.is_some() {
+        return Err(
+            "prefix_hash_preflight.session must not include runtime_state_handle".to_string(),
+        );
+    }
+    Ok(PrefixHashPreflightEnvelope {
+        id,
+        boundary_policy,
+        session,
+    })
+}
+
 fn emit_generate_batch_prefill_ready(
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchPrefillEnvelope,
@@ -1307,6 +1378,82 @@ mod generate_batch_prefill_tests {
 
         let err = validate_generate_batch_prefill(&msg).unwrap_err();
         assert!(err.contains("32 lowercase hex"));
+    }
+
+    #[test]
+    fn validates_prefix_hash_preflight_envelope() {
+        let msg = serde_json::json!({
+            "type": "prefix_hash_preflight",
+            "id": "prefix-1",
+            "worker_key_id": "worker-a",
+            "boundary_policy": "semantic_chat_template",
+            "session": {
+                "id": "req-1",
+                "prompt": "hello",
+                "messages": [
+                    {"role": "system", "content": "be terse"},
+                    {"role": "user", "content": "hello"}
+                ],
+                "state_handle": {
+                    "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                    "logical_position": 0
+                },
+                "params": {
+                    "assistant_prefix": "open_think",
+                    "max_think_tokens": 16
+                }
+            }
+        });
+
+        let envelope = validate_prefix_hash_preflight(&msg).expect("valid preflight");
+        assert_eq!(envelope.id, "prefix-1");
+        assert_eq!(envelope.boundary_policy, "semantic_chat_template");
+        assert_eq!(envelope.session.id, "req-1");
+        assert_eq!(envelope.session.messages_history.as_ref().unwrap().len(), 2);
+        assert_eq!(envelope.session.assistant_prefix, "open_think");
+        assert_eq!(envelope.session.max_think_tokens, 16);
+    }
+
+    #[test]
+    fn rejects_prefix_hash_preflight_suffix_or_unknown_policy() {
+        let suffix = serde_json::json!({
+            "type": "prefix_hash_preflight",
+            "id": "prefix-1",
+            "worker_key_id": "worker-a",
+            "session": {
+                "id": "req-1",
+                "suffix_tokens": [1, 2, 3],
+                "state_handle": {
+                    "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                    "logical_position": 0
+                }
+            }
+        });
+        let err = match validate_prefix_hash_preflight(&suffix) {
+            Ok(_) => panic!("suffix preflight unexpectedly accepted"),
+            Err(err) => err,
+        };
+        assert!(err.contains("must include prompt"));
+
+        let bad_policy = serde_json::json!({
+            "type": "prefix_hash_preflight",
+            "id": "prefix-1",
+            "worker_key_id": "worker-a",
+            "boundary_policy": "every_token",
+            "session": {
+                "id": "req-1",
+                "prompt": "hello",
+                "state_handle": {
+                    "state_kinds": ["attention_kv", "deltanet_recurrent"],
+                    "logical_position": 0
+                }
+            }
+        });
+        let err = match validate_prefix_hash_preflight(&bad_policy) {
+            Ok(_) => panic!("bad boundary policy unexpectedly accepted"),
+            Err(err) => err,
+        };
+        assert!(err.contains("semantic_chat_template"));
     }
 
     #[test]
@@ -2260,6 +2407,35 @@ struct LoadedModel {
 
 const QWEN35_LEGACY_SESSION_ID: &str = "__legacy_generate__";
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModelWorkerId {
+    value: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SequenceStateArenaBackend {
+    Qwen35Wrapped,
+    Unsupported,
+}
+
+impl SequenceStateArenaBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Qwen35Wrapped => "qwen35_wrapped",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModelWorkerRuntimeView {
+    worker_id: ModelWorkerId,
+    max_resident_workers: usize,
+    resident_workers: usize,
+    state_arena_backend: SequenceStateArenaBackend,
+    resident_sessions: usize,
+}
+
 struct Qwen35RequestSessionState {
     seq_pos: usize,
     conversation_tokens: Vec<u32>,
@@ -2492,6 +2668,40 @@ fn qwen35_request_session_count(m: &LoadedModel) -> usize {
             .is_some_and(|id| id != QWEN35_LEGACY_SESSION_ID),
     );
     saved + active
+}
+
+fn loaded_model_worker_id(m: &LoadedModel) -> ModelWorkerId {
+    ModelWorkerId {
+        value: format!(
+            "worker:arch{}:pp{}:{}",
+            m.arch_id,
+            m.pp,
+            m.q35_kv_mode.as_deref().unwrap_or("unknown")
+        ),
+    }
+}
+
+fn loaded_model_state_arena_backend(m: &LoadedModel) -> SequenceStateArenaBackend {
+    if (m.arch_id == 5 || m.arch_id == 6) && m.pp == 1 {
+        SequenceStateArenaBackend::Qwen35Wrapped
+    } else {
+        SequenceStateArenaBackend::Unsupported
+    }
+}
+
+fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
+    let state_arena_backend = loaded_model_state_arena_backend(m);
+    let resident_sessions = match state_arena_backend {
+        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_request_session_count(m),
+        SequenceStateArenaBackend::Unsupported => 0,
+    };
+    ModelWorkerRuntimeView {
+        worker_id: loaded_model_worker_id(m),
+        max_resident_workers: 1,
+        resident_workers: 1,
+        state_arena_backend,
+        resident_sessions,
+    }
 }
 
 fn qwen35_release_sessions(
@@ -2974,6 +3184,125 @@ fn qwen35_materialize_batch_prefill_prompt(
         }
         .build_with_user_tokens(&raw_q_tokens))
     }
+}
+
+fn qwen35_prefix_hash_candidates(
+    m: &LoadedModel,
+    session: &GenerateBatchPrefillSession,
+) -> Result<Vec<PrefixHashPreflightCandidate>, String> {
+    let tokenizer = m
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| "tokenizer not loaded".to_string())?;
+    let full_tokens = qwen35_materialize_batch_prefill_prompt(m, session)?;
+    let full_hash = compute_qwen35_prefix_hash(
+        m.arch_id,
+        m.q35_kv_mode.as_deref(),
+        &session.state_handle.state_kinds,
+        &session.assistant_prefix,
+        session.max_think_tokens,
+        &full_tokens,
+    );
+    let mut candidates = Vec::new();
+    let boundary_tokens = [
+        ("message_end", tokenizer.special_token_id("<|im_end|>")),
+        ("vision_end", tokenizer.special_token_id("<|vision_end|>")),
+        ("tool_end", tokenizer.special_token_id("<|tool_call_end|>")),
+        (
+            "tool_response_end",
+            tokenizer.special_token_id("<|tool_response_end|>"),
+        ),
+    ];
+    let mut boundary_index = 0usize;
+    for (idx, token) in full_tokens.iter().enumerate() {
+        let prefix_len = idx + 1;
+        if prefix_len >= full_tokens.len() {
+            continue;
+        }
+        let Some((boundary, _)) = boundary_tokens
+            .iter()
+            .find(|(_, boundary_token)| boundary_token == &Some(*token))
+        else {
+            continue;
+        };
+        let hash = compute_qwen35_prefix_hash(
+            m.arch_id,
+            m.q35_kv_mode.as_deref(),
+            &session.state_handle.state_kinds,
+            &session.assistant_prefix,
+            session.max_think_tokens,
+            &full_tokens[..prefix_len],
+        );
+        if !candidates
+            .iter()
+            .any(|candidate: &PrefixHashPreflightCandidate| {
+                candidate.hash.prefix_len == hash.prefix_len && candidate.hash.value == hash.value
+            })
+        {
+            candidates.push(PrefixHashPreflightCandidate {
+                hash,
+                boundary: (*boundary).to_string(),
+                boundary_index,
+            });
+            boundary_index += 1;
+        }
+    }
+    candidates.push(PrefixHashPreflightCandidate {
+        hash: full_hash,
+        boundary: "full".to_string(),
+        boundary_index: candidates.len(),
+    });
+    candidates.sort_by_key(|candidate| candidate.hash.prefix_len);
+    Ok(candidates)
+}
+
+fn run_prefix_hash_preflight_qwen35(
+    m: &LoadedModel,
+    stdout: &mut std::io::Stdout,
+    envelope: &PrefixHashPreflightEnvelope,
+) -> Result<(), String> {
+    if !(m.arch_id == 5 || m.arch_id == 6) {
+        return Err(format!(
+            "prefix_hash_preflight currently supports qwen35/qwen35-moe only (arch_id={})",
+            m.arch_id
+        ));
+    }
+    if envelope.boundary_policy != "semantic_chat_template" {
+        return Err(
+            "prefix_hash_preflight.boundary_policy must be semantic_chat_template".to_string(),
+        );
+    }
+    let candidates = qwen35_prefix_hash_candidates(m, &envelope.session)?;
+    let full = candidates
+        .last()
+        .ok_or_else(|| "prefix_hash_preflight produced no candidates".to_string())?;
+    let prefixes: Vec<serde_json::Value> = candidates
+        .iter()
+        .map(|candidate| {
+            serde_json::json!({
+                "algorithm": candidate.hash.algorithm,
+                "value": candidate.hash.value,
+                "prefix_len": candidate.hash.prefix_len,
+                "boundary": candidate.boundary,
+                "boundary_index": candidate.boundary_index,
+            })
+        })
+        .collect();
+    let line = serde_json::json!({
+        "type": "prefix_hash_preflight_done",
+        "id": envelope.id,
+        "algorithm": "xxh128",
+        "boundary_policy": envelope.boundary_policy,
+        "prefixes": prefixes,
+        "full": {
+            "algorithm": full.hash.algorithm,
+            "value": full.hash.value,
+            "prefix_len": full.hash.prefix_len,
+        },
+    });
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+    Ok(())
 }
 
 fn qwen35_prefill_suffix_batch(
@@ -3675,17 +4004,35 @@ fn run_generate_batch_prefill_serial_qwen35(
 
         let created = qwen35_activate_session(m, gpu, &session.id)?;
         let tokens: Vec<u32> = if session.prompt.is_some() {
-            if session.state_handle.logical_position != 0
+            if session.state_handle.runtime_state_handle.is_some() {
+                let full_tokens = qwen35_materialize_batch_prefill_prompt(m, session)?;
+                let prefix_len = session
+                    .state_handle
+                    .prefix_hash
+                    .as_ref()
+                    .map(|hash| hash.prefix_len)
+                    .unwrap_or(session.state_handle.cached_prefix_tokens);
+                if prefix_len > full_tokens.len() {
+                    return Err(format!(
+                        "generate_batch_prefill prompt session {} cached prefix length {} exceeds rendered token length {}",
+                        session.id,
+                        prefix_len,
+                        full_tokens.len()
+                    ));
+                }
+                full_tokens[prefix_len..].to_vec()
+            } else if session.state_handle.logical_position != 0
                 || session.state_handle.cached_prefix_tokens != 0
             {
                 return Err(format!(
                     "generate_batch_prefill prompt session {} must start at logical_position=0 cached_prefix_tokens=0 in the first slice",
                     session.id
                 ));
+            } else {
+                let _ = created;
+                qwen35_reset_active_session(m, gpu)?;
+                qwen35_materialize_batch_prefill_prompt(m, session)?
             }
-            let _ = created;
-            qwen35_reset_active_session(m, gpu)?;
-            qwen35_materialize_batch_prefill_prompt(m, session)?
         } else {
             let current_position = qwen35_active_logical_position(m)?;
             if created && session.state_handle.logical_position != 0 {
@@ -5019,6 +5366,25 @@ fn main() {
                 }
             },
 
+            "prefix_hash_preflight" => match validate_prefix_hash_preflight(&msg) {
+                Ok(envelope) => {
+                    let m = match model.as_ref() {
+                        Some(m) => m,
+                        None => {
+                            emit_error_with_id(&mut stdout, &envelope.id, "no model loaded");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = run_prefix_hash_preflight_qwen35(m, &mut stdout, &envelope) {
+                        emit_error_with_id(&mut stdout, &envelope.id, e);
+                    }
+                }
+                Err(e) => {
+                    let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    emit_error_with_id(&mut stdout, id, e);
+                }
+            },
+
             "release_sessions" => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("release");
                 let sessions: Vec<String> = match msg.get("sessions").and_then(|v| v.as_array()) {
@@ -5057,12 +5423,20 @@ fn main() {
                 };
                 match qwen35_release_sessions(m, &mut gpu, &sessions) {
                     Ok(released) => {
+                        let worker = loaded_model_worker_runtime_view(m);
                         let done = serde_json::json!({
                             "type": "release_sessions_done",
                             "id": id,
                             "requested": sessions.len(),
                             "released": released,
                             "resident_sessions": qwen35_request_session_count(m),
+                            "model_worker": {
+                                "id": worker.worker_id.value,
+                                "resident_workers": worker.resident_workers,
+                                "max_resident_workers": worker.max_resident_workers,
+                                "state_arena_backend": worker.state_arena_backend.as_str(),
+                                "resident_sessions": worker.resident_sessions,
+                            },
                         });
                         let _ = writeln!(stdout, "{done}");
                         let _ = stdout.flush();

@@ -4,6 +4,7 @@ import {
   prefixCheckpointCacheKey,
   prefixTokensHash,
   prefixCheckpointCompatible,
+  prefixCheckpointDaemonCompatible,
   prefixCheckpointAttachable,
   selectResidentCheckpointEvictions,
   spillEligibility,
@@ -17,6 +18,7 @@ const fingerprint: PrefixCheckpointFingerprint = {
   tokenizerHash: "sha256:tok",
   chatTemplateHash: "sha256:chat",
   runtimeConfigHash: "sha256:runtime",
+  cacheNamespaceHash: "sha256:cache-namespace",
   stateMode: "q8+deltanet",
   positionPolicy: "rope-yarn",
   featureFlags: ["qwen35", "prefill_batch"],
@@ -151,6 +153,49 @@ describe("prefix state cache keys", () => {
 
     expect(base.runtimeLogicalPosition).toBe(7);
     expect(prefixCheckpointCacheKey(base)).toBe(prefixCheckpointCacheKey(sameKeyDifferentRuntimePosition));
+  });
+
+  test("daemon hash compatibility ignores full render hash but keeps namespace", () => {
+    const checkpoint = createPrefixCheckpointManifest({
+      fingerprint: {
+        ...fingerprint,
+        runtimeConfigHash: "sha256:short-render",
+      },
+      prefixTokens: [10, 11, 12],
+      stateKinds: ["attention_kv", "deltanet_recurrent"],
+      bytes: 4096,
+      createdAtMs: 100,
+      runtimeState: "attachable",
+      runtimeStateHandle: "qwen35-checkpoint:req",
+      daemonPrefixHash: "0123456789abcdef0123456789abcdef",
+      daemonPrefixLen: 3,
+    });
+
+    expect(prefixCheckpointDaemonCompatible(checkpoint, {
+      fingerprint: {
+        ...fingerprint,
+        runtimeConfigHash: "sha256:longer-render",
+      },
+      daemonPrefixHash: "0123456789abcdef0123456789abcdef",
+      daemonPrefixLen: 3,
+      requiredStateKinds: ["attention_kv", "deltanet_recurrent"],
+    })).toBe(true);
+    expect(prefixCheckpointDaemonCompatible(checkpoint, {
+      fingerprint: {
+        ...fingerprint,
+        runtimeConfigHash: "sha256:longer-render",
+        cacheNamespaceHash: "sha256:other-namespace",
+      },
+      daemonPrefixHash: "0123456789abcdef0123456789abcdef",
+      daemonPrefixLen: 3,
+      requiredStateKinds: ["attention_kv", "deltanet_recurrent"],
+    })).toBe(false);
+    expect(prefixCheckpointDaemonCompatible(checkpoint, {
+      fingerprint,
+      daemonPrefixHash: "ffffffffffffffffffffffffffffffff",
+      daemonPrefixLen: 3,
+      requiredStateKinds: ["attention_kv", "deltanet_recurrent"],
+    })).toBe(false);
   });
 });
 

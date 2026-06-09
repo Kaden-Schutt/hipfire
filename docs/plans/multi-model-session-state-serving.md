@@ -24,7 +24,7 @@ The required structural change is to split **model residency** from
 | 1) Keep OpenAI-compatible request shape | DONE | `cli/index.ts` existing request parsing and response path | No external API change introduced by these slices. |
 | 2) multi-model worker selection by request model | SKIPPED | `cli/index.ts` still routes to a single currently-loaded model path | Current model routing is `findModel(...)` + global reload; per-worker registry not yet added in daemon architecture. Worker keys now include accelerator kind/device id so the later registry has a placement-safe identity. |
 | 3) `RequestSession` extraction with request/session state handles | DONE | `cli/session_state.ts`, `cli/session_state.test.ts`, `cli/server_prefill_batch.ts` | Session drafts now carry worker keys, placement identity, priorities, suffix split, and state-kinds. |
-| 4) Per-session state arena (attention + recurrent + Mamba) | IN PROGRESS | `crates/hipfire-runtime/examples/daemon.rs` | Qwen35 serving has a state-handle v0 and release protocol for resident sessions. Generic attention/recurrent/Mamba arenas remain pending. |
+| 4) Per-session state arena (attention + recurrent + Mamba) | IN PROGRESS | `crates/hipfire-runtime/examples/daemon.rs`, `/health.runtime_workers` | Qwen35 serving has a state-handle v0, release protocol, and a single-worker/Qwen35-wrapped arena scaffold. Generic attention/recurrent/Mamba arenas remain pending. |
 | 5) Prefix cache foundations (token/state manifest + compatibility) | IN PROGRESS | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts` | In-memory fingerprint/caching metadata is present and `prompt_cache_key` namespaces cache compatibility. Metadata-only matches are now telemetry-only misses; runtime reuse requires an attachable manifest with a runtime state handle. |
 | 6) Same-model prefill batching integration | DONE FOR QWEN35 | `cli/server_prefill_batch.ts`, `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-generate-batch-prefill.sh`, `scripts/smoke-server-prefill-batch.sh` | Server can form compatible batches and call daemon `generate_batch_prefill`; Qwen35 dense fused prefill and grouped-MoE fused prefill are implemented, non-streaming text-only `/v1/responses` shares the path after normalization, and resident session handles are returned/released. Generic non-Qwen35 workers remain deferred. |
 | 7) No-cross-model batching guarantees | DONE | `sessionsCompatibleForPrefill` in `cli/session_state.ts` | Compatibility uses `ModelWorkerKey` identity and state kind equality. |
@@ -33,8 +33,9 @@ The required structural change is to split **model residency** from
 
 ### SKIPPED Slice Notes
 
-- Slice 2/3 (single-worker registry + generic state arena) are still blocked by
-  missing runtime worker/session ownership beyond the Qwen35 serving slice.
+- Slice 2/3 (single-worker registry + generic state arena) now have a
+  Qwen35-wrapped scaffold and health surface, but are still blocked on moving
+  runtime worker/session ownership fully behind generic arena operations.
 - Slice 5 (runtime prefix cache) is now safe but intentionally conservative:
   metadata-only manifests are counted but refused for runtime reuse until daemon
   attach/fork support exists.

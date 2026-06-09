@@ -9,6 +9,7 @@ export interface PrefixCheckpointFingerprint {
   tokenizerHash: string;
   chatTemplateHash: string;
   runtimeConfigHash: string;
+  cacheNamespaceHash?: string;
   stateMode: string;
   positionPolicy: string;
   featureFlags: readonly string[];
@@ -50,6 +51,13 @@ export interface CreatePrefixCheckpointManifestInput {
 export interface PrefixCheckpointCompatibilityInput {
   fingerprint: PrefixCheckpointFingerprint;
   prefixTokens: readonly number[];
+  requiredStateKinds: readonly SessionStateKind[];
+}
+
+export interface PrefixCheckpointDaemonCompatibilityInput {
+  fingerprint: PrefixCheckpointFingerprint;
+  daemonPrefixHash: string;
+  daemonPrefixLen: number;
   requiredStateKinds: readonly SessionStateKind[];
 }
 
@@ -130,6 +138,7 @@ export function prefixCheckpointCacheKey(
     fingerprint.tokenizerHash,
     fingerprint.chatTemplateHash,
     fingerprint.runtimeConfigHash,
+    fingerprint.cacheNamespaceHash ?? "",
     fingerprint.stateMode,
     fingerprint.positionPolicy,
     fingerprint.featureFlags.join("+"),
@@ -154,6 +163,28 @@ export function prefixCheckpointCompatible(
     createdAtMs: manifest.createdAtMs,
   });
   return prefixCheckpointCacheKey(candidate) === prefixCheckpointCacheKey(manifest);
+}
+
+export function prefixCheckpointDaemonCompatible(
+  manifest: PrefixCheckpointManifest,
+  input: PrefixCheckpointDaemonCompatibilityInput,
+): boolean {
+  const required = normalizeStateKinds(input.requiredStateKinds);
+  const available = new Set(normalizeStateKinds(manifest.stateKinds));
+  if (!required.every((kind) => available.has(kind))) return false;
+  if (!prefixCheckpointAttachable(manifest)) return false;
+  if (manifest.daemonPrefixHash !== input.daemonPrefixHash) return false;
+  if (manifest.daemonPrefixLen !== input.daemonPrefixLen) return false;
+  const a = normalizeFingerprint(manifest.fingerprint);
+  const b = normalizeFingerprint(input.fingerprint);
+  return a.modelArtifactDigest === b.modelArtifactDigest
+    && String(a.architectureId) === String(b.architectureId)
+    && a.tokenizerHash === b.tokenizerHash
+    && a.chatTemplateHash === b.chatTemplateHash
+    && a.cacheNamespaceHash === b.cacheNamespaceHash
+    && a.stateMode === b.stateMode
+    && a.positionPolicy === b.positionPolicy
+    && a.featureFlags.join("+") === b.featureFlags.join("+");
 }
 
 export function spillEligibility(

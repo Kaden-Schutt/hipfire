@@ -37,6 +37,7 @@ import {
 import {
   createPrefixCheckpointManifest,
   prefixCheckpointCompatible,
+  prefixCheckpointDaemonCompatible,
   prefixCheckpointAttachable,
   prefixCheckpointCacheKey,
   selectResidentCheckpointEvictions,
@@ -2012,6 +2013,9 @@ async function serve(port: number, host: string) {
     cacheMisses: 0,
     metadataCacheHits: 0,
     runtimeCacheHits: 0,
+    prefixHashPreflightRequests: 0,
+    prefixHashPreflightCandidates: 0,
+    prefixHashPreflightMatches: 0,
     totalBatches: 0,
     fusedBatches: 0,
     fallbackBatches: 0,
@@ -2615,6 +2619,9 @@ async function serve(port: number, host: string) {
                   disk_enabled: serverPrefillBatchControls.stateCacheDisk,
                   daemon_prefix_hash: stateCacheDaemonPrefixEntries > 0,
                   daemon_prefix_hash_entries: stateCacheDaemonPrefixEntries,
+                  prefix_hash_preflight_requests: prefillBatchMetrics.prefixHashPreflightRequests,
+                  prefix_hash_preflight_candidates: prefillBatchMetrics.prefixHashPreflightCandidates,
+                  prefix_hash_preflight_matches: prefillBatchMetrics.prefixHashPreflightMatches,
                   entries: stateCacheEntries,
                   bytes: stateCacheBytes,
                   metadata_hits: prefillBatchMetrics.metadataCacheHits,
@@ -2623,6 +2630,17 @@ async function serve(port: number, host: string) {
                   recompute_required_total: stateCacheRecomputeRequiredTotal,
                 }
               : { enabled: false },
+            runtime_workers: {
+              resident_workers: current ? 1 : 0,
+              max_resident_workers: 1,
+              current_worker_key_id: null,
+              state_arena_backend: currentArch === "qwen35" || currentArch === "qwen35_moe"
+                ? "qwen35_wrapped"
+                : current
+                  ? "unsupported"
+                  : "none",
+              generic_state_arena: false,
+            },
             batches: {
               ...buildBatchHealthPayload({
                 enabled: true,
@@ -3366,6 +3384,34 @@ async function serve(port: number, host: string) {
         let spillReason = "state_cache_disabled";
         let servingWorkerScheduler: PriorityPrefillScheduler | undefined;
         let releaseRuntimeSessionId: string | null = null;
+        const preflightChatTemplateKwargs = (body.chat_template_kwargs && typeof body.chat_template_kwargs === "object")
+          ? body.chat_template_kwargs : {};
+        const preflightEnableThinking: boolean | null = typeof preflightChatTemplateKwargs.enable_thinking === "boolean"
+          ? preflightChatTemplateKwargs.enable_thinking
+          : null;
+        const preflightReasoning = (body.reasoning && typeof body.reasoning === "object") ? body.reasoning : null;
+        const preflightEffortMap: Record<string, number> = {
+          none: 1, minimal: 64, low: 256, medium: 1024, high: 4096, xhigh: 0,
+        };
+        const preflightReasoningEffort: number | null = preflightReasoning
+          && typeof preflightReasoning.effort === "string"
+          && preflightReasoning.effort in preflightEffortMap
+          ? preflightEffortMap[preflightReasoning.effort]
+          : null;
+        let requestMaxThinkTokens: number | undefined;
+        if (effective.thinking === "off") requestMaxThinkTokens = 1;
+        else if (effective.max_think_tokens > 0) requestMaxThinkTokens = effective.max_think_tokens;
+        if (preflightEnableThinking === false) requestMaxThinkTokens = 1;
+        if (preflightReasoningEffort !== null) {
+          requestMaxThinkTokens = preflightReasoningEffort === 0 ? undefined : preflightReasoningEffort;
+        }
+        const requestAssistantPrefix = currentArch === "qwen35_dummy"
+          ? "plain"
+          : effective.thinking === "off"
+            || preflightEnableThinking === false
+            || preflightReasoning?.effort === "none"
+            ? "closed_think"
+            : "open_think";
         const prefillPromptTokens = approximatePromptTokenIds(userPrompt);
         const stateKinds = servingWorkerKinds;
         const stateMode = servingWorkerStateMode;
@@ -3386,6 +3432,9 @@ async function serve(port: number, host: string) {
             prompt_cache_retention: requestPromptCacheRetention ?? null,
             render_input_hash: renderInputHash,
           }),
+          cacheNamespaceHash: stableObjectHash({
+            prompt_cache_key: body.prompt_cache_key ?? null,
+          }),
           stateMode,
           positionPolicy: "rope",
           featureFlags: stateFlags,
@@ -3395,6 +3444,7 @@ async function serve(port: number, host: string) {
           checksumLookup[stateKind] = stableHash(`${cacheKeyFingerprint.modelArtifactDigest}|${stateKind}`);
         }
         const servingWorkerStateCache = getWorkerStateCache(servingWorkerKey);
+        let daemonPreflightPrefixes: Array<{ value: string; prefix_len: number; boundary?: string; boundary_index?: number }> = [];
         const requestPrefillDispatchStatus = prefillBatchRequestDispatchStatus({
           eligible: prefillBatchGate.eligible,
           capability: generateBatchPrefillCapability,
@@ -3433,7 +3483,82 @@ async function serve(port: number, host: string) {
               };
             }
 
+            if (
+              requestAllowsResidentPrefixCache &&
+              requestCanUseDaemonPrefillBatch &&
+              servingWorkerStateCache.size > 0 &&
+              current !== null
+            ) {
+              prefillBatchMetrics.prefixHashPreflightRequests += 1;
+              const preflightSession: any = {
+                id: reqId,
+                prompt: userPrompt,
+                state_handle: {
+                  state_kinds: [...stateKinds],
+                  logical_position: 0,
+                  cached_prefix_tokens: 0,
+                },
+                params: {
+                  assistant_prefix: requestAssistantPrefix,
+                },
+              };
+              if (requestMaxThinkTokens !== undefined) {
+                preflightSession.params.max_think_tokens = requestMaxThinkTokens;
+              }
+              if (systemPrompt) preflightSession.system = systemPrompt;
+              if (Array.isArray(body.tools) && body.tools.length > 0) {
+                preflightSession.tools = body.tools;
+              }
+              if (structuredMessages.length > 0) {
+                preflightSession.messages = structuredMessages;
+              }
+              try {
+                await e.send({
+                  type: "prefix_hash_preflight",
+                  id: `prefix-hash-${reqId}`,
+                  worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
+                  model: current,
+                  boundary_policy: "semantic_chat_template",
+                  session: preflightSession,
+                });
+                const preflightMsg = await e.recv();
+                if (preflightMsg?.type === "prefix_hash_preflight_done" && Array.isArray(preflightMsg.prefixes)) {
+                  daemonPreflightPrefixes = preflightMsg.prefixes
+                    .filter((candidate: any) =>
+                      candidate
+                      && typeof candidate.value === "string"
+                      && /^[0-9a-f]{32}$/.test(candidate.value)
+                      && Number.isInteger(candidate.prefix_len)
+                      && candidate.prefix_len >= 0
+                    )
+                    .map((candidate: any) => ({
+                      value: candidate.value,
+                      prefix_len: candidate.prefix_len,
+                      boundary: typeof candidate.boundary === "string" ? candidate.boundary : undefined,
+                      boundary_index: Number.isInteger(candidate.boundary_index) ? candidate.boundary_index : undefined,
+                    }));
+                  prefillBatchMetrics.prefixHashPreflightCandidates += daemonPreflightPrefixes.length;
+                }
+              } catch (err: any) {
+                console.error(`[hipfire] prefix_hash_preflight failed; falling back to exact cache lookup: ${err?.message ?? err}`);
+              }
+            }
+
             let cacheManifest: PrefixCheckpointManifest | undefined;
+            const daemonCacheLookup = daemonPreflightPrefixes
+              .sort((a, b) => b.prefix_len - a.prefix_len)
+              .map((candidate) => [...servingWorkerStateCache.values()]
+                .filter((manifest) => prefixCheckpointDaemonCompatible(manifest, {
+                  fingerprint: cacheKeyFingerprint,
+                  daemonPrefixHash: candidate.value,
+                  daemonPrefixLen: candidate.prefix_len,
+                  requiredStateKinds: stateKinds,
+                }))
+                .sort((a, b) => (b.lastUsedAtMs - a.lastUsedAtMs) || (b.prefixLen - a.prefixLen))[0])
+              .find((manifest): manifest is PrefixCheckpointManifest => !!manifest);
+            if (daemonCacheLookup) {
+              prefillBatchMetrics.prefixHashPreflightMatches += 1;
+            }
             const compatibleCacheLookup = [...servingWorkerStateCache.values()]
               .filter((manifest) => manifest.prefixLen <= prefillPromptTokens.length)
               .filter((manifest) => {
@@ -3447,16 +3572,19 @@ async function serve(port: number, host: string) {
               })
               .sort((a, b) => b.prefixLen - a.prefixLen)[0];
             const cacheLookup = requestAllowsResidentPrefixCache
-              && compatibleCacheLookup
-              && prefixCheckpointAttachable(compatibleCacheLookup)
-              ? compatibleCacheLookup
+              && (daemonCacheLookup ?? (
+                compatibleCacheLookup && prefixCheckpointAttachable(compatibleCacheLookup)
+                  ? compatibleCacheLookup
+                  : undefined
+              ))
+              ? (daemonCacheLookup ?? compatibleCacheLookup)
               : undefined;
 
             if (cacheLookup) {
               cacheHit = true;
               prefillBatchMetrics.cacheHits += 1;
               prefillBatchMetrics.runtimeCacheHits += 1;
-              cachePrefixLen = cacheLookup.prefixLen;
+              cachePrefixLen = cacheLookup.daemonPrefixLen ?? cacheLookup.prefixLen;
               cacheManifest = touchPrefixCheckpointManifest(cacheLookup, requestNowMs);
               cacheKey = prefixCheckpointCacheKey(cacheManifest);
               if (requestAllowsResidentPrefixCache || serverPrefillBatchControls.stateCacheDisk) {
@@ -3464,11 +3592,11 @@ async function serve(port: number, host: string) {
               }
               serverPrefillSession = {
                 ...serverPrefillSession,
-                cachedPrefixTokens: cacheLookup.prefixLen,
-                suffixTokens: prefillPromptTokens.slice(cacheLookup.prefixLen),
+                cachedPrefixTokens: cacheLookup.daemonPrefixLen ?? cacheLookup.prefixLen,
+                suffixTokens: daemonCacheLookup ? [] : prefillPromptTokens.slice(cacheLookup.prefixLen),
                 stateHandle: {
                   ...serverPrefillSession.stateHandle,
-                  cachedPrefixTokens: cacheLookup.prefixLen,
+                  cachedPrefixTokens: cacheLookup.daemonPrefixLen ?? cacheLookup.prefixLen,
                   logicalPosition: cacheLookup.runtimeLogicalPosition ?? cacheLookup.prefixLen,
                   runtimeStateHandle: cacheLookup.runtimeStateHandle,
                   daemonPrefixHash: cacheLookup.daemonPrefixHash,
@@ -3873,7 +4001,13 @@ async function serve(port: number, host: string) {
                 payload.state_handle.prefix_len = draft.stateHandle.daemonPrefixLen;
               }
             }
-            if (draft.cachedPrefixTokens > 0) {
+            if (
+              draft.stateHandle.runtimeStateHandle
+              && draft.stateHandle.daemonPrefixHash
+              && draft.stateHandle.daemonPrefixLen !== undefined
+            ) {
+              payload.prompt = userPrompt;
+            } else if (draft.cachedPrefixTokens > 0) {
               payload.suffix_tokens = draft.suffixTokens;
             } else {
               payload.prompt = userPrompt;
