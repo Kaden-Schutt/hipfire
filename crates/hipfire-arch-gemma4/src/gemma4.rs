@@ -3238,10 +3238,160 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
         };
         res.map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
     }
-    fn run_attend(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
-        Err(hipfire_dispatch::types::DispatchError::Hip(format!(
-            "gemma4 run_attend opcode {} not yet implemented (Step 3)", op_code(_op)
-        )))
+    fn run_attend(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let s = self.scratch;
+        let config = self.config;
+        let pos = self.pos;
+        let hip_to_dispatch = |e: hip_bridge::HipError| hipfire_dispatch::types::DispatchError::Hip(e.to_string());
+
+        let res: HipResult<()> = match op_code(op) {
+            g4_op::ATTEND_SLIDING => {
+                let lw = match self.layer {
+                    LayerWeights::Sliding(lw) => lw,
+                    _ => return Err(hipfire_dispatch::types::DispatchError::Hip("ATTEND_SLIDING on non-Sliding layer".into())),
+                };
+                let head_dim = config.sliding_head_dim;
+                let n_heads = config.n_heads;
+                let n_kv = config.sliding_n_kv_heads;
+
+                // q/k/v norms (v_norm is no-scale — ones buffer).
+                gpu.rmsnorm_batched(&s.q, &lw.q_norm, &s.q, n_heads, head_dim, config.norm_eps).map_err(hip_to_dispatch)?;
+                gpu.rmsnorm_batched(&s.k, &lw.k_norm, &s.k, n_kv, head_dim, config.norm_eps).map_err(hip_to_dispatch)?;
+                gpu.rmsnorm_batched(&s.v, &s.v_norm_ones_full, &s.v, n_kv, head_dim, config.norm_eps).map_err(hip_to_dispatch)?;
+
+                // Pre-scale Q by sqrt(head_dim) — Gemma 4 attention scale is 1.0.
+                gpu.scale_f32(&s.q, (head_dim as f32).sqrt()).map_err(hip_to_dispatch)?;
+
+                // Full rotate_half RoPE (all dims rotate).
+                gpu.rope_f32(&s.q, &s.k, &s.pos_buf,
+                    n_heads, n_kv, head_dim, config.sliding_rope_theta).map_err(hip_to_dispatch)?;
+
+                // KV write + flash attention via dispatch.
+                let kv = &mut *self.kv_sliding;
+                let kv_layer_idx = self.sliding_kv_idx;
+                let sliding_cap = kv.physical_cap as u32;
+                let ctx = DispatchCtx::new(gpu);
+                let tier_inputs = KvTierInputs {
+                    quant_asym4: kv.quant_asym4,
+                    quant_asym3: kv.quant_asym3,
+                    quant_asym2: kv.quant_asym2,
+                    quant_q8: kv.quant_q8,
+                    quant_fwht: kv.quant_fwht,
+                    quant_hfq4: false,
+                    quant_q4: false,
+                    v_mode_bits: kv.v_mode_bits(),
+                    pos,
+                    flash_mode: 2,
+                    capture_mode: gpu.graphs.capture_mode,
+                    batch_size: 1,
+                    is_tree: false,
+                    is_boundary: false,
+                    cache_capacity: sliding_cap,
+                    head_dim,
+                    window_size: config.sliding_window as u32,
+                };
+                let plan = KvTierPlan::derive(tier_inputs)
+                    .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(format!("{:?}", e)))?;
+                let io = AttnParams {
+                    q: &s.q, k: &s.k, v: &s.v,
+                    k_cache: &kv.k_gpu[kv_layer_idx],
+                    v_cache: &kv.v_gpu[kv_layer_idx],
+                    k_scales: None, v_scales: None,
+                    pos_buf: &s.pos_buf, pos, positions: None,
+                    n_heads, n_kv_heads: n_kv, head_dim,
+                    physical_cap: kv.max_seq,
+                    cache_capacity: sliding_cap,
+                    window_size: config.sliding_window as u32,
+                    batch_size: 1, max_ctx_len: 0,
+                    flash_partials: Some(&s.flash_partials),
+                    givens_cos: kv.givens_cos.as_ref(),
+                    givens_sin: kv.givens_sin.as_ref(),
+                    tree_bias: None,
+                    block_start: 0, block_cols: 0,
+                    output: &s.attn_out,
+                };
+                execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+            }
+            g4_op::ATTEND_FULL => {
+                let lw = match self.layer {
+                    LayerWeights::Full(lw) => lw,
+                    _ => return Err(hipfire_dispatch::types::DispatchError::Hip("ATTEND_FULL on non-Full layer".into())),
+                };
+                let head_dim = config.full_head_dim;
+                let n_heads = config.n_heads;
+                let n_kv = config.full_n_kv_heads;
+                let kv_bytes = n_kv * head_dim * 4;
+
+                // CRITICAL: capture pre-k_norm K as V before applying k_norm.
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    gpu.hip.memcpy_dtod_async_at(&s.v.buf, 0, &s.k.buf, 0, kv_bytes, stream).map_err(hip_to_dispatch)?;
+                } else {
+                    gpu.hip.memcpy_dtod(&s.v.buf, &s.k.buf, kv_bytes).map_err(hip_to_dispatch)?;
+                }
+
+                // q/k/v norms (v_norm is no-scale — ones buffer).
+                gpu.rmsnorm_batched(&s.q, &lw.q_norm, &s.q, n_heads, head_dim, config.norm_eps).map_err(hip_to_dispatch)?;
+                gpu.rmsnorm_batched(&s.k, &lw.k_norm, &s.k, n_kv, head_dim, config.norm_eps).map_err(hip_to_dispatch)?;
+                gpu.rmsnorm_batched(&s.v, &s.v_norm_ones_full, &s.v, n_kv, head_dim, config.norm_eps).map_err(hip_to_dispatch)?;
+
+                // Pre-scale Q by sqrt(head_dim).
+                gpu.scale_f32(&s.q, (head_dim as f32).sqrt()).map_err(hip_to_dispatch)?;
+
+                // Proportional partial RoPE (only first n_rot_pairs pairs rotate).
+                let n_rot_pairs = ((head_dim as f32) * config.full_partial_rotary_factor * 0.5) as usize;
+                gpu.rope_partial_halved_f32(&s.q, &s.k, &s.pos_buf,
+                    n_heads, n_kv, head_dim, n_rot_pairs, config.full_rope_theta).map_err(hip_to_dispatch)?;
+
+                // KV write + flash attention via dispatch.
+                let kv = &mut *self.kv_full;
+                let kv_layer_idx = self.full_kv_idx;
+                let ctx = DispatchCtx::new(gpu);
+                let tier_inputs = KvTierInputs {
+                    quant_asym4: kv.quant_asym4,
+                    quant_asym3: kv.quant_asym3,
+                    quant_asym2: kv.quant_asym2,
+                    quant_q8: kv.quant_q8,
+                    quant_fwht: kv.quant_fwht,
+                    quant_hfq4: false,
+                    quant_q4: false,
+                    v_mode_bits: kv.v_mode_bits(),
+                    pos,
+                    flash_mode: 2,
+                    capture_mode: gpu.graphs.capture_mode,
+                    batch_size: 1,
+                    is_tree: false,
+                    is_boundary: false,
+                    cache_capacity: 0,
+                    head_dim,
+                    window_size: 0,
+                };
+                let plan = KvTierPlan::derive(tier_inputs)
+                    .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(format!("{:?}", e)))?;
+                let io = AttnParams {
+                    q: &s.q, k: &s.k, v: &s.v,
+                    k_cache: &kv.k_gpu[kv_layer_idx],
+                    v_cache: &kv.v_gpu[kv_layer_idx],
+                    k_scales: None, v_scales: None,
+                    pos_buf: &s.pos_buf, pos, positions: None,
+                    n_heads, n_kv_heads: n_kv, head_dim,
+                    physical_cap: kv.max_seq,
+                    cache_capacity: 0,
+                    window_size: 0,
+                    batch_size: 1, max_ctx_len: 0,
+                    flash_partials: Some(&s.flash_partials),
+                    givens_cos: kv.givens_cos.as_ref(),
+                    givens_sin: kv.givens_sin.as_ref(),
+                    tree_bias: None,
+                    block_start: 0, block_cols: 0,
+                    output: &s.attn_out,
+                };
+                execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+                    .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+            }
+            other => Err(hip_bridge::HipError::new(0, &format!("unknown ATTEND opcode {other}"))),
+        };
+        res.map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
     }
     fn run_moe(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
         Err(hipfire_dispatch::types::DispatchError::Hip(format!(
