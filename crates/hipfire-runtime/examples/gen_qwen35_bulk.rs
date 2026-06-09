@@ -27,6 +27,7 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let mut model = None; let mut ref_path = None; let mut out_dir = None;
     let mut n = 512usize; let mut seed_len = 32usize; let mut n_seqs = 64usize; let mut start = 0usize; let mut kv_mode = "q8".to_string();
+    let mut rep_penalty = 1.3f32; let mut rep_window = 64usize;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -37,6 +38,8 @@ fn main() {
             "--seed-len" => { seed_len = argv[i + 1].parse().unwrap(); i += 2; }
             "--n-seqs" => { n_seqs = argv[i + 1].parse().unwrap(); i += 2; }
             "--start" => { start = argv[i + 1].parse().unwrap(); i += 2; }
+            "--rep-penalty" => { rep_penalty = argv[i + 1].parse().unwrap(); i += 2; }
+            "--rep-window" => { rep_window = argv[i + 1].parse().unwrap(); i += 2; }
             "--kv-mode" => { kv_mode = argv[i + 1].clone(); i += 2; }
             o => { eprintln!("unknown {o}"); std::process::exit(1); }
         }
@@ -89,7 +92,13 @@ fn main() {
             generated.push(tok);
             gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, eps).unwrap();
             weight_gemv(&mut gpu, &weights.output, &scratch.tmp, &scratch.logits).unwrap();
-            let lg = gpu.download_f32(&scratch.logits).unwrap();
+            let mut lg = gpu.download_f32(&scratch.logits).unwrap();
+            // repetition penalty over the recent window (break greedy loops)
+            let w0 = generated.len().saturating_sub(rep_window);
+            for &t in &generated[w0..] {
+                let v = &mut lg[t as usize];
+                *v = if *v > 0.0 { *v / rep_penalty } else { *v * rep_penalty };
+            }
             let next = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
             tok = if pos + 1 < seed_len { seed[pos + 1] } else { next };
         }
