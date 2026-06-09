@@ -22,7 +22,7 @@ Hipfire metadata/config and defaults to interactive user traffic.
 | 2. Per-worker queueing, enqueue/dequeue/cancel, policy selection | DONE | `cli/worker_scheduler.ts`, `cli/worker_scheduler.test.ts` | Priority buckets, compatibility filtering, opportunistic dispatch policy in one worker-local scheduler. |
 | 3. Model/session foundations and request/session compatibility | DONE | `cli/session_state.ts`, `cli/session_state.test.ts` | Includes `ModelWorkerKey`, accelerator/device placement identity, `RequestSessionDraft`, `SessionStateHandle`, and same-worker/state-kind compatibility. |
 | 4. Server-side prefill batching integration (same-worker/session compatibility, no cross-model batching) | DONE FOR QWEN35 | `cli/server_prefill_batch.ts`, `cli/server_prefill_batch.test.ts`, `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-generate-batch-prefill.sh`, `scripts/smoke-server-prefill-batch.sh` | Policy parsing, eligibility gate, scheduler selection, session adapter, daemon `generate_batch_prefill` dispatch, Qwen35 resident state handles, session release, dense fused prefill, grouped-MoE fused prefill, and non-streaming text-only `/v1/responses` normalization are implemented. Remaining work is generic worker residency beyond Qwen35. |
-| 5. Prefix/state cache metadata + safety telemetry | DONE FOR QWEN35 V1 | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts`, `/health.prefill_batch`, `/health.state_cache`, `scripts/smoke-server-prefix-checkpoint-reuse.sh`, `scripts/smoke-server-prefix-hash-preflight.sh` | Fingerprint, manifest keying, compatibility, `prompt_cache_key` namespace support, spill guardrails, metadata/runtime-hit telemetry, Qwen35 resident attach/fork, daemon-authoritative `xxh128` checkpoint identity, daemon prefix-hash preflight, lifecycle invalidation, and capped in-memory checkpoint residency are wired. Partial-prefix reuse now needs intermediate semantic-boundary checkpoint creation. |
+| 5. Prefix/state cache metadata + safety telemetry | DONE FOR QWEN35 V1 | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts`, `/health.prefill_batch`, `/health.state_cache`, `scripts/smoke-server-prefix-checkpoint-reuse.sh`, `scripts/smoke-server-prefix-hash-preflight.sh`, `scripts/smoke-server-prefix-boundary-reuse.sh` | Fingerprint, manifest keying, compatibility, `prompt_cache_key` namespace support, spill guardrails, metadata/runtime-hit telemetry, Qwen35 resident attach/fork, daemon-authoritative `xxh128` checkpoint identity, daemon prefix-hash preflight, lifecycle invalidation, capped in-memory checkpoint residency, and serial semantic-boundary checkpoint reuse are wired. Fused-backend boundary snapshots need the generic arena hook. |
 | 6. Scheduler starvation/backpressure hardening | DONE | `cli/worker_scheduler.ts`, `cli/worker_scheduler.test.ts` | Optional queue cap and deadline-aging selection prevent unbounded queue growth and strict-priority starvation. |
 | Blocker | PARTIAL | `crates/hipfire-runtime/examples/daemon.rs` implements Qwen35 fused prefill plus state-handle lifecycle and release protocol | Generic multi-model residency, decode batching, and non-Qwen35 worker-owned session arenas remain future work. |
 
@@ -165,6 +165,16 @@ checkpoints above `HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS` with `release_sessions`.
 Daemon reset, unload, reload, interrupted-generation drain, and stale attach
 failures clear the corresponding CLI manifests so a dead handle is not retried
 as a cache hit.
+
+Serial Qwen35 prefill also stores intermediate resident checkpoints at
+daemon-authoritative chat-template boundaries such as completed message, vision,
+tool-call, and tool-response sentinels. The daemon returns these handles in
+`state_handle.prefix_checkpoints[]` with canonical `xxh128` hash metadata, and
+the CLI stores them as normal attachable resident manifests. `/health.state_cache`
+reports `semantic_boundary_checkpoints`, `semantic_boundary_checkpoint_entries`,
+and `prefix_hash_preflight_boundary_matches`. Fused dense/grouped prefill still
+only returns the final checkpoint until the state arena exposes a backend-neutral
+snapshot hook.
 
 This is deliberately narrower than disk spill. `HIPFIRE_SCHED_STATE_CACHE_DISK`
 is reserved for future checkpoint serialization and rehydrate; it must not be

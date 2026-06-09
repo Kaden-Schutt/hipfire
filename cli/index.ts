@@ -1879,6 +1879,14 @@ async function serve(port: number, host: string) {
   let currentStateMode: string | null = null;
   const workerPrefillSchedulers = new Map<string, PriorityPrefillScheduler>();
   const workerStateCaches = new Map<string, Map<string, PrefixCheckpointManifest>>();
+  type ResidentPrefixCheckpointOutcome = {
+    checkpointStateHandle: string;
+    checkpointLogicalPosition?: number;
+    checkpointDaemonPrefixHash: string;
+    checkpointDaemonPrefixLen: number;
+    boundary?: string;
+    boundaryIndex?: number;
+  };
   type PendingPrefillOutcome = {
     prefillTokens: number;
     elapsedMs: number;
@@ -1890,6 +1898,7 @@ async function serve(port: number, host: string) {
     checkpointLogicalPosition?: number;
     checkpointDaemonPrefixHash?: string;
     checkpointDaemonPrefixLen?: number;
+    checkpointPrefixCheckpoints?: ResidentPrefixCheckpointOutcome[];
     runtimeStateEvicted?: boolean;
   };
   type PendingPrefillRequest = {
@@ -2016,6 +2025,8 @@ async function serve(port: number, host: string) {
     prefixHashPreflightRequests: 0,
     prefixHashPreflightCandidates: 0,
     prefixHashPreflightMatches: 0,
+    prefixHashPreflightBoundaryMatches: 0,
+    semanticBoundaryCheckpoints: 0,
     totalBatches: 0,
     fusedBatches: 0,
     fallbackBatches: 0,
@@ -2619,9 +2630,12 @@ async function serve(port: number, host: string) {
                   disk_enabled: serverPrefillBatchControls.stateCacheDisk,
                   daemon_prefix_hash: stateCacheDaemonPrefixEntries > 0,
                   daemon_prefix_hash_entries: stateCacheDaemonPrefixEntries,
+                  semantic_boundary_checkpoints: prefillBatchMetrics.semanticBoundaryCheckpoints > 0,
+                  semantic_boundary_checkpoint_entries: prefillBatchMetrics.semanticBoundaryCheckpoints,
                   prefix_hash_preflight_requests: prefillBatchMetrics.prefixHashPreflightRequests,
                   prefix_hash_preflight_candidates: prefillBatchMetrics.prefixHashPreflightCandidates,
                   prefix_hash_preflight_matches: prefillBatchMetrics.prefixHashPreflightMatches,
+                  prefix_hash_preflight_boundary_matches: prefillBatchMetrics.prefixHashPreflightBoundaryMatches,
                   entries: stateCacheEntries,
                   bytes: stateCacheBytes,
                   metadata_hits: prefillBatchMetrics.metadataCacheHits,
@@ -3545,19 +3559,29 @@ async function serve(port: number, host: string) {
             }
 
             let cacheManifest: PrefixCheckpointManifest | undefined;
-            const daemonCacheLookup = daemonPreflightPrefixes
+            const daemonCacheMatch = daemonPreflightPrefixes
               .sort((a, b) => b.prefix_len - a.prefix_len)
-              .map((candidate) => [...servingWorkerStateCache.values()]
-                .filter((manifest) => prefixCheckpointDaemonCompatible(manifest, {
-                  fingerprint: cacheKeyFingerprint,
-                  daemonPrefixHash: candidate.value,
-                  daemonPrefixLen: candidate.prefix_len,
-                  requiredStateKinds: stateKinds,
-                }))
-                .sort((a, b) => (b.lastUsedAtMs - a.lastUsedAtMs) || (b.prefixLen - a.prefixLen))[0])
-              .find((manifest): manifest is PrefixCheckpointManifest => !!manifest);
+              .map((candidate) => ({
+                candidate,
+                manifest: [...servingWorkerStateCache.values()]
+                  .filter((manifest) => prefixCheckpointDaemonCompatible(manifest, {
+                    fingerprint: cacheKeyFingerprint,
+                    daemonPrefixHash: candidate.value,
+                    daemonPrefixLen: candidate.prefix_len,
+                    requiredStateKinds: stateKinds,
+                  }))
+                  .sort((a, b) => (b.lastUsedAtMs - a.lastUsedAtMs) || (b.prefixLen - a.prefixLen))[0],
+              }))
+              .find((match): match is {
+                candidate: { value: string; prefix_len: number; boundary?: string; boundary_index?: number };
+                manifest: PrefixCheckpointManifest;
+              } => !!match.manifest);
+            const daemonCacheLookup = daemonCacheMatch?.manifest;
             if (daemonCacheLookup) {
               prefillBatchMetrics.prefixHashPreflightMatches += 1;
+              if (daemonCacheMatch?.candidate.boundary && daemonCacheMatch.candidate.boundary !== "full") {
+                prefillBatchMetrics.prefixHashPreflightBoundaryMatches += 1;
+              }
             }
             const compatibleCacheLookup = [...servingWorkerStateCache.values()]
               .filter((manifest) => manifest.prefixLen <= prefillPromptTokens.length)
@@ -4057,6 +4081,7 @@ async function serve(port: number, host: string) {
               const runtimeStateHandlesBySession = new Map<string, string>();
               const checkpointStateHandlesBySession = new Map<string, string>();
               const checkpointDaemonPrefixHashesBySession = new Map<string, { hash: string; len: number }>();
+              const checkpointPrefixCheckpointsBySession = new Map<string, ResidentPrefixCheckpointOutcome[]>();
               const logicalPositionsBySession = new Map<string, number>();
               for (let i = 0; i < 8; i++) {
                 const prefillMsg = await e.recv();
@@ -4121,6 +4146,54 @@ async function serve(port: number, host: string) {
                       });
                     }
                   }
+                  if (
+                    typeof prefillMsg.session_id === "string" &&
+                    stateHandle &&
+                    Array.isArray(stateHandle.prefix_checkpoints)
+                  ) {
+                    if (process.env.HIPFIRE_DEBUG_PREFIX_BOUNDARIES) {
+                      console.error(
+                        `[hipfire] received ${stateHandle.prefix_checkpoints.length} prefix boundary checkpoint(s) for ${prefillMsg.session_id}`,
+                      );
+                    }
+                    const prefixCheckpoints: ResidentPrefixCheckpointOutcome[] = [];
+                    for (const checkpoint of stateHandle.prefix_checkpoints) {
+                      const prefixHash = checkpoint?.prefix_hash;
+                      const prefixLen = typeof checkpoint?.prefix_len === "number"
+                        ? checkpoint.prefix_len
+                        : prefixHash?.prefix_len;
+                      if (
+                        checkpoint &&
+                        typeof checkpoint.checkpoint_id === "string" &&
+                        prefixHash &&
+                        prefixHash.algorithm === "xxh128" &&
+                        typeof prefixHash.value === "string" &&
+                        /^[0-9a-f]{32}$/.test(prefixHash.value) &&
+                        typeof prefixLen === "number" &&
+                        Number.isInteger(prefixLen) &&
+                        prefixLen > 0
+                      ) {
+                        prefixCheckpoints.push({
+                          checkpointStateHandle: checkpoint.checkpoint_id,
+                          checkpointLogicalPosition: Number.isInteger(checkpoint.logical_position)
+                            ? checkpoint.logical_position
+                            : prefixLen,
+                          checkpointDaemonPrefixHash: prefixHash.value,
+                          checkpointDaemonPrefixLen: prefixLen,
+                          boundary: typeof checkpoint.boundary === "string" ? checkpoint.boundary : undefined,
+                          boundaryIndex: Number.isInteger(checkpoint.boundary_index) ? checkpoint.boundary_index : undefined,
+                        });
+                      }
+                    }
+                    if (prefixCheckpoints.length > 0) {
+                      if (process.env.HIPFIRE_DEBUG_PREFIX_BOUNDARIES) {
+                        console.error(
+                          `[hipfire] accepted ${prefixCheckpoints.length} prefix boundary checkpoint(s) for ${prefillMsg.session_id}`,
+                        );
+                      }
+                      checkpointPrefixCheckpointsBySession.set(prefillMsg.session_id, prefixCheckpoints);
+                    }
+                  }
                   continue;
                 }
                 if (prefillMsg?.type === "generate_batch_prefill_started") {
@@ -4168,7 +4241,7 @@ async function serve(port: number, host: string) {
                 if (!requestAllowsResidentPrefixCache || !checkpointHandle || !daemonPrefix) return;
                 const prefixLen = Math.min(
                   draft.promptTokens.length,
-                  Math.max(0, draft.cachedPrefixTokens + draft.suffixTokens.length),
+                  Math.max(0, daemonPrefix.len),
                 );
                 if (prefixLen <= 0) return;
                 const checkpointManifest = createPrefixCheckpointManifest({
@@ -4201,15 +4274,43 @@ async function serve(port: number, host: string) {
                 servingWorkerStateCache.set(key, checkpointManifest);
                 await enforceResidentCheckpointCap();
               };
+              const storeAttachablePrefixCheckpoints = async (
+                draft: RequestSessionDraft,
+                checkpoints: ResidentPrefixCheckpointOutcome[] | undefined,
+              ) => {
+                if (!checkpoints || checkpoints.length === 0) return;
+                for (const checkpoint of checkpoints) {
+                  await storeAttachableCheckpoint(
+                    draft,
+                    checkpoint.checkpointStateHandle,
+                    checkpoint.checkpointLogicalPosition,
+                    {
+                      hash: checkpoint.checkpointDaemonPrefixHash,
+                      len: checkpoint.checkpointDaemonPrefixLen,
+                    },
+                  );
+                  prefillBatchMetrics.semanticBoundaryCheckpoints += 1;
+                }
+              };
               await storeAttachableCheckpoint(
                 serverPrefillSession,
                 checkpointStateHandlesBySession.get(reqId),
                 logicalPositionsBySession.get(reqId),
                 checkpointDaemonPrefixHashesBySession.get(reqId),
               );
+              await storeAttachablePrefixCheckpoints(
+                serverPrefillSession,
+                checkpointPrefixCheckpointsBySession.get(reqId),
+              );
               if (!requestAllowsResidentPrefixCache) {
+                const unusedCheckpointHandles = [
+                  ...checkpointStateHandlesBySession.values(),
+                  ...[...checkpointPrefixCheckpointsBySession.values()]
+                    .flat()
+                    .map((checkpoint) => checkpoint.checkpointStateHandle),
+                ];
                 await releaseRuntimeHandles(
-                  checkpointStateHandlesBySession.values(),
+                  unusedCheckpointHandles,
                   "unused prefix checkpoints",
                 );
               }
@@ -4224,6 +4325,10 @@ async function serve(port: number, host: string) {
               } else {
                 genParams.session_id = runtimeStateHandlesBySession.get(reqId) ?? reqId;
                 genParams.prefill_already_done = true;
+                const prefilledPromptTokens = logicalPositionsBySession.get(reqId);
+                if (prefilledPromptTokens !== undefined) {
+                  genParams.prefilled_prompt_tokens = prefilledPromptTokens;
+                }
                 releaseRuntimeSessionId = genParams.session_id;
               }
               lastPrefillRuntimeDispatchSkippedReason = evictedSessionIds.has(reqId)
@@ -4254,6 +4359,7 @@ async function serve(port: number, host: string) {
                   checkpointLogicalPosition: logicalPositionsBySession.get(selected.id),
                   checkpointDaemonPrefixHash: checkpointDaemonPrefixHashesBySession.get(selected.id)?.hash,
                   checkpointDaemonPrefixLen: checkpointDaemonPrefixHashesBySession.get(selected.id)?.len,
+                  checkpointPrefixCheckpoints: checkpointPrefixCheckpointsBySession.get(selected.id),
                   runtimeStateEvicted,
                 });
               }
@@ -4348,6 +4454,9 @@ async function serve(port: number, host: string) {
               } else {
                 genParams.session_id = pendingOutcome.runtimeStateHandle ?? reqId;
                 genParams.prefill_already_done = true;
+                if (pendingOutcome.checkpointLogicalPosition !== undefined) {
+                  genParams.prefilled_prompt_tokens = pendingOutcome.checkpointLogicalPosition;
+                }
               }
               if (genParams.server_prefill_batch) {
                 genParams.server_prefill_batch.runtime_dispatch = pendingOutcome.runtimeStateEvicted
@@ -4408,6 +4517,49 @@ async function serve(port: number, host: string) {
                   }
                   residentCheckpointHandles.add(pendingOutcome.checkpointStateHandle);
                   servingWorkerStateCache.set(key, checkpointManifest);
+                  await enforceResidentCheckpointCap();
+                }
+              }
+              if (
+                requestAllowsResidentPrefixCache &&
+                pendingOutcome.checkpointPrefixCheckpoints &&
+                serverPrefillSession
+              ) {
+                for (const checkpoint of pendingOutcome.checkpointPrefixCheckpoints) {
+                  const prefixLen = Math.min(
+                    prefillPromptTokens.length,
+                    Math.max(0, checkpoint.checkpointDaemonPrefixLen),
+                  );
+                  if (prefixLen <= 0) continue;
+                  const checkpointManifest = createPrefixCheckpointManifest({
+                    fingerprint: cacheKeyFingerprint,
+                    prefixTokens: prefillPromptTokens.slice(0, prefixLen),
+                    stateKinds,
+                    bytes: Math.max(1, prefixLen) * 16,
+                    runtimeState: "attachable",
+                    runtimeStateHandle: checkpoint.checkpointStateHandle,
+                    runtimeLogicalPosition: checkpoint.checkpointLogicalPosition,
+                    daemonPrefixHash: checkpoint.checkpointDaemonPrefixHash,
+                    daemonPrefixLen: checkpoint.checkpointDaemonPrefixLen,
+                    createdAtMs: requestNowMs,
+                    lastUsedAtMs: Date.now(),
+                    hitCount: 0,
+                    checksums: checksumLookup,
+                  });
+                  const key = prefixCheckpointCacheKey(checkpointManifest);
+                  const previous = servingWorkerStateCache.get(key);
+                  if (
+                    previous?.runtimeStateHandle &&
+                    previous.runtimeStateHandle !== checkpoint.checkpointStateHandle
+                  ) {
+                    await releaseResidentCheckpointHandles(
+                      [previous.runtimeStateHandle],
+                      "resident checkpoint replacement",
+                    );
+                  }
+                  residentCheckpointHandles.add(checkpoint.checkpointStateHandle);
+                  servingWorkerStateCache.set(key, checkpointManifest);
+                  prefillBatchMetrics.semanticBoundaryCheckpoints += 1;
                   await enforceResidentCheckpointCap();
                 }
               }

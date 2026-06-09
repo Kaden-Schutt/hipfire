@@ -129,7 +129,7 @@ export function prefixCheckpointAttachable(manifest: PrefixCheckpointManifest): 
 }
 
 export function prefixCheckpointCacheKey(
-  manifest: Pick<PrefixCheckpointManifest, "fingerprint" | "tokenPrefixHash" | "prefixLen" | "stateKinds">,
+  manifest: Pick<PrefixCheckpointManifest, "fingerprint" | "tokenPrefixHash" | "prefixLen" | "stateKinds" | "daemonPrefixHash" | "daemonPrefixLen">,
 ): string {
   const fingerprint = normalizeFingerprint(manifest.fingerprint);
   return [
@@ -144,6 +144,8 @@ export function prefixCheckpointCacheKey(
     fingerprint.featureFlags.join("+"),
     manifest.tokenPrefixHash,
     manifest.prefixLen,
+    manifest.daemonPrefixHash ?? "",
+    manifest.daemonPrefixLen ?? "",
     normalizeStateKinds(manifest.stateKinds).join("+"),
   ].join("|");
 }

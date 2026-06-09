@@ -1941,17 +1941,32 @@ mod generate_batch_prefill_tests {
         assert!(serial_err.contains("not grouped-MoE eligible"));
     }
 
-    #[test]
-    fn fused_dense_preflight_rejects_non_fused_candidate_plan() {
-        let prepared = vec![Qwen35PreparedPrefillSession {
-            id: "req-1".to_string(),
-            tokens: vec![1, 2, 3],
-            cached_prefix_tokens: 0,
-            replay_as_generated_suffix: false,
+    fn test_prepared_prefill_session(
+        id: &str,
+        tokens: Vec<u32>,
+        cached_prefix_tokens: usize,
+        replay_as_generated_suffix: bool,
+    ) -> Qwen35PreparedPrefillSession {
+        Qwen35PreparedPrefillSession {
+            id: id.to_string(),
+            tokens,
+            cached_prefix_tokens,
+            replay_as_generated_suffix,
             state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
             assistant_prefix: "plain".to_string(),
             max_think_tokens: 0,
-        }];
+            boundary_checkpoints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fused_dense_preflight_rejects_non_fused_candidate_plan() {
+        let prepared = vec![test_prepared_prefill_session(
+            "req-1",
+            vec![1, 2, 3],
+            0,
+            false,
+        )];
 
         let err = validate_qwen35_fused_dense_prefill_batch_preflight(
             &prepared,
@@ -1964,24 +1979,8 @@ mod generate_batch_prefill_tests {
     #[test]
     fn fused_dense_preflight_rejects_empty_session_token_slices() {
         let prepared = vec![
-            Qwen35PreparedPrefillSession {
-                id: "req-1".to_string(),
-                tokens: Vec::new(),
-                cached_prefix_tokens: 0,
-                replay_as_generated_suffix: true,
-                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
-                assistant_prefix: "plain".to_string(),
-                max_think_tokens: 0,
-            },
-            Qwen35PreparedPrefillSession {
-                id: "req-2".to_string(),
-                tokens: vec![4],
-                cached_prefix_tokens: 0,
-                replay_as_generated_suffix: true,
-                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
-                assistant_prefix: "plain".to_string(),
-                max_think_tokens: 0,
-            },
+            test_prepared_prefill_session("req-1", Vec::new(), 0, true),
+            test_prepared_prefill_session("req-2", vec![4], 0, true),
         ];
 
         let err = validate_qwen35_fused_dense_prefill_batch_preflight(
@@ -1994,15 +1993,12 @@ mod generate_batch_prefill_tests {
 
     #[test]
     fn fused_dense_preflight_rejects_single_session_batches() {
-        let prepared = vec![Qwen35PreparedPrefillSession {
-            id: "req-1".to_string(),
-            tokens: vec![1, 2, 3],
-            cached_prefix_tokens: 0,
-            replay_as_generated_suffix: false,
-            state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
-            assistant_prefix: "plain".to_string(),
-            max_think_tokens: 0,
-        }];
+        let prepared = vec![test_prepared_prefill_session(
+            "req-1",
+            vec![1, 2, 3],
+            0,
+            false,
+        )];
 
         let err = validate_qwen35_fused_dense_prefill_batch_preflight(
             &prepared,
@@ -2015,24 +2011,8 @@ mod generate_batch_prefill_tests {
     #[test]
     fn fused_dense_preflight_rejects_mixed_prompt_and_suffix_batches() {
         let prepared = vec![
-            Qwen35PreparedPrefillSession {
-                id: "req-1".to_string(),
-                tokens: vec![1, 2, 3],
-                cached_prefix_tokens: 0,
-                replay_as_generated_suffix: false,
-                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
-                assistant_prefix: "plain".to_string(),
-                max_think_tokens: 0,
-            },
-            Qwen35PreparedPrefillSession {
-                id: "req-2".to_string(),
-                tokens: vec![4],
-                cached_prefix_tokens: 16,
-                replay_as_generated_suffix: true,
-                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
-                assistant_prefix: "plain".to_string(),
-                max_think_tokens: 0,
-            },
+            test_prepared_prefill_session("req-1", vec![1, 2, 3], 0, false),
+            test_prepared_prefill_session("req-2", vec![4], 16, true),
         ];
 
         let err = validate_qwen35_fused_dense_prefill_batch_preflight(
@@ -2046,24 +2026,8 @@ mod generate_batch_prefill_tests {
     #[test]
     fn fused_grouped_moe_preflight_uses_grouped_candidate_plan() {
         let prepared = vec![
-            Qwen35PreparedPrefillSession {
-                id: "req-1".to_string(),
-                tokens: vec![1, 2, 3],
-                cached_prefix_tokens: 0,
-                replay_as_generated_suffix: false,
-                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
-                assistant_prefix: "plain".to_string(),
-                max_think_tokens: 0,
-            },
-            Qwen35PreparedPrefillSession {
-                id: "req-2".to_string(),
-                tokens: vec![4],
-                cached_prefix_tokens: 0,
-                replay_as_generated_suffix: false,
-                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
-                assistant_prefix: "plain".to_string(),
-                max_think_tokens: 0,
-            },
+            test_prepared_prefill_session("req-1", vec![1, 2, 3], 0, false),
+            test_prepared_prefill_session("req-2", vec![4], 0, false),
         ];
 
         validate_qwen35_fused_grouped_moe_prefill_batch_preflight(
@@ -2082,24 +2046,8 @@ mod generate_batch_prefill_tests {
     #[test]
     fn builds_dense_fused_worker_contract_for_prompt_batch() {
         let prepared = vec![
-            Qwen35PreparedPrefillSession {
-                id: "req-1".to_string(),
-                tokens: vec![1, 2, 3],
-                cached_prefix_tokens: 0,
-                replay_as_generated_suffix: false,
-                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
-                assistant_prefix: "plain".to_string(),
-                max_think_tokens: 0,
-            },
-            Qwen35PreparedPrefillSession {
-                id: "req-2".to_string(),
-                tokens: vec![4, 5],
-                cached_prefix_tokens: 0,
-                replay_as_generated_suffix: false,
-                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
-                assistant_prefix: "plain".to_string(),
-                max_think_tokens: 0,
-            },
+            test_prepared_prefill_session("req-1", vec![1, 2, 3], 0, false),
+            test_prepared_prefill_session("req-2", vec![4, 5], 0, false),
         ];
 
         let contract = build_qwen35_fused_dense_prefill_batch_contract(
@@ -2119,24 +2067,8 @@ mod generate_batch_prefill_tests {
     #[test]
     fn builds_dense_fused_worker_contract_for_suffix_batch() {
         let prepared = vec![
-            Qwen35PreparedPrefillSession {
-                id: "req-1".to_string(),
-                tokens: vec![11],
-                cached_prefix_tokens: 8,
-                replay_as_generated_suffix: true,
-                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
-                assistant_prefix: "plain".to_string(),
-                max_think_tokens: 0,
-            },
-            Qwen35PreparedPrefillSession {
-                id: "req-2".to_string(),
-                tokens: vec![12, 13],
-                cached_prefix_tokens: 8,
-                replay_as_generated_suffix: true,
-                state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
-                assistant_prefix: "plain".to_string(),
-                max_think_tokens: 0,
-            },
+            test_prepared_prefill_session("req-1", vec![11], 8, true),
+            test_prepared_prefill_session("req-2", vec![12, 13], 8, true),
         ];
 
         let contract = build_qwen35_fused_dense_prefill_batch_contract(
@@ -2454,6 +2386,16 @@ struct Qwen35PreparedPrefillSession {
     state_kinds: Vec<String>,
     assistant_prefix: String,
     max_think_tokens: usize,
+    boundary_checkpoints: Vec<Qwen35SemanticBoundaryCheckpoint>,
+}
+
+#[derive(Clone, Debug)]
+struct Qwen35SemanticBoundaryCheckpoint {
+    checkpoint_id: Option<String>,
+    prefix_len: usize,
+    hash: GenerateBatchPrefillPrefixHash,
+    boundary: String,
+    boundary_index: usize,
 }
 
 struct Qwen35PrefillSessionResult {
@@ -2463,6 +2405,7 @@ struct Qwen35PrefillSessionResult {
     cached_prefix_tokens: usize,
     prefix_hash: GenerateBatchPrefillPrefixHash,
     debug_sample_token: Option<u32>,
+    boundary_checkpoints: Vec<Qwen35SemanticBoundaryCheckpoint>,
 }
 
 struct Qwen35PrefillBatchResult {
@@ -2990,6 +2933,17 @@ fn qwen35_checkpoint_session_id(
     format!("qwen35-checkpoint:{batch_id}:{session_id}:{logical_position}")
 }
 
+fn qwen35_boundary_checkpoint_session_id(
+    batch_id: &str,
+    session_id: &str,
+    logical_position: usize,
+    boundary_index: usize,
+) -> String {
+    format!(
+        "qwen35-checkpoint:{batch_id}:{session_id}:boundary:{boundary_index}:{logical_position}"
+    )
+}
+
 fn push_hash_field(buf: &mut Vec<u8>, label: &str, value: &str) {
     buf.extend_from_slice(label.as_bytes());
     buf.push(b'=');
@@ -3190,41 +3144,54 @@ fn qwen35_prefix_hash_candidates(
     m: &LoadedModel,
     session: &GenerateBatchPrefillSession,
 ) -> Result<Vec<PrefixHashPreflightCandidate>, String> {
+    let full_tokens = qwen35_materialize_batch_prefill_prompt(m, session)?;
+    qwen35_prefix_hash_candidates_for_tokens(m, session, &full_tokens)
+}
+
+fn qwen35_prefix_hash_candidates_for_tokens(
+    m: &LoadedModel,
+    session: &GenerateBatchPrefillSession,
+    full_tokens: &[u32],
+) -> Result<Vec<PrefixHashPreflightCandidate>, String> {
     let tokenizer = m
         .tokenizer
         .as_ref()
         .ok_or_else(|| "tokenizer not loaded".to_string())?;
-    let full_tokens = qwen35_materialize_batch_prefill_prompt(m, session)?;
     let full_hash = compute_qwen35_prefix_hash(
         m.arch_id,
         m.q35_kv_mode.as_deref(),
         &session.state_handle.state_kinds,
         &session.assistant_prefix,
         session.max_think_tokens,
-        &full_tokens,
+        full_tokens,
     );
     let mut candidates = Vec::new();
-    let boundary_tokens = [
-        ("message_end", tokenizer.special_token_id("<|im_end|>")),
-        ("vision_end", tokenizer.special_token_id("<|vision_end|>")),
-        ("tool_end", tokenizer.special_token_id("<|tool_call_end|>")),
-        (
-            "tool_response_end",
-            tokenizer.special_token_id("<|tool_response_end|>"),
-        ),
-    ];
-    let mut boundary_index = 0usize;
-    for (idx, token) in full_tokens.iter().enumerate() {
-        let prefix_len = idx + 1;
-        if prefix_len >= full_tokens.len() {
-            continue;
+    let boundary_tokens: Vec<(&str, Vec<u32>)> = [
+        ("message_end", "<|im_end|>"),
+        ("vision_end", "<|vision_end|>"),
+        ("tool_end", "<|tool_call_end|>"),
+        ("tool_response_end", "<|tool_response_end|>"),
+    ]
+    .into_iter()
+    .filter_map(|(boundary, marker)| {
+        let marker_tokens = tokenizer
+            .special_token_id(marker)
+            .map(|id| vec![id])
+            .unwrap_or_else(|| tokenizer.encode(marker));
+        if marker_tokens.is_empty() {
+            None
+        } else {
+            Some((boundary, marker_tokens))
         }
-        let Some((boundary, _)) = boundary_tokens
-            .iter()
-            .find(|(_, boundary_token)| boundary_token == &Some(*token))
-        else {
-            continue;
-        };
+    })
+    .collect();
+    let mut boundary_index = 0usize;
+    let mut push_boundary_candidate = |candidates: &mut Vec<PrefixHashPreflightCandidate>,
+                                       prefix_len: usize,
+                                       boundary: &str| {
+        if prefix_len == 0 || prefix_len >= full_tokens.len() {
+            return;
+        }
         let hash = compute_qwen35_prefix_hash(
             m.arch_id,
             m.q35_kv_mode.as_deref(),
@@ -3241,10 +3208,39 @@ fn qwen35_prefix_hash_candidates(
         {
             candidates.push(PrefixHashPreflightCandidate {
                 hash,
-                boundary: (*boundary).to_string(),
+                boundary: boundary.to_string(),
                 boundary_index,
             });
             boundary_index += 1;
+        }
+    };
+    for (idx, _) in full_tokens.iter().enumerate() {
+        let prefix_len = idx + 1;
+        if prefix_len >= full_tokens.len() {
+            continue;
+        }
+        let Some((boundary, _)) = boundary_tokens.iter().find(|(_, marker_tokens)| {
+            prefix_len >= marker_tokens.len()
+                && full_tokens[prefix_len - marker_tokens.len()..prefix_len] == marker_tokens[..]
+        }) else {
+            continue;
+        };
+        push_boundary_candidate(&mut candidates, prefix_len, boundary);
+    }
+
+    let assistant_start: Vec<u32> = [
+        tokenizer.encode("<|im_start|>"),
+        tokenizer.encode("assistant"),
+        tokenizer.encode("\n"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !assistant_start.is_empty() && full_tokens.len() > assistant_start.len() {
+        for idx in 0..=full_tokens.len() - assistant_start.len() {
+            if full_tokens[idx..idx + assistant_start.len()] == assistant_start[..] {
+                push_boundary_candidate(&mut candidates, idx, "assistant_turn_start");
+            }
         }
     }
     candidates.push(PrefixHashPreflightCandidate {
@@ -3254,6 +3250,45 @@ fn qwen35_prefix_hash_candidates(
     });
     candidates.sort_by_key(|candidate| candidate.hash.prefix_len);
     Ok(candidates)
+}
+
+fn qwen35_semantic_boundary_checkpoints(
+    m: &LoadedModel,
+    session: &GenerateBatchPrefillSession,
+    full_tokens: &[u32],
+) -> Result<Vec<Qwen35SemanticBoundaryCheckpoint>, String> {
+    let candidates = qwen35_prefix_hash_candidates_for_tokens(m, session, full_tokens)?;
+    if std::env::var_os("HIPFIRE_DEBUG_PREFIX_BOUNDARIES").is_some() {
+        eprintln!(
+            "[daemon] prefix boundary candidates session={} tokens={} candidates={}",
+            session.id,
+            full_tokens.len(),
+            candidates.len()
+        );
+        for candidate in &candidates {
+            eprintln!(
+                "[daemon] prefix boundary candidate session={} boundary={} index={} len={} hash={}",
+                session.id,
+                candidate.boundary,
+                candidate.boundary_index,
+                candidate.hash.prefix_len,
+                candidate.hash.value
+            );
+        }
+    }
+    Ok(candidates
+        .into_iter()
+        .filter(|candidate| candidate.boundary != "full")
+        .filter(|candidate| candidate.hash.prefix_len > 0)
+        .filter(|candidate| candidate.hash.prefix_len < full_tokens.len())
+        .map(|candidate| Qwen35SemanticBoundaryCheckpoint {
+            checkpoint_id: None,
+            prefix_len: candidate.hash.prefix_len,
+            hash: candidate.hash,
+            boundary: candidate.boundary,
+            boundary_index: candidate.boundary_index,
+        })
+        .collect())
 }
 
 fn run_prefix_hash_preflight_qwen35(
@@ -3308,13 +3343,14 @@ fn run_prefix_hash_preflight_qwen35(
 fn qwen35_prefill_suffix_batch(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
+    batch_id: &str,
     prepared: &[Qwen35PreparedPrefillSession],
     plan: GenerateBatchPrefillPlan,
     backend: Qwen35PrefillBatchBackend,
 ) -> Result<Qwen35PrefillBatchResult, String> {
     match backend {
         Qwen35PrefillBatchBackend::SerialReference => {
-            qwen35_prefill_suffix_batch_serial_reference(m, gpu, prepared, plan, backend)
+            qwen35_prefill_suffix_batch_serial_reference(m, gpu, batch_id, prepared, plan, backend)
         }
         Qwen35PrefillBatchBackend::FusedDense => {
             qwen35_prefill_suffix_batch_fused_dense(m, gpu, prepared, plan, backend)
@@ -3496,6 +3532,7 @@ fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             cached_prefix_tokens: spec.cached_prefix_tokens,
             prefix_hash,
             debug_sample_token,
+            boundary_checkpoints: Vec::new(),
         });
         m.q35_sessions.insert(id, state);
     }
@@ -3721,6 +3758,7 @@ fn qwen35_prefill_suffix_batch_fused_dense(
             cached_prefix_tokens: spec.cached_prefix_tokens,
             prefix_hash,
             debug_sample_token,
+            boundary_checkpoints: Vec::new(),
         });
         m.q35_sessions.insert(id, state);
     }
@@ -3811,6 +3849,7 @@ fn build_qwen35_fused_dense_prefill_batch_contract<'a>(
 fn qwen35_prefill_suffix_batch_serial_reference(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
+    batch_id: &str,
     prepared: &[Qwen35PreparedPrefillSession],
     plan: GenerateBatchPrefillPlan,
     backend: Qwen35PrefillBatchBackend,
@@ -3825,12 +3864,61 @@ fn qwen35_prefill_suffix_batch_serial_reference(
     let mut results = Vec::with_capacity(prepared.len());
     for session in prepared {
         qwen35_activate_session(m, gpu, &session.id)?;
-        let prefilled = qwen35_prefill_active_session(
-            m,
-            gpu,
-            &session.tokens,
-            session.replay_as_generated_suffix,
-        )?;
+        let mut boundary_checkpoints = Vec::new();
+        let prefilled = if session.boundary_checkpoints.is_empty()
+            || session.replay_as_generated_suffix
+        {
+            qwen35_prefill_active_session(
+                m,
+                gpu,
+                &session.tokens,
+                session.replay_as_generated_suffix,
+            )?
+        } else {
+            let mut prefilled = 0usize;
+            let mut boundaries = session.boundary_checkpoints.clone();
+            boundaries.sort_by_key(|boundary| boundary.prefix_len);
+            for mut boundary in boundaries {
+                if boundary.prefix_len <= prefilled || boundary.prefix_len > session.tokens.len() {
+                    continue;
+                }
+                let segment = &session.tokens[prefilled..boundary.prefix_len];
+                prefilled += qwen35_prefill_active_session(m, gpu, segment, false)?;
+                let logical_position = qwen35_active_logical_position(m)?;
+                if logical_position != boundary.prefix_len {
+                    return Err(format!(
+                        "qwen35 semantic boundary checkpoint position mismatch for session {}: boundary_len={} logical_position={}",
+                        session.id, boundary.prefix_len, logical_position
+                    ));
+                }
+                let checkpoint_id = qwen35_boundary_checkpoint_session_id(
+                    batch_id,
+                    &session.id,
+                    logical_position,
+                    boundary.boundary_index,
+                );
+                qwen35_save_active_session(m, gpu)?;
+                if let Some(saved) = m.q35_sessions.get_mut(&session.id) {
+                    saved.prefix_hash = Some(boundary.hash.clone());
+                }
+                qwen35_fork_session_state(m, gpu, &session.id, &checkpoint_id, None).map_err(
+                    |e| {
+                        format!(
+                            "qwen35 session {} failed to create semantic boundary checkpoint {}: {}",
+                            session.id, checkpoint_id, e
+                        )
+                    },
+                )?;
+                qwen35_activate_session(m, gpu, &session.id)?;
+                boundary.checkpoint_id = Some(checkpoint_id);
+                boundary_checkpoints.push(boundary);
+            }
+            if prefilled < session.tokens.len() {
+                prefilled +=
+                    qwen35_prefill_active_session(m, gpu, &session.tokens[prefilled..], false)?;
+            }
+            prefilled
+        };
         let logical_position = qwen35_active_logical_position(m)?;
         let debug_sample_token = if session.replay_as_generated_suffix
             && std::env::var_os("HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE").is_some()
@@ -3890,6 +3978,7 @@ fn qwen35_prefill_suffix_batch_serial_reference(
             cached_prefix_tokens: session.cached_prefix_tokens,
             prefix_hash,
             debug_sample_token,
+            boundary_checkpoints,
         });
     }
 
@@ -4003,9 +4092,10 @@ fn run_generate_batch_prefill_serial_qwen35(
         }
 
         let created = qwen35_activate_session(m, gpu, &session.id)?;
+        let mut boundary_checkpoints = Vec::new();
         let tokens: Vec<u32> = if session.prompt.is_some() {
+            let full_tokens = qwen35_materialize_batch_prefill_prompt(m, session)?;
             if session.state_handle.runtime_state_handle.is_some() {
-                let full_tokens = qwen35_materialize_batch_prefill_prompt(m, session)?;
                 let prefix_len = session
                     .state_handle
                     .prefix_hash
@@ -4031,7 +4121,9 @@ fn run_generate_batch_prefill_serial_qwen35(
             } else {
                 let _ = created;
                 qwen35_reset_active_session(m, gpu)?;
-                qwen35_materialize_batch_prefill_prompt(m, session)?
+                boundary_checkpoints =
+                    qwen35_semantic_boundary_checkpoints(m, session, &full_tokens)?;
+                full_tokens
             }
         } else {
             let current_position = qwen35_active_logical_position(m)?;
@@ -4058,10 +4150,11 @@ fn run_generate_batch_prefill_serial_qwen35(
             state_kinds: session.state_handle.state_kinds.clone(),
             assistant_prefix: session.assistant_prefix.clone(),
             max_think_tokens: session.max_think_tokens,
+            boundary_checkpoints,
         });
     }
 
-    let result = qwen35_prefill_suffix_batch(m, gpu, &prepared, plan, backend)?;
+    let result = qwen35_prefill_suffix_batch(m, gpu, &envelope.batch_id, &prepared, plan, backend)?;
     for session in &result.sessions {
         let checkpoint_id =
             qwen35_checkpoint_session_id(&envelope.batch_id, &session.id, session.logical_position);
@@ -4094,6 +4187,27 @@ fn run_generate_batch_prefill_serial_qwen35(
             "plan": result.plan.as_str(),
             "backend": result.backend.as_str(),
         });
+        let prefix_checkpoints: Vec<serde_json::Value> = session
+            .boundary_checkpoints
+            .iter()
+            .filter_map(|checkpoint| {
+                checkpoint.checkpoint_id.as_ref().map(|checkpoint_id| {
+                    serde_json::json!({
+                        "checkpoint_id": checkpoint_id,
+                        "checkpoint_runtime_state": "attachable",
+                        "logical_position": checkpoint.prefix_len,
+                        "cached_prefix_tokens": checkpoint.prefix_len,
+                        "prefix_hash": generate_prefix_hash_json(&checkpoint.hash),
+                        "prefix_len": checkpoint.hash.prefix_len,
+                        "boundary": checkpoint.boundary,
+                        "boundary_index": checkpoint.boundary_index,
+                    })
+                })
+            })
+            .collect();
+        if !prefix_checkpoints.is_empty() {
+            line["state_handle"]["prefix_checkpoints"] = serde_json::json!(prefix_checkpoints);
+        }
         if let Some(debug_sample_token) = session.debug_sample_token {
             line["debug_sample_token"] = serde_json::json!(debug_sample_token);
         }
@@ -4900,6 +5014,10 @@ fn main() {
                     .get("prefill_already_done")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let prefilled_prompt_tokens = msg
+                    .get("prefilled_prompt_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
                 if (m.arch_id == 5 || m.arch_id == 6) && m.pp == 1 {
                     let target_session_id = session_id.unwrap_or(QWEN35_LEGACY_SESSION_ID);
                     if let Err(e) = qwen35_activate_session(m, &mut gpu, target_session_id) {
@@ -5293,6 +5411,7 @@ fn main() {
                         messages_history.as_deref(),
                         think_mode,
                         prefill_already_done,
+                        prefilled_prompt_tokens,
                     );
                 }
             }
@@ -9529,6 +9648,7 @@ fn generate(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
     prefill_already_done: bool,
+    prefilled_prompt_tokens: Option<usize>,
 ) {
     // Seed the process-global CPU sampler RNG for this request. CPU fallback and
     // grammar/VL-style sampling should not inherit RNG state from prior requests.
@@ -10209,14 +10329,15 @@ fn generate(
         let mut session = q35_session.take().expect("qwen35 request session state");
         if prefill_already_done {
             let current_position = session.seq_pos + session.kv_cache.compact_offset;
-            if current_position != new_tokens.len() {
+            let expected_position = prefilled_prompt_tokens.unwrap_or(new_tokens.len());
+            if current_position != expected_position {
                 write_error(
                     stdout,
                     id,
                     &format!(
-                        "prefill_already_done requested but active session position {} does not match prompt token count {}",
+                        "prefill_already_done requested but active session position {} does not match expected prefilled prompt token count {}",
                         current_position,
-                        new_tokens.len()
+                        expected_position
                     ),
                 );
                 qwen35_restore_or_error(stdout, id, m, gpu, session);

@@ -146,13 +146,40 @@ describe("prefix state cache keys", () => {
       runtimeState: "attachable",
       runtimeStateHandle: "qwen35-checkpoint:req",
       runtimeLogicalPosition: 8,
-      daemonPrefixHash: "fedcba9876543210fedcba9876543210",
+      daemonPrefixHash: "0123456789abcdef0123456789abcdef",
       daemonPrefixLen: 3,
       createdAtMs: 10,
     });
 
     expect(base.runtimeLogicalPosition).toBe(7);
     expect(prefixCheckpointCacheKey(base)).toBe(prefixCheckpointCacheKey(sameKeyDifferentRuntimePosition));
+  });
+
+  test("includes daemon prefix identity in attachable checkpoint keys", () => {
+    const a = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [1, 2, 3],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      runtimeState: "attachable",
+      runtimeStateHandle: "qwen35-checkpoint:a",
+      daemonPrefixHash: "0123456789abcdef0123456789abcdef",
+      daemonPrefixLen: 12,
+      createdAtMs: 10,
+    });
+    const b = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [1, 2, 3],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      runtimeState: "attachable",
+      runtimeStateHandle: "qwen35-checkpoint:b",
+      daemonPrefixHash: "fedcba9876543210fedcba9876543210",
+      daemonPrefixLen: 24,
+      createdAtMs: 10,
+    });
+
+    expect(prefixCheckpointCacheKey(a)).not.toBe(prefixCheckpointCacheKey(b));
   });
 
   test("daemon hash compatibility ignores full render hash but keeps namespace", () => {
