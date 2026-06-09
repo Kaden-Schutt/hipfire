@@ -3133,20 +3133,110 @@ struct Gemma4Bindings<'a> {
 }
 
 impl<'a> ForwardBindings for Gemma4Bindings<'a> {
-    fn run_proj(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
-        Err(hipfire_dispatch::types::DispatchError::Hip(format!(
-            "gemma4 run_proj opcode {} not yet implemented (Step 2)", op_code(_op)
-        )))
+    fn run_proj(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let s = self.scratch;
+        let config = self.config;
+        let res: HipResult<()> = match op_code(op) {
+            g4_op::PROJ_QK_SLIDING => match self.layer {
+                LayerWeights::Sliding(lw) => {
+                    let wr_q = lw.q_proj.dispatch_ref();
+                    let wr_k = lw.k_proj.dispatch_ref();
+                    execute_steps(gpu, ctx, &[
+                        Step::Gemv { w: &wr_q, input: GemvInput::Raw(&s.tmp), out: &s.q },
+                        Step::Gemv { w: &wr_k, input: GemvInput::Raw(&s.tmp), out: &s.k },
+                    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                }
+                _ => Err(hip_bridge::HipError::new(0, "PROJ_QK_SLIDING on non-Sliding layer")),
+            },
+            g4_op::PROJ_V_SLIDING => match self.layer {
+                LayerWeights::Sliding(lw) => weight_gemv(gpu, &lw.v_proj, &s.tmp, &s.v),
+                _ => Err(hip_bridge::HipError::new(0, "PROJ_V_SLIDING on non-Sliding layer")),
+            },
+            g4_op::PROJ_Q_FULL => match self.layer {
+                LayerWeights::Full(lw) => weight_gemv(gpu, &lw.q_proj, &s.tmp, &s.q),
+                _ => Err(hip_bridge::HipError::new(0, "PROJ_Q_FULL on non-Full layer")),
+            },
+            g4_op::PROJ_K_FULL => match self.layer {
+                LayerWeights::Full(lw) => weight_gemv(gpu, &lw.k_proj, &s.tmp, &s.k),
+                _ => Err(hip_bridge::HipError::new(0, "PROJ_K_FULL on non-Full layer")),
+            },
+            g4_op::PROJ_O => match self.layer {
+                LayerWeights::Sliding(lw) => {
+                    let wr = lw.o_proj.dispatch_ref();
+                    execute_steps(gpu, ctx, &[
+                        Step::Gemv { w: &wr, input: GemvInput::Raw(&s.attn_out), out: &s.tmp },
+                    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                }
+                LayerWeights::Full(lw) => weight_gemv(gpu, &lw.o_proj, &s.attn_out, &s.tmp),
+            },
+            g4_op::PROJ_GATE_UP => match self.layer {
+                LayerWeights::Sliding(lw) => {
+                    let wr_gate = lw.gate_proj.dispatch_ref();
+                    let wr_up = lw.up_proj.dispatch_ref();
+                    execute_steps(gpu, ctx, &[
+                        Step::Gemv { w: &wr_gate, input: GemvInput::Raw(&s.tmp), out: &s.gate_ffn },
+                        Step::Gemv { w: &wr_up, input: GemvInput::Raw(&s.tmp), out: &s.up_ffn },
+                    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                }
+                LayerWeights::Full(lw) => {
+                    let wr_gate = lw.gate_proj.dispatch_ref();
+                    let wr_up = lw.up_proj.dispatch_ref();
+                    execute_steps(gpu, ctx, &[
+                        Step::Gemv { w: &wr_gate, input: GemvInput::Raw(&s.tmp), out: &s.gate_ffn },
+                        Step::Gemv { w: &wr_up, input: GemvInput::Raw(&s.tmp), out: &s.up_ffn },
+                    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                }
+            },
+            g4_op::PROJ_DOWN => {
+                // Folded activation: gelu_tanh(gate) * up, then down_proj.
+                let hidden_dim = config.hidden_dim;
+                gpu.gelu_tanh_f32(&s.gate_ffn, &s.ffn_hidden, hidden_dim)
+                    .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))?;
+                gpu.mul_f32(&s.ffn_hidden, &s.up_ffn, &s.ffn_hidden)
+                    .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))?;
+                match self.layer {
+                    LayerWeights::Sliding(lw) => {
+                        let wr = lw.down_proj.dispatch_ref();
+                        execute_steps(gpu, ctx, &[
+                            Step::Gemv { w: &wr, input: GemvInput::Raw(&s.ffn_hidden), out: &s.ffn_out },
+                        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+                    }
+                    LayerWeights::Full(lw) => weight_gemv(gpu, &lw.down_proj, &s.ffn_hidden, &s.ffn_out),
+                }
+            }
+            other => Err(hip_bridge::HipError::new(0, &format!("unknown PROJ opcode {other}"))),
+        };
+        res.map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
     }
     fn run_residual_gemv(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
         Err(hipfire_dispatch::types::DispatchError::Hip(format!(
             "gemma4 run_residual_gemv opcode {} not yet implemented (Step 4)", op_code(_op)
         )))
     }
-    fn run_norm(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
-        Err(hipfire_dispatch::types::DispatchError::Hip(format!(
-            "gemma4 run_norm opcode {} not yet implemented (Step 2)", op_code(_op)
-        )))
+    fn run_norm(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let s = self.scratch;
+        let config = self.config;
+        let res: HipResult<()> = match op_code(op) {
+            g4_op::NORM_INPUT => match self.layer {
+                LayerWeights::Sliding(lw) => gpu.rmsnorm_f32(&s.x, &lw.input_layernorm, &s.tmp, config.norm_eps),
+                LayerWeights::Full(lw) => gpu.rmsnorm_f32(&s.x, &lw.input_layernorm, &s.tmp, config.norm_eps),
+            },
+            g4_op::NORM_POST_ATTN => match self.layer {
+                LayerWeights::Sliding(lw) => gpu.rmsnorm_f32(&s.tmp, &lw.post_attention_layernorm, &s.tmp, config.norm_eps),
+                LayerWeights::Full(lw) => gpu.rmsnorm_f32(&s.tmp, &lw.post_attention_layernorm, &s.tmp, config.norm_eps),
+            },
+            g4_op::NORM_PRE_FFN => match self.layer {
+                LayerWeights::Sliding(lw) => gpu.rmsnorm_f32(&s.x, &lw.pre_feedforward_layernorm, &s.tmp, config.norm_eps),
+                LayerWeights::Full(lw) => gpu.rmsnorm_f32(&s.x, &lw.pre_feedforward_layernorm, &s.tmp, config.norm_eps),
+            },
+            g4_op::NORM_POST_FFN => match self.layer {
+                // Dense-only norm. MoE layers use Moe(MOE_BRANCH) instead.
+                LayerWeights::Sliding(lw) => gpu.rmsnorm_f32(&s.ffn_out, &lw.post_feedforward_layernorm, &s.tmp, config.norm_eps),
+                LayerWeights::Full(lw) => gpu.rmsnorm_f32(&s.ffn_out, &lw.post_feedforward_layernorm, &s.tmp, config.norm_eps),
+            },
+            other => return Err(hipfire_dispatch::types::DispatchError::Hip(format!("unknown NORM opcode {other}"))),
+        };
+        res.map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
     }
     fn run_attend(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
         Err(hipfire_dispatch::types::DispatchError::Hip(format!(
