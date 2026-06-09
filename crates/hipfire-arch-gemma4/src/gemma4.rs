@@ -3208,10 +3208,55 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
         };
         res.map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
     }
-    fn run_residual_gemv(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
-        Err(hipfire_dispatch::types::DispatchError::Hip(format!(
-            "gemma4 run_residual_gemv opcode {} not yet implemented (Step 4)", op_code(_op)
-        )))
+    fn run_residual_gemv(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let s = self.scratch;
+        let dim = self.config.dim;
+        let dim_bytes = dim * 4;
+        let hip_to_dispatch = |e: hip_bridge::HipError| hipfire_dispatch::types::DispatchError::Hip(e.to_string());
+
+        let res: HipResult<()> = match op_code(op) {
+            g4_op::RESID_POST_ATTN => {
+                // First: save x → residual (this is the first time residual is set
+                // in this layer — Norm(INPUT) wrote to tmp, x is still intact).
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    gpu.hip.memcpy_dtod_async_at(&s.residual.buf, 0, &s.x.buf, 0, dim_bytes, stream).map_err(hip_to_dispatch)?;
+                } else {
+                    gpu.hip.memcpy_dtod(&s.residual.buf, &s.x.buf, dim_bytes).map_err(hip_to_dispatch)?;
+                }
+                // x = residual + tmp (tmp holds post_attn_norm output).
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    gpu.hip.memcpy_dtod_async_at(&s.x.buf, 0, &s.residual.buf, 0, dim_bytes, stream).map_err(hip_to_dispatch)?;
+                } else {
+                    gpu.hip.memcpy_dtod(&s.x.buf, &s.residual.buf, dim_bytes).map_err(hip_to_dispatch)?;
+                }
+                gpu.add_inplace_f32(&s.x, &s.tmp).map_err(hip_to_dispatch)?;
+                // Save x → residual for the FFN residual stream.
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    gpu.hip.memcpy_dtod_async_at(&s.residual.buf, 0, &s.x.buf, 0, dim_bytes, stream).map_err(hip_to_dispatch)?;
+                } else {
+                    gpu.hip.memcpy_dtod(&s.residual.buf, &s.x.buf, dim_bytes).map_err(hip_to_dispatch)?;
+                }
+                Ok(())
+            }
+            g4_op::RESID_POST_FFN => {
+                // x = residual + tmp; x *= layer_scalar.
+                // Identical for dense and MoE — tmp already holds normalized output.
+                if let Some(stream) = gpu.active_stream.as_ref() {
+                    gpu.hip.memcpy_dtod_async_at(&s.x.buf, 0, &s.residual.buf, 0, dim_bytes, stream).map_err(hip_to_dispatch)?;
+                } else {
+                    gpu.hip.memcpy_dtod(&s.x.buf, &s.residual.buf, dim_bytes).map_err(hip_to_dispatch)?;
+                }
+                gpu.add_inplace_f32(&s.x, &s.tmp).map_err(hip_to_dispatch)?;
+                let layer_scalar = match self.layer {
+                    LayerWeights::Sliding(lw) => lw.layer_scalar_host,
+                    LayerWeights::Full(lw) => lw.layer_scalar_host,
+                };
+                gpu.scale_f32(&s.x, layer_scalar).map_err(hip_to_dispatch)?;
+                Ok(())
+            }
+            other => Err(hip_bridge::HipError::new(0, &format!("unknown RESID_GEMV opcode {other}"))),
+        };
+        res.map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
     }
     fn run_norm(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
         let s = self.scratch;
