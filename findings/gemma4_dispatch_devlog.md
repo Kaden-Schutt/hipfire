@@ -2347,3 +2347,38 @@ With the Q8-expert model coherent, implemented the indexed-fast MoE decode path:
 - Output quality: coherent, correct Python code generation
 
 **Remaining:** fused MoE gate_up+gelu+down kernel could cut another ~30% (single launch vs 4). But 38 tok/s is competitive.
+
+## Session 25 — Forward-as-pipeline migration (#397 Ship 6)
+
+**Date:** 2026-06-08  
+**Commits:** `64a4cb0d` (Step 1 scaffold) → `2dba327b` (Step 8 default ON)  
+**Plan:** `docs/plans/gemma4_forward_as_pipeline.md` (rev 2, with adversarial review corrections)
+
+### What was done
+
+Migrated Gemma 4's decode forward from `execute_steps` per-token resolution to the Ship 6 lowered-super-op substrate. The lowered path is now **default ON**.
+
+**Implementation (Steps 1–6):**
+1. Scaffold: `Gemma4Variant` enum, `g4_op` opcodes, `lower_variant()`, `Gemma4Bindings<'a>`, `ForwardBindings` stubs, `forward_lowered_enabled()` gate
+2. `run_norm` + `run_proj`: 4 norm opcodes + 7 proj opcodes covering both sliding and full layer paths
+3. `run_attend`: ATTEND_SLIDING (window=1024, q8 ring-buffer, full rope) + ATTEND_FULL (window=0, hd=512, partial rope, V←K pre-k_norm copy)
+4. `run_residual_gemv`: RESID_POST_ATTN (residual save + add + re-save) + RESID_POST_FFN (add + scale(layer_scalar))
+5. `run_moe`: delegates to `apply_moe_branch`
+6. Output stage (final norm + lm_head + softcap) runs outside layer loop
+
+**Key design decisions:**
+- Split PROJ opcodes: QK_SLIDING (fused q+k) vs Q_FULL+K_FULL (separate, no v_proj in full layers)
+- `Norm(POST_ATTN)` owns the only post-attention norm; `ResidualGemv(POST_ATTN)` is plumbing-only
+- MoE residual is byte-identical to dense — `apply_moe_branch` encapsulates everything including the outer norm
+- gelu_tanh + mul activation folded into `Proj(DOWN)`
+
+**Validation:**
+- 12B dense: 40-token greedy decode byte-identical at short + long (1266 tokens) context
+- 26B-A4B MoE: 40-token greedy decode byte-identical at short + long context
+- Both paths produce exactly the same token IDs in the same order
+
+**New code:** ~250 lines (the plan estimated ~600; overestimated the boilerplate)
+
+### Escape hatch
+
+`HIPFIRE_FORWARD_LOWERED=0` forces the legacy hand path. Remove after one release cycle.
