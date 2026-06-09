@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Kaden Schutt, Kate, Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Gemma 4 model: hybrid sliding-window + full attention, dense FFN (SwiGLU + gelu_pytorch_tanh).
 //!
 //! Architectural features vs. Qwen3.5:

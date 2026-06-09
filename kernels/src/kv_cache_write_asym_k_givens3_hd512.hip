@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // K-only write for asym3, head_dim=512 (Gemma 4 full-attention layers).
 //
 // Mirrors `kv_cache_write_asym_k_givens3` but each thread covers 2 chunks

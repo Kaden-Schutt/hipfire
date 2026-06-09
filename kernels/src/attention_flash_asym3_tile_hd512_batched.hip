@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Batched flash attention tile for asym3, head_dim=512 (Gemma 4 full layers).
 //
 // Combines the hd=512 per-thread 16-dim Q/K/V handling from
