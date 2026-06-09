@@ -45,7 +45,7 @@ from typing import Any
 root, daemon, model, max_seq_s, decode_backend, expected_decode_backend = sys.argv[1:]
 max_seq = int(max_seq_s)
 if not expected_decode_backend:
-    if decode_backend in {"fused", "fused_dense", "fused_dense_layer_chunked"}:
+    if decode_backend in {"auto", "fused", "fused_dense", "fused_dense_layer_chunked"}:
         expected_decode_backend = "fused_dense_layer_chunked"
     elif decode_backend in {"fused_grouped_moe", "grouped_moe", "fused_grouped_moe_layer_chunked"}:
         expected_decode_backend = "fused_grouped_moe_layer_chunked"
@@ -54,6 +54,9 @@ if not expected_decode_backend:
 default_request_max_tokens = "1" if expected_decode_backend in {"fused_dense_layer_chunked", "fused_grouped_moe_layer_chunked"} else "2"
 request_max_tokens = int(os.environ.get("HIPFIRE_DECODE_BATCH_MAX_TOKENS", default_request_max_tokens))
 requested_decode_chunk_size = int(os.environ.get("HIPFIRE_QWEN35_DECODE_BATCH_MAX", "0") or "0")
+request_count = int(os.environ.get("HIPFIRE_DECODE_BATCH_REQUESTS", "2"))
+if request_count < 2:
+    raise RuntimeError("HIPFIRE_DECODE_BATCH_REQUESTS must be >= 2")
 dense_fused_mode = expected_decode_backend == "fused_dense_layer_chunked"
 native_multirow_enabled = os.environ.get("HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW", "").lower() in {"1", "true", "yes", "on"}
 
@@ -141,7 +144,7 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
         "HIPFIRE_QWEN35_STATE_QUANT": "fp32" if dense_fused_mode else "q8",
         "HIPFIRE_NO_PID_FILE": "1",
         "HIPFIRE_SERVER_PREFILL_BATCH": "1",
-        "HIPFIRE_SERVER_PREFILL_BATCH_MAX": "2",
+        "HIPFIRE_SERVER_PREFILL_BATCH_MAX": str(request_count),
         "HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS": "250",
         "HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE": "250",
         "HIPFIRE_MAX_SEQ": str(max_seq),
@@ -166,16 +169,16 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
         if prefill.get("generate_batch_prefill_capability") != "supported":
             raise RuntimeError(f"server prefill capability not supported after warmup: {prefill}; log={log_path}")
 
-        start_barrier = threading.Barrier(3)
+        start_barrier = threading.Barrier(request_count + 1)
 
         def synchronized_chat_request(label: str) -> dict[str, Any]:
             start_barrier.wait(timeout=10.0)
             return chat_request(base_url, label)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=request_count) as pool:
             futures = [
-                pool.submit(synchronized_chat_request, "request-a"),
-                pool.submit(synchronized_chat_request, "request-b"),
+                pool.submit(synchronized_chat_request, f"request-{idx}")
+                for idx in range(request_count)
             ]
             start_barrier.wait(timeout=10.0)
             responses = [future.result() for future in futures]
@@ -202,8 +205,8 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
             raise RuntimeError(f"server decode did not record batch telemetry: {checks}; log={log_path}")
         if run_expected_backend == "serial_reference" and int(checks["decode_serial_batches"] or 0) < 1:
             raise RuntimeError(f"server decode did not record serial batch telemetry: {checks}; log={log_path}")
-        if checks["decode_selected_batch_size"] != 2:
-            raise RuntimeError(f"server decode did not select a 2-request batch: {checks}; log={log_path}")
+        if checks["decode_selected_batch_size"] != request_count:
+            raise RuntimeError(f"server decode did not select a {request_count}-request batch: {checks}; log={log_path}")
         if checks["decode_last_backend"] != run_expected_backend:
             raise RuntimeError(f"unexpected decode backend: {checks}; log={log_path}")
         if run_expected_backend in {"fused_dense_layer_chunked", "fused_grouped_moe_layer_chunked"}:
@@ -225,7 +228,7 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
                     )
         if float(checks["decode_last_decode_ms"] or 0) <= 0:
             raise RuntimeError(f"server decode did not record positive decode latency: {checks}; log={log_path}")
-        if checks["prefill_selected_batch_size"] != 2:
+        if checks["prefill_selected_batch_size"] != request_count:
             raise RuntimeError(f"server prefill did not coalesce setup requests: {checks}; log={log_path}")
         if int(checks["decode_active_sessions"] or 0) != 0:
             raise RuntimeError(f"server decode left active pending sessions: {checks}; log={log_path}")

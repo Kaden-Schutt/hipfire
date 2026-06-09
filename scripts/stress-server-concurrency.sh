@@ -55,7 +55,7 @@ concurrency = max(1, int(concurrency_s))
 max_tokens = max(1, int(max_tokens_s))
 max_seq = int(max_seq_s)
 models = [model_a] if not model_b else [model_a, model_b]
-dense_fused = decode_backend in {"fused", "fused_dense", "fused_dense_layer_chunked"}
+dense_fused = decode_backend in {"auto", "fused", "fused_dense", "fused_dense_layer_chunked"}
 
 
 def pick_port() -> int:

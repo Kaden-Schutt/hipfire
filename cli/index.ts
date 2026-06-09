@@ -138,6 +138,15 @@ type BatchJobRecord = StoredBatchRecord & {
   completion_window?: string;
 };
 
+type StoredResponsesContext = {
+  id: string;
+  model: string | null;
+  messages: any[];
+  promptCacheKey?: string;
+  createdAtMs: number;
+  lastUsedAtMs: number;
+};
+
 function batchArtifactPath(fileId: string): string {
   return join(BATCH_FILE_DIR, fileId);
 }
@@ -149,6 +158,19 @@ function readBatchFile(fileId: string): string {
 
 function writeBatchArtifact(fileId: string, content: string): void {
   writeFileSync(batchArtifactPath(fileId), content, "utf8");
+}
+
+function cloneJsonValue<T>(value: T): T {
+  if (value === undefined) return value;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return value;
+  }
+}
+
+function cloneChatMessages(messages: any[]): any[] {
+  return messages.map((message) => cloneJsonValue(message));
 }
 
 function parseResponsesToChatBody(rawBody: any): any {
@@ -1522,7 +1544,10 @@ class Engine {
     try { await this.send({ type: "unload" }); } catch {}
     this.reader?.releaseLock();
     this.reader = null;
-    this.proc?.kill();
+    const proc = this.proc;
+    this.proc = null;
+    proc?.kill();
+    try { await proc?.exited; } catch {}
   }
 }
 
@@ -1896,11 +1921,21 @@ async function serve(port: number, host: string) {
     if (!ownsPidFile) return;
     try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
   };
+  let serveEngine: Engine | null = null;
+  let shuttingDown = false;
+  const shutdown = async (code: number) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    cleanupPid();
+    try { await serveEngine?.stop(); } catch {}
+    process.exit(code);
+  };
   process.on("exit", cleanupPid);
-  process.on("SIGTERM", () => { cleanupPid(); process.exit(0); });
-  process.on("SIGINT", () => { cleanupPid(); process.exit(0); });
+  process.on("SIGTERM", () => { void shutdown(0); });
+  process.on("SIGINT", () => { void shutdown(0); });
 
   const e = new Engine();
+  serveEngine = e;
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
   const acceleratorInventory = detectAcceleratorInventory();
@@ -2110,6 +2145,7 @@ async function serve(port: number, host: string) {
   type PendingPrefillRequest = {
     session: RequestSessionDraft;
     prefillSession: any;
+    fanoutKey?: string;
     reservationId?: string;
     selected: boolean;
     resolve: (outcome: PendingPrefillOutcome) => void;
@@ -2424,11 +2460,353 @@ async function serve(port: number, host: string) {
     prefixHashPreflightCandidates: 0,
     prefixHashPreflightMatches: 0,
     prefixHashPreflightBoundaryMatches: 0,
+    sharedPrefixFanoutGroups: 0,
+    sharedPrefixFanoutFollowers: 0,
     semanticBoundaryCheckpoints: 0,
     totalBatches: 0,
     fusedBatches: 0,
     fallbackBatches: 0,
     batchSizeHistogram: {} as Record<string, number>,
+  };
+  const pendingPrefillFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const parseResidentPrefixCheckpoints = (stateHandle: any): ResidentPrefixCheckpointOutcome[] => {
+    if (!stateHandle || !Array.isArray(stateHandle.prefix_checkpoints)) return [];
+    const prefixCheckpoints: ResidentPrefixCheckpointOutcome[] = [];
+    for (const checkpoint of stateHandle.prefix_checkpoints) {
+      const prefixHash = checkpoint?.prefix_hash;
+      const prefixLen = typeof checkpoint?.prefix_len === "number"
+        ? checkpoint.prefix_len
+        : prefixHash?.prefix_len;
+      if (
+        checkpoint &&
+        typeof checkpoint.checkpoint_id === "string" &&
+        prefixHash &&
+        prefixHash.algorithm === "xxh128" &&
+        typeof prefixHash.value === "string" &&
+        /^[0-9a-f]{32}$/.test(prefixHash.value) &&
+        typeof prefixLen === "number" &&
+        Number.isInteger(prefixLen) &&
+        prefixLen > 0
+      ) {
+        prefixCheckpoints.push({
+          checkpointStateHandle: checkpoint.checkpoint_id,
+          checkpointLogicalPosition: Number.isInteger(checkpoint.logical_position)
+            ? checkpoint.logical_position
+            : prefixLen,
+          checkpointDaemonPrefixHash: prefixHash.value,
+          checkpointDaemonPrefixLen: prefixLen,
+          boundary: typeof checkpoint.boundary === "string" ? checkpoint.boundary : undefined,
+          boundaryIndex: Number.isInteger(checkpoint.boundary_index) ? checkpoint.boundary_index : undefined,
+        });
+      }
+    }
+    return prefixCheckpoints;
+  };
+  const flushPendingPrefillBatch = async (workerKeyId: string, reason: string): Promise<boolean> => {
+    const scheduler = workerPrefillSchedulers.get(workerKeyId);
+    if (!scheduler || scheduler.size === 0) return false;
+    const selected = scheduler.nextPrefillBatch({ nowMs: Date.now() });
+    if (!selected || selected.sessions.length === 0) return false;
+    const selectedPending = selected.sessions
+      .map((session) => pendingPrefillRequests.get(session.id))
+      .filter((pending): pending is PendingPrefillRequest => !!pending);
+    if (selectedPending.length === 0) return false;
+    for (const pending of selectedPending) pending.selected = true;
+    prefillBatchMetrics.selected += 1;
+    const selectedReservationIds = selectedPending
+      .map((pending) => pending.reservationId)
+      .filter((reservationId): reservationId is string => typeof reservationId === "string" && reservationId.length > 0);
+    const leaderPending = selectedPending[0];
+    const sharedPrefixFanoutEnabled = process.env.HIPFIRE_SERVER_PREFILL_SHARED_PREFIX_FANOUT !== "0";
+    const fanoutKey = leaderPending.fanoutKey;
+    const sameWaveFanoutFollowers = sharedPrefixFanoutEnabled && fanoutKey && selectedPending.length > 1
+      && selectedPending.every((pending) => pending.fanoutKey === fanoutKey)
+      ? selectedPending.slice(1)
+      : [];
+    const initialPending = sameWaveFanoutFollowers.length > 0
+      ? [leaderPending]
+      : selectedPending;
+    const batchId = `prefill-flush-${Date.now().toString(36)}`;
+    const modelPath = residentModelWorkers.get(workerKeyId)?.modelPath ?? current;
+    try {
+      await e.send({
+        type: "generate_batch_prefill",
+        id: `${batchId}-dispatch`,
+        batch_id: batchId,
+        worker_key_id: workerKeyId,
+        model: modelPath,
+        sessions: initialPending.map((pending) => pending.prefillSession),
+      });
+      let prefillDone = false;
+      let prefillTokens = 0;
+      let elapsedMs = 0;
+      let plan: string | undefined;
+      let backend: string | undefined;
+      const sessionPrefillTokens = new Map<string, number>();
+      const runtimeStateHandlesBySession = new Map<string, string>();
+      const checkpointStateHandlesBySession = new Map<string, string>();
+      const checkpointDaemonPrefixHashesBySession = new Map<string, { hash: string; len: number }>();
+      const checkpointPrefixCheckpointsBySession = new Map<string, ResidentPrefixCheckpointOutcome[]>();
+      const logicalPositionsBySession = new Map<string, number>();
+      for (let i = 0; i < initialPending.length + 4; i++) {
+        const prefillMsg = await e.recv();
+        if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === batchId) {
+          prefillDone = true;
+          prefillTokens = Number(prefillMsg.prefill_tokens ?? 0);
+          elapsedMs = Number(prefillMsg.elapsed_ms ?? 0);
+          plan = typeof prefillMsg.plan === "string" ? prefillMsg.plan : undefined;
+          backend = typeof prefillMsg.backend === "string" ? prefillMsg.backend : undefined;
+          updateRuntimeWorkerMetrics((prefillMsg as any).model_worker);
+          break;
+        }
+        if (prefillMsg?.type === "generate_batch_prefill_session_done") {
+          if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.prefill_tokens === "number") {
+            sessionPrefillTokens.set(prefillMsg.session_id, prefillMsg.prefill_tokens);
+          }
+          if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.logical_position === "number") {
+            logicalPositionsBySession.set(prefillMsg.session_id, prefillMsg.logical_position);
+          }
+          const stateHandle = (prefillMsg as any).state_handle;
+          if (typeof prefillMsg.session_id === "string" && stateHandle && typeof stateHandle.session_id === "string") {
+            runtimeStateHandlesBySession.set(prefillMsg.session_id, stateHandle.session_id);
+            residentDecodeSessions.add(stateHandle.session_id);
+          }
+          if (typeof prefillMsg.session_id === "string" && stateHandle && typeof stateHandle.checkpoint_id === "string") {
+            checkpointStateHandlesBySession.set(prefillMsg.session_id, stateHandle.checkpoint_id);
+            const prefixHash = stateHandle.prefix_hash;
+            const prefixLen = typeof stateHandle.prefix_len === "number"
+              ? stateHandle.prefix_len
+              : prefixHash?.prefix_len;
+            if (
+              prefixHash &&
+              prefixHash.algorithm === "xxh128" &&
+              typeof prefixHash.value === "string" &&
+              /^[0-9a-f]{32}$/.test(prefixHash.value) &&
+              typeof prefixLen === "number" &&
+              Number.isInteger(prefixLen) &&
+              prefixLen >= 0
+            ) {
+              checkpointDaemonPrefixHashesBySession.set(prefillMsg.session_id, {
+                hash: prefixHash.value,
+                len: prefixLen,
+              });
+            }
+          }
+          const prefixCheckpoints = parseResidentPrefixCheckpoints(stateHandle);
+          if (typeof prefillMsg.session_id === "string" && prefixCheckpoints.length > 0) {
+            checkpointPrefixCheckpointsBySession.set(prefillMsg.session_id, prefixCheckpoints);
+          }
+          continue;
+        }
+        if (prefillMsg?.type === "generate_batch_prefill_started") continue;
+        if (prefillMsg?.type === "error") throw new Error(prefillMsg.message || "generate_batch_prefill flush error");
+        if (prefillMsg?.type === "generate_batch_prefill_unsupported") throw new Error(prefillMsg.reason || "generate_batch_prefill flush unsupported");
+        throw new Error(`unexpected generate_batch_prefill flush response: ${prefillMsg?.type ?? "missing"}`);
+      }
+      if (!prefillDone) throw new Error("generate_batch_prefill flush did not complete");
+
+      if (sameWaveFanoutFollowers.length > 0) {
+        const leaderId = leaderPending.session.id;
+        const leaderCheckpointCandidates: Array<{ handle: string; hash: string; len: number; logicalPosition?: number }> = [];
+        const leaderFinalPrefix = checkpointDaemonPrefixHashesBySession.get(leaderId);
+        const leaderFinalHandle = checkpointStateHandlesBySession.get(leaderId);
+        if (leaderFinalHandle && leaderFinalPrefix) {
+          leaderCheckpointCandidates.push({
+            handle: leaderFinalHandle,
+            hash: leaderFinalPrefix.hash,
+            len: leaderFinalPrefix.len,
+            logicalPosition: logicalPositionsBySession.get(leaderId),
+          });
+        }
+        for (const checkpoint of checkpointPrefixCheckpointsBySession.get(leaderId) ?? []) {
+          leaderCheckpointCandidates.push({
+            handle: checkpoint.checkpointStateHandle,
+            hash: checkpoint.checkpointDaemonPrefixHash,
+            len: checkpoint.checkpointDaemonPrefixLen,
+            logicalPosition: checkpoint.checkpointLogicalPosition,
+          });
+        }
+        let fanoutPreflightPrefixes: Array<{ value: string; prefix_len: number }> = [];
+        try {
+          const fanoutPreflightSession = cloneJsonValue(leaderPending.prefillSession);
+          delete fanoutPreflightSession.state_handle?.runtime_state_handle;
+          delete fanoutPreflightSession.state_handle?.prefix_hash;
+          delete fanoutPreflightSession.state_handle?.prefix_len;
+          fanoutPreflightSession.state_handle = {
+            ...(fanoutPreflightSession.state_handle ?? {}),
+            logical_position: 0,
+            cached_prefix_tokens: 0,
+          };
+          await e.send({
+            type: "prefix_hash_preflight",
+            id: `prefix-hash-${batchId}`,
+            worker_key_id: workerKeyId,
+            model: modelPath,
+            boundary_policy: "semantic_chat_template",
+            session: fanoutPreflightSession,
+          });
+          const fanoutPreflightMsg = await e.recv();
+          if (fanoutPreflightMsg?.type === "prefix_hash_preflight_done" && Array.isArray(fanoutPreflightMsg.prefixes)) {
+            fanoutPreflightPrefixes = fanoutPreflightMsg.prefixes
+              .filter((candidate: any) =>
+                candidate &&
+                typeof candidate.value === "string" &&
+                /^[0-9a-f]{32}$/.test(candidate.value) &&
+                Number.isInteger(candidate.prefix_len) &&
+                candidate.prefix_len >= 0
+              )
+              .map((candidate: any) => ({
+                value: candidate.value,
+                prefix_len: candidate.prefix_len,
+              }))
+              .sort((a: { prefix_len: number }, b: { prefix_len: number }) => b.prefix_len - a.prefix_len);
+            prefillBatchMetrics.prefixHashPreflightRequests += 1;
+            prefillBatchMetrics.prefixHashPreflightCandidates += fanoutPreflightPrefixes.length;
+          }
+        } catch (err: any) {
+          console.error(`[hipfire] shared-prefix timer fanout preflight failed; followers will use normal prefill: ${err?.message ?? err}`);
+        }
+        const fanoutCheckpoint = fanoutPreflightPrefixes
+          .map((prefix) => leaderCheckpointCandidates.find((checkpoint) =>
+            checkpoint.hash === prefix.value &&
+            checkpoint.len === prefix.prefix_len
+          ))
+          .find((checkpoint): checkpoint is { handle: string; hash: string; len: number; logicalPosition?: number } => !!checkpoint);
+        if (fanoutCheckpoint) {
+          const fanoutBatchId = `${batchId}-fanout`;
+          await e.send({
+            type: "generate_batch_prefill",
+            id: `${fanoutBatchId}-dispatch`,
+            batch_id: fanoutBatchId,
+            worker_key_id: workerKeyId,
+            model: modelPath,
+            sessions: sameWaveFanoutFollowers.map((pending) => {
+              const payload = cloneJsonValue(pending.prefillSession);
+              payload.state_handle = {
+                ...(payload.state_handle ?? {}),
+                runtime_state_handle: fanoutCheckpoint.handle,
+                cached_prefix_tokens: fanoutCheckpoint.len,
+                logical_position: fanoutCheckpoint.logicalPosition ?? fanoutCheckpoint.len,
+                prefix_hash: {
+                  algorithm: "xxh128",
+                  value: fanoutCheckpoint.hash,
+                  prefix_len: fanoutCheckpoint.len,
+                },
+                prefix_len: fanoutCheckpoint.len,
+              };
+              delete payload.suffix_tokens;
+              return payload;
+            }),
+          });
+          let fanoutDone = false;
+          for (let i = 0; i < sameWaveFanoutFollowers.length + 4; i++) {
+            const prefillMsg = await e.recv();
+            if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === fanoutBatchId) {
+              fanoutDone = true;
+              prefillTokens += Number(prefillMsg.prefill_tokens ?? 0);
+              elapsedMs += Number(prefillMsg.elapsed_ms ?? 0);
+              updateRuntimeWorkerMetrics((prefillMsg as any).model_worker);
+              break;
+            }
+            if (prefillMsg?.type === "generate_batch_prefill_session_done") {
+              if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.prefill_tokens === "number") {
+                sessionPrefillTokens.set(prefillMsg.session_id, prefillMsg.prefill_tokens);
+              }
+              if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.logical_position === "number") {
+                logicalPositionsBySession.set(prefillMsg.session_id, prefillMsg.logical_position);
+              }
+              const stateHandle = (prefillMsg as any).state_handle;
+              if (typeof prefillMsg.session_id === "string" && stateHandle && typeof stateHandle.session_id === "string") {
+                runtimeStateHandlesBySession.set(prefillMsg.session_id, stateHandle.session_id);
+                residentDecodeSessions.add(stateHandle.session_id);
+              }
+              if (typeof prefillMsg.session_id === "string" && stateHandle && typeof stateHandle.checkpoint_id === "string") {
+                checkpointStateHandlesBySession.set(prefillMsg.session_id, stateHandle.checkpoint_id);
+                const prefixHash = stateHandle.prefix_hash;
+                const prefixLen = typeof stateHandle.prefix_len === "number"
+                  ? stateHandle.prefix_len
+                  : prefixHash?.prefix_len;
+                if (
+                  prefixHash &&
+                  prefixHash.algorithm === "xxh128" &&
+                  typeof prefixHash.value === "string" &&
+                  /^[0-9a-f]{32}$/.test(prefixHash.value) &&
+                  typeof prefixLen === "number" &&
+                  Number.isInteger(prefixLen) &&
+                  prefixLen >= 0
+                ) {
+                  checkpointDaemonPrefixHashesBySession.set(prefillMsg.session_id, {
+                    hash: prefixHash.value,
+                    len: prefixLen,
+                  });
+                }
+              }
+              const prefixCheckpoints = parseResidentPrefixCheckpoints(stateHandle);
+              if (typeof prefillMsg.session_id === "string" && prefixCheckpoints.length > 0) {
+                checkpointPrefixCheckpointsBySession.set(prefillMsg.session_id, prefixCheckpoints);
+              }
+              continue;
+            }
+            if (prefillMsg?.type === "generate_batch_prefill_started") continue;
+            if (prefillMsg?.type === "error") throw new Error(prefillMsg.message || "generate_batch_prefill timer fanout error");
+            if (prefillMsg?.type === "generate_batch_prefill_unsupported") throw new Error(prefillMsg.reason || "generate_batch_prefill timer fanout unsupported");
+            throw new Error(`unexpected generate_batch_prefill timer fanout response: ${prefillMsg?.type ?? "missing"}`);
+          }
+          if (!fanoutDone) throw new Error("generate_batch_prefill timer fanout did not complete");
+          prefillBatchMetrics.sharedPrefixFanoutGroups += 1;
+          prefillBatchMetrics.sharedPrefixFanoutFollowers += sameWaveFanoutFollowers.length;
+          prefillBatchMetrics.cacheHits += sameWaveFanoutFollowers.length;
+          prefillBatchMetrics.runtimeCacheHits += sameWaveFanoutFollowers.length;
+        }
+      }
+
+      await releaseStateReservations(selectedReservationIds, `prefill flush ${reason}`);
+      recordPrefillBatchDispatch(selectedPending.length, prefillTokens, elapsedMs, plan, backend);
+      for (const pending of selectedPending) {
+        const id = pending.session.id;
+        pendingPrefillRequests.delete(id);
+        pending.resolve({
+          prefillTokens: sessionPrefillTokens.get(id) ?? 0,
+          elapsedMs,
+          selectedBatchSize: selectedPending.length,
+          plan,
+          backend,
+          runtimeStateHandle: runtimeStateHandlesBySession.get(id),
+          checkpointStateHandle: checkpointStateHandlesBySession.get(id),
+          checkpointLogicalPosition: logicalPositionsBySession.get(id),
+          checkpointDaemonPrefixHash: checkpointDaemonPrefixHashesBySession.get(id)?.hash,
+          checkpointDaemonPrefixLen: checkpointDaemonPrefixHashesBySession.get(id)?.len,
+          checkpointPrefixCheckpoints: checkpointPrefixCheckpointsBySession.get(id),
+          runtimeStateEvicted: false,
+        });
+      }
+      return true;
+    } catch (err: any) {
+      const error = err instanceof Error ? err : new Error(err?.message ?? String(err));
+      await releaseStateReservations(selectedReservationIds, `prefill flush failed ${reason}`);
+      for (const pending of selectedPending) {
+        pendingPrefillRequests.delete(pending.session.id);
+        pending.reservationId = undefined;
+        pending.reject(error);
+      }
+      console.error(`[hipfire] pending prefill flush failed: ${error.message}`);
+      return false;
+    }
+  };
+  const schedulePendingPrefillFlush = (workerKeyId: string, delayMs: number) => {
+    if (pendingPrefillFlushTimers.has(workerKeyId)) return;
+    const timer = setTimeout(() => {
+      pendingPrefillFlushTimers.delete(workerKeyId);
+      void (async () => {
+        await acquireLock();
+        try {
+          await flushPendingPrefillBatch(workerKeyId, "coalesce timer");
+        } finally {
+          releaseLock();
+        }
+      })();
+    }, Math.max(0, delayMs));
+    pendingPrefillFlushTimers.set(workerKeyId, timer);
   };
   const decodeBatchMetrics = {
     eligible: 0,
@@ -2447,6 +2825,20 @@ async function serve(port: number, host: string) {
   };
   const batchFileStore = new Map<string, BatchFileRecord>();
   const batchControlStore = new Map<string, BatchJobRecord>();
+  const responsesContextMax = Math.max(0, Number.parseInt(process.env.HIPFIRE_RESPONSES_STATE_MAX ?? "1024", 10) || 1024);
+  const responsesContexts = new Map<string, StoredResponsesContext>();
+  let responsesPreviousResponseHits = 0;
+  let responsesPreviousResponseMisses = 0;
+  const storeResponsesContext = (context: StoredResponsesContext) => {
+    if (responsesContextMax <= 0) return;
+    responsesContexts.set(context.id, context);
+    while (responsesContexts.size > responsesContextMax) {
+      const oldest = [...responsesContexts.values()]
+        .sort((a, b) => a.lastUsedAtMs - b.lastUsedAtMs)[0];
+      if (!oldest) break;
+      responsesContexts.delete(oldest.id);
+    }
+  };
   let lastPrefillQueueWaitReason: "selected" | "waiting" | "insufficient_queue" | "memory_pressure" | "not_eligible" | "disabled" = "disabled";
   let lastPrefillFallbackReason = "not_applicable";
   let lastPrefillRuntimeDispatchSkippedReason = "not_applicable";
@@ -3094,6 +3486,11 @@ async function serve(port: number, host: string) {
                   prefix_hash_preflight_candidates: prefillBatchMetrics.prefixHashPreflightCandidates,
                   prefix_hash_preflight_matches: prefillBatchMetrics.prefixHashPreflightMatches,
                   prefix_hash_preflight_boundary_matches: prefillBatchMetrics.prefixHashPreflightBoundaryMatches,
+                  shared_prefix_fanout_groups: prefillBatchMetrics.sharedPrefixFanoutGroups,
+                  shared_prefix_fanout_followers: prefillBatchMetrics.sharedPrefixFanoutFollowers,
+                  responses_previous_response_hits: responsesPreviousResponseHits,
+                  responses_previous_response_misses: responsesPreviousResponseMisses,
+                  responses_stored_contexts: responsesContexts.size,
                   entries: stateCacheEntries,
                   bytes: stateCacheBytes,
                   metadata_hits: prefillBatchMetrics.metadataCacheHits,
@@ -3402,7 +3799,49 @@ async function serve(port: number, host: string) {
         if (!body || typeof body !== "object") {
           return Response.json({ error: { message: "invalid request body", type: "invalid_request_error" } }, { status: 400 });
         }
+        const previousResponseId = isResponsesRequest && typeof body.previous_response_id === "string"
+          ? body.previous_response_id
+          : "";
+        let responsesContextMessagesForStore: any[] | null = null;
+        if (previousResponseId.length > 0) {
+          const previousContext = responsesContexts.get(previousResponseId);
+          if (!previousContext) {
+            responsesPreviousResponseMisses += 1;
+            return Response.json({
+              error: {
+                message: `unknown previous_response_id: ${previousResponseId}`,
+                type: "invalid_request_error",
+              },
+            }, { status: 404 });
+          }
+          const requestedModel = typeof body.model === "string" && body.model.length > 0
+            ? body.model
+            : previousContext.model;
+          if (previousContext.model && requestedModel && previousContext.model !== requestedModel) {
+            responsesPreviousResponseMisses += 1;
+            return Response.json({
+              error: {
+                message: "previous_response_id belongs to a different model",
+                type: "invalid_request_error",
+              },
+            }, { status: 400 });
+          }
+          body.model = requestedModel;
+          body.messages = [
+            ...cloneChatMessages(previousContext.messages),
+            ...cloneChatMessages(Array.isArray(body.messages) ? body.messages : []),
+          ];
+          if (!body.prompt_cache_retention) body.prompt_cache_retention = "in_memory";
+          if (!body.prompt_cache_key && previousContext.promptCacheKey) {
+            body.prompt_cache_key = previousContext.promptCacheKey;
+          }
+          previousContext.lastUsedAtMs = Date.now();
+          responsesPreviousResponseHits += 1;
+        }
         const messages: any[] = body.messages || [];
+        if (isResponsesRequest) {
+          responsesContextMessagesForStore = cloneChatMessages(messages);
+        }
         const tools: any[] = body.tools || [];
 
         // Opt-in request-body dump. Lets an operator see the full
@@ -3465,7 +3904,9 @@ async function serve(port: number, host: string) {
             let unsupportedImage = false;
             let malformedImage = false;
             for (const p of content) {
-              if (p?.type === "text") textParts.push(p.text ?? "");
+              if (p?.type === "text" || p?.type === "input_text" || p?.type === "output_text") {
+                textParts.push(p.text ?? "");
+              }
               else if (p?.type === "image_url") {
                 if (p.image_url?.url) {
                   const url: string = p.image_url.url;
@@ -4177,13 +4618,8 @@ async function serve(port: number, host: string) {
                 } catch { return false; }
               })
               .sort((a, b) => b.prefixLen - a.prefixLen)[0];
-            const cacheLookup = requestAllowsResidentPrefixCache
-              && (daemonCacheLookup ?? (
-                compatibleCacheLookup && prefixCheckpointAttachable(compatibleCacheLookup)
-                  ? compatibleCacheLookup
-                  : undefined
-              ))
-              ? (daemonCacheLookup ?? compatibleCacheLookup)
+            const cacheLookup = requestAllowsResidentPrefixCache && daemonCacheLookup
+              ? daemonCacheLookup
               : undefined;
 
             if (cacheLookup) {
@@ -4665,8 +5101,40 @@ async function serve(port: number, host: string) {
               const selectedSessions = selectedBatchSessions.length > 0
                 ? selectedBatchSessions
                 : [serverPrefillSession];
+              const sharedPrefixFanoutEnabled = process.env.HIPFIRE_SERVER_PREFILL_SHARED_PREFIX_FANOUT !== "0";
+              const fanoutKeyForSession = (session: RequestSessionDraft): string | undefined => {
+                if (session.id === reqId) return requestAllowsResidentPrefixCache ? cacheKey ?? undefined : undefined;
+                return pendingPrefillRequests.get(session.id)?.fanoutKey;
+              };
+              const sameWaveFanoutFollowers = sharedPrefixFanoutEnabled
+                && requestAllowsResidentPrefixCache
+                && !cacheHit
+                && selectedSessions.length > 1
+                && cacheKey
+                && selectedSessions.every((session) => fanoutKeyForSession(session) === cacheKey)
+                ? selectedSessions.filter((session) => session.id !== reqId)
+                : [];
+              if (
+                process.env.HIPFIRE_DEBUG_SHARED_PREFIX_FANOUT === "1" &&
+                selectedSessions.length > 1 &&
+                sameWaveFanoutFollowers.length === 0
+              ) {
+                console.error(`[hipfire] shared-prefix fanout skipped: cacheHit=${cacheHit} cacheKey=${cacheKey ?? "none"} keys=${selectedSessions.map((session) => `${session.id}:${fanoutKeyForSession(session) ?? "none"}`).join(",")}`);
+              }
+              const initialPrefillSessions = sameWaveFanoutFollowers.length > 0
+                ? [serverPrefillSession]
+                : selectedSessions;
               const daemonSessions: any[] = [];
               for (const selected of selectedSessions) {
+                if (selected.id === reqId) continue;
+                const pending = pendingPrefillRequests.get(selected.id);
+                if (!pending) {
+                  throw new Error(`selected prefill session ${selected.id} is not pending`);
+                }
+                pending.selected = true;
+                if (pending.reservationId) selectedReservationIds.push(pending.reservationId);
+              }
+              for (const selected of initialPrefillSessions) {
                 if (selected.id === reqId) {
                   daemonSessions.push(currentPrefillSession);
                   continue;
@@ -4675,8 +5143,6 @@ async function serve(port: number, host: string) {
                 if (!pending) {
                   throw new Error(`selected prefill session ${selected.id} is not pending`);
                 }
-                pending.selected = true;
-                if (pending.reservationId) selectedReservationIds.push(pending.reservationId);
                 daemonSessions.push(pending.prefillSession);
               }
 
@@ -4823,6 +5289,243 @@ async function serve(port: number, host: string) {
                 throw new Error(`unexpected generate_batch_prefill response: ${prefillMsg?.type ?? "missing"}`);
               }
               if (!prefillDone) throw new Error("generate_batch_prefill did not complete");
+              if (sameWaveFanoutFollowers.length > 0) {
+                const leaderCheckpointCandidates: Array<{
+                  handle: string;
+                  hash: string;
+                  len: number;
+                  logicalPosition?: number;
+                }> = [];
+                const leaderFinalPrefix = checkpointDaemonPrefixHashesBySession.get(reqId);
+                const leaderFinalHandle = checkpointStateHandlesBySession.get(reqId);
+                if (leaderFinalHandle && leaderFinalPrefix) {
+                  leaderCheckpointCandidates.push({
+                    handle: leaderFinalHandle,
+                    hash: leaderFinalPrefix.hash,
+                    len: leaderFinalPrefix.len,
+                    logicalPosition: logicalPositionsBySession.get(reqId),
+                  });
+                }
+                for (const checkpoint of checkpointPrefixCheckpointsBySession.get(reqId) ?? []) {
+                  leaderCheckpointCandidates.push({
+                    handle: checkpoint.checkpointStateHandle,
+                    hash: checkpoint.checkpointDaemonPrefixHash,
+                    len: checkpoint.checkpointDaemonPrefixLen,
+                    logicalPosition: checkpoint.checkpointLogicalPosition,
+                  });
+                }
+                let fanoutPreflightPrefixes: Array<{ value: string; prefix_len: number }> = [];
+                try {
+                  const fanoutPreflightSession = cloneJsonValue(currentPrefillSession);
+                  delete fanoutPreflightSession.state_handle?.runtime_state_handle;
+                  delete fanoutPreflightSession.state_handle?.prefix_hash;
+                  delete fanoutPreflightSession.state_handle?.prefix_len;
+                  fanoutPreflightSession.state_handle = {
+                    ...(fanoutPreflightSession.state_handle ?? {}),
+                    logical_position: 0,
+                    cached_prefix_tokens: 0,
+                  };
+                  await e.send({
+                    type: "prefix_hash_preflight",
+                    id: `prefix-hash-fanout-${reqId}`,
+                    worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
+                    model: current,
+                    boundary_policy: "semantic_chat_template",
+                    session: fanoutPreflightSession,
+                  });
+                  const fanoutPreflightMsg = await e.recv();
+                  if (fanoutPreflightMsg?.type === "prefix_hash_preflight_done" && Array.isArray(fanoutPreflightMsg.prefixes)) {
+                    fanoutPreflightPrefixes = fanoutPreflightMsg.prefixes
+                      .filter((candidate: any) =>
+                        candidate
+                        && typeof candidate.value === "string"
+                        && /^[0-9a-f]{32}$/.test(candidate.value)
+                        && Number.isInteger(candidate.prefix_len)
+                        && candidate.prefix_len >= 0
+                      )
+                      .map((candidate: any) => ({
+                        value: candidate.value,
+                        prefix_len: candidate.prefix_len,
+                      }))
+                      .sort((a: { prefix_len: number }, b: { prefix_len: number }) => b.prefix_len - a.prefix_len);
+                    prefillBatchMetrics.prefixHashPreflightRequests += 1;
+                    prefillBatchMetrics.prefixHashPreflightCandidates += fanoutPreflightPrefixes.length;
+                  }
+                } catch (err: any) {
+                  console.error(`[hipfire] shared-prefix fanout preflight failed; followers will use normal prefill: ${err?.message ?? err}`);
+                }
+                const fanoutCheckpoint = fanoutPreflightPrefixes
+                  .map((prefix) => leaderCheckpointCandidates.find((checkpoint) =>
+                    checkpoint.hash === prefix.value &&
+                    checkpoint.len === prefix.prefix_len
+                  ))
+                  .find((checkpoint): checkpoint is {
+                    handle: string;
+                    hash: string;
+                    len: number;
+                    logicalPosition?: number;
+                  } => !!checkpoint);
+                const fanoutCheckpointHandle = fanoutCheckpoint?.handle;
+                const fanoutDaemonPrefix = fanoutCheckpoint
+                  ? { hash: fanoutCheckpoint.hash, len: fanoutCheckpoint.len }
+                  : undefined;
+                const fanoutLogicalPosition = fanoutCheckpoint?.logicalPosition
+                  ?? fanoutDaemonPrefix?.len
+                  ?? prefillPromptTokens.length;
+                const fanoutAttachFromLeader = !!(fanoutCheckpointHandle && fanoutDaemonPrefix);
+                const fanoutSessions: any[] = [];
+                for (const follower of sameWaveFanoutFollowers) {
+                  const pending = pendingPrefillRequests.get(follower.id);
+                  if (!pending) {
+                    throw new Error(`selected fanout session ${follower.id} is not pending`);
+                  }
+                  const payload = cloneJsonValue(pending.prefillSession);
+                  if (fanoutAttachFromLeader) {
+                    payload.state_handle = {
+                      ...(payload.state_handle ?? {}),
+                      runtime_state_handle: fanoutCheckpointHandle,
+                      cached_prefix_tokens: fanoutDaemonPrefix.len,
+                      logical_position: fanoutLogicalPosition,
+                      prefix_hash: {
+                        algorithm: "xxh128",
+                        value: fanoutDaemonPrefix.hash,
+                        prefix_len: fanoutDaemonPrefix.len,
+                      },
+                      prefix_len: fanoutDaemonPrefix.len,
+                    };
+                    delete payload.suffix_tokens;
+                  }
+                  fanoutSessions.push(payload);
+                }
+                const fanoutBatchId = `${runtimeBatchId}-fanout`;
+                await e.send({
+                  type: "generate_batch_prefill",
+                  id: `${reqId}-prefill-fanout`,
+                  batch_id: fanoutBatchId,
+                  worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
+                  model: current,
+                  sessions: fanoutSessions,
+                });
+                let fanoutDone = false;
+                const maxFanoutResponses = fanoutSessions.length + 4;
+                for (let i = 0; i < maxFanoutResponses; i++) {
+                  const prefillMsg = await e.recv();
+                  if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === fanoutBatchId) {
+                    fanoutDone = true;
+                    updateRuntimeWorkerMetrics((prefillMsg as any).model_worker);
+                    if (genParams.server_prefill_batch) {
+                      genParams.server_prefill_batch.daemon_prefill_tokens =
+                        Number(genParams.server_prefill_batch.daemon_prefill_tokens ?? 0)
+                        + Number(prefillMsg.prefill_tokens ?? 0);
+                      genParams.server_prefill_batch.daemon_prefill_ms =
+                        Number(genParams.server_prefill_batch.daemon_prefill_ms ?? 0)
+                        + Number(prefillMsg.elapsed_ms ?? 0);
+                    }
+                    break;
+                  }
+                  if (prefillMsg?.type === "generate_batch_prefill_session_done") {
+                    if (typeof prefillMsg.session_id === "string" && typeof prefillMsg.prefill_tokens === "number") {
+                      sessionPrefillTokens.set(prefillMsg.session_id, prefillMsg.prefill_tokens);
+                    }
+                    const stateHandle = (prefillMsg as any).state_handle;
+                    if (
+                      typeof prefillMsg.session_id === "string" &&
+                      stateHandle &&
+                      typeof stateHandle.session_id === "string"
+                    ) {
+                      runtimeStateHandlesBySession.set(prefillMsg.session_id, stateHandle.session_id);
+                      residentDecodeSessions.add(stateHandle.session_id);
+                    }
+                    if (
+                      typeof prefillMsg.session_id === "string" &&
+                      typeof prefillMsg.logical_position === "number"
+                    ) {
+                      logicalPositionsBySession.set(prefillMsg.session_id, prefillMsg.logical_position);
+                    }
+                    if (
+                      typeof prefillMsg.session_id === "string" &&
+                      stateHandle &&
+                      typeof stateHandle.checkpoint_id === "string"
+                    ) {
+                      checkpointStateHandlesBySession.set(prefillMsg.session_id, stateHandle.checkpoint_id);
+                      const prefixHash = stateHandle.prefix_hash;
+                      const prefixLen = typeof stateHandle.prefix_len === "number"
+                        ? stateHandle.prefix_len
+                        : prefixHash?.prefix_len;
+                      if (
+                        prefixHash &&
+                        prefixHash.algorithm === "xxh128" &&
+                        typeof prefixHash.value === "string" &&
+                        /^[0-9a-f]{32}$/.test(prefixHash.value) &&
+                        typeof prefixLen === "number" &&
+                        Number.isInteger(prefixLen) &&
+                        prefixLen >= 0
+                      ) {
+                        checkpointDaemonPrefixHashesBySession.set(prefillMsg.session_id, {
+                          hash: prefixHash.value,
+                          len: prefixLen,
+                        });
+                      }
+                    }
+                    if (
+                      typeof prefillMsg.session_id === "string" &&
+                      stateHandle &&
+                      Array.isArray(stateHandle.prefix_checkpoints)
+                    ) {
+                      const prefixCheckpoints: ResidentPrefixCheckpointOutcome[] = [];
+                      for (const checkpoint of stateHandle.prefix_checkpoints) {
+                        const prefixHash = checkpoint?.prefix_hash;
+                        const prefixLen = typeof checkpoint?.prefix_len === "number"
+                          ? checkpoint.prefix_len
+                          : prefixHash?.prefix_len;
+                        if (
+                          checkpoint &&
+                          typeof checkpoint.checkpoint_id === "string" &&
+                          prefixHash &&
+                          prefixHash.algorithm === "xxh128" &&
+                          typeof prefixHash.value === "string" &&
+                          /^[0-9a-f]{32}$/.test(prefixHash.value) &&
+                          typeof prefixLen === "number" &&
+                          Number.isInteger(prefixLen) &&
+                          prefixLen > 0
+                        ) {
+                          prefixCheckpoints.push({
+                            checkpointStateHandle: checkpoint.checkpoint_id,
+                            checkpointLogicalPosition: Number.isInteger(checkpoint.logical_position)
+                              ? checkpoint.logical_position
+                              : prefixLen,
+                            checkpointDaemonPrefixHash: prefixHash.value,
+                            checkpointDaemonPrefixLen: prefixLen,
+                            boundary: typeof checkpoint.boundary === "string" ? checkpoint.boundary : undefined,
+                            boundaryIndex: Number.isInteger(checkpoint.boundary_index) ? checkpoint.boundary_index : undefined,
+                          });
+                        }
+                      }
+                      if (prefixCheckpoints.length > 0) {
+                        checkpointPrefixCheckpointsBySession.set(prefillMsg.session_id, prefixCheckpoints);
+                      }
+                    }
+                    continue;
+                  }
+                  if (prefillMsg?.type === "generate_batch_prefill_started") {
+                    continue;
+                  }
+                  if (prefillMsg?.type === "error") {
+                    throw new Error(prefillMsg.message || "generate_batch_prefill fanout error");
+                  }
+                  if (prefillMsg?.type === "generate_batch_prefill_unsupported") {
+                    throw new Error(prefillMsg.reason || "generate_batch_prefill fanout unsupported");
+                  }
+                  throw new Error(`unexpected generate_batch_prefill fanout response: ${prefillMsg?.type ?? "missing"}`);
+                }
+                if (!fanoutDone) throw new Error("generate_batch_prefill fanout did not complete");
+                if (fanoutAttachFromLeader) {
+                  prefillBatchMetrics.sharedPrefixFanoutGroups += 1;
+                  prefillBatchMetrics.sharedPrefixFanoutFollowers += sameWaveFanoutFollowers.length;
+                  prefillBatchMetrics.cacheHits += sameWaveFanoutFollowers.length;
+                  prefillBatchMetrics.runtimeCacheHits += sameWaveFanoutFollowers.length;
+                }
+              }
               await releaseStateReservations(selectedReservationIds, "prefill materialized resident state");
               const residentStateLimit = Number(genParams.server_prefill_batch?.resident_state_limit ?? selectedSessions.length);
               const diskSpillAllowed = genParams.server_prefill_batch?.disk_spill_allowed === true;
@@ -5040,6 +5743,7 @@ async function serve(port: number, host: string) {
             pendingPrefillRequests.set(reqId, {
               session: serverPrefillSession,
               prefillSession,
+              fanoutKey: requestAllowsResidentPrefixCache ? cacheKey ?? undefined : undefined,
               reservationId: stateReservationId,
               selected: false,
               resolve: resolvePending,
@@ -5050,6 +5754,12 @@ async function serve(port: number, host: string) {
               coalesceWaitMs: requestBatchPolicy?.coalesceWaitMs ?? serverPrefillBatch.waitMs,
               maxProcessingMs: requestBatchPolicy?.maxProcessingMs ?? serverPrefillBatch.maxProcessingMs,
             });
+            if (servingWorkerKey) {
+              schedulePendingPrefillFlush(
+                modelWorkerKeyId(servingWorkerKey),
+                requestBatchPolicy?.coalesceWaitMs ?? serverPrefillBatch.waitMs,
+              );
+            }
             safeRelease();
             let pendingOutcome: PendingPrefillOutcome | null = null;
             try {
@@ -5423,13 +6133,6 @@ async function serve(port: number, host: string) {
             }
           }
           return null;
-        }
-
-        if (isResponsesRequest) {
-          // responses streaming isn't represented here yet.
-          return Response.json({
-            error: { message: "/v1/responses currently returns non-streaming only", type: "invalid_request_error" },
-          }, { status: 400 });
         }
 
         if (body.stream) {
@@ -6115,8 +6818,28 @@ async function serve(port: number, host: string) {
           responseBody.x_hipfire_warning = thinkWarning;
         }
         if (url.pathname === "/v1/responses") {
-          const responseId = responseBody.id || `resp_${newObjectId("resp")}`;
-          return Response.json(toResponsesObject(responseId, responseBody));
+          const responsesObject = toResponsesObject(responseBody.id || newObjectId("chatcmpl"), responseBody);
+          if (responsesContextMessagesForStore) {
+            const assistantMessage: any = {
+              role: "assistant",
+              content: choice.message?.content ?? "",
+            };
+            if (choice.message?.tool_calls) assistantMessage.tool_calls = cloneJsonValue(choice.message.tool_calls);
+            if (choice.message?.reasoning_content) assistantMessage.reasoning_content = choice.message.reasoning_content;
+            const nowMs = Date.now();
+            storeResponsesContext({
+              id: responsesObject.id,
+              model: typeof body.model === "string" && body.model.length > 0 ? body.model : modelName,
+              messages: [
+                ...cloneChatMessages(responsesContextMessagesForStore),
+                assistantMessage,
+              ],
+              promptCacheKey: typeof body.prompt_cache_key === "string" ? body.prompt_cache_key : undefined,
+              createdAtMs: nowMs,
+              lastUsedAtMs: nowMs,
+            });
+          }
+          return Response.json(responsesObject);
         }
         return Response.json(responseBody);
       } catch (err: any) {

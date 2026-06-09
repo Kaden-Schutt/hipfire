@@ -890,6 +890,10 @@ fn select_qwen35_decode_batch_backend(
     }
 }
 
+fn qwen35_decode_batch_requested_auto(requested: &str) -> bool {
+    matches!(requested, "" | "auto")
+}
+
 fn qwen35_fused_dense_decode_signature(
     state: &Qwen35RequestSessionState,
 ) -> qwen35::DensePrefillSessionBatchStateSignature {
@@ -3087,6 +3091,7 @@ struct Qwen35RequestSessionState {
     prefilled_generated_suffix_len: usize,
 }
 
+#[derive(Clone)]
 struct Qwen35PreparedPrefillSession {
     id: String,
     tokens: Vec<u32>,
@@ -4787,6 +4792,90 @@ fn qwen35_prefill_suffix_batch(
     plan: GenerateBatchPrefillPlan,
     backend: Qwen35PrefillBatchBackend,
 ) -> Result<Qwen35PrefillBatchResult, String> {
+    let (attach_only, non_empty): (Vec<_>, Vec<_>) = prepared
+        .iter()
+        .partition(|session| session.tokens.is_empty());
+    if !attach_only.is_empty() {
+        let effective_backend = if non_empty.len() < 2 {
+            Qwen35PrefillBatchBackend::SerialReference
+        } else {
+            backend
+        };
+        let mut sessions_by_id: HashMap<String, Qwen35PrefillSessionResult> = HashMap::new();
+        let mut total_prefill_tokens = 0usize;
+        let mut mode = match effective_backend {
+            Qwen35PrefillBatchBackend::SerialReference => "serial_prefill",
+            Qwen35PrefillBatchBackend::FusedDense => "qwen35_fused_dense_prefill",
+            Qwen35PrefillBatchBackend::FusedGroupedMoe => "qwen35_fused_grouped_moe_prefill",
+        };
+        if !non_empty.is_empty() {
+            let non_empty_prepared: Vec<Qwen35PreparedPrefillSession> =
+                non_empty.into_iter().cloned().collect();
+            let result = qwen35_prefill_suffix_batch(
+                m,
+                gpu,
+                batch_id,
+                &non_empty_prepared,
+                plan,
+                effective_backend,
+            )?;
+            total_prefill_tokens += result.total_prefill_tokens;
+            mode = result.mode;
+            for session in result.sessions {
+                sessions_by_id.insert(session.id.clone(), session);
+            }
+        }
+        for session in attach_only {
+            qwen35_activate_session(m, gpu, &session.id)?;
+            qwen35_save_active_session(m, gpu)?;
+            let saved = m.q35_sessions.get(&session.id).ok_or_else(|| {
+                format!(
+                    "qwen35 attach-only session {} missing after activation",
+                    session.id
+                )
+            })?;
+            let logical_position = saved.seq_pos + saved.kv_cache.compact_offset;
+            let prefix_hash = compute_qwen35_prefix_hash(
+                m.arch_id,
+                m.q35_kv_mode.as_deref(),
+                &session.state_kinds,
+                &session.assistant_prefix,
+                session.max_think_tokens,
+                &saved.conversation_tokens,
+            );
+            if let Some(saved) = m.q35_sessions.get_mut(&session.id) {
+                saved.prefix_hash = Some(prefix_hash.clone());
+            }
+            sessions_by_id.insert(
+                session.id.clone(),
+                Qwen35PrefillSessionResult {
+                    id: session.id.clone(),
+                    prefill_tokens: 0,
+                    logical_position,
+                    cached_prefix_tokens: session.cached_prefix_tokens,
+                    prefix_hash,
+                    debug_sample_token: None,
+                    boundary_checkpoints: Vec::new(),
+                },
+            );
+        }
+        let sessions = prepared
+            .iter()
+            .map(|session| {
+                sessions_by_id
+                    .remove(&session.id)
+                    .ok_or_else(|| format!("qwen35 prefill result missing session {}", session.id))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Qwen35PrefillBatchResult {
+            mode,
+            plan,
+            backend: effective_backend,
+            total_prefill_tokens,
+            sessions,
+        });
+    }
+
     match backend {
         Qwen35PrefillBatchBackend::SerialReference => {
             qwen35_prefill_suffix_batch_serial_reference(m, gpu, batch_id, prepared, plan, backend)
@@ -5718,11 +5807,25 @@ fn run_generate_batch_decode_step_qwen35(
     }
     let requested_backend =
         std::env::var("HIPFIRE_QWEN35_DECODE_BATCH").unwrap_or_else(|_| "auto".to_string());
-    let backend = select_qwen35_decode_batch_backend(
+    let mut backend = select_qwen35_decode_batch_backend(
         requested_backend.as_str(),
         m.arch_id,
         envelope.session_count,
     )?;
+    if qwen35_decode_batch_requested_auto(requested_backend.as_str())
+        && m.arch_id == 5
+        && envelope.session_count >= 2
+    {
+        qwen35_save_active_session(m, gpu)?;
+    }
+    if qwen35_decode_batch_requested_auto(requested_backend.as_str())
+        && m.arch_id == 5
+        && envelope.session_count >= 2
+        && validate_qwen35_fused_dense_decode_model_capability(m, envelope.session_count).is_ok()
+        && validate_qwen35_fused_dense_decode_resident_sessions(m, envelope).is_ok()
+    {
+        backend = Qwen35DecodeBatchBackend::FusedDenseLayerChunked;
+    }
     if backend == Qwen35DecodeBatchBackend::FusedDenseLayerChunked {
         validate_qwen35_fused_dense_decode_model_capability(m, envelope.session_count)?;
     } else if backend == Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked {
@@ -6047,7 +6150,7 @@ fn qwen35_decode_step_fused_dense_native_chunks(
     Ok(Qwen35DecodeBatchStepResult {
         session_lines,
         chunk_count: chunks.len(),
-        chunk_size: effective_chunk_size,
+        chunk_size: effective_chunk_size.min(envelope.session_count),
     })
 }
 

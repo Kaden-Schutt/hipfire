@@ -168,9 +168,9 @@ try:
     single_response = chat_request(base_url, "single-timeout")
     single_health = fetch_json(f"{base_url}/health", timeout=10.0)
     single_prefill = single_health.get("prefill_batch", {})
-    if single_prefill.get("runtime_dispatch_skipped_reason") != "daemon_serial_prefill_timeout":
+    if single_prefill.get("runtime_dispatch_skipped_reason") != "not_skipped":
         raise RuntimeError(
-            "single request did not exercise prefill timeout fallback: "
+            "single request did not flush through daemon prefill: "
             f"{single_prefill}; log={log_path}"
         )
     if int(single_prefill.get("pending_requests") or 0) != 0:

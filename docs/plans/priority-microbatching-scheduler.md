@@ -16,9 +16,11 @@ chunked decode dispatch, while
 `HIPFIRE_QWEN35_DECODE_BATCH=fused_grouped_moe` enables Qwen35-MoE chunked
 dispatch. Both explicit backends report `HIPFIRE_QWEN35_DECODE_BATCH_MAX`
 telemetry; dense native multi-row chunks are enabled with
-`HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW=1` and remain explicit until broader
-parity/perf gates justify `auto`. Native grouped-MoE routed kernels, MTP/DFlash
-verify batching, and state-cache eviction to disk remain follow-up phases.
+`HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW=1`. Dense Qwen35 FP32-state `auto`
+promotion is capability-gated in the daemon: supported resident dense batches
+route to `fused_dense_layer_chunked`, while unsupported dense state stays on
+`serial_reference`. Native grouped-MoE routed kernels, MTP/DFlash verify
+batching, and state-cache eviction to disk remain follow-up phases.
 
 External `/v1/chat/completions` remains OpenAI-compatible. Priority is optional
 Hipfire metadata/config and defaults to interactive user traffic.
@@ -31,9 +33,9 @@ Hipfire metadata/config and defaults to interactive user traffic.
 | 2. Per-worker queueing, enqueue/dequeue/cancel, policy selection | DONE | `cli/worker_scheduler.ts`, `cli/worker_scheduler.test.ts` | Priority buckets, compatibility filtering, opportunistic dispatch policy in one worker-local scheduler. |
 | 3. Model/session foundations and request/session compatibility | DONE | `cli/session_state.ts`, `cli/session_state.test.ts` | Includes `ModelWorkerKey`, accelerator/device placement identity, `RequestSessionDraft`, `SessionStateHandle`, and same-worker/state-kind compatibility. |
 | 4. Server-side prefill batching integration (same-worker/session compatibility, no cross-model batching) | DONE FOR QWEN35 | `cli/server_prefill_batch.ts`, `cli/server_prefill_batch.test.ts`, `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-generate-batch-prefill.sh`, `scripts/smoke-server-prefill-batch.sh` | Policy parsing, eligibility gate, scheduler selection, session adapter, daemon `generate_batch_prefill` dispatch, Qwen35 resident state handles, session release, dense fused prefill, grouped-MoE fused prefill, and non-streaming text-only `/v1/responses` normalization are implemented. Remaining work is generic worker residency beyond Qwen35. |
-| 5. Prefix/state cache metadata + safety telemetry | DONE FOR QWEN35 V1 | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts`, `/health.prefill_batch`, `/health.state_cache`, `scripts/smoke-server-prefix-checkpoint-reuse.sh`, `scripts/smoke-server-prefix-hash-preflight.sh`, `scripts/smoke-server-prefix-boundary-reuse.sh` | Fingerprint, manifest keying, compatibility, `prompt_cache_key` namespace support, spill guardrails, metadata/runtime-hit telemetry, Qwen35 resident attach/fork, daemon-authoritative `xxh128` checkpoint identity, daemon prefix-hash preflight, lifecycle invalidation, capped in-memory checkpoint residency, serial semantic-boundary checkpoint reuse, and arena-hooked fused final checkpoints are wired. Interior fused-backend boundary snapshots still need backend-native capture points. |
+| 5. Prefix/state cache metadata + safety telemetry | DONE FOR QWEN35 V1 | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts`, `/health.prefill_batch`, `/health.state_cache`, `scripts/smoke-server-prefix-checkpoint-reuse.sh`, `scripts/smoke-server-prefix-hash-preflight.sh`, `scripts/smoke-server-prefix-boundary-reuse.sh`, `scripts/smoke-server-responses-prefix-reuse.sh`, `scripts/smoke-server-shared-prefix-fanout.sh` | Fingerprint, manifest keying, compatibility, `prompt_cache_key` namespace support, spill guardrails, metadata/runtime-hit telemetry, Qwen35 resident attach/fork, daemon-authoritative `xxh128` checkpoint identity, daemon prefix-hash preflight, lifecycle invalidation, capped in-memory checkpoint residency, serial semantic-boundary checkpoint reuse, Responses `previous_response_id` transcript replay onto resident prefix reuse, timer-flushed exact same-wave fanout for identical cold prefixes, and arena-hooked fused final checkpoints are wired. Interior fused-backend boundary snapshots still need backend-native capture points. |
 | 6. Scheduler starvation/backpressure hardening | DONE | `cli/worker_scheduler.ts`, `cli/worker_scheduler.test.ts`, `cli/index.ts` | Default queue cap, resident session memory-pressure admission, and deadline-aging selection prevent unbounded queue/state growth and strict-priority starvation. |
-| 7. Decode active set and dense/grouped chunked step backends | IN PROGRESS FOR QWEN35 V1 | `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-server-decode-batch.sh`, `scripts/stress-server-concurrency.sh` | Non-streaming text-only greedy Qwen35 requests that already passed server prefill can batch one-token decode steps through `generate_batch_decode_step`. Serial remains the default oracle; explicit dense mode uses native FP32-state chunked state advance and can enable multi-row chunks behind `HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW=1`; explicit grouped-MoE mode is still chunked serial-oracle advanced. Native grouped-MoE routed kernels, sampling, streaming, and non-Qwen35 support remain future work. |
+| 7. Decode active set and dense/grouped chunked step backends | IN PROGRESS FOR QWEN35 V1 | `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-server-decode-batch.sh`, `scripts/stress-server-concurrency.sh` | Non-streaming text-only greedy Qwen35 requests that already passed server prefill can batch one-token decode steps through `generate_batch_decode_step`. Dense FP32-state `auto` uses native chunked state advance and can enable multi-row chunks behind `HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW=1`; unsupported dense state remains serial; explicit grouped-MoE mode is still chunked serial-oracle advanced. Native grouped-MoE routed kernels, sampling, streaming, and non-Qwen35 support remain future work. |
 | Blocker | PARTIAL | `crates/hipfire-runtime/examples/daemon.rs` implements Qwen35 fused prefill plus state-handle lifecycle and release protocol; top-level attach/fork/activate/reset/release/count and fused final-checkpoint creation route through the backend-neutral arena wrapper around the Qwen35 session map. `/health.runtime_workers` exposes descriptor counts/bytes for wrapped Qwen35 KV/DeltaNet/logits state, resident worker lists, and V1 memory totals for pressure-aware model eviction. | Allocator-precise memory accounting, backend-neutral state-page allocation, and non-Qwen35 worker-owned session arenas remain future work. |
 
 ### SKIPPED Slice Notes
@@ -140,6 +142,18 @@ Resident in-memory prefix checkpoint reuse is intentionally controlled by
 also opt into the resident cache with `prompt_cache_retention=in_memory` or
 `prompt_cache_retention=24h`; `24h` is accepted as OpenAI-compatible intent but
 is treated as in-memory until serialization/rehydrate exists.
+
+For Chat Completions, clients resend the full prompt and opt into resident
+reuse with `prompt_cache_retention` or the global resident-cache flag. For
+Responses, completed non-streaming text-only calls store a bounded in-memory
+transcript keyed by `response.id`; a follow-up with `previous_response_id`
+prepends that transcript, opts into in-memory reuse, and then goes through the
+same daemon prefix-hash preflight and attach path as Chat. This supports the
+system-prompt plus document plus multiple-query use case after the first
+request has produced a resident checkpoint. Exact same-wave fanout now handles
+identical cold prompts by timer-flushing the pending queue, prefilling one
+leader, and attaching followers from a daemon-preflight-matched leader
+checkpoint.
 
 ### Disk-Eviction Policy Note
 
@@ -300,12 +314,12 @@ Decode batching now has a conservative V1 control plane:
   native chunk rows,
 - release-path preservation for resident decode handles.
 
-The explicit dense native backend defaults to native singleton chunks for
-conservative compatibility. The Qwen35 session-batched dense row worker is wired
-for decode chunks with two or more rows behind
-`HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW=1`; the two-row parity smoke and
-128-request stress gate now pass, but the flag remains explicit until broader
-batch-size/token-count and latency gates justify promotion.
+The dense native backend defaults to native singleton chunks for conservative
+compatibility. The Qwen35 session-batched dense row worker is wired for decode
+chunks with two or more rows behind `HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW=1`.
+Batch-size 2/4/8, token-count 4, chunk-cap 1/2/8 parity smokes now pass, and
+the 128-request stress gate reports `fused_dense_layer_chunked` under `auto`
+with FP32 dense state.
 
 Eligible V1 sessions:
 
@@ -334,14 +348,13 @@ decode-session counters return to idle.
 
 The default daemon backend is intentionally named `serial_reference`. It proves
 protocol, scheduler, session ownership, stop handling, response assembly, and
-cleanup. Explicit `HIPFIRE_QWEN35_DECODE_BATCH=fused` now selects
-`fused_dense_layer_chunked` for dense Qwen35 FP32-state batches. The backend
-honors `HIPFIRE_QWEN35_DECODE_BATCH_MAX` by splitting selected sessions into
-bounded chunks and reporting `chunk_count` / `chunk_size`; with
-`HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW=1`, multi-row dense chunks advance state
-through the native dense row worker. Quantized KV/state and compacted KV remain
-on `serial_reference`. `auto` remains serial until broader parity and perf gates
-justify promotion.
+cleanup. `HIPFIRE_QWEN35_DECODE_BATCH=auto` now selects
+`fused_dense_layer_chunked` for capability-compatible dense Qwen35 FP32-state
+batches. The backend honors `HIPFIRE_QWEN35_DECODE_BATCH_MAX` by splitting
+selected sessions into bounded chunks and reporting `chunk_count` / effective
+`chunk_size`; with `HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW=1`, multi-row dense
+chunks advance state through the native dense row worker. Quantized KV/state and
+compacted KV remain on `serial_reference`.
 
 Priority policy is stricter for decode than prefill:
 
@@ -451,9 +464,8 @@ wait for disk restore to improve reuse.
   V1 CONTROL PATH.
 - Add explicit grouped-MoE chunked decode backend. DONE FOR QWEN35-MOE V1
   CONTROL PATH.
-- Broaden dense native parity/perf gates across batch sizes and token counts.
-  NEXT.
-- Promote dense fused decode to `auto`. NEXT.
+- Broaden dense native perf measurements beyond smoke prompts. NEXT.
+- Promote dense fused decode to `auto`. DONE FOR DENSE QWEN35 FP32 V1.
 - Add native grouped-MoE routed layer chunks. NEXT.
 - Add per-session sampler and stream state. DEFERRED.
 - Gate fused backend by correctness tests and latency measurements. NEXT.
