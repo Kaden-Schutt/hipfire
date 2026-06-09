@@ -1813,7 +1813,15 @@ fn forward_scratch_inner(
     kv_full: &mut hipfire_runtime::llama::KvCache,
     scratch: &Gemma4Scratch,
 ) -> HipResult<()> {
-    // 3) Per-layer forward.
+    // #397 Ship 6 — forward-as-pipeline. When HIPFIRE_FORWARD_LOWERED=1,
+    // route decode through the lowered super-op executor.
+    if forward_lowered_enabled() {
+        return forward_scratch_inner_lowered(
+            gpu, weights, config, pos, kv_sliding, kv_full, scratch,
+        );
+    }
+
+    // 3) Per-layer forward (legacy hand path).
     let mut sliding_kv_idx = 0usize;
     let mut full_kv_idx = 0usize;
     for (layer_idx, layer_type) in config.layer_types.iter().copied().enumerate() {
@@ -2952,6 +2960,277 @@ fn forward_prefill_batch_v2(
                 gpu.scale_f32(&scratch.pb_residual, layer_scalar)?;
             }
         }
+    }
+    Ok(())
+}
+
+// ── Forward-as-pipeline (#397 Ship 6) — lowered super-op substrate ──────────
+//
+// Migrates Gemma 4's decode forward from per-token execute_steps resolution
+// to pre-resolved LayerPrograms executed via run_layer_program + ForwardBindings.
+// Behind HIPFIRE_FORWARD_LOWERED gate (default OFF) until byte-parity validated.
+// See docs/plans/gemma4_forward_as_pipeline.md for the full plan.
+
+use hipfire_dispatch::pipeline::superop::{
+    self, ForwardBindings, LayerProgram, OpBinding, SuperOp, SuperOpKind, WeightSlot,
+    EscapeKind,
+};
+
+// ── Variant enum ──────────────────────────────────────────────────────────
+
+/// The four Gemma 4 decoder-layer shapes. Derived from the layer type
+/// (Sliding vs Full) and the presence of MoE extras. Pure → unit-testable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gemma4Variant {
+    SlidingDense,
+    SlidingMoe,
+    FullDense,
+    FullMoe,
+}
+
+fn gemma4_variant_of(layer_type: LayerType, layer: &LayerWeights) -> Gemma4Variant {
+    let has_moe = match layer {
+        LayerWeights::Sliding(lw) => lw.moe.is_some(),
+        LayerWeights::Full(lw) => lw.moe.is_some(),
+    };
+    match (layer_type, has_moe) {
+        (LayerType::Sliding, false) => Gemma4Variant::SlidingDense,
+        (LayerType::Sliding, true)  => Gemma4Variant::SlidingMoe,
+        (LayerType::Full,    false) => Gemma4Variant::FullDense,
+        (LayerType::Full,    true)  => Gemma4Variant::FullMoe,
+    }
+}
+
+// ── Opcodes ───────────────────────────────────────────────────────────────
+
+/// Arch-local opcodes encoded into `OpBinding.weights[0]` as `WeightSlot(code)`.
+/// `SuperOpKind` routes to the `ForwardBindings` method; the opcode disambiguates
+/// *which* op of that kind within the layer.
+mod g4_op {
+    // Proj (projection clusters)
+    pub const PROJ_QK_SLIDING: u32 = 0; // sliding: q_proj + k_proj fused (execute_steps)
+    pub const PROJ_V_SLIDING:  u32 = 1; // sliding: v_proj standalone (weight_gemv)
+    pub const PROJ_Q_FULL:     u32 = 2; // full: q_proj standalone (weight_gemv)
+    pub const PROJ_K_FULL:     u32 = 3; // full: k_proj standalone; V←K copied in Attend(FULL)
+    pub const PROJ_O:          u32 = 4; // o_proj
+    pub const PROJ_GATE_UP:    u32 = 5; // gate_proj + up_proj fused
+    pub const PROJ_DOWN:       u32 = 6; // down_proj (folds gelu_tanh + mul activation)
+
+    // Attend
+    pub const ATTEND_SLIDING: u32 = 0; // window=1024, head_dim=256, full rope
+    pub const ATTEND_FULL: u32 = 1;    // window=0, head_dim=512, partial rope, k_eq_v
+
+    // Norm
+    pub const NORM_INPUT:     u32 = 0; // input_layernorm
+    pub const NORM_POST_ATTN: u32 = 1; // post_attention_layernorm
+    pub const NORM_PRE_FFN:   u32 = 2; // pre_feedforward_layernorm
+    pub const NORM_POST_FFN:  u32 = 3; // post_feedforward_layernorm (dense only)
+
+    // ResidualGemv
+    pub const RESID_POST_ATTN: u32 = 0; // residual plumbing only (no norm)
+    pub const RESID_POST_FFN:  u32 = 1; // residual + scale(layer_scalar)
+
+    // Moe
+    pub const MOE_BRANCH: u32 = 0; // encapsulated MoE branch (replaces NORM_POST_FFN)
+}
+
+// ── Lowering ──────────────────────────────────────────────────────────────
+
+fn g4_superop(kind: SuperOpKind, code: u32) -> SuperOp {
+    SuperOp {
+        kind,
+        binding: OpBinding {
+            key: None,
+            weights: vec![WeightSlot(code)],
+            scratch: Vec::new(),
+            flavor: superop::OpFlavor::None,
+        },
+    }
+}
+
+fn lower_variant(v: Gemma4Variant) -> LayerProgram {
+    use g4_op::*;
+    use SuperOpKind::*;
+    match v {
+        Gemma4Variant::SlidingDense => vec![
+            g4_superop(Norm, NORM_INPUT),
+            g4_superop(Proj, PROJ_QK_SLIDING),
+            g4_superop(Proj, PROJ_V_SLIDING),
+            g4_superop(Attend, ATTEND_SLIDING),
+            g4_superop(Proj, PROJ_O),
+            g4_superop(Norm, NORM_POST_ATTN),
+            g4_superop(ResidualGemv, RESID_POST_ATTN),
+            g4_superop(Norm, NORM_PRE_FFN),
+            g4_superop(Proj, PROJ_GATE_UP),
+            g4_superop(Proj, PROJ_DOWN),         // folds gelu_tanh + mul
+            g4_superop(Norm, NORM_POST_FFN),     // dense only
+            g4_superop(ResidualGemv, RESID_POST_FFN),
+        ],
+        Gemma4Variant::SlidingMoe => vec![
+            g4_superop(Norm, NORM_INPUT),
+            g4_superop(Proj, PROJ_QK_SLIDING),
+            g4_superop(Proj, PROJ_V_SLIDING),
+            g4_superop(Attend, ATTEND_SLIDING),
+            g4_superop(Proj, PROJ_O),
+            g4_superop(Norm, NORM_POST_ATTN),
+            g4_superop(ResidualGemv, RESID_POST_ATTN),
+            g4_superop(Norm, NORM_PRE_FFN),
+            g4_superop(Proj, PROJ_GATE_UP),
+            g4_superop(Proj, PROJ_DOWN),
+            // MoE replaces standalone Norm(POST_FFN) — do NOT emit both
+            g4_superop(Moe, MOE_BRANCH),
+            g4_superop(ResidualGemv, RESID_POST_FFN), // identical to dense path
+        ],
+        Gemma4Variant::FullDense => vec![
+            g4_superop(Norm, NORM_INPUT),
+            g4_superop(Proj, PROJ_Q_FULL),
+            g4_superop(Proj, PROJ_K_FULL),      // no v_proj; V←K copied in Attend(FULL)
+            g4_superop(Attend, ATTEND_FULL),
+            g4_superop(Proj, PROJ_O),
+            g4_superop(Norm, NORM_POST_ATTN),
+            g4_superop(ResidualGemv, RESID_POST_ATTN),
+            g4_superop(Norm, NORM_PRE_FFN),
+            g4_superop(Proj, PROJ_GATE_UP),
+            g4_superop(Proj, PROJ_DOWN),
+            g4_superop(Norm, NORM_POST_FFN),
+            g4_superop(ResidualGemv, RESID_POST_FFN),
+        ],
+        Gemma4Variant::FullMoe => vec![
+            g4_superop(Norm, NORM_INPUT),
+            g4_superop(Proj, PROJ_Q_FULL),
+            g4_superop(Proj, PROJ_K_FULL),
+            g4_superop(Attend, ATTEND_FULL),
+            g4_superop(Proj, PROJ_O),
+            g4_superop(Norm, NORM_POST_ATTN),
+            g4_superop(ResidualGemv, RESID_POST_ATTN),
+            g4_superop(Norm, NORM_PRE_FFN),
+            g4_superop(Proj, PROJ_GATE_UP),
+            g4_superop(Proj, PROJ_DOWN),
+            g4_superop(Moe, MOE_BRANCH),
+            g4_superop(ResidualGemv, RESID_POST_FFN),
+        ],
+    }
+}
+
+// ── Bindings struct ───────────────────────────────────────────────────────
+
+fn op_code(op: &OpBinding) -> u32 {
+    op.weights.first().map(|w| w.0).unwrap_or(u32::MAX)
+}
+
+/// Per-layer execution context for the lowered decode path. Holds the current
+/// layer's weights + shared scratch by reference; rebuilt each layer iteration
+/// so the borrows stay scoped.
+struct Gemma4Bindings<'a> {
+    layer: &'a LayerWeights,
+    config: &'a Gemma4Config,
+    scratch: &'a Gemma4Scratch,
+    kv_sliding: &'a mut llama::KvCache,
+    kv_full: &'a mut llama::KvCache,
+    pos: usize,
+    sliding_kv_idx: usize,
+    full_kv_idx: usize,
+}
+
+impl<'a> ForwardBindings for Gemma4Bindings<'a> {
+    fn run_proj(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        Err(hipfire_dispatch::types::DispatchError::Hip(format!(
+            "gemma4 run_proj opcode {} not yet implemented (Step 2)", op_code(_op)
+        )))
+    }
+    fn run_residual_gemv(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        Err(hipfire_dispatch::types::DispatchError::Hip(format!(
+            "gemma4 run_residual_gemv opcode {} not yet implemented (Step 4)", op_code(_op)
+        )))
+    }
+    fn run_norm(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        Err(hipfire_dispatch::types::DispatchError::Hip(format!(
+            "gemma4 run_norm opcode {} not yet implemented (Step 2)", op_code(_op)
+        )))
+    }
+    fn run_attend(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        Err(hipfire_dispatch::types::DispatchError::Hip(format!(
+            "gemma4 run_attend opcode {} not yet implemented (Step 3)", op_code(_op)
+        )))
+    }
+    fn run_moe(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        Err(hipfire_dispatch::types::DispatchError::Hip(format!(
+            "gemma4 run_moe opcode {} not yet implemented (Step 5)", op_code(_op)
+        )))
+    }
+    fn run_recurrent(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        Err(hipfire_dispatch::types::DispatchError::Hip("gemma4 has no recurrent ops".into()))
+    }
+    fn run_conv(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        Err(hipfire_dispatch::types::DispatchError::Hip("gemma4 has no conv ops".into()))
+    }
+    fn run_escape(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding, _kind: EscapeKind) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        Err(hipfire_dispatch::types::DispatchError::Hip("gemma4 escape not yet implemented (Step 6)".into()))
+    }
+}
+
+// ── Gate + lowered forward ───────────────────────────────────────────────
+
+/// Cached `HIPFIRE_FORWARD_LOWERED` toggle. Default OFF until byte-parity
+/// validated. Escape hatch: `HIPFIRE_FORWARD_LOWERED=1` to opt in.
+fn forward_lowered_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() == Some("1")
+    })
+}
+
+/// Lowered (#397 Ship 6) decode layer loop. Behaviorally equivalent to
+/// `forward_scratch_inner`'s hand arms. Builds a coarse-super-op `LayerProgram`
+/// per layer and runs it through the dispatch substrate's executor.
+fn forward_scratch_inner_lowered(
+    gpu: &mut Gpu,
+    weights: &Gemma4Weights,
+    config: &Gemma4Config,
+    pos: usize,
+    kv_sliding: &mut llama::KvCache,
+    kv_full: &mut llama::KvCache,
+    scratch: &Gemma4Scratch,
+) -> HipResult<()> {
+    let ctx = DispatchCtx::new(gpu);
+    let mut sliding_kv_idx = 0usize;
+    let mut full_kv_idx = 0usize;
+
+    for (layer_idx, layer_type) in config.layer_types.iter().copied().enumerate() {
+        let layer = &weights.layers[layer_idx];
+        let variant = gemma4_variant_of(layer_type, layer);
+        let program = lower_variant(variant);
+        {
+            let mut bind = Gemma4Bindings {
+                layer,
+                config,
+                scratch,
+                kv_sliding,
+                kv_full,
+                pos,
+                sliding_kv_idx,
+                full_kv_idx,
+            };
+            superop::run_layer_program(gpu, &ctx, &program, &mut bind)
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+        }
+        match layer_type {
+            LayerType::Sliding => sliding_kv_idx += 1,
+            LayerType::Full => full_kv_idx += 1,
+        }
+    }
+
+    // Output stage: final norm + lm_head + softcap (same as hand path).
+    gpu.rmsnorm_f32(&scratch.x, &weights.final_norm, &scratch.tmp, config.norm_eps)?;
+    {
+        let ctx = DispatchCtx::new(gpu);
+        let wr = weights.lm_head.dispatch_ref();
+        execute_steps(gpu, &ctx, &[
+            Step::Gemv { w: &wr, input: GemvInput::Raw(&scratch.tmp), out: &scratch.logits },
+        ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    }
+    if config.final_logit_softcapping > 0.0 {
+        gpu.logit_softcap_f32(&scratch.logits, config.vocab_size, config.final_logit_softcapping)?;
     }
     Ok(())
 }
