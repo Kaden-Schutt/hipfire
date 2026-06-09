@@ -1877,6 +1877,17 @@ async function serve(port: number, host: string) {
   // conversation rebuild both turn into off-distribution noise.
   let currentArch: string | null = null;
   let currentStateMode: string | null = null;
+  let runtimeWorkerStatePageDescriptorEntries = 0;
+  let runtimeWorkerStatePageDescriptorBytes = 0;
+  const updateRuntimeWorkerStatePageDescriptors = (modelWorker: any) => {
+    if (!modelWorker || typeof modelWorker !== "object") return;
+    if (Number.isFinite(modelWorker.state_page_descriptor_entries)) {
+      runtimeWorkerStatePageDescriptorEntries = Math.max(0, Math.trunc(modelWorker.state_page_descriptor_entries));
+    }
+    if (Number.isFinite(modelWorker.state_page_descriptor_bytes)) {
+      runtimeWorkerStatePageDescriptorBytes = Math.max(0, Math.trunc(modelWorker.state_page_descriptor_bytes));
+    }
+  };
   const workerPrefillSchedulers = new Map<string, PriorityPrefillScheduler>();
   const workerStateCaches = new Map<string, Map<string, PrefixCheckpointManifest>>();
   type ResidentPrefixCheckpointOutcome = {
@@ -1971,6 +1982,7 @@ async function serve(port: number, host: string) {
       });
       const releaseMsg = await e.recv();
       if (releaseMsg?.type === "release_sessions_done") {
+        updateRuntimeWorkerStatePageDescriptors((releaseMsg as any).model_worker);
         for (const handle of unique) {
           residentDecodeSessions.delete(handle);
           residentCheckpointHandles.delete(handle);
@@ -2654,6 +2666,8 @@ async function serve(port: number, host: string) {
                   ? "unsupported"
                   : "none",
               generic_state_arena: false,
+              state_page_descriptor_entries: runtimeWorkerStatePageDescriptorEntries,
+              state_page_descriptor_bytes: runtimeWorkerStatePageDescriptorBytes,
             },
             batches: {
               ...buildBatchHealthPayload({
@@ -3381,7 +3395,7 @@ async function serve(port: number, host: string) {
           jinja_chat: process.env.HIPFIRE_JINJA_CHAT === "1",
         });
 
-        const reqId = `chatcmpl-${Date.now().toString(36)}`;
+        const reqId = newObjectId("chatcmpl");
         const requestNowMs = Date.now();
         let serverPrefillSession: RequestSessionDraft | undefined;
         let selectedForPrefillBatch = false;
@@ -4087,6 +4101,7 @@ async function serve(port: number, host: string) {
                 const prefillMsg = await e.recv();
                 if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === runtimeBatchId) {
                   prefillDone = true;
+                  updateRuntimeWorkerStatePageDescriptors((prefillMsg as any).model_worker);
                   if (genParams.server_prefill_batch) {
                     genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill";
                     genParams.server_prefill_batch.runtime_dispatch_reason = "prefill_done_decode_continuation";
@@ -4227,6 +4242,7 @@ async function serve(port: number, host: string) {
                 });
                 const releaseMsg = await e.recv();
                 if (releaseMsg?.type === "release_sessions_done") {
+                  updateRuntimeWorkerStatePageDescriptors((releaseMsg as any).model_worker);
                   for (const handle of evictedRuntimeHandles) residentDecodeSessions.delete(handle);
                 }
                 stateCacheEvictionsTotal += evictedRuntimeHandles.length;
@@ -5122,6 +5138,7 @@ async function serve(port: number, host: string) {
             });
             const releaseMsg = await e.recv();
             if (releaseMsg?.type === "release_sessions_done") {
+              updateRuntimeWorkerStatePageDescriptors((releaseMsg as any).model_worker);
               residentDecodeSessions.delete(releaseRuntimeSessionId);
             }
           } catch (err: any) {

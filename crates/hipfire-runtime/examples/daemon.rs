@@ -1476,6 +1476,49 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
+    fn model_worker_runtime_view_json_reports_state_page_descriptors() {
+        let worker = ModelWorkerRuntimeView {
+            worker_id: ModelWorkerId {
+                value: "qwen35:worker-a".to_string(),
+            },
+            max_resident_workers: 1,
+            resident_workers: 1,
+            state_arena_backend: SequenceStateArenaBackend::Qwen35Wrapped,
+            resident_sessions: 1,
+            state_page_descriptors: vec![
+                SequenceStatePageDescriptor {
+                    session_id: "checkpoint-a".to_string(),
+                    state_kind: "attention_kv".to_string(),
+                    label: "qwen35.kv_cache".to_string(),
+                    logical_position: 16,
+                    resident_bytes: 128,
+                    placement: "hip:arch5:device0".to_string(),
+                    role: "resident".to_string(),
+                },
+                SequenceStatePageDescriptor {
+                    session_id: "checkpoint-a".to_string(),
+                    state_kind: "metadata".to_string(),
+                    label: "qwen35.prefix_metadata".to_string(),
+                    logical_position: 16,
+                    resident_bytes: 32,
+                    placement: "host".to_string(),
+                    role: "resident".to_string(),
+                },
+            ],
+        };
+
+        let json = model_worker_runtime_view_json(&worker);
+        assert_eq!(json["state_arena_backend"], "qwen35_wrapped");
+        assert_eq!(json["state_page_descriptor_entries"], 2);
+        assert_eq!(json["state_page_descriptor_bytes"], 160);
+        assert_eq!(
+            json["state_page_descriptors"][0]["state_kind"],
+            "attention_kv"
+        );
+        assert_eq!(json["state_page_descriptors"][1]["placement"], "host");
+    }
+
+    #[test]
     fn rejects_missing_worker_identity() {
         let msg = serde_json::json!({
             "type": "generate_batch_prefill",
@@ -2366,6 +2409,27 @@ struct ModelWorkerRuntimeView {
     resident_workers: usize,
     state_arena_backend: SequenceStateArenaBackend,
     resident_sessions: usize,
+    state_page_descriptors: Vec<SequenceStatePageDescriptor>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SequenceStatePageDescriptor {
+    session_id: String,
+    state_kind: String,
+    label: String,
+    logical_position: usize,
+    resident_bytes: usize,
+    placement: String,
+    role: String,
+}
+
+#[derive(Clone, Copy)]
+struct SequenceStateCheckpointRequest<'a> {
+    source_session_id: &'a str,
+    dest_session_id: &'a str,
+    expected_logical_position: usize,
+    requested_prefix_hash: Option<&'a GenerateBatchPrefillPrefixHash>,
+    checkpoint_prefix_hash: Option<&'a GenerateBatchPrefillPrefixHash>,
 }
 
 struct Qwen35RequestSessionState {
@@ -2613,6 +2677,147 @@ fn qwen35_request_session_count(m: &LoadedModel) -> usize {
     saved + active
 }
 
+fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
+    let mut descriptors = Vec::new();
+    let placement = format!("hip:arch{}:device0", m.arch_id);
+    let mut push_session = |session_id: &str, session: &Qwen35RequestSessionState, role: &str| {
+        if session_id == QWEN35_LEGACY_SESSION_ID {
+            return;
+        }
+        let logical_position = session.seq_pos + session.kv_cache.compact_offset;
+        let kv_bytes = session
+            .kv_cache
+            .k_gpu
+            .iter()
+            .chain(session.kv_cache.v_gpu.iter())
+            .chain(session.kv_cache.k_scales.iter())
+            .chain(session.kv_cache.v_scales.iter())
+            .map(|tensor| tensor.buf.size())
+            .sum::<usize>();
+        descriptors.push(SequenceStatePageDescriptor {
+            session_id: session_id.to_string(),
+            state_kind: "attention_kv".to_string(),
+            label: "qwen35.kv_cache".to_string(),
+            logical_position,
+            resident_bytes: kv_bytes,
+            placement: placement.clone(),
+            role: role.to_string(),
+        });
+        let dn_bytes = session
+            .dn_state
+            .s_matrices
+            .iter()
+            .chain(session.dn_state.s_scales.iter())
+            .chain(session.dn_state.conv_states.iter())
+            .map(|tensor| tensor.buf.size())
+            .sum::<usize>();
+        descriptors.push(SequenceStatePageDescriptor {
+            session_id: session_id.to_string(),
+            state_kind: "deltanet_recurrent".to_string(),
+            label: "qwen35.deltanet_state".to_string(),
+            logical_position,
+            resident_bytes: dn_bytes,
+            placement: placement.clone(),
+            role: role.to_string(),
+        });
+        descriptors.push(SequenceStatePageDescriptor {
+            session_id: session_id.to_string(),
+            state_kind: "logits".to_string(),
+            label: "qwen35.logits_snapshot".to_string(),
+            logical_position,
+            resident_bytes: session.logits.buf.size(),
+            placement: placement.clone(),
+            role: role.to_string(),
+        });
+        descriptors.push(SequenceStatePageDescriptor {
+            session_id: session_id.to_string(),
+            state_kind: "metadata".to_string(),
+            label: "qwen35.prefix_metadata".to_string(),
+            logical_position,
+            resident_bytes: session
+                .prefix_hash
+                .as_ref()
+                .map(|hash| hash.value.len() + hash.algorithm.len() + std::mem::size_of::<usize>())
+                .unwrap_or(0),
+            placement: "host".to_string(),
+            role: role.to_string(),
+        });
+    };
+    for (session_id, session) in &m.q35_sessions {
+        push_session(session_id, session, "resident");
+    }
+    if let Some(active_id) = m.q35_active_session_id.as_deref() {
+        if active_id != QWEN35_LEGACY_SESSION_ID {
+            let compact_offset = m.kv_cache.as_ref().map(|kv| kv.compact_offset).unwrap_or(0);
+            let logical_position = m.seq_pos + compact_offset;
+            descriptors.push(SequenceStatePageDescriptor {
+                session_id: active_id.to_string(),
+                state_kind: "attention_kv".to_string(),
+                label: "qwen35.kv_cache.active".to_string(),
+                logical_position,
+                resident_bytes: m
+                    .kv_cache
+                    .as_ref()
+                    .map(|kv| {
+                        kv.k_gpu
+                            .iter()
+                            .chain(kv.v_gpu.iter())
+                            .chain(kv.k_scales.iter())
+                            .chain(kv.v_scales.iter())
+                            .map(|tensor| tensor.buf.size())
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0),
+                placement: placement.clone(),
+                role: "active".to_string(),
+            });
+            descriptors.push(SequenceStatePageDescriptor {
+                session_id: active_id.to_string(),
+                state_kind: "deltanet_recurrent".to_string(),
+                label: "qwen35.deltanet_state.active".to_string(),
+                logical_position,
+                resident_bytes: m
+                    .dn_state
+                    .as_ref()
+                    .map(|dn| {
+                        dn.s_matrices
+                            .iter()
+                            .chain(dn.s_scales.iter())
+                            .chain(dn.conv_states.iter())
+                            .map(|tensor| tensor.buf.size())
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0),
+                placement: placement.clone(),
+                role: "active".to_string(),
+            });
+            descriptors.push(SequenceStatePageDescriptor {
+                session_id: active_id.to_string(),
+                state_kind: "logits".to_string(),
+                label: "qwen35.logits_snapshot.active".to_string(),
+                logical_position,
+                resident_bytes: m
+                    .q35_scratch
+                    .as_ref()
+                    .map(|scratch| scratch.logits.buf.size())
+                    .unwrap_or(0),
+                placement,
+                role: "active".to_string(),
+            });
+            descriptors.push(SequenceStatePageDescriptor {
+                session_id: active_id.to_string(),
+                state_kind: "metadata".to_string(),
+                label: "qwen35.prefix_metadata.active".to_string(),
+                logical_position,
+                resident_bytes: 0,
+                placement: "host".to_string(),
+                role: "active".to_string(),
+            });
+        }
+    }
+    descriptors
+}
+
 fn loaded_model_worker_id(m: &LoadedModel) -> ModelWorkerId {
     ModelWorkerId {
         value: format!(
@@ -2635,13 +2840,48 @@ fn loaded_model_state_arena_backend(m: &LoadedModel) -> SequenceStateArenaBacken
 fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
     let state_arena_backend = loaded_model_state_arena_backend(m);
     let resident_sessions = state_arena_backend.resident_session_count(m);
+    let state_page_descriptors = state_arena_backend.state_page_descriptors(m);
     ModelWorkerRuntimeView {
         worker_id: loaded_model_worker_id(m),
         max_resident_workers: 1,
         resident_workers: 1,
         state_arena_backend,
         resident_sessions,
+        state_page_descriptors,
     }
+}
+
+fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_json::Value {
+    let descriptor_bytes = worker
+        .state_page_descriptors
+        .iter()
+        .map(|descriptor| descriptor.resident_bytes)
+        .sum::<usize>();
+    let descriptors: Vec<serde_json::Value> = worker
+        .state_page_descriptors
+        .iter()
+        .map(|descriptor| {
+            serde_json::json!({
+                "session_id": &descriptor.session_id,
+                "state_kind": &descriptor.state_kind,
+                "label": &descriptor.label,
+                "logical_position": descriptor.logical_position,
+                "resident_bytes": descriptor.resident_bytes,
+                "placement": &descriptor.placement,
+                "role": &descriptor.role,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "id": worker.worker_id.value,
+        "resident_workers": worker.resident_workers,
+        "max_resident_workers": worker.max_resident_workers,
+        "state_arena_backend": worker.state_arena_backend.as_str(),
+        "resident_sessions": worker.resident_sessions,
+        "state_page_descriptor_entries": worker.state_page_descriptors.len(),
+        "state_page_descriptor_bytes": descriptor_bytes,
+        "state_page_descriptors": descriptors,
+    })
 }
 
 fn qwen35_release_sessions(
@@ -2869,6 +3109,47 @@ fn qwen35_fork_session_state(
     Ok(())
 }
 
+fn qwen35_checkpoint_session_state(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    request: SequenceStateCheckpointRequest<'_>,
+) -> Result<(), String> {
+    if request.source_session_id == request.dest_session_id {
+        return Ok(());
+    }
+    qwen35_save_active_session(m, gpu)?;
+    {
+        let source = m
+            .q35_sessions
+            .get(request.source_session_id)
+            .ok_or_else(|| {
+                format!(
+                    "qwen35 checkpoint source session {} is not resident",
+                    request.source_session_id
+                )
+            })?;
+        let logical_position = source.seq_pos + source.kv_cache.compact_offset;
+        if logical_position != request.expected_logical_position {
+            return Err(format!(
+                "qwen35 checkpoint source session {} logical_position mismatch: expected={} resident={}",
+                request.source_session_id, request.expected_logical_position, logical_position
+            ));
+        }
+    }
+    if let Some(prefix_hash) = request.checkpoint_prefix_hash {
+        if let Some(source) = m.q35_sessions.get_mut(request.source_session_id) {
+            source.prefix_hash = Some(prefix_hash.clone());
+        }
+    }
+    qwen35_fork_session_state(
+        m,
+        gpu,
+        request.source_session_id,
+        request.dest_session_id,
+        request.requested_prefix_hash,
+    )
+}
+
 fn qwen35_validate_prefix_hash(
     m: &LoadedModel,
     source_session_id: &str,
@@ -2921,6 +3202,13 @@ impl SequenceStateArenaBackend {
         match self {
             Self::Qwen35Wrapped => qwen35_request_session_count(m),
             Self::Unsupported => 0,
+        }
+    }
+
+    fn state_page_descriptors(self, m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
+        match self {
+            Self::Qwen35Wrapped => qwen35_state_page_descriptors(m),
+            Self::Unsupported => Vec::new(),
         }
     }
 
@@ -2994,6 +3282,19 @@ impl SequenceStateArenaBackend {
                 dest_session_id,
                 requested_prefix_hash,
             ),
+            Self::Unsupported => unreachable!("unsupported arena rejected above"),
+        }
+    }
+
+    fn checkpoint_session_state(
+        self,
+        m: &mut LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        request: SequenceStateCheckpointRequest<'_>,
+    ) -> Result<(), String> {
+        self.ensure_supported(m, "checkpoint_session_state")?;
+        match self {
+            Self::Qwen35Wrapped => qwen35_checkpoint_session_state(m, gpu, request),
             Self::Unsupported => unreachable!("unsupported arena rejected above"),
         }
     }
@@ -3987,18 +4288,24 @@ fn qwen35_prefill_suffix_batch_serial_reference(
                     logical_position,
                     boundary.boundary_index,
                 );
-                qwen35_save_active_session(m, gpu)?;
-                if let Some(saved) = m.q35_sessions.get_mut(&session.id) {
-                    saved.prefix_hash = Some(boundary.hash.clone());
-                }
-                qwen35_fork_session_state(m, gpu, &session.id, &checkpoint_id, None).map_err(
-                    |e| {
+                loaded_model_state_arena_backend(m)
+                    .checkpoint_session_state(
+                        m,
+                        gpu,
+                        SequenceStateCheckpointRequest {
+                            source_session_id: &session.id,
+                            dest_session_id: &checkpoint_id,
+                            expected_logical_position: logical_position,
+                            requested_prefix_hash: None,
+                            checkpoint_prefix_hash: Some(&boundary.hash),
+                        },
+                    )
+                    .map_err(|e| {
                         format!(
                             "qwen35 session {} failed to create semantic boundary checkpoint {}: {}",
                             session.id, checkpoint_id, e
                         )
-                    },
-                )?;
+                    })?;
                 qwen35_activate_session(m, gpu, &session.id)?;
                 boundary.checkpoint_id = Some(checkpoint_id);
                 boundary_checkpoints.push(boundary);
@@ -4251,7 +4558,17 @@ fn run_generate_batch_prefill_serial_qwen35(
         let checkpoint_id =
             qwen35_checkpoint_session_id(&envelope.batch_id, &session.id, session.logical_position);
         arena_backend
-            .fork_session_state(m, gpu, &session.id, &checkpoint_id, None)
+            .checkpoint_session_state(
+                m,
+                gpu,
+                SequenceStateCheckpointRequest {
+                    source_session_id: &session.id,
+                    dest_session_id: &checkpoint_id,
+                    expected_logical_position: session.logical_position,
+                    requested_prefix_hash: None,
+                    checkpoint_prefix_hash: Some(&session.prefix_hash),
+                },
+            )
             .map_err(|e| {
                 format!(
                     "generate_batch_prefill session {} failed to create checkpoint {}: {}",
@@ -4310,6 +4627,7 @@ fn run_generate_batch_prefill_serial_qwen35(
     }
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let worker = loaded_model_worker_runtime_view(m);
     let done = serde_json::json!({
         "type": "generate_batch_prefill_done",
         "id": envelope.id,
@@ -4321,6 +4639,7 @@ fn run_generate_batch_prefill_serial_qwen35(
         "plan": result.plan.as_str(),
         "backend": result.backend.as_str(),
         "resident_sessions": arena_backend.resident_session_count(m),
+        "model_worker": model_worker_runtime_view_json(&worker),
     });
     let _ = writeln!(stdout, "{done}");
     let _ = stdout.flush();
@@ -5644,13 +5963,7 @@ fn main() {
                             "requested": sessions.len(),
                             "released": released,
                             "resident_sessions": arena_backend.resident_session_count(m),
-                            "model_worker": {
-                                "id": worker.worker_id.value,
-                                "resident_workers": worker.resident_workers,
-                                "max_resident_workers": worker.max_resident_workers,
-                                "state_arena_backend": worker.state_arena_backend.as_str(),
-                                "resident_sessions": worker.resident_sessions,
-                            },
+                            "model_worker": model_worker_runtime_view_json(&worker),
                         });
                         let _ = writeln!(stdout, "{done}");
                         let _ = stdout.flush();
