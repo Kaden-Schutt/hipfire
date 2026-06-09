@@ -243,6 +243,13 @@ works, what to measure, what counts as pass/fail.
    no-GPU Rust units, CPU Python tests, env/docs drift, and Bun
    tests/typecheck when Bun is installed. It does not replace hardware
    coherence or speed gates.
+8. **Document bugs before moving on.** Whenever you encounter a bug,
+   odd error, obvious omission, bad code smell, or unexpected behavior
+   while working in this repo, add a lightweight note to `BUGS.md`
+   before continuing to unrelated work. A short description is enough;
+   alternatively record revision + file + line number with a one-line
+   explanation. `BUGS.md` is a reminder list for later investigation,
+   not a full root-cause report.
 
 ---
 
