@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 use std::path::Path;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::f16_to_f32;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Copyright (c) 2026 Kaden Schutt, Kevin Read
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
 //! Gemma-4 logit oracle.
 //!
 //! Runs `gemma4::forward_scratch` over a token-id list — the daemon's exact

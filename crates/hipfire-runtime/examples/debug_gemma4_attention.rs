@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026 Kaden Schutt, Kevin Read
+// Copyright (c) 2026 Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
 
 use std::path::Path;
