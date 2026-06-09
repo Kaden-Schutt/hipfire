@@ -2382,3 +2382,35 @@ Migrated Gemma 4's decode forward from `execute_steps` per-token resolution to t
 ### Escape hatch
 
 `HIPFIRE_FORWARD_LOWERED=0` forces the legacy hand path. Remove after one release cycle.
+
+## Session 25b — Phase 5 validation
+
+**Date:** 2026-06-09  
+**Commits:** `08f6519c` (coherence gate rows + hard-fail checks)
+
+### Coherence gate results
+
+All 4 gemma4 tests pass:
+- 12B cap: "The capital of France is Paris." ✅
+- 12B reason: correct reasoning, "Final Number: 9" ✅
+- 26B-A4B cap: "The capital of France is Paris." ✅
+- 26B-A4B reason: correct reasoning, "Final Number: 9" ✅
+
+All qwen3.5 tests pass (no regression).
+
+### Byte-parity validation
+
+All 4 test cases produce identical token ID sequences between legacy and lowered paths:
+- 12B cap: PASS
+- 12B reasoning: PASS
+- 26B-A4B cap: PASS
+- 26B-A4B reasoning: PASS
+
+### Perf parity
+
+| Model | Legacy (tok/s) | Lowered (tok/s) |
+|-------|----------------|------------------|
+| 12B dense | 7.8 | 7.8 |
+| 26B-A4B MoE | 8.4 | 8.4 |
+
+Zero overhead from the lowered super-op dispatch.
