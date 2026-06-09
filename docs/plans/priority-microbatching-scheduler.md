@@ -7,9 +7,12 @@ priority `0` is realtime and priority `255` is opportunistic. This scheduler is
 the execution policy layer for the broader multi-model/session-state serving
 plan in `docs/plans/multi-model-session-state-serving.md`.
 
-The first implementation target is text-only AR prefill microbatching. Decode
-batching, MTP/DFlash verify batching, and state-cache eviction to disk are
-planned as follow-up phases once per-session state isolation is in place.
+The first implementation target was text-only AR prefill microbatching. The
+current follow-up slice adds a Qwen35-only decode active set and daemon
+`generate_batch_decode_step` protocol for non-streaming greedy no-think
+requests. That path currently uses a serial reference backend; fused decode,
+MTP/DFlash verify batching, and state-cache eviction to disk remain follow-up
+phases.
 
 External `/v1/chat/completions` remains OpenAI-compatible. Priority is optional
 Hipfire metadata/config and defaults to interactive user traffic.
@@ -24,7 +27,8 @@ Hipfire metadata/config and defaults to interactive user traffic.
 | 4. Server-side prefill batching integration (same-worker/session compatibility, no cross-model batching) | DONE FOR QWEN35 | `cli/server_prefill_batch.ts`, `cli/server_prefill_batch.test.ts`, `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-generate-batch-prefill.sh`, `scripts/smoke-server-prefill-batch.sh` | Policy parsing, eligibility gate, scheduler selection, session adapter, daemon `generate_batch_prefill` dispatch, Qwen35 resident state handles, session release, dense fused prefill, grouped-MoE fused prefill, and non-streaming text-only `/v1/responses` normalization are implemented. Remaining work is generic worker residency beyond Qwen35. |
 | 5. Prefix/state cache metadata + safety telemetry | DONE FOR QWEN35 V1 | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts`, `/health.prefill_batch`, `/health.state_cache`, `scripts/smoke-server-prefix-checkpoint-reuse.sh`, `scripts/smoke-server-prefix-hash-preflight.sh`, `scripts/smoke-server-prefix-boundary-reuse.sh` | Fingerprint, manifest keying, compatibility, `prompt_cache_key` namespace support, spill guardrails, metadata/runtime-hit telemetry, Qwen35 resident attach/fork, daemon-authoritative `xxh128` checkpoint identity, daemon prefix-hash preflight, lifecycle invalidation, capped in-memory checkpoint residency, serial semantic-boundary checkpoint reuse, and arena-hooked fused final checkpoints are wired. Interior fused-backend boundary snapshots still need backend-native capture points. |
 | 6. Scheduler starvation/backpressure hardening | DONE | `cli/worker_scheduler.ts`, `cli/worker_scheduler.test.ts` | Optional queue cap and deadline-aging selection prevent unbounded queue growth and strict-priority starvation. |
-| Blocker | PARTIAL | `crates/hipfire-runtime/examples/daemon.rs` implements Qwen35 fused prefill plus state-handle lifecycle and release protocol; top-level attach/fork/activate/reset/release/count and fused final-checkpoint creation route through the backend-neutral arena wrapper around the Qwen35 session map. `/health.runtime_workers` exposes descriptor counts/bytes for the wrapped Qwen35 KV/DeltaNet/logits state. | Generic multi-model residency, decode batching, backend-neutral state-page allocation, and non-Qwen35 worker-owned session arenas remain future work. |
+| 7. Decode active set and serial reference step backend | IN PROGRESS FOR QWEN35 V1 | `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-server-decode-batch.sh` | Non-streaming text-only greedy Qwen35 requests that already passed server prefill can batch one-token decode steps through `generate_batch_decode_step`. The daemon backend is serial reference; fused dense/grouped-MoE decode kernels, sampling, streaming, and non-Qwen35 support remain future work. |
+| Blocker | PARTIAL | `crates/hipfire-runtime/examples/daemon.rs` implements Qwen35 fused prefill plus state-handle lifecycle and release protocol; top-level attach/fork/activate/reset/release/count and fused final-checkpoint creation route through the backend-neutral arena wrapper around the Qwen35 session map. `/health.runtime_workers` exposes descriptor counts/bytes for the wrapped Qwen35 KV/DeltaNet/logits state. | Generic multi-model residency, fused decode batching, backend-neutral state-page allocation, and non-Qwen35 worker-owned session arenas remain future work. |
 
 ### SKIPPED Slice Notes
 
@@ -38,8 +42,11 @@ Hipfire metadata/config and defaults to interactive user traffic.
 The active implementation slice covers compatible same-worker text-only AR
 prefill batches, plus the scheduler and telemetry scaffolding needed to share
 that path with future OpenAI-style batch jobs. It does not claim decode
-batching, MTP/DFlash verify batching, multi-resident model serving, generic
-cross-architecture session arenas, or disk state-cache spill/reload.
+fused decode batching, MTP/DFlash verify batching, multi-resident model
+serving, generic cross-architecture session arenas, or disk state-cache
+spill/reload. The decode batching slice currently claims only Qwen35
+non-streaming greedy no-think requests through a serial reference daemon step
+backend.
 
 Completion evidence for this plan should stay tied to observable request
 lifecycle behavior:
@@ -262,9 +269,27 @@ Batch construction:
 - never concatenate sessions into one logical sequence,
 - pass per-session state handles to worker prefill APIs.
 
-## Decode Batching Outline
+## Decode Batching V1
 
-Decode batching is later than prefill batching.
+Decode batching now has a conservative V1 control plane:
+
+- a worker-local active decode scheduler,
+- `/health.decode_batch` counters,
+- daemon validation for `generate_batch_decode_step`,
+- Qwen35/Qwen35-MoE serial reference stepping for already-prefilled sessions,
+- release-path preservation for resident decode handles.
+
+Eligible V1 sessions:
+
+- Qwen35 or Qwen35-MoE,
+- non-streaming `/v1/chat/completions`,
+- text-only,
+- greedy sampling (`temperature=0`, `top_p=1`),
+- no tools,
+- no images,
+- no DFlash/MTP/PFlash/CASK/eviction,
+- no-think assistant prefix,
+- already owns a runtime session handle from server prefill.
 
 Decode scheduler requirements:
 
@@ -273,6 +298,11 @@ Decode scheduler requirements:
 - per-session stop/filter/tool state,
 - stream-safe output routing,
 - cancellation-safe state release.
+
+The current daemon backend is intentionally named `serial_reference`. It proves
+protocol, scheduler, session ownership, stop handling, response assembly, and
+cleanup before adding fused one-token kernels. Requests for
+`HIPFIRE_QWEN35_DECODE_BATCH=fused` are rejected until that backend exists.
 
 Priority policy is stricter for decode than prefill:
 
@@ -375,9 +405,12 @@ wait for disk restore to improve reuse.
 
 ### Slice 6 - Decode Batching
 
-- Add decode active set and one-token microbatching.
-- Preserve per-session sampler and stream state.
-- Gate by correctness tests and latency measurements.
+- Add decode active set and one-token microbatching. DONE FOR QWEN35 SERIAL V1.
+- Preserve per-session runtime state handles and release semantics. DONE FOR
+  QWEN35 SERIAL V1.
+- Add fused dense/grouped-MoE one-token decode kernels. NEXT.
+- Add per-session sampler and stream state. DEFERRED.
+- Gate fused backend by correctness tests and latency measurements. NEXT.
 
 ### Slice 7 - Verify Batching
 
@@ -409,6 +442,9 @@ GPU tests after session-state refactor:
 - 2/4/8 compatible prefill requests batch and complete independently,
 - first-token logits or greedy first token matches serialized path,
 - Qwen35 A3B MQ4 grouped MoE path remains active on supported RDNA,
+- two compatible no-think greedy decode requests enter
+  `generate_batch_decode_step`, report decode-batch telemetry, and release all
+  resident decode sessions,
 - mixed-priority batches preserve realtime latency.
 
 State-cache tests:

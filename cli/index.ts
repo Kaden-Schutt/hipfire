@@ -21,7 +21,11 @@ import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
 import { createHash, randomUUID } from "crypto";
 import { runEvalCommand } from "./eval";
-import { PriorityPrefillScheduler } from "./worker_scheduler";
+import {
+  PriorityDecodeScheduler,
+  PriorityPrefillScheduler,
+  type ActiveDecodeSession,
+} from "./worker_scheduler";
 import {
   parseServerPrefillBatchPolicy,
   serverPrefillBatchEligibility,
@@ -1797,6 +1801,20 @@ function inferStateKindsForServeArch(arch: string | null): readonly SessionState
   return kinds;
 }
 
+function isQwen35RuntimeArch(arch: string | null): boolean {
+  const normalized = (arch ?? "").toLowerCase();
+  return normalized === "qwen35"
+    || normalized === "qwen35_moe"
+    || normalized === "qwen35_vl"
+    || normalized === "qwen3_5"
+    || normalized === "qwen3_5_moe"
+    || normalized === "qwen3_5_vl"
+    || normalized === "qwen3.5"
+    || normalized === "qwen3.5_moe"
+    || normalized === "qwen3.5_vl"
+    || normalized.startsWith("qwen35_");
+}
+
 async function serve(port: number, host: string) {
   applyConfigEnv(cfg);
   // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
@@ -1889,6 +1907,7 @@ async function serve(port: number, host: string) {
     }
   };
   const workerPrefillSchedulers = new Map<string, PriorityPrefillScheduler>();
+  const workerDecodeSchedulers = new Map<string, PriorityDecodeScheduler>();
   const workerStateCaches = new Map<string, Map<string, PrefixCheckpointManifest>>();
   type ResidentPrefixCheckpointOutcome = {
     checkpointStateHandle: string;
@@ -1920,7 +1939,25 @@ async function serve(port: number, host: string) {
     reject: (err: Error) => void;
     promise: Promise<PendingPrefillOutcome>;
   };
+  type PendingDecodeOutcome = {
+    content: string;
+    completionTokens: number;
+    promptTokens: number;
+    cachedTokens: number;
+    finishReason: "stop" | "length";
+    runtimeStateHandle: string;
+  };
+  type PendingDecodeRequest = {
+    active: ActiveDecodeSession;
+    promptTokens: number;
+    cachedTokens: number;
+    selected: boolean;
+    resolve: (outcome: PendingDecodeOutcome) => void;
+    reject: (err: Error) => void;
+    promise: Promise<PendingDecodeOutcome>;
+  };
   const pendingPrefillRequests = new Map<string, PendingPrefillRequest>();
+  const pendingDecodeRequests = new Map<string, PendingDecodeRequest>();
   const residentDecodeSessions = new Set<string>();
   const residentCheckpointHandles = new Set<string>();
   let debugCorruptNextPrefixHash = process.env.HIPFIRE_DEBUG_CORRUPT_PREFIX_HASH_ONCE === "1";
@@ -1933,6 +1970,15 @@ async function serve(port: number, host: string) {
     if (existing) return existing;
     const created = new PriorityPrefillScheduler();
     workerPrefillSchedulers.set(key, created);
+    return created;
+  };
+  const getWorkerDecodeScheduler = (workerKey: ModelWorkerKey | null): PriorityDecodeScheduler | undefined => {
+    if (!workerKey) return undefined;
+    const key = getWorkerId(workerKey);
+    const existing = workerDecodeSchedulers.get(key);
+    if (existing) return existing;
+    const created = new PriorityDecodeScheduler();
+    workerDecodeSchedulers.set(key, created);
     return created;
   };
   const getWorkerStateCache = (workerKey: ModelWorkerKey | null): Map<string, PrefixCheckpointManifest> => {
@@ -1965,6 +2011,8 @@ async function serve(port: number, host: string) {
     const entries = allStateCacheMaps().reduce((sum, cache) => sum + cache.size, 0);
     fallbackStateCacheStore.clear();
     workerStateCaches.clear();
+    pendingDecodeRequests.clear();
+    workerDecodeSchedulers.clear();
     residentDecodeSessions.clear();
     residentCheckpointHandles.clear();
     if (entries > 0) {
@@ -2043,6 +2091,19 @@ async function serve(port: number, host: string) {
     fusedBatches: 0,
     fallbackBatches: 0,
     batchSizeHistogram: {} as Record<string, number>,
+  };
+  const decodeBatchMetrics = {
+    eligible: 0,
+    selected: 0,
+    skipped: 0,
+    totalBatches: 0,
+    serialBatches: 0,
+    fusedBatches: 0,
+    activeSessions: 0,
+    selectedBatchSize: 0,
+    lastBackend: undefined as string | undefined,
+    lastDecodeMs: 0,
+    lastSkippedReason: "not_applicable",
   };
   const batchFileStore = new Map<string, BatchFileRecord>();
   const batchControlStore = new Map<string, BatchJobRecord>();
@@ -2633,6 +2694,22 @@ async function serve(port: number, host: string) {
                   daemonPrefillBackend: lastPrefillDaemonBackend,
                 })
               : { enabled: false },
+            decode_batch: serverPrefillBatch.enabled
+              ? {
+                  enabled: true,
+                  eligible: decodeBatchMetrics.eligible,
+                  selected: decodeBatchMetrics.selected,
+                  skipped: decodeBatchMetrics.skipped,
+                  active_sessions: decodeBatchMetrics.activeSessions,
+                  selected_batch_size: decodeBatchMetrics.selectedBatchSize,
+                  total_batches: decodeBatchMetrics.totalBatches,
+                  serial_batches: decodeBatchMetrics.serialBatches,
+                  fused_batches: decodeBatchMetrics.fusedBatches,
+                  last_backend: decodeBatchMetrics.lastBackend,
+                  last_decode_ms: decodeBatchMetrics.lastDecodeMs,
+                  last_skipped_reason: decodeBatchMetrics.lastSkippedReason,
+                }
+              : { enabled: false },
             state_cache: serverPrefillBatch.enabled
               ? {
                   enabled: serverPrefillBatchControls.residentStateCache || serverPrefillBatchControls.stateCacheDisk,
@@ -2660,7 +2737,7 @@ async function serve(port: number, host: string) {
               resident_workers: current ? 1 : 0,
               max_resident_workers: 1,
               current_worker_key_id: null,
-              state_arena_backend: currentArch === "qwen35" || currentArch === "qwen35_moe"
+              state_arena_backend: isQwen35RuntimeArch(currentArch)
                 ? "qwen35_wrapped"
                 : current
                   ? "unsupported"
@@ -5065,7 +5142,8 @@ async function serve(port: number, host: string) {
         let promptTokens = 0;
         let cachedTokens = 0;
         let daemonError: string | null = null;
-        e.generating = true;
+        let daemonFinishReason: string | null = null;
+        let decodedByBatch = false;
         // V4F arm emits structured `tool_calls` events from the DSML
         // StreamParser. Capture them here so the non-streaming chat-
         // completion response can carry an OpenAI-format `tool_calls`
@@ -5079,56 +5157,258 @@ async function serve(port: number, host: string) {
         // Use `reasoningContent` for the accumulated `<think>…</think>`
         // body that surfaces under `message.reasoning_content` below.
         let reasoningContent = "";
-        let daemonFinishReason: string | null = null;
-        for await (const msg of e.generate(genParams)) {
-          if (msg.type === "token") { content += msg.text; completionTokens++; }
-          else if (msg.type === "reasoning") {
-            // V4F's StreamParser splits `<think>…</think>` content out
-            // as `reasoning` events. Accumulate so the non-stream chat
-            // completion response can surface it under
-            // `message.reasoning_content` — without this the reasoning
-            // text was silently dropped on every think-mode V4F turn.
-            if (typeof msg.text === "string") reasoningContent += msg.text;
+        let decodeBatchIneligibleReason = "not_eligible";
+        const decodeBatchEligible = (() => {
+          if (!serverPrefillBatch.enabled) {
+            decodeBatchIneligibleReason = "prefill_batch_disabled";
+            return false;
           }
-          else if (msg.type === "done") {
-            // `prompt_tokens` is the full client-visible prompt size
-            // (V4F emits it). `prefill_tokens` (legacy) is what
-            // actually went through forward — equal to prompt when
-            // cached_tokens is 0. Fall back to prefill_tokens so the
-            // non-V4F paths keep their existing accounting.
-            promptTokens = typeof msg.prompt_tokens === "number"
-              ? msg.prompt_tokens
-              : (msg.prefill_tokens ?? 0);
-            cachedTokens = typeof msg.cached_tokens === "number"
-              ? msg.cached_tokens
-              : 0;
-            // V4F daemon emits an authoritative finish_reason. Only
-            // accept the three OpenAI-valid values; anything else falls
-            // back to the legacy inference below.
-            if (msg.finish_reason === "stop" || msg.finish_reason === "length" || msg.finish_reason === "tool_calls") {
-              daemonFinishReason = msg.finish_reason;
+          if (body.stream === true) {
+            decodeBatchIneligibleReason = "streaming";
+            return false;
+          }
+          if (tools.length > 0) {
+            decodeBatchIneligibleReason = "tools";
+            return false;
+          }
+          if (requestImages.length > 0) {
+            decodeBatchIneligibleReason = "images";
+            return false;
+          }
+          if (!isQwen35RuntimeArch(currentArch)) {
+            decodeBatchIneligibleReason = `unsupported_arch:${currentArch ?? "unknown"}`;
+            return false;
+          }
+          if (genParams.prefill_already_done !== true) {
+            decodeBatchIneligibleReason = "prefill_not_done";
+            return false;
+          }
+          if (typeof releaseRuntimeSessionId !== "string") {
+            decodeBatchIneligibleReason = "missing_runtime_state_handle";
+            return false;
+          }
+          if (genParams.assistant_prefix !== "closed_think") {
+            decodeBatchIneligibleReason = `assistant_prefix:${genParams.assistant_prefix ?? "none"}`;
+            return false;
+          }
+          if ((genParams.temperature ?? 0) > 1e-6) {
+            decodeBatchIneligibleReason = "non_greedy_temperature";
+            return false;
+          }
+          if ((body.top_p ?? effective.top_p) !== 1) {
+            decodeBatchIneligibleReason = "non_greedy_top_p";
+            return false;
+          }
+          decodeBatchIneligibleReason = "eligible";
+          return true;
+        })();
+        if (decodeBatchEligible && servingWorkerKey && releaseRuntimeSessionId) {
+          decodeBatchMetrics.eligible += 1;
+          const decodeScheduler = getWorkerDecodeScheduler(servingWorkerKey);
+          const workerKeyId = modelWorkerKeyId(servingWorkerKey);
+          const active: ActiveDecodeSession = {
+            id: reqId,
+            workerKeyId,
+            priority: requestPriority,
+            runtimeStateHandle: releaseRuntimeSessionId,
+            logicalPosition: Number(genParams.prefilled_prompt_tokens ?? prefillPromptTokens.length),
+            generatedTokens: 0,
+            maxTokens: requestMaxTokens,
+          };
+          let resolveDecode!: (outcome: PendingDecodeOutcome) => void;
+          let rejectDecode!: (err: Error) => void;
+          const decodePromise = new Promise<PendingDecodeOutcome>((resolve, reject) => {
+            resolveDecode = resolve;
+            rejectDecode = reject;
+          });
+          pendingDecodeRequests.set(reqId, {
+            active,
+            promptTokens: prefillPromptTokens.length,
+            cachedTokens: cachePrefixLen,
+            selected: false,
+            resolve: resolveDecode,
+            reject: rejectDecode,
+            promise: decodePromise,
+          });
+          decodeScheduler?.enqueue(active);
+          decodeBatchMetrics.activeSessions = pendingDecodeRequests.size;
+          safeRelease();
+          await new Promise((resolve) => setTimeout(resolve, Math.min(25, serverPrefillBatch.waitMs)));
+          await acquireLock();
+          lockReleased = false;
+          let decodeOutcome: PendingDecodeOutcome | null = null;
+          const pendingSelf = pendingDecodeRequests.get(reqId);
+          if (pendingSelf && !pendingSelf.selected && decodeScheduler) {
+            const selected = decodeScheduler.nextDecodeBatch({ nowMs: Date.now() });
+            if (selected && selected.sessions.some((session) => session.id === reqId)) {
+              decodeBatchMetrics.selected += 1;
+              decodeBatchMetrics.selectedBatchSize = selected.sessions.length;
+              for (const selectedSession of selected.sessions) {
+                const pending = pendingDecodeRequests.get(selectedSession.id);
+                if (pending) pending.selected = true;
+              }
+              const states = new Map(selected.sessions.map((session) => [
+                session.id,
+                {
+                  ...session,
+                  content: "",
+                  done: false,
+                  finishReason: "length" as "stop" | "length",
+                },
+              ]));
+              try {
+                while ([...states.values()].some((state) => !state.done && state.generatedTokens < state.maxTokens)) {
+                  const activeSessions = [...states.values()].filter((state) => !state.done && state.generatedTokens < state.maxTokens);
+                  const batchId = `decode-${reqId}-${decodeBatchMetrics.totalBatches + 1}`;
+                  await e.send({
+                    type: "generate_batch_decode_step",
+                    id: `${batchId}-step`,
+                    batch_id: batchId,
+                    worker_key_id: workerKeyId,
+                    sessions: activeSessions.map((state) => ({
+                      id: state.id,
+                      session_id: state.runtimeStateHandle,
+                      logical_position: state.logicalPosition,
+                      max_tokens_remaining: state.maxTokens - state.generatedTokens,
+                    })),
+                  });
+                  const stepById = new Map<string, any>();
+                  let backend: string | undefined;
+                  let elapsedMs = 0;
+                  for (let i = 0; i < activeSessions.length + 4; i++) {
+                    const decodeMsg = await e.recv();
+                    if (decodeMsg?.type === "generate_batch_decode_step_session_done") {
+                      stepById.set(decodeMsg.session_id, decodeMsg);
+                    } else if (decodeMsg?.type === "generate_batch_decode_step_done" && decodeMsg.batch_id === batchId) {
+                      backend = typeof decodeMsg.backend === "string" ? decodeMsg.backend : backend;
+                      elapsedMs = typeof decodeMsg.elapsed_ms === "number" ? decodeMsg.elapsed_ms : 0;
+                      updateRuntimeWorkerStatePageDescriptors((decodeMsg as any).model_worker);
+                      break;
+                    } else if (decodeMsg?.type === "error") {
+                      throw new Error(decodeMsg.message || "decode batch failed");
+                    }
+                  }
+                  decodeBatchMetrics.totalBatches += 1;
+                  if (backend === "serial_reference") decodeBatchMetrics.serialBatches += 1;
+                  if (backend && backend !== "serial_reference") decodeBatchMetrics.fusedBatches += 1;
+                  decodeBatchMetrics.lastBackend = backend;
+                  decodeBatchMetrics.lastDecodeMs = elapsedMs;
+                  for (const state of activeSessions) {
+                    const step = stepById.get(state.id);
+                    if (!step) throw new Error(`decode batch missing step result for ${state.id}`);
+                    state.generatedTokens += 1;
+                    state.logicalPosition = Number.isFinite(step.logical_position) ? step.logical_position : state.logicalPosition + 1;
+                    if (typeof step.text === "string") state.content += step.text;
+                    if (step.stop === true) {
+                      state.done = true;
+                      state.finishReason = state.generatedTokens >= state.maxTokens ? "length" : "stop";
+                    }
+                  }
+                }
+                for (const state of states.values()) {
+                  const pending = pendingDecodeRequests.get(state.id);
+                  if (!pending) continue;
+                  pendingDecodeRequests.delete(state.id);
+                  pending.resolve({
+                    content: state.content,
+                    completionTokens: state.generatedTokens,
+                    promptTokens: pending.promptTokens,
+                    cachedTokens: pending.cachedTokens,
+                    finishReason: state.finishReason,
+                    runtimeStateHandle: state.runtimeStateHandle,
+                  });
+                }
+              } catch (err: any) {
+                const decodeError = err instanceof Error ? err : new Error(err?.message ?? String(err));
+                decodeBatchMetrics.lastSkippedReason = "decode_batch_failed";
+                for (const state of states.values()) {
+                  const pending = pendingDecodeRequests.get(state.id);
+                  if (!pending) continue;
+                  pendingDecodeRequests.delete(state.id);
+                  pending.reject(decodeError);
+                }
+              }
+              decodeBatchMetrics.activeSessions = pendingDecodeRequests.size;
             }
           }
-          else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
-          else if (msg.type === "tool_calls") {
-            const calls = Array.isArray((msg as any).calls) ? (msg as any).calls : [];
-            if (calls.length > 0) {
-              if (structuredToolCalls === null) structuredToolCalls = [];
-              for (let i = 0; i < calls.length; i++) {
-                const c = calls[i] as { name: string; arguments: unknown };
-                const argStr = typeof c.arguments === "string"
-                  ? c.arguments
-                  : JSON.stringify(c.arguments);
-                structuredToolCalls.push({
-                  id: `call_${reqId}_${structuredToolCalls.length}`,
-                  type: "function",
-                  function: { name: c.name, arguments: argStr }
-                });
+          try {
+            decodeOutcome = await Promise.race([
+              decodePromise,
+              new Promise<null>((resolve) => setTimeout(() => resolve(null), serverPrefillBatch.maxProcessingMs)),
+            ]);
+          } catch (err: any) {
+            daemonError = err?.message ?? String(err);
+          }
+          if (decodeOutcome) {
+            content = decodeOutcome.content;
+            completionTokens = decodeOutcome.completionTokens;
+            promptTokens = decodeOutcome.promptTokens;
+            cachedTokens = decodeOutcome.cachedTokens;
+            daemonFinishReason = decodeOutcome.finishReason;
+            decodedByBatch = true;
+          } else if (!daemonError) {
+            decodeBatchMetrics.skipped += 1;
+            decodeBatchMetrics.lastSkippedReason = "decode_batch_timeout";
+            pendingDecodeRequests.delete(reqId);
+            decodeScheduler?.cancel(reqId);
+          }
+          decodeBatchMetrics.activeSessions = pendingDecodeRequests.size;
+        } else if (serverPrefillBatch.enabled) {
+          decodeBatchMetrics.skipped += 1;
+          decodeBatchMetrics.lastSkippedReason = decodeBatchEligible ? "missing_scheduler" : decodeBatchIneligibleReason;
+        }
+        if (!decodedByBatch) {
+          e.generating = true;
+          for await (const msg of e.generate(genParams)) {
+            if (msg.type === "token") { content += msg.text; completionTokens++; }
+            else if (msg.type === "reasoning") {
+              // V4F's StreamParser splits `<think>…</think>` content out
+              // as `reasoning` events. Accumulate so the non-stream chat
+              // completion response can surface it under
+              // `message.reasoning_content` — without this the reasoning
+              // text was silently dropped on every think-mode V4F turn.
+              if (typeof msg.text === "string") reasoningContent += msg.text;
+            }
+            else if (msg.type === "done") {
+              // `prompt_tokens` is the full client-visible prompt size
+              // (V4F emits it). `prefill_tokens` (legacy) is what
+              // actually went through forward — equal to prompt when
+              // cached_tokens is 0. Fall back to prefill_tokens so the
+              // non-V4F paths keep their existing accounting.
+              promptTokens = typeof msg.prompt_tokens === "number"
+                ? msg.prompt_tokens
+                : (msg.prefill_tokens ?? 0);
+              cachedTokens = typeof msg.cached_tokens === "number"
+                ? msg.cached_tokens
+                : 0;
+              // V4F daemon emits an authoritative finish_reason. Only
+              // accept the three OpenAI-valid values; anything else falls
+              // back to the legacy inference below.
+              if (msg.finish_reason === "stop" || msg.finish_reason === "length" || msg.finish_reason === "tool_calls") {
+                daemonFinishReason = msg.finish_reason;
+              }
+            }
+            else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
+            else if (msg.type === "tool_calls") {
+              const calls = Array.isArray((msg as any).calls) ? (msg as any).calls : [];
+              if (calls.length > 0) {
+                if (structuredToolCalls === null) structuredToolCalls = [];
+                for (let i = 0; i < calls.length; i++) {
+                  const c = calls[i] as { name: string; arguments: unknown };
+                  const argStr = typeof c.arguments === "string"
+                    ? c.arguments
+                    : JSON.stringify(c.arguments);
+                  structuredToolCalls.push({
+                    id: `call_${reqId}_${structuredToolCalls.length}`,
+                    type: "function",
+                    function: { name: c.name, arguments: argStr }
+                  });
+                }
               }
             }
           }
+          e.generating = false;
         }
-        e.generating = false;
         if (releaseRuntimeSessionId) {
           try {
             await e.send({

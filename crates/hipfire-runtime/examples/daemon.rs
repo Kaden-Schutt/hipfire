@@ -772,6 +772,22 @@ struct GenerateBatchPrefillPrefixHash {
     prefix_len: usize,
 }
 
+#[derive(Clone, Debug)]
+struct GenerateBatchDecodeEnvelope {
+    id: String,
+    batch_id: String,
+    session_count: usize,
+    sessions: Vec<GenerateBatchDecodeSession>,
+}
+
+#[derive(Clone, Debug)]
+struct GenerateBatchDecodeSession {
+    id: String,
+    session_id: String,
+    max_tokens_remaining: usize,
+    logical_position: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GenerateBatchPrefillPlan {
     SerialExact,
@@ -1205,6 +1221,97 @@ fn validate_prefix_hash_preflight(
     })
 }
 
+fn validate_generate_batch_decode(
+    msg: &serde_json::Value,
+) -> Result<GenerateBatchDecodeEnvelope, String> {
+    let id = msg
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0")
+        .to_string();
+    let batch_id = msg
+        .get("batch_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "generate_batch_decode_step.batch_id must be a non-empty string".to_string()
+        })?
+        .to_string();
+    let has_worker = msg
+        .get("worker_key_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .is_some()
+        || msg
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .is_some();
+    if !has_worker {
+        return Err(
+            "generate_batch_decode_step requires worker_key_id or model identity".to_string(),
+        );
+    }
+    let sessions = msg
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "generate_batch_decode_step.sessions must be an array".to_string())?;
+    if sessions.is_empty() {
+        return Err("generate_batch_decode_step.sessions must not be empty".to_string());
+    }
+    let mut seen_ids = HashSet::new();
+    let mut parsed = Vec::with_capacity(sessions.len());
+    for (i, session) in sessions.iter().enumerate() {
+        let prefix = format!("generate_batch_decode_step.sessions[{i}]");
+        session
+            .as_object()
+            .ok_or_else(|| format!("{prefix} must be an object"))?;
+        let id = session
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("{prefix}.id must be a non-empty string"))?;
+        if !seen_ids.insert(id.to_string()) {
+            return Err(format!(
+                "generate_batch_decode_step duplicate session id {id}"
+            ));
+        }
+        let session_id = session
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("{prefix}.session_id must be a non-empty string"))?;
+        let max_tokens_remaining = session
+            .get("max_tokens_remaining")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                format!("{prefix}.max_tokens_remaining must be an integer greater than 0")
+            })? as usize;
+        if max_tokens_remaining == 0 {
+            return Err(format!(
+                "{prefix}.max_tokens_remaining must be greater than 0"
+            ));
+        }
+        let logical_position = session
+            .get("logical_position")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("{prefix}.logical_position must be an integer >= 0"))?
+            as usize;
+        parsed.push(GenerateBatchDecodeSession {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            max_tokens_remaining,
+            logical_position,
+        });
+    }
+    Ok(GenerateBatchDecodeEnvelope {
+        id,
+        batch_id,
+        session_count: sessions.len(),
+        sessions: parsed,
+    })
+}
+
 fn emit_generate_batch_prefill_ready(
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchPrefillEnvelope,
@@ -1412,6 +1519,70 @@ mod generate_batch_prefill_tests {
         assert_eq!(envelope.session.messages_history.as_ref().unwrap().len(), 2);
         assert_eq!(envelope.session.assistant_prefix, "open_think");
         assert_eq!(envelope.session.max_think_tokens, 16);
+    }
+
+    #[test]
+    fn validates_generate_batch_decode_step_envelope() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_decode_step",
+            "id": "decode-1",
+            "batch_id": "decode-batch-1",
+            "worker_key_id": "worker-a",
+            "sessions": [
+                {
+                    "id": "req-1",
+                    "session_id": "qwen35-checkpoint:batch:req-1:8",
+                    "logical_position": 8,
+                    "max_tokens_remaining": 4
+                },
+                {
+                    "id": "req-2",
+                    "session_id": "qwen35-checkpoint:batch:req-2:8",
+                    "logical_position": 8,
+                    "max_tokens_remaining": 3
+                }
+            ]
+        });
+
+        let envelope = validate_generate_batch_decode(&msg).expect("valid decode envelope");
+        assert_eq!(envelope.id, "decode-1");
+        assert_eq!(envelope.batch_id, "decode-batch-1");
+        assert_eq!(envelope.session_count, 2);
+        assert_eq!(
+            envelope.sessions[0].session_id,
+            "qwen35-checkpoint:batch:req-1:8"
+        );
+        assert_eq!(envelope.sessions[1].max_tokens_remaining, 3);
+    }
+
+    #[test]
+    fn rejects_invalid_generate_batch_decode_step_envelope() {
+        let missing_worker = serde_json::json!({
+            "type": "generate_batch_decode_step",
+            "batch_id": "decode-batch-1",
+            "sessions": [{
+                "id": "req-1",
+                "session_id": "runtime-1",
+                "logical_position": 8,
+                "max_tokens_remaining": 1
+            }]
+        });
+        let err = validate_generate_batch_decode(&missing_worker).unwrap_err();
+        assert!(err.contains("worker_key_id or model"));
+
+        let zero_remaining = serde_json::json!({
+            "type": "generate_batch_decode_step",
+            "batch_id": "decode-batch-1",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "session_id": "runtime-1",
+                "logical_position": 8,
+                "max_tokens_remaining": 0
+            }]
+        });
+        let err = validate_generate_batch_decode(&zero_remaining).unwrap_err();
+        assert!(err.contains("max_tokens_remaining"));
     }
 
     #[test]
@@ -4646,6 +4817,179 @@ fn run_generate_batch_prefill_serial_qwen35(
     Ok(())
 }
 
+fn run_generate_batch_decode_step_qwen35(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    envelope: &GenerateBatchDecodeEnvelope,
+) -> Result<(), String> {
+    if !(m.arch_id == 5 || m.arch_id == 6) || m.pp != 1 {
+        return Err(format!(
+            "generate_batch_decode_step currently supports single-GPU qwen35/qwen35-moe only (arch_id={} pp={})",
+            m.arch_id, m.pp
+        ));
+    }
+    if m.dflash.is_some() {
+        return Err(
+            "generate_batch_decode_step is not supported on DFlash-loaded models".to_string(),
+        );
+    }
+    if m.eviction.is_some() {
+        return Err(
+            "generate_batch_decode_step is not supported with active eviction state".to_string(),
+        );
+    }
+    let requested_backend =
+        std::env::var("HIPFIRE_QWEN35_DECODE_BATCH").unwrap_or_else(|_| "auto".to_string());
+    let backend = match requested_backend.as_str() {
+        "" | "auto" | "serial" | "serial_reference" => "serial_reference",
+        "off" => {
+            return Err(
+                "generate_batch_decode_step disabled by HIPFIRE_QWEN35_DECODE_BATCH=off"
+                    .to_string(),
+            )
+        }
+        "fused" | "fused_dense" | "fused_grouped_moe" => {
+            return Err(
+                "qwen35 fused decode batch backend is not implemented; use HIPFIRE_QWEN35_DECODE_BATCH=serial"
+                    .to_string(),
+            )
+        }
+        other => {
+            return Err(format!(
+                "unsupported HIPFIRE_QWEN35_DECODE_BATCH={other}; expected auto, serial, fused, or off"
+            ))
+        }
+    };
+    let im_end = {
+        let tokenizer = m
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| "generate_batch_decode_step requires a tokenizer".to_string())?;
+        tokenizer.encode("<|im_end|>")
+    };
+    let im_end_token = if im_end.len() == 1 {
+        Some(im_end[0])
+    } else {
+        None
+    };
+    let t0 = Instant::now();
+    let mut session_lines = Vec::with_capacity(envelope.sessions.len());
+    for session in &envelope.sessions {
+        qwen35_activate_session(m, gpu, &session.session_id)?;
+        let mut state = Qwen35RequestSessionState::take_from_loaded(m, gpu)?;
+        let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+        if logical_position != session.logical_position {
+            qwen35_restore_or_error(stdout, &session.id, m, gpu, state);
+            return Err(format!(
+                "decode session {} logical_position mismatch: expected={} resident={}",
+                session.session_id, session.logical_position, logical_position
+            ));
+        }
+        let token = {
+            let config = m
+                .q35_config
+                .as_ref()
+                .ok_or_else(|| "qwen35 config missing".to_string())?;
+            let scratch = m
+                .q35_scratch
+                .as_ref()
+                .ok_or_else(|| "qwen35 scratch missing".to_string())?;
+            gpu.argmax_f32(&scratch.logits, config.vocab_size)
+                .map_err(|e| format!("qwen35 decode argmax: {e:?}"))?
+        };
+        let stop = {
+            let tokenizer = m
+                .tokenizer
+                .as_ref()
+                .ok_or_else(|| "generate_batch_decode_step requires a tokenizer".to_string())?;
+            let config = m
+                .q35_config
+                .as_ref()
+                .ok_or_else(|| "qwen35 config missing".to_string())?;
+            token == config.eos_token
+                || im_end_token == Some(token)
+                || tokenizer.is_terminator(token)
+                || session.max_tokens_remaining <= 1
+        };
+        let text = {
+            let tokenizer = m
+                .tokenizer
+                .as_ref()
+                .ok_or_else(|| "generate_batch_decode_step requires a tokenizer".to_string())?;
+            let config = m
+                .q35_config
+                .as_ref()
+                .ok_or_else(|| "qwen35 config missing".to_string())?;
+            if token == config.eos_token
+                || im_end_token == Some(token)
+                || tokenizer.is_terminator(token)
+            {
+                String::new()
+            } else {
+                tokenizer.decode(&[token])
+            }
+        };
+        state.conversation_tokens.push(token);
+        {
+            let config = m
+                .q35_config
+                .as_ref()
+                .ok_or_else(|| "qwen35 config missing".to_string())?;
+            let weights = m
+                .q35_weights
+                .as_ref()
+                .ok_or_else(|| "qwen35 weights missing".to_string())?;
+            let scratch = m
+                .q35_scratch
+                .as_ref()
+                .ok_or_else(|| "qwen35 scratch missing".to_string())?;
+            qwen35::forward_scratch(
+                gpu,
+                weights,
+                config,
+                token,
+                state.seq_pos,
+                &mut state.kv_cache,
+                &mut state.dn_state,
+                scratch,
+            )
+            .map_err(|e| format!("qwen35 decode forward_scratch: {e:?}"))?;
+        }
+        state.seq_pos += 1;
+        let new_logical_position = state.seq_pos + state.kv_cache.compact_offset;
+        qwen35_restore_or_error(stdout, &session.id, m, gpu, state);
+        session_lines.push(serde_json::json!({
+            "type": "generate_batch_decode_step_session_done",
+            "id": envelope.id,
+            "batch_id": envelope.batch_id,
+            "session_id": session.id,
+            "runtime_state_handle": session.session_id,
+            "token": token,
+            "text": text,
+            "stop": stop,
+            "logical_position": new_logical_position,
+        }));
+    }
+    for line in session_lines {
+        let _ = writeln!(stdout, "{line}");
+    }
+    let worker = loaded_model_worker_runtime_view(m);
+    let done = serde_json::json!({
+        "type": "generate_batch_decode_step_done",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "sessions": envelope.session_count,
+        "backend": backend,
+        "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0,
+        "resident_sessions": loaded_model_state_arena_backend(m).resident_session_count(m),
+        "model_worker": model_worker_runtime_view_json(&worker),
+    });
+    let _ = writeln!(stdout, "{done}");
+    let _ = stdout.flush();
+    Ok(())
+}
+
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
 /// the panic shape we used to emit (which dumped a Rust backtrace and the
 /// raw HipError debug-format) but turns it into a concrete next-step list.
@@ -5908,6 +6252,27 @@ fn main() {
                         }
                     };
                     if let Err(e) = run_prefix_hash_preflight_qwen35(m, &mut stdout, &envelope) {
+                        emit_error_with_id(&mut stdout, &envelope.id, e);
+                    }
+                }
+                Err(e) => {
+                    let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    emit_error_with_id(&mut stdout, id, e);
+                }
+            },
+
+            "generate_batch_decode_step" => match validate_generate_batch_decode(&msg) {
+                Ok(envelope) => {
+                    let m = match model.as_mut() {
+                        Some(m) => m,
+                        None => {
+                            emit_error_with_id(&mut stdout, &envelope.id, "no model loaded");
+                            continue;
+                        }
+                    };
+                    if let Err(e) =
+                        run_generate_batch_decode_step_qwen35(m, &mut gpu, &mut stdout, &envelope)
+                    {
                         emit_error_with_id(&mut stdout, &envelope.id, e);
                     }
                 }

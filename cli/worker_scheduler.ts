@@ -26,6 +26,21 @@ export interface PrefillBatchSelection {
   maxPromptTokens: number;
 }
 
+export interface ActiveDecodeSession {
+  id: string;
+  workerKeyId: string;
+  priority: number;
+  runtimeStateHandle: string;
+  logicalPosition: number;
+  generatedTokens: number;
+  maxTokens: number;
+}
+
+export interface DecodeBatchSelection {
+  sessions: ActiveDecodeSession[];
+  policy: SchedulerPriorityPolicy;
+}
+
 export class PriorityPrefillScheduler {
   private readonly buckets: QueuedPrefillRequest[][] = Array.from(
     { length: 256 },
@@ -242,6 +257,73 @@ export class PriorityPrefillScheduler {
   }
 
   private removeSelected(sessions: readonly RequestSessionDraft[]): void {
+    for (const session of sessions) {
+      this.cancel(session.id);
+    }
+  }
+}
+
+export class PriorityDecodeScheduler {
+  private readonly buckets: ActiveDecodeSession[][] = Array.from(
+    { length: 256 },
+    () => [],
+  );
+  private readonly activeIds = new Set<string>();
+  private activeCount = 0;
+
+  constructor(private readonly env: SchedulerPolicyEnv = process.env) {}
+
+  get size(): number {
+    return this.activeCount;
+  }
+
+  has(id: string): boolean {
+    return this.activeIds.has(id);
+  }
+
+  enqueue(session: ActiveDecodeSession): void {
+    if (this.activeIds.has(session.id)) {
+      throw new Error(`decode session is already active: ${session.id}`);
+    }
+    this.buckets[session.priority].push(session);
+    this.activeIds.add(session.id);
+    this.activeCount += 1;
+  }
+
+  cancel(id: string): boolean {
+    if (!this.activeIds.has(id)) return false;
+    for (const bucket of this.buckets) {
+      const index = bucket.findIndex((session) => session.id === id);
+      if (index >= 0) {
+        bucket.splice(index, 1);
+        this.activeIds.delete(id);
+        this.activeCount -= 1;
+        return true;
+      }
+    }
+    this.activeIds.delete(id);
+    this.activeCount -= 1;
+    return true;
+  }
+
+  nextDecodeBatch(input: NextPrefillBatchInput): DecodeBatchSelection | undefined {
+    for (let priority = 0; priority < this.buckets.length; priority += 1) {
+      const bucket = this.buckets[priority];
+      if (bucket.length === 0) continue;
+      const first = bucket[0];
+      const policy = schedulerPolicyForPriority(first.priority, this.env);
+      const compatible = bucket
+        .filter((session) => session.workerKeyId === first.workerKeyId)
+        .slice(0, policy.maxBatchSize);
+      if (compatible.length === 0) return undefined;
+      this.removeSelected(compatible);
+      return { sessions: compatible, policy };
+    }
+    void input;
+    return undefined;
+  }
+
+  private removeSelected(sessions: readonly ActiveDecodeSession[]): void {
     for (const session of sessions) {
       this.cancel(session.id);
     }

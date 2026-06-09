@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+  PriorityDecodeScheduler,
   PriorityPrefillScheduler,
+  type DecodeBatchSelection,
   type PrefillBatchSelection,
 } from "./worker_scheduler";
 import {
@@ -52,6 +54,10 @@ function session(
 }
 
 function ids(batch: PrefillBatchSelection | undefined): string[] {
+  return batch?.sessions.map((s) => s.id) ?? [];
+}
+
+function decodeIds(batch: DecodeBatchSelection | undefined): string[] {
   return batch?.sessions.map((s) => s.id) ?? [];
 }
 
@@ -251,5 +257,47 @@ describe("priority prefill scheduler", () => {
     });
     scheduler.enqueue(session("first"), 0);
     expect(() => scheduler.enqueue(session("second"), 0)).toThrow("backpressure");
+  });
+});
+
+describe("priority decode scheduler", () => {
+  const active = (
+    id: string,
+    overrides: Partial<{
+      workerKeyId: string;
+      priority: number;
+      generatedTokens: number;
+      maxTokens: number;
+    }> = {},
+  ) => ({
+    id,
+    workerKeyId: overrides.workerKeyId ?? "worker-a",
+    priority: overrides.priority ?? 64,
+    runtimeStateHandle: `runtime-${id}`,
+    logicalPosition: 8 + (overrides.generatedTokens ?? 0),
+    generatedTokens: overrides.generatedTokens ?? 0,
+    maxTokens: overrides.maxTokens ?? 4,
+  });
+
+  test("batches compatible active decode sessions by worker", () => {
+    const scheduler = new PriorityDecodeScheduler({
+      HIPFIRE_SCHED_PREFILL_BATCH_MAX: "2",
+    });
+    scheduler.enqueue(active("a"));
+    scheduler.enqueue(active("b"));
+    scheduler.enqueue(active("c", { workerKeyId: "worker-b" }));
+
+    expect(decodeIds(scheduler.nextDecodeBatch({ nowMs: 0 }))).toEqual(["a", "b"]);
+    expect(decodeIds(scheduler.nextDecodeBatch({ nowMs: 0 }))).toEqual(["c"]);
+  });
+
+  test("cancels active decode sessions by id", () => {
+    const scheduler = new PriorityDecodeScheduler();
+    scheduler.enqueue(active("a"));
+    scheduler.enqueue(active("b"));
+
+    expect(scheduler.cancel("a")).toBe(true);
+    expect(scheduler.cancel("missing")).toBe(false);
+    expect(decodeIds(scheduler.nextDecodeBatch({ nowMs: 0 }))).toEqual(["b"]);
   });
 });

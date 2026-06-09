@@ -35,7 +35,7 @@ Status legend:
 | Runtime per-session state arena | IN PROGRESS | Qwen35 session state exists for current generate-batch-prefill path, the daemon exposes single-worker/state-arena scaffold metadata, top-level attach/fork/activate/reset/release/count operations route through the backend-neutral arena wrapper, fused final-checkpoint creation uses the checkpoint hook, and `/health.runtime_workers` reports Qwen35 state-page descriptor counts/bytes. There is still no generic paged state arena for attention, DeltaNet, Mamba, and architecture-specific state. | `crates/hipfire-runtime/examples/daemon.rs`, `cli/session_state.ts`, `/health.runtime_workers` | Use descriptor inventory to drive allocation/eviction policy, then replace wrapped Qwen35 maps with generic state pages across architectures. |
 | Resident state-cache cap | COMPLETE FOR QWEN35 V1 | `HIPFIRE_SERVER_PREFILL_STATE_CACHE=1` enables in-memory checkpoint reuse; `HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS` caps attachable resident checkpoints and evicts LRU handles through daemon `release_sessions`. | `cli/scheduler_policy.ts`, `cli/index.ts`, `cli/state_cache.ts` | Tune defaults after real workload measurements. |
 | Disk state-cache spill | BLOCKED | Spill eligibility metadata exists only in CLI helper code. `HIPFIRE_SCHED_STATE_CACHE_DISK` remains reserved for future serialization/rehydrate and does not gate resident checkpoint reuse. | `cli/state_cache.ts`, `cli/scheduler_policy.ts` | Requires runtime state arena and complete prefix checkpoint snapshots. |
-| Decode batching | DEFERRED | Planned but not implemented. Decode remains per request. | Source plans only | Start after prefill session-state ownership is mature. |
+| Decode batching | IN PROGRESS FOR QWEN35 V1 | Non-streaming text-only greedy Qwen35/Qwen35-MoE requests that already passed server prefill can enter a worker-local decode active set. The daemon exposes `generate_batch_decode_step` and currently executes the selected sessions through a serial reference backend while preserving per-session state handles and release semantics. Fused decode kernels, streaming routing, tools/images, sampling, DFlash/MTP, and non-Qwen35 backends remain deferred. | `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-server-decode-batch.sh` | Replace the serial reference backend with dense/grouped fused one-token decode kernels and add latency/fairness gates. |
 | MTP/DFlash verify batching | DEFERRED | Planned but intentionally disabled for multi-request batching. | Source plans only | Requires rollback/state parity tests. |
 | Streaming prefill batching | DEFERRED | Streaming requests are explicitly excluded from `generate_batch_prefill`. | `cli/server_prefill_request_path.ts` | Revisit only after stream-safe session state/output routing exists. |
 | `/v1/responses` prefill batching | COMPLETE FOR TEXT-ONLY NON-STREAMING | Responses input is normalized to the chat-shaped execution path, carries `prompt_cache_key` / `prompt_cache_retention`, and can use the same prefill scheduler. | `cli/index.ts`, `cli/batch_api.ts`, `cli/generate_batch_prefill_protocol.ts`, `cli/server_prefill_request_path.ts` | Streaming, tools, images, and richer Responses item types remain deferred. |
@@ -56,7 +56,7 @@ Status legend:
 | Cancellation from queue | COMPLETE | Queue-level cancel implemented and tested. |
 | Deadline aging/starvation hardening | COMPLETE | `HIPFIRE_SCHED_DEADLINE_AGING_MS` lets aged work bypass an unready higher-priority bucket. |
 | Backpressure tests | COMPLETE | `HIPFIRE_SCHED_PREFILL_MAX_QUEUED` rejects new queue entries once the worker queue is full. |
-| Decode active set | NOT STARTED | Deferred until after prefill path. |
+| Decode active set | IN PROGRESS | Worker-local active decode scheduler exists for non-streaming greedy Qwen35 V1; serial daemon step backend is covered by smoke. Fused kernels and streaming-safe routing remain future work. |
 | Verify job scheduling | NOT STARTED | Deferred until MTP/DFlash rollback parity exists. |
 
 ## Multi-Model Session-State Serving Breakdown
@@ -92,15 +92,16 @@ Recent focused validation for this status:
 | `./scripts/smoke-server-prefix-checkpoint-reuse.sh` | NEW | First HTTP request creates a daemon-hashed resident checkpoint; second identical request attaches it and reports a runtime cache hit; a corrupted-prefix-hash attach is rejected and invalidates the manifest without repeated stale-hit telemetry. |
 | `./scripts/smoke-server-prefix-hash-preflight.sh` | NEW | Reuses the checkpoint smoke with preflight counters required, proving cache lookup used daemon prefix-hash preflight before attach. |
 | `./scripts/smoke-server-prefix-boundary-reuse.sh` | NEW | First HTTP request creates semantic-boundary resident checkpoints; second extended conversation attaches the longest shared boundary through daemon prefix-hash preflight and reports a boundary-match counter. |
+| `./scripts/smoke-server-decode-batch.sh` | NEW | Two concurrent non-streaming greedy no-think HTTP requests coalesce through server prefill, then run through the Qwen35 `generate_batch_decode_step` serial reference backend with decode-batch telemetry and no leaked resident decode sessions. |
 
 ## Recommended Next Slices
 
 | Priority | Slice | Why |
 |---|---|---|
-| 1 | Add an arena snapshot/checkpoint hook for fused prefill backends. | Top-level checkpoint/fork/release operations route through the arena wrapper, but serial boundary checkpointing still snapshots by segmenting the Qwen35 path directly. |
-| 2 | Split Qwen35 wrapped state into generic state-page descriptors. | The arena wrapper is still backed by Qwen35-owned KV/DeltaNet/logits structs rather than backend-neutral pages. |
-| 3 | Replace CLI-only accelerator placement with daemon-owned device placement. | Worker keys are device-aware, but execution is still one selected HIP GPU. |
-| 4 | Add BF16/MQ variant coverage for MoE/A3B grouped fused prefill. | MQ4 control is covered at 2/4/8; dtype/format breadth remains. |
+| 1 | Add fused Qwen35/Qwen35-MoE one-token decode backend behind `generate_batch_decode_step`. | The V1 decode scheduler and protocol are live, but the backend is still serial reference. |
+| 2 | Add arena snapshot/checkpoint hooks for fused prefill interior boundaries. | Top-level checkpoint/fork/release operations route through the arena wrapper, but serial boundary checkpointing still snapshots by segmenting the Qwen35 path directly. |
+| 3 | Split Qwen35 wrapped state into generic state-page descriptors. | The arena wrapper is still backed by Qwen35-owned KV/DeltaNet/logits structs rather than backend-neutral pages. |
+| 4 | Replace CLI-only accelerator placement with daemon-owned device placement. | Worker keys are device-aware, but execution is still one selected HIP GPU. |
 
 ## Retired Goal File Coverage
 
