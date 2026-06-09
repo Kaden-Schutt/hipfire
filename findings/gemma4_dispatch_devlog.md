@@ -2316,3 +2316,34 @@ Less critical than the ragged-group bug but still degrades quality.
 - [ ] Production quant format: MQ4G256 for attn + gate/up, Q8 for down_proj
 - [ ] Port fused indexed MoE GEMV for decode speed (currently 3.8 tok/s)
 - [ ] Phase 5 formal validation (coherence gates, perf A/B)
+
+### Session 24b — Q8 indexed MoE GEMV kernels (decode 3.8 → 38 tok/s)
+
+With the Q8-expert model coherent, implemented the indexed-fast MoE decode path:
+
+**New kernels:**
+- `gemv_q8_0_moe_gate_up_k8_indexed.hip`: Q8_0 indexed gate_up GEMV
+  - Grid: (M=2*mi, K_TOP=8, 1), Block: 32 threads
+  - Reads expert pointers from device, computes gate+up projections
+  - No FWHT rotation needed (Q8 is not MagnumQuant)
+- `gemv_q8_0_moe_down_residual_scaled_k8_indexed.hip`: Q8_0 indexed down GEMV
+  - Grid: (M=dim, K_TOP=8, 1), Block: 32 threads
+  - atomicAdd scaled residual into x_residual
+
+**Rust GPU methods:**
+- `Gpu::gemv_q8_0_moe_gate_up_k8_indexed()` in `gemma4_ext.rs`
+- `Gpu::gemv_q8_0_moe_down_residual_scaled_k8_indexed()` in `gemma4_ext.rs`
+
+**Fast-path condition updated:**
+- Before: `gate_ok && down_q8` (only MQ4G256 gate_up)
+- After: `(gate_mq4 || gate_q8) && down_q8` (Q8 gate_up too)
+- For MQ4G256: FWHT rotation then indexed kernel
+- For Q8_0: no rotation, direct indexed kernel
+
+**Results:**
+- Legacy path: 3.8 tok/s (60 D2H syncs/token × 30 layers)
+- Indexed-fast: 38 tok/s (2 kernel launches/layer + 1 gelu + 1 mul + 1 memset)
+- ~10× speedup
+- Output quality: coherent, correct Python code generation
+
+**Remaining:** fused MoE gate_up+gelu+down kernel could cut another ~30% (single launch vs 4). But 38 tok/s is competitive.

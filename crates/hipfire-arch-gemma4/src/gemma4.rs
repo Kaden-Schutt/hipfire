@@ -1319,12 +1319,12 @@ fn apply_moe_branch(
     // down=Q8_0 (mi=704 not 256-aligned → quantizer falls back to Q8_0).
     // Hits the fast path. Other Gemma 4 variants might land in legacy.
     let first = &moe.experts[0];
-    let gate_ok = first.gate_up_proj.gpu_dtype == rdna_compute::DType::MQ4G256;
+    let gate_mq4 = first.gate_up_proj.gpu_dtype == rdna_compute::DType::MQ4G256;
+    let gate_q8  = first.gate_up_proj.gpu_dtype == rdna_compute::DType::Q8_0;
     let down_q8  = first.down_proj.gpu_dtype == rdna_compute::DType::Q8_0;
     let down_hfq4g128 = first.down_proj.gpu_dtype == rdna_compute::DType::HFQ4G128;
-    let fast = false; // TODO(Phase 4): enable indexed-fast path once MoE GEMV kernels are ported
-    // Original condition: gate_ok && (down_q8 || down_hfq4g128);
-    let _ = (gate_ok, down_q8, down_hfq4g128);
+    let fast = (gate_mq4 || gate_q8) && down_q8;
+    let _ = (gate_mq4, down_hfq4g128);
     {
         use std::sync::OnceLock;
         static LOGGED: OnceLock<()> = OnceLock::new();
@@ -1336,19 +1336,30 @@ fn apply_moe_branch(
     }
 
     if fast {
-        // Pre-rotate moe_pre2 once via FWHT (MQ4 GEMV expects rotated x).
-        gpu.rotate_x_mq(&scratch.moe_pre2, &scratch.moe_pre2_rot, dim)?;
-
         // Indexed gate_up: 8 fused GEMVs reading expert IDs from device.
         //   y_gate: [k_top × mi], y_up: [k_top × mi]
-        gpu.gemv_mq4g256_moe_gate_up_k8_indexed(
-            &moe.experts_gate_up_ptrs,
-            &scratch.moe_topk_indices,
-            &scratch.moe_pre2_rot,
-            &scratch.moe_expert_gate_batch,
-            &scratch.moe_expert_up_batch,
-            2 * mi, dim,
-        )?;
+        if gate_mq4 {
+            // MQ4G256 needs FWHT-rotated input.
+            gpu.rotate_x_mq(&scratch.moe_pre2, &scratch.moe_pre2_rot, dim)?;
+            gpu.gemv_mq4g256_moe_gate_up_k8_indexed(
+                &moe.experts_gate_up_ptrs,
+                &scratch.moe_topk_indices,
+                &scratch.moe_pre2_rot,
+                &scratch.moe_expert_gate_batch,
+                &scratch.moe_expert_up_batch,
+                2 * mi, dim,
+            )?;
+        } else {
+            // Q8_0 — no rotation needed.
+            gpu.gemv_q8_0_moe_gate_up_k8_indexed(
+                &moe.experts_gate_up_ptrs,
+                &scratch.moe_topk_indices,
+                &scratch.moe_pre2,
+                &scratch.moe_expert_gate_batch,
+                &scratch.moe_expert_up_batch,
+                2 * mi, dim,
+            )?;
+        };
 
         // Batched gelu_tanh + mul over [k_top × mi].
         gpu.gelu_tanh_f32(&scratch.moe_expert_gate_batch,

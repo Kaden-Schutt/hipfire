@@ -1164,6 +1164,16 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_wave64.hip");
 
+/// Q8_0 indexed MoE gate_up GEMV (Gemma 4 26B-A4B with --expert-q8).
+/// Same device-side expert-pointer table + topk_indices contract;
+/// Q8_0 weight layout (34 B/block of 32 elements).
+pub const GEMV_Q8_0_MOE_GATE_UP_K8_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_moe_gate_up_k8_indexed.hip");
+
+/// Q8_0 indexed MoE down-projection with fused scaled atomicAdd.
+pub const GEMV_Q8_0_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_moe_down_residual_scaled_k8_indexed.hip");
+
 /// N-batched MoE router softmax + top-8 + renorm. Drop-in replacement
 /// for the single-token kernel when prefilling N tokens through an MoE
 /// layer; one workgroup per token. Enables batched MoE prefill.
