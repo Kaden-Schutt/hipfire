@@ -2647,3 +2647,41 @@ Phase 6 Milestone 1 (prefill perf):
 - Step 4 (coherence validation): ❌ blocked by stale logits
 - Step 5 (perf measurement): ❌ blocked
 
+
+### Final logits fix + MoE gate (commit `3712eae6`)
+
+**Root cause of wrong first tokens**: `forward_prefill_batch_v2` ended
+after the layer loop without computing final norm + lm_head + softcap.
+The decode loop samples from `scratch.logits` which was stale from
+initialization. Adding `rmsnorm_f32 + Step::Gemv(lm_head) + softcap`
+on the last position of `pb_residual` fixed the issue completely.
+
+**12B dense model**: byte-identical output to per-token decode.
+"The capital of France is **Paris**." — same token IDs.
+
+**WMMA prefill**: first ~26 tokens identical, small F16 drift after.
+Expected — F16 input quantization loses ~3 mantissa bits vs scalar.
+
+**26B-A4B MoE**: token attractor in batched path. Gated out — MoE models
+fall back to per-token decode. Per-token decode still coherent.
+
+**Coherence gate**: all 8 tests pass.
+
+### Remaining work for WMMA prefill
+
+- **F16 cache invalidation between layers**: `gpu.invalidate_fp16_cache()`
+  added but not yet verified to fix the WMMA+batched drift completely.
+  With final logits fix, WMMA+batched is coherent (first ~26 tokens
+  identical, small drift after).
+
+- **Perf measurement**: Need to measure actual tok/s improvement of
+  batched prefill vs per-token decode. The projection path is already
+  working; need to time a 1266-token prompt.
+
+- **26B-A4B batched prefill**: Blocked by `apply_moe_branch_batched`
+  token attractor. Per-token decode works fine. Need to root-cause
+  the download_f32 path or switch to per-token expert loop in v2.
+
+- **Batched attention for long contexts**: Per-token attention at 1.7%
+  is fine for short prefill. For >512 tokens, adding batched attention
+  with ring-buffer-aware kernels would help further.
