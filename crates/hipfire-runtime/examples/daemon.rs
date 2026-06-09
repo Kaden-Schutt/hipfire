@@ -2634,10 +2634,7 @@ fn loaded_model_state_arena_backend(m: &LoadedModel) -> SequenceStateArenaBacken
 
 fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
     let state_arena_backend = loaded_model_state_arena_backend(m);
-    let resident_sessions = match state_arena_backend {
-        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_request_session_count(m),
-        SequenceStateArenaBackend::Unsupported => 0,
-    };
+    let resident_sessions = state_arena_backend.resident_session_count(m);
     ModelWorkerRuntimeView {
         worker_id: loaded_model_worker_id(m),
         max_resident_workers: 1,
@@ -2907,6 +2904,99 @@ fn qwen35_reset_active_session(
     session.reset(gpu);
     session.restore_into_loaded(m, gpu)?;
     Ok(())
+}
+
+impl SequenceStateArenaBackend {
+    fn ensure_supported(self, m: &LoadedModel, op: &str) -> Result<(), String> {
+        match self {
+            Self::Qwen35Wrapped => Ok(()),
+            Self::Unsupported => Err(format!(
+                "{op} requires a supported sequence-state arena (arch_id={} pp={})",
+                m.arch_id, m.pp
+            )),
+        }
+    }
+
+    fn resident_session_count(self, m: &LoadedModel) -> usize {
+        match self {
+            Self::Qwen35Wrapped => qwen35_request_session_count(m),
+            Self::Unsupported => 0,
+        }
+    }
+
+    fn is_session_resident(self, m: &LoadedModel, session_id: &str) -> bool {
+        match self {
+            Self::Qwen35Wrapped => qwen35_session_resident(m, session_id),
+            Self::Unsupported => false,
+        }
+    }
+
+    fn release_sessions(
+        self,
+        m: &mut LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        session_ids: &[String],
+    ) -> Result<usize, String> {
+        self.ensure_supported(m, "release_sessions")?;
+        match self {
+            Self::Qwen35Wrapped => qwen35_release_sessions(m, gpu, session_ids),
+            Self::Unsupported => unreachable!("unsupported arena rejected above"),
+        }
+    }
+
+    fn activate_session(
+        self,
+        m: &mut LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        self.ensure_supported(m, "activate_session")?;
+        match self {
+            Self::Qwen35Wrapped => qwen35_activate_session(m, gpu, session_id),
+            Self::Unsupported => unreachable!("unsupported arena rejected above"),
+        }
+    }
+
+    fn reset_active_session(
+        self,
+        m: &mut LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+    ) -> Result<(), String> {
+        self.ensure_supported(m, "reset_active_session")?;
+        match self {
+            Self::Qwen35Wrapped => qwen35_reset_active_session(m, gpu),
+            Self::Unsupported => unreachable!("unsupported arena rejected above"),
+        }
+    }
+
+    fn active_logical_position(self, m: &LoadedModel) -> Result<usize, String> {
+        self.ensure_supported(m, "active_logical_position")?;
+        match self {
+            Self::Qwen35Wrapped => qwen35_active_logical_position(m),
+            Self::Unsupported => unreachable!("unsupported arena rejected above"),
+        }
+    }
+
+    fn fork_session_state(
+        self,
+        m: &mut LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        source_session_id: &str,
+        dest_session_id: &str,
+        requested_prefix_hash: Option<&GenerateBatchPrefillPrefixHash>,
+    ) -> Result<(), String> {
+        self.ensure_supported(m, "fork_session_state")?;
+        match self {
+            Self::Qwen35Wrapped => qwen35_fork_session_state(
+                m,
+                gpu,
+                source_session_id,
+                dest_session_id,
+                requested_prefix_hash,
+            ),
+            Self::Unsupported => unreachable!("unsupported arena rejected above"),
+        }
+    }
 }
 
 fn qwen35_restore_or_error(
@@ -4020,6 +4110,7 @@ fn run_generate_batch_prefill_serial_qwen35(
     if pflash_active {
         return Err("generate_batch_prefill does not support PFlash compression yet".to_string());
     }
+    let arena_backend = loaded_model_state_arena_backend(m);
 
     let plan = plan_generate_batch_prefill_qwen35(m.arch_id, envelope);
     let requested_backend = std::env::var("HIPFIRE_QWEN35_PREFILL_SESSION_BATCH").ok();
@@ -4063,22 +4154,23 @@ fn run_generate_batch_prefill_serial_qwen35(
         }
 
         if let Some(runtime_state_handle) = session.state_handle.runtime_state_handle.as_deref() {
-            qwen35_fork_session_state(
-                m,
-                gpu,
-                runtime_state_handle,
-                &session.id,
-                session.state_handle.prefix_hash.as_ref(),
-            )
-            .map_err(|e| {
-                format!(
-                    "generate_batch_prefill session {} failed to attach checkpoint {}: {}",
-                    session.id, runtime_state_handle, e
+            arena_backend
+                .fork_session_state(
+                    m,
+                    gpu,
+                    runtime_state_handle,
+                    &session.id,
+                    session.state_handle.prefix_hash.as_ref(),
                 )
-            })?;
+                .map_err(|e| {
+                    format!(
+                        "generate_batch_prefill session {} failed to attach checkpoint {}: {}",
+                        session.id, runtime_state_handle, e
+                    )
+                })?;
         }
 
-        let resident = qwen35_session_resident(m, &session.id);
+        let resident = arena_backend.is_session_resident(m, &session.id);
         if !resident
             && (session.state_handle.logical_position > 0
                 || session.state_handle.cached_prefix_tokens > 0)
@@ -4091,7 +4183,7 @@ fn run_generate_batch_prefill_serial_qwen35(
             ));
         }
 
-        let created = qwen35_activate_session(m, gpu, &session.id)?;
+        let created = arena_backend.activate_session(m, gpu, &session.id)?;
         let mut boundary_checkpoints = Vec::new();
         let tokens: Vec<u32> = if session.prompt.is_some() {
             let full_tokens = qwen35_materialize_batch_prefill_prompt(m, session)?;
@@ -4120,13 +4212,13 @@ fn run_generate_batch_prefill_serial_qwen35(
                 ));
             } else {
                 let _ = created;
-                qwen35_reset_active_session(m, gpu)?;
+                arena_backend.reset_active_session(m, gpu)?;
                 boundary_checkpoints =
                     qwen35_semantic_boundary_checkpoints(m, session, &full_tokens)?;
                 full_tokens
             }
         } else {
-            let current_position = qwen35_active_logical_position(m)?;
+            let current_position = arena_backend.active_logical_position(m)?;
             if created && session.state_handle.logical_position != 0 {
                 return Err(format!(
                     "generate_batch_prefill suffix session {} is new but logical_position={} (expected 0)",
@@ -4158,12 +4250,14 @@ fn run_generate_batch_prefill_serial_qwen35(
     for session in &result.sessions {
         let checkpoint_id =
             qwen35_checkpoint_session_id(&envelope.batch_id, &session.id, session.logical_position);
-        qwen35_fork_session_state(m, gpu, &session.id, &checkpoint_id, None).map_err(|e| {
-            format!(
-                "generate_batch_prefill session {} failed to create checkpoint {}: {}",
-                session.id, checkpoint_id, e
-            )
-        })?;
+        arena_backend
+            .fork_session_state(m, gpu, &session.id, &checkpoint_id, None)
+            .map_err(|e| {
+                format!(
+                    "generate_batch_prefill session {} failed to create checkpoint {}: {}",
+                    session.id, checkpoint_id, e
+                )
+            })?;
         let mut line = serde_json::json!({
             "type": "generate_batch_prefill_session_done",
             "id": envelope.id,
@@ -4226,7 +4320,7 @@ fn run_generate_batch_prefill_serial_qwen35(
         "mode": result.mode,
         "plan": result.plan.as_str(),
         "backend": result.backend.as_str(),
-        "resident_sessions": qwen35_request_session_count(m),
+        "resident_sessions": arena_backend.resident_session_count(m),
     });
     let _ = writeln!(stdout, "{done}");
     let _ = stdout.flush();
@@ -5540,7 +5634,8 @@ fn main() {
                         continue;
                     }
                 };
-                match qwen35_release_sessions(m, &mut gpu, &sessions) {
+                let arena_backend = loaded_model_state_arena_backend(m);
+                match arena_backend.release_sessions(m, &mut gpu, &sessions) {
                     Ok(released) => {
                         let worker = loaded_model_worker_runtime_view(m);
                         let done = serde_json::json!({
@@ -5548,7 +5643,7 @@ fn main() {
                             "id": id,
                             "requested": sessions.len(),
                             "released": released,
-                            "resident_sessions": qwen35_request_session_count(m),
+                            "resident_sessions": arena_backend.resident_session_count(m),
                             "model_worker": {
                                 "id": worker.worker_id.value,
                                 "resident_workers": worker.resident_workers,
