@@ -3474,7 +3474,9 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
 fn forward_lowered_enabled() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
-        std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() == Some("1")
+        // Default ON (byte-parity validated 2026-06-08).
+        // Set HIPFIRE_FORWARD_LOWERED=0 to force legacy hand path.
+        std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0")
     })
 }
 
