@@ -1038,6 +1038,13 @@ pub struct Gemma4Scratch {
     pub pb_tmp: GpuTensor,
     /// `[N × max_q_dim]` — batched Q projection output (sized for full layer = n_heads * full_head_dim).
     pub pb_q: GpuTensor,
+    /// `[N × max_q_dim]` — batched attention output, kept separate from `pb_q`
+    /// so batched flash attention never reads and writes the same buffer.
+    pub pb_attn_q: GpuTensor,
+    /// `[N × n_heads × max_tiles_full × (2+full_head_dim)]` — batch-sized flash
+    /// partials for batched masked prefill attention. The single-query
+    /// `flash_partials` overflows with batch_size>1.
+    pub pb_flash_partials: GpuTensor,
     /// `[N × max_kv_dim]` — batched K projection output.
     pub pb_k: GpuTensor,
     /// `[N × max_kv_dim]` — batched V projection output.
@@ -1175,6 +1182,8 @@ impl Gemma4Scratch {
         let kv_dim_max = (config.sliding_n_kv_heads * config.sliding_head_dim)
             .max(config.full_n_kv_heads * config.full_head_dim);
         let pb_q = gpu.zeros(&[MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
+        let pb_attn_q = gpu.zeros(&[MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
+        let pb_flash_partials = gpu.zeros(&[MAX_PREFILL_BATCH * flash_partials_sz], DType::F32)?;
         let pb_k = gpu.zeros(&[MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
         let pb_v = gpu.zeros(&[MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
         let pb_gate = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
@@ -1203,7 +1212,7 @@ impl Gemma4Scratch {
             pb_moe_expert_offsets, pb_moe_expert_token_list,
             pb_moe_gate_batch, pb_moe_up_batch, pb_moe_hidden_batch,
             pb_moe_cur_moe, pb_moe_cur_mlp, pb_residual,
-            pb_tmp, pb_q, pb_k, pb_v, pb_gate, pb_up, pb_ffn_hidden,
+            pb_tmp, pb_q, pb_attn_q, pb_flash_partials, pb_k, pb_v, pb_gate, pb_up, pb_ffn_hidden,
             pb_positions,
         })
     }
@@ -1261,6 +1270,8 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.pb_residual);
         let _ = gpu.free_tensor(self.pb_tmp);
         let _ = gpu.free_tensor(self.pb_q);
+        let _ = gpu.free_tensor(self.pb_attn_q);
+        let _ = gpu.free_tensor(self.pb_flash_partials);
         let _ = gpu.free_tensor(self.pb_k);
         let _ = gpu.free_tensor(self.pb_v);
         let _ = gpu.free_tensor(self.pb_gate);
@@ -2914,89 +2925,68 @@ fn forward_prefill_batch_v2(
                     }
                 }
 
-                // Per-token KV write + attention for full layer (hd=512).
-                // Same per-token approach as sliding: batched projections,
-                // per-token attention (batched q8 attention corrupts KV in
-                // ring-buffer mode). Full layers use proportional RoPE via
-                // rope_partial_halved_f32 (already batched above).
-                for i in 0..n_batch {
-                    let pos = start_pos + i;
-                    if let Some(stream) = gpu.active_stream.as_ref() {
-                        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
-                    } else {
-                        gpu.hip.memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
-                    }
-                    if let Some(_s) = gpu.active_stream.as_ref() {
-                        gpu.hip.memcpy_dtod_async_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes, _s)?;
-                        gpu.hip.memcpy_dtod_async_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
-                        // V = K (k_eq_v model): copy from same pb_k offset
-                        gpu.hip.memcpy_dtod_async_at(&scratch.v.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
-                    } else {
-                        gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
-                        gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
-                        gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
-                    }
-                    // Per-token proportional RoPE was already applied above.
-                    let tier_inputs = KvTierInputs {
-                        quant_asym4: kv_full.quant_asym4,
-                        quant_asym3: kv_full.quant_asym3,
-                        quant_asym2: kv_full.quant_asym2,
-                        quant_q8: kv_full.quant_q8,
-                        quant_fwht: kv_full.quant_fwht,
-                        quant_hfq4: false,
-                        quant_q4: false,
-                        v_mode_bits: kv_full.v_mode_bits(),
-                        pos,
-                        flash_mode: 2,
-                        capture_mode: gpu.graphs.capture_mode,
-                        batch_size: 1,
-                        is_tree: false,
-                        is_boundary: false,
-                        cache_capacity: 0,
-                        head_dim,
-                        window_size: 0,
-                    };
-                    let plan = KvTierPlan::derive(tier_inputs)
-                        .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
-                    let io = AttnParams {
-                        q: &scratch.q,
-                        k: &scratch.k,
-                        v: &scratch.v,
-                        k_cache: &kv_full.k_gpu[full_kv_idx],
-                        v_cache: &kv_full.v_gpu[full_kv_idx],
-                        k_scales: None,
-                        v_scales: None,
-                        pos_buf: &scratch.pos_buf,
-                        pos,
-                        positions: None,
-                        n_heads,
-                        n_kv_heads: n_kv,
-                        head_dim,
-                        physical_cap: kv_full.max_seq,
-                        cache_capacity: plan.cache_capacity,
-                        window_size: plan.window_size,
-                        batch_size: 1,
-                        max_ctx_len: 0,
-                        flash_partials: Some(&scratch.flash_partials),
-                        givens_cos: kv_full.givens_cos.as_ref(),
-                        givens_sin: kv_full.givens_sin.as_ref(),
-                        tree_bias: None,
-                        block_start: 0,
-                        block_cols: 0,
-                        output: &scratch.attn_out,
-                    };
-                    let ctx = DispatchCtx::new(gpu);
-                    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])?;
-                    // Copy attention output back to batched buffer.
-                    if let Some(_s) = gpu.active_stream.as_ref() {
-                        gpu.hip.memcpy_dtod_async_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes, _s)?;
-                    } else {
-                        gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes)?;
-                    }
-                }
+                // Batched full-layer attention (hd=512): all N tokens in ONE
+                // masked flash call instead of a per-token loop. Full layers are
+                // non-ring (cache_capacity=0) and non-windowed (window_size=0);
+                // the asym3 batched-masked kernel derives each query's causal
+                // bound from pb_positions, so this reproduces the per-token
+                // result with 1 launch/layer instead of N. (Sliding layers stay
+                // per-token until the q8 batched ring kernel lands — A.2.)
+                // Proportional RoPE was already applied to pb_q/pb_k above.
+                let _ = (q_dim_bytes, kv_dim_bytes); // (no per-token staging now)
+                let tier_inputs = KvTierInputs {
+                    quant_asym4: kv_full.quant_asym4,
+                    quant_asym3: kv_full.quant_asym3,
+                    quant_asym2: kv_full.quant_asym2,
+                    quant_q8: kv_full.quant_q8,
+                    quant_fwht: kv_full.quant_fwht,
+                    quant_hfq4: false,
+                    quant_q4: false,
+                    v_mode_bits: kv_full.v_mode_bits(),
+                    pos: start_pos + n_batch - 1,
+                    flash_mode: 2,
+                    capture_mode: gpu.graphs.capture_mode,
+                    batch_size: n_batch,
+                    is_tree: false,
+                    is_boundary: false,
+                    cache_capacity: 0,
+                    head_dim,
+                    window_size: 0,
+                };
+                let plan = KvTierPlan::derive(tier_inputs)
+                    .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
+                let io = AttnParams {
+                    q: &scratch.pb_q,
+                    k: &scratch.pb_k,
+                    v: &scratch.pb_k, // k_eq_v model
+                    k_cache: &kv_full.k_gpu[full_kv_idx],
+                    v_cache: &kv_full.v_gpu[full_kv_idx],
+                    k_scales: None,
+                    v_scales: None,
+                    pos_buf: &scratch.pos_buf,
+                    pos: start_pos + n_batch - 1,
+                    positions: Some(&scratch.pb_positions),
+                    n_heads,
+                    n_kv_heads: n_kv,
+                    head_dim,
+                    physical_cap: kv_full.max_seq,
+                    cache_capacity: plan.cache_capacity,
+                    window_size: plan.window_size,
+                    batch_size: n_batch,
+                    max_ctx_len: start_pos + n_batch,
+                    flash_partials: Some(&scratch.pb_flash_partials),
+                    givens_cos: kv_full.givens_cos.as_ref(),
+                    givens_sin: kv_full.givens_sin.as_ref(),
+                    tree_bias: None,
+                    block_start: 0,
+                    block_cols: 0,
+                    output: &scratch.pb_attn_q,
+                };
+                let ctx = DispatchCtx::new(gpu);
+                execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])?;
                 full_kv_idx += 1;
 
-                run_prefill_gemm(gpu, &lw.o_proj, &scratch.pb_q, &scratch.pb_attn_out, n_batch)?;
+                run_prefill_gemm(gpu, &lw.o_proj, &scratch.pb_attn_q, &scratch.pb_attn_out, n_batch)?;
                 gpu.rmsnorm_batched(&scratch.pb_attn_out, &lw.post_attention_layernorm,
                     &scratch.pb_attn_out, n_batch, dim, config.norm_eps)?;
                 gpu.add_inplace_f32(&scratch.pb_residual, &scratch.pb_attn_out)?;
