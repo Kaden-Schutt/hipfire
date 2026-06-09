@@ -64,14 +64,26 @@ fn rndv(gpu: &mut Gpu, rows: usize, cols: usize, seed: usize, sc: f32) -> GpuTen
 // lm_head GEMM over vocab=248K is the training bottleneck. Use the register-
 // tiled kernel (reads each 5GB weight row once per 8-batch-tile, ~8x less
 // bandwidth) — validated bit-equal to the naive linear (test_lmhead_tiled).
-fn lmhead_fwd(gpu: &mut Gpu, out: &GpuTensor, lmhead: &GpuTensor, b: usize, d_tgt: usize, vocab: usize) -> GpuTensor {
+fn lmhead_fwd(gpu: &mut Gpu, out: &GpuTensor, lmhead: &GpuTensor, lmhead_bf16: Option<&GpuTensor>, b: usize, d_tgt: usize, vocab: usize) -> GpuTensor {
     let logits = gpu.zeros(&[b, vocab], DType::F32).unwrap();
-    gpu.gemm_f32_register_tiled(lmhead, out, &logits, vocab, d_tgt, b).unwrap();
+    if let Some(lmh) = lmhead_bf16 {
+        let out_bf16 = gpu.zeros(&[b, d_tgt], DType::F16).unwrap();
+        gpu.to_bf16_f32(out, &out_bf16, b * d_tgt).unwrap();
+        gpu.gemm_bf16_mfma(lmh, &out_bf16, &logits, vocab, d_tgt, b).unwrap();
+    } else {
+        gpu.gemm_f32_register_tiled(lmhead, out, &logits, vocab, d_tgt, b).unwrap();
+    }
     logits
 }
-fn lmhead_bwd(gpu: &mut Gpu, dlogits: &GpuTensor, lmhead_t: &GpuTensor, b: usize, d_tgt: usize, vocab: usize) -> GpuTensor {
+fn lmhead_bwd(gpu: &mut Gpu, dlogits: &GpuTensor, lmhead_t: &GpuTensor, lmhead_t_bf16: Option<&GpuTensor>, b: usize, d_tgt: usize, vocab: usize) -> GpuTensor {
     let d_out = gpu.zeros(&[b, d_tgt], DType::F32).unwrap();
-    gpu.gemm_f32_register_tiled(lmhead_t, dlogits, &d_out, d_tgt, vocab, b).unwrap();
+    if let Some(lmh_t) = lmhead_t_bf16 {
+        let dl_bf16 = gpu.zeros(&[b, vocab], DType::F16).unwrap();
+        gpu.to_bf16_f32(dlogits, &dl_bf16, b * vocab).unwrap();
+        gpu.gemm_bf16_mfma(lmh_t, &dl_bf16, &d_out, d_tgt, vocab, b).unwrap();
+    } else {
+        gpu.gemm_f32_register_tiled(lmhead_t, dlogits, &d_out, d_tgt, vocab, b).unwrap();
+    }
     d_out
 }
 
@@ -150,6 +162,14 @@ fn main() {
     let lm_head_T_g = gpu.zeros(&[d_tgt, vocab], DType::F32).unwrap();
     gpu.transpose_f32(&lm_head_g, &lm_head_T_g, vocab, d_tgt).unwrap();
     eprintln!("lm_head transposed for tiled bwd (+{} GB)", (d_tgt * vocab * 4) / 1_000_000_000);
+    let (lm_head_bf16, lm_head_T_bf16) = if dt::dflash_use_mfma() {
+        let a = gpu.zeros(&[vocab, d_tgt], DType::F16).unwrap();
+        gpu.to_bf16_f32(&lm_head_g, &a, vocab * d_tgt).unwrap();
+        let bt = gpu.zeros(&[d_tgt, vocab], DType::F16).unwrap();
+        gpu.to_bf16_f32(&lm_head_T_g, &bt, d_tgt * vocab).unwrap();
+        eprintln!("lm_head bf16-MFMA path ON (+{} GB bf16 weights)", (vocab * d_tgt * 2 * 2) / 1_000_000_000);
+        (Some(a), Some(bt))
+    } else { (None, None) };
     // warm-start net + fresh adapters
     let (mut body_layers, final_norm) = dt::load_lfm2_warmstart(&mut gpu, &cfg, Path::new(st_path)).expect("warm-start");
     if std::env::var("HIPFIRE_CONV_INJECT").ok().as_deref() == Some("1") {
@@ -225,14 +245,14 @@ fn main() {
         let fn2 = gpu.zeros(&[bsz, d], DType::F32).unwrap();
         gpu.rmsnorm_batched(&body_out, &net.final_norm, &fn2, bsz, d, cfg.eps).unwrap();
         let out = dt::lin(&mut gpu, &fn2, &net.out_proj_v, bsz, d, d_tgt);
-        let logits = lmhead_fwd(&mut gpu, &out, &lm_head_g, bsz, d_tgt, vocab);
+        let logits = lmhead_fwd(&mut gpu, &out, &lm_head_g, lm_head_bf16.as_ref(), bsz, d_tgt, vocab);
         let dlogits = gpu.zeros(&[bsz, vocab], DType::F32).unwrap();
         let loss_t = gpu.zeros(&[bsz], DType::F32).unwrap();
         gpu.ce_loss_bwd_f32(&logits, &targets_g, &weights_g, &dlogits, &loss_t, bsz, vocab).unwrap();
         let loss: f32 = gpu.download_f32(&loss_t).unwrap().iter().sum::<f32>() / wsum;
         running = if step == 1 { loss } else { 0.98 * running + 0.02 * loss };
         // backward
-        let d_out = lmhead_bwd(&mut gpu, &dlogits, &lm_head_T_g, bsz, d_tgt, vocab);
+        let d_out = lmhead_bwd(&mut gpu, &dlogits, &lm_head_T_g, lm_head_T_bf16.as_ref(), bsz, d_tgt, vocab);
         let d_fn2 = dt::lin_dx(&mut gpu, &d_out, &net.out_proj_v, bsz, d, d_tgt);
         let g_out_proj_v = dt::lin_dw(&mut gpu, &d_out, &fn2, bsz, d, d_tgt);
         let d_body_out = zt(&mut gpu, bsz * d); let g_final_norm = zt(&mut gpu, d);
@@ -270,7 +290,7 @@ fn main() {
                     let fn2 = gpu.zeros(&[bsz, d], DType::F32).unwrap();
                     gpu.rmsnorm_batched(&body_out, &net.final_norm, &fn2, bsz, d, cfg.eps).unwrap();
                     let out = dt::lin(&mut gpu, &fn2, &net.out_proj_v, bsz, d, d_tgt);
-                    let logits = lmhead_fwd(&mut gpu, &out, &lm_head_g, bsz, d_tgt, vocab);
+                    let logits = lmhead_fwd(&mut gpu, &out, &lm_head_g, lm_head_bf16.as_ref(), bsz, d_tgt, vocab);
                     let lg = gpu.download_f32(&logits).unwrap();
                     // argmax per block position (1..B; pos 0 is the seed)
                     let am: Vec<i32> = (1..bsz).map(|i| {

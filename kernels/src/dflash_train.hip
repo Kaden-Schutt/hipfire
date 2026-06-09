@@ -388,3 +388,104 @@ extern "C" __global__ void colsum_strided_f32(
     for (int j = 0; j < rows; j++) s += x[(size_t)j * row_stride + col_off + c];
     out[c] = s * scale;
 }
+
+// ===================================================================
+// MFMA-accelerated dW for the drafter body linears (gfx942/CDNA3).
+// dW[N,K] = sum_{m=0..M-1} dY[m,N] * X[m,K], with M = batch (<=16) mapped
+// onto the 16-wide MFMA k-dim => ONE v_mfma_f32_16x16x16bf16 per 16x16
+// output tile (vs the naive kernel's N*K blocks each doing M MACs).
+// Inputs f32, cast to bf16 inline for the MFMA operands; fp32 accumulate.
+// Block = 256 (4 waves, 2x2 over a 32x32 dW tile).
+//   wave 0->(m+0,n+0) 1->(m+0,n+16) 2->(m+16,n+0) 3->(m+16,n+16)
+// Lane layout (matches gemm_bf16_mfma.gfx942.hip, verified there):
+//   A operand: lane l holds a[r]=A[i = (l&15), k = ((l>>4)&3)*4 + r]
+//   B operand: lane l holds b[r]=B[j = (l&15), k = ((l>>4)&3)*4 + r]
+//   D output : lane l holds c[r]=D[i = ((l>>4)&3)*4 + r, j = (l&15)]
+// Here A's i-index = dW row (N), B's j-index = dW col (K), reduction k = m.
+// ===================================================================
+#if defined(__gfx942__) || defined(__gfx90a__)
+typedef __bf16 dwbf16x4 __attribute__((ext_vector_type(4)));
+typedef short  dws16x4   __attribute__((ext_vector_type(4)));
+typedef float  dwvf4     __attribute__((ext_vector_type(4)));
+
+extern "C" __global__ __launch_bounds__(256)
+void linear_bwd_dw_mfma_gfx942(
+    const float* __restrict__ dY,   // [M, N] f32
+    const float* __restrict__ X,    // [M, K] f32
+    float* __restrict__ dW,         // [N, K] f32
+    int M, int K, int N)
+{
+    const int tid   = threadIdx.x;
+    const int wave  = tid >> 6;          // 0..3
+    const int lane  = tid & 63;
+    const int nlane = lane & 15;         // 0..15
+    const int strip = (lane >> 4) & 3;   // 0..3
+    const int n_off = blockIdx.x * 32 + ((wave & 2) ? 16 : 0);  // dW row tile (N)
+    const int k_off = blockIdx.y * 32 + ((wave & 1) ? 16 : 0);  // dW col tile (K)
+
+    const int N_idx = n_off + nlane;     // A-operand reads dY column N_idx
+    const int K_idx = k_off + nlane;     // B-operand reads X  column K_idx
+
+    dwvf4 c = {0.f, 0.f, 0.f, 0.f};
+    // Reduce over the full batch M in 16-wide MFMA-k chunks (M may exceed 16,
+    // e.g. the fc gradient at m=n_ctx; M<16 handled by the m<M mask).
+    for (int mc = 0; mc < M; mc += 16) {
+        dwbf16x4 a, b;
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            int m = mc + strip * 4 + r;       // batch / MFMA-k
+            a[r] = (m < M && N_idx < N) ? (__bf16) dY[(size_t)m * N + N_idx] : (__bf16)0;
+            b[r] = (m < M && K_idx < K) ? (__bf16) X[(size_t)m * K + K_idx]  : (__bf16)0;
+        }
+        dws16x4 ai = __builtin_bit_cast(dws16x4, a);
+        dws16x4 bi = __builtin_bit_cast(dws16x4, b);
+        c = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(ai, bi, c, 0, 0, 0);
+    }
+
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        int n = n_off + strip * 4 + r;   // dW row (N)
+        if (n < N && K_idx < K) dW[(size_t)n * K + K_idx] = c[r];
+    }
+}
+
+// dX[batch,K] = sum_{n} dY[batch,n] * W[n,k]. batch<=16 (single MFMA m-tile).
+// 4 waves/WG each own a 16-wide K-strip => 64 K per WG. Reduction over N in
+// 16-wide MFMA-k chunks. Native A[m,k]*B[k,n] MFMA form: A=dY (m=batch,k=n),
+// B=W (k=n,n_out=k_dx) read directly & coalesced over k_dx. f32 in (bf16-cast).
+extern "C" __global__ __launch_bounds__(256)
+void linear_bwd_dx_mfma_gfx942(
+    const float* __restrict__ dY,  // [batch, N] f32
+    const float* __restrict__ W,   // [N, K] f32
+    float* __restrict__ dX,        // [batch, K] f32
+    int batch, int K, int N)
+{
+    const int tid   = threadIdx.x;
+    const int wave  = tid >> 6;          // 0..3
+    const int lane  = tid & 63;
+    const int nlane = lane & 15;
+    const int strip = (lane >> 4) & 3;
+    const int k_off = blockIdx.x * 64 + wave * 16;   // this wave's K-strip start
+    const int b_idx = nlane;                          // A-operand batch row (m)
+    const int K_idx = k_off + nlane;                  // output col (k_dx)
+
+    dwvf4 c = {0.f, 0.f, 0.f, 0.f};
+    for (int nc = 0; nc < N; nc += 16) {
+        dwbf16x4 a, b;
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            int n = nc + strip * 4 + r;               // contraction (MFMA-k)
+            a[r] = (b_idx < batch && n < N) ? (__bf16) dY[(size_t)b_idx * N + n] : (__bf16)0;
+            b[r] = (n < N && K_idx < K)     ? (__bf16) W[(size_t)n * K + K_idx]  : (__bf16)0;
+        }
+        dws16x4 ai = __builtin_bit_cast(dws16x4, a);
+        dws16x4 bi = __builtin_bit_cast(dws16x4, b);
+        c = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(ai, bi, c, 0, 0, 0);
+    }
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        int b_out = strip * 4 + r;                    // output batch row
+        if (b_out < batch && K_idx < K) dX[(size_t)b_out * K + K_idx] = c[r];
+    }
+}
+#endif

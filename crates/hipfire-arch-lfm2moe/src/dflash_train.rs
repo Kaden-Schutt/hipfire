@@ -90,10 +90,30 @@ pub fn lin(gpu: &mut Gpu, x: &GpuTensor, w: &GpuTensor, m: usize, k: usize, n: u
     let y = gpu.zeros(&[m, n], DType::F32).unwrap(); gpu.linear_fwd_f32(x, w, &y, m, k, n).unwrap(); y
 }
 pub fn lin_dx(gpu: &mut Gpu, dy: &GpuTensor, w: &GpuTensor, m: usize, k: usize, n: usize) -> GpuTensor {
-    let dx = gpu.zeros(&[m, k], DType::F32).unwrap(); gpu.linear_bwd_dx_f32(dy, w, &dx, m, k, n).unwrap(); dx
+    let dx = gpu.zeros(&[m, k], DType::F32).unwrap();
+    let dx_mfma = std::env::var("HIPFIRE_DFLASH_DX_MFMA").ok().as_deref() == Some("1");
+    if dflash_use_mfma() && dx_mfma && m <= 16 {
+        gpu.linear_bwd_dx_mfma_f32(dy, w, &dx, m, k, n).unwrap();
+    } else {
+        gpu.linear_bwd_dx_f32(dy, w, &dx, m, k, n).unwrap();
+    }
+    dx
+}
+/// dW backward dispatch: MFMA path (gfx942) when HIPFIRE_DFLASH_MFMA=1 and the
+/// batch (reduction) fits the 16-wide MFMA k-dim; else the portable naive kernel.
+pub fn dflash_use_mfma() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("HIPFIRE_DFLASH_MFMA").ok().as_deref() == Some("1"))
 }
 pub fn lin_dw(gpu: &mut Gpu, dy: &GpuTensor, x: &GpuTensor, m: usize, k: usize, n: usize) -> GpuTensor {
-    let dw = gpu.zeros(&[n, k], DType::F32).unwrap(); gpu.linear_bwd_dw_f32(dy, x, &dw, m, k, n).unwrap(); dw
+    let dw = gpu.zeros(&[n, k], DType::F32).unwrap();
+    if dflash_use_mfma() {
+        gpu.linear_bwd_dw_mfma_f32(dy, x, &dw, m, k, n).unwrap();
+    } else {
+        gpu.linear_bwd_dw_f32(dy, x, &dw, m, k, n).unwrap();
+    }
+    dw
 }
 pub fn addv(gpu: &mut Gpu, a: &GpuTensor, b: &GpuTensor) { gpu.add_inplace_f32(a, b).unwrap(); }
 pub fn add_new(gpu: &mut Gpu, a: &GpuTensor, b: &GpuTensor, n: usize) -> GpuTensor {

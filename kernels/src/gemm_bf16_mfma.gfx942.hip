@@ -174,3 +174,13 @@ void gemm_bf16_mfma_gfx942(
         }
     }
 }
+
+
+// f32 -> bf16 elementwise (writes bf16 bits into a 2-byte buffer; the Rust
+// side hands an F16-typed GpuTensor as the raw container). Used to stage the
+// per-step lm_head activations (out, dlogits) for the bf16-MFMA GEMM.
+extern "C" __global__ void to_bf16_f32(const float* __restrict__ src,
+                                       __bf16* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = (__bf16) src[i];
+}

@@ -2911,6 +2911,8 @@ pub const CONV1D_GATED_BATCHED_SRC: &str =
 /// + naive GQA block-attention with context KV-injection.
 pub const DFLASH_TRAIN_SRC: &str =
     include_str!("../../../kernels/src/dflash_train.hip");
+pub const GEMM_BF16_MFMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_mfma.gfx942.hip");
 
 /// Gated output norm: rmsnorm(x) * silu(z). Fused single kernel.
 /// x and z are [n_heads × head_dim]. weight is [head_dim] (shared across heads).

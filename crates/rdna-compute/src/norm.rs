@@ -1537,6 +1537,67 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [n as u32, k as u32, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// MFMA-accelerated dW (gfx942): dW[N,K] = sum_m dY[m,N]*X[m,K], M=batch<=16.
+    /// One v_mfma_f32_16x16x16bf16 per 16x16 tile. f32 in (bf16-cast), f32 out.
+    pub fn linear_bwd_dw_mfma_f32(&mut self, dy: &GpuTensor, x: &GpuTensor, dw: &GpuTensor, m: usize, k: usize, n_dim: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "linear_bwd_dw_mfma_gfx942")?;
+        let func = &self.functions["linear_bwd_dw_mfma_gfx942"];
+        let mut dyp = dy.buf.as_ptr(); let mut xp = x.buf.as_ptr(); let mut dwp = dw.buf.as_ptr();
+        let mut mi = m as i32; let mut ki = k as i32; let mut ni = n_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dyp as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void, &mut dwp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void,
+        ];
+        let gx = ((n_dim as u32) + 31) / 32; let gy = ((k as u32) + 31) / 32;
+        unsafe { self.hip.launch_kernel(func, [gx, gy, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// f32 -> bf16 elementwise into a 2-byte (F16-container) tensor.
+    pub fn to_bf16_f32(&mut self, src: &GpuTensor, dst: &GpuTensor, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_bf16_mfma", kernels::GEMM_BF16_MFMA_SRC, "to_bf16_f32")?;
+        let func = &self.functions["to_bf16_f32"];
+        let mut sp = src.buf.as_ptr(); let mut dp = dst.buf.as_ptr(); let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void, &mut dp as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void,
+        ];
+        let blk = 256u32; let grid = (((n as u32) + blk - 1) / blk).max(1);
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [blk, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// bf16 x bf16 -> f32 MFMA GEMM (gfx942): D[batch,M] = sum_K A[M,K]*B[batch,K].
+    /// A, B are bf16 (F16-container) tensors; D is f32. Mirrors gemm_f32_register_tiled.
+    pub fn gemm_bf16_mfma(&mut self, a: &GpuTensor, b: &GpuTensor, d: &GpuTensor, m: usize, k: usize, batch: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_bf16_mfma", kernels::GEMM_BF16_MFMA_SRC, "gemm_bf16_mfma_gfx942")?;
+        let func = &self.functions["gemm_bf16_mfma_gfx942"];
+        let mut ap = a.buf.as_ptr(); let mut bp = b.buf.as_ptr(); let mut dp = d.buf.as_ptr();
+        let mut mi = m as i32; let mut ki = k as i32; let mut bi = batch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void, &mut bp as *mut _ as *mut c_void, &mut dp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut bi as *mut _ as *mut c_void,
+        ];
+        let gx = ((m as u32) + 31) / 32; let gy = ((batch as u32) + 31) / 32;
+        unsafe { self.hip.launch_kernel(func, [gx, gy, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// MFMA dX (gfx942): dX[batch,K] = sum_n dY[batch,n]*W[n,k], batch<=16.
+    /// Native A[m,k]*B[k,n] form -- W read directly & coalesced (no transpose).
+    pub fn linear_bwd_dx_mfma_f32(&mut self, dy: &GpuTensor, w: &GpuTensor, dx: &GpuTensor, batch: usize, k: usize, n_dim: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("dflash_train", kernels::DFLASH_TRAIN_SRC, "linear_bwd_dx_mfma_gfx942")?;
+        let func = &self.functions["linear_bwd_dx_mfma_gfx942"];
+        let mut dyp = dy.buf.as_ptr(); let mut wp = w.buf.as_ptr(); let mut dxp = dx.buf.as_ptr();
+        let mut bi = batch as i32; let mut ki = k as i32; let mut ni = n_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dyp as *mut _ as *mut c_void, &mut wp as *mut _ as *mut c_void, &mut dxp as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void,
+        ];
+        let gx = ((k as u32) + 63) / 64;
+        unsafe { self.hip.launch_kernel(func, [gx, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// RMSNorm backward. x [rows,n], g [n], dy [rows,n] -> dx [rows,n], dG [n]
     /// (dG accumulated via atomics — PRE-ZERO it).
     pub fn rmsnorm_bwd_f32(&mut self, x: &GpuTensor, g: &GpuTensor, dy: &GpuTensor, dx: &GpuTensor, dg: &GpuTensor, rows: usize, n: usize, eps: f32) -> HipResult<()> {
