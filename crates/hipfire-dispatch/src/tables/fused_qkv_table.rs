@@ -16,7 +16,12 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedQkvHfq4G256,     ArchPredicate::Always),
         (KernelKey::FusedQkvMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvMq4G256Lloyd, ArchPredicate::HasWmma),
-        (KernelKey::FusedQkvHfq6G256,     ArchPredicate::HasDp4a),
+        // HFQ6G256 fused QKV: batched run-arm `gpu.gemm_qkv_hfq6g256` carries the
+        // full cross-arch ladder (same as the qkvza sibling below). `Always`, not
+        // gfx906-only `HasDp4a` — the old gate dead-gated HFQ6-promoted qkv layers
+        // on RDNA3/4 (AWQ A3B trunk batched-prefill panic). Run-arm keeps the
+        // gfx906 dp4a decode fast-path, cross-arch gemm (n=1) decode elsewhere.
+        (KernelKey::FusedQkvHfq6G256,     ArchPredicate::Always),
         (KernelKey::FusedQkvQ4K,          ArchPredicate::Always),
         // Q8_0 fused QKV (#397 Ship 5.2 slice 3). WMMA-only: the run-arm calls
         // `gpu.gemm_qkv_q8_0_wmma`, which routes to the gfx12 WMMA sibling on
@@ -68,7 +73,17 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedQkvzaHfq4G256,     ArchPredicate::Always),
         (KernelKey::FusedQkvzaMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedQkvzaMq4G256Lloyd, ArchPredicate::HasWmma),
-        (KernelKey::FusedQkvzaHfq6G256,     ArchPredicate::HasDp4a),
+        // HFQ6G256 fused QKVZA. The batched run-arm calls `gpu.gemm_qkvza_hfq6g256`,
+        // which carries the full cross-arch ladder internally (wmma_gfx12 → wmma →
+        // wave64_dp4a → dot2 → fp16 → scalar base), so the key is available on
+        // EVERY arch — not just gfx906. The prior `HasDp4a` gate was the decode
+        // (dp4a) method's reach leaking onto the key; it dead-gated the AWQ A3B
+        // trunk's HFQ6-promoted qkvza layers on RDNA3/RDNA4 (batched-prefill panic
+        // "no implementation for FusedQkvzaHfq6G256"). `Always` matches true
+        // cross-arch availability (mirrors FusedQkvzaHfq4G256 / FusedQkvzaHfq3G256);
+        // the run-arm keeps the gfx906 dp4a decode fast-path and falls to the
+        // cross-arch gemm (n=1) for decode on other archs.
+        (KernelKey::FusedQkvzaHfq6G256,     ArchPredicate::Always),
         // Q8_0 fused QKVZA (#397 Ship 5.2 slice 3). WMMA-only — the run-arm calls
         // `gpu.gemm_qkvza_q8_0_wmma` (gfx12 sibling on RDNA4 else gfx11 `_w32`
         // WMMA), no scalar/dp4a fallback; no `fused_qkvza_q8_0` decode method
@@ -107,7 +122,12 @@ pub fn populate(registry: &mut KernelRegistry) {
         (KernelKey::FusedGateUpHfq4G256,     ArchPredicate::Always),
         (KernelKey::FusedGateUpMq3G256Lloyd, ArchPredicate::HasWmma),
         (KernelKey::FusedGateUpMq4G256Lloyd, ArchPredicate::HasWmma),
-        (KernelKey::FusedGateUpHfq6G256,     ArchPredicate::HasDp4a),
+        // HFQ6G256 fused gate+up: batched run-arm `gpu.gemm_gate_up_hfq6g256` is
+        // cross-arch (same ladder as the qkv/qkvza siblings). `Always`, not
+        // gfx906-only `HasDp4a` — the old gate dead-gated HFQ6-promoted gate_up
+        // layers on RDNA3/4 (AWQ A3B trunk batched-prefill panic). Run-arm keeps
+        // the gfx906 dp4a decode fast-path, cross-arch gemm (n=1) decode elsewhere.
+        (KernelKey::FusedGateUpHfq6G256,     ArchPredicate::Always),
         (KernelKey::FusedGateUpQ4K,          ArchPredicate::Always),
         // HFQ3G256 fused gate+up (#397 Ship 5.2 slice 2). The qwen35 prefill
         // site routes this dtype to `gpu.gemm_gate_up_hfq3g256_wmma` on

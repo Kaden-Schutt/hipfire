@@ -494,10 +494,12 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
         FusedKeyUse { key: KernelKey::FusedGateUpQ4K,       archs: ALL },
         // Q8_0 — cross-arch
         FusedKeyUse { key: KernelKey::FusedGateUpQ8_0,      archs: ALL },
-        // ── dp4a-only kernels (gfx906 sdot4 path) ──
-        FusedKeyUse { key: KernelKey::FusedQkvHfq6G256,     archs: &["gfx906"] },
-        FusedKeyUse { key: KernelKey::FusedQkvzaHfq6G256,   archs: &["gfx906"] },
-        FusedKeyUse { key: KernelKey::FusedGateUpHfq6G256,   archs: &["gfx906"] },
+        // ── HFQ6G256 fused — cross-arch (batched gemm_*_hfq6g256 ladder:
+        //    wmma_gfx12/wmma/dp4a/dot2/fp16/scalar). Was wrongly gfx906-only
+        //    (HasDp4a), which dead-gated the AWQ A3B trunk on RDNA3/4. ──
+        FusedKeyUse { key: KernelKey::FusedQkvHfq6G256,     archs: ALL },
+        FusedKeyUse { key: KernelKey::FusedQkvzaHfq6G256,   archs: ALL },
+        FusedKeyUse { key: KernelKey::FusedGateUpHfq6G256,  archs: ALL },
         // ── WMMA-only kernels (RDNA3/RDNA4) ──
         FusedKeyUse { key: KernelKey::FusedQkvMq3G256Lloyd,  archs: WMMA_ARCHS },
         FusedKeyUse { key: KernelKey::FusedQkvMq4G256Lloyd,  archs: WMMA_ARCHS },

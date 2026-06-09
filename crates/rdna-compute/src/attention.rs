@@ -6034,12 +6034,24 @@ impl Gpu {
             n_heads % n_kv_heads == 0,
             "attention_dflash_wmma_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
         );
-        self.ensure_kernel(
-            "attention_dflash_wmma_f32",
-            kernels::ATTENTION_DFLASH_WMMA_SRC,
-            "attention_dflash_wmma_f32",
-        )?;
-        let func = &self.functions["attention_dflash_wmma_f32"];
+        // gfx12/RDNA4 uses a distinct WMMA lowering (`_w32_gfx12` intrinsic);
+        // the gfx11 `_w32` kernel does not compile on gfx12. Route to the
+        // gfx12 sister there, base kernel on RDNA3/RDNA3.5.
+        let (kernel_name, kernel_src, symbol) = if self.arch_caps.has_wmma_w32_gfx12() {
+            (
+                "attention_dflash_wmma_f32_gfx12",
+                kernels::ATTENTION_DFLASH_WMMA_GFX12_SRC,
+                "attention_dflash_wmma_f32_gfx12",
+            )
+        } else {
+            (
+                "attention_dflash_wmma_f32",
+                kernels::ATTENTION_DFLASH_WMMA_SRC,
+                "attention_dflash_wmma_f32",
+            )
+        };
+        self.ensure_kernel(kernel_name, kernel_src, symbol)?;
+        let func = &self.functions[kernel_name];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         // LDS layout (in f32 slots):
         //   Q_lds[16 * head_dim] + V_lds[16 * head_dim] + O_lds[16 * head_dim]
@@ -6125,12 +6137,23 @@ impl Gpu {
             n_heads % n_kv_heads == 0,
             "attention_dflash_wmma_m32_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
         );
-        self.ensure_kernel(
-            "attention_dflash_wmma_m32_f32",
-            kernels::ATTENTION_DFLASH_WMMA_M32_SRC,
-            "attention_dflash_wmma_m32_f32",
-        )?;
-        let func = &self.functions["attention_dflash_wmma_m32_f32"];
+        // gfx12/RDNA4 uses the `_w32_gfx12` WMMA lowering; the gfx11 kernel
+        // does not compile on gfx12. Base kernel on RDNA3/RDNA3.5.
+        let (m32_name, m32_src, m32_sym) = if self.arch_caps.has_wmma_w32_gfx12() {
+            (
+                "attention_dflash_wmma_m32_f32_gfx12",
+                kernels::ATTENTION_DFLASH_WMMA_M32_GFX12_SRC,
+                "attention_dflash_wmma_m32_f32_gfx12",
+            )
+        } else {
+            (
+                "attention_dflash_wmma_m32_f32",
+                kernels::ATTENTION_DFLASH_WMMA_M32_SRC,
+                "attention_dflash_wmma_m32_f32",
+            )
+        };
+        self.ensure_kernel(m32_name, m32_src, m32_sym)?;
+        let func = &self.functions[m32_name];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         // LDS layout (in f32 slots):
         //   Q_lds[32 * head_dim] + V_lds[16 * head_dim] + O_lds[32 * head_dim]
@@ -8794,16 +8817,16 @@ impl Gpu {
             &mut kf as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
-        let smem = n_iter as u32;
-        // Block sized to parallelise the fast-path identity write of
-        // up to k_stride indices across threads (each thread writes
-        // k_stride/128 slots via stride). Slow path serialises on
-        // thread 0 — extra threads early-return.
+        // Both paths are block-parallel now: the fast path identity-writes
+        // k_stride slots across threads; the slow path runs a parallel
+        // threshold top-K (block min/max + binary search + compact) over
+        // all 256 threads, using only static LDS — so no dynamic smem.
+        let smem = 0u32;
         unsafe {
             self.hip.launch_kernel(
                 func,
                 [n_idx_heads as u32, batch_size as u32, 1],
-                [128, 1, 1],
+                [256, 1, 1],
                 smem,
                 self.stream_ref(),
                 &mut params,
@@ -9804,6 +9827,195 @@ impl Gpu {
             )
         }
     }
+    /// Head-batched f16-WMMA DSA attention (direct top-K) — faster sibling of
+    /// `deepseek4_attn_swa_topk_direct_batched_f32`. K=V tied (single `swa_kv`);
+    /// `max_n_total` (= max over batches of n_valid_swa + n_active_topk) sizes
+    /// the per-block score LDS. Returns Err if the LDS would exceed 64 KB (the
+    /// caller falls back to the f32 kernel). Requires n_heads%16==0, head_dim%16==0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_attn_swa_topk_direct_wmma(
+        &mut self,
+        q: &GpuTensor,
+        swa_kv: &GpuTensor,
+        kv_cache: &GpuTensor,
+        topk_idx: &GpuTensor,
+        attn_sink: &GpuTensor,
+        n_valid_swa_arr: &GpuTensor,
+        n_active_topk_arr: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        swa_window: i32,
+        topk_window: i32,
+        n_compressed: i32,
+        batch_size: i32,
+        max_n_total: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(n_heads % 16, 0, "direct_wmma: n_heads must be %16 (got {n_heads})");
+        debug_assert_eq!(head_dim % 16, 0, "direct_wmma: head_dim must be %16 (got {head_dim})");
+        let n_pad = ((max_n_total + 15) / 16) * 16;
+        let lds_bytes = 16 * head_dim * 2 + 16 * n_pad * 4; // q f16 + s f32
+        if lds_bytes > 64 * 1024 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("direct_wmma: LDS {lds_bytes} > 64KB (max_n_total={max_n_total})"),
+            ));
+        }
+        self.ensure_kernel(
+            "deepseek4_attn_swa_topk_direct_wmma",
+            kernels::V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC,
+            "deepseek4_attn_swa_topk_direct_wmma",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = swa_kv.buf.as_ptr();
+        let cp = kv_cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let nvp = n_valid_swa_arr.buf.as_ptr();
+        let nap = n_active_topk_arr.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut sw = swa_window;
+        let mut tw = topk_window;
+        let mut nc = n_compressed;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nvp as *const _ as *mut c_void,
+            &nap as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut tw as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        // Capture-safe launch (blob path under the new base's prefill capture).
+        self.launch_maybe_blob(
+            "deepseek4_attn_swa_topk_direct_wmma",
+            [(n_heads / 16) as u32, batch_size as u32, 1],
+            [256, 1, 1], // 8 warps split the score n-tiles / output d-tiles
+            lds_bytes as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(cp);
+                b.push_ptr(ip);
+                b.push_ptr(sp);
+                b.push_ptr(nvp);
+                b.push_ptr(nap);
+                b.push_ptr(op);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(sw);
+                b.push_i32(tw);
+                b.push_i32(nc);
+                b.push_i32(bs);
+                b
+            },
+        )
+    }
+
+    /// Head-batched f16-WMMA DSA attention (gathered top-K) — faster sibling of
+    /// `deepseek4_attn_swa_topk_batched_f32`. K=V tied for both SWA (`swa_kv`)
+    /// and top-K (`topk_kv`, the staged d-major buffer). Same LDS/fallback rules
+    /// as `deepseek4_attn_swa_topk_direct_wmma`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_attn_swa_topk_batched_wmma(
+        &mut self,
+        q: &GpuTensor,
+        swa_kv: &GpuTensor,
+        topk_kv: &GpuTensor,
+        attn_sink: &GpuTensor,
+        n_valid_swa_arr: &GpuTensor,
+        n_active_topk_arr: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        swa_window: i32,
+        topk_window: i32,
+        batch_size: i32,
+        max_n_total: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(n_heads % 16, 0, "batched_wmma: n_heads must be %16 (got {n_heads})");
+        debug_assert_eq!(head_dim % 16, 0, "batched_wmma: head_dim must be %16 (got {head_dim})");
+        let n_pad = ((max_n_total + 15) / 16) * 16;
+        let lds_bytes = 16 * head_dim * 2 + 16 * n_pad * 4;
+        if lds_bytes > 64 * 1024 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("batched_wmma: LDS {lds_bytes} > 64KB (max_n_total={max_n_total})"),
+            ));
+        }
+        self.ensure_kernel(
+            "deepseek4_attn_swa_topk_batched_wmma",
+            kernels::V4F_ATTN_SWA_TOPK_BATCHED_WMMA_SRC,
+            "deepseek4_attn_swa_topk_batched_wmma",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = swa_kv.buf.as_ptr();
+        let tp = topk_kv.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let nvp = n_valid_swa_arr.buf.as_ptr();
+        let nap = n_active_topk_arr.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut sw = swa_window;
+        let mut tw = topk_window;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nvp as *const _ as *mut c_void,
+            &nap as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut tw as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        // Capture-safe launch: the new base graph-captures the prefill, and
+        // the void**-kernarg path records dangling stack pointers that break
+        // on replay. launch_maybe_blob uses the blob path under capture.
+        self.launch_maybe_blob(
+            "deepseek4_attn_swa_topk_batched_wmma",
+            [(n_heads / 16) as u32, batch_size as u32, 1],
+            [256, 1, 1],
+            lds_bytes as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(nvp);
+                b.push_ptr(nap);
+                b.push_ptr(op);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(sw);
+                b.push_i32(tw);
+                b.push_i32(bs);
+                b
+            },
+        )
+    }
+
     pub fn deepseek4_attn_swa_topk_f32_buf(
         &mut self,
         q: &GpuTensor,

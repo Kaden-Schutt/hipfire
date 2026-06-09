@@ -294,6 +294,19 @@ pub fn match_prefix(
         .map(|p| (p.key, p.ops.len()))
 }
 
+/// Lower-time fusion match over the canonical `FUSED_TABLE`. The Ship-6 super-op
+/// lowering (`superop::lower_layer`) calls THIS — reusing the same table + guards
+/// verbatim — so a lowered program can never drift from what `execute_steps`
+/// would dispatch live (the fusion-drift mitigation, spike risk #1).
+pub(crate) fn match_fused_prefix(steps: &[Step], ctx: &DispatchCtx) -> Option<(KernelKey, usize)> {
+    match_prefix(FUSED_TABLE, steps, ctx)
+}
+
+/// Public(crate) op-kind accessor for the lowering (mirror of the private `op_kind`).
+pub(crate) fn step_op_kind(step: &Step) -> PipelineOp {
+    op_kind(step)
+}
+
 const QKV3: &[PipelineOp] = &[
     PipelineOp::RmsnormAutomatic,
     PipelineOp::Gemv, PipelineOp::Gemv, PipelineOp::Gemv,

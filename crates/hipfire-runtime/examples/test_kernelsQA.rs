@@ -422,7 +422,7 @@ fn gdn_case(expected_arch: Option<&str>, n_heads: usize, hd: usize) -> CaseOutco
         let alpha = gpu.upload_f32(&vec![0.5f32; n_heads], &[n_heads]).map_err(|e| e.to_string())?;
         let beta = gpu.upload_f32(&vec![0.5f32; n_heads], &[n_heads]).map_err(|e| e.to_string())?;
         let o = gpu.alloc_tensor(&[n_heads * hd], DType::F32).map_err(|e| e.to_string())?;
-        gpu.gated_delta_net_q8(&q, &k, &v, &alpha, &beta, &s_q8, &s_scales, &o, 1, n_heads, hd)
+        gpu.gated_delta_net_q8(&q, &k, &v, &alpha, &beta, &s_q8, &s_scales, &o, 1, n_heads, hd, None)
             .map_err(|e| e.to_string())?;
         let r = gpu.download_f32(&o).map_err(|e| e.to_string())?;
         ensure(r[0].is_finite(), format!("gdn produced non-finite value {}", r[0]))?;

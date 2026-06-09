@@ -145,13 +145,20 @@ pub fn populate(registry: &mut KernelRegistry) {
     // resolve() returns the first passing (arch × shape) variant.
 
     // AttnFullF16: non-causal, F16 K/V
-    // v5 F16-K/V rung (gfx12)
+    // v5 F16-K/V rung (gfx12). BatchGe(32) (not 64 like the gfx11 v5 rung
+    // below) so it ALSO covers the 32..63 window that on gfx11 falls to the
+    // DflashN128 tile — whose kernel (attention_dflash_wmma_n128_f16kv_f32)
+    // is gfx11-only (`_w32` intrinsic, no gfx12 lowering) and would JIT-fail
+    // on gfx1201. The v5 gfx12 kernel handles batch<64 correctly (host grid
+    // = ceil(b/64), kernel masks gq>=B), so this shadows DflashN128 on gfx12
+    // and keeps RDNA4 F16 full-attention on WMMA. gfx12-only predicate →
+    // gfx11 behaviour (v5 for >=64, n128 for 32..63) is unchanged.
     registry.register(KernelVariant {
         key: KernelKey::AttnFullF16,
         arch_required: ArchPredicate::HasWmmaGfx12,
         shape_gate: Some(ShapePredicate::And(&[
             ShapePredicate::HeadDimEq(128),
-            ShapePredicate::BatchGe(64),
+            ShapePredicate::BatchGe(32),
         ])),
         steps: &[PipelineOp::Attend],
         has_awq: false,
@@ -169,7 +176,12 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::DflashV5,
     });
-    // n128 F16-K/V rung (gfx11 only — no gfx12 sibling)
+    // n128 F16-K/V rung. gfx11 only — kernel has no gfx12 lowering. On gfx12
+    // this is shadowed by the DflashV5Gfx12 rung above (BatchGe(32)), so it
+    // is never selected on RDNA4 despite the HasWmma predicate (a gfx12 v5
+    // entry at >=32 takes priority). Keep HasWmma: on gfx11 it is the live
+    // 32..63 rung; do NOT narrow to HasWmmaW32 (AttnFullF16 has no scalar
+    // floor, so an over-narrow gate would dead-gate the shape on gfx12).
     registry.register(KernelVariant {
         key: KernelKey::AttnFullF16,
         arch_required: ArchPredicate::HasWmma,

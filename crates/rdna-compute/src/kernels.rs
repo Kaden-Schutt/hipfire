@@ -1587,6 +1587,8 @@ pub const GEMM_KSPLIT_DET_FINALIZE_SRC: &str =
 // stuck on the dot2 fp16 fallback before this).
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx12_bt.hip");
 pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_lmhead_wmma.gfx12.hip");
 // Q8_1 MMQ prefill variant — opt-in via HIPFIRE_MMQ=1, gated to RDNA3/3.5.
@@ -1688,12 +1690,16 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC: &str =
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.gfx12.hip");
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_gfx12_bt.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister: gfx12 hfq4 recipe + 4-output qkv/z/beta/alpha
 // routing for the DeltaNet LinearAttention preamble.
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.gfx12.hip");
+pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma_gfx12_bt.hip");
 // HFQ3-G256 sister of GEMM_QKVZA_HFQ4G256_WMMA_SRC. Same WMMA shape +
 // lane decomposition; only the inner K-tile unpack differs (3-bit
 // cross-byte vs 4-bit nibble). Used for MQ3 prefill via dispatch
@@ -2739,6 +2745,14 @@ pub const QKV_SPLIT_INTERLEAVED_SRC: &str =
 pub const ATTENTION_DFLASH_WMMA_SRC: &str =
     include_str!("../../../kernels/src/attention_dflash_wmma.hip");
 
+/// gfx12/RDNA4 sister of `ATTENTION_DFLASH_WMMA_SRC`. Same algorithm; the
+/// WMMA fragments use `half8_t` operands + the `_w32_gfx12` intrinsic (the
+/// gfx11 `_w32` builtin does not lower on gfx12 — "Cannot select intrinsic").
+/// Routed via `has_wmma_w32_gfx12()` in `attention_dflash_wmma_f32`. See
+/// `kernels/src/attention_dflash_wmma.gfx12.hip`.
+pub const ATTENTION_DFLASH_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/attention_dflash_wmma.gfx12.hip");
+
 /// M=32 variant of `ATTENTION_DFLASH_WMMA_SRC` — two-wave block (64
 /// threads), processes 32 queries per block instead of 16. Halves the
 /// number of query-tile blocks at large B, which halves global K-tile
@@ -2747,6 +2761,13 @@ pub const ATTENTION_DFLASH_WMMA_SRC: &str =
 /// See `kernels/src/attention_dflash_wmma_m32.hip`.
 pub const ATTENTION_DFLASH_WMMA_M32_SRC: &str =
     include_str!("../../../kernels/src/attention_dflash_wmma_m32.hip");
+
+/// gfx12/RDNA4 sister of `ATTENTION_DFLASH_WMMA_M32_SRC` (`_w32_gfx12`
+/// WMMA, K split across wave-halves). Routed via `has_wmma_w32_gfx12()`
+/// in `attention_dflash_wmma_m32_f32`. See
+/// `kernels/src/attention_dflash_wmma_m32.gfx12.hip`.
+pub const ATTENTION_DFLASH_WMMA_M32_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/attention_dflash_wmma_m32.gfx12.hip");
 
 /// N=64 K-tile variant — M=32 queries per block, **64 keys per outer
 /// loop iteration** (vs 16 in M32_SRC). Q lives in registers across all
@@ -3630,6 +3651,17 @@ pub const V4F_ATTN_SWA_TOPK_BATCHED_SRC: &str =
 /// DeepSeek V4 SWA + indexer top-K attention, direct main-KV variant.
 pub const V4F_ATTN_SWA_TOPK_DIRECT_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_attn_swa_topk_direct_batched.hip");
+
+/// Head-batched f16-WMMA port of the direct-batched DSA attention (gfx1151).
+/// Same joint-softmax math; 16 heads/block so the score/output GEMVs become
+/// WMMA GEMMs reading the shared K/V once. See deepseek4_attn_swa_topk_direct_wmma.hip.
+pub const V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_direct_wmma.hip");
+
+/// Head-batched f16-WMMA port of the gathered DSA attention (top-K staged into
+/// topk_kv[B,D,topk_win]). Sibling of the direct WMMA kernel.
+pub const V4F_ATTN_SWA_TOPK_BATCHED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_batched_wmma.hip");
 
 /// DeepSeek V4 batched pure-SWA attention (Phase A2, 2026-05-18). Twin of
 /// `V4F_ATTN_SWA_TOPK_BATCHED_SRC` for layers without an indexer top-K

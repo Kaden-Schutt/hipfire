@@ -1150,6 +1150,31 @@ impl Gpu {
         Ok(tensor)
     }
 
+    /// Allocate an F32 tensor filled with a constant `value` (host-side fill +
+    /// sync htod). Used for `-inf`-initialised buffers where a byte-memset
+    /// can't express the bit pattern (e.g. the compressor `score_state`, which
+    /// the reference inits to `float("-inf")` so unfilled pool slots get zero
+    /// softmax weight).
+    pub fn full_f32(&mut self, shape: &[usize], value: f32) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let tensor = self.alloc_tensor(shape, DType::F32)?;
+        let data = vec![value; tensor.numel()];
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        self.hip.memcpy_htod(&tensor.buf, bytes)?;
+        Ok(tensor)
+    }
+
+    /// In-place constant fill of an existing F32 tensor (sync htod).
+    pub fn fill_f32(&mut self, tensor: &GpuTensor, value: f32) -> HipResult<()> {
+        self.bind_thread()?;
+        let data = vec![value; tensor.numel()];
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        self.hip.memcpy_htod(&tensor.buf, bytes)?;
+        Ok(())
+    }
+
     pub fn download_f32(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
         self.bind_thread()?;
         let numel = tensor.numel();

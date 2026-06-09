@@ -185,6 +185,16 @@ impl GemmFamily {
             // routes its own gfx12-vs-gfx11 WMMA sibling internally.
             K::GemmHfp4G32Residual => hip!(gpu.gemm_hfp4g32_residual(w.buf, x, y, m, k, batch_size)),
             K::GemmMq3G256LloydResidual => hip!(gpu.gemm_mq3g256_lloyd_residual_wmma(w.buf, x, y, m, k, batch_size)),
+            // #397 Ship 5.3: spec-decode (DFlash) batched lm_head catalog. Each
+            // arm maps the explicit key to the exact rdna-compute method the prior
+            // direct spec-decode call used. The operand order
+            // `(w.buf, x, y, m, k, batch_size)` is byte-identical, and each method
+            // keeps its own internal arch routing (WMMA for batch>1 on gfx11/12,
+            // dp4a on gfx906, fp16/scalar fallback) so output is preserved exactly.
+            K::GemmQ8_0Batched => hip!(gpu.gemm_q8_0_batched(w.buf, x, y, m, k, batch_size)),
+            K::GemmHfq4G256BatchedLmhead => hip!(gpu.gemm_hfq4g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
+            K::GemmHfq3G256BatchedLmhead => hip!(gpu.gemm_hfq3g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
+            K::GemmHfq6G256BatchedLmhead => hip!(gpu.gemm_hfq6g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
             other => Err(DispatchError::MissingImpl { key: other }),
         }
     }

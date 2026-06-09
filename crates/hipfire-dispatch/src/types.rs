@@ -262,6 +262,18 @@ pub enum KernelKey {
     GemmHfq3G256Residual,
     GemmHfp4G32Residual,
     GemmMq3G256LloydResidual,
+    // GEMM — spec-decode (DFlash) batched lm_head catalog (#397 Ship 5.3).
+    // These take the canonical signature `(a, x, y, m, k, batch_size)` and
+    // dispatch the batched verify/draft lm_head GEMM. Each `gpu.gemm_*` method
+    // auto-routes its own arch ladder internally (WMMA for batch>1 on gfx11/12,
+    // dp4a on gfx906, fp16/scalar fallback otherwise) and runs on EVERY arch,
+    // so all are registered `ArchPredicate::Always`. Dispatched through
+    // GemmFamily::run_key against the explicit key (NOT resolve()), so the
+    // method selected is byte-identical to the prior direct spec-decode call.
+    GemmQ8_0Batched,
+    GemmHfq4G256BatchedLmhead,
+    GemmHfq3G256BatchedLmhead,
+    GemmHfq6G256BatchedLmhead,
     // Fused QKV
     FusedQkvHfq4G256,
     FusedQkvMq3G256Lloyd,

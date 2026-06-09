@@ -2207,12 +2207,14 @@ fn main() {
                 // `/v1/chat/completions` POST (no sampling fields) works on
                 // both. Explicit per-request values still override either.
                 let (default_temp, default_top_p) = if m.arch_id == 11 {
-                    // LFM2.5-MoE (11): Liquid's model card recommends specific
-                    // sampling — temperature=0.2, top_p=0.80 (+ repetition_penalty
-                    // 1.05, set below). Use those exact values, not the generic
-                    // MoE-instruct default — they're tuned for this model and
-                    // keep it on-distribution.
-                    (0.2_f64, 0.80_f64)
+                    // LFM2.5 (11): Liquid's model card recommends temperature=0.1,
+                    // top_k=50, repetition_penalty=1.05. The daemon sampler is
+                    // temp + top_p + repeat_penalty (no user-facing top_k — the
+                    // sample_top_p kernel's top-K is a fixed candidate gather), so
+                    // we apply temp=0.1 + rep=1.05 (set below) and keep a tight
+                    // top_p=0.80; at temp 0.1 the top_k-vs-top_p choice is near
+                    // moot (the distribution is already peaked).
+                    (0.1_f64, 0.80_f64)
                 } else if m.arch_id == 9 || m.arch_id == 10 {
                     // DeepSeek V4 (9) + MiniMax-M2 (10): quantized instruct
                     // models that fall into block-level attractors at lower
@@ -5704,7 +5706,12 @@ fn generate_dflash(
     // below before seed_target_hidden_from_prompt runs — so we never
     // need to guard on `seq_pos == 0` here.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
+    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
+    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
+    // the .hfq carries no template, e.g. an older A1B convert).
+    let jinja_enabled =
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
     let try_jinja = jinja_enabled && m.chat_template.is_some();
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
@@ -6974,7 +6981,12 @@ fn generate_multi(
     //   2) Default: hand-rolled ChatFrame::Plain scaffold, byte-
     //      identical to the pp=1 default path so multi-turn behavior
     //      matches between pp=1 and pp>1 when both run the same prompt.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
+    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
+    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
+    // the .hfq carries no template, e.g. an older A1B convert).
+    let jinja_enabled =
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
     // hunt3 H-A: drop the `seq_pos == 0` gate (PR #389 removed it from generate()).
     // With the gate, turn 2+ fell through to the Plain scaffold, dropping the
     // system prompt and the full history replay that render_messages provides.
@@ -8322,7 +8334,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // honors `assistant_prefix` directly (ClosedThink emits a closed
     // `<think></think>` block after the assistant prefix). Each path
     // picks up the signal it needs.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
+    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
+    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
+    // the .hfq carries no template, e.g. an older A1B convert).
+    let jinja_enabled =
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
     // Jinja renders the FULL conversation every turn (stateless full-render,
     // like generate_dflash) — fire on every turn, not just `seq_pos == 0`.
     // `render_messages` below replays `messages_history` (all prior turns) and
@@ -10439,6 +10456,23 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                         }
                     }
 
+                    // If the replayed turn body opened a `<think>` block but
+                    // the model premature-stopped without closing it (EOS inside
+                    // the think, no tool call), close it here with a `</think>`.
+                    // Otherwise the dangling `<think>…<EOS>` drifts the next turn
+                    // (more premature stops, a leaked `</think>`). This is a
+                    // deterministic surround token — a pure function of
+                    // msg.content, NOT part of the cached turn body or the
+                    // asst_turn_fingerprint (which strips think anyway) — so it
+                    // is emitted identically on hit and miss paths and the
+                    // prefix-cache LCP + asst_turn_cache stay effective.
+                    if msg.tool_calls.is_empty()
+                        && msg.content.starts_with("<think>")
+                        && !msg.content.contains("</think>")
+                    {
+                        prompt_ids.extend(tokenizer.encode("</think>"));
+                    }
+
                     // Close the assistant turn with the EOS marker so
                     // the next turn starts cleanly.
                     prompt_ids.push(m.deepseek4_eos_tok);
@@ -10599,9 +10633,39 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         }
     };
 
+    // DSA compressor-ring safety on a PARTIAL prefix-cache hit.
+    //
+    // The DSA decode caches (SWA ring, compressor/indexer ring state, full +
+    // compressed KV) are *position-indexed* and were left by the prior turn at
+    // ITS end position. A FULL hit (`lcp == prior length`) resumes exactly where
+    // the prior turn left those rings, so the incremental prefill is correct —
+    // this is the normal "growing conversation" path and stays fast.
+    //
+    // A PARTIAL hit (`0 < lcp < prior length`) resumes the suffix prefill from
+    // `start_pos = lcp`, but the compressor ring still holds the prior turn's
+    // *end* window, not `lcp`'s. The first compressed block committed after the
+    // resume point then pools a STALE overlap window — and with ratio-4 overlap
+    // that window reaches back over the just-cached tail, corrupting far-context
+    // recall (the cwd/tool-path "lossiness" symptom). The ring can't be cheaply
+    // repopulated (a position's hidden state depends on its SWA window, which
+    // chains all the way back to token 0), so the correct, robust fix is to fall
+    // back to a cold rebuild for partial hits only. Full hits are unaffected.
+    let lcp = if lcp > 0 && lcp < m.conversation_tokens.len() {
+        0
+    } else {
+        lcp
+    };
+
     if lcp == 0 {
         // Cache miss — start a fresh conversation in V4F's state.
         state.reset();
+        // reset() only rewinds n_tokens; the position-indexed decode caches
+        // (SWA ring, compressed/full KV, indexer scratch) still hold the prior
+        // turn's residue, which bleeds into this fresh conversation's forward
+        // and makes greedy output drift turn-to-turn (the "recall/tool-calls
+        // unreliable" symptom). Zero them so a fresh conversation reproduces a
+        // freshly-launched daemon's clean, deterministic state.
+        state.zero_decode_caches(gpu);
         m.conversation_tokens.clear();
         // Tear down the captured V4F decode hipGraph alongside the
         // state, same rationale as the daemon's `"reset"` handler:
@@ -10801,6 +10865,29 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         let mut spec_last_token = deepseek4::spec_decode::logits_argmax(&last_logits) as u32;
         let mut spec_last_position = pos_after_prefill;
         let mut last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
+        // Emit the FIRST generated token (the prefill argmax). The loop below
+        // consumes `spec_last_token` as the decode-FROM token and only emits
+        // the drafted continuation (`r.accepted_tokens`), so without this the
+        // first token is dropped from every spec-decode response — a regression
+        // vs the non-spec path (e.g. "Here's…" → "'s…"). Mirrors the in-loop
+        // emission; EOS-first yields an empty turn (loop then no-ops).
+        if spec_last_token != eos_tok && generated_count < max_tokens {
+            let frag = tokenizer.decode(&[spec_last_token]);
+            for ev in parser.feed(&frag) {
+                absorb_event(&ev);
+                emit_stream_event(stdout, id, ev);
+            }
+            emit_committed_event(
+                stdout,
+                id,
+                spec_last_token,
+                generated_count,
+                decode_t0.elapsed().as_millis() as u64,
+            );
+            let _ = stdout.flush();
+            m.conversation_tokens.push(spec_last_token);
+            generated_count += 1;
+        }
         'outer: while generated_count < max_tokens {
             let lh: Option<&rdna_compute::GpuTensor> = unsafe {
                 last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref())
@@ -10849,21 +10936,15 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     break 'outer;
                 }
                 let frag = tokenizer.decode(&[t]);
-                if grammar_active {
-                    for ev in parser.feed(&frag) {
-                        absorb_event(&ev);
-                        emit_stream_event(stdout, id, ev);
-                    }
-                } else {
-                    // Build through serde_json so `id` (user-supplied) and
-                    // `frag` (model-generated UTF-8 with possible `"`/`\`)
-                    // can't corrupt the JSONL line.
-                    let envelope = serde_json::json!({
-                        "type": "token",
-                        "id": id,
-                        "text": frag,
-                    });
-                    let _ = writeln!(stdout, "{}", envelope);
+                // Always route through the DSML StreamParser (new_in_think in
+                // thinking modes) so `<think>…</think>` is split into reasoning
+                // vs content server-side and emitted as structured events. The
+                // old non-grammar branch emitted raw tokens, leaving the CLI to
+                // client-side-parse a stream that (for V4 thinking mode) starts
+                // INSIDE the think block with no `<think>` opener in the output.
+                for ev in parser.feed(&frag) {
+                    absorb_event(&ev);
+                    emit_stream_event(stdout, id, ev);
                 }
                 emit_committed_event(
                     stdout,
@@ -10882,15 +10963,16 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             }
             last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
         }
-        if grammar_active {
-            for ev in parser.finish() {
-                absorb_event(&ev);
-                emit_stream_event(stdout, id, ev);
-            }
-            let _ = stdout.flush();
-            drop(absorb_event);
-            tool_calls_parsed_count = emit_tool_calls_buf.len();
+        // Flush buffered partial markers / unclosed think — always, not only
+        // when tools are present. A thinking turn that fills max_tokens without
+        // closing </think> must still surface its buffered reasoning.
+        for ev in parser.finish() {
+            absorb_event(&ev);
+            emit_stream_event(stdout, id, ev);
         }
+        let _ = stdout.flush();
+        drop(absorb_event);
+        tool_calls_parsed_count = emit_tool_calls_buf.len();
     } else {
         // Plain decode loop. Sampler honours `temp` + `top_p` from the
         // request; HF default is temp=1.0, top_p=1.0 (multinomial across
@@ -11270,7 +11352,12 @@ fn generate_lfm2moe(
     // ── Prompt build (same two-path branch as the minimax AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+        // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
+    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
+    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
+    // the .hfq carries no template, e.g. an older A1B convert).
+    let jinja_enabled =
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -11703,7 +11790,12 @@ fn generate_minimax(
     let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+        // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
+    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
+    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
+    // the .hfq carries no template, e.g. an older A1B convert).
+    let jinja_enabled =
+        std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1") || m.arch_id == 11;
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();

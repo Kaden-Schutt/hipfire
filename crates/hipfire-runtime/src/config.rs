@@ -25,6 +25,10 @@ pub struct RuntimeConfig {
     pub ddtree_topk: usize,
     pub prefill_batched: bool,
     pub flash_partials_batch: Option<usize>,
+    /// Tensor-parallel RCCL all-reduce toggle. `None` (unset) → RCCL is used
+    /// (default). `Some(false)` (HIPFIRE_TP_USE_RCCL=0) → opt out of the RCCL
+    /// path. `Some(true)` → force on. Read by `multi_gpu::Gpus::ensure_rccl`.
+    pub tp_use_rccl: Option<bool>,
     pub ngram_loop_threshold: usize,
     pub ngram_window: usize,
     pub devices: Option<String>,
@@ -90,6 +94,10 @@ impl RuntimeConfig {
             flash_partials_batch: std::env::var("HIPFIRE_FLASH_PARTIALS_BATCH")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok()),
+            tp_use_rccl: std::env::var("HIPFIRE_TP_USE_RCCL")
+                .ok()
+                .as_deref()
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false")),
             ngram_loop_threshold: std::env::var("HIPFIRE_NGRAM_LOOP_THRESHOLD")
                 .ok()
                 .and_then(|v| v.parse().ok())

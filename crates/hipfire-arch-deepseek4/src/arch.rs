@@ -149,15 +149,44 @@ impl DeepseekV4 {
     /// inline logic but is parameterized on `prefix` so the same code
     /// runs for `layers.{L}` and `mtp.0`. Writes `expert_w2_blob/_ptrs/
     /// _stride` and `expert_gate_up_blob/_ptrs/_stride` on the layer.
+    ///
+    /// `shard = Some((cfg, rank))` enables **EP shard-aware loading**: every
+    /// expert is `pread` from the file (for stride validation) but ONLY the
+    /// rank-owned experts are uploaded into a compact packed blob, so an
+    /// 81 GB model fits across N×32 GB cards. The per-expert pointer table
+    /// then maps owned `e` → its compact-blob slot; non-owned `e` → a shared
+    /// ZEROED gate_up dummy (SwiGLU(0,0)=0 ⇒ 0 routed contribution, even for
+    /// the MQ2/MQ3-Lloyd codebook path: an all-zero buffer dequantizes to 0).
+    /// The non-owned w2 (down) ptr reuses the compact base — its rotate input
+    /// is 0 regardless, so the down weights read don't matter. `shard = None`
+    /// uploads all experts (single-GPU, byte-identical to the original).
     fn upload_layer_routed_experts(
         hfq: &HfqFile,
         gpu: &mut Gpu,
         prefix: &str,
         n_exp: usize,
         layer: &mut DeepseekV4LayerWeights,
+        shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
     ) -> Result<(), String> {
-        // w2 (down): pread each expert into a layer-local host Vec, then
-        // one upload.
+        // EP shard: precompute owned set + compact-slot mapping. `shard = None`
+        // ⇒ every expert owned, `local_of_global[e] == e`, n_owned == n_exp →
+        // identical layout to the unsharded path.
+        let owns = |e: usize| shard.map(|(s, rank)| s.owns_expert(rank, e)).unwrap_or(true);
+        let mut local_of_global = vec![usize::MAX; n_exp];
+        let mut n_owned = 0usize;
+        for e in 0..n_exp {
+            if owns(e) {
+                local_of_global[e] = n_owned;
+                n_owned += 1;
+            }
+        }
+        if n_owned == 0 {
+            return Err(format!("deepseek4: {prefix} shard rank owns no experts"));
+        }
+
+        // w2 (down): pread each expert; pack ONLY owned into a layer-local host
+        // Vec, then one upload. Non-owned experts are read for stride
+        // validation, then dropped (never uploaded — the EP memory win).
         {
             let name0 = format!("{prefix}.ffn.experts.0.w2.weight");
             let (info0, _b0) = hfq
@@ -167,8 +196,15 @@ impl DeepseekV4 {
             let shape0: Vec<usize> = info0.shape.iter().map(|&s| s as usize).collect();
             drop(_b0);
 
-            let mut blob = Vec::with_capacity(stride * n_exp);
+            let mut blob = Vec::with_capacity(stride * n_owned);
             for e in 0..n_exp {
+                // EP shard: read+pack ONLY owned experts (each rank reads just
+                // its 1/N of the file → faster load, less page-cache churn).
+                // Non-owned experts are never touched — their pointer-table
+                // slot reuses the compact base (rotate input 0 ⇒ output 0).
+                if !owns(e) {
+                    continue;
+                }
                 let name = format!("{prefix}.ffn.experts.{e}.w2.weight");
                 let (info, bytes) = hfq
                     .tensor_data_pread(&name)
@@ -181,14 +217,24 @@ impl DeepseekV4 {
                 }
                 blob.extend_from_slice(&bytes);
             }
-            let mut blob_shape = vec![n_exp];
+            let mut blob_shape = vec![n_owned];
             blob_shape.extend_from_slice(&shape0);
             let blob_tensor = gpu
                 .upload_raw(&blob, &blob_shape)
                 .map_err(|e| format!("deepseek4: upload blob {prefix}.w2: {e:?}"))?;
             drop(blob);
             let base_ptr = blob_tensor.buf.as_ptr() as u64;
-            let ptrs: Vec<u64> = (0..n_exp).map(|e| base_ptr + (e * stride) as u64).collect();
+            // Owned e → compact slot; non-owned e → base (rotate input 0 ⇒
+            // output 0 regardless of which down weights are read).
+            let ptrs: Vec<u64> = (0..n_exp)
+                .map(|e| {
+                    if owns(e) {
+                        base_ptr + (local_of_global[e] * stride) as u64
+                    } else {
+                        base_ptr
+                    }
+                })
+                .collect();
             let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
             let ptr_tensor = gpu
                 .alloc_tensor(&[2 * n_exp], rdna_compute::DType::F32)
@@ -200,8 +246,8 @@ impl DeepseekV4 {
             layer.expert_w2_ptrs = Some(ptr_tensor);
             layer.expert_w2_stride = stride;
         }
-        // gate_up (combined w1 ‖ w3): per-expert pread, build one
-        // layer-local host Vec, single upload.
+        // gate_up (combined w1 ‖ w3): per-expert pread, pack ONLY owned, single
+        // upload. Non-owned ptr → a shared ZEROED dummy gate_up buffer.
         {
             let w1_0 = format!("{prefix}.ffn.experts.0.w1.weight");
             let w3_0 = format!("{prefix}.ffn.experts.0.w3.weight");
@@ -222,27 +268,55 @@ impl DeepseekV4 {
                 ));
             }
             let combined_stride = stride_w1 + stride_w3;
-            let mut combined = Vec::with_capacity(combined_stride * n_exp);
+            let mut combined = Vec::with_capacity(combined_stride * n_owned);
             for e in 0..n_exp {
+                // EP shard: pack ONLY owned experts. Each read's `Ref` on the
+                // shared pread buffer MUST be dropped before the next pread
+                // (the buffer is reused; holding two `Ref`s panics with
+                // "RefCell already borrowed").
+                if !owns(e) {
+                    continue;
+                }
                 let w1_name = format!("{prefix}.ffn.experts.{e}.w1.weight");
-                let (_, w1_bytes) = hfq
-                    .tensor_data_pread(&w1_name)
-                    .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
-                combined.extend_from_slice(&w1_bytes);
-                drop(w1_bytes);
+                {
+                    let (_, w1_bytes) = hfq
+                        .tensor_data_pread(&w1_name)
+                        .ok_or_else(|| format!("deepseek4: missing {w1_name}"))?;
+                    combined.extend_from_slice(&w1_bytes);
+                }
                 let w3_name = format!("{prefix}.ffn.experts.{e}.w3.weight");
-                let (_, w3_bytes) = hfq
-                    .tensor_data_pread(&w3_name)
-                    .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
-                combined.extend_from_slice(&w3_bytes);
+                {
+                    let (_, w3_bytes) = hfq
+                        .tensor_data_pread(&w3_name)
+                        .ok_or_else(|| format!("deepseek4: missing {w3_name}"))?;
+                    combined.extend_from_slice(&w3_bytes);
+                }
             }
             let combined_tensor = gpu
-                .upload_raw(&combined, &[n_exp, combined_stride])
+                .upload_raw(&combined, &[n_owned, combined_stride])
                 .map_err(|e| format!("deepseek4: upload gate_up {prefix}: {e:?}"))?;
             drop(combined);
             let base_ptr = combined_tensor.buf.as_ptr() as u64;
+            // Non-owned gate_up ptr → a shared zeroed dummy (only when actually
+            // sharding with some experts non-owned); else the compact base.
+            let dummy_gu = if shard.is_some() && n_owned < n_exp {
+                let z = gpu
+                    .zeros(&[combined_stride / 4], rdna_compute::DType::F32)
+                    .map_err(|e| format!("deepseek4: {prefix} zero gate_up dummy: {e:?}"))?;
+                let p = z.buf.as_ptr() as u64;
+                std::mem::forget(z); // leaked for model lifetime (process teardown reclaims)
+                p
+            } else {
+                base_ptr
+            };
             let ptrs: Vec<u64> = (0..n_exp)
-                .map(|e| base_ptr + (e * combined_stride) as u64)
+                .map(|e| {
+                    if owns(e) {
+                        base_ptr + (local_of_global[e] * combined_stride) as u64
+                    } else {
+                        dummy_gu
+                    }
+                })
                 .collect();
             let ptr_bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
             let ptr_tensor = gpu
@@ -470,6 +544,37 @@ impl Architecture for DeepseekV4 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
+        Self::load_weights_inner(hfq, cfg, gpu, None)
+    }
+
+    fn new_state(_gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
+        DeepseekV4State::new(cfg)
+    }
+}
+
+impl DeepseekV4 {
+    /// EP shard-aware load entry (mirrors `MiniMaxWeights::load`).
+    ///
+    /// Loads the full model but uploads only `rank`'s owned routed experts
+    /// per layer (non-owned ptr → zeroed dummy), so an 81 GB model fits across
+    /// N×32 GB cards under all-reduce EP. Non-expert weights (embed, head,
+    /// attention, norms, shared expert, router) are replicated per rank.
+    pub fn load_weights_sharded(
+        hfq: &mut HfqFile,
+        cfg: &DeepseekV4Config,
+        gpu: &mut Gpu,
+        shard: &hipfire_runtime::tp_shard::ShardConfig,
+        rank: usize,
+    ) -> Result<DeepseekV4Weights, String> {
+        Self::load_weights_inner(hfq, cfg, gpu, Some((shard, rank)))
+    }
+
+    fn load_weights_inner(
+        hfq: &mut HfqFile,
+        cfg: &DeepseekV4Config,
+        gpu: &mut Gpu,
+        shard: Option<(&hipfire_runtime::tp_shard::ShardConfig, usize)>,
+    ) -> Result<DeepseekV4Weights, String> {
         // Phase 1.5 host walk verifies every expected tensor is in the
         // HFQ index. We then upload all globals and per-layer
         // non-expert tensors. The 256 routed experts per layer are
@@ -1116,7 +1221,14 @@ impl Architecture for DeepseekV4 {
                     continue;
                 }
                 let n_exp = cfg.n_routed_experts;
-                Self::upload_layer_routed_experts(hfq, gpu, &format!("layers.{l}"), n_exp, layer)?;
+                Self::upload_layer_routed_experts(
+                    hfq,
+                    gpu,
+                    &format!("layers.{l}"),
+                    n_exp,
+                    layer,
+                    shard,
+                )?;
             }
         }
 
@@ -1140,15 +1252,12 @@ impl Architecture for DeepseekV4 {
                     "mtp.0",
                     cfg.n_routed_experts,
                     mtp,
+                    shard,
                 )?;
             }
         }
 
         Ok(weights)
-    }
-
-    fn new_state(_gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
-        DeepseekV4State::new(cfg)
     }
 }
 

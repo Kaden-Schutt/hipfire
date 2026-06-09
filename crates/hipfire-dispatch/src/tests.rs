@@ -173,16 +173,18 @@ fn arch_gemv_dp4a_gfx906_only() {
 }
 
 #[test]
-fn fused_qkv_hfq6_resolved_only_on_gemv_dp4a_arch() {
+fn fused_qkv_hfq6_resolves_cross_arch() {
+    // Regression: the HFQ6 fused keys (qkv / gate_up / qkvza) used to be gated
+    // `HasDp4a` (gfx906-only), which dead-gated the AWQ A3B trunk's HFQ6-promoted
+    // layers on RDNA3/RDNA4 → batched-prefill panic "no implementation for
+    // FusedQkvzaHfq6G256". Their batched run-arms call gemm_{qkv,gate_up,qkvza}_
+    // hfq6g256, which carry the full cross-arch ladder, so they are now `Always`.
     let fam = FusedQkvFamily::new();
-    // gfx906 (gemv_dp4a enabled) → HFQ6 variants resolve
-    assert!(fam.resolve(KernelKey::FusedQkvzaHfq6G256, &ctx_gfx906(), None).is_ok());
-    assert!(fam.resolve(KernelKey::FusedQkvHfq6G256, &ctx_gfx906(), None).is_ok());
-    assert!(fam.resolve(KernelKey::FusedGateUpHfq6G256, &ctx_gfx906(), None).is_ok());
-    // RDNA3 (gemv_dp4a disabled by default) → HFQ6 variants rejected
-    assert!(fam.resolve(KernelKey::FusedQkvzaHfq6G256, &ctx_rdna3(), None).is_err());
-    assert!(fam.resolve(KernelKey::FusedQkvHfq6G256, &ctx_rdna3(), None).is_err());
-    assert!(fam.resolve(KernelKey::FusedGateUpHfq6G256, &ctx_rdna3(), None).is_err());
+    for ctx in [&ctx_gfx906(), &ctx_rdna3()] {
+        assert!(fam.resolve(KernelKey::FusedQkvzaHfq6G256, ctx, None).is_ok());
+        assert!(fam.resolve(KernelKey::FusedQkvHfq6G256, ctx, None).is_ok());
+        assert!(fam.resolve(KernelKey::FusedGateUpHfq6G256, ctx, None).is_ok());
+    }
 }
 
 #[test]

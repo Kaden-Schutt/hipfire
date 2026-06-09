@@ -5351,6 +5351,14 @@ fn main() {
         // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
         // per-expert) and are translated when the forward bring-up lands.
         "deepseek_v4" => 9,
+        // LFM2.5 (LiquidAI): hybrid short-conv + GQA-attn layers, SwiGLU FFN.
+        //   "lfm2_moe" = A1B (dense MLP head layers + top-4 MoE); per-expert
+        //               pre-split w1/w2/w3 → MQ4G256, everything else → Q8.
+        //   "lfm2"     = dense (Lfm2ForCausalLM, e.g. 350M/1.2B) — no experts,
+        //               every layer dense SwiGLU; the ingest Q8s all tensors.
+        // Crate hipfire-arch-lfm2moe (arch_id 11); loader handles both via
+        // num_dense_layers == num_hidden_layers for the dense variant.
+        "lfm2_moe" | "lfm2" => 11,
         // Gemma 4 (dense + MoE). arch_id=12 routes to hipfire-arch-gemma4.
         // 12B-unified uses model_type="gemma4_unified"; 26B-A4B uses "gemma4".
         "gemma4" | "gemma4_unified" | "gemma4_text" | "gemma4_unified_text" => 12,
@@ -5381,7 +5389,12 @@ fn main() {
     // the standard 2D quant path; the routing fan-out into top-k experts
     // happens at forward time, not quant time.
     let is_deepseek4 = arch_id == 9;
-    let is_moe_like = is_moe || is_deepseek4 || is_gemma4;
+    // LFM2.5 (arch_id 11): A1B routes per-expert w1/w2/w3 → MQ4G256, expert_bias
+    // → F32, everything else → Q8; dense lfm2 (Lfm2ForCausalLM, e.g. 350M/1.2B)
+    // has no experts so the ingest just Q8s every tensor (the loader's load_f32
+    // dequantizes norms / conv-filter back to F32).
+    let is_lfm2moe = arch_id == 11;
+    let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_gemma4;
     // Q8 router: always on for MoE-class models.
     let q8_router = is_moe_like || q8_router_flag;
     if is_moe {
@@ -5389,6 +5402,9 @@ fn main() {
     }
     if is_deepseek4 {
         eprintln!("  DeepSeek V4 detected — per-expert tensors ship pre-split; quantizing each as 2D weight.");
+    }
+    if is_lfm2moe {
+        eprintln!("  LFM2.5 detected — experts → MQ4G256, expert_bias → F32, all else (conv/attn/dense/router/embed/norms) → Q8.");
     }
 
     // Extract layer count for K-map edge-layer promotion.
@@ -5424,6 +5440,38 @@ fn main() {
             .and_then(|s| serde_json::from_str(&s).ok())
     } else {
         None
+    };
+
+    // Some checkpoints (e.g. LFM2.5) ship the Jinja chat template in a separate
+    // `chat_template.jinja` file rather than inside tokenizer_config.json. The
+    // daemon extracts its template from `tokenizer_config.chat_template` (then
+    // renders via minijinja); fold the sidecar in when tokenizer_config lacks
+    // one, else the daemon falls back to Plain framing and a chat-tuned model
+    // produces garbage (LFM2.5-350M bring-up, 2026-06-07).
+    let tokenizer_config = {
+        let mut tc = tokenizer_config;
+        let jinja_path = input_dir.join("chat_template.jinja");
+        if jinja_path.exists() {
+            let has_template = tc
+                .as_ref()
+                .and_then(|v| v.get("chat_template"))
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            if !has_template {
+                if let Ok(jinja) = std::fs::read_to_string(&jinja_path) {
+                    let n = jinja.len();
+                    let obj = tc.get_or_insert_with(|| serde_json::json!({}));
+                    if let Some(map) = obj.as_object_mut() {
+                        map.insert(
+                            "chat_template".to_string(),
+                            serde_json::Value::String(jinja),
+                        );
+                        eprintln!("  embedded chat_template.jinja into tokenizer_config ({n} bytes)");
+                    }
+                }
+            }
+        }
+        tc
     };
 
     // Read generation_config.json. HF stores some sampler-side defaults
@@ -5673,6 +5721,105 @@ fn main() {
         let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
         let n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
+
+        // ── LFM2.5 ingest (arch_id 11) ─────────────────────────────────────────
+        // Routed experts (A1B only) → MQ4G256; expert_bias → F32; everything else
+        // (conv in/out_proj, conv depthwise filter, attn q/k/v/out_proj + qk-norm,
+        // dense w1/w2/w3, router gate, operator/ffn/embedding norms, tied embed/
+        // lm_head) → Q8 (qt=3 Q8F16). Dense lfm2 (350M/1.2B) has no experts, so
+        // every tensor takes the final Q8 path. The loader's load_f32 dequantizes
+        // Q8 norms / conv-filter back to F32 on load.
+        if is_lfm2moe {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            if name.contains(".feed_forward.experts.")
+                && (name.ends_with(".w1.weight")
+                    || name.ends_with(".w2.weight")
+                    || name.ends_with(".w3.weight"))
+                && meta.shape.len() == 2
+                && meta.shape[1] % 256 == 0
+            {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files);
+                let signs1 = gen_fwht_signs(42, 256);
+                let signs2 = gen_fwht_signs(1042, 256);
+                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                eprintln!("  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
+                    "MQ4-LFM", name, meta.shape,
+                    raw_data.len() as f64 / 1024.0, q.len() as f64 / 1024.0);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(), quant_type: QuantType::MQ4G256,
+                    shape, group_size: 256, data: q, spilled_len: 0,
+                });
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+            if name.ends_with(".feed_forward.expert_bias") {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files);
+                let mut bytes = Vec::with_capacity(f32_data.len() * 4);
+                for v in &f32_data { bytes.extend_from_slice(&v.to_le_bytes()); }
+                eprintln!("  {:>8}: {} {:?} (expert_bias F32)", "F32-LFM", name, meta.shape);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(), quant_type: QuantType::F32,
+                    shape, group_size: 1, data: bytes, spilled_len: 0,
+                });
+                st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
+            // Dense mq4 (--format mq4): route the big 2D proj/FFN weight matrices
+            // (conv in/out_proj, attn q/k/v/out_proj, dense w1/w2/w3) → MQ4G256.
+            // The loader's weight_gemv / weight_gemv_residual auto-FWHT-rotate
+            // MQ4G256, so no forward change is needed. Keep the tied embed/lm_head
+            // (model.embed_tokens.weight), the router gate, norms, and the depthwise
+            // conv filter at Q8/F32 (small + precision-sensitive). Default (no mq4
+            // format) keeps the full-precision Q8 bring-up recipe.
+            if use_mq4g256
+                && meta.shape.len() == 2
+                && meta.shape[1] % 256 == 0
+                && !name.ends_with("embed_tokens.weight")
+                && (name.ends_with("_proj.weight")
+                    || name.ends_with(".w1.weight")
+                    || name.ends_with(".w2.weight")
+                    || name.ends_with(".w3.weight"))
+            {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files);
+                let signs1 = gen_fwht_signs(42, 256);
+                let signs2 = gen_fwht_signs(1042, 256);
+                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                eprintln!("  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
+                    "MQ4-LFM", name, meta.shape,
+                    raw_data.len() as f64 / 1024.0, q.len() as f64 / 1024.0);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(), quant_type: QuantType::MQ4G256,
+                    shape, group_size: 256, data: q, spilled_len: 0,
+                });
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+
+            // All remaining LFM2 tensors → Q8 (qt=3). quantize_q8f16 handles any
+            // 1D/2D/3D shape elementwise (conv.conv.weight is [hidden,1,K]).
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name, raw_data, meta, &fp8_scale_for, &st_files);
+            let q = quantize_q8f16(&f32_data);
+            eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-LFM", name, meta.shape);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(), quant_type: QuantType::Q8F16,
+                shape, group_size: 32, data: q, spilled_len: 0,
+            });
+            quantized_params += n_elements as u64;
+            st_files[*file_idx].drop_tensor_pages(name);
+            continue;
+        }
 
         // DeepSeek V4's `tid2eid` hash-routing tables: source I64 in safetensors,
         // shape [vocab=129280, k=6]. The values are token-id × expert-id

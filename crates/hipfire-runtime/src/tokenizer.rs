@@ -476,7 +476,27 @@ impl Tokenizer {
     pub fn from_hfq_metadata(metadata_json: &str) -> Result<Self, TokenizerError> {
         let meta: serde_json::Value = serde_json::from_str(metadata_json)?;
         if let Some(tok_str) = meta.get("tokenizer").and_then(|v| v.as_str()) {
-            return Self::from_hf_json(tok_str);
+            let mut t = Self::from_hf_json(tok_str)?;
+            // `from_hf_json` infers bos/eos from vocab heuristics (it defaults bos
+            // to `<|endoftext|>`), which is WRONG for models whose BOS differs —
+            // e.g. LFM2.5 bos = `<|startoftext|>` (id 1), not `<|endoftext|>`
+            // (id 2). `generation_config.{bos,eos}_token_id` is the authoritative
+            // HF source; override from it when present + scalar (an array eos =
+            // multi-eos: keep the heuristic). Embedded by the quantizer at convert
+            // time. (LFM2.5-350M daemon bring-up, 2026-06-07.)
+            if let Some(gc) = meta.get("generation_config") {
+                if let Some(b) = gc.get("bos_token_id").and_then(|v| v.as_u64()) {
+                    if (b as usize) < t.vocab.len() {
+                        t.bos_id = b as u32;
+                    }
+                }
+                if let Some(e) = gc.get("eos_token_id").and_then(|v| v.as_u64()) {
+                    if (e as usize) < t.vocab.len() {
+                        t.eos_id = e as u32;
+                    }
+                }
+            }
+            return Ok(t);
         }
         if let Some(gguf_meta) = meta.get("gguf_meta") {
             return Self::from_gguf_meta_json(gguf_meta);

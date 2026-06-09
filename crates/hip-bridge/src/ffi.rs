@@ -1321,6 +1321,11 @@ impl Stream {
     pub fn as_raw(&self) -> *mut c_void {
         self.0
     }
+    /// Alias for `as_raw` used by the TP/RCCL collective callers (which take
+    /// a raw stream pointer to hand to `ncclAllReduce`).
+    pub fn raw_ptr(&self) -> *mut c_void {
+        self.0
+    }
 }
 unsafe impl Send for Stream {}
 

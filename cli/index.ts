@@ -2380,8 +2380,19 @@ async function serve(port: number, host: string) {
         const effortMap: Record<string, number> = {
           none: 1, minimal: 64, low: 256, medium: 1024, high: 4096, xhigh: 0,
         };
-        const reasoningEffort: number | null = reasoning && typeof reasoning.effort === "string"
-          && reasoning.effort in effortMap ? effortMap[reasoning.effort] : null;
+        // Accept the reasoning effort from BOTH OpenAI shapes: the Chat
+        // Completions top-level `reasoning_effort` (what most clients + the
+        // OpenAI SDK send) AND the Responses-API nested `reasoning.effort`.
+        // Previously only the nested form was read here, so a top-level
+        // `reasoning_effort:"none"` silently no-op'd and the turn stayed in
+        // thinking mode — even though the daemon itself accepts both at
+        // generate-time (it's this HTTP layer that rewrites effort →
+        // thinking_mode). Top-level wins when both are present.
+        const effortStr: string | null =
+          (typeof (body as any).reasoning_effort === "string" ? (body as any).reasoning_effort : null)
+          ?? (reasoning && typeof reasoning.effort === "string" ? reasoning.effort : null);
+        const reasoningEffort: number | null =
+          effortStr && effortStr in effortMap ? effortMap[effortStr] : null;
 
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
@@ -2427,14 +2438,27 @@ async function serve(port: number, host: string) {
         // The Jinja path uses max_think_tokens==1 as the signal for
         // enable_thinking=false (daemon.rs line 3099). For the legacy
         // ChatFrame path, assistant_prefix="closed_think" is sufficient.
+        // `assistant_prefix` drives the legacy ChatFrame path (Qwen et al.);
+        // `think_mode` drives arch_id=9 (DeepSeek V4), whose generate path
+        // ignores assistant_prefix/max_think_tokens and selects framing +
+        // reasoning-parse from think_mode alone:
+        //   chat     → `<｜Assistant｜></think>` (no reasoning, content only)
+        //   thinking → `<｜Assistant｜><think>`  (emits <think>…</think> reasoning)
+        //   max      → thinking + the "Absolute maximum" reasoning preamble
+        // Both are set so each arch reads the right one. (V4 modes per the HF
+        // encoding/README.md: thinking_mode=chat|thinking, reasoning_effort=max.)
+        const rEffort = effortStr;
         if (effective.thinking === "off") {
           genParams.assistant_prefix = "closed_think";
+          genParams.thinking_mode = "chat";
         } else if ((body as any).chat_template_kwargs?.enable_thinking === false) {
           genParams.assistant_prefix = "closed_think";
           genParams.max_think_tokens = 1; // Jinja path signal
-        } else if ((body as any).reasoning?.effort === "none") {
+          genParams.thinking_mode = "chat";
+        } else if (rEffort === "none") {
           genParams.assistant_prefix = "closed_think";
           genParams.max_think_tokens = 1;
+          genParams.thinking_mode = "chat";
         } else {
           // Thinking is ON (config default, or explicit enable_thinking=true /
           // reasoning.effort>=minimal). OPEN the <think> block so the model
@@ -2445,6 +2469,8 @@ async function serve(port: number, host: string) {
           // thinking models: the daemon's prompt frame falls back to Plain
           // when the tokenizer has no `<think>` special token.
           genParams.assistant_prefix = "open_think";
+          // reasoning_effort max / xhigh → deepest reasoning; otherwise standard.
+          genParams.thinking_mode = (rEffort === "max" || rEffort === "xhigh") ? "max" : "thinking";
         }
         if (systemPrompt) genParams.system = systemPrompt;
 

@@ -286,6 +286,7 @@ for entry in "${tests[@]}"; do
         --target "$TARGET_27B" --draft "$DRAFT_27B" \
         --prompt "$prompt" --max "$max_tok" --ctx 2048 \
         --kv-mode q8 --no-chatml \
+        --state-quant "${HIPFIRE_GATE_STATE_QUANT:-q8}" \
         "${extra[@]}" \
         > "$out_file" 2>&1
     ec=$?

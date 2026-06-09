@@ -129,7 +129,8 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             let [mq, mk, mv] = <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_qkv_hfq6g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n)),
-                None => hip!(gpu.fused_qkv_hfq6g256_dp4a(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+                None if gpu.arch_caps.gemv_dp4a_enabled() => hip!(gpu.fused_qkv_hfq6g256_dp4a(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+                None => hip!(gpu.gemm_qkv_hfq6g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, 1)),
             }
         }
         KernelKey::FusedQkvQ4K => {
@@ -223,8 +224,13 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [mqkv, mz, mbeta, malpha] = <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
             match params.batch_size {
+                // Batched prefill: cross-arch ladder (wmma_gfx12/wmma/dp4a/dot2/fp16/scalar).
                 Some(n) => hip!(gpu.gemm_qkvza_hfq6g256(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n)),
-                None => hip!(gpu.fused_qkvza_hfq6g256_dp4a(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k)),
+                // Decode (n=1): gfx906 dp4a fused fast-path; cross-arch gemm (n=1,
+                // scalar base) elsewhere so RDNA/CDNA decode doesn't hit the
+                // gfx906-only dp4a kernel.
+                None if gpu.arch_caps.gemv_dp4a_enabled() => hip!(gpu.fused_qkvza_hfq6g256_dp4a(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k)),
+                None => hip!(gpu.gemm_qkvza_hfq6g256(wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, 1)),
             }
         }
         // ── Q8_0 fused QKVZA — prefill-only key (#397 Ship 5.2 slice 3) ──
@@ -309,7 +315,8 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             let [mg, mu] = <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_gate_up_hfq6g256(w_gate, w_up, x, gate, up, mg, mu, k, n)),
-                None => hip!(gpu.fused_gate_up_hfq6g256_dp4a(w_gate, w_up, x, gate, up, mg, mu, k)),
+                None if gpu.arch_caps.gemv_dp4a_enabled() => hip!(gpu.fused_gate_up_hfq6g256_dp4a(w_gate, w_up, x, gate, up, mg, mu, k)),
+                None => hip!(gpu.gemm_gate_up_hfq6g256(w_gate, w_up, x, gate, up, mg, mu, k, 1)),
             }
         }
         KernelKey::FusedGateUpQ4K => {
