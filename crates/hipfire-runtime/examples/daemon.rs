@@ -25,7 +25,7 @@ use base64::Engine;
 use hip_bridge::HipResult;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_gemma4::gemma4;
-use hipfire_arch_gemma4::Gemma4;
+#[allow(unused_imports)] use hipfire_arch_gemma4::Gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_dots_ocr::dots_ocr;
