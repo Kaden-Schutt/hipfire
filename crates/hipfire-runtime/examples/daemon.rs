@@ -11661,9 +11661,17 @@ fn generate_gemma4(
         let scratch = m.gemma4_scratch.as_mut().unwrap();
         let kv_sliding = m.gemma4_kv_sliding.as_mut().unwrap();
         let kv_full = m.gemma4_kv_full.as_mut().unwrap();
+        // Batched prefill only for dense models (no MoE). MoE per-token
+        // expert loop in v2's apply_moe_branch_batched has a download_f32
+        // path that produces token attractors. Dense 12B is verified coherent.
+        let has_moe = weights.layers.iter().any(|lw| match lw {
+            gemma4::LayerWeights::Sliding(l) => l.moe.is_some(),
+            gemma4::LayerWeights::Full(l) => l.moe.is_some(),
+        });
         let use_batched = (gemma4::wmma_prefill_enabled() || gemma4::batched_prefill_enabled())
             && prompt_ids.len() >= 4
-            && prompt_ids.len() <= scratch.max_prefill_batch;
+            && prompt_ids.len() <= scratch.max_prefill_batch
+            && !has_moe;
         if use_batched {
             if let Err(e) = gemma4::forward_prefill_batch(
                 gpu, weights, config, &prompt_ids, 0,

@@ -2703,6 +2703,11 @@ fn forward_prefill_batch_v2(
     let mut sliding_kv_idx = 0usize;
     let mut full_kv_idx = 0usize;
     for (layer_idx, layer_type) in config.layer_types.iter().copied().enumerate() {
+        // Invalidate the pointer-keyed F16 conversion cache between layers.
+        // The same activation buffer (pb_tmp) is reused with different contents
+        // each layer; without invalidation, ensure_fp16_x would skip the
+        // F32→F16 conversion and serve stale data from the previous layer.
+        gpu.invalidate_fp16_cache();
         let (layer_scalar, post_ffn_norm_ref, moe_opt) =
             match (layer_type, &weights.layers[layer_idx]) {
                 (LayerType::Sliding, LayerWeights::Sliding(lw)) =>
@@ -3059,6 +3064,27 @@ fn forward_prefill_batch_v2(
             }
         }
     }
+
+    // ── Final logits: extract last token, run final_norm + lm_head + softcap ──
+    // The decode loop samples from scratch.logits, which must be filled
+    // with the last token's logits. Copy last position from pb_residual
+    // to scratch.tmp, run final_norm, lm_head, and softcap.
+    let last_offset = (n_batch - 1) * dim * 4;
+    if let Some(_s) = gpu.active_stream.as_ref() {
+        gpu.hip.memcpy_dtod_async_at(&scratch.tmp.buf, 0, &scratch.pb_residual.buf, last_offset, dim * 4, _s)?;
+    } else {
+        gpu.hip.memcpy_dtod_at(&scratch.tmp.buf, 0, &scratch.pb_residual.buf, last_offset, dim * 4)?;
+    }
+    gpu.rmsnorm_f32(&scratch.tmp, &weights.final_norm, &scratch.tmp, config.norm_eps)?;
+    let ctx = DispatchCtx::new(gpu);
+    let wr_lm = weights.lm_head.dispatch_ref();
+    execute_steps(gpu, &ctx, &[
+        Step::Gemv { w: &wr_lm, input: GemvInput::Raw(&scratch.tmp), out: &scratch.logits },
+    ]).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    if config.final_logit_softcapping > 0.0 {
+        gpu.logit_softcap_f32(&scratch.logits, config.vocab_size, config.final_logit_softcapping)?;
+    }
+
     Ok(())
 }
 
