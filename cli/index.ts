@@ -229,7 +229,7 @@ export interface HipfireConfig {
   top_p: number;
   repeat_penalty: number;
   max_tokens: number;     // per-turn generation cap
-  max_seq: number;        // KV cache capacity allocated at model load (shared across turns)
+  max_seq: number;        // logical context-window limit; physical KV allocation may be smaller
   thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
   max_think_tokens: number; // per-turn budget for <think>...</think> reasoning (0 = unlimited)
   host: string;           // default serve bind address
@@ -590,14 +590,21 @@ function savePerModelConfigs(all: PerModelConfigs) {
 // take effect without restarting a running `hipfire serve`.
 function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   const base = loadConfig();
-  if (!tag) return base;
+  const envMaxSeq = process.env.HIPFIRE_MAX_SEQ
+    ? Number.parseInt(process.env.HIPFIRE_MAX_SEQ, 10)
+    : undefined;
+  const applyEnv = (config: HipfireConfig): HipfireConfig =>
+    envMaxSeq !== undefined && Number.isFinite(envMaxSeq) && envMaxSeq >= 512
+      ? { ...config, max_seq: Math.floor(envMaxSeq) }
+      : config;
+  if (!tag) return applyEnv(base);
   const all = loadPerModelConfigs();
   const resolved = resolveModelTag(tag);
   // Layer both keys: a model can carry overrides under the canonical
   // registry tag AND under the user alias. Alias wins where both set a
   // key, but neither drops the other. Previous `resolved ?? tag` picked
   // exactly one entry, so any key only present on the other vanished.
-  return { ...base, ...(all[resolved] ?? {}), ...(tag !== resolved ? (all[tag] ?? {}) : {}) };
+  return applyEnv({ ...base, ...(all[resolved] ?? {}), ...(tag !== resolved ? (all[tag] ?? {}) : {}) });
 }
 
 // applyThinkingMode is intentionally NOT called anywhere. The previous
@@ -645,6 +652,37 @@ function isBf16ArtifactPath(path: string): boolean {
   return /(^|[-_.])bf16($|[-_.])/.test(basename(path).toLowerCase());
 }
 
+function positiveIntEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : undefined;
+}
+
+function estimatePromptPhysicalTokens(prompt: string): number {
+  if (!prompt) return 0;
+  return Math.max(
+    approximatePromptTokenIds(prompt).length,
+    Math.ceil(prompt.length / 3),
+  );
+}
+
+function defaultPhysicalCapForLoad(maxSeq: number, maxTokens: number): number {
+  const envCap = positiveIntEnv("HIPFIRE_KV_PHYSICAL_CAP")
+    ?? positiveIntEnv("HIPFIRE_KV_INITIAL_PHYSICAL_CAP");
+  const minViable = Math.max(512, maxTokens + 1024);
+  return Math.min(maxSeq, Math.max(minViable, envCap ?? 2048));
+}
+
+function physicalCapForRequest(maxSeq: number, prompt: string, maxTokens: number, visualHeadroom = 0): number {
+  const trailerHeadroom = 32;
+  const promptEstimate = estimatePromptPhysicalTokens(prompt);
+  return Math.min(
+    maxSeq,
+    Math.max(512, promptEstimate + maxTokens + visualHeadroom + trailerHeadroom),
+  );
+}
+
 function buildLoadMessage(path: string, tag?: string | null): any {
   if (isDummyModelPath(path)) {
     return buildDummyLoadMessage();
@@ -654,12 +692,25 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // Guard: the KV cache must be big enough to hold at least one max_tokens
   // response plus a little prompt headroom; otherwise the daemon panics mid-
   // generation. Auto-bump rather than crash.
-  const minViable = resolved.max_tokens + 1024;
-  const max_seq = Math.max(resolved.max_seq, minViable);
-  if (max_seq > resolved.max_seq) {
-    console.error(`[hipfire] note: max_seq (${resolved.max_seq}) < max_tokens (${resolved.max_tokens}) + 1024 — bumping to ${max_seq} for this load`);
+  const envMaxSeq = process.env.HIPFIRE_MAX_SEQ
+    ? Number.parseInt(process.env.HIPFIRE_MAX_SEQ, 10)
+    : undefined;
+  const hasEnvMaxSeq = envMaxSeq !== undefined && Number.isFinite(envMaxSeq) && envMaxSeq >= 512;
+  const minViable = hasEnvMaxSeq ? 512 : resolved.max_tokens + 1024;
+  const requestedMaxSeq =
+    hasEnvMaxSeq
+      ? Math.floor(envMaxSeq)
+      : resolved.max_seq;
+  const max_seq = Math.max(requestedMaxSeq, minViable);
+  if (max_seq > requestedMaxSeq) {
+    console.error(`[hipfire] note: max_seq (${requestedMaxSeq}) < max_tokens (${resolved.max_tokens}) + 1024 — bumping to ${max_seq} for this load`);
+  } else if (requestedMaxSeq !== resolved.max_seq) {
+    console.error(`[hipfire] max_seq overridden by HIPFIRE_MAX_SEQ=${requestedMaxSeq}`);
   }
-  const params: any = { max_seq };
+  const params: any = {
+    max_seq,
+    physical_cap: defaultPhysicalCapForLoad(max_seq, resolved.max_tokens),
+  };
 
   // Resolve KV mode per-model: honors --kv-mode / per-model / global, then
   // applies size-aware default so 27B+ gets asym4 automatically. Daemon
@@ -1670,7 +1721,17 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
-  await e.send(buildLoadMessage(path, model));
+  const runLoadMsg = buildLoadMessage(path, model);
+  const runRequiredPhysicalCap = physicalCapForRequest(
+    runLoadMsg.params.max_seq,
+    prompt,
+    maxTokens,
+    image ? 1024 : 0,
+  );
+  if (runRequiredPhysicalCap > runLoadMsg.params.physical_cap) {
+    runLoadMsg.params.physical_cap = runRequiredPhysicalCap;
+  }
+  await e.send(runLoadMsg);
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
   const vlTag = loaded.vl ? " VL" : "";
@@ -1906,6 +1967,7 @@ async function serve(port: number, host: string) {
     workerKey: ModelWorkerKey;
     modelPath: string;
     maxSeq: number;
+    physicalCap: number;
     arch: string | null;
     stateMode: string | null;
     hasVL: boolean;
@@ -1949,10 +2011,13 @@ async function serve(port: number, host: string) {
         worker.runtimeStateBytes = metricNumber(modelWorker.runtime_state_bytes);
         worker.totalResidentBytes = metricNumber(modelWorker.total_resident_bytes);
         worker.evictableStateBytes = metricNumber(modelWorker.evictable_state_bytes);
+        if (Number.isFinite(modelWorker.physical_cap)) {
+          worker.physicalCap = metricNumber(modelWorker.physical_cap);
+        }
       }
     }
   };
-  const makeResidentWorkerKey = (path: string, maxSeq: number, stateMode: string | null): ModelWorkerKey => pickServingModelWorker({
+  const makeResidentWorkerKey = (path: string, maxSeq: number, stateMode: string | null, physicalCap?: number): ModelWorkerKey => pickServingModelWorker({
     requestModelPath: path,
     currentModelPath: path,
     currentMaxSeq: maxSeq,
@@ -1960,18 +2025,24 @@ async function serve(port: number, host: string) {
     archId: "unknown",
     quantFamily: inferQuantFamilyForPath(path),
     stateMode: stateMode || "unknown",
-    featureFlags: ["serve", "resident_worker"],
+    featureFlags: ["serve", "resident_worker", `physical_cap:${physicalCap ?? maxSeq}`],
     artifactDigest: inferModelArtifactDigest(path),
     maxSeqBucket: maxSeq,
     acceleratorKind: serverAcceleratorKind,
     deviceId: serverDeviceId,
   }).workerKey;
-  const findReusableResidentWorker = (path: string, requiredMaxSeq: number): ResidentModelWorker | undefined => {
+  const findReusableResidentWorker = (path: string, requiredMaxSeq: number, requiredPhysicalCap: number): ResidentModelWorker | undefined => {
     let best: ResidentModelWorker | undefined;
     for (const worker of residentModelWorkers.values()) {
       if (worker.modelPath !== path) continue;
       if (worker.maxSeq < requiredMaxSeq) continue;
-      if (!best || worker.maxSeq < best.maxSeq || worker.lastUsedAtMs > best.lastUsedAtMs) {
+      if (worker.physicalCap < requiredPhysicalCap) continue;
+      if (
+        !best
+        || worker.physicalCap < best.physicalCap
+        || (worker.physicalCap === best.physicalCap && worker.maxSeq < best.maxSeq)
+        || (worker.physicalCap === best.physicalCap && worker.maxSeq === best.maxSeq && worker.lastUsedAtMs > best.lastUsedAtMs)
+      ) {
         best = worker;
       }
     }
@@ -1992,6 +2063,24 @@ async function serve(port: number, host: string) {
   const rememberResidentWorker = (worker: ResidentModelWorker) => {
     residentModelWorkers.set(worker.workerKeyId, worker);
     activateResidentWorker(worker, worker.routeReason);
+  };
+  const unloadResidentWorkerById = async (workerKeyId: string, reason: string) => {
+    await e.send({
+      type: "unload_worker",
+      id: `unload-${Date.now().toString(36)}`,
+      worker_key_id: workerKeyId,
+    });
+    await e.recv();
+    clearWorkerResidentPrefixState(workerKeyId, reason);
+    residentModelWorkers.delete(workerKeyId);
+    if (activeWorkerKeyId === workerKeyId) {
+      current = null;
+      currentMaxSeq = null;
+      modelHasVL = false;
+      currentStateMode = null;
+      currentArch = null;
+      activeWorkerKeyId = null;
+    }
   };
   const workerPrefillSchedulers = new Map<string, PriorityPrefillScheduler>();
   const workerDecodeSchedulers = new Map<string, PriorityDecodeScheduler>();
@@ -2021,6 +2110,7 @@ async function serve(port: number, host: string) {
   type PendingPrefillRequest = {
     session: RequestSessionDraft;
     prefillSession: any;
+    reservationId?: string;
     selected: boolean;
     resolve: (outcome: PendingPrefillOutcome) => void;
     reject: (err: Error) => void;
@@ -2047,6 +2137,12 @@ async function serve(port: number, host: string) {
   const pendingDecodeRequests = new Map<string, PendingDecodeRequest>();
   const residentDecodeSessions = new Set<string>();
   const residentCheckpointHandles = new Set<string>();
+  const residentStateBudgetMb = positiveIntEnv("HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB");
+  const residentStateBudgetBytes = residentStateBudgetMb
+    ? residentStateBudgetMb * 1024 * 1024
+    : 16 * 1024 * 1024 * 1024;
+  let memoryPressureRejectedTotal = 0;
+  let memoryPressureLastReason = "ok";
   let debugCorruptNextPrefixHash = process.env.HIPFIRE_DEBUG_CORRUPT_PREFIX_HASH_ONCE === "1";
   const fallbackStateCacheStore = new Map<string, PrefixCheckpointManifest>();
   const getWorkerId = (workerKey: ModelWorkerKey): string => modelWorkerKeyId(workerKey);
@@ -2081,6 +2177,21 @@ async function serve(port: number, host: string) {
     fallbackStateCacheStore,
     ...workerStateCaches.values(),
   ];
+  const rejectPendingPrefillRequest = (id: string, err: Error): void => {
+    const pending = pendingPrefillRequests.get(id);
+    if (!pending) return;
+    pendingPrefillRequests.delete(id);
+    if (pending.reservationId) {
+      void releaseStateReservations([pending.reservationId], "pending prefill reject");
+    }
+    pending.reject(err);
+  };
+  const rejectPendingDecodeRequest = (id: string, err: Error): void => {
+    const pending = pendingDecodeRequests.get(id);
+    if (!pending) return;
+    pendingDecodeRequests.delete(id);
+    pending.reject(err);
+  };
   const removeAttachableManifestsByHandle = (handle: string): number => {
     let removed = 0;
     for (const cache of allStateCacheMaps()) {
@@ -2096,9 +2207,12 @@ async function serve(port: number, host: string) {
   };
   const clearResidentPrefixState = (reason: string) => {
     const entries = allStateCacheMaps().reduce((sum, cache) => sum + cache.size, 0);
+    const err = new Error(`resident prefix state cleared: ${reason}`);
+    for (const id of [...pendingDecodeRequests.keys()]) {
+      rejectPendingDecodeRequest(id, err);
+    }
     fallbackStateCacheStore.clear();
     workerStateCaches.clear();
-    pendingDecodeRequests.clear();
     workerDecodeSchedulers.clear();
     residentDecodeSessions.clear();
     residentCheckpointHandles.clear();
@@ -2108,17 +2222,138 @@ async function serve(port: number, host: string) {
   };
   const clearWorkerResidentPrefixState = (workerKeyId: string, reason: string) => {
     const entries = workerStateCaches.get(workerKeyId)?.size ?? 0;
+    const err = new Error(`worker resident prefix state cleared: ${reason}`);
+    for (const [id, pending] of [...pendingPrefillRequests.entries()]) {
+      if (modelWorkerKeyId(pending.session.workerKey) === workerKeyId) {
+        rejectPendingPrefillRequest(id, err);
+      }
+    }
     workerStateCaches.delete(workerKeyId);
     workerPrefillSchedulers.delete(workerKeyId);
     workerDecodeSchedulers.delete(workerKeyId);
-    for (const [id, pending] of pendingDecodeRequests.entries()) {
+    for (const [id, pending] of [...pendingDecodeRequests.entries()]) {
       if (pending.active.workerKeyId === workerKeyId) {
-        pendingDecodeRequests.delete(id);
+        rejectPendingDecodeRequest(id, err);
       }
     }
     if (entries > 0) {
       console.error(`[hipfire] cleared worker resident prefix state (${reason}; worker=${workerKeyId} entries=${entries})`);
     }
+  };
+  const hasPendingWorkerRuntimeRequests = (workerKeyId: string): boolean => {
+    for (const pending of pendingPrefillRequests.values()) {
+      if (modelWorkerKeyId(pending.session.workerKey) === workerKeyId) return true;
+    }
+    for (const pending of pendingDecodeRequests.values()) {
+      if (pending.active.workerKeyId === workerKeyId) return true;
+    }
+    return false;
+  };
+  const countPendingWorkerResidentRequests = (workerKeyId: string): number => {
+    let count = 0;
+    for (const pending of pendingPrefillRequests.values()) {
+      if (modelWorkerKeyId(pending.session.workerKey) === workerKeyId) count += 1;
+    }
+    for (const pending of pendingDecodeRequests.values()) {
+      if (pending.active.workerKeyId === workerKeyId) count += 1;
+    }
+    if (activeWorkerKeyId === workerKeyId) {
+      count += residentDecodeSessions.size;
+    }
+    return count;
+  };
+  const estimateResidentSessionBytes = (worker: ResidentModelWorker | undefined, physicalCap: number): number => {
+    if (!worker) return Math.max(64 * 1024 * 1024, physicalCap * 256 * 1024);
+    const descriptorAverage = worker.descriptorEntries > 0
+      ? Math.ceil(worker.runtimeSessionBytes / worker.descriptorEntries)
+      : 0;
+    if (descriptorAverage > 0) return Math.max(descriptorAverage, 16 * 1024 * 1024);
+    return Math.max(64 * 1024 * 1024, physicalCap * 256 * 1024);
+  };
+  const admitResidentSessionOrReject = (
+    workerKeyId: string | null,
+    physicalCap: number,
+    reason: string,
+    additionalSessions = 1,
+  ): Response | null => {
+    if (!workerKeyId) return null;
+    const worker = residentModelWorkers.get(workerKeyId);
+    const sessionBytes = estimateResidentSessionBytes(worker, physicalCap);
+    const pending = countPendingWorkerResidentRequests(workerKeyId);
+    const projectedBytes = (pending + additionalSessions) * sessionBytes;
+    if (residentStateBudgetBytes > 0 && projectedBytes > residentStateBudgetBytes) {
+      memoryPressureRejectedTotal += 1;
+      memoryPressureLastReason = `${reason}: projected_resident_state_bytes=${projectedBytes} budget=${residentStateBudgetBytes} pending=${pending} per_session=${sessionBytes}`;
+      return Response.json({
+        error: "server memory pressure: resident session budget exceeded",
+        detail: {
+          reason,
+          worker_key_id: workerKeyId,
+          pending_resident_requests: pending,
+          estimated_session_bytes: sessionBytes,
+          projected_resident_state_bytes: projectedBytes,
+          additional_sessions: additionalSessions,
+          resident_state_budget_bytes: residentStateBudgetBytes,
+          mode: "reject",
+        },
+      }, { status: 503 });
+    }
+    memoryPressureLastReason = "ok";
+    return null;
+  };
+  const releaseStateReservations = async (reservationIds: Iterable<string>, reason: string): Promise<void> => {
+    const reservations = [...new Set([...reservationIds].filter((id) => id.length > 0))];
+    if (reservations.length === 0) return;
+    try {
+      await e.send({
+        type: "release_session_state_reservation",
+        id: `release-reservation-${Date.now().toString(36)}`,
+        reservations,
+      });
+      await e.recv();
+    } catch (err: any) {
+      console.error(`[hipfire] failed to release state reservation (${reason}): ${err?.message ?? err}`);
+    }
+  };
+  const reserveSessionStateOrReject = async (
+    workerKeyId: string | null,
+    physicalCap: number,
+    reason: string,
+  ): Promise<{ reservationId?: string; response?: Response }> => {
+    if (!workerKeyId) return {};
+    const reservationRequestId = `reserve-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    await e.send({
+      type: "reserve_session_state",
+      id: reservationRequestId,
+      worker_key_id: workerKeyId,
+      physical_cap: physicalCap,
+      budget_bytes: residentStateBudgetBytes,
+      ttl_ms: 30_000,
+    });
+    const reserveMsg = await e.recv();
+    if (reserveMsg?.type === "reserve_session_state_done" && typeof reserveMsg.reservation_id === "string") {
+      memoryPressureLastReason = "ok";
+      return { reservationId: reserveMsg.reservation_id };
+    }
+    if (reserveMsg?.type === "reserve_session_state_rejected") {
+      memoryPressureRejectedTotal += 1;
+      memoryPressureLastReason = `${reason}: daemon ${reserveMsg.reason ?? "memory_pressure"} projected=${reserveMsg.projected_reserved_bytes ?? "unknown"} budget=${reserveMsg.budget_bytes ?? "unknown"}`;
+      return {
+        response: Response.json({
+          error: "server memory pressure: resident session reservation rejected",
+          detail: {
+            reason,
+            worker_key_id: workerKeyId,
+            daemon: reserveMsg,
+            mode: "reject",
+          },
+        }, { status: 503 }),
+      };
+    }
+    const message = reserveMsg?.message ?? `unexpected reserve_session_state response: ${reserveMsg?.type ?? "missing"}`;
+    return {
+      response: Response.json({ error: `server memory pressure: reservation failed: ${message}` }, { status: 503 }),
+    };
   };
   const releaseRuntimeHandles = async (handles: Iterable<string>, reason: string, workerKeyId = activeWorkerKeyId): Promise<number> => {
     const unique = [...new Set([...handles].filter((handle) => handle.length > 0))];
@@ -2212,7 +2447,7 @@ async function serve(port: number, host: string) {
   };
   const batchFileStore = new Map<string, BatchFileRecord>();
   const batchControlStore = new Map<string, BatchJobRecord>();
-  let lastPrefillQueueWaitReason: "selected" | "waiting" | "insufficient_queue" | "not_eligible" | "disabled" = "disabled";
+  let lastPrefillQueueWaitReason: "selected" | "waiting" | "insufficient_queue" | "memory_pressure" | "not_eligible" | "disabled" = "disabled";
   let lastPrefillFallbackReason = "not_applicable";
   let lastPrefillRuntimeDispatchSkippedReason = "not_applicable";
   let lastPrefillDaemonPlan: string | undefined;
@@ -2680,7 +2915,12 @@ async function serve(port: number, host: string) {
     try {
       console.error(`[hipfire] pre-warming ${defaultModel}...`);
       const warmLoadMsg = buildLoadMessage(warmPath, defaultModel);
-      const warmWorkerKey = makeResidentWorkerKey(warmPath, warmLoadMsg.params.max_seq, warmLoadMsg.params.kv_mode || null);
+      const warmWorkerKey = makeResidentWorkerKey(
+        warmPath,
+        warmLoadMsg.params.max_seq,
+        warmLoadMsg.params.kv_mode || null,
+        warmLoadMsg.params.physical_cap,
+      );
       const warmWorkerKeyId = modelWorkerKeyId(warmWorkerKey);
       warmLoadMsg.worker_key_id = warmWorkerKeyId;
       await e.send(warmLoadMsg);
@@ -2698,6 +2938,7 @@ async function serve(port: number, host: string) {
           workerKey: warmWorkerKey,
           modelPath: warmPath,
           maxSeq: warmLoadMsg.params.max_seq,
+          physicalCap: warmLoadMsg.params.physical_cap,
           stateMode: warmLoadMsg.params.kv_mode || null,
           hasVL: loadResult.vl === true,
           arch: typeof loadResult.arch === "string" ? loadResult.arch : null,
@@ -2877,11 +3118,15 @@ async function serve(port: number, host: string) {
               total_runtime_state_bytes: [...residentModelWorkers.values()].reduce((sum, worker) => sum + worker.runtimeStateBytes, 0),
               total_resident_bytes: [...residentModelWorkers.values()].reduce((sum, worker) => sum + worker.totalResidentBytes, 0),
               total_evictable_state_bytes: [...residentModelWorkers.values()].reduce((sum, worker) => sum + worker.evictableStateBytes, 0),
+              resident_state_budget_bytes: residentStateBudgetBytes,
+              memory_pressure_rejected_total: memoryPressureRejectedTotal,
+              memory_pressure_last_reason: memoryPressureLastReason,
               workers: [...residentModelWorkers.values()].map((worker) => ({
                 worker_key_id: worker.workerKeyId,
                 model_path: worker.modelPath,
                 arch: worker.arch,
                 max_seq: worker.maxSeq,
+                physical_cap: worker.physicalCap,
                 state_mode: worker.stateMode,
                 state_arena_backend: isQwen35RuntimeArch(worker.arch) ? "qwen35_wrapped" : "unsupported",
                 resident_sessions: 0,
@@ -3431,15 +3676,22 @@ async function serve(port: number, host: string) {
         // Normalize to avoid spurious reloads when registry vs fuzzy search give different paths
         const path = isDummyModelPath(rawPath) ? rawPath : resolve(rawPath);
 
-        // Resolve effective config FIRST so we can size the KV cache against
-        // the actual per-request max_tokens (body.max_tokens or config). The
-        // daemon's KV buffers are sized at load time — if max_tokens grows
-        // beyond currentMaxSeq we MUST reload instead of sending a request
-        // the daemon would either reject or, worse, overrun the buffer with.
+        // Resolve effective config FIRST so max_seq remains the logical
+        // context-window limit while physical_cap is sized to this request.
+        // The daemon's KV buffers are still allocated at load time, so if the
+        // current worker's physical_cap is too small we reload/grow that
+        // worker up to max_seq instead of treating max_seq as the initial
+        // allocation size.
         const effective = resolveModelConfig(body.model);
         const requestMaxTokens = body.max_tokens ?? effective.max_tokens;
         const visualHeadroom = requestImages.length > 0 ? 1024 : 0;
-        const requiredMaxSeq = Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom);
+        const requiredMaxSeq = effective.max_seq;
+        const requiredPhysicalCap = physicalCapForRequest(
+          requiredMaxSeq,
+          userPrompt,
+          requestMaxTokens,
+          visualHeadroom,
+        );
         const requestPriority = parseSchedulerPriority(
           body.hipfire_priority ?? req.headers.get("x-hipfire-priority"),
           serverPrefillBatch.priority,
@@ -3450,7 +3702,7 @@ async function serve(port: number, host: string) {
           reason: "disabled",
         };
 
-        const reusableWorker = findReusableResidentWorker(path, requiredMaxSeq);
+        const reusableWorker = findReusableResidentWorker(path, requiredMaxSeq, requiredPhysicalCap);
         if (reusableWorker) {
           activateResidentWorker(reusableWorker, "worker_reused");
         }
@@ -3467,7 +3719,7 @@ async function serve(port: number, host: string) {
           artifactDigest: inferModelArtifactDigest(path),
           maxSeqBucket: currentMaxSeq ?? requiredMaxSeq,
         });
-        const needReload = !reusableWorker && initialRoute.needsReload;
+        const needReload = !reusableWorker;
 
         if (needReload) {
           if (maxResidentWorkers <= 1 && current) {
@@ -3476,9 +3728,28 @@ async function serve(port: number, host: string) {
             residentModelWorkers.clear();
             activeWorkerKeyId = null;
           } else if (residentModelWorkers.size >= maxResidentWorkers) {
+            const staleSameModelWorkers = [...residentModelWorkers.values()]
+              .filter((worker) => (
+                worker.modelPath === path
+                && !hasPendingWorkerRuntimeRequests(worker.workerKeyId)
+                && (
+                  worker.maxSeq < requiredMaxSeq
+                  || (worker.maxSeq >= requiredMaxSeq && worker.physicalCap < requiredPhysicalCap)
+                )
+              ))
+              .sort((a, b) => a.physicalCap - b.physicalCap || a.maxSeq - b.maxSeq);
+            for (const stale of staleSameModelWorkers) {
+              await unloadResidentWorkerById(stale.workerKeyId, "same model max_seq growth");
+              if (residentModelWorkers.size < maxResidentWorkers) break;
+            }
+          }
+          if (needReload && maxResidentWorkers > 1 && residentModelWorkers.size >= maxResidentWorkers) {
             const activeWorkerIds = new Set<string>();
             for (const pending of pendingDecodeRequests.values()) {
               activeWorkerIds.add(pending.active.workerKeyId);
+            }
+            for (const pending of pendingPrefillRequests.values()) {
+              activeWorkerIds.add(modelWorkerKeyId(pending.session.workerKey));
             }
             const evictionCandidate = [...residentModelWorkers.values()]
               .filter((worker) => !activeWorkerIds.has(worker.workerKeyId))
@@ -3487,29 +3758,17 @@ async function serve(port: number, host: string) {
               safeRelease();
               return Response.json({ error: "all resident model workers are active; cannot evict for requested model" }, { status: 503 });
             }
-            await e.send({
-              type: "unload_worker",
-              id: `unload-${Date.now().toString(36)}`,
-              worker_key_id: evictionCandidate.workerKeyId,
-            });
-            await e.recv();
-            clearWorkerResidentPrefixState(evictionCandidate.workerKeyId, "worker evicted lru");
-            residentModelWorkers.delete(evictionCandidate.workerKeyId);
-            if (activeWorkerKeyId === evictionCandidate.workerKeyId) {
-              current = null;
-              currentMaxSeq = null;
-              modelHasVL = false;
-              currentStateMode = null;
-              currentArch = null;
-              activeWorkerKeyId = null;
-            }
+            await unloadResidentWorkerById(evictionCandidate.workerKeyId, "worker evicted lru");
           }
           const loadMsg = buildLoadMessage(path, body.model);
-          if (requiredMaxSeq > loadMsg.params.max_seq) {
-            console.error(`[hipfire] request max_tokens=${requestMaxTokens} needs max_seq >= ${requiredMaxSeq} — bumping load (was ${loadMsg.params.max_seq})`);
+          if (loadMsg.params.max_seq !== requiredMaxSeq) {
             loadMsg.params.max_seq = requiredMaxSeq;
           }
-          const loadWorkerKey = makeResidentWorkerKey(path, loadMsg.params.max_seq, loadMsg.params.kv_mode || effective.kv_cache);
+          if (requiredPhysicalCap > loadMsg.params.physical_cap) {
+            console.error(`[hipfire] request needs physical_cap >= ${requiredPhysicalCap} within max_seq=${requiredMaxSeq} — growing load (was ${loadMsg.params.physical_cap})`);
+            loadMsg.params.physical_cap = requiredPhysicalCap;
+          }
+          const loadWorkerKey = makeResidentWorkerKey(path, loadMsg.params.max_seq, loadMsg.params.kv_mode || effective.kv_cache, loadMsg.params.physical_cap);
           const loadWorkerKeyId = modelWorkerKeyId(loadWorkerKey);
           loadMsg.worker_key_id = loadWorkerKeyId;
           await e.send(loadMsg);
@@ -3527,6 +3786,7 @@ async function serve(port: number, host: string) {
             workerKey: loadWorkerKey,
             modelPath: path,
             maxSeq: loadMsg.params.max_seq,
+            physicalCap: loadMsg.params.physical_cap,
             hasVL: loadResult.vl === true,
             stateMode: loadMsg.params.kv_mode || effective.kv_cache,
             arch: typeof loadResult.arch === "string" ? loadResult.arch : null,
@@ -3600,12 +3860,13 @@ async function serve(port: number, host: string) {
         const requestAllowsResidentPrefixCache = serverPrefillBatchControls.residentStateCache
           || requestPromptCacheRetention === "in_memory"
           || requestPromptCacheRetention === "24h";
-        const preserveDaemonStateForResidentCache = serverPrefillBatch.enabled
-          && requestAllowsResidentPrefixCache
+        const preserveDaemonStateForRuntimePrefill = serverPrefillBatch.enabled
           && prefillBatchGate.eligible
           && body.stream !== true
           && generateBatchPrefillCapability === "supported";
-        if (currentArch !== "deepseek4" && !preserveDaemonStateForResidentCache) {
+        const preserveDaemonStateForResidentCache =
+          preserveDaemonStateForRuntimePrefill && requestAllowsResidentPrefixCache;
+        if (currentArch !== "deepseek4" && !preserveDaemonStateForRuntimePrefill) {
           await e.send({ type: "reset", worker_key_id: activeWorkerKeyId ?? undefined }); await e.recv();
           if (maxResidentWorkers > 1 && activeWorkerKeyId) {
             clearWorkerResidentPrefixState(activeWorkerKeyId, "request reset");
@@ -3704,6 +3965,7 @@ async function serve(port: number, host: string) {
         const reqId = newObjectId("chatcmpl");
         const requestNowMs = Date.now();
         let serverPrefillSession: RequestSessionDraft | undefined;
+        let stateReservationId: string | undefined;
         let selectedForPrefillBatch = false;
         let selectedByScheduler = false;
         let queuePreviewReason: "selected" | "waiting" | "insufficient_queue" | "not_eligible" = "not_eligible";
@@ -3990,7 +4252,32 @@ async function serve(port: number, host: string) {
             // session activation; true fused GPU microbatching is the next
             // runtime step.
             if (servingWorkerScheduler) {
-              servingWorkerScheduler.enqueueIfAbsent(serverPrefillSession, requestNowMs);
+              const reservation = await reserveSessionStateOrReject(
+                activeWorkerKeyId,
+                requiredPhysicalCap,
+                "prefill_admission",
+              );
+              if (reservation.response) {
+                lastPrefillQueueWaitReason = "memory_pressure";
+                lastPrefillFallbackReason = "memory_pressure";
+                safeRelease();
+                return reservation.response;
+              }
+              stateReservationId = reservation.reservationId;
+              try {
+                servingWorkerScheduler.enqueueIfAbsent(serverPrefillSession, requestNowMs);
+              } catch (err: any) {
+                if (stateReservationId) {
+                  await releaseStateReservations([stateReservationId], "prefill scheduler backpressure");
+                }
+                lastPrefillQueueWaitReason = "insufficient_queue";
+                lastPrefillFallbackReason = "prefill_scheduler_backpressure";
+                safeRelease();
+                return Response.json(
+                  { error: err?.message ?? "prefill scheduler backpressure" },
+                  { status: 503 },
+                );
+              }
               const preview = servingWorkerScheduler.previewNextPrefillBatch({
                 nowMs: requestNowMs,
               });
@@ -4315,6 +4602,7 @@ async function serve(port: number, host: string) {
           const sessionParams: any = {
             max_tokens: requestMaxTokens,
             temperature: genParams.temperature,
+            semantic_boundary_checkpoints: requestAllowsResidentPrefixCache,
           };
           if (genParams.assistant_prefix) sessionParams.assistant_prefix = genParams.assistant_prefix;
           if (typeof genParams.max_think_tokens === "number") {
@@ -4371,6 +4659,7 @@ async function serve(port: number, host: string) {
 
           if (selectedForPrefillBatch) {
             const runtimeBatchId = `prefill-${reqId}`;
+            const selectedReservationIds: string[] = stateReservationId ? [stateReservationId] : [];
             try {
               const currentPrefillSession = buildDaemonPrefillSession(serverPrefillSession);
               const selectedSessions = selectedBatchSessions.length > 0
@@ -4387,6 +4676,7 @@ async function serve(port: number, host: string) {
                   throw new Error(`selected prefill session ${selected.id} is not pending`);
                 }
                 pending.selected = true;
+                if (pending.reservationId) selectedReservationIds.push(pending.reservationId);
                 daemonSessions.push(pending.prefillSession);
               }
 
@@ -4406,7 +4696,8 @@ async function serve(port: number, host: string) {
               const checkpointDaemonPrefixHashesBySession = new Map<string, { hash: string; len: number }>();
               const checkpointPrefixCheckpointsBySession = new Map<string, ResidentPrefixCheckpointOutcome[]>();
               const logicalPositionsBySession = new Map<string, number>();
-              for (let i = 0; i < 8; i++) {
+              const maxPrefillResponses = selectedSessions.length + 4;
+              for (let i = 0; i < maxPrefillResponses; i++) {
                 const prefillMsg = await e.recv();
                 if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === runtimeBatchId) {
                   prefillDone = true;
@@ -4532,6 +4823,7 @@ async function serve(port: number, host: string) {
                 throw new Error(`unexpected generate_batch_prefill response: ${prefillMsg?.type ?? "missing"}`);
               }
               if (!prefillDone) throw new Error("generate_batch_prefill did not complete");
+              await releaseStateReservations(selectedReservationIds, "prefill materialized resident state");
               const residentStateLimit = Number(genParams.server_prefill_batch?.resident_state_limit ?? selectedSessions.length);
               const diskSpillAllowed = genParams.server_prefill_batch?.disk_spill_allowed === true;
               const residentSessionIds = new Set(
@@ -4691,6 +4983,7 @@ async function serve(port: number, host: string) {
               }
             } catch (err: any) {
               const reason = err?.message ?? "daemon_serial_prefill_failed";
+              await releaseStateReservations(selectedReservationIds, "prefill failed");
               if (
                 reason.includes("failed to attach checkpoint") ||
                 reason.includes("prefix hash mismatch") ||
@@ -4725,6 +5018,7 @@ async function serve(port: number, host: string) {
                 const pending = pendingPrefillRequests.get(selected.id);
                 if (!pending) continue;
                 pendingPrefillRequests.delete(selected.id);
+                pending.reservationId = undefined;
                 pending.reject(new Error(reason));
               }
               console.error(`[hipfire] generate_batch_prefill failed; falling back to generate: ${reason}`);
@@ -4742,9 +5036,11 @@ async function serve(port: number, host: string) {
               resolvePending = resolve;
               rejectPending = reject;
             });
+            pendingPromise.catch(() => {});
             pendingPrefillRequests.set(reqId, {
               session: serverPrefillSession,
               prefillSession,
+              reservationId: stateReservationId,
               selected: false,
               resolve: resolvePending,
               reject: rejectPending,
@@ -4908,6 +5204,10 @@ async function serve(port: number, host: string) {
                 ? (pendingOutcome.prefillTokens * 1000) / pendingOutcome.elapsedMs
                 : 0;
             } else {
+              const pendingBeforeDelete = pendingPrefillRequests.get(reqId);
+              if (pendingBeforeDelete?.reservationId) {
+                await releaseStateReservations([pendingBeforeDelete.reservationId], "prefill pending timeout");
+              }
               pendingPrefillRequests.delete(reqId);
               servingWorkerScheduler?.cancel(reqId);
               prefillBatchMetrics.skipped += 1;
@@ -5367,14 +5667,17 @@ async function serve(port: number, host: string) {
 
         if (
           currentArch !== "deepseek4" &&
-          preserveDaemonStateForResidentCache &&
+          preserveDaemonStateForRuntimePrefill &&
           genParams.prefill_already_done !== true
         ) {
-          await e.send({ type: "reset", worker_key_id: activeWorkerKeyId ?? undefined }); await e.recv();
-          if (maxResidentWorkers > 1 && activeWorkerKeyId) {
-            clearWorkerResidentPrefixState(activeWorkerKeyId, "prefill fallback reset");
-          } else {
-            clearResidentPrefixState("prefill fallback reset");
+          const resetWorkerKeyId = activeWorkerKeyId ?? undefined;
+          if (!resetWorkerKeyId || !hasPendingWorkerRuntimeRequests(resetWorkerKeyId)) {
+            await e.send({ type: "reset", worker_key_id: resetWorkerKeyId }); await e.recv();
+            if (maxResidentWorkers > 1 && activeWorkerKeyId) {
+              clearWorkerResidentPrefixState(activeWorkerKeyId, "prefill fallback reset");
+            } else {
+              clearResidentPrefixState("prefill fallback reset");
+            }
           }
         }
 
@@ -5447,6 +5750,20 @@ async function serve(port: number, host: string) {
           decodeBatchMetrics.eligible += 1;
           const decodeScheduler = getWorkerDecodeScheduler(servingWorkerKey);
           const workerKeyId = modelWorkerKeyId(servingWorkerKey);
+          const memoryReject = admitResidentSessionOrReject(
+            workerKeyId,
+            requiredPhysicalCap,
+            "decode_admission",
+            0,
+          );
+          if (memoryReject) {
+            if (releaseRuntimeSessionId) {
+              await releaseRuntimeHandles([releaseRuntimeSessionId], "decode admission memory pressure", workerKeyId);
+              releaseRuntimeSessionId = null;
+            }
+            safeRelease();
+            return memoryReject;
+          }
           const active: ActiveDecodeSession = {
             id: reqId,
             workerKeyId,
@@ -5462,6 +5779,7 @@ async function serve(port: number, host: string) {
             resolveDecode = resolve;
             rejectDecode = reject;
           });
+          decodePromise.catch(() => {});
           pendingDecodeRequests.set(reqId, {
             active,
             promptTokens: prefillPromptTokens.length,
@@ -5471,7 +5789,23 @@ async function serve(port: number, host: string) {
             reject: rejectDecode,
             promise: decodePromise,
           });
-          decodeScheduler?.enqueue(active);
+          try {
+            decodeScheduler?.enqueue(active);
+          } catch (err: any) {
+            pendingDecodeRequests.delete(reqId);
+            decodeBatchMetrics.skipped += 1;
+            decodeBatchMetrics.lastSkippedReason = "decode_scheduler_backpressure";
+            decodeBatchMetrics.activeSessions = pendingDecodeRequests.size;
+            if (releaseRuntimeSessionId) {
+              await releaseRuntimeHandles([releaseRuntimeSessionId], "decode scheduler backpressure", workerKeyId);
+              releaseRuntimeSessionId = null;
+            }
+            safeRelease();
+            return Response.json(
+              { error: err?.message ?? "decode scheduler backpressure" },
+              { status: 503 },
+            );
+          }
           decodeBatchMetrics.activeSessions = pendingDecodeRequests.size;
           safeRelease();
           await new Promise((resolve) => setTimeout(resolve, Math.min(25, serverPrefillBatch.waitMs)));
@@ -5603,6 +5937,12 @@ async function serve(port: number, host: string) {
         } else if (serverPrefillBatch.enabled) {
           decodeBatchMetrics.skipped += 1;
           decodeBatchMetrics.lastSkippedReason = decodeBatchEligible ? "missing_scheduler" : decodeBatchIneligibleReason;
+        }
+        if (!decodedByBatch && daemonError && genParams.prefill_already_done === true) {
+          delete genParams.session_id;
+          delete genParams.prefilled_prompt_tokens;
+          genParams.prefill_already_done = false;
+          releaseRuntimeSessionId = null;
         }
         if (!decodedByBatch) {
           e.generating = true;
@@ -6994,7 +7334,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     max_seq: {
       label: "max_seq",
-      desc: "KV cache capacity (tokens). Allocated at model load — bigger = longer context",
+      desc: "logical context window (tokens). Physical KV allocation grows per request up to this limit",
       range: [512, 524288], step: 4096,
     },
     thinking: {
@@ -9022,7 +9362,7 @@ Examples:
           top_p: "number in (0, 1]",
           repeat_penalty: "number between 1.0 and 3.0",
           max_tokens: "integer between 1 and 131072",
-          max_seq: "KV cache capacity (tokens). Integer 512-524288",
+          max_seq: "logical context-window limit (tokens). Integer 512-524288",
           thinking: "one of: on, off. Controls whether the model reasons in <think> blocks.",
           max_think_tokens: "integer 0-32768. Budget for reasoning tokens (0 = unlimited).",
           host: "non-empty bind address without whitespace (examples: 127.0.0.1, 0.0.0.0, ::1)",

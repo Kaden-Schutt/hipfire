@@ -1491,8 +1491,12 @@ impl Gpu {
         Ok(())
     }
 
-    /// Ensure the FP16 X scratch contains the conversion of `x`. Skips the
-    /// convert kernel if `x.buf.as_ptr()` matches the last converted source.
+    /// Ensure the FP16 X scratch contains the current conversion of `x`.
+    ///
+    /// Decode and prefill scratch tensors reuse stable device pointers while
+    /// their contents change after nearly every layer. Pointer-keyed staging is
+    /// therefore unsafe for correctness unless every writer invalidates this
+    /// cache. Refresh on every call.
     /// Returns the FP16 device pointer.
     fn ensure_fp16_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
         self.ensure_kernel(
@@ -1513,13 +1517,7 @@ impl Gpu {
             self.fp16_x_source_ptr = std::ptr::null_mut(); // force reconversion after realloc
         }
 
-        // Under graph capture, convert EVERY call: the src/dst pointers are
-        // stable (PrefillBatchScratch + persistent FP16 scratch), but the
-        // DATA at src changes every replay, so the captured convert-node
-        // needs to re-run. The pointer-equality cache would wrongly skip
-        // the node and read stale FP16 on replay. During normal dispatch
-        // the skip is still correct.
-        let must_convert = self.capture_mode || self.fp16_x_source_ptr != src_ptr;
+        let must_convert = true;
         if must_convert {
             let in_ptr = src_ptr;
             let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
@@ -1553,10 +1551,9 @@ impl Gpu {
         Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
     }
 
-    /// Ensure the BF16 X scratch contains a round-to-nearest-even
-    /// conversion of `x`. Skips the conversion when the same FP32 source
-    /// pointer was staged previously, except under graph capture where
-    /// data can change behind stable scratch pointers.
+    /// Ensure the BF16 X scratch contains the current round-to-nearest-even
+    /// conversion of `x`. See `ensure_fp16_x` for why this refreshes even when
+    /// the source pointer matches the previous call.
     fn ensure_bf16_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
         self.ensure_kernel(
             "convert_f32_to_bf16",
@@ -1575,7 +1572,7 @@ impl Gpu {
             self.bf16_x_source_ptr = std::ptr::null_mut();
         }
 
-        let must_convert = self.capture_mode || self.bf16_x_source_ptr != src_ptr;
+        let must_convert = true;
         if must_convert {
             let in_ptr = src_ptr;
             let out_ptr = self.bf16_x_scratch.as_ref().unwrap().as_ptr();

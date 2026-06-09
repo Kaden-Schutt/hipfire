@@ -1,6 +1,6 @@
 import type { GenerateBatchPrefillCapability } from "./generate_batch_prefill_protocol";
 
-export type PrefillQueueWaitReason = "selected" | "waiting" | "insufficient_queue" | "not_eligible" | "disabled";
+export type PrefillQueueWaitReason = "selected" | "waiting" | "insufficient_queue" | "memory_pressure" | "not_eligible" | "disabled";
 export type BatchExecutionMode = "prefill_batch" | "serial_fallback" | "unsupported" | "disabled";
 export type BatchFallbackReason =
   | "idle"

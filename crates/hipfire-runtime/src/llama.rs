@@ -4610,13 +4610,35 @@ impl KvCache {
         head_dim: usize,
         max_seq_len: usize,
     ) -> HipResult<Self> {
+        Self::new_gpu_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    pub fn new_gpu_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
         let kv_dim = n_kv_heads * head_dim;
-        let cache_size = max_seq_len * kv_dim;
+        let cache_size = physical_cap * kv_dim;
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_size, cache_size, is_kv_layer)?;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: fp32 ({n_kv}/{} layers carry KV, others placeholder)",
-            is_kv_layer.len()
+            "KV cache: fp32 ({n_kv}/{} layers carry KV, others placeholder, physical_cap={physical_cap} / max_seq={max_seq_len})",
+            is_kv_layer.len(),
         );
         Ok(Self {
             k_gpu,
@@ -4625,7 +4647,7 @@ impl KvCache {
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
-            physical_cap: max_seq_len,
+            physical_cap,
             n_kv_heads,
             head_dim,
             quantized: false,

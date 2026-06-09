@@ -22,7 +22,7 @@ describe("dummy model sentinel", () => {
     expect(msg).toEqual({
       type: "load",
       model: DUMMY_MODEL_SENTINEL_PATH,
-      params: { dummy_model: true },
+      params: { dummy_model: true, max_seq: 4096, physical_cap: 4096 },
     });
     expect(msg.params.draft).toBeUndefined();
     expect(msg.params.cask_sidecar).toBeUndefined();

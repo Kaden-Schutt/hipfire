@@ -188,7 +188,7 @@ export class PriorityPrefillScheduler {
   }
 
   private maxQueuedRequests(): number {
-    const raw = Number.parseInt(String(this.env.HIPFIRE_SCHED_PREFILL_MAX_QUEUED ?? "0"), 10);
+    const raw = Number.parseInt(String(this.env.HIPFIRE_SCHED_PREFILL_MAX_QUEUED ?? "256"), 10);
     return Number.isFinite(raw) && raw > 0 ? raw : 0;
   }
 
@@ -285,6 +285,10 @@ export class PriorityDecodeScheduler {
     if (this.activeIds.has(session.id)) {
       throw new Error(`decode session is already active: ${session.id}`);
     }
+    const maxActive = this.maxActiveSessions();
+    if (maxActive > 0 && this.activeCount >= maxActive) {
+      throw new Error(`decode scheduler backpressure: active=${this.activeCount} max=${maxActive}`);
+    }
     this.buckets[session.priority].push(session);
     this.activeIds.add(session.id);
     this.activeCount += 1;
@@ -327,5 +331,10 @@ export class PriorityDecodeScheduler {
     for (const session of sessions) {
       this.cancel(session.id);
     }
+  }
+
+  private maxActiveSessions(): number {
+    const raw = Number.parseInt(String(this.env.HIPFIRE_SCHED_DECODE_MAX_ACTIVE ?? "256"), 10);
+    return Number.isFinite(raw) && raw > 0 ? raw : 0;
   }
 }

@@ -55,6 +55,7 @@ default_request_max_tokens = "1" if expected_decode_backend in {"fused_dense_lay
 request_max_tokens = int(os.environ.get("HIPFIRE_DECODE_BATCH_MAX_TOKENS", default_request_max_tokens))
 requested_decode_chunk_size = int(os.environ.get("HIPFIRE_QWEN35_DECODE_BATCH_MAX", "0") or "0")
 dense_fused_mode = expected_decode_backend == "fused_dense_layer_chunked"
+native_multirow_enabled = os.environ.get("HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW", "").lower() in {"1", "true", "yes", "on"}
 
 
 def pick_port() -> int:
@@ -213,6 +214,8 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
                 raise RuntimeError(f"fused decode did not record chunk telemetry: {checks}; log={log_path}")
             if requested_decode_chunk_size > 0:
                 expected_chunk_size = min(requested_decode_chunk_size, selected_size)
+                if run_expected_backend == "fused_dense_layer_chunked" and not native_multirow_enabled:
+                    expected_chunk_size = 1
                 expected_chunk_count = ceil(selected_size / expected_chunk_size)
                 if chunk_size != expected_chunk_size or chunk_count != expected_chunk_count:
                     raise RuntimeError(

@@ -19,6 +19,8 @@ export function buildDummyLoadMessage(): any {
     model: DUMMY_MODEL_SENTINEL_PATH,
     params: {
       dummy_model: true,
+      max_seq: 4096,
+      physical_cap: 4096,
     },
   };
 }

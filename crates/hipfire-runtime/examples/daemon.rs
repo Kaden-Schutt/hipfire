@@ -741,6 +741,7 @@ struct GenerateBatchPrefillSession {
     messages_history: Option<Vec<hipfire_runtime::prompt_frame::Message>>,
     assistant_prefix: String,
     max_think_tokens: usize,
+    semantic_boundary_checkpoints: bool,
     state_handle: GenerateBatchPrefillStateHandle,
 }
 
@@ -868,11 +869,6 @@ fn select_qwen35_decode_batch_backend(
                     "qwen35 fused dense decode batch requested, but arch_id={arch_id} is not dense Qwen35"
                 ));
             }
-            if session_count < 2 {
-                return Err(
-                    "qwen35 fused dense decode batch requires at least two sessions".to_string(),
-                );
-            }
             Ok(Qwen35DecodeBatchBackend::FusedDenseLayerChunked)
         }
         "fused_grouped_moe" | "grouped_moe" | "fused_grouped_moe_layer_chunked" => {
@@ -942,9 +938,7 @@ fn validate_qwen35_fused_dense_decode_model_capability(
             m.arch_id
         ));
     }
-    if session_count < 2 {
-        return Err("qwen35 fused dense decode requires at least two sessions".to_string());
-    }
+    let _ = session_count;
     let config = m
         .q35_config
         .as_ref()
@@ -1058,12 +1052,11 @@ fn validate_qwen35_fused_dense_decode_resident_sessions(
         }
         signatures.push(qwen35_fused_dense_decode_signature(state));
     }
-    validate_qwen35_fused_dense_decode_session_signatures(
-        config,
-        &signatures,
-        envelope.session_count,
-    )
-    .map_err(|e| format!("qwen35 fused dense decode unsupported resident state: {e}"))
+    if signatures.len() == 1 {
+        signatures.push(signatures[0]);
+    }
+    validate_qwen35_fused_dense_decode_session_signatures(config, &signatures, signatures.len())
+        .map_err(|e| format!("qwen35 fused dense decode unsupported resident state: {e}"))
 }
 
 fn select_qwen35_prefill_batch_backend(
@@ -1363,6 +1356,15 @@ fn validate_generate_batch_prefill(
             .and_then(|p| p.get("max_think_tokens"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
+        let semantic_boundary_checkpoints = match session
+            .get("params")
+            .and_then(|p| p.get("semantic_boundary_checkpoints"))
+        {
+            Some(v) => v.as_bool().ok_or_else(|| {
+                format!("{prefix}.params.semantic_boundary_checkpoints must be a boolean")
+            })?,
+            None => false,
+        };
 
         parsed_sessions.push(GenerateBatchPrefillSession {
             id: session_id.to_string(),
@@ -1379,6 +1381,7 @@ fn validate_generate_batch_prefill(
             messages_history,
             assistant_prefix,
             max_think_tokens,
+            semantic_boundary_checkpoints,
             state_handle: GenerateBatchPrefillStateHandle {
                 state_kinds: parsed_state_kinds,
                 logical_position,
@@ -1655,6 +1658,7 @@ mod generate_batch_prefill_tests {
         assert_eq!(envelope.id, "probe-1");
         assert_eq!(envelope.batch_id, "batch-1");
         assert_eq!(envelope.session_count, 1);
+        assert!(!envelope.sessions[0].semantic_boundary_checkpoints);
     }
 
     #[test]
@@ -1932,6 +1936,8 @@ mod generate_batch_prefill_tests {
             worker_id: ModelWorkerId {
                 value: "qwen35:worker-a".to_string(),
             },
+            max_seq: 32768,
+            physical_cap: 2048,
             max_resident_workers: 1,
             resident_workers: 1,
             state_arena_backend: SequenceStateArenaBackend::Qwen35Wrapped,
@@ -1969,6 +1975,8 @@ mod generate_batch_prefill_tests {
 
         let json = model_worker_runtime_view_json(&worker);
         assert_eq!(json["state_arena_backend"], "qwen35_wrapped");
+        assert_eq!(json["max_seq"], 32768);
+        assert_eq!(json["physical_cap"], 2048);
         assert_eq!(json["state_page_descriptor_entries"], 2);
         assert_eq!(json["state_page_descriptor_bytes"], 160);
         assert_eq!(json["model_file_bytes"], 256);
@@ -2202,6 +2210,49 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
+    fn validates_semantic_boundary_checkpoint_param() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-boundary",
+            "batch_id": "batch-boundary",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "hello",
+                "state_handle": {
+                    "state_kinds": ["attention_kv"],
+                    "logical_position": 0
+                },
+                "params": {
+                    "semantic_boundary_checkpoints": true
+                }
+            }]
+        });
+        let envelope = validate_generate_batch_prefill(&msg).expect("valid envelope");
+        assert!(envelope.sessions[0].semantic_boundary_checkpoints);
+
+        let bad = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "probe-boundary-bad",
+            "batch_id": "batch-boundary-bad",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "prompt": "hello",
+                "state_handle": {
+                    "state_kinds": ["attention_kv"],
+                    "logical_position": 0
+                },
+                "params": {
+                    "semantic_boundary_checkpoints": "yes"
+                }
+            }]
+        });
+        let err = validate_generate_batch_prefill(&bad).unwrap_err();
+        assert!(err.contains(".params.semantic_boundary_checkpoints must be a boolean"));
+    }
+
+    #[test]
     fn rejects_prompt_suffix_contract_violations() {
         let msg_both = serde_json::json!({
             "type": "generate_batch_prefill",
@@ -2405,8 +2456,10 @@ mod generate_batch_prefill_tests {
             select_qwen35_decode_batch_backend("fused", 5, 2).unwrap(),
             Qwen35DecodeBatchBackend::FusedDenseLayerChunked
         );
-        let singleton_err = select_qwen35_decode_batch_backend("fused", 5, 1).unwrap_err();
-        assert!(singleton_err.contains("requires at least two sessions"));
+        assert_eq!(
+            select_qwen35_decode_batch_backend("fused", 5, 1).unwrap(),
+            Qwen35DecodeBatchBackend::FusedDenseLayerChunked
+        );
         let moe_err = select_qwen35_decode_batch_backend("fused", 6, 2).unwrap_err();
         assert!(moe_err.contains("not dense Qwen35"));
         assert_eq!(
@@ -2468,6 +2521,26 @@ mod generate_batch_prefill_tests {
             std::env::remove_var("HIPFIRE_QWEN35_DECODE_BATCH_MAX");
         }
         assert_eq!(qwen35_decode_batch_max_chunk_size(4), 4);
+    }
+
+    #[test]
+    fn native_dense_decode_chunk_ranges_support_bounded_chunks() {
+        assert_eq!(
+            qwen35_decode_native_chunk_ranges(4, 1).unwrap(),
+            vec![(0, 1), (1, 2), (2, 3), (3, 4)]
+        );
+        assert_eq!(
+            qwen35_decode_native_chunk_ranges(1, 1).unwrap(),
+            vec![(0, 1)]
+        );
+        assert_eq!(
+            qwen35_decode_native_chunk_ranges(8, 4).unwrap(),
+            vec![(0, 4), (4, 8)]
+        );
+        assert_eq!(
+            qwen35_decode_native_chunk_ranges(5, 4).unwrap(),
+            vec![(0, 4), (4, 5)]
+        );
     }
 
     #[test]
@@ -2862,7 +2935,8 @@ struct LoadedModel {
     max_seq: usize,
     /// Physical KV buffer capacity, in slots. Allocators size per-layer K/V
     /// for this many tokens. Under eviction, budget+beta <= physical_cap;
-    /// without eviction, physical_cap == max_seq.
+    /// without eviction, physical_cap may be lower than max_seq and grows by
+    /// loading a larger worker.
     physical_cap: usize,
     /// When Some(_), the daemon calls `maybe_evict` after every prefill-chunk
     /// and every decode-forward so the physical cache stays bounded by
@@ -2932,6 +3006,13 @@ struct LoadedModelMemory {
     model_weight_bytes: usize,
 }
 
+#[derive(Clone, Debug)]
+struct SessionStateReservation {
+    worker_id: String,
+    reserved_bytes: usize,
+    expires_at: Option<std::time::Instant>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ModelWorkerId {
     value: String,
@@ -2955,6 +3036,8 @@ impl SequenceStateArenaBackend {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ModelWorkerRuntimeView {
     worker_id: ModelWorkerId,
+    max_seq: usize,
+    physical_cap: usize,
     max_resident_workers: usize,
     resident_workers: usize,
     state_arena_backend: SequenceStateArenaBackend,
@@ -3070,8 +3153,21 @@ impl Qwen35RequestSessionState {
         tensor: &rdna_compute::GpuTensor,
         label: &str,
     ) -> Result<rdna_compute::GpuTensor, String> {
-        hipfire_runtime::mtp_mirror::clone_tensor_same(gpu, tensor)
-            .map_err(|e| format!("clone qwen35 checkpoint {label}: {e:?}"))
+        let buffer_size = tensor.buf.size();
+        gpu.bind_thread()
+            .map_err(|e| format!("clone qwen35 checkpoint {label} bind gpu: {e:?}"))?;
+        let buf = gpu
+            .hip
+            .malloc(buffer_size)
+            .map_err(|e| format!("clone qwen35 checkpoint {label} alloc: {e:?}"))?;
+        gpu.hip
+            .memcpy_dtod_at(&buf, 0, &tensor.buf, 0, buffer_size)
+            .map_err(|e| format!("clone qwen35 checkpoint {label} copy: {e:?}"))?;
+        Ok(rdna_compute::GpuTensor {
+            buf,
+            shape: tensor.shape.clone(),
+            dtype: tensor.dtype,
+        })
     }
 
     fn clone_gpu_tensor_vec(
@@ -3625,6 +3721,8 @@ fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
     let memory = loaded_model_memory_view(m, &state_page_descriptors);
     ModelWorkerRuntimeView {
         worker_id: loaded_model_worker_id(m),
+        max_seq: m.max_seq,
+        physical_cap: m.physical_cap,
         max_resident_workers: 1,
         resident_workers: 1,
         state_arena_backend,
@@ -3657,6 +3755,8 @@ fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_json
         .collect();
     serde_json::json!({
         "id": worker.worker_id.value,
+        "max_seq": worker.max_seq,
+        "physical_cap": worker.physical_cap,
         "resident_workers": worker.resident_workers,
         "max_resident_workers": worker.max_resident_workers,
         "state_arena_backend": worker.state_arena_backend.as_str(),
@@ -3685,33 +3785,41 @@ fn message_worker_id(msg: &serde_json::Value) -> String {
 
 fn park_active_model(
     model: &mut Option<LoadedModel>,
+    gpu: &mut rdna_compute::Gpu,
     active_worker_id: &str,
     resident_models: &mut std::collections::HashMap<String, LoadedModel>,
-) {
+) -> Result<(), String> {
+    if let Some(m) = model.as_mut() {
+        if (m.arch_id == 5 || m.arch_id == 6) && m.pp == 1 {
+            qwen35_save_active_session(m, gpu)?;
+        }
+    }
     if let Some(m) = model.take() {
         resident_models.insert(active_worker_id.to_string(), m);
     }
+    Ok(())
 }
 
 fn activate_model_worker(
     worker_id: &str,
     active_worker_id: &mut String,
     model: &mut Option<LoadedModel>,
+    gpu: &mut rdna_compute::Gpu,
     resident_models: &mut std::collections::HashMap<String, LoadedModel>,
-) -> bool {
+) -> Result<bool, String> {
     if active_worker_id == worker_id {
-        return model.is_some();
+        return Ok(model.is_some());
     }
     if !resident_models.contains_key(worker_id) {
-        return false;
+        return Ok(false);
     }
-    park_active_model(model, active_worker_id, resident_models);
+    park_active_model(model, gpu, active_worker_id, resident_models)?;
     if let Some(m) = resident_models.remove(worker_id) {
         *active_worker_id = worker_id.to_string();
         *model = Some(m);
-        true
+        Ok(true)
     } else {
-        false
+        Ok(false)
     }
 }
 
@@ -3759,6 +3867,58 @@ fn resident_worker_status_json(
         "total_evictable_state_bytes": total_evictable_state_bytes,
         "workers": workers,
     })
+}
+
+fn resident_state_reservation_budget_bytes() -> usize {
+    std::env::var("HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB")
+        .or_else(|_| std::env::var("HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB"))
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(16 * 1024 * 1024 * 1024)
+}
+
+fn purge_expired_session_state_reservations(
+    reservations: &mut std::collections::HashMap<String, SessionStateReservation>,
+) {
+    let now = std::time::Instant::now();
+    reservations.retain(|_, reservation| {
+        reservation
+            .expires_at
+            .map(|expires_at| expires_at > now)
+            .unwrap_or(true)
+    });
+}
+
+fn outstanding_reservation_bytes_for_worker(
+    reservations: &std::collections::HashMap<String, SessionStateReservation>,
+    worker_id: &str,
+) -> usize {
+    reservations
+        .values()
+        .filter(|reservation| reservation.worker_id == worker_id)
+        .map(|reservation| reservation.reserved_bytes)
+        .sum()
+}
+
+fn estimate_session_state_reservation_bytes(m: &LoadedModel, physical_cap: usize) -> usize {
+    let descriptors = loaded_model_state_arena_backend(m).state_page_descriptors(m);
+    if !descriptors.is_empty() {
+        let total = descriptors
+            .iter()
+            .map(|descriptor| descriptor.resident_bytes)
+            .sum::<usize>();
+        return (total / descriptors.len().max(1)).max(16 * 1024 * 1024);
+    }
+    (physical_cap.saturating_mul(256 * 1024)).max(64 * 1024 * 1024)
+}
+
+fn current_worker_session_state_bytes(m: &LoadedModel) -> usize {
+    loaded_model_state_arena_backend(m)
+        .state_page_descriptors(m)
+        .iter()
+        .map(|descriptor| descriptor.resident_bytes)
+        .sum()
 }
 
 fn qwen35_release_sessions(
@@ -4525,6 +4685,17 @@ fn qwen35_semantic_boundary_checkpoints(
     session: &GenerateBatchPrefillSession,
     full_tokens: &[u32],
 ) -> Result<Vec<Qwen35SemanticBoundaryCheckpoint>, String> {
+    if !session.semantic_boundary_checkpoints {
+        return Ok(Vec::new());
+    }
+    if matches!(
+        std::env::var("HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS")
+            .ok()
+            .as_deref(),
+        Some("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+    ) {
+        return Ok(Vec::new());
+    }
     let candidates = qwen35_prefix_hash_candidates_for_tokens(m, session, full_tokens)?;
     if std::env::var_os("HIPFIRE_DEBUG_PREFIX_BOUNDARIES").is_some() {
         eprintln!(
@@ -5637,6 +5808,48 @@ fn qwen35_decode_batch_max_chunk_size(session_count: usize) -> usize {
         .max(1)
 }
 
+fn qwen35_decode_dense_native_multirow_enabled() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+    )
+}
+
+fn qwen35_decode_internal_parity_enabled() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+    )
+}
+
+fn qwen35_logits_debug_summary(
+    gpu: &rdna_compute::Gpu,
+    logits: &rdna_compute::GpuTensor,
+    token_a: u32,
+    token_b: u32,
+) -> String {
+    let Ok(values) = gpu.download_f32(logits) else {
+        return "logits_download=failed".to_string();
+    };
+    let token_a_idx = token_a as usize;
+    let token_b_idx = token_b as usize;
+    let token_a_value = values.get(token_a_idx).copied().unwrap_or(f32::NAN);
+    let token_b_value = values.get(token_b_idx).copied().unwrap_or(f32::NAN);
+    let mut top: Vec<(usize, f32)> = values.iter().copied().enumerate().collect();
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top = top
+        .into_iter()
+        .take(4)
+        .map(|(idx, value)| format!("{idx}:{value:.6}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("token_{token_a}={token_a_value:.6} token_{token_b}={token_b_value:.6} top=[{top}]")
+}
+
 fn qwen35_decode_token_outcome(
     m: &LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -5673,6 +5886,7 @@ fn qwen35_decode_step_serial_reference(
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
+    qwen35_save_active_session(m, gpu)?;
     let mut session_lines = Vec::with_capacity(envelope.sessions.len());
     for session in &envelope.sessions {
         qwen35_activate_session(m, gpu, &session.session_id)?;
@@ -5721,6 +5935,12 @@ fn qwen35_decode_step_serial_reference(
                 scratch,
             )
             .map_err(|e| format!("qwen35 decode forward_scratch: {e:?}"))?;
+            gpu.memcpy_dtod_auto(
+                &state.logits.buf,
+                &scratch.logits.buf,
+                scratch.logits.buf.size(),
+            )
+            .map_err(|e| format!("save qwen35 decode logits snapshot: {e:?}"))?;
         }
         state.seq_pos += 1;
         let new_logical_position = state.seq_pos + state.kv_cache.compact_offset;
@@ -5743,7 +5963,7 @@ fn qwen35_decode_step_serial_reference(
 fn qwen35_decode_step_fused_dense_layer_chunked(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
+    _stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
 ) -> Result<Qwen35DecodeBatchStepResult, String> {
@@ -5751,7 +5971,7 @@ fn qwen35_decode_step_fused_dense_layer_chunked(
     validate_qwen35_fused_dense_decode_resident_sessions(m, envelope)?;
 
     let chunk_size = qwen35_decode_batch_max_chunk_size(envelope.session_count);
-    qwen35_decode_step_chunked_serial_oracle(m, gpu, stdout, envelope, im_end_token, chunk_size)
+    qwen35_decode_step_fused_dense_native_chunks(m, gpu, envelope, im_end_token, chunk_size)
 }
 
 fn qwen35_decode_step_fused_grouped_moe_layer_chunked(
@@ -5796,6 +6016,371 @@ fn qwen35_decode_step_chunked_serial_oracle(
         chunk_count,
         chunk_size,
     })
+}
+
+fn qwen35_decode_step_fused_dense_native_chunks(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    envelope: &GenerateBatchDecodeEnvelope,
+    im_end_token: Option<u32>,
+    chunk_size: usize,
+) -> Result<Qwen35DecodeBatchStepResult, String> {
+    let effective_chunk_size = if qwen35_decode_dense_native_multirow_enabled() {
+        chunk_size
+    } else {
+        1
+    };
+    let chunks = qwen35_decode_native_chunk_ranges(envelope.session_count, effective_chunk_size)?;
+    let mut session_lines = Vec::with_capacity(envelope.sessions.len());
+
+    for (start, end) in &chunks {
+        let mut chunk_lines = qwen35_decode_step_fused_dense_native_chunk(
+            m,
+            gpu,
+            envelope,
+            &envelope.sessions[*start..*end],
+            im_end_token,
+        )?;
+        session_lines.append(&mut chunk_lines);
+    }
+
+    Ok(Qwen35DecodeBatchStepResult {
+        session_lines,
+        chunk_count: chunks.len(),
+        chunk_size: effective_chunk_size,
+    })
+}
+
+fn qwen35_decode_native_chunk_ranges(
+    session_count: usize,
+    chunk_size: usize,
+) -> Result<Vec<(usize, usize)>, String> {
+    if session_count <= chunk_size {
+        return Ok(vec![(0, session_count)]);
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < session_count {
+        let end = (start + chunk_size).min(session_count);
+        ranges.push((start, end));
+        start = end;
+    }
+    Ok(ranges)
+}
+
+fn qwen35_ensure_decode_prefill_batch_scratch(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    min_rows: usize,
+) -> Result<(), String> {
+    let config = m
+        .q35_config
+        .as_ref()
+        .ok_or_else(|| "qwen35 config missing".to_string())?;
+    let scratch = m
+        .q35_scratch
+        .as_mut()
+        .ok_or_else(|| "qwen35 scratch missing".to_string())?;
+    let needs_alloc = scratch
+        .prefill_batch
+        .as_ref()
+        .map(|pbs| pbs.max_batch < min_rows)
+        .unwrap_or(true);
+    if needs_alloc {
+        if let Some(existing) = scratch.prefill_batch.take() {
+            existing.free_gpu(gpu);
+        }
+        let configured_max = std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v >= 2)
+            .unwrap_or(qwen35::PREFILL_MAX_BATCH);
+        let max_batch = configured_max.max(min_rows);
+        scratch.prefill_batch = Some(
+            qwen35::PrefillBatchScratch::new(gpu, config, max_batch)
+                .map_err(|e| format!("alloc qwen35 decode native batch scratch: {e:?}"))?,
+        );
+    }
+    Ok(())
+}
+
+fn qwen35_decode_step_fused_dense_native_chunk(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    envelope: &GenerateBatchDecodeEnvelope,
+    chunk: &[GenerateBatchDecodeSession],
+    im_end_token: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    if chunk.len() == 1 {
+        return qwen35_decode_step_fused_dense_native_singleton(
+            m,
+            gpu,
+            envelope,
+            &chunk[0],
+            im_end_token,
+        );
+    }
+    qwen35_ensure_decode_prefill_batch_scratch(m, gpu, chunk.len())?;
+
+    let mut states: Vec<(GenerateBatchDecodeSession, Qwen35RequestSessionState)> =
+        Vec::with_capacity(chunk.len());
+    for session in chunk {
+        let state = m.q35_sessions.remove(&session.session_id).ok_or_else(|| {
+            format!(
+                "decode session {} is not resident for fused dense native decode",
+                session.session_id
+            )
+        })?;
+        states.push((session.clone(), state));
+    }
+
+    let result = (|| -> Result<Vec<serde_json::Value>, String> {
+        let mut outcomes = Vec::with_capacity(states.len());
+        for (session, state) in &states {
+            let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+            if logical_position != session.logical_position {
+                return Err(format!(
+                    "decode session {} logical_position mismatch: expected={} resident={}",
+                    session.session_id, session.logical_position, logical_position
+                ));
+            }
+            outcomes.push(qwen35_decode_token_outcome(
+                m,
+                gpu,
+                &state.logits,
+                session.max_tokens_remaining,
+                im_end_token,
+            )?);
+        }
+        let mut oracle_states = if qwen35_decode_internal_parity_enabled() {
+            let mut cloned = Vec::with_capacity(states.len());
+            for (session, state) in &states {
+                cloned.push((
+                    session.clone(),
+                    Qwen35RequestSessionState::fork_from(gpu, state)?,
+                ));
+            }
+            Some(cloned)
+        } else {
+            None
+        };
+
+        for ((_, state), outcome) in states.iter_mut().zip(outcomes.iter()) {
+            state.conversation_tokens.push(outcome.token);
+        }
+
+        let token_rows: Vec<[u32; 1]> = outcomes.iter().map(|outcome| [outcome.token]).collect();
+        let weights = m
+            .q35_weights
+            .as_ref()
+            .ok_or_else(|| "qwen35 weights missing".to_string())?;
+        let config = m
+            .q35_config
+            .as_ref()
+            .ok_or_else(|| "qwen35 config missing".to_string())?;
+        let scratch = m
+            .q35_scratch
+            .as_ref()
+            .ok_or_else(|| "qwen35 scratch missing".to_string())?;
+        let pbs = scratch
+            .prefill_batch
+            .as_ref()
+            .ok_or_else(|| "qwen35 decode native batch scratch missing".to_string())?;
+        let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> = states
+            .iter_mut()
+            .zip(token_rows.iter())
+            .map(|((_, state), tokens)| qwen35::DensePrefillSessionBatchRow {
+                tokens,
+                start_pos: state.seq_pos,
+                kv_cache: &mut state.kv_cache,
+                dn_state: &mut state.dn_state,
+                logits: &state.logits,
+            })
+            .collect();
+        qwen35::forward_prefill_dense_session_batch(gpu, weights, config, &mut rows, scratch, pbs)
+            .map_err(|e| format!("qwen35 fused dense native decode advance: {e:?}"))?;
+        drop(rows);
+
+        let mut lines = Vec::with_capacity(states.len());
+        for ((session, state), outcome) in states.iter_mut().zip(outcomes.iter()) {
+            state.seq_pos += 1;
+            let new_logical_position = state.seq_pos + state.kv_cache.compact_offset;
+            lines.push(serde_json::json!({
+                "type": "generate_batch_decode_step_session_done",
+                "id": envelope.id,
+                "batch_id": envelope.batch_id,
+                "session_id": session.id,
+                "runtime_state_handle": session.session_id,
+                "token": outcome.token,
+                "text": outcome.text,
+                "stop": outcome.stop,
+                "logical_position": new_logical_position,
+            }));
+        }
+        if let Some(oracle_states) = oracle_states.as_mut() {
+            let config = m
+                .q35_config
+                .as_ref()
+                .ok_or_else(|| "qwen35 config missing".to_string())?;
+            let weights = m
+                .q35_weights
+                .as_ref()
+                .ok_or_else(|| "qwen35 weights missing".to_string())?;
+            let scratch = m
+                .q35_scratch
+                .as_ref()
+                .ok_or_else(|| "qwen35 scratch missing".to_string())?;
+            for (((session, fused_state), outcome), (_, oracle_state)) in states
+                .iter()
+                .zip(outcomes.iter())
+                .zip(oracle_states.iter_mut())
+            {
+                let oracle_outcome = qwen35_decode_token_outcome(
+                    m,
+                    gpu,
+                    &oracle_state.logits,
+                    session.max_tokens_remaining,
+                    im_end_token,
+                )?;
+                if oracle_outcome.token != outcome.token {
+                    return Err(format!(
+                        "qwen35 fused dense native decode parity mismatch before advance for {}: fused_token={} serial_token={}",
+                        session.session_id, outcome.token, oracle_outcome.token
+                    ));
+                }
+                oracle_state.conversation_tokens.push(oracle_outcome.token);
+                qwen35::forward_scratch(
+                    gpu,
+                    weights,
+                    config,
+                    oracle_outcome.token,
+                    oracle_state.seq_pos,
+                    &mut oracle_state.kv_cache,
+                    &mut oracle_state.dn_state,
+                    scratch,
+                )
+                .map_err(|e| format!("qwen35 decode internal serial parity advance: {e:?}"))?;
+                gpu.memcpy_dtod_auto(
+                    &oracle_state.logits.buf,
+                    &scratch.logits.buf,
+                    scratch.logits.buf.size(),
+                )
+                .map_err(|e| format!("save qwen35 decode internal parity logits: {e:?}"))?;
+                oracle_state.seq_pos += 1;
+                let fused_next = gpu
+                    .argmax_f32(&fused_state.logits, config.vocab_size)
+                    .map_err(|e| format!("qwen35 fused parity fused argmax: {e:?}"))?;
+                let serial_next = gpu
+                    .argmax_f32(&oracle_state.logits, config.vocab_size)
+                    .map_err(|e| format!("qwen35 fused parity serial argmax: {e:?}"))?;
+                if fused_next != serial_next {
+                    let fused_summary = qwen35_logits_debug_summary(
+                        gpu,
+                        &fused_state.logits,
+                        fused_next,
+                        serial_next,
+                    );
+                    let serial_summary = qwen35_logits_debug_summary(
+                        gpu,
+                        &oracle_state.logits,
+                        fused_next,
+                        serial_next,
+                    );
+                    return Err(format!(
+                        "qwen35 fused dense native decode parity mismatch after advance for {}: fused_next={} serial_next={} fused_logits=({}) serial_logits=({})",
+                        session.session_id, fused_next, serial_next, fused_summary, serial_summary
+                    ));
+                }
+            }
+        }
+        Ok(lines)
+    })();
+
+    for (session, state) in states {
+        m.q35_sessions.insert(session.session_id, state);
+    }
+
+    result
+}
+
+fn qwen35_decode_step_fused_dense_native_singleton(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    envelope: &GenerateBatchDecodeEnvelope,
+    session: &GenerateBatchDecodeSession,
+    im_end_token: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    qwen35_activate_session(m, gpu, &session.session_id)?;
+    let mut state = Qwen35RequestSessionState::take_from_loaded(m, gpu)?;
+
+    let result = (|| -> Result<Vec<serde_json::Value>, String> {
+        let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+        if logical_position != session.logical_position {
+            return Err(format!(
+                "decode session {} logical_position mismatch: expected={} resident={}",
+                session.session_id, session.logical_position, logical_position
+            ));
+        }
+        let outcome = qwen35_decode_token_outcome(
+            m,
+            gpu,
+            &state.logits,
+            session.max_tokens_remaining,
+            im_end_token,
+        )?;
+        state.conversation_tokens.push(outcome.token);
+        {
+            let config = m
+                .q35_config
+                .as_ref()
+                .ok_or_else(|| "qwen35 config missing".to_string())?;
+            let weights = m
+                .q35_weights
+                .as_ref()
+                .ok_or_else(|| "qwen35 weights missing".to_string())?;
+            let scratch = m
+                .q35_scratch
+                .as_ref()
+                .ok_or_else(|| "qwen35 scratch missing".to_string())?;
+            qwen35::forward_scratch(
+                gpu,
+                weights,
+                config,
+                outcome.token,
+                state.seq_pos,
+                &mut state.kv_cache,
+                &mut state.dn_state,
+                scratch,
+            )
+            .map_err(|e| format!("qwen35 fused dense native singleton decode advance: {e:?}"))?;
+            gpu.memcpy_dtod_auto(
+                &state.logits.buf,
+                &scratch.logits.buf,
+                scratch.logits.buf.size(),
+            )
+            .map_err(|e| format!("save qwen35 native singleton logits snapshot: {e:?}"))?;
+        }
+        state.seq_pos += 1;
+        let new_logical_position = state.seq_pos + state.kv_cache.compact_offset;
+        Ok(vec![serde_json::json!({
+            "type": "generate_batch_decode_step_session_done",
+            "id": envelope.id,
+            "batch_id": envelope.batch_id,
+            "session_id": session.id,
+            "runtime_state_handle": session.session_id,
+            "token": outcome.token,
+            "text": outcome.text,
+            "stop": outcome.stop,
+            "logical_position": new_logical_position,
+        })])
+    })();
+
+    let restore_result = state.restore_into_loaded(m, gpu);
+    let save_result = restore_result.and_then(|()| qwen35_save_active_session(m, gpu));
+    if let Err(err) = save_result {
+        return Err(err);
+    }
+    result
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -5915,6 +6500,8 @@ fn main() {
     let mut active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
     let mut resident_models: std::collections::HashMap<String, LoadedModel> =
         std::collections::HashMap::new();
+    let mut session_state_reservations: std::collections::HashMap<String, SessionStateReservation> =
+        std::collections::HashMap::new();
     // PFlash speculative-prefill state. None unless the load message
     // includes a `prefill_drafter` path AND `prefill_compression` != "off".
     // Lives alongside `model` so unload_model + this state are paired
@@ -5970,6 +6557,8 @@ fn main() {
                 // load (the explicit "unload" handler has the same
                 // ordering for the same reason).
                 if requested_worker_id == active_worker_id {
+                    session_state_reservations
+                        .retain(|_, reservation| reservation.worker_id != requested_worker_id);
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
                             dg.bind_thread_or_warn();
@@ -5984,10 +6573,21 @@ fn main() {
                         unload_model(m, &mut gpu);
                     }
                 } else {
-                    park_active_model(&mut model, &active_worker_id, &mut resident_models);
+                    if let Err(e) = park_active_model(
+                        &mut model,
+                        &mut gpu,
+                        &active_worker_id,
+                        &mut resident_models,
+                    ) {
+                        write_error(&mut stdout, "", &format!("worker switch failed: {e}"));
+                        let _ = stdout.flush();
+                        continue;
+                    }
                     active_worker_id = requested_worker_id.clone();
                 }
                 if let Some(m) = resident_models.remove(&requested_worker_id) {
+                    session_state_reservations
+                        .retain(|_, reservation| reservation.worker_id != requested_worker_id);
                     unload_model(m, &mut gpu);
                 }
                 dummy_model = None;
@@ -6024,6 +6624,12 @@ fn main() {
                     .and_then(|p| p.get("max_seq"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(4096) as usize;
+                let requested_physical_cap = msg
+                    .get("params")
+                    .and_then(|p| p.get("physical_cap"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .filter(|v| *v > 0);
                 // Optional DFlash draft model path. When supplied AND the target
                 // is a Qwen3.5 arch (5 or 6), we load draft weights + scratch
                 // alongside the target and the temp=0 generate fast path routes
@@ -6311,6 +6917,7 @@ fn main() {
                 match load_model(
                     path,
                     max_seq,
+                    requested_physical_cap,
                     draft_path.as_deref(),
                     kv_mode_override.as_deref(),
                     state_quant_override.as_deref(),
@@ -6552,20 +7159,32 @@ fn main() {
             "generate" => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
                 let target_worker_id = message_worker_id(&msg);
-                if dummy_model.is_none()
-                    && !activate_model_worker(
+                if dummy_model.is_none() {
+                    match activate_model_worker(
                         &target_worker_id,
                         &mut active_worker_id,
                         &mut model,
+                        &mut gpu,
                         &mut resident_models,
-                    )
-                {
-                    emit_error_with_id(
-                        &mut stdout,
-                        id,
-                        format!("unknown model worker {target_worker_id}"),
-                    );
-                    continue;
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                id,
+                                format!("unknown model worker {target_worker_id}"),
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                id,
+                                format!("worker switch failed: {e}"),
+                            );
+                            continue;
+                        }
+                    }
                 }
                 let session_id = msg
                     .get("session_id")
@@ -7024,20 +7643,32 @@ fn main() {
             "generate_batch_prefill" => match validate_generate_batch_prefill(&msg) {
                 Ok(envelope) => {
                     let target_worker_id = message_worker_id(&msg);
-                    if dummy_model.is_none()
-                        && !activate_model_worker(
+                    if dummy_model.is_none() {
+                        match activate_model_worker(
                             &target_worker_id,
                             &mut active_worker_id,
                             &mut model,
+                            &mut gpu,
                             &mut resident_models,
-                        )
-                    {
-                        emit_error_with_id(
-                            &mut stdout,
-                            &envelope.id,
-                            format!("unknown model worker {target_worker_id}"),
-                        );
-                        continue;
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                emit_error_with_id(
+                                    &mut stdout,
+                                    &envelope.id,
+                                    format!("unknown model worker {target_worker_id}"),
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                emit_error_with_id(
+                                    &mut stdout,
+                                    &envelope.id,
+                                    format!("worker switch failed: {e}"),
+                                );
+                                continue;
+                            }
+                        }
                     }
                     if generate_batch_prefill_is_probe(&envelope) {
                         if dummy_model.is_some() {
@@ -7109,18 +7740,30 @@ fn main() {
             "prefix_hash_preflight" => match validate_prefix_hash_preflight(&msg) {
                 Ok(envelope) => {
                     let target_worker_id = message_worker_id(&msg);
-                    if !activate_model_worker(
+                    match activate_model_worker(
                         &target_worker_id,
                         &mut active_worker_id,
                         &mut model,
+                        &mut gpu,
                         &mut resident_models,
                     ) {
-                        emit_error_with_id(
-                            &mut stdout,
-                            &envelope.id,
-                            format!("unknown model worker {target_worker_id}"),
-                        );
-                        continue;
+                        Ok(true) => {}
+                        Ok(false) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                &envelope.id,
+                                format!("unknown model worker {target_worker_id}"),
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                &envelope.id,
+                                format!("worker switch failed: {e}"),
+                            );
+                            continue;
+                        }
                     }
                     let m = match model.as_ref() {
                         Some(m) => m,
@@ -7142,18 +7785,30 @@ fn main() {
             "generate_batch_decode_step" => match validate_generate_batch_decode(&msg) {
                 Ok(envelope) => {
                     let target_worker_id = message_worker_id(&msg);
-                    if !activate_model_worker(
+                    match activate_model_worker(
                         &target_worker_id,
                         &mut active_worker_id,
                         &mut model,
+                        &mut gpu,
                         &mut resident_models,
                     ) {
-                        emit_error_with_id(
-                            &mut stdout,
-                            &envelope.id,
-                            format!("unknown model worker {target_worker_id}"),
-                        );
-                        continue;
+                        Ok(true) => {}
+                        Ok(false) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                &envelope.id,
+                                format!("unknown model worker {target_worker_id}"),
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                &envelope.id,
+                                format!("worker switch failed: {e}"),
+                            );
+                            continue;
+                        }
                     }
                     let m = match model.as_mut() {
                         Some(m) => m,
@@ -7177,20 +7832,32 @@ fn main() {
             "release_sessions" => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("release");
                 let target_worker_id = message_worker_id(&msg);
-                if dummy_model.is_none()
-                    && !activate_model_worker(
+                if dummy_model.is_none() {
+                    match activate_model_worker(
                         &target_worker_id,
                         &mut active_worker_id,
                         &mut model,
+                        &mut gpu,
                         &mut resident_models,
-                    )
-                {
-                    emit_error_with_id(
-                        &mut stdout,
-                        id,
-                        format!("unknown model worker {target_worker_id}"),
-                    );
-                    continue;
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                id,
+                                format!("unknown model worker {target_worker_id}"),
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                id,
+                                format!("worker switch failed: {e}"),
+                            );
+                            continue;
+                        }
+                    }
                 }
                 let sessions: Vec<String> = match msg.get("sessions").and_then(|v| v.as_array()) {
                     Some(values) => values
@@ -7245,6 +7912,180 @@ fn main() {
                 }
             }
 
+            "reserve_session_state" => {
+                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("reserve");
+                let target_worker_id = message_worker_id(&msg);
+                purge_expired_session_state_reservations(&mut session_state_reservations);
+                if dummy_model.is_none() {
+                    match activate_model_worker(
+                        &target_worker_id,
+                        &mut active_worker_id,
+                        &mut model,
+                        &mut gpu,
+                        &mut resident_models,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                id,
+                                format!("unknown model worker {target_worker_id}"),
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                id,
+                                format!("worker switch failed: {e}"),
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let physical_cap = msg
+                    .get("physical_cap")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(0);
+                if physical_cap == 0 {
+                    emit_error_with_id(
+                        &mut stdout,
+                        id,
+                        "reserve_session_state.physical_cap must be > 0",
+                    );
+                    continue;
+                }
+                let ttl_ms = msg.get("ttl_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
+                let reservation_id = msg
+                    .get("reservation_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "reserve:{}:{}",
+                            target_worker_id,
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos())
+                                .unwrap_or(0)
+                        )
+                    });
+                let (reserved_bytes, current_session_bytes, outstanding_bytes, budget_bytes) =
+                    if let Some(m) = model.as_ref() {
+                        let budget = msg
+                            .get("budget_bytes")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                            .unwrap_or_else(resident_state_reservation_budget_bytes);
+                        (
+                            estimate_session_state_reservation_bytes(m, physical_cap),
+                            current_worker_session_state_bytes(m),
+                            outstanding_reservation_bytes_for_worker(
+                                &session_state_reservations,
+                                &target_worker_id,
+                            ),
+                            budget,
+                        )
+                    } else if dummy_model.is_some() {
+                        let budget = msg
+                            .get("budget_bytes")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                            .unwrap_or_else(resident_state_reservation_budget_bytes);
+                        (1024usize, 0usize, 0usize, budget)
+                    } else {
+                        emit_error_with_id(&mut stdout, id, "no model loaded");
+                        continue;
+                    };
+                let projected = current_session_bytes
+                    .saturating_add(outstanding_bytes)
+                    .saturating_add(reserved_bytes);
+                if budget_bytes > 0 && projected > budget_bytes {
+                    let rejected = serde_json::json!({
+                        "type": "reserve_session_state_rejected",
+                        "id": id,
+                        "worker_key_id": target_worker_id,
+                        "reason": "memory_pressure",
+                        "reserved_bytes": reserved_bytes,
+                        "current_session_bytes": current_session_bytes,
+                        "outstanding_reserved_bytes": outstanding_bytes,
+                        "projected_reserved_bytes": projected,
+                        "budget_bytes": budget_bytes,
+                    });
+                    let _ = writeln!(stdout, "{rejected}");
+                    let _ = stdout.flush();
+                    continue;
+                }
+                session_state_reservations.insert(
+                    reservation_id.clone(),
+                    SessionStateReservation {
+                        worker_id: target_worker_id.clone(),
+                        reserved_bytes,
+                        expires_at: if ttl_ms == 0 {
+                            None
+                        } else {
+                            Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(ttl_ms),
+                            )
+                        },
+                    },
+                );
+                let done = serde_json::json!({
+                    "type": "reserve_session_state_done",
+                    "id": id,
+                    "worker_key_id": target_worker_id,
+                    "reservation_id": reservation_id,
+                    "reserved_bytes": reserved_bytes,
+                    "current_session_bytes": current_session_bytes,
+                    "outstanding_reserved_bytes": outstanding_bytes,
+                    "projected_reserved_bytes": projected,
+                    "budget_bytes": budget_bytes,
+                });
+                let _ = writeln!(stdout, "{done}");
+                let _ = stdout.flush();
+            }
+
+            "release_session_state_reservation" => {
+                let id = msg
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("release-reservation");
+                let reservations: Vec<String> = msg
+                    .get("reservations")
+                    .and_then(|v| v.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .or_else(|| {
+                        msg.get("reservation_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| vec![s.to_string()])
+                    })
+                    .unwrap_or_default();
+                let mut released = 0usize;
+                let mut released_bytes = 0usize;
+                for reservation_id in reservations {
+                    if let Some(reservation) = session_state_reservations.remove(&reservation_id) {
+                        released += 1;
+                        released_bytes = released_bytes.saturating_add(reservation.reserved_bytes);
+                    }
+                }
+                let done = serde_json::json!({
+                    "type": "release_session_state_reservation_done",
+                    "id": id,
+                    "released": released,
+                    "released_bytes": released_bytes,
+                });
+                let _ = writeln!(stdout, "{done}");
+                let _ = stdout.flush();
+            }
+
             "worker_status" | "list_workers" => {
                 let status = resident_worker_status_json(
                     &active_worker_id,
@@ -7257,23 +8098,37 @@ fn main() {
 
             "reset" => {
                 let target_worker_id = message_worker_id(&msg);
-                if dummy_model.is_none()
-                    && !activate_model_worker(
+                if dummy_model.is_none() {
+                    match activate_model_worker(
                         &target_worker_id,
                         &mut active_worker_id,
                         &mut model,
+                        &mut gpu,
                         &mut resident_models,
-                    )
-                {
-                    emit_error_with_id(
-                        &mut stdout,
-                        "",
-                        format!("unknown model worker {target_worker_id}"),
-                    );
-                    continue;
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                "",
+                                format!("unknown model worker {target_worker_id}"),
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            emit_error_with_id(
+                                &mut stdout,
+                                "",
+                                format!("worker switch failed: {e}"),
+                            );
+                            continue;
+                        }
+                    }
                 }
                 // Reset conversation state without unloading the model.
                 if let Some(dummy) = dummy_model.as_mut() {
+                    session_state_reservations
+                        .retain(|_, reservation| reservation.worker_id != target_worker_id);
                     dummy.reset();
                     let _ = writeln!(stdout, r#"{{"type":"reset"}}"#);
                     let _ = stdout.flush();
@@ -7282,10 +8137,16 @@ fn main() {
                 // Under eviction, also zero the compact_offset so absolute
                 // RoPE phase restarts from zero for the fresh conversation.
                 if let Some(ref mut m) = model {
+                    session_state_reservations
+                        .retain(|_, reservation| reservation.worker_id != target_worker_id);
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
                     m.q35_sessions.clear();
-                    m.q35_active_session_id = if (m.arch_id == 5 || m.arch_id == 6) && m.pp == 1 {
+                    m.q35_active_session_id = if (m.arch_id == 5 || m.arch_id == 6)
+                        && m.pp == 1
+                        && m.kv_cache.is_some()
+                        && m.dn_state.is_some()
+                    {
                         Some(QWEN35_LEGACY_SESSION_ID.to_string())
                     } else {
                         None
@@ -7413,6 +8274,7 @@ fn main() {
                 for (_, m) in resident_models.drain() {
                     unload_model(m, &mut gpu);
                 }
+                session_state_reservations.clear();
                 dummy_model = None;
                 active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
                 let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
@@ -7426,6 +8288,8 @@ fn main() {
                     .unwrap_or("unload_worker");
                 let worker_id = message_worker_id(&msg);
                 let mut unloaded = false;
+                session_state_reservations
+                    .retain(|_, reservation| reservation.worker_id != worker_id);
                 if worker_id == active_worker_id {
                     if let Some(m) = model.take() {
                         unload_model(m, &mut gpu);
@@ -7943,6 +8807,7 @@ fn warn_tiny_model_state(hfq: &HfqFile, q: hipfire_arch_qwen35::qwen35::StateQua
 fn load_model(
     path: &str,
     max_seq: usize,
+    requested_physical_cap: Option<usize>,
     draft_path: Option<&str>,
     kv_mode_override: Option<&str>,
     state_quant_override: Option<&str>,
@@ -8108,8 +8973,9 @@ fn load_model(
 
     // Derive physical_cap. With eviction (cask.sidecar set), the physical
     // buffer only needs to hold budget+beta+safety slots; max_seq is the
-    // advertised window the client targets. Without eviction, the two are
-    // identical (prior behavior).
+    // advertised window the client targets. Without eviction, the server may
+    // still request a smaller initial allocation and reload a larger worker
+    // on demand; max_seq remains the logical context-window limit.
     //
     // The `HIPFIRE_KV_PHYSICAL_CAP` env var is an explicit operator override —
     // useful for ablations or reproducing dflash_spec_demo settings.
@@ -8122,7 +8988,14 @@ fn load_model(
         let derived = cask.budget + cask.beta + safety;
         env_override.unwrap_or(derived).clamp(floor, max_seq)
     } else {
-        max_seq
+        let requested = requested_physical_cap
+            .or_else(|| {
+                std::env::var("HIPFIRE_KV_PHYSICAL_CAP")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+            })
+            .unwrap_or(max_seq);
+        requested.clamp(512.min(max_seq), max_seq)
     };
 
     if hfq.arch_id == 7 {
@@ -8742,20 +9615,22 @@ fn load_model(
         // Legacy "turbo{2,3,4}" aliases map to asym{2,3,4} for backward compat.
         //
         // All allocators go through the `_capped` entry points with
-        // physical_cap derived above. Without eviction, physical_cap==max_seq
-        // and these match the back-compat wrappers byte-for-byte.
+        // physical_cap derived above. Without eviction, physical_cap may still
+        // be smaller than max_seq; the server reloads a larger worker when a
+        // request needs more physical rows.
         let is_kv_layer: Vec<bool> = config
             .layer_types
             .iter()
             .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
             .collect();
         let kv = match kv_mode.as_str() {
-            "fp32" | "f32" => llama::KvCache::new_gpu_filtered(
+            "fp32" | "f32" => llama::KvCache::new_gpu_capped_filtered(
                 gpu,
                 &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 max_seq,
+                physical_cap,
             )
             .map_err(|e| format!("{e}"))?,
             "q8" => {
@@ -8823,7 +9698,8 @@ fn load_model(
             DeltaNetState::new_with_quant(gpu, &config, dn_quant).map_err(|e| format!("{e}"))?;
         // Flash partials size with physical_cap (bounds the max_tiles the
         // flash kernel must address). When physical_cap == max_seq this is
-        // identical to sizing-by-max_seq; under eviction it's much smaller.
+        // identical to sizing-by-max_seq; otherwise it follows the worker's
+        // current physical allocation.
         // Keep the request default at 128, but allocate enough history for
         // clients that explicitly ask for a wider repeat / OpenAI penalty
         // window.
@@ -8911,7 +9787,8 @@ fn load_model(
             // the ctx_capacity argument. Pass `physical_cap` instead of
             // `max_seq` so eviction's smaller buffer caps VRAM: a 128K-advertised
             // model with physical_cap=896 allocates an 896-slot ring, not 128K.
-            // Without eviction, physical_cap == max_seq so the behavior matches.
+            // Without eviction, callers may now choose physical_cap < max_seq;
+            // pass the actual allocation size so the draft ring matches.
             match load_dflash_state(dp, physical_cap, &config, &dn, gpu) {
                 Ok(state) => {
                     eprintln!(

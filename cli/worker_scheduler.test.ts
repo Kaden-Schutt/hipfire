@@ -300,4 +300,12 @@ describe("priority decode scheduler", () => {
     expect(scheduler.cancel("missing")).toBe(false);
     expect(decodeIds(scheduler.nextDecodeBatch({ nowMs: 0 }))).toEqual(["b"]);
   });
+
+  test("backpressure rejects active decode sessions above the configured limit", () => {
+    const scheduler = new PriorityDecodeScheduler({
+      HIPFIRE_SCHED_DECODE_MAX_ACTIVE: "1",
+    });
+    scheduler.enqueue(active("a"));
+    expect(() => scheduler.enqueue(active("b"))).toThrow("decode scheduler backpressure");
+  });
 });
