@@ -11652,19 +11652,34 @@ fn generate_gemma4(
     };
     let t0 = Instant::now();
 
-    // ── Prefill: forward_scratch per prompt token ──
+    // ── Prefill ──
+    // When HIPFIRE_WMMA_PREFILL=1 and prompt is long enough, use batched
+    // prefill (WMMA projections + per-token attention). Otherwise per-token.
     {
         let config = m.gemma4_config.as_ref().unwrap();
         let weights = m.gemma4_weights.as_ref().unwrap();
         let scratch = m.gemma4_scratch.as_mut().unwrap();
         let kv_sliding = m.gemma4_kv_sliding.as_mut().unwrap();
         let kv_full = m.gemma4_kv_full.as_mut().unwrap();
-        for (i, &tok) in prompt_ids.iter().enumerate() {
-            if let Err(e) = gemma4::forward_scratch(
-                gpu, weights, config, tok, i, kv_sliding, kv_full, scratch,
+        let use_batched = (gemma4::wmma_prefill_enabled() || gemma4::batched_prefill_enabled())
+            && prompt_ids.len() >= 4
+            && prompt_ids.len() <= scratch.max_prefill_batch;
+        if use_batched {
+            if let Err(e) = gemma4::forward_prefill_batch(
+                gpu, weights, config, &prompt_ids, 0,
+                kv_sliding, kv_full, scratch,
             ) {
-                emit_error_with_id(stdout, id, format!("gemma4 prefill failed at token {i}: {e:?}"));
+                emit_error_with_id(stdout, id, format!("gemma4 batched prefill failed: {e:?}"));
                 return;
+            }
+        } else {
+            for (i, &tok) in prompt_ids.iter().enumerate() {
+                if let Err(e) = gemma4::forward_scratch(
+                    gpu, weights, config, tok, i, kv_sliding, kv_full, scratch,
+                ) {
+                    emit_error_with_id(stdout, id, format!("gemma4 prefill failed at token {i}: {e:?}"));
+                    return;
+                }
             }
         }
     }

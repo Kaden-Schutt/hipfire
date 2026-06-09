@@ -39,9 +39,18 @@ use hipfire_dispatch::families::gemv::WeightRef;
 /// Env gate for WMMA prefill. Default OFF because WMMA F16 input quantization
 /// loses ~3 mantissa bits vs F32 scalar, so WMMA results are NOT byte-identical
 /// to the scalar GEMV path. Set HIPFIRE_WMMA_PREFILL=1 to opt in.
-fn wmma_prefill_enabled() -> bool {
+pub fn wmma_prefill_enabled() -> bool {
     static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *GATE.get_or_init(|| std::env::var("HIPFIRE_WMMA_PREFILL").map_or(false, |v| v == "1"))
+}
+
+/// Env gate for batched prefill (v2). Independent from WMMA.
+/// Set HIPFIRE_BATCHED_PREFILL=1 to use batched projections + per-token attention.
+pub fn batched_prefill_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("HIPFIRE_BATCHED_PREFILL").map_or(false, |v| v == "1")
+    })
 }
 
 /// Batched GEMM for prefill projections.
@@ -2748,62 +2757,85 @@ fn forward_prefill_batch_v2(
                     dbg_dump(gpu, "[v2] L0 after rope_k", &scratch.pb_k, kv_dim);
                 }
 
-                // Batched KV write + attention via dispatch framework.
-                // Step::Attend combines kv_cache_write + flash attention
-                // into a single dispatch through AttentionFamily.
-                let ct = kv_sliding.givens_cos.as_ref().unwrap();
-                let st = kv_sliding.givens_sin.as_ref().unwrap();
+                // Per-token KV write + attention (batched projections, per-token
+                // attention). The batched q8 attention path has a bug that
+                // corrupts KV when cache_capacity > 0 (ring-buffer mode), so
+                // we run attention per-token through the proven decode-path
+                // Step::Attend with batch_size=1. This is only 1.7% of GPU
+                // time per the rocprof profile, so the overhead is minimal.
                 let sliding_cap = config.sliding_window as u32;
-                let max_ctx_len = start_pos + n_batch;
-                {
-                    let plan = KvTierPlan::derive(KvTierInputs {
-                        quant_asym4: false,
-                        quant_asym3: true,
-                        quant_asym2: false,
-                        quant_q8: false,
-                        quant_fwht: false,
+                for i in 0..n_batch {
+                    let pos = start_pos + i;
+                    if let Some(stream) = gpu.active_stream.as_ref() {
+                        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+                    } else {
+                        gpu.hip.memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
+                    }
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes, _s)?;
+                        gpu.hip.memcpy_dtod_async_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
+                        gpu.hip.memcpy_dtod_async_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
+                        gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                        gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    }
+                    let tier_inputs = KvTierInputs {
+                        quant_asym4: kv_sliding.quant_asym4,
+                        quant_asym3: kv_sliding.quant_asym3,
+                        quant_asym2: kv_sliding.quant_asym2,
+                        quant_q8: kv_sliding.quant_q8,
+                        quant_fwht: kv_sliding.quant_fwht,
                         quant_hfq4: false,
                         quant_q4: false,
-                        v_mode_bits: 8, // Q8_0 V for asym3
-                        pos: start_pos,
+                        v_mode_bits: kv_sliding.v_mode_bits(),
+                        pos,
                         flash_mode: 2,
-                        capture_mode: false,
-                        batch_size: n_batch,
+                        capture_mode: gpu.graphs.capture_mode,
+                        batch_size: 1,
                         is_tree: false,
                         is_boundary: false,
                         cache_capacity: sliding_cap,
                         head_dim,
                         window_size: sliding_cap,
-                    }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                    };
+                    let plan = KvTierPlan::derive(tier_inputs)
+                        .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
                     let io = AttnParams {
-                        q: &scratch.pb_q,
-                        k: &scratch.pb_k,
-                        v: &scratch.pb_v,
+                        q: &scratch.q,
+                        k: &scratch.k,
+                        v: &scratch.v,
                         k_cache: &kv_sliding.k_gpu[sliding_kv_idx],
                         v_cache: &kv_sliding.v_gpu[sliding_kv_idx],
                         k_scales: None,
                         v_scales: None,
                         pos_buf: &scratch.pos_buf,
-                        pos: start_pos,
-                        positions: Some(&scratch.pb_positions),
+                        pos,
+                        positions: None,
                         n_heads,
                         n_kv_heads: n_kv,
                         head_dim,
                         physical_cap: kv_sliding.max_seq,
                         cache_capacity: plan.cache_capacity,
                         window_size: plan.window_size,
-                        batch_size: n_batch,
-                        max_ctx_len,
+                        batch_size: 1,
+                        max_ctx_len: 0,
                         flash_partials: Some(&scratch.flash_partials),
-                        givens_cos: Some(ct),
-                        givens_sin: Some(st),
+                        givens_cos: kv_sliding.givens_cos.as_ref(),
+                        givens_sin: kv_sliding.givens_sin.as_ref(),
                         tree_bias: None,
                         block_start: 0,
                         block_cols: 0,
-                        output: &scratch.pb_q, // out aliases q (safe)
+                        output: &scratch.attn_out,
                     };
                     let ctx = DispatchCtx::new(gpu);
                     execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])?;
+                    // Copy attention output back to batched buffer.
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes)?;
+                    }
                 }
                 sliding_kv_idx += 1;
                 if _dump_on { dbg_dump(gpu, "[v2] L0 after attention (pb_q)", &scratch.pb_q, q_dim); }
@@ -2877,60 +2909,85 @@ fn forward_prefill_batch_v2(
                     }
                 }
 
-                // Batched KV write + attention for full layer (hd=512)
-                // via dispatch framework. No ring-buffer or window masking.
-                let ct = kv_full.givens_cos.as_ref().unwrap();
-                let st = kv_full.givens_sin.as_ref().unwrap();
-                let max_ctx_len = start_pos + n_batch;
-                {
-                    let plan = KvTierPlan::derive(KvTierInputs {
-                        quant_asym4: false,
-                        quant_asym3: true,
-                        quant_asym2: false,
-                        quant_q8: false,
-                        quant_fwht: false,
+                // Per-token KV write + attention for full layer (hd=512).
+                // Same per-token approach as sliding: batched projections,
+                // per-token attention (batched q8 attention corrupts KV in
+                // ring-buffer mode). Full layers use proportional RoPE via
+                // rope_partial_halved_f32 (already batched above).
+                for i in 0..n_batch {
+                    let pos = start_pos + i;
+                    if let Some(stream) = gpu.active_stream.as_ref() {
+                        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+                    } else {
+                        gpu.hip.memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
+                    }
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes, _s)?;
+                        gpu.hip.memcpy_dtod_async_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
+                        // V = K (k_eq_v model): copy from same pb_k offset
+                        gpu.hip.memcpy_dtod_async_at(&scratch.v.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
+                        gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                        gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                    }
+                    // Per-token proportional RoPE was already applied above.
+                    let tier_inputs = KvTierInputs {
+                        quant_asym4: kv_full.quant_asym4,
+                        quant_asym3: kv_full.quant_asym3,
+                        quant_asym2: kv_full.quant_asym2,
+                        quant_q8: kv_full.quant_q8,
+                        quant_fwht: kv_full.quant_fwht,
                         quant_hfq4: false,
                         quant_q4: false,
-                        v_mode_bits: 8, // Q8_0 V for asym3
-                        pos: start_pos,
+                        v_mode_bits: kv_full.v_mode_bits(),
+                        pos,
                         flash_mode: 2,
-                        capture_mode: false,
-                        batch_size: n_batch,
+                        capture_mode: gpu.graphs.capture_mode,
+                        batch_size: 1,
                         is_tree: false,
                         is_boundary: false,
                         cache_capacity: 0,
                         head_dim,
                         window_size: 0,
-                    }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                    };
+                    let plan = KvTierPlan::derive(tier_inputs)
+                        .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
                     let io = AttnParams {
-                        q: &scratch.pb_q,
-                        k: &scratch.pb_k,
-                        v: &scratch.pb_v,
+                        q: &scratch.q,
+                        k: &scratch.k,
+                        v: &scratch.v,
                         k_cache: &kv_full.k_gpu[full_kv_idx],
                         v_cache: &kv_full.v_gpu[full_kv_idx],
                         k_scales: None,
                         v_scales: None,
                         pos_buf: &scratch.pos_buf,
-                        pos: start_pos,
-                        positions: Some(&scratch.pb_positions),
+                        pos,
+                        positions: None,
                         n_heads,
                         n_kv_heads: n_kv,
                         head_dim,
                         physical_cap: kv_full.max_seq,
                         cache_capacity: plan.cache_capacity,
                         window_size: plan.window_size,
-                        batch_size: n_batch,
-                        max_ctx_len,
+                        batch_size: 1,
+                        max_ctx_len: 0,
                         flash_partials: Some(&scratch.flash_partials),
-                        givens_cos: Some(ct),
-                        givens_sin: Some(st),
+                        givens_cos: kv_full.givens_cos.as_ref(),
+                        givens_sin: kv_full.givens_sin.as_ref(),
                         tree_bias: None,
                         block_start: 0,
                         block_cols: 0,
-                        output: &scratch.pb_q, // out aliases q (safe)
+                        output: &scratch.attn_out,
                     };
                     let ctx = DispatchCtx::new(gpu);
                     execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])?;
+                    // Copy attention output back to batched buffer.
+                    if let Some(_s) = gpu.active_stream.as_ref() {
+                        gpu.hip.memcpy_dtod_async_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes, _s)?;
+                    } else {
+                        gpu.hip.memcpy_dtod_at(&scratch.pb_q.buf, i * q_dim_bytes, &scratch.attn_out.buf, 0, q_dim_bytes)?;
+                    }
                 }
                 full_kv_idx += 1;
 
