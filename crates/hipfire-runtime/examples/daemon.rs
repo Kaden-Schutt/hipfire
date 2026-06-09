@@ -837,6 +837,7 @@ impl Qwen35PrefillBatchBackend {
 enum Qwen35DecodeBatchBackend {
     SerialReference,
     FusedDenseLayerChunked,
+    FusedGroupedMoeLayerChunked,
 }
 
 impl Qwen35DecodeBatchBackend {
@@ -844,6 +845,7 @@ impl Qwen35DecodeBatchBackend {
         match self {
             Self::SerialReference => "serial_reference",
             Self::FusedDenseLayerChunked => "fused_dense_layer_chunked",
+            Self::FusedGroupedMoeLayerChunked => "fused_grouped_moe_layer_chunked",
         }
     }
 }
@@ -873,11 +875,21 @@ fn select_qwen35_decode_batch_backend(
             }
             Ok(Qwen35DecodeBatchBackend::FusedDenseLayerChunked)
         }
-        "fused_grouped_moe" | "grouped_moe" => {
-            Err("qwen35 grouped-MoE fused decode batch is not implemented yet".to_string())
+        "fused_grouped_moe" | "grouped_moe" | "fused_grouped_moe_layer_chunked" => {
+            if arch_id != 6 {
+                return Err(format!(
+                    "qwen35 grouped-MoE decode batch requested, but arch_id={arch_id} is not Qwen35 grouped-MoE"
+                ));
+            }
+            if session_count < 2 {
+                return Err(
+                    "qwen35 grouped-MoE decode batch requires at least two sessions".to_string(),
+                );
+            }
+            Ok(Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked)
         }
         other => Err(format!(
-            "unsupported HIPFIRE_QWEN35_DECODE_BATCH={other}; expected auto, serial, fused, or off"
+            "unsupported HIPFIRE_QWEN35_DECODE_BATCH={other}; expected auto, serial, fused, fused_grouped_moe, or off"
         )),
     }
 }
@@ -972,14 +984,49 @@ fn validate_qwen35_fused_dense_decode_model_capability(
     Ok(())
 }
 
-fn validate_qwen35_fused_dense_decode_step_bounds(
+fn validate_qwen35_grouped_moe_decode_model_capability(
+    m: &LoadedModel,
+    session_count: usize,
+) -> Result<(), String> {
+    if m.arch_id != 6 {
+        return Err(format!(
+            "qwen35 grouped-MoE decode requires Qwen35 MoE arch_id=6; loaded arch_id={}",
+            m.arch_id
+        ));
+    }
+    if session_count < 2 {
+        return Err("qwen35 grouped-MoE decode requires at least two sessions".to_string());
+    }
+    let config = m
+        .q35_config
+        .as_ref()
+        .ok_or_else(|| "qwen35 grouped-MoE decode requires qwen35 config".to_string())?;
+    if config.num_experts == 0 || !config.has_shared_expert {
+        return Err("qwen35 grouped-MoE decode requires a grouped-MoE Qwen35 config".to_string());
+    }
+    if m.q35_scratch.is_none() {
+        return Err("qwen35 grouped-MoE decode requires single-GPU qwen35 scratch".to_string());
+    }
+    Ok(())
+}
+
+fn validate_qwen35_decode_resident_sessions(
+    m: &LoadedModel,
     envelope: &GenerateBatchDecodeEnvelope,
+    backend_label: &str,
 ) -> Result<(), String> {
     for session in &envelope.sessions {
-        if session.max_tokens_remaining > 1 {
+        let state = m.q35_sessions.get(&session.session_id).ok_or_else(|| {
+            format!(
+                "decode session {} is not resident for {backend_label} decode",
+                session.session_id
+            )
+        })?;
+        let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+        if logical_position != session.logical_position {
             return Err(format!(
-                "qwen35 fused dense decode currently supports final one-token steps only; session {} has max_tokens_remaining={}; use HIPFIRE_QWEN35_DECODE_BATCH=serial",
-                session.session_id, session.max_tokens_remaining,
+                "decode session {} logical_position mismatch: expected={} resident={}",
+                session.session_id, session.logical_position, logical_position
             ));
         }
     }
@@ -1909,12 +1956,28 @@ mod generate_batch_prefill_tests {
                     role: "resident".to_string(),
                 },
             ],
+            memory: ModelWorkerMemoryView {
+                model_file_bytes: 256,
+                model_weight_bytes: 224,
+                runtime_base_bytes: 64,
+                runtime_session_bytes: 160,
+                runtime_state_bytes: 224,
+                total_resident_bytes: 448,
+                evictable_state_bytes: 160,
+            },
         };
 
         let json = model_worker_runtime_view_json(&worker);
         assert_eq!(json["state_arena_backend"], "qwen35_wrapped");
         assert_eq!(json["state_page_descriptor_entries"], 2);
         assert_eq!(json["state_page_descriptor_bytes"], 160);
+        assert_eq!(json["model_file_bytes"], 256);
+        assert_eq!(json["model_weight_bytes"], 224);
+        assert_eq!(json["runtime_base_bytes"], 64);
+        assert_eq!(json["runtime_session_bytes"], 160);
+        assert_eq!(json["runtime_state_bytes"], 224);
+        assert_eq!(json["total_resident_bytes"], 448);
+        assert_eq!(json["evictable_state_bytes"], 160);
         assert_eq!(
             json["state_page_descriptors"][0]["state_kind"],
             "attention_kv"
@@ -2346,9 +2409,13 @@ mod generate_batch_prefill_tests {
         assert!(singleton_err.contains("requires at least two sessions"));
         let moe_err = select_qwen35_decode_batch_backend("fused", 6, 2).unwrap_err();
         assert!(moe_err.contains("not dense Qwen35"));
-        let grouped_err =
-            select_qwen35_decode_batch_backend("fused_grouped_moe", 6, 2).unwrap_err();
-        assert!(grouped_err.contains("grouped-MoE fused decode batch is not implemented"));
+        assert_eq!(
+            select_qwen35_decode_batch_backend("fused_grouped_moe", 6, 2).unwrap(),
+            Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked
+        );
+        let grouped_dense_err =
+            select_qwen35_decode_batch_backend("fused_grouped_moe", 5, 2).unwrap_err();
+        assert!(grouped_dense_err.contains("not Qwen35 grouped-MoE"));
     }
 
     #[test]
@@ -2388,30 +2455,19 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
-    fn fused_dense_decode_rejects_non_final_decode_steps() {
-        let msg = serde_json::json!({
-            "type": "generate_batch_decode_step",
-            "id": "decode-1",
-            "batch_id": "decode-batch-1",
-            "worker_key_id": "worker-a",
-            "sessions": [
-                {
-                    "id": "req-1",
-                    "session_id": "sess-1",
-                    "logical_position": 8,
-                    "max_tokens_remaining": 1
-                },
-                {
-                    "id": "req-2",
-                    "session_id": "sess-2",
-                    "logical_position": 8,
-                    "max_tokens_remaining": 2
-                }
-            ]
-        });
-        let envelope = validate_generate_batch_decode(&msg).expect("valid decode envelope");
-        let err = validate_qwen35_fused_dense_decode_step_bounds(&envelope).unwrap_err();
-        assert!(err.contains("final one-token steps only"));
+    fn fused_dense_decode_batch_max_can_force_smaller_chunks() {
+        unsafe {
+            std::env::set_var("HIPFIRE_QWEN35_DECODE_BATCH_MAX", "1");
+        }
+        assert_eq!(qwen35_decode_batch_max_chunk_size(4), 1);
+        unsafe {
+            std::env::set_var("HIPFIRE_QWEN35_DECODE_BATCH_MAX", "3");
+        }
+        assert_eq!(qwen35_decode_batch_max_chunk_size(8), 3);
+        unsafe {
+            std::env::remove_var("HIPFIRE_QWEN35_DECODE_BATCH_MAX");
+        }
+        assert_eq!(qwen35_decode_batch_max_chunk_size(4), 4);
     }
 
     #[test]
@@ -2853,6 +2909,7 @@ struct LoadedModel {
     // HfqFile mmap to construct a transient ModelSlot without reloading
     // weights. `HfqFile::open` is a cheap mmap operation.
     model_path: String,
+    memory: LoadedModelMemory,
     // DFlash speculative decoding state (populated when load supplied a draft).
     dflash: Option<DflashState>,
     // Upstream HF Jinja chat_template, extracted from the HFQ
@@ -2867,6 +2924,13 @@ struct LoadedModel {
 }
 
 const QWEN35_LEGACY_SESSION_ID: &str = "__legacy_generate__";
+const DEFAULT_MODEL_WORKER_ID: &str = "__default__";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LoadedModelMemory {
+    model_file_bytes: usize,
+    model_weight_bytes: usize,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ModelWorkerId {
@@ -2896,6 +2960,7 @@ struct ModelWorkerRuntimeView {
     state_arena_backend: SequenceStateArenaBackend,
     resident_sessions: usize,
     state_page_descriptors: Vec<SequenceStatePageDescriptor>,
+    memory: ModelWorkerMemoryView,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2907,6 +2972,17 @@ struct SequenceStatePageDescriptor {
     resident_bytes: usize,
     placement: String,
     role: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ModelWorkerMemoryView {
+    model_file_bytes: usize,
+    model_weight_bytes: usize,
+    runtime_base_bytes: usize,
+    runtime_session_bytes: usize,
+    runtime_state_bytes: usize,
+    total_resident_bytes: usize,
+    evictable_state_bytes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -3304,6 +3380,225 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
     descriptors
 }
 
+fn hfq_model_memory(path: &str, hfq: &hipfire_runtime::hfq::HfqFile) -> LoadedModelMemory {
+    LoadedModelMemory {
+        model_file_bytes: std::fs::metadata(path)
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or(0),
+        model_weight_bytes: hfq
+            .tensors()
+            .iter()
+            .map(|tensor| tensor.data_size)
+            .sum::<usize>(),
+    }
+}
+
+fn unknown_model_memory(path: &str) -> LoadedModelMemory {
+    LoadedModelMemory {
+        model_file_bytes: std::fs::metadata(path)
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or(0),
+        model_weight_bytes: 0,
+    }
+}
+
+fn tensor_bytes(tensor: &rdna_compute::GpuTensor) -> usize {
+    tensor.buf.size()
+}
+
+fn opt_tensor_bytes(tensor: Option<&rdna_compute::GpuTensor>) -> usize {
+    tensor.map(tensor_bytes).unwrap_or(0)
+}
+
+fn tensor_vec_bytes(tensors: &[rdna_compute::GpuTensor]) -> usize {
+    tensors.iter().map(tensor_bytes).sum::<usize>()
+}
+
+fn kv_cache_bytes(kv: &llama::KvCache) -> usize {
+    tensor_vec_bytes(&kv.k_gpu)
+        + tensor_vec_bytes(&kv.v_gpu)
+        + tensor_vec_bytes(&kv.k_scales)
+        + tensor_vec_bytes(&kv.v_scales)
+        + opt_tensor_bytes(kv.givens_cos.as_ref())
+        + opt_tensor_bytes(kv.givens_sin.as_ref())
+}
+
+fn deltanet_state_bytes(dn: &DeltaNetState) -> usize {
+    tensor_vec_bytes(&dn.s_matrices)
+        + tensor_vec_bytes(&dn.s_scales)
+        + tensor_vec_bytes(&dn.conv_states)
+}
+
+fn qwen35_scratch_bytes(scratch: &qwen35::Qwen35Scratch) -> usize {
+    let mut total = scratch.pos_buf.size();
+    total += tensor_bytes(&scratch.x)
+        + tensor_bytes(&scratch.tmp)
+        + tensor_bytes(&scratch.dn_qkv)
+        + tensor_bytes(&scratch.dn_z)
+        + tensor_bytes(&scratch.dn_alpha)
+        + tensor_bytes(&scratch.dn_beta)
+        + tensor_bytes(&scratch.dn_conv_out)
+        + tensor_bytes(&scratch.dn_q)
+        + tensor_bytes(&scratch.dn_k)
+        + tensor_bytes(&scratch.dn_v)
+        + tensor_bytes(&scratch.dn_q_raw)
+        + tensor_bytes(&scratch.dn_k_raw)
+        + tensor_bytes(&scratch.dn_attn_out)
+        + tensor_bytes(&scratch.dn_normed)
+        + tensor_bytes(&scratch.fa_q_full)
+        + tensor_bytes(&scratch.fa_q)
+        + tensor_bytes(&scratch.fa_gate)
+        + tensor_bytes(&scratch.fa_k)
+        + tensor_bytes(&scratch.fa_v)
+        + tensor_bytes(&scratch.fa_attn_out)
+        + tensor_bytes(&scratch.o)
+        + tensor_bytes(&scratch.gate_ffn)
+        + tensor_bytes(&scratch.up)
+        + tensor_bytes(&scratch.ffn_hidden)
+        + tensor_bytes(&scratch.ffn_out)
+        + tensor_bytes(&scratch.logits)
+        + tensor_bytes(&scratch.sample_buf)
+        + tensor_bytes(&scratch.repeat_buf)
+        + tensor_bytes(&scratch.x_rot)
+        + tensor_bytes(&scratch.flash_partials);
+    total += opt_tensor_bytes(scratch.moe_router_logits.as_ref())
+        + opt_tensor_bytes(scratch.moe_scalar_buf.as_ref())
+        + opt_tensor_bytes(scratch.moe_x_rot.as_ref())
+        + opt_tensor_bytes(scratch.moe_gate_up_buf.as_ref())
+        + opt_tensor_bytes(scratch.moe_gate_buf.as_ref())
+        + opt_tensor_bytes(scratch.moe_up_buf.as_ref())
+        + opt_tensor_bytes(scratch.moe_ffn_hidden.as_ref())
+        + opt_tensor_bytes(scratch.moe_ffn_out.as_ref())
+        + opt_tensor_bytes(scratch.moe_gate_batch.as_ref())
+        + opt_tensor_bytes(scratch.moe_up_batch.as_ref())
+        + opt_tensor_bytes(scratch.moe_rot_batch.as_ref())
+        + opt_tensor_bytes(scratch.moe_topk_indices.as_ref())
+        + opt_tensor_bytes(scratch.moe_topk_weights.as_ref())
+        + opt_tensor_bytes(scratch.moe_down_expanded.as_ref());
+    // PrefillBatchScratch is an optional optimization scratch with private
+    // fields. Report it as unknown in V1 instead of inventing an estimate.
+    total
+}
+
+fn qwen2_state_bytes(state: &qwen2::Qwen2State) -> usize {
+    state.pos_buf.size()
+        + tensor_bytes(&state.x)
+        + tensor_bytes(&state.tmp)
+        + tensor_bytes(&state.q)
+        + tensor_bytes(&state.k)
+        + tensor_bytes(&state.v)
+        + tensor_bytes(&state.attn_out)
+        + tensor_bytes(&state.o)
+        + tensor_bytes(&state.gate)
+        + tensor_bytes(&state.up)
+        + tensor_bytes(&state.ffn_hidden)
+        + tensor_bytes(&state.ffn_out)
+        + tensor_bytes(&state.logits)
+        + tensor_bytes(&state.attn_partials)
+        + tensor_vec_bytes(&state.k_cache)
+        + tensor_vec_bytes(&state.v_cache)
+}
+
+fn llama_scratch_bytes(scratch: &llama::ForwardScratch) -> usize {
+    scratch.pos_buf.size()
+        + tensor_bytes(&scratch.x)
+        + tensor_bytes(&scratch.tmp)
+        + tensor_bytes(&scratch.q)
+        + tensor_bytes(&scratch.k)
+        + tensor_bytes(&scratch.v)
+        + tensor_bytes(&scratch.attn_out)
+        + tensor_bytes(&scratch.o)
+        + tensor_bytes(&scratch.gate)
+        + tensor_bytes(&scratch.up)
+        + tensor_bytes(&scratch.ffn_hidden)
+        + tensor_bytes(&scratch.ffn_out)
+        + tensor_bytes(&scratch.logits)
+        + tensor_bytes(&scratch.sample_buf)
+        + tensor_bytes(&scratch.repeat_buf)
+        + tensor_bytes(&scratch.attn_partials)
+        + tensor_bytes(&scratch.x_rot)
+}
+
+fn minimax_state_bytes(state: &hipfire_arch_minimax::MiniMaxState) -> usize {
+    state.pos_buf.size()
+        + kv_cache_bytes(&state.kv)
+        + tensor_bytes(&state.tmp)
+        + tensor_bytes(&state.x_rot)
+        + tensor_bytes(&state.fa_q)
+        + tensor_bytes(&state.fa_k)
+        + tensor_bytes(&state.fa_v)
+        + tensor_bytes(&state.fa_attn_out)
+        + tensor_bytes(&state.flash_partials)
+        + tensor_bytes(&state.h)
+        + tensor_bytes(&state.ffn_tmp)
+        + tensor_bytes(&state.ffn_x_rot)
+        + tensor_bytes(&state.router_logits)
+        + tensor_bytes(&state.topk_indices)
+        + tensor_bytes(&state.topk_weights)
+        + tensor_bytes(&state.gate_batch)
+        + tensor_bytes(&state.up_batch)
+        + tensor_bytes(&state.rot_batch)
+        + tensor_bytes(&state.down_expanded)
+        + tensor_bytes(&state.final_norm_buf)
+        + tensor_bytes(&state.final_rot)
+        + tensor_bytes(&state.logits)
+}
+
+fn loaded_model_runtime_base_bytes(m: &LoadedModel) -> usize {
+    let mut total = 0usize;
+    total += m.kv_cache.as_ref().map(kv_cache_bytes).unwrap_or(0);
+    total += m.dn_state.as_ref().map(deltanet_state_bytes).unwrap_or(0);
+    total += m
+        .q35_scratch
+        .as_ref()
+        .map(qwen35_scratch_bytes)
+        .unwrap_or(0);
+    total += m
+        .pp_scratch_set
+        .as_ref()
+        .map(|set| {
+            set.per_device
+                .iter()
+                .map(qwen35_scratch_bytes)
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    total += m.qwen2_state.as_ref().map(qwen2_state_bytes).unwrap_or(0);
+    total += m.llama_kv.as_ref().map(kv_cache_bytes).unwrap_or(0);
+    total += m
+        .llama_scratch
+        .as_ref()
+        .map(llama_scratch_bytes)
+        .unwrap_or(0);
+    total += m
+        .minimax_state
+        .as_ref()
+        .map(minimax_state_bytes)
+        .unwrap_or(0);
+    total
+}
+
+fn loaded_model_memory_view(
+    m: &LoadedModel,
+    state_page_descriptors: &[SequenceStatePageDescriptor],
+) -> ModelWorkerMemoryView {
+    let runtime_base_bytes = loaded_model_runtime_base_bytes(m);
+    let runtime_session_bytes = state_page_descriptors
+        .iter()
+        .map(|descriptor| descriptor.resident_bytes)
+        .sum::<usize>();
+    let runtime_state_bytes = runtime_base_bytes + runtime_session_bytes;
+    ModelWorkerMemoryView {
+        model_file_bytes: m.memory.model_file_bytes,
+        model_weight_bytes: m.memory.model_weight_bytes,
+        runtime_base_bytes,
+        runtime_session_bytes,
+        runtime_state_bytes,
+        total_resident_bytes: m.memory.model_weight_bytes + runtime_state_bytes,
+        evictable_state_bytes: runtime_session_bytes,
+    }
+}
+
 fn loaded_model_worker_id(m: &LoadedModel) -> ModelWorkerId {
     ModelWorkerId {
         value: format!(
@@ -3327,6 +3622,7 @@ fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
     let state_arena_backend = loaded_model_state_arena_backend(m);
     let resident_sessions = state_arena_backend.resident_session_count(m);
     let state_page_descriptors = state_arena_backend.state_page_descriptors(m);
+    let memory = loaded_model_memory_view(m, &state_page_descriptors);
     ModelWorkerRuntimeView {
         worker_id: loaded_model_worker_id(m),
         max_resident_workers: 1,
@@ -3334,6 +3630,7 @@ fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
         state_arena_backend,
         resident_sessions,
         state_page_descriptors,
+        memory,
     }
 }
 
@@ -3367,6 +3664,100 @@ fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_json
         "state_page_descriptor_entries": worker.state_page_descriptors.len(),
         "state_page_descriptor_bytes": descriptor_bytes,
         "state_page_descriptors": descriptors,
+        "model_file_bytes": worker.memory.model_file_bytes,
+        "model_weight_bytes": worker.memory.model_weight_bytes,
+        "runtime_base_bytes": worker.memory.runtime_base_bytes,
+        "runtime_session_bytes": worker.memory.runtime_session_bytes,
+        "runtime_state_bytes": worker.memory.runtime_state_bytes,
+        "total_resident_bytes": worker.memory.total_resident_bytes,
+        "evictable_state_bytes": worker.memory.evictable_state_bytes,
+    })
+}
+
+fn message_worker_id(msg: &serde_json::Value) -> String {
+    msg.get("worker_id")
+        .or_else(|| msg.get("worker_key_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_MODEL_WORKER_ID)
+        .to_string()
+}
+
+fn park_active_model(
+    model: &mut Option<LoadedModel>,
+    active_worker_id: &str,
+    resident_models: &mut std::collections::HashMap<String, LoadedModel>,
+) {
+    if let Some(m) = model.take() {
+        resident_models.insert(active_worker_id.to_string(), m);
+    }
+}
+
+fn activate_model_worker(
+    worker_id: &str,
+    active_worker_id: &mut String,
+    model: &mut Option<LoadedModel>,
+    resident_models: &mut std::collections::HashMap<String, LoadedModel>,
+) -> bool {
+    if active_worker_id == worker_id {
+        return model.is_some();
+    }
+    if !resident_models.contains_key(worker_id) {
+        return false;
+    }
+    park_active_model(model, active_worker_id, resident_models);
+    if let Some(m) = resident_models.remove(worker_id) {
+        *active_worker_id = worker_id.to_string();
+        *model = Some(m);
+        true
+    } else {
+        false
+    }
+}
+
+fn resident_worker_status_json(
+    active_worker_id: &str,
+    model: Option<&LoadedModel>,
+    resident_models: &std::collections::HashMap<String, LoadedModel>,
+) -> serde_json::Value {
+    let mut workers = Vec::new();
+    let mut total_model_weight_bytes = 0usize;
+    let mut total_runtime_state_bytes = 0usize;
+    let mut total_resident_bytes = 0usize;
+    let mut total_evictable_state_bytes = 0usize;
+    if let Some(m) = model {
+        let worker = loaded_model_worker_runtime_view(m);
+        total_model_weight_bytes += worker.memory.model_weight_bytes;
+        total_runtime_state_bytes += worker.memory.runtime_state_bytes;
+        total_resident_bytes += worker.memory.total_resident_bytes;
+        total_evictable_state_bytes += worker.memory.evictable_state_bytes;
+        let mut value = model_worker_runtime_view_json(&worker);
+        value["worker_key_id"] = serde_json::json!(active_worker_id);
+        value["active"] = serde_json::json!(true);
+        value["model_path"] = serde_json::json!(m.model_path);
+        workers.push(value);
+    }
+    for (worker_id, m) in resident_models {
+        let worker = loaded_model_worker_runtime_view(m);
+        total_model_weight_bytes += worker.memory.model_weight_bytes;
+        total_runtime_state_bytes += worker.memory.runtime_state_bytes;
+        total_resident_bytes += worker.memory.total_resident_bytes;
+        total_evictable_state_bytes += worker.memory.evictable_state_bytes;
+        let mut value = model_worker_runtime_view_json(&worker);
+        value["worker_key_id"] = serde_json::json!(worker_id);
+        value["active"] = serde_json::json!(false);
+        value["model_path"] = serde_json::json!(m.model_path);
+        workers.push(value);
+    }
+    serde_json::json!({
+        "type": "worker_status",
+        "resident_workers": workers.len(),
+        "active_worker_key_id": active_worker_id,
+        "total_model_weight_bytes": total_model_weight_bytes,
+        "total_runtime_state_bytes": total_runtime_state_bytes,
+        "total_resident_bytes": total_resident_bytes,
+        "total_evictable_state_bytes": total_evictable_state_bytes,
+        "workers": workers,
     })
 }
 
@@ -5162,8 +5553,9 @@ fn run_generate_batch_decode_step_qwen35(
         envelope.session_count,
     )?;
     if backend == Qwen35DecodeBatchBackend::FusedDenseLayerChunked {
-        validate_qwen35_fused_dense_decode_step_bounds(envelope)?;
         validate_qwen35_fused_dense_decode_model_capability(m, envelope.session_count)?;
+    } else if backend == Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked {
+        validate_qwen35_grouped_moe_decode_model_capability(m, envelope.session_count)?;
     }
     let im_end = {
         let tokenizer = m
@@ -5178,15 +5570,32 @@ fn run_generate_batch_decode_step_qwen35(
         None
     };
     let t0 = Instant::now();
-    let session_lines = match backend {
-        Qwen35DecodeBatchBackend::SerialReference => {
-            qwen35_decode_step_serial_reference(m, gpu, stdout, envelope, im_end_token)?
-        }
+    let step_result = match backend {
+        Qwen35DecodeBatchBackend::SerialReference => Qwen35DecodeBatchStepResult {
+            session_lines: qwen35_decode_step_serial_reference(
+                m,
+                gpu,
+                stdout,
+                envelope,
+                im_end_token,
+            )?,
+            chunk_count: 1,
+            chunk_size: envelope.session_count,
+        },
         Qwen35DecodeBatchBackend::FusedDenseLayerChunked => {
-            qwen35_decode_step_fused_dense_layer_chunked(m, gpu, envelope, im_end_token)?
+            qwen35_decode_step_fused_dense_layer_chunked(m, gpu, stdout, envelope, im_end_token)?
+        }
+        Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked => {
+            qwen35_decode_step_fused_grouped_moe_layer_chunked(
+                m,
+                gpu,
+                stdout,
+                envelope,
+                im_end_token,
+            )?
         }
     };
-    for line in session_lines {
+    for line in step_result.session_lines {
         let _ = writeln!(stdout, "{line}");
     }
     let worker = loaded_model_worker_runtime_view(m);
@@ -5196,6 +5605,8 @@ fn run_generate_batch_decode_step_qwen35(
         "batch_id": envelope.batch_id,
         "sessions": envelope.session_count,
         "backend": backend.as_str(),
+        "chunk_count": step_result.chunk_count,
+        "chunk_size": step_result.chunk_size,
         "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0,
         "resident_sessions": loaded_model_state_arena_backend(m).resident_session_count(m),
         "model_worker": model_worker_runtime_view_json(&worker),
@@ -5209,6 +5620,21 @@ struct Qwen35DecodeTokenOutcome {
     token: u32,
     text: String,
     stop: bool,
+}
+
+struct Qwen35DecodeBatchStepResult {
+    session_lines: Vec<serde_json::Value>,
+    chunk_count: usize,
+    chunk_size: usize,
+}
+
+fn qwen35_decode_batch_max_chunk_size(session_count: usize) -> usize {
+    std::env::var("HIPFIRE_QWEN35_DECODE_BATCH_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(session_count)
+        .max(1)
 }
 
 fn qwen35_decode_token_outcome(
@@ -5317,148 +5743,59 @@ fn qwen35_decode_step_serial_reference(
 fn qwen35_decode_step_fused_dense_layer_chunked(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
-) -> Result<Vec<serde_json::Value>, String> {
-    validate_qwen35_fused_dense_decode_step_bounds(envelope)?;
+) -> Result<Qwen35DecodeBatchStepResult, String> {
     qwen35_save_active_session(m, gpu)?;
     validate_qwen35_fused_dense_decode_resident_sessions(m, envelope)?;
 
-    struct OwnedDecodeSession {
-        request_id: String,
-        runtime_state_handle: String,
-        state: Qwen35RequestSessionState,
-        outcome: Qwen35DecodeTokenOutcome,
+    let chunk_size = qwen35_decode_batch_max_chunk_size(envelope.session_count);
+    qwen35_decode_step_chunked_serial_oracle(m, gpu, stdout, envelope, im_end_token, chunk_size)
+}
+
+fn qwen35_decode_step_fused_grouped_moe_layer_chunked(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    envelope: &GenerateBatchDecodeEnvelope,
+    im_end_token: Option<u32>,
+) -> Result<Qwen35DecodeBatchStepResult, String> {
+    qwen35_save_active_session(m, gpu)?;
+    validate_qwen35_decode_resident_sessions(m, envelope, "grouped-MoE chunked")?;
+
+    let chunk_size = qwen35_decode_batch_max_chunk_size(envelope.session_count);
+    qwen35_decode_step_chunked_serial_oracle(m, gpu, stdout, envelope, im_end_token, chunk_size)
+}
+
+fn qwen35_decode_step_chunked_serial_oracle(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    envelope: &GenerateBatchDecodeEnvelope,
+    im_end_token: Option<u32>,
+    chunk_size: usize,
+) -> Result<Qwen35DecodeBatchStepResult, String> {
+    let mut session_lines = Vec::with_capacity(envelope.sessions.len());
+    let mut chunk_count = 0usize;
+    for chunk in envelope.sessions.chunks(chunk_size) {
+        chunk_count += 1;
+        let chunk_envelope = GenerateBatchDecodeEnvelope {
+            id: envelope.id.clone(),
+            batch_id: envelope.batch_id.clone(),
+            session_count: chunk.len(),
+            sessions: chunk.to_vec(),
+        };
+        let mut chunk_lines =
+            qwen35_decode_step_serial_reference(m, gpu, stdout, &chunk_envelope, im_end_token)?;
+        session_lines.append(&mut chunk_lines);
     }
 
-    let mut outcomes = Vec::with_capacity(envelope.sessions.len());
-    for session in &envelope.sessions {
-        let state = m.q35_sessions.get(&session.session_id).ok_or_else(|| {
-            format!(
-                "decode session {} is not resident for fused dense decode",
-                session.session_id
-            )
-        })?;
-        let logical_position = state.seq_pos + state.kv_cache.compact_offset;
-        if logical_position != session.logical_position {
-            return Err(format!(
-                "decode session {} logical_position mismatch: expected={} resident={}",
-                session.session_id, session.logical_position, logical_position
-            ));
-        }
-        outcomes.push(qwen35_decode_token_outcome(
-            m,
-            gpu,
-            &state.logits,
-            session.max_tokens_remaining,
-            im_end_token,
-        )?);
-    }
-
-    let mut owned = Vec::with_capacity(envelope.sessions.len());
-    for (session, outcome) in envelope.sessions.iter().zip(outcomes.into_iter()) {
-        let state = m.q35_sessions.remove(&session.session_id).ok_or_else(|| {
-            format!(
-                "decode session {} disappeared before fused dense decode",
-                session.session_id
-            )
-        })?;
-        owned.push(OwnedDecodeSession {
-            request_id: session.id.clone(),
-            runtime_state_handle: session.session_id.clone(),
-            state,
-            outcome,
-        });
-    }
-
-    let token_rows: Vec<[u32; 1]> = owned
-        .iter()
-        .map(|session| [session.outcome.token])
-        .collect();
-
-    let worker_result = {
-        let config = m
-            .q35_config
-            .as_ref()
-            .ok_or_else(|| "qwen35 config missing".to_string())?;
-        let weights = m
-            .q35_weights
-            .as_ref()
-            .ok_or_else(|| "qwen35 weights missing".to_string())?;
-        let scratch = m
-            .q35_scratch
-            .as_mut()
-            .ok_or_else(|| "qwen35 scratch missing".to_string())?;
-        let requested_max_batch = std::env::var("HIPFIRE_QWEN35_DECODE_BATCH_MAX")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(owned.len());
-        // Current fused decode uses the dense session-prefill worker with one
-        // token per selected session. The env var is only a scratch sizing
-        // hint until the worker can split one decode batch into smaller
-        // per-layer chunks.
-        let required_max_batch = requested_max_batch.max(owned.len());
-        let needs_new_pbs = scratch
-            .prefill_batch
-            .as_ref()
-            .map(|pbs| pbs.max_batch < required_max_batch)
-            .unwrap_or(true);
-        if needs_new_pbs {
-            scratch.prefill_batch = Some(
-                qwen35::PrefillBatchScratch::new(gpu, config, required_max_batch)
-                    .map_err(|e| format!("allocate qwen35 decode batch scratch: {e:?}"))?,
-            );
-        }
-        let pbs = scratch.prefill_batch.as_ref().unwrap();
-        let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> = owned
-            .iter_mut()
-            .zip(token_rows.iter())
-            .map(|(session, token_row)| qwen35::DensePrefillSessionBatchRow {
-                tokens: &token_row[..],
-                start_pos: session.state.seq_pos,
-                kv_cache: &mut session.state.kv_cache,
-                dn_state: &mut session.state.dn_state,
-                logits: &session.state.logits,
-            })
-            .collect();
-        qwen35::forward_prefill_dense_session_batch(gpu, weights, config, &mut rows, scratch, pbs)
-    };
-
-    if let Err(err) = worker_result {
-        for session in owned {
-            m.q35_sessions
-                .insert(session.runtime_state_handle, session.state);
-        }
-        return Err(format!(
-            "qwen35 fused dense layer-chunked decode backend failed: {err:?}; \
-             use HIPFIRE_QWEN35_DECODE_BATCH=serial"
-        ));
-    }
-
-    let mut session_lines = Vec::with_capacity(owned.len());
-    for mut session in owned {
-        session
-            .state
-            .conversation_tokens
-            .push(session.outcome.token);
-        session.state.seq_pos += 1;
-        let new_logical_position = session.state.seq_pos + session.state.kv_cache.compact_offset;
-        session_lines.push(serde_json::json!({
-            "type": "generate_batch_decode_step_session_done",
-            "id": envelope.id,
-            "batch_id": envelope.batch_id,
-            "session_id": session.request_id,
-            "runtime_state_handle": session.runtime_state_handle,
-            "token": session.outcome.token,
-            "text": session.outcome.text,
-            "stop": session.outcome.stop,
-            "logical_position": new_logical_position,
-        }));
-        m.q35_sessions
-            .insert(session.runtime_state_handle, session.state);
-    }
-    Ok(session_lines)
+    Ok(Qwen35DecodeBatchStepResult {
+        session_lines,
+        chunk_count,
+        chunk_size,
+    })
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -5575,6 +5912,9 @@ fn main() {
         }
     };
     let mut model: Option<LoadedModel> = None;
+    let mut active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
+    let mut resident_models: std::collections::HashMap<String, LoadedModel> =
+        std::collections::HashMap::new();
     // PFlash speculative-prefill state. None unless the load message
     // includes a `prefill_drafter` path AND `prefill_compression` != "off".
     // Lives alongside `model` so unload_model + this state are paired
@@ -5621,6 +5961,7 @@ fn main() {
 
         match msg_type {
             "load" => {
+                let requested_worker_id = message_worker_id(&msg);
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
                 // it -- otherwise free_tensor would queue them into the
@@ -5628,17 +5969,25 @@ fn main() {
                 // drain, leaving drafter VRAM resident across the next
                 // load (the explicit "unload" handler has the same
                 // ordering for the same reason).
-                if let Some(mut pf) = pflash_state.take() {
-                    if let Some(mut dg) = pflash_drafter_gpu.take() {
-                        dg.bind_thread_or_warn();
-                        pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
-                        gpu.bind_thread_or_warn();
-                    } else {
-                        pf.unload_drafter(&mut gpu);
+                if requested_worker_id == active_worker_id {
+                    if let Some(mut pf) = pflash_state.take() {
+                        if let Some(mut dg) = pflash_drafter_gpu.take() {
+                            dg.bind_thread_or_warn();
+                            pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
+                            gpu.bind_thread_or_warn();
+                        } else {
+                            pf.unload_drafter(&mut gpu);
+                        }
                     }
+                    pflash_cfg = None;
+                    if let Some(m) = model.take() {
+                        unload_model(m, &mut gpu);
+                    }
+                } else {
+                    park_active_model(&mut model, &active_worker_id, &mut resident_models);
+                    active_worker_id = requested_worker_id.clone();
                 }
-                pflash_cfg = None;
-                if let Some(m) = model.take() {
+                if let Some(m) = resident_models.remove(&requested_worker_id) {
                     unload_model(m, &mut gpu);
                 }
                 dummy_model = None;
@@ -5658,6 +6007,7 @@ fn main() {
                     );
                     let line = serde_json::json!({
                         "type": "loaded",
+                        "worker_key_id": requested_worker_id,
                         "arch": "qwen35_dummy",
                         "dim": 16,
                         "layers": 1,
@@ -6056,10 +6406,21 @@ fn main() {
                             }
                         }
 
+                        let model_worker =
+                            model_worker_runtime_view_json(&loaded_model_worker_runtime_view(&m));
                         let _ = writeln!(
                             stdout,
-                            r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{}}}"#,
-                            arch, dim, layers, vocab, vl
+                            "{}",
+                            serde_json::json!({
+                                "type": "loaded",
+                                "worker_key_id": requested_worker_id,
+                                "arch": arch,
+                                "dim": dim,
+                                "layers": layers,
+                                "vocab": vocab,
+                                "vl": vl,
+                                "model_worker": model_worker,
+                            })
                         );
 
                         // ── PFlash drafter load (Phase 4.0) ──────────────
@@ -6190,6 +6551,22 @@ fn main() {
 
             "generate" => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+                let target_worker_id = message_worker_id(&msg);
+                if dummy_model.is_none()
+                    && !activate_model_worker(
+                        &target_worker_id,
+                        &mut active_worker_id,
+                        &mut model,
+                        &mut resident_models,
+                    )
+                {
+                    emit_error_with_id(
+                        &mut stdout,
+                        id,
+                        format!("unknown model worker {target_worker_id}"),
+                    );
+                    continue;
+                }
                 let session_id = msg
                     .get("session_id")
                     .and_then(|v| v.as_str())
@@ -6646,6 +7023,22 @@ fn main() {
 
             "generate_batch_prefill" => match validate_generate_batch_prefill(&msg) {
                 Ok(envelope) => {
+                    let target_worker_id = message_worker_id(&msg);
+                    if dummy_model.is_none()
+                        && !activate_model_worker(
+                            &target_worker_id,
+                            &mut active_worker_id,
+                            &mut model,
+                            &mut resident_models,
+                        )
+                    {
+                        emit_error_with_id(
+                            &mut stdout,
+                            &envelope.id,
+                            format!("unknown model worker {target_worker_id}"),
+                        );
+                        continue;
+                    }
                     if generate_batch_prefill_is_probe(&envelope) {
                         if dummy_model.is_some() {
                             emit_dummy_generate_batch_prefill_ready(&mut stdout, &envelope);
@@ -6715,6 +7108,20 @@ fn main() {
 
             "prefix_hash_preflight" => match validate_prefix_hash_preflight(&msg) {
                 Ok(envelope) => {
+                    let target_worker_id = message_worker_id(&msg);
+                    if !activate_model_worker(
+                        &target_worker_id,
+                        &mut active_worker_id,
+                        &mut model,
+                        &mut resident_models,
+                    ) {
+                        emit_error_with_id(
+                            &mut stdout,
+                            &envelope.id,
+                            format!("unknown model worker {target_worker_id}"),
+                        );
+                        continue;
+                    }
                     let m = match model.as_ref() {
                         Some(m) => m,
                         None => {
@@ -6734,6 +7141,20 @@ fn main() {
 
             "generate_batch_decode_step" => match validate_generate_batch_decode(&msg) {
                 Ok(envelope) => {
+                    let target_worker_id = message_worker_id(&msg);
+                    if !activate_model_worker(
+                        &target_worker_id,
+                        &mut active_worker_id,
+                        &mut model,
+                        &mut resident_models,
+                    ) {
+                        emit_error_with_id(
+                            &mut stdout,
+                            &envelope.id,
+                            format!("unknown model worker {target_worker_id}"),
+                        );
+                        continue;
+                    }
                     let m = match model.as_mut() {
                         Some(m) => m,
                         None => {
@@ -6755,6 +7176,22 @@ fn main() {
 
             "release_sessions" => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("release");
+                let target_worker_id = message_worker_id(&msg);
+                if dummy_model.is_none()
+                    && !activate_model_worker(
+                        &target_worker_id,
+                        &mut active_worker_id,
+                        &mut model,
+                        &mut resident_models,
+                    )
+                {
+                    emit_error_with_id(
+                        &mut stdout,
+                        id,
+                        format!("unknown model worker {target_worker_id}"),
+                    );
+                    continue;
+                }
                 let sessions: Vec<String> = match msg.get("sessions").and_then(|v| v.as_array()) {
                     Some(values) => values
                         .iter()
@@ -6808,7 +7245,33 @@ fn main() {
                 }
             }
 
+            "worker_status" | "list_workers" => {
+                let status = resident_worker_status_json(
+                    &active_worker_id,
+                    model.as_ref(),
+                    &resident_models,
+                );
+                let _ = writeln!(stdout, "{status}");
+                let _ = stdout.flush();
+            }
+
             "reset" => {
+                let target_worker_id = message_worker_id(&msg);
+                if dummy_model.is_none()
+                    && !activate_model_worker(
+                        &target_worker_id,
+                        &mut active_worker_id,
+                        &mut model,
+                        &mut resident_models,
+                    )
+                {
+                    emit_error_with_id(
+                        &mut stdout,
+                        "",
+                        format!("unknown model worker {target_worker_id}"),
+                    );
+                    continue;
+                }
                 // Reset conversation state without unloading the model.
                 if let Some(dummy) = dummy_model.as_mut() {
                     dummy.reset();
@@ -6947,8 +7410,49 @@ fn main() {
                 if let Some(m) = model.take() {
                     unload_model(m, &mut gpu);
                 }
+                for (_, m) in resident_models.drain() {
+                    unload_model(m, &mut gpu);
+                }
                 dummy_model = None;
+                active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
                 let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
+                let _ = stdout.flush();
+            }
+
+            "unload_worker" => {
+                let id = msg
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unload_worker");
+                let worker_id = message_worker_id(&msg);
+                let mut unloaded = false;
+                if worker_id == active_worker_id {
+                    if let Some(m) = model.take() {
+                        unload_model(m, &mut gpu);
+                        unloaded = true;
+                    }
+                    active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
+                    if let Some((next_worker_id, next_model)) = resident_models
+                        .iter()
+                        .next()
+                        .map(|(k, _)| k.clone())
+                        .and_then(|k| resident_models.remove(&k).map(|m| (k, m)))
+                    {
+                        active_worker_id = next_worker_id;
+                        model = Some(next_model);
+                    }
+                } else if let Some(m) = resident_models.remove(&worker_id) {
+                    unload_model(m, &mut gpu);
+                    unloaded = true;
+                }
+                let done = serde_json::json!({
+                    "type": "unload_worker_done",
+                    "id": id,
+                    "worker_key_id": worker_id,
+                    "unloaded": unloaded,
+                    "resident_workers": resident_models.len() + usize::from(model.is_some()),
+                });
+                let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
             }
 
@@ -7477,6 +7981,7 @@ fn load_model(
     }
 
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let model_memory = hfq_model_memory(path, &hfq);
     let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
     if is_bf16_artifact {
         if kv_mode != "fp32" {
@@ -7704,6 +8209,7 @@ fn load_model(
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
+            memory: model_memory,
             dflash: None,
             chat_template,
         });
@@ -7794,6 +8300,7 @@ fn load_model(
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
+            memory: model_memory,
             dflash: None,
             chat_template,
         });
@@ -7905,6 +8412,7 @@ fn load_model(
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
+            memory: model_memory,
             dflash: None,
             chat_template,
         });
@@ -8022,6 +8530,7 @@ fn load_model(
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
+            memory: model_memory,
             dflash: None,
             chat_template,
         });
@@ -8148,6 +8657,7 @@ fn load_model(
                 asst_turn_cache: std::collections::HashMap::new(),
                 decoded_vocab: None,
                 model_path: path.to_string(),
+                memory: model_memory,
                 dflash: None,
                 chat_template,
             });
@@ -8482,6 +8992,7 @@ fn load_model(
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
+            memory: model_memory,
             dflash,
             chat_template,
         })
@@ -8562,6 +9073,7 @@ fn load_model(
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
+            memory: model_memory,
             dflash: None,
             chat_template,
         })
@@ -8579,6 +9091,7 @@ fn load_model_safetensors(
     use hipfire_runtime::safetensors_source::SafetensorsSource;
 
     eprintln!("  opening safetensors directory: {path}");
+    let model_memory = unknown_model_memory(path);
     let source =
         SafetensorsSource::open(Path::new(path)).map_err(|e| format!("safetensors open: {e}"))?;
 
@@ -8728,6 +9241,7 @@ fn load_model_safetensors(
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
             model_path: path.to_string(),
+            memory: model_memory,
             dflash: None,
             chat_template,
         });
@@ -8840,6 +9354,7 @@ fn load_model_safetensors(
         asst_turn_cache: std::collections::HashMap::new(),
         decoded_vocab: None,
         model_path: path.to_string(),
+        memory: model_memory,
         dflash: None,
         chat_template,
     })
@@ -8865,6 +9380,7 @@ fn load_model_pp(
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let model_memory = hfq_model_memory(path, &hfq);
     let is_bf16_artifact = hfq_has_bf16_weights(&hfq);
     if is_bf16_artifact {
         if kv_mode != "fp32" {
@@ -9098,6 +9614,7 @@ fn load_model_pp(
         asst_turn_cache: std::collections::HashMap::new(),
         decoded_vocab: None,
         model_path: path.to_string(),
+        memory: model_memory,
         dflash: None,
         chat_template: resolve_chat_template(&hfq, path),
     })

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { pickServingModelWorker } from "./model_worker_routing";
+import { pickResidentModelWorker, pickServingModelWorker } from "./model_worker_routing";
 
 describe("model worker routing", () => {
   const base = {
@@ -49,5 +49,62 @@ describe("model worker routing", () => {
     expect(dev0.workerKey.deviceId).toBe(0);
     expect(dev1.workerKey.deviceId).toBe(1);
     expect(dev0.workerKey).not.toEqual(dev1.workerKey);
+  });
+
+  test("reuses exact resident worker with enough max_seq", () => {
+    const decision = pickResidentModelWorker({
+      requestModelPath: "/models/a.hfq",
+      requiredMaxSeq: 2048,
+      maxResidentWorkers: 2,
+      workers: [
+        { workerKeyId: "a", modelPath: "/models/a.hfq", maxSeq: 4096, lastUsedAtMs: 10 },
+        { workerKeyId: "b", modelPath: "/models/b.hfq", maxSeq: 4096, lastUsedAtMs: 20 },
+      ],
+    });
+    expect(decision.action).toBe("reuse");
+    expect(decision.routeReason).toBe("worker_reused");
+    expect(decision.workerKeyId).toBe("a");
+  });
+
+  test("loads second worker under resident cap", () => {
+    const decision = pickResidentModelWorker({
+      requestModelPath: "/models/b.hfq",
+      requiredMaxSeq: 2048,
+      maxResidentWorkers: 2,
+      workers: [
+        { workerKeyId: "a", modelPath: "/models/a.hfq", maxSeq: 4096, lastUsedAtMs: 10 },
+      ],
+    });
+    expect(decision.action).toBe("load");
+    expect(decision.routeReason).toBe("worker_loaded");
+  });
+
+  test("evicts largest idle worker over cap and uses LRU as tie-breaker", () => {
+    const decision = pickResidentModelWorker({
+      requestModelPath: "/models/c.hfq",
+      requiredMaxSeq: 2048,
+      maxResidentWorkers: 2,
+      workers: [
+        { workerKeyId: "a", modelPath: "/models/a.hfq", maxSeq: 4096, lastUsedAtMs: 10, totalResidentBytes: 100 },
+        { workerKeyId: "b", modelPath: "/models/b.hfq", maxSeq: 4096, lastUsedAtMs: 20, totalResidentBytes: 200 },
+      ],
+    });
+    expect(decision.action).toBe("evict_and_load");
+    expect(decision.routeReason).toBe("worker_evicted_lru");
+    expect(decision.evictWorkerKeyId).toBe("b");
+  });
+
+  test("rejects when all resident workers are active", () => {
+    const decision = pickResidentModelWorker({
+      requestModelPath: "/models/c.hfq",
+      requiredMaxSeq: 2048,
+      maxResidentWorkers: 2,
+      workers: [
+        { workerKeyId: "a", modelPath: "/models/a.hfq", maxSeq: 4096, lastUsedAtMs: 10, active: true },
+        { workerKeyId: "b", modelPath: "/models/b.hfq", maxSeq: 4096, lastUsedAtMs: 20, active: true },
+      ],
+    });
+    expect(decision.action).toBe("reject");
+    expect(decision.routeReason).toBe("worker_cap_exhausted");
   });
 });

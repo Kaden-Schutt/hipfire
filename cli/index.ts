@@ -670,6 +670,10 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     console.error(`[hipfire] kv_mode bumped for ${tag}: ${baseMode} → ${effectiveMode} (deep stack, asym3 layer-count compounding)`);
   }
   params.kv_mode = effectiveMode;
+  const stateQuantOverride = process.env.HIPFIRE_QWEN35_STATE_QUANT || process.env.HIPFIRE_STATE_QUANT;
+  if (stateQuantOverride) {
+    params.state_quant = stateQuantOverride;
+  }
   if (isBf16ArtifactPath(path)) {
     if (params.kv_mode !== "fp32") {
       console.error(`[hipfire] bf16 artifact detected — forcing kv_mode=fp32 for gold-path verification`);
@@ -1848,9 +1852,11 @@ async function serve(port: number, host: string) {
   const serverPrefillBatchControls = parseServerPrefillPolicyControls();
   let generateBatchPrefillCapability: GenerateBatchPrefillCapability = "unknown";
   let generateBatchPrefillCapabilityReason = "not_probed";
-  const probeGenerateBatchPrefillCapability = async () => {
+  const probeGenerateBatchPrefillCapability = async (workerKeyId: string | null = null) => {
     try {
-      await e.send(buildGenerateBatchPrefillProbeMessage());
+      const probeMsg: any = buildGenerateBatchPrefillProbeMessage();
+      if (workerKeyId) probeMsg.worker_key_id = workerKeyId;
+      await e.send(probeMsg);
       const probeResponse = await e.recv();
       return interpretGenerateBatchPrefillProbeResponse(probeResponse);
     } catch (err: any) {
@@ -1895,9 +1901,35 @@ async function serve(port: number, host: string) {
   // conversation rebuild both turn into off-distribution noise.
   let currentArch: string | null = null;
   let currentStateMode: string | null = null;
+  type ResidentModelWorker = {
+    workerKeyId: string;
+    workerKey: ModelWorkerKey;
+    modelPath: string;
+    maxSeq: number;
+    arch: string | null;
+    stateMode: string | null;
+    hasVL: boolean;
+    lastUsedAtMs: number;
+    descriptorEntries: number;
+    descriptorBytes: number;
+    modelFileBytes: number;
+    modelWeightBytes: number;
+    runtimeBaseBytes: number;
+    runtimeSessionBytes: number;
+    runtimeStateBytes: number;
+    totalResidentBytes: number;
+    evictableStateBytes: number;
+    routeReason: string;
+  };
+  const maxResidentWorkers = Math.max(1, Math.trunc(Number(process.env.HIPFIRE_MAX_RESIDENT_WORKERS || "1") || 1));
+  const residentModelWorkers = new Map<string, ResidentModelWorker>();
+  let activeWorkerKeyId: string | null = null;
   let runtimeWorkerStatePageDescriptorEntries = 0;
   let runtimeWorkerStatePageDescriptorBytes = 0;
-  const updateRuntimeWorkerStatePageDescriptors = (modelWorker: any) => {
+  const metricNumber = (value: unknown): number => (
+    typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0
+  );
+  const updateRuntimeWorkerMetrics = (modelWorker: any) => {
     if (!modelWorker || typeof modelWorker !== "object") return;
     if (Number.isFinite(modelWorker.state_page_descriptor_entries)) {
       runtimeWorkerStatePageDescriptorEntries = Math.max(0, Math.trunc(modelWorker.state_page_descriptor_entries));
@@ -1905,6 +1937,61 @@ async function serve(port: number, host: string) {
     if (Number.isFinite(modelWorker.state_page_descriptor_bytes)) {
       runtimeWorkerStatePageDescriptorBytes = Math.max(0, Math.trunc(modelWorker.state_page_descriptor_bytes));
     }
+    if (activeWorkerKeyId) {
+      const worker = residentModelWorkers.get(activeWorkerKeyId);
+      if (worker) {
+        worker.descriptorEntries = runtimeWorkerStatePageDescriptorEntries;
+        worker.descriptorBytes = runtimeWorkerStatePageDescriptorBytes;
+        worker.modelFileBytes = metricNumber(modelWorker.model_file_bytes);
+        worker.modelWeightBytes = metricNumber(modelWorker.model_weight_bytes);
+        worker.runtimeBaseBytes = metricNumber(modelWorker.runtime_base_bytes);
+        worker.runtimeSessionBytes = metricNumber(modelWorker.runtime_session_bytes);
+        worker.runtimeStateBytes = metricNumber(modelWorker.runtime_state_bytes);
+        worker.totalResidentBytes = metricNumber(modelWorker.total_resident_bytes);
+        worker.evictableStateBytes = metricNumber(modelWorker.evictable_state_bytes);
+      }
+    }
+  };
+  const makeResidentWorkerKey = (path: string, maxSeq: number, stateMode: string | null): ModelWorkerKey => pickServingModelWorker({
+    requestModelPath: path,
+    currentModelPath: path,
+    currentMaxSeq: maxSeq,
+    requiredMaxSeq: maxSeq,
+    archId: "unknown",
+    quantFamily: inferQuantFamilyForPath(path),
+    stateMode: stateMode || "unknown",
+    featureFlags: ["serve", "resident_worker"],
+    artifactDigest: inferModelArtifactDigest(path),
+    maxSeqBucket: maxSeq,
+    acceleratorKind: serverAcceleratorKind,
+    deviceId: serverDeviceId,
+  }).workerKey;
+  const findReusableResidentWorker = (path: string, requiredMaxSeq: number): ResidentModelWorker | undefined => {
+    let best: ResidentModelWorker | undefined;
+    for (const worker of residentModelWorkers.values()) {
+      if (worker.modelPath !== path) continue;
+      if (worker.maxSeq < requiredMaxSeq) continue;
+      if (!best || worker.maxSeq < best.maxSeq || worker.lastUsedAtMs > best.lastUsedAtMs) {
+        best = worker;
+      }
+    }
+    return best;
+  };
+  const activateResidentWorker = (worker: ResidentModelWorker, routeReason = "worker_reused") => {
+    current = worker.modelPath;
+    currentMaxSeq = worker.maxSeq;
+    currentArch = worker.arch;
+    currentStateMode = worker.stateMode;
+    modelHasVL = worker.hasVL;
+    runtimeWorkerStatePageDescriptorEntries = worker.descriptorEntries;
+    runtimeWorkerStatePageDescriptorBytes = worker.descriptorBytes;
+    activeWorkerKeyId = worker.workerKeyId;
+    worker.lastUsedAtMs = Date.now();
+    worker.routeReason = routeReason;
+  };
+  const rememberResidentWorker = (worker: ResidentModelWorker) => {
+    residentModelWorkers.set(worker.workerKeyId, worker);
+    activateResidentWorker(worker, worker.routeReason);
   };
   const workerPrefillSchedulers = new Map<string, PriorityPrefillScheduler>();
   const workerDecodeSchedulers = new Map<string, PriorityDecodeScheduler>();
@@ -2019,18 +2106,34 @@ async function serve(port: number, host: string) {
       console.error(`[hipfire] cleared resident prefix state (${reason}; entries=${entries})`);
     }
   };
-  const releaseRuntimeHandles = async (handles: Iterable<string>, reason: string): Promise<number> => {
+  const clearWorkerResidentPrefixState = (workerKeyId: string, reason: string) => {
+    const entries = workerStateCaches.get(workerKeyId)?.size ?? 0;
+    workerStateCaches.delete(workerKeyId);
+    workerPrefillSchedulers.delete(workerKeyId);
+    workerDecodeSchedulers.delete(workerKeyId);
+    for (const [id, pending] of pendingDecodeRequests.entries()) {
+      if (pending.active.workerKeyId === workerKeyId) {
+        pendingDecodeRequests.delete(id);
+      }
+    }
+    if (entries > 0) {
+      console.error(`[hipfire] cleared worker resident prefix state (${reason}; worker=${workerKeyId} entries=${entries})`);
+    }
+  };
+  const releaseRuntimeHandles = async (handles: Iterable<string>, reason: string, workerKeyId = activeWorkerKeyId): Promise<number> => {
     const unique = [...new Set([...handles].filter((handle) => handle.length > 0))];
     if (unique.length === 0) return 0;
     try {
-      await e.send({
+      const message: any = {
         type: "release_sessions",
         id: `release-${Date.now().toString(36)}`,
         sessions: unique,
-      });
+      };
+      if (workerKeyId) message.worker_key_id = workerKeyId;
+      await e.send(message);
       const releaseMsg = await e.recv();
       if (releaseMsg?.type === "release_sessions_done") {
-        updateRuntimeWorkerStatePageDescriptors((releaseMsg as any).model_worker);
+        updateRuntimeWorkerMetrics((releaseMsg as any).model_worker);
         for (const handle of unique) {
           residentDecodeSessions.delete(handle);
           residentCheckpointHandles.delete(handle);
@@ -2102,6 +2205,8 @@ async function serve(port: number, host: string) {
     activeSessions: 0,
     selectedBatchSize: 0,
     lastBackend: undefined as string | undefined,
+    lastChunkCount: 0,
+    lastChunkSize: 0,
     lastDecodeMs: 0,
     lastSkippedReason: "not_applicable",
   };
@@ -2559,6 +2664,8 @@ async function serve(port: number, host: string) {
       modelHasVL = false;
       currentStateMode = null;
       currentArch = null;
+      residentModelWorkers.clear();
+      activeWorkerKeyId = null;
       clearResidentPrefixState("idle unload");
     }
   }, Math.min(60_000, idleTimeoutMs)) : null;
@@ -2573,23 +2680,42 @@ async function serve(port: number, host: string) {
     try {
       console.error(`[hipfire] pre-warming ${defaultModel}...`);
       const warmLoadMsg = buildLoadMessage(warmPath, defaultModel);
+      const warmWorkerKey = makeResidentWorkerKey(warmPath, warmLoadMsg.params.max_seq, warmLoadMsg.params.kv_mode || null);
+      const warmWorkerKeyId = modelWorkerKeyId(warmWorkerKey);
+      warmLoadMsg.worker_key_id = warmWorkerKeyId;
       await e.send(warmLoadMsg);
       const loadResult = await e.recv();
       if (loadResult.type === "error") {
         console.error(`[hipfire] pre-warm load failed: ${loadResult.message} (will load on first request)`);
       } else {
-        for await (const msg of e.generate({ type: "generate", id: "warmup", prompt: "Hi", temperature: 0, max_tokens: 1 })) {
+        for await (const msg of e.generate({ type: "generate", id: "warmup", worker_key_id: warmWorkerKeyId, prompt: "Hi", temperature: 0, max_tokens: 1 })) {
           if (msg.type === "done") break;
         }
-        await e.send({ type: "reset" }); await e.recv();
+        await e.send({ type: "reset", worker_key_id: warmWorkerKeyId }); await e.recv();
         clearResidentPrefixState("pre-warm reset");
-        current = warmPath;
-        currentMaxSeq = warmLoadMsg.params.max_seq;
-        currentStateMode = warmLoadMsg.params.kv_mode || null;
-        modelHasVL = loadResult.vl === true;
-        currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+        rememberResidentWorker({
+          workerKeyId: warmWorkerKeyId,
+          workerKey: warmWorkerKey,
+          modelPath: warmPath,
+          maxSeq: warmLoadMsg.params.max_seq,
+          stateMode: warmLoadMsg.params.kv_mode || null,
+          hasVL: loadResult.vl === true,
+          arch: typeof loadResult.arch === "string" ? loadResult.arch : null,
+          descriptorEntries: 0,
+          descriptorBytes: 0,
+          modelFileBytes: 0,
+          modelWeightBytes: 0,
+          runtimeBaseBytes: 0,
+          runtimeSessionBytes: 0,
+          runtimeStateBytes: 0,
+          totalResidentBytes: 0,
+          evictableStateBytes: 0,
+          lastUsedAtMs: Date.now(),
+          routeReason: "worker_loaded",
+        });
+        updateRuntimeWorkerMetrics((loadResult as any).model_worker);
         if (serverPrefillBatch.enabled) {
-          const probe = await probeGenerateBatchPrefillCapability();
+          const probe = await probeGenerateBatchPrefillCapability(activeWorkerKeyId);
           generateBatchPrefillCapability = probe.capability;
           generateBatchPrefillCapabilityReason = probe.reason;
           console.error(
@@ -2706,6 +2832,8 @@ async function serve(port: number, host: string) {
                   serial_batches: decodeBatchMetrics.serialBatches,
                   fused_batches: decodeBatchMetrics.fusedBatches,
                   last_backend: decodeBatchMetrics.lastBackend,
+                  last_chunk_count: decodeBatchMetrics.lastChunkCount,
+                  last_chunk_size: decodeBatchMetrics.lastChunkSize,
                   last_decode_ms: decodeBatchMetrics.lastDecodeMs,
                   last_skipped_reason: decodeBatchMetrics.lastSkippedReason,
                 }
@@ -2734,9 +2862,9 @@ async function serve(port: number, host: string) {
                 }
               : { enabled: false },
             runtime_workers: {
-              resident_workers: current ? 1 : 0,
-              max_resident_workers: 1,
-              current_worker_key_id: null,
+              resident_workers: residentModelWorkers.size,
+              max_resident_workers: maxResidentWorkers,
+              current_worker_key_id: activeWorkerKeyId,
               state_arena_backend: isQwen35RuntimeArch(currentArch)
                 ? "qwen35_wrapped"
                 : current
@@ -2745,6 +2873,30 @@ async function serve(port: number, host: string) {
               generic_state_arena: false,
               state_page_descriptor_entries: runtimeWorkerStatePageDescriptorEntries,
               state_page_descriptor_bytes: runtimeWorkerStatePageDescriptorBytes,
+              total_model_weight_bytes: [...residentModelWorkers.values()].reduce((sum, worker) => sum + worker.modelWeightBytes, 0),
+              total_runtime_state_bytes: [...residentModelWorkers.values()].reduce((sum, worker) => sum + worker.runtimeStateBytes, 0),
+              total_resident_bytes: [...residentModelWorkers.values()].reduce((sum, worker) => sum + worker.totalResidentBytes, 0),
+              total_evictable_state_bytes: [...residentModelWorkers.values()].reduce((sum, worker) => sum + worker.evictableStateBytes, 0),
+              workers: [...residentModelWorkers.values()].map((worker) => ({
+                worker_key_id: worker.workerKeyId,
+                model_path: worker.modelPath,
+                arch: worker.arch,
+                max_seq: worker.maxSeq,
+                state_mode: worker.stateMode,
+                state_arena_backend: isQwen35RuntimeArch(worker.arch) ? "qwen35_wrapped" : "unsupported",
+                resident_sessions: 0,
+                state_page_descriptor_entries: worker.descriptorEntries,
+                state_page_descriptor_bytes: worker.descriptorBytes,
+                model_file_bytes: worker.modelFileBytes,
+                model_weight_bytes: worker.modelWeightBytes,
+                runtime_base_bytes: worker.runtimeBaseBytes,
+                runtime_session_bytes: worker.runtimeSessionBytes,
+                runtime_state_bytes: worker.runtimeStateBytes,
+                total_resident_bytes: worker.totalResidentBytes,
+                evictable_state_bytes: worker.evictableStateBytes,
+                last_used_at_ms: worker.lastUsedAtMs,
+                route_reason: worker.routeReason,
+              })),
             },
             batches: {
               ...buildBatchHealthPayload({
@@ -2977,6 +3129,8 @@ async function serve(port: number, host: string) {
         e.generating = false;
         current = null; // daemon may have restarted — force model reload
         currentMaxSeq = null;
+        residentModelWorkers.clear();
+        activeWorkerKeyId = null;
         clearResidentPrefixState("interrupted generation drain");
       }
 
@@ -3296,6 +3450,10 @@ async function serve(port: number, host: string) {
           reason: "disabled",
         };
 
+        const reusableWorker = findReusableResidentWorker(path, requiredMaxSeq);
+        if (reusableWorker) {
+          activateResidentWorker(reusableWorker, "worker_reused");
+        }
         const stateModeForRouting = currentStateMode || effective.kv_cache;
         const initialRoute = pickServingModelWorker({
           requestModelPath: path,
@@ -3309,18 +3467,51 @@ async function serve(port: number, host: string) {
           artifactDigest: inferModelArtifactDigest(path),
           maxSeqBucket: currentMaxSeq ?? requiredMaxSeq,
         });
-        const needReload = initialRoute.needsReload;
+        const needReload = !reusableWorker && initialRoute.needsReload;
 
         if (needReload) {
-          if (current) {
+          if (maxResidentWorkers <= 1 && current) {
             await e.send({ type: "unload" }); await e.recv();
             clearResidentPrefixState("model reload unload");
+            residentModelWorkers.clear();
+            activeWorkerKeyId = null;
+          } else if (residentModelWorkers.size >= maxResidentWorkers) {
+            const activeWorkerIds = new Set<string>();
+            for (const pending of pendingDecodeRequests.values()) {
+              activeWorkerIds.add(pending.active.workerKeyId);
+            }
+            const evictionCandidate = [...residentModelWorkers.values()]
+              .filter((worker) => !activeWorkerIds.has(worker.workerKeyId))
+              .sort((a, b) => b.totalResidentBytes - a.totalResidentBytes || a.lastUsedAtMs - b.lastUsedAtMs)[0];
+            if (!evictionCandidate) {
+              safeRelease();
+              return Response.json({ error: "all resident model workers are active; cannot evict for requested model" }, { status: 503 });
+            }
+            await e.send({
+              type: "unload_worker",
+              id: `unload-${Date.now().toString(36)}`,
+              worker_key_id: evictionCandidate.workerKeyId,
+            });
+            await e.recv();
+            clearWorkerResidentPrefixState(evictionCandidate.workerKeyId, "worker evicted lru");
+            residentModelWorkers.delete(evictionCandidate.workerKeyId);
+            if (activeWorkerKeyId === evictionCandidate.workerKeyId) {
+              current = null;
+              currentMaxSeq = null;
+              modelHasVL = false;
+              currentStateMode = null;
+              currentArch = null;
+              activeWorkerKeyId = null;
+            }
           }
           const loadMsg = buildLoadMessage(path, body.model);
           if (requiredMaxSeq > loadMsg.params.max_seq) {
             console.error(`[hipfire] request max_tokens=${requestMaxTokens} needs max_seq >= ${requiredMaxSeq} — bumping load (was ${loadMsg.params.max_seq})`);
             loadMsg.params.max_seq = requiredMaxSeq;
           }
+          const loadWorkerKey = makeResidentWorkerKey(path, loadMsg.params.max_seq, loadMsg.params.kv_mode || effective.kv_cache);
+          const loadWorkerKeyId = modelWorkerKeyId(loadWorkerKey);
+          loadMsg.worker_key_id = loadWorkerKeyId;
           await e.send(loadMsg);
           const loadResult = await e.recv();
           if (loadResult.type === "error") {
@@ -3331,13 +3522,29 @@ async function serve(port: number, host: string) {
             safeRelease();
             return Response.json({ error: `model load failed: ${loadResult.message}` }, { status: 500 });
           }
-          current = path;
-          currentMaxSeq = loadMsg.params.max_seq;
-          modelHasVL = loadResult.vl === true;
-          currentStateMode = loadMsg.params.kv_mode || currentStateMode;
-          currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+          rememberResidentWorker({
+            workerKeyId: loadWorkerKeyId,
+            workerKey: loadWorkerKey,
+            modelPath: path,
+            maxSeq: loadMsg.params.max_seq,
+            hasVL: loadResult.vl === true,
+            stateMode: loadMsg.params.kv_mode || effective.kv_cache,
+            arch: typeof loadResult.arch === "string" ? loadResult.arch : null,
+            descriptorEntries: 0,
+            descriptorBytes: 0,
+            modelFileBytes: 0,
+            modelWeightBytes: 0,
+            runtimeBaseBytes: 0,
+            runtimeSessionBytes: 0,
+            runtimeStateBytes: 0,
+            totalResidentBytes: 0,
+            evictableStateBytes: 0,
+            lastUsedAtMs: Date.now(),
+            routeReason: "worker_loaded",
+          });
+          updateRuntimeWorkerMetrics((loadResult as any).model_worker);
           if (serverPrefillBatch.enabled) {
-            const probe = await probeGenerateBatchPrefillCapability();
+            const probe = await probeGenerateBatchPrefillCapability(activeWorkerKeyId);
             generateBatchPrefillCapability = probe.capability;
             generateBatchPrefillCapabilityReason = probe.reason;
           }
@@ -3357,6 +3564,21 @@ async function serve(port: number, host: string) {
           } else {
             prefillBatchGate = { eligible: false, reason: "disabled" };
           }
+        } else if (reusableWorker) {
+          requestBatchPolicy = serverPrefillBatch.enabled
+            ? schedulerPolicyForPriority(requestPriority, process.env)
+            : undefined;
+          prefillBatchGate = serverPrefillBatch.enabled
+            ? serverPrefillBatchEligibility({
+              body,
+              loadedModelPath: current,
+              requestModelPath: path,
+              loadedMaxSeq: currentMaxSeq,
+              requiredMaxSeq,
+              requestImages,
+              effectiveConfig: effective,
+            })
+            : { eligible: false, reason: "disabled" };
         }
 
         if (serverPrefillBatch.enabled && requestBatchPolicy === undefined) {
@@ -3384,8 +3606,12 @@ async function serve(port: number, host: string) {
           && body.stream !== true
           && generateBatchPrefillCapability === "supported";
         if (currentArch !== "deepseek4" && !preserveDaemonStateForResidentCache) {
-          await e.send({ type: "reset" }); await e.recv();
-          clearResidentPrefixState("request reset");
+          await e.send({ type: "reset", worker_key_id: activeWorkerKeyId ?? undefined }); await e.recv();
+          if (maxResidentWorkers > 1 && activeWorkerKeyId) {
+            clearWorkerResidentPrefixState(activeWorkerKeyId, "request reset");
+          } else {
+            clearResidentPrefixState("request reset");
+          }
         }
 
         const servingWorkerStateMode = currentStateMode || effective.kv_cache;
@@ -3397,7 +3623,10 @@ async function serve(port: number, host: string) {
         ])).sort();
         let servingWorkerKey: ModelWorkerKey | null = null;
         const servingWorkerKinds: readonly SessionStateKind[] = inferStateKindsForServeArch(currentArch);
-        if (current !== null) {
+        const activeResidentWorker = activeWorkerKeyId ? residentModelWorkers.get(activeWorkerKeyId) : undefined;
+        if (activeResidentWorker) {
+          servingWorkerKey = activeResidentWorker.workerKey;
+        } else if (current !== null) {
           servingWorkerKey = pickServingModelWorker({
             requestModelPath: current,
             currentModelPath: current,
@@ -3928,6 +4157,7 @@ async function serve(port: number, host: string) {
 
         const genParams: any = {
           type: "generate", id: reqId, prompt: userPrompt,
+          worker_key_id: activeWorkerKeyId ?? undefined,
           temperature: (body.temperature ?? effective.temperature) * TEMP_CORRECTION,
           max_tokens: requestMaxTokens,
           repeat_penalty: body.repeat_penalty ?? effective.repeat_penalty,
@@ -3994,7 +4224,9 @@ async function serve(port: number, host: string) {
             cache_spillable: spillable,
             cache_spill_reason: spillReason,
             worker_key_id: servingWorkerKey ? modelWorkerKeyId(servingWorkerKey) : undefined,
-            route_reason: initialRoute.reloadReason,
+            route_reason: activeWorkerKeyId
+              ? (residentModelWorkers.get(activeWorkerKeyId)?.routeReason ?? initialRoute.reloadReason)
+              : initialRoute.reloadReason,
             generate_batch_prefill_capability: generateBatchPrefillCapability,
             generate_batch_prefill_capability_reason: generateBatchPrefillCapabilityReason,
             runtime_dispatch: runtimeDispatch,
@@ -4178,7 +4410,7 @@ async function serve(port: number, host: string) {
                 const prefillMsg = await e.recv();
                 if (prefillMsg?.type === "generate_batch_prefill_done" && prefillMsg.batch_id === runtimeBatchId) {
                   prefillDone = true;
-                  updateRuntimeWorkerStatePageDescriptors((prefillMsg as any).model_worker);
+                  updateRuntimeWorkerMetrics((prefillMsg as any).model_worker);
                   if (genParams.server_prefill_batch) {
                     genParams.server_prefill_batch.runtime_dispatch = "daemon_serial_prefill";
                     genParams.server_prefill_batch.runtime_dispatch_reason = "prefill_done_decode_continuation";
@@ -4315,11 +4547,12 @@ async function serve(port: number, host: string) {
                 await e.send({
                   type: "release_sessions",
                   id: `${reqId}-spill-release`,
+                  worker_key_id: activeWorkerKeyId ?? undefined,
                   sessions: evictedRuntimeHandles,
                 });
                 const releaseMsg = await e.recv();
                 if (releaseMsg?.type === "release_sessions_done") {
-                  updateRuntimeWorkerStatePageDescriptors((releaseMsg as any).model_worker);
+                  updateRuntimeWorkerMetrics((releaseMsg as any).model_worker);
                   for (const handle of evictedRuntimeHandles) residentDecodeSessions.delete(handle);
                 }
                 stateCacheEvictionsTotal += evictedRuntimeHandles.length;
@@ -4469,9 +4702,13 @@ async function serve(port: number, host: string) {
                   reason,
                 );
                 if (preserveDaemonStateForResidentCache) {
-                  await e.send({ type: "reset" });
+                  await e.send({ type: "reset", worker_key_id: activeWorkerKeyId ?? undefined });
                   await e.recv();
-                  clearResidentPrefixState("prefill attach failure reset");
+                  if (maxResidentWorkers > 1 && activeWorkerKeyId) {
+                    clearWorkerResidentPrefixState(activeWorkerKeyId, "prefill attach failure reset");
+                  } else {
+                    clearResidentPrefixState("prefill attach failure reset");
+                  }
                 }
               }
               if (genParams.server_prefill_batch) {
@@ -5133,8 +5370,12 @@ async function serve(port: number, host: string) {
           preserveDaemonStateForResidentCache &&
           genParams.prefill_already_done !== true
         ) {
-          await e.send({ type: "reset" }); await e.recv();
-          clearResidentPrefixState("prefill fallback reset");
+          await e.send({ type: "reset", worker_key_id: activeWorkerKeyId ?? undefined }); await e.recv();
+          if (maxResidentWorkers > 1 && activeWorkerKeyId) {
+            clearWorkerResidentPrefixState(activeWorkerKeyId, "prefill fallback reset");
+          } else {
+            clearResidentPrefixState("prefill fallback reset");
+          }
         }
 
         let content = "";
@@ -5275,14 +5516,18 @@ async function serve(port: number, host: string) {
                   const stepById = new Map<string, any>();
                   let backend: string | undefined;
                   let elapsedMs = 0;
+                  let chunkCount = 0;
+                  let chunkSize = 0;
                   for (let i = 0; i < activeSessions.length + 4; i++) {
                     const decodeMsg = await e.recv();
                     if (decodeMsg?.type === "generate_batch_decode_step_session_done") {
                       stepById.set(decodeMsg.session_id, decodeMsg);
                     } else if (decodeMsg?.type === "generate_batch_decode_step_done" && decodeMsg.batch_id === batchId) {
                       backend = typeof decodeMsg.backend === "string" ? decodeMsg.backend : backend;
+                      chunkCount = typeof decodeMsg.chunk_count === "number" ? decodeMsg.chunk_count : 0;
+                      chunkSize = typeof decodeMsg.chunk_size === "number" ? decodeMsg.chunk_size : 0;
                       elapsedMs = typeof decodeMsg.elapsed_ms === "number" ? decodeMsg.elapsed_ms : 0;
-                      updateRuntimeWorkerStatePageDescriptors((decodeMsg as any).model_worker);
+                      updateRuntimeWorkerMetrics((decodeMsg as any).model_worker);
                       break;
                     } else if (decodeMsg?.type === "error") {
                       throw new Error(decodeMsg.message || "decode batch failed");
@@ -5292,6 +5537,8 @@ async function serve(port: number, host: string) {
                   if (backend === "serial_reference") decodeBatchMetrics.serialBatches += 1;
                   if (backend && backend !== "serial_reference") decodeBatchMetrics.fusedBatches += 1;
                   decodeBatchMetrics.lastBackend = backend;
+                  decodeBatchMetrics.lastChunkCount = chunkCount;
+                  decodeBatchMetrics.lastChunkSize = chunkSize;
                   decodeBatchMetrics.lastDecodeMs = elapsedMs;
                   for (const state of activeSessions) {
                     const step = stepById.get(state.id);
@@ -5414,11 +5661,12 @@ async function serve(port: number, host: string) {
             await e.send({
               type: "release_sessions",
               id: `${reqId}-release`,
+              worker_key_id: activeWorkerKeyId ?? undefined,
               sessions: [releaseRuntimeSessionId],
             });
             const releaseMsg = await e.recv();
             if (releaseMsg?.type === "release_sessions_done") {
-              updateRuntimeWorkerStatePageDescriptors((releaseMsg as any).model_worker);
+              updateRuntimeWorkerMetrics((releaseMsg as any).model_worker);
               residentDecodeSessions.delete(releaseRuntimeSessionId);
             }
           } catch (err: any) {

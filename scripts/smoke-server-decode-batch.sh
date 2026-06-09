@@ -39,14 +39,22 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from math import ceil
 from typing import Any
 
 root, daemon, model, max_seq_s, decode_backend, expected_decode_backend = sys.argv[1:]
 max_seq = int(max_seq_s)
 if not expected_decode_backend:
-    expected_decode_backend = "fused_dense_layer_chunked" if decode_backend in {"fused", "fused_dense", "fused_dense_layer_chunked"} else "serial_reference"
-default_request_max_tokens = "1" if expected_decode_backend == "fused_dense_layer_chunked" else "2"
+    if decode_backend in {"fused", "fused_dense", "fused_dense_layer_chunked"}:
+        expected_decode_backend = "fused_dense_layer_chunked"
+    elif decode_backend in {"fused_grouped_moe", "grouped_moe", "fused_grouped_moe_layer_chunked"}:
+        expected_decode_backend = "fused_grouped_moe_layer_chunked"
+    else:
+        expected_decode_backend = "serial_reference"
+default_request_max_tokens = "1" if expected_decode_backend in {"fused_dense_layer_chunked", "fused_grouped_moe_layer_chunked"} else "2"
 request_max_tokens = int(os.environ.get("HIPFIRE_DECODE_BATCH_MAX_TOKENS", default_request_max_tokens))
+requested_decode_chunk_size = int(os.environ.get("HIPFIRE_QWEN35_DECODE_BATCH_MAX", "0") or "0")
+dense_fused_mode = expected_decode_backend == "fused_dense_layer_chunked"
 
 
 def pick_port() -> int:
@@ -128,7 +136,8 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
     env.update({
         "HIPFIRE_DAEMON_BIN": daemon,
         "HIPFIRE_MODEL": model,
-        "HIPFIRE_KV_MODE": "q8",
+        "HIPFIRE_KV_MODE": "fp32" if dense_fused_mode else "q8",
+        "HIPFIRE_QWEN35_STATE_QUANT": "fp32" if dense_fused_mode else "q8",
         "HIPFIRE_NO_PID_FILE": "1",
         "HIPFIRE_SERVER_PREFILL_BATCH": "1",
         "HIPFIRE_SERVER_PREFILL_BATCH_MAX": "2",
@@ -178,6 +187,8 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
             "decode_serial_batches": decode.get("serial_batches"),
             "decode_selected_batch_size": decode.get("selected_batch_size"),
             "decode_last_backend": decode.get("last_backend"),
+            "decode_last_chunk_count": decode.get("last_chunk_count"),
+            "decode_last_chunk_size": decode.get("last_chunk_size"),
             "decode_last_decode_ms": decode.get("last_decode_ms"),
             "decode_last_skipped_reason": decode.get("last_skipped_reason"),
             "decode_active_sessions": decode.get("active_sessions"),
@@ -194,6 +205,21 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
             raise RuntimeError(f"server decode did not select a 2-request batch: {checks}; log={log_path}")
         if checks["decode_last_backend"] != run_expected_backend:
             raise RuntimeError(f"unexpected decode backend: {checks}; log={log_path}")
+        if run_expected_backend in {"fused_dense_layer_chunked", "fused_grouped_moe_layer_chunked"}:
+            chunk_count = int(checks["decode_last_chunk_count"] or 0)
+            chunk_size = int(checks["decode_last_chunk_size"] or 0)
+            selected_size = int(checks["decode_selected_batch_size"] or 0)
+            if chunk_count < 1 or chunk_size < 1:
+                raise RuntimeError(f"fused decode did not record chunk telemetry: {checks}; log={log_path}")
+            if requested_decode_chunk_size > 0:
+                expected_chunk_size = min(requested_decode_chunk_size, selected_size)
+                expected_chunk_count = ceil(selected_size / expected_chunk_size)
+                if chunk_size != expected_chunk_size or chunk_count != expected_chunk_count:
+                    raise RuntimeError(
+                        "fused decode chunk telemetry did not match HIPFIRE_QWEN35_DECODE_BATCH_MAX: "
+                        f"expected_size={expected_chunk_size} expected_count={expected_chunk_count} "
+                        f"checks={checks}; log={log_path}"
+                    )
         if float(checks["decode_last_decode_ms"] or 0) <= 0:
             raise RuntimeError(f"server decode did not record positive decode latency: {checks}; log={log_path}")
         if checks["prefill_selected_batch_size"] != 2:
@@ -224,7 +250,7 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
 
 
 parity_enabled = os.environ.get("HIPFIRE_DECODE_BATCH_PARITY", "").lower() in {"1", "true", "yes"}
-if parity_enabled and expected_decode_backend == "fused_dense_layer_chunked":
+if parity_enabled and expected_decode_backend in {"fused_dense_layer_chunked", "fused_grouped_moe_layer_chunked"}:
     serial = run_scenario("serial", "serial_reference", "hipfire-server-decode-batch-parity-serial-")
     fused = run_scenario(decode_backend, expected_decode_backend, "hipfire-server-decode-batch-parity-fused-")
     if serial["contents"] != fused["contents"]:
@@ -245,6 +271,7 @@ checks = result["checks"]
 print(
     "server decode batching smoke passed: "
     f"responses={len(result['responses'])} selected_batch_size={checks['decode_selected_batch_size']} "
-    f"backend={checks['decode_last_backend']} log={result['log_path']}"
+    f"backend={checks['decode_last_backend']} chunks={checks.get('decode_last_chunk_count')}/{checks.get('decode_last_chunk_size')} "
+    f"log={result['log_path']}"
 )
 PY

@@ -11,11 +11,13 @@ The first implementation target was text-only AR prefill microbatching. The
 current follow-up slice adds a Qwen35-only decode active set and daemon
 `generate_batch_decode_step` protocol for non-streaming greedy no-think
 requests. The default path uses a serial reference backend, and explicit
-`HIPFIRE_QWEN35_DECODE_BATCH=fused` enables dense Qwen35 FP32-state final-token
-whole-batch decode through the existing session-batched worker. Multi-step fused
-state-advance parity, grouped-MoE fused decode, true capped per-layer/per-chunk
-decode, MTP/DFlash verify batching, and state-cache eviction to disk remain
-follow-up phases.
+`HIPFIRE_QWEN35_DECODE_BATCH=fused` enables dense Qwen35 FP32-state chunked
+decode dispatch, and `HIPFIRE_QWEN35_DECODE_BATCH=fused_grouped_moe` enables
+Qwen35-MoE chunked dispatch. Both explicit backends report
+`HIPFIRE_QWEN35_DECODE_BATCH_MAX` telemetry and are currently parity-safe by
+advancing chunks through the serial state oracle; native fused state advance,
+native grouped-MoE routed kernels, native per-layer chunk kernels, MTP/DFlash
+verify batching, and state-cache eviction to disk remain follow-up phases.
 
 External `/v1/chat/completions` remains OpenAI-compatible. Priority is optional
 Hipfire metadata/config and defaults to interactive user traffic.
@@ -30,8 +32,8 @@ Hipfire metadata/config and defaults to interactive user traffic.
 | 4. Server-side prefill batching integration (same-worker/session compatibility, no cross-model batching) | DONE FOR QWEN35 | `cli/server_prefill_batch.ts`, `cli/server_prefill_batch.test.ts`, `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-generate-batch-prefill.sh`, `scripts/smoke-server-prefill-batch.sh` | Policy parsing, eligibility gate, scheduler selection, session adapter, daemon `generate_batch_prefill` dispatch, Qwen35 resident state handles, session release, dense fused prefill, grouped-MoE fused prefill, and non-streaming text-only `/v1/responses` normalization are implemented. Remaining work is generic worker residency beyond Qwen35. |
 | 5. Prefix/state cache metadata + safety telemetry | DONE FOR QWEN35 V1 | `cli/state_cache.ts`, `cli/state_cache.test.ts`, `cli/index.ts`, `/health.prefill_batch`, `/health.state_cache`, `scripts/smoke-server-prefix-checkpoint-reuse.sh`, `scripts/smoke-server-prefix-hash-preflight.sh`, `scripts/smoke-server-prefix-boundary-reuse.sh` | Fingerprint, manifest keying, compatibility, `prompt_cache_key` namespace support, spill guardrails, metadata/runtime-hit telemetry, Qwen35 resident attach/fork, daemon-authoritative `xxh128` checkpoint identity, daemon prefix-hash preflight, lifecycle invalidation, capped in-memory checkpoint residency, serial semantic-boundary checkpoint reuse, and arena-hooked fused final checkpoints are wired. Interior fused-backend boundary snapshots still need backend-native capture points. |
 | 6. Scheduler starvation/backpressure hardening | DONE | `cli/worker_scheduler.ts`, `cli/worker_scheduler.test.ts` | Optional queue cap and deadline-aging selection prevent unbounded queue growth and strict-priority starvation. |
-| 7. Decode active set and dense fused step backend | IN PROGRESS FOR QWEN35 V1 | `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-server-decode-batch.sh` | Non-streaming text-only greedy Qwen35 requests that already passed server prefill can batch one-token decode steps through `generate_batch_decode_step`. Serial remains the default oracle; explicit fused mode uses dense FP32-state final-token whole-batch stepping through the session-batched worker. Multi-step fused state-advance parity, grouped-MoE decode, true capped dense chunks, sampling, streaming, and non-Qwen35 support remain future work. |
-| Blocker | PARTIAL | `crates/hipfire-runtime/examples/daemon.rs` implements Qwen35 fused prefill plus state-handle lifecycle and release protocol; top-level attach/fork/activate/reset/release/count and fused final-checkpoint creation route through the backend-neutral arena wrapper around the Qwen35 session map. `/health.runtime_workers` exposes descriptor counts/bytes for the wrapped Qwen35 KV/DeltaNet/logits state. | Generic multi-model residency, grouped-MoE fused decode batching, backend-neutral state-page allocation, and non-Qwen35 worker-owned session arenas remain future work. |
+| 7. Decode active set and dense/grouped chunked step backends | IN PROGRESS FOR QWEN35 V1 | `cli/worker_scheduler.ts`, `cli/index.ts`, `crates/hipfire-runtime/examples/daemon.rs`, `scripts/smoke-server-decode-batch.sh` | Non-streaming text-only greedy Qwen35 requests that already passed server prefill can batch one-token decode steps through `generate_batch_decode_step`. Serial remains the default oracle; explicit dense and grouped-MoE modes use chunked dispatch and report chunk count/size, but advance chunks through the serial state oracle until native fused state-advance parity lands. Native per-layer chunk kernels, sampling, streaming, and non-Qwen35 support remain future work. |
+| Blocker | PARTIAL | `crates/hipfire-runtime/examples/daemon.rs` implements Qwen35 fused prefill plus state-handle lifecycle and release protocol; top-level attach/fork/activate/reset/release/count and fused final-checkpoint creation route through the backend-neutral arena wrapper around the Qwen35 session map. `/health.runtime_workers` exposes descriptor counts/bytes for wrapped Qwen35 KV/DeltaNet/logits state, resident worker lists, and V1 memory totals for pressure-aware model eviction. | Allocator-precise memory accounting, backend-neutral state-page allocation, and non-Qwen35 worker-owned session arenas remain future work. |
 
 ### SKIPPED Slice Notes
 
@@ -44,12 +46,15 @@ Hipfire metadata/config and defaults to interactive user traffic.
 
 The active implementation slice covers compatible same-worker text-only AR
 prefill batches, plus the scheduler and telemetry scaffolding needed to share
-that path with future OpenAI-style batch jobs. It does not claim decode
-fused multi-step decode batching, MTP/DFlash verify batching, multi-resident
-model serving, generic cross-architecture session arenas, or disk state-cache
+that path with future OpenAI-style batch jobs. Multi-resident model serving is
+now V1 worker-local and reports load-time HFQ payload/file bytes plus known
+runtime-state bytes; it does not yet claim allocator-precise reserved-memory
+accounting or fine-grained memory-pressure state/chunk eviction. It also does
+not claim native fused multi-step decode state advance, MTP/DFlash verify
+batching, generic cross-architecture session arenas, or disk state-cache
 spill/reload. The decode batching slice currently claims only Qwen35
 non-streaming greedy no-think requests through serial reference or explicit
-dense FP32-state final-token daemon step backends.
+dense FP32-state chunked daemon step backends.
 
 Completion evidence for this plan should stay tied to observable request
 lifecycle behavior:
@@ -280,8 +285,8 @@ Decode batching now has a conservative V1 control plane:
 - `/health.decode_batch` counters,
 - daemon validation for `generate_batch_decode_step`,
 - Qwen35/Qwen35-MoE serial reference stepping for already-prefilled sessions,
-- explicit dense Qwen35 FP32-state final-token whole-batch stepping with one
-  token per session,
+- explicit dense Qwen35 FP32-state chunked dispatch with one token per session
+  per daemon step and serial-oracle state advance,
 - release-path preservation for resident decode handles.
 
 Eligible V1 sessions:
@@ -307,10 +312,13 @@ Decode scheduler requirements:
 The default daemon backend is intentionally named `serial_reference`. It proves
 protocol, scheduler, session ownership, stop handling, response assembly, and
 cleanup. Explicit `HIPFIRE_QWEN35_DECODE_BATCH=fused` now selects
-`fused_dense_layer_chunked` for dense Qwen35 FP32-state final-token batches
-only. Multi-step decode requests, quantized KV/state, and compacted KV remain on
-`serial_reference`. `auto` remains serial until broader parity and perf gates
-justify promotion.
+`fused_dense_layer_chunked` for dense Qwen35 FP32-state batches. The backend
+honors `HIPFIRE_QWEN35_DECODE_BATCH_MAX` by splitting selected sessions into
+bounded chunks and reporting `chunk_count` / `chunk_size`, but those chunks
+still advance state through the serial oracle until the native fused
+state-advance path has multi-token parity. Quantized KV/state and compacted KV
+remain on `serial_reference`. `auto` remains serial until broader parity and
+perf gates justify promotion.
 
 Priority policy is stricter for decode than prefill:
 
@@ -416,12 +424,13 @@ wait for disk restore to improve reuse.
 - Add decode active set and one-token microbatching. DONE FOR QWEN35 SERIAL V1.
 - Preserve per-session runtime state handles and release semantics. DONE FOR
   QWEN35 SERIAL V1.
-- Add explicit dense FP32-state final-token decode backend. DONE FOR DENSE
-  QWEN35 OPT-IN.
-- Fix fused multi-step state-advance parity. NEXT.
-- Add true capped per-layer/per-chunk dense decode batching. NEXT.
+- Add explicit dense FP32-state chunked decode backend. DONE FOR DENSE QWEN35
+  V1 CONTROL PATH.
+- Add explicit grouped-MoE chunked decode backend. DONE FOR QWEN35-MOE V1
+  CONTROL PATH.
+- Replace serial-oracle chunk advance with native fused state advance. NEXT.
 - Promote dense fused decode to `auto`. NEXT.
-- Add grouped-MoE routed layer chunks. NEXT.
+- Add native grouped-MoE routed layer chunks. NEXT.
 - Add per-session sampler and stream state. DEFERRED.
 - Gate fused backend by correctness tests and latency measurements. NEXT.
 
