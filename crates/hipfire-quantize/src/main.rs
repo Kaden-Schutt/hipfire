@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026 Kaden Schutt
-// Copyright (c) 2026 Nick Woolmer
+// Copyright (c) 2026 Kaden Schutt, Nick Woolmer, Kate
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! hipfire-quantize: Quantize raw FP16/BF16/FP32 model weights to Q4_F16 format.

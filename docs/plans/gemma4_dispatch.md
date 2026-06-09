@@ -1358,6 +1358,36 @@ Phase 0 contracts as follows:
 - **E-class Any-to-Any variants** (E4B, E2B) — not in Ships 1–5. Config and
   forward-pass differences TBD once safetensors land.
 
+## 14 · Unported jukefr kernels (tuning backlog)
+
+Kate (jukefr) authored several MoE prefill kernels on `feat/gemma4-128k-ring-buffer`
+that were **not ported** to the dispatch-unification branch. These are opt-in
+paths that need tuning before production use. Listed here for future work.
+
+| Kernel file | Commit | Purpose | Status | Notes |
+|---|---|---|---|---|
+| `gemv_hfq4g128_moe_down_residual_scaled_bucketed.hip` | `959fb0a` → `6d3a44b` | Routing-bucketed MoE down-proj (HFQ4G128) | **NOT PORTED** | v1 had -5.7% prefill regression; v2 (LDS-staged) closed it. Needs re-benchmark on dispatch branch. |
+| `gemv_hfq4g256_moe_gate_up_bucketed.hip` | `959fb0a` → `6d3a44b` | Routing-bucketed MoE gate+up (HFQ4G256) | **NOT PORTED** | Same bucketed path as above. |
+| `moe_bucket_build.hip` | `959fb0a` | Token→expert histogram + scatter offsets | **NOT PORTED** | Prerequisite for bucketed path. |
+| `gemv_hfq4g128_moe_down_residual_scaled_k8_indexed.hip` | `21a2cedd` | Indexed MoE down for HFQ4G128 weights (decode) | **NOT PORTED** | Used for MQ4 gate_up + HFQ4G128 down model. Our production quant uses Q8_0 down instead, so this kernel isn't load-bearing yet. |
+| `gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched.hip` | `5012a0c` | Batched indexed MoE down for prefill | **NOT PORTED** | Scaffolding for prefill batching; depends on the indexed kernel above. |
+
+**What we DO have ported** (for comparison):
+
+| Kernel file | Author | Status |
+|---|---|---|
+| `gemv_q8_0_moe_gate_up_k8_indexed.hip` | Kevin Read | ✅ Production decode path |
+| `gemv_q8_0_moe_down_residual_scaled_k8_indexed.hip` | Kevin Read | ✅ Production decode path |
+| `gemv_hfq4g256_moe_gate_up_indexed.hip` (contains `k8_indexed`) | Kaden Schutt | ✅ Used for MQ4G256 indexed gate_up |
+| `gemv_hfq4g128_moe_down_residual_scaled_k8_indexed.hip` | Kaden Schutt | ✅ Existing HFQ4G128 indexed down (different from Kate's version) |
+| `attention_flash_asym3_tile_hd512_batched.hip` | Kate | ✅ Batched hd512 flash-attn |
+
+**Tuning priority:** The bucketed MoE path (`959fb0a`/`6d3a44b`) is the most
+impactful — it groups tokens by expert to reduce redundant weight loads during
+prefill. On the original branch it closed a prefill regression. Needs re-benchmark
+on the dispatch branch to confirm the win still holds with the current MoE
+indexed-fast decode path.
+
 ---
 
 *Plan authored 2026-06-07. Updated 2026-06-07 with consolidated adversarial

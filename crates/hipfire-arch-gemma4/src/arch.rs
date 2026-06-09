@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Copyright (c) 2026 Kaden Schutt, Kevin Read
+// Copyright (c) 2026 Kaden Schutt, Kate, Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
 //! `Architecture` trait implementation for Gemma 4.
 
