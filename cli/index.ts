@@ -2523,6 +2523,15 @@ async function serve(port: number, host: string) {
       && selectedPending.every((pending) => pending.fanoutKey === fanoutKey)
       ? selectedPending.slice(1)
       : [];
+    if (
+      process.env.HIPFIRE_DEBUG_SHARED_PREFIX_FANOUT === "1" &&
+      selectedPending.length > 1 &&
+      sameWaveFanoutFollowers.length === 0
+    ) {
+      console.error(
+        `[hipfire] shared-prefix timer fanout skipped: fanoutKey=${fanoutKey ?? "none"} keys=${selectedPending.map((pending) => `${pending.session.id}:${pending.fanoutKey ?? "none"}`).join(",")}`,
+      );
+    }
     const initialPending = sameWaveFanoutFollowers.length > 0
       ? [leaderPending]
       : selectedPending;
@@ -2672,6 +2681,14 @@ async function serve(port: number, host: string) {
             checkpoint.len === prefix.prefix_len
           ))
           .find((checkpoint): checkpoint is { handle: string; hash: string; len: number; logicalPosition?: number } => !!checkpoint);
+        if (
+          process.env.HIPFIRE_DEBUG_SHARED_PREFIX_FANOUT === "1" &&
+          !fanoutCheckpoint
+        ) {
+          console.error(
+            `[hipfire] shared-prefix timer fanout found no checkpoint match: candidates=${leaderCheckpointCandidates.map((checkpoint) => `${checkpoint.len}:${checkpoint.hash}`).join(",")} preflight=${fanoutPreflightPrefixes.map((prefix) => `${prefix.prefix_len}:${prefix.value}`).join(",")}`,
+          );
+        }
         if (fanoutCheckpoint) {
           const fanoutBatchId = `${batchId}-fanout`;
           await e.send({
@@ -5365,6 +5382,14 @@ async function serve(port: number, host: string) {
                     len: number;
                     logicalPosition?: number;
                   } => !!checkpoint);
+                if (
+                  process.env.HIPFIRE_DEBUG_SHARED_PREFIX_FANOUT === "1" &&
+                  !fanoutCheckpoint
+                ) {
+                  console.error(
+                    `[hipfire] shared-prefix fanout found no checkpoint match: candidates=${leaderCheckpointCandidates.map((checkpoint) => `${checkpoint.len}:${checkpoint.hash}`).join(",")} preflight=${fanoutPreflightPrefixes.map((prefix) => `${prefix.prefix_len}:${prefix.value}`).join(",")}`,
+                  );
+                }
                 const fanoutCheckpointHandle = fanoutCheckpoint?.handle;
                 const fanoutDaemonPrefix = fanoutCheckpoint
                   ? { hash: fanoutCheckpoint.hash, len: fanoutCheckpoint.len }
@@ -5691,7 +5716,8 @@ async function serve(port: number, host: string) {
                 reason.includes("failed to attach checkpoint") ||
                 reason.includes("prefix hash mismatch") ||
                 reason.includes("checkpoint source session") ||
-                reason.includes("no resident session exists")
+                reason.includes("no resident session exists") ||
+                reason.includes("cached prefix length") && reason.includes("exceeds rendered token length")
               ) {
                 await invalidateAttachFailure(
                   serverPrefillSession.stateHandle.runtimeStateHandle,

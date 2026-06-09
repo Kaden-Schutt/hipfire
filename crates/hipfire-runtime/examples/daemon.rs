@@ -4495,7 +4495,19 @@ fn qwen35_materialize_batch_prefill_prompt(
     let prompt_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(prompt);
     let prompt = prompt_norm.as_ref();
     let raw_q_tokens = tokenizer.encode(prompt);
-    let seq_pos_for_prompt = m.seq_pos;
+    // Prompt-hash/preload sessions that declare a zero logical position need
+    // to materialize the full prompt from position zero even if another active
+    // resident session has advanced m.seq_pos. Attached prompt sessions also
+    // render from zero so the daemon can slice off the cached prefix that was
+    // fingerprinted by prefix_hash_preflight.
+    let seq_pos_for_prompt = if session.state_handle.runtime_state_handle.is_some()
+        || (session.state_handle.logical_position == 0
+            && session.state_handle.cached_prefix_tokens == 0)
+    {
+        0
+    } else {
+        m.seq_pos
+    };
     let assistant_prefix = parse_assistant_prefix_label(Some(&session.assistant_prefix));
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
     let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
@@ -4956,12 +4968,21 @@ fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             "qwen35 scratch missing; grouped-MoE fused prefill is pp=1 only".to_string()
         })?;
         let total_tokens = prepared.iter().map(|spec| spec.tokens.len()).sum::<usize>();
-        if scratch.prefill_batch.is_none() {
+        let needs_scratch = scratch
+            .prefill_batch
+            .as_ref()
+            .map(|pbs| pbs.max_batch < total_tokens)
+            .unwrap_or(true);
+        if needs_scratch {
+            if let Some(existing) = scratch.prefill_batch.take() {
+                existing.free_gpu(gpu);
+            }
             let max_batch = std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&v| v >= total_tokens)
-                .unwrap_or(total_tokens.max(256));
+                .filter(|&v| v >= 2)
+                .unwrap_or(qwen35::PREFILL_MAX_BATCH)
+                .max(total_tokens);
             scratch.prefill_batch = Some(
                 qwen35::PrefillBatchScratch::new(gpu, config, max_batch).map_err(|e| {
                     format!("allocate qwen35 grouped-MoE fused prefill scratch: {e:?}")
@@ -5185,12 +5206,21 @@ fn qwen35_prefill_suffix_batch_fused_dense(
         let scratch = m.q35_scratch.as_mut().ok_or_else(|| {
             "qwen35 scratch missing; fused dense prefill is pp=1 only".to_string()
         })?;
-        if scratch.prefill_batch.is_none() {
+        let needs_scratch = scratch
+            .prefill_batch
+            .as_ref()
+            .map(|pbs| pbs.max_batch < contract.total_tokens)
+            .unwrap_or(true);
+        if needs_scratch {
+            if let Some(existing) = scratch.prefill_batch.take() {
+                existing.free_gpu(gpu);
+            }
             let max_batch = std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&v| v >= contract.total_tokens)
-                .unwrap_or(contract.total_tokens.max(256));
+                .filter(|&v| v >= 2)
+                .unwrap_or(qwen35::PREFILL_MAX_BATCH)
+                .max(contract.total_tokens);
             scratch.prefill_batch = Some(
                 qwen35::PrefillBatchScratch::new(gpu, config, max_batch)
                     .map_err(|e| format!("allocate qwen35 fused dense prefill scratch: {e:?}"))?,
