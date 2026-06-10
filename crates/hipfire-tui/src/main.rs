@@ -77,6 +77,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return true;
     }
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('t')
+        && app.tab == app::Tab::Chat
+    {
+        app.chat.show_reasoning = !app.chat.show_reasoning;
+        return false;
+    }
 
     match key.code {
         KeyCode::Char('q') if !app.text_input_active() => return true,

@@ -100,7 +100,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             if app.chat.sending {
                 "Esc abort stream  q quit  Tab switch  Up/Down scroll"
             } else {
-                "Tab switch  Enter send  Ctrl+O newline  Up/Down scroll  Esc blur  i focus  q quit (blurred)"
+                "Tab switch  Enter send  Ctrl+O newline  Ctrl+T thinking  Up/Down scroll  Esc blur  q quit (blurred)"
             }
         }
         Tab::Models => {
@@ -289,6 +289,24 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
                 format!("{}:", msg.role),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )));
+            if !msg.reasoning.is_empty() {
+                let dim = Style::default().fg(MUTED).add_modifier(Modifier::DIM);
+                if app.chat.show_reasoning {
+                    lines.push(Line::from(Span::styled("[thinking]", dim)));
+                    for line in msg.reasoning.lines() {
+                        lines.push(Line::from(Span::styled(format!("  {line}"), dim)));
+                    }
+                    lines.push(Line::from(Span::styled("[/thinking]", dim)));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "[thinking collapsed - {} chars - Ctrl+T to expand]",
+                            msg.reasoning.chars().count()
+                        ),
+                        dim,
+                    )));
+                }
+            }
             for line in msg.content.lines() {
                 lines.push(Line::from(line.to_string()));
             }

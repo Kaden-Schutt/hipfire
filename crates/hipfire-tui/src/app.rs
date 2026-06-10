@@ -229,10 +229,12 @@ impl App {
                 self.chat.messages.push(ChatMessage {
                     role: "user".into(),
                     content: prompt.clone(),
+                    reasoning: String::new(),
                 });
                 self.chat.messages.push(ChatMessage {
                     role: "assistant".into(),
                     content: String::new(),
+                    reasoning: String::new(),
                 });
                 self.chat.sending = true;
                 self.chat.status = "streaming from hipfire serve".into();
@@ -250,6 +252,8 @@ impl App {
                         messages.pop();
                     }
                 }
+                // Belt and braces: serde skip_serializing already keeps
+                // reasoning out of the request body.
                 thread::spawn(move || {
                     let _ = stream_chat(&host, port, &model, &messages, tx, abort);
                 });
@@ -419,6 +423,11 @@ impl App {
                             last.content.push_str(&text);
                         }
                     }
+                    ChatEvent::Reasoning(text) => {
+                        if let Some(last) = self.chat.messages.last_mut() {
+                            last.reasoning.push_str(&text);
+                        }
+                    }
                     ChatEvent::Status(status) => self.chat.status = status,
                     ChatEvent::Done => {
                         self.chat.status = "ready".into();
@@ -496,6 +505,8 @@ pub struct ChatState {
     pub messages: Vec<ChatMessage>,
     pub status: String,
     pub sending: bool,
+    /// Render reasoning blocks expanded (dim) or collapsed to one line.
+    pub show_reasoning: bool,
     pub scroll: u16,
     rx: Option<Receiver<ChatEvent>>,
     abort: Arc<AtomicBool>,
@@ -509,6 +520,7 @@ impl Default for ChatState {
             messages: Vec::new(),
             status: "ready".into(),
             sending: false,
+            show_reasoning: true,
             scroll: 0,
             rx: None,
             abort: Arc::new(AtomicBool::new(false)),

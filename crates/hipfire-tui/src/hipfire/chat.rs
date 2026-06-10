@@ -20,11 +20,17 @@ use serde_json::{json, Value};
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Reasoning/thinking stream, shown dim and collapsible in the UI.
+    /// `skip_serializing` keeps it out of the request body, so it is
+    /// excluded from next-turn history by construction.
+    #[serde(skip_serializing, default)]
+    pub reasoning: String,
 }
 
 #[derive(Debug)]
 pub enum ChatEvent {
     Delta(String),
+    Reasoning(String),
     Status(String),
     Done,
     Aborted,
@@ -118,7 +124,7 @@ fn stream_chat_inner(
             continue;
         };
         if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
-            let _ = tx.send(ChatEvent::Delta(text.to_string()));
+            let _ = tx.send(ChatEvent::Reasoning(text.to_string()));
         }
         if let Some(text) = delta.get("content").and_then(Value::as_str) {
             let _ = tx.send(ChatEvent::Delta(text.to_string()));
@@ -127,4 +133,29 @@ fn stream_chat_inner(
 
     let _ = tx.send(ChatEvent::Done);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatMessage;
+
+    #[test]
+    fn reasoning_is_excluded_from_request_serialization() {
+        let msg = ChatMessage {
+            role: "assistant".into(),
+            content: "Paris.".into(),
+            reasoning: "the user asks about France...".into(),
+        };
+        let value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(value["role"], "assistant");
+        assert_eq!(value["content"], "Paris.");
+        assert!(
+            value.get("reasoning").is_none(),
+            "reasoning must not leak into next-turn history"
+        );
+        // and deserializes fine when absent
+        let parsed: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        assert_eq!(parsed.reasoning, "");
+    }
 }
