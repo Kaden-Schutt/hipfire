@@ -5735,8 +5735,8 @@ impl KvCache {
         physical_cap: usize,
     ) -> HipResult<Self> {
         assert!(
-            head_dim == 256,
-            "fwht3 currently requires head_dim=256 (Qwen 3.5)"
+            head_dim == 256 || head_dim == 512,
+            "fwht3 requires head_dim=256 or 512 (hd=512 added for Gemma4 full-attention layers)"
         );
         assert!(head_dim % 32 == 0);
         assert!(
@@ -5750,8 +5750,9 @@ impl KvCache {
         let v_bpp = n_kv_heads * v_blocks_per_head * 34;
         let v_elems = (physical_cap * v_bpp + 3) / 4;
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
-        // fwht_shfl_forward_256 reads signs[tid*8..tid*8+7], so 256 floats each.
-        let n_signs = 256;
+        // fwht_shfl_forward_256 reads signs[tid*8..tid*8+7] (256 floats);
+        // fwht_shfl_forward_512 reads signs[tid*16..tid*16+15] (512 floats).
+        let n_signs = head_dim;
         let s1_vals = Self::gen_fwht_signs(42, n_signs);
         let s2_vals = Self::gen_fwht_signs(1042, n_signs);
         let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();

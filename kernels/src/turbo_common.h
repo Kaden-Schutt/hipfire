@@ -341,6 +341,249 @@ __device__ int turbo_quantize_4bit_256(float x) {
          + (x > 0.089815f) + (x > 0.115239f) + (x > 0.150086f);
 }
 
+// ============================================================================
+// 512-element FWHT via ds_swizzle_b32.  Zero shared memory.  Zero barriers.
+// Each thread owns 16 of 512 elements in registers (v0..v15).
+// 32 threads × 16 elements = 512.
+// log2(512) = 9 butterfly passes:
+//   Passes 1-4: register-local (strides 1, 2, 4, 8 in element space)
+//   Passes 5-9: warp shuffle    (strides 16,32,64,128,256 in element space
+//                                = strides  1, 2, 4,  8, 16 in thread space)
+//
+// VGPR budget estimate (RDNA wave32):
+//   v0-v15: 16 VGPRs  (data)
+//   t:       1 VGPR   (butterfly temp, reused across all local passes)
+//   d0:      1 VGPR   (base index tid*16, computed once)
+//   s:       1 VGPR   (scale 1/sqrt(512), fused with signs2 multiply)
+//   swizzle: 0-1 VGPR (compiler aliases shuffle result with target register)
+//   tid:     1 VGPR   (passed in, already live in caller)
+//   Total: ~20 VGPRs worst case — occupancy 16 on gfx1201 at __launch_bounds__(32,16)
+// ============================================================================
+
+// Lloyd-Max optimal centroids for N(0, 1/512) — = 256-dim values × 1/sqrt(2)
+__constant__ float TURBO_C3_512[8] = {
+    -0.095360f, -0.058916f, -0.032859f, -0.010731f,
+     0.010731f,  0.032859f,  0.058916f,  0.095360f
+};
+
+// Branchless 3-bit quantize for N(0, 1/512): returns index 0-7.
+// Thresholds = 256-dim thresholds × 1/sqrt(2).
+__device__ int turbo_quantize_3bit_512(float x) {
+    return (x > -0.077123f) + (x > -0.045893f) + (x > -0.021798f) + (x > 0.0f)
+         + (x > 0.021798f)  + (x > 0.045893f)  + (x > 0.077123f);
+}
+
+// Forward FWHT-512: 16 elements/lane in 16 VGPRs v0..v15.
+// Lane tid owns dims tid*16 .. tid*16+15 (d0 = tid*16).
+__device__ void fwht_shfl_forward_512(
+    float& v0,  float& v1,  float& v2,  float& v3,
+    float& v4,  float& v5,  float& v6,  float& v7,
+    float& v8,  float& v9,  float& v10, float& v11,
+    float& v12, float& v13, float& v14, float& v15,
+    const float* __restrict__ signs1, const float* __restrict__ signs2, int tid)
+{
+    const int d0 = tid * 16;
+
+    // Apply signs1 (randomize input for incoherence)
+    v0  *= signs1[d0];    v1  *= signs1[d0+1];  v2  *= signs1[d0+2];  v3  *= signs1[d0+3];
+    v4  *= signs1[d0+4];  v5  *= signs1[d0+5];  v6  *= signs1[d0+6];  v7  *= signs1[d0+7];
+    v8  *= signs1[d0+8];  v9  *= signs1[d0+9];  v10 *= signs1[d0+10]; v11 *= signs1[d0+11];
+    v12 *= signs1[d0+12]; v13 *= signs1[d0+13]; v14 *= signs1[d0+14]; v15 *= signs1[d0+15];
+
+    // --- Pass 1: stride 1 in element space ---
+    // Butterfly pairs: (0,1),(2,3),(4,5),(6,7),(8,9),(10,11),(12,13),(14,15)
+    float t;
+    t = v0;  v0  = v0  + v1;  v1  = t - v1;
+    t = v2;  v2  = v2  + v3;  v3  = t - v3;
+    t = v4;  v4  = v4  + v5;  v5  = t - v5;
+    t = v6;  v6  = v6  + v7;  v7  = t - v7;
+    t = v8;  v8  = v8  + v9;  v9  = t - v9;
+    t = v10; v10 = v10 + v11; v11 = t - v11;
+    t = v12; v12 = v12 + v13; v13 = t - v13;
+    t = v14; v14 = v14 + v15; v15 = t - v15;
+
+    // --- Pass 2: stride 2 in element space ---
+    // Butterfly pairs: (0,2),(1,3),(4,6),(5,7),(8,10),(9,11),(12,14),(13,15)
+    t = v0;  v0  = v0  + v2;  v2  = t - v2;
+    t = v1;  v1  = v1  + v3;  v3  = t - v3;
+    t = v4;  v4  = v4  + v6;  v6  = t - v6;
+    t = v5;  v5  = v5  + v7;  v7  = t - v7;
+    t = v8;  v8  = v8  + v10; v10 = t - v10;
+    t = v9;  v9  = v9  + v11; v11 = t - v11;
+    t = v12; v12 = v12 + v14; v14 = t - v14;
+    t = v13; v13 = v13 + v15; v15 = t - v15;
+
+    // --- Pass 3: stride 4 in element space ---
+    // Butterfly pairs: (0,4),(1,5),(2,6),(3,7),(8,12),(9,13),(10,14),(11,15)
+    t = v0;  v0  = v0  + v4;  v4  = t - v4;
+    t = v1;  v1  = v1  + v5;  v5  = t - v5;
+    t = v2;  v2  = v2  + v6;  v6  = t - v6;
+    t = v3;  v3  = v3  + v7;  v7  = t - v7;
+    t = v8;  v8  = v8  + v12; v12 = t - v12;
+    t = v9;  v9  = v9  + v13; v13 = t - v13;
+    t = v10; v10 = v10 + v14; v14 = t - v14;
+    t = v11; v11 = v11 + v15; v15 = t - v15;
+
+    // --- Pass 4: stride 8 in element space ---
+    // Butterfly pairs: (0,8),(1,9),(2,10),(3,11),(4,12),(5,13),(6,14),(7,15)
+    t = v0;  v0  = v0  + v8;  v8  = t - v8;
+    t = v1;  v1  = v1  + v9;  v9  = t - v9;
+    t = v2;  v2  = v2  + v10; v10 = t - v10;
+    t = v3;  v3  = v3  + v11; v11 = t - v11;
+    t = v4;  v4  = v4  + v12; v12 = t - v12;
+    t = v5;  v5  = v5  + v13; v13 = t - v13;
+    t = v6;  v6  = v6  + v14; v14 = t - v14;
+    t = v7;  v7  = v7  + v15; v15 = t - v15;
+
+    // --- Passes 5-9: ds_swizzle_b32 (lane-strides 1,2,4,8,16) ---
+    // Swizzle reach max XOR-lane = 16 — identical to FWHT-256, no cross-warp needed.
+    #define HBFLY16(pat, str) \
+        HADAMARD_BFLY(v0,(pat),(str),tid);  HADAMARD_BFLY(v1,(pat),(str),tid); \
+        HADAMARD_BFLY(v2,(pat),(str),tid);  HADAMARD_BFLY(v3,(pat),(str),tid); \
+        HADAMARD_BFLY(v4,(pat),(str),tid);  HADAMARD_BFLY(v5,(pat),(str),tid); \
+        HADAMARD_BFLY(v6,(pat),(str),tid);  HADAMARD_BFLY(v7,(pat),(str),tid); \
+        HADAMARD_BFLY(v8,(pat),(str),tid);  HADAMARD_BFLY(v9,(pat),(str),tid); \
+        HADAMARD_BFLY(v10,(pat),(str),tid); HADAMARD_BFLY(v11,(pat),(str),tid); \
+        HADAMARD_BFLY(v12,(pat),(str),tid); HADAMARD_BFLY(v13,(pat),(str),tid); \
+        HADAMARD_BFLY(v14,(pat),(str),tid); HADAMARD_BFLY(v15,(pat),(str),tid)
+    HBFLY16(0x041F, 1);
+    HBFLY16(0x081F, 2);
+    HBFLY16(0x101F, 4);
+    HBFLY16(0x201F, 8);
+    HBFLY16(0x401F, 16);
+    #undef HBFLY16
+
+    // Scale by 1/sqrt(512) = 0.0441941738f and apply signs2
+    const float s = 0.0441941738f;
+    v0  *= s * signs2[d0];    v1  *= s * signs2[d0+1];  v2  *= s * signs2[d0+2];  v3  *= s * signs2[d0+3];
+    v4  *= s * signs2[d0+4];  v5  *= s * signs2[d0+5];  v6  *= s * signs2[d0+6];  v7  *= s * signs2[d0+7];
+    v8  *= s * signs2[d0+8];  v9  *= s * signs2[d0+9];  v10 *= s * signs2[d0+10]; v11 *= s * signs2[d0+11];
+    v12 *= s * signs2[d0+12]; v13 *= s * signs2[d0+13]; v14 *= s * signs2[d0+14]; v15 *= s * signs2[d0+15];
+}
+
+// Inverse FWHT-512: signs2 -> shuffle passes -> local passes (reversed) -> scale -> signs1
+// Only needed for the lloyd3-rotated-V reduce path (v_mode=3).  Not used in the
+// default q8-V (v_mode=8) path shipped in v1.
+__device__ void fwht_shfl_inverse_512(
+    float& v0,  float& v1,  float& v2,  float& v3,
+    float& v4,  float& v5,  float& v6,  float& v7,
+    float& v8,  float& v9,  float& v10, float& v11,
+    float& v12, float& v13, float& v14, float& v15,
+    const float* __restrict__ signs1, const float* __restrict__ signs2, int tid)
+{
+    const int d0 = tid * 16;
+
+    // Apply signs2 (undo output randomization)
+    v0  *= signs2[d0];    v1  *= signs2[d0+1];  v2  *= signs2[d0+2];  v3  *= signs2[d0+3];
+    v4  *= signs2[d0+4];  v5  *= signs2[d0+5];  v6  *= signs2[d0+6];  v7  *= signs2[d0+7];
+    v8  *= signs2[d0+8];  v9  *= signs2[d0+9];  v10 *= signs2[d0+10]; v11 *= signs2[d0+11];
+    v12 *= signs2[d0+12]; v13 *= signs2[d0+13]; v14 *= signs2[d0+14]; v15 *= signs2[d0+15];
+
+    // --- Passes 5-9: ds_swizzle_b32 (same 5 patterns, same order as forward) ---
+    #define HBFLY16(pat, str) \
+        HADAMARD_BFLY(v0,(pat),(str),tid);  HADAMARD_BFLY(v1,(pat),(str),tid); \
+        HADAMARD_BFLY(v2,(pat),(str),tid);  HADAMARD_BFLY(v3,(pat),(str),tid); \
+        HADAMARD_BFLY(v4,(pat),(str),tid);  HADAMARD_BFLY(v5,(pat),(str),tid); \
+        HADAMARD_BFLY(v6,(pat),(str),tid);  HADAMARD_BFLY(v7,(pat),(str),tid); \
+        HADAMARD_BFLY(v8,(pat),(str),tid);  HADAMARD_BFLY(v9,(pat),(str),tid); \
+        HADAMARD_BFLY(v10,(pat),(str),tid); HADAMARD_BFLY(v11,(pat),(str),tid); \
+        HADAMARD_BFLY(v12,(pat),(str),tid); HADAMARD_BFLY(v13,(pat),(str),tid); \
+        HADAMARD_BFLY(v14,(pat),(str),tid); HADAMARD_BFLY(v15,(pat),(str),tid)
+    HBFLY16(0x041F, 1);
+    HBFLY16(0x081F, 2);
+    HBFLY16(0x101F, 4);
+    HBFLY16(0x201F, 8);
+    HBFLY16(0x401F, 16);
+    #undef HBFLY16
+
+    // --- Pass 4 (reverse): stride 8 --- pairs (0,8),(1,9),(2,10),(3,11),(4,12),(5,13),(6,14),(7,15)
+    float t;
+    t = v0;  v0  = v0  + v8;  v8  = t - v8;
+    t = v1;  v1  = v1  + v9;  v9  = t - v9;
+    t = v2;  v2  = v2  + v10; v10 = t - v10;
+    t = v3;  v3  = v3  + v11; v11 = t - v11;
+    t = v4;  v4  = v4  + v12; v12 = t - v12;
+    t = v5;  v5  = v5  + v13; v13 = t - v13;
+    t = v6;  v6  = v6  + v14; v14 = t - v14;
+    t = v7;  v7  = v7  + v15; v15 = t - v15;
+
+    // --- Pass 3 (reverse): stride 4 --- pairs (0,4),(1,5),(2,6),(3,7),(8,12),(9,13),(10,14),(11,15)
+    t = v0;  v0  = v0  + v4;  v4  = t - v4;
+    t = v1;  v1  = v1  + v5;  v5  = t - v5;
+    t = v2;  v2  = v2  + v6;  v6  = t - v6;
+    t = v3;  v3  = v3  + v7;  v7  = t - v7;
+    t = v8;  v8  = v8  + v12; v12 = t - v12;
+    t = v9;  v9  = v9  + v13; v13 = t - v13;
+    t = v10; v10 = v10 + v14; v14 = t - v14;
+    t = v11; v11 = v11 + v15; v15 = t - v15;
+
+    // --- Pass 2 (reverse): stride 2 --- pairs (0,2),(1,3),(4,6),(5,7),(8,10),(9,11),(12,14),(13,15)
+    t = v0;  v0  = v0  + v2;  v2  = t - v2;
+    t = v1;  v1  = v1  + v3;  v3  = t - v3;
+    t = v4;  v4  = v4  + v6;  v6  = t - v6;
+    t = v5;  v5  = v5  + v7;  v7  = t - v7;
+    t = v8;  v8  = v8  + v10; v10 = t - v10;
+    t = v9;  v9  = v9  + v11; v11 = t - v11;
+    t = v12; v12 = v12 + v14; v14 = t - v14;
+    t = v13; v13 = v13 + v15; v15 = t - v15;
+
+    // --- Pass 1 (reverse): stride 1 --- pairs (0,1),(2,3),(4,5),(6,7),(8,9),(10,11),(12,13),(14,15)
+    t = v0;  v0  = v0  + v1;  v1  = t - v1;
+    t = v2;  v2  = v2  + v3;  v3  = t - v3;
+    t = v4;  v4  = v4  + v5;  v5  = t - v5;
+    t = v6;  v6  = v6  + v7;  v7  = t - v7;
+    t = v8;  v8  = v8  + v9;  v9  = t - v9;
+    t = v10; v10 = v10 + v11; v11 = t - v11;
+    t = v12; v12 = v12 + v13; v13 = t - v13;
+    t = v14; v14 = v14 + v15; v15 = t - v15;
+
+    // Scale by 1/sqrt(512) and apply signs1
+    const float s = 0.0441941738f;
+    v0  *= s * signs1[d0];    v1  *= s * signs1[d0+1];  v2  *= s * signs1[d0+2];  v3  *= s * signs1[d0+3];
+    v4  *= s * signs1[d0+4];  v5  *= s * signs1[d0+5];  v6  *= s * signs1[d0+6];  v7  *= s * signs1[d0+7];
+    v8  *= s * signs1[d0+8];  v9  *= s * signs1[d0+9];  v10 *= s * signs1[d0+10]; v11 *= s * signs1[d0+11];
+    v12 *= s * signs1[d0+12]; v13 *= s * signs1[d0+13]; v14 *= s * signs1[d0+14]; v15 *= s * signs1[d0+15];
+}
+
+// ============================================================================
+// Scalar reference FWHT-512 (for self-test / validation only)
+// ============================================================================
+__device__ void fwht_forward_512(float* x,
+    const float* __restrict__ signs1, const float* __restrict__ signs2)
+{
+    for (int i = 0; i < 512; i++) x[i] *= signs1[i];
+    for (int stride = 1; stride < 512; stride <<= 1) {
+        for (int i = 0; i < 512; i += stride * 2) {
+            for (int j = 0; j < stride; j++) {
+                float a = x[i + j];
+                float b = x[i + j + stride];
+                x[i + j]          = a + b;
+                x[i + j + stride] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt_512 = 0.0441941738f;
+    for (int i = 0; i < 512; i++) x[i] *= inv_sqrt_512 * signs2[i];
+}
+
+__device__ void fwht_inverse_512(float* x,
+    const float* __restrict__ signs1, const float* __restrict__ signs2)
+{
+    for (int i = 0; i < 512; i++) x[i] *= signs2[i];
+    for (int stride = 1; stride < 512; stride <<= 1) {
+        for (int i = 0; i < 512; i += stride * 2) {
+            for (int j = 0; j < stride; j++) {
+                float a = x[i + j];
+                float b = x[i + j + stride];
+                x[i + j]          = a + b;
+                x[i + j + stride] = a - b;
+            }
+        }
+    }
+    const float inv_sqrt_512 = 0.0441941738f;
+    for (int i = 0; i < 512; i++) x[i] *= inv_sqrt_512 * signs1[i];
+}
+
 // Sign flip array for cheap decorrelation (seed=42, ±1.0)
 __constant__ float TURBO_SIGNS1[128] = {
   1.0f, 1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f,
@@ -352,3 +595,4 @@ __constant__ float TURBO_SIGNS1[128] = {
   1.0f,-1.0f,-1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f, 1.0f,
   1.0f,-1.0f,-1.0f,-1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f,-1.0f
 };
+

@@ -4179,8 +4179,10 @@ fn load_model(
                     .to_string(),
             );
         }
-        let _ = kv_mode;
         let _ = state_quant_override;
+        // kv_mode is honoured for arch 13: "fwht3" uses FWHT-512 3-bit K +
+        // Q8_0 V on the full-attention layers; anything else (default) uses Q8.
+        let kv_mode_fwht3 = kv_mode == "fwht3";
 
         // ── Lowered (Kevin-fork execute_steps) path selection ──────────────
         //
@@ -4215,17 +4217,26 @@ fn load_model(
                 gpu, lowered_cfg.n_layers, lowered_cfg.sliding_n_kv_heads,
                 lowered_cfg.sliding_head_dim, max_seq, lowered_cfg.sliding_window,
             ).map_err(|e| format!("gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"))?;
-            let kv_full = hipfire_runtime::llama::KvCache::new_gpu_q8(
-                gpu, lowered_cfg.n_layers, lowered_cfg.full_n_kv_heads,
-                lowered_cfg.full_head_dim, max_seq,
-            ).map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?;
+            let all_true: Vec<bool> = vec![true; lowered_cfg.n_layers];
+            let kv_full = if kv_mode_fwht3 {
+                hipfire_runtime::llama::KvCache::new_gpu_fwht3_capped_filtered(
+                    gpu, &all_true, lowered_cfg.full_n_kv_heads,
+                    lowered_cfg.full_head_dim, max_seq, max_seq,
+                ).map_err(|e| format!("gemma4 (lowered) full KV alloc (fwht3): {e:?}"))?
+            } else {
+                hipfire_runtime::llama::KvCache::new_gpu_q8(
+                    gpu, lowered_cfg.n_layers, lowered_cfg.full_n_kv_heads,
+                    lowered_cfg.full_head_dim, max_seq,
+                ).map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?
+            };
+            let kv_mode_label = if kv_mode_fwht3 { "fwht3" } else { "q8" };
             let eos_tok = tokenizer
                 .special_token_id("<end_of_turn>")
                 .or_else(|| tokenizer.special_token_id("<turn|>"))
                 .unwrap_or(106);
             let chat_template = resolve_chat_template(&hfq, path);
             eprintln!(
-                "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full q8 KV)",
+                "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full {kv_mode_label} KV)",
                 lowered_cfg.enable_moe_block, want_batched,
             );
             return Ok(LoadedModel {
@@ -4300,9 +4311,16 @@ fn load_model(
         let config = gemma4::config::Gemma4Config::from_hfq(&hfq)?;
         let weights = gemma4::gemma4::Gemma4Weights::load(&hfq, &config, gpu)?;
         // Size both KV caches (sliding hd=256 + full hd=512) to the
-        // requested window.
-        let state = gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, &config, max_seq)
-            .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?;
+        // requested window.  kv_mode="fwht3" replaces the full-layer cache
+        // with FWHT-512 3-bit K + Q8_0 V; the sliding cache stays Q8 always.
+        let state = if kv_mode_fwht3 {
+            eprintln!("  gemma4 eager path: kv_mode=fwht3 (full layers: FWHT-512 3-bit K + Q8_0 V)");
+            gemma4::gemma4::Gemma4State::new_with_fwht3_max_seq(gpu, &config, max_seq)
+                .map_err(|e| format!("gemma4: Gemma4State::new_with_fwht3_max_seq failed: {e}"))?
+        } else {
+            gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, &config, max_seq)
+                .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?
+        };
         // Optional EAGLE drafter (arch-22 `gemma4_unified_assistant`): load
         // the drafter weights + per-step scratch + the reusable spec scratch,
         // then prime the batched verify path. File-missing / arch-mismatch is

@@ -3768,6 +3768,14 @@ pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512.hip");
 pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512_batched.hip");
+pub const KV_CACHE_WRITE_FWHT3_HD512_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_fwht3_hd512.hip");
+pub const KV_CACHE_WRITE_FWHT3_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_fwht3_hd512_batched.hip");
+pub const ATTENTION_FLASH_FWHT3_TILE_HD512_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_fwht3_tile_hd512.hip");
+pub const ATTENTION_FLASH_FWHT3_TILE_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_fwht3_tile_hd512_batched.hip");
 
 #[cfg(test)]
 mod dispatch_tests {

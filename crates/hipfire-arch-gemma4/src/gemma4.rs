@@ -717,6 +717,101 @@ impl Gemma4State {
         })
     }
 
+    /// Like [] but replaces the full-layer KV cache with
+    /// FWHT-512 3-bit K + Q8_0 V (fwht3).  The sliding-layer KV cache stays
+    /// Q8_0 (sliding layers use head_dim=256, which has the same byte layout).
+    pub fn new_with_fwht3_max_seq(
+        gpu: &mut Gpu,
+        cfg: &Gemma4Config,
+        max_seq: usize,
+    ) -> Result<Self, String> {
+        let dim = cfg.dim;
+        gpu.ensure_mq_signs()
+            .map_err(|e| format!("gemma4-fwht3: ensure_mq_signs: {e:?}"))?;
+
+        // Sliding layers: Q8 (hd=256, ring-capped to sliding_window).
+        let kv_sliding = KvCache::new_gpu_q8(
+            gpu,
+            cfg.n_sliding_layers(),
+            cfg.sliding_n_kv_heads,
+            cfg.sliding_head_dim,
+            max_seq,
+        )
+        .map_err(|e| format!("gemma4-fwht3: sliding kv cache: {e:?}"))?;
+
+        // Full layers: fwht3 hd=512 (K = FWHT-512 3-bit, V = Q8_0).
+        let all_true: Vec<bool> = vec![true; cfg.n_full_layers()];
+        let kv_full = KvCache::new_gpu_fwht3_capped_filtered(
+            gpu,
+            &all_true,
+            cfg.full_n_kv_heads,
+            cfg.full_head_dim,
+            max_seq,
+            max_seq,
+        )
+        .map_err(|e| format!("gemma4-fwht3: full kv cache: {e:?}"))?;
+
+        // Per-layer slot mapping (identical to new_with_max_seq).
+        let mut kv_slot_for_layer = Vec::with_capacity(cfg.n_layers);
+        let mut s = 0usize;
+        let mut f = 0usize;
+        for &lt in cfg.layer_types.iter() {
+            match lt {
+                LayerType::Sliding => { kv_slot_for_layer.push(s); s += 1; }
+                LayerType::Full    => { kv_slot_for_layer.push(f); f += 1; }
+            }
+        }
+
+        let pos_buf = gpu
+            .hip
+            .malloc(4)
+            .map_err(|e| format!("gemma4-fwht3: pos_buf malloc: {e:?}"))?;
+
+        let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
+            g.zeros(&[n], DType::F32)
+                .map_err(|e| format!("gemma4-fwht3: alloc {label}: {e:?}"))
+        };
+
+        let max_q = cfg.max_q_dim();
+        let max_kv = cfg.max_kv_dim();
+        let max_hd = cfg.max_head_dim();
+
+        let v_norm_ones = alloc(gpu, max_hd, "v_norm_ones")?;
+        {
+            let ones: Vec<f32> = vec![1.0; max_hd];
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, ones.len() * 4) };
+            gpu.hip
+                .memcpy_htod(&v_norm_ones.buf, bytes)
+                .map_err(|e| format!("gemma4-fwht3: init v_norm_ones: {e:?}"))?;
+        }
+
+        Ok(Gemma4State {
+            kv_sliding,
+            kv_full,
+            kv_slot_for_layer,
+            pos_buf,
+            pos_host: vec![0i32; 1].into_boxed_slice(),
+            max_seq,
+            n_tokens: 0,
+            ar_warmed_up: false,
+            x: alloc(gpu, dim, "x")?,
+            residual: alloc(gpu, dim, "residual")?,
+            tmp: alloc(gpu, dim, "tmp")?,
+            tmp_rot: alloc(gpu, dim, "tmp_rot")?,
+            q: alloc(gpu, max_q, "q")?,
+            k: alloc(gpu, max_kv, "k")?,
+            v: alloc(gpu, max_kv, "v")?,
+            attn_out: alloc(gpu, max_q, "attn_out")?,
+            v_norm_ones,
+            gate_ffn: alloc(gpu, cfg.hidden_dim, "gate_ffn")?,
+            up_ffn: alloc(gpu, cfg.hidden_dim, "up_ffn")?,
+            ffn_hidden: alloc(gpu, cfg.hidden_dim, "ffn_hidden")?,
+            ffn_out: alloc(gpu, dim, "ffn_out")?,
+            logits: alloc(gpu, cfg.vocab_size, "logits")?,
+        })
+    }
+
     pub fn reset(&mut self) {
         self.n_tokens = 0;
     }
