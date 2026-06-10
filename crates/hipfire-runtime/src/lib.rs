@@ -25,6 +25,7 @@ pub mod cpu_router;
 pub mod ddtree;
 #[cfg(feature = "deltanet")]
 pub mod dflash;
+pub mod env_docs;
 pub mod eos_filter;
 pub mod eval_common;
 pub mod eval_harness;
