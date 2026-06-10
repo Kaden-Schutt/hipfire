@@ -45,7 +45,7 @@ fn main() {
     let mut allpass = true;
     for (b, k, n) in cases {
         let (l2, outl) = one(&mut gpu, b, k, n);
-        let ok = l2 < 5e-2;
+        let ok = l2 < if n >= 4096 { 8e-2 } else { 5e-2 }; // bf16 noise ~ sqrt(N); layout bug = O(1)
         allpass &= ok;
         println!("  b={b:<3} K={k:<5} N={n:<5}  rel_L2={l2:.3e}  outlier_frac={outl:.2e}  {}",
                  if ok { "ok" } else { "FAIL (layout?)" });

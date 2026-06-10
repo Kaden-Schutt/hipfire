@@ -460,17 +460,24 @@ void linear_bwd_dx_mfma_gfx942(
     float* __restrict__ dX,        // [batch, K] f32
     int batch, int K, int N)
 {
+    // Split-K over the N contraction: grid = (ceil(K/64), ceil(N/256)).
+    // Each WG reduces a 256-wide N-slab into a partial [batch,64] dX tile and
+    // atomicAdds into dX (caller pre-zeros dX). v1 (grid.x only) had ~16 WGs
+    // for K=1024 and LOST to the naive kernel; the slab split restores
+    // occupancy without giving up the MFMA tiles.
     const int tid   = threadIdx.x;
     const int wave  = tid >> 6;          // 0..3
     const int lane  = tid & 63;
     const int nlane = lane & 15;
     const int strip = (lane >> 4) & 3;
     const int k_off = blockIdx.x * 64 + wave * 16;   // this wave's K-strip start
+    const int n_beg = blockIdx.y * 256;               // this WG's N-slab
+    const int n_end = min(n_beg + 256, N);
     const int b_idx = nlane;                          // A-operand batch row (m)
     const int K_idx = k_off + nlane;                  // output col (k_dx)
 
     dwvf4 c = {0.f, 0.f, 0.f, 0.f};
-    for (int nc = 0; nc < N; nc += 16) {
+    for (int nc = n_beg; nc < n_end; nc += 16) {
         dwbf16x4 a, b;
         #pragma unroll
         for (int r = 0; r < 4; r++) {
@@ -485,7 +492,7 @@ void linear_bwd_dx_mfma_gfx942(
     #pragma unroll
     for (int r = 0; r < 4; r++) {
         int b_out = strip * 4 + r;                    // output batch row
-        if (b_out < batch && K_idx < K) dX[(size_t)b_out * K + K_idx] = c[r];
+        if (b_out < batch && K_idx < K) atomicAdd(&dX[(size_t)b_out * K + K_idx], c[r]);
     }
 }
 #endif

@@ -69,7 +69,7 @@ fn lmhead_fwd(gpu: &mut Gpu, out: &GpuTensor, lmhead: &GpuTensor, lmhead_bf16: O
     if let Some(lmh) = lmhead_bf16 {
         let out_bf16 = gpu.zeros(&[b, d_tgt], DType::F16).unwrap();
         gpu.to_bf16_f32(out, &out_bf16, b * d_tgt).unwrap();
-        gpu.gemm_bf16_mfma(lmh, &out_bf16, &logits, vocab, d_tgt, b).unwrap();
+        gpu.gemm_bf16_mfma_splitk(lmh, &out_bf16, &logits, vocab, d_tgt, b).unwrap();
     } else {
         gpu.gemm_f32_register_tiled(lmhead, out, &logits, vocab, d_tgt, b).unwrap();
     }
@@ -80,7 +80,7 @@ fn lmhead_bwd(gpu: &mut Gpu, dlogits: &GpuTensor, lmhead_t: &GpuTensor, lmhead_t
     if let Some(lmh_t) = lmhead_t_bf16 {
         let dl_bf16 = gpu.zeros(&[b, vocab], DType::F16).unwrap();
         gpu.to_bf16_f32(dlogits, &dl_bf16, b * vocab).unwrap();
-        gpu.gemm_bf16_mfma(lmh_t, &dl_bf16, &d_out, d_tgt, vocab, b).unwrap();
+        gpu.gemm_bf16_mfma_splitk(lmh_t, &dl_bf16, &d_out, d_tgt, vocab, b).unwrap();
     } else {
         gpu.gemm_f32_register_tiled(lmhead_t, dlogits, &d_out, d_tgt, vocab, b).unwrap();
     }

@@ -87,12 +87,25 @@ pub struct LT {
 pub fn up(gpu: &mut Gpu, v: &[f32], sh: &[usize]) -> GpuTensor { gpu.upload_f32(v, sh).unwrap() }
 pub fn zt(gpu: &mut Gpu, n: usize) -> GpuTensor { gpu.zeros(&[n], DType::F32).unwrap() }
 pub fn lin(gpu: &mut Gpu, x: &GpuTensor, w: &GpuTensor, m: usize, k: usize, n: usize) -> GpuTensor {
-    let y = gpu.zeros(&[m, n], DType::F32).unwrap(); gpu.linear_fwd_f32(x, w, &y, m, k, n).unwrap(); y
+    let y = gpu.zeros(&[m, n], DType::F32).unwrap();
+    // bf16-MFMA forward (HF-default training precision; fp32 accumulate).
+    // Inline casts cost ~1/3 of one GEMM weight-read; MFMA wins ~5x back.
+    if dflash_use_mfma() {
+        let wb = gpu.zeros(&[n, k], DType::F16).unwrap();
+        gpu.to_bf16_f32(w, &wb, n * k).unwrap();
+        let xb = gpu.zeros(&[m, k], DType::F16).unwrap();
+        gpu.to_bf16_f32(x, &xb, m * k).unwrap();
+        gpu.gemm_bf16_mfma_splitk(&wb, &xb, &y, n, k, m).unwrap();
+    } else {
+        gpu.linear_fwd_f32(x, w, &y, m, k, n).unwrap();
+    }
+    y
 }
 pub fn lin_dx(gpu: &mut Gpu, dy: &GpuTensor, w: &GpuTensor, m: usize, k: usize, n: usize) -> GpuTensor {
     let dx = gpu.zeros(&[m, k], DType::F32).unwrap();
-    let dx_mfma = std::env::var("HIPFIRE_DFLASH_DX_MFMA").ok().as_deref() == Some("1");
-    if dflash_use_mfma() && dx_mfma && m <= 16 {
+    // split-K dX rides the main MFMA flag; HIPFIRE_DFLASH_DX_MFMA=0 opts out.
+    let dx_off = std::env::var("HIPFIRE_DFLASH_DX_MFMA").ok().as_deref() == Some("0");
+    if dflash_use_mfma() && !dx_off && m <= 16 {
         gpu.linear_bwd_dx_mfma_f32(dy, w, &dx, m, k, n).unwrap();
     } else {
         gpu.linear_bwd_dx_f32(dy, w, &dx, m, k, n).unwrap();

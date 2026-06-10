@@ -65,6 +65,17 @@ fn main() {
     let db = gpu.download_f32(&do_bf16).unwrap();
     let bwd_l2 = rel_l2(&df, &db);
 
+    // v2 split-K kernel, same operands (D pre-zeroed by gpu.zeros)
+    let lg_v2 = gpu.zeros(&[b, vocab], DType::F32).unwrap();
+    gpu.gemm_bf16_mfma_splitk(&lmhead_bf16, &out_bf16, &lg_v2, vocab, d_tgt, b).unwrap();
+    let lv = gpu.download_f32(&lg_v2).unwrap();
+    let do_v2 = gpu.zeros(&[b, d_tgt], DType::F32).unwrap();
+    gpu.gemm_bf16_mfma_splitk(&lmhead_t_bf16, &dlog_bf16, &do_v2, d_tgt, vocab, b).unwrap();
+    let dv = gpu.download_f32(&do_v2).unwrap();
+    let fwd_v2 = rel_l2(&lf, &lv);
+    let bwd_v2 = rel_l2(&df, &dv);
+    println!("  v2 fwd rel_L2 = {fwd_v2:.3e}  v2 bwd rel_L2 = {bwd_v2:.3e}");
+    assert!(fwd_v2 < 5e-2 && bwd_v2 < 5e-2, "splitk v2 layout");
     println!("  fwd logits  rel_L2 = {fwd_l2:.3e}   argmax agree = {am_ok}/{b}");
     println!("  bwd d_out   rel_L2 = {bwd_l2:.3e}");
     let ok = fwd_l2 < 5e-2 && bwd_l2 < 5e-2;

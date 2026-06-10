@@ -1582,6 +1582,27 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [gx, gy, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// lm_head bf16 GEMM v2: coalesced LDS A-stage + split-K (atomicAdd).
+    /// D MUST be pre-zeroed. ksplit chosen for >=2048 WGs (304-CU fill).
+    pub fn gemm_bf16_mfma_splitk(&mut self, a: &GpuTensor, b: &GpuTensor, d: &GpuTensor, m: usize, k: usize, batch: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gemm_bf16_mfma", kernels::GEMM_BF16_MFMA_SRC, "gemm_bf16_mfma_splitk_gfx942")?;
+        let func = &self.functions["gemm_bf16_mfma_splitk_gfx942"];
+        let gx = ((m as u32) + 31) / 32;
+        let kchunks = ((k as u32) + 127) / 128;
+        let want = ((2048 + gx - 1) / gx).max(1);
+        let ksplit = want.min(kchunks).max(1);
+        let kcps = ((kchunks + ksplit - 1) / ksplit).max(1);
+        let mut ap = a.buf.as_ptr(); let mut bp = b.buf.as_ptr(); let mut dp = d.buf.as_ptr();
+        let mut mi = m as i32; let mut ki = k as i32; let mut bi = batch as i32; let mut kc = kcps as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void, &mut bp as *mut _ as *mut c_void, &mut dp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut bi as *mut _ as *mut c_void,
+            &mut kc as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [gx, ksplit, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// MFMA dX (gfx942): dX[batch,K] = sum_n dY[batch,n]*W[n,k], batch<=16.
     /// Native A[m,k]*B[k,n] form -- W read directly & coalesced (no transpose).
     pub fn linear_bwd_dx_mfma_f32(&mut self, dy: &GpuTensor, w: &GpuTensor, dx: &GpuTensor, batch: usize, k: usize, n_dim: usize) -> HipResult<()> {
@@ -1594,8 +1615,8 @@ impl Gpu {
             &mut dyp as *mut _ as *mut c_void, &mut wp as *mut _ as *mut c_void, &mut dxp as *mut _ as *mut c_void,
             &mut bi as *mut _ as *mut c_void, &mut ki as *mut _ as *mut c_void, &mut ni as *mut _ as *mut c_void,
         ];
-        let gx = ((k as u32) + 63) / 64;
-        unsafe { self.hip.launch_kernel(func, [gx, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+        let gx = ((k as u32) + 63) / 64; let gy = ((n_dim as u32) + 255) / 256;
+        unsafe { self.hip.launch_kernel(func, [gx, gy, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
     /// RMSNorm backward. x [rows,n], g [n], dy [rows,n] -> dx [rows,n], dG [n]

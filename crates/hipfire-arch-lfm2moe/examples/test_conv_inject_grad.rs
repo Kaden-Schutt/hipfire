@@ -14,6 +14,13 @@ fn up(gpu: &mut Gpu, v: &[f32], sh: &[usize]) -> GpuTensor { gpu.upload_f32(v, s
 struct HW { op: Vec<f32>, fn_: Vec<f32>, inp: Vec<f32>, cw: Vec<f32>, op2: Vec<f32>, wc: Vec<f32>, w1: Vec<f32>, w3: Vec<f32>, w2: Vec<f32> }
 
 fn main() {
+    // central-fd needs eps above the bf16 quantum; under MFMA the forward is
+    // bf16, so eps=1e-3 perturbations quantize away. Layout validated by
+    // test_lin_parity/test_dw_mfma/test_dx_mfma; loss-match covers training.
+    if hipfire_arch_lfm2moe::dflash_train::dflash_use_mfma() {
+        println!("conv_inject_grad: SKIP (bf16 forward under HIPFIRE_DFLASH_MFMA; fd invalid)");
+        return;
+    }
     let mut gpu = Gpu::init().unwrap();
     // single conv layer (the only one that carries W_c) + dims
     let (d, hd, inter) = (32usize, 8usize, 48usize);
