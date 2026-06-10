@@ -98,6 +98,14 @@ impl App {
         self.tab = Tab::ALL[(idx + Tab::ALL.len() - 1) % Tab::ALL.len()];
     }
 
+    /// True only while a text-entry surface is actually capturing keystrokes.
+    /// Focus is per-tab: the chat input only swallows keys while the Chat tab
+    /// is active (and not mid-stream), so `q`/`r` work everywhere else from
+    /// launch without needing Esc first.
+    pub fn text_input_active(&self) -> bool {
+        self.tab == Tab::Chat && self.chat.is_input_focused() && !self.chat.sending
+    }
+
     pub fn handle_tab_key(&mut self, key: KeyEvent) {
         match self.tab {
             Tab::Chat => self.handle_chat_key(key),
@@ -160,11 +168,20 @@ impl App {
             return;
         }
 
+        if !self.chat.is_input_focused() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('i') => self.chat.focus_input(),
+                KeyCode::Up => self.chat.scroll = self.chat.scroll.saturating_add(1),
+                KeyCode::Down => self.chat.scroll = self.chat.scroll.saturating_sub(1),
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Enter => {
                 let prompt = self.chat.input.trim().to_string();
                 if prompt.is_empty() {
-                    self.chat.focus_input();
                     return;
                 }
                 if !self.status.serve_http_ok {
@@ -200,11 +217,9 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.chat.input.pop();
-                self.chat.focus_input();
             }
             KeyCode::Char(c) => {
                 self.chat.input.push(c);
-                self.chat.focus_input();
             }
             KeyCode::Up => {
                 self.chat.scroll = self.chat.scroll.saturating_add(1);
@@ -281,6 +296,50 @@ impl App {
             if !finished {
                 self.chat.rx = Some(rx);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+impl App {
+    /// Construct an App with empty state and no health/GPU probing, for
+    /// keymap and focus tests.
+    pub fn test_app() -> Self {
+        use std::collections::{BTreeMap, BTreeSet};
+        Self {
+            paths: HipfirePaths::discover(),
+            config: ConfigState {
+                host: "127.0.0.1".into(),
+                port: 11435,
+                default_model: "qwen3.5:9b".into(),
+                values: BTreeMap::new(),
+                per_model_count: 0,
+                loaded_from_disk: false,
+                warning: None,
+            },
+            registry: RegistryState {
+                models: Vec::new(),
+                aliases: BTreeMap::new(),
+                local_files: Vec::new(),
+                selected: 0,
+                expanded_groups: BTreeSet::new(),
+                loaded_path: None,
+                warning: None,
+            },
+            status: StatusState {
+                serve_pid: None,
+                serve_pid_alive: false,
+                serve_http_ok: false,
+                health_text: String::new(),
+                gpu_lines: Vec::new(),
+                paths_ok: Vec::new(),
+            },
+            active_model: "qwen3.5:9b".into(),
+            tab: Tab::Home,
+            settings_easy: true,
+            settings_selected: 0,
+            chat: ChatState::default(),
+            last_reload: String::new(),
         }
     }
 }

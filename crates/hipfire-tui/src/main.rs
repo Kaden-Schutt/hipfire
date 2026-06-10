@@ -81,11 +81,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
 
     match key.code {
-        KeyCode::Char('q') if !app.chat.is_input_focused() => return true,
+        KeyCode::Char('q') if !app.text_input_active() => return true,
         KeyCode::Esc => {
             if app.chat.sending {
                 app.chat.status = "stream abort is not wired in prototype 1".into();
-            } else if app.chat.is_input_focused() {
+            } else if app.text_input_active() {
                 app.chat.blur_input();
             } else {
                 return true;
@@ -93,11 +93,80 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Tab => app.next_tab(),
         KeyCode::BackTab => app.prev_tab(),
-        KeyCode::Char('r') if !app.chat.is_input_focused() => app.reload(),
+        KeyCode::Char('r') if !app.text_input_active() => app.reload(),
         KeyCode::Char('e') if app.tab == app::Tab::Settings => app.settings_easy = true,
         KeyCode::Char('a') if app.tab == app::Tab::Settings => app.settings_easy = false,
         _ => app.handle_tab_key(key),
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app::Tab;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn q_quits_from_launch_on_every_non_chat_tab() {
+        for tab in [Tab::Home, Tab::Models, Tab::Settings, Tab::System] {
+            let mut app = App::test_app();
+            app.tab = tab;
+            assert!(
+                app.chat.is_input_focused(),
+                "chat input starts focused by default"
+            );
+            assert!(
+                handle_key(&mut app, key(KeyCode::Char('q'))),
+                "q must quit on {tab:?} even though chat input is focused"
+            );
+        }
+    }
+
+    #[test]
+    fn q_and_r_type_into_focused_chat_input() {
+        let mut app = App::test_app();
+        app.tab = Tab::Chat;
+        assert!(!handle_key(&mut app, key(KeyCode::Char('q'))));
+        assert!(!handle_key(&mut app, key(KeyCode::Char('r'))));
+        assert_eq!(app.chat.input, "qr");
+    }
+
+    #[test]
+    fn esc_blurs_focused_chat_then_quits() {
+        let mut app = App::test_app();
+        app.tab = Tab::Chat;
+        assert!(!handle_key(&mut app, key(KeyCode::Esc)));
+        assert!(!app.chat.is_input_focused());
+        assert!(handle_key(&mut app, key(KeyCode::Esc)));
+    }
+
+    #[test]
+    fn blurred_chat_is_navigation_mode() {
+        let mut app = App::test_app();
+        app.tab = Tab::Chat;
+        app.chat.blur_input();
+        // characters do not leak into the input buffer
+        let mut probe = App::test_app();
+        probe.tab = Tab::Chat;
+        probe.chat.blur_input();
+        assert!(!handle_key(&mut probe, key(KeyCode::Char('x'))));
+        assert_eq!(probe.chat.input, "");
+        // q quits, i refocuses
+        assert!(handle_key(&mut app, key(KeyCode::Char('q'))));
+        assert!(!handle_key(&mut probe, key(KeyCode::Char('i'))));
+        assert!(probe.chat.is_input_focused());
+    }
+
+    #[test]
+    fn esc_quits_directly_on_non_chat_tabs() {
+        let mut app = App::test_app();
+        app.tab = Tab::Models;
+        assert!(handle_key(&mut app, key(KeyCode::Esc)));
+    }
 }

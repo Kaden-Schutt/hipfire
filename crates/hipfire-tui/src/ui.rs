@@ -97,7 +97,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let help = match app.tab {
         Tab::Chat => {
-            "Tab switch  Enter send/start serve  Ctrl+O newline  Up/Down scroll  Esc blur/quit"
+            "Tab switch  Enter send  Ctrl+O newline  Up/Down scroll  Esc blur  i focus  q quit (blurred)"
         }
         Tab::Models => {
             "Tab switch  Up/Down select  Enter expand/select  Left/Right fold  r refresh  q quit"
