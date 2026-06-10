@@ -100,6 +100,7 @@ fn main() {
         g.attention_flash_q8_0_batched_masked(
             &q, &k_cache, &v_cache, &out, &positions,
             nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
+            0, 0, // window_size, cache_capacity (microbench: full causal, no wrap)
         ).expect("new batched");
     });
 

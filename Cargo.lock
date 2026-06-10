@@ -167,6 +167,7 @@ name = "hipfire-arch-gemma4"
 version = "0.2.1"
 dependencies = [
  "hip-bridge",
+ "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
  "serde",

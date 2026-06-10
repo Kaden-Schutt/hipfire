@@ -32,6 +32,19 @@ pub struct KvTierInputs {
     /// True for boundary layers (pinned to Q8 regardless of global tier).
     /// Inert until the boundary-layer producer populates `layer_is_boundary`.
     pub is_boundary: bool,
+    /// Ring-buffer capacity for sliding-window KV caches.
+    /// - `0` or `>= physical_cap` → identity: `slot = pos` (all existing models).
+    /// - `> 0 && < physical_cap` → wrapping: `slot = pos % cache_capacity`
+    ///   (gemma4 sliding layers, where `cache_capacity = sliding_window = 1024`).
+    pub cache_capacity: u32,
+    /// Per-head dimension. Used by attention resolution to select hd256 vs
+    /// hd512 kernel variants. Most models use a single `head_dim` throughout;
+    /// gemma4 uses 256 (sliding) and 512 (full-attention) within the same model.
+    pub head_dim: usize,
+    /// Sliding-window lookback for attention masking. `0` = full causal.
+    /// gemma4 sliding layers set this to `sliding_window` (e.g. 1024);
+    /// full-attention layers and all non-gemma models pass `0`.
+    pub window_size: u32,
 }
 
 /// Paired KV write + attend plan. Derived from `KvTierInputs` by
@@ -47,6 +60,11 @@ pub struct KvTierPlan {
     pub uses_givens: bool,
     /// Token batch size (for ShapeInfo threading).
     pub batch_size: usize,
+    /// Ring-buffer capacity (flowed through from KvTierInputs).
+    pub cache_capacity: u32,
+    /// Sliding-window lookback. `0` = full causal. Flowed through from
+    /// KvTierInputs so dispatch_attend can pass it to the kernel.
+    pub window_size: u32,
 }
 
 /// Error returned by `KvTierPlan::derive` when the combination of inputs
@@ -94,6 +112,9 @@ impl KvTierPlan {
             batch_size,
             is_tree,
             is_boundary,
+            cache_capacity,
+            head_dim: _hd, // stored in AttnParams; not used in tier derivation
+            window_size,
         } = inputs;
 
         // At most one quant tier flag should be set.
@@ -161,6 +182,8 @@ impl KvTierPlan {
             v_mode_bits,
             uses_givens,
             batch_size,
+            cache_capacity,
+            window_size,
         })
     }
 }
@@ -302,6 +325,9 @@ mod tests {
             batch_size: 1,
             is_tree: false,
             is_boundary: false,
+            cache_capacity: 0, // identity (no wrapping)
+            head_dim: 128,
+            window_size: 0,
         }
     }
 

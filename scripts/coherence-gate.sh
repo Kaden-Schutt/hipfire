@@ -63,7 +63,8 @@ else
                crates/hipfire-arch-deepseek4/src/arch.rs \
                crates/hipfire-arch-deepseek4/src/deepseek4.rs \
                crates/hipfire-arch-deepseek4/src/forward.rs \
-               crates/hipfire-arch-deepseek4/src/spec_decode.rs; do
+               crates/hipfire-arch-deepseek4/src/spec_decode.rs \
+               crates/hipfire-arch-gemma4/src/gemma4.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1
             break
@@ -100,6 +101,19 @@ SHORT_TESTS=(
     "qwen3.5-4b.mq4|code|Write a one-line Python function named square that returns n*n.|180"
     "qwen3.5-9b.mq4|reason|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     "qwen3.5-9b.mq4|tool-call|What does the file /tmp/fibonacci.c contain?|180|tool_call_system.txt"
+    # Gemma 4 (arch_id=12) — hybrid sliding(hd256)+full(hd512) attention.
+    # SwiGLU-gelu_tanh FFN. Exercises the hd512 full-attention reduce path (the
+    # 2e36fee2 fix), the <turn|>=106 stop, and the chat-template framing.
+    # Also exercises the forward-as-pipeline lowered super-op path (default ON
+    # since 2026-06-08) and the q8 ring-buffer sliding KV cache.
+    # Skipped if the model file isn't symlinked into MODELS_DIR.
+    "gemma-4-12B-it-q8.hfq|cap-gemma4|What is the capital of France? Answer in one short sentence.|80"
+    "gemma-4-12B-it-q8.hfq|reason-gemma4|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    # Gemma 4 26B-A4B MoE — exercises MoE expert routing (top-8 of 128),
+    # parallel dense+MoE FFN, Q8 indexed GEMV fast path, and full-attention
+    # layers (5 of 30) with hd512 + partial rope + V←K pre-k_norm copy.
+    "gemma-4-26B-A4B-it-mq4-q8down.hfq|cap-gemma4-26b|What is the capital of France? Answer in one short sentence.|80"
+    "gemma-4-26B-A4B-it-mq4-q8down.hfq|reason-gemma4-26b|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     # MQ3 coverage (gfx11+gfx12 only — refused on other archs at load).
     # Verifies WMMA prefill family + K4-unroll decode + fused residual all
     # dispatch and stay coherent. Same prompts as the MQ4 rows so output
@@ -372,6 +386,28 @@ import sys, json
 print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))')
             if ! printf '%s' "$text" | grep -q 'Paris'; then
                 status="HARD_ERROR (AWQ regression: answer missing 'Paris' — AWQ rescale likely not applied; check DType::supports_awq_sidecar gate and rotate_x_mq_for / rotate_x_mq_batched_for dispatch)"
+                hard_errors=$((hard_errors + 1))
+            fi
+            ;;
+        cap-gemma4*)
+            # Gemma 4 capital-France sanity check. A coherent gemma4 model
+            # (dense or MoE) always answers "Paris" at temp=0.
+            text=$(grep -a '"type":"token"' "$out_file" | python3 -c '
+import sys, json
+print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))')
+            if ! printf '%s' "$text" | grep -q 'Paris'; then
+                status="HARD_ERROR (Gemma 4 coherence: answer missing 'Paris' — check forward-as-pipeline path, KV cache, MoE routing)"
+                hard_errors=$((hard_errors + 1))
+            fi
+            ;;
+        reason-gemma4*)
+            # Gemma 4 reasoning sanity. The farmer's-sheep answer should
+            # contain "9" at temp=0.
+            text=$(grep -a '"type":"token"' "$out_file" | python3 -c '
+import sys, json
+print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))')
+            if ! printf '%s' "$text" | grep -qE '(\b9\b|nine)'; then
+                status="HARD_ERROR (Gemma 4 reasoning: answer missing '9' — check forward path / MoE)"
                 hard_errors=$((hard_errors + 1))
             fi
             ;;

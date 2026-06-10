@@ -64,7 +64,9 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmHfq4G256Wmma,
-        arch_required: ArchPredicate::HasWmma,
+        // gfx11-only: kernel uses the gfx11 __builtin_amdgcn_wmma_f32_16x16x16_f16_w32
+        // layout; no gfx12 sibling. RDNA4 falls back to scalar GemmHfq4G256.
+        arch_required: ArchPredicate::HasWmmaW32,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,

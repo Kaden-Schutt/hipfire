@@ -914,6 +914,7 @@ fn forward_step_after_x(
                 &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
                 &state.attn_out, &state.attn_partials,
                 pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
+                0, // no sliding window
             )?;
         }
 
@@ -1298,6 +1299,7 @@ impl<'a> ForwardBindings for Qwen2Bindings<'a> {
                 &self.state.q, &self.state.k_cache[l], &self.state.v_cache[l],
                 &self.state.attn_out, &self.state.attn_partials,
                 self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
+                0, // no sliding window
             )
         }.map_err(|e| DispatchError::Hip(format!("qwen2 L{l}: attention: {e:?}")))?;
 

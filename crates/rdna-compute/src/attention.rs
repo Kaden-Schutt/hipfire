@@ -187,6 +187,7 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         max_seq: usize,
+        kv_window: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -213,6 +214,7 @@ impl Gpu {
         let ms = max_seq as i32;
         let sc = scale;
         let cs = chunk_size as i32;
+        let kw = kv_window as i32;
 
         let mut params1: Vec<*mut c_void> = vec![
             &q_ptr as *const _ as *mut c_void,
@@ -226,6 +228,7 @@ impl Gpu {
             &ms as *const _ as *mut c_void,
             &sc as *const _ as *mut c_void,
             &cs as *const _ as *mut c_void,
+            &kw as *const _ as *mut c_void,
         ];
 
         let block_size = 128u32.min(chunk_size as u32).next_power_of_two();
@@ -250,6 +253,7 @@ impl Gpu {
                 b.push_i32(ms);
                 b.push_f32(sc);
                 b.push_i32(cs);
+                b.push_i32(kw);
                 b
             },
         )?;
@@ -1282,6 +1286,7 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         batch_size: usize,
+        cache_capacity: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -1295,6 +1300,7 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
+        let mut cap = cache_capacity as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut d as *mut _ as *mut c_void,
             &mut s as *mut _ as *mut c_void,
@@ -1302,6 +1308,7 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
+            &mut cap as *mut _ as *mut c_void,
         ];
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
         self.launch_maybe_blob(
@@ -1318,12 +1325,14 @@ impl Gpu {
                 b.push_i32(nkv);
                 b.push_i32(hd);
                 b.push_i32(bs);
+                b.push_i32(cap);
                 b
             },
         )
     }
 
     /// Write KV vector to Q8_0 quantized cache (same format as GGML Q8_0).
+    /// Write a single KV row in Q8_0 format (cap=0 shorthand of `_cap`).
     pub fn kv_cache_write_q8_0(
         &mut self,
         dst: &GpuTensor,
@@ -1331,6 +1340,21 @@ impl Gpu {
         pos_buf: &DeviceBuffer,
         n_kv_heads: usize,
         head_dim: usize,
+    ) -> HipResult<()> {
+        self.kv_cache_write_q8_0_cap(dst, src, pos_buf, n_kv_heads, head_dim, 0)
+    }
+
+    /// Write a single KV row in Q8_0 format with optional ring-buffer wrapping.
+    /// `cache_capacity > 0` enables `slot = pos % cap` (gemma4 sliding layers);
+    /// `0` = identity (all other callers).
+    pub fn kv_cache_write_q8_0_cap(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_kv_heads: usize,
+        head_dim: usize,
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -1343,12 +1367,14 @@ impl Gpu {
         let p = pos_buf.as_ptr();
         let nkv = n_kv_heads as i32;
         let hd = head_dim as i32;
+        let cc = cache_capacity as i32;
         let mut params: Vec<*mut c_void> = vec![
             &d as *const _ as *mut c_void,
             &s as *const _ as *mut c_void,
             &p as *const _ as *mut c_void,
             &nkv as *const _ as *mut c_void,
             &hd as *const _ as *mut c_void,
+            &cc as *const _ as *mut c_void,
         ];
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
         let bytes = crate::profile::kv_cache_write_q8_0_bytes(n_kv_heads, head_dim);
@@ -1367,6 +1393,7 @@ impl Gpu {
                 b.push_ptr(p);
                 b.push_i32(nkv);
                 b.push_i32(hd);
+                b.push_i32(cc);
                 b
             },
         );
@@ -1560,6 +1587,8 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        window_size: usize,
+        cache_capacity: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -1584,6 +1613,8 @@ impl Gpu {
             block_start,
             block_cols,
             V_MODE_Q8, /*force_wmma_grid=*/ false,
+            window_size,
+            cache_capacity,
         )
     }
 
@@ -1592,6 +1623,7 @@ impl Gpu {
     /// blocks for the tile kernel, then [n_heads] blocks for the reduce.
     /// Requires a pre-allocated `partials` buffer of size
     /// n_heads * max_tiles * (2 + head_dim) floats.
+    /// Q8_0 flash attention (cap=0 shorthand of `_cap`).
     pub fn attention_flash_q8_0(
         &mut self,
         q: &GpuTensor,
@@ -1605,6 +1637,27 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
         partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.attention_flash_q8_0_cap(q, k_cache, v_cache, out, pos_buf,
+            seq_len_hint, n_heads, n_kv_heads, head_dim, max_seq, partials, 0, 0)
+    }
+
+    /// Q8_0 flash attention with optional window + ring-buffer wrapping.
+    pub fn attention_flash_q8_0_cap(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        window_size: u32,
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -1638,6 +1691,8 @@ impl Gpu {
             let ms = max_seq as i32;
             let sc = scale;
             let ts = TILE_SIZE as i32;
+            let ws = window_size as i32;
+            let cc = cache_capacity as i32;
             let grid = [n_heads as u32, launch_tiles as u32, 1];
             let shared = ((TILE_SIZE + head_dim) * 4) as u32;
             let mut params: Vec<*mut c_void> = vec![
@@ -1652,6 +1707,8 @@ impl Gpu {
                 &ms as *const _ as *mut c_void,
                 &sc as *const _ as *mut c_void,
                 &ts as *const _ as *mut c_void,
+                &ws as *const _ as *mut c_void,
+                &cc as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob(
                 "attention_flash_q8_0_tile",
@@ -1672,6 +1729,8 @@ impl Gpu {
                     b.push_i32(ms);
                     b.push_f32(sc);
                     b.push_i32(ts);
+                    b.push_i32(ws);
+                    b.push_i32(cc);
                     b
                 },
             )?;
@@ -1723,7 +1782,7 @@ impl Gpu {
     }
 
     /// Compile a givens4 kernel — prepends turbo_common + givens_common headers.
-    fn ensure_givens4_kernel(
+    pub(crate) fn ensure_givens4_kernel(
         &mut self,
         name: &str,
         body_src: &str,
@@ -1761,6 +1820,7 @@ impl Gpu {
 
     /// Fused K+V write for asym4: K at givens4 (rotated 4-bit), V at Q8_0 (normal space).
     /// Launches two kernels — K-only givens4 writer + standard Q8_0 writer.
+    /// Asym4 fused K+V write (cap=0 shorthand of `_cap`).
     pub fn kv_cache_write_asym4_fused(
         &mut self,
         k_dst: &GpuTensor,
@@ -1773,6 +1833,24 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
     ) -> HipResult<()> {
+        self.kv_cache_write_asym4_fused_cap(k_dst, v_dst, k_src, v_src, pos_buf,
+            cos_theta, sin_theta, n_kv_heads, head_dim, 0)
+    }
+
+    /// Fused asym4 K+V write with optional ring-buffer wrapping.
+    pub fn kv_cache_write_asym4_fused_cap(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        cache_capacity: u32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         // K: rotated 4-bit
         self.ensure_givens4_kernel(
@@ -1781,37 +1859,47 @@ impl Gpu {
             "kv_cache_write_asym_k_givens4",
         )?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens4"];
-            let mut kdp = k_dst.buf.as_ptr();
-            let mut ksp = k_src.buf.as_ptr();
-            let mut pp = pos_buf.as_ptr();
-            let mut ctp = cos_theta.buf.as_ptr();
-            let mut stp = sin_theta.buf.as_ptr();
-            let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32;
+            let kdp = k_dst.buf.as_ptr();
+            let ksp = k_src.buf.as_ptr();
+            let pp = pos_buf.as_ptr();
+            let ctp = cos_theta.buf.as_ptr();
+            let stp = sin_theta.buf.as_ptr();
+            let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
-                &mut kdp as *mut _ as *mut c_void,
-                &mut ksp as *mut _ as *mut c_void,
-                &mut pp as *mut _ as *mut c_void,
-                &mut ctp as *mut _ as *mut c_void,
-                &mut stp as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
+                &kdp as *const _ as *mut c_void,
+                &ksp as *const _ as *mut c_void,
+                &pp as *const _ as *mut c_void,
+                &ctp as *const _ as *mut c_void,
+                &stp as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &cc as *const _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_kv_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    shared_mem,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "kv_cache_write_asym_k_givens4",
+                [n_kv_heads as u32, 1, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(ctp);
+                    b.push_ptr(stp);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(cc);
+                    b
+                },
+            )?;
         }
-        // V: standard Q8_0
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        // V: standard Q8_0 with same ring-buffer cap
+        self.kv_cache_write_q8_0_cap(v_dst, v_src, pos_buf, n_kv_heads, head_dim, cache_capacity)
     }
 
     /// Fused K+V write for fwht4: K at signed-FWHT-rotated 4-bit, V at Q8_0.
@@ -1882,6 +1970,7 @@ impl Gpu {
     /// Fused K+V write for asym3: K at 3-bit rotated (RotorQuant "planar3"), V at Q8_0.
     /// Best-quality rotated K per RotorQuant paper. Head geometry: 32 threads × 8
     /// values = 256 dims single-pass. 100 bytes/head for hd=256.
+    /// Fused asym3 K+V write (cap=0 shorthand of `_cap`).
     pub fn kv_cache_write_asym3_fused(
         &mut self,
         k_dst: &GpuTensor,
@@ -1893,6 +1982,24 @@ impl Gpu {
         sin_theta: &GpuTensor,
         n_kv_heads: usize,
         head_dim: usize,
+    ) -> HipResult<()> {
+        self.kv_cache_write_asym3_fused_cap(k_dst, v_dst, k_src, v_src, pos_buf,
+            cos_theta, sin_theta, n_kv_heads, head_dim, 0)
+    }
+
+    /// Fused asym3 K+V write with optional ring-buffer wrapping.
+    pub fn kv_cache_write_asym3_fused_cap(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_givens4_kernel(
@@ -1909,6 +2016,7 @@ impl Gpu {
             let mut stp = sin_theta.buf.as_ptr();
             let mut nkv = n_kv_heads as i32;
             let mut hd = head_dim as i32;
+            let mut cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut kdp as *mut _ as *mut c_void,
                 &mut ksp as *mut _ as *mut c_void,
@@ -1917,6 +2025,7 @@ impl Gpu {
                 &mut stp as *mut _ as *mut c_void,
                 &mut nkv as *mut _ as *mut c_void,
                 &mut hd as *mut _ as *mut c_void,
+                &mut cc as *mut _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
             unsafe {
@@ -1930,7 +2039,7 @@ impl Gpu {
                 )?;
             }
         }
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        self.kv_cache_write_q8_0_cap(v_dst, v_src, pos_buf, n_kv_heads, head_dim, cache_capacity)
     }
 
     /// Launch the fwht3 rotated-centroid write kernel on an arbitrary KV buffer.
@@ -2294,7 +2403,7 @@ impl Gpu {
                 v_dst, v_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size,
             ),
             _ => self.kv_cache_write_q8_0_batched(
-                v_dst, v_src, positions, n_kv_heads, head_dim, batch_size,
+                v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, 0,
             ),
         }
     }
@@ -2602,6 +2711,8 @@ impl Gpu {
         // wrappers that already know their kernel is WMMA. Scalar callers
         // pass `false` (original behavior).
         force_wmma_grid: bool,
+        window_size: usize,
+        cache_capacity: usize,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         const WMMA_BLOCK_M: usize = 16;
@@ -2697,6 +2808,8 @@ impl Gpu {
                 let bs = block_start as i32;
                 let bc = block_cols as i32;
                 let vm = v_mode_bits;
+                let ws = window_size as i32;
+                let cc = cache_capacity as i32;
                 let mut params: Vec<*mut c_void> = vec![
                     &q_ptr as *const _ as *mut c_void,
                     &k_ptr as *const _ as *mut c_void,
@@ -2717,7 +2830,14 @@ impl Gpu {
                     &bs as *const _ as *mut c_void,
                     &bc as *const _ as *mut c_void,
                 ];
-                if !use_wmma_grid {
+                if eff_tile_func == "attention_flash_asym3_tile_hd512_batched" {
+                    params.push(&ws as *const _ as *mut c_void);
+                    params.push(&cc as *const _ as *mut c_void);
+                } else if eff_tile_func == "attention_flash_asym3_tile_batched" {
+                    params.push(&vm as *const _ as *mut c_void);
+                    params.push(&ws as *const _ as *mut c_void);
+                    params.push(&cc as *const _ as *mut c_void);
+                } else if !use_wmma_grid {
                     params.push(&vm as *const _ as *mut c_void);
                 }
                 let (grid, lds_bytes): ([u32; 3], u32) = if use_wmma_grid {
@@ -2755,7 +2875,14 @@ impl Gpu {
                         b.push_i32(bo);
                         b.push_i32(bs);
                         b.push_i32(bc);
-                        if !use_wmma_grid {
+                        if eff_tile_func == "attention_flash_asym3_tile_hd512_batched" {
+                            b.push_i32(ws);
+                            b.push_i32(cc);
+                        } else if eff_tile_func == "attention_flash_asym3_tile_batched" {
+                            b.push_i32(vm);
+                            b.push_i32(ws);
+                            b.push_i32(cc);
+                        } else if !use_wmma_grid {
                             b.push_i32(vm);
                         }
                         b
@@ -2883,7 +3010,7 @@ impl Gpu {
             head_dim,
             batch_size,
         )?;
-        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, 0)
     }
 
     /// Batched K+V write for fwht4 (K FWHT-rotated 4-bit + V Q8_0).
@@ -2958,7 +3085,7 @@ impl Gpu {
             head_dim,
             batch_size,
         )?;
-        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, 0)
     }
 
     /// Batched K+V write for fwht2 (K FWHT-rotated 2-bit + V Q8_0).
@@ -3092,6 +3219,8 @@ impl Gpu {
             block_start,
             block_cols,
             V_MODE_Q8, /*force_wmma_grid=*/ false,
+            0,
+            0,
         )
     }
 
@@ -3128,6 +3257,7 @@ impl Gpu {
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols, V_MODE_Q8, /*force_wmma_grid=*/ true,
+            0, 0,
         )
     }
 
@@ -3161,6 +3291,7 @@ impl Gpu {
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols, V_MODE_Q8, /*force_wmma_grid=*/ true,
+            0, 0,
         )
     }
 
@@ -3255,6 +3386,8 @@ impl Gpu {
             block_start,
             block_cols,
             v_mode_bits, /*force_wmma_grid=*/ false,
+            0,
+            0,
         )
     }
 
@@ -3300,6 +3433,8 @@ impl Gpu {
             0,
             0,
             V_MODE_Q8, /*force_wmma_grid=*/ false,
+            0,
+            0,
         )
     }
 
@@ -3346,6 +3481,8 @@ impl Gpu {
             0,
             0,
             v_mode_bits, /*force_wmma_grid=*/ false,
+            0,
+            0,
         )
     }
 
@@ -3363,56 +3500,108 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         batch_size: usize,
+        cache_capacity: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         // K: batched 3-bit rotated write.
-        self.ensure_givens4_kernel(
-            "kv_cache_write_asym_k_givens3_batched",
-            kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC,
-            "kv_cache_write_asym_k_givens3_batched",
-        )?;
-        {
-            let mut kdp = k_dst.buf.as_ptr();
-            let mut ksp = k_src.buf.as_ptr();
-            let mut pp = positions.buf.as_ptr();
-            let mut ctp = cos_theta.buf.as_ptr();
-            let mut stp = sin_theta.buf.as_ptr();
-            let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut bs = batch_size as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut kdp as *mut _ as *mut c_void,
-                &mut ksp as *mut _ as *mut c_void,
-                &mut pp as *mut _ as *mut c_void,
-                &mut ctp as *mut _ as *mut c_void,
-                &mut stp as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut bs as *mut _ as *mut c_void,
-            ];
-            let shared_mem = ((head_dim + 32) * 4) as u32;
-            self.launch_maybe_blob(
-                "kv_cache_write_asym_k_givens3_batched",
-                [n_kv_heads as u32, batch_size as u32, 1],
-                [32, 1, 1],
-                shared_mem,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(kdp);
-                    b.push_ptr(ksp);
-                    b.push_ptr(pp);
-                    b.push_ptr(ctp);
-                    b.push_ptr(stp);
-                    b.push_i32(nkv);
-                    b.push_i32(hd);
-                    b.push_i32(bs);
-                    b
-                },
+        if head_dim == 512 {
+            self.ensure_givens4_kernel(
+                "kv_cache_write_asym_k_givens3_hd512_batched",
+                kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC,
+                "kv_cache_write_asym_k_givens3_hd512_batched",
             )?;
+            {
+                let mut kdp = k_dst.buf.as_ptr();
+                let mut ksp = k_src.buf.as_ptr();
+                let mut pp = positions.buf.as_ptr();
+                let mut ctp = cos_theta.buf.as_ptr();
+                let mut stp = sin_theta.buf.as_ptr();
+                let mut nkv = n_kv_heads as i32;
+                let mut hd = head_dim as i32;
+                let mut bs = batch_size as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &mut kdp as *mut _ as *mut c_void,
+                    &mut ksp as *mut _ as *mut c_void,
+                    &mut pp as *mut _ as *mut c_void,
+                    &mut ctp as *mut _ as *mut c_void,
+                    &mut stp as *mut _ as *mut c_void,
+                    &mut nkv as *mut _ as *mut c_void,
+                    &mut hd as *mut _ as *mut c_void,
+                    &mut bs as *mut _ as *mut c_void,
+                ];
+                let shared_mem = ((head_dim + 32) * 4) as u32;
+                self.launch_maybe_blob(
+                    "kv_cache_write_asym_k_givens3_hd512_batched",
+                    [n_kv_heads as u32, batch_size as u32, 1],
+                    [32, 1, 1],
+                    shared_mem,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(kdp);
+                        b.push_ptr(ksp);
+                        b.push_ptr(pp);
+                        b.push_ptr(ctp);
+                        b.push_ptr(stp);
+                        b.push_i32(nkv);
+                        b.push_i32(hd);
+                        b.push_i32(bs);
+                        b
+                    },
+                )?;
+            }
+        } else {
+            self.ensure_givens4_kernel(
+                "kv_cache_write_asym_k_givens3_batched",
+                kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC,
+                "kv_cache_write_asym_k_givens3_batched",
+            )?;
+            {
+                let mut kdp = k_dst.buf.as_ptr();
+                let mut ksp = k_src.buf.as_ptr();
+                let mut pp = positions.buf.as_ptr();
+                let mut ctp = cos_theta.buf.as_ptr();
+                let mut stp = sin_theta.buf.as_ptr();
+                let mut nkv = n_kv_heads as i32;
+                let mut hd = head_dim as i32;
+                let mut bs = batch_size as i32;
+                let mut cap = cache_capacity as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &mut kdp as *mut _ as *mut c_void,
+                    &mut ksp as *mut _ as *mut c_void,
+                    &mut pp as *mut _ as *mut c_void,
+                    &mut ctp as *mut _ as *mut c_void,
+                    &mut stp as *mut _ as *mut c_void,
+                    &mut nkv as *mut _ as *mut c_void,
+                    &mut hd as *mut _ as *mut c_void,
+                    &mut bs as *mut _ as *mut c_void,
+                    &mut cap as *mut _ as *mut c_void,
+                ];
+                let shared_mem = ((head_dim + 32) * 4) as u32;
+                self.launch_maybe_blob(
+                    "kv_cache_write_asym_k_givens3_batched",
+                    [n_kv_heads as u32, batch_size as u32, 1],
+                    [32, 1, 1],
+                    shared_mem,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(kdp);
+                        b.push_ptr(ksp);
+                        b.push_ptr(pp);
+                        b.push_ptr(ctp);
+                        b.push_ptr(stp);
+                        b.push_i32(nkv);
+                        b.push_i32(hd);
+                        b.push_i32(bs);
+                        b.push_i32(cap);
+                        b
+                    },
+                )?;
+            }
         }
         // V: batched Q8_0 write.
-        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, cache_capacity)
     }
 
     /// Batched K+V write for fwht3 (K FWHT-rotated 3-bit + V Q8_0).
@@ -3487,6 +3676,8 @@ impl Gpu {
             None,
             0,
             0,
+            0,
+            0,
         )
     }
 
@@ -3513,12 +3704,27 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        window_size: usize,
+        cache_capacity: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let (key, src, func) = if head_dim == 512 {
+            (
+                "attention_flash_asym3_tile_hd512_batched",
+                kernels::ATTENTION_FLASH_ASYM3_TILE_HD512_BATCHED_SRC,
+                "attention_flash_asym3_tile_hd512_batched",
+            )
+        } else {
+            (
+                "attention_flash_asym3_tile_batched",
+                kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,
+                "attention_flash_asym3_tile_batched",
+            )
+        };
         self.launch_asym_flash_batched(
-            "attention_flash_asym3_tile_batched",
-            kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,
-            "attention_flash_asym3_tile_batched",
+            key,
+            src,
+            func,
             q,
             k_cache,
             v_cache,
@@ -3537,6 +3743,8 @@ impl Gpu {
             block_start,
             block_cols,
             V_MODE_Q8, /*force_wmma_grid=*/ false,
+            window_size,
+            cache_capacity,
         )
     }
 
@@ -3628,6 +3836,8 @@ impl Gpu {
             block_start,
             block_cols,
             v_mode_bits, /*force_wmma_grid=*/ false,
+            0,
+            0,
         )
     }
 
@@ -3787,6 +3997,7 @@ impl Gpu {
         Ok(())
     }
 
+    /// Asym3 flash attention (cap=0 shorthand of `_cap`).
     pub fn attention_flash_asym3(
         &mut self,
         q: &GpuTensor,
@@ -3802,6 +4013,35 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
         partials: &GpuTensor,
+        kv_window: usize,
+    ) -> HipResult<()> {
+        self.attention_flash_asym3_cap(q, k_cache, v_cache, out, pos_buf,
+            cos_theta, sin_theta, seq_len_hint, n_heads, n_kv_heads, head_dim,
+            max_seq, partials, kv_window, 0)
+    }
+
+    /// Asym3 flash attention with optional ring-buffer wrapping.
+    pub fn attention_flash_asym3_cap(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        // Sliding-window lookback. 0 = full causal (qwen35 and other callers).
+        // Gemma 4 sliding layers pass `sliding_window` (1024).
+        kv_window: usize,
+        // Ring-buffer cache capacity. 0 = no wrap. Gemma 4 sliding layers pass
+        // `sliding_window`; all other callers pass 0.
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -3835,6 +4075,8 @@ impl Gpu {
             let mut sc = scale;
             let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
+            let mut kw = kv_window as i32;
+            let mut cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -3850,6 +4092,8 @@ impl Gpu {
                 &mut sc as *mut _ as *mut c_void,
                 &mut ts as *mut _ as *mut c_void,
                 &mut mt as *mut _ as *mut c_void,
+                &mut kw as *mut _ as *mut c_void,
+                &mut cc as *mut _ as *mut c_void,
             ];
             unsafe {
                 self.hip.launch_kernel(
@@ -3901,6 +4145,7 @@ impl Gpu {
     }
 
     /// Fused K+V write for asym2: K at givens2 (rotated 2-bit), V at Q8_0 (normal space).
+    /// Asym2 fused K+V write (cap=0 shorthand of `_cap`).
     pub fn kv_cache_write_asym2_fused(
         &mut self,
         k_dst: &GpuTensor,
@@ -3913,6 +4158,24 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
     ) -> HipResult<()> {
+        self.kv_cache_write_asym2_fused_cap(k_dst, v_dst, k_src, v_src, pos_buf,
+            cos_theta, sin_theta, n_kv_heads, head_dim, 0)
+    }
+
+    /// Fused asym2 K+V write with optional ring-buffer wrapping.
+    pub fn kv_cache_write_asym2_fused_cap(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        cache_capacity: u32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_givens4_kernel(
             "kv_cache_write_asym_k_givens2",
@@ -3920,36 +4183,46 @@ impl Gpu {
             "kv_cache_write_asym_k_givens2",
         )?;
         {
-            let func = &self.functions["kv_cache_write_asym_k_givens2"];
-            let mut kdp = k_dst.buf.as_ptr();
-            let mut ksp = k_src.buf.as_ptr();
-            let mut pp = pos_buf.as_ptr();
-            let mut ctp = cos_theta.buf.as_ptr();
-            let mut stp = sin_theta.buf.as_ptr();
-            let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32;
+            let kdp = k_dst.buf.as_ptr();
+            let ksp = k_src.buf.as_ptr();
+            let pp = pos_buf.as_ptr();
+            let ctp = cos_theta.buf.as_ptr();
+            let stp = sin_theta.buf.as_ptr();
+            let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
-                &mut kdp as *mut _ as *mut c_void,
-                &mut ksp as *mut _ as *mut c_void,
-                &mut pp as *mut _ as *mut c_void,
-                &mut ctp as *mut _ as *mut c_void,
-                &mut stp as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
+                &kdp as *const _ as *mut c_void,
+                &ksp as *const _ as *mut c_void,
+                &pp as *const _ as *mut c_void,
+                &ctp as *const _ as *mut c_void,
+                &stp as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &cc as *const _ as *mut c_void,
             ];
             let shared_mem = ((head_dim + 32) * 4) as u32;
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_kv_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    shared_mem,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "kv_cache_write_asym_k_givens2",
+                [n_kv_heads as u32, 1, 1],
+                [32, 1, 1],
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kdp);
+                    b.push_ptr(ksp);
+                    b.push_ptr(pp);
+                    b.push_ptr(ctp);
+                    b.push_ptr(stp);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(cc);
+                    b
+                },
+            )?;
         }
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        self.kv_cache_write_q8_0_cap(v_dst, v_src, pos_buf, n_kv_heads, head_dim, cache_capacity)
     }
 
     /// Fused K+V write for fwht2: K at FWHT-rotated 2-bit, V at Q8_0.
@@ -4016,6 +4289,7 @@ impl Gpu {
 
     /// Flash attention for asym4 KV (K at rotated 4-bit, V at Q8_0 normal space).
     /// Reuses the Q8_0 flash reduce since V was un-rotated — no inverse rotation needed.
+    /// Asym4 flash attention (cap=0 shorthand of `_cap`).
     pub fn attention_flash_asym4(
         &mut self,
         q: &GpuTensor,
@@ -4031,6 +4305,30 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
         partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.attention_flash_asym4_cap(q, k_cache, v_cache, out, pos_buf,
+            cos_theta, sin_theta, seq_len_hint, n_heads, n_kv_heads, head_dim,
+            max_seq, partials, 0, 0)
+    }
+
+    /// Asym4 flash attention with optional window + ring-buffer wrapping.
+    pub fn attention_flash_asym4_cap(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        window_size: u32,
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -4049,48 +4347,68 @@ impl Gpu {
             "attention_flash_asym4_tile",
         )?;
         {
-            let func = &self.functions["attention_flash_asym4_tile"];
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            let mut q_ptr = q.buf.as_ptr();
-            let mut k_ptr = k_cache.buf.as_ptr();
-            let mut v_ptr = v_cache.buf.as_ptr();
-            let mut p_ptr = partials.buf.as_ptr();
-            let mut pos_ptr = pos_buf.as_ptr();
-            let mut ct_ptr = cos_theta.buf.as_ptr();
-            let mut st_ptr = sin_theta.buf.as_ptr();
-            let mut nh = n_heads as i32;
-            let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut ms = max_seq as i32;
-            let mut sc = scale;
-            let mut ts = TILE_SIZE as i32;
-            let mut mt = max_tiles as i32;
+            let q_ptr = q.buf.as_ptr();
+            let k_ptr = k_cache.buf.as_ptr();
+            let v_ptr = v_cache.buf.as_ptr();
+            let p_ptr = partials.buf.as_ptr();
+            let pos_ptr = pos_buf.as_ptr();
+            let ct_ptr = cos_theta.buf.as_ptr();
+            let st_ptr = sin_theta.buf.as_ptr();
+            let nh = n_heads as i32;
+            let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let ms = max_seq as i32;
+            let sc = scale;
+            let ts = TILE_SIZE as i32;
+            let mt = max_tiles as i32;
+            let ws = window_size as i32;
+            let cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
-                &mut q_ptr as *mut _ as *mut c_void,
-                &mut k_ptr as *mut _ as *mut c_void,
-                &mut v_ptr as *mut _ as *mut c_void,
-                &mut p_ptr as *mut _ as *mut c_void,
-                &mut pos_ptr as *mut _ as *mut c_void,
-                &mut ct_ptr as *mut _ as *mut c_void,
-                &mut st_ptr as *mut _ as *mut c_void,
-                &mut nh as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut ms as *mut _ as *mut c_void,
-                &mut sc as *mut _ as *mut c_void,
-                &mut ts as *mut _ as *mut c_void,
-                &mut mt as *mut _ as *mut c_void,
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &ct_ptr as *const _ as *mut c_void,
+                &st_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &ms as *const _ as *mut c_void,
+                &sc as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
+                &ws as *const _ as *mut c_void,
+                &cc as *const _ as *mut c_void,
             ];
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_heads as u32, launch_tiles as u32, 1],
-                    [32, 1, 1],
-                    (TILE_SIZE * 4) as u32, // scores[tile_size]
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "attention_flash_asym4_tile",
+                [n_heads as u32, launch_tiles as u32, 1],
+                [32, 1, 1],
+                (TILE_SIZE * 4) as u32,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(q_ptr);
+                    b.push_ptr(k_ptr);
+                    b.push_ptr(v_ptr);
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_ptr(ct_ptr);
+                    b.push_ptr(st_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(ms);
+                    b.push_f32(sc);
+                    b.push_i32(ts);
+                    b.push_i32(mt);
+                    b.push_i32(ws);
+                    b.push_i32(cc);
+                    b
+                },
+            )?;
         }
 
         // Reuse Q8_0 flash reduce (output already in normal space).
@@ -4100,33 +4418,40 @@ impl Gpu {
             "attention_flash_q8_0_reduce",
         )?;
         {
-            let func = &self.functions["attention_flash_q8_0_reduce"];
-            let mut p_ptr = partials.buf.as_ptr();
-            let mut o_ptr = out.buf.as_ptr();
-            let mut nh = n_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut pos_ptr = pos_buf.as_ptr();
-            let mut ts = TILE_SIZE as i32;
-            let mut mt = max_tiles as i32;
+            let p_ptr = partials.buf.as_ptr();
+            let o_ptr = out.buf.as_ptr();
+            let nh = n_heads as i32;
+            let hd = head_dim as i32;
+            let pos_ptr = pos_buf.as_ptr();
+            let ts = TILE_SIZE as i32;
+            let mt = max_tiles as i32;
             let mut params: Vec<*mut c_void> = vec![
-                &mut p_ptr as *mut _ as *mut c_void,
-                &mut o_ptr as *mut _ as *mut c_void,
-                &mut nh as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut pos_ptr as *mut _ as *mut c_void,
-                &mut ts as *mut _ as *mut c_void,
-                &mut mt as *mut _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &o_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
             ];
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "attention_flash_q8_0_reduce",
+                [n_heads as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(o_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_ptr(pos_ptr);
+                    b.push_i32(ts);
+                    b.push_i32(mt);
+                    b
+                },
+            )?;
         }
         Ok(())
     }
@@ -4441,6 +4766,7 @@ impl Gpu {
         Ok(())
     }
 
+    /// Asym2 flash attention (cap=0 shorthand of `_cap`).
     pub fn attention_flash_asym2(
         &mut self,
         q: &GpuTensor,
@@ -4456,6 +4782,30 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
         partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.attention_flash_asym2_cap(q, k_cache, v_cache, out, pos_buf,
+            cos_theta, sin_theta, seq_len_hint, n_heads, n_kv_heads, head_dim,
+            max_seq, partials, 0, 0)
+    }
+
+    /// Asym2 flash attention with optional window + ring-buffer wrapping.
+    pub fn attention_flash_asym2_cap(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        window_size: u32,
+        cache_capacity: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -4473,48 +4823,68 @@ impl Gpu {
             "attention_flash_asym2_tile",
         )?;
         {
-            let func = &self.functions["attention_flash_asym2_tile"];
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            let mut q_ptr = q.buf.as_ptr();
-            let mut k_ptr = k_cache.buf.as_ptr();
-            let mut v_ptr = v_cache.buf.as_ptr();
-            let mut p_ptr = partials.buf.as_ptr();
-            let mut pos_ptr = pos_buf.as_ptr();
-            let mut ct_ptr = cos_theta.buf.as_ptr();
-            let mut st_ptr = sin_theta.buf.as_ptr();
-            let mut nh = n_heads as i32;
-            let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut ms = max_seq as i32;
-            let mut sc = scale;
-            let mut ts = TILE_SIZE as i32;
-            let mut mt = max_tiles as i32;
+            let q_ptr = q.buf.as_ptr();
+            let k_ptr = k_cache.buf.as_ptr();
+            let v_ptr = v_cache.buf.as_ptr();
+            let p_ptr = partials.buf.as_ptr();
+            let pos_ptr = pos_buf.as_ptr();
+            let ct_ptr = cos_theta.buf.as_ptr();
+            let st_ptr = sin_theta.buf.as_ptr();
+            let nh = n_heads as i32;
+            let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let ms = max_seq as i32;
+            let sc = scale;
+            let ts = TILE_SIZE as i32;
+            let mt = max_tiles as i32;
+            let ws = window_size as i32;
+            let cc = cache_capacity as i32;
             let mut params: Vec<*mut c_void> = vec![
-                &mut q_ptr as *mut _ as *mut c_void,
-                &mut k_ptr as *mut _ as *mut c_void,
-                &mut v_ptr as *mut _ as *mut c_void,
-                &mut p_ptr as *mut _ as *mut c_void,
-                &mut pos_ptr as *mut _ as *mut c_void,
-                &mut ct_ptr as *mut _ as *mut c_void,
-                &mut st_ptr as *mut _ as *mut c_void,
-                &mut nh as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut ms as *mut _ as *mut c_void,
-                &mut sc as *mut _ as *mut c_void,
-                &mut ts as *mut _ as *mut c_void,
-                &mut mt as *mut _ as *mut c_void,
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &ct_ptr as *const _ as *mut c_void,
+                &st_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &ms as *const _ as *mut c_void,
+                &sc as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
+                &ws as *const _ as *mut c_void,
+                &cc as *const _ as *mut c_void,
             ];
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_heads as u32, launch_tiles as u32, 1],
-                    [32, 1, 1],
-                    (TILE_SIZE * 4) as u32,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "attention_flash_asym2_tile",
+                [n_heads as u32, launch_tiles as u32, 1],
+                [32, 1, 1],
+                (TILE_SIZE * 4) as u32,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(q_ptr);
+                    b.push_ptr(k_ptr);
+                    b.push_ptr(v_ptr);
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_ptr(ct_ptr);
+                    b.push_ptr(st_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(ms);
+                    b.push_f32(sc);
+                    b.push_i32(ts);
+                    b.push_i32(mt);
+                    b.push_i32(ws);
+                    b.push_i32(cc);
+                    b
+                },
+            )?;
         }
 
         self.ensure_kernel(
@@ -4523,33 +4893,40 @@ impl Gpu {
             "attention_flash_q8_0_reduce",
         )?;
         {
-            let func = &self.functions["attention_flash_q8_0_reduce"];
-            let mut p_ptr = partials.buf.as_ptr();
-            let mut o_ptr = out.buf.as_ptr();
-            let mut nh = n_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut pos_ptr = pos_buf.as_ptr();
-            let mut ts = TILE_SIZE as i32;
-            let mut mt = max_tiles as i32;
+            let p_ptr = partials.buf.as_ptr();
+            let o_ptr = out.buf.as_ptr();
+            let nh = n_heads as i32;
+            let hd = head_dim as i32;
+            let pos_ptr = pos_buf.as_ptr();
+            let ts = TILE_SIZE as i32;
+            let mt = max_tiles as i32;
             let mut params: Vec<*mut c_void> = vec![
-                &mut p_ptr as *mut _ as *mut c_void,
-                &mut o_ptr as *mut _ as *mut c_void,
-                &mut nh as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut pos_ptr as *mut _ as *mut c_void,
-                &mut ts as *mut _ as *mut c_void,
-                &mut mt as *mut _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &o_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
             ];
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "attention_flash_q8_0_reduce",
+                [n_heads as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(o_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_ptr(pos_ptr);
+                    b.push_i32(ts);
+                    b.push_i32(mt);
+                    b
+                },
+            )?;
         }
         Ok(())
     }

@@ -34,7 +34,12 @@ __global__ void attention_flash_asym4_tile(
     int max_seq,
     float scale_attn,
     int tile_size,
-    int max_tiles
+    int max_tiles,
+    // Sliding-window lookback. 0 = full causal. When > 0, only positions t
+    // in [seq_len - window_size, seq_len - 1] contribute.
+    int window_size,
+    // Ring-buffer cache capacity. 0 = no wrap. > 0: slot = t % cache_capacity.
+    int cache_capacity
 ) {
     const int seq_len = pos_buf[0] + 1;
     const int h = blockIdx.x;
@@ -44,6 +49,17 @@ __global__ void attention_flash_asym4_tile(
     const int tile_end = min(tile_start + tile_size, seq_len);
     if (tile_start >= seq_len) return;
     const int tile_len = tile_end - tile_start;
+
+    // Sliding-window: skip tiles entirely below the window.
+    const int t_lo = (window_size > 0) ? max(0, seq_len - window_size) : 0;
+    if (window_size > 0 && tile_end <= t_lo) {
+        if (threadIdx.x == 0) {
+            float* p0 = partials + (h * max_tiles + tile_id) * (2 + head_dim);
+            p0[0] = -1e30f;
+            p0[1] = 0.0f;
+        }
+        return;
+    }
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
@@ -64,9 +80,9 @@ __global__ void attention_flash_asym4_tile(
     extern __shared__ float sdata[];
     float* scores = sdata;
 
-    // ── Load + rotate Q for each half (2 sets of 4 values for hd=256) ──
+    // ── Load + rotate Q for each half (4 values per half, max 4 halves for hd512) ──
     const float* q_head = q + h * head_dim;
-    float mq[8];
+    float mq[16];
     for (int half = 0; half < n_halves; half++) {
         const int d0 = half * 128 + tid * 4;
         float a = q_head[d0 + 0];
@@ -84,21 +100,25 @@ __global__ void attention_flash_asym4_tile(
     // ═══ Phase A: Q·K dot products (K in rotated 4-bit space) ═══
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
-        const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        float cnorm = *(const float*)kb;
+        const bool out_of_window = (window_size > 0) && (t < t_lo);
         float partial = 0.0f;
-        for (int half = 0; half < n_halves; half++) {
-            // Nibble offset: 4 (cnorm) + half * 64 + tid * 2.
-            unsigned short pk = *(const unsigned short*)(kb + 4 + half * 64 + tid * 2);
-            partial += mq[half * 4 + 0] * (cnorm * TURBO_C4[(pk)       & 0xF])
-                     + mq[half * 4 + 1] * (cnorm * TURBO_C4[(pk >> 4)  & 0xF])
-                     + mq[half * 4 + 2] * (cnorm * TURBO_C4[(pk >> 8)  & 0xF])
-                     + mq[half * 4 + 3] * (cnorm * TURBO_C4[(pk >> 12) & 0xF]);
+        if (!out_of_window) {
+            const int k_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+            const unsigned char* kb = k_cache + (size_t)k_slot * k_bytes_per_pos + k_head_off;
+            float cnorm = *(const float*)kb;
+            for (int half = 0; half < n_halves; half++) {
+                // Nibble offset: 4 (cnorm) + half * 64 + tid * 2.
+                unsigned short pk = *(const unsigned short*)(kb + 4 + half * 64 + tid * 2);
+                partial += mq[half * 4 + 0] * (cnorm * TURBO_C4[(pk)       & 0xF])
+                         + mq[half * 4 + 1] * (cnorm * TURBO_C4[(pk >> 4)  & 0xF])
+                         + mq[half * 4 + 2] * (cnorm * TURBO_C4[(pk >> 8)  & 0xF])
+                         + mq[half * 4 + 3] * (cnorm * TURBO_C4[(pk >> 12) & 0xF]);
+            }
         }
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0)
-            scores[t_local] = partial * scale_attn;
+            scores[t_local] = out_of_window ? -1e30f : (partial * scale_attn);
     }
     __syncthreads();
 
@@ -123,14 +143,13 @@ __global__ void attention_flash_asym4_tile(
     __syncthreads();
 
     // ═══ Phase D: V-weighted accumulation (NORMAL space Q8_0) ═══
-    // For hd=128: each thread owns 4 dims (d_base = tid*4).
-    // For hd=256: each thread owns 8 dims (d_base = tid*8) — 2 Q8 blocks.
-    // We use a loop over "dim pairs of 4" that iterates n_halves times.
-    float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    // Up to 4 halves for hd512: each thread owns 4 dims per half.
+    float out_vec[16] = {};
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+        const int v_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+        const unsigned char* vb = v_cache + (size_t)v_slot * v_row_stride;
         for (int half = 0; half < n_halves; half++) {
             const int d_base = half * 128 + tid * 4;
             const int v_bi       = d_base / 32;

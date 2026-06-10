@@ -25,6 +25,7 @@ use base64::Engine;
 use hip_bridge::HipResult;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_gemma4 as gemma4;
+use hipfire_arch_gemma4::lowered;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_dots_ocr::dots_ocr;
@@ -1113,6 +1114,23 @@ struct Gemma4EagleState {
 /// `crates/hipfire-arch-gemma4/examples/infer_gemma4_spec.rs`.
 const GEMMA4_EAGLE_DRAFT_LEN: usize = 3;
 
+/// Kevin-fork lowered (execute_steps/superop) Gemma 4 path state. Used for
+/// arch-13 MoE models (26B-A4B — our eager `gemma4::forward` path is dense
+/// only) and for the opt-in `HIPFIRE_BATCHED_PREFILL` / `HIPFIRE_WMMA_PREFILL`
+/// dense prefill path. Mutually exclusive with the eager `gemma4_*` /
+/// `gemma4_state` / `gemma4_eagle` fields: a given LoadedModel populates
+/// exactly one of the two Gemma 4 representations. The lowered path uses two
+/// separate `llama::KvCache`s (q8 ring-buffered sliding + asym3 full) and a
+/// `lowered::Gemma4Scratch`, vs the eager path's self-contained `Gemma4State`.
+struct Gemma4LoweredState {
+    config: lowered::Gemma4Config,
+    weights: lowered::Gemma4Weights,
+    scratch: lowered::Gemma4Scratch,
+    kv_sliding: hipfire_runtime::llama::KvCache,
+    kv_full: hipfire_runtime::llama::KvCache,
+    eos_tok: u32,
+}
+
 /// Gate for the `params.spec` knob: only `GEMMA4_EAGLE_DRAFT_LEN` (3) is
 /// accepted in v1 — refuse-don't-degrade, mirroring the DFlash refusal
 /// contracts. Absent means "use the validated default".
@@ -1243,6 +1261,8 @@ struct LoadedModel {
     // RMSNorm + layer_scalar, gelu_pytorch_tanh SwiGLU, tied lm_head, final
     // logit softcap. Both KV caches (sliding hd=256 + full hd=512) live
     // inside Gemma4State; no separate field. None on every other arch path.
+    // (MoE 26B-A4B + the opt-in batched/WMMA dense prefill path live in the
+    // separate `gemma4_lowered` field below.)
     gemma4_config: Option<gemma4::config::Gemma4Config>,
     gemma4_weights: Option<gemma4::gemma4::Gemma4Weights>,
     gemma4_state: Option<gemma4::gemma4::Gemma4State>,
@@ -1364,6 +1384,10 @@ struct LoadedModel {
     /// drafter loaded cleanly; `generate_gemma4` routes temp==0 requests
     /// through `spec_step_gemma4_eagle` when present.
     gemma4_eagle: Option<Gemma4EagleState>,
+    /// Kevin-fork lowered Gemma 4 state (arch-13 MoE + opt-in batched/WMMA
+    /// dense prefill). Mutually exclusive with the eager `gemma4_state` /
+    /// `gemma4_eagle` fields above. See `Gemma4LoweredState`.
+    gemma4_lowered: Option<Gemma4LoweredState>,
     // Upstream HF Jinja chat_template, extracted from the HFQ
     // `tokenizer_config.chat_template` at load time. `None` when the source
     // model didn't ship one (rare for instruct models). Only consumed when
@@ -2049,6 +2073,8 @@ fn main() {
                             (c.hidden_size, c.num_hidden_layers, c.vocab_size)
                         } else if let Some(ref c) = m.gemma4_config {
                             (c.dim, c.n_layers, c.vocab_size)
+                        } else if let Some(ref s) = m.gemma4_lowered {
+                            (s.config.dim, s.config.n_layers, s.config.vocab_size)
                         } else if let Some(ref c) = m.dots_ocr_config {
                             (
                                 c.text.hidden_size,
@@ -3118,27 +3144,37 @@ fn main() {
                     }
                     ok
                 } else if m.arch_id == 13 {
-                    // Gemma 4 warm-pass: per-token eager decode_step over the
-                    // synthetic prompt. Saturates the hybrid sliding/full
-                    // attention + sandwich-norm + GeGLU + softcap kernel set
-                    // before any user-facing generate. This IS the production
-                    // prefill shape (per-token; the hipGraph path only covers
-                    // the decode loop).
-                    let config = m.gemma4_config.as_ref().unwrap();
-                    let weights = m.gemma4_weights.as_ref().unwrap();
-                    let state = m.gemma4_state.as_mut().unwrap();
-                    let mut ok = true;
-                    for (i, &tok) in synthetic.iter().enumerate() {
-                        if gemma4::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
-                        )
-                        .is_err()
-                        {
-                            ok = false;
-                            break;
+                    if let Some(state) = m.gemma4_state.as_mut() {
+                        // Eager path (dense + optional EAGLE): per-token
+                        // decode_step over the synthetic prompt. Saturates the
+                        // hybrid sliding/full attention + sandwich-norm + GeGLU
+                        // + softcap kernel set before any user-facing generate.
+                        // This IS the production prefill shape (per-token; the
+                        // hipGraph path only covers the decode loop).
+                        let config = m.gemma4_config.as_ref().unwrap();
+                        let weights = m.gemma4_weights.as_ref().unwrap();
+                        let mut ok = true;
+                        for (i, &tok) in synthetic.iter().enumerate() {
+                            if gemma4::forward::decode_step(
+                                config, weights, state, &mut gpu, tok, i as u32,
+                            )
+                            .is_err()
+                            {
+                                ok = false;
+                                break;
+                            }
                         }
+                        ok
+                    } else {
+                        // Lowered path (arch-13 MoE / opt-in batched prefill):
+                        // warm-pass SKIPPED. The lowered KV caches are keyed by
+                        // absolute position and overwritten from 0 each turn, so
+                        // a synthetic warm write to slots 0-127 would alias the
+                        // first real generate's KV. The lowered MoE branch's
+                        // batched scratch is instead primed at load (see the
+                        // arch-13 lowered load arm). Skip cleanly.
+                        true
                     }
-                    ok
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
@@ -3771,6 +3807,7 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             gemma4_eagle: None,
+            gemma4_lowered: None,
             chat_template,
         });
     }
@@ -3861,6 +3898,7 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             gemma4_eagle: None,
+            gemma4_lowered: None,
             chat_template,
         });
     }
@@ -3972,6 +4010,7 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             gemma4_eagle: None,
+            gemma4_lowered: None,
             chat_template,
         });
     }
@@ -4076,6 +4115,7 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             gemma4_eagle: None,
+            gemma4_lowered: None,
             chat_template,
         });
     }
@@ -4106,6 +4146,119 @@ fn load_model(
         }
         let _ = kv_mode;
         let _ = state_quant_override;
+
+        // ── Lowered (Kevin-fork execute_steps) path selection ──────────────
+        //
+        // The eager `gemma4::forward` path below is DENSE ONLY. arch-13 MoE
+        // (26B-A4B `enable_moe_block`) must go through `lowered`, which carries
+        // the parallel-MoE branch. We also route DENSE models through `lowered`
+        // when the operator opts into batched / WMMA prefill
+        // (`HIPFIRE_BATCHED_PREFILL=1` / `HIPFIRE_WMMA_PREFILL=1`) — that path
+        // lives only in `lowered::forward_prefill_batch`. EAGLE spec-decode
+        // (`params.drafter`) requires the eager `Gemma4State`, so a drafter
+        // request always wins and keeps the eager path (the batched prefill
+        // opt-in is silently ignored when a drafter is present).
+        let lowered_cfg = lowered::config_from_hfq(&hfq)
+            .ok_or_else(|| "gemma4: lowered config_from_hfq failed".to_string())?;
+        let want_batched = lowered::batched_prefill_enabled() || lowered::wmma_prefill_enabled();
+        let use_lowered =
+            lowered_cfg.enable_moe_block || (want_batched && gemma4_drafter.is_none());
+        if use_lowered {
+            let mut hfq = hfq; // shadow as mut for lowered::load_weights
+            let weights = lowered::load_weights(&mut hfq, &lowered_cfg, gpu)
+                .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
+            let scratch = lowered::Gemma4Scratch::new(gpu, &lowered_cfg, 1)
+                .map_err(|e| format!("gemma4 (lowered) scratch: {e:?}"))?;
+            lowered::init_scratch_constants(gpu, &scratch, lowered_cfg.full_head_dim)
+                .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
+            // q8 ring-buffered sliding KV (constant ~300 MB regardless of
+            // context length; wraps via pos % sliding_window) + asym3 full KV.
+            let kv_sliding = hipfire_runtime::llama::KvCache::new_gpu_q8_capped(
+                gpu, lowered_cfg.n_layers, lowered_cfg.sliding_n_kv_heads,
+                lowered_cfg.sliding_head_dim, max_seq, lowered_cfg.sliding_window,
+            ).map_err(|e| format!("gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"))?;
+            let kv_full = hipfire_runtime::llama::KvCache::new_gpu_asym3(
+                gpu, lowered_cfg.n_layers, lowered_cfg.full_n_kv_heads,
+                lowered_cfg.full_head_dim, max_seq,
+            ).map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?;
+            let eos_tok = tokenizer
+                .special_token_id("<end_of_turn>")
+                .or_else(|| tokenizer.special_token_id("<turn|>"))
+                .unwrap_or(106);
+            let chat_template = resolve_chat_template(&hfq, path);
+            eprintln!(
+                "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full asym3 KV)",
+                lowered_cfg.enable_moe_block, want_batched,
+            );
+            return Ok(LoadedModel {
+                arch_id: hfq.arch_id,
+                pp: 1,
+                ep: None,
+                pp_gpus: None,
+                pp_scratch_set: None,
+                pp_dn_la_to_device: None,
+                q35_config: None,
+                q35_weights: None,
+                q35_scratch: None,
+                kv_cache: None,
+                dn_state: None,
+                llama_config: None,
+                llama_weights: None,
+                llama_scratch: None,
+                llama_kv: None,
+                qwen2_config: None,
+                qwen2_weights: None,
+                qwen2_state: None,
+                deepseek4_config: None,
+                deepseek4_weights: None,
+                deepseek4_state: None,
+                deepseek4_pbs: None,
+                deepseek4_eos_tok: 0,
+                lfm2moe_config: None,
+                lfm2moe_weights: None,
+                lfm2moe_state: None,
+                lfm2moe_eos_tok: 0,
+                minimax_config: None,
+                minimax_weights: None,
+                minimax_state: None,
+                minimax_eos_tok: 0,
+                gemma4_config: None,
+                gemma4_weights: None,
+                gemma4_state: None,
+                gemma4_eos_tok: eos_tok,
+                mtp_mode: "auto".to_string(),
+                mtp_k: 3,
+                mtp_weights_present: false,
+                dots_ocr_config: None,
+                dots_ocr_weights: None,
+                vision_config: None,
+                vision_weights: None,
+                tokenizer: Some(tokenizer),
+                seq_pos: 0,
+                max_seq,
+                physical_cap: max_seq,
+                eviction: None,
+                kv_adaptive: None,
+                conversation_tokens: Vec::new(),
+                asst_turn_cache: AsstTurnCache::new_from_env(),
+                prefill_checkpoints: Vec::new(),
+                dflash_checkpoints: Vec::new(),
+                decoded_vocab: None,
+                model_path: path.to_string(),
+                dflash: None,
+                gemma4_eagle: None,
+                gemma4_lowered: Some(Gemma4LoweredState {
+                    config: lowered_cfg,
+                    weights,
+                    scratch,
+                    kv_sliding,
+                    kv_full,
+                    eos_tok,
+                }),
+                chat_template,
+            });
+        }
+
         let config = gemma4::config::Gemma4Config::from_hfq(&hfq)?;
         let weights = gemma4::gemma4::Gemma4Weights::load(&hfq, &config, gpu)?;
         // Size both KV caches (sliding hd=256 + full hd=512) to the
@@ -4209,6 +4362,7 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             gemma4_eagle,
+            gemma4_lowered: None,
             chat_template,
         });
     }
@@ -4328,6 +4482,7 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             gemma4_eagle: None,
+            gemma4_lowered: None,
             chat_template,
         });
     }
@@ -4793,6 +4948,7 @@ fn load_model(
             model_path: path.to_string(),
             dflash,
             gemma4_eagle: None,
+            gemma4_lowered: None,
             chat_template,
         })
     } else {
@@ -4873,6 +5029,7 @@ fn load_model(
             model_path: path.to_string(),
             dflash: None,
             gemma4_eagle: None,
+            gemma4_lowered: None,
             chat_template,
         })
     }
@@ -5039,6 +5196,7 @@ fn load_model_safetensors(
             model_path: path.to_string(),
             dflash: None,
             gemma4_eagle: None,
+            gemma4_lowered: None,
             chat_template,
         });
     }
@@ -5187,6 +5345,7 @@ fn load_model_safetensors(
         model_path: path.to_string(),
         dflash: None,
         gemma4_eagle: None,
+        gemma4_lowered: None,
         chat_template,
     })
 }
@@ -5434,6 +5593,7 @@ fn load_model_pp(
         model_path: path.to_string(),
         dflash: None,
         gemma4_eagle: None,
+        gemma4_lowered: None,
         chat_template: resolve_chat_template(&hfq, path),
     })
 }
@@ -5629,6 +5789,7 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
         model_path: path.to_string(),
         dflash: None,
         gemma4_eagle: None,
+        gemma4_lowered: None,
         chat_template,
     })
 }
@@ -5756,6 +5917,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         model_path: path.to_string(),
         dflash: None,
         gemma4_eagle: None,
+        gemma4_lowered: None,
         chat_template,
     })
 }
@@ -6314,6 +6476,16 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // Gemma4State — one free_gpu call handles all of it.
     if let Some(s) = m.gemma4_state {
         s.free_gpu(gpu);
+    }
+    // Gemma 4 lowered path (arch-13 MoE / opt-in batched prefill): weights +
+    // scratch + the two separate KV caches each expose explicit frees. The
+    // lowered tied lm_head aliases embed_tokens and is skipped inside its
+    // free_gpu, mirroring the eager path's tied-embedding rule.
+    if let Some(lw) = m.gemma4_lowered {
+        lw.kv_sliding.free_gpu(gpu);
+        lw.kv_full.free_gpu(gpu);
+        lw.scratch.free_gpu(gpu);
+        lw.weights.free_gpu(gpu);
     }
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
@@ -12839,6 +13011,18 @@ fn generate_gemma4(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
+    // Lowered (Kevin-fork) path: arch-13 MoE (26B-A4B) and the opt-in
+    // batched / WMMA dense prefill load populate `gemma4_lowered` instead of
+    // the eager `gemma4_state`. Delegate before the eager body (which assumes
+    // `gemma4_config` / `gemma4_state` are populated).
+    if m.gemma4_lowered.is_some() {
+        generate_gemma4_lowered(
+            m, gpu, stdout, id, prompt, system_prompt, temp, top_p, max_tokens,
+            max_think_tokens, tools, messages_history,
+        );
+        return;
+    }
+
     // v1 is non-thinking (see doc comment item 2); the think budget only
     // gates thinking-capable paths.
     let _ = max_think_tokens;
@@ -13251,6 +13435,274 @@ fn generate_gemma4(
 /// MTP, grammar-constrained decoding, tool-call parsing/execution, repeat
 /// penalty, multi-GPU, eviction/prefix-cache. Correctness first.
 #[allow(clippy::too_many_arguments)]
+/// Kevin-fork lowered (execute_steps / batched-prefill) Gemma 4 generate path.
+///
+/// Used for arch-13 MoE (26B-A4B) and the opt-in `HIPFIRE_BATCHED_PREFILL` /
+/// `HIPFIRE_WMMA_PREFILL` dense prefill path. Reads its config / weights /
+/// scratch / KV from `m.gemma4_lowered`; the eager `gemma4_*` fields are None
+/// on this path. Dispatched from `generate_gemma4` when `m.gemma4_lowered` is
+/// populated. No EAGLE spec-decode here (the drafter forces the eager path at
+/// load); sampling is host-side off the downloaded logits.
+#[allow(clippy::too_many_arguments)]
+fn generate_gemma4_lowered(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    let _ = (max_think_tokens, tools, messages_history);
+
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
+        return;
+    }
+    if m.gemma4_lowered.is_none() {
+        emit_error_with_id(stdout, id, "gemma4_lowered missing".to_string());
+        return;
+    }
+
+    // ── Prompt build ──
+    // Apply the gemma4 chat-template framing (matches templates/gemma-4-it.jinja
+    // generation prompt) when the four turn/channel special tokens are present in
+    // the tokenizer; otherwise fall back to raw tokenization (cannot regress).
+    // Framing:
+    //   <bos><|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>
+    // (optional `<|turn>system\n{system}<turn|>\n` before the user turn). The empty
+    // thought channel is pre-filled so the model emits the answer directly instead
+    // of improvising the `<|channel>thought…<channel|>` scaffold itself. `encode()`
+    // segments on the special tokens; BOS (2) is prepended manually (SPM-BPE doesn't).
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let framed_ok = ["<|turn>", "<turn|>", "<|channel>", "<channel|>"]
+        .iter()
+        .all(|t| tokenizer.special_token_id(t).is_some());
+    eprintln!("[gemma4 lowered chat] framed_ok={framed_ok}");
+    let prompt_ids: Vec<u32> = {
+        let mut ids = vec![2u32]; // BOS
+        if framed_ok {
+            let mut s = String::new();
+            if let Some(sys) = system_prompt {
+                if !sys.is_empty() {
+                    s.push_str(&format!("<|turn>system\n{sys}<turn|>\n"));
+                }
+            }
+            s.push_str(&format!(
+                "<|turn>user\n{prompt}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+            ));
+            ids.extend(tokenizer.encode(&s));
+        } else {
+            ids.extend(tokenizer.encode(prompt));
+        }
+        ids
+    };
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize".to_string());
+        return;
+    }
+    eprintln!("[gemma4 lowered prompt] {} tokens: {:?}", prompt_ids.len(), &prompt_ids[..prompt_ids.len().min(30)]);
+
+    // Context-length guard. Both the sliding and full KV caches are sized at
+    // `max_seq`; writing at pos >= max_seq would OOB. Refuse too-long prompts.
+    let cache_cap = m.gemma4_lowered.as_ref().unwrap().kv_full.max_seq;
+    if prompt_ids.len() >= cache_cap {
+        emit_error_with_id(stdout, id, format!(
+            "gemma4 prompt is {} tokens but max_seq is {}",
+            prompt_ids.len(), cache_cap,
+        ));
+        return;
+    }
+
+    let eos_tok = m.gemma4_lowered.as_ref().unwrap().eos_tok;
+    // Stop-token set. `config.eos_token` comes from `eos_token_id` parsed as a
+    // scalar, but gemma4's HF config sets it to a LIST `[1, 106]`: `<turn|>`
+    // (106, end-of-turn) is the real conversational stop and was being dropped,
+    // so decode looped `<turn|>` forever. Include `<eos>` plus the end-of-turn
+    // token (looked up by content, with the documented gemma4 id 106 as fallback).
+    let stop_set: Vec<u32> = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        let mut s = vec![eos_tok];
+        for name in ["<turn|>", "<end_of_turn>"] {
+            if let Some(tid) = tk.special_token_id(name) {
+                if !s.contains(&tid) { s.push(tid); }
+            }
+        }
+        if !s.contains(&106) { s.push(106); } // gemma4 <turn|> end-of-turn
+        s
+    };
+    let t0 = Instant::now();
+
+    // ── Prefill ──
+    // When HIPFIRE_WMMA_PREFILL=1 and prompt is long enough, use batched
+    // prefill (WMMA projections + per-token attention). Otherwise per-token.
+    {
+        let lw = m.gemma4_lowered.as_mut().unwrap();
+        let config = &lw.config;
+        let weights = &lw.weights;
+        let scratch = &lw.scratch;
+        let kv_sliding = &mut lw.kv_sliding;
+        let kv_full = &mut lw.kv_full;
+        // Batched prefill only for dense models (no MoE). MoE per-token
+        // expert loop in v2's apply_moe_branch_batched has a download_f32
+        // path that produces token attractors. Dense 12B is verified coherent.
+        let has_moe = weights.layers.iter().any(|lw| match lw {
+            lowered::LayerWeights::Sliding(l) => l.moe.is_some(),
+            lowered::LayerWeights::Full(l) => l.moe.is_some(),
+        });
+        // Chunking lets >128-token prompts use batched projections instead of the
+        // CPU-submission-bound per-token forward_scratch path. The scalar batched
+        // path is coherent at any length (verified on the 1279-token prompt). The
+        // WMMA path's F16 projections corrupt the KV cache over multi-chunk prefill
+        // → attractor (verified: scalar-chunked coherent, wmma-chunked not), so
+        // WMMA is restricted to single-chunk (≤max_prefill_batch); longer WMMA
+        // prompts fall back to per-token (coherent). Long-context speedup is via
+        // HIPFIRE_BATCHED_PREFILL=1 (scalar) until the F16 precision issue is fixed.
+        let wmma = lowered::wmma_prefill_enabled();
+        let single_chunk = prompt_ids.len() <= scratch.max_prefill_batch;
+        let use_batched = (wmma || lowered::batched_prefill_enabled())
+            && prompt_ids.len() >= 4
+            && !has_moe
+            && (single_chunk || !wmma);
+        if use_batched {
+            let chunk = scratch.max_prefill_batch.max(1);
+            let mut off = 0usize;
+            while off < prompt_ids.len() {
+                let end = (off + chunk).min(prompt_ids.len());
+                if let Err(e) = lowered::forward_prefill_batch(
+                    gpu, weights, config, &prompt_ids[off..end], off,
+                    kv_sliding, kv_full, scratch,
+                ) {
+                    emit_error_with_id(stdout, id,
+                        format!("gemma4 batched prefill failed at chunk [{off}..{end}]: {e:?}"));
+                    return;
+                }
+                off = end;
+            }
+        } else {
+            for (i, &tok) in prompt_ids.iter().enumerate() {
+                if let Err(e) = lowered::forward_scratch(
+                    gpu, weights, config, tok, i, kv_sliding, kv_full, scratch,
+                ) {
+                    emit_error_with_id(stdout, id, format!("gemma4 prefill failed at token {i}: {e:?}"));
+                    return;
+                }
+            }
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    m.seq_pos = prompt_ids.len();
+
+    // ── Decode loop ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+
+        // Download logits and sample
+        let next_tok = {
+            let scratch = &m.gemma4_lowered.as_ref().unwrap().scratch;
+            let logits = match gpu.download_f32(&scratch.logits) {
+                Ok(l) => l,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("logit download failed: {e:?}"));
+                    return;
+                }
+            };
+            deepseek4::sampling::sample_token(&logits, temp, 0, top_p, &mut rng)
+        };
+
+        if stop_set.contains(&next_tok) {
+            break;
+        }
+
+        // Emit token
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+            "tok": next_tok,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+
+        generated_count += 1;
+
+        // KV-cache capacity guard: the next forward writes KV at slot=`m.seq_pos`;
+        // forwarding at `pos >= max_seq` would write out of bounds. Stop cleanly
+        // here — the just-emitted token is still valid.
+        if m.seq_pos >= cache_cap {
+            break;
+        }
+
+        // Forward step for next token
+        {
+            let lw = m.gemma4_lowered.as_mut().unwrap();
+            let config = &lw.config;
+            let weights = &lw.weights;
+            let scratch = &lw.scratch;
+            let kv_sliding = &mut lw.kv_sliding;
+            let kv_full = &mut lw.kv_full;
+            let pos = m.seq_pos;
+            if let Err(e) = lowered::forward_scratch(
+                gpu, weights, config, next_tok, pos, kv_sliding, kv_full, scratch,
+            ) {
+                emit_error_with_id(stdout, id, format!("gemma4 decode failed: {e:?}"));
+                return;
+            }
+        }
+        m.seq_pos += 1;
+        m.conversation_tokens.push(next_tok);
+    }
+
+    // Measure prefill + decode separately for perf reporting.
+    let prefill_ms = decode_t0.duration_since(t0).as_millis();
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let _total_ms = t0.elapsed().as_millis().max(1);
+    let prefill_tok_s = if prefill_ms > 0 {
+        prompt_ids.len() as f64 / (prefill_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_ms > 0 {
+        generated_count as f64 / (decode_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    let elapsed = t0.elapsed().as_secs_f64();
+    let tok_s = if elapsed > 0.0 {
+        (prompt_ids.len() + generated_count) as f64 / elapsed
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        id, generated_count, tok_s,
+        prompt_ids.len(), prefill_ms, prefill_tok_s, decode_tok_s, prefill_ms
+    );
+    let _ = stdout.flush();
+}
+
 fn generate_minimax(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,

@@ -42,7 +42,9 @@ __global__ void attention_flash_asym3_tile_batched(
     int batch_offset,
     int block_start,                           // ignored when tree_bias == nullptr
     int block_cols,                            // ignored when tree_bias == nullptr
-    int v_mode                                 // 8 = Q8_0 V (only mode for asym3)
+    int v_mode,                                // 8 = Q8_0 V (only mode for asym3)
+    int window_size,                           // 0 = full causal
+    int cache_capacity                         // 0 = no wrap
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -57,6 +59,19 @@ __global__ void attention_flash_asym3_tile_batched(
     if (tile_start >= seq_len) return;
     const int tile_end = min(tile_start + tile_size, seq_len);
     const int tile_len = tile_end - tile_start;
+    const bool sliding = (window_size > 0) && !tree_mode;
+    const int t_lo = sliding ? max(0, seq_len - window_size) : 0;
+    if (sliding && tile_end <= t_lo) {
+        float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
+                            + tile_id * (2 + head_dim);
+        if (tid == 0) { p[0] = -1e30f; p[1] = 0.0f; }
+        const int d0_z = tid * 8;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            p[2 + d0_z + i] = 0.0f;
+        }
+        return;
+    }
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
@@ -104,24 +119,29 @@ __global__ void attention_flash_asym3_tile_batched(
     // Phase A: Q·K
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
-        const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
-        float cnorm = *(const float*)kb;
-        const unsigned char* base = kb + 4 + tid * 3;
-        unsigned int packed = (unsigned int)base[0]
-                            | ((unsigned int)base[1] << 8)
-                            | ((unsigned int)base[2] << 16);
-        float partial = mq0 * (cnorm * TURBO_C3_256[ packed        & 7])
-                      + mq1 * (cnorm * TURBO_C3_256[(packed >> 3)  & 7])
-                      + mq2 * (cnorm * TURBO_C3_256[(packed >> 6)  & 7])
-                      + mq3 * (cnorm * TURBO_C3_256[(packed >> 9)  & 7])
-                      + mq4 * (cnorm * TURBO_C3_256[(packed >> 12) & 7])
-                      + mq5 * (cnorm * TURBO_C3_256[(packed >> 15) & 7])
-                      + mq6 * (cnorm * TURBO_C3_256[(packed >> 18) & 7])
-                      + mq7 * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
+        const bool out_of_window = sliding && (t < t_lo);
+        float partial = 0.0f;
+        if (!out_of_window) {
+            const int k_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+            const unsigned char* kb = k_cache + (size_t)k_slot * k_bytes_per_pos + k_head_off;
+            float cnorm = *(const float*)kb;
+            const unsigned char* base = kb + 4 + tid * 3;
+            unsigned int packed = (unsigned int)base[0]
+                                | ((unsigned int)base[1] << 8)
+                                | ((unsigned int)base[2] << 16);
+            partial = mq0 * (cnorm * TURBO_C3_256[ packed        & 7])
+                    + mq1 * (cnorm * TURBO_C3_256[(packed >> 3)  & 7])
+                    + mq2 * (cnorm * TURBO_C3_256[(packed >> 6)  & 7])
+                    + mq3 * (cnorm * TURBO_C3_256[(packed >> 9)  & 7])
+                    + mq4 * (cnorm * TURBO_C3_256[(packed >> 12) & 7])
+                    + mq5 * (cnorm * TURBO_C3_256[(packed >> 15) & 7])
+                    + mq6 * (cnorm * TURBO_C3_256[(packed >> 18) & 7])
+                    + mq7 * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
+        }
         for (int off = 16; off > 0; off >>= 1)
             partial += __shfl_xor(partial, off);
         if (tid == 0) {
-            float s = partial * scale_attn;
+            float s = out_of_window ? -1e30f : (partial * scale_attn);
             // Tree-attention bias on in-block keys. -inf bias makes exp(s-max)
             // collapse to 0; the ancestor set always contains the root so at
             // least one finite in-block score exists for every query row.
@@ -158,7 +178,8 @@ __global__ void attention_flash_asym3_tile_batched(
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+        const int v_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
+        const unsigned char* vb = v_cache + (size_t)v_slot * v_row_stride;
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             const int d = d0 + i;

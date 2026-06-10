@@ -9479,6 +9479,9 @@ fn forward_prefill_chunk(
                     batch_size: n,
                     is_tree,
                     is_boundary: false,
+                    cache_capacity: 0, // identity (no wrapping)
+                    head_dim: config.head_dim,
+                    window_size: 0,
                 }).map_err(|e| HipError::new(0, &e.to_string()))?;
                 let io = AttnParams {
                     q: &pbs.fa_q_batch,
@@ -9494,7 +9497,9 @@ fn forward_prefill_chunk(
                     n_heads: config.n_heads,
                     n_kv_heads: config.n_kv_heads,
                     head_dim: config.head_dim,
+                    window_size: 0,
                     physical_cap: kv_cache.physical_cap,
+                    cache_capacity: 0, // identity (no wrapping)
                     batch_size: n,
                     max_ctx_len,
                     flash_partials: Some(&s.flash_partials),
@@ -10976,6 +10981,9 @@ fn forward_prefill_chunk(
                     batch_size: n,
                     is_tree,
                     is_boundary: false,
+                    cache_capacity: 0, // identity (no wrapping)
+                    head_dim: config.head_dim,
+                    window_size: 0,
                 }).map_err(|e| HipError::new(0, &e.to_string()))?;
                 let io = AttnParams {
                     q: &pbs.fa_q_batch,
@@ -10991,7 +10999,9 @@ fn forward_prefill_chunk(
                     n_heads: config.n_heads,
                     n_kv_heads: config.n_kv_heads,
                     head_dim: config.head_dim,
+                    window_size: 0,
                     physical_cap: kv_cache.physical_cap,
+                    cache_capacity: 0, // identity (no wrapping)
                     batch_size: n,
                     max_ctx_len,
                     flash_partials: Some(&s.flash_partials),
@@ -12531,7 +12541,10 @@ fn kv_cache_attention_dispatch(
         capture_mode: gpu.graphs.capture_mode,
         batch_size: 1,
         is_tree: false,
-        is_boundary: false, // TODO: boundary producer not yet populated
+        is_boundary: false,
+        cache_capacity: 0, // identity (no wrapping) // TODO: boundary producer not yet populated
+        head_dim: config.head_dim,
+        window_size: 0,
     }).map_err(|e| HipError::new(0, &e.to_string()))?;
     let io = AttnParams {
         q: &s.fa_q,
@@ -12547,7 +12560,9 @@ fn kv_cache_attention_dispatch(
         n_heads: config.n_heads,
         n_kv_heads: config.n_kv_heads,
         head_dim: config.head_dim,
+        window_size: 0,
         physical_cap: kv_cache.physical_cap,
+                    cache_capacity: 0, // identity (no wrapping)
         batch_size: 1,
         max_ctx_len: 0,
         flash_partials: Some(&s.flash_partials),
@@ -13853,6 +13868,7 @@ fn forward_scratch_layers_multi(
                                 config.head_dim,
                                 kv_cache.physical_cap,
                                 &s.flash_partials,
+                                0, // kv_window: 0 = full causal (qwen3.5 asym3)
                             )?;
                         }
                     } else if kv_cache.quant_asym2 {
@@ -14461,6 +14477,7 @@ fn forward_scratch_layers_multi(
                                 config.head_dim,
                                 kv_cache.physical_cap,
                                 &s.flash_partials,
+                                0, // kv_window: 0 = full causal (qwen3.5 asym3)
                             )?;
                         }
                     } else if kv_cache.quant_asym2 {

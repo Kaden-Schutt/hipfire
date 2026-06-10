@@ -23,13 +23,15 @@ extern "C" __global__ void kv_cache_write_asym_k_givens4(
     const int* __restrict__ pos_buf,
     const float* __restrict__ cos_theta,
     const float* __restrict__ sin_theta,
-    int n_kv_heads, int head_dim
+    int n_kv_heads, int head_dim,
+    int cache_capacity   // ring-buffer size; 0 = no wrap
 ) {
     const int h = blockIdx.x;
     if (h >= n_kv_heads) return;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
     const int pos = pos_buf[0];
+    const int slot = (cache_capacity > 0) ? (pos % cache_capacity) : pos;
 
     const int bytes_per_head = 4 + head_dim / 2;
     const int bytes_per_pos = n_kv_heads * bytes_per_head;
@@ -40,7 +42,7 @@ extern "C" __global__ void kv_cache_write_asym_k_givens4(
     float* scratch = smem + head_dim;
 
     const float* src = k_src + h * head_dim;
-    unsigned char* out = k_dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+    unsigned char* out = k_dst + (size_t)slot * bytes_per_pos + h * bytes_per_head;
 
     for (int d = tid; d < head_dim; d += nthreads) x[d] = src[d];
     __syncthreads();

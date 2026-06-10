@@ -15,7 +15,11 @@ extern "C" __global__ void attention_flash_partial(
     int head_dim,
     int max_seq,
     float scale,
-    int chunk_size
+    int chunk_size,
+    // Sliding-window lookback (Gemma 4 sliding layers). 0 = full causal.
+    // When > 0, only keys in [seq_len - kv_window, seq_len) contribute;
+    // chunks entirely older than that are skipped.
+    int kv_window
 ) {
     const int h = blockIdx.x;
     const int chunk_id = blockIdx.y;
@@ -26,10 +30,27 @@ extern "C" __global__ void attention_flash_partial(
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
 
-    const int chunk_start = chunk_id * chunk_size;
-    int chunk_end = chunk_start + chunk_size;
+    // Compute the effective start of the visible window.
+    const int kv_start = (kv_window > 0 && seq_len > kv_window)
+                         ? (seq_len - kv_window) : 0;
+
+    const int chunk_start_raw = chunk_id * chunk_size;
+    int chunk_end = chunk_start_raw + chunk_size;
     if (chunk_end > seq_len) chunk_end = seq_len;
-    if (chunk_start >= seq_len) return;
+    if (chunk_start_raw >= seq_len) return;
+    // Clamp to the in-window region.
+    const int chunk_start = (chunk_start_raw > kv_start) ? chunk_start_raw : kv_start;
+    if (chunk_start >= chunk_end) {
+        // Chunk fully outside the window — emit an empty partial.
+        if (tid == 0) {
+            int n_chunks = gridDim.y;
+            int partial_stride = 2 + head_dim;
+            float* p0 = partials + (h * n_chunks + chunk_id) * partial_stride;
+            p0[0] = -1e30f;
+            p0[1] = 0.0f;
+        }
+        return;
+    }
     const int chunk_len = chunk_end - chunk_start;
 
     const float* q_head = q + h * head_dim;
