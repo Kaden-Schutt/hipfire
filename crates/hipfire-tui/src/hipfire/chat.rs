@@ -4,7 +4,11 @@
 
 use std::{
     io::{BufRead, BufReader},
-    sync::mpsc::Sender,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+        Arc,
+    },
     time::Duration,
 };
 
@@ -23,6 +27,7 @@ pub enum ChatEvent {
     Delta(String),
     Status(String),
     Done,
+    Aborted,
     Error(String),
 }
 
@@ -32,8 +37,9 @@ pub fn stream_chat(
     model: &str,
     messages: &[ChatMessage],
     tx: Sender<ChatEvent>,
+    abort: Arc<AtomicBool>,
 ) -> Result<()> {
-    let result = stream_chat_inner(host, port, model, messages, &tx);
+    let result = stream_chat_inner(host, port, model, messages, &tx, &abort);
     if let Err(err) = result {
         let _ = tx.send(ChatEvent::Error(err.to_string()));
     }
@@ -46,6 +52,7 @@ fn stream_chat_inner(
     model: &str,
     messages: &[ChatMessage],
     tx: &Sender<ChatEvent>,
+    abort: &AtomicBool,
 ) -> Result<()> {
     let url = format!("http://{host}:{port}/v1/chat/completions");
     let agent = ureq::AgentBuilder::new()
@@ -75,6 +82,12 @@ fn stream_chat_inner(
     let reader = BufReader::new(resp.into_reader());
     let _ = tx.send(ChatEvent::Status("connected; waiting for tokens".into()));
     for line in reader.lines() {
+        // Checked once per SSE line: dropping the reader closes the
+        // connection, which the daemon treats as a client cancel.
+        if abort.load(Ordering::Relaxed) {
+            let _ = tx.send(ChatEvent::Aborted);
+            return Ok(());
+        }
         let line = line?;
         let trimmed = line.trim();
         if !trimmed.starts_with("data:") {

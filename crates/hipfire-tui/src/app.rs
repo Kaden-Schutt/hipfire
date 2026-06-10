@@ -3,7 +3,11 @@
 // hipfire - see LICENSE and NOTICE in the project root.
 
 use std::{
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+        Arc,
+    },
     thread,
 };
 
@@ -235,6 +239,8 @@ impl App {
 
                 let (tx, rx) = mpsc::channel();
                 self.chat.rx = Some(rx);
+                self.chat.abort = Arc::new(AtomicBool::new(false));
+                let abort = Arc::clone(&self.chat.abort);
                 let host = self.config.probe_host();
                 let port = self.config.port;
                 let model = self.active_model.clone();
@@ -245,7 +251,7 @@ impl App {
                     }
                 }
                 thread::spawn(move || {
-                    let _ = stream_chat(&host, port, &model, &messages, tx);
+                    let _ = stream_chat(&host, port, &model, &messages, tx, abort);
                 });
             }
             KeyCode::Backspace => {
@@ -419,6 +425,11 @@ impl App {
                         self.chat.sending = false;
                         finished = true;
                     }
+                    ChatEvent::Aborted => {
+                        self.chat.status = "stream aborted; partial reply kept".into();
+                        self.chat.sending = false;
+                        finished = true;
+                    }
                     ChatEvent::Error(err) => {
                         self.chat.status = format!("error: {err}");
                         self.chat.sending = false;
@@ -487,6 +498,7 @@ pub struct ChatState {
     pub sending: bool,
     pub scroll: u16,
     rx: Option<Receiver<ChatEvent>>,
+    abort: Arc<AtomicBool>,
     input_focused: bool,
 }
 
@@ -499,6 +511,7 @@ impl Default for ChatState {
             sending: false,
             scroll: 0,
             rx: None,
+            abort: Arc::new(AtomicBool::new(false)),
             input_focused: true,
         }
     }
@@ -515,5 +528,19 @@ impl ChatState {
 
     pub fn is_input_focused(&self) -> bool {
         self.input_focused
+    }
+
+    /// Ask the streaming thread to stop at the next SSE line. The UI flips
+    /// to non-sending when the thread acknowledges with ChatEvent::Aborted.
+    pub fn request_abort(&mut self) {
+        if self.sending {
+            self.abort.store(true, Ordering::Relaxed);
+            self.status = "aborting stream...".into();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn abort_requested(&self) -> bool {
+        self.abort.load(Ordering::Relaxed)
     }
 }

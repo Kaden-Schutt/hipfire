@@ -58,6 +58,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
             match event::read()? {
                 Event::Key(key) => {
                     if handle_key(&mut app, key) {
+                        // Quit clean: stop any in-flight stream before the
+                        // terminal is restored.
+                        app.chat.request_abort();
                         break;
                     }
                 }
@@ -72,11 +75,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
 
 fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        if app.chat.sending {
-            app.chat.status =
-                "stream is still running; wait for this spike build to finish it".into();
-            return false;
-        }
         return true;
     }
 
@@ -84,7 +82,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('q') if !app.text_input_active() => return true,
         KeyCode::Esc => {
             if app.chat.sending {
-                app.chat.status = "stream abort is not wired in prototype 1".into();
+                app.chat.request_abort();
             } else if app.text_input_active() {
                 app.dismiss_text_input();
             } else {
@@ -212,6 +210,32 @@ mod tests {
         app.settings_selected = app.config.easy_rows().len() - 1;
         assert!(!handle_key(&mut app, key(KeyCode::Enter)));
         assert!(app.settings_edit.is_none());
+    }
+
+    #[test]
+    fn esc_aborts_stream_and_q_quits_while_sending() {
+        let mut app = App::test_app();
+        app.tab = Tab::Chat;
+        app.chat.sending = true;
+        assert!(!app.chat.abort_requested());
+        // Esc requests the abort instead of blurring/quitting
+        assert!(!handle_key(&mut app, key(KeyCode::Esc)));
+        assert!(app.chat.abort_requested());
+        assert!(app.chat.sending, "sending clears only when the thread acks");
+        // q quits even though the chat input was focused (input is inert
+        // while streaming)
+        assert!(handle_key(&mut app, key(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_mid_stream() {
+        let mut app = App::test_app();
+        app.tab = Tab::Chat;
+        app.chat.sending = true;
+        assert!(handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        ));
     }
 
     #[test]
