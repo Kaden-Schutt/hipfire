@@ -99,12 +99,34 @@ pub fn run_cli(cli: &CliInvocation, args: &[String]) -> Result<String, String> {
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let msg = if stderr.is_empty() { stdout } else { stderr };
-    Err(msg
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("command failed with no output")
-        .trim()
-        .to_string())
+    Err(strip_ansi(
+        msg.lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("command failed with no output")
+            .trim(),
+    ))
+}
+
+/// The CLI colors its error output; ANSI escapes would render as garbage in
+/// the ratatui status line, so strip CSI sequences before surfacing.
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for follow in chars.by_ref() {
+                    if follow.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -172,6 +194,19 @@ mod tests {
         let bare = parse_cli_override("hipfire").unwrap();
         assert_eq!(bare.program, "hipfire");
         assert!(bare.leading_args.is_empty());
+    }
+
+    #[test]
+    fn ansi_color_codes_are_stripped_from_cli_errors() {
+        let cli = CliInvocation {
+            program: "sh".into(),
+            leading_args: vec![
+                "-c".into(),
+                "printf '\\033[0m\\033[31mkv_cache must be valid\\033[0m\\n' >&2; exit 1".into(),
+            ],
+            label: "test-sh".into(),
+        };
+        assert_eq!(run_cli(&cli, &[]).unwrap_err(), "kv_cache must be valid");
     }
 
     #[test]
