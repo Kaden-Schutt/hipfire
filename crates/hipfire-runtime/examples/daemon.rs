@@ -1602,6 +1602,7 @@ mod generate_batch_prefill_tests {
             head_dim: 8,
             rope_theta: 1_000_000.0,
             partial_rotary_factor: 0.25,
+            attn_output_gate: true,
             is_vl_text: false,
             mrope_interleaved: false,
             mrope_section: [0, 0, 0],

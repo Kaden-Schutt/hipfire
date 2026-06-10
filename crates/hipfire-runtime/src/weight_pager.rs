@@ -46,6 +46,7 @@ use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::hfq::HfqFile;
+use crate::hfq_modules::{HfqModuleKind, HfqModuleRecord};
 
 const DIRECT_IO_ALIGN: usize = 4096;
 
@@ -118,6 +119,12 @@ pub enum NormKind {
     Ffn,
     /// Final norm before LM head.
     Final,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExpertModuleKey {
+    pub layer: u16,
+    pub expert: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -643,6 +650,14 @@ pub struct WeightPager {
     /// Populated at registration time when the model loader walks the HFQ
     /// tensor index. Stable across the run.
     catalog: HashMap<WeightId, ByteRange>,
+    /// Per-routed-expert module byte ranges. HFQM v2 uses this path so one
+    /// cold load brings in `gate_up_proj` and `down_proj` as a contiguous slab.
+    module_catalog: HashMap<ExpertModuleKey, HfqModuleRecord>,
+    /// Resident routed expert modules. Separate from `resident` so module LRU
+    /// frees whole expert slabs instead of individual tensor slices.
+    resident_modules: HashMap<ExpertModuleKey, ResidentModule>,
+    module_lru: VecDeque<ExpertModuleKey>,
+    module_stats: ModulePagerStats,
     /// Transport implementation (v0.1: pread + H2D, future: io_uring + P2P).
     transport: Box<dyn Transport>,
     /// Construction-time config.
@@ -684,6 +699,23 @@ struct Resident {
     bytes: u64,
 }
 
+struct ResidentModule {
+    tensor: GpuTensor,
+    bytes: u64,
+    gate_up_ptr: u64,
+    down_ptr: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModulePagerStats {
+    pub registered_modules: usize,
+    pub resident_modules: usize,
+    pub resident_module_bytes: u64,
+    pub module_cache_hits: u64,
+    pub module_cold_loads: u64,
+    pub module_evictions: u64,
+}
+
 impl WeightPager {
     pub fn new(transport: Box<dyn Transport>, config: PagerConfig) -> Self {
         Self {
@@ -691,6 +723,10 @@ impl WeightPager {
             lru: VecDeque::new(),
             vram_used_bytes: 0,
             catalog: HashMap::new(),
+            module_catalog: HashMap::new(),
+            resident_modules: HashMap::new(),
+            module_lru: VecDeque::new(),
+            module_stats: ModulePagerStats::default(),
             transport,
             config,
         }
@@ -741,9 +777,73 @@ impl WeightPager {
         self.catalog.insert(id, range);
     }
 
+    /// Register one routed expert module from an HFQM v2 module table.
+    /// Non-routed module kinds are deliberately ignored by this pager; the
+    /// regular model/slab loader owns always-resident weights.
+    pub fn register_expert_module(
+        &mut self,
+        module: HfqModuleRecord,
+    ) -> Result<(), WeightPagerError> {
+        if module.kind != HfqModuleKind::RoutedExpert {
+            return Err(WeightPagerError::InvalidModule(format!(
+                "module {} has kind {:?}, expected routed_expert",
+                module.module_id, module.kind
+            )));
+        }
+        let layer = module.layer.ok_or_else(|| {
+            WeightPagerError::InvalidModule(format!("module {} missing layer", module.module_id))
+        })?;
+        let expert = module.expert.ok_or_else(|| {
+            WeightPagerError::InvalidModule(format!("module {} missing expert", module.module_id))
+        })?;
+        if find_module_tensor_rel_ptr(&module, "gate_up_proj").is_none()
+            || find_module_tensor_rel_ptr(&module, "down_proj").is_none()
+        {
+            return Err(WeightPagerError::InvalidModule(format!(
+                "module {} missing gate_up_proj or down_proj tensor",
+                module.module_id
+            )));
+        }
+        self.module_catalog
+            .insert(ExpertModuleKey { layer, expert }, module);
+        self.module_stats.registered_modules = self.module_catalog.len();
+        Ok(())
+    }
+
+    pub fn register_expert_modules<I>(&mut self, modules: I) -> Result<usize, WeightPagerError>
+    where
+        I: IntoIterator<Item = HfqModuleRecord>,
+    {
+        let mut n = 0usize;
+        for module in modules {
+            if module.kind == HfqModuleKind::RoutedExpert {
+                self.register_expert_module(module)?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// Number of registered weights. Useful for diagnostics.
     pub fn registered_count(&self) -> usize {
         self.catalog.len()
+    }
+
+    pub fn registered_module_count(&self) -> usize {
+        self.module_catalog.len()
+    }
+
+    pub fn resident_module_count(&self) -> usize {
+        self.resident_modules.len()
+    }
+
+    pub fn module_stats(&self) -> ModulePagerStats {
+        ModulePagerStats {
+            registered_modules: self.module_catalog.len(),
+            resident_modules: self.resident_modules.len(),
+            resident_module_bytes: self.resident_modules.values().map(|m| m.bytes).sum(),
+            ..self.module_stats
+        }
     }
 
     /// Returns true if `id` is currently in VRAM.
@@ -805,6 +905,62 @@ impl WeightPager {
         Ok(())
     }
 
+    pub fn ensure_expert_module_resident(
+        &mut self,
+        key: ExpertModuleKey,
+        gpu: &mut Gpu,
+    ) -> Result<(), WeightPagerError> {
+        if self.resident_modules.contains_key(&key) {
+            self.touch_module_lru(key);
+            self.module_stats.module_cache_hits =
+                self.module_stats.module_cache_hits.saturating_add(1);
+            return Ok(());
+        }
+        let module = self
+            .module_catalog
+            .get(&key)
+            .cloned()
+            .ok_or(WeightPagerError::ModuleNotRegistered(key))?;
+        let need = module.data_size as u64;
+        self.would_fit(need)?;
+        if self.config.vram_budget_bytes != u64::MAX
+            && self.vram_used_bytes.saturating_add(need) > self.config.vram_budget_bytes
+        {
+            self.evict_lru_until(need, gpu)?;
+        }
+        let (tensor, _handle) = self
+            .transport
+            .fetch(module.data_offset, module.data_size, gpu)?;
+        let base = tensor.buf.as_ptr() as usize;
+        let gate_up_rel = find_module_tensor_rel_ptr(&module, "gate_up_proj")
+            .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
+        let down_rel = find_module_tensor_rel_ptr(&module, "down_proj")
+            .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
+        self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
+        self.resident_modules.insert(
+            key,
+            ResidentModule {
+                tensor,
+                bytes: need,
+                gate_up_ptr: base.saturating_add(gate_up_rel) as u64,
+                down_ptr: base.saturating_add(down_rel) as u64,
+            },
+        );
+        self.module_lru.push_back(key);
+        self.module_stats.module_cold_loads = self.module_stats.module_cold_loads.saturating_add(1);
+        if self.config.trace {
+            eprintln!(
+                "[weight_pager] cold-load module layer={} expert={} ({} bytes) — {} modules resident, {} bytes used",
+                key.layer,
+                key.expert,
+                module.data_size,
+                self.resident_modules.len(),
+                self.vram_used_bytes
+            );
+        }
+        Ok(())
+    }
+
     /// Patch the device-side `expert_*_ptrs` indirection table so the indexed
     /// MoE GEMV kernels read the currently-resident buffer pointers for the
     /// active experts in `top_indices` for `layer`.
@@ -857,6 +1013,34 @@ impl WeightPager {
         Ok(())
     }
 
+    pub fn patch_expert_module_ptr_table(
+        &self,
+        layer: u16,
+        top_indices: &[u16],
+        gate_up_ptrs: &GpuTensor,
+        down_ptrs: &GpuTensor,
+        gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        for &expert in top_indices {
+            let key = ExpertModuleKey { layer, expert };
+            let module = self.resident_modules.get(&key).unwrap_or_else(|| {
+                panic!(
+                    "patch_expert_module_ptr_table: layer={} expert={} not resident",
+                    layer, expert
+                )
+            });
+            let offset = (expert as usize) * 8;
+            gpu.hip.memcpy_htod_offset(
+                &gate_up_ptrs.buf,
+                offset,
+                &module.gate_up_ptr.to_le_bytes(),
+            )?;
+            gpu.hip
+                .memcpy_htod_offset(&down_ptrs.buf, offset, &module.down_ptr.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
     /// Evict residents from the LRU front (least-recently-used) until at
     /// least `need_bytes` would fit under the budget. Returns
     /// [`WeightPagerError::BudgetExhausted`] if nothing more can be evicted
@@ -880,15 +1064,8 @@ impl WeightPager {
         let budget = self.config.vram_budget_bytes;
         // How much we need to free so that vram_used + need <= budget.
         let target_used = budget.saturating_sub(need_bytes);
-        while self.vram_used_bytes > target_used {
-            let id = self
-                .lru
-                .pop_front()
-                .ok_or(WeightPagerError::BudgetExhausted {
-                    need_bytes,
-                    in_use: self.vram_used_bytes,
-                    budget,
-                })?;
+        while self.vram_used_bytes > target_used && !self.lru.is_empty() {
+            let id = self.lru.pop_front().unwrap();
             if let Some(r) = self.resident.remove(&id) {
                 self.vram_used_bytes = self.vram_used_bytes.saturating_sub(r.bytes);
                 let _ = gpu.free_tensor(r.tensor);
@@ -911,6 +1088,37 @@ impl WeightPager {
                 );
             }
         }
+        while self.vram_used_bytes > target_used {
+            let key = self
+                .module_lru
+                .pop_front()
+                .ok_or(WeightPagerError::BudgetExhausted {
+                    need_bytes,
+                    in_use: self.vram_used_bytes,
+                    budget,
+                })?;
+            if let Some(r) = self.resident_modules.remove(&key) {
+                self.vram_used_bytes = self.vram_used_bytes.saturating_sub(r.bytes);
+                let _ = gpu.free_tensor(r.tensor);
+                self.module_stats.module_evictions =
+                    self.module_stats.module_evictions.saturating_add(1);
+                if self.config.trace {
+                    eprintln!(
+                        "[weight_pager] evict module layer={} expert={} ({} bytes) — {} modules resident, {} used",
+                        key.layer,
+                        key.expert,
+                        r.bytes,
+                        self.resident_modules.len(),
+                        self.vram_used_bytes
+                    );
+                }
+            } else {
+                debug_assert!(
+                    false,
+                    "weight_pager: module LRU contained {key:?} but residency map did not"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -921,7 +1129,11 @@ impl WeightPager {
         for (_id, r) in self.resident.drain() {
             let _ = gpu.free_tensor(r.tensor);
         }
+        for (_key, r) in self.resident_modules.drain() {
+            let _ = gpu.free_tensor(r.tensor);
+        }
         self.lru.clear();
+        self.module_lru.clear();
         self.vram_used_bytes = 0;
     }
 
@@ -950,6 +1162,13 @@ impl WeightPager {
         if let Some(pos) = self.lru.iter().position(|x| *x == id) {
             self.lru.remove(pos);
             self.lru.push_back(id);
+        }
+    }
+
+    pub fn touch_module_lru(&mut self, key: ExpertModuleKey) {
+        if let Some(pos) = self.module_lru.iter().position(|x| *x == key) {
+            self.module_lru.remove(pos);
+            self.module_lru.push_back(key);
         }
     }
 
@@ -988,6 +1207,10 @@ impl WeightPager {
 pub enum WeightPagerError {
     /// Weight wasn't registered with the pager. Loader bug.
     NotRegistered(WeightId),
+    /// Expert module wasn't registered with the pager. Loader/catalog bug.
+    ModuleNotRegistered(ExpertModuleKey),
+    /// Module table entry is malformed for routed expert paging.
+    InvalidModule(String),
     /// Hipfire HIP error (transfer / alloc failed).
     Hip(hip_bridge::HipError),
     /// Eviction couldn't free enough room — budget too small for the
@@ -1006,6 +1229,12 @@ impl std::fmt::Display for WeightPagerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotRegistered(id) => write!(f, "weight not registered: {id:?}"),
+            Self::ModuleNotRegistered(key) => write!(
+                f,
+                "expert module not registered: layer={} expert={}",
+                key.layer, key.expert
+            ),
+            Self::InvalidModule(msg) => write!(f, "invalid expert module: {msg}"),
             Self::Hip(e) => write!(f, "hip error: {e}"),
             Self::BudgetExhausted {
                 need_bytes,
@@ -1028,6 +1257,14 @@ impl From<hip_bridge::HipError> for WeightPagerError {
     fn from(e: hip_bridge::HipError) -> Self {
         Self::Hip(e)
     }
+}
+
+fn find_module_tensor_rel_ptr(module: &HfqModuleRecord, role: &str) -> Option<usize> {
+    module
+        .tensors
+        .iter()
+        .find(|t| t.name.contains(role))
+        .map(|t| t.rel_offset)
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,6 +1364,81 @@ mod tests {
         assert!(!pager.is_resident(id));
         assert!(pager.get(id).is_none());
         // ensure_resident requires a real Gpu — exercised in integration tests.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn routed_module(layer: u16, expert: u16) -> HfqModuleRecord {
+        HfqModuleRecord {
+            module_id: format!("layers.{layer}.experts.{expert}"),
+            kind: HfqModuleKind::RoutedExpert,
+            layer: Some(layer),
+            expert: Some(expert),
+            placement_policy: Some("lazy_lru".to_string()),
+            data_offset: 4096,
+            data_size: 64,
+            tensors: vec![
+                crate::hfq_modules::HfqModuleTensor {
+                    name: format!("model.layers.{layer}.mlp.experts.{expert}.gate_up_proj.weight"),
+                    quant_type: 15,
+                    shape: vec![8, 4],
+                    group_size: 256,
+                    rel_offset: 0,
+                    data_size: 32,
+                },
+                crate::hfq_modules::HfqModuleTensor {
+                    name: format!("model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"),
+                    quant_type: 15,
+                    shape: vec![4, 4],
+                    group_size: 256,
+                    rel_offset: 32,
+                    data_size: 32,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn register_expert_modules_tracks_catalog_stats() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "hipfire-pager-module-reg-{}.bin",
+            std::process::id()
+        ));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let mut pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+        let n = pager
+            .register_expert_modules([routed_module(2, 7), routed_module(2, 8)])
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(pager.registered_module_count(), 2);
+        let stats = pager.module_stats();
+        assert_eq!(stats.registered_modules, 2);
+        assert_eq!(stats.resident_modules, 0);
+        assert_eq!(stats.resident_module_bytes, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn register_expert_module_rejects_missing_down_tensor() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "hipfire-pager-module-bad-{}.bin",
+            std::process::id()
+        ));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let mut pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+        let mut module = routed_module(0, 0);
+        module.tensors.retain(|t| !t.name.contains("down_proj"));
+        assert!(matches!(
+            pager.register_expert_module(module),
+            Err(WeightPagerError::InvalidModule(_))
+        ));
         let _ = std::fs::remove_file(&path);
     }
 

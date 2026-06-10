@@ -4,6 +4,7 @@
 
 //! HFQ (.hfq) file loader for hipfire-native Q4_F16 quantized models.
 
+use crate::hfq_modules::{parse_module_table, validate_modules, HfqModuleRecord};
 use crate::llama::{
     f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
 };
@@ -325,6 +326,7 @@ fn fadvise_dontneed(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
 #[cfg(not(unix))]
 fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
 
+#[derive(Debug, Clone)]
 pub struct HfqTensorInfo {
     pub name: String,
     pub quant_type: u8, // 0=Q4F16G64, 1=F16, 2=F32
@@ -357,11 +359,73 @@ pub struct HfqFile {
     /// can't be evicted while the mapping exists (FADV_DONTNEED is ignored
     /// for mmap'd regions per Linux kernel docs).
     pread_buf: std::cell::RefCell<Vec<u8>>,
+    pub version: u32,
+    modules: Vec<HfqModuleRecord>,
 }
 
 impl HfqFile {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         Self::open_at_offset(path, 0)
+    }
+
+    /// Open only the HFQM header, metadata, and tensor/module indexes.
+    ///
+    /// Unlike [`Self::open`], this does not mmap the full file. It is intended
+    /// for large-artifact probes and repack/catalog tools that must prove they
+    /// can inspect a 100GiB+ model without touching tensor payload pages.
+    pub fn open_index_only(path: &Path) -> std::io::Result<Self> {
+        Self::open_index_only_at_offset(path, 0)
+    }
+
+    pub fn open_index_only_at_offset(path: &Path, base_offset: u64) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let file_len = file.metadata()?.len() as usize;
+        let mut header = [0u8; 32];
+        read_exact_at_portable(&file, &mut header, base_offset)?;
+        if &header[0..4] != HFQM_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("not an HFQM container at offset {base_offset}"),
+            ));
+        }
+        let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let arch_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
+        let n_tensors = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        let base = base_offset as usize;
+        let metadata_offset =
+            u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize + base;
+        let data_offset = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize + base;
+        if metadata_offset > data_offset || data_offset > file_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid HFQM offsets metadata={metadata_offset} data={data_offset}"),
+            ));
+        }
+        let mut meta_index = vec![0u8; data_offset - metadata_offset];
+        read_exact_at_portable(&file, &mut meta_index, metadata_offset as u64)?;
+        let (metadata_json, tensors, tensor_map) = parse_hfqm_meta_index(
+            &meta_index,
+            metadata_offset,
+            data_offset,
+            n_tensors,
+            file_len,
+        )?;
+        let modules = parse_module_table(&metadata_json)?.unwrap_or_default();
+        if !modules.is_empty() {
+            validate_modules(&modules, file_len)?;
+        }
+        Ok(Self {
+            _file: file,
+            path: path.to_path_buf(),
+            mmap: None,
+            arch_id,
+            metadata_json,
+            tensors,
+            tensor_map,
+            pread_buf: std::cell::RefCell::new(Vec::new()),
+            version,
+            modules,
+        })
     }
 
     /// Open an HFQM container that lives inside a larger file, starting at
@@ -398,7 +462,7 @@ impl HfqFile {
         // Parse header (32 bytes) at base offset.
         let magic = &mmap[base..base + 4];
         assert_eq!(magic, b"HFQM", "Not an HFQ container at offset {base}");
-        let _version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
+        let version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
         let arch_id = u32::from_le_bytes(mmap[base + 8..base + 12].try_into().unwrap());
         let n_tensors = u32::from_le_bytes(mmap[base + 12..base + 16].try_into().unwrap()) as usize;
         // Stored offsets are relative to the container start; rebase to absolute
@@ -496,6 +560,11 @@ impl HfqFile {
             cumulative_offset += data_size;
         }
 
+        let modules = parse_module_table(&metadata_json)?.unwrap_or_default();
+        if !modules.is_empty() {
+            validate_modules(&modules, mmap.len())?;
+        }
+
         Ok(Self {
             _file: file,
             path: path.to_path_buf(),
@@ -505,6 +574,8 @@ impl HfqFile {
             tensors,
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
+            version,
+            modules,
         })
     }
 
@@ -769,6 +840,123 @@ impl HfqFile {
     /// `tensor_data_vec`.
     pub fn tensors(&self) -> &[HfqTensorInfo] {
         &self.tensors
+    }
+
+    pub fn modules(&self) -> &[HfqModuleRecord] {
+        &self.modules
+    }
+}
+
+fn parse_hfqm_meta_index(
+    meta_index: &[u8],
+    metadata_offset: usize,
+    data_offset: usize,
+    n_tensors: usize,
+    file_len: usize,
+) -> std::io::Result<(String, Vec<HfqTensorInfo>, HashMap<String, usize>)> {
+    let json_end = json_blob_end(meta_index).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HFQM metadata JSON did not end",
+        )
+    })?;
+    let metadata_json = String::from_utf8_lossy(&meta_index[..json_end]).to_string();
+    let mut pos = json_end;
+    if pos + 4 > meta_index.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "HFQM index missing tensor count",
+        ));
+    }
+    let idx_n = u32::from_le_bytes(meta_index[pos..pos + 4].try_into().unwrap()) as usize;
+    if idx_n != n_tensors {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("HFQM index count {idx_n} != header count {n_tensors}"),
+        ));
+    }
+    pos += 4;
+
+    let mut tensors = Vec::with_capacity(n_tensors);
+    let mut tensor_map = HashMap::new();
+    let mut cumulative_offset = data_offset;
+    for i in 0..n_tensors {
+        if pos + 2 > meta_index.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "HFQM index truncated at name length",
+            ));
+        }
+        let name_len = u16::from_le_bytes(meta_index[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        if pos + name_len + 2 > meta_index.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "HFQM index truncated at name/shape header",
+            ));
+        }
+        let name = String::from_utf8_lossy(&meta_index[pos..pos + name_len]).to_string();
+        pos += name_len;
+        let quant_type = meta_index[pos];
+        pos += 1;
+        let n_dims = meta_index[pos] as usize;
+        pos += 1;
+        if pos + n_dims * 4 + 12 > meta_index.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "HFQM index truncated at shape/data_size",
+            ));
+        }
+        let mut shape = Vec::with_capacity(n_dims);
+        for _ in 0..n_dims {
+            shape.push(u32::from_le_bytes(
+                meta_index[pos..pos + 4].try_into().unwrap(),
+            ));
+            pos += 4;
+        }
+        let group_size = u32::from_le_bytes(meta_index[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let data_size = u64::from_le_bytes(meta_index[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        if cumulative_offset + data_size > file_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "HFQM tensor {name} range {}..{} exceeds file size {}",
+                    cumulative_offset,
+                    cumulative_offset + data_size,
+                    file_len
+                ),
+            ));
+        }
+        tensor_map.insert(name.clone(), i);
+        tensors.push(HfqTensorInfo {
+            name,
+            quant_type,
+            shape,
+            group_size,
+            data_offset: cumulative_offset,
+            data_size,
+        });
+        cumulative_offset += data_size;
+    }
+    let _ = metadata_offset;
+    Ok((metadata_json, tensors, tensor_map))
+}
+
+fn read_exact_at_portable(file: &File, dst: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(dst, offset)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = file.try_clone()?;
+        f.seek(SeekFrom::Start(offset))?;
+        f.read_exact(&mut dst)?;
+        Ok(())
     }
 }
 

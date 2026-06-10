@@ -30,6 +30,7 @@ pub mod eval_common;
 pub mod eval_harness;
 pub mod gguf;
 pub mod hfq;
+pub mod hfq_modules;
 pub mod host_profile;
 pub mod llama;
 pub mod logging;

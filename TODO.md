@@ -30,6 +30,13 @@
   evidence artifacts, especially `moe_router_histogram.json` for MoE/A3B
   models.
 - Run the full no-GPU handoff gate before committing the branch.
+- Extend Qwen35 paged expert execution coverage beyond the current indexed MQ
+  routed path: grouped Path 2, Paro, full-precision, and CPU-fallback paged
+  paths still need explicit tests before broad admission.
+- Extend routed-only Qwen3 MoE forward validation beyond the current one-token
+  modular/lazy expert smoke: multi-token prefill, decode continuation, eager vs
+  paged parity on a smaller artifact, and grouped routed batches still need
+  explicit coverage before removing the guarded execution flag.
 
 ### Deferred
 
