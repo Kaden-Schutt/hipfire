@@ -1102,7 +1102,7 @@ struct Gemma4EagleState {
     /// sized for `draft_len` at load time.
     spec_scratch: gemma4::speculative::Gemma4SpecScratch,
     /// Drafts per round (verify block = draft_len + 1). v1 pins this to
-    /// `GEMMA4_EAGLE_DRAFT_LEN`; the load handler refuses anything else.
+    /// `GEMMA4_EAGLE_DRAFT_LEN` by default; the load handler accepts 1..=5.
     draft_len: usize,
 }
 
@@ -1131,18 +1131,23 @@ struct Gemma4LoweredState {
     eos_tok: u32,
 }
 
-/// Gate for the `params.spec` knob: only `GEMMA4_EAGLE_DRAFT_LEN` (3) is
-/// accepted in v1 — refuse-don't-degrade, mirroring the DFlash refusal
-/// contracts. Absent means "use the validated default".
+/// Gate for the `params.spec` knob: draft_len 1..=5 accepted; absent means
+/// the validated default (`GEMMA4_EAGLE_DRAFT_LEN` = 3). dl <= 4 was
+/// parity-validated at the original EAGLE wiring; dl = 5 is parity-validated
+/// on hiptrx/gfx1201 (spec == eager byte-identical, `infer_gemma4_spec
+/// --check-eager`, deterministic across reruns) after the batched-verify Q8
+/// projections moved to `gemm_q8_0_batched_chunked` — the dl >= 5 fault
+/// previously blamed on batched-MQ4 rode the scalar `gemm_q8_0_batched`
+/// path that fix bypasses and no longer reproduces. dl > 5 stays refused
+/// (unvalidated) — refuse-don't-degrade, mirroring the DFlash contracts.
 fn gemma4_eagle_spec_len(spec: Option<u64>) -> Result<usize, String> {
     match spec {
         None => Ok(GEMMA4_EAGLE_DRAFT_LEN),
-        Some(n) if n == GEMMA4_EAGLE_DRAFT_LEN as u64 => Ok(GEMMA4_EAGLE_DRAFT_LEN),
+        Some(n) if (1..=5).contains(&n) => Ok(n as usize),
         Some(n) => Err(format!(
-            "gemma4 EAGLE v1 supports spec=3 (draft_len) only; got spec={n}. \
-             dl=3 is the validated config (byte-identical to eager for dl <= 4; \
-             dl >= 5 trips a pre-existing batched-MQ4 forward_batch fault on \
-             gfx12) — reload with spec=3 or drop params.drafter."
+            "gemma4 EAGLE supports spec=1..=5 (draft_len; default 3, dl <= 5 \
+             parity-validated on gfx1201); got spec={n} — reload with a \
+             supported spec or drop params.drafter."
         )),
     }
 }
@@ -1752,7 +1757,7 @@ fn main() {
                 // Deliberately a SEPARATE param from `params.draft` (the
                 // qwen3.5 DFlash knob) so a DFlash .hfq can never be routed
                 // into the EAGLE loader by accident. `params.spec` = draft
-                // length; v1 accepts 3 only (see gemma4_eagle_spec_len).
+                // length; 1..=5 accepted (see gemma4_eagle_spec_len).
                 let gemma4_drafter = msg
                     .get("params")
                     .and_then(|p| p.get("drafter"))
@@ -15140,15 +15145,23 @@ mod gemma4_eagle_param_tests {
     }
 
     #[test]
-    fn non_dl3_refused() {
-        // v1 pins draft_len to the validated dl=3 config — every other value
-        // is refused (refuse-don't-degrade), including the dl >= 5 range that
-        // trips the pre-existing batched-MQ4 forward_batch fault on gfx12.
-        for bad in [0u64, 1, 2, 4, 5, 16] {
+    fn dl_1_through_5_accepted() {
+        // dl <= 4 parity-validated at the original wiring; dl = 5 validated
+        // post chunked-WMMA verify fix (spec == eager IDENTICAL on gfx1201).
+        for ok in [1u64, 2, 4, 5] {
+            assert_eq!(gemma4_eagle_spec_len(Some(ok)).unwrap(), ok as usize);
+        }
+    }
+
+    #[test]
+    fn out_of_range_refused() {
+        // 0 and > 5 are refused (refuse-don't-degrade): dl > 5 is
+        // unvalidated, and the refusal names the supported range.
+        for bad in [0u64, 6, 16] {
             let err = gemma4_eagle_spec_len(Some(bad)).unwrap_err();
             assert!(
-                err.contains("spec=3"),
-                "refusal should point the operator at spec=3: {err}"
+                err.contains("spec=1..=5"),
+                "refusal should name the supported range: {err}"
             );
         }
     }

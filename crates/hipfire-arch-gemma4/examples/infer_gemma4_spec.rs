@@ -29,6 +29,19 @@
 //!     --bs 16`), so it is a batched-MQ4-GEMM kernel limitation, NOT a spec-loop
 //!     bug. The spec loop itself is verified correct on the deterministic Q8
 //!     path. See the warmup note below.
+//!   - UNION target (gemma4-12b-it.union.mq4: Q8 attn + Q8 tied lm_head, MQ4
+//!     FFN), 2026-06-10, after `proj_gemm_batched` Q8 routed through
+//!     `gemm_q8_0_batched_chunked` (WMMA on gfx12): spec == eager
+//!     BYTE-IDENTICAL for draft-len 3..=5; 86-93 tok/s @ dl3 and ~106 tok/s
+//!     @ dl5 vs 51.0 tok/s AR (1.7-2.1x). Before that routing fix the scalar
+//!     `gemm_q8_0_batched` cost 334 us/call x 184 attn projections per
+//!     verify (~61 ms/round, 61% of GPU time per rocprofv3) -> 32 tok/s =
+//!     0.63x AR. The dl >= 5 fault note above predates the fix and did NOT
+//!     reproduce at dl5 (b=6) on the union target across repeated
+//!     --check-eager runs; post-fix `verify_batch_gemma4 --bs 8,16,32`:
+//!     B=8 PASS, B=16 PASS (the old illegal-access fault is gone), B=32
+//!     argmax near-tie flip at cosine 0.9999 (numerical, no fault) — all
+//!     far above the daemon's dl <= 5 (b <= 6) envelope.
 //!
 //! Usage:
 //!   infer_gemma4_spec --model <target.hfq> --draft-model <drafter.hfq> \

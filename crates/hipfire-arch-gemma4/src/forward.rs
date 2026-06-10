@@ -912,7 +912,11 @@ fn finish_attn_and_ffn(
 
 /// One projection GEMM, batched, dispatched by weight dtype. Mirrors the
 /// dtypes `weight_gemv` handles on the gemma4 weight set:
-///   - Q8_0      → `gemm_q8_0_batched` (no rotation)
+///   - Q8_0      → `gemm_q8_0_batched_chunked` (no rotation; auto-routes to
+///                 the WMMA Q8 GEMM on gfx12/RDNA4 — the scalar
+///                 `gemm_q8_0_batched` was 334 us/call at b=4 proj widths =
+///                 ~61 ms/round = the gemma4 EAGLE slowdown on gfx1201;
+///                 elsewhere identical scalar kernel, b ≤ 64 = one sub-batch)
 ///   - F32       → `gemm_q8_0_batched` would be wrong; F32 weights are only
 ///                 produced for tiny norm-like tensors, never projections here,
 ///                 so this is an error (projections are Q8/MQ4 in both HFQs).
@@ -934,7 +938,7 @@ fn proj_gemm_batched(
 ) -> Result<(), String> {
     match w.gpu_dtype {
         DType::Q8_0 => gpu
-            .gemm_q8_0_batched(&w.buf, x, y, w.m, w.k, b)
+            .gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, b)
             .map_err(|e| format!("gemma4 batch {label} (q8): {e:?}")),
         DType::MQ4G256 | DType::HFQ4G256 => {
             // FWHT-rotate the shared input once, then run the prerotated GEMM.
