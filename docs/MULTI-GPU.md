@@ -79,13 +79,13 @@ logits, and emitted calls stream as structured `tool_calls` events
 with `finish_reason: "tool_calls"`. For MiniMax-M2 the template
 renders tool definitions into the prompt; output streams as text.
 
-> **Known issue (ds4 + tp>1):** `forward_ep` is not yet byte-exact to
-> the single-GPU forward on DeepSeek V4 — the prefill numerics diverge
-> at the first response token, which can degrade DSML tool-call
-> emission under EP even though the identical prompt produces clean
-> `tool_calls` single-GPU. The render/parse wiring is correct; the
-> forward-numerics gap is tracked under task #26 / Ship 6. Plain text
-> generation is coherent.
+> **Fixed in v0.2.1:** earlier ds4 EP builds emitted degraded tool-call
+> syntax on RDNA4 (gfx12) because every F16-weight GEMV fell back to a
+> broken kernel that corrupted the DSA compressor (fixed in 245ae3fe).
+> EP tool-calling on hiptrx-class tp4 now produces token streams
+> identical to the validated single-GPU path; on the canonical weather
+> tool prompt the daemon emits `tool_calls` with
+> `finish_reason: "tool_calls"` in both think and non-think modes.
 
 Caching: MiniMax-M2 EP carries the single-GPU LCP prefix cache — every
 rank's KV cursor rewinds to the longest common prefix of the rendered
