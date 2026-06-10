@@ -98,7 +98,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let help = match app.tab {
         Tab::Chat => {
             if app.chat.sending {
-                "Esc abort stream  q quit  Tab switch  Up/Down scroll"
+                "Esc abort stream  q quit  Tab switch  Up/Down/PgUp/PgDn scroll  End follow"
             } else {
                 "Tab switch  Enter send  Ctrl+O newline  Ctrl+T thinking  Up/Down scroll  Esc blur  q quit (blurred)"
             }
@@ -266,7 +266,7 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(10), Constraint::Length(5)])
@@ -313,6 +313,18 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::from(""));
         }
     }
+    // Clamp/auto-follow against the wrapped height of the transcript. The
+    // row estimate mirrors Wrap{trim:false}: a line of width w occupies
+    // ceil(w / inner_width) rows (>=1).
+    let inner_width = chunks[0].width.saturating_sub(2).max(1) as usize;
+    let inner_height = chunks[0].height.saturating_sub(2);
+    let total_rows: u32 = lines
+        .iter()
+        .map(|line| (line.width().max(1) as u32).div_ceil(inner_width as u32))
+        .sum();
+    app.chat
+        .sync_scroll(total_rows.min(u16::MAX as u32) as u16, inner_height);
+
     frame.render_widget(
         Paragraph::new(lines)
             .block(block("Chat shell"))

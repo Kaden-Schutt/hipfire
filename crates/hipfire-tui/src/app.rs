@@ -230,6 +230,31 @@ impl App {
     }
 
     fn handle_chat_key(&mut self, key: KeyEvent) {
+        // Scrolling works in every chat state, including mid-stream.
+        match key.code {
+            KeyCode::Up => {
+                self.chat.scroll_up(1);
+                return;
+            }
+            KeyCode::Down => {
+                self.chat.scroll_down(1);
+                return;
+            }
+            KeyCode::PageUp => {
+                self.chat.scroll_up(10);
+                return;
+            }
+            KeyCode::PageDown => {
+                self.chat.scroll_down(10);
+                return;
+            }
+            KeyCode::End => {
+                self.chat.follow_tail();
+                return;
+            }
+            _ => {}
+        }
+
         if self.chat.sending {
             self.chat.status = "generation in progress".into();
             return;
@@ -244,8 +269,6 @@ impl App {
         if !self.chat.is_input_focused() {
             match key.code {
                 KeyCode::Enter | KeyCode::Char('i') => self.chat.focus_input(),
-                KeyCode::Up => self.chat.scroll = self.chat.scroll.saturating_add(1),
-                KeyCode::Down => self.chat.scroll = self.chat.scroll.saturating_sub(1),
                 _ => {}
             }
             return;
@@ -274,6 +297,7 @@ impl App {
                 });
                 self.chat.sending = true;
                 self.chat.status = "streaming from hipfire serve".into();
+                self.chat.follow_tail();
 
                 let (tx, rx) = mpsc::channel();
                 self.chat.rx = Some(rx);
@@ -299,12 +323,6 @@ impl App {
             }
             KeyCode::Char(c) => {
                 self.chat.input.push(c);
-            }
-            KeyCode::Up => {
-                self.chat.scroll = self.chat.scroll.saturating_add(1);
-            }
-            KeyCode::Down => {
-                self.chat.scroll = self.chat.scroll.saturating_sub(1);
             }
             _ => {}
         }
@@ -546,6 +564,12 @@ pub struct ChatState {
     /// Render reasoning blocks expanded (dim) or collapsed to one line.
     pub show_reasoning: bool,
     pub scroll: u16,
+    /// Auto-follow: pin the view to the newest line while streaming. Cleared
+    /// by scrolling up, re-engaged by scrolling back to the bottom or End.
+    pub follow: bool,
+    /// Largest valid scroll offset, refreshed by the renderer each frame
+    /// from the wrapped line count and viewport height.
+    pub max_scroll: u16,
     rx: Option<Receiver<ChatEvent>>,
     abort: Arc<AtomicBool>,
     input_focused: bool,
@@ -560,6 +584,8 @@ impl Default for ChatState {
             sending: false,
             show_reasoning: true,
             scroll: 0,
+            follow: true,
+            max_scroll: 0,
             rx: None,
             abort: Arc::new(AtomicBool::new(false)),
             input_focused: true,
@@ -580,6 +606,34 @@ impl ChatState {
         self.input_focused
     }
 
+    pub fn scroll_up(&mut self, n: u16) {
+        self.follow = false;
+        self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    pub fn scroll_down(&mut self, n: u16) {
+        self.scroll = self.scroll.saturating_add(n).min(self.max_scroll);
+        if self.scroll >= self.max_scroll {
+            self.follow = true;
+        }
+    }
+
+    pub fn follow_tail(&mut self) {
+        self.follow = true;
+        self.scroll = self.max_scroll;
+    }
+
+    /// Renderer hook: clamp the offset to the actual content height and pin
+    /// to the tail while auto-follow is engaged.
+    pub fn sync_scroll(&mut self, total_rows: u16, viewport_rows: u16) {
+        self.max_scroll = total_rows.saturating_sub(viewport_rows);
+        if self.follow {
+            self.scroll = self.max_scroll;
+        } else {
+            self.scroll = self.scroll.min(self.max_scroll);
+        }
+    }
+
     /// Ask the streaming thread to stop at the next SSE line. The UI flips
     /// to non-sending when the thread acknowledges with ChatEvent::Aborted.
     pub fn request_abort(&mut self) {
@@ -592,5 +646,60 @@ impl ChatState {
     #[cfg(test)]
     pub fn abort_requested(&self) -> bool {
         self.abort.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatState;
+
+    #[test]
+    fn follow_pins_to_tail_and_clamps() {
+        let mut chat = ChatState::default();
+        assert!(chat.follow, "auto-follow engaged by default");
+        chat.sync_scroll(100, 20);
+        assert_eq!(chat.max_scroll, 80);
+        assert_eq!(chat.scroll, 80, "follow pins to the newest line");
+        // content grows while following
+        chat.sync_scroll(120, 20);
+        assert_eq!(chat.scroll, 100);
+    }
+
+    #[test]
+    fn scroll_up_disengages_follow_and_clamps_at_top() {
+        let mut chat = ChatState::default();
+        chat.sync_scroll(100, 20);
+        chat.scroll_up(5);
+        assert!(!chat.follow);
+        assert_eq!(chat.scroll, 75);
+        // content grows: view stays put instead of jumping to the tail
+        chat.sync_scroll(120, 20);
+        assert_eq!(chat.scroll, 75);
+        chat.scroll_up(200);
+        assert_eq!(chat.scroll, 0, "clamped at top");
+    }
+
+    #[test]
+    fn scrolling_back_to_bottom_reengages_follow() {
+        let mut chat = ChatState::default();
+        chat.sync_scroll(100, 20);
+        chat.scroll_up(3);
+        assert!(!chat.follow);
+        chat.scroll_down(2);
+        assert!(!chat.follow);
+        chat.scroll_down(1);
+        assert!(chat.follow, "hitting the bottom re-engages follow");
+        chat.scroll_down(50);
+        assert_eq!(chat.scroll, chat.max_scroll, "clamped at bottom");
+    }
+
+    #[test]
+    fn shrinking_content_clamps_stale_offsets() {
+        let mut chat = ChatState::default();
+        chat.sync_scroll(100, 20);
+        chat.scroll_up(1); // follow off, scroll 79
+        chat.sync_scroll(30, 20);
+        assert_eq!(chat.max_scroll, 10);
+        assert_eq!(chat.scroll, 10, "stale offset clamped to new max");
     }
 }
