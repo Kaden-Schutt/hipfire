@@ -92,19 +92,6 @@ fn gemv_steps_uniform(steps: &[Step], dtype: DType, require_no_awq: bool) -> boo
     })
 }
 
-/// True if all Gemv steps in the window (indices 1..) have:
-/// - the given dtype
-/// - GemvInput::Raw (Paro uses Raw because the kernel rotates internally)
-/// - awq_scale == None
-fn gemv_steps_uniform_raw(steps: &[Step], dtype: DType) -> bool {
-    steps[1..].iter().all(|s| match s {
-        Step::Gemv { w, input: GemvInput::Raw(_), .. } => {
-            w.dtype == dtype && w.awq_scale.is_none()
-        }
-        _ => false,
-    })
-}
-
 /// True if ctx has dp4a and !force_unfused.
 fn dp4a_eligible(ctx: &DispatchCtx) -> bool {
     !ctx.flags.force_unfused && ctx.arch.gemv_dp4a_enabled()
@@ -199,8 +186,6 @@ pub(crate) fn guard_gate_up_hfq6g256(steps: &[Step], ctx: &DispatchCtx) -> bool 
         && gemv_steps_uniform(steps, dt, true)
 }
 
-// ── Paro fused guards (Raw input — kernel rotates internally) ──
-
 // ── Q8_0 / Q4K fused guards (non-rotated, Prerotated input) ──
 // These dtypes have no activation rotation (RotationPlan::None), so the
 // RmsnormAutomatic producer does plain rmsnorm and the fused kernels take
@@ -225,46 +210,27 @@ pub(crate) fn guard_gate_up_q8_0(steps: &[Step], ctx: &DispatchCtx) -> bool {
     steps.len() == 3 && gemv_steps_uniform(steps, DType::Q8_0, true)
 }
 
-pub(crate) fn guard_gate_up_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
-    if steps.len() != 3 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
-    dt == DType::ParoQ4G128
-        && gemv_steps_uniform_raw(steps, DType::ParoQ4G128)
-        && steps[1..].iter().all(|s| match s {
-            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0,
-            _ => false,
-        })
-        // Gate and up must have equal m — the fused kernel takes a single m.
-        && {
-            let m0 = match &steps[1] { Step::Gemv { w, .. } => w.m, _ => return false };
-            let m1 = match &steps[2] { Step::Gemv { w, .. } => w.m, _ => return false };
-            m0 == m1
-        }
+// DEAD-GATED: the Paro4G128T fused kernels (paro4g128t_quad_rotate /
+// fused_*_paro4g128t_* in gemv_paro4g128.hip) read pairs/theta/channel_scales
+// at computed offsets INSIDE the weight buffer — they require the
+// self-contained PARO4G128T blob layout (the removed quant_type-28/29 probe
+// format). Runtime ParoQ4G128 WeightTensors store HFQ4G128-repacked rows with
+// the rotation in SEPARATE sidecar buffers (WeightTensor.paro), so the kernel
+// reads garbage rotation tables past the weight bytes. Result: collapsed
+// logits → token-0 (`!`) attractor on shisa-Qwen3.6-35B-A3B-PARO (bisected to
+// 50437c6b). These guards stay rejected until a loader produces genuine
+// T-format blobs; the per-op GEMV fallback (run_auto, Givens-aware) is correct.
+
+pub(crate) fn guard_gate_up_paro4g128t(_steps: &[Step], _ctx: &DispatchCtx) -> bool {
+    false
 }
 
-pub(crate) fn guard_qkvza_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
-    if steps.len() != 5 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
-    dt == DType::ParoQ4G128
-        && gemv_steps_uniform_raw(steps, DType::ParoQ4G128)
-        && steps[1..].iter().all(|s| match s {
-            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0,
-            _ => false,
-        })
+pub(crate) fn guard_qkvza_paro4g128t(_steps: &[Step], _ctx: &DispatchCtx) -> bool {
+    false
 }
 
-pub(crate) fn guard_qkv_paro4g128t(steps: &[Step], ctx: &DispatchCtx) -> bool {
-    if ctx.flags.force_unfused { return false; }
-    if steps.len() != 4 { return false; }
-    let dt = match window_gemv_dtype(steps) { Some(d) => d, None => return false };
-    dt == DType::ParoQ4G128
-        && gemv_steps_uniform_raw(steps, DType::ParoQ4G128)
-        && steps[1..].iter().all(|s| match s {
-            Step::Gemv { w, .. } => w.m % 8 == 0 && w.k % 128 == 0,
-            _ => false,
-        })
+pub(crate) fn guard_qkv_paro4g128t(_steps: &[Step], _ctx: &DispatchCtx) -> bool {
+    false
 }
 
 pub struct FusedPattern {
