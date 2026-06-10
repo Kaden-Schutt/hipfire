@@ -88,7 +88,7 @@ hipfire config qwen3.5:9b                        # per-model overlay
 ```
 
 Common overrides: `temperature` (default 0.30), `kv_cache` (default
-`asym3`), `dflash_mode` (default `auto`). Full key list in
+`asym3`), `dflash_mode` (default `off`). Full key list in
 [CONFIG.md](CONFIG.md).
 
 ## Long context: KV cache eviction
@@ -102,8 +102,8 @@ eviction with:
 hipfire config cask-profile balanced   # or conservative / aggressive-vram
 ```
 
-The daemon automatically discovers the shipped `.triattn.bin` beside the
-weights and sets `cask_sidecar` for you. No manual path needed.
+The daemon automatically discovers the shipped TriAttention sidecar beside
+the weights and sets `cask_sidecar` for you. No manual path needed.
 
 **Note:** eviction is disabled by default even when a sidecar exists —
 you must set a CASK profile (`balanced`, `conservative`, or `aggressive-vram`) to activate it.

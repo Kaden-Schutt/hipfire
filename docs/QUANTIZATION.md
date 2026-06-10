@@ -37,13 +37,16 @@ validation pass on Qwen 3.5 / 3.6 (gfx1100, master `c448d5e`):
   until then `--format mq2` is reserved and gated behind an explicit
   opt-in flag.
 
-There is no WMMA prefill path for MQ3 or MQ2 yet, so prefill falls
-back to per-row GEMV until the kernel lands in a follow-up PR. The
-eligibility check in `qwen35::forward_prefill_batch` (`is_batchable_la`)
-correctly excludes MQ3/MQ2 from the batched fast path; per-token
-`forward_scratch` handles them via `weight_gemv`'s MQ3/MQ2 dispatch
-arms. Engine wiring is correct — the quality verdict is purely about
-the format's expressiveness on each model size, not a runtime bug.
+MQ3 has production WMMA/MMQ prefill paths on validated RDNA3 / RDNA4
+arches (`gfx11` / `gfx12`) for the dense Qwen35 path, including the
+`gemm_qkvza`, `gemm_qkv`, `gemm_gate_up`, and residual HFQ3 families.
+MQ3 inside MoE/A3B remains more tightly gated because shared batched
+MoE prefill has format-specific stride and admission constraints.
+MQ2 remains research-gated: decode kernels exist, but uniform MQ2
+quality collapses and the batched production path is not admitted.
+Engine wiring is correct — the quality verdict is about each format's
+expressiveness and validated admission surface, not a generic runtime
+bug.
 
 Header layout (8 bytes): 4 bytes scale (f32-bitcast-from-f16) + 4 bytes
 zero point. Data: bitwidth × 256 / 8 bytes = 128 (4-bit) or 192 (6-bit)

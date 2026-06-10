@@ -479,7 +479,7 @@ To enumerate which arch a code path takes, grep for `self.arch == "<gfx_id>"` an
 
 Cache and model-discovery checks via `Path::new(...).exists()`. Includes:
 - DFlash draft auto-discovery (`~/.hipfire/models/<target>-dflash-mq4.hfq`)
-- Triattn sidecar discovery (`<model>.triattn.bin`)
+- Triattn sidecar discovery (`<model>.triattn.hfq`, with legacy `.bin` accepted)
 - Model registry lookup
 - Etc.
 

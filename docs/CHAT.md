@@ -35,6 +35,7 @@ Requires a running `hipfire serve` or auto-spawns a dedicated daemon.
 | `/clear` | Clear conversation history |
 | `/stats` | Show model stats |
 | `/trim` | Drop old messages to free context |
+| `/set <key> <val>` | Adjust `temperature`, `top_p`, `max_tokens`, or `repeat_penalty` for this session |
 | `/exit`, `/quit` | Exit chat |
 
 ## Features

@@ -120,7 +120,8 @@ allocated.
 ### Generating the sidecar file
 
 For models from HuggingFace (e.g., `hipfire pull qwen3.6:27b`), a
-published `.triattn.bin` ships alongside the weights and is auto-attached.
+published TriAttention sidecar ships alongside the weights and is
+auto-attached.
 **For custom or quantized models**, you must generate one:
 
 ```bash
@@ -129,8 +130,9 @@ hipfire sidecar-gen ~/.hipfire/models/my-finetune.mq4 --corpus /path/to/corpus.t
 ```
 
 The generated file is placed next to the model by default, for example
-`my-finetune.mq4.triattn.bin`.
-The daemon auto-discovers it using `<basename>.triattn*.bin` matching.
+`my-finetune.mq4.triattn.hfq`.
+The daemon auto-discovers the canonical `.triattn.hfq` name and still
+accepts legacy `.triattn*.bin` sidecars.
 See [CLI.md](CLI.md) for full `sidecar-gen` flag details and
 [QUANTIZE.md](QUANTIZE.md) for the post-quantization workflow.
 
@@ -161,12 +163,13 @@ Picking a profile rewrites a bundle of CASK config keys in one shot. The
 `balanced` / `conservative` / `aggressive-vram` profiles set the policy
 fields and re-enable `cask_auto_attach`; they preserve `cask_sidecar` —
 set the path separately with `hipfire config set cask_sidecar
-/path/to/<model>.triattn.bin`, or rely on auto-attach by `hipfire pull`'ing
+/path/to/<model>.triattn.hfq`, or rely on auto-attach by `hipfire pull`'ing
 a model that ships one.
 
 The `auto` profile is the fresh-default state: at load time the engine
 scans for a TriAttention sidecar next to the model file (registry's
-`triattn.file` first, then `<basename>.triattn*.bin` glob fallback). When
+`triattn.file` first, then `<basename>.triattn.hfq` and legacy `.bin`
+fallbacks). When
 found AND target is not A3B, it attaches with drop-eviction at the
 configured budget. `hipfire pull qwen3.6:27b` fetches the v3 sidecar
 alongside weights, so `hipfire run` engages CASK on the first turn with
@@ -182,7 +185,7 @@ quality-sensitive single-turn workloads).
 
 | Key | Default | Range | Notes |
 |---|---|---|---|
-| `cask_sidecar` | "" | path | Path to TriAttention sidecar `.bin`. Empty = eviction disabled regardless of other knobs. For custom/quantized models, generate one with `hipfire sidecar-gen <model>` — see Generating the sidecar file above for details. |
+| `cask_sidecar` | "" | path | Path to a TriAttention sidecar, canonically `.triattn.hfq`. Empty = eviction disabled regardless of other knobs. For custom/quantized models, generate one with `hipfire sidecar-gen <model>` — see Generating the sidecar file above for details. |
 | `cask` | false | bool | true = CASK m-folding (Kim & Gwon 2026); false = plain TriAttention drop-eviction. |
 | `cask_budget` | 512 | 64–65536 | Active token count post-eviction. Smaller = tighter VRAM, more frequent eviction events. |
 | `cask_beta` | 128 | 0–65536 | Hysteresis. Buffer needs to fill `budget + beta` before re-triggering eviction. |
