@@ -17,6 +17,7 @@ members = [
     "crates/hipfire-quantize",
     "crates/hipfire-detect",
     "crates/hipfire-atlas",
+    "crates/hipfire-tui",
     "crates/redline",
     "crates/hipfire-dispatch",
     "crates/hipfire-dispatch-tests",
