@@ -87,6 +87,7 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_DRAFT_GEMM_DUMP` | DIAG-DUMP | "" (set to "1" to enable) | `crates/hipfire-runtime/src/dflash.rs:571` |
 | `HIPFIRE_DRAFT_SUBPHASE` | DRAFT/SPEC | "" (set to "1" to enable) | `crates/hipfire-runtime/src/dflash.rs:805` |
 | `HIPFIRE_DTOH_DUMP` | DIAG-DUMP | "" (set to "1" to enable) | `crates/hip-bridge/src/ffi.rs:594` |
+| `HIPFIRE_EMIT_TOKEN_IDS` | COHERENCE-DIAG | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/daemon.rs:602` |
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | MISC-USER | — | `cli/index.ts:808` |
 | `HIPFIRE_FLASH_PARTIALS_BATCH` | ATTN | — | `crates/hipfire-arch-qwen35/src/qwen35.rs:2750` |
 | `HIPFIRE_FORCE_A3B_EVICTION` | DFLASH-USER | — | `cli/index.ts:4978` |
