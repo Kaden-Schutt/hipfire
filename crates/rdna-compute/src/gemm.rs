@@ -19094,12 +19094,16 @@ impl Gpu {
             self.ensure_fp16_x(x_f16, batch_size * k)?
         };
 
-        self.ensure_kernel(
-            "gemm_hfq4g256_wmma",
-            kernels::GEMM_HFQ4G256_WMMA_SRC,
-            "gemm_hfq4g256_wmma",
-        )?;
-        let func = &self.functions["gemm_hfq4g256_wmma"];
+        // RDNA3/RDNA3.5 and RDNA4 wave32 WMMA use different operand widths
+        // and f32-accumulator output layouts; select the matching source.
+        // Launch geometry is identical (16x16 tile per wave32 block).
+        let (kname, ksrc): (&str, &str) = if self.arch_caps.is_rdna4() {
+            ("gemm_hfq4g256_wmma_gfx12", kernels::GEMM_HFQ4G256_WMMA_GFX12_SRC)
+        } else {
+            ("gemm_hfq4g256_wmma", kernels::GEMM_HFQ4G256_WMMA_SRC)
+        };
+        self.ensure_kernel(kname, ksrc, kname)?;
+        let func = &self.functions[kname];
         let ap = a_raw.buf.as_ptr();
         let xp = x_f16_ptr;
         let yp = y_f32.buf.as_ptr();
@@ -19107,7 +19111,7 @@ impl Gpu {
         let mut ki = k as i32;
         let mut bi = batch_size as i32;
         let bytes = a_raw.byte_size();
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let mut params: Vec<*mut c_void> = vec![
             &ap as *const _ as *mut c_void,
             &xp as *const _ as *mut c_void,
@@ -19119,7 +19123,7 @@ impl Gpu {
         let grid_m = ((m + 15) / 16) as u32;
         let grid_b = ((batch_size + 15) / 16) as u32;
         let result = self.launch_maybe_blob(
-            "gemm_hfq4g256_wmma",
+            kname,
             [grid_m, grid_b, 1],
             [32, 1, 1],
             0,

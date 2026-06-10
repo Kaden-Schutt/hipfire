@@ -3624,6 +3624,11 @@ pub const V4F_CONVERT_F32_TO_F16_SRC: &str =
 pub const GEMM_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_wmma.hip");
 
+/// gfx12 (RDNA4) sibling of GEMM_HFQ4G256_WMMA_SRC -- half8 operands,
+/// _w32_gfx12 builtin, rows-contiguous C mapping. Plain store (no residual).
+pub const GEMM_HFQ4G256_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_wmma.gfx12.hip");
+
 /// DeepSeek V4 compressor batched ALIGNED compress events. Replaces the
 /// 3-kernel per-event chain (overlap_concat × 2 + softmax_pool)
 /// with a single launch over N_events. Handles both overlap=true

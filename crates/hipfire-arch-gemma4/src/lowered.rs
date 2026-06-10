@@ -75,6 +75,43 @@ fn run_prefill_gemm(
     y: &GpuTensor,
     batch_size: usize,
 ) -> HipResult<()> {
+    // MQ4G256 weights are FWHT-rotated at quantize time. The per-token GEMV
+    // path (weight_gemv) FWHT-rotates x before running the prerotated kernel;
+    // the batched GEMM kernels (scalar gemm_hfq4g256 AND its WMMA siblings)
+    // decode the same 136 B/group layout but do NOT rotate internally, so the
+    // input must be pre-rotated here -- exactly like the eager
+    // forward.rs::proj_gemm_batched (EAGLE verify) does. Skipping this fed raw
+    // activations to the GEMM and produced garbage logits from token 0 on
+    // every arch (root-caused on gfx1201 2026-06-10; gfx11 batched-prefill
+    // validation predated the *.union.mq4 files, which is why it never fired
+    // there).
+    let x_rot_holder = if matches!(w.gpu_dtype, DType::MQ4G256) {
+        let xr = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+        llama::rotate_x_mq_batched_for(gpu, w, x, &xr, w.k, batch_size)?;
+        Some(xr)
+    } else {
+        None
+    };
+    let x_gemm: &GpuTensor = x_rot_holder.as_ref().unwrap_or(x);
+
+    let result = run_prefill_gemm_inner(gpu, w, x, x_gemm, y, batch_size);
+    if let Some(t) = x_rot_holder {
+        gpu.free_tensor(t)?;
+    }
+    result
+}
+
+/// Inner body of `run_prefill_gemm`: `x_gemm` is the (possibly FWHT-rotated)
+/// GEMM input; `x_raw` is the original activation, used only by the per-token
+/// GEMV fallback + verify hook (both rotate internally via ).
+fn run_prefill_gemm_inner(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x_raw: &GpuTensor,
+    x_gemm: &GpuTensor,
+    y: &GpuTensor,
+    batch_size: usize,
+) -> HipResult<()> {
     let ctx = DispatchCtx::new(gpu);
     let w_ref = WeightRef {
         buf: &w.buf,
@@ -85,27 +122,25 @@ fn run_prefill_gemm(
         rotation: None,
         awq_scale: None,
     };
-    let params = GemmParams { w: &w_ref, x, y, batch_size };
+    let params = GemmParams { w: &w_ref, x: x_gemm, y, batch_size };
     let family = llama::gemm_family();
 
     if wmma_prefill_enabled() {
         // WMMA path: use GemmFamily::run which resolves the best kernel
         // for each dtype (WMMA where available, scalar fallback otherwise).
-        // The F32→F16 conversion is handled inside the kernel methods.
+        // The F32->F16 conversion is handled inside the kernel methods.
         //
-        // HARD ERROR on failure — no silent fallthrough. The old code fell
-        // through to the scalar key path when `run` errored (e.g. missing
-        // WMMA kernel for this dtype × arch), which silently produced
+        // HARD ERROR on failure -- no silent fallthrough. The old code fell
+        // through to the scalar key path when  errored (e.g. missing
+        // WMMA kernel for this dtype x arch), which silently produced
         // special-token garbage from token 0 on gfx1201 (RDNA4) where the
-        // gfx11 `_w32` WMMA kernels don't exist. Refuse-don't-degrade: the
+        // gfx11  WMMA kernels do not exist. Refuse-dont-degrade: the
         // operator opted into WMMA explicitly, so a missing kernel is an
         // error, not a degrade. Unset HIPFIRE_WMMA_PREFILL (or use the
         // scalar HIPFIRE_BATCHED_PREFILL=1 path) on archs without coverage.
         return family.run(&ctx, gpu, &params).map_err(|e| {
             hip_bridge::HipError::new(0, &format!(
-                "gemma4 WMMA prefill: GemmFamily::run failed for dtype {:?} on arch {} \
-                 (HIPFIRE_WMMA_PREFILL=1 requires a WMMA kernel for every projection \
-                 dtype — unset it to use the scalar batched path): {e}",
+                "gemma4 WMMA prefill: GemmFamily::run failed for dtype {:?} on arch {}                  (HIPFIRE_WMMA_PREFILL=1 requires a WMMA kernel for every projection                  dtype -- unset it to use the scalar batched path): {e}",
                 w.gpu_dtype, gpu.arch,
             ))
         });
@@ -115,15 +150,17 @@ fn run_prefill_gemm(
     let key = match w.gpu_dtype {
         DType::HFQ4G256 => hipfire_dispatch::types::KernelKey::GemmHfq4G256,
         DType::HFQ4G128 => hipfire_dispatch::types::KernelKey::GemmHfq4G128,
-        DType::MQ4G256 => hipfire_dispatch::types::KernelKey::GemmHfq4G256, // same kernel, layout-identical
+        // Same kernel as HFQ4G256 (layout-identical); input pre-rotated above.
+        DType::MQ4G256 => hipfire_dispatch::types::KernelKey::GemmHfq4G256,
         DType::Q8_0 => hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
-        // No batched GEMM kernel for this dtype — fall back to repeated GEMV.
-        // This matches the old `weight_gemm()` fallback path.
+        // No batched GEMM kernel for this dtype -- fall back to repeated GEMV
+        // on the RAW input (weight_gemv applies any needed rotation itself).
+        // This matches the old  fallback path.
         _ => {
             let x_tok = gpu.alloc_tensor(&[w.k], DType::F32)?;
             let y_tok = gpu.alloc_tensor(&[w.m], DType::F32)?;
             for b in 0..batch_size {
-                gpu.hip.memcpy_dtod_at(&x_tok.buf, 0, &x.buf, b * w.k * 4, w.k * 4)?;
+                gpu.hip.memcpy_dtod_at(&x_tok.buf, 0, &x_raw.buf, b * w.k * 4, w.k * 4)?;
                 weight_gemv(gpu, w, &x_tok, &y_tok)?;
                 gpu.hip.memcpy_dtod_at(&y.buf, b * w.m * 4, &y_tok.buf, 0, w.m * 4)?;
             }
@@ -134,7 +171,23 @@ fn run_prefill_gemm(
     };
     family
         .run_key(key, &ctx, gpu, &params)
-        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+    // Debug parity hook: re-run token 0 through the per-token GEMV path
+    // (raw input; weight_gemv rotates internally) and diff against the GEMM.
+    if std::env::var("HIPFIRE_GEMMA4_GEMM_VERIFY").ok().as_deref() == Some("1") {
+        let x_tok = gpu.alloc_tensor(&[w.k], DType::F32)?;
+        let y_tok = gpu.alloc_tensor(&[w.m], DType::F32)?;
+        gpu.hip.memcpy_dtod_at(&x_tok.buf, 0, &x_raw.buf, 0, w.k * 4)?;
+        weight_gemv(gpu, w, &x_tok, &y_tok)?;
+        let yv = gpu.download_f32(&y_tok)?;
+        let yg = gpu.download_f32(y)?;
+        let mut worst = 0f32; let mut wi = 0usize;
+        for i in 0..w.m { let d = (yv[i] - yg[i]).abs(); if d > worst { worst = d; wi = i; } }
+        eprintln!("[gemm-verify] dtype={:?} m={} k={} b={} key={:?} worst={:.5} at {} gemv={:.4} gemm={:.4} head_gemv={:?} head_gemm={:?}",
+            w.gpu_dtype, w.m, w.k, batch_size, key, worst, wi, yv[wi], yg[wi], &yv[..2], &yg[..2]);
+        gpu.free_tensor(x_tok)?; gpu.free_tensor(y_tok)?;
+    }
+    Ok(())
 }
 
 /// Env-gated dump helper for v1-vs-v2 root-cause work.
@@ -3000,6 +3053,52 @@ fn forward_prefill_batch_v2(
                 let ctx = DispatchCtx::new(gpu);
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                if std::env::var("HIPFIRE_GEMMA4_ATTN_VERIFY").ok().as_deref() == Some("1") {
+                    let batched_out = gpu.download_f32(&scratch.pb_attn_q)?;
+                    for i in 0..n_batch {
+                        let pos = start_pos + i;
+                        gpu.hip.memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
+                        gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
+                        gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                        gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                        let ti = KvTierInputs {
+                            quant_asym4: kv_full.quant_asym4, quant_asym3: kv_full.quant_asym3,
+                            quant_asym2: kv_full.quant_asym2, quant_q8: kv_full.quant_q8,
+                            quant_fwht: kv_full.quant_fwht, quant_hfq4: false, quant_q4: false,
+                            v_mode_bits: kv_full.v_mode_bits(), pos, flash_mode: 2,
+                            capture_mode: gpu.graphs.capture_mode, batch_size: 1,
+                            is_tree: false, is_boundary: false, cache_capacity: 0,
+                            head_dim, window_size: 0,
+                        };
+                        let p1 = KvTierPlan::derive(ti)
+                            .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
+                        let io1 = AttnParams {
+                            q: &scratch.q, k: &scratch.k, v: &scratch.v,
+                            k_cache: &kv_full.k_gpu[full_kv_idx], v_cache: &kv_full.v_gpu[full_kv_idx],
+                            k_scales: None, v_scales: None,
+                            pos_buf: &scratch.pos_buf, pos, positions: None,
+                            n_heads, n_kv_heads: n_kv, head_dim,
+                            physical_cap: kv_full.max_seq, cache_capacity: 0, window_size: 0,
+                            batch_size: 1, max_ctx_len: 0,
+                            flash_partials: Some(&scratch.flash_partials),
+                            givens_cos: kv_full.givens_cos.as_ref(), givens_sin: kv_full.givens_sin.as_ref(),
+                            tree_bias: None, block_start: 0, block_cols: 0,
+                            output: &scratch.attn_out,
+                        };
+                        let c1 = DispatchCtx::new(gpu);
+                        execute_steps(gpu, &c1, &[Step::Attend { plan: p1, io: io1 }])
+                            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                        let single = gpu.download_f32(&scratch.attn_out)?;
+                        let row = &batched_out[i * q_dim..(i + 1) * q_dim];
+                        let mut worst = 0f32; let mut wi = 0usize;
+                        for j in 0..q_dim {
+                            let d = (single[j] - row[j]).abs();
+                            if d > worst { worst = d; wi = j; }
+                        }
+                        eprintln!("[attn-verify] L{layer_idx} start={start_pos} tok={i} pos={pos} worst={worst:.5} at {wi} single={:.4} batched={:.4}",
+                            single[wi], row[wi]);
+                    }
+                }
                 full_kv_idx += 1;
 
                 run_prefill_gemm(gpu, &lw.o_proj, &scratch.pb_attn_q, &scratch.pb_attn_out, n_batch)?;
@@ -3068,6 +3167,15 @@ fn forward_prefill_batch_v2(
                 gpu.add_inplace_f32(&scratch.pb_residual, &scratch.pb_ffn_out)?;
                 gpu.scale_f32(&scratch.pb_residual, layer_scalar)?;
             }
+        }
+        if std::env::var("HIPFIRE_GEMMA4_DUMP").ok().as_deref() == Some("1") {
+            let data = gpu.download_f32(&scratch.pb_residual).unwrap_or_default();
+            let last = &data[(n_batch - 1) * dim..n_batch * dim];
+            let sum: f64 = last.iter().map(|&v| v as f64).sum();
+            let min = last.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+            let max = last.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            eprintln!("[v2 diag] L{layer_idx} {:?} last-tok hidden: first4={:?} sum={sum:.4e} min={min:.4} max={max:.4}",
+                layer_type, &last[..4.min(last.len())]);
         }
     }
 

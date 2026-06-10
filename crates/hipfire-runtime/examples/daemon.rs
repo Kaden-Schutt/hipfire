@@ -1152,34 +1152,23 @@ fn gemma4_eagle_spec_len(spec: Option<u64>) -> Result<usize, String> {
     }
 }
 
-/// Arch gate for the gemma4 batched/WMMA prefill env opt-in
+/// Env opt-in for the gemma4 batched/WMMA prefill
 /// (`HIPFIRE_BATCHED_PREFILL=1` / `HIPFIRE_WMMA_PREFILL=1`).
 ///
-/// The lowered batched-prefill path is validated correct ONLY on gfx11-class
-/// GPUs (RDNA3/RDNA3.5 — is_rdna3/has_wmma_w32, e.g. gfx1100/gfx1151). On
-/// gfx1201 (RDNA4) BOTH flags produce silent special-token garbage from
-/// token 0 (deterministic, even on a single-chunk 20-token prompt): the
-/// gfx11 `_w32` WMMA kernels don't exist there and the old
-/// `lowered::run_prefill_gemm` fell through silently (now a hard error in
-/// `lowered.rs`). Returns true only when an opt-in flag is set AND the arch
-/// is gfx11-class; logs the refusal so the fallback to per-token prefill is
-/// visible in the daemon log.
-fn gemma4_batched_prefill_optin(gpu: &rdna_compute::Gpu) -> bool {
-    let want = lowered::batched_prefill_enabled() || lowered::wmma_prefill_enabled();
-    if !want {
-        return false;
-    }
-    let gfx11 = gpu.arch_caps.is_rdna3() || gpu.arch_caps.has_wmma_w32();
-    if !gfx11 {
-        eprintln!(
-            "[gemma4] REFUSING HIPFIRE_BATCHED_PREFILL/HIPFIRE_WMMA_PREFILL on arch {} \
-             (not gfx11-class): batched/WMMA prefill is validated only on RDNA3/RDNA3.5 \
-             and produces silent special-token garbage on gfx12 — falling back to \
-             per-token prefill",
-            gpu.arch,
-        );
-    }
-    gfx11
+/// History: this used to refuse outside gfx11-class because batched prefill
+/// produced deterministic special-token garbage from token 0 on gfx1201.
+/// Root causes (both fixed 2026-06-10, validated gfx1201):
+///   1. `lowered::run_prefill_gemm` fed MQ4G256 GEMMs raw activations —
+///      MagnumQuant weights need a pre-FWHT-rotated x (now rotated, all arches);
+///   2. `attention_flash_asym_reduce_batched` covered only 256 dims/head —
+///      every full-attention layer's hd=512 output had its top half unwritten
+///      (kernel chunk-loop fix; was a silent-zero on every arch).
+/// WMMA on RDNA4 additionally needed the `gemm_hfq4g256_wmma_gfx12` sibling
+/// (half8 / _w32_gfx12 / rows-contiguous C). With those landed there is no
+/// arch refusal — `run_prefill_gemm` still hard-errors loudly if a WMMA
+/// kernel is missing for some dtype × arch.
+fn gemma4_batched_prefill_optin(_gpu: &rdna_compute::Gpu) -> bool {
+    lowered::batched_prefill_enabled() || lowered::wmma_prefill_enabled()
 }
 
 /// Expert-parallel serving state (task #26 — see docs/plans/daemon-ep-wiring.md).
@@ -4179,10 +4168,8 @@ fn load_model(
                     .to_string(),
             );
         }
+        let _ = kv_mode;
         let _ = state_quant_override;
-        // kv_mode is honoured for arch 13: "fwht3" uses FWHT-512 3-bit K +
-        // Q8_0 V on the full-attention layers; anything else (default) uses Q8.
-        let kv_mode_fwht3 = kv_mode == "fwht3";
 
         // ── Lowered (Kevin-fork execute_steps) path selection ──────────────
         //
@@ -4197,9 +4184,9 @@ fn load_model(
         // opt-in is silently ignored when a drafter is present).
         let lowered_cfg = lowered::config_from_hfq(&hfq)
             .ok_or_else(|| "gemma4: lowered config_from_hfq failed".to_string())?;
-        // Arch-gated opt-in: refuses (with a log line) outside gfx11-class —
-        // gfx12 batched/WMMA prefill emits silent special-token garbage from
-        // token 0, so dense models stay on the eager per-token path there.
+        // Env opt-in (works on all WMMA-class arches incl. RDNA4 since the
+        // 2026-06-10 MQ4-rotation + batched-reduce fixes; see
+        // gemma4_batched_prefill_optin doc comment).
         let want_batched = gemma4_batched_prefill_optin(gpu);
         let use_lowered =
             lowered_cfg.enable_moe_block || (want_batched && gemma4_drafter.is_none());
@@ -4212,31 +4199,22 @@ fn load_model(
             lowered::init_scratch_constants(gpu, &scratch, lowered_cfg.full_head_dim)
                 .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
             // q8 ring-buffered sliding KV (constant ~300 MB regardless of
-            // context length; wraps via pos % sliding_window) + q8 full KV.
+            // context length; wraps via pos % sliding_window) + asym3 full KV.
             let kv_sliding = hipfire_runtime::llama::KvCache::new_gpu_q8_capped(
                 gpu, lowered_cfg.n_layers, lowered_cfg.sliding_n_kv_heads,
                 lowered_cfg.sliding_head_dim, max_seq, lowered_cfg.sliding_window,
             ).map_err(|e| format!("gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"))?;
-            let all_true: Vec<bool> = vec![true; lowered_cfg.n_layers];
-            let kv_full = if kv_mode_fwht3 {
-                hipfire_runtime::llama::KvCache::new_gpu_fwht3_capped_filtered(
-                    gpu, &all_true, lowered_cfg.full_n_kv_heads,
-                    lowered_cfg.full_head_dim, max_seq, max_seq,
-                ).map_err(|e| format!("gemma4 (lowered) full KV alloc (fwht3): {e:?}"))?
-            } else {
-                hipfire_runtime::llama::KvCache::new_gpu_q8(
-                    gpu, lowered_cfg.n_layers, lowered_cfg.full_n_kv_heads,
-                    lowered_cfg.full_head_dim, max_seq,
-                ).map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?
-            };
-            let kv_mode_label = if kv_mode_fwht3 { "fwht3" } else { "q8" };
+            let kv_full = hipfire_runtime::llama::KvCache::new_gpu_asym3(
+                gpu, lowered_cfg.n_layers, lowered_cfg.full_n_kv_heads,
+                lowered_cfg.full_head_dim, max_seq,
+            ).map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?;
             let eos_tok = tokenizer
                 .special_token_id("<end_of_turn>")
                 .or_else(|| tokenizer.special_token_id("<turn|>"))
                 .unwrap_or(106);
             let chat_template = resolve_chat_template(&hfq, path);
             eprintln!(
-                "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full {kv_mode_label} KV)",
+                "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full asym3 KV)",
                 lowered_cfg.enable_moe_block, want_batched,
             );
             return Ok(LoadedModel {
@@ -4311,16 +4289,9 @@ fn load_model(
         let config = gemma4::config::Gemma4Config::from_hfq(&hfq)?;
         let weights = gemma4::gemma4::Gemma4Weights::load(&hfq, &config, gpu)?;
         // Size both KV caches (sliding hd=256 + full hd=512) to the
-        // requested window.  kv_mode="fwht3" replaces the full-layer cache
-        // with FWHT-512 3-bit K + Q8_0 V; the sliding cache stays Q8 always.
-        let state = if kv_mode_fwht3 {
-            eprintln!("  gemma4 eager path: kv_mode=fwht3 (full layers: FWHT-512 3-bit K + Q8_0 V)");
-            gemma4::gemma4::Gemma4State::new_with_fwht3_max_seq(gpu, &config, max_seq)
-                .map_err(|e| format!("gemma4: Gemma4State::new_with_fwht3_max_seq failed: {e}"))?
-        } else {
-            gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, &config, max_seq)
-                .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?
-        };
+        // requested window.
+        let state = gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, &config, max_seq)
+            .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?;
         // Optional EAGLE drafter (arch-22 `gemma4_unified_assistant`): load
         // the drafter weights + per-step scratch + the reusable spec scratch,
         // then prime the batched verify path. File-missing / arch-mismatch is
@@ -13621,9 +13592,8 @@ fn generate_gemma4_lowered(
         // HIPFIRE_BATCHED_PREFILL=1 (scalar) until the F16 precision issue is fixed.
         let wmma = lowered::wmma_prefill_enabled();
         let single_chunk = prompt_ids.len() <= scratch.max_prefill_batch;
-        // Arch-gated opt-in (see gemma4_batched_prefill_optin): refuses with
-        // a log line outside gfx11-class, where batched/WMMA prefill emits
-        // silent special-token garbage from token 0 — per-token is coherent.
+        // Env opt-in (all WMMA-class arches incl. RDNA4 — see
+        // gemma4_batched_prefill_optin doc comment for the fixed root causes).
         let use_batched = gemma4_batched_prefill_optin(gpu)
             && prompt_ids.len() >= 4
             && !has_moe
