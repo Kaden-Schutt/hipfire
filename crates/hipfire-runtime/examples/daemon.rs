@@ -24,6 +24,7 @@
 use base64::Engine;
 use hip_bridge::HipResult;
 use hipfire_arch_deepseek4 as deepseek4;
+use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_dots_ocr::dots_ocr;
@@ -1193,6 +1194,19 @@ struct LoadedModel {
     /// its end-of-turn marker is the added token `[e~[`; falls back to common
     /// alternates, then 1.
     minimax_eos_tok: u32,
+    // Gemma 4 dense state (arch_id=13 — hipfire-arch-gemma4). Hybrid
+    // 5:1 sliding/full attention with K=V sharing on full layers, sandwich
+    // RMSNorm + layer_scalar, gelu_pytorch_tanh SwiGLU, tied lm_head, final
+    // logit softcap. Both KV caches (sliding hd=256 + full hd=512) live
+    // inside Gemma4State; no separate field. None on every other arch path.
+    gemma4_config: Option<gemma4::config::Gemma4Config>,
+    gemma4_weights: Option<gemma4::gemma4::Gemma4Weights>,
+    gemma4_state: Option<gemma4::gemma4::Gemma4State>,
+    /// End-of-turn token id resolved at load time. Gemma 4's conversational
+    /// stop is `<end_of_turn>` / `<turn|>` (HF eos_token_id list `[1, 106]`);
+    /// resolved by name via the tokenizer, falls back to the documented 106.
+    /// `<eos>` (config.eos_token, id 1) is checked separately in generate.
+    gemma4_eos_tok: u32,
     /// MTP config — parsed from load-message params, read at generate time.
     /// Arch-agnostic: currently only DeepSeek V4 (arch_id=9) evaluates these,
     /// but the namespace is intentionally not deepseek4-specific.
@@ -1924,6 +1938,7 @@ fn main() {
                             9 => "deepseek4",
                             10 => "minimax_m2",
                             11 => "lfm2moe",
+                            13 => "gemma4",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
@@ -1933,6 +1948,8 @@ fn main() {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else if let Some(ref c) = m.qwen2_config {
                             (c.hidden_size, c.num_hidden_layers, c.vocab_size)
+                        } else if let Some(ref c) = m.gemma4_config {
+                            (c.dim, c.n_layers, c.vocab_size)
                         } else if let Some(ref c) = m.dots_ocr_config {
                             (
                                 c.text.hidden_size,
@@ -2272,6 +2289,12 @@ fn main() {
                     // models that fall into block-level attractors at lower
                     // temperatures — use the card-recommended temp=1.0/top_p=1.0.
                     (1.0_f64, 1.0_f64)
+                } else if m.arch_id == 13 {
+                    // Gemma 4 (13): Gemma family model cards recommend
+                    // temperature=1.0, top_p=0.95, top_k=64. The daemon
+                    // sampler is temp + top_p (the sample path's top-K is a
+                    // fixed candidate gather), so apply temp=1.0 + top_p=0.95.
+                    (1.0_f64, 0.95_f64)
                 } else {
                     (0.3_f64, 0.8_f64)
                 };
@@ -2700,6 +2723,14 @@ fn main() {
                     if let Some(ref mut s) = m.minimax_state {
                         s.reset();
                     }
+                    // arch_id=13 (Gemma 4): clear the KV cursor between turns.
+                    // reset() is cursor-only; the captured decode hipGraph stays
+                    // valid across resets (position is re-staged via pos_host on
+                    // every replay and attention geometry is sized for max_seq —
+                    // see decode_step_with_graph's capture-safety invariants).
+                    if let Some(ref mut s) = m.gemma4_state {
+                        s.reset();
+                    }
                     // Restore adaptive-KV controller to start tier (q8/fwht4)
                     // so thresholds fire correctly on the fresh conversation
                     // instead of staying pinned at the floor tier.
@@ -2757,6 +2788,7 @@ fn main() {
                         9 => "deepseek4",
                         10 => "minimax_m2",
                         11 => "lfm2moe",
+                        13 => "gemma4",
                         _ => "qwen3",
                     })
                     .unwrap_or("none");
@@ -2986,6 +3018,28 @@ fn main() {
                         }
                     }
                     ok
+                } else if m.arch_id == 13 {
+                    // Gemma 4 warm-pass: per-token eager decode_step over the
+                    // synthetic prompt. Saturates the hybrid sliding/full
+                    // attention + sandwich-norm + GeGLU + softcap kernel set
+                    // before any user-facing generate. This IS the production
+                    // prefill shape (per-token; the hipGraph path only covers
+                    // the decode loop).
+                    let config = m.gemma4_config.as_ref().unwrap();
+                    let weights = m.gemma4_weights.as_ref().unwrap();
+                    let state = m.gemma4_state.as_mut().unwrap();
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if gemma4::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        )
+                        .is_err()
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
@@ -3030,6 +3084,12 @@ fn main() {
                 // MiniMax-M2 (arch_id=10): KV cache + scratch share MiniMaxState;
                 // reset its cursor (no gpu) for a cold prefill on the next request.
                 if let Some(ref mut s) = m.minimax_state {
+                    s.reset();
+                }
+                // Gemma 4 (arch_id=13): both KV caches + scratch share
+                // Gemma4State; reset its cursor (no gpu) for a cold prefill
+                // on the next request.
+                if let Some(ref mut s) = m.gemma4_state {
                     s.reset();
                 }
 
@@ -3119,6 +3179,14 @@ fn main() {
 const FROGGERIC_QWEN35_TEMPLATE: &str =
     include_str!("../templates/eval/qwen35-froggeric-v20.jinja");
 const LFM2_TEMPLATE: &str = include_str!("../templates/eval/lfm2-liquidai.jinja");
+/// Gemma 4 (arch 13) bundled template. Copy of google/gemma-4-*-it's HF
+/// `chat_template.jinja` (`<|turn>role\n…<turn|>` framing + thought-channel
+/// pre-fill + `<|tool>`/`<|tool_call>` blocks); already in-tree since the
+/// May-07 D4 coherence-parity wiring (c40c44eb) and minijinja-validated
+/// there. Used when the .hfq carries no embedded chat_template (the
+/// quantizer embeds `tokenizer_config.chat_template` when the source repo
+/// has one; older exports don't).
+const GEMMA4_TEMPLATE: &str = include_str!("../templates/gemma-4-it.jinja");
 
 fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) -> Option<String> {
     // 1. Env-var override.
@@ -3177,6 +3245,18 @@ fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) 
                 return Some(t);
             }
             return Some(LFM2_TEMPLATE.to_string());
+        }
+        13 => {
+            // Gemma 4: prefer the BUNDLED copy over the embedded one (mirror
+            // of the qwen 5|6 arm). The upstream HF template relies on jinja2
+            // lenient-Undefined (`value['enum']` truth-tests on absent JSON-
+            // schema keys); under our strict-undefined minijinja env those
+            // raise at render time and the tools / tool-replay branches fall
+            // back to a raw un-framed prompt. The bundled copy is the same
+            // template with strict-safe `'k' in x` probes (byte-identical
+            // output) — see the gemma4_bundled_template_renders unit test.
+            // Env / per-model overrides (steps 1-2) still win.
+            return Some(GEMMA4_TEMPLATE.to_string());
         }
         _ => {}
     }
@@ -3540,6 +3620,10 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_state: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3625,6 +3709,10 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_state: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3731,6 +3819,10 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_state: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3830,6 +3922,110 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_state: None,
+            gemma4_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
+            vision_config: None,
+            vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            kv_adaptive: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(),
+            prefill_checkpoints: Vec::new(),
+            dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
+    if hfq.arch_id == 13 {
+        // Gemma 4 dense (hipfire-arch-gemma4). Standalone bring-up — no
+        // eviction, no DFlash drafter, no EAGLE/spec-decode, no PFlash, no
+        // VL, no pipeline-parallel (v1 refusal contracts below). Prefill
+        // goes through the eager `gemma4::forward::decode_step`; the decode
+        // loop uses `decode_step_with_graph` (hipGraph, default ON) in the
+        // `generate_gemma4` hot path. Free-function load triple (config →
+        // weights → state); the gemma4 crate's `Architecture` impl exists
+        // but the daemon mirrors the lfm2moe free-function pattern.
+        if draft_path.is_some() {
+            return Err("Speculative decode (DFlash/EAGLE draft) not supported on \
+                       arch_id=13 (Gemma 4) in the daemon yet. Reload without a draft."
+                .to_string());
+        }
+        if cask.sidecar.is_some() {
+            return Err(
+                "CASK eviction not supported on arch_id=13 (Gemma 4). \
+                       Reload without --cask-sidecar."
+                    .to_string(),
+            );
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        let config = gemma4::config::Gemma4Config::from_hfq(&hfq)?;
+        let weights = gemma4::gemma4::Gemma4Weights::load(&hfq, &config, gpu)?;
+        // Size both KV caches (sliding hd=256 + full hd=512) to the
+        // requested window.
+        let state = gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, &config, max_seq)
+            .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?;
+        // Resolve the conversational end-of-turn token. Gemma 4's HF config
+        // sets eos_token_id to the LIST [1, 106]: `<eos>` (1) plus the
+        // end-of-turn marker — named `<turn|>` on gemma-4 tokenizers,
+        // `<end_of_turn>` on gemma-3-style exports. Resolve by name, fall
+        // back to the documented id 106. `<eos>`/config.eos_token is checked
+        // separately in the generate stop set.
+        let eos_tok: u32 = tokenizer
+            .special_token_id("<end_of_turn>")
+            .or_else(|| tokenizer.special_token_id("<turn|>"))
+            .unwrap_or(106);
+        let chat_template = resolve_chat_template(&hfq, path);
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1,
+            ep: None,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            kv_cache: None,
+            dn_state: None,
+            llama_config: None,
+            llama_weights: None,
+            llama_scratch: None,
+            llama_kv: None,
+            qwen2_config: None,
+            qwen2_weights: None,
+            qwen2_state: None,
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            lfm2moe_config: None,
+            lfm2moe_weights: None,
+            lfm2moe_state: None,
+            lfm2moe_eos_tok: 0,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
+            gemma4_config: Some(config),
+            gemma4_weights: Some(weights),
+            gemma4_state: Some(state),
+            gemma4_eos_tok: eos_tok,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -3944,6 +4140,10 @@ fn load_model(
             minimax_weights: Some(weights),
             minimax_state: Some(state),
             minimax_eos_tok: eos_tok,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_state: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4404,6 +4604,10 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_state: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4479,6 +4683,10 @@ fn load_model(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_state: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4642,6 +4850,10 @@ fn load_model_safetensors(
             minimax_weights: None,
             minimax_state: None,
             minimax_eos_tok: 0,
+            gemma4_config: None,
+            gemma4_weights: None,
+            gemma4_state: None,
+            gemma4_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
@@ -4785,6 +4997,10 @@ fn load_model_safetensors(
         minimax_weights: None,
         minimax_state: None,
         minimax_eos_tok: 0,
+        gemma4_config: None,
+        gemma4_weights: None,
+        gemma4_state: None,
+        gemma4_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -5025,6 +5241,10 @@ fn load_model_pp(
         minimax_weights: None,
         minimax_state: None,
         minimax_eos_tok: 0,
+        gemma4_config: None,
+        gemma4_weights: None,
+        gemma4_state: None,
+        gemma4_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -5215,6 +5435,10 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
         minimax_weights: None,
         minimax_state: None,
         minimax_eos_tok: 0,
+        gemma4_config: None,
+        gemma4_weights: None,
+        gemma4_state: None,
+        gemma4_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -5337,6 +5561,10 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         minimax_weights: None,
         minimax_state: None,
         minimax_eos_tok: eos_tok,
+        gemma4_config: None,
+        gemma4_weights: None,
+        gemma4_state: None,
+        gemma4_eos_tok: 0,
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
@@ -5903,6 +6131,11 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(pbs) = m.deepseek4_pbs {
         pbs.free_gpu(gpu);
     }
+    // Gemma 4 (arch_id=13): both KV caches + the per-decode scratch live in
+    // Gemma4State — one free_gpu call handles all of it.
+    if let Some(s) = m.gemma4_state {
+        s.free_gpu(gpu);
+    }
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
     if let Some(w) = m.q35_weights {
@@ -5918,6 +6151,11 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         w.free_gpu(gpu);
     }
     if let Some(w) = m.deepseek4_weights {
+        w.free_gpu(gpu);
+    }
+    // Gemma 4 weights: tied lm_head aliases embed_tokens — free_gpu frees the
+    // owning allocation exactly once (the alias is skipped inside).
+    if let Some(w) = m.gemma4_weights {
         w.free_gpu(gpu);
     }
     // Drop pointer-keyed caches whose keys point at weight buffers that are
@@ -8542,6 +8780,38 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         );
         let _ = (repeat_penalty, repeat_window);
         generate_lfm2moe(
+            m,
+            gpu,
+            stdout,
+            id,
+            prompt,
+            system_prompt,
+            temp,
+            top_p,
+            max_tokens,
+            max_think_tokens,
+            tools,
+            messages_history,
+        );
+        return;
+    }
+    if m.arch_id == 13 {
+        // arch_id=13 (Gemma 4 dense). Standalone bring-up — same shape as
+        // the lfm2moe short-circuit above. PFlash / DFlash / EAGLE / VL /
+        // multi-GPU / sampler-budget scaffolding all bypass (refused at
+        // load). We honour `system_prompt`, `temp`, `top_p`, and (via
+        // JinjaChatFrame) `messages_history` + `tools` rendering; thinking
+        // mode and spec-decode are out of scope for v1.
+        let _ = (
+            budget_alert_at_tok,
+            budget_alert_text,
+            assistant_prefix,
+            pflash_state,
+            pflash_cfg,
+            think_mode,
+        );
+        let _ = (repeat_penalty, repeat_window);
+        generate_gemma4(
             m,
             gpu,
             stdout,
@@ -12245,6 +12515,289 @@ fn generate_lfm2moe(
     }
 
     m.seq_pos = m.lfm2moe_state.as_ref().unwrap().n_tokens;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms,
+    );
+    let _ = stdout.flush();
+}
+
+/// Gemma 4 dense (arch_id=13) generate path — minimal AR bring-up.
+///
+/// Mirrors `generate_lfm2moe`'s shape (per-token prefill loop, per-token
+/// decode loop, JSONL `token` / `done` events) with four gemma4-specifics:
+///
+///   1. Prompt build renders the arch-13 chat template (embedded or the
+///      bundled `templates/gemma-4-it.jinja`) through `JinjaChatFrame` with
+///      an EXPLICIT `bos_token: Some("<bos>")` — gemma4's tokenizer decodes
+///      bos_id to the LLaMA-cosmetic `<s>`, which re-tokenizes to a 3-token
+///      BPE fragment instead of the single id=2 the template expects (see
+///      the May-07 D4 wiring, c40c44eb). A BOS-prepend guard after encode
+///      covers the no-bos render/fallback paths without ever doubling it.
+///   2. v1 is NON-THINKING: `enable_thinking: false` makes the template
+///      pre-fill the empty thought channel
+///      (`<|turn>model\n<|channel>thought\n<channel|>`) so the model answers
+///      directly instead of improvising the channel scaffold. Thinking-mode
+///      streaming/parsing is a follow-up.
+///   3. Decode runs `gemma4::forward::decode_step_with_graph` (hipGraph
+///      capture/replay, default ON, `HIPFIRE_GEMMA4_GRAPH=0` opt-out);
+///      prefill stays on the eager `decode_step`.
+///   4. Stop set: gemma4's HF `eos_token_id` is the LIST `[1, 106]` —
+///      `<eos>` (config.eos_token) plus the end-of-turn marker (`<turn|>` /
+///      `<end_of_turn>`, resolved at load into `m.gemma4_eos_tok`). Stopping
+///      on the scalar alone loops the end-of-turn token forever.
+///
+/// Out of scope for v1 (and intentionally NOT wired): EAGLE/DFlash
+/// spec-decode, thinking mode, grammar, tool-call parsing/execution, repeat
+/// penalty, multi-GPU, eviction/prefix-cache. Correctness first.
+#[allow(clippy::too_many_arguments)]
+fn generate_gemma4(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    // v1 is non-thinking (see doc comment item 2); the think budget only
+    // gates thinking-capable paths.
+    let _ = max_think_tokens;
+
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
+        return;
+    }
+    if m.gemma4_config.is_none() {
+        emit_error_with_id(
+            stdout,
+            id,
+            "gemma4_config missing on arch_id=13 generate".to_string(),
+        );
+        return;
+    }
+    let bos_tok = m.gemma4_config.as_ref().unwrap().bos_token;
+    let cfg_eos_tok = m.gemma4_config.as_ref().unwrap().eos_token;
+
+    // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        // Jinja default-ON (flipped 2026-06-09): render through the model's
+        // chat template; opt out with HIPFIRE_JINJA_CHAT=0. Arch 13 always
+        // resolves a template (embedded or bundled), so the fallback below is
+        // render-failure / opt-out only.
+        let jinja_enabled =
+            std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        let mut ids: Vec<u32> = if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: false,
+                bos_token: Some("<bos>"),
+            };
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
+                    match messages_history {
+                        Some(h) => h,
+                        None => {
+                            let mut v = Vec::new();
+                            if let Some(sys) = system_prompt {
+                                v.push(hipfire_runtime::prompt_frame::Message {
+                                    role: hipfire_runtime::prompt_frame::Role::System,
+                                    content: sys.to_string(),
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                });
+                            }
+                            v.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::User,
+                                content: prompt.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                            });
+                            synthesized = v;
+                            &synthesized
+                        }
+                    };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    eprintln!(
+                        "[daemon] jinja render failed in gemma4 path ({e}) — \
+                         falling back to BOS + raw prompt"
+                    );
+                    // Raw fallback (NOT Plain ChatML — gemma4 never trained
+                    // on <|im_start|> framing): BOS + raw user prompt, same
+                    // shape as the infer_gemma4 example. Degraded (no
+                    // instruct framing) but coherent.
+                    tokenizer.encode(prompt)
+                }
+            }
+        } else {
+            tokenizer.encode(prompt)
+        };
+        // BOS guard: the jinja render emits `{{ bos_token }}` itself ("<bos>"
+        // → single id 2 via special-token segmentation); the raw fallback
+        // doesn't. Prepend only when absent so it is never doubled.
+        if ids.first() != Some(&bos_tok) {
+            ids.insert(0, bos_tok);
+        }
+        ids
+    };
+
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize".to_string());
+        return;
+    }
+
+    // Stop set (see doc comment item 4). `m.gemma4_eos_tok` already resolved
+    // `<end_of_turn>` / `<turn|>` / 106 at load; union with config.eos_token
+    // (`<eos>`, id 1) and the documented 106 for robustness across exports.
+    let stop_set: Vec<u32> = {
+        let mut s = vec![cfg_eos_tok, m.gemma4_eos_tok];
+        if !s.contains(&106) {
+            s.push(106);
+        }
+        s.dedup();
+        s
+    };
+
+    // Capacity guard. No eviction on arch_id=13 — reset the KV cursors when
+    // the requested run would overflow the physical cache.
+    let overflow = {
+        let state = m.gemma4_state.as_ref().unwrap();
+        state.n_tokens + prompt_ids.len() + max_tokens > state.max_seq
+    };
+    if overflow {
+        let (n, cap) = {
+            let state = m.gemma4_state.as_ref().unwrap();
+            (state.n_tokens, state.max_seq)
+        };
+        eprintln!("[daemon] arch_id=13 context full ({n}/{cap}) — resetting Gemma4State");
+        m.gemma4_state.as_mut().unwrap().reset();
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+    // Hard refusal: even from a cold cache the prompt alone must fit (KV
+    // writes at pos >= max_seq would be out of bounds).
+    let cache_cap = m.gemma4_state.as_ref().unwrap().max_seq;
+    if prompt_ids.len() >= cache_cap {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "gemma4 prompt is {} tokens but max_seq is {cache_cap}",
+                prompt_ids.len()
+            ),
+        );
+        return;
+    }
+
+    let t0 = Instant::now();
+
+    // ── Prefill: eager decode_step per prompt token. The LAST decode_step's
+    // logits are the predictions for the first generated token. ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    {
+        let cfg = m.gemma4_config.as_ref().unwrap();
+        let weights = m.gemma4_weights.as_ref().unwrap();
+        let state = m.gemma4_state.as_mut().unwrap();
+        let mut position = state.n_tokens as u32;
+        for &tok in &prompt_ids {
+            match gemma4::forward::decode_step(cfg, weights, state, gpu, tok, position) {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("gemma4 prefill failed: {e:?}"));
+                    return;
+                }
+            }
+            position += 1;
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // ── Decode loop. Sample host-side from the running logits vector. ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if stop_set.contains(&next_tok) {
+            break;
+        }
+
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        // KV-capacity guard: the next forward writes KV at slot n_tokens;
+        // forwarding at pos >= max_seq would write out of bounds. Stop
+        // cleanly here — the just-emitted token is still valid.
+        if m.gemma4_state.as_ref().unwrap().n_tokens >= cache_cap {
+            break;
+        }
+
+        let step = {
+            let cfg = m.gemma4_config.as_ref().unwrap();
+            let weights = m.gemma4_weights.as_ref().unwrap();
+            let state = m.gemma4_state.as_mut().unwrap();
+            let position = state.n_tokens as u32;
+            gemma4::forward::decode_step_with_graph(cfg, weights, state, gpu, next_tok, position)
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("gemma4 decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = m.gemma4_state.as_ref().unwrap().n_tokens;
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);

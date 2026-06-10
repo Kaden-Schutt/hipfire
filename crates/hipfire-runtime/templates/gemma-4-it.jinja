@@ -7,17 +7,17 @@
             {%- if ns.found_first %},{% endif -%}
             {%- set ns.found_first = true -%}
             {{ key }}:{
-            {%- if value['description'] -%}
+            {%- if 'description' in value and value['description'] -%}
                 description:<|"|>{{ value['description'] }}<|"|>
                 {%- set add_comma = true -%}
             {%- endif -%}
-            {%- if value['type'] | upper == 'STRING' -%}
-                {%- if value['enum'] -%}
+            {%- if 'type' in value and value['type'] | upper == 'STRING' -%}
+                {%- if 'enum' in value and value['enum'] -%}
                     {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
                     enum:{{ format_argument(value['enum']) }}
                 {%- endif -%}
-            {%- elif value['type'] | upper == 'ARRAY' -%}
-                {%- if value['items'] is mapping and value['items'] -%}
+            {%- elif 'type' in value and value['type'] | upper == 'ARRAY' -%}
+                {%- if 'items' in value and value['items'] is mapping and value['items'] -%}
                     {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
                     items:{
                     {%- set ns_items = namespace(found_first=false) -%}
@@ -52,11 +52,11 @@
                     }
                 {%- endif -%}
             {%- endif -%}
-            {%- if value['nullable'] %}
+            {%- if 'nullable' in value and value['nullable'] %}
                 {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
                 nullable:true
             {%- endif -%}
-            {%- if value['type'] | upper == 'OBJECT' -%}
+            {%- if 'type' in value and value['type'] | upper == 'OBJECT' -%}
                 {%- if value['properties'] is defined and value['properties'] is mapping -%}
                     {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
                     properties:{
@@ -68,7 +68,7 @@
                     {{- format_parameters(value, value['required'] | default([]), filter_keys=true) -}}
                     }
                 {%- endif -%}
-                {%- if value['required'] -%}
+                {%- if 'required' in value and value['required'] -%}
                     {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
                     required:[
                     {%- for item in value['required'] | default([]) -%}
@@ -85,13 +85,13 @@
 {%- endmacro -%}
 {%- macro format_function_declaration(tool_data) -%}
     declaration:{{- tool_data['function']['name'] -}}{description:<|"|>{{- tool_data['function']['description'] -}}<|"|>
-    {%- set params = tool_data['function']['parameters'] -%}
+    {%- set params = tool_data['function'].get('parameters') -%}
     {%- if params -%}
         ,parameters:{
-        {%- if params['properties'] -%}
-            properties:{ {{- format_parameters(params['properties'], params['required']) -}} },
+        {%- if 'properties' in params and params['properties'] -%}
+            properties:{ {{- format_parameters(params['properties'], params.get('required')) -}} },
         {%- endif -%}
-        {%- if params['required'] -%}
+        {%- if 'required' in params and params['required'] -%}
             required:[
             {%- for item in params['required'] -%}
                 <|"|>{{- item -}}<|"|>
@@ -99,17 +99,17 @@
             {%- endfor -%}
             ],
         {%- endif -%}
-        {%- if params['type'] -%}
+        {%- if 'type' in params and params['type'] -%}
             type:<|"|>{{- params['type'] | upper -}}<|"|>}
         {%- endif -%}
     {%- endif -%}
     {%- if 'response' in tool_data['function'] -%}
         {%- set response_declaration = tool_data['function']['response'] -%}
         ,response:{
-        {%- if response_declaration['description'] -%}
+        {%- if 'description' in response_declaration and response_declaration['description'] -%}
             description:<|"|>{{- response_declaration['description'] -}}<|"|>,
         {%- endif -%}
-        {%- if response_declaration['type'] | upper == 'OBJECT' -%}
+        {%- if 'type' in response_declaration and response_declaration['type'] | upper == 'OBJECT' -%}
             type:<|"|>{{- response_declaration['type'] | upper -}}<|"|>}
         {%- endif -%}
     {%- endif -%}
@@ -242,7 +242,7 @@
 
             {%- if message['tool_calls'] -%}
                 {%- for tool_call in message['tool_calls'] -%}
-                    {%- set function = tool_call['function'] -%}
+                    {%- set function = tool_call['function'] if 'function' in tool_call else tool_call -%}
                     {{- '<|tool_call>call:' + function['name'] + '{' -}}
                     {%- if function['arguments'] is mapping -%}
                         {%- set ns_args = namespace(found_first=false) -%}
@@ -277,10 +277,10 @@
                     {%- else -%}
                         {%- set follow = loop_messages[k] -%}
                         {#- Resolve tool_call_id to function name -#}
-                        {%- set ns_tname = namespace(name=follow.get('name') | default('unknown')) -%}
+                        {%- set ns_tname = namespace(name=follow.get('name') or 'unknown') -%}
                         {%- for tc in message['tool_calls'] -%}
                             {%- if tc.get('id') == follow.get('tool_call_id') -%}
-                                {%- set ns_tname.name = tc['function']['name'] -%}
+                                {%- set ns_tname.name = tc['function']['name'] if 'function' in tc else tc['name'] -%}
                             {%- endif -%}
                         {%- endfor -%}
                         {#- Handle content as string or content-parts array -#}

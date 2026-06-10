@@ -506,6 +506,54 @@ impl Gemma4Weights {
             layers,
         })
     }
+
+    /// Return all GPU weight buffers to the pool (drained on unload by the
+    /// daemon's `unload_model`). Consumes self.
+    ///
+    /// `lm_head` is NOT freed here: it is always an alias of `embed_tokens`'
+    /// allocation (tied embeddings — see the alias construction in `load`).
+    /// `embed_tokens` owns the bytes and is freed exactly once below; dropping
+    /// the alias is a no-op (`DeviceBuffer` has no `Drop`).
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.embed_tokens);
+        let _ = gpu.free_tensor(self.final_norm);
+        for l in self.layers {
+            match l {
+                LayerWeights::Sliding(l) => {
+                    let _ = gpu.free_tensor(l.input_layernorm);
+                    let _ = gpu.free_tensor(l.post_attention_layernorm);
+                    let _ = gpu.free_tensor(l.pre_feedforward_layernorm);
+                    let _ = gpu.free_tensor(l.post_feedforward_layernorm);
+                    l.q_proj.free_all(gpu);
+                    l.k_proj.free_all(gpu);
+                    l.v_proj.free_all(gpu);
+                    l.o_proj.free_all(gpu);
+                    let _ = gpu.free_tensor(l.q_norm);
+                    let _ = gpu.free_tensor(l.k_norm);
+                    l.gate_proj.free_all(gpu);
+                    l.up_proj.free_all(gpu);
+                    l.down_proj.free_all(gpu);
+                }
+                LayerWeights::Full(l) => {
+                    let _ = gpu.free_tensor(l.input_layernorm);
+                    let _ = gpu.free_tensor(l.post_attention_layernorm);
+                    let _ = gpu.free_tensor(l.pre_feedforward_layernorm);
+                    let _ = gpu.free_tensor(l.post_feedforward_layernorm);
+                    l.q_proj.free_all(gpu);
+                    l.k_proj.free_all(gpu);
+                    if let Some(v) = l.v_proj {
+                        v.free_all(gpu);
+                    }
+                    l.o_proj.free_all(gpu);
+                    let _ = gpu.free_tensor(l.q_norm);
+                    let _ = gpu.free_tensor(l.k_norm);
+                    l.gate_proj.free_all(gpu);
+                    l.up_proj.free_all(gpu);
+                    l.down_proj.free_all(gpu);
+                }
+            }
+        }
+    }
 }
 
 // ──────────────────────────── State ────────────────────────────
@@ -671,5 +719,33 @@ impl Gemma4State {
 
     pub fn reset(&mut self) {
         self.n_tokens = 0;
+    }
+
+    /// Return all GPU state buffers (both KV caches, the device position
+    /// scalar, and the per-decode scratch tensors) to the pool. Consumes
+    /// self. Caller follows with `gpu.drain_pool()` (the daemon's
+    /// `unload_model` already does).
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.kv_sliding.free_gpu(gpu);
+        self.kv_full.free_gpu(gpu);
+        let _ = gpu.hip.free(self.pos_buf);
+        for t in [
+            self.x,
+            self.residual,
+            self.tmp,
+            self.tmp_rot,
+            self.q,
+            self.k,
+            self.v,
+            self.attn_out,
+            self.v_norm_ones,
+            self.gate_ffn,
+            self.up_ffn,
+            self.ffn_hidden,
+            self.ffn_out,
+            self.logits,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
     }
 }
