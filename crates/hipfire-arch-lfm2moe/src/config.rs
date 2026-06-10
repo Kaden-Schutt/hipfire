@@ -76,11 +76,26 @@ struct RawLfm2MoeConfig {
     #[serde(default = "default_conv_l")]
     conv_L_cache: usize,
     intermediate_size: usize,
+    // MoE fields — present on lfm2_moe (A1B), ABSENT on dense lfm2 (350M/1.2B).
+    #[serde(default)]
     moe_intermediate_size: usize,
+    #[serde(default)]
     num_experts: usize,
+    #[serde(default)]
     num_experts_per_tok: usize,
     #[serde(default)]
     num_dense_layers: usize,
+    // LFM2 SwiGLU FFN auto-adjustment (LLaMA-style): the REAL dense FFN dim is
+    // round_to(block_multiple_of, multiplier * 2/3 * block_ff_dim), NOT the raw
+    // intermediate_size. e.g. 350M: round_256(2/3 * 6656) = 4608, not 6656.
+    #[serde(default)]
+    block_auto_adjust_ff_dim: bool,
+    #[serde(default = "default_multiple_of")]
+    block_multiple_of: usize,
+    #[serde(default)]
+    block_ffn_dim_multiplier: Option<f32>,
+    #[serde(default)]
+    block_ff_dim: Option<usize>,
     #[serde(default)]
     rope_parameters: Option<RawRope>,
     #[serde(default = "default_rope_theta")]
@@ -103,6 +118,9 @@ struct RawLfm2MoeConfig {
 
 fn default_rope_theta() -> f32 {
     1_000_000.0
+}
+fn default_multiple_of() -> usize {
+    256
 }
 fn default_conv_l() -> usize {
     3
@@ -160,6 +178,29 @@ impl Lfm2MoeConfig {
                 other => Err(format!("lfm2moe: unknown layer_type {other:?}")),
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // Dense SwiGLU FFN dim: LFM2 auto-adjusts intermediate_size LLaMA-style
+        // (the loaded w1/w2/w3 tensors use this dim, NOT raw intermediate_size).
+        // Idempotent for configs that already carry the adjusted value or set
+        // block_auto_adjust_ff_dim=false (e.g. A1B), so MoE behavior is preserved.
+        let intermediate_size = {
+            let base = raw.block_ff_dim.unwrap_or(raw.intermediate_size);
+            if raw.block_auto_adjust_ff_dim {
+                let mut ff = (2 * base) / 3;
+                if let Some(m) = raw.block_ffn_dim_multiplier {
+                    ff = (m * ff as f32) as usize;
+                }
+                let mo = raw.block_multiple_of.max(1);
+                mo * ((ff + mo - 1) / mo)
+            } else {
+                raw.intermediate_size
+            }
+        };
+        // Dense lfm2 (Lfm2ForCausalLM, no experts) → every layer is dense SwiGLU.
+        let num_dense_layers = if raw.num_experts == 0 {
+            raw.num_hidden_layers
+        } else {
+            raw.num_dense_layers
+        };
         Ok(Lfm2MoeConfig {
             vocab_size: raw.vocab_size,
             hidden_size: raw.hidden_size,
@@ -168,11 +209,11 @@ impl Lfm2MoeConfig {
             num_key_value_heads: raw.num_key_value_heads,
             head_dim,
             conv_kernel_size: raw.conv_L_cache,
-            intermediate_size: raw.intermediate_size,
+            intermediate_size,
             moe_intermediate_size: raw.moe_intermediate_size,
             num_experts: raw.num_experts,
             num_experts_per_tok: raw.num_experts_per_tok,
-            num_dense_layers: raw.num_dense_layers,
+            num_dense_layers,
             rope_theta,
             rms_norm_eps: raw.norm_eps,
             max_position_embeddings: raw.max_position_embeddings,

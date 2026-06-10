@@ -462,6 +462,26 @@ impl Gpu {
                 &format!("device id {id} out of range (count={count})"),
             ));
         }
+        if let Ok(mode) = std::env::var("HIPFIRE_HIP_WAIT") {
+            let mode_lc = mode.to_ascii_lowercase();
+            let flags = match mode_lc.as_str() {
+                "auto" => Some(0x00),
+                "spin" => Some(0x01),
+                "yield" => Some(0x02),
+                "block" | "blocking" | "blocking_sync" => Some(0x04),
+                "" => None,
+                other => {
+                    eprintln!(
+                        "WARNING: unknown HIPFIRE_HIP_WAIT={other:?}; expected auto|spin|yield|blocking"
+                    );
+                    None
+                }
+            };
+            if let Some(flags) = flags {
+                hip.set_device_flags(flags)?;
+                eprintln!("[hipfire] HIP wait mode: {mode_lc}");
+            }
+        }
         // set_device must precede try_init_rocblas — rocBLAS captures the
         // currently-bound device into its handle.
         hip.set_device(id)?;
@@ -1148,6 +1168,31 @@ impl Gpu {
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         self.hip.memcpy_htod(&tensor.buf, bytes)?;
         Ok(tensor)
+    }
+
+    /// Allocate an F32 tensor filled with a constant `value` (host-side fill +
+    /// sync htod). Used for `-inf`-initialised buffers where a byte-memset
+    /// can't express the bit pattern (e.g. the compressor `score_state`, which
+    /// the reference inits to `float("-inf")` so unfilled pool slots get zero
+    /// softmax weight).
+    pub fn full_f32(&mut self, shape: &[usize], value: f32) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let tensor = self.alloc_tensor(shape, DType::F32)?;
+        let data = vec![value; tensor.numel()];
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        self.hip.memcpy_htod(&tensor.buf, bytes)?;
+        Ok(tensor)
+    }
+
+    /// In-place constant fill of an existing F32 tensor (sync htod).
+    pub fn fill_f32(&mut self, tensor: &GpuTensor, value: f32) -> HipResult<()> {
+        self.bind_thread()?;
+        let data = vec![value; tensor.numel()];
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+        self.hip.memcpy_htod(&tensor.buf, bytes)?;
+        Ok(())
     }
 
     pub fn download_f32(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {

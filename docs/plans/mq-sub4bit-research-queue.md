@@ -62,7 +62,7 @@ rounding) to a CPU reference of the same math.
 
 ### Owner / files
 
-- New: `crates/engine/examples/verify_mq3_kernel.rs` (CPU/GPU compare).
+- New: `crates/hipfire-runtime/examples/verify_mq3_kernel.rs` (CPU/GPU compare).
 - Reads: `crates/rdna-compute/src/dispatch.rs` (kernel wrapper), 
   `kernels/src/gemv_hfq3g256.hip` (decode formula),
   `crates/hipfire-quantize/src/main.rs` (`quantize_mq3g256` output layout).
@@ -202,7 +202,7 @@ codebooks fine. They're NOT per-block Lloyd-Max — that's what Q1 adds.
 ### Files
 
 - `crates/hipfire-quantize/src/main.rs`: new `quantize_mq2g256_lloyd`.
-- `crates/engine/src/hfq.rs`: qt 19 → `DType::MQ2G256Lloyd`.
+- `crates/hipfire-runtime/src/hfq.rs`: qt 19 → `DType::MQ2G256Lloyd`.
 - `crates/rdna-compute/src/dispatch.rs`: new dispatch arm + GEMV
   wrapper paralleling `gemv_mq2g256_with_rotate`.
 - `kernels/src/gemv_mq2g256_lloyd.hip`: new — codebook-lookup variant.
@@ -260,7 +260,7 @@ needs Q2 (GPTQ) or Q4 (mixed-precision) on top.
 | `quantize_mq3g256_lloyd` (parallel rayon `par_chunks_mut`) | `crates/hipfire-quantize/src/main.rs` | ~110 |
 | `gemv_mq3g256_lloyd.hip` (8-way switch codebook lookup) | `kernels/src/` | ~85 |
 | `DType::MQ3G256Lloyd` + dispatch wrappers | `crates/rdna-compute/src/dispatch.rs` | ~30 |
-| Engine load arms (qt=20 in 3 sites + DeltaNet CPU dequant) | `crates/engine/src/{hfq,llama,qwen35}.rs` | ~80 |
+| Engine load arms (qt=20 in 3 sites + DeltaNet CPU dequant) | `crates/hipfire-runtime/src/{hfq,llama}.rs + crates/hipfire-arch-qwen35/src/qwen35.rs` | ~80 |
 | `--allow-mq3-lloyd` / `HIPFIRE_ALLOW_MQ3_LLOYD=1` guard | quantizer | ~15 |
 
 Quantize time: 9B Lloyd-MQ3 ~85s wall on 24-core (rayon parallelized over
@@ -301,7 +301,7 @@ uniform MQ3 from 114 → 141). Tracked separately.
 
 - `benchmarks/results/lloyd_max_findings_20260501.md` — full empirical
   writeup with all four formats compared.
-- `crates/engine/examples/perplexity.rs` — single-window NLL harness
+- `crates/hipfire-runtime/examples/perplexity.rs` — single-window NLL harness
   (issue #113 alpha→beta gate is now answered by data, not eyeball).
 - Engine wiring as above.
 

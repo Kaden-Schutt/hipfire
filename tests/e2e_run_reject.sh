@@ -14,7 +14,11 @@
 set -uo pipefail
 MODEL=${MODEL:-qwen3.5:0.8b}
 TMPCFG=$(mktemp -d)
-trap "rm -rf $TMPCFG" EXIT
+# shellcheck disable=SC2329 # invoked by trap
+cleanup() {
+  rm -rf -- "${TMPCFG:-}"
+}
+trap cleanup EXIT
 
 # Isolated HOME; only config.json differs, models/bin are symlinked.
 mkdir -p "$TMPCFG/.hipfire"

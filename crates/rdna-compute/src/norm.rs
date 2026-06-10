@@ -19,6 +19,24 @@ use hip_bridge::{DeviceBuffer, HipResult};
 /// systematic bias that drifted the recurrent state on long generations.
 static GDN_REQUANT_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Q8 DeltaNet-state requant cadence for batched (n_tokens>1) launches.
+/// `false` (DEFAULT) = single-end requant at the last token only (MQ4-fast path,
+/// recovers the per-token-requant DFlash regression). `true` = per-token Q8
+/// roundtrip (PARO drift-echo correctness, ~1.8× slower batched). Strictly OFF
+/// for MQ4/HFQ; opt in via `HIPFIRE_DN_REQUANT_PER_TOKEN=1` for PARO checkpoints
+/// (shisa-ai A3B). For n_tokens==1 (AR decode / DFlash draft) both are identical.
+fn dn_requant_per_token() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HIPFIRE_DN_REQUANT_PER_TOKEN")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0"
+            })
+            .unwrap_or(false)
+    })
+}
+
 impl Gpu {
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
@@ -1449,9 +1467,9 @@ impl Gpu {
         gate: &GpuTensor, beta: &GpuTensor,
         s_q8: &GpuTensor, s_scales: &GpuTensor, output: &GpuTensor,
         n_tokens: usize, n_heads: usize, head_dim: usize,
+        ef_residual: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
         let qp = q.buf.as_ptr();
         let kp = k.buf.as_ptr();
         let vp = v.buf.as_ptr();
@@ -1463,32 +1481,74 @@ impl Gpu {
         let nt = n_tokens as i32;
         let nh = n_heads as i32;
         let hd = head_dim as i32;
-        // Per-launch monotonic frame for the Q8 state stochastic-rounding
-        // dither (data-INDEPENDENT entropy; see GATED_DELTA_NET_Q8 kernel).
         let fr = GDN_REQUANT_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
-            &vp as *const _ as *mut c_void, &gp as *const _ as *mut c_void,
-            &bp as *const _ as *mut c_void, &sp as *const _ as *mut c_void,
-            &scp as *const _ as *mut c_void, &op as *const _ as *mut c_void,
-            &nt as *const _ as *mut c_void, &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void, &fr as *const _ as *mut c_void,
-        ];
+        let efp: *mut c_void = ef_residual.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let n_tiles = (128 / 4) as u32;
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
-        let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8", bytes);
-        let result = self.launch_maybe_blob(
-            "gated_delta_net_q8", [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
-                b.push_ptr(gp); b.push_ptr(bp); b.push_ptr(sp);
-                b.push_ptr(scp); b.push_ptr(op);
-                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(fr);
-                b
-            },
-        );
-        if let Some(t) = timer { t.finish(&self.hip); }
+
+        // Use the lean "fast" kernel for the default path (no per-token requant).
+        // The fast kernel keeps the requant OUTSIDE the per-token loop, avoiding
+        // the VGPR spill-to-scratch on gfx906 wave64 that the full kernel suffers
+        // when both code paths are compiled into one function (108→172 bytes scratch).
+        // EF residual is supported in both paths; the split is only about cadence.
+        let use_fast = !dn_requant_per_token();
+
+        let result = if use_fast {
+            self.ensure_kernel("gated_delta_net_q8_fast", kernels::GATED_DELTA_NET_Q8_FAST_SRC, "gated_delta_net_q8_fast")?;
+            let mut params: Vec<*mut c_void> = vec![
+                &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
+                &vp as *const _ as *mut c_void, &gp as *const _ as *mut c_void,
+                &bp as *const _ as *mut c_void, &sp as *const _ as *mut c_void,
+                &scp as *const _ as *mut c_void, &op as *const _ as *mut c_void,
+                &nt as *const _ as *mut c_void, &nh as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void, &fr as *const _ as *mut c_void,
+                &efp as *const _ as *mut c_void,
+            ];
+            let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8_fast", bytes);
+            let r = self.launch_maybe_blob(
+                "gated_delta_net_q8_fast", [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                    b.push_ptr(gp); b.push_ptr(bp); b.push_ptr(sp);
+                    b.push_ptr(scp); b.push_ptr(op);
+                    b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(fr);
+                    b.push_ptr(efp);
+                    b
+                },
+            );
+            if let Some(t) = timer { t.finish(&self.hip); }
+            r
+        } else {
+            self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
+            let rpt = 1i32; // per_token is always true in this path
+            let mut params: Vec<*mut c_void> = vec![
+                &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
+                &vp as *const _ as *mut c_void, &gp as *const _ as *mut c_void,
+                &bp as *const _ as *mut c_void, &sp as *const _ as *mut c_void,
+                &scp as *const _ as *mut c_void, &op as *const _ as *mut c_void,
+                &nt as *const _ as *mut c_void, &nh as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void, &fr as *const _ as *mut c_void,
+                &efp as *const _ as *mut c_void,
+                &rpt as *const _ as *mut c_void,
+            ];
+            let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8", bytes);
+            let r = self.launch_maybe_blob(
+                "gated_delta_net_q8", [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                    b.push_ptr(gp); b.push_ptr(bp); b.push_ptr(sp);
+                    b.push_ptr(scp); b.push_ptr(op);
+                    b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(fr);
+                    b.push_ptr(efp);
+                    b.push_i32(rpt);
+                    b
+                },
+            );
+            if let Some(t) = timer { t.finish(&self.hip); }
+            r
+        };
         result
     }
 
@@ -1523,9 +1583,17 @@ impl Gpu {
         n_tokens: usize,
         n_heads: usize,
         head_dim: usize,
+        // Optional f16 error-feedback residual; see gated_delta_net_q8. The
+        // batched path requants per token in-launch, so EF carries token-to-token
+        // (and chunk-boundary) error — consistent with the per-token decode/replay.
+        ef_residual: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
+        let use_fast = !dn_requant_per_token();
+        let kernel_name = if use_fast { "gated_delta_net_q8_fast" } else { "gated_delta_net_q8" };
+        let kernel_src = if use_fast { kernels::GATED_DELTA_NET_Q8_FAST_SRC } else { kernels::GATED_DELTA_NET_Q8_SRC };
+        let kernel_fn = if use_fast { "gated_delta_net_q8_fast" } else { "gated_delta_net_q8" };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_fn)?;
 
         let n_tiles = (128 / 4) as u32;
 
@@ -1545,38 +1613,78 @@ impl Gpu {
         // seed it would have gotten from n_tokens sequential per-token
         // launches. The kernel indexes these as `frame + t` (t = 0..n-1).
         let mut fr = GDN_REQUANT_FRAME.fetch_add(n_tokens as u32, std::sync::atomic::Ordering::Relaxed) as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut gp as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut sp as *mut _ as *mut c_void,
-            &mut scp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut nt as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut fr as *mut _ as *mut c_void,
-        ];
-
+        let mut efp: *mut c_void = ef_residual.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut rpt = dn_requant_per_token() as i32;
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8_batch_seq", bytes);
-        let result = self.launch_maybe_blob(
-            "gated_delta_net_q8",
-            [n_heads as u32, n_tiles, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
-                b.push_ptr(gp); b.push_ptr(bp);
-                b.push_ptr(sp); b.push_ptr(scp); b.push_ptr(op);
-                b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(fr);
-                b
-            },
-        );
+
+        let result = if use_fast {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut scp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut fr as *mut _ as *mut c_void,
+                &mut efp as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gated_delta_net_q8_fast",
+                [n_heads as u32, n_tiles, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                    b.push_ptr(gp); b.push_ptr(bp);
+                    b.push_ptr(sp); b.push_ptr(scp); b.push_ptr(op);
+                    b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(fr);
+                    b.push_ptr(efp);
+                    b
+                },
+            )
+        } else {
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut scp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut fr as *mut _ as *mut c_void,
+                &mut efp as *mut _ as *mut c_void,
+                &mut rpt as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gated_delta_net_q8",
+                [n_heads as u32, n_tiles, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                    b.push_ptr(gp); b.push_ptr(bp);
+                    b.push_ptr(sp); b.push_ptr(scp); b.push_ptr(op);
+                    b.push_i32(nt); b.push_i32(nh); b.push_i32(hd); b.push_i32(fr);
+                    b.push_ptr(efp);
+                    b.push_i32(rpt);
+                    b
+                },
+            )
+        };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }

@@ -27,12 +27,27 @@ Edit interactively with `hipfire config` (global) or `hipfire config
 
 | Key | Default | Values |
 |---|---|---|
-| `kv_cache` | auto (per arch) | auto / q8 / asym4 / asym3 / asym2 / turbo / turbo4 / turbo3 / turbo2 |
+| `kv_cache` | auto (per arch) | auto / q8 / fwht4 / fwht3 / fwht2 / asym4 / asym3 / asym2 / turbo / turbo4 / turbo3 / turbo2 |
+| `kv_adaptive` | off | off / conservative / balanced / aggressive / `advanced:k=<fwht4\|fwht3\|fwht2>,v=<lloyd4\|lloyd3\|lloyd2>` |
 
-Per-arch defaults: gfx1100 → asym3, gfx1030 → asym3, gfx1010/1013 →
-asym2. asym3 is rotated K (Lloyd-Max) + Q8 V — the multi-turn quality
-sweet spot. Use `q8` for byte-exact reference behavior at higher VRAM
-cost.
+Per-arch defaults (live, set in `cli/index.ts::archDefaults`): **fwht3**
+on RDNA3+ (gfx1100/1101/1102), RDNA4 (gfx1200/1201), and the
+larger-VRAM RDNA2 parts (gfx1030/1031); **fwht2** on the tight-memory
+parts — RDNA1 (gfx1010/1013), gfx1032 (6600 XT 8 GB), and gfx1151
+(Strix Halo APU, shared memory). The unknown-arch fall-through is
+fwht3. `fwhtN` is FWHT-rotated K (N-bit) + Q8 V — same ~5.5×
+compression and byte layout as the legacy `asymN` Givens modes, but the
+K-rotation basis matches the MQ4 weight/draft FWHT convention so DFlash
+speculative acceptance stays high. Use `q8` for byte-exact reference
+behavior at higher VRAM cost; the `asym*` modes are the legacy Givens
+behavior (kept for backward compat).
+
+`kv_adaptive` (opt-in, default off) downshifts K/V precision at runtime
+to fit growing context. The `conservative`/`balanced`/`aggressive`
+presets pick a built-in floor/threshold schedule; the
+`advanced:k=...,v=...` form pins an explicit K floor (fwht4/fwht3/fwht2)
+and V floor (lloyd4/lloyd3/lloyd2). With adaptive on, `max_seq` is the
+context guaranteed at the floor tier.
 
 ## Speculative decode (DFlash)
 
@@ -154,8 +169,10 @@ hipfire config cask-profile                            # list active + available
 | `conservative` | budget=2048, ≈275 MB on 27B | ≥20 GB VRAM, very long advertised contexts | dense only |
 | `aggressive-vram` | budget=512, ≈96 MB on 27B | dense 27B on a 16 GB card with tight headroom; aggressive long-ctx fit | **AR only** — m-fold + DFlash has a documented attractor regression. Set `dflash_mode=off`. Not for A3B. |
 
-¹ KV footprint estimates for dense 27B with `kv_cache=asym3` (~107 KB/token).
-Scale linearly with the model's `n_layers × n_kv_heads × head_dim`.
+¹ KV footprint estimates for dense 27B with `kv_cache=fwht3` (~107 KB/token;
+the legacy `asym3` shares the identical 3-bit-K + Q8-V byte layout, so the
+estimate holds for either). Scale linearly with the model's
+`n_layers × n_kv_heads × head_dim`.
 
 Picking a profile rewrites a bundle of CASK config keys in one shot. The
 `balanced` / `conservative` / `aggressive-vram` profiles set the policy
@@ -350,7 +367,7 @@ Delete a row's override with the TUI's `d` key.
 For testing without touching the config file:
 
 ```
-HIPFIRE_KV_MODE=asym3
+HIPFIRE_KV_MODE=fwht3
 HIPFIRE_ATTN_FLASH=auto
 HIPFIRE_NORMALIZE_PROMPT=0          # opt out of \n{3,} collapse
 HIPFIRE_LOCAL=1                     # skip the running daemon

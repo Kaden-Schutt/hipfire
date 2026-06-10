@@ -1,10 +1,16 @@
 # Benchmarks
 
-All measurements on the indicated arch with the engine's default config
-(asym3 KV, FlashAttention auto, prompt_normalize=on). Numbers are
+All measurements on the indicated arch with the engine's then-default
+config (asym3 KV, FlashAttention auto, prompt_normalize=on). Numbers are
 medians across 5 runs unless noted. See
 [methodology/perf-benchmarking.md](methodology/perf-benchmarking.md) for
 the protocol and the noise band you should expect when reproducing.
+
+> **KV-mode note:** these numbers were measured pre-fwht3-default (the
+> per-arch default is now `fwht3`/`fwht2`, not `asym3`). They remain
+> valid for `asym3` KV. `fwht3` shares `asym3`'s byte layout and is
+> perf-equivalent (it differs only in K-rotation basis), so the decode /
+> BW figures carry over; the asym3 rows are not re-benched here.
 
 ## Autoregressive decode (no spec) — 7900 XTX (gfx1100)
 
@@ -28,7 +34,8 @@ target's high-entropy continuations diverge from draft predictions can
 be a net loss.
 
 5-run medians, asym3 KV, `--no-chatml`, `max_tokens=120`,
-`prompt_normalize=true`:
+`prompt_normalize=true` (measured pre-fwht3-default; numbers remain
+valid for asym3 KV):
 
 | Model | genre | AR tok/s | DFlash tok/s | speedup | τ |
 |---|---|---:|---:|---:|---:|
@@ -52,7 +59,8 @@ on.
 
 ## vs ollama (Q4_K_M GGUF) — 7900 XTX
 
-Same machine, same models. hipfire MQ4 (asym3 KV, FlashAttention) vs
+Same machine, same models. hipfire MQ4 (asym3 KV, FlashAttention;
+measured pre-fwht3-default, numbers remain valid for asym3 KV) vs
 ollama default Q4_K_M through llama.cpp's ROCm backend. Matched
 ~140-token and ~530-token prompts and matched 128-token generation
 lengths. Ollama numbers extracted from its own `prompt_eval_duration` /

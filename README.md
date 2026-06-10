@@ -9,7 +9,7 @@ hipfire run  qwen3.5:9b "What is the capital of France?"
 hipfire serve -d        # background daemon, OpenAI-compatible API on 0.0.0.0:11435
 ```
 
-Current release: **v0.2.0** — DeepSeek V4 Flash support. See [CHANGELOG.md](CHANGELOG.md).
+Current release: **v0.2.1** — dispatch unification (#397). DeepSeek V4 Flash support landed in v0.2.0. See [CHANGELOG.md](CHANGELOG.md).
 
 Discord: <https://discord.gg/F3BaywB8Rs>
 
@@ -159,10 +159,12 @@ attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Any change to kernels, quant
-formats, dispatch, fusion, rotation, rmsnorm, or the spec-decode path
-must pass `./scripts/coherence-gate-dflash.sh` before commit. The
-canonical correctness gate is per-arch channel-test; the speed-gate
-catches regressions on the baseline arch. Don't bypass either with
-`--no-verify` — see
+See [CONTRIBUTING.md](CONTRIBUTING.md). Install local hooks with
+`./scripts/install-hooks.sh`. The no-GPU CI subset is
+`./scripts/no-gpu-ci.sh`; it does not replace the hardware gates. Any
+change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
+or the spec-decode path must pass `./scripts/coherence-gate-dflash.sh`
+before commit. The canonical correctness gate is per-arch channel-test;
+the speed-gate catches regressions on the baseline arch. Don't bypass
+either with `--no-verify` — see
 [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md).

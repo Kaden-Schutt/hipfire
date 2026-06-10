@@ -72,7 +72,11 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     registry.register(KernelVariant {
         key: KernelKey::GemmF16XF16Wmma,
-        arch_required: ArchPredicate::HasWmma,
+        // gfx11-only: the kernel source uses the gfx11 half16-layout
+        // __builtin_amdgcn_wmma_f32_16x16x16_f16_w32 and has no gfx12
+        // sibling — admitting RDNA4 here would fail loud at JIT. gfx12
+        // F16 GEMMs route through gemm_f16_wmma_mb8 (has a _gfx12 source).
+        arch_required: ArchPredicate::HasWmmaW32,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,

@@ -41,7 +41,7 @@ impl Architecture for MiniMaxM2 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        MiniMaxWeights::load(hfq, cfg, gpu)
+        MiniMaxWeights::load(hfq, cfg, gpu, None)
     }
 
     fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {

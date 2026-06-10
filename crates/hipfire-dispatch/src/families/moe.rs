@@ -126,6 +126,18 @@ pub struct MoeParams<'a> {
     // activations / residual
     pub x_norm: &'a GpuTensor,
     pub x_residual: &'a GpuTensor,
+    /// EP (expert-parallel, Ship 6 substrate-EP) routed-output redirect. When
+    /// `Some`, the routed combine AND the shared-expert down accumulate into
+    /// this **zeroed** partial buffer instead of `x_residual`; the EP executor
+    /// then all-reduces the partial across ranks and adds it into `x_residual`
+    /// once. `None` (default) = single-GPU: accumulate directly into
+    /// `x_residual`, byte-identical to pre-EP behavior.
+    pub routed_out: Option<&'a GpuTensor>,
+    /// EP: skip the shared-expert **down** projection so the replicated shared
+    /// expert is computed on rank 0 only (not summed N× by the all-reduce).
+    /// `false` (default) = run it (single-GPU). Router + shared gate/up still
+    /// run on every rank (they share the fused gate-side GEMV with the router).
+    pub skip_shared: bool,
     // gate-side weights
     pub router: WeightRef<'a>,
     pub shared_expert_gate: WeightRef<'a>,
@@ -215,6 +227,8 @@ pub struct MoeBiasAwareParams<'a> {
     pub gate_batch: &'a GpuTensor,
     pub up_batch: &'a GpuTensor,
     pub rot_batch: &'a GpuTensor,
+    /// `[k_top × hidden]` per-expert down outputs for the deterministic combine.
+    pub down_expanded: &'a GpuTensor,
 }
 
 // ── DeepSeek-V4 batched/prefill MoE parameters ─────────
@@ -337,6 +351,14 @@ pub struct MoePrefillParams<'a> {
     /// Used by the AWQ-aware silu+rotate step. `None` when the routed
     /// experts are non-AWQ (the common case for A3B).
     pub down_awq_scale: Option<&'a GpuTensor>,
+    /// EP (Ship 6 substrate-EP prefill): when `Some`, the **routed** combine
+    /// accumulates into this **zeroed** `[batch × dim]` partial instead of
+    /// `x_batch`; the EP prefill driver then all-reduce-sums the partial across
+    /// ranks and adds it into each rank's `x_batch`. The **shared** expert stays
+    /// in `x_batch` (replicated per rank — added once to each rank's own copy,
+    /// no all-reduce). `None` (the default) accumulates routed into `x_batch`,
+    /// byte-identical to pre-EP behavior.
+    pub routed_out: Option<&'a GpuTensor>,
 }
 
 /// Resolved dispatch plan for the qwen35 batched MoE prefill routed block.

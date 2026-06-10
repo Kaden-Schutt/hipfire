@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.2.1 — Dispatch unification (#397)
+
+The centralized kernel-dispatch program lands: every GEMV/GEMM/attention/
+MoE/rotation/fused projection across qwen35, llama, qwen2, dots-ocr,
+deepseek4, minimax and lfm2moe now resolves through typed kernel families
+with per-(arch x dtype) tables — a new dense quant is a table entry plus a
+kernel file, no model code. The lowered forward-as-pipeline decode is
+default-on for all seven arches (qwen2/dots-ocr byte-parity validated on
+gfx1100 + gfx1201). KvTierPlan unifies KV-write/flash-attend resolution
+with adaptive-KV exemptions; GPU-free coverage gates assert dispatch plans
+for the entire fleet including RDNA4 rows.
+
+Also in this release: gfx12 F16 GEMV fix (broken gemm_f16_tiled fallback
+rewrote ds4 DSA compressor garbage on RDNA4 — restored byte-parity with
+RDNA3.5 and ds4 EP tool-calling); gemm_f16_tiled rewritten (correct + up
+to 13.8x faster); jinja chat templates default-on; DSML render/parse on
+the EP serve path; q8 error-feedback DeltaNet state default; master line
+fully merged back (hunt-3 fixes, FP32/Q4 DeltaNet spec-decode, MQ6 DFlash,
+F32 oracle passthrough quantizer mode).
+
+
 ## v0.2.0 — DeepSeek V4 Flash + tokenizer diagnostics
 
 DeepSeek V4 Flash is now a first-class hipfire architecture (`arch_id=9`).

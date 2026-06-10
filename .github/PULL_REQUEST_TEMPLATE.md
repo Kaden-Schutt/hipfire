@@ -18,9 +18,11 @@
 
 ## Test plan
 
+- [ ] `./scripts/no-gpu-ci.sh` passes, or equivalent CI job is green
 - [ ] `cargo build --release --workspace --features deltanet` clean
 - [ ] `cargo test --lib --workspace --features deltanet` passes
 - [ ] If kernel/dispatch changed: `./scripts/coherence-gate.sh` clean
+- [ ] If spec-decode changed: `./scripts/coherence-gate-dflash.sh` clean
 - [ ] If perf-relevant: `./scripts/speed-gate.sh` within ±2% of locked baselines
 
 ## Architecture-trait change?

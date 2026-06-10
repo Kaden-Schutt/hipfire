@@ -1,0 +1,3 @@
+[submodule "third_party/amd_matrix_instruction_calculator"]
+	path = third_party/amd_matrix_instruction_calculator
+	url = https://github.com/ROCm/amd_matrix_instruction_calculator.git

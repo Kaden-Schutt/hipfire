@@ -33,7 +33,7 @@ quote it: `hipfire run qwen3.5:9b "What's 2+2?"`.
 | `hipfire config` | Interactive TUI for global config (`~/.hipfire/config.json`). |
 | `hipfire config <tag>` | Per-model overlay (`~/.hipfire/per_model_config.json`). Rows show `(inherited)` vs `(overridden)`. |
 | `hipfire config set <key> <val>` | Non-interactive set. |
-| `hipfire config view` | Print effective config + all overlays. |
+| `hipfire config list` | Print effective config. Prefix with a tag (`hipfire config <tag> list`) for the per-model overlay. |
 
 Full key list and tradeoffs in [CONFIG.md](CONFIG.md).
 

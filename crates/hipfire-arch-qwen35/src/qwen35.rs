@@ -16,13 +16,17 @@ use hipfire_runtime::llama::{
 };
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::{GivensRef, WeightRef};
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::kv_tier::{KvTierPlan, KvTierInputs};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
-use hipfire_dispatch::types::RotationPlan;
+use hipfire_dispatch::pipeline::superop::{
+    self, ForwardBindings, LayerProgram, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
+};
+use hipfire_dispatch::types::{DispatchError, RotationPlan};
 use hipfire_dispatch::types::dtype_rotation_plan;
 
 // ─── Config ─────────────────────────────────────────────────────────────
@@ -862,11 +866,24 @@ pub struct DeltaNetState {
     pub s_scales: Vec<GpuTensor>,
     /// Conv ring buffer: [n_deltanet_layers × conv_channels × (kernel_size-1)] FP32
     pub conv_states: Vec<GpuTensor>,
+    /// Per-element f16 error-feedback residual for Q8 state requant (sigma-delta
+    /// noise-shaping). Empty unless Q8 + `HIPFIRE_DN_STATE_EF`. Same element count
+    /// as `s_matrices`; carries the previous step's quant error so the next
+    /// requant cancels it — DeltaNet's contractive decay damps the shaped noise,
+    /// yielding ~FP32-grade state at Q8's byte container.
+    pub s_ef_residual: Vec<GpuTensor>,
     /// Current quantization mode
     pub quant: StateQuant,
 }
 
 impl DeltaNetState {
+    /// EF residual for a delta-layer, if error-feedback is active (Q8 + flag).
+    /// `None` ⇒ callers pass null ⇒ kernel uses the legacy stochastic-rounding requant.
+    #[inline]
+    pub fn ef_residual(&self, idx: usize) -> Option<&GpuTensor> {
+        self.s_ef_residual.get(idx)
+    }
+
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config) -> HipResult<Self> {
         Self::new_with_quant(gpu, config, StateQuant::Q8)
     }
@@ -889,9 +906,21 @@ impl DeltaNetState {
             + config.linear_num_value_heads * config.linear_value_head_dim;
         let conv_state_size = conv_channels * (config.conv_kernel_dim - 1);
 
+        // Error-feedback (sigma-delta) requant for Q8 state — DEFAULT ON as of
+        // 2026-06-08. q8_ef ≈ FP32 coherence at −0.7% decode vs FP32's −4.5% (best
+        // spec-decode τ too), and far better than stochastic Q8 — DFlash 27b-prose
+        // unique_ratio 0.625 vs 0.555, max_freq 0.055 vs 0.078. Also makes the DN
+        // state DETERMINISTIC (no stochastic dither). Opt OUT with
+        // HIPFIRE_DN_STATE_EF=0. Q8-only (FP32 has no requant; Q4 EF is future
+        // work; the multi-GPU band split is still stochastic — new_with_quant_multi
+        // leaves s_ef_residual empty). Residual is f16 per-element.
+        let ef_enabled = quant == StateQuant::Q8
+            && std::env::var("HIPFIRE_DN_STATE_EF").map(|v| v != "0").unwrap_or(true);
+
         let mut s_matrices = Vec::with_capacity(n_delta_layers);
         let mut s_scales = Vec::with_capacity(n_delta_layers);
         let mut conv_states = Vec::with_capacity(n_delta_layers);
+        let mut s_ef_residual = Vec::with_capacity(if ef_enabled { n_delta_layers } else { 0 });
         for _ in 0..n_delta_layers {
             match quant {
                 StateQuant::FP32 => {
@@ -921,12 +950,16 @@ impl DeltaNetState {
                     s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
                 }
             }
+            if ef_enabled {
+                s_ef_residual.push(gpu.zeros(&[s_size], DType::F16)?);
+            }
             conv_states.push(gpu.zeros(&[conv_state_size], DType::F32)?);
         }
         Ok(Self {
             s_matrices,
             s_scales,
             conv_states,
+            s_ef_residual,
             quant,
         })
     }
@@ -940,6 +973,9 @@ impl DeltaNetState {
             let _ = gpu.free_tensor(t);
         }
         for t in self.conv_states {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.s_ef_residual {
             let _ = gpu.free_tensor(t);
         }
     }
@@ -960,6 +996,9 @@ impl DeltaNetState {
                 for s in &self.conv_states {
                     let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
                 }
+                for s in &self.s_ef_residual {
+                    let _ = gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream);
+                }
             }
             None => {
                 for s in &self.s_matrices {
@@ -969,6 +1008,9 @@ impl DeltaNetState {
                     let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                 }
                 for s in &self.conv_states {
+                    let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for s in &self.s_ef_residual {
                     let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                 }
             }
@@ -1042,6 +1084,10 @@ impl DeltaNetState {
                 s_matrices,
                 s_scales,
                 conv_states,
+                // EF residual not wired for the multi-GPU band split (would need
+                // per-device residual alloc routed by device_for_layer); empty ⇒
+                // ef_residual() returns None ⇒ kernel uses the stochastic path.
+                s_ef_residual: Vec::new(),
                 quant,
             },
             la_to_device,
@@ -1441,6 +1487,48 @@ fn load_weight_tensor_raw(
                 })
             }
         },
+        2 => {
+            // F32 — native full-precision oracle weights (qt=2). Raw f32 LE
+            // bytes uploaded as-is; the engine forwards through gemv_f32 /
+            // gemm_f32_batched / attention_f32. Part of the F1 native-bf16
+            // reference path (no quantization).
+            let buf = gpu.upload_raw(data, &[m, k])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        16 => {
+            // BF16 — widen losslessly to F32 on host, then upload as F32.
+            // bf16 is the high 16 bits of an f32 (same sign/exp, 7 mantissa
+            // bits), so `from_bits((bf16 as u32) << 16)` is exact. The engine
+            // has no native bf16 GEMV for the text arch; the gfx942 bf16 MFMA
+            // GEMM (kernels/src/gemm_bf16_mfma.gfx942.hip) is the perf path and
+            // is documented as a deferred gap. F32 compute over bf16-rounded
+            // weights is a superset-precision oracle.
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         _ => panic!("unsupported quant_type {} for lm_head", quant_type),
     }
 }
@@ -2606,10 +2694,23 @@ pub fn load_weights(
             EmbeddingFormat::Q8_0,
         )
     } else {
-        let f32_data: Vec<f32> = embd_data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
+        // F1 native-bf16 oracle: embed_tokens may arrive as qt=2 (F32, 4-byte
+        // LE) or qt=16 (BF16, 2-byte high-half of f32). Decode by quant_type
+        // rather than assuming F16. qt=1 (F16) keeps the historical path.
+        let f32_data: Vec<f32> = match embd_qt {
+            2 => embd_data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            16 => embd_data
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect(),
+            _ => embd_data
+                .chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+        };
         (
             gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
             EmbeddingFormat::F32,
@@ -4468,7 +4569,7 @@ fn moe_ffn_decode(
         topk_weights: &topk_weights,
         down_expanded: &down_expanded,
     };
-    let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false);
+    let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false, None, false);
 
     for t in [
         router_logits,
@@ -4539,7 +4640,7 @@ pub(crate) fn moe_ffn_decode_with_scratch(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false)
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false, None, false)
 }
 
 /// Same as `moe_ffn_decode_with_scratch` but expects the caller to have
@@ -4556,7 +4657,7 @@ pub(crate) fn moe_ffn_decode_with_scratch_prerotated(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, true)
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, true, None, false)
 }
 
 /// The actual MoE FFN implementation. Uses the caller-provided scratch
@@ -4569,6 +4670,13 @@ fn moe_ffn_decode_impl(
     config: &Qwen35Config,
     s: &MoeScratchRef<'_>,
     x_rot_prerotated: bool,
+    // EP (Ship 6 substrate-EP). `ep_routed_out = Some(partial)` redirects the
+    // routed combine + shared-down into a zeroed partial (the EP executor
+    // all-reduces it and adds into x_residual once); `None` = single-GPU into
+    // x_residual (byte-identical). `ep_skip_shared` skips the shared-expert
+    // down on rank>0 so the replicated shared expert is summed once.
+    ep_routed_out: Option<&GpuTensor>,
+    ep_skip_shared: bool,
 ) -> HipResult<()> {
     let hidden = config.dim;
     let mi = config.moe_intermediate_size;
@@ -4624,6 +4732,11 @@ fn moe_ffn_decode_impl(
         x_rot_prerotated,
         x_norm,
         x_residual,
+        // EP (Ship 6 substrate-EP): threaded from moe_ffn_decode_impl params.
+        // None/false (single-GPU) = byte-identical; Some(partial)/skip_shared
+        // come from moe_ffn_dispatch_ep via run_layer_program_ep.
+        routed_out: ep_routed_out,
+        skip_shared: ep_skip_shared,
         router: ffn.router.dispatch_ref(),
         shared_expert_gate: ffn.shared_expert_gate.dispatch_ref(),
         shared_gate_w: ffn.shared_expert.gate.dispatch_ref(),
@@ -6146,6 +6259,7 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         None, // mask_override: captured-prefill caller does not use the MTP probe hook
         needs_last_token_logits,
         None, // max_layer: single-chunk captured path always runs the full stack
+        None, // routed_out: non-EP single-GPU path
     )
 }
 
@@ -6522,6 +6636,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 mo_for_chunk,
                 needs_last_token_logits,
                 max_layer,
+                None, // routed_out: non-EP single-GPU path
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
@@ -6759,6 +6874,103 @@ fn paro_batched_admit_enabled_from_env(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MoePrefillDtypes {
+    router: DType,
+    shared_expert_scalar_gate: DType,
+    shared_expert_gate: DType,
+    shared_expert_up: DType,
+    shared_expert_down: DType,
+    expert_gate_up: DType,
+    expert_down: DType,
+    expert_gate_up_uniform: bool,
+    expert_down_uniform: bool,
+}
+
+impl MoePrefillDtypes {
+    #[cfg(test)]
+    fn uniform(dtype: DType) -> Self {
+        Self {
+            router: dtype,
+            shared_expert_scalar_gate: dtype,
+            shared_expert_gate: dtype,
+            shared_expert_up: dtype,
+            shared_expert_down: dtype,
+            expert_gate_up: dtype,
+            expert_down: dtype,
+            expert_gate_up_uniform: true,
+            expert_down_uniform: true,
+        }
+    }
+
+    fn from_ffn(ffn: &MoeFfnWeights) -> Option<Self> {
+        let first = ffn.experts.first()?;
+        Some(Self {
+            router: ffn.router.gpu_dtype,
+            shared_expert_scalar_gate: ffn.shared_expert_gate.gpu_dtype,
+            shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
+            shared_expert_up: ffn.shared_expert.up.gpu_dtype,
+            shared_expert_down: ffn.shared_expert.down.gpu_dtype,
+            expert_gate_up: first.gate_up.gpu_dtype,
+            expert_down: first.down.gpu_dtype,
+            expert_gate_up_uniform: ffn
+                .experts
+                .iter()
+                .all(|e| e.gate_up.gpu_dtype == first.gate_up.gpu_dtype),
+            expert_down_uniform: ffn
+                .experts
+                .iter()
+                .all(|e| e.down.gpu_dtype == first.down.gpu_dtype),
+        })
+    }
+}
+
+fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
+    k_top == 8 && num_experts <= 1024
+}
+
+fn moe_ffn_batched_admissible_for_dtypes(
+    dtypes: &MoePrefillDtypes,
+    admit_mq6: bool,
+    admit_paro: bool,
+) -> bool {
+    let router_ok = matches!(dtypes.router, DType::MQ4G256 | DType::Q8_0 | DType::F32);
+    let shared_gate_ok = matches!(
+        dtypes.shared_expert_scalar_gate,
+        DType::MQ4G256 | DType::Q8_0 | DType::F32
+    );
+    if !(router_ok && shared_gate_ok && dtypes.expert_gate_up_uniform && dtypes.expert_down_uniform)
+    {
+        return false;
+    }
+
+    if admit_paro
+        && dtypes.shared_expert_gate == DType::ParoQ4G128
+        && dtypes.shared_expert_up == DType::ParoQ4G128
+        && dtypes.shared_expert_down == DType::ParoQ4G128
+        && dtypes.expert_gate_up == DType::ParoQ4G128
+        && dtypes.expert_down == DType::ParoQ4G128
+    {
+        return true;
+    }
+
+    if admit_mq6 {
+        let shared_gu_dt = dtypes.shared_expert_gate;
+        let shared_gu_ok = matches!(shared_gu_dt, DType::MQ4G256 | DType::MQ6G256)
+            && dtypes.shared_expert_up == shared_gu_dt;
+        let shared_dn_ok = matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ6G256);
+        let experts_ok = matches!(dtypes.expert_gate_up, DType::MQ4G256 | DType::MQ6G256)
+            && matches!(dtypes.expert_down, DType::MQ4G256 | DType::MQ6G256);
+        shared_gu_ok && shared_dn_ok && experts_ok
+    } else {
+        dtypes.shared_expert_gate == DType::MQ4G256
+            && dtypes.shared_expert_up == DType::MQ4G256
+            && dtypes.shared_expert_down == DType::MQ4G256
+            && dtypes.expert_gate_up == DType::MQ4G256
+            && dtypes.expert_down == DType::MQ4G256
+    }
+}
+
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
 /// dispatch — single-token prefill must not take the batched path.
 const MIN_BATCH: usize = 2;
@@ -6787,7 +6999,8 @@ pub fn prefill_batch_pbs_eligible(
     let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
     // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels) and
     // num_experts ≤ 1024 (bound of the batched top-K shared mem).
-    let moe_topk_ok = config.num_experts_per_tok == 8 && config.num_experts <= 1024;
+    let moe_topk_ok =
+        moe_prefill_topk_shape_supported(config.num_experts_per_tok, config.num_experts);
     let admit_mq6 = mq6_batched_admit_enabled_from_env(
         std::env::var("HIPFIRE_MOE_MQ6_ADMIT").ok().as_deref(),
         arch,
@@ -6851,18 +7064,9 @@ fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
 }
 
 fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool) -> bool {
-    // F32 router/shared_gate admit (PARO checkpoints — router is FP16-dense,
-    // expanded to F32 on GPU; shared_expert_gate likewise. See
-    // load_fp16_weight_from_source at qwen35.rs:1177). The dispatch arms in
-    // prefill_moe_ffn_body_batched route F32 through gemm_f32_batched.
-    let router_ok = matches!(
-        ffn.router.gpu_dtype,
-        DType::MQ4G256 | DType::Q8_0 | DType::F32
-    );
-    let shared_gate_ok = matches!(
-        ffn.shared_expert_gate.gpu_dtype,
-        DType::MQ4G256 | DType::Q8_0 | DType::F32
-    );
+    let Some(dtypes) = MoePrefillDtypes::from_ffn(ffn) else {
+        return false;
+    };
 
     // PARO admit is default-on. Set HIPFIRE_PARO_BATCHED=0 to force the old
     // fallback path while bisecting or debugging.
@@ -6875,49 +7079,8 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool) -> bool {
     let admit_paro = *PARO_ADMIT.get_or_init(|| {
         paro_batched_admit_enabled_from_env(std::env::var("HIPFIRE_PARO_BATCHED").ok().as_deref())
     });
-    if admit_paro {
-        let paro_ok = router_ok
-            && shared_gate_ok
-            && matches!(ffn.shared_expert.gate.gpu_dtype, DType::ParoQ4G128)
-            && matches!(ffn.shared_expert.up.gpu_dtype, DType::ParoQ4G128)
-            && matches!(ffn.shared_expert.down.gpu_dtype, DType::ParoQ4G128)
-            && ffn.experts.iter().all(|e| {
-                e.gate_up.gpu_dtype == DType::ParoQ4G128 && e.down.gpu_dtype == DType::ParoQ4G128
-            });
-        if paro_ok {
-            return true;
-        }
-    }
 
-    if admit_mq6 {
-        // Per-projection MQ4 OR MQ6 admit.
-        let shared_gu_dt = ffn.shared_expert.gate.gpu_dtype;
-        let shared_gu_ok = matches!(shared_gu_dt, DType::MQ4G256 | DType::MQ6G256)
-            && ffn.shared_expert.up.gpu_dtype == shared_gu_dt;
-        let shared_dn_ok = matches!(
-            ffn.shared_expert.down.gpu_dtype,
-            DType::MQ4G256 | DType::MQ6G256
-        );
-        let experts_gu = ffn.experts[0].gate_up.gpu_dtype;
-        let experts_dn = ffn.experts[0].down.gpu_dtype;
-        let experts_ok = matches!(experts_gu, DType::MQ4G256 | DType::MQ6G256)
-            && matches!(experts_dn, DType::MQ4G256 | DType::MQ6G256)
-            && ffn
-                .experts
-                .iter()
-                .all(|e| e.gate_up.gpu_dtype == experts_gu && e.down.gpu_dtype == experts_dn);
-        router_ok && shared_gate_ok && shared_gu_ok && shared_dn_ok && experts_ok
-    } else {
-        // Strict MQ4 (pre-fan-out behavior).
-        router_ok
-            && shared_gate_ok
-            && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
-            && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
-            && ffn.shared_expert.down.gpu_dtype == DType::MQ4G256
-            && ffn.experts.iter().all(|e| {
-                e.gate_up.gpu_dtype == DType::MQ4G256 && e.down.gpu_dtype == DType::MQ4G256
-            })
-    }
+    moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, admit_paro)
 }
 
 /// #397 Ship 5.2 slice 1: route a single PLAIN-batched prefill GEMM through
@@ -7173,6 +7336,7 @@ fn run_fused_qkvza_key(
 /// per-token launch replaced by its N-batched equivalent. Byte-exact
 /// except for atomicAdd nondeterminism in the routed-down accumulation
 /// (same as the single-token indexed kernel it replaces).
+#[allow(clippy::too_many_arguments)]
 fn prefill_moe_ffn_body_batched(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
@@ -7181,6 +7345,12 @@ fn prefill_moe_ffn_body_batched(
     pbs: &PrefillBatchScratch,
     n: usize,
     ctx: &DispatchCtx,
+    // EP (Ship 6 substrate-EP prefill): when `Some`, the routed combine writes
+    // into this zeroed `[n × dim]` partial instead of `pbs.x_batch` (the EP
+    // driver all-reduce-sums it across ranks and adds into x_batch). The shared
+    // expert (step 5) stays in `pbs.x_batch` — replicated per rank, not
+    // redirected. `None` = byte-identical single-GPU behavior.
+    routed_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
     let dim = config.dim;
     let mi = config.moe_intermediate_size;
@@ -7613,6 +7783,7 @@ fn prefill_moe_ffn_body_batched(
         paro_gate_up,
         paro_down,
         down_awq_scale,
+        routed_out,
     };
     hipfire_runtime::llama::moe_family()
         .run_prefill(ctx, gpu, &moe_prefill_params)
@@ -7730,10 +7901,21 @@ fn forward_prefill_chunk(
     mask_override: Option<MaskEmbedOverride<'_>>,
     needs_last_token_logits: bool,
     max_layer: Option<usize>,
+    // EP (Ship 6 substrate-EP prefill): per-MoE-layer routed partial. ONLY set
+    // by the EP driver, which calls this with a SINGLE-layer band so the routed
+    // combine of that one MoE layer lands in the zeroed partial (all-reduced by
+    // the driver after the call). Always `None` for multi-layer bands (PP /
+    // single-GPU full stack) — a shared partial across >1 MoE layer would be wrong.
+    routed_out: Option<&GpuTensor>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
+    debug_assert!(
+        routed_out.is_none()
+            || band.map(|b| b.layer_end - b.layer_start <= 1).unwrap_or(false),
+        "forward_prefill_chunk: routed_out requires a single-layer band (EP driver invariant)",
+    );
 
     let dim = config.dim;
     let hidden_dim = config.hidden_dim;
@@ -8450,6 +8632,7 @@ fn forward_prefill_chunk(
                             n,
                             n_v_heads,
                             config.linear_value_head_dim,
+                            dn_state.ef_residual(delta_layer_idx),
                         )?,
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &pbs.dn_q_batch,
@@ -10265,6 +10448,7 @@ fn forward_prefill_chunk(
                             n,
                             n_v_heads,
                             config.linear_value_head_dim,
+                            dn_state.ef_residual(delta_layer_idx),
                         )?,
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &pbs.dn_q_batch,
@@ -10416,7 +10600,7 @@ fn forward_prefill_chunk(
                 // silu_mul + w_down) block. Takes pbs.x_batch as input AND
                 // accumulates the FFN output residual back into it via the
                 // batched indexed down kernel's atomicAdd path.
-                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n, &ctx)?;
+                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n, &ctx, routed_out)?;
 
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
@@ -10943,7 +11127,7 @@ fn forward_prefill_chunk(
                 }
 
                 // Batched MoE FFN.
-                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n, &ctx)?;
+                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n, &ctx, routed_out)?;
 
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
@@ -11518,6 +11702,14 @@ fn forward_scratch_layers(
     s: &Qwen35Scratch,
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
 ) -> HipResult<()> {
+    // #397 Ship 6 — forward-as-pipeline. When HIPFIRE_FORWARD_LOWERED=1, route
+    // single-GPU decode through the lowered super-op executor. Skipped when a
+    // hidden-state ring buffer is active (spec-decode capture engages only the
+    // hand path for now). Default off → the hand arms below run unchanged.
+    if forward_lowered_enabled() && hidden_rb.is_none() {
+        return forward_scratch_layers_lowered(gpu, weights, config, pos, kv_cache, dn_state, s);
+    }
+
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
     let n_v_heads = config.linear_num_value_heads;
@@ -11606,6 +11798,7 @@ fn forward_scratch_layers(
                         1,
                         n_v_heads,
                         config.linear_value_head_dim,
+                        dn_state.ef_residual(delta_layer_idx),
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &s.dn_q,
@@ -11819,6 +12012,7 @@ fn forward_scratch_layers(
                         1,
                         n_v_heads,
                         config.linear_value_head_dim,
+                        dn_state.ef_residual(delta_layer_idx),
                     )?,
                     StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &s.dn_q,
@@ -12159,6 +12353,134 @@ fn moe_ffn_dispatch(
     Ok(())
 }
 
+/// EP (Ship 6 substrate-EP) variant of `moe_ffn_dispatch`: same rmsnorm/rotate +
+/// MoE decode, but the routed combine + shared-down accumulate into `routed_out`
+/// (a zeroed per-rank partial the EP executor all-reduces), and `skip_shared`
+/// gates the shared-expert down to rank 0. Calls `moe_ffn_decode_impl` directly
+/// (the `with_scratch` wrappers don't carry EP params). The residual `x` is left
+/// untouched — the executor adds the all-reduced partial into it afterward.
+fn moe_ffn_dispatch_ep(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x: &GpuTensor,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+    routed_out: &GpuTensor,
+    skip_shared: bool,
+) -> HipResult<()> {
+    let refs = MoeScratchRef::from_scratch(s);
+    if ffn_all_mq4_for_moe(ffn) {
+        gpu.fused_rmsnorm_rotate_mq(
+            x, ffn_norm,
+            s.moe_x_rot.as_ref().expect("MoE scratch"),
+            config.dim, config.norm_eps,
+        )?;
+        moe_ffn_decode_impl(gpu, ffn, x, x, config, &refs, true, Some(routed_out), skip_shared)
+    } else {
+        gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)?;
+        moe_ffn_decode_impl(gpu, ffn, &s.tmp, x, config, &refs, false, Some(routed_out), skip_shared)
+    }
+}
+
+/// EP (Ship 6 substrate-EP, ported from tp-mtp-prototype Stage 3e): shard a MoE
+/// layer's routed experts to `rank`. Frees the non-owned experts (the memory
+/// win), compacts owned to the front of `ffn.experts` (so `experts[0]` stays a
+/// valid shared-AWQ representative for the batched silu/rotate helpers), and
+/// rebuilds the `[2·n_exp]` device pointer tables: owned global id → its
+/// (compacted) buffer ptr; **non-owned → a shared ZEROED gate_up buffer**.
+/// Zeroed quant bytes dequant to +0.0 → the non-owned expert's gate_up output
+/// is 0 → silu·mul = 0 → rot = 0 → down output 0, so it contributes nothing
+/// through `moe_down_combine` WITHOUT any masking kernel. (The non-owned down
+/// ptr is irrelevant — its input rot is already 0 — so it reuses
+/// `experts[0].down`.) Router / shared expert / attention stay full (replicated
+/// in EP v1). The zero buffer is leaked for v1 (lives until teardown) to avoid
+/// threading a lifetime field through `Qwen35Weights`.
+pub fn shard_moe_experts(
+    gpu: &mut Gpu,
+    ffn: &mut MoeFfnWeights,
+    shard: &ShardConfig,
+    rank: usize,
+    n_exp: usize,
+) -> HipResult<()> {
+    debug_assert_eq!(
+        ffn.experts.len(), n_exp,
+        "shard_moe_experts expects a full-loaded expert Vec (paged EP is unsupported in v1)",
+    );
+    // Free non-owned experts; compact owned to the front, recording global→local.
+    let old = std::mem::take(&mut ffn.experts);
+    let mut compacted: Vec<ExpertWeights> = Vec::with_capacity(shard.experts_per_rank(n_exp));
+    let mut local_of_global = vec![usize::MAX; n_exp];
+    for (e, ew) in old.into_iter().enumerate() {
+        if shard.owns_expert(rank, e) {
+            local_of_global[e] = compacted.len();
+            compacted.push(ew);
+        } else {
+            let _ = gpu.free_tensor(ew.gate_up.buf);
+            if let Some(s) = ew.gate_up.awq_scale { let _ = gpu.free_tensor(s); }
+            let _ = gpu.free_tensor(ew.down.buf);
+            if let Some(s) = ew.down.awq_scale { let _ = gpu.free_tensor(s); }
+        }
+    }
+    assert!(
+        !compacted.is_empty(),
+        "shard_moe_experts: rank {rank} owns no experts (n_exp={n_exp}, tp={})",
+        shard.tp_size,
+    );
+
+    // Shared zeroed gate_up buffer for non-owned slots (same byte size as a real
+    // expert's gate_up). LEAKED (mem::forget) so the ptr stays valid for the
+    // model's lifetime without a Qwen35Weights field — v1 TODO: own it properly.
+    let gu_bytes = compacted[0].gate_up.buf.buf.size();
+    let zero_gu = gpu.zeros(&[gu_bytes / 4], DType::F32)?;
+    let dummy_gu = zero_gu.buf.as_ptr() as u64;
+    let dummy_dn = compacted[0].down.buf.buf.as_ptr() as u64; // rot=0 ⇒ output 0 regardless
+    std::mem::forget(zero_gu);
+
+    // Rebuild the [2·n_exp] u64 pointer tables (8 B/ptr = 2 F32 slots).
+    let mut gu = vec![0u64; n_exp];
+    let mut dn = vec![0u64; n_exp];
+    for e in 0..n_exp {
+        if shard.owns_expert(rank, e) {
+            let li = local_of_global[e];
+            gu[e] = compacted[li].gate_up.buf.buf.as_ptr() as u64;
+            dn[e] = compacted[li].down.buf.buf.as_ptr() as u64;
+        } else {
+            gu[e] = dummy_gu;
+            dn[e] = dummy_dn;
+        }
+    }
+    let gu_b: Vec<u8> = gu.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    let dn_b: Vec<u8> = dn.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    gpu.hip.memcpy_htod(&ffn.expert_gate_up_ptrs.buf, &gu_b)?;
+    gpu.hip.memcpy_htod(&ffn.expert_down_ptrs.buf, &dn_b)?;
+    ffn.experts = compacted;
+    Ok(())
+}
+
+/// Shard every MoE layer of a replicated `Qwen35Weights` to `rank`, calling
+/// [`shard_moe_experts`] on each `DeltaNetMoe` / `FullAttnMoe` layer's FFN.
+/// Dense / attention-only layers are untouched. Convenience wrapper for the EP
+/// load path so callers (the `forward_ep` driver / examples) never reach into
+/// `LayerWeights` internals. `n_exp` is the model's routed expert count
+/// (`config.num_experts`).
+pub fn shard_all_moe_layers(
+    gpu: &mut Gpu,
+    weights: &mut Qwen35Weights,
+    shard: &ShardConfig,
+    rank: usize,
+    n_exp: usize,
+) -> HipResult<()> {
+    for layer in weights.layers.iter_mut() {
+        match layer {
+            LayerWeights::DeltaNetMoe(l) => shard_moe_experts(gpu, &mut l.ffn, shard, rank, n_exp)?,
+            LayerWeights::FullAttnMoe(l) => shard_moe_experts(gpu, &mut l.ffn, shard, rank, n_exp)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// TriAttention tap helper (inline from original forward).
 fn triattn_tap(
     gpu: &mut Gpu,
@@ -12241,6 +12563,787 @@ fn kv_cache_attention_dispatch(
     ]).map_err(|e| HipError::new(0, &e.to_string()))
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// #397 Ship 6 — forward-as-pipeline: qwen35 DECODE lowered path (ADDITIVE).
+//
+// `HIPFIRE_FORWARD_LOWERED=1` routes the single-GPU decode layer loop through
+// the dispatch substrate's `run_layer_program` executor (one pre-resolved
+// `LayerProgram` of coarse super-ops per layer) instead of the hand-written
+// arms in `forward_scratch_layers`. The hand arms are left UNTOUCHED, so the
+// default (flag off) is byte-identical to master by construction; the lowered
+// path is validated byte-identical via the external committed-token md5 gate
+// (`FORWARD_LOWERED=0` vs `=1`, same prompt) on the fleet before the default is
+// flipped per arch. See [[project_ship6_forward_pipeline_design_2026_06_07]].
+//
+// The super-op handlers call the SAME helper fns the hand path uses
+// (`qkv/qkvza/gate_up_via_execute_steps`, `kv_cache_attention_dispatch`,
+// `moe_ffn_dispatch`, `weight_gemv_swiglu_residual`) plus the inline attend/
+// recurrent/gated-norm fragments. DIAG dumps / trace_finite / hidden_rb are
+// output-neutral and omitted here (hidden_rb engages only the hand path).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// qwen35-local super-op opcodes, encoded into `OpBinding.weights[0].0`. The
+/// `SuperOpKind` routes to the `ForwardBindings` method; the opcode disambiguates
+/// *which* op of that kind within the layer (qkv vs gate_up, wo vs down, …).
+mod q35_op {
+    // Proj
+    pub const PROJ_QKV: u32 = 0;
+    pub const PROJ_QKVZA: u32 = 1;
+    pub const PROJ_GATE_UP: u32 = 2;
+    // Attend
+    pub const ATTEND_FULL: u32 = 0;
+    pub const ATTEND_DN_PREP: u32 = 1;
+    // ResidualGemv
+    pub const RESID_WO: u32 = 0;
+    pub const RESID_DOWN_SWIGLU: u32 = 1;
+    // Norm
+    pub const NORM_GATED: u32 = 0;
+    // Recurrent
+    pub const RECUR_GDN: u32 = 0;
+    // Moe
+    pub const MOE_FFN: u32 = 0;
+}
+
+/// The four qwen35 decoder-layer shapes. Derived from the `LayerWeights`
+/// discriminant; kept as a plain enum so `lower_variant` is pure (no GpuTensor)
+/// and unit-testable without a GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Q35Variant {
+    DeltaNet,
+    FullAttn,
+    DeltaNetMoe,
+    FullAttnMoe,
+}
+
+fn variant_of(layer: &LayerWeights) -> Q35Variant {
+    match layer {
+        LayerWeights::DeltaNet(_) => Q35Variant::DeltaNet,
+        LayerWeights::FullAttn(_) => Q35Variant::FullAttn,
+        LayerWeights::DeltaNetMoe(_) => Q35Variant::DeltaNetMoe,
+        LayerWeights::FullAttnMoe(_) => Q35Variant::FullAttnMoe,
+    }
+}
+
+#[inline]
+fn q35_superop(kind: SuperOpKind, code: u32) -> SuperOp {
+    SuperOp {
+        kind,
+        binding: OpBinding {
+            key: None,
+            weights: vec![WeightSlot(code)],
+            scratch: Vec::new(),
+            flavor: OpFlavor::None,
+        },
+    }
+}
+
+/// Lower one qwen35 decoder layer to a coarse-super-op `LayerProgram`. The op
+/// SEQUENCE mirrors the matching hand arm in `forward_scratch_layers` exactly
+/// (per the decode-forward variant map). Pure → unit-testable.
+fn lower_variant(v: Q35Variant) -> LayerProgram {
+    use q35_op::*;
+    use SuperOpKind::{Attend, Moe, Norm, Proj, Recurrent, ResidualGemv};
+    match v {
+        Q35Variant::DeltaNet => vec![
+            q35_superop(Proj, PROJ_QKVZA),
+            q35_superop(Attend, ATTEND_DN_PREP),
+            q35_superop(Recurrent, RECUR_GDN),
+            q35_superop(Norm, NORM_GATED),
+            q35_superop(ResidualGemv, RESID_WO),
+            q35_superop(Proj, PROJ_GATE_UP),
+            q35_superop(ResidualGemv, RESID_DOWN_SWIGLU),
+        ],
+        Q35Variant::FullAttn => vec![
+            q35_superop(Proj, PROJ_QKV),
+            q35_superop(Attend, ATTEND_FULL),
+            q35_superop(ResidualGemv, RESID_WO),
+            q35_superop(Proj, PROJ_GATE_UP),
+            q35_superop(ResidualGemv, RESID_DOWN_SWIGLU),
+        ],
+        Q35Variant::DeltaNetMoe => vec![
+            q35_superop(Proj, PROJ_QKVZA),
+            q35_superop(Attend, ATTEND_DN_PREP),
+            q35_superop(Recurrent, RECUR_GDN),
+            q35_superop(Norm, NORM_GATED),
+            q35_superop(ResidualGemv, RESID_WO),
+            q35_superop(Moe, MOE_FFN),
+        ],
+        Q35Variant::FullAttnMoe => vec![
+            q35_superop(Proj, PROJ_QKV),
+            q35_superop(Attend, ATTEND_FULL),
+            q35_superop(ResidualGemv, RESID_WO),
+            q35_superop(Moe, MOE_FFN),
+        ],
+    }
+}
+
+/// Per-layer execution context for the lowered decode path. Holds the current
+/// layer's weights + shared scratch/state by reference; rebuilt each layer
+/// iteration so the borrows stay scoped. `kv_cache` is the only `&mut` (DeltaNet
+/// state is mutated through interior-mutable GpuTensor buffers via shared refs).
+struct Qwen35Bindings<'a> {
+    layer: &'a LayerWeights,
+    s: &'a Qwen35Scratch,
+    config: &'a Qwen35Config,
+    kv_cache: &'a mut llama::KvCache,
+    dn_state: &'a DeltaNetState,
+    pos: usize,
+    layer_idx: usize,
+    delta_layer_idx: usize,
+    k_dim: usize,
+    v_dim: usize,
+    n_v_heads: usize,
+    hd: usize,
+}
+
+fn op_code(op: &OpBinding) -> u32 {
+    op.weights.first().map(|w| w.0).unwrap_or(u32::MAX)
+}
+
+impl<'a> ForwardBindings for Qwen35Bindings<'a> {
+    fn run_proj(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError> {
+        let s = self.s;
+        let config = self.config;
+        let res: HipResult<()> = match op_code(op) {
+            q35_op::PROJ_QKV => match self.layer {
+                LayerWeights::FullAttn(l) => qkv_via_execute_steps(
+                    gpu, ctx, &l.wq, &l.wk, &l.wv, &l.attn_norm,
+                    &s.x, &s.tmp, &s.x_rot, &s.fa_q_full, &s.fa_k, &s.fa_v, config.norm_eps,
+                ),
+                LayerWeights::FullAttnMoe(l) => qkv_via_execute_steps(
+                    gpu, ctx, &l.wq, &l.wk, &l.wv, &l.attn_norm,
+                    &s.x, &s.tmp, &s.x_rot, &s.fa_q_full, &s.fa_k, &s.fa_v, config.norm_eps,
+                ),
+                _ => return Err(DispatchError::Hip("PROJ_QKV on non-FullAttn layer".into())),
+            },
+            q35_op::PROJ_QKVZA => match self.layer {
+                LayerWeights::DeltaNet(l) => qkvza_via_execute_steps(
+                    gpu, ctx, &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.attn_norm,
+                    &s.x, &s.tmp, &s.x_rot, &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha, config.norm_eps,
+                ),
+                LayerWeights::DeltaNetMoe(l) => qkvza_via_execute_steps(
+                    gpu, ctx, &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.attn_norm,
+                    &s.x, &s.tmp, &s.x_rot, &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha, config.norm_eps,
+                ),
+                _ => return Err(DispatchError::Hip("PROJ_QKVZA on non-DeltaNet layer".into())),
+            },
+            q35_op::PROJ_GATE_UP => match self.layer {
+                LayerWeights::DeltaNet(l) => gate_up_via_execute_steps(
+                    gpu, ctx, &l.w_gate, &l.w_up, &l.ffn_norm,
+                    &s.x, &s.tmp, &s.x_rot, &s.gate_ffn, &s.up, config.norm_eps,
+                ),
+                LayerWeights::FullAttn(l) => gate_up_via_execute_steps(
+                    gpu, ctx, &l.w_gate, &l.w_up, &l.ffn_norm,
+                    &s.x, &s.tmp, &s.x_rot, &s.gate_ffn, &s.up, config.norm_eps,
+                ),
+                _ => return Err(DispatchError::Hip("PROJ_GATE_UP on MoE/unknown layer".into())),
+            },
+            other => return Err(DispatchError::Hip(format!("unknown PROJ opcode {other}"))),
+        };
+        res.map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
+    fn run_residual_gemv(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError> {
+        let s = self.s;
+        let res: HipResult<()> = (|| match op_code(op) {
+            q35_op::RESID_WO => {
+                let (wo, input): (&WeightTensor, &GpuTensor) = match self.layer {
+                    LayerWeights::FullAttn(l) => (&l.wo, &s.fa_attn_out),
+                    LayerWeights::FullAttnMoe(l) => (&l.wo, &s.fa_attn_out),
+                    LayerWeights::DeltaNet(l) => (&l.wo, &s.dn_normed),
+                    LayerWeights::DeltaNetMoe(l) => (&l.wo, &s.dn_normed),
+                };
+                let wr = wo.dispatch_ref();
+                execute_steps(gpu, ctx, &[Step::GemvResidual {
+                    w: &wr, input: GemvInput::Raw(input), residual: &s.x, out: &s.x,
+                }])
+                .map_err(|e| HipError::new(0, &e.to_string()))
+            }
+            q35_op::RESID_DOWN_SWIGLU => {
+                let w_down = match self.layer {
+                    LayerWeights::DeltaNet(l) => &l.w_down,
+                    LayerWeights::FullAttn(l) => &l.w_down,
+                    _ => return Err(HipError::new(0, "RESID_DOWN_SWIGLU on MoE layer")),
+                };
+                hipfire_runtime::llama::weight_gemv_swiglu_residual(
+                    gpu, w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
+                )
+            }
+            other => Err(HipError::new(0, &format!("unknown RESID opcode {other}"))),
+        })();
+        res.map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
+    fn run_norm(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+        let s = self.s;
+        let config = self.config;
+        let norm_weight = match self.layer {
+            LayerWeights::DeltaNet(l) => &l.norm_weight,
+            LayerWeights::DeltaNetMoe(l) => &l.norm_weight,
+            _ => return Err(DispatchError::Hip("NORM_GATED on non-DeltaNet layer".into())),
+        };
+        gpu.gated_norm_f32(
+            &s.dn_attn_out, &s.dn_z, norm_weight, &s.dn_normed,
+            self.n_v_heads, config.linear_value_head_dim, config.norm_eps,
+        )
+        .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
+    fn run_attend(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError> {
+        let s = self.s;
+        let config = self.config;
+        let res: HipResult<()> = (|| match op_code(op) {
+            q35_op::ATTEND_FULL => {
+                let (q_norm, k_norm) = match self.layer {
+                    LayerWeights::FullAttn(l) => (&l.q_norm, &l.k_norm),
+                    LayerWeights::FullAttnMoe(l) => (&l.q_norm, &l.k_norm),
+                    _ => return Err(HipError::new(0, "ATTEND_FULL on non-FullAttn layer")),
+                };
+                gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
+                gpu.rmsnorm_batched(&s.fa_q, q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
+                gpu.rmsnorm_batched(&s.fa_k, k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+                if hipfire_runtime::triattn::tap_enabled() {
+                    triattn_tap(gpu, self.layer_idx, s, config)?;
+                }
+                if self.kv_cache.compact_offset > 0 {
+                    let abs = (self.pos + self.kv_cache.compact_offset) as i32;
+                    gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
+                }
+                let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                gpu.rope_partial_interleaved_f32(
+                    &s.fa_q, &s.fa_k, &s.pos_buf, config.n_heads, config.n_kv_heads,
+                    config.head_dim, n_rot, config.rope_theta,
+                )?;
+                if self.kv_cache.compact_offset > 0 {
+                    let phys = self.pos as i32;
+                    gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
+                }
+                kv_cache_attention_dispatch(ctx, gpu, self.kv_cache, s, config, self.layer_idx, self.pos)?;
+                gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+                Ok(())
+            }
+            q35_op::ATTEND_DN_PREP => {
+                let (dt_bias, a_log, conv_weight) = match self.layer {
+                    LayerWeights::DeltaNet(l) => (&l.dt_bias, &l.a_log, &l.conv_weight),
+                    LayerWeights::DeltaNetMoe(l) => (&l.dt_bias, &l.a_log, &l.conv_weight),
+                    _ => return Err(HipError::new(0, "ATTEND_DN_PREP on non-DeltaNet layer")),
+                };
+                gpu.fused_sigmoid_alpha_gate_f32(&s.dn_beta, &s.dn_alpha, dt_bias, a_log, self.n_v_heads)?;
+                gpu.conv1d_silu_split_f32(
+                    &s.dn_q_raw, &s.dn_k_raw, &s.dn_v, &s.dn_qkv, conv_weight,
+                    &self.dn_state.conv_states[self.delta_layer_idx], self.k_dim, self.v_dim,
+                )?;
+                gpu.fused_qk_l2_norm_scale_f32(
+                    &s.dn_q_raw, &s.dn_k_raw, config.linear_num_key_heads, self.hd,
+                    1.0 / (self.hd as f32).sqrt(), config.norm_eps,
+                )?;
+                if config.linear_num_key_heads < self.n_v_heads {
+                    let ratio = self.n_v_heads / config.linear_num_key_heads;
+                    gpu.repeat_interleave_qk_f32(
+                        &s.dn_q_raw, &s.dn_k_raw, &s.dn_q, &s.dn_k,
+                        config.linear_num_key_heads, ratio, self.hd,
+                    )?;
+                } else {
+                    gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, self.k_dim * 4)?;
+                    gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, self.k_dim * 4)?;
+                }
+                Ok(())
+            }
+            other => Err(HipError::new(0, &format!("unknown ATTEND opcode {other}"))),
+        })();
+        res.map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
+    fn run_moe(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+        let s = self.s;
+        let config = self.config;
+        let (ffn, ffn_norm) = match self.layer {
+            LayerWeights::DeltaNetMoe(l) => (&l.ffn, &l.ffn_norm),
+            LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
+            _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
+        };
+        moe_ffn_dispatch(gpu, ffn, &s.x, ffn_norm, config, s)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
+    fn run_moe_ep(
+        &mut self,
+        gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        routed_out: &GpuTensor,
+        skip_shared: bool,
+    ) -> Result<(), DispatchError> {
+        let s = self.s;
+        let config = self.config;
+        let (ffn, ffn_norm) = match self.layer {
+            LayerWeights::DeltaNetMoe(l) => (&l.ffn, &l.ffn_norm),
+            LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
+            _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
+        };
+        // Routed combine + shared-down (rank 0 only) accumulate into `routed_out`
+        // (zeroed by the EP executor); s.x (the replicated attention residual) is
+        // untouched until ep_add_into_residual after the all-reduce.
+        moe_ffn_dispatch_ep(gpu, ffn, &s.x, ffn_norm, config, s, routed_out, skip_shared)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
+    fn ep_add_into_residual(&mut self, gpu: &mut Gpu, partial: &GpuTensor) -> Result<(), DispatchError> {
+        // s.x += the all-reduced routed partial (the EP MoE output summed across
+        // ranks). Mirrors the prototype's `tp_allreduce_add` residual step.
+        let s = self.s;
+        gpu.add_inplace_f32(&s.x, partial)
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
+    fn run_recurrent(&mut self, gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+        let s = self.s;
+        let config = self.config;
+        let dn = self.dn_state;
+        let i = self.delta_layer_idx;
+        let res: HipResult<()> = match dn.quant {
+            StateQuant::FP32 => gpu.gated_delta_net_f32(
+                &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                &dn.s_matrices[i], &s.dn_attn_out, 1, self.n_v_heads, config.linear_value_head_dim,
+            ),
+            StateQuant::Q8 => gpu.gated_delta_net_q8(
+                &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                &dn.s_matrices[i], &dn.s_scales[i], &s.dn_attn_out, 1, self.n_v_heads, config.linear_value_head_dim,
+                dn.ef_residual(i),
+            ),
+            StateQuant::Q4 => gpu.gated_delta_net_q4(
+                &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+                &dn.s_matrices[i], &dn.s_scales[i], &s.dn_attn_out, 1, self.n_v_heads, config.linear_value_head_dim,
+            ),
+        };
+        res.map_err(|e| DispatchError::Hip(e.to_string()))
+    }
+
+    fn run_conv(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip("qwen35 has no Conv super-op".into()))
+    }
+
+    fn run_escape(&mut self, _gpu: &mut Gpu, _ctx: &DispatchCtx, _op: &OpBinding, kind: superop::EscapeKind) -> Result<(), DispatchError> {
+        Err(DispatchError::Hip(format!("qwen35 has no Escape super-op ({kind:?})")))
+    }
+}
+
+/// Cached `HIPFIRE_FORWARD_LOWERED` toggle. #397 Ship 6: the qwen35 single-GPU
+/// decode lowered path is **DEFAULT ON** as of 2026-06-07 — validated byte-
+/// identical to the hand path via fleet decode byte-parity (RDNA3 k9lin / RDNA4
+/// hiptrx / RDNA3.5 hipx, dense + MoE) and the full coherence battery (13 cases,
+/// k9lin). Escape hatch: `HIPFIRE_FORWARD_LOWERED=0` forces the legacy hand arms
+/// (still present in forward_scratch_layers); any other value (or unset) → lowered.
+fn forward_lowered_enabled() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+}
+
+/// Lowered (#397 Ship 6) single-GPU decode layer loop. Behaviorally equivalent
+/// to `forward_scratch_layers`'s hand arms (validated byte-identical via the
+/// external committed-token md5 gate). Builds a coarse-super-op `LayerProgram`
+/// per layer and runs it through the dispatch substrate's executor.
+fn forward_scratch_layers_lowered(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &DeltaNetState,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+
+    let ctx = DispatchCtx::new(gpu);
+    let mut delta_layer_idx = 0usize;
+
+    for layer_idx in 0..config.n_layers {
+        let layer = &weights.layers[layer_idx];
+        let program = lower_variant(variant_of(layer));
+        {
+            let mut bind = Qwen35Bindings {
+                layer,
+                s,
+                config,
+                kv_cache: &mut *kv_cache,
+                dn_state,
+                pos,
+                layer_idx,
+                delta_layer_idx,
+                k_dim,
+                v_dim,
+                n_v_heads,
+                hd,
+            };
+            superop::run_layer_program(gpu, &ctx, &program, &mut bind)
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+        }
+        if matches!(layer, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_)) {
+            delta_layer_idx += 1;
+        }
+        dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, layer_idx, "pertoken");
+    }
+
+    // Final norm + logits into scratch.logits (mirrors forward_scratch_layers).
+    gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+    {
+        let ctx = DispatchCtx::new(gpu);
+        let wr = weights.output.dispatch_ref();
+        let step = Step::Gemv { w: &wr, input: GemvInput::Raw(&s.tmp), out: &s.logits };
+        execute_steps(gpu, &ctx, &[step])
+            .map_err(|e| HipError::new(0, &e.to_string()))?;
+    }
+    Ok(())
+}
+
+
+/// EP (Ship 6 substrate-EP) replicated N-rank decode forward for ONE token.
+///
+/// Every rank holds **full replicated** weights / scratch / KV / DeltaNet
+/// state EXCEPT the MoE routed experts, which were sharded per rank at load by
+/// [`shard_moe_experts`]. Behaviorally this mirrors the single-GPU
+/// [`forward_scratch`] → [`forward_scratch_layers_lowered`] pipeline (embed →
+/// per-layer `LayerProgram` → final norm + lm_head), but runs each layer's
+/// program through the EP executor ([`hipfire_runtime::ep::run_layer_program_ep`]):
+/// the `Moe` super-op is all-reduce-EP'd across ranks (each rank computes only
+/// its owned experts into a zeroed routed partial, the partials are
+/// all-reduce-summed, then added into each rank's residual); every other
+/// super-op runs **replicated** and stays bit-identical across ranks.
+///
+/// Logits land in `scratch_per_rank[0].logits` (rank 0 = `output_device`); the
+/// caller reads them with `gpu.download_f32` after this returns (this fn
+/// device-synchronizes every rank before returning, so the read is safe even
+/// though work ran on each rank's `active_stream`).
+///
+/// All parallel slices (`weights_per_rank`, `kv_per_rank`, `dn_per_rank`,
+/// `scratch_per_rank`, `partials`) must have length `gpus.devices.len()`, with
+/// element `r` allocated on `gpus.devices[r]`. Every device must have an
+/// `active_stream` set ([`hipfire_runtime::ep::ensure_rank_streams`]).
+///
+/// TP=1 is the degenerate reference: one rank owns all experts (no zero-dummy),
+/// the all-reduce short-circuits to identity, and the result is the same as the
+/// single-GPU lowered decode (validated byte-/argmax-identical on the fleet).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_ep(
+    gpus: &mut Gpus,
+    weights_per_rank: &[Qwen35Weights],
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_per_rank: &mut [llama::KvCache],
+    dn_per_rank: &[DeltaNetState],
+    scratch_per_rank: &[Qwen35Scratch],
+    partials: &[GpuTensor],
+) -> HipResult<()> {
+    let n = gpus.devices.len();
+    assert_eq!(weights_per_rank.len(), n, "forward_ep: weights_per_rank.len() != n_ranks");
+    assert_eq!(kv_per_rank.len(), n, "forward_ep: kv_per_rank.len() != n_ranks");
+    assert_eq!(dn_per_rank.len(), n, "forward_ep: dn_per_rank.len() != n_ranks");
+    assert_eq!(scratch_per_rank.len(), n, "forward_ep: scratch_per_rank.len() != n_ranks");
+    assert_eq!(partials.len(), n, "forward_ep: partials.len() != n_ranks");
+
+    let dim = config.dim;
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    let pos_i32 = pos as i32;
+
+    // 1. Embed token + write pos on each rank (replicated; deterministic, since
+    //    weights are byte-identical replicas → s.x is bit-identical per rank).
+    for r in 0..n {
+        gpus.devices[r].bind_thread()?;
+        let w = &weights_per_rank[r];
+        let s = &scratch_per_rank[r];
+        let gpu = &mut gpus.devices[r];
+        match w.embd_format {
+            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&w.token_embd, &s.x, token, dim)?,
+            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&w.token_embd, &s.x, token, dim)?,
+            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&w.token_embd, &s.x, token, dim)?,
+            EmbeddingFormat::F32 => gpu.embedding_lookup(&w.token_embd, &s.x, token, dim)?,
+            other => return Err(HipError::new(0, &format!("forward_ep: unsupported embedding format {other:?}"))),
+        }
+        gpu.hip.memcpy_htod(&s.pos_buf, &pos_i32.to_ne_bytes())?;
+    }
+
+    // 2. Per-layer EP program. Variant + delta-layer counter are replicated
+    //    (sharding frees experts but never changes the layer variant), so rank 0
+    //    is authoritative for both.
+    let mut delta_layer_idx = 0usize;
+    for layer_idx in 0..config.n_layers {
+        let program = lower_variant(variant_of(&weights_per_rank[0].layers[layer_idx]));
+        // Build the N per-rank bindings. `kv_per_rank.iter_mut()` yields the
+        // disjoint `&mut KvCache` each binding needs; weights/scratch/dn are
+        // shared `&`. This Vec is dropped at the end of the iteration, releasing
+        // the mutable KV borrows before the next layer's `iter_mut`.
+        let mut binds: Vec<Qwen35Bindings> = Vec::with_capacity(n);
+        for (((w, s), kv), dn) in weights_per_rank
+            .iter()
+            .zip(scratch_per_rank.iter())
+            .zip(kv_per_rank.iter_mut())
+            .zip(dn_per_rank.iter())
+        {
+            binds.push(Qwen35Bindings {
+                layer: &w.layers[layer_idx],
+                s,
+                config,
+                kv_cache: kv,
+                dn_state: dn,
+                pos,
+                layer_idx,
+                delta_layer_idx,
+                k_dim,
+                v_dim,
+                n_v_heads,
+                hd,
+            });
+        }
+        hipfire_runtime::ep::run_layer_program_ep(gpus, binds.as_mut_slice(), partials, &program, dim)
+            .map_err(|e| HipError::new(0, &e.to_string()))?;
+        if matches!(
+            &weights_per_rank[0].layers[layer_idx],
+            LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_)
+        ) {
+            delta_layer_idx += 1;
+        }
+    }
+
+    // 3. Final norm + lm_head on rank 0 (output_device). Logits → rank0 scratch.
+    {
+        gpus.devices[0].bind_thread()?;
+        let w = &weights_per_rank[0];
+        let s = &scratch_per_rank[0];
+        let gpu = &mut gpus.devices[0];
+        gpu.rmsnorm_f32(&s.x, &w.output_norm, &s.tmp, config.norm_eps)?;
+        let ctx = DispatchCtx::new(gpu);
+        let wr = w.output.dispatch_ref();
+        let step = Step::Gemv { w: &wr, input: GemvInput::Raw(&s.tmp), out: &s.logits };
+        execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()))?;
+    }
+
+    // 4. Sync every rank — work ran on each device's active_stream, so a host
+    //    download of rank 0's logits (on the null stream) would otherwise race.
+    for r in 0..n {
+        gpus.devices[r].bind_thread()?;
+        gpus.devices[r].hip.device_synchronize()?;
+    }
+    Ok(())
+}
+
+/// EP (Ship 6 substrate-EP) **WMMA batched prefill** for qwen3.x-A3B (E6b).
+///
+/// The batched analog of [`forward_ep`]: processes all `tokens` as one batch
+/// through the WMMA/grouped-GEMM prefill kernels (NOT token-by-token), replicated
+/// across `gpus.devices.len()` EP ranks, with MoE experts sharded per rank.
+///
+/// Driven **layer-granularly** by calling [`forward_prefill_chunk`] with a
+/// single-layer band per rank, because EP needs a per-MoE-layer all-reduce: the
+/// next layer's replicated attention must read the FULL (cross-rank-summed)
+/// residual. For each layer:
+///   1. (MoE only) zero each rank's `[n × dim]` routed partial,
+///   2. run the layer's batched chunk on every rank — the **shared** expert
+///      accumulates into `pbs.x_batch` (replicated, added once per rank), the
+///      **routed** combine into the zeroed partial (owned experts only; non-owned
+///      read load-time zero-dummy → 0),
+///   3. (MoE only) `all_reduce_sum_f32` the `[n × dim]` partials across ranks and
+///      add into each rank's `pbs.x_batch`.
+/// Non-MoE (dense DeltaNet / FullAttn) layers run replicated, no partial, no
+/// all-reduce. Final norm + lm_head (last token) run on rank 0 → `scratch_per_rank[0].logits`.
+///
+/// **v1 constraints:** the whole prompt must fit one batch (`tokens.len() <=
+/// pbs.max_batch`; no chunk loop yet) and KV must be a non-asym mode (q8/q4/…)
+/// so no per-rank Givens replicas are needed (asym EP prefill = future work). The
+/// per-layer chunk dispatch trades some launch overhead for the per-layer
+/// all-reduce seam; a fused EP prefill layer loop is a later perf refinement.
+///
+/// Slices (`weights_per_rank`, `kv_per_rank`, `dn_per_rank`, `scratch_per_rank`,
+/// `pbs_per_rank`, `partials`) must have length `gpus.devices.len()`; element `r`
+/// lives on `gpus.devices[r]`. Each `partials[r]` must hold >= `n × dim` f32.
+/// Every device must have an `active_stream` ([`hipfire_runtime::ep::ensure_rank_streams`]).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_ep(
+    gpus: &mut Gpus,
+    weights_per_rank: &[Qwen35Weights],
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_per_rank: &mut [llama::KvCache],
+    dn_per_rank: &mut [DeltaNetState],
+    scratch_per_rank: &[Qwen35Scratch],
+    pbs_per_rank: &[PrefillBatchScratch],
+    partials: &[GpuTensor],
+) -> HipResult<()> {
+    let n_rank = gpus.devices.len();
+    assert_eq!(weights_per_rank.len(), n_rank, "forward_prefill_batch_ep: weights_per_rank len");
+    assert_eq!(kv_per_rank.len(), n_rank, "forward_prefill_batch_ep: kv_per_rank len");
+    assert_eq!(dn_per_rank.len(), n_rank, "forward_prefill_batch_ep: dn_per_rank len");
+    assert_eq!(scratch_per_rank.len(), n_rank, "forward_prefill_batch_ep: scratch_per_rank len");
+    assert_eq!(pbs_per_rank.len(), n_rank, "forward_prefill_batch_ep: pbs_per_rank len");
+    assert_eq!(partials.len(), n_rank, "forward_prefill_batch_ep: partials len");
+
+    let n = tokens.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let dim = config.dim;
+    assert!(
+        n <= pbs_per_rank[0].max_batch,
+        "forward_prefill_batch_ep v1: prompt ({n} toks) must fit one batch (max_batch={}); \
+         chunked EP prefill is future work",
+        pbs_per_rank[0].max_batch,
+    );
+
+    // Per-layer cumulative LA / FA counters (replicated → identical across ranks;
+    // they index dn_state.s_matrices / kv_cache.k_gpu exactly like the band
+    // offsets the PP driver threads). kv_layer_offset == fa_layer_offset.
+    let mut delta_off = 0usize;
+    let mut fa_off = 0usize;
+
+    let ep_timing = std::env::var("HIPFIRE_EP_PREFILL_TIMING").is_ok();
+    let ep_skip_ar = std::env::var("HIPFIRE_EP_SKIP_ALLREDUCE").is_ok(); // DIAGNOSTIC ONLY (wrong output)
+    // Peer-direct all-reduce (bypass RCCL): the routed-partial sum goes through
+    // Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms
+    // vs RCCL's ~40 ms/call on hiptrx (gfx1201, PCIe). DEFAULT ON; opt back to
+    // RCCL with HIPFIRE_EP_PEER_ALLREDUCE=0. The peer temps live in Gpus (shared
+    // with TP), lazily sized to the largest count seen.
+    let ep_peer_ar = std::env::var("HIPFIRE_EP_PEER_ALLREDUCE").as_deref() != Ok("0");
+    let mut t_chunk = 0.0f64;
+    let mut t_ar = 0.0f64;
+    let mut t_add = 0.0f64;
+    for layer_idx in 0..config.n_layers {
+        let is_moe = matches!(
+            &weights_per_rank[0].layers[layer_idx],
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
+        );
+
+        // 1. Zero each rank's routed partial (on its active_stream, so it's
+        //    ordered before the chunk's routed combine that writes into it).
+        if is_moe {
+            for r in 0..n_rank {
+                gpus.devices[r].bind_thread()?;
+                let stream = gpus.devices[r]
+                    .active_stream
+                    .as_ref()
+                    .ok_or_else(|| HipError::new(0, "forward_prefill_batch_ep: no active_stream (call ensure_rank_streams)"))?;
+                gpus.devices[r]
+                    .hip
+                    .memset_async(&partials[r].buf, 0, n * dim * 4, stream)?;
+            }
+        }
+
+        // 2. Run the layer's batched chunk on every rank (single-layer band).
+        let t_c = std::time::Instant::now();
+        for r in 0..n_rank {
+            gpus.devices[r].bind_thread()?;
+            let band = PrefillBandCtx {
+                layer_start: layer_idx,
+                layer_end: layer_idx + 1,
+                delta_layer_offset: delta_off,
+                kv_layer_offset: fa_off,
+                fa_layer_offset: fa_off,
+                is_first_band: layer_idx == 0,
+                is_last_band: false, // final norm + lm_head done explicitly below
+                // v1 EP prefill is q8/non-asym KV → no per-rank Givens replicas.
+                givens_cos: None,
+                givens_sin: None,
+            };
+            let routed_out = if is_moe { Some(&partials[r]) } else { None };
+            forward_prefill_chunk(
+                &mut gpus.devices[r],
+                &weights_per_rank[r],
+                config,
+                tokens,
+                start_pos,
+                &mut kv_per_rank[r],
+                &mut dn_per_rank[r],
+                &scratch_per_rank[r],
+                &pbs_per_rank[r],
+                None,  // hidden_rb
+                None,  // per_token_hidden_out
+                None,  // gdn_tape
+                0,     // tape_offset
+                None,  // tree_verify
+                false, // pre_uploaded
+                Some(&band),
+                None,  // mask_override
+                false, // needs_last_token_logits (no lm_head in band)
+                None,  // max_layer
+                routed_out,
+            )?;
+        }
+
+        if ep_timing {
+            t_chunk += t_c.elapsed().as_secs_f64() * 1000.0;
+        }
+
+        // 3. All-reduce the routed partials, add into each rank's residual.
+        if is_moe && !ep_skip_ar {
+            let t_a = std::time::Instant::now();
+            let refs: Vec<&hip_bridge::DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
+            if ep_peer_ar {
+                gpus.all_reduce_sum_f32_peer(&refs, n * dim)
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
+            } else {
+                gpus.all_reduce_sum_f32(&refs, n * dim)
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
+            }
+            if ep_timing {
+                t_ar += t_a.elapsed().as_secs_f64() * 1000.0;
+            }
+            let t_d = std::time::Instant::now();
+            for r in 0..n_rank {
+                gpus.devices[r].bind_thread()?;
+                let x_n = pbs_per_rank[r].x_batch.sub_offset(0, n * dim);
+                let p_n = partials[r].sub_offset(0, n * dim);
+                gpus.devices[r].add_inplace_f32(&x_n, &p_n)?;
+            }
+            if ep_timing {
+                t_add += t_d.elapsed().as_secs_f64() * 1000.0;
+            }
+        }
+
+        match config.layer_types[layer_idx] {
+            LayerType::LinearAttention => delta_off += 1,
+            LayerType::FullAttention => fa_off += 1,
+        }
+    }
+
+    // Final norm + lm_head on rank 0 (last token) → scratch_per_rank[0].logits.
+    // Done explicitly (not via the chunk) so it runs AFTER the last layer's
+    // all-reduce — the last MoE layer's routed output is only in x_batch after
+    // step 3, so an in-chunk lm_head would read an incomplete residual.
+    {
+        gpus.devices[0].bind_thread()?;
+        let gpu = &mut gpus.devices[0];
+        let w = &weights_per_rank[0];
+        let s = &scratch_per_rank[0];
+        let pbs = &pbs_per_rank[0];
+        let last_x = pbs.x_batch.sub_offset((n - 1) * dim, dim);
+        gpu.rmsnorm_f32(&last_x, &w.output_norm, &s.tmp, config.norm_eps)?;
+        let ctx = DispatchCtx::new(gpu);
+        let wr = w.output.dispatch_ref();
+        let step = Step::Gemv { w: &wr, input: GemvInput::Raw(&s.tmp), out: &s.logits };
+        execute_steps(gpu, &ctx, &[step]).map_err(|e| HipError::new(0, &e.to_string()))?;
+    }
+
+    // Sync every rank — work ran on active_streams; the host logits read on rank
+    // 0 (null stream) would otherwise race.
+    let t_s = std::time::Instant::now();
+    for r in 0..n_rank {
+        gpus.devices[r].bind_thread()?;
+        gpus.devices[r].hip.device_synchronize()?;
+    }
+    if ep_timing {
+        let t_sync = t_s.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "EP-PREFILL-TIMING (host ms): chunk-loop={t_chunk:.1} all_reduce={t_ar:.1} add={t_add:.1} final-sync={t_sync:.1}",
+        );
+    }
+    Ok(())
+}
 
 /// Multi-GPU layer-loop dispatcher (Stage 5 of multi-GPU pp migration #58).
 /// Mirrors `forward_scratch_layers` but routes per-layer work to
@@ -12435,6 +13538,7 @@ fn forward_scratch_layers_multi(
                             1,
                             n_v_heads,
                             config.linear_value_head_dim,
+                            dn_state.ef_residual(delta_layer_idx),
                         )?,
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &s.dn_q,
@@ -13085,6 +14189,7 @@ fn forward_scratch_layers_multi(
                             1,
                             n_v_heads,
                             config.linear_value_head_dim,
+                            dn_state.ef_residual(delta_layer_idx),
                         )?,
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
                             &s.dn_q,
@@ -13847,6 +14952,7 @@ pub fn forward_prefill_batch_multi(
                         None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
                         true, // needs_last_token_logits: preserve multi-GPU post-condition
                         None, // max_layer: multi-GPU PP path runs full stack
+                        None, // routed_out: PP bands are multi-layer, not EP
                     )?;
                 }
 
@@ -13930,6 +15036,59 @@ pub fn forward_with_embedding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #397 Ship 6 — lowered decode super-op program shapes ──────────────
+    // The lowered LayerProgram per variant must mirror the hand-arm op sequence
+    // in forward_scratch_layers exactly. These are CPU-pure (no GPU/GpuTensor).
+    #[test]
+    fn lowered_fullattn_program_shape() {
+        use SuperOpKind::{Attend, Proj, ResidualGemv};
+        let p = lower_variant(Q35Variant::FullAttn);
+        let kinds: Vec<_> = p.iter().map(|o| o.kind).collect();
+        assert_eq!(kinds, vec![Proj, Attend, ResidualGemv, Proj, ResidualGemv]);
+        assert_eq!(p[0].binding.weights[0].0, q35_op::PROJ_QKV);
+        assert_eq!(p[1].binding.weights[0].0, q35_op::ATTEND_FULL);
+        assert_eq!(p[2].binding.weights[0].0, q35_op::RESID_WO);
+        assert_eq!(p[3].binding.weights[0].0, q35_op::PROJ_GATE_UP);
+        assert_eq!(p[4].binding.weights[0].0, q35_op::RESID_DOWN_SWIGLU);
+    }
+
+    #[test]
+    fn lowered_deltanet_program_shape() {
+        use SuperOpKind::{Attend, Norm, Proj, Recurrent, ResidualGemv};
+        let p = lower_variant(Q35Variant::DeltaNet);
+        let kinds: Vec<_> = p.iter().map(|o| o.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![Proj, Attend, Recurrent, Norm, ResidualGemv, Proj, ResidualGemv]
+        );
+        assert_eq!(p[0].binding.weights[0].0, q35_op::PROJ_QKVZA);
+        assert_eq!(p[1].binding.weights[0].0, q35_op::ATTEND_DN_PREP);
+    }
+
+    #[test]
+    fn lowered_moe_variants_replace_dense_ffn_with_one_moe_op() {
+        use SuperOpKind::Moe;
+        let dn = lower_variant(Q35Variant::DeltaNetMoe);
+        let fa = lower_variant(Q35Variant::FullAttnMoe);
+        // MoE variants end in a single Moe super-op (no dense gate_up/down).
+        assert_eq!(dn.last().unwrap().kind, Moe);
+        assert_eq!(fa.last().unwrap().kind, Moe);
+        assert!(dn.iter().all(|o| o.binding.weights[0].0 != q35_op::PROJ_GATE_UP || o.kind != SuperOpKind::Proj));
+        // FullAttnMoe is the shortest: Proj, Attend, ResidualGemv(wo), Moe.
+        assert_eq!(fa.len(), 4);
+        assert_eq!(dn.len(), 6);
+    }
+
+    #[test]
+    fn lowered_variant_of_maps_layer_discriminant() {
+        // variant_of is a thin discriminant map; assert the program lengths it
+        // would produce per the documented layer shapes.
+        assert_eq!(lower_variant(Q35Variant::FullAttn).len(), 5);
+        assert_eq!(lower_variant(Q35Variant::DeltaNet).len(), 7);
+        assert_eq!(lower_variant(Q35Variant::DeltaNetMoe).len(), 6);
+        assert_eq!(lower_variant(Q35Variant::FullAttnMoe).len(), 4);
+    }
 
     #[test]
     fn f16_lm_head_mode_defaults_to_native() {
@@ -14076,6 +15235,73 @@ mod tests {
         let _batchable_dt = DType::MQ4G256;
         // Use default F32 as fallback
         // MoeFfnWeights requires GPU-backed tensors; predicate is tested at DType level.
+    }
+
+    #[test]
+    fn moe_prefill_topk_shape_requires_k8_and_bounded_experts() {
+        assert!(moe_prefill_topk_shape_supported(8, 256));
+        assert!(moe_prefill_topk_shape_supported(8, 1024));
+        assert!(!moe_prefill_topk_shape_supported(4, 256));
+        assert!(!moe_prefill_topk_shape_supported(8, 1025));
+    }
+
+    #[test]
+    fn moe_prefill_admits_mq4_as_known_good_control() {
+        let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false));
+    }
+
+    #[test]
+    fn moe_prefill_rejects_mq3_before_admission_work() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.expert_gate_up = DType::MQ3G256;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.shared_expert_down = DType::MQ3G256;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+    }
+
+    #[test]
+    fn moe_prefill_mq6_requires_explicit_admission() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        dtypes.shared_expert_gate = DType::MQ6G256;
+        dtypes.shared_expert_up = DType::MQ6G256;
+        dtypes.shared_expert_down = DType::MQ6G256;
+        dtypes.expert_gate_up = DType::MQ6G256;
+        dtypes.expert_down = DType::MQ6G256;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false
+        ));
+        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+    }
+
+    #[test]
+    fn moe_prefill_rejects_nonuniform_expert_projections() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.expert_gate_up_uniform = false;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.expert_down_uniform = false;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+    }
+
+    #[test]
+    fn moe_prefill_shared_gate_up_must_be_one_dtype() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.shared_expert_up = DType::MQ6G256;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+    }
+
+    #[test]
+    fn moe_prefill_admits_paro_when_enabled() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::ParoQ4G128);
+        dtypes.router = DType::F32;
+        dtypes.shared_expert_scalar_gate = DType::F32;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false));
+        assert!(moe_ffn_batched_admissible_for_dtypes(&dtypes, true, true));
     }
 
     #[test]

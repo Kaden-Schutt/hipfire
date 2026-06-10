@@ -167,7 +167,14 @@ works, what to measure, what counts as pass/fail.
    gate.sh is deprecated — its byte-exact baselines drift faster than
    the engine evolves. Run `./scripts/coherence-gate-dflash.sh` after
    any change touching kernels, quant formats, dispatch, fusion,
-   rotation, rmsnorm, or the spec-decode path.
+   rotation, rmsnorm, or the spec-decode path. Its detector enforces
+   three tiers (matching the CLAUDE.md "DFlash Coherence Gate" section):
+   **Tier 1** (first 128 tokens, HARD fail) `unique_token_ratio < 0.15`
+   OR `max_single_token_frequency > 0.50`; **Tier 2** (last 128 tokens,
+   HARD fail) `unique_token_ratio < 0.30` OR
+   `max_single_token_frequency > 0.50`; **Tier 3** (full output, SOFT
+   `FLAG` for human eyeball) consecutive-3gram repetition density > 0.50
+   in the final half OR full-output `unique_token_ratio < 0.10`.
 2. **Prompt structure dictates τ.** One newline character can swing τ
    by 17%. Any tok/s comparison across sessions, agents, or commits
    MUST use **byte-identical prompts**. Embed prompts as committed

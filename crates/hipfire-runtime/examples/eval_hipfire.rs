@@ -78,8 +78,8 @@ fn main() {
             "--output" => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
             "--kv-mode" => {
                 let v = argv[i + 1].clone();
-                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4" | "fwht2" | "fwht3" | "fwht4") {
-                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 fwht2 fwht3 fwht4 (got {v})");
+                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4" | "fwht2" | "fwht3" | "fwht4" | "f32" | "f16") {
+                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 fwht2 fwht3 fwht4 f32 f16 (got {v})");
                     std::process::exit(1);
                 }
                 kv_mode = v;
@@ -278,6 +278,16 @@ fn main() {
         ).unwrap(),
         "fwht2" => KvCache::new_gpu_fwht2_filtered(
             &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
+        ).unwrap(),
+        // F1-KV: true un-quantized KV. `new_gpu` allocates raw FP32 K/V with all
+        // quant_* flags false. The prefill batched-FA gate (`fa_batched_ok`) requires
+        // a q8/asym cache, so an F32 cache forces FA layers through the per-token
+        // `run_fa_layer_body` fallback whose else-branch does raw `kv_cache_write` +
+        // `attention_f32` — i.e. the cache is NOT Q8-quantized during scoring. "f16"
+        // is accepted as an alias and maps to the same FP32-storage path (there is no
+        // separate quantized-f16 cache ctor; FP32 is the higher-precision oracle).
+        "f32" | "f16" => KvCache::new_gpu(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
         ).unwrap(),
         other => panic!("unknown --kv-mode: {other}"),
     };

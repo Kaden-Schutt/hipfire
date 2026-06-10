@@ -654,15 +654,31 @@ fn dispatch_attend(
                 plan.v_mode_bits,
             ))
         }
-        // Q8_0: P-1 no-LDS-cap tiled kernel
+        // Q8_0 batched: use old batched kernel for short ctx (fewer dispatches,
+        // faster), fall back to tiled kernel for long ctx where LDS would overflow.
+        // LDS = (max_ctx_len + nthreads + head_dim) * 4 bytes; 64KB hardware limit
+        // gives ~16K tokens for head_dim=128. Use 8K threshold for margin.
         KernelKey::AttnQ8_0KvBatchedMasked => {
-            let fp = io.flash_partials.unwrap();
-            hip!(gpu.attention_flash_q8_0_batched_masked(
-                io.q, io.k_cache, io.v_cache, io.output, io.positions(),
-                io.n_heads, io.n_kv_heads, io.head_dim,
-                io.physical_cap, io.max_ctx_len, io.batch_size, fp,
-                io.tree_bias, io.block_start, io.block_cols,
-            ))
+            const Q8_BATCHED_LDS_CROSSOVER: usize = 8192;
+            if io.max_ctx_len <= Q8_BATCHED_LDS_CROSSOVER {
+                // Fast path: single-launch batched kernel, LDS-backed attention tile.
+                let positions = io.positions.unwrap();
+                hip!(gpu.attention_q8_0_kv_batched_masked(
+                    io.q, io.k_cache, io.v_cache, io.output, positions,
+                    io.n_heads, io.n_kv_heads, io.head_dim,
+                    io.physical_cap, io.max_ctx_len, io.batch_size,
+                    io.tree_bias, io.block_start, io.block_cols,
+                ))
+            } else {
+                // Long-context path: tiled kernel, no LDS capacity limit.
+                let fp = io.flash_partials.unwrap();
+                hip!(gpu.attention_flash_q8_0_batched_masked(
+                    io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                    io.n_heads, io.n_kv_heads, io.head_dim,
+                    io.physical_cap, io.max_ctx_len, io.batch_size, fp,
+                    io.tree_bias, io.block_start, io.block_cols,
+                ))
+            }
         }
 
         _ => Err(DispatchError::UnsupportedVariant {

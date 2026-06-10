@@ -1577,6 +1577,8 @@ pub const GEMM_KSPLIT_DET_FINALIZE_SRC: &str =
 // stuck on the dot2 fp16 fallback before this).
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx12_bt.hip");
 pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_lmhead_wmma.gfx12.hip");
 // Q8_1 MMQ prefill variant — opt-in via HIPFIRE_MMQ=1, gated to RDNA3/3.5.
@@ -1678,12 +1680,16 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC: &str =
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.gfx12.hip");
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_gfx12_bt.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister: gfx12 hfq4 recipe + 4-output qkv/z/beta/alpha
 // routing for the DeltaNet LinearAttention preamble.
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.gfx12.hip");
+pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma_gfx12_bt.hip");
 // HFQ3-G256 sister of GEMM_QKVZA_HFQ4G256_WMMA_SRC. Same WMMA shape +
 // lane decomposition; only the inner K-tile unpack differs (3-bit
 // cross-byte vs 4-bit nibble). Used for MQ3 prefill via dispatch
@@ -2951,6 +2957,11 @@ pub const GATED_DELTA_NET_SRC: &str = include_str!("../../../kernels/src/gated_d
 pub const GATED_DELTA_NET_Q8_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_q8.hip");
 
+/// Fast variant for the default MQ4/HFQ4 path: no per-token requant,
+/// requant outside the loop. Supports EF residual. Lower VGPR pressure.
+pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip");
+
 /// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
 /// to a caller-owned tape buffer, so sibling tokens read the parent's
 /// post-update state rather than the previous sibling's. Required for
@@ -3668,6 +3679,17 @@ pub const V4F_ATTN_SWA_TOPK_BATCHED_SRC: &str =
 /// DeepSeek V4 SWA + indexer top-K attention, direct main-KV variant.
 pub const V4F_ATTN_SWA_TOPK_DIRECT_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_attn_swa_topk_direct_batched.hip");
+
+/// Head-batched f16-WMMA port of the direct-batched DSA attention (gfx1151).
+/// Same joint-softmax math; 16 heads/block so the score/output GEMVs become
+/// WMMA GEMMs reading the shared K/V once. See deepseek4_attn_swa_topk_direct_wmma.hip.
+pub const V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_direct_wmma.hip");
+
+/// Head-batched f16-WMMA port of the gathered DSA attention (top-K staged into
+/// topk_kv[B,D,topk_win]). Sibling of the direct WMMA kernel.
+pub const V4F_ATTN_SWA_TOPK_BATCHED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_batched_wmma.hip");
 
 /// DeepSeek V4 batched pure-SWA attention (Phase A2, 2026-05-18). Twin of
 /// `V4F_ATTN_SWA_TOPK_BATCHED_SRC` for layers without an indexer top-K

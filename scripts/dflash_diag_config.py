@@ -38,13 +38,12 @@ import argparse
 import sys
 from pathlib import Path
 
-import torch
 from safetensors.torch import load_file
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / ".dflash-reference"))
 
-from dflash.model import DFlashDraftModel  # noqa: E402
+from dflash.model import DFlashDraftModel  # type: ignore[import-not-found]  # noqa: E402
 
 
 def parse_args():
@@ -93,7 +92,7 @@ def instantiate_and_dump(args, tc):
     cfg = mod.build_draft_config(tc, args.draft_layers, args.block_size,
                                  mask_token_id=151935)
     print("\n" + "=" * 72)
-    print(f"Draft config (from build_draft_config):")
+    print("Draft config (from build_draft_config):")
     print(f"  type               = {type(cfg).__name__}")
     print(f"  num_hidden_layers  = {cfg.num_hidden_layers}")
     print(f"  hidden_size        = {cfg.hidden_size}")
@@ -167,7 +166,7 @@ def load_and_compare(our_path, other_path, ref_shapes):
         if missing_theirs:
             print(f"  missing in checkpoint ({len(missing_theirs)}): {missing_theirs[:5]}")
         if not shape_mismatch and not extra_theirs and not missing_theirs:
-            print(f"  ✓ keys + shapes match model → draft loadable")
+            print("  ✓ keys + shapes match model → draft loadable")
 
 
 def main():

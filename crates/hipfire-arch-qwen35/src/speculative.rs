@@ -61,7 +61,19 @@ fn run_spec_gemm_key(
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemm::GemmParams;
     use hipfire_dispatch::families::gemv::WeightRef;
-    let ctx = DispatchCtx::new(gpu);
+    use std::cell::RefCell;
+    // Cache the DispatchCtx per thread instead of rebuilding it on every call.
+    // `DispatchCtx::new` runs `FeatureFlags::from_env` (41 `env::var` reads under
+    // the process-global env lock) + ArchCaps + ResourceManager, and its own doc
+    // says it is "resolved once ... and shared immutably across all dispatch
+    // calls". This helper is hit ~170×/generation by the DFlash verify+draft
+    // lm_head loop, so reconstructing the ctx per call cost ~9 tok/s at constant
+    // τ (gfx1201, 27B AWQ DFlash). `gemm_family()` is already a OnceLock
+    // singleton; this brings the ctx in line. Keyed on `gpu.arch` so a thread
+    // that drives a different arch (multi-GPU) rebuilds rather than reusing stale.
+    thread_local! {
+        static SPEC_CTX: RefCell<Option<(String, DispatchCtx)>> = const { RefCell::new(None) };
+    }
     let w = WeightRef {
         buf: w_buf,
         dtype: w_dtype,
@@ -72,9 +84,21 @@ fn run_spec_gemm_key(
         awq_scale: None,
     };
     let params = GemmParams { w: &w, x, y, batch_size: n };
-    hipfire_runtime::llama::gemm_family()
-        .run_key(key, &ctx, gpu, &params)
-        .map_err(hip_bridge::HipError::from)
+    SPEC_CTX.with(|cell| {
+        let needs_rebuild = {
+            let slot = cell.borrow();
+            slot.as_ref().map_or(true, |(arch, _)| arch != &gpu.arch)
+        };
+        if needs_rebuild {
+            let fresh = DispatchCtx::new(gpu);
+            *cell.borrow_mut() = Some((gpu.arch.clone(), fresh));
+        }
+        let slot = cell.borrow();
+        let ctx = &slot.as_ref().unwrap().1;
+        hipfire_runtime::llama::gemm_family()
+            .run_key(key, ctx, gpu, &params)
+            .map_err(hip_bridge::HipError::from)
+    })
 }
 
 fn dflash_q8_lmhead_wmma_enabled_from_env() -> bool {
@@ -1192,6 +1216,7 @@ impl GdnTape {
                     n_steps,
                     n_v_heads,
                     value_head_dim,
+                    dn_state.ef_residual(la_idx),
                 )?,
                 qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
                     &self.q_scratch,

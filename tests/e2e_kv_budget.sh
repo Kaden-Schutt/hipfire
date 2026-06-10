@@ -14,12 +14,18 @@ LOG=$(mktemp)
 echo "=== booting serve on :$PORT (log $LOG) ==="
 HIPFIRE_MODEL="$MODEL" bun cli/index.ts serve "$PORT" > "$LOG" 2>&1 &
 PID=$!
-trap "kill -TERM $PID 2>/dev/null; wait $PID 2>/dev/null; rm -f $LOG" EXIT
+# shellcheck disable=SC2329 # invoked by trap
+cleanup() {
+  kill -TERM "${PID:-}" 2>/dev/null || true
+  wait "${PID:-}" 2>/dev/null || true
+  rm -f -- "${LOG:-}"
+}
+trap cleanup EXIT
 
 # Wait for health
 for i in $(seq 1 90); do
   if curl -sf "http://localhost:$PORT/health" >/dev/null 2>&1; then echo "ready after ${i}s"; break; fi
-  if ! kill -0 $PID 2>/dev/null; then
+  if ! kill -0 "$PID" 2>/dev/null; then
     echo "FAIL: serve exited prematurely"
     tail -30 "$LOG"
     exit 1
@@ -44,7 +50,7 @@ PAY=$(jq -cn --arg sys "$SYS" --arg m "$MODEL" \
 B=$(curl -sf -X POST "http://localhost:$PORT/v1/chat/completions" -H "Content-Type: application/json" --max-time 120 -d "$PAY")
 echo "$B" | jq '{finish: .choices[0].finish_reason, tokens: .usage.completion_tokens, error: .error}'
 if echo "$B" | jq -e '.error' >/dev/null; then
-  echo "FAIL B — got error: $(echo $B | jq -r .error)"; fail=$((fail+1))
+  echo "FAIL B — got error: $(echo "$B" | jq -r .error)"; fail=$((fail+1))
 fi
 
 echo "=== C: short follow-up (should reuse loaded model) ==="

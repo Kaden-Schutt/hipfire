@@ -172,7 +172,7 @@ services.hipfire = {
   src = pkgs.fetchFromGitHub {
     owner = "Kaden-Schutt";
     repo = "hipfire";
-    rev = "v0.2.0";
+    rev = "v0.2.1";
     hash = "sha256-AAAA...";
   };
 };
