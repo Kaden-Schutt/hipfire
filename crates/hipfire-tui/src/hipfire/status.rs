@@ -4,7 +4,13 @@
 
 use std::{
     env, fs,
+    path::PathBuf,
     process::{Command, Stdio},
+    sync::{
+        mpsc::{self, Receiver},
+        Arc, Mutex,
+    },
+    thread,
     time::Duration,
 };
 
@@ -24,13 +30,8 @@ pub struct StatusState {
 
 impl StatusState {
     pub fn load(paths: &HipfirePaths, config: &ConfigState) -> Self {
-        let serve_pid = fs::read_to_string(&paths.serve_pid)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
-        let serve_pid_alive = serve_pid
-            .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
-            .unwrap_or(false);
-        let (serve_http_ok, health_text) = probe_health(config);
+        let (serve_pid, serve_pid_alive) = read_serve_pid(&paths.serve_pid);
+        let (serve_http_ok, health_text) = probe_health_at(&config.probe_host(), config.port);
         let gpu_lines = detect_gpu_lines();
         let paths_ok = vec![
             ("~/.hipfire".into(), paths.root.exists()),
@@ -86,8 +87,8 @@ pub fn start_background_serve() -> Result<()> {
     Ok(())
 }
 
-fn probe_health(config: &ConfigState) -> (bool, String) {
-    let url = format!("http://{}:{}/health", config.probe_host(), config.port);
+fn probe_health_at(host: &str, port: u16) -> (bool, String) {
+    let url = format!("http://{host}:{port}/health");
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(450))
         .build();
@@ -104,6 +105,58 @@ fn probe_health(config: &ConfigState) -> (bool, String) {
         }
         Err(err) => (false, err.to_string()),
     }
+}
+
+fn read_serve_pid(pid_path: &std::path::Path) -> (Option<u32>, bool) {
+    let pid = fs::read_to_string(pid_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let alive = pid
+        .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
+        .unwrap_or(false);
+    (pid, alive)
+}
+
+/// One health snapshot from the background poller.
+#[derive(Clone, Debug)]
+pub struct HealthUpdate {
+    pub serve_http_ok: bool,
+    pub health_text: String,
+    pub serve_pid: Option<u32>,
+    pub serve_pid_alive: bool,
+}
+
+/// Shared probe endpoint, updated by the app when host/port change.
+pub type ProbeTarget = Arc<Mutex<(String, u16)>>;
+
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Spawn the 2s background health poller. The thread exits when the app
+/// drops the receiver. The first probe fires immediately so startup state
+/// is fresh without pressing r.
+pub fn spawn_health_poller(serve_pid_path: PathBuf, target: ProbeTarget) -> Receiver<HealthUpdate> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || loop {
+        let (host, port) = {
+            let guard = target.lock().unwrap_or_else(|err| err.into_inner());
+            guard.clone()
+        };
+        let (serve_http_ok, health_text) = probe_health_at(&host, port);
+        let (serve_pid, serve_pid_alive) = read_serve_pid(&serve_pid_path);
+        if tx
+            .send(HealthUpdate {
+                serve_http_ok,
+                health_text,
+                serve_pid,
+                serve_pid_alive,
+            })
+            .is_err()
+        {
+            break;
+        }
+        thread::sleep(HEALTH_POLL_INTERVAL);
+    });
+    rx
 }
 
 fn detect_gpu_lines() -> Vec<String> {

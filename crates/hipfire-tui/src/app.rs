@@ -6,7 +6,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver},
-        Arc,
+        Arc, Mutex,
     },
     thread,
 };
@@ -19,7 +19,7 @@ use crate::hipfire::{
     cli,
     config::ConfigState,
     registry::{RegistryAction, RegistryState},
-    status::{start_background_serve, StatusState},
+    status::{spawn_health_poller, start_background_serve, HealthUpdate, ProbeTarget, StatusState},
     HipfirePaths,
 };
 
@@ -67,6 +67,10 @@ pub struct App {
     pub settings_scope_model: bool,
     pub chat: ChatState,
     pub last_reload: String,
+    /// Endpoint shared with the background health poller; updated on reload
+    /// so config host/port changes are picked up without a restart.
+    probe_target: ProbeTarget,
+    health_rx: Option<Receiver<HealthUpdate>>,
 }
 
 /// An in-progress settings edit; applied through the hipfire CLI so the CLI
@@ -84,6 +88,11 @@ impl App {
         let registry = RegistryState::load(&paths);
         let status = StatusState::load(&paths, &config);
         let active_model = config.default_model.clone();
+        let probe_target: ProbeTarget = Arc::new(Mutex::new((config.probe_host(), config.port)));
+        let health_rx = Some(spawn_health_poller(
+            paths.serve_pid.clone(),
+            Arc::clone(&probe_target),
+        ));
         Ok(Self {
             paths,
             config,
@@ -97,6 +106,8 @@ impl App {
             settings_scope_model: false,
             chat: ChatState::default(),
             last_reload: "loaded hipfire state".into(),
+            probe_target,
+            health_rx,
         })
     }
 
@@ -104,7 +115,32 @@ impl App {
         self.config = ConfigState::load(&self.paths);
         self.registry = RegistryState::load(&self.paths);
         self.status = StatusState::load(&self.paths, &self.config);
+        // Repoint the background poller at the (possibly changed) endpoint.
+        {
+            let mut target = self
+                .probe_target
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            *target = (self.config.probe_host(), self.config.port);
+        }
         self.last_reload = "reloaded config, registry, models, and serve status".into();
+    }
+
+    /// Apply the freshest snapshot from the 2s background health poller.
+    pub fn drain_health_events(&mut self) {
+        let Some(rx) = &self.health_rx else {
+            return;
+        };
+        let mut latest = None;
+        while let Ok(update) = rx.try_recv() {
+            latest = Some(update);
+        }
+        if let Some(update) = latest {
+            self.status.serve_http_ok = update.serve_http_ok;
+            self.status.health_text = update.health_text;
+            self.status.serve_pid = update.serve_pid;
+            self.status.serve_pid_alive = update.serve_pid_alive;
+        }
     }
 
     pub fn next_tab(&mut self) {
@@ -277,14 +313,14 @@ impl App {
     fn start_serve_for_chat(&mut self) {
         if self.status.serve_pid_alive {
             self.chat.status =
-                "serve process exists; waiting for HTTP health, press r to refresh".into();
+                "serve process exists; health auto-refreshes every 2s, retry shortly".into();
             return;
         }
 
         match start_background_serve() {
             Ok(()) => {
                 self.chat.status =
-                    "starting serve -d; keep your prompt and retry after health is online".into();
+                    "starting serve -d; health auto-refreshes, retry once it shows online".into();
                 self.last_reload = "requested background serve start".into();
                 self.status = StatusState::load(&self.paths, &self.config);
             }
@@ -496,6 +532,8 @@ impl App {
             settings_scope_model: false,
             chat: ChatState::default(),
             last_reload: String::new(),
+            probe_target: Arc::new(Mutex::new(("127.0.0.1".into(), 11435))),
+            health_rx: None,
         }
     }
 }

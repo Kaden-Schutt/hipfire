@@ -53,6 +53,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     loop {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
         app.drain_chat_events();
+        app.drain_health_events();
 
         if event::poll(std::time::Duration::from_millis(80))? {
             match event::read()? {
