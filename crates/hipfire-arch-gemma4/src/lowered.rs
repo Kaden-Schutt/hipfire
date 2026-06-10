@@ -92,11 +92,23 @@ fn run_prefill_gemm(
         // WMMA path: use GemmFamily::run which resolves the best kernel
         // for each dtype (WMMA where available, scalar fallback otherwise).
         // The F32→F16 conversion is handled inside the kernel methods.
-        if family.run(&ctx, gpu, &params).is_ok() {
-            return Ok(());
-        }
-        // If GemmFamily::run returns UnsupportedVariant, fall through to
-        // the explicit key path below.
+        //
+        // HARD ERROR on failure — no silent fallthrough. The old code fell
+        // through to the scalar key path when `run` errored (e.g. missing
+        // WMMA kernel for this dtype × arch), which silently produced
+        // special-token garbage from token 0 on gfx1201 (RDNA4) where the
+        // gfx11 `_w32` WMMA kernels don't exist. Refuse-don't-degrade: the
+        // operator opted into WMMA explicitly, so a missing kernel is an
+        // error, not a degrade. Unset HIPFIRE_WMMA_PREFILL (or use the
+        // scalar HIPFIRE_BATCHED_PREFILL=1 path) on archs without coverage.
+        return family.run(&ctx, gpu, &params).map_err(|e| {
+            hip_bridge::HipError::new(0, &format!(
+                "gemma4 WMMA prefill: GemmFamily::run failed for dtype {:?} on arch {} \
+                 (HIPFIRE_WMMA_PREFILL=1 requires a WMMA kernel for every projection \
+                 dtype — unset it to use the scalar batched path): {e}",
+                w.gpu_dtype, gpu.arch,
+            ))
+        });
     }
 
     // Scalar path (default) or fallback for unsupported WMMA dtypes.

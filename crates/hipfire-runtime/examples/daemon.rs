@@ -1147,6 +1147,36 @@ fn gemma4_eagle_spec_len(spec: Option<u64>) -> Result<usize, String> {
     }
 }
 
+/// Arch gate for the gemma4 batched/WMMA prefill env opt-in
+/// (`HIPFIRE_BATCHED_PREFILL=1` / `HIPFIRE_WMMA_PREFILL=1`).
+///
+/// The lowered batched-prefill path is validated correct ONLY on gfx11-class
+/// GPUs (RDNA3/RDNA3.5 — is_rdna3/has_wmma_w32, e.g. gfx1100/gfx1151). On
+/// gfx1201 (RDNA4) BOTH flags produce silent special-token garbage from
+/// token 0 (deterministic, even on a single-chunk 20-token prompt): the
+/// gfx11 `_w32` WMMA kernels don't exist there and the old
+/// `lowered::run_prefill_gemm` fell through silently (now a hard error in
+/// `lowered.rs`). Returns true only when an opt-in flag is set AND the arch
+/// is gfx11-class; logs the refusal so the fallback to per-token prefill is
+/// visible in the daemon log.
+fn gemma4_batched_prefill_optin(gpu: &rdna_compute::Gpu) -> bool {
+    let want = lowered::batched_prefill_enabled() || lowered::wmma_prefill_enabled();
+    if !want {
+        return false;
+    }
+    let gfx11 = gpu.arch_caps.is_rdna3() || gpu.arch_caps.has_wmma_w32();
+    if !gfx11 {
+        eprintln!(
+            "[gemma4] REFUSING HIPFIRE_BATCHED_PREFILL/HIPFIRE_WMMA_PREFILL on arch {} \
+             (not gfx11-class): batched/WMMA prefill is validated only on RDNA3/RDNA3.5 \
+             and produces silent special-token garbage on gfx12 — falling back to \
+             per-token prefill",
+            gpu.arch,
+        );
+    }
+    gfx11
+}
+
 /// Expert-parallel serving state (task #26 — see docs/plans/daemon-ep-wiring.md).
 /// Present only when the load message requested `tp > 1`. Mirrors the PP path
 /// (`pp_gpus`) but routes the forward through `forward_ep` (replicated attention
@@ -4160,7 +4190,10 @@ fn load_model(
         // opt-in is silently ignored when a drafter is present).
         let lowered_cfg = lowered::config_from_hfq(&hfq)
             .ok_or_else(|| "gemma4: lowered config_from_hfq failed".to_string())?;
-        let want_batched = lowered::batched_prefill_enabled() || lowered::wmma_prefill_enabled();
+        // Arch-gated opt-in: refuses (with a log line) outside gfx11-class —
+        // gfx12 batched/WMMA prefill emits silent special-token garbage from
+        // token 0, so dense models stay on the eager per-token path there.
+        let want_batched = gemma4_batched_prefill_optin(gpu);
         let use_lowered =
             lowered_cfg.enable_moe_block || (want_batched && gemma4_drafter.is_none());
         if use_lowered {
@@ -13565,7 +13598,10 @@ fn generate_gemma4_lowered(
         // HIPFIRE_BATCHED_PREFILL=1 (scalar) until the F16 precision issue is fixed.
         let wmma = lowered::wmma_prefill_enabled();
         let single_chunk = prompt_ids.len() <= scratch.max_prefill_batch;
-        let use_batched = (wmma || lowered::batched_prefill_enabled())
+        // Arch-gated opt-in (see gemma4_batched_prefill_optin): refuses with
+        // a log line outside gfx11-class, where batched/WMMA prefill emits
+        // silent special-token garbage from token 0 — per-token is coherent.
+        let use_batched = gemma4_batched_prefill_optin(gpu)
             && prompt_ids.len() >= 4
             && !has_moe
             && (single_chunk || !wmma);
