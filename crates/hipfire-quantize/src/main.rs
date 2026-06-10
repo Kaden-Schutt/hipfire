@@ -6790,7 +6790,17 @@ fn main() {
                             let q = quantize_q8f16(&f32_data);
                             (q, QuantType::Q8F16, 32u32, "Q8_F16")
                         }
-                    } else if q8_router && is_q8_tensor(name) {
+                    } else if q8_router
+                        && is_q8_tensor(name)
+                        // Gemma4 (arch 13/22): HIPFIRE_GEMMA4_MQ4_ATTN=1 must also
+                        // bypass this q8_router catch-all (is_q8_tensor matches all
+                        // self_attn projections, not just routers) or the kmap-level
+                        // opt-out at the top of this arm is dead code for gemma4.
+                        && !((arch_id == 13 || arch_id == 22)
+                            && name.contains("self_attn.")
+                            && name.ends_with("_proj.weight")
+                            && std::env::var_os("HIPFIRE_GEMMA4_MQ4_ATTN").is_some())
+                    {
                         // Q8 router for MoE: keep mlp.gate.weight and
                         // shared_expert_gate.weight at Q8 regardless of --format.
                         let q = quantize_q8f16(&f32_data);

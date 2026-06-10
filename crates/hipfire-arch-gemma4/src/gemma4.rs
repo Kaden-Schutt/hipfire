@@ -130,6 +130,7 @@ fn load_wt(
         11 => DType::HFQ3G256,
         13 => DType::MQ4G256,
         15 => DType::MQ6G256,
+        17 => DType::MQ3G256,
         // MG4G256 (qt=19) reads back as MQ4G256: identical binary layout.
         19 => DType::MQ4G256,
         qt => return Err(format!("gemma4: unsupported quant_type {qt} for {name}")),
