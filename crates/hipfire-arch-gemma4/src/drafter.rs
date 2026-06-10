@@ -538,6 +538,33 @@ impl Gemma4DrafterWeights {
             embd_q8,
         })
     }
+
+    /// Return all GPU weight buffers to the pool (drained by the daemon's
+    /// `unload_model`). Consumes self.
+    ///
+    /// `lm_head` is NOT freed here: it is always an alias of `embed_tokens`'
+    /// allocation (tied embedding — see the alias construction in `load`).
+    /// `embed_tokens` owns the bytes and is freed exactly once below; dropping
+    /// the alias is a no-op (`DeviceBuffer` has no `Drop`). Same rule as
+    /// `Gemma4Weights::free_gpu` on the target.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.embed_tokens);
+        let _ = gpu.free_tensor(self.final_norm);
+        self.pre_projection.free_all(gpu);
+        self.post_projection.free_all(gpu);
+        for l in self.layers {
+            let _ = gpu.free_tensor(l.input_layernorm);
+            let _ = gpu.free_tensor(l.post_attention_layernorm);
+            let _ = gpu.free_tensor(l.pre_feedforward_layernorm);
+            let _ = gpu.free_tensor(l.post_feedforward_layernorm);
+            l.q_proj.free_all(gpu);
+            l.o_proj.free_all(gpu);
+            let _ = gpu.free_tensor(l.q_norm);
+            l.gate_proj.free_all(gpu);
+            l.up_proj.free_all(gpu);
+            l.down_proj.free_all(gpu);
+        }
+    }
 }
 
 // ─── Scratch ───────────────────────────────────────────────────────────────
@@ -589,6 +616,27 @@ impl Gemma4DrafterScratch {
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
             pos_buf,
         })
+    }
+
+    /// Return all scratch buffers to the pool. Consumes self. The raw
+    /// `pos_buf` DeviceBuffer is freed directly (it never went through the
+    /// tensor pool).
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.concat);
+        let _ = gpu.free_tensor(self.embed_half);
+        let _ = gpu.free_tensor(self.x);
+        let _ = gpu.free_tensor(self.residual);
+        let _ = gpu.free_tensor(self.tmp);
+        let _ = gpu.free_tensor(self.q);
+        let _ = gpu.free_tensor(self.attn_out);
+        let _ = gpu.free_tensor(self.gate_ffn);
+        let _ = gpu.free_tensor(self.up_ffn);
+        let _ = gpu.free_tensor(self.ffn_hidden);
+        let _ = gpu.free_tensor(self.ffn_out);
+        let _ = gpu.free_tensor(self.normed);
+        let _ = gpu.free_tensor(self.post_proj);
+        let _ = gpu.free_tensor(self.logits);
+        let _ = gpu.hip.free(self.pos_buf);
     }
 }
 

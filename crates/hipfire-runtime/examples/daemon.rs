@@ -1085,6 +1085,50 @@ struct DdtreeState {
     path_c_main_end_snap: DeltaNetSnapshot,
 }
 
+/// Optional Gemma 4 EAGLE speculative-decoding state (arch-22
+/// `gemma4_unified_assistant` drafter riding an arch-13 target). Populated
+/// when `load` supplies `params.drafter` on an arch_id=13 model. Used by
+/// `generate_gemma4`'s temp==0 fast path — temp > 0 falls back to AR
+/// sampling (the EAGLE accept rule is greedy-only, same contract as DFlash).
+/// The drafter has NO KV cache of its own: `drafter_step` queries the
+/// TARGET's KV at a constant position, so the only per-session state is the
+/// target's `Gemma4State` plus the small reusable scratch held here.
+struct Gemma4EagleState {
+    drafter_config: gemma4::drafter::Gemma4DrafterConfig,
+    drafter_weights: gemma4::drafter::Gemma4DrafterWeights,
+    drafter_scratch: gemma4::drafter::Gemma4DrafterScratch,
+    /// Reusable seed/draft/verify hidden buffers for `spec_step_gemma4_eagle`,
+    /// sized for `draft_len` at load time.
+    spec_scratch: gemma4::speculative::Gemma4SpecScratch,
+    /// Drafts per round (verify block = draft_len + 1). v1 pins this to
+    /// `GEMMA4_EAGLE_DRAFT_LEN`; the load handler refuses anything else.
+    draft_len: usize,
+}
+
+/// v1 draft length for gemma4 EAGLE (`params.spec`). dl=3 is the validated
+/// config: spec == eager byte-identical for dl ≤ 4 on both the Q8 and
+/// MQ4-attn targets, +61% over AR (80.5 vs 50.1 tok/s, hiptrx/gfx1201) at
+/// dl=3, while dl ≥ 5 trips a pre-existing non-deterministic batched-MQ4
+/// `forward_batch` fault on gfx12 — see
+/// `crates/hipfire-arch-gemma4/examples/infer_gemma4_spec.rs`.
+const GEMMA4_EAGLE_DRAFT_LEN: usize = 3;
+
+/// Gate for the `params.spec` knob: only `GEMMA4_EAGLE_DRAFT_LEN` (3) is
+/// accepted in v1 — refuse-don't-degrade, mirroring the DFlash refusal
+/// contracts. Absent means "use the validated default".
+fn gemma4_eagle_spec_len(spec: Option<u64>) -> Result<usize, String> {
+    match spec {
+        None => Ok(GEMMA4_EAGLE_DRAFT_LEN),
+        Some(n) if n == GEMMA4_EAGLE_DRAFT_LEN as u64 => Ok(GEMMA4_EAGLE_DRAFT_LEN),
+        Some(n) => Err(format!(
+            "gemma4 EAGLE v1 supports spec=3 (draft_len) only; got spec={n}. \
+             dl=3 is the validated config (byte-identical to eager for dl <= 4; \
+             dl >= 5 trips a pre-existing batched-MQ4 forward_batch fault on \
+             gfx12) — reload with spec=3 or drop params.drafter."
+        )),
+    }
+}
+
 /// Expert-parallel serving state (task #26 — see docs/plans/daemon-ep-wiring.md).
 /// Present only when the load message requested `tp > 1`. Mirrors the PP path
 /// (`pp_gpus`) but routes the forward through `forward_ep` (replicated attention
@@ -1315,6 +1359,11 @@ struct LoadedModel {
     model_path: String,
     // DFlash speculative decoding state (populated when load supplied a draft).
     dflash: Option<DflashState>,
+    /// Gemma 4 EAGLE spec-decode state (arch-22 drafter on an arch-13
+    /// target). `Some` only when `load` supplied `params.drafter` and the
+    /// drafter loaded cleanly; `generate_gemma4` routes temp==0 requests
+    /// through `spec_step_gemma4_eagle` when present.
+    gemma4_eagle: Option<Gemma4EagleState>,
     // Upstream HF Jinja chat_template, extracted from the HFQ
     // `tokenizer_config.chat_template` at load time. `None` when the source
     // model didn't ship one (rare for instruct models). Only consumed when
@@ -1645,6 +1694,38 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
+                // Gemma 4 EAGLE drafter (arch-22 `gemma4_unified_assistant`).
+                // Deliberately a SEPARATE param from `params.draft` (the
+                // qwen3.5 DFlash knob) so a DFlash .hfq can never be routed
+                // into the EAGLE loader by accident. `params.spec` = draft
+                // length; v1 accepts 3 only (see gemma4_eagle_spec_len).
+                let gemma4_drafter = msg
+                    .get("params")
+                    .and_then(|p| p.get("drafter"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let gemma4_draft_len = if gemma4_drafter.is_some() {
+                    let spec_raw = msg
+                        .get("params")
+                        .and_then(|p| p.get("spec"))
+                        .and_then(|v| v.as_u64());
+                    match gemma4_eagle_spec_len(spec_raw) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"error","message":"{}"}}"#,
+                                e.replace('"', "'")
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    }
+                } else {
+                    GEMMA4_EAGLE_DRAFT_LEN
+                };
+
                 // MTP speculative decode config. `mtp_mode` gates weight
                 // discovery at load time (off=skip, on=error-if-missing,
                 // auto=scan+log). `mtp_k` sets the draft window size.
@@ -1875,7 +1956,23 @@ fn main() {
                     let _ = stdout.flush();
                     continue;
                 }
+                if tp > 1 && gemma4_drafter.is_some() {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"EP serving (tp>1) does not support the gemma4 EAGLE drafter; reload without params.drafter."}}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if pp > 1 {
+                    if gemma4_drafter.is_some() {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"error","message":"gemma4 EAGLE spec-decode requires pp=1 (arch_id=13 has no pipeline-parallel path); reload without params.drafter."}}"#
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
                     if draft_path.is_some()
                         && std::env::var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1")
                     {
@@ -1920,6 +2017,8 @@ fn main() {
                         path,
                         max_seq,
                         draft_path.as_deref(),
+                        gemma4_drafter.as_deref(),
+                        gemma4_draft_len,
                         kv_mode_override.as_deref(),
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
@@ -3376,6 +3475,8 @@ fn load_model(
     path: &str,
     max_seq: usize,
     draft_path: Option<&str>,
+    gemma4_drafter: Option<&str>,
+    gemma4_eagle_draft_len: usize,
     kv_mode_override: Option<&str>,
     kv_adaptive_override: Option<&str>,
     state_quant_override: Option<&str>,
@@ -3390,7 +3491,13 @@ fn load_model(
         // with pp>1, draft_path is None and cask.sidecar is None.
         // Adaptive KV is Qwen3.5 single-process only (pp=1); not wired on the
         // tensor-parallel path. Consume the override so it isn't silently dropped.
-        let _ = (draft_path, cask, kv_adaptive_override);
+        let _ = (
+            draft_path,
+            cask,
+            kv_adaptive_override,
+            gemma4_drafter,
+            gemma4_eagle_draft_len,
+        );
         return load_model_pp(
             path,
             max_seq,
@@ -3420,10 +3527,29 @@ fn load_model(
     // If the path is a directory with config.json, try loading as a
     // SafetensorsSource (ParoQuant, AWQ, etc.) instead of HFQ.
     if Path::new(path).is_dir() {
+        if gemma4_drafter.is_some() {
+            return Err(
+                "params.drafter (gemma4 EAGLE) is only supported on arch_id=13 \
+                 HFQ targets, not safetensors directories."
+                    .to_string(),
+            );
+        }
         return load_model_safetensors(path, max_seq, &kv_mode, gpu);
     }
 
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+
+    // Gemma 4 EAGLE drafter is an arch-13 contract — refuse on every other
+    // arch BEFORE any weight upload (fail-fast, same rationale as the DFlash
+    // lm_head quant_type refusal below).
+    if gemma4_drafter.is_some() && hfq.arch_id != 13 {
+        return Err(format!(
+            "params.drafter (gemma4 EAGLE, arch-22) is only supported on \
+             arch_id=13 (Gemma 4) targets; this model is arch_id={}. Use \
+             params.draft for qwen3.5 DFlash drafts.",
+            hfq.arch_id
+        ));
+    }
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
@@ -3644,6 +3770,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            gemma4_eagle: None,
             chat_template,
         });
     }
@@ -3733,6 +3860,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            gemma4_eagle: None,
             chat_template,
         });
     }
@@ -3843,6 +3971,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            gemma4_eagle: None,
             chat_template,
         });
     }
@@ -3946,22 +4075,26 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            gemma4_eagle: None,
             chat_template,
         });
     }
 
     if hfq.arch_id == 13 {
-        // Gemma 4 dense (hipfire-arch-gemma4). Standalone bring-up — no
-        // eviction, no DFlash drafter, no EAGLE/spec-decode, no PFlash, no
-        // VL, no pipeline-parallel (v1 refusal contracts below). Prefill
-        // goes through the eager `gemma4::forward::decode_step`; the decode
+        // Gemma 4 dense (hipfire-arch-gemma4). No eviction, no DFlash
+        // drafter, no PFlash, no VL, no pipeline-parallel (v1 refusal
+        // contracts below). EAGLE spec-decode (arch-22 drafter via
+        // `params.drafter`) IS wired: greedy requests route through
+        // `spec_step_gemma4_eagle` in `generate_gemma4`. AR prefill goes
+        // through the eager `gemma4::forward::decode_step`; the AR decode
         // loop uses `decode_step_with_graph` (hipGraph, default ON) in the
         // `generate_gemma4` hot path. Free-function load triple (config →
         // weights → state); the gemma4 crate's `Architecture` impl exists
         // but the daemon mirrors the lfm2moe free-function pattern.
         if draft_path.is_some() {
-            return Err("Speculative decode (DFlash/EAGLE draft) not supported on \
-                       arch_id=13 (Gemma 4) in the daemon yet. Reload without a draft."
+            return Err("params.draft (qwen3.5 DFlash) is not supported on \
+                       arch_id=13 (Gemma 4). For Gemma 4 spec-decode pass the \
+                       arch-22 EAGLE drafter via params.drafter instead."
                 .to_string());
         }
         if cask.sidecar.is_some() {
@@ -3979,6 +4112,35 @@ fn load_model(
         // requested window.
         let state = gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, &config, max_seq)
             .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?;
+        // Optional EAGLE drafter (arch-22 `gemma4_unified_assistant`): load
+        // the drafter weights + per-step scratch + the reusable spec scratch,
+        // then prime the batched verify path. File-missing / arch-mismatch is
+        // logged and the model serves AR-only (mirrors the qwen3.5 DFlash
+        // load contract); the spec knob itself was already validated upstream
+        // (v1 accepts draft_len=3 only).
+        let gemma4_eagle = if let Some(dp) = gemma4_drafter {
+            match load_gemma4_eagle_state(dp, gemma4_eagle_draft_len, &config, &weights, gpu) {
+                Ok(st) => {
+                    eprintln!(
+                        "  gemma4 EAGLE drafter loaded: {} (layers={}, hidden={}, draft_len={})",
+                        dp,
+                        st.drafter_config.n_layers,
+                        st.drafter_config.hidden,
+                        st.draft_len,
+                    );
+                    Some(st)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  gemma4 EAGLE drafter load failed ({}): {} — falling back to AR only",
+                        dp, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // Resolve the conversational end-of-turn token. Gemma 4's HF config
         // sets eos_token_id to the LIST [1, 106]: `<eos>` (1) plus the
         // end-of-turn marker — named `<turn|>` on gemma-4 tokenizers,
@@ -4046,6 +4208,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            gemma4_eagle,
             chat_template,
         });
     }
@@ -4164,6 +4327,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            gemma4_eagle: None,
             chat_template,
         });
     }
@@ -4628,6 +4792,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash,
+            gemma4_eagle: None,
             chat_template,
         })
     } else {
@@ -4707,6 +4872,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            gemma4_eagle: None,
             chat_template,
         })
     }
@@ -4872,6 +5038,7 @@ fn load_model_safetensors(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            gemma4_eagle: None,
             chat_template,
         });
     }
@@ -5019,6 +5186,7 @@ fn load_model_safetensors(
         decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
+        gemma4_eagle: None,
         chat_template,
     })
 }
@@ -5265,6 +5433,7 @@ fn load_model_pp(
         decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
+        gemma4_eagle: None,
         chat_template: resolve_chat_template(&hfq, path),
     })
 }
@@ -5459,6 +5628,7 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
         decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
+        gemma4_eagle: None,
         chat_template,
     })
 }
@@ -5585,6 +5755,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
+        gemma4_eagle: None,
         chat_template,
     })
 }
@@ -6086,6 +6257,14 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         df.draft_weights.free_gpu(gpu);
         df.draft_scratch.free_gpu(gpu);
     }
+    // Gemma 4 EAGLE drafter: weights + per-step scratch + spec scratch all
+    // expose explicit frees (the drafter lm_head aliases embed_tokens and is
+    // skipped inside free_gpu, mirroring the target's tied-embedding rule).
+    if let Some(ge) = m.gemma4_eagle {
+        ge.drafter_weights.free_gpu(gpu);
+        ge.drafter_scratch.free_gpu(gpu);
+        ge.spec_scratch.free(gpu);
+    }
     // Free eviction context (centers + scratch tensors) if active.
     if let Some(ev) = m.eviction {
         ev.free_gpu(gpu);
@@ -6171,6 +6350,89 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // memory.
     gpu.invalidate_graph_state();
     gpu.drain_pool();
+}
+
+/// Load the arch-22 gemma4 EAGLE drafter + spec scratch and prime the batched
+/// verify path. Mirrors `load_dflash_state`'s role for qwen3.5 DFlash.
+///
+/// The warm block exists because gemma4's b>1 batched MQ4 FFN GEMM lazily
+/// initializes scratch on first use and can fault (illegal access) if its
+/// very first call is the one inside the spec loop — a pre-existing
+/// `forward_batch` fragility (reproduced standalone via `verify_batch_gemma4
+/// --bs 16` on the UNMODIFIED forward_batch), not a spec-loop bug. Priming at
+/// b=1 THEN at the real verify block size (draft_len+1) on disposable states
+/// initializes both the scalar and batched-WMMA scratch; Q8 targets get a
+/// cheap no-op. Same protocol as `infer_gemma4_spec.rs`.
+fn load_gemma4_eagle_state(
+    drafter_path: &str,
+    draft_len: usize,
+    target_cfg: &gemma4::config::Gemma4Config,
+    target_weights: &gemma4::gemma4::Gemma4Weights,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<Gemma4EagleState, String> {
+    let dhfq = HfqFile::open(Path::new(drafter_path))
+        .map_err(|e| format!("open gemma4 drafter: {e}"))?;
+    if dhfq.arch_id != 22 {
+        return Err(format!(
+            "gemma4 EAGLE drafter must be arch_id=22 (gemma4_unified_assistant); \
+             got arch_id={} — a DFlash draft goes in params.draft on qwen3.5 \
+             targets, not params.drafter",
+            dhfq.arch_id
+        ));
+    }
+    let dcfg = gemma4::drafter::Gemma4DrafterConfig::from_hfq(&dhfq)?;
+    if dcfg.backbone_hidden != target_cfg.dim {
+        return Err(format!(
+            "drafter backbone_hidden ({}) != target hidden ({}) — this drafter \
+             was trained against a different target width",
+            dcfg.backbone_hidden, target_cfg.dim
+        ));
+    }
+    let drafter_weights = gemma4::drafter::Gemma4DrafterWeights::load(&dhfq, &dcfg, gpu)?;
+    let drafter_scratch = gemma4::drafter::Gemma4DrafterScratch::new(gpu, &dcfg)?;
+    let spec_scratch = gemma4::speculative::Gemma4SpecScratch::new(gpu, target_cfg, draft_len)?;
+
+    // ── Prime the batched verify path (see doc comment): b=1 then the real
+    // block size, each on a disposable throwaway state. ──
+    let warm_b = draft_len + 1;
+    {
+        let mut warm =
+            gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
+                .map_err(|e| format!("gemma4-eagle: warm state: {e}"))?;
+        let _ = gemma4::forward::forward_batch(
+            target_cfg,
+            target_weights,
+            &mut warm,
+            gpu,
+            &[target_cfg.bos_token],
+            0,
+        );
+        let _ = gpu.hip.device_synchronize();
+        warm.free_gpu(gpu);
+    }
+    {
+        let mut warm =
+            gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
+                .map_err(|e| format!("gemma4-eagle: warm state 2: {e}"))?;
+        let _ = gemma4::forward::forward_batch(
+            target_cfg,
+            target_weights,
+            &mut warm,
+            gpu,
+            &vec![target_cfg.bos_token; warm_b],
+            0,
+        );
+        let _ = gpu.hip.device_synchronize();
+        warm.free_gpu(gpu);
+    }
+
+    Ok(Gemma4EagleState {
+        drafter_config: dcfg,
+        drafter_weights,
+        drafter_scratch,
+        spec_scratch,
+        draft_len,
+    })
 }
 
 fn load_dflash_state(
@@ -8796,12 +9058,15 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         return;
     }
     if m.arch_id == 13 {
-        // arch_id=13 (Gemma 4 dense). Standalone bring-up — same shape as
-        // the lfm2moe short-circuit above. PFlash / DFlash / EAGLE / VL /
-        // multi-GPU / sampler-budget scaffolding all bypass (refused at
-        // load). We honour `system_prompt`, `temp`, `top_p`, and (via
-        // JinjaChatFrame) `messages_history` + `tools` rendering; thinking
-        // mode and spec-decode are out of scope for v1.
+        // arch_id=13 (Gemma 4 dense). Same shape as the lfm2moe
+        // short-circuit above. PFlash / DFlash / VL / multi-GPU /
+        // sampler-budget scaffolding all bypass (refused at load). EAGLE
+        // spec-decode (arch-22 drafter) is dispatched INSIDE
+        // generate_gemma4: greedy requests route through
+        // spec_step_gemma4_eagle when a drafter is loaded; temp > 0 falls
+        // back to the AR sampling loop. We honour `system_prompt`, `temp`,
+        // `top_p`, and (via JinjaChatFrame) `messages_history` + `tools`
+        // rendering; thinking mode is out of scope for v1.
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -12742,6 +13007,161 @@ fn generate_gemma4(
     }
     let prefill_ms = t0.elapsed().as_millis();
 
+    // ── EAGLE spec-decode fast path (arch-22 drafter loaded; greedy only) ──
+    //
+    // Mirrors the DFlash dispatch contract: the accept rule is greedy-argmax,
+    // so the committed stream is PROVABLY the target's greedy AR sequence —
+    // the same tokens the AR loop below would emit at temp 0. That invariant
+    // is the gate `infer_gemma4_spec --check-eager` validates byte-for-byte
+    // (spec == eager on hiptrx/gfx1201, Q8 and MQ4-attn targets, dl ≤ 4).
+    // temp > 0 falls through to the AR sampling loop, exactly like DFlash.
+    // Opt out with HIPFIRE_GEMMA4_EAGLE=0.
+    let eagle_active = m.gemma4_eagle.is_some()
+        && temp <= 1e-6
+        && std::env::var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() != Some("0");
+    if eagle_active {
+        let draft_len = m.gemma4_eagle.as_ref().unwrap().draft_len;
+        // Seed hidden = post-`model.norm` hidden of the last prompt position
+        // (left in `state.tmp` by the final prefill `decode_step` — the
+        // lm_head input). The seed TOKEN is the last prompt token; its KV is
+        // re-written (identically) at the top of the first verify. The first
+        // generated token comes out of round 1's verify (argmax_per_pos[0]),
+        // exactly as the AR loop's first sample from `last_logits` would —
+        // so `last_logits` is intentionally unused on this path.
+        {
+            let state = m.gemma4_state.as_ref().unwrap();
+            let eagle = m.gemma4_eagle.as_ref().unwrap();
+            if let Err(e) = eagle.spec_scratch.set_seed_hidden_from(gpu, &state.tmp) {
+                emit_error_with_id(stdout, id, format!("gemma4 eagle seed hidden: {e}"));
+                return;
+            }
+        }
+        let prefill_end = m.gemma4_state.as_ref().unwrap().n_tokens;
+        let mut seed_token = *prompt_ids.last().unwrap();
+        let mut generated_count = 0usize;
+        let mut rounds = 0usize;
+        let mut total_accepted = 0usize;
+        let mut stop = false;
+        let decode_t0 = Instant::now();
+        while !stop && generated_count < max_tokens {
+            let committed_len = m.gemma4_state.as_ref().unwrap().n_tokens;
+            // KV/seq bound: the verify block occupies [L-1, L-1+draft_len+1).
+            if committed_len + draft_len + 1 >= cache_cap {
+                break;
+            }
+            let spec = {
+                let cfg = m.gemma4_config.as_ref().unwrap();
+                let weights = m.gemma4_weights.as_ref().unwrap();
+                let state = m.gemma4_state.as_mut().unwrap();
+                let eagle = m.gemma4_eagle.as_mut().unwrap();
+                gemma4::speculative::spec_step_gemma4_eagle(
+                    gpu,
+                    weights,
+                    cfg,
+                    state,
+                    &eagle.drafter_weights,
+                    &eagle.drafter_config,
+                    &mut eagle.drafter_scratch,
+                    &mut eagle.spec_scratch,
+                    seed_token,
+                    committed_len,
+                    draft_len,
+                    0.0,
+                )
+            };
+            let spec = match spec {
+                Ok(s) => s,
+                Err(e) => {
+                    emit_error_with_id(
+                        stdout,
+                        id,
+                        format!("gemma4 eagle spec step failed: {e}"),
+                    );
+                    return;
+                }
+            };
+            rounds += 1;
+            total_accepted += spec.accept_len;
+            // Emit the committed tokens (accepted drafts ++ bonus); stop at
+            // EOS / max_tokens — identical to what the AR loop would commit.
+            for &t in &spec.committed {
+                if stop_set.contains(&t) {
+                    stop = true;
+                    break;
+                }
+                let frag = {
+                    let tokenizer = m.tokenizer.as_ref().unwrap();
+                    tokenizer.decode(&[t])
+                };
+                let envelope = serde_json::json!({
+                    "type": "token",
+                    "id": id,
+                    "text": frag,
+                });
+                let _ = writeln!(stdout, "{}", envelope);
+                let _ = stdout.flush();
+                m.conversation_tokens.push(t);
+                generated_count += 1;
+                if generated_count >= max_tokens {
+                    stop = true;
+                    break;
+                }
+            }
+            // Next round's seed = this round's bonus; its hidden is already
+            // staged in spec_scratch.seed_hidden by spec_step.
+            seed_token = spec.next_seed_token;
+        }
+
+        // ── Cursor settle. `spec_step` leaves n_tokens = L+accept_len+1 with
+        // the final bonus's KV slot unwritten, and an EOS mid-block leaves
+        // committed-but-not-emitted tokens counted. Re-anchor the cursor to
+        // the EMITTED extent and re-forward the last emitted token at its
+        // slot so every position < n_tokens carries valid KV — the same
+        // invariant the AR loop leaves behind. (KV writes are absolute-
+        // position keyed and deterministic, so the re-write is identical to
+        // a fresh forward — the same property the verify itself relies on
+        // when it re-writes the seed's KV each round.) ──
+        if generated_count > 0 {
+            let last_tok = *m.conversation_tokens.last().unwrap();
+            let cfg = m.gemma4_config.as_ref().unwrap();
+            let weights = m.gemma4_weights.as_ref().unwrap();
+            let state = m.gemma4_state.as_mut().unwrap();
+            let last_pos = (prefill_end + generated_count - 1) as u32;
+            if let Err(e) =
+                gemma4::forward::decode_step(cfg, weights, state, gpu, last_tok, last_pos)
+            {
+                // Non-fatal: the emitted stream is already correct; only the
+                // (reset-between-turns) cursor bookkeeping is affected.
+                eprintln!("[daemon] gemma4 eagle cursor settle failed: {e:?}");
+                state.n_tokens = prefill_end + generated_count;
+            }
+        } else {
+            m.gemma4_state.as_mut().unwrap().n_tokens = prefill_end;
+        }
+        m.seq_pos = m.gemma4_state.as_ref().unwrap().n_tokens;
+
+        let decode_ms = decode_t0.elapsed().as_millis().max(1);
+        let total_ms = t0.elapsed().as_millis().max(1);
+        let tok_s = if generated_count > 0 {
+            (generated_count as f64 * 1000.0) / decode_ms as f64
+        } else {
+            0.0
+        };
+        // τ = mean tokens committed per round (accepted drafts + 1 bonus).
+        let tau = if rounds > 0 {
+            (total_accepted + rounds) as f64 / rounds as f64
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{}}}"#,
+            id, generated_count, tok_s, prefill_ms, total_ms, rounds, tau, draft_len,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
     // ── Decode loop. Sample host-side from the running logits vector. ──
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -14214,6 +14634,36 @@ fn generate_vl_dots_ocr(
         prefill_s * 1000.0
     );
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod gemma4_eagle_param_tests {
+    use super::{gemma4_eagle_spec_len, GEMMA4_EAGLE_DRAFT_LEN};
+
+    #[test]
+    fn absent_spec_defaults_to_dl3() {
+        assert_eq!(gemma4_eagle_spec_len(None).unwrap(), GEMMA4_EAGLE_DRAFT_LEN);
+        assert_eq!(GEMMA4_EAGLE_DRAFT_LEN, 3);
+    }
+
+    #[test]
+    fn spec_3_accepted() {
+        assert_eq!(gemma4_eagle_spec_len(Some(3)).unwrap(), 3);
+    }
+
+    #[test]
+    fn non_dl3_refused() {
+        // v1 pins draft_len to the validated dl=3 config — every other value
+        // is refused (refuse-don't-degrade), including the dl >= 5 range that
+        // trips the pre-existing batched-MQ4 forward_batch fault on gfx12.
+        for bad in [0u64, 1, 2, 4, 5, 16] {
+            let err = gemma4_eagle_spec_len(Some(bad)).unwrap_err();
+            assert!(
+                err.contains("spec=3"),
+                "refusal should point the operator at spec=3: {err}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
