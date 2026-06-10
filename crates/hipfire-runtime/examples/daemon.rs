@@ -4210,12 +4210,12 @@ fn load_model(
             lowered::init_scratch_constants(gpu, &scratch, lowered_cfg.full_head_dim)
                 .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
             // q8 ring-buffered sliding KV (constant ~300 MB regardless of
-            // context length; wraps via pos % sliding_window) + asym3 full KV.
+            // context length; wraps via pos % sliding_window) + q8 full KV.
             let kv_sliding = hipfire_runtime::llama::KvCache::new_gpu_q8_capped(
                 gpu, lowered_cfg.n_layers, lowered_cfg.sliding_n_kv_heads,
                 lowered_cfg.sliding_head_dim, max_seq, lowered_cfg.sliding_window,
             ).map_err(|e| format!("gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"))?;
-            let kv_full = hipfire_runtime::llama::KvCache::new_gpu_asym3(
+            let kv_full = hipfire_runtime::llama::KvCache::new_gpu_q8(
                 gpu, lowered_cfg.n_layers, lowered_cfg.full_n_kv_heads,
                 lowered_cfg.full_head_dim, max_seq,
             ).map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?;
@@ -4225,7 +4225,7 @@ fn load_model(
                 .unwrap_or(106);
             let chat_template = resolve_chat_template(&hfq, path);
             eprintln!(
-                "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full asym3 KV)",
+                "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full q8 KV)",
                 lowered_cfg.enable_moe_block, want_batched,
             );
             return Ok(LoadedModel {
