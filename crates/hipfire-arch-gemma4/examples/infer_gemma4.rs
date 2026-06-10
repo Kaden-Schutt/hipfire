@@ -31,6 +31,7 @@ fn main() {
     let mut prompt = "The capital of France is".to_string();
     let mut max: usize = 8192;
     let mut rep_pen: f32 = 1.3;
+    let mut kv_mode = String::new();
     let mut token_ids: Option<Vec<u32>> = None;
     let mut i = 1;
     while i < argv.len() {
@@ -66,6 +67,10 @@ fn main() {
             }
             "--rep-pen" => {
                 rep_pen = argv[i + 1].parse().expect("--rep-pen");
+                i += 2;
+            }
+            "--kv-mode" => {
+                kv_mode = argv[i + 1].clone();
                 i += 2;
             }
             other => {
@@ -108,7 +113,12 @@ fn main() {
     }
     eprintln!("prompt {:?} → {} tokens", prompt, prompt_ids.len());
     let max_seq = prompt_ids.len() + max + 16;
-    let mut state = Gemma4State::new_with_max_seq(&mut gpu, &cfg, max_seq).expect("state");
+    let mut state = if kv_mode == "fwht3" {
+        eprintln!("kv_mode=fwht3: full-attention layers use FWHT-512 3-bit K + Q8_0 V");
+        Gemma4State::new_with_fwht3_max_seq(&mut gpu, &cfg, max_seq).expect("state (fwht3)")
+    } else {
+        Gemma4State::new_with_max_seq(&mut gpu, &cfg, max_seq).expect("state")
+    };
 
     // Greedy argmax with a repetition penalty over already-emitted tokens.
     let argmax_with_penalty = |v: &mut [f32], history: &[u32], pen: f32| -> u32 {
