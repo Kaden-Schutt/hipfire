@@ -12,6 +12,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::hipfire::{
     chat::{stream_chat, ChatEvent, ChatMessage},
+    cli,
     config::ConfigState,
     registry::{RegistryAction, RegistryState},
     status::{start_background_serve, StatusState},
@@ -56,8 +57,20 @@ pub struct App {
     pub tab: Tab,
     pub settings_easy: bool,
     pub settings_selected: usize,
+    pub settings_edit: Option<SettingsEdit>,
+    /// When true, Enter-applied settings target the active model
+    /// (`hipfire config <tag> set ...`) instead of the global config.
+    pub settings_scope_model: bool,
     pub chat: ChatState,
     pub last_reload: String,
+}
+
+/// An in-progress settings edit; applied through the hipfire CLI so the CLI
+/// remains the single validation source of truth.
+#[derive(Clone, Debug)]
+pub struct SettingsEdit {
+    pub key: String,
+    pub buffer: String,
 }
 
 impl App {
@@ -76,6 +89,8 @@ impl App {
             tab: Tab::Home,
             settings_easy: true,
             settings_selected: 0,
+            settings_edit: None,
+            settings_scope_model: false,
             chat: ChatState::default(),
             last_reload: "loaded hipfire state".into(),
         })
@@ -103,7 +118,25 @@ impl App {
     /// is active (and not mid-stream), so `q`/`r` work everywhere else from
     /// launch without needing Esc first.
     pub fn text_input_active(&self) -> bool {
-        self.tab == Tab::Chat && self.chat.is_input_focused() && !self.chat.sending
+        match self.tab {
+            Tab::Chat => self.chat.is_input_focused() && !self.chat.sending,
+            Tab::Settings => self.settings_edit.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Esc on an active text surface: blur the chat input or cancel the
+    /// settings edit without applying it.
+    pub fn dismiss_text_input(&mut self) {
+        match self.tab {
+            Tab::Chat => self.chat.blur_input(),
+            Tab::Settings => {
+                if self.settings_edit.take().is_some() {
+                    self.last_reload = "edit cancelled; nothing applied".into();
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn handle_tab_key(&mut self, key: KeyEvent) {
@@ -252,6 +285,24 @@ impl App {
     }
 
     fn handle_settings_key(&mut self, key: KeyEvent) {
+        if self.settings_edit.is_some() {
+            match key.code {
+                KeyCode::Enter => self.apply_settings_edit(),
+                KeyCode::Backspace => {
+                    if let Some(edit) = &mut self.settings_edit {
+                        edit.buffer.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(edit) = &mut self.settings_edit {
+                        edit.buffer.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         let len = if self.settings_easy {
             self.config.easy_rows().len()
         } else {
@@ -265,7 +316,90 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.settings_selected = self.settings_selected.saturating_sub(1);
             }
+            KeyCode::Enter => self.begin_settings_edit(),
+            KeyCode::Char('m') => {
+                self.settings_scope_model = !self.settings_scope_model;
+                self.last_reload = if self.settings_scope_model {
+                    format!(
+                        "settings scope: per-model ({}) — applies via `config {} set`",
+                        self.active_model, self.active_model
+                    )
+                } else {
+                    "settings scope: global — applies via `config set`".into()
+                };
+            }
             _ => {}
+        }
+    }
+
+    /// The config key + current value behind the selected settings row.
+    pub fn selected_settings_entry(&self) -> Option<(String, String)> {
+        if self.settings_easy {
+            let rows = self.config.easy_rows();
+            let row = rows.get(self.settings_selected)?;
+            Some(((*row.key.as_ref()?).to_string(), row.value.clone()))
+        } else {
+            self.config
+                .values
+                .iter()
+                .nth(self.settings_selected)
+                .map(|(k, v)| (k.clone(), v.clone()))
+        }
+    }
+
+    fn begin_settings_edit(&mut self) {
+        match self.selected_settings_entry() {
+            Some((key, value)) => {
+                self.settings_edit = Some(SettingsEdit { key, buffer: value });
+                self.last_reload = "editing: Enter applies via hipfire CLI, Esc cancels".into();
+            }
+            None => {
+                self.last_reload =
+                    "row is informational; edit host/port in advanced view (a)".into();
+            }
+        }
+    }
+
+    fn apply_settings_edit(&mut self) {
+        let Some(edit) = self.settings_edit.clone() else {
+            return;
+        };
+        let value = edit.buffer.trim().to_string();
+        if value.is_empty() {
+            self.last_reload = "value is empty; type a value or Esc to cancel".into();
+            return;
+        }
+        let scope = if self.settings_scope_model {
+            Some(self.active_model.clone())
+        } else {
+            None
+        };
+        let args = cli::config_set_args(scope.as_deref(), &edit.key, &value);
+        let Some(cli_inv) = cli::resolve_cli() else {
+            self.last_reload =
+                "hipfire CLI not found: install hipfire, run from a checkout, or set HIPFIRE_TUI_CLI"
+                    .into();
+            return;
+        };
+        match cli::run_cli(&cli_inv, &args) {
+            Ok(out) => {
+                self.settings_edit = None;
+                self.reload();
+                self.last_reload = format!(
+                    "{}: {}",
+                    cli_inv.label,
+                    if out.is_empty() {
+                        "applied".into()
+                    } else {
+                        out
+                    }
+                );
+            }
+            Err(err) => {
+                // Keep the edit buffer so the user can correct it; the CLI's
+                // stderr is the status line.
+                self.last_reload = format!("rejected: {err}");
+            }
         }
     }
 
@@ -338,6 +472,8 @@ impl App {
             tab: Tab::Home,
             settings_easy: true,
             settings_selected: 0,
+            settings_edit: None,
+            settings_scope_model: false,
             chat: ChatState::default(),
             last_reload: String::new(),
         }

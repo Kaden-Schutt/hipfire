@@ -3,6 +3,7 @@
 // hipfire - see LICENSE and NOTICE in the project root.
 
 pub mod chat;
+pub mod cli;
 pub mod config;
 pub mod registry;
 pub mod status;

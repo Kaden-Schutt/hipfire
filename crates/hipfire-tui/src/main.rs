@@ -86,7 +86,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             if app.chat.sending {
                 app.chat.status = "stream abort is not wired in prototype 1".into();
             } else if app.text_input_active() {
-                app.chat.blur_input();
+                app.dismiss_text_input();
             } else {
                 return true;
             }
@@ -94,8 +94,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Tab => app.next_tab(),
         KeyCode::BackTab => app.prev_tab(),
         KeyCode::Char('r') if !app.text_input_active() => app.reload(),
-        KeyCode::Char('e') if app.tab == app::Tab::Settings => app.settings_easy = true,
-        KeyCode::Char('a') if app.tab == app::Tab::Settings => app.settings_easy = false,
+        KeyCode::Char('e') if app.tab == app::Tab::Settings && !app.text_input_active() => {
+            app.settings_easy = true;
+            app.settings_selected = 0;
+        }
+        KeyCode::Char('a') if app.tab == app::Tab::Settings && !app.text_input_active() => {
+            app.settings_easy = false;
+            app.settings_selected = 0;
+        }
         _ => app.handle_tab_key(key),
     }
 
@@ -161,6 +167,51 @@ mod tests {
         assert!(handle_key(&mut app, key(KeyCode::Char('q'))));
         assert!(!handle_key(&mut probe, key(KeyCode::Char('i'))));
         assert!(probe.chat.is_input_focused());
+    }
+
+    #[test]
+    fn settings_edit_captures_keys_and_esc_cancels() {
+        let mut app = App::test_app();
+        app.tab = Tab::Settings;
+        app.settings_easy = false;
+        app.config.values.insert("kv_cache".into(), "auto".into());
+        app.settings_selected = 0;
+        // Enter begins the edit prefilled with the current value
+        assert!(!handle_key(&mut app, key(KeyCode::Enter)));
+        assert!(app.text_input_active());
+        assert_eq!(app.settings_edit.as_ref().unwrap().key, "kv_cache");
+        assert_eq!(app.settings_edit.as_ref().unwrap().buffer, "auto");
+        // q now types into the buffer instead of quitting
+        assert!(!handle_key(&mut app, key(KeyCode::Char('q'))));
+        assert_eq!(app.settings_edit.as_ref().unwrap().buffer, "autoq");
+        // Esc cancels without applying, second Esc quits
+        assert!(!handle_key(&mut app, key(KeyCode::Esc)));
+        assert!(app.settings_edit.is_none());
+        assert!(handle_key(&mut app, key(KeyCode::Esc)));
+    }
+
+    #[test]
+    fn settings_scope_toggle_targets_active_model() {
+        let mut app = App::test_app();
+        app.tab = Tab::Settings;
+        app.active_model = "qwen3.5:9b".into();
+        assert!(!app.settings_scope_model);
+        assert!(!handle_key(&mut app, key(KeyCode::Char('m'))));
+        assert!(app.settings_scope_model);
+        assert!(app.last_reload.contains("qwen3.5:9b"));
+        assert!(!handle_key(&mut app, key(KeyCode::Char('m'))));
+        assert!(!app.settings_scope_model);
+    }
+
+    #[test]
+    fn informational_easy_row_is_not_editable() {
+        let mut app = App::test_app();
+        app.tab = Tab::Settings;
+        app.settings_easy = true;
+        // last easy row is the Serve endpoint (key: None)
+        app.settings_selected = app.config.easy_rows().len() - 1;
+        assert!(!handle_key(&mut app, key(KeyCode::Enter)));
+        assert!(app.settings_edit.is_none());
     }
 
     #[test]

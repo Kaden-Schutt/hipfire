@@ -102,7 +102,13 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Tab::Models => {
             "Tab switch  Up/Down select  Enter expand/select  Left/Right fold  r refresh  q quit"
         }
-        Tab::Settings => "Tab switch  e easy  a advanced  Up/Down select  r refresh  q quit",
+        Tab::Settings => {
+            if app.settings_edit.is_some() {
+                "Enter apply  Esc cancel  Backspace erase"
+            } else {
+                "Tab switch  Enter edit  m scope  e easy  a advanced  Up/Down select  r refresh  q quit"
+            }
+        }
         _ => "Tab switch  r refresh  q quit",
     };
     frame.render_widget(
@@ -193,7 +199,7 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     let actions = vec![
         ListItem::new("Chat: use the Chat tab; it streams through existing hipfire serve."),
         ListItem::new("Models: browse registry and local downloads."),
-        ListItem::new("Settings: easy/advanced split, read-only in prototype 1."),
+        ListItem::new("Settings: easy/advanced split; Enter applies edits via the hipfire CLI."),
         ListItem::new("System: hardware and path checks."),
     ];
     frame.render_widget(
@@ -435,13 +441,20 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         "Advanced settings"
     };
-    let note = if app.settings_easy {
-        "Read-only prototype. Press a for advanced."
+    let scope = if app.settings_scope_model {
+        format!("scope: {} (m for global)", app.active_model)
     } else {
-        "Raw config view. Press e for easy."
+        "scope: global (m for per-model)".into()
+    };
+    let note = if app.settings_edit.is_some() {
+        "EDITING - Enter applies via hipfire CLI, Esc cancels"
+    } else if app.settings_easy {
+        "Enter edits the selected row. Press a for advanced."
+    } else {
+        "Enter edits the selected key. Press e for easy."
     };
     frame.render_widget(
-        Paragraph::new(format!("{mode}    {note}"))
+        Paragraph::new(format!("{mode}    {scope}    {note}"))
             .block(block("Settings"))
             .style(Style::default().fg(TEXT).bg(PANEL)),
         chunks[0],
@@ -459,9 +472,19 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             .into_iter()
             .skip(start)
             .take(visible_rows(chunks[1].height, 3))
-            .map(|(idx, (label, value, desc))| {
-                Row::new([label.to_string(), value, desc.to_string()]).style(
-                    if idx == app.settings_selected {
+            .map(|(idx, row)| {
+                let selected = idx == app.settings_selected;
+                let value = match (&app.settings_edit, selected) {
+                    (Some(edit), true) => format!("{}_", edit.buffer),
+                    _ => row.value,
+                };
+                Row::new([row.label.to_string(), value, row.desc.to_string()]).style(
+                    if selected && app.settings_edit.is_some() {
+                        Style::default()
+                            .fg(YELLOW)
+                            .bg(PANEL_2)
+                            .add_modifier(Modifier::BOLD)
+                    } else if selected {
                         Style::default().fg(ACCENT).bg(PANEL_2)
                     } else {
                         Style::default().fg(TEXT).bg(PANEL)
@@ -479,7 +502,7 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
                 ],
             )
             .header(Row::new(["Setting", "Value", "Meaning"]).style(Style::default().fg(MUTED)))
-            .block(block("User-safe controls"))
+            .block(block("User-safe controls (Enter to edit)"))
             .style(Style::default().fg(TEXT).bg(PANEL)),
             chunks[1],
         );
@@ -491,7 +514,17 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
             .skip(start)
             .take(visible_rows(chunks[1].height, 3))
             .map(|(idx, (k, v))| {
-                Row::new([k.clone(), v.clone()]).style(if idx == app.settings_selected {
+                let selected = idx == app.settings_selected;
+                let value = match (&app.settings_edit, selected) {
+                    (Some(edit), true) => format!("{}_", edit.buffer),
+                    _ => v.clone(),
+                };
+                Row::new([k.clone(), value]).style(if selected && app.settings_edit.is_some() {
+                    Style::default()
+                        .fg(YELLOW)
+                        .bg(PANEL_2)
+                        .add_modifier(Modifier::BOLD)
+                } else if selected {
                     Style::default().fg(ACCENT).bg(PANEL_2)
                 } else {
                     Style::default().fg(TEXT).bg(PANEL)

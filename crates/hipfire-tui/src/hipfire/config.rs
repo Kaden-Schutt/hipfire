@@ -25,8 +25,8 @@ impl ConfigState {
         let mut loaded_from_disk = false;
         let mut warning = None;
 
-        match fs::read_to_string(&paths.config) {
-            Ok(raw) => match serde_json::from_str::<Value>(&raw) {
+        if let Ok(raw) = fs::read_to_string(&paths.config) {
+            match serde_json::from_str::<Value>(&raw) {
                 Ok(Value::Object(map)) => {
                     loaded_from_disk = true;
                     for (k, v) in map {
@@ -35,8 +35,7 @@ impl ConfigState {
                 }
                 Ok(_) => warning = Some("config.json is not an object; using defaults".into()),
                 Err(err) => warning = Some(format!("config parse error: {err}")),
-            },
-            Err(_) => {}
+            }
         }
 
         let per_model_count = fs::read_to_string(&paths.per_model_config)
@@ -77,52 +76,62 @@ impl ConfigState {
         }
     }
 
-    pub fn easy_rows(&self) -> Vec<(&'static str, String, &'static str)> {
+    pub fn easy_rows(&self) -> Vec<EasyRow> {
+        let get = |key: &str, fallback: &str| -> String {
+            self.values
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| fallback.to_string())
+        };
         vec![
-            (
-                "Model",
-                self.default_model.clone(),
-                "Default model pre-warmed by serve and used by chat.",
-            ),
-            (
-                "Context",
-                self.values
-                    .get("max_seq")
-                    .cloned()
-                    .unwrap_or_else(|| "32768".into()),
-                "KV cache capacity allocated at load.",
-            ),
-            (
-                "Spec decode",
-                self.values
-                    .get("dflash_mode")
-                    .cloned()
-                    .unwrap_or_else(|| "off".into()),
-                "DFlash mode. Keep off unless intentionally testing drafts.",
-            ),
-            (
-                "KV cache",
-                self.values
-                    .get("kv_cache")
-                    .cloned()
-                    .unwrap_or_else(|| "auto".into()),
-                "Precision/memory tradeoff for attention cache.",
-            ),
-            (
-                "Thinking",
-                self.values
-                    .get("thinking")
-                    .cloned()
-                    .unwrap_or_else(|| "on".into()),
-                "Whether reasoning models emit a hidden think block.",
-            ),
-            (
-                "Serve",
-                format!("{}:{}", self.host, self.port),
-                "OpenAI-compatible endpoint used by chat and API clients.",
-            ),
+            EasyRow {
+                key: Some("default_model"),
+                label: "Model",
+                value: self.default_model.clone(),
+                desc: "Default model pre-warmed by serve and used by chat.",
+            },
+            EasyRow {
+                key: Some("max_seq"),
+                label: "Context",
+                value: get("max_seq", "32768"),
+                desc: "KV cache capacity allocated at load.",
+            },
+            EasyRow {
+                key: Some("dflash_mode"),
+                label: "Spec decode",
+                value: get("dflash_mode", "off"),
+                desc: "DFlash mode. Keep off unless intentionally testing drafts.",
+            },
+            EasyRow {
+                key: Some("kv_cache"),
+                label: "KV cache",
+                value: get("kv_cache", "auto"),
+                desc: "Precision/memory tradeoff for attention cache.",
+            },
+            EasyRow {
+                key: Some("thinking"),
+                label: "Thinking",
+                value: get("thinking", "on"),
+                desc: "Whether reasoning models emit a hidden think block.",
+            },
+            EasyRow {
+                key: None,
+                label: "Serve",
+                value: format!("{}:{}", self.host, self.port),
+                desc: "Endpoint. Edit host/port as separate keys in advanced view.",
+            },
         ]
     }
+}
+
+/// One row of the user-safe settings view. `key` is the underlying
+/// `hipfire config set` key, or None when the row is informational only.
+#[derive(Clone, Debug)]
+pub struct EasyRow {
+    pub key: Option<&'static str>,
+    pub label: &'static str,
+    pub value: String,
+    pub desc: &'static str,
 }
 
 fn defaults() -> BTreeMap<String, String> {
