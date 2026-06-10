@@ -4340,11 +4340,18 @@ impl Gpu {
             actual_tiles
         };
 
-        // Tile kernel
+        // Tile kernel. head_dim > 256 routes to the _hd512 instantiation
+        // (MAX_HALVES=4); the default name stays register-lean (MAX_HALVES=2,
+        // zero scratch spill). Both live in the same source file.
+        let tile_func = if head_dim > 256 {
+            "attention_flash_asym4_tile_hd512"
+        } else {
+            "attention_flash_asym4_tile"
+        };
         self.ensure_givens4_kernel(
-            "attention_flash_asym4_tile",
+            tile_func,
             kernels::ATTENTION_FLASH_ASYM4_TILE_SRC,
-            "attention_flash_asym4_tile",
+            tile_func,
         )?;
         {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -4383,7 +4390,7 @@ impl Gpu {
                 &cc as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob(
-                "attention_flash_asym4_tile",
+                tile_func,
                 [n_heads as u32, launch_tiles as u32, 1],
                 [32, 1, 1],
                 (TILE_SIZE * 4) as u32,
@@ -4817,10 +4824,18 @@ impl Gpu {
             actual_tiles
         };
 
+        // Tile kernel. head_dim > 256 routes to the _hd512 instantiation
+        // (MAX_HALVES=4); the default name stays register-lean (MAX_HALVES=2,
+        // zero scratch spill). Both live in the same source file.
+        let tile_func = if head_dim > 256 {
+            "attention_flash_asym2_tile_hd512"
+        } else {
+            "attention_flash_asym2_tile"
+        };
         self.ensure_givens4_kernel(
-            "attention_flash_asym2_tile",
+            tile_func,
             kernels::ATTENTION_FLASH_ASYM2_TILE_SRC,
-            "attention_flash_asym2_tile",
+            tile_func,
         )?;
         {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -4859,7 +4874,7 @@ impl Gpu {
                 &cc as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob(
-                "attention_flash_asym2_tile",
+                tile_func,
                 [n_heads as u32, launch_tiles as u32, 1],
                 [32, 1, 1],
                 (TILE_SIZE * 4) as u32,

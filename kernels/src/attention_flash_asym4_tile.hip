@@ -19,8 +19,13 @@
 #include "turbo_common.h"
 #include "givens_common.h"
 
-extern "C" __launch_bounds__(32, 16)
-__global__ void attention_flash_asym4_tile(
+// MAX_HALVES is a compile-time bound on head_dim/128 so the per-thread
+// mq/out_vec arrays stay in registers (zero scratch spill at the default
+// width). Two instantiations are exported:
+//   attention_flash_asym4_tile        — MAX_HALVES=2, head_dim ∈ {128, 256}
+//   attention_flash_asym4_tile_hd512  — MAX_HALVES=4, head_dim ∈ {384, 512}
+template <int MAX_HALVES>
+__device__ __forceinline__ void asym4_tile_body(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -64,7 +69,9 @@ __global__ void attention_flash_asym4_tile(
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
     const int tid = threadIdx.x;
-    const int n_halves = head_dim / 128;  // 1 for hd=128, 2 for hd=256
+    // Compile-time clamp keeps mq/out_vec indices provably in range so they
+    // stay in VGPRs. Callers guarantee head_dim/128 <= MAX_HALVES.
+    const int n_halves = min(head_dim / 128, MAX_HALVES);
 
     // ── K geometry (givens4 layout) ─────────────────────────────────
     const int k_bytes_per_head = 4 + head_dim / 2;        // 68 (hd128) / 132 (hd256)
@@ -80,9 +87,9 @@ __global__ void attention_flash_asym4_tile(
     extern __shared__ float sdata[];
     float* scores = sdata;
 
-    // ── Load + rotate Q for each half (4 values per half, max 4 halves for hd512) ──
+    // ── Load + rotate Q for each half (4 values per half) ──
     const float* q_head = q + h * head_dim;
-    float mq[16];
+    float mq[MAX_HALVES * 4];
     for (int half = 0; half < n_halves; half++) {
         const int d0 = half * 128 + tid * 4;
         float a = q_head[d0 + 0];
@@ -143,8 +150,7 @@ __global__ void attention_flash_asym4_tile(
     __syncthreads();
 
     // ═══ Phase D: V-weighted accumulation (NORMAL space Q8_0) ═══
-    // Up to 4 halves for hd512: each thread owns 4 dims per half.
-    float out_vec[16] = {};
+    float out_vec[MAX_HALVES * 4] = {};
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
@@ -178,4 +184,40 @@ __global__ void attention_flash_asym4_tile(
         p[2 + d_base + 2] = out_vec[half * 4 + 2];
         p[2 + d_base + 3] = out_vec[half * 4 + 3];
     }
+}
+
+extern "C" __launch_bounds__(32, 16)
+__global__ void attention_flash_asym4_tile(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials,
+    const int* __restrict__ pos_buf,
+    const float* __restrict__ cos_theta,
+    const float* __restrict__ sin_theta,
+    int n_heads, int n_kv_heads, int head_dim, int max_seq,
+    float scale_attn, int tile_size, int max_tiles,
+    int window_size, int cache_capacity
+) {
+    asym4_tile_body<2>(q, k_cache, v_cache, partials, pos_buf, cos_theta, sin_theta,
+        n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size, max_tiles,
+        window_size, cache_capacity);
+}
+
+extern "C" __launch_bounds__(32, 16)
+__global__ void attention_flash_asym4_tile_hd512(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials,
+    const int* __restrict__ pos_buf,
+    const float* __restrict__ cos_theta,
+    const float* __restrict__ sin_theta,
+    int n_heads, int n_kv_heads, int head_dim, int max_seq,
+    float scale_attn, int tile_size, int max_tiles,
+    int window_size, int cache_capacity
+) {
+    asym4_tile_body<4>(q, k_cache, v_cache, partials, pos_buf, cos_theta, sin_theta,
+        n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size, max_tiles,
+        window_size, cache_capacity);
 }
