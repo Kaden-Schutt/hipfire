@@ -3,7 +3,7 @@
 // hipfire - see LICENSE and NOTICE in the project root.
 
 use std::{
-    env, fs,
+    fs,
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -16,7 +16,11 @@ use std::{
 
 use anyhow::{anyhow, Result};
 
-use super::{config::ConfigState, HipfirePaths};
+use super::{
+    cli::{resolve_cli, serve_detach_args},
+    config::ConfigState,
+    HipfirePaths,
+};
 
 #[derive(Clone, Debug)]
 pub struct StatusState {
@@ -66,25 +70,25 @@ impl StatusState {
     }
 }
 
-pub fn start_background_serve() -> Result<()> {
-    let cwd = env::current_dir()?;
-    let script = cwd.join("cli/index.ts");
-    if !script.exists() {
-        return Err(anyhow!(
-            "cli/index.ts not found; run this spike from the hipfire repo root"
-        ));
-    }
-
-    Command::new("bun")
-        .arg(script)
-        .arg("serve")
-        .arg("-d")
+/// Launch `serve -d` through whichever hipfire CLI is available: the
+/// installed `hipfire` wrapper first, then `bun cli/index.ts` (cwd, then
+/// ~/.hipfire). Overridable via HIPFIRE_TUI_CLI. Returns the label of the
+/// CLI that was used so the status line can say which one started serve.
+pub fn start_background_serve() -> Result<String> {
+    let cli = resolve_cli().ok_or_else(|| {
+        anyhow!(
+            "no hipfire CLI found: install hipfire, run from a checkout, or set HIPFIRE_TUI_CLI"
+        )
+    })?;
+    Command::new(&cli.program)
+        .args(&cli.leading_args)
+        .args(serve_detach_args())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|err| anyhow!("failed to launch `bun cli/index.ts serve -d`: {err}"))?;
-    Ok(())
+        .map_err(|err| anyhow!("failed to launch `{} serve -d`: {err}", cli.label))?;
+    Ok(cli.label)
 }
 
 fn probe_health_at(host: &str, port: u16) -> (bool, String) {

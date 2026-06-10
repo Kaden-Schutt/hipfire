@@ -336,11 +336,11 @@ impl App {
         }
 
         match start_background_serve() {
-            Ok(()) => {
-                self.chat.status =
-                    "starting serve -d; health auto-refreshes, retry once it shows online".into();
-                self.last_reload = "requested background serve start".into();
-                self.status = StatusState::load(&self.paths, &self.config);
+            Ok(label) => {
+                self.chat.status = format!(
+                    "starting serve -d via {label}; health auto-refreshes, retry once online"
+                );
+                self.last_reload = format!("requested background serve start via {label}");
             }
             Err(err) => {
                 self.chat.status = format!("{err}");

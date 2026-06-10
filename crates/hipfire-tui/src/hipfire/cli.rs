@@ -81,7 +81,6 @@ pub fn config_set_args(model_scope: Option<&str>, key: &str, value: &str) -> Vec
 }
 
 /// Command line for `hipfire serve -d` (detached daemon).
-#[allow(dead_code)] // wired into start_background_serve by the serve-fallback step
 pub fn serve_detach_args() -> Vec<String> {
     vec!["serve".to_string(), "-d".to_string()]
 }
