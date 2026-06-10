@@ -134,7 +134,9 @@ the prefill MMQ redesign log is at
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | Measured perf per arch, vs ollama |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Engine layout, dispatch, two model paths |
 | [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, asym KV cache, FWHT math |
-| [multi-gpu.md](docs/multi-gpu.md) | Pipeline-parallel (pp≥2) — memory budget, deployment, refusals |
+| [CHAT.md](docs/CHAT.md) | `hipfire chat` TUI — keybindings, slash commands |
+| [JINJA.md](docs/JINJA.md) | Jinja chat templates (default ON) — resolution order, opt-out, tool rendering |
+| [MULTI-GPU.md](docs/MULTI-GPU.md) | Multi-GPU serving — expert-parallel (`--tp N`) and pipeline-parallel (pp≥2) |
 | [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md) | Bench protocol — read before claiming a perf win |
 
 ## License

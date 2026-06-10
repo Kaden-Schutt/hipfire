@@ -6,7 +6,7 @@
 //! given model with `load_weights_multi`, builds `Qwen35ScratchSet` +
 //! `KvCache::new_gpu_asym3_capped_multi` + `DeltaNetState` (Q8), and
 //! reports per-card VRAM deltas at each stage. Output is a markdown
-//! table row suitable for `docs/multi-gpu.md`.
+//! table row suitable for `docs/MULTI-GPU.md`.
 //!
 //! Run: HIP_VISIBLE_DEVICES=0,1 cargo run -p hipfire-runtime \
 //!         --release --features deltanet --example pp2_vram_probe -- \
@@ -111,7 +111,7 @@ fn main() {
     fmt_per_card("after DN state", &after_dn);
     fmt_per_card("Δ DN state", &dn_delta);
 
-    // Aggregate and emit a markdown row matching docs/multi-gpu.md schema:
+    // Aggregate and emit a markdown row matching docs/MULTI-GPU.md schema:
     //   model | quant | n_layers | dim | KV mode | ctx |
     //   weights | KV | scratch | total | per-card PP=2 | fits 24 GB?
     let weights_max = weights_delta.iter().cloned().fold(0.0_f64, f64::max);

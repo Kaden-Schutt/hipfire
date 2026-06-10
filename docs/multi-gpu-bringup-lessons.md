@@ -2,7 +2,7 @@
 
 Captures non-obvious gotchas and root-causes from bringing up hetero
 PP=2 across a cross-arch AMD pair (gfx906 MI50 CDNA1 + gfx1031 RX 6700 XT
-RDNA2). Companion to the operational `docs/multi-gpu.md` — that one
+RDNA2). Companion to the operational `docs/MULTI-GPU.md` — that one
 covers what PP gives you and how to deploy it; this one covers what
 broke and why during bring-up.
 
@@ -237,7 +237,7 @@ day one.**
 
 ## See also
 
-- `docs/multi-gpu.md` — operational guide (memory budgets, deployment recipes, throughput).
+- `docs/MULTI-GPU.md` — operational guide (memory budgets, deployment recipes, throughput).
 - `docs/plans/hetero-pflash-dflash.prd` — the hetero PFlash+DFlash architectural plan.
 - `docs/plans/path_d.md` — same-card spec-decode pipelining design (closed without merge after empirical dominated by chain-mode; preserved for future revival).
 - PR #204 (closed) — full hetero spec-decode prototype with the bind_thread pattern, long-context findings, and the pivot to native MTP as the actual perf lever.

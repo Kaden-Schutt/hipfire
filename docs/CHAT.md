@@ -33,8 +33,9 @@ Requires a running `hipfire serve` or auto-spawns a dedicated daemon.
 |---------|-------------|
 | `/help`, `/?` | Show help |
 | `/clear` | Clear conversation history |
-| `/stats` | Show model stats |
-| `/trim` | Drop old messages to free context |
+| `/stats` | Show model stats (tok/s, context usage) |
+| `/trim [pct]` | Drop oldest turns (default trim to 50% of context) |
+| `/set <key> <val>` | Adjust `temperature`, `top_p`, `max_tokens`, `repeat_penalty` for this session |
 | `/exit`, `/quit` | Exit chat |
 
 ## Features

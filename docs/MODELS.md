@@ -1,8 +1,16 @@
 # Models
 
-hipfire ships with a curated registry of Qwen 3.5 / 3.6 family tags
-(small + dense + MoE) and supports running any GGUF or safetensors model
-you bring yourself.
+hipfire ships with a curated registry of model tags — Qwen 3.5 / 3.6
+(dense + MoE), Qwen 3 standard-attention, LFM2.5 (dense + MoE),
+DeepSeek V4 Flash, and several fine-tunes — and supports running any
+GGUF or safetensors model you bring yourself.
+
+> **Registry mechanics:** the registry is a static JSON
+> (`cli/registry.json`) baked into the CLI at build time. `hipfire list
+> -r` reads it; new tags arrive with `hipfire update` (git pull +
+> rebuild). A dynamic registry — published from the HuggingFace org and
+> fetched/cached by the CLI with fallback to the bundled copy — is in
+> development; until it lands, a stale checkout means stale tags.
 
 ## Curated tags
 
@@ -20,7 +28,23 @@ sizes when you want more headroom; pull with the `:<size>-mq6` suffix.
 | `qwen3.5:35b-a3b` | 19.7 GB | 22 GB | MoE 35B / 3B-active |
 | `qwen3.6:27b` | 15 GB | 16 GB | 3.6 refresh, same hybrid arch as 3.5 |
 | `qwen3.6:35b-a3b` | 22.9 GB | 24 GB | 3.6 MoE refresh |
-| `deepseek-v4-flash` | 82 GB | 96 GB | DeepSeek V4 Flash (arch_id=9): MQ2-Lloyd routed-expert MoE, Q8_0 attn KV, Hyper-Connections + compressed-KV indexer + tail-only RoPE. `hipfire pull` also fetches the MTP sidecar for K=2 spec-decode (+29% TG on code). |
+| `deepseek-v4-flash` | 82 GB | 96 GB | DeepSeek V4 Flash (arch_id=9): MQ2-Lloyd routed-expert MoE, Q8_0 attn KV, Hyper-Connections + compressed-KV indexer + tail-only RoPE. `hipfire pull` also fetches the MTP sidecar for K=2 spec-decode (+29% TG on code). Multi-GPU EP serving: [MULTI-GPU.md](MULTI-GPU.md). |
+
+LFM2.5 family (LiquidAI, arch_id=11 — hybrid short-conv + GQA):
+
+| Tag | File | VRAM floor | Notes |
+|---|---|---|---|
+| `lfm2.5:350m` | 0.23 GB | 2 GB | Dense, MQ4, embedded chat template |
+| `lfm2.5:1.2b` | 1.25 GB | 3 GB | 1.2B Instruct dense, Q8 |
+| `lfm2.5:1.2b-thinking` | 1.25 GB | 3 GB | 1.2B Thinking dense, Q8, reasoning |
+| `lfm2.5:8b-a1b` | 4.9 GB | 7 GB | MoE 8B / 1B-active, MQ4. Ships no embedded chat template — the engine bundles LiquidAI's Jinja template (see [JINJA.md](JINJA.md)) |
+
+Qwen 3 standard-attention (no DeltaNet — LLaMA-family loader path):
+
+| Tag | File | VRAM floor | Notes |
+|---|---|---|---|
+| `qwen3:0.6b` | 0.4 GB | 1 GB | HF4 |
+| `qwen3:8b` | 4.1 GB | 6 GB | HF4, ~60 tok/s |
 
 Higher-quality variants:
 
@@ -85,9 +109,13 @@ hipfire quantize ./my-finetune/ --format mq4 -o my-finetune.mq4
 ```
 
 Any directory that contains a `config.json` plus one or more
-`.safetensors` files. Architectures supported by the engine: `llama`,
-`qwen3`, `qwen3_5`, `qwen3_5_moe`. Other architectures are accepted by
-the quantizer but won't load at inference.
+`.safetensors` files. Architectures auto-detected by the quantizer
+(`config.json:model_type`): `llama`, `qwen3` / `qwen2`, `qwen3_5`,
+`qwen3_5_moe`, `dots_ocr`, `deepseek_v4`, `lfm2` / `lfm2_moe`. Plain
+Qwen2 models that need the Q/K/V-bias loader should be stamped with
+`--arch-id 7` (the `hipfire-arch-qwen2` crate) — the default
+LLaMA-family path silently drops the bias tensors. Other architectures
+are accepted by the quantizer but won't load at inference.
 
 ### From GGUF
 
@@ -197,9 +225,14 @@ respectively.
 
 ### Chat template
 
-hipfire applies the **ChatML** template for Qwen 3.5 / 3.6 / Carnice /
-Qwopus; the daemon expects messages already serialized by the CLI
-into:
+Since 2026-06-09 the daemon renders prompts through the model's **Jinja
+chat template by default** (the same `chat_template` HuggingFace's
+`apply_chat_template` uses), for all architectures. Qwen 3.5 / 3.6 (and
+the Carnice / Qwopus fine-tunes) render through a bundled
+community-fixed template; LFM2.5 through LiquidAI's; everything else
+through the template embedded in the `.hfq`. When no template resolves
+— or a render fails — the daemon falls back to the legacy hand-rolled
+ChatML scaffold:
 
 ```
 <|im_start|>system
@@ -209,11 +242,11 @@ into:
 <|im_start|>assistant
 ```
 
-`hipfire run` and the OpenAI server both build this string from
-`messages[]` before sending to the daemon. Per-model template tweaks
-live in `cli/registry.json` under each model entry; you don't normally
-edit them. Custom system prompts are forwarded as a `system` role
-message and inserted at the top of the ChatML envelope.
+Opt out of Jinja rendering with `HIPFIRE_JINJA_CHAT=0`. Resolution
+order, per-model overrides, tool-call rendering, and the
+thinking-model prompt cache are documented in [JINJA.md](JINJA.md).
+DeepSeek V4 is the exception: it renders through its dedicated DSML
+prompt builder (`<｜User｜>…<｜Assistant｜>`), not Jinja.
 
 One implicit normalization step: the engine collapses runs of three or
 more `\n` characters down to exactly two before tokenization
@@ -241,10 +274,13 @@ Extension legend:
 | `.mq6` | MQ6G256 (FWHT-rotated 6-bit) | Qwen3.5+ higher quality |
 | `.hf4` | HFQ4-G256 (raw 4-bit) | Llama / Qwen3 / Mistral / dense |
 | `.hf6` | HFQ6-G256 (raw 6-bit) | Dense, higher quality |
+| `.q8` | Q8 (8-bit) | Small models where quality > size (e.g. `lfm2.5:1.2b`) |
+| `.mq2lloyd` | MQ2-Lloyd (2-bit expert MoE) | DeepSeek V4 / MiniMax-M2 big-MoE tiers |
 | `.hfq` | Legacy HFQ4 (pre-0.1.5 naming) | Loads, no new files written here |
 
-CLI discovery (`hipfire list`, fuzzy `hipfire run` lookup) recognizes
-all five extensions.
+Fuzzy CLI discovery (`hipfire list`, `hipfire run` substring lookup)
+scans for `.mq4` / `.mq6` / `.hf4` / `.hf6` / `.hfq` / `.mq2lloyd`;
+registry tags resolve by exact filename regardless of extension.
 
 ## Current local family status
 
@@ -259,8 +295,9 @@ is a custom non-Hipfire architecture target.
 | Qwen 3.5 / 3.6 dense hybrid | `qwen3.5-{0.8b,2b,4b,9b}`, `qwen3.6-27b` | Supported as Qwen35 dense (`arch_id=5`). | Supported for paired dense drafts when target lm_head dtype is Q8/HFQ4/MQ4, plus MQ3 on gfx11/gfx12; MQ6 targets need AR. | Present as native Qwen35 speculative-verify/MTP surfaces for validated dense paths; still correctness-first and not the same as DFlash drafts. | Supported with TriAttention/CASK sidecars on FullAttention layers. | Supported only on Qwen35 path when incompatible features are off. | Supported via Qwen35 batched prefill path. | Smoke refs exist for `qwen3.5-{0.8b,2b,9b}`; no full refs yet. | Dense Qwen35 decode/prefill kernels cover BF16/MQ4/MQ6 and selected MQ3. Missing DFlash batched lm_head/verify support for MQ6/MQ8/MQ2/F16 targets. |
 | Qwen 3.5 / 3.6 MoE | `qwen3.6-35b-a3b`, `qwen3.5-122b-a10b` | Supported as Qwen35 MoE (`arch_id=6`) when quantized in Qwen3.5-MoE tensor layout. | Limited: dense-style DFlash works only where target/draft dtypes hit supported batched verify paths; MQ3 MoE is refused for DFlash. | MoE MTP code exists, but admission is narrower than dense and still gated by MoE dtype/layout validation. | Supported on FullAttention layers; no MoE-specific eviction of expert weights unless using the separate pager path. | Supported only on Qwen35 path when incompatible features are off. | Supported; MoE batched prefill admits MQ4 control and newer MQ6/MQ3 surfaces on validated arches. | `qwen3.6-35b-a3b-bf16` KLD producer is currently skipped on error; no completed refs for MoE rows. | Indexed MoE gate/up/down, shared expert, router, and grouped GEMM kernels exist for Qwen35 MoE. Missing broad MQ3/MQ2/MQ8 MoE DFlash coverage and full validation for every local MoE artifact. |
 | Qwen3-MoE / Qwen3-Coder (`qwen3_moe`) | `qwen3-coder-30b-a3b-instruct`, `tiny-random/qwen3-moe` | Not currently first-class. Local Coder HFQs are stamped `arch_id=0`, but source configs are `qwen3_moe`; that does not match the Qwen35-MoE loader layout. | No. | No. | No. | No. | No. | Listed as a desired KLD target for Coder, but no completed ref. | Needs a `qwen3_moe` architecture mapping and loader/kernel audit. Existing Qwen35 MoE kernels assume Qwen3.5 hybrid layer/tensor layout, not plain Qwen3-MoE/Coder layout. |
-| DeepSeek V4 Flash | `deepseek-v4-flash.mq4.hfq` | Supported as dedicated DeepSeek V4 path (`arch_id=9`). | No Qwen-style DFlash drafter. | Supported as DeepSeek V4's own optional MTP speculative decode path. | No. | No. | Supported by DeepSeek V4 chunked batched prefill / MTP fill. | Not currently targeted for KLD refs. | Dedicated DeepSeek V4 kernels cover Hyper-Connections, compressed-KV indexer, SWA attention, routed MoE, MQ2/MQ3-Lloyd expert variants, and MTP. Missing CASK, PP, and Qwen-style DFlash integration. |
-| LFM2.5-MoE | `lfm2.5-8b-a1b` | Supported as LFM2.5-MoE (`arch_id=11`) when compiled with `arch-lfm2moe`. Minimal AR bring-up. | No. | No. | No. | No. | No; prefill is per-token `decode_step`. | No completed refs yet. | Short-conv, attention, router, top-4 MoE, MQ4/MQ6 expert kernels are present. Missing batched prefill, DFlash/spec decode, CASK, PP, and grammar/tool-exec integration. |
-| Dense LFM2.5 | `lfm2.5-350m`, `lfm2.5-1.2b-instruct` | Not supported as dense LFM2. Local MQ artifacts stamped `arch_id=11` are suspect because the LFM2-MoE parser requires MoE-only fields. | No. | No. | No. | No. | No. | KLD producer currently skipped on error for dense LFM2 rows. | Needs a dense LFM2 architecture crate or a generalized LFM2 loader. Current `hipfire-arch-lfm2moe` kernels/config assume `lfm2_moe` layer types, experts, and MoE FFN fields. |
+| DeepSeek V4 Flash | `deepseek-v4-flash.mq4.hfq` | Supported as dedicated DeepSeek V4 path (`arch_id=9`). Multi-GPU expert-parallel serving via `hipfire serve --tp N` ([MULTI-GPU.md](MULTI-GPU.md)). | No Qwen-style DFlash drafter. | Supported as DeepSeek V4's own optional MTP speculative decode path (single-GPU; the EP path decodes plain greedy AR). | No. | No (PP refused; EP is the multi-GPU path). | Supported by DeepSeek V4 chunked batched prefill / MTP fill. | Not currently targeted for KLD refs. | Dedicated DeepSeek V4 kernels cover Hyper-Connections, compressed-KV indexer, SWA attention, routed MoE, MQ2/MQ3-Lloyd expert variants, and MTP. Missing CASK and Qwen-style DFlash integration. |
+| LFM2.5-MoE | `lfm2.5-8b-a1b` | Supported as LFM2.5-MoE (`arch_id=11`, `hipfire-arch-lfm2moe`). AR decode; registry tag `lfm2.5:8b-a1b`. Chat framing via the bundled LiquidAI Jinja template (the A1B export ships no embedded template — see [JINJA.md](JINJA.md)). | No. | No. | No. | No. | No; prefill is per-token `decode_step`. | No completed refs yet. | Short-conv, attention, router, top-4 MoE, MQ4/MQ6 expert kernels are present. Missing batched prefill, DFlash/spec decode, CASK, PP, and grammar/tool-exec integration. |
+| Dense LFM2.5 | `lfm2.5-350m`, `lfm2.5-1.2b-instruct`, `lfm2.5-1.2b-thinking` | Supported through the same `arch_id=11` crate — the config parser treats `num_experts == 0` (plain `lfm2` / `Lfm2ForCausalLM`) as all-dense-SwiGLU (`num_dense_layers == num_hidden_layers`). Registry tags `lfm2.5:350m` (MQ4), `lfm2.5:1.2b` / `lfm2.5:1.2b-thinking` (Q8). | No. | No. | No. | No. | No; per-token prefill like the MoE path. | No completed refs yet. | Same kernel set as LFM2.5-MoE minus the router/expert kernels (unused at `num_experts=0`). Same gaps: batched prefill, spec decode, CASK, PP. |
+| Qwen2 dense (`arch_id=7`) | `qwen2-1.5b-instruct` | Supported via `hipfire-arch-qwen2` (GQA + Q/K/V bias + 1-D RoPE). Validated against the committed HF F32 reference on gfx1151; forward-as-pipeline lowered decode is default-ON after gfx1100+gfx1201 byte-parity. Quantize with `--arch-id 7`. | No. | No. | No. | No. | No. | Smoke ref `qwen2_1p5b_instruct_smoke.json` (16/16 top-1 at Q8). | Q8F16 / HFQ4 / F16 weight paths. Missing DFlash, CASK, PP, batched prefill. |
 | LLaMA-family dense | `llama-3.2-1b-instruct`, `supra-50m-instruct` | Basic dense AR support through LLaMA-family path (`arch_id=0`). | No. | No. | No. | No. | No Qwen35-style batched prefill. | Producer skipped on error for `llama-3.2-1b-instruct-bf16` and `supra-50m-instruct-bf16`. | Dense LLaMA/GGUF-style GEMV, Q8/HFQ/MQ weight paths exist. Missing family-specific optimized prefill, DFlash, CASK, PP, and per-model quality refs. |
 | Gemma 4 | `gemma-4-E2B-it` | Not runnable as a Gemma architecture yet. Prompt/tool-call support scaffolding exists, but no Gemma4 architecture crate is in the workspace. | No. | No. | No. | No. | No. | Not generated. | Needs `hipfire-arch-gemma4`, config/loader/forward kernels, and stop/tool-call policy wiring. Existing Gemma parser support is not model execution support. |

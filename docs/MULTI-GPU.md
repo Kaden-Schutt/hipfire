@@ -1,9 +1,147 @@
-# Multi-GPU Pipeline-Parallel
+# Multi-GPU serving
 
-**Status:** v1 feature-complete on `feat/multi-gpu-pp` branch — tracking
+hipfire has two multi-GPU modes, selected per model load and **mutually
+exclusive** (the daemon refuses a load that sets both):
+
+| Mode | Load param | What's sharded | For | Arches |
+|---|---|---|---|---|
+| **Expert-parallel (EP)** | `tp` (`hipfire serve --tp N`) | Routed MoE experts (rank `r` owns experts `e % tp == r`); attention / KV / norms replicated per rank | Big-MoE models whose *weights* don't fit one card (DeepSeek V4 Flash ~82 GB, MiniMax-M2) | DeepSeek V4 (arch 9), MiniMax-M2 (arch 10) |
+| **Pipeline-parallel (PP)** | `pp` | Contiguous layer bands; the residual stream flows dev0 → dev1 → … | Dense / hybrid models that need more *context or headroom* than one card | Qwen 3.5/3.6 dense + MoE (arch 5/6) |
+
+---
+
+# Expert-parallel (EP) — `--tp N`
+
+**Status:** v1 landed (task #26 — design doc
+`docs/plans/daemon-ep-wiring.md`, substrate validation log
+`docs/plans/ship6-substrate-ep.md`). Greedy AR decode, validated on
+4× gfx1201 (32 GiB each) for DeepSeek V4 Flash and MiniMax-M2
+(MiniMax: coherent at 51.7 tok/s decode, ~24 GB/card shard load) —
+models whose MQ2-Lloyd tiers (~82–86 GB) cannot fit any single 32 GB
+card.
+
+## How it works
+
+`Gpus::init_tp(tp, n_layers)` brings up `tp` ranks; each rank loads the
+full non-expert weight set (attention, norms, router, shared expert)
+plus **only its owned routed experts** (`ExpertAssign::Stride`: rank
+`r` owns experts `e % tp == r`; non-owned slots are zeroed dummies that
+contribute 0). Every rank runs the full forward; the routed-expert
+combine is the only cross-GPU step — one peer-direct copy+add
+all-reduce of a `[hidden_size]` partial per MoE layer. Logits land on
+rank 0 and sampling happens on the host, so the EP seam is
+forward-only.
+
+## Serving
+
+```bash
+# DeepSeek V4 Flash across 4 GPUs
+HIP_VISIBLE_DEVICES=0,1,2,3 hipfire serve --tp 4
+hipfire run deepseek-v4-flash "What is the capital of France?"
+```
+
+Driving the daemon JSON directly:
+
+```json
+{"type":"load","model":".../deepseek-v4-flash.mq2lloyd","params":{"max_seq":8192,"tp":4}}
+```
+
+`hipfire serve --tp N` sets `HIPFIRE_TP=N`; the CLI forwards it as
+`params.tp` on every model load (only when > 1, so single-GPU loads
+stay byte-identical). Loads are refused with a structured error when:
+
+- `tp > 1` **and** `pp > 1` (mutually exclusive),
+- `tp > 1` with a DFlash drafter configured (no spec-decode under EP v1),
+- the model's arch_id is not 9 (DeepSeek V4) or 10 (MiniMax-M2),
+- `init_tp` finds fewer devices than `tp` (check
+  `HIP_VISIBLE_DEVICES` / `ROCR_VISIBLE_DEVICES`).
+
+## Generate semantics (v1)
+
+The EP generate path (`generate_ep` in the daemon) accepts the normal
+generate fields — `prompt`, `system_prompt`, `messages` (multi-turn
+history), `tools`, `max_tokens`, `stop`, think mode — with v1 limits:
+
+- **Greedy decode only.** Sampling params (temperature / top_p /
+  penalties) are not applied on the EP path yet; logits are argmax'd
+  host-side from rank 0.
+- **MTP / DFlash / CASK / PFlash / VL: not available** under EP.
+- Prompt rendering matches single-GPU: DeepSeek V4 goes through its
+  DSML prompt builder (`<｜User｜>…<｜Assistant｜>`), MiniMax-M2 through
+  its Jinja chat template with `tools` and the full message history
+  threaded (see [JINJA.md](JINJA.md)).
+
+**Tool calls are wired on the EP path.** For DeepSeek V4 the daemon
+builds per-request tool schemas from the OpenAI `tools` array and runs
+the DSML stream parser plus a **grammar-constrained token mask** during
+decode — tokens that would malform a tool call are masked out of the
+logits, and emitted calls stream as structured `tool_calls` events
+with `finish_reason: "tool_calls"`. For MiniMax-M2 the template
+renders tool definitions into the prompt; output streams as text.
+
+> **Known issue (ds4 + tp>1):** `forward_ep` is not yet byte-exact to
+> the single-GPU forward on DeepSeek V4 — the prefill numerics diverge
+> at the first response token, which can degrade DSML tool-call
+> emission under EP even though the identical prompt produces clean
+> `tool_calls` single-GPU. The render/parse wiring is correct; the
+> forward-numerics gap is tracked under task #26 / Ship 6. Plain text
+> generation is coherent.
+
+Caching: MiniMax-M2 EP carries the single-GPU LCP prefix cache — every
+rank's KV cursor rewinds to the longest common prefix of the rendered
+conversation and only the divergent suffix re-prefills
+(interleaved-thinking partial reuse). The MiniMax `<think>\n` opener is
+re-emitted display-only so the assistant turn stays well-formed.
+DeepSeek V4 EP keeps an assistant-turn cache for verbatim history
+replay.
+
+## Environment / debug knobs (EP)
+
+| Variable | Effect |
+|---|---|
+| `HIP_VISIBLE_DEVICES=0,1,2,3` | Standard ROCm device filter — expose exactly the ranks you want |
+| `HIPFIRE_TP=N` | What `hipfire serve --tp N` sets; any CLI-initiated load forwards it as `params.tp` |
+| `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB=N` | Pre-flight VRAM-asymmetry tolerance (default 2.0). Raise it when a busy card makes the uniform-VRAM check flag a false asymmetry |
+| `HIPFIRE_DEEPSEEK4_DUMP_PROMPT=1` | Dump the rendered EP prompt (token count + decoded text) to stderr |
+| `HIPFIRE_DEEPSEEK4_CACHE_TRACE=1` | Trace ds4 assistant-turn cache stores |
+| `HIPFIRE_QWEN_CACHE_TRACE=1` | Trace the MiniMax EP LCP prefix-cache decisions |
+
+## Validation harnesses (EP)
+
+GPU-side parity and bring-up harnesses, runnable without the daemon:
+
+```bash
+# DeepSeek V4 Flash EP greedy decode (4× gfx1201 recipe)
+HIP_VISIBLE_DEVICES=0,1,2,3 cargo run --release \
+    -p hipfire-arch-deepseek4 --example ep_deepseek4 -- \
+    --model ~/.hipfire/models/deepseek-v4-flash.mq2lloyd --tp 4 --max 48 \
+    --prompt "The capital of France is"
+
+# MiniMax-M2 EP greedy decode
+HIP_VISIBLE_DEVICES=0,1,2,3 cargo run --release --features deltanet \
+    -p hipfire-arch-minimax --example ep_minimax -- \
+    --model ~/.hipfire/models/minimax-m2.mq2lloyd --tp 4 --max 32 \
+    --prompt "The capital of France is"
+
+# EP ≡ single-GPU decode parity (Qwen3.x-A3B substrate harness):
+# run at tp=1 then tp=2 and diff the printed FNV hash.
+HIP_VISIBLE_DEVICES=0,1 cargo run --release --features deltanet \
+    -p hipfire-runtime --example ep_decode_parity -- \
+    ~/.hipfire/models/qwen3.6-35b-a3b.mq4 2 24 "The capital of France is"
+```
+
+The EP examples print an FNV-1a fingerprint over the emitted token
+ids; a `--tp N` run is expected to match the `--tp 1` / single-GPU
+fingerprint (the EP combine is accumulate-style, so EP ≡ non-EP).
+
+---
+
+# Pipeline-parallel (PP) — `pp ≥ 2`
+
+**Status:** v1 feature-complete — tracking
 issue [#58](https://github.com/Kaden-Schutt/hipfire/issues/58). Stages
 0–9 of the v2 plan are merged; refusal contracts (DFlash / VL / CASK +
-pp>1) are wired and validated. This doc is the source of truth for
+pp>1) are wired and validated. This section is the source of truth for
 memory budget, deployment recipes, throughput, and known limitations.
 
 ## Why PP

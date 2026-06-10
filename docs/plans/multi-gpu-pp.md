@@ -5,7 +5,7 @@
 **Date:** 2026-05-05
 **Target Release:** v0.2.0 (at maintainer discretion)
 **Related:** issue [#58](https://github.com/Kaden-Schutt/hipfire/issues/58),
-`docs/multi-gpu.md` (user-facing reference), `AGENTS.md` §threading,
+`docs/MULTI-GPU.md` (user-facing reference), `AGENTS.md` §threading,
 `CLAUDE.md` "Coherence Gate"
 
 ---
@@ -233,7 +233,7 @@ New: `crates/hipfire-runtime/src/multi_gpu.rs`.
   `gpus.devices[gpus.output_device]`; per-layer weights →
   `gpus.devices[gpus.device_for_layer(i)]`.
 - `Qwen35Weights::free_gpu_multi` mirrors per-device ownership.
-- Update `docs/multi-gpu.md` memory budget table from real measurements.
+- Update `docs/MULTI-GPU.md` memory budget table from real measurements.
 
 ### Stage 5 — `multi-gpu-pp-5-state-placement` (~4-5d)
 
@@ -317,7 +317,7 @@ within one layer's body and does not cross boundaries.
 `crates/hipfire-arch-qwen35/tests/pp_parity.rs` (new),
 `crates/hipfire-runtime/examples/{pp_parity,pp_parity_chatml,pp2_vram_probe}.rs`
 (new),
-`docs/multi-gpu.md`,
+`docs/MULTI-GPU.md`,
 `tests/speed-baselines/gfx1100x2_pp.txt` (new).
 
 - `coherence-gate.sh --pp N`; for changes touching `multi_gpu.rs` or
@@ -381,7 +381,7 @@ and re-stated here for permanence:
 
 - Issue [#58](https://github.com/Kaden-Schutt/hipfire/issues/58) —
   multi-GPU roadmap
-- `docs/multi-gpu.md` — user-facing reference (memory budget table,
+- `docs/MULTI-GPU.md` — user-facing reference (memory budget table,
   deployment recipes, limitations)
 - `docs/methodology/perf-benchmarking.md` — perf claim discipline
 - `CLAUDE.md` "Coherence Gate" — mandatory gate for forward-pass changes

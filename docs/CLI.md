@@ -16,15 +16,26 @@ flag-level detail; this page is the index.
 
 | Command | Purpose |
 |---|---|
-| `hipfire run <tag\|path> [prompt...]` | Generate. Auto-pulls if missing. Routes through the running `serve` daemon if one is up; otherwise spawns a one-shot daemon. |
-| `hipfire chat <tag>` | Interactive TUI chat with streaming, markdown, multi-line input. Reuses running serve or spawns a dedicated daemon. |
-| `hipfire serve [host] [port] [-d]` | Start the OpenAI-compatible HTTP server. Accepts `host port` or `host:port` such as `hipfire serve 0.0.0.0:11435`. `-d` detaches into the background and writes a pid file. Defaults: host `0.0.0.0`, port `11435` (`hipfire config set host ...`, `hipfire config set port ...`). |
+| `hipfire run <tag\|path> [prompt...]` | Generate. Auto-pulls if missing. Routes through the running `serve` daemon if one is up; otherwise spawns a one-shot daemon. `--max-tokens` defaults to 4096. |
+| `hipfire chat <tag>` | Interactive TUI chat with streaming, markdown, multi-line input. Reuses running serve or spawns a dedicated daemon. Requires a TTY. Full keybinding / slash-command reference: [CHAT.md](CHAT.md). |
+| `hipfire serve [host] [port] [-d] [--tp N]` | Start the OpenAI-compatible HTTP server. Accepts `host port` or `host:port` such as `hipfire serve 0.0.0.0:11435`. `-d` detaches into the background and writes a pid file. `--tp N` enables expert-parallel serving across N GPUs (MiniMax-M2 / DeepSeek-V4 — see [MULTI-GPU.md](MULTI-GPU.md)). Defaults: host `0.0.0.0`, port `11435` (`hipfire config set host ...`, `hipfire config set port ...`). |
 | `hipfire stop` | Graceful shutdown of the background daemon. |
 | `hipfire bench <tag>` | Measure prefill + decode tok/s on a fixed prompt set. |
 
 `hipfire run` accepts either a registry tag (`qwen3.5:9b`) or a literal
 file path (`./my.mq4`). For a prompt with shell-special characters,
 quote it: `hipfire run qwen3.5:9b "What's 2+2?"`.
+
+`hipfire serve` takes a bind address, **not** a model. The server loads
+models per-request (or pre-warms `default_model`). Passing a model tag
+(`hipfire serve qwen3.5:9b`) is detected and refused with a hint
+(exit 1) instead of silently binding to host `"qwen3.5:9b"`:
+
+```
+hipfire run qwen3.5:9b "hello"                # one-shot (uses running serve if any)
+hipfire config set default_model qwen3.5:9b   # make serve pre-warm this model
+hipfire serve [host] [port]
+```
 
 ## Configuration
 
@@ -107,7 +118,24 @@ See [CONFIG.md](CONFIG.md) for CASK-related configuration keys.
 | Command | Purpose |
 |---|---|
 | `hipfire diag` | GPU arch, VRAM, HIP version, ROCm version, kernel blob hashes, model directory. First place to check if anything misbehaves. |
-| `hipfire update` | `git pull` + rebuild + refresh kernel blobs. Use when upstream pushes a fix. |
+| `hipfire profile [model]` | Kernel efficiency profiler (`--json`, `--kernel <name>`). |
+| `hipfire update` | `git pull` + rebuild + refresh kernel blobs. Use when upstream pushes a fix. Also how new registry tags arrive (the model registry ships with the CLI). |
+
+## Exit codes
+
+The CLI keeps a script-friendly contract:
+
+| Code | Meaning |
+|---|---|
+| `0` | Success. Also explicit help requests: `hipfire help`, `-h`, `--help`, and bare `hipfire` (prints help, plus a first-run setup banner when no config/models exist yet). |
+| `1` | Any error: unknown command (`Unknown command: <cmd>` on stderr — typos no longer print full help on stdout with exit 0), invalid usage / missing required args (`run`, `rm`, `quantize`, `sidecar-gen` without their positional arg), model not found (`rm`, `chat`), `chat` without a TTY, the `serve` model-tag-as-host guard, invalid `--tp` values. |
+| daemon's code (or `1`) | One-shot `run` / `bench`: if the spawned daemon dies, its own nonzero exit code is propagated. |
+| `130` | Interactive TUI (`config`, profile picker) interrupted with CTRL+C / CTRL+D (standard 128+SIGINT). |
+
+Error hints ride on stderr — e.g. `hipfire rm` with a missing or unknown
+model prints `See installed models: hipfire list`, and the DFlash-on-A3B
+auto-off path prints the real override syntax
+(`hipfire config <tag> set dflash_mode on`).
 
 ## Where files live
 
@@ -115,6 +143,7 @@ See [CONFIG.md](CONFIG.md) for CASK-related configuration keys.
 - Config: `~/.hipfire/config.json`
 - Per-model overlay: `~/.hipfire/per_model_config.json`
 - Local model aliases: `~/.hipfire/models.json`
+- Per-model chat-template overrides: `~/.hipfire/templates/<model-file>.j2` (see [JINJA.md](JINJA.md))
 - Pre-compiled kernels: `~/.hipfire/bin/kernels/<arch>/`
 - Daemon log: `~/.hipfire/serve.log`
 - Daemon pid file: `~/.hipfire/serve.pid`
@@ -125,9 +154,12 @@ Single-invocation overrides bypass the config file:
 
 | Variable | Effect |
 |---|---|
-| `HIPFIRE_KV_MODE=asym3\|q8\|asym4\|asym2` | Override KV cache layout. |
+| `HIPFIRE_KV_MODE=q8\|asym4\|asym3\|asym2\|fwht4\|fwht3\|fwht2\|turbo*` | Override KV cache layout (same value set as the `kv_cache` config key). |
 | `HIPFIRE_ATTN_FLASH=auto\|always\|never` | Force or disable FlashAttention. |
 | `HIPFIRE_NORMALIZE_PROMPT=0` | Opt out of `\n{3,}` → `\n\n` prompt collapse (default ON). |
+| `HIPFIRE_JINJA_CHAT=0` | Opt out of Jinja chat-template rendering (default ON) — falls back to the hand-rolled ChatML scaffold. See [JINJA.md](JINJA.md). |
+| `HIPFIRE_CHAT_TEMPLATE_FILE=<path>` | Override the chat template for the next model load. See [JINJA.md](JINJA.md). |
+| `HIPFIRE_TP=N` | Expert-parallel degree for model loads (what `hipfire serve --tp N` sets). See [MULTI-GPU.md](MULTI-GPU.md). |
 | `HIPFIRE_LOCAL=1` | `hipfire run` skips the HTTP daemon and spawns a fresh one-shot. |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS=...` | Append flags to JIT kernel compilations. |
 | `HIPFIRE_PROMPT_TOKEN_HEAT=1` | Dump per-position BPE merge-rank heat to stderr. |
