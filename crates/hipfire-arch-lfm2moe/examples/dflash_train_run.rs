@@ -99,7 +99,7 @@ fn zeros_like(gpu: &mut Gpu, src: &dt::Net) -> dt::Net {
         w_c: l.w_c.as_ref().map(|t| mk(gpu, t)),
         w1: mk(gpu, &l.w1), w3: mk(gpu, &l.w3), w2: mk(gpu, &l.w2),
     }).collect();
-    dt::Net { layers, in_proj_v: mk(gpu, &src.in_proj_v), out_proj_v: mk(gpu, &src.out_proj_v), fc: mk(gpu, &src.fc), final_norm: mk(gpu, &src.final_norm) }
+    dt::Net { layers, in_proj_v: mk(gpu, &src.in_proj_v), out_proj_v: mk(gpu, &src.out_proj_v), fc: mk(gpu, &src.fc), final_norm: mk(gpu, &src.final_norm), hidden_norm: None }
 }
 
 // deterministic xorshift PRNG (Math.random unavailable; seedable + replayable)
@@ -183,6 +183,7 @@ fn main() {
         out_proj_v: rndv(&mut gpu, d_tgt, d, 2, ws),
         fc: rndv(&mut gpu, d, fc_in, 3, 1.0 / (fc_in as f32).sqrt()),
         final_norm,
+        hidden_norm: None,
     };
     let m_state = zeros_like(&mut gpu, &net);
     let v_state = zeros_like(&mut gpu, &net);
@@ -260,7 +261,7 @@ fn main() {
         let (d_body_in, d_ctx, glayers) = dt::body_backward(&mut gpu, &cfg, &net.layers, &tape, &d_body_out, &ctx, &block_pos_g, &full_pos_g, &conv_state, bsz, n_ctx);
         let g_in_proj_v = dt::lin_dw(&mut gpu, &d_body_in, &embed_in_g, bsz, d_tgt, d);
         let g_fc = dt::lin_dw(&mut gpu, &d_ctx, &ctxh_g, n_ctx, fc_in, d);
-        let grad = dt::Net { layers: glayers, in_proj_v: g_in_proj_v, out_proj_v: g_out_proj_v, fc: g_fc, final_norm: g_final_norm };
+        let grad = dt::Net { layers: glayers, in_proj_v: g_in_proj_v, out_proj_v: g_out_proj_v, fc: g_fc, final_norm: g_final_norm, hidden_norm: None };
         let bc1 = 1.0 / (1.0 - b1.powi(step as i32)); let bc2 = 1.0 / (1.0 - b2.powi(step as i32));
         let ps = dt::net_tensors(&net); let gs = dt::net_tensors(&grad); let ms = dt::net_tensors(&m_state); let vs = dt::net_tensors(&v_state);
         for i in 0..ps.len() { let n = ps[i].numel(); gpu.adam_step_f32(ps[i], gs[i], ms[i], vs[i], lr, b1, b2, eps_a, wd, bc1, bc2, n).unwrap(); }

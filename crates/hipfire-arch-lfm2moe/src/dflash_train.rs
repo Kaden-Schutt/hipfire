@@ -30,6 +30,10 @@ impl Cfg {
     pub fn qd(&self) -> usize { self.nh * self.hd }
     pub fn kvd(&self) -> usize { self.nkv * self.hd }
     /// Real LFM2.5-350M-Base dims; `is_attn` per config.json layer_types.
+    pub fn zlab_27b(vocab: usize) -> Cfg {
+        Cfg { d: 5120, is_attn: vec![true; 5], nh: 32, nkv: 8, hd: 128, conv_k: 3,
+              inter: 17408, theta: 1.0e7, eps: 1e-6, d_tgt: 5120, vocab, n_tgt_layers: 5 }
+    }
     pub fn lfm2_350m(d_tgt: usize, vocab: usize, n_tgt_layers: usize) -> Self {
         let attn = [2usize, 5, 8, 10, 12, 14];
         Cfg {
@@ -58,6 +62,9 @@ pub struct Net {
     pub out_proj_v: GpuTensor, // [d_tgt, d]
     pub fc: GpuTensor,         // [d, n_tgt_layers*d_tgt]
     pub final_norm: GpuTensor, // [d]
+    /// z-lab convention: RMSNorm on the fc output rows (post-fc, pre-body).
+    /// None = trainer-native nets.
+    pub hidden_norm: Option<GpuTensor>,
 }
 pub fn lw_tensors(lw: &LW) -> Vec<&GpuTensor> {
     let mut v = vec![&lw.op_norm, &lw.ffn_norm];
@@ -67,6 +74,47 @@ pub fn lw_tensors(lw: &LW) -> Vec<&GpuTensor> {
     v.push(&lw.w1); v.push(&lw.w3); v.push(&lw.w2);
     v
 }
+/// z-lab safetensors loader: 5 attn layers d=5120, no in/out proj (loads
+/// identity), fc [d,5*d], hidden_norm. Use Cfg::zlab_27b().
+pub fn load_zlab(gpu: &mut Gpu, cfg: &Cfg, path: &Path) -> std::io::Result<Net> {
+    let st = StFile::open(path)?;
+    let d = cfg.d;
+    let g = |gpu: &mut Gpu, st: &StFile, n: &str, sh: &[usize]| -> GpuTensor {
+        let v = st.f32(n);
+        gpu.upload_f32(&v, sh).unwrap()
+    };
+    let mut layers = Vec::new();
+    for li in 0..cfg.is_attn.len() {
+        let p = format!("layers.{li}");
+        layers.push(LW {
+            op_norm: g(gpu, &st, &format!("{p}.input_layernorm.weight"), &[d]),
+            ffn_norm: g(gpu, &st, &format!("{p}.post_attention_layernorm.weight"), &[d]),
+            in_proj: None, conv_w: None, out_proj: None,
+            wq: Some(g(gpu, &st, &format!("{p}.self_attn.q_proj.weight"), &[cfg.nh * cfg.hd, d])),
+            wk: Some(g(gpu, &st, &format!("{p}.self_attn.k_proj.weight"), &[cfg.nkv * cfg.hd, d])),
+            wv: Some(g(gpu, &st, &format!("{p}.self_attn.v_proj.weight"), &[cfg.nkv * cfg.hd, d])),
+            wo: Some(g(gpu, &st, &format!("{p}.self_attn.o_proj.weight"), &[d, cfg.nh * cfg.hd])),
+            q_norm: Some(g(gpu, &st, &format!("{p}.self_attn.q_norm.weight"), &[cfg.hd])),
+            k_norm: Some(g(gpu, &st, &format!("{p}.self_attn.k_norm.weight"), &[cfg.hd])),
+            w_c: None,
+            w1: g(gpu, &st, &format!("{p}.mlp.gate_proj.weight"), &[cfg.inter, d]),
+            w3: g(gpu, &st, &format!("{p}.mlp.up_proj.weight"), &[cfg.inter, d]),
+            w2: g(gpu, &st, &format!("{p}.mlp.down_proj.weight"), &[d, cfg.inter]),
+        });
+    }
+    // identity in/out (drafter natively d == d_tgt)
+    let mut eye = vec![0f32; d * d];
+    for i in 0..d { eye[i * d + i] = 1.0; }
+    let in_proj_v = gpu.upload_f32(&eye, &[d, d]).unwrap();
+    let out_proj_v = gpu.upload_f32(&eye, &[d, d]).unwrap();
+    Ok(Net {
+        layers, in_proj_v, out_proj_v,
+        fc: g(gpu, &st, "fc.weight", &[d, cfg.n_tgt_layers * d]),
+        final_norm: g(gpu, &st, "norm.weight", &[d]),
+        hidden_norm: Some(g(gpu, &st, "hidden_norm.weight", &[d])),
+    })
+}
+
 pub fn net_tensors(net: &Net) -> Vec<&GpuTensor> {
     let mut v = Vec::new();
     for l in &net.layers { v.extend(lw_tensors(l)); }
@@ -474,7 +522,7 @@ pub fn load_net(gpu: &mut Gpu, cfg: &Cfg, path: &Path) -> std::io::Result<Net> {
         };
         layers.push(lw);
     }
-    Ok(Net {
+    Ok(Net { hidden_norm: None,
         layers,
         in_proj_v: g(gpu, &map, "in_proj_v", &[d, d_tgt]),
         out_proj_v: g(gpu, &map, "out_proj_v", &[d_tgt, d]),

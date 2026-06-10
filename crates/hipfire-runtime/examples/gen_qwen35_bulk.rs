@@ -23,7 +23,7 @@ fn main() {
     use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
     use std::path::PathBuf;
 
-    const SEL: [usize; 5] = [2, 16, 31, 46, 61];
+    let mut sel: Vec<usize> = vec![2, 16, 31, 46, 61];
     let argv: Vec<String> = std::env::args().collect();
     let mut model = None; let mut ref_path = None; let mut out_dir = None;
     let mut n = 512usize; let mut seed_len = 32usize; let mut n_seqs = 64usize; let mut start = 0usize; let mut kv_mode = "q8".to_string();
@@ -38,6 +38,7 @@ fn main() {
             "--seed-len" => { seed_len = argv[i + 1].parse().unwrap(); i += 2; }
             "--n-seqs" => { n_seqs = argv[i + 1].parse().unwrap(); i += 2; }
             "--start" => { start = argv[i + 1].parse().unwrap(); i += 2; }
+            "--sel" => { sel = argv[i + 1].split(',').map(|x| x.parse().unwrap()).collect(); i += 2; }
             "--rep-penalty" => { rep_penalty = argv[i + 1].parse().unwrap(); i += 2; }
             "--rep-window" => { rep_window = argv[i + 1].parse().unwrap(); i += 2; }
             "--kv-mode" => { kv_mode = argv[i + 1].clone(); i += 2; }
@@ -83,8 +84,8 @@ fn main() {
         let ck = gpu.pool_checkpoint();
         let mut kv_cache = KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, n + 16).unwrap();
         let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
-        let mut rb = HiddenStateRingBuffer::new(&mut gpu, config.n_layers, SEL.len(), config.dim, n, 1).unwrap();
-        rb.extract_layers = SEL.to_vec();
+        let mut rb = HiddenStateRingBuffer::new(&mut gpu, config.n_layers, sel.len(), config.dim, n, 1).unwrap();
+        rb.extract_layers = sel.clone();
         let mut generated: Vec<u32> = Vec::with_capacity(n);
         let mut tok = seed[0];
         for pos in 0..n {
@@ -99,14 +100,16 @@ fn main() {
                 let v = &mut lg[t as usize];
                 *v = if *v > 0.0 { *v / rep_penalty } else { *v * rep_penalty };
             }
-            let next = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+            let mut bi = 0usize; let mut bv = lg[0];
+            for j in 1..lg.len() { if lg[j] > bv { bv = lg[j]; bi = j; } }
+            let next = bi as u32;
             tok = if pos + 1 < seed_len { seed[pos + 1] } else { next };
         }
         // dump 5 layers (HFHS n_layers=5, in SEL order) + toks
         let hp = format!("{out_dir}/seq{idx}.hfhs");
         let mut out = BufWriter::with_capacity(4 << 20, File::create(&hp).unwrap());
         out.write_all(b"HFHS\0\0\0\0").unwrap();
-        out.write_all(&(SEL.len() as u32).to_le_bytes()).unwrap();
+        out.write_all(&(sel.len() as u32).to_le_bytes()).unwrap();
         out.write_all(&(n as u32).to_le_bytes()).unwrap();
         out.write_all(&(config.dim as u32).to_le_bytes()).unwrap();
         out.write_all(&0u32.to_le_bytes()).unwrap();
