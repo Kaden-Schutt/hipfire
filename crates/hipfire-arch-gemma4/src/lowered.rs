@@ -643,6 +643,11 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
             let buf = gpu.upload_raw(bytes, &[m, k])?;
             return Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None, paro: None });
         }
+        2 => {
+            // F32 raw (oracle / --format f32 passthrough .hfq) — upload as-is.
+            let buf = gpu.upload_raw(data, &[m, k])?;
+            return Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None, paro: None });
+        }
         3  => DType::Q8_0,
         4  => DType::Q4K,
         6  => DType::HFQ4G256,
@@ -851,6 +856,14 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
             eprintln!("  (F16 → F32)");
             let f32_data: Vec<f32> = embed_data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            (gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
+        }
+        2 => {
+            // F32 raw (oracle / --format f32 passthrough .hfq).
+            eprintln!("  (F32 raw, {} MB)", embed_data.len() / 1_000_000);
+            let f32_data: Vec<f32> = embed_data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
             (gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
         }

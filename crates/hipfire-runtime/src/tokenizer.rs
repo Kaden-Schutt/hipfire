@@ -877,11 +877,23 @@ impl Tokenizer {
         let n_chars = boundaries.len() - 1;
 
         let mut pos = 0usize;
+        // Cap the greedy scan at the longest vocab token (in chars). The
+        // uncapped (pos+1..=n_chars).rev() scan is O(text^2) hash work over
+        // megabyte-long candidate slices on corpus-sized inputs (the wt2
+        // KLD slice never finished tokenizing). No vocab entry longer than
+        // max_tok_chars can ever match, so capping is byte-identical.
+        let max_tok_chars = self
+            .token_to_id
+            .keys()
+            .map(|t| t.chars().count())
+            .max()
+            .unwrap_or(1);
         while pos < n_chars {
             // Greedy longest match from vocabulary (high-`end` first).
             let mut best_len = 0;
             let mut best_id = 0u32;
-            for end in (pos + 1..=n_chars).rev() {
+            let scan_end = (pos + max_tok_chars).min(n_chars);
+            for end in (pos + 1..=scan_end).rev() {
                 let candidate = &sp_text[boundaries[pos]..boundaries[end]];
                 if let Some(&id) = self.token_to_id.get(candidate) {
                     best_len = end - pos;
