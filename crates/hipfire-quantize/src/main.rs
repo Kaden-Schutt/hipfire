@@ -3318,17 +3318,31 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
         return QuantLevel::Promote6;
     }
 
-    // Mode 2 (typed): promote ffn_down and attn_v in all layers.
+    // Mode 2 (typed): promote ffn_down, attn_v, and edge-layer FFN everywhere.
+    // attn q/k/o are deliberately excluded — dense attn promotion regresses PPL
+    // +3.1% on 27B (see ppl_kmap_20260508.md). Edge layers promote FFN + v_proj
+    // only; attn q/k/o stay at Base even for edge layers.
+    // This mode is the default for gemma4 (arch_id 13).
     if kmap_mode == 2 {
         let is_down = name.contains("down_proj") || name.contains("ffn_down");
         let is_v = name.contains("v_proj") || name.contains("attn_v");
+        // Unconditionally promote down_proj and v_proj in all layers.
         if is_down || is_v {
             return QuantLevel::Promote6;
         }
+        // Edge layers: promote FFN tensors only — NOT attn q/k/o.
         if n_layers > 0 {
             if let Some(idx) = parse_layer_idx(name) {
                 if idx < 2 || idx >= n_layers.saturating_sub(2) {
-                    return QuantLevel::Promote6;
+                    let is_attn_qko = name.contains("q_proj")
+                        || name.contains("attn_q")
+                        || name.contains("k_proj")
+                        || name.contains("attn_k")
+                        || name.contains("o_proj")
+                        || name.contains("attn_o");
+                    if !is_attn_qko {
+                        return QuantLevel::Promote6;
+                    }
                 }
             }
         }
@@ -5225,11 +5239,14 @@ fn main() {
     // short context, win at long context — see benchmarks/results/
     // ppl_kmap_20260508.md). Maintainer directive 2026-05-08: "intends to
     // help ONLY (never on dense)" by default.
+    // Exception: gemma4 (arch_id 13) auto-enables kmap_mode=2 (typed) — see
+    // the arch-specific override after arch_id resolution below.
     let kmap_dense = args.iter().any(|a| a == "--kmap-dense");
     // K-map mode: 0=full (all candidates promoted), 1=alternating (edge + every 3rd),
-    // 2=typed (ffn_down+attn_v everywhere). Default: alternating — same PPL as full
-    // at 17% less model size on MoE (22.9 vs 27.7 GB, PPL 8K: 19.96 vs 20.07).
-    let kmap_mode: u8 = args
+    // 2=typed (ffn_down+attn_v everywhere, edge layers FFN+v only — no attn q/k/o).
+    // Default for MoE: alternating (same PPL as full at 17% less size).
+    // Default for gemma4 (arch_id 13): typed (mode 2) — auto-set after arch detection.
+    let kmap_mode_explicit: Option<u8> = args
         .iter()
         .position(|a| a == "--kmap-mode")
         .and_then(|i| args.get(i + 1))
@@ -5241,8 +5258,12 @@ fn main() {
                 eprintln!("warning: unknown --kmap-mode '{v}', using alternating");
                 1
             }
-        })
-        .unwrap_or(1);
+        });
+    // kmap_mode is finalised after arch_id is known (gemma4 override may apply).
+    // For the GGUF early-exit path the arch is not resolved until inside
+    // run_gguf_pipeline; use the CLI value directly there (gemma4 GGUF callers
+    // can pass --kmap-mode typed explicitly).
+    let kmap_mode: u8 = kmap_mode_explicit.unwrap_or(1);
 
     // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
     // MQ2 with the current uniform 4-level codebook collapses at every
@@ -5472,6 +5493,15 @@ fn main() {
     // dequantizes norms / conv-filter back to F32).
     let is_lfm2moe = arch_id == 11;
     let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_gemma4;
+    // Gemma4 (arch_id 13) defaults to kmap_mode=2 (typed): promote down_proj,
+    // v_proj, and edge-layer non-attn-qko tensors. Attn q/k/o are excluded even
+    // in edge layers (dense attn promotion regresses PPL +3.1% on 27B).
+    // The explicit --kmap-mode flag overrides this default.
+    let kmap_mode: u8 = if is_gemma4 {
+        kmap_mode_explicit.unwrap_or(2)
+    } else {
+        kmap_mode
+    };
     // Q8 router: always on for MoE-class models.
     let q8_router = is_moe_like || q8_router_flag;
     if is_moe {
@@ -5632,7 +5662,10 @@ fn main() {
     // the K-map default-on path because the routed-expert promotion is
     // the headline win and the empirical regression there is tighter
     // (+1.7% PPL at 2K, gated below the dense regression threshold).
-    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
+    // K-map is enabled for: MoE models (default), gemma4 (arch_id 13,
+    // default mode=2), or any dense model with --kmap-dense.
+    // Suppress with --no-kmap / --uniform.
+    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !is_gemma4 && !kmap_dense) {
         HashMap::new()
     } else {
         let mut map = HashMap::new();
