@@ -6931,6 +6931,17 @@ fn main() {
                                     quantize_mq4g256(&f32_data, &signs1, &signs2)
                                 }
                             } else {
+                                // HIPFIRE_GEMMA4_UNIT_AWQ=1: emit unit sidecar (all 1.0,
+                                // no weight pre-scaling) so the runtime picks up the
+                                // AWQ kernel path rather than the broken plain-rotate path.
+                                // Mirrors qwen Fix-A: sidecar is identity at inference but
+                                // routes through the correct _awq rotate kernel.
+                                let gemma4_unit_awq = (is_gemma4 || arch_id == 22)
+                                    && std::env::var("HIPFIRE_GEMMA4_UNIT_AWQ").ok().as_deref()
+                                        == Some("1");
+                                if gemma4_unit_awq && awq_eligible(name) {
+                                    awq_sidecar_scales = Some(vec![1.0f32; k_dim]);
+                                }
                                 quantize_mq4g256(&f32_data, &signs1, &signs2)
                             };
                             (q, QuantType::MQ4G256, 256u32, "MQ4G256")
