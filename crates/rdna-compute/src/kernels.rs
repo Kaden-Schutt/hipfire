@@ -1947,6 +1947,8 @@ pub const GEMM_QKV_HFQ6G256_DOT2_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_hfq6g256_dot2.hip");
 pub const GEMM_QKV_HFQ6G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_hfq6g256_wmma.hip");
+pub const GEMM_QKV_HFQ6G256_WMMA_4W_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gemm_qkv_hfq6g256_wmma_4w.gfx1151.hip");
 // gfx12 (RDNA4) sister of GEMM_QKV_HFQ6G256_WMMA_SRC. Same gfx12 recipe
 // as the hfq4 scaffolds, with the hfq6 dequant inner loop carried over
 // (200B groups, 4-byte unaligned reads at byte-offsets {0, 3} per K
