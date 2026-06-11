@@ -2832,6 +2832,12 @@ pub const GATED_DELTA_NET_F32_ROUTED_BATCH_SEQ_SRC: &str =
 pub const GATED_DELTA_NET_Q8_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_q8.hip");
 
+/// gfx1151 register-state GDN Q8 experiment. Keeps one S row per thread in
+/// registers and preserves the production stochastic-requant ABI.
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_Q8_REG_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gated_delta_net_q8_reg.gfx1151.hip");
+
 /// Routed Q8 Gated Delta Net for independent request sessions. One block per
 /// session/head/S-tile scans round-major prefix rows and updates only that
 /// session's recurrent Q8 S state.

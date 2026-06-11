@@ -137,7 +137,13 @@ All norm kernels are F32-only. The `fused_rmsnorm_mq_rotate` family (called befo
 |---|---|---|---|---|---|---|
 | mq_rotate_x_dual | — | — | — | — | — | basic |
 | pack_f32_to_fp8 | — | — | — | — | — | basic |
-| gated_delta_net_q8 | — | — | — | — | — | basic (gfx1200 only) |
+| gated_delta_net_q8 | — | — | — | — | basic (register-state probe, opt-in) | basic (gfx1200 only) |
+
+gfx1151 GDN Q8 register-state probe: `HIPFIRE_GDN_Q8_REG_GFX1151=1` routes
+the recurrent state through one 128-thread block per head with one S row per
+thread. It is default-off after Qwen3.6-35B-A3B MQ4 pp256 profiling regressed
+GDN time from 11.8 ms on the generic LDS-backed path to 168.5 ms on the
+register-state path.
 
 ---
 
