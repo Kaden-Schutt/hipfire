@@ -14,10 +14,9 @@
 // (all 4 sub-blocks of one Q8_1 block) by keeping FOUR independent
 // int32 accumulators in flight.
 //
-// Rationale: k4 hit +4.6% over k2 on gfx1151 with zero register spills
-// (k2=126 VGPR, k4=132 VGPR). k8 is the natural next pipeline-depth
-// experiment; expected diminishing return as register pressure grows.
-// If k8 spills, the answer is "k4 is the local max" — a clean negative.
+// Rationale: k8 measured as the best shipped gfx1151 HFQ4 grouped-MoE
+// variant on the 122B A10B pp128 profile: k2 ~248 ms, k4 ~132 ms,
+// k8 ~112 ms across the 58 HFQ4 grouped-MoE calls.
 //
 // Structural fit: each Q8_1 block contains 4 sub-blocks (sb=0..3, each
 // covering K=32 → 128-K total per Q8_1 block). The HFQ4-G256 group is

@@ -20056,12 +20056,15 @@ impl Gpu {
         let use_i8_gfx1151 =
             self.arch_caps.is_gfx1151() && self.flags.moe_grouped_i8.unwrap_or(true);
         if use_i8_gfx1151 {
-            // Optional deeper-pipeline variants (opt-IN, default OFF).
+            // Optional deeper-pipeline variants. On gfx1151, k8 is default ON
+            // after the 122B A10B pp128 profile showed ~2.2x over k2 for the
+            // HFQ4 grouped-MoE hotspot; opt out with HIPFIRE_MOE_GROUPED_I8_K8=0.
+            // k4 remains available via HIPFIRE_MOE_GROUPED_I8_K4=1.
             // Same kernarg layout + scatter contract as the k2 default.
             // - k8: processes all 4 sub-blocks of one Q8_1 block per inner
             //   iteration (8 WMMAs into 4 independent int32 accumulators).
             // - k4: pairs adjacent Q8_1 sub-blocks (4 WMMAs into 2 accumulators).
-            // - k2 (default): one sub-block per inner iteration.
+            // - k2: one sub-block per inner iteration.
             let use_k8 = self.flags.moe_grouped_i8_k8;
             let use_k4 = self.flags.moe_grouped_i8_k4;
             if use_k8 {

@@ -1279,11 +1279,9 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K4_GFX1151_SRC: &str =
 /// Processes all 4 sub-blocks of one Q8_1 block per inner iteration —
 /// 8 WMMAs into 4 independent int32 accumulators before the per-sub-block
 /// scale FMA resolves. Same kernarg signature + grid + block geometry as
-/// the k2/k4 siblings; the only difference is unroll depth. Natural next
-/// experiment after k4 hit +4.6% on gfx1151 with zero register spills;
-/// expected diminishing return (+1-3% upside, possible 0% or regression
-/// if registers spill). Opt-IN via `HIPFIRE_MOE_GROUPED_I8_K8=1` (default
-/// OFF pending bench validation).
+/// the k2/k4 siblings; the only difference is unroll depth. Default ON for
+/// gfx1151 after the 122B A10B pp128 profile showed a large HFQ4 grouped-MoE
+/// win over k2/k4. Opt out with `HIPFIRE_MOE_GROUPED_I8_K8=0`.
 pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K8_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/gemm_hfq4g256_moe_grouped_mmq_k8.gfx1151.hip");
 

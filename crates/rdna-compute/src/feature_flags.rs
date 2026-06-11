@@ -201,7 +201,11 @@ impl FeatureFlags {
                 Some("0") => Some(false),
                 _ => None,
             },
-            moe_grouped_i8_k8: std::env::var("HIPFIRE_MOE_GROUPED_I8_K8").as_deref() == Ok("1"),
+            moe_grouped_i8_k8: if arch == "gfx1151" {
+                std::env::var("HIPFIRE_MOE_GROUPED_I8_K8").as_deref() != Ok("0")
+            } else {
+                std::env::var("HIPFIRE_MOE_GROUPED_I8_K8").as_deref() == Ok("1")
+            },
             moe_grouped_i8_k4: std::env::var("HIPFIRE_MOE_GROUPED_I8_K4").as_deref() == Ok("1"),
             moe_grouped_i8_k4_gfx12: std::env::var("HIPFIRE_MOE_GROUPED_I8_K4_GFX12").as_deref()
                 == Ok("1"),
