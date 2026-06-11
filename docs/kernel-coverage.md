@@ -86,7 +86,7 @@ gfx1151 now routes HFQ4/MQ4 decode GEMV through the RDNA3 single-row and multi-r
 |---|---|---|---|---|---|---|
 | moe grouped hfq4g256 | — | — | — | basic (gfx11_dgpu, 2 variants) | standard (mmq k4/k8) | **tuned** (wmma+mmq, m2 variant) |
 | moe grouped hfq3g256 | — | — | — | — | basic | standard |
-| moe grouped hfq6g256 | — | — | — | — | basic | standard (v2) |
+| moe grouped hfq6g256 | — | — | — | — | **tuned** (4w default, v2 opt-in) | standard (v2) |
 | moe grouped mq4g256 | — | — | — | — | — | — |
 | moe grouped paro q4g128 | — | — | — | — | standard (k8 variant) | — |
 | moe grouped bf16/f16 | — | — | — | — | basic | — |

@@ -21185,36 +21185,52 @@ impl Gpu {
                 self.arch
             );
         }
-        // v2 lever (M-direction 2×1 reg-block, env-gated). Defaults off;
-        // promotes when `HIPFIRE_MOE_HFQ6_V2=1`. Each warp covers 32 rows
-        // × 16 slots (vs 16×16); B-load halved per output. Compatible with
-        // existing BLOCK_M=16 scatter — only the M (row) dimension is
-        // restrided. The slot tile stride stays at 16 so expert-boundary
-        // safety is unchanged from v1.
+        // gfx1151 default: 4-warp 64-row tile sharing one staged 16-slot
+        // X slice across four row-warps. Opt out with HIPFIRE_MOE_HFQ6_4W=0.
+        //
+        // v2 lever (M-direction 2×1 reg-block, env-gated) remains available
+        // behind HIPFIRE_MOE_HFQ6_V2=1 for gfx12 or gfx1151 when the 4w path
+        // is explicitly disabled. Each warp covers 32 rows × 16 slots (vs
+        // 16×16); B-load halved per output. Compatible with existing
+        // BLOCK_M=16 scatter — only the M (row) dimension is restrided.
+        // The slot tile stride stays at 16 so expert-boundary safety is
+        // unchanged from v1.
+        let use_4w = self.arch == "gfx1151" && self.flags.moe_hfq6_4w;
         let use_v2 = self.flags.moe_hfq6_v2;
-        let (kernel_name, kernel_src, row_tile_stride) = if self.arch == "gfx1151" && use_v2 {
+        let (kernel_name, kernel_src, row_tile_stride, block_dim) = if use_4w {
+            (
+                "gemm_hfq6g256_moe_grouped_wmma_4w_gfx1151",
+                kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_4W_GFX1151_SRC,
+                64usize,
+                128u32,
+            )
+        } else if self.arch == "gfx1151" && use_v2 {
             (
                 "gemm_hfq6g256_moe_grouped_wmma_v2_gfx1151",
                 kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX1151_SRC,
                 32usize,
+                32u32,
             )
         } else if self.arch == "gfx1151" {
             (
                 "gemm_hfq6g256_moe_grouped_wmma_gfx1151",
                 kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX1151_SRC,
                 16usize,
+                32u32,
             )
         } else if use_v2 {
             (
                 "gemm_hfq6g256_moe_grouped_wmma_v2_gfx12",
                 kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC,
                 32usize,
+                32u32,
             )
         } else {
             (
                 "gemm_hfq6g256_moe_grouped_wmma_gfx12",
                 kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC,
                 16usize,
+                32u32,
             )
         };
         let slot_tile_stride = 16usize;
@@ -21252,7 +21268,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles, slot_tiles, 1],
-            [32, 1, 1],
+            [block_dim, 1, 1],
             0,
             &mut params,
             || {

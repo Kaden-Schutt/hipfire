@@ -1347,6 +1347,14 @@ pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
 pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/gemm_hfq6g256_moe_grouped_wmma.gfx1151.hip");
 
+/// gfx1151 4-warp HFQ6/MQ6 grouped-MoE WMMA variant. One block covers
+/// 64 M-rows x 16 routed slots for a single expert tile and stages the
+/// 16-slot X slice in LDS once per 256-K group, sharing it across four
+/// row-warps. Default on for gfx1151 after the 122B A10B pp128 profile
+/// showed a large win over v1; opt out with `HIPFIRE_MOE_HFQ6_4W=0`.
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_4W_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gemm_hfq6g256_moe_grouped_wmma_4w.gfx1151.hip");
+
 /// M-direction 2×1 reg-blocked sister of GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC.
 /// Each warp covers a 32-row × 16-slot output tile (vs 16×16 in v1); per
 /// K-substep 2 A-dequants + 1 B-load → 2 WMMAs (vs 1+1+1 in v1). Halves X-gather

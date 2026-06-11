@@ -219,6 +219,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_MOE_GROUPED_I8_K4_GFX12` | Runtime variable controlling moe grouped i8 k4 gfx12 in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:210` |
 | `HIPFIRE_MOE_GROUPED_I8_K8` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:207` |
 | `HIPFIRE_MOE_GROUPED_M2` | Run m2 kernel (env set) | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:212` |
+| `HIPFIRE_MOE_HFQ6_4W` | Default ON for gfx1151 HFQ6 grouped MoE; set to 0 to use the older v1/v2 path | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:215` |
 | `HIPFIRE_MOE_HFQ6_V2` | v2 needs HIPFIRE_MOE_HFQ6_V2=1 to route. Set if not present | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:213` |
 | `HIPFIRE_MOE_PARO_I8` | Default-on for gfx1151 since 2026-05-21: i8 MMQ +6.3% over | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:14321` |
 | `HIPFIRE_MOE_PARO_I8_K8` | Runtime variable controlling moe paro i8 k8 in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:14325` |
