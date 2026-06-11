@@ -48,7 +48,7 @@
 
 use crate::config::{Gemma4Config, LayerType, RopeType};
 use crate::gemma4::{Gemma4State, Gemma4Weights};
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::{HfqFile, load_awq_scale};
 use hipfire_runtime::llama::{f16_to_f32, weight_gemv, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -345,6 +345,11 @@ fn load_wt(
     let buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("gemma4-drafter: upload {name}: {e:?}"))?;
+    let awq_scale = if dtype.supports_awq_sidecar() {
+        load_awq_scale(hfq, gpu, name, k)
+    } else {
+        None
+    };
     Ok(WeightTensor {
         buf,
         gpu_dtype: dtype,
@@ -352,7 +357,7 @@ fn load_wt(
         k,
         row_stride: 0,
         paro: None,
-        awq_scale: None,
+        awq_scale,
     })
 }
 

@@ -18,7 +18,7 @@
 //!   • Tied LM head (embed_tokens.weight aliased).
 //!   • Embed scale: sqrt(hidden_size) multiplied onto every embedding row lookup.
 
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::{HfqFile, load_awq_scale};
 use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, WeightTensor, EmbeddingFormat};
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -668,7 +668,12 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
         )),
     };
     let buf = gpu.upload_raw(data, &[data.len()])?;
-    Ok(WeightTensor { buf, gpu_dtype: dtype, m, k, row_stride: 0, awq_scale: None, paro: None })
+    let awq_scale = if dtype.supports_awq_sidecar() {
+        load_awq_scale(hfq, gpu, name, k)
+    } else {
+        None
+    };
+    Ok(WeightTensor { buf, gpu_dtype: dtype, m, k, row_stride: 0, awq_scale, paro: None })
 }
 
 /// Load the MoE branch weights for a single Gemma 4 MoE layer (26B-A4B).

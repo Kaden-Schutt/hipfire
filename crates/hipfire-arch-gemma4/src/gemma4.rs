@@ -138,6 +138,11 @@ fn load_wt(
     let buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("gemma4: upload {name}: {e:?}"))?;
+    let awq_scale = if dtype.supports_awq_sidecar() {
+        hipfire_runtime::hfq::load_awq_scale(hfq, gpu, name, k)
+    } else {
+        None
+    };
     Ok(WeightTensor {
         buf,
         gpu_dtype: dtype,
@@ -145,7 +150,7 @@ fn load_wt(
         k,
         row_stride: 0,
         paro: None,
-        awq_scale: None,
+        awq_scale,
     })
 }
 
