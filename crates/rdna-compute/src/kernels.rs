@@ -86,6 +86,12 @@ pub const RMSNORM_GFX1151_SRC: &str =
 pub const CONV1D_SILU_SPLIT_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/conv1d_silu_split.gfx1151.hip");
 
+/// gfx1151 single-token DeltaNet decode fusion: sigmoid/alpha gate plus
+/// conv1d+SiLU+QKV split in one launch. Same math as the generic pair.
+pub const FUSED_SIGMOID_ALPHA_GATE_CONV1D_SILU_SPLIT_GFX1151_SRC: &str = include_str!(
+    "../../../kernels/src/gfx1151/fused_sigmoid_alpha_gate_conv1d_silu_split.gfx1151.hip"
+);
+
 /// HFQ2-G256: flat 2-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][64B data] = 72 bytes per 256 weights (0.28 B/w).
 pub const GEMV_HFQ2G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2g256.hip");

@@ -19768,35 +19768,27 @@ fn forward_scratch_layers(
                     trace_finite_if_enabled(gpu, "layer 0 LA w_beta", &s.dn_beta)?;
                     trace_finite_if_enabled(gpu, "layer 0 LA w_alpha", &s.dn_alpha)?;
                 }
-                // Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are
-                // elementwise scalar transforms on independent buffers of size
-                // n_v_heads — merging into one launch shaves one dispatch per LA.
-                gpu.fused_sigmoid_alpha_gate_f32(
+                // gfx1151 fuses the independent sigmoid/alpha gate with the
+                // single-token conv1d+SiLU+split below, shaving one dispatch
+                // per LA decode layer. Other arches preserve the old pair.
+                gpu.fused_sigmoid_alpha_gate_conv1d_silu_split_f32(
                     &s.dn_beta,
                     &s.dn_alpha,
                     &layer.dt_bias,
                     &layer.a_log,
-                    n_v_heads,
-                )?;
-                if layer_idx == 0 {
-                    trace_finite_if_enabled(gpu, "layer 0 LA beta", &s.dn_beta)?;
-                    trace_finite_if_enabled(gpu, "layer 0 LA alpha", &s.dn_alpha)?;
-                }
-
-                // Fused conv1d+SiLU+split: writes directly to q_raw/k_raw/v,
-                // eliminating the 3 DtoD copies that used to follow a
-                // contiguous conv1d_silu into dn_conv_out.
-                gpu.conv1d_silu_split_f32(
                     &s.dn_q_raw,
                     &s.dn_k_raw,
                     &s.dn_v,
                     &s.dn_qkv,
                     &layer.conv_weight,
                     &dn_state.conv_states[delta_layer_idx],
+                    n_v_heads,
                     k_dim,
                     v_dim,
                 )?;
                 if layer_idx == 0 {
+                    trace_finite_if_enabled(gpu, "layer 0 LA beta", &s.dn_beta)?;
+                    trace_finite_if_enabled(gpu, "layer 0 LA alpha", &s.dn_alpha)?;
                     trace_finite_if_enabled(gpu, "layer 0 LA conv q", &s.dn_q_raw)?;
                     trace_finite_if_enabled(gpu, "layer 0 LA conv k", &s.dn_k_raw)?;
                     trace_finite_if_enabled(gpu, "layer 0 LA conv v", &s.dn_v)?;
@@ -20919,20 +20911,18 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 }
-                gpu.fused_sigmoid_alpha_gate_f32(
+                gpu.fused_sigmoid_alpha_gate_conv1d_silu_split_f32(
                     &s.dn_beta,
                     &s.dn_alpha,
                     &layer.dt_bias,
                     &layer.a_log,
-                    n_v_heads,
-                )?;
-                gpu.conv1d_silu_split_f32(
                     &s.dn_q_raw,
                     &s.dn_k_raw,
                     &s.dn_v,
                     &s.dn_qkv,
                     &layer.conv_weight,
                     &dn_state.conv_states[delta_layer_idx],
+                    n_v_heads,
                     k_dim,
                     v_dim,
                 )?;
@@ -21913,20 +21903,18 @@ fn forward_scratch_layers_multi(
                         weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                         weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                     }
-                    gpu.fused_sigmoid_alpha_gate_f32(
+                    gpu.fused_sigmoid_alpha_gate_conv1d_silu_split_f32(
                         &s.dn_beta,
                         &s.dn_alpha,
                         &layer.dt_bias,
                         &layer.a_log,
-                        n_v_heads,
-                    )?;
-                    gpu.conv1d_silu_split_f32(
                         &s.dn_q_raw,
                         &s.dn_k_raw,
                         &s.dn_v,
                         &s.dn_qkv,
                         &layer.conv_weight,
                         &dn_state.conv_states[delta_layer_idx],
+                        n_v_heads,
                         k_dim,
                         v_dim,
                     )?;
@@ -22776,20 +22764,18 @@ fn forward_scratch_layers_multi(
                         weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                         weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                     }
-                    gpu.fused_sigmoid_alpha_gate_f32(
+                    gpu.fused_sigmoid_alpha_gate_conv1d_silu_split_f32(
                         &s.dn_beta,
                         &s.dn_alpha,
                         &layer.dt_bias,
                         &layer.a_log,
-                        n_v_heads,
-                    )?;
-                    gpu.conv1d_silu_split_f32(
                         &s.dn_q_raw,
                         &s.dn_k_raw,
                         &s.dn_v,
                         &s.dn_qkv,
                         &layer.conv_weight,
                         &dn_state.conv_states[delta_layer_idx],
+                        n_v_heads,
                         k_dim,
                         v_dim,
                     )?;

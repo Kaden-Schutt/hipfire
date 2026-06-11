@@ -36957,6 +36957,110 @@ impl Gpu {
         result
     }
 
+    /// gfx1151 single-token DeltaNet decode fusion. On other arches this
+    /// preserves the existing two-launch sequence.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_sigmoid_alpha_gate_conv1d_silu_split_f32(
+        &mut self,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        n_heads: usize,
+        k_dim: usize,
+        v_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1151() {
+            self.fused_sigmoid_alpha_gate_f32(beta, alpha, dt_bias, a_log, n_heads)?;
+            return self
+                .conv1d_silu_split_f32(q_out, k_out, v_out, input, weight, state, k_dim, v_dim);
+        }
+
+        let kernel_name = "fused_sigmoid_alpha_gate_conv1d_silu_split_f32_gfx1151";
+        self.ensure_kernel(
+            "fused_sigmoid_alpha_gate_conv1d_silu_split_gfx1151",
+            kernels::FUSED_SIGMOID_ALPHA_GATE_CONV1D_SILU_SPLIT_GFX1151_SRC,
+            kernel_name,
+        )?;
+
+        let bp = beta.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let dp = dt_bias.buf.as_ptr();
+        let lp = a_log.buf.as_ptr();
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let nh = n_heads as i32;
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &bp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+        ];
+        let n_channels = 2 * k_dim + v_dim;
+        let elems = n_channels.max(n_heads);
+        let block = 256u32;
+        let grid = ((elems as u32) + block - 1) / block;
+        let bytes = n_heads * 4 * 4 + crate::profile::conv1d_silu_bytes(n_channels);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "fused_sigmoid_alpha_gate_conv1d_silu_split_f32_gfx1151",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(bp);
+                b.push_ptr(ap);
+                b.push_ptr(dp);
+                b.push_ptr(lp);
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_i32(nh);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Fused L2-norm(Q) + L2-norm(K) + scale(Q). Replaces three back-to-back
     /// launches in DeltaNet's attention path with one — ~2 launches saved per
     /// linear-attention layer, so on Qwen3.5 (18-32 LA layers) we shave ~36-64
@@ -37178,31 +37282,42 @@ impl Gpu {
             kernels::CONV1D_DECODE_SRC,
             "conv1d_decode_f32",
         )?;
-        let func = &self.functions["conv1d_decode_f32"];
-        let mut op = output.buf.as_ptr();
-        let mut ip = input.buf.as_ptr();
-        let mut wp = weight.buf.as_ptr();
-        let mut sp = state.buf.as_ptr();
-        let mut nc = n_channels as i32;
+        let op = output.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let nc = n_channels as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut op as *mut _ as *mut c_void,
-            &mut ip as *mut _ as *mut c_void,
-            &mut wp as *mut _ as *mut c_void,
-            &mut sp as *mut _ as *mut c_void,
-            &mut nc as *mut _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nc as *const _ as *mut c_void,
         ];
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
+        let bytes = n_channels * 4 * 6;
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_decode_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "conv1d_decode_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(op);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_i32(nc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
     }
 
     /// LFM2 LIV double-gated short-conv, single-token decode. Reads the in_proj
