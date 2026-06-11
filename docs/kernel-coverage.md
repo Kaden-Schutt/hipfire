@@ -59,7 +59,7 @@ gfx1151 now routes HFQ4/MQ4 decode GEMV through the RDNA3 single-row and multi-r
 
 | Kernel group | gfx906 | gfx942 | gfx1030 | gfx1100 | gfx1151 | gfx12 |
 |---|---|---|---|---|---|---|
-| gemm residual hfq4g256 | **tuned** (x8–x64) | **tuned** (mfma v1–v4) | **tuned** (mmq x8–x32) | — | standard (wmma mb4) | **tuned** (wmma) |
+| gemm residual hfq4g256 | **tuned** (x8–x64) | **tuned** (mfma v1–v4) | **tuned** (mmq x8–x32) | — | standard (mmq x16/x32_y64) | **tuned** (wmma) |
 | gemm residual hfq3g256 | — | — | **tuned** (mmq x8–x32) | — | — | standard (wmma) |
 | gemm residual hfq6g256 | — | — | — | — | — | standard (wmma) |
 | gemm residual mq4g256 | — | — | — | — | standard (wmma) | standard (wmma) |
@@ -79,6 +79,12 @@ gfx1151 now routes HFQ4/MQ4 decode GEMV through the RDNA3 single-row and multi-r
 | gemm qkv hfp4g32 | — | — | — | — | — | standard (wmma+fp8) |
 | gemm lmhead hfq4g256 | — | — | — | — | — | basic |
 | gemm bf16 | — | standard (mfma) | — | — | standard (wmma) | — |
+
+gfx1151 HFQ4-G256 one-wave i8 WMMA: `HIPFIRE_HFQ4G256_MMQ_GFX1151=1`
+routes aligned set/residual projections through a 16x16 one-wave IU8 WMMA
+probe. On Qwen3.5-9B MQ4 pp256 it regressed profiled GEMM time
+(`set` 161.4 ms vs 134.6 ms, `add` 85.9 ms vs 61.9 ms), so the existing
+MMQ x16/x32_y64 path remains the default.
 
 ### MoE grouped GEMM
 

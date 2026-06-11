@@ -57,6 +57,12 @@ pub const GEMM_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4
 pub const GEMM_HFQ4G128_MMQ_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/gemm_hfq4g128_mmq.gfx1151.hip");
 
+/// HFQ4-G256 i8 WMMA MMQ (non-grouped) for gfx1151. One wave32 computes a
+/// 16-row x 16-token tile, mirroring the G128 gfx1151 fast path while keeping
+/// the G256 136-byte group layout.
+pub const GEMM_HFQ4G256_MMQ_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gemm_hfq4g256_mmq.gfx1151.hip");
+
 /// HFQ2-G256: flat 2-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][64B data] = 72 bytes per 256 weights (0.28 B/w).
 pub const GEMV_HFQ2G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2g256.hip");

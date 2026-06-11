@@ -22065,6 +22065,9 @@ impl Gpu {
         // so narrow-batch calls pick mmq_x=16 and long-prefill picks
         // mmq_x=32_y64 (MQ3 phase-2 finding). All variants clamp M-tail
         // internally, so no alignment check needed.
+        if self.hfq4g256_mmq_gfx1151_enabled(m, k, batch_size) {
+            return self.gemm_hfq4g256_mmq_gfx1151(a_raw, x, y, m, k, batch_size, true);
+        }
         if batch_size > 1 && self.arch_caps.has_hfq4_mmq() {
             return self.gemm_hfq4g256_residual_mmq_rdna2_auto(a_raw, x, y, m, k, batch_size);
         }
@@ -22776,6 +22779,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.hfq4g256_mmq_gfx1151_enabled(m, k, batch_size) {
+            return self.gemm_hfq4g256_mmq_gfx1151(a_raw, x, y, m, k, batch_size, true);
+        }
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
         let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
             "gemm_hfq4g256_residual_mmq_full_add"
@@ -23477,6 +23483,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.hfq4g256_mmq_gfx1151_enabled(m, k, batch_size) {
+            return self.gemm_hfq4g256_mmq_gfx1151(a_raw, x, y, m, k, batch_size, false);
+        }
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
         let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
             "gemm_hfq4g256_residual_mmq_full_set"
@@ -23561,6 +23570,10 @@ impl Gpu {
                  callers should route to gemm_hfq4g256_residual_mmq_gfx906 directly",
             ));
         }
+        if self.hfq4g256_mmq_gfx1151_enabled(m, k, batch_size) {
+            return self
+                .gemm_hfq4g256_mmq_gfx1151_prequant(a_raw, x_q8_ptr, y, m, k, batch_size, false);
+        }
         let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
             "gemm_hfq4g256_residual_mmq_full_set"
         } else {
@@ -23610,6 +23623,97 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr);
                 b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    fn hfq4g256_mmq_gfx1151_enabled(&self, m: usize, k: usize, batch_size: usize) -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let enabled = *ENABLED
+            .get_or_init(|| std::env::var("HIPFIRE_HFQ4G256_MMQ_GFX1151").as_deref() == Ok("1"));
+        enabled
+            && self.arch.starts_with("gfx1151")
+            && batch_size >= 16
+            && batch_size % 16 == 0
+            && m % 16 == 0
+            && k % 256 == 0
+    }
+
+    fn gemm_hfq4g256_mmq_gfx1151(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        self.gemm_hfq4g256_mmq_gfx1151_prequant(a_raw, x_q8_ptr, y, m, k, batch_size, add)
+    }
+
+    fn gemm_hfq4g256_mmq_gfx1151_prequant(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_mmq_gfx1151",
+            kernels::GEMM_HFQ4G256_MMQ_GFX1151_SRC,
+            "gemm_hfq4g256_mmq_gfx1151",
+        )?;
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
+        let add_val = if add { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_q8_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &add_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k
+            + batch_size * m * 4 * if add { 2 } else { 1 };
+        let label = if add {
+            "gemm_hfq4g256_mmq_gfx1151_add"
+        } else {
+            "gemm_hfq4g256_mmq_gfx1151_set"
+        };
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", label, bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_mmq_gfx1151",
+            [(m / 16) as u32, (batch_size / 16) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_q8_ptr);
                 b.push_ptr(y_ptr);
                 b.push_i32(m_val);
                 b.push_i32(k_val);
