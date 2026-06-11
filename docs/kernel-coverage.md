@@ -45,15 +45,15 @@ These kernels are shared by all model families.
 
 | Kernel group | gfx906 | gfx942 | gfx1030 | gfx1100 | gfx1151 | gfx12 |
 |---|---|---|---|---|---|---|
-| gemv hfq4g256 | — | standard | **tuned** (v1–v5) | standard | **—** ⚠️ | — |
-| gemv hfq4g256 multirow | — | — | — | standard | — | — |
+| gemv hfq4g256 | — | standard | **tuned** (v1–v5) | standard | standard | — |
+| gemv hfq4g256 multirow | — | — | — | standard | standard (R=2 default) | — |
 | gemv hfq3g256 | — | — | — | standard | — | — |
 | gemv mq4g256 lloyd | — | — | — | **tuned** (multiacc_diag) | — | — |
 | gemv mq3g256 lloyd | — | — | — | standard | — | — |
 | gemv hfp4g32 | — | — | — | basic | — | basic (fp8 path) |
 | gemv hfq6g256 | — | — | — | — | — | basic |
 
-**gfx1151 has no decode GEMV variants at all.** The UMA bandwidth budget (~89 GB/s) is far tighter than a discrete GPU; this is the single largest performance gap on the dev machine.
+gfx1151 now routes HFQ4/MQ4 decode GEMV through the RDNA3 single-row and multi-row sources rather than the generic fallback. The R=2 multi-row path is staged by default on gfx115x APUs; early 9B pp32/gen50 A/B was flat within noise, so larger decode-shape tuning remains open.
 
 ### GEMM — prefill projection (compute-bound)
 
@@ -197,7 +197,7 @@ Ordered by estimated decode-path impact on active hardware.
 
 | Priority | Gap | Arch | Reason |
 |---|---|---|---|
-| 1 | GEMV decode (mq4g256, hfq4g256) | gfx1151 | No GEMV at all on dev machine; falls back to generic F32 widen+compute |
+| 1 | GEMV decode (mq4g256, hfq4g256) | gfx1151 | RDNA3 R=2 path is wired, but measured flat so further decode-shape tuning remains open |
 | 2 | fused_rmsnorm_mq_rotate BF16 | gfx1151 | Called before every GEMV; widening weight overhead not hidden by UMA bandwidth |
 | 3 | conv1d + fused_sigmoid_alpha_gate BF16 | gfx1151 | Every DeltaNet layer; Qwen3.5 is the primary gfx1151 model |
 | 4 | hc_sinkhorn_4x4 + hc_mix_4stream | gfx942 | Every forward pass layer in DeepSeek4; MFMA available but unused |

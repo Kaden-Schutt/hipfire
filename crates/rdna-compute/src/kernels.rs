@@ -2055,7 +2055,9 @@ pub fn gemv_hfq4g256_for_arch(
                 _ => (GEMV_HFQ4G256_GFX1030_V1_SRC, "gemv_hfq4g256_rdna2v1"),
             }
         }
-        "gfx1100" | "gfx1101" | "gfx1102" => (GEMV_HFQ4G256_GFX1100_SRC, "gemv_hfq4g256_rdna3"),
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1152" => {
+            (GEMV_HFQ4G256_GFX1100_SRC, "gemv_hfq4g256_rdna3")
+        }
         // RDNA4 variants (existing)
         // "gfx1200" | "gfx1201" => ...,
         _ => (GEMV_HFQ4G256_SRC, "gemv_hfq4g256"), // gfx1010 baseline
@@ -2085,7 +2087,7 @@ pub fn gemv_hfp4g32_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
 pub fn gemv_hfq4g256_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
     let arch = caps.arch();
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" => (
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1152" => (
             GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC,
             "gemv_hfq4g256_residual_rdna3",
         ),

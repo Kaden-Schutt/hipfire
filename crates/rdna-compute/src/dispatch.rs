@@ -9508,22 +9508,22 @@ impl Gpu {
         };
 
         // Multi-row GEMV: one warp computes R output rows, sharing x register
-        // state across rows. Per-arch default picks R=1 on RDNA3 (negative)
-        // and RDNA2 (has its own arch-specific narrow path), R=2 on the
-        // default gfx1010-baseline path (gfx1010, gfx1013 Cyan Skillfish,
-        // etc.). Override any arch with HIPFIRE_GEMV_ROWS ∈ {1, 2, 4, 8}.
+        // state across rows. Per-arch default picks R=1 on RDNA3 dGPU
+        // (negative) and RDNA2 (has its own arch-specific narrow path), R=2
+        // on lower-bandwidth RDNA3.5 APUs and the default gfx1010-baseline
+        // path (gfx1010, gfx1013 Cyan Skillfish, etc.). Override any arch
+        // with HIPFIRE_GEMV_ROWS in {1, 2, 4, 8}.
         //
         // See gemv_rows_default() for the measurement data that motivates
         // the per-arch defaults.
-        let rdna3 = self.arch_caps.is_rdna3_dgpu();
+        let rdna3 = self.arch_caps.is_rdna3();
         let rows = self.arch_caps.gemv_rows_default();
         let use_multirow = rows > 1;
 
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
         // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
-        let use_wide = !use_multirow
-            && m >= 64
-            && !(self.arch_caps.is_rdna2() || self.arch_caps.is_rdna3_dgpu());
+        let use_wide =
+            !use_multirow && m >= 64 && !(self.arch_caps.is_rdna2() || self.arch_caps.is_rdna3());
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256", bytes);
@@ -17403,15 +17403,13 @@ impl Gpu {
         // half the wave masks out per `__shfl_down`. Byte-exact with base.
         let cdna3 = self.arch_caps.is_wave64_native();
 
-        // RDNA3 multi-row override path. Same selector as the non-residual
-        // variant but there's currently no gfx1010-default multi-row residual
-        // kernel, so non-RDNA3 archs still take the single-row residual path
-        // regardless of HIPFIRE_GEMV_ROWS. (TODO: port the multi-row residual
-        // kernel to the default path if/when the non-residual multi-row wins
-        // scale to justify residual too.)
-        let rdna3 = self.arch_caps.is_rdna3_dgpu();
+        // RDNA3 multi-row path. gfx1100 dGPU defaults to R=1 from measured
+        // regressions; gfx115x APUs default to R=2 unless HIPFIRE_GEMV_ROWS
+        // overrides it. Non-RDNA3 archs still take the single-row residual
+        // path because only the RDNA3 residual multi-row source exists.
+        let rdna3 = self.arch_caps.is_rdna3();
         let rows = if rdna3 {
-            self.flags.gemv_rows.unwrap_or(1)
+            self.arch_caps.gemv_rows_default()
         } else {
             1
         };
@@ -40112,11 +40110,11 @@ impl Gpu {
                         kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC.to_string(),
                     ));
                 }
-                // gfx1100 multi-row GEMV is opt-in via HIPFIRE_GEMV_ROWS={2,4,8}.
-                // Empirically slower than the single-row kernel on gfx1100 at all
-                // tested matrix sizes (see commit log / multi-row kernel header),
-                // so we only precompile when the env var explicitly requests it.
-                if self.arch_caps.is_rdna3_dgpu() && self.flags.gemv_rows.unwrap_or(1) > 1 {
+                // RDNA3 multi-row GEMV is opt-in on dGPU via
+                // HIPFIRE_GEMV_ROWS={2,4,8}, but default-on at R=2 for
+                // lower-bandwidth gfx115x APUs. Precompile whenever the
+                // effective row selector asks for it.
+                if self.arch_caps.is_rdna3() && self.arch_caps.gemv_rows_default() > 1 {
                     specs.push((
                         "gemv_hfq4g256_multirow_rdna3",
                         kernels::GEMV_HFQ4G256_MULTIROW_GFX1100_SRC.to_string(),
@@ -40202,6 +40200,16 @@ impl Gpu {
                     specs.push((
                         "gemv_hfq4g256_moe_down_indexed_batched_wave64",
                         kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC.to_string(),
+                    ));
+                }
+                if self.arch_caps.is_rdna3() && self.arch_caps.gemv_rows_default() > 1 {
+                    specs.push((
+                        "gemv_hfq4g256_multirow_rdna3",
+                        kernels::GEMV_HFQ4G256_MULTIROW_GFX1100_SRC.to_string(),
+                    ));
+                    specs.push((
+                        "gemv_hfq4g256_residual_multirow_rdna3",
+                        kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC.to_string(),
                     ));
                 }
             }
