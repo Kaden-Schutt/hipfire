@@ -12639,7 +12639,8 @@ fn trace_stage_sync_if_enabled(gpu: &Gpu, label: &str) -> HipResult<()> {
 ///   inline below).
 /// - shared_expert.gate AND .up: same dtype; the fused gate+up kernel
 ///   handles one storage layout per call.
-/// - shared_expert.down: same dtype as shared gate/up for now.
+/// - shared_expert.down: independently dispatchable; it may differ from
+///   shared gate/up as long as its dtype is supported.
 /// - experts.gate_up: uniform across all experts in this layer.
 /// - experts.down: same dtype as experts.gate_up and uniform across experts.
 ///
@@ -12869,24 +12870,27 @@ fn moe_ffn_batched_admissible_for_dtypes(
     }
 
     let shared_gu_one_dtype = dtypes.shared_expert_up == dtypes.shared_expert_gate;
-    let shared_one_dtype =
-        shared_gu_one_dtype && dtypes.shared_expert_down == dtypes.shared_expert_gate;
     let experts_one_dtype = dtypes.expert_down == dtypes.expert_gate_up;
-    if !(shared_one_dtype && experts_one_dtype) {
+    if !(shared_gu_one_dtype && experts_one_dtype) {
         return false;
     }
 
-    let shared_supported =
+    let shared_gate_up_supported =
         moe_prefill_quant_family_supported_for_arch(dtypes.shared_expert_gate, arch)
             || moe_prefill_full_precision_shared_dtype_supported(dtypes.shared_expert_gate, arch);
+    let shared_down_supported =
+        moe_prefill_quant_family_supported_for_arch(dtypes.shared_expert_down, arch)
+            || moe_prefill_full_precision_shared_dtype_supported(dtypes.shared_expert_down, arch);
     let routed_supported = moe_prefill_quant_family_supported_for_arch(dtypes.expert_gate_up, arch)
         || moe_prefill_full_precision_routed_dtype_supported(dtypes.expert_gate_up, arch);
-    if !shared_supported || !routed_supported {
+    if !shared_gate_up_supported || !shared_down_supported || !routed_supported {
         return false;
     }
 
-    dtypes.shared_expert_gate == dtypes.expert_gate_up
-        || moe_grouped_gemm_supported_for_dtype(dtypes.expert_gate_up, arch)
+    let shared_matches_routed = dtypes.shared_expert_gate == dtypes.expert_gate_up
+        && dtypes.shared_expert_down == dtypes.expert_down;
+
+    shared_matches_routed || moe_grouped_gemm_supported_for_dtype(dtypes.expert_gate_up, arch)
 }
 
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
@@ -12978,7 +12982,15 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, arch: &str) -> bool {
         paro_batched_admit_enabled_from_env(std::env::var("HIPFIRE_PARO_BATCHED").ok().as_deref())
     });
 
-    moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_paro, arch)
+    if !moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_paro, arch) {
+        return false;
+    }
+
+    // Mixed shared/routed MQ-family layers need to rotate the normalized input
+    // a second time using an actual routed gate_up tensor as representative.
+    // Paged expert mode has dtype metadata only here, so keep it on the
+    // established fallback until page-level AWQ representatives are exposed.
+    !(ffn.experts.is_empty() && moe_prefill_needs_routed_gate_up_reprojection(&dtypes))
 }
 
 fn moe_prefill_quant_family_supported_for_arch(dtype: DType, arch: &str) -> bool {
@@ -13026,6 +13038,46 @@ fn moe_grouped_gemm_path2_required_for_dtype(dtype: DType) -> bool {
 fn moe_grouped_gemm_path2_eligible_for_dtype(dtype: DType, arch: &str, use_path2: bool) -> bool {
     (use_path2 || moe_grouped_gemm_path2_required_for_dtype(dtype))
         && moe_grouped_gemm_supported_for_dtype(dtype, arch)
+}
+
+fn moe_prefill_mq_family_uses_prerotation(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::MQ2G256
+            | DType::MQ3G256
+            | DType::MQ4G256
+            | DType::MQ6G256
+            | DType::MQ8G256
+            | DType::MQ2G256Lloyd
+            | DType::MQ3G256Lloyd
+    )
+}
+
+fn moe_prefill_needs_routed_gate_up_reprojection(dtypes: &MoePrefillDtypes) -> bool {
+    dtypes.expert_gate_up != dtypes.shared_expert_gate
+        && moe_prefill_mq_family_uses_prerotation(dtypes.expert_gate_up)
+}
+
+fn moe_prefill_prepare_routed_gate_up_input(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    dtypes: &MoePrefillDtypes,
+    x_norm_batch: &GpuTensor,
+    x_rot_batch: &GpuTensor,
+    dim: usize,
+    n: usize,
+) -> HipResult<()> {
+    if !moe_prefill_needs_routed_gate_up_reprojection(dtypes) {
+        return Ok(());
+    }
+
+    let Some(representative) = ffn.experts.first().map(|e| &e.gate_up) else {
+        return Err(HipError::new(
+            0,
+            "mixed-dtype paged MoE prefill needs a routed gate_up representative",
+        ));
+    };
+    rotate_x_mq_batched_for(gpu, representative, x_norm_batch, x_rot_batch, dim, n)
 }
 
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
@@ -13705,6 +13757,15 @@ fn prefill_moe_ffn_body_batched(
             "paged grouped-MoE prefill requires grouped GEMM path2 support",
         ));
     }
+    moe_prefill_prepare_routed_gate_up_input(
+        gpu,
+        ffn,
+        &dtypes,
+        &pbs.x_norm_batch,
+        &pbs.x_rot_batch,
+        dim,
+        n,
+    )?;
     if path2_eligible {
         // Stage 1 scatter pipeline. The scratch buffers are sized for
         // worst-case max_batch. Runtime launch bounds use the tighter live
@@ -25220,6 +25281,31 @@ mod tests {
     }
 
     #[test]
+    fn moe_prefill_admits_a10b_shared_mq4_down_and_routed_mq6_on_gfx1151() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        dtypes.shared_expert_gate = DType::MQ4G256;
+        dtypes.shared_expert_up = DType::MQ4G256;
+        dtypes.shared_expert_down = DType::MQ6G256;
+        dtypes.expert_gate_up = DType::MQ6G256;
+        dtypes.expert_down = DType::MQ6G256;
+
+        assert!(
+            moe_ffn_batched_admissible_for_dtypes(&dtypes, false, "gfx1151"),
+            "Qwen3.5-122B-A10B mixed MQ4 shared gate/up plus MQ6 routed layers should admit on gfx1151"
+        );
+        assert!(
+            moe_prefill_needs_routed_gate_up_reprojection(&dtypes),
+            "mixed shared/routed MQ-family layers must refresh x_rot_batch before routed gate_up"
+        );
+        assert!(
+            !moe_ffn_batched_admissible_for_dtypes(&dtypes, false, "gfx1100"),
+            "MQ6 routed grouped GEMM is not wired on gfx1100"
+        );
+    }
+
+    #[test]
     fn moe_decode_routes_mq6_indexed_path_for_k8() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ6G256);
         dtypes.router = DType::Q8_0;
@@ -25575,6 +25661,23 @@ mod tests {
         dtypes.shared_expert_up = DType::MQ6G256;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
             &dtypes, false, "gfx1201"
+        ));
+    }
+
+    #[test]
+    fn moe_prefill_shared_down_may_differ_when_routed_grouped_gemm_exists() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.router = DType::Q8_0;
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        dtypes.shared_expert_down = DType::MQ6G256;
+        dtypes.expert_gate_up = DType::MQ6G256;
+        dtypes.expert_down = DType::MQ6G256;
+
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1151"
+        ));
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, "gfx1100"
         ));
     }
 
