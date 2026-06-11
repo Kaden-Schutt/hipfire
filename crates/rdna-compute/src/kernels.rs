@@ -1357,6 +1357,8 @@ pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
 /// Gated on `HIPFIRE_MOE_HFQ6_V2=1` (default off).
 pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gfx12/gemm_hfq6g256_moe_grouped_wmma_v2.gfx12.hip");
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gemm_hfq6g256_moe_grouped_wmma_v2.gfx1151.hip");
 
 /// gfx12/gfx1151 HFQ3/MQ3 sister of the HFQ4 grouped MoE WMMA kernels.
 /// Same WMMA tile geometry + expert_tile_ids sentinel pattern + kernarg

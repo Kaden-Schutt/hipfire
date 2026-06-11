@@ -21194,7 +21194,13 @@ impl Gpu {
         // restrided. The slot tile stride stays at 16 so expert-boundary
         // safety is unchanged from v1.
         let use_v2 = self.flags.moe_hfq6_v2;
-        let (kernel_name, kernel_src, row_tile_stride) = if self.arch == "gfx1151" {
+        let (kernel_name, kernel_src, row_tile_stride) = if self.arch == "gfx1151" && use_v2 {
+            (
+                "gemm_hfq6g256_moe_grouped_wmma_v2_gfx1151",
+                kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX1151_SRC,
+                32usize,
+            )
+        } else if self.arch == "gfx1151" {
             (
                 "gemm_hfq6g256_moe_grouped_wmma_gfx1151",
                 kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX1151_SRC,

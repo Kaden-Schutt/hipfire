@@ -1,5 +1,5 @@
 //! Byte-equivalent CPU/GPU correctness check for
-//! `gemm_hfq6g256_moe_grouped_wmma_v2_gfx12` (M-direction 2×1 reg-block).
+//! `gemm_hfq6g256_moe_grouped_wmma_v2_*` (M-direction 2×1 reg-block).
 //!
 //! Mirrors `test_moe_grouped_wmma_hfq6.rs` but sets HIPFIRE_MOE_HFQ6_V2=1
 //! so the dispatcher routes to the v2 kernel. Same CPU reference, same
@@ -11,7 +11,7 @@
 //! single A-row path. Empirical bound on the a3b-slice case is ~1e-3
 //! abs — well within the 5e-3 cushion.
 //!
-//! GFX12 ONLY. Skips on non-gfx12 archs with a SKIP message.
+//! Runs on gfx12 and gfx1151. Skips on other archs with a SKIP message.
 //!
 //! Run:
 //!   HIPFIRE_MOE_HFQ6_V2=1 cargo run --release -p rdna-compute --example test_moe_grouped_wmma_hfq6_v2
@@ -317,9 +317,9 @@ fn run_case(
 
     let mut gpu = Gpu::init().expect("Gpu::init");
     let arch = gpu.arch.clone();
-    if !arch.starts_with("gfx12") {
+    if !arch.starts_with("gfx12") && arch != "gfx1151" {
         println!(
-            "  SKIP — arch {} is not gfx12; HFQ6 v2 kernel only registered for gfx12",
+            "  SKIP — arch {} is not gfx12/gfx1151; HFQ6 v2 kernel only registered for those archs",
             arch
         );
         return;
