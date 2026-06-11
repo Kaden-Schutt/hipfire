@@ -2199,6 +2199,11 @@ pub const GEMM_GATE_UP_Q8_0_WMMA_SRC: &str =
 pub const GEMM_Q8_0_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.hip");
 
+/// gfx1151 4-warp 64x64 Q8_0 residual GEMM.
+/// LDS-stages X and preserves `Y += X @ A^T` semantics.
+pub const GEMM_Q8_0_RESIDUAL_WMMA_4W_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gemm_q8_0_residual_wmma_4w.gfx1151.hip");
+
 // gfx12 (RDNA4) sister of GEMM_QKV_Q8_0_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
 // and half8_t operands (vs half16_t). Lane-grp K split (tid>>4 selects

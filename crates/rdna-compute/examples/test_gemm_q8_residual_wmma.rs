@@ -86,6 +86,27 @@ fn main() {
                 "  N={n:4}  {mark}   mean_rel={:.2e}  max_rel={:.2e}",
                 s.mean_rel, s.max_rel
             );
+
+            if arch == "gfx1151" && n % 64 == 0 {
+                let d_y_4w = gpu.upload_f32(&r_host[..n * m], &[n * m]).unwrap();
+                gpu.gemm_q8_0_residual_wmma_4w_gfx1151(&d_a, &x_n, &d_y_4w, m, k, n)
+                    .unwrap();
+                let s4 = compare(
+                    &gpu.download_f32(&d_y_4w).unwrap(),
+                    &gpu.download_f32(&d_y_ref).unwrap(),
+                );
+                let pass4 = s4.mean_rel < 2e-3 && s4.max_rel < 3.5e-2;
+                let mark4 = if pass4 {
+                    "PASS"
+                } else {
+                    total_fail += 1;
+                    "FAIL"
+                };
+                eprintln!(
+                    "          4w {mark4} mean_rel={:.2e}  max_rel={:.2e}",
+                    s4.mean_rel, s4.max_rel
+                );
+            }
         }
     }
     eprintln!("\n=== {total_fail} failure(s) ===");
