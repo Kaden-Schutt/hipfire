@@ -230,6 +230,25 @@ fn f32_to_f16(val: f32) -> u16 {
     ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
 }
 
+/// Gemma4 per-tensor F16-keep ablation knob.
+///
+/// Reads `HIPFIRE_GEMMA4_F16_KEEP` (comma-separated substrings, e.g.
+/// `"embed,down_proj"`). Returns true if `name` contains any of the
+/// comma-separated tokens, meaning that tensor should be emitted as raw
+/// F16 rather than quantized. Lets us ablate the quant loss of specific
+/// tensor groups (embeddings, down_proj, etc.) to localize accuracy
+/// regressions. Empty/unset env => always false (no-op).
+fn gemma4_f16_keep(name: &str) -> bool {
+    match std::env::var("HIPFIRE_GEMMA4_F16_KEEP") {
+        Ok(spec) => spec
+            .split(",")
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .any(|tok| name.contains(tok)),
+        Err(_) => false,
+    }
+}
+
 /// Convert raw tensor bytes to F32 based on dtype string
 fn to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
     match dtype {
@@ -6770,7 +6789,16 @@ fn main() {
                     // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
                     let is_embed = name.contains("embed_tokens");
 
-                    if use_hfq_mixed {
+                    if gemma4_f16_keep(name) {
+                        // F16-KEEP ablation knob (HIPFIRE_GEMMA4_F16_KEEP): emit
+                        // this tensor as raw F16 instead of quantizing. Mirrors the
+                        // QuantLevel::F16 emit above.
+                        let f16_bytes: Vec<u8> = f32_data
+                            .iter()
+                            .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                            .collect();
+                        (f16_bytes, QuantType::F16, 0u32, "F16-KEEP")
+                    } else if use_hfq_mixed {
                         // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
                         let is_ffn = name.contains("mlp.") || name.contains("ffn");
                         if !is_ffn {
