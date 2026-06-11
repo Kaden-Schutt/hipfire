@@ -135,7 +135,9 @@ fn main() {
         .filter_map(|e| e.ok()).map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |x| x == "hfhs")).collect();
     paths.sort();
-    let uniq_min = 0.20f32;
+    // pure-greedy corpora loop legitimately (production spec-decode is greedy);
+    // filter only the fully-degenerate tail. Env-tunable.
+    let uniq_min: f32 = std::env::var("HIPFIRE_UNIQ_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.05);
     let mut seqs = Vec::new();
     let mut skipped = 0;
     for hp in &paths {
@@ -188,7 +190,12 @@ fn main() {
     let m_state = zeros_like(&mut gpu, &net);
     let v_state = zeros_like(&mut gpu, &net);
 
-    let bsz = 16usize; let n_ctx = 32usize; let mask_id = 0usize; let gamma = 8.0f32;
+    // z-lab protocol: mask token 248070, long context (env-tunable; rung-0
+    // showed 32 was crippling). Default 256.
+    let bsz = 16usize;
+    let n_ctx: usize = std::env::var("HIPFIRE_TRAIN_NCTX").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+    let mask_id = 248070usize; let gamma = 8.0f32;
+    eprintln!("protocol: n_ctx={n_ctx} mask_id={mask_id}");
     let warmup = (steps / 60).max(500).min(1500);
     let (b1, b2, eps_a, wd) = (0.9f32, 0.999f32, 1e-8f32, 0.01f32);
     // seed-anchor: position 0 is the revealed seed (weight 0); predict 1..B with w_k
