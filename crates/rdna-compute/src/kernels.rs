@@ -1285,6 +1285,15 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K4_GFX1151_SRC: &str =
 pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K8_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/gemm_hfq4g256_moe_grouped_mmq_k8.gfx1151.hip");
 
+/// 4-warp X-staged sibling of GEMM_HFQ4G256_MOE_GROUPED_MMQ_K8_GFX1151_SRC.
+/// Each block covers 64 M-rows x 16 routed slots and stages one Q8_1
+/// activation block per slot in LDS, sharing it across four row-warps.
+/// Opt-in via `HIPFIRE_MOE_GROUPED_I8_4W=1`. Default off: the 2026-06-12
+/// gfx1151 A3B/122B profiles showed this LDS-staged variant regresses the
+/// shipped k8 path despite bit-identical output.
+pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K8_4W_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gemm_hfq4g256_moe_grouped_mmq_k8_4w.gfx1151.hip");
+
 /// gfx12 (RDNA4 — R9700/gfx1201, gfx1200) i8 MMQ variant of MOE_GROUPED_WMMA.
 /// Uses the gfx12-specific i8 WMMA intrinsic
 /// (`wmma_i32_16x16x16_iu8_w32_gfx12`). X pre-quantized to Q8_1 via

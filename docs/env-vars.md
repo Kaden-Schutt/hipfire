@@ -215,6 +215,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_MODEL` | Pre-warm: load default model and compile kernels before accepting requests | `/home/sadara/.hipfire/src/cli/index.ts:3320` |
 | `HIPFIRE_MOE_GROUPED_GEMM` | GEMV path. Opt out with "HIPFIRE_MOE_GROUPED_GEMM=0" | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:13742` |
 | `HIPFIRE_MOE_GROUPED_I8` | Run FP16 reference (i8 disabled) | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:199` |
+| `HIPFIRE_MOE_GROUPED_I8_4W` | Experimental gfx1151 HFQ4 grouped MoE k8 4w variant; default off after A3B/122B regression vs k8 | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:205` |
 | `HIPFIRE_MOE_GROUPED_I8_K4` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:209` |
 | `HIPFIRE_MOE_GROUPED_I8_K4_GFX12` | Runtime variable controlling moe grouped i8 k4 gfx12 in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:210` |
 | `HIPFIRE_MOE_GROUPED_I8_K8` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:207` |

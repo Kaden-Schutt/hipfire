@@ -1,12 +1,10 @@
-//! Tolerance-bounded A/B validation: gemm_hfq4g256_moe_grouped_mmq_k8_gfx1151
-//! against gemm_hfq4g256_moe_grouped_wmma_k2 (the FP16 grouped base).
+//! Parity validation for gemm_hfq4g256_moe_grouped_mmq_k8_gfx1151 and
+//! gemm_hfq4g256_moe_grouped_mmq_k8_4w_gfx1151.
 //!
-//! The k8 path quantizes X to Q8_1 (7-bit signed int + per-32-element
-//! scale), so outputs differ within the Q8_1 quantization noise envelope.
-//! Output is numerically equivalent to the k2/k4 i8 paths modulo summation
-//! order in integer WMMA reductions (commutative; integer addition is exact).
-//! Expected relative error is ~1-3%; we use the same conservative rtol/atol
-//! as the k4 channel test.
+//! The wrapper path is called first to exercise current gfx1151 defaults, then
+//! the direct k8 and k8_4w entry points are checked for bit-identical output.
+//! This catches routed-slot, padding, LDS-copy, and gfx11 C-mapping mistakes
+//! in the 4w variant.
 //!
 //! GFX1151 ONLY. Skips with a clear message on other archs.
 //!
@@ -184,25 +182,29 @@ fn run_case(
     let x_f32 = build_x_f32(x_src_rows, k, seed_x);
     let x_src = upload_f32(&mut gpu, &x_f32);
 
-    let y_fp16 = alloc_f32_zeros(&mut gpu, m_total * m);
+    let y_default = alloc_f32_zeros(&mut gpu, m_total * m);
     let y_i8_k8 = alloc_f32_zeros(&mut gpu, m_total * m);
+    let y_i8_k8_4w = alloc_f32_zeros(&mut gpu, m_total * m);
 
-    // Run FP16 reference (i8 disabled).
-    std::env::set_var("HIPFIRE_MOE_GROUPED_I8", "0");
+    // Run the current wrapper default first. Feature flags are resolved at
+    // Gpu::init(), so this intentionally validates the production route rather
+    // than trying to mutate env vars mid-test.
     gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
         &expert_weight_ptrs,
         &expert_tile_ids,
         &sorted_slot_index,
         &x_src,
-        &y_fp16,
+        &y_default,
         m,
         k,
         x_row_div,
         m_total,
         x_src_rows,
     )
-    .expect("FP16 kernel launch");
-    gpu.hip.device_synchronize().expect("sync after FP16");
+    .expect("default wrapper launch");
+    gpu.hip
+        .device_synchronize()
+        .expect("sync after default wrapper");
 
     // Run i8 MMQ k8 path (gated to gfx1151 only — explicit direct call so
     // the test is robust to whether the wrapper dispatch sets defaults).
@@ -220,54 +222,60 @@ fn run_case(
     )
     .expect("i8 MMQ k8 kernel launch");
     gpu.hip.device_synchronize().expect("sync after i8 MMQ k8");
-    std::env::remove_var("HIPFIRE_MOE_GROUPED_I8");
 
-    let y_fp16_v = download_f32(&gpu, &y_fp16, m_total * m);
+    gpu.gemm_hfq4g256_moe_grouped_mmq_k8_4w_gfx1151(
+        &expert_weight_ptrs,
+        &expert_tile_ids,
+        &sorted_slot_index,
+        &x_src,
+        &y_i8_k8_4w,
+        m,
+        k,
+        x_row_div,
+        m_total,
+        x_src_rows,
+    )
+    .expect("i8 MMQ k8 4w kernel launch");
+    gpu.hip
+        .device_synchronize()
+        .expect("sync after i8 MMQ k8 4w");
+
+    let y_default_v = download_f32(&gpu, &y_default, m_total * m);
     let y_i8_v = download_f32(&gpu, &y_i8_k8, m_total * m);
+    let y_i8_4w_v = download_f32(&gpu, &y_i8_k8_4w, m_total * m);
 
-    // i8 has ~1-3% relative error vs FP16 due to Q8_1 quantization.
-    let mut max_abs = 0f32;
-    let mut max_rel = 0f32;
-    let mut argmax_abs = 0usize;
-    let mut argmax_rel = 0usize;
-    let mut sum_sq_err = 0f64;
-    let mut sum_sq_ref = 0f64;
-    for (i, (a, b)) in y_fp16_v.iter().zip(y_i8_v.iter()).enumerate() {
+    let mut max_default_vs_k8 = 0f32;
+    let mut argmax_default_vs_k8 = 0usize;
+    for (i, (a, b)) in y_default_v.iter().zip(y_i8_v.iter()).enumerate() {
         let d = (a - b).abs();
-        let r = if a.abs() > 1e-6 { d / a.abs() } else { d };
-        if d > max_abs {
-            max_abs = d;
-            argmax_abs = i;
+        if d > max_default_vs_k8 {
+            max_default_vs_k8 = d;
+            argmax_default_vs_k8 = i;
         }
-        if r > max_rel {
-            max_rel = r;
-            argmax_rel = i;
-        }
-        sum_sq_err += (d as f64) * (d as f64);
-        sum_sq_ref += (*a as f64) * (*a as f64);
     }
-    let rmse = (sum_sq_err / (m_total * m) as f64).sqrt() as f32;
-    let nrmse = if sum_sq_ref > 0.0 {
-        (sum_sq_err.sqrt() / sum_sq_ref.sqrt()) as f32
-    } else {
-        0.0
-    };
-
     println!(
-        "  max_abs_diff = {:.6e} (at {}: fp16={:.6}, i8_k8={:.6})",
-        max_abs, argmax_abs, y_fp16_v[argmax_abs], y_i8_v[argmax_abs]
+        "  default_vs_k8_max_abs = {:.6e} (at {}: default={:.6}, k8={:.6})",
+        max_default_vs_k8,
+        argmax_default_vs_k8,
+        y_default_v[argmax_default_vs_k8],
+        y_i8_v[argmax_default_vs_k8]
     );
-    println!(
-        "  max_rel_diff = {:.6e} (at {}: fp16={:.6}, i8_k8={:.6})",
-        max_rel, argmax_rel, y_fp16_v[argmax_rel], y_i8_v[argmax_rel]
-    );
-    println!("  RMSE = {:.6e}   NRMSE = {:.6e}", rmse, nrmse);
 
-    // Accept if either: rel error within rtol, OR abs error within atol
-    // (catches small-value cases where rel is unstable). Also accept if
-    // NRMSE is within tolerance — single-element outliers can blow up
-    // max_rel but the overall noise envelope can still be small.
-    let pass = max_rel <= rtol || max_abs <= atol || nrmse <= rtol;
+    let mut max_k8_vs_4w = 0f32;
+    let mut argmax_k8_vs_4w = 0usize;
+    for (i, (a, b)) in y_i8_v.iter().zip(y_i8_4w_v.iter()).enumerate() {
+        let d = (a - b).abs();
+        if d > max_k8_vs_4w {
+            max_k8_vs_4w = d;
+            argmax_k8_vs_4w = i;
+        }
+    }
+    println!(
+        "  k8_vs_4w_max_abs = {:.6e} (at {}: k8={:.6}, k8_4w={:.6})",
+        max_k8_vs_4w, argmax_k8_vs_4w, y_i8_v[argmax_k8_vs_4w], y_i8_4w_v[argmax_k8_vs_4w]
+    );
+
+    let pass = max_default_vs_k8 <= 1e-5 && max_k8_vs_4w <= 1e-5;
     if pass {
         println!("  PASS (rtol={} atol={})", rtol, atol);
     } else {

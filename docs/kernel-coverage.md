@@ -93,6 +93,11 @@ gfx1151 now routes HFQ4/MQ4 decode GEMV through the RDNA3 single-row and multi-r
 | moe scalar path | — | — | — | — | basic | — |
 | moe hfp4g32 | — | — | — | — | — | standard |
 
+gfx1151 HFQ4 grouped MMQ: the `HIPFIRE_MOE_GROUPED_I8_4W=1` experiment stages
+routed Q8_1 blocks in LDS across four row-warps and is bit-identical to k8, but
+regressed the default k8 path on both A3B pp256 and 122B pp128. Keep k8 as the
+default.
+
 ### Fused QKV (prefill, quant decode into Q/K/V in one pass)
 
 | Kernel group | gfx906 | gfx942 | gfx1030 | gfx1100 | gfx1151 | gfx12 |
