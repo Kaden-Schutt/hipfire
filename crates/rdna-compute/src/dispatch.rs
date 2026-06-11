@@ -1439,6 +1439,51 @@ impl Gpu {
         self.ensure_kernel(module_name, source, func_name)
     }
 
+    /// Synthetic gfx1151 IU4/IU8 WMMA probe. This is diagnostic-only and is
+    /// intentionally not routed into any model path: it validates instruction
+    /// availability and accumulator layout before Q4 activation-scratch MMQ
+    /// work begins.
+    pub fn bench_iu_wmma_gfx1151(
+        &mut self,
+        output: &GpuTensor,
+        blocks: usize,
+        iters: usize,
+        use_iu4: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let func_name = if use_iu4 {
+            "bench_iu4_wmma_gfx1151"
+        } else {
+            "bench_iu8_wmma_gfx1151"
+        };
+        self.ensure_kernel(
+            "bench_iu4_wmma_gfx1151",
+            kernels::BENCH_IU4_WMMA_GFX1151_SRC,
+            func_name,
+        )?;
+
+        let out_ptr = output.buf.as_ptr();
+        let iters_i32 = iters as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &out_ptr as *const _ as *mut c_void,
+            &iters_i32 as *const _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            func_name,
+            [blocks as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(out_ptr);
+                b.push_i32(iters_i32);
+                b
+            },
+        )
+    }
+
     /// Launch a pre-loaded kernel by name using the `extra`-mode kernarg
     /// blob path. This is the only launch path that survives hipGraph
     /// capture on gfx1100 / ROCm 6.x — the traditional `kernelParams`

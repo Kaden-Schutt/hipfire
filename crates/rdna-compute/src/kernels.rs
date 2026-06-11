@@ -63,6 +63,12 @@ pub const GEMM_HFQ4G128_MMQ_GFX1151_SRC: &str =
 pub const GEMM_HFQ4G256_MMQ_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/gemm_hfq4g256_mmq.gfx1151.hip");
 
+/// gfx1151 IU4/IU8 WMMA diagnostic probe. Synthetic only: validates packed
+/// operand vectors, accumulator layout, and rough issue throughput before a
+/// Q4 activation-scratch MMQ path is routed into model code.
+pub const BENCH_IU4_WMMA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/bench_iu4_wmma.gfx1151.hip");
+
 /// HFQ2-G256: flat 2-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][64B data] = 72 bytes per 256 weights (0.28 B/w).
 pub const GEMV_HFQ2G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2g256.hip");

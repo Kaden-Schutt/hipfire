@@ -111,9 +111,12 @@ as a mixed-format transform, not as a drop-in Lloyd kernel replacement.
 
 ## Proposed gfx1151 Implementation Order
 
-1. **Add a tiny IU4 probe/microbench.** Keep it synthetic and isolated:
-   prove packed operands, signedness flags, accumulator layout, and
-   disassembly metadata on gfx1151.
+1. **Add a tiny IU4 probe/microbench.** Done in
+   `probe_gfx1151_iu4_wmma` and
+   `kernels/src/gfx1151/bench_iu4_wmma.gfx1151.hip`; see
+   `docs/perf-checkpoints/2026-06-12-gfx1151-iu4-wmma-probe.md`.
+   The synthetic chain validated accumulator contents and measured IU4 at
+   1.883x IU8 throughput on gfx1151.
 2. **Implement Q4 activation scratch.** Add a `block_q4_*_mmq` sibling
    to the existing Q8_1 scratch. Start with symmetric Q4 unless a zero
    point is needed for quality.
