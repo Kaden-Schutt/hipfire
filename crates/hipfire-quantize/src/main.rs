@@ -4351,6 +4351,10 @@ fn run_gguf_pipeline(
         "llama" => 0,
         "qwen3" | "qwen2" => 1,
         "qwen3moe" => 6,
+        // Gemma4 EAGLE drafter (arch_id 22) — must come before the gemma4
+        // catch-all below so that a GGUF with general.architecture =
+        // "gemma4_unified_assistant" is not mis-tagged as arch 13.
+        "gemma4_unified_assistant" => 22,
         // Gemma 4 family (dense + MoE) => hipfire-arch-gemma4 (arch_id 13).
         // Require a "gemma4"-prefixed arch string; bare "gemma"/"gemma2"/
         // "gemma3" GGUFs are different architectures and must not be mis-tagged.
