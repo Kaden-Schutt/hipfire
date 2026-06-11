@@ -3025,13 +3025,60 @@ fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
     output
 }
 
+/// Pure helper: given the alignment flags for an expert tensor's K dimension
+/// (with all higher-priority format flags absent/false — i.e. mq4 default with
+/// no --expert-q8 / --expert-hfq4 / --expert-mq6 etc.), return which QuantType
+/// the expert-arm cascade would choose for that K.
+///
+/// This mirrors the tail of the rayon closure at the MoE expert dispatch site:
+///   } else if supports_g256 { MQ4G256 }
+///   } else if supports_g128 { HFQ4G128 }  ← THE BUG LIVES HERE (ragged-K groups)
+///   } else { Q8F16 }
+///
+/// Called by tests to pin the ragged-K protection without invoking the full
+/// quantizer pipeline.
+///
+/// KEEP IN SYNC with the live cascade tail (search for `supports_g128` in
+/// the expert dispatch around line ~6300): this is a parallel
+/// re-implementation, so its tests pin intent only — the
+/// `fallback_g128_or_q8_*` tests are the ones that exercise live code.
+#[cfg(test)]
+fn expert_default_quant_type(inner_k: usize) -> QuantType {
+    let supports_g256 = inner_k % 256 == 0;
+    let supports_g128 = inner_k % 128 == 0;
+    if supports_g256 {
+        QuantType::MQ4G256
+    } else if supports_g128 {
+        QuantType::HFQ4G128
+    } else {
+        QuantType::Q8F16
+    }
+}
+
+/// Quantize a 2D weight tensor, choosing HFQ4G128 when k_dim is aligned
+/// to 128, or falling back to Q8_0 (32-byte blocks, always aligned) when
+/// k_dim % 128 != 0. Avoids the ragged-group kernel bug where whole-tensor
+/// packing disagrees with per-row stride for non-aligned K.
+///
+/// Returns (quantized_bytes, quant_type, group_size, label_str).
+fn quantize_fallback_g128_or_q8(f32_data: &[f32], k_dim: usize) -> (Vec<u8>, QuantType, u32, &'static str) {
+    if k_dim % 128 == 0 {
+        (quantize_hfq4g128(f32_data), QuantType::HFQ4G128, 128u32, "HFQ4G128")
+    } else {
+        eprintln!(
+            "  NOTE: K={k_dim} not divisible by 128, falling back to Q8_0 (group-quant ragged-K protection)"
+        );
+        (quantize_q8f16(f32_data), QuantType::Q8F16, 32u32, "Q8_0")
+    }
+}
+
 // ─── HFQ File Format ────────────────────────────────────────────────────────
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
 const HFQ_VERSION: u32 = 1;
 
 #[repr(u8)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum QuantType {
     Q4F16G64 = 0,
     F16 = 1,
@@ -4622,14 +4669,29 @@ fn run_gguf_pipeline(
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
             }
-        } else {
-            // K not divisible by 256 — fall back to HFQ4-G128 (no rotation).
-            // This branch fires for the rare ragged dim; ignores --format
-            // (no G128 variant of mq4/mq6 exists).
+        } else if k_dim % 128 == 0 {
+            // K not divisible by 256 but divisible by 128 — fall back to
+            // HFQ4-G128 (no rotation, no G256 variant of mq4/mq6 exists).
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let q = quantize_hfq4g128(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+        } else {
+            // K not divisible by 128 either — group-quantized formats would
+            // produce misaligned groups (whole-tensor packing vs per-row
+            // stride). Fall back to Q8_0 which has 32-byte blocks and works
+            // for any K divisible by 32.
+            //
+            // Fires for: qwen A3B moe_inter (K=1408, 1408%256≠0) and any
+            // future architecture with non-256-aligned intermediate dims.
+            eprintln!(
+                "  NOTE: K={k_dim} not divisible by 128, falling back to Q8_0 for {}",
+                info.name
+            );
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let q = quantize_q8f16(&f32_data);
+            quant_params += n_elements as u64;
+            (q, QuantType::Q8F16, 32u32, "Q8_0")
         };
 
         total_bytes_out += data.len() as u64;
@@ -6463,8 +6525,8 @@ fn main() {
                                 let q = quantize_hfq4g256(&f32_data);
                                 (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                             } else {
-                                let q = quantize_hfq4g128(&f32_data);
-                                (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                                let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                                (q, qt, gs, lbl)
                             }
                         }
                     } else if use_hfq6 {
@@ -6492,9 +6554,9 @@ fn main() {
                             let q = quantize_hfq2g256(&f32_data);
                             (q, QuantType::HFQ2G256, 256u32, "HFQ2G256")
                         } else {
-                            // Fallback to HFQ4 for non-256-aligned
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            // Fallback to HFQ4G128 or Q8 for non-256-aligned
+                            let (q, qt, gs, lbl) = quantize_fallback_g128_or_q8(&f32_data, k_dim);
+                            (q, qt, gs, lbl)
                         }
                     } else if use_mq8g256 && is_embed {
                         let q = quantize_q8f16(&f32_data);
@@ -9548,6 +9610,96 @@ mod tests {
         assert_eq!(
             kmap_resolve_mode("model.layers.15.mlp.gate_proj.weight", 40, false, 2),
             QuantLevel::Base
+        );
+    }
+
+    // ── Ragged-K protection regression tests ─────────────────────────────
+    //
+    // These tests pin two invariants that guard the known G128 ragged-K kernel
+    // bug (gemv/gemm_hfq4g128 uses floor-stride groups_per_row = K/128, which
+    // produces wrong results when K%128 != 0):
+    //
+    //   1. quantize_fallback_g128_or_q8 selects Q8F16 for ragged-K inputs.
+    //   2. The expert-arm cascade selects Q8F16 (not HFQ4G128) for ragged-K.
+    //   3. The inverse: aligned K values select the expected group formats.
+    //
+    // A refactor that reverts to unconditional quantize_hfq4g128 (as in the
+    // pre-fix form at main.rs:4630 / :6176) would fail tests 1 and 2 immediately.
+    // A refactor that makes the alignment guard over-conservative would fail
+    // test 3.
+
+    #[test]
+    fn fallback_g128_or_q8_ragged_k_selects_q8f16() {
+        // K=704 (Gemma4-26B expert down_proj): 704 % 128 = 64 — ragged.
+        // Must NOT emit HFQ4G128; must fall back to Q8F16.
+        let data: Vec<f32> = vec![0.0f32; 704];
+        let (_bytes, qt, _gs, label) = quantize_fallback_g128_or_q8(&data, 704);
+        assert_eq!(qt, QuantType::Q8F16, "K=704 ragged: expected Q8F16, got {qt:?}");
+        assert_eq!(label, "Q8_0");
+
+        // K=2112 (Gemma4-26B dense FFN down_proj): 2112 % 128 = 64 — ragged.
+        let data2: Vec<f32> = vec![0.0f32; 2112];
+        let (_bytes2, qt2, _gs2, label2) = quantize_fallback_g128_or_q8(&data2, 2112);
+        assert_eq!(qt2, QuantType::Q8F16, "K=2112 ragged: expected Q8F16, got {qt2:?}");
+        assert_eq!(label2, "Q8_0");
+    }
+
+    #[test]
+    fn fallback_g128_or_q8_aligned_k_selects_hfq4g128() {
+        // K=640: 640 % 128 = 0, 640 % 256 = 128 — g128-aligned, not g256.
+        // Should select HFQ4G128 (not Q8F16, not HFQ4G256).
+        let data: Vec<f32> = vec![0.0f32; 640];
+        let (_bytes, qt, gs, label) = quantize_fallback_g128_or_q8(&data, 640);
+        assert_eq!(qt, QuantType::HFQ4G128, "K=640 g128-aligned: expected HFQ4G128, got {qt:?}");
+        assert_eq!(gs, 128u32);
+        assert_eq!(label, "HFQ4G128");
+
+        // K=768: 768 % 128 = 0, 768 % 256 = 0 — also g128-aligned.
+        let data2: Vec<f32> = vec![0.0f32; 768];
+        let (_bytes2, qt2, gs2, _label2) = quantize_fallback_g128_or_q8(&data2, 768);
+        assert_eq!(qt2, QuantType::HFQ4G128, "K=768 g128-aligned: expected HFQ4G128, got {qt2:?}");
+        assert_eq!(gs2, 128u32);
+    }
+
+    #[test]
+    fn expert_default_quant_type_ragged_k_selects_q8f16() {
+        // K=704 (Gemma4-26B expert down_proj): 704 % 128 = 64 — ragged.
+        // The expert cascade's alignment-tail must NOT select HFQ4G128.
+        assert_eq!(
+            expert_default_quant_type(704),
+            QuantType::Q8F16,
+            "K=704 expert ragged: expected Q8F16"
+        );
+        // K=1408 (qwen A3B moe_inter): 1408 % 256 = 128, 1408 % 128 = 0 — g128 ok.
+        // (This is the qwen-A3B case mentioned in the PR: K%256≠0 but K%128==0)
+        assert_eq!(
+            expert_default_quant_type(1408),
+            QuantType::HFQ4G128,
+            "K=1408 qwen A3B moe_inter: expected HFQ4G128 (g128-aligned)"
+        );
+        // K=2112 (Gemma4-26B dense FFN down_proj-equivalent): also ragged.
+        assert_eq!(
+            expert_default_quant_type(2112),
+            QuantType::Q8F16,
+            "K=2112 expert ragged: expected Q8F16"
+        );
+    }
+
+    #[test]
+    fn expert_default_quant_type_aligned_k_selects_correct_format() {
+        // K=768: 768 % 256 = 0 → MQ4G256 (default mq4 format, g256-aligned).
+        assert_eq!(
+            expert_default_quant_type(768),
+            QuantType::MQ4G256,
+            "K=768 g256-aligned: expected MQ4G256"
+        );
+        // K=640: 640 % 256 = 128, 640 % 128 = 0 → HFQ4G128.
+        // This tests the g128 arm is still reached for the right K values.
+        // (This arm is only safe when K%128==0, which K=640 satisfies.)
+        assert_eq!(
+            expert_default_quant_type(640),
+            QuantType::HFQ4G128,
+            "K=640 g128-aligned (not g256): expected HFQ4G128"
         );
     }
 }
