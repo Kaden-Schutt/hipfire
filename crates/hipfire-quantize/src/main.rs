@@ -230,6 +230,26 @@ fn f32_to_f16(val: f32) -> u16 {
     ((sign << 15) | ((new_exp as u32) << 10) | (frac >> 13)) as u16
 }
 
+/// Returns true if the tensor `name` should be kept as F16 (skipping Q8
+/// quantization) when the `HIPFIRE_GEMMA4_F16_KEEP` env var is set.
+///
+/// The env var is a comma-separated list of substring tokens. A tensor
+/// matches if ANY token is a substring of its full safetensors name.
+/// Unset / empty env => always returns false (no effect on quantization).
+///
+/// Example:
+///   HIPFIRE_GEMMA4_F16_KEEP=embed,down_proj
+///   => keeps model.language_model.embed_tokens.weight and every down_proj at F16.
+fn gemma4_f16_keep(name: &str) -> bool {
+    let Ok(val) = std::env::var("HIPFIRE_GEMMA4_F16_KEEP") else {
+        return false;
+    };
+    val.split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .any(|token| name.contains(token))
+}
+
 /// Convert raw tensor bytes to F32 based on dtype string
 fn to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
     match dtype {
@@ -6373,6 +6393,57 @@ fn main() {
             st_files[*file_idx].drop_tensor_pages(name);
             if let Some(ref mut s) = spill {
                 maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024); // 2 GB threshold
+            }
+            continue;
+        }
+
+        // ── HIPFIRE_GEMMA4_F16_KEEP knob ──────────────────────────────────────────
+        // Ablation/precision override for gemma4 (arch 13 / 22): any tensor whose
+        // name contains a token from the comma-separated HIPFIRE_GEMMA4_F16_KEEP env
+        // var is stored as F16 instead of Q8.  Only fires when the knob is set; in
+        // production (unset) this arm is a no-op and adds zero overhead.
+        //
+        // Typical use:
+        //   HIPFIRE_GEMMA4_F16_KEEP=embed,down_proj  -- keep embed + all down_proj at F16
+        //
+        // The arm runs before the deepseek4-q8-mtp short-circuit so it is truly the
+        // first format-specific override in the dispatch chain; it intentionally has
+        // no arch_id guard (safe to leave set for non-gemma4 experiments too).
+        if (arch_id == 13 || arch_id == 22) && gemma4_f16_keep(name) && n_elements >= 32 {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let src_dtype = meta.dtype.as_str();
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name,
+                raw_data,
+                meta,
+                &fp8_scale_for,
+                &st_files,
+            );
+            quantized_params += n_elements as u64;
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect();
+            eprintln!(
+                "  {:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [src={src_dtype}, gemma4-f16-keep]",
+                "F16",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                f16_bytes.len() as f64 / 1024.0
+            );
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::F16,
+                shape,
+                group_size: 0,
+                data: f16_bytes,
+                spilled_len: 0,
+            });
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut s) = spill {
+                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
             }
             continue;
         }
