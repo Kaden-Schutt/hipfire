@@ -12,7 +12,7 @@ The shape of this file is lifted from
 
 | Project | Author | What We Learned |
 |---------|--------|-----------------|
-| [autoresearch](https://github.com/karpathy/autoresearch) | Andrej Karpathy | Methodology pattern: `program.md` (strategy) > agent modifies one file > fixed eval > keep/discard > repeat. We adapt it for hardware/driver exploration; the "fixed eval" equivalent is the tiered ROCm validation harness in `harness.sh`. |
+| [autoresearch](https://github.com/karpathy/autoresearch) | Andrej Karpathy | Methodology pattern: `program.md` (strategy) > agent modifies one file > fixed eval > keep/discard > repeat. We adapt it for hardware/driver exploration; the "fixed eval" equivalent is the tiered ROCm validation harness in `tests/harness.sh`. |
 | [rustane](https://github.com/ncdrone/rustane) | ncdrone | Rust-native FFI to private/undocumented hardware APIs via `dlopen`. Their `ane-bridge` > `metal-decode` > `engine` decomposition is what we adapted into `hip-bridge` > `rdna-compute` > `engine`. The CREDITS.md shape here is also lifted from theirs. |
 | [Mesa (radeonsi / radv)](https://gitlab.freedesktop.org/mesa/mesa) | Mesa contributors | Open AMD GPU driver source. The gfx10 register headers (`sid.h`, `gfx10_format_table.h`) and the compute-relevant register documentation that ROCm does not publish. Reference for what gfx1010 can actually do at the hardware level vs. what ROCm chooses to expose. |
 | [amdgpu kernel driver](https://gitlab.freedesktop.org/agd5f/linux) | AMD + upstream contributors | KMD ioctl surface for `/dev/dri/renderD*`, PM4 command buffer format, doorbell semantics. Backstop for the redline (direct-KMD) crate and for diagnosing firmware/driver mismatches. |

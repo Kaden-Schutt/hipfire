@@ -61,8 +61,8 @@ Rough effort estimate for a real arch port:
 - Kernel work for any new ops: stays in `kernels/src/*.hip` and
   `crates/rdna-compute`, **not** in your arch crate. See
   `CONTRIBUTING.md` "Crate topology" decision tree.
-- Coherence + speed-gate validation: see `scripts/coherence-gate.sh`
-  and `scripts/speed-gate.sh`.
+- Coherence + speed-gate validation: see `tests/coherence-gate.sh`
+  and `tests/speed-gate.sh`.
 
 ## Production reference
 

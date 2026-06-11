@@ -65,7 +65,7 @@ cargo build --release --features deltanet -p hipfire-runtime \
     --example bench_qwen35_mq4
 
 # 3. Run the gate
-./scripts/speed-gate.sh --fast
+./tests/speed-gate.sh --fast
 
 # 4. Same procedure for the baseline
 git checkout <baseline>
@@ -201,7 +201,7 @@ batched Q8 lm_head kernel is currently out of scope per
 
 `tests/speed-baselines/<arch>.txt` records the "ground floor" decode
 + prefill numbers per arch. The pre-commit hook runs
-`scripts/speed-gate.sh --fast` automatically when the staged diff
+`tests/speed-gate.sh --fast` automatically when the staged diff
 touches kernel / dispatch / forward-pass files. Tolerance is ±5% from
 the committed baseline.
 
@@ -210,7 +210,7 @@ for a much bigger win on another arch (rare, but happens), update the
 baseline in the same commit:
 
 ```bash
-./scripts/speed-gate.sh --update-baselines
+./tests/speed-gate.sh --update-baselines
 git add tests/speed-baselines/
 git commit
 ```
@@ -285,7 +285,7 @@ jq -nR --arg p "$(cat benchmarks/prompts/humaneval_0_has_close_elements.txt)" \
 jq -nR --arg p "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
    '{label:"lru-cache",  prompt:$p, max:16}' >> manifest.jsonl
 
-# python3 form (no jq dependency; see scripts/dflash_bench_resident_smoke.sh)
+# python3 form (no jq dependency; see tests/dflash_bench_resident_smoke.sh)
 python3 -c '
 import json, sys
 for label, path in [("humaneval-0","benchmarks/prompts/humaneval_0_has_close_elements.txt"),
@@ -309,7 +309,7 @@ Caveats:
   separate invocations until a per-row reset path exists.
 - Cross-row validation: pass the same prompt twice with `--temp 0`;
   the two `DFlash tokens: [...]` lines must match byte-for-byte.
-  `scripts/dflash_bench_resident_smoke.sh` is the reference check.
+  `tests/dflash_bench_resident_smoke.sh` is the reference check.
 - Per-process flags (e.g. `HIPFIRE_MMQ_MIN_BATCH` cutover, ddtree
   budget/topk, kv-mode) still vary across invocations, not within.
   Group manifest rows by these flags and run one invocation per group.
@@ -318,7 +318,7 @@ See issue #173 for the full design.
 
 ## DFlash speed gate
 
-`scripts/coherence-gate-dflash.sh` runs the spec-decode coherence
+`tests/coherence-gate-dflash.sh` runs the spec-decode coherence
 battery: a fixed (model × prompt × spec-mode) matrix that catches
 token-attractor regressions (output that passes the perf gate while
 emitting `[1734 2357 2733 283 869 1734 2357 ...]` for 1500 tokens).

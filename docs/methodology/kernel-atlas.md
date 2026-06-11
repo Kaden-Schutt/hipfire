@@ -224,7 +224,7 @@ python3 scripts/kernel_atlas.py task \
   --isa .codeinsight+research/kernel-atlas/runs/isa-gfx1201.json \
   --dispatch .codeinsight+research/kernel-atlas/runs/dispatch-gfx1201.json \
   --allowed-file kernels/src/gemv_hfq4g256_multirow.hip \
-  --correctness-command './scripts/coherence-gate-dflash.sh' \
+  --correctness-command './tests/coherence-gate-dflash.sh' \
   --output-dir .codeinsight+research/kernel-atlas/tasks/gfx1201-gemv-r4
 ```
 

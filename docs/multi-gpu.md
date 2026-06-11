@@ -164,10 +164,10 @@ Architectural limits in v1:
 
 ```sh
 # Multi-GPU gate. Skips silently when fewer than 2 GPU visible.
-./scripts/pp-gate.sh
+./tests/pp-gate.sh
 
 # Just the parity smoke (no daemon end-to-end), faster
-./scripts/pp-gate.sh --skip-end-to-end
+./tests/pp-gate.sh --skip-end-to-end
 
 # Underlying byte-equivalence example
 HIP_VISIBLE_DEVICES=0,1 cargo run --release --features deltanet \

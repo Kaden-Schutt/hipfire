@@ -75,7 +75,7 @@ The default CI path intentionally avoids AMD GPU access and model
 downloads:
 
 ```bash
-./scripts/no-gpu-ci.sh
+./tests/no-gpu-ci.sh
 ```
 
 It runs `cargo check --workspace --examples`, no-GPU Rust unit tests,
@@ -102,9 +102,9 @@ before commit. The pre-commit hook runs them automatically when staged
 files match the hotspot regex.
 
 ```bash
-./scripts/coherence-gate.sh             # AR coherence (panic / zero-tokens / timeout = hard fail)
-./scripts/coherence-gate-dflash.sh      # spec-decode token-attractor detection
-./scripts/speed-gate.sh --fast          # 4B prefill+decode regression vs tests/speed-baselines/<arch>.txt
+./tests/coherence-gate.sh             # AR coherence (panic / zero-tokens / timeout = hard fail)
+./tests/coherence-gate-dflash.sh      # spec-decode token-attractor detection
+./tests/speed-gate.sh --fast          # 4B prefill+decode regression vs tests/speed-baselines/<arch>.txt
 ```
 
 **Don't bypass with `--no-verify`.** A regression the gate catches is

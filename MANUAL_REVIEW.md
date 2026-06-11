@@ -4,8 +4,8 @@ Items that require Kaden's judgment. Sorted by what unblocks the most downstream
 
 ## Full coherence-gate / speed-gate run hangs in this session
 
-- **Why escalated:** Both `scripts/coherence-gate.sh` (no flags) and
-  `scripts/speed-gate.sh --fast` ran past 20 min in this session
+- **Why escalated:** Both `tests/coherence-gate.sh` (no flags) and
+  `tests/speed-gate.sh --fast` ran past 20 min in this session
   without producing a fresh report or registering GPU activity. Single-
   shot Qwen3.5-4B.mq4 generate via the daemon works fine end-to-end
   (verified: prefill 535 tok/s, decode 167 tok/s, no `pflash` field on

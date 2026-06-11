@@ -161,9 +161,9 @@ attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Install local hooks with
 `./scripts/install-hooks.sh`. The no-GPU CI subset is
-`./scripts/no-gpu-ci.sh`; it does not replace the hardware gates. Any
+`./tests/no-gpu-ci.sh`; it does not replace the hardware gates. Any
 change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
-or the spec-decode path must pass `./scripts/coherence-gate-dflash.sh`
+or the spec-decode path must pass `./tests/coherence-gate-dflash.sh`
 before commit. The canonical correctness gate is per-arch channel-test;
 the speed-gate catches regressions on the baseline arch. Don't bypass
 either with `--no-verify` — see

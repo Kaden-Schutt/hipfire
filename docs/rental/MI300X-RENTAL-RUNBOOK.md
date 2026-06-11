@@ -34,7 +34,7 @@ branches on origin:
 - `scripts/convert_gguf_imatrix_to_npz.py` — GGUF imatrix → raw-sumsq npz
 - `scripts/mq4_masked_calib.py` — `--awq-raw-sumsq-npz` flag, F1-default scope
 - `scripts/mi300x_bootstrap.sh` — this runbook's automation
-- `scripts/mi300x_smoke_gfx942.sh` — pre-flight verification
+- `tests/mi300x_smoke_gfx942.sh` — pre-flight verification
 - `scripts/mi300x_v3_matrix.sh` — model sweep
 - `scripts/mi300x_sub_0_10_attempt.sh` — final lever
 
@@ -94,7 +94,7 @@ already exist.
 ### 5. Smoke test (~5 min)
 
 ```bash
-bash /workspace/hipfire/scripts/mi300x_smoke_gfx942.sh
+bash /workspace/hipfire/tests/mi300x_smoke_gfx942.sh
 ```
 
 Verifies:

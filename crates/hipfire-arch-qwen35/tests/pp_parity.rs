@@ -184,7 +184,7 @@ fn run_pp2(path: &str, prompt: &[u32]) -> Vec<u32> {
 //       cargo test -p hipfire-arch-qwen35 --release --features deltanet \
 //                  --test pp_parity -- --ignored
 //
-// The canonical hands-free regression is `scripts/pp-gate.sh`, which
+// The canonical hands-free regression is `tests/pp-gate.sh`, which
 // drives the daemon binary (carries pre-compiled kernels) end-to-end
 // and is wired into the pre-commit hook.
 #[test]

@@ -207,7 +207,7 @@ and any first-time arch transition.
   the contributor onboarding workflow.
 - **A new kernel variant**: `kernels/src/<existing>.<chip>.hip` and
   wire it in `kernels.rs` + `dispatch.rs`. Run the speed-gate
-  (`scripts/speed-gate.sh --fast`) before committing.
+  (`tests/speed-gate.sh --fast`) before committing.
 - **A new GGUF dequant type** (Q5_K / IQ4_XS / etc.): port from
   llama.cpp's `ggml-quants.c` into
   `crates/hipfire-quantize/src/gguf_input.rs`.
