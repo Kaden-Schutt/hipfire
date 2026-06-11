@@ -110,7 +110,7 @@ echo "Engine code changed. Running coherence battery (~2-4 min)..."
 echo "PFlash regression stage: $PFLASH_GATE_NOTE"
 echo
 
-if ! env $PFLASH_GATE_ENV ./scripts/coherence-gate.sh; then
+if ! env $PFLASH_GATE_ENV ./tests/coherence-gate.sh; then
     echo
     echo "========================================================================"
     echo "COMMIT BLOCKED: coherence battery hit a HARD error."
@@ -120,8 +120,8 @@ if ! env $PFLASH_GATE_ENV ./scripts/coherence-gate.sh; then
     echo "or timeout. See the report path printed above."
     echo
     echo "Investigation:"
-    echo "  ./scripts/coherence-gate.sh           # re-run short battery"
-    echo "  ./scripts/coherence-gate.sh --full    # include A3B tests"
+    echo "  ./tests/coherence-gate.sh           # re-run short battery"
+    echo "  ./tests/coherence-gate.sh --full    # include A3B tests"
     echo
     echo "Fix the panic/error in the same commit. Do NOT bypass with --no-verify"
     echo "unless you have a plan."
@@ -168,7 +168,7 @@ if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
     echo "=== DFlash/DDTree Coherence Battery $DFLASH_NOTE ==="
     echo "Spec-decode path changed. Running dflash coherence battery..."
     echo
-    if ! ./scripts/coherence-gate-dflash.sh $DFLASH_FLAG; then
+    if ! ./tests/coherence-gate-dflash.sh $DFLASH_FLAG; then
         echo
         echo "========================================================================"
         echo "COMMIT BLOCKED: dflash coherence battery hit a HARD error."
@@ -183,8 +183,8 @@ if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
         echo "+τ / +tok-s wins on stat gates and silently corrupt outputs."
         echo
         echo "Investigation:"
-        echo "  ./scripts/coherence-gate-dflash.sh           # re-run short (4 cells)"
-        echo "  ./scripts/coherence-gate-dflash.sh --full    # add b22-k4 + b8-k2"
+        echo "  ./tests/coherence-gate-dflash.sh           # re-run short (4 cells)"
+        echo "  ./tests/coherence-gate-dflash.sh --full    # add b22-k4 + b8-k2"
         echo
         exit 1
     fi
@@ -199,7 +199,7 @@ if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
     # model isn't symlinked into MODELS_DIR.
     if [ -f "$HOME/.hipfire/models/deepseek-v4-flash.mq2lloyd" ]; then
         echo "=== DeepSeek V4 MTP spec-decode Coherence Battery (fast) ==="
-        if ! ./scripts/coherence-gate-deepseek4-mtp.sh --fast; then
+        if ! ./tests/coherence-gate-deepseek4-mtp.sh --fast; then
             echo
             echo "========================================================================"
             echo "COMMIT BLOCKED: DeepSeek V4 MTP coherence battery hit a HARD error."
@@ -234,7 +234,7 @@ if [ "${HIPFIRE_SKIP_AGENTIC_GATE:-0}" != "1" ]; then
     echo "=== Agentic Gate $AGENTIC_NOTE ==="
     echo "Tool-call shape regression cover. Skips if A3B models absent."
     echo
-    if ! ./scripts/agentic-gate.sh $AGENTIC_FLAG; then
+    if ! ./tests/agentic-gate.sh $AGENTIC_FLAG; then
         echo
         echo "========================================================================"
         echo "COMMIT BLOCKED: agentic-gate.sh hit a HARD failure."
@@ -249,9 +249,9 @@ if [ "${HIPFIRE_SKIP_AGENTIC_GATE:-0}" != "1" ]; then
         echo "regression that ChatML-leaked into <tool_call> JSON)."
         echo
         echo "Investigation:"
-        echo "  ./scripts/agentic-gate.sh --fast        # re-run single cell"
-        echo "  ./scripts/agentic-gate.sh               # full 8-cell battery"
-        echo "  ./scripts/agentic-gate.sh --self-check  # verify detectors not rotted"
+        echo "  ./tests/agentic-gate.sh --fast        # re-run single cell"
+        echo "  ./tests/agentic-gate.sh               # full 8-cell battery"
+        echo "  ./tests/agentic-gate.sh --self-check  # verify detectors not rotted"
         echo
         echo "Per-commit escape (use with care): HIPFIRE_SKIP_AGENTIC_GATE=1"
         echo
@@ -268,7 +268,7 @@ if [ "$PP_TOUCHED" -eq 1 ]; then
     echo "=== Multi-GPU PP Gate ==="
     echo "Multi-GPU code changed. Running pp-gate (skips if <2 GPU)..."
     echo
-    if ! ./scripts/pp-gate.sh; then
+    if ! ./tests/pp-gate.sh; then
         echo
         echo "========================================================================"
         echo "COMMIT BLOCKED: pp-gate.sh hit a HARD failure."
@@ -276,8 +276,8 @@ if [ "$PP_TOUCHED" -eq 1 ]; then
         echo
         echo "Multi-GPU pp=2 ≢ pp=1 byte-identical, refusal contract broken,"
         echo "or daemon panic. Investigation:"
-        echo "  ./scripts/pp-gate.sh                       # full battery"
-        echo "  ./scripts/pp-gate.sh --skip-end-to-end     # parity-only"
+        echo "  ./tests/pp-gate.sh                       # full battery"
+        echo "  ./tests/pp-gate.sh --skip-end-to-end     # parity-only"
         echo
         echo "Refer to docs/multi-gpu.md for the validation contract."
         exit 1
@@ -290,7 +290,7 @@ echo "=== MQ4 Speed Gate (fast) ==="
 echo "Running 4B prefill/decode regression check..."
 echo
 
-if ! ./scripts/speed-gate.sh --fast; then
+if ! ./tests/speed-gate.sh --fast; then
     echo
     echo "========================================================================"
     echo "COMMIT BLOCKED: MQ4 speed regression detected."
@@ -300,12 +300,12 @@ if ! ./scripts/speed-gate.sh --fast; then
     echo "The current MQ4 numbers are the PERMANENT MINIMUM — no code may ship below."
     echo
     echo "Next steps:"
-    echo "  ./scripts/speed-gate.sh                 # all sizes (0.8b / 4b / 9b / 27b)"
-    echo "  ./scripts/speed-gate.sh --verbose       # full bench output"
+    echo "  ./tests/speed-gate.sh                 # all sizes (0.8b / 4b / 9b / 27b)"
+    echo "  ./tests/speed-gate.sh --verbose       # full bench output"
     echo
     echo "If this regression is INTENTIONAL (new correctness path, new hardware"
     echo "target that needs the extra cycles, etc.), justify it AND re-baseline:"
-    echo "  ./scripts/speed-gate.sh --update-baselines"
+    echo "  ./tests/speed-gate.sh --update-baselines"
     echo "  git add tests/speed-baselines/"
     echo "  # then re-attempt the commit"
     echo
