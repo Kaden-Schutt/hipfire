@@ -27,8 +27,8 @@
 #   path-c-phase2-b12-k2  : Steps 1+2+3 (lazy branch FA-only re-verify)
 #
 # Usage:
-#   ./scripts/path-c-smoke.sh                    # auto-detect models
-#   TARGET=/path/to/t.mq4 DRAFT=/path/to/d.hfq ./scripts/path-c-smoke.sh
+#   ./tests/path-c-smoke.sh                    # auto-detect models
+#   TARGET=/path/to/t.mq4 DRAFT=/path/to/d.hfq ./tests/path-c-smoke.sh
 #
 # Exit codes:
 #   0  smoke ran clean

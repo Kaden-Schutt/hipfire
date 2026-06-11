@@ -8,7 +8,7 @@
 # daemon-side `tools` / `messages` JSONL fields.
 #
 # Why this gate exists:
-#   `scripts/agentic-gate.sh` sends tool definitions as TEXT inside the
+#   `tests/agentic-gate.sh` sends tool definitions as TEXT inside the
 #   system prompt (the same shape cli/index.ts pre-renders today). The
 #   model's Jinja template `{% if tools %}` block is therefore unreachable
 #   from the daemon — there is no way to A/B the upstream tools-block

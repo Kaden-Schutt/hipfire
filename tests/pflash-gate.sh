@@ -22,11 +22,11 @@
 #   2  build / environment error
 #
 # Usage:
-#   ./scripts/pflash-gate.sh                # default baseline
-#   ./scripts/pflash-gate.sh --baseline scripts/pflash-baselines/<file>.json
-#   ./scripts/pflash-gate.sh --tolerance 15 # widen to ±15%
+#   ./tests/pflash-gate.sh                # default baseline
+#   ./tests/pflash-gate.sh --baseline scripts/pflash-baselines/<file>.json
+#   ./tests/pflash-gate.sh --tolerance 15 # widen to ±15%
 #
-# Hooks into scripts/coherence-gate.sh as a follow-up stage.
+# Hooks into tests/coherence-gate.sh as a follow-up stage.
 
 set -u
 cd "$(dirname "$0")/.."
@@ -57,7 +57,7 @@ EXE="./target/release/examples/pflash_niah_bench"
 # Without this freshness check, the gate would run against a stale binary
 # whenever someone forgot to rebuild after editing pflash.rs / qwen35.rs /
 # llama.rs / the bench itself / the score kernel and silently report a
-# pass on outdated code. Mirror the pattern from scripts/coherence-gate.sh.
+# pass on outdated code. Mirror the pattern from tests/coherence-gate.sh.
 #
 # Coverage extends through the full PFlash kernel wiring chain so a change
 # anywhere in the dispatch path forces a rebuild:

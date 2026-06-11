@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MODEL_DIR="${HIPFIRE_BASELINE_MODEL:-/home/sadara/hipfire/models/Qwen3.5-0.8B}"
+MODEL_DIR="${HIPFIRE_BASELINE_MODEL:-$HOME/.hipfire/models/Qwen3.5-0.8B}"
 MODEL_NAME="${HIPFIRE_BASELINE_NAME:-qwen3.5-0.8b}"
 MODEL_STORE="${HIPFIRE_MODEL_STORE:-$HOME/.hipfire/models}"
 OUT="${HIPFIRE_BASELINE_OUT:-benchmarks/results/baseline-quant-$(date +%Y%m%d-%H%M%S)}"

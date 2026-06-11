@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # HipFire Tiered Validation Harness
 # Run after each approach attempt. Records which tiers pass.
-# Usage: ./harness.sh [approach_name]
+# Usage: ./tests/harness.sh [approach_name]
 
 set -euo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+cd "$ROOT"
 
 APPROACH="${1:-baseline}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)

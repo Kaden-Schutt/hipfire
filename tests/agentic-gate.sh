@@ -31,9 +31,9 @@
 #     daemon-up + curl harness; defer.
 #
 # Modes:
-#   ./scripts/agentic-gate.sh                # full: 2 models * 4 cells = 8 cells, ~5 min
-#   ./scripts/agentic-gate.sh --fast         # 1 cell, ~2 min - used by pre-commit
-#   ./scripts/agentic-gate.sh --self-check   # detector rot guard, <1s
+#   ./tests/agentic-gate.sh                # full: 2 models * 4 cells = 8 cells, ~5 min
+#   ./tests/agentic-gate.sh --fast         # 1 cell, ~2 min - used by pre-commit
+#   ./tests/agentic-gate.sh --self-check   # detector rot guard, <1s
 #
 # Exit codes:
 #   0 - battery ran clean

@@ -39,5 +39,5 @@
 # 27b: not yet measured. MI100's 32 GiB VRAM has plenty of headroom for the
 # 15 GiB MQ4 model, but the bundle hasn't been pulled to this rig yet.
 # Add a row when the bundle is fetched. DFlash baselines (drafted-decode) also
-# pending — drafts lookup paths in scripts/speed-gate.sh's bench_dflash_*
+# pending — drafts lookup paths in tests/speed-gate.sh's bench_dflash_*
 # need a `qwen35-9b-dflash-mq4.hfq` (or similar) pulled here.

@@ -14,8 +14,8 @@
 #    correctness check.
 #
 # Usage:
-#   ./scripts/dflash_bench_resident_smoke.sh           # use staged drafter
-#   ./scripts/dflash_bench_resident_smoke.sh --build   # cargo build first
+#   ./tests/dflash_bench_resident_smoke.sh           # use staged drafter
+#   ./tests/dflash_bench_resident_smoke.sh --build   # cargo build first
 #
 # Skips cleanly (exit 0) if no DFlash drafter is staged.
 

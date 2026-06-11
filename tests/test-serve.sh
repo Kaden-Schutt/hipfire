@@ -4,14 +4,16 @@
 # Optionally tests Hermes agent integration.
 #
 # Usage:
-#   ./test-serve.sh                  # run all curl-based tests (starts serve automatically)
-#   ./test-serve.sh --hermes         # also run Hermes agent integration test
-#   ./test-serve.sh --port 8080      # use custom port
-#   ./test-serve.sh --running        # connect to already-running hipfire serve
+#   ./tests/test-serve.sh            # run all curl-based tests (starts serve automatically)
+#   ./tests/test-serve.sh --hermes   # also run Hermes agent integration test
+#   ./tests/test-serve.sh --port 8080
+#   ./tests/test-serve.sh --running  # connect to already-running hipfire serve
 #
 # Requires: curl, jq, bun (for starting hipfire serve)
 
 set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
 PORT="${PORT:-11435}"
 BASE="http://localhost:$PORT"
@@ -59,7 +61,7 @@ trap cleanup EXIT
 if ! $ALREADY_RUNNING; then
   header "Starting hipfire serve on port $PORT"
   # Find the CLI
-  CLI="$(dirname "$(readlink -f "$0")")/cli/index.ts"
+  CLI="$ROOT/cli/index.ts"
   if [[ ! -f "$CLI" ]]; then
     echo "Cannot find cli/index.ts — run from repo root"
     exit 1

@@ -6,7 +6,7 @@
 
 # Comprehensive kernel test harness. Validates every dispatch path
 # with synthetic data — no model loading required.
-# Usage: ./scripts/test-kernels.sh [arch]   # arch defaults to detected
+# Usage: ./tests/test-kernels.sh [arch]   # arch defaults to detected
 set -euo pipefail
 
 SCRIPT_DIR_BIN="$(cd "$(dirname "$0")" && pwd)"

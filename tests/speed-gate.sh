@@ -16,11 +16,11 @@
 # it without explicit justification.
 #
 # Modes:
-#   ./scripts/speed-gate.sh              # all available sizes
-#   ./scripts/speed-gate.sh --fast       # 4B only (~25s, used by pre-commit)
-#   ./scripts/speed-gate.sh --update-baselines  # record current speeds as new floor
-#   ./scripts/speed-gate.sh --tolerance 0.1     # allow up to 10% regression (default 0.05)
-#   ./scripts/speed-gate.sh --verbose    # show full bench output on fail
+#   ./tests/speed-gate.sh              # all available sizes
+#   ./tests/speed-gate.sh --fast       # 4B only (~25s, used by pre-commit)
+#   ./tests/speed-gate.sh --update-baselines  # record current speeds as new floor
+#   ./tests/speed-gate.sh --tolerance 0.1     # allow up to 10% regression (default 0.05)
+#   ./tests/speed-gate.sh --verbose    # show full bench output on fail
 #
 # Exit codes:
 #   0   all metrics within tolerance
@@ -84,7 +84,7 @@ if [ -z "$BASELINE_ARCH" ]; then
 fi
 
 BASELINE_FILE="tests/speed-baselines/${BASELINE_ARCH}.txt"
-MODELS_DIR="${HIPFIRE_MODELS_DIR:-/home/kaden/ClaudeCode/autorocm/hipfire/models}"
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 
 FAST=0
 UPDATE=0
@@ -114,6 +114,20 @@ color() {
     else
         printf '%s' "$2"
     fi
+}
+
+# Resolve model artifacts from the configured install/cache directory. The
+# current canonical artifact suffix is .hfq, but several historical gates and
+# registry rows used extensionless paths such as qwen3.5-4b.mq4.
+find_model_file() {
+    local name="$1"
+    local dir cand
+    for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
+        for cand in "$dir/$name" "$dir/$name.hfq"; do
+            [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+        done
+    done
+    return 1
 }
 
 # Model sizes to test. 4B is fastest reliable signal; 9B/27B catch BW
@@ -147,16 +161,13 @@ bench_dflash_27b_lru() {
     # Models may live at $MODELS_DIR (project-local) or ~/.hipfire/models/
     # (install). Drafts in particular are usually only at the install path.
     local target draft
-    for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
-        [ -f "$dir/qwen3.5-27b.mq4" ] && [ -z "${target:-}" ] && target="$dir/qwen3.5-27b.mq4"
-        # Registry filename is `qwen35-27b-dflash-mq4.hfq` (cli/index.ts:469).
-        # The legacy `qwen35-27b-dflash.mq4` was renamed when the registry
-        # standardized on `<base>-<quant>.hfq`. Accept both for back-compat
-        # with older pulls; #61 reporter hit MISSING_DRAFT here.
-        for cand in "$dir/qwen35-27b-dflash-mq4.hfq" "$dir/qwen35-27b-dflash.mq4"; do
-            [ -f "$cand" ] && [ -z "${draft:-}" ] && draft="$cand" && break
-        done
-    done
+    target="$(find_model_file "qwen3.5-27b.mq4" || true)"
+    # Registry filename is `qwen35-27b-dflash-mq4.hfq` (cli/index.ts:469).
+    # The legacy `qwen35-27b-dflash.mq4` was renamed when the registry
+    # standardized on `<base>-<quant>.hfq`. Accept both for back-compat
+    # with older pulls; #61 reporter hit MISSING_DRAFT here.
+    draft="$(find_model_file "qwen35-27b-dflash-mq4.hfq" || true)"
+    [ -z "${draft:-}" ] && draft="$(find_model_file "qwen35-27b-dflash.mq4" || true)"
     [ ! -x "$DFLASH_EXE" ] && { echo "MISSING_BIN"; return; }
     [ -z "${target:-}" ] && { echo "MISSING_TARGET"; return; }
     [ -z "${draft:-}" ] && { echo "MISSING_DRAFT"; return; }
@@ -191,10 +202,8 @@ bench_dflash_27b_lru() {
 _bench_dflash_merge_sort_core() {
     local target_name="$1" draft_name="$2"
     local target draft
-    for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
-        [ -f "$dir/$target_name" ] && [ -z "${target:-}" ] && target="$dir/$target_name"
-        [ -f "$dir/$draft_name" ]  && [ -z "${draft:-}" ]  && draft="$dir/$draft_name"
-    done
+    target="$(find_model_file "$target_name" || true)"
+    draft="$(find_model_file "$draft_name" || true)"
     [ ! -x "$DFLASH_EXE" ] && { echo "MISSING_BIN"; return; }
     [ -z "${target:-}" ] && { echo "MISSING_TARGET"; return; }
     [ -z "${draft:-}" ] && { echo "MISSING_DRAFT"; return; }
@@ -233,10 +242,7 @@ bench_dflash_27b_merge_sort() {
 # Helper: does a draft file with this basename exist in any known model dir?
 _draft_exists() {
     local name="$1"
-    for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
-        [ -f "$dir/$name" ] && return 0
-    done
-    return 1
+    find_model_file "$name" >/dev/null
 }
 
 bench_dflash_9b_merge_sort() {
@@ -248,7 +254,9 @@ bench_dflash_9b_merge_sort() {
 bench_run() {
     local size="$1"
     local prefill="$2"
-    local model_path="$MODELS_DIR/qwen3.5-${size}.mq4"
+    local model_path
+    model_path="$(find_model_file "qwen3.5-${size}.mq4" || true)"
+    [ -z "$model_path" ] && return
     # givens4 was removed in the asym migration; asym3 is the current default
     # (5.5× compression, same speed regime as the old givens4 baseline).
     # DPM_WARMUP_SECS pins the GPU to high DPM before the timed prefill, so
@@ -256,13 +264,13 @@ bench_run() {
     # pp32 single-shot drops ~16% from cold DPM (e.g. 9B 1240→1040) and the
     # baseline becomes unreproducible across sessions. The DFlash bench
     # arms below already set this; bench_qwen35_mq4 calls didn't.
-    local env_prefix="HIPFIRE_KV_MODE=asym3 HIPFIRE_DPM_WARMUP_SECS=3"
+    local env_prefix=(HIPFIRE_KV_MODE=asym3 HIPFIRE_DPM_WARMUP_SECS=3)
     # 0.8B has a known hipGraph panic; use plain path.
     if [ "$size" != "0.8b" ]; then
-        env_prefix="$env_prefix HIPFIRE_GRAPH=1"
+        env_prefix+=(HIPFIRE_GRAPH=1)
     fi
     local out
-    out=$(eval "$env_prefix $EXE $model_path --prefill $prefill --warmup 5 --gen 50" 2>&1 | grep "^SUMMARY" | tail -1)
+    out=$(env "${env_prefix[@]}" "$EXE" "$model_path" --prefill "$prefill" --warmup 5 --gen 50 2>&1 | grep "^SUMMARY" | tail -1)
     local p d
     p=$(echo "$out" | sed -nE 's/.*prefill_tok_s=([0-9.]+).*/\1/p')
     d=$(echo "$out" | sed -nE 's/.*gen_tok_s=([0-9.]+).*/\1/p')
@@ -275,7 +283,8 @@ bench_run() {
 bench_best_of_2() {
     local size="$1"
     local prefill="$2"
-    local model_path="$MODELS_DIR/qwen3.5-${size}.mq4"
+    local model_path
+    model_path="$(find_model_file "qwen3.5-${size}.mq4" || true)"
     if [ ! -f "$model_path" ]; then
         echo "MISSING"
         return
@@ -434,7 +443,7 @@ fi
 
 if [ ! -f "$BASELINE_FILE" ]; then
     color yellow "speed-gate: no baseline file at $BASELINE_FILE"; echo
-    echo "  generate with: HIPFIRE_BASELINE_ARCH=$BASELINE_ARCH ./scripts/speed-gate.sh --update-baselines"
+    echo "  generate with: HIPFIRE_BASELINE_ARCH=$BASELINE_ARCH ./tests/speed-gate.sh --update-baselines"
     exit 2
 fi
 

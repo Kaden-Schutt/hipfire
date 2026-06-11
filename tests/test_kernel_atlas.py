@@ -658,7 +658,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
             row,
             manifest,
             allowed_files=["kernels/src/gemv_hfq4g256_multirow.hip"],
-            correctness_commands=[["./scripts/coherence-gate-dflash.sh"]],
+            correctness_commands=[["./tests/coherence-gate-dflash.sh"]],
             task_id="atlas-test-task",
         )
 
@@ -798,7 +798,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
             ],
             "rationale": ["launch dominated"],
             "candidate_steps": ["fuse one adjacent transform"],
-            "correctness_commands": [["./scripts/coherence-gate-dflash.sh"]],
+            "correctness_commands": [["./tests/coherence-gate-dflash.sh"]],
         }
 
         task = kernel_atlas.build_task_bundle_from_row(row, manifest={}, suggestion=suggestion)
@@ -811,7 +811,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
             task["constraints"]["allowed_files"],
             ["crates/hipfire-runtime/src/llama.rs", "kernels/src/fused_rmsnorm_mq_rotate.hip"],
         )
-        self.assertEqual(task["eval"]["correctness_commands"], [["./scripts/coherence-gate-dflash.sh"]])
+        self.assertEqual(task["eval"]["correctness_commands"], [["./tests/coherence-gate-dflash.sh"]])
         self.assertIn("## Suggested Experiment", text)
         self.assertIn("Prioritize decode launch/fusion experiments", text)
 

@@ -32,9 +32,9 @@
 #   2  build or environment error
 #
 # Modes:
-#   ./scripts/coherence-gate-deepseek4-mtp.sh         # short — 2 tests, ~1-2 min
-#   ./scripts/coherence-gate-deepseek4-mtp.sh --fast  # 1 test (code) — <1 min
-#   ./scripts/coherence-gate-deepseek4-mtp.sh --full  # 4 tests (cap + reason + code + math)
+#   ./tests/coherence-gate-deepseek4-mtp.sh         # short — 2 tests, ~1-2 min
+#   ./tests/coherence-gate-deepseek4-mtp.sh --fast  # 1 test (code) — <1 min
+#   ./tests/coherence-gate-deepseek4-mtp.sh --full  # 4 tests (cap + reason + code + math)
 
 set -u
 cd "$(dirname "$0")/.."

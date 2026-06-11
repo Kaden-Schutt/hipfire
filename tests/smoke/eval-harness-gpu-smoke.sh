@@ -20,10 +20,10 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-MODEL="${HIPFIRE_EVAL_SMOKE_MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4}"
+MODEL="${HIPFIRE_EVAL_SMOKE_MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4.hfq}"
 DRAFT="${HIPFIRE_EVAL_SMOKE_DRAFT:-}"
 MAX_TOKENS="${HIPFIRE_EVAL_SMOKE_MAX_TOKENS:-4}"
 OUT_ROOT="${HIPFIRE_EVAL_SMOKE_OUT_ROOT:-$HOME/.hipfire/eval-results/smoke}"

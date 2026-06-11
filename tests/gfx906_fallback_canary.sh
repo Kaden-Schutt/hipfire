@@ -20,7 +20,7 @@
 # no-op and both runs are identical.
 #
 # Usage:
-#   scripts/gfx906_fallback_canary.sh [path/to/qwen3.5-9b.mq4]
+#   tests/gfx906_fallback_canary.sh [path/to/qwen3.5-9b.mq4]
 #
 # Defaults to ~/.hipfire/models/qwen3.5-9b.mq4 if unset.
 

@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 OUT_ROOT="${HIPFIRE_EVAL_NOGPU_OUT_ROOT:-$HOME/.hipfire/eval-results/smoke}"

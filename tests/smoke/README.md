@@ -16,5 +16,5 @@ claims.
   smoke with generated quality/evidence fixtures plus examples-backed speed
   rows.
 
-`scripts/no-gpu-ci.sh` invokes the no-GPU smoke and syntax-checks the GPU smoke
+`tests/no-gpu-ci.sh` invokes the no-GPU smoke and syntax-checks the GPU smoke
 scripts.

@@ -49,10 +49,10 @@
 # pp_*, peer_access, or other pipeline-related code.
 #
 # Manual invocation:
-#   ./scripts/pp-gate.sh                       # full battery
-#   ./scripts/pp-gate.sh --skip-end-to-end     # parity example only
-#   ./scripts/pp-gate.sh --dry-run             # parser/filter trace, no GPU work
-#   ./scripts/pp-gate.sh --dry-run --simulate=0:gfx1100,1:gfx1101
+#   ./tests/pp-gate.sh                       # full battery
+#   ./tests/pp-gate.sh --skip-end-to-end     # parity example only
+#   ./tests/pp-gate.sh --dry-run             # parser/filter trace, no GPU work
+#   ./tests/pp-gate.sh --dry-run --simulate=0:gfx1100,1:gfx1101
 #                                              # feed canned topology
 
 set -u

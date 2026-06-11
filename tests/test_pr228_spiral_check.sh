@@ -40,7 +40,7 @@ run_one() {
     local prompt_json
     prompt_json=$(python3 -c "import sys,json; print(json.dumps(sys.argv[1]))" "$PROMPT")
 
-    # JSONL invocation pattern matches scripts/coherence-gate.sh:201-202
+    # JSONL invocation pattern matches tests/coherence-gate.sh:201-202
     # (single-turn `prompt` field, manual ChatML scaffolding inside the
     # daemon, no Jinja env-gate). max_tokens=800 matches the gate's
     # moe36-sheep row (line 126) and the gate-run report on this PR that

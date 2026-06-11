@@ -34,9 +34,9 @@
 #   2  build or environment error
 #
 # Modes:
-#   ./scripts/coherence-gate-dflash.sh          # short — 4 tests, ~2-3 min
-#   ./scripts/coherence-gate-dflash.sh --fast   # 2 tests (1 prose + 1 code, dflash only) — ~1 min
-#   ./scripts/coherence-gate-dflash.sh --full   # add ddtree b22-k4 + b8-k2 — ~6-8 min
+#   ./tests/coherence-gate-dflash.sh          # short — 4 tests, ~2-3 min
+#   ./tests/coherence-gate-dflash.sh --fast   # 2 tests (1 prose + 1 code, dflash only) — ~1 min
+#   ./tests/coherence-gate-dflash.sh --full   # add ddtree b22-k4 + b8-k2 — ~6-8 min
 #
 # --fast is for pre-commit on $SPEC_HOTSPOT match (down from full short battery).
 # Force-full via HIPFIRE_FORCE_SPEC_GATE=1.

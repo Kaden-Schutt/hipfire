@@ -22,8 +22,8 @@
 # Report destination: /tmp/coherence-<timestamp>.md (or $HIPFIRE_COHERENCE_OUT)
 #
 # Modes:
-#   ./scripts/coherence-gate.sh          # short battery (~2-4 min)
-#   ./scripts/coherence-gate.sh --full   # add A3B tests (~6-10 min)
+#   ./tests/coherence-gate.sh          # short battery (~2-4 min)
+#   ./tests/coherence-gate.sh --full   # add A3B tests (~6-10 min)
 
 set -u
 cd "$(dirname "$0")/.."
@@ -441,7 +441,7 @@ fi
 echo
 echo "── pflash regression stage ────────────────────────────────────────"
 HIPFIRE_PFLASH_TARGET="$PFLASH_TARGET" HIPFIRE_PFLASH_DRAFTER="$PFLASH_DRAFTER" \
-    ./scripts/pflash-gate.sh
+    ./tests/pflash-gate.sh
 pflash_rc=$?
 if [ "$pflash_rc" -ne 0 ]; then
     echo "pflash-gate: FAILED (exit $pflash_rc) — combined gate FAILED"
