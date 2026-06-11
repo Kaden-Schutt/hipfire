@@ -97,6 +97,8 @@ pub const FUSED_SIGMOID_ALPHA_GATE_CONV1D_SILU_SPLIT_GFX1151_SRC: &str = include
 pub const GEMV_HFQ2G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2g256.hip");
 pub const MOE_MQ_GFX1151_SCALAR_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/moe_mq_gfx1151_scalar_batched.hip");
+pub const GEMV_FP16_MOE_GATE_UP_INDEXED_BATCHED_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gemv_fp16_moe_gate_up_indexed_batched.gfx1151.hip");
 
 /// MQ2G256Lloyd: 2-bit + per-block 4-entry fp16 codebook (72 B/group).
 pub const GEMV_MQ2G256_LLOYD_SRC: &str =

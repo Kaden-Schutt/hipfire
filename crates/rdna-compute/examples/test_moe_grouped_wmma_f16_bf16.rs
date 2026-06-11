@@ -210,6 +210,45 @@ fn cpu_ref(
     y
 }
 
+fn cpu_gate_up_ref(
+    weights: &[Vec<f32>],
+    topk: &[i32],
+    x: &[f32],
+    m: usize,
+    k: usize,
+    k_top: usize,
+    batch: usize,
+    bf16: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    let mi = m / 2;
+    let mut gate = vec![0f32; batch * k_top * mi];
+    let mut up = vec![0f32; batch * k_top * mi];
+    let x_rounded: Vec<f32> = x
+        .iter()
+        .map(|v| if bf16 { bf16_round(*v) } else { f16_round(*v) })
+        .collect();
+    for bid in 0..batch {
+        for krank in 0..k_top {
+            let expert = topk[bid * k_top + krank] as usize;
+            let w = &weights[expert];
+            let x_row = &x_rounded[bid * k..(bid + 1) * k];
+            let out_base = bid * k_top * mi + krank * mi;
+            for row in 0..m {
+                let mut acc = 0f32;
+                for kk in 0..k {
+                    acc += w[row * k + kk] * x_row[kk];
+                }
+                if row < mi {
+                    gate[out_base + row] = acc;
+                } else {
+                    up[out_base + (row - mi)] = acc;
+                }
+            }
+        }
+    }
+    (gate, up)
+}
+
 fn run_case(
     label: &str,
     bf16: bool,
@@ -356,6 +395,111 @@ fn run_case(
     true
 }
 
+fn run_indexed_gate_up_case(label: &str, bf16: bool) -> bool {
+    let m = 64usize;
+    let k = 128usize;
+    let k_top = 8usize;
+    let batch = 5usize;
+    let experts = 4usize;
+    println!(
+        "=== {} indexed-gate-up {} M={} K={} B={} K_TOP={} E={} ===",
+        if bf16 { "BF16" } else { "F16" },
+        label,
+        m,
+        k,
+        batch,
+        k_top,
+        experts
+    );
+    let mut gpu = match Gpu::init() {
+        Ok(gpu) => gpu,
+        Err(err) => {
+            println!("  SKIP - Gpu::init failed: {err:?}");
+            return false;
+        }
+    };
+    if gpu.arch != "gfx1151" {
+        println!("  SKIP - arch {} is not gfx1151", gpu.arch);
+        return false;
+    }
+
+    let mut expert_ptrs = Vec::with_capacity(experts);
+    let mut expert_weights = Vec::with_capacity(experts);
+    let mut expert_tensors = Vec::with_capacity(experts);
+    for e in 0..experts {
+        let (bytes, rounded) = build_weight_bytes(m, k, 0x4000 + e as u32 * 6151, bf16);
+        let t = upload_raw(&mut gpu, &bytes);
+        expert_ptrs.push(t.buf.as_ptr() as u64);
+        expert_weights.push(rounded);
+        expert_tensors.push(t);
+    }
+    let expert_weight_ptrs = upload_u64(&mut gpu, &expert_ptrs);
+    let topk = (0..batch * k_top)
+        .map(|i| ((i * 3 + 1) % experts) as i32)
+        .collect::<Vec<_>>();
+    let topk_gpu = upload_i32(&mut gpu, &topk);
+    let x = build_x(batch, k, 0xabcd_1000);
+    let x_gpu = upload_f32(&mut gpu, &x);
+    let y_gate = alloc_f32_zeros(&mut gpu, batch * k_top * (m / 2));
+    let y_up = alloc_f32_zeros(&mut gpu, batch * k_top * (m / 2));
+
+    if bf16 {
+        gpu.gemv_bf16_moe_gate_up_k8_indexed_batched_gfx1151(
+            &expert_weight_ptrs,
+            &topk_gpu,
+            &x_gpu,
+            &y_gate,
+            &y_up,
+            m,
+            k,
+            k_top,
+            batch,
+        )
+        .expect("BF16 indexed gate_up launch");
+    } else {
+        gpu.gemv_f16_moe_gate_up_k8_indexed_batched_gfx1151(
+            &expert_weight_ptrs,
+            &topk_gpu,
+            &x_gpu,
+            &y_gate,
+            &y_up,
+            m,
+            k,
+            k_top,
+            batch,
+        )
+        .expect("F16 indexed gate_up launch");
+    }
+    gpu.hip.device_synchronize().expect("sync");
+    let got_gate = download_f32(&gpu, &y_gate, batch * k_top * (m / 2));
+    let got_up = download_f32(&gpu, &y_up, batch * k_top * (m / 2));
+    let (want_gate, want_up) =
+        cpu_gate_up_ref(&expert_weights, &topk, &x, m, k, k_top, batch, bf16);
+
+    let mut max_abs = 0f32;
+    let mut max_rel = 0f32;
+    for (got, want) in got_gate
+        .iter()
+        .chain(got_up.iter())
+        .zip(want_gate.iter().chain(want_up.iter()))
+    {
+        let d = (got - want).abs();
+        let r = if want.abs() > 1e-5 { d / want.abs() } else { d };
+        max_abs = max_abs.max(d);
+        max_rel = max_rel.max(r);
+    }
+    println!("  max_abs={:.6e} max_rel={:.6e}", max_abs, max_rel);
+    let abs_tol = if bf16 { 6e-2 } else { 8e-3 };
+    let rel_tol = if bf16 { 8e-2 } else { 2e-2 };
+    if max_abs > abs_tol && max_rel > rel_tol {
+        eprintln!("  FAIL");
+        std::process::exit(1);
+    }
+    drop(expert_tensors);
+    println!("  PASS");
+    true
+}
+
 fn main() {
     let mut ran = 0usize;
     for bf16 in [false, true] {
@@ -363,6 +507,7 @@ fn main() {
         ran += run_case("gate-up-div8", bf16, 64, 128, 128, 4, 8, false) as usize;
         ran += run_case("sparse-sentinel", bf16, 16, 64, 16 * 4, 4, 8, true) as usize;
         ran += run_case("padded-m", bf16, 48, 80, 48, 3, 1, false) as usize;
+        ran += run_indexed_gate_up_case("compact", bf16) as usize;
     }
     if ran == 0 {
         println!("\nNo F16/BF16 grouped MoE cases ran on this host.");

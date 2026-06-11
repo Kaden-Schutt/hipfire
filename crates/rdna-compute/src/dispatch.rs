@@ -21755,6 +21755,161 @@ impl Gpu {
         result
     }
 
+    /// gfx1151 F16 routed-MoE indexed gate/up GEMV. This is the compact
+    /// small-prefill path for full-precision experts; it computes N*K_TOP
+    /// real routed slots and avoids grouped-GEMM padding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_f16_moe_gate_up_k8_indexed_batched_gfx1151(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_src: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1151" {
+            panic!(
+                "gemv_f16_moe_gate_up_k8_indexed_batched_gfx1151: only gfx1151 is supported; arch={}",
+                self.arch
+            );
+        }
+        self.ensure_kernel(
+            "gemv_fp16_moe_gate_up_indexed_batched_gfx1151",
+            kernels::GEMV_FP16_MOE_GATE_UP_INDEXED_BATCHED_GFX1151_SRC,
+            "gemv_f16_moe_gate_up_k8_indexed_batched_gfx1151",
+        )?;
+        let xp = self.ensure_fp16_x(x_src, batch_size * k)?;
+        let ep = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let gp = y_gate.buf.as_ptr();
+        let up = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &up as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * k_top * (m / 2) * 2 * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_f16_moe_gate_up_k8_indexed_batched_gfx1151",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_f16_moe_gate_up_k8_indexed_batched_gfx1151",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(gp);
+                b.push_ptr(up);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1151 BF16 routed-MoE indexed gate/up GEMV. Input activations are
+    /// staged to BF16 first, matching the grouped BF16 WMMA path's precision.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_bf16_moe_gate_up_k8_indexed_batched_gfx1151(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_src: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1151" {
+            panic!(
+                "gemv_bf16_moe_gate_up_k8_indexed_batched_gfx1151: only gfx1151 is supported; arch={}",
+                self.arch
+            );
+        }
+        self.ensure_kernel(
+            "gemv_fp16_moe_gate_up_indexed_batched_gfx1151",
+            kernels::GEMV_FP16_MOE_GATE_UP_INDEXED_BATCHED_GFX1151_SRC,
+            "gemv_bf16_moe_gate_up_k8_indexed_batched_gfx1151",
+        )?;
+        let xp = self.ensure_bf16_x(x_src, batch_size * k)?;
+        let ep = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let gp = y_gate.buf.as_ptr();
+        let up = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &up as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * k_top * (m / 2) * 2 * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_bf16_moe_gate_up_k8_indexed_batched_gfx1151",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_bf16_moe_gate_up_k8_indexed_batched_gfx1151",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(gp);
+                b.push_ptr(up);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Fused single-CTA scatter pipeline. Replaces histogram + offsets +
     /// permute with one launch — saves ~2 launches × ~75µs per MoE layer
     /// (≈2-3ms across 40 A3B layers).

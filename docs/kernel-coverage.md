@@ -104,6 +104,11 @@ routed Q8_1 blocks in LDS across four row-warps and is bit-identical to k8, but
 regressed the default k8 path on both A3B pp256 and 122B pp128. Keep k8 as the
 default.
 
+gfx1151 BF16/F16 routed MoE: native grouped WMMA is the default. A compact
+indexed gate/up kernel has channel-test coverage but is not routed: it avoids
+grouped padding but loses on Qwen3.6-35B-A3B BF16 pp128 (`904.0ms` grouped
+gate/up vs `938.9ms` indexed gate/up across 40 calls).
+
 ### Fused QKV (prefill, quant decode into Q/K/V in one pass)
 
 | Kernel group | gfx906 | gfx942 | gfx1030 | gfx1100 | gfx1151 | gfx12 |
