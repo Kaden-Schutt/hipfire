@@ -9,6 +9,7 @@ Output is a single file the daemon mmaps directly.
 | Format | Bitwidth | Rotation | When to use |
 |---|---|---|---|
 | `fp16` | 16-bit | none | Reference/debug artifacts and maximum-quality smoke tests. Large, but preserves every quantizable tensor as raw F16. |
+| `bf16` | 16-bit | none | Source-precision smoke/reference artifacts. BF16 source tensors stay raw BF16. |
 | `mq4` | 4-bit | FWHT (rotated) | Qwen 3.5+ targets — calibrated for the DeltaNet hybrid attention path. Default for safetensors input. |
 | `mq6` | 6-bit | FWHT (rotated) | Qwen 3.5+ when you can spare +47% file size for quality. |
 | `hf4` | 4-bit | none | Dense models (Llama, Mistral, Gemma, older Qwen). Default for GGUF input. |
@@ -21,6 +22,13 @@ via `gemv_mq4g256_with_rotate`, but adds runtime overhead with no
 quality benefit on a model that wasn't trained against that weight
 space. **MQ4 on a Llama-style dense model is correct math but slower
 inference and no better quality** — pick HF4.
+
+For normal quantized safetensors output (`mq4`, `mq6`, `hf4`, `hf6`), tensors
+that are intentionally not quantized (norms, biases, small DeltaNet scalars)
+preserve their source precision. BF16 source tensors are written as BF16 in the
+same canonical artifact name, for example `qwen3.5-9b-mq4.hfq`; do not add a
+`bf16-` filename modifier. BF16 and F16 payloads have the same byte width, and
+older non-BF16 arches downgrade BF16 tensors to F16 at load time.
 
 ## From HuggingFace
 

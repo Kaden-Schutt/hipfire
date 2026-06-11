@@ -116,14 +116,28 @@ color() {
     fi
 }
 
-# Resolve model artifacts from the configured install/cache directory. The
-# current canonical artifact suffix is .hfq, but several historical gates and
-# registry rows used extensionless paths such as qwen3.5-4b.mq4.
+# Resolve model artifacts from the configured install/cache directory.
+# Accepted forms include:
+#   qwen3.5-4b.mq4          legacy extensionless registry name
+#   qwen3.5-4b.mq4.hfq      installed HFQ artifact with dotted quant token
+#   qwen3.5-4b-mq4.hfq      canonical artifact-name shape
+# DFlash draft names also use this to bridge qwen35-27b-dflash-mq4.hfq and
+# the older qwen35-27b-dflash.mq4 spelling.
 find_model_file() {
     local name="$1"
-    local dir cand
+    local stem alt dot_alt dir cand
+    stem="${name%.hfq}"
+    alt="${stem/.mq4/-mq4}"
+    dot_alt="${stem/-mq4/.mq4}"
     for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
-        for cand in "$dir/$name" "$dir/$name.hfq"; do
+        for cand in \
+            "$dir/$name" \
+            "$dir/$stem" \
+            "$dir/$stem.hfq" \
+            "$dir/$alt" \
+            "$dir/$alt.hfq" \
+            "$dir/$dot_alt" \
+            "$dir/$dot_alt.hfq"; do
             [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
         done
     done

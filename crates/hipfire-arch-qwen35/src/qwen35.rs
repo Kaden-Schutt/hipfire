@@ -10,7 +10,7 @@ use hip_bridge::{HipError, HipResult};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::hfq_modules::HfqModuleKind;
 use hipfire_runtime::llama::{
-    self, f16_to_f32, fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_for_paro,
+    self, f16_to_f32, f32_to_f16, fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_for_paro,
     fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
     fused_silu_mul_rotate_mq_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
     weight_gemv_prerotated, weight_gemv_residual, weight_gemv_swiglu_residual, EmbeddingFormat,
@@ -174,7 +174,9 @@ enum F16LmHeadMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Bf16WeightLoadMode {
+    Auto,
     Native,
+    F16,
     F32,
 }
 
@@ -187,8 +189,12 @@ fn parse_f16_lm_head_mode(value: Option<&str>) -> F16LmHeadMode {
 
 fn parse_bf16_weight_load_mode(value: Option<&str>) -> Bf16WeightLoadMode {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Bf16WeightLoadMode::Auto,
+        Some(v) if matches!(v.as_str(), "auto" | "") => Bf16WeightLoadMode::Auto,
+        Some(v) if matches!(v.as_str(), "native" | "bf16") => Bf16WeightLoadMode::Native,
+        Some(v) if matches!(v.as_str(), "f16" | "fp16") => Bf16WeightLoadMode::F16,
         Some(v) if matches!(v.as_str(), "0" | "f32" | "fp32" | "legacy") => Bf16WeightLoadMode::F32,
-        _ => Bf16WeightLoadMode::Native,
+        _ => Bf16WeightLoadMode::Auto,
     }
 }
 
@@ -200,6 +206,18 @@ fn f16_lm_head_mode_from_env() -> F16LmHeadMode {
 fn bf16_weight_load_mode_from_env() -> Bf16WeightLoadMode {
     let value = std::env::var("HIPFIRE_BF16_WEIGHTS").ok();
     parse_bf16_weight_load_mode(value.as_deref())
+}
+
+fn bf16_native_weight_arch(arch: &str) -> bool {
+    arch.starts_with("gfx11") || arch.starts_with("gfx12")
+}
+
+fn resolve_bf16_weight_load_mode(requested: Bf16WeightLoadMode, arch: &str) -> Bf16WeightLoadMode {
+    match requested {
+        Bf16WeightLoadMode::Auto if bf16_native_weight_arch(arch) => Bf16WeightLoadMode::Native,
+        Bf16WeightLoadMode::Auto => Bf16WeightLoadMode::F16,
+        other => other,
+    }
 }
 
 /// Optional tree-attention context for `forward_prefill_batch` — activates
@@ -1480,6 +1498,15 @@ fn bf16_bytes_to_f32(data: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn bf16_bytes_to_f16_bytes(data: &[u8]) -> Vec<u8> {
+    data.chunks_exact(2)
+        .flat_map(|c| {
+            let v = bf16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+            f32_to_f16(v).to_le_bytes()
+        })
+        .collect()
+}
+
 fn hfq_plain_tensor_as_f32(info: &HfqTensorInfo, data: &[u8], name: &str) -> Vec<f32> {
     match info.quant_type {
         1 => data
@@ -1539,18 +1566,31 @@ fn load_norm_weight_raw(
     gpu.upload_f32(&f32_data, shape)
 }
 
-/// Load a qt=16 matrix weight. Native BF16 is the default contract for
-/// matrix/tied-embedding weights: kernels consume BF16 operands and accumulate
-/// into F32 where the dispatch supports it. `HIPFIRE_BF16_WEIGHTS=f32` keeps a
-/// debug/oracle escape hatch for the old host-expanded path.
+/// Load a qt=16 matrix weight. BF16-capable RDNA arches keep raw BF16 by
+/// default; older arches host-convert to same-size F16 so a single BF16-
+/// preserving HFQ artifact remains portable. `HIPFIRE_BF16_WEIGHTS` accepts
+/// `native`, `f16`, or `f32` as explicit overrides.
 fn load_bf16_matrix_weight(gpu: &Gpu, data: &[u8], m: usize, k: usize) -> HipResult<WeightTensor> {
-    match bf16_weight_load_mode_from_env() {
+    match resolve_bf16_weight_load_mode(bf16_weight_load_mode_from_env(), &gpu.arch) {
         Bf16WeightLoadMode::Native => {
             let mut buf = gpu.upload_raw(data, &[data.len()])?;
             buf.dtype = DType::BF16;
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::BF16,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        Bf16WeightLoadMode::F16 | Bf16WeightLoadMode::Auto => {
+            let f16_data = bf16_bytes_to_f16_bytes(data);
+            let buf = gpu.upload_raw(&f16_data, &[m, k])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::F16,
                 m,
                 k,
                 row_stride: 0,
@@ -13688,8 +13728,7 @@ fn prefill_moe_ffn_body_batched(
             }
             // Load all active experts once before the per-bucket loops so the
             // down phase doesn't need a second round of page-ins.
-            let active_experts: Vec<usize> =
-                buckets.iter().map(|b| b.expert as usize).collect();
+            let active_experts: Vec<usize> = buckets.iter().map(|b| b.expert as usize).collect();
             ensure_paged_experts_resident(gpu, pager, ffn, &active_experts)?;
             for bucket in buckets {
                 upload_paged_moe_expert_bucket(gpu, bucket, sorted, inverse_perm, tile_ids)?;
@@ -23836,11 +23875,8 @@ mod tests {
     }
 
     #[test]
-    fn bf16_weight_load_mode_defaults_to_native() {
-        assert_eq!(
-            parse_bf16_weight_load_mode(None),
-            Bf16WeightLoadMode::Native
-        );
+    fn bf16_weight_load_mode_defaults_to_auto() {
+        assert_eq!(parse_bf16_weight_load_mode(None), Bf16WeightLoadMode::Auto);
         assert_eq!(
             parse_bf16_weight_load_mode(Some("native")),
             Bf16WeightLoadMode::Native
@@ -23851,8 +23887,52 @@ mod tests {
         );
         assert_eq!(
             parse_bf16_weight_load_mode(Some("surprise")),
+            Bf16WeightLoadMode::Auto
+        );
+    }
+
+    #[test]
+    fn bf16_weight_load_mode_auto_is_arch_aware() {
+        assert_eq!(
+            resolve_bf16_weight_load_mode(Bf16WeightLoadMode::Auto, "gfx1151"),
             Bf16WeightLoadMode::Native
         );
+        assert_eq!(
+            resolve_bf16_weight_load_mode(Bf16WeightLoadMode::Auto, "gfx1201"),
+            Bf16WeightLoadMode::Native
+        );
+        assert_eq!(
+            resolve_bf16_weight_load_mode(Bf16WeightLoadMode::Auto, "gfx906"),
+            Bf16WeightLoadMode::F16
+        );
+        assert_eq!(
+            resolve_bf16_weight_load_mode(Bf16WeightLoadMode::Auto, "gfx1030"),
+            Bf16WeightLoadMode::F16
+        );
+    }
+
+    #[test]
+    fn bf16_weight_load_mode_allows_f16_downgrade_override() {
+        assert_eq!(
+            parse_bf16_weight_load_mode(Some("f16")),
+            Bf16WeightLoadMode::F16
+        );
+        assert_eq!(
+            parse_bf16_weight_load_mode(Some("fp16")),
+            Bf16WeightLoadMode::F16
+        );
+        assert_eq!(
+            resolve_bf16_weight_load_mode(Bf16WeightLoadMode::F16, "gfx1151"),
+            Bf16WeightLoadMode::F16
+        );
+    }
+
+    #[test]
+    fn bf16_to_f16_downgrade_preserves_byte_width() {
+        let bf16 = [0x80, 0x3f, 0x00, 0x40]; // 1.0, 2.0 in BF16 LE
+        let f16 = bf16_bytes_to_f16_bytes(&bf16);
+        assert_eq!(f16.len(), bf16.len());
+        assert_eq!(f16, vec![0x00, 0x3c, 0x00, 0x40]);
     }
 
     #[test]

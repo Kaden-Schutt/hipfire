@@ -8474,42 +8474,31 @@ fn main() {
                 spilled_len: 0,
             });
         } else {
-            // Keep as F16 (convert BF16 -> F16 if needed)
-            let f16_data = match meta.dtype.as_str() {
-                "F16" => raw_data.to_vec(),
-                "BF16" => {
-                    // BF16 → F32 → F16
-                    let f32_vals = to_f32(raw_data, "BF16");
-                    f32_vals
-                        .iter()
-                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                        .collect()
-                }
-                "F32" => {
-                    let f32_vals = to_f32(raw_data, "F32");
-                    f32_vals
-                        .iter()
-                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                        .collect()
-                }
-                other => panic!("unsupported dtype for norm/embd: {other}"),
+            // Preserve source precision for non-quantized tensors (norms,
+            // biases, DeltaNet scalars, etc.). BF16 and F16 have the same byte
+            // width, so keeping BF16 in normal MQ/HFQ artifacts remains
+            // portable: older arches can downgrade to F16 at load time.
+            let f32_data = if meta.dtype == "F32" {
+                to_f32(raw_data, "F32")
+            } else {
+                Vec::new()
             };
-
+            let (data, qt, label) = source_precision_tensor_bytes(raw_data, &meta.dtype, &f32_data);
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             eprintln!(
-                "  F16:        {} {:?} ({} elements, {:.1} KB)",
+                "  {label:<10} {} {:?} ({} elements, {:.1} KB)",
                 name,
                 meta.shape,
                 n_elements,
-                f16_data.len() as f64 / 1024.0
+                data.len() as f64 / 1024.0
             );
 
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
-                quant_type: QuantType::F16,
+                quant_type: qt,
                 shape,
                 group_size: 0,
-                data: f16_data,
+                data,
                 spilled_len: 0,
             });
         }
@@ -10576,6 +10565,16 @@ mod tests {
         assert_eq!(data, raw);
         assert_eq!(quant_type as u8, QuantType::BF16 as u8);
         assert_eq!(label, "BF16");
+    }
+
+    #[test]
+    fn source_precision_converts_f32_to_f16_for_same_width_fallback() {
+        let raw = vec![0; 8];
+        let f32_data = [1.0, 2.0];
+        let (data, quant_type, label) = source_precision_tensor_bytes(&raw, "F32", &f32_data);
+        assert_eq!(data, vec![0x00, 0x3c, 0x00, 0x40]);
+        assert_eq!(quant_type as u8, QuantType::F16 as u8);
+        assert_eq!(label, "F16");
     }
 
     #[test]

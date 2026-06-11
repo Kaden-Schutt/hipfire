@@ -37,7 +37,7 @@
 | `HIPFIRE_BASELINE_ARCH` | `crates/hipfire-runtime/src/coherence_runtime.rs:440` |
 | `HIPFIRE_BF16_DENSE_M128` | `crates/rdna-compute/src/dispatch.rs:40829` |
 | `HIPFIRE_BF16_MOE_M256` | `crates/rdna-compute/src/dispatch.rs:21495` |
-| `HIPFIRE_BF16_WEIGHTS` | `crates/hipfire-arch-qwen35/src/qwen35.rs:201` |
+| `HIPFIRE_BF16_WEIGHTS` | `crates/hipfire-arch-qwen35/src/qwen35.rs:207` |
 | `HIPFIRE_BLOB_FORCE` | `crates/rdna-compute/src/feature_flags.rs:212` |
 | `HIPFIRE_CALIB_PROFILE` | `crates/hipfire-runtime/examples/triattn_validate.rs:40` |
 | `HIPFIRE_CASK_OFF` | `cli/index.ts:878` |
