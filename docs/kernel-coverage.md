@@ -65,13 +65,13 @@ gfx1151 now routes HFQ4/MQ4 decode GEMV through the RDNA3 single-row and multi-r
 | gemm residual mq4g256 | — | — | — | — | standard (wmma) | standard (wmma) |
 | gemm residual mq3g256 | — | — | — | — | — | standard (wmma) |
 | gemm residual hfp4g32 | — | — | — | — | — | standard (wmma) |
-| gemm residual q8_0 | — | — | — | — | — | standard (wmma) |
+| gemm residual q8_0 | — | — | — | — | standard (wmma 4w) | standard (wmma) |
 | gemm gate_up hfq4g256 | **tuned** (x8–x64) | standard | **tuned** (mmq x8–x32) | — | standard (wmma) | **tuned** (wmma) |
 | gemm gate_up hfq3g256 | — | — | **tuned** (mmq+dp4a) | — | — | standard (wmma) |
 | gemm gate_up mq4g256 | — | — | — | standard | **tuned** (wmma, mb4) | **tuned** (wmma) |
 | gemm gate_up mq3g256 | — | — | — | standard | — | standard (wmma) |
 | gemm gate_up hfp4g32 | — | — | — | — | — | standard (wmma) |
-| gemm gate_up q8_0 | — | — | — | — | — | standard (wmma) |
+| gemm gate_up q8_0 | — | — | — | — | standard (wmma 4w) | standard (wmma) |
 | gemm qkv hfq4g256 | **tuned** (x8–x64) | standard | **tuned** (mmq x8–x32) | — | standard (wmma) | **tuned** (wmma) |
 | gemm qkv hfq3g256 | — | — | **tuned** (mmq+dp4a) | — | — | standard (wmma) |
 | gemm qkv mq4g256 | — | — | — | — | standard (wmma, mb4) | **tuned** (wmma) |
@@ -106,7 +106,7 @@ default.
 | fused qkv mq4g256 | — | — | — | standard | standard (wmma, mb4) | **tuned** |
 | fused qkv mq3g256 | — | — | — | standard | — | standard |
 | fused qkv hfp4g32 | — | — | — | — | — | standard |
-| fused qkv q8_0 | — | — | — | — | — | standard |
+| fused qkv q8_0 | — | — | — | — | standard (wmma 4w) | standard |
 
 ### Attention
 

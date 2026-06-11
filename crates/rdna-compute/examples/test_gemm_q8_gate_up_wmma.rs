@@ -6,6 +6,7 @@
 //! Gate: gated mean_rel < 1e-3 on Y_gate and Y_up.
 
 use rdna_compute::{DType, Gpu};
+use std::time::Instant;
 
 #[path = "common/q8_test_utils.rs"]
 mod q8_test_utils;
@@ -44,6 +45,8 @@ fn main() {
 
         let d_yg_w = gpu.zeros(&[max_n * gate_m], DType::F32).unwrap();
         let d_yu_w = gpu.zeros(&[max_n * up_m], DType::F32).unwrap();
+        let d_yg_4w = gpu.zeros(&[max_n * gate_m], DType::F32).unwrap();
+        let d_yu_4w = gpu.zeros(&[max_n * up_m], DType::F32).unwrap();
         let d_yg_r = gpu.zeros(&[max_n * gate_m], DType::F32).unwrap();
         let d_yu_r = gpu.zeros(&[max_n * up_m], DType::F32).unwrap();
 
@@ -51,6 +54,8 @@ fn main() {
             let x_n = d_x.sub_offset(0, n * k);
             let gw = d_yg_w.sub_offset(0, n * gate_m);
             let uw = d_yu_w.sub_offset(0, n * up_m);
+            let g4 = d_yg_4w.sub_offset(0, n * gate_m);
+            let u4 = d_yu_4w.sub_offset(0, n * up_m);
             let gr = d_yg_r.sub_offset(0, n * gate_m);
             let ur = d_yu_r.sub_offset(0, n * up_m);
 
@@ -93,6 +98,78 @@ fn main() {
                 "  N={n:4}  {mark}   gate: mean={:.2e}/max={:.2e}  up: {:.2e}/{:.2e}",
                 s[0].mean_rel, s[0].max_rel, s[1].mean_rel, s[1].max_rel,
             );
+
+            if arch == "gfx1151" && n % 64 == 0 {
+                gpu.gemm_gate_up_q8_0_wmma_4w_gfx1151(
+                    &d_g, &d_u, &x_n, &g4, &u4, gate_m, up_m, k, n,
+                )
+                .unwrap();
+                let s4 = [
+                    compare(
+                        &gpu.download_f32(&g4).unwrap(),
+                        &gpu.download_f32(&gr).unwrap(),
+                    ),
+                    compare(
+                        &gpu.download_f32(&u4).unwrap(),
+                        &gpu.download_f32(&ur).unwrap(),
+                    ),
+                ];
+                let pass4 = s4.iter().all(|x| x.mean_rel < 2e-3 && x.max_rel < 3.5e-2);
+                let mark4 = if pass4 {
+                    "PASS"
+                } else {
+                    total_fail += 1;
+                    "FAIL"
+                };
+                eprintln!(
+                    "          4w {mark4} gate: mean={:.2e}/max={:.2e}  up: {:.2e}/{:.2e}",
+                    s4[0].mean_rel, s4[0].max_rel, s4[1].mean_rel, s4[1].max_rel,
+                );
+
+                if std::env::var("HIPFIRE_Q8_GATE_UP_BENCH").ok().as_deref() == Some("1")
+                    && std::env::var("HIPFIRE_Q8_GATE_UP_4W").ok().as_deref() == Some("0")
+                    && gate_m == 11008
+                    && up_m == 11008
+                    && k == 4096
+                    && n >= 128
+                {
+                    const WARMUP: usize = 5;
+                    const ITERS: usize = 40;
+                    for _ in 0..WARMUP {
+                        gpu.gemm_gate_up_q8_0_wmma(&d_g, &d_u, &x_n, &gw, &uw, gate_m, up_m, k, n)
+                            .unwrap();
+                    }
+                    gpu.hip.device_synchronize().unwrap();
+                    let t0 = Instant::now();
+                    for _ in 0..ITERS {
+                        gpu.gemm_gate_up_q8_0_wmma(&d_g, &d_u, &x_n, &gw, &uw, gate_m, up_m, k, n)
+                            .unwrap();
+                    }
+                    gpu.hip.device_synchronize().unwrap();
+                    let one_warp_us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+
+                    for _ in 0..WARMUP {
+                        gpu.gemm_gate_up_q8_0_wmma_4w_gfx1151(
+                            &d_g, &d_u, &x_n, &g4, &u4, gate_m, up_m, k, n,
+                        )
+                        .unwrap();
+                    }
+                    gpu.hip.device_synchronize().unwrap();
+                    let t0 = Instant::now();
+                    for _ in 0..ITERS {
+                        gpu.gemm_gate_up_q8_0_wmma_4w_gfx1151(
+                            &d_g, &d_u, &x_n, &g4, &u4, gate_m, up_m, k, n,
+                        )
+                        .unwrap();
+                    }
+                    gpu.hip.device_synchronize().unwrap();
+                    let four_warp_us = t0.elapsed().as_secs_f64() * 1e6 / ITERS as f64;
+                    eprintln!(
+                        "          bench 1w={one_warp_us:.1}us 4w={four_warp_us:.1}us speedup={:.2}x",
+                        one_warp_us / four_warp_us
+                    );
+                }
+            }
         }
     }
     eprintln!("\n=== {total_fail} failure(s) ===");

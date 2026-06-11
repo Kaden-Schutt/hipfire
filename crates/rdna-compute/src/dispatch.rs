@@ -28310,6 +28310,18 @@ impl Gpu {
             0,
             "gemm_gate_up_q8_0_wmma: K must be a multiple of 32 (got K={k})"
         );
+        static Q8_GATE_UP_4W: OnceLock<bool> = OnceLock::new();
+        let q8_gate_up_4w = *Q8_GATE_UP_4W.get_or_init(|| {
+            !matches!(
+                std::env::var("HIPFIRE_Q8_GATE_UP_4W").ok().as_deref(),
+                Some("0" | "off" | "false" | "no")
+            )
+        });
+        if q8_gate_up_4w && self.arch == "gfx1151" && batch_size % 64 == 0 && batch_size >= 128 {
+            return self.gemm_gate_up_q8_0_wmma_4w_gfx1151(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            );
+        }
         self.ensure_kernel(
             "gemm_gate_up_q8_0_wmma",
             kernels::GEMM_GATE_UP_Q8_0_WMMA_SRC,
@@ -28350,6 +28362,101 @@ impl Gpu {
             "gemm_gate_up_q8_0_wmma",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_g);
+                b.push_ptr(a_u);
+                b.push_ptr(xp);
+                b.push_ptr(y_g);
+                b.push_ptr(y_u);
+                b.push_i32(gate_m_val);
+                b.push_i32(up_m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1151 4-warp 64x64 Q8_0 gate+up GEMM for large prefill shapes.
+    pub fn gemm_gate_up_q8_0_wmma_4w_gfx1151(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(
+            self.arch, "gfx1151",
+            "gemm_gate_up_q8_0_wmma_4w_gfx1151 is gfx1151-only"
+        );
+        debug_assert_eq!(
+            k % 32,
+            0,
+            "gemm_gate_up_q8_0_wmma_4w_gfx1151: K must be a multiple of 32"
+        );
+        debug_assert_eq!(
+            batch_size % 64,
+            0,
+            "gemm_gate_up_q8_0_wmma_4w_gfx1151: N must be a multiple of 64"
+        );
+        self.ensure_kernel(
+            "gemm_gate_up_q8_0_wmma_4w_gfx1151",
+            kernels::GEMM_GATE_UP_Q8_0_WMMA_4W_GFX1151_SRC,
+            "gemm_gate_up_q8_0_wmma_4w_gfx1151",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_g = a_gate.buf.as_ptr();
+        let mut a_u = a_up.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut y_g = y_gate.buf.as_ptr();
+        let mut y_u = y_up.buf.as_ptr();
+        let mut gate_m_val = gate_m as i32;
+        let mut up_m_val = up_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_g as *mut _ as *mut c_void,
+            &mut a_u as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_g as *mut _ as *mut c_void,
+            &mut y_u as *mut _ as *mut c_void,
+            &mut gate_m_val as *mut _ as *mut c_void,
+            &mut up_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = gate_m + up_m;
+        let row_tiles = (total_m + 63) / 64;
+        let batch_tiles = (batch_size + 63) / 64;
+        let q8_bytes = |m: usize| m * (k / 32) * 34;
+        let bytes =
+            q8_bytes(gate_m) + q8_bytes(up_m) + batch_size * k * 2 + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            "gemm_gate_up_q8_0_wmma_4w_gfx1151",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_gate_up_q8_0_wmma_4w_gfx1151",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [128, 1, 1],
             0,
             &mut params,
             || {

@@ -291,6 +291,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_Q8_BATCHED_LEGACY` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:220` |
 | `HIPFIRE_Q8_DP4A` | (A2) dp4a wave32 (gfx906 v_dot4_i32_i8 Q·K) | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:185` |
 | `HIPFIRE_Q8_DP4A_W64` | (A3) dp4a WAVE64 (full 64-lane utilization) | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:196` |
+| `HIPFIRE_Q8_GATE_UP_4W` | Default ON for gfx1151 Q8 gate+up prefill when `N>=128` and `N%64==0`; set to `0` to use the single-wave WMMA path | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28316` |
 | `HIPFIRE_Q8_QKVZA_4W` | Interprets "HIPFIRE_Q8_QKVZA_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:27957` |
 | `HIPFIRE_Q8_QKV_4W` | Interprets "HIPFIRE_Q8_QKV_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28457` |
 | `HIPFIRE_Q8_RESIDUAL_4W` | Interprets "HIPFIRE_Q8_RESIDUAL_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28286` |
