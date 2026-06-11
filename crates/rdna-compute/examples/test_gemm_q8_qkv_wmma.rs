@@ -69,6 +69,10 @@ fn main() {
         let d_yk_wmma = gpu.zeros(&[max_n * k_m], DType::F32).unwrap();
         let d_yv_wmma = gpu.zeros(&[max_n * v_m], DType::F32).unwrap();
 
+        let d_yq_4w = gpu.zeros(&[max_n * q_m], DType::F32).unwrap();
+        let d_yk_4w = gpu.zeros(&[max_n * k_m], DType::F32).unwrap();
+        let d_yv_4w = gpu.zeros(&[max_n * v_m], DType::F32).unwrap();
+
         let d_yq_ref = gpu.zeros(&[max_n * q_m], DType::F32).unwrap();
         let d_yk_ref = gpu.zeros(&[max_n * k_m], DType::F32).unwrap();
         let d_yv_ref = gpu.zeros(&[max_n * v_m], DType::F32).unwrap();
@@ -78,6 +82,9 @@ fn main() {
             let yq_w = d_yq_wmma.sub_offset(0, n * q_m);
             let yk_w = d_yk_wmma.sub_offset(0, n * k_m);
             let yv_w = d_yv_wmma.sub_offset(0, n * v_m);
+            let yq_4 = d_yq_4w.sub_offset(0, n * q_m);
+            let yk_4 = d_yk_4w.sub_offset(0, n * k_m);
+            let yv_4 = d_yv_4w.sub_offset(0, n * v_m);
             let yq_r = d_yq_ref.sub_offset(0, n * q_m);
             let yk_r = d_yk_ref.sub_offset(0, n * k_m);
             let yv_r = d_yv_ref.sub_offset(0, n * v_m);
@@ -142,6 +149,43 @@ fn main() {
                 stats_v.mean_rel,
                 stats_v.max_rel,
             );
+
+            if arch == "gfx1151" && n % 64 == 0 {
+                gpu.gemm_qkv_q8_0_wmma_4w_gfx1151(
+                    &d_aq, &d_ak, &d_av, &x_n, &yq_4, &yk_4, &yv_4, q_m, k_m, v_m, k, n,
+                )
+                .unwrap();
+                let yq_4_host = gpu.download_f32(&yq_4).unwrap();
+                let yk_4_host = gpu.download_f32(&yk_4).unwrap();
+                let yv_4_host = gpu.download_f32(&yv_4).unwrap();
+                let stats_q4 = compare(&yq_4_host, &yq_r_host);
+                let stats_k4 = compare(&yk_4_host, &yk_r_host);
+                let stats_v4 = compare(&yv_4_host, &yv_r_host);
+                let pass4 = stats_q4.mean_rel < 2e-3
+                    && stats_k4.mean_rel < 2e-3
+                    && stats_v4.mean_rel < 2e-3
+                    && stats_q4.max_rel < 3.5e-2
+                    && stats_k4.max_rel < 3.5e-2
+                    && stats_v4.max_rel < 3.5e-2;
+                let mark4 = if pass4 {
+                    "PASS"
+                } else {
+                    total_fail += 1;
+                    "FAIL"
+                };
+                eprintln!(
+                    "          4w {mark4} \
+                     Q: mean_rel={:.3e} max_rel={:.3e}  \
+                     K: mean_rel={:.3e} max_rel={:.3e}  \
+                     V: mean_rel={:.3e} max_rel={:.3e}",
+                    stats_q4.mean_rel,
+                    stats_q4.max_rel,
+                    stats_k4.mean_rel,
+                    stats_k4.max_rel,
+                    stats_v4.mean_rel,
+                    stats_v4.max_rel,
+                );
+            }
         }
     }
 

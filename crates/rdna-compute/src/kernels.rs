@@ -2177,6 +2177,11 @@ pub const GEMM_Q8_0_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_
 pub const GEMM_QKV_Q8_0_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_q8_0_wmma.hip");
 
+/// gfx1151 4-warp 64x64 fused QKV GEMM for Q8_0.
+/// LDS-stages X and reuses packed Q8 rows across 64 prompt tokens.
+pub const GEMM_QKV_Q8_0_WMMA_4W_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gemm_qkv_q8_0_wmma_4w.gfx1151.hip");
+
 /// WMMA 4-way fused qkv+z+beta+alpha GEMM for Q8_0 (DeltaNet LA preamble).
 pub const GEMM_QKVZA_Q8_0_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_q8_0_wmma.hip");
