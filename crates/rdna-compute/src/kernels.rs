@@ -1921,6 +1921,8 @@ pub const GEMM_HFQ6G256_RESIDUAL_FP16_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq6g256_residual_fp16.hip");
 pub const GEMM_HFQ6G256_RESIDUAL_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq6g256_residual_wmma_k2.hip");
+pub const GEMM_HFQ6G256_RESIDUAL_WMMA_4W_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gemm_hfq6g256_residual_wmma_4w.gfx1151.hip");
 // gfx12 (RDNA4) sister of GEMM_HFQ6G256_RESIDUAL_WMMA_K2_SRC. Pure composition
 // of validated patterns — hfq6 dequant (gemm_qkv_hfq6g256_wmma.gfx12.hip) +
 // fused residual `+=` (gemm_q8_0_residual_wmma.gfx12.hip).

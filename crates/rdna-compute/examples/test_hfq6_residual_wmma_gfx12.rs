@@ -1,4 +1,4 @@
-//! Channel-test for the gfx12 (RDNA4) WMMA HFQ6-G256 residual sister.
+//! Channel-test for WMMA HFQ6-G256 residual sisters.
 //!
 //! Tests the WMMA matmul AND the fused `+=` residual semantics.
 //!
@@ -24,12 +24,9 @@ use rdna_compute::Gpu;
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     let arch = gpu.arch.clone();
-    eprintln!("=== test_hfq6_residual_wmma_gfx12 ===\n  arch = {arch}");
-    if !arch.starts_with("gfx12") {
-        eprintln!(
-            "  SKIPPED: this test requires gfx12 (RDNA4). Current arch: {arch}.\n\
-             The `_w32_gfx12` WMMA builtin does not exist on other archs."
-        );
+    eprintln!("=== test_hfq6_residual_wmma ===\n  arch = {arch}");
+    if !arch.starts_with("gfx11") && !arch.starts_with("gfx12") {
+        eprintln!("  SKIPPED: needs gfx11/12, got {arch}");
         std::process::exit(0);
     }
 
@@ -65,10 +62,15 @@ fn main() {
         for &n in &batches {
             let x_n = d_x.sub_offset(0, n * k);
 
-            // Test path: seed Y with residual, run fused gfx12 WMMA kernel.
+            // Test path: seed Y with residual, run fused WMMA kernel.
             let d_y_test = gpu.upload_f32(&r_host[..n * m], &[n, m]).unwrap();
-            gpu.gemm_hfq6g256_residual_wmma_gfx12(&d_a, &x_n, &d_y_test, m, k, n)
-                .unwrap();
+            if arch.starts_with("gfx12") {
+                gpu.gemm_hfq6g256_residual_wmma_gfx12(&d_a, &x_n, &d_y_test, m, k, n)
+                    .unwrap();
+            } else {
+                gpu.gemm_hfq6g256_residual_wmma(&d_a, &x_n, &d_y_test, m, k, n)
+                    .unwrap();
+            }
 
             // Ref path: seed Y with same residual, run validated FP16 kernel.
             // (Both paths take FP32 X — the WMMA wrapper converts to FP16
@@ -97,6 +99,28 @@ fn main() {
                 "  N={n:4}  {mark}   max_abs={:.2e}  mean_rel={:.2e}  max_rel={:.2e}  drift={:.2e}",
                 s.max_abs, s.mean_rel, s.max_rel, drift
             );
+
+            if arch == "gfx1151" && n % 64 == 0 {
+                let d_y_4w = gpu.upload_f32(&r_host[..n * m], &[n, m]).unwrap();
+                gpu.gemm_hfq6g256_residual_wmma_4w_gfx1151(&d_a, &x_n, &d_y_4w, m, k, n)
+                    .unwrap();
+                let s4 = compare(
+                    &gpu.download_f32(&d_y_4w).unwrap(),
+                    &gpu.download_f32(&d_y_ref).unwrap(),
+                );
+                let drift4 = s4.max_abs / s4.max_ref.max(1e-6);
+                let pass4 = s4.mean_rel < 2.5e-3 && s4.max_rel < 6e-2 && drift4 < 5e-3;
+                let mark4 = if pass4 {
+                    "PASS"
+                } else {
+                    total_fail += 1;
+                    "FAIL"
+                };
+                eprintln!(
+                    "          4w {mark4} max_abs={:.2e}  mean_rel={:.2e}  max_rel={:.2e}  drift={:.2e}",
+                    s4.max_abs, s4.mean_rel, s4.max_rel, drift4
+                );
+            }
         }
     }
     eprintln!("\n=== {total_fail} failure(s) ===");

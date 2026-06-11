@@ -25079,6 +25079,20 @@ impl Gpu {
             if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_hfq6g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
             }
+            static HFQ6_RESIDUAL_4W: OnceLock<bool> = OnceLock::new();
+            let hfq6_residual_4w = *HFQ6_RESIDUAL_4W.get_or_init(|| {
+                matches!(
+                    std::env::var("HIPFIRE_HFQ6_RESIDUAL_4W").ok().as_deref(),
+                    Some("1" | "on" | "true" | "yes")
+                )
+            });
+            if hfq6_residual_4w
+                && self.arch == "gfx1151"
+                && batch_size % 64 == 0
+                && batch_size >= 128
+            {
+                return self.gemm_hfq6g256_residual_wmma_4w_gfx1151(a_raw, x, y, m, k, batch_size);
+            }
             // WMMA on gfx11+ (RDNA3): 16x16 tiled
             if self.arch_caps.has_wmma_w32() {
                 return self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size);
@@ -25263,6 +25277,88 @@ impl Gpu {
                 &mut params,
             )
         };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1151 4-warp 64x64 WMMA HFQ6 residual GEMM.
+    pub fn gemm_hfq6g256_residual_wmma_4w_gfx1151(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(
+            self.arch, "gfx1151",
+            "gemm_hfq6g256_residual_wmma_4w_gfx1151 is gfx1151-only"
+        );
+        debug_assert_eq!(
+            k % 256,
+            0,
+            "gemm_hfq6g256_residual_wmma_4w_gfx1151: K must be a multiple of 256"
+        );
+        debug_assert_eq!(
+            batch_size % 64,
+            0,
+            "gemm_hfq6g256_residual_wmma_4w_gfx1151: N must be a multiple of 64"
+        );
+        self.ensure_kernel(
+            "gemm_hfq6g256_residual_wmma_4w_gfx1151",
+            kernels::GEMM_HFQ6G256_RESIDUAL_WMMA_4W_GFX1151_SRC,
+            "gemm_hfq6g256_residual_wmma_4w_gfx1151",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 63) / 64;
+        let batch_tiles = (batch_size + 63) / 64;
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            "gemm_hfq6g256_residual_wmma_4w_gfx1151",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_hfq6g256_residual_wmma_4w_gfx1151",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
