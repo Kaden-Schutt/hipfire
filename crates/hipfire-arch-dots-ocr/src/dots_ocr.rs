@@ -540,7 +540,14 @@ fn load_norm_weight_raw(
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        qt => panic!("dots-ocr: expected F16/F32 for norm {name}, got qt={qt}"),
+        16 => data
+            .chunks_exact(2)
+            .map(|c| {
+                let bits = u16::from_le_bytes([c[0], c[1]]);
+                f32::from_bits((bits as u32) << 16)
+            })
+            .collect(),
+        qt => panic!("dots-ocr: expected F16/F32/BF16 for norm {name}, got qt={qt}"),
     };
     assert_eq!(
         f32_data.len(),

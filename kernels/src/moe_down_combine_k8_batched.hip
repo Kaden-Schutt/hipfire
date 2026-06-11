@@ -33,18 +33,11 @@ extern "C" __global__ void moe_down_combine_k8_batched(
     const int       weights_base = bid * K_TOP;
     const long long residual_off = (long long)bid * M + col;
 
-    // K_TOP is statically 8 per the indexed-batched kernel family contract.
-    // Hard-coding the unroll lets the compiler issue 8 independent loads of
-    // (expert_outputs, topk_weights) without a loop branch, and keeps the
-    // accumulator chain short for FP-stable reductions.
     float acc = 0.0f;
-    #pragma unroll
-    for (int k = 0; k < 8; k++) {
-        if (k < K_TOP) {
-            float w  = topk_weights[weights_base + k];
-            float v  = expert_outputs[token_base + (long long)k * M + col];
-            acc += w * v;
-        }
+    for (int k = 0; k < K_TOP; k++) {
+        float w  = topk_weights[weights_base + k];
+        float v  = expert_outputs[token_base + (long long)k * M + col];
+        acc += w * v;
     }
 
     x_residual[residual_off] += acc;

@@ -837,6 +837,46 @@ impl WeightPager {
         self.resident_modules.len()
     }
 
+    pub fn would_fit_expert_module_set(
+        &self,
+        layer: u16,
+        experts: &[u16],
+    ) -> Result<(), WeightPagerError> {
+        let mut unique = experts.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let mut need = 0u64;
+        for expert in unique {
+            let key = ExpertModuleKey { layer, expert };
+            let module = self
+                .module_catalog
+                .get(&key)
+                .ok_or(WeightPagerError::ModuleNotRegistered(key))?;
+            need = need.saturating_add(module.data_size as u64);
+        }
+        self.would_fit(need)
+    }
+
+    /// Worst-case budget check: sums the `k` largest expert data sizes for
+    /// `layer` and verifies they fit. Safer than [`would_fit_expert_module_set`]
+    /// for heterogeneous expert sizes because it probes the heaviest possible
+    /// routing set rather than an arbitrary fixed prefix.
+    pub fn would_fit_largest_expert_module_set(
+        &self,
+        layer: u16,
+        k: usize,
+    ) -> Result<(), WeightPagerError> {
+        let mut sizes: Vec<u64> = self
+            .module_catalog
+            .iter()
+            .filter(|(key, _)| key.layer == layer)
+            .map(|(_, m)| m.data_size as u64)
+            .collect();
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        let need: u64 = sizes.iter().take(k).sum();
+        self.would_fit(need)
+    }
+
     pub fn module_stats(&self) -> ModulePagerStats {
         ModulePagerStats {
             registered_modules: self.module_catalog.len(),
@@ -1023,12 +1063,15 @@ impl WeightPager {
     ) -> HipResult<()> {
         for &expert in top_indices {
             let key = ExpertModuleKey { layer, expert };
-            let module = self.resident_modules.get(&key).unwrap_or_else(|| {
-                panic!(
-                    "patch_expert_module_ptr_table: layer={} expert={} not resident",
-                    layer, expert
-                )
-            });
+            let Some(module) = self.resident_modules.get(&key) else {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "patch_expert_module_ptr_table: layer={} expert={} not resident",
+                        layer, expert
+                    ),
+                ));
+            };
             let offset = (expert as usize) * 8;
             gpu.hip.memcpy_htod_offset(
                 &gate_up_ptrs.buf,

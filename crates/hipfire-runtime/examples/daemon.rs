@@ -1066,6 +1066,7 @@ fn validate_qwen35_fused_dense_decode_resident_sessions(
 fn select_qwen35_prefill_batch_backend(
     plan: GenerateBatchPrefillPlan,
     requested: Option<&str>,
+    fused_grouped_moe_supported: Result<(), String>,
 ) -> Result<Qwen35PrefillBatchBackend, String> {
     match requested.unwrap_or("auto") {
         "auto" | "" => match plan {
@@ -1073,7 +1074,11 @@ fn select_qwen35_prefill_batch_backend(
                 Ok(Qwen35PrefillBatchBackend::FusedDense)
             }
             GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate => {
-                Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
+                if fused_grouped_moe_supported.is_ok() {
+                    Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
+                } else {
+                    Ok(Qwen35PrefillBatchBackend::SerialReference)
+                }
             }
             GenerateBatchPrefillPlan::SerialExact => Ok(Qwen35PrefillBatchBackend::SerialReference),
         },
@@ -1082,6 +1087,7 @@ fn select_qwen35_prefill_batch_backend(
             if plan == GenerateBatchPrefillPlan::FusedDenseQwen35Candidate {
                 Ok(Qwen35PrefillBatchBackend::FusedDense)
             } else if plan == GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
+                fused_grouped_moe_supported?;
                 Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
             } else {
                 Err(format!(
@@ -1092,6 +1098,7 @@ fn select_qwen35_prefill_batch_backend(
         }
         "fused_moe" | "grouped_moe" | "fused_grouped_moe" => {
             if plan == GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
+                fused_grouped_moe_supported?;
                 Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
             } else {
                 Err(format!(
@@ -2425,10 +2432,12 @@ mod generate_batch_prefill_tests {
 
     #[test]
     fn selects_fused_backend_by_default_for_fused_candidate_plans() {
+        let fused_grouped_ok = || Ok::<(), String>(());
         assert_eq!(
             select_qwen35_prefill_batch_backend(
                 GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
                 None,
+                fused_grouped_ok(),
             )
             .unwrap(),
             Qwen35PrefillBatchBackend::FusedDense
@@ -2437,6 +2446,7 @@ mod generate_batch_prefill_tests {
             select_qwen35_prefill_batch_backend(
                 GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
                 None,
+                fused_grouped_ok(),
             )
             .unwrap(),
             Qwen35PrefillBatchBackend::FusedGroupedMoe
@@ -2444,7 +2454,8 @@ mod generate_batch_prefill_tests {
         assert_eq!(
             select_qwen35_prefill_batch_backend(
                 GenerateBatchPrefillPlan::SerialExact,
-                Some("auto")
+                Some("auto"),
+                fused_grouped_ok(),
             )
             .unwrap(),
             Qwen35PrefillBatchBackend::SerialReference
@@ -2550,10 +2561,12 @@ mod generate_batch_prefill_tests {
 
     #[test]
     fn admits_fused_backend_only_for_dense_fused_candidate_plan() {
+        let fused_grouped_ok = || Ok::<(), String>(());
         assert_eq!(
             select_qwen35_prefill_batch_backend(
                 GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
                 Some("fused"),
+                fused_grouped_ok(),
             )
             .unwrap(),
             Qwen35PrefillBatchBackend::FusedDense
@@ -2561,12 +2574,14 @@ mod generate_batch_prefill_tests {
         let err = select_qwen35_prefill_batch_backend(
             GenerateBatchPrefillPlan::SerialExact,
             Some("fused"),
+            fused_grouped_ok(),
         )
         .unwrap_err();
         assert!(err.contains("not fused-eligible"));
         let moe_err = select_qwen35_prefill_batch_backend(
             GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
             Some("fused"),
+            fused_grouped_ok(),
         )
         .unwrap();
         assert_eq!(moe_err, Qwen35PrefillBatchBackend::FusedGroupedMoe);
@@ -2574,10 +2589,12 @@ mod generate_batch_prefill_tests {
 
     #[test]
     fn admits_explicit_grouped_moe_backend_only_for_grouped_candidate_plan() {
+        let fused_grouped_ok = || Ok::<(), String>(());
         assert_eq!(
             select_qwen35_prefill_batch_backend(
                 GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
                 Some("fused_moe"),
+                fused_grouped_ok(),
             )
             .unwrap(),
             Qwen35PrefillBatchBackend::FusedGroupedMoe
@@ -2586,6 +2603,7 @@ mod generate_batch_prefill_tests {
             select_qwen35_prefill_batch_backend(
                 GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
                 Some("grouped_moe"),
+                fused_grouped_ok(),
             )
             .unwrap(),
             Qwen35PrefillBatchBackend::FusedGroupedMoe
@@ -2593,15 +2611,54 @@ mod generate_batch_prefill_tests {
         let dense_err = select_qwen35_prefill_batch_backend(
             GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
             Some("fused_moe"),
+            fused_grouped_ok(),
         )
         .unwrap_err();
         assert!(dense_err.contains("not grouped-MoE eligible"));
         let serial_err = select_qwen35_prefill_batch_backend(
             GenerateBatchPrefillPlan::SerialExact,
             Some("grouped_moe"),
+            fused_grouped_ok(),
         )
         .unwrap_err();
         assert!(serial_err.contains("not grouped-MoE eligible"));
+    }
+
+    #[test]
+    fn auto_grouped_moe_falls_back_to_serial_when_fused_capability_fails() {
+        let unsupported = Err::<(), String>(
+            "grouped MoE session fused prefix currently requires K_TOP=8, got 10".to_string(),
+        );
+        assert_eq!(
+            select_qwen35_prefill_batch_backend(
+                GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
+                None,
+                unsupported.clone(),
+            )
+            .unwrap(),
+            Qwen35PrefillBatchBackend::SerialReference
+        );
+        let err = select_qwen35_prefill_batch_backend(
+            GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
+            Some("fused_moe"),
+            unsupported,
+        )
+        .unwrap_err();
+        assert!(err.contains("requires K_TOP=8"));
+    }
+
+    #[test]
+    fn paged_prefill_scratch_defaults_to_live_rows() {
+        assert_eq!(qwen35_prefill_scratch_target_batch(true, 16, None), 16);
+        assert_eq!(qwen35_prefill_scratch_target_batch(true, 1, None), 2);
+        assert_eq!(
+            qwen35_prefill_scratch_target_batch(true, 16, Some("64")),
+            64
+        );
+        assert_eq!(
+            qwen35_prefill_scratch_target_batch(false, 16, None),
+            qwen35::PREFILL_MAX_BATCH
+        );
     }
 
     fn test_prepared_prefill_session(
@@ -3806,6 +3863,68 @@ fn park_active_model(
     Ok(())
 }
 
+fn validate_qwen35_fused_grouped_moe_prefill_model_capability(
+    m: &LoadedModel,
+    session_count: usize,
+) -> Result<(), String> {
+    if m.arch_id != 6 {
+        return Err(format!(
+            "qwen35 grouped-MoE fused prefill-session batch worker requires arch_id=6, got {}",
+            m.arch_id
+        ));
+    }
+    if session_count < 2 {
+        return Err(
+            "qwen35 grouped-MoE fused prefill-session batch worker requires at least two sessions"
+                .to_string(),
+        );
+    }
+    let config = m
+        .q35_config
+        .as_ref()
+        .ok_or_else(|| "qwen35 grouped-MoE fused prefill requires qwen35 config".to_string())?;
+    if config.num_experts == 0 {
+        return Err("qwen35 grouped-MoE fused prefill requires routed experts".to_string());
+    }
+    if !config.has_shared_expert {
+        return Err("qwen35 grouped-MoE fused prefill requires a shared expert".to_string());
+    }
+    if config.num_experts_per_tok != 8
+        && !(config.paged_experts && config.num_experts_per_tok == 10)
+    {
+        return Err(format!(
+            "grouped MoE session fused prefix currently requires K_TOP=8, or paged K_TOP=10, got {}",
+            config.num_experts_per_tok
+        ));
+    }
+    if m.q35_scratch.is_none() {
+        return Err("qwen35 grouped-MoE fused prefill requires qwen35 scratch".to_string());
+    }
+    if config.paged_experts {
+        if let Some(weights) = m.q35_weights.as_ref() {
+            qwen35::validate_paged_moe_decode_expert_cache(weights, config)?;
+        }
+    }
+    Ok(())
+}
+
+fn qwen35_prefill_scratch_target_batch(
+    paged_experts: bool,
+    required_rows: usize,
+    env: Option<&str>,
+) -> usize {
+    let configured = env
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v >= 2);
+    if let Some(configured) = configured {
+        return configured.max(required_rows);
+    }
+    if paged_experts {
+        return required_rows.max(2);
+    }
+    qwen35::PREFILL_MAX_BATCH.max(required_rows)
+}
+
 fn activate_model_worker(
     worker_id: &str,
     active_worker_id: &mut String,
@@ -4969,25 +5088,24 @@ fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             "qwen35 scratch missing; grouped-MoE fused prefill is pp=1 only".to_string()
         })?;
         let total_tokens = prepared.iter().map(|spec| spec.tokens.len()).sum::<usize>();
+        let scratch_target_batch = qwen35_prefill_scratch_target_batch(
+            config.paged_experts,
+            total_tokens,
+            std::env::var("HIPFIRE_PREFILL_MAX_BATCH").ok().as_deref(),
+        );
         let needs_scratch = scratch
             .prefill_batch
             .as_ref()
-            .map(|pbs| pbs.max_batch < total_tokens)
+            .map(|pbs| pbs.max_batch < scratch_target_batch)
             .unwrap_or(true);
         if needs_scratch {
             if let Some(existing) = scratch.prefill_batch.take() {
                 existing.free_gpu(gpu);
             }
-            let max_batch = std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&v| v >= 2)
-                .unwrap_or(qwen35::PREFILL_MAX_BATCH)
-                .max(total_tokens);
             scratch.prefill_batch = Some(
-                qwen35::PrefillBatchScratch::new(gpu, config, max_batch).map_err(|e| {
-                    format!("allocate qwen35 grouped-MoE fused prefill scratch: {e:?}")
-                })?,
+                qwen35::PrefillBatchScratch::new(gpu, config, scratch_target_batch).map_err(
+                    |e| format!("allocate qwen35 grouped-MoE fused prefill scratch: {e:?}"),
+                )?,
             );
         }
         let pbs_max_batch = scratch.prefill_batch.as_ref().unwrap().max_batch;
@@ -5589,7 +5707,13 @@ fn run_generate_batch_prefill_serial_qwen35(
 
     let plan = plan_generate_batch_prefill_qwen35(m.arch_id, envelope);
     let requested_backend = std::env::var("HIPFIRE_QWEN35_PREFILL_SESSION_BATCH").ok();
-    let backend = select_qwen35_prefill_batch_backend(plan, requested_backend.as_deref())?;
+    let fused_grouped_moe_supported =
+        validate_qwen35_fused_grouped_moe_prefill_model_capability(m, envelope.session_count);
+    let backend = select_qwen35_prefill_batch_backend(
+        plan,
+        requested_backend.as_deref(),
+        fused_grouped_moe_supported,
+    )?;
     let started = serde_json::json!({
         "type": "generate_batch_prefill_started",
         "id": envelope.id,
@@ -13350,7 +13474,7 @@ fn generate(
             // advance and call maybe_evict immediately so the next write
             // never overruns physical_cap. compact_offset bookkeeping on
             // the cache itself keeps RoPE phase correct across evictions.
-            qwen35::forward_scratch(
+            if let Err(e) = qwen35::forward_scratch(
                 gpu,
                 weights,
                 config,
@@ -13359,8 +13483,15 @@ fn generate(
                 kv,
                 dn,
                 scratch,
-            )
-            .unwrap();
+            ) {
+                write_error(
+                    stdout,
+                    id,
+                    &format!("qwen35 decode forward_scratch failed: {e:?}"),
+                );
+                qwen35_restore_or_error(stdout, id, m, gpu, session);
+                return;
+            }
             session.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
                 if let Some(hipfire_runtime::triattn::EvictionResult {
@@ -13598,7 +13729,7 @@ fn generate(
                             );
                             let _ = stdout.flush();
                         }
-                        qwen35::forward_scratch(
+                        if let Err(e) = qwen35::forward_scratch(
                             gpu,
                             weights,
                             config,
@@ -13607,8 +13738,15 @@ fn generate(
                             kv,
                             dn,
                             scratch,
-                        )
-                        .unwrap();
+                        ) {
+                            write_error(
+                                stdout,
+                                id,
+                                &format!("qwen35 budget-alert forward_scratch failed: {e:?}"),
+                            );
+                            qwen35_restore_or_error(stdout, id, m, gpu, session);
+                            return;
+                        }
                         session.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
                             if let Some(hipfire_runtime::triattn::EvictionResult {
@@ -13689,8 +13827,24 @@ fn generate(
         if im_end_token == Some(*session.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty()
         {
             for &t in &nl {
-                qwen35::forward_scratch(gpu, weights, config, t, session.seq_pos, kv, dn, scratch)
-                    .unwrap();
+                if let Err(e) = qwen35::forward_scratch(
+                    gpu,
+                    weights,
+                    config,
+                    t,
+                    session.seq_pos,
+                    kv,
+                    dn,
+                    scratch,
+                ) {
+                    write_error(
+                        stdout,
+                        id,
+                        &format!("qwen35 ChatML newline forward_scratch failed: {e:?}"),
+                    );
+                    qwen35_restore_or_error(stdout, id, m, gpu, session);
+                    return;
+                }
                 session.seq_pos += 1;
                 if let Some(ref ev) = m.eviction {
                     if let Some(hipfire_runtime::triattn::EvictionResult {

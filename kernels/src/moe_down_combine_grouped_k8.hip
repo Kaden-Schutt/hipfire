@@ -38,18 +38,13 @@ extern "C" __global__ void moe_down_combine_grouped_k8(
     const int weights_base = token * K_TOP;
     const int flat_base    = token * K_TOP;
 
-    // K_TOP = 8 in production. Hard-coded unroll so the compiler can
-    // overlap the 8 (inverse_perm, Y, weights) loads. The k < K_TOP
-    // guard preserves correctness if a future caller picks K_TOP < 8.
     float acc = 0.0f;
-    #pragma unroll
-    for (int k = 0; k < 8; k++) {
-        if (k < K_TOP) {
-            const int slot = inverse_perm[flat_base + k];
-            const float w  = topk_weights[weights_base + k];
-            const float v  = Y_down_grouped[(long long)slot * dim + m_col];
-            acc += w * v;
-        }
+    for (int k = 0; k < K_TOP; k++) {
+        const int slot = inverse_perm[flat_base + k];
+        if (slot < 0) continue;
+        const float w  = topk_weights[weights_base + k];
+        const float v  = Y_down_grouped[(long long)slot * dim + m_col];
+        acc += w * v;
     }
 
     x_residual[(long long)token * dim + m_col] += acc;

@@ -439,13 +439,30 @@ impl HfqFile {
     /// Callers passing `base_offset = 0` go through the canonical [`Self::open`]
     /// entry point.
     pub fn open_at_offset(path: &Path, base_offset: u64) -> std::io::Result<Self> {
+        // For large standalone files, skip the full-file mmap entirely and use the
+        // pread-based index loader. The mmap is only useful when tensor data will be
+        // read via mmap slices (discrete GPU path); on UMA, drop_mmap() is called
+        // immediately in load_weights() before any tensor data is accessed, making the
+        // mmap a pure overhead cost. Beyond ~64 GiB the overhead becomes dangerous:
+        // mmap.advise(Sequential) triggers kernel readahead that races with the slab
+        // loader's O_DIRECT fd on the same inode → kworker deadlock → system hang
+        // (reproduced at 291 GiB on RDNA3.5 APU, 2026-06-11). Embedded containers
+        // (base_offset > 0) are always small relative to their host file and are
+        // unaffected by this check.
+        const LARGE_FILE_THRESHOLD: u64 = 64 * 1024 * 1024 * 1024;
+        if base_offset == 0 {
+            let file_len = std::fs::metadata(path)?.len();
+            if file_len > LARGE_FILE_THRESHOLD {
+                return Self::open_index_only_at_offset(path, 0);
+            }
+        }
+
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        // Sequential access hint: helps the kernel readahead and drop pages sooner.
+        // Sequential access hint: helps the kernel prefetch pages and drop them sooner.
         #[cfg(unix)]
         {
             mmap.advise(memmap2::Advice::Sequential).ok();
-            // Also advise the file descriptor for the data region.
             use std::os::unix::io::AsRawFd;
             unsafe {
                 libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
@@ -592,6 +609,17 @@ impl HfqFile {
     /// so callers should only invoke this when UMA is detected.
     pub fn drop_mmap(&mut self) {
         self.mmap = None;
+        // Cancel any in-flight readahead triggered by the Sequential advice at open
+        // time. On UMA systems the slab loader opens an O_DIRECT fd immediately after
+        // this call; without DONTNEED the readahead kworker may still hold an inode
+        // lock that O_DIRECT needs, causing a deadlock (see open_at_offset comment).
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::posix_fadvise(self._file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+            }
+        }
     }
 
     /// Release the pread reuse buffer back to the allocator. After a
