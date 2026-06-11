@@ -75,6 +75,12 @@ pub const BENCH_IU4_WMMA_GFX1151_SRC: &str =
 pub const FUSED_RMSNORM_MQ_ROTATE_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/fused_rmsnorm_mq_rotate.gfx1151.hip");
 
+/// gfx1151 RMSNorm with wave-reduced sum-of-squares. Same ABI as the generic
+/// `rmsnorm_f32` kernel, but routes through a distinct entry point so the
+/// dispatcher can select it only on gfx1151.
+pub const RMSNORM_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/rmsnorm.gfx1151.hip");
+
 /// HFQ2-G256: flat 2-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][64B data] = 72 bytes per 256 weights (0.28 B/w).
 pub const GEMV_HFQ2G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2g256.hip");

@@ -125,18 +125,19 @@ default.
 
 | Kernel group | gfx906 | gfx942 | gfx1030 | gfx1100 | gfx1151 | gfx12 |
 |---|---|---|---|---|---|---|
-| rmsnorm | — | standard (reduce) | — | — | **—** ⚠️ | — |
+| rmsnorm | — | standard (reduce) | — | — | basic (wave-reduced) | — |
 | rotate_with_rms (fused) | — | standard | — | — | **—** ⚠️ | — |
 | fused_rmsnorm_mq_rotate | generic only | generic only | generic only | generic only | basic (wave-reduced RMS) | generic only |
 
-All norm kernels are F32-only. gfx1151 now has a fused RMSNorm+MQ-rotate
-variant that keeps the generic FWHT phase but replaces the 256-float LDS
-reduction ladder with wave reductions plus 8 wave sums. On
-Qwen3.6-35B-A3B MQ4 pp256, the profiled batched row moved from 867.3us to
-821.4us across 40 calls. Standalone split-vs-fused correctness stays within
-9.54e-7 max_abs at K=12288. The remaining norm/rotate gap is broader:
-plain `rmsnorm`, `gated_norm`, `fused_silu_mul_mq_rotate`, and DeltaNet-
-specific conv/gate kernels still use generic F32 implementations.
+All norm kernels are F32-only. gfx1151 now has wave-reduced `rmsnorm` and a
+fused RMSNorm+MQ-rotate variant that keeps the generic FWHT phase but replaces
+the 256-float LDS reduction ladder with wave reductions plus 8 wave sums. On
+Qwen3.6-35B-A3B MQ4 pp256, fused RMSNorm+MQ rotate moved from 867.3us to
+821.4us across 40 calls. On Qwen3.5-9B MQ4 pp256, plain batched RMSNorm moved
+from 444.9us to 356.4us across 16 calls; standalone CPU-reference correctness
+stays within 3.10e-6 max_abs at batch=3, K=12288. The remaining norm/rotate
+gap is broader: `gated_norm`, `fused_silu_mul_mq_rotate`, and DeltaNet-specific
+conv/gate kernels still use generic F32 implementations.
 
 ### Misc compute
 
@@ -222,7 +223,7 @@ Ordered by estimated decode-path impact on active hardware.
 | Priority | Gap | Arch | Reason |
 |---|---|---|---|
 | 1 | GEMV decode (mq4g256, hfq4g256) | gfx1151 | RDNA3 R=2 path is wired, but measured flat so further decode-shape tuning remains open |
-| 2 | fused_rmsnorm_mq_rotate BF16 | gfx1151 | Called before every GEMV; widening weight overhead not hidden by UMA bandwidth |
+| 2 | fused_rmsnorm_mq_rotate / plain rmsnorm BF16 | gfx1151 | Initial wave-reduced gfx1151 paths are wired; broader BF16-native norm coverage remains open |
 | 3 | conv1d + fused_sigmoid_alpha_gate BF16 | gfx1151 | Every DeltaNet layer; Qwen3.5 is the primary gfx1151 model |
 | 4 | hc_sinkhorn_4x4 + hc_mix_4stream | gfx942 | Every forward pass layer in DeepSeek4; MFMA available but unused |
 | 5 | GEMV decode (mq4g256, hfq4g256) | gfx12 | Only FP8 GEMV exists; MQ4 decode falls back to generic |

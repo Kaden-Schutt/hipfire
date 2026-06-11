@@ -29835,7 +29835,25 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, "rmsnorm_f32")?;
+        let (module_name, kernel_src, kernel_name, timer_name, reduce_slots) =
+            if self.arch_caps.is_gfx1151() {
+                (
+                    "rmsnorm_gfx1151",
+                    kernels::RMSNORM_GFX1151_SRC,
+                    "rmsnorm_f32_gfx1151",
+                    "rmsnorm_f32_gfx1151",
+                    8u32,
+                )
+            } else {
+                (
+                    "rmsnorm",
+                    kernels::RMSNORM_SRC,
+                    "rmsnorm_f32",
+                    "rmsnorm_f32",
+                    256u32,
+                )
+            };
+        self.ensure_kernel(module_name, kernel_src, kernel_name)?;
 
         let batch = if x.shape.len() > 1 { x.shape[0] } else { 1 };
         let n = x.shape.last().copied().unwrap() as i32;
@@ -29855,12 +29873,16 @@ impl Gpu {
         ];
 
         let block_size = 256u32.min(n as u32);
-        let shared_mem = block_size * 4; // float per thread
+        let shared_mem = if self.arch_caps.is_gfx1151() {
+            reduce_slots * 4
+        } else {
+            block_size * 4
+        };
 
         let bytes = crate::profile::rmsnorm_bytes(batch * n as usize);
-        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_f32", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", timer_name, bytes);
         let result = self.launch_maybe_blob(
-            "rmsnorm_f32",
+            kernel_name,
             [batch as u32, 1, 1],
             [block_size, 1, 1],
             shared_mem,
@@ -29969,7 +29991,25 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, "rmsnorm_f32")?;
+        let (module_name, kernel_src, kernel_name, timer_name, reduce_slots) =
+            if self.arch_caps.is_gfx1151() {
+                (
+                    "rmsnorm_gfx1151",
+                    kernels::RMSNORM_GFX1151_SRC,
+                    "rmsnorm_f32_gfx1151",
+                    "rmsnorm_batched_gfx1151",
+                    8u32,
+                )
+            } else {
+                (
+                    "rmsnorm",
+                    kernels::RMSNORM_SRC,
+                    "rmsnorm_f32",
+                    "rmsnorm_batched",
+                    256u32,
+                )
+            };
+        self.ensure_kernel(module_name, kernel_src, kernel_name)?;
 
         let mut x_ptr = x.buf.as_ptr();
         let mut w_ptr = weight.buf.as_ptr();
@@ -29986,11 +30026,15 @@ impl Gpu {
         ];
 
         let block_size = 256u32.min(n as u32);
-        let shared_mem = block_size * 4;
+        let shared_mem = if self.arch_caps.is_gfx1151() {
+            reduce_slots * 4
+        } else {
+            block_size * 4
+        };
         let bytes = crate::profile::rmsnorm_bytes(batch * n);
-        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_batched", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", timer_name, bytes);
         let result = self.launch_maybe_blob(
-            "rmsnorm_f32",
+            kernel_name,
             [batch as u32, 1, 1],
             [block_size, 1, 1],
             shared_mem,
