@@ -5714,7 +5714,13 @@ fn main() {
     let mut quantized_params = 0u64;
     // Spill file for large models — keeps peak RSS bounded by flushing
     // completed tensor data to disk when accumulated memory exceeds 32 GB.
-    let spill_dir = output_path.parent().unwrap_or(Path::new("."));
+    // HIPFIRE_SPILL_DIR overrides the spill location (e.g. a tmpfs) so the
+    // transient 1x-model-size spill does not double the disk footprint of
+    // large F32-oracle conversions next to the output file.
+    let spill_dir_env = std::env::var_os("HIPFIRE_SPILL_DIR").map(PathBuf::from);
+    let spill_dir: &Path = spill_dir_env
+        .as_deref()
+        .unwrap_or_else(|| output_path.parent().unwrap_or(Path::new(".")));
     let mut spill = TensorSpill::new(spill_dir).ok();
     let mut total_quant_error = 0.0f64;
     let mut max_quant_error = 0.0f32;
@@ -6543,7 +6549,15 @@ fn main() {
                     && name.ends_with("_proj.weight")
                     && std::env::var_os("HIPFIRE_GEMMA4_MQ4_ATTN").is_none()
                 {
-                    kmap_level = QuantLevel::Q8;
+                    // HIPFIRE_GEMMA4_MQ6_ATTN=1: promote attn to the 6-bit
+                    // variant of the base format (MQ6G256 under --format mq4)
+                    // instead of the default Q8 force — A/B lever for the
+                    // attn-precision KLD study.
+                    kmap_level = if std::env::var_os("HIPFIRE_GEMMA4_MQ6_ATTN").is_some() {
+                        QuantLevel::Promote6
+                    } else {
+                        QuantLevel::Q8
+                    };
                 }
 
                 // AWQ sidecar scales for this tensor — populated only inside the

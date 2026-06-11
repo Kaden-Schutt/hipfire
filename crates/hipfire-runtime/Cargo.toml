@@ -130,6 +130,14 @@ name = "gemma4_oracle"
 required-features = []
 
 [[example]]
+name = "build_kld_ref_native_gemma4"
+required-features = []
+
+[[example]]
+name = "eval_hipfire_gemma4"
+required-features = []
+
+[[example]]
 name = "coherence_probe"
 required-features = []
 

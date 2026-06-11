@@ -47,10 +47,18 @@ fn main() {
         &mut gpu, config.n_layers, config.sliding_n_kv_heads,
         config.sliding_head_dim, max_seq,
     ).expect("kv sliding alloc");
-    let mut kv_full = KvCache::new_gpu_asym3(
-        &mut gpu, config.n_layers, config.full_n_kv_heads,
-        config.full_head_dim, max_seq,
-    ).expect("kv full alloc");
+    let mut kv_full = if std::env::var("HIPFIRE_ORACLE_KV_F32").ok().as_deref() == Some("1") {
+        eprintln!("oracle: FULL KV = F32 (HIPFIRE_ORACLE_KV_F32=1)");
+        KvCache::new_gpu(
+            &mut gpu, config.n_layers, config.full_n_kv_heads,
+            config.full_head_dim, max_seq,
+        ).expect("kv full alloc f32")
+    } else {
+        KvCache::new_gpu_asym3(
+            &mut gpu, config.n_layers, config.full_n_kv_heads,
+            config.full_head_dim, max_seq,
+        ).expect("kv full alloc")
+    };
 
     for (i, &tok) in ids.iter().enumerate() {
         gemma4::forward_scratch(
