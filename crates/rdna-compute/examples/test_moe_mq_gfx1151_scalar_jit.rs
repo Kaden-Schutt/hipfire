@@ -7,7 +7,7 @@
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_mq_gfx1151_scalar_jit
 
-const SRC: &str = include_str!("../../../kernels/src/moe_mq_gfx1151_scalar_batched.hip");
+const SRC: &str = include_str!("../../../kernels/src/gfx1151/moe_mq_gfx1151_scalar_batched.hip");
 
 const KERNELS: &[&str] = &[
     "gemm_gate_up_hfq2g256_scalar_batched",

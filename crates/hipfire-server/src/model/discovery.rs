@@ -3,9 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::config::models_dir;
 
 /// Extension preferred order for fuzzy scan (most-to-least preferred quant).
-static QUANT_PREFERENCE: &[&str] = &[
-    "-mq4", "-hf4", "-mq3", "-mq2lloyd", "-mq6", "-hf6", "-q8",
-];
+static QUANT_PREFERENCE: &[&str] = &["-mq4", "-hf4", "-mq3", "-mq2lloyd", "-mq6", "-hf6", "-q8"];
 
 /// Resolve a model identifier to an absolute file path.
 ///
@@ -62,7 +60,11 @@ fn normalize_tag_stem(tag: &str) -> String {
 }
 
 fn quant_rank(path: &Path) -> usize {
-    let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
     QUANT_PREFERENCE
         .iter()
         .position(|q| name.contains(q))
@@ -70,11 +72,17 @@ fn quant_rank(path: &Path) -> usize {
 }
 
 fn scan_models_dir(dir: &Path, stem: &str) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return vec![] };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
         if name.ends_with(".hfq") && !is_role_sidecar(&name) && name.contains(stem) {
             out.push(path.clone());
         }
@@ -83,7 +91,11 @@ fn scan_models_dir(dir: &Path, stem: &str) -> Vec<PathBuf> {
             if let Ok(sub) = std::fs::read_dir(&path) {
                 for se in sub.flatten() {
                     let sp = se.path();
-                    let sn = sp.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                    let sn = sp
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase();
                     if sn.ends_with(".hfq") && !is_role_sidecar(&sn) && sn.contains(stem) {
                         out.push(sp);
                     }
@@ -105,12 +117,18 @@ fn is_role_sidecar(name: &str) -> bool {
 /// List all non-sidecar .hfq files in the models directory.
 pub fn list_local_models() -> Vec<PathBuf> {
     let mdir = models_dir();
-    let Ok(entries) = std::fs::read_dir(&mdir) else { return vec![] };
+    let Ok(entries) = std::fs::read_dir(&mdir) else {
+        return vec![];
+    };
     let mut out: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            let n = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            let n = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
             n.ends_with(".hfq") && !is_role_sidecar(&n)
         })
         .collect();

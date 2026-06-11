@@ -2,23 +2,57 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-fn default_host() -> String { "0.0.0.0".to_string() }
-fn default_port() -> u16 { 11435 }
-fn default_max_seq() -> u32 { 4096 }
-fn default_max_tokens() -> u32 { 512 }
-fn default_temperature() -> f64 { 0.3 }
-fn default_top_p() -> f64 { 0.8 }
-fn default_repeat_penalty() -> f64 { 1.05 }
-fn default_idle_timeout() -> u32 { 300 }
-fn default_kv_cache() -> String { "auto".to_string() }
-fn default_flash_mode() -> String { "auto".to_string() }
-fn default_dflash_mode() -> String { "off".to_string() }
-fn default_mtp_mode() -> String { "auto".to_string() }
-fn default_mtp_k() -> u32 { 3 }
-fn default_thinking() -> String { "off".to_string() }
-fn default_gpu_slab_load() -> String { "auto".to_string() }
-fn default_prompt_normalize() -> bool { true }
-fn default_cask_auto_attach() -> bool { true }
+fn default_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_port() -> u16 {
+    11435
+}
+fn default_max_seq() -> u32 {
+    4096
+}
+fn default_max_tokens() -> u32 {
+    512
+}
+fn default_temperature() -> f64 {
+    0.3
+}
+fn default_top_p() -> f64 {
+    0.8
+}
+fn default_repeat_penalty() -> f64 {
+    1.05
+}
+fn default_idle_timeout() -> u32 {
+    300
+}
+fn default_kv_cache() -> String {
+    "auto".to_string()
+}
+fn default_flash_mode() -> String {
+    "auto".to_string()
+}
+fn default_dflash_mode() -> String {
+    "off".to_string()
+}
+fn default_mtp_mode() -> String {
+    "auto".to_string()
+}
+fn default_mtp_k() -> u32 {
+    3
+}
+fn default_thinking() -> String {
+    "off".to_string()
+}
+fn default_gpu_slab_load() -> String {
+    "auto".to_string()
+}
+fn default_prompt_normalize() -> bool {
+    true
+}
+fn default_cask_auto_attach() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HipfireConfig {

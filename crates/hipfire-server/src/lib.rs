@@ -17,7 +17,10 @@ pub fn build_router(state: SharedState) -> Router {
     Router::new()
         .route("/health", get(routes::health::get_health))
         .route("/v1/models", get(routes::models::get_models))
-        .route("/v1/chat/completions", post(routes::chat::post_chat_completions))
+        .route(
+            "/v1/chat/completions",
+            post(routes::chat::post_chat_completions),
+        )
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

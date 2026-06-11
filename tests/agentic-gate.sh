@@ -160,12 +160,32 @@ MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_AGENTIC_GATE_OUT:-/tmp/agentic-gate-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
-A3B_35="$MODELS_DIR/qwen3.5-35b-a3b.mq4"
-# 2026-05-15: qwen3.6-35b-a3b.mq4 hangs / emits zero tokens during this gate
-# (per issue #262 side-finding). Switched the "3.6" cell to dense qwen3.6-27b
-# while that's investigated — agentic tool-call shape testing doesn't strictly
-# require A3B, dense 27B exercises the same JSON-output predicates.
-A3B_36="$MODELS_DIR/qwen3.6-27b.mq4"
+find_model_file() {
+    local name="$1"
+    local stem alt dot_alt dir cand
+    stem="${name%.hfq}"
+    alt="${stem/.mq4/-mq4}"
+    dot_alt="${stem/-mq4/.mq4}"
+    for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
+        for cand in \
+            "$dir/$name" \
+            "$dir/$stem" \
+            "$dir/$stem.hfq" \
+            "$dir/$alt" \
+            "$dir/$alt.hfq" \
+            "$dir/$dot_alt" \
+            "$dir/$dot_alt.hfq"; do
+            [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+        done
+    done
+    return 1
+}
+
+A3B_35="$(find_model_file "qwen3.5-35b-a3b.mq4" || true)"
+# Defaults to the Qwen3.6 A3B artifact. If the old zero-token issue recurs,
+# set HIPFIRE_AGENTIC_GATE_QWEN36_MODEL=qwen3.6-27b.mq4 to force the dense
+# predicate-only fallback without changing the script.
+A3B_36="$(find_model_file "${HIPFIRE_AGENTIC_GATE_QWEN36_MODEL:-qwen3.6-35b-a3b.mq4}" || true)"
 PI_SYS="benchmarks/prompts/agentic_pi_system.txt"
 HERMES_SYS="benchmarks/prompts/agentic_hermes_system.txt"
 USER_READ="benchmarks/prompts/agentic_user_read.txt"
@@ -197,6 +217,17 @@ for f in /sys/class/drm/card*/device/mem_info_vram_total; do
     v="$(cat "$f" 2>/dev/null)" || continue
     [ "$v" -gt "$VRAM_BYTES" ] && VRAM_BYTES="$v"
 done
+if [ "$VRAM_BYTES" -lt 1073741824 ] && [ -r "scripts/_detect-gpu.sh" ]; then
+    # UMA/APU systems can report a tiny DRM "VRAM" aperture while ROCm exposes
+    # the real GPU-visible global pool through rocminfo.
+    # shellcheck disable=SC1091
+    . "scripts/_detect-gpu.sh"
+    case "${HIPFIRE_DETECTED_VRAM_GB:-}" in
+        ''|'?') ;;
+        *[!0-9]*) ;;
+        *) VRAM_BYTES=$(( HIPFIRE_DETECTED_VRAM_GB * 1073741824 )) ;;
+    esac
+fi
 VRAM_GB=$(( VRAM_BYTES / 1073741824 ))
 if [ "$VRAM_BYTES" -eq 0 ] && [ "${HIPFIRE_AGENTIC_GATE_NO_VRAM_CHECK:-0}" != "1" ]; then
     echo "agentic-gate: VRAM detection unavailable (no /sys/class/drm/card*/device/mem_info_vram_total) - skipping VRAM check"
@@ -214,10 +245,17 @@ model_fits_vram() {
     min_gb="$(python3 -c '
 import json, sys
 fname = sys.argv[1]
+names = {fname}
+if fname.endswith(".hfq"):
+    names.add(fname[:-4])
+for name in list(names):
+    names.add(name.replace("-mq4", ".mq4"))
+    names.add(name.replace("-mq6", ".mq6"))
+    names.add(name.replace("-mq3", ".mq3"))
 with open(sys.argv[2]) as fh:
     data = json.load(fh)
 for entry in data.get("models", {}).values():
-    if isinstance(entry, dict) and entry.get("file") == fname:
+    if isinstance(entry, dict) and entry.get("file") in names:
         v = entry.get("min_vram_gb")
         if v is not None:
             print(v)
@@ -246,7 +284,7 @@ if [ ! -f "$A3B_35" ] && [ ! -f "$A3B_36" ]; then
     if [ "$A3B_35_VRAM_SKIP" = "1" ] || [ "$A3B_36_VRAM_SKIP" = "1" ]; then
         echo "agentic-gate: all A3B models absent or exceed host VRAM (${VRAM_GB} GB) - SKIPPED"
     else
-        echo "agentic-gate: A3B models absent ($MODELS_DIR/qwen3.{5,6}-35b-a3b.mq4) - SKIPPED"
+        echo "agentic-gate: A3B models absent ($MODELS_DIR/qwen3.{5,6}-35b-a3b.{mq4,mq4.hfq} or -mq4.hfq) - SKIPPED"
     fi
     exit 0
 fi

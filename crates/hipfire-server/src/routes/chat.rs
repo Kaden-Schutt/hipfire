@@ -63,8 +63,8 @@ fn messages_to_prompt(messages: &[ChatMessage]) -> String {
 }
 
 async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(), String> {
-    let model_path = find_model(model_arg)
-        .ok_or_else(|| format!("model not found: {model_arg}"))?;
+    let model_path =
+        find_model(model_arg).ok_or_else(|| format!("model not found: {model_arg}"))?;
     let model_str = model_path.to_string_lossy().into_owned();
 
     let mut engine_guard = state.engine.lock().await;
@@ -83,9 +83,7 @@ async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(),
             .to_string()
     })?;
 
-    let mut engine = DaemonEngine::spawn(&bin)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut engine = DaemonEngine::spawn(&bin).await.map_err(|e| e.to_string())?;
 
     let params = {
         let cfg = state.config.lock().await;
@@ -98,7 +96,10 @@ async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(),
         }
     };
 
-    engine.load(&model_str, params).await.map_err(|e| e.to_string())?;
+    engine
+        .load(&model_str, params)
+        .await
+        .map_err(|e| e.to_string())?;
 
     *loaded_guard = Some(model_str);
     *engine_guard = Some(engine);
@@ -114,8 +115,10 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
     };
 
     let Some(model_arg) = model_arg else {
-        return Json(json!({"error": {"message": "no model specified", "type": "invalid_request_error"}}))
-            .into_response();
+        return Json(
+            json!({"error": {"message": "no model specified", "type": "invalid_request_error"}}),
+        )
+        .into_response();
     };
 
     if let Err(e) = ensure_model_loaded(&state, &model_arg).await {
@@ -124,7 +127,12 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
 
     let gen_req = {
         let cfg = state.config.lock().await;
-        let worker_key_id = state.engine.lock().await.as_ref().and_then(|e| e.worker_key_id.clone());
+        let worker_key_id = state
+            .engine
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|e| e.worker_key_id.clone());
         GenerateRequest {
             id: req_id.clone(),
             prompt: messages_to_prompt(&body.messages),
@@ -144,8 +152,10 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
     let engine = match engine_guard.as_mut() {
         Some(e) => e,
         None => {
-            return Json(json!({"error": {"message": "daemon not running", "type": "server_error"}}))
-                .into_response()
+            return Json(
+                json!({"error": {"message": "daemon not running", "type": "server_error"}}),
+            )
+            .into_response()
         }
     };
 
@@ -171,9 +181,8 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
             }))
             .into_response()
         }
-        Err(e) => {
-            Json(json!({"error": {"message": e.to_string(), "type": "server_error"}})).into_response()
-        }
+        Err(e) => Json(json!({"error": {"message": e.to_string(), "type": "server_error"}}))
+            .into_response(),
     }
 }
 
@@ -206,8 +215,12 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
 
         let gen_req = {
             let cfg = state.config.lock().await;
-            let worker_key_id =
-                state.engine.lock().await.as_ref().and_then(|e| e.worker_key_id.clone());
+            let worker_key_id = state
+                .engine
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|e| e.worker_key_id.clone());
             GenerateRequest {
                 id: req_id.clone(),
                 prompt: messages_to_prompt(&body.messages),
@@ -257,7 +270,11 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                 "model": model_arg,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
             });
-            let _ = tx.send(Ok(Event::default().data(serde_json::to_string(&final_chunk).unwrap()))).await;
+            let _ = tx
+                .send(Ok(
+                    Event::default().data(serde_json::to_string(&final_chunk).unwrap())
+                ))
+                .await;
         }
         let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
     });
@@ -272,6 +289,5 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
 }
 
 fn sse_error(msg: &str) -> Event {
-    Event::default()
-        .data(serde_json::to_string(&json!({"error": {"message": msg}})).unwrap())
+    Event::default().data(serde_json::to_string(&json!({"error": {"message": msg}})).unwrap())
 }
