@@ -6,6 +6,55 @@ into full investigations here.
 
 - Qwen3 no-output-gate FullAttention faults in fused Q/K/V MQ4 projection;
   split projection should be used until the fused kernel is shape-audited.
+- Qwen3.5-397B-A17B HFQM v2 paged-expert forced serial prefill can panic when
+  `HIPFIRE_QWEN35_EXPERT_CACHE_MB` is too small for the per-layer routed set;
+  observed with 64 MB as `patch_expert_module_ptr_table: layer=0 expert=9 not
+  resident` after same-layer LRU eviction. `auto` now routes paged K_TOP=10
+  MQ6 models through the grouped-MoE bucket backend instead of this forced
+  serial diagnostic path.
+- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE B=4 suffix replay previously
+  OOMed while paging an expert module with `HIPFIRE_QWEN35_EXPERT_CACHE_MB=16`
+  or 64 when scratch over-reserved rows; keep this covered by live-row scratch
+  sizing tests.
+- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE prefill was reserving the default
+  256-row `PrefillBatchScratch` envelope for much smaller live batches; this
+  reduces expert-paging headroom and should stay live-row-sized unless
+  `HIPFIRE_PREFILL_MAX_BATCH` is explicitly set.
+- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE B=2 suffix replay with 16 tokens
+  per session previously OOMed at `HIPFIRE_QWEN35_EXPERT_CACHE_MB=16` when
+  scratch over-reserved rows; keep this covered by live-row scratch sizing
+  tests.
+- Qwen3.5-397B-A17B HFQM v2 post-prefill AR decode previously used the old
+  per-token paged expert path and could panic or hit the
+  `paged Qwen35-MoE decode requires GPU top-k indexed dispatch` gate; cache128
+  now reaches the indexed MQ6 decode path, but decode batching/orchestration is
+  still not complete.
+- Qwen3.5-397B-A17B HFQM v2 paged AR decode requires enough expert-cache
+  budget to hold the K_TOP routed expert module set for a token; cache16 is too
+  small for K_TOP=10 and should reject before streaming, while cache128 can run
+  the indexed MQ6 decode path.
+- The daemon example can leave a stale `~/.hipfire/daemon.pid` after a
+  subprocess kill in smoke harnesses; the next daemon start then reports
+  `FATAL: hipfire daemon already running` even though the PID is gone.
+- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE smoke matrix exposed a daemon
+  exit when issuing a second independent `generate_batch_prefill` request in
+  the same daemon process after the first batch completed; fresh-process
+  per-case smokes are still needed until repeated prefill lifecycle is audited.
+- Qwen3.5-397B-A17B HFQM v2 paged grouped-MoE fresh-process prefill still fails
+  for B=8 with 8 suffix tokens/session: cache16/cache64 report `hipMalloc: out
+  of memory` while paging an expert module, and cache128 was SIGKILLed during
+  the run. B=4 with 16 suffix tokens/session passes, so session fanout pressure
+  needs a separate audit from total live-row scratch sizing.
+- **[CRASH — FIXED] Qwen3.5-397B-A17B load on RDNA3.5 APU caused kernel
+  deadlock requiring hard reboot** (2026-06-11). Root cause: `HfqFile::open`
+  called `mmap.advise(Sequential)` + `posix_fadvise(SEQUENTIAL)`, triggering
+  291 GiB of kernel readahead. The slab loader then opened a second O_DIRECT fd
+  to the same inode; the readahead kworker (`kworker/6:0`) held an inode lock
+  that the O_DIRECT I/Os also needed → deadlock. For 35B (26 GiB) the readahead
+  completes in ~6 s before O_DIRECT starts; for 397B (291 GiB) it ran for ~70 s
+  concurrently. Fixed in `crates/hipfire-runtime/src/hfq.rs`: Sequential advice
+  is skipped for files > 64 GiB, and `drop_mmap()` now calls `FADV_DONTNEED` to
+  cancel any in-flight readahead before the O_DIRECT path starts.
 
 ## [High] cli/index.ts is a monolithic file
 - Category: Maintainability
