@@ -31,14 +31,26 @@ echo "Source: $SRC_DIR"
 echo "Architectures: ${ARCHS[*]}"
 echo "Parallel jobs: $JOBS"
 
-# Variant-tag regex: matches .gfxNNNN.hip (chip, e.g. .gfx1201.hip) and
-# .gfxNN.hip (family, e.g. .gfx12.hip). Files matching this are treated as
-# overrides for their parent name, not as independent kernels.
-VARIANT_TAG_RE='\.gfx[0-9]+\.hip$'
+# Variant-tag regex: matches .gfxNNNN.hip, .gfxNN.hip, and .gfxNNNN_xxx.hip
+# (e.g. .gfx11_dgpu.hip) at the end of a filename. Files matching this in the
+# root are treated as arch overrides, not independent kernels.
+VARIANT_TAG_RE='\.gfx[0-9]+(_[a-z_]+)?\.hip$'
 
 # ── Phase 1: enumerate jobs ──────────────────────────────────────────────
 # Emit one job per line: <arch>|<name>|<src>|<out>
 # (Skips and variant resolution applied here so the worker stays simple.)
+#
+# Arch-specific kernels live in kernels/src/$arch/ subdirs. Variant precedence
+# for a root base kernel (highest to lowest):
+#   1. $arch_dir/${name}.${arch}.hip          chip-tagged in chip dir
+#   2. $arch_dir/${name}.hip                  clean name in chip dir
+#   3. $family_dir/${name}.${arch_family}.hip family-tagged in family dir
+#   4. $family_dir/${name}.hip                clean name in family dir
+#   5. root/${name}.${arch}.hip               chip tag in root (backward compat)
+#   6. root/${name}.${arch_family}.hip        family tag in root (backward compat)
+#   7. root/${name}.hip                       generic fallback
+#
+# Phase 1b picks up kernels that live only in an arch subdir (no root .hip).
 
 JOB_FILE="$(mktemp)"
 trap 'rm -f "$JOB_FILE"' EXIT
@@ -47,12 +59,15 @@ for arch in "${ARCHS[@]}"; do
     out_dir="$OUT_BASE/$arch"
     mkdir -p "$out_dir"
     arch_family="${arch:0:5}"
+    arch_dir="$SRC_DIR/$arch"
+    family_dir="$SRC_DIR/$arch_family"
 
+    # ── Phase 1a: root base kernels ──────────────────────────────────────
     for src in "$SRC_DIR"/*.hip; do
         base=$(basename "$src")
 
-        # Skip variant-tagged files during the parent iteration; they get
-        # picked up below via the override lookup.
+        # Skip variant-tagged files in root; they get picked up via the
+        # override lookup below or have moved to an arch subdir.
         if [[ "$base" =~ $VARIANT_TAG_RE ]]; then
             continue
         fi
@@ -80,20 +95,64 @@ for arch in "${ARCHS[@]}"; do
             esac
         fi
 
-        # Variant precedence:
-        #   1. ${name}.${arch}.hip          (chip-specific, e.g. .gfx1100.)
-        #   2. ${name}.${arch_family}.hip   (family, e.g. .gfx12.)
-        #   3. ${name}.hip                  (default)
-        chip_variant="$SRC_DIR/${name}.${arch}.hip"
-        family_variant="$SRC_DIR/${name}.${arch_family}.hip"
-        if [ -f "$chip_variant" ]; then
-            src="$chip_variant"
-        elif [ -f "$family_variant" ]; then
-            src="$family_variant"
+        # Override lookup: arch subdir first, then root tags (backward compat).
+        if   [ -f "$arch_dir/${name}.${arch}.hip" ];          then src="$arch_dir/${name}.${arch}.hip"
+        elif [ -f "$arch_dir/${name}.hip" ];                  then src="$arch_dir/${name}.hip"
+        elif [ -f "$family_dir/${name}.${arch_family}.hip" ]; then src="$family_dir/${name}.${arch_family}.hip"
+        elif [ -f "$family_dir/${name}.hip" ];                then src="$family_dir/${name}.hip"
+        elif [ -f "$SRC_DIR/${name}.${arch}.hip" ];           then src="$SRC_DIR/${name}.${arch}.hip"
+        elif [ -f "$SRC_DIR/${name}.${arch_family}.hip" ];    then src="$SRC_DIR/${name}.${arch_family}.hip"
         fi
 
         out="$out_dir/${name}.hsaco"
         printf '%s|%s|%s|%s\n' "$arch" "$name" "$src" "$out" >> "$JOB_FILE"
+    done
+
+    # ── Phase 1b: arch-subdir-only kernels ───────────────────────────────
+    # Kernels that live exclusively in the arch or family subdir (no root .hip
+    # counterpart). Chip dir is scanned first; family dir skips names already
+    # added from chip dir to avoid duplicate jobs.
+    phase1b_seen=""
+    processed_subdirs=""
+    for subdir in "$arch_dir" "$family_dir"; do
+        [ -d "$subdir" ] || continue
+        # Skip if we already scanned this exact dir (arch == arch_family edge case)
+        case "$processed_subdirs" in *"|${subdir}|"*) continue ;; esac
+        processed_subdirs="${processed_subdirs}|${subdir}|"
+
+        for arch_src in "$subdir"/*.hip; do
+            [ -f "$arch_src" ] || continue
+            arch_base=$(basename "$arch_src")
+
+            # Derive canonical kernel name: strip arch/family tag, else .hip
+            arch_name="${arch_base%.${arch}.hip}"
+            [ "$arch_name" != "$arch_base" ] || arch_name="${arch_base%.${arch_family}.hip}"
+            [ "$arch_name" != "$arch_base" ] || arch_name="${arch_base%.hip}"
+
+            # Skip if a root base exists (already handled by Phase 1a)
+            [ -f "$SRC_DIR/${arch_name}.hip" ] && continue
+            # Skip if already emitted from chip dir in this Phase 1b pass
+            case "$phase1b_seen" in *"|${arch_name}|"*) continue ;; esac
+
+            if [ "$arch" = "gfx906" ]; then
+                case "$arch_name" in
+                    *_wmma*|gemv_mq8g256)
+                        echo "  - $arch_name SKIP (unsupported ISA on gfx906)"
+                        continue ;;
+                esac
+            fi
+            if [ "$arch" != "gfx906" ]; then
+                case "$arch_name" in
+                    *_gfx906|*_gfx906_*|*_dp4a)
+                        echo "  - $arch_name SKIP (gfx906-only)"
+                        continue ;;
+                esac
+            fi
+
+            phase1b_seen="${phase1b_seen}|${arch_name}|"
+            out="$out_dir/${arch_name}.hsaco"
+            printf '%s|%s|%s|%s\n' "$arch" "$arch_name" "$arch_src" "$out" >> "$JOB_FILE"
+        done
     done
 done
 

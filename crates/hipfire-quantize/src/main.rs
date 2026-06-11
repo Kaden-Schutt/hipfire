@@ -4144,12 +4144,18 @@ fn quantize_hfq_source_tensor(
         let (data, qt, label) = source_precision_tensor_bytes(raw, src_dtype, &f32_data);
         return Ok((data, qt, 0, label));
     }
-    if format == HfqInputFormat::F16 || !should_quantize(name) {
+    if format == HfqInputFormat::F16 {
         let data = match src_dtype {
             "F16" => raw.to_vec(),
             _ => f32_slice_to_f16_bytes(&f32_data),
         };
         return Ok((data, QuantType::F16, 0, "F16"));
+    }
+    if !should_quantize(name) {
+        // Preserve source precision for non-quantizable tensors (norms, decay
+        // scalars, etc.) — BF16 source should not be silently downcast to F16.
+        let (data, qt, label) = source_precision_tensor_bytes(raw, src_dtype, &f32_data);
+        return Ok((data, qt, 0, label));
     }
     let is_embed = name.contains("embed_tokens");
     let is_moe_router =

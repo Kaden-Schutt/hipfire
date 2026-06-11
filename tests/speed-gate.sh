@@ -27,7 +27,7 @@
 #   1   regression detected
 #   2   build or environment error
 #
-# Each metric is best-of-2 runs to smooth JIT/thermal noise.
+# Each metric is best-of-3 runs to smooth JIT/thermal noise.
 
 set -u
 cd "$(dirname "$0")/.."
@@ -156,7 +156,7 @@ ensure_build() {
 # MISSING_DRAFT, MISSING_PROMPT, MISSING_BIN, CRASH.
 # Canonical bench: 27B-3.5 LRU code @ max=256, Q8 KV, no chatml, no
 # adaptive-b. Default flags include prompt_normalize=true (engine default
-# since 2026-04-26). Best-of-2 (within 5% jitter on hot-cache).
+# since 2026-04-26). Best-of-3 (within 5% jitter on hot-cache).
 bench_dflash_27b_lru() {
     # Models may live at $MODELS_DIR (project-local) or ~/.hipfire/models/
     # (install). Drafts in particular are usually only at the install path.
@@ -434,9 +434,27 @@ if [ "$UPDATE" -eq 1 ]; then
     mkdir -p "$(dirname "$BASELINE_FILE")"
     cp "$tmpfile" "$BASELINE_FILE"
     rm -f "$tmpfile"
+
+    # Record quant-type distributions alongside the baselines so regressions
+    # caused by a model file changing format (e.g. BF16 accidentally replacing
+    # MQ4) are detectable without re-running the full gate.
+    DIST_DIR="tests/weight-distributions"
+    mkdir -p "$DIST_DIR"
+    if command -v python3 >/dev/null 2>&1 && [ -f scripts/inspect_hfq.py ]; then
+        for size in "${SIZES[@]}"; do
+            mf="$(find_model_file "qwen3.5-${size}.mq4" || true)"
+            [ -z "$mf" ] && continue
+            python3 scripts/inspect_hfq.py --dist-only "$mf" \
+                > "$DIST_DIR/qwen3.5-${size}-mq4-${BASELINE_ARCH}.dist.txt"
+            printf "  dist recorded: qwen3.5-%s-mq4-%s.dist.txt\n" "$size" "$BASELINE_ARCH"
+        done
+    else
+        color yellow "  skipping weight-distribution snapshot (python3 or scripts/inspect_hfq.py not found)"; echo
+    fi
+
     echo
     color bold "Baselines written to $BASELINE_FILE"; echo
-    echo "Review with:  git diff $BASELINE_FILE"
+    echo "Review with:  git diff $BASELINE_FILE $DIST_DIR/"
     echo "Then commit them alongside your code change."
     exit 0
 fi

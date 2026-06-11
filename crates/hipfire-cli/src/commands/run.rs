@@ -26,8 +26,8 @@ pub struct RunArgs {
 }
 
 pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
-    let model_path =
-        find_model(&args.model).ok_or_else(|| anyhow::anyhow!("model not found: {}", args.model))?;
+    let model_path = find_model(&args.model)
+        .ok_or_else(|| anyhow::anyhow!("model not found: {}", args.model))?;
 
     let bin = find_daemon_bin().ok_or_else(|| {
         anyhow::anyhow!(

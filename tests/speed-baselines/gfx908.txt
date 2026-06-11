@@ -8,7 +8,7 @@
 # ROCm 7.0.51831 / HIP 7.0 / amd-clang 20 (roc-7.0.0)
 # Tolerance: 0.05 (fail if any metric drops below baseline × (1 - tolerance))
 #
-# Measurements: best-of-2 via bench_qwen35_mq4 with HIPFIRE_KV_MODE=asym3.
+# Measurements: best-of-3 via bench_qwen35_mq4 with HIPFIRE_KV_MODE=asym3.
 # Two prefill sizes per model:
 #   pp32  — short-context / launch-overhead regression detector
 #   pp128 — realistic prompt / GEMM-efficiency detector

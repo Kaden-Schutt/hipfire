@@ -19,6 +19,10 @@ enum Command {
     /// List locally available models
     #[command(alias = "models")]
     List,
+    /// Run the quant admission/model evaluation harness
+    Eval(commands::forward::EvalArgs),
+    /// Measure host, GPU-copy, and model storage bandwidth
+    HostProfile(commands::forward::HostProfileArgs),
 }
 
 #[tokio::main]
@@ -41,5 +45,7 @@ async fn main() -> anyhow::Result<()> {
             commands::list::run();
             Ok(())
         }
+        Command::Eval(args) => commands::forward::run_eval(args),
+        Command::HostProfile(args) => commands::forward::run_host_profile(args),
     }
 }
