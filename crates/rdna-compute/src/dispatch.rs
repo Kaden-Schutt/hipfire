@@ -7687,11 +7687,25 @@ impl Gpu {
         }
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        self.ensure_kernel(
-            "fused_rmsnorm_mq_rotate",
-            kernels::FUSED_RMSNORM_MQ_ROTATE_SRC,
-            "fused_rmsnorm_mq_rotate",
-        )?;
+        let (module_name, kernel_src, kernel_name, timer_name, reduce_slots) =
+            if self.arch_caps.is_gfx1151() {
+                (
+                    "fused_rmsnorm_mq_rotate_gfx1151",
+                    kernels::FUSED_RMSNORM_MQ_ROTATE_GFX1151_SRC,
+                    "fused_rmsnorm_mq_rotate_gfx1151",
+                    "fused_rmsnorm_mq_rotate_gfx1151",
+                    8usize,
+                )
+            } else {
+                (
+                    "fused_rmsnorm_mq_rotate",
+                    kernels::FUSED_RMSNORM_MQ_ROTATE_SRC,
+                    "fused_rmsnorm_mq_rotate",
+                    "fused_rmsnorm_mq_rotate",
+                    256usize,
+                )
+            };
+        self.ensure_kernel(module_name, kernel_src, kernel_name)?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
@@ -7713,15 +7727,15 @@ impl Gpu {
         ];
 
         let block_size = 256u32;
-        // Dynamic LDS: K floats for x_shared + 256 floats for reduce buffer.
-        let shared_mem = ((k + 256) * 4) as u32;
+        // Dynamic LDS: K floats for x_shared plus the selected reduction
+        // scratch (generic=256 floats, gfx1151=8 wave sums).
+        let shared_mem = ((k + reduce_slots) * 4) as u32;
 
         // Bandwidth: read x (K*4) + weight (K*4) + signs (2*256*4) + write x_rot (K*4)
         let bytes = k * 4 * 3 + 2 * 256 * 4;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "fused", "fused_rmsnorm_mq_rotate", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", timer_name, bytes);
         let result = self.launch_maybe_blob(
-            "fused_rmsnorm_mq_rotate",
+            kernel_name,
             [1, 1, 1],
             [block_size, 1, 1],
             shared_mem,
@@ -8043,11 +8057,25 @@ impl Gpu {
         }
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        self.ensure_kernel(
-            "fused_rmsnorm_mq_rotate",
-            kernels::FUSED_RMSNORM_MQ_ROTATE_SRC,
-            "fused_rmsnorm_mq_rotate",
-        )?;
+        let (module_name, kernel_src, kernel_name, timer_name, reduce_slots) =
+            if self.arch_caps.is_gfx1151() {
+                (
+                    "fused_rmsnorm_mq_rotate_gfx1151",
+                    kernels::FUSED_RMSNORM_MQ_ROTATE_GFX1151_SRC,
+                    "fused_rmsnorm_mq_rotate_gfx1151",
+                    "fused_rmsnorm_mq_rotate_gfx1151_batched",
+                    8usize,
+                )
+            } else {
+                (
+                    "fused_rmsnorm_mq_rotate",
+                    kernels::FUSED_RMSNORM_MQ_ROTATE_SRC,
+                    "fused_rmsnorm_mq_rotate",
+                    "fused_rmsnorm_mq_rotate_batched",
+                    256usize,
+                )
+            };
+        self.ensure_kernel(module_name, kernel_src, kernel_name)?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
@@ -8068,16 +8096,11 @@ impl Gpu {
             &mut eps_v as *mut _ as *mut c_void,
         ];
         let block_size = 256u32;
-        let shared_mem = ((k + 256) * 4) as u32;
+        let shared_mem = ((k + reduce_slots) * 4) as u32;
         let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            "fused_rmsnorm_mq_rotate_batched",
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "fused", timer_name, bytes);
         let result = self.launch_maybe_blob(
-            "fused_rmsnorm_mq_rotate",
+            kernel_name,
             [batch_size as u32, 1, 1],
             [block_size, 1, 1],
             shared_mem,

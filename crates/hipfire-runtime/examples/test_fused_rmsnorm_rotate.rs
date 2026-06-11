@@ -60,6 +60,11 @@ fn main() {
         eprintln!("  max_rel:   {max_rel:.6e}");
         eprintln!("  split[0..4]: {:?}", &a[..4]);
         eprintln!("  fused[0..4]: {:?}", &b[..4]);
+        assert_eq!(n_finite, k, "non-finite fused_rmsnorm_rotate output");
+        assert!(
+            max_abs <= 2.0e-6,
+            "fused_rmsnorm_rotate max_abs {max_abs:.6e} exceeds tolerance"
+        );
 
         gpu.free_tensor(d_x).unwrap();
         gpu.free_tensor(d_w).unwrap();

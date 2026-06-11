@@ -127,9 +127,16 @@ default.
 |---|---|---|---|---|---|---|
 | rmsnorm | — | standard (reduce) | — | — | **—** ⚠️ | — |
 | rotate_with_rms (fused) | — | standard | — | — | **—** ⚠️ | — |
-| fused_rmsnorm_mq_rotate | generic only | generic only | generic only | generic only | **generic only** ⚠️ | generic only |
+| fused_rmsnorm_mq_rotate | generic only | generic only | generic only | generic only | basic (wave-reduced RMS) | generic only |
 
-All norm kernels are F32-only. The `fused_rmsnorm_mq_rotate` family (called before every GEMV) has no arch-specific variants anywhere. This is highest priority for gfx1151 where BF16 widening overhead is not hidden by discrete VRAM bandwidth.
+All norm kernels are F32-only. gfx1151 now has a fused RMSNorm+MQ-rotate
+variant that keeps the generic FWHT phase but replaces the 256-float LDS
+reduction ladder with wave reductions plus 8 wave sums. On
+Qwen3.6-35B-A3B MQ4 pp256, the profiled batched row moved from 867.3us to
+821.4us across 40 calls. Standalone split-vs-fused correctness stays within
+9.54e-7 max_abs at K=12288. The remaining norm/rotate gap is broader:
+plain `rmsnorm`, `gated_norm`, `fused_silu_mul_mq_rotate`, and DeltaNet-
+specific conv/gate kernels still use generic F32 implementations.
 
 ### Misc compute
 
