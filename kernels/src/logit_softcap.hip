@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Logit soft-capping (Gemma 2/3/4 final-logit softcap): out[i] = tanh(x[i]/cap)*cap
 // In-place over the flat logits vector. Gemma 4 has NO per-attention-layer softcap.
 #include <hip/hip_runtime.h>

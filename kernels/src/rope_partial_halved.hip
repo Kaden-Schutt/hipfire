@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Partial RoPE using the HuggingFace "rotate_half" pairing convention.
 //
 // This is the Gemma 4 full-attention layer RoPE: head_dim=512 but only the

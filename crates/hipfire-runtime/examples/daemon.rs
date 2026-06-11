@@ -2164,6 +2164,14 @@ fn main() {
                         // exact failure that left the prompt cache dead when the
                         // installed CLI predated the allowlist. Source of truth
                         // lives here, next to the cache implementation.
+                        // arch_id 13 (gemma4) is intentionally absent: generate_gemma4 has
+                        // no LCP prefix-reuse logic (no lcp/conversation_tokens skip before
+                        // prefill). Adding 13 here would cause the CLI to skip the per-turn
+                        // reset and send only the last user message as prompt, but the
+                        // generate path re-renders the full conversation and prefills from
+                        // state.n_tokens (non-zero after turn 1) → wrong KV slot offsets.
+                        // Wire when generate_gemma4 gains an LCP block matching
+                        // generate_minimax's prefix-cache pattern (lines ~13875-13928).
                         let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10);
                         let _ = writeln!(
                             stdout,

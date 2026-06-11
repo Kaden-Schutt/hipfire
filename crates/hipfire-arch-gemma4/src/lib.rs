@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026 Kaden Schutt
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Kaden Schutt, Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! hipfire-arch-gemma4: Gemma 4 dense text (`google/gemma-4-12B-it`) for hipfire.
