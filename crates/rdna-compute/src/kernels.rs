@@ -2181,6 +2181,11 @@ pub const GEMM_QKV_Q8_0_WMMA_SRC: &str =
 pub const GEMM_QKVZA_Q8_0_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_q8_0_wmma.hip");
 
+/// gfx1151 4-warp 64x64 fused qkv+z+beta+alpha GEMM for Q8_0.
+/// LDS-stages X and reuses packed Q8 rows across 64 prompt tokens.
+pub const GEMM_QKVZA_Q8_0_WMMA_4W_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gemm_qkvza_q8_0_wmma_4w.gfx1151.hip");
+
 /// WMMA 2-way fused gate+up GEMM for Q8_0 (FFN preamble).
 pub const GEMM_GATE_UP_Q8_0_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_q8_0_wmma.hip");

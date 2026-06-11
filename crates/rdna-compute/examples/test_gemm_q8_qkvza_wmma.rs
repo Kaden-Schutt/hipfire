@@ -54,6 +54,10 @@ fn main() {
         let d_y_z_r = gpu.zeros(&[max_n * z_m], DType::F32).unwrap();
         let d_y_beta_r = gpu.zeros(&[max_n * beta_m], DType::F32).unwrap();
         let d_y_alpha_r = gpu.zeros(&[max_n * alpha_m], DType::F32).unwrap();
+        let d_y_qkv_4w = gpu.zeros(&[max_n * qkv_m], DType::F32).unwrap();
+        let d_y_z_4w = gpu.zeros(&[max_n * z_m], DType::F32).unwrap();
+        let d_y_beta_4w = gpu.zeros(&[max_n * beta_m], DType::F32).unwrap();
+        let d_y_alpha_4w = gpu.zeros(&[max_n * alpha_m], DType::F32).unwrap();
 
         for &n in &batches {
             let x_n = d_x.sub_offset(0, n * k);
@@ -65,6 +69,10 @@ fn main() {
             let zr = d_y_z_r.sub_offset(0, n * z_m);
             let br = d_y_beta_r.sub_offset(0, n * beta_m);
             let ar = d_y_alpha_r.sub_offset(0, n * alpha_m);
+            let q4 = d_y_qkv_4w.sub_offset(0, n * qkv_m);
+            let z4 = d_y_z_4w.sub_offset(0, n * z_m);
+            let b4 = d_y_beta_4w.sub_offset(0, n * beta_m);
+            let a4 = d_y_alpha_4w.sub_offset(0, n * alpha_m);
 
             if arch.starts_with("gfx12") {
                 gpu.gemm_qkvza_q8_0_wmma_gfx12(
@@ -124,6 +132,44 @@ fn main() {
                 s[0].mean_rel, s[0].max_rel, s[1].mean_rel, s[1].max_rel,
                 s[2].mean_rel, s[2].max_rel, s[3].mean_rel, s[3].max_rel,
             );
+
+            if arch == "gfx1151" && n % 64 == 0 {
+                gpu.gemm_qkvza_q8_0_wmma_4w_gfx1151(
+                    &d_qkv, &d_z, &d_beta, &d_alpha, &x_n, &q4, &z4, &b4, &a4, qkv_m, z_m, beta_m,
+                    alpha_m, k, n,
+                )
+                .unwrap();
+                let s4 = [
+                    compare(
+                        &gpu.download_f32(&q4).unwrap(),
+                        &gpu.download_f32(&qr).unwrap(),
+                    ),
+                    compare(
+                        &gpu.download_f32(&z4).unwrap(),
+                        &gpu.download_f32(&zr).unwrap(),
+                    ),
+                    compare(
+                        &gpu.download_f32(&b4).unwrap(),
+                        &gpu.download_f32(&br).unwrap(),
+                    ),
+                    compare(
+                        &gpu.download_f32(&a4).unwrap(),
+                        &gpu.download_f32(&ar).unwrap(),
+                    ),
+                ];
+                let pass4 = s4.iter().all(|x| x.mean_rel < 2e-3 && x.max_rel < 3.5e-2);
+                let mark4 = if pass4 {
+                    "PASS"
+                } else {
+                    total_fail += 1;
+                    "FAIL"
+                };
+                eprintln!(
+                    "          4w {mark4} QKV: mean={:.2e}/max={:.2e}  Z: {:.2e}/{:.2e}  β: {:.2e}/{:.2e}  α: {:.2e}/{:.2e}",
+                    s4[0].mean_rel, s4[0].max_rel, s4[1].mean_rel, s4[1].max_rel,
+                    s4[2].mean_rel, s4[2].max_rel, s4[3].mean_rel, s4[3].max_rel,
+                );
+            }
         }
     }
     eprintln!("\n=== {total_fail} failure(s) ===");

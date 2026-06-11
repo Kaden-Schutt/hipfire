@@ -27591,6 +27591,19 @@ impl Gpu {
             0,
             "gemm_qkvza_q8_0_wmma: K must be a multiple of 32 (got K={k})"
         );
+        static Q8_QKVZA_4W: OnceLock<bool> = OnceLock::new();
+        let q8_qkvza_4w = *Q8_QKVZA_4W.get_or_init(|| {
+            !matches!(
+                std::env::var("HIPFIRE_Q8_QKVZA_4W").ok().as_deref(),
+                Some("0" | "off" | "false" | "no")
+            )
+        });
+        if q8_qkvza_4w && self.arch == "gfx1151" && batch_size % 64 == 0 && batch_size >= 128 {
+            return self.gemm_qkvza_q8_0_wmma_4w_gfx1151(
+                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+                alpha_m, k, batch_size,
+            );
+        }
         self.ensure_kernel(
             "gemm_qkvza_q8_0_wmma",
             kernels::GEMM_QKVZA_Q8_0_WMMA_SRC,
@@ -27647,6 +27660,130 @@ impl Gpu {
             "gemm_qkvza_q8_0_wmma",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_qkv_p);
+                b.push_ptr(a_z_p);
+                b.push_ptr(a_beta_p);
+                b.push_ptr(a_alpha_p);
+                b.push_ptr(xp);
+                b.push_ptr(y_qkv_p);
+                b.push_ptr(y_z_p);
+                b.push_ptr(y_beta_p);
+                b.push_ptr(y_alpha_p);
+                b.push_i32(qkv_m_val);
+                b.push_i32(z_m_val);
+                b.push_i32(beta_m_val);
+                b.push_i32(alpha_m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1151 4-warp 64x64 Q8_0 QKVZA GEMM. Explicit opt-in until the
+    /// end-to-end Qwen35 profile proves the shape gate is consistently a win.
+    pub fn gemm_qkvza_q8_0_wmma_4w_gfx1151(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(
+            self.arch, "gfx1151",
+            "gemm_qkvza_q8_0_wmma_4w_gfx1151 is gfx1151-only"
+        );
+        debug_assert_eq!(
+            k % 32,
+            0,
+            "gemm_qkvza_q8_0_wmma_4w_gfx1151: K must be a multiple of 32"
+        );
+        debug_assert_eq!(
+            batch_size % 64,
+            0,
+            "gemm_qkvza_q8_0_wmma_4w_gfx1151: N must be a multiple of 64"
+        );
+        self.ensure_kernel(
+            "gemm_qkvza_q8_0_wmma_4w_gfx1151",
+            kernels::GEMM_QKVZA_Q8_0_WMMA_4W_GFX1151_SRC,
+            "gemm_qkvza_q8_0_wmma_4w_gfx1151",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_qkv_p = a_qkv.buf.as_ptr();
+        let mut a_z_p = a_z.buf.as_ptr();
+        let mut a_beta_p = a_beta.buf.as_ptr();
+        let mut a_alpha_p = a_alpha.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut y_qkv_p = y_qkv.buf.as_ptr();
+        let mut y_z_p = y_z.buf.as_ptr();
+        let mut y_beta_p = y_beta.buf.as_ptr();
+        let mut y_alpha_p = y_alpha.buf.as_ptr();
+        let mut qkv_m_val = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut beta_m_val = beta_m as i32;
+        let mut alpha_m_val = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_qkv_p as *mut _ as *mut c_void,
+            &mut a_z_p as *mut _ as *mut c_void,
+            &mut a_beta_p as *mut _ as *mut c_void,
+            &mut a_alpha_p as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_qkv_p as *mut _ as *mut c_void,
+            &mut y_z_p as *mut _ as *mut c_void,
+            &mut y_beta_p as *mut _ as *mut c_void,
+            &mut y_alpha_p as *mut _ as *mut c_void,
+            &mut qkv_m_val as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut beta_m_val as *mut _ as *mut c_void,
+            &mut alpha_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let row_tiles = (total_m + 63) / 64;
+        let batch_tiles = (batch_size + 63) / 64;
+        let q8_bytes = |m: usize| m * (k / 32) * 34;
+        let bytes = q8_bytes(qkv_m)
+            + q8_bytes(z_m)
+            + q8_bytes(beta_m)
+            + q8_bytes(alpha_m)
+            + batch_size * k * 2
+            + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            "gemm_qkvza_q8_0_wmma_4w_gfx1151",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_qkvza_q8_0_wmma_4w_gfx1151",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [128, 1, 1],
             0,
             &mut params,
             || {
