@@ -1,0 +1,33 @@
+[package]
+name = "hipfire-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "hipfire inference daemon — JSON-lines IPC worker process"
+
+[[bin]]
+name = "hipfire-daemon"
+path = "src/main.rs"
+
+[features]
+default = ["arch-lfm2moe", "deltanet"]
+arch-lfm2moe = ["hipfire-arch-lfm2moe"]
+deltanet = ["rdna-compute/deltanet"]
+
+[dependencies]
+hipfire-runtime    = { path = "../hipfire-runtime" }
+hipfire-arch-qwen35    = { path = "../hipfire-arch-qwen35" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hipfire-arch-llama     = { path = "../hipfire-arch-llama" }
+hipfire-arch-qwen2     = { path = "../hipfire-arch-qwen2" }
+hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
+hipfire-arch-minimax   = { path = "../hipfire-arch-minimax" }
+hipfire-arch-dots-ocr  = { path = "../hipfire-arch-dots-ocr" }
+hipfire-arch-lfm2moe   = { path = "../hipfire-arch-lfm2moe", optional = true }
+hip-bridge    = { path = "../hip-bridge" }
+rdna-compute  = { path = "../rdna-compute" }
+base64        = "0.22"
+serde_json    = "1"
+libc          = "0.2"
+tracing       = "0.1"
+twox-hash     = { version = "2", default-features = false, features = ["xxhash64"] }

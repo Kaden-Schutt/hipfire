@@ -18,6 +18,9 @@ members = [
     "crates/hipfire-detect",
     "crates/hipfire-atlas",
     "crates/redline",
+    "crates/hipfire-server",
+    "crates/hipfire-cli",
+    "crates/hipfire-daemon",
 ]
 
 [workspace.package]

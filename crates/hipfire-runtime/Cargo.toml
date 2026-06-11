@@ -118,10 +118,6 @@ hipfire-atlas = { path = "../hipfire-atlas" }
 # touch arch crates and build under any feature combination.
 
 [[example]]
-name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-lfm2moe", "arch-dots-ocr"]
-
-[[example]]
 name = "hfq_split"
 required-features = []
 
