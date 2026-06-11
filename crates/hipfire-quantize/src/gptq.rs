@@ -37,8 +37,6 @@
 //! All linear algebra is FP64 (per Claude M2 + GLM5 M2 reviews) — FP32
 //! Cholesky on K=12288 with cond=1e6+ has zero effective precision.
 
-#![cfg_attr(not(test), allow(dead_code))]  // suppress until main.rs wires it
-
 use faer::linalg::solvers::{DenseSolveCore, Solve};
 use faer::{Mat, Side};
 use rayon::prelude::*;

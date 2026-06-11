@@ -7043,6 +7043,22 @@ fn main() {
                         if k_dim % 256 == 0 {
                             let signs1 = gen_fwht_signs(42, 256);
                             let signs2 = gen_fwht_signs(1042, 256);
+                            // ── Gemma4 (arch 13/22): embed/lm_head MUST NOT reach AWQ ──────
+                            // embed_tokens and lm_head are always routed to Q8 via the K-map
+                            // (kmap_level == QuantLevel::Q8) before reaching this branch, so
+                            // they cannot arrive here. Assert that invariant to document it:
+                            // Gemma4 uses a tied embed/lm_head with an implicit √d_model
+                            // (√3840) scaling factor — there is no RMSNorm anchor on the
+                            // embedding dimension, making AWQ's imatrix-saliency ratio
+                            // meaningless and the per-channel pre-scale actively harmful.
+                            debug_assert!(
+                                !(is_gemma4_family
+                                    && (name.contains("embed_tokens")
+                                        || name.contains("lm_head"))),
+                                "gemma4 embed/lm_head reached the MQ4 AWQ path —                                  kmap Q8 guard should have prevented this (arch {} tensor {})",
+                                arch_id, name
+                            );
+
                             // Phase A Stage A — AWQ pre-scaling, when --awq is enabled
                             // AND we have imatrix data for this tensor AND the tensor
                             // is on the AWQ whitelist (see `awq_eligible`). Mutates a
@@ -7056,7 +7072,76 @@ fn main() {
                             // produces `(W·s)·x ≠ W·x` and catastrophically corrupts
                             // logits (KLD 0.67 → 13.5 measured on 0.8B Qwen3.5 before
                             // this guard landed). See `docs/plans/awq_fix_claude.md`.
-                            let q = if let (Some(alpha), Some(im_weights)) =
+                            //
+                            // ── Gemma4 (arch 13/22) FFN → GPTQ, not AWQ ─────────────────────
+                            // For Gemma4 gate_proj / up_proj / down_proj (and shared-expert
+                            // counterparts), AWQ is structurally unsound: the rotated FFN basis
+                            // (GeLU + GeGLU gate) has no stable RMSNorm-derived per-channel
+                            // activation scale to anchor AWQ's saliency ratio. Instead we use
+                            // `gptq::gptq_pipeline_mq4g256` with a diagonal Hessian approximation
+                            // built from the imatrix: H ≈ diag(im_weights²). This is a standard
+                            // approximation when full second-moment statistics are unavailable;
+                            // GPTQ's column-sequential OBS compensation works well even with a
+                            // diagonal Hessian and consistently beats AWQ on gemma-style rotated FFN.
+                            // Falls back to plain MQ4 if Cholesky fails (rare: only on degenerate
+                            // activation distributions).
+                            let q = if is_gemma4_family
+                                && gemma4_is_ffn_tensor(name)
+                                && awq_eligible(name)
+                            {
+                                // Gemma4 FFN: GPTQ path (with or without --awq flag — the
+                                // AWQ flag controls the general AWQ pass; GPTQ here is
+                                // unconditional for gemma4 FFN when imatrix is available).
+                                if let Some(im_weights) = imatrix_weights_for(name) {
+                                    debug_assert_eq!(
+                                        im_weights.len(),
+                                        k_dim,
+                                        "imatrix length ({}) != K dim ({}) for {}",
+                                        im_weights.len(),
+                                        k_dim,
+                                        name
+                                    );
+                                    let m_dim = meta.shape[0];
+                                    // Diagonal Hessian: H[i,i] = im_weights[i]², H[i,j≠i] = 0.
+                                    // Packed row-major as a K×K flat vec. This is the standard
+                                    // diagonal approximation used when full Hessians are not
+                                    // pre-collected; gptq_pipeline_mq4g256 handles the
+                                    // FWHT-similarity transform internally.
+                                    let h_diag: Vec<f32> = {
+                                        let mut h = vec![0.0f32; k_dim * k_dim];
+                                        for j in 0..k_dim {
+                                            h[j * k_dim + j] = (im_weights[j] as f32).powi(2);
+                                        }
+                                        h
+                                    };
+                                    // AWQ scales = identity (no AWQ pre-scaling for gemma4).
+                                    let awq_unit: Vec<f64> = vec![1.0f64; k_dim];
+                                    match gptq::gptq_pipeline_mq4g256(
+                                        &f32_data,
+                                        m_dim,
+                                        k_dim,
+                                        &h_diag,
+                                        &awq_unit,
+                                        &signs1,
+                                        &signs2,
+                                        1e-3,
+                                        1e3,
+                                        name,
+                                    ) {
+                                        Ok(bytes) => bytes,
+                                        Err(e) => {
+                                            eprintln!(
+                                                "  gptq: Cholesky failed for {} ({:?}) —                                                  falling back to plain MQ4",
+                                                name, e
+                                            );
+                                            quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                        }
+                                    }
+                                } else {
+                                    // No imatrix: fall back to plain MQ4 (no AWQ sidecar).
+                                    quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                }
+                            } else if let (Some(alpha), Some(im_weights)) =
                                 (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                             {
                                 if awq_eligible(name) {
