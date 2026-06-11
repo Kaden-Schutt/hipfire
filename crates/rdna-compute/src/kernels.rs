@@ -81,6 +81,11 @@ pub const FUSED_RMSNORM_MQ_ROTATE_GFX1151_SRC: &str =
 pub const RMSNORM_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/rmsnorm.gfx1151.hip");
 
+/// gfx1151 parallel-token DeltaNet conv1d+SiLU+QKV split for prefill. Same
+/// ABI as the generic conv1d split kernel plus a companion state update entry.
+pub const CONV1D_SILU_SPLIT_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/conv1d_silu_split.gfx1151.hip");
+
 /// HFQ2-G256: flat 2-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][64B data] = 72 bytes per 256 weights (0.28 B/w).
 pub const GEMV_HFQ2G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2g256.hip");

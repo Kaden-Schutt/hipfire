@@ -168,11 +168,17 @@ Unique kernels: `conv1d_*`, `fused_sigmoid_alpha_gate`, `alpha_gate`
 |---|---|---|---|---|---|---|
 | conv1d_decode | — | — | — | — | **—** ⚠️ | — |
 | conv1d_gated_decode | — | — | — | — | **—** ⚠️ | — |
-| conv1d_silu / split / routed / tree | — | — | — | — | **—** ⚠️ | — |
+| conv1d_silu / split / routed / tree | — | — | — | — | basic (`split` prefill) | — |
 | fused_sigmoid_alpha_gate | — | — | — | — | **—** ⚠️ | — |
 | alpha_gate | — | — | — | — | — | — |
 
-gfx1151 is the primary deployment target for Qwen3.5. Every DeltaNet layer runs through conv1d + fused_sigmoid_alpha_gate using F32-only generic kernels.
+gfx1151 is the primary deployment target for Qwen3.5. The linear
+`conv1d_silu_split_f32_n` large-prefill path now has a gfx1151 parallel-token
+variant plus a state-commit kernel (admitted at `n_tokens >= 64` after pp32
+speed-gate rejected the extra launch). On Qwen3.5-9B MQ4 pp256, the profiled
+conv compute row moved from 3274.2us to 1494.3us across 24 calls, plus
+164.7us for final state commits. Decode, routed-session, tree-verify, and
+`fused_sigmoid_alpha_gate` still use generic F32 kernels.
 
 ### DeepSeek V4 Flash + mHC (hipfire-arch-deepseek4)
 
@@ -224,7 +230,7 @@ Ordered by estimated decode-path impact on active hardware.
 |---|---|---|---|
 | 1 | GEMV decode (mq4g256, hfq4g256) | gfx1151 | RDNA3 R=2 path is wired, but measured flat so further decode-shape tuning remains open |
 | 2 | fused_rmsnorm_mq_rotate / plain rmsnorm BF16 | gfx1151 | Initial wave-reduced gfx1151 paths are wired; broader BF16-native norm coverage remains open |
-| 3 | conv1d + fused_sigmoid_alpha_gate BF16 | gfx1151 | Every DeltaNet layer; Qwen3.5 is the primary gfx1151 model |
+| 3 | conv1d + fused_sigmoid_alpha_gate BF16 | gfx1151 | Linear prefill split path is parallelized; decode/routed/tree conv and alpha gate remain generic |
 | 4 | hc_sinkhorn_4x4 + hc_mix_4stream | gfx942 | Every forward pass layer in DeepSeek4; MFMA available but unused |
 | 5 | GEMV decode (mq4g256, hfq4g256) | gfx12 | Only FP8 GEMV exists; MQ4 decode falls back to generic |
 | 6 | deepseek4_attn_swa causal | gfx942, gfx12 | Hot path on MI300X / RX 9070; currently generic F32 |

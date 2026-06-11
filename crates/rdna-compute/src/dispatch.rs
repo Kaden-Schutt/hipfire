@@ -38539,6 +38539,11 @@ impl Gpu {
         n_tokens: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.arch_caps.is_gfx1151() && n_tokens >= 64 {
+            return self.conv1d_silu_split_f32_n_gfx1151(
+                q_out, k_out, v_out, input, weight, state, k_dim, v_dim, n_tokens,
+            );
+        }
         self.ensure_kernel(
             "conv1d_silu_split",
             kernels::CONV1D_SILU_SPLIT_SRC,
@@ -38594,6 +38599,122 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_silu_split_f32_n_gfx1151(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "conv1d_silu_split_gfx1151",
+            kernels::CONV1D_SILU_SPLIT_GFX1151_SRC,
+            "conv1d_silu_split_f32_gfx1151",
+        )?;
+        self.ensure_kernel(
+            "conv1d_silu_split_state_gfx1151",
+            kernels::CONV1D_SILU_SPLIT_GFX1151_SRC,
+            "conv1d_silu_split_update_state_gfx1151",
+        )?;
+
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let nt = n_tokens as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        let n_channels = 2 * k_dim + v_dim;
+        let block = 256u32;
+        let grid = ((n_channels as u32) + block - 1) / block;
+        let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "conv1d_silu_split_f32_n_gfx1151",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "conv1d_silu_split_f32_gfx1151",
+            [grid, n_tokens as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(nt);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+
+        let nc = n_channels as i32;
+        let mut update_params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nc as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        let update_bytes = n_channels * 4 * 4;
+        let update_timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "conv1d_silu_split_state_gfx1151",
+            update_bytes,
+        );
+        let update_result = self.launch_maybe_blob(
+            "conv1d_silu_split_update_state_gfx1151",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut update_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(sp);
+                b.push_i32(nc);
+                b.push_i32(nt);
+                b
+            },
+        );
+        if let Some(t) = update_timer {
+            t.finish(&self.hip);
+        }
+        update_result
     }
 
     #[cfg(feature = "deltanet")]
