@@ -11,6 +11,7 @@
 //! RDNA-native quantized weights.
 
 mod gguf_input;
+mod gptq;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -248,6 +249,21 @@ fn gemma4_f16_keep(name: &str) -> bool {
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
         .any(|token| name.contains(token))
+}
+
+/// True when  is a Gemma4 FFN projection (gate_proj / up_proj / down_proj,
+/// including the shared-expert variants). Used to route gemma4 FFN tensors through
+/// GPTQ instead of AWQ: Gemma4 lacks RMSNorm-anchored inputs (√d_model embedding
+/// scale, no per-layer pre-norm on FFN inputs), which makes AWQ's imatrix-saliency
+/// signal unreliable — GPTQ's column-sequential OBS correction is a better fit.
+fn gemma4_is_ffn_tensor(name: &str) -> bool {
+    name.ends_with("mlp.gate_proj.weight")
+        || name.ends_with("mlp.up_proj.weight")
+        || name.ends_with("mlp.down_proj.weight")
+        // shared expert FFN in gemma4 26B-A4B MoE
+        || name.ends_with("mlp.shared_expert.gate_proj.weight")
+        || name.ends_with("mlp.shared_expert.up_proj.weight")
+        || name.ends_with("mlp.shared_expert.down_proj.weight")
 }
 
 /// Convert raw tensor bytes to F32 based on dtype string
@@ -5479,6 +5495,11 @@ fn main() {
     }
     let is_moe = arch_id == 6;
     let is_gemma4 = arch_id == 13;
+    // Covers both the dense arch-13 (12B/26B unified) and the EAGLE drafter
+    // (arch-22). Both have the same AWQ-unsuitability: √d_model embedding scale
+    // (not RMSNorm-anchored) corrupts AWQ saliency for FFN; embed/lm_head are
+    // tied + scaled by √3840 making AWQ scale saliency meaningless there.
+    let is_gemma4_family = arch_id == 13 || arch_id == 22;
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
@@ -6671,6 +6692,36 @@ fn main() {
                 // the runtime can apply `x / s` before the rotation kernel at
                 // inference time.
                 let mut awq_sidecar_scales: Option<Vec<f32>> = None;
+
+                // ── HIPFIRE_GEMMA4_SOFTCAP_CALIB skeleton ─────────────────────────
+                // No-op guard for future softcap-aware lm_head calibration.
+                // See findings/gemma4_softcap_aware_calib.md for the full design.
+                //
+                // When HIPFIRE_GEMMA4_SOFTCAP_CALIB=1 is set AND this tensor is the
+                // tied lm_head / embed_tokens for a Gemma4 model, a future
+                // implementation would:
+                //   1. Load corpus activations x (post-final-RMSNorm, shape [n, dim])
+                //      collected by a separate `collect_softcap_calib` pass.
+                //   2. Run a softcap-aware AWQ scale search:
+                //         argmin_s || tanh(Wq(s)*(x/s)/cap)*cap
+                //                    - tanh(W*(x/s)/cap)*cap ||_F
+                //      over ~20 alpha candidates (same as standard AWQ grid).
+                //   3. Emit a `<lm_head_name>.awq_scale` sidecar distinct from the
+                //      embed_tokens sidecar (tied bytes, separate WeightTensor
+                //      dispatch site at forward time).
+                //
+                // Today this block is a no-op: it prints a diagnostic and falls
+                // through to the standard Q8 path unchanged.
+                if (arch_id == 13 || arch_id == 22)
+                    && std::env::var_os("HIPFIRE_GEMMA4_SOFTCAP_CALIB").is_some()
+                    && (name.contains("embed_tokens") || name.contains("lm_head"))
+                {
+                    eprintln!(
+                        "  [HIPFIRE_GEMMA4_SOFTCAP_CALIB] softcap-aware calibration                          for '{}' not yet implemented -- using standard Q8.                          See findings/gemma4_softcap_aware_calib.md.",
+                        name
+                    );
+                    // Fall through to the standard Q8 arm below (no `continue`).
+                }
 
                 let (quantized, qt, gs, label) = if q8_conv1d_default && is_conv1d_tensor(name) {
                     // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
