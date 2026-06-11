@@ -279,8 +279,8 @@ bench_run() {
     fi
 }
 
-# Best-of-2 runs at a given prefill size.
-bench_best_of_2() {
+# Best-of-3 runs at a given prefill size.
+bench_best_of_3() {
     local size="$1"
     local prefill="$2"
     local model_path
@@ -290,7 +290,7 @@ bench_best_of_2() {
         return
     fi
     local best_p=0 best_d=0
-    for run in 1 2; do
+    for run in 1 2 3; do
         local r
         r=$(bench_run "$size" "$prefill")
         if [ -z "$r" ]; then continue; fi
@@ -355,7 +355,7 @@ if [ "$UPDATE" -eq 1 ]; then
         echo "# Config: KV=asym3, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)"
         echo "# Tolerance: 0.05 (fail if any metric drops below baseline × (1 - tolerance))"
         echo "#"
-        echo "# Measurements: best-of-2 via bench_qwen35_mq4. Two prefill sizes per model:"
+        echo "# Measurements: best-of-3 via bench_qwen35_mq4. Two prefill sizes per model:"
         echo "#   pp32  — short-context / launch-overhead regression detector"
         echo "#   pp128 — realistic prompt / GEMM-efficiency detector"
         echo "# Decode numbers are taken from the pp32 run (warmup+50 gen is enough to settle)."
@@ -366,10 +366,10 @@ if [ "$UPDATE" -eq 1 ]; then
     for size in "${SIZES[@]}"; do
         for pf in 32 128; do
             printf "  %-5s pp%-3s " "$size" "$pf"
-            result=$(bench_best_of_2 "$size" "$pf")
+            result=$(bench_best_of_3 "$size" "$pf")
             case "$result" in
                 MISSING) color yellow "SKIP"; echo " (model not present)"; continue ;;
-                CRASH)   color red "CRASH"; echo " (bench failed both runs)"; continue ;;
+                CRASH)   color red "CRASH"; echo " (bench failed all runs)"; continue ;;
             esac
             read -r p d <<< "$result"
             printf "prefill=%7.1f  decode=%7.1f tok/s\n" "$p" "$d"
@@ -467,7 +467,7 @@ for size in "${SIZES[@]}"; do
     decode_observed=""
 
     for pf in "${prefills[@]}"; do
-        result=$(bench_best_of_2 "$size" "$pf")
+        result=$(bench_best_of_3 "$size" "$pf")
         case "$result" in
             MISSING)
                 printf "  %-5s pp%-3s " "$size" "$pf"

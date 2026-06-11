@@ -27,9 +27,10 @@ fn main() {
         "Run from repo root (kernels/src/ not found)"
     );
 
-    // Read turbo_common preamble (prepended to turbo kernels by ensure_turbo_kernel)
-    let turbo_common =
-        std::fs::read_to_string(src_dir.join("turbo_common.hip")).unwrap_or_default();
+    // Read common preambles prepended by dispatch helper paths.
+    let turbo_common = std::fs::read_to_string(src_dir.join("turbo_common.h")).unwrap_or_default();
+    let givens_common =
+        std::fs::read_to_string(src_dir.join("givens_common.h")).unwrap_or_default();
 
     // Collect all generic kernel sources (skip arch-specific variants like *.gfx1100.hip)
     let mut kernel_sources: Vec<(String, String)> = Vec::new();
@@ -60,9 +61,14 @@ fn main() {
                 continue; // Skip other arch-specific variants
             }
             let raw_source = std::fs::read_to_string(&path).unwrap();
-            // Replicate ensure_turbo_kernel: if source includes turbo_common.h,
-            // strip the #include and prepend the preamble (same as dispatch.rs:2507-2509).
-            let source = if raw_source.contains("#include \"turbo_common.h\"") {
+            // Replicate runtime source assembly. Givens kernels go through
+            // ensure_givens4_kernel, which prepends both common headers.
+            let source = if raw_source.contains("#include \"givens_common.h\"") {
+                let stripped = raw_source
+                    .replace("#include \"turbo_common.h\"", "")
+                    .replace("#include \"givens_common.h\"", "");
+                format!("{}\n{}\n{}", turbo_common, givens_common, stripped)
+            } else if raw_source.contains("#include \"turbo_common.h\"") {
                 let stripped = raw_source.replace("#include \"turbo_common.h\"", "");
                 format!("{}\n{}", turbo_common, stripped)
             } else {
