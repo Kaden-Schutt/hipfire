@@ -30,7 +30,7 @@ not the source tree:
 
     nix develop github:Kaden-Schutt/hipfire
     cd ~/my-hipfire-fork
-    cargo build --release --features deltanet --example daemon -p hipfire-runtime
+    cargo build --release
 
 ### Build from source
 

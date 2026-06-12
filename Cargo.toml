@@ -21,6 +21,7 @@ anyhow = "1"
 uuid = { version = "1", features = ["v4"] }
 
 [features]
+default = ["deltanet"]
 deltanet = []
 
 [workspace]

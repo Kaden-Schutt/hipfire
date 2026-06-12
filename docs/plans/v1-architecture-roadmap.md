@@ -21,7 +21,7 @@ According to `docs/plans/stabilize-before-extraction.md`, large runtime files (l
 
 ## 2. Replacing Bun with Rust (Clap + Axum)
 
-Currently, the CLI is written in Bun (`cli/index.ts`) and interacts with `examples/daemon.rs` over HTTP. This introduces IPC overhead, packaging complexity, and architectural fragmentation. We will unify the stack entirely into Rust.
+Currently, the CLI is written in Bun (`cli/index.ts`) and interacts with `crates/hipfire-daemon/src/main.rs` over HTTP. This introduces IPC overhead, packaging complexity, and architectural fragmentation. We will unify the stack entirely into Rust.
 
 ### CLI Layer (`clap.rs`)
 Create a new binary crate `crates/hipfire-cli` powered by `clap`.
@@ -30,7 +30,7 @@ Create a new binary crate `crates/hipfire-cli` powered by `clap`.
 - **Process Lifecycle:** Run the server in-process for `hipfire serve` or as an embedded Tokio task for `hipfire run`.
 
 ### Daemon & HTTP Layer (`axum.rs`)
-Replace `examples/daemon.rs` and `cli/index.ts` API logic with `crates/hipfire-server` powered by `axum`.
+Replace `crates/hipfire-daemon/src/main.rs` and `cli/index.ts` API logic with `crates/hipfire-server` powered by `axum`.
 - **Routing:** Expose clean OpenAI-compatible endpoints `/v1/chat/completions`, `/v1/models`, and cluster-specific internal coordination routes.
 - **State Management:** Avoid global `OnceLock` and `thread_local!` states. Inject context (`Tokenizer`, `Gpu`, and active `Model` engines) cleanly using Axum's `State` extractor.
 - **Error Handling:** Replace synchronous `.unwrap()` calls with proper async/await error propagation using custom `Result<T, AppError>` types.
@@ -51,7 +51,7 @@ Keep highly specialized/hybrid architectures isolated:
 - `hipfire-arch-lfm2moe` (Liquid Foundation Model MoE structure)
 
 ### B. Workspace Additions
-- **`crates/hipfire-server`**: An official workspace-member crate carrying Axum routing, metrics, and static asset mapping, fully migrating the server code out of `examples/daemon.rs`.
+- **`crates/hipfire-server`**: An official workspace-member crate carrying Axum routing, metrics, and static asset mapping, fully migrating the server code out of `crates/hipfire-daemon/src/main.rs`.
 - **`crates/hipfire-cli`**: Houses Clap argument parsing, peer network request coordination, and console output progress tracking.
 - **`crates/xdna-compute`**: Holds FFI bindings to the Xilinx Runtime (`libxrt`) to manage XDNA NPU-specific compilation and kernel execution.
 

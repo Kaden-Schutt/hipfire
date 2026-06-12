@@ -390,11 +390,11 @@ fn find_daemon_binary() -> Result<PathBuf, String> {
     let exe = std::env::consts::EXE_SUFFIX;
     let repo = repo_root();
     newest_existing_path([
-        repo.join(format!("target/release/examples/daemon{exe}")),
-        repo.join(format!("target/debug/examples/daemon{exe}")),
+        repo.join(format!("target/release/hipfire-daemon{exe}")),
+        repo.join(format!("target/debug/hipfire-daemon{exe}")),
     ])
     .ok_or_else(|| {
-        "daemon binary not found; run `cargo build --release --features deltanet -p hipfire-runtime --example daemon` first".to_string()
+        "daemon binary not found; run `cargo build --release --features deltanet -p hipfire-daemon --bin hipfire-daemon` first".to_string()
     })
 }
 

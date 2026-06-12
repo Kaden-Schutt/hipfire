@@ -41,7 +41,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/hipfire-daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
@@ -52,7 +52,7 @@ if [ ! -x "$EXE" ]; then
     rebuild=1
 else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
-               crates/hipfire-runtime/src/hfq.rs crates/hipfire-runtime/examples/daemon.rs \
+               crates/hipfire-runtime/src/hfq.rs crates/hipfire-daemon/src/main.rs \
                crates/rdna-compute/src/dispatch.rs \
                crates/hipfire-arch-deepseek4/src/arch.rs \
                crates/hipfire-arch-deepseek4/src/deepseek4.rs \
@@ -66,7 +66,7 @@ else
 fi
 if [ "$rebuild" -eq 1 ]; then
     echo "coherence-gate: rebuilding daemon..."
-    if ! cargo build --release --example daemon --features deltanet >&2; then
+    if ! cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet >&2; then
         echo "coherence-gate: build failed" >&2
         exit 2
     fi

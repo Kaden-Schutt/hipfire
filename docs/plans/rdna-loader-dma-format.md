@@ -124,9 +124,9 @@ The real slab loader defaults to `auto`: enabled when HIP reports the target GPU
 as integrated/UMA, disabled on discrete GPUs. The env var can force behavior:
 
 ```bash
-HIPFIRE_GPU_SLAB_LOAD=1 HIPFIRE_GPU_SLAB_MIB=512 ./target/release/examples/daemon  # force on
-HIPFIRE_GPU_SLAB_LOAD=0 ./target/release/examples/daemon                           # force off
-HIPFIRE_GPU_SLAB_LOAD=auto HIPFIRE_GPU_SLAB_MIB=512 ./target/release/examples/daemon
+HIPFIRE_GPU_SLAB_LOAD=1 HIPFIRE_GPU_SLAB_MIB=512 ./target/release/hipfire-daemon  # force on
+HIPFIRE_GPU_SLAB_LOAD=0 ./target/release/hipfire-daemon                           # force off
+HIPFIRE_GPU_SLAB_LOAD=auto HIPFIRE_GPU_SLAB_MIB=512 ./target/release/hipfire-daemon
 ```
 
 Interpretation:

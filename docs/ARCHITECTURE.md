@@ -29,7 +29,7 @@ hipfire run qwen3.5:9b "..."
     ├── if running daemon detected → POST /v1/chat/completions
     └── else → spawn one-shot daemon binary
 
-  Daemon (crates/hipfire-runtime/examples/daemon.rs)
+  Daemon (crates/hipfire-daemon/src/main.rs)
     ├── HfqFile::open(path)               # mmap, read header + tensor index
     ├── config_from_hfq                   # rebuild LlamaConfig / Qwen35Config
     ├── Tokenizer::from_hfq_metadata      # vocab, merges, BOS/EOS

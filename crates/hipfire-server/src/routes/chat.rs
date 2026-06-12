@@ -79,7 +79,7 @@ async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(),
     }
 
     let bin = find_daemon_bin().ok_or_else(|| {
-        "daemon binary not found; build with `cargo build -p hipfire-runtime --example daemon`"
+        "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`"
             .to_string()
     })?;
 

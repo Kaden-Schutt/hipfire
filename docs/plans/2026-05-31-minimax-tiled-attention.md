@@ -103,7 +103,7 @@ acceptable — measure first.)
   GPU with **`ROCR_VISIBLE_DEVICES=1`** (idx0 = gfx1010 5700XT 8 GB, idx1 = gfx1151).
 - Serve worktree: `~/hipfire-minimax-val` checked out on `lfm2moe/impl`. Update
   with `git fetch origin +refs/heads/lfm2moe/impl:refs/remotes/origin/lfm2moe/impl
-  && git reset --hard origin/lfm2moe/impl && cargo build --release --example daemon`.
+  && git reset --hard origin/lfm2moe/impl && cargo build --release -p hipfire-daemon --bin hipfire-daemon`.
 - Start serve: `ROCR_VISIBLE_DEVICES=1 HIPFIRE_JINJA_CHAT=1 bun cli/index.ts serve
   127.0.0.1:11435 -d` (from the worktree). Stop: `bun cli/index.ts stop`.
 - minimax model: `~/minimax-tiny-val/MiniMax-M2.7-lloyd-mq2.hfq` (86 GB), symlinked as

@@ -6,7 +6,7 @@
 //! end-of-turn suppression to the decoded byte stream as tokens are
 //! emitted. Single source for what reaches stdout / network.
 //!
-//! Each generation loop in `crates/hipfire-runtime/examples/daemon.rs` decodes
+//! Each generation loop in `crates/hipfire-daemon/src/main.rs` decodes
 //! every newly-committed token to bytes and ships those bytes out the
 //! wire. Per-arch quirks (Gemma 4's literal `<end_of_turn>` marker that
 //! sometimes resolves to the compact-EOT special token id, Qwen-style

@@ -31,7 +31,7 @@
 - `crates/hipfire-runtime/src/loop_guard.rs` — replace env reads with `RuntimeConfig` fields
 - `crates/hipfire-runtime/src/multi_gpu.rs` — replace env reads with `RuntimeConfig` fields
 - `crates/hipfire-runtime/src/arch.rs` — replace env reads with `RuntimeConfig` fields
-- `crates/hipfire-runtime/examples/daemon.rs` — construct `RuntimeConfig`, pass through
+- `crates/hipfire-daemon/src/main.rs` — construct `RuntimeConfig`, pass through
 - `crates/hipfire-runtime/examples/dflash_spec_demo.rs` — construct `RuntimeConfig`, pass through
 - `crates/hipfire-arch-qwen35/src/qwen35.rs` — replace `rdna_compute::gemv_dp4a_enabled(&gpu.arch)` with `gpu.flags.gemv_dp4a_enabled()`, same for `has_wmma_f16`
 - `crates/hipfire-arch-qwen35/src/arch.rs` — import `FeatureFlags` if needed
@@ -469,7 +469,7 @@ Similarly:
 
 - [ ] **Step 5: Update external consumers of `gpu.mmq_screen`**
 
-In `hipfire-runtime/examples/daemon.rs`, lines ~658–659 and ~1714:
+In `hipfire-runtime/crates/hipfire-daemon/src/main.rs`, lines ~658–659 and ~1714:
 
 ```rust
 // BEFORE:
@@ -828,7 +828,7 @@ Assisted-by: OpenCode:anthropic/claude-sonnet-4-20250514"
 ## Task 7: Update `hipfire-runtime` examples to construct `RuntimeConfig`
 
 **Files:**
-- Modify: `crates/hipfire-runtime/examples/daemon.rs`
+- Modify: `crates/hipfire-daemon/src/main.rs`
 - Modify: `crates/hipfire-runtime/examples/dflash_spec_demo.rs`
 - Modify: (other examples as needed)
 
@@ -883,7 +883,7 @@ Assisted-by: OpenCode:anthropic/claude-sonnet-4-20250514"
 
 - [ ] **Step 1:** `cargo check --workspace` — must pass with zero errors
 
-- [ ] **Step 2:** `cargo build --release --features deltanet -p hipfire-runtime --example daemon` — must pass
+- [ ] **Step 2:** `cargo build --release` — must pass
 
 - [ ] **Step 3:** Run `./scripts/coherence-gate-dflash.sh` (if GPU available) to verify no behavioral regression
 

@@ -31,7 +31,7 @@ pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
 
     let bin = find_daemon_bin().ok_or_else(|| {
         anyhow::anyhow!(
-            "daemon binary not found; build with: cargo build -p hipfire-runtime --example daemon"
+            "daemon binary not found; build with: cargo build -p hipfire-daemon --bin hipfire-daemon"
         )
     })?;
 

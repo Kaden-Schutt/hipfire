@@ -10,13 +10,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODEL=${MODEL:-/local/hipfire/qwen3.6-27b-mq4.hfq}
-EXE=./target/release/examples/daemon
+EXE=./target/release/hipfire-daemon
 PP=${PP:-2}
 PROMPT='Write a one-sentence greeting.'
 KV_MODE=${KV_MODE:-asym3}
 
 if [ ! -f "$EXE" ]; then
-    echo "build daemon first: cargo build --release --example daemon"
+    echo "build daemon first: cargo build --release -p hipfire-daemon --bin hipfire-daemon"
     exit 2
 fi
 if [ ! -f "$MODEL" ]; then

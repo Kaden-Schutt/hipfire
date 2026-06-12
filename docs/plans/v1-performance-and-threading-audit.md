@@ -14,7 +14,7 @@ The v0.2.0-era codebase prioritizes raw kernel speed (using custom HIP GEMVs and
 - **Impact:** Serializing and deserializing heavy payloads (such as large tool-calling schemas or batch prefill arrays) stalls HTTP message loop processing, adding **3–12ms** of host-side latency before a single token can be dispatched to the Rust daemon.
 
 ### B. Synchronous Host/Device Sampler execution (No Overlap)
-- **Location:** `crates/hipfire-runtime/src/llama.rs`, `qwen35.rs`, and `examples/daemon.rs`
+- **Location:** `crates/hipfire-runtime/src/llama.rs`, `qwen35.rs`, and `crates/hipfire-daemon/src/main.rs`
 - **Issue:** During the autoregressive decode loop, the host thread blocks sequentially on:
   1. Launching the decode forward pass kernels on the default stream.
   2. Synchronously copying the final layer's output logits back to host memory via `hipMemcpyDtoH`.

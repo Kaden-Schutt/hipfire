@@ -21,7 +21,7 @@ The following issues represent immediate reliability, safety, or maintainability
 - **Category:** Architecture / Maintainability
 - **Location:** 
   - `crates/rdna-compute/src/dispatch.rs` (46,000+ lines, ~1.67MB)
-  - `crates/hipfire-runtime/examples/daemon.rs` (~16.5K lines)
+  - `crates/hipfire-daemon/src/main.rs` (~16.5K lines)
   - `cli/index.ts` (~10,000 lines, ~490KB)
 - **Impact:** These files are architectural "god-objects." They mix low-level kernel compilations, HTTP routing, state management, and parsing in single scopes. This creates extreme friction for contributors, slows IDE tooling, and guarantees merge conflicts.
 - **Suggested Fix:** Mechanically slice `dispatch.rs` by kernel family, extract daemon handlers to independent server modules, and deprecate the Bun CLI in favor of a native `clap` binary crate.
@@ -63,7 +63,7 @@ Within these boundaries, modularity breaks down. Config flags, model structures,
 
 - **`crates/rdna-compute/src/dispatch.rs`**: Interweaves static device limits with dynamically generated kernel compilation strings. Stride calculations are hardcoded rather than derived from metadata.
 - **`crates/hipfire-runtime/src/llama.rs`**: Features a monolithic forward execution block where tensor dimensions, memory aliases, and kernel parameters are mapped in-place across hundreds of lines of code.
-- **`crates/hipfire-runtime/examples/daemon.rs`**: Contains standard HTTP response models, token trackers, and connection management code in an "example" rather than a first-class production target.
+- **`crates/hipfire-daemon/src/main.rs`**: Contains standard HTTP response models, token trackers, and connection management code in an "example" rather than a first-class production target.
 
 ---
 
@@ -87,7 +87,7 @@ Phase 2: Encapsulation
 └── Establish non-GPU mock tests for tokenizers & layout strides
 
 Phase 3: Crate Migration & Splitting
-├── Extract examples/daemon.rs into crates/hipfire-server
+├── Extract crates/hipfire-daemon/src/main.rs into crates/hipfire-server
 ├── Extract Bun CLI into crates/hipfire-cli (Clap)
 ├── Consolidate arch-* directories into arch-transformers
 └── Split dispatch.rs by family (gemv.rs, wmma.rs, norm.rs)

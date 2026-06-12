@@ -46,7 +46,7 @@ STABILIZE FIRST (Phase 1-2)  ──>  MODERNIZE & ENCAPSULATE (Phase 3)  ──>
   3. Relocate global atomic stats (like `MMQ_CURRENT_LAYER`) to active session states or engine-level state managers.
 
 ### Phase 3: CLI & Server Modernization (Unifying under Rust)
-- **Goal:** Migrate `cli/index.ts` to `clap` and `examples/daemon.rs` to an `axum` service, unifying process ownership.
+- **Goal:** Migrate `cli/index.ts` to `clap` and `crates/hipfire-daemon/src/main.rs` to an `axum` service, unifying process ownership.
 - **Action Items:**
   1. Establish `crates/hipfire-cli` and `crates/hipfire-server` within the Cargo workspace.
   2. Implement an Axum server that shares an `Arc<EngineContext>` across handlers.

@@ -892,13 +892,13 @@ hipfire bench qwen3.5:9b --runs 3
 
 # rocprof kernel-trace
 rocprofv3 --kernel-trace --stats -d ./run -o trace --output-format csv -- \
-    target/release/examples/daemon < decode_input.jl
+    target/release/hipfire-daemon < decode_input.jl
 
 # PMC (one counter per pass on gfx906)
 for ctr in VALUBusy MemUnitStalled FetchSize VALUUtilization L2CacheHit; do
     printf 'pmc: %s\ngpu: 0\n' "$ctr" > pmc.txt
     rocprof -i pmc.txt -o "run_${ctr}.csv" \
-        target/release/examples/daemon < decode_input.jl
+        target/release/hipfire-daemon < decode_input.jl
 done
 
 # L2CacheHit pass on bench_qwen35_speed (validated working command)

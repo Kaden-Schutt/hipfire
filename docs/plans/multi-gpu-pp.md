@@ -281,7 +281,7 @@ within one layer's body and does not cross boundaries.
 
 ### Stage 7 — `multi-gpu-pp-7-daemon` (~1.5d)
 
-`crates/hipfire-runtime/examples/daemon.rs`.
+`crates/hipfire-daemon/src/main.rs`.
 
 - `Gpu::init()` → `Gpus::init_uniform(...) + enable_peer_all()`.
 - Read `pp` from load command JSON (default = `gpus.devices.len()`).
@@ -355,7 +355,7 @@ within one layer's body and does not cross boundaries.
 - `crates/hipfire-runtime/src/llama.rs` — 14 KvCache `*_multi` constructors
 - `crates/hipfire-arch-qwen35/src/qwen35.rs` — weights, scratch,
   decode + prefill multi loops
-- `crates/hipfire-runtime/examples/daemon.rs` — daemon integration
+- `crates/hipfire-daemon/src/main.rs` — daemon integration
 
 ---
 

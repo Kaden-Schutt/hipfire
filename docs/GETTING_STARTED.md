@@ -50,7 +50,7 @@ For source builds:
 ```bash
 git clone https://github.com/Kaden-Schutt/hipfire
 cd hipfire
-cargo build --release --features deltanet --example daemon -p hipfire-runtime
+cargo build --release
 cargo build --release -p hipfire-quantize
 ```
 

@@ -160,8 +160,8 @@ impl DaemonEngine {
 /// Locate the daemon binary. Priority:
 /// 1. `HIPFIRE_DAEMON_BIN` env var
 /// 2. `~/.hipfire/bin/daemon`
-/// 3. `./target/release/examples/daemon`
-/// 4. `./target/debug/examples/daemon`
+/// 3. `./target/release/hipfire-daemon`
+/// 4. `./target/debug/hipfire-daemon`
 pub fn find_daemon_bin() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("HIPFIRE_DAEMON_BIN") {
         let path = PathBuf::from(p);
@@ -183,9 +183,6 @@ pub fn find_daemon_bin() -> Option<PathBuf> {
     for rel in &[
         "target/release/hipfire-daemon",
         "target/debug/hipfire-daemon",
-        // legacy example path — kept for installs that haven't rebuilt yet
-        "target/release/examples/daemon",
-        "target/debug/examples/daemon",
     ] {
         let p = PathBuf::from(rel);
         if p.exists() {

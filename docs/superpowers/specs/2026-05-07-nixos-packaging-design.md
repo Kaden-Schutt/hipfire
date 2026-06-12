@@ -71,7 +71,7 @@ Linux, so the wrapper approach is required on NixOS.
 **Cargo build flags:**
 ```
 cargo build --release --features deltanet \
-  --example daemon --example infer --example infer_hfq \
+  -p hipfire-daemon --bin hipfire-daemon --example infer --example infer_hfq \
   -p hipfire-runtime
 ```
 

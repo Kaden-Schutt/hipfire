@@ -247,7 +247,7 @@ attribution was wrong.** Empirical disambiguation (this run):
 
 | path | output first 4 tokens | output coherent? |
 |---|---|---|
-| daemon (`crates/hipfire-runtime/examples/daemon.rs`) | ` an LRU cache with O(1)...` | YES |
+| daemon (`crates/hipfire-daemon/src/main.rs`) | ` an LRU cache with O(1)...` | YES |
 | `infer_qwen35` (per-token `forward_scratch`) | `<think>!!!!!!!!` (2048 of `!`) | NO |
 | `dflash_spec_demo --ar-baseline` (batched `forward_prefill_batch_with_pbs`) | `<think>\n\n!!!!!!!!` | NO |
 

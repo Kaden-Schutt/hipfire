@@ -37,7 +37,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/hipfire-daemon"
 MODEL="${HIPFIRE_PP_MODEL:-/local/hipfire/qwen3.6-27b-mq4.hfq}"
 MTP_HEAD="${HIPFIRE_PP_MTP_HEAD:-/data/hipfire/qwen3.6-27b-cvs16384.mtp}"
 OUT="${HIPFIRE_COHERENCE_PP_OUT:-/tmp/coherence-pp-$(date +%Y%m%d-%H%M%S).md}"
@@ -57,7 +57,7 @@ else
                crates/hipfire-runtime/src/llama.rs \
                crates/hipfire-runtime/src/multi_gpu.rs \
                crates/hipfire-runtime/src/mtp_mirror.rs \
-               crates/hipfire-runtime/examples/daemon.rs; do
+               crates/hipfire-daemon/src/main.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1
             break
@@ -66,7 +66,7 @@ else
 fi
 if [ "$rebuild" -eq 1 ]; then
     echo "coherence-gate-pp: rebuilding daemon..."
-    if ! cargo build --release --example daemon --features deltanet >&2; then
+    if ! cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet >&2; then
         echo "coherence-gate-pp: build failed" >&2
         exit 2
     fi

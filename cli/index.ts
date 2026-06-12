@@ -1447,11 +1447,12 @@ class Engine {
     const envBin = process.env.HIPFIRE_DAEMON_BIN;
     const bins = [
       ...(envBin ? [envBin] : []),
-      resolve(__dirname, `../target/release/examples/daemon${exe}`),
+      resolve(__dirname, `../target/release/hipfire-daemon${exe}`),
+      join(HIPFIRE_DIR, "bin", `hipfire-daemon${exe}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe}`),
     ];
     const bin = bins.find(p => existsSync(p));
-    if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p hipfire-runtime");
+    if (!bin) throw new Error("daemon not found. cargo build --release -p hipfire-daemon --bin hipfire-daemon");
 
     this.proc = spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "inherit", env: { ...process.env } });
     const stdout = this.proc.stdout;
@@ -9067,7 +9068,7 @@ switch (cmd) {
     };
     const grepPatterns = [
       "hipfire-quantize",        // quantizer binary
-      "target/release/examples/daemon",  // inference daemon
+      "target/release/hipfire-daemon",  // inference daemon
       "target/release/examples/serve",   // http serve wrapper (if any)
       "cli/index.ts.*serve",     // bun CLI running serve
       "cli/index.ts.*quantize",  // bun CLI running quantize
@@ -9288,7 +9289,7 @@ switch (cmd) {
       console.error("  daemon binary was NOT rebuilt.");
       console.error("");
       console.error("  To diagnose:  hipfire diag");
-      console.error("  To retry:     cd ~/.hipfire/src && cargo build --release --features deltanet -p hipfire-runtime --example daemon");
+      console.error("  To retry:     cd ~/.hipfire/src && cargo build --release --features deltanet -p hipfire-daemon --bin hipfire-daemon");
       process.exit(1);
     }
     // Build the CPU quantizer binary too so `hipfire quantize` works out of the box.
@@ -9460,7 +9461,7 @@ switch (cmd) {
     const envBin2 = process.env.HIPFIRE_DAEMON_BIN;
     const daemonBins = [
       ...(envBin2 ? [envBin2] : []),
-      resolve(__dirname, `../target/release/examples/daemon${exe2}`),
+      resolve(__dirname, `../target/release/hipfire-daemon${exe2}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe2}`),
     ];
     const daemonBin = daemonBins.find(p => existsSync(p));

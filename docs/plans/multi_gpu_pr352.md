@@ -446,7 +446,7 @@ branch. This ensures:
 ### 8.1 Build + coherence
 
 ```bash
-cargo build --release --example daemon -p hipfire-runtime --features deltanet
+cargo build --release
 ./scripts/coherence-gate-pp.sh   # PP-AR + PP-MTP coherence
 ```
 
@@ -464,12 +464,12 @@ validated the kernels on-arch, not the new wiring.
 # Legacy mode
 HIPFIRE_MTP_DEVICE_TOKEN_CHAIN=0 \
   HIPFIRE_ALLOW_MIXED_ARCH=1 HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB=22 \
-  ./target/release/examples/daemon < /tmp/pp_mtp_test.jsonl > /tmp/port_off.jsonl
+  ./target/release/hipfire-daemon < /tmp/pp_mtp_test.jsonl > /tmp/port_off.jsonl
 
 # Ported mode
 HIPFIRE_MTP_DEVICE_TOKEN_CHAIN=1 HIPFIRE_MTP_GPU_GREEDY_ACCEPT=1 \
   HIPFIRE_ALLOW_MIXED_ARCH=1 HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB=22 \
-  ./target/release/examples/daemon < /tmp/pp_mtp_test.jsonl > /tmp/port_on.jsonl
+  ./target/release/hipfire-daemon < /tmp/pp_mtp_test.jsonl > /tmp/port_on.jsonl
 
 # Compare decoded text (must be identical)
 diff <(jq -r '.content' /tmp/port_off.jsonl) <(jq -r '.content' /tmp/port_on.jsonl)

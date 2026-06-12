@@ -7524,7 +7524,7 @@ fn run_daemon_coherence_anchor(
             case_id,
             None,
             EvalStatus::Skip,
-            Some("daemon binary not found; build with `cargo build --release --features deltanet -p hipfire-runtime --example daemon`".to_string()),
+            Some("daemon binary not found; build with `cargo build --release --features deltanet -p hipfire-daemon --bin hipfire-daemon`".to_string()),
             metrics,
             config,
             ctx,

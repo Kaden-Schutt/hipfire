@@ -41,21 +41,21 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_CALIB_PROFILE` | Enable with HIPFIRE_CALIB_PROFILE=1; emits to stderr | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/triattn_validate.rs:40` |
 | `HIPFIRE_CASK_OFF` | HIPFIRE_CASK_OFF=1 is an ops escape hatch: forces no auto-attach | `/home/sadara/.hipfire/src/cli/index.ts:878` |
 | `HIPFIRE_CHATML` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/probe_argmax_agreement.rs:58` |
-| `HIPFIRE_CHAT_TEMPLATE_FILE` | 1. Env-var override | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:8963` |
+| `HIPFIRE_CHAT_TEMPLATE_FILE` | 1. Env-var override | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:8963` |
 | `HIPFIRE_CONV1D_TREE_GFX1151` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_conv1d_tree_gfx1151.rs:22` |
 | `HIPFIRE_DAEMON_BIN` | Runtime variable controlling daemon bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-server/src/daemon/engine.rs:166` |
-| `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling daemon resident state budget mb in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:3998` |
+| `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling daemon resident state budget mb in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:3998` |
 | `HIPFIRE_DDTREE_BUDGET` | Runtime variable controlling DDTree budget in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:74` |
 | `HIPFIRE_DDTREE_FORCE_SLOW` | HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5063` |
 | `HIPFIRE_DDTREE_LOGW_CUTOFF` | Adaptive-B usage report — only meaningful when --adaptive-b is on | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:2382` |
 | `HIPFIRE_DDTREE_PATH_B_CAPTURE` | Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5102` |
-| `HIPFIRE_DDTREE_PATH_C` | Resolve "HIPFIRE_DDTREE_PATH_C" ONCE before the decode loop. The | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:11532` |
+| `HIPFIRE_DDTREE_PATH_C` | Resolve "HIPFIRE_DDTREE_PATH_C" ONCE before the decode loop. The | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:11532` |
 | `HIPFIRE_DDTREE_PATH_C_VERBOSE` | Runtime variable controlling DDTree path c verbose in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5617` |
 | `HIPFIRE_DDTREE_TAPE_DUMP` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5082` |
 | `HIPFIRE_DDTREE_TOPK` | Runtime variable controlling DDTree topk in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:78` |
 | `HIPFIRE_DDTREE_TREE_LA` | Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:4944` |
 | `HIPFIRE_DEBUG_CORRUPT_PREFIX_HASH_ONCE` | Runtime variable controlling debug corrupt prefix hash once in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:2182` |
-| `HIPFIRE_DEBUG_PREFIX_BOUNDARIES` | Runtime variable controlling debug prefix boundaries in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:4837` |
+| `HIPFIRE_DEBUG_PREFIX_BOUNDARIES` | Runtime variable controlling debug prefix boundaries in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:4837` |
 | `HIPFIRE_DEBUG_SHARED_PREFIX_FANOUT` | Runtime variable controlling debug shared prefix fanout in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:5386` |
 | `HIPFIRE_DEEPSEEK4_ATTN` | main model's final_norm_and_head head-HC reduction. Without | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:68` |
 | `HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT` | DEBUG: in-kernel bisect (HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT=1) | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:5368` |
@@ -63,11 +63,11 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT` | Runtime variable controlling deepseek4 attn topk direct in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:5650` |
 | `HIPFIRE_DEEPSEEK4_ATTN_TWIN` | DEBUG: same-process twin-call test (HIPFIRE_DEEPSEEK4_ATTN_TWIN=1) | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:5346` |
 | `HIPFIRE_DEEPSEEK4_BATCH_HEAD` | Opt-out: HIPFIRE_DEEPSEEK4_BATCH_HEAD=0 forces the legacy per-position | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:7229` |
-| `HIPFIRE_DEEPSEEK4_CACHE_TRACE` | Runtime variable controlling deepseek4 cache trace in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:15061` |
+| `HIPFIRE_DEEPSEEK4_CACHE_TRACE` | Runtime variable controlling deepseek4 cache trace in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:15061` |
 | `HIPFIRE_DEEPSEEK4_CHAT_RAW` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:160` |
 | `HIPFIRE_DEEPSEEK4_COMP_F16_WMMA` | (gemv_f32 path) while default MQ4G256 quants land as Raw | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:5721` |
 | `HIPFIRE_DEEPSEEK4_COMP_ROPE_POS` | Runtime variable controlling deepseek4 comp rope pos in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:4390` |
-| `HIPFIRE_DEEPSEEK4_DUMP_PROMPT` | Runtime variable controlling deepseek4 dump prompt in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:14411` |
+| `HIPFIRE_DEEPSEEK4_DUMP_PROMPT` | Runtime variable controlling deepseek4 dump prompt in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:14411` |
 | `HIPFIRE_DEEPSEEK4_DUMP_STATE` | Determinism-bisection helper: when "HIPFIRE_DEEPSEEK4_DUMP_STATE=<dir>" is | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:208` |
 | `HIPFIRE_DEEPSEEK4_DUMP_TOPK` | [B, K_TOP] block of i32 per layer per chunk. Off by default | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:6630` |
 | `HIPFIRE_DEEPSEEK4_EXPERT_LAYER_END` | Runtime variable controlling deepseek4 expert layer end in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/arch.rs:490` |
@@ -94,15 +94,15 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_DEEPSEEK4_MTP_HEAD_HC` | input-side HC fix shipped in 82224ad). Opt out with =0 for | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:81` |
 | `HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD` | HIPFIRE_DEEPSEEK4_MTP_SKIP_HEAD=1 short-circuits steps 8+9 (return empty | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:8078` |
 | `HIPFIRE_DEEPSEEK4_POST_SCALE` | Default post_scale = 1.5: empirical optimum under mixed attention | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:7424` |
-| `HIPFIRE_DEEPSEEK4_PP_BATCH` | B=1024 default (bumped from 16 on 2026-05-26). Sweep at 2.1k tokens: | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:9474` |
+| `HIPFIRE_DEEPSEEK4_PP_BATCH` | B=1024 default (bumped from 16 on 2026-05-26). Sweep at 2.1k tokens: | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:9474` |
 | `HIPFIRE_DEEPSEEK4_Q8_4W` | Opt out via HIPFIRE_DEEPSEEK4_Q8_4W=0 for diagnosis | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:275` |
 | `HIPFIRE_DEEPSEEK4_Q8_WMMA` | bench_q8_wmma_variants. Opt-out via HIPFIRE_DEEPSEEK4_Q8_WMMA=0 | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:256` |
 | `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` | Runtime variable controlling deepseek4 route scale in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:6554` |
-| `HIPFIRE_DEEPSEEK4_SEED` | Runtime variable controlling deepseek4 seed in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:14635` |
-| `HIPFIRE_DEEPSEEK4_SPEC_DECODE` | Speculative decode opt-in. Default off because at current DeepSeek V4 MQ2-Lloyd | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:14433` |
-| `HIPFIRE_DEEPSEEK4_SPEC_K` | Runtime variable controlling deepseek4 spec k in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:14441` |
+| `HIPFIRE_DEEPSEEK4_SEED` | Runtime variable controlling deepseek4 seed in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:14635` |
+| `HIPFIRE_DEEPSEEK4_SPEC_DECODE` | Speculative decode opt-in. Default off because at current DeepSeek V4 MQ2-Lloyd | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:14433` |
+| `HIPFIRE_DEEPSEEK4_SPEC_K` | Runtime variable controlling deepseek4 spec k in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:14441` |
 | `HIPFIRE_DEEPSEEK4_TEMP` | Runtime variable controlling deepseek4 temp in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs:161` |
-| `HIPFIRE_DEEPSEEK4_TOP_K` | for local deployment; we honor that as the default. Pure greedy | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:14631` |
+| `HIPFIRE_DEEPSEEK4_TOP_K` | for local deployment; we honor that as the default. Pure greedy | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:14631` |
 | `HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS` | For VRAM-constrained partial-MoE testing, set | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/arch.rs:486` |
 | `HIPFIRE_DEEPSEEK4_WO_MULTIROW` | Multi-row variant if HIPFIRE_DEEPSEEK4_WO_MULTIROW=2 or 4 | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:6295` |
 | `HIPFIRE_DEEPSEEK4_WO_Q8_WMMA` | Runtime variable controlling deepseek4 wo Q8 wmma in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:47790` |
@@ -133,14 +133,14 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_DRAFT_GEMM_DUMP` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:72` |
 | `HIPFIRE_DRAFT_SUBPHASE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:73` |
 | `HIPFIRE_DTOH_DUMP` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hip-bridge/src/ffi.rs:938` |
-| `HIPFIRE_DUMMY_GENERATE_DELAY_MS` | Parses "HIPFIRE_DUMMY_GENERATE_DELAY_MS" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:417` |
-| `HIPFIRE_DUMMY_PREFILL_DELAY_MS` | Parses "HIPFIRE_DUMMY_PREFILL_DELAY_MS" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:409` |
+| `HIPFIRE_DUMMY_GENERATE_DELAY_MS` | Parses "HIPFIRE_DUMMY_GENERATE_DELAY_MS" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:417` |
+| `HIPFIRE_DUMMY_PREFILL_DELAY_MS` | Parses "HIPFIRE_DUMMY_PREFILL_DELAY_MS" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:409` |
 | `HIPFIRE_DUMP_REQUEST` | a strace. Off by default — gigantic for typical agent prompts | `/home/sadara/.hipfire/src/cli/index.ts:3867` |
-| `HIPFIRE_EMIT_TOKEN_IDS` | or "\" in it would corrupt the line, breaking the client's JSONL | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:602` |
+| `HIPFIRE_EMIT_TOKEN_IDS` | or "\" in it would corrupt the line, breaking the client's JSONL | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:602` |
 | `HIPFIRE_EVAL_DATASET_MIRROR` | Runtime variable controlling eval dataset mirror in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/eval_harness/mod.rs:2538` |
 | `HIPFIRE_EVAL_EVIDENCE_DIR` | --no-tape: disable GdnTape capture so spec_step_dflash replays via | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/run.rs:413` |
 | `HIPFIRE_EVAL_HIPFIRE_BIN` | Runtime variable controlling eval hipfire bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/eval_harness/mod.rs:7954` |
-| `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | cache so the model "sees" them as part of its own trajectory, | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:7674` |
+| `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | cache so the model "sees" them as part of its own trajectory, | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:7674` |
 | `HIPFIRE_FLASH_PARTIALS_BATCH` | Parses "HIPFIRE_FLASH_PARTIALS_BATCH" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:83` |
 | `HIPFIRE_FORCE_A3B_EVICTION` | Runtime variable controlling force a3b eviction in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:10200` |
 | `HIPFIRE_FP16` | Runtime variable controlling fp16 in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:166` |
@@ -151,7 +151,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_GEMM_DUMP` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:235` |
 | `HIPFIRE_GEMV_ROWS` | Runtime variable controlling gemv rows in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:138` |
 | `HIPFIRE_GEN` | Runtime variable controlling gen in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:25` |
-| `HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE` | Runtime variable controlling generate batch prefill debug sample in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:5607` |
+| `HIPFIRE_GENERATE_BATCH_PREFILL_DEBUG_SAMPLE` | Runtime variable controlling generate batch prefill debug sample in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:5607` |
 | `HIPFIRE_GFX942_GEMV_V3` | Interprets "HIPFIRE_GFX942_GEMV_V3" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:198` |
 | `HIPFIRE_GFX942_MFMA_PREFILL` | Interprets "HIPFIRE_GFX942_MFMA_PREFILL" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:201` |
 | `HIPFIRE_GFX942_RMSNORM_SPLIT` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:200` |
@@ -176,7 +176,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_HIP_WAIT` | Runtime variable controlling hip wait in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:698` |
 | `HIPFIRE_HOST_PROFILE_BIN` | Runtime variable controlling host profile bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/eval_harness/mod.rs:7969` |
 | `HIPFIRE_HOST_TIMING` | HIPFIRE_HOST_TIMING=1: dump per-cycle host-side wall-clock breakdown | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1703` |
-| `HIPFIRE_JINJA_CHAT` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:15662` |
+| `HIPFIRE_JINJA_CHAT` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:15662` |
 | `HIPFIRE_KERNEL_CACHE` | HIPFIRE_KERNEL_CACHE=/tmp/hipfire_kernels if tmpfs speed matters | `/home/sadara/.hipfire/src/crates/rdna-compute/src/compiler.rs:106` |
 | `HIPFIRE_KLD_DIRECT_F16KV_ATTN` | Used to configure runtime execution by explicitly setting "HIPFIRE_KLD_DIRECT_F16KV_ATTN" | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:698` |
 | `HIPFIRE_KLD_DIRECT_WMMA_ATTN` | Used to configure runtime execution by explicitly setting "HIPFIRE_KLD_DIRECT_WMMA_ATTN" | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:697` |
@@ -187,7 +187,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_KLD_PREFILL_ONLY` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:843` |
 | `HIPFIRE_KLD_SOURCE_SHA256` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:839` |
 | `HIPFIRE_KV_MODE` | Defaults to asym3 when unset | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/probe_argmax_agreement.rs:116` |
-| `HIPFIRE_KV_PHYSICAL_CAP` | Parses "HIPFIRE_KV_PHYSICAL_CAP" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:9251` |
+| `HIPFIRE_KV_PHYSICAL_CAP` | Parses "HIPFIRE_KV_PHYSICAL_CAP" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:9251` |
 | `HIPFIRE_LFM2_CAPTURE_POSTMIXER` | Runtime variable controlling lfm2 capture postmixer in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-lfm2moe/src/forward.rs:132` |
 | `HIPFIRE_LFM2_EXPERT_MQ6` | opt-in via HIPFIRE_LFM2_EXPERT_MQ6 for higher quality), else mq4 | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:6734` |
 | `HIPFIRE_LFM2_GRAPH` | opt-in switch. Default OFF (unset / "0") → | `/home/sadara/.hipfire/src/crates/hipfire-arch-lfm2moe/src/forward.rs:57` |
@@ -260,21 +260,21 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_PARO_SHARED_PAIRS` | Runtime variable controlling paro shared pairs in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:4875` |
 | `HIPFIRE_PARO_SMALL_DIRECT` | Runtime variable controlling paro small direct in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/llama.rs:624` |
 | `HIPFIRE_PARO_SWIGLU_FUSED` | Runtime variable controlling paro swiglu fused in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/llama.rs:1561` |
-| `HIPFIRE_PFLASH_DEBUG` | Runtime variable controlling pflash debug in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:12947` |
+| `HIPFIRE_PFLASH_DEBUG` | Runtime variable controlling pflash debug in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:12947` |
 | `HIPFIRE_PFLASH_DRAFTER_KV` | Read "HIPFIRE_PFLASH_DRAFTER_KV" env var; defaults to Q8 (current | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:533` |
 | `HIPFIRE_PFLASH_DRAFTER_STATE` | Hybrid drafter only stores K (and V for chat-path) at | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:620` |
 | `HIPFIRE_PFLASH_SCORE_LAYER` | Parses "HIPFIRE_PFLASH_SCORE_LAYER" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:1081` |
-| `HIPFIRE_PP_DFLASH` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:7139` |
+| `HIPFIRE_PP_DFLASH` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:7139` |
 | `HIPFIRE_PP_LAYERS` | Runtime variable controlling pp layers in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/pp_overlap_microbench.rs:121` |
 | `HIPFIRE_PP_PARITY_MODEL` | Runtime variable controlling pp parity model in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/tests/pp_parity.rs:197` |
-| `HIPFIRE_PP_PFLASH` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:7157` |
+| `HIPFIRE_PP_PFLASH` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:7157` |
 | `HIPFIRE_PREFILL_ALPHA` | Runtime variable controlling prefill alpha in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:124` |
 | `HIPFIRE_PREFILL_BATCHED` | Enabled by default; set to 0 to disable | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:82` |
 | `HIPFIRE_PREFILL_BLOCK` | Runtime variable controlling prefill block in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:144` |
 | `HIPFIRE_PREFILL_COMPRESSION` | Runtime variable controlling prefill compression in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:104` |
 | `HIPFIRE_PREFILL_DRAFTER` | Runtime variable controlling prefill drafter in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:157` |
 | `HIPFIRE_PREFILL_KEEP_RATIO` | Runtime variable controlling prefill keep ratio in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:114` |
-| `HIPFIRE_PREFILL_MAX_BATCH` | Runtime variable controlling prefill max batch in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:6351` |
+| `HIPFIRE_PREFILL_MAX_BATCH` | Runtime variable controlling prefill max batch in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:6351` |
 | `HIPFIRE_PREFILL_MAX_LAYER` | Runtime variable controlling prefill max layer in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11996` |
 | `HIPFIRE_PREFILL_MIN_KEEP` | Runtime variable controlling prefill min keep in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:129` |
 | `HIPFIRE_PREFILL_PROFILE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:154` |
@@ -286,7 +286,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_PREFILL_STOP_STAGE` | Runtime variable controlling prefill stop stage in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:14586` |
 | `HIPFIRE_PREFILL_STOP_STAGE_LAYER` | Parses "HIPFIRE_PREFILL_STOP_STAGE_LAYER" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:14583` |
 | `HIPFIRE_PREFILL_THRESHOLD` | Runtime variable controlling prefill threshold in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/pflash.rs:109` |
-| `HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS` | Interprets "HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS" from environment to select behavior | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:4829` |
+| `HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS` | Interprets "HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS" from environment to select behavior | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:4829` |
 | `HIPFIRE_PROFILE` | HIPFIRE_PROFILE=1 + HIPFIRE_PROFILE_CYCLES=N: per-kernel profiling | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/mtp_only_demo.rs:495` |
 | `HIPFIRE_PROFILE_CYCLES` | Runtime variable controlling profile cycles in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/mtp_only_demo.rs:496` |
 | `HIPFIRE_PROFILE_DECODE` | HIPFIRE_PROFILE_DECODE=1 wraps the timed gen loop in the per-kernel | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/bench_qwen35_speed.rs:683` |
@@ -304,15 +304,15 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_QA_KV_MODES` | Defaults to q8,asym4,asym3,asym2 when unset | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/test_inferenceQA.rs:761` |
 | `HIPFIRE_QUANT_DIAG_PATH` | Runtime variable controlling quant diag path in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:10397` |
 | `HIPFIRE_QUANT_THREADS` | Runtime variable controlling quant threads in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5463` |
-| `HIPFIRE_QWEN35_DECODE_BATCH` | Defaults to auto when unset | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:5964` |
-| `HIPFIRE_QWEN35_DECODE_BATCH_MAX` | Runtime variable controlling qwen35 decode batch max in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:6061` |
-| `HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY` | Interprets "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY" from environment to select behavior | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:6080` |
-| `HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW` | Interprets "HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW" from environment to select behavior | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:6071` |
+| `HIPFIRE_QWEN35_DECODE_BATCH` | Defaults to auto when unset | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:5964` |
+| `HIPFIRE_QWEN35_DECODE_BATCH_MAX` | Runtime variable controlling qwen35 decode batch max in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:6061` |
+| `HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY` | Interprets "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY" from environment to select behavior | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:6080` |
+| `HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW` | Interprets "HIPFIRE_QWEN35_DECODE_NATIVE_MULTIROW" from environment to select behavior | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:6071` |
 | `HIPFIRE_QWEN35_EXPERT_CACHE_MB` | Parses "HIPFIRE_QWEN35_EXPERT_CACHE_MB" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:686` |
 | `HIPFIRE_QWEN35_EXPERT_CACHE_TRACE` | Interprets "HIPFIRE_QWEN35_EXPERT_CACHE_TRACE" from environment to select behavior | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:3782` |
 | `HIPFIRE_QWEN35_FINITE_TRACE` | Runtime variable controlling qwen35 finite trace in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:12558` |
 | `HIPFIRE_QWEN35_PAGED_EXPERTS` | Interprets "HIPFIRE_QWEN35_PAGED_EXPERTS" from environment to select behavior | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:3226` |
-| `HIPFIRE_QWEN35_PREFILL_SESSION_BATCH` | Runtime variable controlling qwen35 prefill session batch in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:5709` |
+| `HIPFIRE_QWEN35_PREFILL_SESSION_BATCH` | Runtime variable controlling qwen35 prefill session batch in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:5709` |
 | `HIPFIRE_QWEN35_ROUTED_ONLY_MOE_FORWARD` | Runtime variable controlling qwen35 routed only moe forward in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:6018` |
 | `HIPFIRE_QWEN35_STAGE_SYNC` | Runtime variable controlling qwen35 stage sync in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:12592` |
 | `HIPFIRE_QWEN35_STAGE_TRACE` | Runtime variable controlling qwen35 stage trace in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:12586` |
@@ -328,7 +328,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_RUN_EXAMPLE_BIN` | Runtime variable controlling run example bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/eval_harness/mod.rs:7939` |
 | `HIPFIRE_SAMPLE_COMPARE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/infer_qwen35.rs:222` |
 | `HIPFIRE_SERVER_PREFILL_SHARED_PREFIX_FANOUT` | Runtime variable controlling server prefill shared prefix fanout in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:5121` |
-| `HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling server resident state budget mb in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:3999` |
+| `HIPFIRE_SERVER_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling server resident state budget mb in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:3999` |
 | `HIPFIRE_SMOKE_KV` | Select KV cache quant via HIPFIRE_SMOKE_KV (default q8, matches the | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_smoke_forward.rs:109` |
 | `HIPFIRE_SMOKE_KV_SEQ` | production CLI default). asym3/asym4 engage the Givens-rotated 3/4-bit | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_smoke_forward.rs:102` |
 | `HIPFIRE_SMOKE_MODE` | raw (default for back-compat): tokenize "Hello" and decode from pos=0 | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_smoke_forward.rs:157` |
@@ -358,7 +358,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `QWEN35_TEST_MODEL` | Runtime variable controlling qwen35 test model in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/test_qwen35_loadQA.rs:22` |
 | `TINYLLAMA_GGUF` | Runtime variable controlling tinyllama gguf in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/test_q4f16QA.rs:38` |
 | `TRIALS` | Runtime variable controlling trials in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_gfx1151_hfq4_s4_mmq.rs:151` |
-| `USERPROFILE` | Runtime variable controlling userprofile in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:648` |
+| `USERPROFILE` | Runtime variable controlling userprofile in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:648` |
 | `USE_SAMPLE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:117` |
 | `VERIFY` | VERIFY=1: run the token-parallel path vs the tile_batched fallback on | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:92` |
 | `W64` | Force the candidate into out_tp: W64=1 → dp4a wave64, DP4A=1 → | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:105` |

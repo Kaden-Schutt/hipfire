@@ -31,7 +31,7 @@ This is the substantive engineering. Modify:
 
 - `crates/hipfire-runtime/src/dflash.rs` — `DflashWeights`, `DflashScratch`, drafter KV state need to live on a specifiable Gpu. Constructor signatures change from `&mut Gpu` to `(drafter_gpu: &mut Gpu, target_gpu: &mut Gpu)`.
 - `crates/hipfire-arch-qwen35/src/speculative.rs` — `spec_step_dflash` and related helpers need to accept two Gpu instances and route per-step ops correctly. This is the main refactor; ~150 lines of careful surgery.
-- `crates/hipfire-runtime/examples/daemon.rs::generate_dflash` — accepts the two-Gpu split, plumbs through the speculative module.
+- `crates/hipfire-daemon/src/main.rs::generate_dflash` — accepts the two-Gpu split, plumbs through the speculative module.
 - Cross-card token-ID transfer + acceptance bitmap transfer per cycle: `hipMemcpy` device→host on one card, host→device on the other. ~30 lines.
 - KV state synchronization on accepted-prefix-rollback: drafter must roll back unaccepted positions on its KV; target advances by accepted_count on its KV. The existing single-Gpu rollback logic just needs to be redispatched against the appropriate Gpu instance.
 

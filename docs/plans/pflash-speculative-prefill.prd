@@ -64,7 +64,7 @@ hipfire already has several ingredients that make a native version plausible:
 | Long-context KV formats | `llama::KvCache` asym2/asym3/asym4/q8 paths in `crates/engine/src/llama.rs` |
 | KV / hidden compaction concepts | TriAttention / CASK scaffolding in `crates/engine/src/triattn.rs` and `crates/engine/src/cask.rs` |
 | HIP kernel pipeline | `kernels/src/*.hip`, `crates/rdna-compute/src/kernels.rs`, `crates/rdna-compute/src/dispatch.rs` |
-| Daemon state machine | `crates/engine/examples/daemon.rs` |
+| Daemon state machine | `crates/hipfire-daemon/src/main.rs` |
 
 PFlash should be treated as a **front-of-prefill compression stage**, not as a replacement for DFlash decode. It should produce a shorter token stream that the target prefills normally.
 
@@ -229,7 +229,7 @@ pub fn maybe_compress_prompt(
 
 Initial drafter target: Qwen3-0.6B.
 
-Because `crates/engine/examples/daemon.rs` currently loads target models from HFQ, the cleanest first implementation is:
+Because `crates/hipfire-daemon/src/main.rs` currently loads target models from HFQ, the cleanest first implementation is:
 
 1. Add or extend quantizer support so `hipfire-quantize` can produce a Qwen3-0.6B BF16 or MQ4 HFQ drafter artifact.
 2. Require tokenizer compatibility with the target:
@@ -308,7 +308,7 @@ Modify:
 ```text
 crates/engine/src/lib.rs
 crates/engine/src/llama.rs
-crates/engine/examples/daemon.rs   # only enough to load / debug the drafter, not auto-enable
+crates/hipfire-daemon/src/main.rs   # only enough to load / debug the drafter, not auto-enable
 ```
 
 Work:
@@ -401,7 +401,7 @@ Goal: make PFlash a user-facing, opt-in feature.
 Modify:
 
 ```text
-crates/engine/examples/daemon.rs
+crates/hipfire-daemon/src/main.rs
 crates/engine/examples/run.rs
 # CLI/config crates if present in the active branch
 # docs/CONFIG.md or equivalent config docs
@@ -459,7 +459,7 @@ Required gates before any release note / public claim:
 
 ```bash
 cargo build --release --features deltanet \
-  --example daemon \
+  -p hipfire-daemon --bin hipfire-daemon \
   --example dflash_spec_demo \
   --example encode_prompt \
   --example run \

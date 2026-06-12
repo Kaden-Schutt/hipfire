@@ -43,11 +43,11 @@ log "CLI deps OK"
 
 # ── 3. Build daemon (if missing) ─────────────────────────────────────
 cd /root/hipfire
-if [ ! -x target/release/examples/daemon ]; then
+if [ ! -x target/release/hipfire-daemon ]; then
     log "building daemon..."
-    cargo build --release --features deltanet --example daemon 2>&1 | tail -3
+    cargo build --release --features deltanet -p hipfire-daemon --bin hipfire-daemon 2>&1 | tail -3
 fi
-log "daemon binary OK: $(ls -la target/release/examples/daemon)"
+log "daemon binary OK: $(ls -la target/release/hipfire-daemon)"
 
 # ── 4. Hermes-agent install ──────────────────────────────────────────
 if ! command -v hermes >/dev/null 2>&1; then
@@ -62,7 +62,7 @@ fi
 log "────────────────────────────────────────────────────"
 log "STAGE A COMPLETE"
 log "  Bun:           $(command -v bun || echo NOT_FOUND)"
-log "  daemon binary: /root/hipfire/target/release/examples/daemon"
+log "  daemon binary: /root/hipfire/target/release/hipfire-daemon"
 log "  hermes-agent:  $(command -v hermes || echo NOT_FOUND)"
 log ""
 log "Next — run scripts/hermes_validate_run.sh after current GPU chain drains"

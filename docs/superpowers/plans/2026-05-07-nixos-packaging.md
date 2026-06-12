@@ -129,7 +129,7 @@ rustPlatform.buildRustPackage {
   buildPhase = ''
     runHook preBuild
     cargo build --release --features deltanet \
-      --example daemon --example infer --example infer_hfq \
+      -p hipfire-daemon --bin hipfire-daemon --example infer --example infer_hfq \
       -p hipfire-runtime
     runHook postBuild
   '';
@@ -144,7 +144,7 @@ rustPlatform.buildRustPackage {
 
     # Install daemon and inference binaries
     mkdir -p $out/bin
-    cp target/release/examples/daemon $out/bin/hipfire-daemon-unwrapped
+    cp target/release/hipfire-daemon $out/bin/hipfire-daemon-unwrapped
     cp target/release/examples/infer $out/bin/hipfire-infer 2>/dev/null || true
     cp target/release/examples/infer_hfq $out/bin/hipfire-infer-hfq 2>/dev/null || true
 
@@ -676,7 +676,7 @@ not the source tree:
 
     nix develop github:Kaden-Schutt/hipfire
     cd ~/my-hipfire-fork
-    cargo build --release --features deltanet --example daemon -p hipfire-runtime
+    cargo build --release
 
 ### Build from source
 
@@ -1020,7 +1020,7 @@ Use the existing code style and insert at the appropriate location.
 
 - [ ] **Step 3: If changes were made, test the CLI still works**
 
-Run: `HIPFIRE_DAEMON_BIN=./target/release/examples/daemon bun run cli/index.ts --help 2>&1 | head -5`
+Run: `HIPFIRE_DAEMON_BIN=./target/release/hipfire-daemon bun run cli/index.ts --help 2>&1 | head -5`
 
 Expected: CLI help output.
 

@@ -26,7 +26,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/hipfire-daemon"
 MODEL="${HIPFIRE_PP_MODEL:-/local/hipfire/qwen3.6-27b-mq4.hfq}"
 MTP_HEAD="${HIPFIRE_PP_MTP_HEAD:-/data/hipfire/qwen3.6-27b-cvs16384.mtp}"
 MAX="${HIPFIRE_BENCH_MAX:-256}"
@@ -37,11 +37,11 @@ LOCK_SCRIPT="./scripts/gpu-lock.sh"
 PROMPT="Write a Python function that implements an LRU cache with a configurable capacity, using an OrderedDict. Include get and put methods, and a docstring."
 
 # ── build if stale ──
-if [ ! -x "$EXE" ] || [ crates/hipfire-runtime/examples/daemon.rs -nt "$EXE" ] \
+if [ ! -x "$EXE" ] || [ crates/hipfire-daemon/src/main.rs -nt "$EXE" ] \
    || [ crates/hipfire-arch-qwen35/src/mtp_spec.rs -nt "$EXE" ] \
    || [ crates/hipfire-arch-qwen35/src/qwen35.rs -nt "$EXE" ]; then
     echo "bench-ppmtp-split: building daemon..." >&2
-    cargo build --release --example daemon --features deltanet >&2 || { echo "build failed" >&2; exit 2; }
+    cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet >&2 || { echo "build failed" >&2; exit 2; }
 fi
 
 [ -f "$MODEL" ]    || { echo "model not found: $MODEL" >&2; exit 2; }

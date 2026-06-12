@@ -638,7 +638,9 @@ Any mismatch = re-pull or report.
 
 ```bash
 cargo build --release --features deltanet \
-  --example daemon \
+  -p hipfire-daemon \
+  --bin hipfire-daemon
+cargo build --release --features deltanet \
   --example dflash_spec_demo \
   --example encode_prompt \
   --example run \

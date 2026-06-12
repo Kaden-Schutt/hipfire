@@ -434,7 +434,7 @@ defaults inherited from the dispatch fallthrough.
 
 Every phase passes ALL of:
 
-1. **Build clean.** `cargo build --release --example daemon --features deltanet`
+1. **Build clean.** `cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet`
 2. **Coherence-gate** clean on gfx1031 — the `mq3-awq-paris` row
    (existing from PR #292) catches AWQ regressions; the new variants
    should not break it. `./scripts/coherence-gate.sh` on gfx1031.

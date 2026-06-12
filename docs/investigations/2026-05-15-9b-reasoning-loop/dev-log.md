@@ -40,7 +40,7 @@ Repro recipe (master at the time of this writeup):
     --input /local/hipfire/Qwen3.5-9B-BF16-st \
     --output /local/hipfire/qwen3.5-9b.q8 --format q8
 
-cargo build --release --example daemon --features deltanet
+cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet
 
 # JSON over stdin to the daemon. Send a load message, wait, then generate
 # at temp=0.3 (or 0.0), jinja chat template on, thinking on.
@@ -270,10 +270,10 @@ For the FA-stages dump format (used in Phase 7.6 MLP-bisect, also retracted), ea
     --output /local/hipfire/qwen3.5-9b.q8 --format q8
 
 # 2. Build daemon
-cargo build --release --example daemon --features deltanet
+cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet
 
 # 3. Drive daemon (jinja chat template + thinking on + greedy decode)
-DAEMON=./target/release/examples/daemon
+DAEMON=./target/release/hipfire-daemon
 PROMPT_JSON=$(python3 -c "import json; print(json.dumps(open('benchmarks/prompts/trains-meet.txt').read()))")
 (
   echo "{\"type\":\"load\",\"model\":\"/local/hipfire/qwen3.5-9b.q8\",\"params\":{\"max_seq\":4096,\"kv_mode\":\"q8\"}}"

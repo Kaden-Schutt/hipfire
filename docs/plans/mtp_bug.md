@@ -117,11 +117,11 @@ accept/commit wiring.
 
 ```
 # pure AR (coherent baseline) — current daemon, greedy:
-cargo build --release --example daemon --features deltanet
+cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet
 printf '%s\n' \
   '{"type":"load","model":"/local/hipfire/qwen3.6-27b-mq4.hfq","params":{"max_seq":4096}}' \
   '{"type":"generate","id":"r1","prompt":"What is the capital of France? Answer in one sentence.","temperature":0.0,"max_tokens":40,"repeat_penalty":1.0}' \
-  '{"type":"unload"}' | ./target/release/examples/daemon
+  '{"type":"unload"}' | ./target/release/hipfire-daemon
 
 # native MTP (derails):
 ./target/release/examples/mtp_only_demo \

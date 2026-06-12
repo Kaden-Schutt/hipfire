@@ -7,7 +7,7 @@ import { spawn } from "bun";
 import { homedir } from "os";
 
 const MODEL = process.argv[2] || `${homedir()}/.hipfire/models/qwen3.5-35b-a3b-mq4.hfq`;
-const DAEMON = `${import.meta.dir}/../target/release/examples/daemon`;
+const DAEMON = `${import.meta.dir}/../target/release/hipfire-daemon`;
 
 console.log(`Regression test against issue #8 prompts.\nModel: ${MODEL}\n`);
 

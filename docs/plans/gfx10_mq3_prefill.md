@@ -596,7 +596,7 @@ not the priority.
 
 ## Validation gates (apply to every phase)
 
-1. **Build clean.** Standard `cargo build --release --example daemon
+1. **Build clean.** Standard `cargo build --release -p hipfire-daemon --bin hipfire-daemon
    --features deltanet`.
 2. **Coherence-gate clean on gfx1031.** `mq3-awq-paris` row from PR
    #292 catches AWQ correctness; new prefill paths must not break it.

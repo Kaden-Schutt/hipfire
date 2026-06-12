@@ -70,7 +70,7 @@ This PRD targets Variant A. Variant B is a follow-on optimization once Variant A
 
 ### PR 1: Lift DFlash + pp>1 refusal (env-gated)
 
-- File: `crates/hipfire-runtime/examples/daemon.rs:594` (DFlash refusal site).
+- File: `crates/hipfire-daemon/src/main.rs:594` (DFlash refusal site).
 - Env: `HIPFIRE_PP_DFLASH=1` opts into the experimental pp>1 DFlash path.
 - Mechanically identical to the PFlash + pp>1 refusal lift we already shipped (commit `ea2b8b7`, `HIPFIRE_PP_PFLASH=1`).
 - Default behavior unchanged when env unset; refusal still fires.

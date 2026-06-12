@@ -89,7 +89,7 @@ has `dflash_mode`; MTP needs the same. Default: `auto` (use MTP when head is
 present, DFlash when draft is present). Log which spec path is active on every
 generation.
 
-## Daemon changes (`crates/hipfire-runtime/examples/daemon.rs`)
+## Daemon changes (`crates/hipfire-daemon/src/main.rs`)
 
 ### State & loading
 

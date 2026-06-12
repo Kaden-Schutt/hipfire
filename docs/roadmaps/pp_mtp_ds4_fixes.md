@@ -4,7 +4,7 @@
 **Reviewer:** Kevin Read
 **Date:** 2026-06-02
 **Status:** All findings fixed (commit `TBD`)
-**Comparison:** `crates/hipfire-runtime/examples/daemon.rs` (ours) vs `/tmp/daemon_master.rs` (origin/master, 6832 lines)
+**Comparison:** `crates/hipfire-daemon/src/main.rs` (ours) vs `/tmp/daemon_master.rs` (origin/master, 6832 lines)
 
 Master's DS4 touchpoints were extracted verbatim into our daemon, but the
 two codebases diverged in the request-parsing layer and the bench handler.

@@ -178,7 +178,7 @@ exists — leave alone for now and audit when adding HFQ untied support).
 
 ```
 source ./scripts/gpu-lock.sh && gpu_acquire "paro-divergence"
-cargo build --release --example daemon --example coherence_probe
+cargo build --release -p hipfire-daemon --bin hipfire-daemon --example coherence_probe
 HIPFIRE_PARO_DEBUG=1 HIPFIRE_GRAPH=0 \
 LD_LIBRARY_PATH=/nix/store/q9mb3b1wcns128mgvcn0cf6dq2zd1pgh-system-path/lib \
 ./target/release/examples/coherence_probe \
@@ -205,4 +205,4 @@ markers in `forward_scratch` (line 3728) and `forward_scratch_layers`
 takes; they're zero-cost when the env var is unset.
 
 Note: the daemon binary must be rebuilt for these to fire — the probe
-spawns `target/release/examples/daemon`, not `coherence_probe` itself.
+spawns `target/release/hipfire-daemon`, not `coherence_probe` itself.

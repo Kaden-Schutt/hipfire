@@ -597,7 +597,7 @@ Sequence (each step blocks on the previous):
 | `crates/engine/src/speculative.rs:2384` | D3b — `pipeline_mode: bool` branch in `spec_step_dflash`; snapshot-head, async scatter, cross-stream events |
 | `crates/engine/src/speculative.rs` (top) | D4 — rolling-τ helper, per-class baseline cache, bypass state |
 | `crates/engine/examples/dflash_spec_demo.rs` | D1–D5 — thread env-flag to scratch alloc + step selection |
-| `crates/engine/examples/daemon.rs` | D1–D5 — same threading; daemon path also calls `spec_step_dflash` (line 1717) and was missed in v1 touch list |
+| `crates/hipfire-daemon/src/main.rs` | D1–D5 — same threading; daemon path also calls `spec_step_dflash` (line 1717) and was missed in v1 touch list |
 | `crates/hip-bridge/src/ffi.rs` | (none — APIs already exposed) |
 | `docs/methodology/perf-benchmarking.md` | D5 — bench-matrix results, baseline update, bandwidth-contention finding |
 

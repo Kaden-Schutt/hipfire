@@ -10,7 +10,7 @@ Models:
 
 Binaries:
 - `target/release/examples/eval_hipfire` (KLD validation + corruption checks)
-- `target/release/examples/daemon` (canonical kernel-speed meter)
+- `target/release/hipfire-daemon` (canonical kernel-speed meter)
 - `target/release/examples/test_gemm_q8_{qkv,qkvza,gate_up,residual}_wmma` (4 unit tests)
 - `target/release/examples/bench_q8_wmma_variants` (T3-1a recipe-pick microbench, retained as regression probe)
 

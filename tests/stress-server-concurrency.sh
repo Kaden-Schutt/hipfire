@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DAEMON="${DAEMON:-$ROOT/target/release/examples/daemon}"
+DAEMON="${DAEMON:-$ROOT/target/release/hipfire-daemon}"
 MODEL_A="${MODEL_A:-$HOME/.hipfire/models/qwen3.5-0.8b-mq4.hfq}"
 MODEL_B="${MODEL_B:-}"
 REQUESTS="${HIPFIRE_STRESS_REQUESTS:-128}"
@@ -21,7 +21,7 @@ fi
 
 if [[ ! -x "$DAEMON" ]]; then
   echo "missing daemon binary: $DAEMON" >&2
-  echo "build it with: cargo build --release -p hipfire-runtime --example daemon" >&2
+  echo "build it with: cargo build --release -p hipfire-daemon --bin hipfire-daemon" >&2
   exit 2
 fi
 
