@@ -75,12 +75,12 @@ def wait_health(base_url: str, proc: subprocess.Popen[str], log_path: str) -> di
     raise RuntimeError(f"server did not become healthy; last_err={last_err}; log={log_path}")
 
 
-def chat_request(base_url: str, label: str) -> dict[str, Any]:
+def chat_request(base_url: str, label: str, user_prompt: str | None = None) -> dict[str, Any]:
     body = {
         "model": model,
         "messages": [
             {"role": "system", "content": "Answer with one lowercase color word."},
-            {"role": "user", "content": "Return the color of a clear daytime sky."},
+            {"role": "user", "content": user_prompt or "Return the color of a clear daytime sky."},
         ],
         "stream": False,
         "temperature": 0,
@@ -98,7 +98,10 @@ def chat_request(base_url: str, label: str) -> dict[str, Any]:
     return out
 
 
-def start_server(corrupt_prefix_hash_once: bool = False) -> tuple[str, subprocess.Popen[str], Any, str]:
+def start_server(
+    corrupt_prefix_hash_once: bool = False,
+    max_checkpoints: str = "4",
+) -> tuple[str, subprocess.Popen[str], Any, str]:
     port = pick_port()
     base_url = f"http://127.0.0.1:{port}"
     log_file = tempfile.NamedTemporaryFile("w", prefix="hipfire-server-prefix-cache-", suffix=".log", delete=False)
@@ -115,7 +118,7 @@ def start_server(corrupt_prefix_hash_once: bool = False) -> tuple[str, subproces
         "HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS": "0",
         "HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE": "0",
         "HIPFIRE_SERVER_PREFILL_STATE_CACHE": "1",
-        "HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS": "4",
+        "HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS": max_checkpoints,
         "HIPFIRE_MAX_SEQ": str(max_seq),
         "HIPFIRE_DFLASH_DRAFT": "",
         "HIPFIRE_QWEN35_PREFILL_SESSION_BATCH": "serial",
@@ -245,7 +248,47 @@ def run_mismatch_scenario() -> str:
         stop_server(proc, log_file)
 
 
+def run_cap_scenario() -> str:
+    base_url, proc, log_file, log_path = start_server(max_checkpoints="1")
+    try:
+        initial = wait_health(base_url, proc, log_path)
+        prefill = initial.get("prefill_batch", {})
+        if prefill.get("generate_batch_prefill_capability") != "supported":
+            raise RuntimeError(f"server prefill capability not supported after warmup: {prefill}; log={log_path}")
+
+        first = chat_request(base_url, "cap first", "Return the color of a clear daytime sky.")
+        first_health = fetch_json(f"{base_url}/health", timeout=10.0)
+        first_state_cache = first_health.get("state_cache", {})
+        if int(first_state_cache.get("resident_checkpoints") or 0) != 1:
+            raise RuntimeError(f"cap setup did not leave exactly one resident checkpoint: {first_state_cache}; log={log_path}")
+
+        second = chat_request(base_url, "cap second", "Return the color of healthy grass.")
+        second_health = fetch_json(f"{base_url}/health", timeout=10.0)
+        second_state_cache = second_health.get("state_cache", {})
+        resident = int(second_state_cache.get("resident_checkpoints") or 0)
+        evictions = int(second_state_cache.get("evictions_total") or 0)
+        recompute = int(second_state_cache.get("recompute_required_total") or 0)
+        if int(second_state_cache.get("resident_checkpoint_max") or 0) != 1:
+            raise RuntimeError(f"cap scenario did not report resident checkpoint max=1: {second_state_cache}; log={log_path}")
+        if resident > 1:
+            raise RuntimeError(f"checkpoint cap did not bound resident checkpoints: {second_state_cache}; log={log_path}")
+        if evictions < 1 or recompute < 1:
+            raise RuntimeError(f"checkpoint cap did not report eviction/recompute telemetry: {second_state_cache}; log={log_path}")
+        assert_response_content("cap first", first)
+        assert_response_content("cap second", second)
+        return (
+            "cap: "
+            f"resident_checkpoints={resident} "
+            f"evictions_total={evictions} "
+            f"recompute_required_total={recompute} "
+            f"log={log_path}"
+        )
+    finally:
+        stop_server(proc, log_file)
+
+
 reuse_summary = run_reuse_scenario()
 mismatch_summary = run_mismatch_scenario()
-print(f"server prefix checkpoint reuse smoke passed: {reuse_summary}; {mismatch_summary}")
+cap_summary = run_cap_scenario()
+print(f"server prefix checkpoint reuse smoke passed: {reuse_summary}; {mismatch_summary}; {cap_summary}")
 PY
