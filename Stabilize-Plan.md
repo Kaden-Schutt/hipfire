@@ -95,6 +95,11 @@
     position 120 remains at the same one-step serial-tape mismatch (`s_matrix[0]`, `differing_bytes=169326`, `first_offset=8`, `serial_byte=190`,
     `serial_tape_byte=189`), and position 59 remains mismatched as well. The next comparison needs to move after the fused gate+conv wrapper and
     compare serial decode's `q_raw/k_raw/v` plus post-gate alpha/beta against the fused replay outputs, before QK norm and GDN.
+    That comparison now passes: both position 120 and position 59 report `dflash-rollback-fused-output-compare ... match` and
+    `dflash-rollback-gdn-input-compare ... match`, while the following `s_matrix[0]` compare still mismatches. This localizes the serial-tape
+    replay control to the GDN recurrence update itself with byte-identical `q/k/v/alpha/beta` inputs; the next blocker is proving whether the
+    single-token `gated_delta_net_q8` replay kernel is numerically different from the serial decode call site, or whether S-state snapshot/restore
+    aliasing is changing the initial state before that first recurrence update.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

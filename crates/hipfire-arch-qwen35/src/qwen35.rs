@@ -15657,6 +15657,34 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let q_raw_row_bytes = tape.k_dim * 4;
+                    let v_row_bytes = tape.v_dim * 4;
+                    let off_q_raw = tape_offset * q_raw_row_bytes;
+                    let off_v = tape_offset * v_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.q_raw_bufs[delta_layer_idx].buf,
+                        off_q_raw,
+                        &pbs.dn_q_raw_batch.buf,
+                        0,
+                        n * q_raw_row_bytes,
+                    )?;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.k_raw_bufs[delta_layer_idx].buf,
+                        off_q_raw,
+                        &pbs.dn_k_raw_batch.buf,
+                        0,
+                        n * q_raw_row_bytes,
+                    )?;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.v_bufs[delta_layer_idx].buf,
+                        off_v,
+                        &pbs.dn_v_batch.buf,
+                        0,
+                        n * v_row_bytes,
+                    )?;
+                }
+
                 // Fused L2-norm(Q) + scale(Q) + L2-norm(K) + repeat-interleave
                 // when n_key_heads < n_v_heads. One launch instead of two —
                 // ~200µs saved per LA layer × ~30 LA layers ≈ 6ms per prefill
@@ -15700,6 +15728,25 @@ fn forward_prefill_chunk(
                         &pbs.dn_k_batch.buf,
                         &pbs.dn_k_raw_batch.buf,
                         n * k_dim * 4,
+                    )?;
+                }
+
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let q_row_bytes = tape.v_dim * 4;
+                    let off_q = tape_offset * q_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.q_bufs[delta_layer_idx].buf,
+                        off_q,
+                        &pbs.dn_q_batch.buf,
+                        0,
+                        n * q_row_bytes,
+                    )?;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.k_bufs[delta_layer_idx].buf,
+                        off_q,
+                        &pbs.dn_k_batch.buf,
+                        0,
+                        n * q_row_bytes,
                     )?;
                 }
 
@@ -17975,6 +18022,33 @@ fn forward_prefill_chunk(
                     )?;
                 }
                 debug_stop_after!("conv", layer_idx);
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let q_raw_row_bytes = tape.k_dim * 4;
+                    let v_row_bytes = tape.v_dim * 4;
+                    let off_q_raw = tape_offset * q_raw_row_bytes;
+                    let off_v = tape_offset * v_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.q_raw_bufs[delta_layer_idx].buf,
+                        off_q_raw,
+                        &pbs.dn_q_raw_batch.buf,
+                        0,
+                        n * q_raw_row_bytes,
+                    )?;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.k_raw_bufs[delta_layer_idx].buf,
+                        off_q_raw,
+                        &pbs.dn_k_raw_batch.buf,
+                        0,
+                        n * q_raw_row_bytes,
+                    )?;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.v_bufs[delta_layer_idx].buf,
+                        off_v,
+                        &pbs.dn_v_batch.buf,
+                        0,
+                        n * v_row_bytes,
+                    )?;
+                }
                 gpu.fused_qk_l2_norm_scale_f32_batched(
                     &pbs.dn_q_raw_batch,
                     &pbs.dn_k_raw_batch,
@@ -18009,6 +18083,24 @@ fn forward_prefill_chunk(
                     )?;
                 }
                 debug_stop_after!("qk_repeat", layer_idx);
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let q_row_bytes = tape.v_dim * 4;
+                    let off_q = tape_offset * q_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.q_bufs[delta_layer_idx].buf,
+                        off_q,
+                        &pbs.dn_q_batch.buf,
+                        0,
+                        n * q_row_bytes,
+                    )?;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.k_bufs[delta_layer_idx].buf,
+                        off_q,
+                        &pbs.dn_k_batch.buf,
+                        0,
+                        n * q_row_bytes,
+                    )?;
+                }
                 if let Some(parents) = tree_parents {
                     if matches!(dn_state.quant, StateQuant::FP32) {
                         return Err(hip_bridge::HipError::new(
@@ -20232,6 +20324,8 @@ fn forward_scratch_layers(
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let qkv_row_bytes = tape.qkv_dim * 4;
                     let alpha_beta_row_bytes = tape.n_v_heads * 4;
+                    let q_raw_row_bytes = tape.k_dim * 4;
+                    let v_row_bytes = tape.v_dim * 4;
                     gpu.hip.memcpy_dtod_at(
                         &tape.qkv_bufs[delta_layer_idx].buf,
                         *tape_row * qkv_row_bytes,
@@ -20252,6 +20346,27 @@ fn forward_scratch_layers(
                         &s.dn_beta.buf,
                         0,
                         alpha_beta_row_bytes,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.q_raw_bufs[delta_layer_idx].buf,
+                        *tape_row * q_raw_row_bytes,
+                        &s.dn_q_raw.buf,
+                        0,
+                        q_raw_row_bytes,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.k_raw_bufs[delta_layer_idx].buf,
+                        *tape_row * q_raw_row_bytes,
+                        &s.dn_k_raw.buf,
+                        0,
+                        q_raw_row_bytes,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.v_bufs[delta_layer_idx].buf,
+                        *tape_row * v_row_bytes,
+                        &s.dn_v.buf,
+                        0,
+                        v_row_bytes,
                     )?;
                 }
                 if layer_idx == 0 {
@@ -20300,6 +20415,24 @@ fn forward_scratch_layers(
                     // depend on a capturing blocking stream" under hipGraph.
                     gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
                     gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+                }
+
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let q_row_bytes = tape.v_dim * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.q_bufs[delta_layer_idx].buf,
+                        *tape_row * q_row_bytes,
+                        &s.dn_q.buf,
+                        0,
+                        q_row_bytes,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.k_bufs[delta_layer_idx].buf,
+                        *tape_row * q_row_bytes,
+                        &s.dn_k.buf,
+                        0,
+                        q_row_bytes,
+                    )?;
                 }
 
                 match dn_state.quant {

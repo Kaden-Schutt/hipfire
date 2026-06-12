@@ -1086,9 +1086,10 @@ pub struct DeltaNetTape {
 /// Innovation tape for the GatedDeltaNet recurrence. During a batched verify
 /// forward we capture the per-LA-layer pre-conv1d `qkv` projection, the raw
 /// `(alpha,beta)` projections, and the post-sigmoid `(α, β)` for every block
-/// position. On rollback we replay conv1d + QK-norm + repeat-interleave + GDN
-/// for `accept_len + 1` steps against the pre-verify DN snapshot — advancing
-/// both S-state AND conv_state correctly, no full target re-run needed.
+/// position, plus post fused-gate+conv outputs for rollback diagnostics. On
+/// rollback we replay conv1d + QK-norm + repeat-interleave + GDN for
+/// `accept_len + 1` steps against the pre-verify DN snapshot — advancing both
+/// S-state AND conv_state correctly, no full target re-run needed.
 ///
 /// Why pre-conv1d qkv instead of post-conv1d (q, k, v): conv_state is a
 /// recurrent buffer advanced by conv1d_silu_split. If we skipped conv1d on
@@ -1116,6 +1117,14 @@ pub struct GdnTape {
     /// same fused gate+conv kernel shape as serial decode.
     pub alpha_raw_bufs: Vec<GpuTensor>,
     pub beta_raw_bufs: Vec<GpuTensor>,
+    /// Per-LA-layer post fused-gate+conv outputs. These diagnostic captures let
+    /// rollback compare stop before QK norm and GDN.
+    pub q_raw_bufs: Vec<GpuTensor>,
+    pub k_raw_bufs: Vec<GpuTensor>,
+    pub v_bufs: Vec<GpuTensor>,
+    /// Per-LA-layer post QK-norm/repeat outputs fed into GDN.
+    pub q_bufs: Vec<GpuTensor>,
+    pub k_bufs: Vec<GpuTensor>,
     /// Replay scratch (shared across layers — serial replay is fine).
     pub q_raw_scratch: GpuTensor, // [max_n × k_dim]
     pub k_raw_scratch: GpuTensor, // [max_n × k_dim]
@@ -1147,12 +1156,22 @@ impl GdnTape {
         let mut beta_bufs = Vec::with_capacity(n_la_layers);
         let mut alpha_raw_bufs = Vec::with_capacity(n_la_layers);
         let mut beta_raw_bufs = Vec::with_capacity(n_la_layers);
+        let mut q_raw_bufs = Vec::with_capacity(n_la_layers);
+        let mut k_raw_bufs = Vec::with_capacity(n_la_layers);
+        let mut v_bufs = Vec::with_capacity(n_la_layers);
+        let mut q_bufs = Vec::with_capacity(n_la_layers);
+        let mut k_bufs = Vec::with_capacity(n_la_layers);
         for _ in 0..n_la_layers {
             qkv_bufs.push(gpu.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
             alpha_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
             beta_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
             alpha_raw_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
             beta_raw_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+            q_raw_bufs.push(gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?);
+            k_raw_bufs.push(gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?);
+            v_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
+            q_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
+            k_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
         }
 
         Ok(Self {
@@ -1169,6 +1188,11 @@ impl GdnTape {
             beta_bufs,
             alpha_raw_bufs,
             beta_raw_bufs,
+            q_raw_bufs,
+            k_raw_bufs,
+            v_bufs,
+            q_bufs,
+            k_bufs,
             q_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
             k_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
             v_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
@@ -1186,6 +1210,11 @@ impl GdnTape {
             .chain(self.beta_bufs.into_iter())
             .chain(self.alpha_raw_bufs.into_iter())
             .chain(self.beta_raw_bufs.into_iter())
+            .chain(self.q_raw_bufs.into_iter())
+            .chain(self.k_raw_bufs.into_iter())
+            .chain(self.v_bufs.into_iter())
+            .chain(self.q_bufs.into_iter())
+            .chain(self.k_bufs.into_iter())
         {
             let _ = gpu.free_tensor(t);
         }
@@ -1277,6 +1306,11 @@ impl GdnTapeShards {
             let mut beta_bufs = Vec::with_capacity(n_la_total);
             let mut alpha_raw_bufs = Vec::with_capacity(n_la_total);
             let mut beta_raw_bufs = Vec::with_capacity(n_la_total);
+            let mut q_raw_bufs = Vec::with_capacity(n_la_total);
+            let mut k_raw_bufs = Vec::with_capacity(n_la_total);
+            let mut v_bufs = Vec::with_capacity(n_la_total);
+            let mut q_bufs = Vec::with_capacity(n_la_total);
+            let mut k_bufs = Vec::with_capacity(n_la_total);
             for global_la_idx in 0..n_la_total {
                 if shard_owns[band][global_la_idx] {
                     qkv_bufs.push(g.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
@@ -1287,6 +1321,11 @@ impl GdnTapeShards {
                         .push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
                     beta_raw_bufs
                         .push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+                    q_raw_bufs.push(g.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?);
+                    k_raw_bufs.push(g.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?);
+                    v_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
+                    q_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
+                    k_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
                 } else {
                     // Placeholder: 1 F32 element. Lets the chunk dispatch
                     // index `qkv_bufs[delta_layer_idx]` without bounds-
@@ -1299,6 +1338,11 @@ impl GdnTapeShards {
                     beta_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     alpha_raw_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     beta_raw_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    q_raw_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    k_raw_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    v_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    q_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    k_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                 }
             }
             shards.push(GdnTape {
@@ -1315,6 +1359,11 @@ impl GdnTapeShards {
                 beta_bufs,
                 alpha_raw_bufs,
                 beta_raw_bufs,
+                q_raw_bufs,
+                k_raw_bufs,
+                v_bufs,
+                q_bufs,
+                k_bufs,
                 // Replay scratch: each band gets its own (cheap) so the
                 // chunk dispatch can call replay-related helpers on the
                 // band-local scratch. PP+MTP consumer's replay runs on
@@ -1346,11 +1395,10 @@ impl GdnTapeShards {
     /// `target` tape's matching global-indexed slots. Target must have
     /// `n_la_total` entries; its home device receives all the data.
     ///
-    /// Bytes per LA layer: `max_n * (qkv_dim + 4 * n_v_heads) * 4`.
-    /// For qwen3.6-27b at max_n=5 (verify K+1): ~30 KB/layer × 48
-    /// total LA layers = ~1.4 MB worst-case full assembly; less than
-    /// 1 ms at PCIe DMA speeds. Sub-cycle cost on the MTP critical
-    /// path.
+    /// Bytes per LA layer: `max_n * (2 * qkv_dim + 2 * v_dim + 4 * n_v_heads) * 4`.
+    /// Diagnostic captures increase this versus the production tape, but the
+    /// copy still stays sub-cycle relative to DFlash verify on current 27B/35B
+    /// targets.
     pub fn assemble_into(&self, gpus: &mut Gpus, target: &mut GdnTape) -> HipResult<()> {
         // Find target's home device by checking which gpu owns its first
         // real allocation. (All target buffers live on the same gpu;
@@ -1389,10 +1437,15 @@ impl GdnTapeShards {
             let owning_band: usize = (0..self.shards.len())
                 .find(|&b| self.shard_owns[b][global_la_idx])
                 .expect("every LA layer must be owned by exactly one band");
-            // Compute bytes per layer slot (shape: max_n × {qkv_dim, n_v_heads, n_v_heads}).
+            // Compute bytes per layer slot.
             let qkv_bytes = target.max_n * target.qkv_dim * 4;
             let alpha_bytes = target.max_n * target.n_v_heads * 4;
             let beta_bytes = alpha_bytes;
+            let q_raw_bytes = target.max_n * target.k_dim * 4;
+            let k_raw_bytes = q_raw_bytes;
+            let v_bytes = target.max_n * target.v_dim * 4;
+            let q_bytes = target.max_n * target.v_dim * 4;
+            let k_bytes = q_bytes;
 
             if owning_band == target_dev {
                 // Same-device: D2D memcpy from shard to target on
@@ -1433,6 +1486,41 @@ impl GdnTapeShards {
                     &self.shards[owning_band].beta_raw_bufs[global_la_idx].buf,
                     0,
                     beta_bytes,
+                )?;
+                g.hip.memcpy_dtod_at(
+                    &target.q_raw_bufs[global_la_idx].buf,
+                    0,
+                    &self.shards[owning_band].q_raw_bufs[global_la_idx].buf,
+                    0,
+                    q_raw_bytes,
+                )?;
+                g.hip.memcpy_dtod_at(
+                    &target.k_raw_bufs[global_la_idx].buf,
+                    0,
+                    &self.shards[owning_band].k_raw_bufs[global_la_idx].buf,
+                    0,
+                    k_raw_bytes,
+                )?;
+                g.hip.memcpy_dtod_at(
+                    &target.v_bufs[global_la_idx].buf,
+                    0,
+                    &self.shards[owning_band].v_bufs[global_la_idx].buf,
+                    0,
+                    v_bytes,
+                )?;
+                g.hip.memcpy_dtod_at(
+                    &target.q_bufs[global_la_idx].buf,
+                    0,
+                    &self.shards[owning_band].q_bufs[global_la_idx].buf,
+                    0,
+                    q_bytes,
+                )?;
+                g.hip.memcpy_dtod_at(
+                    &target.k_bufs[global_la_idx].buf,
+                    0,
+                    &self.shards[owning_band].k_bufs[global_la_idx].buf,
+                    0,
+                    k_bytes,
                 )?;
             } else {
                 // Cross-device: hipMemcpyPeer from owning_band's
@@ -1476,6 +1564,41 @@ impl GdnTapeShards {
                     &self.shards[owning_band].beta_raw_bufs[global_la_idx].buf,
                     src_dev_id,
                     beta_bytes,
+                )?;
+                runtime.memcpy_peer(
+                    &target.q_raw_bufs[global_la_idx].buf,
+                    dst_dev_id,
+                    &self.shards[owning_band].q_raw_bufs[global_la_idx].buf,
+                    src_dev_id,
+                    q_raw_bytes,
+                )?;
+                runtime.memcpy_peer(
+                    &target.k_raw_bufs[global_la_idx].buf,
+                    dst_dev_id,
+                    &self.shards[owning_band].k_raw_bufs[global_la_idx].buf,
+                    src_dev_id,
+                    k_raw_bytes,
+                )?;
+                runtime.memcpy_peer(
+                    &target.v_bufs[global_la_idx].buf,
+                    dst_dev_id,
+                    &self.shards[owning_band].v_bufs[global_la_idx].buf,
+                    src_dev_id,
+                    v_bytes,
+                )?;
+                runtime.memcpy_peer(
+                    &target.q_bufs[global_la_idx].buf,
+                    dst_dev_id,
+                    &self.shards[owning_band].q_bufs[global_la_idx].buf,
+                    src_dev_id,
+                    q_bytes,
+                )?;
+                runtime.memcpy_peer(
+                    &target.k_bufs[global_la_idx].buf,
+                    dst_dev_id,
+                    &self.shards[owning_band].k_bufs[global_la_idx].buf,
+                    src_dev_id,
+                    k_bytes,
                 )?;
             }
         }
@@ -1706,7 +1829,7 @@ impl GdnTape {
         config: &qwen35::Qwen35Config,
         dn_state: &mut qwen35::DeltaNetState,
         n_steps: usize,
-    ) -> HipResult<()> {
+    ) -> HipResult<(Option<DeltaNetSnapshotDiff>, Option<DeltaNetSnapshotDiff>)> {
         assert!(
             n_steps <= self.max_n,
             "replay_gdn_fused_gate_conv_for_compare: n_steps {n_steps} > max_n {}",
@@ -1719,6 +1842,8 @@ impl GdnTape {
         let k_dim = self.k_dim;
         let value_head_dim = self.value_head_dim;
         let mut la_idx = 0usize;
+        let mut first_post_fused_diff: Option<DeltaNetSnapshotDiff> = None;
+        let mut first_gdn_input_diff: Option<DeltaNetSnapshotDiff> = None;
 
         for (layer_idx, lt) in config.layer_types.iter().enumerate() {
             if *lt != qwen35::LayerType::LinearAttention {
@@ -1752,6 +1877,56 @@ impl GdnTape {
                     k_dim,
                     v_dim,
                 )?;
+            }
+
+            if first_post_fused_diff.is_none() {
+                let q_raw_bytes = n_steps * k_dim * 4;
+                let v_bytes = n_steps * v_dim * 4;
+                let alpha_beta_bytes = n_steps * n_v_heads * 4;
+                for (family, actual, expected, bytes) in [
+                    (
+                        "fused_q_raw",
+                        &self.q_raw_scratch.buf,
+                        &self.q_raw_bufs[la_idx].buf,
+                        q_raw_bytes,
+                    ),
+                    (
+                        "fused_k_raw",
+                        &self.k_raw_scratch.buf,
+                        &self.k_raw_bufs[la_idx].buf,
+                        q_raw_bytes,
+                    ),
+                    (
+                        "fused_v",
+                        &self.v_scratch.buf,
+                        &self.v_bufs[la_idx].buf,
+                        v_bytes,
+                    ),
+                    (
+                        "fused_alpha",
+                        &self.alpha_raw_bufs[la_idx].buf,
+                        &self.alpha_bufs[la_idx].buf,
+                        alpha_beta_bytes,
+                    ),
+                    (
+                        "fused_beta",
+                        &self.beta_raw_bufs[la_idx].buf,
+                        &self.beta_bufs[la_idx].buf,
+                        alpha_beta_bytes,
+                    ),
+                ] {
+                    if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                        gpu, family, la_idx, actual, expected, bytes,
+                    )? {
+                        first_post_fused_diff = Some(diff);
+                        break;
+                    }
+                }
+            }
+
+            for step in 0..n_steps {
+                let q_raw = self.q_raw_scratch.sub_offset(step * k_dim, k_dim);
+                let k_raw = self.k_raw_scratch.sub_offset(step * k_dim, k_dim);
                 gpu.fused_qk_l2_norm_scale_f32(
                     &q_raw,
                     &k_raw,
@@ -1760,15 +1935,71 @@ impl GdnTape {
                     1.0 / (hd as f32).sqrt(),
                     config.norm_eps,
                 )?;
-                let (q, k) = if n_key_heads < n_v_heads {
+                if n_key_heads < n_v_heads {
                     let ratio = n_v_heads / n_key_heads;
                     let q = self.q_scratch.sub_offset(step * v_dim, v_dim);
                     let k = self.k_scratch.sub_offset(step * v_dim, v_dim);
                     gpu.repeat_interleave_qk_f32(&q_raw, &k_raw, &q, &k, n_key_heads, ratio, hd)?;
-                    (q, k)
                 } else {
-                    (q_raw, k_raw)
+                    let q = self.q_scratch.sub_offset(step * v_dim, v_dim);
+                    let k = self.k_scratch.sub_offset(step * v_dim, v_dim);
+                    gpu.hip
+                        .memcpy_dtod_at(&q.buf, 0, &q_raw.buf, 0, k_dim * 4)?;
+                    gpu.hip
+                        .memcpy_dtod_at(&k.buf, 0, &k_raw.buf, 0, k_dim * 4)?;
                 };
+            }
+
+            if first_gdn_input_diff.is_none() {
+                let v_bytes = n_steps * v_dim * 4;
+                let alpha_beta_bytes = n_steps * n_v_heads * 4;
+                for (family, actual, expected, bytes) in [
+                    (
+                        "gdn_q",
+                        &self.q_scratch.buf,
+                        &self.q_bufs[la_idx].buf,
+                        v_bytes,
+                    ),
+                    (
+                        "gdn_k",
+                        &self.k_scratch.buf,
+                        &self.k_bufs[la_idx].buf,
+                        v_bytes,
+                    ),
+                    (
+                        "gdn_v",
+                        &self.v_scratch.buf,
+                        &self.v_bufs[la_idx].buf,
+                        v_bytes,
+                    ),
+                    (
+                        "gdn_alpha",
+                        &self.alpha_raw_bufs[la_idx].buf,
+                        &self.alpha_bufs[la_idx].buf,
+                        alpha_beta_bytes,
+                    ),
+                    (
+                        "gdn_beta",
+                        &self.beta_raw_bufs[la_idx].buf,
+                        &self.beta_bufs[la_idx].buf,
+                        alpha_beta_bytes,
+                    ),
+                ] {
+                    if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                        gpu, family, la_idx, actual, expected, bytes,
+                    )? {
+                        first_gdn_input_diff = Some(diff);
+                        break;
+                    }
+                }
+            }
+
+            for step in 0..n_steps {
+                let alpha = self.alpha_raw_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
+                let beta = self.beta_raw_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
+                let q = self.q_scratch.sub_offset(step * v_dim, v_dim);
+                let k = self.k_scratch.sub_offset(step * v_dim, v_dim);
+                let v = self.v_scratch.sub_offset(step * v_dim, v_dim);
                 let out = self.attn_scratch.sub_offset(step * v_dim, v_dim);
                 match dn_state.quant {
                     qwen35::StateQuant::FP32 => gpu.gated_delta_net_f32(
@@ -1814,7 +2045,7 @@ impl GdnTape {
 
             la_idx += 1;
         }
-        Ok(())
+        Ok((first_post_fused_diff, first_gdn_input_diff))
     }
 
     /// Replay the full LA sub-pipeline (conv1d + qk-l2norm + repeat-interleave +
@@ -4642,13 +4873,56 @@ pub fn spec_step_dflash(
                 ),
             }
             target_snap.restore_to(&mut target.dn_state, gpu)?;
-            serial_tape.replay_gdn_fused_gate_conv_for_compare(
-                gpu,
-                &target.weights,
-                &target.config,
-                &mut target.dn_state,
-                accept_len + 1,
-            )?;
+            let (post_fused_diff, gdn_input_diff) = serial_tape
+                .replay_gdn_fused_gate_conv_for_compare(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    &mut target.dn_state,
+                    accept_len + 1,
+                )?;
+            match post_fused_diff {
+                Some(diff) => eprintln!(
+                    "[dflash-rollback-fused-output-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} replay_byte={}",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                    diff.family,
+                    diff.index,
+                    diff.bytes,
+                    diff.differing_bytes,
+                    diff.first_offset,
+                    diff.expected_byte,
+                    diff.actual_byte,
+                ),
+                None => eprintln!(
+                    "[dflash-rollback-fused-output-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+            }
+            match gdn_input_diff {
+                Some(diff) => eprintln!(
+                    "[dflash-rollback-gdn-input-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} replay_byte={}",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                    diff.family,
+                    diff.index,
+                    diff.bytes,
+                    diff.differing_bytes,
+                    diff.first_offset,
+                    diff.expected_byte,
+                    diff.actual_byte,
+                ),
+                None => eprintln!(
+                    "[dflash-rollback-gdn-input-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+            }
             match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &serial_result)? {
                 Some(diff) => eprintln!(
                     "[dflash-rollback-serial-tape-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} serial_tape_byte={}",
