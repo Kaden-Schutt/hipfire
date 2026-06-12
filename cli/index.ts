@@ -2833,6 +2833,9 @@ async function serve(port: number, host: string) {
     lastChunkSize: 0,
     lastDecodeMs: 0,
     lastSkippedReason: "not_applicable",
+    lastCompatibleStateKinds: [] as string[],
+    lastCachedPrefixTokens: 0,
+    lastFallbackReason: "not_applicable",
   };
   const batchFileStore = new Map<string, BatchFileRecord>();
   const batchControlStore = new Map<string, BatchJobRecord>();
@@ -3480,6 +3483,9 @@ async function serve(port: number, host: string) {
                   last_chunk_size: decodeBatchMetrics.lastChunkSize,
                   last_decode_ms: decodeBatchMetrics.lastDecodeMs,
                   last_skipped_reason: decodeBatchMetrics.lastSkippedReason,
+                  compatible_state_kinds: decodeBatchMetrics.lastCompatibleStateKinds,
+                  cached_prefix_tokens: decodeBatchMetrics.lastCachedPrefixTokens,
+                  fallback_reason: decodeBatchMetrics.lastFallbackReason,
                 }
               : { enabled: false },
             state_cache: serverPrefillBatch.enabled
@@ -6575,6 +6581,9 @@ async function serve(port: number, host: string) {
                   let elapsedMs = 0;
                   let chunkCount = 0;
                   let chunkSize = 0;
+                  let compatibleStateKinds: string[] = [];
+                  let decodeFallbackReason = "not_reported";
+                  let cachedPrefixTokens = 0;
                   for (let i = 0; i < activeSessions.length + 4; i++) {
                     const decodeMsg = await e.recv();
                     if (decodeMsg?.type === "generate_batch_decode_step_session_done") {
@@ -6584,6 +6593,11 @@ async function serve(port: number, host: string) {
                       chunkCount = typeof decodeMsg.chunk_count === "number" ? decodeMsg.chunk_count : 0;
                       chunkSize = typeof decodeMsg.chunk_size === "number" ? decodeMsg.chunk_size : 0;
                       elapsedMs = typeof decodeMsg.elapsed_ms === "number" ? decodeMsg.elapsed_ms : 0;
+                      compatibleStateKinds = Array.isArray(decodeMsg.compatible_state_kinds)
+                        ? decodeMsg.compatible_state_kinds.filter((kind: unknown): kind is string => typeof kind === "string")
+                        : [];
+                      decodeFallbackReason = typeof decodeMsg.fallback_reason === "string" ? decodeMsg.fallback_reason : "not_reported";
+                      cachedPrefixTokens = typeof decodeMsg.cached_prefix_tokens === "number" ? decodeMsg.cached_prefix_tokens : 0;
                       updateRuntimeWorkerMetrics((decodeMsg as any).model_worker);
                       break;
                     } else if (decodeMsg?.type === "error") {
@@ -6597,6 +6611,9 @@ async function serve(port: number, host: string) {
                   decodeBatchMetrics.lastChunkCount = chunkCount;
                   decodeBatchMetrics.lastChunkSize = chunkSize;
                   decodeBatchMetrics.lastDecodeMs = elapsedMs;
+                  decodeBatchMetrics.lastCompatibleStateKinds = compatibleStateKinds;
+                  decodeBatchMetrics.lastCachedPrefixTokens = cachedPrefixTokens;
+                  decodeBatchMetrics.lastFallbackReason = decodeFallbackReason;
                   for (const state of activeSessions) {
                     const step = stepById.get(state.id);
                     if (!step) throw new Error(`decode batch missing step result for ${state.id}`);

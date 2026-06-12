@@ -195,6 +195,9 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
             "decode_last_chunk_size": decode.get("last_chunk_size"),
             "decode_last_decode_ms": decode.get("last_decode_ms"),
             "decode_last_skipped_reason": decode.get("last_skipped_reason"),
+            "decode_compatible_state_kinds": decode.get("compatible_state_kinds"),
+            "decode_cached_prefix_tokens": decode.get("cached_prefix_tokens"),
+            "decode_fallback_reason": decode.get("fallback_reason"),
             "decode_active_sessions": decode.get("active_sessions"),
             "prefill_selected_batch_size": prefill.get("selected_batch_size"),
             "resident_runtime_sessions": prefill.get("resident_runtime_sessions"),
@@ -228,6 +231,12 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
                     )
         if float(checks["decode_last_decode_ms"] or 0) <= 0:
             raise RuntimeError(f"server decode did not record positive decode latency: {checks}; log={log_path}")
+        if checks["decode_compatible_state_kinds"] != ["attention_kv", "deltanet_recurrent"]:
+            raise RuntimeError(f"server decode did not expose compatible state kinds: {checks}; log={log_path}")
+        if checks["decode_cached_prefix_tokens"] is None:
+            raise RuntimeError(f"server decode did not expose cached prefix token metadata: {checks}; log={log_path}")
+        if not isinstance(checks["decode_fallback_reason"], str) or not checks["decode_fallback_reason"]:
+            raise RuntimeError(f"server decode did not expose fallback reason metadata: {checks}; log={log_path}")
         if checks["prefill_selected_batch_size"] != request_count:
             raise RuntimeError(f"server prefill did not coalesce setup requests: {checks}; log={log_path}")
         if int(checks["decode_active_sessions"] or 0) != 0:

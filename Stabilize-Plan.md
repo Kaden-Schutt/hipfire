@@ -74,6 +74,9 @@
       - compatible state kinds,
       - cached prefix tokens,
       - fallback reason.
+    Status: `generate_batch_decode_step_done` now exposes selected backend, batch size, compatible state kinds, cached-prefix metadata, and fallback
+    reason, and `/health.decode_batch` mirrors those fields for scheduler/status consumers. Decode cached-prefix tokens are currently reported as
+    zero because the active decode envelope does not yet carry the originating prefill cache count.
 
   ## Test Plan
 

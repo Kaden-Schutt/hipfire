@@ -894,6 +894,46 @@ fn qwen35_decode_batch_requested_auto(requested: &str) -> bool {
     matches!(requested, "" | "auto")
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Qwen35DecodeBatchSchedulerMetadata {
+    selected_backend: &'static str,
+    batch_size: usize,
+    compatible_state_kinds: Vec<&'static str>,
+    cached_prefix_tokens: usize,
+    fallback_reason: &'static str,
+}
+
+fn qwen35_decode_batch_scheduler_metadata(
+    requested: &str,
+    arch_id: u32,
+    backend: Qwen35DecodeBatchBackend,
+    batch_size: usize,
+) -> Qwen35DecodeBatchSchedulerMetadata {
+    let fallback_reason = if qwen35_decode_batch_requested_auto(requested) {
+        match (arch_id, backend) {
+            (6, Qwen35DecodeBatchBackend::SerialReference) => {
+                "auto_grouped_moe_serial_pending_latency_gate"
+            }
+            (_, Qwen35DecodeBatchBackend::SerialReference) if batch_size < 2 => {
+                "auto_requires_multi_session"
+            }
+            (_, Qwen35DecodeBatchBackend::SerialReference) => "auto_serial_reference",
+            _ => "none",
+        }
+    } else if backend == Qwen35DecodeBatchBackend::SerialReference {
+        "requested_serial_reference"
+    } else {
+        "none"
+    };
+    Qwen35DecodeBatchSchedulerMetadata {
+        selected_backend: backend.as_str(),
+        batch_size,
+        compatible_state_kinds: vec!["attention_kv", "deltanet_recurrent"],
+        cached_prefix_tokens: 0,
+        fallback_reason,
+    }
+}
+
 fn qwen35_fused_dense_decode_signature(
     state: &Qwen35RequestSessionState,
 ) -> qwen35::DensePrefillSessionBatchStateSignature {
@@ -2682,6 +2722,50 @@ mod generate_batch_prefill_tests {
         let grouped_dense_err =
             select_qwen35_decode_batch_backend("fused_grouped_moe", 5, 2).unwrap_err();
         assert!(grouped_dense_err.contains("not Qwen35 grouped-MoE"));
+    }
+
+    #[test]
+    fn decode_batch_scheduler_metadata_reports_backend_state_and_fallback() {
+        let auto_grouped = qwen35_decode_batch_scheduler_metadata(
+            "auto",
+            6,
+            Qwen35DecodeBatchBackend::SerialReference,
+            8,
+        );
+        assert_eq!(auto_grouped.selected_backend, "serial_reference");
+        assert_eq!(auto_grouped.batch_size, 8);
+        assert_eq!(
+            auto_grouped.compatible_state_kinds,
+            vec!["attention_kv", "deltanet_recurrent"]
+        );
+        assert_eq!(auto_grouped.cached_prefix_tokens, 0);
+        assert_eq!(
+            auto_grouped.fallback_reason,
+            "auto_grouped_moe_serial_pending_latency_gate"
+        );
+
+        let explicit_grouped = qwen35_decode_batch_scheduler_metadata(
+            "fused_grouped_moe",
+            6,
+            Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked,
+            4,
+        );
+        assert_eq!(
+            explicit_grouped.selected_backend,
+            "fused_grouped_moe_layer_chunked"
+        );
+        assert_eq!(explicit_grouped.fallback_reason, "none");
+
+        let explicit_serial = qwen35_decode_batch_scheduler_metadata(
+            "serial",
+            5,
+            Qwen35DecodeBatchBackend::SerialReference,
+            2,
+        );
+        assert_eq!(
+            explicit_serial.fallback_reason,
+            "requested_serial_reference"
+        );
     }
 
     #[test]
@@ -6846,12 +6930,23 @@ fn run_generate_batch_decode_step_qwen35(
         let _ = writeln!(stdout, "{line}");
     }
     let worker = loaded_model_worker_runtime_view(m);
+    let scheduler_metadata = qwen35_decode_batch_scheduler_metadata(
+        requested_backend.as_str(),
+        m.arch_id,
+        backend,
+        envelope.session_count,
+    );
     let done = serde_json::json!({
         "type": "generate_batch_decode_step_done",
         "id": envelope.id,
         "batch_id": envelope.batch_id,
         "sessions": envelope.session_count,
         "backend": backend.as_str(),
+        "selected_backend": scheduler_metadata.selected_backend,
+        "batch_size": scheduler_metadata.batch_size,
+        "compatible_state_kinds": scheduler_metadata.compatible_state_kinds,
+        "cached_prefix_tokens": scheduler_metadata.cached_prefix_tokens,
+        "fallback_reason": scheduler_metadata.fallback_reason,
         "chunk_count": step_result.chunk_count,
         "chunk_size": step_result.chunk_size,
         "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0,
