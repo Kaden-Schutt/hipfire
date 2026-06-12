@@ -12746,7 +12746,24 @@ fn generate_dflash(
                 }
             }
         }
-        position += step.accepted + 1;
+        let rollback = speculative::spec_rollback_parity_decision(
+            position,
+            step.accepted,
+            step.committed.len(),
+            step.drafted.len(),
+            position + step.accepted + 1,
+        );
+        if !rollback.allow_single_session {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":"DFlash rollback parity guard failed: {}"}}"#,
+                id, rollback.reason
+            );
+            let _ = stdout.flush();
+            break;
+        }
+        debug_assert!(!rollback.allow_multi_request_verify_batch);
+        position = rollback.next_position;
         seed_token = step.bonus_token;
         // Per-cycle eviction (FlashCASK). Fires whenever current physical
         // has grown to budget+β since the last compaction. No-op when

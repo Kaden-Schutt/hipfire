@@ -385,7 +385,9 @@ Rules:
 - verify batching stays disabled until AR prefill/decode coherence is proven,
 - verify rollback/state repair must be per-session,
 - DFlash/MTP must not share a verify batch across sessions until first-token
-  parity and rollback parity tests exist,
+  parity and rollback parity tests exist; the Qwen35 speculative path now has
+  a rollback-admission guard for accept/reject commit shape and AR replay
+  boundary alignment, and the daemon checks it before advancing DFlash state,
 - MoE verify follows MQ4 control first before expanding MQ3/MQ6 or Paro lanes.
 
 The scheduler can eventually batch verify spines because existing code already

@@ -688,9 +688,91 @@ pub struct SpecStepResult {
     pub bonus_token: u32,
     /// The full sequence of tokens the draft proposed this cycle.
     pub drafted: Vec<u32>,
-    /// The tokens actually committed to both models: `drafted[..accepted]`
-    /// followed by `bonus_token`. Always non-empty (length = accepted + 1).
+    /// The tokens actually committed to both models: the seed token, accepted
+    /// draft tokens, then `bonus_token` (length = accepted + 2).
     pub committed: Vec<u32>,
+}
+
+/// Conservative admission result for speculative verify rollback.
+///
+/// Qwen35 DFlash/MTP verify may write KV/logit state past the ultimately
+/// accepted prefix. Single-session decode can tolerate this only when the next
+/// AR/spec verify starts at the post-commit boundary and overwrites every slot
+/// it will read. Cross-session verify batching is refused until a real
+/// per-session scratch/commit protocol can prove KV, DeltaNet, logits, and next
+/// token parity against AR replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpecRollbackParityDecision {
+    pub accepted: usize,
+    pub committed_len: usize,
+    pub next_position: usize,
+    pub ar_replay_start: usize,
+    pub allow_single_session: bool,
+    pub allow_multi_request_verify_batch: bool,
+    pub reason: &'static str,
+}
+
+pub fn spec_rollback_parity_decision(
+    start_position: usize,
+    accepted: usize,
+    committed_len: usize,
+    verify_len: usize,
+    ar_replay_start: usize,
+) -> SpecRollbackParityDecision {
+    let next_position = start_position.saturating_add(committed_len.saturating_sub(1));
+    if committed_len == 0 {
+        return SpecRollbackParityDecision {
+            accepted,
+            committed_len,
+            next_position,
+            ar_replay_start,
+            allow_single_session: false,
+            allow_multi_request_verify_batch: false,
+            reason: "empty_commit",
+        };
+    }
+    if accepted + 1 > verify_len {
+        return SpecRollbackParityDecision {
+            accepted,
+            committed_len,
+            next_position,
+            ar_replay_start,
+            allow_single_session: false,
+            allow_multi_request_verify_batch: false,
+            reason: "accepted_prefix_exceeds_verify",
+        };
+    }
+    if committed_len != accepted + 2 {
+        return SpecRollbackParityDecision {
+            accepted,
+            committed_len,
+            next_position,
+            ar_replay_start,
+            allow_single_session: false,
+            allow_multi_request_verify_batch: false,
+            reason: "commit_shape_mismatch",
+        };
+    }
+    if ar_replay_start != next_position {
+        return SpecRollbackParityDecision {
+            accepted,
+            committed_len,
+            next_position,
+            ar_replay_start,
+            allow_single_session: false,
+            allow_multi_request_verify_batch: false,
+            reason: "ar_replay_does_not_start_at_commit_boundary",
+        };
+    }
+    SpecRollbackParityDecision {
+        accepted,
+        committed_len,
+        next_position,
+        ar_replay_start,
+        allow_single_session: true,
+        allow_multi_request_verify_batch: false,
+        reason: "multi_request_verify_batch_disabled_pending_rollback_parity",
+    }
 }
 
 /// Backing storage for a DeltaNetState snapshot. Holds device buffers sized
@@ -6020,6 +6102,41 @@ mod tests {
         assert!(dflash_use_gdn_tape_replay(true, true));
         assert!(!dflash_use_gdn_tape_replay(false, true));
         assert!(!dflash_use_gdn_tape_replay(true, false));
+    }
+
+    #[test]
+    fn spec_rollback_parity_admits_single_session_accept_and_reject_paths() {
+        let accept = spec_rollback_parity_decision(32, 3, 5, 4, 36);
+        assert!(accept.allow_single_session);
+        assert!(!accept.allow_multi_request_verify_batch);
+        assert_eq!(accept.next_position, 36);
+        assert_eq!(
+            accept.reason,
+            "multi_request_verify_batch_disabled_pending_rollback_parity"
+        );
+
+        let reject = spec_rollback_parity_decision(32, 0, 2, 4, 33);
+        assert!(reject.allow_single_session);
+        assert!(!reject.allow_multi_request_verify_batch);
+        assert_eq!(reject.next_position, 33);
+    }
+
+    #[test]
+    fn spec_rollback_parity_rejects_bad_replay_or_commit_shape() {
+        let replay_mismatch = spec_rollback_parity_decision(32, 1, 3, 4, 32);
+        assert!(!replay_mismatch.allow_single_session);
+        assert_eq!(
+            replay_mismatch.reason,
+            "ar_replay_does_not_start_at_commit_boundary"
+        );
+
+        let shape_mismatch = spec_rollback_parity_decision(32, 1, 2, 4, 34);
+        assert!(!shape_mismatch.allow_single_session);
+        assert_eq!(shape_mismatch.reason, "commit_shape_mismatch");
+
+        let impossible_accept = spec_rollback_parity_decision(32, 5, 7, 4, 38);
+        assert!(!impossible_accept.allow_single_session);
+        assert_eq!(impossible_accept.reason, "accepted_prefix_exceeds_verify");
     }
 
     #[test]
