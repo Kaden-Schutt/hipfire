@@ -2005,6 +2005,49 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
+    fn qwen35_prefill_checkpoint_hook_preserves_handle_contract() {
+        let hash = GenerateBatchPrefillPrefixHash {
+            algorithm: "xxh128".to_string(),
+            value: "0123456789abcdef0123456789abcdef".to_string(),
+            prefix_len: 12,
+        };
+        let final_hook = Qwen35PrefillCheckpointHook {
+            batch_id: "batch-a",
+            session_id: "req-1",
+            source_state_handle: "req-1",
+            logical_position: 12,
+            kind: Qwen35PrefillCheckpointKind::Final,
+            prefix_hash: &hash,
+        };
+
+        assert_eq!(final_hook.source_state_handle, "req-1");
+        assert_eq!(final_hook.prefix_hash.prefix_len, 12);
+        assert_eq!(qwen35_prefill_checkpoint_boundary_kind(final_hook), "full");
+        assert_eq!(
+            qwen35_prefill_checkpoint_session_id(final_hook),
+            "qwen35-checkpoint:batch-a:req-1:12"
+        );
+
+        let boundary_hook = Qwen35PrefillCheckpointHook {
+            logical_position: 8,
+            kind: Qwen35PrefillCheckpointKind::SemanticBoundary {
+                boundary: "message_end",
+                boundary_index: 3,
+            },
+            ..final_hook
+        };
+
+        assert_eq!(
+            qwen35_prefill_checkpoint_boundary_kind(boundary_hook),
+            "message_end"
+        );
+        assert_eq!(
+            qwen35_prefill_checkpoint_session_id(boundary_hook),
+            "qwen35-checkpoint:batch-a:req-1:boundary:3:8"
+        );
+    }
+
+    #[test]
     fn model_worker_runtime_view_json_reports_state_page_descriptors() {
         let worker = ModelWorkerRuntimeView {
             worker_id: ModelWorkerId {
@@ -3252,6 +3295,25 @@ struct SequenceStateCheckpointRequest<'a> {
     expected_logical_position: usize,
     requested_prefix_hash: Option<&'a GenerateBatchPrefillPrefixHash>,
     checkpoint_prefix_hash: Option<&'a GenerateBatchPrefillPrefixHash>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Qwen35PrefillCheckpointKind<'a> {
+    Final,
+    SemanticBoundary {
+        boundary: &'a str,
+        boundary_index: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct Qwen35PrefillCheckpointHook<'a> {
+    batch_id: &'a str,
+    session_id: &'a str,
+    source_state_handle: &'a str,
+    logical_position: usize,
+    kind: Qwen35PrefillCheckpointKind<'a>,
+    prefix_hash: &'a GenerateBatchPrefillPrefixHash,
 }
 
 struct Qwen35RequestSessionState {
@@ -4612,6 +4674,53 @@ fn qwen35_boundary_checkpoint_session_id(
     )
 }
 
+fn qwen35_prefill_checkpoint_session_id(hook: Qwen35PrefillCheckpointHook<'_>) -> String {
+    match hook.kind {
+        Qwen35PrefillCheckpointKind::Final => {
+            qwen35_checkpoint_session_id(hook.batch_id, hook.session_id, hook.logical_position)
+        }
+        Qwen35PrefillCheckpointKind::SemanticBoundary { boundary_index, .. } => {
+            qwen35_boundary_checkpoint_session_id(
+                hook.batch_id,
+                hook.session_id,
+                hook.logical_position,
+                boundary_index,
+            )
+        }
+    }
+}
+
+fn qwen35_prefill_checkpoint_boundary_kind(hook: Qwen35PrefillCheckpointHook<'_>) -> &'_ str {
+    match hook.kind {
+        Qwen35PrefillCheckpointKind::Final => "full",
+        Qwen35PrefillCheckpointKind::SemanticBoundary { boundary, .. } => boundary,
+    }
+}
+
+fn emit_qwen35_prefill_checkpoint(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    arena_backend: SequenceStateArenaBackend,
+    hook: Qwen35PrefillCheckpointHook<'_>,
+) -> Result<String, String> {
+    if qwen35_prefill_checkpoint_boundary_kind(hook).is_empty() {
+        return Err("qwen35 prefill checkpoint boundary kind is empty".to_string());
+    }
+    let checkpoint_id = qwen35_prefill_checkpoint_session_id(hook);
+    arena_backend.checkpoint_session_state(
+        m,
+        gpu,
+        SequenceStateCheckpointRequest {
+            source_session_id: hook.source_state_handle,
+            dest_session_id: &checkpoint_id,
+            expected_logical_position: hook.logical_position,
+            requested_prefix_hash: None,
+            checkpoint_prefix_hash: Some(hook.prefix_hash),
+        },
+    )?;
+    Ok(checkpoint_id)
+}
+
 fn push_hash_field(buf: &mut Vec<u8>, label: &str, value: &str) {
     buf.extend_from_slice(label.as_bytes());
     buf.push(b'=');
@@ -5683,30 +5792,30 @@ fn qwen35_prefill_suffix_batch_serial_reference(
                         session.id, boundary.prefix_len, logical_position
                     ));
                 }
-                let checkpoint_id = qwen35_boundary_checkpoint_session_id(
+                let hook = Qwen35PrefillCheckpointHook {
                     batch_id,
-                    &session.id,
+                    session_id: &session.id,
+                    source_state_handle: &session.id,
                     logical_position,
-                    boundary.boundary_index,
-                );
-                loaded_model_state_arena_backend(m)
-                    .checkpoint_session_state(
-                        m,
-                        gpu,
-                        SequenceStateCheckpointRequest {
-                            source_session_id: &session.id,
-                            dest_session_id: &checkpoint_id,
-                            expected_logical_position: logical_position,
-                            requested_prefix_hash: None,
-                            checkpoint_prefix_hash: Some(&boundary.hash),
-                        },
+                    kind: Qwen35PrefillCheckpointKind::SemanticBoundary {
+                        boundary: &boundary.boundary,
+                        boundary_index: boundary.boundary_index,
+                    },
+                    prefix_hash: &boundary.hash,
+                };
+                let checkpoint_id_for_error = qwen35_prefill_checkpoint_session_id(hook);
+                let checkpoint_id = emit_qwen35_prefill_checkpoint(
+                    m,
+                    gpu,
+                    loaded_model_state_arena_backend(m),
+                    hook,
+                )
+                .map_err(|e| {
+                    format!(
+                        "qwen35 session {} failed to create semantic boundary checkpoint {}: {}",
+                        session.id, checkpoint_id_for_error, e
                     )
-                    .map_err(|e| {
-                        format!(
-                            "qwen35 session {} failed to create semantic boundary checkpoint {}: {}",
-                            session.id, checkpoint_id, e
-                        )
-                    })?;
+                })?;
                 qwen35_activate_session(m, gpu, &session.id)?;
                 boundary.checkpoint_id = Some(checkpoint_id);
                 boundary_checkpoints.push(boundary);
@@ -5962,24 +6071,20 @@ fn run_generate_batch_prefill_serial_qwen35(
 
     let result = qwen35_prefill_suffix_batch(m, gpu, &envelope.batch_id, &prepared, plan, backend)?;
     for session in &result.sessions {
+        let hook = Qwen35PrefillCheckpointHook {
+            batch_id: &envelope.batch_id,
+            session_id: &session.id,
+            source_state_handle: &session.id,
+            logical_position: session.logical_position,
+            kind: Qwen35PrefillCheckpointKind::Final,
+            prefix_hash: &session.prefix_hash,
+        };
+        let checkpoint_id_for_error = qwen35_prefill_checkpoint_session_id(hook);
         let checkpoint_id =
-            qwen35_checkpoint_session_id(&envelope.batch_id, &session.id, session.logical_position);
-        arena_backend
-            .checkpoint_session_state(
-                m,
-                gpu,
-                SequenceStateCheckpointRequest {
-                    source_session_id: &session.id,
-                    dest_session_id: &checkpoint_id,
-                    expected_logical_position: session.logical_position,
-                    requested_prefix_hash: None,
-                    checkpoint_prefix_hash: Some(&session.prefix_hash),
-                },
-            )
-            .map_err(|e| {
+            emit_qwen35_prefill_checkpoint(m, gpu, arena_backend, hook).map_err(|e| {
                 format!(
                     "generate_batch_prefill session {} failed to create checkpoint {}: {}",
-                    session.id, checkpoint_id, e
+                    session.id, checkpoint_id_for_error, e
                 )
             })?;
         let mut line = serde_json::json!({
