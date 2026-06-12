@@ -115,7 +115,11 @@ gfx1151 HFQ4 grouped MMQ: the `HIPFIRE_MOE_GROUPED_I8_4W=1` experiment stages
 routed Q8_1 blocks in LDS across four row-warps and is bit-identical to k8, but
 regressed the default k8 path on A3B pp256, 122B pp128, and 122B pp64. The
 122B pp64 sweep measured default k8 at 71.2 ms inside a 294.2 ms profiled
-prefill, versus 85.8 ms for k4 and 78.7 ms for k8-4w. Keep k8 as the default.
+prefill, versus 85.8 ms for k4 and 78.7 ms for k8-4w. A fresh
+Qwen3.6-35B-A3B pp128 probe also kept k8 ahead (`44.0 ms` grouped total,
+`663.9 tok/s`) versus k8-4w (`50.1 ms`, `642.6 tok/s`). Keep k8 as the
+default. See
+`docs/perf-checkpoints/2026-06-12-gfx1151-qwen35-profile-refresh.md`.
 
 gfx1151 HFQ6 grouped MoE: the 4-warp WMMA path is default-on and remains the
 best measured 122B route. On Qwen3.5-122B-A10B MQ4 pp64, HFQ6 grouped MoE was
@@ -175,9 +179,12 @@ the 256-float LDS reduction ladder with wave reductions plus 8 wave sums. On
 Qwen3.6-35B-A3B MQ4 pp256, fused RMSNorm+MQ rotate moved from 867.3us to
 821.4us across 40 calls. On Qwen3.5-9B MQ4 pp256, plain batched RMSNorm moved
 from 444.9us to 356.4us across 16 calls; standalone CPU-reference correctness
-stays within 3.10e-6 max_abs at batch=3, K=12288. The remaining norm/rotate
-gap is broader: `gated_norm`, `fused_silu_mul_mq_rotate`, and DeltaNet-specific
-conv/gate kernels still use generic F32 implementations.
+stays within 3.10e-6 max_abs at batch=3, K=12288. A 2026-06-12 profile refresh
+put the remaining norm/scalar rows below the matrix kernels: on Qwen3.5-9B MQ4
+decode, `gated_norm_f32` was 1.2% and the gfx1151 fused gate+conv row was 1.2%;
+on Qwen3.6-35B-A3B MQ4 decode, they were 1.7% each. The remaining norm/rotate
+gap is therefore correctness/precision-policy cleanup rather than the next
+first-order gfx1151 performance lever.
 
 ### Misc compute
 
@@ -281,11 +288,12 @@ Ordered by estimated decode-path impact on active hardware.
 
 | Priority | Gap | Arch | Reason |
 |---|---|---|---|
-| 1 | GEMV decode (mq4g256, hfq4g256) | gfx1151 | RDNA3 single-row path is default after R=2/4/8 regressed 4B/9B decode; larger decode-shape tuning remains open |
-| 2 | fused_rmsnorm_mq_rotate / plain rmsnorm BF16 | gfx1151 | Initial wave-reduced gfx1151 paths are wired; broader BF16-native norm coverage remains open |
-| 3 | conv1d + fused_sigmoid_alpha_gate BF16 | gfx1151 | Linear prefill split and tree conv are parallelized and decode gate+split is fused; routed conv and BF16-native gate coverage remain generic |
+| 1 | HFQ4/MQ4 decode GEMV family | gfx1151 | Fresh Qwen3.5-9B and Qwen3.6-35B-A3B profiles put standalone/residual/fused-QKV/fused-QKVZA/indexed-MoE GEMV at the top of decode time |
+| 2 | HFQ4 grouped MMQ prefill | gfx1151 | Qwen3.6-35B-A3B pp128 spends 45.6% of profiled prefill in `gemm_hfq4g256_moe_grouped_mmq_k8_gfx1151`; existing 4w variant still loses |
+| 3 | non-grouped HFQ4 MMQ prefill shapes | gfx1151 | K=2048 A3B/shared path routes to gfx1151 i8 WMMA, but dense K=4096 9B/122B still falls back because the gfx1151 route regresses those shapes |
 | 4 | hc_sinkhorn_4x4 + hc_mix_4stream | gfx942 | Every forward pass layer in DeepSeek4; MFMA available but unused |
 | 5 | GEMV decode (mq4g256, hfq4g256) | gfx12 | Only FP8 GEMV exists; MQ4 decode falls back to generic |
 | 6 | deepseek4_attn_swa causal | gfx942, gfx12 | Hot path on MI300X / RX 9070; currently generic F32 |
-| 7 | fused_rmsnorm_mq_rotate BF16 | gfx1100, gfx12 | BF16 native on both; norm widening is free performance |
-| 8 | indexer_relu_score wmma | gfx1151, gfx12 | MiniMax plaid-flash token routing; WMMA available |
+| 7 | Qwen3.5/3.6 scalar cleanup | gfx1151 | `gated_norm`, `fused_silu_mul_mq_rotate`, and routed DeltaNet conv/gate BF16 policy remain open but are low single-digit rows in the current profile |
+| 8 | fused_rmsnorm_mq_rotate BF16 | gfx1100, gfx12 | BF16 native on both; norm widening may help non-gfx1151 paths |
+| 9 | indexer_relu_score wmma | gfx1151, gfx12 | MiniMax plaid-flash token routing; WMMA available |
