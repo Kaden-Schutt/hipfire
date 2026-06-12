@@ -1758,6 +1758,9 @@ fn main() {
         // Reported value = prefill_ms + first_cycle_ms, taken from t_decode
         // (set AFTER warmup) plus the previously-recorded prefill_secs.
         let mut ttft_ms: Option<f64> = None;
+        let mut rollback_checked_cycles: usize = 0;
+        let mut rollback_single_session_ok: usize = 0;
+        let mut rollback_multi_request_disabled: usize = 0;
         while emitted.len() < max_tokens {
             if position + draft_scratch_b >= ctx_capacity {
                 eprintln!("hit ctx_capacity {}; stopping", ctx_capacity);
@@ -2022,6 +2025,23 @@ fn main() {
             if used_pld {
                 pld_accepted += step.accepted;
             }
+            let rollback = speculative::spec_rollback_parity_decision_for_step(position, &step);
+            rollback_checked_cycles += 1;
+            if rollback.allow_single_session {
+                rollback_single_session_ok += 1;
+            }
+            if !rollback.allow_multi_request_verify_batch {
+                rollback_multi_request_disabled += 1;
+            }
+            assert!(
+                rollback.allow_single_session,
+                "DFlash rollback parity guard failed: {}",
+                rollback.reason
+            );
+            assert!(
+                !rollback.allow_multi_request_verify_batch,
+                "DFlash multi-request verify batching unexpectedly admitted"
+            );
 
             // Per-cycle debug for the first N cycles.
             if stats.cycles < debug_cycles {
@@ -2295,6 +2315,10 @@ fn main() {
             stats.accepted_tokens,
             stats.tau(),
             stats.mean_committed(),
+        );
+        eprintln!(
+            "rollback_parity: checked={} single_session_ok={} multi_request_disabled={}",
+            rollback_checked_cycles, rollback_single_session_ok, rollback_multi_request_disabled,
         );
         if let Some(ref p) = cask_policy {
             eprintln!(

@@ -330,8 +330,8 @@ for entry in "${tests[@]}"; do
         status="WARN (paragraph-level repetition — soft, not blocking)"
     fi
 
-    # Pull stats lines (emitted/τ/cycles/accept_rate) for the report.
-    stats=$(grep -aE '^emitted:|^cycles:|^accept_rate:' "$out_file" | head -3)
+    # Pull stats lines (emitted/τ/cycles/rollback/accept_rate) for the report.
+    stats=$(grep -aE '^emitted:|^cycles:|^rollback_parity:|^accept_rate:' "$out_file" | head -4)
 
     {
         echo "## $label ($mode)"
