@@ -210,12 +210,13 @@ tool-call, and tool-response sentinels. The daemon returns these handles in
 `state_handle.prefix_checkpoints[]` with canonical `xxh128` hash metadata, and
 the CLI stores them as normal attachable resident manifests. `/health.state_cache`
 reports `semantic_boundary_checkpoints`, `semantic_boundary_checkpoint_entries`,
-and `prefix_hash_preflight_boundary_matches`. Final checkpoints and serial
-semantic-boundary checkpoints now route through one typed Qwen35 prefill
-checkpoint hook carrying the session id, source state handle, logical token
-position, boundary kind, and prefix hash. Interior semantic-boundary checkpoints
-from fused dense/grouped prefill still require backend-native capture points
-inside the fused executors.
+and `prefix_hash_preflight_boundary_matches`. Final checkpoints, serial
+semantic-boundary checkpoints, and synchronized multi-session fused dense/grouped
+semantic-boundary checkpoints now route through typed Qwen35 prefill checkpoint
+hooks carrying the session id, source state handle, logical token position,
+boundary kind, and prefix hash. Fused boundary layouts that would leave a
+single-session interior segment fall back to `serial_reference` so the serial
+oracle remains the correctness path for unsupported layouts.
 
 The daemon now routes top-level Qwen35 attach, fork, activate, reset, release,
 resident-count, and logical-position operations through `SequenceStateArenaBackend`

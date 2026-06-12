@@ -20,9 +20,9 @@
 
   - Add backend-neutral prefill checkpoint hooks so fused prefill can emit semantic-boundary checkpoints, not only final checkpoints. The hook should
     carry: session id, logical token position, boundary kind, prefix hash input, and state handle.
-    Status: the daemon now has a typed Qwen35 prefill checkpoint hook carrying that metadata, and both final prefill checkpoints and serial
-    semantic-boundary checkpoints route through the state-arena checkpoint surface. Fused dense/grouped prefill still needs backend-native interior
-    capture points before it can emit mid-prefill boundary snapshots.
+    Status: the daemon now has a typed Qwen35 prefill checkpoint hook carrying that metadata. Final prefill checkpoints, serial semantic-boundary
+    checkpoints, and synchronized multi-session fused dense/grouped semantic-boundary checkpoints can all emit attachable resident snapshots.
+    Boundary layouts that would require a single-session fused interior segment fall back to serial_reference.
 
   - Replace Qwen35-only wrapped state assumptions with generic state descriptors:
       - StatePageKind: KV, DeltaNet, logits snapshot, backend-private.

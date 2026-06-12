@@ -192,6 +192,58 @@ def prefill_batch(
             raise RuntimeError(f"{batch_id}: daemon error: {event.get('message')}")
 
 
+def prefill_boundary_batch(
+    proc: subprocess.Popen[str],
+    batch_id: str,
+    sessions: list[dict[str, Any]],
+    expect_backend: str,
+    expect_plan: str = "fused_dense_qwen35_candidate",
+) -> dict[str, int]:
+    send(proc, {
+        "type": "generate_batch_prefill",
+        "id": batch_id,
+        "batch_id": batch_id,
+        "worker_key_id": worker_id,
+        "sessions": sessions,
+    })
+    prefix_checkpoint_counts: dict[str, int] = {}
+    started = False
+    while True:
+        event = recv_json(proc)
+        typ = event.get("type")
+        if typ == "generate_batch_prefill_started":
+            started = True
+            if event.get("plan") != expect_plan:
+                raise RuntimeError(f"{batch_id}: unexpected plan in started event: {event}")
+            if event.get("backend") != expect_backend:
+                raise RuntimeError(f"{batch_id}: unexpected backend in started event: {event}")
+        elif typ == "generate_batch_prefill_session_done":
+            sid = event.get("session_id")
+            state_handle = event.get("state_handle")
+            if not isinstance(sid, str) or not isinstance(state_handle, dict):
+                raise RuntimeError(f"{batch_id}: malformed session_done event: {event}")
+            prefix_checkpoints = state_handle.get("prefix_checkpoints")
+            if not isinstance(prefix_checkpoints, list) or not prefix_checkpoints:
+                raise RuntimeError(f"{batch_id}: missing prefix checkpoints for {sid}: {event}")
+            for checkpoint in prefix_checkpoints:
+                if not isinstance(checkpoint, dict) or checkpoint.get("checkpoint_runtime_state") != "attachable":
+                    raise RuntimeError(f"{batch_id}: malformed prefix checkpoint for {sid}: {checkpoint}")
+            prefix_checkpoint_counts[sid] = len(prefix_checkpoints)
+        elif typ == "generate_batch_prefill_done":
+            if not started:
+                raise RuntimeError(f"{batch_id}: done before started")
+            if event.get("sessions") != len(sessions):
+                raise RuntimeError(f"{batch_id}: wrong session count in done event: {event}")
+            if event.get("backend") != expect_backend:
+                raise RuntimeError(f"{batch_id}: unexpected backend in done event: {event}")
+            missing = {s["id"] for s in sessions} - set(prefix_checkpoint_counts)
+            if missing:
+                raise RuntimeError(f"{batch_id}: missing boundary checkpoint event for {sorted(missing)}")
+            return prefix_checkpoint_counts
+        elif typ == "error":
+            raise RuntimeError(f"{batch_id}: daemon error: {event.get('message')}")
+
+
 def decode_one_token_after_prefill(
     proc: subprocess.Popen[str],
     session: dict[str, Any],
@@ -311,6 +363,15 @@ def prompt_sessions(batch_size: int, label: str) -> list[dict[str, Any]]:
     ]
 
 
+def boundary_prompt_sessions(batch_size: int, label: str) -> list[dict[str, Any]]:
+    sessions = prompt_sessions(batch_size, label)
+    for session in sessions:
+        params = dict(session["params"])
+        params["semantic_boundary_checkpoints"] = True
+        session["params"] = params
+    return sessions
+
+
 def suffix_sessions(
     logical_positions: dict[str, int],
     suffix_token_ids: dict[str, int],
@@ -424,9 +485,24 @@ finally:
         proc.wait()
 
 
-fused_proc = start_daemon({"HIPFIRE_QWEN35_PREFILL_SESSION_BATCH": "fused"})
+fused_proc = start_daemon({
+    "HIPFIRE_QWEN35_PREFILL_SESSION_BATCH": "fused",
+    "HIPFIRE_JINJA_CHAT": "1",
+})
 try:
     load(fused_proc)
+    reset(fused_proc)
+    boundary_counts = prefill_boundary_batch(
+        fused_proc,
+        "fused-boundary-b2",
+        boundary_prompt_sessions(2, "fused-boundary"),
+        "fused_dense",
+    )
+    print(
+        "explicit fused boundary checkpoints: "
+        f"sessions={len(boundary_counts)} "
+        f"checkpoints={sum(boundary_counts.values())} ok"
+    )
     for batch_size in (2, 4, 8):
         label = f"fused-b{batch_size}"
         fused_batch = prompt_sessions(batch_size, label)

@@ -2047,6 +2047,58 @@ mod generate_batch_prefill_tests {
         );
     }
 
+    fn test_prefill_boundary_session(
+        id: &str,
+        tokens: &[u32],
+        boundaries: &[usize],
+    ) -> Qwen35PreparedPrefillSession {
+        Qwen35PreparedPrefillSession {
+            id: id.to_string(),
+            tokens: tokens.to_vec(),
+            cached_prefix_tokens: 0,
+            replay_as_generated_suffix: false,
+            state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
+            assistant_prefix: "plain".to_string(),
+            max_think_tokens: 0,
+            boundary_checkpoints: boundaries
+                .iter()
+                .enumerate()
+                .map(
+                    |(boundary_index, &prefix_len)| Qwen35SemanticBoundaryCheckpoint {
+                        checkpoint_id: None,
+                        prefix_len,
+                        hash: GenerateBatchPrefillPrefixHash {
+                            algorithm: "xxh128".to_string(),
+                            value: format!("{prefix_len:032x}"),
+                            prefix_len,
+                        },
+                        boundary: "message_end".to_string(),
+                        boundary_index,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn fused_prefill_boundary_cuts_require_multi_session_segments() {
+        let synchronized = vec![
+            test_prefill_boundary_session("req-a", &[1, 2, 3, 4], &[2]),
+            test_prefill_boundary_session("req-b", &[5, 6, 7, 8], &[2]),
+        ];
+        assert_eq!(
+            qwen35_fused_prefill_boundary_cuts(&synchronized).expect("valid cuts"),
+            Some(vec![2, 4])
+        );
+
+        let uneven_tail = vec![
+            test_prefill_boundary_session("req-a", &[1], &[]),
+            test_prefill_boundary_session("req-b", &[5, 6, 7, 8], &[1]),
+        ];
+        let err = qwen35_fused_prefill_boundary_cuts(&uneven_tail).unwrap_err();
+        assert!(err.contains("active session"));
+    }
+
     #[test]
     fn model_worker_runtime_view_json_reports_state_page_descriptors() {
         let worker = ModelWorkerRuntimeView {
@@ -5232,22 +5284,123 @@ fn qwen35_prefill_suffix_batch(
         });
     }
 
+    if matches!(
+        backend,
+        Qwen35PrefillBatchBackend::FusedDense | Qwen35PrefillBatchBackend::FusedGroupedMoe
+    ) {
+        if let Err(err) = qwen35_fused_prefill_boundary_cuts(prepared) {
+            if std::env::var_os("HIPFIRE_DEBUG_PREFIX_BOUNDARIES").is_some() {
+                eprintln!("[daemon] fused prefill boundary checkpoint fallback: {err}");
+            }
+            return qwen35_prefill_suffix_batch_serial_reference(
+                m,
+                gpu,
+                batch_id,
+                prepared,
+                plan,
+                Qwen35PrefillBatchBackend::SerialReference,
+            );
+        }
+    }
+
     match backend {
         Qwen35PrefillBatchBackend::SerialReference => {
             qwen35_prefill_suffix_batch_serial_reference(m, gpu, batch_id, prepared, plan, backend)
         }
         Qwen35PrefillBatchBackend::FusedDense => {
-            qwen35_prefill_suffix_batch_fused_dense(m, gpu, prepared, plan, backend)
+            qwen35_prefill_suffix_batch_fused_dense(m, gpu, batch_id, prepared, plan, backend)
         }
         Qwen35PrefillBatchBackend::FusedGroupedMoe => {
-            qwen35_prefill_suffix_batch_fused_grouped_moe(m, gpu, prepared, plan, backend)
+            qwen35_prefill_suffix_batch_fused_grouped_moe(m, gpu, batch_id, prepared, plan, backend)
         }
     }
+}
+
+fn qwen35_fused_prefill_boundary_cuts(
+    prepared: &[Qwen35PreparedPrefillSession],
+) -> Result<Option<Vec<usize>>, String> {
+    if prepared
+        .iter()
+        .all(|session| session.boundary_checkpoints.is_empty())
+    {
+        return Ok(None);
+    }
+    if prepared.iter().any(|session| {
+        session.replay_as_generated_suffix && !session.boundary_checkpoints.is_empty()
+    }) {
+        return Err(
+            "qwen35 fused prefill boundary checkpoints are only supported for full-prompt prefill"
+                .to_string(),
+        );
+    }
+    let mut cuts: Vec<usize> = prepared
+        .iter()
+        .flat_map(|session| {
+            session
+                .boundary_checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.prefix_len)
+        })
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let max_len = prepared
+        .iter()
+        .map(|session| session.tokens.len())
+        .max()
+        .unwrap_or(0);
+    if max_len == 0 {
+        return Ok(None);
+    }
+    if cuts.last().copied() != Some(max_len) {
+        cuts.push(max_len);
+    }
+    let mut previous_cut = 0usize;
+    for &cut in &cuts {
+        if cut <= previous_cut {
+            continue;
+        }
+        let row_count = prepared
+            .iter()
+            .filter(|session| previous_cut < session.tokens.len().min(cut))
+            .count();
+        if row_count < 2 {
+            return Err(format!(
+                "qwen35 fused prefill boundary segment {previous_cut}..{cut} has {row_count} active session(s); use serial_reference for this boundary layout"
+            ));
+        }
+        previous_cut = cut;
+    }
+    Ok(Some(cuts))
+}
+
+fn emit_qwen35_owned_prefill_checkpoint(
+    sessions: &mut HashMap<String, Qwen35RequestSessionState>,
+    gpu: &mut rdna_compute::Gpu,
+    hook: Qwen35PrefillCheckpointHook<'_>,
+    source: &mut Qwen35RequestSessionState,
+) -> Result<String, String> {
+    if qwen35_prefill_checkpoint_boundary_kind(hook).is_empty() {
+        return Err("qwen35 prefill checkpoint boundary kind is empty".to_string());
+    }
+    let logical_position = source.seq_pos + source.kv_cache.compact_offset;
+    if logical_position != hook.logical_position {
+        return Err(format!(
+            "qwen35 owned prefill checkpoint source {} logical_position mismatch: expected={} resident={}",
+            hook.source_state_handle, hook.logical_position, logical_position
+        ));
+    }
+    source.prefix_hash = Some(hook.prefix_hash.clone());
+    let checkpoint_id = qwen35_prefill_checkpoint_session_id(hook);
+    let checkpoint = Qwen35RequestSessionState::fork_from(gpu, source)?;
+    sessions.insert(checkpoint_id.clone(), checkpoint);
+    Ok(checkpoint_id)
 }
 
 fn qwen35_prefill_suffix_batch_fused_grouped_moe(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
+    batch_id: &str,
     prepared: &[Qwen35PreparedPrefillSession],
     plan: GenerateBatchPrefillPlan,
     backend: Qwen35PrefillBatchBackend,
@@ -5274,6 +5427,7 @@ fn qwen35_prefill_suffix_batch_fused_grouped_moe(
         .q35_weights
         .as_ref()
         .ok_or_else(|| "qwen35 weights missing".to_string())?;
+    let boundary_cuts = qwen35_fused_prefill_boundary_cuts(prepared)?;
     let mut owned_sessions: Vec<(String, Qwen35RequestSessionState)> =
         Vec::with_capacity(prepared.len());
     for spec in prepared {
@@ -5305,6 +5459,165 @@ fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             ));
         }
         owned_sessions.push((spec.id.to_string(), state));
+    }
+
+    if let Some(boundary_cuts) = boundary_cuts {
+        let total_tokens = prepared.iter().map(|spec| spec.tokens.len()).sum::<usize>();
+        let mut progress = vec![0usize; prepared.len()];
+        let mut boundary_checkpoints_by_session = vec![Vec::new(); prepared.len()];
+        let mut shape_total_tokens = 0usize;
+        for &cut in &boundary_cuts {
+            let active_indices: Vec<usize> = prepared
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, spec)| {
+                    let end = spec.tokens.len().min(cut);
+                    (progress[idx] < end).then_some(idx)
+                })
+                .collect();
+            if active_indices.len() < 2 {
+                for (id, state) in owned_sessions {
+                    m.q35_sessions.insert(id, state);
+                }
+                return Err(format!(
+                    "qwen35 grouped-MoE fused prefill boundary segment ending at {cut} has {} active session(s); use serial_reference",
+                    active_indices.len()
+                ));
+            }
+            let worker_result = {
+                let scratch = m.q35_scratch.as_mut().ok_or_else(|| {
+                    "qwen35 scratch missing; grouped-MoE fused prefill is pp=1 only".to_string()
+                })?;
+                let scratch_target_batch = qwen35_prefill_scratch_target_batch(
+                    config.paged_experts,
+                    total_tokens,
+                    std::env::var("HIPFIRE_PREFILL_MAX_BATCH").ok().as_deref(),
+                );
+                let needs_scratch = scratch
+                    .prefill_batch
+                    .as_ref()
+                    .map(|pbs| pbs.max_batch < scratch_target_batch)
+                    .unwrap_or(true);
+                if needs_scratch {
+                    if let Some(existing) = scratch.prefill_batch.take() {
+                        existing.free_gpu(gpu);
+                    }
+                    scratch.prefill_batch = Some(
+                        qwen35::PrefillBatchScratch::new(gpu, config, scratch_target_batch)
+                            .map_err(|e| {
+                                format!("allocate qwen35 grouped-MoE fused prefill scratch: {e:?}")
+                            })?,
+                    );
+                }
+                let pbs_max_batch = scratch.prefill_batch.as_ref().unwrap().max_batch;
+                if pbs_max_batch < total_tokens {
+                    return Err(format!(
+                        "qwen35 grouped-MoE fused prefill scratch max_batch={pbs_max_batch} is smaller than required fused rows {}; increase HIPFIRE_PREFILL_MAX_BATCH or restart the daemon",
+                        total_tokens,
+                    ));
+                }
+                let pbs = scratch.prefill_batch.as_ref().unwrap();
+                let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> = owned_sessions
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(idx, (_, state))| {
+                        let end = prepared[idx].tokens.len().min(cut);
+                        (progress[idx] < end).then(|| qwen35::DensePrefillSessionBatchRow {
+                            tokens: &prepared[idx].tokens[progress[idx]..end],
+                            start_pos: state.seq_pos,
+                            kv_cache: &mut state.kv_cache,
+                            dn_state: &mut state.dn_state,
+                            logits: &state.logits,
+                        })
+                    })
+                    .collect();
+                qwen35::forward_prefill_grouped_moe_session_batch(
+                    gpu, weights, config, &mut rows, scratch, pbs,
+                )
+            };
+            let shape = match worker_result {
+                Ok(shape) => shape,
+                Err(e) => {
+                    for (id, state) in owned_sessions {
+                        m.q35_sessions.insert(id, state);
+                    }
+                    return Err(format!(
+                        "qwen35 grouped-MoE fused boundary prefill-session batch backend failed: {e:?}; \
+                         use HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=auto or serial"
+                    ));
+                }
+            };
+            shape_total_tokens += shape.total_tokens;
+            for idx in active_indices {
+                let start = progress[idx];
+                let end = prepared[idx].tokens.len().min(cut);
+                let state = &mut owned_sessions[idx].1;
+                state.seq_pos += end - start;
+                state
+                    .conversation_tokens
+                    .extend_from_slice(&prepared[idx].tokens[start..end]);
+                progress[idx] = end;
+                for mut boundary in prepared[idx]
+                    .boundary_checkpoints
+                    .iter()
+                    .filter(|boundary| boundary.prefix_len == end)
+                    .cloned()
+                {
+                    let hook = Qwen35PrefillCheckpointHook {
+                        batch_id,
+                        session_id: &prepared[idx].id,
+                        source_state_handle: &prepared[idx].id,
+                        logical_position: end,
+                        kind: Qwen35PrefillCheckpointKind::SemanticBoundary {
+                            boundary: &boundary.boundary,
+                            boundary_index: boundary.boundary_index,
+                        },
+                        prefix_hash: &boundary.hash,
+                    };
+                    let checkpoint_id_for_error = qwen35_prefill_checkpoint_session_id(hook);
+                    let checkpoint_id =
+                        emit_qwen35_owned_prefill_checkpoint(&mut m.q35_sessions, gpu, hook, state).map_err(|e| {
+                            format!(
+                                "qwen35 session {} failed to create fused semantic boundary checkpoint {}: {}",
+                                prepared[idx].id, checkpoint_id_for_error, e
+                            )
+                        })?;
+                    boundary.checkpoint_id = Some(checkpoint_id);
+                    boundary_checkpoints_by_session[idx].push(boundary);
+                }
+            }
+        }
+        let mut sessions = Vec::with_capacity(owned_sessions.len());
+        for (idx, (id, mut state)) in owned_sessions.into_iter().enumerate() {
+            state.prefilled_generated_suffix_len = 0;
+            let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+            let prefix_hash = compute_qwen35_prefix_hash(
+                m.arch_id,
+                m.q35_kv_mode.as_deref(),
+                &prepared[idx].state_kinds,
+                &prepared[idx].assistant_prefix,
+                prepared[idx].max_think_tokens,
+                &state.conversation_tokens,
+            );
+            state.prefix_hash = Some(prefix_hash.clone());
+            sessions.push(Qwen35PrefillSessionResult {
+                id: id.clone(),
+                prefill_tokens: prepared[idx].tokens.len(),
+                logical_position,
+                cached_prefix_tokens: prepared[idx].cached_prefix_tokens,
+                prefix_hash,
+                debug_sample_token: None,
+                boundary_checkpoints: std::mem::take(&mut boundary_checkpoints_by_session[idx]),
+            });
+            m.q35_sessions.insert(id, state);
+        }
+        return Ok(Qwen35PrefillBatchResult {
+            mode: "qwen35_fused_grouped_moe_prefill_boundary_chunked",
+            plan,
+            backend,
+            total_prefill_tokens: shape_total_tokens,
+            sessions,
+        });
     }
 
     let worker_result = {
@@ -5481,6 +5794,7 @@ fn validate_qwen35_fused_grouped_moe_prefill_batch_preflight(
 fn qwen35_prefill_suffix_batch_fused_dense(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
+    batch_id: &str,
     prepared: &[Qwen35PreparedPrefillSession],
     plan: GenerateBatchPrefillPlan,
     backend: Qwen35PrefillBatchBackend,
@@ -5512,6 +5826,7 @@ fn qwen35_prefill_suffix_batch_fused_dense(
         .q35_weights
         .as_ref()
         .ok_or_else(|| "qwen35 weights missing".to_string())?;
+    let boundary_cuts = qwen35_fused_prefill_boundary_cuts(prepared)?;
     let mut owned_sessions: Vec<(String, Qwen35RequestSessionState)> =
         Vec::with_capacity(contract.sessions.len());
     for spec in &contract.sessions {
@@ -5543,6 +5858,165 @@ fn qwen35_prefill_suffix_batch_fused_dense(
             ));
         }
         owned_sessions.push((spec.id.to_string(), state));
+    }
+
+    if let Some(boundary_cuts) = boundary_cuts {
+        let mut progress = vec![0usize; contract.sessions.len()];
+        let mut boundary_checkpoints_by_session = vec![Vec::new(); contract.sessions.len()];
+        let mut shape_total_tokens = 0usize;
+        for &cut in &boundary_cuts {
+            let active_indices: Vec<usize> = contract
+                .sessions
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, spec)| {
+                    let end = spec.tokens.len().min(cut);
+                    (progress[idx] < end).then_some(idx)
+                })
+                .collect();
+            if active_indices.len() < 2 {
+                for (id, state) in owned_sessions {
+                    m.q35_sessions.insert(id, state);
+                }
+                return Err(format!(
+                    "qwen35 fused dense boundary segment ending at {cut} has {} active session(s); use serial_reference",
+                    active_indices.len()
+                ));
+            }
+            let worker_result = {
+                let scratch = m.q35_scratch.as_mut().ok_or_else(|| {
+                    "qwen35 scratch missing; fused dense prefill is pp=1 only".to_string()
+                })?;
+                let needs_scratch = scratch
+                    .prefill_batch
+                    .as_ref()
+                    .map(|pbs| pbs.max_batch < contract.total_tokens)
+                    .unwrap_or(true);
+                if needs_scratch {
+                    if let Some(existing) = scratch.prefill_batch.take() {
+                        existing.free_gpu(gpu);
+                    }
+                    let max_batch = std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .filter(|&v| v >= 2)
+                        .unwrap_or(qwen35::PREFILL_MAX_BATCH)
+                        .max(contract.total_tokens);
+                    scratch.prefill_batch = Some(
+                        qwen35::PrefillBatchScratch::new(gpu, config, max_batch).map_err(|e| {
+                            format!("allocate qwen35 fused dense prefill scratch: {e:?}")
+                        })?,
+                    );
+                }
+                let pbs_max_batch = scratch.prefill_batch.as_ref().unwrap().max_batch;
+                if pbs_max_batch < contract.total_tokens {
+                    return Err(format!(
+                        "qwen35 fused dense prefill scratch max_batch={pbs_max_batch} is smaller than required fused rows {}; increase HIPFIRE_PREFILL_MAX_BATCH or restart the daemon",
+                        contract.total_tokens,
+                    ));
+                }
+                let pbs = scratch.prefill_batch.as_ref().unwrap();
+                let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> = owned_sessions
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(idx, (_, state))| {
+                        let end = contract.sessions[idx].tokens.len().min(cut);
+                        (progress[idx] < end).then(|| qwen35::DensePrefillSessionBatchRow {
+                            tokens: &contract.sessions[idx].tokens[progress[idx]..end],
+                            start_pos: state.seq_pos,
+                            kv_cache: &mut state.kv_cache,
+                            dn_state: &mut state.dn_state,
+                            logits: &state.logits,
+                        })
+                    })
+                    .collect();
+                qwen35::forward_prefill_dense_session_batch(
+                    gpu, weights, config, &mut rows, scratch, pbs,
+                )
+            };
+            let shape = match worker_result {
+                Ok(shape) => shape,
+                Err(e) => {
+                    for (id, state) in owned_sessions {
+                        m.q35_sessions.insert(id, state);
+                    }
+                    return Err(format!(
+                        "qwen35 fused dense boundary prefill-session batch backend failed: {e:?}; \
+                         use HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=auto or serial"
+                    ));
+                }
+            };
+            shape_total_tokens += shape.total_tokens;
+            for idx in active_indices {
+                let start = progress[idx];
+                let end = contract.sessions[idx].tokens.len().min(cut);
+                let state = &mut owned_sessions[idx].1;
+                state.seq_pos += end - start;
+                state
+                    .conversation_tokens
+                    .extend_from_slice(&contract.sessions[idx].tokens[start..end]);
+                progress[idx] = end;
+                for mut boundary in prepared[idx]
+                    .boundary_checkpoints
+                    .iter()
+                    .filter(|boundary| boundary.prefix_len == end)
+                    .cloned()
+                {
+                    let hook = Qwen35PrefillCheckpointHook {
+                        batch_id,
+                        session_id: contract.sessions[idx].id,
+                        source_state_handle: contract.sessions[idx].id,
+                        logical_position: end,
+                        kind: Qwen35PrefillCheckpointKind::SemanticBoundary {
+                            boundary: &boundary.boundary,
+                            boundary_index: boundary.boundary_index,
+                        },
+                        prefix_hash: &boundary.hash,
+                    };
+                    let checkpoint_id_for_error = qwen35_prefill_checkpoint_session_id(hook);
+                    let checkpoint_id =
+                        emit_qwen35_owned_prefill_checkpoint(&mut m.q35_sessions, gpu, hook, state).map_err(|e| {
+                            format!(
+                                "qwen35 session {} failed to create fused semantic boundary checkpoint {}: {}",
+                                contract.sessions[idx].id, checkpoint_id_for_error, e
+                            )
+                        })?;
+                    boundary.checkpoint_id = Some(checkpoint_id);
+                    boundary_checkpoints_by_session[idx].push(boundary);
+                }
+            }
+        }
+        let mut sessions = Vec::with_capacity(owned_sessions.len());
+        for (idx, (id, mut state)) in owned_sessions.into_iter().enumerate() {
+            state.prefilled_generated_suffix_len = 0;
+            let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+            let prefix_hash = compute_qwen35_prefix_hash(
+                m.arch_id,
+                m.q35_kv_mode.as_deref(),
+                contract.sessions[idx].state_kinds,
+                contract.sessions[idx].assistant_prefix,
+                contract.sessions[idx].max_think_tokens,
+                &state.conversation_tokens,
+            );
+            state.prefix_hash = Some(prefix_hash.clone());
+            sessions.push(Qwen35PrefillSessionResult {
+                id: id.clone(),
+                prefill_tokens: contract.sessions[idx].tokens.len(),
+                logical_position,
+                cached_prefix_tokens: contract.sessions[idx].cached_prefix_tokens,
+                prefix_hash,
+                debug_sample_token: None,
+                boundary_checkpoints: std::mem::take(&mut boundary_checkpoints_by_session[idx]),
+            });
+            m.q35_sessions.insert(id, state);
+        }
+        return Ok(Qwen35PrefillBatchResult {
+            mode: "qwen35_fused_dense_prefill_boundary_chunked",
+            plan,
+            backend,
+            total_prefill_tokens: shape_total_tokens,
+            sessions,
+        });
     }
 
     let worker_result = {

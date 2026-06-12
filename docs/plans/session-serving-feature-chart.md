@@ -102,7 +102,7 @@ Recent focused validation for this status:
 | Priority | Slice | Why |
 |---|---|---|
 | 1 | Run grouped-MoE decode parity/latency gates on real Qwen35-MoE artifacts and decide whether auto promotion is safe. | Explicit grouped-MoE decode now uses the native grouped row worker; auto remains serial until evidence is strong. |
-| 2 | Add fused executor capture points for prefill interior boundaries. | Final prefill checkpoints and serial semantic-boundary checkpoints now share one typed Qwen35 prefill checkpoint hook over the arena wrapper. Fused dense/grouped executors still need backend-native interior capture points before they can emit mid-prefill semantic-boundary snapshots. |
+| 2 | Broaden fused prefill interior boundary layouts. | Final checkpoints, serial semantic-boundary checkpoints, and synchronized multi-session fused dense/grouped semantic-boundary checkpoints now share typed Qwen35 prefill checkpoint hooks. Fused layouts that would require a single-session interior segment fall back to `serial_reference`; broader fused capture is still future work. |
 | 3 | Split Qwen35 wrapped state into generic state-page descriptors. | The arena wrapper is still backed by Qwen35-owned KV/DeltaNet/logits structs rather than backend-neutral pages. |
 
 ## Retired Goal File Coverage
