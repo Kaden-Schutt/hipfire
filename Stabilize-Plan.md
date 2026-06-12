@@ -43,6 +43,9 @@
       - GPU backend is current production path.
       - NPU backend remains opt-in.
       - Evidence records selected backend, module id, drift, and fallback reason.
+    Status: the Qwen35 dense FFN BF16 oracle/probe path now exposes a typed `qwen35_dense_ffn_swiglu_down` contract with CPU-oracle,
+    GPU-production, and NPU-opt-in backend preferences. Compare/cpu probe evidence records module id, selected backend, CPU oracle backend,
+    drift stats when comparing GPU to CPU, and fallback reason. XDNA execution remains reserved until a real NPU backend lands.
 
   ## Interfaces
 
@@ -100,6 +103,11 @@
       - reject path restores KV + DeltaNet + logits state,
       - AR replay parity after restore,
       - verify batching remains disabled until tests pass.
+
+  - Add backend module contract tests:
+      - dense FFN/SwiGLU/down contract shape and statelessness,
+      - CPU/GPU/NPU-opt-in backend selection,
+      - evidence records selected backend, module id, drift, and fallback reason.
 
   ## Assumptions
 
