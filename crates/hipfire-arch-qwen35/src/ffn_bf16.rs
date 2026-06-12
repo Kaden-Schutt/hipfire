@@ -104,6 +104,13 @@ pub struct DenseFfnModuleContract {
     pub preferred_backend: DenseFfnBackendPreference,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenseFfnModuleInvocation {
+    pub contract: DenseFfnModuleContract,
+    pub selected_backend: DenseFfnBackend,
+    pub fallback_reason: Option<&'static str>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DenseFfnModuleEvidence {
     pub module_id: String,
@@ -111,6 +118,12 @@ pub struct DenseFfnModuleEvidence {
     pub oracle_backend: DenseFfnBackend,
     pub drift: Option<DiffStats>,
     pub fallback_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DenseFfnModuleOutput {
+    pub evidence: DenseFfnModuleEvidence,
+    pub mutates_residual: bool,
 }
 
 pub fn config() -> &'static FfnBf16Config {
@@ -193,6 +206,22 @@ pub fn dense_ffn_backend_decision(
     }
 }
 
+pub fn dense_ffn_module_invocation(
+    layer_idx: usize,
+    shadow: &Bf16DownShadow,
+    preferred_backend: DenseFfnBackendPreference,
+    npu_available: bool,
+) -> DenseFfnModuleInvocation {
+    let contract = dense_ffn_swiglu_down_contract(layer_idx, shadow, preferred_backend);
+    let (selected_backend, fallback_reason) =
+        dense_ffn_backend_decision(preferred_backend, npu_available);
+    DenseFfnModuleInvocation {
+        contract,
+        selected_backend,
+        fallback_reason,
+    }
+}
+
 pub fn dense_ffn_module_evidence(
     contract: &DenseFfnModuleContract,
     selected_backend: DenseFfnBackend,
@@ -205,6 +234,21 @@ pub fn dense_ffn_module_evidence(
         oracle_backend: DenseFfnBackend::CpuOracle,
         drift,
         fallback_reason,
+    }
+}
+
+pub fn dense_ffn_module_output(
+    invocation: &DenseFfnModuleInvocation,
+    drift: Option<DiffStats>,
+) -> DenseFfnModuleOutput {
+    DenseFfnModuleOutput {
+        evidence: dense_ffn_module_evidence(
+            &invocation.contract,
+            invocation.selected_backend,
+            drift,
+            invocation.fallback_reason,
+        ),
+        mutates_residual: invocation.contract.state.mutates_residual,
     }
 }
 
@@ -435,5 +479,38 @@ mod tests {
         assert_eq!(evidence.oracle_backend, DenseFfnBackend::CpuOracle);
         assert_eq!(evidence.fallback_reason, Some("test_fallback"));
         assert_eq!(evidence.drift.unwrap().max_abs, 0.25);
+    }
+
+    #[test]
+    fn dense_ffn_invocation_and_output_bind_contract_to_backend_decision() {
+        let shadow = Bf16DownShadow {
+            w_down: vec![1.0, 2.0],
+            m: 1,
+            k: 2,
+        };
+        let invocation =
+            dense_ffn_module_invocation(4, &shadow, DenseFfnBackendPreference::NpuOptIn, false);
+        assert_eq!(
+            invocation.contract.module_id,
+            "qwen35.layers.4.mlp.swiglu_down"
+        );
+        assert_eq!(
+            invocation.contract.preferred_backend,
+            DenseFfnBackendPreference::NpuOptIn
+        );
+        assert_eq!(invocation.selected_backend, DenseFfnBackend::GpuProduction);
+        assert_eq!(invocation.fallback_reason, Some("npu_backend_unavailable"));
+
+        let output = dense_ffn_module_output(&invocation, None);
+        assert_eq!(output.evidence.module_id, invocation.contract.module_id);
+        assert_eq!(
+            output.evidence.selected_backend,
+            DenseFfnBackend::GpuProduction
+        );
+        assert_eq!(
+            output.evidence.fallback_reason,
+            Some("npu_backend_unavailable")
+        );
+        assert!(output.mutates_residual);
     }
 }

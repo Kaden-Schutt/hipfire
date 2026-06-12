@@ -1597,10 +1597,8 @@ fn weight_gemv_swiglu_residual_bf16_probe(
                 FfnBf16Mode::Cpu => ffn_bf16::DenseFfnBackendPreference::CpuOracle,
                 FfnBf16Mode::Off | FfnBf16Mode::Xdna1 => unreachable!(),
             };
-            let contract =
-                ffn_bf16::dense_ffn_swiglu_down_contract(layer_idx, shadow, preferred_backend);
-            let (selected_backend, fallback_reason) =
-                ffn_bf16::dense_ffn_backend_decision(preferred_backend, false);
+            let invocation =
+                ffn_bf16::dense_ffn_module_invocation(layer_idx, shadow, preferred_backend, false);
             let t0 = std::time::Instant::now();
             let residual_pre = gpu.download_f32(x)?;
             let gate_cpu = gpu.download_f32(gate)?;
@@ -1616,19 +1614,14 @@ fn weight_gemv_swiglu_residual_bf16_probe(
                     weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x)?;
                     let gpu_out = gpu.download_f32(x)?;
                     let stats = ffn_bf16::diff_stats(&gpu_out, &cpu_out);
-                    let evidence = ffn_bf16::dense_ffn_module_evidence(
-                        &contract,
-                        selected_backend,
-                        Some(stats),
-                        fallback_reason,
-                    );
+                    let output = ffn_bf16::dense_ffn_module_output(&invocation, Some(stats));
                     eprintln!(
                         "[qwen35 ffn bf16] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} n={} max_abs={:.6e} mean_abs={:.6e} rms={:.6e} nan={} inf={}",
-                        evidence.module_id,
-                        contract.preferred_backend.as_str(),
-                        evidence.selected_backend.as_str(),
-                        evidence.oracle_backend.as_str(),
-                        evidence.fallback_reason.unwrap_or("none"),
+                        output.evidence.module_id,
+                        invocation.contract.preferred_backend.as_str(),
+                        output.evidence.selected_backend.as_str(),
+                        output.evidence.oracle_backend.as_str(),
+                        output.evidence.fallback_reason.unwrap_or("none"),
                         stats.n,
                         stats.max_abs,
                         stats.mean_abs,
@@ -1648,20 +1641,15 @@ fn weight_gemv_swiglu_residual_bf16_probe(
                         std::slice::from_raw_parts(cpu_out.as_ptr().cast::<u8>(), cpu_out.len() * 4)
                     };
                     gpu.hip.memcpy_htod(&x.buf, bytes)?;
-                    let evidence = ffn_bf16::dense_ffn_module_evidence(
-                        &contract,
-                        selected_backend,
-                        None,
-                        fallback_reason,
-                    );
+                    let output = ffn_bf16::dense_ffn_module_output(&invocation, None);
                     if ffn_bf16::config().trace {
                         eprintln!(
                             "[qwen35 ffn bf16] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} download_ms={download_ms:.3} cpu_ms={cpu_ms:.3}",
-                            evidence.module_id,
-                            contract.preferred_backend.as_str(),
-                            evidence.selected_backend.as_str(),
-                            evidence.oracle_backend.as_str(),
-                            evidence.fallback_reason.unwrap_or("none"),
+                            output.evidence.module_id,
+                            invocation.contract.preferred_backend.as_str(),
+                            output.evidence.selected_backend.as_str(),
+                            output.evidence.oracle_backend.as_str(),
+                            output.evidence.fallback_reason.unwrap_or("none"),
                         );
                     }
                     Ok(())
