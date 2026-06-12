@@ -2114,19 +2114,29 @@ mod generate_batch_prefill_tests {
             state_page_descriptors: vec![
                 SequenceStatePageDescriptor {
                     session_id: "checkpoint-a".to_string(),
-                    state_kind: "attention_kv".to_string(),
+                    handle: SequenceStateHandle {
+                        id: "checkpoint-a".to_string(),
+                        kind: "qwen35_session".to_string(),
+                    },
+                    kind: SequenceStatePageKind::Kv,
                     label: "qwen35.kv_cache".to_string(),
                     logical_position: 16,
                     resident_bytes: 128,
+                    shape: vec![2, 16, 4, 32],
                     placement: "hip:arch5:device0".to_string(),
                     role: "resident".to_string(),
                 },
                 SequenceStatePageDescriptor {
                     session_id: "checkpoint-a".to_string(),
-                    state_kind: "metadata".to_string(),
+                    handle: SequenceStateHandle {
+                        id: "checkpoint-a".to_string(),
+                        kind: "qwen35_session".to_string(),
+                    },
+                    kind: SequenceStatePageKind::BackendPrivate,
                     label: "qwen35.prefix_metadata".to_string(),
                     logical_position: 16,
                     resident_bytes: 32,
+                    shape: vec![1],
                     placement: "host".to_string(),
                     role: "resident".to_string(),
                 },
@@ -2158,6 +2168,22 @@ mod generate_batch_prefill_tests {
         assert_eq!(
             json["state_page_descriptors"][0]["state_kind"],
             "attention_kv"
+        );
+        assert_eq!(
+            json["state_page_descriptors"][0]["page_kind"],
+            "attention_kv"
+        );
+        assert_eq!(
+            json["state_page_descriptors"][0]["handle"]["id"],
+            "checkpoint-a"
+        );
+        assert_eq!(
+            json["state_page_descriptors"][0]["shape"],
+            serde_json::json!([2, 16, 4, 32])
+        );
+        assert_eq!(
+            json["state_page_descriptors"][1]["state_kind"],
+            "backend_private"
         );
         assert_eq!(json["state_page_descriptors"][1]["placement"], "host");
     }
@@ -3319,12 +3345,39 @@ struct ModelWorkerRuntimeView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct SequenceStateHandle {
+    id: String,
+    kind: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SequenceStatePageKind {
+    Kv,
+    DeltaNet,
+    Logits,
+    BackendPrivate,
+}
+
+impl SequenceStatePageKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Kv => "attention_kv",
+            Self::DeltaNet => "deltanet_recurrent",
+            Self::Logits => "logits",
+            Self::BackendPrivate => "backend_private",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SequenceStatePageDescriptor {
     session_id: String,
-    state_kind: String,
+    handle: SequenceStateHandle,
+    kind: SequenceStatePageKind,
     label: String,
     logical_position: usize,
     resident_bytes: usize,
+    shape: Vec<usize>,
     placement: String,
     role: String,
 }
@@ -3646,10 +3699,20 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             .sum::<usize>();
         descriptors.push(SequenceStatePageDescriptor {
             session_id: session_id.to_string(),
-            state_kind: "attention_kv".to_string(),
+            handle: SequenceStateHandle {
+                id: session_id.to_string(),
+                kind: "qwen35_session".to_string(),
+            },
+            kind: SequenceStatePageKind::Kv,
             label: "qwen35.kv_cache".to_string(),
             logical_position,
             resident_bytes: kv_bytes,
+            shape: vec![
+                session.kv_cache.k_gpu.len(),
+                session.kv_cache.physical_cap,
+                session.kv_cache.n_kv_heads,
+                session.kv_cache.head_dim,
+            ],
             placement: placement.clone(),
             role: role.to_string(),
         });
@@ -3663,25 +3726,43 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             .sum::<usize>();
         descriptors.push(SequenceStatePageDescriptor {
             session_id: session_id.to_string(),
-            state_kind: "deltanet_recurrent".to_string(),
+            handle: SequenceStateHandle {
+                id: session_id.to_string(),
+                kind: "qwen35_session".to_string(),
+            },
+            kind: SequenceStatePageKind::DeltaNet,
             label: "qwen35.deltanet_state".to_string(),
             logical_position,
             resident_bytes: dn_bytes,
+            shape: vec![
+                session.dn_state.s_matrices.len(),
+                session.dn_state.s_scales.len(),
+                session.dn_state.conv_states.len(),
+            ],
             placement: placement.clone(),
             role: role.to_string(),
         });
         descriptors.push(SequenceStatePageDescriptor {
             session_id: session_id.to_string(),
-            state_kind: "logits".to_string(),
+            handle: SequenceStateHandle {
+                id: session_id.to_string(),
+                kind: "qwen35_session".to_string(),
+            },
+            kind: SequenceStatePageKind::Logits,
             label: "qwen35.logits_snapshot".to_string(),
             logical_position,
             resident_bytes: session.logits.buf.size(),
+            shape: session.logits.shape.clone(),
             placement: placement.clone(),
             role: role.to_string(),
         });
         descriptors.push(SequenceStatePageDescriptor {
             session_id: session_id.to_string(),
-            state_kind: "metadata".to_string(),
+            handle: SequenceStateHandle {
+                id: session_id.to_string(),
+                kind: "qwen35_session".to_string(),
+            },
+            kind: SequenceStatePageKind::BackendPrivate,
             label: "qwen35.prefix_metadata".to_string(),
             logical_position,
             resident_bytes: session
@@ -3689,6 +3770,7 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
                 .as_ref()
                 .map(|hash| hash.value.len() + hash.algorithm.len() + std::mem::size_of::<usize>())
                 .unwrap_or(0),
+            shape: vec![usize::from(session.prefix_hash.is_some())],
             placement: "host".to_string(),
             role: role.to_string(),
         });
@@ -3702,7 +3784,11 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             let logical_position = m.seq_pos + compact_offset;
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
-                state_kind: "attention_kv".to_string(),
+                handle: SequenceStateHandle {
+                    id: active_id.to_string(),
+                    kind: "qwen35_session".to_string(),
+                },
+                kind: SequenceStatePageKind::Kv,
                 label: "qwen35.kv_cache.active".to_string(),
                 logical_position,
                 resident_bytes: m
@@ -3718,12 +3804,21 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
                             .sum::<usize>()
                     })
                     .unwrap_or(0),
+                shape: m
+                    .kv_cache
+                    .as_ref()
+                    .map(|kv| vec![kv.k_gpu.len(), kv.physical_cap, kv.n_kv_heads, kv.head_dim])
+                    .unwrap_or_default(),
                 placement: placement.clone(),
                 role: "active".to_string(),
             });
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
-                state_kind: "deltanet_recurrent".to_string(),
+                handle: SequenceStateHandle {
+                    id: active_id.to_string(),
+                    kind: "qwen35_session".to_string(),
+                },
+                kind: SequenceStatePageKind::DeltaNet,
                 label: "qwen35.deltanet_state.active".to_string(),
                 logical_position,
                 resident_bytes: m
@@ -3738,12 +3833,21 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
                             .sum::<usize>()
                     })
                     .unwrap_or(0),
+                shape: m
+                    .dn_state
+                    .as_ref()
+                    .map(|dn| vec![dn.s_matrices.len(), dn.s_scales.len(), dn.conv_states.len()])
+                    .unwrap_or_default(),
                 placement: placement.clone(),
                 role: "active".to_string(),
             });
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
-                state_kind: "logits".to_string(),
+                handle: SequenceStateHandle {
+                    id: active_id.to_string(),
+                    kind: "qwen35_session".to_string(),
+                },
+                kind: SequenceStatePageKind::Logits,
                 label: "qwen35.logits_snapshot.active".to_string(),
                 logical_position,
                 resident_bytes: m
@@ -3751,15 +3855,25 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
                     .as_ref()
                     .map(|scratch| scratch.logits.buf.size())
                     .unwrap_or(0),
+                shape: m
+                    .q35_scratch
+                    .as_ref()
+                    .map(|scratch| scratch.logits.shape.clone())
+                    .unwrap_or_default(),
                 placement,
                 role: "active".to_string(),
             });
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
-                state_kind: "metadata".to_string(),
+                handle: SequenceStateHandle {
+                    id: active_id.to_string(),
+                    kind: "qwen35_session".to_string(),
+                },
+                kind: SequenceStatePageKind::BackendPrivate,
                 label: "qwen35.prefix_metadata.active".to_string(),
                 logical_position,
                 resident_bytes: 0,
+                shape: Vec::new(),
                 placement: "host".to_string(),
                 role: "active".to_string(),
             });
@@ -4036,10 +4150,16 @@ fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_json
         .map(|descriptor| {
             serde_json::json!({
                 "session_id": &descriptor.session_id,
-                "state_kind": &descriptor.state_kind,
+                "handle": {
+                    "id": &descriptor.handle.id,
+                    "kind": &descriptor.handle.kind,
+                },
+                "state_kind": descriptor.kind.as_str(),
+                "page_kind": descriptor.kind.as_str(),
                 "label": &descriptor.label,
                 "logical_position": descriptor.logical_position,
                 "resident_bytes": descriptor.resident_bytes,
+                "shape": &descriptor.shape,
                 "placement": &descriptor.placement,
                 "role": &descriptor.role,
             })

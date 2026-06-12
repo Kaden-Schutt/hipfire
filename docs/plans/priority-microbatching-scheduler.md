@@ -222,9 +222,11 @@ The daemon now routes top-level Qwen35 attach, fork, activate, reset, release,
 resident-count, and logical-position operations through `SequenceStateArenaBackend`
 methods, and reports descriptor counts/bytes for the wrapped Qwen35
 KV/DeltaNet/logits state in `model_worker` responses and `/health.runtime_workers`.
-This does not create allocator-owned generic state pages yet; it makes the
-current Qwen35-owned state map observable and checkpointable through one
-operation surface so later eviction policy and non-Qwen35 backends can share it.
+Descriptors now carry typed page kinds, shape metadata, and a sequence-state
+handle identity for active sessions and checkpoints. This does not create
+allocator-owned generic state pages yet; it makes the current Qwen35-owned state
+map observable and checkpointable through one operation surface so later
+eviction policy and non-Qwen35 backends can share it.
 
 This is deliberately narrower than disk spill. `HIPFIRE_SCHED_STATE_CACHE_DISK`
 is reserved for future checkpoint serialization and rehydrate; it must not be
