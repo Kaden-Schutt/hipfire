@@ -823,6 +823,10 @@ pub struct DeltaNetSnapshot {
     s_matrix_bufs: Vec<DeviceBuffer>,
     s_scale_bufs: Vec<DeviceBuffer>,
     conv_state_bufs: Vec<DeviceBuffer>,
+    /// Error-feedback residual backup â f16, one buf per LA layer.
+    /// Empty when EF is off (`state.s_ef_residual` is empty), fine to
+    /// skip in save/restore with an empty zip.
+    s_ef_residual_bufs: Vec<DeviceBuffer>,
 }
 
 impl DeltaNetSnapshot {
@@ -840,10 +844,15 @@ impl DeltaNetSnapshot {
         for t in &state.conv_states {
             conv_state_bufs.push(gpu.hip.malloc(t.buf.size())?);
         }
+        let mut s_ef_residual_bufs = Vec::with_capacity(state.s_ef_residual.len());
+        for t in &state.s_ef_residual {
+            s_ef_residual_bufs.push(gpu.hip.malloc(t.buf.size())?);
+        }
         Ok(Self {
             s_matrix_bufs,
             s_scale_bufs,
             conv_state_bufs,
+            s_ef_residual_bufs,
         })
     }
 
@@ -856,6 +865,9 @@ impl DeltaNetSnapshot {
             gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
         }
         for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+        }
+        for (dst, src) in self.s_ef_residual_bufs.iter().zip(state.s_ef_residual.iter()) {
             gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
         }
         Ok(())
@@ -883,6 +895,10 @@ impl DeltaNetSnapshot {
             gpu.hip
                 .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
         }
+        for (dst, src) in self.s_ef_residual_bufs.iter().zip(state.s_ef_residual.iter()) {
+            gpu.hip
+                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
+        }
         Ok(())
     }
 
@@ -895,6 +911,9 @@ impl DeltaNetSnapshot {
             gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
         }
         for (src, dst) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+        }
+        for (src, dst) in self.s_ef_residual_bufs.iter().zip(state.s_ef_residual.iter()) {
             gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
         }
         Ok(())
@@ -913,6 +932,9 @@ impl DeltaNetSnapshot {
             let _ = gpu.hip.free(b);
         }
         for b in self.conv_state_bufs {
+            let _ = gpu.hip.free(b);
+        }
+        for b in self.s_ef_residual_bufs {
             let _ = gpu.hip.free(b);
         }
     }

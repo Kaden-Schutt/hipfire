@@ -33,3 +33,8 @@ required-features = ["deltanet"]
 name = "mtp_head_smoke"
 path = "examples/mtp_head_smoke.rs"
 required-features = ["deltanet"]
+
+[[example]]
+name = "dn_rewind_parity"
+path = "examples/dn_rewind_parity.rs"
+required-features = ["deltanet"]
