@@ -932,6 +932,30 @@ fn validate_qwen35_fused_dense_decode_session_signatures(
     )
 }
 
+fn validate_qwen35_grouped_moe_decode_session_signatures(
+    config: &qwen35::Qwen35Config,
+    signatures: &[qwen35::DensePrefillSessionBatchStateSignature],
+    session_count: usize,
+    arch: &str,
+) -> Result<(), String> {
+    let execution_plan = qwen35::DensePrefillSessionBatchExecutionPlan {
+        rounds: Vec::new(),
+        state_routes: Vec::new(),
+        total_rows: session_count,
+        max_rows_per_round: session_count,
+        multi_state_rounds: 1,
+        multi_state_prefix_rounds: 1,
+        multi_state_prefix_rows: session_count,
+        singleton_tail: None,
+    };
+    qwen35::validate_grouped_moe_prefill_session_batch_q8_state_contract(
+        config,
+        signatures,
+        &execution_plan,
+        arch,
+    )
+}
+
 fn validate_qwen35_fused_dense_decode_model_capability(
     m: &LoadedModel,
     session_count: usize,
@@ -985,6 +1009,7 @@ fn validate_qwen35_fused_dense_decode_model_capability(
 fn validate_qwen35_grouped_moe_decode_model_capability(
     m: &LoadedModel,
     session_count: usize,
+    arch: &str,
 ) -> Result<(), String> {
     if m.arch_id != 6 {
         return Err(format!(
@@ -1005,6 +1030,22 @@ fn validate_qwen35_grouped_moe_decode_model_capability(
     if m.q35_scratch.is_none() {
         return Err("qwen35 grouped-MoE decode requires single-GPU qwen35 scratch".to_string());
     }
+    let signatures = vec![
+        qwen35::DensePrefillSessionBatchStateSignature {
+            kv_physical_cap: 128,
+            kv_compact_offset: 0,
+            kv_quantized: true,
+            kv_quant_q8: true,
+            kv_quant_asym2: false,
+            kv_quant_asym3: false,
+            kv_quant_asym4: false,
+            kv_quant_fwht: false,
+            dn_quant: qwen35::StateQuant::Q8,
+        };
+        session_count
+    ];
+    validate_qwen35_grouped_moe_decode_session_signatures(config, &signatures, session_count, arch)
+        .map_err(|e| format!("qwen35 grouped-MoE decode unsupported model contract: {e}"))?;
     Ok(())
 }
 
@@ -1631,6 +1672,18 @@ mod generate_batch_prefill_tests {
         }
     }
 
+    fn test_grouped_moe_qwen35_config() -> qwen35::Qwen35Config {
+        qwen35::Qwen35Config {
+            num_experts: 4,
+            num_experts_per_tok: 8,
+            moe_intermediate_size: 16,
+            shared_expert_intermediate_size: 16,
+            has_shared_expert: true,
+            norm_topk_prob: true,
+            ..test_dense_qwen35_config()
+        }
+    }
+
     fn fp32_decode_state_signature() -> qwen35::DensePrefillSessionBatchStateSignature {
         qwen35::DensePrefillSessionBatchStateSignature {
             kv_physical_cap: 128,
@@ -1642,6 +1695,15 @@ mod generate_batch_prefill_tests {
             kv_quant_asym4: false,
             kv_quant_fwht: false,
             dn_quant: qwen35::StateQuant::FP32,
+        }
+    }
+
+    fn q8_decode_state_signature() -> qwen35::DensePrefillSessionBatchStateSignature {
+        qwen35::DensePrefillSessionBatchStateSignature {
+            kv_quantized: true,
+            kv_quant_q8: true,
+            dn_quant: qwen35::StateQuant::Q8,
+            ..fp32_decode_state_signature()
         }
     }
 
@@ -2469,6 +2531,10 @@ mod generate_batch_prefill_tests {
             Qwen35DecodeBatchBackend::SerialReference
         );
         assert_eq!(
+            select_qwen35_decode_batch_backend("auto", 6, 8).unwrap(),
+            Qwen35DecodeBatchBackend::SerialReference
+        );
+        assert_eq!(
             select_qwen35_decode_batch_backend("fused", 5, 2).unwrap(),
             Qwen35DecodeBatchBackend::FusedDenseLayerChunked
         );
@@ -2482,6 +2548,16 @@ mod generate_batch_prefill_tests {
             select_qwen35_decode_batch_backend("fused_grouped_moe", 6, 2).unwrap(),
             Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked
         );
+        for batch_size in [2, 4, 8] {
+            assert_eq!(
+                select_qwen35_decode_batch_backend("fused_grouped_moe", 6, batch_size).unwrap(),
+                Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked,
+                "explicit grouped-MoE decode should admit B={batch_size}"
+            );
+        }
+        let singleton_err =
+            select_qwen35_decode_batch_backend("fused_grouped_moe", 6, 1).unwrap_err();
+        assert!(singleton_err.contains("at least two sessions"));
         let grouped_dense_err =
             select_qwen35_decode_batch_backend("fused_grouped_moe", 5, 2).unwrap_err();
         assert!(grouped_dense_err.contains("not Qwen35 grouped-MoE"));
@@ -2540,7 +2616,7 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
-    fn native_dense_decode_chunk_ranges_support_bounded_chunks() {
+    fn native_decode_chunk_ranges_support_bounded_chunks() {
         assert_eq!(
             qwen35_decode_native_chunk_ranges(4, 1).unwrap(),
             vec![(0, 1), (1, 2), (2, 3), (3, 4)]
@@ -2557,6 +2633,45 @@ mod generate_batch_prefill_tests {
             qwen35_decode_native_chunk_ranges(5, 4).unwrap(),
             vec![(0, 4), (4, 5)]
         );
+        assert_eq!(
+            qwen35_decode_native_chunk_ranges(4, 2).unwrap(),
+            vec![(0, 2), (2, 4)]
+        );
+        assert_eq!(
+            qwen35_decode_native_chunk_ranges(8, 2).unwrap(),
+            vec![(0, 2), (2, 4), (4, 6), (6, 8)]
+        );
+    }
+
+    #[test]
+    fn grouped_moe_decode_contract_admits_q8_state_batches_and_rejects_fallback_cases() {
+        let config = test_grouped_moe_qwen35_config();
+        for batch_size in [2, 4, 8] {
+            let signatures = vec![q8_decode_state_signature(); batch_size];
+            validate_qwen35_grouped_moe_decode_session_signatures(
+                &config,
+                &signatures,
+                batch_size,
+                "gfx1151",
+            )
+            .unwrap_or_else(|err| panic!("B={batch_size} should admit grouped-MoE decode: {err}"));
+        }
+
+        let fp32 = vec![fp32_decode_state_signature(); 2];
+        let err =
+            validate_qwen35_grouped_moe_decode_session_signatures(&config, &fp32, 2, "gfx1151")
+                .unwrap_err();
+        assert!(err.contains("must use Q8 KV state"));
+
+        let dense = test_dense_qwen35_config();
+        let q8 = vec![q8_decode_state_signature(); 2];
+        let err = validate_qwen35_grouped_moe_decode_session_signatures(&dense, &q8, 2, "gfx1151")
+            .unwrap_err();
+        assert!(err.contains("requires Qwen35 MoE/A3B weights"));
+
+        let err = validate_qwen35_grouped_moe_decode_session_signatures(&config, &q8, 2, "gfx906")
+            .unwrap_err();
+        assert!(err.contains("requires an RDNA grouped-MoE target"));
     }
 
     #[test]
@@ -5984,7 +6099,11 @@ fn run_generate_batch_decode_step_qwen35(
     if backend == Qwen35DecodeBatchBackend::FusedDenseLayerChunked {
         validate_qwen35_fused_dense_decode_model_capability(m, envelope.session_count)?;
     } else if backend == Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked {
-        validate_qwen35_grouped_moe_decode_model_capability(m, envelope.session_count)?;
+        validate_qwen35_grouped_moe_decode_model_capability(
+            m,
+            envelope.session_count,
+            gpu.arch.as_str(),
+        )?;
     }
     let im_end = {
         let tokenizer = m
@@ -6235,7 +6354,7 @@ fn qwen35_decode_step_fused_dense_layer_chunked(
 fn qwen35_decode_step_fused_grouped_moe_layer_chunked(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
+    _stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchDecodeEnvelope,
     im_end_token: Option<u32>,
 ) -> Result<Qwen35DecodeBatchStepResult, String> {
@@ -6243,37 +6362,7 @@ fn qwen35_decode_step_fused_grouped_moe_layer_chunked(
     validate_qwen35_decode_resident_sessions(m, envelope, "grouped-MoE chunked")?;
 
     let chunk_size = qwen35_decode_batch_max_chunk_size(envelope.session_count);
-    qwen35_decode_step_chunked_serial_oracle(m, gpu, stdout, envelope, im_end_token, chunk_size)
-}
-
-fn qwen35_decode_step_chunked_serial_oracle(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    envelope: &GenerateBatchDecodeEnvelope,
-    im_end_token: Option<u32>,
-    chunk_size: usize,
-) -> Result<Qwen35DecodeBatchStepResult, String> {
-    let mut session_lines = Vec::with_capacity(envelope.sessions.len());
-    let mut chunk_count = 0usize;
-    for chunk in envelope.sessions.chunks(chunk_size) {
-        chunk_count += 1;
-        let chunk_envelope = GenerateBatchDecodeEnvelope {
-            id: envelope.id.clone(),
-            batch_id: envelope.batch_id.clone(),
-            session_count: chunk.len(),
-            sessions: chunk.to_vec(),
-        };
-        let mut chunk_lines =
-            qwen35_decode_step_serial_reference(m, gpu, stdout, &chunk_envelope, im_end_token)?;
-        session_lines.append(&mut chunk_lines);
-    }
-
-    Ok(Qwen35DecodeBatchStepResult {
-        session_lines,
-        chunk_count,
-        chunk_size,
-    })
+    qwen35_decode_step_fused_grouped_moe_native_chunks(m, gpu, envelope, im_end_token, chunk_size)
 }
 
 fn qwen35_decode_step_fused_dense_native_chunks(
@@ -6307,6 +6396,241 @@ fn qwen35_decode_step_fused_dense_native_chunks(
         chunk_count: chunks.len(),
         chunk_size: effective_chunk_size.min(envelope.session_count),
     })
+}
+
+fn qwen35_decode_step_fused_grouped_moe_native_chunks(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    envelope: &GenerateBatchDecodeEnvelope,
+    im_end_token: Option<u32>,
+    chunk_size: usize,
+) -> Result<Qwen35DecodeBatchStepResult, String> {
+    let chunks = qwen35_decode_native_chunk_ranges(envelope.session_count, chunk_size)?;
+    let mut session_lines = Vec::with_capacity(envelope.sessions.len());
+
+    for (start, end) in &chunks {
+        let chunk = &envelope.sessions[*start..*end];
+        let mut chunk_lines = if chunk.len() == 1 {
+            qwen35_decode_step_fused_dense_native_singleton(
+                m,
+                gpu,
+                envelope,
+                &chunk[0],
+                im_end_token,
+            )?
+        } else {
+            qwen35_decode_step_fused_grouped_moe_native_chunk(
+                m,
+                gpu,
+                envelope,
+                chunk,
+                im_end_token,
+            )?
+        };
+        session_lines.append(&mut chunk_lines);
+    }
+
+    Ok(Qwen35DecodeBatchStepResult {
+        session_lines,
+        chunk_count: chunks.len(),
+        chunk_size: chunk_size.min(envelope.session_count),
+    })
+}
+
+fn qwen35_decode_step_fused_grouped_moe_native_chunk(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    envelope: &GenerateBatchDecodeEnvelope,
+    chunk: &[GenerateBatchDecodeSession],
+    im_end_token: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    qwen35_ensure_decode_prefill_batch_scratch(m, gpu, chunk.len())?;
+
+    let mut states: Vec<(GenerateBatchDecodeSession, Qwen35RequestSessionState)> =
+        Vec::with_capacity(chunk.len());
+    for session in chunk {
+        let state = m.q35_sessions.remove(&session.session_id).ok_or_else(|| {
+            format!(
+                "decode session {} is not resident for fused grouped-MoE native decode",
+                session.session_id
+            )
+        })?;
+        states.push((session.clone(), state));
+    }
+
+    let result = (|| -> Result<Vec<serde_json::Value>, String> {
+        let mut outcomes = Vec::with_capacity(states.len());
+        for (session, state) in &states {
+            let logical_position = state.seq_pos + state.kv_cache.compact_offset;
+            if logical_position != session.logical_position {
+                return Err(format!(
+                    "decode session {} logical_position mismatch: expected={} resident={}",
+                    session.session_id, session.logical_position, logical_position
+                ));
+            }
+            outcomes.push(qwen35_decode_token_outcome(
+                m,
+                gpu,
+                &state.logits,
+                session.max_tokens_remaining,
+                im_end_token,
+            )?);
+        }
+        let mut oracle_states = if qwen35_decode_internal_parity_enabled() {
+            let mut cloned = Vec::with_capacity(states.len());
+            for (session, state) in &states {
+                cloned.push((
+                    session.clone(),
+                    Qwen35RequestSessionState::fork_from(gpu, state)?,
+                ));
+            }
+            Some(cloned)
+        } else {
+            None
+        };
+
+        for ((_, state), outcome) in states.iter_mut().zip(outcomes.iter()) {
+            state.conversation_tokens.push(outcome.token);
+        }
+
+        let token_rows: Vec<[u32; 1]> = outcomes.iter().map(|outcome| [outcome.token]).collect();
+        let weights = m
+            .q35_weights
+            .as_ref()
+            .ok_or_else(|| "qwen35 weights missing".to_string())?;
+        let config = m
+            .q35_config
+            .as_ref()
+            .ok_or_else(|| "qwen35 config missing".to_string())?;
+        let scratch = m
+            .q35_scratch
+            .as_ref()
+            .ok_or_else(|| "qwen35 scratch missing".to_string())?;
+        let pbs = scratch
+            .prefill_batch
+            .as_ref()
+            .ok_or_else(|| "qwen35 grouped-MoE decode native batch scratch missing".to_string())?;
+        let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> = states
+            .iter_mut()
+            .zip(token_rows.iter())
+            .map(|((_, state), tokens)| qwen35::DensePrefillSessionBatchRow {
+                tokens,
+                start_pos: state.seq_pos,
+                kv_cache: &mut state.kv_cache,
+                dn_state: &mut state.dn_state,
+                logits: &state.logits,
+            })
+            .collect();
+        qwen35::forward_prefill_grouped_moe_session_batch(
+            gpu, weights, config, &mut rows, scratch, pbs,
+        )
+        .map_err(|e| format!("qwen35 fused grouped-MoE native decode advance: {e:?}"))?;
+        drop(rows);
+
+        let mut lines = Vec::with_capacity(states.len());
+        for ((session, state), outcome) in states.iter_mut().zip(outcomes.iter()) {
+            state.seq_pos += 1;
+            let new_logical_position = state.seq_pos + state.kv_cache.compact_offset;
+            lines.push(serde_json::json!({
+                "type": "generate_batch_decode_step_session_done",
+                "id": envelope.id,
+                "batch_id": envelope.batch_id,
+                "session_id": session.id,
+                "runtime_state_handle": session.session_id,
+                "token": outcome.token,
+                "text": outcome.text,
+                "stop": outcome.stop,
+                "logical_position": new_logical_position,
+            }));
+        }
+        if let Some(oracle_states) = oracle_states.as_mut() {
+            let config = m
+                .q35_config
+                .as_ref()
+                .ok_or_else(|| "qwen35 config missing".to_string())?;
+            let weights = m
+                .q35_weights
+                .as_ref()
+                .ok_or_else(|| "qwen35 weights missing".to_string())?;
+            let scratch = m
+                .q35_scratch
+                .as_ref()
+                .ok_or_else(|| "qwen35 scratch missing".to_string())?;
+            for (((session, fused_state), outcome), (_, oracle_state)) in states
+                .iter()
+                .zip(outcomes.iter())
+                .zip(oracle_states.iter_mut())
+            {
+                let oracle_outcome = qwen35_decode_token_outcome(
+                    m,
+                    gpu,
+                    &oracle_state.logits,
+                    session.max_tokens_remaining,
+                    im_end_token,
+                )?;
+                if oracle_outcome.token != outcome.token {
+                    return Err(format!(
+                        "qwen35 fused grouped-MoE native decode parity mismatch before advance for {}: fused_token={} serial_token={}",
+                        session.session_id, outcome.token, oracle_outcome.token
+                    ));
+                }
+                oracle_state.conversation_tokens.push(oracle_outcome.token);
+                qwen35::forward_scratch(
+                    gpu,
+                    weights,
+                    config,
+                    oracle_outcome.token,
+                    oracle_state.seq_pos,
+                    &mut oracle_state.kv_cache,
+                    &mut oracle_state.dn_state,
+                    scratch,
+                )
+                .map_err(|e| {
+                    format!("qwen35 grouped-MoE decode internal serial parity advance: {e:?}")
+                })?;
+                gpu.memcpy_dtod_auto(
+                    &oracle_state.logits.buf,
+                    &scratch.logits.buf,
+                    scratch.logits.buf.size(),
+                )
+                .map_err(|e| {
+                    format!("save qwen35 grouped-MoE decode internal parity logits: {e:?}")
+                })?;
+                oracle_state.seq_pos += 1;
+                let fused_next = gpu
+                    .argmax_f32(&fused_state.logits, config.vocab_size)
+                    .map_err(|e| format!("qwen35 grouped-MoE fused parity fused argmax: {e:?}"))?;
+                let serial_next = gpu
+                    .argmax_f32(&oracle_state.logits, config.vocab_size)
+                    .map_err(|e| format!("qwen35 grouped-MoE fused parity serial argmax: {e:?}"))?;
+                if fused_next != serial_next {
+                    let fused_summary = qwen35_logits_debug_summary(
+                        gpu,
+                        &fused_state.logits,
+                        fused_next,
+                        serial_next,
+                    );
+                    let serial_summary = qwen35_logits_debug_summary(
+                        gpu,
+                        &oracle_state.logits,
+                        fused_next,
+                        serial_next,
+                    );
+                    return Err(format!(
+                        "qwen35 fused grouped-MoE native decode parity mismatch after advance for {}: fused_next={} serial_next={} fused_logits=({}) serial_logits=({})",
+                        session.session_id, fused_next, serial_next, fused_summary, serial_summary
+                    ));
+                }
+            }
+        }
+        Ok(lines)
+    })();
+
+    for (session, state) in states {
+        m.q35_sessions.insert(session.session_id, state);
+    }
+
+    result
 }
 
 fn qwen35_decode_native_chunk_ranges(

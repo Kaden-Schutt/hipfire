@@ -28,6 +28,7 @@ from typing import Any
 
 daemon, model, moe_model, unsupported_model, max_seq_s = sys.argv[1:]
 max_seq = int(max_seq_s)
+worker_id = "qwen35-smoke-worker"
 
 
 def start_daemon(env: dict[str, str] | None = None) -> subprocess.Popen[str]:
@@ -73,6 +74,7 @@ def load(proc: subprocess.Popen[str], model_path: str = model) -> None:
     send(proc, {
         "type": "load",
         "model": model_path,
+        "worker_key_id": worker_id,
         "params": {
             "max_seq": max_seq,
             "kv_mode": "q8",
@@ -91,7 +93,7 @@ def probe_generate_batch_prefill(proc: subprocess.Popen[str]) -> dict[str, Any]:
         "type": "generate_batch_prefill",
         "id": "prefill-batch-probe",
         "batch_id": "prefill-batch-probe",
-        "worker_key_id": "probe-worker",
+        "worker_key_id": worker_id,
         "sessions": [{
             "id": "probe-session",
             "suffix_tokens": [1],
@@ -127,7 +129,7 @@ def assert_prefill_probe(proc: subprocess.Popen[str], model_path: str, supported
 
 
 def reset(proc: subprocess.Popen[str]) -> None:
-    send(proc, {"type": "reset"})
+    send(proc, {"type": "reset", "worker_key_id": worker_id})
     while True:
         event = recv_json(proc)
         if event.get("type") == "reset":
@@ -147,7 +149,7 @@ def prefill_batch(
         "type": "generate_batch_prefill",
         "id": batch_id,
         "batch_id": batch_id,
-        "worker_key_id": "qwen35-smoke-worker",
+        "worker_key_id": worker_id,
         "sessions": sessions,
     })
     logical_positions: dict[str, int] = {}
@@ -199,6 +201,7 @@ def decode_one_token_after_prefill(
     send(proc, {
         "type": "generate",
         "id": f"{sid}-decode",
+        "worker_key_id": worker_id,
         "prompt": prompt_override if prompt_override is not None else session["prompt"],
         "session_id": sid,
         "prefill_already_done": True,
@@ -245,6 +248,7 @@ def generate_serial_tokens(
     send(proc, {
         "type": "generate",
         "id": "serial-reference",
+        "worker_key_id": worker_id,
         "prompt": prompt,
         "temperature": 0,
         "top_p": 1,
