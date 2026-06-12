@@ -58,7 +58,7 @@ Status legend:
 | Cancellation from queue | COMPLETE | Queue-level cancel implemented and tested. |
 | Deadline aging/starvation hardening | COMPLETE | `HIPFIRE_SCHED_DEADLINE_AGING_MS` lets aged work bypass an unready higher-priority bucket. |
 | Backpressure tests | COMPLETE | `HIPFIRE_SCHED_PREFILL_MAX_QUEUED` defaults to 256 and rejects new queue entries once the worker queue is full; resident session memory pressure can also reject before enqueue. |
-| Decode active set | IN PROGRESS | Worker-local active decode scheduler exists for non-streaming greedy Qwen35 V1; serial fallback, auto dense FP32-state native chunked, and explicit Qwen35-MoE chunked daemon step backends are wired. Dense native multi-row chunks are parity/stress-smoked; native grouped-MoE routed kernels and streaming-safe routing remain future work. |
+| Decode active set | IN PROGRESS | Worker-local active decode scheduler exists for non-streaming greedy Qwen35 V1; serial fallback, auto dense FP32-state native chunked, and explicit Qwen35-MoE chunked daemon step backends are wired. Dense native multi-row chunks are parity/stress-smoked; explicit native grouped-MoE chunks have serial-oracle parity coverage. Auto grouped-MoE promotion and streaming-safe routing remain future work. |
 | Verify job scheduling | NOT STARTED | Deferred until MTP/DFlash rollback parity exists. |
 
 ## Multi-Model Session-State Serving Breakdown

@@ -17,6 +17,9 @@
 
   - Add native grouped-MoE routed decode chunks under the existing Qwen35 decode-batch path. Keep serial_reference as oracle, keep auto conservative,
     and only promote grouped-MoE native decode after parity and latency gates pass.
+    Status: explicit Qwen35-MoE `fused_grouped_moe_layer_chunked` decode now advances multi-session chunks through the native grouped-MoE row worker.
+    `serial_reference` remains the oracle, internal parity can compare native and serial state, forced multi-chunk mode is covered, and `auto`
+    remains serial for grouped-MoE until latency evidence is strong enough to promote.
 
   - Add backend-neutral prefill checkpoint hooks so fused prefill can emit semantic-boundary checkpoints, not only final checkpoints. The hook should
     carry: session id, logical token position, boundary kind, prefix hash input, and state handle.
