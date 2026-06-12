@@ -198,7 +198,7 @@ def prefill_boundary_batch(
     sessions: list[dict[str, Any]],
     expect_backend: str,
     expect_plan: str = "fused_dense_qwen35_candidate",
-) -> dict[str, int]:
+) -> tuple[dict[str, int], str]:
     send(proc, {
         "type": "generate_batch_prefill",
         "id": batch_id,
@@ -207,6 +207,7 @@ def prefill_boundary_batch(
         "sessions": sessions,
     })
     prefix_checkpoint_counts: dict[str, int] = {}
+    first_checkpoint_handle: str | None = None
     started = False
     while True:
         event = recv_json(proc)
@@ -228,6 +229,11 @@ def prefill_boundary_batch(
             for checkpoint in prefix_checkpoints:
                 if not isinstance(checkpoint, dict) or checkpoint.get("checkpoint_runtime_state") != "attachable":
                     raise RuntimeError(f"{batch_id}: malformed prefix checkpoint for {sid}: {checkpoint}")
+                handle = checkpoint.get("checkpoint_id")
+                if not isinstance(handle, str) or not handle:
+                    raise RuntimeError(f"{batch_id}: malformed prefix checkpoint handle for {sid}: {checkpoint}")
+                if first_checkpoint_handle is None:
+                    first_checkpoint_handle = handle
             prefix_checkpoint_counts[sid] = len(prefix_checkpoints)
         elif typ == "generate_batch_prefill_done":
             if not started:
@@ -239,9 +245,32 @@ def prefill_boundary_batch(
             missing = {s["id"] for s in sessions} - set(prefix_checkpoint_counts)
             if missing:
                 raise RuntimeError(f"{batch_id}: missing boundary checkpoint event for {sorted(missing)}")
-            return prefix_checkpoint_counts
+            if first_checkpoint_handle is None:
+                raise RuntimeError(f"{batch_id}: no attachable checkpoint handle captured")
+            return prefix_checkpoint_counts, first_checkpoint_handle
         elif typ == "error":
             raise RuntimeError(f"{batch_id}: daemon error: {event.get('message')}")
+
+
+def release_sessions(proc: subprocess.Popen[str], handles: list[str], expect_released: int, label: str) -> None:
+    send(proc, {
+        "type": "release_sessions",
+        "id": f"{label}-release",
+        "worker_key_id": worker_id,
+        "sessions": handles,
+    })
+    while True:
+        event = recv_json(proc)
+        typ = event.get("type")
+        if typ == "release_sessions_done":
+            released = event.get("released")
+            if released != expect_released:
+                raise RuntimeError(
+                    f"{label}: expected release count {expect_released}, got {released}: {event}"
+                )
+            return
+        if typ == "error":
+            raise RuntimeError(f"{label}: release_sessions error: {event.get('message')}")
 
 
 def decode_one_token_after_prefill(
@@ -492,16 +521,19 @@ fused_proc = start_daemon({
 try:
     load(fused_proc)
     reset(fused_proc)
-    boundary_counts = prefill_boundary_batch(
+    boundary_counts, boundary_checkpoint_handle = prefill_boundary_batch(
         fused_proc,
         "fused-boundary-b2",
         boundary_prompt_sessions(2, "fused-boundary"),
         "fused_dense",
     )
+    release_sessions(fused_proc, [boundary_checkpoint_handle], 1, "fused-boundary-checkpoint")
+    release_sessions(fused_proc, [boundary_checkpoint_handle], 0, "fused-boundary-checkpoint-stale")
     print(
         "explicit fused boundary checkpoints: "
         f"sessions={len(boundary_counts)} "
-        f"checkpoints={sum(boundary_counts.values())} ok"
+        f"checkpoints={sum(boundary_counts.values())} "
+        f"released=1 stale_release=0 ok"
     )
     for batch_size in (2, 4, 8):
         label = f"fused-b{batch_size}"
