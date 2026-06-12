@@ -895,6 +895,30 @@ fn qwen35_decode_batch_requested_auto(requested: &str) -> bool {
     matches!(requested, "" | "auto")
 }
 
+fn validate_qwen35_decode_batch_runtime_surface(
+    arch_id: u32,
+    pp: usize,
+    dflash_loaded: bool,
+    eviction_active: bool,
+) -> Result<(), String> {
+    if !(arch_id == 5 || arch_id == 6) || pp != 1 {
+        return Err(format!(
+            "generate_batch_decode_step currently supports single-GPU qwen35/qwen35-moe only (arch_id={arch_id} pp={pp})"
+        ));
+    }
+    if dflash_loaded {
+        return Err(
+            "generate_batch_decode_step is not supported on DFlash-loaded models".to_string(),
+        );
+    }
+    if eviction_active {
+        return Err(
+            "generate_batch_decode_step is not supported with active eviction state".to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Qwen35DecodeBatchSchedulerMetadata {
     selected_backend: &'static str,
@@ -2803,6 +2827,33 @@ mod generate_batch_prefill_tests {
         let grouped_dense_err =
             select_qwen35_decode_batch_backend("fused_grouped_moe", 5, 2).unwrap_err();
         assert!(grouped_dense_err.contains("not Qwen35 grouped-MoE"));
+    }
+
+    #[test]
+    fn decode_batch_runtime_surface_rejects_spec_decode_and_eviction_state() {
+        validate_qwen35_decode_batch_runtime_surface(5, 1, false, false).unwrap();
+        validate_qwen35_decode_batch_runtime_surface(6, 1, false, false).unwrap();
+
+        let pp_err = validate_qwen35_decode_batch_runtime_surface(5, 2, false, false).unwrap_err();
+        assert!(pp_err.contains("single-GPU qwen35/qwen35-moe"));
+
+        let arch_err =
+            validate_qwen35_decode_batch_runtime_surface(9, 1, false, false).unwrap_err();
+        assert!(arch_err.contains("single-GPU qwen35/qwen35-moe"));
+
+        let dflash_err =
+            validate_qwen35_decode_batch_runtime_surface(5, 1, true, false).unwrap_err();
+        assert_eq!(
+            dflash_err,
+            "generate_batch_decode_step is not supported on DFlash-loaded models"
+        );
+
+        let eviction_err =
+            validate_qwen35_decode_batch_runtime_surface(5, 1, false, true).unwrap_err();
+        assert_eq!(
+            eviction_err,
+            "generate_batch_decode_step is not supported with active eviction state"
+        );
     }
 
     #[test]
@@ -6950,22 +7001,12 @@ fn run_generate_batch_decode_step_qwen35(
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchDecodeEnvelope,
 ) -> Result<(), String> {
-    if !(m.arch_id == 5 || m.arch_id == 6) || m.pp != 1 {
-        return Err(format!(
-            "generate_batch_decode_step currently supports single-GPU qwen35/qwen35-moe only (arch_id={} pp={})",
-            m.arch_id, m.pp
-        ));
-    }
-    if m.dflash.is_some() {
-        return Err(
-            "generate_batch_decode_step is not supported on DFlash-loaded models".to_string(),
-        );
-    }
-    if m.eviction.is_some() {
-        return Err(
-            "generate_batch_decode_step is not supported with active eviction state".to_string(),
-        );
-    }
+    validate_qwen35_decode_batch_runtime_surface(
+        m.arch_id,
+        m.pp,
+        m.dflash.is_some(),
+        m.eviction.is_some(),
+    )?;
     let requested_backend =
         std::env::var("HIPFIRE_QWEN35_DECODE_BATCH").unwrap_or_else(|_| "auto".to_string());
     let mut backend = select_qwen35_decode_batch_backend(
