@@ -895,6 +895,10 @@ fn qwen35_decode_batch_requested_auto(requested: &str) -> bool {
     matches!(requested, "" | "auto")
 }
 
+fn qwen35_grouped_moe_decode_auto_latency_gate_passed(session_count: usize) -> bool {
+    session_count >= 4
+}
+
 fn validate_qwen35_decode_batch_runtime_surface(
     arch_id: u32,
     pp: usize,
@@ -937,6 +941,11 @@ fn qwen35_decode_batch_scheduler_metadata(
 ) -> Qwen35DecodeBatchSchedulerMetadata {
     let fallback_reason = if qwen35_decode_batch_requested_auto(requested) {
         match (arch_id, backend) {
+            (6, Qwen35DecodeBatchBackend::SerialReference)
+                if !qwen35_grouped_moe_decode_auto_latency_gate_passed(batch_size) =>
+            {
+                "auto_grouped_moe_serial_small_batch_latency_gate"
+            }
             (6, Qwen35DecodeBatchBackend::SerialReference) => {
                 "auto_grouped_moe_serial_pending_latency_gate"
             }
@@ -2907,6 +2916,20 @@ mod generate_batch_prefill_tests {
 
     #[test]
     fn decode_batch_scheduler_metadata_reports_backend_state_and_fallback() {
+        let small_auto_grouped = qwen35_decode_batch_scheduler_metadata(
+            "auto",
+            6,
+            Qwen35DecodeBatchBackend::SerialReference,
+            2,
+            3,
+        );
+        assert_eq!(small_auto_grouped.selected_backend, "serial_reference");
+        assert_eq!(
+            small_auto_grouped.fallback_reason,
+            "auto_grouped_moe_serial_small_batch_latency_gate"
+        );
+        assert_eq!(small_auto_grouped.cached_prefix_tokens, 3);
+
         let auto_grouped = qwen35_decode_batch_scheduler_metadata(
             "auto",
             6,
@@ -2950,6 +2973,13 @@ mod generate_batch_prefill_tests {
             explicit_serial.fallback_reason,
             "requested_serial_reference"
         );
+    }
+
+    #[test]
+    fn grouped_moe_decode_auto_latency_gate_requires_b4_or_larger() {
+        assert!(!qwen35_grouped_moe_decode_auto_latency_gate_passed(2));
+        assert!(qwen35_grouped_moe_decode_auto_latency_gate_passed(4));
+        assert!(qwen35_grouped_moe_decode_auto_latency_gate_passed(8));
     }
 
     #[test]
@@ -7070,12 +7100,31 @@ fn run_generate_batch_decode_step_qwen35(
         qwen35_save_active_session(m, gpu)?;
     }
     if qwen35_decode_batch_requested_auto(requested_backend.as_str())
+        && m.arch_id == 6
+        && qwen35_grouped_moe_decode_auto_latency_gate_passed(envelope.session_count)
+    {
+        qwen35_save_active_session(m, gpu)?;
+    }
+    if qwen35_decode_batch_requested_auto(requested_backend.as_str())
         && m.arch_id == 5
         && envelope.session_count >= 2
         && validate_qwen35_fused_dense_decode_model_capability(m, envelope.session_count).is_ok()
         && validate_qwen35_fused_dense_decode_resident_sessions(m, envelope).is_ok()
     {
         backend = Qwen35DecodeBatchBackend::FusedDenseLayerChunked;
+    }
+    if qwen35_decode_batch_requested_auto(requested_backend.as_str())
+        && m.arch_id == 6
+        && qwen35_grouped_moe_decode_auto_latency_gate_passed(envelope.session_count)
+        && validate_qwen35_grouped_moe_decode_model_capability(
+            m,
+            envelope.session_count,
+            gpu.arch.as_str(),
+        )
+        .is_ok()
+        && validate_qwen35_decode_resident_sessions(m, envelope, "grouped-MoE auto").is_ok()
+    {
+        backend = Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked;
     }
     if backend == Qwen35DecodeBatchBackend::FusedDenseLayerChunked {
         validate_qwen35_fused_dense_decode_model_capability(m, envelope.session_count)?;

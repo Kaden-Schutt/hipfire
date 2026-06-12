@@ -2159,6 +2159,13 @@ pub const ENV_HIPFIRE_QWEN35_DECODE_BATCH_MAX: EnvVarDoc = EnvVarDoc {
     source: "/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:6061",
 };
 
+/// `HIPFIRE_DECODE_BATCH_GROUPED_PARITY_CHUNK_SIZE` — Smoke-only override for grouped-MoE decode parity matrix chunk size
+pub const ENV_HIPFIRE_DECODE_BATCH_GROUPED_PARITY_CHUNK_SIZE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DECODE_BATCH_GROUPED_PARITY_CHUNK_SIZE",
+    description: "Smoke-only override for grouped-MoE decode parity matrix chunk size",
+    source: "/home/sadara/.hipfire/src/tests/smoke-server-decode-batch.sh:17",
+};
+
 /// `HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY` — Interprets "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY" from environment to select behavior
 pub const ENV_HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY",
@@ -2861,6 +2868,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_QA_KV_MODES,
     ENV_HIPFIRE_QUANT_DIAG_PATH,
     ENV_HIPFIRE_QUANT_THREADS,
+    ENV_HIPFIRE_DECODE_BATCH_GROUPED_PARITY_CHUNK_SIZE,
     ENV_HIPFIRE_QWEN35_DECODE_BATCH,
     ENV_HIPFIRE_QWEN35_DECODE_BATCH_MAX,
     ENV_HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY,

@@ -57,6 +57,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_DEBUG_CORRUPT_PREFIX_HASH_ONCE` | Runtime variable controlling debug corrupt prefix hash once in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:2182` |
 | `HIPFIRE_DEBUG_PREFIX_BOUNDARIES` | Runtime variable controlling debug prefix boundaries in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:4837` |
 | `HIPFIRE_DEBUG_SHARED_PREFIX_FANOUT` | Runtime variable controlling debug shared prefix fanout in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:5386` |
+| `HIPFIRE_DECODE_BATCH_GROUPED_PARITY_CHUNK_SIZE` | Smoke-only override for grouped-MoE decode parity matrix chunk size | `/home/sadara/.hipfire/src/tests/smoke-server-decode-batch.sh:17` |
 | `HIPFIRE_DEEPSEEK4_ATTN` | main model's final_norm_and_head head-HC reduction. Without | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:68` |
 | `HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT` | DEBUG: in-kernel bisect (HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT=1) | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:5368` |
 | `HIPFIRE_DEEPSEEK4_ATTN_PER_POS` | DEBUG: HIPFIRE_DEEPSEEK4_ATTN_PER_POS=1 substitutes a per-position loop | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:5301` |

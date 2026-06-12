@@ -14,6 +14,8 @@ SERVER_SMOKE_LOCK_WAIT="${HIPFIRE_SERVER_SMOKE_LOCK_WAIT:-300}"
 # HIPFIRE_QWEN35_DECODE_BATCH=fused_grouped_moe to compare serial_reference
 # against native grouped-MoE decode at B=2/4/8. B=4 and B=8 force chunk size
 # 2 so the smoke covers multi-chunk native grouped-MoE advancement.
+# Set HIPFIRE_DECODE_BATCH_GROUPED_PARITY_CHUNK_SIZE to override the matrix
+# chunk size for latency experiments; the default stays 2 for coverage.
 
 exec 9>"$SERVER_SMOKE_LOCK"
 if ! flock -w "$SERVER_SMOKE_LOCK_WAIT" 9; then
@@ -328,10 +330,13 @@ if matrix_enabled:
             "HIPFIRE_DECODE_BATCH_GROUPED_PARITY_MATRIX requires "
             "HIPFIRE_QWEN35_DECODE_BATCH=fused_grouped_moe"
         )
+    matrix_chunk_size = int(os.environ.get("HIPFIRE_DECODE_BATCH_GROUPED_PARITY_CHUNK_SIZE", "2") or "2")
+    if matrix_chunk_size < 1:
+        raise RuntimeError("HIPFIRE_DECODE_BATCH_GROUPED_PARITY_CHUNK_SIZE must be >= 1")
     matrix = [
-        run_parity_pair(2, 2),
-        run_parity_pair(4, 2),
-        run_parity_pair(8, 2),
+        run_parity_pair(2, matrix_chunk_size),
+        run_parity_pair(4, matrix_chunk_size),
+        run_parity_pair(8, matrix_chunk_size),
     ]
     result = matrix[-1]
     print(
