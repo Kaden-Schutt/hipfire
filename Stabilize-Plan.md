@@ -22,9 +22,11 @@
     server parity/latency smokes pass for B=2/4/8 with a forced chunk cap. `auto` remains serial for grouped-MoE until broader latency evidence is
     strong enough to promote. The decode-batch smoke now has an opt-in grouped-MoE parity matrix mode covering B=2/4/8 with chunk size 2; B=4 and
     B=8 force multi-chunk native grouped-MoE decode while comparing responses against `serial_reference`.
-    Current smoke blocker: `tests/smoke-generate-batch-prefill.sh` cannot run against this host's local dense 0.8B MQ4 artifact
-    (`qwen3.5-0.8b.mq4.hfq`) because fused dense prefill final logits reject `lm_head dtype Q8_0`; rerun with a canonical dense artifact whose
-    output dtype is supported by fused dense prefill.
+    The full prefill smoke now passes on this host with canonical dense BF16 plus grouped-MoE MQ4 artifacts:
+    `MODEL=$HOME/.hipfire/models/qwen3.5-0.8b-bf16.hfq MOE_MODEL=$HOME/.hipfire/models/qwen3.6-35b-a3b-mq4.hfq
+    UNSUPPORTED_MODEL=$HOME/.hipfire/models/llama-3.2-1b-instruct.mq4.hfq ./tests/smoke-generate-batch-prefill.sh`.
+    The older dense MQ4 local spelling (`qwen3.5-0.8b.mq4.hfq`) remains unsuitable for this fused dense prefill smoke because its Q8_0 lm_head is
+    intentionally rejected by the dense full-precision final-logits path.
 
   - Add backend-neutral prefill checkpoint hooks so fused prefill can emit semantic-boundary checkpoints, not only final checkpoints. The hook should
     carry: session id, logical token position, boundary kind, prefix hash input, and state handle.
