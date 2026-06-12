@@ -91,6 +91,10 @@
     pre-GDN replay segment: serial decode uses gfx1151's fused sigmoid/alpha-gate + conv1d/SiLU/split kernel, while GDN tape replay currently stores
     post-gate alpha/beta and replays through the separate conv-only path. Fast replay needs either raw pre-gate alpha/beta capture plus the exact
     fused serial kernel shape, or a proven byte-exact conv-only replay variant, before it can graduate from diagnostic mode.
+    Adding raw pre-gate alpha/beta tape buffers and replaying the serial-captured tape through the fused gate+conv wrapper did not clear the control:
+    position 120 remains at the same one-step serial-tape mismatch (`s_matrix[0]`, `differing_bytes=169326`, `first_offset=8`, `serial_byte=190`,
+    `serial_tape_byte=189`), and position 59 remains mismatched as well. The next comparison needs to move after the fused gate+conv wrapper and
+    compare serial decode's `q_raw/k_raw/v` plus post-gate alpha/beta against the fused replay outputs, before QK norm and GDN.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

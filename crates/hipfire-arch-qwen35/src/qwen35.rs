@@ -15557,6 +15557,26 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let alpha_row_bytes = n_v_heads * 4;
+                    let off_a = tape_offset * alpha_row_bytes;
+                    let copy_a = n * alpha_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.alpha_raw_bufs[delta_layer_idx].buf,
+                        off_a,
+                        &pbs.dn_alpha_batch.buf,
+                        0,
+                        copy_a,
+                    )?;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.beta_raw_bufs[delta_layer_idx].buf,
+                        off_a,
+                        &pbs.dn_beta_batch.buf,
+                        0,
+                        copy_a,
+                    )?;
+                }
+
                 // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
                 gpu.fused_sigmoid_alpha_gate_f32_batched(
                     &pbs.dn_beta_batch,
@@ -17869,6 +17889,25 @@ fn forward_prefill_chunk(
                     )?;
                 }
                 debug_stop_after!("qkvza", layer_idx);
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let alpha_row_bytes = n_v_heads * 4;
+                    let off_a = tape_offset * alpha_row_bytes;
+                    let copy_a = n * alpha_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.alpha_raw_bufs[delta_layer_idx].buf,
+                        off_a,
+                        &pbs.dn_alpha_batch.buf,
+                        0,
+                        copy_a,
+                    )?;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.beta_raw_bufs[delta_layer_idx].buf,
+                        off_a,
+                        &pbs.dn_beta_batch.buf,
+                        0,
+                        copy_a,
+                    )?;
+                }
                 gpu.fused_sigmoid_alpha_gate_f32_batched(
                     &pbs.dn_beta_batch,
                     &pbs.dn_alpha_batch,
@@ -20158,6 +20197,23 @@ fn forward_scratch_layers(
                 // gfx1151 fuses the independent sigmoid/alpha gate with the
                 // single-token conv1d+SiLU+split below, shaving one dispatch
                 // per LA decode layer. Other arches preserve the old pair.
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let alpha_beta_row_bytes = tape.n_v_heads * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.alpha_raw_bufs[delta_layer_idx].buf,
+                        *tape_row * alpha_beta_row_bytes,
+                        &s.dn_alpha.buf,
+                        0,
+                        alpha_beta_row_bytes,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.beta_raw_bufs[delta_layer_idx].buf,
+                        *tape_row * alpha_beta_row_bytes,
+                        &s.dn_beta.buf,
+                        0,
+                        alpha_beta_row_bytes,
+                    )?;
+                }
                 gpu.fused_sigmoid_alpha_gate_conv1d_silu_split_f32(
                     &s.dn_beta,
                     &s.dn_alpha,

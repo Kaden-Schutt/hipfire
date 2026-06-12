@@ -1084,11 +1084,11 @@ pub struct DeltaNetTape {
 }
 
 /// Innovation tape for the GatedDeltaNet recurrence. During a batched verify
-/// forward we capture the per-LA-layer pre-conv1d `qkv` projection and the
-/// post-sigmoid `(α, β)` for every block position. On rollback we replay
-/// conv1d + QK-norm + repeat-interleave + GDN for `accept_len + 1` steps
-/// against the pre-verify DN snapshot — advancing both S-state AND
-/// conv_state correctly, no full target re-run needed.
+/// forward we capture the per-LA-layer pre-conv1d `qkv` projection, the raw
+/// `(alpha,beta)` projections, and the post-sigmoid `(α, β)` for every block
+/// position. On rollback we replay conv1d + QK-norm + repeat-interleave + GDN
+/// for `accept_len + 1` steps against the pre-verify DN snapshot — advancing
+/// both S-state AND conv_state correctly, no full target re-run needed.
 ///
 /// Why pre-conv1d qkv instead of post-conv1d (q, k, v): conv_state is a
 /// recurrent buffer advanced by conv1d_silu_split. If we skipped conv1d on
@@ -1111,6 +1111,11 @@ pub struct GdnTape {
     /// Per-LA-layer [max_n × n_v_heads] F32 — post-sigmoid_alpha_gate.
     pub alpha_bufs: Vec<GpuTensor>,
     pub beta_bufs: Vec<GpuTensor>,
+    /// Per-LA-layer [max_n × n_v_heads] F32 — raw gate projections before
+    /// sigmoid/alpha-gate. Used by the rollback diagnostic that replays the
+    /// same fused gate+conv kernel shape as serial decode.
+    pub alpha_raw_bufs: Vec<GpuTensor>,
+    pub beta_raw_bufs: Vec<GpuTensor>,
     /// Replay scratch (shared across layers — serial replay is fine).
     pub q_raw_scratch: GpuTensor, // [max_n × k_dim]
     pub k_raw_scratch: GpuTensor, // [max_n × k_dim]
@@ -1140,10 +1145,14 @@ impl GdnTape {
         let mut qkv_bufs = Vec::with_capacity(n_la_layers);
         let mut alpha_bufs = Vec::with_capacity(n_la_layers);
         let mut beta_bufs = Vec::with_capacity(n_la_layers);
+        let mut alpha_raw_bufs = Vec::with_capacity(n_la_layers);
+        let mut beta_raw_bufs = Vec::with_capacity(n_la_layers);
         for _ in 0..n_la_layers {
             qkv_bufs.push(gpu.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
             alpha_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
             beta_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+            alpha_raw_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+            beta_raw_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
         }
 
         Ok(Self {
@@ -1158,6 +1167,8 @@ impl GdnTape {
             qkv_bufs,
             alpha_bufs,
             beta_bufs,
+            alpha_raw_bufs,
+            beta_raw_bufs,
             q_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
             k_raw_scratch: gpu.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
             v_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
@@ -1173,6 +1184,8 @@ impl GdnTape {
             .into_iter()
             .chain(self.alpha_bufs.into_iter())
             .chain(self.beta_bufs.into_iter())
+            .chain(self.alpha_raw_bufs.into_iter())
+            .chain(self.beta_raw_bufs.into_iter())
         {
             let _ = gpu.free_tensor(t);
         }
@@ -1192,7 +1205,7 @@ impl GdnTape {
 /// the band's OWN device (kernels can't write across devices).
 ///
 /// `GdnTapeShards` holds one [`GdnTape`] per band. Each shard's
-/// `qkv_bufs` / `alpha_bufs` / `beta_bufs` are `Vec`s of length
+/// qkv / alpha / beta tape vectors are `Vec`s of length
 /// `n_la_total` (the global LA layer count); entries at indices
 /// corresponding to LA layers in THAT band are real allocations on
 /// the band's device, all other entries are 1-byte placeholders on
@@ -1262,12 +1275,18 @@ impl GdnTapeShards {
             let mut qkv_bufs = Vec::with_capacity(n_la_total);
             let mut alpha_bufs = Vec::with_capacity(n_la_total);
             let mut beta_bufs = Vec::with_capacity(n_la_total);
+            let mut alpha_raw_bufs = Vec::with_capacity(n_la_total);
+            let mut beta_raw_bufs = Vec::with_capacity(n_la_total);
             for global_la_idx in 0..n_la_total {
                 if shard_owns[band][global_la_idx] {
                     qkv_bufs.push(g.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
                     alpha_bufs
                         .push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
                     beta_bufs.push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+                    alpha_raw_bufs
+                        .push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+                    beta_raw_bufs
+                        .push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
                 } else {
                     // Placeholder: 1 F32 element. Lets the chunk dispatch
                     // index `qkv_bufs[delta_layer_idx]` without bounds-
@@ -1278,6 +1297,8 @@ impl GdnTapeShards {
                     qkv_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     alpha_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     beta_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    alpha_raw_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    beta_raw_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                 }
             }
             shards.push(GdnTape {
@@ -1292,6 +1313,8 @@ impl GdnTapeShards {
                 qkv_bufs,
                 alpha_bufs,
                 beta_bufs,
+                alpha_raw_bufs,
+                beta_raw_bufs,
                 // Replay scratch: each band gets its own (cheap) so the
                 // chunk dispatch can call replay-related helpers on the
                 // band-local scratch. PP+MTP consumer's replay runs on
@@ -1323,7 +1346,7 @@ impl GdnTapeShards {
     /// `target` tape's matching global-indexed slots. Target must have
     /// `n_la_total` entries; its home device receives all the data.
     ///
-    /// Bytes per LA layer: `max_n * (qkv_dim + 2 * n_v_heads) * 4`.
+    /// Bytes per LA layer: `max_n * (qkv_dim + 4 * n_v_heads) * 4`.
     /// For qwen3.6-27b at max_n=5 (verify K+1): ~30 KB/layer × 48
     /// total LA layers = ~1.4 MB worst-case full assembly; less than
     /// 1 ms at PCIe DMA speeds. Sub-cycle cost on the MTP critical
@@ -1397,6 +1420,20 @@ impl GdnTapeShards {
                     0,
                     beta_bytes,
                 )?;
+                g.hip.memcpy_dtod_at(
+                    &target.alpha_raw_bufs[global_la_idx].buf,
+                    0,
+                    &self.shards[owning_band].alpha_raw_bufs[global_la_idx].buf,
+                    0,
+                    alpha_bytes,
+                )?;
+                g.hip.memcpy_dtod_at(
+                    &target.beta_raw_bufs[global_la_idx].buf,
+                    0,
+                    &self.shards[owning_band].beta_raw_bufs[global_la_idx].buf,
+                    0,
+                    beta_bytes,
+                )?;
             } else {
                 // Cross-device: hipMemcpyPeer from owning_band's
                 // device to target_dev. Use split_pair_mut to get
@@ -1423,6 +1460,20 @@ impl GdnTapeShards {
                     &target.beta_bufs[global_la_idx].buf,
                     dst_dev_id,
                     &self.shards[owning_band].beta_bufs[global_la_idx].buf,
+                    src_dev_id,
+                    beta_bytes,
+                )?;
+                runtime.memcpy_peer(
+                    &target.alpha_raw_bufs[global_la_idx].buf,
+                    dst_dev_id,
+                    &self.shards[owning_band].alpha_raw_bufs[global_la_idx].buf,
+                    src_dev_id,
+                    alpha_bytes,
+                )?;
+                runtime.memcpy_peer(
+                    &target.beta_raw_bufs[global_la_idx].buf,
+                    dst_dev_id,
+                    &self.shards[owning_band].beta_raw_bufs[global_la_idx].buf,
                     src_dev_id,
                     beta_bytes,
                 )?;
@@ -1646,6 +1697,124 @@ impl GdnTape {
             }
         }
         Ok(None)
+    }
+
+    fn replay_gdn_fused_gate_conv_for_compare(
+        &self,
+        gpu: &mut Gpu,
+        weights: &qwen35::Qwen35Weights,
+        config: &qwen35::Qwen35Config,
+        dn_state: &mut qwen35::DeltaNetState,
+        n_steps: usize,
+    ) -> HipResult<()> {
+        assert!(
+            n_steps <= self.max_n,
+            "replay_gdn_fused_gate_conv_for_compare: n_steps {n_steps} > max_n {}",
+            self.max_n
+        );
+        let n_v_heads = self.n_v_heads;
+        let n_key_heads = self.n_key_heads;
+        let hd = self.key_head_dim;
+        let v_dim = self.v_dim;
+        let k_dim = self.k_dim;
+        let value_head_dim = self.value_head_dim;
+        let mut la_idx = 0usize;
+
+        for (layer_idx, lt) in config.layer_types.iter().enumerate() {
+            if *lt != qwen35::LayerType::LinearAttention {
+                continue;
+            }
+            let (conv_weight, dt_bias, a_log) = match &weights.layers[layer_idx] {
+                qwen35::LayerWeights::DeltaNet(l) => (&l.conv_weight, &l.dt_bias, &l.a_log),
+                qwen35::LayerWeights::DeltaNetMoe(l) => (&l.conv_weight, &l.dt_bias, &l.a_log),
+                _ => unreachable!("LA layer type mismatch in replay_gdn"),
+            };
+
+            for step in 0..n_steps {
+                let qkv = self.qkv_bufs[la_idx].sub_offset(step * self.qkv_dim, self.qkv_dim);
+                let alpha = self.alpha_raw_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
+                let beta = self.beta_raw_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
+                let q_raw = self.q_raw_scratch.sub_offset(step * k_dim, k_dim);
+                let k_raw = self.k_raw_scratch.sub_offset(step * k_dim, k_dim);
+                let v = self.v_scratch.sub_offset(step * v_dim, v_dim);
+                gpu.fused_sigmoid_alpha_gate_conv1d_silu_split_f32(
+                    &beta,
+                    &alpha,
+                    dt_bias,
+                    a_log,
+                    &q_raw,
+                    &k_raw,
+                    &v,
+                    &qkv,
+                    conv_weight,
+                    &dn_state.conv_states[la_idx],
+                    n_v_heads,
+                    k_dim,
+                    v_dim,
+                )?;
+                gpu.fused_qk_l2_norm_scale_f32(
+                    &q_raw,
+                    &k_raw,
+                    n_key_heads,
+                    hd,
+                    1.0 / (hd as f32).sqrt(),
+                    config.norm_eps,
+                )?;
+                let (q, k) = if n_key_heads < n_v_heads {
+                    let ratio = n_v_heads / n_key_heads;
+                    let q = self.q_scratch.sub_offset(step * v_dim, v_dim);
+                    let k = self.k_scratch.sub_offset(step * v_dim, v_dim);
+                    gpu.repeat_interleave_qk_f32(&q_raw, &k_raw, &q, &k, n_key_heads, ratio, hd)?;
+                    (q, k)
+                } else {
+                    (q_raw, k_raw)
+                };
+                let out = self.attn_scratch.sub_offset(step * v_dim, v_dim);
+                match dn_state.quant {
+                    qwen35::StateQuant::FP32 => gpu.gated_delta_net_f32(
+                        &q,
+                        &k,
+                        &v,
+                        &alpha,
+                        &beta,
+                        &dn_state.s_matrices[la_idx],
+                        &out,
+                        1,
+                        n_v_heads,
+                        value_head_dim,
+                    )?,
+                    qwen35::StateQuant::Q8 => gpu.gated_delta_net_q8(
+                        &q,
+                        &k,
+                        &v,
+                        &alpha,
+                        &beta,
+                        &dn_state.s_matrices[la_idx],
+                        &dn_state.s_scales[la_idx],
+                        &out,
+                        1,
+                        n_v_heads,
+                        value_head_dim,
+                    )?,
+                    qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
+                        &q,
+                        &k,
+                        &v,
+                        &alpha,
+                        &beta,
+                        &dn_state.s_matrices[la_idx],
+                        &dn_state.s_scales[la_idx],
+                        &out,
+                        1,
+                        n_v_heads,
+                        value_head_dim,
+                    )?,
+                }
+            }
+
+            la_idx += 1;
+        }
+        Ok(())
     }
 
     /// Replay the full LA sub-pipeline (conv1d + qk-l2norm + repeat-interleave +
@@ -4473,7 +4642,7 @@ pub fn spec_step_dflash(
                 ),
             }
             target_snap.restore_to(&mut target.dn_state, gpu)?;
-            serial_tape.replay_gdn(
+            serial_tape.replay_gdn_fused_gate_conv_for_compare(
                 gpu,
                 &target.weights,
                 &target.config,
