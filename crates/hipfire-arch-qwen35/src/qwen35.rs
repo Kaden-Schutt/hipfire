@@ -13031,6 +13031,31 @@ fn moe_grouped_gemm_path2_enabled_from_env(value: Option<&str>) -> bool {
     }
 }
 
+fn mq2_lloyd_n32_gfx1151_enabled_from_env(
+    arch: &str,
+    total_slots: usize,
+    value: Option<&str>,
+) -> bool {
+    if arch != "gfx1151" {
+        return false;
+    }
+    match value {
+        Some("0") | Some("off") => false,
+        Some("1") | Some("on") => true,
+        _ => total_slots >= 1024,
+    }
+}
+
+fn mq2_lloyd_n32_gfx1151_enabled(arch: &str, total_slots: usize) -> bool {
+    static MODE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    mq2_lloyd_n32_gfx1151_enabled_from_env(
+        arch,
+        total_slots,
+        MODE.get_or_init(|| std::env::var("HIPFIRE_MOE_MQ2L_N32_GFX1151").ok())
+            .as_deref(),
+    )
+}
+
 fn moe_grouped_gemm_path2_required_for_dtype(dtype: DType) -> bool {
     matches!(dtype, DType::MQ3G256 | DType::F16 | DType::BF16)
 }
@@ -13887,18 +13912,35 @@ fn prefill_moe_ffn_body_batched(
                     m_total,
                     path2_shape.gate_up_source_rows,
                 )?,
-                DType::MQ2G256Lloyd => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
-                    &ffn.expert_gate_up_ptrs,
-                    tile_ids,
-                    sorted,
-                    &pbs.x_rot_batch,
-                    y_gu_grouped,
-                    2 * mi,
-                    gate_up_k,
-                    path2_shape.gate_up_x_row_div,
-                    m_total,
-                    path2_shape.gate_up_source_rows,
-                )?,
+                DType::MQ2G256Lloyd => {
+                    if mq2_lloyd_n32_gfx1151_enabled(&gpu.arch, path2_shape.total_slots) {
+                        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
+                            &ffn.expert_gate_up_ptrs,
+                            tile_ids,
+                            sorted,
+                            &pbs.x_rot_batch,
+                            y_gu_grouped,
+                            2 * mi,
+                            gate_up_k,
+                            path2_shape.gate_up_x_row_div,
+                            m_total,
+                            path2_shape.gate_up_source_rows,
+                        )?
+                    } else {
+                        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+                            &ffn.expert_gate_up_ptrs,
+                            tile_ids,
+                            sorted,
+                            &pbs.x_rot_batch,
+                            y_gu_grouped,
+                            2 * mi,
+                            gate_up_k,
+                            path2_shape.gate_up_x_row_div,
+                            m_total,
+                            path2_shape.gate_up_source_rows,
+                        )?
+                    }
+                }
                 DType::F16 => gpu.gemm_f16_moe_grouped_wmma_gfx1151(
                     &ffn.expert_gate_up_ptrs,
                     tile_ids,
@@ -14269,18 +14311,35 @@ fn prefill_moe_ffn_body_batched(
                     m_total,
                     path2_shape.down_source_rows,
                 )?,
-                DType::MQ2G256Lloyd => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
-                    &ffn.expert_down_ptrs,
-                    tile_ids,
-                    sorted,
-                    rot_batch,
-                    y_down_grouped,
-                    down_m,
-                    down_k,
-                    path2_shape.down_x_row_div,
-                    m_total,
-                    path2_shape.down_source_rows,
-                )?,
+                DType::MQ2G256Lloyd => {
+                    if mq2_lloyd_n32_gfx1151_enabled(&gpu.arch, path2_shape.total_slots) {
+                        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
+                            &ffn.expert_down_ptrs,
+                            tile_ids,
+                            sorted,
+                            rot_batch,
+                            y_down_grouped,
+                            down_m,
+                            down_k,
+                            path2_shape.down_x_row_div,
+                            m_total,
+                            path2_shape.down_source_rows,
+                        )?
+                    } else {
+                        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+                            &ffn.expert_down_ptrs,
+                            tile_ids,
+                            sorted,
+                            rot_batch,
+                            y_down_grouped,
+                            down_m,
+                            down_k,
+                            path2_shape.down_x_row_div,
+                            m_total,
+                            path2_shape.down_source_rows,
+                        )?
+                    }
+                }
                 DType::F16 => gpu.gemm_f16_moe_grouped_wmma_gfx1151(
                     &ffn.expert_down_ptrs,
                     tile_ids,
@@ -25460,6 +25519,29 @@ mod tests {
         assert!(moe_grouped_gemm_path2_enabled_from_env(Some("surprise")));
         assert!(!moe_grouped_gemm_path2_enabled_from_env(Some("0")));
         assert!(!moe_grouped_gemm_path2_enabled_from_env(Some("off")));
+    }
+
+    #[test]
+    fn moe_prefill_mq2_lloyd_n32_policy_is_gfx1151_large_slots_only() {
+        assert!(!mq2_lloyd_n32_gfx1151_enabled_from_env(
+            "gfx1100", 4096, None
+        ));
+        assert!(!mq2_lloyd_n32_gfx1151_enabled_from_env(
+            "gfx1151", 768, None
+        ));
+        assert!(mq2_lloyd_n32_gfx1151_enabled_from_env(
+            "gfx1151", 1024, None
+        ));
+        assert!(!mq2_lloyd_n32_gfx1151_enabled_from_env(
+            "gfx1151",
+            4096,
+            Some("0")
+        ));
+        assert!(mq2_lloyd_n32_gfx1151_enabled_from_env(
+            "gfx1151",
+            128,
+            Some("1")
+        ));
     }
 
     #[test]

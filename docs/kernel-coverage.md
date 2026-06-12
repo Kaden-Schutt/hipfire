@@ -105,6 +105,7 @@ path.
 | moe grouped hfq4g256 | — | — | — | basic (gfx11_dgpu, 2 variants) | standard (mmq k4/k8) | **tuned** (wmma+mmq, m2 variant) |
 | moe grouped hfq3g256 | — | — | — | — | basic | standard |
 | moe grouped hfq6g256 | — | — | — | — | **tuned** (4w default, v2 opt-in) | standard (v2) |
+| moe grouped mq2g256 lloyd | — | — | — | — | standard (1w, n32 large-slot route) | — |
 | moe grouped mq4g256 | — | — | — | — | — | — |
 | moe grouped paro q4g128 | — | — | — | — | standard (k8 variant) | — |
 | moe grouped bf16/f16 | — | — | — | — | basic | — |
@@ -126,6 +127,15 @@ best measured 122B route. On Qwen3.5-122B-A10B MQ4 pp64, HFQ6 grouped MoE was
 86.8 ms with 4w enabled, versus 144.1 ms for v1 and 177.3 ms for v2 when 4w was
 disabled. See `docs/perf-checkpoints/2026-06-12-gfx1151-moe-variant-sweep.md`
 for the full variant table.
+
+gfx1151 MQ2-Lloyd grouped MoE: the routed prefill path now uses the
+`4w64x32` grouped WMMA variant when actual routed slots are at least 1024,
+with `HIPFIRE_MOE_MQ2L_N32_GFX1151=0` as the kill switch. Synthetic grouped
+shape coverage found the n32 variant correct and +5% to +11% on B>=256
+gate/up and down shapes, while the B=128 gate/up shape still favors the
+single-warp path. The `mmqload` and `mmqload_nosync` variants remain unrouted:
+they looked fast but failed element-wise correctness. See
+`docs/perf-checkpoints/2026-06-12-gfx1151-mq2lloyd-moe-n32.md`.
 
 gfx1151 BF16/F16 routed MoE: native grouped WMMA is the default. A compact
 indexed gate/up kernel has channel-test coverage but is not routed: it avoids

@@ -58,6 +58,111 @@ fn wrap_buf(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn launch_variant(
+    gpu: &mut Gpu,
+    variant: &str,
+    expert_weight_ptrs: &GpuTensor,
+    expert_tile_ids: &GpuTensor,
+    sorted_slot_index: &GpuTensor,
+    x_src: &GpuTensor,
+    y_grouped: &GpuTensor,
+    m: usize,
+    k: usize,
+    x_row_div: usize,
+    m_total: usize,
+    x_src_rows: usize,
+) {
+    match variant {
+        "1w16x16" => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            x_src_rows,
+        ),
+        "4w64x16" => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            x_src_rows,
+        ),
+        "4w64x16_mmqload" => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            x_src_rows,
+        ),
+        "4w64x16_mmqload_nosync" => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            x_src_rows,
+        ),
+        "4w64x32" => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            x_src_rows,
+        ),
+        "4w64x16_cnd" => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            x_src_rows,
+        ),
+        "8w128x16" => gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            x_src,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            x_src_rows,
+        ),
+        _ => panic!("unknown MQ2-Lloyd MoE variant {variant}"),
+    }
+    .expect("variant launch");
+}
+
 /// MQ2-Lloyd quant: per 256-element K-group, [4 × fp16 codebook | 64 B
 /// packed 2-bit indices (4 per byte, LSB-first)]. Total 72 B/group.
 /// Fixed codebook `[-3, -1, 1, 3]`; deterministic pseudo-random indices.
@@ -189,112 +294,113 @@ fn main() {
             DType::F32,
         );
 
-        // ── Correctness pass: baseline vs 4w, element-wise compare.
-        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
-            &ep_t, &tp_t, &sp_t, &x_t, &yref_t, m, k, 1, m_total, m_total,
-        )
-        .expect("baseline");
-        gpu.hip.device_synchronize().expect("sync");
-        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
-            &ep_t, &tp_t, &sp_t, &x_t, &y4w_t, m, k, 1, m_total, m_total,
-        )
-        .expect("4w");
-        gpu.hip.device_synchronize().expect("sync");
+        let variants = [
+            "4w64x16",
+            "4w64x16_mmqload",
+            "4w64x16_mmqload_nosync",
+            "4w64x32",
+            "4w64x16_cnd",
+            "8w128x16",
+        ];
 
+        // ── Correctness pass: baseline vs each variant, element-wise compare.
+        launch_variant(
+            &mut gpu, "1w16x16", &ep_t, &tp_t, &sp_t, &x_t, &yref_t, m, k, 1, m_total, m_total,
+        );
+        gpu.hip.device_synchronize().expect("sync");
         let mut y_ref_bytes = vec![0u8; m_total * m * 4];
-        let mut y_4w_bytes = vec![0u8; m_total * m * 4];
         gpu.hip
             .memcpy_dtoh(&mut y_ref_bytes, &yref_gpu)
             .expect("dtoh ref");
-        gpu.hip
-            .memcpy_dtoh(&mut y_4w_bytes, &y4w_gpu)
-            .expect("dtoh 4w");
         let y_ref: &[f32] =
             unsafe { std::slice::from_raw_parts(y_ref_bytes.as_ptr() as *const f32, m_total * m) };
-        let y_4w: &[f32] =
-            unsafe { std::slice::from_raw_parts(y_4w_bytes.as_ptr() as *const f32, m_total * m) };
 
-        let mut max_abs = 0f32;
-        let mut max_rel = 0f32;
-        let mut bad = 0usize;
-        let mut nan_count = 0usize;
-        for i in 0..(m_total * m) {
-            if !y_4w[i].is_finite() {
-                nan_count += 1;
-                continue;
+        let mut ok_variants = Vec::new();
+        for variant in variants {
+            launch_variant(
+                &mut gpu, variant, &ep_t, &tp_t, &sp_t, &x_t, &y4w_t, m, k, 1, m_total, m_total,
+            );
+            gpu.hip.device_synchronize().expect("sync");
+
+            let mut y_4w_bytes = vec![0u8; m_total * m * 4];
+            gpu.hip
+                .memcpy_dtoh(&mut y_4w_bytes, &y4w_gpu)
+                .expect("dtoh variant");
+            let y_4w: &[f32] = unsafe {
+                std::slice::from_raw_parts(y_4w_bytes.as_ptr() as *const f32, m_total * m)
+            };
+
+            let mut max_abs = 0f32;
+            let mut max_rel = 0f32;
+            let mut bad = 0usize;
+            let mut nan_count = 0usize;
+            for i in 0..(m_total * m) {
+                if !y_4w[i].is_finite() {
+                    nan_count += 1;
+                    continue;
+                }
+                let d = (y_ref[i] - y_4w[i]).abs();
+                let r = d / y_ref[i].abs().max(1e-6);
+                if d > max_abs {
+                    max_abs = d;
+                }
+                if r > max_rel {
+                    max_rel = r;
+                }
+                if d > ATOL && r > RTOL {
+                    bad += 1;
+                }
             }
-            let d = (y_ref[i] - y_4w[i]).abs();
-            let r = d / y_ref[i].abs().max(1e-6);
-            if d > max_abs {
-                max_abs = d;
-            }
-            if r > max_rel {
-                max_rel = r;
-            }
-            if d > ATOL && r > RTOL {
-                bad += 1;
+            let ok = bad == 0 && nan_count == 0;
+            println!(
+                "  correctness {variant:>23}: max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  bad={bad}/{}  nan={nan_count}  {}",
+                m_total * m,
+                if ok { "OK" } else { "FAIL" },
+            );
+            if ok {
+                ok_variants.push(variant);
             }
         }
-        let ok = bad == 0 && nan_count == 0;
-        println!(
-            "  correctness: max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  bad={bad}/{}  nan={nan_count}  {}",
-            m_total * m,
-            if ok { "OK" } else { "FAIL" },
-        );
-        if !ok {
-            println!("  ✗ CORRECTNESS FAIL — skipping perf");
-            std::mem::forget(ep_t);
-            std::mem::forget(tp_t);
-            std::mem::forget(sp_t);
-            std::mem::forget(x_t);
-            std::mem::forget(yref_t);
-            std::mem::forget(y4w_t);
-            continue;
-        }
-
         // ── Perf A/B
         for _ in 0..WARMUP {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
-                &ep_t, &tp_t, &sp_t, &x_t, &yref_t, m, k, 1, m_total, m_total,
-            )
-            .unwrap();
+            launch_variant(
+                &mut gpu, "1w16x16", &ep_t, &tp_t, &sp_t, &x_t, &yref_t, m, k, 1, m_total, m_total,
+            );
         }
         gpu.hip.device_synchronize().unwrap();
         let t0 = Instant::now();
         for _ in 0..TRIALS {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
-                &ep_t, &tp_t, &sp_t, &x_t, &yref_t, m, k, 1, m_total, m_total,
-            )
-            .unwrap();
+            launch_variant(
+                &mut gpu, "1w16x16", &ep_t, &tp_t, &sp_t, &x_t, &yref_t, m, k, 1, m_total, m_total,
+            );
         }
         gpu.hip.device_synchronize().unwrap();
         let ref_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
 
-        for _ in 0..WARMUP {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
-                &ep_t, &tp_t, &sp_t, &x_t, &y4w_t, m, k, 1, m_total, m_total,
-            )
-            .unwrap();
-        }
-        gpu.hip.device_synchronize().unwrap();
-        let t0 = Instant::now();
-        for _ in 0..TRIALS {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
-                &ep_t, &tp_t, &sp_t, &x_t, &y4w_t, m, k, 1, m_total, m_total,
-            )
-            .unwrap();
-        }
-        gpu.hip.device_synchronize().unwrap();
-        let new_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
-
-        let speedup = ref_us / new_us;
         let flops = 2.0 * m as f64 * k as f64 * m_total as f64;
         let ref_gflops = flops / ref_us / 1e3;
-        let new_gflops = flops / new_us / 1e3;
-        println!(
-            "  ref (1w16x16): {ref_us:>8.1} µs ({ref_gflops:>6.0} GFLOPS)   \
-             4w (64x16):    {new_us:>8.1} µs ({new_gflops:>6.0} GFLOPS)   speedup: {speedup:.2}×"
-        );
+        println!("  ref (1w16x16): {ref_us:>8.1} µs ({ref_gflops:>6.0} GFLOPS)");
+        for variant in ok_variants {
+            for _ in 0..WARMUP {
+                launch_variant(
+                    &mut gpu, variant, &ep_t, &tp_t, &sp_t, &x_t, &y4w_t, m, k, 1, m_total, m_total,
+                );
+            }
+            gpu.hip.device_synchronize().unwrap();
+            let t0 = Instant::now();
+            for _ in 0..TRIALS {
+                launch_variant(
+                    &mut gpu, variant, &ep_t, &tp_t, &sp_t, &x_t, &y4w_t, m, k, 1, m_total, m_total,
+                );
+            }
+            gpu.hip.device_synchronize().unwrap();
+            let new_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
+            let new_gflops = flops / new_us / 1e3;
+            println!(
+                "  {variant:>23}: {new_us:>8.1} µs ({new_gflops:>6.0} GFLOPS)   speedup: {:.2}x",
+                ref_us / new_us
+            );
+        }
 
         std::mem::forget(ep_t);
         std::mem::forget(tp_t);
