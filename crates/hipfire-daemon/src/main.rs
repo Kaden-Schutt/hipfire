@@ -2276,6 +2276,40 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
+    fn model_worker_runtime_view_json_reports_unsupported_state_arena_without_pages() {
+        let worker = ModelWorkerRuntimeView {
+            worker_id: ModelWorkerId {
+                value: "worker:arch9:pp1:q8".to_string(),
+            },
+            max_seq: 4096,
+            physical_cap: 4096,
+            max_resident_workers: 1,
+            resident_workers: 1,
+            state_arena_backend: SequenceStateArenaBackend::Unsupported,
+            resident_sessions: 0,
+            state_page_descriptors: Vec::new(),
+            memory: ModelWorkerMemoryView {
+                model_file_bytes: 512,
+                model_weight_bytes: 384,
+                runtime_base_bytes: 0,
+                runtime_session_bytes: 0,
+                runtime_state_bytes: 0,
+                total_resident_bytes: 384,
+                evictable_state_bytes: 0,
+            },
+        };
+
+        let json = model_worker_runtime_view_json(&worker);
+        assert_eq!(json["state_arena_backend"], "unsupported");
+        assert_eq!(json["resident_sessions"], 0);
+        assert_eq!(json["state_page_descriptor_entries"], 0);
+        assert_eq!(json["state_page_descriptor_bytes"], 0);
+        assert_eq!(json["state_page_descriptors"], serde_json::json!([]));
+        assert_eq!(json["runtime_session_bytes"], 0);
+        assert_eq!(json["evictable_state_bytes"], 0);
+    }
+
+    #[test]
     fn rejects_missing_worker_identity() {
         let msg = serde_json::json!({
             "type": "generate_batch_prefill",
