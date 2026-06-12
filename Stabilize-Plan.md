@@ -22,6 +22,10 @@
     server parity/latency smokes pass for B=2/4/8 with a forced chunk cap. `auto` remains serial for grouped-MoE until broader latency evidence is
     strong enough to promote. The decode-batch smoke now has an opt-in grouped-MoE parity matrix mode covering B=2/4/8 with chunk size 2; B=4 and
     B=8 force multi-chunk native grouped-MoE decode while comparing responses against `serial_reference`.
+    The same matrix now reports serial/native latency for the promotion gate. On gfx1151 with
+    `qwen3.6-35b-a3b-mq4.hfq`, the current grouped-native path remains slower than serial in the one-token server smoke
+    (B=2: 15.743 ms serial vs 72.969 ms native; B=4: 41.224 ms vs 121.888 ms; B=8: 91.716 ms vs 230.408 ms), so this is
+    parity-ready but not latency-ready for `auto`.
     The full prefill smoke now passes on this host with canonical dense BF16 plus grouped-MoE MQ4 artifacts:
     `MODEL=$HOME/.hipfire/models/qwen3.5-0.8b-bf16.hfq MOE_MODEL=$HOME/.hipfire/models/qwen3.6-35b-a3b-mq4.hfq
     UNSUPPORTED_MODEL=$HOME/.hipfire/models/llama-3.2-1b-instruct.mq4.hfq ./tests/smoke-generate-batch-prefill.sh`.

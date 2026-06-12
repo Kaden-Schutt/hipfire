@@ -268,6 +268,7 @@ describe("priority decode scheduler", () => {
       priority: number;
       generatedTokens: number;
       maxTokens: number;
+      cachedPrefixTokens: number;
     }> = {},
   ) => ({
     id,
@@ -275,6 +276,7 @@ describe("priority decode scheduler", () => {
     priority: overrides.priority ?? 64,
     runtimeStateHandle: `runtime-${id}`,
     logicalPosition: 8 + (overrides.generatedTokens ?? 0),
+    cachedPrefixTokens: overrides.cachedPrefixTokens ?? 8,
     generatedTokens: overrides.generatedTokens ?? 0,
     maxTokens: overrides.maxTokens ?? 4,
   });

@@ -307,6 +307,7 @@ def run_parity_pair(batch_size: int, chunk_size: int | None = None) -> dict[str,
             "fused_log": fused["log_path"],
             "log_path": fused["log_path"],
             "contents": fused["contents"],
+            "serial_checks": serial["checks"],
             "checks": fused["checks"],
             "responses": fused["responses"],
         }
@@ -335,7 +336,9 @@ if matrix_enabled:
     print(
         "server grouped-MoE decode parity matrix passed: "
         + " ".join(
-            f"B={entry['batch_size']} chunks={entry['checks'].get('decode_last_chunk_count')}/{entry['checks'].get('decode_last_chunk_size')}"
+            f"B={entry['batch_size']} chunks={entry['checks'].get('decode_last_chunk_count')}/{entry['checks'].get('decode_last_chunk_size')} "
+            f"serial_ms={float(entry['serial_checks'].get('decode_last_decode_ms') or 0):.3f} "
+            f"native_ms={float(entry['checks'].get('decode_last_decode_ms') or 0):.3f}"
             for entry in matrix
         )
     )
