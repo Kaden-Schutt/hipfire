@@ -8094,7 +8094,11 @@ fn forward_prefill_chunk(
     // compatibility but ignored — the DdNode depths it carries are only
     // used by `linearize_tree` to build the attn_bias mask.
     if !pre_uploaded {
-        let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
+        let positions_host: Vec<i32> = if let Some(ctx) = tree_verify.as_ref() {
+            ctx.positions.to_vec()
+        } else {
+            (0..n).map(|i| (start_pos + i) as i32).collect()
+        };
         let positions_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
         gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
