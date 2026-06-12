@@ -23995,15 +23995,26 @@ impl Gpu {
     }
 
     fn hfq4g256_mmq_gfx1151_enabled(&self, m: usize, k: usize, batch_size: usize) -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        let enabled = *ENABLED
-            .get_or_init(|| std::env::var("HIPFIRE_HFQ4G256_MMQ_GFX1151").as_deref() == Ok("1"));
-        enabled
-            && self.arch.starts_with("gfx1151")
-            && batch_size >= 16
-            && batch_size % 16 == 0
-            && m % 16 == 0
-            && k % 256 == 0
+        static MODE: OnceLock<Option<bool>> = OnceLock::new();
+        if !self.arch.starts_with("gfx1151")
+            || batch_size < 16
+            || batch_size % 16 != 0
+            || m % 16 != 0
+            || k % 256 != 0
+        {
+            return false;
+        }
+
+        match *MODE.get_or_init(
+            || match std::env::var("HIPFIRE_HFQ4G256_MMQ_GFX1151").as_deref() {
+                Ok("0") => Some(false),
+                Ok("1") => Some(true),
+                _ => None,
+            },
+        ) {
+            Some(force) => force,
+            None => k == 2048,
+        }
     }
 
     fn gemm_hfq4g256_mmq_gfx1151(

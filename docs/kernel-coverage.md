@@ -80,11 +80,14 @@ gfx1151 now routes HFQ4/MQ4 decode GEMV through the RDNA3 single-row and multi-r
 | gemm lmhead hfq4g256 | — | — | — | — | — | basic |
 | gemm bf16 | — | standard (mfma) | — | — | standard (wmma) | — |
 
-gfx1151 HFQ4-G256 one-wave i8 WMMA: `HIPFIRE_HFQ4G256_MMQ_GFX1151=1`
-routes aligned set/residual projections through a 16x16 one-wave IU8 WMMA
-probe. On Qwen3.5-9B MQ4 pp256 it regressed profiled GEMM time
-(`set` 161.4 ms vs 134.6 ms, `add` 85.9 ms vs 61.9 ms), so the existing
-MMQ x16/x32_y64 path remains the default.
+gfx1151 HFQ4-G256 one-wave i8 WMMA now auto-routes only the aligned
+K=2048 projection shapes used by Qwen3.5/3.6 A3B/shared paths. On
+Qwen3.6-35B-A3B MQ4 pp128 profiling, this reduced `gemm_hfq4g256_mmq_set`
+from 31.7 ms to 20.0 ms and total profiled prefill from 108.7 ms to
+96.0 ms. Larger dense Qwen3.5-9B K=4096 pp256 still regresses badly
+(`set` 164.0 ms vs 134.3 ms, `add` 88.4 ms vs 61.9 ms), so those shapes
+remain on the existing MMQ x16/x32_y64 path. `HIPFIRE_HFQ4G256_MMQ_GFX1151=0`
+forces the fallback; `=1` forces the probe for aligned experiments.
 
 gfx1151 IU4 WMMA is available and now has a signed-Q4 tile channel test
 (`test_gfx1151_s4_wmma_tile`) that validates packed S4xS4 -> I32 accumulator
