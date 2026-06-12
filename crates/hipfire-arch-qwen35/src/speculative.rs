@@ -805,6 +805,18 @@ pub fn spec_rollback_parity_decision_for_step(
     )
 }
 
+fn dflash_trace_position_from_env() -> Option<usize> {
+    std::env::var("HIPFIRE_DFLASH_TRACE_POSITION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+}
+
+fn dflash_trace_expected_token_from_env() -> Option<usize> {
+    std::env::var("HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+}
+
 /// Backing storage for a DeltaNetState snapshot. Holds device buffers sized
 /// to match the source state's tensors. Allocate once per slot, reuse across
 /// all speculative cycles.
@@ -3805,6 +3817,8 @@ pub fn spec_step_dflash(
     );
     let use_tape_replay = dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape);
     let mut gdn_tape_opt = if use_tape_replay { gdn_tape } else { None };
+    let trace_position = dflash_trace_position_from_env();
+    let trace_this_position = trace_position == Some(position);
 
     if phase_on {
         gpu.hip.device_synchronize()?;
@@ -3817,7 +3831,7 @@ pub fn spec_step_dflash(
         position,
         hidden_rb,
         gdn_tape_opt.as_deref_mut(),
-        use_temp_sampling || host_path_active, // full target logits needed for rejection sampling, RP, or n-gram block
+        use_temp_sampling || host_path_active || trace_this_position, // full target logits needed for rejection sampling, RP, n-gram block, or trace
         verify_scratch,
     )?;
 
@@ -3950,6 +3964,41 @@ pub fn spec_step_dflash(
             }
         }
         bonus_token = argmax_per_pos[accept_len];
+    }
+    if trace_this_position {
+        let expected = dflash_trace_expected_token_from_env();
+        let logits_present = verify_out.logits_per_pos.len() >= vocab;
+        if logits_present {
+            let row = &verify_out.logits_per_pos[..vocab];
+            let mut top: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            top.truncate(5);
+            let expected_logit = expected.and_then(|tok| row.get(tok).copied());
+            eprintln!(
+                "[trace-verify] pos={} B={} seed={} block1={:?} accepted={} bonus={} expected={:?} expected_logit={:?} bonus_logit={:?} top5={:?}",
+                position,
+                b,
+                seed_token,
+                block.get(1).copied(),
+                accept_len,
+                bonus_token,
+                expected,
+                expected_logit,
+                row.get(bonus_token as usize).copied(),
+                top,
+            );
+        } else {
+            eprintln!(
+                "[trace-verify] pos={} B={} seed={} block1={:?} accepted={} bonus={} expected={:?} logits=unavailable",
+                position,
+                b,
+                seed_token,
+                block.get(1).copied(),
+                accept_len,
+                bonus_token,
+                expected,
+            );
+        }
     }
 
     // ── 7b. Seed-prediction oracle (Task #93 Phase B) ───────────────────
