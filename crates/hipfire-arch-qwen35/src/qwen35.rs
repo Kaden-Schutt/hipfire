@@ -8222,7 +8222,7 @@ pub fn forward_scratch(
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, true,
+            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, true, None,
         )?;
         gpu.ar_forward_kernel_dirty = false;
     } else if use_graph {
@@ -8239,7 +8239,7 @@ pub fn forward_scratch(
         gpu.drop_captured_graph();
         gpu.begin_graph_capture()?;
         forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, true,
+            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, true, None,
         )?;
         gpu.end_graph_capture()?;
         gpu.graph_launch()?;
@@ -8248,10 +8248,59 @@ pub fn forward_scratch(
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(
-            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, true,
+            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, true, None,
         )?;
     }
     Ok(())
+}
+
+/// Debug-only companion to `forward_scratch` that records each LinearAttention
+/// layer's raw replay inputs into `gdn_tape` at `tape_row`.
+pub fn forward_scratch_capture_gdn_tape(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    gdn_tape: &mut crate::speculative::GdnTape,
+    tape_row: usize,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let pos_i32 = pos as i32;
+    gpu.hip
+        .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::Q8_0 => {
+            gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::F32 => {
+            gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        _ => panic!("unsupported embedding format"),
+    }
+
+    forward_scratch_layers(
+        gpu,
+        weights,
+        config,
+        pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        None,
+        true,
+        Some((gdn_tape, tape_row)),
+    )
 }
 
 /// Per-layer batched intermediates used by `forward_prefill_batch`. Each
@@ -19698,6 +19747,7 @@ pub fn forward_scratch_with_hidden(
         scratch,
         Some(hidden_rb),
         true,
+        None,
     )?;
     hidden_rb.advance_head();
     Ok(())
@@ -19735,7 +19785,7 @@ fn forward_scratch_no_logits(
     }
 
     forward_scratch_layers(
-        gpu, weights, config, pos, kv_cache, dn_state, scratch, None, false,
+        gpu, weights, config, pos, kv_cache, dn_state, scratch, None, false, None,
     )
 }
 
@@ -19762,7 +19812,7 @@ pub fn forward_scratch_embed(
     };
     gpu.hip.memcpy_htod(&scratch.x.buf, bytes)?;
     forward_scratch_layers(
-        gpu, weights, config, pos, kv_cache, dn_state, scratch, None, true,
+        gpu, weights, config, pos, kv_cache, dn_state, scratch, None, true, None,
     )
 }
 
@@ -19856,6 +19906,7 @@ fn forward_scratch_layers(
     s: &Qwen35Scratch,
     mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
     needs_last_token_logits: bool,
+    mut gdn_tape_capture: Option<(&mut crate::speculative::GdnTape, usize)>,
 ) -> HipResult<()> {
     ensure_qwen35_forward_capability(config)?;
     let _dim = config.dim;
@@ -20122,6 +20173,31 @@ fn forward_scratch_layers(
                     k_dim,
                     v_dim,
                 )?;
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let qkv_row_bytes = tape.qkv_dim * 4;
+                    let alpha_beta_row_bytes = tape.n_v_heads * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.qkv_bufs[delta_layer_idx].buf,
+                        *tape_row * qkv_row_bytes,
+                        &s.dn_qkv.buf,
+                        0,
+                        qkv_row_bytes,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.alpha_bufs[delta_layer_idx].buf,
+                        *tape_row * alpha_beta_row_bytes,
+                        &s.dn_alpha.buf,
+                        0,
+                        alpha_beta_row_bytes,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.beta_bufs[delta_layer_idx].buf,
+                        *tape_row * alpha_beta_row_bytes,
+                        &s.dn_beta.buf,
+                        0,
+                        alpha_beta_row_bytes,
+                    )?;
+                }
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 LA beta", &s.dn_beta)?;
                     trace_finite_if_enabled(gpu, "layer 0 LA alpha", &s.dn_alpha)?;

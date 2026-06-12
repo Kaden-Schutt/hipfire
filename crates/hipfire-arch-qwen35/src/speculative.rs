@@ -984,6 +984,48 @@ fn compare_device_buffer_to_snapshot(
     }))
 }
 
+fn compare_device_buffer_prefix_to_snapshot(
+    gpu: &Gpu,
+    family: &'static str,
+    index: usize,
+    actual: &DeviceBuffer,
+    expected: &DeviceBuffer,
+    bytes: usize,
+) -> HipResult<Option<DeltaNetSnapshotDiff>> {
+    if bytes > actual.size() || bytes > expected.size() {
+        return Ok(Some(DeltaNetSnapshotDiff {
+            family,
+            index,
+            bytes,
+            differing_bytes: bytes,
+            first_offset: 0,
+            expected_byte: 0,
+            actual_byte: 0,
+        }));
+    }
+    let mut actual_host = vec![0u8; bytes];
+    let mut expected_host = vec![0u8; bytes];
+    gpu.hip.memcpy_dtoh(&mut actual_host, actual)?;
+    gpu.hip.memcpy_dtoh(&mut expected_host, expected)?;
+    let mut first: Option<usize> = None;
+    let mut differing = 0usize;
+    for (i, (a, e)) in actual_host.iter().zip(expected_host.iter()).enumerate() {
+        if a != e {
+            differing += 1;
+            first.get_or_insert(i);
+        }
+    }
+    Ok(first.map(|first_offset| DeltaNetSnapshotDiff {
+        family,
+        index,
+        bytes,
+        differing_bytes: differing,
+        first_offset,
+        expected_byte: expected_host[first_offset],
+        actual_byte: actual_host[first_offset],
+    }))
+}
+
 fn compare_delta_net_state_to_snapshot(
     gpu: &Gpu,
     actual: &DeltaNetState,
@@ -1544,6 +1586,68 @@ impl GdnTapeShards {
 //      replay-side methods stay where they were. No behavior change
 //      vs pre-Stage-2b.) ──────────────────────────────────────────────
 impl GdnTape {
+    fn compare_captured_inputs_to(
+        &self,
+        gpu: &Gpu,
+        expected: &GdnTape,
+        n_positions: usize,
+    ) -> HipResult<Option<DeltaNetSnapshotDiff>> {
+        let qkv_bytes = n_positions * self.qkv_dim * 4;
+        let alpha_beta_bytes = n_positions * self.n_v_heads * 4;
+        for (i, (actual, expected)) in self
+            .qkv_bufs
+            .iter()
+            .zip(expected.qkv_bufs.iter())
+            .enumerate()
+        {
+            if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                gpu,
+                "qkv",
+                i,
+                &actual.buf,
+                &expected.buf,
+                qkv_bytes,
+            )? {
+                return Ok(Some(diff));
+            }
+        }
+        for (i, (actual, expected)) in self
+            .alpha_bufs
+            .iter()
+            .zip(expected.alpha_bufs.iter())
+            .enumerate()
+        {
+            if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                gpu,
+                "alpha",
+                i,
+                &actual.buf,
+                &expected.buf,
+                alpha_beta_bytes,
+            )? {
+                return Ok(Some(diff));
+            }
+        }
+        for (i, (actual, expected)) in self
+            .beta_bufs
+            .iter()
+            .zip(expected.beta_bufs.iter())
+            .enumerate()
+        {
+            if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                gpu,
+                "beta",
+                i,
+                &actual.buf,
+                &expected.buf,
+                alpha_beta_bytes,
+            )? {
+                return Ok(Some(diff));
+            }
+        }
+        Ok(None)
+    }
+
     /// Replay the full LA sub-pipeline (conv1d + qk-l2norm + repeat-interleave +
     /// GDN recurrence) for `n_steps` across all LinearAttention layers. Advances
     /// both `dn_state.s_matrices`/`s_scales` AND `dn_state.conv_states` by
@@ -4330,8 +4434,9 @@ pub fn spec_step_dflash(
             gdn_result.save_from(&target.dn_state, gpu)?;
 
             target_snap.restore_to(&mut target.dn_state, gpu)?;
+            let mut serial_tape = GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
             for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
-                qwen35::forward_scratch(
+                qwen35::forward_scratch_capture_gdn_tape(
                     gpu,
                     &target.weights,
                     &target.config,
@@ -4340,7 +4445,30 @@ pub fn spec_step_dflash(
                     &mut target.kv_cache,
                     &mut target.dn_state,
                     &target.scratch,
+                    &mut serial_tape,
+                    i,
                 )?;
+            }
+            match serial_tape.compare_captured_inputs_to(gpu, tape, accept_len + 1)? {
+                Some(diff) => eprintln!(
+                    "[dflash-rollback-input-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                    diff.family,
+                    diff.index,
+                    diff.bytes,
+                    diff.differing_bytes,
+                    diff.first_offset,
+                    diff.actual_byte,
+                    diff.expected_byte,
+                ),
+                None => eprintln!(
+                    "[dflash-rollback-input-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
             }
             match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &gdn_result)? {
                 Some(diff) => eprintln!(
@@ -4363,6 +4491,7 @@ pub fn spec_step_dflash(
                     accept_len + 1,
                 ),
             }
+            serial_tape.free_gpu(gpu);
             gdn_result.restore_to(&mut target.dn_state, gpu)?;
             gdn_result.free_gpu(gpu);
         }

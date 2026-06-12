@@ -80,6 +80,11 @@
     `s_matrix[0]` (`bytes=786432`, `differing_bytes=169288`, `first_offset=5`, `serial_byte=124`, `gdn_byte=123`), and the verifier row still
     chooses DFlash token `6511` over AR token `57874`. The next blocker is comparing the captured fast-replay `q/k/v/alpha/beta` inputs against
     serial per-token decode inputs before the first-layer GDN update, then fixing that input/capture drift before re-enabling fast replay.
+    That comparison now shows the drift starts before replay recurrence: at the known position-120 repro, raw captured `qkv` for LA layer 0 differs
+    before the first GDN update (`bytes=40960`, `differing_bytes=22466`, `first_offset=0`, `serial_byte=152`, `gdn_byte=255`). Disabling
+    verify graph leaves the same raw `qkv` mismatch, so this is not graph replay. The first post-prefill DFlash cycle also differs at position 59
+    (`bytes=81920`, `differing_bytes=45778`, `first_offset=0`, `serial_byte=132`, `gdn_byte=88`), which localizes the next blocker to batched
+    verify/tape projection parity versus serial decode projection bytes rather than accumulated fast-rollback state.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
