@@ -1378,7 +1378,7 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K8_4W_GFX1151_SRC: &str =
 ///     per lane half), unlike gfx11/gfx1151's `acc[j] = C[2*j + k_grp][m_lane]`.
 ///   - Per-row HFQ4 sc/zp shuffle uses `src_lane = 8*k_grp + j`.
 ///
-/// **EMPIRICAL RESULT (2026-05-19, R9700/gfx1201, A3B uniform.mq4, prefill=256):
+/// **EMPIRICAL RESULT (2026-05-19, R9700/gfx1201, A3B uniform-mq4.hfq, prefill=256):
 /// 2960 → 2607 tok/s = -11.6% REGRESSION** vs FP16 grouped WMMA. Kernel-level:
 /// 279µs/call (FP16) → 408µs/call (i8) = +46% slowdown despite correctness
 /// PASS (NRMSE ~0.4% on a3b-slice shape). Root cause: i8 WMMA's theoretical
@@ -3220,7 +3220,7 @@ pub const PFLASH_SCORE_FWHT2_KV_SRC: &str =
     include_str!("../../../kernels/src/pflash/score_fwht2_kv.hip");
 
 // ─── DeepSeek V4 Flash (arch_id=9) — kernels ─────────────────────────────────
-// All kernel sources required by the deepseek-v4-flash.mq2lloyd serving path.
+// All kernel sources required by the deepseek-v4-flash-lloyd-mq2.hfq serving path.
 // Registered as `pub const X_SRC: &str = include_str!(...)`.
 
 /// MQ2-Lloyd MoE indexed family: routed-experts gate_up + down with
@@ -3521,7 +3521,7 @@ pub const WO_PER_GROUP_BATCHED_HFQ4G256_SRC: &str =
 
 /// DeepSeek V4 per-group O-LoRA batched GEMV for Q8_0-packed wo_a (Phase D,
 /// 2026-05-21). Sibling of `wo_per_group_batched_hfq4g256` for the
-/// deepseek4-mq2lloyd-q8 build where wo_a is Q8_0. Single launch in place of
+/// deepseek4-lloyd-mq2-q8 build where wo_a is Q8_0. Single launch in place of
 /// B × G `gemv_q8_0` calls — collapses ~32k per-chunk dispatches.
 pub const WO_PER_GROUP_BATCHED_Q8_0_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_q8_0.hip");

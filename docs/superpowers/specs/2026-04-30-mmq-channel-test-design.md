@@ -46,7 +46,7 @@ through both the f16 WMMA and MMQ paths and diffs the outputs on CPU.
 
 ```
 cargo run --release --example channel_test_mmq -- \
-  --model models/qwen3.6-27b.mq4 \
+  --model models/qwen3.6-27b-mq4.hfq \
   --prompt benchmarks/prompts/tool_call_read_file.txt \
   --system benchmarks/prompts/tool_call_system.txt \
   --stage {site-scan|channel-map|layer-sweep} \
@@ -264,7 +264,7 @@ GEMM sites in MoE layers.
 
 ```json
 {
-  "model": "qwen3.6-27b.mq4",
+  "model": "qwen3.6-27b-mq4.hfq",
   "prompt_md5": "a1b2c3...",
   "stage": "site-scan",
   "arch": "gfx1151",

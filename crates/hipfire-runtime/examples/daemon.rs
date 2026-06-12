@@ -8944,7 +8944,7 @@ fn main() {
 ///      that template wins. Operator escape hatch / debugging knob.
 ///   2. Per-model file at `~/.hipfire/templates/<sanitized-tag>.j2`
 ///      where the tag is derived from the model file basename
-///      (`qwen3.5-9b.mq4` → `qwen3.5-9b.mq4.j2`). User-controllable
+///      (`qwen3.5-9b-mq4.hfq` → `qwen3.5-9b-mq4.hfq.j2`). User-controllable
 ///      override for a specific model without env-var globalness.
 ///   3. HFQ-embedded `tokenizer_config.chat_template`. Default — what
 ///      the model was trained with.
@@ -9121,7 +9121,7 @@ fn load_model(
     // speculative.rs's `try_batched` predicate (lines 2083-2087,
     // 2606-2609); every other dtype falls through to a per-row sequential
     // GEMV path that hangs spec verify (observed: 1 token in 240 s on
-    // 27B MQ3 + dflash-mq4 draft).
+    // 27B MQ3 + mq4.dflash draft).
     //
     // Refuse fast at the HFQ-index level — BEFORE any weight upload, KV
     // alloc, or scratch alloc — so we don't strand ~12 GB of VRAM in the

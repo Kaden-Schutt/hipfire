@@ -11,8 +11,8 @@
 #
 # Usage:
 #   ./scripts/distill/run_distill_parallel.sh \
-#     --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-#     --drafter ~/.hipfire/models/qwen3.5-9b.mq4 \
+#     --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
+#     --drafter ~/.hipfire/models/qwen3.5-9b-mq4.hfq \
 #     --prompts-dir /tmp/distill_prompts \
 #     --output-dir /tmp/distill_outputs \
 #     --gpus 4 \

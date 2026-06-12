@@ -191,7 +191,7 @@ task never needs the write lock.
    Use `tokio::spawn` from the handler; share `AppState` via `Arc`.
 
 4. **Model discovery ordering**: Port the 6-level chain exactly.
-   The fuzzy filesystem walk prefers `mq4 > hf4 > legacy > mq3 > mq2lloyd
+   The fuzzy filesystem walk prefers `mq4 > hf4 > legacy > mq3 > lloyd-mq2
    > mq6 > hf6 > q8`. Wrong ordering changes which model loads.
 
 5. **Config validation**: Port `validateConfigValue` switch exactly.

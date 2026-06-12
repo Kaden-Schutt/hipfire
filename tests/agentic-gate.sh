@@ -164,8 +164,8 @@ find_model_file() {
     local name="$1"
     local stem alt dot_alt dir cand
     stem="${name%.hfq}"
-    alt="${stem/.mq4/-mq4}"
-    dot_alt="${stem/-mq4/.mq4}"
+    alt="${stem/-mq4.hfq/-mq4}"
+    dot_alt="${stem/-mq4/-mq4.hfq}"
     for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
         for cand in \
             "$dir/$name" \
@@ -181,11 +181,11 @@ find_model_file() {
     return 1
 }
 
-A3B_35="$(find_model_file "qwen3.5-35b-a3b.mq4" || true)"
+A3B_35="$(find_model_file "qwen3.5-35b-a3b-mq4.hfq" || true)"
 # Defaults to the Qwen3.6 A3B artifact. If the old zero-token issue recurs,
-# set HIPFIRE_AGENTIC_GATE_QWEN36_MODEL=qwen3.6-27b.mq4 to force the dense
+# set HIPFIRE_AGENTIC_GATE_QWEN36_MODEL=qwen3.6-27b-mq4.hfq to force the dense
 # predicate-only fallback without changing the script.
-A3B_36="$(find_model_file "${HIPFIRE_AGENTIC_GATE_QWEN36_MODEL:-qwen3.6-35b-a3b.mq4}" || true)"
+A3B_36="$(find_model_file "${HIPFIRE_AGENTIC_GATE_QWEN36_MODEL:-qwen3.6-35b-a3b-mq4.hfq}" || true)"
 PI_SYS="benchmarks/prompts/agentic_pi_system.txt"
 HERMES_SYS="benchmarks/prompts/agentic_hermes_system.txt"
 USER_READ="benchmarks/prompts/agentic_user_read.txt"
@@ -249,9 +249,9 @@ names = {fname}
 if fname.endswith(".hfq"):
     names.add(fname[:-4])
 for name in list(names):
-    names.add(name.replace("-mq4", ".mq4"))
-    names.add(name.replace("-mq6", ".mq6"))
-    names.add(name.replace("-mq3", ".mq3"))
+    names.add(name.replace("-mq4", "-mq4.hfq"))
+    names.add(name.replace("-mq6", "-mq6.hfq"))
+    names.add(name.replace("-mq3", "-mq3.hfq"))
 with open(sys.argv[2]) as fh:
     data = json.load(fh)
 for entry in data.get("models", {}).values():
@@ -441,7 +441,7 @@ done
 
 # Iterate models; per model, build a single JSONL session.
 for model in "${!MODEL_CELLS[@]}"; do
-    model_short="$(basename "$model" .mq4)"
+    model_short="$(basename "$model" -mq4.hfq)"
     echo "## $model_short" >> "$OUT"
     echo >> "$OUT"
     echo "agentic-gate: model $model_short ($(echo "${MODEL_CELLS[$model]}" | grep -c '|') cells)..."

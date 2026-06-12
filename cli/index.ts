@@ -764,8 +764,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   //    draft would otherwise be found.
   //
   // 2. Auto-match: look alongside the target for a file named with the new
-  //    role-sidecar convention, e.g. `qwen3.5-27b-mq4.dflash.hfq`. Legacy
-  //    `qwen35-<size>-dflash-<quant>.hfq` names are still accepted. Size is
+  //    role-sidecar convention, e.g. `qwen3.5-27b-mq4.dflash.hfq`. Size is
   //    extracted from the target path (e.g. `qwen3.5-27b-mq4.hfq` → size=27b).
   //    Only runs when #1 is unset.
   //
@@ -1027,11 +1026,7 @@ const REGISTRY: Record<string, ModelEntry> = registryData.models as Record<strin
 const ALIASES: Record<string, string>    = registryData.aliases as Record<string, string>;
 
 export function resolveModelTag(input: string): string {
-  // Backward compat: old hfq4/hfq6 tags → hf4/hf6
-  let normalized = input.replace(/-hfq(\d)/, "-hf$1");
-  if (normalized.endsWith(".hfq") && !artifactQuantToken(normalized) && !isRoleSidecarArtifact(normalized)) {
-    normalized = normalized.replace(/\.hfq$/, ".hf4");
-  }
+  const normalized = input;
   // Direct registry match
   if (REGISTRY[normalized]) return normalized;
   // Alias
@@ -1870,8 +1865,6 @@ function inferQuantFamilyForPath(modelPath: string): string {
   const lower = modelPath.toLowerCase();
   const token = artifactQuantToken(lower);
   if (token) return token;
-  if (lower.includes(".hf4") || lower.includes("-hfq4")) return "hf4";
-  if (lower.includes(".hf6") || lower.includes("-hfq6")) return "hf6";
   if (lower.includes("mq3")) return "mq3";
   if (lower.includes("mq6")) return "mq6";
   if (lower.includes("q8")) return "q8";
@@ -6904,10 +6897,8 @@ function findTriAttnValidateBinary(): string | null {
 
 function artifactFormatToken(format: string): string {
   switch (format.toLowerCase()) {
-    case "mq2-lloyd":
-    case "mq2g256-lloyd":
-    case "mq2lloyd":
-      return "mq2lloyd";
+    case "lloyd-mq2":
+      return "lloyd-mq2";
     case "hfq4":
     case "hfq4g256":
       return "hf4";
@@ -6921,19 +6912,23 @@ function artifactFormatToken(format: string): string {
   }
 }
 
+function artifactFileToken(format: string): string {
+  return artifactFormatToken(format);
+}
+
 function artifactFileName(stem: string, format: string): string {
-  const token = artifactFormatToken(format);
-  return new RegExp(`(?:^|[-.])${token}$`, "i").test(stem)
+  const token = artifactFileToken(format);
+  return new RegExp(`(?:^|-)${token}$`, "i").test(stem)
     ? `${stem}.hfq`
     : `${stem}-${token}.hfq`;
 }
 
 function artifactQuantToken(filename: string): string | null {
   const lower = filename.toLowerCase();
-  const canonical = lower.match(/(?:^|[-.])(mq2lloyd|mq3|mq4|mq6|hf4|hf6|q8|q8f16)(?:\+[^.]*)?\.hfq$/);
+  const lloydMq2 = lower.match(/(?:^|-)lloyd-mq2(?:\+[^.]*)?\.hfq$/);
+  if (lloydMq2) return "lloyd-mq2";
+  const canonical = lower.match(/(?:^|-)(mq[1-8]|hf[1-8]|q8|q8f16)(?:\+[^.]*)?\.hfq$/);
   if (canonical) return artifactFormatToken(canonical[1]);
-  const legacy = lower.match(/\.(mq2lloyd|mq3|mq4|mq6|hf4|hf6)$/);
-  if (legacy) return artifactFormatToken(legacy[1]);
   return null;
 }
 
@@ -6948,7 +6943,7 @@ function defaultRoleSidecarPath(modelPath: string, role: string): string {
 }
 
 function parseQwenQuantArtifact(filename: string): { version: string; size: string; quant: string } | null {
-  const m = filename.toLowerCase().match(/qwen3[._-]?(5|6)[-_](.+?)(?:[-.])(mq3|mq4|mq6|hf4|hf6|hfq4|hfq6|q8)(?:\+[^.]*)?(?:\.hfq)?$/);
+  const m = filename.toLowerCase().match(/qwen3[._-]?(5|6)[-_](.+?)-(mq[1-8]|hf[1-8]|hfq4|hfq6|q8)(?:\+[^.]*)?(?:\.hfq)?$/);
   if (!m) return null;
   return {
     version: m[1],
@@ -6958,16 +6953,7 @@ function parseQwenQuantArtifact(filename: string): { version: string; size: stri
 }
 
 function modelFileAliases(filename: string): string[] {
-  const aliases = new Set<string>([filename]);
-  const token = artifactQuantToken(filename);
-  if (token && filename.endsWith(`-${token}.hfq`)) {
-    aliases.add(filename.replace(new RegExp(`-${token}\\.hfq$`, "i"), `.${token}`));
-  }
-  if (token && filename.endsWith(`.${token}.hfq`)) {
-    aliases.add(filename.replace(new RegExp(`\\.${token}\\.hfq$`, "i"), `.${token}`));
-  }
-  aliases.add(filename.replace(/\.q4\.hfq$/, ".hf4").replace(/\.hfq6\.hfq$/, ".hf6").replace(/-hfq4\.hfq$/, ".hf4").replace(/\.hfq$/, ".hf4"));
-  return [...aliases];
+  return [filename];
 }
 
 interface QuantizeOpts {
@@ -7211,45 +7197,31 @@ export function findModel(name: string): string | null {
   if (entry) {
     const p = join(MODELS_DIR, entry.file);
     if (existsSync(p)) return p;
-    // Backward compat: try old .hfq naming for the SAME quant level only
-    // (only applies to old .hf4 / .hf6 registry entries).
-    if (entry.file.endsWith(".hf4") || entry.file.endsWith(".hf6")) {
-      const base = entry.file.replace(/\.(hf4|hf6)$/, "");
-      const isHf6 = entry.file.endsWith(".hf6");
-      const oldNames = isHf6
-        ? [base + ".hfq6.hfq"]                              // HF6 → only try old hfq6
-        : [base + ".q4.hfq", base + "-hfq4.hfq", base + ".hfq"];  // HF4 → only try old q4/hfq4
-      for (const old of oldNames) {
-        const op = join(MODELS_DIR, old);
-        if (existsSync(op)) return op;
-      }
-    }
   }
 
   // Fuzzy search local dirs (top-level + one level of subdirectories)
-  // If the name includes a quant hint (hf4/hf6/mq3/mq4/mq6/q8), match exactly.
+  // If the name includes a quant hint (hfN/mqN/q8), match exactly.
   // Otherwise prefer MQ4 (default quant: FWHT-rotated 4-bit, quality-gated,
   // WMMA-accelerated on RDNA3+). Fall back to HF4 only if no MQ4 is found
   // so Qwen3 (which currently ships only HF4) still resolves.
   const searchName = name.replace(":", "-");
-  const hasQuantHint = /(?:^|[-.])(hf[46]|mq2lloyd|mq[346]|q8)(?:\+[^.]*)?(?:\.hfq)?$/i.test(name);
+  const hasQuantHint = /(?:^|-)(hf[1-8]|mq[1-8]|lloyd-mq2|q8|q8f16)(?:\+[^.]*)?(?:\.hfq)?$/i.test(name);
   const matchesName = (f: string) => f === name || f === searchName
     || f.includes(name) || f.includes(searchName);
   const hasValidExt = (f: string) => !isRoleSidecarArtifact(f)
-    && (artifactQuantToken(f) !== null || f.endsWith(".hfq"));
+    && artifactQuantToken(f) !== null;
 
-  // Preference order when no quant hint: MQ4 → HF4 → legacy HFQ → MQ3 → MQ6 → HF6 → Q8.
+  // Preference order when no quant hint: MQ4 → HF4 → MQ3 → Lloyd MQ2 → MQ6 → HF6 → Q8.
   // (MQ6 only if explicitly asked; HF6 ditto — both are larger files.)
   const extPriority = (f: string): number => {
     const token = artifactQuantToken(f);
     if (token === "mq4") return 0;
     if (token === "hf4") return 1;
-    if (f.endsWith(".hfq") && !token) return 2; // legacy HF4 naming
-    if (token === "mq3") return 3;
-    if (token === "mq2lloyd") return 4;
-    if (token === "mq6") return 5;
-    if (token === "hf6") return 6;
-    if (token === "q8") return 7;
+    if (token === "mq3") return 2;
+    if (token === "lloyd-mq2") return 3;
+    if (token === "mq6") return 4;
+    if (token === "hf6") return 5;
+    if (token === "q8") return 6;
     return 99;
   };
 
@@ -7259,17 +7231,8 @@ export function findModel(name: string): string | null {
     if (f === name || f === searchName) return true;
     // With a quant hint in the name, caller is explicit — any matching file is fine.
     if (hasQuantHint) return true;
-    // No hint: accept any valid extension; extPriority picks the best one.
-    // Still filter .hfq to default-q4 flavor (.q4.hfq / -hfq4.hfq stems) so
-    // we don't return an experimental -hfq4g128.hfq instead of a proper MQ4.
-    if (f.endsWith(".hfq")) {
-      const token = artifactQuantToken(f);
-      if (token) return true;
-      const stem = f.slice(0, -4);
-      const isDefaultQ4 = stem.endsWith(".q4") || stem.endsWith("-hfq4")
-        || stem === searchName || stem === name;
-      if (!isDefaultQ4) return false;
-    }
+    // No hint: accept any canonical quant artifact; extPriority picks the best one.
+    if (!artifactQuantToken(f)) return false;
     return true;
   };
 
@@ -7305,7 +7268,7 @@ function listLocal() {
     let entries: string[];
     try { entries = readdirSync(dir); } catch { continue; }
     for (const f of entries) {
-      if (!isRoleSidecarArtifact(f) && (artifactQuantToken(f) !== null || f.endsWith(".hfq")) && !seen.has(f)) {
+      if (!isRoleSidecarArtifact(f) && artifactQuantToken(f) !== null && !seen.has(f)) {
         seen.add(f);
         // statSync may throw on dangling symlinks or files removed mid-scan;
         // skip those individually instead of aborting the rest of the loop
@@ -9389,26 +9352,6 @@ switch (cmd) {
         console.error(`  Updated ${gpuArch} kernels ✓ (cache cleared)`);
       }
     }
-    // Rename legacy .hfq model files to -hf4.hfq/-hf6.hfq. New convention files such
-    // as <stem>-mq4.hfq and role sidecars such as <stem>.triattn.hfq are
-    // already canonical and must not be touched.
-    const { renameSync } = await import("fs");
-    try {
-      for (const f of readdirSync(MODELS_DIR)) {
-        if (!f.endsWith(".hfq")) continue;
-        if (artifactQuantToken(f) || isRoleSidecarArtifact(f)) continue;
-        let newName = "";
-        if (f.endsWith(".q4.hfq")) newName = f.replace(/\.q4\.hfq$/, "-hf4.hfq");
-        else if (f.endsWith(".hfq6.hfq")) newName = f.replace(/\.hfq6\.hfq$/, "-hf6.hfq");
-        else if (f.match(/-hfq4\.hfq$/)) newName = f.replace(/-hfq4\.hfq$/, "-hf4.hfq");
-        else if (f.match(/-hfq4g\d+\.hfq$/)) continue; // skip experimental variants
-        else newName = f.replace(/\.hfq$/, "-hf4.hfq"); // bare .hfq → assume hf4
-        if (newName && newName !== f && !existsSync(join(MODELS_DIR, newName))) {
-          renameSync(join(MODELS_DIR, f), join(MODELS_DIR, newName));
-          console.error(`  Renamed ${f} → ${newName}`);
-        }
-      }
-    } catch {}
     // Pre-compile GPU kernels so `hipfire serve` starts instantly
     const daemonForPrecompile = join(binDir, `daemon${exe}`) ;
     if (existsSync(daemonForPrecompile)) {

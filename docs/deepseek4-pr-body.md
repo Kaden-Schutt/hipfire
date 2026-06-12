@@ -1,7 +1,7 @@
 # Add DeepSeek V4 Flash support (arch_id=9)
 
 Bring DeepSeek V4 Flash onto the canonical upstream serving path.
-Targets the production `deepseek-v4-flash.mq2lloyd` build: MQ2-Lloyd
+Targets the production `deepseek-v4-flash-lloyd-mq2.hfq` build: MQ2-Lloyd
 routed experts (96 % of bytes), Q8_0 attention + router + shared-expert
 weights, F16 compressor / indexer / Hyper-Connections / norms. KV cache
 at runtime is F32 (raw SWA window + compressed-KV indexer). End-to-end:
@@ -43,8 +43,8 @@ DeepSeek V4 diverges from the qwen35 / LLaMA paths in five load-bearing places:
 
 ## Perf numbers (gfx1151 / Strix Halo / Radeon 8060S)
 
-All measured against `/data/hipfire-models/deepseek-v4-flash.mq2lloyd`
-(arch_id=9, MTP layer in `deepseek-v4-flash-mtp.mq2lloyd` sidecar).
+All measured against `/data/hipfire-models/deepseek-v4-flash-lloyd-mq2.hfq`
+(arch_id=9, MTP layer in `deepseek-v4-flash-mtp-lloyd-mq2.hfq` sidecar).
 
 | Config | PP tok/s | TG tok/s | Notes |
 |---|---:|---:|---|
@@ -101,11 +101,11 @@ Optionally split off the MTP layer into a sidecar (so non-spec-decode
 users skip the 1.85 GB MTP upload):
 
 ```bash
-hfq_split deepseek-v4-flash.mq2lloyd \
-    --base   deepseek-v4-flash.mq2lloyd.new \
-    --addon  deepseek-v4-flash-mtp.mq2lloyd \
+hfq_split deepseek-v4-flash-lloyd-mq2.hfq \
+    --base   deepseek-v4-flash-lloyd-mq2.hfq.new \
+    --addon  deepseek-v4-flash-mtp-lloyd-mq2.hfq \
     --addon-prefix mtp.0.
-mv deepseek-v4-flash.mq2lloyd.new deepseek-v4-flash.mq2lloyd
+mv deepseek-v4-flash-lloyd-mq2.hfq.new deepseek-v4-flash-lloyd-mq2.hfq
 ```
 
 The runtime picks up the addon via either

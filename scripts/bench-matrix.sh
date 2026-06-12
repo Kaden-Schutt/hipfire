@@ -9,7 +9,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-MODEL=${1:-/tmp/qwen3-8b-hfq4.hfq}
+MODEL=${1:-/tmp/qwen3-8b-hf4.hfq}
 INFER=$REPO/target/release/examples/infer_hfq
 OUT=$REPO/bench/results/turbo-matrix.txt
 

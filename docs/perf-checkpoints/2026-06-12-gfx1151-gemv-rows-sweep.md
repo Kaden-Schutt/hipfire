@@ -18,13 +18,13 @@ whether the MoE decode mix needs a different default.
 HIPFIRE_GEMV_ROWS=$rows HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
   cargo run --release --features deltanet -p hipfire-runtime \
   --example bench_qwen35_speed -- \
-  ~/.hipfire/models/qwen3.5-4b.mq4.hfq \
+  ~/.hipfire/models/qwen3.5-4b-mq4.hfq \
   --prefill 32 --prefill-runs 1 --warmup 5 --gen 50
 
 HIPFIRE_GEMV_ROWS=$rows HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
   cargo run --release --features deltanet -p hipfire-runtime \
   --example bench_qwen35_speed -- \
-  ~/.hipfire/models/qwen3.5-9b.mq4.hfq \
+  ~/.hipfire/models/qwen3.5-9b-mq4.hfq \
   --prefill 32 --prefill-runs 1 --warmup 5 --gen 50
 
 HIPFIRE_GEMV_ROWS=$rows HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \

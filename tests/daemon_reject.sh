@@ -7,7 +7,7 @@
 # NOT expected: silent overrun / crash.
 
 set -euo pipefail
-MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4}"
+MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b-mq4.hfq}"
 DAEMON="target/release/examples/daemon"
 
 if [[ ! -f "$MODEL" ]]; then echo "missing model: $MODEL"; exit 2; fi

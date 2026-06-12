@@ -21489,7 +21489,7 @@ impl Gpu {
     /// layout + grouped dispatch contract; differs only in the 200 B/group
     /// HFQ6 dequant inner loop. Unblocks AWQ A3B prefill (where ~50% of
     /// experts are MQ6 not MQ4 in the production AWQ A3B build at
-    /// /mnt/nas/kaden/hipfire/mi300x-v3/qwen3-35b-a3b.mq4-awq).
+    /// /mnt/nas/kaden/hipfire/mi300x-v3/qwen3-35b-a3b-awq-mq4.hfq).
     ///
     /// `x_row_div` selects the X gather layout (identical to the HFQ4 sister):
     ///   gate_up: x_src = x_rot_batch [N × K], x_row_div = K_TOP
@@ -47769,7 +47769,7 @@ impl Gpu {
 
     /// DeepSeek V4 per-group O-LoRA batched GEMV — Q8_0-packed wo_a.
     /// Sibling of `wo_per_group_batched_hfq4g256` for the Q8 case
-    /// (deepseek4-mq2lloyd-q8 builds). Single launch in place of B × G
+    /// (deepseek4-lloyd-mq2-q8 builds). Single launch in place of B × G
     /// per-position `gemv_q8_0` calls — collapses the per-(b, g) loop
     /// in `attention_block_batched_*` for Q8_0 wo_a.
     #[allow(clippy::too_many_arguments)]

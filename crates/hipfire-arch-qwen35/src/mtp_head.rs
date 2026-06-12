@@ -745,17 +745,17 @@ impl Qwen35MtpHead {
     }
 }
 
-// ─── Bundled .mq4-mtp loader (trunk + MTP head in one file) ───────────────
+// ─── Bundled -mq4+mtp.hfq loader (trunk + MTP head in one file) ───────────────
 
 /// Trailer magic written by `mq4_merge_mtp`. Indicates the file is a bundle
-/// of a trunk `.mq4` followed by an MTP `.mtp` section.
+/// of a trunk `-mq4.hfq` followed by an MTP `.mtp` section.
 pub const BUNDLE_TRAILER_MAGIC: &[u8; 8] = b"HFBNDMTP";
 /// Trailer is 8 bytes magic + 8 bytes u64 mtp-section offset = 16 bytes.
 pub const BUNDLE_TRAILER_LEN: u64 = 16;
 
 /// Inspect a file's trailing 16 bytes for the `mq4_merge_mtp` trailer. If
 /// present, returns the byte offset where the embedded MTP `.mtp` section
-/// starts. Returns `None` for plain `.mq4` trunk files (no MTP bundled).
+/// starts. Returns `None` for plain `-mq4.hfq` trunk files (no MTP bundled).
 ///
 /// Cheap operation — single 16-byte read from end of file. Safe to call
 /// on any path: returns `Ok(None)` rather than erroring when the file is
@@ -783,11 +783,11 @@ pub fn detect_bundled_mtp_offset(path: &Path) -> std::io::Result<Option<u64>> {
     Ok(Some(mtp_offset))
 }
 
-/// Load the MTP head section embedded inside a bundled `.mq4-mtp` file.
+/// Load the MTP head section embedded inside a bundled `-mq4+mtp.hfq` file.
 /// `path` is the bundle file path; the trailer is read to find the embedded
 /// MTP section offset, then [`load_mtp_head_at_offset`] parses it.
 ///
-/// Returns `Ok(None)` if `path` is a plain trunk `.mq4` (no bundle trailer).
+/// Returns `Ok(None)` if `path` is a plain trunk `-mq4.hfq` (no bundle trailer).
 pub fn load_mtp_head_bundled(
     path: &Path,
     gpu: &mut Gpu,
@@ -796,7 +796,7 @@ pub fn load_mtp_head_bundled(
     let mtp_offset = match detect_bundled_mtp_offset(path) {
         Ok(Some(off)) => off,
         Ok(None) => return Ok(None),
-        // Return Err (not panic): the daemon auto-probes every .mq4 trunk for a
+        // Return Err (not panic): the daemon auto-probes every -mq4.hfq trunk for a
         // bundled trailer on load; an IO error here must not crash the process.
         Err(e) => {
             return Err(hip_bridge::HipError::new(
@@ -822,7 +822,7 @@ pub fn load_mtp_head(path: &Path, gpu: &mut Gpu, max_seq: usize) -> HipResult<Qw
 
 /// Like [`load_mtp_head`] but opens the HFQM container at `base_offset`
 /// inside `path`. Pass `0` for a standalone `.mtp` file; for a bundled
-/// `.mq4-mtp` file pass the offset returned by [`detect_bundled_mtp_offset`].
+/// `-mq4+mtp.hfq` file pass the offset returned by [`detect_bundled_mtp_offset`].
 pub fn load_mtp_head_at_offset(
     path: &Path,
     gpu: &mut Gpu,

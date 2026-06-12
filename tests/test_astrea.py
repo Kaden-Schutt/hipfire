@@ -386,7 +386,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "synthetic.mq4"
+            model = root / "synthetic-mq4.hfq"
             imatrix = root / "imatrix.gguf"
             self.write_minimal_hfq(
                 model,
@@ -727,7 +727,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
 
         plan = astrea.build_plan(
-            model="/mnt/nas/qwen3.5-9b.mq4",
+            model="/mnt/nas/qwen3.5-9b-mq4.hfq",
             formats=["mq4"],
             methods=["imatrix-scale", "awq", "gptq"],
             recipe_stages=[
@@ -777,7 +777,7 @@ class AstreaTests(unittest.TestCase):
             source_dir = root / "source"
             source_dir.mkdir()
             model = root / "synthetic-mq4.hfq"
-            candidate = root / "synthetic.ls.mq4.hfq"
+            candidate = root / "synthetic-ls-mq4.hfq"
             imatrix = root / "imatrix.gguf"
             plan_path = root / "plan.json"
             tensor_name = "model.language_model.layers.0.mlp.gate_proj.weight"
@@ -836,7 +836,7 @@ class AstreaTests(unittest.TestCase):
             source_dir = root / "source"
             source_dir.mkdir()
             model = root / "synthetic-mq4.hfq"
-            candidate = root / "synthetic.awq.mq4.hfq"
+            candidate = root / "synthetic-awq-mq4.hfq"
             imatrix = root / "imatrix.gguf"
             plan_path = root / "plan.json"
             tensor_name = "model.language_model.layers.0.mlp.gate_proj.weight"
@@ -896,7 +896,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             sensitivity = root / "sensitivity.json"
             self.write_minimal_hfq(
                 model,
@@ -960,7 +960,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             imatrix = root / "imatrix.gguf"
             self.write_minimal_hfq(
                 model,
@@ -999,7 +999,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             imatrix = root / "imatrix.gguf"
             tensor_name = "model.language_model.layers.0.mlp.gate_proj.weight"
             self.write_minimal_hfq(
@@ -1033,7 +1033,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             sensitivity = root / "groups.json"
             tensor_name = "model.language_model.layers.0.mlp.up_proj.weight"
             self.write_minimal_hfq(
@@ -1078,7 +1078,7 @@ class AstreaTests(unittest.TestCase):
     def test_mixed_policy_refuses_lloyd_formats_in_v1(self):
         astrea = load_astrea()
         with self.assertRaisesRegex(ValueError, "refuses them"):
-            astrea.normalize_mixed_g256_formats(["mq3", "mq3-lloyd"], allow_mq2=False)
+            astrea.normalize_mixed_g256_formats(["mq3", "lloyd-mq3"], allow_mq2=False)
 
     def test_mixed_policy_awq_eligibility_is_mq3_mq4_only(self):
         astrea = load_astrea()
@@ -1098,7 +1098,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             sensitivity = root / "sensitivity.json"
             anchor_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
             dependent_name = "model.language_model.layers.0.linear_attn.in_proj_a.weight"
@@ -1144,7 +1144,7 @@ class AstreaTests(unittest.TestCase):
             root = Path(td)
             source_dir = root / "source"
             source_dir.mkdir()
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             candidate = root / "candidate.mixed.hfq"
             selected_name = "model.language_model.layers.0.mlp.gate_proj.weight"
             untouched_name = "model.language_model.layers.0.mlp.down_proj.weight"
@@ -1205,7 +1205,7 @@ class AstreaTests(unittest.TestCase):
             root = Path(td)
             source_dir = root / "source"
             source_dir.mkdir()
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             candidate = root / "candidate.mixed.hfq"
             anchor_name = "model.language_model.layers.0.self_attn.q_proj.weight"
             dependent_name = "model.language_model.layers.0.self_attn.k_proj.weight"
@@ -1253,7 +1253,7 @@ class AstreaTests(unittest.TestCase):
             root = Path(td)
             source_dir = root / "source"
             source_dir.mkdir()
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             candidate = root / "candidate.mixed.hfq"
             policy_path = root / "policy.json"
             tensor_name = "model.language_model.layers.0.mlp.gate_proj.weight"
@@ -1298,7 +1298,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "qwen3.6-a3b.mq4.hfq"
+            model = root / "qwen3.6-a3b-mq4.hfq"
             sensitivity = root / "sensitivity.json"
             self.write_minimal_hfq(
                 model,
@@ -1346,7 +1346,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             sensitivity = root / "sensitivity.json"
             self.write_minimal_hfq(
                 model,
@@ -1398,7 +1398,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             triattn = root / "synthetic-mq4.triattn.hfq"
             self.write_minimal_hfq(model)
             triattn.write_bytes(b"TRIA" + b"\0" * 32)
@@ -1425,7 +1425,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             triattn = root / "synthetic-mq4.triattn.hfq"
             self.write_minimal_hfq(model)
             triattn.write_bytes(b"TRIA" + b"\0" * 32)
@@ -1623,7 +1623,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             triattn = root / "synthetic-mq4.triattn.hfq"
             self.write_minimal_hfq(model)
             triattn.write_bytes(b"TRIA" + b"\0" * 32)

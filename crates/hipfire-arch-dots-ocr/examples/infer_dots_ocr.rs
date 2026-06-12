@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! cargo run --release --example infer_dots_ocr -p hipfire-arch-dots-ocr -- \
-//!     --hfq ~/.hipfire/models/dots-ocr.q8.hfq \
+//!     --hfq ~/.hipfire/models/dots-ocr-q8.hfq \
 //!     --image benchmarks/images/dots_ocr_smoke_001.jpg \
 //!     --reference benchmarks/references/dots_ocr_smoke_001_activations
 //! ```

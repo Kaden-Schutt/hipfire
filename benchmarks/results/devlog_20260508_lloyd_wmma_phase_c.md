@@ -27,7 +27,7 @@ consistent with prior B2 numbers and not a Lloyd-specific regression.
 | Field | Value |
 |---|---|
 | Tool | `target/release/examples/bench_qwen35_speed` |
-| Models | `qwen3.5-9b.mq3` (uniform), `qwen3.5-9b.mq3-lloyd` |
+| Models | `qwen3.5-9b-mq3.hfq` (uniform), `qwen3.5-9b-lloyd-mq3.hfq` |
 | Flags | `--prefill 256 --warmup 5 --prefill-runs 3 --gen 30` |
 | Env | `HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1` |
 | Cross-process A/B | 3 fresh process invocations × 2 models |
@@ -48,13 +48,13 @@ session-state effects (DPM, thermal, fragmented HSA queues).
 ## Raw numbers (gfx1100, ROCm 7.2, branch HEAD 053f78d)
 
 ```
-=== qwen3.5-9b.mq3 (uniform) ===
+=== qwen3.5-9b-mq3.hfq (uniform) ===
   run 1: prefill_median=1745.8 tok/s, gen=121.6 tok/s
   run 2: prefill_median=1673.2 tok/s, gen=121.3 tok/s
   run 3: prefill_median=1739.8 tok/s, gen=121.7 tok/s
   → prefill mean = 1719.6 tok/s   gen mean = 121.5 tok/s
 
-=== qwen3.5-9b.mq3-lloyd ===
+=== qwen3.5-9b-lloyd-mq3.hfq ===
   run 1: prefill_median=1527.6 tok/s, gen=114.5 tok/s
   run 2: prefill_median=1514.1 tok/s, gen=114.3 tok/s
   run 3: prefill_median=1508.2 tok/s, gen=114.0 tok/s
@@ -99,13 +99,13 @@ same `_rdna3` kernel as gfx1100, so this round confirms behaviour
 matches across the gfx11 family.
 
 ```
-=== qwen3.5-9b.mq3 (uniform) ===
+=== qwen3.5-9b-mq3.hfq (uniform) ===
   inv 1: prefill_median=514.8 tok/s, gen=53.8 tok/s
   inv 2: prefill_median=520.2 tok/s, gen=53.8 tok/s
   inv 3: prefill_median=520.6 tok/s, gen=53.9 tok/s
   → prefill mean = 518.5 tok/s   gen mean = 53.8 tok/s
 
-=== qwen3.5-9b.mq3-lloyd ===
+=== qwen3.5-9b-lloyd-mq3.hfq ===
   inv 1: prefill_median=495.3 tok/s, gen=49.1 tok/s
   inv 2: prefill_median=503.3 tok/s, gen=48.9 tok/s
   inv 3: prefill_median=505.5 tok/s, gen=49.1 tok/s
@@ -116,8 +116,8 @@ Decode-regression check at the canonical probe-commits shape
 (`--prefill 16 --warmup 3 --gen 30`, 3 fresh invocations × 2 models):
 
 ```
-qwen3.5-9b.mq3      : gen 55.7 / 56.0 / 55.7 → mean 55.8 tok/s
-qwen3.5-9b.mq3-lloyd: gen 50.5 / 50.6 / 50.7 → mean 50.6 tok/s
+qwen3.5-9b-mq3.hfq      : gen 55.7 / 56.0 / 55.7 → mean 55.8 tok/s
+qwen3.5-9b-lloyd-mq3.hfq: gen 50.5 / 50.6 / 50.7 → mean 50.6 tok/s
 ```
 
 | Comparison | Numerator | Denominator | Ratio | Verdict |
@@ -158,19 +158,19 @@ fluent output and terminate cleanly with `<|im_end|>`. Raw rows from
 `/tmp/coherence-gfx1151-pr195.md`:
 
 ```
-qwen3.5-4b.mq3-lloyd / cap-mq3-lloyd-4b
+qwen3.5-4b-lloyd-mq3.hfq / cap-mq3-lloyd-4b
   prefill 21 tok @ 457.4 tok/s  decode 72.2 tok/s  → "Paris is the capital of France."
 
-qwen3.5-9b.mq3-lloyd / reason-mq3-lloyd-9b
+qwen3.5-9b-lloyd-mq3.hfq / reason-mq3-lloyd-9b
   prefill 36 tok @ 363.3 tok/s  decode 50.6 tok/s  → "Final Number: 8"
   (sheep-riddle answer is wrong on this model class — the same prompt
    on gfx1100 produces the same off-by-one; not a kernel issue.)
 
-qwen3.5-4b.mq3-lloyd / long-prefill-mq3-lloyd-4b
+qwen3.5-4b-lloyd-mq3.hfq / long-prefill-mq3-lloyd-4b
   prefill 190 tok @ 964.3 tok/s  decode 70.4 tok/s  → 220-token LRU cache
   walkthrough, fluent, on-topic, no attractor loops.
 
-qwen3.5-9b.mq3-lloyd / long-prefill-mq3-lloyd-9b
+qwen3.5-9b-lloyd-mq3.hfq / long-prefill-mq3-lloyd-9b
   prefill 190 tok @ 496.2 tok/s  decode 49.0 tok/s  → 126-token LRU cache
   explanation, fluent, terminates cleanly.
 ```

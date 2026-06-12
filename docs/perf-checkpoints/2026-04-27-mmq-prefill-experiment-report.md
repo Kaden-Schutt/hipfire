@@ -214,7 +214,7 @@ Prompt-processing correctness was then added to the inference QA harness as:
 ```bash
 HIPFIRE_VERIFY_GRAPH=0 HIPFIRE_MMQ=1 \
   target/release/examples/test_inferenceQA \
-  --model ~/.hipfire/models/qwen3.5-9b.mq4 \
+  --model ~/.hipfire/models/qwen3.5-9b-mq4.hfq \
   --qa-case prefill_batch_matches_sequential
 ```
 

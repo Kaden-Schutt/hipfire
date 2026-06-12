@@ -22,14 +22,14 @@
 # are calibrated against gfx906.
 #
 # Usage:
-#   scripts/gfx906_logit_divergence.sh [path/to/qwen3.5-9b.mq4]
+#   scripts/gfx906_logit_divergence.sh [path/to/qwen3.5-9b-mq4.hfq]
 #
-# Defaults to ~/.hipfire/models/qwen3.5-9b.mq4. Tunables:
+# Defaults to ~/.hipfire/models/qwen3.5-9b-mq4.hfq. Tunables:
 #   HIPFIRE_DIVERGENCE_PREFILL=64    # prompt length
 #   HIPFIRE_DIVERGENCE_TOL=1e-2      # max-abs-diff threshold (advisory)
 
 set -u
-MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b.mq4}"
+MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b-mq4.hfq}"
 PREFILL_LEN="${HIPFIRE_DIVERGENCE_PREFILL:-64}"
 TOL="${HIPFIRE_DIVERGENCE_TOL:-1e-2}"
 

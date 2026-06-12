@@ -133,14 +133,14 @@ sidecar_cal() {
 job_4b_sidecar_cal() {
     # Uses the existing MQ4 target (not the new draft — sidecars are for
     # the TARGET's attention, not the draft). Produces
-    # qwen3.5-4b.mq4.triattn.bin which pairs with any 4B draft.
-    local tgt=/root/models/qwen3.5-4b.mq4
+    # qwen3.5-4b-mq4.triattn.hfq which pairs with any 4B draft.
+    local tgt=/root/models/qwen3.5-4b-mq4.hfq
     [ -f "$tgt" ] || { echo "no target at $tgt — stage with stage_models.sh first" >&2; return 3; }
     sidecar_cal "$tgt" "${tgt}.triattn.agentic.bin"
 }
 
 job_9b_sidecar_cal() {
-    local tgt=/root/models/qwen3.5-9b.mq4
+    local tgt=/root/models/qwen3.5-9b-mq4.hfq
     [ -f "$tgt" ] || { echo "no target at $tgt — stage with stage_models.sh first" >&2; return 3; }
     sidecar_cal "$tgt" "${tgt}.triattn.agentic.bin"
 }

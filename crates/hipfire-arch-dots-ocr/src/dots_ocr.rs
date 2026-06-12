@@ -1668,7 +1668,7 @@ mod tests {
     #[test]
     fn build_prompt_ids_matches_hf_capture() {
         use std::path::Path;
-        let hfq_path = "/data/hipfire/dots-ocr.q8.hfq";
+        let hfq_path = "/data/hipfire/dots-ocr-q8.hfq";
         let cap_path = "../../benchmarks/references/dots_ocr_smoke_001.json";
         if !Path::new(hfq_path).exists() || !Path::new(cap_path).exists() {
             eprintln!("skipping build_prompt_ids_matches_hf_capture: model/fixture absent");

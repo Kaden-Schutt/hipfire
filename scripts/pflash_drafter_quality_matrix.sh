@@ -46,9 +46,9 @@ echo "outdir=$OUTDIR" | tee -a "$SUMMARY"
 
 # Drafter list: label|path  (skip any whose file is missing)
 DRAFTERS=(
-  "0.8B-MQ4|/local/hipfire/qwen3.5-0.8b.mq4"
+  "0.8B-MQ4|/local/hipfire/qwen3.5-0.8b-mq4.hfq"
   "0.8B-Q8|/local/hipfire/qwen3.5-0.8b.q8"
-  "4B-MQ4|/local/hipfire/qwen3.5-4b.mq4"
+  "4B-MQ4|/local/hipfire/qwen3.5-4b-mq4.hfq"
 )
 KEEPS=(0.30 0.20 0.15 0.10)
 

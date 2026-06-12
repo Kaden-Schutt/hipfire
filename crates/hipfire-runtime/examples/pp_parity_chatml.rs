@@ -13,7 +13,7 @@
 //!
 //! Run: HIP_VISIBLE_DEVICES=0,1 cargo run -p hipfire-runtime \
 //!         --release --features deltanet --example pp_parity_chatml -- \
-//!         ~/.hipfire/models/qwen3.5-0.8b.mq4
+//!         ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq
 
 use hipfire_arch_qwen35::qwen35::{
     self, DeltaNetState, Qwen35Scratch, Qwen35ScratchSet, StateQuant,
@@ -203,7 +203,7 @@ fn main() {
     // whether the caller (pp-gate.sh) sets the var in the environment.
     // PP FP16 reduction order is non-deterministic without this flag.
     std::env::set_var("HIPFIRE_DETERMINISTIC", "1");
-    let path = std::env::args().nth(1).expect("Usage: ... <model.mq4>");
+    let path = std::env::args().nth(1).expect("Usage: ... <model-mq4.hfq>");
     let hfq = HfqFile::open(Path::new(&path)).expect("open hfq");
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let prompt_tokens = build_prompt_tokens(&tokenizer);

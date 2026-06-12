@@ -30,7 +30,7 @@ class KernelAtlasTest(unittest.TestCase):
                 git_sha="a4e42c5a",
                 phase="ar",
                 workload="qwen3.5-27b",
-                model_path="/models/qwen3.5-27b.mq4",
+                model_path="/models/qwen3.5-27b-mq4.hfq",
                 command=[str(binary)],
                 env={},
                 status="ok",
@@ -99,8 +99,8 @@ SUMMARY  gen_tok_s=101.5  bw_gib_s=1512.4  prefill_tok_s=1262.2  avg_ms=9.85  p5
             git_sha="a4e42c5a",
             phase="unused",
             workload="qwen3.5-27b",
-            model_path="/models/qwen3.5-27b.mq4",
-            command=["bench_qwen35_speed", "/models/qwen3.5-27b.mq4"],
+            model_path="/models/qwen3.5-27b-mq4.hfq",
+            command=["bench_qwen35_speed", "/models/qwen3.5-27b-mq4.hfq"],
             env={"HIPFIRE_KV_MODE": "asym3", "HIPFIRE_GEMV_ROWS": "4"},
             status="ok",
         )
@@ -314,8 +314,8 @@ accepted: 239
     def test_dflash_row_records_prompt_hash_and_phase(self):
         with tempfile.TemporaryDirectory() as td:
             prompt_path = Path(td) / "prompt.txt"
-            target_path = Path(td) / "qwen3.5-27b.mq4"
-            draft_path = Path(td) / "qwen35-27b-dflash-mq4.hfq"
+            target_path = Path(td) / "qwen3.5-27b-mq4.hfq"
+            draft_path = Path(td) / "qwen3.5-27b-mq4.dflash.hfq"
             prompt_path.write_text("def merge_sort(xs):\n    pass\n", encoding="utf-8")
             target_path.write_text("small fake target", encoding="utf-8")
             draft_path.write_text("small fake draft", encoding="utf-8")
@@ -332,7 +332,7 @@ accepted: 239
                 git_sha="a4e42c5a",
                 phase="unused",
                 workload="qwen3.5-27b-dflash",
-                model_path="/models/qwen3.5-27b.mq4",
+                model_path="/models/qwen3.5-27b-mq4.hfq",
                 command=["dflash_spec_demo"],
                 env={"HIPFIRE_KV_MODE": "asym3"},
                 status="ok",
@@ -625,7 +625,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
             "phase": "decode_ar",
             "shape_bucket": "decode_ar_pp32_gen50",
             "metrics": {"gen_tok_s": 192.69, "bw_gib_s": 536.4},
-            "command": ["bench_qwen35_speed", "/models/qwen3.5-27b.mq4"],
+            "command": ["bench_qwen35_speed", "/models/qwen3.5-27b-mq4.hfq"],
             "variant": {"env": {"HIPFIRE_GEMV_ROWS": "4"}},
             "provenance": {"binary_md5": "abc", "diff_md5": "def", "git_dirty": True},
             "artifacts": {
@@ -672,7 +672,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
         self.assertEqual(task["constraints"]["allowed_files"], ["kernels/src/gemv_hfq4g256_multirow.hip"])
         self.assertEqual(task["eval"]["metric"], "gen_tok_s")
         self.assertEqual(task["eval"]["goal"], "maximize")
-        self.assertEqual(task["eval"]["benchmark_command"], ["bench_qwen35_speed", "/models/qwen3.5-27b.mq4"])
+        self.assertEqual(task["eval"]["benchmark_command"], ["bench_qwen35_speed", "/models/qwen3.5-27b-mq4.hfq"])
 
     def test_build_task_bundle_strips_profile_env_and_requires_clean_baseline(self):
         row = {

@@ -8,7 +8,7 @@
 #
 # Runs the 6 Phase 5 NIAH fixtures (8K, 16K, multi-16K, longcode,
 # longprose, 32K) under both baseline and PFlash modes against
-# qwen3.5-27b.mq3 + qwen3.5-0.8b.mq4 drafter, then asserts:
+# qwen3.5-27b-mq3.hfq + qwen3.5-0.8b-mq4.hfq drafter, then asserts:
 #   1. Verdict matches the recorded baseline (PASS stays PASS,
 #      FAIL stays FAIL; flips are quality regressions).
 #   2. Total wall-clock within ±10% of the recorded median.
@@ -232,8 +232,8 @@ if [ "$rebuild" -eq 1 ]; then
     fi
 fi
 
-TARGET="${HIPFIRE_PFLASH_TARGET:-$HOME/.hipfire/models/qwen3.5-27b.mq3}"
-DRAFTER="${HIPFIRE_PFLASH_DRAFTER:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4}"
+TARGET="${HIPFIRE_PFLASH_TARGET:-$HOME/.hipfire/models/qwen3.5-27b-mq3.hfq}"
+DRAFTER="${HIPFIRE_PFLASH_DRAFTER:-$HOME/.hipfire/models/qwen3.5-0.8b-mq4.hfq}"
 if [ ! -f "$TARGET" ] || [ ! -f "$DRAFTER" ]; then
     echo "pflash-gate: target or drafter not present" >&2
     echo "  target  = $TARGET" >&2

@@ -9,7 +9,7 @@
 //!
 //! Usage:
 //!   cargo run --release -p hipfire-runtime --example render_chat_template -- \
-//!     <model.mq4> <prompt.txt>
+//!     <model-mq4.hfq> <prompt.txt>
 //!
 //! Prints rendered length + first/last bytes. Compare against the
 //! Python jinja2 reference render to confirm parity.
@@ -23,7 +23,7 @@ use std::path::Path;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: render_chat_template <model.mq4> <prompt.txt>");
+        eprintln!("usage: render_chat_template <model-mq4.hfq> <prompt.txt>");
         std::process::exit(2);
     }
     let model_path = &args[1];

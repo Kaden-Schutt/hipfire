@@ -21,7 +21,7 @@ Hypothesis: under current ROCm 7.2.2, PR3 may now yield neutral or positive resu
 
 - Hardware: hipx, single RX 5700 XT (gfx1010, ROCR_VISIBLE_DEVICES=1 = 0000:05:00.0 healthy fans).
 - Power state: amdgpu default (auto DPM), no manual clock/power overrides.
-- Models: `qwen3.5-0.8b.mq4` and `qwen3.5-9b.mq4`.
+- Models: `qwen3.5-0.8b-mq4.hfq` and `qwen3.5-9b-mq4.hfq`.
 - KV mode: asym3.
 - Prompt: literal `"Why is the sky blue? Answer in two sentences."` (19 tokens).
 - max_seq: 4096; max_tokens: 120; temperature: 0.0; deterministic.
@@ -59,7 +59,7 @@ DPM ramps under load to level 2 (2100 MHz) during decode.
 
 Raw runs at `/tmp/perf-research/baselines/01-pr3-graph-cache-rebench/results.log` and `/tmp/perf-research/treatments/01-pr3-graph-cache-rebench/results.log`.
 
-### qwen3.5-0.8b.mq4
+### qwen3.5-0.8b-mq4.hfq
 
 | condition | run 1 | run 2 | run 3 | median | mean | σ |
 |---|---|---|---|---|---|---|
@@ -70,7 +70,7 @@ Raw runs at `/tmp/perf-research/baselines/01-pr3-graph-cache-rebench/results.log
 - Treatment median is 76σ below baseline mean.
 - Crosses the loss threshold (-2%) by an order of magnitude.
 
-### qwen3.5-9b.mq4
+### qwen3.5-9b-mq4.hfq
 
 | condition | run 1 | run 2 | run 3 | median | mean | σ |
 |---|---|---|---|---|---|---|

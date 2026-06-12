@@ -74,7 +74,7 @@ fallbacks for future validation when appropriate.
 
 ## dots.ocr / RDNA2 Note
 
-The dots.ocr real-model pass uses `/mnt/nas/kaden/models/dots-ocr.q8.hfq`,
+The dots.ocr real-model pass uses `/mnt/nas/kaden/models/dots-ocr-q8.hfq`,
 quantized from `rednote-hilab/dots.ocr` with `--format q8 --arch-id 8
 --include-vision`. The vision tower stores dense F16 GPU weights after
 load/dequant, so the RDNA2 HFQ3/HFQ4 sdot4 MMQ family does not accelerate

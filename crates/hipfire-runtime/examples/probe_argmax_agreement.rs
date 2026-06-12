@@ -19,7 +19,7 @@
 //! when the small model is used as a draft for the large one.
 //!
 //! Usage:
-//!   probe_argmax_agreement <small.mq4> <large.mq4> "<prompt>" [N=128]
+//!   probe_argmax_agreement <small-mq4.hfq> <large-mq4.hfq> "<prompt>" [N=128]
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_runtime::hfq::HfqFile;
@@ -46,7 +46,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
         eprintln!(
-            "usage: {} <small.mq4> <large.mq4> \"<prompt>\" [N=128]",
+            "usage: {} <small-mq4.hfq> <large-mq4.hfq> \"<prompt>\" [N=128]",
             args[0]
         );
         std::process::exit(1);

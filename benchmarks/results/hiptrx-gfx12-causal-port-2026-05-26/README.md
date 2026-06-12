@@ -17,8 +17,8 @@ Code under test:
 |---|---|---|---|
 | Build | `cargo build --release -p rdna-compute --example parity_causal_wmma -p hipfire-arch-qwen2 --example infer_qwen2 -p hipfire-arch-dots-ocr --example ocr_e2e` | PASS | Built on `hiptrx` before model smokes. Existing repo warnings only. |
 | Direct causal WMMA parity + timing | `raw/causal-parity-bench-a570ea63.log` | PASS | gfx1201 parity max-abs-diff `1.439e-4` at all tested sizes. WMMA beat scalar at B=128, 512, 1024, and 2048. |
-| Qwen2 real model smoke | `raw/qwen2-smoke-a570ea63.log` | PASS | `/mnt/nas/kaden/models/qwen2-1.5b.arch7.q8.hfq`; tokenizer parity exact; 16/16 generated token top-1 matches reference. |
-| dots OCR bounded smoke | `raw/dots-ocr-max0-a570ea63.stderr` | PASS | `/mnt/nas/kaden/models/dots-ocr.q8.hfq`; full vision tower completed on scalar fallback; Qwen2 text path loaded; 5095-token batch prefill completed with `--max-tokens 0`. |
+| Qwen2 real model smoke | `raw/qwen2-smoke-a570ea63.log` | PASS | `/mnt/nas/kaden/models/qwen2-1.5b-arch7-q8.hfq`; tokenizer parity exact; 16/16 generated token top-1 matches reference. |
+| dots OCR bounded smoke | `raw/dots-ocr-max0-a570ea63.stderr` | PASS | `/mnt/nas/kaden/models/dots-ocr-q8.hfq`; full vision tower completed on scalar fallback; Qwen2 text path loaded; 5095-token batch prefill completed with `--max-tokens 0`. |
 | Repro hashes | `raw/md5-a570ea63.log` | RECORDED | Binary md5s plus prompt/reference/image md5s captured from `hiptrx`. |
 
 ## Causal WMMA Timing

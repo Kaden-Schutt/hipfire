@@ -27,7 +27,7 @@ Doc nits / max_n constant: c7abe67a.
 
 ## Bench config
 
-- Model: `~/.hipfire/models/qwen3.5-27b.mq4` (14.0 GiB)
+- Model: `~/.hipfire/models/qwen3.5-27b-mq4.hfq` (14.0 GiB)
 - Prompt: `benchmarks/prompts/lru_cache_pep8_strict.txt`
 - Prompt md5 (raw file): `df5dedc8040ce70ba55080c4548e6024`
 - Prompt md5 (after probe's chatml-wrap, per-harness log): `1e74f17934fe759468dbe1471b732067`
@@ -147,7 +147,7 @@ Worktree: `.claude/worktrees/mtp-qualcomm-probe`. GPU: gfx1100 (k9lin 7900 XTX).
 
 ### AR baseline after purge (unchanged config)
 
-`dflash_spec_demo --target ~/.hipfire/models/qwen3.5-27b.mq4 --draft ~/.hipfire/models/qwen35-9b-dflash-mq4.hfq --prompt "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" --max 120 --temp 0 --kv-mode q8 --ar-baseline`
+`dflash_spec_demo --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq --draft ~/.hipfire/models/qwen3.5-9b-mq4.dflash.hfq --prompt "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" --max 120 --temp 0 --kv-mode q8 --ar-baseline`
 
 | variant | prefill tok/s | decode tok/s | first ~30 tokens | coherent |
 |---|---|---|---|---|
@@ -165,7 +165,7 @@ attractor finding.)
 
 ### MTP probe 3× after purge
 
-`mtp_probe_demo --target ~/.hipfire/models/qwen3.5-27b.mq4 --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt --max 120 --temp 0`
+`mtp_probe_demo --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt --max 120 --temp 0`
 
 prompt md5: `1e74f17934fe759468dbe1471b732067` (same prompt-bytes as pre-purge,
 distinct from `df5dedc...` because mtp_probe_demo's own chatml wrap path
@@ -251,7 +251,7 @@ attribution was wrong.** Empirical disambiguation (this run):
 | `infer_qwen35` (per-token `forward_scratch`) | `<think>!!!!!!!!` (2048 of `!`) | NO |
 | `dflash_spec_demo --ar-baseline` (batched `forward_prefill_batch_with_pbs`) | `<think>\n\n!!!!!!!!` | NO |
 
-Same `qwen3.5-27b.mq4`, same LRU prompt, fresh kernels, same hardware.
+Same `qwen3.5-27b-mq4.hfq`, same LRU prompt, fresh kernels, same hardware.
 Daemon works; example binaries break.
 
 ### Root cause: hipGraph capture/replay kernarg-snapshot bug on ROCm 7.2.2

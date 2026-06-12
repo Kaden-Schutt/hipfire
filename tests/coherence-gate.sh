@@ -73,15 +73,10 @@ if [ "$rebuild" -eq 1 ]; then
 fi
 binary_md5=$(md5sum "$EXE" | awk '{print $1}')
 
-# Resolve model artifacts from the configured install/cache directory.
-# Accepted forms include:
-#   qwen3.5-4b.mq4            legacy extensionless registry name
-#   qwen3.5-4b.mq4.hfq        installed HFQ artifact with dotted quant token
-#   qwen3.5-4b-mq4.hfq        canonical artifact-name shape
-#   qwen3.5-9b-lloyd-mq4.hfq  older modifier-before-quant artifact shape
+# Resolve canonical model artifact names from the configured install/cache directory.
 find_model_file() {
     local name="$1"
-    local lookup_name requested_dir stem dir cand base quant suffix dash_quant modifier_first
+    local lookup_name requested_dir dir cand
     local dirs=()
 
     if [[ "$name" == */* ]]; then
@@ -94,34 +89,9 @@ find_model_file() {
         dirs=("$MODELS_DIR" "$HOME/.hipfire/models")
     fi
 
-    stem="${lookup_name%.hfq}"
-
-    if [[ "$stem" =~ ^(.+)\.(mq[0-9][a-z0-9]*|q8f16)(-.+)?$ ]]; then
-        base="${BASH_REMATCH[1]}"
-        quant="${BASH_REMATCH[2]}"
-        suffix="${BASH_REMATCH[3]:-}"
-        dash_quant="${base}-${quant}${suffix}"
-        if [ -n "$suffix" ]; then
-            modifier_first="${base}${suffix}-${quant}"
-        else
-            modifier_first=""
-        fi
-    else
-        dash_quant=""
-        modifier_first=""
-    fi
-
     for dir in "${dirs[@]}"; do
-        for cand in \
-            "$dir/$lookup_name" \
-            "$dir/$stem" \
-            "$dir/$stem.hfq" \
-            ${dash_quant:+"$dir/$dash_quant"} \
-            ${dash_quant:+"$dir/$dash_quant.hfq"} \
-            ${modifier_first:+"$dir/$modifier_first"} \
-            ${modifier_first:+"$dir/$modifier_first.hfq"}; do
-            [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
-        done
+        cand="$dir/$lookup_name"
+        [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
     done
     return 1
 }
@@ -144,29 +114,29 @@ fi
 # + a tool-call shape (auto-MMQ regression detector for #87 redo).
 # Full battery (--full): adds A3B MoE tests (loads large models, ~2-3 min each).
 SHORT_TESTS=(
-    "qwen3.5-0.8b.mq4|cap|What is the capital of France? Answer in one short sentence.|80"
-    "qwen3.5-4b.mq4|code|Write a one-line Python function named square that returns n*n.|180"
-    "qwen3.5-9b.mq4|reason|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
-    "qwen3.5-9b.mq4|tool-call|What does the file /tmp/fibonacci.c contain?|180|tool_call_system.txt"
+    "qwen3.5-0.8b-mq4.hfq|cap|What is the capital of France? Answer in one short sentence.|80"
+    "qwen3.5-4b-mq4.hfq|code|Write a one-line Python function named square that returns n*n.|180"
+    "qwen3.5-9b-mq4.hfq|reason|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    "qwen3.5-9b-mq4.hfq|tool-call|What does the file /tmp/fibonacci.c contain?|180|tool_call_system.txt"
     # MQ3 coverage (gfx11+gfx12 only — refused on other archs at load).
     # Verifies WMMA prefill family + K4-unroll decode + fused residual all
     # dispatch and stay coherent. Same prompts as the MQ4 rows so output
     # drift between bit-widths is comparable.
-    "qwen3.5-4b.mq3|cap-mq3-4b|What is the capital of France? Answer in one short sentence.|80"
-    "qwen3.5-9b.mq3|reason-mq3|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
-    "qwen3.5-27b.mq3|cap-mq3-27b|What is the capital of France? Answer in one short sentence.|80"
+    "qwen3.5-4b-mq3.hfq|cap-mq3-4b|What is the capital of France? Answer in one short sentence.|80"
+    "qwen3.5-9b-mq3.hfq|reason-mq3|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    "qwen3.5-27b-mq3.hfq|cap-mq3-27b|What is the capital of France? Answer in one short sentence.|80"
     # LFM2.5-8B-A1B (arch_id 11, hipfire-arch-lfm2moe): hybrid 18 short-conv + 6
     # GQA-attn mixers, 2 dense SwiGLU + 22 top-4 MoE FFN layers. Exercises the
     # NEW conv1d_gated_decode kernel + per-head QK-norm + full-dim RoPE +
     # sigmoid-bias top-4 MoE GEMV path. Skipped if the model file is absent.
-    "lfm2.5-8b-a1b.mq4|lfm2-cap|What is the capital of France? Answer in one short sentence.|80"
-    "lfm2.5-8b-a1b.mq4|lfm2-reason|If a train travels 60 km in 45 minutes, what is its speed in km/h?|160"
+    "lfm2.5-8b-a1b-mq4.hfq|lfm2-cap|What is the capital of France? Answer in one short sentence.|80"
+    "lfm2.5-8b-a1b-mq4.hfq|lfm2-reason|If a train travels 60 km in 45 minutes, what is its speed in km/h?|160"
     # MQ3-Lloyd coverage (PR #115 — research-gated format, --allow-mq3-lloyd
     # at quantize time only; no runtime gate). 4B + 9B exercise the K4 +
     # fp32-LDS-codebook gfx1100 kernel + tail-rotation logic. Runs anywhere
     # with the model file present.
-    "qwen3.5-4b.mq3-lloyd|cap-mq3-lloyd-4b|What is the capital of France? Answer in one short sentence.|80"
-    "qwen3.5-9b.mq3-lloyd|reason-mq3-lloyd-9b|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    "qwen3.5-4b-lloyd-mq3.hfq|cap-mq3-lloyd-4b|What is the capital of France? Answer in one short sentence.|80"
+    "qwen3.5-9b-lloyd-mq3.hfq|reason-mq3-lloyd-9b|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     # MQ3-Lloyd batched-prefill coverage (companion to issue #116 Phase B2).
     # Uses a ~180-token prompt (well above MIN_BATCH=2) to exercise the
     # batched-prefill path's new WMMA fused kernels (qkv, qkvza, gate_up,
@@ -174,15 +144,15 @@ SHORT_TESTS=(
     # from benchmarks/prompts/coherence_lloyd_long.txt — referenced by
     # md5 below to detect drift (per CLAUDE.md prompt-md5 rule).
     #   md5(coherence_lloyd_long.txt) = f20bbc4f5b88ab5f7b44fe7c7da0e2e3
-    "qwen3.5-4b.mq3-lloyd|long-prefill-mq3-lloyd-4b|@coherence_lloyd_long.txt|220"
-    "qwen3.5-9b.mq3-lloyd|long-prefill-mq3-lloyd-9b|@coherence_lloyd_long.txt|220"
+    "qwen3.5-4b-lloyd-mq3.hfq|long-prefill-mq3-lloyd-4b|@coherence_lloyd_long.txt|220"
+    "qwen3.5-9b-lloyd-mq3.hfq|long-prefill-mq3-lloyd-9b|@coherence_lloyd_long.txt|220"
     # MQ4-Lloyd coverage (issue #182 Phase B3 — regression-prevention
     # companion to B2's batched WMMA prefill wiring). Exercises
     # gemm_*_mq4g256_lloyd_wmma family + nibble-pair decode + per-row LDS
     # codebook (16 entries × 16 rows = 512 B/workgroup). 9B row catches
     # any mid-layer corruption that would surface as token-loop attractor.
     # gfx11 + gfx12 only (refused on other archs by is_batchable_la).
-    "qwen3.5-9b.mq4-lloyd|reason-mq4-lloyd-9b|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    "qwen3.5-9b-lloyd-mq4.hfq|reason-mq4-lloyd-9b|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     # Q8_0 batched-prefill coverage (companion to docs/plans/q8-fused-prefill-kernels.md
     # T3-0 prerequisite). Exercises the Tier 2 dispatch arms
     # (gemm_q8_0_batched_chunked at qkv/qkvza/gate_up/wo+residual/w_down+residual)
@@ -195,9 +165,9 @@ SHORT_TESTS=(
     # MQ6 coverage — different quant family (HFQ6-G256, 200 B/group). Used
     # as a regression-safety check that gfx906's new HFQ4 dp4a/prefetch
     # defaults don't disturb the mq6 dispatch routing. Skipped if model
-    # absent (download via `hipfire pull qwen3.5-9b.mq6`).
-    "qwen3.5-9b.mq6|reason-mq6|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
-    "qwen3.5-27b.mq6|cap-mq6-27b|What is the capital of France? Answer in one short sentence.|80"
+    # absent (download via `hipfire pull qwen3.5-9b-mq6.hfq`).
+    "qwen3.5-9b-mq6.hfq|reason-mq6|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    "qwen3.5-27b-mq6.hfq|cap-mq6-27b|What is the capital of France? Answer in one short sentence.|80"
     # MQ3-AWQ coverage — regression catcher for the 2026-05-18 loader bug
     # where `qwen35.rs:907` gated AWQ-sidecar attachment on
     # `matches!(wt.gpu_dtype, DType::MQ4G256)` and silently dropped sidecars
@@ -209,9 +179,9 @@ SHORT_TESTS=(
     # awq-gptq sibling terses out on this prompt (7 tokens, no Paris), so
     # it would false-positive the gate. Skipped if the canonical file
     # isn't symlinked into MODELS_DIR — symlink it as:
-    #   ln -s /data/hipfire/mq3-sweep/qwen3.5-4b.mq3-awq-only.hfq \
-    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-4b.mq3-awq-only"
-    "qwen3.5-4b.mq3-awq-only|mq3-awq-paris|What is the capital of France? Answer in one short sentence.|80"
+    #   ln -s /data/hipfire/mq3-sweep/qwen3.5-4b-awq-only-mq3.hfq \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-4b-awq-only-mq3.hfq"
+    "qwen3.5-4b-awq-only-mq3.hfq|mq3-awq-paris|What is the capital of France? Answer in one short sentence.|80"
     # lm_head AWQ coverage — regression catcher for the AWQ-aware lm_head
     # dispatch landed in 2026-05-18's lm-head-awq-runtime PR. The 9B file
     # ships `lm_head.awq_scale.weight` alongside the 248 per-layer
@@ -224,37 +194,37 @@ SHORT_TESTS=(
     # see docs/plans/awq_fix_claude.md). max_tokens=300 because 9B
     # Qwen3.5 thinking mode spends more tokens in `<think>` before
     # emitting the final answer. Symlink to enable:
-    #   ln -s /data/hipfire/qwen3.5-9b.mq4-awq-gptq-f2-lmhead-a100.hfq \
-    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-9b.mq4-awq-gptq-f2-lmhead"
-    "qwen3.5-9b.mq4-awq-gptq-f2-lmhead|lmhead-awq-paris|What is the capital of France? Answer in one short sentence.|300"
+    #   ln -s /data/hipfire/qwen3.5-9b-awq-gptq-f2-lmhead-a100-mq4.hfq \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-9b-awq-gptq-f2-lmhead-mq4.hfq"
+    "qwen3.5-9b-awq-gptq-f2-lmhead-mq4.hfq|lmhead-awq-paris|What is the capital of France? Answer in one short sentence.|300"
 )
 FULL_EXTRA=(
-    "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
-    "qwen3.6-35b-a3b.mq4|moe36-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
+    "qwen3.5-35b-a3b-mq4.hfq|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
+    "qwen3.6-35b-a3b-mq4.hfq|moe36-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
     # MQ6 A3B coverage — same prompts as the MQ4 MoE rows. These rows are
     # the first promotion-facing coherence check for gfx1151 MQ6 routed
     # expert prefill/decode; they do not prove KLD/PPL or perf parity.
-    "qwen3.5-35b-a3b.mq6|moe-mq6-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
-    "qwen3.6-35b-a3b.mq6|moe36-mq6-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
+    "qwen3.5-35b-a3b-mq6.hfq|moe-mq6-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
+    "qwen3.6-35b-a3b-mq6.hfq|moe36-mq6-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
     # MQ3 A3B coverage — same prompts as the MQ4/MQ6 MoE rows. These rows
     # exercise routed-expert prefill/decode for the size-gated MQ3 lane; they
     # are coherence evidence only and do not prove KLD/PPL or DFlash readiness.
-    "qwen3.5-35b-a3b.mq3|moe-mq3-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
-    "qwen3.6-35b-a3b.mq3|moe36-mq3-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
-    "qwen3.6-27b.mq4|tool-call-27b|What does the file /tmp/fibonacci.c contain?|220|tool_call_system.txt"
+    "qwen3.5-35b-a3b-mq3.hfq|moe-mq3-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
+    "qwen3.6-35b-a3b-mq3.hfq|moe36-mq3-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
+    "qwen3.6-27b-mq4.hfq|tool-call-27b|What does the file /tmp/fibonacci.c contain?|220|tool_call_system.txt"
     # DeepSeek V4 Flash (arch_id=9, hipfire-arch-deepseek4). Loads the
     # 80 GB base from the MTP-sidecar split + the MTP addon via
     # HIPFIRE_DEEPSEEK4_MTP_ADDON. Skipped unless the symlink is present in
     # MODELS_DIR; symlink with:
-    #   ln -s /data/hipfire-models/deepseek-v4-flash.mq2lloyd \
-    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/deepseek-v4-flash.mq2lloyd"
-    #   ln -s /data/hipfire-models/deepseek-v4-flash-mtp.mq2lloyd \
-    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/deepseek-v4-flash-mtp.mq2lloyd"
+    #   ln -s /data/hipfire-models/deepseek-v4-flash-lloyd-mq2.hfq \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/deepseek-v4-flash-lloyd-mq2.hfq"
+    #   ln -s /data/hipfire-models/deepseek-v4-flash-mtp-lloyd-mq2.hfq \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/deepseek-v4-flash-mtp-lloyd-mq2.hfq"
     # HIPFIRE_DEEPSEEK4_MTP_ADDON is auto-set by the run-case when the sibling
     # addon file exists.
-    "deepseek-v4-flash.mq2lloyd|deepseek4-cap|What is the capital of France? Answer in one short sentence.|80"
-    "deepseek-v4-flash.mq2lloyd|deepseek4-reason|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
-    "deepseek-v4-flash.mq2lloyd|deepseek4-long-prefill|@coherence_lloyd_long.txt|220"
+    "deepseek-v4-flash-lloyd-mq2.hfq|deepseek4-cap|What is the capital of France? Answer in one short sentence.|80"
+    "deepseek-v4-flash-lloyd-mq2.hfq|deepseek4-reason|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    "deepseek-v4-flash-lloyd-mq2.hfq|deepseek4-long-prefill|@coherence_lloyd_long.txt|220"
 )
 tests=("${SHORT_TESTS[@]}")
 if [ "$FULL" -eq 1 ]; then
@@ -347,7 +317,7 @@ JL
     # caller's env unchanged.
     declare -a deepseek4_env=()
     if [[ "$model_file" == deepseek-v4* ]]; then
-        addon="${model_path%.mq2lloyd}-mtp.mq2lloyd"
+        addon="${model_path%-lloyd-mq2.hfq}-mtp-lloyd-mq2.hfq"
         if [ -f "$addon" ]; then
             deepseek4_env+=("HIPFIRE_DEEPSEEK4_MTP_ADDON=$addon")
         fi
@@ -484,8 +454,8 @@ if [ "${HIPFIRE_SKIP_PFLASH_GATE:-0}" = "1" ]; then
     echo "pflash-gate: SKIPPED (HIPFIRE_SKIP_PFLASH_GATE=1)"
     exit 0
 fi
-PFLASH_TARGET="${HIPFIRE_PFLASH_TARGET:-qwen3.5-27b.mq3}"
-PFLASH_DRAFTER="${HIPFIRE_PFLASH_DRAFTER:-qwen3.5-0.8b.mq4}"
+PFLASH_TARGET="${HIPFIRE_PFLASH_TARGET:-qwen3.5-27b-mq3.hfq}"
+PFLASH_DRAFTER="${HIPFIRE_PFLASH_DRAFTER:-qwen3.5-0.8b-mq4.hfq}"
 PFLASH_TARGET_PATH="$(find_model_file "$PFLASH_TARGET" || true)"
 PFLASH_DRAFTER_PATH="$(find_model_file "$PFLASH_DRAFTER" || true)"
 if [ -z "$PFLASH_TARGET_PATH" ] || [ -z "$PFLASH_DRAFTER_PATH" ]; then

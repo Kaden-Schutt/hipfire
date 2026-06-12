@@ -27,12 +27,12 @@ for spec in \
   if [ -n "$envs" ]; then
     env $envs cargo run --release --features deltanet -p hipfire-runtime \
       --example profile_prefill_qwen35 -- \
-      ~/.hipfire/models/qwen3.5-122b-a10b.mq4.hfq \
+      ~/.hipfire/models/qwen3.5-122b-a10b-mq4.hfq \
       --prefill 64 --warmup 0 --kv-mode asym3
   else
     cargo run --release --features deltanet -p hipfire-runtime \
       --example profile_prefill_qwen35 -- \
-      ~/.hipfire/models/qwen3.5-122b-a10b.mq4.hfq \
+      ~/.hipfire/models/qwen3.5-122b-a10b-mq4.hfq \
       --prefill 64 --warmup 0 --kv-mode asym3
   fi
 done

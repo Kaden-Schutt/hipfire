@@ -14,7 +14,7 @@
 //!   phase 2: softmax max/sum reductions
 //!   phase 3: V-weighted sum
 //!
-//! Usage: profile_attention_phases <model.mq4> [--prefill N] [--repeats N]
+//! Usage: profile_attention_phases <model-mq4.hfq> [--prefill N] [--repeats N]
 //!
 //! The workflow: prefill to target context via forward_prefill_batch, then
 //! do a handful of single-token forward steps to settle the KV cache, then
@@ -37,7 +37,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: profile_attention_phases <model.mq4> [--prefill N] [--repeats N]");
+        eprintln!("Usage: profile_attention_phases <model-mq4.hfq> [--prefill N] [--repeats N]");
         std::process::exit(1);
     }
     let model_path = &args[1];

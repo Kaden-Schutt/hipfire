@@ -76,8 +76,8 @@ Verbatim from the originating warning:
 >    added.
 >
 > 3. After matcher updates, validate end-to-end on a real model:
->    produce a small `qwen3.5-{0.8b,4b}.mq3-lloyd` via
->    `hipfire-quantize --format mq3-lloyd`, run
+>    produce a small `qwen3.5-{0.8b,4b}-lloyd-mq3.hfq` via
+>    `hipfire-quantize --format lloyd-mq3`, run
 >    `./scripts/coherence-gate.sh` on a config that hits the
 >    prefill-batched path (any prompt of more than ~16 tokens), and
 >    read the report. If first-128-token unique-token-ratio is
@@ -85,7 +85,7 @@ Verbatim from the originating warning:
 >    passes hard-fail thresholds, that's the symptom of stride-
 >    mismatched prefill — open the matchers and re-grep.
 >
-> 4. Add `qwen3.5-9b.mq3-lloyd` (or whatever your perplexity-validated
+> 4. Add `qwen3.5-9b-lloyd-mq3.hfq` (or whatever your perplexity-validated
 >    reference is) to the coherence-gate matrix at
 >    `scripts/coherence-gate.sh:84-103`. Without this, future PRs that
 >    touch MoE or per-layer dispatch can regress MQ-Lloyd silently.

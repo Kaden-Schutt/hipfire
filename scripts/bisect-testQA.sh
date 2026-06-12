@@ -148,11 +148,11 @@ if quantize "$MODEL_06B" /tmp/bisect-06b-q8.hfq default; then
 fi
 
 log "-- hfq4 (auto) --"
-if quantize "$MODEL_06B" /tmp/bisect-06b-hfq4.hfq hfq4; then
-    run_infer /tmp/bisect-06b-hfq4.hfq "hfq4 warmup" "$PROMPT_SHORT" >/dev/null || true
-    run_infer /tmp/bisect-06b-hfq4.hfq "hfq4 defkv short" "$PROMPT_SHORT"
-    run_infer /tmp/bisect-06b-hfq4.hfq "hfq4 defkv long" "$PROMPT_LONG"
-    run_infer /tmp/bisect-06b-hfq4.hfq "hfq4 fp32kv short" "$PROMPT_SHORT" --fp32kv
+if quantize "$MODEL_06B" /tmp/bisect-06b-hf4.hfq hfq4; then
+    run_infer /tmp/bisect-06b-hf4.hfq "hfq4 warmup" "$PROMPT_SHORT" >/dev/null || true
+    run_infer /tmp/bisect-06b-hf4.hfq "hfq4 defkv short" "$PROMPT_SHORT"
+    run_infer /tmp/bisect-06b-hf4.hfq "hfq4 defkv long" "$PROMPT_LONG"
+    run_infer /tmp/bisect-06b-hf4.hfq "hfq4 fp32kv short" "$PROMPT_SHORT" --fp32kv
 fi
 
 log "-- hfq4g256 --"
@@ -170,10 +170,10 @@ log ""
 log "──── Qwen3-8B (HFQ4 only) ────"
 
 log "-- hfq4 (auto) --"
-if quantize "$MODEL_8B" /tmp/bisect-8b-hfq4.hfq hfq4; then
-    run_infer /tmp/bisect-8b-hfq4.hfq "8B hfq4 warmup" "$PROMPT_SHORT" >/dev/null || true
-    run_infer /tmp/bisect-8b-hfq4.hfq "8B hfq4 defkv short" "$PROMPT_SHORT"
-    run_infer /tmp/bisect-8b-hfq4.hfq "8B hfq4 defkv long" "$PROMPT_LONG"
+if quantize "$MODEL_8B" /tmp/bisect-8b-hf4.hfq hfq4; then
+    run_infer /tmp/bisect-8b-hf4.hfq "8B hfq4 warmup" "$PROMPT_SHORT" >/dev/null || true
+    run_infer /tmp/bisect-8b-hf4.hfq "8B hfq4 defkv short" "$PROMPT_SHORT"
+    run_infer /tmp/bisect-8b-hf4.hfq "8B hfq4 defkv long" "$PROMPT_LONG"
 fi
 
 log "-- hfq4g256 --"

@@ -13,7 +13,7 @@
 # Skips commits whose build fails with exit code 125 (git-bisect convention).
 
 set -u
-MODEL="${HIPFIRE_9B_MODEL:-$HOME/.hipfire/models/qwen3.5-9b.mq4}"
+MODEL="${HIPFIRE_9B_MODEL:-$HOME/.hipfire/models/qwen3.5-9b-mq4.hfq}"
 THRESHOLD="${BISECT_TOK_S:-125.0}"
 
 cd "$(git rev-parse --show-toplevel)"

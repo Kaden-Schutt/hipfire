@@ -74,7 +74,7 @@ The verify path (`spec_step_mtp_compressed_serial`, mtp_spec.rs:1656)
 calls `forward_prefill_batch_with_pbs`, whose batched-vs-per-token gate
 is `prefill_batch_pbs_eligible` (qwen35.rs:5422 — the single source of
 truth, used by both the forward and the rollback-replay choice). Walking
-it for THIS fixture (`qwen3.6-27b.mq4` dense trunk, `kv_mode q8`,
+it for THIS fixture (`qwen3.6-27b-mq4.hfq` dense trunk, `kv_mode q8`,
 n_verify = max_n+1 = 4):
 
 - `n >= MIN_BATCH` → 4 ≥ **2** ✓ (qwen35.rs:27)

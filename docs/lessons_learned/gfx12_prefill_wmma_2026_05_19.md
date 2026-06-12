@@ -131,7 +131,7 @@ Three parallel agents are porting the grouped-WMMA pattern to HFQ6/MQ6,
 HFQ3/MQ3, and HFP4/MFP4 quants (branches `feat/hfq6-moe-grouped-wmma`,
 `feat/hfq3-moe-grouped-wmma`, `feat/hfp4-moe-grouped-wmma`) to unblock
 AWQ-style mixed-precision MoE prefill — e.g.
-`/mnt/nas/kaden/hipfire/mi300x-v3/qwen3-35b-a3b.mq4-awq` whose experts
+`/mnt/nas/kaden/hipfire/mi300x-v3/qwen3-35b-a3b-awq-mq4.hfq` whose experts
 are ≈50/50 MQ4/MQ6. After integration plus an admit-predicate update
 (`moe_ffn_all_mq4` → `moe_ffn_supported`), AWQ A3B should benefit too.
 Bench numbers pending.

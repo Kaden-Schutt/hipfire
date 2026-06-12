@@ -28,9 +28,9 @@ This plan is Phase 5.
 
 1. `cargo check -p rdna-compute -p hipfire-arch-qwen35 -p hipfire-runtime` clean.
 2. Coherence-gate passes on a long-prompt (≥ `MIN_BATCH` tokens; verify
-   value at `qwen35.rs:3520`) row for `qwen3.5-{4b,9b}.mq3-lloyd`.
+   value at `qwen35.rs:3520`) row for `qwen3.5-{4b,9b}-lloyd-mq3.hfq`.
 3. **`ΔNLL/tok < 0.01`** (≤ 1% PPL drift) vs the per-token decode path
-   on `qwen3.5-9b.mq3-lloyd`. NOT byte-stable: WMMA's hardware
+   on `qwen3.5-9b-lloyd-mq3.hfq`. NOT byte-stable: WMMA's hardware
    accumulation order differs from GEMV's K-loop order; the resulting
    fp32-reorder drift is the same envelope as issue #188's gfx1100
    GEMV multi-acc finding.
@@ -286,7 +286,7 @@ Mechanical, auditable yes/no items:
 ### Phase B3 (companion commit) — coherence-gate row
 
 - Add a long-prompt row to `scripts/coherence-gate.sh` for
-  `qwen3.5-{4b,9b}.mq3-lloyd` that exercises the batched-prefill
+  `qwen3.5-{4b,9b}-lloyd-mq3.hfq` that exercises the batched-prefill
   path (token count ≥ `MIN_BATCH`, single forward pass).
 - Reuse the existing 4B / 9B Lloyd model files (already on disk;
   no new model dependency).

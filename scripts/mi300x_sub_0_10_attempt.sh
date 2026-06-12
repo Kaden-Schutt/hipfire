@@ -46,7 +46,7 @@ phase "0  Prerequisites"
 [ -s "$IMATRIX" ] || die "missing unsloth 9B imatrix at $IMATRIX (run bootstrap)"
 # v3 base must exist (produced by v3_matrix or PR #266 recipe). If missing,
 # build it now using the v3 recipe.
-V3_BASE="$MODELS_OUT/qwen3.5-9b.mq4-v3"
+V3_BASE="$MODELS_OUT/qwen3.5-9b-v3-mq4.hfq"
 if [ ! -f "$V3_BASE" ]; then
     die "v3 9B HFQ missing at $V3_BASE — run scripts/mi300x_v3_matrix.sh first (or just the 9B leg)"
 fi

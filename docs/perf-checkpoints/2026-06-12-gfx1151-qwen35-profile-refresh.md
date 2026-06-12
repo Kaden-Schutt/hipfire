@@ -17,7 +17,7 @@ are still worth targeting before the matrix kernels.
 ```bash
 HIPFIRE_PROFILE=1 HIPFIRE_PROFILE_DECODE=1 HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
   cargo run --release --features deltanet -p hipfire-runtime --example bench_qwen35_speed -- \
-  ~/.hipfire/models/qwen3.5-9b.mq4.hfq --prefill 256 --prefill-runs 1 --warmup 3 --gen 12
+  ~/.hipfire/models/qwen3.5-9b-mq4.hfq --prefill 256 --prefill-runs 1 --warmup 3 --gen 12
 
 HIPFIRE_PROFILE=1 HIPFIRE_PROFILE_DECODE=1 HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
   cargo run --release --features deltanet -p hipfire-runtime --example bench_qwen35_speed -- \

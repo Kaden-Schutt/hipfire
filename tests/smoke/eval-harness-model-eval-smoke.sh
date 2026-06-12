@@ -23,8 +23,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-CANDIDATE="${HIPFIRE_EVAL_MODEL_SMOKE_CANDIDATE:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4.hfq}"
-BASELINE="${HIPFIRE_EVAL_MODEL_SMOKE_BASELINE:-$HOME/.hipfire/models/qwen3.5-0.8b.mq6.hfq}"
+CANDIDATE="${HIPFIRE_EVAL_MODEL_SMOKE_CANDIDATE:-$HOME/.hipfire/models/qwen3.5-0.8b-mq4.hfq}"
+BASELINE="${HIPFIRE_EVAL_MODEL_SMOKE_BASELINE:-$HOME/.hipfire/models/qwen3.5-0.8b-mq6.hfq}"
 OUT_ROOT="${HIPFIRE_EVAL_MODEL_SMOKE_OUT_ROOT:-$HOME/.hipfire/eval-results/smoke}"
 MAX_TOKENS="${HIPFIRE_EVAL_MODEL_SMOKE_MAX_TOKENS:-4}"
 EXPECT="${HIPFIRE_EVAL_MODEL_SMOKE_EXPECT:-promote}"

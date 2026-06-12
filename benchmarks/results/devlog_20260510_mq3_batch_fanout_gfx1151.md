@@ -13,8 +13,8 @@ Initial baseline bench (gfx1151, 9B prefill=256, ROCm 7.12):
 
 | Model | prefill tok/s | Lloyd / uniform |
 |---|---|---|
-| qwen3.5-9b.mq3 (uniform) | 503.7 | — |
-| qwen3.5-9b.mq3-lloyd | 494.1 | 98.1 % |
+| qwen3.5-9b-mq3.hfq (uniform) | 503.7 | — |
+| qwen3.5-9b-lloyd-mq3.hfq | 494.1 | 98.1 % |
 
 The Lloyd / uniform ratio was already healthy at 98 % — but **both
 absolute numbers are roughly half of uniform-MQ4's 1123 tok/s** on the
@@ -107,7 +107,7 @@ production-validated correctness mechanically.
 3 fresh process invocations × 2 modes, `--prefill 256 --prefill-runs 3
 --gen 30 --warmup 5`.
 
-### qwen3.5-9b.mq3 (uniform / HFQ3)
+### qwen3.5-9b-mq3.hfq (uniform / HFQ3)
 
 | Mode | run 1 | run 2 | run 3 | mean prefill | mean gen |
 |---|---|---|---|---|---|
@@ -115,7 +115,7 @@ production-validated correctness mechanically.
 | `MB4=1` | 907.9 | 920.2 | 916.7 | **914.9 tok/s** | 53.63 |
 | Δ      |       |       |       | **+396.8 (+76.6 %)** | -0.3 |
 
-### qwen3.5-9b.mq3-lloyd
+### qwen3.5-9b-lloyd-mq3.hfq
 
 | Mode | run 1 | run 2 | run 3 | mean prefill | mean gen |
 |---|---|---|---|---|---|
@@ -123,7 +123,7 @@ production-validated correctness mechanically.
 | `MB4=1` | 823.4 | 852.8 | 852.1 | **842.8 tok/s** | 48.8 |
 | Δ      |       |       |       | **+339.9 (+67.6 %)** | -0.2 |
 
-### qwen3.5-4b.mq3-lloyd
+### qwen3.5-4b-lloyd-mq3.hfq
 
 (No 4B uniform-MQ3 model on this host; just the Lloyd self-A/B.)
 
@@ -155,10 +155,10 @@ format-tax floor of ~85 % (Lloyd's 7.7 % weight footprint penalty,
 
 | Model | Prefill tok/s on gfx1151 (post-mb4) |
 |---|---|
-| qwen3.5-9b.mq4 (uniform) | 1122.9 |
-| qwen3.5-9b.mq4-lloyd     |  800.8 |
-| qwen3.5-9b.mq3 (uniform) |  914.9 |
-| qwen3.5-9b.mq3-lloyd     |  842.8 |
+| qwen3.5-9b-mq4.hfq (uniform) | 1122.9 |
+| qwen3.5-9b-lloyd-mq4.hfq     |  800.8 |
+| qwen3.5-9b-mq3.hfq (uniform) |  914.9 |
+| qwen3.5-9b-lloyd-mq3.hfq     |  842.8 |
 
 **MQ3-Lloyd post-mb4 (843 tok/s) is now FASTER than MQ4-Lloyd
 post-Phase-D (801 tok/s)** on the same hardware — consistent with MQ3's
@@ -210,7 +210,7 @@ export LD_LIBRARY_PATH="/opt/rocm-7.12/lib:${LD_LIBRARY_PATH:-}"
 
 source scripts/gpu-lock.sh && gpu_acquire "mq3-mb4-bench"
 
-for model in qwen3.5-9b.mq3 qwen3.5-9b.mq3-lloyd; do
+for model in qwen3.5-9b-mq3.hfq qwen3.5-9b-lloyd-mq3.hfq; do
   for mb4 in 0 1; do
     for run in 1 2 3; do
       HIPFIRE_MQ3_MB4=$mb4 HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
@@ -264,7 +264,7 @@ fp32-reorder envelope opens up regardless of arch.
 
 ### Cross-process A/B (3 runs × 2 modes, prefill=256, asym3, GRAPH=1)
 
-#### qwen3.5-9b.mq3 (uniform / HFQ3)
+#### qwen3.5-9b-mq3.hfq (uniform / HFQ3)
 
 | Mode | run 1 | run 2 | run 3 | mean prefill | mean gen |
 |---|---|---|---|---|---|
@@ -272,7 +272,7 @@ fp32-reorder envelope opens up regardless of arch.
 | `MB4=1` | 2006.2 | 2001.6 | 1999.9 | **2002.6 tok/s** | 118.7 |
 | Δ      |        |        |        | **+286.5 (+16.7 %)** | -0.5 % |
 
-#### qwen3.5-9b.mq3-lloyd
+#### qwen3.5-9b-lloyd-mq3.hfq
 
 | Mode | run 1 | run 2 | run 3 | mean prefill | mean gen |
 |---|---|---|---|---|---|
@@ -280,7 +280,7 @@ fp32-reorder envelope opens up regardless of arch.
 | `MB4=1` | 1857.7 | 1862.1 | 1859.4 | **1859.7 tok/s** | 112.2 |
 | Δ      |        |        |        | **+396.2 (+27.1 %)** | -0.1 % |
 
-#### qwen3.5-4b.mq3-lloyd
+#### qwen3.5-4b-lloyd-mq3.hfq
 
 | Mode | run 1 | run 2 | run 3 | mean prefill | mean gen |
 |---|---|---|---|---|---|
@@ -305,9 +305,9 @@ touches the prefill batched path.
 
 | Model | gfx1151 Δ | gfx1100 Δ |
 |---|---|---|
-| qwen3.5-9b.mq3 (uniform) | +76.6 % | **+16.7 %** |
-| qwen3.5-9b.mq3-lloyd | +67.6 % | **+27.1 %** |
-| qwen3.5-4b.mq3-lloyd | +60.6 % | **+16.9 %** |
+| qwen3.5-9b-mq3.hfq (uniform) | +76.6 % | **+16.7 %** |
+| qwen3.5-9b-lloyd-mq3.hfq | +67.6 % | **+27.1 %** |
+| qwen3.5-4b-lloyd-mq3.hfq | +60.6 % | **+16.9 %** |
 
 The gfx1100 wins are smaller in % terms but absolute throughput is far
 higher: 9B-MQ3 baseline jumps from gfx1151's 518 tok/s to gfx1100's 1716
@@ -335,8 +335,8 @@ fanout fix is doing exactly what it should on the bigger GPU.
 
 | Model | Prefill tok/s on gfx1100 |
 |---|---|
-| qwen3.5-9b.mq3 (uniform) | 2002.6 |
-| qwen3.5-9b.mq3-lloyd     | 1859.7 |
+| qwen3.5-9b-mq3.hfq (uniform) | 2002.6 |
+| qwen3.5-9b-lloyd-mq3.hfq     | 1859.7 |
 
 Unlike gfx1151 (where Lloyd post-mb4 at 843 narrowly beat uniform-MQ4
 at 801), on gfx1100 uniform-MQ3 stays ahead of Lloyd-MQ3 by ~7 %.

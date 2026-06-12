@@ -64,7 +64,7 @@ Useful flags:
 ## From a local safetensors directory
 
 ```bash
-hipfire quantize ./my-finetune/ --format mq4 -o my-finetune.mq4
+hipfire quantize ./my-finetune/ --format mq4 -o my-finetune-mq4.hfq
 ```
 
 Directory must contain `config.json` plus one or more `.safetensors`
@@ -105,7 +105,7 @@ blk.{i}.ffn_gate.weight → model.layers.{i}.mlp.gate_proj.weight
 
 The GGUF tokenizer (`tokenizer.ggml.tokens` / `merges` /
 `bos_token_id` / `eos_token_id` / `model`) is preserved verbatim under
-`gguf_meta` in the `.hf4` / `.mq4` metadata blob. The engine's
+`gguf_meta` in the `-hf4.hfq` / `-mq4.hfq` metadata blob. The engine's
 `Tokenizer::from_hfq_metadata` reads it directly — no need to keep the
 original GGUF on disk.
 
@@ -190,10 +190,10 @@ context prompts. Without it, all positions are treated equally and early
 tokens (which often carry critical instructions) may be evicted.
 
 ```bash
-hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
+hipfire sidecar-gen my-finetune-mq4.hfq --corpus /path/to/corpus.txt
 ```
 
-The sidecar is written as `my-finetune.mq4.triattn.hfq` next to your
+The sidecar is written as `my-finetune-mq4.triattn.hfq` next to your
 model file by default. The daemon auto-discovers it when you enable a
 CASK profile with `hipfire config cask-profile balanced`. See
 [CLI.md](CLI.md) for full flag details.
@@ -203,10 +203,10 @@ CASK profile with `hipfire config cask-profile balanced`. See
 > generate the sidecar using either the file path or the registered tag:
 >
 > ```bash
-> hipfire quantize ./my-finetune/ --format mq4 -o my-finetune.mq4 \\
+> hipfire quantize ./my-finetune/ --format mq4 -o my-finetune-mq4.hfq \\
 >     --install --register finetune:1b
 > # Then generate the sidecar (either works):
-> hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
+> hipfire sidecar-gen my-finetune-mq4.hfq --corpus /path/to/corpus.txt
 > # or, if you prefer using the alias:
 > hipfire sidecar-gen finetune:1b --corpus /path/to/corpus.txt
 > ```

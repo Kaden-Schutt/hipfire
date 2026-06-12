@@ -118,8 +118,8 @@ run_one() {
     local imatrix="$IMATRIX_DIR/$im_subdir/imatrix_unsloth.gguf_file"
     [ -s "$imatrix" ] || die "missing imatrix: $imatrix"
 
-    local awq_base="$MODELS_OUT/${slug}.mq4-awq"
-    local v3_out="$MODELS_OUT/${slug}.mq4-v3"
+    local awq_base="$MODELS_OUT/${slug}-awq-mq4.hfq"
+    local v3_out="$MODELS_OUT/${slug}-v3-mq4.hfq"
 
     # Stage 1: AWQ-prescaled MQ4 base
     if [ ! -f "$awq_base" ]; then

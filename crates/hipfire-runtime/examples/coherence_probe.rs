@@ -29,7 +29,7 @@
 //!
 //! Example end-to-end:
 //!     coherence_probe \
-//!         --model ~/.hipfire/models/qwen3.6-27b.mq4 \
+//!         --model ~/.hipfire/models/qwen3.6-27b-mq4.hfq \
 //!         --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt \
 //!         --max-tokens 200 --temperature 0.0
 //!
@@ -106,7 +106,7 @@ fn print_help() {
           coherence_probe --model PATH --prompt-file PATH [flags...]\n  \
           coherence_probe --self-check\n\n\
         Flags:\n  \
-          --model PATH          model file (.mq3/.mq4/.hfq, etc.)\n  \
+          --model PATH          model file (-mq3.hfq/-mq4.hfq/.hfq, etc.)\n  \
           --prompt-file PATH    user prompt file\n  \
           --system PATH         optional system-prompt file\n  \
           --max-tokens N        max generated tokens (default 200)\n  \
@@ -223,6 +223,9 @@ fn run() -> Result<i32, String> {
         prompt,
         prompt_label,
         system,
+        tools: None,
+        assistant_prefix: None,
+        force_jinja_chat: false,
         max_tokens: args.max_tokens.unwrap_or(200),
         temperature: args.temperature.unwrap_or(0.0),
         repeat_penalty: args.repeat_penalty,

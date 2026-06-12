@@ -25,8 +25,8 @@ IMATRIX_08B=benchmarks/quality-baselines/refs/qwen3.5-0.8b-bf16.imatrix.gguf
 QUANT_BIN=target/release/hipfire-quantize
 RUN_BIN=target/release/examples/run
 
-QUANT_SLOT_9B=/local/hipfire/qwen3.5-9b.mq4-awq-current
-QUANT_SLOT_08B=/local/hipfire/qwen3.5-0.8b.mq4-awq-current
+QUANT_SLOT_9B=/local/hipfire/qwen3.5-9b-awq-current-mq4.hfq
+QUANT_SLOT_08B=/local/hipfire/qwen3.5-0.8b-awq-current-mq4.hfq
 
 OUT_DIR=benchmarks/quality-baselines/results/2026-05-14-awq-coherence-check
 mkdir -p "$OUT_DIR"

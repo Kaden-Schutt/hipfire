@@ -65,7 +65,7 @@ print()
 imp = counts * np.sqrt(np.maximum(energy, 0))   # ~ counts * typical |x|
 print("=== PROMOTION LEVERAGE: promote top-K experts/layer (by count) to higher precision ===")
 print(f"{'K/layer':>8} {'rout_cov':>9} {'imp_cov':>8} {'size mq6':>9} {'size mq4':>9}")
-# base sizes (per the produced files): mq2-lloyd=67.5GB experts; mq6~2.8x, mq4~1.8x of mq2-lloyd per expert
+# base sizes (per the produced files): lloyd-mq2=67.5GB experts; mq6~2.8x, mq4~1.8x of lloyd-mq2 per expert
 GB_MQ2 = 67.5
 for K in (8, 16, 32, 48, 64):
     rc, ic = [], []
@@ -77,7 +77,7 @@ for K in (8, 16, 32, 48, 64):
         it = imp[n].sum()
         ic.append(imp[n][order].sum()/it if it > 0 else 0)
     frac = K / NE
-    # promoted experts cost (mult-1)x extra; mq6~2.8x, mq4~1.8x the mq2-lloyd per-expert bytes
+    # promoted experts cost (mult-1)x extra; mq6~2.8x, mq4~1.8x the lloyd-mq2 per-expert bytes
     sz6 = GB_MQ2 + GB_MQ2 * frac * (2.8 - 1.0)
     sz4 = GB_MQ2 + GB_MQ2 * frac * (1.8 - 1.0)
     print(f"{K:>8} {np.mean(rc):>9.2f} {np.mean(ic):>8.2f} {sz6:>7.1f}GB {sz4:>7.1f}GB")

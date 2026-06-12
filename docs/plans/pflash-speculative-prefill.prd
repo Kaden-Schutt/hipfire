@@ -412,10 +412,10 @@ Daemon load params:
 ```json
 {
   "type": "load",
-  "model": "~/.hipfire/models/qwen3.6-27b.mq4",
+  "model": "~/.hipfire/models/qwen3.6-27b-mq4.hfq",
   "params": {
     "max_seq": 131072,
-    "draft": "~/.hipfire/models/qwen36-27b-dflash-mq4.hfq",
+    "draft": "~/.hipfire/models/qwen3.6-27b-mq4.dflash.hfq",
     "prefill_compression": "auto",
     "prefill_threshold": 32768,
     "prefill_keep_ratio": 0.05,

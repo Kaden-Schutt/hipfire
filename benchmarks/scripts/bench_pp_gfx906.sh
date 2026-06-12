@@ -13,16 +13,16 @@
 # the harness invocation + commit hash, recorded below.
 #
 # Usage:
-#   ./benchmarks/scripts/bench_pp_gfx906.sh /path/to/qwen3.5-9b.mq4
+#   ./benchmarks/scripts/bench_pp_gfx906.sh /path/to/qwen3.5-9b-mq4.hfq
 #
 # Prints a row per pp{N}, plus the `git rev-parse HEAD` and binary md5.
 
 set -u
-MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b.mq4}"
+MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b-mq4.hfq}"
 
 if [ ! -f "$MODEL" ]; then
     echo "model not found: $MODEL" >&2
-    echo "usage: $0 <path-to-qwen3.5-9b.mq4>" >&2
+    echo "usage: $0 <path-to-qwen3.5-9b-mq4.hfq>" >&2
     exit 2
 fi
 

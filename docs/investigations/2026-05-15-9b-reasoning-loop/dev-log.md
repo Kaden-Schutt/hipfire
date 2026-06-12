@@ -24,9 +24,9 @@ Correct answer: **11:34 AM**.
 
 Quants used during the investigation (all hipfire-native, built on /local since they're large):
 
-- `qwen3.5-9b.mq4` — May 6 pre-AWQ plain MQ4
-- `qwen3.5-9b.mq4-awq-current` — F2 AWQ at α=0.5
-- `qwen3.5-9b.mq6`, `qwen3.5-9b.mq8` — higher bit-rate MQ family
+- `qwen3.5-9b-mq4.hfq` — May 6 pre-AWQ plain MQ4
+- `qwen3.5-9b-awq-current-mq4.hfq` — F2 AWQ at α=0.5
+- `qwen3.5-9b-mq6.hfq`, `qwen3.5-9b-mq8.hfq` — higher bit-rate MQ family
 - `qwen3.5-9b.q8` — unrotated Q8 (binary-compatible block layout with GGML Q8_0), built via `hipfire-quantize --format q8`
 - `qwen3.5-9b.q8-f16lm` — Q8 weights + F16 lm_head (`HIPFIRE_QUANTIZE_LM_HEAD_F16=1`)
 - `qwen3.5-9b.q8f16-fresh` — fresh Q8F16 with F16 embeddings

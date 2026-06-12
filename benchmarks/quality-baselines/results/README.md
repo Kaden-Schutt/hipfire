@@ -6,8 +6,8 @@ Each eval cohort lands as a dated subdirectory:
 results/
 ├── 2026-MM-DD/
 │   ├── per-seq/                     # raw per-sequence-KLD files (HFKSEQ)
-│   │   ├── qwen3.5-9b.mq4-uniform__gfx1100.kldseq
-│   │   ├── qwen3.5-9b.mq3-uniform__gfx1100.kldseq
+│   │   ├── qwen3.5-9b-uniform__gfx1100.kldseq-mq4.hfq
+│   │   ├── qwen3.5-9b-uniform__gfx1100.kldseq-mq3.hfq
 │   │   └── ... (one per variant × arch)
 │   ├── result-table.md              # markdown table (kld_reduce.py output)
 │   ├── result-data.json             # same data, JSON for plot scripts

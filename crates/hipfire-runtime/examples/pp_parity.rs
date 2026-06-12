@@ -10,7 +10,7 @@
 //!
 //! Run: HIP_VISIBLE_DEVICES=0,1 cargo run -p hipfire-runtime \
 //!         --release --features deltanet --example pp_parity -- \
-//!         ~/.hipfire/models/qwen3.5-0.8b.mq4
+//!         ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq
 
 use hipfire_arch_qwen35::qwen35::{
     self, DeltaNetState, Qwen35Scratch, Qwen35ScratchSet, StateQuant,
@@ -123,7 +123,7 @@ fn run_multi_gpu(path: &str) -> Vec<u32> {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("Usage: ... <model.mq4>");
+    let path = std::env::args().nth(1).expect("Usage: ... <model-mq4.hfq>");
 
     println!("── PP=1 forward ──────────────────────────────────────────");
     let tokens_pp1 = run_single_gpu(&path);

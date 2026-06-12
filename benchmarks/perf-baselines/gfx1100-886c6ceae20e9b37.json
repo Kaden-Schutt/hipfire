@@ -18,8 +18,8 @@
     "source": "legacy pflash baseline metadata"
   },
   "models": {
-    "target": "qwen3.5-27b.mq3",
-    "drafter": "qwen3.5-0.8b.mq4"
+    "target": "qwen3.5-27b-mq3.hfq",
+    "drafter": "qwen3.5-0.8b-mq4.hfq"
   },
   "run_config": {
     "kv_mode": "asym3",

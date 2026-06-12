@@ -13,7 +13,7 @@
 //! Run: HIP_VISIBLE_DEVICES=0,1 cargo run --release --features deltanet \
 //!         -p hipfire-arch-qwen35 \
 //!         --example test_qwen35_state_multi -- \
-//!         ~/.hipfire/models/qwen3.5-0.8b.mq4
+//!         ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35ScratchSet, StateQuant};
 use hipfire_runtime::hfq::HfqFile;
@@ -22,7 +22,7 @@ use hipfire_runtime::multi_gpu::Gpus;
 use std::path::Path;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("Usage: ... <model.mq4>");
+    let path = std::env::args().nth(1).expect("Usage: ... <model-mq4.hfq>");
     let hfq = HfqFile::open(Path::new(&path)).expect("open hfq");
     let config = qwen35::config_from_hfq(&hfq).expect("config_from_hfq");
     eprintln!(

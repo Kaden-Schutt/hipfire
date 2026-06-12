@@ -80,7 +80,7 @@ To reproduce on your hardware:
 ```sh
 HIP_VISIBLE_DEVICES=0,1 cargo run --release --features deltanet \
     -p hipfire-runtime --example pp2_vram_probe -- \
-    ~/.hipfire/models/qwen3.5-9b.mq4 4096
+    ~/.hipfire/models/qwen3.5-9b-mq4.hfq 4096
 ```
 
 ## Deployment recipes
@@ -105,7 +105,7 @@ HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB=4 hipfire run qwen3.5:27b "Hi"
 Direct daemon JSON (driving without the CLI):
 
 ```json
-{"type":"load","model":".../qwen3.5-27b.mq4","params":{"max_seq":16384,"pp":2}}
+{"type":"load","model":".../qwen3.5-27b-mq4.hfq","params":{"max_seq":16384,"pp":2}}
 ```
 
 ### Environment variables
@@ -172,7 +172,7 @@ Architectural limits in v1:
 # Underlying byte-equivalence example
 HIP_VISIBLE_DEVICES=0,1 cargo run --release --features deltanet \
     -p hipfire-runtime --example pp_parity_chatml -- \
-    ~/.hipfire/models/qwen3.5-0.8b.mq4
+    ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq
 ```
 
 The `pp-gate.sh` battery checks:

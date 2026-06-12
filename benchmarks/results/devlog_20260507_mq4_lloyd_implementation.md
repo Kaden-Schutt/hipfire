@@ -1,6 +1,6 @@
 # Dev log 2026-05-07 — MQ4-Lloyd implementation: Phase 1 + Phase 2 + multi-acc bisect
 
-**Branch:** `feat/issue-182-mq4-lloyd` (off `lloyd-max-mq3-spike` →
+**Branch:** `feat/issue-182-lloyd-mq4` (off `lloyd-max-mq3-spike` →
 `upstream/master + Lloyd-MQ3 perf chain + this branch's MQ4-Lloyd work`).
 **Target hardware (this session):** AMD Ryzen AI MAX+ 395 / Radeon 8060S
 (gfx1151, RDNA3.5 Strix Halo APU, ROCm 7.12). gfx1100 (the MQ-Lloyd
@@ -47,7 +47,7 @@ outcomes and the multi-accumulator bug bisect.
 
 ## Phase 1 — quantizer + slow GEMV + viability PPL
 
-(Detailed methodology: [`findings/mq4-lloyd-9b-ppl.md`](../../findings/mq4-lloyd-9b-ppl.md).)
+(Detailed methodology: [`findings/lloyd-mq4-9b-ppl.md`](../../findings/lloyd-mq4-9b-ppl.md).)
 
 Implemented in commit `7ef567d`:
 
@@ -63,7 +63,7 @@ Implemented in commit `7ef567d`:
   + bytes accounting + Rust bindings; loaders in `hfq.rs` and
   `qwen35.rs`; basic `weight_gemv` / `weight_gemv_prerotated` /
   `fused_rmsnorm_rotate_for_mq` / `rotate_x_for_mq` arms.
-- `--format mq4-lloyd` CLI + `--allow-mq4-lloyd` research-only gate.
+- `--format lloyd-mq4` CLI + `--allow-lloyd-mq4` research-only gate.
 
 ### 9B PPL on local wikitext-flavored corpus (`benchmarks/calib/calib-5m.txt`)
 
@@ -150,7 +150,7 @@ drift on real model. PPL byte-equality is the decisive gate.
 
 ## Multi-accumulator bisect — what we learned
 
-(Full writeup: [`findings/mq4-lloyd-multiacc-investigation.md`](../../findings/mq4-lloyd-multiacc-investigation.md).)
+(Full writeup: [`findings/lloyd-mq4-multiacc-investigation.md`](../../findings/lloyd-mq4-multiacc-investigation.md).)
 
 **Initial framing:** during P2-B bring-up, the K4 multi-accumulator
 pattern (4 separate `acc0..acc3` registers + final
@@ -280,12 +280,12 @@ larger 160 B/group bandwidth. To be measured.
    magnitude ~5e-7 to 2e-6 on real Qwen3.5-9B weights). Full-coverage
    PPL drift on gfx1100 is the *same magnitude* as gfx1151 but
    *opposite sign* — fp32 reorder direction is essentially random per
-   arch. See `findings/mq4-lloyd-multiacc-investigation.md` "Update
+   arch. See `findings/lloyd-mq4-multiacc-investigation.md` "Update
    2026-05-07" section for the data. Conclusion: single-acc is
    universally correct for MQ4-Lloyd (already shipping); MQ3-Lloyd
    would benefit too at ~2% decode cost (issue #188).
 3. **MQ3-Lloyd → single-acc port** — **WIP under issue #188**.
-   Branch `feat/188-mq3-lloyd-single-acc-gfx1100` has the 5-kernel
+   Branch `feat/188-lloyd-mq3-single-acc-gfx1100` has the 5-kernel
    port; gfx1100 cross-process A/B shows 121.7 → 119.2 tok/s on
    Qwen3.5-9B (−2.05%, misses #181's ≥120 ship gate by 0.8 tok/s).
    Maintainer decision pending: keep multi-acc + accept arch-dependent
@@ -319,12 +319,12 @@ Diagnostic infrastructure (kept for future bisects):
 
 Findings docs:
 
-- `findings/mq4-lloyd-9b-ppl.md` — Phase 1 viability + quality projection
-- `findings/mq4-lloyd-multiacc-investigation.md` — multi-acc bisect
+- `findings/lloyd-mq4-9b-ppl.md` — Phase 1 viability + quality projection
+- `findings/lloyd-mq4-multiacc-investigation.md` — multi-acc bisect
 
 Sibling PR (out of MQ4-Lloyd scope):
 
-- **PR #189 — `feat(mq3-lloyd): enable fast variants on gfx1151
+- **PR #189 — `feat(lloyd-mq3): enable fast variants on gfx1151
   (Strix Halo APU) — parity with gfx1100`** — adds gfx1151 to all 5
   MQ3-Lloyd matchers, matching gfx1100's existing full-coverage
   deployment shape. ~2× decode speedup on Qwen3.5-9B (18.2 →
@@ -338,6 +338,6 @@ Sibling PR (out of MQ4-Lloyd scope):
 - gfx1151 (Strix Halo APU) consistently SIGSEGVs during ROCm teardown
   after metrics print. Doesn't affect bench numbers (printed before
   teardown). Exit codes are 139 even on otherwise-successful runs.
-- `~/.hipfire/models/qwen36-27b-dflash-mq4.hfq` filename uses `qwen36`
+- `~/.hipfire/models/qwen3.6-27b-mq4.dflash.hfq` filename uses `qwen36`
   (no dot) but the model ID in code is `qwen3.6` (with dot). Cosmetic;
   noted here for grep-ability.

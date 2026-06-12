@@ -31,10 +31,10 @@ Probe command:
 
 ```bash
 cargo run -p hipfire-runtime --features deltanet --example load_transport_probe -- \
-  ~/.hipfire/models/qwen3.5-0.8b.mq4 --transport pread
+  ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq --transport pread
 
 cargo run -p hipfire-runtime --features deltanet --example load_transport_probe -- \
-  ~/.hipfire/models/qwen3.5-0.8b.mq4 --transport pinned
+  ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq --transport pinned
 ```
 
 Observed debug-build results on the local 0.8B MQ4 HFQ:

@@ -106,12 +106,12 @@ acceptable — measure first.)
   && git reset --hard origin/lfm2moe/impl && cargo build --release --example daemon`.
 - Start serve: `ROCR_VISIBLE_DEVICES=1 HIPFIRE_JINJA_CHAT=1 bun cli/index.ts serve
   127.0.0.1:11435 -d` (from the worktree). Stop: `bun cli/index.ts stop`.
-- minimax model: `~/minimax-tiny-val/MiniMax-M2.7.mq2-lloyd` (86 GB), symlinked as
-  `~/.hipfire/models/minimax-m2.mq2lloyd` (the `.mq2-lloyd` dash ext is NOT
-  recognized by `findModel`; `.mq2lloyd` is). serve auto-loads max_seq=32768.
+- minimax model: `~/minimax-tiny-val/MiniMax-M2.7-lloyd-mq2.hfq` (86 GB), symlinked as
+  `~/.hipfire/models/minimax-m2-lloyd-mq2.hfq` (the `-lloyd-mq2.hfq` dash ext is NOT
+  recognized by `findModel`; `-lloyd-mq2.hfq` is). serve auto-loads max_seq=32768.
 - hermes: `~/.local/bin/hermes`, config `~/.hermes/config.yaml` → `custom:hipfire`
   provider, `base_url http://localhost:11435/v1`, **`context_length: 64000`** (its
-  floor), `model.default: minimax-m2.mq2lloyd`, streaming off. Headless run:
+  floor), `model.default: minimax-m2-lloyd-mq2.hfq`, streaming off. Headless run:
   `hermes chat -q "..." -t terminal --max-turns 4 </dev/null` (NOT `-Q` — its
   q-to-quit handler KeyboardInterrupts under non-interactive ssh).
 - ssh quoting: pipe scripts via `ssh hipx 'bash -l' <<'REMOTE' … REMOTE`; single
@@ -160,7 +160,7 @@ minimax onto it.
 - Local gfx1201 parity (`test_q8kv`, GQA head_dim=128): flash vs baseline
   cosine=1.000000, max-abs-err ≤1.1e-6 at seq=4/64/512/2048; flash-only at
   seq=20000 (baseline can't run) finite + correct (max|out−V|=3.9e-3, Q8 noise).
-- hipx gfx1151 on-model (86 GB MiniMax-M2.7.mq2-lloyd, serve, flash_mode=2 →
+- hipx gfx1151 on-model (86 GB MiniMax-M2.7-lloyd-mq2.hfq, serve, flash_mode=2 →
   every decode step uses flash): coherent reasoning + correct answer
   ("17 × 23 = 391"); no LDS/`invalid argument`/panic.
 - >16K context (needle-in-haystack, ~19K-token prompt → prefill-flash >15K

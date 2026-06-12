@@ -33,7 +33,7 @@ Example for a 27B MQ4 AR prefill/decode capture:
 
 ```bash
 python3 scripts/kernel_atlas.py collect-ar \
-  --model ~/.hipfire/models/qwen3.5-27b.mq4 \
+  --model ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
   --workload qwen3.5-27b \
   --model-size 27b \
   --quant mq4 \
@@ -62,8 +62,8 @@ Example for the canonical merge-sort DFlash shape:
 
 ```bash
 python3 scripts/kernel_atlas.py collect-dflash \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
+  --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
+  --draft ~/.hipfire/models/qwen3.5-27b-mq4.dflash.hfq \
   --prompt-file benchmarks/prompts/merge_sort_thinking_off.txt \
   --workload qwen3.5-27b-dflash-merge-sort \
   --max-tokens 256 \
@@ -87,7 +87,7 @@ Inline a small manifest into each row:
 
 ```bash
 python3 scripts/kernel_atlas.py collect-ar \
-  --model ~/.hipfire/models/qwen3.5-0.8b.mq4 \
+  --model ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq \
   --workload qwen3.5-0.8b \
   --model-size 0.8b \
   --prefill 32 \
@@ -102,7 +102,7 @@ Write the ISA manifest once and reference it from each row:
 
 ```bash
 python3 scripts/kernel_atlas.py collect-ar \
-  --model ~/.hipfire/models/qwen3.5-27b.mq4 \
+  --model ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
   --workload qwen3.5-27b \
   --model-size 27b \
   --prefill 32 \
@@ -134,7 +134,7 @@ Atlas can also attach a dispatch/source manifest for the profiled kernels:
 
 ```bash
 python3 scripts/kernel_atlas.py collect-ar \
-  --model ~/.hipfire/models/qwen3.5-27b.mq4 \
+  --model ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
   --workload qwen3.5-27b \
   --model-size 27b \
   --prefill 32 \

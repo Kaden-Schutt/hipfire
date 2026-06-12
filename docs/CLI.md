@@ -24,7 +24,7 @@ flag-level detail; this page is the index.
 | `hipfire eval <model>` | Human-default eval: short speed bench plus local baseline comparison. First run creates `~/.hipfire/benchmarks/<model>.speed.json`; later runs compare against it. |
 
 `hipfire run` accepts either a registry tag (`qwen3.5:9b`) or a literal
-file path (`./my.mq4`). For a prompt with shell-special characters,
+file path (`./my-mq4.hfq`). For a prompt with shell-special characters,
 quote it: `hipfire run qwen3.5:9b "What's 2+2?"`.
 
 ## Evaluation
@@ -49,7 +49,7 @@ Examples:
 hipfire eval ~/.hipfire/models/qwen3.5-4b-mq4.hfq
 hipfire eval speed ~/.hipfire/models/qwen3.5-4b-mq4.hfq --benchmark
 hipfire eval admit candidate.hfq baseline.hfq
-hipfire eval dflash qwen3.5-27b-mq4.hfq --draft qwen3.5-27b-dflash-mq4.hfq
+hipfire eval dflash qwen3.5-27b-mq4.hfq --draft qwen3.5-27b-mq4.dflash.hfq
 ```
 
 Local default-speed baselines are user-specific and live under
@@ -88,14 +88,14 @@ generate the calibration sidecar:
 Usage:
 
 ```bash
-hipfire sidecar-gen qwen3.5-27b-dflash-mq4.hfq --corpus my-corpus.txt --max-tokens 8192 --chunk-len 1024 -o /path/to/output.triattn.hfq
+hipfire sidecar-gen qwen3.5-27b-mq4.dflash.hfq --corpus my-corpus.txt --max-tokens 8192 --chunk-len 1024 -o /path/to/output.triattn.hfq
 ```
 
 Flags for `sidecar-gen`:
 
 | Flag | Purpose |
 |---|---|
-| `<model>` (positional) | Model tag or local file path. The sidecar is written next to the model file by default using the full model filename: `my-finetune.mq4` → `my-finetune.mq4.triattn.hfq`. See **Filename discovery** below for details. |
+| `<model>` (positional) | Model tag or local file path. The sidecar is written next to the model file by default using the full model filename: `my-finetune-mq4.hfq` → `my-finetune-mq4.triattn.hfq`. See **Filename discovery** below for details. |
 | `--corpus PATH` | Text corpus for calibration. If omitted, uses an internal default. |
 | `--max-tokens N` | Maximum tokens of context to calibrate over (default: 4000). |
 | `--chunk-len N` | Chunk size for KV cache statistics collection (default: 256). |
@@ -112,8 +112,8 @@ critical early tokens on long context prompts, causing quality drop-off.
 **Quick setup after quantizing your own model:**
 
 ```bash
-hipfire quantize ./my-model/ --format mq4 -o my-finetune.mq4
-hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
+hipfire quantize ./my-model/ --format mq4 -o my-finetune-mq4.hfq
+hipfire sidecar-gen my-finetune-mq4.hfq --corpus /path/to/corpus.txt
 hipfire config cask-profile balanced
 # The daemon will auto-attach the sidecar on the next model load
 ```

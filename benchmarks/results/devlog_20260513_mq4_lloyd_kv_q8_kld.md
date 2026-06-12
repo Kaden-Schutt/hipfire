@@ -1,6 +1,6 @@
 # Dev log 2026-05-13 — Q8-KV KLD probes (9B, gfx1151): MQ4-Lloyd + MQ6-q8conv1d
 
-**Branch:** `feat/issue-182-mq4-lloyd` (HEAD `1deeaa5e`, post-master-merge that
+**Branch:** `feat/issue-182-lloyd-mq4` (HEAD `1deeaa5e`, post-master-merge that
 brought in halfsplit RoPE + HFP4G32 + MFP4G32).
 **Hardware:** gfx1151 (Radeon 8060S, AMD Ryzen AI Max+ 395 / Strix Halo APU,
 LPDDR5x ~250 GB/s), ROCm 7.12.
@@ -109,20 +109,20 @@ Per-run:
 
 | Field | Value |
 |---|---|
-| Model | `/home/kread/.hipfire/models/qwen3.5-9b.mq4-lloyd` (md5 `cd8626a1701e65055d31986bb5ec840c`, re-quantized on this branch from `Qwen/Qwen3.5-9B` safetensors at snapshot `c2022362...` — see "Quantize provenance" below) |
+| Model | `/home/kread/.hipfire/models/qwen3.5-9b-lloyd-mq4.hfq` (md5 `cd8626a1701e65055d31986bb5ec840c`, re-quantized on this branch from `Qwen/Qwen3.5-9B` safetensors at snapshot `c2022362...` — see "Quantize provenance" below) |
 | `--max-chunks` | `512` (of 1175 in the slice) |
 | Wall-clock | 76 min (`116 tok/s` end-to-end, 523 776 scored tokens). First 30 chunks include rmsnorm JIT compile; steady-state throughput is 116 tok/s. |
-| Output | `benchmarks/quality-baselines/results/2026-05-13-kv-q8/per-seq/qwen3.5-9b.mq4-lloyd-kvq8-c512__gfx1151__prefill.kldseq` |
+| Output | `benchmarks/quality-baselines/results/2026-05-13-kv-q8/per-seq/qwen3.5-9b-lloyd-kvq8-c512__gfx1151__prefill.kldseq-mq4.hfq` |
 
 ### MQ4-Lloyd-q8conv1d (added after 2188e841 cherry-pick)
 
 | Field | Value |
 |---|---|
-| Model | `/home/kread/.hipfire/models/qwen3.5-9b.mq4-lloyd-q8conv1d` (md5 `d26bcfca41e30caad4b21bddafc20bd1`, 6056.2 MB; re-quantized from the same `Qwen/Qwen3.5-9B` snapshot as the MQ4-Lloyd baseline after cherry-picking `2188e841` "default conv1d weight to Q8") |
+| Model | `/home/kread/.hipfire/models/qwen3.5-9b-lloyd-q8conv1d-mq4.hfq` (md5 `d26bcfca41e30caad4b21bddafc20bd1`, 6056.2 MB; re-quantized from the same `Qwen/Qwen3.5-9B` snapshot as the MQ4-Lloyd baseline after cherry-picking `2188e841` "default conv1d weight to Q8") |
 | `--max-chunks` | `512` (of 1175) — preceded by a 20-chunk smoke (same flags) |
 | Quantize log evidence | every `linear_attn.conv1d.weight` row printed as `Q8_F16: ... 64.0 KB → 34.0 KB` (vs the `MQ4G256Lloyd: ... 64.0 KB → 20.0 KB` rows in the baseline quantize log) |
 | Wall-clock | 20-chunk smoke ~3 min (88 tok/s); 512-chunk run ~1h25 (102 tok/s steady — kernels warm from earlier runs) |
-| Outputs | `benchmarks/quality-baselines/results/2026-05-13-kv-q8/per-seq/qwen3.5-9b.mq4-lloyd-q8conv1d-kvq8-c20__gfx1151__prefill.kldseq` (smoke) and `qwen3.5-9b.mq4-lloyd-q8conv1d-kvq8-c512__gfx1151__prefill.kldseq` (full) |
+| Outputs | `benchmarks/quality-baselines/results/2026-05-13-kv-q8/per-seq/qwen3.5-9b-lloyd-q8conv1d-kvq8-c20__gfx1151__prefill.kldseq-mq4.hfq` (smoke) and `qwen3.5-9b-lloyd-q8conv1d-kvq8-c512__gfx1151__prefill.kldseq-mq4.hfq` (full) |
 | Independent mean KLD | 0.2519 (CI 0.2418 – 0.2626, n=512) |
 | Paired vs MQ4-Lloyd (512 ch) | per-chunk delta mean 0.0595 (95 % CI 0.0568 – 0.0624), 511/512 chunks improve, one regression of 0.007 |
 
@@ -130,10 +130,10 @@ Per-run:
 
 | Field | Value |
 |---|---|
-| Model | `/data/hipfire/qwen3.5-9b.mq6-q8conv1d` (md5 `7b1b6d822d0f662c78f9c75675c8639b`, 7.30 GB; pre-existing on this branch — not re-quantized in this session) |
+| Model | `/data/hipfire/qwen3.5-9b-q8conv1d-mq6.hfq` (md5 `7b1b6d822d0f662c78f9c75675c8639b`, 7.30 GB; pre-existing on this branch — not re-quantized in this session) |
 | `--max-chunks` | `512` (of 1175 in the slice) — preceded by a 20-chunk smoke (same flags) |
 | Wall-clock | 20-chunk smoke ~6 min (steady-state ~60 tok/s); 512-chunk run 1h45 (steady-state 83 tok/s — kernels warmed across both runs, so the second run never paid JIT-compile overhead) |
-| Outputs | `benchmarks/quality-baselines/results/2026-05-13-kv-q8/per-seq/qwen3.5-9b.mq6-q8conv1d-kvq8-c20__gfx1151__prefill.kldseq` (smoke) and `qwen3.5-9b.mq6-q8conv1d-kvq8-c512__gfx1151__prefill.kldseq` (full) |
+| Outputs | `benchmarks/quality-baselines/results/2026-05-13-kv-q8/per-seq/qwen3.5-9b-q8conv1d-kvq8-c20__gfx1151__prefill.kldseq-mq6.hfq` (smoke) and `qwen3.5-9b-q8conv1d-kvq8-c512__gfx1151__prefill.kldseq-mq6.hfq` (full) |
 
 ## Eligibility — did batched WMMA prefill actually fire?
 
@@ -153,7 +153,7 @@ already exercised on this branch (see `kv_cache.quant_q8` in qwen35.rs:3651,
 
 ## Quantize provenance
 
-Original `qwen3.5-9b.mq4-lloyd` on disk dated 2026-05-06 was rejected by the
+Original `qwen3.5-9b-lloyd-mq4.hfq` on disk dated 2026-05-06 was rejected by the
 loader on this branch with `unsupported quant_type 21 for layers.0.linear_attn.conv1d.weight` — the qt-renumber from 21 to 30 in the HFP4G32 merge
 (`596dd231`, "renumbered to avoid HFP4G32=21 collision") makes any pre-merge
 MQ4-Lloyd .hfq unreadable. Re-quantized on this branch:
@@ -161,9 +161,9 @@ MQ4-Lloyd .hfq unreadable. Re-quantized on this branch:
 ```
 ./target/release/hipfire-quantize \
   --input /data/cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a/ \
-  --output /home/kread/.hipfire/models/qwen3.5-9b.mq4-lloyd \
-  --format mq4-lloyd \
-  --allow-mq4-lloyd
+  --output /home/kread/.hipfire/models/qwen3.5-9b-lloyd-mq4.hfq \
+  --format lloyd-mq4 \
+  --allow-lloyd-mq4
 ```
 
 Wrote 6055.8 MB; md5 `cd8626a1701e65055d31986bb5ec840c`.
@@ -201,12 +201,12 @@ Wrote 6055.8 MB; md5 `cd8626a1701e65055d31986bb5ec840c`.
 
 ```
 benchmarks/quality-baselines/results/2026-05-13-kv-q8/per-seq/
-  qwen3.5-9b.mq4-lloyd__gfx1151__kv-q8__prefill__c50.kldseq        (50-chunk smoke;  KLD 0.3005)
-  qwen3.5-9b.mq4-lloyd-kvq8-c512__gfx1151__prefill.kldseq          (512-chunk run;   KLD 0.3114)
-  qwen3.5-9b.mq4-lloyd-q8conv1d-kvq8-c20__gfx1151__prefill.kldseq  (20-chunk smoke;  KLD 0.2492)
-  qwen3.5-9b.mq4-lloyd-q8conv1d-kvq8-c512__gfx1151__prefill.kldseq (512-chunk run;   KLD 0.2519)
-  qwen3.5-9b.mq6-q8conv1d-kvq8-c20__gfx1151__prefill.kldseq        (20-chunk smoke;  KLD 0.0568)
-  qwen3.5-9b.mq6-q8conv1d-kvq8-c512__gfx1151__prefill.kldseq       (512-chunk run;   KLD 0.0510)
+  qwen3.5-9b-lloyd__gfx1151__kv-q8__prefill__c50.kldseq-mq4.hfq        (50-chunk smoke;  KLD 0.3005)
+  qwen3.5-9b-lloyd-kvq8-c512__gfx1151__prefill.kldseq-mq4.hfq          (512-chunk run;   KLD 0.3114)
+  qwen3.5-9b-lloyd-q8conv1d-kvq8-c20__gfx1151__prefill.kldseq-mq4.hfq  (20-chunk smoke;  KLD 0.2492)
+  qwen3.5-9b-lloyd-q8conv1d-kvq8-c512__gfx1151__prefill.kldseq-mq4.hfq (512-chunk run;   KLD 0.2519)
+  qwen3.5-9b-q8conv1d-kvq8-c20__gfx1151__prefill.kldseq-mq6.hfq        (20-chunk smoke;  KLD 0.0568)
+  qwen3.5-9b-q8conv1d-kvq8-c512__gfx1151__prefill.kldseq-mq6.hfq       (512-chunk run;   KLD 0.0510)
 ```
 
 The `<variant>-kvq8-c<n>` form makes the 3-segment `kld_reduce.py` parser

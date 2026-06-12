@@ -25,8 +25,8 @@ def pct(sorted_arr, p):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jsonl", default="/tmp/humaneval/HumanEval.jsonl")
-    ap.add_argument("--target", default=os.path.expanduser("~/.hipfire/models/qwen3.5-27b.mq4"))
-    ap.add_argument("--draft", default=os.path.expanduser("~/.hipfire/models/qwen35-27b-dflash-mq4.hfq"))
+    ap.add_argument("--target", default=os.path.expanduser("~/.hipfire/models/qwen3.5-27b-mq4.hfq"))
+    ap.add_argument("--draft", default=os.path.expanduser("~/.hipfire/models/qwen3.5-27b-mq4.dflash.hfq"))
     ap.add_argument("--demo", default="./target/release/examples/dflash_spec_demo")
     ap.add_argument("--max", type=int, default=128, help="max tokens per prompt")
     ap.add_argument("--ctx", type=int, default=2048)

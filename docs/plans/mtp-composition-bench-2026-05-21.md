@@ -17,8 +17,8 @@ wire them up. This bench just exercises the existing artifacts.
 ```
 HIPFIRE_DPM_WARMUP_SECS=10 (or 1 throwaway run) \
 ./target/release/examples/dflash_mtp_demo \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --drafter ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
+  --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
+  --drafter ~/.hipfire/models/qwen3.5-27b-mq4.dflash.hfq \
   --mtp-head <path-to-cvs16384.mtp-or-q8.mtp> \
   --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt \
   --max 120 --temp 0 --no-chatml --kv-mode q8 \
@@ -366,8 +366,8 @@ tok_s, replay_skipped %) differ. Generated tokens (preview_200) are
 byte-exact identical. K=4 vs K=5 is pure perf, no correctness change.
 
 **Coherence-gate.sh: PASSED** (2026-05-21T12:37:35):
-- 6 cells: qwen3.5-{0.8b,4b,9b}.mq4 × {cap,code,reason,tool-call} +
-  qwen3.5-27b.mq3/cap-mq3-27b + qwen3.5-9b.q8f16/long-prefill-q8-9b
+- 6 cells: qwen3.5-{0.8b,4b,9b}-mq4.hfq × {cap,code,reason,tool-call} +
+  qwen3.5-27b-mq3.hfq/cap-mq3-27b + qwen3.5-9b.q8f16/long-prefill-q8-9b
 - All status: OK. Output fluent, on-topic, no attractors.
 - Report saved at hiptrx `~/.hipfire/distill_artifacts_2026_05_21/coherence-20260521-123735.md`
 
@@ -422,8 +422,8 @@ characterization** documenting what works, what doesn't, and why.
 ## Bench reproducibility
 
 Models on hiptrx + k9lin (canonical):
-- `~/.hipfire/models/qwen3.5-27b.mq4` — trunk (14.0 GiB)
-- `~/.hipfire/models/qwen35-27b-dflash-mq4.hfq` — DFlash drafter (876 MiB)
+- `~/.hipfire/models/qwen3.5-27b-mq4.hfq` — trunk (14.0 GiB)
+- `~/.hipfire/models/qwen3.5-27b-mq4.dflash.hfq` — DFlash drafter (876 MiB)
 - `~/.hipfire/models/qwen3.5-27b-cvs16384.mtp` (or `/tmp/...` on k9lin) — MTP head vocab=16K (258 MiB)
 - `~/.hipfire/models/qwen3.5-27b-q8.mtp` — MTP head full vocab (451 MiB)
 

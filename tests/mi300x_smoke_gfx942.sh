@@ -51,12 +51,12 @@ phase "3/5  AR decode finite-logit check (Q3.5-9B mq4)"
 # Need an mq4 HFQ to test against. If we have one, use it; otherwise build a
 # tiny ad-hoc one. The v3_matrix script will build proper ones later.
 test_hfq=""
-for cand in /workspace/models/qwen3.5-9b.mq4 /root/.hipfire/models/qwen3.5-9b.mq4; do
+for cand in /workspace/models/qwen3.5-9b-mq4.hfq /root/.hipfire/models/qwen3.5-9b-mq4.hfq; do
     [ -f "$cand" ] && test_hfq="$cand" && break
 done
 if [ -z "$test_hfq" ]; then
     mkdir -p "$WORK/models"
-    test_hfq="$WORK/models/qwen3.5-9b.mq4.smoke"
+    test_hfq="$WORK/models/qwen3.5-9b-mq4.hfq.smoke"
     src=$(python3 -c "
 from huggingface_hub import snapshot_download
 print(snapshot_download(repo_id='Qwen/Qwen3.5-9B', revision='c202236235762e1c871ad0ccb60c8ee5ba337b9a',

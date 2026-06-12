@@ -4,7 +4,7 @@ Date: 2026-05-17
 
 ## Goal
 
-Make a target `.mq4`/HFQ artifact optionally carry the paired DFlash draft so
+Make a target `-mq4.hfq`/HFQ artifact optionally carry the paired DFlash draft so
 install/pull can become single-file while existing external draft
 auto-discovery keeps working. This note is design-only; no draft tensors are
 embedded in this pass.
@@ -30,7 +30,7 @@ Add metadata like:
 ```json
 "dflash": {
   "mode": "external",
-  "draft_filename": "qwen35-27b-dflash-mq4.hfq",
+  "draft_filename": "qwen3.5-27b-mq4.dflash.hfq",
   "draft_md5": "...",
   "target_family": "qwen3.5",
   "target_size": "27b"

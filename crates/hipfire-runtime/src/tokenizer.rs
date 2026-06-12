@@ -495,7 +495,7 @@ impl Tokenizer {
     /// Load tokenizer from a JSON-serialized GGUF metadata tree. Mirrors
     /// `from_gguf` field-for-field but reads `serde_json::Value` instead of
     /// the live `GgufFile`. Used by the GGUF→MQ4 quantize path so a
-    /// converted `.mq4` is fully self-sufficient (no GGUF-on-disk fallback).
+    /// converted `-mq4.hfq` is fully self-sufficient (no GGUF-on-disk fallback).
     pub fn from_gguf_meta_json(meta: &serde_json::Value) -> Result<Self, TokenizerError> {
         let tokens_arr = meta
             .get("tokenizer.ggml.tokens")

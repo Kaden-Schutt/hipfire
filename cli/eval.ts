@@ -63,10 +63,11 @@ export function resolveEvalBinary(
   dirname: string = __dirname,
 ): string | null {
   const exe = platform === "win32" ? ".exe" : "";
+  const hipfireDir = env.HIPFIRE_DIR ?? join(homedir(), ".hipfire");
   const candidates = [
     env.HIPFIRE_EVAL_BIN,
     resolve(dirname, `../target/release/hipfire-eval${exe}`),
-    join(homedir(), ".hipfire", "bin", `hipfire-eval${exe}`),
+    join(hipfireDir, "bin", `hipfire-eval${exe}`),
   ].filter((p): p is string => !!p);
   return candidates.find((p) => existsSync(p)) ?? null;
 }

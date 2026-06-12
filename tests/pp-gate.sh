@@ -456,12 +456,12 @@ export HIPFIRE_DETERMINISTIC=1
 
 EXE="./target/release/examples/daemon"
 EXAMPLES_DIR="./target/release/examples"
-MODEL="${HIPFIRE_PP_GATE_MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4}"
+MODEL="${HIPFIRE_PP_GATE_MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b-mq4.hfq}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
 if [ ! -f "$MODEL" ]; then
     echo "pp-gate: model not found at $MODEL — skipping"
-    echo "         set HIPFIRE_PP_GATE_MODEL or install qwen3.5-0.8b.mq4"
+    echo "         set HIPFIRE_PP_GATE_MODEL or install qwen3.5-0.8b-mq4.hfq"
     exit 0
 fi
 

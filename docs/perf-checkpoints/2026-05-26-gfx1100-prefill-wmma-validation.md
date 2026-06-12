@@ -10,7 +10,7 @@ greedy decode).
 
 ```
 ./target/release/examples/ocr_e2e \
-  --hfq /data/hipfire/dots-ocr.q8.hfq \
+  --hfq /data/hipfire/dots-ocr-q8.hfq \
   --image benchmarks/images/dots_ocr_smoke_001.jpg \
   --prompt-json benchmarks/references/dots_ocr_smoke_001.json \
   --prefill {seq|batch} --max-tokens {64|1}

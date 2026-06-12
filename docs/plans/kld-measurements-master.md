@@ -74,7 +74,7 @@ the linked detail section. `—` = not recorded in this summary (see detail).
 | Q3.5-9B | `mq4-awq-gptq-f2-q8head` | **PPL-best 4-bit** (alt headline) | ~4.4 | 0.1727 | 8.417 | q8 | 256 | §1.1j |
 | Q3.5-9B | `mq4-q8conv1d` | lever: Q8 conv1d only | 4.25 | 0.2501 | 8.789 | q8 | 512 | §1.1f |
 | Q3.5-9B | `mq4-awq + Q8 conv1d` | stack (superseded by §1.1j/k) | 4.25 | 0.1842 | 9.575 | q8 | 512 | §1.1f |
-| Q3.5-9B | `mq4-lloyd` | **dropped** — Lloyd null at 4-bit | ~4.91 | 0.3114 | 9.085 | q8 | 512 | §1.1c |
+| Q3.5-9B | `lloyd-mq4` | **dropped** — Lloyd null at 4-bit | ~4.91 | 0.3114 | 9.085 | q8 | 512 | §1.1c |
 | Q3.5-9B | `mq4-kmd2` (no AWQ) | lever: mixed MQ4/MQ6 | ~4.81 | 0.1859 | 9.661 | asym3 | 256 | §1.1h |
 | Q3.5-9B | `mq4-kmd2-awq` | stack (asym3; ~0.11 q8-equiv est.) | ~5.75 | 0.1485 | 9.844 | asym3 | 256 | §1.1h |
 | Q3.5-9B | F1 α=0.5 (184 sidecars) | AWQ whitelist | 4.25 | 0.1725 | 9.54 | q8 | 256 | §1.1h |
@@ -194,7 +194,7 @@ Working artifacts: `benchmarks/quality-baselines/results/2026-05-18-9b-q8head-co
 
 ### 1.1k mq4-awq-gptq-f2-lmhead-a100 (KV=q8, prefill, n=256, 2026-05-19) — **cross-arch confirmed**
 
-Source: `qwen3.5-9b.mq4-awq-gptq-f2-lmhead-a100.hfq` on `/data/hipfire` (5.315 GB, **4.744 bpw** effective whole-file at 8.96B params). Same .hfq evaluated on two arches, same slice (md5 `83b0205a`, n=256), same kv-mode (q8), same scoring mode (prefill), same `kldref` (md5 `283ecb32`).
+Source: `qwen3.5-9b-awq-gptq-f2-lmhead-a100-mq4.hfq` on `/data/hipfire` (5.315 GB, **4.744 bpw** effective whole-file at 8.96B params). Same .hfq evaluated on two arches, same slice (md5 `83b0205a`, n=256), same kv-mode (q8), same scoring mode (prefill), same `kldref` (md5 `283ecb32`).
 
 | Arch | Run | KLD (CI) | p99 KLD | mean NLL | PPL | Wall | tok/s |
 |---|---|---|---:|---:|---:|---:|---:|
@@ -304,7 +304,7 @@ PPL 9.172 is **within 0.02% of the Tier-3 Q8 floor** (9.189) — indistinguishab
 
 ### 1.1h AWQ + K-map mixed MQ4/MQ6 + Q8 conv1d (gfx1151, KV=asym3, prefill, n=256, 2026-05-15)
 
-Source: commit `0043e26c` ("feat(quantize): AWQ pre-scale K-map MQ6 promotions") — extends Stage A AWQ-on-MQ4 to the K-map-promoted MQ6 tensors. Recipe: `--format mq4 --kmap-dense --kmap-mode 2 --imatrix … --awq`, q8_conv1d_default ON (PR #251). Quantized models in `~/.hipfire/models/qwen3.5-9b.mq4-kmd2{,-awq}-2026-05-14`. **Both runs ran on the same fresh build** (cargo clean + `.hipfire_kernels/` nuke + daemon binary refresh — earlier KLD=0 / NaN cohort was a stale-binary artifact). Cohort artifacts: `benchmarks/quality-baselines/results/2026-05-14-awq-mq6-cohort-fresh/per-seq/`.
+Source: commit `0043e26c` ("feat(quantize): AWQ pre-scale K-map MQ6 promotions") — extends Stage A AWQ-on-MQ4 to the K-map-promoted MQ6 tensors. Recipe: `--format mq4 --kmap-dense --kmap-mode 2 --imatrix … --awq`, q8_conv1d_default ON (PR #251). Quantized models in `~/.hipfire/models/qwen3.5-9b-kmd2-mq4.hfq{,-awq}-2026-05-14`. **Both runs ran on the same fresh build** (cargo clean + `.hipfire_kernels/` nuke + daemon binary refresh — earlier KLD=0 / NaN cohort was a stale-binary artifact). Cohort artifacts: `benchmarks/quality-baselines/results/2026-05-14-awq-mq6-cohort-fresh/per-seq/`.
 
 | Variant | n | bpw (body / total) | KLD | mean NLL | PPL | Wall |
 |---|---:|---:|---:|---:|---:|---:|
@@ -464,9 +464,9 @@ Source: gfx1151 agent 2026-05-13 PM. Default conv1d (MQ4G256, not Q8), default l
 
 | Variant | bpw | KLD (CI) | p99 | PPL | Wall |
 |---|---:|---|---:|---:|---:|
-| **mq4-lloyd** | **~4.91** (incl. Lloyd codebook overhead) | **0.3114** (CI 0.2999–0.3236) | 18.69 | **9.085** | 76 min @ 116 tok/s |
+| **lloyd-mq4** | **~4.91** (incl. Lloyd codebook overhead) | **0.3114** (CI 0.2999–0.3236) | 18.69 | **9.085** | 76 min @ 116 tok/s |
 
-**Lloyd codebook provides essentially zero KLD improvement on MQ4 at 9B.** Compared to mq4-base (asym3-KV n=512: 0.3376, q8-KV n=20: 0.3182, q8-KV n=512 estimated 0.27-0.32), mq4-lloyd at 0.3114 is within noise of the baseline — and the file is 6.06 GB vs mq4-base's 5.31 GB (**+744 MB / +0.66 bpw avg overhead** for the Lloyd codebook).
+**Lloyd codebook provides essentially zero KLD improvement on MQ4 at 9B.** Compared to mq4-base (asym3-KV n=512: 0.3376, q8-KV n=20: 0.3182, q8-KV n=512 estimated 0.27-0.32), lloyd-mq4 at 0.3114 is within noise of the baseline — and the file is 6.06 GB vs mq4-base's 5.31 GB (**+744 MB / +0.66 bpw avg overhead** for the Lloyd codebook).
 
 **Mechanism (confirms §4A.2 prediction):** after FWHT-256 rotation, per-block weight distribution is approximately Gaussian (CLT on 256 elements). Lloyd-Max codebooks fit to a near-Gaussian don't beat uniform 4-bit grids by much. Lloyd is theorized to help on heavy-tailed distributions; the FWHT rotation already removes the heavy-tail problem MQ4 base would otherwise have.
 
@@ -677,7 +677,7 @@ Source: this session. Run via `eval_hipfire` against `qwen3.5-4b-bf16.kldref.bin
 
 Smoke (n=20, same recipe): KLD 0.0572, PPL 10.4167, 142 tok/s.
 
-Quant output: `~/.hipfire/models/qwen3.5-4b.mq4-awq-gptq-q8conv` (2.5 GB, 30.6% of 8.4 GB BF16 input).
+Quant output: `~/.hipfire/models/qwen3.5-4b-awq-gptq-q8conv-mq4.hfq` (2.5 GB, 30.6% of 8.4 GB BF16 input).
 
 **VL caveat (load-bearing for reproducibility).** Qwen3.5-4B on HF is `Qwen3_5ForConditionalGeneration` (`pipeline_tag: image-text-to-text`); its safetensors store tensors as `model.language_model.embed_tokens.weight` etc. with the `language_model.` prefix. The 9B and 0.8B base models are text-only and have no such prefix. Quantizing 4B **from a BF16 GGUF** silently strips that prefix (the GGUF flatten doesn't preserve the VL nesting), producing a .hfq that fails to load (`embed_tokens not found` at `qwen35.rs:1334`) AND causes zero Hessian-key matches in the GPTQ OBS pass (hessian keys retain `language_model.` from the HF-side collection). **Always pass `--input <HF-safetensors-dir>` for 4B, never the GGUF.** The imatrix and kldref are still built from the BF16 GGUF — those paths use llama.cpp's tokenizer/forward and don't care about the safetensors prefix.
 
@@ -852,16 +852,16 @@ need to be benched before strategic decisions get cemented.
 
 | Format | bpw | Status on disk | Gated by | KLD against current ref? |
 |---|---:|---|---|---|
-| MQ3G256 (uniform 3-bit, "mq3-rtn") | 3.25 | `~/.hipfire/models/qwen3.5-9b.mq3` exists | — | **MEASURED §1.4** — 0.5449 (gfx1151, kv-q8, n=256) |
+| MQ3G256 (uniform 3-bit, "mq3-rtn") | 3.25 | `~/.hipfire/models/qwen3.5-9b-mq3.hfq` exists | — | **MEASURED §1.4** — 0.5449 (gfx1151, kv-q8, n=256) |
 | MQ3G256 + AWQ + GPTQ | 3.25 | quant produced via stage-A F2 + stage-B GPTQ | — | **MEASURED §1.4** — 0.1967 (gfx1151, kv-q8, n=256) |
-| MQ3G256-Lloyd (3-bit + per-block Lloyd-Max 8-entry FP16 codebook) | 3.50 | `~/.hipfire/models/qwen3.5-9b.mq3-lloyd` exists | — | **NOT MEASURED** |
-| MQ4G256-Lloyd (4-bit + Lloyd codebook, prefill kernel) | ~4.5 | not quantized | PR [#197](https://github.com/Kaden-Schutt/hipfire/pull/197) (`feat/issue-182-mq4-lloyd`, open) | **NOT MEASURED** |
+| MQ3G256-Lloyd (3-bit + per-block Lloyd-Max 8-entry FP16 codebook) | 3.50 | `~/.hipfire/models/qwen3.5-9b-lloyd-mq3.hfq` exists | — | **NOT MEASURED** |
+| MQ4G256-Lloyd (4-bit + Lloyd codebook, prefill kernel) | ~4.5 | not quantized | PR [#197](https://github.com/Kaden-Schutt/hipfire/pull/197) (`feat/issue-182-lloyd-mq4`, open) | **NOT MEASURED** |
 | MQ2G256-Lloyd (2-bit + Lloyd codebook) | ~2.5 | check `~/.hipfire/models/` | — | **NOT MEASURED** |
 
 ### 4A.2 Lloyd-transform uplift — investigation note
 
-The Lloyd-Max per-block codebook (used in mq3-lloyd / mq4-lloyd /
-mq2-lloyd) replaces the uniform 4/8/16-codepoint grid with K
+The Lloyd-Max per-block codebook (used in lloyd-mq3 / lloyd-mq4 /
+lloyd-mq2) replaces the uniform 4/8/16-codepoint grid with K
 data-driven centroids fit to each post-FWHT block's value distribution.
 Theory: for post-FWHT weights with heavy-tailed kurtosis, a uniform
 grid wastes codepoints on tail bins while under-resolving the dense
@@ -886,15 +886,15 @@ how non-uniform the post-FWHT distribution is.
    them as additive vs interfering is part of the design validation.
 
 **Highest-leverage measurement order:**
-1. mq3 + mq3-lloyd at 9B (no PR gating, no quantize required, ~30 min wall)
-2. mq3 + mq3-lloyd at 0.8B (need to quantize first; ~10 min quantize + ~15 min eval)
-3. mq4-lloyd at 9B (gated on PR #197 — see below)
-4. mq4-lloyd + AWQ stack at 9B (Phase A Step 5c follow-up)
+1. mq3 + lloyd-mq3 at 9B (no PR gating, no quantize required, ~30 min wall)
+2. mq3 + lloyd-mq3 at 0.8B (need to quantize first; ~10 min quantize + ~15 min eval)
+3. lloyd-mq4 at 9B (gated on PR #197 — see below)
+4. lloyd-mq4 + AWQ stack at 9B (Phase A Step 5c follow-up)
 
-### 4A.3 How to measure mq4-lloyd (gated on PR #197)
+### 4A.3 How to measure lloyd-mq4 (gated on PR #197)
 
-PR `Kaden-Schutt/hipfire#197` (`feat/issue-182-mq4-lloyd`, OPEN) ships
-the MQ4-Lloyd WMMA prefill kernels. To measure mq4-lloyd KLD without
+PR `Kaden-Schutt/hipfire#197` (`feat/issue-182-lloyd-mq4`, OPEN) ships
+the MQ4-Lloyd WMMA prefill kernels. To measure lloyd-mq4 KLD without
 merging:
 
 ```bash
@@ -906,14 +906,14 @@ gh pr checkout 197 -R Kaden-Schutt/hipfire
 
 # Quantize a candidate
 cargo run --release -p hipfire-quantize -- \
-    --hf <bf16-path> --format mq4-lloyd \
-    --out ~/.hipfire/models/qwen3.5-9b.mq4-lloyd
+    --hf <bf16-path> --format lloyd-mq4 \
+    --out ~/.hipfire/models/qwen3.5-9b-lloyd-mq4.hfq
 
 # Eval against the existing ref
 ./target/release/examples/eval_hipfire \
-    --model ~/.hipfire/models/qwen3.5-9b.mq4-lloyd \
+    --model ~/.hipfire/models/qwen3.5-9b-lloyd-mq4.hfq \
     --ref benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin \
-    --output benchmarks/quality-baselines/results/<dated>/qwen35-9b-mq4-lloyd__gfx1100.kldseq \
+    --output benchmarks/quality-baselines/results/<dated>/qwen35-9b-lloyd-mq4__gfx1100.kldseq \
     --kv-mode asym3 --scoring-mode prefill --max-chunks 512
 
 # Reduce + copy results back to feat/mq-v2-quant-format

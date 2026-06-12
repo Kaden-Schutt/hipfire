@@ -5,7 +5,7 @@ Implements `docs/plans/cdna-calibration-optimization.prd`.
 
 ## Speedup vs Phase B baseline
 
-100k-token wikitext bench (chunk_len=1024, qwen3.6-27b.mq4):
+100k-token wikitext bench (chunk_len=1024, qwen3.6-27b-mq4.hfq):
 
 | stage | wall | tok/s | speedup | R̄ |
 |---|---|---|---|---|
@@ -22,9 +22,9 @@ R̄ matched byte-exact across all stages — correctness gate met by exact match
 
 | sidecar | Phase C v2 R̄ | new v3 R̄ | wall | speedup vs Phase B (8h24m) |
 |---|---|---|---|---|
-| qwen3.6-27b.mq4 | 0.611 | 0.610 | 9m29s | **53×** |
-| qwen3.6-35b-a3b.mq4 | 0.392 | 0.391 | 13m13s | **38×** |
-| qwen3.5-35b-a3b.mq4 | 0.362 | 0.363 | 13m05s | **39×** |
+| qwen3.6-27b-mq4.hfq | 0.611 | 0.610 | 9m29s | **53×** |
+| qwen3.6-35b-a3b-mq4.hfq | 0.392 | 0.391 | 13m13s | **38×** |
+| qwen3.5-35b-a3b-mq4.hfq | 0.362 | 0.363 | 13m05s | **39×** |
 
 **All three R̄ within ±0.001 of v2** → Phase 2 GPU/skip-K/pretok changes preserve
 calibration math exactly (FP-tolerance gate passed). Optimizations are
@@ -51,7 +51,7 @@ Stretch goal (5M re-cal) skipped: structurally confirmed not to help.
 
 - `benchmarks/calib/blended-corpus.txt` — md5 c96c7ca1b189ccc19b09565ccb0c010e
   (built ad-hoc; committed in `scripts/fetch_calibration_corpus.sh --recipe blended`)
-- `models/{qwen3.6-27b,qwen3.6-35b-a3b,qwen3.5-35b-a3b}/*.mq4.triattn.blended_v3.bin`
+- `models/{qwen3.6-27b,qwen3.6-35b-a3b,qwen3.5-35b-a3b}/*-mq4-blended-v3.triattn.hfq`
 - This dir: 6 profile traces in CSV format (per-chunk timing breakdowns)
 
 ## Phase 2 commit chain on `feat/cdna-calib-mfma`

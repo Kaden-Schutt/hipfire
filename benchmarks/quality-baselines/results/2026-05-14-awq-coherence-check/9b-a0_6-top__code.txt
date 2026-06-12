@@ -1,6 +1,6 @@
 GPU dev 0: gfx906 (34.3 GB VRAM, HIP 6.4)
   pre-compiled kernels: .hipfire_kernels/gfx906
-Loading /local/hipfire/qwen3.5-9b.mq4-awq-current...
+Loading /local/hipfire/qwen3.5-9b-awq-current...-mq4.hfq
 KV cache: q8
   loading token_embd...
     (Q8_0 raw, 1080 MB)

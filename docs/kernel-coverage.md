@@ -135,7 +135,7 @@ shape coverage found the n32 variant correct and +5% to +11% on B>=256
 gate/up and down shapes, while the B=128 gate/up shape still favors the
 single-warp path. The `mmqload` and `mmqload_nosync` variants remain unrouted:
 they looked fast but failed element-wise correctness. See
-`docs/perf-checkpoints/2026-06-12-gfx1151-mq2lloyd-moe-n32.md`.
+`docs/perf-checkpoints/2026-06-12-gfx1151-lloyd-mq2-moe-n32.md`.
 
 gfx1151 BF16/F16 routed MoE: native grouped WMMA is the default. A compact
 indexed gate/up kernel has channel-test coverage but is not routed: it avoids

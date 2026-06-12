@@ -237,8 +237,8 @@ log "            --corpus /root/calibration_corpus.txt"
 else
 log "  3. Single-GPU calibration:"
 log "       $REPO_DIR/target/release/examples/triattn_validate \\"
-log "            /root/models/qwen3.5-9b.mq4 \\"
+log "            /root/models/qwen3.5-9b-mq4.hfq \\"
 log "            --corpus /root/calibration_corpus.txt --max-tokens 1000000 \\"
-log "            --sidecar /root/models/qwen3.5-9b.mq4.triattn.bin"
+log "            --sidecar /root/models/qwen3.5-9b-mq4.triattn.hfq"
 fi
 log "────────────────────────────────────────────────────"

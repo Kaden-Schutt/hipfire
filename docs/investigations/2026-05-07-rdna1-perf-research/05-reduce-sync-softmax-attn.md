@@ -13,7 +13,7 @@ Same drop-in wave-reduce pattern as Exp #4, applied to:
 
 ### Target 1: softmax.hip is not on the 9B decode hot path
 
-`softmax_f32` is dispatched only from MoE router-logits softmax in `qwen35.rs:1968, 1976, 3820`. Our test scenario (`qwen3.5-9b.mq4`) is a dense (non-MoE) model and does not invoke this kernel during decode. To exercise the lever meaningfully, the bench would have to be:
+`softmax_f32` is dispatched only from MoE router-logits softmax in `qwen35.rs:1968, 1976, 3820`. Our test scenario (`qwen3.5-9b-mq4.hfq`) is a dense (non-MoE) model and does not invoke this kernel during decode. To exercise the lever meaningfully, the bench would have to be:
 
 - An MoE model (e.g., qwen3.5-A3B), which is not in our small-model bench rotation tonight, OR
 - A scenario where router softmax is on the hot path (only MoE).

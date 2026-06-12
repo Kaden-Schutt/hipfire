@@ -10,7 +10,7 @@
 //!
 //! Run: HIP_VISIBLE_DEVICES=0,1 cargo run -p hipfire-runtime \
 //!         --release --features deltanet --example pp2_vram_probe -- \
-//!         ~/.hipfire/models/qwen3.5-0.8b.mq4 [max_seq=4096]
+//!         ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq [max_seq=4096]
 
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35ScratchSet, StateQuant};
 use hipfire_runtime::hfq::HfqFile;
@@ -38,7 +38,7 @@ fn fmt_per_card(label: &str, used: &[f64]) {
 fn main() {
     let path = std::env::args()
         .nth(1)
-        .expect("Usage: ... <model.mq4> [max_seq]");
+        .expect("Usage: ... <model-mq4.hfq> [max_seq]");
     let max_seq: usize = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())
@@ -137,9 +137,9 @@ fn main() {
     let total_max = after_dn.iter().cloned().fold(0.0_f64, f64::max);
     let total_sum: f64 = after_dn.iter().sum();
 
-    let quant_tag = if path.contains(".mq4") {
+    let quant_tag = if path.contains("-mq4.hfq") {
         "mq4"
-    } else if path.contains(".mq3") {
+    } else if path.contains("-mq3.hfq") {
         "mq3"
     } else {
         "?"

@@ -7,7 +7,7 @@
 
 | Engine | Model | Body quant | Vision tower | LM head |
 |---|---|---|---|---|
-| hipfire | `qwen3.5-9b.mq4-q8head-vision-f16-spliced.hfq` | MQ4 (~4.4 bpw, AWQ+GPTQ) | F16 (spliced) | Q8 |
+| hipfire | `qwen3.5-9b-q8head-vision-f16-spliced-mq4.hfq` | MQ4 (~4.4 bpw, AWQ+GPTQ) | F16 (spliced) | Q8 |
 | llama.cpp Q4_K_M | `Qwen3.5-9B-Q4_K_M.gguf` + `mmproj-F16.gguf` | Q4_K_M (~4.5 bpw) | F16 | Q4_K_M |
 | llama.cpp Q8_0 | `Qwen3.5-9B-Q8_0.gguf` + `mmproj-F16.gguf` | Q8_0 (~8.5 bpw) | F16 | Q8_0 |
 

@@ -40,11 +40,11 @@ LDS pressure reduced from 8 round-trip iterations (256-thread block) to ~1 cross
 
 `./scripts/coherence-gate.sh` (short battery, 5 model × prompt combinations) ran on `exp/reduce-sync-rmsnorm` branch. **PASS — no hard errors**, all outputs fluent and on-topic:
 
-- qwen3.5-0.8b.mq4 / cap: "Paris."
-- qwen3.5-4b.mq4 / code: clean Python one-liner
-- qwen3.5-9b.mq4 / reason: 9 with correct logic
-- qwen3.5-9b.mq4 / tool-call: clean tool invocation
-- qwen3.5-9b.mq3 / reason-mq3: clean
+- qwen3.5-0.8b-mq4.hfq / cap: "Paris."
+- qwen3.5-4b-mq4.hfq / code: clean Python one-liner
+- qwen3.5-9b-mq4.hfq / reason: 9 with correct logic
+- qwen3.5-9b-mq4.hfq / tool-call: clean tool invocation
+- qwen3.5-9b-mq3.hfq / reason-mq3: clean
 
 Numerical equivalence is approximate (different reduction order), but the coherence battery confirms it's within bf16 ULP of the prior output for production purposes.
 
@@ -52,7 +52,7 @@ Numerical equivalence is approximate (different reduction order), but the cohere
 
 Hardware state: same as Exp #1 (recorded in `/tmp/perf-research/hw-state/01-pr3-graph-cache-rebench.txt`; bench run on the same gfx1010 with no power/thermal change since Exp #1 completed minutes earlier).
 
-### qwen3.5-9b.mq4 decode tok/s
+### qwen3.5-9b-mq4.hfq decode tok/s
 
 | condition | run 1 | run 2 | run 3 | median | mean | σ |
 |---|---|---|---|---|---|---|

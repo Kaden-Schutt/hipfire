@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Inspect a .hfq/.mq4 file and report whether it carries AWQ scale
+//! Inspect a .hfq/-mq4.hfq file and report whether it carries AWQ scale
 //! sidecars, GPTQ g_idx sidecars, or ParoQuant rotations.
 //!
 //! Run: ./target/release/examples/check_awq_gptq <path>

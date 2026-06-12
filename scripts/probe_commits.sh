@@ -9,14 +9,14 @@
 #   <hash>  <gen_tok_s>  <short message>
 #
 # Env vars:
-#   BENCH_MODEL  Path under ~/.hipfire/models/ (default qwen3.5-9b.mq4).
-#                Bench is dtype-agnostic — pass qwen3.5-9b.mq3-lloyd to
+#   BENCH_MODEL  Path under ~/.hipfire/models/ (default qwen3.5-9b-mq4.hfq).
+#                Bench is dtype-agnostic — pass qwen3.5-9b-lloyd-mq3.hfq to
 #                bench Lloyd-MQ3. Decoder dtype is detected from the .hfq
 #                quant-type ID in qwen35::load_weights.
 #   HIPFIRE_KV_MODE  KV-cache mode (default asym3). See bench_qwen35_speed.
 #   HIPFIRE_GRAPH    Set to 1 to capture the decode loop as a graph (default 1).
 set -u
-BENCH_MODEL="${BENCH_MODEL:-qwen3.5-9b.mq4}"
+BENCH_MODEL="${BENCH_MODEL:-qwen3.5-9b-mq4.hfq}"
 COMMITS=("$@")
 START_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 # Stash any dirty state

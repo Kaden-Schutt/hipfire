@@ -18,8 +18,8 @@ Code under test:
 | Targeted build | `raw/hiptrx-targeted-build-0bcc6bb8-20260526.log` | PASS | Built rdna direct probes plus Qwen2 and dots OCR examples at `0bcc6bb8`. |
 | gfx12 WMMA/Lloyd kernel smokes | `raw/hiptrx-gfx1201-kernel-smokes-20260526.log` | MIXED, superseded | Initial broad run passed gfx12 QKV/QKVZA/gate/residual/HFQ6/MQ3/MQ4 fused probes, but direct gfx11-only probes failed on gfx1201. |
 | gfx11-only direct probe rerun | `raw/hiptrx-gfx1201-wiring-rerun-20260526.log` | PASS / SKIP | MQ4-Lloyd residual base gfx12 path passed all shapes. `_mb2`/`_mb4` now skip as gfx11-only. Causal WMMA parity now skips on gfx1201 instead of compiling gfx11 WMMA. |
-| Qwen2 real model smoke | `raw/hiptrx-gfx1201-qwen2-smoke-20260526.stderr` | PASS | `/mnt/nas/kaden/models/qwen2-1.5b.arch7.q8.hfq`; tokenizer parity exact; 16/16 generated token top-1 matches reference. |
-| dots OCR bounded smoke | `raw/hiptrx-gfx1201-dots-ocr-max0-20260526.stderr` | PASS | `/mnt/nas/kaden/models/dots-ocr.q8.hfq`; full vision tower loaded; `vision kernels: scalar-fallback`; all 42 vision blocks completed; text loaded; 5095-token batch prefill completed. |
+| Qwen2 real model smoke | `raw/hiptrx-gfx1201-qwen2-smoke-20260526.stderr` | PASS | `/mnt/nas/kaden/models/qwen2-1.5b-arch7-q8.hfq`; tokenizer parity exact; 16/16 generated token top-1 matches reference. |
+| dots OCR bounded smoke | `raw/hiptrx-gfx1201-dots-ocr-max0-20260526.stderr` | PASS | `/mnt/nas/kaden/models/dots-ocr-q8.hfq`; full vision tower loaded; `vision kernels: scalar-fallback`; all 42 vision blocks completed; text loaded; 5095-token batch prefill completed. |
 
 ## Routing Conclusion
 

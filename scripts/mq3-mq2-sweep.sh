@@ -81,14 +81,14 @@ if [ "$#" -gt 0 ]; then
     MODELS=("$@")
 else
     MODELS=(
-        "qwen3.5-0.8b.mq3"
-        "qwen3.5-0.8b.mq2"
-        "qwen3.5-4b.mq3"
-        "qwen3.5-4b.mq2"
-        "qwen3.5-9b.mq3"
-        "qwen3.5-9b.mq2"
-        "qwen3.5-27b.mq3"
-        "qwen3.6-27b.mq3"
+        "qwen3.5-0.8b-mq3.hfq"
+        "qwen3.5-0.8b-mq2.hfq"
+        "qwen3.5-4b-mq3.hfq"
+        "qwen3.5-4b-mq2.hfq"
+        "qwen3.5-9b-mq3.hfq"
+        "qwen3.5-9b-mq2.hfq"
+        "qwen3.5-27b-mq3.hfq"
+        "qwen3.6-27b-mq3.hfq"
     )
 fi
 

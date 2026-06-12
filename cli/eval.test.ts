@@ -37,7 +37,9 @@ describe("hipfire eval CLI delegation", () => {
   });
 
   test("returns null when no candidate exists", () => {
-    expect(resolveEvalBinary({}, "linux", "/missing")).toBeNull();
+    const dir = mkdtempSync(join(tmpdir(), "hipfire-eval-empty-home-"));
+    tempDirs.push(dir);
+    expect(resolveEvalBinary({ HIPFIRE_DIR: dir }, "linux", "/missing")).toBeNull();
   });
 
   test("passes args through unchanged", () => {

@@ -68,7 +68,7 @@ gibberish failure mode.
 
 | Component | Status on gfx1031 |
 | --- | --- |
-| MQ4G256 (`qwen3.5-4b.mq4-cuda.hfq`, decode + prefill) | ✅ 717 tok coherent (2026-05-18) |
+| MQ4G256 (`qwen3.5-4b-cuda-mq4.hfq`, decode + prefill) | ✅ 717 tok coherent (2026-05-18) |
 | MQ3G256 (4 mq3-sweep variants, decode + prefill) | ❌ token soup, all four |
 | HFQ3 GEMV kernel source (`gemv_hfq3g256.hip`) | arch-agnostic *per its header comment* (unverified empirically on gfx10) |
 | FWHT rotation (`mq_rotate_x` in `gemv_mq4g256` module) | known-good for MQ4 strides; **untested in isolation against a CPU FWHT reference** |
@@ -231,7 +231,7 @@ small PR ahead of any kernel work.
 ### Step 1.5 — confirm prefill routing (cheap H1 prune)
 
 Add a temporary `eprintln!` at both the captured and non-captured
-prefill entry points. Load `qwen3.5-4b.mq3-rtn.hfq` on gfx1031, feed
+prefill entry points. Load `qwen3.5-4b-rtn-mq3.hfq` on gfx1031, feed
 a 10-token prompt, observe stderr. If only the per-token fallback
 fires, H1 is essentially impossible (the fallback reuses decode
 GEMV) and Step 2 collapses into "is decode wrong, yes/no."
@@ -275,7 +275,7 @@ If H1 is the remaining hypothesis after H2 is excluded:
 2. `./scripts/coherence-gate-dflash.sh` clean on gfx1031 (glm5
    finding #1B: dflash is the canonical gate per AGENTS.md §0.1, not
    the older `coherence-gate.sh`).
-3. The `qwen3.5-27b.mq3` row in the coherence matrix continues to
+3. The `qwen3.5-27b-mq3.hfq` row in the coherence matrix continues to
    pass on gfx1100 — no regression.
 4. **No measurable MQ4/MQ6/HFQ4 regression on gfx1031** —
    quantified at <1% perf delta (gemini minor finding) via
@@ -455,12 +455,12 @@ Per the commit message:
 `strings -n 8 *.hfq | grep '\.awq_scale\.'` on the four
 `/data/hipfire/mq3-sweep/` files returns **zero matches** for any of:
 
-- `qwen3.5-4b.mq3-rtn.hfq`
-- `qwen3.5-4b.mq3-awq-only.hfq`
-- `qwen3.5-4b.mq3-gptq-only.hfq`
-- `qwen3.5-4b.mq3-awq-gptq.hfq`
+- `qwen3.5-4b-rtn-mq3.hfq`
+- `qwen3.5-4b-awq-only-mq3.hfq`
+- `qwen3.5-4b-gptq-only-mq3.hfq`
+- `qwen3.5-4b-awq-gptq-mq3.hfq`
 
-The same probe against the working `qwen3.5-4b.mq4-cuda.hfq` returns
+The same probe against the working `qwen3.5-4b-cuda-mq4.hfq` returns
 many hits (`model.language_model.layers.0.linear_attn.in_proj_*
 .awq_scale.weight`, etc.) — so the probe is sensitive enough.
 

@@ -6,7 +6,7 @@ Branch: `feat/q8-prefill-tier2` at `97bf8cf4`.
 Models:
 - `~/.hipfire/models/qwen3.5-9b.q8f16` — Q8 weights, Q8 lm_head, 8.9 GB
 - `~/.hipfire/models/qwen3.5-9b.q8f16-f16lm-2026-05-12` — Q8 weights, F16 lm_head, 9.8 GB (used only for eval-harness disambiguation)
-- `~/.hipfire/models/qwen3.5-9b.mq4` — MQ4 baseline anchor
+- `~/.hipfire/models/qwen3.5-9b-mq4.hfq` — MQ4 baseline anchor
 
 Binaries:
 - `target/release/examples/eval_hipfire` (KLD validation + corruption checks)
@@ -136,7 +136,7 @@ Same fused kernels, three different lm_head choices, 1-chunk smoke on gfx1100:
 |---|---|---:|---:|
 | qwen3.5-9b.q8f16 | Q8_0 | 27 | 1069 |
 | qwen3.5-9b.q8f16-f16lm-2026-05-12 (with PR #242 batched fan-out) | F16 batched | 187 | 1069 |
-| qwen3.5-9b.mq4 (reference anchor) | MQ4G256 | 248 | ~1100 |
+| qwen3.5-9b-mq4.hfq (reference anchor) | MQ4G256 | 248 | ~1100 |
 
 The Q8 fused kernels are doing their job — the gap between 27 and 1069 is the lm_head fan-out wall. PR #242's F16 batched fan-out (parallel work on a sibling branch, not in this PR) closes the gap for F16 lm_head models. A Q8 lm_head batched-fan-out kernel (`gemm_lm_head_q8_0`) would close it for Q8-lm-head models — out of scope here (see §7).
 

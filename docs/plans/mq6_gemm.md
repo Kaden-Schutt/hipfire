@@ -141,7 +141,7 @@ HFQ6 has no `_wmma_gfx12` variant on the residual side (only HFQ4 does, at `disp
    - **ulp tolerance is NOT used.** If bit-identicality fails, the templatize refactor changed codegen; back out per criterion 2.
 4. **Parity vs CPU f32 reference** (Gemini §3, GLM5 §2.2). Extend the existing `crates/hipfire-runtime/examples/test_hfq6_gemm.rs` to add a `--non-residual` mode. The existing CPU reference is the ground truth; both residual-pre-zeroed and the new non-residual must match it to the existing test's tolerance (single ulp under reduction order). This catches dequant bugs in the shared template that the criterion-3 self-parity wouldn't.
 5. **Poison test** (Gemini §5). In the same test binary, initialize Y with `f32::NAN` before calling the non-residual kernel. Every output element must be overwritten (no NaN survives). Catches tiling / `local_bs` guard mistakes that would silently leak uninitialized memory after the memset goes away.
-6. **KLD on `qwen3.5-9b.mq4-kmd2-q8conv1d` byte-identical** to the post-#249 baseline of `0.155438` at q8 KV, n=20 chunks. Same code path, same FP rounding order, must yield same bits. If it differs, the residual-side refactor leaked something. *(Removed the original plan's ±0.001 tolerance — was inconsistent with the byte-exact claim per GLM5 §3.1 and my §2.)*
+6. **KLD on `qwen3.5-9b-kmd2-q8conv1d-mq4.hfq` byte-identical** to the post-#249 baseline of `0.155438` at q8 KV, n=20 chunks. Same code path, same FP rounding order, must yield same bits. If it differs, the residual-side refactor leaked something. *(Removed the original plan's ±0.001 tolerance — was inconsistent with the byte-exact claim per GLM5 §3.1 and my §2.)*
 7. **Perf gate**: ≥ 0.5% prefill speedup on the kmd2 model at n=1024 across 3 fresh-process runs (per `docs/methodology/perf-benchmarking.md`), uncontended GPU. Below 0.5% means the bandwidth optimization didn't carry — but **don't auto-revert** (GLM5 §4.2): the correctness benefit (no active-stream hazard) and the lmhead-path fix are real even at 0% perf. Threshold is for "did we measure what Phase 0 predicted?"; decision to keep/revert is a judgement call.
 
 Coherence-gate: **not in the acceptance set** — the gate's models are uniform-format and don't exercise `gemm_hfq6g256` (non-residual) at all (my §5, GLM5 §5.6). Adding a kmd2 row to the gate matrix is its own task and not blocking on this PR.
@@ -155,7 +155,7 @@ Coherence-gate: **not in the acceptance set** — the gate's models are uniform-
    - Batch sizes: `{1, 16, 64, 256, 1024}`. Include `1` so single-token decode is covered.
    - For each shape × batch_size × mode: random-init weight + x, compute CPU reference, run kernel, compare bits to CPU ref (criterion 4) and to memset+residual (criterion 3) and confirm no NaN-poison survives (criterion 5).
 3. **End-to-end eval**: rebuild `eval_hipfire`, re-run kmd2 q8 n=20. KLD must be byte-identical to baseline `0.155438` (criterion 6). PPL must be byte-identical to `9.2070`.
-4. **Uniform-MQ6 regression smoke**: run `eval_hipfire` on `qwen3.5-9b.mq6` before/after. Must be byte-identical (uniform path is untouched; this is a defense against accidental codegen drift in the residual sibling). Tied to criterion 2.
+4. **Uniform-MQ6 regression smoke**: run `eval_hipfire` on `qwen3.5-9b-mq6.hfq` before/after. Must be byte-identical (uniform path is untouched; this is a defense against accidental codegen drift in the residual sibling). Tied to criterion 2.
 
 ## Sequencing (issue #1 from my review fixed)
 

@@ -53,7 +53,7 @@ References (KLD master doc):
 | Per-arch reproducibility on gfx1151 | most anchors are gfx1100; cohort §1.4 is gfx1151 | partial — eval the incoming 27B quants on gfx1151 |
 
 **Phase 0a deliverables**:
-1. **kmd2 reproducibility smoke**: re-run `eval_hipfire` at q8 KV n=20 on `qwen3.5-9b.mq4-kmd2-q8conv1d`. Confirms post-#257 baseline reproduces on current master. Drift > 0 means the env shifted; investigate before any sweep.
+1. **kmd2 reproducibility smoke**: re-run `eval_hipfire` at q8 KV n=20 on `qwen3.5-9b-kmd2-q8conv1d-mq4.hfq`. Confirms post-#257 baseline reproduces on current master. Drift > 0 means the env shifted; investigate before any sweep.
 2. **27B MQ4-uniform-AWQ-GPTQ on gfx1151** (when CUDA pipeline delivers): eval at n=20 first, n=512 second. Confirms §3.2's 0.1257 reproduces on bench arch; the n=512 number becomes the canonical 27B MQ4 ceiling for our gate.
 3. **27B MQ3-uniform-AWQ-GPTQ on gfx1151** (when CUDA pipeline delivers, enqueued after MQ4): eval at n=20. Fills the missing 27B floor anchor.
 
@@ -319,11 +319,11 @@ Per GLM5 §12 (no integration test today): load the Phase 0-winning MQ3+MQ4 quan
 3. `cargo test -p hipfire-quantize kmap` — unit tests for new `Promote(GgufFormat)`, `Override(GgufFormat)`, promote-pair allowlist rejection, tied-embed refusal, UNSAFE-gate sequencing, `awq_eligible` lm_head paths, CUDA env-var alias deprecation warning.
 4. Poison tests pass (FA QKV mixed + the two synthetic same-dtype gates).
 5. Decode-coherence smoke passes on the Phase 0-winning MQ3+MQ4 quant.
-6. **kmd2 regression check**: `eval_hipfire` on `qwen3.5-9b.mq4-kmd2-q8conv1d` q8 KV n=20 byte-identical to post-#257 baseline (`0.155438 / 2.219963 / 9.2070`). Verified deterministic across runs in #257's eval.
+6. **kmd2 regression check**: `eval_hipfire` on `qwen3.5-9b-kmd2-q8conv1d-mq4.hfq` q8 KV n=20 byte-identical to post-#257 baseline (`0.155438 / 2.219963 / 9.2070`). Verified deterministic across runs in #257's eval.
 7. **MQ3+MQ4 27B n=20** with Phase 0-winning mode: finite KLD/NLL/PPL.
 8. Llama-arch QKV gate test — synthesize a mixed-dtype FA QKV on a llama-arch model harness, assert no NaN.
 
-Coherence-gate (`scripts/coherence-gate.sh`) is **not** in this PR's acceptance set; its model matrix is uniform-format and doesn't exercise the new code path. A `qwen3.5-9b.mq3-kmap-mq4` row gets added in a follow-up.
+Coherence-gate (`scripts/coherence-gate.sh`) is **not** in this PR's acceptance set; its model matrix is uniform-format and doesn't exercise the new code path. A `qwen3.5-9b-kmap-mq4-mq3.hfq` row gets added in a follow-up.
 
 ## Risks
 
@@ -457,7 +457,7 @@ The CUDA-branch's runtime-side AWQ-aware lm_head work has materialized as a two-
 
 Merge order:
 1. **#290 lands first** (or rebases on master after #292 follow-ups).
-2. **#292 lands next** (acceptance-blocked on a `qwen3.5-9b.mq4-awq-gptq-f2-lmhead-a100.hfq` artifact from the CUDA pipeline; PR is in draft).
+2. **#292 lands next** (acceptance-blocked on a `qwen3.5-9b-awq-gptq-f2-lmhead-a100-mq4.hfq` artifact from the CUDA pipeline; PR is in draft).
 3. **Our PR (`feat/configurable-kmap-pair`)** lands — introduces `HIPFIRE_LM_HEAD_AWQ_UNSAFE` for forward compatibility.
 4. **Follow-up PR drops the `HIPFIRE_LM_HEAD_AWQ_UNSAFE` gate** once the loader (#290) + dispatch (#292) are both on master. This PR is small (delete the env-var check in `main.rs`); it can be cut as soon as the merge order above completes.
 

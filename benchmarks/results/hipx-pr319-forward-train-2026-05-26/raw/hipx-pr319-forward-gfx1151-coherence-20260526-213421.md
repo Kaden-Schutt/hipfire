@@ -5,8 +5,8 @@
 - date:   2026-05-26T21:34:21+00:00
 - mode:   short
 - kv_mode: q8
-- target: /home/kaden/.hipfire/models/qwen3.5-27b.mq4
-- draft:  /home/kaden/.hipfire/models/qwen35-27b-dflash-mq4.hfq
+- target: /home/kaden/.hipfire/models/qwen3.5-27b-mq4.hfq
+- draft:  /home/kaden/.hipfire/models/qwen3.5-27b-mq4.dflash.hfq
 
 Hard-fail thresholds: zero tokens, panic, max_token_freq > 0.40,
 unique_token_ratio < 0.30 (token-attractor detection — see Path A

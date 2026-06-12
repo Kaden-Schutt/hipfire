@@ -214,7 +214,7 @@ impl ArchCaps {
                 // beats fp16 wave64 from B≥8). RDNA3+ has a higher fixed cost
                 // for the WMMA-INT8 dispatch (Q8_1 quantize prelude + MMQ tile
                 // setup) but still beats single-warp WMMA from B=128 up —
-                // measured +118% prefill on qwen3.6-27b.mq4 / gfx1151 by
+                // measured +118% prefill on qwen3.6-27b-mq4.hfq / gfx1151 by
                 // dropping the cutoff from 256 → 128, with byte-identical
                 // greedy decode parity (2026-05-29). RDNA2 keeps 256 for now
                 // (untested at lower cutoffs in this session).

@@ -564,8 +564,8 @@ soft requests:
    binary md5 + model md5 + commit hash.
 
 4. (Soft) mq3 + mq6 coherence rows. Existing gate already had
-   `qwen3.5-9b.mq3` and `qwen3.5-27b.mq3`. mq6 added in commit
-   `c28b74f` (`qwen3.5-9b.mq6`). 7/7 OK at HEAD. Important caveat:
+   `qwen3.5-9b-mq3.hfq` and `qwen3.5-27b-mq3.hfq`. mq6 added in commit
+   `c28b74f` (`qwen3.5-9b-mq6.hfq`). 7/7 OK at HEAD. Important caveat:
    mq3/mq6 quants route through `gemv_hfq3g256_residual` /
    `gemv_hfq6g256_residual` — *different kernel families* from this
    PR's HFQ4 dp4a/prefetch ports — so these rows are
@@ -906,7 +906,7 @@ HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
 HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
 rocprof -i pmc_l2.txt -o decode_l2.csv \
     target/release/examples/bench_qwen35_speed \
-    $HOME/.hipfire/models/qwen3.5-9b.mq4 \
+    $HOME/.hipfire/models/qwen3.5-9b-mq4.hfq \
     --prefill 16 --warmup 1 --gen 128
 
 # Occupancy / register-pressure audit — see

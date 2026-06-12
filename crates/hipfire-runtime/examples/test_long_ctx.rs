@@ -10,7 +10,7 @@
 //! reports per-turn prefill/decode token throughput.
 //!
 //! Usage:
-//!   test_long_ctx <model.mq4> [--turns-file <path>] [--max-gen N]
+//!   test_long_ctx <model-mq4.hfq> [--turns-file <path>] [--max-gen N]
 //!
 //! If --turns-file is omitted, a built-in 3-turn fixture runs that
 //! exercises a long single-turn prompt followed by two short follow-ups.
@@ -33,7 +33,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: test_long_ctx <model.mq4> [--turns-file <path>] [--max-gen N] [--no-think]"
+            "Usage: test_long_ctx <model-mq4.hfq> [--turns-file <path>] [--max-gen N] [--no-think]"
         );
         std::process::exit(1);
     }

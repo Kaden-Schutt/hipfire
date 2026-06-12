@@ -11185,8 +11185,8 @@ fn dflash_draft_candidates(filename: &str) -> Vec<String> {
     };
     let dotted_family = format!("{family}{version}");
     vec![
-        format!("{dotted_family}-{size}-dflash-{quant}.hfq"),
-        format!("{dotted_family}-{size}-draft-{quant}.hfq"),
+        format!("{dotted_family}-{size}-{quant}.dflash.hfq"),
+        format!("{dotted_family}-{size}-{quant}.draft.hfq"),
     ]
 }
 
@@ -11194,13 +11194,13 @@ fn parse_qwen_dflash_target(filename: &str) -> Option<(&'static str, String, Str
     let mut quant_from_ext = None;
     let stem = if let Some(stem) = filename.strip_suffix(".hfq") {
         stem
-    } else if let Some(stem) = filename.strip_suffix(".mq4") {
+    } else if let Some(stem) = filename.strip_suffix("-mq4.hfq") {
         quant_from_ext = Some("mq4".to_string());
         stem
-    } else if let Some(stem) = filename.strip_suffix(".mq3") {
+    } else if let Some(stem) = filename.strip_suffix("-mq3.hfq") {
         quant_from_ext = Some("mq3".to_string());
         stem
-    } else if let Some(stem) = filename.strip_suffix(".mq6") {
+    } else if let Some(stem) = filename.strip_suffix("-mq6.hfq") {
         quant_from_ext = Some("mq6".to_string());
         stem
     } else {
@@ -11848,7 +11848,7 @@ mod tests {
             Some("qwen3.5-0.8b-bf16.kldref.hfq")
         );
         assert_eq!(
-            kldref_name_for_model("/models/qwen3.5-0.8b.mq4").as_deref(),
+            kldref_name_for_model("/models/qwen3.5-0.8b-mq4.hfq").as_deref(),
             Some("qwen3.5-0.8b-bf16.kldref.hfq")
         );
         assert_eq!(
@@ -11923,8 +11923,8 @@ mod tests {
     fn dflash_auto_discovers_matching_qwen_draft() {
         let dir = temp_path("dflash-autodiscover");
         fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("qwen3.5-27b.mq4");
-        let draft = dir.join("qwen3.5-27b-dflash-mq4.hfq");
+        let target = dir.join("qwen3.5-27b-mq4.hfq");
+        let draft = dir.join("qwen3.5-27b-mq4.dflash.hfq");
         fs::write(&target, b"target").unwrap();
         fs::write(&draft, b"draft").unwrap();
 
@@ -11947,8 +11947,8 @@ mod tests {
     fn explicit_dflash_draft_overrides_auto_discovery() {
         let dir = temp_path("dflash-explicit-draft");
         fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("qwen3.5-27b.mq4");
-        let discovered = dir.join("qwen3.5-27b-dflash-mq4.hfq");
+        let target = dir.join("qwen3.5-27b-mq4.hfq");
+        let discovered = dir.join("qwen3.5-27b-mq4.dflash.hfq");
         let explicit = dir.join("custom-draft.hfq");
         fs::write(&target, b"target").unwrap();
         fs::write(&discovered, b"draft").unwrap();

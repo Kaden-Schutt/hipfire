@@ -193,7 +193,7 @@ def build_payload(tag, hfid, mode, parsed):
         payload["engineFlags"]["specDecoding"] = True
         payload["engineFlags"]["specMethod"] = "DFlash"
         payload["engineFlags"]["specBlockSize"] = 16
-        payload["engineFlags"]["specModel"] = f"hipfire-{tag.replace(':', '-')}-dflash-mq4"
+        payload["engineFlags"]["specModel"] = f"hipfire-{tag.replace(':', '-')}-mq4.dflash"
 
     payload["engineFlags"]["commandSnippet"] = (
         f"hipfire bench {tag} --runs {RUNS} \"{PROMPT}\"  "

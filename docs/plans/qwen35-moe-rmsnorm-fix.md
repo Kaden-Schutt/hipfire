@@ -213,7 +213,7 @@ chain-of-thought formatting tokens, dropping the trajectory into a
 self-doubt / number-hallucination attractor. The 1.3 → 1.0 default
 flip dissolves the spiral on Qwen3.6-A3B reasoning prompts without
 needing the under-scaled final norm. A/B verified on /local/hipfire/
-qwen3.6-35b-a3b.mq4 (post-merge `f57e07df`): correct GemmaRMSNorm +
+qwen3.6-35b-a3b-mq4.hfq (post-merge `f57e07df`): correct GemmaRMSNorm +
 `repeat_penalty=1.0` produces the same clean step-by-step reasoning
 as the `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1` workaround. The env-var
 fallback was therefore removed.
@@ -305,19 +305,19 @@ The `load_weights` site carries the rationale block citing 1e01c0b
 cargo build --release --example dump_norms
 
 # Confirm the on-disk values for the four reference cases.
-./target/release/examples/dump_norms /local/hipfire/qwen3.5-0.8b.mq4 \
+./target/release/examples/dump_norms /local/hipfire/qwen3.5-0.8b-mq4.hfq \
     "language_model.norm.weight"
 # Expected: model.language_model.norm.weight ... +3.3092 ... -0.777 +5.312
 
-./target/release/examples/dump_norms /local/hipfire/qwen3.5-9b.mq4 \
+./target/release/examples/dump_norms /local/hipfire/qwen3.5-9b-mq4.hfq \
     "language_model.norm.weight"
 # Expected mean ~+1.14
 
-./target/release/examples/dump_norms /local/hipfire/qwen3.6-27b.mq4 \
+./target/release/examples/dump_norms /local/hipfire/qwen3.6-27b-mq4.hfq \
     "language_model.norm.weight"
 # Expected: ... +0.9619 0.1364 -0.271 +1.758
 
-./target/release/examples/dump_norms /local/hipfire/qwen3.6-35b-a3b.mq4 \
+./target/release/examples/dump_norms /local/hipfire/qwen3.6-35b-a3b-mq4.hfq \
     "language_model.norm.weight"
 # Expected: ... +1.6279 0.2278 -0.233 +2.484
 ```

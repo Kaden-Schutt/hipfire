@@ -9,7 +9,7 @@
   "variants": [
     {
       "name": "qwen35-9b-mq4",
-      "hfq_path": "/home/kread/.hipfire/models/qwen3.5-9b.mq4",
+      "hfq_path": "/home/kread/.hipfire/models/qwen3.5-9b-mq4.hfq",
       "arch": "gfx1100"
     },
     {

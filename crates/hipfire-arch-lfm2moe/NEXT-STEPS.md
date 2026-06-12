@@ -39,7 +39,7 @@ KLD showed the 4-bit EXPERTS (not the projections) dominate the quality gap. So
 added 6-bit experts via a new HFQ6 indexed MoE GEMV kernel
 (`gemv_hfq6g256_moe_gate_up_k8_indexed_batched`; the `_down_*_expanded` sibling
 already existed) + forward routing on MQ6G256 expert dtype + quantizer flag.
-Model `lfm2.5-8b-a1b.mq6e`: **KL vs bf16 0.424→0.135 (−68%), top-1 72.7→79.5%,
+Model `lfm2.5-8b-a1b-mq6e.hfq`: **KL vs bf16 0.424→0.135 (−68%), top-1 72.7→79.5%,
 for −16% decode (241→203 tok/s) + 1.8 GB VRAM (4.6→6.4).** Coherent (chat-framed
 coherence_probe verdict OK, 0 hard/0 soft). Opt-in; default stays mq4 (max speed).
 See design doc "MQ6-experts". NOTE: the bare-prompt `infer_lfm2moe` smoke loops
@@ -51,7 +51,7 @@ does it too), NOT a kernel bug; validate coherence via the daemon/ChatFrame.
 gives **258.8 vs 241.5 tok/s = +7.2%** on matched full-256-tok runs (6 runs each,
 ±0.1%), real model coherent (Paris / 80 km/h). OFF by default due to a quality
 cost (tiny-oracle cosine 0.94 < 0.99 4-bit gate — quant noise, milder on the real
-wide projections). Fast variant model: `~/.hipfire/models/lfm2.5-8b-a1b.mq4p`. To
+wide projections). Fast variant model: `~/.hipfire/models/lfm2.5-8b-a1b-mq4p.hfq`. To
 make default: KLD/PPL vs Q8 first. See design doc "PERF TUNING".
 (Measurement note: an early "+18%" was an EOS-truncation artifact and a "WASH"
 was a fabricated number — corrected; the +7.2% is from grep-able matched logs.)

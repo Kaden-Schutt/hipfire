@@ -524,7 +524,7 @@ All 2039 tokens scored, zero non-finite warnings.
 
 | Model                       | format               | NLL/tok | PPL    | Δ vs MQ4   |
 |-----------------------------|----------------------|---------|--------|------------|
-| qwen3.5-0.8b.mq4            | MQ4G256 (FWHT-rot)   | 3.6471  | 38.36  | reference  |
+| qwen3.5-0.8b-mq4.hfq            | MQ4G256 (FWHT-rot)   | 3.6471  | 38.36  | reference  |
 | qwen3.5-0.8b.paro4g128-eng  | PARO4G128T (engine)  | 3.2627  | 26.12  | **−32% PPL** |
 | qwen3.5-0.8b.paro4g128-nat  | PARO4G128 (native)   | 3.2034  | 24.62  | **−36% PPL** |
 

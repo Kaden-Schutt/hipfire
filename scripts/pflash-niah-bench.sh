@@ -24,15 +24,15 @@
 # Examples:
 #   # Baseline 16K NIAH, 3 fresh runs:
 #   ./scripts/pflash-niah-bench.sh \
-#       ~/.hipfire/models/qwen3.5-4b.mq4 \
+#       ~/.hipfire/models/qwen3.5-4b-mq4.hfq \
 #       benchmarks/longctx/niah/niah_16k.jsonl \
 #       --pretok --runs 3 --label baseline
 #
 #   # PFlash compressed 16K NIAH, 3 fresh runs:
 #   ./scripts/pflash-niah-bench.sh \
-#       ~/.hipfire/models/qwen3.5-4b.mq4 \
+#       ~/.hipfire/models/qwen3.5-4b-mq4.hfq \
 #       benchmarks/longctx/niah/niah_16k.jsonl \
-#       --drafter ~/.hipfire/models/qwen3.5-0.8b.mq4 \
+#       --drafter ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq \
 #       --keep-ratio 0.30 --pretok --runs 3 --label pflash30
 #
 # Reports per (mode) point:

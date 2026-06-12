@@ -126,7 +126,7 @@ Short-ctx we already win (~6× ahead at 4K). Long-ctx we lose because our Q8 bat
 
 Hardware: hipx Strix Halo (Radeon 8060S, gfx1151, RDNA3.5, UMA 128 GB)
 — **the goal's target hardware**, lucebox-comparable. Target
-qwen3.5-27b.mq4, PFlash drafter qwen3.5-0.8b.mq4, **target KV q8**
+qwen3.5-27b-mq4.hfq, PFlash drafter qwen3.5-0.8b-mq4.hfq, **target KV q8**
 (lucebox-matched), `--keep-ratio 0.05 --block-size 16 --maxgen 96`,
 warm.
 
@@ -218,8 +218,8 @@ even smaller keep ratios are required, but the bs=16 config is the
 production-ready answer for ≥0.05 keep.
 
 ### niah_4k post-A baseline (earlier bench, retained for trend)
-niah_4k on hipx (Radeon 8060S / gfx1151), target qwen3.5-27b.mq4, PFlash
-drafter qwen3.5-0.8b.mq4, asym3 KV, --maxgen 64:
+niah_4k on hipx (Radeon 8060S / gfx1151), target qwen3.5-27b-mq4.hfq, PFlash
+drafter qwen3.5-0.8b-mq4.hfq, asym3 KV, --maxgen 64:
 
 | keep_ratio | metric | Pre A | Post A (shipped) | Δ |
 |---:|---|---:|---:|---:|

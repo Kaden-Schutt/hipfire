@@ -667,6 +667,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hipfire-server",
+ "indicatif",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "hipfire-arch-deepseek4"
 version = "0.2.0"
 dependencies = [

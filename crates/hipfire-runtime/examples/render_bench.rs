@@ -7,7 +7,7 @@
 //! the existing hand-rolled `ChatFrame::Plain` build path.
 //!
 //! Usage:
-//!   render_bench <model.mq4> [iterations]
+//!   render_bench <model-mq4.hfq> [iterations]
 //!
 //! Default 1000 iterations. Reports mean / p50 / p99 / min / max in
 //! microseconds for each path.
@@ -56,7 +56,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let model_path = args
         .get(1)
-        .expect("usage: render_bench <model.mq4> [iters]");
+        .expect("usage: render_bench <model-mq4.hfq> [iters]");
     let iters: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1000);
 
     let hfq = HfqFile::open(Path::new(model_path)).expect("open model");

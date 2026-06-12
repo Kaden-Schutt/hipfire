@@ -11,9 +11,9 @@
 #   - token_sequence.txt: one token ID per line
 #   - logit_stats.txt: per-step top-5 logits, entropy, argmax
 #
-# Run on 5700 XT:  ./scripts/logit_dump.sh models/qwen3.5-9b.q4.hfq logit_dump_gfx1010
+# Run on 5700 XT:  ./scripts/logit_dump.sh models/qwen3.5-9b-hf4.hfq logit_dump_gfx1010
 # Swap GPU.
-# Run on 7900 XTX: ./scripts/logit_dump.sh models/qwen3.5-9b.q4.hfq logit_dump_gfx1100
+# Run on 7900 XTX: ./scripts/logit_dump.sh models/qwen3.5-9b-hf4.hfq logit_dump_gfx1100
 # Then: diff logit_dump_gfx1010/token_sequence.txt logit_dump_gfx1100/token_sequence.txt
 
 set -euo pipefail

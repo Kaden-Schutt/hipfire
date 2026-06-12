@@ -18,7 +18,7 @@ MTP code was NOT on this branch (it predated the MTP merge). Brought it in:
 
 ## Single-GPU MTP — WORKS (gfx906, device 0)
 
-`mtp_only_demo --target qwen3.6-27b.mq4 (AWQ) --mtp-head
+`mtp_only_demo --target qwen3.6-27b-mq4.hfq (AWQ) --mtp-head
 /data/hipfire/qwen3.6-27b-cvs16384.mtp --max 64 --temp 0`:
 
 - Loads 27B AWQ trunk + cvs16384 MTP head. Prefill 1850 tok/s.

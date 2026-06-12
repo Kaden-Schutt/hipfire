@@ -626,10 +626,10 @@ back to AR silently.
 ### Verify md5s after pull (paranoid mode)
 
 ```
-qwen3.5-9b-dflash-mq4.hfq   590f35403cd7f1d634945233234a12b7  557 MB
-qwen3.5-27b-dflash-mq4.hfq  7b6df2a4ee1c8d933f0a52e187d1860b  919 MB
-qwen3.6-27b-dflash-mq4.hfq  ecc64877dfe0a1312b6f4066c3920128  919 MB
-qwen3.6-27b.mq4             9a6acdc49bcaa6a7b52ac161444cb769   15 GB
+qwen3.5-9b-mq4.dflash.hfq   590f35403cd7f1d634945233234a12b7  557 MB
+qwen3.5-27b-mq4.dflash.hfq  7b6df2a4ee1c8d933f0a52e187d1860b  919 MB
+qwen3.6-27b-mq4.dflash.hfq  ecc64877dfe0a1312b6f4066c3920128  919 MB
+qwen3.6-27b-mq4.hfq             9a6acdc49bcaa6a7b52ac161444cb769   15 GB
 ```
 
 Any mismatch = re-pull or report.
@@ -681,7 +681,7 @@ emit garbage on the new model's first decode.
 Three known MQ4 attractor malformations are repaired before the
 OpenAI shape returns: spec form, flat form, XML-tag corruption.
 Token-attractor root cause (calibration retrain) deferred. Smoke
-test: tool-calling prompt against `qwen3.5-9b.mq4` should never
+test: tool-calling prompt against `qwen3.5-9b-mq4.hfq` should never
 return raw `<tool_call>` text in `message.content`.
 
 ### D. Inherited from v0.1.8 (still load-bearing)
@@ -728,11 +728,11 @@ is killed.
 ### D. DFlash drafts on HuggingFace
 
 Three new HF endpoints (uploaded 2026-04-25, schuttdev account):
-- `schuttdev/hipfire-qwen3.5-9b/qwen3.5-9b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.5-27b/qwen3.5-27b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.6-27b/qwen3.6-27b-dflash-mq4.hfq`
+- `schuttdev/hipfire-qwen3.5-9b/qwen3.5-9b-mq4.dflash.hfq`
+- `schuttdev/hipfire-qwen3.5-27b/qwen3.5-27b-mq4.dflash.hfq`
+- `schuttdev/hipfire-qwen3.6-27b/qwen3.6-27b-mq4.dflash.hfq`
 
-Plus the 3.6 27B target itself: `schuttdev/hipfire-qwen3.6-27b/qwen3.6-27b.mq4`.
+Plus the 3.6 27B target itself: `schuttdev/hipfire-qwen3.6-27b/qwen3.6-27b-mq4.hfq`.
 
 Pullable via `hipfire pull qwen3.{5,6}:{9b,27b}-draft` and
 `hipfire pull qwen3.6:27b`.
@@ -756,8 +756,8 @@ gfx1100 (±10–15 % drift from DPM/thermal state). For tight measurements:
 ```bash
 # A: PEP-8 prompt, normalize OFF (un-fixed)
 ./target/release/examples/dflash_spec_demo \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --draft ~/.hipfire/models/qwen3.5-27b-dflash-mq4.hfq \
+  --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
+  --draft ~/.hipfire/models/qwen3.5-27b-mq4.dflash.hfq \
   --prompt "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
   --max 256 --ctx 2048 --kv-mode q8 --no-adaptive-b --no-chatml
 
@@ -778,8 +778,8 @@ tok/s here, vs. Lucebox's RTX 3090 demo peak):
 ```bash
 PROMPT=$(python3 -c "import json; print([json.loads(l) for l in open('/home/kaden/.hipfire/datasets/HumanEval.jsonl')][53]['prompt'])")
 HIPFIRE_NORMALIZE_PROMPT=1 ./target/release/examples/dflash_spec_demo \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --draft ~/.hipfire/models/qwen3.5-27b-dflash-mq4.hfq \
+  --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
+  --draft ~/.hipfire/models/qwen3.5-27b-mq4.dflash.hfq \
   --prompt "$PROMPT" \
   --max 256 --ctx 2048 --kv-mode q8 --no-adaptive-b --no-chatml
 ```
@@ -895,10 +895,10 @@ the canonical trunk by local filename. Local filenames drift and lookalike
 AWQ/MQ4 files are not comparable.
 
 The canonical trunk is whichever local artifact byte-matches the current
-Hugging Face `.mq4` artifact:
+Hugging Face `-mq4.hfq` artifact:
 
 - HF repo: `schuttdev/hipfire-qwen3.6-27b`
-- HF file: `qwen3.6-27b.mq4`
+- HF file: `qwen3.6-27b-mq4.hfq`
 - HF repo commit when pinned: `f9b326a657f14cbc400e384ff84a4b9b4b726ba2`
 - File size: `14984158208`
 - SHA-256 / HF `x-linked-etag`:
@@ -906,7 +906,7 @@ Hugging Face `.mq4` artifact:
 
 Before reporting dense 3.6 AWQ MTP/DFlash results, verify the candidate
 trunk with `sha256sum` and require the digest above. If Hugging Face has
-published a newer `.mq4`, refresh the HF headers first and pin the new
+published a newer `-mq4.hfq`, refresh the HF headers first and pin the new
 `x-linked-etag`/size in the report.
 
 Reports that use a trunk with a different digest are not comparable and
@@ -920,8 +920,8 @@ user explicitly updates this fixture section:
 
 ```bash
 ./target/release/examples/dflash_spec_demo \
-  --target /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x \
-  --draft /home/kaden/.hipfire/models/qwen3.6-35b-a3b-dflash-mq4.hfq \
+  --target /home/kaden/.hipfire/models/qwen3.6-35b-a3b-awq-mi300x-mq4.hfq \
+  --draft /home/kaden/.hipfire/models/qwen3.6-35b-a3b-mq4.dflash.hfq \
   --prompt-file <allowed-prompt> \
   --max 256 --temp 0.0 --no-chatml --kv-mode q8 --ctx 4096 \
   --block-size 6 --no-adaptive-b
@@ -1116,7 +1116,7 @@ Quick run:
 cargo build --release --example coherence_probe
 ./target/release/examples/coherence_probe --self-check     # no GPU needed
 ./target/release/examples/coherence_probe \
-    --model ~/.hipfire/models/qwen3.5-9b.mq4 \
+    --model ~/.hipfire/models/qwen3.5-9b-mq4.hfq \
     --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt \
     --max-tokens 200 --temperature 0.0
 ```

@@ -126,7 +126,7 @@ python3 scripts/compare_hidden_states.py --hf /tmp/tiny/oracle.hfhs --hipfire /t
 ## REAL-MODEL COHERENCE — daemon PASS ✅
 
 Quantized the real bf16 checkpoint (2302 tensors) →
-`~/.hipfire/models/lfm2.5-8b-a1b.mq4` (4.90 GB; experts MQ4G256, all else Q8).
+`~/.hipfire/models/lfm2.5-8b-a1b-mq4.hfq` (4.90 GB; experts MQ4G256, all else Q8).
 Registered arch_id 11 in the daemon (LoadedModel lfm2moe_* fields, arch_id==11
 load branch, `generate_lfm2moe`, Cargo `arch-lfm2moe`); builds clean under
 default / {arch-lfm2moe,deltanet} / {arch-minimax,deltanet}.
@@ -229,7 +229,7 @@ process, gfx1201):
 **Opt-in, not default** purely because of the unquantified quality cost: a
 quality-reducing quant must clear a KLD-vs-Q8 check before becoming default.
 Validated default stays Q8-proj (cosine ≥0.999, 241 tok/s); fast variant ships as
-`~/.hipfire/models/lfm2.5-8b-a1b.mq4p` (4.66 GB).
+`~/.hipfire/models/lfm2.5-8b-a1b-mq4p.hfq` (4.66 GB).
 
 > **Measurement-integrity note (cost: 3 tries, 2 wrong numbers).** An early
 > "+18% / 285 tok/s" was a real artifact — EOS-truncated ~110-tok runs report a
@@ -381,7 +381,7 @@ ONE new kernel — `gemv_hfq6g256_moe_gate_up_k8_indexed_batched` (the matching
 MoE GEMV with the 6-bit dequant from `gemv_hfq6g256.hip` (200 B/group vs hfq4's
 136; bit-pack roundtrip proven symbolically against `quantize_mq6g256`).
 forward.rs routes to the HFQ6 kernels when the loaded experts are MQ6G256;
-quantizer gate `HIPFIRE_LFM2_EXPERT_MQ6=1`. Model: `lfm2.5-8b-a1b.mq6e`.
+quantizer gate `HIPFIRE_LFM2_EXPERT_MQ6=1`. Model: `lfm2.5-8b-a1b-mq6e.hfq`.
 
 | variant | experts | mean KL vs bf16 | top-1 vs bf16 | decode tok/s | VRAM | coherence |
 |---------|---------|-----------------|---------------|--------------|------|-----------|

@@ -1,6 +1,6 @@
 //! dflash_mtp_demo: DFlash + MTP composition spec-decode bench harness (Task 11).
 //!
-//! Loads a Qwen3.5 trunk (.mq4 / .hfq), a matched DFlash drafter (.hfq), and a
+//! Loads a Qwen3.5 trunk (-mq4.hfq / .hfq), a matched DFlash drafter (.hfq), and a
 //! native MTP head (.mtp). Each cycle:
 //!   1. Run dflash drafter (B=16 candidates).
 //!   2. MTP fanout (K candidates) seeded from drafter's last hidden.
@@ -12,7 +12,7 @@
 //! compare directly. Greedy / temp=0 only.
 //!
 //! Usage:
-//!   dflash_mtp_demo --target <trunk.mq4> --drafter <drafter.hfq> \
+//!   dflash_mtp_demo --target <trunk-mq4.hfq> --drafter <drafter.hfq> \
 //!                   --mtp-head <head.mtp> \
 //!                   (--prompt "..." | --prompt-file <path>) \
 //!                   [--max 120] [--temp 0] [--dflash-b 16] [--mtp-k 2] \
@@ -110,7 +110,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: dflash_mtp_demo --target <trunk.mq4> --drafter <drafter.hfq> \\\n\
+                    "Usage: dflash_mtp_demo --target <trunk-mq4.hfq> --drafter <drafter.hfq> \\\n\
                      \t--mtp-head <head.mtp> \\\n\
                      \t(--prompt \"...\" | --prompt-file <path>) \\\n\
                      \t[--max 120] [--temp 0] [--dflash-b 16] [--mtp-k 2] \\\n\

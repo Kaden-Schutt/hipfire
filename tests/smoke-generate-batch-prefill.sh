@@ -3,9 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON="${DAEMON:-$ROOT/target/release/examples/daemon}"
-MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4.hfq}"
+MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b-mq4.hfq}"
 MOE_MODEL="${MOE_MODEL:-$HOME/.hipfire/models/qwen3.6-35b-a3b-mq4.hfq}"
-UNSUPPORTED_MODEL="${UNSUPPORTED_MODEL:-$HOME/.hipfire/models/llama-3.2-1b-instruct.mq4.hfq}"
+UNSUPPORTED_MODEL="${UNSUPPORTED_MODEL:-$HOME/.hipfire/models/llama-3.2-1b-instruct-mq4.hfq}"
 MAX_SEQ="${MAX_SEQ:-512}"
 
 if [[ ! -x "$DAEMON" ]]; then

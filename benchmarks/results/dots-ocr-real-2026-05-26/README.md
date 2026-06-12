@@ -3,7 +3,7 @@
 Model artifact:
 
 - Source: `rednote-hilab/dots.ocr`
-- Quantized artifact: `/mnt/nas/kaden/models/dots-ocr.q8.hfq`
+- Quantized artifact: `/mnt/nas/kaden/models/dots-ocr-q8.hfq`
 - Quant command used `--format q8 --arch-id 8 --include-vision`
 - HFQ inspector reported Qwen2 config: hidden 1536, 28 text layers, 12 heads, 2 KV heads, head_dim 128, vocab 151936.
 

@@ -5,10 +5,10 @@ Hardware: Radeon 8060S / gfx1151, ROCm 7.2, toolbox `llama-rocm-7.2`.
 Models:
 
 - llama.cpp: `/home/kotdath/omp/personal/amd-strix-halo-toolboxes/models/Qwen3.5-9B-Q4_K_M.gguf`
-- hipfire target: `~/.hipfire/models/qwen3.5-9b.mq4`
-- hipfire draft: `~/.hipfire/models/qwen35-9b-dflash-mq4.hfq`
+- hipfire target: `~/.hipfire/models/qwen3.5-9b-mq4.hfq`
+- hipfire draft: `~/.hipfire/models/qwen3.5-9b-mq4.dflash.hfq`
 - hipfire target converted from the Unsloth GGUF:
-  `/home/kotdath/omp/personal/amd-strix-halo-toolboxes/models/qwen3.5-9b-unsloth.hf4`
+  `/home/kotdath/omp/personal/amd-strix-halo-toolboxes/models/qwen3.5-9b-unsloth-hf4.hfq`
 
 Binaries:
 
@@ -38,7 +38,7 @@ Command pattern:
 
 ```bash
 HIPFIRE_KV_MODE=q8 ./target/release/examples/bench_qwen35_speed \
-  ~/.hipfire/models/qwen3.5-9b.mq4 --prefill <N> --prefill-runs 3 --warmup 0 --gen 1
+  ~/.hipfire/models/qwen3.5-9b-mq4.hfq --prefill <N> --prefill-runs 3 --warmup 0 --gen 1
 ```
 
 Before the gfx1151 routing change, q8 pp2048 measured `233.0 tok/s` median.
@@ -87,7 +87,7 @@ small.
 
 The Unsloth GGUF was converted into hipfire `hf4` format and benchmarked with
 the same Q8 KV prefill command. The result was `357.8 tok/s` median and `43.5`
-gen tok/s, matching the native hipfire `.mq4` within noise. This rules out the
+gen tok/s, matching the native hipfire `-mq4.hfq` within noise. This rules out the
 final Unsloth/GGUF model artifact as the cause of the 3x prefill gap; the gap
 is in the hipfire execution format/kernels.
 
@@ -194,7 +194,7 @@ Command:
 HIPFIRE_VERIFY_GRAPH=0 HIPFIRE_MMQ=1 \
 HIPFIRE_PREFILL_REUSE_PBS=1 HIPFIRE_PREFILL_MAX_BATCH=2048 \
 target/release/examples/bench_qwen35_speed \
-  ~/.hipfire/models/qwen3.5-9b.mq4 \
+  ~/.hipfire/models/qwen3.5-9b-mq4.hfq \
   --prefill 2048 --prefill-runs 1 --gen 0 --warmup 0
 ```
 
@@ -219,8 +219,8 @@ HFQ4G256 QA PASS: gpu_cpu_err=0.000366 quant_ref_err=0.000000 mmq_err=0.040617
 Short 9B DFlash sanity with `HIPFIRE_MMQ=1` produced coherent Fibonacci
 text, `decode_tau=3.6522`, `decode_tok_s=24.98`. The canonical
 `coherence-gate-dflash.sh` was invoked with the same MMQ env, but skipped
-because the expected 27B files (`qwen3.5-27b.mq4` and
-`qwen35-27b-dflash.mq4`) were not present in `~/.hipfire/models`.
+because the expected 27B files (`qwen3.5-27b-mq4.hfq` and
+`qwen3.5-27b-mq4.dflash.hfq`) were not present in `~/.hipfire/models`.
 
 ## MMQ Full-Tile Fast Path
 

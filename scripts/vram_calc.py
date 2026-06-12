@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Compute exact VRAM footprint for a hipfire .hfq/.mq4 model file.
+Compute exact VRAM footprint for a hipfire .hfq/-mq4.hfq model file.
 
 Reads the HFQ binary header/tensor index, sums per-tensor GPU memory,
 adds known overheads (KV cache, scratch, DeltaNet state), and reports
 whether the model fits on a given GPU VRAM budget.
 
 Usage:
-    python3 scripts/vram_calc.py path/to/model.mq4 [--vram 16] [--kv-seq 512] [--kv-mode q8]
+    python3 scripts/vram_calc.py path/to/model-mq4.hfq [--vram 16] [--kv-seq 512] [--kv-mode q8]
 """
 
 import struct
@@ -280,7 +280,7 @@ def deltanet_bytes(config: dict) -> int:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='Compute VRAM footprint for HFQ model')
-    parser.add_argument('model_path', help='Path to .hfq/.mq4 model file')
+    parser.add_argument('model_path', help='Path to .hfq/-mq4.hfq model file')
     parser.add_argument('--vram', type=float, default=16.0, help='GPU VRAM in GB (default: 16)')
     parser.add_argument('--kv-seq', type=int, default=512, help='KV sequence length for calibration (default: 512)')
     parser.add_argument('--kv-mode', default='q8', choices=['q8', 'asym3', 'asym4', 'fp32'],

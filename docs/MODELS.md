@@ -80,7 +80,7 @@ qwopus:4b` works. See [QUANTIZE.md](QUANTIZE.md).
 ### From local safetensors
 
 ```bash
-hipfire quantize ./my-finetune/ --format mq4 -o my-finetune.mq4
+hipfire quantize ./my-finetune/ --format mq4 -o my-finetune-mq4.hfq
 ```
 
 Any directory that contains a `config.json` plus one or more
@@ -226,9 +226,9 @@ preserving raw `\n{3,}` whitespace.
 
 ```
 ~/.hipfire/models/
-├── qwen3.5-9b.mq4                  # MQ4 (FWHT-rotated, Qwen3.5 hot path)
-├── qwen35-9b-dflash-mq4.hfq        # DFlash draft for qwen3.5:9b (filename auto-match)
-├── tinyllama.Q4_K_M.hf4            # HFQ4 (no rotation, dense)
+├── qwen3.5-9b-mq4.hfq                  # MQ4 (FWHT-rotated, Qwen3.5 hot path)
+├── qwen3.5-9b-mq4.dflash.hfq        # DFlash draft for qwen3.5:9b (filename auto-match)
+├── tinyllama.Q4_K_M-hf4.hfq            # HFQ4 (no rotation, dense)
 └── ...
 ```
 
@@ -236,10 +236,10 @@ Extension legend:
 
 | Ext | Format | Inference path |
 |---|---|---|
-| `.mq4` | MQ4G256 (FWHT-rotated 4-bit) | Qwen3.5+ hot path (DeltaNet) |
-| `.mq6` | MQ6G256 (FWHT-rotated 6-bit) | Qwen3.5+ higher quality |
-| `.hf4` | HFQ4-G256 (raw 4-bit) | Llama / Qwen3 / Mistral / dense |
-| `.hf6` | HFQ6-G256 (raw 6-bit) | Dense, higher quality |
+| `-mq4.hfq` | MQ4G256 (FWHT-rotated 4-bit) | Qwen3.5+ hot path (DeltaNet) |
+| `-mq6.hfq` | MQ6G256 (FWHT-rotated 6-bit) | Qwen3.5+ higher quality |
+| `-hf4.hfq` | HFQ4-G256 (raw 4-bit) | Llama / Qwen3 / Mistral / dense |
+| `-hf6.hfq` | HFQ6-G256 (raw 6-bit) | Dense, higher quality |
 | `.hfq` | Legacy HFQ4 (pre-0.1.5 naming) | Loads, no new files written here |
 
 CLI discovery (`hipfire list`, fuzzy `hipfire run` lookup) recognizes
@@ -258,7 +258,7 @@ is a custom non-Hipfire architecture target.
 | Qwen 3.5 / 3.6 dense hybrid | `qwen3.5-{0.8b,2b,4b,9b}`, `qwen3.6-27b` | Supported as Qwen35 dense (`arch_id=5`). | Supported for paired dense drafts when target lm_head dtype is Q8/HFQ4/MQ4, plus MQ3 on gfx11/gfx12; MQ6 targets need AR. | Present as native Qwen35 speculative-verify/MTP surfaces for validated dense paths; still correctness-first and not the same as DFlash drafts. | Supported with TriAttention/CASK sidecars on FullAttention layers. | Supported only on Qwen35 path when incompatible features are off. | Supported via Qwen35 batched prefill path. | Smoke refs exist for `qwen3.5-{0.8b,2b,9b}`; no full refs yet. | Dense Qwen35 decode/prefill kernels cover BF16/MQ4/MQ6 and selected MQ3. Missing DFlash batched lm_head/verify support for MQ6/MQ8/MQ2/F16 targets. |
 | Qwen 3.5 / 3.6 MoE | `qwen3.6-35b-a3b`, `qwen3.5-122b-a10b` | Supported as Qwen35 MoE (`arch_id=6`) when quantized in Qwen3.5-MoE tensor layout. | Limited: dense-style DFlash works only where target/draft dtypes hit supported batched verify paths; MQ3 MoE is refused for DFlash. | MoE MTP code exists, but admission is narrower than dense and still gated by MoE dtype/layout validation. | Supported on FullAttention layers; no MoE-specific eviction of expert weights unless using the separate pager path. | Supported only on Qwen35 path when incompatible features are off. | Supported; MoE batched prefill admits MQ4 control and newer MQ6/MQ3 surfaces on validated arches. | `qwen3.6-35b-a3b-bf16` KLD producer is currently skipped on error; no completed refs for MoE rows. | Indexed MoE gate/up/down, shared expert, router, and grouped GEMM kernels exist for Qwen35 MoE. Missing broad MQ3/MQ2/MQ8 MoE DFlash coverage and full validation for every local MoE artifact. |
 | Qwen3-MoE / Qwen3-Coder (`qwen3_moe`) | `qwen3-coder-30b-a3b-instruct`, `tiny-random/qwen3-moe` | Not currently first-class. Local Coder HFQs are stamped `arch_id=0`, but source configs are `qwen3_moe`; that does not match the Qwen35-MoE loader layout. | No. | No. | No. | No. | No. | Listed as a desired KLD target for Coder, but no completed ref. | Needs a `qwen3_moe` architecture mapping and loader/kernel audit. Existing Qwen35 MoE kernels assume Qwen3.5 hybrid layer/tensor layout, not plain Qwen3-MoE/Coder layout. |
-| DeepSeek V4 Flash | `deepseek-v4-flash.mq4.hfq` | Supported as dedicated DeepSeek V4 path (`arch_id=9`). | No Qwen-style DFlash drafter. | Supported as DeepSeek V4's own optional MTP speculative decode path. | No. | No. | Supported by DeepSeek V4 chunked batched prefill / MTP fill. | Not currently targeted for KLD refs. | Dedicated DeepSeek V4 kernels cover Hyper-Connections, compressed-KV indexer, SWA attention, routed MoE, MQ2/MQ3-Lloyd expert variants, and MTP. Missing CASK, PP, and Qwen-style DFlash integration. |
+| DeepSeek V4 Flash | `deepseek-v4-flash-mq4.hfq` | Supported as dedicated DeepSeek V4 path (`arch_id=9`). | No Qwen-style DFlash drafter. | Supported as DeepSeek V4's own optional MTP speculative decode path. | No. | No. | Supported by DeepSeek V4 chunked batched prefill / MTP fill. | Not currently targeted for KLD refs. | Dedicated DeepSeek V4 kernels cover Hyper-Connections, compressed-KV indexer, SWA attention, routed MoE, MQ2/MQ3-Lloyd expert variants, and MTP. Missing CASK, PP, and Qwen-style DFlash integration. |
 | LFM2.5-MoE | `lfm2.5-8b-a1b` | Supported as LFM2.5-MoE (`arch_id=11`) when compiled with `arch-lfm2moe`. Minimal AR bring-up. | No. | No. | No. | No. | No; prefill is per-token `decode_step`. | No completed refs yet. | Short-conv, attention, router, top-4 MoE, MQ4/MQ6 expert kernels are present. Missing batched prefill, DFlash/spec decode, CASK, PP, and grammar/tool-exec integration. |
 | Dense LFM2.5 | `lfm2.5-350m`, `lfm2.5-1.2b-instruct` | Not supported as dense LFM2. Local MQ artifacts stamped `arch_id=11` are suspect because the LFM2-MoE parser requires MoE-only fields. | No. | No. | No. | No. | No. | KLD producer currently skipped on error for dense LFM2 rows. | Needs a dense LFM2 architecture crate or a generalized LFM2 loader. Current `hipfire-arch-lfm2moe` kernels/config assume `lfm2_moe` layer types, experts, and MoE FFN fields. |
 | LLaMA-family dense | `llama-3.2-1b-instruct`, `supra-50m-instruct` | Basic dense AR support through LLaMA-family path (`arch_id=0`). | No. | No. | No. | No. | No Qwen35-style batched prefill. | Producer skipped on error for `llama-3.2-1b-instruct-bf16` and `supra-50m-instruct-bf16`. | Dense LLaMA/GGUF-style GEMV, Q8/HFQ/MQ weight paths exist. Missing family-specific optimized prefill, DFlash, CASK, PP, and per-model quality refs. |

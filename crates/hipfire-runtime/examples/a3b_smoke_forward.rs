@@ -8,7 +8,7 @@
 //!
 //! Usage:
 //!   cargo run --release --features deltanet --example a3b_smoke_forward -- \
-//!       ~/.hipfire/models/qwen3.5-35b-a3b.mq4
+//!       ~/.hipfire/models/qwen3.5-35b-a3b-mq4.hfq
 //!
 //!   # ParoQuant / HF safetensors directory (auto-routes by path-is-dir):
 //!   cargo run --release --features deltanet --example a3b_smoke_forward -- \
@@ -31,7 +31,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: a3b_smoke_forward <model.mq4 | safetensors-dir>");
+        eprintln!("Usage: a3b_smoke_forward <model-mq4.hfq | safetensors-dir>");
         std::process::exit(1);
     }
     let model_path = Path::new(&args[1]);

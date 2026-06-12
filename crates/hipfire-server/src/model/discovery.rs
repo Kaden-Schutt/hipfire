@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::config::models_dir;
 
 /// Extension preferred order for fuzzy scan (most-to-least preferred quant).
-static QUANT_PREFERENCE: &[&str] = &["-mq4", "-hf4", "-mq3", "-mq2lloyd", "-mq6", "-hf6", "-q8"];
+static QUANT_PREFERENCE: &[&str] = &["-mq4", "-hf4", "-mq3", "-lloyd-mq2", "-mq6", "-hf6", "-q8"];
 
 /// Resolve a model identifier to an absolute file path.
 ///

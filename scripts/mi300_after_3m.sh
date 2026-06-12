@@ -26,7 +26,7 @@ wait_file_ready() {
 
 # Hand off after the last step in the 3M chain
 log "start — waiting for 3.6-A3B 3M sidecar"
-wait_file_ready /root/models/qwen3.6-35b-a3b.mq4.triattn.3m.bin
+wait_file_ready /root/models/qwen3.6-35b-a3b-mq4-3m.triattn.hfq
 log "all cal chain work done; moving to draft training POC"
 
 source /root/pytorch_env/bin/activate

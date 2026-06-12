@@ -58,7 +58,7 @@ The actual calibration math (per `triattn.rs:549-572` + `triattn_accumulate.hip`
 
 Goal: confirm the bottleneck stack from "Hypothesized bottleneck stack" above. Output is a CSV breakdown that tells us whether #1, #2, or #3 is dominant.
 
-- Run `triattn_validate <27b.mq4> --corpus calib-1m.txt --chunk-len 1024 --max-tokens 1000000` with `HIPFIRE_CALIB_PROFILE=1` and `rocprof --stats` wrapping it.
+- Run `triattn_validate <27b-mq4.hfq> --corpus calib-1m.txt --chunk-len 1024 --max-tokens 1000000` with `HIPFIRE_CALIB_PROFILE=1` and `rocprof --stats` wrapping it.
 - Look for: % wall time in `triattn_score` / `triattn_accumulate_f32` kernels vs CPU-side runtime. If kernel time is < 10% of wall, host-side path is dominant. If kernel time is > 50%, MFMA tuning is the lever.
 - Save the rocprof traces to `benchmarks/calib/profile-mi300x-baseline.csv` for later comparison.
 

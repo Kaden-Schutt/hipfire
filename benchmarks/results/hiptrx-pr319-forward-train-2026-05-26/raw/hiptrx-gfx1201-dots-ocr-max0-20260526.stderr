@@ -1,5 +1,5 @@
 === dots-ocr end-to-end OCR validation ===
-HFQ:         /mnt/nas/kaden/models/dots-ocr.q8.hfq
+HFQ:         /mnt/nas/kaden/models/dots-ocr-q8.hfq
 Image:       benchmarks/images/dots_ocr_smoke_001.jpg
 Prompt JSON: benchmarks/references/dots_ocr_smoke_001.json
 Text decoder: layers=28, hidden=1536, vocab=151936

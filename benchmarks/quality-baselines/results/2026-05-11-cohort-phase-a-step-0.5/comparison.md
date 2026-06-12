@@ -74,7 +74,7 @@ The format decision pending Phase A is genuinely open per the rebuttal doc's fra
 ## 5. Pointers
 
 - Cohort artifacts: this directory's `per-variant/` (kldseq, mse.txt, eval.log)
-- Existing 2026-05-11 full-slice MQ4 reference: `../2026-05-11/per-seq/qwen3.5-9b.mq4__gfx1100__prefill.kldseq` (used as the cross-check for the 256-chunk reproducibility claim)
+- Existing 2026-05-11 full-slice MQ4 reference: `../2026-05-11/per-seq/qwen3.5-9b-mq4.hfq__gfx1100__prefill.kldseq` (used as the cross-check for the 256-chunk reproducibility claim)
 - Fivetide's source doc: `benchmarks/quality-baselines/external/fivetide-2026-05-11-hfp4-quality-analysis.md` (snapshotted in-tree by commit 78892f0a)
 - §5.4 prefill-eligibility table fix (this confirms HFP4/MFP4 ran via the batched WMMA path, not per-token fallback): `docs/plans/issue-113-quant-quality-eval.md` (commit 78892f0a)
 - Strategic rebuttal that this cohort populates: `docs/plans/hfp4-fivetide-rebuttal-perspective.md` §"Things that need to be measured before claiming"

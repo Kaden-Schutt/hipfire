@@ -1,10 +1,10 @@
-# qwen3.5-0.8b.mq4  total=510.3 MiB  tensors=320
-qwen3.5-0.8b.mq4_q8f16_tensors=19
-qwen3.5-0.8b.mq4_q8f16_bytes=270642176
-qwen3.5-0.8b.mq4_mq4g256_tensors=186
-qwen3.5-0.8b.mq4_mq4g256_bytes=264357888
-qwen3.5-0.8b.mq4_bf16_tensors=79
-qwen3.5-0.8b.mq4_bf16_bytes=107072
-qwen3.5-0.8b.mq4_f16_tensors=36
-qwen3.5-0.8b.mq4_f16_bytes=5184
+# qwen3.5-0.8b-mq4.hfq  total=510.3 MiB  tensors=320
+qwen3.5-0.8b-mq4.hfq_q8f16_tensors=19
+qwen3.5-0.8b-mq4.hfq_q8f16_bytes=270642176
+qwen3.5-0.8b-mq4.hfq_mq4g256_tensors=186
+qwen3.5-0.8b-mq4.hfq_mq4g256_bytes=264357888
+qwen3.5-0.8b-mq4.hfq_bf16_tensors=79
+qwen3.5-0.8b-mq4.hfq_bf16_bytes=107072
+qwen3.5-0.8b-mq4.hfq_f16_tensors=36
+qwen3.5-0.8b-mq4.hfq_f16_bytes=5184
 

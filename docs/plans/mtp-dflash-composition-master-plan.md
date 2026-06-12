@@ -95,7 +95,7 @@ prior `[[mtp-native-head-deferred-2026-05-15]]` composition lose −32.7%.
 super-cycle:
   1. DFlash drafter proposes K1=12 candidates from cur_pos
   2. MTP head proposes K2=3 candidates CHAINED off draft_11 (DFlash's last)
-     - MTP K2-step uses bundled .mq4-mtp's head + trunk's lm_head
+     - MTP K2-step uses bundled -mq4+mtp.hfq's head + trunk's lm_head
      - Cheap: 3 × MTP block forward ≈ 6 ms (overlappable with DFlash drafter)
   3. Trunk verify ONE batched forward over:
         [last_committed, draft_0..draft_11, mtp_0..mtp_2] = 16 positions
@@ -271,7 +271,7 @@ Per-cycle profile (canonical 27B-3.5 cvs=16K bundled K=5 greedy):
 
 | SHA | Lines | What |
 |---|---|---|
-| `d344af5b` | +750 | Bundle .mq4-mtp format + skip-replay + p_min + kv-mode matrix |
+| `d344af5b` | +750 | Bundle -mq4+mtp.hfq format + skip-replay + p_min + kv-mode matrix |
 | `4feae90d` | +370 | Host-side residual sampling (falsified default-off) |
 | `615a4a67` | +311 | GPU sampling kernels (falsifies "missing kernels") |
 | `d10c0906` | +61 | Per-kernel profile dump in mtp_only_demo |
@@ -279,18 +279,18 @@ Per-cycle profile (canonical 27B-3.5 cvs=16K bundled K=5 greedy):
 ## Bundled artifacts ready to use (~/.hipfire/models/)
 
 ```
-qwen3.5-9b.mq4-mtp                   5.07 GiB  full-vocab MQ4 (best UX on 9B)
-qwen3.5-27b.mq4-mtp                  14.16 GiB full-vocab MQ4
-qwen3.5-27b-compressed.mq4-mtp       14.24 GiB compressed 32K sidecar (canonical bench)
-qwen3.5-27b-cvs{4K,8K,16K}.mq4-mtp   14.17-14.20 GiB (cvs sweep variants)
-qwen3.6-27b.mq4-mtp                  14.16 GiB full-vocab MQ4 (note: slower than 3.5)
+qwen3.5-9b-mq4+mtp.hfq                   5.07 GiB  full-vocab MQ4 (best UX on 9B)
+qwen3.5-27b-mq4+mtp.hfq                  14.16 GiB full-vocab MQ4
+qwen3.5-27b-compressed-mq4+mtp.hfq       14.24 GiB compressed 32K sidecar (canonical bench)
+qwen3.5-27b-cvs{4K,8K,16K}-mq4+mtp.hfq   14.17-14.20 GiB (cvs sweep variants)
+qwen3.6-27b-mq4+mtp.hfq                  14.16 GiB full-vocab MQ4 (note: slower than 3.5)
 ```
 
 Best canonical-bench combination so far:
 ```
 HIPFIRE_DPM_WARMUP_SECS=10 cargo run --release \
   -p hipfire-runtime --example mtp_only_demo -- \
-  --target ~/.hipfire/models/qwen3.5-27b-cvs16384.mq4-mtp \
+  --target ~/.hipfire/models/qwen3.5-27b-cvs16384-mq4+mtp.hfq \
   --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt \
   --max 120 --max-n 5 --temp 0.0 --no-chatml \
   --compressed-serial --kv-mode q8

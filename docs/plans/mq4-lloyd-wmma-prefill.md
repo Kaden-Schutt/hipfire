@@ -14,8 +14,8 @@ This plan is the MQ4-Lloyd sibling of `docs/plans/mq3-lloyd-wmma-prefill.md`. Th
 ## Acceptance criteria
 
 1. `cargo check -p rdna-compute -p hipfire-arch-qwen35 -p hipfire-runtime` clean.
-2. Coherence-gate passes on a long-prompt (≥ `MIN_BATCH` tokens; verify value at `qwen35.rs:3520`) row for `qwen3.5-{4b,9b}.mq4-lloyd`.
-3. **`ΔNLL/tok < 0.01`** (≤ 1 % PPL drift) vs the per-token decode path on `qwen3.5-9b.mq4-lloyd`. NOT byte-stable: WMMA's hardware accumulation order differs from GEMV's K-loop order; the resulting fp32-reorder drift is the same envelope as MQ3-Lloyd Phase A's. Note: this is a **second** drift surface added on top of the MQ4-Lloyd production kernels' single-acc byte-equality vs slow generic — the prefill path's WMMA accumulation is hardware-defined and not byte-equal to the K4 single-acc GEMV path. The 1 % gate is the same envelope MQ3 Phase A measured (max-abs 5.83e-5 at K=12288 on the 9B-down-proj scale).
+2. Coherence-gate passes on a long-prompt (≥ `MIN_BATCH` tokens; verify value at `qwen35.rs:3520`) row for `qwen3.5-{4b,9b}-lloyd-mq4.hfq`.
+3. **`ΔNLL/tok < 0.01`** (≤ 1 % PPL drift) vs the per-token decode path on `qwen3.5-9b-lloyd-mq4.hfq`. NOT byte-stable: WMMA's hardware accumulation order differs from GEMV's K-loop order; the resulting fp32-reorder drift is the same envelope as MQ3-Lloyd Phase A's. Note: this is a **second** drift surface added on top of the MQ4-Lloyd production kernels' single-acc byte-equality vs slow generic — the prefill path's WMMA accumulation is hardware-defined and not byte-equal to the K4 single-acc GEMV path. The 1 % gate is the same envelope MQ3 Phase A measured (max-abs 5.83e-5 at K=12288 on the 9B-down-proj scale).
 4. Cross-process prefill perf gate per Phase C decision rules below (data-driven, not a fixed percentage).
 5. The Phase B2 reviewer checklist (5 items, mirrored from the MQ3 plan, MQ4 substitutions) all pass.
 
@@ -192,7 +192,7 @@ Mechanical, auditable yes/no items (mirrored from MQ3 plan, MQ4-substituted):
 
 ### Phase B3 (companion commit) — coherence-gate row
 
-- Add a long-prompt row to `scripts/coherence-gate.sh` for `qwen3.5-{4b,9b}.mq4-lloyd` that exercises the batched-prefill path (token count ≥ `MIN_BATCH`, single forward pass).
+- Add a long-prompt row to `scripts/coherence-gate.sh` for `qwen3.5-{4b,9b}-lloyd-mq4.hfq` that exercises the batched-prefill path (token count ≥ `MIN_BATCH`, single forward pass).
 - Reuse the existing 4B / 9B MQ4-Lloyd model files from PR #182 (already on disk; no new model dependency).
 - Commit the prompt as a separate file (per CLAUDE.md prompt-md5 rule), referenced by md5 in the gate script.
 - Soft requirement: gate passes (fluent + on-topic + no attractor loops). Not part of the Phase B2 corruption-prevention package.

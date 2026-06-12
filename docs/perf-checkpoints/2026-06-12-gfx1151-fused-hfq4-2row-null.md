@@ -37,7 +37,7 @@ HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
 HIPFIRE_FUSED_HFQ4_2ROW_GFX1151=$mode HIPFIRE_PROFILE_DECODE=1 \
 HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
   target/release/examples/bench_qwen35_speed \
-  ~/.hipfire/models/qwen3.5-9b.mq4.hfq \
+  ~/.hipfire/models/qwen3.5-9b-mq4.hfq \
   --prefill 32 --prefill-runs 1 --warmup 3 --gen 12
 ```
 

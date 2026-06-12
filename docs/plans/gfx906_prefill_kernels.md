@@ -147,7 +147,7 @@ same pattern before adding MMQ_Y variants.
 gfx906 currently has **no HFQ3 batched prefill at all** (the prefill
 fast-path for MQ3 dispatch on gfx906 falls through to the FP16 wave64
 path because the MMQ family is HFQ4-only on gfx906). MQ3-quantized
-9B / 4B models exist (`qwen3.5-4b.mq3-lloyd`, `qwen3.5-9b.mq3`) and
+9B / 4B models exist (`qwen3.5-4b-lloyd-mq3.hfq`, `qwen3.5-9b-mq3.hfq`) and
 are useful for VRAM-constrained deployments.
 
 PR #298 + #315 cover MQ3 on gfx1030 via:
@@ -372,7 +372,7 @@ Byte-exact A/B verified.
   5 MQ3 collateral), no hard errors
 - KLD eval (n=50 chunks, asym3-KV, prefill scoring): 0.323142,
   inside CI band of canonical §1.1 master baseline 0.3376
-  (CI 0.3263–0.3494) on the same `qwen3.5-9b.mq4` file
+  (CI 0.3263–0.3494) on the same `qwen3.5-9b-mq4.hfq` file
 
 The MMQ_Y=64 research scaffold stays gated behind
 `HIPFIRE_HFQ4_MMQ_GFX906_Y64=1` (default OFF) per PR #315's

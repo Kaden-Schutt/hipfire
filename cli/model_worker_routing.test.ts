@@ -3,8 +3,8 @@ import { pickResidentModelWorker, pickServingModelWorker } from "./model_worker_
 
 describe("model worker routing", () => {
   const base = {
-    requestModelPath: "/models/qwen3.5-9b.mq4",
-    currentModelPath: "/models/qwen3.5-9b.mq4",
+    requestModelPath: "/models/qwen3.5-9b-mq4.hfq",
+    currentModelPath: "/models/qwen3.5-9b-mq4.hfq",
     currentMaxSeq: 4096,
     requiredMaxSeq: 2048,
     archId: "qwen",
@@ -26,7 +26,7 @@ describe("model worker routing", () => {
   test("reloads when switching model path", () => {
     const decision = pickServingModelWorker({
       ...base,
-      currentModelPath: "/models/qwen3.5-27b.mq4",
+      currentModelPath: "/models/qwen3.5-27b-mq4.hfq",
     });
     expect(decision.needsReload).toBe(true);
     expect(decision.canReuseCurrentWorker).toBe(false);

@@ -42,7 +42,7 @@ rounding) to a CPU reference of the same math.
 
 ### Plan
 
-1. Pick the smallest .mq3 / .mq2 artifact (`qwen3.5-0.8b.mq3`).
+1. Pick the smallest -mq3.hfq / -mq2.hfq artifact (`qwen3.5-0.8b-mq3.hfq`).
 2. Write a CPU reference: `cpu_reference_gemv(W_rot, x, m, k) -> y`
    that loads MQ3 bytes, dequantizes per the kernel's reconstruction
    formula (`scale * q + zero`), runs `cpu_fwht_256(signs ⊙ x) / 16`,
@@ -437,7 +437,7 @@ post-FWHT block-level dynamic range or outlier-to-median ratio.
 
 ### Risks
 
-- Backward compat: existing `.mq3` / `.mq2` artifacts use seeds
+- Backward compat: existing `-mq3.hfq` / `-mq2.hfq` artifacts use seeds
   42 / 1042. New artifacts would have a different metadata field.
   Loader must default to old constants when the field is absent.
 - Diminishing returns: the FWHT rotation is already designed to
@@ -542,10 +542,10 @@ WMMA family but with 3-bit unpack inside the K-tile loop. Add to
 
 ```bash
 # Quantize the canonical sweep set (NAS HF cache → ~/.hipfire/models/)
-hipfire-quantize --input <Qwen3.5-0.8B-snapshot> --output ~/.hipfire/models/qwen3.5-0.8b.mq3 --format mq3
-hipfire-quantize --input <Qwen3.5-9B-snapshot>   --output ~/.hipfire/models/qwen3.5-9b.mq3   --format mq3
-hipfire-quantize --input <Qwen3.5-27B-snapshot>  --output ~/.hipfire/models/qwen3.5-27b.mq3  --format mq3
-hipfire-quantize --input <Qwen3.6-27B-snapshot>  --output ~/.hipfire/models/qwen3.6-27b.mq3  --format mq3
+hipfire-quantize --input <Qwen3.5-0.8B-snapshot> --output ~/.hipfire/models/qwen3.5-0.8b-mq3.hfq --format mq3
+hipfire-quantize --input <Qwen3.5-9B-snapshot>   --output ~/.hipfire/models/qwen3.5-9b-mq3.hfq   --format mq3
+hipfire-quantize --input <Qwen3.5-27B-snapshot>  --output ~/.hipfire/models/qwen3.5-27b-mq3.hfq  --format mq3
+hipfire-quantize --input <Qwen3.6-27B-snapshot>  --output ~/.hipfire/models/qwen3.6-27b-mq3.hfq  --format mq3
 # (MQ2 needs --allow-mq2 per PR #109 guard)
 
 ./scripts/mq3-mq2-sweep.sh

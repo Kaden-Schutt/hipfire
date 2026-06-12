@@ -27,7 +27,7 @@
 //!
 //! Usage:
 //!   cargo run --release --features deltanet --example channel_test_mmq -- \
-//!     --model models/qwen3.6-27b.mq4 --stage site-scan [--batch 128] [--threshold 0.01]
+//!     --model models/qwen3.6-27b-mq4.hfq --stage site-scan [--batch 128] [--threshold 0.01]
 //!     --stage channel-map [--layer 14] [--site residual]
 //!     --stage layer-sweep [--site residual]
 
@@ -107,10 +107,10 @@ Expected: Build succeeds (possibly with dead-code warnings for the TODO stubs).
 
 - [ ] **Step 3: Verify it loads a model and prints config**
 
-Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b.mq4 --stage site-scan 2>&1 | head -10`
+Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b-mq4.hfq --stage site-scan 2>&1 | head -10`
 Expected: Prints `GPU: gfx1151`, `Loaded: N layers, dim=...`, then `site-scan: TODO`.
 
-If you don't have `qwen3.5-9b.mq4`, use whichever `.mq4` model is available in `models/`. The 9B is preferred for fast iteration; 27B is the canonical reproducer but loads slower.
+If you don't have `qwen3.5-9b-mq4.hfq`, use whichever `-mq4.hfq` model is available in `models/`. The 9B is preferred for fast iteration; 27B is the canonical reproducer but loads slower.
 
 - [ ] **Step 4: Commit**
 
@@ -404,7 +404,7 @@ fn site_scan(
 Run: `cargo build --release --features deltanet --example channel_test_mmq 2>&1 | tail -5`
 Expected: Compiles.
 
-Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b.mq4 --stage site-scan 2>&1 | tail -30`
+Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b-mq4.hfq --stage site-scan 2>&1 | tail -30`
 Expected: Prints the comparison table for all layers × sites. On gfx1151, some sites
 should show non-zero error. Record which sites are worst.
 
@@ -581,7 +581,7 @@ fn channel_map(
 Run: `cargo build --release --features deltanet --example channel_test_mmq 2>&1 | tail -3`
 Expected: Compiles.
 
-Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b.mq4 --stage channel-map --layer 0 --site residual 2>&1`
+Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b-mq4.hfq --stage channel-map --layer 0 --site residual 2>&1`
 Expected: Prints per-row error table for layer 0's `wo` projection.
 
 - [ ] **Step 5: Commit**
@@ -688,7 +688,7 @@ fn layer_sweep(
 Run: `cargo build --release --features deltanet --example channel_test_mmq 2>&1 | tail -3`
 Expected: Compiles.
 
-Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b.mq4 --stage layer-sweep --site residual 2>&1`
+Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b-mq4.hfq --stage layer-sweep --site residual 2>&1`
 Expected: Prints per-layer error for the `residual` site across all layers.
 
 - [ ] **Step 3: Commit**
@@ -771,7 +771,7 @@ for site_name in sites_for_layer {
 
 - [ ] **Step 2: Verify all three stages still work**
 
-Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b.mq4 --stage site-scan 2>&1 | tail -15`
+Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b-mq4.hfq --stage site-scan 2>&1 | tail -15`
 Expected: Same output as before.
 
 - [ ] **Step 3: Commit**
@@ -840,7 +840,7 @@ Run all three stages against a real model and confirm the binary produces action
 
 - [ ] **Step 1: Run site-scan on 9B**
 
-Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b.mq4 --stage site-scan --batch 128 2>&1 | tee /tmp/mmq_site_scan.txt`
+Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b-mq4.hfq --stage site-scan --batch 128 2>&1 | tee /tmp/mmq_site_scan.txt`
 
 Review the output. Record which (site, layer) pairs have the highest error.
 
@@ -848,21 +848,21 @@ Review the output. Record which (site, layer) pairs have the highest error.
 
 Using the worst pair from step 1 (e.g., layer 14, residual):
 
-Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b.mq4 --stage channel-map --layer 14 --site residual --batch 128 2>&1 | tee /tmp/mmq_channel_map.txt`
+Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b-mq4.hfq --stage channel-map --layer 14 --site residual --batch 128 2>&1 | tee /tmp/mmq_channel_map.txt`
 
 Review: which rows have the highest error?
 
 - [ ] **Step 3: Run layer-sweep on the worst site**
 
-Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b.mq4 --stage layer-sweep --site residual --batch 128 2>&1 | tee /tmp/mmq_layer_sweep.txt`
+Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.5-9b-mq4.hfq --stage layer-sweep --site residual --batch 128 2>&1 | tee /tmp/mmq_layer_sweep.txt`
 
 Review: is the error concentrated in specific layers?
 
 - [ ] **Step 4: Run site-scan on 27B (the canonical reproducer model)**
 
-If `qwen3.6-27b.mq4` is available:
+If `qwen3.6-27b-mq4.hfq` is available:
 
-Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.6-27b.mq4 --stage site-scan --batch 128 2>&1 | tee /tmp/mmq_site_scan_27b.txt`
+Run: `cargo run --release --features deltanet --example channel_test_mmq -- --model models/qwen3.6-27b-mq4.hfq --stage site-scan --batch 128 2>&1 | tee /tmp/mmq_site_scan_27b.txt`
 
 Compare error patterns between 9B and 27B.
 

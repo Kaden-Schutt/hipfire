@@ -15,9 +15,9 @@
 #   - /root/hermes_traces_corpus.txt present
 #
 # Arrivals:
-#   - /root/models/carnice-9b.mq4                      Quantized target
-#   - /root/models/carnice-9b.mq4.hermes.triattn.bin   Agentic sidecar for Carnice
-#   - /root/models/qwen3.6-35b-a3b.mq4.hermes.triattn.bin   Agentic sidecar for A3B
+#   - /root/models/carnice-9b-mq4.hfq                      Quantized target
+#   - /root/models/carnice-9b-mq4.hfq.hermes.triattn.bin   Agentic sidecar for Carnice
+#   - /root/models/qwen3.6-35b-a3b-mq4.hfq.hermes.triattn.bin   Agentic sidecar for A3B
 #   - /root/hermes_validate_results/                   Per-task agent-run logs
 
 set -euo pipefail
@@ -40,7 +40,7 @@ log "GPU free"
 
 # ── 1. Quantize Carnice-9b HF bf16 → MQ4 ─────────────────────────────
 CARNICE_HF="$(ls -d /root/hf_cache/models--kai-os--Carnice-9b/snapshots/* | head -1)"
-CARNICE_MQ4=/root/models/carnice-9b.mq4
+CARNICE_MQ4=/root/models/carnice-9b-mq4.hfq
 if [ ! -f "$CARNICE_MQ4" ]; then
     log "quantizing Carnice-9b: $CARNICE_HF → $CARNICE_MQ4"
     ./target/release/hipfire-quantize \
@@ -53,7 +53,7 @@ fi
 ls -la "$CARNICE_MQ4"
 
 # ── 2. Agentic sidecar cal for Carnice-9b ───────────────────────────
-CARNICE_SIDECAR=/root/models/carnice-9b.mq4.hermes.triattn.bin
+CARNICE_SIDECAR=/root/models/carnice-9b-mq4.hfq.hermes.triattn.bin
 if [ ! -f "$CARNICE_SIDECAR" ]; then
     log "calibrating Carnice-9b agentic sidecar (1M hermes tokens)"
     ./target/release/examples/triattn_validate "$CARNICE_MQ4" \
@@ -67,8 +67,8 @@ fi
 tail -6 /root/cal_carnice_hermes.log 2>&1 || true
 
 # ── 3. Agentic sidecar cal for 3.6-A3B ──────────────────────────────
-A3B_MQ4=/root/models/qwen3.6-35b-a3b.mq4
-A3B_SIDECAR=/root/models/qwen3.6-35b-a3b.mq4.hermes.triattn.bin
+A3B_MQ4=/root/models/qwen3.6-35b-a3b-mq4.hfq
+A3B_SIDECAR=/root/models/qwen3.6-35b-a3b-mq4.hfq.hermes.triattn.bin
 if [ ! -f "$A3B_SIDECAR" ]; then
     log "calibrating 3.6-A3B agentic sidecar (1M hermes tokens)"
     ./target/release/examples/triattn_validate "$A3B_MQ4" \

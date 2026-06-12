@@ -4,18 +4,23 @@
 # Copyright (c) 2026 Kaden Schutt
 # hipfire — see LICENSE and NOTICE in the project root.
 
-# hipfire installer — builds from source and installs to ~/.hipfire.
+# hipfire installer — builds from source and installs to ${HIPFIRE_DIR:-~/.hipfire}.
 # Usage (from source checkout): ./scripts/install.sh
 # Usage (remote):               curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
 set -euo pipefail
 
-HIPFIRE_DIR="$HOME/.hipfire"
+HIPFIRE_DIR="${HIPFIRE_DIR:-$HOME/.hipfire}"
 BIN_DIR="$HIPFIRE_DIR/bin"
 MODELS_DIR="$HIPFIRE_DIR/models"
-LOCAL_BIN="$HOME/.local/bin"
+LOCAL_BIN="${LOCAL_BIN:-$HOME/.local/bin}"
 SRC_DIR="$HIPFIRE_DIR/src"
 GITHUB_REPO="Kaden-Schutt/hipfire"
 GITHUB_BRANCH="master"
+INSTALL_OPTS=()
+if [ -n "${CARGO_INSTALL_OPTS:-}" ]; then
+    # shellcheck disable=SC2206
+    INSTALL_OPTS=(${CARGO_INSTALL_OPTS})
+fi
 
 echo "=== hipfire installer ==="
 echo ""
@@ -206,15 +211,16 @@ echo "Building and installing hipfire (release build — this may take several m
 cd "$REPO_DIR"
 
 # hipfire-daemon: the GPU inference worker
-cargo install --path crates/hipfire-daemon --root "$HIPFIRE_DIR"
+cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-daemon --root "$HIPFIRE_DIR"
 
 # hipfire: the CLI (serve / run / list)
-cargo install --path crates/hipfire-cli --root "$HIPFIRE_DIR"
+cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-cli --root "$HIPFIRE_DIR"
 
 # Auxiliary runtime tools
 cargo install --path crates/hipfire-runtime \
     --bin hipfire-eval \
     --bin hipfire-host-profile \
+    "${INSTALL_OPTS[@]}" \
     --root "$HIPFIRE_DIR"
 
 echo ""

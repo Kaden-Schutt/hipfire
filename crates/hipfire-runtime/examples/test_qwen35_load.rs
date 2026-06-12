@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Minimal test: load Qwen3.5 HFQ, parse config, print layer types.
-//! Usage: cargo run --release --features deltanet --example test_qwen35_load -- models/qwen3.5-0.8b.q4.hfq
+//! Usage: cargo run --release --features deltanet --example test_qwen35_load -- models/qwen3.5-0.8b-hf4.hfq
 
 use hipfire_runtime::hfq::HfqFile;
 use std::path::Path;

@@ -65,9 +65,9 @@ Q36_27B="/home/sadara/Models/models--Qwen--Qwen3.6-27B/snapshots/6a9e13bd6fc8f09
 Q36_A3B="/home/sadara/Models/models--Qwen--Qwen3.6-35B-A3B/snapshots/995ad96eacd98c81ed38be0c5b274b04031597b0"
 
 run_quant "$Q35_4B" "mq3" "$MODELS_DIR/qwen3.5-4b-mq3.hfq"
-run_quant "$Q35_4B" "mq3-lloyd" "$MODELS_DIR/qwen3.5-4b-lloyd-mq3.hfq" "--allow-mq3-lloyd"
+run_quant "$Q35_4B" "lloyd-mq3" "$MODELS_DIR/qwen3.5-4b-lloyd-mq3.hfq" "--allow-mq3-lloyd"
 run_quant "$Q35_9B" "mq3" "$MODELS_DIR/qwen3.5-9b-mq3.hfq"
-run_quant "$Q35_9B" "mq3-lloyd" "$MODELS_DIR/qwen3.5-9b-lloyd-mq3.hfq" "--allow-mq3-lloyd"
+run_quant "$Q35_9B" "lloyd-mq3" "$MODELS_DIR/qwen3.5-9b-lloyd-mq3.hfq" "--allow-mq3-lloyd"
 run_quant "$Q35_9B" "q8f16" "$MODELS_DIR/qwen3.5-9b-q8f16.hfq"
 run_quant "$Q35_27B" "mq3" "$MODELS_DIR/qwen3.5-27b-mq3.hfq"
 run_quant "$Q35_27B" "mq6" "$MODELS_DIR/qwen3.5-27b-mq6.hfq"

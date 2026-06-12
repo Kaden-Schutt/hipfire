@@ -2,7 +2,7 @@
 //! MTP head loader + forward pass.
 //!
 //! Algorithm:
-//!   1. Load `~/.hipfire/models/qwen3.5-0.8b.mq4` as the trunk.
+//!   1. Load `~/.hipfire/models/qwen3.5-0.8b-mq4.hfq` as the trunk.
 //!   2. Run trunk forward at (token=1, pos=0); capture post-final-norm
 //!      hidden as `prev_hidden`.
 //!   3. Load `/tmp/qwen3.5-0.8b.mtp` (Task 8 output).
@@ -23,7 +23,7 @@ use std::path::Path;
 fn main() -> HipResult<()> {
     let trunk_path = std::env::var("HIPFIRE_MTP_SMOKE_TRUNK").unwrap_or_else(|_| {
         let home = std::env::var("HOME").expect("HOME unset");
-        format!("{home}/.hipfire/models/qwen3.5-0.8b.mq4")
+        format!("{home}/.hipfire/models/qwen3.5-0.8b-mq4.hfq")
     });
     let mtp_path = std::env::var("HIPFIRE_MTP_SMOKE_HEAD")
         .unwrap_or_else(|_| "/tmp/qwen3.5-0.8b.mtp".to_string());

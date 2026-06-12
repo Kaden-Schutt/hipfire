@@ -20,12 +20,12 @@
 # no-op and both runs are identical.
 #
 # Usage:
-#   tests/gfx906_fallback_canary.sh [path/to/qwen3.5-9b.mq4]
+#   tests/gfx906_fallback_canary.sh [path/to/qwen3.5-9b-mq4.hfq]
 #
-# Defaults to ~/.hipfire/models/qwen3.5-9b.mq4 if unset.
+# Defaults to ~/.hipfire/models/qwen3.5-9b-mq4.hfq if unset.
 
 set -u
-MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b.mq4}"
+MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b-mq4.hfq}"
 PREFILL_LEN="${HIPFIRE_CANARY_PREFILL:-512}"
 PREFILL_RUNS="${HIPFIRE_CANARY_RUNS:-3}"
 

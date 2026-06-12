@@ -11,8 +11,8 @@ Let `hipfire serve` / `hipfire run` use native MTP speculative decode, loading
 the MTP head from **either**:
 
 1. a **separate `.mtp` sidecar** referenced like a DFlash `draft` — **no trunk
-   re-download** (pull the ~515 MB head next to the existing `.mq4`), or
-2. a **bundled `.mq4-mtp`** (trunk+head in one file, trailer-detected) — one file
+   re-download** (pull the ~515 MB head next to the existing `-mq4.hfq`), or
+2. a **bundled `-mq4+mtp.hfq`** (trunk+head in one file, trailer-detected) — one file
    for users who prefer it.
 
 Both must coexist with the existing DFlash-draft path and with plain AR. Existing
@@ -47,7 +47,7 @@ models keep working untouched (no trailer + no sidecar ⇒ AR/DFlash as today).
   loader for `.mtp`. The head's config carries `n_embd`/`vocab_size`/`rope_theta`
   for a trunk-compat check.
 - **Producers:** `mtp_extract` (`--vocab-sidecar cvs.json` → compressed `.mtp`);
-  `mq4_merge_mtp` (`--trunk --mtp` → `.mq4-mtp` bundle).
+  `mq4_merge_mtp` (`--trunk --mtp` → `-mq4+mtp.hfq` bundle).
 
 ## MTP head resolution (daemon load) — the dual-source core
 
@@ -62,11 +62,11 @@ On `load`, after the trunk is loaded, resolve the MTP head in priority order:
 ```
 
 Implications:
-- **No re-download:** paths 1–2 leave the trunk `.mq4` byte-identical; the user
+- **No re-download:** paths 1–2 leave the trunk `-mq4.hfq` byte-identical; the user
   pulls only the small `.mtp`. This is the DFlash distribution model.
-- **One-file convenience:** path 3 is opportunistic — `serve foo.mq4-mtp` just
+- **One-file convenience:** path 3 is opportunistic — `serve foo-mq4+mtp.hfq` just
   works, zero config.
-- **Backward compatible:** unchanged `.mq4` files hit path 4.
+- **Backward compatible:** unchanged `-mq4.hfq` files hit path 4.
 
 **Compat guard (mandatory):** a sidecar `.mtp` can mismatch its trunk (wrong
 arch/dims) and silently produce garbage. On load, verify the head's `arch_id ==
@@ -225,8 +225,8 @@ generation.
 
 | mode | producer | user action | trunk re-download |
 |---|---|---|---|
-| **sidecar** (default) | `mtp_extract … --vocab-sidecar` → `.mtp` | `hipfire pull <model>` fetches the small `.mtp` next to the existing `.mq4` | **No** |
-| **bundle** (opt-in) | `mq4_merge_mtp --trunk --mtp` → `.mq4-mtp` | download/build the one-file bundle | Yes (new file) |
+| **sidecar** (default) | `mtp_extract … --vocab-sidecar` → `.mtp` | `hipfire pull <model>` fetches the small `.mtp` next to the existing `-mq4.hfq` | **No** |
+| **bundle** (opt-in) | `mq4_merge_mtp --trunk --mtp` → `-mq4+mtp.hfq` | download/build the one-file bundle | Yes (new file) |
 
 Recommend the **sidecar as the default shipped form** — it's small (~515 MB cvs),
 re-uses the trunk, and matches the DFlash model users already understand. Offer
@@ -275,7 +275,7 @@ acceptance which can hide bugs (low τ looks like "draft disagreement" not
   sampling (wiring is trivial — just call `set_sampling`). Repeat penalty on
   trunk verify (item 7). Manual `params.mtp_head`. Coherence-gate row (greedy
   + sampling). `mtp_mode` override (item in mutual exclusion).
-  → `serve foo.mq4-mtp` and `load {mtp_head: "x.mtp"}` both work for any
+  → `serve foo-mq4+mtp.hfq` and `load {mtp_head: "x.mtp"}` both work for any
   temperature / repeat_penalty.
 
 - **Phase 2:** registry `mtp` field + `hipfire pull`/`index.ts` plumbing (12–13)

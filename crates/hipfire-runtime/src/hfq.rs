@@ -429,7 +429,7 @@ impl HfqFile {
     }
 
     /// Open an HFQM container that lives inside a larger file, starting at
-    /// `base_offset`. Used by the bundled `.mq4-mtp` loader to parse the
+    /// `base_offset`. Used by the bundled `-mq4+mtp.hfq` loader to parse the
     /// MTP section embedded after the trunk's tensor data.
     ///
     /// The whole file is mmap'd, and the HFQM header is read starting at

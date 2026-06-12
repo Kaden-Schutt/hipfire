@@ -18,7 +18,7 @@
 # Example:
 #   scripts/bench_quant_quality.sh \
 #       ~/.cache/huggingface/hub/models--Qwen--Qwen3.6-35B-A3B/snapshots/SNAP \
-#       /local/hipfire/qwen3.6-35b-a3b.mq4 \
+#       /local/hipfire/qwen3.6-35b-a3b-mq4.hfq \
 #       benchmarks/results/quant_quality_a3b_baseline.md
 #
 # Output is a markdown report with:

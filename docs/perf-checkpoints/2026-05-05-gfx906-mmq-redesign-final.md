@@ -470,7 +470,7 @@ prefill anyway, but documenting for completeness.
 # Final perf bench (no env vars — default-on at gfx906)
 HIPFIRE_DPM_WARMUP_SECS=2 \
   $HIPFIRE/target/release/examples/bench_qwen35_speed \
-  $HIPFIRE_MODELS/qwen3.5-9b.mq4 \
+  $HIPFIRE_MODELS/qwen3.5-9b-mq4.hfq \
   --prefill 128 --prefill-runs 5 --gen 0 --warmup 0
 
 # Cross-process A/B
@@ -479,7 +479,7 @@ for iter in 1 2 3; do
     [ "$label" = "A" ] && env="HIPFIRE_MMQ=0" || env=""
     env $env HIPFIRE_DPM_WARMUP_SECS=2 \
       $HIPFIRE/target/release/examples/bench_qwen35_speed \
-      $HIPFIRE_MODELS/qwen3.5-9b.mq4 \
+      $HIPFIRE_MODELS/qwen3.5-9b-mq4.hfq \
       --prefill 128 --prefill-runs 5 --gen 0 --warmup 0
   done
 done
@@ -490,7 +490,7 @@ for ctr in VALUBusy LDSBankConflict ALUStalledByLDS \
   printf 'pmc: %s\ngpu: 0\n' "$ctr" > pmc.txt
   rocprof -i pmc.txt -o "run_${ctr}.csv" \
     $HIPFIRE/target/release/examples/bench_qwen35_speed \
-    $HIPFIRE_MODELS/qwen3.5-9b.mq4 \
+    $HIPFIRE_MODELS/qwen3.5-9b-mq4.hfq \
     --prefill 128 --prefill-runs 1 --gen 0 --warmup 0
 done
 
@@ -498,7 +498,7 @@ done
 # system — use --kernel-trace specifically, not -L)
 rocprofv3 --kernel-trace --stats -d ./run -o trace --output-format csv -- \
   $HIPFIRE/target/release/examples/bench_qwen35_speed \
-  $HIPFIRE_MODELS/qwen3.5-9b.mq4 \
+  $HIPFIRE_MODELS/qwen3.5-9b-mq4.hfq \
   --prefill 128 --prefill-runs 1 --gen 0 --warmup 0
 
 # Coherence gate

@@ -53,18 +53,18 @@ LOCK_SCRIPT="./scripts/gpu-lock.sh"
 # Override with HIPFIRE_JINJA_TOOLS_MODEL=<path> for hosts where the
 # default-selected file doesn't fit (or for picking A3B explicitly).
 CANDIDATES=(
-    "$MODELS_DIR/qwen3.6-27b.mq4"
-    "$MODELS_DIR/qwen3.5-27b.mq4"
-    "$MODELS_DIR/qwen3.5-9b.mq4"
-    "$MODELS_DIR/qwen3.6-35b-a3b.mq4"
-    "$MODELS_DIR/qwen3.5-35b-a3b.mq4"
+    "$MODELS_DIR/qwen3.6-27b-mq4.hfq"
+    "$MODELS_DIR/qwen3.5-27b-mq4.hfq"
+    "$MODELS_DIR/qwen3.5-9b-mq4.hfq"
+    "$MODELS_DIR/qwen3.6-35b-a3b-mq4.hfq"
+    "$MODELS_DIR/qwen3.5-35b-a3b-mq4.hfq"
 )
 MODEL=""
 LABEL=""
 if [ -n "${HIPFIRE_JINJA_TOOLS_MODEL:-}" ]; then
     if [ -f "$HIPFIRE_JINJA_TOOLS_MODEL" ]; then
         MODEL="$HIPFIRE_JINJA_TOOLS_MODEL"
-        LABEL="$(basename "$MODEL" .mq4)_jinja_tools"
+        LABEL="$(basename "$MODEL" -mq4.hfq)_jinja_tools"
     else
         echo "agentic-gate-jinja-tools: HIPFIRE_JINJA_TOOLS_MODEL=$HIPFIRE_JINJA_TOOLS_MODEL not found" >&2
         exit 2
@@ -73,7 +73,7 @@ else
     for cand in "${CANDIDATES[@]}"; do
         if [ -f "$cand" ]; then
             MODEL="$cand"
-            LABEL="$(basename "$MODEL" .mq4)_jinja_tools"
+            LABEL="$(basename "$MODEL" -mq4.hfq)_jinja_tools"
             break
         fi
     done
@@ -93,7 +93,7 @@ fi
 # DFlash).
 #
 # Mapping is base-specific. 3.5 and 3.6 ship distinct drafters — the
-# legacy `qwen35-27b-dflash.mq4` is 3.5-only despite being the original
+# `qwen3.5-27b-mq4.dflash.hfq` is 3.5-only despite being the original
 # DFlash drafter that shipped before 3.6 trained its own.
 #
 # Override with HIPFIRE_JINJA_TOOLS_DRAFTER=<path|"none"> when the
@@ -105,11 +105,11 @@ if [ -n "${HIPFIRE_JINJA_TOOLS_DRAFTER:-}" ]; then
     fi
 else
     case "$(basename "$MODEL")" in
-        qwen3.6-27b.mq4)         DRAFTER_CAND="$MODELS_DIR/qwen36-27b-dflash-mq4.hf4" ;;
-        qwen3.5-27b.mq4)         DRAFTER_CAND="$MODELS_DIR/qwen35-27b-dflash-mq4.hf4" ;;
-        qwen3.5-9b.mq4)          DRAFTER_CAND="$MODELS_DIR/qwen35-9b-dflash-mq4.hf4" ;;
-        qwen3.6-35b-a3b.mq4)     DRAFTER_CAND="$MODELS_DIR/qwen36-35b-a3b-dflash-mq4.hf4" ;;
-        qwen3.5-35b-a3b.mq4)     DRAFTER_CAND="$MODELS_DIR/qwen35-35b-a3b-dflash-mq4.hf4" ;;
+        qwen3.6-27b-mq4.hfq)         DRAFTER_CAND="$MODELS_DIR/qwen3.6-27b-mq4.dflash.hfq" ;;
+        qwen3.5-27b-mq4.hfq)         DRAFTER_CAND="$MODELS_DIR/qwen3.5-27b-mq4.dflash.hfq" ;;
+        qwen3.5-9b-mq4.hfq)          DRAFTER_CAND="$MODELS_DIR/qwen3.5-9b-mq4.dflash.hfq" ;;
+        qwen3.6-35b-a3b-mq4.hfq)     DRAFTER_CAND="$MODELS_DIR/qwen3.6-35b-a3b-mq4.dflash.hfq" ;;
+        qwen3.5-35b-a3b-mq4.hfq)     DRAFTER_CAND="$MODELS_DIR/qwen3.5-35b-a3b-mq4.dflash.hfq" ;;
         *)                       DRAFTER_CAND="" ;;
     esac
     if [ -n "$DRAFTER_CAND" ] && [ -f "$DRAFTER_CAND" ]; then

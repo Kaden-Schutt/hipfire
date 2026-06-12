@@ -11,7 +11,7 @@
 #
 # Usage:
 #   bash calibrate_multigpu.sh \
-#       --models model1.mq4,model2.mq4,... \
+#       --models model1-mq4.hfq,model2-mq4.hfq,... \
 #       (--corpus FILE | --recipe NAME) \
 #       [--max-tokens 1000000] \
 #       [--chunk-len 1024] \

@@ -47,15 +47,15 @@ numbers + analysis.
 | Field | Value |
 |---|---|
 | Tool | `target/release/examples/bench_qwen35_speed` |
-| Models | `qwen3.5-9b.mq4` (uniform), `qwen3.5-9b.mq4-lloyd` |
+| Models | `qwen3.5-9b-mq4.hfq` (uniform), `qwen3.5-9b-lloyd-mq4.hfq` |
 | Flags | `--prefill 256 --warmup 5 --prefill-runs 3 --gen 30` |
 | Env | `HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1` |
 | Cross-process A/B | 3 fresh process invocations × 2 models |
 | In-process samples | 3 timed prefills per invocation; in-process median |
 | Reported metric | mean of in-process medians across the 3 invocations |
 | Bench binary md5 | `71234969e9d9461a5c6fbc86449ba6c4` (target/release/examples/bench_qwen35_speed at HEAD `0a34ba6`; identical at HEAD `1934aae`) |
-| Model md5 (uniform) | `31a8d8dc7603226801b08d8319015602` (qwen3.5-9b.mq4) |
-| Model md5 (Lloyd)   | `b3eea80aeade0b56c153a054b1143ab2` (qwen3.5-9b.mq4-lloyd) |
+| Model md5 (uniform) | `31a8d8dc7603226801b08d8319015602` (qwen3.5-9b-mq4.hfq) |
+| Model md5 (Lloyd)   | `b3eea80aeade0b56c153a054b1143ab2` (qwen3.5-9b-lloyd-mq4.hfq) |
 | Prompt | N/A — `bench_qwen35_speed` generates a deterministic synthetic token sequence (token ids `0..prefill_len`) internally; no user prompt |
 
 `--prefill 256` rather than the probe-commits canonical `--prefill 16`
@@ -70,13 +70,13 @@ effects (DPM, thermal, fragmented HSA queues).
 ## Raw numbers (gfx1100, ROCm 7.2, branch HEAD `1934aae`)
 
 ```
-=== qwen3.5-9b.mq4 (uniform) ===
+=== qwen3.5-9b-mq4.hfq (uniform) ===
   run 1: prefill_median=2297.0 tok/s, gen=110.4 tok/s
   run 2: prefill_median=2303.0 tok/s, gen=110.3 tok/s
   run 3: prefill_median=2298.4 tok/s, gen=110.5 tok/s
   → prefill mean = 2299.5 tok/s   gen mean = 110.4 tok/s
 
-=== qwen3.5-9b.mq4-lloyd ===
+=== qwen3.5-9b-lloyd-mq4.hfq ===
   run 1: prefill_median=1384.1 tok/s, gen=93.6 tok/s
   run 2: prefill_median=1389.9 tok/s, gen=92.3 tok/s
   run 3: prefill_median=1406.3 tok/s, gen=92.4 tok/s
@@ -84,7 +84,7 @@ effects (DPM, thermal, fragmented HSA queues).
 ```
 
 Decode regression check via `probe_commits.sh` (master `85678ed` vs
-HEAD `1934aae`, BENCH_MODEL=qwen3.5-9b.mq4, canonical `--prefill 16
+HEAD `1934aae`, BENCH_MODEL=qwen3.5-9b-mq4.hfq, canonical `--prefill 16
 --gen 30` shape):
 
 ```
@@ -162,7 +162,7 @@ Phase B2 wiring — the gate already runs on gfx1151 via Phase B3, but
 the gfx1100 coherence wasn't explicitly captured for this PR until now.
 
 ```
-## qwen3.5-9b.mq4-lloyd — reason-mq4-lloyd-9b
+## qwen3.5-9b-lloyd-mq4.hfq — reason-mq4-lloyd-9b
 
 - wall: 54.4s  status: **OK**
 - stats: tokens=53, prefill_tokens=36, prefill_tok_s=690.3, decode_tok_s=91.2
@@ -182,19 +182,19 @@ termination, no attractor loops. Status OK on gfx1100.
 
 ## 4B data point (added 2026-05-08, branch HEAD `5fce3e3`)
 
-Quantized `qwen3.5-4b.mq4-lloyd` from `/data/models/qwen/Qwen3.5-4B/`
+Quantized `qwen3.5-4b-lloyd-mq4.hfq` from `/data/models/qwen/Qwen3.5-4B/`
 and re-ran the same Phase C cross-process A/B at the smaller model
 scale to get a second hardware-ratio data point. Same gfx1100 host,
 same bench config, same `--prefill 256 --prefill-runs 3` methodology.
 
 ```
-=== qwen3.5-4b.mq4 (uniform) ===
+=== qwen3.5-4b-mq4.hfq (uniform) ===
   run 1: prefill_median=3591.6 tok/s, gen=152.3 tok/s
   run 2: prefill_median=3594.9 tok/s, gen=152.2 tok/s
   run 3: prefill_median=3583.1 tok/s, gen=151.9 tok/s
   → prefill mean = 3589.9 tok/s   gen mean = 152.1 tok/s
 
-=== qwen3.5-4b.mq4-lloyd ===
+=== qwen3.5-4b-lloyd-mq4.hfq ===
   run 1: prefill_median=2602.3 tok/s, gen=136.7 tok/s
   run 2: prefill_median=2567.6 tok/s, gen=136.4 tok/s
   run 3: prefill_median=2594.3 tok/s, gen=136.2 tok/s
@@ -229,7 +229,7 @@ Model md5 (4B Lloyd):   `d13028f6a1f4fda772c17bb6c3f3a0bc`.
 
 ## 27B data point (added 2026-05-08, branch HEAD `c42deb0`)
 
-Quantized `qwen3.6-27b.mq4-lloyd` from
+Quantized `qwen3.6-27b-lloyd-mq4.hfq` from
 `/data/cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/6a9e13bd...`
 (52 GB safetensors, output 17.4 GB Lloyd-MQ4) and re-ran the same Phase
 C cross-process A/B at the largest available scale on gfx1100. **Note**:
@@ -237,13 +237,13 @@ C cross-process A/B at the largest available scale on gfx1100. **Note**:
 still scale with size but the architectural baseline shifts slightly.
 
 ```
-=== qwen3.6-27b.mq4 (uniform) ===
+=== qwen3.6-27b-mq4.hfq (uniform) ===
   run 1: prefill_median=780.8 tok/s, gen=39.2 tok/s
   run 2: prefill_median=779.3 tok/s, gen=39.1 tok/s
   run 3: prefill_median=777.2 tok/s, gen=39.1 tok/s
   → prefill mean = 779.1 tok/s   gen mean = 39.1 tok/s
 
-=== qwen3.6-27b.mq4-lloyd ===
+=== qwen3.6-27b-lloyd-mq4.hfq ===
   run 1: prefill_median=397.0 tok/s, gen=33.3 tok/s
   run 2: prefill_median=397.4 tok/s, gen=33.3 tok/s
   run 3: prefill_median=397.7 tok/s, gen=33.3 tok/s

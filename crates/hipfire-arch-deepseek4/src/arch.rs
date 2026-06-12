@@ -498,9 +498,9 @@ impl Architecture for DeepseekV4 {
         //
         //   1. HIPFIRE_DEEPSEEK4_MTP_ADDON=<path>       — explicit override
         //   2. <base>.mtp-addon.hfq                     — `.mtp-addon.hfq`
-        //      e.g. v4f.mq2lloyd-q8.hfq  →  v4f.mq2lloyd-q8.mtp-addon.hfq
+        //      e.g. v4f-lloyd-mq2.hfq-q8.hfq  →  v4f-lloyd-mq2.hfq-q8.mtp-addon.hfq
         //   3. <stem>-mtp.<ext>                         — `-mtp` infix
-        //      e.g. deepseek-v4-flash.mq2lloyd  →  deepseek-v4-flash-mtp.mq2lloyd
+        //      e.g. deepseek-v4-flash-lloyd-mq2.hfq  →  deepseek-v4-flash-mtp-lloyd-mq2.hfq
         //
         // When set, ALL `mtp.0.*` reads in the block below source from the
         // addon instead of the base. The MTP layer is present iff the addon

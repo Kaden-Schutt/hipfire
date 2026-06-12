@@ -9,8 +9,8 @@ replaced" (caught by SHA256 in `manifest.json`).
 accumulator changes, prompt-handling drift) — not reference identity
 changes. See plan §"Reference-drift canary (clarified)".
 
-**Candidate model for canary:** `qwen3.5-9b.mq4` (canonical hipfire MQ4-uniform
-9B; available locally at `~/.hipfire/models/qwen3.5-9b.mq4`). Candidate is
+**Candidate model for canary:** `qwen3.5-9b-mq4.hfq` (canonical hipfire MQ4-uniform
+9B; available locally at `~/.hipfire/models/qwen3.5-9b-mq4.hfq`). Candidate is
 fixed across all canary runs; ref is the same as the bulk-eval ref.
 
 ## Sequences

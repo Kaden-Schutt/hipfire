@@ -51,7 +51,7 @@ mkdir -p "$MODELS_DIR"
 log() { printf '[stage-models] %s\n' "$*"; }
 
 # MODEL = HF repo ID, OUT_STEM = filename stem in MODELS_DIR (the quant
-# format will append .mq4 / .mq6 to produce the final filename).
+# format will append -mq4.hfq / -mq6.hfq to produce the final filename).
 #
 # Format syntax: hipfire-quantize auto-downloads when --input is
 # "org/name". Output filename convention is <stem>.<format>.

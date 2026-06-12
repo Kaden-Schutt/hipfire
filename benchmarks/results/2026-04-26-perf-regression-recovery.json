@@ -8,8 +8,8 @@
     "os": "Ubuntu 24.04 LTS"
   },
   "model": {
-    "target": "qwen3.5-27b.mq4 (FWHT-rotated 4-bit)",
-    "draft": "qwen35-27b-dflash.mq4 (8-layer DFlash)",
+    "target": "qwen3.5-27b-mq4.hfq (FWHT-rotated 4-bit)",
+    "draft": "qwen3.5-27b-mq4.dflash.hfq (8-layer DFlash)",
     "kv_cache": "asym3"
   },
   "prompt": {

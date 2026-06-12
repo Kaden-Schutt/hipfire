@@ -8,6 +8,14 @@ Linux with ROCm 6+ installed and an AMD RDNA GPU:
 curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
 ```
 
+From a source checkout, install hipfire into `~/.hipfire/bin/`:
+
+```bash
+./install.sh
+# or
+make install
+```
+
 The installer detects your GPU arch (`gfx1010` / `gfx1030` / `gfx1100` / etc.),
 fetches matching pre-compiled kernel blobs, drops the daemon and quantizer
 binaries into `~/.hipfire/bin/`, and adds a wrapper to `~/.local/bin/`. Make
@@ -111,7 +119,7 @@ you must set a CASK profile (`balanced`, `conservative`, or `aggressive-vram`) t
 For custom or quantized models, generate the sidecar first:
 
 ```bash
-hipfire sidecar-gen ~/models/my-finetune.mq4 --corpus corpus.txt
+hipfire sidecar-gen ~/models/my-finetune-mq4.hfq --corpus corpus.txt
 hipfire config cask-profile balanced
 ```
 

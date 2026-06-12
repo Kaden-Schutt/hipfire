@@ -12,10 +12,10 @@
 //!
 //! Asserts: per-token `forward_scratch_multi` ≡ `forward_scratch` bit-
 //! exact across 50 decode tokens after a 15-token ChatML prefill on
-//! qwen3.5-0.8b.mq4 + asym3 KV. This is the floor — if this regresses,
+//! qwen3.5-0.8b-mq4.hfq + asym3 KV. This is the floor — if this regresses,
 //! pp=2 is broken.
 //!
-//! Model location: `$HOME/.hipfire/models/qwen3.5-0.8b.mq4` (override
+//! Model location: `$HOME/.hipfire/models/qwen3.5-0.8b-mq4.hfq` (override
 //! via `HIPFIRE_PP_PARITY_MODEL`).
 
 use hipfire_arch_qwen35::qwen35::{
@@ -196,7 +196,7 @@ fn pp_parity_chatml_50_decode() {
     }
     let model = std::env::var("HIPFIRE_PP_PARITY_MODEL").unwrap_or_else(|_| {
         let home = std::env::var("HOME").expect("HOME");
-        format!("{home}/.hipfire/models/qwen3.5-0.8b.mq4")
+        format!("{home}/.hipfire/models/qwen3.5-0.8b-mq4.hfq")
     });
     if !Path::new(&model).is_file() {
         eprintln!("skipping: model {model} not found");

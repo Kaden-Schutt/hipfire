@@ -1,6 +1,6 @@
 [
   {
-    "variant": "qwen3.5-9b-awq-mtp.mq4",
+    "variant": "qwen3.5-9b-awq-mtp-mq4.hfq",
     "arch": "gfx1151",
     "scoring_mode": "prefill-q8-c50",
     "n_chunks": 50,
@@ -12,7 +12,7 @@
     "notes": ""
   },
   {
-    "variant": "qwen3.5-9b.mq4",
+    "variant": "qwen3.5-9b-mq4.hfq",
     "arch": "gfx1151",
     "scoring_mode": "prefill-q8-c50",
     "n_chunks": 50,

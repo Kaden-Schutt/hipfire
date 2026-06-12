@@ -52,7 +52,7 @@ prior tests didn't.
 ```
 HIPFIRE_DPM_WARMUP_SECS=10 \
 ./target/release/examples/mtp_only_demo \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
+  --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
   --mtp-head /tmp/qwen3.5-27b-cvs16384.mtp \
   --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt \
   --max 480 --max-n 2 --mtp-p-min 0.65 \

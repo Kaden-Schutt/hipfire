@@ -222,7 +222,7 @@ a register).
 
 ---
 
-### D. Pre-compiled `.hsaco` blobs shipped with `.mq3` files
+### D. Pre-compiled `.hsaco` blobs shipped with `-mq3.hfq` files
 
 **Effort:** 2–3 days.
 **Perf impact:** First-run wait reduced from a few seconds to ~zero.
@@ -236,7 +236,7 @@ cached at `~/.hipfire/bin/kernels/compiled/<arch>/`. A user's first
 prefill on a fresh machine pays the JIT cost (a few seconds per kernel
 × ~30+ kernels).
 
-Bundling pre-compiled `.hsaco` blobs in the `.mq3` file (or in a
+Bundling pre-compiled `.hsaco` blobs in the `-mq3.hfq` file (or in a
 sibling `.hsaco-bundle` file) would skip the JIT entirely.
 
 #### Tradeoffs

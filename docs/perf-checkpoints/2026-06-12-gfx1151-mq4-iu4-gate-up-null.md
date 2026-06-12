@@ -6,7 +6,7 @@ Model focus: Qwen3.5/Qwen3.6 MQ4 prefill
 
 ## Profile Baseline
 
-`profile_prefill_qwen35` on `qwen3.5-9b.mq4.hfq`, `--prefill 256 --warmup 0 --kv-mode asym3`, showed the dense MQ4 path is dominated by the existing HFQ4 MMQ integer kernels:
+`profile_prefill_qwen35` on `qwen3.5-9b-mq4.hfq`, `--prefill 256 --warmup 0 --kv-mode asym3`, showed the dense MQ4 path is dominated by the existing HFQ4 MMQ integer kernels:
 
 | Kernel | Calls | Total |
 |---|---:|---:|

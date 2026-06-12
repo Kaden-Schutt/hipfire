@@ -131,10 +131,10 @@ Read in order:
 ```bash
 cargo build --release --features deltanet --example dflash_spec_demo
 ./target/release/examples/dflash_spec_demo \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --draft ~/.hipfire/models/qwen35-27b-dflash.mq4 \
+  --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
+  --draft ~/.hipfire/models/qwen3.5-27b-mq4.dflash.hfq \
   --prompt-file benchmarks/longctx/niah/niah_128k_prompt.txt \
-  --pflash ~/.hipfire/models/qwen3.5-0.8b.mq4 \
+  --pflash ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq \
   --keep-ratio 0.03 --max 64 --kv-mode asym3 --no-chatml --ctx 8192
 ```
 

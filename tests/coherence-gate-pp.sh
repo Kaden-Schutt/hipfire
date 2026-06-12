@@ -38,7 +38,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 EXE="./target/release/examples/daemon"
-MODEL="${HIPFIRE_PP_MODEL:-/local/hipfire/qwen3.6-27b.mq4}"
+MODEL="${HIPFIRE_PP_MODEL:-/local/hipfire/qwen3.6-27b-mq4.hfq}"
 MTP_HEAD="${HIPFIRE_PP_MTP_HEAD:-/data/hipfire/qwen3.6-27b-cvs16384.mtp}"
 OUT="${HIPFIRE_COHERENCE_PP_OUT:-/tmp/coherence-pp-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"

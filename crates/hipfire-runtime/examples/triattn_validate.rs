@@ -102,12 +102,12 @@ fn main() {
                 i += 1;
             }
             other => {
-                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar] [--gpu-calib | --cpu-calib]");
+                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model-mq4.hfq> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar] [--gpu-calib | --cpu-calib]");
                 std::process::exit(1);
             }
         }
     }
-    let model_path = model_path.expect("need <model.mq4> positional arg");
+    let model_path = model_path.expect("need <model-mq4.hfq> positional arg");
     let sidecar_path = sidecar_path.unwrap_or_else(|| format!("{model_path}.triattn.bin"));
 
     // Calibration corpus: either chunks from --corpus file or 8 built-in

@@ -81,9 +81,9 @@ fn print_usage() {
          Tensor bytes are copied 1:1 — no quantization runs.\n\
          \n\
          Example (split DeepSeek V4's optional MTP layer into a sidecar):\n\
-             hfq_split deepseek-v4-flash.mq2lloyd \\\n\
-                 --base deepseek-v4-flash.mq2lloyd.new \\\n\
-                 --addon deepseek-v4-flash-mtp.mq2lloyd \\\n\
+             hfq_split deepseek-v4-flash-lloyd-mq2.hfq \\\n\
+                 --base deepseek-v4-flash-lloyd-mq2.hfq.new \\\n\
+                 --addon deepseek-v4-flash-mtp-lloyd-mq2.hfq \\\n\
                  --addon-prefix mtp.0."
     );
 }

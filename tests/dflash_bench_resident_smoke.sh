@@ -44,27 +44,24 @@ if [ "$DO_BUILD" -eq 1 ] || [ ! -x "$EXE" ]; then
 fi
 
 # Pick the smallest staged DFlash drafter and its matching target.
-# Drafter naming convention (from existing benches): `*-dflash*.hfq` or
-# `*-dflash*.mq4`. Match by model size prefix (e.g. qwen35-27b-dflash → qwen3.5-27b).
+# Drafter naming convention (from existing benches): `*-mq4.dflash.hfq`. Match by model family and size.
 DRAFT=""
 TARGET=""
 for d in \
-    "$MODELS_DIR/qwen35-9b-dflash-mq4.hfq" \
-    "$MODELS_DIR/qwen35-9b-dflash.mq4" \
-    "$MODELS_DIR/qwen35-27b-dflash-mq4.hfq" \
-    "$MODELS_DIR/qwen35-27b-dflash.mq4" \
-    "$MODELS_DIR/qwen36-27b-dflash-mq4.hfq"; do
+    "$MODELS_DIR/qwen3.5-9b-mq4.dflash.hfq" \
+    "$MODELS_DIR/qwen3.5-27b-mq4.dflash.hfq" \
+    "$MODELS_DIR/qwen3.6-27b-mq4.dflash.hfq"; do
     if [ -f "$d" ]; then DRAFT="$d"; break; fi
 done
 if [ -z "$DRAFT" ]; then
     echo "smoke: no DFlash drafter staged in $MODELS_DIR — skipping"
-    echo "       (looked for qwen35-9b-dflash, qwen35-27b-dflash, qwen36-27b-dflash)"
+    echo "       (looked for qwen3.5-9b-mq4.dflash.hfq, qwen3.5-27b-mq4.dflash.hfq, qwen3.6-27b-mq4.dflash.hfq)"
     exit 0
 fi
 case "$DRAFT" in
-    *qwen35-9b-dflash*)  TARGET="$MODELS_DIR/qwen3.5-9b.mq4" ;;
-    *qwen35-27b-dflash*) TARGET="$MODELS_DIR/qwen3.5-27b.mq4" ;;
-    *qwen36-27b-dflash*) TARGET="$MODELS_DIR/qwen3.6-27b.mq4" ;;
+    *qwen3.5-9b-mq4.dflash*)  TARGET="$MODELS_DIR/qwen3.5-9b-mq4.hfq" ;;
+    *qwen3.5-27b-mq4.dflash*) TARGET="$MODELS_DIR/qwen3.5-27b-mq4.hfq" ;;
+    *qwen3.6-27b-mq4.dflash*) TARGET="$MODELS_DIR/qwen3.6-27b-mq4.hfq" ;;
 esac
 if [ ! -f "$TARGET" ]; then
     echo "smoke: target $TARGET not found (drafter $DRAFT staged but pair incomplete) — skipping"

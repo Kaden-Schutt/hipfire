@@ -7,7 +7,7 @@
 """sim_mq3.py — approximate 3-bit quantization on an MQ4 file (NOT exact MQ3).
 
 What this script actually does:
-  Reads an existing .mq4 file, finds all MQ4-G256 (quant_type=13) tensors,
+  Reads an existing -mq4.hfq file, finds all MQ4-G256 (quant_type=13) tensors,
   and snaps each 4-bit nibble (q4 in [0..15]) to the nearest of the
   8-element subset {0, 2, 4, 6, 9, 11, 13, 15} via lookup table SNAP_4.
   The 8 chosen indices are the closest-integer approximations of a uniform
@@ -84,8 +84,8 @@ NOT a strict upper bound on its quality cost:
   re-quantize from the original f32 / bf16 safetensors weights, not
   from already-MQ4-quantized values.
 
-Usage: ./scripts/sim_mq3.py <input.mq4> <output.mq4>   # requires +x bit
-       python3 scripts/sim_mq3.py <input.mq4> <output.mq4>
+Usage: ./scripts/sim_mq3.py <input-mq4.hfq> <output-mq4.hfq>   # requires +x bit
+       python3 scripts/sim_mq3.py <input-mq4.hfq> <output-mq4.hfq>
 """
 import json
 import struct

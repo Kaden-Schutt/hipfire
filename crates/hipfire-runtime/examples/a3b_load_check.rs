@@ -8,7 +8,7 @@
 //! types before wiring up the (much more involved) MoE forward path.
 //!
 //! Usage: cargo run --release --features deltanet --example a3b_load_check -- \
-//!     ~/.hipfire/models/qwen3.5-35b-a3b.mq4
+//!     ~/.hipfire/models/qwen3.5-35b-a3b-mq4.hfq
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -23,7 +23,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: a3b_load_check <model.mq4>");
+        eprintln!("Usage: a3b_load_check <model-mq4.hfq>");
         std::process::exit(1);
     }
     let model_path = &args[1];

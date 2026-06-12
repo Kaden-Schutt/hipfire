@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON="${DAEMON:-$ROOT/target/release/examples/daemon}"
-MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4.hfq}"
+MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b-mq4.hfq}"
 REQUESTS="${HIPFIRE_SHARED_PREFIX_REQUESTS:-2}"
 MAX_SEQ="${MAX_SEQ:-768}"
 SERVER_SMOKE_LOCK="${HIPFIRE_SERVER_SMOKE_LOCK:-${TMPDIR:-/tmp}/hipfire-server-smoke.lock}"

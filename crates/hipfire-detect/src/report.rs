@@ -183,7 +183,7 @@ mod tests {
         ReportHeader {
             prompt_md5: "deadbeef".to_string(),
             prompt_label: "test".to_string(),
-            model: "qwen3.5-9b.mq4".to_string(),
+            model: "qwen3.5-9b-mq4.hfq".to_string(),
             arch: "gfx1100".to_string(),
             host: "k9lin".to_string(),
             total_tokens: 100,

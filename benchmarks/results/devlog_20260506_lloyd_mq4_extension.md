@@ -366,16 +366,16 @@ Investigation: `bench_qwen35_speed.rs` is **dtype-agnostic** despite the
 name — it loads via `HfqFile::open` + `qwen35::load_weights`. The
 load path at `crates/hipfire-arch-qwen35/src/qwen35.rs:738-744`
 dispatches on the .hfq quant-type ID (20 → `MQ3G256Lloyd`), so the
-bench Just Works against a `.mq3-lloyd` file. The `--allow-mq3-lloyd`
+bench Just Works against a `-lloyd-mq3.hfq` file. The `--allow-mq3-lloyd`
 guard at `crates/hipfire-quantize/src/main.rs:2011` is **quantizer-
 only**; the runtime has no equivalent gate.
 
 Fix landed in `scripts/probe_commits.sh`: parameterized the model
-path via `BENCH_MODEL` env var (default `qwen3.5-9b.mq4` preserves
+path via `BENCH_MODEL` env var (default `qwen3.5-9b-mq4.hfq` preserves
 existing behavior). Use:
 
 ```
-BENCH_MODEL=qwen3.5-9b.mq3-lloyd ./scripts/probe_commits.sh <c1> <c2>
+BENCH_MODEL=qwen3.5-9b-lloyd-mq3.hfq ./scripts/probe_commits.sh <c1> <c2>
 ```
 
 The bench's prefill is a deterministic token-id sequence
@@ -449,7 +449,7 @@ cargo build --release --features deltanet -p hipfire-runtime --example bench_qwe
 The PR's published 22.56 ppl on 4B was from a different quantization
 seed/iteration; locally-quantized model files produce different
 absolute ppl. The right correctness signal is **new kernel vs old
-kernel on the same `~/.hipfire/models/qwen3.5-{4b,9b}.mq3-lloyd`**.
+kernel on the same `~/.hipfire/models/qwen3.5-{4b,9b}-lloyd-mq3.hfq`**.
 
 ```
 4B Lloyd-MQ3:    NEW ppl=13.1804  BASELINE ppl=12.9956  Δ=0.18 (1.4%)

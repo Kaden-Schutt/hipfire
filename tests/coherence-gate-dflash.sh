@@ -62,15 +62,46 @@ if [ "$FAST" -eq 1 ] && [ "$FULL" -eq 1 ]; then
 fi
 
 EXE="./target/release/examples/dflash_spec_demo"
-MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
-TARGET_27B="$MODELS_DIR/qwen3.5-27b.mq4"
-DRAFT_27B="$MODELS_DIR/qwen35-27b-dflash.mq4"
-if [ ! -f "$DRAFT_27B" ] && [ -f "$MODELS_DIR/qwen35-27b-dflash-mq4.hfq" ]; then
-    DRAFT_27B="$MODELS_DIR/qwen35-27b-dflash-mq4.hfq"
-fi
+HIPFIRE_HOME="${HIPFIRE_DIR:-$HOME/.hipfire}"
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HIPFIRE_HOME/models}"
+DFLASH_DIR="${HIPFIRE_DFLASH_DIR:-$HIPFIRE_HOME/drafts}"
+TARGET_27B=""
+DRAFT_27B=""
+PAIR_27B=""
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-dflash-$(date +%Y%m%d-%H%M%S).md}"
 CASE_TIMEOUT="${HIPFIRE_COHERENCE_TIMEOUT:-240}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
+
+try_27b_pair() {
+    local label="$1"
+    local target="$2"
+    local draft="$3"
+    if [ -f "$target" ] && [ -f "$draft" ]; then
+        PAIR_27B="$label"
+        TARGET_27B="$target"
+        DRAFT_27B="$draft"
+        return 0
+    fi
+    return 1
+}
+
+select_27b_pair() {
+    try_27b_pair "qwen3.6-27b-mq4+dflash" \
+        "$MODELS_DIR/qwen3.6-27b-mq4.hfq" \
+        "$DFLASH_DIR/qwen3.6-27b-mq4.dflash.hfq" && return 0
+    try_27b_pair "qwen3.5-27b-mq4+dflash" \
+        "$MODELS_DIR/qwen3.5-27b-mq4.hfq" \
+        "$DFLASH_DIR/qwen3.5-27b-mq4.dflash.hfq" && return 0
+    try_27b_pair "qwen3.6-27b-mq3+dflash" \
+        "$MODELS_DIR/qwen3.6-27b-mq3.hfq" \
+        "$DFLASH_DIR/qwen3.6-27b-mq3.dflash.hfq" && return 0
+    try_27b_pair "qwen3.5-27b-mq3+dflash" \
+        "$MODELS_DIR/qwen3.5-27b-mq3.hfq" \
+        "$DFLASH_DIR/qwen3.5-27b-mq3.dflash.hfq" && return 0
+    return 1
+}
+
+select_27b_pair || true
 
 # ── Rebuild dflash_spec_demo if any relevant source is newer ──────────────
 rebuild=0
@@ -157,6 +188,9 @@ hard_errors=0
     echo "- date:   $(date -Iseconds)"
     echo "- mode:   $( [ "$FAST" -eq 1 ] && echo fast || ( [ "$FULL" -eq 1 ] && echo full || echo short ) )"
     echo "- kv_mode: q8"
+    echo "- pair:   ${PAIR_27B:-not found}"
+    echo "- models_dir: $MODELS_DIR"
+    echo "- dflash_dir: $DFLASH_DIR"
     echo "- target: $TARGET_27B"
     echo "- draft:  $DRAFT_27B"
     echo
@@ -173,9 +207,12 @@ if [ ! -f "$TARGET_27B" ] || [ ! -f "$DRAFT_27B" ]; then
         echo
         echo "- target present: $( [ -f "$TARGET_27B" ] && echo yes || echo no )"
         echo "- draft present:  $( [ -f "$DRAFT_27B" ] && echo yes || echo no )"
+        echo "- models_dir: $MODELS_DIR"
+        echo "- dflash_dir: $DFLASH_DIR"
         echo
-        echo "DFlash/DDTree coherence skipped. Re-stage models or set"
-        echo "\`HIPFIRE_MODELS_DIR\` and re-run."
+        echo "DFlash/DDTree coherence skipped. Re-stage target models under"
+        echo "\`HIPFIRE_MODELS_DIR\` and DFlash sidecars under \`HIPFIRE_DFLASH_DIR\`,"
+        echo "or use the default \`$HIPFIRE_HOME/models\` and \`$HIPFIRE_HOME/drafts\`."
     } >> "$OUT"
     echo "coherence-gate-dflash: 27B models not present, skipping (no hard error)"
     echo "report: $OUT"

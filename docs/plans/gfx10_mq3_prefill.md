@@ -240,7 +240,7 @@ the eyeball matrix (`paris/sheep/code/awq` from
 (4.18×)** vs the pre-batched scalar baseline.
 
 KLD eval at n=30, KV=Q8 on
-`/data/hipfire/qwen3.5-9b.mq3-awq-gptq-f2-lmhead-a100.hfq`:
+`/data/hipfire/qwen3.5-9b-awq-gptq-f2-lmhead-a100-mq3.hfq`:
 slice-mean KLD = 0.191693, PPL = 9.9466 — healthy (Phase 1 baseline
 at n=256 was KLD 0.219, PPL 9.93; n=30 is a smaller sample so not
 directly comparable, but the magnitude confirms no regression).

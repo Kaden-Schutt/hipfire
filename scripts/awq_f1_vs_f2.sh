@@ -18,7 +18,7 @@ IMATRIX=benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.imatrix.gguf
 KLDREF=/data/hipfire/qwen3.5-9b-bf16.kldref.bin
 QUANT_BIN=target/release/hipfire-quantize
 EVAL_BIN=target/release/examples/eval_hipfire
-QUANT_SLOT=/local/hipfire/qwen3.5-9b.mq4-awq-current
+QUANT_SLOT=/local/hipfire/qwen3.5-9b-awq-current-mq4.hfq
 
 ALPHA=${ALPHA:-0.55}
 MAX_CHUNKS=${MAX_CHUNKS:-256}

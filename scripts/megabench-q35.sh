@@ -116,16 +116,16 @@ echo "Detected VRAM: ${VRAM_MB}MB" >&2
 # Model list with minimum VRAM requirement in MB
 # Format: filename:label:min_vram_mb
 QWEN35_MODELS=(
-    "qwen3.5-0.8b.q4.hfq:0.8B-Q4:1024"
-    "qwen3.5-0.8b.hfq6.hfq:0.8B-HFQ6:1024"
-    "qwen3.5-2b.q4.hfq:2B-Q4:2048"
-    "qwen3.5-2b.hfq6.hfq:2B-HFQ6:2560"
-    "qwen3.5-4b.q4.hfq:4B-Q4:3584"
-    "qwen3.5-4b.hfq6.hfq:4B-HFQ6:4608"
-    "qwen3.5-9b.q4.hfq:9B-Q4:6144"
-    "qwen3.5-9b.hfq6.hfq:9B-HFQ6:8192"
-    "qwen3.5-27b.q4.hfq:27B-Q4:15360"
-    "qwen3.5-27b.hfq6.hfq:27B-HFQ6:22528"
+    "qwen3.5-0.8b-hf4.hfq:0.8B-Q4:1024"
+    "qwen3.5-0.8b-hf6.hfq:0.8B-HFQ6:1024"
+    "qwen3.5-2b-hf4.hfq:2B-Q4:2048"
+    "qwen3.5-2b-hf6.hfq:2B-HFQ6:2560"
+    "qwen3.5-4b-hf4.hfq:4B-Q4:3584"
+    "qwen3.5-4b-hf6.hfq:4B-HFQ6:4608"
+    "qwen3.5-9b-hf4.hfq:9B-Q4:6144"
+    "qwen3.5-9b-hf6.hfq:9B-HFQ6:8192"
+    "qwen3.5-27b-hf4.hfq:27B-Q4:15360"
+    "qwen3.5-27b-hf6.hfq:27B-HFQ6:22528"
 )
 
 echo "## Phase 1: Speed + Coherence (Q8 KV, --no-think)" | tee -a "$RESULTS"
@@ -164,8 +164,8 @@ echo "| Model | KV Mode | tok/s | tokens | coherence |" | tee -a "$RESULTS"
 echo "|-------|---------|-------|--------|-----------|" | tee -a "$RESULTS"
 
 KV_TEST_MODELS=(
-    "qwen3.5-4b.q4.hfq:4B-Q4"
-    "qwen3.5-9b.q4.hfq:9B-Q4"
+    "qwen3.5-4b-hf4.hfq:4B-Q4"
+    "qwen3.5-9b-hf4.hfq:9B-Q4"
 )
 KV_MODES=(
     ":Q8 (default)"
@@ -196,7 +196,7 @@ echo "" | tee -a "$LONG_RESULTS"
 echo "| Model | KV Mode | tok/s | tokens | coherence |" | tee -a "$LONG_RESULTS"
 echo "|-------|---------|-------|--------|-----------|" | tee -a "$LONG_RESULTS"
 
-LONG_CTX_MODEL="$MODELS_DIR/qwen3.5-4b.q4.hfq"
+LONG_CTX_MODEL="$MODELS_DIR/qwen3.5-4b-hf4.hfq"
 if [ -f "$LONG_CTX_MODEL" ]; then
     for kv_entry in "${KV_MODES[@]}"; do
         flags="${kv_entry%%:*}"
@@ -209,7 +209,7 @@ else
 fi
 
 # Also test 9B with long context
-LONG_CTX_9B="$MODELS_DIR/qwen3.5-9b.q4.hfq"
+LONG_CTX_9B="$MODELS_DIR/qwen3.5-9b-hf4.hfq"
 if [ -f "$LONG_CTX_9B" ]; then
     for kv_entry in "" "--turbo4:Turbo4" "--asym:Asym (Q8K+T4V)"; do
         [ -z "$kv_entry" ] && continue

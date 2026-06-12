@@ -65,19 +65,19 @@ extract_accepted()  { grep -Eo 'accepted: [0-9]+' "$1" | tail -1 || echo "?"; }
 
 # ── Config ─────────────────────────────────────────────────────────
 declare -A MODELS=(
-    [4b]="$HOME_MODELS/qwen3.5-4b.mq4"
-    [9b]="$HOME_MODELS/qwen3.5-9b.mq4"
-    [27b]="$HOME_MODELS/qwen3.5-27b.mq4"
+    [4b]="$HOME_MODELS/qwen3.5-4b-mq4.hfq"
+    [9b]="$HOME_MODELS/qwen3.5-9b-mq4.hfq"
+    [27b]="$HOME_MODELS/qwen3.5-27b-mq4.hfq"
 )
 declare -A DRAFTS=(
-    [4b]="$BRANCH_MODELS/qwen35-4b-dflash-mq4.hfq"
-    [9b]="$BRANCH_MODELS/qwen35-9b-dflash-mq4.hfq"
-    [27b]="$HOME_MODELS/qwen35-27b-dflash-mq4.hfq"
+    [4b]="$BRANCH_MODELS/qwen3.5-4b-mq4.dflash.hfq"
+    [9b]="$BRANCH_MODELS/qwen3.5-9b-mq4.dflash.hfq"
+    [27b]="$HOME_MODELS/qwen3.5-27b-mq4.dflash.hfq"
 )
 declare -A SIDECARS=(
-    [4b]="$HOME_MODELS/qwen3.5-4b.mq4.triattn.bin"
-    [9b]="$HOME_MODELS/qwen3.5-9b.mq4.triattn.bin"
-    [27b]="$HOME_MODELS/qwen3.5-27b.mq4.triattn.bin"
+    [4b]="$HOME_MODELS/qwen3.5-4b-mq4.triattn.hfq"
+    [9b]="$HOME_MODELS/qwen3.5-9b-mq4.triattn.hfq"
+    [27b]="$HOME_MODELS/qwen3.5-27b-mq4.triattn.hfq"
 )
 
 # ── Run ────────────────────────────────────────────────────────────

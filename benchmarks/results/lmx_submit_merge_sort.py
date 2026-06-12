@@ -34,12 +34,12 @@ SIZE_TO_HFID = {
     "27b": "Qwen/Qwen3.5-27B",
 }
 SIZE_TO_DRAFT = {
-    "9b":  "qwen35-9b-dflash-mq4.hfq",
-    "27b": "qwen35-27b-dflash.mq4",
+    "9b":  "qwen3.5-9b-mq4.dflash.hfq",
+    "27b": "qwen3.5-27b-mq4.dflash.hfq",
 }
 SIZE_TO_TARGET = {
-    "9b":  "qwen3.5-9b.mq4",
-    "27b": "qwen3.5-27b.mq4",
+    "9b":  "qwen3.5-9b-mq4.hfq",
+    "27b": "qwen3.5-27b-mq4.hfq",
 }
 
 
@@ -134,7 +134,7 @@ def main():
             "specDecoding": True,
             "specMethod": "DFlash",
             "specBlockSize": 16,
-            "specModel": f"hipfire-qwen3.5-{args.size}-dflash-mq4",
+            "specModel": f"hipfire-qwen3.5-{args.size}-mq4.dflash",
             "promptNormalize": True,
             "thinking": "off",
             "prefillTokSPerSec": median["prefill_tok_s"],

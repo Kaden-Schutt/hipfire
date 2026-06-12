@@ -27,10 +27,10 @@ if [ ! -x "$EXE" ]; then
 fi
 
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
-TARGET_35="$MODELS_DIR/qwen3.5-27b.mq4"
-TARGET_36="$MODELS_DIR/qwen3.6-27b.mq4"
-DRAFT_35="$MODELS_DIR/qwen35-27b-dflash-mq4.hfq"
-DRAFT_36="$MODELS_DIR/qwen36-27b-dflash-mq4.hfq"
+TARGET_35="$MODELS_DIR/qwen3.5-27b-mq4.hfq"
+TARGET_36="$MODELS_DIR/qwen3.6-27b-mq4.hfq"
+DRAFT_35="$MODELS_DIR/qwen3.5-27b-mq4.dflash.hfq"
+DRAFT_36="$MODELS_DIR/qwen3.6-27b-mq4.dflash.hfq"
 
 PROMPT_LRU=benchmarks/prompts/lru_cache_pep8_strict.txt
 PROMPT_HE0=benchmarks/prompts/humaneval_0_has_close_elements.txt
@@ -48,12 +48,12 @@ done
 echo "## Reproducibility metadata"
 echo "- commit:       $(git rev-parse HEAD)"
 echo "- binary md5:   $(md5sum "$EXE" | awk '{print $1}')"
-echo "- target 3.5:   $(md5sum "$TARGET_35" | awk '{print $1}')  qwen3.5-27b.mq4"
-echo "- draft 3.5:    $(md5sum "$DRAFT_35"  | awk '{print $1}')  qwen35-27b-dflash-mq4"
+echo "- target 3.5:   $(md5sum "$TARGET_35" | awk '{print $1}')  qwen3.5-27b-mq4.hfq"
+echo "- draft 3.5:    $(md5sum "$DRAFT_35"  | awk '{print $1}')  qwen3.5-27b-mq4.dflash"
 [ -f "$TARGET_36" ] && \
-echo "- target 3.6:   $(md5sum "$TARGET_36" | awk '{print $1}')  qwen3.6-27b.mq4"
+echo "- target 3.6:   $(md5sum "$TARGET_36" | awk '{print $1}')  qwen3.6-27b-mq4.hfq"
 [ -f "$DRAFT_36" ] && \
-echo "- draft 3.6:    $(md5sum "$DRAFT_36"  | awk '{print $1}')  qwen36-27b-dflash-mq4"
+echo "- draft 3.6:    $(md5sum "$DRAFT_36"  | awk '{print $1}')  qwen3.6-27b-mq4.dflash"
 echo "- prompt md5:   $(md5sum "$PROMPT_LRU" | awk '{print $1}')  $(basename $PROMPT_LRU)"
 echo "- prompt md5:   $(md5sum "$PROMPT_HE0" | awk '{print $1}')  $(basename $PROMPT_HE0)"
 echo "- arch:         $(rocminfo 2>/dev/null | grep -E '^\s+Name:\s+gfx' | head -1 | awk '{print $2}')"

@@ -1,4 +1,4 @@
-[1/5] opening HFQ: /mnt/nas/kaden/models/qwen2-1.5b.arch7.q8.hfq
+[1/5] opening HFQ: /mnt/nas/kaden/models/qwen2-1.5b-arch7-q8.hfq
       arch_id (header) = 7
 [2/5] parsing Qwen2Config
       hidden=1536, layers=28, n_heads=12, n_kv_heads=2, head_dim=128, vocab=151936, attention_bias=true, tie_word_embeddings=true, eos_ids=[151645]

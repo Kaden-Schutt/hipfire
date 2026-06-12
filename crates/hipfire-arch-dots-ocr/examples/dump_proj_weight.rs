@@ -4,7 +4,7 @@
 //!
 //! Usage:
 //!   cargo run --release --example dump_proj_weight -p hipfire-arch-dots-ocr -- \
-//!     --hfq ~/.hipfire/models/dots-ocr.q8.hfq \
+//!     --hfq ~/.hipfire/models/dots-ocr-q8.hfq \
 //!     --block 1 \
 //!     --out /tmp/proj_w_block_01.npy
 

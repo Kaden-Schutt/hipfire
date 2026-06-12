@@ -101,7 +101,7 @@ Adapting to standalone-drafter distillation needs:
    (use existing 0.8B / 9B DeltaNet drafter shape)
 2. Adjust loss target from multi-token-ahead to next-token-argmax
    (or KLD against full softmax for higher-fidelity training)
-3. Add a convert-PyTorch-state-dict-to-.mq4/.hfq step at the end so
+3. Add a convert-PyTorch-state-dict-to--mq4.hfq/.hfq step at the end so
    the trained drafter drops into the existing DFlash dispatch
 
 Estimated wall-clock on hiptrx (4× R9700): **~1 week focused work**.
@@ -163,7 +163,7 @@ papers:
    session logs (ChatML-wrapped), distillation = target argmax-or-KLD,
    loss = TVD++.
 
-4. **Quantize trained drafter back to .mq4 / DeltaNet arch=20.**
+4. **Quantize trained drafter back to -mq4.hfq / DeltaNet arch=20.**
    Validate via coherence-gate + canonical bench. Expected: prose τ
    recovers from ~3.5 to ~6-7. Code τ probably unchanged (was already
    near ceiling).
@@ -188,8 +188,8 @@ papers:
 ## Empirical validation on 7900 XTX (2026-05-15, late afternoon)
 
 Bench run on k9lin (Sapphire Nitro+ 7900 XTX, gfx1100) directly testing
-the hypothesis above. Same `qwen3.5-27b.mq4` target +
-`qwen35-27b-dflash.mq4` drafter, max=120, kv-mode=asym3.
+the hypothesis above. Same `qwen3.5-27b-mq4.hfq` target +
+`qwen3.5-27b-mq4.dflash.hfq` drafter, max=120, kv-mode=asym3.
 
 ### Code prompt (`benchmarks/prompts/lru_cache_pep8_strict.txt`, md5 df5dedc)
 

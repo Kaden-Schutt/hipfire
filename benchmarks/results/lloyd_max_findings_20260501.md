@@ -105,6 +105,6 @@ follow-up; quality win justifies shipping the slower decoder first.
 
 ## Quantize artifacts (ephemeral, NOT committed, NOT shipped to HF)
 
-- `~/.hipfire/models/qwen3.5-{0.8b,4b,9b}.mq3-lloyd` (~480 MB / 2.1 GB / 4.6 GB)
-- `~/.hipfire/models/qwen3.5-{0.8b,4b,9b}.mq2-lloyd` (~424 MB / 1.7 GB / 3.3 GB)
-- `~/.hipfire/models/qwen3.5-{0.8b,9b}.mq2` (uniform MQ2 baseline)
+- `~/.hipfire/models/qwen3.5-{0.8b,4b,9b}-lloyd-mq3.hfq` (~480 MB / 2.1 GB / 4.6 GB)
+- `~/.hipfire/models/qwen3.5-{0.8b,4b,9b}-lloyd-mq2.hfq` (~424 MB / 1.7 GB / 3.3 GB)
+- `~/.hipfire/models/qwen3.5-{0.8b,9b}-mq2.hfq` (uniform MQ2 baseline)

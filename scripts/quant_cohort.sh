@@ -34,7 +34,7 @@
 # variant-spec.tsv format (tab-separated; one row per variant):
 #   <variant-name>  <hfq-path>  <arch>
 # Example:
-#   qwen35-9b-mq4-uniform  /local/hipfire/qwen3.5-9b.mq4         gfx906
+#   qwen35-9b-mq4-uniform  /local/hipfire/qwen3.5-9b-mq4.hfq         gfx906
 #   qwen35-9b-mfp4         /local/hipfire/qwen3.5-9b.mfp4        gfx906
 #   qwen35-9b-hfp4         /local/hipfire/qwen3.5-9b.hfp4        gfx906
 #

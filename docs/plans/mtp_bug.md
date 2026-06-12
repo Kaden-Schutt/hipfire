@@ -8,7 +8,7 @@ exonerated. The defect is in the native-MTP accept/verify path.
 ## TL;DR
 
 `mtp_only_demo` (native-MTP spec-decode) produces **incoherent greedy output**
-that derails into a token attractor after ~30 tokens, on `qwen3.6-27b.mq4`
+that derails into a token attractor after ~30 tokens, on `qwen3.6-27b-mq4.hfq`
 (a known-good AWQ+GPTQ trunk). Pure AR greedy and DFlash spec-decode on the
 **same trunk, same post-merge code, same greedy settings** are **fully
 coherent**. Since MTP greedy is supposed to be **lossless** (commit only the
@@ -37,7 +37,7 @@ signature.
 
 ## What was ruled out (with evidence)
 
-All runs greedy (temp=0) on `/local/hipfire/qwen3.6-27b.mq4`, LRU + simple prompts.
+All runs greedy (temp=0) on `/local/hipfire/qwen3.6-27b-mq4.hfq`, LRU + simple prompts.
 
 | hypothesis | test | result |
 |---|---|---|
@@ -119,13 +119,13 @@ accept/commit wiring.
 # pure AR (coherent baseline) — current daemon, greedy:
 cargo build --release --example daemon --features deltanet
 printf '%s\n' \
-  '{"type":"load","model":"/local/hipfire/qwen3.6-27b.mq4","params":{"max_seq":4096}}' \
+  '{"type":"load","model":"/local/hipfire/qwen3.6-27b-mq4.hfq","params":{"max_seq":4096}}' \
   '{"type":"generate","id":"r1","prompt":"What is the capital of France? Answer in one sentence.","temperature":0.0,"max_tokens":40,"repeat_penalty":1.0}' \
   '{"type":"unload"}' | ./target/release/examples/daemon
 
 # native MTP (derails):
 ./target/release/examples/mtp_only_demo \
-  --target /local/hipfire/qwen3.6-27b.mq4 \
+  --target /local/hipfire/qwen3.6-27b-mq4.hfq \
   --mtp-head /local/hipfire/qwen3.6-27b-full.mtp \
   --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt --max 120 --no-chatml
 ```

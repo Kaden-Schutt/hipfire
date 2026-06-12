@@ -11,7 +11,7 @@
 //! Greedy / temp=0 only.
 //!
 //! Usage:
-//!   dflash_mtp_tree_demo --target <trunk.mq4> --drafter <drafter.hfq> \
+//!   dflash_mtp_tree_demo --target <trunk-mq4.hfq> --drafter <drafter.hfq> \
 //!                        --mtp-head <head.mtp> \
 //!                        (--prompt "..." | --prompt-file <path>) \
 //!                        [--max 120] [--temp 0] [--dflash-b 16] [--mtp-k 2] \
@@ -109,7 +109,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: dflash_mtp_tree_demo --target <trunk.mq4> --drafter <drafter.hfq> \\\n\
+                    "Usage: dflash_mtp_tree_demo --target <trunk-mq4.hfq> --drafter <drafter.hfq> \\\n\
                      \t--mtp-head <head.mtp> \\\n\
                      \t(--prompt \"...\" | --prompt-file <path>) \\\n\
                      \t[--max 120] [--temp 0] [--dflash-b 16] [--mtp-k 2] \\\n\

@@ -29,6 +29,9 @@ Rules:
 - Use `+feature` only when bundled: `mq4+mtp`, `mq4+dflash`.
 - Use role sidecars when loaded independently: `.mtp.hfq`, `.dflash.hfq`, `.triattn.hfq`.
 - Use `.triattn.hfq` for TriAttention sidecars even though they are not weight tensors; do not introduce `.triattn.bin` for new files.
+- Do not use dotted quant artifact suffixes. The quant token belongs before
+  the `.hfq` extension with a hyphen separator; Lloyd MQ2 uses
+  `-lloyd-mq2.hfq`.
 - When a script, gate, registry, or doc is found using an older artifact spelling,
   update it to the canonical naming convention as part of the fix.
 - Backwards compatibility is a separate, explicit decision: add legacy-name

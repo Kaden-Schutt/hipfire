@@ -32,7 +32,7 @@ compatible with Lloyd's per-row codebook decode.
 3. **gfx1151 9B Lloyd-MQ4 prefill / uniform-MQ4 prefill ≥ 60 %.** Current floor is 41.5 % (devlog 2026-05-09). Hitting 60 % means matching gfx1100's 9B ship gate on bandwidth-bound hardware — closing the cross-arch ratio gap.
 4. **gfx1100 9B Lloyd-MQ4 prefill / uniform-MQ4 prefill: no regression vs current 60.6 %.** D's tile shape is wider; if anything, gfx1100 should also gain (less L2 churn from duplicate fetches).
 5. No decode regression on the per-token forward path (Lloyd's GEMV decode is untouched by D; verify with `probe_commits.sh` against PR #197 HEAD).
-6. Coherence-gate row green for `qwen3.5-9b.mq4-lloyd` on both gfx1100 and gfx1151.
+6. Coherence-gate row green for `qwen3.5-9b-lloyd-mq4.hfq` on both gfx1100 and gfx1151.
 
 Acceptance criterion 3 is the load-bearing one. Criteria 1, 2, 5, 6 are guard rails.
 
@@ -153,7 +153,7 @@ D-B ship gate: the four-kernel set (residual + 3 fused) collectively reaches the
 1. Wire the `_mb4` kernels into `is_batchable_la` and the LA/FA matchers in `qwen35.rs`. **Threshold-gated dispatch**: route to `_mb4` when `batch_size ≥ 64`, fall through to the existing `_wmma` family otherwise. Pattern follows HFQ4's WMMA-vs-mmq path selection.
 2. The captured-path corruption-prevention guards already cover MQ4-Lloyd in dense and refuse it in MoE. Extend the LA/FA matchers to dispatch `_mb4` over `_wmma` only when the batch-size-gate fires; the guards remain unchanged. Adding `_mb4` does not widen the corruption surface — the stride is unchanged at 160 B/group.
 3. Cross-process A/B bench identical to PR #197 Phase C: 3 invocations × 2 models (uniform + Lloyd) × 2 sizes (4B + 9B) on gfx1151. Add a gfx1100 row for non-regression confirmation.
-4. Coherence-gate green on both gfx1100 and gfx1151 with `qwen3.5-9b.mq4-lloyd`.
+4. Coherence-gate green on both gfx1100 and gfx1151 with `qwen3.5-9b-lloyd-mq4.hfq`.
 
 ## Out of scope (deferred)
 

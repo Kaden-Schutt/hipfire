@@ -14,7 +14,7 @@ Inputs:
                                                                        if variant contains
                                                                        "gguf-", else
                                                                        "per-token")
-                         e.g., qwen3.5-9b.mq3__gfx1100__prefill.kldseq
+                         e.g., qwen3.5-9b-mq3.hfq__gfx1100__prefill.kldseq
                                qwen3.5-9b.gguf-q4_k_m__gfx1151.kldseq
 
 Output:
@@ -73,7 +73,7 @@ def parse_filename(name: str) -> tuple[str, str, str]:
     """Returns (variant, arch, scoring_mode).
 
     Preferred form (3 fields): <variant>__<arch>__<scoring_mode>.kldseq
-      e.g. qwen3.5-9b.mq3__gfx1100__prefill.kldseq
+      e.g. qwen3.5-9b-mq3.hfq__gfx1100__prefill.kldseq
 
     Legacy form (2 fields): <variant>__<arch>.kldseq
       Auto-tagged: scoring_mode="gguf" if "gguf" in variant else "per-token".

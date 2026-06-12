@@ -10,7 +10,7 @@ rev-3.2 §"Tokenizer alignment + bridge investigation").
 
 Usage:
   python3 tokenizer_parity.py \\
-    --hipfire-hfq    <path-to-qwen3.5-9b.mq4 or similar .hfq>  \\
+    --hipfire-hfq    <path-to-qwen3.5-9b-mq4.hfq or similar .hfq>  \\
     --llamacpp-gguf  <path-to-qwen3.5-9b-bf16.gguf>            \\
     --slice          <path-to-slice.txt>                       \\
     [--llama-tokenize-bin <path>=llama-tokenize]               \\

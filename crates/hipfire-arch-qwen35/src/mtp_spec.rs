@@ -2120,7 +2120,7 @@ pub fn spec_step_mtp_compressed_serial(
     //     32K compressed vocab, which dilutes top-1 prob signal (compresses
     //     the distribution shape) and breaks --mtp-p-min.
     //
-    //   full-vocab (bundled .mq4-mtp): use the trunk's own output (lm_head)
+    //   full-vocab (bundled -mq4+mtp.hfq): use the trunk's own output (lm_head)
     //     directly as the draft head. Per-step GEMV is larger (~0.69 ms BW)
     //     but the softmax is over the real 248K vocab — top-1 prob is the
     //     true confidence the trunk would see, and the argmax id IS the
@@ -2129,7 +2129,7 @@ pub fn spec_step_mtp_compressed_serial(
     //     This is the architecture Unsloth/llama.cpp #22673 ship.
     //
     // Mode is selected by whether the loaded head carries a compressed sidecar.
-    // Bundled .mq4-mtp files drop the sidecar; load_mtp_head_bundled returns
+    // Bundled -mq4+mtp.hfq files drop the sidecar; load_mtp_head_bundled returns
     // a head with lm_head_draft: None.
     let use_full_vocab = head.weights.lm_head_draft.is_none();
     let (vocab_map_opt, cvs): (Option<&Vec<u32>>, usize) = if use_full_vocab {
@@ -3310,7 +3310,7 @@ fn drafter_embed_lookup(
 // on the critical path).
 //
 // V1 limits inherited from `_hetero`:
-// - compressed-sidecar lm_head_draft path only (bundled full-vocab .mq4-mtp
+// - compressed-sidecar lm_head_draft path only (bundled full-vocab -mq4+mtp.hfq
 //   would need a trunk.output mirror; daemon load gates the head shape)
 // - greedy-only (temp = 0)
 // - no p_min early-exit
@@ -3342,7 +3342,7 @@ pub fn spec_step_mtp_compressed_serial_multi(
     // V1: compressed-sidecar path only (same constraint as _hetero).
     let lm_head_draft = head.weights.lm_head_draft.as_ref().expect(
         "spec_step_mtp_compressed_serial_multi: head has no lm_head_draft sidecar; \
-                 v1 requires the cvs-compressed .mtp path (bundled full-vocab .mq4-mtp \
+                 v1 requires the cvs-compressed .mtp path (bundled full-vocab -mq4+mtp.hfq \
                  needs trunk.output mirror, not implemented)",
     );
     let cvs = head

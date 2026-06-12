@@ -56,7 +56,7 @@ mostly long-form prose.
 | `mtp_k` | 3 | 1–10 | Draft tokens per spec-decode window. Higher = more parallelism, lower acceptance probability per draft step. |
 
 `auto` discovers MTP weights from `<model>-mtp.*` sibling files (e.g.
-`deepseek-v4-flash-mtp.mq2lloyd` alongside the main `.mq2lloyd`). Set `off`
+`deepseek-v4-flash-mtp-lloyd-mq2.hfq` alongside the main `-lloyd-mq2.hfq`). Set `off`
 to skip the sibling scan entirely and use plain AR decode.
 
 Per-model override:
@@ -126,11 +126,11 @@ auto-attached.
 
 ```bash
 # After pushing your model to ~/.hipfire/models/:
-hipfire sidecar-gen ~/.hipfire/models/my-finetune.mq4 --corpus /path/to/corpus.txt
+hipfire sidecar-gen ~/.hipfire/models/my-finetune-mq4.hfq --corpus /path/to/corpus.txt
 ```
 
 The generated file is placed next to the model by default, for example
-`my-finetune.mq4.triattn.hfq`.
+`my-finetune-mq4.triattn.hfq`.
 The daemon auto-discovers the canonical `.triattn.hfq` name and still
 accepts legacy `.triattn*.bin` sidecars.
 See [CLI.md](CLI.md) for full `sidecar-gen` flag details and
@@ -292,13 +292,13 @@ CLI usage:
 ```bash
 # Global default
 hipfire config set prefill_compression auto
-hipfire config set prefill_drafter ~/.hipfire/models/qwen3-0.6b.hf4
+hipfire config set prefill_drafter ~/.hipfire/models/qwen3-0.6b-hf4.hfq
 
 # Per-target override (recommended -- different drafters per target).
 # CLI shape: `hipfire config <model-tag> set <key> <value>` (the tag
 # slots in BEFORE the action, matching the existing cask / dflash UX).
 hipfire config qwen3.5:9b set prefill_compression auto
-hipfire config qwen3.5:9b set prefill_drafter ~/.hipfire/models/qwen3-0.6b.hf4
+hipfire config qwen3.5:9b set prefill_drafter ~/.hipfire/models/qwen3-0.6b-hf4.hfq
 
 # Per-request env override (research / one-shot benchmarking)
 HIPFIRE_PREFILL_COMPRESSION=always \
@@ -364,6 +364,6 @@ HIPFIRE_GRAPH=1                     # hipGraph capture (debug; AR-only, may degr
 HIPFIRE_PREFILL_COMPRESSION=auto    # PFlash mode: off|auto|always (#93)
 HIPFIRE_PREFILL_THRESHOLD=32768     # PFlash auto-mode source-token cutoff
 HIPFIRE_PREFILL_KEEP_RATIO=0.05     # PFlash kept fraction in (0, 1]
-HIPFIRE_PREFILL_DRAFTER=~/.hipfire/models/qwen3-0.6b.hf4
+HIPFIRE_PREFILL_DRAFTER=~/.hipfire/models/qwen3-0.6b-hf4.hfq
 HIPFIRE_PREFILL_PROFILE=1           # PFlash per-stage timing logs
 ```

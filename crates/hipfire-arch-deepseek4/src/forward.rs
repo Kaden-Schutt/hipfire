@@ -6661,7 +6661,7 @@ fn ffn_batched(
     // Original gate at 256 was set 2026-05-22 (commit 29984e2) based on
     // theoretical "Gate 1 tile-fill" reasoning, never empirically swept
     // at lower batch sizes. 2026-05-26 PP_BATCH×gate sweep on
-    // deepseek-v4-flash.mq2lloyd (2100-token prompt, B=16..256, 3 trials
+    // deepseek-v4-flash-lloyd-mq2.hfq (2100-token prompt, B=16..256, 3 trials
     // per cell, fresh process) shows the actual crossover is between
     // B=64 (tied: 40.84 scalar vs 40.29 grouped) and B=128 (grouped wins
     // 46.02 vs 39.28 = +17.2%). Setting threshold at 128 captures the

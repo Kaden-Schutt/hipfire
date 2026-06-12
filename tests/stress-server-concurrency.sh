@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON="${DAEMON:-$ROOT/target/release/examples/daemon}"
-MODEL_A="${MODEL_A:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4.hfq}"
+MODEL_A="${MODEL_A:-$HOME/.hipfire/models/qwen3.5-0.8b-mq4.hfq}"
 MODEL_B="${MODEL_B:-}"
 REQUESTS="${HIPFIRE_STRESS_REQUESTS:-128}"
 CONCURRENCY="${HIPFIRE_STRESS_CONCURRENCY:-$REQUESTS}"

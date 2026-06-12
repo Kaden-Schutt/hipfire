@@ -25,7 +25,7 @@ export PATH=/opt/rocm-7.12/bin:$PATH
 export LD_LIBRARY_PATH=/opt/rocm-7.12/lib:${LD_LIBRARY_PATH:-}
 
 DAEMON="${HIPFIRE_DAEMON:-$HOME/.hipfire/bin/daemon}"
-MODEL="${HIPFIRE_MODEL:-/local/hipfire/qwen3.6-35b-a3b.mq4}"
+MODEL="${HIPFIRE_MODEL:-/local/hipfire/qwen3.6-35b-a3b-mq4.hfq}"
 PROMPT='A train leaves Station A traveling at 60 km/h. Two hours later, a second train leaves Station A on the same track traveling at 90 km/h. How long after the second train departs will it catch up to the first? Show your reasoning step by step.'
 OUT_DIR="/tmp/pr228-spiral-check-$$"
 mkdir -p "$OUT_DIR"

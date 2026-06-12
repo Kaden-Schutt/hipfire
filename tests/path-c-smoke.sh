@@ -28,7 +28,7 @@
 #
 # Usage:
 #   ./tests/path-c-smoke.sh                    # auto-detect models
-#   TARGET=/path/to/t.mq4 DRAFT=/path/to/d.hfq ./tests/path-c-smoke.sh
+#   TARGET=/path/to/t-mq4.hfq DRAFT=/path/to/d.hfq ./tests/path-c-smoke.sh
 #
 # Exit codes:
 #   0  smoke ran clean
@@ -57,12 +57,12 @@ MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 TARGET="${TARGET:-}"
 DRAFT="${DRAFT:-}"
 if [ -z "$TARGET" ]; then
-    for cand in "$MODELS_DIR/qwen3.6-27b.mq4" "$MODELS_DIR/qwen3.5-27b.mq4"; do
+    for cand in "$MODELS_DIR/qwen3.6-27b-mq4.hfq" "$MODELS_DIR/qwen3.5-27b-mq4.hfq"; do
         [ -f "$cand" ] && TARGET="$cand" && break
     done
 fi
 if [ -z "$DRAFT" ]; then
-    for cand in "$MODELS_DIR/qwen36-27b-dflash-mq4.hfq" "$MODELS_DIR/qwen35-27b-dflash.mq4"; do
+    for cand in "$MODELS_DIR/qwen3.6-27b-mq4.dflash.hfq" "$MODELS_DIR/qwen3.5-27b-mq4.dflash.hfq"; do
         [ -f "$cand" ] && DRAFT="$cand" && break
     done
 fi

@@ -4,7 +4,7 @@
 
 //! mtp_only_demo: standalone Qwen3.5 MTP-only spec-decode bench harness.
 //!
-//! Loads a Qwen3.5 trunk (.hfq / .mq4 / etc.) and a native MTP head (.mtp,
+//! Loads a Qwen3.5 trunk (.hfq / -mq4.hfq / etc.) and a native MTP head (.mtp,
 //! produced by `mtp_extract`, Task 8). Prefills the prompt, then loops
 //! `mtp_spec::spec_step_mtp` until N tokens committed or EOS. Prints τ +
 //! tok/s + prompt md5 + decoded output. v1 (greedy, --temp 0).
@@ -166,15 +166,15 @@ fn main() {
     }
 
     let target_path = target_path.expect("--target required");
-    // --mtp-head is optional when the target is a bundled .mq4-mtp file
-    // (the trailer points at the embedded MTP section). For plain .mq4
+    // --mtp-head is optional when the target is a bundled -mq4+mtp.hfq file
+    // (the trailer points at the embedded MTP section). For plain -mq4.hfq
     // targets it's required.
-    let target_is_bundle = target_path.ends_with(".mq4-mtp");
+    let target_is_bundle = target_path.ends_with("-mq4+mtp.hfq");
     let mtp_path = match (mtp_path, target_is_bundle) {
         (Some(p), _) => Some(p),
         (None, true) => None, // resolved from bundle below
         (None, false) => {
-            eprintln!("--mtp-head required for non-bundle .mq4 target (got '{target_path}')");
+            eprintln!("--mtp-head required for non-bundle -mq4.hfq target (got '{target_path}')");
             std::process::exit(2);
         }
     };
@@ -223,7 +223,7 @@ fn main() {
         "mtp-head:   {}",
         mtp_path
             .as_deref()
-            .unwrap_or("<bundled in target .mq4-mtp>")
+            .unwrap_or("<bundled in target -mq4+mtp.hfq>")
     );
     eprintln!("prompt md5: {prompt_hash}");
     eprintln!("max={max_tokens} ctx={ctx_capacity} max_n={max_n} chatml={chatml}");
@@ -262,11 +262,11 @@ fn main() {
         // Explicit --mtp-head: standalone .mtp file (legacy path).
         mtp_head::load_mtp_head(Path::new(mp), head_load_gpu, max_seq_total).expect("load mtp head")
     } else {
-        // Bundled .mq4-mtp: load MTP section embedded in target file.
+        // Bundled -mq4+mtp.hfq: load MTP section embedded in target file.
         mtp_head::load_mtp_head_bundled(Path::new(&target_path), head_load_gpu, max_seq_total)
             .expect("load bundled mtp head")
             .expect(
-                "target ends in .mq4-mtp but no MTP bundle trailer found; \
+                "target ends in -mq4+mtp.hfq but no MTP bundle trailer found; \
                      was the file produced by mq4_merge_mtp?",
             )
     };
@@ -274,7 +274,7 @@ fn main() {
     let head_source = if mtp_path.is_some() {
         "standalone .mtp"
     } else {
-        "bundled .mq4-mtp"
+        "bundled -mq4+mtp.hfq"
     };
     eprintln!("mtp head loaded in {:.2}s ({head_source}) — n_embd={} vocab={} n_rot={} rope_theta={} compressed_lm_head_draft={}",
               t_mtp.elapsed().as_secs_f64(),
@@ -364,7 +364,7 @@ fn main() {
     // Compressed mode: two sub-cases now:
     //   (a) Head has a compressed lm_head_draft sidecar (`compressed_vocab_size:
     //       Some`): allocate logits_compressed scratch + sub-batched scratch.
-    //   (b) Head has NO sidecar (e.g. bundled .mq4-mtp using full-vocab trunk
+    //   (b) Head has NO sidecar (e.g. bundled -mq4+mtp.hfq using full-vocab trunk
     //       lm_head): nothing to allocate; spec_step_mtp_compressed_serial
     //       branches internally on lm_head_draft.is_none() and uses the
     //       trunk's lm_head for the K-step draft GEMV. compressed-serial path

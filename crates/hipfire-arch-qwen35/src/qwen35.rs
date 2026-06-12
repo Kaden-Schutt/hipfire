@@ -12629,7 +12629,7 @@ fn trace_stage_sync_if_enabled(gpu: &Gpu, label: &str) -> HipResult<()> {
 /// Pre-fix this required ALL weights to be MQ4G256, which made every
 /// A3B model fall back to per-token prefill because router is universally
 /// Q8_0. Widening to accept Q8 router + Q8 shared_expert_gate unlocks
-/// uniform-MQ4 A3B variants (Qwen3.5-A3B, qwen3.6-35b-a3b-uniform.mq4).
+/// uniform-MQ4 A3B variants (Qwen3.5-A3B, qwen3.6-35b-a3b-uniform-mq4.hfq).
 /// Mixed-precision Qwen3.6-A3B uses the MQ6 branches when its MoE weights are
 /// quantized to MQ6G256.
 /// MoE FFN admit predicate for the batched prefill body
@@ -13757,7 +13757,7 @@ fn prefill_moe_ffn_body_batched(
     // to `gemm_hfq4g256_moe_grouped_wmma_k2` via the base w32 WMMA builtin,
     // gfx12 to the `_gfx12` variant). Empirical lift on Qwen3.5-A3B mq4
     // prefill=256: gfx1100 7900 XTX 1396 → 2983 tok/s (+114%); gfx1201
-    // R9700 1016 → 2966 tok/s (uniform.mq4, +192%). CDNA wave64 (gfx9*)
+    // R9700 1016 → 2966 tok/s (uniform-mq4.hfq, +192%). CDNA wave64 (gfx9*)
     // and pre-WMMA RDNA (gfx10*) stay on the per-token indexed_batched
     // GEMV path. Opt out with `HIPFIRE_MOE_GROUPED_GEMM=0`.
     // Cached read — getenv on every layer × MoE call adds up.

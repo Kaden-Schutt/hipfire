@@ -50,20 +50,20 @@ PYTHON=/home/kaden/miniforge3/envs/hipfire-rocm/bin/python
 ```bash
 ./target/release/hipfire-quantize \
   --input /home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a/ \
-  --output /home/kaden/.hipfire/models/qwen3.5-9b.mq4-awq-pr266-repro \
+  --output /home/kaden/.hipfire/models/qwen3.5-9b-awq-pr266-repro-mq4.hfq \
   --format mq4 --awq --awq-alpha 0.5 \
   --imatrix /home/kaden/.hipfire/imatrix/unsloth/Qwen3.5-9B-GGUF/imatrix_unsloth.gguf_file
 ```
 
 Verify the output:
 ```bash
-ls -lh /home/kaden/.hipfire/models/qwen3.5-9b.mq4-awq-pr266-repro
+ls -lh /home/kaden/.hipfire/models/qwen3.5-9b-awq-pr266-repro-mq4.hfq
 # Expected: ~5.0 GB (5314.8 MB written)
 
 # AWQ sidecar count should be 184 (F1 input-side scope):
 python3 -c "
 import os
-p='/home/kaden/.hipfire/models/qwen3.5-9b.mq4-awq-pr266-repro'
+p='/home/kaden/.hipfire/models/qwen3.5-9b-awq-pr266-repro-mq4.hfq'
 sz=os.path.getsize(p)
 print(open(p,'rb').read(min(50_000_000,sz)).count(b'.awq_scale.weight'))
 "
@@ -73,28 +73,28 @@ print(open(p,'rb').read(min(50_000_000,sz)).count(b'.awq_scale.weight'))
 
 ```bash
 $PYTHON scripts/mq4_masked_calib.py quantize \
-  --base /home/kaden/.hipfire/models/qwen3.5-9b.mq4-awq-pr266-repro \
+  --base /home/kaden/.hipfire/models/qwen3.5-9b-awq-pr266-repro-mq4.hfq \
   --source-dir /home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a \
   --mask ~/hipfire/.worktrees/paroquant/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/mask.json \
   --stats-npz ~/hipfire/.worktrees/paroquant/.codeinsight+research/astrea/mq4-gptq-9b-poc/20260515T-start/hessian-linear-c64-ctx256/stats-merged.npz \
-  --output /home/kaden/.hipfire/models/qwen3.5-9b.mq4-awq-pr266-gptq-v3 \
+  --output /home/kaden/.hipfire/models/qwen3.5-9b-awq-pr266-gptq-v3-mq4.hfq \
   --out /tmp/candidate-awq-gptq-v3.json \
   --method gptq --gptq-damp 0.01 --gptq-refit-iters 2 \
   --gpu 0 \
-  --awq-aware-hessian /home/kaden/.hipfire/models/qwen3.5-9b.mq4-awq-pr266-repro \
+  --awq-aware-hessian /home/kaden/.hipfire/models/qwen3.5-9b-awq-pr266-repro-mq4.hfq \
   --tensor-filter "lm_head,in_proj_a,in_proj_b,in_proj_qkv,in_proj_z,out_proj,mlp.,self_attn." \
   --skip-unsupported --progress-every 30
 ```
 
 Verify output:
 ```bash
-ls -lh /home/kaden/.hipfire/models/qwen3.5-9b.mq4-awq-pr266-gptq-v3
+ls -lh /home/kaden/.hipfire/models/qwen3.5-9b-awq-pr266-gptq-v3-mq4.hfq
 # Expected: ~5.0 GB (same disk as flat MQ4)
 
 # 184 sidecars preserved through GPTQ pass:
 python3 -c "
 import os
-p='/home/kaden/.hipfire/models/qwen3.5-9b.mq4-awq-pr266-gptq-v3'
+p='/home/kaden/.hipfire/models/qwen3.5-9b-awq-pr266-gptq-v3-mq4.hfq'
 sz=os.path.getsize(p)
 print(open(p,'rb').read(min(50_000_000,sz)).count(b'.awq_scale.weight'))
 "
@@ -105,7 +105,7 @@ print(open(p,'rb').read(min(50_000_000,sz)).count(b'.awq_scale.weight'))
 ```bash
 mkdir -p .codeinsight+research/repro-v3/per-seq
 ROCR_VISIBLE_DEVICES=0 ./target/release/examples/eval_hipfire \
-  --model /home/kaden/.hipfire/models/qwen3.5-9b.mq4-awq-pr266-gptq-v3 \
+  --model /home/kaden/.hipfire/models/qwen3.5-9b-awq-pr266-gptq-v3-mq4.hfq \
   --ref ~/hipfire/.worktrees/HIPa/benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin \
   --output .codeinsight+research/repro-v3/per-seq/v3-repro__gfx1201__prefill.kldseq \
   --kv-mode q8 --scoring-mode prefill --max-chunks 512
@@ -164,7 +164,7 @@ Best round = lowest KLD in `round_*/summary.md`. Final model = `round_<best>/mod
 
 After producing v3 or any iterative round model:
 ```bash
-./target/release/examples/test_inference /home/kaden/.hipfire/models/qwen3.5-9b.mq4-awq-pr266-gptq-v3
+./target/release/examples/test_inference /home/kaden/.hipfire/models/qwen3.5-9b-awq-pr266-gptq-v3-mq4.hfq
 # Expected: 9/9 PASS (finite logits, forward parity, ChatML, asym3 KV alloc, decode, VRAM drain)
 ```
 

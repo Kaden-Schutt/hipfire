@@ -22,7 +22,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 EXE="./target/release/examples/daemon"
-MODEL="${HIPFIRE_PP_MODEL:-/local/hipfire/qwen3.6-27b.mq4}"
+MODEL="${HIPFIRE_PP_MODEL:-/local/hipfire/qwen3.6-27b-mq4.hfq}"
 MTP_HEAD="${HIPFIRE_PP_MTP_HEAD:-/data/hipfire/qwen3.6-27b-cvs16384.mtp}"
 MAX="${HIPFIRE_BENCH_MAX:-256}"
 OUT="${HIPFIRE_BENCH_OUT:-/tmp/mtp-vs-ar-gfx906-$(date +%Y%m%d-%H%M%S).md}"

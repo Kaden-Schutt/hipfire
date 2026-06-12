@@ -22,7 +22,7 @@ LLAMA_BIN=$HOME/git/llm/llama.cpp/build/bin/llama-mtmd-cli
 MMPROJ=/data/models/unsloth/Qwen3.5-9B/mmproj-F16.gguf
 GGUF_Q4=/data/models/unsloth/Qwen3.5-9B/Qwen3.5-9B-Q4_K_M.gguf
 GGUF_Q8=/data/models/unsloth/Qwen3.5-9B/Qwen3.5-9B-Q8_0.gguf
-HIPFIRE_HFQ=$HOME/models-local/qwen3.5-9b.mq4-q8head-vision-f16-spliced.hfq
+HIPFIRE_HFQ=$HOME/models-local/qwen3.5-9b-q8head-vision-f16-spliced-mq4.hfq
 
 source $HOME/git/hipfire/scripts/gpu-lock.sh
 

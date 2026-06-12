@@ -39,11 +39,11 @@ fi
 
 # Test set: model basename | label | prompt | max_tokens
 TESTS=(
-    "qwen3.5-0.8b.mq4|cap-08|What is the capital of France? Answer in one short sentence.|80"
-    "qwen3.5-0.8b.mq4|reason-08|A farmer has 17 sheep. All but 9 die. How many are left?|160"
-    "qwen3.5-9b.mq4|cap-9|What is the capital of France? Answer in one short sentence.|80"
-    "qwen3.5-9b.mq4|reason-9|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|240"
-    "qwen3.5-9b.mq4|code-9|Write a one-line Python function named square that returns n*n.|180"
+    "qwen3.5-0.8b-mq4.hfq|cap-08|What is the capital of France? Answer in one short sentence.|80"
+    "qwen3.5-0.8b-mq4.hfq|reason-08|A farmer has 17 sheep. All but 9 die. How many are left?|160"
+    "qwen3.5-9b-mq4.hfq|cap-9|What is the capital of France? Answer in one short sentence.|80"
+    "qwen3.5-9b-mq4.hfq|reason-9|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|240"
+    "qwen3.5-9b-mq4.hfq|code-9|Write a one-line Python function named square that returns n*n.|180"
 )
 
 run_one() {

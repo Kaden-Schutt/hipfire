@@ -7,7 +7,7 @@
 //! `profile_prefill_qwen35.rs`.
 //!
 //! Usage:
-//!   profile_prefill_deepseek4 <model.mq2lloyd> [--prefill N] [--warmup N]
+//!   profile_prefill_deepseek4 <model-lloyd-mq2.hfq> [--prefill N] [--warmup N]
 //!                              [--pp-batch N] [--mtp-fill]
 //!                              [--gen N] [--no-profile]
 
@@ -28,7 +28,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: profile_prefill_deepseek4 <model.mq2lloyd> [--prefill N] [--warmup N] [--pp-batch N] [--mtp-fill]");
+        eprintln!("Usage: profile_prefill_deepseek4 <model-lloyd-mq2.hfq> [--prefill N] [--warmup N] [--pp-batch N] [--mtp-fill]");
         std::process::exit(1);
     }
     let model_path = &args[1];

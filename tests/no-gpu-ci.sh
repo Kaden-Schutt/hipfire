@@ -26,6 +26,9 @@ python3 -m pytest tests
 echo "== Env/docs drift check =="
 python3 scripts/check-env-docs.py
 
+echo "== Artifact naming check =="
+bash scripts/check-artifact-names.sh
+
 echo "== Eval smoke script syntax =="
 bash -n tests/smoke/eval-harness-nogpu-smoke.sh
 bash -n tests/smoke/eval-harness-gpu-smoke.sh

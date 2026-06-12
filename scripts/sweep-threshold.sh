@@ -11,7 +11,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/rocm-env.sh"
 
-MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b.mq4}"
+MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b-mq4.hfq}"
 EXE="target/release/examples/daemon"
 
 SYSTEM=$(python3 -c "import json; print(json.dumps(open('benchmarks/prompts/tool_call_system.txt').read()))")

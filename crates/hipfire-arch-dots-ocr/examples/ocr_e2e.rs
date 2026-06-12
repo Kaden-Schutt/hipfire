@@ -20,7 +20,7 @@
 //!     export PATH=/opt/rocm-7.12/bin:$PATH
 //!     export LD_LIBRARY_PATH=/opt/rocm-7.12/lib:$LD_LIBRARY_PATH
 //!     cargo run --release -p hipfire-arch-dots-ocr --example ocr_e2e -- \
-//!         --hfq ~/.hipfire/models/dots-ocr.q8.hfq \
+//!         --hfq ~/.hipfire/models/dots-ocr-q8.hfq \
 //!         --image benchmarks/images/dots_ocr_smoke_001.jpg \
 //!         --prompt-json benchmarks/references/dots_ocr_smoke_001.json \
 //!         --max-tokens 16384 > /tmp/our_ocr.txt

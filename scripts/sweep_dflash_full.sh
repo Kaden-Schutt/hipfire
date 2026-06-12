@@ -88,9 +88,9 @@ PY
 #   3.5 drafts trained on raw text → --no-chatml
 #   3.6 draft trained with ChatML → default
 MODELS=(
-  "9b-3.5|$MODELS_DIR/qwen3.5-9b.mq4|models/qwen35-9b-dflash-mq4.hfq|--no-chatml"
-  "27b-3.5|$MODELS_DIR/qwen3.5-27b.mq4|$MODELS_DIR/qwen35-27b-dflash.mq4|--no-chatml"
-  "27b-3.6|$MODELS_DIR/qwen3.6-27b.mq4|$MODELS_DIR/qwen36-27b-dflash-mq4-new.hfq|"
+  "9b-3.5|$MODELS_DIR/qwen3.5-9b-mq4.hfq|models/qwen3.5-9b-mq4.dflash.hfq|--no-chatml"
+  "27b-3.5|$MODELS_DIR/qwen3.5-27b-mq4.hfq|$MODELS_DIR/qwen3.5-27b-mq4.dflash.hfq|--no-chatml"
+  "27b-3.6|$MODELS_DIR/qwen3.6-27b-mq4.hfq|$MODELS_DIR/qwen3.6-27b-mq4.dflash.hfq|"
 )
 
 MODES=(

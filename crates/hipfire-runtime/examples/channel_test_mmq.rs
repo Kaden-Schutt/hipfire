@@ -12,7 +12,7 @@
 //!
 //! ```sh
 //! cargo run --release --features deltanet --example channel_test_mmq -- \
-//!     --model <path.mq4> --stage <STAGE> [OPTIONS]
+//!     --model <path-mq4.hfq> --stage <STAGE> [OPTIONS]
 //! ```
 //!
 //! # Stages
@@ -30,7 +30,7 @@
 //!
 //! # Options
 //!
-//!   --model <path>       Model file (.mq4 / .hfq), required
+//!   --model <path>       Model file (-mq4.hfq / .hfq), required
 //!   --stage <name>       Stage to run (default: site-scan)
 //!   --batch <N>          Batch size for synthetic activations (default: 128)
 //!   --threshold <F>      Abs error threshold for flagging bad elements (default: 0.01)
@@ -48,16 +48,16 @@
 //!
 //! ```sh
 //! # 1. Which GEMM site has the most error?
-//! cargo run ... -- --model m.mq4 --stage site-scan --batch 128
+//! cargo run ... -- --model m-mq4.hfq --stage site-scan --batch 128
 //!
 //! # 2. Which output rows in that site are worst?
-//! cargo run ... -- --model m.mq4 --stage channel-map --site residual --layer 0
+//! cargo run ... -- --model m-mq4.hfq --stage channel-map --site residual --layer 0
 //!
 //! # 3. Is the error concentrated in specific layers?
-//! cargo run ... -- --model m.mq4 --stage layer-sweep --site residual
+//! cargo run ... -- --model m-mq4.hfq --stage layer-sweep --site residual
 //!
 //! # 4. Validate the screening fix catches the outliers
-//! cargo run ... -- --model m.mq4 --stage screen
+//! cargo run ... -- --model m-mq4.hfq --stage screen
 //! ```
 //!
 //! # Environment variables
@@ -87,10 +87,10 @@ fn main() {
     if args.len() < 2 || args.iter().any(|a| a == "--help" || a == "-h") {
         eprintln!("MMQ vs WMMA bit-comparison diagnostic (ref: #87)");
         eprintln!();
-        eprintln!("Usage: channel_test_mmq --model <path.mq4> [OPTIONS]");
+        eprintln!("Usage: channel_test_mmq --model <path-mq4.hfq> [OPTIONS]");
         eprintln!();
         eprintln!("Options:");
-        eprintln!("  --model <path>       Model file (.mq4 / .hfq), required");
+        eprintln!("  --model <path>       Model file (-mq4.hfq / .hfq), required");
         eprintln!(
             "  --stage <name>       site-scan (default) | channel-map | layer-sweep | screen"
         );

@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MODEL=${MODEL:-/local/hipfire/qwen3.6-27b.mq4}
+MODEL=${MODEL:-/local/hipfire/qwen3.6-27b-mq4.hfq}
 EXE=./target/release/examples/daemon
 PP=${PP:-2}
 PROMPT='Write a one-sentence greeting.'

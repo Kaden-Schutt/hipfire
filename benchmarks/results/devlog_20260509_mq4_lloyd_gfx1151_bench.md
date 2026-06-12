@@ -34,7 +34,7 @@ point, not to re-gate.
 | Field | Value |
 |---|---|
 | Tool | `target/release/examples/bench_qwen35_speed` |
-| Models | `qwen3.5-{4,9}b.mq4` (uniform), `qwen3.5-{4,9}b.mq4-lloyd` |
+| Models | `qwen3.5-{4,9}b-mq4.hfq` (uniform), `qwen3.5-{4,9}b-lloyd-mq4.hfq` |
 | Flags | `--prefill 256 --warmup 5 --prefill-runs 3 --gen 30` |
 | Env | `HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1` |
 | ROCm path | `PATH=/opt/rocm-7.12/bin:$PATH LD_LIBRARY_PATH=/opt/rocm-7.12/lib:...` |
@@ -56,13 +56,13 @@ comparable across hardware.
 ### Qwen3.5-9B
 
 ```
-=== qwen3.5-9b.mq4 (uniform) ===
+=== qwen3.5-9b-mq4.hfq (uniform) ===
   run 1: prefill_median=1102.6 tok/s, gen=45.1 tok/s
   run 2: prefill_median=1132.3 tok/s, gen=45.1 tok/s
   run 3: prefill_median=1133.9 tok/s, gen=45.2 tok/s
   → prefill mean = 1122.9 tok/s   gen mean = 45.13 tok/s
 
-=== qwen3.5-9b.mq4-lloyd ===
+=== qwen3.5-9b-lloyd-mq4.hfq ===
   run 1: prefill_median=467.7 tok/s, gen=37.4 tok/s
   run 2: prefill_median=463.1 tok/s, gen=37.4 tok/s
   run 3: prefill_median=466.9 tok/s, gen=37.4 tok/s
@@ -72,13 +72,13 @@ comparable across hardware.
 ### Qwen3.5-4B
 
 ```
-=== qwen3.5-4b.mq4 (uniform) ===
+=== qwen3.5-4b-mq4.hfq (uniform) ===
   run 1: prefill_median=1945.6 tok/s, gen=67.4 tok/s
   run 2: prefill_median=1937.9 tok/s, gen=67.6 tok/s
   run 3: prefill_median=1942.0 tok/s, gen=67.4 tok/s
   → prefill mean = 1941.8 tok/s   gen mean = 67.47 tok/s
 
-=== qwen3.5-4b.mq4-lloyd ===
+=== qwen3.5-4b-lloyd-mq4.hfq ===
   run 1: prefill_median=950.3 tok/s, gen=59.7 tok/s
   run 2: prefill_median=986.1 tok/s, gen=59.5 tok/s
   run 3: prefill_median=992.3 tok/s, gen=59.7 tok/s
@@ -120,7 +120,7 @@ host, less on the LPDDR5x APU.
 
 ## What this doesn't tell us
 
-- **No 27B data point.** 27B Lloyd-MQ4 (`qwen3.6-27b.mq4-lloyd`) is
+- **No 27B data point.** 27B Lloyd-MQ4 (`qwen3.6-27b-lloyd-mq4.hfq`) is
   resident; gfx1151 has the VRAM to run it but at ~3× lower absolute
   prefill than gfx1100, the wall-time for a 3-run cross-process matrix
   is ~10× the 9B run. Skipped here; happy to add if the ratio at 27B
@@ -140,7 +140,7 @@ Every non-GEMM kernel (delta-net, conv1d, rmsnorm, rope, sigmoid)
 profiles within run-to-run noise between the two configs — the +6 ms
 total spread visible below is invisible at prefill scale.
 
-### `qwen3.5-9b.mq4` (uniform / HFQ4)
+### `qwen3.5-9b-mq4.hfq` (uniform / HFQ4)
 
 ```
 gemm_hfq4g256_mmq_set            184x  132.4ms  ( 720µs/call)  60.2%   26.3 GiB/s
@@ -156,7 +156,7 @@ WALL                                   236.4ms (1082.8 tok/s)
 GEMM time                              194.2ms (88 % of prefill wall)
 ```
 
-### `qwen3.5-9b.mq4-lloyd`
+### `qwen3.5-9b-lloyd-mq4.hfq`
 
 ```
 gemm_gate_up_mq4g256_lloyd_wmma   32x  234.3ms  (7322µs/call)  44.2%   11.5 GiB/s
@@ -596,8 +596,8 @@ export LD_LIBRARY_PATH="/opt/rocm-7.12/lib:${LD_LIBRARY_PATH:-}"
 
 source scripts/gpu-lock.sh && gpu_acquire "bench-mq4-lloyd-gfx1151"
 
-for model in qwen3.5-9b.mq4 qwen3.5-9b.mq4-lloyd \
-             qwen3.5-4b.mq4 qwen3.5-4b.mq4-lloyd; do
+for model in qwen3.5-9b-mq4.hfq qwen3.5-9b-lloyd-mq4.hfq \
+             qwen3.5-4b-mq4.hfq qwen3.5-4b-lloyd-mq4.hfq; do
   for run in 1 2 3; do
     HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
       ./target/release/examples/bench_qwen35_speed \

@@ -29,17 +29,17 @@ MODELS = [
     {
         "tag": "qwen3.5:9b",
         "hfid": "Qwen/Qwen3.5-9B",
-        "sidecar": "/home/kaden/.hipfire/models/qwen3.5-9b.mq4.triattn.bin",
+        "sidecar": "/home/kaden/.hipfire/models/qwen3.5-9b-mq4.triattn.hfq",
     },
     {
         "tag": "qwen3.5:27b",
         "hfid": "Qwen/Qwen3.5-27B",
-        "sidecar": "/home/kaden/.hipfire/models/qwen3.5-27b.mq4.triattn.bin",
+        "sidecar": "/home/kaden/.hipfire/models/qwen3.5-27b-mq4.triattn.hfq",
     },
     {
         "tag": "qwen3.5:35b-a3b",
         "hfid": "Qwen/Qwen3.5-35B-A3B",
-        "sidecar": "/home/kaden/.hipfire/models/qwen3.5-35b-a3b.mq4.triattn.bin",
+        "sidecar": "/home/kaden/.hipfire/models/qwen3.5-35b-a3b-mq4.triattn.hfq",
     },
     {
         "tag": "qwen3.6:27b",
@@ -49,7 +49,7 @@ MODELS = [
     {
         "tag": "qwen3.6:35b-a3b",
         "hfid": "Qwen/Qwen3.6-35B-A3B",
-        "sidecar": "/home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4.hermes.triattn.bin",
+        "sidecar": "/home/kaden/.hipfire/models/qwen3.6-35b-a3b-mq4.hfq.hermes.triattn.bin",
     },
 ]
 

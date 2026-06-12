@@ -13,7 +13,7 @@ the in-tree `HIPFIRE_PROFILE=1` dump was sufficient cross-check).
 **Bench config** (canonical):
 ```
 HIP_VISIBLE_DEVICES=0 ./target/release/examples/mtp_only_demo \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
+  --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
   --mtp-head ~/.hipfire/models/qwen3.5-27b-cvs16384.mtp \
   --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt \
   --max 120 --max-n 5 --temp 0.0 --no-chatml \

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL="${1:-/home/sadara/.hipfire/models/qwen3.5-397b-a17b.mq6.hfq}"
+MODEL="${1:-/home/sadara/.hipfire/models/qwen3.5-397b-a17b-mq6.hfq}"
 RSS_LIMIT_KB="${HIPFIRE_EXPERT_MODULE_PROBE_RSS_LIMIT_KB:-2097152}"
 
 if [[ ! -f "$MODEL" ]]; then

@@ -448,7 +448,7 @@ Every phase passes ALL of:
    commit message.
 6. **KLD parity.** On any phase that changes the inner-loop math
    (v4 dp4a, Phase 5 batched lm_head): run `eval_hipfire --n=256
-   --kv-mode q8` on `/data/hipfire/qwen3.5-9b.mq3-awq-gptq-f2-lmhead-a100.hfq`
+   --kv-mode q8` on `/data/hipfire/qwen3.5-9b-awq-gptq-f2-lmhead-a100-mq3.hfq`
    and confirm slice-mean KLD is within 5% of the v1 baseline.
 
 The Phase 5 batched lm_head specifically gets an additional

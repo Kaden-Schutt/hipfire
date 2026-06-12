@@ -21,7 +21,7 @@ fn main() {
 
     let model_path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "/home/kaden/.hipfire/models/qwen3.5-35b-a3b.mq4".to_string());
+        .unwrap_or_else(|| "/home/kaden/.hipfire/models/qwen3.5-35b-a3b-mq4.hfq".to_string());
     let n_gen: usize = std::env::var("HIPFIRE_GEN")
         .ok()
         .and_then(|v| v.parse().ok())

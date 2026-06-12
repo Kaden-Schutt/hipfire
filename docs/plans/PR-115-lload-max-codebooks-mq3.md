@@ -179,11 +179,11 @@ any of the perf gate is meaningful, **either**:
 
 - (a) Add `crates/hipfire-runtime/examples/bench_qwen35_mq3_lloyd.rs`
   mirroring `bench_qwen35_speed.rs`, point it at
-  `~/.hipfire/models/qwen3.5-9b.mq3-lloyd`, and teach
+  `~/.hipfire/models/qwen3.5-9b-lloyd-mq3.hfq`, and teach
   `probe_commits.sh` to take an example name (or fork
   `probe_commits_mq3_lloyd.sh`).
 - (b) Verify that `bench_qwen35_speed.rs` auto-detects the dtype from
-  the loaded weights — if so, point it at the `.mq3-lloyd` file
+  the loaded weights — if so, point it at the `-lloyd-mq3.hfq` file
   directly. (Read the example to confirm before relying on this.)
 
 Commit the bench prompt as a file (NOT a heredoc inside the script);

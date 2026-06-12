@@ -11,7 +11,7 @@
 //!
 //! Run: source scripts/gpu-lock.sh && gpu_acquire mtp-mirror-smoke && \
 //!      ./target/release/examples/mtp_mirror_smoke \
-//!          --target /local/hipfire/qwen3.6-27b.mq4 && gpu_release
+//!          --target /local/hipfire/qwen3.6-27b-mq4.hfq && gpu_release
 //!
 //! Reports VRAM accounting on both devices before / after the mirror.
 

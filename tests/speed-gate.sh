@@ -70,11 +70,9 @@ resolve_eval_bin() {
 
 find_model_file() {
     local name="$1"
-    local alt dir
-    alt="${name/-mq4.hfq/.mq4.hfq}"
+    local dir
     for dir in "$MODELS_DIR"; do
         [ -f "$dir/$name" ] && { printf '%s\n' "$dir/$name"; return 0; }
-        [ -f "$dir/$alt" ] && { printf '%s\n' "$dir/$alt"; return 0; }
     done
     return 1
 }

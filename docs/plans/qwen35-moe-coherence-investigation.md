@@ -5,7 +5,7 @@
 
 ## Resolution (2026-05-17)
 
-The underlying attractor was **not** a precision cliff in the MoE / router / final-norm path. It was the daemon's `repeat_penalty` default of 1.3 over a 128-token window penalizing legitimately repeated chain-of-thought formatting tokens (bullet markers, indentation), dropping the trajectory off the model's well-trained reasoning path into a self-doubt / number-hallucination attractor. The pattern matched llama.cpp's `--repeat-penalty 1.0` and HF transformers' `generate(repetition_penalty=1.0)` defaults; both produce clean structured CoT on the same prompts at greedy decode. Commit `9b4ab74a` (PR #267) flipped the daemon default from 1.3 → 1.0, dissolving the spiral on Qwen3.6-35B-A3B at correct GemmaRMSNorm scale without any precision-path change. A/B verified on `/local/hipfire/qwen3.6-35b-a3b.mq4`:
+The underlying attractor was **not** a precision cliff in the MoE / router / final-norm path. It was the daemon's `repeat_penalty` default of 1.3 over a 128-token window penalizing legitimately repeated chain-of-thought formatting tokens (bullet markers, indentation), dropping the trajectory off the model's well-trained reasoning path into a self-doubt / number-hallucination attractor. The pattern matched llama.cpp's `--repeat-penalty 1.0` and HF transformers' `generate(repetition_penalty=1.0)` defaults; both produce clean structured CoT on the same prompts at greedy decode. Commit `9b4ab74a` (PR #267) flipped the daemon default from 1.3 → 1.0, dissolving the spiral on Qwen3.6-35B-A3B at correct GemmaRMSNorm scale without any precision-path change. A/B verified on `/local/hipfire/qwen3.6-35b-a3b-mq4.hfq`:
 
 - **rp=1.0, no workaround:** clean step-by-step reasoning to 60(t+2)=90t → t=4 hours ✓
 - **rp=1.3 (prior default), no workaround:** classic self-doubt spiral ("Wait, re-reading prompt…", hallucinated numbers, looping Step B/C/D)
@@ -39,7 +39,7 @@ The maintainer's commit message stated this fixed a `<think>` spiral. PR #228 re
 
 ### Phase 2: smoke test on existing A3B file
 
-Tested `/local/hipfire/qwen3.6-35b-a3b.mq4` (timestamp May 6, 17:03 UTC) on the train-pursuit reasoning prompt at temp=0:
+Tested `/local/hipfire/qwen3.6-35b-a3b-mq4.hfq` (timestamp May 6, 17:03 UTC) on the train-pursuit reasoning prompt at temp=0:
 
 | Mode | Result |
 |---|---|
@@ -108,7 +108,7 @@ Commit `ee1be8a` (May 6, 19:23 UTC) introduced the always-on Q8 router for MoE m
 
 > 4-bit quantization of MoE router weights destroys routing precision on Qwen3.6-A3B: 152/256 expert rows drop below 0.99 cosine similarity at HFQ4G256 (3× worse MSE than llama.cpp Q4_K_M). This causes structural attractors (repetition loops) on multi-paragraph prompts under greedy decoding.
 
-The original `qwen3.6-35b-a3b.mq4` file was quantized at 17:03 UTC, **2.5 hours before** ee1be8a landed. So the original file is a **pre-ee1be8a artifact** with 4-bit (MQ4) router; every file we quantized today has Q8 router.
+The original `qwen3.6-35b-a3b-mq4.hfq` file was quantized at 17:03 UTC, **2.5 hours before** ee1be8a landed. So the original file is a **pre-ee1be8a artifact** with 4-bit (MQ4) router; every file we quantized today has Q8 router.
 
 ### Phase 8: the regime-collision picture
 
@@ -290,7 +290,7 @@ Expected smoke-test cases (4 conditions):
 | Workaround | reasoning | coherent (matches May 6 baseline) | depends |
 | Workaround | "Paris" | coherent | coherent |
 
-If H1 holds (default + reasoning works), the 4-bit-router file becomes a candidate replacement for the existing /local/hipfire/qwen3.6-35b-a3b.mq4, and ee1be8a's Q8-router promotion needs revisiting at the design level (e.g., gate the promotion behind a flag that defaults off until paired with a coherence audit).
+If H1 holds (default + reasoning works), the 4-bit-router file becomes a candidate replacement for the existing /local/hipfire/qwen3.6-35b-a3b-mq4.hfq, and ee1be8a's Q8-router promotion needs revisiting at the design level (e.g., gate the promotion behind a flag that defaults off until paired with a coherence audit).
 
 ## Engine-pass implications
 

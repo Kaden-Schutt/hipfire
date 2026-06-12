@@ -94,10 +94,10 @@ band on this host is ~±10–15% per
 
 | Model                   | Mode | Prefill (median, tok/s) | Decode (gen, tok/s) | Effective BW |
 |-------------------------|------|------------------------:|--------------------:|-------------:|
-| `qwen3.5-4b.mq3-lloyd`  | slow |                    35.5 |                34.6 |    72.6 GiB/s |
-| `qwen3.5-4b.mq3-lloyd`  | **fast** |                **74.5** |            **67.5** |  **141.7 GiB/s** |
-| `qwen3.5-9b.mq3-lloyd`  | slow |                    18.3 |                18.2 |    77.2 GiB/s |
-| `qwen3.5-9b.mq3-lloyd`  | **fast** |                **49.1** |            **46.4** |  **197.3 GiB/s** |
+| `qwen3.5-4b-lloyd-mq3.hfq`  | slow |                    35.5 |                34.6 |    72.6 GiB/s |
+| `qwen3.5-4b-lloyd-mq3.hfq`  | **fast** |                **74.5** |            **67.5** |  **141.7 GiB/s** |
+| `qwen3.5-9b-lloyd-mq3.hfq`  | slow |                    18.3 |                18.2 |    77.2 GiB/s |
+| `qwen3.5-9b-lloyd-mq3.hfq`  | **fast** |                **49.1** |            **46.4** |  **197.3 GiB/s** |
 
 **Headline: ~2.0× decode on 4B, ~2.5× decode on 9B.** Effective BW
 roughly doubles too — gfx1151 has shared LPDDR5x (~250 GB/s peak
@@ -108,8 +108,8 @@ shared with CPU); 197 GiB/s on 9B-fast represents ~78% of that peak
 
 | Model                   | Mode | Decode (gen, tok/s) |
 |-------------------------|------|--------------------:|
-| `qwen3.5-4b.mq3-lloyd`  | fast |                34.6 (+0.0%) |
-| `qwen3.5-9b.mq3-lloyd`  | fast |                19.7 (+8.2%) |
+| `qwen3.5-4b-lloyd-mq3.hfq`  | fast |                34.6 (+0.0%) |
+| `qwen3.5-9b-lloyd-mq3.hfq`  | fast |                19.7 (+8.2%) |
 
 GEMV-only sees minimal speedup because only the `wo` output projection
 (per FA layer) plus the single lm_head GEMV per token routes through
@@ -148,19 +148,19 @@ source scripts/gpu-lock.sh && gpu_acquire "mq3-lloyd gfx1151"
 
 # Performance:
 ./target/release/examples/bench_qwen35_speed \
-  ~/.hipfire/models/qwen3.5-9b.mq3-lloyd \
+  ~/.hipfire/models/qwen3.5-9b-lloyd-mq3.hfq \
   --prefill 128 --prefill-runs 3 --warmup 8 --gen 100
 
 HIPFIRE_LLOYD_FORCE_BASELINE=1 ./target/release/examples/bench_qwen35_speed \
-  ~/.hipfire/models/qwen3.5-9b.mq3-lloyd \
+  ~/.hipfire/models/qwen3.5-9b-lloyd-mq3.hfq \
   --prefill 128 --prefill-runs 3 --warmup 8 --gen 100
 
 # PPL drift envelope (10-decimal NLL/tok printf surfaces the latent drift):
 ./target/release/examples/perplexity \
-  ~/.hipfire/models/qwen3.5-9b.mq3-lloyd \
+  ~/.hipfire/models/qwen3.5-9b-lloyd-mq3.hfq \
   benchmarks/calib/calib-5m.txt --ctx 2048 --warmup 8 --offset 0
 HIPFIRE_LLOYD_FORCE_BASELINE=1 ./target/release/examples/perplexity \
-  ~/.hipfire/models/qwen3.5-9b.mq3-lloyd \
+  ~/.hipfire/models/qwen3.5-9b-lloyd-mq3.hfq \
   benchmarks/calib/calib-5m.txt --ctx 2048 --warmup 8 --offset 0
 ```
 

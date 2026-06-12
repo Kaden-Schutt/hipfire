@@ -13,8 +13,8 @@
 //! Python environment.
 //!
 //! Usage:
-//!   cargo run --release --example dump_norms -- /local/hipfire/qwen3.6-27b.mq4
-//!   cargo run --release --example dump_norms -- /local/hipfire/qwen3.6-27b.mq4 norm.weight
+//!   cargo run --release --example dump_norms -- /local/hipfire/qwen3.6-27b-mq4.hfq
+//!   cargo run --release --example dump_norms -- /local/hipfire/qwen3.6-27b-mq4.hfq norm.weight
 //!
 //! Optional second arg filters tensor names by substring.
 

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DAEMON="${DAEMON:-$ROOT/target/release/examples/daemon}"
-MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4.hfq}"
+MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b-mq4.hfq}"
 MAX_SEQ="${MAX_SEQ:-512}"
 DECODE_BACKEND="${HIPFIRE_QWEN35_DECODE_BATCH:-serial}"
 EXPECTED_DECODE_BACKEND="${EXPECTED_DECODE_BACKEND:-}"

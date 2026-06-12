@@ -11,7 +11,7 @@ crates/
 ├── hipfire-arch-*/     per-family forward pass (qwen35, llama, qwen35-vl, etc.)
 ├── rdna-compute/       kernel dispatch, hipGraph capture, JIT loader
 ├── hip-bridge/         safe Rust FFI over libamdhip64.so
-├── hipfire-quantize/   CPU-side safetensors / GGUF → .mq4 / .hf4 encoder
+├── hipfire-quantize/   CPU-side safetensors / GGUF → -mq4.hfq / -hf4.hfq encoder
 └── redline/            direct-KMD dispatch research (future, skips HIP)
 ```
 

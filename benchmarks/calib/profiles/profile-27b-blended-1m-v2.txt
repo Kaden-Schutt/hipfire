@@ -2044,7 +2044,7 @@ calibration path: GPU (kernel triattn_accumulate_f32) [opt-in]
 [CALIB_PROFILE] 1968,61,0.696,152.664,153.361,540256
 total calibration samples: 540256 tokens × FA layers
 [CALIB_PROFILE] SUMMARY total_tokens=540256 loop_ms=533945.7 finalize_ms=17.4 effective_tok_per_sec=1011.8
-saved sidecar: models/qwen3.6-27b/qwen3.6-27b.mq4.triattn.blended_v3.bin
+saved sidecar: models/qwen3.6-27b/qwen3.6-27b-mq4-blended-v3.triattn.hfq
 Mean Resultant Length R_f across all (layer, head, band): mean=0.464, median=0.427, 3.7% > 0.95
 paper target: ~90% of heads R > 0.95 (Figure 2C)
 note: R_f is validation-prompt-INDEPENDENT (a plus) but has LOW DYNAMIC RANGE — empirically on qwen3.5-9b, calibration corpora of 20k / 50k / 100k Wikipedia tokens all land at R_f≈0.74 despite the 5× size difference. Treat R_f as a floor check (is aggregation converging at all?), not as a ranking metric.
