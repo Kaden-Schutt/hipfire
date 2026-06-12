@@ -1763,6 +1763,9 @@ fn main() {
         let mut rollback_multi_request_disabled: usize = 0;
         let mut rollback_replay_gdn_tape: usize = 0;
         let mut rollback_replay_full_prefill: usize = 0;
+        let trace_token_index: Option<usize> = std::env::var("HIPFIRE_DFLASH_TRACE_TOKEN_INDEX")
+            .ok()
+            .and_then(|s| s.parse().ok());
         while emitted.len() < max_tokens {
             if position + draft_scratch_b >= ctx_capacity {
                 eprintln!("hit ctx_capacity {}; stopping", ctx_capacity);
@@ -2120,6 +2123,29 @@ fn main() {
             }
 
             // `step.committed[0]` is the seed_token (already emitted). Emit [1..].
+            let emit_start = emitted.len();
+            let emit_count = step.committed.len().saturating_sub(1);
+            if let Some(trace_idx) = trace_token_index {
+                if trace_idx >= emit_start && trace_idx < emit_start + emit_count {
+                    let tail: Vec<u32> = step.committed.iter().skip(1).copied().collect();
+                    eprintln!(
+                        "[trace-token] target_index={} cycle={} emit_range={}..{} pos={} seed={} accepted={} bonus={} replay={} rollback_reason={} next_position={} tail={:?}",
+                        trace_idx,
+                        stats.cycles,
+                        emit_start,
+                        emit_start + emit_count,
+                        position,
+                        seed_token,
+                        step.accepted,
+                        step.bonus_token,
+                        step.rollback_replay.as_str(),
+                        rollback.reason,
+                        rollback.next_position,
+                        tail,
+                    );
+                    eprintln!("  decoded-tail: {:?}", tokenizer.decode(&tail));
+                }
+            }
             for (&tok, _) in step.committed.iter().skip(1).zip(0..) {
                 emitted.push(tok);
             }
