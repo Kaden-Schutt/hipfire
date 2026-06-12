@@ -40,6 +40,10 @@
 #
 # --fast is for pre-commit on $SPEC_HOTSPOT match (down from full short battery).
 # Force-full via HIPFIRE_FORCE_SPEC_GATE=1.
+#
+# Set HIPFIRE_DFLASH_AR_PARITY=1 to rerun DFlash cases through --ar-baseline
+# and hard-fail on token-list mismatch. This is stricter than the default
+# coherence detector and is used while proving rollback parity.
 
 set -u
 cd "$(dirname "$0")/.."
@@ -179,6 +183,7 @@ fi
 
 # ── Run ───────────────────────────────────────────────────────────────────
 hard_errors=0
+AR_PARITY="${HIPFIRE_DFLASH_AR_PARITY:-0}"
 
 {
     echo "# Coherence battery — DFlash / DDTree"
@@ -188,6 +193,7 @@ hard_errors=0
     echo "- date:   $(date -Iseconds)"
     echo "- mode:   $( [ "$FAST" -eq 1 ] && echo fast || ( [ "$FULL" -eq 1 ] && echo full || echo short ) )"
     echo "- kv_mode: q8"
+    echo "- ar_parity: $AR_PARITY"
     echo "- pair:   ${PAIR_27B:-not found}"
     echo "- models_dir: $MODELS_DIR"
     echo "- dflash_dir: $DFLASH_DIR"
@@ -285,6 +291,39 @@ print(json.dumps({
 PYEOF
 )
 
+PARITY_PY=$(cat <<'PYEOF'
+import sys, re, json
+if len(sys.argv) != 3:
+    print(json.dumps({"ok": False, "reason": "usage"}))
+    sys.exit(0)
+def tokens(path, label):
+    out = open(path, "rb").read().decode("utf-8", "replace")
+    m = re.search(rf"{label} tokens: \[([^\]]+)\]", out)
+    if not m:
+        return None
+    return [int(x) for x in m.group(1).split(",") if x.strip()]
+ar = tokens(sys.argv[1], "AR")
+df = tokens(sys.argv[2], "DFlash")
+if ar is None:
+    print(json.dumps({"ok": False, "reason": "missing_ar_tokens"}))
+elif df is None:
+    print(json.dumps({"ok": False, "reason": "missing_dflash_tokens"}))
+elif ar == df:
+    print(json.dumps({"ok": True, "tokens": len(df)}))
+else:
+    first = next((i for i, (a, d) in enumerate(zip(ar, df)) if a != d), min(len(ar), len(df)))
+    print(json.dumps({
+        "ok": False,
+        "reason": "token_mismatch",
+        "first_mismatch": first,
+        "ar_len": len(ar),
+        "dflash_len": len(df),
+        "ar_token": ar[first] if first < len(ar) else None,
+        "dflash_token": df[first] if first < len(df) else None,
+    }))
+PYEOF
+)
+
 for entry in "${tests[@]}"; do
     IFS='|' read -r label mode prompt_var max_tok <<< "$entry"
     case "$prompt_var" in
@@ -318,6 +357,24 @@ for entry in "${tests[@]}"; do
     detect=$(python3 -c "$DETECT_PY" < "$out_file")
     detect_ok=$(echo "$detect" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('ok',False))")
     detect_warn=$(echo "$detect" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('soft_warn',False))")
+    parity="not_requested"
+    ar_out_file=""
+    if [ "$AR_PARITY" = "1" ] && [ "$mode" = "dflash" ]; then
+        ar_out_file="/tmp/cohdf_ar_$$.log"
+        timeout "$CASE_TIMEOUT" "$EXE" \
+            --target "$TARGET_27B" --draft "$DRAFT_27B" \
+            --prompt "$prompt" --max "$max_tok" --ctx 2048 \
+            --kv-mode q8 --no-chatml \
+            --ar-baseline \
+            > "$ar_out_file" 2>&1
+        ar_ec=$?
+        ar_panic=$(grep -aE 'panicked|thread.*panicked|FATAL|error: ' "$ar_out_file" | head -1)
+        if [ "$ar_ec" -ne 0 ] || [ -n "$ar_panic" ]; then
+            parity="{\"ok\": false, \"reason\": \"ar_run_failed\", \"exit\": $ar_ec}"
+        else
+            parity=$(python3 -c "$PARITY_PY" "$ar_out_file" "$out_file")
+        fi
+    fi
 
     status="OK"
     if [ "$ec" -ne 0 ] || [ -n "$panic" ]; then
@@ -329,6 +386,11 @@ for entry in "${tests[@]}"; do
     elif [ "$detect_warn" = "True" ]; then
         status="WARN (paragraph-level repetition — soft, not blocking)"
     fi
+    parity_ok=$(echo "$parity" | python3 -c "import sys,json; s=sys.stdin.read().strip(); print('skip' if s == 'not_requested' else json.loads(s).get('ok', False))")
+    if [ "$parity_ok" = "False" ]; then
+        status="HARD_ERROR (AR parity: $parity)"
+        hard_errors=$((hard_errors + 1))
+    fi
 
     # Pull stats lines (emitted/τ/cycles/rollback/accept_rate) for the report.
     stats=$(grep -aE '^emitted:|^cycles:|^rollback_parity:|^accept_rate:' "$out_file" | head -4)
@@ -338,6 +400,7 @@ for entry in "${tests[@]}"; do
         echo
         echo "- wall: ${wall}s  status: **$status**"
         echo "- detector: \`$detect\`"
+        echo "- ar_parity: \`$parity\`"
         if [ -n "$stats" ]; then
             echo "- stats:"
             echo '  ```'
@@ -364,6 +427,7 @@ for entry in "${tests[@]}"; do
     } >> "$OUT"
 
     rm -f "$out_file"
+    [ -n "$ar_out_file" ] && rm -f "$ar_out_file"
 done
 
 echo
