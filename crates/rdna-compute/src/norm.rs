@@ -1703,6 +1703,13 @@ impl Gpu {
     /// - `s_tape_scales`: `[n_tokens × n_heads × HD]` f32 (scratch)
     /// - `parent_indices`: `[n_tokens]` i32 (host materialized by
     ///   `ddtree::linearize_tree`; spine topology is [-1, 0, 1, 2, ...])
+    /// : optional per-node EF residual tape (f16,
+    /// ). Non-null ⇒ DETERMINISTIC
+    /// round-to-nearest requant (sigma-delta per parent chain) instead of
+    /// stochastic PRNG. Gate with  (default on).
+    /// : optional per-layer EF residual for root nodes
+    /// (the persistent state from the linear kernel's last requant). Pass
+    ///  for both when EF is disabled; kernel falls back to stochastic.
     #[cfg(feature = "deltanet")]
     pub fn gated_delta_net_q8_tree_batch_seq(
         &mut self,
@@ -1720,6 +1727,8 @@ impl Gpu {
         n_tokens: usize,
         n_heads: usize,
         head_dim: usize,
+        s_ef_residual_tape: Option<&GpuTensor>,
+        s_ef_residual_init: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -1729,6 +1738,8 @@ impl Gpu {
         )?;
 
         let n_tiles = (128 / 4) as u32;
+
+        let null_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
 
         let mut qp = q_batch.buf.as_ptr();
         let mut kp = k_batch.buf.as_ptr();
@@ -1744,22 +1755,32 @@ impl Gpu {
         let mut nt = n_tokens as i32;
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
+        // EF residual tape and init pointers — null when EF is disabled.
+        let mut ef_tape_p: *mut std::ffi::c_void = s_ef_residual_tape
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let mut ef_init_p: *mut std::ffi::c_void = s_ef_residual_init
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut params: Vec<*mut c_void> = vec![
-            &mut qp   as *mut _ as *mut c_void,
-            &mut kp   as *mut _ as *mut c_void,
-            &mut vp   as *mut _ as *mut c_void,
-            &mut gp   as *mut _ as *mut c_void,
-            &mut bp   as *mut _ as *mut c_void,
-            &mut sip  as *mut _ as *mut c_void,
-            &mut scip as *mut _ as *mut c_void,
-            &mut stp  as *mut _ as *mut c_void,
-            &mut stsp as *mut _ as *mut c_void,
-            &mut pp   as *mut _ as *mut c_void,
-            &mut op   as *mut _ as *mut c_void,
-            &mut nt   as *mut _ as *mut c_void,
-            &mut nh   as *mut _ as *mut c_void,
-            &mut hd   as *mut _ as *mut c_void,
+            &mut qp      as *mut _ as *mut c_void,
+            &mut kp      as *mut _ as *mut c_void,
+            &mut vp      as *mut _ as *mut c_void,
+            &mut gp      as *mut _ as *mut c_void,
+            &mut bp      as *mut _ as *mut c_void,
+            &mut sip     as *mut _ as *mut c_void,
+            &mut scip    as *mut _ as *mut c_void,
+            &mut stp     as *mut _ as *mut c_void,
+            &mut stsp    as *mut _ as *mut c_void,
+            &mut pp      as *mut _ as *mut c_void,
+            &mut op      as *mut _ as *mut c_void,
+            &mut nt      as *mut _ as *mut c_void,
+            &mut nh      as *mut _ as *mut c_void,
+            &mut hd      as *mut _ as *mut c_void,
+            &mut ef_tape_p as *mut _ as *mut c_void,
+            &mut ef_init_p as *mut _ as *mut c_void,
         ];
+        let _ = null_ptr;
 
         let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
         let timer = crate::profile::begin_timer(
@@ -1779,6 +1800,7 @@ impl Gpu {
                 b.push_ptr(stp); b.push_ptr(stsp);
                 b.push_ptr(pp); b.push_ptr(op);
                 b.push_i32(nt); b.push_i32(nh); b.push_i32(hd);
+                b.push_ptr(ef_tape_p); b.push_ptr(ef_init_p);
                 b
             },
         );

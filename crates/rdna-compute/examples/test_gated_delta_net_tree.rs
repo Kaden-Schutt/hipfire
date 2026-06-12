@@ -5,13 +5,21 @@
 //! Tree-aware gated_delta_net_q8 correctness test.
 //!
 //! Verifies: for spine topology (parent_indices = [-1, 0, 1, 2, ...]),
-//! tree-GDN produces outputs byte-exact with calling linear GDN N times
-//! in sequence (n_tokens=1 each call) on the rolling s_q8 state.
+//! tree-GDN with EF (error-feedback) produces outputs byte-exact with
+//! calling linear GDN N times in sequence (n_tokens=1 each call) with
+//! the same EF residual state.
 //!
-//! The linear batch (n_tokens>1) kernel keeps S in F32 LDS across the
-//! whole batch and requants once at the end — that's qualitatively
-//! different, so it's NOT our reference. The reference is the per-token
-//! linear decode path, which matches the tree-GDN spine semantics.
+//! EF mode: both sides use deterministic round-to-nearest with f16 error
+//! carry. The tree kernel writes EF residuals to a per-node tape; the
+//! linear kernel uses a shared in-place residual buffer. For spine
+//! topology the two are equivalent: each node's parent is the previous
+//! node, so reading the tape slot[t-1] is the same as reading the live
+//! linear EF buffer after the t-1 call.
+//!
+//! NOTE: the stochastic PRNG path does NOT produce byte-exact results
+//! because the tree kernel seeds PRNG from my_max (data-dependent) while
+//! the linear kernel seeds from the frame counter (call-count-dependent).
+//! Use EF for any cross-kernel parity validation.
 //!
 //! Build: `cargo run --release --features deltanet \
 //!   --example test_gated_delta_net_tree -p rdna-compute`
@@ -57,6 +65,10 @@ fn main() {
     let sc_ref = upload_f32(&mut gpu, &s_scales_init, &[N_HEADS * HD]);
     let out_ref = gpu.zeros(&[N_TOKENS, N_HEADS * HD], DType::F32).unwrap();
 
+    // EF residual shared across linear reference calls. Zeroed so the root
+    // token starts with zero carry (matches tree kernel root when ef_init=null).
+    let ef_ref = gpu.zeros(&[N_HEADS * HD * HD], rdna_compute::DType::F16).unwrap();
+
     // Slice the input/output tensors per-token by calling the existing
     // batch_seq kernel with n_tokens=1 at sliding pointer offsets. Since
     // we can't offset tensor pointers via the high-level API, we upload
@@ -68,7 +80,8 @@ fn main() {
         let g1 = upload_f32(&mut gpu, &gate[t * N_HEADS..(t + 1) * N_HEADS], &[1, N_HEADS]);
         let b1 = upload_f32(&mut gpu, &beta[t * N_HEADS..(t + 1) * N_HEADS], &[1, N_HEADS]);
         let o1 = gpu.zeros(&[1, N_HEADS * HD], DType::F32).unwrap();
-        gpu.gated_delta_net_q8_batch_seq(&q1, &k1, &v1, &g1, &b1, &sq_ref, &sc_ref, &o1, 1, N_HEADS, HD, None).unwrap();
+        // Use shared EF residual: same as tree EF tape for spine topology.
+        gpu.gated_delta_net_q8_batch_seq(&q1, &k1, &v1, &g1, &b1, &sq_ref, &sc_ref, &o1, 1, N_HEADS, HD, Some(&ef_ref)).unwrap();
         // Scatter o1 back into out_ref[t].
         let row_bytes = N_HEADS * HD * 4;
         gpu.hip.memcpy_dtod_at(&out_ref.buf, t * row_bytes, &o1.buf, 0, row_bytes).unwrap();
@@ -90,6 +103,8 @@ fn main() {
     let tape_sc = gpu.zeros(&[N_TOKENS * N_HEADS * HD], DType::F32).unwrap();
     let parents_gpu = upload_i32(&mut gpu, &parents);
     let out_tree = gpu.zeros(&[N_TOKENS, N_HEADS * HD], DType::F32).unwrap();
+    // EF tape for tree kernel: zeroed so root sees zero carry (matches ef_ref above).
+    let ef_tape = gpu.zeros(&[N_TOKENS * N_HEADS * HD * HD], rdna_compute::DType::F16).unwrap();
 
     gpu.gated_delta_net_q8_tree_batch_seq(
         &q_gpu, &k_gpu, &v_gpu, &gate_gpu, &beta_gpu,
@@ -97,6 +112,8 @@ fn main() {
         &tape_q8, &tape_sc, &parents_gpu,
         &out_tree,
         N_TOKENS, N_HEADS, HD,
+        Some(&ef_tape),  // EF tape: carry error-feedback residuals per node
+        None,            // s_ef_residual_init: root starts from zero (tape zeroed)
     ).unwrap();
 
     let out_tree_host = gpu.download_f32(&out_tree).unwrap();

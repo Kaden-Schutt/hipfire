@@ -5593,6 +5593,11 @@ pub struct PrefillBatchScratch {
     // `new`); currently always allocated when LA layers exist, like the Q8
     // tape. s_tape_f32: [max_batch × n_v_heads × head_dim × head_dim] f32.
     pub dn_s_tape_f32: Option<GpuTensor>,
+    // EF (error-feedback) residual tape for tree-verify Q8 path. f16,
+    // same element count as dn_s_tape_q8. Allocated when LA layers exist;
+    // passed to gated_delta_net_q8_tree when EF is enabled (default on).
+    // s_ef_tape: [max_batch x n_v_heads x head_dim x head_dim] f16.
+    pub dn_s_ef_tape: Option<GpuTensor>,
 }
 
 impl PrefillBatchScratch {
@@ -5805,6 +5810,17 @@ impl PrefillBatchScratch {
                     * config.linear_value_head_dim],
                 DType::F32
             ),
+            // EF residual tape: same element count as dn_s_tape_q8 but f16.
+            // Allocated unconditionally when LA layers exist; the tree call
+            // sites pass None when EF is disabled (HIPFIRE_DN_STATE_EF=0).
+            dn_s_ef_tape: alloc_opt!(
+                config.linear_num_value_heads > 0,
+                &[max_batch
+                    * config.linear_num_value_heads
+                    * config.linear_value_head_dim
+                    * config.linear_value_head_dim],
+                DType::F16
+            ),
         })
     }
 
@@ -5868,6 +5884,7 @@ impl PrefillBatchScratch {
             self.dn_s_tape_q8,
             self.dn_s_tape_scales,
             self.dn_s_tape_f32,
+            self.dn_s_ef_tape,
         ] {
             if let Some(t) = t {
                 let _ = gpu.free_tensor(t);
@@ -8580,6 +8597,26 @@ fn forward_prefill_chunk(
                                 .expect("tree-aware LA requires dn_s_tape_q8 scratch (check PrefillBatchScratch::new)");
                             let tape_sc = pbs.dn_s_tape_scales.as_ref()
                                 .expect("tree-aware LA requires dn_s_tape_scales scratch (check PrefillBatchScratch::new)");
+                            // EF residual tape for deterministic tree-verify requant.
+                            // Zero the tape before each layer: the tape is reused
+                            // across LA layers, and non-root nodes read their
+                            // parent's EF slot. Without zeroing, layer 1+ would
+                            // read layer 0's stale residuals for non-root nodes
+                            // whose parent slot was set by the previous layer.
+                            // The root node always reads from s_ef_residual_init
+                            // (layer-indexed, correct), so only non-root slots
+                            // need clearing. Zeroing the whole tape is simpler
+                            // and the cost is negligible (f16, same size as tape_q8).
+                            let ef_tape = pbs.dn_s_ef_tape.as_ref();
+                            let ef_init = dn_state.ef_residual(delta_layer_idx);
+                            let (ef_tape_arg, ef_init_arg) = if ef_init.is_some() {
+                                if let Some(t) = ef_tape {
+                                    gpu.hip.memset(&t.buf, 0, t.byte_size())?;
+                                }
+                                (ef_tape, ef_init)
+                            } else {
+                                (None, None)
+                            };
                             gpu.gated_delta_net_q8_tree_batch_seq(
                                 &pbs.dn_q_batch,
                                 &pbs.dn_k_batch,
@@ -8595,6 +8632,8 @@ fn forward_prefill_chunk(
                                 n,
                                 n_v_heads,
                                 config.linear_value_head_dim,
+                                ef_tape_arg,
+                                ef_init_arg,
                             )?;
                         }
                         StateQuant::Q4 => {
@@ -10405,6 +10444,26 @@ fn forward_prefill_chunk(
                                 .dn_s_tape_scales
                                 .as_ref()
                                 .expect("tree-aware LA requires dn_s_tape_scales scratch");
+                            // EF residual tape for deterministic tree-verify requant.
+                            // Zero the tape before each layer: the tape is reused
+                            // across LA layers, and non-root nodes read their
+                            // parent's EF slot. Without zeroing, layer 1+ would
+                            // read layer 0's stale residuals for non-root nodes
+                            // whose parent slot was set by the previous layer.
+                            // The root node always reads from s_ef_residual_init
+                            // (layer-indexed, correct), so only non-root slots
+                            // need clearing. Zeroing the whole tape is simpler
+                            // and the cost is negligible (f16, same size as tape_q8).
+                            let ef_tape = pbs.dn_s_ef_tape.as_ref();
+                            let ef_init = dn_state.ef_residual(delta_layer_idx);
+                            let (ef_tape_arg, ef_init_arg) = if ef_init.is_some() {
+                                if let Some(t) = ef_tape {
+                                    gpu.hip.memset(&t.buf, 0, t.byte_size())?;
+                                }
+                                (ef_tape, ef_init)
+                            } else {
+                                (None, None)
+                            };
                             gpu.gated_delta_net_q8_tree_batch_seq(
                                 &pbs.dn_q_batch,
                                 &pbs.dn_k_batch,
@@ -10420,6 +10479,8 @@ fn forward_prefill_chunk(
                                 n,
                                 n_v_heads,
                                 config.linear_value_head_dim,
+                                ef_tape_arg,
+                                ef_init_arg,
                             )?;
                         }
                         StateQuant::Q4 => {

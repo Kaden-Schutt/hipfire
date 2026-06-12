@@ -82,6 +82,11 @@ pub struct DeltaNetTreeParams<'a> {
     pub n_tokens: usize,
     pub n_heads: usize,
     pub head_dim: usize,
+    /// Optional per-node EF residual tape (f16, shape [n_nodes * n_heads * HD * HD]).
+    /// Non-null => deterministic requant; null => stochastic rounding (compat).
+    pub s_ef_residual_tape: Option<&'a GpuTensor>,
+    /// Optional persistent EF residual for root nodes (from linear kernel last requant).
+    pub s_ef_residual_init: Option<&'a GpuTensor>,
 }
 
 /// Parameters for DeltaNet conv-state ring-buffer management.
@@ -221,6 +226,8 @@ impl Qwen35ModelExt for () {
             params.s_tape_q8, params.s_tape_scales,
             params.parent_indices, params.output_batch,
             params.n_tokens, params.n_heads, params.head_dim,
+            params.s_ef_residual_tape,
+            params.s_ef_residual_init,
         )
         .map_err(|e| format!("delta_net_tree: {e:?}"))
     }
