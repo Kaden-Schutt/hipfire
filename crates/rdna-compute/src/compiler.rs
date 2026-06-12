@@ -9,6 +9,7 @@ use hip_bridge::HipResult;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -38,6 +39,9 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
         let src = entry.path();
         let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("");
         if ext != "hsaco" && ext != "hash" {
+            continue;
+        }
+        if ext == "hsaco" && !hsaco_is_elf_path(&src) {
             continue;
         }
         let name = match src.file_name() {
@@ -76,6 +80,14 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn hsaco_is_elf_path(path: &Path) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok() && magic == [0x7f, b'E', b'L', b'F']
+}
+
 /// Compiles HIP kernel sources to code objects, with caching.
 /// Tries pre-compiled blobs first (kernels/compiled/{arch}/), falls back to hipcc.
 pub struct KernelCompiler {
@@ -88,6 +100,101 @@ pub struct KernelCompiler {
 }
 
 impl KernelCompiler {
+    fn hsaco_is_elf(path: &Path) -> bool {
+        hsaco_is_elf_path(path)
+    }
+
+    fn cache_valid(obj_path: &Path, hash_path: &Path, src_hash: &str) -> bool {
+        obj_path.exists()
+            && hash_path.exists()
+            && Self::hsaco_is_elf(obj_path)
+            && std::fs::read_to_string(hash_path).unwrap_or_default() == src_hash
+    }
+
+    fn normalize_hipcc_output(arch: &str, obj_path: &Path, name: &str) -> HipResult<()> {
+        if Self::hsaco_is_elf(obj_path) {
+            return Ok(());
+        }
+
+        const BUNDLE_MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
+        let data = std::fs::read(obj_path).map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("failed to read compiled kernel {name}: {e}"))
+        })?;
+        if !data.starts_with(BUNDLE_MAGIC) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "hipcc produced non-ELF kernel object for {name}: {}",
+                    obj_path.display()
+                ),
+            ));
+        }
+
+        let bundler = std::env::var_os("ROCM_PATH")
+            .map(PathBuf::from)
+            .map(|p| p.join("lib/llvm/bin/clang-offload-bundler"))
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| PathBuf::from("clang-offload-bundler"));
+        let parent = obj_path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = obj_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(name);
+        let pid = std::process::id();
+        let device_path = parent.join(format!("{stem}.{pid}.device.o"));
+        let host_path = parent.join(format!("{stem}.{pid}.host.o"));
+        let targets = format!("hipv4-amdgcn-amd-amdhsa--{arch},host-x86_64-unknown-linux-gnu-");
+
+        let output = Command::new(&bundler)
+            .arg("--type=o")
+            .arg("--unbundle")
+            .arg(format!("--input={}", obj_path.display()))
+            .arg(format!("--targets={targets}"))
+            .arg(format!("--output={}", device_path.display()))
+            .arg(format!("--output={}", host_path.display()))
+            .output()
+            .map_err(|e| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("failed to run clang-offload-bundler for {name}: {e}"),
+                )
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = std::fs::remove_file(&device_path);
+            let _ = std::fs::remove_file(&host_path);
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("failed to unbundle hipcc output for {name}:\n{stderr}"),
+            ));
+        }
+
+        if !Self::hsaco_is_elf(&device_path) {
+            let _ = std::fs::remove_file(&device_path);
+            let _ = std::fs::remove_file(&host_path);
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("unbundled device object for {name} is not ELF"),
+            ));
+        }
+
+        std::fs::rename(&device_path, obj_path)
+            .or_else(|_| {
+                std::fs::copy(&device_path, obj_path).map(|_| {
+                    let _ = std::fs::remove_file(&device_path);
+                })
+            })
+            .map_err(|e| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("failed to replace bundled kernel object for {name}: {e}"),
+                )
+            })?;
+        let _ = std::fs::remove_file(&host_path);
+        Ok(())
+    }
+
     pub fn new(arch: &str, extra_flags: String) -> HipResult<Self> {
         // Cache (hot path) defaults to $CWD/.hipfire_kernels so parallel
         // worktrees/agents on the same machine don't clobber each other's
@@ -221,7 +328,7 @@ impl KernelCompiler {
                     let stored = std::fs::read_to_string(&hash_file).unwrap_or_default();
                     stored.trim() == src_hash
                 };
-                if hash_ok {
+                if hash_ok && Self::hsaco_is_elf(&precompiled) {
                     self.compiled.insert(name.to_string(), precompiled);
                     return Ok(&self.compiled[name]);
                 }
@@ -241,9 +348,7 @@ impl KernelCompiler {
         let obj_path = self.cache_dir.join(format!("{name}.hsaco"));
         let hash_path = self.cache_dir.join(format!("{name}.hash"));
 
-        let cache_valid = obj_path.exists()
-            && hash_path.exists()
-            && std::fs::read_to_string(&hash_path).unwrap_or_default() == src_hash;
+        let cache_valid = Self::cache_valid(&obj_path, &hash_path, &src_hash);
 
         if !cache_valid {
             Self::hipcc_compile(
@@ -254,6 +359,7 @@ impl KernelCompiler {
                 source,
                 &self.extra_flags,
             )?;
+            Self::normalize_hipcc_output(&self.arch, &obj_path, name)?;
             let _ = std::fs::write(&hash_path, &src_hash);
         }
 
@@ -435,7 +541,7 @@ impl KernelCompiler {
                         let stored = std::fs::read_to_string(&hash_file).unwrap_or_default();
                         stored.trim() == src_hash
                     };
-                    if hash_ok {
+                    if hash_ok && Self::hsaco_is_elf(&precompiled) {
                         self.compiled.insert(name.to_string(), precompiled);
                         continue;
                     }
@@ -451,9 +557,7 @@ impl KernelCompiler {
             let hash_path = self.cache_dir.join(format!("{name}.hash"));
             let src_path = self.cache_dir.join(format!("{name}.hip"));
 
-            let cache_valid = obj_path.exists()
-                && hash_path.exists()
-                && std::fs::read_to_string(&hash_path).unwrap_or_default() == src_hash;
+            let cache_valid = Self::cache_valid(&obj_path, &hash_path, &src_hash);
 
             if cache_valid {
                 // Writeback to precompiled dir if missing
@@ -513,7 +617,8 @@ impl KernelCompiler {
                         &name,
                         &source,
                         &extra_flags,
-                    );
+                    )
+                    .and_then(|_| Self::normalize_hipcc_output(&arch, &obj_path, &name));
                     if result.is_ok() {
                         let _ = std::fs::write(&hash_path, &src_hash);
                         // Write back to precompiled dir

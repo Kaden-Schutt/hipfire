@@ -28,6 +28,8 @@
 #[cfg(feature = "deltanet")]
 pub mod arch;
 #[cfg(feature = "deltanet")]
+pub mod ffn_bf16;
+#[cfg(feature = "deltanet")]
 pub mod mtp_compose;
 #[cfg(feature = "deltanet")]
 pub mod mtp_head;

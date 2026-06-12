@@ -1,15 +1,9 @@
 # Stabilize Before Extraction
 
-Large runtime files such as `crates/hipfire-arch-qwen35/src/qwen35.rs`
-should not be split until the no-GPU and hardware gates around the
-current production paths are stable.
+This plan has been merged into
+[`modular-runtime-architecture.md`](modular-runtime-architecture.md).
 
-Extraction boundaries to revisit after the gates are green:
+The short version remains unchanged: stabilize correctness gates and typed
+boundaries before splitting large hot-path files such as `qwen35.rs`,
+`dispatch.rs`, or daemon serving state.
 
-- MoE batched prefill admission and dispatch planning.
-- DFlash/MTP target verification plumbing.
-- Prefill batch scratch allocation and shape invariants.
-- Format-specific grouped GEMM dispatch helpers.
-
-Do not combine extraction with MQ3/MQ6/MTP admission changes. First land
-the invariants, then move code with behavior-preserving tests.

@@ -5,6 +5,7 @@
 //! Qwen3.5 model: hybrid DeltaNet (linear attention) + standard attention.
 //! Feature-gated behind `deltanet`.
 
+use crate::ffn_bf16::{self, Bf16DownShadow, FfnBf16Mode};
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::{HipError, HipResult};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
@@ -784,6 +785,7 @@ pub struct DeltaNetLayerWeights {
     pub w_gate: WeightTensor,   // mlp.gate_proj
     pub w_up: WeightTensor,     // mlp.up_proj
     pub w_down: WeightTensor,   // mlp.down_proj
+    pub bf16_down_shadow: Option<Bf16DownShadow>,
 }
 
 /// Weights for a full attention (gated) layer — similar to Qwen3 but with q+gate split.
@@ -799,6 +801,7 @@ pub struct FullAttnLayerWeights {
     pub w_gate: WeightTensor,
     pub w_up: WeightTensor,
     pub w_down: WeightTensor,
+    pub bf16_down_shadow: Option<Bf16DownShadow>,
 }
 
 // ─── MoE FFN weights (Qwen3.5-MoE / A3B) ────────────────────────────────
@@ -1486,6 +1489,156 @@ fn qwen35_tensor_data<'a>(hfq: &'a HfqFile, name: &str) -> Option<(&'a HfqTensor
         }
     }
     None
+}
+
+fn load_bf16_down_shadow_for(
+    hfq: &HfqFile,
+    name: &str,
+    layer_idx: usize,
+    m: usize,
+    k: usize,
+) -> HipResult<Option<Bf16DownShadow>> {
+    if !ffn_bf16::enabled() || !ffn_bf16::layer_selected(layer_idx) {
+        return Ok(None);
+    }
+    let (info, data) =
+        qwen35_tensor_data_vec(hfq, name).unwrap_or_else(|| panic!("tensor not found: {name}"));
+    ffn_bf16::decode_w_down_shadow(&data, info.quant_type, m, k)
+        .map(Some)
+        .ok_or_else(|| {
+            HipError::new(
+                0,
+                &format!(
+                    "HIPFIRE_QWEN35_FFN_BF16 requires F32-oracle HFQ w_down (qt=2 F32 or qt=16 BF16) for layer {layer_idx}, tensor {name}; got qt={} shape={:?} bytes={}",
+                    info.quant_type,
+                    info.shape,
+                    data.len()
+                ),
+            )
+        })
+}
+
+fn validate_ffn_bf16_hfq_load(config: &Qwen35Config) -> HipResult<()> {
+    if !ffn_bf16::enabled() {
+        return Ok(());
+    }
+    if let ffn_bf16::LayerSelect::One(layer_idx) = ffn_bf16::config().layer {
+        if layer_idx >= config.n_layers {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "HIPFIRE_QWEN35_FFN_BF16_LAYER={layer_idx} is out of range for {} layers",
+                    config.n_layers
+                ),
+            ));
+        }
+    }
+    if config.num_experts > 0 {
+        return Err(HipError::new(
+            0,
+            "HIPFIRE_QWEN35_FFN_BF16 is dense-FFN only; MoE/A3B layers are out of scope for this probe",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_ffn_bf16_non_hfq_load(source: &str) -> HipResult<()> {
+    if ffn_bf16::enabled() {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "HIPFIRE_QWEN35_FFN_BF16 requires F32-oracle HFQ load path; {source} is unsupported"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn ffn_bf16_selected_shadow<'a>(
+    layer_idx: usize,
+    shadow: &'a Option<Bf16DownShadow>,
+) -> HipResult<Option<&'a Bf16DownShadow>> {
+    if !ffn_bf16::enabled() || !ffn_bf16::layer_selected(layer_idx) {
+        return Ok(None);
+    }
+    shadow.as_ref().map(Some).ok_or_else(|| {
+        HipError::new(
+            0,
+            &format!(
+                "HIPFIRE_QWEN35_FFN_BF16 selected dense layer {layer_idx}, but no BF16 w_down shadow was loaded; requires F32-oracle HFQ"
+            ),
+        )
+    })
+}
+
+fn weight_gemv_swiglu_residual_bf16_probe(
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    w_down: &WeightTensor,
+    shadow: &Option<Bf16DownShadow>,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    ffn_hidden: &GpuTensor,
+    x: &GpuTensor,
+) -> HipResult<()> {
+    let Some(shadow) = ffn_bf16_selected_shadow(layer_idx, shadow)? else {
+        return weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x);
+    };
+
+    match ffn_bf16::config().mode {
+        FfnBf16Mode::Off => weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x),
+        FfnBf16Mode::Xdna1 => Err(HipError::new(
+            0,
+            "HIPFIRE_QWEN35_FFN_BF16=xdna1 is reserved for the later XDNA1 BF16 stage; use compare or cpu for this CPU/oracle probe",
+        )),
+        FfnBf16Mode::Compare | FfnBf16Mode::Cpu => {
+            let t0 = std::time::Instant::now();
+            let residual_pre = gpu.download_f32(x)?;
+            let gate_cpu = gpu.download_f32(gate)?;
+            let up_cpu = gpu.download_f32(up)?;
+            let download_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let cpu_t0 = std::time::Instant::now();
+            let cpu_out = ffn_bf16::swiglu_down_bf16_cpu(&gate_cpu, &up_cpu, &residual_pre, shadow);
+            let cpu_ms = cpu_t0.elapsed().as_secs_f64() * 1000.0;
+
+            match ffn_bf16::config().mode {
+                FfnBf16Mode::Compare => {
+                    weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x)?;
+                    let gpu_out = gpu.download_f32(x)?;
+                    let stats = ffn_bf16::diff_stats(&gpu_out, &cpu_out);
+                    eprintln!(
+                        "[qwen35 ffn bf16] layer={layer_idx} mode=compare n={} max_abs={:.6e} mean_abs={:.6e} rms={:.6e} nan={} inf={}",
+                        stats.n,
+                        stats.max_abs,
+                        stats.mean_abs,
+                        stats.rms,
+                        stats.n_nan,
+                        stats.n_inf,
+                    );
+                    if ffn_bf16::config().trace {
+                        eprintln!(
+                            "[qwen35 ffn bf16] layer={layer_idx} timings download_ms={download_ms:.3} cpu_ms={cpu_ms:.3}"
+                        );
+                    }
+                    Ok(())
+                }
+                FfnBf16Mode::Cpu => {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(cpu_out.as_ptr().cast::<u8>(), cpu_out.len() * 4)
+                    };
+                    gpu.hip.memcpy_htod(&x.buf, bytes)?;
+                    if ffn_bf16::config().trace {
+                        eprintln!(
+                            "[qwen35 ffn bf16] layer={layer_idx} mode=cpu download_ms={download_ms:.3} cpu_ms={cpu_ms:.3}"
+                        );
+                    }
+                    Ok(())
+                }
+                FfnBf16Mode::Off | FfnBf16Mode::Xdna1 => unreachable!(),
+            }
+        }
+    }
 }
 
 fn bf16_to_f32(bits: u16) -> f32 {
@@ -3492,6 +3645,7 @@ pub fn load_weights(
     config: &Qwen35Config,
     gpu: &mut Gpu,
 ) -> HipResult<Qwen35Weights> {
+    validate_ffn_bf16_hfq_load(config)?;
     let load_t0 = std::time::Instant::now();
     let file_payload_bytes: usize = hfq.tensors().iter().map(|t| t.data_size).sum();
     let mut loaded_bytes = 0usize;
@@ -3923,6 +4077,13 @@ pub fn load_weights(
                         config.dim,
                         config.hidden_dim,
                     )?,
+                    bf16_down_shadow: load_bf16_down_shadow_for(
+                        hfq,
+                        &format!("{p}.mlp.down_proj.weight"),
+                        i,
+                        config.dim,
+                        config.hidden_dim,
+                    )?,
                 }));
             }
             (LayerType::FullAttention, false) => {
@@ -4007,6 +4168,13 @@ pub fn load_weights(
                         gpu,
                         slabs,
                         &format!("{p}.mlp.down_proj.weight"),
+                        config.dim,
+                        config.hidden_dim,
+                    )?,
+                    bf16_down_shadow: load_bf16_down_shadow_for(
+                        hfq,
+                        &format!("{p}.mlp.down_proj.weight"),
+                        i,
                         config.dim,
                         config.hidden_dim,
                     )?,
@@ -4310,6 +4478,7 @@ pub fn load_weights_paroquant(
     config: &Qwen35Config,
     gpu: &mut Gpu,
 ) -> HipResult<Qwen35Weights> {
+    reject_ffn_bf16_non_hfq_load("ParoQuant/safetensors load path")?;
     let qc = source
         .quant_config()
         .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
@@ -4502,6 +4671,7 @@ pub fn load_weights_paroquant(
                         gs,
                         kr,
                     )?,
+                    bf16_down_shadow: None,
                 }));
             }
             (LayerType::FullAttention, false) => {
@@ -4595,6 +4765,7 @@ pub fn load_weights_paroquant(
                         gs,
                         kr,
                     )?,
+                    bf16_down_shadow: None,
                 }));
             }
             (LayerType::LinearAttention, true) => {
@@ -4781,6 +4952,7 @@ pub fn load_weights_multi(
     config: &Qwen35Config,
     gpus: &mut Gpus,
 ) -> HipResult<Qwen35Weights> {
+    validate_ffn_bf16_hfq_load(config)?;
     let (token_embd, embd_fmt) = load_token_embd_into(hfq, config, &mut gpus.devices[0])?;
     let out_dev = gpus.output_device;
     let (output_norm, output) = load_output_into(hfq, config, &mut gpus.devices[out_dev])?;
@@ -5108,6 +5280,13 @@ fn load_layer_into(
                     config.dim,
                     config.hidden_dim,
                 )?,
+                bf16_down_shadow: load_bf16_down_shadow_for(
+                    hfq,
+                    &format!("{p}.mlp.down_proj.weight"),
+                    layer_idx,
+                    config.dim,
+                    config.hidden_dim,
+                )?,
             })
         }
         (LayerType::FullAttention, false) => {
@@ -5191,6 +5370,13 @@ fn load_layer_into(
                     gpu,
                     slabs,
                     &format!("{p}.mlp.down_proj.weight"),
+                    config.dim,
+                    config.hidden_dim,
+                )?,
+                bf16_down_shadow: load_bf16_down_shadow_for(
+                    hfq,
+                    &format!("{p}.mlp.down_proj.weight"),
+                    layer_idx,
                     config.dim,
                     config.hidden_dim,
                 )?,
@@ -19370,7 +19556,16 @@ fn run_fa_layer_body(
         }
         weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
     }
-    weight_gemv_swiglu_residual(gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x)?;
+    weight_gemv_swiglu_residual_bf16_probe(
+        gpu,
+        layer_idx,
+        &layer.w_down,
+        &layer.bf16_down_shadow,
+        &s.gate_ffn,
+        &s.up,
+        &s.ffn_hidden,
+        &s.x,
+    )?;
 
     Ok(())
 }
@@ -20110,9 +20305,11 @@ fn forward_scratch_layers(
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
-                weight_gemv_swiglu_residual(
+                weight_gemv_swiglu_residual_bf16_probe(
                     gpu,
+                    layer_idx,
                     &layer.w_down,
+                    &layer.bf16_down_shadow,
                     &s.gate_ffn,
                     &s.up,
                     &s.ffn_hidden,
@@ -20794,9 +20991,11 @@ fn forward_scratch_layers(
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
-                weight_gemv_swiglu_residual(
+                weight_gemv_swiglu_residual_bf16_probe(
                     gpu,
+                    layer_idx,
                     &layer.w_down,
+                    &layer.bf16_down_shadow,
                     &s.gate_ffn,
                     &s.up,
                     &s.ffn_hidden,
@@ -22147,9 +22346,11 @@ fn forward_scratch_layers_multi(
                         }
                         weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                     }
-                    weight_gemv_swiglu_residual(
+                    weight_gemv_swiglu_residual_bf16_probe(
                         gpu,
+                        layer_idx,
                         &layer.w_down,
+                        &layer.bf16_down_shadow,
                         &s.gate_ffn,
                         &s.up,
                         &s.ffn_hidden,
@@ -22667,9 +22868,11 @@ fn forward_scratch_layers_multi(
                         }
                         weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                     }
-                    weight_gemv_swiglu_residual(
+                    weight_gemv_swiglu_residual_bf16_probe(
                         gpu,
+                        layer_idx,
                         &layer.w_down,
+                        &layer.bf16_down_shadow,
                         &s.gate_ffn,
                         &s.up,
                         &s.ffn_hidden,
