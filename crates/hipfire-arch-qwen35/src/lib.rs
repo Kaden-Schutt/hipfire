@@ -52,4 +52,4 @@ pub mod grammar;
 pub use arch::Qwen35;
 
 #[cfg(feature = "deltanet")]
-pub use mtp_compose::{spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState};
+pub use mtp_compose::{build_mtp_tree_ar, spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState, MtpArTreeState};

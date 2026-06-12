@@ -61,6 +61,8 @@ fn main() {
     use hipfire_arch_qwen35::speculative::{
         self, DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, ModelSlotConfig, SpecStats,
     };
+    use hipfire_arch_qwen35::mtp_compose::MtpArTreeState;
+    use hipfire_arch_qwen35::mtp_head::{load_mtp_head, Qwen35MtpHead};
     use hipfire_runtime::cask::CaskCtx;
     use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
     use hipfire_runtime::hfq::HfqFile;
@@ -103,6 +105,7 @@ fn main() {
     }
     let mut target_path: Option<String> = None;
     let mut draft_path: Option<String> = None;
+    let mut mtp_path: Option<String> = None;
     let mut prompt: Option<String> = None;
     let mut prompts_file: Option<String> = None;
     let mut prompt_file: Option<String> = None;
@@ -228,6 +231,10 @@ fn main() {
             }
             "--draft" => {
                 draft_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--mtp" => {
+                mtp_path = Some(args[i + 1].clone());
                 i += 2;
             }
             "--prompt" => {
@@ -767,6 +774,44 @@ fn main() {
     // 1 + ddtree_budget) to cover plain DFlash and DDTree. Drops ~8
     // hipMalloc/hipFree pairs per cycle (biggest is 16 MB logits buffer),
     // saving 0.5-1.5 ms/cycle.
+    // ── MTP-AR tree state (opt-in via HIPFIRE_MTP_AR_TREE=1) ──────────────
+    // Allocate the MTP head and MtpArTreeState once at startup.
+    // Both are owned here; the spec step borrows them each cycle.
+    let use_mtp_ar_tree = std::env::var("HIPFIRE_MTP_AR_TREE").ok().as_deref() == Some("1");
+    let mtp_ar_head_owned: Option<Qwen35MtpHead> = if use_mtp_ar_tree {
+        let mtp_p = mtp_path
+            .as_deref()
+            .expect("HIPFIRE_MTP_AR_TREE=1 requires --mtp <path.mtp>");
+        eprintln!("mtp-ar: loading head from {mtp_p}");
+        let head = load_mtp_head(
+            std::path::Path::new(mtp_p),
+            &mut gpu,
+            ctx_capacity + ddtree_budget + 4,
+        )
+        .expect("load mtp head");
+        eprintln!(
+            "mtp-ar: head loaded (n_embd={} n_head_kv={} head_dim={})",
+            head.config.n_embd, head.config.n_head_kv, head.config.head_dim,
+        );
+        Some(head)
+    } else {
+        None
+    };
+    let mut mtp_ar_state_owned: Option<MtpArTreeState> = if use_mtp_ar_tree {
+        let head = mtp_ar_head_owned.as_ref().expect("mtp head must be Some");
+        Some(
+            MtpArTreeState::new(
+                &mut gpu,
+                head,
+                ddtree_budget + 2,
+                ddtree_topk.min(8).max(1),
+            )
+            .expect("alloc MtpArTreeState"),
+        )
+    } else {
+        None
+    };
+
     let verify_max_n = draft_scratch_b.max(1 + ddtree_budget);
     let verify_scratch = hipfire_arch_qwen35::speculative::VerifyScratch::with_prefill(
         &mut gpu,
@@ -1063,6 +1108,22 @@ fn main() {
         )
         .expect("seed scatter");
         draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
+        // ── MTP-AR: capture initial prev_hidden from scratch.tmp ─────────
+        // After seed_target_hidden_from_prompt, scratch.tmp holds the
+        // post-output-norm trunk hidden at position prompt_len - 1.
+        // This is the MTP root's prev_hidden for the first cycle
+        // (pos = prompt_len, next_token = first generated token).
+        if let Some(ref mut ar_state) = mtp_ar_state_owned {
+            let dim = target.config.dim;
+            gpu.hip.memcpy_dtod_at(
+                &ar_state.prev_hidden_scratch.buf,
+                0,
+                &target.scratch.tmp.buf,
+                0,
+                dim * 4,
+            ).expect("mtp-ar: initial prev_hidden D2D");
+            eprintln!("mtp-ar: initial prev_hidden captured from scratch.tmp");
+        }
         // Seed per-row absolute positions for the draft's cross-attention RoPE.
         // Pre-eviction these match [0..prompt_len) exactly, so FlashCASK-free runs
         // stay byte-identical to the old contiguous-range behaviour.
@@ -1680,6 +1741,8 @@ fn main() {
                         ctx_slice,
                         ddtree_budget,
                         ddtree_topk,
+                        mtp_ar_head_owned.as_ref(),
+                        mtp_ar_state_owned.as_mut(),
                     )
                     .expect("ddtree-batched spec step")
                 } else {

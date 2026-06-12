@@ -1227,3 +1227,423 @@ fn topk_indices(logits: &[f32], k: usize) -> Vec<u32> {
     items.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
     items.into_iter().map(|it| it.1).collect()
 }
+
+// ─── MTP-AR tree drafter (Vector Plate v1) ───────────────────────────────────
+//
+// Pure-MTP autoregressive tree: uses the MTP head alone in best-first tree
+// expansion without DFlash. Output is a `DdTree` compatible with the existing
+// `spec_step_ddtree_batched` single-pass verify path.
+//
+// KV tape: after each `mtp_head_forward(pos)`, D2H-copy the Q8 K/V bytes at
+// slot `pos`. Before each expansion at depth D, walk the ancestor chain and
+// H2D-restore each saved slot so the shared MTP KV cache holds the correct
+// causal prefix for this branch.
+
+use hipfire_runtime::ddtree::{DdNode, DdTree};
+
+/// Per-generation state for the MTP-AR tree drafter.
+pub struct MtpArTreeState {
+    /// Per-call scratch for `mtp_head_forward`.
+    pub mtp_scratch: Qwen35MtpHeadScratch,
+    /// Single-layer Q8 MTP KV cache.
+    pub mtp_kv: Qwen35MtpHeadKvCache,
+    /// Scratch for `prev_hidden` uploads (dim F32).
+    pub prev_hidden_scratch: GpuTensor,
+    /// GPU scratch: [max_topk] f32 (raw i32 bits) for topk indices.
+    pub topk_idx_buf: GpuTensor,
+    /// GPU scratch: [max_topk] f32 for topk log-probs.
+    pub topk_logp_buf: GpuTensor,
+    pub max_budget: usize,
+    pub max_topk: usize,
+    /// Q8 KV slot bytes per position: n_head_kv * (head_dim / 32) * 34.
+    pub kv_slot_bytes: usize,
+}
+
+impl MtpArTreeState {
+    pub fn new(
+        gpu: &mut Gpu,
+        head: &Qwen35MtpHead,
+        max_budget: usize,
+        max_topk: usize,
+    ) -> HipResult<Self> {
+        assert!(max_budget >= 1, "MtpArTreeState: max_budget >= 1");
+        assert!(
+            max_topk >= 1 && max_topk <= 8,
+            "MtpArTreeState: max_topk must be in [1, 8] (topk_logsumexp constraint)"
+        );
+        let cfg = &head.config;
+        let dim = cfg.n_embd;
+        let kv_slot_bytes = cfg.n_head_kv * (cfg.head_dim / 32) * 34;
+        Ok(Self {
+            mtp_scratch: Qwen35MtpHeadScratch::new(gpu, cfg)?,
+            mtp_kv: Qwen35MtpHeadKvCache::new(gpu, cfg)?,
+            prev_hidden_scratch: gpu.alloc_tensor(&[dim], DType::F32)?,
+            topk_idx_buf: gpu.alloc_tensor(&[max_topk], DType::F32)?,
+            topk_logp_buf: gpu.alloc_tensor(&[max_topk], DType::F32)?,
+            max_budget,
+            max_topk,
+            kv_slot_bytes,
+        })
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.prev_hidden_scratch);
+        let _ = gpu.free_tensor(self.topk_idx_buf);
+        let _ = gpu.free_tensor(self.topk_logp_buf);
+        self.mtp_scratch.free_gpu(gpu);
+        self.mtp_kv.inner.free_gpu(gpu);
+    }
+}
+
+/// Heap entry for best-first MTP-AR tree expansion.
+#[derive(PartialEq)]
+struct MtpArHeapEntry {
+    neg_logw: f32,
+    push_order: u64,
+    depth: usize,      // 1-indexed depth of candidate
+    rank: usize,       // 0-indexed rank in parent's top-K
+    parent_index: i32, // -1 = root is parent; ≥0 = node_states index
+    logw: f32,         // cumulative log-weight root → candidate
+}
+
+impl Eq for MtpArHeapEntry {}
+
+impl std::cmp::Ord for MtpArHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match other
+            .neg_logw
+            .partial_cmp(&self.neg_logw)
+            .unwrap_or(std::cmp::Ordering::Equal)
+        {
+            std::cmp::Ordering::Equal => other.push_order.cmp(&self.push_order),
+            ord => ord,
+        }
+    }
+}
+
+impl std::cmp::PartialOrd for MtpArHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// CPU-side snapshot saved after each MTP forward.
+struct MtpArNodeSnap {
+    pos: usize,
+    kv_k: Vec<u8>,
+    kv_v: Vec<u8>,
+    /// t_mtp_out bytes (dim × 4) — becomes next-level prev_hidden.
+    t_mtp_out: Vec<u8>,
+    /// Top-K indices for children.
+    child_topk_idx: Vec<u32>,
+    /// Top-K log-probs for children.
+    child_topk_logp: Vec<f32>,
+    /// Parent index in the DdNode sense (mirrors DdNode::parent_index).
+    parent_index: i32,
+}
+
+/// D2H-copy Q8 KV bytes at absolute position `pos`.
+fn mtp_ar_dtoh_slot(
+    gpu: &Gpu,
+    kv: &Qwen35MtpHeadKvCache,
+    pos: usize,
+    slot_bytes: usize,
+    is_k: bool,
+) -> HipResult<Vec<u8>> {
+    let off = pos * slot_bytes;
+    let raw_buf = if is_k { &kv.inner.k_gpu[0].buf } else { &kv.inner.v_gpu[0].buf };
+    let src = unsafe {
+        hip_bridge::DeviceBuffer::from_raw(
+            (raw_buf.as_ptr() as *mut u8).add(off) as *mut std::ffi::c_void,
+            slot_bytes,
+        )
+    };
+    let mut out = vec![0u8; slot_bytes];
+    gpu.hip.memcpy_dtoh(&mut out, &src)?;
+    Ok(out)
+}
+
+/// H2D-write `bytes` into KV slot at absolute position `pos`.
+fn mtp_ar_htod_slot(
+    gpu: &Gpu,
+    kv: &Qwen35MtpHeadKvCache,
+    pos: usize,
+    slot_bytes: usize,
+    is_k: bool,
+    bytes: &[u8],
+) -> HipResult<()> {
+    let off = pos * slot_bytes;
+    let raw_buf = if is_k { &kv.inner.k_gpu[0].buf } else { &kv.inner.v_gpu[0].buf };
+    let dst = unsafe {
+        hip_bridge::DeviceBuffer::from_raw(
+            (raw_buf.as_ptr() as *mut u8).add(off) as *mut std::ffi::c_void,
+            slot_bytes,
+        )
+    };
+    gpu.hip.memcpy_htod(&dst, bytes)?;
+    Ok(())
+}
+
+/// D2H-copy `n_elems` F32 values as raw bytes from a GpuTensor.
+fn mtp_ar_dtoh_f32(gpu: &Gpu, tensor: &GpuTensor, n_elems: usize) -> HipResult<Vec<u8>> {
+    let bytes = n_elems * 4;
+    let src = unsafe {
+        hip_bridge::DeviceBuffer::from_raw(tensor.buf.as_ptr(), bytes)
+    };
+    let mut out = vec![0u8; bytes];
+    gpu.hip.memcpy_dtoh(&mut out, &src)?;
+    Ok(out)
+}
+
+/// Run GPU top-K on the single-row logits in `state.mtp_scratch.logits`.
+/// Returns `(token_indices, log_probs)` on the host.
+fn mtp_ar_extract_topk(
+    gpu: &mut Gpu,
+    state: &MtpArTreeState,
+    vocab: usize,
+    topk: usize,
+) -> HipResult<(Vec<u32>, Vec<f32>)> {
+    let lv = state.mtp_scratch.logits.sub_offset(0, vocab);
+    let iv = state.topk_idx_buf.sub_offset(0, topk);
+    let pv = state.topk_logp_buf.sub_offset(0, topk);
+    gpu.topk_logsumexp_batched_f32(&lv, &iv, &pv, vocab, topk, 1)?;
+    let idx_raw = gpu.download_f32(&iv)?;
+    let logp = gpu.download_f32(&pv)?;
+    let idx: Vec<u32> = idx_raw
+        .iter()
+        .map(|&f| i32::from_ne_bytes(f.to_ne_bytes()) as u32)
+        .collect();
+    Ok((idx, logp))
+}
+
+/// Build an MTP-AR speculative tree via best-first expansion.
+///
+/// The returned `DdTree` has ≤ `budget` nodes and is compatible with
+/// `linearize_tree_with_parents` + `follow_verified_tree`.
+///
+/// Note on positions: tree node at depth `d` writes the MTP KV cache at
+/// `base_pos + d`. `linearize_tree` assigns `base_pos + depth` as the
+/// RoPE position for each node, matching the DDTree convention.
+#[allow(clippy::too_many_arguments)]
+pub fn build_mtp_tree_ar(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    state: &mut MtpArTreeState,
+    trunk_weights: &Qwen35Weights,
+    root_prev_hidden: &GpuTensor,
+    seed_token: u32,
+    base_pos: usize,
+    budget: usize,
+    topk: usize,
+) -> HipResult<DdTree> {
+    if budget == 0 {
+        return Ok(DdTree {
+            nodes: Vec::new(),
+            visibility: vec![vec![true]],
+            child_maps: vec![std::collections::HashMap::new()],
+        });
+    }
+    let topk = topk.min(state.max_topk).max(1);
+    let budget = budget.min(state.max_budget);
+    let cfg = &head.config;
+    let dim = cfg.n_embd;
+    let vocab = cfg.vocab_size;
+    let slot_bytes = state.kv_slot_bytes;
+
+    // Clear the MTP KV cache so stale bytes from prior cycles don't leak.
+    state.mtp_kv.reset(gpu)?;
+
+    // ── Root expansion (seed_token @ base_pos) ────────────────────────────
+    mtp_head::mtp_head_forward(
+        gpu,
+        head,
+        &state.mtp_scratch,
+        &mut state.mtp_kv,
+        seed_token,
+        root_prev_hidden,
+        base_pos,
+        trunk_weights,
+        &trunk_weights.output,
+    )?;
+    let (root_child_idx, root_child_logp) = mtp_ar_extract_topk(gpu, state, vocab, topk)?;
+    let root_kv_k = mtp_ar_dtoh_slot(gpu, &state.mtp_kv, base_pos, slot_bytes, true)?;
+    let root_kv_v = mtp_ar_dtoh_slot(gpu, &state.mtp_kv, base_pos, slot_bytes, false)?;
+    let root_t_mtp_out = mtp_ar_dtoh_f32(gpu, &state.mtp_scratch.t_mtp_out, dim)?;
+
+    // Encode the root as a virtual snap at index `usize::MAX` so ancestor
+    // walks can find it. We store it separately as `root_snap`.
+    let root_snap = MtpArNodeSnap {
+        pos: base_pos,
+        kv_k: root_kv_k,
+        kv_v: root_kv_v,
+        t_mtp_out: root_t_mtp_out,
+        child_topk_idx: root_child_idx,
+        child_topk_logp: root_child_logp,
+        parent_index: i32::MIN, // sentinal: no parent
+    };
+
+    // ── Node storage ──────────────────────────────────────────────────────
+    let mut snaps: Vec<MtpArNodeSnap> = Vec::with_capacity(budget);
+    let mut nodes: Vec<DdNode> = Vec::with_capacity(budget);
+    let mut child_maps: Vec<std::collections::HashMap<u32, usize>> = Vec::with_capacity(budget + 1);
+    child_maps.push(std::collections::HashMap::new()); // root slot
+
+    // ── Heap: seed with depth-1 candidate rank 0 ──────────────────────────
+    let mut heap: std::collections::BinaryHeap<MtpArHeapEntry> = std::collections::BinaryHeap::new();
+    let mut push_ctr: u64 = 0;
+    if !root_snap.child_topk_logp.is_empty() {
+        heap.push(MtpArHeapEntry {
+            neg_logw: -root_snap.child_topk_logp[0],
+            push_order: push_ctr,
+            depth: 1,
+            rank: 0,
+            parent_index: -1,
+            logw: root_snap.child_topk_logp[0],
+        });
+        push_ctr += 1;
+    }
+
+    // ── Expansion loop ────────────────────────────────────────────────────
+    while let Some(entry) = heap.pop() {
+        if nodes.len() >= budget {
+            break;
+        }
+        let MtpArHeapEntry { depth: d, rank, parent_index, logw, .. } = entry;
+        let mtp_pos = base_pos + d;
+
+        // Look up parent snap.
+        let (par_topk_idx, par_topk_logp, par_t_mtp_out_bytes) = if parent_index < 0 {
+            (
+                &root_snap.child_topk_idx,
+                &root_snap.child_topk_logp,
+                &root_snap.t_mtp_out,
+            )
+        } else {
+            let ns = &snaps[parent_index as usize];
+            (&ns.child_topk_idx, &ns.child_topk_logp, &ns.t_mtp_out)
+        };
+        let token = par_topk_idx[rank];
+        let parent_rank_logp = par_topk_logp[rank];
+        // Clone to release immutable borrow on `snaps` so we can push later.
+        let par_topk_idx_owned: Vec<u32> = par_topk_idx.to_vec();
+        let par_topk_logp_owned: Vec<f32> = par_topk_logp.to_vec();
+        // par_t_mtp_out_bytes is used in memcpy_htod below; clone it too.
+        let par_t_mtp_out_owned: Vec<u8> = par_t_mtp_out_bytes.to_vec();
+        // Drop the borrows from snaps so push later can proceed.
+        drop((par_topk_idx, par_topk_logp, par_t_mtp_out_bytes));
+        let par_topk_idx = &par_topk_idx_owned;
+        let par_topk_logp = &par_topk_logp_owned;
+        let par_t_mtp_out_bytes = &par_t_mtp_out_owned;
+
+        // ── Restore ancestor K/V chain ─────────────────────────────────────
+        // Ancestors of this node (depth d): root (base_pos) + depth-1..d-1 nodes.
+        // We walk parent_index chain to collect ancestor node indices in leaf-to-root
+        // order, then reverse.
+        {
+            // Restore root slot first.
+            mtp_ar_htod_slot(gpu, &state.mtp_kv, base_pos, slot_bytes, true, &root_snap.kv_k)?;
+            mtp_ar_htod_slot(gpu, &state.mtp_kv, base_pos, slot_bytes, false, &root_snap.kv_v)?;
+
+            // Walk ancestor chain from parent upward.
+            let mut anc: Vec<usize> = Vec::new();
+            let mut cur = parent_index;
+            while cur >= 0 {
+                anc.push(cur as usize);
+                cur = snaps[cur as usize].parent_index;
+            }
+            anc.reverse();
+            for idx in anc {
+                let ns = &snaps[idx];
+                mtp_ar_htod_slot(gpu, &state.mtp_kv, ns.pos, slot_bytes, true, &ns.kv_k)?;
+                mtp_ar_htod_slot(gpu, &state.mtp_kv, ns.pos, slot_bytes, false, &ns.kv_v)?;
+            }
+        }
+
+        // ── H2D parent t_mtp_out → prev_hidden_scratch ───────────────────
+        gpu.hip.memcpy_htod(&state.prev_hidden_scratch.buf, par_t_mtp_out_bytes)?;
+
+        // ── MTP forward at mtp_pos ────────────────────────────────────────
+        mtp_head::mtp_head_forward(
+            gpu,
+            head,
+            &state.mtp_scratch,
+            &mut state.mtp_kv,
+            token,
+            &state.prev_hidden_scratch,
+            mtp_pos,
+            trunk_weights,
+            &trunk_weights.output,
+        )?;
+
+        // ── Extract children's top-K ──────────────────────────────────────
+        let (child_topk_idx, child_topk_logp) = mtp_ar_extract_topk(gpu, state, vocab, topk)?;
+
+        // ── Save this node's snap ─────────────────────────────────────────
+        let current_index = nodes.len();
+        let kv_k = mtp_ar_dtoh_slot(gpu, &state.mtp_kv, mtp_pos, slot_bytes, true)?;
+        let kv_v = mtp_ar_dtoh_slot(gpu, &state.mtp_kv, mtp_pos, slot_bytes, false)?;
+        let t_mtp_out = mtp_ar_dtoh_f32(gpu, &state.mtp_scratch.t_mtp_out, dim)?;
+        snaps.push(MtpArNodeSnap {
+            pos: mtp_pos,
+            kv_k,
+            kv_v,
+            t_mtp_out,
+            child_topk_idx: child_topk_idx.clone(),
+            child_topk_logp: child_topk_logp.clone(),
+            parent_index,
+        });
+
+        // ── Register node in DdTree ───────────────────────────────────────
+        nodes.push(DdNode { token, depth: d as u32, parent_index });
+        child_maps.push(std::collections::HashMap::new());
+        let par_slot = if parent_index < 0 { 0 } else { (parent_index as usize) + 1 };
+        child_maps[par_slot].insert(token, current_index);
+
+        // ── Push sibling (rank+1, same parent, same depth) ───────────────
+        if rank + 1 < topk && rank + 1 < par_topk_idx.len() {
+            let sib_logp = par_topk_logp[rank + 1];
+            let sib_logw = logw - parent_rank_logp + sib_logp;
+            heap.push(MtpArHeapEntry {
+                neg_logw: -sib_logw,
+                push_order: push_ctr,
+                depth: d,
+                rank: rank + 1,
+                parent_index,
+                logw: sib_logw,
+            });
+            push_ctr += 1;
+        }
+
+        // ── Push first child (depth+1, rank 0) ───────────────────────────
+        if nodes.len() < budget && !child_topk_logp.is_empty() {
+            let child_logw = logw + child_topk_logp[0];
+            heap.push(MtpArHeapEntry {
+                neg_logw: -child_logw,
+                push_order: push_ctr,
+                depth: d + 1,
+                rank: 0,
+                parent_index: current_index as i32,
+                logw: child_logw,
+            });
+            push_ctr += 1;
+        }
+    }
+
+    // ── Build visibility matrix ───────────────────────────────────────────
+    let n = nodes.len();
+    let len = 1 + n;
+    let mut visibility: Vec<Vec<bool>> = vec![vec![false; len]; len];
+    visibility[0][0] = true;
+    for i in 1..len {
+        let par_slot = {
+            let p = nodes[i - 1].parent_index;
+            if p < 0 { 0 } else { (p as usize) + 1 }
+        };
+        for j in 0..i {
+            visibility[i][j] = visibility[par_slot][j];
+        }
+        visibility[i][i] = true;
+    }
+
+    Ok(DdTree { nodes, visibility, child_maps })
+}
