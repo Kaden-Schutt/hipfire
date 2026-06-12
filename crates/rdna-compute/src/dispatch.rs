@@ -24017,6 +24017,18 @@ impl Gpu {
         }
     }
 
+    fn q8_4w_mode(env: &str) -> Option<bool> {
+        match std::env::var(env).ok().as_deref() {
+            Some("0" | "off" | "false" | "no") => Some(false),
+            Some("1" | "on" | "true" | "yes") => Some(true),
+            _ => None,
+        }
+    }
+
+    fn gfx1151_q8_4w_enabled(mode: Option<bool>, auto: bool) -> bool {
+        mode.unwrap_or(auto)
+    }
+
     fn gemm_hfq4g256_mmq_gfx1151(
         &mut self,
         a_raw: &GpuTensor,
@@ -28536,14 +28548,15 @@ impl Gpu {
             0,
             "gemm_qkvza_q8_0_wmma: K must be a multiple of 32 (got K={k})"
         );
-        static Q8_QKVZA_4W: OnceLock<bool> = OnceLock::new();
-        let q8_qkvza_4w = *Q8_QKVZA_4W.get_or_init(|| {
-            !matches!(
-                std::env::var("HIPFIRE_Q8_QKVZA_4W").ok().as_deref(),
-                Some("0" | "off" | "false" | "no")
-            )
-        });
-        if q8_qkvza_4w && self.arch == "gfx1151" && batch_size % 64 == 0 && batch_size >= 128 {
+        static Q8_QKVZA_4W: OnceLock<Option<bool>> = OnceLock::new();
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let auto_q8_qkvza_4w =
+            batch_size >= 128 || (batch_size >= 64 && k == 3072 && total_m >= 8192);
+        let q8_qkvza_4w = Self::gfx1151_q8_4w_enabled(
+            *Q8_QKVZA_4W.get_or_init(|| Self::q8_4w_mode("HIPFIRE_Q8_QKVZA_4W")),
+            auto_q8_qkvza_4w,
+        );
+        if q8_qkvza_4w && self.arch == "gfx1151" && batch_size % 64 == 0 {
             return self.gemm_qkvza_q8_0_wmma_4w_gfx1151(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
                 alpha_m, k, batch_size,
@@ -28590,7 +28603,6 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
 
-        let total_m = qkv_m + z_m + beta_m + alpha_m;
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
         let q8_bytes = |m: usize| m * (k / 32) * 34;
@@ -28782,14 +28794,12 @@ impl Gpu {
             0,
             "gemm_gate_up_q8_0_wmma: K must be a multiple of 32 (got K={k})"
         );
-        static Q8_GATE_UP_4W: OnceLock<bool> = OnceLock::new();
-        let q8_gate_up_4w = *Q8_GATE_UP_4W.get_or_init(|| {
-            !matches!(
-                std::env::var("HIPFIRE_Q8_GATE_UP_4W").ok().as_deref(),
-                Some("0" | "off" | "false" | "no")
-            )
-        });
-        if q8_gate_up_4w && self.arch == "gfx1151" && batch_size % 64 == 0 && batch_size >= 128 {
+        static Q8_GATE_UP_4W: OnceLock<Option<bool>> = OnceLock::new();
+        let q8_gate_up_4w = Self::gfx1151_q8_4w_enabled(
+            *Q8_GATE_UP_4W.get_or_init(|| Self::q8_4w_mode("HIPFIRE_Q8_GATE_UP_4W")),
+            batch_size >= 128,
+        );
+        if q8_gate_up_4w && self.arch == "gfx1151" && batch_size % 64 == 0 {
             return self.gemm_gate_up_q8_0_wmma_4w_gfx1151(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             );
@@ -28972,14 +28982,13 @@ impl Gpu {
             0,
             "gemm_q8_0_residual_wmma: K must be a multiple of 32 (got K={k})"
         );
-        static Q8_RESIDUAL_4W: OnceLock<bool> = OnceLock::new();
-        let q8_residual_4w = *Q8_RESIDUAL_4W.get_or_init(|| {
-            !matches!(
-                std::env::var("HIPFIRE_Q8_RESIDUAL_4W").ok().as_deref(),
-                Some("0" | "off" | "false" | "no")
-            )
-        });
-        if q8_residual_4w && self.arch == "gfx1151" && batch_size % 64 == 0 && batch_size >= 128 {
+        static Q8_RESIDUAL_4W: OnceLock<Option<bool>> = OnceLock::new();
+        let auto_q8_residual_4w = batch_size >= 128 || (batch_size >= 64 && m == 3072 && k >= 8192);
+        let q8_residual_4w = Self::gfx1151_q8_4w_enabled(
+            *Q8_RESIDUAL_4W.get_or_init(|| Self::q8_4w_mode("HIPFIRE_Q8_RESIDUAL_4W")),
+            auto_q8_residual_4w,
+        );
+        if q8_residual_4w && self.arch == "gfx1151" && batch_size % 64 == 0 {
             return self.gemm_q8_0_residual_wmma_4w_gfx1151(a, x, y, m, k, batch_size);
         }
         self.ensure_kernel(
@@ -29143,14 +29152,15 @@ impl Gpu {
             0,
             "gemm_qkv_q8_0_wmma: K must be a multiple of 32 (got K={k})"
         );
-        static Q8_QKV_4W: OnceLock<bool> = OnceLock::new();
-        let q8_qkv_4w = *Q8_QKV_4W.get_or_init(|| {
-            !matches!(
-                std::env::var("HIPFIRE_Q8_QKV_4W").ok().as_deref(),
-                Some("0" | "off" | "false" | "no")
-            )
-        });
-        if q8_qkv_4w && self.arch == "gfx1151" && batch_size % 64 == 0 && batch_size >= 128 {
+        static Q8_QKV_4W: OnceLock<Option<bool>> = OnceLock::new();
+        let total_m = q_m + k_m + v_m;
+        let auto_q8_qkv_4w =
+            batch_size >= 128 || (batch_size >= 64 && k == 3072 && total_m >= 8192);
+        let q8_qkv_4w = Self::gfx1151_q8_4w_enabled(
+            *Q8_QKV_4W.get_or_init(|| Self::q8_4w_mode("HIPFIRE_Q8_QKV_4W")),
+            auto_q8_qkv_4w,
+        );
+        if q8_qkv_4w && self.arch == "gfx1151" && batch_size % 64 == 0 {
             return self.gemm_qkv_q8_0_wmma_4w_gfx1151(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
             );
@@ -29190,7 +29200,6 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
 
-        let total_m = q_m + k_m + v_m;
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
 

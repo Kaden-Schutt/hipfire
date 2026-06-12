@@ -293,11 +293,11 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_Q8_BATCHED_LEGACY` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:228` |
 | `HIPFIRE_Q8_DP4A` | (A2) dp4a wave32 (gfx906 v_dot4_i32_i8 Q·K) | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:185` |
 | `HIPFIRE_Q8_DP4A_W64` | (A3) dp4a WAVE64 (full 64-lane utilization) | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:196` |
-| `HIPFIRE_Q8_GATE_UP_4W` | Default ON for gfx1151 Q8 gate+up prefill when "N>=128" and "N%64==0"; set to "0" to use the single-wave WMMA path | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28420` |
+| `HIPFIRE_Q8_GATE_UP_4W` | gfx1151 Q8 gate+up 4w control: unset auto-routes aligned N>=128, "0" forces single-wave WMMA, "1" forces 4w for aligned N%64==0 experiments | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28794` |
 | `HIPFIRE_Q8_GATE_UP_BENCH` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:129` |
-| `HIPFIRE_Q8_QKVZA_4W` | Interprets "HIPFIRE_Q8_QKVZA_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28174` |
-| `HIPFIRE_Q8_QKV_4W` | Interprets "HIPFIRE_Q8_QKV_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28781` |
-| `HIPFIRE_Q8_RESIDUAL_4W` | Interprets "HIPFIRE_Q8_RESIDUAL_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28610` |
+| `HIPFIRE_Q8_QKVZA_4W` | gfx1151 Q8 QKVZA 4w control: unset auto-routes aligned N>=128 and large Qwen3.5-122B K=3072,N>=64 shapes, "0" forces single-wave WMMA, "1" forces 4w | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28548` |
+| `HIPFIRE_Q8_QKV_4W` | gfx1151 Q8 QKV 4w control: unset auto-routes aligned N>=128 and large Qwen3.5-122B K=3072,N>=64 shapes, "0" forces single-wave WMMA, "1" forces 4w | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:29153` |
+| `HIPFIRE_Q8_RESIDUAL_4W` | gfx1151 Q8 residual 4w control: unset auto-routes aligned N>=128 and Qwen3.5-122B M=3072,K>=8192,N>=64 residuals, "0" forces single-wave WMMA, "1" forces 4w | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28982` |
 | `HIPFIRE_Q8_TOKPAR` | (A) NEW token-parallel | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:174` |
 | `HIPFIRE_Q8_WMMA_4W` | originally shipped default-ON on gfx11/gfx12, but the auto-enable | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28064` |
 | `HIPFIRE_Q8_WMMA_X64` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:27875` |

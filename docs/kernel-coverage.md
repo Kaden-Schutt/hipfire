@@ -131,6 +131,22 @@ gate/up vs `938.9ms` indexed gate/up across 40 calls).
 | fused qkv hfp4g32 | — | — | — | — | — | standard |
 | fused qkv q8_0 | — | — | — | — | standard (wmma 4w) | standard |
 
+gfx1151 Q8_0 fused prefill uses the four-warp 64x64 WMMA family for large
+Qwen3.5/3.6 Q8 shapes. The conservative default remains `B>=128` for broad
+Q8_0 fused projections, but Qwen3.5-122B-A10B `B=64` now auto-routes the
+large `K=3072` QKVZA/QKV projections and `M=3072,K>=8192` residuals through
+the gfx1151 4w kernels. On Qwen3.5-122B-A10B MQ4 pp64 profiling this moved
+total profiled prefill from 441.3 ms to 294.9 ms; the main Q8 buckets moved
+`gemm_qkvza_q8_0_wmma` 173.8 ms to `gemm_qkvza_q8_0_wmma_4w_gfx1151`
+47.9 ms, `gemm_qkv_q8_0_wmma` 33.5 ms to
+`gemm_qkv_q8_0_wmma_4w_gfx1151` 16.3 ms, and
+`gemm_q8_0_residual_wmma` 25.4 ms to
+`gemm_q8_0_residual_wmma_4w_gfx1151` 16.3 ms. The per-kernel env vars
+`HIPFIRE_Q8_QKVZA_4W`, `HIPFIRE_Q8_QKV_4W`,
+`HIPFIRE_Q8_RESIDUAL_4W`, and `HIPFIRE_Q8_GATE_UP_4W` are tri-state:
+unset uses the shape gate, `0` forces the single-wave path, and `1` forces
+the gfx1151 4w path for aligned `B%64==0` experiments.
+
 ### Attention
 
 | Kernel group | gfx906 | gfx942 | gfx1030 | gfx1100 | gfx1151 | gfx12 |
