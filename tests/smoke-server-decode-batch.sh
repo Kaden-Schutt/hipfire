@@ -10,6 +10,11 @@ EXPECTED_DECODE_BACKEND="${EXPECTED_DECODE_BACKEND:-}"
 SERVER_SMOKE_LOCK="${HIPFIRE_SERVER_SMOKE_LOCK:-${TMPDIR:-/tmp}/hipfire-server-smoke.lock}"
 SERVER_SMOKE_LOCK_WAIT="${HIPFIRE_SERVER_SMOKE_LOCK_WAIT:-300}"
 
+# Set HIPFIRE_DECODE_BATCH_GROUPED_PARITY_MATRIX=1 with
+# HIPFIRE_QWEN35_DECODE_BATCH=fused_grouped_moe to compare serial_reference
+# against native grouped-MoE decode at B=2/4/8. B=4 and B=8 force chunk size
+# 2 so the smoke covers multi-chunk native grouped-MoE advancement.
+
 exec 9>"$SERVER_SMOKE_LOCK"
 if ! flock -w "$SERVER_SMOKE_LOCK_WAIT" 9; then
   echo "timed out waiting for server smoke lock: $SERVER_SMOKE_LOCK" >&2
@@ -267,19 +272,78 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
 
 
 parity_enabled = os.environ.get("HIPFIRE_DECODE_BATCH_PARITY", "").lower() in {"1", "true", "yes"}
-if parity_enabled and expected_decode_backend in {"fused_dense_layer_chunked", "fused_grouped_moe_layer_chunked"}:
-    serial = run_scenario("serial", "serial_reference", "hipfire-server-decode-batch-parity-serial-")
-    fused = run_scenario(decode_backend, expected_decode_backend, "hipfire-server-decode-batch-parity-fused-")
-    if serial["contents"] != fused["contents"]:
+
+
+def run_parity_pair(batch_size: int, chunk_size: int | None = None) -> dict[str, Any]:
+    global request_count, requested_decode_chunk_size
+
+    old_request_count = request_count
+    old_requested_chunk_size = requested_decode_chunk_size
+    old_chunk_env = os.environ.get("HIPFIRE_QWEN35_DECODE_BATCH_MAX")
+    request_count = batch_size
+    if chunk_size is None:
+        requested_decode_chunk_size = old_requested_chunk_size
+        if old_chunk_env is None:
+            os.environ.pop("HIPFIRE_QWEN35_DECODE_BATCH_MAX", None)
+        else:
+            os.environ["HIPFIRE_QWEN35_DECODE_BATCH_MAX"] = old_chunk_env
+    else:
+        requested_decode_chunk_size = chunk_size
+        os.environ["HIPFIRE_QWEN35_DECODE_BATCH_MAX"] = str(chunk_size)
+    try:
+        serial = run_scenario("serial", "serial_reference", f"hipfire-server-decode-batch-parity-b{batch_size}-serial-")
+        fused = run_scenario(decode_backend, expected_decode_backend, f"hipfire-server-decode-batch-parity-b{batch_size}-fused-")
+        if serial["contents"] != fused["contents"]:
+            raise RuntimeError(
+                "serial/fused decode response parity mismatch: "
+                f"batch_size={batch_size} chunk_size={chunk_size} "
+                f"serial={serial['contents']} fused={fused['contents']} "
+                f"serial_log={serial['log_path']} fused_log={fused['log_path']}"
+            )
+        return {
+            "batch_size": batch_size,
+            "chunk_size": chunk_size,
+            "serial_log": serial["log_path"],
+            "fused_log": fused["log_path"],
+            "log_path": fused["log_path"],
+            "contents": fused["contents"],
+            "checks": fused["checks"],
+            "responses": fused["responses"],
+        }
+    finally:
+        request_count = old_request_count
+        requested_decode_chunk_size = old_requested_chunk_size
+        if old_chunk_env is None:
+            os.environ.pop("HIPFIRE_QWEN35_DECODE_BATCH_MAX", None)
+        else:
+            os.environ["HIPFIRE_QWEN35_DECODE_BATCH_MAX"] = old_chunk_env
+
+
+matrix_enabled = os.environ.get("HIPFIRE_DECODE_BATCH_GROUPED_PARITY_MATRIX", "").lower() in {"1", "true", "yes"}
+if matrix_enabled:
+    if expected_decode_backend != "fused_grouped_moe_layer_chunked":
         raise RuntimeError(
-            "serial/fused decode response parity mismatch: "
-            f"serial={serial['contents']} fused={fused['contents']} "
-            f"serial_log={serial['log_path']} fused_log={fused['log_path']}"
+            "HIPFIRE_DECODE_BATCH_GROUPED_PARITY_MATRIX requires "
+            "HIPFIRE_QWEN35_DECODE_BATCH=fused_grouped_moe"
         )
-    result = fused
+    matrix = [
+        run_parity_pair(2, 2),
+        run_parity_pair(4, 2),
+        run_parity_pair(8, 2),
+    ]
+    result = matrix[-1]
+    print(
+        "server grouped-MoE decode parity matrix passed: "
+        + " ".join(
+            f"B={entry['batch_size']} chunks={entry['checks'].get('decode_last_chunk_count')}/{entry['checks'].get('decode_last_chunk_size')}"
+            for entry in matrix
+        )
+    )
+elif parity_enabled and expected_decode_backend in {"fused_dense_layer_chunked", "fused_grouped_moe_layer_chunked"}:
+    result = run_parity_pair(request_count)
     print(
         "server decode batching parity passed: "
-        f"contents={result['contents']} serial_log={serial['log_path']} fused_log={result['log_path']}"
+        f"contents={result['contents']} serial_log={result['serial_log']} fused_log={result['fused_log']}"
     )
 else:
     result = run_scenario(decode_backend, expected_decode_backend, "hipfire-server-decode-batch-")

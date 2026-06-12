@@ -20,7 +20,11 @@
     Status: explicit Qwen35-MoE `fused_grouped_moe_layer_chunked` decode now advances multi-session chunks through the native grouped-MoE row worker.
     `serial_reference` remains the oracle, internal parity can compare native and serial state, forced multi-chunk mode is covered, and real A3B
     server parity/latency smokes pass for B=2/4/8 with a forced chunk cap. `auto` remains serial for grouped-MoE until broader latency evidence is
-    strong enough to promote.
+    strong enough to promote. The decode-batch smoke now has an opt-in grouped-MoE parity matrix mode covering B=2/4/8 with chunk size 2; B=4 and
+    B=8 force multi-chunk native grouped-MoE decode while comparing responses against `serial_reference`.
+    Current smoke blocker: `tests/smoke-generate-batch-prefill.sh` cannot run against this host's local dense 0.8B MQ4 artifact
+    (`qwen3.5-0.8b.mq4.hfq`) because fused dense prefill final logits reject `lm_head dtype Q8_0`; rerun with a canonical dense artifact whose
+    output dtype is supported by fused dense prefill.
 
   - Add backend-neutral prefill checkpoint hooks so fused prefill can emit semantic-boundary checkpoints, not only final checkpoints. The hook should
     carry: session id, logical token position, boundary kind, prefix hash input, and state handle.
