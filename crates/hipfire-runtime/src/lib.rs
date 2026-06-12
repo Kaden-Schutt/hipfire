@@ -22,6 +22,7 @@ pub mod hfq;
 pub mod kv_adaptive;
 pub mod llama;
 pub mod model_source;
+pub mod mtp_mirror;
 pub mod safetensors_source;
 pub mod loop_guard;
 pub mod multi_gpu;

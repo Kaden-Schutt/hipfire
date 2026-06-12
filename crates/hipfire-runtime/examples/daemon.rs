@@ -29,6 +29,8 @@ use hipfire_arch_minimax as minimax;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_llama::Llama;
 use hipfire_arch_qwen2::qwen2;
+use hipfire_arch_qwen35::mtp_head::{self, MtpKvMode, Qwen35MtpHead};
+use hipfire_arch_qwen35::mtp_spec::{MtpHeteroDrafterState, MtpSpecState};
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType, Qwen35ScratchSet};
 use hipfire_arch_qwen35::speculative::{
@@ -1057,6 +1059,18 @@ struct DflashState {
     ddtree: Option<DdtreeState>,
 }
 
+/// Optional Qwen3.5/Qwen3.6 MTP speculative-decoding state.
+///
+/// The daemon currently wires the PP+MTP path; single-GPU qwen MTP remains
+/// exercised through `mtp_only_demo`.
+struct MtpState {
+    head: Qwen35MtpHead,
+    spec_state: MtpSpecState,
+    max_n: usize,
+    compressed: bool,
+    drafter_state: Option<MtpHeteroDrafterState>,
+}
+
 /// Side state for DDTree-mode speculative decoding. Allocated alongside
 /// the rest of `DflashState` at model-load time when DDTree is enabled,
 /// reused across all decode cycles.
@@ -1301,6 +1315,8 @@ struct LoadedModel {
     model_path: String,
     // DFlash speculative decoding state (populated when load supplied a draft).
     dflash: Option<DflashState>,
+    // Qwen MTP speculative decoding state. Populated for PP+MTP loads.
+    mtp: Option<MtpState>,
     // Upstream HF Jinja chat_template, extracted from the HFQ
     // `tokenizer_config.chat_template` at load time. `None` when the source
     // model didn't ship one (rare for instruct models). Only consumed when
@@ -1645,6 +1661,25 @@ fn main() {
                     .and_then(|p| p.get("mtp_k"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(3) as usize;
+                let raw_mtp_head = msg
+                    .get("params")
+                    .and_then(|p| p.get("mtp_head"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let mtp_head_path = if mtp_mode == "off" {
+                    if let Some(path) = raw_mtp_head.as_deref() {
+                        eprintln!("[hipfire-daemon] mtp_mode=off — skipping MTP head load ({path})");
+                    }
+                    None
+                } else {
+                    raw_mtp_head
+                };
+                let mtp_kv_mode_str = msg
+                    .get("params")
+                    .and_then(|p| p.get("mtp_kv_mode"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("q8");
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
                 // `adaptive_b` matches dflash_spec_demo's --adaptive-b default.
@@ -1719,6 +1754,22 @@ fn main() {
                     core_frac: cask_core_frac,
                     fold_m: cask_fold_m,
                 };
+                if mtp_head_path.is_some() && draft_path.is_some() {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"MTP head and DFlash draft are mutually exclusive speculative decode paths. Remove one and retry."}}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                if mtp_head_path.is_some() && cask_enabled {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"error","message":"MTP head and CASK/eviction are not compatible yet; disable one and retry."}}"#
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
 
                 // MMQ per-weight screening (#87): detect outlier rows that
                 // cause Q8_1 precision loss and fall back to WMMA for those
@@ -1911,6 +1962,9 @@ fn main() {
                         state_quant_override.as_deref(),
                         &cask,
                         pp,
+                        mtp_head_path.as_deref(),
+                        mtp_k,
+                        mtp_kv_mode_str,
                         &mut gpu,
                     )
                 };
@@ -3301,6 +3355,9 @@ fn load_model(
     state_quant_override: Option<&str>,
     cask: &CaskConfig,
     pp: usize,
+    mtp_head_path: Option<&str>,
+    mtp_k: usize,
+    mtp_kv_mode_str: &str,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
     if pp > 1 {
@@ -3317,7 +3374,16 @@ fn load_model(
             kv_mode_override,
             state_quant_override,
             pp,
+            mtp_head_path,
+            mtp_k,
+            mtp_kv_mode_str,
             gpu,
+        );
+    }
+    if mtp_head_path.is_some() {
+        return Err(
+            "daemon qwen MTP is currently wired for pp>1 only; use mtp_only_demo for single-GPU MTP"
+                .to_string(),
         );
     }
     // Per-load kv_mode (sent in load message params) overrides the env var.
@@ -3560,6 +3626,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            mtp: None,
             chat_template,
         });
     }
@@ -3645,6 +3712,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            mtp: None,
             chat_template,
         });
     }
@@ -3751,6 +3819,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            mtp: None,
             chat_template,
         });
     }
@@ -3850,6 +3919,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            mtp: None,
             chat_template,
         });
     }
@@ -3964,6 +4034,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            mtp: None,
             chat_template,
         });
     }
@@ -4424,6 +4495,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash,
+            mtp: None,
             chat_template,
         })
     } else {
@@ -4499,6 +4571,7 @@ fn load_model(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            mtp: None,
             chat_template,
         })
     }
@@ -4660,6 +4733,7 @@ fn load_model_safetensors(
             decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
+            mtp: None,
             chat_template,
         });
     }
@@ -4803,6 +4877,7 @@ fn load_model_safetensors(
         decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
+        mtp: None,
         chat_template,
     })
 }
@@ -4820,6 +4895,9 @@ fn load_model_pp(
     kv_mode_override: Option<&str>,
     state_quant_override: Option<&str>,
     pp: usize,
+    mtp_head_path: Option<&str>,
+    mtp_k: usize,
+    mtp_kv_mode_str: &str,
     _gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
     let kv_mode = kv_mode_override
@@ -4988,6 +5066,110 @@ fn load_model_pp(
         .enable_peer_all()
         .map_err(|e| format!("enable_peer_all: {e}"))?;
 
+    let mut mtp: Option<MtpState> = None;
+    let want_bundled_mtp = mtp_head_path.is_none()
+        && mtp_head::detect_bundled_mtp_offset(Path::new(path))
+            .map_err(|e| format!("detect bundled MTP: {e}"))?
+            .is_some();
+    if mtp_head_path.is_some() || want_bundled_mtp {
+        let output_device = gpus.output_device;
+        let kv_mode = MtpKvMode::parse(mtp_kv_mode_str)?;
+        let head = {
+            let dev = &mut gpus.devices[output_device];
+            dev.bind_thread().map_err(|e| format!("{e}"))?;
+            if let Some(mp) = mtp_head_path {
+                mtp_head::load_mtp_head(Path::new(mp), dev, max_seq).map_err(|e| format!("{e}"))?
+            } else {
+                mtp_head::load_mtp_head_bundled(Path::new(path), dev, max_seq)
+                    .map_err(|e| format!("{e}"))?
+                    .ok_or_else(|| "bundled MTP trailer disappeared during load".to_string())?
+            }
+        };
+        if head.config.n_embd != config.dim {
+            return Err(format!(
+                "MTP head n_embd={} != trunk dim={}",
+                head.config.n_embd, config.dim
+            ));
+        }
+        if head.config.vocab_size != config.vocab_size {
+            return Err(format!(
+                "MTP head vocab_size={} != trunk vocab={}",
+                head.config.vocab_size, config.vocab_size
+            ));
+        }
+        if (head.config.rope_theta - config.rope_theta).abs() > 1e-3 {
+            return Err(format!(
+                "MTP head rope_theta={} != trunk rope_theta={}",
+                head.config.rope_theta, config.rope_theta
+            ));
+        }
+        let cvs = head
+            .weights
+            .compressed_vocab_size
+            .ok_or_else(|| "PP+MTP requires compressed-sidecar .mtp".to_string())?;
+        if head.weights.lm_head_draft.is_none() || head.weights.lm_head_draft_vocab_map_gpu.is_none()
+        {
+            return Err("PP+MTP requires lm_head_draft and GPU vocab map".to_string());
+        }
+        let mut spec_state = {
+            let dev = &mut gpus.devices[output_device];
+            MtpSpecState::new_for_config_with_kv_mode(
+                dev,
+                &config,
+                &dn,
+                &head,
+                mtp_k.max(1),
+                kv_mode,
+            )
+            .map_err(|e| format!("{e}"))?
+        };
+        {
+            let dev = &mut gpus.devices[output_device];
+            spec_state
+                .ensure_compressed_lm_logits(dev, cvs)
+                .map_err(|e| format!("{e}"))?;
+        }
+        let mirrored_token_embd = if output_device == 0 {
+            let dev = &mut gpus.devices[0];
+            hipfire_runtime::mtp_mirror::clone_tensor_same(dev, &weights.token_embd)
+                .map_err(|e| format!("clone token_embd: {e}"))?
+        } else {
+            let (left, right) = gpus.devices.split_at_mut(output_device);
+            let src = &left[0];
+            let dst = &mut right[0];
+            hipfire_runtime::mtp_mirror::clone_tensor_peer(src, dst, &weights.token_embd)
+                .map_err(|e| format!("peer clone token_embd: {e}"))?
+        };
+        let drafter_state = MtpHeteroDrafterState::new_for_pp(
+            &mut gpus,
+            output_device,
+            &dn,
+            &la_to_device,
+            &head,
+            mtp_k.max(1),
+            kv_mode,
+            mirrored_token_embd,
+            weights.embd_format,
+        )
+        .map_err(|e| format!("{e}"))?;
+        eprintln!(
+            "  MTP head loaded on output_device={} (n_embd={}, vocab={}, cvs={}, k={}, kv={:?})",
+            output_device,
+            head.config.n_embd,
+            head.config.vocab_size,
+            cvs,
+            mtp_k.max(1),
+            kv_mode,
+        );
+        mtp = Some(MtpState {
+            head,
+            spec_state,
+            max_n: mtp_k.max(1),
+            compressed: true,
+            drafter_state: Some(drafter_state),
+        });
+    }
+
     eprintln!(
         "  pp={pp} loaded: layer_to_device={:?}, output_device={}, peer_access={}",
         gpus.layer_to_device, gpus.output_device, gpus.peer_access_enabled,
@@ -5045,6 +5227,7 @@ fn load_model_pp(
         decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
+        mtp,
         chat_template: resolve_chat_template(&hfq, path),
     })
 }
@@ -5235,6 +5418,7 @@ fn load_model_ep(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, S
         decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
+        mtp: None,
         chat_template,
     })
 }
@@ -5357,6 +5541,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
+        mtp: None,
         chat_template,
     })
 }
@@ -5828,6 +6013,15 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // weights, so each free targets a still-live owner.
     if m.pp > 1 {
         let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
+        let output_device = gpus.output_device;
+        if let Some(mut mtp) = m.mtp {
+            if let Some(drafter_state) = mtp.drafter_state.take() {
+                drafter_state.free_gpu(&mut gpus, output_device);
+            }
+            let g = &mut gpus.devices[output_device];
+            mtp.spec_state.free_gpu(g);
+            mtp.head.free_gpu(g);
+        }
         if let Some(scratch_set) = m.pp_scratch_set {
             scratch_set.free_gpu_multi(&mut gpus);
         }
@@ -8438,6 +8632,506 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn generate_pp_mtp(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    stop: &[String],
+) {
+    let tokenizer = m.tokenizer.take().expect("loaded model tokenizer");
+    let chat_template = m.chat_template.clone();
+    let raw_q_tokens = tokenizer.encode(prompt);
+    let prompt_est = raw_q_tokens.len() + 20;
+
+    macro_rules! reset_pp_recurrent {
+        () => {{
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            free_checkpoints(&mut m.prefill_checkpoints, gpu);
+            free_checkpoints(&mut m.dflash_checkpoints, gpu);
+            if let (Some(ref dn), Some(ref mut gpus), Some(ref la)) = (
+                m.dn_state.as_ref(),
+                m.pp_gpus.as_mut(),
+                m.pp_dn_la_to_device.as_ref(),
+            ) {
+                for (i, s) in dn.s_matrices.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    let _ = g.bind_thread();
+                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for (i, s) in dn.s_scales.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    let _ = g.bind_thread();
+                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                }
+                for (i, s) in dn.conv_states.iter().enumerate() {
+                    let g = &mut gpus.devices[la[i] as usize];
+                    let _ = g.bind_thread();
+                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+                }
+            }
+            if let Some(kv) = m.kv_cache.as_mut() {
+                kv.compact_offset = 0;
+            }
+            if let (Some(mtp), Some(gpus)) = (m.mtp.as_mut(), m.pp_gpus.as_mut()) {
+                let out = gpus.output_device;
+                let g = &mut gpus.devices[out];
+                let _ = mtp.spec_state.mtp_kv.reset(g);
+                if let Some(ds) = mtp.drafter_state.as_mut() {
+                    let _ = ds.mtp_kv.reset(g);
+                }
+            }
+        }};
+    }
+
+    if m.seq_pos + prompt_est + max_tokens > m.max_seq {
+        eprintln!(
+            "[daemon] pp-mtp context full ({}/{}) — resetting conversation",
+            m.seq_pos, m.max_seq
+        );
+        reset_pp_recurrent!();
+    }
+
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let try_jinja = jinja_enabled && chat_template.is_some();
+    let new_tokens = if try_jinja {
+        let template = chat_template.as_ref().unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer: &tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: max_think_tokens != 1,
+            bos_token: None,
+        };
+        let render_result = if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(m) => m,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(e) => {
+                eprintln!("[daemon] jinja render failed in pp-mtp path ({e}) — falling back to Plain");
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer: &tokenizer,
+                    system: if m.seq_pos == 0 { system_prompt } else { None },
+                    user: "",
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build_with_user_tokens(&raw_q_tokens)
+            }
+        }
+    } else {
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer: &tokenizer,
+            system: if m.seq_pos == 0 { system_prompt } else { None },
+            user: "",
+            assistant_prefix,
+            raw: false,
+        }
+        .build_with_user_tokens(&raw_q_tokens)
+    };
+
+    if try_jinja && m.seq_pos > 0 {
+        reset_pp_recurrent!();
+    }
+
+    let im_end = tokenizer.encode("<|im_end|>");
+    let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    if new_tokens.is_empty() {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"pp-mtp prompt encoded to zero tokens"}}"#,
+            id
+        );
+        let _ = stdout.flush();
+        m.tokenizer = Some(tokenizer);
+        return;
+    }
+    if m.seq_pos + new_tokens.len() + max_tokens > m.physical_cap {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} > physical_cap={}"}}"#,
+            id,
+            m.seq_pos,
+            new_tokens.len(),
+            max_tokens,
+            m.physical_cap
+        );
+        let _ = stdout.flush();
+        m.tokenizer = Some(tokenizer);
+        return;
+    }
+
+    let t0 = Instant::now();
+    let config = m.q35_config.as_ref().unwrap().clone();
+    let output_device = m.pp_gpus.as_ref().unwrap().output_device;
+    let dim = config.dim;
+    let start_pos = m.seq_pos;
+    let weights = m.q35_weights.take().expect("q35 weights");
+    let mut kv_cache = m.kv_cache.take().expect("kv cache");
+    let mut dn_state = m.dn_state.take().expect("dn state");
+    let scratch_set = m.pp_scratch_set.take().expect("pp scratch set");
+    let mut mtp_state = m.mtp.take().expect("MTP state");
+    let mut drafter_state = mtp_state
+        .drafter_state
+        .take()
+        .expect("PP+MTP drafter state");
+
+    macro_rules! restore_pp_mtp_state {
+        () => {{
+            mtp_state.drafter_state = Some(drafter_state);
+            m.q35_weights = Some(weights);
+            m.kv_cache = Some(kv_cache);
+            m.dn_state = Some(dn_state);
+            m.pp_scratch_set = Some(scratch_set);
+            m.mtp = Some(mtp_state);
+            m.tokenizer = Some(tokenizer);
+        }};
+    }
+    macro_rules! bail {
+        ($msg:expr) => {{
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"error","id":"{}","message":{}}}"#,
+                id,
+                serde_json::to_string(&$msg).unwrap_or_default()
+            );
+            let _ = stdout.flush();
+            restore_pp_mtp_state!();
+            return;
+        }};
+    }
+
+    let per_tok_hidden_out = {
+        let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+        match g.alloc_tensor(&[new_tokens.len() * dim], rdna_compute::DType::F32) {
+            Ok(t) => t,
+            Err(e) => bail!(format!("pp-mtp alloc hidden capture: {e}")),
+        }
+    };
+
+    {
+        let gpus = m.pp_gpus.as_mut().unwrap();
+        if let Err(e) = qwen35::forward_prefill_batch_multi_with_caps(
+            gpus,
+            &weights,
+            &config,
+            &new_tokens,
+            start_pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch_set,
+            Some(&per_tok_hidden_out),
+            None,
+            false,
+        ) {
+            let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+            let _ = g.free_tensor(per_tok_hidden_out);
+            bail!(format!("pp-mtp prefill: {e}"));
+        }
+    }
+    m.seq_pos += new_tokens.len();
+    m.conversation_tokens.extend_from_slice(&new_tokens);
+
+    {
+        let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+        let last_row_off = (new_tokens.len() - 1) * dim * 4;
+        if let Err(e) = g.hip.memcpy_dtod_at(
+            &mtp_state.spec_state.prev_hidden.buf,
+            0,
+            &per_tok_hidden_out.buf,
+            last_row_off,
+            dim * 4,
+        ) {
+            let _ = g.free_tensor(per_tok_hidden_out);
+            bail!(format!("pp-mtp seed prev_hidden: {e}"));
+        }
+        if let Err(e) = g.hip.memcpy_dtod_at(
+            &drafter_state.prev_hidden.buf,
+            0,
+            &per_tok_hidden_out.buf,
+            last_row_off,
+            dim * 4,
+        ) {
+            let _ = g.free_tensor(per_tok_hidden_out);
+            bail!(format!("pp-mtp seed drafter prev_hidden: {e}"));
+        }
+    }
+
+    let first_token = {
+        let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+        let logits = match g.alloc_tensor(&[config.vocab_size], rdna_compute::DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = g.free_tensor(per_tok_hidden_out);
+                bail!(format!("pp-mtp alloc first logits: {e}"));
+            }
+        };
+        let last_row = per_tok_hidden_out.sub_offset((new_tokens.len() - 1) * dim, dim);
+        if let Err(e) = llama::weight_gemv(g, &weights.output, &last_row, &logits) {
+            let _ = g.free_tensor(logits);
+            let _ = g.free_tensor(per_tok_hidden_out);
+            bail!(format!("pp-mtp first lm_head: {e}"));
+        }
+        let logits_host = match g.download_f32(&logits) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = g.free_tensor(logits);
+                let _ = g.free_tensor(per_tok_hidden_out);
+                bail!(format!("pp-mtp download first logits: {e}"));
+            }
+        };
+        let _ = g.free_tensor(logits);
+        logits_host
+            .iter()
+            .enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(best, best_v), (i, &v)| {
+                if v > best_v { (i as u32, v) } else { (best, best_v) }
+            })
+            .0
+    };
+    {
+        let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+        let _ = g.free_tensor(per_tok_hidden_out);
+    }
+
+    let t_prefill = Instant::now();
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut emitted: Vec<u32> = Vec::new();
+    let mut bytes_fed_to_filter = 0usize;
+    let mut filter = EosFilter::new(EosFilterConfig::default());
+    let mut position = start_pos + new_tokens.len();
+    let mut seed_token = first_token;
+    let mut generated = 0usize;
+    let mut total_cycles = 0usize;
+    let mut total_accepted = 0usize;
+    let mut committed_from_cycles = 0usize;
+    let eos_token = config.eos_token;
+
+    let mut push_token = |tok: u32,
+                          stdout: &mut std::io::Stdout,
+                          generated: &mut usize,
+                          streamed_tokens: &mut Vec<u32>,
+                          bytes_fed_to_filter: &mut usize,
+                          filter: &mut EosFilter| {
+        emitted.push(tok);
+        streamed_tokens.push(tok);
+        emit_committed_event(
+            stdout,
+            id,
+            tok,
+            streamed_tokens.len() - 1,
+            t0.elapsed().as_millis() as u64,
+        );
+        let all_bytes = tokenizer.decode_bytes(streamed_tokens);
+        let new_bytes = &all_bytes[*bytes_fed_to_filter..];
+        *bytes_fed_to_filter = all_bytes.len();
+        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+            if let Ok(text) = std::str::from_utf8(&text_bytes) {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"token","id":"{}","text":{}}}"#,
+                    id,
+                    serde_json::to_string(text).unwrap_or_default()
+                );
+                let _ = stdout.flush();
+            }
+        }
+        *generated += 1;
+    };
+
+    push_token(
+        first_token,
+        stdout,
+        &mut generated,
+        &mut streamed_tokens,
+        &mut bytes_fed_to_filter,
+        &mut filter,
+    );
+
+    let mut hit_terminal = first_token == eos_token
+        || im_end_token == Some(first_token)
+        || tokenizer.is_terminator(first_token);
+    if !stop.is_empty() && stop.iter().any(|s| tokenizer.decode(&streamed_tokens).ends_with(s)) {
+        hit_terminal = true;
+    }
+
+    while generated < max_tokens && !hit_terminal {
+        let cycle_k = (max_tokens - generated)
+            .saturating_sub(1)
+            .min(mtp_state.max_n);
+        if cycle_k == 0 {
+            break;
+        }
+        if position + cycle_k + 1 >= m.physical_cap {
+            break;
+        }
+        let saved_spec_max_n = mtp_state.spec_state.max_n;
+        let saved_drafter_max_n = drafter_state.max_n;
+        mtp_state.spec_state.max_n = cycle_k;
+        drafter_state.max_n = cycle_k;
+        let step = {
+            let gpus = m.pp_gpus.as_mut().unwrap();
+            hipfire_arch_qwen35::mtp_spec::spec_step_mtp_compressed_serial_multi(
+                gpus,
+                output_device,
+                &config,
+                &weights,
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch_set,
+                &mtp_state.head,
+                &mut mtp_state.spec_state,
+                &mut drafter_state,
+                position,
+                seed_token,
+                eos_token,
+            )
+        };
+        mtp_state.spec_state.max_n = saved_spec_max_n;
+        drafter_state.max_n = saved_drafter_max_n;
+        let step = match step {
+            Ok(s) => s,
+            Err(e) => bail!(format!("pp-mtp spec_step: {e}")),
+        };
+        total_cycles += 1;
+        total_accepted += step.accept_count;
+        for &tok in &step.committed {
+            if generated >= max_tokens {
+                break;
+            }
+            push_token(
+                tok,
+                stdout,
+                &mut generated,
+                &mut streamed_tokens,
+                &mut bytes_fed_to_filter,
+                &mut filter,
+            );
+            committed_from_cycles += 1;
+            if tok == eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) {
+                hit_terminal = true;
+                break;
+            }
+            if !stop.is_empty() && stop.iter().any(|s| tokenizer.decode(&streamed_tokens).ends_with(s)) {
+                hit_terminal = true;
+                break;
+            }
+        }
+        position += step.advance;
+        if let Some(&last) = step.committed.last() {
+            seed_token = last;
+        }
+    }
+
+    if generated > 0 {
+        let gpus = m.pp_gpus.as_mut().unwrap();
+        if let Err(e) = qwen35::forward_scratch_multi(
+            gpus,
+            &weights,
+            &config,
+            seed_token,
+            position,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch_set,
+        ) {
+            eprintln!("[daemon] pp-mtp final-token KV write failed (ignored): {e}");
+        } else {
+            position += 1;
+        }
+    }
+
+    m.conversation_tokens.extend_from_slice(&emitted);
+    m.seq_pos = position;
+    mtp_state.drafter_state = Some(drafter_state);
+    m.q35_weights = Some(weights);
+    m.kv_cache = Some(kv_cache);
+    m.dn_state = Some(dn_state);
+    m.pp_scratch_set = Some(scratch_set);
+    m.mtp = Some(mtp_state);
+    m.tokenizer = Some(tokenizer);
+
+    let t_end = Instant::now();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
+    let prefill_tok_s = if prefill_s > 0.0 {
+        new_tokens.len() as f64 / prefill_s
+    } else {
+        0.0
+    };
+    let decode_tok_s = if decode_s > 0.0 {
+        generated as f64 / decode_s
+    } else {
+        0.0
+    };
+    let tau = if total_cycles > 0 {
+        committed_from_cycles as f64 / total_cycles as f64
+    } else {
+        0.0
+    };
+    let accept_rate = if total_cycles > 0 {
+        total_accepted as f64 / total_cycles as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"spec_path":"pp-mtp","mtp_k":{},"tau":{:.2},"accept_rate":{:.2},"cycles":{},"pp":{}}}"#,
+        id,
+        generated,
+        tok_s,
+        new_tokens.len(),
+        prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        prefill_s * 1000.0,
+        m.mtp.as_ref().map(|s| s.max_n).unwrap_or(0),
+        tau,
+        accept_rate,
+        total_cycles,
+        m.pp,
+    );
+    let _ = stdout.flush();
+}
+
+#[allow(clippy::too_many_arguments)]
 fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, frequency_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode, stop: &[String]) {
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
@@ -8595,6 +9289,30 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
     if m.pp > 1 {
+        let pp_mtp_allowed = m.mtp.as_ref().map(|s| s.compressed).unwrap_or(false)
+            && temp <= 1e-6
+            && (repeat_penalty - 1.0).abs() <= 1e-6
+            && presence_penalty.abs() <= 1e-6
+            && frequency_penalty.abs() <= 1e-6
+            && budget_alert_at_tok == 0
+            && pflash_state.is_none();
+        if pp_mtp_allowed {
+            generate_pp_mtp(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                max_tokens,
+                max_think_tokens,
+                assistant_prefix,
+                tools,
+                messages_history,
+                stop,
+            );
+            return;
+        }
         generate_multi(
             m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
             temp, top_p, max_tokens, repeat_penalty, repeat_window,

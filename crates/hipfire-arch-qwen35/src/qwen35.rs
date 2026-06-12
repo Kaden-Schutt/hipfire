@@ -14815,9 +14815,9 @@ pub fn forward_scratch_multi(
 ///      `x_batch`) and `is_last_band=true` (does final norm + lm_head).
 ///   5. Repeat for any further bands.
 ///
-/// `tree_verify`, DFlash hidden-rb, GdnTape, and per_token_hidden_out
-/// are pp=1 only in v1. They've been refused at the daemon load-time
-/// gate, so this function does not accept them as parameters.
+/// Default PP prefill surface. Capability-bearing callers such as PP+MTP use
+/// [`forward_prefill_batch_multi_with_caps`] so the output band can capture the
+/// post-output-norm hidden rows without perturbing the AR path.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_batch_multi(
     gpus: &mut Gpus,
@@ -14829,9 +14829,49 @@ pub fn forward_prefill_batch_multi(
     dn_state: &mut DeltaNetState,
     scratch_set: &Qwen35ScratchSet,
 ) -> HipResult<()> {
+    forward_prefill_batch_multi_with_caps(
+        gpus,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch_set,
+        None,
+        None,
+        true,
+    )
+}
+
+/// PP prefill with the narrow capability hooks needed by PP+MTP verify.
+///
+/// `per_token_hidden_out`, when present, must live on the output band. The
+/// final band writes rows at `chunk_start..chunk_start+chunk_n`; earlier bands
+/// keep passing only residual streams across the PP boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_multi_with_caps(
+    gpus: &mut Gpus,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch_set: &Qwen35ScratchSet,
+    per_token_hidden_out: Option<&GpuTensor>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    needs_last_token_logits: bool,
+) -> HipResult<()> {
     let n_total = tokens.len();
     if n_total == 0 {
         return Ok(());
+    }
+    if tree_verify.is_some() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "forward_prefill_batch_multi_with_caps: tree_verify under PP is not implemented",
+        ));
     }
 
     let n_bands = gpus.devices.len();
@@ -14903,6 +14943,13 @@ pub fn forward_prefill_batch_multi(
         });
 
     if !eligible {
+        if per_token_hidden_out.is_some() || !needs_last_token_logits {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "forward_prefill_batch_multi_with_caps: requested hidden capture/logit elision \
+                 but this model is not eligible for the batched PP path",
+            ));
+        }
         // Per-token fallback. Correctness over speed when the batched
         // path's preconditions are not met.
         for (i, &tok) in tokens.iter().enumerate() {
@@ -15012,6 +15059,11 @@ pub fn forward_prefill_batch_multi(
                     let pbs_b: &PrefillBatchScratch = &pbs_per_band[b];
                     let s_b = &scratch_set.per_device[b];
                     let g_b = &mut gpus.devices[b];
+                    let hidden_out = if b + 1 == n_bands {
+                        per_token_hidden_out.map(|t| (t, chunk_start))
+                    } else {
+                        None
+                    };
                     forward_prefill_chunk(
                         g_b,
                         weights,
@@ -15023,14 +15075,14 @@ pub fn forward_prefill_batch_multi(
                         s_b,
                         pbs_b,
                         None, // hidden_rb: pp=1 only
-                        None, // per_token_hidden_out: pp=1 only
+                        hidden_out,
                         None, // gdn_tape: pp=1 only
                         0,
                         None,  // tree_verify: pp=1 only
                         false, // pre_uploaded
                         Some(&band_ctx),
                         None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
-                        true, // needs_last_token_logits: preserve multi-GPU post-condition
+                        needs_last_token_logits || b + 1 < n_bands,
                         None, // max_layer: multi-GPU PP path runs full stack
                         None, // routed_out: PP bands are multi-layer, not EP
                     )?;

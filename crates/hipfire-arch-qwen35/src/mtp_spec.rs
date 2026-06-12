@@ -33,8 +33,10 @@
 use crate::mtp_head::{self, Qwen35MtpHead, Qwen35MtpHeadKvCache, Qwen35MtpHeadScratch};
 use crate::qwen35::{self, Qwen35Weights};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
-use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
+use hip_bridge::{DeviceBuffer, Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::llama;
+use hipfire_runtime::llama::EmbeddingFormat;
+use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
@@ -638,6 +640,111 @@ impl MtpSpecState {
         })
     }
 
+    pub fn new_for_config_with_kv_mode(
+        gpu: &mut Gpu,
+        config: &qwen35::Qwen35Config,
+        dn_state: &qwen35::DeltaNetState,
+        head: &Qwen35MtpHead,
+        max_n: usize,
+        kv_mode: crate::mtp_head::MtpKvMode,
+    ) -> HipResult<Self> {
+        assert!(
+            max_n >= 1,
+            "MtpSpecState::new_for_config: max_n must be >= 1",
+        );
+        let dim = config.dim;
+        let vocab = config.vocab_size;
+        assert_eq!(
+            head.config.n_embd, dim,
+            "MtpSpecState: trunk dim={dim} but head n_embd={}",
+            head.config.n_embd,
+        );
+        assert_eq!(
+            head.config.vocab_size, vocab,
+            "MtpSpecState: trunk vocab={vocab} but head vocab={}",
+            head.config.vocab_size,
+        );
+
+        let prev_hidden = gpu.alloc_tensor(&[dim], DType::F32)?;
+        let verify_hidden = gpu.alloc_tensor(&[(max_n + 1) * dim], DType::F32)?;
+        let verify_logits = gpu.alloc_tensor(&[(max_n + 1) * vocab], DType::F32)?;
+        let verify_rot = gpu.alloc_tensor(&[(max_n + 1) * dim], DType::F32)?;
+        let verify_argmax = gpu.alloc_tensor(&[max_n + 1], DType::F32)?;
+        let trunk_snap = DeltaNetSnapshot::new_for(gpu, dn_state)?;
+        let (trunk_snap_stream, trunk_snap_start_event) = if mtp_snapshot_overlap_enabled_from_env()
+        {
+            (
+                Some(gpu.hip.stream_create()?),
+                Some(gpu.hip.event_create()?),
+            )
+        } else {
+            (None, None)
+        };
+        let trunk_pbs = qwen35::PrefillBatchScratch::new(gpu, config, max_n + 1)?;
+        let trunk_gdn_tape = GdnTape::new_for_config(gpu, config, max_n + 1)?;
+        let mtp_scratch = Qwen35MtpHeadScratch::new(gpu, &head.config)?;
+        let mtp_kv = Qwen35MtpHeadKvCache::new_with_kv_mode(gpu, &head.config, kv_mode)?;
+        let mtp_t_outs = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
+        let mtp_lm_tmp = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
+        let mtp_lm_rot = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
+        let mtp_lm_logits = gpu.alloc_tensor(&[max_n * vocab], DType::F32)?;
+        let mtp_lm_argmax = gpu.alloc_tensor(&[max_n], DType::F32)?;
+        let mtp_token_chain = gpu.alloc_tensor(&[max_n + 1], DType::F32)?;
+        let mtp_token_embed = gpu.alloc_tensor(&[dim], DType::F32)?;
+        let mtp_positions = gpu.alloc_tensor(&[max_n], DType::F32)?;
+        let mtp_topk_idx = gpu.alloc_tensor(&[2], DType::F32)?;
+        let mtp_topk_logp = gpu.alloc_tensor(&[2], DType::F32)?;
+        let mtp_sample_result = gpu.alloc_tensor(&[2], DType::F32)?;
+        let mtp_sample_repeat_buf = gpu.alloc_tensor(&[1], DType::F32)?;
+        let mtp_gather_idx_draft = gpu.alloc_tensor(&[1], DType::F32)?;
+        let mtp_gather_prob_draft = gpu.alloc_tensor(&[1], DType::F32)?;
+        let mtp_gather_idx_verify = gpu.alloc_tensor(&[max_n], DType::F32)?;
+        let mtp_gather_prob_verify = gpu.alloc_tensor(&[max_n], DType::F32)?;
+
+        Ok(Self {
+            prev_hidden,
+            verify_hidden,
+            verify_logits,
+            verify_rot,
+            verify_argmax,
+            trunk_snap,
+            trunk_snap_stream,
+            trunk_snap_start_event,
+            trunk_pbs,
+            trunk_gdn_tape,
+            mtp_scratch,
+            mtp_kv,
+            mtp_t_outs,
+            mtp_lm_tmp,
+            mtp_lm_rot,
+            mtp_lm_logits,
+            mtp_lm_argmax,
+            mtp_token_chain,
+            mtp_token_embed,
+            mtp_positions,
+            mtp_proposal_graph: None,
+            mtp_proposal_graph_exec: None,
+            mtp_proposal_graph_blobs: Vec::new(),
+            mtp_proposal_graph_seq_cap: 0,
+            mtp_proposal_graph_warmed: false,
+            mtp_proposal_graph_disabled: false,
+            mtp_lm_logits_compressed: None,
+            mtp_topk_idx,
+            mtp_topk_logp,
+            mtp_sample_result,
+            mtp_sample_repeat_buf,
+            mtp_gather_idx_draft,
+            mtp_gather_prob_draft,
+            mtp_gather_idx_verify,
+            mtp_gather_prob_verify,
+            gpu_rng_state: 42,
+            max_n,
+            p_min: 0.0,
+            sampling: MtpSamplingConfig::default(),
+            rng: MtpRng::new(42),
+        })
+    }
+
     /// Configure sampling (temp/top_p/top_k/min_p) and reseed the per-state RNG.
     /// `cfg.temp == 0.0` keeps the legacy greedy path. `cfg.temp > 0` enables
     /// residual-acceptance sampling per the Unsloth/llama.cpp MTP recipe.
@@ -784,6 +891,195 @@ impl MtpSpecState {
     }
 }
 
+/// Multi-device backup for a PP `DeltaNetState`.
+///
+/// `DeltaNetSnapshot` is single-device and is correct only when every recurrent
+/// tensor lives on the same `Gpu`. The PP path allocates each LA layer on its
+/// owning band, so rollback needs buffers on those same devices.
+pub struct DeltaNetSnapshotMulti {
+    s_matrix_bufs: Vec<DeviceBuffer>,
+    s_scale_bufs: Vec<DeviceBuffer>,
+    conv_state_bufs: Vec<DeviceBuffer>,
+    la_to_device: Vec<u8>,
+}
+
+impl DeltaNetSnapshotMulti {
+    pub fn new_for(
+        gpus: &mut Gpus,
+        state: &qwen35::DeltaNetState,
+        la_to_device: &[u8],
+    ) -> HipResult<Self> {
+        assert_eq!(
+            state.s_matrices.len(),
+            la_to_device.len(),
+            "DeltaNetSnapshotMulti: la_to_device length mismatch",
+        );
+        let mut s_matrix_bufs = Vec::with_capacity(state.s_matrices.len());
+        let mut s_scale_bufs = Vec::with_capacity(state.s_scales.len());
+        let mut conv_state_bufs = Vec::with_capacity(state.conv_states.len());
+        for (i, t) in state.s_matrices.iter().enumerate() {
+            let g = &mut gpus.devices[la_to_device[i] as usize];
+            g.bind_thread()?;
+            s_matrix_bufs.push(g.hip.malloc(t.buf.size())?);
+        }
+        for (i, t) in state.s_scales.iter().enumerate() {
+            let g = &mut gpus.devices[la_to_device[i] as usize];
+            g.bind_thread()?;
+            s_scale_bufs.push(g.hip.malloc(t.buf.size())?);
+        }
+        for (i, t) in state.conv_states.iter().enumerate() {
+            let g = &mut gpus.devices[la_to_device[i] as usize];
+            g.bind_thread()?;
+            conv_state_bufs.push(g.hip.malloc(t.buf.size())?);
+        }
+        Ok(Self {
+            s_matrix_bufs,
+            s_scale_bufs,
+            conv_state_bufs,
+            la_to_device: la_to_device.to_vec(),
+        })
+    }
+
+    pub fn save_from(&mut self, gpus: &mut Gpus, state: &qwen35::DeltaNetState) -> HipResult<()> {
+        for (i, (dst, src)) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()).enumerate() {
+            let g = &mut gpus.devices[self.la_to_device[i] as usize];
+            g.bind_thread()?;
+            g.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+        }
+        for (i, (dst, src)) in self.s_scale_bufs.iter().zip(state.s_scales.iter()).enumerate() {
+            let g = &mut gpus.devices[self.la_to_device[i] as usize];
+            g.bind_thread()?;
+            g.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+        }
+        for (i, (dst, src)) in self.conv_state_bufs.iter().zip(state.conv_states.iter()).enumerate() {
+            let g = &mut gpus.devices[self.la_to_device[i] as usize];
+            g.bind_thread()?;
+            g.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+        }
+        Ok(())
+    }
+
+    pub fn restore_to(
+        &self,
+        gpus: &mut Gpus,
+        state: &mut qwen35::DeltaNetState,
+    ) -> HipResult<()> {
+        for (i, (src, dst)) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()).enumerate() {
+            let g = &mut gpus.devices[self.la_to_device[i] as usize];
+            g.bind_thread()?;
+            g.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+        }
+        for (i, (src, dst)) in self.s_scale_bufs.iter().zip(state.s_scales.iter()).enumerate() {
+            let g = &mut gpus.devices[self.la_to_device[i] as usize];
+            g.bind_thread()?;
+            g.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+        }
+        for (i, (src, dst)) in self.conv_state_bufs.iter().zip(state.conv_states.iter()).enumerate() {
+            let g = &mut gpus.devices[self.la_to_device[i] as usize];
+            g.bind_thread()?;
+            g.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+        }
+        Ok(())
+    }
+
+    pub fn free_gpu(self, gpus: &mut Gpus) {
+        for (i, b) in self.s_matrix_bufs.into_iter().enumerate() {
+            let _ = gpus.devices[self.la_to_device[i] as usize].hip.free(b);
+        }
+        for (i, b) in self.s_scale_bufs.into_iter().enumerate() {
+            let _ = gpus.devices[self.la_to_device[i] as usize].hip.free(b);
+        }
+        for (i, b) in self.conv_state_bufs.into_iter().enumerate() {
+            let _ = gpus.devices[self.la_to_device[i] as usize].hip.free(b);
+        }
+    }
+}
+
+/// Drafter-side state for PP+MTP. Lives on the PP output device with a local
+/// clone of the trunk embedding table and its own MTP KV/scratch.
+pub struct MtpHeteroDrafterState {
+    pub mirrored_token_embd: GpuTensor,
+    pub embd_format: EmbeddingFormat,
+    pub prev_hidden: GpuTensor,
+    pub mtp_scratch: Qwen35MtpHeadScratch,
+    pub mtp_kv: Qwen35MtpHeadKvCache,
+    pub mtp_t_outs: GpuTensor,
+    pub mtp_lm_argmax: GpuTensor,
+    pub mtp_token_chain: GpuTensor,
+    pub mtp_token_embed: GpuTensor,
+    pub trunk_snap: DeltaNetSnapshotMulti,
+    pub max_n: usize,
+}
+
+impl MtpHeteroDrafterState {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_pp(
+        gpus: &mut Gpus,
+        output_device: usize,
+        target_dn: &qwen35::DeltaNetState,
+        la_to_device: &[u8],
+        head: &Qwen35MtpHead,
+        max_n: usize,
+        kv_mode: crate::mtp_head::MtpKvMode,
+        mirrored_token_embd: GpuTensor,
+        embd_format: EmbeddingFormat,
+    ) -> HipResult<Self> {
+        assert!(max_n >= 1, "MtpHeteroDrafterState: max_n must be >= 1");
+        let n_embd = head.config.n_embd;
+        let trunk_snap = DeltaNetSnapshotMulti::new_for(gpus, target_dn, la_to_device)?;
+        let g = &mut gpus.devices[output_device];
+        g.bind_thread()?;
+        let prev_hidden = g.alloc_tensor(&[n_embd], DType::F32)?;
+        let mut mtp_scratch = Qwen35MtpHeadScratch::new(g, &head.config)?;
+        if let Some(cvs) = head.weights.compressed_vocab_size {
+            mtp_scratch.ensure_compressed_logits(g, cvs)?;
+        }
+        let mtp_kv = Qwen35MtpHeadKvCache::new_with_kv_mode(g, &head.config, kv_mode)?;
+        let mtp_t_outs = g.alloc_tensor(&[max_n * n_embd], DType::F32)?;
+        let mtp_lm_argmax = g.alloc_tensor(&[max_n], DType::F32)?;
+        let mtp_token_chain = g.alloc_tensor(&[max_n + 1], DType::F32)?;
+        let mtp_token_embed = g.alloc_tensor(&[n_embd], DType::F32)?;
+        Ok(Self {
+            mirrored_token_embd,
+            embd_format,
+            prev_hidden,
+            mtp_scratch,
+            mtp_kv,
+            mtp_t_outs,
+            mtp_lm_argmax,
+            mtp_token_chain,
+            mtp_token_embed,
+            trunk_snap,
+            max_n,
+        })
+    }
+
+    pub fn free_gpu(self, gpus: &mut Gpus, output_device: usize) {
+        let Self {
+            mirrored_token_embd,
+            prev_hidden,
+            mtp_scratch,
+            mtp_kv,
+            mtp_t_outs,
+            mtp_lm_argmax,
+            mtp_token_chain,
+            mtp_token_embed,
+            trunk_snap,
+            ..
+        } = self;
+        trunk_snap.free_gpu(gpus);
+        let g = &mut gpus.devices[output_device];
+        let _ = g.free_tensor(mirrored_token_embd);
+        let _ = g.free_tensor(prev_hidden);
+        mtp_scratch.free_gpu(g);
+        mtp_kv.inner.free_gpu(g);
+        let _ = g.free_tensor(mtp_t_outs);
+        let _ = g.free_tensor(mtp_lm_argmax);
+        let _ = g.free_tensor(mtp_token_chain);
+        let _ = g.free_tensor(mtp_token_embed);
+    }
+}
+
 // ─── One spec-decode cycle ───────────────────────────────────────────────
 
 /// Result of one MTP spec-decode cycle.
@@ -844,6 +1140,23 @@ fn embed_device_token_into(
             gpu.embedding_lookup_q8_batched(&weights.token_embd, out, token_id, 1, dim)
         }
         other => panic!("device-token MTP chain does not support embedding format {other:?}"),
+    }
+}
+
+fn embed_device_token_into_drafter(
+    gpu: &mut Gpu,
+    token_embd: &GpuTensor,
+    embd_format: EmbeddingFormat,
+    out: &GpuTensor,
+    token_id: &GpuTensor,
+    dim: usize,
+) -> HipResult<()> {
+    match embd_format {
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256_batched(token_embd, out, token_id, 1, dim)
+        }
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(token_embd, out, token_id, 1, dim),
+        other => panic!("PP+MTP device-token chain does not support embedding format {other:?}"),
     }
 }
 
@@ -2991,6 +3304,369 @@ pub fn spec_step_mtp_compressed_serial(
         advance,
         drafts_generated,
         chain_truncated,
+        replay_skipped,
+    })
+}
+
+/// One greedy compressed-MTP cycle for a pipeline-parallel Qwen3.5/Qwen3.6
+/// trunk. The MTP head and drafter state live on `output_device`; verify runs
+/// through `forward_prefill_batch_multi_with_caps`.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_mtp_compressed_serial_multi(
+    gpus: &mut Gpus,
+    output_device: usize,
+    target_config: &qwen35::Qwen35Config,
+    trunk_weights: &Qwen35Weights,
+    target_kv: &mut hipfire_runtime::llama::KvCache,
+    target_dn: &mut qwen35::DeltaNetState,
+    pp_scratch_set: &qwen35::Qwen35ScratchSet,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    drafter_state: &mut MtpHeteroDrafterState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+) -> HipResult<MtpSpecResult> {
+    let max_n = drafter_state.max_n;
+    assert_eq!(max_n, state.max_n, "PP+MTP state max_n mismatch");
+    assert!(
+        state.sampling.is_greedy(),
+        "PP+MTP v1 is greedy-only; temp={}",
+        state.sampling.temp,
+    );
+    assert!(
+        state.p_min <= 0.0,
+        "PP+MTP v1 does not implement p_min; got {}",
+        state.p_min,
+    );
+    let cvs = head
+        .weights
+        .compressed_vocab_size
+        .expect("PP+MTP requires compressed MTP sidecar");
+    assert!(
+        head.weights.lm_head_draft.is_some()
+            && head.weights.lm_head_draft_vocab_map_gpu.is_some(),
+        "PP+MTP requires compressed lm_head_draft and GPU vocab map",
+    );
+    let dim = target_config.dim;
+    let vocab = target_config.vocab_size;
+    let dim_bytes = dim * 4;
+
+    // 1. Draft K candidates on output_device using an on-device token chain.
+    let mut candidates: Vec<u32> = Vec::with_capacity(max_n);
+    {
+        let drafter_gpu = &mut gpus.devices[output_device];
+        drafter_gpu.bind_thread()?;
+        let seed_token = last_committed as i32;
+        let seed_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(&seed_token as *const i32 as *const u8, 4) };
+        drafter_gpu
+            .hip
+            .memcpy_htod(&drafter_state.mtp_token_chain.buf, seed_bytes)?;
+
+        let argmax_view = drafter_state.mtp_lm_argmax.sub_offset(0, 1);
+        let logits_c = drafter_state
+            .mtp_scratch
+            .logits_compressed
+            .as_ref()
+            .expect("drafter compressed logits not allocated");
+        let vocab_map_gpu = head
+            .weights
+            .lm_head_draft_vocab_map_gpu
+            .as_ref()
+            .expect("PP+MTP requires GPU vocab map");
+
+        for k in 0..max_n {
+            let token_slot = drafter_state.mtp_token_chain.sub_offset(k, 1);
+            embed_device_token_into_drafter(
+                drafter_gpu,
+                &drafter_state.mirrored_token_embd,
+                drafter_state.embd_format,
+                &drafter_state.mtp_token_embed,
+                &token_slot,
+                dim,
+            )?;
+
+            if k == 0 {
+                mtp_head::mtp_head_forward_block_only(
+                    drafter_gpu,
+                    head,
+                    &drafter_state.mtp_scratch,
+                    &mut drafter_state.mtp_kv,
+                    0,
+                    &drafter_state.prev_hidden,
+                    Some(&drafter_state.mtp_token_embed),
+                    cur_pos + k,
+                    trunk_weights,
+                )?;
+            } else {
+                let prev_row = drafter_state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                mtp_head::mtp_head_forward_block_only(
+                    drafter_gpu,
+                    head,
+                    &drafter_state.mtp_scratch,
+                    &mut drafter_state.mtp_kv,
+                    0,
+                    &prev_row,
+                    Some(&drafter_state.mtp_token_embed),
+                    cur_pos + k,
+                    trunk_weights,
+                )?;
+            }
+            mtp_head::mtp_head_apply_lm_head_draft(
+                drafter_gpu,
+                head,
+                &drafter_state.mtp_scratch,
+            )?;
+            drafter_gpu.argmax_token_chain_f32(
+                logits_c,
+                &argmax_view,
+                &drafter_state.mtp_token_chain,
+                Some(vocab_map_gpu),
+                cvs,
+                k + 1,
+            )?;
+            if k + 1 < max_n {
+                drafter_gpu.memcpy_dtod_at_auto(
+                    &drafter_state.mtp_t_outs.buf,
+                    k * dim_bytes,
+                    &drafter_state.mtp_scratch.t_mtp_out.buf,
+                    0,
+                    dim_bytes,
+                )?;
+            }
+        }
+
+        let candidate_view = drafter_state.mtp_token_chain.sub_offset(1, max_n);
+        let mut candidate_host: Vec<i32> = vec![0; max_n];
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(candidate_host.as_mut_ptr() as *mut u8, max_n * 4)
+        };
+        drafter_gpu.hip.memcpy_dtoh(bytes, &candidate_view.buf)?;
+        candidates.extend(candidate_host.into_iter().map(|t| t as u32));
+    }
+
+    // 2. Snapshot recurrent state, then verify the trunk through all PP bands.
+    let verify_tokens = build_trunk_spine_verify_tokens(last_committed, &candidates);
+    let n_verify = verify_tokens.len();
+    drafter_state.trunk_snap.save_from(gpus, target_dn)?;
+    qwen35::forward_prefill_batch_multi_with_caps(
+        gpus,
+        trunk_weights,
+        target_config,
+        &verify_tokens,
+        cur_pos,
+        target_kv,
+        target_dn,
+        pp_scratch_set,
+        Some(&state.verify_hidden),
+        None,
+        false,
+    )?;
+
+    // 3. Trunk lm_head + greedy accept on output_device.
+    let committed: Vec<u32>;
+    let accept_count: usize;
+    let hit_eos: bool;
+    {
+        let target_gpu = &mut gpus.devices[output_device];
+        target_gpu.bind_thread()?;
+        let w_out = &trunk_weights.output;
+        let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
+        match w_out.gpu_dtype {
+            DType::Q8_0 => {
+                if mtp_q8_verify_wmma_enabled_from_env() {
+                    target_gpu.gemm_q8_0_batched_chunked(
+                        &w_out.buf,
+                        &state.verify_hidden,
+                        &logits_view,
+                        w_out.m,
+                        w_out.k,
+                        n_verify,
+                    )?;
+                } else {
+                    target_gpu.gemm_q8_0_batched(
+                        &w_out.buf,
+                        &state.verify_hidden,
+                        &logits_view,
+                        w_out.m,
+                        w_out.k,
+                        n_verify,
+                    )?;
+                }
+            }
+            DType::HFQ4G256 => target_gpu.gemm_hfq4g256_batched_lmhead(
+                &w_out.buf,
+                &state.verify_hidden,
+                &logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?,
+            DType::MQ4G256 => {
+                let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+                llama::rotate_x_mq_batched_for(
+                    target_gpu,
+                    w_out,
+                    &state.verify_hidden,
+                    &rot,
+                    w_out.k,
+                    n_verify,
+                )?;
+                target_gpu.gemm_hfq4g256_batched_lmhead(
+                    &w_out.buf,
+                    &rot,
+                    &logits_view,
+                    w_out.m,
+                    w_out.k,
+                    n_verify,
+                )?;
+            }
+            DType::MQ3G256 => {
+                let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+                llama::rotate_x_mq_batched_for(
+                    target_gpu,
+                    w_out,
+                    &state.verify_hidden,
+                    &rot,
+                    w_out.k,
+                    n_verify,
+                )?;
+                target_gpu.gemm_hfq3g256_batched_lmhead(
+                    &w_out.buf,
+                    &rot,
+                    &logits_view,
+                    w_out.m,
+                    w_out.k,
+                    n_verify,
+                )?;
+            }
+            DType::HFQ6G256 => target_gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf,
+                &state.verify_hidden,
+                &logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?,
+            DType::MQ6G256 => {
+                let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+                llama::rotate_x_mq_batched_for(
+                    target_gpu,
+                    w_out,
+                    &state.verify_hidden,
+                    &rot,
+                    w_out.k,
+                    n_verify,
+                )?;
+                target_gpu.gemm_hfq6g256_batched_lmhead(
+                    &w_out.buf,
+                    &rot,
+                    &logits_view,
+                    w_out.m,
+                    w_out.k,
+                    n_verify,
+                )?;
+            }
+            _ => {
+                for i in 0..n_verify {
+                    let row = state.verify_hidden.sub_offset(i * dim, dim);
+                    let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
+                    llama::weight_gemv(target_gpu, w_out, &row, &logits_row)?;
+                }
+            }
+        }
+
+        let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
+        target_gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
+        let candidate_device = drafter_state.mtp_token_chain.sub_offset(1, max_n);
+        let accept_result = state.verify_argmax.sub_offset(0, 2);
+        target_gpu.greedy_accept_from_argmax_i32(
+            &argmax_v,
+            &candidate_device,
+            &accept_result,
+            max_n,
+            eos_token_id,
+        )?;
+        let mut accept_host: [i32; 2] = [0, 0];
+        let bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(accept_host.as_mut_ptr() as *mut u8, 8) };
+        target_gpu.hip.memcpy_dtoh(bytes, &accept_result.buf)?;
+        let accepted = assemble_greedy_accept_from_gpu_result(
+            &candidates,
+            accept_host[0] as usize,
+            accept_host[1],
+            eos_token_id,
+        );
+        committed = accepted.committed;
+        accept_count = accepted.accept_count;
+        hit_eos = accepted.hit_eos;
+    }
+
+    let advance = committed.len();
+    debug_assert!(advance >= 1 && advance <= max_n + 1);
+
+    // 4. Refresh next-cycle prev_hidden on both the PP+MTP drafter and the
+    // generic MTP state for diagnostics / consistency.
+    let prev_hidden_row = advance - 1;
+    let src_row_offset = prev_hidden_row * dim_bytes;
+    {
+        let g = &mut gpus.devices[output_device];
+        g.hip.memcpy_dtod_at(
+            &drafter_state.prev_hidden.buf,
+            0,
+            &state.verify_hidden.buf,
+            src_row_offset,
+            dim_bytes,
+        )?;
+        g.hip.memcpy_dtod_at(
+            &state.prev_hidden.buf,
+            0,
+            &state.verify_hidden.buf,
+            src_row_offset,
+            dim_bytes,
+        )?;
+    }
+
+    // 5. If verify overran past the committed prefix, restore multi-device DN
+    // state and replay only committed tokens. KV rows beyond the committed prefix
+    // will be overwritten by later forwards at their actual positions.
+    let full_accept_no_eos = advance == max_n + 1 && !hit_eos;
+    let replay_skipped = full_accept_no_eos;
+    if !full_accept_no_eos {
+        drafter_state.trunk_snap.restore_to(gpus, target_dn)?;
+        if advance >= 2 {
+            qwen35::forward_prefill_batch_multi(
+                gpus,
+                trunk_weights,
+                target_config,
+                &verify_tokens[..advance],
+                cur_pos,
+                target_kv,
+                target_dn,
+                pp_scratch_set,
+            )?;
+        } else {
+            qwen35::forward_scratch_multi(
+                gpus,
+                trunk_weights,
+                target_config,
+                verify_tokens[0],
+                cur_pos,
+                target_kv,
+                target_dn,
+                pp_scratch_set,
+            )?;
+        }
+    }
+
+    Ok(MtpSpecResult {
+        committed,
+        accept_count,
+        hit_eos,
+        advance,
+        drafts_generated: max_n,
+        chain_truncated: false,
         replay_skipped,
     })
 }
