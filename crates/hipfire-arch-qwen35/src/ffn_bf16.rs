@@ -171,16 +171,25 @@ pub fn dense_ffn_swiglu_down_contract(
     shadow: &Bf16DownShadow,
     preferred_backend: DenseFfnBackendPreference,
 ) -> DenseFfnModuleContract {
+    dense_ffn_swiglu_down_contract_from_shape(layer_idx, shadow.m, shadow.k, preferred_backend)
+}
+
+pub fn dense_ffn_swiglu_down_contract_from_shape(
+    layer_idx: usize,
+    residual_len: usize,
+    hidden_len: usize,
+    preferred_backend: DenseFfnBackendPreference,
+) -> DenseFfnModuleContract {
     DenseFfnModuleContract {
         module_kind: "qwen35_dense_ffn_swiglu_down",
         module_id: dense_ffn_module_id(layer_idx),
         layer_idx,
         tensor: DenseFfnTensorContract {
-            residual_len: shadow.m,
-            gate_len: shadow.k,
-            up_len: shadow.k,
-            down_rows: shadow.m,
-            down_cols: shadow.k,
+            residual_len,
+            gate_len: hidden_len,
+            up_len: hidden_len,
+            down_rows: residual_len,
+            down_cols: hidden_len,
         },
         state: DenseFfnStateContract {
             reads_kv: false,
@@ -212,7 +221,28 @@ pub fn dense_ffn_module_invocation(
     preferred_backend: DenseFfnBackendPreference,
     npu_available: bool,
 ) -> DenseFfnModuleInvocation {
-    let contract = dense_ffn_swiglu_down_contract(layer_idx, shadow, preferred_backend);
+    dense_ffn_module_invocation_from_shape(
+        layer_idx,
+        shadow.m,
+        shadow.k,
+        preferred_backend,
+        npu_available,
+    )
+}
+
+pub fn dense_ffn_module_invocation_from_shape(
+    layer_idx: usize,
+    residual_len: usize,
+    hidden_len: usize,
+    preferred_backend: DenseFfnBackendPreference,
+    npu_available: bool,
+) -> DenseFfnModuleInvocation {
+    let contract = dense_ffn_swiglu_down_contract_from_shape(
+        layer_idx,
+        residual_len,
+        hidden_len,
+        preferred_backend,
+    );
     let (selected_backend, fallback_reason) =
         dense_ffn_backend_decision(preferred_backend, npu_available);
     DenseFfnModuleInvocation {
@@ -511,6 +541,40 @@ mod tests {
             output.evidence.fallback_reason,
             Some("npu_backend_unavailable")
         );
+        assert!(output.mutates_residual);
+    }
+
+    #[test]
+    fn dense_ffn_invocation_can_use_production_weight_shape_without_bf16_shadow() {
+        let invocation = dense_ffn_module_invocation_from_shape(
+            5,
+            4096,
+            11008,
+            DenseFfnBackendPreference::GpuProduction,
+            false,
+        );
+        assert_eq!(
+            invocation.contract.module_kind,
+            "qwen35_dense_ffn_swiglu_down"
+        );
+        assert_eq!(
+            invocation.contract.module_id,
+            "qwen35.layers.5.mlp.swiglu_down"
+        );
+        assert_eq!(invocation.contract.tensor.residual_len, 4096);
+        assert_eq!(invocation.contract.tensor.gate_len, 11008);
+        assert_eq!(invocation.contract.tensor.up_len, 11008);
+        assert_eq!(invocation.contract.tensor.down_rows, 4096);
+        assert_eq!(invocation.contract.tensor.down_cols, 11008);
+        assert_eq!(invocation.selected_backend, DenseFfnBackend::GpuProduction);
+        assert_eq!(invocation.fallback_reason, None);
+
+        let output = dense_ffn_module_output(&invocation, None);
+        assert_eq!(
+            output.evidence.selected_backend,
+            DenseFfnBackend::GpuProduction
+        );
+        assert_eq!(output.evidence.oracle_backend, DenseFfnBackend::CpuOracle);
         assert!(output.mutates_residual);
     }
 }

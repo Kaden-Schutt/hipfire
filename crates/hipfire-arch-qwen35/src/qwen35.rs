@@ -1582,7 +1582,27 @@ fn weight_gemv_swiglu_residual_bf16_probe(
     x: &GpuTensor,
 ) -> HipResult<()> {
     let Some(shadow) = ffn_bf16_selected_shadow(layer_idx, shadow)? else {
-        return weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x);
+        let invocation = ffn_bf16::dense_ffn_module_invocation_from_shape(
+            layer_idx,
+            w_down.m,
+            w_down.k,
+            ffn_bf16::DenseFfnBackendPreference::GpuProduction,
+            false,
+        );
+        let result = weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x);
+        if result.is_ok() && ffn_bf16::config().trace {
+            let output = ffn_bf16::dense_ffn_module_output(&invocation, None);
+            eprintln!(
+                "[qwen35 ffn module] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={}",
+                output.evidence.module_id,
+                invocation.contract.preferred_backend.as_str(),
+                output.evidence.selected_backend.as_str(),
+                output.evidence.oracle_backend.as_str(),
+                output.evidence.fallback_reason.unwrap_or("none"),
+                output.mutates_residual,
+            );
+        }
+        return result;
     };
 
     match ffn_bf16::config().mode {
