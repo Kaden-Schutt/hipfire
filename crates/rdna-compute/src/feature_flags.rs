@@ -204,15 +204,23 @@ impl FeatureFlags {
                 _ => None,
             },
             moe_grouped_i8_4w: std::env::var("HIPFIRE_MOE_GROUPED_I8_4W").as_deref() == Ok("1"),
+            // HIPFIRE_MOE_GROUPED_I8_K8: gfx1151 HFQ4 grouped MoE k8 control;
+            // default on for gfx1151, set to 0 to test k4 or base k2 variants.
             moe_grouped_i8_k8: if arch == "gfx1151" {
                 std::env::var("HIPFIRE_MOE_GROUPED_I8_K8").as_deref() != Ok("0")
             } else {
                 std::env::var("HIPFIRE_MOE_GROUPED_I8_K8").as_deref() == Ok("1")
             },
+            // HIPFIRE_MOE_GROUPED_I8_K4: opt-in gfx1151 HFQ4 grouped MoE k4
+            // variant; use with HIPFIRE_MOE_GROUPED_I8_K8=0. Default off
+            // after Qwen3.5-122B pp64 measured slower than k8.
             moe_grouped_i8_k4: std::env::var("HIPFIRE_MOE_GROUPED_I8_K4").as_deref() == Ok("1"),
             moe_grouped_i8_k4_gfx12: std::env::var("HIPFIRE_MOE_GROUPED_I8_K4_GFX12").as_deref()
                 == Ok("1"),
             moe_grouped_m2: std::env::var("HIPFIRE_MOE_GROUPED_M2").as_deref() == Ok("1"),
+            // HIPFIRE_MOE_HFQ6_V2: opt-in HFQ6 grouped MoE v2 path; on
+            // gfx1151 it only routes when HIPFIRE_MOE_HFQ6_4W=0 and remains
+            // slower than the default 4w path on Qwen3.5-122B pp64.
             moe_hfq6_v2: std::env::var("HIPFIRE_MOE_HFQ6_V2").as_deref() == Ok("1"),
             moe_hfq6_4w: if arch == "gfx1151" {
                 std::env::var("HIPFIRE_MOE_HFQ6_4W").as_deref() != Ok("0")

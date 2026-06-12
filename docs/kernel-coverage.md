@@ -113,8 +113,15 @@ path.
 
 gfx1151 HFQ4 grouped MMQ: the `HIPFIRE_MOE_GROUPED_I8_4W=1` experiment stages
 routed Q8_1 blocks in LDS across four row-warps and is bit-identical to k8, but
-regressed the default k8 path on both A3B pp256 and 122B pp128. Keep k8 as the
-default.
+regressed the default k8 path on A3B pp256, 122B pp128, and 122B pp64. The
+122B pp64 sweep measured default k8 at 71.2 ms inside a 294.2 ms profiled
+prefill, versus 85.8 ms for k4 and 78.7 ms for k8-4w. Keep k8 as the default.
+
+gfx1151 HFQ6 grouped MoE: the 4-warp WMMA path is default-on and remains the
+best measured 122B route. On Qwen3.5-122B-A10B MQ4 pp64, HFQ6 grouped MoE was
+86.8 ms with 4w enabled, versus 144.1 ms for v1 and 177.3 ms for v2 when 4w was
+disabled. See `docs/perf-checkpoints/2026-06-12-gfx1151-moe-variant-sweep.md`
+for the full variant table.
 
 gfx1151 BF16/F16 routed MoE: native grouped WMMA is the default. A compact
 indexed gate/up kernel has channel-test coverage but is not routed: it avoids
