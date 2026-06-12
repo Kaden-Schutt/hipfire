@@ -41,8 +41,8 @@
     and next token match the serial reference within explicit tolerance. Keep multi-request verify batching disabled until this passes.
     Status: Qwen35 speculative decode now has a named rollback-admission guard for accept/reject commit shapes and AR replay boundary alignment.
     The daemon consults a centralized post-step decision helper before advancing DFlash state, decode batching refuses DFlash-loaded models at the
-    runtime-surface boundary, and the DFlash coherence gate now reports per-cycle rollback-admission counts. Multi-request verify batching remains
-    explicitly disabled pending full KV/DeltaNet/logits parity evidence.
+    runtime-surface boundary, and the DFlash coherence gate now reports per-cycle rollback-admission and DeltaNet replay-path counts. Multi-request
+    verify batching remains explicitly disabled pending full KV/DeltaNet/logits parity evidence.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

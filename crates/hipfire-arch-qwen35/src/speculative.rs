@@ -691,6 +691,23 @@ pub struct SpecStepResult {
     /// The tokens actually committed to both models: the seed token, accepted
     /// draft tokens, then `bonus_token` (length = accepted + 2).
     pub committed: Vec<u32>,
+    /// DeltaNet rollback replay path used after the over-verifying target pass.
+    pub rollback_replay: SpecRollbackReplayKind,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SpecRollbackReplayKind {
+    GdnTape,
+    FullPrefill,
+}
+
+impl SpecRollbackReplayKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GdnTape => "gdn_tape",
+            Self::FullPrefill => "full_prefill",
+        }
+    }
 }
 
 /// Conservative admission result for speculative verify rollback.
@@ -2624,6 +2641,7 @@ pub fn spec_step_greedy(
         bonus_token,
         drafted,
         committed,
+        rollback_replay: SpecRollbackReplayKind::FullPrefill,
     })
 }
 
@@ -4098,7 +4116,7 @@ pub fn spec_step_dflash(
     // Fallback (no tape): batched forward_prefill_batch over (accept+1)
     // tokens, same as the prior version — re-runs the full target but one
     // batched call instead of (accept+1) sequential decodes.
-    if let Some(tape) = gdn_tape_opt.as_deref() {
+    let rollback_replay = if let Some(tape) = gdn_tape_opt.as_deref() {
         tape.replay_gdn(
             gpu,
             &target.weights,
@@ -4106,6 +4124,7 @@ pub fn spec_step_dflash(
             &mut target.dn_state,
             accept_len + 1,
         )?;
+        SpecRollbackReplayKind::GdnTape
     } else {
         let replay_tokens = &committed[..accept_len + 1];
         qwen35::forward_prefill_batch(
@@ -4122,7 +4141,8 @@ pub fn spec_step_dflash(
             None,
             None,
         )?;
-    }
+        SpecRollbackReplayKind::FullPrefill
+    };
     // Target state is now at position + accept_len + 1. KV cache has
     // written K/V at positions [position..position+accept_len]. The bonus
     // token's K/V will be written on the next iter's verify (at position
@@ -4169,6 +4189,7 @@ pub fn spec_step_dflash(
         bonus_token,
         drafted,
         committed,
+        rollback_replay,
     })
 }
 
@@ -4677,6 +4698,7 @@ pub fn spec_step_ddtree(
             bonus_token: bonus,
             drafted: vec![seed_token],
             committed: vec![seed_token, bonus],
+            rollback_replay: SpecRollbackReplayKind::FullPrefill,
         });
     }
 
@@ -4854,6 +4876,7 @@ pub fn spec_step_ddtree(
         bonus_token,
         drafted,
         committed,
+        rollback_replay: SpecRollbackReplayKind::GdnTape,
     })
 }
 
@@ -4994,6 +5017,7 @@ pub fn spec_step_ddtree_batched(
             bonus_token: bonus,
             drafted: vec![seed_token],
             committed: vec![seed_token, bonus],
+            rollback_replay: SpecRollbackReplayKind::FullPrefill,
         });
     }
 
@@ -5485,6 +5509,7 @@ pub fn spec_step_ddtree_batched(
         bonus_token,
         drafted,
         committed,
+        rollback_replay: SpecRollbackReplayKind::GdnTape,
     })
 }
 
@@ -5623,6 +5648,7 @@ pub fn spec_step_ddtree_path_c(
             bonus_token: bonus,
             drafted: vec![seed_token],
             committed: vec![seed_token, bonus],
+            rollback_replay: SpecRollbackReplayKind::FullPrefill,
         });
     }
 
@@ -5939,6 +5965,7 @@ pub fn spec_step_ddtree_path_c(
         bonus_token: effective_bonus,
         drafted,
         committed,
+        rollback_replay: SpecRollbackReplayKind::GdnTape,
     })
 }
 
@@ -6135,12 +6162,19 @@ mod tests {
     }
 
     #[test]
+    fn spec_rollback_replay_kind_labels_are_stable() {
+        assert_eq!(SpecRollbackReplayKind::GdnTape.as_str(), "gdn_tape");
+        assert_eq!(SpecRollbackReplayKind::FullPrefill.as_str(), "full_prefill");
+    }
+
+    #[test]
     fn spec_rollback_parity_decision_for_step_derives_replay_boundary() {
         let full_accept_step = SpecStepResult {
             accepted: 3,
             bonus_token: 17,
             drafted: vec![3, 5, 7, 11],
             committed: vec![2, 5, 7, 11, 17],
+            rollback_replay: SpecRollbackReplayKind::GdnTape,
         };
         let full_accept = spec_rollback_parity_decision_for_step(32, &full_accept_step);
         assert!(full_accept.allow_single_session);
@@ -6155,6 +6189,7 @@ mod tests {
             bonus_token: 19,
             drafted: vec![3, 5, 7, 11],
             committed: vec![2, 19],
+            rollback_replay: SpecRollbackReplayKind::GdnTape,
         };
         let reject = spec_rollback_parity_decision_for_step(32, &reject_step);
         assert!(reject.allow_single_session);
@@ -6170,6 +6205,7 @@ mod tests {
             bonus_token: 17,
             drafted: vec![3, 5, 7, 11],
             committed: vec![2, 5, 17],
+            rollback_replay: SpecRollbackReplayKind::GdnTape,
         };
         let decision = spec_rollback_parity_decision_for_step(32, &corrupt_step);
         assert!(!decision.allow_single_session);

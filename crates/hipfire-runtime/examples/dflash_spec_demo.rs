@@ -1761,6 +1761,8 @@ fn main() {
         let mut rollback_checked_cycles: usize = 0;
         let mut rollback_single_session_ok: usize = 0;
         let mut rollback_multi_request_disabled: usize = 0;
+        let mut rollback_replay_gdn_tape: usize = 0;
+        let mut rollback_replay_full_prefill: usize = 0;
         while emitted.len() < max_tokens {
             if position + draft_scratch_b >= ctx_capacity {
                 eprintln!("hit ctx_capacity {}; stopping", ctx_capacity);
@@ -2032,6 +2034,12 @@ fn main() {
             }
             if !rollback.allow_multi_request_verify_batch {
                 rollback_multi_request_disabled += 1;
+            }
+            match step.rollback_replay {
+                speculative::SpecRollbackReplayKind::GdnTape => rollback_replay_gdn_tape += 1,
+                speculative::SpecRollbackReplayKind::FullPrefill => {
+                    rollback_replay_full_prefill += 1
+                }
             }
             assert!(
                 rollback.allow_single_session,
@@ -2317,8 +2325,12 @@ fn main() {
             stats.mean_committed(),
         );
         eprintln!(
-            "rollback_parity: checked={} single_session_ok={} multi_request_disabled={}",
-            rollback_checked_cycles, rollback_single_session_ok, rollback_multi_request_disabled,
+            "rollback_parity: checked={} single_session_ok={} multi_request_disabled={} replay_gdn_tape={} replay_full_prefill={}",
+            rollback_checked_cycles,
+            rollback_single_session_ok,
+            rollback_multi_request_disabled,
+            rollback_replay_gdn_tape,
+            rollback_replay_full_prefill,
         );
         if let Some(ref p) = cask_policy {
             eprintln!(
