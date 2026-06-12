@@ -853,6 +853,13 @@ pub const ENV_HIPFIRE_DFLASH_Q8_LMHEAD_WMMA: EnvVarDoc = EnvVarDoc {
     source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:33",
 };
 
+/// `HIPFIRE_DFLASH_ROLLBACK_COMPARE` — Diagnostic-only fast GDN-tape rollback replay comparison against serial replay
+pub const ENV_HIPFIRE_DFLASH_ROLLBACK_COMPARE: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DFLASH_ROLLBACK_COMPARE",
+    description: "Diagnostic-only fast GDN-tape rollback replay comparison against serial replay",
+    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:829",
+};
+
 /// `HIPFIRE_DFLASH_SEED_ORACLE` — Enabled when set to 1
 pub const ENV_HIPFIRE_DFLASH_SEED_ORACLE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_SEED_ORACLE",
@@ -2686,6 +2693,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD,
     ENV_HIPFIRE_DFLASH_NGRAM_BLOCK,
     ENV_HIPFIRE_DFLASH_Q8_LMHEAD_WMMA,
+    ENV_HIPFIRE_DFLASH_ROLLBACK_COMPARE,
     ENV_HIPFIRE_DFLASH_SEED_ORACLE,
     ENV_HIPFIRE_DFLASH_SPEC_DEMO_BIN,
     ENV_HIPFIRE_DOT2_GEMV,

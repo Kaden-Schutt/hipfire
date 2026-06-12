@@ -826,6 +826,15 @@ fn dflash_force_serial_rollback_replay_from_env() -> bool {
     )
 }
 
+fn dflash_compare_rollback_replay_from_env() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_DFLASH_ROLLBACK_COMPARE")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+    )
+}
+
 /// Backing storage for a DeltaNetState snapshot. Holds device buffers sized
 /// to match the source state's tensors. Allocate once per slot, reuse across
 /// all speculative cycles.
@@ -920,6 +929,103 @@ impl DeltaNetSnapshot {
             let _ = gpu.hip.free(buf);
         }
     }
+}
+
+#[derive(Debug)]
+struct DeltaNetSnapshotDiff {
+    family: &'static str,
+    index: usize,
+    bytes: usize,
+    differing_bytes: usize,
+    first_offset: usize,
+    expected_byte: u8,
+    actual_byte: u8,
+}
+
+fn compare_device_buffer_to_snapshot(
+    gpu: &Gpu,
+    family: &'static str,
+    index: usize,
+    actual: &DeviceBuffer,
+    expected: &DeviceBuffer,
+) -> HipResult<Option<DeltaNetSnapshotDiff>> {
+    let bytes = actual.size();
+    if bytes != expected.size() {
+        return Ok(Some(DeltaNetSnapshotDiff {
+            family,
+            index,
+            bytes,
+            differing_bytes: bytes.max(expected.size()),
+            first_offset: 0,
+            expected_byte: 0,
+            actual_byte: 0,
+        }));
+    }
+    let mut actual_host = vec![0u8; bytes];
+    let mut expected_host = vec![0u8; bytes];
+    gpu.hip.memcpy_dtoh(&mut actual_host, actual)?;
+    gpu.hip.memcpy_dtoh(&mut expected_host, expected)?;
+    let mut first: Option<usize> = None;
+    let mut differing = 0usize;
+    for (i, (a, e)) in actual_host.iter().zip(expected_host.iter()).enumerate() {
+        if a != e {
+            differing += 1;
+            first.get_or_insert(i);
+        }
+    }
+    Ok(first.map(|first_offset| DeltaNetSnapshotDiff {
+        family,
+        index,
+        bytes,
+        differing_bytes: differing,
+        first_offset,
+        expected_byte: expected_host[first_offset],
+        actual_byte: actual_host[first_offset],
+    }))
+}
+
+fn compare_delta_net_state_to_snapshot(
+    gpu: &Gpu,
+    actual: &DeltaNetState,
+    expected: &DeltaNetSnapshot,
+) -> HipResult<Option<DeltaNetSnapshotDiff>> {
+    for (i, (actual, expected)) in actual
+        .s_matrices
+        .iter()
+        .zip(expected.s_matrix_bufs.iter())
+        .enumerate()
+    {
+        if let Some(diff) =
+            compare_device_buffer_to_snapshot(gpu, "s_matrix", i, &actual.buf, expected)?
+        {
+            return Ok(Some(diff));
+        }
+    }
+    for (i, (actual, expected)) in actual
+        .s_scales
+        .iter()
+        .zip(expected.s_scale_bufs.iter())
+        .enumerate()
+    {
+        if let Some(diff) =
+            compare_device_buffer_to_snapshot(gpu, "s_scale", i, &actual.buf, expected)?
+        {
+            return Ok(Some(diff));
+        }
+    }
+    for (i, (actual, expected)) in actual
+        .conv_states
+        .iter()
+        .zip(expected.conv_state_bufs.iter())
+        .enumerate()
+    {
+        if let Some(diff) =
+            compare_device_buffer_to_snapshot(gpu, "conv_state", i, &actual.buf, expected)?
+        {
+            return Ok(Some(diff));
+        }
+    }
+    Ok(None)
 }
 
 /// A series of `n_slots` `DeltaNetSnapshot` slots, used by the tape-replay
@@ -4202,6 +4308,49 @@ pub fn spec_step_dflash(
             &mut target.dn_state,
             accept_len + 1,
         )?;
+        if dflash_compare_rollback_replay_from_env()
+            && (trace_position.is_none() || trace_this_position)
+        {
+            let mut gdn_result = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
+            gdn_result.save_from(&target.dn_state, gpu)?;
+
+            target_snap.restore_to(&mut target.dn_state, gpu)?;
+            for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
+                qwen35::forward_scratch(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    tok,
+                    position + i,
+                    &mut target.kv_cache,
+                    &mut target.dn_state,
+                    &target.scratch,
+                )?;
+            }
+            match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &gdn_result)? {
+                Some(diff) => eprintln!(
+                    "[dflash-rollback-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                    diff.family,
+                    diff.index,
+                    diff.bytes,
+                    diff.differing_bytes,
+                    diff.first_offset,
+                    diff.actual_byte,
+                    diff.expected_byte,
+                ),
+                None => eprintln!(
+                    "[dflash-rollback-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+            }
+            gdn_result.restore_to(&mut target.dn_state, gpu)?;
+            gdn_result.free_gpu(gpu);
+        }
         SpecRollbackReplayKind::GdnTape
     } else {
         let replay_tokens = &committed[..accept_len + 1];
@@ -6242,6 +6391,30 @@ mod tests {
         assert!(dflash_force_serial_rollback_replay_from_env());
         unsafe {
             std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY");
+        }
+    }
+
+    #[test]
+    fn dflash_rollback_compare_is_opt_in_diagnostic() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_COMPARE");
+        }
+        assert!(!dflash_compare_rollback_replay_from_env());
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_COMPARE", "1");
+        }
+        assert!(dflash_compare_rollback_replay_from_env());
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_COMPARE", "true");
+        }
+        assert!(dflash_compare_rollback_replay_from_env());
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_COMPARE", "0");
+        }
+        assert!(!dflash_compare_rollback_replay_from_env());
+        unsafe {
+            std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_COMPARE");
         }
     }
 

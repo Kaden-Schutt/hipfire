@@ -123,6 +123,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD` | shapes. sub_offset returns a non-owning view; do NOT free these | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:2660` |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:3281` |
 | `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` | Selects behavior from recognized values | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:33` |
+| `HIPFIRE_DFLASH_ROLLBACK_COMPARE` | Diagnostic-only fast GDN-tape rollback replay comparison against serial replay | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:829` |
 | `HIPFIRE_DFLASH_SEED_ORACLE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:3872` |
 | `HIPFIRE_DFLASH_SPEC_DEMO_BIN` | Runtime variable controlling dflash spec demo bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/eval_harness/mod.rs:7924` |
 | `HIPFIRE_DOT2_GEMV` | Interprets "HIPFIRE_DOT2_GEMV" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:158` |
