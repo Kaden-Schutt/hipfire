@@ -1544,6 +1544,80 @@ impl Gpu {
         )
     }
 
+    /// Synthetic gfx1151 HFQ4-G256 x signed-Q4 activation IU4-WMMA probe.
+    /// Caller supplies a prequantized S4 activation scratch plus per-32-K
+    /// scale/sum metadata. This validates the affine correction path but is
+    /// deliberately not routed into Qwen model code.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq4g256_s4_mmq_gfx1151(
+        &mut self,
+        a: &GpuTensor,
+        x_qs: &GpuTensor,
+        x_d: &GpuTensor,
+        x_sum: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1151" {
+            panic!(
+                "gemm_hfq4g256_s4_mmq_gfx1151: only gfx1151 is supported; arch={}",
+                self.arch
+            );
+        }
+        assert_eq!(
+            k % 256,
+            0,
+            "gemm_hfq4g256_s4_mmq_gfx1151 requires K multiple of 256"
+        );
+        self.ensure_kernel(
+            "gemm_hfq4g256_s4_mmq_gfx1151",
+            kernels::GEMM_HFQ4G256_S4_MMQ_GFX1151_SRC,
+            "gemm_hfq4g256_s4_mmq_gfx1151",
+        )?;
+
+        let a_ptr = a.buf.as_ptr();
+        let x_qs_ptr = x_qs.buf.as_ptr();
+        let x_d_ptr = x_d.buf.as_ptr();
+        let x_sum_ptr = x_sum.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_qs_ptr as *const _ as *mut c_void,
+            &x_d_ptr as *const _ as *mut c_void,
+            &x_sum_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "gemm_hfq4g256_s4_mmq_gfx1151",
+            [m.div_ceil(16) as u32, n.div_ceil(16) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_qs_ptr);
+                b.push_ptr(x_d_ptr);
+                b.push_ptr(x_sum_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )
+    }
+
     /// Launch a pre-loaded kernel by name using the `extra`-mode kernarg
     /// blob path. This is the only launch path that survives hipGraph
     /// capture on gfx1100 / ROCm 6.x — the traditional `kernelParams`

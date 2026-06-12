@@ -75,6 +75,13 @@ pub const BENCH_IU4_WMMA_GFX1151_SRC: &str =
 pub const GEMM_S4S4_WMMA_TILE_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/gemm_s4s4_wmma_tile.gfx1151.hip");
 
+/// gfx1151 HFQ4-G256 x signed-Q4 activation IU4-WMMA correction-path probe.
+/// Synthetic/channel-test only: uses existing HFQ4 weight blocks and a
+/// prequantized S4 activation scratch to validate affine scale/zero handling
+/// before any model route or quality claim.
+pub const GEMM_HFQ4G256_S4_MMQ_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gemm_hfq4g256_s4_mmq.gfx1151.hip");
+
 /// gfx1151 fused RMSNorm + MQ FWHT rotation with wave-reduced RMS. Same
 /// output contract as the generic source; only the RMS reduction topology is
 /// gfx1151-specific.

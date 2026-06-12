@@ -88,9 +88,12 @@ MMQ x16/x32_y64 path remains the default.
 
 gfx1151 IU4 WMMA is available and now has a signed-Q4 tile channel test
 (`test_gfx1151_s4_wmma_tile`) that validates packed S4xS4 -> I32 accumulator
-layout against a CPU dot reference. It is not routed into Qwen yet; the next
-production step is a symmetric Q4 activation scratch plus HFQ4/MQ4 scale and
-zero-point correction quality evaluation.
+layout against a CPU dot reference. A follow-on HFQ4-G256 correction-path
+probe (`test_gfx1151_hfq4_s4_mmq`) validates existing HFQ4 blocks plus
+signed-Q4 activation scratch against a CPU affine reference. Neither path is
+routed into Qwen yet; the next production step is runtime symmetric-Q4
+activation quantization plus quality/perf evaluation against the Q8_1 MMQ
+path.
 
 ### MoE grouped GEMM
 

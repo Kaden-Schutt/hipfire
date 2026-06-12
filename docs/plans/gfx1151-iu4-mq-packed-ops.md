@@ -123,8 +123,13 @@ as a mixed-format transform, not as a drop-in Lloyd kernel replacement.
    `v_wmma_i32_16x16x16_iu4` S4×S4 tile against a CPU integer-dot
    reference for aligned and edge shapes. Start the real scratch path with
    symmetric Q4 unless a zero point is needed for quality.
-3. **Prototype MQ4/HFQ4 uniform residual MMQ with IU4.** This is the
-   cleanest affine case and the best comparison against the existing
+3. **Prototype MQ4/HFQ4 uniform residual MMQ with IU4.** The first
+   standalone correction-path probe is now covered by
+   `test_gfx1151_hfq4_s4_mmq`: it consumes existing HFQ4-G256 blocks,
+   a signed-Q4 activation scratch, and applies the affine
+   `w = scale * (qs + 8) + zero` correction around an IU4 WMMA dot. It
+   is not routed into Qwen yet; production routing still needs runtime
+   activation quantization plus drift/perf gates against the existing
    Q8_1 + IU8 MMQ kernel.
 4. **Run gold comparisons before routing.** Compare against the current
    MQ4 control path and explicitly measure activation-Q4 drift. Do not
