@@ -1710,19 +1710,34 @@ impl GdnTape {
                     n_v_heads,
                     value_head_dim,
                 )?,
-                qwen35::StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
-                    &self.q_scratch,
-                    &self.k_scratch,
-                    &self.v_scratch,
-                    &self.alpha_bufs[la_idx],
-                    &self.beta_bufs[la_idx],
-                    &dn_state.s_matrices[la_idx],
-                    &dn_state.s_scales[la_idx],
-                    &self.attn_scratch,
-                    n_steps,
-                    n_v_heads,
-                    value_head_dim,
-                )?,
+                qwen35::StateQuant::Q8 => {
+                    // Rollback parity is defined against decode's per-token
+                    // recurrent-state cadence. The batched Q8 helper
+                    // requantizes once after N tokens, which is fine for
+                    // throughput-oriented prefill but not for replaying the
+                    // AR-equivalent accepted prefix.
+                    for step in 0..n_steps {
+                        let q = self.q_scratch.sub_offset(step * v_dim, v_dim);
+                        let k = self.k_scratch.sub_offset(step * v_dim, v_dim);
+                        let v = self.v_scratch.sub_offset(step * v_dim, v_dim);
+                        let alpha = self.alpha_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
+                        let beta = self.beta_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
+                        let out = self.attn_scratch.sub_offset(step * v_dim, v_dim);
+                        gpu.gated_delta_net_q8(
+                            &q,
+                            &k,
+                            &v,
+                            &alpha,
+                            &beta,
+                            &dn_state.s_matrices[la_idx],
+                            &dn_state.s_scales[la_idx],
+                            &out,
+                            1,
+                            n_v_heads,
+                            value_head_dim,
+                        )?;
+                    }
+                }
                 qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
                     &self.q_scratch,
                     &self.k_scratch,

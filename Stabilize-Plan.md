@@ -75,8 +75,11 @@
     Re-running the known prose repro with `HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY=0 HIPFIRE_DFLASH_ROLLBACK_COMPARE=1
     HIPFIRE_DFLASH_TRACE_POSITION=120 HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN=57874` localizes the first recurrent-state mismatch to
     `s_matrix[0]`: `bytes=786432`, `differing_bytes=169285`, `first_offset=1`, `serial_byte=243`, `gdn_byte=242`. The verifier row at the same
-    position still ranks DFlash token `6511` above AR token `57874`, so the next blocker is fixing first-layer GDN replay state parity before
-    re-enabling fast replay.
+    position still ranks DFlash token `6511` above AR token `57874`. Switching Q8 GDN-tape replay to the same per-token
+    `gated_delta_net_q8` recurrence cadence used by serial decode did not clear the known position-120 repro: the first mismatch is still in
+    `s_matrix[0]` (`bytes=786432`, `differing_bytes=169288`, `first_offset=5`, `serial_byte=124`, `gdn_byte=123`), and the verifier row still
+    chooses DFlash token `6511` over AR token `57874`. The next blocker is comparing the captured fast-replay `q/k/v/alpha/beta` inputs against
+    serial per-token decode inputs before the first-layer GDN update, then fixing that input/capture drift before re-enabling fast replay.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
