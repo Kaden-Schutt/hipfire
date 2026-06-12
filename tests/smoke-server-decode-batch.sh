@@ -321,6 +321,7 @@ def run_parity_pair(batch_size: int, chunk_size: int | None = None) -> dict[str,
 
 
 matrix_enabled = os.environ.get("HIPFIRE_DECODE_BATCH_GROUPED_PARITY_MATRIX", "").lower() in {"1", "true", "yes"}
+internal_parity_enabled = os.environ.get("HIPFIRE_QWEN35_DECODE_INTERNAL_PARITY", "").lower() in {"1", "true", "yes", "on"}
 if matrix_enabled:
     if expected_decode_backend != "fused_grouped_moe_layer_chunked":
         raise RuntimeError(
@@ -335,6 +336,7 @@ if matrix_enabled:
     result = matrix[-1]
     print(
         "server grouped-MoE decode parity matrix passed: "
+        f"internal_parity={internal_parity_enabled} "
         + " ".join(
             f"B={entry['batch_size']} chunks={entry['checks'].get('decode_last_chunk_count')}/{entry['checks'].get('decode_last_chunk_size')} "
             f"serial_ms={float(entry['serial_checks'].get('decode_last_decode_ms') or 0):.3f} "
