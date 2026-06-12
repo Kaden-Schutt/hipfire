@@ -2153,10 +2153,17 @@ fn main() {
 
             // `step.committed[0]` is the seed_token (already emitted). Emit [1..].
             let emit_start = emitted.len();
-            let emit_count = step.committed.len().saturating_sub(1);
+            let emit_count_total = step.committed.len().saturating_sub(1);
+            let emit_count = emit_count_total.min(max_tokens.saturating_sub(emitted.len()));
             if let Some(trace_idx) = trace_token_index {
                 if trace_idx >= emit_start && trace_idx < emit_start + emit_count {
-                    let tail: Vec<u32> = step.committed.iter().skip(1).copied().collect();
+                    let tail: Vec<u32> = step
+                        .committed
+                        .iter()
+                        .skip(1)
+                        .take(emit_count)
+                        .copied()
+                        .collect();
                     eprintln!(
                         "[trace-token] target_index={} cycle={} emit_range={}..{} pos={} seed={} accepted={} bonus={} replay={} rollback_reason={} next_position={} tail={:?}",
                         trace_idx,
@@ -2175,10 +2182,10 @@ fn main() {
                     eprintln!("  decoded-tail: {:?}", tokenizer.decode(&tail));
                 }
             }
-            for (&tok, _) in step.committed.iter().skip(1).zip(0..) {
+            for &tok in step.committed.iter().skip(1).take(emit_count) {
                 emitted.push(tok);
             }
-            if ttft_ms.is_none() && step.committed.len() > 1 {
+            if ttft_ms.is_none() && emit_count > 0 {
                 // Use t_decode (post-warmup) + prefill_secs so the reported
                 // TTFT is what a serving-mode client would actually see.
                 let first_cycle_ms = t_decode.elapsed().as_secs_f64() * 1000.0;

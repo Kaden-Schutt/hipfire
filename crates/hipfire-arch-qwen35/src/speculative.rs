@@ -817,6 +817,15 @@ fn dflash_trace_expected_token_from_env() -> Option<usize> {
         .and_then(|s| s.parse().ok())
 }
 
+fn dflash_force_serial_rollback_replay_from_env() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY")
+            .ok()
+            .as_deref(),
+        Some("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
+    )
+}
+
 /// Backing storage for a DeltaNetState snapshot. Holds device buffers sized
 /// to match the source state's tensors. Allocate once per slot, reuse across
 /// all speculative cycles.
@@ -4165,7 +4174,27 @@ pub fn spec_step_dflash(
     // Fallback (no tape): batched forward_prefill_batch over (accept+1)
     // tokens, same as the prior version — re-runs the full target but one
     // batched call instead of (accept+1) sequential decodes.
-    let rollback_replay = if let Some(tape) = gdn_tape_opt.as_deref() {
+    // Conservative default while proving rollback parity: replay committed
+    // tokens through the same serial target path as AR. Fast GDN-tape/batched
+    // replay remains available for diagnostics with
+    // HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY=0, but it currently diverges from
+    // AR on the prose parity repro at B=8.
+    let force_serial_rollback = dflash_force_serial_rollback_replay_from_env();
+    let rollback_replay = if force_serial_rollback {
+        for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
+            qwen35::forward_scratch(
+                gpu,
+                &target.weights,
+                &target.config,
+                tok,
+                position + i,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+            )?;
+        }
+        SpecRollbackReplayKind::FullPrefill
+    } else if let Some(tape) = gdn_tape_opt.as_deref() {
         tape.replay_gdn(
             gpu,
             &target.weights,
@@ -6164,6 +6193,9 @@ pub fn compact_target_hidden_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn compact_target_hidden_host_keeps_selected_rows() {
@@ -6191,6 +6223,26 @@ mod tests {
         assert!(dflash_use_gdn_tape_replay(true, true));
         assert!(!dflash_use_gdn_tape_replay(false, true));
         assert!(!dflash_use_gdn_tape_replay(true, false));
+    }
+
+    #[test]
+    fn dflash_serial_rollback_replay_is_conservative_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY");
+        }
+        assert!(dflash_force_serial_rollback_replay_from_env());
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY", "0");
+        }
+        assert!(!dflash_force_serial_rollback_replay_from_env());
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY", "1");
+        }
+        assert!(dflash_force_serial_rollback_replay_from_env());
+        unsafe {
+            std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY");
+        }
     }
 
     #[test]
