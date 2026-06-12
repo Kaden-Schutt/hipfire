@@ -43,7 +43,9 @@
 #
 # Set HIPFIRE_DFLASH_AR_PARITY=1 to rerun DFlash cases through --ar-baseline
 # and hard-fail on token-list mismatch. This is stricter than the default
-# coherence detector and is used while proving rollback parity.
+# coherence detector and is used while proving rollback parity. AR parity also
+# requires conservative serial/full-prefill rollback replay; fast GDN-tape
+# replay remains diagnostic-only until it passes the same token parity gate.
 
 set -u
 cd "$(dirname "$0")/.."
@@ -329,6 +331,45 @@ else:
 PYEOF
 )
 
+ROLLBACK_REPLAY_PY=$(cat <<'PYEOF'
+import sys, re, json
+if len(sys.argv) != 2:
+    print(json.dumps({"ok": False, "reason": "usage"}))
+    sys.exit(0)
+out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+m = re.search(
+    r"^rollback_parity: .*replay_gdn_tape=(\d+) replay_full_prefill=(\d+)",
+    out,
+    re.MULTILINE,
+)
+if not m:
+    print(json.dumps({"ok": False, "reason": "missing_rollback_parity_stats"}))
+    sys.exit(0)
+gdn = int(m.group(1))
+full = int(m.group(2))
+if gdn != 0:
+    print(json.dumps({
+        "ok": False,
+        "reason": "fast_gdn_tape_replay_is_diagnostic_only",
+        "replay_gdn_tape": gdn,
+        "replay_full_prefill": full,
+    }))
+elif full <= 0:
+    print(json.dumps({
+        "ok": False,
+        "reason": "missing_conservative_full_prefill_replay",
+        "replay_gdn_tape": gdn,
+        "replay_full_prefill": full,
+    }))
+else:
+    print(json.dumps({
+        "ok": True,
+        "replay_gdn_tape": gdn,
+        "replay_full_prefill": full,
+    }))
+PYEOF
+)
+
 for entry in "${tests[@]}"; do
     IFS='|' read -r label mode prompt_var max_tok <<< "$entry"
     case "$prompt_var" in
@@ -381,6 +422,9 @@ for entry in "${tests[@]}"; do
         fi
     fi
 
+    # Pull stats lines (emitted/τ/cycles/rollback/accept_rate) for the report.
+    stats=$(grep -aE '^emitted:|^cycles:|^rollback_parity:|^accept_rate:' "$out_file" | head -4)
+
     status="OK"
     if [ "$ec" -ne 0 ] || [ -n "$panic" ]; then
         status="HARD_ERROR (exit=$ec panic=${panic:+yes})"
@@ -397,8 +441,15 @@ for entry in "${tests[@]}"; do
         hard_errors=$((hard_errors + 1))
     fi
 
-    # Pull stats lines (emitted/τ/cycles/rollback/accept_rate) for the report.
-    stats=$(grep -aE '^emitted:|^cycles:|^rollback_parity:|^accept_rate:' "$out_file" | head -4)
+    rollback_replay="not_checked"
+    if [ "$AR_PARITY" = "1" ] && [ "$mode" = "dflash" ]; then
+        rollback_replay=$(python3 -c "$ROLLBACK_REPLAY_PY" "$out_file")
+        rollback_replay_ok=$(echo "$rollback_replay" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))")
+        if [ "$rollback_replay_ok" != "True" ]; then
+            status="HARD_ERROR (rollback replay: $rollback_replay)"
+            hard_errors=$((hard_errors + 1))
+        fi
+    fi
 
     {
         echo "## $label ($mode)"
@@ -406,6 +457,7 @@ for entry in "${tests[@]}"; do
         echo "- wall: ${wall}s  status: **$status**"
         echo "- detector: \`$detect\`"
         echo "- ar_parity: \`$parity\`"
+        echo "- rollback_replay: \`$rollback_replay\`"
         if [ -n "$stats" ]; then
             echo "- stats:"
             echo '  ```'
