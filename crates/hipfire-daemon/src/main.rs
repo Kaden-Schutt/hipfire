@@ -2913,6 +2913,30 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
+    fn auto_grouped_moe_decode_stays_serial_when_native_route_is_unsupported() {
+        let config = test_grouped_moe_qwen35_config();
+        let signatures = vec![q8_decode_state_signature(); 8];
+        let unsupported = validate_qwen35_grouped_moe_decode_session_signatures(
+            &config,
+            &signatures,
+            8,
+            "gfx906",
+        )
+        .unwrap_err();
+        assert!(unsupported.contains("requires an RDNA grouped-MoE target"));
+
+        let backend = select_qwen35_decode_batch_backend("auto", 6, 8).unwrap();
+        assert_eq!(backend, Qwen35DecodeBatchBackend::SerialReference);
+        let metadata = qwen35_decode_batch_scheduler_metadata("auto", 6, backend, 8, 11);
+        assert_eq!(metadata.selected_backend, "serial_reference");
+        assert_eq!(
+            metadata.fallback_reason,
+            "auto_grouped_moe_serial_pending_latency_gate"
+        );
+        assert_eq!(metadata.cached_prefix_tokens, 11);
+    }
+
+    #[test]
     fn admits_fused_backend_only_for_dense_fused_candidate_plan() {
         let fused_grouped_ok = || Ok::<(), String>(());
         assert_eq!(
