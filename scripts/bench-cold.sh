@@ -57,7 +57,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-EXE="./target/release/examples/bench_qwen35_mq4"
+EXE="./target/release/examples/bench_qwen35_speed"
 MODEL=""
 PREFILLS="32,128"
 RUNS=5
@@ -87,7 +87,7 @@ if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
 fi
 if [ ! -x "$EXE" ]; then
     echo "ERR: bench binary missing — build with:" >&2
-    echo "  cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4" >&2
+    echo "  cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_speed" >&2
     exit 2
 fi
 

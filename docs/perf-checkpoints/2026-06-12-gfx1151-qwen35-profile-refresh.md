@@ -16,15 +16,15 @@ are still worth targeting before the matrix kernels.
 
 ```bash
 HIPFIRE_PROFILE=1 HIPFIRE_PROFILE_DECODE=1 HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
-  cargo run --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4 -- \
+  cargo run --release --features deltanet -p hipfire-runtime --example bench_qwen35_speed -- \
   ~/.hipfire/models/qwen3.5-9b.mq4.hfq --prefill 256 --prefill-runs 1 --warmup 3 --gen 12
 
 HIPFIRE_PROFILE=1 HIPFIRE_PROFILE_DECODE=1 HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
-  cargo run --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4 -- \
+  cargo run --release --features deltanet -p hipfire-runtime --example bench_qwen35_speed -- \
   ~/.hipfire/models/qwen3.6-35b-a3b-mq4.hfq --prefill 128 --prefill-runs 1 --warmup 2 --gen 6
 
 HIPFIRE_PROFILE=1 HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 HIPFIRE_MOE_GROUPED_I8_4W={0,1} \
-  target/release/examples/bench_qwen35_mq4 \
+  target/release/examples/bench_qwen35_speed \
   ~/.hipfire/models/qwen3.6-35b-a3b-mq4.hfq --prefill 128 --prefill-runs 1 --warmup 0 --gen 0
 ```
 

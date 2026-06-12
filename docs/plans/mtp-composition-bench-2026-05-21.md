@@ -357,7 +357,7 @@ at M=16 cluster at 155-170 tok/s; M>16 drops to ~120 (2-tile penalty).
 were invoked as SEPARATE PROCESSES (each `./target/release/examples/...`
 invocation forks a new process; no shared shell state). Per CLAUDE.md
 ±5% rule, this satisfies the "fresh-process probe_commits.sh" intent.
-`scripts/probe_commits.sh` itself exercises `bench_qwen35_mq4` (bare AR
+`scripts/probe_commits.sh` itself exercises `bench_qwen35_speed` (bare AR
 on 9B), not MTP, so it's not directly applicable to MTP findings.
 
 **K=4 byte-identical output to K=5**: Captured `=== output ===` text

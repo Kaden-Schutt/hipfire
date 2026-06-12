@@ -97,6 +97,9 @@ pub enum BatteryId {
     Retrieval,
     Speed,
     Dflash,
+    Pflash,
+    Agentic,
+    Runtime,
     PromptShape,
     Structured,
     Barrage,
@@ -115,6 +118,9 @@ impl BatteryId {
             "retrieval" => Ok(Self::Retrieval),
             "speed" => Ok(Self::Speed),
             "dflash" => Ok(Self::Dflash),
+            "pflash" => Ok(Self::Pflash),
+            "agentic" | "tool_call" | "tool-call" => Ok(Self::Agentic),
+            "runtime" | "server-runtime" | "server_runtime" => Ok(Self::Runtime),
             "prompt_shape" | "prompt-shape" => Ok(Self::PromptShape),
             "structured" => Ok(Self::Structured),
             "barrage" => Ok(Self::Barrage),
@@ -134,6 +140,9 @@ impl BatteryId {
             Self::Retrieval => "retrieval",
             Self::Speed => "speed",
             Self::Dflash => "dflash",
+            Self::Pflash => "pflash",
+            Self::Agentic => "agentic",
+            Self::Runtime => "runtime",
             Self::PromptShape => "prompt_shape",
             Self::Structured => "structured",
             Self::Barrage => "barrage",
@@ -900,7 +909,7 @@ pub fn usage() -> String {
     "Usage:\n  hipfire-eval --model <model> [--tier fast|medium|long|extensive]\n\n\
      Options:\n\
        --version                print Hipfire eval runner version/git metadata\n\
-       --battery <a,b>          smoke,coherence,quality,retrieval,speed,dflash,prompt_shape,structured,barrage,longctx,vision,cask,profile\n\
+       --battery <a,b>          smoke,coherence,quality,retrieval,speed,dflash,pflash,agentic,runtime,prompt_shape,structured,barrage,longctx,vision,cask,profile\n\
        --suite <a,b>            gpqa,lm_eval_micro,humaneval,deep_swe,swe_bench,ruler,nolima,needle_chain,niah,sequential_niah\n\
        --baseline <model>       baseline quantized model for candidate comparison\n\
        --reference <model>      higher precision reference model or fixture\n\
@@ -1024,6 +1033,7 @@ pub fn default_batteries(tier: EvalTier) -> Vec<BatteryId> {
         BatteryId::Retrieval,
         BatteryId::Speed,
         BatteryId::Dflash,
+        BatteryId::Agentic,
         BatteryId::PromptShape,
         BatteryId::Structured,
     ];
@@ -3876,7 +3886,12 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
         "memory" => &[],
         "dflash_trace" => &[BatteryId::Dflash],
         "profiling" => &[],
-        "coherence" => &[BatteryId::Coherence, BatteryId::Longctx, BatteryId::Dflash],
+        "coherence" => &[
+            BatteryId::Coherence,
+            BatteryId::Longctx,
+            BatteryId::Dflash,
+            BatteryId::Agentic,
+        ],
         _ => return Vec::new(),
     };
     results
@@ -3951,6 +3966,7 @@ fn has_performance_metric(row: &EvalResult) -> bool {
         "prefill_ms",
         "prefill_secs",
         "prefill_tok_s",
+        "total_ms",
         "elapsed_ms",
         "launch_count",
     ]
@@ -4519,7 +4535,10 @@ fn required_evidence_row_matches(kind: &str, batteries: &[BatteryId], row: &Eval
 fn required_admission_evidence(config: &EvalConfig) -> Vec<(&'static str, Vec<BatteryId>)> {
     let mut required = vec![
         ("quality", vec![BatteryId::Quality]),
-        ("performance", vec![BatteryId::Speed, BatteryId::Dflash]),
+        (
+            "performance",
+            vec![BatteryId::Speed, BatteryId::Dflash, BatteryId::Pflash],
+        ),
     ];
     if config.batteries.contains(&BatteryId::Barrage) {
         required.push(("barrage", vec![BatteryId::Barrage]));
@@ -4786,6 +4805,43 @@ fn mock_battery_rows(
                 ])
             },
         ),
+        BatteryId::Agentic => mock_metric_family_rows(
+            battery,
+            "agentic_tool_call_shape",
+            prompt("benchmarks/prompts/agentic_user_read.txt"),
+            config,
+            ctx,
+            |_model| {
+                BTreeMap::from([
+                    ("hard_fails".to_string(), json!(0.0)),
+                    ("soft_warns".to_string(), json!(0.0)),
+                    ("detector_count".to_string(), json!(9.0)),
+                    ("generated_tokens".to_string(), json!(64.0)),
+                    ("structured_probe".to_string(), json!("agentic_tool_call")),
+                    ("runtime_path".to_string(), json!("daemon_jsonl_mock")),
+                ])
+            },
+        ),
+        BatteryId::Runtime => runtime_cases()
+            .iter()
+            .map(|case| {
+                pass_row(
+                    BatteryId::Runtime,
+                    None,
+                    case.label,
+                    None,
+                    config,
+                    ctx,
+                    None,
+                    BTreeMap::from([
+                        ("runtime_evidence_case".to_string(), json!(case.label)),
+                        ("script".to_string(), json!(case.script)),
+                        ("executor".to_string(), json!("mock")),
+                        ("runtime_path".to_string(), json!("server_runtime_mock")),
+                    ]),
+                )
+            })
+            .collect(),
         BatteryId::Barrage => mock_barrage_rows(config, ctx, datasets),
         _ => return None,
     };
@@ -5844,22 +5900,8 @@ fn examples_battery_rows(
             ),
             run_direct_session_reset_recall(config, ctx),
         ]),
-        BatteryId::Coherence => Some(vec![run_examples_coherence_anchor(config, ctx)]),
-        BatteryId::Speed => Some(
-            evaluation_models(config)
-                .into_iter()
-                .map(|model| {
-                    run_dflash_spec_demo_anchor(
-                        BatteryId::Speed,
-                        "ar_short_decode",
-                        true,
-                        config,
-                        ctx,
-                        model,
-                    )
-                })
-                .collect(),
-        ),
+        BatteryId::Coherence => Some(run_examples_coherence_rows(config, ctx)),
+        BatteryId::Speed => Some(run_examples_qwen35_speed_rows(config, ctx)),
         BatteryId::PromptShape => Some(vec![run_examples_run_anchor_with_prompt(
             BatteryId::PromptShape,
             "whitespace_template_canary",
@@ -5882,6 +5924,9 @@ fn examples_battery_rows(
                         BatteryId::Dflash,
                         "ar_anchor",
                         true,
+                        "benchmarks/prompts/dflash_resident_smoke.txt",
+                        &[],
+                        BTreeMap::new(),
                         config,
                         ctx,
                         model,
@@ -5904,13 +5949,20 @@ fn examples_battery_rows(
                     BatteryId::Dflash,
                     "dflash_anchor",
                     false,
+                    "benchmarks/prompts/dflash_resident_smoke.txt",
+                    &[],
+                    BTreeMap::new(),
                     config,
                     ctx,
                     config.model.clone(),
                 ));
             }
+            rows.extend(run_examples_dflash_matrix_rows(config, ctx));
             Some(rows)
         }
+        BatteryId::Pflash => Some(run_examples_pflash_rows(config, ctx)),
+        BatteryId::Agentic => Some(run_examples_agentic_rows(config, ctx)),
+        BatteryId::Runtime => Some(run_examples_runtime_rows(config, ctx)),
         BatteryId::Barrage => Some(examples_barrage_rows(config, ctx, datasets)),
         BatteryId::Longctx => Some(vec![run_examples_longctx_anchor(config, ctx)]),
         BatteryId::Profile => Some(
@@ -5953,28 +6005,102 @@ fn examples_executor_available_for(battery: BatteryId) -> bool {
         | BatteryId::Barrage
         | BatteryId::Profile => resolve_run_example_bin().is_some(),
         BatteryId::Longctx => crate::coherence_runtime::daemon_binary_available(),
-        BatteryId::Speed | BatteryId::Dflash => resolve_dflash_spec_demo_bin().is_some(),
+        BatteryId::Speed => resolve_bench_qwen35_speed_bin().is_some(),
+        BatteryId::Dflash => resolve_dflash_spec_demo_bin().is_some(),
+        BatteryId::Pflash => resolve_pflash_niah_bench_bin().is_some(),
+        BatteryId::Agentic => crate::coherence_runtime::daemon_binary_available(),
+        BatteryId::Runtime => true,
         _ => false,
     }
 }
 
-fn run_examples_coherence_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalResult {
+#[derive(Clone, Copy)]
+struct CoherenceCase {
+    label: &'static str,
+    prompt_path: &'static str,
+    system_path: Option<&'static str>,
+    max_tokens: usize,
+}
+
+fn coherence_cases() -> &'static [CoherenceCase] {
+    &[
+        CoherenceCase {
+            label: "capital_short_answer",
+            prompt_path: "benchmarks/prompts/coherence_capital_france.txt",
+            system_path: None,
+            max_tokens: 80,
+        },
+        CoherenceCase {
+            label: "code_square_function",
+            prompt_path: "benchmarks/prompts/coherence_square_function.txt",
+            system_path: None,
+            max_tokens: 180,
+        },
+        CoherenceCase {
+            label: "reason_sheep",
+            prompt_path: "benchmarks/prompts/coherence_sheep_reason.txt",
+            system_path: None,
+            max_tokens: 300,
+        },
+        CoherenceCase {
+            label: "tool_call_read_file",
+            prompt_path: "benchmarks/prompts/tool_call_read_file.txt",
+            system_path: Some("benchmarks/prompts/tool_call_system.txt"),
+            max_tokens: 180,
+        },
+        CoherenceCase {
+            label: "long_prefill_lloyd",
+            prompt_path: "benchmarks/prompts/coherence_lloyd_long.txt",
+            system_path: None,
+            max_tokens: 220,
+        },
+    ]
+}
+
+fn run_examples_coherence_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    coherence_cases()
+        .iter()
+        .map(|case| run_examples_coherence_case(config, ctx, *case))
+        .collect()
+}
+
+fn run_examples_coherence_case(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    case: CoherenceCase,
+) -> EvalResult {
+    let prompt_ref = if let Some(system_path) = case.system_path {
+        combined_prompt_ref(system_path, case.prompt_path)
+    } else {
+        prompt(case.prompt_path)
+    };
+    let metrics = BTreeMap::from([
+        ("suite".to_string(), json!("coherence_gate")),
+        ("prompt_kind".to_string(), json!(case.label)),
+        (
+            "detector_profile".to_string(),
+            json!(if case.system_path.is_some() {
+                "agentic_toolcall_shape"
+            } else {
+                "default_runtime_coherence"
+            }),
+        ),
+    ]);
     run_daemon_coherence_anchor(
         BatteryId::Coherence,
-        "runtime_detector_canary",
-        "benchmarks/prompts/qwen2_smoke.txt",
-        prompt("benchmarks/prompts/qwen2_smoke.txt"),
+        case.label,
+        case.prompt_path,
+        prompt_ref,
         config,
         ctx,
         config.model.clone(),
+        Some((case.max_tokens + 2048).max(4096)),
+        Some(case.max_tokens),
+        metrics,
+        case.system_path,
         None,
-        BTreeMap::from([
-            (
-                "detector_profile".to_string(),
-                json!("default_runtime_coherence"),
-            ),
-            ("runtime_path".to_string(), json!("daemon_jsonl")),
-        ]),
+        None,
+        false,
         None,
     )
 }
@@ -6018,7 +6144,12 @@ fn run_examples_longctx_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalRe
             ctx,
             config.model.clone(),
             Some(longctx.max_seq),
+            None,
             longctx.metrics,
+            None,
+            None,
+            None,
+            false,
             Some(crate::coherence_runtime::DetectorProfile::long_state()),
         ),
         Err(err) => row(
@@ -6037,6 +6168,1315 @@ fn run_examples_longctx_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalRe
     }
 }
 
+#[derive(Clone, Copy)]
+struct Qwen35SpeedCase {
+    label: &'static str,
+    prefill: usize,
+}
+
+fn qwen35_speed_cases() -> &'static [Qwen35SpeedCase] {
+    &[
+        Qwen35SpeedCase {
+            label: "pp32_prefill_decode",
+            prefill: 32,
+        },
+        Qwen35SpeedCase {
+            label: "pp128_prefill_decode",
+            prefill: 128,
+        },
+    ]
+}
+
+fn run_examples_qwen35_speed_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    evaluation_models(config)
+        .into_iter()
+        .flat_map(|model| {
+            qwen35_speed_cases()
+                .iter()
+                .map(move |case| run_examples_qwen35_speed_case(config, ctx, model.clone(), *case))
+        })
+        .collect()
+}
+
+fn run_examples_qwen35_speed_case(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: String,
+    case: Qwen35SpeedCase,
+) -> EvalResult {
+    let prompt_ref = prompt("benchmarks/prompts/lru_cache_single_blank.txt");
+    let mut metrics = BTreeMap::from([
+        ("implemented".to_string(), json!(true)),
+        ("executor".to_string(), json!("examples")),
+        ("suite".to_string(), json!("qwen35_speed_gate")),
+        ("prefill_tokens".to_string(), json!(case.prefill)),
+        (
+            "kv_mode".to_string(),
+            json!(config.kv_mode.as_deref().unwrap_or("asym3")),
+        ),
+    ]);
+    if !Path::new(&model).exists() {
+        return row_for_model(
+            BatteryId::Speed,
+            None,
+            case.label,
+            None,
+            EvalStatus::Skip,
+            Some("bench_qwen35_speed requires --model to be a local filesystem path".to_string()),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            0,
+            model,
+        );
+    }
+    let Some(bin) = resolve_bench_qwen35_speed_bin() else {
+        return row_for_model(
+            BatteryId::Speed,
+            None,
+            case.label,
+            None,
+            EvalStatus::Skip,
+            Some("bench_qwen35_speed example binary not found; build with `cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_speed`".to_string()),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            0,
+            model,
+        );
+    };
+
+    let args = vec![
+        model.clone(),
+        "--prefill".to_string(),
+        case.prefill.to_string(),
+        "--warmup".to_string(),
+        "5".to_string(),
+        "--gen".to_string(),
+        config.max_tokens.max(50).to_string(),
+    ];
+    let command_display = format!("{} {}", bin.display(), args.join(" "));
+    metrics.insert("command".to_string(), json!(command_display.clone()));
+    let started = SystemTime::now();
+    let mut command = Command::new(&bin);
+    command.args(&args);
+    command.env(
+        "HIPFIRE_KV_MODE",
+        config.kv_mode.as_deref().unwrap_or("asym3"),
+    );
+    command.env("HIPFIRE_DPM_WARMUP_SECS", "3");
+    if !model_stem(&model).contains("0.8b") {
+        command.env("HIPFIRE_GRAPH", "1");
+        metrics.insert("graph_enabled".to_string(), json!(true));
+    } else {
+        metrics.insert("graph_enabled".to_string(), json!(false));
+    }
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(err) => {
+            return row_for_model(
+                BatteryId::Speed,
+                None,
+                case.label,
+                None,
+                EvalStatus::Fail,
+                Some(format!("spawn bench_qwen35_speed: {err}")),
+                metrics,
+                config,
+                ctx,
+                prompt_ref,
+                elapsed_since_ms(started),
+                model,
+            );
+        }
+    };
+    let elapsed_ms = elapsed_since_ms(started);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    metrics.extend(parse_summary_kv_metrics(&stderr));
+    metrics.insert(
+        "stdout_hash".to_string(),
+        json!(stable_hash_bytes(stdout.as_bytes())),
+    );
+    metrics.insert(
+        "stderr_hash".to_string(),
+        json!(stable_hash_bytes(stderr.as_bytes())),
+    );
+    if let Some(v) = metrics.get("gen_tok_s").cloned() {
+        metrics.entry("tok_s".to_string()).or_insert(v);
+    }
+    let baseline_check = apply_speed_baseline(&mut metrics, &model, case.prefill, ctx);
+    let baseline_failed = baseline_check
+        .as_ref()
+        .map(|check| check.failed)
+        .unwrap_or(false);
+    let baseline_error = baseline_check
+        .as_ref()
+        .and_then(|check| check.error.as_deref());
+    if output.status.success()
+        && metrics.contains_key("prefill_tok_s")
+        && !baseline_failed
+        && baseline_error.is_none()
+    {
+        row_for_model(
+            BatteryId::Speed,
+            None,
+            case.label,
+            None,
+            EvalStatus::Pass,
+            None,
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            elapsed_ms,
+            model,
+        )
+    } else {
+        let reason = if let Some(error) = baseline_error {
+            error.to_string()
+        } else if baseline_failed {
+            "bench_qwen35_speed fell below perf baseline floor".to_string()
+        } else if output.status.success() {
+            "bench_qwen35_speed did not emit SUMMARY metrics".to_string()
+        } else {
+            format!("bench_qwen35_speed exited with {}", output.status)
+        };
+        row_for_model(
+            BatteryId::Speed,
+            None,
+            case.label,
+            None,
+            EvalStatus::Fail,
+            Some(reason),
+            metrics,
+            config,
+            ctx,
+            prompt_ref,
+            elapsed_ms,
+            model,
+        )
+    }
+}
+
+struct SpeedBaselineCheck {
+    failed: bool,
+    error: Option<String>,
+}
+
+fn apply_speed_baseline(
+    metrics: &mut BTreeMap<String, Value>,
+    model: &str,
+    prefill: usize,
+    ctx: &EvalContext,
+) -> Option<SpeedBaselineCheck> {
+    let require = env_truthy("HIPFIRE_REQUIRE_PERF_BASELINE");
+    let baseline_path = match resolve_perf_baseline_path(ctx) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            metrics.insert("perf_baseline_status".to_string(), json!("missing"));
+            if require {
+                return Some(SpeedBaselineCheck {
+                    failed: false,
+                    error: Some("no matching perf baseline found".to_string()),
+                });
+            }
+            return None;
+        }
+        Err(err) => {
+            metrics.insert("perf_baseline_status".to_string(), json!("error"));
+            return Some(SpeedBaselineCheck {
+                failed: false,
+                error: Some(err),
+            });
+        }
+    };
+    let model_size = match speed_model_size(model) {
+        Some(size) => size,
+        None => {
+            metrics.insert("perf_baseline_status".to_string(), json!("unmatched_model"));
+            if require {
+                return Some(SpeedBaselineCheck {
+                    failed: false,
+                    error: Some(format!("cannot infer model size from {model}")),
+                });
+            }
+            return None;
+        }
+    };
+    let model_id = speed_model_id(model);
+    let baseline = match load_speed_baseline(&baseline_path, &model_id, &model_size, prefill) {
+        Ok(Some(baseline)) => baseline,
+        Ok(None) => {
+            metrics.insert("perf_baseline_status".to_string(), json!("missing_row"));
+            metrics.insert(
+                "perf_baseline_path".to_string(),
+                json!(baseline_path.display().to_string()),
+            );
+            if require {
+                return Some(SpeedBaselineCheck {
+                    failed: false,
+                    error: Some(format!(
+                        "perf baseline {} has no speed row for {model_id} pp{prefill}",
+                        baseline_path.display()
+                    )),
+                });
+            }
+            return None;
+        }
+        Err(err) => {
+            metrics.insert("perf_baseline_status".to_string(), json!("error"));
+            return Some(SpeedBaselineCheck {
+                failed: false,
+                error: Some(err),
+            });
+        }
+    };
+    let tolerance = baseline.tolerance_pct / 100.0;
+    let prefill_observed = metrics.get("prefill_tok_s").and_then(Value::as_f64);
+    let gen_observed = metrics.get("gen_tok_s").and_then(Value::as_f64);
+    let mut failed = false;
+    metrics.insert("perf_baseline_status".to_string(), json!("compared"));
+    metrics.insert(
+        "perf_baseline_path".to_string(),
+        json!(baseline_path.display().to_string()),
+    );
+    metrics.insert("baseline_label".to_string(), json!(baseline.label));
+    metrics.insert("baseline_model_id".to_string(), json!(baseline.model_id));
+    metrics.insert("baseline_format".to_string(), json!(baseline.format));
+    metrics.insert(
+        "baseline_tolerance_pct".to_string(),
+        json!(baseline.tolerance_pct),
+    );
+    if let Some(floor) = baseline.prefill_tok_s {
+        metrics.insert("baseline_prefill_tok_s".to_string(), json!(floor));
+        metrics.insert(
+            "baseline_prefill_floor_tok_s".to_string(),
+            json!(floor * (1.0 - tolerance)),
+        );
+        if prefill_observed.is_some_and(|observed| observed < floor * (1.0 - tolerance)) {
+            failed = true;
+        }
+    }
+    if let Some(floor) = baseline.gen_tok_s {
+        metrics.insert("baseline_gen_tok_s".to_string(), json!(floor));
+        metrics.insert(
+            "baseline_gen_floor_tok_s".to_string(),
+            json!(floor * (1.0 - tolerance)),
+        );
+        if gen_observed.is_some_and(|observed| observed < floor * (1.0 - tolerance)) {
+            failed = true;
+        }
+    }
+    metrics.insert("perf_baseline_failed".to_string(), json!(failed));
+    Some(SpeedBaselineCheck {
+        failed,
+        error: None,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct SpeedBaseline {
+    label: String,
+    model_id: String,
+    format: String,
+    prefill_tok_s: Option<f64>,
+    gen_tok_s: Option<f64>,
+    tolerance_pct: f64,
+}
+
+fn load_speed_baseline(
+    path: &Path,
+    model_id: &str,
+    model_size: &str,
+    prefill: usize,
+) -> Result<Option<SpeedBaseline>, String> {
+    let body = fs::read_to_string(path)
+        .map_err(|err| format!("read perf baseline {}: {err}", path.display()))?;
+    let value: Value = serde_json::from_str(&body)
+        .map_err(|err| format!("parse perf baseline {}: {err}", path.display()))?;
+    let tolerance_pct = value
+        .get("tolerance_pct")
+        .and_then(Value::as_f64)
+        .unwrap_or(5.0);
+    let Some(rows) = value
+        .get("baselines")
+        .and_then(|v| v.get("speed"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(None);
+    };
+    for row in rows {
+        let row_model_id = row.get("model_id").and_then(Value::as_str);
+        let row_size = row.get("model_size").and_then(Value::as_str);
+        let row_prefill = row.get("prefill_tokens").and_then(Value::as_u64);
+        if row_model_id == Some(model_id)
+            && row_size == Some(model_size)
+            && row_prefill == Some(prefill as u64)
+        {
+            return Ok(Some(SpeedBaseline {
+                label: row
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("speed")
+                    .to_string(),
+                model_id: model_id.to_string(),
+                format: row
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                prefill_tok_s: row.get("prefill_tok_s").and_then(Value::as_f64),
+                gen_tok_s: row.get("gen_tok_s").and_then(Value::as_f64),
+                tolerance_pct: row
+                    .get("tolerance_pct")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(tolerance_pct),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_perf_baseline_path(ctx: &EvalContext) -> Result<Option<PathBuf>, String> {
+    if let Ok(path) = std::env::var("HIPFIRE_PERF_BASELINE") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Ok(Some(path));
+        }
+        return Err(format!(
+            "HIPFIRE_PERF_BASELINE points to missing file: {}",
+            path.display()
+        ));
+    }
+    let Some(arch) = ctx.arch.as_deref().or(ctx.host_profile.gfx.as_deref()) else {
+        return Ok(None);
+    };
+    let root = std::env::var("HIPFIRE_PERF_BASELINE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("benchmarks/perf-baselines"));
+    let root = if root.is_absolute() {
+        root
+    } else {
+        repo_root().unwrap_or_else(|| PathBuf::from(".")).join(root)
+    };
+    let pattern_prefix = format!("{arch}-");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("read perf baseline dir {}: {err}", root.display())),
+    };
+    let mut matches = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with(&pattern_prefix) && name.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => Err(format!(
+            "multiple perf baselines for {arch}; set HIPFIRE_PERF_BASELINE"
+        )),
+    }
+}
+
+fn speed_model_id(model: &str) -> String {
+    model_stem(model).to_ascii_lowercase()
+}
+
+fn speed_model_size(model: &str) -> Option<String> {
+    let stem = model_stem(model).to_ascii_lowercase();
+    for size in ["0.8b", "4b", "9b", "27b", "35b-a3b"] {
+        if stem.contains(size) {
+            return Some(size.to_string());
+        }
+    }
+    None
+}
+
+fn env_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+#[derive(Clone, Copy)]
+struct AgenticCase {
+    label: &'static str,
+    system_path: &'static str,
+    thinking_clamped: bool,
+    max_tokens: usize,
+}
+
+fn agentic_cases() -> &'static [AgenticCase] {
+    &[
+        AgenticCase {
+            label: "agentic_pi_unclamped",
+            system_path: "benchmarks/prompts/agentic_pi_system.txt",
+            thinking_clamped: false,
+            max_tokens: 256,
+        },
+        AgenticCase {
+            label: "agentic_pi_clamped",
+            system_path: "benchmarks/prompts/agentic_pi_system.txt",
+            thinking_clamped: true,
+            max_tokens: 256,
+        },
+        AgenticCase {
+            label: "agentic_hermes_unclamped",
+            system_path: "benchmarks/prompts/agentic_hermes_system.txt",
+            thinking_clamped: false,
+            max_tokens: 256,
+        },
+    ]
+}
+
+fn run_examples_agentic_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    let mut rows = evaluation_models(config)
+        .into_iter()
+        .flat_map(|model| {
+            agentic_cases()
+                .iter()
+                .map(move |case| run_examples_agentic_case(config, ctx, model.clone(), *case))
+        })
+        .collect::<Vec<_>>();
+    rows.push(run_examples_agentic_jinja_tools_case(
+        config,
+        ctx,
+        config.model.clone(),
+    ));
+    rows
+}
+
+fn run_examples_agentic_case(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: String,
+    case: AgenticCase,
+) -> EvalResult {
+    let prompt_path = "benchmarks/prompts/agentic_user_read.txt";
+    let prompt_ref = combined_prompt_ref(case.system_path, prompt_path);
+    let mut metrics = BTreeMap::from([
+        ("suite".to_string(), json!("agentic_tool_call")),
+        ("system_prompt".to_string(), json!(case.system_path)),
+        ("user_prompt".to_string(), json!(prompt_path)),
+        ("thinking_clamped".to_string(), json!(case.thinking_clamped)),
+        (
+            "detector_profile".to_string(),
+            json!("agentic_toolcall_shape"),
+        ),
+    ]);
+    if case.thinking_clamped {
+        metrics.insert("max_think_tokens".to_string(), json!(1));
+    }
+    let mut profile = crate::coherence_runtime::DetectorProfile::default_for_prompt("", None);
+    profile.agentic = true;
+    run_daemon_coherence_anchor(
+        BatteryId::Agentic,
+        case.label,
+        prompt_path,
+        prompt_ref,
+        config,
+        ctx,
+        model,
+        Some(4096),
+        Some(case.max_tokens),
+        metrics,
+        Some(case.system_path),
+        None,
+        None,
+        false,
+        Some(profile),
+    )
+}
+
+fn run_examples_agentic_jinja_tools_case(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    model: String,
+) -> EvalResult {
+    let prompt_path = "benchmarks/prompts/agentic_jinja_tools_user.txt";
+    let system_path = "benchmarks/prompts/agentic_jinja_tools_system.txt";
+    let tools = json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the current weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {
+                            "type": "string",
+                            "description": "City name."
+                        },
+                        "unit": {
+                            "type": "string",
+                            "enum": ["c", "f"],
+                            "description": "Temperature unit."
+                        }
+                    },
+                    "required": ["city"]
+                }
+            }
+        }
+    ]);
+    let prompt_ref = structured_tools_prompt_ref(system_path, prompt_path, &tools);
+    let metrics = BTreeMap::from([
+        ("suite".to_string(), json!("agentic_jinja_tools")),
+        ("system_prompt".to_string(), json!(system_path)),
+        ("user_prompt".to_string(), json!(prompt_path)),
+        ("tools_count".to_string(), json!(1.0)),
+        ("force_jinja_chat".to_string(), json!(true)),
+        ("assistant_prefix".to_string(), json!("closed_think")),
+        (
+            "detector_profile".to_string(),
+            json!("agentic_structured_tools"),
+        ),
+    ]);
+    let mut profile = crate::coherence_runtime::DetectorProfile::default_for_prompt("", None);
+    profile.agentic = true;
+    run_daemon_coherence_anchor(
+        BatteryId::Agentic,
+        "agentic_jinja_structured_tools",
+        prompt_path,
+        prompt_ref,
+        config,
+        ctx,
+        model,
+        Some(1024),
+        Some(192),
+        metrics,
+        Some(system_path),
+        Some(tools),
+        Some("closed_think"),
+        true,
+        Some(profile),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeCase {
+    label: &'static str,
+    script: &'static str,
+    category: &'static str,
+}
+
+fn runtime_cases() -> &'static [RuntimeCase] {
+    &[
+        RuntimeCase {
+            label: "server_prefill_batch",
+            script: "tests/smoke-server-prefill-batch.sh",
+            category: "prefill_batching",
+        },
+        RuntimeCase {
+            label: "server_decode_batch",
+            script: "tests/smoke-server-decode-batch.sh",
+            category: "decode_batching",
+        },
+        RuntimeCase {
+            label: "daemon_generate_batch_prefill",
+            script: "tests/smoke-generate-batch-prefill.sh",
+            category: "prefill_batching",
+        },
+        RuntimeCase {
+            label: "prefix_checkpoint_reuse",
+            script: "tests/smoke-server-prefix-checkpoint-reuse.sh",
+            category: "prefix_reuse",
+        },
+        RuntimeCase {
+            label: "prefix_boundary_reuse",
+            script: "tests/smoke-server-prefix-boundary-reuse.sh",
+            category: "prefix_reuse",
+        },
+        RuntimeCase {
+            label: "responses_prefix_reuse",
+            script: "tests/smoke-server-responses-prefix-reuse.sh",
+            category: "prefix_reuse",
+        },
+        RuntimeCase {
+            label: "shared_prefix_fanout",
+            script: "tests/smoke-server-shared-prefix-fanout.sh",
+            category: "shared_prefix_fanout",
+        },
+        RuntimeCase {
+            label: "multi_model_workers",
+            script: "tests/smoke-server-multi-model-workers.sh",
+            category: "multi_model_workers",
+        },
+        RuntimeCase {
+            label: "server_concurrency",
+            script: "tests/stress-server-concurrency.sh",
+            category: "concurrency",
+        },
+        RuntimeCase {
+            label: "kv_budget_reload",
+            script: "tests/e2e_kv_budget.sh",
+            category: "kv_admission",
+        },
+        RuntimeCase {
+            label: "kv_reject_http",
+            script: "tests/e2e_kv_reject.sh",
+            category: "kv_admission",
+        },
+        RuntimeCase {
+            label: "kv_reject_run",
+            script: "tests/e2e_run_reject.sh",
+            category: "kv_admission",
+        },
+        RuntimeCase {
+            label: "pipeline_parallel_gate",
+            script: "tests/pp-gate.sh",
+            category: "pipeline_parallel",
+        },
+        RuntimeCase {
+            label: "pipeline_parallel_coherence",
+            script: "tests/coherence-gate-pp.sh",
+            category: "pipeline_parallel",
+        },
+    ]
+}
+
+fn run_examples_runtime_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    runtime_cases()
+        .iter()
+        .map(|case| run_examples_runtime_case(config, ctx, *case))
+        .collect()
+}
+
+fn run_examples_runtime_case(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    case: RuntimeCase,
+) -> EvalResult {
+    let script = Path::new(case.script);
+    let mut metrics = BTreeMap::from([
+        ("runtime_evidence_case".to_string(), json!(case.label)),
+        ("runtime_category".to_string(), json!(case.category)),
+        ("script".to_string(), json!(case.script)),
+        ("runtime_path".to_string(), json!("shell_runtime_gate")),
+    ]);
+
+    if !script.is_file() {
+        return skip_row_with_metrics(
+            BatteryId::Runtime,
+            None,
+            case.label,
+            None,
+            "runtime evidence script is not present",
+            config,
+            ctx,
+            None,
+            metrics,
+        );
+    }
+
+    if is_local_filesystem_model(&config.model) && !Path::new(&config.model).is_file() {
+        metrics.insert("model_missing".to_string(), json!(true));
+        return skip_row_with_metrics(
+            BatteryId::Runtime,
+            None,
+            case.label,
+            None,
+            "model path is missing; runtime evidence script not run",
+            config,
+            ctx,
+            None,
+            metrics,
+        );
+    }
+
+    let started = SystemTime::now();
+    let output = match Command::new("bash")
+        .arg(script)
+        .env("MODEL", &config.model)
+        .env("HIPFIRE_MODEL", &config.model)
+        .env("HIPFIRE_EVAL_RUNTIME_ROW", case.label)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            return row(
+                BatteryId::Runtime,
+                None,
+                case.label,
+                None,
+                EvalStatus::Fail,
+                Some(format!("spawn runtime evidence script: {err}")),
+                metrics,
+                config,
+                ctx,
+                None,
+                elapsed_since_ms(started),
+            );
+        }
+    };
+    let elapsed_ms = elapsed_since_ms(started);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    metrics.insert(
+        "exit_code".to_string(),
+        json!(output.status.code().unwrap_or(-1)),
+    );
+    metrics.insert(
+        "stdout_hash".to_string(),
+        json!(stable_hash_bytes(stdout.as_bytes())),
+    );
+    metrics.insert(
+        "stderr_hash".to_string(),
+        json!(stable_hash_bytes(stderr.as_bytes())),
+    );
+    metrics.insert(
+        "stdout_excerpt".to_string(),
+        json!(truncate_for_metric(stdout.trim(), 512)),
+    );
+    metrics.insert(
+        "stderr_excerpt".to_string(),
+        json!(truncate_for_metric(stderr.trim(), 512)),
+    );
+
+    if output.status.success() {
+        if combined.to_ascii_lowercase().contains("skipping")
+            || combined.to_ascii_lowercase().contains("skipped")
+        {
+            skip_row_with_metrics(
+                BatteryId::Runtime,
+                None,
+                case.label,
+                None,
+                "runtime evidence script skipped on this host",
+                config,
+                ctx,
+                None,
+                metrics,
+            )
+        } else {
+            row(
+                BatteryId::Runtime,
+                None,
+                case.label,
+                None,
+                EvalStatus::Pass,
+                None,
+                metrics,
+                config,
+                ctx,
+                None,
+                elapsed_ms,
+            )
+        }
+    } else if output.status.code() == Some(2)
+        && runtime_script_output_is_environment_skip(&combined)
+    {
+        skip_row_with_metrics(
+            BatteryId::Runtime,
+            None,
+            case.label,
+            None,
+            "runtime evidence script prerequisites are unavailable on this host",
+            config,
+            ctx,
+            None,
+            metrics,
+        )
+    } else {
+        row(
+            BatteryId::Runtime,
+            None,
+            case.label,
+            None,
+            EvalStatus::Fail,
+            Some("runtime evidence script failed".to_string()),
+            metrics,
+            config,
+            ctx,
+            None,
+            elapsed_ms,
+        )
+    }
+}
+
+fn is_local_filesystem_model(model: &str) -> bool {
+    model.starts_with('/') || model.starts_with("./") || model.starts_with("../")
+}
+
+fn runtime_script_output_is_environment_skip(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    [
+        "missing model",
+        "model not found",
+        "missing daemon binary",
+        "daemon binary",
+        "build it with:",
+        "fewer than 2",
+        "less than 2",
+        "skipping",
+        "not found",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn truncate_for_metric(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+#[derive(Clone, Copy)]
+struct DflashMatrixCase {
+    label: &'static str,
+    prompt_path: &'static str,
+    mode: &'static str,
+    max_tokens: usize,
+    extra_args: &'static [&'static str],
+}
+
+fn dflash_matrix_cases() -> &'static [DflashMatrixCase] {
+    &[
+        DflashMatrixCase {
+            label: "dflash_prose_attractor",
+            prompt_path: "benchmarks/prompts/dflash_resident_smoke.txt",
+            mode: "dflash",
+            max_tokens: 192,
+            extra_args: &[],
+        },
+        DflashMatrixCase {
+            label: "dflash_code_attractor",
+            prompt_path: "benchmarks/prompts/humaneval_0_has_close_elements.txt",
+            mode: "dflash",
+            max_tokens: 128,
+            extra_args: &[],
+        },
+        DflashMatrixCase {
+            label: "ddtree_b12_k2_prose",
+            prompt_path: "benchmarks/prompts/dflash_resident_smoke.txt",
+            mode: "ddtree-batched",
+            max_tokens: 192,
+            extra_args: &[
+                "--ddtree-batched",
+                "--ddtree-budget",
+                "12",
+                "--ddtree-topk",
+                "2",
+            ],
+        },
+        DflashMatrixCase {
+            label: "path_c_phase1_prose",
+            prompt_path: "benchmarks/prompts/dflash_resident_smoke.txt",
+            mode: "path-c-phase1",
+            max_tokens: 192,
+            extra_args: &[
+                "--ddtree-path-c",
+                "phase1",
+                "--ddtree-budget",
+                "12",
+                "--ddtree-topk",
+                "2",
+            ],
+        },
+        DflashMatrixCase {
+            label: "path_c_phase2_prose",
+            prompt_path: "benchmarks/prompts/dflash_resident_smoke.txt",
+            mode: "path-c-phase2",
+            max_tokens: 192,
+            extra_args: &[
+                "--ddtree-path-c",
+                "phase2",
+                "--ddtree-budget",
+                "12",
+                "--ddtree-topk",
+                "2",
+            ],
+        },
+    ]
+}
+
+fn run_examples_dflash_matrix_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    if matches!(config.dflash, DflashMode::Off) {
+        return dflash_matrix_cases()
+            .iter()
+            .map(|case| {
+                skip_row(
+                    BatteryId::Dflash,
+                    None,
+                    case.label,
+                    None,
+                    "DFlash/DDTree matrix disabled by --dflash off",
+                    config,
+                    ctx,
+                    prompt(case.prompt_path),
+                )
+            })
+            .collect();
+    }
+    dflash_matrix_cases()
+        .iter()
+        .map(|case| run_examples_dflash_matrix_case(config, ctx, *case))
+        .collect()
+}
+
+fn run_examples_dflash_matrix_case(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    case: DflashMatrixCase,
+) -> EvalResult {
+    let mut metrics = BTreeMap::from([
+        ("suite".to_string(), json!("dflash_ddtree_path_c")),
+        ("mode".to_string(), json!(case.mode)),
+        ("max_tokens".to_string(), json!(case.max_tokens)),
+        (
+            "token_attractor_detector".to_string(),
+            json!("dflash_spec_demo_tokens_v1"),
+        ),
+    ]);
+    let mut extra_args = case.extra_args.to_vec();
+    let max_tokens = case.max_tokens.to_string();
+    extra_args.extend(["--max", max_tokens.as_str()]);
+    metrics.insert("extra_args".to_string(), json!(case.extra_args));
+    run_dflash_spec_demo_anchor(
+        BatteryId::Dflash,
+        case.label,
+        false,
+        case.prompt_path,
+        &extra_args,
+        metrics,
+        config,
+        ctx,
+        config.model.clone(),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct PflashNiahCase {
+    label: &'static str,
+    fixture: &'static str,
+    mode: &'static str,
+}
+
+fn pflash_niah_cases() -> &'static [PflashNiahCase] {
+    &[
+        PflashNiahCase {
+            label: "niah_8k_baseline",
+            fixture: "benchmarks/longctx/niah/niah_8k.jsonl",
+            mode: "baseline",
+        },
+        PflashNiahCase {
+            label: "niah_8k_pflash30",
+            fixture: "benchmarks/longctx/niah/niah_8k.jsonl",
+            mode: "pflash",
+        },
+        PflashNiahCase {
+            label: "niah_16k_baseline",
+            fixture: "benchmarks/longctx/niah/niah_16k.jsonl",
+            mode: "baseline",
+        },
+        PflashNiahCase {
+            label: "niah_16k_pflash30",
+            fixture: "benchmarks/longctx/niah/niah_16k.jsonl",
+            mode: "pflash",
+        },
+        PflashNiahCase {
+            label: "niah_multi_16k_baseline",
+            fixture: "benchmarks/longctx/niah/niah_multi_16k.jsonl",
+            mode: "baseline",
+        },
+        PflashNiahCase {
+            label: "niah_multi_16k_pflash30",
+            fixture: "benchmarks/longctx/niah/niah_multi_16k.jsonl",
+            mode: "pflash",
+        },
+        PflashNiahCase {
+            label: "longcode_baseline",
+            fixture: "benchmarks/prompts/longcode_pflash.jsonl",
+            mode: "baseline",
+        },
+        PflashNiahCase {
+            label: "longcode_pflash30",
+            fixture: "benchmarks/prompts/longcode_pflash.jsonl",
+            mode: "pflash",
+        },
+        PflashNiahCase {
+            label: "longprose_baseline",
+            fixture: "benchmarks/prompts/longprose_multidoc.jsonl",
+            mode: "baseline",
+        },
+        PflashNiahCase {
+            label: "longprose_pflash30",
+            fixture: "benchmarks/prompts/longprose_multidoc.jsonl",
+            mode: "pflash",
+        },
+        PflashNiahCase {
+            label: "niah_32k_baseline",
+            fixture: "benchmarks/longctx/niah/niah_32k.jsonl",
+            mode: "baseline",
+        },
+        PflashNiahCase {
+            label: "niah_32k_pflash30",
+            fixture: "benchmarks/longctx/niah/niah_32k.jsonl",
+            mode: "pflash",
+        },
+    ]
+}
+
+fn pflash_maxgen_for_fixture(fixture: &str) -> usize {
+    if fixture.contains("multi") {
+        80
+    } else if fixture.contains("longcode") || fixture.contains("longprose") {
+        64
+    } else {
+        32
+    }
+}
+
+fn run_examples_pflash_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    pflash_niah_cases()
+        .iter()
+        .map(|case| run_examples_pflash_case(config, ctx, *case))
+        .collect()
+}
+
+fn run_examples_pflash_case(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    case: PflashNiahCase,
+) -> EvalResult {
+    let model = config.model.clone();
+    let prompt_ref = prompt(case.fixture);
+    let mut base_metrics = BTreeMap::from([
+        ("implemented".to_string(), json!(true)),
+        ("executor".to_string(), json!("examples")),
+        ("suite".to_string(), json!("pflash_niah")),
+        ("fixture".to_string(), json!(case.fixture)),
+        ("mode".to_string(), json!(case.mode)),
+        ("kv_mode".to_string(), json!("asym3")),
+        ("pretok".to_string(), json!(true)),
+        (
+            "maxgen".to_string(),
+            json!(pflash_maxgen_for_fixture(case.fixture)),
+        ),
+    ]);
+
+    if !Path::new(&model).exists() {
+        return row_for_model(
+            BatteryId::Pflash,
+            None,
+            case.label,
+            None,
+            EvalStatus::Skip,
+            Some(
+                "pflash examples executor requires --model to be a local filesystem path"
+                    .to_string(),
+            ),
+            base_metrics,
+            config,
+            ctx,
+            prompt_ref,
+            0,
+            model,
+        );
+    }
+    let Some(bin) = resolve_pflash_niah_bench_bin() else {
+        return row_for_model(
+            BatteryId::Pflash,
+            None,
+            case.label,
+            None,
+            EvalStatus::Skip,
+            Some("pflash_niah_bench example binary not found; build with `cargo build --release --features deltanet -p hipfire-runtime --example pflash_niah_bench`".to_string()),
+            base_metrics,
+            config,
+            ctx,
+            prompt_ref,
+            0,
+            model,
+        );
+    };
+    let Some(fixture_path) = resolve_repo_path(case.fixture) else {
+        return row_for_model(
+            BatteryId::Pflash,
+            None,
+            case.label,
+            None,
+            EvalStatus::Fail,
+            Some(format!("pflash fixture not found: {}", case.fixture)),
+            base_metrics,
+            config,
+            ctx,
+            prompt_ref,
+            0,
+            model,
+        );
+    };
+
+    let mut args = vec![
+        model.clone(),
+        fixture_path.display().to_string(),
+        "--maxgen".to_string(),
+        pflash_maxgen_for_fixture(case.fixture).to_string(),
+        "--asym3".to_string(),
+        "--pretok".to_string(),
+    ];
+    if case.mode == "pflash" {
+        let Some(draft) = config.draft.as_deref() else {
+            return row_for_model(
+                BatteryId::Pflash,
+                None,
+                case.label,
+                None,
+                EvalStatus::Skip,
+                Some("pflash examples executor requires --draft for pflash mode".to_string()),
+                base_metrics,
+                config,
+                ctx,
+                prompt_ref,
+                0,
+                model,
+            );
+        };
+        if !Path::new(draft).exists() {
+            return row_for_model(
+                BatteryId::Pflash,
+                None,
+                case.label,
+                None,
+                EvalStatus::Skip,
+                Some(
+                    "pflash examples executor requires --draft to be a local filesystem path"
+                        .to_string(),
+                ),
+                base_metrics,
+                config,
+                ctx,
+                prompt_ref,
+                0,
+                model,
+            );
+        }
+        base_metrics.insert("keep_ratio".to_string(), json!(0.30));
+        base_metrics.insert("block_size".to_string(), json!(64));
+        args.extend([
+            "--pflash".to_string(),
+            draft.to_string(),
+            "--keep-ratio".to_string(),
+            "0.30".to_string(),
+            "--block-size".to_string(),
+            "64".to_string(),
+        ]);
+    }
+
+    let command_display = format!("{} {}", bin.display(), args.join(" "));
+    let started = SystemTime::now();
+    let output = match Command::new(&bin).args(&args).output() {
+        Ok(output) => output,
+        Err(err) => {
+            base_metrics.insert("command".to_string(), json!(command_display));
+            return row_for_model(
+                BatteryId::Pflash,
+                None,
+                case.label,
+                None,
+                EvalStatus::Fail,
+                Some(format!("spawn pflash_niah_bench: {err}")),
+                base_metrics,
+                config,
+                ctx,
+                prompt_ref,
+                elapsed_since_ms(started),
+                model,
+            );
+        }
+    };
+    let elapsed_ms = elapsed_since_ms(started);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    let mut metrics = parse_pflash_niah_metrics(&combined);
+    metrics.extend(base_metrics);
+    metrics.insert("command".to_string(), json!(command_display));
+    metrics.insert(
+        "stdout_hash".to_string(),
+        json!(stable_hash_bytes(stdout.as_bytes())),
+    );
+    metrics.insert(
+        "stderr_hash".to_string(),
+        json!(stable_hash_bytes(stderr.as_bytes())),
+    );
+
+    let verdict = metrics
+        .get("niah_verdict")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let ok = output.status.success() && metrics.contains_key("total_ms") && verdict.is_some();
+    row_for_model(
+        BatteryId::Pflash,
+        None,
+        case.label,
+        None,
+        if ok {
+            EvalStatus::Pass
+        } else {
+            EvalStatus::Fail
+        },
+        if ok {
+            None
+        } else if output.status.success() {
+            Some("pflash_niah_bench did not emit total/verdict metrics".to_string())
+        } else {
+            Some(format!("pflash_niah_bench exited with {}", output.status))
+        },
+        metrics,
+        config,
+        ctx,
+        prompt_ref,
+        elapsed_ms,
+        model,
+    )
+}
+
+fn parse_pflash_niah_metrics(output: &str) -> BTreeMap<String, Value> {
+    let mut metrics = BTreeMap::new();
+    for raw in output.lines() {
+        let line = raw.trim();
+        if let Some(value) = prefixed_ms(line, "total:") {
+            metrics.insert("total_ms".to_string(), json!(value));
+        } else if let Some(value) = prefixed_ms(line, "prefill:") {
+            metrics.insert("prefill_ms".to_string(), json!(value));
+        } else if let Some(value) = prefixed_ms(line, "decode:") {
+            metrics.insert("decode_ms".to_string(), json!(value));
+        } else if let Some(value) = prefixed_ms(line, "compress:") {
+            metrics.insert("compress_ms".to_string(), json!(value));
+        } else if line.starts_with("PASS:") {
+            metrics.insert("niah_verdict".to_string(), json!("PASS"));
+            metrics.insert("niah_pass".to_string(), json!(1.0));
+        } else if line.starts_with("FAIL:") {
+            metrics.insert("niah_verdict".to_string(), json!("FAIL"));
+            metrics.insert("niah_pass".to_string(), json!(0.0));
+        }
+    }
+    metrics
+}
+
+fn prefixed_ms(line: &str, prefix: &str) -> Option<u64> {
+    line.strip_prefix(prefix)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_daemon_coherence_anchor(
     battery: BatteryId,
@@ -6047,7 +7487,12 @@ fn run_daemon_coherence_anchor(
     ctx: &EvalContext,
     model: String,
     max_seq: Option<usize>,
+    max_tokens: Option<usize>,
     mut metrics: BTreeMap<String, Value>,
+    system_path: Option<&str>,
+    tools: Option<Value>,
+    assistant_prefix: Option<&str>,
+    force_jinja_chat: bool,
     profile: Option<crate::coherence_runtime::DetectorProfile>,
 ) -> EvalResult {
     metrics.insert("executor".to_string(), json!("daemon"));
@@ -6123,15 +7568,63 @@ fn run_daemon_coherence_anchor(
             );
         }
     };
+    let system_text = if let Some(path) = system_path {
+        let Some(resolved_system) = resolve_repo_path(path) else {
+            return row_for_model(
+                battery,
+                None,
+                case_id,
+                None,
+                EvalStatus::Fail,
+                Some(format!("system prompt not found: {path}")),
+                metrics,
+                config,
+                ctx,
+                prompt_ref,
+                0,
+                model,
+            );
+        };
+        match fs::read_to_string(&resolved_system) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                return row_for_model(
+                    battery,
+                    None,
+                    case_id,
+                    None,
+                    EvalStatus::Fail,
+                    Some(format!(
+                        "read system prompt {}: {err}",
+                        resolved_system.display()
+                    )),
+                    metrics,
+                    config,
+                    ctx,
+                    prompt_ref,
+                    0,
+                    model,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let profile = profile.unwrap_or_else(|| {
-        crate::coherence_runtime::DetectorProfile::default_for_prompt(&prompt_text, None)
+        crate::coherence_runtime::DetectorProfile::default_for_prompt(
+            &prompt_text,
+            system_text.as_deref(),
+        )
     });
     let run_config = crate::coherence_runtime::CoherenceRunConfig {
         model: model.clone(),
         prompt: prompt_text,
         prompt_label: prompt_path.to_string(),
-        system: None,
-        max_tokens: config.max_tokens,
+        system: system_text,
+        tools,
+        assistant_prefix: assistant_prefix.map(str::to_string),
+        force_jinja_chat,
+        max_tokens: max_tokens.unwrap_or(config.max_tokens),
         temperature: 0.0,
         repeat_penalty: None,
         repeat_window: None,
@@ -7363,11 +8856,13 @@ fn run_dflash_spec_demo_anchor(
     battery: BatteryId,
     case_id: &str,
     ar_baseline: bool,
+    prompt_path: &str,
+    extra_args: &[&str],
+    mut extra_metrics: BTreeMap<String, Value>,
     config: &EvalConfig,
     ctx: &EvalContext,
     model: String,
 ) -> EvalResult {
-    let prompt_path = "benchmarks/prompts/dflash_resident_smoke.txt";
     let prompt_ref = prompt(prompt_path);
     if !Path::new(&model).exists() {
         return row_for_model(
@@ -7468,6 +8963,7 @@ fn run_dflash_spec_demo_anchor(
     if ar_baseline {
         args.push("--ar-baseline".to_string());
     }
+    args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
     let command_display = format!("{} {}", bin.display(), args.join(" "));
     let started = SystemTime::now();
     let mut command = Command::new(&bin);
@@ -7502,6 +8998,7 @@ fn run_dflash_spec_demo_anchor(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let mut metrics = parse_bench_metrics(&stderr);
+    metrics.append(&mut extra_metrics);
     metrics.insert("implemented".to_string(), json!(true));
     metrics.insert("executor".to_string(), json!("examples"));
     metrics.insert("command".to_string(), json!(command_display));
@@ -7531,7 +9028,14 @@ fn run_dflash_spec_demo_anchor(
     if let Some(v) = metrics.get("decode_accept_rate").cloned() {
         metrics.entry("accept_rate".to_string()).or_insert(v);
     }
-    if output.status.success() && metrics.contains_key("decode_tok_s") {
+    if let Some(attractor) = parse_spec_decode_token_attractor_metrics(&stderr) {
+        metrics.extend(attractor.metrics);
+    }
+    let attractor_fail = metrics
+        .get("token_attractor_fail")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if output.status.success() && metrics.contains_key("decode_tok_s") && !attractor_fail {
         row_for_model(
             battery,
             None,
@@ -7554,7 +9058,11 @@ fn run_dflash_spec_demo_anchor(
             None,
             EvalStatus::Fail,
             Some(if output.status.success() {
-                "dflash_spec_demo did not emit BENCH METRICS".to_string()
+                if attractor_fail {
+                    "dflash_spec_demo token-attractor detector failed".to_string()
+                } else {
+                    "dflash_spec_demo did not emit BENCH METRICS".to_string()
+                }
             } else {
                 format!("dflash_spec_demo exited with {}", output.status)
             }),
@@ -7566,6 +9074,74 @@ fn run_dflash_spec_demo_anchor(
             model,
         )
     }
+}
+
+struct TokenAttractorMetrics {
+    metrics: BTreeMap<String, Value>,
+}
+
+fn parse_spec_decode_token_attractor_metrics(output: &str) -> Option<TokenAttractorMetrics> {
+    let tokens = parse_spec_decode_tokens(output)?;
+    if tokens.is_empty() {
+        let metrics = BTreeMap::from([
+            ("token_count".to_string(), json!(0.0)),
+            ("token_attractor_fail".to_string(), json!(true)),
+            ("token_attractor_reason".to_string(), json!("zero_tokens")),
+        ]);
+        return Some(TokenAttractorMetrics { metrics });
+    }
+    let eot = [248044u32, 248046u32];
+    let trimmed: Vec<u32> = tokens
+        .iter()
+        .copied()
+        .take_while(|token| !eot.contains(token))
+        .take(128)
+        .collect();
+    if trimmed.len() < 16 {
+        let metrics = BTreeMap::from([
+            ("token_count".to_string(), json!(trimmed.len() as f64)),
+            ("token_attractor_fail".to_string(), json!(false)),
+            ("token_attractor_reason".to_string(), json!("short_clean")),
+        ]);
+        return Some(TokenAttractorMetrics { metrics });
+    }
+    let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for token in &trimmed {
+        *counts.entry(*token).or_insert(0) += 1;
+    }
+    let max_freq = counts.values().copied().max().unwrap_or(0) as f64 / trimmed.len() as f64;
+    let unique_ratio = counts.len() as f64 / trimmed.len() as f64;
+    let fail = max_freq > 0.40 || unique_ratio < 0.30;
+    let metrics = BTreeMap::from([
+        ("token_count".to_string(), json!(trimmed.len() as f64)),
+        ("unique_token_count".to_string(), json!(counts.len() as f64)),
+        ("max_token_frequency".to_string(), json!(max_freq)),
+        ("unique_token_ratio".to_string(), json!(unique_ratio)),
+        ("token_attractor_fail".to_string(), json!(fail)),
+        (
+            "token_attractor_reason".to_string(),
+            json!(if fail { "attractor" } else { "ok" }),
+        ),
+    ]);
+    Some(TokenAttractorMetrics { metrics })
+}
+
+fn parse_spec_decode_tokens(output: &str) -> Option<Vec<u32>> {
+    for prefix in ["DFlash tokens:", "AR tokens:"] {
+        let Some(start) = output.find(prefix) else {
+            continue;
+        };
+        let rest = &output[start + prefix.len()..];
+        let open = rest.find('[')?;
+        let close = rest[open + 1..].find(']')? + open + 1;
+        let body = &rest[open + 1..close];
+        let tokens = body
+            .split(',')
+            .filter_map(|part| part.trim().parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        return Some(tokens);
+    }
+    None
 }
 
 fn run_examples_run_anchor_with_prompt(
@@ -7935,6 +9511,38 @@ fn resolve_dflash_spec_demo_bin() -> Option<PathBuf> {
     ])
 }
 
+fn resolve_bench_qwen35_speed_bin() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("HIPFIRE_BENCH_QWEN35_SPEED_BIN") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::consts::EXE_SUFFIX;
+    let repo = repo_root()?;
+    [
+        repo.join(format!("target/release/examples/bench_qwen35_speed{exe}")),
+        repo.join(format!("target/debug/examples/bench_qwen35_speed{exe}")),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+}
+
+fn resolve_pflash_niah_bench_bin() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("HIPFIRE_PFLASH_NIAH_BENCH_BIN") {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::consts::EXE_SUFFIX;
+    let repo = repo_root()?;
+    newest_existing_path([
+        repo.join(format!("target/release/examples/pflash_niah_bench{exe}")),
+        repo.join(format!("target/debug/examples/pflash_niah_bench{exe}")),
+    ])
+}
+
 fn resolve_run_example_bin() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("HIPFIRE_RUN_EXAMPLE_BIN") {
         let p = PathBuf::from(path);
@@ -8022,6 +9630,26 @@ fn parse_bench_metrics(stderr: &str) -> BTreeMap<String, Value> {
             metrics.insert(key.to_string(), json!(value));
         } else {
             metrics.insert(key.to_string(), json!(raw_value));
+        }
+    }
+    metrics
+}
+
+fn parse_summary_kv_metrics(output: &str) -> BTreeMap<String, Value> {
+    let mut metrics = BTreeMap::new();
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if !line.starts_with("SUMMARY") && !line.starts_with("PREFILL_SUMMARY") {
+            continue;
+        }
+        for part in line.split_whitespace().skip(1) {
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            let value = value.trim_end_matches(',');
+            if let Ok(parsed) = value.parse::<f64>() {
+                metrics.insert(key.to_string(), json!(parsed));
+            }
         }
     }
     metrics
@@ -8431,14 +10059,30 @@ fn result_cache_prompt_paths(battery: BatteryId) -> Vec<&'static str> {
             "benchmarks/prompts/qwen2_smoke.txt",
             "benchmarks/prompts/trains-meet.txt",
         ],
-        BatteryId::Coherence => vec!["benchmarks/prompts/qwen2_smoke.txt"],
+        BatteryId::Coherence => vec![
+            "benchmarks/prompts/coherence_capital_france.txt",
+            "benchmarks/prompts/coherence_square_function.txt",
+            "benchmarks/prompts/coherence_sheep_reason.txt",
+            "benchmarks/prompts/tool_call_read_file.txt",
+            "benchmarks/prompts/tool_call_system.txt",
+            "benchmarks/prompts/coherence_lloyd_long.txt",
+        ],
         BatteryId::Quality => vec!["benchmarks/quality-baselines/harness/canary.md"],
         BatteryId::Retrieval => vec!["benchmarks/prompts/trains-meet.txt"],
-        BatteryId::Speed => vec![
-            "benchmarks/prompts/dflash_resident_smoke.txt",
-            "benchmarks/prompts/lru_cache_single_blank.txt",
-        ],
+        BatteryId::Speed => vec!["benchmarks/prompts/lru_cache_single_blank.txt"],
         BatteryId::Dflash => vec!["benchmarks/prompts/dflash_resident_smoke.txt"],
+        BatteryId::Pflash => pflash_niah_cases()
+            .iter()
+            .map(|case| case.fixture)
+            .collect(),
+        BatteryId::Agentic => vec![
+            "benchmarks/prompts/agentic_pi_system.txt",
+            "benchmarks/prompts/agentic_hermes_system.txt",
+            "benchmarks/prompts/agentic_user_read.txt",
+            "benchmarks/prompts/agentic_jinja_tools_system.txt",
+            "benchmarks/prompts/agentic_jinja_tools_user.txt",
+        ],
+        BatteryId::Runtime => Vec::new(),
         BatteryId::PromptShape => vec!["benchmarks/prompts/lru_cache_pep8_strict.txt"],
         BatteryId::Structured => vec!["benchmarks/prompts/tool_call_read_file.txt"],
         BatteryId::Longctx => vec!["benchmarks/prompts/longprose_multidoc.jsonl"],
@@ -8639,6 +10283,54 @@ fn run_battery(
             ));
             rows
         }
+        BatteryId::Pflash => pflash_niah_cases()
+            .iter()
+            .map(|case| {
+                skip_row(
+                    battery,
+                    None,
+                    case.label,
+                    None,
+                    "pflash examples executor is not available in this environment",
+                    config,
+                    ctx,
+                    prompt(case.fixture),
+                )
+            })
+            .collect(),
+        BatteryId::Agentic => agentic_cases()
+            .iter()
+            .map(|case| {
+                skip_row(
+                    battery,
+                    None,
+                    case.label,
+                    None,
+                    "daemon-backed agentic coherence executor is not available in this environment",
+                    config,
+                    ctx,
+                    combined_prompt_ref(
+                        case.system_path,
+                        "benchmarks/prompts/agentic_user_read.txt",
+                    ),
+                )
+            })
+            .collect(),
+        BatteryId::Runtime => runtime_cases()
+            .iter()
+            .map(|case| {
+                skip_row(
+                    battery,
+                    None,
+                    case.label,
+                    None,
+                    "server/runtime evidence script executor is not available in this environment",
+                    config,
+                    ctx,
+                    None,
+                )
+            })
+            .collect(),
         BatteryId::PromptShape => vec![pass_row(
             battery,
             None,
@@ -9153,6 +10845,39 @@ fn prompt(path: &str) -> Option<PromptRef> {
     })
 }
 
+fn combined_prompt_ref(system_path: &str, prompt_path: &str) -> Option<PromptRef> {
+    let system = fs::read(resolve_repo_path(system_path)?).ok()?;
+    let prompt = fs::read(resolve_repo_path(prompt_path)?).ok()?;
+    let mut content = Vec::with_capacity(system.len() + prompt.len() + 5);
+    content.extend_from_slice(&system);
+    content.extend_from_slice(b"\n---\n");
+    content.extend_from_slice(&prompt);
+    Some(PromptRef::from_content(
+        format!("{system_path}+{prompt_path}"),
+        &content,
+    ))
+}
+
+fn structured_tools_prompt_ref(
+    system_path: &str,
+    prompt_path: &str,
+    tools: &Value,
+) -> Option<PromptRef> {
+    let system = fs::read(resolve_repo_path(system_path)?).ok()?;
+    let prompt = fs::read(resolve_repo_path(prompt_path)?).ok()?;
+    let tools = serde_json::to_vec(tools).ok()?;
+    let mut content = Vec::with_capacity(system.len() + prompt.len() + tools.len() + 16);
+    content.extend_from_slice(&system);
+    content.extend_from_slice(b"\n---prompt---\n");
+    content.extend_from_slice(&prompt);
+    content.extend_from_slice(b"\n---tools---\n");
+    content.extend_from_slice(&tools);
+    Some(PromptRef::from_content(
+        format!("{system_path}+{prompt_path}+structured_tools"),
+        &content,
+    ))
+}
+
 fn resolve_repo_path(path: &str) -> Option<PathBuf> {
     let direct = PathBuf::from(path);
     if direct.exists() {
@@ -9458,13 +11183,9 @@ fn dflash_draft_candidates(filename: &str) -> Vec<String> {
     let Some((family, version, size, quant)) = parse_qwen_dflash_target(filename) else {
         return Vec::new();
     };
-    let compact_version = version.replace('.', "");
-    let compact_family = format!("{family}{compact_version}");
     let dotted_family = format!("{family}{version}");
     vec![
-        format!("{compact_family}-{size}-dflash-{quant}.hfq"),
         format!("{dotted_family}-{size}-dflash-{quant}.hfq"),
-        format!("{compact_family}-{size}-draft-{quant}.hfq"),
         format!("{dotted_family}-{size}-draft-{quant}.hfq"),
     ]
 }
@@ -10203,7 +11924,7 @@ mod tests {
         let dir = temp_path("dflash-autodiscover");
         fs::create_dir_all(&dir).unwrap();
         let target = dir.join("qwen3.5-27b.mq4");
-        let draft = dir.join("qwen35-27b-dflash-mq4.hfq");
+        let draft = dir.join("qwen3.5-27b-dflash-mq4.hfq");
         fs::write(&target, b"target").unwrap();
         fs::write(&draft, b"draft").unwrap();
 
@@ -10227,7 +11948,7 @@ mod tests {
         let dir = temp_path("dflash-explicit-draft");
         fs::create_dir_all(&dir).unwrap();
         let target = dir.join("qwen3.5-27b.mq4");
-        let discovered = dir.join("qwen35-27b-dflash-mq4.hfq");
+        let discovered = dir.join("qwen3.5-27b-dflash-mq4.hfq");
         let explicit = dir.join("custom-draft.hfq");
         fs::write(&target, b"target").unwrap();
         fs::write(&discovered, b"draft").unwrap();
@@ -10301,6 +12022,48 @@ mod tests {
         assert!(default_suites(EvalTier::Long).contains(&SuiteId::NoLiMa));
         assert!(default_suites(EvalTier::Long).contains(&SuiteId::DeepSwe));
         assert!(default_suites(EvalTier::Long).contains(&SuiteId::SweBench));
+    }
+
+    #[test]
+    fn parses_runtime_battery_aliases() {
+        assert_eq!(BatteryId::parse("runtime").unwrap(), BatteryId::Runtime);
+        assert_eq!(
+            BatteryId::parse("server-runtime").unwrap(),
+            BatteryId::Runtime
+        );
+        assert_eq!(BatteryId::Runtime.as_str(), "runtime");
+    }
+
+    #[test]
+    fn runtime_battery_has_admission_evidence_rows() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "candidate.hfq",
+            "--battery",
+            "runtime",
+            "--executor",
+            "mock",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+        let rows = run_battery(BatteryId::Runtime, &cfg, &ctx, &[]);
+        assert!(rows.iter().any(|row| row.case_id == "server_prefill_batch"));
+        assert!(rows.iter().any(|row| row.case_id == "shared_prefix_fanout"));
+        assert!(rows.iter().any(|row| row.case_id == "kv_reject_http"));
+        assert!(rows
+            .iter()
+            .any(|row| row.case_id == "pipeline_parallel_gate"));
+        assert!(rows.iter().all(|row| row.battery == BatteryId::Runtime));
     }
 
     #[test]
@@ -13698,6 +15461,9 @@ more noise
             BatteryId::Dflash,
             "dflash_anchor",
             false,
+            "benchmarks/prompts/dflash_resident_smoke.txt",
+            &[],
+            BTreeMap::new(),
             &cfg,
             &ctx,
             cfg.model.clone(),
@@ -14183,6 +15949,121 @@ more noise
         assert_eq!(comparison.status, EvalStatus::Skip);
 
         let _ = fs::remove_file(perf_json);
+    }
+
+    #[test]
+    fn speed_baseline_parser_matches_model_size_and_prefill() {
+        let path = temp_path("speed-baseline.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "schema": "hipfire.perf_baseline.v1",
+                "arch": "gfx1151",
+                "tolerance_pct": 5.0,
+                "baselines": {
+                    "speed": [
+                        {
+                            "label": "4b_pp32_prefill_decode",
+                            "model_id": "qwen3.5-4b-mq4",
+                            "model_size": "4b",
+                            "format": "mq4",
+                            "prefill_tokens": 32,
+                            "prefill_tok_s": 590.7,
+                            "gen_tok_s": 65.5
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let baseline = load_speed_baseline(&path, "qwen3.5-4b-mq4", "4b", 32)
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline.label, "4b_pp32_prefill_decode");
+        assert_eq!(baseline.model_id, "qwen3.5-4b-mq4");
+        assert_eq!(baseline.format, "mq4");
+        assert_eq!(baseline.prefill_tok_s, Some(590.7));
+        assert_eq!(baseline.gen_tok_s, Some(65.5));
+        assert_eq!(baseline.tolerance_pct, 5.0);
+        assert!(load_speed_baseline(&path, "qwen3.5-4b-bf16", "4b", 32)
+            .unwrap()
+            .is_none());
+        assert!(load_speed_baseline(&path, "qwen3.5-9b-mq4", "9b", 32)
+            .unwrap()
+            .is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn speed_model_size_is_format_neutral() {
+        assert_eq!(
+            speed_model_size("qwen3.5-0.8b-bf16.hfq"),
+            Some("0.8b".to_string())
+        );
+        assert_eq!(
+            speed_model_size("/models/qwen3.5-35b-a3b-awq-mq4.hfq"),
+            Some("35b-a3b".to_string())
+        );
+        assert_eq!(
+            speed_model_id("/models/qwen3.5-0.8b-bf16.hfq"),
+            "qwen3.5-0.8b-bf16"
+        );
+    }
+
+    #[test]
+    fn speed_baseline_check_fails_below_floor() {
+        let _guard = env_lock();
+        let path = temp_path("speed-baseline-check.json");
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&json!({
+                "schema": "hipfire.perf_baseline.v1",
+                "arch": "gfx1151",
+                "tolerance_pct": 5.0,
+                "baselines": {
+                    "speed": [
+                        {
+                            "label": "4b_pp32_prefill_decode",
+                            "model_id": "qwen3.5-4b-mq4",
+                            "model_size": "4b",
+                            "format": "mq4",
+                            "prefill_tokens": 32,
+                            "prefill_tok_s": 100.0,
+                            "gen_tok_s": 50.0
+                        }
+                    ]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let _baseline = ScopedEnv::set("HIPFIRE_PERF_BASELINE", &path);
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: Some("gfx1151".to_string()),
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+        let mut metrics = BTreeMap::from([
+            ("prefill_tok_s".to_string(), json!(94.0)),
+            ("gen_tok_s".to_string(), json!(51.0)),
+        ]);
+
+        let check = apply_speed_baseline(&mut metrics, "qwen3.5-4b-mq4.hfq", 32, &ctx).unwrap();
+        assert!(check.failed);
+        assert_eq!(check.error, None);
+        assert_eq!(metrics["perf_baseline_status"], json!("compared"));
+        assert_eq!(metrics["perf_baseline_failed"], json!(true));
+        assert_eq!(metrics["baseline_prefill_floor_tok_s"], json!(95.0));
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

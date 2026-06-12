@@ -293,7 +293,7 @@ Two notable false alarms rejected on adjudication:
 
 Two real blockers landed in the plan as Step 0 + Step 4b:
 - **Bench harness gap**: `scripts/probe_commits.sh` is hardcoded to
-  `bench_qwen35_mq4`; no Lloyd-MQ3 bench example exists. Step 0 either
+  `bench_qwen35_speed`; no Lloyd-MQ3 bench example exists. Step 0 either
   adds one or verifies dtype auto-detection.
 - **Graph-capture safety**: `dispatch.rs:2073` uses raw
   `self.hip.launch_kernel`; HFQ3 at line 2626 uses
@@ -362,7 +362,7 @@ Artifacts: `/tmp/lloyd_disasm/gemv_mq3g256_lloyd-hip-amdgcn-amd-amdhsa-gfx1100.s
 
 ### Step 0: bench harness gap (DONE 2026-05-06)
 
-Investigation: `bench_qwen35_mq4.rs` is **dtype-agnostic** despite the
+Investigation: `bench_qwen35_speed.rs` is **dtype-agnostic** despite the
 name — it loads via `HfqFile::open` + `qwen35::load_weights`. The
 load path at `crates/hipfire-arch-qwen35/src/qwen35.rs:738-744`
 dispatches on the .hfq quant-type ID (20 → `MQ3G256Lloyd`), so the
@@ -390,7 +390,7 @@ SUMMARY  gen_tok_s=42.9  bw_gib_s=182.3  prefill_tok_s=41.6
 ```
 
 42.9 tok/s vs the PR's 44 tok/s — within 3%, consistent across the
-different harnesses (bench_qwen35_mq4 single-process steady-state
+different harnesses (bench_qwen35_speed single-process steady-state
 vs perplexity harness window-pass). The discrepancy is well within
 DPM-driven session-to-session noise.
 
@@ -440,7 +440,7 @@ session. Files touched:
 
 ```
 cargo check -p rdna-compute -p hipfire-runtime  → clean
-cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4
+cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_speed
                                                 → clean
 ```
 
@@ -541,7 +541,7 @@ GPU-internal (rocprofv3 counters: spills, L2, LDS).
 
 ### Decode-loop profile (in-process, gen=50, 9B Lloyd-MQ3, GRAPH=0)
 
-Added `HIPFIRE_PROFILE_DECODE=1` to `bench_qwen35_mq4` (wraps the timed
+Added `HIPFIRE_PROFILE_DECODE=1` to `bench_qwen35_speed` (wraps the timed
 gen loop in `rdna_compute::profile::start/stop`; distinct from the
 existing `HIPFIRE_PROFILE=1` which only profiles prefill). Also added
 profile timer wrapping to `gemv_mq3g256_lloyd` dispatch (was previously
@@ -611,7 +611,7 @@ address.**
   ~100% naturally.
 - 420 GiB/s achieved = 47% of theoretical 960 GB/s. Real ceiling for
   this kernel shape on RDNA3 is 50-60% (bookended by HFQ4-G256 numbers
-  in `tests/speed-baselines/gfx1100.txt`). **There IS some room here**
+  now curated under `benchmarks/perf-baselines/`). **There IS some room here**
   — codebook prefetch across the quad boundary or wider unroll could
   push toward 480-500 GiB/s, which would be ~5-7% perf at the
   end-to-end level.
@@ -1330,10 +1330,9 @@ should be unconditional + hoisted out of `if (q+1 < quads)` guards
 
 ### Files touched
 
-- `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs` — added
+- `crates/hipfire-runtime/examples/bench_qwen35_speed.rs` — added
   `HIPFIRE_PROFILE_DECODE=1` switch to profile the gen loop.
 - `crates/rdna-compute/src/profile.rs` — added
   `gemv_mq3g256_lloyd_bytes()` byte counter.
 - `crates/rdna-compute/src/dispatch.rs` — wrapped `gemv_mq3g256_lloyd`
   dispatch with `begin_timer`/`finish` for profile attribution.
-

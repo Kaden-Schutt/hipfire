@@ -12,7 +12,7 @@ Models:
 
 Binaries:
 
-- `bench_qwen35_mq4`: `7cd9a6b059dc4d05b78ffb504470c680`
+- `bench_qwen35_speed`: `7cd9a6b059dc4d05b78ffb504470c680`
 - `dflash_spec_demo`: `8df7bd8dc9d8f716a79fab8f7c95f825`
 - `lru_cache_pep8_strict.txt`: `df5dedc8040ce70ba55080c4548e6024`
 
@@ -37,7 +37,7 @@ llama-bench -m /home/kotdath/omp/personal/amd-strix-halo-toolboxes/models/Qwen3.
 Command pattern:
 
 ```bash
-HIPFIRE_KV_MODE=q8 ./target/release/examples/bench_qwen35_mq4 \
+HIPFIRE_KV_MODE=q8 ./target/release/examples/bench_qwen35_speed \
   ~/.hipfire/models/qwen3.5-9b.mq4 --prefill <N> --prefill-runs 3 --warmup 0 --gen 1
 ```
 
@@ -175,7 +175,7 @@ Commit under test: `c5a28ca` plus local MMQ changes.
 
 Binaries:
 
-- `bench_qwen35_mq4`: `5fcafd6c8719275046caa10e629140c4`
+- `bench_qwen35_speed`: `5fcafd6c8719275046caa10e629140c4`
 - `dflash_spec_demo`: `fef1598678742ee1153b12ffd9c7a76a`
 - `test_hfq4g256QA`: `15139ebc102703ebd5ffeb871655d79a`
 
@@ -193,7 +193,7 @@ Command:
 ```bash
 HIPFIRE_VERIFY_GRAPH=0 HIPFIRE_MMQ=1 \
 HIPFIRE_PREFILL_REUSE_PBS=1 HIPFIRE_PREFILL_MAX_BATCH=2048 \
-target/release/examples/bench_qwen35_mq4 \
+target/release/examples/bench_qwen35_speed \
   ~/.hipfire/models/qwen3.5-9b.mq4 \
   --prefill 2048 --prefill-runs 1 --gen 0 --warmup 0
 ```
@@ -228,7 +228,7 @@ Commit under test: local changes after `d77f1ec`.
 
 Binaries:
 
-- `bench_qwen35_mq4`: `e466040940b12e46c73bf00504294b41`
+- `bench_qwen35_speed`: `e466040940b12e46c73bf00504294b41`
 - `dflash_spec_demo`: `7f87da798bc93cff8bd3cbb8ddff6351`
 - `test_hfq4g256QA`: `c07383316121d12bc43824db8fea9bee`
 
@@ -289,7 +289,7 @@ Commit under test: local changes after `947eef8`.
 
 Binaries:
 
-- `bench_qwen35_mq4`: `d926b1e1a6cc25cd498eda390f2fbe65`
+- `bench_qwen35_speed`: `d926b1e1a6cc25cd498eda390f2fbe65`
 - `dflash_spec_demo`: `3840178c5e166c0ec42a2a7ce5e7a744`
 - `test_hfq4g256QA`: `2fec248d246697539f0831ee0854f32d`
 

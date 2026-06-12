@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-23
 **Hardware:** MI50 (gfx906), ROCm 6.4, isolated to `ROCR_VISIBLE_DEVICES=0`
-**Model:** /local/hipfire/qwen3.5-9b.mq4 (md5 from `bench_qwen35_mq4` runs)
+**Model:** /local/hipfire/qwen3.5-9b.mq4 (md5 from `bench_qwen35_speed` runs)
 **Prompt:** synthetic 256-token deterministic stream (tokens 0..255)
 **Path:** `forward_prefill_batch` at B=256, kv_mode=asym3, warmup=2 then 1 profiled iter
 **Profiler:** in-process `rdna_compute::profile::{start,stop}` (hipEvent-based;
@@ -90,7 +90,7 @@ bench on the same hardware shows:
 | **mean** | **726.9** | **779.9** |
 | Δ   | — | **+7.3%** |
 
-`bench_qwen35_mq4 /local/hipfire/qwen3.5-9b.mq4 --prefill 256 --prefill-runs 3 --gen 10 --warmup 2`
+`bench_qwen35_speed /local/hipfire/qwen3.5-9b.mq4 --prefill 256 --prefill-runs 3 --gen 10 --warmup 2`
 on `ROCR_VISIBLE_DEVICES=0` (MI50 / gfx906).
 
 Decode tok/s unchanged (~56.0 ±0.4) — the kernels touch only the batched
@@ -126,7 +126,7 @@ occupancy.
 | prefill wall (ms)         | 328.5               | 347.9               |
 | per-call gate_up wall (µs)| 2683                | 3012 (**+12.3%**)   |
 
-`bench_qwen35_mq4 /local/hipfire/qwen3.5-9b.mq4 --prefill 256 --prefill-runs 3 --gen 10 --warmup 2`
+`bench_qwen35_speed /local/hipfire/qwen3.5-9b.mq4 --prefill 256 --prefill-runs 3 --gen 10 --warmup 2`
 `HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1 HIPFIRE_HFQ4_MMQ_GFX906_Y64=1`.
 
 Byte-exact A/B (greedy_dump) confirms numerical equivalence — both

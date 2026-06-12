@@ -10,6 +10,7 @@ For detailed notices, project operating guides, and testing playbooks, see the c
 
 ## Testing & Coherence Gates
 - **Coherence-gate-dflash is the canonical correctness gate.** Run `./tests/coherence-gate-dflash.sh` after any change touching kernels, quant formats, dispatch, fusion, rotation, rmsnorm, or the spec-decode path.
+- **Model/runtime evidence belongs in `hipfire-eval`.** When adding or repairing speed, coherence, DFlash/DDTree/Path C, PFlash, agentic/tool-call, long-context, quality, or server-runtime admission tests, add or update `hipfire-eval` batteries/suites first. Keep shell gates only as enforcement wrappers where they still provide baseline comparison or hook integration.
 - **Prompt structure dictates τ.** ALWAYS use byte-identical prompts via `benchmarks/prompts/*.txt`.
 - **Run the no-GPU subset.** `./tests/no-gpu-ci.sh` before handing off workflow-only changes.
 - **GPU Lock Protocol:** Coordinate GPU access through `gpu-lock.sh` (`source gpu-lock.sh && gpu_acquire "<branch>"`).
@@ -28,6 +29,10 @@ Rules:
 - Use `+feature` only when bundled: `mq4+mtp`, `mq4+dflash`.
 - Use role sidecars when loaded independently: `.mtp.hfq`, `.dflash.hfq`, `.triattn.hfq`.
 - Use `.triattn.hfq` for TriAttention sidecars even though they are not weight tensors; do not introduce `.triattn.bin` for new files.
+- When a script, gate, registry, or doc is found using an older artifact spelling,
+  update it to the canonical naming convention as part of the fix.
+- Backwards compatibility is a separate, explicit decision: add legacy-name
+  fallback only when the task or migration risk calls for it, and document why.
 
 ---
 

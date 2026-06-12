@@ -18,7 +18,7 @@
 # Example:
 #   mkdir -p /tmp/cov-run
 #   scripts/rocprof-wrap.sh /tmp/cov-run -- \
-#     ./target/release/examples/bench_qwen35_mq4 model.hfq \
+#     ./target/release/examples/bench_qwen35_speed model.hfq \
 #       --prefill 32 --emit-atlas /tmp/cov-run/atlas.jsonl
 #   scripts/coverage-audit.py \
 #     --internal /tmp/cov-run/atlas.jsonl \

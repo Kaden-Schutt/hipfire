@@ -4,7 +4,7 @@
 
 //! Per-kernel profiler for Qwen3.5 MQ4 forward pass.
 //!
-//! Runs the exact same forward_scratch path as bench_qwen35_mq4 /
+//! Runs the exact same forward_scratch path as bench_qwen35_speed /
 //! greedy_dump, but wraps N generation steps in rdna_compute::profile::{start,stop}
 //! and aggregates the collected ProfileEntries by kernel name. Reports
 //! per-kernel total time, call count, average time per call, total bytes,
@@ -13,7 +13,7 @@
 //!
 //! Profiling serializes kernel launches (event sync after each), so the
 //! total time is NOT the same as a real wall-clock bench — it's longer
-//! because async pipelining is disabled. Use bench_qwen35_mq4 for the
+//! because async pipelining is disabled. Use bench_qwen35_speed for the
 //! real tok/s number. Use this to see where the time goes.
 //!
 //! Usage: profile_qwen35_mq4 <model.hfq> [--prefill N] [--warmup N] [--profile-steps N]
@@ -102,7 +102,7 @@ fn main() {
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
-    // Deterministic fake prompt: tokens 0..prefill_len-1 (matches bench_qwen35_mq4).
+    // Deterministic fake prompt: tokens 0..prefill_len-1 (matches bench_qwen35_speed).
     let prompt_tokens: Vec<u32> = (0..prefill_len as u32).collect();
     eprintln!("\nPrefill {prefill_len} tokens (batched, untimed)...");
     let t_prefill = Instant::now();

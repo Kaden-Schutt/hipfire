@@ -33,7 +33,7 @@ point, not to re-gate.
 
 | Field | Value |
 |---|---|
-| Tool | `target/release/examples/bench_qwen35_mq4` |
+| Tool | `target/release/examples/bench_qwen35_speed` |
 | Models | `qwen3.5-{4,9}b.mq4` (uniform), `qwen3.5-{4,9}b.mq4-lloyd` |
 | Flags | `--prefill 256 --warmup 5 --prefill-runs 3 --gen 30` |
 | Env | `HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1` |
@@ -46,7 +46,7 @@ point, not to re-gate.
 | Model md5 (9B Lloyd)   | `b3eea80aeade0b56c153a054b1143ab2` |
 | Model md5 (4B uniform) | `93b9b5f2bd075922c50f3f8c9a5ad3e3` |
 | Model md5 (4B Lloyd)   | `d13028f6a1f4fda772c17bb6c3f3a0bc` |
-| Prompt | N/A — `bench_qwen35_mq4` generates a deterministic synthetic token sequence (token ids `0..prefill_len`) |
+| Prompt | N/A — `bench_qwen35_speed` generates a deterministic synthetic token sequence (token ids `0..prefill_len`) |
 
 Same config used for the gfx1100 Phase C devlog so the ratios are directly
 comparable across hardware.
@@ -286,7 +286,7 @@ shape sweep. Suggested tolerance unchanged at 1.75e-4.
 | **14336** | **4096** | **256** (9B FFN gate/up output) | 4829.0 | 2154.3 | **2.24×** | **30.2** |
 
 **Aggregate across 11 shapes:** 1.67× speedup. Production-shape cluster
-(M ≥ 4096, N = 256, the regime that matters for `bench_qwen35_mq4
+(M ≥ 4096, N = 256, the regime that matters for `bench_qwen35_speed
 --prefill 256`): **1.40-2.24× speedup, 17-30 GiB/s effective.** The
 14336×4096 case beats HFQ4-mmq's 26 GiB/s at the same size on the
 same hardware — the predicted "match the uniform-MQ4 ceiling" outcome
@@ -600,7 +600,7 @@ for model in qwen3.5-9b.mq4 qwen3.5-9b.mq4-lloyd \
              qwen3.5-4b.mq4 qwen3.5-4b.mq4-lloyd; do
   for run in 1 2 3; do
     HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
-      ./target/release/examples/bench_qwen35_mq4 \
+      ./target/release/examples/bench_qwen35_speed \
       ~/.hipfire/models/$model \
       --prefill 256 --warmup 5 --prefill-runs 3 --gen 30
   done

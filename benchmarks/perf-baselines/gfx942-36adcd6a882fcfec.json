@@ -1,0 +1,86 @@
+{
+  "schema": "hipfire.perf_baseline.v1",
+  "arch": "gfx942",
+  "hardware_profile_hash": "36adcd6a882fcfec",
+  "hardware_profile_hash_source": "legacy-derived",
+  "captured_on": null,
+  "captured_in_commit": null,
+  "captured_via": "legacy speed baseline conversion",
+  "tolerance_pct": 5.0,
+  "hardware": {
+    "gfx": "gfx942",
+    "notes": "Converted from legacy speed baseline gfx942.txt"
+  },
+  "baselines": {
+    "speed": [
+      {
+        "label": "0.8b_pp32_prefill_decode",
+        "model_size": "0.8b",
+        "format": "mq4",
+        "prefill_tokens": 32,
+        "prefill_tok_s": 767.7,
+        "gen_tok_s": 458.5,
+        "model_id": "qwen3.5-0.8b-mq4"
+      },
+      {
+        "label": "0.8b_pp128_prefill_decode",
+        "model_size": "0.8b",
+        "format": "mq4",
+        "prefill_tokens": 128,
+        "prefill_tok_s": 2873.8,
+        "model_id": "qwen3.5-0.8b-mq4"
+      },
+      {
+        "label": "4b_pp32_prefill_decode",
+        "model_size": "4b",
+        "format": "mq4",
+        "prefill_tokens": 32,
+        "prefill_tok_s": 451.7,
+        "gen_tok_s": 203.4,
+        "model_id": "qwen3.5-4b-mq4"
+      },
+      {
+        "label": "4b_pp128_prefill_decode",
+        "model_size": "4b",
+        "format": "mq4",
+        "prefill_tokens": 128,
+        "prefill_tok_s": 1653.6,
+        "model_id": "qwen3.5-4b-mq4"
+      },
+      {
+        "label": "9b_pp32_prefill_decode",
+        "model_size": "9b",
+        "format": "mq4",
+        "prefill_tokens": 32,
+        "prefill_tok_s": 351.4,
+        "gen_tok_s": 164.0,
+        "model_id": "qwen3.5-9b-mq4"
+      },
+      {
+        "label": "9b_pp128_prefill_decode",
+        "model_size": "9b",
+        "format": "mq4",
+        "prefill_tokens": 128,
+        "prefill_tok_s": 1306.3,
+        "model_id": "qwen3.5-9b-mq4"
+      },
+      {
+        "label": "27b_pp32_prefill_decode",
+        "model_size": "27b",
+        "format": "mq4",
+        "prefill_tokens": 32,
+        "prefill_tok_s": 154.4,
+        "gen_tok_s": 64.9,
+        "model_id": "qwen3.5-27b-mq4"
+      },
+      {
+        "label": "27b_pp128_prefill_decode",
+        "model_size": "27b",
+        "format": "mq4",
+        "prefill_tokens": 128,
+        "prefill_tok_s": 572.5,
+        "model_id": "qwen3.5-27b-mq4"
+      }
+    ]
+  }
+}

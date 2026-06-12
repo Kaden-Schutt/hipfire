@@ -1,0 +1,237 @@
+{
+  "schema": "hipfire.perf_baseline.v1",
+  "arch": "gfx1100",
+  "hardware_profile_hash": "886c6ceae20e9b37",
+  "hardware_profile_hash_source": "legacy-derived",
+  "captured_on": "2026-05-02",
+  "captured_in_commit": "94fbd76",
+  "captured_via": "scripts/pflash-niah-bench.sh",
+  "tolerance_pct": 10.0,
+  "hardware": {
+    "gpu_model": "Radeon RX 7900 XTX",
+    "gfx": "gfx1100",
+    "memory_class": "GDDR6",
+    "notes": "Converted from the legacy standalone PFlash baseline before hipfire-eval host_profile_hash capture."
+  },
+  "speed_class": {
+    "label": "7900-xtx-legacy",
+    "source": "legacy pflash baseline metadata"
+  },
+  "models": {
+    "target": "qwen3.5-27b.mq3",
+    "drafter": "qwen3.5-0.8b.mq4"
+  },
+  "run_config": {
+    "kv_mode": "asym3",
+    "keep_ratio": 0.3,
+    "block_size": 64,
+    "runs_per_row": 3,
+    "aggregation": "median"
+  },
+  "baselines": {
+    "pflash_niah": [
+      {
+        "fixture": "benchmarks/longctx/niah/niah_8k.jsonl",
+        "label": "niah_8k_baseline",
+        "mode": "baseline",
+        "compress_ms": null,
+        "prefill_ms": 11318,
+        "decode_ms": 450,
+        "total_ms": 11768,
+        "verdict": "PASS",
+        "passes": "3/3"
+      },
+      {
+        "fixture": "benchmarks/longctx/niah/niah_8k.jsonl",
+        "label": "niah_8k_pflash30",
+        "mode": "pflash",
+        "compress_ms": 756,
+        "prefill_ms": 3102,
+        "decode_ms": 424,
+        "total_ms": 4278,
+        "verdict": "PASS",
+        "passes": "3/3"
+      },
+      {
+        "fixture": "benchmarks/longctx/niah/niah_16k.jsonl",
+        "label": "niah_16k_baseline",
+        "mode": "baseline",
+        "compress_ms": null,
+        "prefill_ms": 25648,
+        "decode_ms": 685,
+        "total_ms": 26333,
+        "verdict": "FAIL",
+        "passes": "0/3"
+      },
+      {
+        "fixture": "benchmarks/longctx/niah/niah_16k.jsonl",
+        "label": "niah_16k_pflash30",
+        "mode": "pflash",
+        "compress_ms": 2279,
+        "prefill_ms": 6399,
+        "decode_ms": 428,
+        "total_ms": 9106,
+        "verdict": "PASS",
+        "passes": "3/3"
+      },
+      {
+        "fixture": "benchmarks/longctx/niah/niah_multi_16k.jsonl",
+        "label": "niah_multi_16k_baseline",
+        "mode": "baseline",
+        "compress_ms": null,
+        "prefill_ms": 25844,
+        "decode_ms": 1087,
+        "total_ms": 26931,
+        "verdict": "FAIL",
+        "passes": "0/3"
+      },
+      {
+        "fixture": "benchmarks/longctx/niah/niah_multi_16k.jsonl",
+        "label": "niah_multi_16k_pflash30",
+        "mode": "pflash",
+        "compress_ms": 2452,
+        "prefill_ms": 6471,
+        "decode_ms": 1138,
+        "total_ms": 10209,
+        "verdict": "PASS",
+        "passes": "3/3"
+      },
+      {
+        "fixture": "benchmarks/prompts/longcode_pflash.jsonl",
+        "label": "longcode_baseline",
+        "mode": "baseline",
+        "compress_ms": null,
+        "prefill_ms": 32416,
+        "decode_ms": 1259,
+        "total_ms": 33683,
+        "verdict": "FAIL",
+        "passes": "0/3"
+      },
+      {
+        "fixture": "benchmarks/prompts/longcode_pflash.jsonl",
+        "label": "longcode_pflash30",
+        "mode": "pflash",
+        "compress_ms": 3303,
+        "prefill_ms": 7798,
+        "decode_ms": 1349,
+        "total_ms": 12450,
+        "verdict": "PASS",
+        "passes": "3/3"
+      },
+      {
+        "fixture": "benchmarks/prompts/longprose_multidoc.jsonl",
+        "label": "longprose_baseline",
+        "mode": "baseline",
+        "compress_ms": null,
+        "prefill_ms": 18051,
+        "decode_ms": 636,
+        "total_ms": 18689,
+        "verdict": "PASS",
+        "passes": "3/3"
+      },
+      {
+        "fixture": "benchmarks/prompts/longprose_multidoc.jsonl",
+        "label": "longprose_pflash30",
+        "mode": "pflash",
+        "compress_ms": 1337,
+        "prefill_ms": 4685,
+        "decode_ms": 235,
+        "total_ms": 6259,
+        "verdict": "PASS",
+        "passes": "3/3"
+      },
+      {
+        "fixture": "benchmarks/longctx/niah/niah_32k.jsonl",
+        "label": "niah_32k_baseline",
+        "mode": "baseline",
+        "compress_ms": null,
+        "prefill_ms": 64083,
+        "decode_ms": 767,
+        "total_ms": 64850,
+        "verdict": "FAIL",
+        "passes": "0/3"
+      },
+      {
+        "fixture": "benchmarks/longctx/niah/niah_32k.jsonl",
+        "label": "niah_32k_pflash30",
+        "mode": "pflash",
+        "compress_ms": 11522,
+        "prefill_ms": 13861,
+        "decode_ms": 456,
+        "total_ms": 25818,
+        "verdict": "PASS",
+        "passes": "3/3"
+      }
+    ],
+    "speed": [
+      {
+        "label": "0.8b_pp32_prefill_decode",
+        "model_size": "0.8b",
+        "format": "mq4",
+        "prefill_tokens": 32,
+        "prefill_tok_s": 2007.9,
+        "gen_tok_s": 365.6,
+        "model_id": "qwen3.5-0.8b-mq4"
+      },
+      {
+        "label": "0.8b_pp128_prefill_decode",
+        "model_size": "0.8b",
+        "format": "mq4",
+        "prefill_tokens": 128,
+        "prefill_tok_s": 4672.5,
+        "model_id": "qwen3.5-0.8b-mq4"
+      },
+      {
+        "label": "4b_pp32_prefill_decode",
+        "model_size": "4b",
+        "format": "mq4",
+        "prefill_tokens": 32,
+        "prefill_tok_s": 1014.0,
+        "gen_tok_s": 178.0,
+        "model_id": "qwen3.5-4b-mq4"
+      },
+      {
+        "label": "4b_pp128_prefill_decode",
+        "model_size": "4b",
+        "format": "mq4",
+        "prefill_tokens": 128,
+        "prefill_tok_s": 2004.3,
+        "model_id": "qwen3.5-4b-mq4"
+      },
+      {
+        "label": "9b_pp32_prefill_decode",
+        "model_size": "9b",
+        "format": "mq4",
+        "prefill_tokens": 32,
+        "prefill_tok_s": 1240.0,
+        "gen_tok_s": 114.8,
+        "model_id": "qwen3.5-9b-mq4"
+      },
+      {
+        "label": "9b_pp128_prefill_decode",
+        "model_size": "9b",
+        "format": "mq4",
+        "prefill_tokens": 128,
+        "prefill_tok_s": 1672.0,
+        "model_id": "qwen3.5-9b-mq4"
+      },
+      {
+        "label": "27b_pp32_prefill_decode",
+        "model_size": "27b",
+        "format": "mq4",
+        "prefill_tokens": 32,
+        "prefill_tok_s": 406.1,
+        "gen_tok_s": 46.5,
+        "model_id": "qwen3.5-27b-mq4"
+      },
+      {
+        "label": "27b_pp128_prefill_decode",
+        "model_size": "27b",
+        "format": "mq4",
+        "prefill_tokens": 128,
+        "prefill_tok_s": 491.1,
+        "model_id": "qwen3.5-27b-mq4"
+      }
+    ]
+  }
+}

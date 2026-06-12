@@ -128,7 +128,7 @@
 | `HIPFIRE_DOTS_OCR_BF16_RESIDUAL` | `crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1111` |
 | `HIPFIRE_DOTS_OCR_DUMP_DIR` | `crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1013` |
 | `HIPFIRE_DOTS_OCR_TRACE` | `crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1048`<br>`crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1141` |
-| `HIPFIRE_DPM_WARMUP_SECS` | `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:181`<br>`crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:671`<br>`crates/hipfire-runtime/examples/daemon.rs:7140`<br>`crates/hipfire-runtime/examples/dflash_spec_demo.rs:1714`<br>`crates/rdna-compute/examples/bench_stream_overlap.rs:60` |
+| `HIPFIRE_DPM_WARMUP_SECS` | `crates/hipfire-runtime/examples/bench_qwen35_speed.rs:181`<br>`crates/hipfire-runtime/examples/bench_qwen35_speed.rs:671`<br>`crates/hipfire-runtime/examples/daemon.rs:7140`<br>`crates/hipfire-runtime/examples/dflash_spec_demo.rs:1714`<br>`crates/rdna-compute/examples/bench_stream_overlap.rs:60` |
 | `HIPFIRE_DRAFT_F16` | `crates/hipfire-runtime/src/config.rs:71` |
 | `HIPFIRE_DRAFT_GEMM_DUMP` | `crates/hipfire-runtime/src/config.rs:72` |
 | `HIPFIRE_DRAFT_SUBPHASE` | `crates/hipfire-runtime/src/config.rs:73` |
@@ -161,7 +161,7 @@
 | `HIPFIRE_GQA_FUSED` | `crates/hipfire-arch-qwen2/src/qwen2.rs:1054` |
 | `HIPFIRE_GRAPH` | `cli/index.ts:8418`<br>`cli/index.ts:8826`<br>`crates/hipfire-arch-qwen35/src/qwen35.rs:7743`<br>`crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:709`<br>`crates/hipfire-runtime/examples/dump_qwen35_hidden_states.rs:104`<br>`crates/hipfire-runtime/examples/eval_hipfire.rs:356`<br>`crates/hipfire-runtime/examples/eval_hipfire_llama.rs:123`<br>`crates/hipfire-runtime/examples/prefill_microbench.rs:119` |
 | `HIPFIRE_GRAPH_MOE` | `crates/hipfire-arch-qwen35/src/qwen35.rs:7722` |
-| `HIPFIRE_GRAPH_PREFILL` | `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:275` |
+| `HIPFIRE_GRAPH_PREFILL` | `crates/hipfire-runtime/examples/bench_qwen35_speed.rs:275` |
 | `HIPFIRE_HAVE_2_GPU` | `crates/hipfire-arch-qwen35/tests/pp_parity.rs:193` |
 | `HIPFIRE_HETERO_DIFF` | `crates/hipfire-arch-qwen35/src/mtp_spec.rs:2953` |
 | `HIPFIRE_HFQ4G128_MMQ` | `crates/rdna-compute/src/dispatch.rs:4866`<br>`crates/rdna-compute/src/feature_flags.rs:188` |
@@ -180,7 +180,7 @@
 | `HIPFIRE_KLD_NO_ACTIVE_STREAM` | `crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:290` |
 | `HIPFIRE_KLD_PREFILL_ONLY` | `crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:843` |
 | `HIPFIRE_KLD_SOURCE_SHA256` | `crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:839` |
-| `HIPFIRE_KV_MODE` | `cli/index.ts:665`<br>`cli/index.ts:1210`<br>`cli/index.ts:1237`<br>`crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:132`<br>`crates/hipfire-runtime/examples/daemon.rs:8974`<br>`crates/hipfire-runtime/examples/daemon.rs:10392`<br>`crates/hipfire-runtime/examples/dump_logits_qwen35.rs:65`<br>`crates/hipfire-runtime/examples/dump_qwen35_hidden_states.rs:105`<br>`crates/hipfire-runtime/examples/eval_hipfire.rs:357`<br>`crates/hipfire-runtime/examples/eval_hipfire_llama.rs:124`<br>`crates/hipfire-runtime/examples/greedy_dump.rs:73`<br>`crates/hipfire-runtime/examples/greedy_dump_top5.rs:41`<br>`crates/hipfire-runtime/examples/infer_qwen35.rs:158`<br>`crates/hipfire-runtime/examples/prefill_microbench.rs:120`<br>`crates/hipfire-runtime/examples/probe_argmax_agreement.rs:116` |
+| `HIPFIRE_KV_MODE` | `cli/index.ts:665`<br>`cli/index.ts:1210`<br>`cli/index.ts:1237`<br>`crates/hipfire-runtime/examples/bench_qwen35_speed.rs:132`<br>`crates/hipfire-runtime/examples/daemon.rs:8974`<br>`crates/hipfire-runtime/examples/daemon.rs:10392`<br>`crates/hipfire-runtime/examples/dump_logits_qwen35.rs:65`<br>`crates/hipfire-runtime/examples/dump_qwen35_hidden_states.rs:105`<br>`crates/hipfire-runtime/examples/eval_hipfire.rs:357`<br>`crates/hipfire-runtime/examples/eval_hipfire_llama.rs:124`<br>`crates/hipfire-runtime/examples/greedy_dump.rs:73`<br>`crates/hipfire-runtime/examples/greedy_dump_top5.rs:41`<br>`crates/hipfire-runtime/examples/infer_qwen35.rs:158`<br>`crates/hipfire-runtime/examples/prefill_microbench.rs:120`<br>`crates/hipfire-runtime/examples/probe_argmax_agreement.rs:116` |
 | `HIPFIRE_KV_PHYSICAL_CAP` | `crates/hipfire-runtime/examples/daemon.rs:9117`<br>`crates/hipfire-runtime/examples/daemon.rs:9127` |
 | `HIPFIRE_LFM2_CAPTURE_POSTMIXER` | `crates/hipfire-arch-lfm2moe/examples/dump_lfm2moe_hidden_states.rs:50`<br>`crates/hipfire-arch-lfm2moe/src/forward.rs:132` |
 | `HIPFIRE_LFM2_EXPERT_MQ6` | `crates/hipfire-quantize/src/main.rs:6728` |
@@ -278,9 +278,9 @@
 | `HIPFIRE_PREFILL_STOP_STAGE_LAYER` | `crates/hipfire-arch-qwen35/src/qwen35.rs:14094` |
 | `HIPFIRE_PREFILL_THRESHOLD` | `crates/hipfire-arch-qwen35/src/pflash.rs:109` |
 | `HIPFIRE_PREFIX_BOUNDARY_CHECKPOINTS` | `crates/hipfire-runtime/examples/daemon.rs:4710` |
-| `HIPFIRE_PROFILE` | `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:194`<br>`crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:842`<br>`crates/hipfire-runtime/examples/dflash_spec_demo.rs:1567`<br>`crates/hipfire-runtime/examples/mtp_only_demo.rs:495` |
+| `HIPFIRE_PROFILE` | `crates/hipfire-runtime/examples/bench_qwen35_speed.rs:194`<br>`crates/hipfire-runtime/examples/build_kld_ref_hipfire.rs:842`<br>`crates/hipfire-runtime/examples/dflash_spec_demo.rs:1567`<br>`crates/hipfire-runtime/examples/mtp_only_demo.rs:495` |
 | `HIPFIRE_PROFILE_CYCLES` | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:1568`<br>`crates/hipfire-runtime/examples/mtp_only_demo.rs:496` |
-| `HIPFIRE_PROFILE_DECODE` | `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:683` |
+| `HIPFIRE_PROFILE_DECODE` | `crates/hipfire-runtime/examples/bench_qwen35_speed.rs:683` |
 | `HIPFIRE_PROMPT_HEAT_JSON` | `crates/hipfire-runtime/src/config.rs:58` |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | `crates/hipfire-runtime/src/config.rs:59` |
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | `crates/hipfire-runtime/examples/daemon.rs:7399`<br>`crates/hipfire-runtime/examples/dflash_spec_demo.rs:1145`<br>`crates/hipfire-runtime/examples/run.rs:920`<br>`crates/hipfire-runtime/examples/triattn_infer.rs:232`<br>`crates/hipfire-runtime/src/config.rs:56` |
@@ -312,7 +312,7 @@
 | `HIPFIRE_ROCBLAS_ALL_ARCHS` | `crates/rdna-compute/src/feature_flags.rs:224` |
 | `HIPFIRE_ROCBLAS_OFF` | `crates/rdna-compute/src/feature_flags.rs:226` |
 | `HIPFIRE_ROCPROF_BIN` | `crates/hipfire-runtime/src/eval_harness/mod.rs:1599` |
-| `HIPFIRE_ROCPROF_CSV` | `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:447` |
+| `HIPFIRE_ROCPROF_CSV` | `crates/hipfire-runtime/examples/bench_qwen35_speed.rs:447` |
 | `HIPFIRE_ROPE_INTERLEAVED_LEGACY` | `crates/rdna-compute/src/feature_flags.rs:217` |
 | `HIPFIRE_RUN_EXAMPLE_BIN` | `crates/hipfire-runtime/src/eval_harness/mod.rs:7939` |
 | `HIPFIRE_SAMPLE_COMPARE` | `crates/hipfire-runtime/examples/infer_qwen35.rs:222` |

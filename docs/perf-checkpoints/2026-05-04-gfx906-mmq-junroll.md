@@ -88,7 +88,7 @@ Two confounders:
    `crates/rdna-compute/src/kernels.rs`). After editing the `.hip`
    file we have to rebuild *both* the kernel artifacts (`compile-kernels.sh`)
    *and* the Rust binary (`cargo build --release --example
-   bench_qwen35_mq4`). Otherwise the old source's hash mismatches the
+   bench_qwen35_speed`). Otherwise the old source's hash mismatches the
    new blob in `.hipfire_kernels/`, the JIT recompiles, and the cached
    `kernels/compiled/` blob is ignored.
 

@@ -174,7 +174,7 @@ name = "bench_qwen35_forward"
 required-features = ["arch-qwen35"]
 
 [[example]]
-name = "bench_qwen35_mq4"
+name = "bench_qwen35_speed"
 required-features = ["arch-qwen35"]
 
 [[example]]

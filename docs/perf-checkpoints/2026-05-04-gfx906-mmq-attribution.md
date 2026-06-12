@@ -181,7 +181,7 @@ Estimated impact:
 3. Quick correctness check:
    `./tests/test_gfx906_mmq_correctness 4096 4096 32` (NRMSE ≤ 0.13%)
 4. Wallclock bench:
-   `bench_qwen35_mq4 ... --prefill 128 --prefill-runs 3` against
+   `bench_qwen35_speed ... --prefill 128 --prefill-runs 3` against
    `39b1eb7` baseline 125.2 tk/s.
 5. If perf gain: rocprof g0/g2 to confirm VMEM_WR dropped and VALUBusy
    rose.

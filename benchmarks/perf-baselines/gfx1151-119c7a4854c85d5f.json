@@ -1,0 +1,69 @@
+{
+  "schema": "hipfire.perf_baseline.v1",
+  "arch": "gfx1151",
+  "hardware_profile_hash": "119c7a4854c85d5f",
+  "hardware_profile_hash_source": "legacy-derived",
+  "captured_on": null,
+  "captured_in_commit": null,
+  "captured_via": "legacy speed baseline conversion",
+  "tolerance_pct": 5.0,
+  "hardware": {
+    "gfx": "gfx1151",
+    "notes": "Converted from legacy speed baseline gfx1151.txt"
+  },
+  "baselines": {
+    "speed": [
+      {
+        "label": "0.8b_pp32_prefill_decode",
+        "model_size": "0.8b",
+        "format": "mq4",
+        "prefill_tokens": 32,
+        "prefill_tok_s": 1468.8,
+        "gen_tok_s": 220.6,
+        "model_id": "qwen3.5-0.8b-mq4"
+      },
+      {
+        "label": "0.8b_pp128_prefill_decode",
+        "model_size": "0.8b",
+        "format": "mq4",
+        "prefill_tokens": 128,
+        "prefill_tok_s": 3817.0,
+        "model_id": "qwen3.5-0.8b-mq4"
+      },
+      {
+        "label": "4b_pp32_prefill_decode",
+        "model_size": "4b",
+        "format": "mq4",
+        "prefill_tokens": 32,
+        "prefill_tok_s": 590.7,
+        "gen_tok_s": 65.5,
+        "model_id": "qwen3.5-4b-mq4"
+      },
+      {
+        "label": "4b_pp128_prefill_decode",
+        "model_size": "4b",
+        "format": "mq4",
+        "prefill_tokens": 128,
+        "prefill_tok_s": 1368.0,
+        "model_id": "qwen3.5-4b-mq4"
+      },
+      {
+        "label": "9b_pp32_prefill_decode",
+        "model_size": "9b",
+        "format": "mq4",
+        "prefill_tokens": 32,
+        "prefill_tok_s": 307.6,
+        "gen_tok_s": 43.9,
+        "model_id": "qwen3.5-9b-mq4"
+      },
+      {
+        "label": "9b_pp128_prefill_decode",
+        "model_size": "9b",
+        "format": "mq4",
+        "prefill_tokens": 128,
+        "prefill_tok_s": 882.9,
+        "model_id": "qwen3.5-9b-mq4"
+      }
+    ]
+  }
+}

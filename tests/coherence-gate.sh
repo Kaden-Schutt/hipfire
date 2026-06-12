@@ -73,6 +73,59 @@ if [ "$rebuild" -eq 1 ]; then
 fi
 binary_md5=$(md5sum "$EXE" | awk '{print $1}')
 
+# Resolve model artifacts from the configured install/cache directory.
+# Accepted forms include:
+#   qwen3.5-4b.mq4            legacy extensionless registry name
+#   qwen3.5-4b.mq4.hfq        installed HFQ artifact with dotted quant token
+#   qwen3.5-4b-mq4.hfq        canonical artifact-name shape
+#   qwen3.5-9b-lloyd-mq4.hfq  older modifier-before-quant artifact shape
+find_model_file() {
+    local name="$1"
+    local lookup_name requested_dir stem dir cand base quant suffix dash_quant modifier_first
+    local dirs=()
+
+    if [[ "$name" == */* ]]; then
+        requested_dir="$(dirname "$name")"
+        lookup_name="$(basename "$name")"
+        dirs=("$requested_dir")
+    else
+        requested_dir=""
+        lookup_name="$name"
+        dirs=("$MODELS_DIR" "$HOME/.hipfire/models")
+    fi
+
+    stem="${lookup_name%.hfq}"
+
+    if [[ "$stem" =~ ^(.+)\.(mq[0-9][a-z0-9]*|q8f16)(-.+)?$ ]]; then
+        base="${BASH_REMATCH[1]}"
+        quant="${BASH_REMATCH[2]}"
+        suffix="${BASH_REMATCH[3]:-}"
+        dash_quant="${base}-${quant}${suffix}"
+        if [ -n "$suffix" ]; then
+            modifier_first="${base}${suffix}-${quant}"
+        else
+            modifier_first=""
+        fi
+    else
+        dash_quant=""
+        modifier_first=""
+    fi
+
+    for dir in "${dirs[@]}"; do
+        for cand in \
+            "$dir/$lookup_name" \
+            "$dir/$stem" \
+            "$dir/$stem.hfq" \
+            ${dash_quant:+"$dir/$dash_quant"} \
+            ${dash_quant:+"$dir/$dash_quant.hfq"} \
+            ${modifier_first:+"$dir/$modifier_first"} \
+            ${modifier_first:+"$dir/$modifier_first.hfq"}; do
+            [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+        done
+    done
+    return 1
+}
+
 # ── GPU lock ──────────────────────────────────────────────────────────────
 if [ -r "$LOCK_SCRIPT" ]; then
     # shellcheck disable=SC1090
@@ -227,8 +280,8 @@ hard_errors=0
 
 for entry in "${tests[@]}"; do
     IFS='|' read -r model_file prompt_id prompt max_tok system_file <<< "$entry"
-    model_path="$MODELS_DIR/$model_file"
-    if [ ! -f "$model_path" ]; then
+    model_path="$(find_model_file "$model_file" || true)"
+    if [ -z "$model_path" ]; then
         echo "## $model_file — $prompt_id — SKIPPED (model not present)" >> "$OUT"
         echo >> "$OUT"
         continue
@@ -384,6 +437,7 @@ print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))'
         else
             echo "- prompt: \"$prompt\""
         fi
+        echo "- model_path: \`$model_path\`"
         if [ -n "${system_file:-}" ]; then
             echo "- system: \`@$system_file\` (md5: \`$system_md5\`)"
         fi
@@ -430,9 +484,11 @@ if [ "${HIPFIRE_SKIP_PFLASH_GATE:-0}" = "1" ]; then
     echo "pflash-gate: SKIPPED (HIPFIRE_SKIP_PFLASH_GATE=1)"
     exit 0
 fi
-PFLASH_TARGET="${HIPFIRE_PFLASH_TARGET:-$MODELS_DIR/qwen3.5-27b.mq3}"
-PFLASH_DRAFTER="${HIPFIRE_PFLASH_DRAFTER:-$MODELS_DIR/qwen3.5-0.8b.mq4}"
-if [ ! -f "$PFLASH_TARGET" ] || [ ! -f "$PFLASH_DRAFTER" ]; then
+PFLASH_TARGET="${HIPFIRE_PFLASH_TARGET:-qwen3.5-27b.mq3}"
+PFLASH_DRAFTER="${HIPFIRE_PFLASH_DRAFTER:-qwen3.5-0.8b.mq4}"
+PFLASH_TARGET_PATH="$(find_model_file "$PFLASH_TARGET" || true)"
+PFLASH_DRAFTER_PATH="$(find_model_file "$PFLASH_DRAFTER" || true)"
+if [ -z "$PFLASH_TARGET_PATH" ] || [ -z "$PFLASH_DRAFTER_PATH" ]; then
     echo
     echo "pflash-gate: SKIPPED (target or drafter not present)"
     exit 0
@@ -440,7 +496,8 @@ fi
 
 echo
 echo "── pflash regression stage ────────────────────────────────────────"
-HIPFIRE_PFLASH_TARGET="$PFLASH_TARGET" HIPFIRE_PFLASH_DRAFTER="$PFLASH_DRAFTER" \
+HIPFIRE_SKIP_MISSING_PERF_BASELINE=1 \
+HIPFIRE_PFLASH_TARGET="$PFLASH_TARGET_PATH" HIPFIRE_PFLASH_DRAFTER="$PFLASH_DRAFTER_PATH" \
     ./tests/pflash-gate.sh
 pflash_rc=$?
 if [ "$pflash_rc" -ne 0 ]; then

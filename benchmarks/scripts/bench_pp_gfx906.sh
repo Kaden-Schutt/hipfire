@@ -3,9 +3,9 @@
 # Pinned invocation + environment so the 5× pp512 claim in PR #158 is
 # reproducible byte-for-byte on any MI50.
 #
-# The bench uses *synthetic* token input via `bench_qwen35_mq4`'s built-in
+# The bench uses *synthetic* token input via `bench_qwen35_speed`'s built-in
 # deterministic generator (`prompt_tokens = [0, 1, 2, ..., prefill_len-1]`
-# in crates/hipfire-runtime/examples/bench_qwen35_mq4.rs). There is no
+# in crates/hipfire-runtime/examples/bench_qwen35_speed.rs). There is no
 # external prompt file — the input is fully determined by `--prefill N`,
 # the model file, and the binary commit. The CLAUDE.md prompt-md5 rule
 # applies to AR-decode / DFlash where prompt-structure swings τ; for
@@ -26,10 +26,10 @@ if [ ! -f "$MODEL" ]; then
     exit 2
 fi
 
-EXE=./target/release/examples/bench_qwen35_mq4
+EXE=./target/release/examples/bench_qwen35_speed
 if [ ! -x "$EXE" ]; then
-    echo "building bench_qwen35_mq4..." >&2
-    cargo build --release -p hipfire-runtime --example bench_qwen35_mq4 \
+    echo "building bench_qwen35_speed..." >&2
+    cargo build --release -p hipfire-runtime --example bench_qwen35_speed \
         --features deltanet 2>&1 | tail -3
 fi
 

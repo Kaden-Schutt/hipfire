@@ -85,7 +85,7 @@ PR rejects in favor of deployment parity — see `Performance` below.
 
 ## Performance — gfx1151
 
-`bench_qwen35_mq4 <model> --prefill 128 --prefill-runs 3 --warmup 8 --gen 100`,
+`bench_qwen35_speed <model> --prefill 128 --prefill-runs 3 --warmup 8 --gen 100`,
 median of 3 prefill runs, single 100-token gen. Within-session noise
 band on this host is ~±10–15% per
 `docs/methodology/perf-benchmarking.md`.
@@ -134,7 +134,7 @@ is ~2.6× slower than gfx1100, consistent with shared LPDDR5x
   `devlog_20260507_mq4_lloyd_implementation.md`. Doesn't affect
   bench numbers (printed before teardown). Exit code 139 on
   otherwise-successful runs.
-- `bench_qwen35_mq4` is general-purpose — works on MQ3-Lloyd files
+- `bench_qwen35_speed` is general-purpose — works on MQ3-Lloyd files
   too; dispatch is dtype-driven from per-tensor metadata. Naming is
   historical (the binary was added during MQ4 bring-up).
 
@@ -142,16 +142,16 @@ is ~2.6× slower than gfx1100, consistent with shared LPDDR5x
 
 ```sh
 source scripts/rocm-env.sh
-cargo build --release -p hipfire-runtime --example bench_qwen35_mq4 --features deltanet
+cargo build --release -p hipfire-runtime --example bench_qwen35_speed --features deltanet
 cargo build --release -p hipfire-runtime --example perplexity
 source scripts/gpu-lock.sh && gpu_acquire "mq3-lloyd gfx1151"
 
 # Performance:
-./target/release/examples/bench_qwen35_mq4 \
+./target/release/examples/bench_qwen35_speed \
   ~/.hipfire/models/qwen3.5-9b.mq3-lloyd \
   --prefill 128 --prefill-runs 3 --warmup 8 --gen 100
 
-HIPFIRE_LLOYD_FORCE_BASELINE=1 ./target/release/examples/bench_qwen35_mq4 \
+HIPFIRE_LLOYD_FORCE_BASELINE=1 ./target/release/examples/bench_qwen35_speed \
   ~/.hipfire/models/qwen3.5-9b.mq3-lloyd \
   --prefill 128 --prefill-runs 3 --warmup 8 --gen 100
 

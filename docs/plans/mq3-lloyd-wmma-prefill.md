@@ -299,7 +299,7 @@ Mechanical, auditable yes/no items:
 
 **Bench tool prerequisite:** identify or build a prefill-perf bench.
 Candidates to evaluate first:
-- `target/release/examples/bench_qwen35_mq4` — used by
+- `target/release/examples/bench_qwen35_speed` — used by
   `probe_commits.sh` for decode; check whether `--prefill` flag
   exists and produces a `prefill_tok_s` metric.
 - `target/release/examples/perplexity` — emits `pos= N scored= M ...

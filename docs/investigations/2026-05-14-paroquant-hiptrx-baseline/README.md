@@ -12,7 +12,7 @@ tuning loop. Branch checkpoint: `26ebcfc3 checkpoint paroquant atlas tuning`.
 | hiptrx  | gfx1201 | native  | 101.3     | 103.2         | 94.2           | 9.78   |
 | hiptrx  | gfx1201 | engine  | **186.6** | **193.4**     | **174.6**      | 5.27   |
 
-Same `bench_qwen35_mq4` config: `HIPFIRE_DPM_WARMUP_SECS=3 HIPFIRE_GRAPH=0
+Same `bench_qwen35_speed` config: `HIPFIRE_DPM_WARMUP_SECS=3 HIPFIRE_GRAPH=0
 HIPFIRE_KV_MODE=q8 --prefill 32 --prefill-runs 2 --warmup 2 --gen 64`. Sustains
 across `--gen 256` within ±0.5%.
 
@@ -162,7 +162,7 @@ share, not perf claims.
     --layout engine --copy-floats f16
 
 cargo build --release --example test_gemv_paro4g128 \
-    --example bench_qwen35_mq4 --example test_inference
+    --example bench_qwen35_speed --example test_inference
 
 # correctness
 ./target/release/examples/test_gemv_paro4g128  # 22 variants ALL PASS
@@ -170,14 +170,14 @@ cargo build --release --example test_gemv_paro4g128 \
 
 # perf
 HIPFIRE_DPM_WARMUP_SECS=3 HIPFIRE_GRAPH=0 HIPFIRE_KV_MODE=q8 \
-    ./target/release/examples/bench_qwen35_mq4 \
+    ./target/release/examples/bench_qwen35_speed \
     ~/.hipfire/models/qwen3.5-0.8b.paro4g128-engine.hfq \
     --prefill 32 --prefill-runs 2 --warmup 2 --gen 64
 # expected: gen_tok_s=186.6, bw_gib_s=174.6 ±1%
 
 # profile breakdown
 HIPFIRE_DPM_WARMUP_SECS=3 HIPFIRE_GRAPH=0 HIPFIRE_KV_MODE=q8 HIPFIRE_PROFILE_DECODE=1 \
-    ./target/release/examples/bench_qwen35_mq4 \
+    ./target/release/examples/bench_qwen35_speed \
     ~/.hipfire/models/qwen3.5-0.8b.paro4g128-engine.hfq \
     --prefill 32 --prefill-runs 2 --warmup 2 --gen 64
 ```

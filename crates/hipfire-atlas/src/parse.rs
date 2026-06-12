@@ -44,7 +44,7 @@ pub fn parse_bench_summary(text: &str) -> Result<BTreeMap<String, f64>, String> 
         }
     }
     // Also merge PREFILL_SUMMARY fields if present (latency split metrics
-    // emitted by bench_qwen35_mq4 starting 2026-05-14).
+    // emitted by bench_qwen35_speed starting 2026-05-14).
     if let Some(prefill_line) = text
         .lines()
         .find(|line| line.starts_with("PREFILL_SUMMARY"))

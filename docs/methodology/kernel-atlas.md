@@ -9,7 +9,7 @@ autotuning, or an advisor model.
 
 Each row has exactly one phase:
 
-- `prefill`: AR prompt processing from `bench_qwen35_mq4 --prefill N`.
+- `prefill`: AR prompt processing from `bench_qwen35_speed --prefill N`.
 - `decode_ar`: target-only AR generation from the same bench run.
 - `decode_dflash`: speculative decode from `dflash_spec_demo`.
 

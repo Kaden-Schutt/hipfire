@@ -5,7 +5,7 @@ Read-only audit, 2026-05-20. Cross-references:
 - hipEngine survey: `/tmp/hipengine-survey/`
 - hipfire branch: `paroquant-a3b` worktree
 
-## Baseline (this branch, `bench_qwen35_mq4`, prefill 256 / gen 100 / kv-mode q8 / gfx1151)
+## Baseline (this branch, `bench_qwen35_speed`, prefill 256 / gen 100 / kv-mode q8 / gfx1151)
 
 | Metric  | hipfire (today) |
 | ---     | --:             |
@@ -69,7 +69,7 @@ with room for 3-10× before hitting the FP16/BF16 WMMA roof.
   `runtime/qwen35_paro_runner.py:3282-3343` (Qwen35ParoDecodeGraph),
   `docs/OPTIMIZE.md:255-273` (877 dispatches/token measurement).
 - **Citations (hipfire)**: `crates/hipfire-arch-qwen35/src/qwen35.rs:3765-3825`,
-  `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:128-156` (DPM warmup + prefill warmup).
+  `crates/hipfire-runtime/examples/bench_qwen35_speed.rs:128-156` (DPM warmup + prefill warmup).
 - **Portability**: portable to all RDNA arches; CDNA already has HIP graph support.
 
 ### 2. GDN prefill is strictly sequential per token in both engines — same wall, but hipEngine has the open ticket
@@ -234,8 +234,8 @@ This is the cheapest win because we don't yet know whether hipfire's current ben
 dispatch-bound or kernel-bound on gfx1151. hipEngine's audit drove every accepted/rejected
 candidate in OPTIMIZE.md from rocprofv3 `--kernel-trace --selected-regions` (`docs/OPTIMIZE.md:151-167`).
 
-**Sketch**: Run `bench_qwen35_mq4 --emit-atlas` (the bench already supports JSONL emit —
-`crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:37-42`) and add a rocprofv3
+**Sketch**: Run `bench_qwen35_speed --emit-atlas` (the bench already supports JSONL emit —
+`crates/hipfire-runtime/examples/bench_qwen35_speed.rs:37-42`) and add a rocprofv3
 kernel-trace pass. Rank by total kernel time; expect to find:
 
 - If GDN kernels dominate (>20%) → win #2 (chunkwise GDN) is the lever.
@@ -305,4 +305,4 @@ From `docs/LESSONS-LEARNED.md` and `docs/BENCHMARK.md`:
 - `/home/bjoern/hipfire/.worktrees/paroquant-a3b/crates/hipfire-arch-qwen35/src/qwen35.rs:4426-5243` — MoE prefill (Path 2 grouped-WMMA)
 - `/home/bjoern/hipfire/.worktrees/paroquant-a3b/kernels/src/gated_delta_net_q8.hip:56-86` — GDN serial-per-token loop
 - `/home/bjoern/hipfire/.worktrees/paroquant-a3b/kernels/src/gemm_hfq4g256_moe_grouped_wmma_k2.hip:43-100` — grouped-MoE WMMA
-- `/home/bjoern/hipfire/.worktrees/paroquant-a3b/crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:1-200` — bench config
+- `/home/bjoern/hipfire/.worktrees/paroquant-a3b/crates/hipfire-runtime/examples/bench_qwen35_speed.rs:1-200` — bench config

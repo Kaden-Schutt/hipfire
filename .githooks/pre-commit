@@ -304,9 +304,10 @@ if ! ./tests/speed-gate.sh --fast; then
     echo "  ./tests/speed-gate.sh --verbose       # full bench output"
     echo
     echo "If this regression is INTENTIONAL (new correctness path, new hardware"
-    echo "target that needs the extra cycles, etc.), justify it AND re-baseline:"
-    echo "  ./tests/speed-gate.sh --update-baselines"
-    echo "  git add tests/speed-baselines/"
+    echo "target that needs the extra cycles, etc.), justify it AND re-baseline"
+    echo "from a hipfire-eval report:"
+    echo "  hipfire eval --model <model> --battery speed --benchmark --force"
+    echo "  git add benchmarks/perf-baselines/"
     echo "  # then re-attempt the commit"
     echo
     echo "Do NOT bypass with --no-verify without a plan to restore perf in the same commit."

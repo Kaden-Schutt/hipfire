@@ -214,7 +214,7 @@ for model in qwen3.5-9b.mq3 qwen3.5-9b.mq3-lloyd; do
   for mb4 in 0 1; do
     for run in 1 2 3; do
       HIPFIRE_MQ3_MB4=$mb4 HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
-        ./target/release/examples/bench_qwen35_mq4 \
+        ./target/release/examples/bench_qwen35_speed \
         ~/.hipfire/models/$model \
         --prefill 256 --prefill-runs 3 --warmup 5 --gen 30
     done

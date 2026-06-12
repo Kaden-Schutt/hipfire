@@ -42,6 +42,7 @@ pub mod multi_gpu;
 pub mod prompt_frame;
 pub mod safetensors_source;
 pub mod sampler;
+pub mod speed_bench;
 pub mod tokenizer;
 pub mod tool_call;
 #[cfg(feature = "deltanet")]

@@ -124,8 +124,8 @@ These are intentionally out of scope and clearly documented:
 - **RDNA1 / RDNA2 (gfx1010 / gfx1030)** scalar fallback dispatches.
   WMMA is fundamentally unavailable; DeepSeek V4 would need a scalar
   serving path (significant work).
-- **DeepSeek V4-aware `speed-gate.sh`**. Current `bench_qwen35_mq4` is qwen35-only.
-  DeepSeek V4 numbers in `tests/speed-baselines/gfx1151.txt` are documented but
+- **DeepSeek V4-aware `speed-gate.sh`**. Current `bench_qwen35_speed` is qwen35-only.
+  DeepSeek V4 numbers in `benchmarks/perf-baselines/` are documented but
   not enforced.
 - **DeepSeek V4 PFlash / DFlash drafter** integration (DeepSeek V4 draft model design open).
 - **DeepSeek V4 multi-GPU pipeline-parallel** + **CASK eviction**.

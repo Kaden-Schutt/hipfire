@@ -793,7 +793,7 @@ fn main() {
     // HIP kernel launches are async. Without an explicit synchronize,
     // `t_pre.elapsed()` would only measure host-side launch time and the
     // first D2H download in the "first dec" bucket would absorb the real
-    // prefill compute. Mirror the bench_qwen35_mq4 pattern: sync inside
+    // prefill compute. Mirror the bench_qwen35_speed pattern: sync inside
     // the prefill timer, then time download+argmax separately as the
     // first-decode-step bucket.
     let t_pre = Instant::now();

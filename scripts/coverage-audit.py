@@ -17,7 +17,7 @@ rocprofv3 stats CSV format (columns):
 
 Atlas JSONL format: each line is a JSON object with at minimum:
     {"metrics": {"internal_kernel_total_ms": <f>, ...}, ...}
-When emitted by bench_qwen35_mq4 with HIPFIRE_ROCPROF_CSV set, the atlas
+When emitted by bench_qwen35_speed with HIPFIRE_ROCPROF_CSV set, the atlas
 row already contains rocprof_coverage_pct etc. This script is useful for
 running the audit independently (e.g. when the atlas row was emitted
 without HIPFIRE_ROCPROF_CSV, or when comparing a fresh rocprof run).
@@ -281,7 +281,7 @@ def main(argv=None):
         "--internal",
         required=True,
         metavar="ATLAS_JSONL",
-        help="Atlas JSONL file from bench_qwen35_mq4 --emit-atlas",
+        help="Atlas JSONL file from bench_qwen35_speed --emit-atlas",
     )
     parser.add_argument(
         "--rocprof",

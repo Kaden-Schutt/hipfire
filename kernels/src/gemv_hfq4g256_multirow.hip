@@ -17,7 +17,7 @@
 // default is R=2 — see dispatch.rs).
 //
 // Empirical result on BC-250 / gfx1013 (runs as gfx1010), 24 CUs,
-// 224 GiB/s peak DRAM, Qwen3.5 0.8B MQ4, bench_qwen35_mq4 200 gen:
+// 224 GiB/s peak DRAM, Qwen3.5 0.8B MQ4, bench_qwen35_speed 200 gen:
 //
 //   R=1 (baseline): 212.6 tok/s  (108.7 GiB/s, 48.5% of peak)
 //   R=2           : 218.4 tok/s  (111.7 GiB/s, 49.9% of peak)  +2.7%

@@ -1144,7 +1144,7 @@ pub const ENV_HIPFIRE_GRAPH_MOE: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_GRAPH_PREFILL: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GRAPH_PREFILL",
     description: "HIPFIRE_GRAPH_PREFILL=1: route the timed prefill loop through",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:275",
+    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/bench_qwen35_speed.rs:275",
 };
 
 /// `HIPFIRE_HAVE_2_GPU` — Environment toggle value controls runtime behavior
@@ -2040,7 +2040,7 @@ pub const ENV_HIPFIRE_PROFILE_CYCLES: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_PROFILE_DECODE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_PROFILE_DECODE",
     description: "HIPFIRE_PROFILE_DECODE=1 wraps the timed gen loop in the per-kernel",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:683",
+    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/bench_qwen35_speed.rs:683",
 };
 
 /// `HIPFIRE_PROMPT_HEAT_JSON` — Enabled when set to 1
@@ -2285,7 +2285,7 @@ pub const ENV_HIPFIRE_ROCPROF_BIN: EnvVarDoc = EnvVarDoc {
 pub const ENV_HIPFIRE_ROCPROF_CSV: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ROCPROF_CSV",
     description: "Runtime variable controlling rocprof csv in hipfire",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/bench_qwen35_mq4.rs:447",
+    source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/bench_qwen35_speed.rs:447",
 };
 
 /// `HIPFIRE_ROPE_INTERLEAVED_LEGACY` — Runtime variable controlling rope interleaved legacy in hipfire

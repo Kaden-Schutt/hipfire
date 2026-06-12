@@ -57,6 +57,9 @@ pub struct CoherenceRunConfig {
     pub prompt: String,
     pub prompt_label: String,
     pub system: Option<String>,
+    pub tools: Option<Value>,
+    pub assistant_prefix: Option<String>,
+    pub force_jinja_chat: bool,
     pub max_tokens: usize,
     pub temperature: f64,
     pub repeat_penalty: Option<f64>,
@@ -77,6 +80,8 @@ pub struct CoherenceRunOutput {
     pub repeat_penalty: Option<f64>,
     pub repeat_window: Option<usize>,
     pub state: Option<String>,
+    pub tools_present: bool,
+    pub force_jinja_chat: bool,
 }
 
 impl CoherenceRunOutput {
@@ -97,6 +102,8 @@ impl CoherenceRunOutput {
             "generated_text": self.generated_text,
             "token_ids": self.token_ids,
             "state": self.state,
+            "tools_present": self.tools_present,
+            "force_jinja_chat": self.force_jinja_chat,
             "max_seq": self.max_seq,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
@@ -167,7 +174,7 @@ pub fn decide_agentic(prompt: &str, system: Option<&str>) -> bool {
 pub fn run_coherence(config: &CoherenceRunConfig) -> Result<CoherenceRunOutput, String> {
     let mut bank = build_detector_bank(&config.profile);
     let daemon = find_daemon_binary()?;
-    let mut child = spawn_daemon(&daemon)?;
+    let mut child = spawn_daemon(&daemon, config.force_jinja_chat)?;
 
     let mut params = serde_json::Map::new();
     params.insert("max_seq".to_string(), json!(config.max_seq));
@@ -240,6 +247,8 @@ pub fn run_coherence(config: &CoherenceRunConfig) -> Result<CoherenceRunOutput, 
         repeat_penalty: config.repeat_penalty,
         repeat_window: config.repeat_window,
         state: config.state.clone(),
+        tools_present: config.tools.is_some(),
+        force_jinja_chat: config.force_jinja_chat,
     })
 }
 
@@ -273,6 +282,16 @@ fn drive_generate(
         req.as_object_mut()
             .unwrap()
             .insert("system".to_string(), json!(system));
+    }
+    if let Some(tools) = config.tools.clone() {
+        req.as_object_mut()
+            .unwrap()
+            .insert("tools".to_string(), tools);
+    }
+    if let Some(prefix) = config.assistant_prefix.as_deref() {
+        req.as_object_mut()
+            .unwrap()
+            .insert("assistant_prefix".to_string(), json!(prefix));
     }
     send(d, &req)?;
 
@@ -379,12 +398,15 @@ fn find_daemon_binary() -> Result<PathBuf, String> {
     })
 }
 
-fn spawn_daemon(daemon: &Path) -> Result<DaemonChild, String> {
+fn spawn_daemon(daemon: &Path, force_jinja_chat: bool) -> Result<DaemonChild, String> {
     let mut cmd = Command::new(daemon);
     cmd.env("HIPFIRE_EMIT_TOKEN_IDS", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    if force_jinja_chat {
+        cmd.env("HIPFIRE_JINJA_CHAT", "1");
+    }
     let mut child = cmd.spawn().map_err(|e| format!("spawn daemon: {e}"))?;
     let stdin = child.stdin.take().ok_or("daemon stdin")?;
     let stdout = BufReader::new(child.stdout.take().ok_or("daemon stdout")?);

@@ -21,10 +21,40 @@ flag-level detail; this page is the index.
 | `hipfire serve [host] [port] [-d]` | Start the OpenAI-compatible HTTP server. Accepts `host port` or `host:port` such as `hipfire serve 0.0.0.0:11435`. `-d` detaches into the background and writes a pid file. Defaults: host `0.0.0.0`, port `11435` (`hipfire config set host ...`, `hipfire config set port ...`). |
 | `hipfire stop` | Graceful shutdown of the background daemon. |
 | `hipfire bench <tag>` | Measure prefill + decode tok/s on a fixed prompt set. |
+| `hipfire eval <model>` | Human-default eval: short speed bench plus local baseline comparison. First run creates `~/.hipfire/benchmarks/<model>.speed.json`; later runs compare against it. |
 
 `hipfire run` accepts either a registry tag (`qwen3.5:9b`) or a literal
 file path (`./my.mq4`). For a prompt with shell-special characters,
 quote it: `hipfire run qwen3.5:9b "What's 2+2?"`.
+
+## Evaluation
+
+`hipfire eval` has human presets over the lower-level `hipfire-eval`
+runner:
+
+| Command | Expands to |
+|---|---|
+| `hipfire eval <model>` | `--model <model> --battery speed` plus local baseline capture/comparison. |
+| `hipfire eval speed <model>` | Same as the default form; add `--benchmark` for 5 samples. |
+| `hipfire eval smoke <model>` | `--model <model> --tier fast`. |
+| `hipfire eval admit <candidate> <baseline>` | Candidate-vs-baseline quality/speed/barrage admission with `--fail-on-admission`. |
+| `hipfire eval dflash <target> --draft <draft>` | DFlash battery with `--dflash on`. |
+| `hipfire eval runtime <model>` | Server/runtime admission rows. |
+| `hipfire eval quality <model>` | Quality battery. |
+| `hipfire eval raw --model <model> ...` | Pass flags directly to `hipfire-eval`. |
+
+Examples:
+
+```bash
+hipfire eval ~/.hipfire/models/qwen3.5-4b-mq4.hfq
+hipfire eval speed ~/.hipfire/models/qwen3.5-4b-mq4.hfq --benchmark
+hipfire eval admit candidate.hfq baseline.hfq
+hipfire eval dflash qwen3.5-27b-mq4.hfq --draft qwen3.5-27b-dflash-mq4.hfq
+```
+
+Local default-speed baselines are user-specific and live under
+`~/.hipfire/benchmarks/`. Source-controlled regression baselines remain in
+`benchmarks/perf-baselines/`.
 
 ## Configuration
 
@@ -58,7 +88,7 @@ generate the calibration sidecar:
 Usage:
 
 ```bash
-hipfire sidecar-gen qwen35-27b-dflash-mq4 --corpus my-corpus.txt --max-tokens 8192 --chunk-len 1024 -o /path/to/output.triattn.hfq
+hipfire sidecar-gen qwen3.5-27b-dflash-mq4.hfq --corpus my-corpus.txt --max-tokens 8192 --chunk-len 1024 -o /path/to/output.triattn.hfq
 ```
 
 Flags for `sidecar-gen`:
@@ -93,14 +123,13 @@ See [CONFIG.md](CONFIG.md) for CASK-related configuration keys.
 > **Note:** `sidecar-gen` requires a model file to exist — it does not
 > pull models from HuggingFace. First pull your target: `hipfire pull <tag>`
 > or put your quantized weights alongside the expected filename pattern
-> (`qwen3{ver}-{size}-dflash-{quant}.hfq`). The daemon auto-discovers
+> (`qwen3.5-{size}-dflash-{quant}.hfq`). The daemon auto-discovers
 > `.triattn.hfq` files next to their matching model.
 >
 > **Filename discovery:** When `cask_sidecar` is unset, the daemon looks for
 > a sidecar in the same directory as the model file using
-> `<basename>.triattn.hfq` first, with legacy `.triattn*.bin` files still
-> accepted for released artifacts. If you specify a path with directories
-> (`foo/bar/model.mq4`), it scans `foo/bar/` for the sidecar — not the current
+> `<basename>.triattn.hfq`. If you specify a path with directories
+> (`foo/bar/model.hfq`), it scans `foo/bar/` for the sidecar, not the current
 > working directory.
 
 ## Diagnostics
@@ -116,6 +145,7 @@ See [CONFIG.md](CONFIG.md) for CASK-related configuration keys.
 - Config: `~/.hipfire/config.json`
 - Per-model overlay: `~/.hipfire/per_model_config.json`
 - Local model aliases: `~/.hipfire/models.json`
+- Local eval baselines: `~/.hipfire/benchmarks/`
 - Pre-compiled kernels: `~/.hipfire/bin/kernels/<arch>/`
 - Daemon log: `~/.hipfire/serve.log`
 - Daemon pid file: `~/.hipfire/serve.pid`

@@ -24,7 +24,7 @@ inputs:   z-lab/Qwen3.6-35B-A3B-PARO @ snapshot 0c62664e (HF, public)
           Loaded direct from safetensors via Björn's PARO loader (no HFQ import).
           20 GB on disk.
 env:      HIPFIRE_GRAPH=0 HIPFIRE_KV_MODE=q8 HIPFIRE_DPM_WARMUP_SECS=2
-flags:    bench_qwen35_mq4 <snapshot-dir> --prefill 32 --prefill-runs 2 --warmup 0 --gen N
+flags:    bench_qwen35_speed <snapshot-dir> --prefill 32 --prefill-runs 2 --warmup 0 --gen N
 ```
 
 ## Measurements
@@ -112,7 +112,7 @@ NON-DETERMINISTIC. Likely an uninitialized-memory issue in one of the new
 A3B-PARO MoE kernels that randomly materializes as NaN.
 
 **Fix shipped on `feat/lever-4-gpu-argmax-stability`** (branched off PR #319
-HEAD `bf04d2b4`, pushed to origin): bench_qwen35_mq4 now calls
+HEAD `bf04d2b4`, pushed to origin): bench_qwen35_speed now calls
 `gpu.argmax_f32(&scratch.logits, vocab_size)` instead of
 `download_f32 + llama::argmax`. The GPU argmax kernel uses `>` comparison
 which treats NaN as smaller — graceful fallback (returns index 0 when all

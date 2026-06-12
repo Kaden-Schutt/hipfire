@@ -2,13 +2,13 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Focused perf benchmark for Qwen3.5 MQ4 forward pass.
+//! Focused perf benchmark for Qwen3.5-family forward pass.
 //!
 //! Separates prefill from generation, strips first-run kernel JIT overhead
 //! via an explicit warmup phase, and reports per-token latency stats plus
 //! an effective memory bandwidth estimate (weights_bytes × gen_tok/s).
 //!
-//! Usage: bench_qwen35_mq4 <model.hfq> [--prefill <N>] [--prefill-runs <N>] [--gen <N>] [--warmup <N>]
+//! Usage: bench_qwen35_speed <model.hfq> [--prefill <N>] [--prefill-runs <N>] [--gen <N>] [--warmup <N>]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -19,57 +19,22 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::{self, KvCache};
+    use hipfire_runtime::llama;
+    use hipfire_runtime::speed_bench::{
+        self, file_bytes, kv_mode_from_env, kv_seq_len, maybe_dpm_warmup, new_kv_cache,
+        safetensors_dir_bytes, LatencyStats, SpeedBenchArgs,
+    };
     use std::path::Path;
     use std::time::Instant;
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prefill-runs N] [--gen N] [--warmup N] [--emit-atlas <path.jsonl>]");
-        std::process::exit(1);
-    }
-    let model_path = &args[1];
+    let args = SpeedBenchArgs::parse("bench_qwen35_speed");
+    let model_path = &args.model_path;
+    let prefill_len = args.prefill_len;
+    let prefill_runs = args.prefill_runs;
+    let gen_len = args.gen_len;
+    let warmup_len = args.warmup_len;
 
-    // Defaults: 32-token prefill, 5-token warmup, 100-token bench.
-    let mut prefill_len: usize = 32;
-    let mut prefill_runs: usize = 1;
-    let mut gen_len: usize = 100;
-    let mut warmup_len: usize = 5;
-    // Optional kernel-atlas emission: when set, write one typed AtlasRow
-    // per timed phase (prefill, decode_ar) to this JSONL file. Replaces
-    // stdout-scraping by external collectors like scripts/kernel_atlas.py.
-    let mut atlas_out: Option<String> = None;
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--prefill" => {
-                prefill_len = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--prefill-runs" => {
-                prefill_runs = args[i + 1].parse::<usize>().unwrap().max(1);
-                i += 2;
-            }
-            "--gen" => {
-                gen_len = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--warmup" => {
-                warmup_len = args[i + 1].parse().unwrap();
-                i += 2;
-            }
-            "--emit-atlas" => {
-                atlas_out = Some(args[i + 1].clone());
-                i += 2;
-            }
-            other => {
-                eprintln!("unknown arg: {other}");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    eprintln!("=== bench_qwen35_mq4 ===");
+    eprintln!("=== bench_qwen35_speed ===");
     eprintln!("Model: {model_path}");
     eprintln!("Phases: prefill={prefill_len} prefill_runs={prefill_runs} warmup={warmup_len} gen={gen_len}");
 
@@ -89,16 +54,7 @@ fn main() {
             "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
             config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
         );
-        let bytes = std::fs::read_dir(model_path_buf)
-            .ok()
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
-                    .filter_map(|e| std::fs::metadata(e.path()).ok())
-                    .map(|m| m.len())
-                    .sum::<u64>()
-            })
-            .unwrap_or(0);
+        let bytes = safetensors_dir_bytes(model_path_buf);
         eprintln!(
             "Model size: {:.3} GiB ({} bytes, safetensors)",
             bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -115,7 +71,7 @@ fn main() {
             "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
             config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
         );
-        let bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+        let bytes = file_bytes(model_path_buf);
         eprintln!(
             "Model size: {:.3} GiB ({} bytes)",
             bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -126,46 +82,20 @@ fn main() {
     };
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
-    let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
+    let kv_seq = kv_seq_len(prefill_len, warmup_len, gen_len);
     // KV cache mode via HIPFIRE_KV_MODE env var:
     //   q8 (default) | asym4 | asym3 | asym2
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    let kv_mode = kv_mode_from_env("q8");
     eprintln!("KV mode: {kv_mode}");
-    let mut kv_cache = match kv_mode.as_str() {
-        "q8" => KvCache::new_gpu_q8(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        "asym4" | "turbo4" => KvCache::new_gpu_asym4(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        "asym2" | "turbo2" => KvCache::new_gpu_asym2(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
-        .unwrap(),
-        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4|asym3|asym2)"),
-    };
+    let mut kv_cache = new_kv_cache(
+        &mut gpu,
+        &kv_mode,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        kv_seq,
+    )
+    .unwrap();
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
 
@@ -178,13 +108,7 @@ fn main() {
     // prefill measurement when the GPU is in DPM step 0/1 from idle. This
     // mirrors that hook for the prefill phase: stabilizes clocks before the
     // timed forward_prefill_batch.
-    if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
-        let secs: f32 = secs_str.parse().unwrap_or(0.0);
-        if secs > 0.0 {
-            eprintln!("\n=== DPM warmup ({secs:.1}s, pre-prefill) ===");
-            gpu.dpm_warmup(secs).expect("dpm warmup");
-        }
-    }
+    maybe_dpm_warmup(&mut gpu, Some("pre-prefill")).expect("dpm warmup");
 
     // === PREFILL ===
     // Route through forward_prefill_batch so the bench measures the production
@@ -218,48 +142,15 @@ fn main() {
         .expect("warmup prefill failed");
         // Reset DeltaNet state for the profiled run
         dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
-        kv_cache = match kv_mode.as_str() {
-            "q8" => KvCache::new_gpu_q8(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_seq,
-            )
-            .unwrap(),
-            "asym4" | "turbo4" => KvCache::new_gpu_asym4(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_seq,
-            )
-            .unwrap(),
-            "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_seq,
-            )
-            .unwrap(),
-            "asym2" | "turbo2" => KvCache::new_gpu_asym2(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_seq,
-            )
-            .unwrap(),
-            _ => KvCache::new_gpu_q8(
-                &mut gpu,
-                config.n_layers,
-                config.n_kv_heads,
-                config.head_dim,
-                kv_seq,
-            )
-            .unwrap(),
-        };
+        kv_cache = new_kv_cache(
+            &mut gpu,
+            &kv_mode,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap();
         eprintln!("  JIT complete, profiling next pass...");
         rdna_compute::profile::start();
     }
@@ -367,48 +258,15 @@ fn main() {
         for run in 0..prefill_runs {
             if run > 0 {
                 dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
-                kv_cache = match kv_mode.as_str() {
-                    "q8" => KvCache::new_gpu_q8(
-                        &mut gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
-                    "asym4" | "turbo4" => KvCache::new_gpu_asym4(
-                        &mut gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
-                    "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
-                        &mut gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
-                    "asym2" | "turbo2" => KvCache::new_gpu_asym2(
-                        &mut gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
-                    _ => KvCache::new_gpu_q8(
-                        &mut gpu,
-                        config.n_layers,
-                        config.n_kv_heads,
-                        config.head_dim,
-                        kv_seq,
-                    )
-                    .unwrap(),
-                };
+                kv_cache = new_kv_cache(
+                    &mut gpu,
+                    &kv_mode,
+                    config.n_layers,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    kv_seq,
+                )
+                .unwrap();
             }
             let t_prefill = Instant::now();
             qwen35::forward_prefill_batch(
@@ -554,14 +412,14 @@ fn main() {
     // panic in graph-captured gen warmup blocks the end-of-run SUMMARY).
     eprintln!(
         "PREFILL_SUMMARY  prefill_tok_s={prefill_tok_s:.1}  prefill_wall_ms={prefill_ms:.2}{}",
-        split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms)
+        speed_bench::split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms)
     );
 
     // Atlas row: typed prefill measurement. Emitted right here so it
     // survives any panic in the gen phase. Eliminates the stdout-scrape
     // round-trip the Python harness would otherwise do.
-    if let Some(ref atlas_path) = atlas_out {
-        let mut row = hipfire_atlas::AtlasRow::new("prefill", "bench_qwen35_mq4");
+    if let Some(ref atlas_path) = args.atlas_out {
+        let mut row = hipfire_atlas::AtlasRow::new("prefill", "bench_qwen35_speed");
         row.set_metric_f64("prefill_tok_s", prefill_tok_s)
             .set_metric_f64("prefill_wall_ms", prefill_ms)
             .set_metric_u64("prefill_tokens", prefill_len as u64)
@@ -668,12 +526,7 @@ fn main() {
 
     // HIPFIRE_DPM_WARMUP_SECS: optional DPM-stabilization pass before the
     // timed decode. See crates/rdna-compute/src/dispatch.rs `dpm_warmup`.
-    if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
-        let secs: f32 = secs_str.parse().unwrap_or(0.0);
-        if secs > 0.0 {
-            gpu.dpm_warmup(secs).expect("dpm warmup");
-        }
-    }
+    maybe_dpm_warmup(&mut gpu, None).expect("dpm warmup");
 
     // === GEN BENCHMARK ===
     // HIPFIRE_PROFILE_DECODE=1 wraps the timed gen loop in the per-kernel
@@ -752,55 +605,50 @@ fn main() {
     }
 
     // Stats
-    let mut sorted = per_token_ms.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = sorted.len();
-    if n == 0 {
+    let Some(stats) = LatencyStats::from_samples(&per_token_ms) else {
         eprintln!("  total: {gen_total_ms:.1}ms over 0 tokens");
         eprintln!("  tok/s (gen): 0.0");
         eprintln!();
         eprintln!("SUMMARY  gen_tok_s=0.0  bw_gib_s=0.0  prefill_tok_s={prefill_tok_s:.1}  avg_ms=0.00  p50_ms=0.00{}",
-            split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms));
+            speed_bench::split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms));
         return;
-    }
-    let sum: f64 = sorted.iter().sum();
-    let avg_ms = sum / n as f64;
-    let min_ms = sorted[0];
-    let max_ms = sorted[n - 1];
-    let p50_ms = sorted[n / 2];
-    let p90_ms = sorted[(n * 90) / 100];
-    let p99_ms = sorted[(n.saturating_sub(1) * 99) / 100];
-    let gen_tok_s = n as f64 / (gen_total_ms / 1000.0);
+    };
+    let gen_tok_s = stats.n as f64 / (gen_total_ms / 1000.0);
 
     // BW estimate: each gen token reads ~all weights (minus KV cache writes,
     // which are separate). Effective BW = model_bytes × tok/s.
     let bw_gbps = (model_bytes as f64 * gen_tok_s) / (1024.0 * 1024.0 * 1024.0);
 
-    eprintln!("  total: {gen_total_ms:.1}ms over {n} tokens");
+    eprintln!("  total: {gen_total_ms:.1}ms over {} tokens", stats.n);
     eprintln!("  per-token ms:");
-    eprintln!("    min={min_ms:.2}  p50={p50_ms:.2}  avg={avg_ms:.2}  p90={p90_ms:.2}  p99={p99_ms:.2}  max={max_ms:.2}");
+    eprintln!(
+        "    min={:.2}  p50={:.2}  avg={:.2}  p90={:.2}  p99={:.2}  max={:.2}",
+        stats.min_ms, stats.p50_ms, stats.avg_ms, stats.p90_ms, stats.p99_ms, stats.max_ms
+    );
     eprintln!("  tok/s (gen): {gen_tok_s:.1}");
     eprintln!(
         "  effective BW: {bw_gbps:.1} GiB/s (model {:.2} GiB × {gen_tok_s:.1} tok/s)",
         model_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     eprintln!();
-    eprintln!("SUMMARY  gen_tok_s={gen_tok_s:.1}  bw_gib_s={bw_gbps:.1}  prefill_tok_s={prefill_tok_s:.1}  avg_ms={avg_ms:.2}  p50_ms={p50_ms:.2}{}",
-        split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms));
+    eprintln!("SUMMARY  gen_tok_s={gen_tok_s:.1}  bw_gib_s={bw_gbps:.1}  prefill_tok_s={prefill_tok_s:.1}  avg_ms={:.2}  p50_ms={:.2}{}",
+        stats.avg_ms,
+        stats.p50_ms,
+        speed_bench::split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms));
 
     // Decode atlas row (gen phase). Pairs with the prefill row emitted
     // earlier so a single bench invocation produces two phase-tagged rows.
-    if let Some(ref atlas_path) = atlas_out {
-        let mut row = hipfire_atlas::AtlasRow::new("decode_ar", "bench_qwen35_mq4");
+    if let Some(ref atlas_path) = args.atlas_out {
+        let mut row = hipfire_atlas::AtlasRow::new("decode_ar", "bench_qwen35_speed");
         row.set_metric_f64("gen_tok_s", gen_tok_s)
             .set_metric_f64("bw_gib_s", bw_gbps)
-            .set_metric_f64("avg_ms", avg_ms)
-            .set_metric_f64("p50_ms", p50_ms)
-            .set_metric_f64("p90_ms", p90_ms)
-            .set_metric_f64("p99_ms", p99_ms)
-            .set_metric_f64("min_ms", min_ms)
-            .set_metric_f64("max_ms", max_ms)
-            .set_metric_u64("gen_tokens", n as u64)
+            .set_metric_f64("avg_ms", stats.avg_ms)
+            .set_metric_f64("p50_ms", stats.p50_ms)
+            .set_metric_f64("p90_ms", stats.p90_ms)
+            .set_metric_f64("p99_ms", stats.p99_ms)
+            .set_metric_f64("min_ms", stats.min_ms)
+            .set_metric_f64("max_ms", stats.max_ms)
+            .set_metric_u64("gen_tokens", stats.n as u64)
             .set_metric_str("kv_mode", &kv_mode)
             .set_metric_str("arch", &gpu.arch)
             .set_metric_str("model_path", model_path)
@@ -808,36 +656,5 @@ fn main() {
         if let Err(e) = row.append_to_jsonl(atlas_path) {
             eprintln!("WARN: failed to append atlas row to {atlas_path}: {e}");
         }
-    }
-}
-
-/// Emit the latency-class split for prefill when profiling captured the
-/// per-kernel time. `prefill_tok_s` in the main SUMMARY is the wall-clock
-/// figure (includes first-process JIT compile + graph capture). The
-/// `*_kernel` figures here are steady-state kernel throughput — what every
-/// call after the first one converges to once JIT amortizes. The gap is
-/// `startup_overhead_ms`. AOT-shipped HSACOs should drop that gap to ~0.
-///
-/// Returns an empty string if profiling was disabled so the SUMMARY line
-/// stays parseable by older tooling.
-#[cfg(feature = "deltanet")]
-fn split_prefill_summary(
-    prefill_len: usize,
-    prefill_ms: f64,
-    prefill_kernel_ms: Option<f64>,
-) -> String {
-    if let Some(kernel_ms) = prefill_kernel_ms {
-        let prefill_tok_s_kernel = prefill_len as f64 / (kernel_ms / 1000.0);
-        let startup_overhead_ms = prefill_ms - kernel_ms;
-        let cold_pct = if prefill_ms > 0.0 {
-            (startup_overhead_ms / prefill_ms) * 100.0
-        } else {
-            0.0
-        };
-        format!(
-            "  prefill_tok_s_kernel={prefill_tok_s_kernel:.1}  prefill_kernel_ms={kernel_ms:.2}  startup_overhead_ms={startup_overhead_ms:.2}  cold_overhead_pct={cold_pct:.1}"
-        )
-    } else {
-        String::new()
     }
 }

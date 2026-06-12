@@ -60,6 +60,13 @@ def hfq_to_module_name(hfq_name: str) -> str:
     return name
 
 
+def hfq_module_name_candidates(hfq_name: str) -> list[str]:
+    names = [hfq_to_module_name(hfq_name)]
+    if hfq_name.startswith("model.language_model."):
+        names.append(hfq_name[: -len(".weight")] if hfq_name.endswith(".weight") else hfq_name)
+    return list(dict.fromkeys(names))
+
+
 def safe_key(name: str) -> str:
     return name.replace("/", "__slash__").replace(".", "__dot__")
 
@@ -468,6 +475,21 @@ def model_input_device(model, fallback):
         return fallback
 
 
+def load_calib_transformer(hf_model, **load_kwargs):
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    config = AutoConfig.from_pretrained(hf_model, local_files_only=True, trust_remote_code=True)
+    if (
+        getattr(config, "model_type", None) == "qwen3_5"
+        and hasattr(config, "text_config")
+        and not hasattr(config, "vocab_size")
+    ):
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+
+        return Qwen3_5ForConditionalGeneration.from_pretrained(hf_model, **load_kwargs)
+    return AutoModelForCausalLM.from_pretrained(hf_model, **load_kwargs)
+
+
 def torch_fwht_256(x, signs1, signs2):
     import torch
 
@@ -589,7 +611,12 @@ def install_candidate_mq4_weights(model, candidate_mq4):
         if int(info["quant_type"]) != 13 or len(info["shape"]) != 2:
             continue
         module_name = hfq_to_module_name(name)
-        module = module_map.get(module_name)
+        module = None
+        for candidate_name in hfq_module_name_candidates(name):
+            module = module_map.get(candidate_name)
+            if module is not None:
+                module_name = candidate_name
+                break
         if module is None or not hasattr(module, "weight"):
             missing_modules.append(module_name)
             continue
@@ -619,10 +646,9 @@ def install_candidate_mq4_weights(model, candidate_mq4):
 def collect_stats_candidate_mq4(args, targets, chunks, run_dir):
     import numpy as np
     import torch
-    from transformers import AutoModelForCausalLM
 
     device = torch.device("cpu")
-    model = AutoModelForCausalLM.from_pretrained(
+    model = load_calib_transformer(
         args.hf_model,
         torch_dtype=torch.float32,
         local_files_only=True,
@@ -673,7 +699,11 @@ def collect_stats_candidate_mq4(args, targets, chunks, run_dir):
 
     missing_modules = []
     for item in targets:
-        module = module_map.get(item["module_name"])
+        module = None
+        for module_name in hfq_module_name_candidates(item["hfq_name"]):
+            module = module_map.get(module_name)
+            if module is not None:
+                break
         if module is None:
             missing_modules.append(item["module_name"])
             continue
@@ -732,7 +762,6 @@ def collect_stats_candidate_mq4(args, targets, chunks, run_dir):
 def stats_worker(worker):
     import numpy as np
     import torch
-    from transformers import AutoModelForCausalLM
 
     device_index = int(worker["device"])
     torch.cuda.set_device(device_index)
@@ -759,7 +788,7 @@ def stats_worker(worker):
         max_memory = parse_max_memory(worker.get("max_memory"))
         if max_memory is not None:
             load_kwargs["max_memory"] = max_memory
-    model = AutoModelForCausalLM.from_pretrained(worker["hf_model"], **load_kwargs)
+    model = load_calib_transformer(worker["hf_model"], **load_kwargs)
     if not device_map or device_map == "none":
         model = model.to(device)
     model.eval()
@@ -802,7 +831,11 @@ def stats_worker(worker):
 
     missing_modules = []
     for item in targets:
-        module = module_map.get(item["module_name"])
+        module = None
+        for module_name in hfq_module_name_candidates(item["hfq_name"]):
+            module = module_map.get(module_name)
+            if module is not None:
+                break
         if module is None:
             missing_modules.append(item["module_name"])
             continue

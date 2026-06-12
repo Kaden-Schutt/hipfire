@@ -41,7 +41,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Legacy stdout parsing (migration bridge):");
     eprintln!("  hipfire-atlas parse-bench <bench_stdout.txt> <out.jsonl>");
-    eprintln!("                                              parse a captured bench_qwen35_mq4");
+    eprintln!("                                              parse a captured bench_qwen35_speed");
     eprintln!("                                              stdout into prefill + decode_ar rows");
     eprintln!("  hipfire-atlas parse-dflash <dflash_stdout.txt> <out.jsonl>");
     eprintln!("                                              parse a captured dflash_spec_demo");

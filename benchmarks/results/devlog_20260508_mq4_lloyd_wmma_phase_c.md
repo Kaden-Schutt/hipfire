@@ -46,17 +46,17 @@ numbers + analysis.
 
 | Field | Value |
 |---|---|
-| Tool | `target/release/examples/bench_qwen35_mq4` |
+| Tool | `target/release/examples/bench_qwen35_speed` |
 | Models | `qwen3.5-9b.mq4` (uniform), `qwen3.5-9b.mq4-lloyd` |
 | Flags | `--prefill 256 --warmup 5 --prefill-runs 3 --gen 30` |
 | Env | `HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1` |
 | Cross-process A/B | 3 fresh process invocations × 2 models |
 | In-process samples | 3 timed prefills per invocation; in-process median |
 | Reported metric | mean of in-process medians across the 3 invocations |
-| Bench binary md5 | `71234969e9d9461a5c6fbc86449ba6c4` (target/release/examples/bench_qwen35_mq4 at HEAD `0a34ba6`; identical at HEAD `1934aae`) |
+| Bench binary md5 | `71234969e9d9461a5c6fbc86449ba6c4` (target/release/examples/bench_qwen35_speed at HEAD `0a34ba6`; identical at HEAD `1934aae`) |
 | Model md5 (uniform) | `31a8d8dc7603226801b08d8319015602` (qwen3.5-9b.mq4) |
 | Model md5 (Lloyd)   | `b3eea80aeade0b56c153a054b1143ab2` (qwen3.5-9b.mq4-lloyd) |
-| Prompt | N/A — `bench_qwen35_mq4` generates a deterministic synthetic token sequence (token ids `0..prefill_len`) internally; no user prompt |
+| Prompt | N/A — `bench_qwen35_speed` generates a deterministic synthetic token sequence (token ids `0..prefill_len`) internally; no user prompt |
 
 `--prefill 256` rather than the probe-commits canonical `--prefill 16`
 because 16 is too small to meaningfully exercise the batched-prefill

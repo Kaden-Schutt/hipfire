@@ -146,7 +146,7 @@ One line each, file paths included so future-you doesn't re-investigate:
   `HIPFIRE_MOE_GROUPED_M2=1`, default off. Do not retry without
   N-direction amortization and scatter pad=32.
 - **hipGraph capture/replay for prefill MoE FFN** —
-  `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs`
+  `crates/hipfire-runtime/examples/bench_qwen35_speed.rs`
   `HIPFIRE_GRAPH_PREFILL` branch (commit **42ca533d**; capture-safe
   lm_head fix **d86fafa3**) — −1.6% prefill. ROCm 7.2.2 hipGraph on
   gfx1201 doesn't amortize launch overhead the way decode hipGraph

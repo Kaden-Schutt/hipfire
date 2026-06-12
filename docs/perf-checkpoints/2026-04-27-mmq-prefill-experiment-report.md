@@ -278,9 +278,9 @@ validated again on Strix Halo / gfx1151 in the ROCm 7.2 toolbox.
 Build and binary identity:
 
 ```text
-cargo build --release --features deltanet --example test_hfq4g256QA --example test_inferenceQA --example bench_qwen35_mq4 -p engine
+cargo build --release --features deltanet --example test_hfq4g256QA --example test_inferenceQA --example bench_qwen35_speed -p engine
 
-md5sum target/release/examples/bench_qwen35_mq4
+md5sum target/release/examples/bench_qwen35_speed
 7505b5121044d70847b826f3d084898d
 ```
 

@@ -45,7 +45,7 @@ HISTORY_REJECT_DEMOTE = 48.0
 
 
 def parse_bench_summary(text):
-    """Parse the bench_qwen35_mq4 SUMMARY line."""
+    """Parse the bench_qwen35_speed SUMMARY line."""
     summary = None
     for line in text.splitlines():
         if line.startswith("SUMMARY"):
@@ -3476,7 +3476,7 @@ def build_parser():
     graph.set_defaults(func=graph_ab_from_row)
 
     ar = sub.add_parser("collect-ar", help="collect AR prefill/decode rows")
-    ar.add_argument("--bench", default="./target/release/examples/bench_qwen35_mq4")
+    ar.add_argument("--bench", default="./target/release/examples/bench_qwen35_speed")
     ar.add_argument("--model", required=True)
     ar.add_argument("--workload", default="qwen3.5")
     ar.add_argument("--model-size", default="unknown")

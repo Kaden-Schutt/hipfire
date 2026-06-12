@@ -164,9 +164,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Install local hooks with
 `./tests/no-gpu-ci.sh`; it does not replace the hardware gates. Any
 change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
 or the spec-decode path must pass `./tests/coherence-gate-dflash.sh`
-before commit. The canonical correctness gate is per-arch channel-test;
-the speed-gate catches regressions on the baseline arch. Don't bypass
-either with `--no-verify` — see
+before commit. Model/runtime evidence should be captured through
+`hipfire eval` batteries where available; the shell gates remain the
+hook/enforcement entrypoints when they still provide baseline comparison.
+Server batching, prefix reuse, KV admission, concurrency, and pipeline-parallel
+admission smokes are represented as `hipfire eval --battery runtime` rows;
+install, environment, documentation, and kernel-unit/screening checks remain
+ordinary tests.
+The canonical correctness gate is per-arch channel-test; the speed-gate
+catches regressions on the baseline arch. Don't bypass either with `--no-verify` — see
 [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md).
 
 
@@ -613,16 +619,16 @@ hipfire pull qwen3.5:9b-draft      # 0.55 GB DFlash draft
 ```
 
 Files land at `~/.hipfire/models/<canonical-name>` matching the
-daemon's auto-discovery pattern (`qwen3{ver}-{size}-dflash-{quant}.hfq`).
+daemon's auto-discovery pattern (`qwen3.5-{size}-dflash-{quant}.hfq`).
 **Do not rename.** Renaming breaks the auto-discovery and DFlash falls
 back to AR silently.
 
 ### Verify md5s after pull (paranoid mode)
 
 ```
-qwen35-9b-dflash-mq4.hfq    590f35403cd7f1d634945233234a12b7  557 MB
-qwen35-27b-dflash-mq4.hfq   7b6df2a4ee1c8d933f0a52e187d1860b  919 MB
-qwen36-27b-dflash-mq4.hfq   ecc64877dfe0a1312b6f4066c3920128  919 MB
+qwen3.5-9b-dflash-mq4.hfq   590f35403cd7f1d634945233234a12b7  557 MB
+qwen3.5-27b-dflash-mq4.hfq  7b6df2a4ee1c8d933f0a52e187d1860b  919 MB
+qwen3.6-27b-dflash-mq4.hfq  ecc64877dfe0a1312b6f4066c3920128  919 MB
 qwen3.6-27b.mq4             9a6acdc49bcaa6a7b52ac161444cb769   15 GB
 ```
 
@@ -722,9 +728,9 @@ is killed.
 ### D. DFlash drafts on HuggingFace
 
 Three new HF endpoints (uploaded 2026-04-25, schuttdev account):
-- `schuttdev/hipfire-qwen3.5-9b/qwen35-9b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.5-27b/qwen35-27b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.6-27b/qwen36-27b-dflash-mq4.hfq`
+- `schuttdev/hipfire-qwen3.5-9b/qwen3.5-9b-dflash-mq4.hfq`
+- `schuttdev/hipfire-qwen3.5-27b/qwen3.5-27b-dflash-mq4.hfq`
+- `schuttdev/hipfire-qwen3.6-27b/qwen3.6-27b-dflash-mq4.hfq`
 
 Plus the 3.6 27B target itself: `schuttdev/hipfire-qwen3.6-27b/qwen3.6-27b.mq4`.
 
@@ -751,7 +757,7 @@ gfx1100 (±10–15 % drift from DPM/thermal state). For tight measurements:
 # A: PEP-8 prompt, normalize OFF (un-fixed)
 ./target/release/examples/dflash_spec_demo \
   --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
+  --draft ~/.hipfire/models/qwen3.5-27b-dflash-mq4.hfq \
   --prompt "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
   --max 256 --ctx 2048 --kv-mode q8 --no-adaptive-b --no-chatml
 
@@ -773,7 +779,7 @@ tok/s here, vs. Lucebox's RTX 3090 demo peak):
 PROMPT=$(python3 -c "import json; print([json.loads(l) for l in open('/home/kaden/.hipfire/datasets/HumanEval.jsonl')][53]['prompt'])")
 HIPFIRE_NORMALIZE_PROMPT=1 ./target/release/examples/dflash_spec_demo \
   --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
+  --draft ~/.hipfire/models/qwen3.5-27b-dflash-mq4.hfq \
   --prompt "$PROMPT" \
   --max 256 --ctx 2048 --kv-mode q8 --no-adaptive-b --no-chatml
 ```
@@ -915,7 +921,7 @@ user explicitly updates this fixture section:
 ```bash
 ./target/release/examples/dflash_spec_demo \
   --target /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x \
-  --draft /home/kaden/.hipfire/models/qwen36-35b-a3b-dflash-mq4.hfq \
+  --draft /home/kaden/.hipfire/models/qwen3.6-35b-a3b-dflash-mq4.hfq \
   --prompt-file <allowed-prompt> \
   --max 256 --temp 0.0 --no-chatml --kv-mode q8 --ctx 4096 \
   --block-size 6 --no-adaptive-b

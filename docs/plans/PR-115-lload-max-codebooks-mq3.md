@@ -174,15 +174,15 @@ verify also at runtime load).
 
 ### Step 0 — Bench harness exists
 
-`scripts/probe_commits.sh` is hardcoded to `bench_qwen35_mq4`. Before
+`scripts/probe_commits.sh` is hardcoded to `bench_qwen35_speed`. Before
 any of the perf gate is meaningful, **either**:
 
 - (a) Add `crates/hipfire-runtime/examples/bench_qwen35_mq3_lloyd.rs`
-  mirroring `bench_qwen35_mq4.rs`, point it at
+  mirroring `bench_qwen35_speed.rs`, point it at
   `~/.hipfire/models/qwen3.5-9b.mq3-lloyd`, and teach
   `probe_commits.sh` to take an example name (or fork
   `probe_commits_mq3_lloyd.sh`).
-- (b) Verify that `bench_qwen35_mq4.rs` auto-detects the dtype from
+- (b) Verify that `bench_qwen35_speed.rs` auto-detects the dtype from
   the loaded weights — if so, point it at the `.mq3-lloyd` file
   directly. (Read the example to confirm before relying on this.)
 

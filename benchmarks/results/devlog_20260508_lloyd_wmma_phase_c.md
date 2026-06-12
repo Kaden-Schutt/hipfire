@@ -26,7 +26,7 @@ consistent with prior B2 numbers and not a Lloyd-specific regression.
 
 | Field | Value |
 |---|---|
-| Tool | `target/release/examples/bench_qwen35_mq4` |
+| Tool | `target/release/examples/bench_qwen35_speed` |
 | Models | `qwen3.5-9b.mq3` (uniform), `qwen3.5-9b.mq3-lloyd` |
 | Flags | `--prefill 256 --warmup 5 --prefill-runs 3 --gen 30` |
 | Env | `HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1` |

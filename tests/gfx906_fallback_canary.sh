@@ -36,7 +36,7 @@ if [ ! -f "$MODEL" ]; then
 fi
 
 # Build once — both runs share the binary.
-cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4 \
+cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_speed \
     >/tmp/gfx906_canary_build.log 2>&1 || {
     echo "BUILD FAILED — see /tmp/gfx906_canary_build.log" >&2
     exit 1
@@ -46,7 +46,7 @@ run_bench() {
     local label="$1"; shift
     # Capture last "tok/s:" line emitted by the prefill phase.
     local out
-    out=$("$@" target/release/examples/bench_qwen35_mq4 "$MODEL" \
+    out=$("$@" target/release/examples/bench_qwen35_speed "$MODEL" \
         --prefill "$PREFILL_LEN" --prefill-runs "$PREFILL_RUNS" \
         --warmup 1 --gen 0 2>&1) || {
         echo "  $label: BENCH FAILED" >&2

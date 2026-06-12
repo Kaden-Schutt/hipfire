@@ -77,7 +77,7 @@ regression checks; inspect raw rows when stddev or cv_pct is high.
 For performance admission or regression evidence, prefer:
 
 ```bash
-hipfire eval --model candidate.hfq --battery speed --benchmark --force
+hipfire eval speed candidate.hfq --benchmark --force
 ```
 
 Use `--force` or `--regenerate` for benchmark reruns so stale cached evidence
@@ -127,27 +127,29 @@ HIPFIRE_EVAL_BIN=target/debug/hipfire-eval bash scripts/smoke/eval-harness-nogpu
 Fast local eval:
 
 ```bash
-hipfire eval --model ~/.hipfire/models/qwen3.5-0.8b.mq4 --tier fast
+hipfire eval smoke ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq
+```
+
+Human default speed check:
+
+```bash
+hipfire eval ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq
 ```
 
 Regenerate cached rows for a model:
 
 ```bash
-hipfire eval --model ~/.hipfire/models/qwen3.5-0.8b.mq4 --tier fast --regenerate
+hipfire eval smoke ~/.hipfire/models/qwen3.5-0.8b-mq4.hfq --regenerate
 ```
 
 Candidate-vs-baseline admission:
 
 ```bash
 hipfire eval \
-  --model candidate.hfq \
-  --baseline baseline.hfq \
-  --tier medium \
-  --battery quality,speed,barrage \
+  admit candidate.hfq baseline.hfq \
   --quality-json result-data.json \
   --performance-json perf.json \
   --evidence-dir runtime-evidence \
-  --fail-on-admission
 ```
 
 Opt-in Hugging Face dataset fetch:
@@ -224,8 +226,8 @@ For paired DFlash validation, provide a real draft:
 ```bash
 HIPFIRE_EVAL_BIN=target/debug/hipfire-eval \
 HIPFIRE_EVAL_SMOKE_GROUP=dflash \
-HIPFIRE_EVAL_SMOKE_MODEL=~/.hipfire/models/qwen3.5-27b.mq4 \
-HIPFIRE_EVAL_SMOKE_DRAFT=~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
+HIPFIRE_EVAL_SMOKE_MODEL=~/.hipfire/models/qwen3.5-27b-mq4.hfq \
+HIPFIRE_EVAL_SMOKE_DRAFT=~/.hipfire/models/qwen3.5-27b-dflash-mq4.hfq \
 scripts/smoke/eval-harness-gpu-smoke.sh
 ```
 

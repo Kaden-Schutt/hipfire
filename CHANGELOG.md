@@ -493,7 +493,7 @@ from being preserved.
 
 ### Known issues
 
-- **#60 reporter (@h2252) hit a `--gen 0` panic** on `bench_qwen35_mq4` pre-alpha.2.
+- **#60 reporter (@h2252) hit a `--gen 0` panic** on `bench_qwen35_speed` pre-alpha.2.
   Cannot reproduce on master; many of today's commits could have addressed it
   incidentally. If you hit this on alpha.2, please retry with
   `RUST_BACKTRACE=1` and post the trace on #60.

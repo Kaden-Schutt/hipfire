@@ -13,8 +13,8 @@
 #      FAIL stays FAIL; flips are quality regressions).
 #   2. Total wall-clock within ±10% of the recorded median.
 #
-# Baseline JSON: scripts/pflash-baselines/<arch>-<date>.json
-# Default: scripts/pflash-baselines/gfx1100-2026-05-02.json
+# Baseline JSON: benchmarks/perf-baselines/<gfx>-<hardware-profile-hash>.json
+# Default: auto-select by detected GFX arch.
 #
 # Exit codes:
 #   0  every fixture matches verdict and stays inside ±10%
@@ -22,8 +22,8 @@
 #   2  build / environment error
 #
 # Usage:
-#   ./tests/pflash-gate.sh                # default baseline
-#   ./tests/pflash-gate.sh --baseline scripts/pflash-baselines/<file>.json
+#   ./tests/pflash-gate.sh                # auto-select perf baseline
+#   ./tests/pflash-gate.sh --baseline benchmarks/perf-baselines/<file>.json
 #   ./tests/pflash-gate.sh --tolerance 15 # widen to ±15%
 #
 # Hooks into tests/coherence-gate.sh as a follow-up stage.
@@ -31,7 +31,8 @@
 set -u
 cd "$(dirname "$0")/.."
 
-BASELINE="scripts/pflash-baselines/gfx1100-2026-05-02.json"
+BASELINE="${HIPFIRE_PERF_BASELINE:-}"
+BASELINE_ROOT="${HIPFIRE_PERF_BASELINE_DIR:-benchmarks/perf-baselines}"
 TOLERANCE_PCT=10
 MAXGEN_NIAH=32
 MAXGEN_LONG=64
@@ -46,8 +47,128 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+gfx_target_version_to_arch() {
+    case "$1" in
+        900000) echo "gfx900" ;;
+        906000) echo "gfx906" ;;
+        908000) echo "gfx908" ;;
+        1010000) echo "gfx1010" ;;
+        1030000) echo "gfx1030" ;;
+        1100000|1100001) echo "gfx1100" ;;
+        1105001) echo "gfx1151" ;;
+        1200000) echo "gfx1200" ;;
+        1201000) echo "gfx1201" ;;
+        *) return 1 ;;
+    esac
+}
+
+detect_gfx_arch() {
+    if [ -n "${HIPFIRE_BASELINE_ARCH:-}" ]; then
+        printf '%s\n' "$HIPFIRE_BASELINE_ARCH"
+        return 0
+    fi
+    if command -v hipfire-eval >/dev/null 2>&1; then
+        arch="$(hipfire-eval --version 2>/dev/null | awk '/^arch / {print $2; exit}')"
+        [ -n "$arch" ] && { printf '%s\n' "$arch"; return 0; }
+    fi
+    for exe in ./target/release/hipfire-eval ./target/debug/hipfire-eval; do
+        if [ -x "$exe" ]; then
+            arch="$("$exe" --version 2>/dev/null | awk '/^arch / {print $2; exit}')"
+            [ -n "$arch" ] && { printf '%s\n' "$arch"; return 0; }
+        fi
+    done
+    for props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
+        [ -r "$props" ] || continue
+        raw="$(awk '$1 == "gfx_target_version" {print $2; exit}' "$props")"
+        [ -n "$raw" ] || continue
+        gfx_target_version_to_arch "$raw" && return 0
+    done
+    return 1
+}
+
+select_perf_baseline() {
+    local arch matches count
+    if [ -n "$BASELINE" ]; then
+        printf '%s\n' "$BASELINE"
+        return 0
+    fi
+    arch="$(detect_gfx_arch || true)"
+    if [ -z "$arch" ]; then
+        echo "pflash-gate: could not detect GFX arch; set HIPFIRE_BASELINE_ARCH or --baseline" >&2
+        return 1
+    fi
+    # shellcheck disable=SC2206
+    matches=( "$BASELINE_ROOT/$arch"-*.json )
+    count=0
+    for path in "${matches[@]}"; do
+        [ -f "$path" ] || continue
+        count=$((count + 1))
+        BASELINE="$path"
+    done
+    if [ "$count" -eq 0 ]; then
+        echo "pflash-gate: no perf baseline for $arch under $BASELINE_ROOT" >&2
+        echo "             capture one with hipfire eval, then curate it as $BASELINE_ROOT/$arch-<host_profile_hash>.json" >&2
+        return 1
+    fi
+    if [ "$count" -gt 1 ]; then
+        echo "pflash-gate: multiple perf baselines for $arch; choose one with --baseline or HIPFIRE_PERF_BASELINE" >&2
+        for path in "$BASELINE_ROOT/$arch"-*.json; do
+            [ -f "$path" ] && echo "  $path" >&2
+        done
+        return 1
+    fi
+    printf '%s\n' "$BASELINE"
+}
+
+if ! BASELINE="$(select_perf_baseline)"; then
+    if [ "${HIPFIRE_SKIP_MISSING_PERF_BASELINE:-0}" = "1" ]; then
+        echo "pflash-gate: SKIPPED (no matching perf baseline)"
+        exit 0
+    fi
+    exit 2
+fi
 if [ ! -f "$BASELINE" ]; then
     echo "pflash-gate: baseline not found: $BASELINE" >&2
+    exit 2
+fi
+
+# Read baseline rows. We use python for robust JSON without adding deps.
+if ! BASELINE_INFO_AND_ROWS=$(python3 -c '
+import json, sys
+b = json.load(open(sys.argv[1]))
+schema = b.get("schema", "legacy.pflash_baseline.v0")
+arch = b.get("arch") or b.get("_meta", {}).get("gpu", "unknown").split()[0]
+profile = b.get("hardware_profile_hash") or b.get("_meta", {}).get("gpu", "legacy")
+suite = b.get("baselines", {}).get("pflash_niah")
+if suite is None:
+    suite = b.get("fixtures")
+if not isinstance(suite, list):
+    print("__missing_pflash_suite__|{}|{}|{}".format(schema, arch, profile))
+    raise SystemExit(0)
+print(f"__baseline__|{schema}|{arch}|{profile}")
+for r in suite:
+    print("{}|{}|{}|{}|{}".format(r["label"], r["fixture"], r["mode"], r["total_ms"], r["verdict"]))
+' "$BASELINE"); then
+    echo "pflash-gate: failed to parse perf baseline: $BASELINE" >&2
+    exit 2
+fi
+
+BASELINE_HEADER=$(printf '%s\n' "$BASELINE_INFO_AND_ROWS" | head -1)
+ROWS_JSON=$(printf '%s\n' "$BASELINE_INFO_AND_ROWS" | sed '1d')
+IFS='|' read -r _baseline_tag baseline_schema baseline_arch baseline_profile <<< "$BASELINE_HEADER"
+if [ "$_baseline_tag" = "__missing_pflash_suite__" ]; then
+    if [ "${HIPFIRE_SKIP_MISSING_PERF_BASELINE:-0}" = "1" ]; then
+        echo "pflash-gate: SKIPPED (baseline has no baselines.pflash_niah rows)"
+        exit 0
+    fi
+    echo "pflash-gate: baseline has no baselines.pflash_niah rows: $BASELINE" >&2
+    exit 2
+fi
+
+current_arch="$(detect_gfx_arch || echo unknown)"
+if [ "$current_arch" != "unknown" ] && [ "$baseline_arch" != "unknown" ] && [ "$current_arch" != "$baseline_arch" ]; then
+    echo "pflash-gate: refusing cross-arch perf comparison: current=$current_arch baseline=$baseline_arch" >&2
+    echo "             choose an explicit same-arch baseline with --baseline only if this is intentional" >&2
     exit 2
 fi
 
@@ -129,16 +250,9 @@ if [ -r "$LOCK" ]; then
 fi
 
 echo "pflash-gate: baseline=$BASELINE tolerance=±${TOLERANCE_PCT}%"
+echo "pflash-gate: baseline_schema=$baseline_schema arch=$baseline_arch hardware_profile=$baseline_profile"
 echo "pflash-gate: target=$(basename "$TARGET") drafter=$(basename "$DRAFTER")"
 echo
-
-# Read baseline rows. We use python for robust JSON without adding deps.
-ROWS_JSON=$(python3 -c "
-import json, sys
-b = json.load(open(sys.argv[1]))
-for r in b['fixtures']:
-    print(f\"{r['label']}|{r['fixture']}|{r['mode']}|{r['total_ms']}|{r['verdict']}\")
-" "$BASELINE")
 
 regressions=0
 total_rows=0

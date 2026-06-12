@@ -44,7 +44,7 @@ pub struct ReportHeader {
     /// timer, post-DPM-warmup), `decode_tok_s` is the steady-state decode
     /// rate (post-prefill), `ttft_ms` is real prefill time, `tok_s` is the
     /// daemon's own `total_tokens / total_wall_seconds`. These are the
-    /// numbers to compare against `bench_qwen35_mq4 prefill_tok_s` and
+    /// numbers to compare against `bench_qwen35_speed prefill_tok_s` and
     /// `gen_tok_s`. Zero for non-Qwen35 paths or older daemons.
     pub daemon_prefill_ms: f64,
     pub daemon_prefill_tok_s: f64,

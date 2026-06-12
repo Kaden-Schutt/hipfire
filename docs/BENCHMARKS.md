@@ -106,10 +106,25 @@ skyne98/iacopPBK fork: 63.48 (1.08× ahead).
 hipfire bench qwen3.5:9b
 ```
 
-Runs the canonical bench (pp32 / pp128 / decode) on a fresh build
-against the committed speed-baselines in
-`tests/speed-baselines/<arch>.txt`. The same harness gates
-pre-commit when kernel or dispatch code changes.
+For day-to-day local checks, use:
+
+```bash
+hipfire eval ~/.hipfire/models/qwen3.5-9b-mq4.hfq
+```
+
+That runs the short speed battery and compares it against a personal local
+baseline. If no baseline exists yet, the passing run is saved under
+`~/.hipfire/benchmarks/` for future comparisons.
+
+The canonical source-controlled regression gate still runs through
+`hipfire-eval --battery speed` against committed baselines in
+`benchmarks/perf-baselines/<gfx>-<hardware-profile-hash>.json`. That harness
+gates pre-commit when kernel or dispatch code changes.
+
+Server/runtime admission smokes live under `hipfire-eval --battery runtime`.
+Those rows wrap the server batching, prefix reuse, KV rejection, concurrency,
+and pipeline-parallel gates as evidence rows. Kernel-unit tests, install/env
+checks, and Kernel Atlas audits stay outside the eval ledger.
 
 For DFlash perf comparison, use the prompt-md5-pinned scripts in
 `benchmarks/prompts/` — see `methodology/perf-benchmarking.md` for why

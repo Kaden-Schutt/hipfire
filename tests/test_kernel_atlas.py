@@ -19,7 +19,7 @@ spec.loader.exec_module(kernel_atlas)
 class KernelAtlasTest(unittest.TestCase):
     def test_base_metadata_records_binary_and_diff_provenance(self):
         with tempfile.TemporaryDirectory() as td:
-            binary = Path(td) / "bench_qwen35_mq4"
+            binary = Path(td) / "bench_qwen35_speed"
             binary.write_bytes(b"fake binary")
             diff = " M scripts/kernel_atlas.py\n--- diff body\n"
             diff_md5 = hashlib.md5(diff.encode("utf-8")).hexdigest()
@@ -100,7 +100,7 @@ SUMMARY  gen_tok_s=101.5  bw_gib_s=1512.4  prefill_tok_s=1262.2  avg_ms=9.85  p5
             phase="unused",
             workload="qwen3.5-27b",
             model_path="/models/qwen3.5-27b.mq4",
-            command=["bench_qwen35_mq4", "/models/qwen3.5-27b.mq4"],
+            command=["bench_qwen35_speed", "/models/qwen3.5-27b.mq4"],
             env={"HIPFIRE_KV_MODE": "asym3", "HIPFIRE_GEMV_ROWS": "4"},
             status="ok",
         )
@@ -625,7 +625,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
             "phase": "decode_ar",
             "shape_bucket": "decode_ar_pp32_gen50",
             "metrics": {"gen_tok_s": 192.69, "bw_gib_s": 536.4},
-            "command": ["bench_qwen35_mq4", "/models/qwen3.5-27b.mq4"],
+            "command": ["bench_qwen35_speed", "/models/qwen3.5-27b.mq4"],
             "variant": {"env": {"HIPFIRE_GEMV_ROWS": "4"}},
             "provenance": {"binary_md5": "abc", "diff_md5": "def", "git_dirty": True},
             "artifacts": {
@@ -672,7 +672,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
         self.assertEqual(task["constraints"]["allowed_files"], ["kernels/src/gemv_hfq4g256_multirow.hip"])
         self.assertEqual(task["eval"]["metric"], "gen_tok_s")
         self.assertEqual(task["eval"]["goal"], "maximize")
-        self.assertEqual(task["eval"]["benchmark_command"], ["bench_qwen35_mq4", "/models/qwen3.5-27b.mq4"])
+        self.assertEqual(task["eval"]["benchmark_command"], ["bench_qwen35_speed", "/models/qwen3.5-27b.mq4"])
 
     def test_build_task_bundle_strips_profile_env_and_requires_clean_baseline(self):
         row = {
@@ -761,7 +761,7 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
             "phase": "decode_ar",
             "shape_bucket": "decode_ar_pp32_gen16",
             "metrics": {"gen_tok_s": 72.5},
-            "command": ["bench_qwen35_mq4", "/models/paro4.hfq"],
+            "command": ["bench_qwen35_speed", "/models/paro4.hfq"],
             "variant": {"env": {"HIPFIRE_PROFILE_DECODE": "1", "HIPFIRE_GRAPH": "0"}},
             "artifacts": {
                 "profile_kernels": kernel_atlas.annotate_profile_kernels(

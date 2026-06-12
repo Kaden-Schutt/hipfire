@@ -104,7 +104,7 @@ Doc: `gfx12-asymptote.md`.
 
 ```
 feat/lever-4-gpu-argmax-stability (off fivetide/feat/paroquant-batched-phase2-shared-expert @ bf04d2b4)
-dcf752dc  feat(paroquant-decode): Lever 4 — bench_qwen35_mq4 uses GPU argmax
+dcf752dc  feat(paroquant-decode): Lever 4 — bench_qwen35_speed uses GPU argmax
 ```
 
 Pushed to origin/feat/lever-4-gpu-argmax-stability. Ready to cherry-pick into PR #319.

@@ -146,7 +146,7 @@ Files: `gemm_qkvza_mq4g256_lloyd_wmma_mb4.hip`, `gemm_qkv_mq4g256_lloyd_wmma_mb4
 
 Parity tests extend `test_gemm_fused_mq4g256_lloyd_wmma.rs` similarly.
 
-D-B ship gate: the four-kernel set (residual + 3 fused) collectively reaches the criterion-3 60% Lloyd / uniform ratio on gfx1151 at the canonical bench config (`bench_qwen35_mq4 --prefill 256 --prefill-runs 3`).
+D-B ship gate: the four-kernel set (residual + 3 fused) collectively reaches the criterion-3 60% Lloyd / uniform ratio on gfx1151 at the canonical bench config (`bench_qwen35_speed --prefill 256 --prefill-runs 3`).
 
 ### D-C: dispatch wiring + ship-gate bench
 
@@ -184,7 +184,7 @@ D-B ship gate: the four-kernel set (residual + 3 fused) collectively reaches the
 - `kernels/src/gemm_mq4g256_lloyd_residual_wmma.hip` — Phase A parent for D-A.
 - `kernels/src/gemm_hfq4g256_residual_mmq.hip` — LDS-staging structural reference (fp16-WMMA port of the discipline; not the i8 WMMA primitive).
 - `crates/rdna-compute/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs` — parity test harness; D-A extends with `_mb4` row per shape.
-- `crates/rdna-compute/examples/bench_qwen35_mq4` (via `target/release/examples/bench_qwen35_mq4`) — D-A and D-C use this for cross-process A/B.
+- `crates/rdna-compute/examples/bench_qwen35_speed` (via `target/release/examples/bench_qwen35_speed`) — D-A and D-C use this for cross-process A/B.
 - `docs/skills/gfx-kernel-metadata` — disassembly recipe for the VGPR/spill check.
 - PR #197 — MQ4-Lloyd Phase 5b; D's predecessor.
 - Issue #182 — MQ4-Lloyd implementation tracking; D rolls under this issue.

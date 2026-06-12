@@ -12,8 +12,8 @@ Output format  (default):
      1  F16              36    54.2 MiB   3.6%  (e.g. linear_attn.A_log)
     16  BF16            284  1356.9 MiB  96.4%  (e.g. embed_tokens.weight)
 
---dist-only emits the distribution in the same key=value format used by the
-speed-gate baseline files, suitable for appending to tests/weight-distributions/.
+--dist-only emits a machine-readable key=value distribution that can be stored
+alongside curated perf-baseline evidence when a model file changes.
 """
 
 import struct, sys, os, json

@@ -556,7 +556,7 @@ soft requests:
    up in commit `c28b74f` (no behavior change).
 
 3. (Soft) Bench prompt md5. The pp{32,64,128,256,512} numbers
-   come from `bench_qwen35_mq4 --prefill N` which uses synthetic
+   come from `bench_qwen35_speed --prefill N` which uses synthetic
    token generation (`prompt_tokens = (0..N).collect()`) — no
    external prompt file, so the literal prompt-md5 rule doesn't
    apply. Added `benchmarks/scripts/bench_pp_gfx906.sh` (commit
@@ -901,11 +901,11 @@ for ctr in VALUBusy MemUnitStalled FetchSize VALUUtilization L2CacheHit; do
         target/release/examples/daemon < decode_input.jl
 done
 
-# L2CacheHit pass on bench_qwen35_mq4 (validated working command)
+# L2CacheHit pass on bench_qwen35_speed (validated working command)
 HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
 HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
 rocprof -i pmc_l2.txt -o decode_l2.csv \
-    target/release/examples/bench_qwen35_mq4 \
+    target/release/examples/bench_qwen35_speed \
     $HOME/.hipfire/models/qwen3.5-9b.mq4 \
     --prefill 16 --warmup 1 --gen 128
 

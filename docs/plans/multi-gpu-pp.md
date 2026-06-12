@@ -318,7 +318,7 @@ within one layer's body and does not cross boundaries.
 `crates/hipfire-runtime/examples/{pp_parity,pp_parity_chatml,pp2_vram_probe}.rs`
 (new),
 `docs/multi-gpu.md`,
-`tests/speed-baselines/gfx1100x2_pp.txt` (new).
+`benchmarks/perf-baselines/<gfx>-<hardware-profile-hash>.json` PP rows (new).
 
 - `coherence-gate.sh --pp N`; for changes touching `multi_gpu.rs` or
   forward, run with both `--pp 1` and `--pp 2`.

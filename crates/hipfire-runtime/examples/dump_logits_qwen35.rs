@@ -101,7 +101,7 @@ fn main() {
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
 
-    // Deterministic fake prompt: 0, 1, 2, ... — same as bench_qwen35_mq4.
+    // Deterministic fake prompt: 0, 1, 2, ... — same as bench_qwen35_speed.
     let prompt_tokens: Vec<u32> = (0..prefill_len as u32).collect();
 
     qwen35::forward_prefill_batch(

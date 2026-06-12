@@ -100,7 +100,7 @@ add '| model | ctx | decode tok/s |'
 add '|-------|-----|--------------|'
 for M in 4b 9b 27b; do
     log=$(run_and_capture "ar_${M}" \
-        ./target/release/examples/bench_qwen35_mq4 "${MODELS[$M]}" --max 200 --ctx 4096)
+        ./target/release/examples/bench_qwen35_speed "${MODELS[$M]}" --max 200 --ctx 4096)
     ts=$(extract_tok_s "$log")
     add "| $M | 4096 | $ts |"
 done

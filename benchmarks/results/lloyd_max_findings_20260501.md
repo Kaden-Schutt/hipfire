@@ -71,7 +71,7 @@ uniform MQ3's `scale*q + zero`:
 
 | variant | 9B decode (tok/s, single-window ppl harness) |
 |---|---:|
-| MQ3 uniform | ~141 (per `tests/speed-baselines/gfx1100.txt`) |
+| MQ3 uniform | ~141 (per the legacy gfx1100 speed floor now curated under `benchmarks/perf-baselines/`) |
 | MQ3-Lloyd   | 44 (perplexity harness, 100% per-token) |
 
 The 3× slowdown is real but expected — switch-based codebook lookup is harder

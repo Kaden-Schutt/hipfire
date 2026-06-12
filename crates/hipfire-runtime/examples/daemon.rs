@@ -7243,7 +7243,7 @@ fn main() {
                         // Pins the GPU at high sclk/mclk so the first `generate`
                         // request doesn't pay the 1-10s DPM ramp from idle. Same
                         // `HIPFIRE_DPM_WARMUP_SECS` env the in-process bench tools
-                        // honor (`bench_qwen35_mq4`, `dflash_spec_demo`,
+                        // honor (`bench_qwen35_speed`, `dflash_spec_demo`,
                         // `bench_stream_overlap`); see
                         // `crates/rdna-compute/src/dispatch.rs::dpm_warmup` and
                         // `docs/methodology/perf-benchmarking.md`.

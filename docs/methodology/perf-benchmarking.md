@@ -15,7 +15,7 @@ error.** Warm first, then measure.
 
 Warmup options (any of these is sufficient):
 - `HIPFIRE_DPM_WARMUP_SECS=10` env var on the bench binary
-  (built into `bench_qwen35_mq4`, `dflash_spec_demo`, daemon)
+  (built into `bench_qwen35_speed`, `dflash_spec_demo`, daemon)
 - A throwaway warmup run with the same prompt before the timed run
 - Use `scripts/probe_commits.sh` (handles warmup automatically)
 
@@ -60,9 +60,9 @@ git checkout <candidate>
 
 # 2. Rebuild from clean
 cargo clean -p rdna-compute
-rm -f target/release/examples/bench_qwen35_mq4
+rm -f target/release/examples/bench_qwen35_speed
 cargo build --release --features deltanet -p hipfire-runtime \
-    --example bench_qwen35_mq4
+    --example bench_qwen35_speed
 
 # 3. Run the gate
 ./tests/speed-gate.sh --fast
@@ -84,7 +84,7 @@ one that doesn't probably isn't.
 
 ## Daemon-driven perf measurement
 
-The in-process `bench_qwen35_mq4` and `dflash_spec_demo` examples are
+The in-process `bench_qwen35_speed` and `dflash_spec_demo` examples are
 the canonical perf tools — they run a 10s `dpm_warmup` (memset loop
 that pins the GPU at high sclk/mclk) before the timed gen window, so
 their `gen_tok_s` numbers reflect steady-state silicon throughput.
@@ -122,7 +122,7 @@ Two fixes ship together:
     These come from the `done` event the daemon emits — `prefill_ms`
     is the real `forward_prefill_batch` timer, `decode_tok_s` is
     steady-state post-prefill, `ttft_ms` is real first-prefill-token
-    latency. Apples-to-apples with `bench_qwen35_mq4 prefill_tok_s` /
+    latency. Apples-to-apples with `bench_qwen35_speed prefill_tok_s` /
     `gen_tok_s`.
   - **Probe-derived** (UX framing only, NOT perf-comparable): `tokens:
     N (probe wall A tok/s, probe gen B tok/s, probe ttft Cms)`. The
@@ -199,19 +199,31 @@ batched Q8 lm_head kernel is currently out of scope per
 
 ## Speed-gate baselines
 
-`tests/speed-baselines/<arch>.txt` records the "ground floor" decode
-+ prefill numbers per arch. The pre-commit hook runs
-`tests/speed-gate.sh --fast` automatically when the staged diff
-touches kernel / dispatch / forward-pass files. Tolerance is ±5% from
-the committed baseline.
+For human local checks, prefer the short form:
+
+```bash
+hipfire eval <model.hfq>
+```
+
+On the first successful run, the wrapper writes a personal speed baseline to
+`~/.hipfire/benchmarks/<model>.speed.json`. Later runs compare against that
+same file. These files are intentionally user-local; they are for quick
+same-machine drift detection, not review evidence.
+
+`benchmarks/perf-baselines/<gfx>-<hardware-profile-hash>.json` records
+the curated "ground floor" decode + prefill numbers per hardware profile.
+The pre-commit hook runs `tests/speed-gate.sh --fast` automatically when
+the staged diff touches kernel / dispatch / forward-pass files. The wrapper
+delegates measurement and comparison to `hipfire-eval --battery speed`;
+tolerance comes from the committed perf-baseline JSON.
 
 If a legitimate change trades a small regression on the baseline arch
 for a much bigger win on another arch (rare, but happens), update the
 baseline in the same commit:
 
 ```bash
-./tests/speed-gate.sh --update-baselines
-git add tests/speed-baselines/
+hipfire eval speed <model> --benchmark --force
+git add benchmarks/perf-baselines/
 git commit
 ```
 

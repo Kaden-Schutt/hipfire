@@ -14,7 +14,7 @@ wrapper. The internal profile was missing two-thirds of the actual work.
 mkdir -p /tmp/cov-run
 scripts/rocprof-wrap.sh /tmp/cov-run -- \
     env HIPFIRE_PROFILE=1 \
-    ./target/release/examples/bench_qwen35_mq4 model.hfq \
+    ./target/release/examples/bench_qwen35_speed model.hfq \
         --prefill 256 --gen 1 \
         --emit-atlas /tmp/cov-run/atlas.jsonl
 

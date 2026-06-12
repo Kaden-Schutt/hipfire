@@ -181,7 +181,7 @@ which gates passed. One logical change per PR. Run `cargo fmt` and
 `cargo clippy` before submit; CI enforces both.
 
 For perf claims: include the binary md5
-(`md5sum target/release/examples/bench_qwen35_mq4`) and the prompt
+(`md5sum target/release/examples/bench_qwen35_speed`) and the prompt
 md5 if the bench is prompt-dependent. Without these, the result is
 unreproducible — see
 [docs/methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md).
