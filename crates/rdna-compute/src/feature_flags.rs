@@ -63,6 +63,7 @@ pub struct FeatureFlags {
     pub gfx942_gemv_v3: bool,
     pub gfx942_rmsnorm_split: bool,
     pub gfx942_mfma_prefill: Option<String>,
+    pub conv1d_tree_gfx1151: Option<bool>,
     pub moe_grouped_i8: Option<bool>,
     pub moe_grouped_i8_4w: bool,
     pub moe_grouped_i8_k8: bool,
@@ -198,6 +199,7 @@ impl FeatureFlags {
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942")
                 && std::env::var("HIPFIRE_GFX942_RMSNORM_SPLIT").as_deref() != Ok("0"),
             gfx942_mfma_prefill: std::env::var("HIPFIRE_GFX942_MFMA_PREFILL").ok(),
+            conv1d_tree_gfx1151: parse_bool("HIPFIRE_CONV1D_TREE_GFX1151"),
             moe_grouped_i8: match std::env::var("HIPFIRE_MOE_GROUPED_I8").ok().as_deref() {
                 Some("1") => Some(true),
                 Some("0") => Some(false),
@@ -366,6 +368,7 @@ impl FeatureFlags {
             gfx942_gemv_v3: false,
             gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942"),
             gfx942_mfma_prefill: None,
+            conv1d_tree_gfx1151: None,
             moe_grouped_i8: None,
             moe_grouped_i8_4w: false,
             moe_grouped_i8_k8: false,

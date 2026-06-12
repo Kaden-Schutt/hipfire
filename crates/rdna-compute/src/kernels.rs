@@ -96,11 +96,20 @@ pub const RMSNORM_GFX1151_SRC: &str =
 
 /// gfx1151 parallel-token DeltaNet conv1d+SiLU+QKV split for prefill. Same
 /// ABI as the generic conv1d split kernel plus a companion state update entry.
+#[cfg(feature = "deltanet")]
 pub const CONV1D_SILU_SPLIT_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/conv1d_silu_split.gfx1151.hip");
 
+/// gfx1151 tree-aware DeltaNet conv1d+SiLU+QKV split. Parallelizes across
+/// token rows because tree conv reads parent indices and leaves state
+/// unchanged.
+#[cfg(feature = "deltanet")]
+pub const CONV1D_SILU_SPLIT_TREE_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/conv1d_silu_split_tree.gfx1151.hip");
+
 /// gfx1151 single-token DeltaNet decode fusion: sigmoid/alpha gate plus
 /// conv1d+SiLU+QKV split in one launch. Same math as the generic pair.
+#[cfg(feature = "deltanet")]
 pub const FUSED_SIGMOID_ALPHA_GATE_CONV1D_SILU_SPLIT_GFX1151_SRC: &str = include_str!(
     "../../../kernels/src/gfx1151/fused_sigmoid_alpha_gate_conv1d_silu_split.gfx1151.hip"
 );

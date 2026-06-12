@@ -39254,11 +39254,26 @@ impl Gpu {
         n_tokens: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "conv1d_silu_split_tree",
-            kernels::CONV1D_SILU_SPLIT_TREE_SRC,
-            "conv1d_silu_split_tree_f32",
-        )?;
+        let use_gfx1151 =
+            self.arch_caps.is_gfx1151() && self.flags.conv1d_tree_gfx1151.unwrap_or(true);
+        let (module_name, src, kernel_name, timer_name, grid_y) = if use_gfx1151 {
+            (
+                "conv1d_silu_split_tree_gfx1151",
+                kernels::CONV1D_SILU_SPLIT_TREE_GFX1151_SRC,
+                "conv1d_silu_split_tree_f32_gfx1151",
+                "conv1d_silu_split_tree_f32_n_gfx1151",
+                n_tokens as u32,
+            )
+        } else {
+            (
+                "conv1d_silu_split_tree",
+                kernels::CONV1D_SILU_SPLIT_TREE_SRC,
+                "conv1d_silu_split_tree_f32",
+                "conv1d_silu_split_tree_f32_n",
+                1,
+            )
+        };
+        self.ensure_kernel(module_name, src, kernel_name)?;
         let qp = q_out.buf.as_ptr();
         let kp = k_out.buf.as_ptr();
         let vp = v_out.buf.as_ptr();
@@ -39285,15 +39300,10 @@ impl Gpu {
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
         let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "deltanet",
-            "conv1d_silu_split_tree_f32_n",
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", timer_name, bytes);
         let result = self.launch_maybe_blob(
-            "conv1d_silu_split_tree_f32",
-            [grid, 1, 1],
+            kernel_name,
+            [grid, grid_y, 1],
             [block, 1, 1],
             0,
             &mut params,

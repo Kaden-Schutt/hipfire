@@ -208,7 +208,7 @@ Unique kernels: `conv1d_*`, `fused_sigmoid_alpha_gate`, `alpha_gate`
 |---|---|---|---|---|---|---|
 | conv1d_decode | — | — | — | — | **—** ⚠️ | — |
 | conv1d_gated_decode | — | — | — | — | **—** ⚠️ | — |
-| conv1d_silu / split / routed / tree | — | — | — | — | basic (`split` prefill, decode fusion) | — |
+| conv1d_silu / split / routed / tree | — | — | — | — | basic (`split` prefill, `tree`, decode fusion) | — |
 | fused_sigmoid_alpha_gate | — | — | — | — | basic (decode fusion) | — |
 | alpha_gate | — | — | — | — | — | — |
 
@@ -221,8 +221,17 @@ conv compute row moved from 3274.2us to 1494.3us across 24 calls, plus
 that combines `fused_sigmoid_alpha_gate_f32` with `conv1d_silu_split_f32`,
 removing one launch per linear-attention decode layer while preserving the
 generic math. On Qwen3.6-35B-A3B MQ4, an 8-token profiled decode changed from
-6424 launches / 48.6 tok/s to 6184 launches / 49.5 tok/s. Routed-session and
-tree-verify conv still use generic F32 kernels.
+6424 launches / 48.6 tok/s to 6184 launches / 49.5 tok/s. Routed-session conv
+still uses the generic F32 kernel because it mutates per-session state
+sequentially.
+
+gfx1151 tree conv now has a token-parallel variant for DFlash/tree verify. The
+generic kernel owns one channel per thread and loops over tree tokens; the
+gfx1151 kernel maps one block row per token because tree conv leaves state
+unchanged. On a synthetic DeltaNet tree-conv microbench (`k_dim=128`,
+`v_dim=256`, 1000 trials), `n_tokens=64` moved from 15.760us generic to
+2.729us gfx1151, with smaller trees also winning (`n=4`: 3.112us to 2.261us).
+`HIPFIRE_CONV1D_TREE_GFX1151=0` forces the generic route for A/B checks.
 
 ### DeepSeek V4 Flash + mHC (hipfire-arch-deepseek4)
 
@@ -274,7 +283,7 @@ Ordered by estimated decode-path impact on active hardware.
 |---|---|---|---|
 | 1 | GEMV decode (mq4g256, hfq4g256) | gfx1151 | RDNA3 single-row path is default after R=2/4/8 regressed 4B/9B decode; larger decode-shape tuning remains open |
 | 2 | fused_rmsnorm_mq_rotate / plain rmsnorm BF16 | gfx1151 | Initial wave-reduced gfx1151 paths are wired; broader BF16-native norm coverage remains open |
-| 3 | conv1d + fused_sigmoid_alpha_gate BF16 | gfx1151 | Linear prefill split path is parallelized and decode gate+split is fused; routed/tree conv and BF16-native gate coverage remain generic |
+| 3 | conv1d + fused_sigmoid_alpha_gate BF16 | gfx1151 | Linear prefill split and tree conv are parallelized and decode gate+split is fused; routed conv and BF16-native gate coverage remain generic |
 | 4 | hc_sinkhorn_4x4 + hc_mix_4stream | gfx942 | Every forward pass layer in DeepSeek4; MFMA available but unused |
 | 5 | GEMV decode (mq4g256, hfq4g256) | gfx12 | Only FP8 GEMV exists; MQ4 decode falls back to generic |
 | 6 | deepseek4_attn_swa causal | gfx942, gfx12 | Hot path on MI300X / RX 9070; currently generic F32 |
