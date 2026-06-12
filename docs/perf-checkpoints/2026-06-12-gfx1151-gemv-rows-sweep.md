@@ -9,7 +9,8 @@ Branch: `chaingun`
 gfx115x APUs had been defaulting HFQ4/MQ4 decode GEMV to the RDNA3 multi-row
 path with `R=2`. The open question was whether larger row groups (`R=4` or
 `R=8`) should replace that default for Qwen3.5 dense decode, or whether the
-multi-row path should stay opt-in.
+multi-row path should stay opt-in. A follow-up Qwen3.6-35B-A3B sweep checks
+whether the MoE decode mix needs a different default.
 
 ## Commands
 
@@ -25,12 +26,18 @@ HIPFIRE_GEMV_ROWS=$rows HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
   --example bench_qwen35_mq4 -- \
   ~/.hipfire/models/qwen3.5-9b.mq4.hfq \
   --prefill 32 --prefill-runs 1 --warmup 5 --gen 50
+
+HIPFIRE_GEMV_ROWS=$rows HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
+  target/release/examples/bench_qwen35_mq4 \
+  ~/.hipfire/models/qwen3.6-35b-a3b-mq4.hfq \
+  --prefill 32 --prefill-runs 1 --warmup 3 --gen 20
 ```
 
 Logs:
 
 - `/tmp/gfx1151-gemv-rows-sweep-20260612-094318.log`
 - `/tmp/gfx1151-gemv-rows-sweep-9b-20260612-094335.log`
+- `/tmp/gfx1151-a3b-gemv-rows-20260612-100734.log`
 
 ## Results
 
@@ -44,11 +51,16 @@ Logs:
 | Qwen3.5-9B MQ4 | 2 | 44.0 | 22.58 | 286.8 |
 | Qwen3.5-9B MQ4 | 4 | 42.6 | 23.34 | 281.7 |
 | Qwen3.5-9B MQ4 | 8 | 42.9 | 23.14 | 285.2 |
+| Qwen3.6-35B-A3B MQ4 | 1 | 80.6 | 12.29 | 402.6 |
+| Qwen3.6-35B-A3B MQ4 | 2 | 80.3 | 12.33 | 401.7 |
+| Qwen3.6-35B-A3B MQ4 | 4 | 79.5 | 12.45 | 396.8 |
+| Qwen3.6-35B-A3B MQ4 | 8 | 79.9 | 12.41 | 401.3 |
 
 ## Decision
 
 Keep the RDNA3 multi-row kernels available, but do not default gfx115x to them.
-For the two dense Qwen3.5 decode shapes measured here, the single-row path wins
-or ties within noise and the larger row groups regress. gfx115x now defaults to
-`R=1`; `HIPFIRE_GEMV_ROWS=2/4/8` remains the opt-in tuning hook for future
-larger-shape or server-batched decode experiments.
+For the dense Qwen3.5 decode shapes and the Qwen3.6 A3B decode shape measured
+here, the single-row path wins or ties within noise and the larger row groups
+regress. gfx115x defaults to `R=1`; `HIPFIRE_GEMV_ROWS=2/4/8` remains the
+opt-in tuning hook for future larger-shape or server-batched decode
+experiments.

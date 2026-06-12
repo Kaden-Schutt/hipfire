@@ -53,7 +53,7 @@ These kernels are shared by all model families.
 | gemv hfp4g32 | — | — | — | basic | — | basic (fp8 path) |
 | gemv hfq6g256 | — | — | — | — | — | basic |
 
-gfx1151 now routes HFQ4/MQ4 decode GEMV through the RDNA3 single-row and multi-row sources rather than the generic fallback. A 2026-06-12 rows sweep on Qwen3.5-4B and Qwen3.5-9B found the single-row path fastest for decode (`4B gen50: R1 66.8 tok/s, R2 66.2, R4 66.1, R8 65.8`; `9B gen50: R1 44.2, R2 44.0, R4 42.6, R8 42.9`), so gfx115x defaults back to R=1 while `HIPFIRE_GEMV_ROWS=2/4/8` remains available for larger-shape experiments.
+gfx1151 now routes HFQ4/MQ4 decode GEMV through the RDNA3 single-row and multi-row sources rather than the generic fallback. A 2026-06-12 rows sweep on Qwen3.5-4B, Qwen3.5-9B, and Qwen3.6-35B-A3B found the single-row path fastest for decode (`4B gen50: R1 66.8 tok/s, R2 66.2, R4 66.1, R8 65.8`; `9B gen50: R1 44.2, R2 44.0, R4 42.6, R8 42.9`; `A3B gen20: R1 80.6, R2 80.3, R4 79.5, R8 79.9`), so gfx115x defaults back to R=1 while `HIPFIRE_GEMV_ROWS=2/4/8` remains available for larger-shape experiments.
 
 ### GEMM — prefill projection (compute-bound)
 
