@@ -34,7 +34,8 @@
       - SequenceStateHandle: active session or checkpoint identity.
       - Keep current Qwen35 structs as the backing implementation until descriptors are proven.
     Status: model-worker descriptors now use typed page kinds, include shape metadata, and carry a sequence-state handle identity while still being
-    backed by the current Qwen35 resident session map. Allocator-owned generic pages remain out of scope for this stabilize-first slice.
+    backed by the current Qwen35 resident session map. Runtime-view coverage now explicitly includes the KV, DeltaNet, and logits descriptor triplet
+    needed to audit rollback state. Allocator-owned generic pages remain out of scope for this stabilize-first slice.
 
   - Add MTP/DFlash rollback parity before verify batching. Required invariant: after save, speculative advance, reject/restore, and AR replay, logits
     and next token match the serial reference within explicit tolerance. Keep multi-request verify batching disabled until this passes.

@@ -2243,6 +2243,34 @@ mod generate_batch_prefill_tests {
                         id: "checkpoint-a".to_string(),
                         kind: "qwen35_session".to_string(),
                     },
+                    kind: SequenceStatePageKind::DeltaNet,
+                    label: "qwen35.deltanet_state".to_string(),
+                    logical_position: 16,
+                    resident_bytes: 96,
+                    shape: vec![48, 48, 48],
+                    placement: "hip:arch5:device0".to_string(),
+                    role: "resident".to_string(),
+                },
+                SequenceStatePageDescriptor {
+                    session_id: "checkpoint-a".to_string(),
+                    handle: SequenceStateHandle {
+                        id: "checkpoint-a".to_string(),
+                        kind: "qwen35_session".to_string(),
+                    },
+                    kind: SequenceStatePageKind::Logits,
+                    label: "qwen35.logits_snapshot".to_string(),
+                    logical_position: 16,
+                    resident_bytes: 64,
+                    shape: vec![16],
+                    placement: "hip:arch5:device0".to_string(),
+                    role: "resident".to_string(),
+                },
+                SequenceStatePageDescriptor {
+                    session_id: "checkpoint-a".to_string(),
+                    handle: SequenceStateHandle {
+                        id: "checkpoint-a".to_string(),
+                        kind: "qwen35_session".to_string(),
+                    },
                     kind: SequenceStatePageKind::BackendPrivate,
                     label: "qwen35.prefix_metadata".to_string(),
                     logical_position: 16,
@@ -2256,10 +2284,10 @@ mod generate_batch_prefill_tests {
                 model_file_bytes: 256,
                 model_weight_bytes: 224,
                 runtime_base_bytes: 64,
-                runtime_session_bytes: 160,
-                runtime_state_bytes: 224,
-                total_resident_bytes: 448,
-                evictable_state_bytes: 160,
+                runtime_session_bytes: 320,
+                runtime_state_bytes: 384,
+                total_resident_bytes: 608,
+                evictable_state_bytes: 320,
             },
         };
 
@@ -2267,15 +2295,15 @@ mod generate_batch_prefill_tests {
         assert_eq!(json["state_arena_backend"], "qwen35_wrapped");
         assert_eq!(json["max_seq"], 32768);
         assert_eq!(json["physical_cap"], 2048);
-        assert_eq!(json["state_page_descriptor_entries"], 2);
-        assert_eq!(json["state_page_descriptor_bytes"], 160);
+        assert_eq!(json["state_page_descriptor_entries"], 4);
+        assert_eq!(json["state_page_descriptor_bytes"], 320);
         assert_eq!(json["model_file_bytes"], 256);
         assert_eq!(json["model_weight_bytes"], 224);
         assert_eq!(json["runtime_base_bytes"], 64);
-        assert_eq!(json["runtime_session_bytes"], 160);
-        assert_eq!(json["runtime_state_bytes"], 224);
-        assert_eq!(json["total_resident_bytes"], 448);
-        assert_eq!(json["evictable_state_bytes"], 160);
+        assert_eq!(json["runtime_session_bytes"], 320);
+        assert_eq!(json["runtime_state_bytes"], 384);
+        assert_eq!(json["total_resident_bytes"], 608);
+        assert_eq!(json["evictable_state_bytes"], 320);
         assert_eq!(
             json["state_page_descriptors"][0]["state_kind"],
             "attention_kv"
@@ -2294,9 +2322,30 @@ mod generate_batch_prefill_tests {
         );
         assert_eq!(
             json["state_page_descriptors"][1]["state_kind"],
+            "deltanet_recurrent"
+        );
+        assert_eq!(
+            json["state_page_descriptors"][1]["label"],
+            "qwen35.deltanet_state"
+        );
+        assert_eq!(
+            json["state_page_descriptors"][1]["shape"],
+            serde_json::json!([48, 48, 48])
+        );
+        assert_eq!(json["state_page_descriptors"][2]["state_kind"], "logits");
+        assert_eq!(
+            json["state_page_descriptors"][2]["label"],
+            "qwen35.logits_snapshot"
+        );
+        assert_eq!(
+            json["state_page_descriptors"][2]["shape"],
+            serde_json::json!([16])
+        );
+        assert_eq!(
+            json["state_page_descriptors"][3]["state_kind"],
             "backend_private"
         );
-        assert_eq!(json["state_page_descriptors"][1]["placement"], "host");
+        assert_eq!(json["state_page_descriptors"][3]["placement"], "host");
     }
 
     #[test]

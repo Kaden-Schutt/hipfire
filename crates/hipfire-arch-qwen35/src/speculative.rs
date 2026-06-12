@@ -6123,6 +6123,11 @@ mod tests {
 
     #[test]
     fn spec_rollback_parity_rejects_bad_replay_or_commit_shape() {
+        let empty_commit = spec_rollback_parity_decision(32, 0, 0, 4, 32);
+        assert!(!empty_commit.allow_single_session);
+        assert!(!empty_commit.allow_multi_request_verify_batch);
+        assert_eq!(empty_commit.reason, "empty_commit");
+
         let replay_mismatch = spec_rollback_parity_decision(32, 1, 3, 4, 32);
         assert!(!replay_mismatch.allow_single_session);
         assert_eq!(
