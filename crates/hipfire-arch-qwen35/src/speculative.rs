@@ -775,6 +775,19 @@ pub fn spec_rollback_parity_decision(
     }
 }
 
+pub fn spec_rollback_parity_decision_for_step(
+    start_position: usize,
+    step: &SpecStepResult,
+) -> SpecRollbackParityDecision {
+    spec_rollback_parity_decision(
+        start_position,
+        step.accepted,
+        step.committed.len(),
+        step.drafted.len(),
+        start_position + step.accepted + 1,
+    )
+}
+
 /// Backing storage for a DeltaNetState snapshot. Holds device buffers sized
 /// to match the source state's tensors. Allocate once per slot, reuse across
 /// all speculative cycles.
@@ -6119,6 +6132,49 @@ mod tests {
         assert!(reject.allow_single_session);
         assert!(!reject.allow_multi_request_verify_batch);
         assert_eq!(reject.next_position, 33);
+    }
+
+    #[test]
+    fn spec_rollback_parity_decision_for_step_derives_replay_boundary() {
+        let full_accept_step = SpecStepResult {
+            accepted: 3,
+            bonus_token: 17,
+            drafted: vec![3, 5, 7, 11],
+            committed: vec![2, 5, 7, 11, 17],
+        };
+        let full_accept = spec_rollback_parity_decision_for_step(32, &full_accept_step);
+        assert!(full_accept.allow_single_session);
+        assert!(!full_accept.allow_multi_request_verify_batch);
+        assert_eq!(full_accept.accepted, 3);
+        assert_eq!(full_accept.committed_len, 5);
+        assert_eq!(full_accept.ar_replay_start, 36);
+        assert_eq!(full_accept.next_position, 36);
+
+        let reject_step = SpecStepResult {
+            accepted: 0,
+            bonus_token: 19,
+            drafted: vec![3, 5, 7, 11],
+            committed: vec![2, 19],
+        };
+        let reject = spec_rollback_parity_decision_for_step(32, &reject_step);
+        assert!(reject.allow_single_session);
+        assert!(!reject.allow_multi_request_verify_batch);
+        assert_eq!(reject.ar_replay_start, 33);
+        assert_eq!(reject.next_position, 33);
+    }
+
+    #[test]
+    fn spec_rollback_parity_decision_for_step_rejects_corrupt_step_shape() {
+        let corrupt_step = SpecStepResult {
+            accepted: 2,
+            bonus_token: 17,
+            drafted: vec![3, 5, 7, 11],
+            committed: vec![2, 5, 17],
+        };
+        let decision = spec_rollback_parity_decision_for_step(32, &corrupt_step);
+        assert!(!decision.allow_single_session);
+        assert!(!decision.allow_multi_request_verify_batch);
+        assert_eq!(decision.reason, "commit_shape_mismatch");
     }
 
     #[test]

@@ -13040,13 +13040,7 @@ fn generate_dflash(
                 }
             }
         }
-        let rollback = speculative::spec_rollback_parity_decision(
-            position,
-            step.accepted,
-            step.committed.len(),
-            step.drafted.len(),
-            position + step.accepted + 1,
-        );
+        let rollback = speculative::spec_rollback_parity_decision_for_step(position, &step);
         if !rollback.allow_single_session {
             let _ = writeln!(
                 stdout,
