@@ -124,7 +124,7 @@ impl FeatureFlags {
         let mmq_screen_threshold_default: f32 = if is_gfx906 { 0.50 } else { 0.10 };
 
         let gemv_rows_default: u32 = match arch {
-            "gfx1100" | "gfx1101" | "gfx1102" => 1,
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1152" => 1,
             "gfx1030" | "gfx1031" => 1,
             "gfx906" | "gfx908" | "gfx940" | "gfx941" | "gfx942" => 1,
             _ => 2,
@@ -322,7 +322,7 @@ impl FeatureFlags {
         let is_gfx906 = arch == "gfx906";
 
         let gemv_rows_default: u32 = match arch {
-            "gfx1100" | "gfx1101" | "gfx1102" => 1,
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1152" => 1,
             "gfx1030" | "gfx1031" => 1,
             "gfx906" | "gfx908" | "gfx940" | "gfx941" | "gfx942" => 1,
             _ => 2,

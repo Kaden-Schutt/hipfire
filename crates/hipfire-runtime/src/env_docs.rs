@@ -210,11 +210,10 @@ pub const ENV_HIPFIRE_ALLOW_UNIT_IMATRIX: EnvVarDoc = EnvVarDoc {
     source: "/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5695",
 };
 
-/// `HIPFIRE_ATTN_FLASH` — Honors HIPFIRE_ATTN_FLASH=never\\\\\\\|0\\\\\\\|off as an explicit override
+/// `HIPFIRE_ATTN_FLASH` — Honors HIPFIRE_ATTN_FLASH=never\\\\\\\\|0\\\\\\\\|off as an explicit override
 pub const ENV_HIPFIRE_ATTN_FLASH: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_ATTN_FLASH",
-    description:
-        "Honors HIPFIRE_ATTN_FLASH=never\\\\\\\\\\\\\\|0\\\\\\\\\\\\\\|off as an explicit override",
+    description: "Honors HIPFIRE_ATTN_FLASH=never\\\\\\\\\\\\\\\\|0\\\\\\\\\\\\\\\\|off as an explicit override",
     source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:7635",
 };
 
@@ -2499,6 +2498,14 @@ pub const ENV_TINYLLAMA_GGUF: EnvVarDoc = EnvVarDoc {
     source: "/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/test_q4f16QA.rs:38",
 };
 
+/// `TRIALS` — Runtime variable controlling trials in hipfire.
+pub const ENV_TRIALS: EnvVarDoc = EnvVarDoc {
+    name: "TRIALS",
+    description: "Runtime variable controlling trials in hipfire.",
+    source:
+        "/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_gfx1151_hfq4_s4_mmq.rs:151",
+};
+
 /// `USERPROFILE` — Runtime variable controlling userprofile in hipfire
 pub const ENV_USERPROFILE: EnvVarDoc = EnvVarDoc {
     name: "USERPROFILE",
@@ -2882,6 +2889,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_PROMPT_MODE,
     ENV_QWEN35_TEST_MODEL,
     ENV_TINYLLAMA_GGUF,
+    ENV_TRIALS,
     ENV_USERPROFILE,
     ENV_USE_SAMPLE,
     ENV_VERIFY,

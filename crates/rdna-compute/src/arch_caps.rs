@@ -143,7 +143,7 @@ impl ArchCaps {
         let gemv_dp4a = flags.gemv_dp4a.unwrap_or(is_gfx906);
         let gemv_prefetch = flags.gemv_prefetch.unwrap_or(is_gfx906);
         let gemv_rows_default = flags.gemv_rows.unwrap_or_else(|| {
-            if is_wave64_native || is_rdna2 || is_rdna3_dgpu {
+            if is_wave64_native || is_rdna2 || is_rdna3 {
                 1
             } else {
                 2

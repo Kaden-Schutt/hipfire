@@ -9710,11 +9710,8 @@ impl Gpu {
         };
 
         // Multi-row GEMV: one warp computes R output rows, sharing x register
-        // state across rows. Per-arch default picks R=1 on RDNA3 dGPU
-        // (negative) and RDNA2 (has its own arch-specific narrow path), R=2
-        // on lower-bandwidth RDNA3.5 APUs and the default gfx1010-baseline
-        // path (gfx1010, gfx1013 Cyan Skillfish, etc.). Override any arch
-        // with HIPFIRE_GEMV_ROWS in {1, 2, 4, 8}.
+        // state across rows. Measured RDNA3/RDNA3.5 defaults stay at R=1;
+        // override any arch with HIPFIRE_GEMV_ROWS in {1, 2, 4, 8}.
         //
         // See gemv_rows_default() for the measurement data that motivates
         // the per-arch defaults.
@@ -17605,10 +17602,10 @@ impl Gpu {
         // half the wave masks out per `__shfl_down`. Byte-exact with base.
         let cdna3 = self.arch_caps.is_wave64_native();
 
-        // RDNA3 multi-row path. gfx1100 dGPU defaults to R=1 from measured
-        // regressions; gfx115x APUs default to R=2 unless HIPFIRE_GEMV_ROWS
-        // overrides it. Non-RDNA3 archs still take the single-row residual
-        // path because only the RDNA3 residual multi-row source exists.
+        // RDNA3 multi-row path. RDNA3/RDNA3.5 defaults to R=1 from measured
+        // regressions; HIPFIRE_GEMV_ROWS can still opt into R=2/4/8.
+        // Non-RDNA3 archs take the single-row residual path because only the
+        // RDNA3 residual multi-row source exists.
         let rdna3 = self.arch_caps.is_rdna3();
         let rows = if rdna3 {
             self.arch_caps.gemv_rows_default()
@@ -41204,10 +41201,8 @@ impl Gpu {
                         kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC.to_string(),
                     ));
                 }
-                // RDNA3 multi-row GEMV is opt-in on dGPU via
-                // HIPFIRE_GEMV_ROWS={2,4,8}, but default-on at R=2 for
-                // lower-bandwidth gfx115x APUs. Precompile whenever the
-                // effective row selector asks for it.
+                // RDNA3 multi-row GEMV is opt-in via HIPFIRE_GEMV_ROWS={2,4,8}.
+                // Precompile whenever the effective row selector asks for it.
                 if self.arch_caps.is_rdna3() && self.arch_caps.gemv_rows_default() > 1 {
                     specs.push((
                         "gemv_hfq4g256_multirow_rdna3",

@@ -46,14 +46,14 @@ These kernels are shared by all model families.
 | Kernel group | gfx906 | gfx942 | gfx1030 | gfx1100 | gfx1151 | gfx12 |
 |---|---|---|---|---|---|---|
 | gemv hfq4g256 | — | standard | **tuned** (v1–v5) | standard | standard | — |
-| gemv hfq4g256 multirow | — | — | — | standard | standard (R=2 default) | — |
+| gemv hfq4g256 multirow | — | — | — | standard | standard (opt-in) | — |
 | gemv hfq3g256 | — | — | — | standard | — | — |
 | gemv mq4g256 lloyd | — | — | — | **tuned** (multiacc_diag) | — | — |
 | gemv mq3g256 lloyd | — | — | — | standard | — | — |
 | gemv hfp4g32 | — | — | — | basic | — | basic (fp8 path) |
 | gemv hfq6g256 | — | — | — | — | — | basic |
 
-gfx1151 now routes HFQ4/MQ4 decode GEMV through the RDNA3 single-row and multi-row sources rather than the generic fallback. The R=2 multi-row path is staged by default on gfx115x APUs; early 9B pp32/gen50 A/B was flat within noise, so larger decode-shape tuning remains open.
+gfx1151 now routes HFQ4/MQ4 decode GEMV through the RDNA3 single-row and multi-row sources rather than the generic fallback. A 2026-06-12 rows sweep on Qwen3.5-4B and Qwen3.5-9B found the single-row path fastest for decode (`4B gen50: R1 66.8 tok/s, R2 66.2, R4 66.1, R8 65.8`; `9B gen50: R1 44.2, R2 44.0, R4 42.6, R8 42.9`), so gfx115x defaults back to R=1 while `HIPFIRE_GEMV_ROWS=2/4/8` remains available for larger-shape experiments.
 
 ### GEMM — prefill projection (compute-bound)
 
@@ -272,7 +272,7 @@ Ordered by estimated decode-path impact on active hardware.
 
 | Priority | Gap | Arch | Reason |
 |---|---|---|---|
-| 1 | GEMV decode (mq4g256, hfq4g256) | gfx1151 | RDNA3 R=2 path is wired, but measured flat so further decode-shape tuning remains open |
+| 1 | GEMV decode (mq4g256, hfq4g256) | gfx1151 | RDNA3 single-row path is default after R=2/4/8 regressed 4B/9B decode; larger decode-shape tuning remains open |
 | 2 | fused_rmsnorm_mq_rotate / plain rmsnorm BF16 | gfx1151 | Initial wave-reduced gfx1151 paths are wired; broader BF16-native norm coverage remains open |
 | 3 | conv1d + fused_sigmoid_alpha_gate BF16 | gfx1151 | Linear prefill split path is parallelized and decode gate+split is fused; routed/tree conv and BF16-native gate coverage remain generic |
 | 4 | hc_sinkhorn_4x4 + hc_mix_4stream | gfx942 | Every forward pass layer in DeepSeek4; MFMA available but unused |
