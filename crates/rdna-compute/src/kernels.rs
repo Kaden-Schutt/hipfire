@@ -69,6 +69,12 @@ pub const GEMM_HFQ4G256_MMQ_GFX1151_SRC: &str =
 pub const BENCH_IU4_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gfx1151/bench_iu4_wmma.gfx1151.hip");
 
+/// gfx1151 S4xS4->I32 WMMA tile probe. Synthetic/channel-test only: validates
+/// the signed packed-Q4 activation operand layout needed before any HFQ4/MQ4
+/// IU4 approximation can be evaluated.
+pub const GEMM_S4S4_WMMA_TILE_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gfx1151/gemm_s4s4_wmma_tile.gfx1151.hip");
+
 /// gfx1151 fused RMSNorm + MQ FWHT rotation with wave-reduced RMS. Same
 /// output contract as the generic source; only the RMS reduction topology is
 /// gfx1151-specific.

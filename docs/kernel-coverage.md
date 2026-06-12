@@ -86,6 +86,12 @@ probe. On Qwen3.5-9B MQ4 pp256 it regressed profiled GEMM time
 (`set` 161.4 ms vs 134.6 ms, `add` 85.9 ms vs 61.9 ms), so the existing
 MMQ x16/x32_y64 path remains the default.
 
+gfx1151 IU4 WMMA is available and now has a signed-Q4 tile channel test
+(`test_gfx1151_s4_wmma_tile`) that validates packed S4xS4 -> I32 accumulator
+layout against a CPU dot reference. It is not routed into Qwen yet; the next
+production step is a symmetric Q4 activation scratch plus HFQ4/MQ4 scale and
+zero-point correction quality evaluation.
+
 ### MoE grouped GEMM
 
 | Kernel group | gfx906 | gfx942 | gfx1030 | gfx1100 | gfx1151 | gfx12 |

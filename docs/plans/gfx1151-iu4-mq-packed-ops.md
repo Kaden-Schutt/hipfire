@@ -118,8 +118,11 @@ as a mixed-format transform, not as a drop-in Lloyd kernel replacement.
    The synthetic chain validated accumulator contents and measured IU4 at
    1.883x IU8 throughput on gfx1151.
 2. **Implement Q4 activation scratch.** Add a `block_q4_*_mmq` sibling
-   to the existing Q8_1 scratch. Start with symmetric Q4 unless a zero
-   point is needed for quality.
+   to the existing Q8_1 scratch. The first signed-Q4 layout check is now
+   covered by `test_gfx1151_s4_wmma_tile`, which runs a standalone
+   `v_wmma_i32_16x16x16_iu4` S4×S4 tile against a CPU integer-dot
+   reference for aligned and edge shapes. Start the real scratch path with
+   symmetric Q4 unless a zero point is needed for quality.
 3. **Prototype MQ4/HFQ4 uniform residual MMQ with IU4.** This is the
    cleanest affine case and the best comparison against the existing
    Q8_1 + IU8 MMQ kernel.
