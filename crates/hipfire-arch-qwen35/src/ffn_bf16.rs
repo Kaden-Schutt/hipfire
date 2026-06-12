@@ -126,6 +126,48 @@ pub struct DenseFfnModuleOutput {
     pub mutates_residual: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectionTensorContract {
+    pub input_len: usize,
+    pub output_len: usize,
+    pub weight_rows: usize,
+    pub weight_cols: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectionStateContract {
+    pub reads_kv: bool,
+    pub reads_deltanet: bool,
+    pub uses_attention_gate: bool,
+    pub mutates_residual: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionModuleContract {
+    pub module_kind: &'static str,
+    pub module_id: String,
+    pub layer_idx: usize,
+    pub tensor: ProjectionTensorContract,
+    pub state: ProjectionStateContract,
+    pub preferred_backend: DenseFfnBackendPreference,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionModuleInvocation {
+    pub contract: ProjectionModuleContract,
+    pub selected_backend: DenseFfnBackend,
+    pub fallback_reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectionModuleOutput {
+    pub module_id: String,
+    pub selected_backend: DenseFfnBackend,
+    pub oracle_backend: DenseFfnBackend,
+    pub fallback_reason: Option<&'static str>,
+    pub mutates_residual: bool,
+}
+
 pub fn config() -> &'static FfnBf16Config {
     static CONFIG: OnceLock<FfnBf16Config> = OnceLock::new();
     CONFIG.get_or_init(|| {
@@ -164,6 +206,10 @@ pub fn config() -> &'static FfnBf16Config {
 
 pub fn dense_ffn_module_id(layer_idx: usize) -> String {
     format!("qwen35.layers.{layer_idx}.mlp.swiglu_down")
+}
+
+pub fn attention_wo_module_id(layer_idx: usize) -> String {
+    format!("qwen35.layers.{layer_idx}.attention.wo_residual")
 }
 
 pub fn dense_ffn_swiglu_down_contract(
@@ -278,6 +324,67 @@ pub fn dense_ffn_module_output(
             drift,
             invocation.fallback_reason,
         ),
+        mutates_residual: invocation.contract.state.mutates_residual,
+    }
+}
+
+pub fn attention_wo_residual_contract_from_shape(
+    layer_idx: usize,
+    input_len: usize,
+    output_len: usize,
+    uses_attention_gate: bool,
+    preferred_backend: DenseFfnBackendPreference,
+) -> ProjectionModuleContract {
+    ProjectionModuleContract {
+        module_kind: "qwen35_attention_wo_residual",
+        module_id: attention_wo_module_id(layer_idx),
+        layer_idx,
+        tensor: ProjectionTensorContract {
+            input_len,
+            output_len,
+            weight_rows: output_len,
+            weight_cols: input_len,
+        },
+        state: ProjectionStateContract {
+            reads_kv: false,
+            reads_deltanet: false,
+            uses_attention_gate,
+            mutates_residual: true,
+        },
+        preferred_backend,
+    }
+}
+
+pub fn attention_wo_residual_invocation_from_shape(
+    layer_idx: usize,
+    input_len: usize,
+    output_len: usize,
+    uses_attention_gate: bool,
+    preferred_backend: DenseFfnBackendPreference,
+    npu_available: bool,
+) -> ProjectionModuleInvocation {
+    let contract = attention_wo_residual_contract_from_shape(
+        layer_idx,
+        input_len,
+        output_len,
+        uses_attention_gate,
+        preferred_backend,
+    );
+    let (selected_backend, fallback_reason) =
+        dense_ffn_backend_decision(preferred_backend, npu_available);
+    ProjectionModuleInvocation {
+        contract,
+        selected_backend,
+        fallback_reason,
+    }
+}
+
+pub fn projection_module_output(invocation: &ProjectionModuleInvocation) -> ProjectionModuleOutput {
+    ProjectionModuleOutput {
+        module_id: invocation.contract.module_id.clone(),
+        selected_backend: invocation.selected_backend,
+        oracle_backend: DenseFfnBackend::CpuOracle,
+        fallback_reason: invocation.fallback_reason,
         mutates_residual: invocation.contract.state.mutates_residual,
     }
 }
@@ -575,6 +682,41 @@ mod tests {
             DenseFfnBackend::GpuProduction
         );
         assert_eq!(output.evidence.oracle_backend, DenseFfnBackend::CpuOracle);
+        assert!(output.mutates_residual);
+    }
+
+    #[test]
+    fn attention_wo_invocation_records_projection_shape_and_gate_state() {
+        let invocation = attention_wo_residual_invocation_from_shape(
+            7,
+            2048,
+            4096,
+            true,
+            DenseFfnBackendPreference::GpuProduction,
+            false,
+        );
+        assert_eq!(
+            invocation.contract.module_kind,
+            "qwen35_attention_wo_residual"
+        );
+        assert_eq!(
+            invocation.contract.module_id,
+            "qwen35.layers.7.attention.wo_residual"
+        );
+        assert_eq!(invocation.contract.tensor.input_len, 2048);
+        assert_eq!(invocation.contract.tensor.output_len, 4096);
+        assert_eq!(invocation.contract.tensor.weight_rows, 4096);
+        assert_eq!(invocation.contract.tensor.weight_cols, 2048);
+        assert!(invocation.contract.state.uses_attention_gate);
+        assert!(invocation.contract.state.mutates_residual);
+        assert!(!invocation.contract.state.reads_kv);
+        assert_eq!(invocation.selected_backend, DenseFfnBackend::GpuProduction);
+
+        let output = projection_module_output(&invocation);
+        assert_eq!(output.module_id, invocation.contract.module_id);
+        assert_eq!(output.selected_backend, DenseFfnBackend::GpuProduction);
+        assert_eq!(output.oracle_backend, DenseFfnBackend::CpuOracle);
+        assert_eq!(output.fallback_reason, None);
         assert!(output.mutates_residual);
     }
 }

@@ -48,9 +48,10 @@
       - Evidence records selected backend, module id, drift, and fallback reason.
     Status: the Qwen35 dense FFN BF16 oracle/probe path now exposes a typed `qwen35_dense_ffn_swiglu_down` contract with CPU-oracle,
     GPU-production, and NPU-opt-in backend preferences. The normal GPU production path and compare/cpu probe path now build the same in-place
-    module invocation/output object tying the tensor/state contract to backend selection and output evidence. Compare/cpu probe evidence records
-    module id, selected backend, CPU oracle backend, drift stats when comparing GPU to CPU, and fallback reason. XDNA execution remains reserved
-    until a real NPU backend lands.
+    module invocation/output object tying the tensor/state contract to backend selection and output evidence. The adjacent Qwen35 attention `wo`
+    residual projection now has the same in-place invocation shape on its production helper. Compare/cpu probe evidence records module id, selected
+    backend, CPU oracle backend, drift stats when comparing GPU to CPU, and fallback reason. XDNA execution remains reserved until a real NPU backend
+    lands.
 
   ## Interfaces
 

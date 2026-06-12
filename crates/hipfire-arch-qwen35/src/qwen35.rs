@@ -754,16 +754,51 @@ fn qwen35_apply_fa_gate(
 fn qwen35_attention_wo_residual(
     gpu: &mut Gpu,
     config: &Qwen35Config,
+    layer_idx: usize,
     wo: &WeightTensor,
     attn_out: &GpuTensor,
     residual: &GpuTensor,
     tmp_out: &GpuTensor,
 ) -> HipResult<()> {
+    let invocation = ffn_bf16::attention_wo_residual_invocation_from_shape(
+        layer_idx,
+        wo.k,
+        wo.m,
+        config.attn_output_gate,
+        ffn_bf16::DenseFfnBackendPreference::GpuProduction,
+        false,
+    );
     if config.attn_output_gate {
-        weight_gemv_residual(gpu, wo, attn_out, residual)
+        let result = weight_gemv_residual(gpu, wo, attn_out, residual);
+        if result.is_ok() && ffn_bf16::config().trace {
+            let output = ffn_bf16::projection_module_output(&invocation);
+            eprintln!(
+                "[qwen35 projection module] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={}",
+                output.module_id,
+                invocation.contract.preferred_backend.as_str(),
+                output.selected_backend.as_str(),
+                output.oracle_backend.as_str(),
+                output.fallback_reason.unwrap_or("none"),
+                output.mutates_residual,
+            );
+        }
+        result
     } else {
         weight_gemv(gpu, wo, attn_out, tmp_out)?;
-        gpu.add_inplace_f32(residual, tmp_out)
+        let result = gpu.add_inplace_f32(residual, tmp_out);
+        if result.is_ok() && ffn_bf16::config().trace {
+            let output = ffn_bf16::projection_module_output(&invocation);
+            eprintln!(
+                "[qwen35 projection module] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={}",
+                output.module_id,
+                invocation.contract.preferred_backend.as_str(),
+                output.selected_backend.as_str(),
+                output.oracle_backend.as_str(),
+                output.fallback_reason.unwrap_or("none"),
+                output.mutates_residual,
+            );
+        }
+        result
     }
 }
 
@@ -19451,7 +19486,15 @@ fn run_fa_layer_body(
     }
 
     qwen35_apply_fa_gate(gpu, config, &s.fa_attn_out, &s.fa_gate)?;
-    qwen35_attention_wo_residual(gpu, config, &layer.wo, &s.fa_attn_out, &s.x, &s.o)?;
+    qwen35_attention_wo_residual(
+        gpu,
+        config,
+        layer_idx,
+        &layer.wo,
+        &s.fa_attn_out,
+        &s.x,
+        &s.o,
+    )?;
 
     // FFN: fused rmsnorm + rotate for w_gate/w_up.
     let x_rot = fused_rmsnorm_rotate_for_mq(
@@ -20880,7 +20923,15 @@ fn forward_scratch_layers(
 
                 qwen35_apply_fa_gate(gpu, config, &s.fa_attn_out, &s.fa_gate)?;
                 // Fused wo GEMV + residual add: s.x += layer.wo * s.fa_attn_out
-                qwen35_attention_wo_residual(gpu, config, &layer.wo, &s.fa_attn_out, &s.x, &s.o)?;
+                qwen35_attention_wo_residual(
+                    gpu,
+                    config,
+                    layer_idx,
+                    &layer.wo,
+                    &s.fa_attn_out,
+                    &s.x,
+                    &s.o,
+                )?;
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
@@ -21905,7 +21956,15 @@ fn forward_scratch_layers(
                     gpu,
                     &format!("layer {layer_idx} FullAttnMoe wo residual begin"),
                 )?;
-                qwen35_attention_wo_residual(gpu, config, &layer.wo, &s.fa_attn_out, &s.x, &s.o)?;
+                qwen35_attention_wo_residual(
+                    gpu,
+                    config,
+                    layer_idx,
+                    &layer.wo,
+                    &s.fa_attn_out,
+                    &s.x,
+                    &s.o,
+                )?;
                 trace_stage_sync_if_enabled(
                     gpu,
                     &format!("layer {layer_idx} FullAttnMoe wo residual done"),
@@ -22805,6 +22864,7 @@ fn forward_scratch_layers_multi(
                     qwen35_attention_wo_residual(
                         gpu,
                         config,
+                        layer_idx,
                         &layer.wo,
                         &s.fa_attn_out,
                         &s.x,
@@ -23614,6 +23674,7 @@ fn forward_scratch_layers_multi(
                     qwen35_attention_wo_residual(
                         gpu,
                         config,
+                        layer_idx,
                         &layer.wo,
                         &s.fa_attn_out,
                         &s.x,
