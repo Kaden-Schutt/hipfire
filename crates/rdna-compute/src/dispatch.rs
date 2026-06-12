@@ -19040,8 +19040,8 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let cdna_wave64 = self.arch_caps.is_wave64_native();
-        let (func_name, block, grid_x) = if cdna_wave64 {
+        let two_row = self.arch_caps.is_wave64_native() || self.gfx1151_moe_indexed_2row_enabled();
+        let (func_name, block, grid_x) = if two_row {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_gate_up_indexed_wave64",
                 kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC,
@@ -19388,8 +19388,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let cdna_wave64 = self.arch_caps.is_wave64_native();
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
+        let two_row = self.arch_caps.is_wave64_native() || self.gfx1151_moe_indexed_2row_enabled();
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if two_row {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
                 kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC,
@@ -19581,11 +19581,31 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
-            kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
-        )?;
+        let two_row = self.gfx1151_moe_indexed_2row_enabled();
+        let (kernel_key, kernel_src, func_name, block, grid_div): (
+            &str,
+            &str,
+            &str,
+            [u32; 3],
+            u32,
+        ) = if two_row {
+            (
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_2row_gfx1151",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_2ROW_GFX1151_SRC,
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_2row_gfx1151",
+                [64, 1, 1],
+                2,
+            )
+        } else {
+            (
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+                kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+                "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+                [32, 1, 1],
+                1,
+            )
+        };
+        self.ensure_kernel(kernel_key, kernel_src, func_name)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let rbp = rot_batch.buf.as_ptr();
@@ -19609,10 +19629,11 @@ impl Gpu {
             "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
             bytes,
         );
+        let grid_x = (m as u32 + grid_div - 1) / grid_div;
         let result = self.launch_maybe_blob(
-            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
-            [m as u32, k_top as u32, batch_size as u32],
-            [32, 1, 1],
+            func_name,
+            [grid_x, k_top as u32, batch_size as u32],
+            block,
             0,
             &mut params,
             || {
@@ -24043,6 +24064,24 @@ impl Gpu {
         }
         match *MODE.get_or_init(|| {
             match std::env::var("HIPFIRE_FUSED_HFQ4_2ROW_GFX1151").as_deref() {
+                Ok("0") => Some(false),
+                Ok("1") => Some(true),
+                _ => None,
+            }
+        }) {
+            Some(force) => force,
+            None => false,
+        }
+    }
+
+    fn gfx1151_moe_indexed_2row_enabled(&self) -> bool {
+        static MODE: OnceLock<Option<bool>> = OnceLock::new();
+        if !self.arch.starts_with("gfx1151") {
+            return false;
+        }
+        match *MODE.get_or_init(|| {
+            // Opt-in ("1") gfx1151 two-row indexed MoE HFQ4 decode probe for gate/up and expanded down; default off after flat A3B measurements.
+            match std::env::var("HIPFIRE_MOE_INDEXED_2ROW_GFX1151").as_deref() {
                 Ok("0") => Some(false),
                 Ok("1") => Some(true),
                 _ => None,

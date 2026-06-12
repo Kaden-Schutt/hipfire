@@ -1187,6 +1187,15 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// gfx1151 two-row probe for the atomic-free batched indexed MoE down path.
+/// Same math/output contract as
+/// `GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC`, but packs two
+/// output rows per workgroup for low-batch decode experiments.
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_2ROW_GFX1151_SRC: &str =
+    include_str!(
+        "../../../kernels/src/gfx1151/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_2row.gfx1151.hip"
+    );
+
 /// HFQ4G128 (ParoQuant) variant of the atomic-free batched indexed MoE
 /// down. Same expanded-output contract as the HFQ4G256 sibling; pairs
 /// with `MOE_DOWN_COMBINE_K8_BATCHED_SRC` for the K_TOP fold. Closes the

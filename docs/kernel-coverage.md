@@ -165,6 +165,15 @@ off after flat A3B/9B measurements (`A3B gen12: 52.4 -> 52.7 tok/s`,
 `9B gen12: 38.6 -> 38.7 tok/s`; targeted fused rows unchanged within noise).
 See `docs/perf-checkpoints/2026-06-12-gfx1151-fused-hfq4-2row-null.md`.
 
+gfx1151 indexed MoE HFQ4 decode two-row probe:
+`HIPFIRE_MOE_INDEXED_2ROW_GFX1151=1` routes the indexed gate/up kernels
+through the existing two-row CTA variants and routes the atomic-free expanded
+down path through `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_2row_gfx1151`.
+It is default off after flat A3B measurements (`gen12: 52.5 -> 52.6 tok/s`;
+gate/up `23.2 -> 23.4 ms`, expanded down `16.7 -> 16.8 ms`). Halving the
+workgroup count did not overcome the block64 pressure on Strix Halo. See
+`docs/perf-checkpoints/2026-06-12-gfx1151-moe-indexed-2row-null.md`.
+
 ### Attention
 
 | Kernel group | gfx906 | gfx942 | gfx1030 | gfx1100 | gfx1151 | gfx12 |

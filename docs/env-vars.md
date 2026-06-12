@@ -31,17 +31,18 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_ALLOW_MQ3_LLOYD` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5937` |
 | `HIPFIRE_ALLOW_MQ4_LLOYD` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5987` |
 | `HIPFIRE_ALLOW_UNIT_IMATRIX` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5695` |
-| `HIPFIRE_ATTN_FLASH` | Honors HIPFIRE_ATTN_FLASH=never\\\\\\\\\\|0\\\\\\\\\\|off as an explicit override | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:7635` |
+| `HIPFIRE_ATTN_FLASH` | Honors HIPFIRE_ATTN_FLASH=never\\\\\\\\\\\\\|0\\\\\\\\\\\\\|off as an explicit override | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:7635` |
 | `HIPFIRE_AWQ_F1_ONLY` | bench against the same binary's F2 quant. Default (env unset): | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:4770` |
 | `HIPFIRE_BASELINE_ARCH` | Runtime variable controlling baseline arch in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/coherence_runtime.rs:440` |
-| `HIPFIRE_BF16_DENSE_M128` | Enabled by default; set to 0 to disable | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:42648` |
-| `HIPFIRE_BF16_MOE_M256` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:21810` |
+| `HIPFIRE_BF16_DENSE_M128` | Enabled by default; set to 0 to disable | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:42726` |
+| `HIPFIRE_BF16_MOE_M256` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:21853` |
 | `HIPFIRE_BF16_WEIGHTS` | Qwen35 BF16 weight load policy: unset/"auto" keeps native BF16 on BF16-capable RDNA arches and downgrades to F16 elsewhere; "native" forces BF16, "f16" forces same-size downgrade, "f32"/"legacy" expands for debug | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:207` |
 | `HIPFIRE_BLOB_FORCE` | Graph / capture / deterministic | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:234` |
 | `HIPFIRE_CALIB_PROFILE` | Enable with HIPFIRE_CALIB_PROFILE=1; emits to stderr | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/triattn_validate.rs:40` |
 | `HIPFIRE_CASK_OFF` | HIPFIRE_CASK_OFF=1 is an ops escape hatch: forces no auto-attach | `/home/sadara/.hipfire/src/cli/index.ts:878` |
 | `HIPFIRE_CHATML` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/probe_argmax_agreement.rs:58` |
 | `HIPFIRE_CHAT_TEMPLATE_FILE` | 1. Env-var override | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:8963` |
+| `HIPFIRE_CONV1D_TREE_GFX1151` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_conv1d_tree_gfx1151.rs:22` |
 | `HIPFIRE_DAEMON_BIN` | Runtime variable controlling daemon bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-server/src/daemon/engine.rs:166` |
 | `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling daemon resident state budget mb in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:3998` |
 | `HIPFIRE_DDTREE_BUDGET` | Runtime variable controlling DDTree budget in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:74` |
@@ -104,7 +105,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_DEEPSEEK4_TOP_K` | for local deployment; we honor that as the default. Pure greedy | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/daemon.rs:14631` |
 | `HIPFIRE_DEEPSEEK4_UPLOAD_EXPERTS` | For VRAM-constrained partial-MoE testing, set | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/arch.rs:486` |
 | `HIPFIRE_DEEPSEEK4_WO_MULTIROW` | Multi-row variant if HIPFIRE_DEEPSEEK4_WO_MULTIROW=2 or 4 | `/home/sadara/.hipfire/src/crates/hipfire-arch-deepseek4/src/forward.rs:6295` |
-| `HIPFIRE_DEEPSEEK4_WO_Q8_WMMA` | Runtime variable controlling deepseek4 wo Q8 wmma in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:47712` |
+| `HIPFIRE_DEEPSEEK4_WO_Q8_WMMA` | Runtime variable controlling deepseek4 wo Q8 wmma in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:47790` |
 | `HIPFIRE_DELTANET_STATE` | Interprets "HIPFIRE_DELTANET_STATE" from environment to select behavior | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/greedy_dump_top5.rs:245` |
 | `HIPFIRE_DETERMINISTIC` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:236` |
 | `HIPFIRE_DEVICES` | Runtime variable controlling devices in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:94` |
@@ -144,9 +145,9 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_FORCE_A3B_EVICTION` | Runtime variable controlling force a3b eviction in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:10200` |
 | `HIPFIRE_FP16` | Runtime variable controlling fp16 in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:166` |
 | `HIPFIRE_FP8_WMMA` | Interprets "HIPFIRE_FP8_WMMA" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:157` |
-| `HIPFIRE_FUSED_HFQ4_2ROW_GFX1151` | Opt-in ("1") gfx1151 two-row fused HFQ4 decode probe for QKV/QKVZA; default off after flat A3B/9B measurements | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:24040` |
+| `HIPFIRE_FUSED_HFQ4_2ROW_GFX1151` | Opt-in ("1") gfx1151 two-row fused HFQ4 decode probe for QKV/QKVZA; default off after flat A3B/9B measurements | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:24066` |
 | `HIPFIRE_GATE_UP_VARIANT` | Runtime variable controlling gate up variant in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:196` |
-| `HIPFIRE_GDN_Q8_REG_GFX1151` | Opt-in ("1") gfx1151 register-state GDN Q8 probe; default off after A3B pp256 prefill regressed 11.8 ms to 168.5 ms total GDN time | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:38361` |
+| `HIPFIRE_GDN_Q8_REG_GFX1151` | Opt-in ("1") gfx1151 register-state GDN Q8 probe; default off after A3B pp256 prefill regressed 11.8 ms to 168.5 ms total GDN time | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:38439` |
 | `HIPFIRE_GEMM_DUMP` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:235` |
 | `HIPFIRE_GEMV_ROWS` | Runtime variable controlling gemv rows in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:138` |
 | `HIPFIRE_GEN` | Runtime variable controlling gen in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:25` |
@@ -158,7 +159,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_GPU_SLAB_LOAD` | Runtime variable controlling gpu slab load in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:3511` |
 | `HIPFIRE_GPU_SLAB_MIB` | Parses "HIPFIRE_GPU_SLAB_MIB" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:3192` |
 | `HIPFIRE_GPU_TOPK` | HIPFIRE_GPU_TOPK=1 enables the GPU topk_logits_f32 kernel + CPU | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/infer_qwen35.rs:221` |
-| `HIPFIRE_GQA_CHUNK` | Runtime variable controlling gqa chunk in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:30939` |
+| `HIPFIRE_GQA_CHUNK` | Runtime variable controlling gqa chunk in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:31017` |
 | `HIPFIRE_GQA_FUSED` | Fused variant (opt-in via HIPFIRE_GQA_FUSED=1): single launch | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen2/src/qwen2.rs:1061` |
 | `HIPFIRE_GRAPH` | Used to configure runtime execution by explicitly setting "HIPFIRE_GRAPH" | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/prefill_microbench.rs:119` |
 | `HIPFIRE_GRAPH_MOE` | - gfx11 (RDNA3 / 3.5): default-ON. +0.6-0.7% decode on 9B and | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:7884` |
@@ -166,11 +167,11 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_HAVE_2_GPU` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/tests/pp_parity.rs:193` |
 | `HIPFIRE_HETERO_DIFF` | above (#352's GPU greedy-accept path doesn't materialize it), | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/mtp_spec.rs:2953` |
 | `HIPFIRE_HFQ4G128_MMQ` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:191` |
-| `HIPFIRE_HFQ4G256_MMQ_GFX1151` | gfx1151 one-wave i8-WMMA HFQ4-G256 MMQ control: unset auto-routes aligned K=2048 A3B/shared shapes, "0" forces fallback, "1" forces the probe on aligned shapes | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:24006` |
+| `HIPFIRE_HFQ4G256_MMQ_GFX1151` | gfx1151 one-wave i8-WMMA HFQ4-G256 MMQ control: unset auto-routes aligned K=2048 A3B/shared shapes, "0" forces fallback, "1" forces the probe on aligned shapes | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:24049` |
 | `HIPFIRE_HFQ4_MMQ_GFX906_Y64` | Runtime variable controlling hfQ4 mmq gfx906 y64 in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:194` |
-| `HIPFIRE_HFQ6_QKVZA_4W` | Interprets "HIPFIRE_HFQ6_QKVZA_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:26075` |
-| `HIPFIRE_HFQ6_QKV_4W` | Interprets "HIPFIRE_HFQ6_QKV_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:26828` |
-| `HIPFIRE_HFQ6_RESIDUAL_4W` | Interprets "HIPFIRE_HFQ6_RESIDUAL_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:25682` |
+| `HIPFIRE_HFQ6_QKVZA_4W` | Interprets "HIPFIRE_HFQ6_QKVZA_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:26153` |
+| `HIPFIRE_HFQ6_QKV_4W` | Interprets "HIPFIRE_HFQ6_QKV_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:26906` |
+| `HIPFIRE_HFQ6_RESIDUAL_4W` | Interprets "HIPFIRE_HFQ6_RESIDUAL_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:25760` |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | Parses "HIPFIRE_HIPCC_EXTRA_FLAGS" with fallback defaults | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:261` |
 | `HIPFIRE_HIP_WAIT` | Runtime variable controlling hip wait in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:698` |
 | `HIPFIRE_HOST_PROFILE_BIN` | Runtime variable controlling host profile bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/eval_harness/mod.rs:7969` |
@@ -225,6 +226,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_MOE_GROUPED_M2` | Run m2 kernel (env set) | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:222` |
 | `HIPFIRE_MOE_HFQ6_4W` | Default ON for gfx1151 HFQ6 grouped MoE; set to 0 to use the older v1/v2 path | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:230` |
 | `HIPFIRE_MOE_HFQ6_V2` | Opt-in HFQ6 grouped MoE v2 path; on gfx1151 it only routes when "HIPFIRE_MOE_HFQ6_4W=0" and remains slower than the default 4w path on 122B pp64 | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:226` |
+| `HIPFIRE_MOE_INDEXED_2ROW_GFX1151` | Opt-in ("1") gfx1151 two-row indexed MoE HFQ4 decode probe for gate/up and expanded down; default off after flat A3B measurements | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:24084` |
 | `HIPFIRE_MOE_PARO_I8` | Default-on for gfx1151 since 2026-05-21: i8 MMQ +6.3% over | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:14321` |
 | `HIPFIRE_MOE_PARO_I8_K8` | Runtime variable controlling moe paro i8 k8 in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:14325` |
 | `HIPFIRE_MQ3_MB4` | Helper: run kernel "f" with HIPFIRE_MQ3_MB4 set to "mode", return Y | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_hfq3g256_wmma.rs:92` |
@@ -297,8 +299,8 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_Q8_GATE_UP_4W` | gfx1151 Q8 gate+up 4w control: unset auto-routes aligned N>=128, "0" forces single-wave WMMA, "1" forces 4w for aligned N%64==0 experiments | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:130` |
 | `HIPFIRE_Q8_GATE_UP_BENCH` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:129` |
 | `HIPFIRE_Q8_TOKPAR` | (A) NEW token-parallel | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:174` |
-| `HIPFIRE_Q8_WMMA_4W` | originally shipped default-ON on gfx11/gfx12, but the auto-enable | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28441` |
-| `HIPFIRE_Q8_WMMA_X64` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28252` |
+| `HIPFIRE_Q8_WMMA_4W` | originally shipped default-ON on gfx11/gfx12, but the auto-enable | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28519` |
+| `HIPFIRE_Q8_WMMA_X64` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28330` |
 | `HIPFIRE_QA_KV_MODES` | Defaults to q8,asym4,asym3,asym2 when unset | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/test_inferenceQA.rs:761` |
 | `HIPFIRE_QUANT_DIAG_PATH` | Runtime variable controlling quant diag path in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:10397` |
 | `HIPFIRE_QUANT_THREADS` | Runtime variable controlling quant threads in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5463` |
@@ -361,6 +363,6 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `VERIFY` | VERIFY=1: run the token-parallel path vs the tile_batched fallback on | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:92` |
 | `W64` | Force the candidate into out_tp: W64=1 → dp4a wave64, DP4A=1 → | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:105` |
 
-- Total env vars: **355**
-- `HIPFIRE_*` vars: **321**
+- Total env vars: **358**
+- `HIPFIRE_*` vars: **324**
 - non-`HIPFIRE_*` vars: **34**
