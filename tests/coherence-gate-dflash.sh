@@ -312,6 +312,8 @@ elif ar == df:
     print(json.dumps({"ok": True, "tokens": len(df)}))
 else:
     first = next((i for i, (a, d) in enumerate(zip(ar, df)) if a != d), min(len(ar), len(df)))
+    lo = max(0, first - 4)
+    hi = min(max(len(ar), len(df)), first + 5)
     print(json.dumps({
         "ok": False,
         "reason": "token_mismatch",
@@ -320,6 +322,9 @@ else:
         "dflash_len": len(df),
         "ar_token": ar[first] if first < len(ar) else None,
         "dflash_token": df[first] if first < len(df) else None,
+        "window_start": lo,
+        "ar_window": ar[lo:min(hi, len(ar))],
+        "dflash_window": df[lo:min(hi, len(df))],
     }))
 PYEOF
 )
