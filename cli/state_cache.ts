@@ -228,3 +228,20 @@ export function selectResidentCheckpointEvictions(
     })
     .slice(0, attachable.length - limit);
 }
+
+export function removeAttachableManifestsByRuntimeHandle(
+  caches: Iterable<Map<string, PrefixCheckpointManifest>>,
+  runtimeStateHandle: string,
+): number {
+  if (runtimeStateHandle.length === 0) return 0;
+  let removed = 0;
+  for (const cache of caches) {
+    for (const [key, manifest] of cache.entries()) {
+      if (manifest.runtimeState === "attachable" && manifest.runtimeStateHandle === runtimeStateHandle) {
+        cache.delete(key);
+        removed += 1;
+      }
+    }
+  }
+  return removed;
+}

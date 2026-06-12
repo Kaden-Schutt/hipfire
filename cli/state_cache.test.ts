@@ -6,6 +6,7 @@ import {
   prefixCheckpointCompatible,
   prefixCheckpointDaemonCompatible,
   prefixCheckpointAttachable,
+  removeAttachableManifestsByRuntimeHandle,
   selectResidentCheckpointEvictions,
   spillEligibility,
   touchPrefixCheckpointManifest,
@@ -368,5 +369,48 @@ describe("state cache spill guardrails", () => {
       .toEqual(["cold"]);
     expect(selectResidentCheckpointEvictions([metadataOnly, cold, warm, hot], 0).map((m) => m.runtimeStateHandle))
       .toEqual(["cold", "warm", "hot"]);
+  });
+
+  test("removes only attachable manifests for a stale runtime handle", () => {
+    const stale = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [1],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      runtimeState: "attachable",
+      runtimeStateHandle: "stale",
+      daemonPrefixHash: "00000000000000000000000000000001",
+      daemonPrefixLen: 1,
+      createdAtMs: 1,
+    });
+    const staleResident = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [2],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      runtimeState: "resident",
+      runtimeStateHandle: "stale",
+      createdAtMs: 2,
+    });
+    const other = createPrefixCheckpointManifest({
+      fingerprint,
+      prefixTokens: [3],
+      stateKinds: ["attention_kv"],
+      bytes: 1024,
+      runtimeState: "attachable",
+      runtimeStateHandle: "other",
+      daemonPrefixHash: "00000000000000000000000000000003",
+      daemonPrefixLen: 1,
+      createdAtMs: 3,
+    });
+    const cacheA = new Map([[prefixCheckpointCacheKey(stale), stale]]);
+    const cacheB = new Map([
+      [prefixCheckpointCacheKey(staleResident), staleResident],
+      [prefixCheckpointCacheKey(other), other],
+    ]);
+
+    expect(removeAttachableManifestsByRuntimeHandle([cacheA, cacheB], "stale")).toBe(1);
+    expect(cacheA.size).toBe(0);
+    expect([...cacheB.values()].map((m) => m.runtimeStateHandle)).toEqual(["stale", "other"]);
   });
 });

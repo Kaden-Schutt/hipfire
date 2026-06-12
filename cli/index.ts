@@ -44,6 +44,7 @@ import {
   prefixCheckpointDaemonCompatible,
   prefixCheckpointAttachable,
   prefixCheckpointCacheKey,
+  removeAttachableManifestsByRuntimeHandle,
   selectResidentCheckpointEvictions,
   touchPrefixCheckpointManifest,
   spillEligibility,
@@ -2223,15 +2224,7 @@ async function serve(port: number, host: string) {
     pending.reject(err);
   };
   const removeAttachableManifestsByHandle = (handle: string): number => {
-    let removed = 0;
-    for (const cache of allStateCacheMaps()) {
-      for (const [key, manifest] of cache.entries()) {
-        if (manifest.runtimeStateHandle === handle) {
-          cache.delete(key);
-          removed += 1;
-        }
-      }
-    }
+    const removed = removeAttachableManifestsByRuntimeHandle(allStateCacheMaps(), handle);
     residentCheckpointHandles.delete(handle);
     return removed;
   };
