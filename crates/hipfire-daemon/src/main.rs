@@ -2170,6 +2170,23 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
+    fn fused_prefill_boundary_cuts_cover_multiple_boundaries_and_suffix_replay_fallback() {
+        let multi_cut = vec![
+            test_prefill_boundary_session("req-a", &[1, 2, 3, 4], &[1, 3]),
+            test_prefill_boundary_session("req-b", &[5, 6, 7, 8], &[1, 3]),
+        ];
+        assert_eq!(
+            qwen35_fused_prefill_boundary_cuts(&multi_cut).expect("valid multi-cut layout"),
+            Some(vec![1, 3, 4])
+        );
+
+        let mut replay = test_prefill_boundary_session("req-a", &[1, 2, 3, 4], &[2]);
+        replay.replay_as_generated_suffix = true;
+        let err = qwen35_fused_prefill_boundary_cuts(&[replay]).unwrap_err();
+        assert!(err.contains("only supported for full-prompt prefill"));
+    }
+
+    #[test]
     fn model_worker_runtime_view_json_reports_state_page_descriptors() {
         let worker = ModelWorkerRuntimeView {
             worker_id: ModelWorkerId {
