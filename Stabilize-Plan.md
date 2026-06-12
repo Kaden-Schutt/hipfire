@@ -85,6 +85,12 @@
     verify graph leaves the same raw `qkv` mismatch, so this is not graph replay. The first post-prefill DFlash cycle also differs at position 59
     (`bytes=81920`, `differing_bytes=45778`, `first_offset=0`, `serial_byte=132`, `gdn_byte=88`), which localizes the next blocker to batched
     verify/tape projection parity versus serial decode projection bytes rather than accumulated fast-rollback state.
+    A follow-up serial-tape control shows replay is also not byte-exact when the tape is populated from serial decode projection bytes: position 120
+    still mismatches after a one-step serial-captured tape replay (`s_matrix[0]`, `differing_bytes=169326`, `first_offset=8`, `serial_byte=190`,
+    `serial_tape_byte=189`). Position 59 with two replay steps similarly mismatches. This rules out Q8 recurrence cadence alone and points at the
+    pre-GDN replay segment: serial decode uses gfx1151's fused sigmoid/alpha-gate + conv1d/SiLU/split kernel, while GDN tape replay currently stores
+    post-gate alpha/beta and replays through the separate conv-only path. Fast replay needs either raw pre-gate alpha/beta capture plus the exact
+    fused serial kernel shape, or a proven byte-exact conv-only replay variant, before it can graduate from diagnostic mode.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

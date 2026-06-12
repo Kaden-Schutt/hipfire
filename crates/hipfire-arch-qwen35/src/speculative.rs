@@ -4449,6 +4449,8 @@ pub fn spec_step_dflash(
                     i,
                 )?;
             }
+            let mut serial_result = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
+            serial_result.save_from(&target.dn_state, gpu)?;
             match serial_tape.compare_captured_inputs_to(gpu, tape, accept_len + 1)? {
                 Some(diff) => eprintln!(
                     "[dflash-rollback-input-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}",
@@ -4470,6 +4472,36 @@ pub fn spec_step_dflash(
                     accept_len + 1,
                 ),
             }
+            target_snap.restore_to(&mut target.dn_state, gpu)?;
+            serial_tape.replay_gdn(
+                gpu,
+                &target.weights,
+                &target.config,
+                &mut target.dn_state,
+                accept_len + 1,
+            )?;
+            match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &serial_result)? {
+                Some(diff) => eprintln!(
+                    "[dflash-rollback-serial-tape-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} serial_tape_byte={}",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                    diff.family,
+                    diff.index,
+                    diff.bytes,
+                    diff.differing_bytes,
+                    diff.first_offset,
+                    diff.expected_byte,
+                    diff.actual_byte,
+                ),
+                None => eprintln!(
+                    "[dflash-rollback-serial-tape-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+            }
+            serial_result.restore_to(&mut target.dn_state, gpu)?;
             match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &gdn_result)? {
                 Some(diff) => eprintln!(
                     "[dflash-rollback-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}",
@@ -4492,6 +4524,7 @@ pub fn spec_step_dflash(
                 ),
             }
             serial_tape.free_gpu(gpu);
+            serial_result.free_gpu(gpu);
             gdn_result.restore_to(&mut target.dn_state, gpu)?;
             gdn_result.free_gpu(gpu);
         }
