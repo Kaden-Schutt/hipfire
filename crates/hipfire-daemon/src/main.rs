@@ -778,6 +778,7 @@ struct GenerateBatchDecodeEnvelope {
     id: String,
     batch_id: String,
     session_count: usize,
+    cached_prefix_tokens: usize,
     sessions: Vec<GenerateBatchDecodeSession>,
 }
 
@@ -908,6 +909,7 @@ fn qwen35_decode_batch_scheduler_metadata(
     arch_id: u32,
     backend: Qwen35DecodeBatchBackend,
     batch_size: usize,
+    cached_prefix_tokens: usize,
 ) -> Qwen35DecodeBatchSchedulerMetadata {
     let fallback_reason = if qwen35_decode_batch_requested_auto(requested) {
         match (arch_id, backend) {
@@ -929,7 +931,7 @@ fn qwen35_decode_batch_scheduler_metadata(
         selected_backend: backend.as_str(),
         batch_size,
         compatible_state_kinds: vec!["attention_kv", "deltanet_recurrent"],
-        cached_prefix_tokens: 0,
+        cached_prefix_tokens,
         fallback_reason,
     }
 }
@@ -1587,6 +1589,16 @@ fn validate_generate_batch_decode(
     if sessions.is_empty() {
         return Err("generate_batch_decode_step.sessions must not be empty".to_string());
     }
+    let cached_prefix_tokens = msg
+        .get("cached_prefix_tokens")
+        .map(|v| {
+            v.as_u64().map(|n| n as usize).ok_or_else(|| {
+                "generate_batch_decode_step.cached_prefix_tokens must be an integer >= 0"
+                    .to_string()
+            })
+        })
+        .transpose()?
+        .unwrap_or(0);
     let mut seen_ids = HashSet::new();
     let mut parsed = Vec::with_capacity(sessions.len());
     for (i, session) in sessions.iter().enumerate() {
@@ -1635,6 +1647,7 @@ fn validate_generate_batch_decode(
     Ok(GenerateBatchDecodeEnvelope {
         id,
         batch_id,
+        cached_prefix_tokens,
         session_count: sessions.len(),
         sessions: parsed,
     })
@@ -1926,6 +1939,7 @@ mod generate_batch_prefill_tests {
             "id": "decode-1",
             "batch_id": "decode-batch-1",
             "worker_key_id": "worker-a",
+            "cached_prefix_tokens": 12,
             "sessions": [
                 {
                     "id": "req-1",
@@ -1946,6 +1960,7 @@ mod generate_batch_prefill_tests {
         assert_eq!(envelope.id, "decode-1");
         assert_eq!(envelope.batch_id, "decode-batch-1");
         assert_eq!(envelope.session_count, 2);
+        assert_eq!(envelope.cached_prefix_tokens, 12);
         assert_eq!(
             envelope.sessions[0].session_id,
             "qwen35-checkpoint:batch:req-1:8"
@@ -1981,6 +1996,21 @@ mod generate_batch_prefill_tests {
         });
         let err = validate_generate_batch_decode(&zero_remaining).unwrap_err();
         assert!(err.contains("max_tokens_remaining"));
+
+        let invalid_cached_prefix = serde_json::json!({
+            "type": "generate_batch_decode_step",
+            "batch_id": "decode-batch-1",
+            "worker_key_id": "worker-a",
+            "cached_prefix_tokens": -1,
+            "sessions": [{
+                "id": "req-1",
+                "session_id": "runtime-1",
+                "logical_position": 8,
+                "max_tokens_remaining": 1
+            }]
+        });
+        let err = validate_generate_batch_decode(&invalid_cached_prefix).unwrap_err();
+        assert!(err.contains("cached_prefix_tokens"));
     }
 
     #[test]
@@ -2731,6 +2761,7 @@ mod generate_batch_prefill_tests {
             6,
             Qwen35DecodeBatchBackend::SerialReference,
             8,
+            7,
         );
         assert_eq!(auto_grouped.selected_backend, "serial_reference");
         assert_eq!(auto_grouped.batch_size, 8);
@@ -2738,7 +2769,7 @@ mod generate_batch_prefill_tests {
             auto_grouped.compatible_state_kinds,
             vec!["attention_kv", "deltanet_recurrent"]
         );
-        assert_eq!(auto_grouped.cached_prefix_tokens, 0);
+        assert_eq!(auto_grouped.cached_prefix_tokens, 7);
         assert_eq!(
             auto_grouped.fallback_reason,
             "auto_grouped_moe_serial_pending_latency_gate"
@@ -2749,6 +2780,7 @@ mod generate_batch_prefill_tests {
             6,
             Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked,
             4,
+            0,
         );
         assert_eq!(
             explicit_grouped.selected_backend,
@@ -2761,6 +2793,7 @@ mod generate_batch_prefill_tests {
             5,
             Qwen35DecodeBatchBackend::SerialReference,
             2,
+            0,
         );
         assert_eq!(
             explicit_serial.fallback_reason,
@@ -6935,6 +6968,7 @@ fn run_generate_batch_decode_step_qwen35(
         m.arch_id,
         backend,
         envelope.session_count,
+        envelope.cached_prefix_tokens,
     );
     let done = serde_json::json!({
         "type": "generate_batch_decode_step_done",

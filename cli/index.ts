@@ -6493,12 +6493,14 @@ async function serve(port: number, host: string) {
             safeRelease();
             return memoryReject;
           }
+          const decodeLogicalPosition = Number(genParams.prefilled_prompt_tokens ?? prefillPromptTokens.length);
           const active: ActiveDecodeSession = {
             id: reqId,
             workerKeyId,
             priority: requestPriority,
             runtimeStateHandle: releaseRuntimeSessionId,
-            logicalPosition: Number(genParams.prefilled_prompt_tokens ?? prefillPromptTokens.length),
+            logicalPosition: decodeLogicalPosition,
+            cachedPrefixTokens: decodeLogicalPosition,
             generatedTokens: 0,
             maxTokens: requestMaxTokens,
           };
@@ -6564,11 +6566,16 @@ async function serve(port: number, host: string) {
                 while ([...states.values()].some((state) => !state.done && state.generatedTokens < state.maxTokens)) {
                   const activeSessions = [...states.values()].filter((state) => !state.done && state.generatedTokens < state.maxTokens);
                   const batchId = `decode-${reqId}-${decodeBatchMetrics.totalBatches + 1}`;
+                  const decodeCachedPrefixTokens = activeSessions.reduce(
+                    (sum, state) => sum + Math.max(0, state.cachedPrefixTokens),
+                    0,
+                  );
                   await e.send({
                     type: "generate_batch_decode_step",
                     id: `${batchId}-step`,
                     batch_id: batchId,
                     worker_key_id: workerKeyId,
+                    cached_prefix_tokens: decodeCachedPrefixTokens,
                     sessions: activeSessions.map((state) => ({
                       id: state.id,
                       session_id: state.runtimeStateHandle,

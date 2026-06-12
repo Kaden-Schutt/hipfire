@@ -32,6 +32,7 @@ export interface ActiveDecodeSession {
   priority: number;
   runtimeStateHandle: string;
   logicalPosition: number;
+  cachedPrefixTokens: number;
   generatedTokens: number;
   maxTokens: number;
 }

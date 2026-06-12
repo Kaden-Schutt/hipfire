@@ -235,6 +235,8 @@ def run_scenario(run_backend: str, run_expected_backend: str, log_prefix: str) -
             raise RuntimeError(f"server decode did not expose compatible state kinds: {checks}; log={log_path}")
         if checks["decode_cached_prefix_tokens"] is None:
             raise RuntimeError(f"server decode did not expose cached prefix token metadata: {checks}; log={log_path}")
+        if int(checks["decode_cached_prefix_tokens"] or 0) <= 0:
+            raise RuntimeError(f"server decode did not preserve cached prefix token metadata: {checks}; log={log_path}")
         if not isinstance(checks["decode_fallback_reason"], str) or not checks["decode_fallback_reason"]:
             raise RuntimeError(f"server decode did not expose fallback reason metadata: {checks}; log={log_path}")
         if checks["prefill_selected_batch_size"] != request_count:
