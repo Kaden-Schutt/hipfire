@@ -26,6 +26,8 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let mut model = None; let mut ref_path = None; let mut out_path = None; let mut toks_path = None;
     let mut chunk = 0usize; let mut n = 512usize; let mut seed_len = 16usize; let mut kv_mode = "q8".to_string();
+    let mut temp = 0.0f32;
+    let mut rng_seed: u64 = 0x9E3779B97F4A7C15;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -37,6 +39,8 @@ fn main() {
             "--n" => { n = argv[i + 1].parse().unwrap(); i += 2; }
             "--seed-len" => { seed_len = argv[i + 1].parse().unwrap(); i += 2; }
             "--kv-mode" => { kv_mode = argv[i + 1].clone(); i += 2; }
+            "--temp" => { temp = argv[i + 1].parse().unwrap(); i += 2; }
+            "--seed" => { rng_seed = argv[i + 1].parse().unwrap(); i += 2; }
             o => { eprintln!("unknown arg {o}"); std::process::exit(1); }
         }
     }
@@ -82,8 +86,24 @@ fn main() {
         gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, eps).expect("norm");
         weight_gemv(&mut gpu, &weights.output, &scratch.tmp, &scratch.logits).expect("lm_head");
         let lg = gpu.download_f32(&scratch.logits).expect("dl");
-        let next = lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
-        // next token: keep seeding while within the seed prefix, else use argmax
+        // next token: temperature sampling when temp>0, else argmax
+        let next = if temp > 0.0 {
+            let inv_t = 1.0 / temp;
+            let mut max_l = f32::NEG_INFINITY;
+            for &v in &lg { if v * inv_t > max_l { max_l = v * inv_t; } }
+            let mut sum = 0.0f32;
+            let mut probs: Vec<f32> = lg.iter().map(|&v| { let e = (v * inv_t - max_l).exp(); sum += e; e }).collect();
+            let inv_sum = 1.0 / sum;
+            for p in probs.iter_mut() { *p *= inv_sum; }
+            // xorshift64* RNG
+            rng_seed ^= rng_seed << 13; rng_seed ^= rng_seed >> 7; rng_seed ^= rng_seed << 17;
+            let u = ((rng_seed >> 40) as f32) * (1.0 / 16_777_216.0);
+            let mut acc = 0.0f32; let mut sampled = (probs.len() - 1) as u32;
+            for (j, &p) in probs.iter().enumerate() { acc += p; if u < acc { sampled = j as u32; break; } }
+            sampled
+        } else {
+            lg.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32
+        };
         tok = if pos + 1 < seed_len { seed[pos + 1] } else { next };
         if pos == 0 || (pos + 1) % 128 == 0 { eprintln!("  gen {}/{} ({:.1}s)", pos + 1, n, t0.elapsed().as_secs_f32()); }
     }

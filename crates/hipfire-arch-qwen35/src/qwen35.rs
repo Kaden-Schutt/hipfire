@@ -4780,7 +4780,7 @@ fn forward_from_x_gpu(
     }
 
     // Run the production pipeline
-    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, &scratch, None)?;
+    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, &scratch, None, None)?;
 
     // DEBUG_LAYERS: dump per-layer residual norms
     if debug_layers && pos == 0 {
@@ -5336,7 +5336,7 @@ pub fn forward_scratch(
         // successful direct dispatch so subsequent calls can capture. ──
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None)?;
         gpu.graphs.ar_forward_kernel_dirty = false;
     } else if use_graph {
         // ── Capture + launch: kernels are clean but caller has not committed
@@ -5355,7 +5355,7 @@ pub fn forward_scratch(
             gpu.device_id,
             gpu.active_stream.as_ref().unwrap(),
         )?;
-        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None)?;
         gpu.graphs.end_graph_capture(
             &gpu.hip,
             gpu.device_id,
@@ -5367,7 +5367,7 @@ pub fn forward_scratch(
         // ── Direct path (graph not eligible: arch / MoE config) ──
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None)?;
     }
     Ok(())
 }
@@ -11398,6 +11398,59 @@ pub fn forward_scratch_with_hidden(
         dn_state,
         scratch,
         Some(hidden_rb),
+        None,
+    )?;
+    hidden_rb.advance_head();
+    Ok(())
+}
+
+/// Variant of `forward_scratch_with_hidden` that also captures the
+/// post-sigmoid alpha gate values (shape `[n_v_heads]`) for every LA layer
+/// into `alpha_out` (appended in LA-layer order). Used by the White-Snake
+/// datagen (`HIPFIRE_WS_STATE_COUPLE=1`) to build the `.wsstate` file.
+/// `alpha_out` is cleared on entry; on return it contains
+/// `n_la_layers * n_v_heads` f32 values.
+pub fn forward_scratch_with_hidden_ws(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    alpha_out: &mut Vec<f32>,
+) -> HipResult<()> {
+    alpha_out.clear();
+    let dim = config.dim;
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::Q8_0 => {
+            gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        EmbeddingFormat::F32 => {
+            gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
+        }
+        _ => panic!("unsupported embedding format"),
+    }
+    forward_scratch_layers(
+        gpu,
+        weights,
+        config,
+        pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        Some(hidden_rb),
+        Some(alpha_out),
     )?;
     hidden_rb.advance_head();
     Ok(())
@@ -11425,7 +11478,7 @@ pub fn forward_scratch_embed(
         )
     };
     gpu.hip.memcpy_htod(&scratch.x.buf, bytes)?;
-    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)
+    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None)
 }
 
 /// Batched single-weight GEMM used by the mixed-format fallback in
@@ -11554,6 +11607,9 @@ fn forward_scratch_layers(
     dn_state: &mut DeltaNetState,
     s: &Qwen35Scratch,
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    // White-Snake datagen: when Some, download alpha[n_v_heads] per LA layer
+    // into the flat Vec<f32> (n_la_layers * n_v_heads values per call).
+    mut alpha_cap: Option<&mut Vec<f32>>,
 ) -> HipResult<()> {
     // #397 Ship 6 — forward-as-pipeline. When HIPFIRE_FORWARD_LOWERED=1, route
     // single-GPU decode through the lowered super-op executor. Skipped when a
@@ -11699,6 +11755,11 @@ fn forward_scratch_layers(
                     &format!("layer {layer_idx} LinearAttention residual"),
                     &s.x,
                 )?;
+                // WS state capture: download post-sigmoid alpha[n_v_heads] for this LA layer
+                if let Some(ref mut cap) = alpha_cap {
+                    let alpha_vals = gpu.download_f32(&s.dn_alpha)?;
+                    cap.extend_from_slice(&alpha_vals[..n_v_heads]);
+                }
                 delta_layer_idx += 1;
             }
 
