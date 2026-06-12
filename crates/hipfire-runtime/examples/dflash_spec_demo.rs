@@ -127,6 +127,25 @@ fn main() {
             .and_then(|stdout| stdout.split_whitespace().next().map(str::to_string))
     }
 
+    fn dflash_trace_position_from_env() -> Option<usize> {
+        std::env::var("HIPFIRE_DFLASH_TRACE_POSITION")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    }
+
+    fn dflash_trace_expected_token_from_env() -> Option<usize> {
+        std::env::var("HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    }
+
+    fn trace_logits_top5(row: &[f32]) -> Vec<(usize, f32)> {
+        let mut top: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
+        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        top.truncate(5);
+        top
+    }
+
     fn hipfire_runtime_context() -> serde_json::Value {
         use serde_json::json;
 
@@ -1579,6 +1598,8 @@ fn main() {
             eprintln!("AR-BASELINE MODE: pure greedy target decode (no DFlash)");
             let t_ar = Instant::now();
             let mut ar_first_tok_secs: Option<f64> = None;
+            let trace_position = dflash_trace_position_from_env();
+            let trace_expected = dflash_trace_expected_token_from_env();
             // Position already advanced to prompt_tokens.len() during prefill.
             // seed_token = target's argmax at position `prompt_len` (first emit).
             let mut cur_token = seed_token;
@@ -1599,6 +1620,14 @@ fn main() {
                 )
                 .expect("ar forward");
                 let lg = gpu.download_f32(&target.scratch.logits).expect("logits");
+                if trace_position == Some(position) {
+                    let top = trace_logits_top5(&lg);
+                    let expected_logit = trace_expected.and_then(|tok| lg.get(tok).copied());
+                    eprintln!(
+                        "[trace-ar] pos={} cur_token={} expected={:?} expected_logit={:?} top5={:?}",
+                        position, cur_token, trace_expected, expected_logit, top,
+                    );
+                }
                 let next = lg
                     .iter()
                     .enumerate()
