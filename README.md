@@ -637,14 +637,7 @@ Any mismatch = re-pull or report.
 ### Build from source (if you're on a dev branch)
 
 ```bash
-cargo build --release --features deltanet \
-  -p hipfire-daemon \
-  --bin hipfire-daemon
-cargo build --release --features deltanet \
-  --example dflash_spec_demo \
-  --example encode_prompt \
-  --example run \
-  -p hipfire-runtime
+make build
 ```
 
 ---

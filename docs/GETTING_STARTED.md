@@ -54,6 +54,9 @@ cargo build --release
 cargo build --release -p hipfire-quantize
 ```
 
+For normal source-checkout builds, `make build` is the short form for the
+release build.
+
 ## Verify
 
 ```bash
