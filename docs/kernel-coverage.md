@@ -158,6 +158,13 @@ total profiled prefill from 441.3 ms to 294.9 ms; the main Q8 buckets moved
 unset uses the shape gate, `0` forces the single-wave path, and `1` forces
 the gfx1151 4w path for aligned `B%64==0` experiments.
 
+gfx1151 fused HFQ4 decode two-row probe: `HIPFIRE_FUSED_HFQ4_2ROW_GFX1151=1`
+routes single-token `fused_qkv_hfq4g256` and `fused_qkvza_hfq4g256` through
+the existing two-row CTA kernels used by the CDNA wave64 path. It is default
+off after flat A3B/9B measurements (`A3B gen12: 52.4 -> 52.7 tok/s`,
+`9B gen12: 38.6 -> 38.7 tok/s`; targeted fused rows unchanged within noise).
+See `docs/perf-checkpoints/2026-06-12-gfx1151-fused-hfq4-2row-null.md`.
+
 ### Attention
 
 | Kernel group | gfx906 | gfx942 | gfx1030 | gfx1100 | gfx1151 | gfx12 |

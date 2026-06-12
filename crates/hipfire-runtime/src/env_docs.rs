@@ -1006,6 +1006,13 @@ pub const ENV_HIPFIRE_FP8_WMMA: EnvVarDoc = EnvVarDoc {
     source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:157",
 };
 
+/// `HIPFIRE_FUSED_HFQ4_2ROW_GFX1151` — Opt-in ("1") gfx1151 two-row fused HFQ4 decode probe for QKV/QKVZA; default off after flat A3B/9B measurements
+pub const ENV_HIPFIRE_FUSED_HFQ4_2ROW_GFX1151: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_FUSED_HFQ4_2ROW_GFX1151",
+    description: "Opt-in (\"1\") gfx1151 two-row fused HFQ4 decode probe for QKV/QKVZA; default off after flat A3B/9B measurements",
+    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:24040",
+};
+
 /// `HIPFIRE_GATE_UP_VARIANT` — Runtime variable controlling gate up variant in hipfire
 pub const ENV_HIPFIRE_GATE_UP_VARIANT: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_GATE_UP_VARIANT",
@@ -2679,6 +2686,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_FORCE_A3B_EVICTION,
     ENV_HIPFIRE_FP16,
     ENV_HIPFIRE_FP8_WMMA,
+    ENV_HIPFIRE_FUSED_HFQ4_2ROW_GFX1151,
     ENV_HIPFIRE_GATE_UP_VARIANT,
     ENV_HIPFIRE_GDN_Q8_REG_GFX1151,
     ENV_HIPFIRE_GEMM_DUMP,

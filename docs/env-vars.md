@@ -144,6 +144,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_FORCE_A3B_EVICTION` | Runtime variable controlling force a3b eviction in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:10200` |
 | `HIPFIRE_FP16` | Runtime variable controlling fp16 in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:166` |
 | `HIPFIRE_FP8_WMMA` | Interprets "HIPFIRE_FP8_WMMA" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:157` |
+| `HIPFIRE_FUSED_HFQ4_2ROW_GFX1151` | Opt-in ("1") gfx1151 two-row fused HFQ4 decode probe for QKV/QKVZA; default off after flat A3B/9B measurements | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:24040` |
 | `HIPFIRE_GATE_UP_VARIANT` | Runtime variable controlling gate up variant in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:196` |
 | `HIPFIRE_GDN_Q8_REG_GFX1151` | Opt-in ("1") gfx1151 register-state GDN Q8 probe; default off after A3B pp256 prefill regressed 11.8 ms to 168.5 ms total GDN time | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:38361` |
 | `HIPFIRE_GEMM_DUMP` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:235` |

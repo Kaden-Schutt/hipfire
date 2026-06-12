@@ -10125,6 +10125,7 @@ impl Gpu {
         }
 
         let cdna_wave64 = self.arch_caps.is_wave64_native();
+        let gfx1151_2row = self.gfx1151_fused_hfq4_2row_enabled();
         let (func_name, block, grid_x) = if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
@@ -10152,6 +10153,14 @@ impl Gpu {
                 let total = (q_m + k_m + v_m) as u32;
                 ("fused_qkv_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
             }
+        } else if gfx1151_2row {
+            self.ensure_kernel(
+                "fused_qkv_hfq4g256_wave64",
+                kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC,
+                "fused_qkv_hfq4g256_wave64",
+            )?;
+            let total = (q_m + k_m + v_m) as u32;
+            ("fused_qkv_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
         } else {
             self.ensure_kernel(
                 "fused_qkv_hfq4g256",
@@ -10258,6 +10267,7 @@ impl Gpu {
         // the wave slot. This kernel uses no MFMA, just FMA + shfl_down within
         // wave64, so it is safe for Vega 20 as well as CDNA.
         let cdna_wave64 = self.arch_caps.is_wave64_native();
+        let gfx1151_2row = self.gfx1151_fused_hfq4_2row_enabled();
         let (func_name, block, grid_x) = if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
@@ -10289,6 +10299,18 @@ impl Gpu {
                     (total + 1) / 2,
                 )
             }
+        } else if gfx1151_2row {
+            self.ensure_kernel(
+                "fused_qkvza_hfq4g256_wave64",
+                kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC,
+                "fused_qkvza_hfq4g256_wave64",
+            )?;
+            let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+            (
+                "fused_qkvza_hfq4g256_wave64",
+                [64u32, 1, 1],
+                (total + 1) / 2,
+            )
         } else {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256",
@@ -24011,6 +24033,23 @@ impl Gpu {
         ) {
             Some(force) => force,
             None => k == 2048,
+        }
+    }
+
+    fn gfx1151_fused_hfq4_2row_enabled(&self) -> bool {
+        static MODE: OnceLock<Option<bool>> = OnceLock::new();
+        if !self.arch.starts_with("gfx1151") {
+            return false;
+        }
+        match *MODE.get_or_init(|| {
+            match std::env::var("HIPFIRE_FUSED_HFQ4_2ROW_GFX1151").as_deref() {
+                Ok("0") => Some(false),
+                Ok("1") => Some(true),
+                _ => None,
+            }
+        }) {
+            Some(force) => force,
+            None => false,
         }
     }
 
