@@ -219,6 +219,7 @@ keys = [
     "HIPFIRE_DFLASH_ROLLBACK_COMPARE",
     "HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS",
     "HIPFIRE_DFLASH_TRACE_POSITION",
+    "HIPFIRE_DFLASH_SERIAL_QKVZA_SELF_COMPARE",
     "HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN",
     "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY",
     "HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE",
@@ -1226,6 +1227,19 @@ single_mismatch_pattern = re.compile(
     r"serial_byte=(\d+) single_byte=(\d+)$",
     re.MULTILINE,
 )
+self_match_pattern = re.compile(
+    r"^\[dflash-serial-qkvza-self-compare\] "
+    r"layer=(\d+) pos=(\d+) family=([A-Za-z0-9_]+) match len=(\d+)$",
+    re.MULTILINE,
+)
+self_mismatch_pattern = re.compile(
+    r"^\[dflash-serial-qkvza-self-compare\] "
+    r"layer=(\d+) pos=(\d+) family=([A-Za-z0-9_]+) mismatch len=(\d+) "
+    r"bit_diff=(\d+) first=(\d+) probe_f32=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"serial_f32=([+\-0-9.eE]+|NaN|nan|inf|-inf) max_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"mean_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf)$",
+    re.MULTILINE,
+)
 
 def parse_context(context):
     parsed = {}
@@ -1242,6 +1256,7 @@ def parse_context(context):
 events = []
 route_meta = []
 single_row_checks = []
+serial_self_checks = []
 last_meta_by_layer = {}
 for m in meta_pattern.finditer(out):
     meta = {
@@ -1298,6 +1313,30 @@ for m in single_mismatch_pattern.finditer(out):
         "single_byte": int(m.group(8)),
         "reason": f"{m.group(2)}_mismatch",
     })
+for m in self_match_pattern.finditer(out):
+    serial_self_checks.append({
+        "ok": True,
+        "layer": int(m.group(1)),
+        "pos": int(m.group(2)),
+        "family": m.group(3),
+        "len": int(m.group(4)),
+    })
+for m in self_mismatch_pattern.finditer(out):
+    family = m.group(3)
+    serial_self_checks.append({
+        "ok": False,
+        "layer": int(m.group(1)),
+        "pos": int(m.group(2)),
+        "family": family,
+        "len": int(m.group(4)),
+        "bit_diff": int(m.group(5)),
+        "first": int(m.group(6)),
+        "probe_f32": float(m.group(7)),
+        "serial_f32": float(m.group(8)),
+        "max_abs": float(m.group(9)),
+        "mean_abs": float(m.group(10)),
+        "reason": f"serial_qkvza_self_{family}_mismatch",
+    })
 for m in unsupported_pattern.finditer(out):
     layer = int(m.group(4))
     event = {
@@ -1352,6 +1391,8 @@ if route_meta:
     payload["route_meta"] = route_meta
 if single_row_checks:
     payload["single_row_checks"] = single_row_checks
+if serial_self_checks:
+    payload["serial_self_checks"] = serial_self_checks
 if not checks:
     payload["ok"] = True
 if mismatches:

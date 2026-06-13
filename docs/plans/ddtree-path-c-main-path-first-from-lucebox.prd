@@ -465,6 +465,18 @@ Latest rollback diagnostic evidence:
   simple batch-size-2 qkvza dispatch artifact; the remaining isolate is
   whether the serial raw-gate capture site is observing a different
   beta/alpha source than the serial `x_in` plus weights imply.
+- `/tmp/coherence-dflash-serial-qkvza-self3-20260614-000913.md`
+  added a serial-capture-site self-compare under
+  `HIPFIRE_DFLASH_SERIAL_QKVZA_SELF_COMPARE=1` and preserved it in the
+  gate report as `serial_self_checks`. At capture positions 59 and 60,
+  immediate serial recompute over the same live `eff_x` matched the
+  just-produced serial `qkv`, `z`, `beta_raw`, and `alpha_raw`
+  byte-for-byte. The later route diagnostic still reported
+  `qkvza_single_beta_raw_mismatch` when recomputing from the copied
+  tape `x_in` row. This rules out serial qkvza nondeterminism and the
+  raw-gate copy operation as primary causes; the active isolate is now
+  the `x_in` tape snapshot/lifetime or row mapping between serial
+  capture and later qkvza-route recompute.
 
 ## References
 

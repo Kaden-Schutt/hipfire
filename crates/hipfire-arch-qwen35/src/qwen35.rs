@@ -13029,6 +13029,52 @@ fn trace_stage_sync_if_enabled(gpu: &Gpu, label: &str) -> HipResult<()> {
     Ok(())
 }
 
+fn dflash_serial_qkvza_self_compare_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("HIPFIRE_DFLASH_SERIAL_QKVZA_SELF_COMPARE").is_some())
+}
+
+fn log_dflash_serial_qkvza_self_diff(
+    family: &str,
+    layer_idx: usize,
+    pos: usize,
+    probe: &[f32],
+    serial: &[f32],
+) {
+    let len = probe.len().min(serial.len());
+    let first_mismatch = probe
+        .iter()
+        .zip(serial.iter())
+        .take(len)
+        .position(|(a, b)| a.to_bits() != b.to_bits());
+    let Some(first) = first_mismatch else {
+        eprintln!(
+            "[dflash-serial-qkvza-self-compare] layer={layer_idx} pos={pos} family={family} match len={len}"
+        );
+        return;
+    };
+
+    let mut max_abs = 0.0f32;
+    let mut sum_abs = 0.0f64;
+    let mut bit_diff = 0usize;
+    for (a, b) in probe.iter().zip(serial.iter()).take(len) {
+        if a.to_bits() != b.to_bits() {
+            bit_diff += 1;
+        }
+        let abs = (*a - *b).abs();
+        max_abs = max_abs.max(abs);
+        sum_abs += abs as f64;
+    }
+    let mean_abs = if len == 0 { 0.0 } else { sum_abs / len as f64 };
+    eprintln!(
+        "[dflash-serial-qkvza-self-compare] layer={layer_idx} pos={pos} family={family} mismatch len={len} bit_diff={bit_diff} first={first} probe_f32={:.9e} serial_f32={:.9e} max_abs={:.9e} mean_abs={:.9e}",
+        probe[first],
+        serial[first],
+        max_abs,
+        mean_abs,
+    );
+}
+
 /// Process one chunk of up to `pbs.max_batch` tokens through the batched
 /// prefill path. All LA layers go through batched kernels; all FA layers
 /// go through a per-token gather/scatter loop with the inline FA body.
@@ -20852,6 +20898,76 @@ fn forward_scratch_layers(
                     trace_finite_if_enabled(gpu, "layer 0 LA w_beta", &s.dn_beta)?;
                     trace_finite_if_enabled(gpu, "layer 0 LA w_alpha", &s.dn_alpha)?;
                 }
+                if layer_idx == 0
+                    && dflash_serial_qkvza_self_compare_enabled()
+                    && gdn_tape_capture.is_some()
+                    && fused_la4_mq4
+                {
+                    let eff_x = match x_rot {
+                        Some(xr) => xr,
+                        None => &s.tmp,
+                    };
+                    let probe_qkv = gpu.alloc_tensor(&[layer.wqkv.m], DType::F32)?;
+                    let probe_z = gpu.alloc_tensor(&[layer.wz.m], DType::F32)?;
+                    let probe_beta = gpu.alloc_tensor(&[layer.w_beta.m], DType::F32)?;
+                    let probe_alpha = gpu.alloc_tensor(&[layer.w_alpha.m], DType::F32)?;
+                    gpu.fused_qkvza_hfq4g256(
+                        &layer.wqkv.buf,
+                        &layer.wz.buf,
+                        &layer.w_beta.buf,
+                        &layer.w_alpha.buf,
+                        eff_x,
+                        &probe_qkv,
+                        &probe_z,
+                        &probe_beta,
+                        &probe_alpha,
+                        layer.wqkv.m,
+                        layer.wz.m,
+                        layer.w_beta.m,
+                        layer.w_alpha.m,
+                        layer.wqkv.k,
+                    )?;
+                    let probe_qkv_host = gpu.download_f32(&probe_qkv)?;
+                    let serial_qkv_host = gpu.download_f32(&s.dn_qkv)?;
+                    log_dflash_serial_qkvza_self_diff(
+                        "qkv",
+                        layer_idx,
+                        pos,
+                        &probe_qkv_host,
+                        &serial_qkv_host,
+                    );
+                    let probe_z_host = gpu.download_f32(&probe_z)?;
+                    let serial_z_host = gpu.download_f32(&s.dn_z)?;
+                    log_dflash_serial_qkvza_self_diff(
+                        "z",
+                        layer_idx,
+                        pos,
+                        &probe_z_host,
+                        &serial_z_host,
+                    );
+                    let probe_beta_host = gpu.download_f32(&probe_beta)?;
+                    let serial_beta_host = gpu.download_f32(&s.dn_beta)?;
+                    log_dflash_serial_qkvza_self_diff(
+                        "beta_raw",
+                        layer_idx,
+                        pos,
+                        &probe_beta_host,
+                        &serial_beta_host,
+                    );
+                    let probe_alpha_host = gpu.download_f32(&probe_alpha)?;
+                    let serial_alpha_host = gpu.download_f32(&s.dn_alpha)?;
+                    log_dflash_serial_qkvza_self_diff(
+                        "alpha_raw",
+                        layer_idx,
+                        pos,
+                        &probe_alpha_host,
+                        &serial_alpha_host,
+                    );
+                    gpu.free_tensor(probe_qkv)?;
+                    gpu.free_tensor(probe_z)?;
+                    gpu.free_tensor(probe_beta)?;
+                    gpu.free_tensor(probe_alpha)?;
+                }
                 // gfx1151 fuses the independent sigmoid/alpha gate with the
                 // single-token conv1d+SiLU+split below, shaving one dispatch
                 // per LA decode layer. Other arches preserve the old pair.
@@ -20859,21 +20975,21 @@ fn forward_scratch_layers(
                     let x_in_for_tape = x_rot_paro.or(x_rot).unwrap_or(&s.tmp);
                     let x_in_row_bytes = tape.x_in_dim * 4;
                     let alpha_beta_row_bytes = tape.n_v_heads * 4;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.x_in_bufs[delta_layer_idx].buf,
                         *tape_row * x_in_row_bytes,
                         &x_in_for_tape.buf,
                         0,
                         x_in_row_bytes,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.alpha_raw_bufs[delta_layer_idx].buf,
                         *tape_row * alpha_beta_row_bytes,
                         &s.dn_alpha.buf,
                         0,
                         alpha_beta_row_bytes,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.beta_raw_bufs[delta_layer_idx].buf,
                         *tape_row * alpha_beta_row_bytes,
                         &s.dn_beta.buf,
@@ -20901,42 +21017,42 @@ fn forward_scratch_layers(
                     let alpha_beta_row_bytes = tape.n_v_heads * 4;
                     let q_raw_row_bytes = tape.k_dim * 4;
                     let v_row_bytes = tape.v_dim * 4;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.qkv_bufs[delta_layer_idx].buf,
                         *tape_row * qkv_row_bytes,
                         &s.dn_qkv.buf,
                         0,
                         qkv_row_bytes,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.alpha_bufs[delta_layer_idx].buf,
                         *tape_row * alpha_beta_row_bytes,
                         &s.dn_alpha.buf,
                         0,
                         alpha_beta_row_bytes,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.beta_bufs[delta_layer_idx].buf,
                         *tape_row * alpha_beta_row_bytes,
                         &s.dn_beta.buf,
                         0,
                         alpha_beta_row_bytes,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.q_raw_bufs[delta_layer_idx].buf,
                         *tape_row * q_raw_row_bytes,
                         &s.dn_q_raw.buf,
                         0,
                         q_raw_row_bytes,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.k_raw_bufs[delta_layer_idx].buf,
                         *tape_row * q_raw_row_bytes,
                         &s.dn_k_raw.buf,
                         0,
                         q_raw_row_bytes,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.v_bufs[delta_layer_idx].buf,
                         *tape_row * v_row_bytes,
                         &s.dn_v.buf,
@@ -20994,14 +21110,14 @@ fn forward_scratch_layers(
 
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let q_row_bytes = tape.v_dim * 4;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.q_bufs[delta_layer_idx].buf,
                         *tape_row * q_row_bytes,
                         &s.dn_q.buf,
                         0,
                         q_row_bytes,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.k_bufs[delta_layer_idx].buf,
                         *tape_row * q_row_bytes,
                         &s.dn_k.buf,
@@ -21055,7 +21171,7 @@ fn forward_scratch_layers(
                 }
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let v_row_bytes = tape.v_dim * 4;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.attn_out_bufs[delta_layer_idx].buf,
                         *tape_row * v_row_bytes,
                         &s.dn_attn_out.buf,
@@ -21078,7 +21194,7 @@ fn forward_scratch_layers(
                 }
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let v_row_bytes = tape.v_dim * 4;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.normed_bufs[delta_layer_idx].buf,
                         *tape_row * v_row_bytes,
                         &s.dn_normed.buf,
@@ -21088,7 +21204,7 @@ fn forward_scratch_layers(
                 }
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let hidden_row_bytes = tape.x_in_dim * 4;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.wo_residual_in_bufs[delta_layer_idx].buf,
                         *tape_row * hidden_row_bytes,
                         &s.x.buf,
@@ -21112,7 +21228,7 @@ fn forward_scratch_layers(
                     } else {
                         &s.dn_normed
                     };
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.wo_input_bufs[delta_layer_idx].buf,
                         *tape_row * v_row_bytes,
                         &wo_input.buf,
@@ -21125,7 +21241,7 @@ fn forward_scratch_layers(
                 }
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let hidden_row_bytes = tape.x_in_dim * 4;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.attn_residual_bufs[delta_layer_idx].buf,
                         *tape_row * hidden_row_bytes,
                         &s.x.buf,
@@ -21168,7 +21284,7 @@ fn forward_scratch_layers(
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let hidden_row_bytes = tape.x_in_dim * 4;
                     let ffn_input = x_rot_paro.or(x_rot).unwrap_or(&s.tmp);
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.ffn_input_bufs[delta_layer_idx].buf,
                         *tape_row * hidden_row_bytes,
                         &ffn_input.buf,
@@ -21299,14 +21415,14 @@ fn forward_scratch_layers(
                 }
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let ffn_row_bytes = tape.ffn_dim * 4;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.ffn_gate_bufs[delta_layer_idx].buf,
                         *tape_row * ffn_row_bytes,
                         &s.gate_ffn.buf,
                         0,
                         ffn_row_bytes,
                     )?;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.ffn_up_bufs[delta_layer_idx].buf,
                         *tape_row * ffn_row_bytes,
                         &s.up.buf,
@@ -21319,7 +21435,7 @@ fn forward_scratch_layers(
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let hidden_row_bytes = tape.x_in_dim * 4;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.w_down_residual_in_bufs[delta_layer_idx].buf,
                         *tape_row * hidden_row_bytes,
                         &s.x.buf,
@@ -21354,7 +21470,7 @@ fn forward_scratch_layers(
                     } else {
                         &s.ffn_hidden
                     };
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.w_down_input_bufs[delta_layer_idx].buf,
                         *tape_row * ffn_row_bytes,
                         &w_down_input.buf,
@@ -21364,7 +21480,7 @@ fn forward_scratch_layers(
                 }
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let hidden_row_bytes = tape.x_in_dim * 4;
-                    gpu.hip.memcpy_dtod_at(
+                    gpu.memcpy_dtod_at_auto(
                         &tape.layer_out_bufs[delta_layer_idx].buf,
                         *tape_row * hidden_row_bytes,
                         &s.x.buf,
@@ -21421,7 +21537,7 @@ fn forward_scratch_layers(
                         && tape.fa_bridge_valid[delta_layer_idx]
                     {
                         let hidden_row_bytes = tape.x_in_dim * 4;
-                        gpu.hip.memcpy_dtod_at(
+                        gpu.memcpy_dtod_at_auto(
                             &tape.fa_bridge_input_bufs[delta_layer_idx].buf,
                             *tape_row * hidden_row_bytes,
                             &s.x.buf,
@@ -21436,7 +21552,7 @@ fn forward_scratch_layers(
                     {
                         let x_for_tape = x_rot_paro.or(x_rot).unwrap_or(&s.tmp);
                         let hidden_row_bytes = tape.x_in_dim * 4;
-                        gpu.hip.memcpy_dtod_at(
+                        gpu.memcpy_dtod_at_auto(
                             &tape.fa_bridge_x_bufs[delta_layer_idx].buf,
                             *tape_row * hidden_row_bytes,
                             &x_for_tape.buf,
@@ -21611,7 +21727,7 @@ fn forward_scratch_layers(
                         && tape.fa_bridge_valid[delta_layer_idx]
                     {
                         let q_full_row_bytes = tape.fa_q_full_dim * 4;
-                        gpu.hip.memcpy_dtod_at(
+                        gpu.memcpy_dtod_at_auto(
                             &tape.fa_bridge_q_full_bufs[delta_layer_idx].buf,
                             *tape_row * q_full_row_bytes,
                             &s.fa_q_full.buf,
@@ -21636,7 +21752,7 @@ fn forward_scratch_layers(
                         && tape.fa_bridge_valid[delta_layer_idx]
                     {
                         let q_row_bytes = tape.fa_q_dim * 4;
-                        gpu.hip.memcpy_dtod_at(
+                        gpu.memcpy_dtod_at_auto(
                             &tape.fa_bridge_q_norm_bufs[delta_layer_idx].buf,
                             *tape_row * q_row_bytes,
                             &s.fa_q.buf,
@@ -21704,21 +21820,21 @@ fn forward_scratch_layers(
                     {
                         let q_row_bytes = tape.fa_q_dim * 4;
                         let kv_row_bytes = tape.fa_kv_dim * 4;
-                        gpu.hip.memcpy_dtod_at(
+                        gpu.memcpy_dtod_at_auto(
                             &tape.fa_bridge_q_bufs[delta_layer_idx].buf,
                             *tape_row * q_row_bytes,
                             &s.fa_q.buf,
                             0,
                             q_row_bytes,
                         )?;
-                        gpu.hip.memcpy_dtod_at(
+                        gpu.memcpy_dtod_at_auto(
                             &tape.fa_bridge_k_bufs[delta_layer_idx].buf,
                             *tape_row * kv_row_bytes,
                             &s.fa_k.buf,
                             0,
                             kv_row_bytes,
                         )?;
-                        gpu.hip.memcpy_dtod_at(
+                        gpu.memcpy_dtod_at_auto(
                             &tape.fa_bridge_v_bufs[delta_layer_idx].buf,
                             *tape_row * kv_row_bytes,
                             &s.fa_v.buf,
@@ -21983,7 +22099,7 @@ fn forward_scratch_layers(
                         && tape.fa_bridge_valid[delta_layer_idx]
                     {
                         let q_row_bytes = tape.fa_q_dim * 4;
-                        gpu.hip.memcpy_dtod_at(
+                        gpu.memcpy_dtod_at_auto(
                             &tape.fa_bridge_attn_raw_bufs[delta_layer_idx].buf,
                             *tape_row * q_row_bytes,
                             &s.fa_attn_out.buf,
@@ -21999,7 +22115,7 @@ fn forward_scratch_layers(
                         && tape.fa_bridge_valid[delta_layer_idx]
                     {
                         let hidden_row_bytes = tape.x_in_dim * 4;
-                        gpu.hip.memcpy_dtod_at(
+                        gpu.memcpy_dtod_at_auto(
                             &tape.fa_bridge_attn_out_bufs[delta_layer_idx].buf,
                             *tape_row * hidden_row_bytes,
                             &s.fa_attn_out.buf,
@@ -22023,7 +22139,7 @@ fn forward_scratch_layers(
                         && tape.fa_bridge_valid[delta_layer_idx]
                     {
                         let hidden_row_bytes = tape.x_in_dim * 4;
-                        gpu.hip.memcpy_dtod_at(
+                        gpu.memcpy_dtod_at_auto(
                             &tape.fa_bridge_wo_residual_bufs[delta_layer_idx].buf,
                             *tape_row * hidden_row_bytes,
                             &s.x.buf,
@@ -22196,7 +22312,7 @@ fn forward_scratch_layers(
                         && tape.fa_bridge_valid[delta_layer_idx]
                     {
                         let hidden_row_bytes = tape.x_in_dim * 4;
-                        gpu.hip.memcpy_dtod_at(
+                        gpu.memcpy_dtod_at_auto(
                             &tape.fa_bridge_layer_out_bufs[delta_layer_idx].buf,
                             *tape_row * hidden_row_bytes,
                             &s.x.buf,
