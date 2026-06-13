@@ -173,8 +173,12 @@
     LA input, `x_in[4]` (`bytes=20480`, `differing_bytes=4333`, `first_offset=4`, row 0/logical position 120/hidden elem 1) with
     `actual_f32=-4.16579276e-1`, `expected_f32=-4.16579247e-1`, `max_abs=4.76837158e-7`, `mean_abs=4.65472105e-8`, and
     `max_rel=7.69230770e-3`. The following state compare still mismatches at `s_matrix[0]`, so this tolerance walk suggests low-amplitude
-    floating-point reduction/order drift propagating from FA output into the next layer input, not a discrete indexing/routing error. Fast
-    rollback replay remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity evidence.
+    floating-point reduction/order drift propagating from FA output into the next layer input, not a discrete indexing/routing error. Adding
+    f32 stats to the recurrent-state compare proves that tolerance alone is not admission evidence: the same run's final `s_matrix[0]` diff has
+    `f32_words=196608`, `f32_bit_diff_words=110835`, `actual_f32=-1.08794908e37`, `expected_f32=-1.08791663e37`,
+    `max_abs=3.40205476e38`, `mean_abs=2.42472451e36`, and `max_rel=inf`. The next blocker is to localize where the tiny FA/input drift is
+    amplified inside the following GDN recurrence, or prove a bounded rescale/quantization policy that preserves logits. Fast rollback replay
+    remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity evidence.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

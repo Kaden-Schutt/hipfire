@@ -1275,6 +1275,30 @@ fn rollback_input_diff_context(
     }
 }
 
+fn rollback_snapshot_diff_context(diff: &DeltaNetSnapshotDiff) -> String {
+    let value_context = match (diff.actual_f32, diff.expected_f32) {
+        (Some(actual), Some(expected)) => {
+            format!(" actual_f32={actual:.8e} expected_f32={expected:.8e}")
+        }
+        _ => String::new(),
+    };
+    let stats_context = diff
+        .f32_stats
+        .as_ref()
+        .map(|stats| {
+            format!(
+                " f32_words={} f32_bit_diff_words={} max_abs={:.8e} mean_abs={:.8e} max_rel={:.8e}",
+                stats.words,
+                stats.bit_different_words,
+                stats.max_abs,
+                stats.mean_abs,
+                stats.max_rel
+            )
+        })
+        .unwrap_or_default();
+    format!("{value_context}{stats_context}")
+}
+
 /// A series of `n_slots` `DeltaNetSnapshot` slots, used by the tape-replay
 /// rollback path. After each verify forward step writes its post-state into
 /// the next slot, `restore_from(accept_len + 1)` jumps the live DN state
@@ -6198,19 +6222,23 @@ pub fn spec_step_dflash(
                 ),
             }
             match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &serial_result)? {
-                Some(diff) => eprintln!(
-                    "[dflash-rollback-serial-tape-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} serial_tape_byte={}",
-                    position,
-                    accept_len,
-                    accept_len + 1,
-                    diff.family,
-                    diff.index,
-                    diff.bytes,
-                    diff.differing_bytes,
-                    diff.first_offset,
-                    diff.expected_byte,
-                    diff.actual_byte,
-                ),
+                Some(diff) => {
+                    let context = rollback_snapshot_diff_context(&diff);
+                    eprintln!(
+                        "[dflash-rollback-serial-tape-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} serial_tape_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.expected_byte,
+                        diff.actual_byte,
+                        context,
+                    );
+                }
                 None => eprintln!(
                     "[dflash-rollback-serial-tape-compare] pos={} accepted={} replay_steps={} match",
                     position,
@@ -6259,19 +6287,23 @@ pub fn spec_step_dflash(
             );
             gpu.debug_set_gdn_requant_frame(serial_frame_end);
             match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &serial_result)? {
-                Some(diff) => eprintln!(
-                    "[dflash-rollback-serial-tape-token-major-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} serial_tape_byte={}",
-                    position,
-                    accept_len,
-                    accept_len + 1,
-                    diff.family,
-                    diff.index,
-                    diff.bytes,
-                    diff.differing_bytes,
-                    diff.first_offset,
-                    diff.expected_byte,
-                    diff.actual_byte,
-                ),
+                Some(diff) => {
+                    let context = rollback_snapshot_diff_context(&diff);
+                    eprintln!(
+                        "[dflash-rollback-serial-tape-token-major-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} serial_tape_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.expected_byte,
+                        diff.actual_byte,
+                        context,
+                    );
+                }
                 None => eprintln!(
                     "[dflash-rollback-serial-tape-token-major-compare] pos={} accepted={} replay_steps={} match",
                     position,
@@ -6282,19 +6314,23 @@ pub fn spec_step_dflash(
             token_major_tape.free_gpu(gpu);
             serial_result.restore_to(&mut target.dn_state, gpu)?;
             match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &gdn_result)? {
-                Some(diff) => eprintln!(
-                    "[dflash-rollback-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}",
-                    position,
-                    accept_len,
-                    accept_len + 1,
-                    diff.family,
-                    diff.index,
-                    diff.bytes,
-                    diff.differing_bytes,
-                    diff.first_offset,
-                    diff.actual_byte,
-                    diff.expected_byte,
-                ),
+                Some(diff) => {
+                    let context = rollback_snapshot_diff_context(&diff);
+                    eprintln!(
+                        "[dflash-rollback-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.actual_byte,
+                        diff.expected_byte,
+                        context,
+                    );
+                }
                 None => eprintln!(
                     "[dflash-rollback-compare] pos={} accepted={} replay_steps={} match",
                     position,
