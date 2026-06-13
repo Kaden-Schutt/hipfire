@@ -302,6 +302,9 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_Q8_BATCHED_LEGACY` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:238` |
 | `HIPFIRE_Q8_DP4A` | (A2) dp4a wave32 (gfx906 v_dot4_i32_i8 Q·K) | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:185` |
 | `HIPFIRE_Q8_DP4A_W64` | (A3) dp4a WAVE64 (full 64-lane utilization) | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:196` |
+| `HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS` | Diagnostic: ignore DDTree bias in Q8 FullAttention batched attention | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11725` |
+| `HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP` | Diagnostic: route Q8 FullAttention batched rows through one-row masked launches | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11697` |
+| `HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP` | Diagnostic: route Q8 FullAttention rows through scalar causal Q8 attention | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11711` |
 | `HIPFIRE_Q8_GATE_UP_4W` | gfx1151 Q8 gate+up 4w control: unset auto-routes aligned N>=128, "0" forces single-wave WMMA, "1" forces 4w for aligned N%64==0 experiments | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:130` |
 | `HIPFIRE_Q8_GATE_UP_BENCH` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:129` |
 | `HIPFIRE_Q8_TOKPAR` | (A) NEW token-parallel | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:174` |

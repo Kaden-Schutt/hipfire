@@ -217,6 +217,27 @@ pub const ENV_HIPFIRE_ATTN_FLASH: EnvVarDoc = EnvVarDoc {
     source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:7635",
 };
 
+/// `HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP` — Diagnostic: route Q8 FullAttention batched rows through one-row masked launches
+pub const ENV_HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP",
+    description: "Diagnostic: route Q8 FullAttention batched rows through one-row masked launches",
+    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11697",
+};
+
+/// `HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP` — Diagnostic: route Q8 FullAttention rows through scalar causal Q8 attention
+pub const ENV_HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP",
+    description: "Diagnostic: route Q8 FullAttention rows through scalar causal Q8 attention",
+    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11711",
+};
+
+/// `HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS` — Diagnostic: ignore DDTree bias in Q8 FullAttention batched attention
+pub const ENV_HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS",
+    description: "Diagnostic: ignore DDTree bias in Q8 FullAttention batched attention",
+    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11725",
+};
+
 /// `HIPFIRE_AWQ_F1_ONLY` — bench against the same binary's F2 quant. Default (env unset):
 pub const ENV_HIPFIRE_AWQ_F1_ONLY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_AWQ_F1_ONLY",
@@ -2631,6 +2652,9 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_ALLOW_MQ4_LLOYD,
     ENV_HIPFIRE_ALLOW_UNIT_IMATRIX,
     ENV_HIPFIRE_ATTN_FLASH,
+    ENV_HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS,
+    ENV_HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP,
+    ENV_HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP,
     ENV_HIPFIRE_AWQ_F1_ONLY,
     ENV_HIPFIRE_BASELINE_ARCH,
     ENV_HIPFIRE_BF16_DENSE_M128,

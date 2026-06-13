@@ -11701,6 +11701,42 @@ fn kld_fp32_gqa4_attention_enabled() -> bool {
     })
 }
 
+fn q8_fa_attention_row_loop_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        )
+    })
+}
+
+fn q8_fa_attention_scalar_loop_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        )
+    })
+}
+
+fn q8_fa_attention_ignore_tree_bias_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        )
+    })
+}
+
 fn kld_fp32_gqa4_attention_eligible(
     gpu: &Gpu,
     kv_cache: &llama::KvCache,
@@ -17327,7 +17363,65 @@ fn forward_prefill_chunk(
                         )?;
                     }
                     let _ = gpu.hip.free(pos_buf_tmp);
+                } else if kv_cache.quant_q8 && q8_fa_attention_scalar_loop_enabled() {
+                    let q_dim = config.n_heads * config.head_dim;
+                    let pos_buf_tmp = gpu.hip.malloc(4)?;
+                    for b in 0..n {
+                        let pos_b = position_at_row(b);
+                        let pos_i32 = pos_b as i32;
+                        gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
+                        let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
+                        let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
+                        gpu.attention_q8_0_kv(
+                            &q_b,
+                            &kv_cache.k_gpu[layer_idx],
+                            &kv_cache.v_gpu[layer_idx],
+                            &out_b,
+                            &pos_buf_tmp,
+                            pos_b + 1,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            kv_cache.physical_cap,
+                        )?;
+                    }
+                    let _ = gpu.hip.free(pos_buf_tmp);
+                } else if kv_cache.quant_q8 && q8_fa_attention_row_loop_enabled() {
+                    let q8_tree_bias = if q8_fa_attention_ignore_tree_bias_enabled() {
+                        None
+                    } else {
+                        tree_bias
+                    };
+                    let q_dim = config.n_heads * config.head_dim;
+                    for b in 0..n {
+                        let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
+                        let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
+                        let pos_b = pbs.positions.sub_offset(b, 1);
+                        let bias_b =
+                            q8_tree_bias.map(|bias| bias.sub_offset(b * block_cols, block_cols));
+                        gpu.attention_q8_0_kv_batched_masked(
+                            &q_b,
+                            &kv_cache.k_gpu[layer_idx],
+                            &kv_cache.v_gpu[layer_idx],
+                            &out_b,
+                            &pos_b,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            kv_cache.physical_cap,
+                            max_ctx_len,
+                            1,
+                            bias_b.as_ref(),
+                            block_start,
+                            block_cols,
+                        )?;
+                    }
                 } else if kv_cache.quant_q8 {
+                    let q8_tree_bias = if q8_fa_attention_ignore_tree_bias_enabled() {
+                        None
+                    } else {
+                        tree_bias
+                    };
                     gpu.attention_q8_0_kv_batched_masked(
                         &pbs.fa_q_batch,
                         &kv_cache.k_gpu[layer_idx],
@@ -17340,7 +17434,7 @@ fn forward_prefill_chunk(
                         kv_cache.physical_cap,
                         max_ctx_len,
                         n,
-                        tree_bias,
+                        q8_tree_bias,
                         block_start,
                         block_cols,
                     )?;
