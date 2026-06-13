@@ -427,6 +427,15 @@
     for the production batched qkvza output, not rollback replay order. The `HIPFIRE_HFQ4_QKVZA_FAST=0` control is still rejected because it breaks
     prose AR parity, so fast GDN-tape rollback must remain diagnostic-only until the default projection path either emits serial-equivalent captured
     rows or a live fail-closed recurrent/logit admission policy exists.
+    The coherence gate now classifies that split explicitly in the JSON evidence. Fresh focused validation
+    `/tmp/coherence-dflash-20260613-202412.md` plus `/tmp/coherence-dflash-20260613-202412.dflash_trace.json` passed prose/code AR parity with
+    live rollback still conservative (`replay_gdn_tape=0`; prose `replay_full_prefill=92`; code `replay_full_prefill=4`,
+    `replay_verify_complete=1`). The traced prose admission remains `rejected` with blockers
+    `fast_replay_recurrent_state_mismatch`, `single_step_recurrent_state_mismatch`, `rollback_input_mismatch`, and the new
+    `projection_family_mismatch`. The sidecar records the projection split as
+    `forward_scratch_capture_gdn_tape:fused_qkvza` versus `verify_dflash_block:gemm_qkvza`, with `x_in` as the matched prior boundary and `qkv`
+    as the first mismatching family. This makes the remaining fast-rollback blocker machine-readable for eval ingestion instead of relying on
+    planning-doc inference.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

@@ -1013,6 +1013,14 @@ for _, label, check in events:
         first = dict(check)
         first["check"] = label
         payload["first_mismatch"] = first
+        if label == "input" and check.get("family") == "qkv":
+            payload["blocker_class"] = "projection_family_mismatch"
+            payload["projection_split"] = {
+                "serial_route": "forward_scratch_capture_gdn_tape:fused_qkvza",
+                "verify_route": "verify_dflash_block:gemm_qkvza",
+                "matched_prior_boundary": "x_in",
+                "first_mismatch_family": "qkv",
+            }
         break
 print(json.dumps(payload, sort_keys=True))
 PYEOF
@@ -1164,6 +1172,8 @@ elif not state.get("ok", False):
 
 if input_checked > 0 and not input_compare.get("ok", False):
     blockers.append(input_compare.get("reason", "captured_input_mismatch"))
+    if input_compare.get("blocker_class") == "projection_family_mismatch":
+        blockers.append("projection_family_mismatch")
 
 payload = {
     "verdict": "not_evaluated" if logit_checked <= 0 and state_checked <= 0 else ("admitted" if not blockers else "rejected"),
@@ -1195,6 +1205,10 @@ if logit.get("first_mismatch"):
     payload["first_logit_mismatch"] = logit["first_mismatch"]
 if input_compare.get("first_mismatch"):
     payload["first_input_mismatch"] = input_compare["first_mismatch"]
+if input_compare.get("blocker_class"):
+    payload["input_blocker_class"] = input_compare["blocker_class"]
+if input_compare.get("projection_split"):
+    payload["projection_split"] = input_compare["projection_split"]
 if input_compare.get("mismatch_counts"):
     payload["input_mismatch_counts"] = input_compare["mismatch_counts"]
 if logit.get("max_abs_over_margin") is not None:
