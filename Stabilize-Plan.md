@@ -324,6 +324,11 @@
     `replay_batched_prefill=91 replay_full_prefill=0`, and preserving verifier KV rows in `/tmp/coherence-dflash-20260613-180847.md` still failed
     the same window with `replay_batched_prefill=95 replay_full_prefill=0`. Batched prefix prefill therefore remains diagnostic-only for
     partial/reject cycles until end-to-end token parity, not just recurrent snapshot parity, is proven.
+    A follow-up diagnostic in `/tmp/coherence-dflash-20260613-181719.md` adds `rollback_prefill_logit_compare`: at the traced position-120 repro,
+    batched-prefix prefill matches serial for the recurrent snapshot and for the bounded 8-step next-logit chain exactly
+    (`argmax_mismatches=0`, `max_abs=0`, `max_mean_abs=0`). That rules out the traced position's accepted-prefix recurrent/KV/logit state as the
+    promotion failure by itself. The remaining batched-prefix blocker is now to find the untraced cycle/session side effect that made whole-run
+    promotion diverge before admitting `replay_batched_prefill` for live partial/reject rollback.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

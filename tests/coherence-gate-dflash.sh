@@ -537,6 +537,73 @@ print(json.dumps(payload, sort_keys=True))
 PYEOF
 )
 
+ROLLBACK_PREFILL_LOGIT_COMPARE_PY=$(cat <<'PYEOF'
+import sys, re, json, math
+if len(sys.argv) != 2:
+    print(json.dumps({"ok": False, "reason": "usage"}))
+    sys.exit(0)
+out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+pattern = re.compile(
+    r"^\[dflash-rollback-prefill-next-logit-compare\] "
+    r"pos=(\d+) step=(\d+) compare_steps=(\d+) token_pos=(\d+) token=(\d+) "
+    r"serial_argmax=(\d+) prefill_argmax=(\d+) "
+    r"serial_token_logit=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"prefill_token_logit=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"f32_words=(\d+) f32_bit_diff_words=(\d+) "
+    r"max_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"mean_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"max_rel=([+\-0-9.eE]+|NaN|nan|inf|-inf)$",
+    re.MULTILINE,
+)
+rows = []
+for m in pattern.finditer(out):
+    max_abs = float(m.group(12))
+    mean_abs = float(m.group(13))
+    max_rel = float(m.group(14))
+    rows.append({
+        "pos": int(m.group(1)),
+        "step": int(m.group(2)),
+        "compare_steps": int(m.group(3)),
+        "token_pos": int(m.group(4)),
+        "token": int(m.group(5)),
+        "serial_argmax": int(m.group(6)),
+        "prefill_argmax": int(m.group(7)),
+        "max_abs": max_abs,
+        "mean_abs": mean_abs,
+        "max_rel": max_rel,
+    })
+if not rows:
+    print(json.dumps({"ok": True, "checked": 0}))
+    sys.exit(0)
+mismatches = [r for r in rows if r["serial_argmax"] != r["prefill_argmax"]]
+finite_max_abs = [r["max_abs"] for r in rows if math.isfinite(r["max_abs"])]
+finite_mean_abs = [r["mean_abs"] for r in rows if math.isfinite(r["mean_abs"])]
+finite_max_rel = [r["max_rel"] for r in rows if math.isfinite(r["max_rel"])]
+payload = {
+    "ok": not mismatches,
+    "checked": len(rows),
+    "argmax_mismatches": len(mismatches),
+    "positions": sorted(set(r["pos"] for r in rows)),
+    "max_compare_steps": max(r["compare_steps"] for r in rows),
+    "max_abs": max(finite_max_abs) if finite_max_abs else None,
+    "max_mean_abs": max(finite_mean_abs) if finite_mean_abs else None,
+    "max_rel": max(finite_max_rel) if finite_max_rel else None,
+}
+if mismatches:
+    first = mismatches[0]
+    payload["reason"] = "prefill_replay_next_logit_argmax_mismatch"
+    payload["first_mismatch"] = {
+        "pos": first["pos"],
+        "step": first["step"],
+        "token_pos": first["token_pos"],
+        "token": first["token"],
+        "serial_argmax": first["serial_argmax"],
+        "prefill_argmax": first["prefill_argmax"],
+    }
+print(json.dumps(payload, sort_keys=True))
+PYEOF
+)
+
 ROLLBACK_STATE_COMPARE_PY=$(cat <<'PYEOF'
 import sys, re, json, math
 if len(sys.argv) != 2:
@@ -1022,6 +1089,7 @@ for entry in "${tests[@]}"; do
     rollback_replay="not_checked"
     verify_graph="not_checked"
     rollback_logit_compare="not_checked"
+    rollback_prefill_logit_compare="not_checked"
     rollback_state_compare="not_checked"
     rollback_prefill_compare="not_checked"
     rollback_input_compare="not_checked"
@@ -1046,6 +1114,7 @@ for entry in "${tests[@]}"; do
             status="HARD_ERROR (rollback logit compare: $rollback_logit_compare)"
             hard_errors=$((hard_errors + 1))
         fi
+        rollback_prefill_logit_compare=$(python3 -c "$ROLLBACK_PREFILL_LOGIT_COMPARE_PY" "$out_file")
         rollback_state_compare=$(python3 -c "$ROLLBACK_STATE_COMPARE_PY" "$out_file")
         rollback_prefill_compare=$(python3 -c "$ROLLBACK_PREFILL_COMPARE_PY" "$out_file")
         rollback_input_compare=$(python3 -c "$ROLLBACK_INPUT_COMPARE_PY" "$out_file")
@@ -1054,10 +1123,10 @@ for entry in "${tests[@]}"; do
     fi
 
     if [ "$mode" = "dflash" ]; then
-        record_json=$(python3 - "$label" "$mode" "$status" "$detect" "$parity" "$rollback_replay" "$rollback_logit_compare" "$rollback_state_compare" "$rollback_prefill_compare" "$rollback_input_compare" "$rollback_fast_token_major_compare" "$rollback_fast_replay_admission" "$verify_graph" "$wall" <<'PYEOF'
+        record_json=$(python3 - "$label" "$mode" "$status" "$detect" "$parity" "$rollback_replay" "$rollback_logit_compare" "$rollback_prefill_logit_compare" "$rollback_state_compare" "$rollback_prefill_compare" "$rollback_input_compare" "$rollback_fast_token_major_compare" "$rollback_fast_replay_admission" "$verify_graph" "$wall" <<'PYEOF'
 import json, sys
 
-label, mode, status, detect, parity, rollback_replay, rollback_logit, rollback_state, rollback_prefill, rollback_input, token_major, admission, verify_graph, wall = sys.argv[1:]
+label, mode, status, detect, parity, rollback_replay, rollback_logit, rollback_prefill_logit, rollback_state, rollback_prefill, rollback_input, token_major, admission, verify_graph, wall = sys.argv[1:]
 
 def decode(value):
     if value in {"not_checked", "not_requested"}:
@@ -1074,6 +1143,7 @@ metrics = {
     "ar_parity": decode(parity),
     "rollback_replay": decode(rollback_replay),
     "rollback_logit_compare": decode(rollback_logit),
+    "rollback_prefill_logit_compare": decode(rollback_prefill_logit),
     "rollback_state_compare": decode(rollback_state),
     "rollback_prefill_compare": decode(rollback_prefill),
     "rollback_input_compare": decode(rollback_input),
@@ -1100,6 +1170,7 @@ PYEOF
         echo "- ar_parity: \`$parity\`"
         echo "- rollback_replay: \`$rollback_replay\`"
         echo "- rollback_logit_compare: \`$rollback_logit_compare\`"
+        echo "- rollback_prefill_logit_compare: \`$rollback_prefill_logit_compare\`"
         echo "- rollback_state_compare: \`$rollback_state_compare\`"
         echo "- rollback_prefill_compare: \`$rollback_prefill_compare\`"
         echo "- rollback_input_compare: \`$rollback_input_compare\`"
