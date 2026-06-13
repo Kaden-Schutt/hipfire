@@ -20916,10 +20916,22 @@ fn forward_scratch_layers(
                 }
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let ffn_row_bytes = tape.ffn_dim * 4;
+                    let w_down_input = if matches!(
+                        layer.w_down.gpu_dtype,
+                        DType::MQ4G256
+                            | DType::MQ6G256
+                            | DType::MQ3G256
+                            | DType::MQ3G256Lloyd
+                            | DType::MFP4G32
+                    ) {
+                        gpu.mq_x_rot.as_ref().unwrap()
+                    } else {
+                        &s.ffn_hidden
+                    };
                     gpu.hip.memcpy_dtod_at(
                         &tape.w_down_input_bufs[delta_layer_idx].buf,
                         *tape_row * ffn_row_bytes,
-                        &s.ffn_hidden.buf,
+                        &w_down_input.buf,
                         0,
                         ffn_row_bytes,
                     )?;
