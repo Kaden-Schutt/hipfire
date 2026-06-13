@@ -510,6 +510,12 @@
     `/tmp/path-c-smoke-20260613-212001.md` plus `/tmp/path-c-smoke-20260613-212001.path_c_trace.json`, again passed without hard errors and kept
     `promotion_verdict=NOT_PROMOTED`: phase1 code `-2.078%`, phase1 prose `+2.988%`, phase2 code `-0.227%`, and phase2 prose `-3.059%`
     tok/s deltas against the 5% threshold, with the phase2 prose τ delta also below the `-1.0%` floor (`-2.097%`).
+    Current-commit graph A/B evidence on `chaingun` `a5ff31e7`,
+    `/tmp/path-c-smoke-20260613-214439.md` plus `/tmp/path-c-smoke-20260613-214439.path_c_trace.json`, again passed without hard errors and
+    kept `promotion_verdict=NOT_PROMOTED`: phase1 code regressed `-7.905%` tok/s, phase1 prose improved only `+2.822%` against the 5% floor,
+    phase2 code improved `+10.349%`, and phase2 prose regressed `-0.586%` tok/s with τ delta `-2.097%` below the `-1.0%` floor. The graph rows
+    carried graph capture/replay counters (`direct=0`), while paired nograph controls carried direct-only counters, so the default-off Path C graph
+    policy remains justified by current mixed performance evidence instead of stale planning data.
     A follow-up AR-parity control showed that direct/no-graph DFlash verify is not yet production-safe:
     `HIPFIRE_DFLASH_AR_PARITY=1 ./tests/coherence-gate-dflash.sh --fast` failed prose at token mismatch `57874` vs `6511` with
     `replay_gdn_tape=0`, while `HIPFIRE_VERIFY_GRAPH=1 HIPFIRE_DFLASH_AR_PARITY=1 ./tests/coherence-gate-dflash.sh --fast` passed
@@ -528,6 +534,15 @@
     with no fast rollback admission. The current-worktree run `/tmp/coherence-dflash-20260613-211728.md` reconfirmed the same dense DFlash graph
     policy after serial-tape rollback promotion: prose used `direct=0/warmup=5/capture=5/replay=82`, code used
     `direct=0/warmup=1/capture=1/replay=3`, and the coherence gate would hard-fail any AR-parity DFlash row that reports `direct>0`.
+    Current `a5ff31e7` graph-on validation with rollback comparison,
+    `/tmp/coherence-dflash-20260613-214039.md` plus `/tmp/coherence-dflash-20260613-214039.dflash_trace.json`, passed strict AR parity with
+    dense verify graph capture active (`direct=0`, prose `warmup=5/capture=5/replay=82`, code `warmup=1/capture=1/replay=3`) and no full-prefill
+    rollback. The paired direct/no-graph control,
+    `HIPFIRE_VERIFY_GRAPH=0 HIPFIRE_DFLASH_AR_PARITY=1 ./tests/coherence-gate-dflash.sh --fast`, failed closed at
+    `/tmp/coherence-dflash-20260613-214816.md` plus `/tmp/coherence-dflash-20260613-214816.dflash_trace.json`: prose AR parity mismatched at token
+    62 (`57874` vs `6511`) and both DFlash rows reported `verify_graph.reason="direct_verify_is_diagnostic_only_for_dflash_ar_parity"` with
+    direct-only counters (`prose direct=83`, `code direct=5`). Dense DFlash direct/no-graph verify therefore remains non-production-safe on the
+    current commit, and keeping graph capture default-on is both enforced and freshly evidenced.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
