@@ -219,6 +219,10 @@
     remains serial. The position-120 prose repro reports `forced_serial=1` with a fast-tape mismatch at `s_matrix[0]`
     (`differing_bytes=709`, `max_abs=2.53553992e38`, `mean_abs=5.81178619e33`, `max_rel=inf`) while live telemetry still reports
     `replay_gdn_tape=0 replay_full_prefill=59`. This restores the fast-vs-serial diagnostic surface without admitting fast tape replay.
+    Extending that forced-serial diagnostic to recapture serial tape inputs shows the same repro diverges before replay state update:
+    `qkv index=0` differs with `max_abs=7.38525391e-3`, and replay-critical `gdn_q index=0` differs with `max_abs=1.89878047e-5`; live telemetry
+    remains `replay_gdn_tape=0 replay_full_prefill=59`. The active blocker is therefore fast verify tape input parity before any fast replay
+    admission, not only the final `tape.replay_gdn` state update.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
