@@ -16507,6 +16507,21 @@ fn forward_prefill_chunk(
                 // same gate when wk/wv aren't Q8.
                 let qkv_same_dtype = layer.wk.gpu_dtype == layer.wq.gpu_dtype
                     && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
+                if let Some(tape) = gdn_tape.as_ref() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let hidden_row_bytes = tape.x_in_dim * 4;
+                        let off_hidden = tape_offset * hidden_row_bytes;
+                        gpu.memcpy_dtod_at_auto(
+                            &tape.fa_bridge_input_bufs[delta_layer_idx].buf,
+                            off_hidden,
+                            &pbs.x_batch.buf,
+                            0,
+                            n * hidden_row_bytes,
+                        )?;
+                    }
+                }
 
                 // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
                 if qkv_is_mq {
@@ -16888,6 +16903,35 @@ fn forward_prefill_chunk(
                     n,
                     kv_cache.compact_offset as i32,
                 )?;
+                if let Some(tape) = gdn_tape.as_ref() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let q_row_bytes = tape.fa_q_dim * 4;
+                        let kv_row_bytes = tape.fa_kv_dim * 4;
+                        gpu.memcpy_dtod_at_auto(
+                            &tape.fa_bridge_q_bufs[delta_layer_idx].buf,
+                            tape_offset * q_row_bytes,
+                            &pbs.fa_q_batch.buf,
+                            0,
+                            n * q_row_bytes,
+                        )?;
+                        gpu.memcpy_dtod_at_auto(
+                            &tape.fa_bridge_k_bufs[delta_layer_idx].buf,
+                            tape_offset * kv_row_bytes,
+                            &pbs.fa_k_batch.buf,
+                            0,
+                            n * kv_row_bytes,
+                        )?;
+                        gpu.memcpy_dtod_at_auto(
+                            &tape.fa_bridge_v_bufs[delta_layer_idx].buf,
+                            tape_offset * kv_row_bytes,
+                            &pbs.fa_v_batch.buf,
+                            0,
+                            n * kv_row_bytes,
+                        )?;
+                    }
+                }
 
                 let use_kld_direct_f16kv_attention = kld_direct_f16kv_attention_eligible(
                     gpu,
@@ -17277,6 +17321,21 @@ fn forward_prefill_chunk(
                 }
 
                 qwen35_apply_fa_gate(gpu, config, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+                if let Some(tape) = gdn_tape.as_ref() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let hidden_row_bytes = tape.x_in_dim * 4;
+                        let off_hidden = tape_offset * hidden_row_bytes;
+                        gpu.memcpy_dtod_at_auto(
+                            &tape.fa_bridge_attn_out_bufs[delta_layer_idx].buf,
+                            off_hidden,
+                            &pbs.fa_attn_out_batch.buf,
+                            0,
+                            n * hidden_row_bytes,
+                        )?;
+                    }
+                }
 
                 // 9. wo residual: x_batch += wo · (optional rotate)(fa_attn_out_batch).
                 // Same MQ rotation requirement as the LA wo path.
@@ -17420,6 +17479,21 @@ fn forward_prefill_chunk(
                         layer.wo.k,
                         n,
                     )?;
+                }
+                if let Some(tape) = gdn_tape.as_ref() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let hidden_row_bytes = tape.x_in_dim * 4;
+                        let off_hidden = tape_offset * hidden_row_bytes;
+                        gpu.memcpy_dtod_at_auto(
+                            &tape.fa_bridge_wo_residual_bufs[delta_layer_idx].buf,
+                            off_hidden,
+                            &pbs.x_batch.buf,
+                            0,
+                            n * hidden_row_bytes,
+                        )?;
+                    }
                 }
 
                 // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
@@ -17771,6 +17845,21 @@ fn forward_prefill_chunk(
                         layer.w_down.k,
                         n,
                     )?;
+                }
+                if let Some(tape) = gdn_tape.as_ref() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let hidden_row_bytes = tape.x_in_dim * 4;
+                        let off_hidden = tape_offset * hidden_row_bytes;
+                        gpu.memcpy_dtod_at_auto(
+                            &tape.fa_bridge_layer_out_bufs[delta_layer_idx].buf,
+                            off_hidden,
+                            &pbs.x_batch.buf,
+                            0,
+                            n * hidden_row_bytes,
+                        )?;
+                    }
                 }
 
                 // Post-layer hidden extract for the DFlash draft path.
@@ -20990,6 +21079,20 @@ fn forward_scratch_layers(
                 } else {
                     None
                 };
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let hidden_row_bytes = tape.x_in_dim * 4;
+                        gpu.hip.memcpy_dtod_at(
+                            &tape.fa_bridge_input_bufs[delta_layer_idx].buf,
+                            *tape_row * hidden_row_bytes,
+                            &s.x.buf,
+                            0,
+                            hidden_row_bytes,
+                        )?;
+                    }
+                }
                 // Cross-arch fast path: fused 3-way projection for wq+wk+wv.
                 // Works for MQ4 and HF4 — same kernel math as the LA 4-way.
                 let dt = layer.wq.gpu_dtype;
@@ -21215,6 +21318,35 @@ fn forward_scratch_layers(
                     n_rot,
                     config.rope_theta,
                 )?;
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let q_row_bytes = tape.fa_q_dim * 4;
+                        let kv_row_bytes = tape.fa_kv_dim * 4;
+                        gpu.hip.memcpy_dtod_at(
+                            &tape.fa_bridge_q_bufs[delta_layer_idx].buf,
+                            *tape_row * q_row_bytes,
+                            &s.fa_q.buf,
+                            0,
+                            q_row_bytes,
+                        )?;
+                        gpu.hip.memcpy_dtod_at(
+                            &tape.fa_bridge_k_bufs[delta_layer_idx].buf,
+                            *tape_row * kv_row_bytes,
+                            &s.fa_k.buf,
+                            0,
+                            kv_row_bytes,
+                        )?;
+                        gpu.hip.memcpy_dtod_at(
+                            &tape.fa_bridge_v_bufs[delta_layer_idx].buf,
+                            *tape_row * kv_row_bytes,
+                            &s.fa_v.buf,
+                            0,
+                            kv_row_bytes,
+                        )?;
+                    }
+                }
                 if kv_cache.compact_offset > 0 {
                     let phys = pos as i32;
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
@@ -21468,6 +21600,20 @@ fn forward_scratch_layers(
                 }
 
                 qwen35_apply_fa_gate(gpu, config, &s.fa_attn_out, &s.fa_gate)?;
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let hidden_row_bytes = tape.x_in_dim * 4;
+                        gpu.hip.memcpy_dtod_at(
+                            &tape.fa_bridge_attn_out_bufs[delta_layer_idx].buf,
+                            *tape_row * hidden_row_bytes,
+                            &s.fa_attn_out.buf,
+                            0,
+                            hidden_row_bytes,
+                        )?;
+                    }
+                }
                 // Fused wo GEMV + residual add: s.x += layer.wo * s.fa_attn_out
                 qwen35_attention_wo_residual(
                     gpu,
@@ -21478,6 +21624,20 @@ fn forward_scratch_layers(
                     &s.x,
                     &s.o,
                 )?;
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let hidden_row_bytes = tape.x_in_dim * 4;
+                        gpu.hip.memcpy_dtod_at(
+                            &tape.fa_bridge_wo_residual_bufs[delta_layer_idx].buf,
+                            *tape_row * hidden_row_bytes,
+                            &s.x.buf,
+                            0,
+                            hidden_row_bytes,
+                        )?;
+                    }
+                }
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
@@ -21637,6 +21797,20 @@ fn forward_scratch_layers(
                     &s.ffn_hidden,
                     &s.x,
                 )?;
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let hidden_row_bytes = tape.x_in_dim * 4;
+                        gpu.hip.memcpy_dtod_at(
+                            &tape.fa_bridge_layer_out_bufs[delta_layer_idx].buf,
+                            *tape_row * hidden_row_bytes,
+                            &s.x.buf,
+                            0,
+                            hidden_row_bytes,
+                        )?;
+                    }
+                }
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {

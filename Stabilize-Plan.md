@@ -139,7 +139,11 @@
     `s.ffn_hidden`. Capturing `gpu.mq_x_rot` for MQ `w_down` clears the LA0 FFN split under
     `HIPFIRE_HFQ4_QKVZA_FAST=0 HIPFIRE_HFQ4_GATE_UP_FAST=0 HIPFIRE_HFQ4_RESIDUAL_FAST=0`; the first mismatch moves to `x_in[3]`
     (`bytes=20480`, `differing_bytes=10071`, `first_offset=0`, `serial_byte=89`, `gdn_byte=196`), i.e. after the intervening FullAttention
-    segment between LA index 2 and LA index 3. The next cut is FullAttention-stage tape around that segment.
+    segment between LA index 2 and LA index 3. FullAttention bridge tape shows the hidden input to that segment matches serial, then the first
+    mismatch appears at `fa_bridge_q[3]` after FullAttention q/k/v projection plus RoPE (`bytes=24576`, `differing_bytes=14526`,
+    `first_offset=0`, `serial_byte=64`, `gdn_byte=8`) under
+    `HIPFIRE_HFQ4_QKVZA_FAST=0 HIPFIRE_HFQ4_GATE_UP_FAST=0 HIPFIRE_HFQ4_RESIDUAL_FAST=0`. The next cut is inside the FullAttention
+    norm/projection/RoPE preamble rather than the attention kernel.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
