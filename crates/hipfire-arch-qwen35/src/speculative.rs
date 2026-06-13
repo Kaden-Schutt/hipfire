@@ -907,17 +907,17 @@ fn dflash_prefix_verify_rollback_replay_from_env() -> bool {
     )
 }
 
-/// `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=1` — opt in to capturing the
-/// committed prefix through the serial target path, then committing DN state
-/// through `GdnTape::replay_gdn` instead of trusting the serial/full-prefill
-/// DN result directly. Still conservative, but it proves the live rollback
-/// commit can be tape-based when fed serial-equivalent tape rows.
+/// `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=0` opts out of the conservative
+/// serial-source tape rollback path. Default-on: capture the committed prefix
+/// through the serial target path, then commit DN state through token-major
+/// GDN tape replay instead of trusting the serial/full-prefill DN result
+/// directly.
 fn dflash_serial_tape_rollback_replay_from_env() -> bool {
-    matches!(
+    !matches!(
         std::env::var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE")
             .ok()
             .as_deref(),
-        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        Some("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
     )
 }
 
@@ -7071,13 +7071,14 @@ pub fn spec_step_dflash(
         let serial_frame_end = gpu.debug_gdn_requant_frame();
         target_snap.restore_to(&mut target.dn_state, gpu)?;
         gpu.debug_set_gdn_requant_frame(serial_frame_start);
-        serial_tape.replay_gdn(
-            gpu,
-            &target.weights,
-            &target.config,
-            &mut target.dn_state,
-            replay_tokens.len(),
-        )?;
+        let _serial_tape_attn_out_diff = serial_tape
+            .replay_gdn_fused_gate_conv_token_major_for_compare(
+                gpu,
+                &target.weights,
+                &target.config,
+                &mut target.dn_state,
+                replay_tokens.len(),
+            )?;
         gpu.debug_set_gdn_requant_frame(serial_frame_end);
         serial_tape.free_gpu(gpu);
         SpecRollbackReplayKind::SerialTape
@@ -10306,12 +10307,12 @@ mod tests {
     }
 
     #[test]
-    fn dflash_serial_tape_rollback_replay_is_opt_in() {
+    fn dflash_serial_tape_rollback_replay_defaults_on_with_opt_out() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE");
         }
-        assert!(!dflash_serial_tape_rollback_replay_from_env());
+        assert!(dflash_serial_tape_rollback_replay_from_env());
         unsafe {
             std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE", "1");
         }

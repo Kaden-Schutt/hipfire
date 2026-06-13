@@ -458,12 +458,15 @@
     `differing_bytes=11921`, `max_abs=8.83549452e-4`, and `mean_abs=1.68811166e-4`. The replacement path therefore cannot stop at repairing
     layer-0 qkvza rows; it must either make the verify layer outputs feed serial-equivalent `x_in` to later LA layers, or repair/admit the whole
     per-layer tape chain before enabling live fast GDN rollback.
-    Two non-full-prefill rollback candidates are now explicitly rejected by the same AR-parity gate. The committed-prefix verify path,
+    The committed-prefix verify rollback candidate remains rejected by the same AR-parity gate:
     `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY=1`, removed full-prefill rollback (`replay_prefix_verify=38`, `replay_full_prefill=0`) but failed
-    prose AR parity at token 14 and fell into a repetition attractor (`/tmp/coherence-dflash-20260613-205741.md`). A serial-source tape commit
-    candidate, `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=1`, also removed full-prefill rollback (`replay_serial_tape=83`, `replay_full_prefill=0`)
-    but failed prose AR parity at token 62 (`/tmp/coherence-dflash-20260613-210131.md`). Both paths remain opt-in diagnostics; neither can replace
-    conservative live rollback until it passes strict AR parity on prose and code.
+    prose AR parity at token 14 and fell into a repetition attractor (`/tmp/coherence-dflash-20260613-205741.md`). The serial-source tape commit
+    candidate initially failed when it used the layer-major `replay_gdn` cadence (`/tmp/coherence-dflash-20260613-210131.md`), but token-major
+    serial-source tape replay passed and is now the live default when a GDN tape is available. Focused default validation
+    `/tmp/coherence-dflash-20260613-211049.md` plus `/tmp/coherence-dflash-20260613-211049.dflash_trace.json` passed strict prose/code AR parity
+    with fast verify-tape replay still disabled (`replay_gdn_tape=0`) and no full-prefill rollback (`replay_full_prefill=0`): prose used
+    `replay_serial_tape=92`, code used `replay_serial_tape=4` plus `replay_verify_complete=1`. `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=0` is now
+    the diagnostic opt-out back to the older conservative fallback.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
