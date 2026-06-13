@@ -220,6 +220,7 @@ keys = [
     "HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS",
     "HIPFIRE_DFLASH_TRACE_POSITION",
     "HIPFIRE_DFLASH_SERIAL_QKVZA_SELF_COMPARE",
+    "HIPFIRE_DFLASH_SERIAL_TAPE_X_IN_COMPARE",
     "HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN",
     "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY",
     "HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE",
@@ -1214,7 +1215,7 @@ meta_pattern = re.compile(
     re.MULTILINE,
 )
 single_match_pattern = re.compile(
-    r"^\[dflash-rollback-qkvza-single-row-compare\] layer=(\d+) match$",
+    r"^\[dflash-rollback-qkvza-single-row-compare\] layer=(\d+)(?: row=(\d+))? match$",
     re.MULTILINE,
 )
 single_unsupported_pattern = re.compile(
@@ -1222,7 +1223,7 @@ single_unsupported_pattern = re.compile(
     re.MULTILINE,
 )
 single_mismatch_pattern = re.compile(
-    r"^\[dflash-rollback-qkvza-single-row-compare\] layer=(\d+) mismatch family=([A-Za-z0-9_]+) "
+    r"^\[dflash-rollback-qkvza-single-row-compare\] layer=(\d+)(?: row=(\d+))? mismatch family=([A-Za-z0-9_]+) "
     r"index=(\d+) bytes=(\d+) differing_bytes=(\d+) first_offset=(\d+) "
     r"serial_byte=(\d+) single_byte=(\d+)$",
     re.MULTILINE,
@@ -1237,6 +1238,19 @@ self_mismatch_pattern = re.compile(
     r"layer=(\d+) pos=(\d+) family=([A-Za-z0-9_]+) mismatch len=(\d+) "
     r"bit_diff=(\d+) first=(\d+) probe_f32=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
     r"serial_f32=([+\-0-9.eE]+|NaN|nan|inf|-inf) max_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"mean_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf)$",
+    re.MULTILINE,
+)
+tape_x_in_match_pattern = re.compile(
+    r"^\[dflash-serial-tape-x-in-compare\] "
+    r"layer=(\d+) pos=(\d+) tape_row=(\d+) match len=(\d+)$",
+    re.MULTILINE,
+)
+tape_x_in_mismatch_pattern = re.compile(
+    r"^\[dflash-serial-tape-x-in-compare\] "
+    r"layer=(\d+) pos=(\d+) tape_row=(\d+) mismatch len=(\d+) "
+    r"bit_diff=(\d+) first=(\d+) source_f32=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"captured_f32=([+\-0-9.eE]+|NaN|nan|inf|-inf) max_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
     r"mean_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf)$",
     re.MULTILINE,
 )
@@ -1257,6 +1271,7 @@ events = []
 route_meta = []
 single_row_checks = []
 serial_self_checks = []
+serial_tape_x_in_checks = []
 last_meta_by_layer = {}
 for m in meta_pattern.finditer(out):
     meta = {
@@ -1286,10 +1301,13 @@ for m in match_pattern.finditer(out):
     events.append((m.start(), event))
 
 for m in single_match_pattern.finditer(out):
-    single_row_checks.append({
+    event = {
         "ok": True,
         "layer": int(m.group(1)),
-    })
+    }
+    if m.group(2) is not None:
+        event["row"] = int(m.group(2))
+    single_row_checks.append(event)
 for m in single_unsupported_pattern.finditer(out):
     event = {
         "ok": False,
@@ -1301,18 +1319,21 @@ for m in single_unsupported_pattern.finditer(out):
         event["dtype"] = m.group(3)
     single_row_checks.append(event)
 for m in single_mismatch_pattern.finditer(out):
-    single_row_checks.append({
+    event = {
         "ok": False,
         "layer": int(m.group(1)),
-        "family": m.group(2),
-        "index": int(m.group(3)),
-        "bytes": int(m.group(4)),
-        "differing_bytes": int(m.group(5)),
-        "first_offset": int(m.group(6)),
-        "serial_byte": int(m.group(7)),
-        "single_byte": int(m.group(8)),
-        "reason": f"{m.group(2)}_mismatch",
-    })
+        "family": m.group(3),
+        "index": int(m.group(4)),
+        "bytes": int(m.group(5)),
+        "differing_bytes": int(m.group(6)),
+        "first_offset": int(m.group(7)),
+        "serial_byte": int(m.group(8)),
+        "single_byte": int(m.group(9)),
+        "reason": f"{m.group(3)}_mismatch",
+    }
+    if m.group(2) is not None:
+        event["row"] = int(m.group(2))
+    single_row_checks.append(event)
 for m in self_match_pattern.finditer(out):
     serial_self_checks.append({
         "ok": True,
@@ -1336,6 +1357,29 @@ for m in self_mismatch_pattern.finditer(out):
         "max_abs": float(m.group(9)),
         "mean_abs": float(m.group(10)),
         "reason": f"serial_qkvza_self_{family}_mismatch",
+    })
+for m in tape_x_in_match_pattern.finditer(out):
+    serial_tape_x_in_checks.append({
+        "ok": True,
+        "layer": int(m.group(1)),
+        "pos": int(m.group(2)),
+        "tape_row": int(m.group(3)),
+        "len": int(m.group(4)),
+    })
+for m in tape_x_in_mismatch_pattern.finditer(out):
+    serial_tape_x_in_checks.append({
+        "ok": False,
+        "layer": int(m.group(1)),
+        "pos": int(m.group(2)),
+        "tape_row": int(m.group(3)),
+        "len": int(m.group(4)),
+        "bit_diff": int(m.group(5)),
+        "first": int(m.group(6)),
+        "source_f32": float(m.group(7)),
+        "captured_f32": float(m.group(8)),
+        "max_abs": float(m.group(9)),
+        "mean_abs": float(m.group(10)),
+        "reason": "serial_tape_x_in_mismatch",
     })
 for m in unsupported_pattern.finditer(out):
     layer = int(m.group(4))
@@ -1393,6 +1437,8 @@ if single_row_checks:
     payload["single_row_checks"] = single_row_checks
 if serial_self_checks:
     payload["serial_self_checks"] = serial_self_checks
+if serial_tape_x_in_checks:
+    payload["serial_tape_x_in_checks"] = serial_tape_x_in_checks
 if not checks:
     payload["ok"] = True
 if mismatches:
@@ -1945,10 +1991,43 @@ for entry in "${tests[@]}"; do
     fi
 
     if [ "$mode" = "dflash" ]; then
-        record_json=$(python3 - "$label" "$mode" "$status" "$detect" "$parity" "$rollback_replay" "$rollback_logit_compare" "$rollback_prefill_logit_compare" "$rollback_state_compare" "$rollback_prefill_compare" "$rollback_input_compare" "$rollback_qkvza_route_compare" "$rollback_x_in_compare" "$rollback_qkvza_repair_compare" "$rollback_hidden_boundary_compare" "$rollback_fast_token_major_compare" "$rollback_fast_replay_admission" "$verify_graph" "$wall" <<'PYEOF'
+        record_input_file=$(mktemp "${TMPDIR:-/tmp}/coherence-dflash-record.XXXXXX")
+        printf '%s\0' \
+            "$label" "$mode" "$status" "$detect" "$parity" "$rollback_replay" \
+            "$rollback_logit_compare" "$rollback_prefill_logit_compare" \
+            "$rollback_state_compare" "$rollback_prefill_compare" \
+            "$rollback_input_compare" "$rollback_qkvza_route_compare" \
+            "$rollback_x_in_compare" "$rollback_qkvza_repair_compare" \
+            "$rollback_hidden_boundary_compare" "$rollback_fast_token_major_compare" \
+            "$rollback_fast_replay_admission" "$verify_graph" "$wall" \
+            > "$record_input_file"
+        record_json=$(python3 - "$record_input_file" <<'PYEOF'
 import json, sys
 
-label, mode, status, detect, parity, rollback_replay, rollback_logit, rollback_prefill_logit, rollback_state, rollback_prefill, rollback_input, qkvza_route, x_in_compare, qkvza_repair, hidden_boundary, token_major, admission, verify_graph, wall = sys.argv[1:]
+with open(sys.argv[1], "rb") as f:
+    parts = f.read().split(b"\0")
+values = [part.decode("utf-8", "replace") for part in parts[:-1]]
+(
+    label,
+    mode,
+    status,
+    detect,
+    parity,
+    rollback_replay,
+    rollback_logit,
+    rollback_prefill_logit,
+    rollback_state,
+    rollback_prefill,
+    rollback_input,
+    qkvza_route,
+    x_in_compare,
+    qkvza_repair,
+    hidden_boundary,
+    token_major,
+    admission,
+    verify_graph,
+    wall,
+) = values
 
 def decode(value):
     if value in {"not_checked", "not_requested"}:
@@ -1985,6 +2064,7 @@ print(json.dumps({
 }, sort_keys=True))
 PYEOF
 )
+        rm -f "$record_input_file"
         append_trace_json_record "$record_json"
     fi
 

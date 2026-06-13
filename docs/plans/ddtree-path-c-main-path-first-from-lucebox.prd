@@ -477,6 +477,29 @@ Latest rollback diagnostic evidence:
   raw-gate copy operation as primary causes; the active isolate is now
   the `x_in` tape snapshot/lifetime or row mapping between serial
   capture and later qkvza-route recompute.
+- `/tmp/coherence-dflash-20260614-003357.md` added row-aware
+  single-row qkvza diagnostics plus immediate serial tape `x_in`
+  capture checks under `HIPFIRE_DFLASH_SERIAL_TAPE_X_IN_COMPARE=1`.
+  Prose and code both passed AR parity, all `serial_self_checks` and
+  `serial_tape_x_in_checks` matched, and dense DFlash still used verify
+  graph capture/replay by default (`direct=0`). The qkvza route compare
+  still rejected fast replay at LA0: prose first mismatched at
+  `family=qkvza_route_qkv`, `first_offset=0`, `row=0`, while the
+  row-specific fused recompute first mismatched
+  `qkvza_single_beta_raw`. This rules out a hidden later-row selection
+  problem and rules out immediate tape `x_in` copy corruption; the
+  remaining blocker is a projection-family split after exact `x_in`
+  between the serial capture route
+  (`forward_scratch_capture_gdn_tape:fused_qkvza`) and the verify route
+  (`verify_dflash_block:gemm_qkvza`).
+- `/tmp/coherence-dflash-20260614-003019.md` repeated the row-aware
+  diagnostic with `HIPFIRE_HFQ4_QKVZA_FAST=0`. Prose hard-failed AR
+  parity at token 62 and the qkvza route mismatch persisted, changing
+  to `qkvza_route_beta_raw_mismatch`. This invalidates the simple
+  slow-route flag as a production fix; live DFlash rollback therefore
+  remains on conservative serial-source tape/full-prefill fallback, and
+  fast GDN-tape replay remains diagnostic-only until the projection
+  route split is repaired.
 
 ## References
 

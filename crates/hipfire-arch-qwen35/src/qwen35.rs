@@ -13034,6 +13034,11 @@ fn dflash_serial_qkvza_self_compare_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("HIPFIRE_DFLASH_SERIAL_QKVZA_SELF_COMPARE").is_some())
 }
 
+fn dflash_serial_tape_x_in_compare_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("HIPFIRE_DFLASH_SERIAL_TAPE_X_IN_COMPARE").is_some())
+}
+
 fn log_dflash_serial_qkvza_self_diff(
     family: &str,
     layer_idx: usize,
@@ -13070,6 +13075,47 @@ fn log_dflash_serial_qkvza_self_diff(
         "[dflash-serial-qkvza-self-compare] layer={layer_idx} pos={pos} family={family} mismatch len={len} bit_diff={bit_diff} first={first} probe_f32={:.9e} serial_f32={:.9e} max_abs={:.9e} mean_abs={:.9e}",
         probe[first],
         serial[first],
+        max_abs,
+        mean_abs,
+    );
+}
+
+fn log_dflash_serial_tape_x_in_diff(
+    layer_idx: usize,
+    pos: usize,
+    tape_row: usize,
+    source: &[f32],
+    captured: &[f32],
+) {
+    let len = source.len().min(captured.len());
+    let first_mismatch = source
+        .iter()
+        .zip(captured.iter())
+        .take(len)
+        .position(|(a, b)| a.to_bits() != b.to_bits());
+    let Some(first) = first_mismatch else {
+        eprintln!(
+            "[dflash-serial-tape-x-in-compare] layer={layer_idx} pos={pos} tape_row={tape_row} match len={len}"
+        );
+        return;
+    };
+
+    let mut max_abs = 0.0f32;
+    let mut sum_abs = 0.0f64;
+    let mut bit_diff = 0usize;
+    for (a, b) in source.iter().zip(captured.iter()).take(len) {
+        if a.to_bits() != b.to_bits() {
+            bit_diff += 1;
+        }
+        let abs = (*a - *b).abs();
+        max_abs = max_abs.max(abs);
+        sum_abs += abs as f64;
+    }
+    let mean_abs = if len == 0 { 0.0 } else { sum_abs / len as f64 };
+    eprintln!(
+        "[dflash-serial-tape-x-in-compare] layer={layer_idx} pos={pos} tape_row={tape_row} mismatch len={len} bit_diff={bit_diff} first={first} source_f32={:.9e} captured_f32={:.9e} max_abs={:.9e} mean_abs={:.9e}",
+        source[first],
+        captured[first],
         max_abs,
         mean_abs,
     );
@@ -20982,6 +21028,28 @@ fn forward_scratch_layers(
                         0,
                         x_in_row_bytes,
                     )?;
+                    if layer_idx == 0 && dflash_serial_tape_x_in_compare_enabled() {
+                        gpu.hip.device_synchronize()?;
+                        let captured_x_in = gpu.alloc_tensor(&[tape.x_in_dim], DType::F32)?;
+                        gpu.memcpy_dtod_at_auto(
+                            &captured_x_in.buf,
+                            0,
+                            &tape.x_in_bufs[delta_layer_idx].buf,
+                            *tape_row * x_in_row_bytes,
+                            x_in_row_bytes,
+                        )?;
+                        gpu.hip.device_synchronize()?;
+                        let source_host = gpu.download_f32(x_in_for_tape)?;
+                        let captured_host = gpu.download_f32(&captured_x_in)?;
+                        log_dflash_serial_tape_x_in_diff(
+                            layer_idx,
+                            pos,
+                            *tape_row,
+                            &source_host,
+                            &captured_host,
+                        );
+                        gpu.free_tensor(captured_x_in)?;
+                    }
                     gpu.memcpy_dtod_at_auto(
                         &tape.alpha_raw_bufs[delta_layer_idx].buf,
                         *tape_row * alpha_beta_row_bytes,
