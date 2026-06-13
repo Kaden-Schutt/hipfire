@@ -234,6 +234,12 @@
     `fa_bridge_input[6]` (`max_abs=1.49011612e-7`). These tolerance walks still leave final recurrent-state drift at `s_matrix[4]`
     (`differing_bytes=2`, `max_abs=2.59614843e33`), so tolerance at intermediate tape boundaries is not admission evidence. The remaining blocker
     is proving a bounded recurrent/logit effect for these tiny FA/hidden drifts, or eliminating them before fast replay can be considered.
+    Rechecking the all-projection-fast-off repro with Q8 FullAttention controls confirms they are not the active fix: one-row masked launches and
+    tree-bias removal reproduce the same `fa_bridge_attn_raw[3]` and `s_matrix[4]` drift; scalar and serial-KV row loops require
+    `HIPFIRE_VERIFY_GRAPH=0` because they allocate during graph capture, and under no-graph they match the no-graph baseline exactly. No-graph
+    reduces the final compare to two subnormal `s_matrix[3]` byte differences (`max_abs=2.40741243e-35`), and adding FA raw tolerance again moves
+    the first visible input drift to tiny `x_in[4]` (`max_abs=3.57627869e-7`). These are still diagnostic-only controls: verify-graph off changes
+    the trajectory count (`replay_full_prefill=57` vs `59`) and is not promotion evidence for fast tape replay.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
