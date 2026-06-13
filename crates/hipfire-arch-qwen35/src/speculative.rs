@@ -3714,6 +3714,37 @@ impl GdnTape {
         Ok(None)
     }
 
+    fn compare_x_inputs_to(
+        &self,
+        gpu: &Gpu,
+        expected: &GdnTape,
+        n_positions: usize,
+    ) -> HipResult<Option<DeltaNetSnapshotDiff>> {
+        let x_in_atol = dflash_rollback_x_in_atol_from_env();
+        let x_in_bytes = n_positions * self.x_in_dim * 4;
+        for i in 0..self.x_in_bufs.len() {
+            if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                gpu,
+                "x_in",
+                i,
+                &self.x_in_bufs[i].buf,
+                &expected.x_in_bufs[i].buf,
+                x_in_bytes,
+            )? {
+                if x_in_atol > 0.0
+                    && diff
+                        .f32_stats
+                        .as_ref()
+                        .is_some_and(|stats| stats.max_abs <= x_in_atol)
+                {
+                    continue;
+                }
+                return Ok(Some(diff));
+            }
+        }
+        Ok(None)
+    }
+
     fn compare_gdn_inputs_layer_to(
         &self,
         gpu: &Gpu,
@@ -7138,6 +7169,32 @@ pub fn spec_step_dflash(
                     }
                     None => eprintln!(
                         "[dflash-rollback-input-compare] pos={} accepted={} replay_steps={} forced_serial=1 match",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                    ),
+                }
+                match serial_tape.compare_x_inputs_to(gpu, tape, accept_len + 1)? {
+                    Some(diff) => {
+                        let context =
+                            rollback_input_diff_context(&target.config, tape, &diff, position);
+                        eprintln!(
+                            "[dflash-rollback-x-in-compare] pos={} accepted={} replay_steps={} forced_serial=1 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} verify_byte={}{}",
+                            position,
+                            accept_len,
+                            accept_len + 1,
+                            diff.family,
+                            diff.index,
+                            diff.bytes,
+                            diff.differing_bytes,
+                            diff.first_offset,
+                            diff.actual_byte,
+                            diff.expected_byte,
+                            context,
+                        );
+                    }
+                    None => eprintln!(
+                        "[dflash-rollback-x-in-compare] pos={} accepted={} replay_steps={} forced_serial=1 match",
                         position,
                         accept_len,
                         accept_len + 1,

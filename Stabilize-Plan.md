@@ -451,6 +451,13 @@
     replacement for full-prefill rollback; after LA0 is repaired, downstream verify-captured LA inputs are already divergent. Fast rollback remains
     diagnostic-only until the verify path can produce serial-equivalent per-layer captured inputs or a broader live repair/admission policy proves
     recurrent-state parity across layers.
+    The coherence gate now reports an `x_in`-only rollback comparison so this downstream split is visible without being masked by the earlier LA0
+    `qkv` mismatch. Fresh focused evidence `/tmp/coherence-dflash-20260613-205148.md` plus
+    `/tmp/coherence-dflash-20260613-205148.dflash_trace.json` passed strict AR parity and records
+    `rollback_x_in_compare.ok=false`: the first downstream input mismatch is `x_in[1]` at logical position 66, `hidden_elem=0`,
+    `differing_bytes=11921`, `max_abs=8.83549452e-4`, and `mean_abs=1.68811166e-4`. The replacement path therefore cannot stop at repairing
+    layer-0 qkvza rows; it must either make the verify layer outputs feed serial-equivalent `x_in` to later LA layers, or repair/admit the whole
+    per-layer tape chain before enabling live fast GDN rollback.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
