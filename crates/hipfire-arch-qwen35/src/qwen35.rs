@@ -16277,6 +16277,15 @@ fn forward_prefill_chunk(
                         layer.wo.k,
                         n,
                     )?;
+                } else if gdn_tape.is_some() {
+                    gpu.gemm_hfq4g256_residual_exact(
+                        &layer.wo.buf,
+                        wo_input,
+                        &pbs.x_batch,
+                        layer.wo.m,
+                        layer.wo.k,
+                        n,
+                    )?;
                 } else {
                     gpu.gemm_hfq4g256_residual(
                         &layer.wo.buf,

@@ -22815,6 +22815,76 @@ impl Gpu {
         result
     }
 
+    pub fn gemm_hfq4g256_residual_exact(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
+            self.ensure_kernel(
+                "gemm_hfq4g256_residual_wave64",
+                kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC,
+                "gemm_hfq4g256_residual_wave64",
+            )?;
+            ("gemm_hfq4g256_residual_wave64", [64, 1, 1], 2)
+        } else {
+            self.ensure_kernel(
+                "gemm_hfq4g256_residual",
+                kernels::GEMM_HFQ4G256_RESIDUAL_SRC,
+                "gemm_hfq4g256_residual",
+            )?;
+            ("gemm_hfq4g256_residual", [32, 1, 1], 1)
+        };
+        let func = &self.functions[func_name];
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let batch_tiles = {
+            const BATCH_TILE: usize = 8;
+            (batch_size + BATCH_TILE - 1) / BATCH_TILE
+        };
+        let grid_x = (m as u32 + grid_div - 1) / grid_div;
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 4 + batch_size * m * 4 * 2;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_exact", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, batch_tiles as u32, 1],
+                block,
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Batched HFQ3-G256 GEMM with fused residual add (MQ3 path).
     ///
     /// HFQ3 sibling of `gemm_hfq4g256_residual` — single scalar variant,

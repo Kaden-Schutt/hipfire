@@ -563,6 +563,21 @@ Latest rollback diagnostic evidence:
   `attn_residual` before LA1 (`max_abs=0.00144004822`). This keeps live
   DFlash rollback on conservative serial-source tape/full-prefill
   fallback while fast GDN-tape replay remains diagnostic-only.
+- `/tmp/coherence-dflash-20260614-014333.md` added an exact HFQ4/MQ4
+  residual dispatch for tape-producing dense verify and routed the LA
+  `wo + residual` branch through it when a GDN tape is being recorded.
+  The standalone `test_gemm_hfq4g256_residual -- 5120 6144 1 2`
+  reproduced the fast residual mismatch at the production LA shape
+  (`10147/10240` divergent values for `N=2`), while
+  `HIPFIRE_HFQ4_RESIDUAL_FAST=0 test_gemm_hfq4g256_residual -- 5120
+  6144 2` was byte-exact on the same shape. The focused DFlash
+  diagnostic then moved the first rollback input mismatch from
+  `attn_residual` to `ffn_gate` (`max_abs=0.000219663139`), reduced
+  the LA1 `gdn_q` input delta to `max_abs=0.00000599212945`, and kept
+  qkvza exact-route comparison passing. Fast GDN-tape replay remains
+  diagnostic-only because admission still reports recurrent-state and
+  rollback-input mismatches, but the residual projection split is no
+  longer the first blocker.
 
 ## References
 
