@@ -115,20 +115,22 @@ Owns generation orchestration:
 This crate should decide *what* module runs next and *which backend* is
 selected. It should not contain the backend implementation details.
 
-### `hipfire-gpu`
+### `hipfire-rocm`
 
 Owns HIP/RDNA/CDNA backend implementation:
 
-- GPU module runners,
-- GPU tensor views/adapters,
+- ROCm module runners,
+- ROCm tensor views/adapters,
 - calls into `rdna-compute`,
 - kernel dispatch wrappers,
 - graph/capture details,
-- GPU-specific cache invalidation.
+- ROCm-specific cache invalidation.
 
 `rdna-compute` can remain the lower-level HIP kernel/runtime crate under this
 backend. Do not rename or split it wholesale before the wrapper boundary is
-proven.
+proven. Keep this crate name backend-specific so future wrappers such as
+`hipfire-cuda` or `hipfire-gaudi` can implement the same module contracts
+without overloading a generic GPU crate name.
 
 ### `hipfire-cpu`
 
@@ -453,11 +455,11 @@ split:
 - Route the module through `hipfire-generate` with CPU oracle support.
 - Add per-module and final-logits drift evidence.
 
-### Phase 3 - GPU Backend Wrapper
+### Phase 3 - ROCm Backend Wrapper
 
-- Add `hipfire-gpu` as a wrapper over existing `rdna-compute` and arch calls.
+- Add `hipfire-rocm` as a wrapper over existing `rdna-compute` and arch calls.
 - Do not move every kernel at once.
-- Route the same module contract to GPU production behavior.
+- Route the same module contract to ROCm production behavior.
 - Keep `rdna-compute` as low-level HIP kernel/runtime support.
 
 ### Phase 4 - State Arena
@@ -510,9 +512,11 @@ hipfire-eval
     +-- hipfire-generate
     |       |
     |       +-- hipfire-cpu
-    |       +-- hipfire-gpu
+    |       +-- hipfire-rocm
     |       |       +-- rdna-compute
     |       |               +-- hip-bridge
+    |       +-- hipfire-cuda      (future)
+    |       +-- hipfire-gaudi     (future)
     |       +-- hipfire-npu
     +-- hipfire-coherence
     +-- hipfire-evidence
@@ -528,7 +532,7 @@ below `hipfire-generate`.
 - Should `hipfire-model` own model package discovery, or should that stay in
   `hipfire-cli` until packaging stabilizes?
 - What is the smallest stable `ModuleKind` set for qwen3.5 NPU bring-up?
-- How much of `rdna-compute::Gpu` should be exposed through `hipfire-gpu`
+- How much of `rdna-compute::Gpu` should be exposed through `hipfire-rocm`
   versus hidden behind backend tensor handles?
-- What evidence tolerance should be accepted for CPU/GPU/NPU mixed pipelines?
-
+- What evidence tolerance should be accepted for CPU/ROCm/CUDA/Gaudi/NPU mixed
+  pipelines?
