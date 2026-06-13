@@ -377,6 +377,16 @@ Latest rollback diagnostic evidence:
   blocker upstream of the `wo` residual projection output, consistent
   with the qkv/qkvza route split already reported by
   `rollback_input_compare`.
+- `/tmp/coherence-dflash-prefix-verify-20260613-223806.md` tested the
+  existing prefix-verify replacement candidate with serial tape disabled.
+  It avoided serial/full-prefill rollback
+  (`replay_prefix_verify=52`, `replay_full_prefill=0` on prose) but
+  failed AR parity at token 9, so prefix-verify rollback is not a
+  production replacement.
+- `/tmp/coherence-dflash-q8-per-token-20260613-223936.md` tested Q8 GDN
+  verify through per-token kernels. It still used full-prefill rollback
+  on prose (`replay_full_prefill=87`) and failed AR parity at token 62,
+  so the blocker is not solved by forcing per-token Q8 GDN verify.
 
 ## References
 
