@@ -93,6 +93,22 @@ find_model_file() {
         cand="$dir/$lookup_name"
         [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
     done
+
+    # Older staged artifacts used a dotted quant token. Keep gates usable on
+    # existing local caches while the script entries stay canonical.
+    case "$lookup_name" in
+        *-mq[1-8].hfq)
+            local quant prefix legacy
+            quant="${lookup_name##*-}"
+            prefix="${lookup_name%-"$quant"}"
+            prefix="${prefix%-}"
+            legacy="${prefix}.${quant}"
+            for dir in "${dirs[@]}"; do
+                cand="$dir/$legacy"
+                [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+            done
+            ;;
+    esac
     return 1
 }
 

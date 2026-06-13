@@ -64,10 +64,36 @@ extract_tau()   { grep -Eo 'τ=[0-9]+\.[0-9]+' "$1" | tail -1 || echo "?"; }
 extract_accepted()  { grep -Eo 'accepted: [0-9]+' "$1" | tail -1 || echo "?"; }
 
 # ── Config ─────────────────────────────────────────────────────────
+resolve_model_path() {
+    local dir="$1"
+    local name="$2"
+    local path="$dir/$name"
+    if [ -f "$path" ]; then
+        printf '%s\n' "$path"
+        return 0
+    fi
+
+    case "$name" in
+        *-mq[1-8].hfq)
+            local quant prefix legacy
+            quant="${name##*-}"
+            prefix="${name%-"$quant"}"
+            prefix="${prefix%-}"
+            legacy="$dir/${prefix}.${quant}"
+            if [ -f "$legacy" ]; then
+                printf '%s\n' "$legacy"
+                return 0
+            fi
+            ;;
+    esac
+
+    printf '%s\n' "$path"
+}
+
 declare -A MODELS=(
-    [4b]="$HOME_MODELS/qwen3.5-4b-mq4.hfq"
-    [9b]="$HOME_MODELS/qwen3.5-9b-mq4.hfq"
-    [27b]="$HOME_MODELS/qwen3.5-27b-mq4.hfq"
+    [4b]="$(resolve_model_path "$HOME_MODELS" qwen3.5-4b-mq4.hfq)"
+    [9b]="$(resolve_model_path "$HOME_MODELS" qwen3.5-9b-mq4.hfq)"
+    [27b]="$(resolve_model_path "$HOME_MODELS" qwen3.5-27b-mq4.hfq)"
 )
 declare -A DRAFTS=(
     [4b]="$BRANCH_MODELS/qwen3.5-4b-mq4.dflash.hfq"
