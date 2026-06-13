@@ -436,6 +436,13 @@
     `forward_scratch_capture_gdn_tape:fused_qkvza` versus `verify_dflash_block:gemm_qkvza`, with `x_in` as the matched prior boundary and `qkv`
     as the first mismatching family. This makes the remaining fast-rollback blocker machine-readable for eval ingestion instead of relying on
     planning-doc inference.
+    A sharper route diagnostic now feeds the serial-captured `x_in` through the production batch-size qkvza route and compares only the committed
+    prefix rows against serial qkv. Fresh evidence `/tmp/coherence-dflash-20260613-203511.md` plus
+    `/tmp/coherence-dflash-20260613-203511.dflash_trace.json` passes AR parity and records `rollback_qkvza_route_compare.ok=false` at the same
+    prose position 66: layer 0 `qkvza_route_qkv` differs with the same `differing_bytes=22340` and `max_abs=1.36566162e-2` as the original
+    captured-input split. That proves the qkv split is reproduced by the batch-size qkvza route itself when fed serial `x_in`; it is not a hidden
+    tape copy, replay order, or earlier projection-input capture issue. The next implementation cut must either make the batched qkvza kernel family
+    serial-equivalent for these rows, or keep fast rollback rejected behind the existing recurrent/logit admission blockers.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

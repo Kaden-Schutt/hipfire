@@ -24,7 +24,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1246,6 +1246,237 @@ struct DeltaNetSnapshotDiff {
     expected_f32: Option<f32>,
     actual_f32: Option<f32>,
     f32_stats: Option<F32DiffStats>,
+}
+
+enum QkvzaRouteCompare {
+    Match,
+    Mismatch(DeltaNetSnapshotDiff),
+    Unsupported(&'static str),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_batched_qkvza_dispatch(
+    gpu: &mut Gpu,
+    wqkv: &llama::WeightTensor,
+    wz: &llama::WeightTensor,
+    w_beta: &llama::WeightTensor,
+    w_alpha: &llama::WeightTensor,
+    x: &GpuTensor,
+    qkv: &GpuTensor,
+    z: &GpuTensor,
+    beta: &GpuTensor,
+    alpha: &GpuTensor,
+    n_positions: usize,
+) -> HipResult<QkvzaRouteCompare> {
+    let same_dtype = wz.gpu_dtype == wqkv.gpu_dtype
+        && w_beta.gpu_dtype == wqkv.gpu_dtype
+        && w_alpha.gpu_dtype == wqkv.gpu_dtype;
+    if !same_dtype {
+        return Ok(QkvzaRouteCompare::Unsupported("mixed_qkvza_dtype"));
+    }
+    match wqkv.gpu_dtype {
+        DType::Q8_0 => {
+            if gpu.arch_caps.has_wmma() {
+                gpu.gemm_qkvza_q8_0_wmma(
+                    &wqkv.buf,
+                    &wz.buf,
+                    &w_beta.buf,
+                    &w_alpha.buf,
+                    x,
+                    qkv,
+                    z,
+                    beta,
+                    alpha,
+                    wqkv.m,
+                    wz.m,
+                    w_beta.m,
+                    w_alpha.m,
+                    wqkv.k,
+                    n_positions,
+                )?;
+            } else {
+                gpu.gemm_q8_0_batched_chunked(&wqkv.buf, x, qkv, wqkv.m, wqkv.k, n_positions)?;
+                gpu.gemm_q8_0_batched_chunked(&wz.buf, x, z, wz.m, wz.k, n_positions)?;
+                gpu.gemm_q8_0_batched_chunked(
+                    &w_beta.buf,
+                    x,
+                    beta,
+                    w_beta.m,
+                    w_beta.k,
+                    n_positions,
+                )?;
+                gpu.gemm_q8_0_batched_chunked(
+                    &w_alpha.buf,
+                    x,
+                    alpha,
+                    w_alpha.m,
+                    w_alpha.k,
+                    n_positions,
+                )?;
+            }
+        }
+        DType::F32 => {
+            gpu.gemm_f32_register_tiled(&wqkv.buf, x, qkv, wqkv.m, wqkv.k, n_positions)?;
+            gpu.gemm_f32_register_tiled(&wz.buf, x, z, wz.m, wz.k, n_positions)?;
+            gpu.gemm_f32_register_tiled(&w_beta.buf, x, beta, w_beta.m, w_beta.k, n_positions)?;
+            gpu.gemm_f32_register_tiled(&w_alpha.buf, x, alpha, w_alpha.m, w_alpha.k, n_positions)?;
+        }
+        DType::F16 | DType::BF16 => {
+            gpu.fused_qkvza_f16_xf32_batched(
+                &wqkv.buf,
+                &wz.buf,
+                &w_beta.buf,
+                &w_alpha.buf,
+                x,
+                qkv,
+                z,
+                beta,
+                alpha,
+                wqkv.m,
+                wz.m,
+                w_beta.m,
+                w_alpha.m,
+                wqkv.k,
+                n_positions,
+            )?;
+        }
+        DType::MQ4G256 | DType::HFQ4G256 => {
+            gpu.gemm_qkvza_hfq4g256(
+                &wqkv.buf,
+                &wz.buf,
+                &w_beta.buf,
+                &w_alpha.buf,
+                x,
+                qkv,
+                z,
+                beta,
+                alpha,
+                wqkv.m,
+                wz.m,
+                w_beta.m,
+                w_alpha.m,
+                wqkv.k,
+                n_positions,
+            )?;
+        }
+        DType::MQ6G256 | DType::HFQ6G256 => {
+            gpu.gemm_qkvza_hfq6g256(
+                &wqkv.buf,
+                &wz.buf,
+                &w_beta.buf,
+                &w_alpha.buf,
+                x,
+                qkv,
+                z,
+                beta,
+                alpha,
+                wqkv.m,
+                wz.m,
+                w_beta.m,
+                w_alpha.m,
+                wqkv.k,
+                n_positions,
+            )?;
+        }
+        DType::MQ3G256Lloyd => {
+            gpu.gemm_qkvza_mq3g256_lloyd_wmma(
+                &wqkv.buf,
+                &wz.buf,
+                &w_beta.buf,
+                &w_alpha.buf,
+                x,
+                qkv,
+                z,
+                beta,
+                alpha,
+                wqkv.m,
+                wz.m,
+                w_beta.m,
+                w_alpha.m,
+                wqkv.k,
+                n_positions,
+            )?;
+        }
+        DType::MQ4G256Lloyd => {
+            gpu.gemm_qkvza_mq4g256_lloyd_wmma(
+                &wqkv.buf,
+                &wz.buf,
+                &w_beta.buf,
+                &w_alpha.buf,
+                x,
+                qkv,
+                z,
+                beta,
+                alpha,
+                wqkv.m,
+                wz.m,
+                w_beta.m,
+                w_alpha.m,
+                wqkv.k,
+                n_positions,
+            )?;
+        }
+        DType::MQ3G256 | DType::HFQ3G256 => {
+            if gpu.arch_caps.has_wmma() {
+                gpu.gemm_qkvza_hfq3g256_wmma(
+                    &wqkv.buf,
+                    &wz.buf,
+                    &w_beta.buf,
+                    &w_alpha.buf,
+                    x,
+                    qkv,
+                    z,
+                    beta,
+                    alpha,
+                    wqkv.m,
+                    wz.m,
+                    w_beta.m,
+                    w_alpha.m,
+                    wqkv.k,
+                    n_positions,
+                )?;
+            } else {
+                gpu.gemm_qkvza_hfq3g256(
+                    &wqkv.buf,
+                    &wz.buf,
+                    &w_beta.buf,
+                    &w_alpha.buf,
+                    x,
+                    qkv,
+                    z,
+                    beta,
+                    alpha,
+                    wqkv.m,
+                    wz.m,
+                    w_beta.m,
+                    w_alpha.m,
+                    wqkv.k,
+                    n_positions,
+                )?;
+            }
+        }
+        DType::HFP4G32 | DType::MFP4G32 => {
+            gpu.gemm_qkvza_hfp4g32(
+                &wqkv.buf,
+                &wz.buf,
+                &w_beta.buf,
+                &w_alpha.buf,
+                x,
+                qkv,
+                z,
+                beta,
+                alpha,
+                wqkv.m,
+                wz.m,
+                w_beta.m,
+                w_alpha.m,
+                wqkv.k,
+                n_positions,
+            )?;
+        }
+        _ => return Ok(QkvzaRouteCompare::Unsupported("unsupported_qkvza_dtype")),
+    }
+    Ok(QkvzaRouteCompare::Match)
 }
 
 fn first_mismatched_f32(bytes: &[u8], first_offset: usize) -> Option<f32> {
@@ -2966,6 +3197,81 @@ impl GdnTapeShards {
 //      replay-side methods stay where they were. No behavior change
 //      vs pre-Stage-2b.) ──────────────────────────────────────────────
 impl GdnTape {
+    fn compare_batched_qkvza_from_captured_x_to_serial(
+        &self,
+        gpu: &mut Gpu,
+        weights: &qwen35::Qwen35Weights,
+        layer_index: usize,
+        n_positions: usize,
+    ) -> HipResult<QkvzaRouteCompare> {
+        let Some(layer) = weights
+            .layers
+            .iter()
+            .filter(|layer| {
+                matches!(
+                    layer,
+                    qwen35::LayerWeights::DeltaNet(_) | qwen35::LayerWeights::DeltaNetMoe(_)
+                )
+            })
+            .nth(layer_index)
+        else {
+            return Ok(QkvzaRouteCompare::Unsupported(
+                "missing_linear_attention_layer",
+            ));
+        };
+
+        let batch_n = self.max_n.max(n_positions).max(2);
+        let x = gpu.alloc_tensor(&[batch_n * self.x_in_dim], DType::F32)?;
+        let qkv = gpu.alloc_tensor(&[batch_n * self.qkv_dim], DType::F32)?;
+        let z = gpu.alloc_tensor(&[batch_n * self.v_dim], DType::F32)?;
+        let beta = gpu.alloc_tensor(&[batch_n * self.n_v_heads], DType::F32)?;
+        let alpha = gpu.alloc_tensor(&[batch_n * self.n_v_heads], DType::F32)?;
+        let x_row_bytes = self.x_in_dim * 4;
+        for row in 0..batch_n {
+            let src_row = row.min(n_positions.saturating_sub(1));
+            gpu.hip.memcpy_dtod_at(
+                &x.buf,
+                row * x_row_bytes,
+                &self.x_in_bufs[layer_index].buf,
+                src_row * x_row_bytes,
+                x_row_bytes,
+            )?;
+        }
+
+        let dispatch = match layer {
+            qwen35::LayerWeights::DeltaNet(l) => compare_batched_qkvza_dispatch(
+                gpu, &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &x, &qkv, &z, &beta, &alpha, batch_n,
+            ),
+            qwen35::LayerWeights::DeltaNetMoe(l) => compare_batched_qkvza_dispatch(
+                gpu, &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &x, &qkv, &z, &beta, &alpha, batch_n,
+            ),
+            _ => Ok(QkvzaRouteCompare::Unsupported("non_linear_attention_layer")),
+        };
+
+        let result = match dispatch? {
+            QkvzaRouteCompare::Unsupported(reason) => QkvzaRouteCompare::Unsupported(reason),
+            QkvzaRouteCompare::Match => match compare_device_buffer_prefix_to_snapshot(
+                gpu,
+                "qkvza_route_qkv",
+                layer_index,
+                &qkv.buf,
+                &self.qkv_bufs[layer_index].buf,
+                n_positions * self.qkv_dim * 4,
+            )? {
+                Some(diff) => QkvzaRouteCompare::Mismatch(diff),
+                None => QkvzaRouteCompare::Match,
+            },
+            QkvzaRouteCompare::Mismatch(diff) => QkvzaRouteCompare::Mismatch(diff),
+        };
+
+        let _ = gpu.free_tensor(x);
+        let _ = gpu.free_tensor(qkv);
+        let _ = gpu.free_tensor(z);
+        let _ = gpu.free_tensor(beta);
+        let _ = gpu.free_tensor(alpha);
+        Ok(result)
+    }
+
     fn compare_captured_inputs_to(
         &self,
         gpu: &Gpu,
@@ -6745,6 +7051,44 @@ pub fn spec_step_dflash(
                         accept_len + 1,
                     ),
                 }
+                match serial_tape.compare_batched_qkvza_from_captured_x_to_serial(
+                    gpu,
+                    &target.weights,
+                    0,
+                    accept_len + 1,
+                )? {
+                    QkvzaRouteCompare::Mismatch(diff) => {
+                        let context =
+                            rollback_input_diff_context(&target.config, &serial_tape, &diff, position);
+                        eprintln!(
+                            "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} forced_serial=1 layer=0 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} batched_byte={}{}",
+                            position,
+                            accept_len,
+                            accept_len + 1,
+                            diff.family,
+                            diff.index,
+                            diff.bytes,
+                            diff.differing_bytes,
+                            diff.first_offset,
+                            diff.expected_byte,
+                            diff.actual_byte,
+                            context,
+                        );
+                    }
+                    QkvzaRouteCompare::Match => eprintln!(
+                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} forced_serial=1 layer=0 match",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                    ),
+                    QkvzaRouteCompare::Unsupported(reason) => eprintln!(
+                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} forced_serial=1 layer=0 unsupported reason={}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        reason,
+                    ),
+                }
                 match serial_tape.compare_gdn_inputs_to(gpu, tape, accept_len + 1)? {
                     Some(diff) => {
                         let context =
@@ -7148,6 +7492,44 @@ pub fn spec_step_dflash(
                     position,
                     accept_len,
                     accept_len + 1,
+                ),
+            }
+            match serial_tape.compare_batched_qkvza_from_captured_x_to_serial(
+                gpu,
+                &target.weights,
+                0,
+                accept_len + 1,
+            )? {
+                QkvzaRouteCompare::Mismatch(diff) => {
+                    let context =
+                        rollback_input_diff_context(&target.config, &serial_tape, &diff, position);
+                    eprintln!(
+                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} layer=0 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} batched_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.expected_byte,
+                        diff.actual_byte,
+                        context,
+                    );
+                }
+                QkvzaRouteCompare::Match => eprintln!(
+                    "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} layer=0 match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+                QkvzaRouteCompare::Unsupported(reason) => eprintln!(
+                    "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} layer=0 unsupported reason={}",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                    reason,
                 ),
             }
             match serial_tape.compare_gdn_inputs_layer_to(gpu, tape, 0, accept_len + 1)? {
