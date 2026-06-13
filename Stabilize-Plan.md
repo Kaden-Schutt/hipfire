@@ -366,6 +366,19 @@
     and preserves the same worst row (`pos=117`, `token_pos=120`, `max_abs_over_margin=3.8156`). Code remains logit-bounded on this run
     (`max_abs_over_margin=0.1043`) but is still rejected on recurrent-state mismatch. This keeps fast rollback admission machine-readable and
     fail-closed until the drift source is removed or a real live hybrid fallback policy exists.
+    A focused trace of that worst row, `/tmp/coherence-dflash-20260613-191019.md`, keeps AR parity passing under the production fast projection
+    defaults but shows the first rollback input mismatch at `qkv` (`max_abs=1.02e-2`) and token-major replay diverging at `attn-out` step 1
+    (`max_abs=1.35e-2`). Disabling the HFQ4 qkvza fast projection is not a promotion path: the matched control
+    `/tmp/coherence-dflash-20260613-191208.md` with `HIPFIRE_HFQ4_QKVZA_FAST=0` failed prose AR parity (`57874` vs `6511`), produced a fast
+    rollback logit argmax mismatch (`6511` vs `33145`), and widened the margin overrun to `75.76x` while shifting the first input mismatch to
+    `attn_out`. The remaining fix therefore has to preserve default AR parity while eliminating the fast-replay drift source, or introduce a
+    live fail-closed hybrid that can prove the margin and recurrent-state bounds before using fast replay.
+    The all-cycle rollback input parsers now preserve event counts and the first log-order mismatch instead of only the last row per check.
+    Fresh validation `/tmp/coherence-dflash-20260613-192225.md` passed AR parity and kept live rollback conservative (`replay_gdn_tape=0`,
+    prose `replay_full_prefill=92`; code `replay_full_prefill=4`, `replay_verify_complete=1`) while making the broad drift machine-readable:
+    prose `rollback_input_compare.checked=184`, `mismatch_counts={"input":92,"gdn-input-all":92}`, first mismatch at `pos=59/qkv`, and
+    `rollback_fast_token_major_compare.checked=276`, first mismatch at `pos=59/attn-out`. This identifies the earliest broad-run replay drift
+    without requiring a focused trace rerun, but still rejects fast replay on the existing margin and recurrent-state blockers.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

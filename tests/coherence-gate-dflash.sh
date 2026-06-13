@@ -890,20 +890,23 @@ def parse_context(context):
             parsed[key] = value if math.isfinite(value) else raw
     return parsed
 
+events = []
 checks = {}
 for m in match_pattern.finditer(out):
     label = m.group(1).removeprefix("dflash-rollback-").removesuffix("-compare")
-    checks[label] = {
+    check = {
         "ok": True,
         "pos": int(m.group(2)),
         "accepted": int(m.group(3)),
         "replay_steps": int(m.group(4)),
     }
+    events.append((m.start(), label, check))
+    checks[label] = check
 
 for m in mismatch_pattern.finditer(out):
     label = m.group(1).removeprefix("dflash-rollback-").removesuffix("-compare")
     context = m.group(12).strip() or None
-    checks[label] = {
+    check = {
         "ok": False,
         "pos": int(m.group(2)),
         "accepted": int(m.group(3)),
@@ -918,6 +921,8 @@ for m in mismatch_pattern.finditer(out):
         "context": context,
         "stats": parse_context(context),
     }
+    events.append((m.start(), label, check))
+    checks[label] = check
 
 frames = [
     {
@@ -931,13 +936,22 @@ frames = [
     for m in frame_pattern.finditer(out)
 ]
 
+events.sort(key=lambda event: event[0])
+mismatch_counts = {}
+for _, label, check in events:
+    if not check.get("ok", False):
+        mismatch_counts[label] = mismatch_counts.get(label, 0) + 1
+
 payload = {
-    "ok": all(check.get("ok", False) for check in checks.values()),
-    "checked": len(checks),
+    "ok": not mismatch_counts,
+    "checked": len(events),
+    "matches": sum(1 for _, _, check in events if check.get("ok", False)),
+    "mismatches": sum(1 for _, _, check in events if not check.get("ok", False)),
+    "mismatch_counts": mismatch_counts,
     "frames": frames,
     "checks": checks,
 }
-for label, check in checks.items():
+for _, label, check in events:
     if not check.get("ok", False):
         payload["reason"] = f"rollback_{label}_mismatch"
         first = dict(check)
@@ -988,20 +1002,23 @@ def parse_context(context):
             parsed[key] = value if math.isfinite(value) else raw
     return parsed
 
+events = []
 checks = {}
 for m in match_pattern.finditer(out):
     label = m.group(1).removeprefix("dflash-rollback-fast-token-major-").removesuffix("-compare")
-    checks[label] = {
+    check = {
         "ok": True,
         "pos": int(m.group(2)),
         "accepted": int(m.group(3)),
         "replay_steps": int(m.group(4)),
     }
+    events.append((m.start(), label, check))
+    checks[label] = check
 
 for m in mismatch_pattern.finditer(out):
     label = m.group(1).removeprefix("dflash-rollback-fast-token-major-").removesuffix("-compare")
     context = m.group(13).strip() or None
-    checks[label] = {
+    check = {
         "ok": False,
         "pos": int(m.group(2)),
         "accepted": int(m.group(3)),
@@ -1017,6 +1034,8 @@ for m in mismatch_pattern.finditer(out):
         "context": context,
         "stats": parse_context(context),
     }
+    events.append((m.start(), label, check))
+    checks[label] = check
 
 frames = [
     {
@@ -1030,17 +1049,25 @@ frames = [
     for m in frame_pattern.finditer(out)
 ]
 
-checked = len(checks)
+events.sort(key=lambda event: event[0])
+checked = len(events)
+mismatch_counts = {}
+for _, label, check in events:
+    if not check.get("ok", False):
+        mismatch_counts[label] = mismatch_counts.get(label, 0) + 1
 payload = {
-    "ok": checked > 0 and all(check.get("ok", False) for check in checks.values()),
+    "ok": checked > 0 and not mismatch_counts,
     "checked": checked,
+    "matches": sum(1 for _, _, check in events if check.get("ok", False)),
+    "mismatches": sum(1 for _, _, check in events if not check.get("ok", False)),
+    "mismatch_counts": mismatch_counts,
     "frames": frames,
     "checks": checks,
 }
 if checked == 0:
     payload["ok"] = True
 if checked and not payload["ok"]:
-    first_label, first = next((k, v) for k, v in checks.items() if not v.get("ok", False))
+    first_label, first = next((label, check) for _, label, check in events if not check.get("ok", False))
     payload["reason"] = f"fast_token_major_{first_label}_mismatch"
     payload["first_mismatch"] = {"check": first_label, **first}
 print(json.dumps(payload, sort_keys=True))
