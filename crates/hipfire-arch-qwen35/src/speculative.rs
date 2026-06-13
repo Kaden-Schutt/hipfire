@@ -73,6 +73,34 @@ fn dflash_moe_verify_graph_lmhead_enabled_from_env_value(value: Option<&str>) ->
     }
 }
 
+fn dflash_verify_graph_enabled_from_env_value(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "off" || v == "no")
+        }
+        None => true,
+    }
+}
+
+fn ddtree_path_c_verify_graph_enabled_from_env_value(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "on" || v == "yes"
+        }
+        None => false,
+    }
+}
+
+fn ddtree_path_c_verify_graph_enabled_from_env() -> bool {
+    ddtree_path_c_verify_graph_enabled_from_env_value(
+        std::env::var("HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH")
+            .ok()
+            .as_deref(),
+    )
+}
+
 fn dflash_moe_verify_graph_lmhead_eligible(
     num_experts: usize,
     want_full_logits: bool,
@@ -693,6 +721,8 @@ pub struct SpecStepResult {
     pub committed: Vec<u32>,
     /// DeltaNet rollback replay path used after the over-verifying target pass.
     pub rollback_replay: SpecRollbackReplayKind,
+    /// Verify graph path used for the target verifier in this step.
+    pub verify_graph_mode: SpecVerifyGraphMode,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -708,6 +738,33 @@ impl SpecRollbackReplayKind {
             Self::FullPrefill => "full_prefill",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SpecVerifyGraphMode {
+    NotApplicable,
+    Direct,
+    Warmup,
+    Capture,
+    Replay,
+}
+
+impl SpecVerifyGraphMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Direct => "direct",
+            Self::Warmup => "warmup",
+            Self::Capture => "capture",
+            Self::Replay => "replay",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum VerifyGraphPolicy {
+    Default,
+    Disabled,
 }
 
 /// Conservative admission result for speculative verify rollback.
@@ -855,6 +912,15 @@ fn dflash_rollback_x_in_atol_from_env() -> f32 {
         .unwrap_or(0.0)
 }
 
+fn dflash_rollback_logit_compare_steps_from_env() -> usize {
+    std::env::var("HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&steps| steps > 0)
+        .map(|steps| steps.min(8))
+        .unwrap_or(1)
+}
+
 /// Backing storage for a DeltaNetState snapshot. Holds device buffers sized
 /// to match the source state's tensors. Allocate once per slot, reuse across
 /// all speculative cycles.
@@ -862,6 +928,155 @@ pub struct DeltaNetSnapshot {
     s_matrix_bufs: Vec<DeviceBuffer>,
     s_scale_bufs: Vec<DeviceBuffer>,
     conv_state_bufs: Vec<DeviceBuffer>,
+}
+
+struct KvCacheRowsSnapshot {
+    start_pos: usize,
+    rows: usize,
+    k_bufs: Vec<DeviceBuffer>,
+    v_bufs: Vec<DeviceBuffer>,
+    k_scale_bufs: Vec<DeviceBuffer>,
+    v_scale_bufs: Vec<DeviceBuffer>,
+}
+
+impl KvCacheRowsSnapshot {
+    fn new_for(
+        gpu: &mut Gpu,
+        kv_cache: &llama::KvCache,
+        start_pos: usize,
+        rows: usize,
+    ) -> HipResult<Self> {
+        let rows = if start_pos >= kv_cache.physical_cap {
+            0
+        } else {
+            rows.min(kv_cache.physical_cap - start_pos)
+        };
+        Ok(Self {
+            start_pos,
+            rows,
+            k_bufs: Self::save_tensor_rows(
+                gpu,
+                &kv_cache.k_gpu,
+                kv_cache.physical_cap,
+                start_pos,
+                rows,
+            )?,
+            v_bufs: Self::save_tensor_rows(
+                gpu,
+                &kv_cache.v_gpu,
+                kv_cache.physical_cap,
+                start_pos,
+                rows,
+            )?,
+            k_scale_bufs: Self::save_tensor_rows(
+                gpu,
+                &kv_cache.k_scales,
+                kv_cache.physical_cap,
+                start_pos,
+                rows,
+            )?,
+            v_scale_bufs: Self::save_tensor_rows(
+                gpu,
+                &kv_cache.v_scales,
+                kv_cache.physical_cap,
+                start_pos,
+                rows,
+            )?,
+        })
+    }
+
+    fn save_tensor_rows(
+        gpu: &mut Gpu,
+        tensors: &[GpuTensor],
+        physical_cap: usize,
+        start_pos: usize,
+        rows: usize,
+    ) -> HipResult<Vec<DeviceBuffer>> {
+        if rows == 0 || physical_cap == 0 {
+            return Ok(Vec::new());
+        }
+        let mut bufs = Vec::with_capacity(tensors.len());
+        for tensor in tensors {
+            let row_bytes = tensor.buf.size() / physical_cap;
+            let bytes = row_bytes.saturating_mul(rows);
+            let buf = gpu.hip.malloc(bytes)?;
+            gpu.hip
+                .memcpy_dtod_at(&buf, 0, &tensor.buf, start_pos * row_bytes, bytes)?;
+            bufs.push(buf);
+        }
+        Ok(bufs)
+    }
+
+    fn restore_to(&self, kv_cache: &mut llama::KvCache, gpu: &mut Gpu) -> HipResult<()> {
+        Self::restore_tensor_rows(
+            gpu,
+            &self.k_bufs,
+            &kv_cache.k_gpu,
+            kv_cache.physical_cap,
+            self.start_pos,
+            self.rows,
+        )?;
+        Self::restore_tensor_rows(
+            gpu,
+            &self.v_bufs,
+            &kv_cache.v_gpu,
+            kv_cache.physical_cap,
+            self.start_pos,
+            self.rows,
+        )?;
+        Self::restore_tensor_rows(
+            gpu,
+            &self.k_scale_bufs,
+            &kv_cache.k_scales,
+            kv_cache.physical_cap,
+            self.start_pos,
+            self.rows,
+        )?;
+        Self::restore_tensor_rows(
+            gpu,
+            &self.v_scale_bufs,
+            &kv_cache.v_scales,
+            kv_cache.physical_cap,
+            self.start_pos,
+            self.rows,
+        )
+    }
+
+    fn restore_tensor_rows(
+        gpu: &mut Gpu,
+        snapshots: &[DeviceBuffer],
+        tensors: &[GpuTensor],
+        physical_cap: usize,
+        start_pos: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        if rows == 0 || physical_cap == 0 {
+            return Ok(());
+        }
+        for (snapshot, tensor) in snapshots.iter().zip(tensors.iter()) {
+            let row_bytes = tensor.buf.size() / physical_cap;
+            gpu.hip.memcpy_dtod_at(
+                &tensor.buf,
+                start_pos * row_bytes,
+                snapshot,
+                0,
+                row_bytes.saturating_mul(rows),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) {
+        for buf in self
+            .k_bufs
+            .into_iter()
+            .chain(self.v_bufs.into_iter())
+            .chain(self.k_scale_bufs.into_iter())
+            .chain(self.v_scale_bufs.into_iter())
+        {
+            let _ = gpu.hip.free(buf);
+        }
+    }
 }
 
 impl DeltaNetSnapshot {
@@ -4767,6 +4982,7 @@ pub fn spec_step_greedy(
         drafted,
         committed,
         rollback_replay: SpecRollbackReplayKind::FullPrefill,
+        verify_graph_mode: SpecVerifyGraphMode::NotApplicable,
     })
 }
 
@@ -4785,6 +5001,8 @@ pub struct DflashVerifyOutput {
     /// (i.e. temperature sampling). Empty otherwise — greedy decode
     /// uses GPU argmax and ships just B × 4 bytes to the host.
     pub logits_per_pos: Vec<f32>,
+    /// Verify graph path used by this target verifier invocation.
+    pub verify_graph_mode: SpecVerifyGraphMode,
 }
 
 fn dflash_use_gdn_tape_replay(caller_supplied_tape: bool, verify_populates_tape: bool) -> bool {
@@ -4817,6 +5035,30 @@ pub fn verify_dflash_block(
     want_full_logits: bool,
     verify_scratch: &VerifyScratch,
 ) -> HipResult<DflashVerifyOutput> {
+    verify_dflash_block_with_graph_policy(
+        gpu,
+        target,
+        draft_tokens,
+        start_pos,
+        hidden_rb,
+        gdn_tape,
+        want_full_logits,
+        VerifyGraphPolicy::Default,
+        verify_scratch,
+    )
+}
+
+fn verify_dflash_block_with_graph_policy(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    gdn_tape: Option<&mut GdnTape>,
+    want_full_logits: bool,
+    graph_policy: VerifyGraphPolicy,
+    verify_scratch: &VerifyScratch,
+) -> HipResult<DflashVerifyOutput> {
     verify_dflash_block_inner(
         gpu,
         target,
@@ -4826,6 +5068,7 @@ pub fn verify_dflash_block(
         gdn_tape,
         want_full_logits,
         None,
+        graph_policy,
         verify_scratch,
     )
 }
@@ -4862,6 +5105,7 @@ pub fn verify_dflash_block_tree(
         gdn_tape,
         want_full_logits,
         Some(tree_verify),
+        VerifyGraphPolicy::Default,
         verify_scratch,
     )
 }
@@ -4875,6 +5119,7 @@ fn verify_dflash_block_inner(
     gdn_tape: Option<&mut GdnTape>,
     want_full_logits: bool,
     tree_verify: Option<qwen35::TreeVerifyCtx<'_>>,
+    graph_policy: VerifyGraphPolicy,
     verify_scratch: &VerifyScratch,
 ) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
@@ -4917,10 +5162,11 @@ fn verify_dflash_block_inner(
     // `gdn_tape` is safe because verify is single-chunk → tape_offset=0 always
     // → captured node's dst offset is correct across cycles.
     //
-    // Default-on for eligible models (2026-04-21 smoke on 27B MQ4 Qwen3.5
-    // showed +14 % tok/s 25.6→29.2, wall-per-cycle 89→80 ms via coalescing
-    // verify kernels into one graph replay and saving ~1.3 ms of per-cycle
-    // launch overhead). Opt out with HIPFIRE_VERIFY_GRAPH=0.
+    // Default-on for dense DFlash correctness. Fresh Path C graph/nograph
+    // promotion gates are mixed and return NOT_PROMOTED for speed, but direct
+    // verify currently fails strict AR-token parity on the 27B prose smoke.
+    // Use HIPFIRE_VERIFY_GRAPH=0 only for graph/nograph diagnostics and
+    // promotion-gate rows until direct verify clears the same AR parity gate.
     // Tree-verify was historically excluded (tree_verify.is_none()) because
     // the tree-attention mask varies per cycle. In theory mask +
     // parent_indices live in fixed `ddtree_scratch` buffers that the caller
@@ -4952,7 +5198,9 @@ fn verify_dflash_block_inner(
         }
     }
     let tree_ok_for_graph = !tree_verify_present || tree_graph_enabled;
-    let verify_graph_ok = std::env::var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() != Some("0")
+    let verify_graph_env = std::env::var("HIPFIRE_VERIFY_GRAPH").ok();
+    let verify_graph_ok = graph_policy == VerifyGraphPolicy::Default
+        && dflash_verify_graph_enabled_from_env_value(verify_graph_env.as_deref())
         && tree_ok_for_graph
         && matches!(
             target.weights.embd_format,
@@ -4966,7 +5214,7 @@ fn verify_dflash_block_inner(
     // forward + lm_head; the recorded mode tag distinguishes replay vs
     // warmup-direct vs first-capture vs no-graph-eligible.
     let vg_timing = std::env::var("HIPFIRE_VERIFY_GRAPH_TIMING").ok().as_deref() == Some("1");
-    let mut vg_mode = "direct";
+    let mut vg_mode = SpecVerifyGraphMode::Direct;
     let vg_t0 = if vg_timing {
         gpu.hip.device_synchronize()?;
         Some(std::time::Instant::now())
@@ -4985,7 +5233,7 @@ fn verify_dflash_block_inner(
             gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
         if gpu.verify_has_graph(b) {
-            vg_mode = "replay";
+            vg_mode = SpecVerifyGraphMode::Replay;
             graph_includes_lmhead_argmax =
                 moe_lmhead_graph_ok && gpu.verify_graph_has_lmhead_argmax(b);
             // Replay path: kernels read pbs.tokens/pbs.positions/dn_state/
@@ -4993,7 +5241,7 @@ fn verify_dflash_block_inner(
             gpu.verify_graph_launch(b)?;
             Ok(())
         } else if gpu.verify_needs_warmup(b) {
-            vg_mode = "warmup";
+            vg_mode = SpecVerifyGraphMode::Warmup;
             // Warmup for this b: run direct so kernel JIT and any lazy scratch
             // allocations (e.g., MQ signs/x_rot/x_q8, FP16 shadow) happen
             // outside any captured region. Capturing a JIT + scratch-malloc
@@ -5024,7 +5272,7 @@ fn verify_dflash_block_inner(
             }
             r
         } else {
-            vg_mode = "capture";
+            vg_mode = SpecVerifyGraphMode::Capture;
             // Capture path: first call at this B after warmup.
             let capture_lmhead_argmax = moe_lmhead_graph_ok;
             gpu.begin_verify_graph_capture(b)?;
@@ -5202,7 +5450,7 @@ fn verify_dflash_block_inner(
         eprintln!(
             "[vg-time] B={} mode={} elapsed_us={}",
             b,
-            vg_mode,
+            vg_mode.as_str(),
             t0.elapsed().as_micros()
         );
     }
@@ -5210,6 +5458,7 @@ fn verify_dflash_block_inner(
     Ok(DflashVerifyOutput {
         argmax_per_pos,
         logits_per_pos,
+        verify_graph_mode: vg_mode,
     })
 }
 
@@ -6436,53 +6685,90 @@ pub fn spec_step_dflash(
                         accept_len + 1,
                     ),
                 }
+                let mut fast_replay_result = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
+                fast_replay_result.save_from(&target.dn_state, gpu)?;
+                let logit_compare_steps = dflash_rollback_logit_compare_steps_from_env();
                 let bonus_position = position + accept_len + 1;
-                qwen35::forward_scratch(
+                let kv_rows = KvCacheRowsSnapshot::new_for(
                     gpu,
-                    &target.weights,
-                    &target.config,
-                    bonus_token,
+                    &target.kv_cache,
                     bonus_position,
-                    &mut target.kv_cache,
-                    &mut target.dn_state,
-                    &target.scratch,
+                    logit_compare_steps,
                 )?;
-                let fast_logits = gpu.download_f32(&target.scratch.logits)?;
+                let mut serial_logit_rows = Vec::with_capacity(logit_compare_steps);
+                let mut compare_token = bonus_token;
+                serial_result.restore_to(&mut target.dn_state, gpu)?;
+                kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                gpu.debug_set_gdn_requant_frame(serial_frame_end);
+                for step in 0..logit_compare_steps {
+                    let step_position = bonus_position + step;
+                    qwen35::forward_scratch(
+                        gpu,
+                        &target.weights,
+                        &target.config,
+                        compare_token,
+                        step_position,
+                        &mut target.kv_cache,
+                        &mut target.dn_state,
+                        &target.scratch,
+                    )?;
+                    let serial_logits = gpu.download_f32(&target.scratch.logits)?;
+                    let serial_argmax = argmax_u32(&serial_logits);
+                    serial_logit_rows.push((
+                        compare_token,
+                        step_position,
+                        serial_argmax,
+                        serial_logits,
+                    ));
+                    compare_token = serial_argmax;
+                }
 
+                fast_replay_result.restore_to(&mut target.dn_state, gpu)?;
+                kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                gpu.debug_set_gdn_requant_frame(serial_frame_end);
+                for (step, (step_token, step_position, serial_argmax, serial_logits)) in
+                    serial_logit_rows.iter().enumerate()
+                {
+                    qwen35::forward_scratch(
+                        gpu,
+                        &target.weights,
+                        &target.config,
+                        *step_token,
+                        *step_position,
+                        &mut target.kv_cache,
+                        &mut target.dn_state,
+                        &target.scratch,
+                    )?;
+                    let fast_logits = gpu.download_f32(&target.scratch.logits)?;
+                    let logit_stats = logit_diff_stats(&fast_logits, serial_logits);
+                    let fast_argmax = argmax_u32(&fast_logits);
+                    let token_idx = *step_token as usize;
+                    let serial_token_logit =
+                        serial_logits.get(token_idx).copied().unwrap_or(f32::NAN);
+                    let fast_token_logit = fast_logits.get(token_idx).copied().unwrap_or(f32::NAN);
+                    eprintln!(
+                        "[dflash-rollback-next-logit-compare] pos={} step={} compare_steps={} token_pos={} token={} serial_argmax={} fast_argmax={} serial_token_logit={:.8e} fast_token_logit={:.8e} f32_words={} f32_bit_diff_words={} max_abs={:.8e} mean_abs={:.8e} max_rel={:.8e}",
+                        position,
+                        step,
+                        logit_compare_steps,
+                        step_position,
+                        step_token,
+                        serial_argmax,
+                        fast_argmax,
+                        serial_token_logit,
+                        fast_token_logit,
+                        logit_stats.words,
+                        logit_stats.bit_different_words,
+                        logit_stats.max_abs,
+                        logit_stats.mean_abs,
+                        logit_stats.max_rel,
+                    );
+                }
                 serial_result.restore_to(&mut target.dn_state, gpu)?;
-                qwen35::forward_scratch(
-                    gpu,
-                    &target.weights,
-                    &target.config,
-                    bonus_token,
-                    bonus_position,
-                    &mut target.kv_cache,
-                    &mut target.dn_state,
-                    &target.scratch,
-                )?;
-                let serial_logits = gpu.download_f32(&target.scratch.logits)?;
-                let logit_stats = logit_diff_stats(&fast_logits, &serial_logits);
-                let fast_argmax = argmax_u32(&fast_logits);
-                let serial_argmax = argmax_u32(&serial_logits);
-                let bonus_idx = bonus_token as usize;
-                let serial_bonus_logit = serial_logits.get(bonus_idx).copied().unwrap_or(f32::NAN);
-                let fast_bonus_logit = fast_logits.get(bonus_idx).copied().unwrap_or(f32::NAN);
-                eprintln!(
-                    "[dflash-rollback-next-logit-compare] pos={} bonus_pos={} bonus_token={} serial_argmax={} fast_argmax={} serial_bonus_logit={:.8e} fast_bonus_logit={:.8e} f32_words={} f32_bit_diff_words={} max_abs={:.8e} mean_abs={:.8e} max_rel={:.8e}",
-                    position,
-                    bonus_position,
-                    bonus_token,
-                    serial_argmax,
-                    fast_argmax,
-                    serial_bonus_logit,
-                    fast_bonus_logit,
-                    logit_stats.words,
-                    logit_stats.bit_different_words,
-                    logit_stats.max_abs,
-                    logit_stats.mean_abs,
-                    logit_stats.max_rel,
-                );
-                serial_result.restore_to(&mut target.dn_state, gpu)?;
+                kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                gpu.debug_set_gdn_requant_frame(serial_frame_end);
+                kv_rows.free_gpu(gpu);
+                fast_replay_result.free_gpu(gpu);
                 serial_tape.free_gpu(gpu);
                 serial_result.free_gpu(gpu);
             }
@@ -7002,6 +7288,7 @@ pub fn spec_step_dflash(
         drafted,
         committed,
         rollback_replay,
+        verify_graph_mode: verify_out.verify_graph_mode,
     })
 }
 
@@ -7511,6 +7798,7 @@ pub fn spec_step_ddtree(
             drafted: vec![seed_token],
             committed: vec![seed_token, bonus],
             rollback_replay: SpecRollbackReplayKind::FullPrefill,
+            verify_graph_mode: SpecVerifyGraphMode::NotApplicable,
         });
     }
 
@@ -7650,7 +7938,7 @@ pub fn spec_step_ddtree(
         committed[..accept_len + 1].to_vec()
     };
     target_snap.restore_to(&mut target.dn_state, gpu)?;
-    let _tape_verify = verify_dflash_block(
+    let tape_verify = verify_dflash_block(
         gpu,
         target,
         &tape_block,
@@ -7689,6 +7977,7 @@ pub fn spec_step_ddtree(
         drafted,
         committed,
         rollback_replay: SpecRollbackReplayKind::GdnTape,
+        verify_graph_mode: tape_verify.verify_graph_mode,
     })
 }
 
@@ -7830,6 +8119,7 @@ pub fn spec_step_ddtree_batched(
             drafted: vec![seed_token],
             committed: vec![seed_token, bonus],
             rollback_replay: SpecRollbackReplayKind::FullPrefill,
+            verify_graph_mode: SpecVerifyGraphMode::NotApplicable,
         });
     }
 
@@ -8322,6 +8612,7 @@ pub fn spec_step_ddtree_batched(
         drafted,
         committed,
         rollback_replay: SpecRollbackReplayKind::GdnTape,
+        verify_graph_mode: verify_out.verify_graph_mode,
     })
 }
 
@@ -8461,6 +8752,7 @@ pub fn spec_step_ddtree_path_c(
             drafted: vec![seed_token],
             committed: vec![seed_token, bonus],
             rollback_replay: SpecRollbackReplayKind::FullPrefill,
+            verify_graph_mode: SpecVerifyGraphMode::NotApplicable,
         });
     }
 
@@ -8477,7 +8769,12 @@ pub fn spec_step_ddtree_path_c(
     // ── 6. Linear verify on the main chain. No tree mask, no linearization
     //       phase poisoning — RoPE phases match committed slots exactly.
     //       This is the entire "Step 1" of the PRD's three-step pattern.
-    let main_verify_out = verify_dflash_block(
+    let graph_policy = if ddtree_path_c_verify_graph_enabled_from_env() {
+        VerifyGraphPolicy::Default
+    } else {
+        VerifyGraphPolicy::Disabled
+    };
+    let main_verify_out = verify_dflash_block_with_graph_policy(
         gpu,
         target,
         &verify_tokens,
@@ -8485,6 +8782,7 @@ pub fn spec_step_ddtree_path_c(
         hidden_rb,
         Some(gdn_tape),
         false,
+        graph_policy,
         verify_scratch,
     )?;
     let main_posterior = main_verify_out.argmax_per_pos;
@@ -8620,7 +8918,7 @@ pub fn spec_step_ddtree_path_c(
                 branch_chain_tokens.push(tree.nodes[ni].token);
             }
             let branch_start_pos = position + accepted_main;
-            let branch_verify_out = verify_dflash_block(
+            let branch_verify_out = verify_dflash_block_with_graph_policy(
                 gpu,
                 target,
                 &branch_chain_tokens,
@@ -8628,6 +8926,7 @@ pub fn spec_step_ddtree_path_c(
                 hidden_rb,
                 Some(gdn_tape),
                 false,
+                graph_policy,
                 verify_scratch,
             )?;
             let branch_posterior = branch_verify_out.argmax_per_pos;
@@ -8778,6 +9077,7 @@ pub fn spec_step_ddtree_path_c(
         drafted,
         committed,
         rollback_replay: SpecRollbackReplayKind::GdnTape,
+        verify_graph_mode: main_verify_out.verify_graph_mode,
     })
 }
 
@@ -9012,6 +9312,30 @@ mod tests {
     }
 
     #[test]
+    fn dflash_rollback_logit_compare_steps_default_and_cap() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS");
+        }
+        assert_eq!(dflash_rollback_logit_compare_steps_from_env(), 1);
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS", "0");
+        }
+        assert_eq!(dflash_rollback_logit_compare_steps_from_env(), 1);
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS", "4");
+        }
+        assert_eq!(dflash_rollback_logit_compare_steps_from_env(), 4);
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS", "32");
+        }
+        assert_eq!(dflash_rollback_logit_compare_steps_from_env(), 8);
+        unsafe {
+            std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS");
+        }
+    }
+
+    #[test]
     fn spec_rollback_parity_admits_single_session_accept_and_reject_paths() {
         let accept = spec_rollback_parity_decision(32, 3, 5, 4, 36);
         assert!(accept.allow_single_session);
@@ -9035,6 +9359,18 @@ mod tests {
     }
 
     #[test]
+    fn spec_verify_graph_mode_labels_are_stable() {
+        assert_eq!(
+            SpecVerifyGraphMode::NotApplicable.as_str(),
+            "not_applicable"
+        );
+        assert_eq!(SpecVerifyGraphMode::Direct.as_str(), "direct");
+        assert_eq!(SpecVerifyGraphMode::Warmup.as_str(), "warmup");
+        assert_eq!(SpecVerifyGraphMode::Capture.as_str(), "capture");
+        assert_eq!(SpecVerifyGraphMode::Replay.as_str(), "replay");
+    }
+
+    #[test]
     fn spec_rollback_parity_decision_for_step_derives_replay_boundary() {
         let full_accept_step = SpecStepResult {
             accepted: 3,
@@ -9042,6 +9378,7 @@ mod tests {
             drafted: vec![3, 5, 7, 11],
             committed: vec![2, 5, 7, 11, 17],
             rollback_replay: SpecRollbackReplayKind::GdnTape,
+            verify_graph_mode: SpecVerifyGraphMode::Replay,
         };
         let full_accept = spec_rollback_parity_decision_for_step(32, &full_accept_step);
         assert!(full_accept.allow_single_session);
@@ -9057,6 +9394,7 @@ mod tests {
             drafted: vec![3, 5, 7, 11],
             committed: vec![2, 19],
             rollback_replay: SpecRollbackReplayKind::GdnTape,
+            verify_graph_mode: SpecVerifyGraphMode::Replay,
         };
         let reject = spec_rollback_parity_decision_for_step(32, &reject_step);
         assert!(reject.allow_single_session);
@@ -9073,6 +9411,7 @@ mod tests {
             drafted: vec![3, 5, 7, 11],
             committed: vec![2, 5, 17],
             rollback_replay: SpecRollbackReplayKind::GdnTape,
+            verify_graph_mode: SpecVerifyGraphMode::Replay,
         };
         let decision = spec_rollback_parity_decision_for_step(32, &corrupt_step);
         assert!(!decision.allow_single_session);
@@ -9123,6 +9462,50 @@ mod tests {
             false,
             Some("0")
         ));
+    }
+
+    #[test]
+    fn dflash_verify_graph_is_default_on_with_explicit_disable() {
+        assert!(dflash_verify_graph_enabled_from_env_value(None));
+        assert!(dflash_verify_graph_enabled_from_env_value(Some("1")));
+        assert!(dflash_verify_graph_enabled_from_env_value(Some("true")));
+        assert!(dflash_verify_graph_enabled_from_env_value(Some("on")));
+        assert!(dflash_verify_graph_enabled_from_env_value(Some("yes")));
+        assert!(!dflash_verify_graph_enabled_from_env_value(Some("0")));
+        assert!(!dflash_verify_graph_enabled_from_env_value(Some("false")));
+        assert!(!dflash_verify_graph_enabled_from_env_value(Some("off")));
+        assert!(!dflash_verify_graph_enabled_from_env_value(Some("no")));
+        assert!(dflash_verify_graph_enabled_from_env_value(Some("auto")));
+    }
+
+    #[test]
+    fn ddtree_path_c_verify_graph_is_explicit_opt_in() {
+        assert!(!ddtree_path_c_verify_graph_enabled_from_env_value(None));
+        assert!(!ddtree_path_c_verify_graph_enabled_from_env_value(Some(
+            "0"
+        )));
+        assert!(!ddtree_path_c_verify_graph_enabled_from_env_value(Some(
+            "false"
+        )));
+        assert!(!ddtree_path_c_verify_graph_enabled_from_env_value(Some(
+            "off"
+        )));
+        assert!(!ddtree_path_c_verify_graph_enabled_from_env_value(Some(
+            "no"
+        )));
+        assert!(!ddtree_path_c_verify_graph_enabled_from_env_value(Some(
+            "auto"
+        )));
+        assert!(ddtree_path_c_verify_graph_enabled_from_env_value(Some("1")));
+        assert!(ddtree_path_c_verify_graph_enabled_from_env_value(Some(
+            "true"
+        )));
+        assert!(ddtree_path_c_verify_graph_enabled_from_env_value(Some(
+            "on"
+        )));
+        assert!(ddtree_path_c_verify_graph_enabled_from_env_value(Some(
+            "yes"
+        )));
     }
 
     #[test]

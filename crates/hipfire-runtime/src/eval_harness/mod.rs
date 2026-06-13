@@ -3389,6 +3389,29 @@ fn write_evidence_artifacts(
             &["ar_tok_s", "dflash_tok_s", "accept_rate", "tau"][..],
         ),
         (
+            "path_c_trace.json",
+            "path_c_trace",
+            &[
+                "tok_s",
+                "tau",
+                "promotion_verdict",
+                "tok_s_delta_pct",
+                "tau_delta_pct",
+            ][..],
+        ),
+        (
+            "module_evidence.json",
+            "module_evidence",
+            &[
+                "module_kind",
+                "module_id",
+                "preferred_backend",
+                "selected_backend",
+                "oracle_backend",
+                "fallback_reason",
+            ][..],
+        ),
+        (
             "profiling.json",
             "profiling",
             &["kernel_name", "duration_us", "occupancy", "waves"][..],
@@ -3751,6 +3774,8 @@ fn runtime_evidence_paths_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
                     | "performance"
                     | "coherence"
                     | "dflash_trace"
+                    | "path_c_trace"
+                    | "module_evidence"
                     | "quality"
             )
         {
@@ -3885,6 +3910,8 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
         "moe_router_histogram" => &[],
         "memory" => &[],
         "dflash_trace" => &[BatteryId::Dflash],
+        "path_c_trace" => &[BatteryId::Dflash],
+        "module_evidence" => &[],
         "profiling" => &[],
         "coherence" => &[
             BatteryId::Coherence,
@@ -3913,6 +3940,10 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
                     has_moe_router_metric(row)
                 } else if kind == "profiling" {
                     has_profiling_metric(row)
+                } else if kind == "path_c_trace" {
+                    has_path_c_trace_metric(row)
+                } else if kind == "module_evidence" {
+                    has_module_evidence_metric(row)
                 } else {
                     batteries.contains(&row.battery)
                 }
@@ -3925,6 +3956,8 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
                 "moe_router_histogram" => select_metrics(row, MOE_ROUTER_METRICS),
                 "profiling" => select_metrics(row, PROFILING_METRICS),
                 "dflash_trace" => dflash_trace_metrics(row),
+                "path_c_trace" => path_c_trace_metrics(row),
+                "module_evidence" => module_evidence_metrics(row),
                 _ => row.metrics.clone(),
             };
             json!({
@@ -4032,6 +4065,30 @@ fn has_profiling_metric(row: &EvalResult) -> bool {
     has_any_metric(row, PROFILING_METRICS)
 }
 
+fn has_path_c_trace_metric(row: &EvalResult) -> bool {
+    row.metrics
+        .get("mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode.starts_with("path-c"))
+        || row.metrics.contains_key("promotion_verdict")
+}
+
+fn has_module_evidence_metric(row: &EvalResult) -> bool {
+    has_any_metric(
+        row,
+        &[
+            "module_kind",
+            "module_id",
+            "preferred_backend",
+            "selected_backend",
+            "oracle_backend",
+            "fallback_reason",
+            "evidence",
+            "evidence_json",
+        ],
+    )
+}
+
 fn has_any_metric(row: &EvalResult, keys: &[&str]) -> bool {
     keys.iter().any(|key| row.metrics.contains_key(*key))
 }
@@ -4134,6 +4191,24 @@ fn dflash_trace_metrics(row: &EvalResult) -> BTreeMap<String, Value> {
     copy_numeric_metric(&row.metrics, &mut metrics, "accept_rate", "accept_rate");
     copy_numeric_metric(&row.metrics, &mut metrics, "tok_s", "tok_s");
     copy_bool_metric(&row.metrics, &mut metrics, "ar_baseline", "ar_baseline");
+    copy_json_metric(
+        &row.metrics,
+        &mut metrics,
+        "rollback_logit_compare",
+        "rollback_logit_compare",
+    );
+    copy_json_metric(
+        &row.metrics,
+        &mut metrics,
+        "rollback_state_compare",
+        "rollback_state_compare",
+    );
+    copy_json_metric(
+        &row.metrics,
+        &mut metrics,
+        "rollback_fast_replay_admission",
+        "rollback_fast_replay_admission",
+    );
 
     if let Some(ar_baseline) = row.metrics.get("ar_baseline").and_then(Value::as_bool) {
         metrics.insert(
@@ -4151,6 +4226,73 @@ fn dflash_trace_metrics(row: &EvalResult) -> BTreeMap<String, Value> {
         metrics.insert("mode".to_string(), json!("aggregate"));
     }
 
+    metrics
+}
+
+fn path_c_trace_metrics(row: &EvalResult) -> BTreeMap<String, Value> {
+    let mut metrics = BTreeMap::new();
+    for key in [
+        "mode",
+        "phase",
+        "graph_mode",
+        "detector",
+        "verify_graph",
+        "path_c_counters",
+        "promotion_verdict",
+        "blockers",
+        "pairs",
+        "extra_args",
+        "token_attractor_detector",
+    ] {
+        copy_json_metric(&row.metrics, &mut metrics, key, key);
+    }
+    for key in [
+        "tok_s",
+        "tau",
+        "accept_rate",
+        "emitted_tokens",
+        "wall_s",
+        "paired_cases",
+        "tok_s_min_delta_pct",
+        "tau_min_delta_pct",
+        "max_tokens",
+    ] {
+        copy_numeric_metric(&row.metrics, &mut metrics, key, key);
+    }
+    metrics
+}
+
+fn module_evidence_metrics(row: &EvalResult) -> BTreeMap<String, Value> {
+    let mut metrics = BTreeMap::new();
+    for key in [
+        "module_kind",
+        "module_id",
+        "preferred_backend",
+        "selected_backend",
+        "oracle_backend",
+        "fallback_reason",
+        "drift",
+        "shape",
+        "contract",
+        "evidence",
+        "evidence_json",
+        "mutates_residual",
+    ] {
+        copy_json_metric(&row.metrics, &mut metrics, key, key);
+    }
+    for key in [
+        "layer",
+        "hidden",
+        "intermediate",
+        "n",
+        "max_abs",
+        "mean_abs",
+        "rms",
+        "nan",
+        "inf",
+    ] {
+        copy_numeric_metric(&row.metrics, &mut metrics, key, key);
+    }
     metrics
 }
 
@@ -4179,6 +4321,20 @@ fn copy_bool_metric(
     }
     if let Some(value) = source.get(source_key).and_then(Value::as_bool) {
         dest.insert(dest_key.to_string(), json!(value));
+    }
+}
+
+fn copy_json_metric(
+    source: &BTreeMap<String, Value>,
+    dest: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    dest_key: &str,
+) {
+    if dest.contains_key(dest_key) {
+        return;
+    }
+    if let Some(value) = source.get(source_key) {
+        dest.insert(dest_key.to_string(), value.clone());
     }
 }
 
@@ -4557,6 +4713,8 @@ fn observed_admission_evidence(
         "moe_router_histogram",
         "memory",
         "dflash_trace",
+        "path_c_trace",
+        "module_evidence",
         "coherence",
         "profiling",
     ]
@@ -14556,6 +14714,39 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
                     ("ar_baseline".to_string(), json!(false)),
                     ("tau".to_string(), json!(2.5)),
                     ("accept_rate".to_string(), json!(0.6)),
+                    (
+                        "rollback_logit_compare".to_string(),
+                        json!({
+                            "ok": true,
+                            "checked": 8,
+                            "argmax_mismatches": 0,
+                        }),
+                    ),
+                    (
+                        "rollback_state_compare".to_string(),
+                        json!({
+                            "ok": false,
+                            "checked": 1,
+                            "reason": "fast_replay_recurrent_state_mismatch",
+                            "first_mismatch": {
+                                "family": "s_matrix",
+                                "index": 0,
+                                "stats": {
+                                    "f32_bit_diff_words": 702,
+                                    "max_abs": 2.53553992e38_f64,
+                                },
+                            },
+                        }),
+                    ),
+                    (
+                        "rollback_fast_replay_admission".to_string(),
+                        json!({
+                            "verdict": "rejected",
+                            "blockers": ["fast_replay_recurrent_state_mismatch"],
+                            "logit_checked": 8,
+                            "state_checked": 1,
+                        }),
+                    ),
                 ]),
             ),
         ];
@@ -14590,6 +14781,162 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
         assert_eq!(trace["records"][1]["metrics"]["dflash_tok_s"], json!(130.0));
         assert_eq!(trace["records"][1]["metrics"]["tau"], json!(2.5));
         assert_eq!(trace["records"][1]["metrics"]["accept_rate"], json!(0.6));
+        assert_eq!(
+            trace["records"][1]["metrics"]["rollback_logit_compare"]["argmax_mismatches"],
+            json!(0)
+        );
+        assert_eq!(
+            trace["records"][1]["metrics"]["rollback_state_compare"]["reason"],
+            json!("fast_replay_recurrent_state_mismatch")
+        );
+        assert_eq!(
+            trace["records"][1]["metrics"]["rollback_state_compare"]["first_mismatch"]["stats"]
+                ["f32_bit_diff_words"],
+            json!(702)
+        );
+        assert_eq!(
+            trace["records"][1]["metrics"]["rollback_fast_replay_admission"]["verdict"],
+            json!("rejected")
+        );
+
+        let _ = fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn path_c_trace_artifact_collects_only_path_c_rows() {
+        let out = temp_path("path-c-trace-artifacts");
+        fs::create_dir_all(&out).unwrap();
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "candidate.hfq",
+            "--battery",
+            "dflash",
+            "--dflash",
+            "auto",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+        let rows = vec![
+            pass_row(
+                BatteryId::Dflash,
+                None,
+                "dflash_anchor",
+                None,
+                &cfg,
+                &ctx,
+                None,
+                BTreeMap::from([
+                    ("mode".to_string(), json!("dflash")),
+                    ("tok_s".to_string(), json!(130.0)),
+                ]),
+            ),
+            pass_row(
+                BatteryId::Dflash,
+                None,
+                "path_c_phase1_prose",
+                None,
+                &cfg,
+                &ctx,
+                None,
+                BTreeMap::from([
+                    ("mode".to_string(), json!("path-c-phase1")),
+                    ("tok_s".to_string(), json!(5.86)),
+                    ("tau".to_string(), json!(1.23)),
+                    ("max_tokens".to_string(), json!(192)),
+                    (
+                        "verify_graph".to_string(),
+                        json!({
+                            "direct": 0,
+                            "warmup": 3,
+                            "capture": 3,
+                            "replay": 81,
+                            "not_applicable": 0,
+                        }),
+                    ),
+                ]),
+            ),
+            pass_row(
+                BatteryId::Dflash,
+                None,
+                "verify_graph_promotion",
+                None,
+                &cfg,
+                &ctx,
+                None,
+                BTreeMap::from([
+                    ("promotion_verdict".to_string(), json!("NOT_PROMOTED")),
+                    ("paired_cases".to_string(), json!(4)),
+                    (
+                        "blockers".to_string(),
+                        json!(["path-c-phase2-code: tok/s delta -3.732% < 5.000%"]),
+                    ),
+                    (
+                        "pairs".to_string(),
+                        json!([{
+                            "case_id": "path-c-phase2-code",
+                            "tok_s_delta_pct": -3.732,
+                        }]),
+                    ),
+                ]),
+            ),
+        ];
+        let comparison = ComparisonArtifact {
+            schema: 1,
+            provenance: run_provenance(&ctx),
+            status: EvalStatus::Skip,
+            reason: Some("no --baseline provided".to_string()),
+            baseline: None,
+            reference: None,
+            cases: Vec::new(),
+        };
+
+        let admission = build_admission_artifact(&cfg, &rows, &comparison, &ctx);
+        let artifacts =
+            write_evidence_artifacts(&out, &cfg, &[], &rows, &comparison, &admission, &ctx)
+                .unwrap();
+        assert_eq!(
+            artifacts
+                .get("path_c_trace")
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str),
+            Some("collected")
+        );
+        let trace: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("path_c_trace.json")).unwrap())
+                .unwrap();
+        assert_eq!(trace["status"], "collected");
+        assert_eq!(trace["records"].as_array().unwrap().len(), 2);
+        assert_eq!(trace["records"][0]["case_id"], json!("path_c_phase1_prose"));
+        assert_eq!(
+            trace["records"][0]["metrics"]["mode"],
+            json!("path-c-phase1")
+        );
+        assert_eq!(
+            trace["records"][0]["metrics"]["verify_graph"]["direct"],
+            json!(0)
+        );
+        assert_eq!(
+            trace["records"][1]["case_id"],
+            json!("verify_graph_promotion")
+        );
+        assert_eq!(
+            trace["records"][1]["metrics"]["promotion_verdict"],
+            json!("NOT_PROMOTED")
+        );
+        assert_eq!(
+            trace["records"][1]["metrics"]["blockers"][0],
+            json!("path-c-phase2-code: tok/s delta -3.732% < 5.000%")
+        );
 
         let _ = fs::remove_dir_all(out);
     }
@@ -14884,6 +15231,25 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
                             }
                         }
                     ]
+                },
+                "module_evidence": {
+                    "records": [
+                        {
+                            "case_id": "qwen35_dense_ffn_swiglu_down.layer4",
+                            "metrics": {
+                                "module_kind": "dense_ffn_swiglu_down",
+                                "module_id": "qwen35_dense_ffn_swiglu_down.layer4",
+                                "preferred_backend": "npu_opt_in",
+                                "selected_backend": "gpu_production",
+                                "oracle_backend": "cpu_oracle",
+                                "fallback_reason": "npu_backend_unavailable",
+                                "drift": {
+                                    "max_abs": 0.00125,
+                                    "mean_abs": 0.00012
+                                }
+                            }
+                        }
+                    ]
                 }
             }))
             .unwrap(),
@@ -14973,6 +15339,27 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
                 .and_then(Value::as_str),
             Some("moe_router_histogram")
         );
+        assert_eq!(
+            artifacts
+                .get("module_evidence")
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str),
+            Some("collected")
+        );
+        assert_eq!(
+            artifacts
+                .get("module_evidence")
+                .and_then(|v| v.get("row_count"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert!(artifacts
+            .get("module_evidence")
+            .and_then(|v| v.get("expected_metrics"))
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .any(|v| v == "selected_backend"));
         assert!(artifacts
             .get("moe_router_histogram")
             .and_then(|v| v.get("expected_metrics"))
@@ -15034,6 +15421,26 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             router["records"][0]["hipfire_eval_context"]["git_branch"],
             json!("evaluation-harness")
         );
+        let module_evidence: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("module_evidence.json")).unwrap())
+                .unwrap();
+        assert_eq!(module_evidence["status"], "collected");
+        assert_eq!(
+            module_evidence["records"][0]["metrics"]["selected_backend"],
+            json!("gpu_production")
+        );
+        assert_eq!(
+            module_evidence["records"][0]["metrics"]["fallback_reason"],
+            json!("npu_backend_unavailable")
+        );
+        assert_eq!(
+            module_evidence["records"][0]["metrics"]["drift"]["max_abs"],
+            json!(0.00125)
+        );
+        assert_eq!(
+            module_evidence["records"][0]["source_path"],
+            json!(evidence_json.display().to_string())
+        );
 
         let _ = fs::remove_dir_all(out);
         let _ = fs::remove_file(evidence_json);
@@ -15077,6 +15484,122 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
                             "duration_us": 42.5,
                             "occupancy": 0.75,
                             "waves": 16
+                        }
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            evidence_dir.join("dflash_trace.json"),
+            serde_json::to_string(&json!({
+                "kind": "dflash_trace",
+                "records": [
+                    {
+                        "battery": "dflash",
+                        "case_id": "27b-dflash-prose",
+                        "status": "OK",
+                        "metrics": {
+                            "mode": "dflash",
+                            "rollback_fast_replay_admission": {
+                                "verdict": "rejected",
+                                "blockers": ["fast_replay_recurrent_state_mismatch"],
+                                "logit_checked": 8,
+                                "state_checked": 1
+                            },
+                            "rollback_state_compare": {
+                                "ok": false,
+                                "reason": "fast_replay_recurrent_state_mismatch",
+                                "first_mismatch": {
+                                    "family": "s_matrix",
+                                    "stats": {
+                                        "f32_bit_diff_words": 702,
+                                        "max_abs": 2.53553992e38_f64
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    {
+                        "battery": "dflash",
+                        "case_id": "rollback_fast_replay_admission_summary",
+                        "status": "rejected",
+                        "metrics": {
+                            "verdict": "rejected",
+                            "case_count": 2,
+                            "admission_count": 2,
+                            "verdict_counts": {
+                                "admitted": 0,
+                                "rejected": 1,
+                                "not_evaluated": 1,
+                                "other": 0
+                            },
+                            "blocker_counts": {
+                                "fast_replay_recurrent_state_mismatch": 1
+                            },
+                            "logit_checked": 8,
+                            "state_checked": 1
+                        }
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            evidence_dir.join("path_c_trace.json"),
+            serde_json::to_string(&json!({
+                "kind": "path_c_trace",
+                "records": [
+                    {
+                        "battery": "path_c",
+                        "case_id": "verify_graph_promotion",
+                        "status": "NOT_PROMOTED",
+                        "metrics": {
+                            "promotion_verdict": "NOT_PROMOTED",
+                            "paired_cases": 4,
+                            "tok_s_min_delta_pct": 5.0,
+                            "tau_min_delta_pct": -1.0,
+                            "blockers": [
+                                "path-c-phase2-code: tok/s delta -11.553% < 5.000%"
+                            ],
+                            "pairs": [
+                                {
+                                    "case_id": "path-c-phase2-code",
+                                    "graph_tok_s": 42.0,
+                                    "nograph_tok_s": 47.5,
+                                    "tok_s_delta_pct": -11.553,
+                                    "graph_tau": 2.0,
+                                    "nograph_tau": 2.0,
+                                    "tau_delta_pct": 0.0
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            evidence_dir.join("module_evidence.json"),
+            serde_json::to_string(&json!({
+                "kind": "module_evidence",
+                "records": [
+                    {
+                        "case_id": "qwen35_dense_ffn_swiglu_down.layer4",
+                        "metrics": {
+                            "module_kind": "dense_ffn_swiglu_down",
+                            "module_id": "qwen35_dense_ffn_swiglu_down.layer4",
+                            "preferred_backend": "npu_opt_in",
+                            "selected_backend": "gpu_production",
+                            "oracle_backend": "cpu_oracle",
+                            "fallback_reason": "npu_backend_unavailable",
+                            "drift": {
+                                "max_abs": 0.00125,
+                                "mean_abs": 0.00012
+                            }
                         }
                     }
                 ]
@@ -15140,6 +15663,27 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
                 .and_then(Value::as_str),
             Some("collected")
         );
+        assert_eq!(
+            artifacts
+                .get("dflash_trace")
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str),
+            Some("collected")
+        );
+        assert_eq!(
+            artifacts
+                .get("path_c_trace")
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str),
+            Some("collected")
+        );
+        assert_eq!(
+            artifacts
+                .get("module_evidence")
+                .and_then(|v| v.get("status"))
+                .and_then(Value::as_str),
+            Some("collected")
+        );
         let launch_counts: Value =
             serde_json::from_str(&fs::read_to_string(out.join("launch_counts.json")).unwrap())
                 .unwrap();
@@ -15186,6 +15730,68 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
             profiling["records"][0]["hipfire_eval_context"]["runner_version"]
                 .as_str()
                 .is_some()
+        );
+        let trace: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("dflash_trace.json")).unwrap())
+                .unwrap();
+        assert_eq!(trace["status"], "collected");
+        assert_eq!(
+            trace["records"][0]["metrics"]["rollback_fast_replay_admission"]["verdict"],
+            json!("rejected")
+        );
+        assert_eq!(
+            trace["records"][0]["metrics"]["rollback_state_compare"]["first_mismatch"]["stats"]
+                ["f32_bit_diff_words"],
+            json!(702)
+        );
+        assert_eq!(
+            trace["records"][0]["source_path"],
+            json!(evidence_dir.join("dflash_trace.json").display().to_string())
+        );
+        assert_eq!(
+            trace["records"][1]["case_id"],
+            json!("rollback_fast_replay_admission_summary")
+        );
+        assert_eq!(trace["records"][1]["metrics"]["verdict"], json!("rejected"));
+        assert_eq!(
+            trace["records"][1]["metrics"]["blocker_counts"]
+                ["fast_replay_recurrent_state_mismatch"],
+            json!(1)
+        );
+        let path_c_trace: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("path_c_trace.json")).unwrap())
+                .unwrap();
+        assert_eq!(path_c_trace["status"], "collected");
+        assert_eq!(
+            path_c_trace["records"][0]["metrics"]["promotion_verdict"],
+            json!("NOT_PROMOTED")
+        );
+        assert_eq!(
+            path_c_trace["records"][0]["metrics"]["blockers"][0],
+            json!("path-c-phase2-code: tok/s delta -11.553% < 5.000%")
+        );
+        assert_eq!(
+            path_c_trace["records"][0]["source_path"],
+            json!(evidence_dir.join("path_c_trace.json").display().to_string())
+        );
+        let module_evidence: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("module_evidence.json")).unwrap())
+                .unwrap();
+        assert_eq!(module_evidence["status"], "collected");
+        assert_eq!(
+            module_evidence["records"][0]["metrics"]["selected_backend"],
+            json!("gpu_production")
+        );
+        assert_eq!(
+            module_evidence["records"][0]["metrics"]["fallback_reason"],
+            json!("npu_backend_unavailable")
+        );
+        assert_eq!(
+            module_evidence["records"][0]["source_path"],
+            json!(evidence_dir
+                .join("module_evidence.json")
+                .display()
+                .to_string())
         );
 
         let _ = fs::remove_dir_all(out);

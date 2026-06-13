@@ -46,7 +46,8 @@
     carry: session id, logical token position, boundary kind, prefix hash input, and state handle.
     Status: the daemon now has a typed Qwen35 prefill checkpoint hook carrying that metadata. Final prefill checkpoints, serial semantic-boundary
     checkpoints, and synchronized multi-session fused dense/grouped semantic-boundary checkpoints can all emit attachable resident snapshots.
-    Boundary layouts that would require a single-session fused interior segment fall back to serial_reference.
+    Boundary layouts that contain a single-session interior/tail segment now keep the fused boundary flow for multi-session chunks and replay only the
+    one-row segment through the serial oracle before emitting the same attachable checkpoint.
 
   - Replace Qwen35-only wrapped state assumptions with generic state descriptors:
       - StatePageKind: KV, DeltaNet, logits snapshot, backend-private.
@@ -55,7 +56,14 @@
       - Keep current Qwen35 structs as the backing implementation until descriptors are proven.
     Status: model-worker descriptors now use typed page kinds, include shape metadata, and carry a sequence-state handle identity while still being
     backed by the current Qwen35 resident session map. Runtime-view coverage now explicitly includes the KV, DeltaNet, and logits descriptor triplet
-    needed to audit rollback state. Allocator-owned generic pages remain out of scope for this stabilize-first slice.
+    needed to audit rollback state. Worker status also reports the internal state-arena operation vocabulary (`reserve_session_state`,
+    `attach_checkpoint`, `fork_checkpoint`, `release_state`, `describe_state`) and whether the arena owns generic pages. The daemon now routes generic
+    reservations through a `GenericSequenceStateArena` owner instead of ad hoc handler maps, returns generation-aware `generic_reserved_state` handles,
+    stamps the same allocation epoch into every typed page descriptor, rejects stale structured handles on describe/release, and still accepts raw
+    handle strings for compatibility. Saved Qwen35 request sessions and cloned attachable checkpoints now also carry a nonzero allocation epoch, typed
+    `qwen35_session`/`qwen35_checkpoint` handles, and per-descriptor `owns_pages=true` for the real GPU KV/DeltaNet/logits pages they own. The active
+    loaded singleton now carries the same allocation-epoch identity when Qwen35 state is resident, so worker status reports
+    `state_arena_owns_pages=true` for the wrapped Qwen35 arena while stale structured handles remain rejected.
 
   - Add MTP/DFlash rollback parity before verify batching. Required invariant: after save, speculative advance, reject/restore, and AR replay, logits
     and next token match the serial reference within explicit tolerance. Keep multi-request verify batching disabled until this passes.
@@ -244,7 +252,86 @@
     default path at position 120, the immediate next-logit argmax still matches (`303`) but drift is large (`max_abs=1.76373720e-2`,
     `mean_abs=1.97809376e-3`). Under all projection-fast-off controls the same probe keeps the next-logit argmax matched (`13`) and reduces logit
     drift to `max_abs=5.16176224e-5`, `mean_abs=4.74912758e-6`, while final recurrent state still differs. This is useful bounded-effect evidence
-    for one cycle, but it is not enough to admit fast replay because multi-cycle recurrent/logit parity remains unproven.
+    for one cycle, but it is not enough to admit fast replay because multi-cycle recurrent/logit parity remains unproven. The forced-serial
+    diagnostic can now run a bounded serial-argmax next-logit chain via `HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS` (default 1, capped at 8) without
+    perturbing live generation: the diagnostic snapshots/restores the touched future KV rows, DeltaNet state, and GDN requant frame before each
+    serial/fast probe chain and again after forwarding probe tokens. A deeper 8-step probe initially exposed a graph-off confounder rather than a
+    logit-chain isolation bug: direct/no-graph DFlash verify failed prose AR parity at `57874` vs `6511`, while graph-on verify passed. Production
+    dense DFlash therefore keeps verify graph capture default-on and reserves `HIPFIRE_VERIFY_GRAPH=0` for diagnostics until direct verify clears
+    AR parity. Fresh gfx1151 evidence (2026-06-13) with `HIPFIRE_DFLASH_AR_PARITY=1 HIPFIRE_DFLASH_ROLLBACK_COMPARE=1
+    HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS=2 HIPFIRE_DFLASH_TRACE_POSITION=120 HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN=57874
+    ./tests/coherence-gate-dflash.sh --fast` passed AR parity for prose/code, with `replay_gdn_tape=0`; this validates the diagnostic isolation but
+    still does not admit fast replay. Rechecking with `HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS=8` after restoring graph default-on also passed
+    (`/tmp/coherence-dflash-20260613-151126.md`, prose/code AR parity OK, `replay_gdn_tape=0`), so the diagnostic can now probe longer bounded
+    logit chains without changing live generation. The DFlash coherence gate now parses those next-logit diagnostic rows into a
+    `rollback_logit_compare` report field and hard-fails the diagnostic run on any fast-vs-serial argmax mismatch. Current gfx1151 evidence
+    (2026-06-13) with the same position-120 repro and `HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS=8` passed with
+    `/tmp/coherence-dflash-20260613-153613.md`: prose checked 8 serial-argmax probe steps at position 120, `argmax_mismatches=0`,
+    `max_abs=2.79172659e-2`, and `max_mean_abs=2.88508949e-3`, while live rollback still reported `replay_gdn_tape=0`. The same gate now also
+    reports forced-serial recurrent-state drift through `rollback_state_compare`; `/tmp/coherence-dflash-20260613-154759.md` shows the position-120
+    forced fast replay still mismatches serial at `s_matrix[0]` with structured stats:
+    `differing_bytes=709`, `f32_bit_diff_words=702`, `max_abs=2.53553992e38`, `mean_abs=5.81178619e33`, and `max_rel=inf`, while the
+    8-step next-logit argmax chain still has `argmax_mismatches=0`. The same report now emits an explicit
+    `rollback_fast_replay_admission` verdict: the traced prose row is `rejected` with blocker `fast_replay_recurrent_state_mismatch`, while the
+    untraced code row is `not_evaluated`. This is stronger bounded-logit evidence for the diagnostic path and now records the remaining
+    recurrent-state blocker in the gate report, but it still is not enough to admit fast replay because recurrent-state drift remains unbounded
+    across longer trajectories and the live path remains conservative. `hipfire-eval` now preserves `rollback_logit_compare`,
+    `rollback_state_compare`, and `rollback_fast_replay_admission` inside the `dflash_trace.json` evidence artifact, so the same admission verdict
+    can be consumed by eval tooling instead of only by the shell-gate markdown report. The JSON sidecar path is now emitted directly by
+    `tests/coherence-gate-dflash.sh` and remains valid even on model-missing skips. Fresh gfx1151 evidence
+    `/tmp/coherence-dflash-20260613-155624.md` plus `/tmp/coherence-dflash-20260613-155624.dflash_trace.json` confirms the sidecar carries both
+    DFlash rows: prose AR parity OK, `replay_gdn_tape=0`, 8-step rollback logit compare with zero argmax mismatches, recurrent-state mismatch at
+    `s_matrix[0]`, and `rollback_fast_replay_admission.verdict="rejected"`; code AR parity OK, `replay_gdn_tape=0`, and the untraced rollback
+    admission is `not_evaluated`. The DFlash sidecar now also emits a run-level `rollback_fast_replay_admission_summary` record. Fresh evidence
+    `/tmp/coherence-dflash-20260613-161358.md` plus `/tmp/coherence-dflash-20260613-161358.dflash_trace.json` passed the same AR-parity diagnostic
+    and summarized the run as `rejected`: 2 DFlash cases, 1 rejected, 1 not evaluated, `logit_checked=8`, `state_checked=1`, with blocker counts for
+    `fast_replay_recurrent_state_mismatch`, `missing_logit_compare`, and `missing_recurrent_state_compare`. A refreshed current-worktree run,
+    `/tmp/coherence-dflash-20260613-162612.md` plus `/tmp/coherence-dflash-20260613-162612.dflash_trace.json`, gives the same admission shape:
+    prose/code AR parity OK, live rollback remains conservative (`replay_gdn_tape=0`, full-prefill replay 92/5), verify graph capture is active
+    (`direct=0`), the prose 8-step next-logit diagnostic has zero argmax mismatches, and the run-level fast-replay admission summary remains
+    `rejected` with `fast_replay_recurrent_state_mismatch`. This keeps the admitted live path conservative while making the remaining fast-replay
+    blocker machine-readable at run scope.
+    The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
+    extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
+    `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
+    ./tests/path-c-smoke.sh --graph-ab` passed without hard errors while pairing explicit graph-on rows against explicit graph-off controls and
+    reported: phase1 code `+7.426% tok/s / +0.000% tau`, phase1 prose `+2.988% / +9.723%`, phase2 code
+    `-11.553% / +0.000%`, phase2 prose `-2.687% / -2.097%`. This makes production verify-graph drift visible in the gate report; it is not yet broad enough to promote graph capture
+    as a universal production win. The same smoke now emits an explicit promotion verdict: `--graph-ab` reports `PROMOTED`/`NOT_PROMOTED` using
+    per-case tok/s and τ thresholds, and `--graph-promote` hard-fails unless every paired case clears those thresholds. Defaults are conservative
+    (`PATH_C_GRAPH_MIN_TOK_DELTA_PCT=5.0`, `PATH_C_GRAPH_MIN_TAU_DELTA_PCT=-1.0`); the current report
+    `/tmp/path-c-smoke-20260613-153024.md` returned `NOT_PROMOTED` with blockers on phase1 prose, phase2 code, and phase2 prose, so graph capture has not been promoted
+    as a universal speed win. The graph A/B smoke now also emits `path_c_trace.json` with one record per graph/nograph case plus a
+    `verify_graph_promotion` summary record, and `hipfire-eval` preserves that artifact from evidence directories. Fresh gfx1151 evidence
+    `/tmp/path-c-smoke-20260613-160247.md` plus `/tmp/path-c-smoke-20260613-160247.path_c_trace.json` passed without hard errors and kept the
+    promotion verdict at `NOT_PROMOTED`: phase1 code/prose cleared the default thresholds (`+7.683%`, `+6.352%` tok/s), while phase2 code/prose
+    regressed (`-3.732%`, `-1.768%` tok/s). Refreshed current-worktree graph A/B runs,
+    `/tmp/path-c-smoke-20260613-162820.md` plus `/tmp/path-c-smoke-20260613-162820.path_c_trace.json` and
+    `/tmp/path-c-smoke-20260613-163932.md` plus `/tmp/path-c-smoke-20260613-163932.path_c_trace.json`, also passed without hard errors and kept
+    `promotion_verdict=NOT_PROMOTED`. The latest run reported phase1 code `-6.932%`, phase1 prose `+5.386%`, phase2 code `-2.415%`, and
+    phase2 prose `-0.982%` tok/s deltas against the default 5% threshold, with blockers on both code rows and phase2 prose. The sidecar records
+    graph rows with `direct=0` and capture/replay counters, nograph rows with `direct>0`, paired deltas, thresholds, and blockers, so graph-capture
+    promotion evidence is now machine-readable rather than markdown-only. Because the A/B evidence is still not promoted, Path C production verify
+    now defaults graph capture off unless `HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH=1`; the graph A/B smoke explicitly sets that opt-in for graph rows and
+    sets it to `0` for nograph controls. A default-env Path C control,
+    `/tmp/path-c-smoke-20260613-164313.md` plus `/tmp/path-c-smoke-20260613-164313.path_c_trace.json`, passed without hard errors and showed all
+    four default rows were direct-only: phase1 prose `direct=91`, phase1 code `direct=5`, phase2 prose `direct=76`, and phase2 code `direct=5`, with
+    `warmup=capture=replay=0` in every row. The eval artifact path now filters first-party `path_c_trace` rows to Path C modes or explicit promotion
+    verdicts, so ordinary DFlash rows cannot pollute graph-promotion evidence when `hipfire-eval` emits artifacts from its own result rows.
+    A follow-up AR-parity control showed that direct/no-graph DFlash verify is not yet production-safe:
+    `HIPFIRE_DFLASH_AR_PARITY=1 ./tests/coherence-gate-dflash.sh --fast` failed prose at token mismatch `57874` vs `6511` with
+    `replay_gdn_tape=0`, while `HIPFIRE_VERIFY_GRAPH=1 HIPFIRE_DFLASH_AR_PARITY=1 ./tests/coherence-gate-dflash.sh --fast` passed
+    (`/tmp/coherence-dflash-20260613-150638.md`). After restoring graph capture to default-on, the default-env AR-parity gate also passed and now
+    reports verify-graph mode counts in the coherence report: `/tmp/coherence-dflash-20260613-152838.md` shows prose
+    `verify_graph: direct=0 warmup=5 capture=5 replay=82` and code `direct=0 warmup=1 capture=1 replay=3`, with `replay_gdn_tape=0` for both.
+    The coherence gate now treats `direct>0` as a hard error for AR-parity DFlash rows, so graph-off/direct verify cannot accidentally satisfy the
+    rollback evidence surface. The stricter guard passed on `/tmp/coherence-dflash-20260613-152149.md` with prose
+    `verify_graph={"ok":true,"direct":0,"warmup":5,"capture":5,"replay":82}` and code
+    `verify_graph={"ok":true,"direct":0,"warmup":1,"capture":1,"replay":3}`. A refreshed current-worktree AR-parity run after the Path C-specific
+    opt-in change, `/tmp/coherence-dflash-20260613-164509.md` plus `/tmp/coherence-dflash-20260613-164509.dflash_trace.json`, also passed with
+    `direct=0` for both DFlash rows and `replay_gdn_tape=0` for both rollback rows. Production dense DFlash therefore keeps verify graph capture
+    default-on for correctness, and `HIPFIRE_VERIFY_GRAPH=0` is reserved for graph/nograph diagnostics and direct-verify promotion work until it
+    clears the same AR parity gate.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
@@ -254,9 +341,13 @@
     Status: the Qwen35 dense FFN BF16 oracle/probe path now exposes a typed `qwen35_dense_ffn_swiglu_down` contract with CPU-oracle,
     GPU-production, and NPU-opt-in backend preferences. The normal GPU production path and compare/cpu probe path now build the same in-place
     module invocation/output object tying the tensor/state contract to backend selection and output evidence. The adjacent Qwen35 attention `wo`
-    residual projection now has the same in-place invocation shape on its production helper. Compare/cpu probe evidence records module id, selected
-    backend, CPU oracle backend, drift stats when comparing GPU to CPU, and fallback reason. XDNA execution remains reserved until a real NPU backend
-    lands.
+    residual projection now has the same in-place invocation shape on its production helper. Compare/cpu probe evidence records module kind, module
+    id, preferred backend, selected backend, CPU oracle backend, drift stats when comparing GPU to CPU, and fallback reason. The `xdna1` opt-in mode
+    now routes through the same module invocation contract and records `npu_backend_unavailable` while falling back to the GPU production path. The
+    BF16/projection trace surface now also emits a stable `evidence_json` object from the same typed output, so backend substitution evidence is
+    machine-readable and no longer requires scraping human key/value text. `hipfire-eval` now preserves external or runtime
+    `module_evidence.json` records as a first-party artifact with provenance, so backend substitution evidence can be admitted alongside other
+    runtime evidence; real XDNA execution remains reserved until a real NPU backend lands.
 
   ## Interfaces
 
@@ -266,6 +357,15 @@
       - fork_checkpoint(session, boundary)
       - release_state(handle)
       - describe_state(handle) -> Vec<StatePageDescriptor>
+    Status: the daemon now has a single operation vocabulary for this internal API and exposes the supported operations plus page-ownership flag in
+    worker status. `reserve_session_state` returns a generation-aware `generic_reserved_state` handle with allocator-owned host page descriptors, and
+    `describe_state`/`release_state` operate on either the raw handle id or the structured handle object while rejecting stale structured generations.
+    Existing Qwen35 checkpoint attach/fork still routes through the resident-session map, but saved sessions/checkpoints now expose descriptor-level
+    ownership for their actual GPU KV/DeltaNet/logits pages. The common `describe_state` and `release_state` surface now accepts structured
+    `qwen35_session` / `qwen35_checkpoint` handles with allocation epochs and resolves them against the same descriptor set, so stale epoch handles
+    are rejected by describe and release remains idempotent. The active loaded singleton now also carries a nonzero active-slot allocation epoch when
+    Qwen35 state is resident, so worker status can report `state_arena_owns_pages=true` while each descriptor exposes the exact epoch that must be
+    presented back to `describe_state`/`release_state`.
 
   - Add a generation module invocation API:
       - ModuleKind
@@ -306,22 +406,48 @@
       - stale handle rejection,
       - checkpoint cap eviction,
       - Qwen35 wrapped-state compatibility.
+    Status: focused daemon coverage now includes descriptor accounting
+    (`model_worker_runtime_view_json_reports_state_page_descriptors`, `generic_state_reservation_descriptors_are_owned_handles`), generic
+    reserve/describe/release and stale-generation rejection (`reserve_session_state_kinds_default_deduplicate_and_alias`,
+    `generic_state_arena_rejects_stale_generation_handles`, `generic_state_arena_purges_ttl_and_releases_by_worker`), structured Qwen35
+    handle/epoch lookup (`sequence_state_descriptor_lookup_binds_qwen35_epoch_handles`,
+    `qwen35_checkpoint_handles_report_owned_epoch_identity`), and raw/structured handle parsing
+    (`sequence_state_handle_id_accepts_string_or_handle_object`, `parsed_state_handle_kind_routes_generic_and_qwen35_surfaces`). Checkpoint-cap
+    eviction remains a server-level state-cache behavior covered by `tests/smoke-server-prefix-checkpoint-reuse.sh` with
+    `HIPFIRE_STATE_CACHE_MAX_CHECKPOINTS=1`, not by the allocator-only daemon unit suite.
 
   - Add fused checkpoint tests:
       - final checkpoint still works,
       - interior semantic-boundary checkpoint attaches,
       - boundary reuse produces same continuation as full prefill.
+    Status: daemon tests cover hook contract and boundary planning (`qwen35_prefill_checkpoint_hook_preserves_handle_contract`,
+    `validates_semantic_boundary_checkpoint_param`, `fused_prefill_boundary_cuts_cover_multiple_boundaries_and_suffix_replay_fallback`,
+    `fused_prefill_boundary_cuts_allow_single_session_serial_segments`). Server-level continuation/reuse evidence is covered by
+    `tests/smoke-generate-batch-prefill.sh` for emitted prefix checkpoints and `tests/smoke-server-prefix-boundary-reuse.sh` for attaching a
+    semantic-boundary checkpoint on a later request.
 
   - Add MTP/DFlash rollback tests:
       - accept path unchanged,
       - reject path restores KV + DeltaNet + logits state,
       - AR replay parity after restore,
       - verify batching remains disabled until tests pass.
+    Status: Qwen35 unit coverage exercises accept/reject rollback admission and corrupt-shape rejection
+    (`spec_rollback_parity_admits_single_session_accept_and_reject_paths`, `spec_rollback_parity_decision_for_step_derives_replay_boundary`,
+    `spec_rollback_parity_rejects_bad_replay_or_commit_shape`, `spec_rollback_parity_decision_for_step_rejects_corrupt_step_shape`) plus
+    diagnostic replay policy (`dflash_serial_rollback_replay_is_conservative_default`, `dflash_live_rollback_rejects_fast_tape_replay`,
+    `dflash_rollback_compare_is_opt_in_diagnostic`, `dflash_rollback_logit_compare_steps_default_and_cap`). The GPU AR-parity gate
+    `HIPFIRE_DFLASH_AR_PARITY=1 ./tests/coherence-gate-dflash.sh --fast` now hard-fails if fast GDN-tape replay is used or if direct/no-graph
+    DFlash verify appears in an AR-parity row.
 
   - Add backend module contract tests:
       - dense FFN/SwiGLU/down contract shape and statelessness,
       - CPU/GPU/NPU-opt-in backend selection,
       - evidence records selected backend, module id, drift, and fallback reason.
+    Status: `cargo test -p hipfire-arch-qwen35 ffn_bf16 -- --nocapture` covers the dense FFN contract shape, CPU/GPU/NPU-opt-in backend selection,
+    production-shape invocation without a BF16 shadow, evidence fields including module kind/id/drift/fallback, `xdna1` fallback, and adjacent
+    attention `wo` invocation metadata. The same suite now pins the JSON evidence shape for drift, NPU fallback, and attention `wo` projection
+    metadata, while `cargo test -p hipfire-runtime evidence_json_ingest_collects_runtime_artifacts -- --nocapture` pins
+    `module_evidence.json` ingestion and provenance.
 
   ## Assumptions
 

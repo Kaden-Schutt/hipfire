@@ -6,6 +6,8 @@
 
 use std::sync::OnceLock;
 
+use serde_json::{json, Value};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfnBf16Mode {
     Off,
@@ -113,7 +115,9 @@ pub struct DenseFfnModuleInvocation {
 
 #[derive(Debug, Clone)]
 pub struct DenseFfnModuleEvidence {
+    pub module_kind: &'static str,
     pub module_id: String,
+    pub preferred_backend: DenseFfnBackendPreference,
     pub selected_backend: DenseFfnBackend,
     pub oracle_backend: DenseFfnBackend,
     pub drift: Option<DiffStats>,
@@ -161,7 +165,9 @@ pub struct ProjectionModuleInvocation {
 
 #[derive(Debug, Clone)]
 pub struct ProjectionModuleOutput {
+    pub module_kind: &'static str,
     pub module_id: String,
+    pub preferred_backend: DenseFfnBackendPreference,
     pub selected_backend: DenseFfnBackend,
     pub oracle_backend: DenseFfnBackend,
     pub fallback_reason: Option<&'static str>,
@@ -261,6 +267,17 @@ pub fn dense_ffn_backend_decision(
     }
 }
 
+pub fn dense_ffn_backend_preference_for_mode(
+    mode: FfnBf16Mode,
+) -> Option<DenseFfnBackendPreference> {
+    match mode {
+        FfnBf16Mode::Off => None,
+        FfnBf16Mode::Compare => Some(DenseFfnBackendPreference::GpuProduction),
+        FfnBf16Mode::Cpu => Some(DenseFfnBackendPreference::CpuOracle),
+        FfnBf16Mode::Xdna1 => Some(DenseFfnBackendPreference::NpuOptIn),
+    }
+}
+
 pub fn dense_ffn_module_invocation(
     layer_idx: usize,
     shadow: &Bf16DownShadow,
@@ -305,7 +322,9 @@ pub fn dense_ffn_module_evidence(
     fallback_reason: Option<&'static str>,
 ) -> DenseFfnModuleEvidence {
     DenseFfnModuleEvidence {
+        module_kind: contract.module_kind,
         module_id: contract.module_id.clone(),
+        preferred_backend: contract.preferred_backend,
         selected_backend,
         oracle_backend: DenseFfnBackend::CpuOracle,
         drift,
@@ -326,6 +345,39 @@ pub fn dense_ffn_module_output(
         ),
         mutates_residual: invocation.contract.state.mutates_residual,
     }
+}
+
+pub fn diff_stats_json(stats: DiffStats) -> Value {
+    json!({
+        "n": stats.n,
+        "max_abs": stats.max_abs,
+        "mean_abs": stats.mean_abs,
+        "rms": stats.rms,
+        "n_nan": stats.n_nan,
+        "n_inf": stats.n_inf,
+    })
+}
+
+pub fn dense_ffn_module_evidence_json(evidence: &DenseFfnModuleEvidence) -> Value {
+    let mut value = json!({
+        "module_kind": evidence.module_kind,
+        "module_id": evidence.module_id,
+        "preferred_backend": evidence.preferred_backend.as_str(),
+        "selected_backend": evidence.selected_backend.as_str(),
+        "oracle_backend": evidence.oracle_backend.as_str(),
+        "fallback_reason": evidence.fallback_reason,
+    });
+    if let Some(drift) = evidence.drift {
+        value["drift"] = diff_stats_json(drift);
+    }
+    value
+}
+
+pub fn dense_ffn_module_output_json(output: &DenseFfnModuleOutput) -> Value {
+    json!({
+        "evidence": dense_ffn_module_evidence_json(&output.evidence),
+        "mutates_residual": output.mutates_residual,
+    })
 }
 
 pub fn attention_wo_residual_contract_from_shape(
@@ -381,12 +433,26 @@ pub fn attention_wo_residual_invocation_from_shape(
 
 pub fn projection_module_output(invocation: &ProjectionModuleInvocation) -> ProjectionModuleOutput {
     ProjectionModuleOutput {
+        module_kind: invocation.contract.module_kind,
         module_id: invocation.contract.module_id.clone(),
+        preferred_backend: invocation.contract.preferred_backend,
         selected_backend: invocation.selected_backend,
         oracle_backend: DenseFfnBackend::CpuOracle,
         fallback_reason: invocation.fallback_reason,
         mutates_residual: invocation.contract.state.mutates_residual,
     }
+}
+
+pub fn projection_module_output_json(output: &ProjectionModuleOutput) -> Value {
+    json!({
+        "module_kind": output.module_kind,
+        "module_id": output.module_id,
+        "preferred_backend": output.preferred_backend.as_str(),
+        "selected_backend": output.selected_backend.as_str(),
+        "oracle_backend": output.oracle_backend.as_str(),
+        "fallback_reason": output.fallback_reason,
+        "mutates_residual": output.mutates_residual,
+    })
 }
 
 pub fn enabled() -> bool {
@@ -611,11 +677,26 @@ mod tests {
             Some(drift),
             Some("test_fallback"),
         );
+        assert_eq!(evidence.module_kind, "qwen35_dense_ffn_swiglu_down");
         assert_eq!(evidence.module_id, "qwen35.layers.0.mlp.swiglu_down");
+        assert_eq!(
+            evidence.preferred_backend,
+            DenseFfnBackendPreference::GpuProduction
+        );
         assert_eq!(evidence.selected_backend, DenseFfnBackend::GpuProduction);
         assert_eq!(evidence.oracle_backend, DenseFfnBackend::CpuOracle);
         assert_eq!(evidence.fallback_reason, Some("test_fallback"));
         assert_eq!(evidence.drift.unwrap().max_abs, 0.25);
+
+        let json = dense_ffn_module_evidence_json(&evidence);
+        assert_eq!(json["module_kind"], "qwen35_dense_ffn_swiglu_down");
+        assert_eq!(json["module_id"], "qwen35.layers.0.mlp.swiglu_down");
+        assert_eq!(json["preferred_backend"], "gpu_production");
+        assert_eq!(json["selected_backend"], "gpu_production");
+        assert_eq!(json["oracle_backend"], "cpu_oracle");
+        assert_eq!(json["fallback_reason"], "test_fallback");
+        assert_eq!(json["drift"]["n"], 1);
+        assert_eq!(json["drift"]["max_abs"], 0.25);
     }
 
     #[test]
@@ -639,7 +720,12 @@ mod tests {
         assert_eq!(invocation.fallback_reason, Some("npu_backend_unavailable"));
 
         let output = dense_ffn_module_output(&invocation, None);
+        assert_eq!(output.evidence.module_kind, "qwen35_dense_ffn_swiglu_down");
         assert_eq!(output.evidence.module_id, invocation.contract.module_id);
+        assert_eq!(
+            output.evidence.preferred_backend,
+            DenseFfnBackendPreference::NpuOptIn
+        );
         assert_eq!(
             output.evidence.selected_backend,
             DenseFfnBackend::GpuProduction
@@ -649,6 +735,45 @@ mod tests {
             Some("npu_backend_unavailable")
         );
         assert!(output.mutates_residual);
+
+        let json = dense_ffn_module_output_json(&output);
+        assert_eq!(json["evidence"]["preferred_backend"], "npu_opt_in");
+        assert_eq!(json["evidence"]["selected_backend"], "gpu_production");
+        assert_eq!(json["evidence"]["oracle_backend"], "cpu_oracle");
+        assert_eq!(
+            json["evidence"]["fallback_reason"],
+            "npu_backend_unavailable"
+        );
+        assert_eq!(json["mutates_residual"], true);
+    }
+
+    #[test]
+    fn dense_ffn_mode_maps_xdna1_to_npu_opt_in_preference() {
+        assert_eq!(
+            dense_ffn_backend_preference_for_mode(FfnBf16Mode::Off),
+            None
+        );
+        assert_eq!(
+            dense_ffn_backend_preference_for_mode(FfnBf16Mode::Compare),
+            Some(DenseFfnBackendPreference::GpuProduction)
+        );
+        assert_eq!(
+            dense_ffn_backend_preference_for_mode(FfnBf16Mode::Cpu),
+            Some(DenseFfnBackendPreference::CpuOracle)
+        );
+        assert_eq!(
+            dense_ffn_backend_preference_for_mode(FfnBf16Mode::Xdna1),
+            Some(DenseFfnBackendPreference::NpuOptIn)
+        );
+        let invocation = dense_ffn_module_invocation_from_shape(
+            2,
+            4096,
+            11008,
+            dense_ffn_backend_preference_for_mode(FfnBf16Mode::Xdna1).unwrap(),
+            false,
+        );
+        assert_eq!(invocation.selected_backend, DenseFfnBackend::GpuProduction);
+        assert_eq!(invocation.fallback_reason, Some("npu_backend_unavailable"));
     }
 
     #[test]
@@ -677,6 +802,10 @@ mod tests {
         assert_eq!(invocation.fallback_reason, None);
 
         let output = dense_ffn_module_output(&invocation, None);
+        assert_eq!(
+            output.evidence.preferred_backend,
+            DenseFfnBackendPreference::GpuProduction
+        );
         assert_eq!(
             output.evidence.selected_backend,
             DenseFfnBackend::GpuProduction
@@ -713,10 +842,24 @@ mod tests {
         assert_eq!(invocation.selected_backend, DenseFfnBackend::GpuProduction);
 
         let output = projection_module_output(&invocation);
+        assert_eq!(output.module_kind, "qwen35_attention_wo_residual");
         assert_eq!(output.module_id, invocation.contract.module_id);
+        assert_eq!(
+            output.preferred_backend,
+            DenseFfnBackendPreference::GpuProduction
+        );
         assert_eq!(output.selected_backend, DenseFfnBackend::GpuProduction);
         assert_eq!(output.oracle_backend, DenseFfnBackend::CpuOracle);
         assert_eq!(output.fallback_reason, None);
         assert!(output.mutates_residual);
+
+        let json = projection_module_output_json(&output);
+        assert_eq!(json["module_kind"], "qwen35_attention_wo_residual");
+        assert_eq!(json["module_id"], "qwen35.layers.7.attention.wo_residual");
+        assert_eq!(json["preferred_backend"], "gpu_production");
+        assert_eq!(json["selected_backend"], "gpu_production");
+        assert_eq!(json["oracle_backend"], "cpu_oracle");
+        assert!(json["fallback_reason"].is_null());
+        assert_eq!(json["mutates_residual"], true);
     }
 }

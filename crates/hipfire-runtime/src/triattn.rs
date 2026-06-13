@@ -42,7 +42,7 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -504,9 +504,15 @@ impl TriAttnCalibStateGpu {
 static TAP_ENABLED: AtomicBool = AtomicBool::new(false);
 static TAP_STATE: Mutex<Option<TapState>> = Mutex::new(None);
 
+fn tap_state() -> MutexGuard<'static, Option<TapState>> {
+    TAP_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Install a fresh calibration state (online accumulation, no raw retention).
 pub fn install_tap(state: TriAttnCalibState) {
-    *TAP_STATE.lock().unwrap() = Some(TapState::Calibrate(state));
+    *tap_state() = Some(TapState::Calibrate(state));
     TAP_ENABLED.store(true, Ordering::SeqCst);
 }
 
@@ -514,17 +520,17 @@ pub fn install_tap(state: TriAttnCalibState) {
 /// memory; the kernel writes partial sums directly into device buffers.
 /// ~5-8× faster than the CPU tap on MI300X (measured).
 pub fn install_tap_gpu(state: TriAttnCalibStateGpu) {
-    *TAP_STATE.lock().unwrap() = Some(TapState::CalibrateGpu(state));
+    *tap_state() = Some(TapState::CalibrateGpu(state));
     TAP_ENABLED.store(true, Ordering::SeqCst);
 }
 
 /// Remove and return the GPU calibration tap so the caller can finalize.
 pub fn take_tap_gpu() -> Option<TriAttnCalibStateGpu> {
     TAP_ENABLED.store(false, Ordering::SeqCst);
-    match TAP_STATE.lock().unwrap().take() {
+    match tap_state().take() {
         Some(TapState::CalibrateGpu(s)) => Some(s),
         other => {
-            *TAP_STATE.lock().unwrap() = other;
+            *tap_state() = other;
             None
         }
     }
@@ -551,7 +557,7 @@ pub fn record_prerope_q_batch_gpu_if_applicable(
     // async-enqueue (sub-ms), so the lock hold is short and contention-free
     // (qwen35 forward is single-threaded per Gpu). gpu.triattn_accumulate
     // does not touch TAP_STATE itself.
-    let guard = TAP_STATE.lock().unwrap();
+    let guard = tap_state();
     let s = match guard.as_ref() {
         Some(TapState::CalibrateGpu(s)) => s,
         _ => return Ok(false),
@@ -574,18 +580,18 @@ pub fn record_prerope_q_batch_gpu_if_applicable(
 /// but lets the reconstruction harness compute ground-truth logits on the
 /// host.
 pub fn install_capture(cap: TriAttnCapture) {
-    *TAP_STATE.lock().unwrap() = Some(TapState::Capture(cap));
+    *tap_state() = Some(TapState::Capture(cap));
     TAP_ENABLED.store(true, Ordering::SeqCst);
 }
 
 /// Remove and return the calibration tap, disabling the global hook.
 pub fn take_tap() -> Option<TriAttnCalibState> {
     TAP_ENABLED.store(false, Ordering::SeqCst);
-    match TAP_STATE.lock().unwrap().take() {
+    match tap_state().take() {
         Some(TapState::Calibrate(s)) => Some(s),
         other => {
             // Restore non-calibrate state so a mis-matched take doesn't lose data.
-            *TAP_STATE.lock().unwrap() = other;
+            *tap_state() = other;
             None
         }
     }
@@ -594,10 +600,10 @@ pub fn take_tap() -> Option<TriAttnCalibState> {
 /// Remove and return the full-capture buffer.
 pub fn take_capture() -> Option<TriAttnCapture> {
     TAP_ENABLED.store(false, Ordering::SeqCst);
-    match TAP_STATE.lock().unwrap().take() {
+    match tap_state().take() {
         Some(TapState::Capture(c)) => Some(c),
         other => {
-            *TAP_STATE.lock().unwrap() = other;
+            *tap_state() = other;
             None
         }
     }
@@ -610,7 +616,7 @@ pub fn capture_finish_token() {
     if !TAP_ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    if let Some(TapState::Capture(c)) = TAP_STATE.lock().unwrap().as_mut() {
+    if let Some(TapState::Capture(c)) = tap_state().as_mut() {
         c.finish_token();
     }
 }
@@ -629,10 +635,7 @@ pub fn tap_needs_k() -> bool {
     if !TAP_ENABLED.load(Ordering::Relaxed) {
         return false;
     }
-    matches!(
-        TAP_STATE.lock().unwrap().as_ref(),
-        Some(TapState::Capture(_)),
-    )
+    matches!(tap_state().as_ref(), Some(TapState::Capture(_)),)
 }
 
 /// Called from the FA layer pre-RoPE point. `q` is `[n_heads × head_dim]`
@@ -646,7 +649,7 @@ pub fn record_prerope_qk(layer_idx: usize, q: &[f32], k_opt: Option<&[f32]>) {
     if !TAP_ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    let mut guard = TAP_STATE.lock().unwrap();
+    let mut guard = tap_state();
     match guard.as_mut() {
         Some(TapState::Calibrate(state)) => {
             state.add_sample(layer_idx, q);

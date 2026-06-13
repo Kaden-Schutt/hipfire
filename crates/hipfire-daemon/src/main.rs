@@ -48,6 +48,7 @@ use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
@@ -2184,7 +2185,7 @@ mod generate_batch_prefill_tests {
     }
 
     #[test]
-    fn fused_prefill_boundary_cuts_require_multi_session_segments() {
+    fn fused_prefill_boundary_cuts_allow_single_session_serial_segments() {
         let synchronized = vec![
             test_prefill_boundary_session("req-a", &[1, 2, 3, 4], &[2]),
             test_prefill_boundary_session("req-b", &[5, 6, 7, 8], &[2]),
@@ -2198,8 +2199,10 @@ mod generate_batch_prefill_tests {
             test_prefill_boundary_session("req-a", &[1], &[]),
             test_prefill_boundary_session("req-b", &[5, 6, 7, 8], &[1]),
         ];
-        let err = qwen35_fused_prefill_boundary_cuts(&uneven_tail).unwrap_err();
-        assert!(err.contains("active session"));
+        assert_eq!(
+            qwen35_fused_prefill_boundary_cuts(&uneven_tail).expect("valid mixed cuts"),
+            Some(vec![1, 4])
+        );
     }
 
     #[test]
@@ -2237,11 +2240,14 @@ mod generate_batch_prefill_tests {
                     handle: SequenceStateHandle {
                         id: "checkpoint-a".to_string(),
                         kind: "qwen35_session".to_string(),
+                        generation: 0,
                     },
                     kind: SequenceStatePageKind::Kv,
                     label: "qwen35.kv_cache".to_string(),
                     logical_position: 16,
                     resident_bytes: 128,
+                    allocation_epoch: 0,
+                    owns_pages: false,
                     shape: vec![2, 16, 4, 32],
                     placement: "hip:arch5:device0".to_string(),
                     role: "resident".to_string(),
@@ -2251,11 +2257,14 @@ mod generate_batch_prefill_tests {
                     handle: SequenceStateHandle {
                         id: "checkpoint-a".to_string(),
                         kind: "qwen35_session".to_string(),
+                        generation: 0,
                     },
                     kind: SequenceStatePageKind::DeltaNet,
                     label: "qwen35.deltanet_state".to_string(),
                     logical_position: 16,
                     resident_bytes: 96,
+                    allocation_epoch: 0,
+                    owns_pages: false,
                     shape: vec![48, 48, 48],
                     placement: "hip:arch5:device0".to_string(),
                     role: "resident".to_string(),
@@ -2265,11 +2274,14 @@ mod generate_batch_prefill_tests {
                     handle: SequenceStateHandle {
                         id: "checkpoint-a".to_string(),
                         kind: "qwen35_session".to_string(),
+                        generation: 0,
                     },
                     kind: SequenceStatePageKind::Logits,
                     label: "qwen35.logits_snapshot".to_string(),
                     logical_position: 16,
                     resident_bytes: 64,
+                    allocation_epoch: 0,
+                    owns_pages: false,
                     shape: vec![16],
                     placement: "hip:arch5:device0".to_string(),
                     role: "resident".to_string(),
@@ -2279,11 +2291,14 @@ mod generate_batch_prefill_tests {
                     handle: SequenceStateHandle {
                         id: "checkpoint-a".to_string(),
                         kind: "qwen35_session".to_string(),
+                        generation: 0,
                     },
                     kind: SequenceStatePageKind::BackendPrivate,
                     label: "qwen35.prefix_metadata".to_string(),
                     logical_position: 16,
                     resident_bytes: 32,
+                    allocation_epoch: 0,
+                    owns_pages: false,
                     shape: vec![1],
                     placement: "host".to_string(),
                     role: "resident".to_string(),
@@ -2302,6 +2317,17 @@ mod generate_batch_prefill_tests {
 
         let json = model_worker_runtime_view_json(&worker);
         assert_eq!(json["state_arena_backend"], "qwen35_wrapped");
+        assert_eq!(json["state_arena_owns_pages"], true);
+        assert_eq!(
+            json["state_arena_operations"],
+            serde_json::json!([
+                "reserve_session_state",
+                "attach_checkpoint",
+                "fork_checkpoint",
+                "release_state",
+                "describe_state"
+            ])
+        );
         assert_eq!(json["max_seq"], 32768);
         assert_eq!(json["physical_cap"], 2048);
         assert_eq!(json["state_page_descriptor_entries"], 4);
@@ -2325,6 +2351,8 @@ mod generate_batch_prefill_tests {
             json["state_page_descriptors"][0]["handle"]["id"],
             "checkpoint-a"
         );
+        assert_eq!(json["state_page_descriptors"][0]["allocation_epoch"], 0);
+        assert_eq!(json["state_page_descriptors"][0]["owns_pages"], false);
         assert_eq!(
             json["state_page_descriptors"][0]["shape"],
             serde_json::json!([2, 16, 4, 32])
@@ -2383,12 +2411,323 @@ mod generate_batch_prefill_tests {
 
         let json = model_worker_runtime_view_json(&worker);
         assert_eq!(json["state_arena_backend"], "unsupported");
+        assert_eq!(json["state_arena_owns_pages"], false);
+        assert_eq!(json["state_arena_operations"], serde_json::json!([]));
         assert_eq!(json["resident_sessions"], 0);
         assert_eq!(json["state_page_descriptor_entries"], 0);
         assert_eq!(json["state_page_descriptor_bytes"], 0);
         assert_eq!(json["state_page_descriptors"], serde_json::json!([]));
         assert_eq!(json["runtime_session_bytes"], 0);
         assert_eq!(json["evictable_state_bytes"], 0);
+    }
+
+    #[test]
+    fn reserve_session_state_kinds_default_deduplicate_and_alias() {
+        let defaults = parse_reserve_session_state_kinds(&serde_json::json!({})).unwrap();
+        assert_eq!(
+            defaults,
+            vec![SequenceStatePageKind::Kv, SequenceStatePageKind::DeltaNet]
+        );
+
+        let parsed = parse_reserve_session_state_kinds(&serde_json::json!({
+            "state_kinds": [
+                "attention_kv",
+                "deltanet_recurrent",
+                "attention_kv",
+                "architecture_specific"
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                SequenceStatePageKind::Kv,
+                SequenceStatePageKind::DeltaNet,
+                SequenceStatePageKind::BackendPrivate
+            ]
+        );
+
+        let err = parse_reserve_session_state_kinds(&serde_json::json!({
+            "state_kinds": ["unknown_state"]
+        }))
+        .unwrap_err();
+        assert!(err.contains("unsupported kind unknown_state"));
+    }
+
+    #[test]
+    fn generic_state_reservation_descriptors_are_owned_handles() {
+        let handle = SequenceStateHandle {
+            id: "reserve-a".to_string(),
+            kind: "generic_reserved_state".to_string(),
+            generation: 7,
+        };
+        let descriptors = generic_state_reservation_descriptors(
+            "worker-a",
+            &handle,
+            &[
+                SequenceStatePageKind::Kv,
+                SequenceStatePageKind::DeltaNet,
+                SequenceStatePageKind::Logits,
+            ],
+            2048,
+            10,
+        );
+
+        assert_eq!(descriptors.len(), 3);
+        assert_eq!(descriptors[0].handle.id, "reserve-a");
+        assert_eq!(descriptors[0].handle.kind, "generic_reserved_state");
+        assert_eq!(descriptors[0].handle.generation, 7);
+        assert_eq!(descriptors[0].session_id, "reserve-a");
+        assert_eq!(descriptors[0].resident_bytes, 4);
+        assert_eq!(descriptors[0].allocation_epoch, 7);
+        assert!(descriptors[0].owns_pages);
+        assert_eq!(descriptors[1].resident_bytes, 3);
+        assert_eq!(descriptors[2].resident_bytes, 3);
+        assert_eq!(descriptors[0].shape, vec![2048]);
+        assert_eq!(descriptors[2].shape, vec![1]);
+        assert_eq!(descriptors[0].placement, "host:reserved:worker-a");
+        assert_eq!(descriptors[0].role, "reserved");
+
+        let json = sequence_state_page_descriptor_json(&descriptors[0]);
+        assert_eq!(json["handle"]["kind"], "generic_reserved_state");
+        assert_eq!(json["handle"]["generation"], 7);
+        assert_eq!(json["state_kind"], "attention_kv");
+        assert_eq!(json["resident_bytes"], 4);
+        assert_eq!(json["allocation_epoch"], 7);
+        assert_eq!(json["owns_pages"], true);
+    }
+
+    fn test_state_descriptor(
+        id: &str,
+        kind: &str,
+        generation: u64,
+        page_kind: SequenceStatePageKind,
+        bytes: usize,
+    ) -> SequenceStatePageDescriptor {
+        SequenceStatePageDescriptor {
+            session_id: id.to_string(),
+            handle: SequenceStateHandle {
+                id: id.to_string(),
+                kind: kind.to_string(),
+                generation,
+            },
+            kind: page_kind,
+            label: format!("{kind}.{}", page_kind.as_str()),
+            logical_position: 16,
+            resident_bytes: bytes,
+            allocation_epoch: generation,
+            owns_pages: generation != 0,
+            shape: vec![1],
+            placement: "hip:arch5:device0".to_string(),
+            role: "resident".to_string(),
+        }
+    }
+
+    #[test]
+    fn sequence_state_descriptor_lookup_binds_qwen35_epoch_handles() {
+        let descriptors = vec![
+            test_state_descriptor(
+                "qwen35-checkpoint:batch:req:16",
+                "qwen35_checkpoint",
+                41,
+                SequenceStatePageKind::Kv,
+                128,
+            ),
+            test_state_descriptor(
+                "qwen35-checkpoint:batch:req:16",
+                "qwen35_checkpoint",
+                41,
+                SequenceStatePageKind::DeltaNet,
+                96,
+            ),
+            test_state_descriptor(
+                "qwen35-checkpoint:batch:req:16",
+                "qwen35_checkpoint",
+                42,
+                SequenceStatePageKind::Logits,
+                64,
+            ),
+        ];
+        let handle = ParsedSequenceStateHandle {
+            id: "qwen35-checkpoint:batch:req:16".to_string(),
+            kind: Some("qwen35_checkpoint".to_string()),
+            generation: Some(41),
+        };
+        let matched =
+            describe_sequence_state_descriptors(descriptors.clone(), &handle).expect("match");
+        assert_eq!(matched.len(), 2);
+        assert!(matched.iter().all(|descriptor| {
+            descriptor.handle.kind == "qwen35_checkpoint" && descriptor.allocation_epoch == 41
+        }));
+
+        let stale = ParsedSequenceStateHandle {
+            generation: Some(40),
+            ..handle
+        };
+        assert!(describe_sequence_state_descriptors(descriptors, &stale).is_none());
+    }
+
+    #[test]
+    fn parsed_state_handle_kind_routes_generic_and_qwen35_surfaces() {
+        let generic = parse_sequence_state_handle(&serde_json::json!({
+            "id": "reserve-a",
+            "kind": "generic_reserved_state",
+            "generation": 7
+        }))
+        .unwrap();
+        assert!(parsed_handle_may_target_generic(&generic));
+        assert!(!parsed_handle_may_target_loaded_state(&generic));
+
+        let qwen35 = parse_sequence_state_handle(&serde_json::json!({
+            "id": "qwen35-checkpoint:batch:req:16",
+            "kind": "qwen35_checkpoint",
+            "allocation_epoch": 41
+        }))
+        .unwrap();
+        assert!(!parsed_handle_may_target_generic(&qwen35));
+        assert!(parsed_handle_may_target_loaded_state(&qwen35));
+        assert_eq!(qwen35.generation, Some(41));
+
+        let legacy = parse_sequence_state_handle(&serde_json::json!("session-a")).unwrap();
+        assert!(parsed_handle_may_target_generic(&legacy));
+        assert!(parsed_handle_may_target_loaded_state(&legacy));
+    }
+
+    #[test]
+    fn qwen35_checkpoint_handles_report_owned_epoch_identity() {
+        let session_handle = qwen35_sequence_state_handle("session-a", 11);
+        assert_eq!(session_handle.id, "session-a");
+        assert_eq!(session_handle.kind, "qwen35_session");
+        assert_eq!(session_handle.generation, 11);
+
+        let checkpoint_handle = qwen35_sequence_state_handle("qwen35-checkpoint:batch:req:16", 12);
+        assert_eq!(checkpoint_handle.kind, "qwen35_checkpoint");
+        assert_eq!(checkpoint_handle.generation, 12);
+    }
+
+    #[test]
+    fn sequence_state_handle_id_accepts_string_or_handle_object() {
+        assert_eq!(
+            sequence_state_handle_id(&serde_json::json!("reserve-a")),
+            Some("reserve-a")
+        );
+        assert_eq!(
+            sequence_state_handle_id(&serde_json::json!({
+                "id": "reserve-b",
+                "kind": "generic_reserved_state",
+                "generation": 9
+            })),
+            Some("reserve-b")
+        );
+        assert_eq!(
+            sequence_state_handle_parts(&serde_json::json!({
+                "id": "reserve-b",
+                "kind": "generic_reserved_state",
+                "generation": 9
+            })),
+            Some(("reserve-b", Some(9)))
+        );
+        assert_eq!(sequence_state_handle_id(&serde_json::json!("")), None);
+        assert_eq!(
+            sequence_state_handle_id(&serde_json::json!({"kind": "missing_id"})),
+            None
+        );
+    }
+
+    #[test]
+    fn generic_state_arena_rejects_stale_generation_handles() {
+        let mut arena = GenericSequenceStateArena::new();
+        let first = arena.reserve(
+            "worker-a",
+            "reserve-a".to_string(),
+            &[SequenceStatePageKind::Kv],
+            128,
+            64,
+            0,
+        );
+        assert_eq!(first.handle.generation, 1);
+        assert!(arena.describe("reserve-a", Some(1)).is_some());
+        assert!(arena.describe("reserve-a", Some(2)).is_none());
+        assert_eq!(
+            arena.release(vec![("reserve-a".to_string(), Some(2))]),
+            (0, 0)
+        );
+        assert!(arena.describe("reserve-a", Some(1)).is_some());
+        assert_eq!(
+            arena.release(vec![("reserve-a".to_string(), Some(1))]),
+            (1, 64)
+        );
+
+        let second = arena.reserve(
+            "worker-a",
+            "reserve-a".to_string(),
+            &[SequenceStatePageKind::DeltaNet],
+            128,
+            32,
+            0,
+        );
+        assert_eq!(second.handle.generation, 2);
+        assert!(arena.describe("reserve-a", Some(1)).is_none());
+        assert!(arena.describe("reserve-a", Some(2)).is_some());
+    }
+
+    #[test]
+    fn generic_state_arena_purges_ttl_and_releases_by_worker() {
+        let mut arena = GenericSequenceStateArena::new();
+        let expiring = arena.reserve(
+            "worker-a",
+            "reserve-expiring".to_string(),
+            &[SequenceStatePageKind::Kv],
+            128,
+            16,
+            1,
+        );
+        let persistent = arena.reserve(
+            "worker-a",
+            "reserve-persistent".to_string(),
+            &[SequenceStatePageKind::DeltaNet],
+            128,
+            32,
+            0,
+        );
+        let other_worker = arena.reserve(
+            "worker-b",
+            "reserve-other".to_string(),
+            &[SequenceStatePageKind::Logits],
+            128,
+            64,
+            0,
+        );
+        assert_eq!(arena.outstanding_bytes_for_worker("worker-a"), 48);
+        assert_eq!(arena.outstanding_bytes_for_worker("worker-b"), 64);
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        arena.purge_expired();
+        assert!(
+            arena
+                .describe("reserve-expiring", Some(expiring.handle.generation))
+                .is_none()
+        );
+        assert!(
+            arena
+                .describe("reserve-persistent", Some(persistent.handle.generation))
+                .is_some()
+        );
+        assert_eq!(arena.outstanding_bytes_for_worker("worker-a"), 32);
+
+        arena.release_worker("worker-a");
+        assert!(
+            arena
+                .describe("reserve-persistent", Some(persistent.handle.generation))
+                .is_none()
+        );
+        assert!(
+            arena
+                .describe("reserve-other", Some(other_worker.handle.generation))
+                .is_some()
+        );
+        assert_eq!(arena.outstanding_bytes_for_worker("worker-a"), 0);
+        assert_eq!(arena.outstanding_bytes_for_worker("worker-b"), 64);
     }
 
     #[test]
@@ -3464,6 +3803,7 @@ struct LoadedModel {
     q35_state_quant: Option<hipfire_arch_qwen35::qwen35::StateQuant>,
     q35_sessions: std::collections::HashMap<String, Qwen35RequestSessionState>,
     q35_active_session_id: Option<String>,
+    q35_active_state_allocation_epoch: u64,
     q35_active_prefilled_generated_suffix_len: usize,
     // Qwen3 state
     llama_config: Option<llama::LlamaConfig>,
@@ -3619,6 +3959,11 @@ struct LoadedModel {
 
 const QWEN35_LEGACY_SESSION_ID: &str = "__legacy_generate__";
 const DEFAULT_MODEL_WORKER_ID: &str = "__default__";
+static QWEN35_STATE_ALLOCATION_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_qwen35_state_allocation_epoch() -> u64 {
+    QWEN35_STATE_ALLOCATION_EPOCH.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct LoadedModelMemory {
@@ -3630,7 +3975,15 @@ struct LoadedModelMemory {
 struct SessionStateReservation {
     worker_id: String,
     reserved_bytes: usize,
+    handle: SequenceStateHandle,
+    state_page_descriptors: Vec<SequenceStatePageDescriptor>,
     expires_at: Option<std::time::Instant>,
+}
+
+#[derive(Default)]
+struct GenericSequenceStateArena {
+    reservations: std::collections::HashMap<String, SessionStateReservation>,
+    next_generation: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3644,11 +3997,52 @@ enum SequenceStateArenaBackend {
     Unsupported,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SequenceStateArenaOperation {
+    ReserveSessionState,
+    AttachCheckpoint,
+    ForkCheckpoint,
+    ReleaseState,
+    DescribeState,
+}
+
+impl SequenceStateArenaOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReserveSessionState => "reserve_session_state",
+            Self::AttachCheckpoint => "attach_checkpoint",
+            Self::ForkCheckpoint => "fork_checkpoint",
+            Self::ReleaseState => "release_state",
+            Self::DescribeState => "describe_state",
+        }
+    }
+}
+
 impl SequenceStateArenaBackend {
     fn as_str(self) -> &'static str {
         match self {
             Self::Qwen35Wrapped => "qwen35_wrapped",
             Self::Unsupported => "unsupported",
+        }
+    }
+
+    fn owns_state_pages(self) -> bool {
+        match self {
+            Self::Qwen35Wrapped => true,
+            Self::Unsupported => false,
+        }
+    }
+
+    fn supported_operations(self) -> &'static [SequenceStateArenaOperation] {
+        match self {
+            Self::Qwen35Wrapped => &[
+                SequenceStateArenaOperation::ReserveSessionState,
+                SequenceStateArenaOperation::AttachCheckpoint,
+                SequenceStateArenaOperation::ForkCheckpoint,
+                SequenceStateArenaOperation::ReleaseState,
+                SequenceStateArenaOperation::DescribeState,
+            ],
+            Self::Unsupported => &[],
         }
     }
 }
@@ -3670,6 +4064,14 @@ struct ModelWorkerRuntimeView {
 struct SequenceStateHandle {
     id: String,
     kind: String,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedSequenceStateHandle {
+    id: String,
+    kind: Option<String>,
+    generation: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3689,6 +4091,18 @@ impl SequenceStatePageKind {
             Self::BackendPrivate => "backend_private",
         }
     }
+
+    fn from_state_kind(kind: &str) -> Option<Self> {
+        match kind {
+            "attention_kv" => Some(Self::Kv),
+            "deltanet_recurrent" => Some(Self::DeltaNet),
+            "logits" => Some(Self::Logits),
+            "backend_private" | "architecture_specific" | "mamba_ssm" | "mamba_conv" => {
+                Some(Self::BackendPrivate)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3699,6 +4113,8 @@ struct SequenceStatePageDescriptor {
     label: String,
     logical_position: usize,
     resident_bytes: usize,
+    allocation_epoch: u64,
+    owns_pages: bool,
     shape: Vec<usize>,
     placement: String,
     role: String,
@@ -3751,6 +4167,7 @@ struct Qwen35RequestSessionState {
     dn_state: DeltaNetState,
     logits: rdna_compute::GpuTensor,
     prefilled_generated_suffix_len: usize,
+    allocation_epoch: u64,
 }
 
 #[derive(Clone)]
@@ -3911,6 +4328,7 @@ impl Qwen35RequestSessionState {
             dn_state: Self::clone_dn_state(gpu, &source.dn_state)?,
             logits: Self::clone_gpu_tensor(gpu, &source.logits, "logits")?,
             prefilled_generated_suffix_len: source.prefilled_generated_suffix_len,
+            allocation_epoch: next_qwen35_state_allocation_epoch(),
         })
     }
 
@@ -3938,6 +4356,7 @@ impl Qwen35RequestSessionState {
             dn_state: m.dn_state.take().unwrap(),
             logits,
             prefilled_generated_suffix_len: m.q35_active_prefilled_generated_suffix_len,
+            allocation_epoch: next_qwen35_state_allocation_epoch(),
         })
     }
 
@@ -3946,6 +4365,7 @@ impl Qwen35RequestSessionState {
         m: &mut LoadedModel,
         gpu: &mut rdna_compute::Gpu,
     ) -> Result<(), String> {
+        let allocation_epoch = self.allocation_epoch;
         if let Some(scratch) = m.q35_scratch.as_ref() {
             gpu.memcpy_dtod_auto(
                 &scratch.logits.buf,
@@ -3961,6 +4381,7 @@ impl Qwen35RequestSessionState {
         // sessions are saved back into the session map.
         m.kv_cache = Some(self.kv_cache);
         m.dn_state = Some(self.dn_state);
+        m.q35_active_state_allocation_epoch = allocation_epoch;
         m.q35_active_prefilled_generated_suffix_len = self.prefilled_generated_suffix_len;
         Ok(())
     }
@@ -4002,6 +4423,22 @@ fn qwen35_request_session_count(m: &LoadedModel) -> usize {
     saved + active
 }
 
+fn qwen35_state_handle_kind(session_id: &str) -> &'static str {
+    if session_id.starts_with("qwen35-checkpoint:") {
+        "qwen35_checkpoint"
+    } else {
+        "qwen35_session"
+    }
+}
+
+fn qwen35_sequence_state_handle(session_id: &str, allocation_epoch: u64) -> SequenceStateHandle {
+    SequenceStateHandle {
+        id: session_id.to_string(),
+        kind: qwen35_state_handle_kind(session_id).to_string(),
+        generation: allocation_epoch,
+    }
+}
+
 fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
     let mut descriptors = Vec::new();
     let placement = format!("hip:arch{}:device0", m.arch_id);
@@ -4010,6 +4447,8 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             return;
         }
         let logical_position = session.seq_pos + session.kv_cache.compact_offset;
+        let handle = qwen35_sequence_state_handle(session_id, session.allocation_epoch);
+        let owns_pages = session.allocation_epoch != 0;
         let kv_bytes = session
             .kv_cache
             .k_gpu
@@ -4021,14 +4460,13 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             .sum::<usize>();
         descriptors.push(SequenceStatePageDescriptor {
             session_id: session_id.to_string(),
-            handle: SequenceStateHandle {
-                id: session_id.to_string(),
-                kind: "qwen35_session".to_string(),
-            },
+            handle: handle.clone(),
             kind: SequenceStatePageKind::Kv,
             label: "qwen35.kv_cache".to_string(),
             logical_position,
             resident_bytes: kv_bytes,
+            allocation_epoch: session.allocation_epoch,
+            owns_pages,
             shape: vec![
                 session.kv_cache.k_gpu.len(),
                 session.kv_cache.physical_cap,
@@ -4048,14 +4486,13 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             .sum::<usize>();
         descriptors.push(SequenceStatePageDescriptor {
             session_id: session_id.to_string(),
-            handle: SequenceStateHandle {
-                id: session_id.to_string(),
-                kind: "qwen35_session".to_string(),
-            },
+            handle: handle.clone(),
             kind: SequenceStatePageKind::DeltaNet,
             label: "qwen35.deltanet_state".to_string(),
             logical_position,
             resident_bytes: dn_bytes,
+            allocation_epoch: session.allocation_epoch,
+            owns_pages,
             shape: vec![
                 session.dn_state.s_matrices.len(),
                 session.dn_state.s_scales.len(),
@@ -4066,24 +4503,20 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
         });
         descriptors.push(SequenceStatePageDescriptor {
             session_id: session_id.to_string(),
-            handle: SequenceStateHandle {
-                id: session_id.to_string(),
-                kind: "qwen35_session".to_string(),
-            },
+            handle: handle.clone(),
             kind: SequenceStatePageKind::Logits,
             label: "qwen35.logits_snapshot".to_string(),
             logical_position,
             resident_bytes: session.logits.buf.size(),
+            allocation_epoch: session.allocation_epoch,
+            owns_pages,
             shape: session.logits.shape.clone(),
             placement: placement.clone(),
             role: role.to_string(),
         });
         descriptors.push(SequenceStatePageDescriptor {
             session_id: session_id.to_string(),
-            handle: SequenceStateHandle {
-                id: session_id.to_string(),
-                kind: "qwen35_session".to_string(),
-            },
+            handle,
             kind: SequenceStatePageKind::BackendPrivate,
             label: "qwen35.prefix_metadata".to_string(),
             logical_position,
@@ -4092,6 +4525,8 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
                 .as_ref()
                 .map(|hash| hash.value.len() + hash.algorithm.len() + std::mem::size_of::<usize>())
                 .unwrap_or(0),
+            allocation_epoch: session.allocation_epoch,
+            owns_pages,
             shape: vec![usize::from(session.prefix_hash.is_some())],
             placement: "host".to_string(),
             role: role.to_string(),
@@ -4104,11 +4539,14 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
         if active_id != QWEN35_LEGACY_SESSION_ID {
             let compact_offset = m.kv_cache.as_ref().map(|kv| kv.compact_offset).unwrap_or(0);
             let logical_position = m.seq_pos + compact_offset;
+            let allocation_epoch = m.q35_active_state_allocation_epoch;
+            let owns_pages = allocation_epoch != 0;
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
                 handle: SequenceStateHandle {
                     id: active_id.to_string(),
                     kind: "qwen35_session".to_string(),
+                    generation: allocation_epoch,
                 },
                 kind: SequenceStatePageKind::Kv,
                 label: "qwen35.kv_cache.active".to_string(),
@@ -4131,6 +4569,8 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
                     .as_ref()
                     .map(|kv| vec![kv.k_gpu.len(), kv.physical_cap, kv.n_kv_heads, kv.head_dim])
                     .unwrap_or_default(),
+                allocation_epoch,
+                owns_pages,
                 placement: placement.clone(),
                 role: "active".to_string(),
             });
@@ -4139,6 +4579,7 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
                 handle: SequenceStateHandle {
                     id: active_id.to_string(),
                     kind: "qwen35_session".to_string(),
+                    generation: allocation_epoch,
                 },
                 kind: SequenceStatePageKind::DeltaNet,
                 label: "qwen35.deltanet_state.active".to_string(),
@@ -4160,6 +4601,8 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
                     .as_ref()
                     .map(|dn| vec![dn.s_matrices.len(), dn.s_scales.len(), dn.conv_states.len()])
                     .unwrap_or_default(),
+                allocation_epoch,
+                owns_pages,
                 placement: placement.clone(),
                 role: "active".to_string(),
             });
@@ -4168,6 +4611,7 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
                 handle: SequenceStateHandle {
                     id: active_id.to_string(),
                     kind: "qwen35_session".to_string(),
+                    generation: allocation_epoch,
                 },
                 kind: SequenceStatePageKind::Logits,
                 label: "qwen35.logits_snapshot.active".to_string(),
@@ -4182,6 +4626,8 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
                     .as_ref()
                     .map(|scratch| scratch.logits.shape.clone())
                     .unwrap_or_default(),
+                allocation_epoch,
+                owns_pages,
                 placement,
                 role: "active".to_string(),
             });
@@ -4190,11 +4636,14 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
                 handle: SequenceStateHandle {
                     id: active_id.to_string(),
                     kind: "qwen35_session".to_string(),
+                    generation: allocation_epoch,
                 },
                 kind: SequenceStatePageKind::BackendPrivate,
                 label: "qwen35.prefix_metadata.active".to_string(),
                 logical_position,
                 resident_bytes: 0,
+                allocation_epoch,
+                owns_pages,
                 shape: Vec::new(),
                 placement: "host".to_string(),
                 role: "active".to_string(),
@@ -4469,23 +4918,7 @@ fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_json
     let descriptors: Vec<serde_json::Value> = worker
         .state_page_descriptors
         .iter()
-        .map(|descriptor| {
-            serde_json::json!({
-                "session_id": &descriptor.session_id,
-                "handle": {
-                    "id": &descriptor.handle.id,
-                    "kind": &descriptor.handle.kind,
-                },
-                "state_kind": descriptor.kind.as_str(),
-                "page_kind": descriptor.kind.as_str(),
-                "label": &descriptor.label,
-                "logical_position": descriptor.logical_position,
-                "resident_bytes": descriptor.resident_bytes,
-                "shape": &descriptor.shape,
-                "placement": &descriptor.placement,
-                "role": &descriptor.role,
-            })
-        })
+        .map(sequence_state_page_descriptor_json)
         .collect();
     serde_json::json!({
         "id": worker.worker_id.value,
@@ -4494,6 +4927,13 @@ fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_json
         "resident_workers": worker.resident_workers,
         "max_resident_workers": worker.max_resident_workers,
         "state_arena_backend": worker.state_arena_backend.as_str(),
+        "state_arena_owns_pages": worker.state_arena_backend.owns_state_pages(),
+        "state_arena_operations": worker
+            .state_arena_backend
+            .supported_operations()
+            .iter()
+            .map(|op| op.as_str())
+            .collect::<Vec<_>>(),
         "resident_sessions": worker.resident_sessions,
         "state_page_descriptor_entries": worker.state_page_descriptors.len(),
         "state_page_descriptor_bytes": descriptor_bytes,
@@ -4505,6 +4945,29 @@ fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_json
         "runtime_state_bytes": worker.memory.runtime_state_bytes,
         "total_resident_bytes": worker.memory.total_resident_bytes,
         "evictable_state_bytes": worker.memory.evictable_state_bytes,
+    })
+}
+
+fn sequence_state_page_descriptor_json(
+    descriptor: &SequenceStatePageDescriptor,
+) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": &descriptor.session_id,
+        "handle": {
+            "id": &descriptor.handle.id,
+            "kind": &descriptor.handle.kind,
+            "generation": descriptor.handle.generation,
+        },
+        "state_kind": descriptor.kind.as_str(),
+        "page_kind": descriptor.kind.as_str(),
+        "label": &descriptor.label,
+        "logical_position": descriptor.logical_position,
+        "resident_bytes": descriptor.resident_bytes,
+        "allocation_epoch": descriptor.allocation_epoch,
+        "owns_pages": descriptor.owns_pages,
+        "shape": &descriptor.shape,
+        "placement": &descriptor.placement,
+        "role": &descriptor.role,
     })
 }
 
@@ -4674,27 +5137,412 @@ fn resident_state_reservation_budget_bytes() -> usize {
         .unwrap_or(16 * 1024 * 1024 * 1024)
 }
 
-fn purge_expired_session_state_reservations(
-    reservations: &mut std::collections::HashMap<String, SessionStateReservation>,
-) {
-    let now = std::time::Instant::now();
-    reservations.retain(|_, reservation| {
+impl GenericSequenceStateArena {
+    fn new() -> Self {
+        Self {
+            reservations: std::collections::HashMap::new(),
+            next_generation: 1,
+        }
+    }
+
+    fn purge_expired(&mut self) {
+        let now = std::time::Instant::now();
+        self.reservations.retain(|_, reservation| {
+            reservation
+                .expires_at
+                .map(|expires_at| expires_at > now)
+                .unwrap_or(true)
+        });
+    }
+
+    fn release_worker(&mut self, worker_id: &str) {
+        self.reservations
+            .retain(|_, reservation| reservation.worker_id != worker_id);
+    }
+
+    fn clear(&mut self) {
+        self.reservations.clear();
+    }
+
+    fn outstanding_bytes_for_worker(&self, worker_id: &str) -> usize {
+        self.reservations
+            .values()
+            .filter(|reservation| reservation.worker_id == worker_id)
+            .map(|reservation| reservation.reserved_bytes)
+            .sum()
+    }
+
+    fn reserve(
+        &mut self,
+        worker_id: &str,
+        reservation_id: String,
+        state_kinds: &[SequenceStatePageKind],
+        physical_cap: usize,
+        reserved_bytes: usize,
+        ttl_ms: u64,
+    ) -> SessionStateReservation {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1).max(1);
+        let handle = SequenceStateHandle {
+            id: reservation_id.clone(),
+            kind: "generic_reserved_state".to_string(),
+            generation,
+        };
+        let state_page_descriptors = generic_state_reservation_descriptors(
+            worker_id,
+            &handle,
+            state_kinds,
+            physical_cap,
+            reserved_bytes,
+        );
+        let reservation = SessionStateReservation {
+            worker_id: worker_id.to_string(),
+            reserved_bytes,
+            handle,
+            state_page_descriptors,
+            expires_at: if ttl_ms == 0 {
+                None
+            } else {
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(ttl_ms))
+            },
+        };
+        self.reservations
+            .insert(reservation_id, reservation.clone());
         reservation
-            .expires_at
-            .map(|expires_at| expires_at > now)
+    }
+
+    fn describe(
+        &self,
+        handle_id: &str,
+        generation: Option<u64>,
+    ) -> Option<&SessionStateReservation> {
+        let reservation = self.reservations.get(handle_id)?;
+        if generation
+            .map(|generation| generation == reservation.handle.generation)
             .unwrap_or(true)
-    });
+        {
+            Some(reservation)
+        } else {
+            None
+        }
+    }
+
+    fn release<I>(&mut self, handles: I) -> (usize, usize)
+    where
+        I: IntoIterator<Item = (String, Option<u64>)>,
+    {
+        let mut released = 0usize;
+        let mut released_bytes = 0usize;
+        for (handle_id, generation) in handles {
+            let matches_generation = self
+                .reservations
+                .get(&handle_id)
+                .map(|reservation| {
+                    generation
+                        .map(|generation| generation == reservation.handle.generation)
+                        .unwrap_or(true)
+                })
+                .unwrap_or(false);
+            if matches_generation {
+                if let Some(reservation) = self.reservations.remove(&handle_id) {
+                    released += 1;
+                    released_bytes = released_bytes.saturating_add(reservation.reserved_bytes);
+                }
+            }
+        }
+        (released, released_bytes)
+    }
 }
 
-fn outstanding_reservation_bytes_for_worker(
-    reservations: &std::collections::HashMap<String, SessionStateReservation>,
+fn sequence_state_handle_id(value: &serde_json::Value) -> Option<&str> {
+    sequence_state_handle_parts(value).map(|(id, _)| id)
+}
+
+fn sequence_state_handle_parts(value: &serde_json::Value) -> Option<(&str, Option<u64>)> {
+    if let Some(id) = value.as_str().filter(|s| !s.is_empty()) {
+        return Some((id, None));
+    }
+    let id = value.get("id").and_then(|v| v.as_str())?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let generation = value
+        .get("generation")
+        .or_else(|| value.get("allocation_epoch"))
+        .and_then(|v| v.as_u64());
+    Some((id, generation))
+}
+
+fn parse_sequence_state_handle(value: &serde_json::Value) -> Option<ParsedSequenceStateHandle> {
+    let (id, generation) = sequence_state_handle_parts(value)?;
+    let kind = value
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .filter(|kind| !kind.is_empty())
+        .map(|kind| kind.to_string());
+    Some(ParsedSequenceStateHandle {
+        id: id.to_string(),
+        kind,
+        generation,
+    })
+}
+
+fn parse_sequence_state_handle_list(msg: &serde_json::Value) -> Vec<ParsedSequenceStateHandle> {
+    msg.get("reservations")
+        .or_else(|| msg.get("handles"))
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(parse_sequence_state_handle)
+                .collect()
+        })
+        .or_else(|| {
+            msg.get("reservation_id")
+                .and_then(parse_sequence_state_handle)
+                .map(|handle| vec![handle])
+        })
+        .or_else(|| {
+            msg.get("runtime_state_handle")
+                .and_then(parse_sequence_state_handle)
+                .map(|handle| vec![handle])
+        })
+        .or_else(|| {
+            msg.get("handle")
+                .and_then(parse_sequence_state_handle)
+                .map(|handle| vec![handle])
+        })
+        .unwrap_or_default()
+}
+
+fn parse_reserve_session_state_kinds(
+    msg: &serde_json::Value,
+) -> Result<Vec<SequenceStatePageKind>, String> {
+    let Some(value) = msg.get("state_kinds") else {
+        return Ok(vec![
+            SequenceStatePageKind::Kv,
+            SequenceStatePageKind::DeltaNet,
+        ]);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| "reserve_session_state.state_kinds must be an array".to_string())?;
+    if values.is_empty() {
+        return Err("reserve_session_state.state_kinds must not be empty".to_string());
+    }
+    let mut kinds = Vec::with_capacity(values.len());
+    for value in values {
+        let raw = value
+            .as_str()
+            .ok_or_else(|| "reserve_session_state.state_kinds must be strings".to_string())?;
+        let kind = SequenceStatePageKind::from_state_kind(raw).ok_or_else(|| {
+            format!("reserve_session_state.state_kinds contains unsupported kind {raw}")
+        })?;
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    Ok(kinds)
+}
+
+fn generic_state_reservation_descriptors(
     worker_id: &str,
-) -> usize {
-    reservations
-        .values()
-        .filter(|reservation| reservation.worker_id == worker_id)
-        .map(|reservation| reservation.reserved_bytes)
-        .sum()
+    handle: &SequenceStateHandle,
+    kinds: &[SequenceStatePageKind],
+    physical_cap: usize,
+    reserved_bytes: usize,
+) -> Vec<SequenceStatePageDescriptor> {
+    let count = kinds.len().max(1);
+    let base_bytes = reserved_bytes / count;
+    let remainder = reserved_bytes % count;
+    kinds
+        .iter()
+        .enumerate()
+        .map(|(idx, &kind)| {
+            let resident_bytes = base_bytes + usize::from(idx < remainder);
+            let label = match kind {
+                SequenceStatePageKind::Kv => "generic.attention_kv",
+                SequenceStatePageKind::DeltaNet => "generic.deltanet_recurrent",
+                SequenceStatePageKind::Logits => "generic.logits",
+                SequenceStatePageKind::BackendPrivate => "generic.backend_private",
+            };
+            let shape = match kind {
+                SequenceStatePageKind::Kv | SequenceStatePageKind::DeltaNet => vec![physical_cap],
+                SequenceStatePageKind::Logits | SequenceStatePageKind::BackendPrivate => vec![1],
+            };
+            SequenceStatePageDescriptor {
+                session_id: handle.id.clone(),
+                handle: handle.clone(),
+                kind,
+                label: label.to_string(),
+                logical_position: 0,
+                resident_bytes,
+                allocation_epoch: handle.generation,
+                owns_pages: true,
+                shape,
+                placement: format!("host:reserved:{worker_id}"),
+                role: "reserved".to_string(),
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct DescribedSequenceState {
+    worker_id: String,
+    handle: SequenceStateHandle,
+    state_arena_owns_pages: bool,
+    reserved_bytes: usize,
+    state_page_descriptors: Vec<SequenceStatePageDescriptor>,
+}
+
+fn sequence_state_descriptor_matches_handle(
+    descriptor: &SequenceStatePageDescriptor,
+    handle: &ParsedSequenceStateHandle,
+) -> bool {
+    if descriptor.handle.id != handle.id {
+        return false;
+    }
+    if let Some(kind) = handle.kind.as_deref() {
+        if descriptor.handle.kind != kind {
+            return false;
+        }
+    }
+    handle
+        .generation
+        .map(|generation| descriptor.handle.generation == generation)
+        .unwrap_or(true)
+}
+
+fn describe_sequence_state_descriptors(
+    descriptors: Vec<SequenceStatePageDescriptor>,
+    handle: &ParsedSequenceStateHandle,
+) -> Option<Vec<SequenceStatePageDescriptor>> {
+    let matched = descriptors
+        .into_iter()
+        .filter(|descriptor| sequence_state_descriptor_matches_handle(descriptor, handle))
+        .collect::<Vec<_>>();
+    if matched.is_empty() {
+        None
+    } else {
+        Some(matched)
+    }
+}
+
+fn parsed_handle_may_target_generic(handle: &ParsedSequenceStateHandle) -> bool {
+    handle
+        .kind
+        .as_deref()
+        .map(|kind| kind == "generic_reserved_state")
+        .unwrap_or(true)
+}
+
+fn parsed_handle_may_target_loaded_state(handle: &ParsedSequenceStateHandle) -> bool {
+    handle
+        .kind
+        .as_deref()
+        .map(|kind| matches!(kind, "qwen35_session" | "qwen35_checkpoint"))
+        .unwrap_or(true)
+}
+
+fn describe_loaded_model_sequence_state(
+    worker_id: &str,
+    m: &LoadedModel,
+    handle: &ParsedSequenceStateHandle,
+) -> Option<DescribedSequenceState> {
+    if !parsed_handle_may_target_loaded_state(handle) {
+        return None;
+    }
+    let arena_backend = loaded_model_state_arena_backend(m);
+    let descriptors =
+        describe_sequence_state_descriptors(arena_backend.state_page_descriptors(m), handle)?;
+    let state_arena_owns_pages = descriptors.iter().any(|descriptor| descriptor.owns_pages);
+    let reserved_bytes = descriptors
+        .iter()
+        .map(|descriptor| descriptor.resident_bytes)
+        .sum();
+    Some(DescribedSequenceState {
+        worker_id: worker_id.to_string(),
+        handle: descriptors[0].handle.clone(),
+        state_arena_owns_pages,
+        reserved_bytes,
+        state_page_descriptors: descriptors,
+    })
+}
+
+fn describe_loaded_sequence_state(
+    active_worker_id: &str,
+    model: Option<&LoadedModel>,
+    resident_models: &HashMap<String, LoadedModel>,
+    handle: &ParsedSequenceStateHandle,
+) -> Option<DescribedSequenceState> {
+    if let Some(m) = model {
+        if let Some(described) = describe_loaded_model_sequence_state(active_worker_id, m, handle) {
+            return Some(described);
+        }
+    }
+    for (worker_id, m) in resident_models {
+        if let Some(described) = describe_loaded_model_sequence_state(worker_id, m, handle) {
+            return Some(described);
+        }
+    }
+    None
+}
+
+fn release_loaded_model_sequence_state_handles(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    handles: &[ParsedSequenceStateHandle],
+) -> Result<(usize, usize), String> {
+    let arena_backend = loaded_model_state_arena_backend(m);
+    let mut released = 0usize;
+    let mut released_bytes = 0usize;
+    let mut released_session_ids = HashSet::new();
+    for handle in handles {
+        if !parsed_handle_may_target_loaded_state(handle)
+            || released_session_ids.contains(&handle.id)
+        {
+            continue;
+        }
+        let Some(descriptors) =
+            describe_sequence_state_descriptors(arena_backend.state_page_descriptors(m), handle)
+        else {
+            continue;
+        };
+        let descriptor_bytes = descriptors
+            .iter()
+            .map(|descriptor| descriptor.resident_bytes)
+            .sum::<usize>();
+        let session_ids = vec![handle.id.clone()];
+        let session_released = arena_backend.release_sessions(m, gpu, &session_ids)?;
+        if session_released > 0 {
+            released += session_released;
+            released_bytes = released_bytes.saturating_add(descriptor_bytes);
+            released_session_ids.insert(handle.id.clone());
+        }
+    }
+    Ok((released, released_bytes))
+}
+
+fn release_loaded_sequence_state_handles(
+    model: &mut Option<LoadedModel>,
+    resident_models: &mut HashMap<String, LoadedModel>,
+    gpu: &mut rdna_compute::Gpu,
+    handles: &[ParsedSequenceStateHandle],
+) -> Result<(usize, usize), String> {
+    let mut released = 0usize;
+    let mut released_bytes = 0usize;
+    if let Some(m) = model.as_mut() {
+        let (count, bytes) = release_loaded_model_sequence_state_handles(m, gpu, handles)?;
+        released += count;
+        released_bytes = released_bytes.saturating_add(bytes);
+    }
+    for m in resident_models.values_mut() {
+        let (count, bytes) = release_loaded_model_sequence_state_handles(m, gpu, handles)?;
+        released += count;
+        released_bytes = released_bytes.saturating_add(bytes);
+    }
+    Ok((released, released_bytes))
 }
 
 fn estimate_session_state_reservation_bytes(m: &LoadedModel, physical_cap: usize) -> usize {
@@ -4879,6 +5727,7 @@ fn qwen35_allocate_session_state(
             .alloc_tensor(&[config.vocab_size], rdna_compute::DType::F32)
             .map_err(|e| format!("alloc qwen35 session logits snapshot: {e:?}"))?,
         prefilled_generated_suffix_len: 0,
+        allocation_epoch: next_qwen35_state_allocation_epoch(),
     })
 }
 
@@ -4890,6 +5739,7 @@ fn qwen35_save_active_session(
         let session = Qwen35RequestSessionState::take_from_loaded(m, gpu)
             .map_err(|e| format!("failed to save active qwen35 session: {e}"))?;
         m.q35_sessions.insert(active_id, session);
+        m.q35_active_state_allocation_epoch = 0;
     }
     Ok(())
 }
@@ -5318,6 +6168,32 @@ fn qwen35_prefill_active_session(
     } else {
         0
     };
+    Ok(tokens.len())
+}
+
+fn qwen35_prefill_owned_session_serial_segment(
+    gpu: &mut rdna_compute::Gpu,
+    weights: &qwen35::Qwen35Weights,
+    config: &qwen35::Qwen35Config,
+    scratch: &qwen35::Qwen35Scratch,
+    state: &mut Qwen35RequestSessionState,
+    tokens: &[u32],
+) -> Result<usize, String> {
+    for &token in tokens {
+        qwen35::forward_scratch(
+            gpu,
+            weights,
+            config,
+            token,
+            state.seq_pos,
+            &mut state.kv_cache,
+            &mut state.dn_state,
+            scratch,
+        )
+        .map_err(|e| format!("qwen35 serial boundary prefill segment failed: {e:?}"))?;
+        state.seq_pos += 1;
+        state.conversation_tokens.push(token);
+    }
     Ok(tokens.len())
 }
 
@@ -5797,22 +6673,6 @@ fn qwen35_fused_prefill_boundary_cuts(
     if cuts.last().copied() != Some(max_len) {
         cuts.push(max_len);
     }
-    let mut previous_cut = 0usize;
-    for &cut in &cuts {
-        if cut <= previous_cut {
-            continue;
-        }
-        let row_count = prepared
-            .iter()
-            .filter(|session| previous_cut < session.tokens.len().min(cut))
-            .count();
-        if row_count < 2 {
-            return Err(format!(
-                "qwen35 fused prefill boundary segment {previous_cut}..{cut} has {row_count} active session(s); use serial_reference for this boundary layout"
-            ));
-        }
-        previous_cut = cut;
-    }
     Ok(Some(cuts))
 }
 
@@ -5918,13 +6778,67 @@ fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                 })
                 .collect();
             if active_indices.len() < 2 {
-                for (id, state) in owned_sessions {
-                    m.q35_sessions.insert(id, state);
+                let scratch = m.q35_scratch.as_ref().ok_or_else(|| {
+                    "qwen35 scratch missing; grouped-MoE serial boundary segment is pp=1 only"
+                        .to_string()
+                })?;
+                for &idx in &active_indices {
+                    let start = progress[idx];
+                    let end = prepared[idx].tokens.len().min(cut);
+                    let state = &mut owned_sessions[idx].1;
+                    let segment_tokens = match qwen35_prefill_owned_session_serial_segment(
+                        gpu,
+                        weights,
+                        config,
+                        scratch,
+                        state,
+                        &prepared[idx].tokens[start..end],
+                    ) {
+                        Ok(tokens) => tokens,
+                        Err(err) => {
+                            for (id, state) in owned_sessions {
+                                m.q35_sessions.insert(id, state);
+                            }
+                            return Err(err);
+                        }
+                    };
+                    shape_total_tokens += segment_tokens;
+                    progress[idx] = end;
+                    for mut boundary in prepared[idx]
+                        .boundary_checkpoints
+                        .iter()
+                        .filter(|boundary| boundary.prefix_len == end)
+                        .cloned()
+                    {
+                        let hook = Qwen35PrefillCheckpointHook {
+                            batch_id,
+                            session_id: &prepared[idx].id,
+                            source_state_handle: &prepared[idx].id,
+                            logical_position: end,
+                            kind: Qwen35PrefillCheckpointKind::SemanticBoundary {
+                                boundary: &boundary.boundary,
+                                boundary_index: boundary.boundary_index,
+                            },
+                            prefix_hash: &boundary.hash,
+                        };
+                        let checkpoint_id_for_error = qwen35_prefill_checkpoint_session_id(hook);
+                        let checkpoint_id = emit_qwen35_owned_prefill_checkpoint(
+                            &mut m.q35_sessions,
+                            gpu,
+                            hook,
+                            state,
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "qwen35 session {} failed to create fused semantic boundary checkpoint {}: {}",
+                                prepared[idx].id, checkpoint_id_for_error, e
+                            )
+                        })?;
+                        boundary.checkpoint_id = Some(checkpoint_id);
+                        boundary_checkpoints_by_session[idx].push(boundary);
+                    }
                 }
-                return Err(format!(
-                    "qwen35 grouped-MoE fused prefill boundary segment ending at {cut} has {} active session(s); use serial_reference",
-                    active_indices.len()
-                ));
+                continue;
             }
             let worker_result = {
                 let scratch = m.q35_scratch.as_mut().ok_or_else(|| {
@@ -6317,13 +7231,67 @@ fn qwen35_prefill_suffix_batch_fused_dense(
                 })
                 .collect();
             if active_indices.len() < 2 {
-                for (id, state) in owned_sessions {
-                    m.q35_sessions.insert(id, state);
+                let scratch = m.q35_scratch.as_ref().ok_or_else(|| {
+                    "qwen35 scratch missing; fused dense serial boundary segment is pp=1 only"
+                        .to_string()
+                })?;
+                for &idx in &active_indices {
+                    let start = progress[idx];
+                    let end = contract.sessions[idx].tokens.len().min(cut);
+                    let state = &mut owned_sessions[idx].1;
+                    let segment_tokens = match qwen35_prefill_owned_session_serial_segment(
+                        gpu,
+                        weights,
+                        config,
+                        scratch,
+                        state,
+                        &contract.sessions[idx].tokens[start..end],
+                    ) {
+                        Ok(tokens) => tokens,
+                        Err(err) => {
+                            for (id, state) in owned_sessions {
+                                m.q35_sessions.insert(id, state);
+                            }
+                            return Err(err);
+                        }
+                    };
+                    shape_total_tokens += segment_tokens;
+                    progress[idx] = end;
+                    for mut boundary in prepared[idx]
+                        .boundary_checkpoints
+                        .iter()
+                        .filter(|boundary| boundary.prefix_len == end)
+                        .cloned()
+                    {
+                        let hook = Qwen35PrefillCheckpointHook {
+                            batch_id,
+                            session_id: contract.sessions[idx].id,
+                            source_state_handle: contract.sessions[idx].id,
+                            logical_position: end,
+                            kind: Qwen35PrefillCheckpointKind::SemanticBoundary {
+                                boundary: &boundary.boundary,
+                                boundary_index: boundary.boundary_index,
+                            },
+                            prefix_hash: &boundary.hash,
+                        };
+                        let checkpoint_id_for_error = qwen35_prefill_checkpoint_session_id(hook);
+                        let checkpoint_id = emit_qwen35_owned_prefill_checkpoint(
+                            &mut m.q35_sessions,
+                            gpu,
+                            hook,
+                            state,
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "qwen35 session {} failed to create fused semantic boundary checkpoint {}: {}",
+                                contract.sessions[idx].id, checkpoint_id_for_error, e
+                            )
+                        })?;
+                        boundary.checkpoint_id = Some(checkpoint_id);
+                        boundary_checkpoints_by_session[idx].push(boundary);
+                    }
                 }
-                return Err(format!(
-                    "qwen35 fused dense boundary segment ending at {cut} has {} active session(s); use serial_reference",
-                    active_indices.len()
-                ));
+                continue;
             }
             let worker_result = {
                 let scratch = m.q35_scratch.as_mut().ok_or_else(|| {
@@ -8124,8 +9092,7 @@ fn main() {
     let mut active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
     let mut resident_models: std::collections::HashMap<String, LoadedModel> =
         std::collections::HashMap::new();
-    let mut session_state_reservations: std::collections::HashMap<String, SessionStateReservation> =
-        std::collections::HashMap::new();
+    let mut generic_state_arena = GenericSequenceStateArena::new();
     // PFlash speculative-prefill state. None unless the load message
     // includes a `prefill_drafter` path AND `prefill_compression` != "off".
     // Lives alongside `model` so unload_model + this state are paired
@@ -8181,8 +9148,7 @@ fn main() {
                 // load (the explicit "unload" handler has the same
                 // ordering for the same reason).
                 if requested_worker_id == active_worker_id {
-                    session_state_reservations
-                        .retain(|_, reservation| reservation.worker_id != requested_worker_id);
+                    generic_state_arena.release_worker(&requested_worker_id);
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
                             dg.bind_thread_or_warn();
@@ -8210,8 +9176,7 @@ fn main() {
                     active_worker_id = requested_worker_id.clone();
                 }
                 if let Some(m) = resident_models.remove(&requested_worker_id) {
-                    session_state_reservations
-                        .retain(|_, reservation| reservation.worker_id != requested_worker_id);
+                    generic_state_arena.release_worker(&requested_worker_id);
                     unload_model(m, &mut gpu);
                 }
                 dummy_model = None;
@@ -9539,7 +10504,7 @@ fn main() {
             "reserve_session_state" => {
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("reserve");
                 let target_worker_id = message_worker_id(&msg);
-                purge_expired_session_state_reservations(&mut session_state_reservations);
+                generic_state_arena.purge_expired();
                 if dummy_model.is_none() {
                     match activate_model_worker(
                         &target_worker_id,
@@ -9580,6 +10545,13 @@ fn main() {
                     );
                     continue;
                 }
+                let state_kinds = match parse_reserve_session_state_kinds(&msg) {
+                    Ok(kinds) => kinds,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, id, e);
+                        continue;
+                    }
+                };
                 let ttl_ms = msg.get("ttl_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
                 let reservation_id = msg
                     .get("reservation_id")
@@ -9606,10 +10578,7 @@ fn main() {
                         (
                             estimate_session_state_reservation_bytes(m, physical_cap),
                             current_worker_session_state_bytes(m),
-                            outstanding_reservation_bytes_for_worker(
-                                &session_state_reservations,
-                                &target_worker_id,
-                            ),
+                            generic_state_arena.outstanding_bytes_for_worker(&target_worker_id),
                             budget,
                         )
                     } else if dummy_model.is_some() {
@@ -9642,26 +10611,32 @@ fn main() {
                     let _ = stdout.flush();
                     continue;
                 }
-                session_state_reservations.insert(
+                let reservation = generic_state_arena.reserve(
+                    &target_worker_id,
                     reservation_id.clone(),
-                    SessionStateReservation {
-                        worker_id: target_worker_id.clone(),
-                        reserved_bytes,
-                        expires_at: if ttl_ms == 0 {
-                            None
-                        } else {
-                            Some(
-                                std::time::Instant::now()
-                                    + std::time::Duration::from_millis(ttl_ms),
-                            )
-                        },
-                    },
+                    &state_kinds,
+                    physical_cap,
+                    reserved_bytes,
+                    ttl_ms,
                 );
+                let state_page_descriptor_values: Vec<serde_json::Value> = reservation
+                    .state_page_descriptors
+                    .iter()
+                    .map(sequence_state_page_descriptor_json)
+                    .collect();
                 let done = serde_json::json!({
                     "type": "reserve_session_state_done",
                     "id": id,
                     "worker_key_id": target_worker_id,
                     "reservation_id": reservation_id,
+                    "runtime_state_handle": &reservation.handle.id,
+                    "handle": {
+                        "id": &reservation.handle.id,
+                        "kind": &reservation.handle.kind,
+                        "generation": reservation.handle.generation,
+                    },
+                    "state_arena_owns_pages": true,
+                    "state_page_descriptors": state_page_descriptor_values,
                     "reserved_bytes": reserved_bytes,
                     "current_session_bytes": current_session_bytes,
                     "outstanding_reserved_bytes": outstanding_bytes,
@@ -9672,39 +10647,129 @@ fn main() {
                 let _ = stdout.flush();
             }
 
-            "release_session_state_reservation" => {
+            "describe_state" => {
+                let id = msg
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("describe-state");
+                generic_state_arena.purge_expired();
+                let handle_value = msg
+                    .get("runtime_state_handle")
+                    .or_else(|| msg.get("reservation_id"))
+                    .or_else(|| msg.get("handle"));
+                let Some(handle) = handle_value.and_then(parse_sequence_state_handle) else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        id,
+                        "describe_state requires runtime_state_handle",
+                    );
+                    continue;
+                };
+                if parsed_handle_may_target_generic(&handle) {
+                    if let Some(reservation) =
+                        generic_state_arena.describe(&handle.id, handle.generation)
+                    {
+                        let state_page_descriptors: Vec<serde_json::Value> = reservation
+                            .state_page_descriptors
+                            .iter()
+                            .map(sequence_state_page_descriptor_json)
+                            .collect();
+                        let done = serde_json::json!({
+                            "type": "describe_state_done",
+                            "id": id,
+                            "worker_key_id": &reservation.worker_id,
+                            "runtime_state_handle": &reservation.handle.id,
+                            "handle": {
+                                "id": &reservation.handle.id,
+                                "kind": &reservation.handle.kind,
+                                "generation": reservation.handle.generation,
+                            },
+                            "state_arena_owns_pages": true,
+                            "reserved_bytes": reservation.reserved_bytes,
+                            "state_page_descriptors": state_page_descriptors,
+                        });
+                        let _ = writeln!(stdout, "{done}");
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                }
+                let Some(described) = describe_loaded_sequence_state(
+                    &active_worker_id,
+                    model.as_ref(),
+                    &resident_models,
+                    &handle,
+                ) else {
+                    emit_error_with_id(
+                        &mut stdout,
+                        id,
+                        format!("describe_state unknown runtime_state_handle {}", handle.id),
+                    );
+                    continue;
+                };
+                let state_page_descriptors: Vec<serde_json::Value> = described
+                    .state_page_descriptors
+                    .iter()
+                    .map(sequence_state_page_descriptor_json)
+                    .collect();
+                let done = serde_json::json!({
+                    "type": "describe_state_done",
+                    "id": id,
+                    "worker_key_id": &described.worker_id,
+                    "runtime_state_handle": &described.handle.id,
+                    "handle": {
+                        "id": &described.handle.id,
+                        "kind": &described.handle.kind,
+                        "generation": described.handle.generation,
+                    },
+                    "state_arena_owns_pages": described.state_arena_owns_pages,
+                    "reserved_bytes": described.reserved_bytes,
+                    "state_page_descriptors": state_page_descriptors,
+                });
+                let _ = writeln!(stdout, "{done}");
+                let _ = stdout.flush();
+            }
+
+            "release_session_state_reservation" | "release_state" => {
                 let id = msg
                     .get("id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("release-reservation");
-                let reservations: Vec<String> = msg
-                    .get("reservations")
-                    .and_then(|v| v.as_array())
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .or_else(|| {
-                        msg.get("reservation_id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| vec![s.to_string()])
-                    })
-                    .unwrap_or_default();
-                let mut released = 0usize;
-                let mut released_bytes = 0usize;
-                for reservation_id in reservations {
-                    if let Some(reservation) = session_state_reservations.remove(&reservation_id) {
-                        released += 1;
-                        released_bytes = released_bytes.saturating_add(reservation.reserved_bytes);
-                    }
-                }
+                let is_release_state =
+                    msg.get("type").and_then(|v| v.as_str()) == Some("release_state");
+                let handles = parse_sequence_state_handle_list(&msg);
+                let generic_handles = handles
+                    .iter()
+                    .filter(|handle| parsed_handle_may_target_generic(handle))
+                    .map(|handle| (handle.id.clone(), handle.generation))
+                    .collect::<Vec<_>>();
+                let (generic_released, generic_released_bytes) =
+                    generic_state_arena.release(generic_handles);
+                let (loaded_released, loaded_released_bytes) =
+                    match release_loaded_sequence_state_handles(
+                        &mut model,
+                        &mut resident_models,
+                        &mut gpu,
+                        &handles,
+                    ) {
+                        Ok(released) => released,
+                        Err(e) => {
+                            emit_error_with_id(&mut stdout, id, e);
+                            continue;
+                        }
+                    };
+                let released = generic_released + loaded_released;
+                let released_bytes = generic_released_bytes.saturating_add(loaded_released_bytes);
                 let done = serde_json::json!({
-                    "type": "release_session_state_reservation_done",
+                    "type": if is_release_state {
+                        "release_state_done"
+                    } else {
+                        "release_session_state_reservation_done"
+                    },
                     "id": id,
                     "released": released,
                     "released_bytes": released_bytes,
+                    "generic_released": generic_released,
+                    "loaded_released": loaded_released,
                 });
                 let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
@@ -9751,8 +10816,7 @@ fn main() {
                 }
                 // Reset conversation state without unloading the model.
                 if let Some(dummy) = dummy_model.as_mut() {
-                    session_state_reservations
-                        .retain(|_, reservation| reservation.worker_id != target_worker_id);
+                    generic_state_arena.release_worker(&target_worker_id);
                     dummy.reset();
                     let _ = writeln!(stdout, r#"{{"type":"reset"}}"#);
                     let _ = stdout.flush();
@@ -9761,8 +10825,7 @@ fn main() {
                 // Under eviction, also zero the compact_offset so absolute
                 // RoPE phase restarts from zero for the fresh conversation.
                 if let Some(ref mut m) = model {
-                    session_state_reservations
-                        .retain(|_, reservation| reservation.worker_id != target_worker_id);
+                    generic_state_arena.release_worker(&target_worker_id);
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
                     m.q35_sessions.clear();
@@ -9771,8 +10834,10 @@ fn main() {
                         && m.kv_cache.is_some()
                         && m.dn_state.is_some()
                     {
+                        m.q35_active_state_allocation_epoch = next_qwen35_state_allocation_epoch();
                         Some(QWEN35_LEGACY_SESSION_ID.to_string())
                     } else {
+                        m.q35_active_state_allocation_epoch = 0;
                         None
                     };
                     // Multi-GPU branch: route per-LA-layer memsets through
@@ -9898,7 +10963,7 @@ fn main() {
                 for (_, m) in resident_models.drain() {
                     unload_model(m, &mut gpu);
                 }
-                session_state_reservations.clear();
+                generic_state_arena.clear();
                 dummy_model = None;
                 active_worker_id = DEFAULT_MODEL_WORKER_ID.to_string();
                 let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
@@ -9912,8 +10977,7 @@ fn main() {
                     .unwrap_or("unload_worker");
                 let worker_id = message_worker_id(&msg);
                 let mut unloaded = false;
-                session_state_reservations
-                    .retain(|_, reservation| reservation.worker_id != worker_id);
+                generic_state_arena.release_worker(&worker_id);
                 if worker_id == active_worker_id {
                     if let Some(m) = model.take() {
                         unload_model(m, &mut gpu);
@@ -10665,6 +11729,7 @@ fn load_model(
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: None,
+            q35_active_state_allocation_epoch: 0,
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -10756,6 +11821,7 @@ fn load_model(
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: None,
+            q35_active_state_allocation_epoch: 0,
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -10868,6 +11934,7 @@ fn load_model(
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: None,
+            q35_active_state_allocation_epoch: 0,
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -10986,6 +12053,7 @@ fn load_model(
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: None,
+            q35_active_state_allocation_epoch: 0,
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -11117,6 +12185,7 @@ fn load_model(
                 q35_state_quant: None,
                 q35_sessions: std::collections::HashMap::new(),
                 q35_active_session_id: None,
+                q35_active_state_allocation_epoch: 0,
                 q35_active_prefilled_generated_suffix_len: 0,
                 llama_config: None,
                 llama_weights: None,
@@ -11452,6 +12521,7 @@ fn load_model(
             q35_state_quant: Some(dn_quant),
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
+            q35_active_state_allocation_epoch: next_qwen35_state_allocation_epoch(),
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: None,
             llama_weights: None,
@@ -11533,6 +12603,7 @@ fn load_model(
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: None,
+            q35_active_state_allocation_epoch: 0,
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: Some(config),
             llama_weights: Some(weights),
@@ -11706,6 +12777,7 @@ fn load_model_safetensors(
             q35_state_quant: None,
             q35_sessions: std::collections::HashMap::new(),
             q35_active_session_id: None,
+            q35_active_state_allocation_epoch: 0,
             q35_active_prefilled_generated_suffix_len: 0,
             llama_config: Some(config),
             llama_weights: Some(weights),
@@ -11819,6 +12891,7 @@ fn load_model_safetensors(
         q35_state_quant: Some(hipfire_arch_qwen35::qwen35::StateQuant::Q8),
         q35_sessions: std::collections::HashMap::new(),
         q35_active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
+        q35_active_state_allocation_epoch: next_qwen35_state_allocation_epoch(),
         q35_active_prefilled_generated_suffix_len: 0,
         llama_config: None,
         llama_weights: None,
@@ -12074,6 +13147,7 @@ fn load_model_pp(
         q35_state_quant: None,
         q35_sessions: std::collections::HashMap::new(),
         q35_active_session_id: None,
+        q35_active_state_allocation_epoch: 0,
         q35_active_prefilled_generated_suffix_len: 0,
         llama_config: None,
         llama_weights: None,

@@ -75,6 +75,7 @@ TARGET_27B=""
 DRAFT_27B=""
 PAIR_27B=""
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-dflash-$(date +%Y%m%d-%H%M%S).md}"
+TRACE_JSON_OUT="${HIPFIRE_COHERENCE_DFLASH_TRACE_JSON:-${OUT%.md}.dflash_trace.json}"
 CASE_TIMEOUT="${HIPFIRE_COHERENCE_TIMEOUT:-240}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
@@ -207,9 +208,20 @@ AR_PARITY="${HIPFIRE_DFLASH_AR_PARITY:-0}"
     echo "failure mode in commit 6c84b13)."
     echo
 } > "$OUT"
+printf '{"kind":"dflash_trace","records":[\n' > "$TRACE_JSON_OUT"
+trace_json_records=0
+
+append_trace_json_record() {
+    if [ "$trace_json_records" -gt 0 ]; then
+        printf ',\n' >> "$TRACE_JSON_OUT"
+    fi
+    printf '%s' "$1" >> "$TRACE_JSON_OUT"
+    trace_json_records=$((trace_json_records + 1))
+}
 
 # Skip everything if 27B model + draft aren't both present.
 if [ ! -f "$TARGET_27B" ] || [ ! -f "$DRAFT_27B" ]; then
+    printf '\n]}\n' >> "$TRACE_JSON_OUT"
     {
         echo "## SKIPPED — 27B target or draft model not found"
         echo
@@ -224,6 +236,7 @@ if [ ! -f "$TARGET_27B" ] || [ ! -f "$DRAFT_27B" ]; then
     } >> "$OUT"
     echo "coherence-gate-dflash: 27B models not present, skipping (no hard error)"
     echo "report: $OUT"
+    echo "dflash trace json: $TRACE_JSON_OUT"
     exit 0
 fi
 
@@ -370,6 +383,247 @@ else:
 PYEOF
 )
 
+VERIFY_GRAPH_PY=$(cat <<'PYEOF'
+import sys, re, json
+if len(sys.argv) != 2:
+    print(json.dumps({"ok": False, "reason": "usage"}))
+    sys.exit(0)
+out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+m = re.search(
+    r"^verify_graph: direct=(\d+) warmup=(\d+) capture=(\d+) replay=(\d+) not_applicable=(\d+)",
+    out,
+    re.MULTILINE,
+)
+if not m:
+    print(json.dumps({"ok": False, "reason": "missing_verify_graph_stats"}))
+    sys.exit(0)
+direct, warmup, capture, replay, not_applicable = [int(x) for x in m.groups()]
+if direct != 0:
+    print(json.dumps({
+        "ok": False,
+        "reason": "direct_verify_is_diagnostic_only_for_dflash_ar_parity",
+        "direct": direct,
+        "warmup": warmup,
+        "capture": capture,
+        "replay": replay,
+        "not_applicable": not_applicable,
+    }))
+elif capture + replay <= 0:
+    print(json.dumps({
+        "ok": False,
+        "reason": "missing_verify_graph_capture_or_replay",
+        "direct": direct,
+        "warmup": warmup,
+        "capture": capture,
+        "replay": replay,
+        "not_applicable": not_applicable,
+    }))
+else:
+    print(json.dumps({
+        "ok": True,
+        "direct": direct,
+        "warmup": warmup,
+        "capture": capture,
+        "replay": replay,
+        "not_applicable": not_applicable,
+    }))
+PYEOF
+)
+
+ROLLBACK_LOGIT_COMPARE_PY=$(cat <<'PYEOF'
+import sys, re, json, math
+if len(sys.argv) != 2:
+    print(json.dumps({"ok": False, "reason": "usage"}))
+    sys.exit(0)
+out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+pattern = re.compile(
+    r"^\[dflash-rollback-next-logit-compare\] "
+    r"pos=(\d+) step=(\d+) compare_steps=(\d+) token_pos=(\d+) token=(\d+) "
+    r"serial_argmax=(\d+) fast_argmax=(\d+) "
+    r"serial_token_logit=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"fast_token_logit=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"f32_words=(\d+) f32_bit_diff_words=(\d+) "
+    r"max_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"mean_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"max_rel=([+\-0-9.eE]+|NaN|nan|inf|-inf)$",
+    re.MULTILINE,
+)
+rows = []
+for m in pattern.finditer(out):
+    max_abs = float(m.group(12))
+    mean_abs = float(m.group(13))
+    max_rel = float(m.group(14))
+    rows.append({
+        "pos": int(m.group(1)),
+        "step": int(m.group(2)),
+        "compare_steps": int(m.group(3)),
+        "token_pos": int(m.group(4)),
+        "token": int(m.group(5)),
+        "serial_argmax": int(m.group(6)),
+        "fast_argmax": int(m.group(7)),
+        "max_abs": max_abs,
+        "mean_abs": mean_abs,
+        "max_rel": max_rel,
+    })
+if not rows:
+    print(json.dumps({"ok": True, "checked": 0}))
+    sys.exit(0)
+mismatches = [r for r in rows if r["serial_argmax"] != r["fast_argmax"]]
+finite_max_abs = [r["max_abs"] for r in rows if math.isfinite(r["max_abs"])]
+finite_mean_abs = [r["mean_abs"] for r in rows if math.isfinite(r["mean_abs"])]
+finite_max_rel = [r["max_rel"] for r in rows if math.isfinite(r["max_rel"])]
+payload = {
+    "ok": not mismatches,
+    "checked": len(rows),
+    "argmax_mismatches": len(mismatches),
+    "positions": sorted(set(r["pos"] for r in rows)),
+    "max_compare_steps": max(r["compare_steps"] for r in rows),
+    "max_abs": max(finite_max_abs) if finite_max_abs else None,
+    "max_mean_abs": max(finite_mean_abs) if finite_mean_abs else None,
+    "max_rel": max(finite_max_rel) if finite_max_rel else None,
+}
+if mismatches:
+    first = mismatches[0]
+    payload["reason"] = "fast_replay_next_logit_argmax_mismatch"
+    payload["first_mismatch"] = {
+        "pos": first["pos"],
+        "step": first["step"],
+        "token_pos": first["token_pos"],
+        "token": first["token"],
+        "serial_argmax": first["serial_argmax"],
+        "fast_argmax": first["fast_argmax"],
+    }
+print(json.dumps(payload, sort_keys=True))
+PYEOF
+)
+
+ROLLBACK_STATE_COMPARE_PY=$(cat <<'PYEOF'
+import sys, re, json, math
+if len(sys.argv) != 2:
+    print(json.dumps({"ok": False, "reason": "usage"}))
+    sys.exit(0)
+out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+mismatch_pattern = re.compile(
+    r"^\[dflash-rollback-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 "
+    r"mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) "
+    r"differing_bytes=(\d+) first_offset=(\d+) serial_byte=(\d+) gdn_byte=(\d+)(.*)$",
+    re.MULTILINE,
+)
+match_pattern = re.compile(
+    r"^\[dflash-rollback-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 match$",
+    re.MULTILINE,
+)
+
+def parse_context(context):
+    parsed = {}
+    if not context:
+        return parsed
+    for key, raw in re.findall(r"\b([A-Za-z0-9_]+)=([+\-0-9.eE]+|NaN|nan|inf|-inf)", context):
+        if key in {"f32_words", "f32_bit_diff_words"}:
+            parsed[key] = int(raw)
+        else:
+            value = float(raw)
+            parsed[key] = value if math.isfinite(value) else raw
+    return parsed
+
+matches = [
+    {
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+    }
+    for m in match_pattern.finditer(out)
+]
+mismatches = []
+for m in mismatch_pattern.finditer(out):
+    context = m.group(11).strip() or None
+    mismatches.append({
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+        "family": m.group(4),
+        "index": int(m.group(5)),
+        "bytes": int(m.group(6)),
+        "differing_bytes": int(m.group(7)),
+        "first_offset": int(m.group(8)),
+        "serial_byte": int(m.group(9)),
+        "gdn_byte": int(m.group(10)),
+        "context": context,
+        "stats": parse_context(context),
+    })
+checked = len(matches) + len(mismatches)
+if checked == 0:
+    print(json.dumps({"ok": True, "checked": 0}))
+    sys.exit(0)
+payload = {
+    "ok": not mismatches,
+    "checked": checked,
+    "matches": len(matches),
+    "mismatches": len(mismatches),
+    "positions": sorted(set([r["pos"] for r in matches] + [r["pos"] for r in mismatches])),
+}
+if mismatches:
+    first = mismatches[0]
+    payload["reason"] = "fast_replay_recurrent_state_mismatch"
+    payload["first_mismatch"] = {
+        "pos": first["pos"],
+        "accepted": first["accepted"],
+        "replay_steps": first["replay_steps"],
+        "family": first["family"],
+        "index": first["index"],
+        "differing_bytes": first["differing_bytes"],
+        "first_offset": first["first_offset"],
+        "serial_byte": first["serial_byte"],
+        "gdn_byte": first["gdn_byte"],
+        "context": first["context"],
+        "stats": first["stats"],
+    }
+print(json.dumps(payload, sort_keys=True))
+PYEOF
+)
+
+ROLLBACK_FAST_REPLAY_ADMISSION_PY=$(cat <<'PYEOF'
+import sys, json
+if len(sys.argv) != 3:
+    print(json.dumps({"verdict": "not_evaluated", "reason": "usage"}))
+    sys.exit(0)
+try:
+    logit = json.loads(sys.argv[1])
+    state = json.loads(sys.argv[2])
+except json.JSONDecodeError as exc:
+    print(json.dumps({"verdict": "not_evaluated", "reason": f"json_decode_error:{exc}"}))
+    sys.exit(0)
+
+blockers = []
+logit_checked = int(logit.get("checked", 0) or 0)
+state_checked = int(state.get("checked", 0) or 0)
+
+if logit_checked <= 0:
+    blockers.append("missing_logit_compare")
+elif not logit.get("ok", False):
+    blockers.append(logit.get("reason", "logit_argmax_mismatch"))
+
+if state_checked <= 0:
+    blockers.append("missing_recurrent_state_compare")
+elif not state.get("ok", False):
+    blockers.append(state.get("reason", "recurrent_state_mismatch"))
+
+payload = {
+    "verdict": "not_evaluated" if logit_checked <= 0 and state_checked <= 0 else ("admitted" if not blockers else "rejected"),
+    "blockers": blockers,
+    "logit_checked": logit_checked,
+    "state_checked": state_checked,
+}
+if state.get("first_mismatch"):
+    payload["first_state_mismatch"] = state["first_mismatch"]
+if logit.get("first_mismatch"):
+    payload["first_logit_mismatch"] = logit["first_mismatch"]
+print(json.dumps(payload, sort_keys=True))
+PYEOF
+)
+
 for entry in "${tests[@]}"; do
     IFS='|' read -r label mode prompt_var max_tok <<< "$entry"
     case "$prompt_var" in
@@ -423,7 +677,7 @@ for entry in "${tests[@]}"; do
     fi
 
     # Pull stats lines (emitted/τ/cycles/rollback/accept_rate) for the report.
-    stats=$(grep -aE '^emitted:|^cycles:|^rollback_parity:|^accept_rate:' "$out_file" | head -4)
+    stats=$(grep -aE '^emitted:|^cycles:|^rollback_parity:|^verify_graph:|^accept_rate:' "$out_file" | head -5)
 
     status="OK"
     if [ "$ec" -ne 0 ] || [ -n "$panic" ]; then
@@ -442,6 +696,10 @@ for entry in "${tests[@]}"; do
     fi
 
     rollback_replay="not_checked"
+    verify_graph="not_checked"
+    rollback_logit_compare="not_checked"
+    rollback_state_compare="not_checked"
+    rollback_fast_replay_admission="not_checked"
     if [ "$AR_PARITY" = "1" ] && [ "$mode" = "dflash" ]; then
         rollback_replay=$(python3 -c "$ROLLBACK_REPLAY_PY" "$out_file")
         rollback_replay_ok=$(echo "$rollback_replay" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))")
@@ -449,6 +707,56 @@ for entry in "${tests[@]}"; do
             status="HARD_ERROR (rollback replay: $rollback_replay)"
             hard_errors=$((hard_errors + 1))
         fi
+        verify_graph=$(python3 -c "$VERIFY_GRAPH_PY" "$out_file")
+        verify_graph_ok=$(echo "$verify_graph" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))")
+        if [ "$verify_graph_ok" != "True" ]; then
+            status="HARD_ERROR (verify graph: $verify_graph)"
+            hard_errors=$((hard_errors + 1))
+        fi
+        rollback_logit_compare=$(python3 -c "$ROLLBACK_LOGIT_COMPARE_PY" "$out_file")
+        rollback_logit_compare_ok=$(echo "$rollback_logit_compare" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))")
+        if [ "$rollback_logit_compare_ok" != "True" ]; then
+            status="HARD_ERROR (rollback logit compare: $rollback_logit_compare)"
+            hard_errors=$((hard_errors + 1))
+        fi
+        rollback_state_compare=$(python3 -c "$ROLLBACK_STATE_COMPARE_PY" "$out_file")
+        rollback_fast_replay_admission=$(python3 -c "$ROLLBACK_FAST_REPLAY_ADMISSION_PY" "$rollback_logit_compare" "$rollback_state_compare")
+    fi
+
+    if [ "$mode" = "dflash" ]; then
+        record_json=$(python3 - "$label" "$mode" "$status" "$detect" "$parity" "$rollback_replay" "$rollback_logit_compare" "$rollback_state_compare" "$rollback_fast_replay_admission" "$verify_graph" "$wall" <<'PYEOF'
+import json, sys
+
+label, mode, status, detect, parity, rollback_replay, rollback_logit, rollback_state, admission, verify_graph, wall = sys.argv[1:]
+
+def decode(value):
+    if value in {"not_checked", "not_requested"}:
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+metrics = {
+    "mode": mode,
+    "wall_s": float(wall),
+    "detector": decode(detect),
+    "ar_parity": decode(parity),
+    "rollback_replay": decode(rollback_replay),
+    "rollback_logit_compare": decode(rollback_logit),
+    "rollback_state_compare": decode(rollback_state),
+    "rollback_fast_replay_admission": decode(admission),
+    "verify_graph": decode(verify_graph),
+}
+print(json.dumps({
+    "battery": "dflash",
+    "case_id": label,
+    "status": status,
+    "metrics": metrics,
+}, sort_keys=True))
+PYEOF
+)
+        append_trace_json_record "$record_json"
     fi
 
     {
@@ -458,6 +766,10 @@ for entry in "${tests[@]}"; do
         echo "- detector: \`$detect\`"
         echo "- ar_parity: \`$parity\`"
         echo "- rollback_replay: \`$rollback_replay\`"
+        echo "- rollback_logit_compare: \`$rollback_logit_compare\`"
+        echo "- rollback_state_compare: \`$rollback_state_compare\`"
+        echo "- rollback_fast_replay_admission: \`$rollback_fast_replay_admission\`"
+        echo "- verify_graph: \`$verify_graph\`"
         if [ -n "$stats" ]; then
             echo "- stats:"
             echo '  ```'
@@ -486,9 +798,69 @@ for entry in "${tests[@]}"; do
     rm -f "$out_file"
     [ -n "$ar_out_file" ] && rm -f "$ar_out_file"
 done
+summary_json=$(python3 - "$TRACE_JSON_OUT" <<'PYEOF'
+import json
+import sys
+
+path = sys.argv[1]
+text = open(path, "r", encoding="utf-8").read()
+records = json.loads(text + "\n]}")["records"]
+dflash_records = [r for r in records if r.get("battery") == "dflash"]
+admissions = []
+for record in dflash_records:
+    metrics = record.get("metrics") or {}
+    admission = metrics.get("rollback_fast_replay_admission")
+    if isinstance(admission, dict):
+        admissions.append((record.get("case_id"), admission))
+
+counts = {"admitted": 0, "rejected": 0, "not_evaluated": 0, "other": 0}
+blockers = {}
+case_verdicts = []
+logit_checked = 0
+state_checked = 0
+for case_id, admission in admissions:
+    verdict = admission.get("verdict", "other")
+    if verdict not in counts:
+        verdict = "other"
+    counts[verdict] += 1
+    logit_checked += int(admission.get("logit_checked") or 0)
+    state_checked += int(admission.get("state_checked") or 0)
+    case_verdicts.append({"case_id": case_id, "verdict": admission.get("verdict", "other")})
+    for blocker in admission.get("blockers") or []:
+        blockers[blocker] = blockers.get(blocker, 0) + 1
+
+if counts["rejected"]:
+    verdict = "rejected"
+elif counts["admitted"] and not counts["not_evaluated"] and not counts["other"]:
+    verdict = "admitted"
+elif admissions:
+    verdict = "not_evaluated"
+else:
+    verdict = "not_checked"
+
+print(json.dumps({
+    "battery": "dflash",
+    "case_id": "rollback_fast_replay_admission_summary",
+    "status": verdict,
+    "metrics": {
+        "verdict": verdict,
+        "case_count": len(dflash_records),
+        "admission_count": len(admissions),
+        "verdict_counts": counts,
+        "blocker_counts": blockers,
+        "case_verdicts": case_verdicts,
+        "logit_checked": logit_checked,
+        "state_checked": state_checked,
+    },
+}, sort_keys=True))
+PYEOF
+)
+append_trace_json_record "$summary_json"
+printf '\n]}\n' >> "$TRACE_JSON_OUT"
 
 echo
 echo "coherence report: $OUT"
+echo "dflash trace json: $TRACE_JSON_OUT"
 if [ "$hard_errors" -gt 0 ]; then
     echo "$hard_errors test(s) hit hard errors — gate FAILED"
     exit 1

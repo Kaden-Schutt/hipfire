@@ -507,7 +507,11 @@ impl Transport for PinnedH2DTransport {
             )
         })?;
         let buf = gpu.hip.malloc(len)?;
-        let src = &self.staging.as_ref().unwrap().as_slice()[..len];
+        let src = &self
+            .staging
+            .as_ref()
+            .ok_or_else(|| hip_bridge::HipError::new(0, "pinned staging buffer missing"))?
+            .as_slice()[..len];
         let stream = hip_bridge::Stream::null();
         gpu.hip.memcpy_htod_async(&buf, src, &stream)?;
         gpu.hip.stream_synchronize(&stream)?;
@@ -1108,7 +1112,14 @@ impl WeightPager {
         // How much we need to free so that vram_used + need <= budget.
         let target_used = budget.saturating_sub(need_bytes);
         while self.vram_used_bytes > target_used && !self.lru.is_empty() {
-            let id = self.lru.pop_front().unwrap();
+            let id = self
+                .lru
+                .pop_front()
+                .ok_or(WeightPagerError::BudgetExhausted {
+                    need_bytes,
+                    in_use: self.vram_used_bytes,
+                    budget,
+                })?;
             if let Some(r) = self.resident.remove(&id) {
                 self.vram_used_bytes = self.vram_used_bytes.saturating_sub(r.bytes);
                 let _ = gpu.free_tensor(r.tensor);

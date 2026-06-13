@@ -406,6 +406,12 @@ fn speculative_decode_impl(
     // forward READS those stale slots before overwriting — happens
     // only in narrow windows and is documented as a production-hardening
     // follow-up.
+    //
+    // Correct fix shape: speculative verify must either write into scratch
+    // cache state and commit only the accepted prefix, or explicitly
+    // invalidate/rewind every per-layer cache slot beyond n_accept before
+    // returning. Moving n_tokens alone is not sufficient, because SWA ring
+    // indices can still alias rejected-token cache entries on a later read.
     state.n_tokens = initial_n_tokens + accepted_tokens.len() as u64;
 
     Ok(SpecStepResult {

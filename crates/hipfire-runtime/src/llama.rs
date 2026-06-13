@@ -689,6 +689,10 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
     match dense_gemv_route(w.gpu_dtype) {
         DenseGemvRoute::Mq6RotateThenMq6Prerotated => {
             gpu.ensure_mq_signs()?;
+            // TODO(scratch-alias-safety): centralize these scratch views behind
+            // a non-owning Gpu helper. The repeated `alias()` calls in this file
+            // are safe only while all mq_x_rot users are stream-ordered and the
+            // aliases never outlive or free the backing scratch allocation.
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],

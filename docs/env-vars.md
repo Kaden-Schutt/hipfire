@@ -50,6 +50,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_DDTREE_LOGW_CUTOFF` | Adaptive-B usage report — only meaningful when --adaptive-b is on | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:2382` |
 | `HIPFIRE_DDTREE_PATH_B_CAPTURE` | Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5102` |
 | `HIPFIRE_DDTREE_PATH_C` | Resolve "HIPFIRE_DDTREE_PATH_C" ONCE before the decode loop. The | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:11532` |
+| `HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH` | Opt-in Path C verify graph capture for graph A/B diagnostics; default off because current Path C graph A/B evidence is not promoted | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:86` |
 | `HIPFIRE_DDTREE_PATH_C_VERBOSE` | Runtime variable controlling DDTree path c verbose in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5617` |
 | `HIPFIRE_DDTREE_TAPE_DUMP` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5082` |
 | `HIPFIRE_DDTREE_TOPK` | Runtime variable controlling DDTree topk in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:78` |
@@ -125,6 +126,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` | Selects behavior from recognized values | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:33` |
 | `HIPFIRE_DFLASH_ROLLBACK_COMPARE` | Diagnostic-only fast GDN-tape rollback replay comparison against serial replay; live DFlash rollback remains serial because fast tape replay is not parity-proven | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:829` |
 | `HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL` | Diagnostic-only absolute tolerance for FA raw attention rollback input compare | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:838` |
+| `HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS` | Diagnostic depth for forced-serial rollback next-logit chain comparison; defaults to 1 and caps at 8 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:858` |
 | `HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL` | Diagnostic-only absolute tolerance for x_in rollback input compare | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:846` |
 | `HIPFIRE_DFLASH_SEED_ORACLE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:3872` |
 | `HIPFIRE_DFLASH_SPEC_DEMO_BIN` | Runtime variable controlling dflash spec demo bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/eval_harness/mod.rs:7924` |
@@ -353,7 +355,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_TARGET_ARCH` | HIPFIRE_TARGET_ARCH overrides the detected GPU arch for kernel | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:727` |
 | `HIPFIRE_TIER_RATIO` | Runtime variable controlling tier ratio in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5738` |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Runtime variable controlling uniform vram tolerance gb in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:97` |
-| `HIPFIRE_VERIFY_GRAPH` | Enabled by default; set to 0 to disable | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:2717` |
+| `HIPFIRE_VERIFY_GRAPH` | DFlash verify graph capture is default-on; set to 0 only for graph/nograph diagnostics because direct verify has not cleared AR parity | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5113` |
 | `HIPFIRE_VERIFY_GRAPH_TIMING` | (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:2730` |
 | `HIPFIRE_VERIFY_GRAPH_TREE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:2707` |
 | `HIPFIRE_VL_DUMP_DIR` | little-endian f32 blobs + JSON sidecars to $HIPFIRE_VL_DUMP_DIR | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/infer.rs:148` |

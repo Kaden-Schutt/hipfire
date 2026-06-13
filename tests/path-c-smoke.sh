@@ -29,6 +29,8 @@
 # Usage:
 #   ./tests/path-c-smoke.sh                    # auto-detect models
 #   TARGET=/path/to/t-mq4.hfq DRAFT=/path/to/d.hfq ./tests/path-c-smoke.sh
+#   ./tests/path-c-smoke.sh --graph-ab         # report graph/nograph deltas
+#   ./tests/path-c-smoke.sh --graph-promote    # hard-fail unless graph deltas promote
 #
 # Exit codes:
 #   0  smoke ran clean
@@ -40,10 +42,12 @@ cd "$(dirname "$0")/.."
 
 FULL=0
 GRAPH_AB=0
+GRAPH_PROMOTE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --full) FULL=1 ;;
         --graph-ab) GRAPH_AB=1 ;;  # A/B verify-graph capture on/off (Phase 3 gate)
+        --graph-promote) GRAPH_AB=1; GRAPH_PROMOTE=1 ;;  # hard-fail unless graph A/B is promotable
         -h|--help) sed -n '3,33p' "$0"; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -68,6 +72,7 @@ if [ -z "$DRAFT" ]; then
 fi
 
 OUT="${HIPFIRE_PATH_C_OUT:-/tmp/path-c-smoke-$(date +%Y%m%d-%H%M%S).md}"
+TRACE_JSON_OUT="${HIPFIRE_PATH_C_TRACE_JSON:-${OUT%.md}.path_c_trace.json}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
 # ── Build dflash_spec_demo if needed ──────────────────────────────────────
@@ -102,6 +107,7 @@ if [ -r "$LOCK_SCRIPT" ]; then
 fi
 
 if [ -z "$TARGET" ] || [ -z "$DRAFT" ] || [ ! -f "$TARGET" ] || [ ! -f "$DRAFT" ]; then
+    printf '{"kind":"path_c_trace","records":[\n\n]}\n' > "$TRACE_JSON_OUT"
     {
         echo "# Path C smoke — SKIPPED (target/draft model not found)"
         echo
@@ -112,6 +118,7 @@ if [ -z "$TARGET" ] || [ -z "$DRAFT" ] || [ ! -f "$TARGET" ] || [ ! -f "$DRAFT" 
     } > "$OUT"
     echo "path-c-smoke: models not present, skipping (no hard error)"
     echo "report: $OUT"
+    echo "path-c trace json: $TRACE_JSON_OUT"
     exit 0
 fi
 
@@ -181,10 +188,12 @@ else
     TESTS=("${SHORT_TESTS[@]}")
 fi
 
-# --graph-ab pairs each test with a `-nograph` variant that runs the same
-# command with HIPFIRE_VERIFY_GRAPH=0. Used to validate the PRD's Phase 3
+# --graph-ab pairs each HIPFIRE_VERIFY_GRAPH=1 test with a `-nograph` variant
+# that runs the same command with HIPFIRE_VERIFY_GRAPH=0. Used to validate the PRD's Phase 3
 # expected delta (+10-15 % tok/s with verify-graph capture on the Path C
 # main + branch FA forwards). Doubles the test count.
+GRAPH_MIN_TOK_DELTA_PCT="${PATH_C_GRAPH_MIN_TOK_DELTA_PCT:-5.0}"
+GRAPH_MIN_TAU_DELTA_PCT="${PATH_C_GRAPH_MIN_TAU_DELTA_PCT:--1.0}"
 if [ "$GRAPH_AB" -eq 1 ]; then
     AB=()
     for t in "${TESTS[@]}"; do
@@ -240,6 +249,22 @@ PYEOF
 
 # ── Run ──────────────────────────────────────────────────────────────────
 hard_errors=0
+GRAPH_METRICS_FILE="/tmp/path_c_graph_metrics_$$.tsv"
+GRAPH_VERDICT_FILE="/tmp/path_c_graph_verdict_$$.txt"
+GRAPH_SUMMARY_FILE="/tmp/path_c_graph_summary_$$.json"
+rm -f "$GRAPH_METRICS_FILE"
+rm -f "$GRAPH_VERDICT_FILE"
+rm -f "$GRAPH_SUMMARY_FILE"
+printf '{"kind":"path_c_trace","records":[\n' > "$TRACE_JSON_OUT"
+trace_json_records=0
+
+append_trace_json_record() {
+    if [ "$trace_json_records" -gt 0 ]; then
+        printf ',\n' >> "$TRACE_JSON_OUT"
+    fi
+    printf '%s' "$1" >> "$TRACE_JSON_OUT"
+    trace_json_records=$((trace_json_records + 1))
+}
 
 {
     echo "# Path C smoke (PRD ddtree-path-c-main-path-first-from-lucebox)"
@@ -267,10 +292,15 @@ for entry in "${TESTS[@]}"; do
         INSTRUCT_PROMPT) prompt="$INSTRUCT_PROMPT" ;;
         *) echo "unknown prompt_var: $prompt_var" >&2; exit 2 ;;
     esac
-    # graph_flag = "nograph" → HIPFIRE_VERIFY_GRAPH=0 for this run; otherwise
-    # default behaviour (graph capture on by default for eligible models).
+    # graph_flag = "nograph" disables both dense-DFlash graph capture and the
+    # Path C opt-in. graph A/B explicitly opts into both graph controls.
+    case_graph_mode="default"
     if [ "${graph_flag:-}" = "nograph" ]; then
-        graph_env=("HIPFIRE_VERIFY_GRAPH=0")
+        graph_env=("HIPFIRE_VERIFY_GRAPH=0" "HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH=0")
+        case_graph_mode="nograph"
+    elif [ "$GRAPH_AB" -eq 1 ]; then
+        graph_env=("HIPFIRE_VERIFY_GRAPH=1" "HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH=1")
+        case_graph_mode="graph"
     else
         graph_env=()
     fi
@@ -304,8 +334,79 @@ for entry in "${TESTS[@]}"; do
         status="WARN (paragraph-level repetition — soft, not blocking)"
     fi
 
-    stats=$(grep -aE '^emitted:|^cycles:|^accept_rate:' "$out_file" | head -3)
+    stats=$(grep -aE '^emitted:|^cycles:|^verify_graph:|^accept_rate:' "$out_file" | head -4)
     path_c_last=$(grep -a '^\[path-c\]' "$out_file" | tail -1)
+    record_json=$(python3 - "$label" "$phase" "$case_graph_mode" "$status" "$detect" "$stats" "$path_c_last" "$wall" <<'PYEOF'
+import json
+import re
+import sys
+
+label, phase, graph_mode, status, detect, stats, path_c_last, wall = sys.argv[1:]
+
+def decode_json(value):
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+metrics = {
+    "phase": phase,
+    "graph_mode": graph_mode,
+    "wall_s": float(wall),
+    "detector": decode_json(detect),
+}
+emitted = re.search(r"^emitted:\s+(\d+) tokens.*\(([-+0-9.eE]+)\s+tok/s\)", stats, re.MULTILINE)
+if emitted:
+    metrics["emitted_tokens"] = int(emitted.group(1))
+    metrics["tok_s"] = float(emitted.group(2))
+cycles = re.search(r"^cycles:.*τ=([-+0-9.eE]+)", stats, re.MULTILINE)
+if cycles:
+    metrics["tau"] = float(cycles.group(1))
+verify_graph = re.search(
+    r"^verify_graph: direct=(\d+) warmup=(\d+) capture=(\d+) replay=(\d+) not_applicable=(\d+)",
+    stats,
+    re.MULTILINE,
+)
+if verify_graph:
+    metrics["verify_graph"] = {
+        "direct": int(verify_graph.group(1)),
+        "warmup": int(verify_graph.group(2)),
+        "capture": int(verify_graph.group(3)),
+        "replay": int(verify_graph.group(4)),
+        "not_applicable": int(verify_graph.group(5)),
+    }
+if path_c_last:
+    metrics["path_c_counters"] = path_c_last
+print(json.dumps({
+    "battery": "path_c",
+    "case_id": label,
+    "status": status,
+    "metrics": metrics,
+}, sort_keys=True))
+PYEOF
+)
+    append_trace_json_record "$record_json"
+    if [ "$GRAPH_AB" -eq 1 ] && [ -n "$stats" ]; then
+        base_label="${label%-nograph}"
+        graph_mode="graph"
+        [ "${graph_flag:-}" = "nograph" ] && graph_mode="nograph"
+        python3 - "$out_file" "$base_label" "$graph_mode" >> "$GRAPH_METRICS_FILE" <<'PYEOF'
+import re
+import sys
+
+path, label, graph_mode = sys.argv[1:]
+text = open(path, "rb").read().decode("utf-8", "replace")
+tok_s = "nan"
+tau = "nan"
+m = re.search(r"^emitted:.*\(([-+0-9.eE]+)\s+tok/s\)", text, re.MULTILINE)
+if m:
+    tok_s = m.group(1)
+m = re.search(r"^cycles:.*τ=([-+0-9.eE]+)", text, re.MULTILINE)
+if m:
+    tau = m.group(1)
+print(f"{label}\t{graph_mode}\t{tok_s}\t{tau}")
+PYEOF
+    fi
 
     {
         echo "## $label (phase=$phase, b=12, k=2)"
@@ -346,8 +447,116 @@ for entry in "${TESTS[@]}"; do
     rm -f "$out_file"
 done
 
+if [ "$GRAPH_AB" -eq 1 ] && [ -s "$GRAPH_METRICS_FILE" ]; then
+    {
+        echo "## Verify Graph A/B"
+        echo
+        echo "- promotion thresholds: tok/s delta >= ${GRAPH_MIN_TOK_DELTA_PCT}% for every paired case, τ delta >= ${GRAPH_MIN_TAU_DELTA_PCT}% for every paired case"
+        echo "- hard gate: $( [ "$GRAPH_PROMOTE" -eq 1 ] && echo enabled || echo disabled )"
+        echo
+        echo "| case | graph tok/s | nograph tok/s | tok/s delta | graph τ | nograph τ | τ delta |"
+        echo "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+        python3 - "$GRAPH_METRICS_FILE" "$GRAPH_VERDICT_FILE" "$GRAPH_SUMMARY_FILE" "$GRAPH_MIN_TOK_DELTA_PCT" "$GRAPH_MIN_TAU_DELTA_PCT" <<'PYEOF'
+import math
+import json
+import sys
+
+rows = {}
+metrics_path, verdict_path, summary_path, min_tok_raw, min_tau_raw = sys.argv[1:]
+min_tok_delta = float(min_tok_raw)
+min_tau_delta = float(min_tau_raw)
+with open(metrics_path, "r", encoding="utf-8") as f:
+    for line in f:
+        label, mode, tok_s, tau = line.rstrip("\n").split("\t")
+        rows.setdefault(label, {})[mode] = (float(tok_s), float(tau))
+
+def fmt(value):
+    if not math.isfinite(value):
+        return "nan"
+    return f"{value:.3f}"
+
+failures = []
+summary_rows = []
+paired = 0
+for label in sorted(rows):
+    pair = rows[label]
+    if "graph" not in pair or "nograph" not in pair:
+        failures.append(f"{label}: missing graph/nograph pair")
+        continue
+    paired += 1
+    graph_tok, graph_tau = pair["graph"]
+    nograph_tok, nograph_tau = pair["nograph"]
+    tok_delta = ((graph_tok - nograph_tok) / nograph_tok * 100.0) if nograph_tok else math.nan
+    tau_delta = ((graph_tau - nograph_tau) / nograph_tau * 100.0) if nograph_tau else math.nan
+    if not math.isfinite(tok_delta) or not math.isfinite(tau_delta):
+        failures.append(f"{label}: non-finite delta")
+    elif tok_delta < min_tok_delta:
+        failures.append(f"{label}: tok/s delta {tok_delta:.3f}% < {min_tok_delta:.3f}%")
+    elif tau_delta < min_tau_delta:
+        failures.append(f"{label}: τ delta {tau_delta:.3f}% < {min_tau_delta:.3f}%")
+    summary_rows.append({
+        "case_id": label,
+        "graph_tok_s": graph_tok,
+        "nograph_tok_s": nograph_tok,
+        "tok_s_delta_pct": tok_delta,
+        "graph_tau": graph_tau,
+        "nograph_tau": nograph_tau,
+        "tau_delta_pct": tau_delta,
+    })
+    print(
+        f"| {label} | {fmt(graph_tok)} | {fmt(nograph_tok)} | {fmt(tok_delta)}% | "
+        f"{fmt(graph_tau)} | {fmt(nograph_tau)} | {fmt(tau_delta)}% |"
+    )
+if paired == 0:
+    failures.append("no paired graph/nograph metrics")
+promoted = not failures
+print()
+print(f"- promotion_verdict: {'PROMOTED' if promoted else 'NOT_PROMOTED'}")
+print(f"- paired_cases: {paired}")
+if failures:
+    print("- blockers:")
+    for failure in failures:
+        print(f"  - {failure}")
+with open(verdict_path, "w", encoding="utf-8") as f:
+    f.write("PROMOTED\n" if promoted else "NOT_PROMOTED\n")
+with open(summary_path, "w", encoding="utf-8") as f:
+    json.dump({
+        "battery": "path_c",
+        "case_id": "verify_graph_promotion",
+        "status": "PROMOTED" if promoted else "NOT_PROMOTED",
+        "metrics": {
+            "promotion_verdict": "PROMOTED" if promoted else "NOT_PROMOTED",
+            "paired_cases": paired,
+            "tok_s_min_delta_pct": min_tok_delta,
+            "tau_min_delta_pct": min_tau_delta,
+            "blockers": failures,
+            "pairs": summary_rows,
+        },
+    }, f, sort_keys=True)
+PYEOF
+        echo
+    } >> "$OUT"
+    if [ -s "$GRAPH_SUMMARY_FILE" ]; then
+        append_trace_json_record "$(cat "$GRAPH_SUMMARY_FILE")"
+    fi
+fi
+if [ "$GRAPH_PROMOTE" -eq 1 ]; then
+    if [ "$(cat "$GRAPH_VERDICT_FILE" 2>/dev/null || echo NOT_PROMOTED)" != "PROMOTED" ]; then
+        hard_errors=$((hard_errors + 1))
+        {
+            echo "## Verify Graph Promotion Gate"
+            echo
+            echo "Graph capture did not satisfy promotion thresholds; keeping it diagnostic."
+            echo
+        } >> "$OUT"
+    fi
+fi
+printf '\n]}\n' >> "$TRACE_JSON_OUT"
+rm -f "$GRAPH_METRICS_FILE" "$GRAPH_VERDICT_FILE" "$GRAPH_SUMMARY_FILE"
+
 echo
 echo "path-c-smoke report: $OUT"
+echo "path-c trace json: $TRACE_JSON_OUT"
 if [ "$hard_errors" -gt 0 ]; then
     echo "$hard_errors test(s) hit hard errors — gate FAILED"
     exit 1

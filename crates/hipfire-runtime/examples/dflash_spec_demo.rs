@@ -1792,6 +1792,11 @@ fn main() {
         let mut rollback_multi_request_disabled: usize = 0;
         let mut rollback_replay_gdn_tape: usize = 0;
         let mut rollback_replay_full_prefill: usize = 0;
+        let mut verify_graph_direct: usize = 0;
+        let mut verify_graph_warmup: usize = 0;
+        let mut verify_graph_capture: usize = 0;
+        let mut verify_graph_replay: usize = 0;
+        let mut verify_graph_not_applicable: usize = 0;
         let trace_token_index: Option<usize> = std::env::var("HIPFIRE_DFLASH_TRACE_TOKEN_INDEX")
             .ok()
             .and_then(|s| s.parse().ok());
@@ -2072,6 +2077,13 @@ fn main() {
                 speculative::SpecRollbackReplayKind::FullPrefill => {
                     rollback_replay_full_prefill += 1
                 }
+            }
+            match step.verify_graph_mode {
+                speculative::SpecVerifyGraphMode::Direct => verify_graph_direct += 1,
+                speculative::SpecVerifyGraphMode::Warmup => verify_graph_warmup += 1,
+                speculative::SpecVerifyGraphMode::Capture => verify_graph_capture += 1,
+                speculative::SpecVerifyGraphMode::Replay => verify_graph_replay += 1,
+                speculative::SpecVerifyGraphMode::NotApplicable => verify_graph_not_applicable += 1,
             }
             assert!(
                 rollback.allow_single_session,
@@ -2393,6 +2405,14 @@ fn main() {
             rollback_multi_request_disabled,
             rollback_replay_gdn_tape,
             rollback_replay_full_prefill,
+        );
+        eprintln!(
+            "verify_graph: direct={} warmup={} capture={} replay={} not_applicable={}",
+            verify_graph_direct,
+            verify_graph_warmup,
+            verify_graph_capture,
+            verify_graph_replay,
+            verify_graph_not_applicable,
         );
         if let Some(ref p) = cask_policy {
             eprintln!(

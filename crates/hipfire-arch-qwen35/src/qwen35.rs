@@ -772,14 +772,16 @@ fn qwen35_attention_wo_residual(
         let result = weight_gemv_residual(gpu, wo, attn_out, residual);
         if result.is_ok() && ffn_bf16::config().trace {
             let output = ffn_bf16::projection_module_output(&invocation);
+            let evidence_json = ffn_bf16::projection_module_output_json(&output);
             eprintln!(
-                "[qwen35 projection module] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={}",
+                "[qwen35 projection module] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={} evidence_json={}",
                 output.module_id,
                 invocation.contract.preferred_backend.as_str(),
                 output.selected_backend.as_str(),
                 output.oracle_backend.as_str(),
                 output.fallback_reason.unwrap_or("none"),
                 output.mutates_residual,
+                evidence_json,
             );
         }
         result
@@ -788,14 +790,16 @@ fn qwen35_attention_wo_residual(
         let result = gpu.add_inplace_f32(residual, tmp_out);
         if result.is_ok() && ffn_bf16::config().trace {
             let output = ffn_bf16::projection_module_output(&invocation);
+            let evidence_json = ffn_bf16::projection_module_output_json(&output);
             eprintln!(
-                "[qwen35 projection module] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={}",
+                "[qwen35 projection module] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={} evidence_json={}",
                 output.module_id,
                 invocation.contract.preferred_backend.as_str(),
                 output.selected_backend.as_str(),
                 output.oracle_backend.as_str(),
                 output.fallback_reason.unwrap_or("none"),
                 output.mutates_residual,
+                evidence_json,
             );
         }
         result
@@ -1627,14 +1631,16 @@ fn weight_gemv_swiglu_residual_bf16_probe(
         let result = weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x);
         if result.is_ok() && ffn_bf16::config().trace {
             let output = ffn_bf16::dense_ffn_module_output(&invocation, None);
+            let evidence_json = ffn_bf16::dense_ffn_module_output_json(&output);
             eprintln!(
-                "[qwen35 ffn module] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={}",
+                "[qwen35 ffn module] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={} evidence_json={}",
                 output.evidence.module_id,
                 invocation.contract.preferred_backend.as_str(),
                 output.evidence.selected_backend.as_str(),
                 output.evidence.oracle_backend.as_str(),
                 output.evidence.fallback_reason.unwrap_or("none"),
                 output.mutates_residual,
+                evidence_json,
             );
         }
         return result;
@@ -1642,18 +1648,30 @@ fn weight_gemv_swiglu_residual_bf16_probe(
 
     match ffn_bf16::config().mode {
         FfnBf16Mode::Off => weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x),
-        FfnBf16Mode::Xdna1 => Err(HipError::new(
-            0,
-            "HIPFIRE_QWEN35_FFN_BF16=xdna1 is reserved for the later XDNA1 BF16 stage; use compare or cpu for this CPU/oracle probe",
-        )),
-        FfnBf16Mode::Compare | FfnBf16Mode::Cpu => {
-            let preferred_backend = match ffn_bf16::config().mode {
-                FfnBf16Mode::Compare => ffn_bf16::DenseFfnBackendPreference::GpuProduction,
-                FfnBf16Mode::Cpu => ffn_bf16::DenseFfnBackendPreference::CpuOracle,
-                FfnBf16Mode::Off | FfnBf16Mode::Xdna1 => unreachable!(),
-            };
+        FfnBf16Mode::Compare | FfnBf16Mode::Cpu | FfnBf16Mode::Xdna1 => {
+            let mode = ffn_bf16::config().mode;
+            let preferred_backend = ffn_bf16::dense_ffn_backend_preference_for_mode(mode)
+                .expect("enabled BF16 mode has a backend preference");
             let invocation =
                 ffn_bf16::dense_ffn_module_invocation(layer_idx, shadow, preferred_backend, false);
+            if mode == FfnBf16Mode::Xdna1 {
+                let result = weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x);
+                if result.is_ok() {
+                    let output = ffn_bf16::dense_ffn_module_output(&invocation, None);
+                    let evidence_json = ffn_bf16::dense_ffn_module_output_json(&output);
+                    eprintln!(
+                        "[qwen35 ffn bf16] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={} evidence_json={}",
+                        output.evidence.module_id,
+                        invocation.contract.preferred_backend.as_str(),
+                        output.evidence.selected_backend.as_str(),
+                        output.evidence.oracle_backend.as_str(),
+                        output.evidence.fallback_reason.unwrap_or("none"),
+                        output.mutates_residual,
+                        evidence_json,
+                    );
+                }
+                return result;
+            }
             let t0 = std::time::Instant::now();
             let residual_pre = gpu.download_f32(x)?;
             let gate_cpu = gpu.download_f32(gate)?;
@@ -1670,8 +1688,9 @@ fn weight_gemv_swiglu_residual_bf16_probe(
                     let gpu_out = gpu.download_f32(x)?;
                     let stats = ffn_bf16::diff_stats(&gpu_out, &cpu_out);
                     let output = ffn_bf16::dense_ffn_module_output(&invocation, Some(stats));
+                    let evidence_json = ffn_bf16::dense_ffn_module_output_json(&output);
                     eprintln!(
-                        "[qwen35 ffn bf16] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} n={} max_abs={:.6e} mean_abs={:.6e} rms={:.6e} nan={} inf={}",
+                        "[qwen35 ffn bf16] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} n={} max_abs={:.6e} mean_abs={:.6e} rms={:.6e} nan={} inf={} evidence_json={}",
                         output.evidence.module_id,
                         invocation.contract.preferred_backend.as_str(),
                         output.evidence.selected_backend.as_str(),
@@ -1683,6 +1702,7 @@ fn weight_gemv_swiglu_residual_bf16_probe(
                         stats.rms,
                         stats.n_nan,
                         stats.n_inf,
+                        evidence_json,
                     );
                     if ffn_bf16::config().trace {
                         eprintln!(
@@ -1698,13 +1718,15 @@ fn weight_gemv_swiglu_residual_bf16_probe(
                     gpu.hip.memcpy_htod(&x.buf, bytes)?;
                     let output = ffn_bf16::dense_ffn_module_output(&invocation, None);
                     if ffn_bf16::config().trace {
+                        let evidence_json = ffn_bf16::dense_ffn_module_output_json(&output);
                         eprintln!(
-                            "[qwen35 ffn bf16] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} download_ms={download_ms:.3} cpu_ms={cpu_ms:.3}",
+                            "[qwen35 ffn bf16] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} download_ms={download_ms:.3} cpu_ms={cpu_ms:.3} evidence_json={}",
                             output.evidence.module_id,
                             invocation.contract.preferred_backend.as_str(),
                             output.evidence.selected_backend.as_str(),
                             output.evidence.oracle_backend.as_str(),
                             output.evidence.fallback_reason.unwrap_or("none"),
+                            evidence_json,
                         );
                     }
                     Ok(())
