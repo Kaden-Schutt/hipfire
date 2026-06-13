@@ -346,6 +346,38 @@ post-RoPE K bytes, and post-RoPE K depends only on the position phase
 that this PRD has now made correct. So no kernel-math change is needed,
 just an addressing change.
 
+## Hipfire status checkpoint — 2026-06-13
+
+The current hipfire tree keeps the production defaults conservative:
+
+- `HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH` defaults off. The graph A/B gate
+  keeps graph capture diagnostic-only unless `tests/path-c-smoke.sh
+  --graph-promote` reports `promotion_verdict=PROMOTED`.
+- Dense DFlash keeps verify graph capture default-on. Direct/no-graph
+  verify remains diagnostic-only for dense DFlash AR-parity work.
+- Fast DFlash GDN-tape rollback remains diagnostic-only; live rollback
+  uses conservative serial-source tape replay by default, with
+  full-prefill/verify-complete fallback when serial tape is explicitly
+  disabled.
+
+Latest rollback diagnostic evidence:
+
+- `/tmp/coherence-dflash-20260613-223336.md` (qwen3.6-27B mq4+dflash,
+  `HIPFIRE_DFLASH_AR_PARITY=1`, serial tape disabled, rollback compare
+  enabled) passed AR parity and DFlash coherence.
+- Fast replay admission stayed rejected with
+  `fast_replay_recurrent_state_mismatch`, `rollback_input_mismatch`, and
+  `projection_family_mismatch`.
+- The narrowed hidden-boundary compare now checks LA `attn_out`,
+  `normed`, and `wo_input` between `wo_residual_in` and
+  `attn_residual`. For the prose rollback frame at position 59,
+  `wo_residual_in` still matched, and the first hidden-boundary mismatch
+  moved to LA0 `attn_out` (`max_abs=1.06632710e-2`,
+  `mean_abs=1.14494742e-5`). This points the remaining fast rollback
+  blocker upstream of the `wo` residual projection output, consistent
+  with the qkv/qkvza route split already reported by
+  `rollback_input_compare`.
+
 ## References
 
 - Path A revert: `ecbc49d`, corruption confirmation `6c84b13` (2026-04-23).

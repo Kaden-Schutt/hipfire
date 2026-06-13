@@ -3800,6 +3800,7 @@ impl GdnTape {
     ) -> HipResult<Option<DeltaNetSnapshotDiff>> {
         let x_in_atol = dflash_rollback_x_in_atol_from_env();
         let hidden_bytes = n_positions * self.x_in_dim * 4;
+        let v_bytes = n_positions * self.v_dim * 4;
         let ffn_bytes = n_positions * self.ffn_dim * 4;
         for i in 0..self.x_in_bufs.len() {
             for (family, actual, expected, bytes) in [
@@ -3808,6 +3809,24 @@ impl GdnTape {
                     &self.wo_residual_in_bufs[i].buf,
                     &expected.wo_residual_in_bufs[i].buf,
                     hidden_bytes,
+                ),
+                (
+                    "attn_out",
+                    &self.attn_out_bufs[i].buf,
+                    &expected.attn_out_bufs[i].buf,
+                    v_bytes,
+                ),
+                (
+                    "normed",
+                    &self.normed_bufs[i].buf,
+                    &expected.normed_bufs[i].buf,
+                    v_bytes,
+                ),
+                (
+                    "wo_input",
+                    &self.wo_input_bufs[i].buf,
+                    &expected.wo_input_bufs[i].buf,
+                    v_bytes,
                 ),
                 (
                     "attn_residual",
