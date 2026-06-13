@@ -1189,6 +1189,20 @@ pub const ENV_HIPFIRE_HFQ4_MMQ_GFX906_Y64: EnvVarDoc = EnvVarDoc {
     source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:194",
 };
 
+/// `HIPFIRE_HFQ4_QKVZA_FAST` — HIPFIRE_HFQ4_QKVZA_FAST=0 narrows the FP16/WMMA/dot2 prefill
+pub const ENV_HIPFIRE_HFQ4_QKVZA_FAST: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_HFQ4_QKVZA_FAST",
+    description: "HIPFIRE_HFQ4_QKVZA_FAST=0 narrows the FP16/WMMA/dot2 prefill",
+    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:174",
+};
+
+/// `HIPFIRE_HFQ4_RESIDUAL_FAST` — HIPFIRE_HFQ4_RESIDUAL_FAST=0 narrows the residual-projection
+pub const ENV_HIPFIRE_HFQ4_RESIDUAL_FAST: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_HFQ4_RESIDUAL_FAST",
+    description: "HIPFIRE_HFQ4_RESIDUAL_FAST=0 narrows the residual-projection",
+    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:178",
+};
+
 /// `HIPFIRE_HFQ6_QKVZA_4W` — Interprets "HIPFIRE_HFQ6_QKVZA_4W" from environment to select behavior
 pub const ENV_HIPFIRE_HFQ6_QKVZA_4W: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ6_QKVZA_4W",
@@ -2741,6 +2755,8 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_HFQ4G128_MMQ,
     ENV_HIPFIRE_HFQ4G256_MMQ_GFX1151,
     ENV_HIPFIRE_HFQ4_MMQ_GFX906_Y64,
+    ENV_HIPFIRE_HFQ4_QKVZA_FAST,
+    ENV_HIPFIRE_HFQ4_RESIDUAL_FAST,
     ENV_HIPFIRE_HFQ6_QKVZA_4W,
     ENV_HIPFIRE_HFQ6_QKV_4W,
     ENV_HIPFIRE_HFQ6_RESIDUAL_4W,

@@ -43,6 +43,7 @@ pub struct FeatureFlags {
     pub fp16_layer_min: Option<usize>,
     pub fp16_layer_max: Option<usize>,
     pub hfq4_qkvza_fast: bool,
+    pub hfq4_residual_fast: bool,
     pub wo_mmq: bool,
     pub lm_head_wmma_disabled: bool,
     pub lm_head_overwrite: bool,
@@ -171,6 +172,10 @@ impl FeatureFlags {
             // escape hatch to the LA qkvza projection while debugging DFlash
             // parity; default keeps existing fast routing.
             hfq4_qkvza_fast: std::env::var("HIPFIRE_HFQ4_QKVZA_FAST").as_deref() != Ok("0"),
+            // HIPFIRE_HFQ4_RESIDUAL_FAST=0 narrows the residual-projection
+            // escape hatch to HFQ4/MQ4 batched residual GEMM while debugging
+            // DFlash parity; default keeps existing fast routing.
+            hfq4_residual_fast: std::env::var("HIPFIRE_HFQ4_RESIDUAL_FAST").as_deref() != Ok("0"),
             wo_mmq: std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1"),
             lm_head_wmma_disabled: std::env::var("HIPFIRE_LM_HEAD_WMMA")
                 .map_or(false, |v| v == "0"),
@@ -357,6 +362,7 @@ impl FeatureFlags {
             fp16_layer_min: None,
             fp16_layer_max: None,
             hfq4_qkvza_fast: true,
+            hfq4_residual_fast: true,
             wo_mmq: false,
             lm_head_wmma_disabled: false,
             lm_head_overwrite: false,

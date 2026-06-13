@@ -22482,15 +22482,15 @@ impl Gpu {
         // so narrow-batch calls pick mmq_x=16 and long-prefill picks
         // mmq_x=32_y64 (MQ3 phase-2 finding). All variants clamp M-tail
         // internally, so no alignment check needed.
-        if self.hfq4g256_mmq_gfx1151_enabled(m, k, batch_size) {
+        if self.flags.hfq4_residual_fast && self.hfq4g256_mmq_gfx1151_enabled(m, k, batch_size) {
             return self.gemm_hfq4g256_mmq_gfx1151(a_raw, x, y, m, k, batch_size, true);
         }
-        if batch_size > 1 && self.arch_caps.has_hfq4_mmq() {
+        if self.flags.hfq4_residual_fast && batch_size > 1 && self.arch_caps.has_hfq4_mmq() {
             return self.gemm_hfq4g256_residual_mmq_rdna2_auto(a_raw, x, y, m, k, batch_size);
         }
 
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !self.flags.fp16_disabled {
+        if self.flags.hfq4_residual_fast && batch_size > 1 && !self.flags.fp16_disabled {
             // gfx906 dp4a MMQ residual path — default-on at batch ≥ 8 per
             // should_use_mmq's gfx906 default. Distinguishes two reasons
             // MMQ might NOT fire:

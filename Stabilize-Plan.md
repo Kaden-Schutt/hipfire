@@ -122,7 +122,14 @@
     also matches serial immediately before LA0 `wo`; the first mismatch remains `attn_residual[0]`. That leaves the MQ4 `wo` projection output or
     fused residual epilogue itself as the active blocker. Capturing the rotated `wo_input` confirms the MQ activation rotation also matches serial,
     so both inputs to the fused residual projection match before the call. The remaining split is inside the batched `gemm_hfq4g256_residual`
-    projection/epilogue path versus serial `gemv_hfq4g256_residual`.
+    projection/epilogue path versus serial `gemv_hfq4g256_residual`. The backend-level residual parity harness reproduces the issue at the LA
+    `wo` shape (`M=5120 K=2048 B=2`) under default gfx1151 dispatch; disabling MMQ alone is insufficient, while forcing the scalar batched
+    fallback with `HIPFIRE_HFQ4G256_MMQ_GFX1151=0 HIPFIRE_MMQ=0 HIPFIRE_FP16=0` restores byte-exact parity for B=2/4/8. The narrow diagnostic
+    flag is now `HIPFIRE_HFQ4_RESIDUAL_FAST=0`, which bypasses only the HFQ4/MQ4 residual fast branches and leaves the scalar batched residual
+    kernel in place. Running the position-120 DFlash comparator with both `HIPFIRE_HFQ4_QKVZA_FAST=0` and `HIPFIRE_HFQ4_RESIDUAL_FAST=0` clears
+    the LA `wo` residual split and moves the first mismatch to the post-FFN layer output (`layer_out[0]`, `bytes=20480`,
+    `differing_bytes=10604`, `first_offset=0`, `serial_byte=65`, `gdn_byte=20`). The next cut is FFN-stage tape capture: FFN norm/rotated
+    gate-up input, gate/up outputs, SwiGLU/down input, and the pre-`w_down` residual destination.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
