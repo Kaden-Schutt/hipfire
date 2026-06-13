@@ -595,6 +595,19 @@ Latest rollback diagnostic evidence:
   `mean_abs=0.00000222557333`). Fast GDN-tape replay remains rejected
   on recurrent-state plus rollback-input mismatch, so live DFlash
   rollback remains conservative serial/full-prefill.
+- The production-shape `w_down + residual` diagnostic
+  `test_gemm_hfq4g256_residual -- 5120 17408 1 2` reproduced that
+  `layer_out` split: `N=1` was byte-exact, but fast `N=2` diverged
+  (`10221/10240` values). With `HIPFIRE_HFQ4_RESIDUAL_FAST=0`, the
+  same `5120 x 17408, N=2` shape was byte-exact, so tape-producing
+  dense verify now routes the FFN `w_down + residual` branch through the
+  exact residual dispatch as well.
+- `/tmp/coherence-dflash-20260614-021920.md` verified that exact
+  `w_down + residual` routing moves the first rollback input mismatch
+  past `layer_out`. Fast replay is still rejected on recurrent-state and
+  rollback-input mismatch; the first remaining input mismatch is now the
+  FullAttention bridge Q projection (`fa_bridge_q_full`) at position 226
+  (`max_abs=0.00364112854`, `mean_abs=0.000602068903`).
 
 ## References
 
