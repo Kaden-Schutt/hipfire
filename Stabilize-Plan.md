@@ -111,7 +111,11 @@
     projection family; on the same gfx1151 position-120 repro it keeps prefill near the default path (~57 tok/s), clears the LA0 `qkv` first
     mismatch, and exposes the next drift earlier in the network at `x_in index=1` (`bytes=20480`, `differing_bytes=11716`, `first_offset=0`,
     `serial_byte=108`, `gdn_byte=144`). The remaining blocker is now to locate the first non-qkvza batched verify drift before LA layer 1 before
-    any fast replay path can be promoted.
+    any fast replay path can be promoted. Extending the same tape diagnostic through LA0's post-projection stages shows `q_raw/k_raw/v`, repeated
+    `q/k`, GDN output, and gated output norm all match serial, then the first mismatch appears after LA0 `wo` residual
+    (`attn_residual[0]`, `bytes=20480`, `differing_bytes=12020`, `first_offset=0`, `serial_byte=90`, `gdn_byte=95`). The current blocker is
+    therefore the batched HFQ4 residual projection family for LA `wo` versus serial `weight_gemv_residual`, not GDN recurrence, gated norm, or
+    the next layer's RMSNorm input.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

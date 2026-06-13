@@ -15819,6 +15819,18 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let v_row_bytes = tape.v_dim * 4;
+                    let off_v = tape_offset * v_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.attn_out_bufs[delta_layer_idx].buf,
+                        off_v,
+                        &pbs.dn_attn_out_batch.buf,
+                        0,
+                        n * v_row_bytes,
+                    )?;
+                }
+
                 // Batched gated output norm.
                 gpu.gated_norm_f32_batched(
                     &pbs.dn_attn_out_batch,
@@ -15830,6 +15842,18 @@ fn forward_prefill_chunk(
                     config.norm_eps,
                     n,
                 )?;
+
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let v_row_bytes = tape.v_dim * 4;
+                    let off_v = tape_offset * v_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.normed_bufs[delta_layer_idx].buf,
+                        off_v,
+                        &pbs.dn_normed_batch.buf,
+                        0,
+                        n * v_row_bytes,
+                    )?;
+                }
 
                 // Batched wo + residual.
                 //
@@ -15981,6 +16005,18 @@ fn forward_prefill_chunk(
                         layer.wo.m,
                         layer.wo.k,
                         n,
+                    )?;
+                }
+
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    let off_hidden = tape_offset * hidden_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.attn_residual_bufs[delta_layer_idx].buf,
+                        off_hidden,
+                        &pbs.x_batch.buf,
+                        0,
+                        n * hidden_row_bytes,
                     )?;
                 }
 
@@ -16341,6 +16377,18 @@ fn forward_prefill_chunk(
                         layer.w_down.m,
                         layer.w_down.k,
                         n,
+                    )?;
+                }
+
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    let off_hidden = tape_offset * hidden_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.layer_out_bufs[delta_layer_idx].buf,
+                        off_hidden,
+                        &pbs.x_batch.buf,
+                        0,
+                        n * hidden_row_bytes,
                     )?;
                 }
 
@@ -20507,6 +20555,16 @@ fn forward_scratch_layers(
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 LA gdn out", &s.dn_attn_out)?;
                 }
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let v_row_bytes = tape.v_dim * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.attn_out_bufs[delta_layer_idx].buf,
+                        *tape_row * v_row_bytes,
+                        &s.dn_attn_out.buf,
+                        0,
+                        v_row_bytes,
+                    )?;
+                }
 
                 gpu.gated_norm_f32(
                     &s.dn_attn_out,
@@ -20520,10 +20578,30 @@ fn forward_scratch_layers(
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 LA gated norm", &s.dn_normed)?;
                 }
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let v_row_bytes = tape.v_dim * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.normed_bufs[delta_layer_idx].buf,
+                        *tape_row * v_row_bytes,
+                        &s.dn_normed.buf,
+                        0,
+                        v_row_bytes,
+                    )?;
+                }
                 // Fused wo GEMV + residual add: s.x += layer.wo * s.dn_normed
                 weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 LA wo residual", &s.x)?;
+                }
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.attn_residual_bufs[delta_layer_idx].buf,
+                        *tape_row * hidden_row_bytes,
+                        &s.x.buf,
+                        0,
+                        hidden_row_bytes,
+                    )?;
                 }
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
@@ -20693,6 +20771,16 @@ fn forward_scratch_layers(
                 )?;
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 FFN residual", &s.x)?;
+                }
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.layer_out_bufs[delta_layer_idx].buf,
+                        *tape_row * hidden_row_bytes,
+                        &s.x.buf,
+                        0,
+                        hidden_row_bytes,
+                    )?;
                 }
 
                 if let Some(ref rb) = hidden_rb {
