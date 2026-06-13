@@ -207,7 +207,9 @@
     serial accepted-prefix trajectory, or keep multi-step fast replay rejected and limit any future fast path to cases with explicit per-layer
     serial-equivalence evidence. A replay-output check further shows the fast tape's token-major replay recomputes LA0 row-1 `attn_out` to the
     serial value, but the verify-captured `attn_out[0]` row 1 stored in the tape is different; serial recapture plus token-major replay matches.
-    Fast rollback replay remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity evidence.
+    Fast rollback replay is now runtime-rejected for live rollback even when `HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY=0`; rechecking the position-59
+    and position-120 repros with the old fast override set reports `replay_gdn_tape=0` and `replay_full_prefill=47/60`, respectively. The serial
+    AR path remains the only admitted DFlash rollback path until tolerance semantics are tied to final recurrent/logit parity evidence.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

@@ -123,7 +123,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD` | shapes. sub_offset returns a non-owning view; do NOT free these | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:2660` |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:3281` |
 | `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` | Selects behavior from recognized values | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:33` |
-| `HIPFIRE_DFLASH_ROLLBACK_COMPARE` | Diagnostic-only fast GDN-tape rollback replay comparison against serial replay | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:829` |
+| `HIPFIRE_DFLASH_ROLLBACK_COMPARE` | Diagnostic-only fast GDN-tape rollback replay comparison against serial replay; live DFlash rollback remains serial because fast tape replay is not parity-proven | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:829` |
 | `HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL` | Diagnostic-only absolute tolerance for FA raw attention rollback input compare | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:838` |
 | `HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL` | Diagnostic-only absolute tolerance for x_in rollback input compare | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:846` |
 | `HIPFIRE_DFLASH_SEED_ORACLE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:3872` |

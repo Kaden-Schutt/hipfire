@@ -6234,11 +6234,12 @@ pub fn spec_step_dflash(
     // tokens, same as the prior version — re-runs the full target but one
     // batched call instead of (accept+1) sequential decodes.
     // Conservative default while proving rollback parity: replay committed
-    // tokens through the same serial target path as AR. Fast GDN-tape/batched
-    // replay remains available for diagnostics with
-    // HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY=0, but it currently diverges from
-    // AR on the prose parity repro at B=8.
+    // tokens through the same serial target path as AR. Fast GDN-tape replay
+    // remains rejected for live rollback even when
+    // HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY=0 because both one-step
+    // production replay and multi-step fast tape rows still lack parity.
     let force_serial_rollback = dflash_force_serial_rollback_replay_from_env();
+    let force_serial_rollback = force_serial_rollback || gdn_tape_opt.is_some();
     let rollback_replay = if force_serial_rollback {
         for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
             qwen35::forward_scratch(
