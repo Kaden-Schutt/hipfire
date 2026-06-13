@@ -194,8 +194,11 @@
     position-120 repro still mismatches at `s_matrix[0]` with huge magnitude while LA0 `q/k/v/alpha/beta`, serial-tape replay inputs, and
     serial-tape layer state all match. That rules out the simple batched-vs-per-token kernel cadence as a complete explanation. The next cut is
     comparing the fast verify post-GDN state snapshot immediately after LA0 against the serial-tape post-LA0 state, including Q8 scale buffers and
-    the debug requant frame counter, to determine whether verify writes a different Q8 state representation before later layers run. Fast rollback
-    replay remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity evidence.
+    the debug requant frame counter, to determine whether verify writes a different Q8 state representation before later layers run. That fast-tape
+    LA0 state probe now shows matching fused outputs, matching GDN inputs, and matching frame counters, with only a single tiny byte drift in
+    `s_matrix[3]` (`max_abs=6.79251602e-18`), while production fast rollback still diverges massively at `s_matrix[0]`. The next blocker is the
+    production `tape.replay_gdn` state update path or its order/frame interaction, not the fast-tape LA0 projection inputs. Fast rollback replay
+    remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity evidence.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
