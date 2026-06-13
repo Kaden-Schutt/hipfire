@@ -66,11 +66,6 @@ import {
   type GenerateBatchPrefillCapability,
 } from "./generate_batch_prefill_protocol";
 import {
-  acquireResourceLease,
-  buildServeResourceLocks,
-  parseCpuCoreList,
-} from "./resource_lock";
-import {
   buildPrefillBatchHealthPayload,
   buildBatchHealthPayload,
   type PrefillBatchHealthInputs,
@@ -1907,7 +1902,6 @@ function isQwen35RuntimeArch(arch: string | null): boolean {
 
 async function serve(port: number, host: string) {
   applyConfigEnv(cfg);
-  let resourceLease: Awaited<ReturnType<typeof acquireResourceLease>> | null = null;
   // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
   // Cleanup on normal exit; stale PID on crash is tolerated (isPidAlive catches it).
   // HIPFIRE_NO_PID_FILE=1 suppresses the write — used by `hipfire chat` when it
@@ -1917,22 +1911,16 @@ async function serve(port: number, host: string) {
     if (!ownsPidFile) return;
     try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
   };
-  const cleanupResourceLease = () => {
-    try { resourceLease?.release(); } catch {}
-    resourceLease = null;
-  };
   let serveEngine: Engine | null = null;
   let shuttingDown = false;
   const shutdown = async (code: number) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    cleanupResourceLease();
     cleanupPid();
     try { await serveEngine?.stop(); } catch {}
     process.exit(code);
   };
   process.on("exit", () => {
-    cleanupResourceLease();
     cleanupPid();
   });
   process.on("SIGTERM", () => { void shutdown(0); });
@@ -1941,23 +1929,6 @@ async function serve(port: number, host: string) {
   const acceleratorInventory = detectAcceleratorInventory();
   const serverAcceleratorKind = "hip";
   const serverDeviceId = acceleratorInventory.hip_gpus[0]?.id ?? 0;
-  // HIPFIRE_RESOURCE_LOCK=0 disables startup resource leases.
-  // HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds per-core CPU leases.
-  // HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy leases instead of failing fast.
-  // HIPFIRE_RESOURCE_LOCK_NPUS=1 also leases detected NPU accelerators.
-  if (process.env.HIPFIRE_RESOURCE_LOCK !== "0") {
-    const cpuCores = parseCpuCoreList(process.env.HIPFIRE_RESOURCE_LOCK_CPU_CORES);
-    const waitMs = Number.parseInt(process.env.HIPFIRE_RESOURCE_LOCK_WAIT_MS ?? "0", 10) || 0;
-    const lockRequests = buildServeResourceLocks({
-      hipGpuIds: [serverDeviceId],
-      npuIds: (process.env.HIPFIRE_RESOURCE_LOCK_NPUS === "1"
-        ? acceleratorInventory.npus.map((npu) => npu.id)
-        : []),
-      cpuCores,
-    });
-    resourceLease = await acquireResourceLease(lockRequests, { waitMs });
-    console.error(`[hipfire] resource locks acquired: ${resourceLease.resources.join(", ")}`);
-  }
   if (ownsPidFile) {
     try {
       require("fs").writeFileSync(SERVE_PID_FILE, String(process.pid));

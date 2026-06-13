@@ -13,7 +13,7 @@ For detailed notices, project operating guides, and testing playbooks, see the c
 - **Model/runtime evidence belongs in `hipfire-eval`.** When adding or repairing speed, coherence, DFlash/DDTree/Path C, PFlash, agentic/tool-call, long-context, quality, or server-runtime admission tests, add or update `hipfire-eval` batteries/suites first. Keep shell gates only as enforcement wrappers where they still provide baseline comparison or hook integration.
 - **Prompt structure dictates τ.** ALWAYS use byte-identical prompts via `benchmarks/prompts/*.txt`.
 - **Run the no-GPU subset.** `./tests/no-gpu-ci.sh` before handing off workflow-only changes.
-- **GPU Lock Protocol:** Coordinate GPU access through `gpu-lock.sh` (`source gpu-lock.sh && gpu_acquire "<branch>"`).
+- **Resource Lock Protocol:** `hipfire-daemon` acquires `/tmp/hipfire-resource-locks/*.lock` leases before HIP init. Use `HIPFIRE_RESOURCE_LOCK_WAIT_MS` to wait for busy GPU/NPU/CPU leases; legacy shell gates may still wrap `scripts/gpu-lock.sh`.
 
 ## Skills (`docs/skills/`)
 Reusable how-tos live in `docs/skills/` to keep this root file focused. Reach for it by name when the situation matches.

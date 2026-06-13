@@ -515,18 +515,27 @@ matches. Index of currently-available skills:
 When adding a new skill, give it a one-line index entry here so future
 sessions find it without grepping.
 
-## GPU Lock Protocol (Multi-Agent)
+## Resource Lock Protocol (Multi-Agent)
 
-When multiple agents work in parallel (e.g. via worktrees), they coordinate
-GPU access through `gpu-lock.sh`. **This is enforced automatically via hooks in
-`.claude/settings.json`** — any `cargo` command triggers lock acquire before execution
-and release after completion.
+`hipfire-daemon` acquires runtime leases before HIP initialization, so normal
+`hipfire serve`, daemon JSONL, and `--precompile` startups contend in-process
+instead of relying on a shell-only GPU mutex.
 
-- Lock file: `/tmp/hipfire-gpu.lock`
-- Contains a human-readable status like `model-ingestion agent is using the gpu`
-- Agents poll every 5s (configurable via `GPU_POLL_INTERVAL`) when the GPU is busy
-- Manual usage: `source gpu-lock.sh && gpu_acquire "<branch>" && gpu_release`
-- Check status: `source gpu-lock.sh && gpu_status`
+- Lock root: `/tmp/hipfire-resource-locks` by default
+- Lock shape: one directory per scoped resource, e.g. `hip-gpu-0.lock`,
+  `npu-accel0.lock`, `cpu-core-3.lock`
+- Owner metadata: each lock contains `owner.json` with PID, host, command,
+  timestamp, and resource name
+- Stale lock handling: dead-PID owners are reclaimed automatically
+- Wait behavior: set `HIPFIRE_RESOURCE_LOCK_WAIT_MS=<ms>` to wait for busy
+  resources instead of failing fast
+- Scope controls: `HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4` adds CPU-core
+  leases; `HIPFIRE_RESOURCE_LOCK_NPUS=1` leases detected NPUs, or set a comma
+  list of explicit NPU IDs
+- Bypass: `HIPFIRE_RESOURCE_LOCK=0`
+
+Legacy test gates may still wrap `scripts/gpu-lock.sh`, but daemon startup is
+the canonical runtime lock.
 
 ---
 
