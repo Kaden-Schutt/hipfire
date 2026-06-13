@@ -15855,6 +15855,18 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    let off_hidden = tape_offset * hidden_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.wo_residual_in_bufs[delta_layer_idx].buf,
+                        off_hidden,
+                        &pbs.x_batch.buf,
+                        0,
+                        n * hidden_row_bytes,
+                    )?;
+                }
+
                 // Batched wo + residual.
                 //
                 // For MQ weights, the decode path's weight_gemv_residual
@@ -20586,6 +20598,16 @@ fn forward_scratch_layers(
                         &s.dn_normed.buf,
                         0,
                         v_row_bytes,
+                    )?;
+                }
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.wo_residual_in_bufs[delta_layer_idx].buf,
+                        *tape_row * hidden_row_bytes,
+                        &s.x.buf,
+                        0,
+                        hidden_row_bytes,
                     )?;
                 }
                 // Fused wo GEMV + residual add: s.x += layer.wo * s.dn_normed

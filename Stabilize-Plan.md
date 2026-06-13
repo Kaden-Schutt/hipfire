@@ -118,7 +118,9 @@
     the next layer's RMSNorm input. Follow-up diagnostics did not clear that boundary: `HIPFIRE_HFQ4G256_MMQ_GFX1151=0` still reports the same
     `attn_residual[0]` mismatch, and a local per-row `weight_gemv_residual` experiment for the whole HFQ4 residual chunk also kept the first
     mismatch at `attn_residual[0]` while degrading output quality. The next cut should compare the residual input and residual destination rows
-    immediately before the `wo` call, not swap residual kernels.
+    immediately before the `wo` call, not swap residual kernels. Adding that `wo_residual_in` tape point confirms the destination residual row
+    also matches serial immediately before LA0 `wo`; the first mismatch remains `attn_residual[0]`. That leaves the MQ4 `wo` projection output or
+    fused residual epilogue itself as the active blocker.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
