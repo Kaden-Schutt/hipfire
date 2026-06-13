@@ -826,6 +826,10 @@ fn dflash_force_serial_rollback_replay_from_env() -> bool {
     )
 }
 
+fn dflash_force_serial_rollback_replay(env_force_serial: bool, gdn_tape_available: bool) -> bool {
+    env_force_serial || gdn_tape_available
+}
+
 fn dflash_compare_rollback_replay_from_env() -> bool {
     matches!(
         std::env::var("HIPFIRE_DFLASH_ROLLBACK_COMPARE")
@@ -6238,8 +6242,10 @@ pub fn spec_step_dflash(
     // remains rejected for live rollback even when
     // HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY=0 because both one-step
     // production replay and multi-step fast tape rows still lack parity.
-    let force_serial_rollback = dflash_force_serial_rollback_replay_from_env();
-    let force_serial_rollback = force_serial_rollback || gdn_tape_opt.is_some();
+    let force_serial_rollback = dflash_force_serial_rollback_replay(
+        dflash_force_serial_rollback_replay_from_env(),
+        gdn_tape_opt.is_some(),
+    );
     let rollback_replay = if force_serial_rollback {
         for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
             qwen35::forward_scratch(
@@ -8743,6 +8749,14 @@ mod tests {
         unsafe {
             std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY");
         }
+    }
+
+    #[test]
+    fn dflash_live_rollback_rejects_fast_tape_replay() {
+        assert!(dflash_force_serial_rollback_replay(false, true));
+        assert!(dflash_force_serial_rollback_replay(true, true));
+        assert!(dflash_force_serial_rollback_replay(true, false));
+        assert!(!dflash_force_serial_rollback_replay(false, false));
     }
 
     #[test]
