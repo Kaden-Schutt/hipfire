@@ -290,7 +290,26 @@
     prose/code AR parity OK, live rollback remains conservative (`replay_gdn_tape=0`, full-prefill replay 92/5), verify graph capture is active
     (`direct=0`), the prose 8-step next-logit diagnostic has zero argmax mismatches, and the run-level fast-replay admission summary remains
     `rejected` with `fast_replay_recurrent_state_mismatch`. This keeps the admitted live path conservative while making the remaining fast-replay
-    blocker machine-readable at run scope.
+    blocker machine-readable at run scope. Fresh follow-up evidence on the committed checkout (`af6c96b8`) keeps the same shape:
+    `/tmp/coherence-dflash-20260613-173157.md` plus `/tmp/coherence-dflash-20260613-173157.dflash_trace.json` passed with prose/code AR parity OK,
+    `replay_gdn_tape=0`, verify graph `direct=0`, prose 8-step next-logit compare with zero argmax mismatches, and
+    `rollback_fast_replay_admission_summary.status="rejected"`. The `dflash_trace.json` sidecar now records a top-level `run_config` object with
+    the DFlash rollback, verify-graph, trace-position, tolerance, and projection-control environment toggles used for the run, so default production
+    evidence and failed promotion/control evidence can be audited without reconstructing shell command history. The all-projection-fast-off control
+    (`HIPFIRE_HFQ4_QKV_FAST=0 HIPFIRE_HFQ4_QKVZA_FAST=0 HIPFIRE_HFQ4_GATE_UP_FAST=0 HIPFIRE_HFQ4_RESIDUAL_FAST=0` plus the existing FA/input
+    tolerances) is still not admissible as production policy: `/tmp/coherence-dflash-20260613-172921.md` failed prose AR parity at token 154 even
+    though live rollback stayed serial (`replay_gdn_tape=0`), and fast replay admission was still `rejected` on final recurrent-state drift
+    (`s_matrix[4]`, two differing bytes but very large decoded magnitude). The next useful fast-rollback cut remains eliminating or bounding the
+    tiny FA/raw-hidden drift all the way through recurrent and logit parity; disabling fast projection families is diagnostic only.
+    Fresh forced-serial structured evidence, `/tmp/coherence-dflash-20260613-174431.md` plus
+    `/tmp/coherence-dflash-20260613-174431.dflash_trace.json`, keeps prose/code AR parity passing while live rollback remains conservative
+    (`replay_gdn_tape=0`, full-prefill replay 92/5). The new `rollback_input_compare` sidecar field preserves the upstream tape-input split:
+    at position 120, serial recapture and verify tape differ first at raw `qkv index=0` (`max_abs=7.38525391e-3`) and then at replay-critical
+    `gdn_q index=0` (`max_abs=1.89878047e-5`). The new `rollback_fast_token_major_compare` field shows token-major replay matches the captured
+    tape `attn_out` and matches production `tape.replay_gdn`, but both still mismatch serial at `s_matrix[0]`
+    (`max_abs=2.53553992e38`). That rules out replay order as the current promotion fix: the active blocker is verify-tape accepted-prefix input
+    parity, and fast GDN-tape rollback remains diagnostic-only until the captured rows are serial-equivalent or a bounded recurrent/logit admission
+    policy is proven.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

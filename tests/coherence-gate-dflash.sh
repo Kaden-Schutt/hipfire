@@ -208,7 +208,39 @@ AR_PARITY="${HIPFIRE_DFLASH_AR_PARITY:-0}"
     echo "failure mode in commit 6c84b13)."
     echo
 } > "$OUT"
-printf '{"kind":"dflash_trace","records":[\n' > "$TRACE_JSON_OUT"
+run_mode="$( [ "$FAST" -eq 1 ] && echo fast || ( [ "$FULL" -eq 1 ] && echo full || echo short ) )"
+run_config_json=$(python3 - "$run_mode" <<'PYEOF'
+import json
+import os
+import sys
+
+keys = [
+    "HIPFIRE_DFLASH_AR_PARITY",
+    "HIPFIRE_DFLASH_ROLLBACK_COMPARE",
+    "HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS",
+    "HIPFIRE_DFLASH_TRACE_POSITION",
+    "HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN",
+    "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY",
+    "HIPFIRE_VERIFY_GRAPH",
+    "HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL",
+    "HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL",
+    "HIPFIRE_HFQ4_QKV_FAST",
+    "HIPFIRE_HFQ4_QKVZA_FAST",
+    "HIPFIRE_HFQ4_GATE_UP_FAST",
+    "HIPFIRE_HFQ4_RESIDUAL_FAST",
+    "HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP",
+    "HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS",
+    "HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP",
+    "HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP",
+]
+
+print(json.dumps({
+    "mode": sys.argv[1],
+    "env": {key: os.environ[key] for key in keys if key in os.environ},
+}, sort_keys=True))
+PYEOF
+)
+printf '{"kind":"dflash_trace","run_config":%s,"records":[\n' "$run_config_json" > "$TRACE_JSON_OUT"
 trace_json_records=0
 
 append_trace_json_record() {
@@ -584,6 +616,201 @@ print(json.dumps(payload, sort_keys=True))
 PYEOF
 )
 
+ROLLBACK_INPUT_COMPARE_PY=$(cat <<'PYEOF'
+import sys, re, json, math
+if len(sys.argv) != 2:
+    print(json.dumps({"ok": False, "reason": "usage"}))
+    sys.exit(0)
+out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+
+frame_pattern = re.compile(
+    r"^\[dflash-rollback-forced-serial-input-frame-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) "
+    r"serial_start=(\d+) serial_end=(\d+) capture_end=(\d+)$",
+    re.MULTILINE,
+)
+match_pattern = re.compile(
+    r"^\[(dflash-rollback-(?:input|gdn-input-all)-compare)\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?match$",
+    re.MULTILINE,
+)
+mismatch_pattern = re.compile(
+    r"^\[(dflash-rollback-(?:input|gdn-input-all)-compare)\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?"
+    r"mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) "
+    r"differing_bytes=(\d+) first_offset=(\d+) serial_byte=(\d+) gdn_byte=(\d+)(.*)$",
+    re.MULTILINE,
+)
+
+def parse_context(context):
+    parsed = {}
+    if not context:
+        return parsed
+    for key, raw in re.findall(r"\b([A-Za-z0-9_]+)=([+\-0-9.eE]+|NaN|nan|inf|-inf)", context):
+        if key in {"f32_words", "f32_bit_diff_words"}:
+            parsed[key] = int(raw)
+        else:
+            value = float(raw)
+            parsed[key] = value if math.isfinite(value) else raw
+    return parsed
+
+checks = {}
+for m in match_pattern.finditer(out):
+    label = m.group(1).removeprefix("dflash-rollback-").removesuffix("-compare")
+    checks[label] = {
+        "ok": True,
+        "pos": int(m.group(2)),
+        "accepted": int(m.group(3)),
+        "replay_steps": int(m.group(4)),
+    }
+
+for m in mismatch_pattern.finditer(out):
+    label = m.group(1).removeprefix("dflash-rollback-").removesuffix("-compare")
+    context = m.group(12).strip() or None
+    checks[label] = {
+        "ok": False,
+        "pos": int(m.group(2)),
+        "accepted": int(m.group(3)),
+        "replay_steps": int(m.group(4)),
+        "family": m.group(5),
+        "index": int(m.group(6)),
+        "bytes": int(m.group(7)),
+        "differing_bytes": int(m.group(8)),
+        "first_offset": int(m.group(9)),
+        "serial_byte": int(m.group(10)),
+        "gdn_byte": int(m.group(11)),
+        "context": context,
+        "stats": parse_context(context),
+    }
+
+frames = [
+    {
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+        "serial_start": int(m.group(4)),
+        "serial_end": int(m.group(5)),
+        "capture_end": int(m.group(6)),
+    }
+    for m in frame_pattern.finditer(out)
+]
+
+payload = {
+    "ok": all(check.get("ok", False) for check in checks.values()),
+    "checked": len(checks),
+    "frames": frames,
+    "checks": checks,
+}
+for label, check in checks.items():
+    if not check.get("ok", False):
+        payload["reason"] = f"rollback_{label}_mismatch"
+        first = dict(check)
+        first["check"] = label
+        payload["first_mismatch"] = first
+        break
+print(json.dumps(payload, sort_keys=True))
+PYEOF
+)
+
+ROLLBACK_FAST_TOKEN_MAJOR_COMPARE_PY=$(cat <<'PYEOF'
+import sys, re, json, math
+if len(sys.argv) != 2:
+    print(json.dumps({"ok": False, "reason": "usage"}))
+    sys.exit(0)
+out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+
+frame_pattern = re.compile(
+    r"^\[dflash-rollback-fast-token-major-frame-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?"
+    r"serial_start=(\d+) serial_end=(\d+) replay_end=(\d+)$",
+    re.MULTILINE,
+)
+match_pattern = re.compile(
+    r"^\[(dflash-rollback-fast-token-major-(?:attn-out|serial|vs-production)-compare)\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?match$",
+    re.MULTILINE,
+)
+mismatch_pattern = re.compile(
+    r"^\[(dflash-rollback-fast-token-major-(?:attn-out|serial|vs-production)-compare)\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?"
+    r"(?:step=(\d+) )?mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) "
+    r"differing_bytes=(\d+) first_offset=(\d+) "
+    r"(?:replay_byte|serial_byte|fast_token_major_byte)=(\d+) "
+    r"(?:tape_byte|fast_token_major_byte|production_byte)=(\d+)(.*)$",
+    re.MULTILINE,
+)
+
+def parse_context(context):
+    parsed = {}
+    if not context:
+        return parsed
+    for key, raw in re.findall(r"\b([A-Za-z0-9_]+)=([+\-0-9.eE]+|NaN|nan|inf|-inf)", context):
+        if key in {"f32_words", "f32_bit_diff_words"}:
+            parsed[key] = int(raw)
+        else:
+            value = float(raw)
+            parsed[key] = value if math.isfinite(value) else raw
+    return parsed
+
+checks = {}
+for m in match_pattern.finditer(out):
+    label = m.group(1).removeprefix("dflash-rollback-fast-token-major-").removesuffix("-compare")
+    checks[label] = {
+        "ok": True,
+        "pos": int(m.group(2)),
+        "accepted": int(m.group(3)),
+        "replay_steps": int(m.group(4)),
+    }
+
+for m in mismatch_pattern.finditer(out):
+    label = m.group(1).removeprefix("dflash-rollback-fast-token-major-").removesuffix("-compare")
+    context = m.group(13).strip() or None
+    checks[label] = {
+        "ok": False,
+        "pos": int(m.group(2)),
+        "accepted": int(m.group(3)),
+        "replay_steps": int(m.group(4)),
+        "step": None if m.group(5) is None else int(m.group(5)),
+        "family": m.group(6),
+        "index": int(m.group(7)),
+        "bytes": int(m.group(8)),
+        "differing_bytes": int(m.group(9)),
+        "first_offset": int(m.group(10)),
+        "actual_byte": int(m.group(11)),
+        "expected_byte": int(m.group(12)),
+        "context": context,
+        "stats": parse_context(context),
+    }
+
+frames = [
+    {
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+        "serial_start": int(m.group(4)),
+        "serial_end": int(m.group(5)),
+        "replay_end": int(m.group(6)),
+    }
+    for m in frame_pattern.finditer(out)
+]
+
+checked = len(checks)
+payload = {
+    "ok": checked > 0 and all(check.get("ok", False) for check in checks.values()),
+    "checked": checked,
+    "frames": frames,
+    "checks": checks,
+}
+if checked == 0:
+    payload["ok"] = True
+if checked and not payload["ok"]:
+    first_label, first = next((k, v) for k, v in checks.items() if not v.get("ok", False))
+    payload["reason"] = f"fast_token_major_{first_label}_mismatch"
+    payload["first_mismatch"] = {"check": first_label, **first}
+print(json.dumps(payload, sort_keys=True))
+PYEOF
+)
+
 ROLLBACK_FAST_REPLAY_ADMISSION_PY=$(cat <<'PYEOF'
 import sys, json
 if len(sys.argv) != 3:
@@ -699,6 +926,8 @@ for entry in "${tests[@]}"; do
     verify_graph="not_checked"
     rollback_logit_compare="not_checked"
     rollback_state_compare="not_checked"
+    rollback_input_compare="not_checked"
+    rollback_fast_token_major_compare="not_checked"
     rollback_fast_replay_admission="not_checked"
     if [ "$AR_PARITY" = "1" ] && [ "$mode" = "dflash" ]; then
         rollback_replay=$(python3 -c "$ROLLBACK_REPLAY_PY" "$out_file")
@@ -720,14 +949,16 @@ for entry in "${tests[@]}"; do
             hard_errors=$((hard_errors + 1))
         fi
         rollback_state_compare=$(python3 -c "$ROLLBACK_STATE_COMPARE_PY" "$out_file")
+        rollback_input_compare=$(python3 -c "$ROLLBACK_INPUT_COMPARE_PY" "$out_file")
+        rollback_fast_token_major_compare=$(python3 -c "$ROLLBACK_FAST_TOKEN_MAJOR_COMPARE_PY" "$out_file")
         rollback_fast_replay_admission=$(python3 -c "$ROLLBACK_FAST_REPLAY_ADMISSION_PY" "$rollback_logit_compare" "$rollback_state_compare")
     fi
 
     if [ "$mode" = "dflash" ]; then
-        record_json=$(python3 - "$label" "$mode" "$status" "$detect" "$parity" "$rollback_replay" "$rollback_logit_compare" "$rollback_state_compare" "$rollback_fast_replay_admission" "$verify_graph" "$wall" <<'PYEOF'
+        record_json=$(python3 - "$label" "$mode" "$status" "$detect" "$parity" "$rollback_replay" "$rollback_logit_compare" "$rollback_state_compare" "$rollback_input_compare" "$rollback_fast_token_major_compare" "$rollback_fast_replay_admission" "$verify_graph" "$wall" <<'PYEOF'
 import json, sys
 
-label, mode, status, detect, parity, rollback_replay, rollback_logit, rollback_state, admission, verify_graph, wall = sys.argv[1:]
+label, mode, status, detect, parity, rollback_replay, rollback_logit, rollback_state, rollback_input, token_major, admission, verify_graph, wall = sys.argv[1:]
 
 def decode(value):
     if value in {"not_checked", "not_requested"}:
@@ -745,6 +976,8 @@ metrics = {
     "rollback_replay": decode(rollback_replay),
     "rollback_logit_compare": decode(rollback_logit),
     "rollback_state_compare": decode(rollback_state),
+    "rollback_input_compare": decode(rollback_input),
+    "rollback_fast_token_major_compare": decode(token_major),
     "rollback_fast_replay_admission": decode(admission),
     "verify_graph": decode(verify_graph),
 }
@@ -768,6 +1001,8 @@ PYEOF
         echo "- rollback_replay: \`$rollback_replay\`"
         echo "- rollback_logit_compare: \`$rollback_logit_compare\`"
         echo "- rollback_state_compare: \`$rollback_state_compare\`"
+        echo "- rollback_input_compare: \`$rollback_input_compare\`"
+        echo "- rollback_fast_token_major_compare: \`$rollback_fast_token_major_compare\`"
         echo "- rollback_fast_replay_admission: \`$rollback_fast_replay_admission\`"
         echo "- verify_graph: \`$verify_graph\`"
         if [ -n "$stats" ]; then
