@@ -731,6 +731,7 @@ pub enum SpecRollbackReplayKind {
     BatchedPrefill,
     FullPrefill,
     PrefixVerify,
+    SerialTape,
     VerifyComplete,
 }
 
@@ -741,6 +742,7 @@ impl SpecRollbackReplayKind {
             Self::BatchedPrefill => "batched_prefill",
             Self::FullPrefill => "full_prefill",
             Self::PrefixVerify => "prefix_verify",
+            Self::SerialTape => "serial_tape",
             Self::VerifyComplete => "verify_complete",
         }
     }
@@ -899,6 +901,20 @@ fn dflash_force_serial_rollback_replay(env_force_serial: bool, gdn_tape_availabl
 fn dflash_prefix_verify_rollback_replay_from_env() -> bool {
     matches!(
         std::env::var("HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+    )
+}
+
+/// `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=1` — opt in to capturing the
+/// committed prefix through the serial target path, then committing DN state
+/// through `GdnTape::replay_gdn` instead of trusting the serial/full-prefill
+/// DN result directly. Still conservative, but it proves the live rollback
+/// commit can be tape-based when fed serial-equivalent tape rows.
+fn dflash_serial_tape_rollback_replay_from_env() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE")
             .ok()
             .as_deref(),
         Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
@@ -7034,6 +7050,37 @@ pub fn spec_step_dflash(
         )?;
         prefix_tape.free_gpu(gpu);
         SpecRollbackReplayKind::PrefixVerify
+    } else if dflash_serial_tape_rollback_replay_from_env() && gdn_tape_opt.is_some() {
+        let replay_tokens = &committed[..accept_len + 1];
+        let serial_frame_start = gpu.debug_gdn_requant_frame();
+        let mut serial_tape = GdnTape::new_for_config(gpu, &target.config, replay_tokens.len())?;
+        for (i, &tok) in replay_tokens.iter().enumerate() {
+            qwen35::forward_scratch_capture_gdn_tape(
+                gpu,
+                &target.weights,
+                &target.config,
+                tok,
+                position + i,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                &mut serial_tape,
+                i,
+            )?;
+        }
+        let serial_frame_end = gpu.debug_gdn_requant_frame();
+        target_snap.restore_to(&mut target.dn_state, gpu)?;
+        gpu.debug_set_gdn_requant_frame(serial_frame_start);
+        serial_tape.replay_gdn(
+            gpu,
+            &target.weights,
+            &target.config,
+            &mut target.dn_state,
+            replay_tokens.len(),
+        )?;
+        gpu.debug_set_gdn_requant_frame(serial_frame_end);
+        serial_tape.free_gpu(gpu);
+        SpecRollbackReplayKind::SerialTape
     } else if force_serial_rollback {
         let serial_frame_start = gpu.debug_gdn_requant_frame();
         for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
@@ -10259,6 +10306,30 @@ mod tests {
     }
 
     #[test]
+    fn dflash_serial_tape_rollback_replay_is_opt_in() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE");
+        }
+        assert!(!dflash_serial_tape_rollback_replay_from_env());
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE", "1");
+        }
+        assert!(dflash_serial_tape_rollback_replay_from_env());
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE", "true");
+        }
+        assert!(dflash_serial_tape_rollback_replay_from_env());
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE", "0");
+        }
+        assert!(!dflash_serial_tape_rollback_replay_from_env());
+        unsafe {
+            std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE");
+        }
+    }
+
+    #[test]
     fn dflash_rollback_compare_is_opt_in_diagnostic() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -10335,6 +10406,7 @@ mod tests {
             SpecRollbackReplayKind::PrefixVerify.as_str(),
             "prefix_verify"
         );
+        assert_eq!(SpecRollbackReplayKind::SerialTape.as_str(), "serial_tape");
         assert_eq!(
             SpecRollbackReplayKind::VerifyComplete.as_str(),
             "verify_complete"

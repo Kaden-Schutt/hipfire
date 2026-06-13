@@ -458,6 +458,12 @@
     `differing_bytes=11921`, `max_abs=8.83549452e-4`, and `mean_abs=1.68811166e-4`. The replacement path therefore cannot stop at repairing
     layer-0 qkvza rows; it must either make the verify layer outputs feed serial-equivalent `x_in` to later LA layers, or repair/admit the whole
     per-layer tape chain before enabling live fast GDN rollback.
+    Two non-full-prefill rollback candidates are now explicitly rejected by the same AR-parity gate. The committed-prefix verify path,
+    `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY=1`, removed full-prefill rollback (`replay_prefix_verify=38`, `replay_full_prefill=0`) but failed
+    prose AR parity at token 14 and fell into a repetition attractor (`/tmp/coherence-dflash-20260613-205741.md`). A serial-source tape commit
+    candidate, `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=1`, also removed full-prefill rollback (`replay_serial_tape=83`, `replay_full_prefill=0`)
+    but failed prose AR parity at token 62 (`/tmp/coherence-dflash-20260613-210131.md`). Both paths remain opt-in diagnostics; neither can replace
+    conservative live rollback until it passes strict AR parity on prose and code.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

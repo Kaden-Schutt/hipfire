@@ -384,7 +384,7 @@ if len(sys.argv) != 2:
     sys.exit(0)
 out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
 m = re.search(
-    r"^rollback_parity: .*replay_gdn_tape=(\d+)(?: replay_batched_prefill=(\d+))? replay_full_prefill=(\d+)(?: replay_prefix_verify=(\d+))?(?: replay_verify_complete=(\d+))?",
+    r"^rollback_parity: .*replay_gdn_tape=(\d+)(?: replay_batched_prefill=(\d+))? replay_full_prefill=(\d+)(?: replay_prefix_verify=(\d+))?(?: replay_serial_tape=(\d+))?(?: replay_verify_complete=(\d+))?",
     out,
     re.MULTILINE,
 )
@@ -395,7 +395,8 @@ gdn = int(m.group(1))
 batched = int(m.group(2) or 0)
 full = int(m.group(3))
 prefix_verify = int(m.group(4) or 0)
-verify_complete = int(m.group(5) or 0)
+serial_tape = int(m.group(5) or 0)
+verify_complete = int(m.group(6) or 0)
 if gdn != 0:
     print(json.dumps({
         "ok": False,
@@ -404,9 +405,10 @@ if gdn != 0:
         "replay_batched_prefill": batched,
         "replay_full_prefill": full,
         "replay_prefix_verify": prefix_verify,
+        "replay_serial_tape": serial_tape,
         "replay_verify_complete": verify_complete,
     }))
-elif batched + full + prefix_verify + verify_complete <= 0:
+elif batched + full + prefix_verify + serial_tape + verify_complete <= 0:
     print(json.dumps({
         "ok": False,
         "reason": "missing_admitted_rollback_replay",
@@ -414,6 +416,7 @@ elif batched + full + prefix_verify + verify_complete <= 0:
         "replay_batched_prefill": batched,
         "replay_full_prefill": full,
         "replay_prefix_verify": prefix_verify,
+        "replay_serial_tape": serial_tape,
         "replay_verify_complete": verify_complete,
     }))
 else:
@@ -423,6 +426,7 @@ else:
         "replay_batched_prefill": batched,
         "replay_full_prefill": full,
         "replay_prefix_verify": prefix_verify,
+        "replay_serial_tape": serial_tape,
         "replay_verify_complete": verify_complete,
     }))
 PYEOF
