@@ -492,6 +492,18 @@ Latest rollback diagnostic evidence:
   between the serial capture route
   (`forward_scratch_capture_gdn_tape:fused_qkvza`) and the verify route
   (`verify_dflash_block:gemm_qkvza`).
+- `/tmp/coherence-dflash-20260614-004628.md` fixed the diagnostic
+  replay to preserve raw gate captures by copying raw alpha/beta into
+  scratch before the in-place fused gate+conv kernel. With that fix,
+  prose and code still passed AR parity, all `serial_self_checks` and
+  `serial_tape_x_in_checks` matched, and every row-aware single-row
+  fused recompute matched (`single_row_checks.ok=true`). The remaining
+  qkvza route mismatch is now isolated to batched `gemm_qkvza` versus
+  serial `fused_qkvza` at LA0 `qkv`, `first_offset=0`, after exact
+  captured `x_in`. Fast replay admission still rejects on
+  `projection_family_mismatch`, recurrent-state mismatch, and missing
+  logit compare; dense DFlash still keeps verify graph default-on with
+  `direct=0`.
 - `/tmp/coherence-dflash-20260614-003019.md` repeated the row-aware
   diagnostic with `HIPFIRE_HFQ4_QKVZA_FAST=0`. Prose hard-failed AR
   parity at token 62 and the qkvza route mismatch persisted, changing

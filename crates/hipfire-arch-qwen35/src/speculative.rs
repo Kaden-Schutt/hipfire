@@ -1990,6 +1990,8 @@ pub struct GdnTape {
     pub v_scratch: GpuTensor,     // [max_n × v_dim]
     pub q_scratch: GpuTensor,     // [max_n × v_dim] (post repeat-interleave)
     pub k_scratch: GpuTensor,     // [max_n × v_dim]
+    pub alpha_scratch: GpuTensor, // [max_n × n_v_heads]
+    pub beta_scratch: GpuTensor,  // [max_n × n_v_heads]
     pub attn_scratch: GpuTensor,  // [max_n × v_dim]
 }
 
@@ -2174,6 +2176,8 @@ impl GdnTape {
             v_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
             q_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
             k_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+            alpha_scratch: gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?,
+            beta_scratch: gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?,
             attn_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
         })
     }
@@ -2222,6 +2226,8 @@ impl GdnTape {
         let _ = gpu.free_tensor(self.v_scratch);
         let _ = gpu.free_tensor(self.q_scratch);
         let _ = gpu.free_tensor(self.k_scratch);
+        let _ = gpu.free_tensor(self.alpha_scratch);
+        let _ = gpu.free_tensor(self.beta_scratch);
         let _ = gpu.free_tensor(self.attn_scratch);
     }
 }
@@ -2496,6 +2502,8 @@ impl GdnTapeShards {
                 v_scratch: g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
                 q_scratch: g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
                 k_scratch: g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+                alpha_scratch: g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?,
+                beta_scratch: g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?,
                 attn_scratch: g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
             });
         }
@@ -4253,11 +4261,27 @@ impl GdnTape {
 
             for step in 0..n_steps {
                 let qkv = self.qkv_bufs[la_idx].sub_offset(step * self.qkv_dim, self.qkv_dim);
-                let alpha = self.alpha_raw_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
-                let beta = self.beta_raw_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
+                let alpha = self.alpha_scratch.sub_offset(step * n_v_heads, n_v_heads);
+                let beta = self.beta_scratch.sub_offset(step * n_v_heads, n_v_heads);
                 let q_raw = self.q_raw_scratch.sub_offset(step * k_dim, k_dim);
                 let k_raw = self.k_raw_scratch.sub_offset(step * k_dim, k_dim);
                 let v = self.v_scratch.sub_offset(step * v_dim, v_dim);
+                let gate_offset_bytes = step * n_v_heads * 4;
+                let gate_row_bytes = n_v_heads * 4;
+                gpu.hip.memcpy_dtod_at(
+                    &alpha.buf,
+                    0,
+                    &self.alpha_raw_bufs[la_idx].buf,
+                    gate_offset_bytes,
+                    gate_row_bytes,
+                )?;
+                gpu.hip.memcpy_dtod_at(
+                    &beta.buf,
+                    0,
+                    &self.beta_raw_bufs[la_idx].buf,
+                    gate_offset_bytes,
+                    gate_row_bytes,
+                )?;
                 gpu.fused_sigmoid_alpha_gate_conv1d_silu_split_f32(
                     &beta,
                     &alpha,
@@ -4300,13 +4324,13 @@ impl GdnTape {
                     ),
                     (
                         "fused_alpha",
-                        &self.alpha_raw_bufs[la_idx].buf,
+                        &self.alpha_scratch.buf,
                         &self.alpha_bufs[la_idx].buf,
                         alpha_beta_bytes,
                     ),
                     (
                         "fused_beta",
-                        &self.beta_raw_bufs[la_idx].buf,
+                        &self.beta_scratch.buf,
                         &self.beta_bufs[la_idx].buf,
                         alpha_beta_bytes,
                     ),
@@ -4370,13 +4394,13 @@ impl GdnTape {
                     ),
                     (
                         "gdn_alpha",
-                        &self.alpha_raw_bufs[la_idx].buf,
+                        &self.alpha_scratch.buf,
                         &self.alpha_bufs[la_idx].buf,
                         alpha_beta_bytes,
                     ),
                     (
                         "gdn_beta",
-                        &self.beta_raw_bufs[la_idx].buf,
+                        &self.beta_scratch.buf,
                         &self.beta_bufs[la_idx].buf,
                         alpha_beta_bytes,
                     ),
@@ -4391,8 +4415,8 @@ impl GdnTape {
             }
 
             for step in 0..n_steps {
-                let alpha = self.alpha_raw_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
-                let beta = self.beta_raw_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
+                let alpha = self.alpha_scratch.sub_offset(step * n_v_heads, n_v_heads);
+                let beta = self.beta_scratch.sub_offset(step * n_v_heads, n_v_heads);
                 let q = self.q_scratch.sub_offset(step * v_dim, v_dim);
                 let k = self.k_scratch.sub_offset(step * v_dim, v_dim);
                 let v = self.v_scratch.sub_offset(step * v_dim, v_dim);
@@ -4488,11 +4512,27 @@ impl GdnTape {
                 };
 
                 let qkv = self.qkv_bufs[la_idx].sub_offset(step * self.qkv_dim, self.qkv_dim);
-                let alpha = self.alpha_raw_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
-                let beta = self.beta_raw_bufs[la_idx].sub_offset(step * n_v_heads, n_v_heads);
+                let alpha = self.alpha_scratch.sub_offset(step * n_v_heads, n_v_heads);
+                let beta = self.beta_scratch.sub_offset(step * n_v_heads, n_v_heads);
                 let q_raw = self.q_raw_scratch.sub_offset(step * k_dim, k_dim);
                 let k_raw = self.k_raw_scratch.sub_offset(step * k_dim, k_dim);
                 let v = self.v_scratch.sub_offset(step * v_dim, v_dim);
+                let gate_offset_bytes = step * n_v_heads * 4;
+                let gate_row_bytes = n_v_heads * 4;
+                gpu.hip.memcpy_dtod_at(
+                    &alpha.buf,
+                    0,
+                    &self.alpha_raw_bufs[la_idx].buf,
+                    gate_offset_bytes,
+                    gate_row_bytes,
+                )?;
+                gpu.hip.memcpy_dtod_at(
+                    &beta.buf,
+                    0,
+                    &self.beta_raw_bufs[la_idx].buf,
+                    gate_offset_bytes,
+                    gate_row_bytes,
+                )?;
                 gpu.fused_sigmoid_alpha_gate_conv1d_silu_split_f32(
                     &beta,
                     &alpha,
