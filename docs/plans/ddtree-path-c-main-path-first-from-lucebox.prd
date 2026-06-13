@@ -504,6 +504,16 @@ Latest rollback diagnostic evidence:
   `projection_family_mismatch`, recurrent-state mismatch, and missing
   logit compare; dense DFlash still keeps verify graph default-on with
   `direct=0`.
+- `/tmp/coherence-dflash-20260614-005739.md` tightened the repair
+  diagnostic parser so a repair compare with zero emitted rows reports
+  `ok=false`, `reason=qkvza_repair_not_checked` instead of a vacuous
+  pass. The focused position-59 run still passed prose/code AR parity,
+  but prose fast replay admission remained rejected on
+  `missing_logit_compare`, `fast_replay_recurrent_state_mismatch`,
+  `rollback_input_mismatch`, and `projection_family_mismatch`. The
+  active qkvza route mismatch remains LA0 `qkv`, `first_offset=0`,
+  with exact serial self checks and exact tape `x_in`; dense DFlash
+  still used verify graph capture/replay by default (`direct=0`).
 - `/tmp/coherence-dflash-20260614-003019.md` repeated the row-aware
   diagnostic with `HIPFIRE_HFQ4_QKVZA_FAST=0`. Prose hard-failed AR
   parity at token 62 and the qkvza route mismatch persisted, changing

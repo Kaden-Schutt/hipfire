@@ -1708,7 +1708,9 @@ payload = {
     "checks": checks,
 }
 if not checks:
-    payload["ok"] = True
+    payload["ok"] = False
+    payload["reason"] = "qkvza_repair_not_checked"
+    payload["not_checked"] = True
 if mismatches:
     payload["first_mismatch"] = mismatches[0]
     payload["reason"] = mismatches[0].get("reason", "qkvza_repair_mismatch")
