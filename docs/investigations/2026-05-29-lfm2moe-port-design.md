@@ -369,7 +369,7 @@ doubles it (+0.63).
    the MQ6-experts section below.
 
 **Caveat (honest):** the absolute ~0.42-nat baseline may include some
-hipfire-GPU-vs-HF-CPU numerical drift beyond pure quantization (tiny-oracle
+hipfire-ROCm-vs-HF-CPU numerical drift beyond pure quantization (tiny-oracle
 cosine ≥0.999 + passing coherence confirm the arch is correct, so it's not a
 bug). The RELATIVE ordering is robust to any constant offset.
 

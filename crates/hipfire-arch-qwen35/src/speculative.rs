@@ -5361,6 +5361,7 @@ fn verify_dflash_block_inner(
             None,  // mask_override: speculative verify path doesn't use the MTP probe hook
             None,  // max_layer: DFlash verify always runs the full stack
             false, // DFlash computes all verify logits from final_hidden below
+            false, // force_q8_gdn_per_token: DFlash verify preserves production policy
         )
     };
 
@@ -6570,7 +6571,9 @@ pub fn spec_step_dflash(
 
                 target_snap.restore_to(&mut target.dn_state, gpu)?;
                 gpu.debug_set_gdn_requant_frame(serial_frame_start);
-                qwen35::forward_prefill_batch(
+                let mut prefill_tape =
+                    GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
+                qwen35::forward_prefill_batch_force_q8_gdn_per_token(
                     gpu,
                     &target.weights,
                     &target.config,
@@ -6581,7 +6584,7 @@ pub fn spec_step_dflash(
                     &target.scratch,
                     None,
                     None,
-                    None,
+                    Some(&mut prefill_tape),
                     None,
                 )?;
                 let prefill_frame_end = gpu.debug_gdn_requant_frame();
@@ -6985,6 +6988,7 @@ pub fn spec_step_dflash(
                 kv_rows.free_gpu(gpu);
                 fast_replay_result.free_gpu(gpu);
                 serial_tape.free_gpu(gpu);
+                prefill_tape.free_gpu(gpu);
                 prefill_accepted_kv_rows.free_gpu(gpu);
                 serial_accepted_kv_rows.free_gpu(gpu);
                 prefill_result.free_gpu(gpu);

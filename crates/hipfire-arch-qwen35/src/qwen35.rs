@@ -12409,6 +12409,7 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         None, // positions_override: captured-prefill uses linear positions
         needs_last_token_logits,
         debug_max_layer, // max_layer: default full stack; env is for graph-fault bisection only
+        false,           // force_q8_gdn_per_token: captured verify preserves production policy
     )
 }
 
@@ -12445,6 +12446,42 @@ pub fn forward_prefill_batch(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_force_q8_gdn_per_token(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+) -> HipResult<()> {
+    forward_prefill_batch_with_pbs_opts(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        scratch.prefill_batch.as_ref(),
+        None,
+        None,
+        true,
+        true,
+    )
+}
+
 pub fn forward_prefill_batch_with_pbs(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -12478,7 +12515,8 @@ pub fn forward_prefill_batch_with_pbs(
         pbs_in,
         mask_override,
         max_layer,
-        true, // preserve legacy post-condition: scratch.logits is last-token logits
+        true,  // preserve legacy post-condition: scratch.logits is last-token logits
+        false, // force_q8_gdn_per_token: default callers preserve existing policy
     )
 }
 
@@ -12513,6 +12551,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
     mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
     needs_last_token_logits: bool,
+    force_q8_gdn_per_token: bool,
 ) -> HipResult<()> {
     // Upper bound on the PrefillBatchScratch — large prompts get split
     // into chunks of this size and processed in a loop.
@@ -12798,6 +12837,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 None, // positions_override: default path uses linear positions
                 needs_last_token_logits,
                 max_layer,
+                force_q8_gdn_per_token,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
@@ -14997,6 +15037,7 @@ fn forward_prefill_chunk(
     positions_override: Option<&[usize]>,
     needs_last_token_logits: bool,
     max_layer: Option<usize>,
+    force_q8_gdn_per_token: bool,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -15885,7 +15926,9 @@ fn forward_prefill_chunk(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
-                } else if gdn_tape.is_some() && q8_gdn_verify_per_token_enabled() {
+                } else if force_q8_gdn_per_token
+                    || (gdn_tape.is_some() && q8_gdn_verify_per_token_enabled())
+                {
                     for step in 0..n {
                         let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
                         let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
@@ -18631,7 +18674,9 @@ fn forward_prefill_chunk(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
-                } else if gdn_tape.is_some() && q8_gdn_verify_per_token_enabled() {
+                } else if force_q8_gdn_per_token
+                    || (gdn_tape.is_some() && q8_gdn_verify_per_token_enabled())
+                {
                     for step in 0..n {
                         let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
                         let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
@@ -25163,7 +25208,8 @@ pub fn forward_prefill_batch_multi_with_caps(
                         None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
                         None, // positions_override: PP path uses linear positions
                         needs_last_token_logits,
-                        None, // max_layer: multi-GPU PP path runs full stack
+                        None,  // max_layer: multi-GPU PP path runs full stack
+                        false, // force_q8_gdn_per_token
                     )?;
                 }
 

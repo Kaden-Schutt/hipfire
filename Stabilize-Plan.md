@@ -334,6 +334,13 @@
     `argmax_mismatches=0`; code `checked=4`, `argmax_mismatches=0`). It also shows why this is still not enough for promotion: batched-prefix
     recurrent snapshots mismatch serial on multi-token prefixes (prose `matches=32`, `mismatches=60`; code `mismatches=4`), so the next admission
     cut is a multi-step continuation check or a recurrent-state fix for multi-token prefill rollback, not a one-step argmax-only policy.
+    A scoped per-token Q8 GDN prefill diagnostic was added so rollback-prefix comparison can force the serial GDN cadence without perturbing the
+    live DFlash verifier globally. The traced control `/tmp/coherence-dflash-20260613-183322.md` passed AR parity with production graph verify
+    unchanged and kept the position-120 diagnostic exact (`rollback_prefill_compare.ok=true`, `rollback_prefill_logit_compare.max_abs=0`).
+    The all-cycle control `/tmp/coherence-dflash-20260613-183516.md` was still negative: AR parity passed and first-next-token argmax parity held,
+    but multi-token recurrent snapshots remained non-admissible (prose `matches=32`, `mismatches=60`; code `mismatches=4`). This confirms the
+    global `HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN=1` workaround is not a production fix and that partial/reject rollback must stay on conservative
+    serial/full-prefill until multi-step recurrent parity is proven.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

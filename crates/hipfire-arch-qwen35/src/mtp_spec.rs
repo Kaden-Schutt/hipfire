@@ -1445,6 +1445,7 @@ pub fn spec_step_mtp(
         None,  // mask_override
         None,  // max_layer
         false, // MTP computes all verify logits from verify_hidden below
+        false, // force_q8_gdn_per_token: MTP verify preserves production policy
     )?;
 
     // ── 5. Per-position lm_head + batched argmax ─────────────────────────
@@ -1879,6 +1880,7 @@ pub fn spec_step_mtp_compressed(
         None,  // mask_override
         None,  // max_layer
         false, // MTP computes all verify logits from verify_hidden below
+        false, // force_q8_gdn_per_token: MTP verify preserves production policy
     )?;
 
     // ── 3. Trunk batched lm_head over verify positions ─────────────────────
@@ -2681,6 +2683,7 @@ pub fn spec_step_mtp_compressed_serial(
         None,  // mask_override
         None,  // max_layer
         false, // MTP computes all verify logits from verify_hidden below
+        false, // force_q8_gdn_per_token: MTP verify preserves production policy
     )?;
 
     let w_out = &trunk_weights.output;
