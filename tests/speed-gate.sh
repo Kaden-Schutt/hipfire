@@ -18,6 +18,16 @@ BASELINE_ROOT="${HIPFIRE_PERF_BASELINE_DIR:-benchmarks/perf-baselines}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 FAST=0
 VERBOSE=0
+MODEL_TMP_DIR=""
+
+cleanup() {
+    if declare -F gpu_release >/dev/null 2>&1; then
+        gpu_release 2>/dev/null || true
+    fi
+    [ -n "$MODEL_TMP_DIR" ] && rm -rf "$MODEL_TMP_DIR"
+}
+
+trap cleanup EXIT
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -74,6 +84,27 @@ find_model_file() {
     for dir in "$MODELS_DIR"; do
         [ -f "$dir/$name" ] && { printf '%s\n' "$dir/$name"; return 0; }
     done
+    # Older staged models used a dotted quant token. Keep the speed gate
+    # usable for local legacy artifacts while preserving canonical output names.
+    case "$name" in
+        *-mq[1-8].hfq)
+            local quant prefix legacy
+            quant="${name##*-}"
+            prefix="${name%-"$quant"}"
+            prefix="${prefix%-}"
+            legacy="${prefix}.${quant}"
+            for dir in "$MODELS_DIR"; do
+                if [ -f "$dir/$legacy" ]; then
+                    if [ -z "$MODEL_TMP_DIR" ]; then
+                        MODEL_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hipfire-speed-gate-models.XXXXXX")" || return 1
+                    fi
+                    ln -sf "$dir/$legacy" "$MODEL_TMP_DIR/$name"
+                    printf '%s\n' "$MODEL_TMP_DIR/$name"
+                    return 0
+                fi
+            done
+            ;;
+    esac
     return 1
 }
 
@@ -149,7 +180,6 @@ if [ -r "$LOCK_SCRIPT" ]; then
     # shellcheck disable=SC1090
     . "$LOCK_SCRIPT"
     gpu_acquire "speed-gate" || { color red "could not acquire GPU lock"; echo; exit 2; }
-    trap 'gpu_release 2>/dev/null || true' EXIT
 fi
 
 color bold "=== MQ4 Speed Gate via hipfire-eval ==="; echo
