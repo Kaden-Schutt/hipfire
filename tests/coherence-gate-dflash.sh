@@ -542,6 +542,22 @@ payload = {
     "min_serial_argmax_margin": min(finite_margins) if finite_margins else None,
     "max_abs_over_margin": max(finite_abs_over_margin) if finite_abs_over_margin else None,
 }
+if finite_abs_over_margin:
+    worst = max(
+        (r for r in rows if r["max_abs_over_margin"] is not None and math.isfinite(r["max_abs_over_margin"])),
+        key=lambda r: r["max_abs_over_margin"],
+    )
+    payload["max_abs_over_margin_row"] = {
+        "pos": worst["pos"],
+        "step": worst["step"],
+        "token_pos": worst["token_pos"],
+        "token": worst["token"],
+        "serial_argmax": worst["serial_argmax"],
+        "fast_argmax": worst["fast_argmax"],
+        "max_abs": worst["max_abs"],
+        "serial_argmax_margin": worst["serial_argmax_margin"],
+        "max_abs_over_margin": worst["max_abs_over_margin"],
+    }
 if mismatches:
     first = mismatches[0]
     payload["reason"] = "fast_replay_next_logit_argmax_mismatch"
@@ -629,6 +645,22 @@ payload = {
     "min_serial_argmax_margin": min(finite_margins) if finite_margins else None,
     "max_abs_over_margin": max(finite_abs_over_margin) if finite_abs_over_margin else None,
 }
+if finite_abs_over_margin:
+    worst = max(
+        (r for r in rows if r["max_abs_over_margin"] is not None and math.isfinite(r["max_abs_over_margin"])),
+        key=lambda r: r["max_abs_over_margin"],
+    )
+    payload["max_abs_over_margin_row"] = {
+        "pos": worst["pos"],
+        "step": worst["step"],
+        "token_pos": worst["token_pos"],
+        "token": worst["token"],
+        "serial_argmax": worst["serial_argmax"],
+        "prefill_argmax": worst["prefill_argmax"],
+        "max_abs": worst["max_abs"],
+        "serial_argmax_margin": worst["serial_argmax_margin"],
+        "max_abs_over_margin": worst["max_abs_over_margin"],
+    }
 if mismatches:
     first = mismatches[0]
     payload["reason"] = "prefill_replay_next_logit_argmax_mismatch"

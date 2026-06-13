@@ -353,6 +353,14 @@
     `min_serial_argmax_margin=0.599`. That makes the tolerance surface machine-readable and fail-closed for future all-cycle admission work:
     a cycle can only be considered bounded if its logit drift stays below the observed serial top-1 margin, and recurrent-state mismatch still
     blocks promotion until the policy is validated across all partial/reject cycles.
+    The first all-cycle margin-aware run, `/tmp/coherence-dflash-20260613-185354.md`, rejected that bounded-logit policy for prose even though
+    all first-next-token argmaxes still matched: fast tape reached `max_abs_over_margin=3.82` and scoped prefill reached `3.73`, so at least one
+    cycle's drift exceeds the serial top-1 safety margin. The gate now preserves the worst row. A rerun,
+    `/tmp/coherence-dflash-20260613-185736.md`, localizes the worst prose row to rollback cycle `pos=117`, continuation `token_pos=120`,
+    `token=27786`, where serial still chooses `57874` but the margin is only `0.051462`; fast-tape drift is `0.19636` (`3.82x` margin) and
+    scoped-prefill drift is `0.19177` (`3.73x` margin). Code remains bounded on this gate (`max_abs_over_margin<=0.112`), but prose blocks
+    promotion. The next viable rollback replacement is therefore either eliminating the position-117/120 drift source or adding a live
+    fail-closed hybrid that uses fast rollback only when every checked continuation row clears the margin bound and otherwise falls back to serial.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
