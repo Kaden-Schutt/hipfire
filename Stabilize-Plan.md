@@ -115,7 +115,10 @@
     `q/k`, GDN output, and gated output norm all match serial, then the first mismatch appears after LA0 `wo` residual
     (`attn_residual[0]`, `bytes=20480`, `differing_bytes=12020`, `first_offset=0`, `serial_byte=90`, `gdn_byte=95`). The current blocker is
     therefore the batched HFQ4 residual projection family for LA `wo` versus serial `weight_gemv_residual`, not GDN recurrence, gated norm, or
-    the next layer's RMSNorm input.
+    the next layer's RMSNorm input. Follow-up diagnostics did not clear that boundary: `HIPFIRE_HFQ4G256_MMQ_GFX1151=0` still reports the same
+    `attn_residual[0]` mismatch, and a local per-row `weight_gemv_residual` experiment for the whole HFQ4 residual chunk also kept the first
+    mismatch at `attn_residual[0]` while degrading output quality. The next cut should compare the residual input and residual destination rows
+    immediately before the `wo` call, not swap residual kernels.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
