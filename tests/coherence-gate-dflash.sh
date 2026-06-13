@@ -383,7 +383,7 @@ if len(sys.argv) != 2:
     sys.exit(0)
 out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
 m = re.search(
-    r"^rollback_parity: .*replay_gdn_tape=(\d+) replay_full_prefill=(\d+)",
+    r"^rollback_parity: .*replay_gdn_tape=(\d+) replay_full_prefill=(\d+)(?: replay_verify_complete=(\d+))?",
     out,
     re.MULTILINE,
 )
@@ -392,25 +392,29 @@ if not m:
     sys.exit(0)
 gdn = int(m.group(1))
 full = int(m.group(2))
+verify_complete = int(m.group(3) or 0)
 if gdn != 0:
     print(json.dumps({
         "ok": False,
         "reason": "fast_gdn_tape_replay_is_diagnostic_only",
         "replay_gdn_tape": gdn,
         "replay_full_prefill": full,
+        "replay_verify_complete": verify_complete,
     }))
-elif full <= 0:
+elif full + verify_complete <= 0:
     print(json.dumps({
         "ok": False,
-        "reason": "missing_conservative_full_prefill_replay",
+        "reason": "missing_admitted_rollback_replay",
         "replay_gdn_tape": gdn,
         "replay_full_prefill": full,
+        "replay_verify_complete": verify_complete,
     }))
 else:
     print(json.dumps({
         "ok": True,
         "replay_gdn_tape": gdn,
         "replay_full_prefill": full,
+        "replay_verify_complete": verify_complete,
     }))
 PYEOF
 )

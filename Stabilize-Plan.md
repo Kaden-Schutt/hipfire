@@ -309,7 +309,13 @@
     tape `attn_out` and matches production `tape.replay_gdn`, but both still mismatch serial at `s_matrix[0]`
     (`max_abs=2.53553992e38`). That rules out replay order as the current promotion fix: the active blocker is verify-tape accepted-prefix input
     parity, and fast GDN-tape rollback remains diagnostic-only until the captured rows are serial-equivalent or a bounded recurrent/logit admission
-    policy is proven.
+    policy is proven. A narrow replacement path now avoids rollback entirely for full-accept cycles: when `accept_len + 1 == B`, the target
+    verify state already reflects the committed pre-bonus prefix, so DFlash keeps that state and reports `replay_verify_complete` instead of
+    restoring and serial-replaying. Fresh evidence `/tmp/coherence-dflash-20260613-175137.md` plus
+    `/tmp/coherence-dflash-20260613-175137.dflash_trace.json` passed prose/code AR parity with `replay_gdn_tape=0`; the code row moved one cycle
+    to `replay_verify_complete=1` (`replay_full_prefill=4`), while prose had no full-accept cycles and stayed `replay_full_prefill=92`.
+    This reduces dependence on conservative serial replay for the provably exact full-verify case, but the rejection/partial-accept path remains
+    blocked on verify-tape accepted-prefix parity.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

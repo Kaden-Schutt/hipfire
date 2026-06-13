@@ -729,6 +729,7 @@ pub struct SpecStepResult {
 pub enum SpecRollbackReplayKind {
     GdnTape,
     FullPrefill,
+    VerifyComplete,
 }
 
 impl SpecRollbackReplayKind {
@@ -736,6 +737,7 @@ impl SpecRollbackReplayKind {
         match self {
             Self::GdnTape => "gdn_tape",
             Self::FullPrefill => "full_prefill",
+            Self::VerifyComplete => "verify_complete",
         }
     }
 }
@@ -6510,7 +6512,10 @@ pub fn spec_step_dflash(
     // draft tokens). The bonus token is NOT replayed — it will be
     // block[0] of the next iter. This keeps the invariant that before each
     // verify, target state is at position `start` (= pre-verify position).
-    target_snap.restore_to(&mut target.dn_state, gpu)?;
+    let verify_complete_rollback = rows_to_keep == b;
+    if !verify_complete_rollback {
+        target_snap.restore_to(&mut target.dn_state, gpu)?;
+    }
 
     if phase_on {
         gpu.hip.device_synchronize()?;
@@ -6536,7 +6541,9 @@ pub fn spec_step_dflash(
         dflash_force_serial_rollback_replay_from_env(),
         gdn_tape_opt.is_some(),
     );
-    let rollback_replay = if force_serial_rollback {
+    let rollback_replay = if verify_complete_rollback {
+        SpecRollbackReplayKind::VerifyComplete
+    } else if force_serial_rollback {
         let serial_frame_start = gpu.debug_gdn_requant_frame();
         for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
             qwen35::forward_scratch(
@@ -9456,6 +9463,10 @@ mod tests {
     fn spec_rollback_replay_kind_labels_are_stable() {
         assert_eq!(SpecRollbackReplayKind::GdnTape.as_str(), "gdn_tape");
         assert_eq!(SpecRollbackReplayKind::FullPrefill.as_str(), "full_prefill");
+        assert_eq!(
+            SpecRollbackReplayKind::VerifyComplete.as_str(),
+            "verify_complete"
+        );
     }
 
     #[test]
