@@ -3357,7 +3357,7 @@ impl GdnTape {
         config: &qwen35::Qwen35Config,
         dn_state: &mut qwen35::DeltaNetState,
         n_steps: usize,
-    ) -> HipResult<()> {
+    ) -> HipResult<Option<(usize, DeltaNetSnapshotDiff)>> {
         assert!(
             n_steps <= self.max_n,
             "replay_gdn_fused_gate_conv_token_major_for_compare: n_steps {n_steps} > max_n {}",
@@ -3369,6 +3369,7 @@ impl GdnTape {
         let v_dim = self.v_dim;
         let k_dim = self.k_dim;
         let value_head_dim = self.value_head_dim;
+        let mut first_attn_out_diff: Option<(usize, DeltaNetSnapshotDiff)> = None;
 
         for step in 0..n_steps {
             let mut la_idx = 0usize;
@@ -3462,10 +3463,23 @@ impl GdnTape {
                         value_head_dim,
                     )?,
                 }
+                if first_attn_out_diff.is_none() {
+                    let expected = self.attn_out_bufs[la_idx].sub_offset(step * v_dim, v_dim);
+                    if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                        gpu,
+                        "replay_attn_out",
+                        la_idx,
+                        &out.buf,
+                        &expected.buf,
+                        v_dim * 4,
+                    )? {
+                        first_attn_out_diff = Some((step, diff));
+                    }
+                }
                 la_idx += 1;
             }
         }
-        Ok(())
+        Ok(first_attn_out_diff)
     }
 
     /// Replay the full LA sub-pipeline (conv1d + qk-l2norm + repeat-interleave +
@@ -6467,13 +6481,14 @@ pub fn spec_step_dflash(
             }
             target_snap.restore_to(&mut target.dn_state, gpu)?;
             gpu.debug_set_gdn_requant_frame(serial_frame_start);
-            tape.replay_gdn_fused_gate_conv_token_major_for_compare(
-                gpu,
-                &target.weights,
-                &target.config,
-                &mut target.dn_state,
-                accept_len + 1,
-            )?;
+            let fast_token_major_attn_out_diff = tape
+                .replay_gdn_fused_gate_conv_token_major_for_compare(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    &mut target.dn_state,
+                    accept_len + 1,
+                )?;
             let fast_token_major_frame_end = gpu.debug_gdn_requant_frame();
             eprintln!(
                 "[dflash-rollback-fast-token-major-frame-compare] pos={} accepted={} replay_steps={} serial_start={} serial_end={} replay_end={}",
@@ -6485,6 +6500,32 @@ pub fn spec_step_dflash(
                 fast_token_major_frame_end,
             );
             gpu.debug_set_gdn_requant_frame(serial_frame_end);
+            match fast_token_major_attn_out_diff {
+                Some((step, diff)) => {
+                    let context = rollback_input_diff_context(&target.config, tape, &diff, position);
+                    eprintln!(
+                        "[dflash-rollback-fast-token-major-attn-out-compare] pos={} accepted={} replay_steps={} step={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} replay_byte={} tape_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        step,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.actual_byte,
+                        diff.expected_byte,
+                        context,
+                    );
+                }
+                None => eprintln!(
+                    "[dflash-rollback-fast-token-major-attn-out-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+            }
             match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &serial_result)? {
                 Some(diff) => {
                     let context = rollback_snapshot_diff_context(&diff);
@@ -6556,13 +6597,14 @@ pub fn spec_step_dflash(
             let token_major_capture_frame_end = gpu.debug_gdn_requant_frame();
             target_snap.restore_to(&mut target.dn_state, gpu)?;
             gpu.debug_set_gdn_requant_frame(serial_frame_start);
-            token_major_tape.replay_gdn_fused_gate_conv_token_major_for_compare(
-                gpu,
-                &target.weights,
-                &target.config,
-                &mut target.dn_state,
-                accept_len + 1,
-            )?;
+            let token_major_attn_out_diff = token_major_tape
+                .replay_gdn_fused_gate_conv_token_major_for_compare(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    &mut target.dn_state,
+                    accept_len + 1,
+                )?;
             let token_major_frame_end = gpu.debug_gdn_requant_frame();
             eprintln!(
                 "[dflash-rollback-token-major-frame-compare] pos={} accepted={} replay_steps={} serial_start={} serial_end={} recapture_end={} replay_end={}",
@@ -6575,6 +6617,33 @@ pub fn spec_step_dflash(
                 token_major_frame_end,
             );
             gpu.debug_set_gdn_requant_frame(serial_frame_end);
+            match token_major_attn_out_diff {
+                Some((step, diff)) => {
+                    let context =
+                        rollback_input_diff_context(&target.config, &token_major_tape, &diff, position);
+                    eprintln!(
+                        "[dflash-rollback-serial-token-major-attn-out-compare] pos={} accepted={} replay_steps={} step={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} replay_byte={} tape_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        step,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.actual_byte,
+                        diff.expected_byte,
+                        context,
+                    );
+                }
+                None => eprintln!(
+                    "[dflash-rollback-serial-token-major-attn-out-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+            }
             match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &serial_result)? {
                 Some(diff) => {
                     let context = rollback_snapshot_diff_context(&diff);

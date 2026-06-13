@@ -205,8 +205,9 @@
     `q/k/v/alpha/beta` inputs across all LA layers localizes the two-step position-59 tape drift to `gdn_q index=1` at row 1
     (`max_abs=7.47820362e-4`), while LA0 replay inputs still match. The next blocker is to make later-layer fast tape rows represent the
     serial accepted-prefix trajectory, or keep multi-step fast replay rejected and limit any future fast path to cases with explicit per-layer
-    serial-equivalence evidence. Fast rollback replay remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity
-    evidence.
+    serial-equivalence evidence. A replay-output check further shows the fast tape's token-major replay recomputes LA0 row-1 `attn_out` to the
+    serial value, but the verify-captured `attn_out[0]` row 1 stored in the tape is different; serial recapture plus token-major replay matches.
+    Fast rollback replay remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity evidence.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
