@@ -11904,6 +11904,97 @@ impl Gpu {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_hfq4g256_exact(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
+            self.ensure_kernel(
+                "gemm_qkv_hfq4g256_wave64",
+                kernels::GEMM_QKV_HFQ4G256_WAVE64_SRC,
+                "gemm_qkv_hfq4g256_wave64",
+            )?;
+            ("gemm_qkv_hfq4g256_wave64", [64, 1, 1], 2)
+        } else {
+            self.ensure_kernel(
+                "gemm_qkv_hfq4g256",
+                kernels::GEMM_QKV_HFQ4G256_SRC,
+                "gemm_qkv_hfq4g256",
+            )?;
+            ("gemm_qkv_hfq4g256", [32, 1, 1], 1)
+        };
+        let func = &self.functions[func_name];
+
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let batch_tiles = {
+            const BATCH_TILE: usize = 8;
+            (batch_size + BATCH_TILE - 1) / BATCH_TILE
+        };
+        let total_m = (q_m + k_m + v_m) as u32;
+        let grid_x = (total_m + grid_div - 1) / grid_div;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(k_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(v_m, k);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_exact", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, batch_tiles as u32, 1],
+                block,
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Batched 3-way fused HFQ3-G256 GEMM for the FA preamble (MQ3 path).
     ///
     /// HFQ3 sibling of `gemm_qkv_hfq4g256` — same dispatch shape, 104 B

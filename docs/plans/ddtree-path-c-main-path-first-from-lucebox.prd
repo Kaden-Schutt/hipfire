@@ -608,6 +608,23 @@ Latest rollback diagnostic evidence:
   rollback-input mismatch; the first remaining input mismatch is now the
   FullAttention bridge Q projection (`fa_bridge_q_full`) at position 226
   (`max_abs=0.00364112854`, `mean_abs=0.000602068903`).
+- The production-shape FA bridge QKV diagnostic
+  `test_gemm_qkv_and_gate_up --qkv 12288 1024 1024 5120 1 2`
+  reproduced that split: `N=1` was byte-exact, but fast `N=2`
+  diverged for Q/K/V (`24396/24576`, `2033/2048`, and `2033/2048`
+  divergent values). With `HIPFIRE_HFQ4_QKV_FAST=0`, the same shape was
+  byte-exact at `N=2`, so tape-producing dense verify now routes the FA
+  bridge HFQ4/MQ4 QKV branch through an exact scalar batched dispatch
+  while ordinary prefill keeps the fast path.
+- `/tmp/coherence-dflash-20260614-023128.md` verified that exact FA QKV
+  routing moves the first rollback input mismatch past
+  `fa_bridge_q_full`. Fast replay is still rejected on recurrent-state
+  and rollback-input mismatch; the first remaining input mismatch is now
+  `attn_out` at position 59 (`max_abs=0.0105993748`,
+  `mean_abs=0.0000111932113`). Direct/no-graph verify remained unused
+  (`verify_graph direct=0`, capture/replay active), and live DFlash
+  rollback remained conservative (`replay_gdn_tape=0`,
+  `replay_serial_tape=92` on prose).
 
 ## References
 

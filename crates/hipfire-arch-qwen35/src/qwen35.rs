@@ -16794,6 +16794,10 @@ fn forward_prefill_chunk(
                 // same gate when wk/wv aren't Q8.
                 let qkv_same_dtype = layer.wk.gpu_dtype == layer.wq.gpu_dtype
                     && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
+                let fa_bridge_tape_active = gdn_tape.as_ref().is_some_and(|tape| {
+                    delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                });
                 if let Some(tape) = gdn_tape.as_ref() {
                     if delta_layer_idx < tape.fa_bridge_valid.len()
                         && tape.fa_bridge_valid[delta_layer_idx]
@@ -17056,20 +17060,37 @@ fn forward_prefill_chunk(
                         )?;
                     }
                 } else if qkv_same_dtype {
-                    gpu.gemm_qkv_hfq4g256(
-                        &layer.wq.buf,
-                        &layer.wk.buf,
-                        &layer.wv.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.fa_q_full_batch,
-                        &pbs.fa_k_batch,
-                        &pbs.fa_v_batch,
-                        layer.wq.m,
-                        layer.wk.m,
-                        layer.wv.m,
-                        layer.wq.k,
-                        n,
-                    )?;
+                    if fa_bridge_tape_active {
+                        gpu.gemm_qkv_hfq4g256_exact(
+                            &layer.wq.buf,
+                            &layer.wk.buf,
+                            &layer.wv.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_q_full_batch,
+                            &pbs.fa_k_batch,
+                            &pbs.fa_v_batch,
+                            layer.wq.m,
+                            layer.wk.m,
+                            layer.wv.m,
+                            layer.wq.k,
+                            n,
+                        )?;
+                    } else {
+                        gpu.gemm_qkv_hfq4g256(
+                            &layer.wq.buf,
+                            &layer.wk.buf,
+                            &layer.wv.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_q_full_batch,
+                            &pbs.fa_k_batch,
+                            &pbs.fa_v_batch,
+                            layer.wq.m,
+                            layer.wk.m,
+                            layer.wv.m,
+                            layer.wq.k,
+                            n,
+                        )?;
+                    }
                 } else {
                     // Mixed-format fallback (issue #249): wq/wk/wv don't all
                     // share a dtype. Dispatch each weight to its own

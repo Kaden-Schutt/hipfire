@@ -14,8 +14,13 @@ use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let gate_up_only = args.get(1).is_some_and(|a| a == "--gate-up");
-    let (n_list, k, gate_shape): (Vec<usize>, usize, Option<(usize, usize)>) = if gate_up_only {
+    let mode = args.get(1).map(String::as_str);
+    let (n_list, k, qkv_shape, gate_shape): (
+        Vec<usize>,
+        usize,
+        Option<(usize, usize, usize)>,
+        Option<(usize, usize)>,
+    ) = if mode == Some("--gate-up") {
         if args.len() < 6 {
             eprintln!("usage: test_gemm_qkv_and_gate_up --gate-up <gate_m> <up_m> <k> <n> [n...]");
             std::process::exit(2);
@@ -27,9 +32,23 @@ fn main() {
             .iter()
             .map(|n| n.parse().expect("n must be integer"))
             .collect();
-        (n_list, k, Some((gate_m, up_m)))
+        (n_list, k, None, Some((gate_m, up_m)))
+    } else if mode == Some("--qkv") {
+        if args.len() < 7 {
+            eprintln!("usage: test_gemm_qkv_and_gate_up --qkv <q_m> <k_m> <v_m> <k> <n> [n...]");
+            std::process::exit(2);
+        }
+        let q_m: usize = args[2].parse().expect("q_m must be integer");
+        let k_m: usize = args[3].parse().expect("k_m must be integer");
+        let v_m: usize = args[4].parse().expect("v_m must be integer");
+        let k: usize = args[5].parse().expect("k must be integer");
+        let n_list: Vec<usize> = args[6..]
+            .iter()
+            .map(|n| n.parse().expect("n must be integer"))
+            .collect();
+        (n_list, k, Some((q_m, k_m, v_m)), None)
     } else {
-        (vec![1, 4, 16, 64], 1024, None)
+        (vec![1, 4, 16, 64], 1024, None, None)
     };
     assert!(k % 256 == 0, "K must be divisible by 256");
     let groups_per_row = k / 256;
@@ -37,18 +56,24 @@ fn main() {
 
     let mut gpu = Gpu::init().expect("gpu init");
 
-    if !gate_up_only {
-        test_qkv(&mut gpu, &n_list, k, row_bytes);
+    if mode != Some("--gate-up") {
+        test_qkv(&mut gpu, &n_list, k, row_bytes, qkv_shape);
     }
-    test_gate_up(&mut gpu, &n_list, k, row_bytes, gate_shape);
+    if mode != Some("--qkv") {
+        test_gate_up(&mut gpu, &n_list, k, row_bytes, gate_shape);
+    }
 
     eprintln!("\n=== REQUESTED KERNELS PASSED ===");
 }
 
-fn test_qkv(gpu: &mut Gpu, n_list: &[usize], k: usize, row_bytes: usize) {
-    let q_m: usize = 2048;
-    let k_m: usize = 512;
-    let v_m: usize = 512;
+fn test_qkv(
+    gpu: &mut Gpu,
+    n_list: &[usize],
+    k: usize,
+    row_bytes: usize,
+    shape: Option<(usize, usize, usize)>,
+) {
+    let (q_m, k_m, v_m): (usize, usize, usize) = shape.unwrap_or((2048, 512, 512));
 
     eprintln!("=== gemm_qkv_hfq4g256 ===");
     eprintln!("q_m={q_m} k_m={k_m} v_m={v_m} K={k}");
