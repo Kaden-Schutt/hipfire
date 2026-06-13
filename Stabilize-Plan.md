@@ -142,8 +142,12 @@
     segment between LA index 2 and LA index 3. FullAttention bridge tape shows the hidden input to that segment matches serial, then the first
     mismatch appears at `fa_bridge_q[3]` after FullAttention q/k/v projection plus RoPE (`bytes=24576`, `differing_bytes=14526`,
     `first_offset=0`, `serial_byte=64`, `gdn_byte=8`) under
-    `HIPFIRE_HFQ4_QKVZA_FAST=0 HIPFIRE_HFQ4_GATE_UP_FAST=0 HIPFIRE_HFQ4_RESIDUAL_FAST=0`. The next cut is inside the FullAttention
-    norm/projection/RoPE preamble rather than the attention kernel.
+    `HIPFIRE_HFQ4_QKVZA_FAST=0 HIPFIRE_HFQ4_GATE_UP_FAST=0 HIPFIRE_HFQ4_RESIDUAL_FAST=0`. Finer bridge capture shows the normalized/rotated
+    FA input matches, then the split occurs at `fa_bridge_q_full[3]` (`bytes=49152`, `differing_bytes=26488`, `first_offset=0`,
+    `serial_byte=64`, `gdn_byte=16`), before q_norm/RoPE. A broad `HIPFIRE_FP16=0` A/B clears `fa_bridge_q_full` and moves the first
+    mismatch to `fa_bridge_attn_out[3]` (`bytes=24576`, `differing_bytes=9335`, `first_offset=0`, `serial_byte=14`, `gdn_byte=10`). The
+    narrower diagnostic flag `HIPFIRE_HFQ4_QKV_FAST=0` reproduces that move without disabling unrelated HFQ4 fast paths. The next cut is
+    FullAttention output capture before/after the output gate now that q/k/v parity can be forced independently.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

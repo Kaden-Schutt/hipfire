@@ -1103,6 +1103,7 @@ pub struct GdnTape {
     pub x_in_dim: usize,
     pub qkv_dim: usize,
     pub ffn_dim: usize,
+    pub fa_q_full_dim: usize,
     pub fa_q_dim: usize,
     pub fa_kv_dim: usize,
     pub v_dim: usize,
@@ -1121,6 +1122,12 @@ pub struct GdnTape {
     pub x_in_bufs: Vec<GpuTensor>,
     /// FullAttention bridge input keyed by the following LA slot.
     pub fa_bridge_input_bufs: Vec<GpuTensor>,
+    /// FullAttention normalized/rotated QKV input keyed by the following LA slot.
+    pub fa_bridge_x_bufs: Vec<GpuTensor>,
+    /// FullAttention raw/full Q projection keyed by the following LA slot.
+    pub fa_bridge_q_full_bufs: Vec<GpuTensor>,
+    /// FullAttention Q after per-head q_norm, before RoPE.
+    pub fa_bridge_q_norm_bufs: Vec<GpuTensor>,
     /// FullAttention post-RoPE Q keyed by the following LA slot.
     pub fa_bridge_q_bufs: Vec<GpuTensor>,
     /// FullAttention post-RoPE K keyed by the following LA slot.
@@ -1218,6 +1225,7 @@ impl GdnTape {
         let qkv_dim = k_dim * 2 + v_dim;
         let ffn_dim = config.hidden_dim;
         let fa_q_dim = config.n_heads * config.head_dim;
+        let fa_q_full_dim = fa_q_dim * if config.attn_output_gate { 2 } else { 1 };
         let fa_kv_dim = config.n_kv_heads * config.head_dim;
         let n_v_heads = config.linear_num_value_heads;
         let n_key_heads = config.linear_num_key_heads;
@@ -1230,6 +1238,9 @@ impl GdnTape {
 
         let mut x_in_bufs = Vec::with_capacity(n_la_layers);
         let mut fa_bridge_input_bufs = Vec::with_capacity(n_la_layers);
+        let mut fa_bridge_x_bufs = Vec::with_capacity(n_la_layers);
+        let mut fa_bridge_q_full_bufs = Vec::with_capacity(n_la_layers);
+        let mut fa_bridge_q_norm_bufs = Vec::with_capacity(n_la_layers);
         let mut fa_bridge_q_bufs = Vec::with_capacity(n_la_layers);
         let mut fa_bridge_k_bufs = Vec::with_capacity(n_la_layers);
         let mut fa_bridge_v_bufs = Vec::with_capacity(n_la_layers);
@@ -1261,6 +1272,11 @@ impl GdnTape {
             x_in_bufs.push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
             fa_bridge_input_bufs
                 .push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+            fa_bridge_x_bufs.push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+            fa_bridge_q_full_bufs
+                .push(gpu.alloc_tensor(&[max_n * fa_q_full_dim], rdna_compute::DType::F32)?);
+            fa_bridge_q_norm_bufs
+                .push(gpu.alloc_tensor(&[max_n * fa_q_dim], rdna_compute::DType::F32)?);
             fa_bridge_q_bufs.push(gpu.alloc_tensor(&[max_n * fa_q_dim], rdna_compute::DType::F32)?);
             fa_bridge_k_bufs
                 .push(gpu.alloc_tensor(&[max_n * fa_kv_dim], rdna_compute::DType::F32)?);
@@ -1303,6 +1319,7 @@ impl GdnTape {
             x_in_dim,
             qkv_dim,
             ffn_dim,
+            fa_q_full_dim,
             fa_q_dim,
             fa_kv_dim,
             v_dim,
@@ -1314,6 +1331,9 @@ impl GdnTape {
             fa_bridge_valid,
             x_in_bufs,
             fa_bridge_input_bufs,
+            fa_bridge_x_bufs,
+            fa_bridge_q_full_bufs,
+            fa_bridge_q_norm_bufs,
             fa_bridge_q_bufs,
             fa_bridge_k_bufs,
             fa_bridge_v_bufs,
@@ -1355,6 +1375,9 @@ impl GdnTape {
             .x_in_bufs
             .into_iter()
             .chain(self.fa_bridge_input_bufs.into_iter())
+            .chain(self.fa_bridge_x_bufs.into_iter())
+            .chain(self.fa_bridge_q_full_bufs.into_iter())
+            .chain(self.fa_bridge_q_norm_bufs.into_iter())
             .chain(self.fa_bridge_q_bufs.into_iter())
             .chain(self.fa_bridge_k_bufs.into_iter())
             .chain(self.fa_bridge_v_bufs.into_iter())
@@ -1444,6 +1467,7 @@ impl GdnTapeShards {
         let qkv_dim = k_dim * 2 + v_dim;
         let ffn_dim = config.hidden_dim;
         let fa_q_dim = config.n_heads * config.head_dim;
+        let fa_q_full_dim = fa_q_dim * if config.attn_output_gate { 2 } else { 1 };
         let fa_kv_dim = config.n_kv_heads * config.head_dim;
         let n_v_heads = config.linear_num_value_heads;
         let n_key_heads = config.linear_num_key_heads;
@@ -1475,6 +1499,9 @@ impl GdnTapeShards {
             g.bind_thread()?;
             let mut x_in_bufs = Vec::with_capacity(n_la_total);
             let mut fa_bridge_input_bufs = Vec::with_capacity(n_la_total);
+            let mut fa_bridge_x_bufs = Vec::with_capacity(n_la_total);
+            let mut fa_bridge_q_full_bufs = Vec::with_capacity(n_la_total);
+            let mut fa_bridge_q_norm_bufs = Vec::with_capacity(n_la_total);
             let mut fa_bridge_q_bufs = Vec::with_capacity(n_la_total);
             let mut fa_bridge_k_bufs = Vec::with_capacity(n_la_total);
             let mut fa_bridge_v_bufs = Vec::with_capacity(n_la_total);
@@ -1507,6 +1534,12 @@ impl GdnTapeShards {
                     x_in_bufs.push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
                     fa_bridge_input_bufs
                         .push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                    fa_bridge_x_bufs
+                        .push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
+                    fa_bridge_q_full_bufs
+                        .push(g.alloc_tensor(&[max_n * fa_q_full_dim], rdna_compute::DType::F32)?);
+                    fa_bridge_q_norm_bufs
+                        .push(g.alloc_tensor(&[max_n * fa_q_dim], rdna_compute::DType::F32)?);
                     fa_bridge_q_bufs
                         .push(g.alloc_tensor(&[max_n * fa_q_dim], rdna_compute::DType::F32)?);
                     fa_bridge_k_bufs
@@ -1559,6 +1592,9 @@ impl GdnTapeShards {
                     // this band).
                     x_in_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     fa_bridge_input_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    fa_bridge_x_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    fa_bridge_q_full_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    fa_bridge_q_norm_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     fa_bridge_q_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     fa_bridge_k_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     fa_bridge_v_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
@@ -1594,6 +1630,7 @@ impl GdnTapeShards {
                 x_in_dim,
                 qkv_dim,
                 ffn_dim,
+                fa_q_full_dim,
                 fa_q_dim,
                 fa_kv_dim,
                 v_dim,
@@ -1605,6 +1642,9 @@ impl GdnTapeShards {
                 fa_bridge_valid: fa_bridge_valid.clone(),
                 x_in_bufs,
                 fa_bridge_input_bufs,
+                fa_bridge_x_bufs,
+                fa_bridge_q_full_bufs,
+                fa_bridge_q_norm_bufs,
                 fa_bridge_q_bufs,
                 fa_bridge_k_bufs,
                 fa_bridge_v_bufs,
@@ -1718,6 +1758,7 @@ impl GdnTapeShards {
             let attn_out_bytes = target.max_n * target.v_dim * 4;
             let hidden_bytes = target.max_n * target.x_in_dim * 4;
             let ffn_bytes = target.max_n * target.ffn_dim * 4;
+            let fa_q_full_bytes = target.max_n * target.fa_q_full_dim * 4;
             let fa_q_bytes = target.max_n * target.fa_q_dim * 4;
             let fa_kv_bytes = target.max_n * target.fa_kv_dim * 4;
 
@@ -1740,6 +1781,27 @@ impl GdnTapeShards {
                         &self.shards[owning_band].fa_bridge_input_bufs[global_la_idx].buf,
                         0,
                         hidden_bytes,
+                    )?;
+                    g.hip.memcpy_dtod_at(
+                        &target.fa_bridge_x_bufs[global_la_idx].buf,
+                        0,
+                        &self.shards[owning_band].fa_bridge_x_bufs[global_la_idx].buf,
+                        0,
+                        hidden_bytes,
+                    )?;
+                    g.hip.memcpy_dtod_at(
+                        &target.fa_bridge_q_full_bufs[global_la_idx].buf,
+                        0,
+                        &self.shards[owning_band].fa_bridge_q_full_bufs[global_la_idx].buf,
+                        0,
+                        fa_q_full_bytes,
+                    )?;
+                    g.hip.memcpy_dtod_at(
+                        &target.fa_bridge_q_norm_bufs[global_la_idx].buf,
+                        0,
+                        &self.shards[owning_band].fa_bridge_q_norm_bufs[global_la_idx].buf,
+                        0,
+                        fa_q_bytes,
                     )?;
                     g.hip.memcpy_dtod_at(
                         &target.fa_bridge_q_bufs[global_la_idx].buf,
@@ -1953,6 +2015,27 @@ impl GdnTapeShards {
                         &self.shards[owning_band].fa_bridge_input_bufs[global_la_idx].buf,
                         src_dev_id,
                         hidden_bytes,
+                    )?;
+                    runtime.memcpy_peer(
+                        &target.fa_bridge_x_bufs[global_la_idx].buf,
+                        dst_dev_id,
+                        &self.shards[owning_band].fa_bridge_x_bufs[global_la_idx].buf,
+                        src_dev_id,
+                        hidden_bytes,
+                    )?;
+                    runtime.memcpy_peer(
+                        &target.fa_bridge_q_full_bufs[global_la_idx].buf,
+                        dst_dev_id,
+                        &self.shards[owning_band].fa_bridge_q_full_bufs[global_la_idx].buf,
+                        src_dev_id,
+                        fa_q_full_bytes,
+                    )?;
+                    runtime.memcpy_peer(
+                        &target.fa_bridge_q_norm_bufs[global_la_idx].buf,
+                        dst_dev_id,
+                        &self.shards[owning_band].fa_bridge_q_norm_bufs[global_la_idx].buf,
+                        src_dev_id,
+                        fa_q_bytes,
                     )?;
                     runtime.memcpy_peer(
                         &target.fa_bridge_q_bufs[global_la_idx].buf,
@@ -2316,6 +2399,7 @@ impl GdnTape {
         let q_raw_bytes = n_positions * self.k_dim * 4;
         let v_bytes = n_positions * self.v_dim * 4;
         let ffn_bytes = n_positions * self.ffn_dim * 4;
+        let fa_q_full_bytes = n_positions * self.fa_q_full_dim * 4;
         let fa_q_bytes = n_positions * self.fa_q_dim * 4;
         let fa_kv_bytes = n_positions * self.fa_kv_dim * 4;
         for i in 0..self.qkv_bufs.len() {
@@ -2327,6 +2411,36 @@ impl GdnTape {
                     &self.fa_bridge_input_bufs[i].buf,
                     &expected.fa_bridge_input_bufs[i].buf,
                     x_in_bytes,
+                )? {
+                    return Ok(Some(diff));
+                }
+                if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                    gpu,
+                    "fa_bridge_x",
+                    i,
+                    &self.fa_bridge_x_bufs[i].buf,
+                    &expected.fa_bridge_x_bufs[i].buf,
+                    x_in_bytes,
+                )? {
+                    return Ok(Some(diff));
+                }
+                if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                    gpu,
+                    "fa_bridge_q_full",
+                    i,
+                    &self.fa_bridge_q_full_bufs[i].buf,
+                    &expected.fa_bridge_q_full_bufs[i].buf,
+                    fa_q_full_bytes,
+                )? {
+                    return Ok(Some(diff));
+                }
+                if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                    gpu,
+                    "fa_bridge_q_norm",
+                    i,
+                    &self.fa_bridge_q_norm_bufs[i].buf,
+                    &expected.fa_bridge_q_norm_bufs[i].buf,
+                    fa_q_bytes,
                 )? {
                     return Ok(Some(diff));
                 }

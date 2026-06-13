@@ -11525,8 +11525,10 @@ impl Gpu {
                 return r1.and(r2).and(r3);
             }
         }
-        // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !self.flags.fp16_disabled {
+        // Fast paths for prefill (batch_size > 1). Disable globally with
+        // HIPFIRE_FP16=0 or only for this FA q/k/v projection with
+        // HIPFIRE_HFQ4_QKV_FAST=0.
+        if batch_size > 1 && !self.flags.fp16_disabled && self.flags.hfq4_qkv_fast {
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
             if self.arch_caps.is_gcn5_wave64() {
                 // gfx906 dp4a MMQ: route q+k+v through the new MMQ kernel.

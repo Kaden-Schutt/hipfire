@@ -16546,6 +16546,21 @@ fn forward_prefill_chunk(
                         config.norm_eps,
                     )?;
                 }
+                if let Some(tape) = gdn_tape.as_ref() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let hidden_row_bytes = tape.x_in_dim * 4;
+                        let off_hidden = tape_offset * hidden_row_bytes;
+                        gpu.memcpy_dtod_at_auto(
+                            &tape.fa_bridge_x_bufs[delta_layer_idx].buf,
+                            off_hidden,
+                            &pbs.x_rot_batch.buf,
+                            0,
+                            n * hidden_row_bytes,
+                        )?;
+                    }
+                }
 
                 // 2. Batched 3-way QKV projection (wq+wk+wv).
                 if qkv_is_6bit && qkv_same_dtype {
@@ -16795,6 +16810,20 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 }
+                if let Some(tape) = gdn_tape.as_ref() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let q_full_row_bytes = tape.fa_q_full_dim * 4;
+                        gpu.memcpy_dtod_at_auto(
+                            &tape.fa_bridge_q_full_bufs[delta_layer_idx].buf,
+                            tape_offset * q_full_row_bytes,
+                            &pbs.fa_q_full_batch.buf,
+                            0,
+                            n * q_full_row_bytes,
+                        )?;
+                    }
+                }
 
                 qwen35_materialize_fa_q(
                     gpu,
@@ -16816,6 +16845,20 @@ fn forward_prefill_chunk(
                     config.head_dim,
                     config.norm_eps,
                 )?;
+                if let Some(tape) = gdn_tape.as_ref() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let q_row_bytes = tape.fa_q_dim * 4;
+                        gpu.memcpy_dtod_at_auto(
+                            &tape.fa_bridge_q_norm_bufs[delta_layer_idx].buf,
+                            tape_offset * q_row_bytes,
+                            &pbs.fa_q_batch.buf,
+                            0,
+                            n * q_row_bytes,
+                        )?;
+                    }
+                }
                 gpu.rmsnorm_batched(
                     &pbs.fa_k_batch,
                     &layer.k_norm,
@@ -21093,6 +21136,21 @@ fn forward_scratch_layers(
                         )?;
                     }
                 }
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let x_for_tape = x_rot_paro.or(x_rot).unwrap_or(&s.tmp);
+                        let hidden_row_bytes = tape.x_in_dim * 4;
+                        gpu.hip.memcpy_dtod_at(
+                            &tape.fa_bridge_x_bufs[delta_layer_idx].buf,
+                            *tape_row * hidden_row_bytes,
+                            &x_for_tape.buf,
+                            0,
+                            hidden_row_bytes,
+                        )?;
+                    }
+                }
                 // Cross-arch fast path: fused 3-way projection for wq+wk+wv.
                 // Works for MQ4 and HF4 — same kernel math as the LA 4-way.
                 let dt = layer.wq.gpu_dtype;
@@ -21254,6 +21312,20 @@ fn forward_scratch_layers(
                         &format!("layer {layer_idx} FullAttnMoe split v projection done"),
                     )?;
                 }
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let q_full_row_bytes = tape.fa_q_full_dim * 4;
+                        gpu.hip.memcpy_dtod_at(
+                            &tape.fa_bridge_q_full_bufs[delta_layer_idx].buf,
+                            *tape_row * q_full_row_bytes,
+                            &s.fa_q_full.buf,
+                            0,
+                            q_full_row_bytes,
+                        )?;
+                    }
+                }
 
                 qwen35_materialize_fa_q(gpu, config, &s.fa_q_full, &s.fa_q, &s.fa_gate, 1)?;
 
@@ -21265,6 +21337,20 @@ fn forward_scratch_layers(
                     config.head_dim,
                     config.norm_eps,
                 )?;
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let q_row_bytes = tape.fa_q_dim * 4;
+                        gpu.hip.memcpy_dtod_at(
+                            &tape.fa_bridge_q_norm_bufs[delta_layer_idx].buf,
+                            *tape_row * q_row_bytes,
+                            &s.fa_q.buf,
+                            0,
+                            q_row_bytes,
+                        )?;
+                    }
+                }
 
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 gpu.rmsnorm_batched(

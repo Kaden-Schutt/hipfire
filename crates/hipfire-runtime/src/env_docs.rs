@@ -1196,18 +1196,25 @@ pub const ENV_HIPFIRE_HFQ4_QKVZA_FAST: EnvVarDoc = EnvVarDoc {
     source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:175",
 };
 
+/// `HIPFIRE_HFQ4_QKV_FAST` — HIPFIRE_HFQ4_QKV_FAST=0 narrows the FA q/k/v batched prefill fast paths
+pub const ENV_HIPFIRE_HFQ4_QKV_FAST: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_HFQ4_QKV_FAST",
+    description: "HIPFIRE_HFQ4_QKV_FAST=0 narrows the FA q/k/v batched prefill fast paths",
+    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:179",
+};
+
 /// `HIPFIRE_HFQ4_GATE_UP_FAST` — HIPFIRE_HFQ4_GATE_UP_FAST=0 narrows the escape hatch to the
 pub const ENV_HIPFIRE_HFQ4_GATE_UP_FAST: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ4_GATE_UP_FAST",
     description: "HIPFIRE_HFQ4_GATE_UP_FAST=0 narrows the escape hatch to the",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:179",
+    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:183",
 };
 
 /// `HIPFIRE_HFQ4_RESIDUAL_FAST` — HIPFIRE_HFQ4_RESIDUAL_FAST=0 narrows the residual-projection
 pub const ENV_HIPFIRE_HFQ4_RESIDUAL_FAST: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_HFQ4_RESIDUAL_FAST",
     description: "HIPFIRE_HFQ4_RESIDUAL_FAST=0 narrows the residual-projection",
-    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:183",
+    source: "/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:187",
 };
 
 /// `HIPFIRE_HFQ6_QKVZA_4W` — Interprets "HIPFIRE_HFQ6_QKVZA_4W" from environment to select behavior
@@ -2763,6 +2770,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_HFQ4G256_MMQ_GFX1151,
     ENV_HIPFIRE_HFQ4_MMQ_GFX906_Y64,
     ENV_HIPFIRE_HFQ4_GATE_UP_FAST,
+    ENV_HIPFIRE_HFQ4_QKV_FAST,
     ENV_HIPFIRE_HFQ4_QKVZA_FAST,
     ENV_HIPFIRE_HFQ4_RESIDUAL_FAST,
     ENV_HIPFIRE_HFQ6_QKVZA_4W,

@@ -172,6 +172,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_HFQ4G256_MMQ_GFX1151` | gfx1151 one-wave i8-WMMA HFQ4-G256 MMQ control: unset auto-routes aligned K=2048 A3B/shared shapes, "0" forces fallback, "1" forces the probe on aligned shapes | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:24049` |
 | `HIPFIRE_HFQ4_MMQ_GFX906_Y64` | Runtime variable controlling hfQ4 mmq gfx906 y64 in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:194` |
 | `HIPFIRE_HFQ4_GATE_UP_FAST` | HIPFIRE_HFQ4_GATE_UP_FAST=0 narrows the escape hatch to the | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:179` |
+| `HIPFIRE_HFQ4_QKV_FAST` | HIPFIRE_HFQ4_QKV_FAST=0 narrows the FA q/k/v batched prefill fast paths | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:179` |
 | `HIPFIRE_HFQ4_QKVZA_FAST` | HIPFIRE_HFQ4_QKVZA_FAST=0 narrows the FP16/WMMA/dot2 prefill | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:175` |
 | `HIPFIRE_HFQ4_RESIDUAL_FAST` | HIPFIRE_HFQ4_RESIDUAL_FAST=0 narrows the residual-projection | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:183` |
 | `HIPFIRE_HFQ6_QKVZA_4W` | Interprets "HIPFIRE_HFQ6_QKVZA_4W" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:26153` |
