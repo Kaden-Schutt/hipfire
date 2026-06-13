@@ -329,6 +329,11 @@
     (`argmax_mismatches=0`, `max_abs=0`, `max_mean_abs=0`). That rules out the traced position's accepted-prefix recurrent/KV/logit state as the
     promotion failure by itself. The remaining batched-prefix blocker is now to find the untraced cycle/session side effect that made whole-run
     promotion diverge before admitting `replay_batched_prefill` for live partial/reject rollback.
+    An all-cycle diagnostic without a trace-position filter, `/tmp/coherence-dflash-20260613-182104.md`, keeps AR parity passing with serial live
+    rollback and shows first-next-token argmax parity for batched-prefix prefill across every rollback cycle (prose `checked=92`,
+    `argmax_mismatches=0`; code `checked=4`, `argmax_mismatches=0`). It also shows why this is still not enough for promotion: batched-prefix
+    recurrent snapshots mismatch serial on multi-token prefixes (prose `matches=32`, `mismatches=60`; code `mismatches=4`), so the next admission
+    cut is a multi-step continuation check or a recurrent-state fix for multi-token prefill rollback, not a one-step argmax-only policy.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
