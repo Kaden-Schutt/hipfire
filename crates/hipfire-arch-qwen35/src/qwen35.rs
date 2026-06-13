@@ -11725,6 +11725,18 @@ fn q8_fa_attention_scalar_loop_enabled() -> bool {
     })
 }
 
+fn q8_fa_attention_serial_kv_loop_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        )
+    })
+}
+
 fn q8_fa_attention_ignore_tree_bias_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -17119,6 +17131,13 @@ fn forward_prefill_chunk(
                             n,
                         )?;
                     }
+                } else if kv_cache.quant_q8 && q8_fa_attention_serial_kv_loop_enabled() {
+                    assert!(
+                        tree_verify.is_none(),
+                        "HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP is a causal Q8 FA diagnostic; tree-verify masking is not supported",
+                    );
+                    // Diagnostic: defer KV writes to the row-serial attention
+                    // loop below so write/read ordering matches serial decode.
                 } else if kv_cache.quant_q8 {
                     gpu.kv_cache_write_q8_0_batched(
                         &kv_cache.k_gpu[layer_idx],
@@ -17323,6 +17342,50 @@ fn forward_prefill_chunk(
                             &s.flash_partials,
                         )?;
                     }
+                } else if kv_cache.quant_q8 && q8_fa_attention_serial_kv_loop_enabled() {
+                    assert!(
+                        tree_verify.is_none(),
+                        "HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP is a causal Q8 FA diagnostic; tree-verify masking is not supported",
+                    );
+                    let q_dim = config.n_heads * config.head_dim;
+                    let kv_dim = config.n_kv_heads * config.head_dim;
+                    let pos_buf_tmp = gpu.hip.malloc(4)?;
+                    for b in 0..n {
+                        let pos_b = position_at_row(b);
+                        let pos_i32 = pos_b as i32;
+                        gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
+                        let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
+                        let k_b = pbs.fa_k_batch.sub_offset(b * kv_dim, kv_dim);
+                        let v_b = pbs.fa_v_batch.sub_offset(b * kv_dim, kv_dim);
+                        let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
+                        gpu.kv_cache_write_q8_0(
+                            &kv_cache.k_gpu[layer_idx],
+                            &k_b,
+                            &pos_buf_tmp,
+                            config.n_kv_heads,
+                            config.head_dim,
+                        )?;
+                        gpu.kv_cache_write_q8_0(
+                            &kv_cache.v_gpu[layer_idx],
+                            &v_b,
+                            &pos_buf_tmp,
+                            config.n_kv_heads,
+                            config.head_dim,
+                        )?;
+                        gpu.attention_q8_0_kv(
+                            &q_b,
+                            &kv_cache.k_gpu[layer_idx],
+                            &kv_cache.v_gpu[layer_idx],
+                            &out_b,
+                            &pos_buf_tmp,
+                            pos_b + 1,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            kv_cache.physical_cap,
+                        )?;
+                    }
+                    let _ = gpu.hip.free(pos_buf_tmp);
                 } else if kv_cache.quant_q8 && max_ctx_len > LDS_CTX_LIMIT {
                     assert!(
                         tree_verify.is_none(),

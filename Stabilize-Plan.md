@@ -156,7 +156,12 @@
     `HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP=1` routes through one-row masked launches, `HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS=1` removes the
     DDTree bias from the Q8 masked path, and `HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP=1` routes each row through the scalar causal
     `attention_q8_0_kv` path. That makes the next cut KV write/read ordering, row-position materialization, or replay/oracle semantics around
-    the FA bridge rather than a pure `attention_q8_0_kv_batched_masked` grid/bias bug.
+    the FA bridge rather than a pure `attention_q8_0_kv_batched_masked` grid/bias bug. A fourth diagnostic,
+    `HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP=1`, defers Q8 FA KV writes and runs each row through serial `kv_cache_write_q8_0(K)`,
+    `kv_cache_write_q8_0(V)`, and scalar `attention_q8_0_kv` in row order; it also reproduces the same `fa_bridge_attn_raw[3]` mismatch
+    (`bytes=24576`, `differing_bytes=6347`, `first_offset=0`, `serial_byte=69`, `gdn_byte=66`). This rules out batched Q8 KV write timing as
+    the active split. The next cut should compare the serial replay oracle semantics and FA bridge row/position materialization around the raw
+    attention capture, or add an explicit serial-vs-batched raw attention oracle before the tape comparison.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

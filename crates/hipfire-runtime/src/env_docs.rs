@@ -231,11 +231,19 @@ pub const ENV_HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP: EnvVarDoc = EnvVarDoc {
     source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11711",
 };
 
+/// `HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP` — Diagnostic: route Q8 FullAttention KV writes and attention through the serial row loop
+pub const ENV_HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP",
+    description:
+        "Diagnostic: route Q8 FullAttention KV writes and attention through the serial row loop",
+    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11725",
+};
+
 /// `HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS` — Diagnostic: ignore DDTree bias in Q8 FullAttention batched attention
 pub const ENV_HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS",
     description: "Diagnostic: ignore DDTree bias in Q8 FullAttention batched attention",
-    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11725",
+    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11739",
 };
 
 /// `HIPFIRE_AWQ_F1_ONLY` — bench against the same binary's F2 quant. Default (env unset):
@@ -2655,6 +2663,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS,
     ENV_HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP,
     ENV_HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP,
+    ENV_HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP,
     ENV_HIPFIRE_AWQ_F1_ONLY,
     ENV_HIPFIRE_BASELINE_ARCH,
     ENV_HIPFIRE_BF16_DENSE_M128,
