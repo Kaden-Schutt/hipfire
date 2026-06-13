@@ -4566,6 +4566,28 @@ fn argmax_u32(logits: &[f32]) -> u32 {
     best as u32
 }
 
+#[inline]
+fn argmax_u32_with_margin(logits: &[f32]) -> (u32, f32, f32, f32) {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    let mut second_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_v {
+            second_v = best_v;
+            best_v = v;
+            best = i;
+        } else if v > second_v {
+            second_v = v;
+        }
+    }
+    let margin = if best_v.is_finite() && second_v.is_finite() {
+        best_v - second_v
+    } else {
+        f32::NAN
+    };
+    (best as u32, best_v, second_v, margin)
+}
+
 /// Temperature-scaled softmax. Writes into `out` (reused across calls to
 /// avoid per-position allocation in the rejection-sampling hot loop).
 #[inline]
@@ -6887,11 +6909,19 @@ pub fn spec_step_dflash(
                         &target.scratch,
                     )?;
                     let serial_logits = gpu.download_f32(&target.scratch.logits)?;
-                    let serial_argmax = argmax_u32(&serial_logits);
+                    let (
+                        serial_argmax,
+                        serial_argmax_logit,
+                        serial_runner_up_logit,
+                        serial_argmax_margin,
+                    ) = argmax_u32_with_margin(&serial_logits);
                     serial_logit_rows.push((
                         compare_token,
                         step_position,
                         serial_argmax,
+                        serial_argmax_logit,
+                        serial_runner_up_logit,
+                        serial_argmax_margin,
                         serial_logits,
                     ));
                     compare_token = serial_argmax;
@@ -6900,8 +6930,18 @@ pub fn spec_step_dflash(
                 fast_replay_result.restore_to(&mut target.dn_state, gpu)?;
                 kv_rows.restore_to(&mut target.kv_cache, gpu)?;
                 gpu.debug_set_gdn_requant_frame(serial_frame_end);
-                for (step, (step_token, step_position, serial_argmax, serial_logits)) in
-                    serial_logit_rows.iter().enumerate()
+                for (
+                    step,
+                    (
+                        step_token,
+                        step_position,
+                        serial_argmax,
+                        serial_argmax_logit,
+                        serial_runner_up_logit,
+                        serial_argmax_margin,
+                        serial_logits,
+                    ),
+                ) in serial_logit_rows.iter().enumerate()
                 {
                     qwen35::forward_scratch(
                         gpu,
@@ -6921,7 +6961,7 @@ pub fn spec_step_dflash(
                         serial_logits.get(token_idx).copied().unwrap_or(f32::NAN);
                     let fast_token_logit = fast_logits.get(token_idx).copied().unwrap_or(f32::NAN);
                     eprintln!(
-                        "[dflash-rollback-next-logit-compare] pos={} step={} compare_steps={} token_pos={} token={} serial_argmax={} fast_argmax={} serial_token_logit={:.8e} fast_token_logit={:.8e} f32_words={} f32_bit_diff_words={} max_abs={:.8e} mean_abs={:.8e} max_rel={:.8e}",
+                        "[dflash-rollback-next-logit-compare] pos={} step={} compare_steps={} token_pos={} token={} serial_argmax={} fast_argmax={} serial_token_logit={:.8e} fast_token_logit={:.8e} f32_words={} f32_bit_diff_words={} max_abs={:.8e} mean_abs={:.8e} max_rel={:.8e} serial_argmax_logit={:.8e} serial_runner_up_logit={:.8e} serial_argmax_margin={:.8e}",
                         position,
                         step,
                         logit_compare_steps,
@@ -6936,14 +6976,27 @@ pub fn spec_step_dflash(
                         logit_stats.max_abs,
                         logit_stats.mean_abs,
                         logit_stats.max_rel,
+                        serial_argmax_logit,
+                        serial_runner_up_logit,
+                        serial_argmax_margin,
                     );
                 }
                 prefill_result.restore_to(&mut target.dn_state, gpu)?;
                 prefill_accepted_kv_rows.restore_to(&mut target.kv_cache, gpu)?;
                 kv_rows.restore_to(&mut target.kv_cache, gpu)?;
                 gpu.debug_set_gdn_requant_frame(prefill_frame_end);
-                for (step, (step_token, step_position, serial_argmax, serial_logits)) in
-                    serial_logit_rows.iter().enumerate()
+                for (
+                    step,
+                    (
+                        step_token,
+                        step_position,
+                        serial_argmax,
+                        serial_argmax_logit,
+                        serial_runner_up_logit,
+                        serial_argmax_margin,
+                        serial_logits,
+                    ),
+                ) in serial_logit_rows.iter().enumerate()
                 {
                     qwen35::forward_scratch(
                         gpu,
@@ -6964,7 +7017,7 @@ pub fn spec_step_dflash(
                     let prefill_token_logit =
                         prefill_logits.get(token_idx).copied().unwrap_or(f32::NAN);
                     eprintln!(
-                        "[dflash-rollback-prefill-next-logit-compare] pos={} step={} compare_steps={} token_pos={} token={} serial_argmax={} prefill_argmax={} serial_token_logit={:.8e} prefill_token_logit={:.8e} f32_words={} f32_bit_diff_words={} max_abs={:.8e} mean_abs={:.8e} max_rel={:.8e}",
+                        "[dflash-rollback-prefill-next-logit-compare] pos={} step={} compare_steps={} token_pos={} token={} serial_argmax={} prefill_argmax={} serial_token_logit={:.8e} prefill_token_logit={:.8e} f32_words={} f32_bit_diff_words={} max_abs={:.8e} mean_abs={:.8e} max_rel={:.8e} serial_argmax_logit={:.8e} serial_runner_up_logit={:.8e} serial_argmax_margin={:.8e}",
                         position,
                         step,
                         logit_compare_steps,
@@ -6979,6 +7032,9 @@ pub fn spec_step_dflash(
                         logit_stats.max_abs,
                         logit_stats.mean_abs,
                         logit_stats.max_rel,
+                        serial_argmax_logit,
+                        serial_runner_up_logit,
+                        serial_argmax_margin,
                     );
                 }
                 serial_result.restore_to(&mut target.dn_state, gpu)?;

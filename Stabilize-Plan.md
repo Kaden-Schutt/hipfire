@@ -347,6 +347,12 @@
     mismatched (`s_matrix[0]`, `differing_bytes=175503`) and the upstream accepted-prefix inputs still diverged (`qkv max_abs=1.02e-2`,
     `gdn_q max_abs=2.46e-5`). This is useful tolerance evidence, but not yet production admission: the next cut is to run the same multi-step
     continuation over all mismatching cycles or define an explicit bounded-logit tolerance policy that can fail closed when margins are too small.
+    The rollback continuation diagnostic now records the serial top-1 margin in the gate report instead of relying on argmax equality alone.
+    Re-running the same position-59 trace after that change, `/tmp/coherence-dflash-20260613-185038.md`, kept AR parity passing and reported
+    fast-tape `max_abs_over_margin=0.174` and scoped-prefill `max_abs_over_margin=0.180` over 8 continuation steps, with
+    `min_serial_argmax_margin=0.599`. That makes the tolerance surface machine-readable and fail-closed for future all-cycle admission work:
+    a cycle can only be considered bounded if its logit drift stays below the observed serial top-1 margin, and recurrent-state mismatch still
+    blocks promotion until the policy is validated across all partial/reject cycles.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

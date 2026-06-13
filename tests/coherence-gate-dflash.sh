@@ -485,7 +485,10 @@ pattern = re.compile(
     r"f32_words=(\d+) f32_bit_diff_words=(\d+) "
     r"max_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
     r"mean_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
-    r"max_rel=([+\-0-9.eE]+|NaN|nan|inf|-inf)$",
+    r"max_rel=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"serial_argmax_logit=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"serial_runner_up_logit=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"serial_argmax_margin=([+\-0-9.eE]+|NaN|nan|inf|-inf)$",
     re.MULTILINE,
 )
 rows = []
@@ -493,6 +496,7 @@ for m in pattern.finditer(out):
     max_abs = float(m.group(12))
     mean_abs = float(m.group(13))
     max_rel = float(m.group(14))
+    serial_argmax_margin = float(m.group(17))
     rows.append({
         "pos": int(m.group(1)),
         "step": int(m.group(2)),
@@ -504,6 +508,14 @@ for m in pattern.finditer(out):
         "max_abs": max_abs,
         "mean_abs": mean_abs,
         "max_rel": max_rel,
+        "serial_argmax_logit": float(m.group(15)),
+        "serial_runner_up_logit": float(m.group(16)),
+        "serial_argmax_margin": serial_argmax_margin,
+        "max_abs_over_margin": (
+            max_abs / serial_argmax_margin
+            if math.isfinite(max_abs) and math.isfinite(serial_argmax_margin) and serial_argmax_margin > 0
+            else None
+        ),
     })
 if not rows:
     print(json.dumps({"ok": True, "checked": 0}))
@@ -512,6 +524,12 @@ mismatches = [r for r in rows if r["serial_argmax"] != r["fast_argmax"]]
 finite_max_abs = [r["max_abs"] for r in rows if math.isfinite(r["max_abs"])]
 finite_mean_abs = [r["mean_abs"] for r in rows if math.isfinite(r["mean_abs"])]
 finite_max_rel = [r["max_rel"] for r in rows if math.isfinite(r["max_rel"])]
+finite_margins = [r["serial_argmax_margin"] for r in rows if math.isfinite(r["serial_argmax_margin"])]
+finite_abs_over_margin = [
+    r["max_abs_over_margin"]
+    for r in rows
+    if r["max_abs_over_margin"] is not None and math.isfinite(r["max_abs_over_margin"])
+]
 payload = {
     "ok": not mismatches,
     "checked": len(rows),
@@ -521,6 +539,8 @@ payload = {
     "max_abs": max(finite_max_abs) if finite_max_abs else None,
     "max_mean_abs": max(finite_mean_abs) if finite_mean_abs else None,
     "max_rel": max(finite_max_rel) if finite_max_rel else None,
+    "min_serial_argmax_margin": min(finite_margins) if finite_margins else None,
+    "max_abs_over_margin": max(finite_abs_over_margin) if finite_abs_over_margin else None,
 }
 if mismatches:
     first = mismatches[0]
@@ -552,7 +572,10 @@ pattern = re.compile(
     r"f32_words=(\d+) f32_bit_diff_words=(\d+) "
     r"max_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
     r"mean_abs=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
-    r"max_rel=([+\-0-9.eE]+|NaN|nan|inf|-inf)$",
+    r"max_rel=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"serial_argmax_logit=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"serial_runner_up_logit=([+\-0-9.eE]+|NaN|nan|inf|-inf) "
+    r"serial_argmax_margin=([+\-0-9.eE]+|NaN|nan|inf|-inf)$",
     re.MULTILINE,
 )
 rows = []
@@ -560,6 +583,7 @@ for m in pattern.finditer(out):
     max_abs = float(m.group(12))
     mean_abs = float(m.group(13))
     max_rel = float(m.group(14))
+    serial_argmax_margin = float(m.group(17))
     rows.append({
         "pos": int(m.group(1)),
         "step": int(m.group(2)),
@@ -571,6 +595,14 @@ for m in pattern.finditer(out):
         "max_abs": max_abs,
         "mean_abs": mean_abs,
         "max_rel": max_rel,
+        "serial_argmax_logit": float(m.group(15)),
+        "serial_runner_up_logit": float(m.group(16)),
+        "serial_argmax_margin": serial_argmax_margin,
+        "max_abs_over_margin": (
+            max_abs / serial_argmax_margin
+            if math.isfinite(max_abs) and math.isfinite(serial_argmax_margin) and serial_argmax_margin > 0
+            else None
+        ),
     })
 if not rows:
     print(json.dumps({"ok": True, "checked": 0}))
@@ -579,6 +611,12 @@ mismatches = [r for r in rows if r["serial_argmax"] != r["prefill_argmax"]]
 finite_max_abs = [r["max_abs"] for r in rows if math.isfinite(r["max_abs"])]
 finite_mean_abs = [r["mean_abs"] for r in rows if math.isfinite(r["mean_abs"])]
 finite_max_rel = [r["max_rel"] for r in rows if math.isfinite(r["max_rel"])]
+finite_margins = [r["serial_argmax_margin"] for r in rows if math.isfinite(r["serial_argmax_margin"])]
+finite_abs_over_margin = [
+    r["max_abs_over_margin"]
+    for r in rows
+    if r["max_abs_over_margin"] is not None and math.isfinite(r["max_abs_over_margin"])
+]
 payload = {
     "ok": not mismatches,
     "checked": len(rows),
@@ -588,6 +626,8 @@ payload = {
     "max_abs": max(finite_max_abs) if finite_max_abs else None,
     "max_mean_abs": max(finite_mean_abs) if finite_mean_abs else None,
     "max_rel": max(finite_max_rel) if finite_max_rel else None,
+    "min_serial_argmax_margin": min(finite_margins) if finite_margins else None,
+    "max_abs_over_margin": max(finite_abs_over_margin) if finite_abs_over_margin else None,
 }
 if mismatches:
     first = mismatches[0]
