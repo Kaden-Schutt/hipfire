@@ -361,6 +361,11 @@
     scoped-prefill drift is `0.19177` (`3.73x` margin). Code remains bounded on this gate (`max_abs_over_margin<=0.112`), but prose blocks
     promotion. The next viable rollback replacement is therefore either eliminating the position-117/120 drift source or adding a live
     fail-closed hybrid that uses fast rollback only when every checked continuation row clears the margin bound and otherwise falls back to serial.
+    The admission parser now carries that bound into `rollback_fast_replay_admission` instead of leaving it as side evidence. Fresh all-cycle
+    evidence, `/tmp/coherence-dflash-20260613-190242.md`, rejects prose with `blockers=["logit_margin_overrun","fast_replay_recurrent_state_mismatch"]`
+    and preserves the same worst row (`pos=117`, `token_pos=120`, `max_abs_over_margin=3.8156`). Code remains logit-bounded on this run
+    (`max_abs_over_margin=0.1043`) but is still rejected on recurrent-state mismatch. This keeps fast rollback admission machine-readable and
+    fail-closed until the drift source is removed or a real live hybrid fallback policy exists.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

@@ -1067,6 +1067,8 @@ if logit_checked <= 0:
     blockers.append("missing_logit_compare")
 elif not logit.get("ok", False):
     blockers.append(logit.get("reason", "logit_argmax_mismatch"))
+elif (logit.get("max_abs_over_margin") is not None) and logit["max_abs_over_margin"] >= 1.0:
+    blockers.append("logit_margin_overrun")
 
 if state_checked <= 0:
     blockers.append("missing_recurrent_state_compare")
@@ -1083,6 +1085,10 @@ if state.get("first_mismatch"):
     payload["first_state_mismatch"] = state["first_mismatch"]
 if logit.get("first_mismatch"):
     payload["first_logit_mismatch"] = logit["first_mismatch"]
+if logit.get("max_abs_over_margin") is not None:
+    payload["max_abs_over_margin"] = logit["max_abs_over_margin"]
+if logit.get("max_abs_over_margin_row"):
+    payload["max_abs_over_margin_row"] = logit["max_abs_over_margin_row"]
 print(json.dumps(payload, sort_keys=True))
 PYEOF
 )
