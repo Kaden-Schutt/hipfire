@@ -434,6 +434,18 @@ Latest rollback diagnostic evidence:
   also reinforces the dense-DFlash graph policy: direct/no-graph verify
   stayed diagnostic-only and the gate rejected it
   (`direct_verify_is_diagnostic_only_for_dflash_ar_parity`).
+- `/tmp/coherence-dflash-qkvza-raw-route-20260613-233011.md` corrected
+  the earlier qkvza-route conclusion by extending the diagnostic beyond
+  `qkv` to the captured raw gate projections. With
+  `HIPFIRE_HFQ4_QKVZA_FAST=0` and `HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN=1`,
+  prose AR parity still failed at token 62, and the route compare now
+  reports `qkvza_route_beta_raw_mismatch` at LA0
+  (`max_abs=4.50865221`, `mean_abs=1.17341781`). The downstream GDN
+  input check also reports raw-gate drift (`gdn_alpha_raw`), while
+  `serial-tape-attn-out.ok=true` still holds. The active fast rollback
+  blocker is therefore in the verify-captured raw gate/qkvza stream
+  feeding LA0 replay, not in token-major replay itself or default-on
+  verify graph capture.
 
 ## References
 

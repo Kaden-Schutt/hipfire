@@ -1241,14 +1241,15 @@ for m in unsupported_pattern.finditer(out):
     }))
 for m in mismatch_pattern.finditer(out):
     context = m.group(12).strip() or None
+    family = m.group(5)
     events.append((m.start(), {
         "ok": False,
-        "reason": "qkvza_route_qkv_mismatch",
+        "reason": f"{family}_mismatch",
         "pos": int(m.group(1)),
         "accepted": int(m.group(2)),
         "replay_steps": int(m.group(3)),
         "layer": int(m.group(4)),
-        "family": m.group(5),
+        "family": family,
         "index": int(m.group(6)),
         "bytes": int(m.group(7)),
         "differing_bytes": int(m.group(8)),

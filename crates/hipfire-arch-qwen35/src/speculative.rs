@@ -3389,17 +3389,47 @@ impl GdnTape {
 
         let result = match dispatch? {
             QkvzaRouteCompare::Unsupported(reason) => QkvzaRouteCompare::Unsupported(reason),
-            QkvzaRouteCompare::Match => match compare_device_buffer_prefix_to_snapshot(
-                gpu,
-                "qkvza_route_qkv",
-                layer_index,
-                &qkv.buf,
-                &self.qkv_bufs[layer_index].buf,
-                n_positions * self.qkv_dim * 4,
-            )? {
-                Some(diff) => QkvzaRouteCompare::Mismatch(diff),
-                None => QkvzaRouteCompare::Match,
-            },
+            QkvzaRouteCompare::Match => {
+                let qkv_bytes = n_positions * self.qkv_dim * 4;
+                let alpha_beta_bytes = n_positions * self.n_v_heads * 4;
+                let mut mismatch = None;
+                for (family, actual, expected, bytes) in [
+                    (
+                        "qkvza_route_qkv",
+                        &qkv.buf,
+                        &self.qkv_bufs[layer_index].buf,
+                        qkv_bytes,
+                    ),
+                    (
+                        "qkvza_route_beta_raw",
+                        &beta.buf,
+                        &self.beta_raw_bufs[layer_index].buf,
+                        alpha_beta_bytes,
+                    ),
+                    (
+                        "qkvza_route_alpha_raw",
+                        &alpha.buf,
+                        &self.alpha_raw_bufs[layer_index].buf,
+                        alpha_beta_bytes,
+                    ),
+                ] {
+                    if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                        gpu,
+                        family,
+                        layer_index,
+                        actual,
+                        expected,
+                        bytes,
+                    )? {
+                        mismatch = Some(diff);
+                        break;
+                    }
+                }
+                match mismatch {
+                    Some(diff) => QkvzaRouteCompare::Mismatch(diff),
+                    None => QkvzaRouteCompare::Match,
+                }
+            }
             QkvzaRouteCompare::Mismatch(diff) => QkvzaRouteCompare::Mismatch(diff),
         };
 
@@ -3959,6 +3989,18 @@ impl GdnTape {
                 &self.v_bufs[layer_index].buf,
                 &expected.v_bufs[layer_index].buf,
                 v_bytes,
+            ),
+            (
+                "gdn_alpha_raw",
+                &self.alpha_raw_bufs[layer_index].buf,
+                &expected.alpha_raw_bufs[layer_index].buf,
+                alpha_beta_bytes,
+            ),
+            (
+                "gdn_beta_raw",
+                &self.beta_raw_bufs[layer_index].buf,
+                &expected.beta_raw_bufs[layer_index].buf,
+                alpha_beta_bytes,
             ),
             (
                 "gdn_alpha",
