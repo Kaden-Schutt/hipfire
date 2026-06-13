@@ -621,6 +621,24 @@ impl Gpu {
         Ok(())
     }
 
+    /// Debug-only access to the Q8 GatedDeltaNet stochastic requantization
+    /// frame. Production paths should consume the frame monotonically; rollback
+    /// diagnostics use this to prove whether two otherwise identical replay
+    /// paths diverge only because they launched with different stochastic
+    /// rounding seeds.
+    #[cfg(feature = "deltanet")]
+    pub fn debug_gdn_requant_frame(&self) -> u32 {
+        // bind_thread: skip — pure atomic state query
+        GDN_REQUANT_FRAME.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// See [`Gpu::debug_gdn_requant_frame`].
+    #[cfg(feature = "deltanet")]
+    pub fn debug_set_gdn_requant_frame(&self, frame: u32) {
+        // bind_thread: skip — pure atomic state update
+        GDN_REQUANT_FRAME.store(frame, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// `bind_thread` for `&mut self -> ()` and `Drop` contexts. Logs to
     /// stderr on hipSetDevice failure instead of swallowing it silently;
     /// no debug_assert (would risk panic-in-Drop on top of an unwinding
