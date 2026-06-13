@@ -229,6 +229,11 @@
     `HIPFIRE_HFQ4_QKV_FAST=0` moves it to `fa_bridge_attn_raw[3]` with a much smaller `max_abs=1.54972076e-6`. These are failed promotion
     attempts, not production policy: disabling fast projection families only localizes the drift ladder. The current next cut is the small
     FullAttention raw-attention drift and whether it can be bounded all the way through recurrent/logit parity.
+    Under that all-projection-fast-off control, `HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL=0.000002` skips the raw-attention split and exposes
+    `x_in[4]` (`max_abs=3.57627869e-7`); adding `HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL=0.000001` skips that and exposes
+    `fa_bridge_input[6]` (`max_abs=1.49011612e-7`). These tolerance walks still leave final recurrent-state drift at `s_matrix[4]`
+    (`differing_bytes=2`, `max_abs=2.59614843e33`), so tolerance at intermediate tape boundaries is not admission evidence. The remaining blocker
+    is proving a bounded recurrent/logit effect for these tiny FA/hidden drifts, or eliminating them before fast replay can be considered.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
