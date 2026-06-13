@@ -4104,17 +4104,18 @@ impl GdnTape {
         ))
     }
 
-    fn replay_gdn_fused_gate_conv_token_major_for_compare(
+    fn replay_gdn_token_major_inner(
         &self,
         gpu: &mut Gpu,
         weights: &qwen35::Qwen35Weights,
         config: &qwen35::Qwen35Config,
         dn_state: &mut qwen35::DeltaNetState,
         n_steps: usize,
+        compare_attn_out: bool,
     ) -> HipResult<Option<(usize, DeltaNetSnapshotDiff)>> {
         assert!(
             n_steps <= self.max_n,
-            "replay_gdn_fused_gate_conv_token_major_for_compare: n_steps {n_steps} > max_n {}",
+            "replay_gdn_token_major_inner: n_steps {n_steps} > max_n {}",
             self.max_n
         );
         let n_v_heads = self.n_v_heads;
@@ -4217,7 +4218,7 @@ impl GdnTape {
                         value_head_dim,
                     )?,
                 }
-                if first_attn_out_diff.is_none() {
+                if compare_attn_out && first_attn_out_diff.is_none() {
                     let expected = self.attn_out_bufs[la_idx].sub_offset(step * v_dim, v_dim);
                     if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
                         gpu,
@@ -4234,6 +4235,29 @@ impl GdnTape {
             }
         }
         Ok(first_attn_out_diff)
+    }
+
+    fn replay_gdn_fused_gate_conv_token_major_for_compare(
+        &self,
+        gpu: &mut Gpu,
+        weights: &qwen35::Qwen35Weights,
+        config: &qwen35::Qwen35Config,
+        dn_state: &mut qwen35::DeltaNetState,
+        n_steps: usize,
+    ) -> HipResult<Option<(usize, DeltaNetSnapshotDiff)>> {
+        self.replay_gdn_token_major_inner(gpu, weights, config, dn_state, n_steps, true)
+    }
+
+    fn replay_gdn_token_major_for_state_compare(
+        &self,
+        gpu: &mut Gpu,
+        weights: &qwen35::Qwen35Weights,
+        config: &qwen35::Qwen35Config,
+        dn_state: &mut qwen35::DeltaNetState,
+        n_steps: usize,
+    ) -> HipResult<()> {
+        self.replay_gdn_token_major_inner(gpu, weights, config, dn_state, n_steps, false)
+            .map(|_| ())
     }
 
     /// Replay the full LA sub-pipeline (conv1d + qk-l2norm + repeat-interleave +
@@ -7717,6 +7741,59 @@ pub fn spec_step_dflash(
                                 }
                                 None => eprintln!(
                                     "[dflash-rollback-qkvza-repair-compare] pos={} accepted={} replay_steps={} forced_serial=1 source={} match",
+                                    position,
+                                    accept_len,
+                                    accept_len + 1,
+                                    repair_source_name,
+                                ),
+                            }
+
+                            target_snap.restore_to(&mut target.dn_state, gpu)?;
+                            gpu.debug_set_gdn_requant_frame(serial_frame_start);
+                            repaired_tape.replay_gdn_token_major_for_state_compare(
+                                gpu,
+                                &target.weights,
+                                &target.config,
+                                &mut target.dn_state,
+                                accept_len + 1,
+                            )?;
+                            let repaired_token_major_frame_end = gpu.debug_gdn_requant_frame();
+                            eprintln!(
+                                "[dflash-rollback-qkvza-repair-token-major-frame-compare] pos={} accepted={} replay_steps={} forced_serial=1 source={} serial_start={} serial_end={} replay_end={}",
+                                position,
+                                accept_len,
+                                accept_len + 1,
+                                repair_source_name,
+                                serial_frame_start,
+                                serial_frame_end,
+                                repaired_token_major_frame_end,
+                            );
+                            gpu.debug_set_gdn_requant_frame(serial_frame_end);
+                            match compare_delta_net_state_to_snapshot(
+                                gpu,
+                                &target.dn_state,
+                                &serial_result,
+                            )? {
+                                Some(diff) => {
+                                    let context = rollback_snapshot_diff_context(&diff);
+                                    eprintln!(
+                                        "[dflash-rollback-qkvza-repair-token-major-compare] pos={} accepted={} replay_steps={} forced_serial=1 source={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} repaired_byte={}{}",
+                                        position,
+                                        accept_len,
+                                        accept_len + 1,
+                                        repair_source_name,
+                                        diff.family,
+                                        diff.index,
+                                        diff.bytes,
+                                        diff.differing_bytes,
+                                        diff.first_offset,
+                                        diff.expected_byte,
+                                        diff.actual_byte,
+                                        context,
+                                    );
+                                }
+                                None => eprintln!(
+                                    "[dflash-rollback-qkvza-repair-token-major-compare] pos={} accepted={} replay_steps={} forced_serial=1 source={} match",
                                     position,
                                     accept_len,
                                     accept_len + 1,

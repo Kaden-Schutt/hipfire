@@ -1350,8 +1350,26 @@ state_mismatch_pattern = re.compile(
     r"first_offset=(\d+) serial_byte=(\d+) repaired_byte=(\d+)(.*)$",
     re.MULTILINE,
 )
+token_major_match_pattern = re.compile(
+    r"^\[dflash-rollback-qkvza-repair-token-major-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 source=([A-Za-z0-9_]+) match$",
+    re.MULTILINE,
+)
+token_major_state_mismatch_pattern = re.compile(
+    r"^\[dflash-rollback-qkvza-repair-token-major-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 source=([A-Za-z0-9_]+) mismatch "
+    r"family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) differing_bytes=(\d+) "
+    r"first_offset=(\d+) serial_byte=(\d+) repaired_byte=(\d+)(.*)$",
+    re.MULTILINE,
+)
 frame_pattern = re.compile(
     r"^\[dflash-rollback-qkvza-repair-frame-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 "
+    r"source=([A-Za-z0-9_]+) serial_start=(\d+) serial_end=(\d+) replay_end=(\d+)$",
+    re.MULTILINE,
+)
+token_major_frame_pattern = re.compile(
+    r"^\[dflash-rollback-qkvza-repair-token-major-frame-compare\] "
     r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 "
     r"source=([A-Za-z0-9_]+) serial_start=(\d+) serial_end=(\d+) replay_end=(\d+)$",
     re.MULTILINE,
@@ -1377,6 +1395,7 @@ for m in match_pattern.finditer(out):
         "accepted": int(m.group(2)),
         "replay_steps": int(m.group(3)),
         "source": m.group(4),
+        "kind": "layer_major",
     }))
 for m in unsupported_pattern.finditer(out):
     events.append((m.start(), {
@@ -1388,6 +1407,7 @@ for m in unsupported_pattern.finditer(out):
         "accepted": int(m.group(2)),
         "replay_steps": int(m.group(3)),
         "source": m.group(4),
+        "kind": "layer_major",
     }))
 for pattern, reason in [
     (repair_mismatch_pattern, "qkvza_repair_projection_mismatch"),
@@ -1402,6 +1422,7 @@ for pattern, reason in [
             "accepted": int(m.group(2)),
             "replay_steps": int(m.group(3)),
             "source": m.group(4),
+            "kind": "layer_major",
             "family": m.group(5),
             "index": int(m.group(6)),
             "bytes": int(m.group(7)),
@@ -1412,6 +1433,35 @@ for pattern, reason in [
             "context": context,
             "stats": parse_context(context),
         }))
+for m in token_major_match_pattern.finditer(out):
+    events.append((m.start(), {
+        "ok": True,
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+        "source": m.group(4),
+        "kind": "token_major",
+    }))
+for m in token_major_state_mismatch_pattern.finditer(out):
+    context = m.group(12).strip() or None
+    events.append((m.start(), {
+        "ok": False,
+        "reason": "qkvza_repair_token_major_replay_state_mismatch",
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+        "source": m.group(4),
+        "kind": "token_major",
+        "family": m.group(5),
+        "index": int(m.group(6)),
+        "bytes": int(m.group(7)),
+        "differing_bytes": int(m.group(8)),
+        "first_offset": int(m.group(9)),
+        "expected_byte": int(m.group(10)),
+        "actual_byte": int(m.group(11)),
+        "context": context,
+        "stats": parse_context(context),
+    }))
 
 frames = [
     {
@@ -1419,12 +1469,26 @@ frames = [
         "accepted": int(m.group(2)),
         "replay_steps": int(m.group(3)),
         "source": m.group(4),
+        "kind": "layer_major",
         "serial_start": int(m.group(5)),
         "serial_end": int(m.group(6)),
         "replay_end": int(m.group(7)),
     }
     for m in frame_pattern.finditer(out)
 ]
+frames.extend([
+    {
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+        "source": m.group(4),
+        "kind": "token_major",
+        "serial_start": int(m.group(5)),
+        "serial_end": int(m.group(6)),
+        "replay_end": int(m.group(7)),
+    }
+    for m in token_major_frame_pattern.finditer(out)
+])
 events.sort(key=lambda event: event[0])
 checks = [event for _, event in events]
 mismatches = [event for event in checks if not event.get("ok", False)]
