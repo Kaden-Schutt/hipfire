@@ -932,6 +932,15 @@ impl DeltaNetSnapshot {
 }
 
 #[derive(Debug)]
+struct F32DiffStats {
+    words: usize,
+    bit_different_words: usize,
+    max_abs: f32,
+    mean_abs: f32,
+    max_rel: f32,
+}
+
+#[derive(Debug)]
 struct DeltaNetSnapshotDiff {
     family: &'static str,
     index: usize,
@@ -942,12 +951,60 @@ struct DeltaNetSnapshotDiff {
     actual_byte: u8,
     expected_f32: Option<f32>,
     actual_f32: Option<f32>,
+    f32_stats: Option<F32DiffStats>,
 }
 
 fn first_mismatched_f32(bytes: &[u8], first_offset: usize) -> Option<f32> {
     let float_offset = first_offset.saturating_sub(first_offset % 4);
     let word = bytes.get(float_offset..float_offset + 4)?;
     Some(f32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
+}
+
+fn f32_diff_stats(actual: &[u8], expected: &[u8]) -> Option<F32DiffStats> {
+    if actual.len() != expected.len() || actual.len() % 4 != 0 {
+        return None;
+    }
+    let mut words = 0usize;
+    let mut bit_different_words = 0usize;
+    let mut max_abs = 0.0f32;
+    let mut sum_abs = 0.0f64;
+    let mut max_rel = 0.0f32;
+    for (actual_word, expected_word) in actual.chunks_exact(4).zip(expected.chunks_exact(4)) {
+        let actual_value = f32::from_ne_bytes([
+            actual_word[0],
+            actual_word[1],
+            actual_word[2],
+            actual_word[3],
+        ]);
+        let expected_value = f32::from_ne_bytes([
+            expected_word[0],
+            expected_word[1],
+            expected_word[2],
+            expected_word[3],
+        ]);
+        words += 1;
+        if actual_value.to_bits() != expected_value.to_bits() {
+            bit_different_words += 1;
+        }
+        let abs = (actual_value - expected_value).abs();
+        if abs.is_finite() {
+            max_abs = max_abs.max(abs);
+            sum_abs += abs as f64;
+            let denom = expected_value.abs().max(1.0e-12);
+            max_rel = max_rel.max(abs / denom);
+        }
+    }
+    Some(F32DiffStats {
+        words,
+        bit_different_words,
+        max_abs,
+        mean_abs: if words == 0 {
+            0.0
+        } else {
+            (sum_abs / words as f64) as f32
+        },
+        max_rel,
+    })
 }
 
 fn compare_device_buffer_to_snapshot(
@@ -969,6 +1026,7 @@ fn compare_device_buffer_to_snapshot(
             actual_byte: 0,
             expected_f32: None,
             actual_f32: None,
+            f32_stats: None,
         }));
     }
     let mut actual_host = vec![0u8; bytes];
@@ -993,6 +1051,7 @@ fn compare_device_buffer_to_snapshot(
         actual_byte: actual_host[first_offset],
         expected_f32: first_mismatched_f32(&expected_host, first_offset),
         actual_f32: first_mismatched_f32(&actual_host, first_offset),
+        f32_stats: f32_diff_stats(&actual_host, &expected_host),
     }))
 }
 
@@ -1015,6 +1074,7 @@ fn compare_device_buffer_prefix_to_snapshot(
             actual_byte: 0,
             expected_f32: None,
             actual_f32: None,
+            f32_stats: None,
         }));
     }
     let mut actual_host = vec![0u8; bytes];
@@ -1039,6 +1099,7 @@ fn compare_device_buffer_prefix_to_snapshot(
         actual_byte: actual_host[first_offset],
         expected_f32: first_mismatched_f32(&expected_host, first_offset),
         actual_f32: first_mismatched_f32(&actual_host, first_offset),
+        f32_stats: f32_diff_stats(&actual_host, &expected_host),
     }))
 }
 
@@ -1100,6 +1161,20 @@ fn rollback_input_diff_context(
         }
         _ => String::new(),
     };
+    let stats_context = diff
+        .f32_stats
+        .as_ref()
+        .map(|stats| {
+            format!(
+                " f32_words={} f32_bit_diff_words={} max_abs={:.8e} mean_abs={:.8e} max_rel={:.8e}",
+                stats.words,
+                stats.bit_different_words,
+                stats.max_abs,
+                stats.mean_abs,
+                stats.max_rel
+            )
+        })
+        .unwrap_or_default();
     let row_context = |row_stride: usize| {
         if row_stride == 0 {
             return None;
@@ -1114,11 +1189,11 @@ fn rollback_input_diff_context(
                 let head = elem / config.head_dim;
                 let dim = elem % config.head_dim;
                 format!(
-                    " row={} logical_pos={} elem={} head={} head_dim={} byte_in_f32={}{}",
-                    row, logical_pos, elem, head, dim, byte_in_float, value_context
+                    " row={} logical_pos={} elem={} head={} head_dim={} byte_in_f32={}{}{}",
+                    row, logical_pos, elem, head, dim, byte_in_float, value_context, stats_context
                 )
             } else {
-                format!(" byte_in_f32={byte_in_float}{value_context}")
+                format!(" byte_in_f32={byte_in_float}{value_context}{stats_context}")
             }
         }
         "fa_bridge_q_full" => {
@@ -1128,11 +1203,11 @@ fn rollback_input_diff_context(
                 let head = split_elem / config.head_dim;
                 let dim = split_elem % config.head_dim;
                 format!(
-                    " row={} logical_pos={} elem={} split={} split_elem={} head={} head_dim={} byte_in_f32={}{}",
-                    row, logical_pos, elem, gate_split, split_elem, head, dim, byte_in_float, value_context
+                    " row={} logical_pos={} elem={} split={} split_elem={} head={} head_dim={} byte_in_f32={}{}{}",
+                    row, logical_pos, elem, gate_split, split_elem, head, dim, byte_in_float, value_context, stats_context
                 )
             } else {
-                format!(" byte_in_f32={byte_in_float}{value_context}")
+                format!(" byte_in_f32={byte_in_float}{value_context}{stats_context}")
             }
         }
         "fa_bridge_k" | "fa_bridge_v" => {
@@ -1140,55 +1215,55 @@ fn rollback_input_diff_context(
                 let head = elem / config.head_dim;
                 let dim = elem % config.head_dim;
                 format!(
-                    " row={} logical_pos={} elem={} kv_head={} head_dim={} byte_in_f32={}{}",
-                    row, logical_pos, elem, head, dim, byte_in_float, value_context
+                    " row={} logical_pos={} elem={} kv_head={} head_dim={} byte_in_f32={}{}{}",
+                    row, logical_pos, elem, head, dim, byte_in_float, value_context, stats_context
                 )
             } else {
-                format!(" byte_in_f32={byte_in_float}{value_context}")
+                format!(" byte_in_f32={byte_in_float}{value_context}{stats_context}")
             }
         }
         "fa_bridge_input" | "fa_bridge_x" | "fa_bridge_wo_residual" | "fa_bridge_layer_out" => {
             if let Some((row, logical_pos, elem)) = row_context(tape.x_in_dim) {
                 format!(
-                    " row={} logical_pos={} hidden_elem={} byte_in_f32={}{}",
-                    row, logical_pos, elem, byte_in_float, value_context
+                    " row={} logical_pos={} hidden_elem={} byte_in_f32={}{}{}",
+                    row, logical_pos, elem, byte_in_float, value_context, stats_context
                 )
             } else {
-                format!(" byte_in_f32={byte_in_float}{value_context}")
+                format!(" byte_in_f32={byte_in_float}{value_context}{stats_context}")
             }
         }
         "x_in" | "wo_residual_in" | "attn_residual" | "ffn_input" | "w_down_residual_in"
         | "layer_out" => {
             if let Some((row, logical_pos, elem)) = row_context(tape.x_in_dim) {
                 format!(
-                    " row={} logical_pos={} hidden_elem={} byte_in_f32={}{}",
-                    row, logical_pos, elem, byte_in_float, value_context
+                    " row={} logical_pos={} hidden_elem={} byte_in_f32={}{}{}",
+                    row, logical_pos, elem, byte_in_float, value_context, stats_context
                 )
             } else {
-                format!(" byte_in_f32={byte_in_float}{value_context}")
+                format!(" byte_in_f32={byte_in_float}{value_context}{stats_context}")
             }
         }
         "qkv" => {
             if let Some((row, logical_pos, elem)) = row_context(tape.qkv_dim) {
                 format!(
-                    " row={} logical_pos={} qkv_elem={} byte_in_f32={}{}",
-                    row, logical_pos, elem, byte_in_float, value_context
+                    " row={} logical_pos={} qkv_elem={} byte_in_f32={}{}{}",
+                    row, logical_pos, elem, byte_in_float, value_context, stats_context
                 )
             } else {
-                format!(" byte_in_f32={byte_in_float}{value_context}")
+                format!(" byte_in_f32={byte_in_float}{value_context}{stats_context}")
             }
         }
         "ffn_gate" | "ffn_up" | "w_down_input" => {
             if let Some((row, logical_pos, elem)) = row_context(tape.ffn_dim) {
                 format!(
-                    " row={} logical_pos={} ffn_elem={} byte_in_f32={}{}",
-                    row, logical_pos, elem, byte_in_float, value_context
+                    " row={} logical_pos={} ffn_elem={} byte_in_f32={}{}{}",
+                    row, logical_pos, elem, byte_in_float, value_context, stats_context
                 )
             } else {
-                format!(" byte_in_f32={byte_in_float}{value_context}")
+                format!(" byte_in_f32={byte_in_float}{value_context}{stats_context}")
             }
         }
-        _ => format!(" byte_in_f32={byte_in_float}{value_context}"),
+        _ => format!(" byte_in_f32={byte_in_float}{value_context}{stats_context}"),
     }
 }
 

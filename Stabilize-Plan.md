@@ -165,6 +165,10 @@
     the same compare shows the first differing word is the first FA raw output element for replay row 0 at logical position 120, head 0/dim 0:
     serial `actual_f32=2.97952801e-1` versus GDN tape `expected_f32=2.97952712e-1`. The tiny first-value delta with many differing bytes points
     at reduction/order or oracle-tolerance semantics for the FA raw attention stage, not a wrong row, wrong logical position, or wrong head slice.
+    Adding full-buffer f32 diff stats confirms the magnitude is small but broad: `f32_words=6144`, `f32_bit_diff_words=5848`,
+    `max_abs=1.66893005e-6`, `mean_abs=1.52590843e-7`, `max_rel=1.76467560e-2`. The next cut is to decide whether fast rollback input
+    comparisons need tolerance at FA raw attention boundaries, then prove the resulting recurrent/logit state still matches the serial oracle within
+    an admission-grade tolerance before promoting any GDN-tape replay path.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
