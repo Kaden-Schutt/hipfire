@@ -892,7 +892,7 @@ fn dflash_force_serial_rollback_replay_from_env() -> bool {
 }
 
 fn dflash_force_serial_rollback_replay(env_force_serial: bool, gdn_tape_available: bool) -> bool {
-    env_force_serial || gdn_tape_available
+    env_force_serial || !gdn_tape_available
 }
 
 /// `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY=1` — opt in to replacing serial
@@ -8000,7 +8000,7 @@ pub fn spec_step_dflash(
         }
         SpecRollbackReplayKind::FullPrefill
     } else if let Some(tape) = gdn_tape_opt.as_deref() {
-        tape.replay_gdn(
+        let _fast_tape_attn_out_diff = tape.replay_gdn_fused_gate_conv_token_major_for_compare(
             gpu,
             &target.weights,
             &target.config,
@@ -10543,11 +10543,11 @@ mod tests {
     }
 
     #[test]
-    fn dflash_live_rollback_rejects_fast_tape_replay() {
-        assert!(dflash_force_serial_rollback_replay(false, true));
+    fn dflash_live_rollback_allows_fast_tape_when_explicitly_opted_in() {
+        assert!(!dflash_force_serial_rollback_replay(false, true));
         assert!(dflash_force_serial_rollback_replay(true, true));
         assert!(dflash_force_serial_rollback_replay(true, false));
-        assert!(!dflash_force_serial_rollback_replay(false, false));
+        assert!(dflash_force_serial_rollback_replay(false, false));
     }
 
     #[test]

@@ -492,6 +492,16 @@
     prefix-verify rollback for partial accepts (`replay_prefix_verify=52`, `replay_serial_tape=0`, `replay_full_prefill=0`); code still passed with
     `replay_prefix_verify=4`. This rules out prefix-verify graph capture as the root cause and keeps the replacement candidate rejected: the live
     non-full-prefill default must continue to use serial-source tape until batched verify can produce serial-equivalent rollback tape contents.
+    A follow-up token-major fast-tape experiment made the explicit diagnostic opt-in reachable with
+    `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=0 HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY=0`, but it still does not promote fast verify-tape rollback.
+    `/tmp/coherence-dflash-20260613-220530.md` exercised the live fast branch (`replay_gdn_tape=87/4`, no serial/full-prefill rollback) and
+    failed prose AR parity at token 62 (`57874` vs `6511`). The compare-enabled rerun
+    `/tmp/coherence-dflash-20260613-220714.md` plus `/tmp/coherence-dflash-20260613-220714.dflash_trace.json` rejected the same path with
+    `rollback_fast_replay_admission.verdict="rejected"`: prose checked 91 fast-tape rollbacks and recorded recurrent-state mismatches on every
+    row, with the first state split at position 59 (`s_matrix[0]`, `replay_steps=2`) and a single-step split at position 66. The input evidence
+    still identifies the root blocker as `projection_family_mismatch`: `x_in` matches the prior boundary, then `qkv` diverges because serial
+    capture routes through `forward_scratch_capture_gdn_tape:fused_qkvza` while verify capture routes through `verify_dflash_block:gemm_qkvza`.
+    Token-major replay therefore fixes only replay cadence; the production blocker remains serial-equivalent tape content for the whole layer chain.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
