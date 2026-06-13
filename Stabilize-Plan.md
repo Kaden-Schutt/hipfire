@@ -147,7 +147,11 @@
     `serial_byte=64`, `gdn_byte=16`), before q_norm/RoPE. A broad `HIPFIRE_FP16=0` A/B clears `fa_bridge_q_full` and moves the first
     mismatch to `fa_bridge_attn_out[3]` (`bytes=24576`, `differing_bytes=9335`, `first_offset=0`, `serial_byte=14`, `gdn_byte=10`). The
     narrower diagnostic flag `HIPFIRE_HFQ4_QKV_FAST=0` reproduces that move without disabling unrelated HFQ4 fast paths. The next cut is
-    FullAttention output capture before/after the output gate now that q/k/v parity can be forced independently.
+    FullAttention output capture before/after the output gate now that q/k/v parity can be forced independently. Adding a pre-gate
+    `fa_bridge_attn_raw` capture shows the split is already in the raw attention output (`fa_bridge_attn_raw[3]`, `bytes=24576`,
+    `differing_bytes=6347`, `first_offset=0`, `serial_byte=69`, `gdn_byte=66`) under
+    `HIPFIRE_HFQ4_QKV_FAST=0 HIPFIRE_HFQ4_QKVZA_FAST=0 HIPFIRE_HFQ4_GATE_UP_FAST=0 HIPFIRE_HFQ4_RESIDUAL_FAST=0`. The next blocker is
+    batched Q8 FullAttention attention semantics: mask/bias, per-row position, KV write/read ordering, or the Q8 batched attention kernel.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

@@ -17362,6 +17362,20 @@ fn forward_prefill_chunk(
                         block_cols,
                     )?;
                 }
+                if let Some(tape) = gdn_tape.as_ref() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let q_row_bytes = tape.fa_q_dim * 4;
+                        gpu.memcpy_dtod_at_auto(
+                            &tape.fa_bridge_attn_raw_bufs[delta_layer_idx].buf,
+                            tape_offset * q_row_bytes,
+                            &pbs.fa_attn_out_batch.buf,
+                            0,
+                            n * q_row_bytes,
+                        )?;
+                    }
+                }
 
                 qwen35_apply_fa_gate(gpu, config, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
                 if let Some(tape) = gdn_tape.as_ref() {
@@ -21683,6 +21697,20 @@ fn forward_scratch_layers(
                         config.head_dim,
                         kv_cache.physical_cap,
                     )?;
+                }
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    if delta_layer_idx < tape.fa_bridge_valid.len()
+                        && tape.fa_bridge_valid[delta_layer_idx]
+                    {
+                        let q_row_bytes = tape.fa_q_dim * 4;
+                        gpu.hip.memcpy_dtod_at(
+                            &tape.fa_bridge_attn_raw_bufs[delta_layer_idx].buf,
+                            *tape_row * q_row_bytes,
+                            &s.fa_attn_out.buf,
+                            0,
+                            q_row_bytes,
+                        )?;
+                    }
                 }
 
                 qwen35_apply_fa_gate(gpu, config, &s.fa_attn_out, &s.fa_gate)?;
