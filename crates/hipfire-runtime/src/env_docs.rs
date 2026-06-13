@@ -246,6 +246,13 @@ pub const ENV_HIPFIRE_Q8_FA_ATTENTION_IGNORE_TREE_BIAS: EnvVarDoc = EnvVarDoc {
     source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11739",
 };
 
+/// `HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN` — Diagnostic: route batched Q8 GDN verify updates through per-token GDN kernels
+pub const ENV_HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN",
+    description: "Diagnostic: route batched Q8 GDN verify updates through per-token GDN kernels",
+    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11753",
+};
+
 /// `HIPFIRE_AWQ_F1_ONLY` — bench against the same binary's F2 quant. Default (env unset):
 pub const ENV_HIPFIRE_AWQ_F1_ONLY: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_AWQ_F1_ONLY",
@@ -2678,6 +2685,7 @@ pub const ALL_ENV_VARS: &[EnvVarDoc] = &[
     ENV_HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP,
     ENV_HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP,
     ENV_HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP,
+    ENV_HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN,
     ENV_HIPFIRE_AWQ_F1_ONLY,
     ENV_HIPFIRE_BASELINE_ARCH,
     ENV_HIPFIRE_BF16_DENSE_M128,

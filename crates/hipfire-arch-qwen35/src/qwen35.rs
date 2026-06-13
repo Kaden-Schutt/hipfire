@@ -11749,6 +11749,18 @@ fn q8_fa_attention_ignore_tree_bias_enabled() -> bool {
     })
 }
 
+fn q8_gdn_verify_per_token_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        )
+    })
+}
+
 fn kld_fp32_gqa4_attention_eligible(
     gpu: &Gpu,
     kv_cache: &llama::KvCache,
@@ -15851,6 +15863,28 @@ fn forward_prefill_chunk(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
+                } else if gdn_tape.is_some() && q8_gdn_verify_per_token_enabled() {
+                    for step in 0..n {
+                        let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
+                        let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
+                        let v = pbs.dn_v_batch.sub_offset(step * v_dim, v_dim);
+                        let alpha = pbs.dn_alpha_batch.sub_offset(step * n_v_heads, n_v_heads);
+                        let beta = pbs.dn_beta_batch.sub_offset(step * n_v_heads, n_v_heads);
+                        let out = pbs.dn_attn_out_batch.sub_offset(step * v_dim, v_dim);
+                        gpu.gated_delta_net_q8(
+                            &q,
+                            &k,
+                            &v,
+                            &alpha,
+                            &beta,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &dn_state.s_scales[delta_layer_idx],
+                            &out,
+                            1,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?;
+                    }
                 } else {
                     gpu.gated_delta_net_q8_batch_seq(
                         &pbs.dn_q_batch,
@@ -18575,6 +18609,28 @@ fn forward_prefill_chunk(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
+                } else if gdn_tape.is_some() && q8_gdn_verify_per_token_enabled() {
+                    for step in 0..n {
+                        let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
+                        let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
+                        let v = pbs.dn_v_batch.sub_offset(step * v_dim, v_dim);
+                        let alpha = pbs.dn_alpha_batch.sub_offset(step * n_v_heads, n_v_heads);
+                        let beta = pbs.dn_beta_batch.sub_offset(step * n_v_heads, n_v_heads);
+                        let out = pbs.dn_attn_out_batch.sub_offset(step * v_dim, v_dim);
+                        gpu.gated_delta_net_q8(
+                            &q,
+                            &k,
+                            &v,
+                            &alpha,
+                            &beta,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &dn_state.s_scales[delta_layer_idx],
+                            &out,
+                            1,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?;
+                    }
                 } else {
                     gpu.gated_delta_net_q8_batch_seq(
                         &pbs.dn_q_batch,

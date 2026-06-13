@@ -189,8 +189,13 @@
     itself: compare the fast verify GDN update's LA0 inputs, quant frame/order, and kernel path against the byte-exact serial-tape replay. A direct
     LA0 `q/k/v/alpha/beta` input compare now reports `dflash-rollback-la0-gdn-input-compare ... match` on the same position-120 repro, so the
     mismatch is not in the captured LA0 recurrence inputs. The next blocker is fast verify's GDN update semantics for LA0: batched vs per-token
-    kernel path, state requant frame/order, or the way verify advances/stores Q8 recurrent state. Fast rollback replay remains diagnostic-only
-    until tolerance semantics are tied to final recurrent/logit parity evidence.
+    kernel path, state requant frame/order, or the way verify advances/stores Q8 recurrent state. An opt-in
+    `HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN=1` diagnostic routes tape-capturing Q8 verify GDN updates through per-token `gated_delta_net_q8`, but the
+    position-120 repro still mismatches at `s_matrix[0]` with huge magnitude while LA0 `q/k/v/alpha/beta`, serial-tape replay inputs, and
+    serial-tape layer state all match. That rules out the simple batched-vs-per-token kernel cadence as a complete explanation. The next cut is
+    comparing the fast verify post-GDN state snapshot immediately after LA0 against the serial-tape post-LA0 state, including Q8 scale buffers and
+    the debug requant frame counter, to determine whether verify writes a different Q8 state representation before later layers run. Fast rollback
+    replay remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity evidence.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

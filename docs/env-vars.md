@@ -308,6 +308,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_Q8_FA_ATTENTION_ROW_LOOP` | Diagnostic: route Q8 FullAttention batched rows through one-row masked launches | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11697` |
 | `HIPFIRE_Q8_FA_ATTENTION_SCALAR_LOOP` | Diagnostic: route Q8 FullAttention rows through scalar causal Q8 attention | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11711` |
 | `HIPFIRE_Q8_FA_ATTENTION_SERIAL_KV_LOOP` | Diagnostic: route Q8 FullAttention KV writes and attention through the serial row loop | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11725` |
+| `HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN` | Diagnostic: route batched Q8 GDN verify updates through per-token GDN kernels | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11753` |
 | `HIPFIRE_Q8_GATE_UP_4W` | gfx1151 Q8 gate+up 4w control: unset auto-routes aligned N>=128, "0" forces single-wave WMMA, "1" forces 4w for aligned N%64==0 experiments | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:130` |
 | `HIPFIRE_Q8_GATE_UP_BENCH` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:129` |
 | `HIPFIRE_Q8_TOKPAR` | (A) NEW token-parallel | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:174` |
