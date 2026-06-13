@@ -6425,73 +6425,29 @@ pub fn spec_step_dflash(
             }
             target_snap.restore_to(&mut target.dn_state, gpu)?;
             gpu.debug_set_gdn_requant_frame(serial_frame_start);
-            let (fast_post_fused_diff, fast_gdn_input_diff, fast_layer_state_diff) = tape
-                .replay_gdn_fused_gate_conv_for_compare(
-                    gpu,
-                    &target.weights,
-                    &target.config,
-                    &mut target.dn_state,
-                    &serial_result,
-                    accept_len + 1,
-                )?;
-            let fast_replay_frame_end = gpu.debug_gdn_requant_frame();
+            tape.replay_gdn_fused_gate_conv_token_major_for_compare(
+                gpu,
+                &target.weights,
+                &target.config,
+                &mut target.dn_state,
+                accept_len + 1,
+            )?;
+            let fast_token_major_frame_end = gpu.debug_gdn_requant_frame();
             eprintln!(
-                "[dflash-rollback-fast-gdn-frame-compare] pos={} accepted={} replay_steps={} serial_start={} serial_end={} replay_end={}",
+                "[dflash-rollback-fast-token-major-frame-compare] pos={} accepted={} replay_steps={} serial_start={} serial_end={} replay_end={}",
                 position,
                 accept_len,
                 accept_len + 1,
                 serial_frame_start,
                 serial_frame_end,
-                fast_replay_frame_end,
+                fast_token_major_frame_end,
             );
             gpu.debug_set_gdn_requant_frame(serial_frame_end);
-            match fast_post_fused_diff {
-                Some(diff) => eprintln!(
-                    "[dflash-rollback-fast-fused-output-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} tape_byte={} replay_byte={}",
-                    position,
-                    accept_len,
-                    accept_len + 1,
-                    diff.family,
-                    diff.index,
-                    diff.bytes,
-                    diff.differing_bytes,
-                    diff.first_offset,
-                    diff.expected_byte,
-                    diff.actual_byte,
-                ),
-                None => eprintln!(
-                    "[dflash-rollback-fast-fused-output-compare] pos={} accepted={} replay_steps={} match",
-                    position,
-                    accept_len,
-                    accept_len + 1,
-                ),
-            }
-            match fast_gdn_input_diff {
-                Some(diff) => eprintln!(
-                    "[dflash-rollback-fast-gdn-input-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} tape_byte={} replay_byte={}",
-                    position,
-                    accept_len,
-                    accept_len + 1,
-                    diff.family,
-                    diff.index,
-                    diff.bytes,
-                    diff.differing_bytes,
-                    diff.first_offset,
-                    diff.expected_byte,
-                    diff.actual_byte,
-                ),
-                None => eprintln!(
-                    "[dflash-rollback-fast-gdn-input-compare] pos={} accepted={} replay_steps={} match",
-                    position,
-                    accept_len,
-                    accept_len + 1,
-                ),
-            }
-            match fast_layer_state_diff {
+            match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &serial_result)? {
                 Some(diff) => {
                     let context = rollback_snapshot_diff_context(&diff);
                     eprintln!(
-                        "[dflash-rollback-fast-layer-state-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} replay_byte={}{}",
+                        "[dflash-rollback-fast-token-major-serial-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} fast_token_major_byte={}{}",
                         position,
                         accept_len,
                         accept_len + 1,
@@ -6506,7 +6462,32 @@ pub fn spec_step_dflash(
                     );
                 }
                 None => eprintln!(
-                    "[dflash-rollback-fast-layer-state-compare] pos={} accepted={} replay_steps={} match",
+                    "[dflash-rollback-fast-token-major-serial-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+            }
+            match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &gdn_result)? {
+                Some(diff) => {
+                    let context = rollback_snapshot_diff_context(&diff);
+                    eprintln!(
+                        "[dflash-rollback-fast-token-major-vs-production-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} fast_token_major_byte={} production_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.actual_byte,
+                        diff.expected_byte,
+                        context,
+                    );
+                }
+                None => eprintln!(
+                    "[dflash-rollback-fast-token-major-vs-production-compare] pos={} accepted={} replay_steps={} match",
                     position,
                     accept_len,
                     accept_len + 1,
