@@ -186,8 +186,11 @@
     whose state magnitude diverges. Adding that per-LA state compare to the serial-tape diagnostic shows the replayed serial tape matches the
     serial final recurrent state layer-by-layer (`dflash-rollback-layer-state-compare ... match`) even when the original fast verify result still
     differs from serial at `s_matrix[0]` with the same huge magnitude. That narrows the next blocker to the fast verify-produced GDN state for LA0
-    itself: compare the fast verify GDN update's LA0 inputs, quant frame/order, and kernel path against the byte-exact serial-tape replay. Fast
-    rollback replay remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity evidence.
+    itself: compare the fast verify GDN update's LA0 inputs, quant frame/order, and kernel path against the byte-exact serial-tape replay. A direct
+    LA0 `q/k/v/alpha/beta` input compare now reports `dflash-rollback-la0-gdn-input-compare ... match` on the same position-120 repro, so the
+    mismatch is not in the captured LA0 recurrence inputs. The next blocker is fast verify's GDN update semantics for LA0: batched vs per-token
+    kernel path, state requant frame/order, or the way verify advances/stores Q8 recurrent state. Fast rollback replay remains diagnostic-only
+    until tolerance semantics are tied to final recurrent/logit parity evidence.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

@@ -3038,6 +3038,61 @@ impl GdnTape {
         Ok(None)
     }
 
+    fn compare_gdn_inputs_layer_to(
+        &self,
+        gpu: &Gpu,
+        expected: &GdnTape,
+        layer_index: usize,
+        n_positions: usize,
+    ) -> HipResult<Option<DeltaNetSnapshotDiff>> {
+        let v_bytes = n_positions * self.v_dim * 4;
+        let alpha_beta_bytes = n_positions * self.n_v_heads * 4;
+        for (family, actual, expected, bytes) in [
+            (
+                "gdn_q",
+                &self.q_bufs[layer_index].buf,
+                &expected.q_bufs[layer_index].buf,
+                v_bytes,
+            ),
+            (
+                "gdn_k",
+                &self.k_bufs[layer_index].buf,
+                &expected.k_bufs[layer_index].buf,
+                v_bytes,
+            ),
+            (
+                "gdn_v",
+                &self.v_bufs[layer_index].buf,
+                &expected.v_bufs[layer_index].buf,
+                v_bytes,
+            ),
+            (
+                "gdn_alpha",
+                &self.alpha_bufs[layer_index].buf,
+                &expected.alpha_bufs[layer_index].buf,
+                alpha_beta_bytes,
+            ),
+            (
+                "gdn_beta",
+                &self.beta_bufs[layer_index].buf,
+                &expected.beta_bufs[layer_index].buf,
+                alpha_beta_bytes,
+            ),
+        ] {
+            if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                gpu,
+                family,
+                layer_index,
+                actual,
+                expected,
+                bytes,
+            )? {
+                return Ok(Some(diff));
+            }
+        }
+        Ok(None)
+    }
+
     fn replay_gdn_fused_gate_conv_for_compare(
         &self,
         gpu: &mut Gpu,
@@ -6223,6 +6278,32 @@ pub fn spec_step_dflash(
                 }
                 None => eprintln!(
                     "[dflash-rollback-input-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+            }
+            match serial_tape.compare_gdn_inputs_layer_to(gpu, tape, 0, accept_len + 1)? {
+                Some(diff) => {
+                    let context =
+                        rollback_input_diff_context(&target.config, tape, &diff, position);
+                    eprintln!(
+                        "[dflash-rollback-la0-gdn-input-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.actual_byte,
+                        diff.expected_byte,
+                        context,
+                    );
+                }
+                None => eprintln!(
+                    "[dflash-rollback-la0-gdn-input-compare] pos={} accepted={} replay_steps={} match",
                     position,
                     accept_len,
                     accept_len + 1,
