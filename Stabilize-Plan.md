@@ -106,7 +106,12 @@
     known position-120 repro reaches LA layer 0 with byte-identical normalized/rotated projection input, then diverges at that layer's batched
     verify `qkv` output (`bytes=40960`, `differing_bytes=22466`, `first_offset=0`, `serial_byte=152`, `gdn_byte=255`). The next blocker is
     therefore the batched LA `qkvza` projection family versus the serial decode projection family for identical input, not hidden-state drift
-    before the first LA layer.
+    before the first LA layer. A global diagnostic A/B with `HIPFIRE_FP16=0` clears that LA0 `qkv` mismatch but is too broad and slows prefill to
+    ~22 tok/s, so it is not a production policy. The narrower `HIPFIRE_HFQ4_QKVZA_FAST=0` startup flag now bypasses only the HFQ4 qkvza fast
+    projection family; on the same gfx1151 position-120 repro it keeps prefill near the default path (~57 tok/s), clears the LA0 `qkv` first
+    mismatch, and exposes the next drift earlier in the network at `x_in index=1` (`bytes=20480`, `differing_bytes=11716`, `first_offset=0`,
+    `serial_byte=108`, `gdn_byte=144`). The remaining blocker is now to locate the first non-qkvza batched verify drift before LA layer 1 before
+    any fast replay path can be promoted.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
