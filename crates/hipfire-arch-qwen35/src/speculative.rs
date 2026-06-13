@@ -3792,6 +3792,105 @@ impl GdnTape {
         Ok(None)
     }
 
+    fn compare_hidden_boundaries_to(
+        &self,
+        gpu: &Gpu,
+        expected: &GdnTape,
+        n_positions: usize,
+    ) -> HipResult<Option<DeltaNetSnapshotDiff>> {
+        let x_in_atol = dflash_rollback_x_in_atol_from_env();
+        let hidden_bytes = n_positions * self.x_in_dim * 4;
+        let ffn_bytes = n_positions * self.ffn_dim * 4;
+        for i in 0..self.x_in_bufs.len() {
+            for (family, actual, expected, bytes) in [
+                (
+                    "wo_residual_in",
+                    &self.wo_residual_in_bufs[i].buf,
+                    &expected.wo_residual_in_bufs[i].buf,
+                    hidden_bytes,
+                ),
+                (
+                    "attn_residual",
+                    &self.attn_residual_bufs[i].buf,
+                    &expected.attn_residual_bufs[i].buf,
+                    hidden_bytes,
+                ),
+                (
+                    "ffn_input",
+                    &self.ffn_input_bufs[i].buf,
+                    &expected.ffn_input_bufs[i].buf,
+                    hidden_bytes,
+                ),
+                (
+                    "ffn_gate",
+                    &self.ffn_gate_bufs[i].buf,
+                    &expected.ffn_gate_bufs[i].buf,
+                    ffn_bytes,
+                ),
+                (
+                    "ffn_up",
+                    &self.ffn_up_bufs[i].buf,
+                    &expected.ffn_up_bufs[i].buf,
+                    ffn_bytes,
+                ),
+                (
+                    "w_down_residual_in",
+                    &self.w_down_residual_in_bufs[i].buf,
+                    &expected.w_down_residual_in_bufs[i].buf,
+                    hidden_bytes,
+                ),
+                (
+                    "w_down_input",
+                    &self.w_down_input_bufs[i].buf,
+                    &expected.w_down_input_bufs[i].buf,
+                    ffn_bytes,
+                ),
+                (
+                    "layer_out",
+                    &self.layer_out_bufs[i].buf,
+                    &expected.layer_out_bufs[i].buf,
+                    hidden_bytes,
+                ),
+            ] {
+                if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                    gpu, family, i, actual, expected, bytes,
+                )? {
+                    if x_in_atol > 0.0
+                        && bytes == hidden_bytes
+                        && diff
+                            .f32_stats
+                            .as_ref()
+                            .is_some_and(|stats| stats.max_abs <= x_in_atol)
+                    {
+                        continue;
+                    }
+                    return Ok(Some(diff));
+                }
+            }
+            if i + 1 < self.x_in_bufs.len() {
+                if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                    gpu,
+                    "next_x_in",
+                    i + 1,
+                    &self.x_in_bufs[i + 1].buf,
+                    &expected.x_in_bufs[i + 1].buf,
+                    hidden_bytes,
+                )? {
+                    if x_in_atol > 0.0
+                        && diff
+                            .f32_stats
+                            .as_ref()
+                            .is_some_and(|stats| stats.max_abs <= x_in_atol)
+                    {
+                        continue;
+                    }
+                    return Ok(Some(diff));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn compare_gdn_inputs_layer_to(
         &self,
         gpu: &Gpu,
@@ -7206,6 +7305,32 @@ pub fn spec_step_dflash(
                         replay_tokens.len(),
                     ),
                 }
+                match serial_tape.compare_hidden_boundaries_to(gpu, tape, replay_tokens.len())? {
+                    Some(diff) => {
+                        let context =
+                            rollback_input_diff_context(&target.config, tape, &diff, position);
+                        eprintln!(
+                            "[dflash-rollback-hidden-boundary-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} verify_byte={}{}",
+                            position,
+                            accept_len,
+                            replay_tokens.len(),
+                            diff.family,
+                            diff.index,
+                            diff.bytes,
+                            diff.differing_bytes,
+                            diff.first_offset,
+                            diff.actual_byte,
+                            diff.expected_byte,
+                            context,
+                        );
+                    }
+                    None => eprintln!(
+                        "[dflash-rollback-hidden-boundary-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 match",
+                        position,
+                        accept_len,
+                        replay_tokens.len(),
+                    ),
+                }
                 match serial_tape.compare_batched_qkvza_from_captured_x_to_serial(
                     gpu,
                     &target.weights,
@@ -7564,6 +7689,32 @@ pub fn spec_step_dflash(
                     }
                     None => eprintln!(
                         "[dflash-rollback-x-in-compare] pos={} accepted={} replay_steps={} forced_serial=1 match",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                    ),
+                }
+                match serial_tape.compare_hidden_boundaries_to(gpu, tape, accept_len + 1)? {
+                    Some(diff) => {
+                        let context =
+                            rollback_input_diff_context(&target.config, tape, &diff, position);
+                        eprintln!(
+                            "[dflash-rollback-hidden-boundary-compare] pos={} accepted={} replay_steps={} forced_serial=1 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} verify_byte={}{}",
+                            position,
+                            accept_len,
+                            accept_len + 1,
+                            diff.family,
+                            diff.index,
+                            diff.bytes,
+                            diff.differing_bytes,
+                            diff.first_offset,
+                            diff.actual_byte,
+                            diff.expected_byte,
+                            context,
+                        );
+                    }
+                    None => eprintln!(
+                        "[dflash-rollback-hidden-boundary-compare] pos={} accepted={} replay_steps={} forced_serial=1 match",
                         position,
                         accept_len,
                         accept_len + 1,

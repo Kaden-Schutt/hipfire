@@ -517,6 +517,11 @@
     layer inputs, but verify-captured downstream inputs remain non-serial. The next production fix must make verify produce serial-equivalent
     downstream `x_in`/tape rows after LA0, or introduce a bounded runtime admission proof for the whole verify-derived tape before replacing
     serial-source rollback.
+    The hidden-boundary diagnostic now skips qkv/GDN input families and reports the first hidden-stream split after LA0. Fresh evidence
+    `/tmp/coherence-dflash-20260613-222808.md` plus `/tmp/coherence-dflash-20260613-222808.dflash_trace.json` kept strict AR parity passing and
+    records `rollback_hidden_boundary_compare.first_mismatch.family="attn_residual"` at LA index 0, position 59 (`max_abs=3.70693207e-3`,
+    `mean_abs=2.62928981e-4`). That narrows the downstream `x_in[1]` blocker to the LA0 output-projection/residual path after the qkv/GDN input
+    drift, not to the following layer's rmsnorm/rotation alone.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
