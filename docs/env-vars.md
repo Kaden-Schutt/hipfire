@@ -13,7 +13,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `BENCH_M` | Runtime variable controlling bench m in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_stream_overlap.rs:48` |
 | `BENCH_VERIFY_LAYERS` | Runtime variable controlling bench verify layers in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/bench_stream_overlap.rs:219` |
 | `CLICOLOR` | disables when stdout/stderr aren't TTYs (already gated above for stdin | `/home/sadara/.hipfire/src/cli/chat.ts:101` |
-| `DDTREE_TIMING` | pre_verify / verify. The draft and top-K are fused into one GPU- | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:8335` |
+| `DDTREE_TIMING` | pre_verify / verify. The draft and top-K are fused into one GPU- | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:8373` |
 | `DEBUG_LAYERS` | Runtime variable controlling debug layers in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:7075` |
 | `DFLASH_LIVE_TAU` | Runtime variable controlling dflash live tau in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1512` |
 | `DP4A` | Force the candidate into out_tp: W64=1 → dp4a wave64, DP4A=1 → | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:104` |
@@ -31,7 +31,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_ALLOW_MQ3_LLOYD` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5934` |
 | `HIPFIRE_ALLOW_MQ4_LLOYD` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5984` |
 | `HIPFIRE_ALLOW_UNIT_IMATRIX` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5695` |
-| `HIPFIRE_ATTN_FLASH` | Honors HIPFIRE_ATTN_FLASH=never\\\\\\\\\\\\\\\|0\\\\\\\\\\\\\\\|off as an explicit override | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:7917` |
+| `HIPFIRE_ATTN_FLASH` | Honors HIPFIRE_ATTN_FLASH=never\\\\\\\\\\\\\\\\|0\\\\\\\\\\\\\\\\|off as an explicit override | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:7917` |
 | `HIPFIRE_AWQ_F1_ONLY` | bench against the same binary's F2 quant. Default (env unset): | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:4770` |
 | `HIPFIRE_BASELINE_ARCH` | Runtime variable controlling baseline arch in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/coherence_runtime.rs:462` |
 | `HIPFIRE_BENCH_QWEN35_SPEED_BIN` | Runtime variable controlling bench qwen35 speed bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/eval_harness/mod.rs:9673` |
@@ -47,15 +47,15 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_DAEMON_BIN` | Runtime variable controlling daemon bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-server/src/daemon/engine.rs:166` |
 | `HIPFIRE_DAEMON_RESIDENT_STATE_BUDGET_MB` | Runtime variable controlling daemon resident state budget mb in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:5132` |
 | `HIPFIRE_DDTREE_BUDGET` | Runtime variable controlling DDTree budget in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:74` |
-| `HIPFIRE_DDTREE_FORCE_SLOW` | HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:8562` |
-| `HIPFIRE_DDTREE_LOGW_CUTOFF` | Adaptive-B usage report — only meaningful when --adaptive-b is on | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:2510` |
-| `HIPFIRE_DDTREE_PATH_B_CAPTURE` | Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:8601` |
+| `HIPFIRE_DDTREE_FORCE_SLOW` | HIPFIRE_DDTREE_FORCE_SLOW=1: force the slow (re-verify) path even when | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:8600` |
+| `HIPFIRE_DDTREE_LOGW_CUTOFF` | Adaptive-B usage report — only meaningful when --adaptive-b is on | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:2515` |
+| `HIPFIRE_DDTREE_PATH_B_CAPTURE` | Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:8639` |
 | `HIPFIRE_DDTREE_PATH_C` | Resolve "HIPFIRE_DDTREE_PATH_C" ONCE before the decode loop. The | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:13972` |
-| `HIPFIRE_DDTREE_PATH_C_VERBOSE` | Runtime variable controlling DDTree path c verbose in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:9126` |
+| `HIPFIRE_DDTREE_PATH_C_VERBOSE` | Runtime variable controlling DDTree path c verbose in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:9164` |
 | `HIPFIRE_DDTREE_PATH_C_VERIFY_GRAPH` | Opt-in Path C verify graph capture for graph A/B diagnostics; default off because current Path C graph A/B evidence is not promoted | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:98` |
-| `HIPFIRE_DDTREE_TAPE_DUMP` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:8581` |
+| `HIPFIRE_DDTREE_TAPE_DUMP` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:8619` |
 | `HIPFIRE_DDTREE_TOPK` | Runtime variable controlling DDTree topk in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:78` |
-| `HIPFIRE_DDTREE_TREE_LA` | Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:8443` |
+| `HIPFIRE_DDTREE_TREE_LA` | Opt out with HIPFIRE_DDTREE_TREE_LA=0 if a regression is suspected | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:8481` |
 | `HIPFIRE_DEBUG_CORRUPT_PREFIX_HASH_ONCE` | Runtime variable controlling debug corrupt prefix hash once in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:2209` |
 | `HIPFIRE_DEBUG_PREFIX_BOUNDARIES` | Runtime variable controlling debug prefix boundaries in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:6610` |
 | `HIPFIRE_DEBUG_SHARED_PREFIX_FANOUT` | Runtime variable controlling debug shared prefix fanout in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:5411` |
@@ -120,20 +120,21 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_DFLASH_LOOP_BREAK_STOP_AFTER` | Runtime variable controlling dflash loop break stop after in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1445` |
 | `HIPFIRE_DFLASH_LOOP_BREAK_TEMP` | Runtime variable controlling dflash loop break temp in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1441` |
 | `HIPFIRE_DFLASH_MODE` | Defaults to off when unset | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:70` |
-| `HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH` | cycle); off-by-default for that reason | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5798` |
-| `HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD` | shapes. sub_offset returns a non-owning view; do NOT free these | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5169` |
-| `HIPFIRE_DFLASH_NGRAM_BLOCK` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5795` |
+| `HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH` | cycle); off-by-default for that reason | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5812` |
+| `HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD` | shapes. sub_offset returns a non-owning view; do NOT free these | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5183` |
+| `HIPFIRE_DFLASH_NGRAM_BLOCK` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5809` |
 | `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` | Selects behavior from recognized values | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:33` |
-| `HIPFIRE_DFLASH_ROLLBACK_COMPARE` | Diagnostic-only fast GDN-tape rollback replay comparison against serial replay; live DFlash rollback remains serial because fast tape replay is not parity-proven | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:9584` |
-| `HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL` | Diagnostic-only absolute tolerance for FA raw attention rollback input compare | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:904` |
-| `HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS` | Diagnostic depth for forced-serial rollback next-logit chain comparison; defaults to 1 and caps at 8 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:9608` |
-| `HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY" | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:9552` |
-| `HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL` | Diagnostic-only absolute tolerance for x_in rollback input compare | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:912` |
-| `HIPFIRE_DFLASH_SEED_ORACLE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:6423` |
+| `HIPFIRE_DFLASH_ROLLBACK_COMPARE` | Diagnostic-only fast GDN-tape rollback replay comparison against serial replay; live DFlash rollback remains serial because fast tape replay is not parity-proven | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:9646` |
+| `HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL` | Diagnostic-only absolute tolerance for FA raw attention rollback input compare | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:918` |
+| `HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS` | Diagnostic depth for forced-serial rollback next-logit chain comparison; defaults to 1 and caps at 8 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:9670` |
+| `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY" | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:9622` |
+| `HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY" | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:9590` |
+| `HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL` | Diagnostic-only absolute tolerance for x_in rollback input compare | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:926` |
+| `HIPFIRE_DFLASH_SEED_ORACLE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:6437` |
 | `HIPFIRE_DFLASH_SPEC_DEMO_BIN` | Runtime variable controlling dflash spec demo bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/eval_harness/mod.rs:9658` |
 | `HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN` | Runtime variable controlling dflash trace expected token in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:137` |
 | `HIPFIRE_DFLASH_TRACE_POSITION` | Runtime variable controlling dflash trace position in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:131` |
-| `HIPFIRE_DFLASH_TRACE_TOKEN_INDEX` | Runtime variable controlling dflash trace token index in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1802` |
+| `HIPFIRE_DFLASH_TRACE_TOKEN_INDEX` | Runtime variable controlling dflash trace token index in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/dflash_spec_demo.rs:1803` |
 | `HIPFIRE_DOT2_GEMV` | Interprets "HIPFIRE_DOT2_GEMV" from environment to select behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:162` |
 | `HIPFIRE_DOTS_OCR_BF16_RESIDUAL` | HF cast x to bf16 at vision forward entry (modeling_dots_vision.py | `/home/sadara/.hipfire/src/crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1118` |
 | `HIPFIRE_DOTS_OCR_DUMP_DIR` | HIPFIRE_DOTS_OCR_DUMP_DIR=<path>: dump full per-stage tensor | `/home/sadara/.hipfire/src/crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1020` |
@@ -344,7 +345,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_QWEN35_STAGE_TRACE` | Runtime variable controlling qwen35 stage trace in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:13017` |
 | `HIPFIRE_QWEN35_STATE_QUANT` | Runtime variable controlling qwen35 state quant in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:752` |
 | `HIPFIRE_RDNA2_VARIANT` | Runtime variable controlling rdna2 variant in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:276` |
-| `HIPFIRE_REPLAY_GRAPH` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:3776` |
+| `HIPFIRE_REPLAY_GRAPH` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:3790` |
 | `HIPFIRE_RESOURCE_LOCK` | HIPFIRE_RESOURCE_LOCK=0 disables startup resource leases | `/home/sadara/.hipfire/src/cli/index.ts:1948` |
 | `HIPFIRE_RESOURCE_LOCK_CPU_CORES` | Runtime variable controlling resource lock cpu cores in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:1949` |
 | `HIPFIRE_RESOURCE_LOCK_NPUS` | Runtime variable controlling resource lock npus in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:1953` |
@@ -364,15 +365,15 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_SMOKE_MODE` | raw (default for back-compat): tokenize "Hello" and decode from pos=0 | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_smoke_forward.rs:157` |
 | `HIPFIRE_SMOKE_PROMPT` | Defaults to Hello when unset | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_smoke_forward.rs:158` |
 | `HIPFIRE_SMOKE_STEPS` | Runtime variable controlling smoke steps in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/a3b_smoke_forward.rs:38` |
-| `HIPFIRE_SPEC_PHASES` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5765` |
+| `HIPFIRE_SPEC_PHASES` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5779` |
 | `HIPFIRE_STATE` | Interprets "HIPFIRE_STATE" from environment to select behavior | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/greedy_dump_top5.rs:245` |
 | `HIPFIRE_STATE_QUANT` | Runtime variable controlling state quant in hipfire | `/home/sadara/.hipfire/src/cli/index.ts:752` |
 | `HIPFIRE_TARGET_ARCH` | HIPFIRE_TARGET_ARCH overrides the detected GPU arch for kernel | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:745` |
 | `HIPFIRE_TIER_RATIO` | Runtime variable controlling tier ratio in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-quantize/src/main.rs:5738` |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | Runtime variable controlling uniform vram tolerance gb in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/config.rs:97` |
-| `HIPFIRE_VERIFY_GRAPH` | DFlash verify graph capture is default-on; set to 0 only for graph/nograph diagnostics because direct verify has not cleared AR parity | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5227` |
-| `HIPFIRE_VERIFY_GRAPH_TIMING` | (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5242` |
-| `HIPFIRE_VERIFY_GRAPH_TREE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5217` |
+| `HIPFIRE_VERIFY_GRAPH` | DFlash verify graph capture is default-on; set to 0 only for graph/nograph diagnostics because direct verify has not cleared AR parity | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5241` |
+| `HIPFIRE_VERIFY_GRAPH_TIMING` | (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5256` |
+| `HIPFIRE_VERIFY_GRAPH_TREE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:5231` |
 | `HIPFIRE_VL_DUMP_DIR` | little-endian f32 blobs + JSON sidecars to $HIPFIRE_VL_DUMP_DIR | `/home/sadara/.hipfire/src/crates/hipfire-runtime/examples/infer.rs:148` |
 | `HIPFIRE_WO_MMQ` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:189` |
 | `HIPFIRE_WO_WMMA_VARIANT` | Runtime variable controlling wo wmma variant in hipfire | `/home/sadara/.hipfire/src/crates/rdna-compute/src/feature_flags.rs:263` |
@@ -394,6 +395,6 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `VERIFY` | VERIFY=1: run the token-parallel path vs the tile_batched fallback on | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:92` |
 | `W64` | Force the candidate into out_tp: W64=1 → dp4a wave64, DP4A=1 → | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:105` |
 
-- Total env vars: **389**
-- `HIPFIRE_*` vars: **354**
+- Total env vars: **390**
+- `HIPFIRE_*` vars: **355**
 - non-`HIPFIRE_*` vars: **35**

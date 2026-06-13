@@ -730,6 +730,7 @@ pub enum SpecRollbackReplayKind {
     GdnTape,
     BatchedPrefill,
     FullPrefill,
+    PrefixVerify,
     VerifyComplete,
 }
 
@@ -739,6 +740,7 @@ impl SpecRollbackReplayKind {
             Self::GdnTape => "gdn_tape",
             Self::BatchedPrefill => "batched_prefill",
             Self::FullPrefill => "full_prefill",
+            Self::PrefixVerify => "prefix_verify",
             Self::VerifyComplete => "verify_complete",
         }
     }
@@ -889,6 +891,18 @@ fn dflash_force_serial_rollback_replay_from_env() -> bool {
 
 fn dflash_force_serial_rollback_replay(env_force_serial: bool, gdn_tape_available: bool) -> bool {
     env_force_serial || gdn_tape_available
+}
+
+/// `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY=1` — opt in to replacing serial
+/// DFlash partial/reject rollback with committed-prefix verify plus GDN-tape
+/// replay. Experimental until it passes the AR-parity gate.
+fn dflash_prefix_verify_rollback_replay_from_env() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+    )
 }
 
 fn dflash_compare_rollback_replay_from_env() -> bool {
@@ -6567,6 +6581,30 @@ pub fn spec_step_dflash(
     );
     let rollback_replay = if verify_complete_rollback {
         SpecRollbackReplayKind::VerifyComplete
+    } else if dflash_prefix_verify_rollback_replay_from_env() && gdn_tape_opt.is_some() {
+        let replay_tokens = &committed[..accept_len + 1];
+        let mut prefix_tape = GdnTape::new_for_config(gpu, &target.config, replay_tokens.len())?;
+        target_snap.restore_to(&mut target.dn_state, gpu)?;
+        let _prefix_verify = verify_dflash_block(
+            gpu,
+            target,
+            replay_tokens,
+            position,
+            hidden_rb,
+            Some(&mut prefix_tape),
+            false,
+            verify_scratch,
+        )?;
+        target_snap.restore_to(&mut target.dn_state, gpu)?;
+        prefix_tape.replay_gdn(
+            gpu,
+            &target.weights,
+            &target.config,
+            &mut target.dn_state,
+            replay_tokens.len(),
+        )?;
+        prefix_tape.free_gpu(gpu);
+        SpecRollbackReplayKind::PrefixVerify
     } else if force_serial_rollback {
         let serial_frame_start = gpu.debug_gdn_requant_frame();
         for (i, &tok) in committed[..accept_len + 1].iter().enumerate() {
@@ -9566,6 +9604,30 @@ mod tests {
     }
 
     #[test]
+    fn dflash_prefix_verify_rollback_replay_is_opt_in() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY");
+        }
+        assert!(!dflash_prefix_verify_rollback_replay_from_env());
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY", "1");
+        }
+        assert!(dflash_prefix_verify_rollback_replay_from_env());
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY", "true");
+        }
+        assert!(dflash_prefix_verify_rollback_replay_from_env());
+        unsafe {
+            std::env::set_var("HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY", "0");
+        }
+        assert!(!dflash_prefix_verify_rollback_replay_from_env());
+        unsafe {
+            std::env::remove_var("HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY");
+        }
+    }
+
+    #[test]
     fn dflash_rollback_compare_is_opt_in_diagnostic() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -9638,6 +9700,10 @@ mod tests {
             "batched_prefill"
         );
         assert_eq!(SpecRollbackReplayKind::FullPrefill.as_str(), "full_prefill");
+        assert_eq!(
+            SpecRollbackReplayKind::PrefixVerify.as_str(),
+            "prefix_verify"
+        );
         assert_eq!(
             SpecRollbackReplayKind::VerifyComplete.as_str(),
             "verify_complete"

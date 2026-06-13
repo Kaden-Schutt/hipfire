@@ -379,6 +379,13 @@
     prose `rollback_input_compare.checked=184`, `mismatch_counts={"input":92,"gdn-input-all":92}`, first mismatch at `pos=59/qkv`, and
     `rollback_fast_token_major_compare.checked=276`, first mismatch at `pos=59/attn-out`. This identifies the earliest broad-run replay drift
     without requiring a focused trace rerun, but still rejects fast replay on the existing margin and recurrent-state blockers.
+    A committed-prefix verify replacement was wired behind `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY=1` to test the DDTree-style repair shape in
+    vanilla DFlash: re-verify only `committed[..accept+1]`, capture a fresh tape, restore, and replay that token-correct tape instead of using
+    serial/full-prefill rollback. The opt-in gate `/tmp/coherence-dflash-20260613-193216.md` removed serial/full-prefill counters
+    (`replay_prefix_verify=38`, `replay_verify_complete=14` for prose; `replay_prefix_verify=4`, `replay_verify_complete=1` for code), but it
+    failed prose AR parity at token 14 (`25849` vs `310`) and tripped the repetition detector (`max_freq=0.625`). Code passed, so the shape is
+    not universally invalid, but it is rejected for production and remains diagnostic-only until the prefix verify hidden/state side effects are
+    made AR-equivalent on prose.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
