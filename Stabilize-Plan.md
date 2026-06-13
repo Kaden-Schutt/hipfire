@@ -421,6 +421,12 @@
     `input_mismatch_counts={"input":1,"gdn-input-all":1}`, and `first_input_mismatch.family="qkv"` at row 0/logical position 66. This makes
     captured-row parity a first-class admission condition; any future fast rollback promotion must clear both the input blocker and recurrent-state
     blocker in the same evidence row.
+    Source inspection of the position-66 split confirms the current blocker shape: serial decode captures `x_in` from the single-token qkvza route
+    and then `s.dn_qkv`, while batched verify captures `x_in` from `pbs.x_rot_batch` and `qkv` from the `gemm_qkvza_*` route. Because the focused
+    admission row reports `x_in` matched and the first mismatch is `qkv`, the remaining fast-rollback issue is projection-family serial equivalence
+    for the production batched qkvza output, not rollback replay order. The `HIPFIRE_HFQ4_QKVZA_FAST=0` control is still rejected because it breaks
+    prose AR parity, so fast GDN-tape rollback must remain diagnostic-only until the default projection path either emits serial-equivalent captured
+    rows or a live fail-closed recurrent/logit admission policy exists.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

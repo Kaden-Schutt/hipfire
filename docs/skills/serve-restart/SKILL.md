@@ -1,6 +1,6 @@
 ---
 name: serve-restart
-description: Cleanly stop, free the port, and restart `hipfire serve`. Use when serve "Failed to start (port in use)", a stale daemon holds VRAM, an os-error-2/JSON-parse pre-warm crash left a zombie singleton, or you just want a guaranteed-fresh daemon. Kills both bun CLI serve and the spawned target/release/hipfire-daemon, reaps stale ~/.hipfire/daemon.pid + serve.pid + GPU lock, fuser-frees the port, then relaunches.
+description: Cleanly stop, free the port, and restart `hipfire serve`. Use when serve "Failed to start (port in use)", a stale daemon holds VRAM, an os-error-2/JSON-parse pre-warm crash left a zombie singleton, or you just want a guaranteed-fresh daemon. Kills both bun CLI serve and the spawned target/release/hipfire-daemon, reaps stale ~/.hipfire/daemon.pid + serve.pid plus daemon resource locks, fuser-frees the port, then relaunches.
 ---
 
 # Cleanly restart hipfire serve
@@ -19,8 +19,9 @@ scripts/serve-restart.sh [port] [-- <extra hipfire serve args>]
 Default port 11435. Env honored: `HIPFIRE_MODELS_DIR`, `HIPFIRE_VERIFY_GRAPH`.
 
 It: kills `cli/index.ts serve` + `examples/daemon`, `fuser -k <port>/tcp`,
-removes `~/.hipfire/{daemon,serve}.pid` + `/tmp/hipfire-gpu.lock`, waits
-the port free, relaunches detached, tails to `warm-up complete`.
+removes `~/.hipfire/{daemon,serve}.pid`, lets daemon startup reclaim stale
+`/tmp/hipfire-resource-locks/*.lock` leases, waits the port free, relaunches
+detached, tails to `warm-up complete`.
 
 ## Just kill, don't restart
 
