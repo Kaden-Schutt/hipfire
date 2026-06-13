@@ -401,6 +401,12 @@
     `single_step_mismatches=31`) and every multi-step cycle through replay depth 5, while code only exercised multi-step cycles
     (`replay_steps=5/6/8/9`) and also mismatched every recurrent-state probe. A live fast path therefore cannot be admitted by limiting it to
     one-step partial/reject rollback; it still needs captured-row parity or a per-cycle runtime proof stronger than replay-step shape.
+    The parser now also preserves first single-step and multi-step state mismatches, and the refreshed diagnostic
+    `/tmp/coherence-dflash-20260613-200434.md` plus `/tmp/coherence-dflash-20260613-200434.dflash_trace.json` records
+    `single_step_recurrent_state_mismatch` as an admission blocker. The smallest unsafe fast-rollback case is now explicit: prose position 66,
+    `accepted=0`, `replay_steps=1`, `s_matrix[0]`, `differing_bytes=914`, `max_abs=1.95490281e38`. The first multi-step blocker remains the
+    earlier position-59 two-step row. The next runtime cut should target the position-66 one-step captured-row/state split first; if that cannot
+    be made serial-equivalent, no replay-shape-only hybrid can replace conservative rollback.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

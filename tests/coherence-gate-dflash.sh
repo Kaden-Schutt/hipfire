@@ -785,6 +785,36 @@ if mismatches:
         "context": first["context"],
         "stats": first["stats"],
     }
+    if single_step_mismatches:
+        first_single = single_step_mismatches[0]
+        payload["first_single_step_mismatch"] = {
+            "pos": first_single["pos"],
+            "accepted": first_single["accepted"],
+            "replay_steps": first_single["replay_steps"],
+            "family": first_single["family"],
+            "index": first_single["index"],
+            "differing_bytes": first_single["differing_bytes"],
+            "first_offset": first_single["first_offset"],
+            "serial_byte": first_single["serial_byte"],
+            "gdn_byte": first_single["gdn_byte"],
+            "context": first_single["context"],
+            "stats": first_single["stats"],
+        }
+    if multi_step_mismatches:
+        first_multi = multi_step_mismatches[0]
+        payload["first_multi_step_mismatch"] = {
+            "pos": first_multi["pos"],
+            "accepted": first_multi["accepted"],
+            "replay_steps": first_multi["replay_steps"],
+            "family": first_multi["family"],
+            "index": first_multi["index"],
+            "differing_bytes": first_multi["differing_bytes"],
+            "first_offset": first_multi["first_offset"],
+            "serial_byte": first_multi["serial_byte"],
+            "gdn_byte": first_multi["gdn_byte"],
+            "context": first_multi["context"],
+            "stats": first_multi["stats"],
+        }
 print(json.dumps(payload, sort_keys=True))
 PYEOF
 )
@@ -1127,6 +1157,8 @@ if state_checked <= 0:
     blockers.append("missing_recurrent_state_compare")
 elif not state.get("ok", False):
     blockers.append(state.get("reason", "recurrent_state_mismatch"))
+    if int(state.get("single_step_mismatches", 0) or 0) > 0:
+        blockers.append("single_step_recurrent_state_mismatch")
 
 payload = {
     "verdict": "not_evaluated" if logit_checked <= 0 and state_checked <= 0 else ("admitted" if not blockers else "rejected"),
@@ -1149,6 +1181,10 @@ if shape:
     payload["replay_shape"] = shape
 if state.get("first_mismatch"):
     payload["first_state_mismatch"] = state["first_mismatch"]
+if state.get("first_single_step_mismatch"):
+    payload["first_single_step_state_mismatch"] = state["first_single_step_mismatch"]
+if state.get("first_multi_step_mismatch"):
+    payload["first_multi_step_state_mismatch"] = state["first_multi_step_mismatch"]
 if logit.get("first_mismatch"):
     payload["first_logit_mismatch"] = logit["first_mismatch"]
 if logit.get("max_abs_over_margin") is not None:
