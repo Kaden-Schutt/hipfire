@@ -728,6 +728,7 @@ pub struct SpecStepResult {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SpecRollbackReplayKind {
     GdnTape,
+    BatchedPrefill,
     FullPrefill,
     VerifyComplete,
 }
@@ -736,6 +737,7 @@ impl SpecRollbackReplayKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::GdnTape => "gdn_tape",
+            Self::BatchedPrefill => "batched_prefill",
             Self::FullPrefill => "full_prefill",
             Self::VerifyComplete => "verify_complete",
         }
@@ -6534,9 +6536,8 @@ pub fn spec_step_dflash(
     // batched call instead of (accept+1) sequential decodes.
     // Conservative default while proving rollback parity: replay committed
     // tokens through the same serial target path as AR. Fast GDN-tape replay
-    // remains rejected for live rollback even when
-    // HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY=0 because both one-step
-    // production replay and multi-step fast tape rows still lack parity.
+    // remains diagnostic-only because one-step production replay and
+    // multi-step fast tape rows still lack parity.
     let force_serial_rollback = dflash_force_serial_rollback_replay(
         dflash_force_serial_rollback_replay_from_env(),
         gdn_tape_opt.is_some(),
@@ -6564,6 +6565,62 @@ pub fn spec_step_dflash(
             {
                 let mut serial_result = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
                 serial_result.save_from(&target.dn_state, gpu)?;
+
+                target_snap.restore_to(&mut target.dn_state, gpu)?;
+                gpu.debug_set_gdn_requant_frame(serial_frame_start);
+                qwen35::forward_prefill_batch(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    &committed[..accept_len + 1],
+                    position,
+                    &mut target.kv_cache,
+                    &mut target.dn_state,
+                    &target.scratch,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+                let prefill_frame_end = gpu.debug_gdn_requant_frame();
+
+                eprintln!(
+                    "[dflash-rollback-prefill-frame-compare] pos={} accepted={} replay_steps={} forced_serial=1 serial_start={} serial_end={} prefill_end={}",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                    serial_frame_start,
+                    serial_frame_end,
+                    prefill_frame_end,
+                );
+                gpu.debug_set_gdn_requant_frame(prefill_frame_end);
+                match compare_delta_net_state_to_snapshot(gpu, &target.dn_state, &serial_result)?
+                {
+                    Some(diff) => {
+                        let context = rollback_snapshot_diff_context(&diff);
+                        eprintln!(
+                            "[dflash-rollback-prefill-compare] pos={} accepted={} replay_steps={} forced_serial=1 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} prefill_byte={}{}",
+                            position,
+                            accept_len,
+                            accept_len + 1,
+                            diff.family,
+                            diff.index,
+                            diff.bytes,
+                            diff.differing_bytes,
+                            diff.first_offset,
+                            diff.expected_byte,
+                            diff.actual_byte,
+                            context,
+                        );
+                    }
+                    None => eprintln!(
+                        "[dflash-rollback-prefill-compare] pos={} accepted={} replay_steps={} forced_serial=1 match",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                    ),
+                }
+                serial_result.restore_to(&mut target.dn_state, gpu)?;
 
                 target_snap.restore_to(&mut target.dn_state, gpu)?;
                 gpu.debug_set_gdn_requant_frame(serial_frame_start);
@@ -9462,6 +9519,10 @@ mod tests {
     #[test]
     fn spec_rollback_replay_kind_labels_are_stable() {
         assert_eq!(SpecRollbackReplayKind::GdnTape.as_str(), "gdn_tape");
+        assert_eq!(
+            SpecRollbackReplayKind::BatchedPrefill.as_str(),
+            "batched_prefill"
+        );
         assert_eq!(SpecRollbackReplayKind::FullPrefill.as_str(), "full_prefill");
         assert_eq!(
             SpecRollbackReplayKind::VerifyComplete.as_str(),

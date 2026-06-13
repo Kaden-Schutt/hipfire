@@ -1791,6 +1791,7 @@ fn main() {
         let mut rollback_single_session_ok: usize = 0;
         let mut rollback_multi_request_disabled: usize = 0;
         let mut rollback_replay_gdn_tape: usize = 0;
+        let mut rollback_replay_batched_prefill: usize = 0;
         let mut rollback_replay_full_prefill: usize = 0;
         let mut rollback_replay_verify_complete: usize = 0;
         let mut verify_graph_direct: usize = 0;
@@ -2075,6 +2076,9 @@ fn main() {
             }
             match step.rollback_replay {
                 speculative::SpecRollbackReplayKind::GdnTape => rollback_replay_gdn_tape += 1,
+                speculative::SpecRollbackReplayKind::BatchedPrefill => {
+                    rollback_replay_batched_prefill += 1
+                }
                 speculative::SpecRollbackReplayKind::FullPrefill => {
                     rollback_replay_full_prefill += 1
                 }
@@ -2403,11 +2407,12 @@ fn main() {
             stats.mean_committed(),
         );
         eprintln!(
-            "rollback_parity: checked={} single_session_ok={} multi_request_disabled={} replay_gdn_tape={} replay_full_prefill={} replay_verify_complete={}",
+            "rollback_parity: checked={} single_session_ok={} multi_request_disabled={} replay_gdn_tape={} replay_batched_prefill={} replay_full_prefill={} replay_verify_complete={}",
             rollback_checked_cycles,
             rollback_single_session_ok,
             rollback_multi_request_disabled,
             rollback_replay_gdn_tape,
+            rollback_replay_batched_prefill,
             rollback_replay_full_prefill,
             rollback_replay_verify_complete,
         );

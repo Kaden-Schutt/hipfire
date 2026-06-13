@@ -316,6 +316,14 @@
     to `replay_verify_complete=1` (`replay_full_prefill=4`), while prose had no full-accept cycles and stayed `replay_full_prefill=92`.
     This reduces dependence on conservative serial replay for the provably exact full-verify case, but the rejection/partial-accept path remains
     blocked on verify-tape accepted-prefix parity.
+    A batched-prefix rollback replacement was tested next. The diagnostic compare in
+    `/tmp/coherence-dflash-20260613-181201.md` shows the traced position-120 batched prefill recurrent snapshot matches serial
+    (`rollback_prefill_compare.ok=true`, `serial_end=prefill_end=3504`) while the admitted live path remains conservative and AR-parity clean
+    (`replay_gdn_tape=0`, prose/code `replay_full_prefill=92/4`, code `replay_verify_complete=1`). Promoting that batched-prefix prefill to the
+    live rollback path was rejected: `/tmp/coherence-dflash-20260613-180525.md` failed prose AR parity at token 62 with
+    `replay_batched_prefill=91 replay_full_prefill=0`, and preserving verifier KV rows in `/tmp/coherence-dflash-20260613-180847.md` still failed
+    the same window with `replay_batched_prefill=95 replay_full_prefill=0`. Batched prefix prefill therefore remains diagnostic-only for
+    partial/reject cycles until end-to-end token parity, not just recurrent snapshot parity, is proven.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
