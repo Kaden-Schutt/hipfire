@@ -12374,7 +12374,8 @@ impl Gpu {
         // to the GEMM work at prefill batches, so fusing into a single
         // concatenated matrix isn't worth the extra kernel code tonight.
         let cdna3 = self.arch_caps.is_cdna3();
-        if cdna3
+        if self.flags.hfq4_gate_up_fast
+            && cdna3
             && batch_size >= self.rocblas_min_batch()
             && self.rocblas.is_some()
             && !self.capture_mode
@@ -12417,7 +12418,7 @@ impl Gpu {
             }
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !self.flags.fp16_disabled {
+        if self.flags.hfq4_gate_up_fast && batch_size > 1 && !self.flags.fp16_disabled {
             // gfx906 dp4a MMQ — default-on at batch_size ≥ 8 (per
             // should_use_mmq's gfx906 default). Quantize X once, screen
             // both weights, dispatch MMQ for each in set mode (add=0).

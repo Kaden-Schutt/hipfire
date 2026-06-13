@@ -16082,6 +16082,17 @@ fn forward_prefill_chunk(
                         config.norm_eps,
                     )?;
                 }
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    let off_hidden = tape_offset * hidden_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.ffn_input_bufs[delta_layer_idx].buf,
+                        off_hidden,
+                        &pbs.x_rot_batch.buf,
+                        0,
+                        n * hidden_row_bytes,
+                    )?;
+                }
 
                 // Batched gate+up projection.
                 if ffn_is_6bit {
@@ -16250,6 +16261,24 @@ fn forward_prefill_chunk(
                         n,
                     )?;
                 }
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let ffn_row_bytes = tape.ffn_dim * 4;
+                    let off_ffn = tape_offset * ffn_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.ffn_gate_bufs[delta_layer_idx].buf,
+                        off_ffn,
+                        &pbs.gate_ffn_batch.buf,
+                        0,
+                        n * ffn_row_bytes,
+                    )?;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.ffn_up_bufs[delta_layer_idx].buf,
+                        off_ffn,
+                        &pbs.up_batch.buf,
+                        0,
+                        n * ffn_row_bytes,
+                    )?;
+                }
 
                 // SwiGLU activation feeding w_down. For MQ, we need the
                 // output FWHT-rotated so it matches the pre-rotated w_down
@@ -16287,6 +16316,26 @@ fn forward_prefill_chunk(
                     )?;
                 } else {
                     gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+                }
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    let off_hidden = tape_offset * hidden_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.w_down_residual_in_bufs[delta_layer_idx].buf,
+                        off_hidden,
+                        &pbs.x_batch.buf,
+                        0,
+                        n * hidden_row_bytes,
+                    )?;
+                    let ffn_row_bytes = tape.ffn_dim * 4;
+                    let off_ffn = tape_offset * ffn_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.w_down_input_bufs[delta_layer_idx].buf,
+                        off_ffn,
+                        &pbs.ffn_hidden_batch.buf,
+                        0,
+                        n * ffn_row_bytes,
+                    )?;
                 }
 
                 // Batched w_down + residual.
@@ -20690,6 +20739,17 @@ fn forward_scratch_layers(
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 FFN norm", &s.tmp)?;
                 }
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    let ffn_input = x_rot_paro.or(x_rot).unwrap_or(&s.tmp);
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.ffn_input_bufs[delta_layer_idx].buf,
+                        *tape_row * hidden_row_bytes,
+                        &ffn_input.buf,
+                        0,
+                        hidden_row_bytes,
+                    )?;
+                }
                 // Cross-arch fast path: fused gate+up in one launch. Works
                 // for both MQ4 (x_rot Some) and HF4 (x_rot None → s.tmp).
                 let dt_g = layer.w_gate.gpu_dtype;
@@ -20811,9 +20871,36 @@ fn forward_scratch_layers(
                     trace_finite_if_enabled(gpu, "layer 0 FFN gate", &s.gate_ffn)?;
                     trace_finite_if_enabled(gpu, "layer 0 FFN up", &s.up)?;
                 }
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let ffn_row_bytes = tape.ffn_dim * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.ffn_gate_bufs[delta_layer_idx].buf,
+                        *tape_row * ffn_row_bytes,
+                        &s.gate_ffn.buf,
+                        0,
+                        ffn_row_bytes,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.ffn_up_bufs[delta_layer_idx].buf,
+                        *tape_row * ffn_row_bytes,
+                        &s.up.buf,
+                        0,
+                        ffn_row_bytes,
+                    )?;
+                }
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
                 //   HF4: silu_mul + weight_gemv_residual (unchanged)
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.w_down_residual_in_bufs[delta_layer_idx].buf,
+                        *tape_row * hidden_row_bytes,
+                        &s.x.buf,
+                        0,
+                        hidden_row_bytes,
+                    )?;
+                }
                 weight_gemv_swiglu_residual_bf16_probe(
                     gpu,
                     layer_idx,
@@ -20826,6 +20913,16 @@ fn forward_scratch_layers(
                 )?;
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 FFN residual", &s.x)?;
+                }
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let ffn_row_bytes = tape.ffn_dim * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.w_down_input_bufs[delta_layer_idx].buf,
+                        *tape_row * ffn_row_bytes,
+                        &s.ffn_hidden.buf,
+                        0,
+                        ffn_row_bytes,
+                    )?;
                 }
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
                     let hidden_row_bytes = tape.x_in_dim * 4;

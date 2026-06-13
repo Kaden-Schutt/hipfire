@@ -130,6 +130,13 @@
     the LA `wo` residual split and moves the first mismatch to the post-FFN layer output (`layer_out[0]`, `bytes=20480`,
     `differing_bytes=10604`, `first_offset=0`, `serial_byte=65`, `gdn_byte=20`). The next cut is FFN-stage tape capture: FFN norm/rotated
     gate-up input, gate/up outputs, SwiGLU/down input, and the pre-`w_down` residual destination.
+    Adding that FFN tape capture moves the first mismatch earlier to the FFN gate projection (`ffn_gate[0]`, `bytes=69632`,
+    `differing_bytes=39124`, `first_offset=0`, `serial_byte=156`, `gdn_byte=59`) with qkvza/residual fast paths disabled. A broad
+    `HIPFIRE_FP16=0` A/B clears `ffn_gate` and moves the split to `w_down_input[0]` (`bytes=69632`, `differing_bytes=69225`,
+    `first_offset=0`, `serial_byte=0`, `gdn_byte=24`), so the gate/up split is in the batched HFQ4/MQ4 gate-up fast routing versus serial
+    `fused_gate_up_hfq4g256`. The narrow diagnostic flag for that split is now `HIPFIRE_HFQ4_GATE_UP_FAST=0`; using it with the qkvza and
+    residual fast-path flags also clears `ffn_gate` and leaves the same `w_down_input[0]` split. The next cut is the MQ SwiGLU/down-input
+    rotation (`fused_silu_mul_rotate_mq_batched_for` versus serial `weight_gemv_swiglu_residual_bf16_probe`'s down-input preparation).
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

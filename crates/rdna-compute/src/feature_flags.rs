@@ -43,6 +43,7 @@ pub struct FeatureFlags {
     pub fp16_layer_min: Option<usize>,
     pub fp16_layer_max: Option<usize>,
     pub hfq4_qkvza_fast: bool,
+    pub hfq4_gate_up_fast: bool,
     pub hfq4_residual_fast: bool,
     pub wo_mmq: bool,
     pub lm_head_wmma_disabled: bool,
@@ -172,6 +173,10 @@ impl FeatureFlags {
             // escape hatch to the LA qkvza projection while debugging DFlash
             // parity; default keeps existing fast routing.
             hfq4_qkvza_fast: std::env::var("HIPFIRE_HFQ4_QKVZA_FAST").as_deref() != Ok("0"),
+            // HIPFIRE_HFQ4_GATE_UP_FAST=0 narrows the escape hatch to the
+            // HFQ4/MQ4 batched gate/up projection while debugging DFlash
+            // parity; default keeps existing fast routing.
+            hfq4_gate_up_fast: std::env::var("HIPFIRE_HFQ4_GATE_UP_FAST").as_deref() != Ok("0"),
             // HIPFIRE_HFQ4_RESIDUAL_FAST=0 narrows the residual-projection
             // escape hatch to HFQ4/MQ4 batched residual GEMM while debugging
             // DFlash parity; default keeps existing fast routing.
@@ -362,6 +367,7 @@ impl FeatureFlags {
             fp16_layer_min: None,
             fp16_layer_max: None,
             hfq4_qkvza_fast: true,
+            hfq4_gate_up_fast: true,
             hfq4_residual_fast: true,
             wo_mmq: false,
             lm_head_wmma_disabled: false,
