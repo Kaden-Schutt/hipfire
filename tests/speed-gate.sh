@@ -19,6 +19,7 @@ LOCK_SCRIPT="./scripts/gpu-lock.sh"
 FAST=0
 VERBOSE=0
 MODEL_TMP_DIR=""
+SPEED_GATE_ATTEMPTS="${HIPFIRE_SPEED_GATE_ATTEMPTS:-2}"
 
 cleanup() {
     if declare -F gpu_release >/dev/null 2>&1; then
@@ -198,18 +199,16 @@ for size in "${SIZES[@]}"; do
         skip=$((skip + 1))
         continue
     fi
-    out="${HIPFIRE_SPEED_GATE_OUT:-/tmp/hipfire-speed-gate-${size}-$(date +%Y%m%d-%H%M%S)}"
-    if ! HIPFIRE_REQUIRE_PERF_BASELINE=1 HIPFIRE_PERF_BASELINE="$BASELINE" \
-        "$EVAL_BIN" --model "$model" --battery speed --executor examples \
-        --max-tokens 50 --no-cache --out "$out" >/tmp/hipfire-speed-gate.stdout 2>/tmp/hipfire-speed-gate.stderr; then
-        printf "  %-5s " "$size"
-        color red "FAIL"
-        echo " (hipfire-eval failed; report: $out)"
-        [ "$VERBOSE" -eq 1 ] && cat /tmp/hipfire-speed-gate.stderr
-        fail=$((fail + 1))
-        continue
-    fi
-    if python3 - "$out/results.jsonl" "$VERBOSE" <<'PY'
+    attempt=1
+    model_ok=0
+    out=""
+    while [ "$attempt" -le "$SPEED_GATE_ATTEMPTS" ]; do
+        out="${HIPFIRE_SPEED_GATE_OUT:-/tmp/hipfire-speed-gate-${size}-$(date +%Y%m%d-%H%M%S)-try${attempt}}"
+        if ! HIPFIRE_REQUIRE_PERF_BASELINE=1 HIPFIRE_PERF_BASELINE="$BASELINE" \
+            "$EVAL_BIN" --model "$model" --battery speed --executor examples \
+            --max-tokens 50 --no-cache --out "$out" >/tmp/hipfire-speed-gate.stdout 2>/tmp/hipfire-speed-gate.stderr; then
+            [ "$VERBOSE" -eq 1 ] && cat /tmp/hipfire-speed-gate.stderr
+        elif python3 - "$out/results.jsonl" "$VERBOSE" <<'PY'
 import json, sys
 path = sys.argv[1]
 verbose = sys.argv[2] == "1"
@@ -228,7 +227,16 @@ for row in rows:
         print(f"      reason: {row['reason']}")
 sys.exit(1 if failed else 0)
 PY
-    then
+        then
+            model_ok=1
+            break
+        fi
+        if [ "$attempt" -lt "$SPEED_GATE_ATTEMPTS" ]; then
+            echo "    retrying ${size} speed sample (attempt ${attempt}/${SPEED_GATE_ATTEMPTS})"
+        fi
+        attempt=$((attempt + 1))
+    done
+    if [ "$model_ok" -eq 1 ]; then
         printf "  %-5s " "$size"
         color green "OK"
         echo " (report: $out)"

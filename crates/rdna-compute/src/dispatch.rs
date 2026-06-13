@@ -12759,6 +12759,74 @@ impl Gpu {
         result
     }
 
+    pub fn gemm_gate_up_hfq4g256_exact(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_gate_up_hfq4g256",
+            kernels::GEMM_GATE_UP_HFQ4G256_SRC,
+            "gemm_gate_up_hfq4g256",
+        )?;
+        let func = &self.functions["gemm_gate_up_hfq4g256"];
+
+        let mut ag = a_gate.buf.as_ptr();
+        let mut au = a_up.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yg = y_gate.buf.as_ptr();
+        let mut yu = y_up.buf.as_ptr();
+        let mut g_m = gate_m as i32;
+        let mut u_m = up_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag as *mut _ as *mut c_void,
+            &mut au as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yg as *mut _ as *mut c_void,
+            &mut yu as *mut _ as *mut c_void,
+            &mut g_m as *mut _ as *mut c_void,
+            &mut u_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let batch_tiles = {
+            const BATCH_TILE: usize = 8;
+            (batch_size + BATCH_TILE - 1) / BATCH_TILE
+        };
+        let total_m = (gate_m + up_m) as u32;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(up_m, k);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq4g256_exact", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [total_m, batch_tiles as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// v_dot2_f32_f16-accelerated batched 2-way fused HFQ4-G256 GEMM (gate + up).
     /// RDNA2 (gfx1011/1012/1030-1032) fast path using `__ockl_fdot2`.
     /// One instruction per half2 dot with FP32 accumulation — 1.2-1.5× over FP16 packed.

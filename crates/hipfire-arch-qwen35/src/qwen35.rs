@@ -16514,6 +16514,18 @@ fn forward_prefill_chunk(
                         layer.w_gate.k,
                         n,
                     )?;
+                } else if gdn_tape.is_some() {
+                    gpu.gemm_gate_up_hfq4g256_exact(
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.gate_ffn_batch,
+                        &pbs.up_batch,
+                        layer.w_gate.m,
+                        layer.w_up.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
                 } else {
                     gpu.gemm_gate_up_hfq4g256(
                         &layer.w_gate.buf,

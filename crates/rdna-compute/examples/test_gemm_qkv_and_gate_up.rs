@@ -13,17 +13,36 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
 fn main() {
-    let n_list: Vec<usize> = vec![1, 4, 16, 64];
-    let k: usize = 1024;
+    let args: Vec<String> = std::env::args().collect();
+    let gate_up_only = args.get(1).is_some_and(|a| a == "--gate-up");
+    let (n_list, k, gate_shape): (Vec<usize>, usize, Option<(usize, usize)>) = if gate_up_only {
+        if args.len() < 6 {
+            eprintln!("usage: test_gemm_qkv_and_gate_up --gate-up <gate_m> <up_m> <k> <n> [n...]");
+            std::process::exit(2);
+        }
+        let gate_m: usize = args[2].parse().expect("gate_m must be integer");
+        let up_m: usize = args[3].parse().expect("up_m must be integer");
+        let k: usize = args[4].parse().expect("k must be integer");
+        let n_list: Vec<usize> = args[5..]
+            .iter()
+            .map(|n| n.parse().expect("n must be integer"))
+            .collect();
+        (n_list, k, Some((gate_m, up_m)))
+    } else {
+        (vec![1, 4, 16, 64], 1024, None)
+    };
+    assert!(k % 256 == 0, "K must be divisible by 256");
     let groups_per_row = k / 256;
     let row_bytes = groups_per_row * 136;
 
     let mut gpu = Gpu::init().expect("gpu init");
 
-    test_qkv(&mut gpu, &n_list, k, row_bytes);
-    test_gate_up(&mut gpu, &n_list, k, row_bytes);
+    if !gate_up_only {
+        test_qkv(&mut gpu, &n_list, k, row_bytes);
+    }
+    test_gate_up(&mut gpu, &n_list, k, row_bytes, gate_shape);
 
-    eprintln!("\n=== BOTH KERNELS PASSED ===");
+    eprintln!("\n=== REQUESTED KERNELS PASSED ===");
 }
 
 fn test_qkv(gpu: &mut Gpu, n_list: &[usize], k: usize, row_bytes: usize) {
@@ -120,9 +139,14 @@ fn test_qkv(gpu: &mut Gpu, n_list: &[usize], k: usize, row_bytes: usize) {
     }
 }
 
-fn test_gate_up(gpu: &mut Gpu, n_list: &[usize], k: usize, row_bytes: usize) {
-    let gate_m: usize = 4096;
-    let up_m: usize = 4096;
+fn test_gate_up(
+    gpu: &mut Gpu,
+    n_list: &[usize],
+    k: usize,
+    row_bytes: usize,
+    shape: Option<(usize, usize)>,
+) {
+    let (gate_m, up_m): (usize, usize) = shape.unwrap_or((4096, 4096));
 
     eprintln!("\n=== gemm_gate_up_hfq4g256 ===");
     eprintln!("gate_m={gate_m} up_m={up_m} K={k}");

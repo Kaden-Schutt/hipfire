@@ -578,6 +578,23 @@ Latest rollback diagnostic evidence:
   diagnostic-only because admission still reports recurrent-state and
   rollback-input mismatches, but the residual projection split is no
   longer the first blocker.
+- The production-shape gate/up diagnostic
+  `test_gemm_qkv_and_gate_up --gate-up 17408 17408 5120 1 2`
+  then reproduced the next split: `N=1` was byte-exact, but the fast
+  `N=2` gate/up path diverged for both gate and up
+  (`34510/34816` and `34527/34816` divergent values). Re-running the
+  same shape with `HIPFIRE_HFQ4_GATE_UP_FAST=0` was byte-exact at
+  `N=2`, so tape-producing dense verify now routes the HFQ4/MQ4 gate/up
+  branch through an exact scalar batched dispatch while ordinary prefill
+  keeps the fast path.
+- `/tmp/coherence-dflash-20260614-015914.md` verified that exact gate/up
+  routing moves the first rollback input mismatch past `ffn_gate`.
+  Qkvza exact-route comparison still passed, direct/no-graph verify was
+  still unused (`verify_graph direct=0`), and the first remaining input
+  mismatch is now `layer_out` at position 226 (`max_abs=0.0000143051147`,
+  `mean_abs=0.00000222557333`). Fast GDN-tape replay remains rejected
+  on recurrent-state plus rollback-input mismatch, so live DFlash
+  rollback remains conservative serial/full-prefill.
 
 ## References
 
