@@ -644,6 +644,18 @@ Latest rollback diagnostic evidence:
   (`serial-tape-attn-out.ok=true` in the code row), so the remaining
   blocker is the verify-captured GDN/attention stream, not token-major
   replay of a serial-captured tape.
+- `/tmp/coherence-dflash-direct-refresh-20260614-030114.md` repeated the
+  same focused diagnostic with `HIPFIRE_VERIFY_GRAPH=0`. The wrapper
+  correctly hard-failed the run as diagnostic-only (`verify_graph
+  direct=83` on prose and `direct=5` on code). More importantly, prose
+  failed strict AR parity again at token 62 (`AR=57874`, `DFlash=6511`),
+  matching the earlier graph-off failure mode. Code still passed AR
+  parity for 45 tokens, but fast replay remained rejected on
+  `attn_out` plus recurrent `s_matrix` mismatch, and the serial-source
+  tape self-check still matched. This refresh keeps dense DFlash
+  direct/no-graph verify unpromoted for production: graph capture stays
+  default-on until the direct path clears the same AR-parity gate on
+  prose and code.
 
 ## References
 
