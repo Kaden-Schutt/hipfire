@@ -407,6 +407,14 @@
     `accepted=0`, `replay_steps=1`, `s_matrix[0]`, `differing_bytes=914`, `max_abs=1.95490281e38`. The first multi-step blocker remains the
     earlier position-59 two-step row. The next runtime cut should target the position-66 one-step captured-row/state split first; if that cannot
     be made serial-equivalent, no replay-shape-only hybrid can replace conservative rollback.
+    A focused position-66 control, `/tmp/coherence-dflash-20260613-201053.md`, keeps default projection routing and passes strict AR parity while
+    rejecting the one-step fast tape row: prefill replay is exact (`rollback_prefill_compare.ok=true`, `rollback_prefill_logit_compare.max_abs=0`),
+    the 8-step continuation argmax stays matched (`max_abs_over_margin=0.1167`), token-major replay matches the captured `attn-out` and production
+    fast replay, but the captured fast-tape input already differs from serial at LA `qkv` (`max_abs=1.36566162e-2`) and final recurrent state
+    differs at `s_matrix[0]`. A matched `HIPFIRE_HFQ4_QKVZA_FAST=0` control,
+    `/tmp/coherence-dflash-20260613-201250.md`, is not a fix: it breaks prose AR parity at token 62 (`57874` vs `6511`), moves the first
+    input split to `attn_residual` (`max_abs=1.47056580e-3`), and still rejects one-step fast replay at `s_matrix[1]`. The next cut is therefore
+    not a qkvza-fast opt-out policy; it is proving or eliminating the one-step captured-row drift under production projection routing.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
