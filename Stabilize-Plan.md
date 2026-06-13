@@ -168,7 +168,13 @@
     Adding full-buffer f32 diff stats confirms the magnitude is small but broad: `f32_words=6144`, `f32_bit_diff_words=5848`,
     `max_abs=1.66893005e-6`, `mean_abs=1.52590843e-7`, `max_rel=1.76467560e-2`. The next cut is to decide whether fast rollback input
     comparisons need tolerance at FA raw attention boundaries, then prove the resulting recurrent/logit state still matches the serial oracle within
-    an admission-grade tolerance before promoting any GDN-tape replay path.
+    an admission-grade tolerance before promoting any GDN-tape replay path. A diagnostic-only
+    `HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL=0.000002` run advances past the FA raw attention boundary and exposes the next drift at the following
+    LA input, `x_in[4]` (`bytes=20480`, `differing_bytes=4333`, `first_offset=4`, row 0/logical position 120/hidden elem 1) with
+    `actual_f32=-4.16579276e-1`, `expected_f32=-4.16579247e-1`, `max_abs=4.76837158e-7`, `mean_abs=4.65472105e-8`, and
+    `max_rel=7.69230770e-3`. The following state compare still mismatches at `s_matrix[0]`, so this tolerance walk suggests low-amplitude
+    floating-point reduction/order drift propagating from FA output into the next layer input, not a discrete indexing/routing error. Fast
+    rollback replay remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity evidence.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

@@ -889,6 +889,13 @@ pub const ENV_HIPFIRE_DFLASH_ROLLBACK_COMPARE: EnvVarDoc = EnvVarDoc {
     source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:829",
 };
 
+/// `HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL` — Diagnostic-only absolute tolerance for FA raw attention rollback input compare
+pub const ENV_HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL: EnvVarDoc = EnvVarDoc {
+    name: "HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL",
+    description: "Diagnostic-only absolute tolerance for FA raw attention rollback input compare",
+    source: "/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:838",
+};
+
 /// `HIPFIRE_DFLASH_SEED_ORACLE` — Enabled when set to 1
 pub const ENV_HIPFIRE_DFLASH_SEED_ORACLE: EnvVarDoc = EnvVarDoc {
     name: "HIPFIRE_DFLASH_SEED_ORACLE",
