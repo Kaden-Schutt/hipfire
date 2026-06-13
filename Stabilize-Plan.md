@@ -466,7 +466,10 @@
     `/tmp/coherence-dflash-20260613-211049.md` plus `/tmp/coherence-dflash-20260613-211049.dflash_trace.json` passed strict prose/code AR parity
     with fast verify-tape replay still disabled (`replay_gdn_tape=0`) and no full-prefill rollback (`replay_full_prefill=0`): prose used
     `replay_serial_tape=92`, code used `replay_serial_tape=4` plus `replay_verify_complete=1`. `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=0` is now
-    the diagnostic opt-out back to the older conservative fallback.
+    the diagnostic opt-out back to the older conservative fallback. Refreshed current-worktree evidence
+    `/tmp/coherence-dflash-20260613-211728.md` plus `/tmp/coherence-dflash-20260613-211728.dflash_trace.json` reconfirmed this policy on
+    `chaingun` `b601a4c9`: prose/code strict AR parity passed, `replay_gdn_tape=0`, `replay_full_prefill=0`, prose used
+    `replay_serial_tape=92`, and code used `replay_serial_tape=4` plus `replay_verify_complete=1`.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
@@ -494,6 +497,10 @@
     four default rows were direct-only: phase1 prose `direct=91`, phase1 code `direct=5`, phase2 prose `direct=76`, and phase2 code `direct=5`, with
     `warmup=capture=replay=0` in every row. The eval artifact path now filters first-party `path_c_trace` rows to Path C modes or explicit promotion
     verdicts, so ordinary DFlash rows cannot pollute graph-promotion evidence when `hipfire-eval` emits artifacts from its own result rows.
+    Refreshed graph A/B evidence on the staged qwen3.6 27B artifacts,
+    `/tmp/path-c-smoke-20260613-212001.md` plus `/tmp/path-c-smoke-20260613-212001.path_c_trace.json`, again passed without hard errors and kept
+    `promotion_verdict=NOT_PROMOTED`: phase1 code `-2.078%`, phase1 prose `+2.988%`, phase2 code `-0.227%`, and phase2 prose `-3.059%`
+    tok/s deltas against the 5% threshold, with the phase2 prose τ delta also below the `-1.0%` floor (`-2.097%`).
     A follow-up AR-parity control showed that direct/no-graph DFlash verify is not yet production-safe:
     `HIPFIRE_DFLASH_AR_PARITY=1 ./tests/coherence-gate-dflash.sh --fast` failed prose at token mismatch `57874` vs `6511` with
     `replay_gdn_tape=0`, while `HIPFIRE_VERIFY_GRAPH=1 HIPFIRE_DFLASH_AR_PARITY=1 ./tests/coherence-gate-dflash.sh --fast` passed
@@ -509,7 +516,9 @@
     default-on for correctness, and `HIPFIRE_VERIFY_GRAPH=0` is reserved for graph/nograph diagnostics and direct-verify promotion work until it
     clears the same AR parity gate. A refreshed default run on `8449f2e7`, `/tmp/coherence-dflash-20260613-194740.md`, reconfirmed this policy:
     prose used `warmup=5/capture=5/replay=82/direct=0`, code used `warmup=1/capture=1/replay=3/direct=0`, and both rows passed strict AR parity
-    with no fast rollback admission.
+    with no fast rollback admission. The current-worktree run `/tmp/coherence-dflash-20260613-211728.md` reconfirmed the same dense DFlash graph
+    policy after serial-tape rollback promotion: prose used `direct=0/warmup=5/capture=5/replay=82`, code used
+    `direct=0/warmup=1/capture=1/replay=3`, and the coherence gate would hard-fail any AR-parity DFlash row that reports `direct>0`.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

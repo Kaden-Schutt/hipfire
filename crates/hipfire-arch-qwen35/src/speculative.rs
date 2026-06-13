@@ -914,6 +914,8 @@ fn dflash_prefix_verify_rollback_replay_from_env() -> bool {
 /// directly.
 fn dflash_serial_tape_rollback_replay_from_env() -> bool {
     !matches!(
+        // HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE: default-on conservative
+        // serial-source GDN tape rollback; set 0/false/off/no to opt out.
         std::env::var("HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE")
             .ok()
             .as_deref(),
