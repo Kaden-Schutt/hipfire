@@ -419,6 +419,21 @@ Latest rollback diagnostic evidence:
   the fast-replay blocker past qkvza and LA0 GDN inputs: LA0 GDN output
   or the replay/capture cadence for its `attn_out` is the next active
   site.
+- `/tmp/coherence-dflash-serial-tape-self-20260613-231546.md` added a
+  serial-tape self-replay `attn_out` diagnostic. The serial tape
+  replayed its own LA0 `attn_out` capture exactly
+  (`serial-tape-attn-out.ok=true`), while the verify tape still
+  mismatched serial at LA0 `attn_out`. This rules out token-major replay
+  itself as the LA0 output mismatch source; the remaining mismatch is
+  specific to the verify-captured tape stream.
+- `/tmp/coherence-dflash-serial-tape-self-graphoff-20260613-231814.md`
+  repeated the same diagnostic with `HIPFIRE_VERIFY_GRAPH=0`. The
+  serial-tape self-replay still matched and the serial-vs-verify LA0
+  `attn_out` mismatch remained unchanged, so default-on verify graph
+  replay is not the active source of this fast-rollback blocker. The run
+  also reinforces the dense-DFlash graph policy: direct/no-graph verify
+  stayed diagnostic-only and the gate rejected it
+  (`direct_verify_is_diagnostic_only_for_dflash_ar_parity`).
 
 ## References
 
