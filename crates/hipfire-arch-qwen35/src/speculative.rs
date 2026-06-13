@@ -7031,6 +7031,8 @@ pub fn spec_step_dflash(
     } else if dflash_prefix_verify_rollback_replay_from_env() && gdn_tape_opt.is_some() {
         let replay_tokens = &committed[..accept_len + 1];
         let mut prefix_tape = GdnTape::new_for_config(gpu, &target.config, replay_tokens.len())?;
+        let hidden_head_before_prefix_verify = hidden_rb.head;
+        let hidden_written_before_prefix_verify = hidden_rb.written;
         target_snap.restore_to(&mut target.dn_state, gpu)?;
         let _prefix_verify = verify_dflash_block(
             gpu,
@@ -7042,6 +7044,12 @@ pub fn spec_step_dflash(
             false,
             verify_scratch,
         )?;
+        // Prefix-verify rollback captures a replacement GDN tape after the
+        // accepted rows were already scattered into the draft hidden cache.
+        // Keep that diagnostic verify from shifting the ring cursor observed
+        // by later DFlash cycles.
+        hidden_rb.head = hidden_head_before_prefix_verify;
+        hidden_rb.written = hidden_written_before_prefix_verify;
         target_snap.restore_to(&mut target.dn_state, gpu)?;
         prefix_tape.replay_gdn(
             gpu,

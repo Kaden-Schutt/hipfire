@@ -479,6 +479,13 @@
     `qkv` at position 66 (`max_abs=1.36566162e-2`), and the first state split remains `s_matrix[0]` on the same one-step rollback row
     (`differing_bytes=914`, `max_abs=1.95490281e38`). Fast verify-tape rollback therefore remains diagnostic-only, but its rejection is now
     proven under the live no-full-prefill serial-tape policy rather than under the old fallback branch.
+    A narrowed dirty-tree prefix-verify control restored `hidden_rb.head`/`written` after the extra prefix verify so the diagnostic tape capture
+    could not shift the hidden-ring cursor seen by later DFlash cycles. That did not fix the replacement path:
+    `/tmp/coherence-dflash-20260613-215238.md` plus `/tmp/coherence-dflash-20260613-215238.dflash_trace.json` still removed full-prefill rollback
+    (`replay_prefix_verify=38`, `replay_verify_complete=14`, `replay_full_prefill=0`) but failed prose AR parity at token 14
+    (`25849` vs `310`) and repeated (`max_freq=0.625`). Code still passed with `replay_prefix_verify=4`. The prefix-verify blocker is therefore
+    not just hidden-ring cursor drift after the diagnostic verify; the remaining failure is a target-state/KV/tape side effect in the prefix verify
+    replacement itself.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
