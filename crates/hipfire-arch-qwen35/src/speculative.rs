@@ -7034,7 +7034,9 @@ pub fn spec_step_dflash(
         let hidden_head_before_prefix_verify = hidden_rb.head;
         let hidden_written_before_prefix_verify = hidden_rb.written;
         target_snap.restore_to(&mut target.dn_state, gpu)?;
-        let _prefix_verify = verify_dflash_block(
+        // Keep this replacement-candidate diagnostic from testing graph replay
+        // state; the normal dense DFlash verify path still defaults graph-on.
+        let _prefix_verify = verify_dflash_block_with_graph_policy(
             gpu,
             target,
             replay_tokens,
@@ -7042,6 +7044,7 @@ pub fn spec_step_dflash(
             hidden_rb,
             Some(&mut prefix_tape),
             false,
+            VerifyGraphPolicy::Disabled,
             verify_scratch,
         )?;
         // Prefix-verify rollback captures a replacement GDN tape after the

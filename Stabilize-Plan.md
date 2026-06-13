@@ -486,6 +486,12 @@
     (`25849` vs `310`) and repeated (`max_freq=0.625`). Code still passed with `replay_prefix_verify=4`. The prefix-verify blocker is therefore
     not just hidden-ring cursor drift after the diagnostic verify; the remaining failure is a target-state/KV/tape side effect in the prefix verify
     replacement itself.
+    The prefix-verify replacement now also disables verify-graph capture for the extra diagnostic verify call, so that experiment no longer depends
+    on graph replay state. Fresh evidence `/tmp/coherence-dflash-20260613-215740.md` plus
+    `/tmp/coherence-dflash-20260613-215740.dflash_trace.json` still failed prose AR parity at token 9 (`4777` vs `2166`) while using only
+    prefix-verify rollback for partial accepts (`replay_prefix_verify=52`, `replay_serial_tape=0`, `replay_full_prefill=0`); code still passed with
+    `replay_prefix_verify=4`. This rules out prefix-verify graph capture as the root cause and keeps the replacement candidate rejected: the live
+    non-full-prefill default must continue to use serial-source tape until batched verify can produce serial-equivalent rollback tape contents.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
