@@ -36,6 +36,11 @@
     UNSUPPORTED_MODEL=$HOME/.hipfire/models/llama-3.2-1b-instruct.mq4.hfq ./tests/smoke-generate-batch-prefill.sh`.
     The older dense MQ4 local spelling (`qwen3.5-0.8b.mq4.hfq`) remains unsuitable for this fused dense prefill smoke because its Q8_0 lm_head is
     intentionally rejected by the dense full-precision final-logits path.
+    Fresh checkout evidence on gfx1151 (2026-06-13): the grouped decode parity matrix passed with
+    `MODEL=$HOME/.hipfire/models/qwen3.6-35b-a3b-mq4.hfq HIPFIRE_QWEN35_DECODE_BATCH=fused_grouped_moe
+    HIPFIRE_DECODE_BATCH_GROUPED_PARITY_MATRIX=1 ./tests/smoke-server-decode-batch.sh`: B=2 `chunks=1/2 serial/native=15.264/14.435 ms`,
+    B=4 `chunks=2/2 serial/native=40.687/30.413 ms`, B=8 `chunks=4/2 serial/native=91.129/86.483 ms`. The same checkout also passed the full
+    batch-prefill smoke above, including unsupported-arch fallback, with `generate_batch_prefill smoke passed`.
 
   - Add backend-neutral prefill checkpoint hooks so fused prefill can emit semantic-boundary checkpoints, not only final checkpoints. The hook should
     carry: session id, logical token position, boundary kind, prefix hash input, and state handle.
