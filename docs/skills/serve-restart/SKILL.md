@@ -19,8 +19,10 @@ scripts/serve-restart.sh [port] [-- <extra hipfire serve args>]
 Default port 11435. Env honored: `HIPFIRE_MODELS_DIR`, `HIPFIRE_VERIFY_GRAPH`.
 
 It: kills `cli/index.ts serve` + `examples/daemon`, `fuser -k <port>/tcp`,
-removes `~/.hipfire/{daemon,serve}.pid` + `/tmp/hipfire-gpu.lock`, waits
-the port free, relaunches detached, tails to `warm-up complete`.
+removes `~/.hipfire/{daemon,serve}.pid`, waits the port free, relaunches
+detached, tails to `warm-up complete`. (It no longer touches
+`/tmp/hipfire-gpu.lock` — that is an flock'd file the kernel auto-releases
+on holder death; deleting it would break GPU mutual exclusion.)
 
 ## Just kill, don't restart
 

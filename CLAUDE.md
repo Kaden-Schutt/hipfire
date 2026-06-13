@@ -421,11 +421,22 @@ GPU access through `gpu-lock.sh`. **This is enforced automatically via hooks in
 `.claude/settings.json`** — any `cargo` command triggers lock acquire before execution
 and release after completion.
 
-- Lock file: `/tmp/hipfire-gpu.lock`
-- Contains a human-readable status like `model-ingestion agent is using the gpu`
-- Agents poll every 5s (configurable via `GPU_POLL_INTERVAL`) when the GPU is busy
+- Lock file: `/tmp/hipfire-gpu.lock` (override with `HIPFIRE_GPU_LOCKFILE`)
+- Backed by `flock(1)` held on an open fd, so the **kernel auto-releases the
+  lock when the holder dies for any reason** (kill -9, crash, OOM, terminal
+  close). Stale locks are structurally impossible — **never `rm` the lockfile**
+  (unlinking an flock'd file lets a second acquirer lock a fresh inode → two
+  holders). If validation seems "stuck on a stale lock", it isn't stale: a live
+  holder is genuinely using the GPU — check `gpu_status`.
+- Records `agent pid=… host=… acquired=…` in the file for diagnostics
+- While a live holder is busy, waiters print status every 5s
+  (`GPU_POLL_INTERVAL`) and give up after `GPU_LOCK_TIMEOUT` (default 1800s;
+  `0` = wait forever), exiting non-zero instead of hanging indefinitely
+- `gpu_acquire` is reentrant within a process tree (`HIPFIRE_GPU_LOCK_OWNER`),
+  so nested gates (e.g. `pp-gate` under `speed-gate`) don't self-deadlock
 - Manual usage: `source gpu-lock.sh && gpu_acquire "<branch>" && gpu_release`
 - Check status: `source gpu-lock.sh && gpu_status`
+- Regression test (no GPU): `bash scripts/test-gpu-lock.sh`
 
 ## Rules
 
