@@ -223,6 +223,12 @@
     `qkv index=0` differs with `max_abs=7.38525391e-3`, and replay-critical `gdn_q index=0` differs with `max_abs=1.89878047e-5`; live telemetry
     remains `replay_gdn_tape=0 replay_full_prefill=59`. The active blocker is therefore fast verify tape input parity before any fast replay
     admission, not only the final `tape.replay_gdn` state update.
+    A forced-serial A/B ladder on the same repro confirms the split chain without admitting fast replay: `HIPFIRE_HFQ4_QKVZA_FAST=0` moves the first
+    mismatch to `attn_residual[0]` (`max_abs=1.73091888e-3`); adding `HIPFIRE_HFQ4_RESIDUAL_FAST=0` moves it to `ffn_gate[0]`
+    (`max_abs=4.45604324e-4`); adding `HIPFIRE_HFQ4_GATE_UP_FAST=0` moves it to `fa_bridge_q_full[3]` (`max_abs=3.54099274e-3`); adding
+    `HIPFIRE_HFQ4_QKV_FAST=0` moves it to `fa_bridge_attn_raw[3]` with a much smaller `max_abs=1.54972076e-6`. These are failed promotion
+    attempts, not production policy: disabling fast projection families only localizes the drift ladder. The current next cut is the small
+    FullAttention raw-attention drift and whether it can be bounded all the way through recurrent/logit parity.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
