@@ -386,6 +386,14 @@
     failed prose AR parity at token 14 (`25849` vs `310`) and tripped the repetition detector (`max_freq=0.625`). Code passed, so the shape is
     not universally invalid, but it is rejected for production and remains diagnostic-only until the prefix verify hidden/state side effects are
     made AR-equivalent on prose.
+    Current-worktree evidence after the daemon resource-lock change keeps the same production/diagnostic split. The default AR-parity gate
+    `/tmp/coherence-dflash-20260613-194740.md` passed with live rollback conservative (`replay_gdn_tape=0`; prose `replay_full_prefill=92`;
+    code `replay_full_prefill=4`, `replay_verify_complete=1`) and graph verify active. The all-cycle fast rollback diagnostic
+    `/tmp/coherence-dflash-20260613-194925.md` rejected fast replay again: prose hit `fast_replay_next_logit_argmax_mismatch` at
+    `pos=108/token_pos=120` (`6511` vs `57874`) plus recurrent-state mismatch at `pos=59/s_matrix[0]`, while code had no argmax mismatch but was
+    still rejected on recurrent-state mismatch and `max_abs_over_margin=1.8169`. Fast GDN-tape rollback therefore remains diagnostic-only; the next
+    production-grade cut is eliminating the captured-row drift or building a live fail-closed hybrid that proves recurrent-state and continuation
+    margin bounds before using fast replay.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
@@ -426,7 +434,9 @@
     opt-in change, `/tmp/coherence-dflash-20260613-164509.md` plus `/tmp/coherence-dflash-20260613-164509.dflash_trace.json`, also passed with
     `direct=0` for both DFlash rows and `replay_gdn_tape=0` for both rollback rows. Production dense DFlash therefore keeps verify graph capture
     default-on for correctness, and `HIPFIRE_VERIFY_GRAPH=0` is reserved for graph/nograph diagnostics and direct-verify promotion work until it
-    clears the same AR parity gate.
+    clears the same AR parity gate. A refreshed default run on `8449f2e7`, `/tmp/coherence-dflash-20260613-194740.md`, reconfirmed this policy:
+    prose used `warmup=5/capture=5/replay=82/direct=0`, code used `warmup=1/capture=1/replay=3/direct=0`, and both rows passed strict AR parity
+    with no fast rollback admission.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
