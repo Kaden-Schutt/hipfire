@@ -102,7 +102,11 @@
     token-major same-frame replay matches (`dflash-rollback-serial-tape-token-major-compare ... match`). This rules out the Q8 recurrence kernel
     and snapshot/restore as the serial-tape blocker: the replay must consume stochastic requant frames in the same token-major order as serial
     decode. The remaining fast-path blocker is still verify-tape projection parity (`qkv` mismatch at positions 59 and 120) plus a production-safe
-    frame/order policy before GDN-tape rollback can replace conservative serial rollback.
+    frame/order policy before GDN-tape rollback can replace conservative serial rollback. A projection-input tape diagnostic now proves the
+    known position-120 repro reaches LA layer 0 with byte-identical normalized/rotated projection input, then diverges at that layer's batched
+    verify `qkv` output (`bytes=40960`, `differing_bytes=22466`, `first_offset=0`, `serial_byte=152`, `gdn_byte=255`). The next blocker is
+    therefore the batched LA `qkvza` projection family versus the serial decode projection family for identical input, not hidden-state drift
+    before the first LA layer.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

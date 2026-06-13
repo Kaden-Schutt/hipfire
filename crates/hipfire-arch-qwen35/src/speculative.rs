@@ -1100,6 +1100,7 @@ pub struct DeltaNetTape {
 /// place.
 pub struct GdnTape {
     pub max_n: usize,
+    pub x_in_dim: usize,
     pub qkv_dim: usize,
     pub v_dim: usize,
     pub k_dim: usize,
@@ -1107,6 +1108,10 @@ pub struct GdnTape {
     pub n_key_heads: usize,
     pub value_head_dim: usize,
     pub key_head_dim: usize,
+    /// Per-LA-layer [max_n x hidden_dim] F32 — normalized/rotated activation
+    /// fed to the layer's qkv projection. Diagnostic-only; lets rollback
+    /// compare distinguish projection-input drift from qkv kernel drift.
+    pub x_in_bufs: Vec<GpuTensor>,
     /// Per-LA-layer [max_n × qkv_dim] F32 — raw qkvza projection output.
     pub qkv_bufs: Vec<GpuTensor>,
     /// Per-LA-layer [max_n × n_v_heads] F32 — post-sigmoid_alpha_gate.
@@ -1142,6 +1147,7 @@ impl GdnTape {
     ) -> HipResult<Self> {
         let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
         let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let x_in_dim = config.dim;
         let qkv_dim = k_dim * 2 + v_dim;
         let n_v_heads = config.linear_num_value_heads;
         let n_key_heads = config.linear_num_key_heads;
@@ -1151,6 +1157,7 @@ impl GdnTape {
             .filter(|t| **t == qwen35::LayerType::LinearAttention)
             .count();
 
+        let mut x_in_bufs = Vec::with_capacity(n_la_layers);
         let mut qkv_bufs = Vec::with_capacity(n_la_layers);
         let mut alpha_bufs = Vec::with_capacity(n_la_layers);
         let mut beta_bufs = Vec::with_capacity(n_la_layers);
@@ -1162,6 +1169,7 @@ impl GdnTape {
         let mut q_bufs = Vec::with_capacity(n_la_layers);
         let mut k_bufs = Vec::with_capacity(n_la_layers);
         for _ in 0..n_la_layers {
+            x_in_bufs.push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
             qkv_bufs.push(gpu.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
             alpha_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
             beta_bufs.push(gpu.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
@@ -1176,6 +1184,7 @@ impl GdnTape {
 
         Ok(Self {
             max_n,
+            x_in_dim,
             qkv_dim,
             v_dim,
             k_dim,
@@ -1183,6 +1192,7 @@ impl GdnTape {
             n_key_heads,
             value_head_dim: config.linear_value_head_dim,
             key_head_dim: config.linear_key_head_dim,
+            x_in_bufs,
             qkv_bufs,
             alpha_bufs,
             beta_bufs,
@@ -1204,8 +1214,9 @@ impl GdnTape {
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
         for t in self
-            .qkv_bufs
+            .x_in_bufs
             .into_iter()
+            .chain(self.qkv_bufs.into_iter())
             .chain(self.alpha_bufs.into_iter())
             .chain(self.beta_bufs.into_iter())
             .chain(self.alpha_raw_bufs.into_iter())
@@ -1273,6 +1284,7 @@ impl GdnTapeShards {
         let n_bands = gpus.devices.len();
         let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
         let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let x_in_dim = config.dim;
         let qkv_dim = k_dim * 2 + v_dim;
         let n_v_heads = config.linear_num_value_heads;
         let n_key_heads = config.linear_num_key_heads;
@@ -1301,6 +1313,7 @@ impl GdnTapeShards {
         for band in 0..n_bands {
             let g = &mut gpus.devices[band];
             g.bind_thread()?;
+            let mut x_in_bufs = Vec::with_capacity(n_la_total);
             let mut qkv_bufs = Vec::with_capacity(n_la_total);
             let mut alpha_bufs = Vec::with_capacity(n_la_total);
             let mut beta_bufs = Vec::with_capacity(n_la_total);
@@ -1313,6 +1326,7 @@ impl GdnTapeShards {
             let mut k_bufs = Vec::with_capacity(n_la_total);
             for global_la_idx in 0..n_la_total {
                 if shard_owns[band][global_la_idx] {
+                    x_in_bufs.push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
                     qkv_bufs.push(g.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
                     alpha_bufs
                         .push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
@@ -1333,6 +1347,7 @@ impl GdnTapeShards {
                     // These entries are never written under correct
                     // dispatch (the chunk loop only iterates layers in
                     // this band).
+                    x_in_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     qkv_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     alpha_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     beta_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
@@ -1347,6 +1362,7 @@ impl GdnTapeShards {
             }
             shards.push(GdnTape {
                 max_n,
+                x_in_dim,
                 qkv_dim,
                 v_dim,
                 k_dim,
@@ -1354,6 +1370,7 @@ impl GdnTapeShards {
                 n_key_heads,
                 value_head_dim: config.linear_value_head_dim,
                 key_head_dim: config.linear_key_head_dim,
+                x_in_bufs,
                 qkv_bufs,
                 alpha_bufs,
                 beta_bufs,
@@ -1438,6 +1455,7 @@ impl GdnTapeShards {
                 .find(|&b| self.shard_owns[b][global_la_idx])
                 .expect("every LA layer must be owned by exactly one band");
             // Compute bytes per layer slot.
+            let x_in_bytes = target.max_n * target.x_in_dim * 4;
             let qkv_bytes = target.max_n * target.qkv_dim * 4;
             let alpha_bytes = target.max_n * target.n_v_heads * 4;
             let beta_bytes = alpha_bytes;
@@ -1452,6 +1470,13 @@ impl GdnTapeShards {
                 // target_dev. Free; no peer copy.
                 let g = &mut gpus.devices[target_dev];
                 g.bind_thread()?;
+                g.hip.memcpy_dtod_at(
+                    &target.x_in_bufs[global_la_idx].buf,
+                    0,
+                    &self.shards[owning_band].x_in_bufs[global_la_idx].buf,
+                    0,
+                    x_in_bytes,
+                )?;
                 g.hip.memcpy_dtod_at(
                     &target.qkv_bufs[global_la_idx].buf,
                     0,
@@ -1530,6 +1555,13 @@ impl GdnTapeShards {
                 let src_dev_id = src_g.device_id;
                 let dst_dev_id = dst_g.device_id;
                 let runtime = &dst_g.hip;
+                runtime.memcpy_peer(
+                    &target.x_in_bufs[global_la_idx].buf,
+                    dst_dev_id,
+                    &self.shards[owning_band].x_in_bufs[global_la_idx].buf,
+                    src_dev_id,
+                    x_in_bytes,
+                )?;
                 runtime.memcpy_peer(
                     &target.qkv_bufs[global_la_idx].buf,
                     dst_dev_id,
@@ -1766,54 +1798,46 @@ impl GdnTape {
         expected: &GdnTape,
         n_positions: usize,
     ) -> HipResult<Option<DeltaNetSnapshotDiff>> {
+        let x_in_bytes = n_positions * self.x_in_dim * 4;
         let qkv_bytes = n_positions * self.qkv_dim * 4;
         let alpha_beta_bytes = n_positions * self.n_v_heads * 4;
-        for (i, (actual, expected)) in self
-            .qkv_bufs
-            .iter()
-            .zip(expected.qkv_bufs.iter())
-            .enumerate()
-        {
+        for i in 0..self.qkv_bufs.len() {
+            if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                gpu,
+                "x_in",
+                i,
+                &self.x_in_bufs[i].buf,
+                &expected.x_in_bufs[i].buf,
+                x_in_bytes,
+            )? {
+                return Ok(Some(diff));
+            }
             if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
                 gpu,
                 "qkv",
                 i,
-                &actual.buf,
-                &expected.buf,
+                &self.qkv_bufs[i].buf,
+                &expected.qkv_bufs[i].buf,
                 qkv_bytes,
             )? {
                 return Ok(Some(diff));
             }
-        }
-        for (i, (actual, expected)) in self
-            .alpha_bufs
-            .iter()
-            .zip(expected.alpha_bufs.iter())
-            .enumerate()
-        {
             if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
                 gpu,
                 "alpha",
                 i,
-                &actual.buf,
-                &expected.buf,
+                &self.alpha_bufs[i].buf,
+                &expected.alpha_bufs[i].buf,
                 alpha_beta_bytes,
             )? {
                 return Ok(Some(diff));
             }
-        }
-        for (i, (actual, expected)) in self
-            .beta_bufs
-            .iter()
-            .zip(expected.beta_bufs.iter())
-            .enumerate()
-        {
             if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
                 gpu,
                 "beta",
                 i,
-                &actual.buf,
-                &expected.buf,
+                &self.beta_bufs[i].buf,
+                &expected.beta_bufs[i].buf,
                 alpha_beta_bytes,
             )? {
                 return Ok(Some(diff));

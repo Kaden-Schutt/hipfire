@@ -15558,9 +15558,19 @@ fn forward_prefill_chunk(
                 }
 
                 if let Some(tape) = gdn_tape.as_ref() {
+                    let x_in_row_bytes = tape.x_in_dim * 4;
                     let alpha_row_bytes = n_v_heads * 4;
+                    let off_x = tape_offset * x_in_row_bytes;
                     let off_a = tape_offset * alpha_row_bytes;
+                    let copy_x = n * x_in_row_bytes;
                     let copy_a = n * alpha_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.x_in_bufs[delta_layer_idx].buf,
+                        off_x,
+                        &pbs.x_rot_batch.buf,
+                        0,
+                        copy_x,
+                    )?;
                     gpu.memcpy_dtod_at_auto(
                         &tape.alpha_raw_bufs[delta_layer_idx].buf,
                         off_a,
@@ -17937,9 +17947,19 @@ fn forward_prefill_chunk(
                 }
                 debug_stop_after!("qkvza", layer_idx);
                 if let Some(tape) = gdn_tape.as_ref() {
+                    let x_in_row_bytes = tape.x_in_dim * 4;
                     let alpha_row_bytes = n_v_heads * 4;
+                    let off_x = tape_offset * x_in_row_bytes;
                     let off_a = tape_offset * alpha_row_bytes;
+                    let copy_x = n * x_in_row_bytes;
                     let copy_a = n * alpha_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.x_in_bufs[delta_layer_idx].buf,
+                        off_x,
+                        &pbs.x_rot_batch.buf,
+                        0,
+                        copy_x,
+                    )?;
                     gpu.memcpy_dtod_at_auto(
                         &tape.alpha_raw_bufs[delta_layer_idx].buf,
                         off_a,
@@ -20290,7 +20310,16 @@ fn forward_scratch_layers(
                 // single-token conv1d+SiLU+split below, shaving one dispatch
                 // per LA decode layer. Other arches preserve the old pair.
                 if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let x_in_for_tape = x_rot_paro.or(x_rot).unwrap_or(&s.tmp);
+                    let x_in_row_bytes = tape.x_in_dim * 4;
                     let alpha_beta_row_bytes = tape.n_v_heads * 4;
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.x_in_bufs[delta_layer_idx].buf,
+                        *tape_row * x_in_row_bytes,
+                        &x_in_for_tape.buf,
+                        0,
+                        x_in_row_bytes,
+                    )?;
                     gpu.hip.memcpy_dtod_at(
                         &tape.alpha_raw_bufs[delta_layer_idx].buf,
                         *tape_row * alpha_beta_row_bytes,
