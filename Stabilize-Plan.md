@@ -201,8 +201,12 @@
     the fast verify tape confirms the one-step position-120 case is also serial-equivalent except for the same single-byte `s_matrix[3]` drift, but
     the two-step position-59 case still diverges from serial at `s_matrix[1]` while serial recapture plus token-major replay is byte-exact. That
     rules out a simple production-only layer-major order bug as the whole issue: fast verify tape capture/replay is still not multi-step serial
-    equivalent, and production `tape.replay_gdn` remains a separate larger `s_matrix[0]` divergence. Fast rollback replay remains diagnostic-only
-    until tolerance semantics are tied to final recurrent/logit parity evidence.
+    equivalent, and production `tape.replay_gdn` remains a separate larger `s_matrix[0]` divergence. Comparing only the replay-critical
+    `q/k/v/alpha/beta` inputs across all LA layers localizes the two-step position-59 tape drift to `gdn_q index=1` at row 1
+    (`max_abs=7.47820362e-4`), while LA0 replay inputs still match. The next blocker is to make later-layer fast tape rows represent the
+    serial accepted-prefix trajectory, or keep multi-step fast replay rejected and limit any future fast path to cases with explicit per-layer
+    serial-equivalence evidence. Fast rollback replay remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity
+    evidence.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

@@ -3093,6 +3093,22 @@ impl GdnTape {
         Ok(None)
     }
 
+    fn compare_gdn_inputs_to(
+        &self,
+        gpu: &Gpu,
+        expected: &GdnTape,
+        n_positions: usize,
+    ) -> HipResult<Option<DeltaNetSnapshotDiff>> {
+        for layer_index in 0..self.q_bufs.len() {
+            if let Some(diff) =
+                self.compare_gdn_inputs_layer_to(gpu, expected, layer_index, n_positions)?
+            {
+                return Ok(Some(diff));
+            }
+        }
+        Ok(None)
+    }
+
     fn replay_gdn_fused_gate_conv_for_compare(
         &self,
         gpu: &mut Gpu,
@@ -6304,6 +6320,32 @@ pub fn spec_step_dflash(
                 }
                 None => eprintln!(
                     "[dflash-rollback-la0-gdn-input-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+            }
+            match serial_tape.compare_gdn_inputs_to(gpu, tape, accept_len + 1)? {
+                Some(diff) => {
+                    let context =
+                        rollback_input_diff_context(&target.config, tape, &diff, position);
+                    eprintln!(
+                        "[dflash-rollback-gdn-input-all-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.actual_byte,
+                        diff.expected_byte,
+                        context,
+                    );
+                }
+                None => eprintln!(
+                    "[dflash-rollback-gdn-input-all-compare] pos={} accepted={} replay_steps={} match",
                     position,
                     accept_len,
                     accept_len + 1,
