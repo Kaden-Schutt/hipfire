@@ -120,7 +120,9 @@
     mismatch at `attn_residual[0]` while degrading output quality. The next cut should compare the residual input and residual destination rows
     immediately before the `wo` call, not swap residual kernels. Adding that `wo_residual_in` tape point confirms the destination residual row
     also matches serial immediately before LA0 `wo`; the first mismatch remains `attn_residual[0]`. That leaves the MQ4 `wo` projection output or
-    fused residual epilogue itself as the active blocker.
+    fused residual epilogue itself as the active blocker. Capturing the rotated `wo_input` confirms the MQ activation rotation also matches serial,
+    so both inputs to the fused residual projection match before the call. The remaining split is inside the batched `gemm_hfq4g256_residual`
+    projection/epilogue path versus serial `gemv_hfq4g256_residual`.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.

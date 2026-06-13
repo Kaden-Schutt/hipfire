@@ -1134,6 +1134,8 @@ pub struct GdnTape {
     pub attn_out_bufs: Vec<GpuTensor>,
     /// Per-LA-layer gated output norm result, before `wo`.
     pub normed_bufs: Vec<GpuTensor>,
+    /// Per-LA-layer input passed to LA `wo` after any MQ rotation.
+    pub wo_input_bufs: Vec<GpuTensor>,
     /// Per-LA-layer hidden state used as the LA `wo` residual input.
     pub wo_residual_in_bufs: Vec<GpuTensor>,
     /// Per-LA-layer hidden state after LA `wo` residual, before the FFN.
@@ -1180,6 +1182,7 @@ impl GdnTape {
         let mut k_bufs = Vec::with_capacity(n_la_layers);
         let mut attn_out_bufs = Vec::with_capacity(n_la_layers);
         let mut normed_bufs = Vec::with_capacity(n_la_layers);
+        let mut wo_input_bufs = Vec::with_capacity(n_la_layers);
         let mut wo_residual_in_bufs = Vec::with_capacity(n_la_layers);
         let mut attn_residual_bufs = Vec::with_capacity(n_la_layers);
         let mut layer_out_bufs = Vec::with_capacity(n_la_layers);
@@ -1197,6 +1200,7 @@ impl GdnTape {
             k_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
             attn_out_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
             normed_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
+            wo_input_bufs.push(gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
             wo_residual_in_bufs
                 .push(gpu.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
             attn_residual_bufs
@@ -1227,6 +1231,7 @@ impl GdnTape {
             k_bufs,
             attn_out_bufs,
             normed_bufs,
+            wo_input_bufs,
             wo_residual_in_bufs,
             attn_residual_bufs,
             layer_out_bufs,
@@ -1255,6 +1260,7 @@ impl GdnTape {
             .chain(self.k_bufs.into_iter())
             .chain(self.attn_out_bufs.into_iter())
             .chain(self.normed_bufs.into_iter())
+            .chain(self.wo_input_bufs.into_iter())
             .chain(self.wo_residual_in_bufs.into_iter())
             .chain(self.attn_residual_bufs.into_iter())
             .chain(self.layer_out_bufs.into_iter())
@@ -1358,6 +1364,7 @@ impl GdnTapeShards {
             let mut k_bufs = Vec::with_capacity(n_la_total);
             let mut attn_out_bufs = Vec::with_capacity(n_la_total);
             let mut normed_bufs = Vec::with_capacity(n_la_total);
+            let mut wo_input_bufs = Vec::with_capacity(n_la_total);
             let mut wo_residual_in_bufs = Vec::with_capacity(n_la_total);
             let mut attn_residual_bufs = Vec::with_capacity(n_la_total);
             let mut layer_out_bufs = Vec::with_capacity(n_la_total);
@@ -1379,6 +1386,7 @@ impl GdnTapeShards {
                     k_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
                     attn_out_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
                     normed_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
+                    wo_input_bufs.push(g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?);
                     wo_residual_in_bufs
                         .push(g.alloc_tensor(&[max_n * x_in_dim], rdna_compute::DType::F32)?);
                     attn_residual_bufs
@@ -1405,6 +1413,7 @@ impl GdnTapeShards {
                     k_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     attn_out_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     normed_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    wo_input_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     wo_residual_in_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     attn_residual_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
                     layer_out_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
@@ -1433,6 +1442,7 @@ impl GdnTapeShards {
                 k_bufs,
                 attn_out_bufs,
                 normed_bufs,
+                wo_input_bufs,
                 wo_residual_in_bufs,
                 attn_residual_bufs,
                 layer_out_bufs,
@@ -1619,6 +1629,13 @@ impl GdnTapeShards {
                     attn_out_bytes,
                 )?;
                 g.hip.memcpy_dtod_at(
+                    &target.wo_input_bufs[global_la_idx].buf,
+                    0,
+                    &self.shards[owning_band].wo_input_bufs[global_la_idx].buf,
+                    0,
+                    attn_out_bytes,
+                )?;
+                g.hip.memcpy_dtod_at(
                     &target.wo_residual_in_bufs[global_la_idx].buf,
                     0,
                     &self.shards[owning_band].wo_residual_in_bufs[global_la_idx].buf,
@@ -1735,6 +1752,13 @@ impl GdnTapeShards {
                     &target.normed_bufs[global_la_idx].buf,
                     dst_dev_id,
                     &self.shards[owning_band].normed_bufs[global_la_idx].buf,
+                    src_dev_id,
+                    attn_out_bytes,
+                )?;
+                runtime.memcpy_peer(
+                    &target.wo_input_bufs[global_la_idx].buf,
+                    dst_dev_id,
+                    &self.shards[owning_band].wo_input_bufs[global_la_idx].buf,
                     src_dev_id,
                     attn_out_bytes,
                 )?;
@@ -2037,6 +2061,16 @@ impl GdnTape {
                 i,
                 &self.normed_bufs[i].buf,
                 &expected.normed_bufs[i].buf,
+                v_bytes,
+            )? {
+                return Ok(Some(diff));
+            }
+            if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                gpu,
+                "wo_input",
+                i,
+                &self.wo_input_bufs[i].buf,
+                &expected.wo_input_bufs[i].buf,
                 v_bytes,
             )? {
                 return Ok(Some(diff));

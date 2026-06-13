@@ -15904,6 +15904,17 @@ fn forward_prefill_chunk(
                 } else {
                     &pbs.dn_normed_batch
                 };
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let v_row_bytes = tape.v_dim * 4;
+                    let off_v = tape_offset * v_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.wo_input_bufs[delta_layer_idx].buf,
+                        off_v,
+                        &wo_input.buf,
+                        0,
+                        n * v_row_bytes,
+                    )?;
+                }
                 if wo_is_6bit {
                     gpu.gemm_hfq6g256_residual(
                         &layer.wo.buf,
@@ -20612,6 +20623,28 @@ fn forward_scratch_layers(
                 }
                 // Fused wo GEMV + residual add: s.x += layer.wo * s.dn_normed
                 weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+                if let Some((tape, tape_row)) = gdn_tape_capture.as_mut() {
+                    let v_row_bytes = tape.v_dim * 4;
+                    let wo_input = if matches!(
+                        layer.wo.gpu_dtype,
+                        DType::MQ4G256
+                            | DType::MQ6G256
+                            | DType::MQ3G256
+                            | DType::MQ3G256Lloyd
+                            | DType::MFP4G32
+                    ) {
+                        gpu.mq_x_rot.as_ref().unwrap()
+                    } else {
+                        &s.dn_normed
+                    };
+                    gpu.hip.memcpy_dtod_at(
+                        &tape.wo_input_bufs[delta_layer_idx].buf,
+                        *tape_row * v_row_bytes,
+                        &wo_input.buf,
+                        0,
+                        v_row_bytes,
+                    )?;
+                }
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 LA wo residual", &s.x)?;
                 }
