@@ -221,6 +221,7 @@ keys = [
     "HIPFIRE_DFLASH_TRACE_POSITION",
     "HIPFIRE_DFLASH_TRACE_EXPECTED_TOKEN",
     "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY",
+    "HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE",
     "HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY",
     "HIPFIRE_VERIFY_GRAPH",
     "HIPFIRE_DFLASH_ROLLBACK_FA_RAW_ATOL",
@@ -693,14 +694,14 @@ if len(sys.argv) != 2:
 out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
 mismatch_pattern = re.compile(
     r"^\[dflash-rollback-compare\] "
-    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
     r"mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) "
     r"differing_bytes=(\d+) first_offset=(\d+) serial_byte=(\d+) gdn_byte=(\d+)(.*)$",
     re.MULTILINE,
 )
 match_pattern = re.compile(
     r"^\[dflash-rollback-compare\] "
-    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 match$",
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?match$",
     re.MULTILINE,
 )
 
@@ -927,12 +928,12 @@ frame_pattern = re.compile(
 )
 match_pattern = re.compile(
     r"^\[(dflash-rollback-(?:input|gdn-input-all)-compare)\] "
-    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?match$",
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?match$",
     re.MULTILINE,
 )
 mismatch_pattern = re.compile(
     r"^\[(dflash-rollback-(?:input|gdn-input-all)-compare)\] "
-    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?"
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
     r"mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) "
     r"differing_bytes=(\d+) first_offset=(\d+) serial_byte=(\d+) gdn_byte=(\d+)(.*)$",
     re.MULTILINE,
@@ -1039,18 +1040,18 @@ out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
 
 frame_pattern = re.compile(
     r"^\[dflash-rollback-fast-token-major-frame-compare\] "
-    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?"
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
     r"serial_start=(\d+) serial_end=(\d+) replay_end=(\d+)$",
     re.MULTILINE,
 )
 match_pattern = re.compile(
     r"^\[(dflash-rollback-fast-token-major-(?:attn-out|serial|vs-production)-compare)\] "
-    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?match$",
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?match$",
     re.MULTILINE,
 )
 mismatch_pattern = re.compile(
     r"^\[(dflash-rollback-fast-token-major-(?:attn-out|serial|vs-production)-compare)\] "
-    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?"
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
     r"(?:step=(\d+) )?mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) "
     r"differing_bytes=(\d+) first_offset=(\d+) "
     r"(?:replay_byte|serial_byte|fast_token_major_byte)=(\d+) "
@@ -1151,19 +1152,19 @@ out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
 
 match_pattern = re.compile(
     r"^\[dflash-rollback-qkvza-route-compare\] "
-    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?"
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
     r"layer=(\d+) match$",
     re.MULTILINE,
 )
 unsupported_pattern = re.compile(
     r"^\[dflash-rollback-qkvza-route-compare\] "
-    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?"
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
     r"layer=(\d+) unsupported reason=([A-Za-z0-9_]+)$",
     re.MULTILINE,
 )
 mismatch_pattern = re.compile(
     r"^\[dflash-rollback-qkvza-route-compare\] "
-    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?"
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
     r"layer=(\d+) mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) "
     r"differing_bytes=(\d+) first_offset=(\d+) serial_byte=(\d+) batched_byte=(\d+)(.*)$",
     re.MULTILINE,
@@ -1249,12 +1250,12 @@ out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
 
 match_pattern = re.compile(
     r"^\[dflash-rollback-x-in-compare\] "
-    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?match$",
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?match$",
     re.MULTILINE,
 )
 mismatch_pattern = re.compile(
     r"^\[dflash-rollback-x-in-compare\] "
-    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:forced_serial=1 )?"
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
     r"mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) differing_bytes=(\d+) "
     r"first_offset=(\d+) serial_byte=(\d+) verify_byte=(\d+)(.*)$",
     re.MULTILINE,

@@ -470,6 +470,15 @@
     `/tmp/coherence-dflash-20260613-211728.md` plus `/tmp/coherence-dflash-20260613-211728.dflash_trace.json` reconfirmed this policy on
     `chaingun` `b601a4c9`: prose/code strict AR parity passed, `replay_gdn_tape=0`, `replay_full_prefill=0`, prose used
     `replay_serial_tape=92`, and code used `replay_serial_tape=4` plus `replay_verify_complete=1`.
+    The rollback comparison diagnostics now run inside the default serial-source tape path as well, so fast verify-tape admission evidence no
+    longer requires `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=0` or the older full-prefill rollback fallback. Fresh default-mode validation
+    `/tmp/coherence-dflash-20260613-214039.md` plus `/tmp/coherence-dflash-20260613-214039.dflash_trace.json` passed strict prose/code AR parity
+    with `replay_full_prefill=0` and `replay_serial_tape=92/4`, while the traced prose row rejected fast verify-tape rollback in the same run:
+    `rollback_fast_replay_admission.verdict="rejected"` with blockers `fast_replay_recurrent_state_mismatch`,
+    `single_step_recurrent_state_mismatch`, `rollback_input_mismatch`, and `projection_family_mismatch`. The first input split remains LA0
+    `qkv` at position 66 (`max_abs=1.36566162e-2`), and the first state split remains `s_matrix[0]` on the same one-step rollback row
+    (`differing_bytes=914`, `max_abs=1.95490281e38`). Fast verify-tape rollback therefore remains diagnostic-only, but its rejection is now
+    proven under the live no-full-prefill serial-tape policy rather than under the old fallback branch.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
