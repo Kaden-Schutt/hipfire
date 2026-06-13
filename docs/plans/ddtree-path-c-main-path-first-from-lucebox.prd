@@ -396,6 +396,18 @@ Latest rollback diagnostic evidence:
   necessary but not sufficient: the remaining fast-tape blocker is in
   the first token-major recurrent replay step/state cadence, not only in
   the batched qkvza projection family.
+- `/tmp/coherence-dflash-qkvza-all-layers-20260613-225920.md` extended
+  the qkvza-route diagnostic from LA0 to the first mismatch across all
+  LA layers. With `HIPFIRE_HFQ4_QKVZA_FAST=0`, the qkvza route matched
+  through the last LA layer (`rollback_qkvza_route_compare` reported
+  `layer=47`, `ok=true`), while prose AR parity still failed at token
+  62. Fast replay admission stayed rejected on
+  `fast_replay_recurrent_state_mismatch` and `rollback_input_mismatch`;
+  the first input mismatch moved to LA0 `attn_out`, and the one-step
+  prefix compare still failed at `s_matrix[1]`. This removes the qkvza
+  projection family as the active blocker under the slow-route control:
+  the remaining issue is the captured GDN/attention output stream and
+  recurrent-state replay cadence.
 
 ## References
 

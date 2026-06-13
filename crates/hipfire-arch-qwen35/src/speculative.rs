@@ -3411,6 +3411,28 @@ impl GdnTape {
         Ok(result)
     }
 
+    fn compare_first_batched_qkvza_from_captured_x_to_serial(
+        &self,
+        gpu: &mut Gpu,
+        weights: &qwen35::Qwen35Weights,
+        n_positions: usize,
+    ) -> HipResult<(usize, QkvzaRouteCompare)> {
+        let mut last_checked = 0usize;
+        for layer_index in 0..self.qkv_bufs.len() {
+            last_checked = layer_index;
+            match self.compare_batched_qkvza_from_captured_x_to_serial(
+                gpu,
+                weights,
+                layer_index,
+                n_positions,
+            )? {
+                QkvzaRouteCompare::Match => {}
+                other => return Ok((layer_index, other)),
+            }
+        }
+        Ok((last_checked, QkvzaRouteCompare::Match))
+    }
+
     fn compare_captured_inputs_to(
         &self,
         gpu: &Gpu,
@@ -7350,12 +7372,13 @@ pub fn spec_step_dflash(
                         replay_tokens.len(),
                     ),
                 }
-                match serial_tape.compare_batched_qkvza_from_captured_x_to_serial(
-                    gpu,
-                    &target.weights,
-                    0,
-                    replay_tokens.len(),
-                )? {
+                let (qkvza_layer, qkvza_route_compare) = serial_tape
+                    .compare_first_batched_qkvza_from_captured_x_to_serial(
+                        gpu,
+                        &target.weights,
+                        replay_tokens.len(),
+                    )?;
+                match qkvza_route_compare {
                     QkvzaRouteCompare::Mismatch(diff) => {
                         let context = rollback_input_diff_context(
                             &target.config,
@@ -7364,10 +7387,11 @@ pub fn spec_step_dflash(
                             position,
                         );
                         eprintln!(
-                            "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 layer=0 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} batched_byte={}{}",
+                            "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 layer={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} batched_byte={}{}",
                             position,
                             accept_len,
                             replay_tokens.len(),
+                            qkvza_layer,
                             diff.family,
                             diff.index,
                             diff.bytes,
@@ -7379,16 +7403,18 @@ pub fn spec_step_dflash(
                         );
                     }
                     QkvzaRouteCompare::Match => eprintln!(
-                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 layer=0 match",
+                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 layer={} match",
                         position,
                         accept_len,
                         replay_tokens.len(),
+                        qkvza_layer,
                     ),
                     QkvzaRouteCompare::Unsupported(reason) => eprintln!(
-                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 layer=0 unsupported reason={}",
+                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 layer={} unsupported reason={}",
                         position,
                         accept_len,
                         replay_tokens.len(),
+                        qkvza_layer,
                         reason,
                     ),
                 }
@@ -7790,20 +7816,22 @@ pub fn spec_step_dflash(
                         accept_len + 1,
                     ),
                 }
-                match serial_tape.compare_batched_qkvza_from_captured_x_to_serial(
-                    gpu,
-                    &target.weights,
-                    0,
-                    accept_len + 1,
-                )? {
+                let (qkvza_layer, qkvza_route_compare) = serial_tape
+                    .compare_first_batched_qkvza_from_captured_x_to_serial(
+                        gpu,
+                        &target.weights,
+                        accept_len + 1,
+                    )?;
+                match qkvza_route_compare {
                     QkvzaRouteCompare::Mismatch(diff) => {
                         let context =
                             rollback_input_diff_context(&target.config, &serial_tape, &diff, position);
                         eprintln!(
-                            "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} forced_serial=1 layer=0 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} batched_byte={}{}",
+                            "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} forced_serial=1 layer={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} batched_byte={}{}",
                             position,
                             accept_len,
                             accept_len + 1,
+                            qkvza_layer,
                             diff.family,
                             diff.index,
                             diff.bytes,
@@ -7815,16 +7843,18 @@ pub fn spec_step_dflash(
                         );
                     }
                     QkvzaRouteCompare::Match => eprintln!(
-                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} forced_serial=1 layer=0 match",
+                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} forced_serial=1 layer={} match",
                         position,
                         accept_len,
                         accept_len + 1,
+                        qkvza_layer,
                     ),
                     QkvzaRouteCompare::Unsupported(reason) => eprintln!(
-                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} forced_serial=1 layer=0 unsupported reason={}",
+                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} forced_serial=1 layer={} unsupported reason={}",
                         position,
                         accept_len,
                         accept_len + 1,
+                        qkvza_layer,
                         reason,
                     ),
                 }
@@ -8439,20 +8469,22 @@ pub fn spec_step_dflash(
                     accept_len + 1,
                 ),
             }
-            match serial_tape.compare_batched_qkvza_from_captured_x_to_serial(
-                gpu,
-                &target.weights,
-                0,
-                accept_len + 1,
-            )? {
+            let (qkvza_layer, qkvza_route_compare) = serial_tape
+                .compare_first_batched_qkvza_from_captured_x_to_serial(
+                    gpu,
+                    &target.weights,
+                    accept_len + 1,
+                )?;
+            match qkvza_route_compare {
                 QkvzaRouteCompare::Mismatch(diff) => {
                     let context =
                         rollback_input_diff_context(&target.config, &serial_tape, &diff, position);
                     eprintln!(
-                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} layer=0 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} batched_byte={}{}",
+                        "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} layer={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} batched_byte={}{}",
                         position,
                         accept_len,
                         accept_len + 1,
+                        qkvza_layer,
                         diff.family,
                         diff.index,
                         diff.bytes,
@@ -8464,16 +8496,18 @@ pub fn spec_step_dflash(
                     );
                 }
                 QkvzaRouteCompare::Match => eprintln!(
-                    "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} layer=0 match",
+                    "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} layer={} match",
                     position,
                     accept_len,
                     accept_len + 1,
+                    qkvza_layer,
                 ),
                 QkvzaRouteCompare::Unsupported(reason) => eprintln!(
-                    "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} layer=0 unsupported reason={}",
+                    "[dflash-rollback-qkvza-route-compare] pos={} accepted={} replay_steps={} layer={} unsupported reason={}",
                     position,
                     accept_len,
                     accept_len + 1,
+                    qkvza_layer,
                     reason,
                 ),
             }
