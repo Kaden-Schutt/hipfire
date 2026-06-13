@@ -446,6 +446,15 @@ Latest rollback diagnostic evidence:
   blocker is therefore in the verify-captured raw gate/qkvza stream
   feeding LA0 replay, not in token-major replay itself or default-on
   verify graph capture.
+- `/tmp/coherence-dflash-qkvza-serialexact2-20260613-233846.md` tested a
+  local row-wise serial-exact HFQ4 qkvza fallback under
+  `HIPFIRE_HFQ4_QKVZA_FAST=0` before reverting that code path. The
+  prose case was unchanged: AR parity still failed at token 62 and the
+  route compare still reported the same `qkvza_route_beta_raw_mismatch`
+  at LA0. This rules out the simple "make the slow HFQ4 qkvza dispatch
+  row-wise fused" lever as sufficient; the remaining investigation needs
+  to isolate why the verify-captured raw gate stream remains different
+  even when the slow-route flag is present.
 
 ## References
 
