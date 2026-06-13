@@ -1044,13 +1044,19 @@ frame_pattern = re.compile(
     r"serial_start=(\d+) serial_end=(\d+) replay_end=(\d+)$",
     re.MULTILINE,
 )
+prefix_frame_pattern = re.compile(
+    r"^\[dflash-rollback-fast-token-major-prefix-frame-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
+    r"serial_start=(\d+) serial_end=(\d+) replay_end=(\d+)$",
+    re.MULTILINE,
+)
 match_pattern = re.compile(
-    r"^\[(dflash-rollback-fast-token-major-(?:attn-out|serial|vs-production)-compare)\] "
+    r"^\[(dflash-rollback-fast-token-major-(?:attn-out|serial|vs-production|prefix-serial)-compare)\] "
     r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?match$",
     re.MULTILINE,
 )
 mismatch_pattern = re.compile(
-    r"^\[(dflash-rollback-fast-token-major-(?:attn-out|serial|vs-production)-compare)\] "
+    r"^\[(dflash-rollback-fast-token-major-(?:attn-out|serial|vs-production|prefix-serial)-compare)\] "
     r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
     r"(?:step=(\d+) )?mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) "
     r"differing_bytes=(\d+) first_offset=(\d+) "
@@ -1111,12 +1117,25 @@ frames = [
         "pos": int(m.group(1)),
         "accepted": int(m.group(2)),
         "replay_steps": int(m.group(3)),
+        "kind": "full",
         "serial_start": int(m.group(4)),
         "serial_end": int(m.group(5)),
         "replay_end": int(m.group(6)),
     }
     for m in frame_pattern.finditer(out)
 ]
+frames.extend([
+    {
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+        "kind": "prefix",
+        "serial_start": int(m.group(4)),
+        "serial_end": int(m.group(5)),
+        "replay_end": int(m.group(6)),
+    }
+    for m in prefix_frame_pattern.finditer(out)
+])
 
 events.sort(key=lambda event: event[0])
 checked = len(events)

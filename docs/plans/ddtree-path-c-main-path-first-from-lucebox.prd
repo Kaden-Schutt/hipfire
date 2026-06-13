@@ -387,6 +387,15 @@ Latest rollback diagnostic evidence:
   verify through per-token kernels. It still used full-prefill rollback
   on prose (`replay_full_prefill=87`) and failed AR parity at token 62,
   so the blocker is not solved by forcing per-token Q8 GDN verify.
+- `/tmp/coherence-dflash-prefix-state2-20260613-225035.md` tested the
+  qkvza slow route (`HIPFIRE_HFQ4_QKVZA_FAST=0`) with serial tape
+  disabled. The qkvza route compare then matched for LA0, but AR parity
+  still failed at token 62. The new one-step prefix-state diagnostic
+  failed before the full two-step replay (`check=prefix-serial`,
+  `family=s_matrix`, `index=1`, `replay_steps=1`), so qkvza exactness is
+  necessary but not sufficient: the remaining fast-tape blocker is in
+  the first token-major recurrent replay step/state cadence, not only in
+  the batched qkvza projection family.
 
 ## References
 
