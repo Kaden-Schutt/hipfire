@@ -1163,6 +1163,44 @@ fn compare_delta_net_state_to_snapshot(
     Ok(None)
 }
 
+fn compare_delta_net_layer_to_snapshot(
+    gpu: &Gpu,
+    actual: &DeltaNetState,
+    expected: &DeltaNetSnapshot,
+    index: usize,
+) -> HipResult<Option<DeltaNetSnapshotDiff>> {
+    if let (Some(actual), Some(expected)) = (
+        actual.s_matrices.get(index),
+        expected.s_matrix_bufs.get(index),
+    ) {
+        if let Some(diff) =
+            compare_device_buffer_to_snapshot(gpu, "s_matrix", index, &actual.buf, expected)?
+        {
+            return Ok(Some(diff));
+        }
+    }
+    if let (Some(actual), Some(expected)) =
+        (actual.s_scales.get(index), expected.s_scale_bufs.get(index))
+    {
+        if let Some(diff) =
+            compare_device_buffer_to_snapshot(gpu, "s_scale", index, &actual.buf, expected)?
+        {
+            return Ok(Some(diff));
+        }
+    }
+    if let (Some(actual), Some(expected)) = (
+        actual.conv_states.get(index),
+        expected.conv_state_bufs.get(index),
+    ) {
+        if let Some(diff) =
+            compare_device_buffer_to_snapshot(gpu, "conv_state", index, &actual.buf, expected)?
+        {
+            return Ok(Some(diff));
+        }
+    }
+    Ok(None)
+}
+
 fn rollback_input_diff_context(
     config: &qwen35::Qwen35Config,
     tape: &GdnTape,
@@ -3006,8 +3044,13 @@ impl GdnTape {
         weights: &qwen35::Qwen35Weights,
         config: &qwen35::Qwen35Config,
         dn_state: &mut qwen35::DeltaNetState,
+        expected_state: &DeltaNetSnapshot,
         n_steps: usize,
-    ) -> HipResult<(Option<DeltaNetSnapshotDiff>, Option<DeltaNetSnapshotDiff>)> {
+    ) -> HipResult<(
+        Option<DeltaNetSnapshotDiff>,
+        Option<DeltaNetSnapshotDiff>,
+        Option<DeltaNetSnapshotDiff>,
+    )> {
         assert!(
             n_steps <= self.max_n,
             "replay_gdn_fused_gate_conv_for_compare: n_steps {n_steps} > max_n {}",
@@ -3022,6 +3065,7 @@ impl GdnTape {
         let mut la_idx = 0usize;
         let mut first_post_fused_diff: Option<DeltaNetSnapshotDiff> = None;
         let mut first_gdn_input_diff: Option<DeltaNetSnapshotDiff> = None;
+        let mut first_layer_state_diff: Option<DeltaNetSnapshotDiff> = None;
 
         for (layer_idx, lt) in config.layer_types.iter().enumerate() {
             if *lt != qwen35::LayerType::LinearAttention {
@@ -3221,9 +3265,18 @@ impl GdnTape {
                 }
             }
 
+            if first_layer_state_diff.is_none() {
+                first_layer_state_diff =
+                    compare_delta_net_layer_to_snapshot(gpu, dn_state, expected_state, la_idx)?;
+            }
+
             la_idx += 1;
         }
-        Ok((first_post_fused_diff, first_gdn_input_diff))
+        Ok((
+            first_post_fused_diff,
+            first_gdn_input_diff,
+            first_layer_state_diff,
+        ))
     }
 
     fn replay_gdn_fused_gate_conv_token_major_for_compare(
@@ -6177,12 +6230,13 @@ pub fn spec_step_dflash(
             }
             target_snap.restore_to(&mut target.dn_state, gpu)?;
             gpu.debug_set_gdn_requant_frame(serial_frame_start);
-            let (post_fused_diff, gdn_input_diff) = serial_tape
+            let (post_fused_diff, gdn_input_diff, layer_state_diff) = serial_tape
                 .replay_gdn_fused_gate_conv_for_compare(
                     gpu,
                     &target.weights,
                     &target.config,
                     &mut target.dn_state,
+                    &serial_result,
                     accept_len + 1,
                 )?;
             let replay_frame_end = gpu.debug_gdn_requant_frame();
@@ -6233,6 +6287,31 @@ pub fn spec_step_dflash(
                 ),
                 None => eprintln!(
                     "[dflash-rollback-gdn-input-compare] pos={} accepted={} replay_steps={} match",
+                    position,
+                    accept_len,
+                    accept_len + 1,
+                ),
+            }
+            match layer_state_diff {
+                Some(diff) => {
+                    let context = rollback_snapshot_diff_context(&diff);
+                    eprintln!(
+                        "[dflash-rollback-layer-state-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} replay_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.expected_byte,
+                        diff.actual_byte,
+                        context,
+                    );
+                }
+                None => eprintln!(
+                    "[dflash-rollback-layer-state-compare] pos={} accepted={} replay_steps={} match",
                     position,
                     accept_len,
                     accept_len + 1,

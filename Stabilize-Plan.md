@@ -183,8 +183,11 @@
     `actual_f32=-2.74384245e-2`, `expected_f32=-2.74384618e-2`, `max_abs=1.19209290e-7`, `mean_abs=2.20296901e-8`, and
     `max_rel=1.42053526e-3`; the final `s_matrix[0]` diff is unchanged. That rules out the previous `x_in[4]` boundary as the sole
     amplification point. The next useful cut is a hidden-boundary tolerance walk or a per-LA state compare to identify the first recurrent layer
-    whose state magnitude diverges. Fast rollback replay remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity
-    evidence.
+    whose state magnitude diverges. Adding that per-LA state compare to the serial-tape diagnostic shows the replayed serial tape matches the
+    serial final recurrent state layer-by-layer (`dflash-rollback-layer-state-compare ... match`) even when the original fast verify result still
+    differs from serial at `s_matrix[0]` with the same huge magnitude. That narrows the next blocker to the fast verify-produced GDN state for LA0
+    itself: compare the fast verify GDN update's LA0 inputs, quant frame/order, and kernel path against the byte-exact serial-tape replay. Fast
+    rollback replay remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity evidence.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
