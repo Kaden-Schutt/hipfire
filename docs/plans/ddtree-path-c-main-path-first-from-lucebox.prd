@@ -625,6 +625,25 @@ Latest rollback diagnostic evidence:
   (`verify_graph direct=0`, capture/replay active), and live DFlash
   rollback remained conservative (`replay_gdn_tape=0`,
   `replay_serial_tape=92` on prose).
+- `/tmp/coherence-dflash-refresh-20260614-025650.md` refreshed the
+  focused gate on the current tree with `HIPFIRE_DFLASH_AR_PARITY=1`,
+  rollback compare, one-step logit compare, and serial tape `x_in`
+  diagnostics. The prose row passed AR parity for 192 tokens and the
+  code row passed AR parity for 45 tokens. Dense DFlash still used graph
+  capture/replay by default (`verify_graph direct=0`; prose
+  `warmup=5 capture=5 replay=82`, code `warmup=1 capture=1 replay=3`).
+  Live rollback still stayed on the conservative serial-source tape path
+  (`replay_gdn_tape=0`; prose `replay_serial_tape=92`, code
+  `replay_serial_tape=4`, `replay_verify_complete=1`). Fast tape replay
+  remains rejected: prose still first mismatches LA0 `attn_out` at
+  position 59 row 1 (`max_abs=0.0105993748`,
+  `mean_abs=0.0000111932113`), while the code row shows the same class
+  of row-1 boundary failure at position 123 (`attn_out`,
+  `max_abs=0.0281143188`, `mean_abs=0.0000325554029`) plus recurrent
+  `s_matrix` mismatch. The serial-source tape self-check still matched
+  (`serial-tape-attn-out.ok=true` in the code row), so the remaining
+  blocker is the verify-captured GDN/attention stream, not token-major
+  replay of a serial-captured tape.
 
 ## References
 
