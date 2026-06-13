@@ -215,6 +215,10 @@
     Fast rollback replay is now runtime-rejected for live rollback even when `HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY=0`; rechecking the position-59
     and position-120 repros with the old fast override set reports `replay_gdn_tape=0` and `replay_full_prefill=47/60`, respectively. The serial
     AR path remains the only admitted DFlash rollback path until tolerance semantics are tied to final recurrent/logit parity evidence.
+    Fresh checkout evidence on gfx1151 (2026-06-13): `HIPFIRE_DFLASH_ROLLBACK_COMPARE=1` now runs as a side diagnostic even though live rollback
+    remains serial. The position-120 prose repro reports `forced_serial=1` with a fast-tape mismatch at `s_matrix[0]`
+    (`differing_bytes=709`, `max_abs=2.53553992e38`, `mean_abs=5.81178619e33`, `max_rel=inf`) while live telemetry still reports
+    `replay_gdn_tape=0 replay_full_prefill=59`. This restores the fast-vs-serial diagnostic surface without admitting fast tape replay.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
