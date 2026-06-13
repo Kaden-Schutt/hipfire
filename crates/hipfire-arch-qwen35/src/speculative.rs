@@ -940,6 +940,14 @@ struct DeltaNetSnapshotDiff {
     first_offset: usize,
     expected_byte: u8,
     actual_byte: u8,
+    expected_f32: Option<f32>,
+    actual_f32: Option<f32>,
+}
+
+fn first_mismatched_f32(bytes: &[u8], first_offset: usize) -> Option<f32> {
+    let float_offset = first_offset.saturating_sub(first_offset % 4);
+    let word = bytes.get(float_offset..float_offset + 4)?;
+    Some(f32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
 }
 
 fn compare_device_buffer_to_snapshot(
@@ -959,6 +967,8 @@ fn compare_device_buffer_to_snapshot(
             first_offset: 0,
             expected_byte: 0,
             actual_byte: 0,
+            expected_f32: None,
+            actual_f32: None,
         }));
     }
     let mut actual_host = vec![0u8; bytes];
@@ -981,6 +991,8 @@ fn compare_device_buffer_to_snapshot(
         first_offset,
         expected_byte: expected_host[first_offset],
         actual_byte: actual_host[first_offset],
+        expected_f32: first_mismatched_f32(&expected_host, first_offset),
+        actual_f32: first_mismatched_f32(&actual_host, first_offset),
     }))
 }
 
@@ -1001,6 +1013,8 @@ fn compare_device_buffer_prefix_to_snapshot(
             first_offset: 0,
             expected_byte: 0,
             actual_byte: 0,
+            expected_f32: None,
+            actual_f32: None,
         }));
     }
     let mut actual_host = vec![0u8; bytes];
@@ -1023,6 +1037,8 @@ fn compare_device_buffer_prefix_to_snapshot(
         first_offset,
         expected_byte: expected_host[first_offset],
         actual_byte: actual_host[first_offset],
+        expected_f32: first_mismatched_f32(&expected_host, first_offset),
+        actual_f32: first_mismatched_f32(&actual_host, first_offset),
     }))
 }
 
@@ -1068,6 +1084,112 @@ fn compare_delta_net_state_to_snapshot(
         }
     }
     Ok(None)
+}
+
+fn rollback_input_diff_context(
+    config: &qwen35::Qwen35Config,
+    tape: &GdnTape,
+    diff: &DeltaNetSnapshotDiff,
+    base_position: usize,
+) -> String {
+    let float_index = diff.first_offset / 4;
+    let byte_in_float = diff.first_offset % 4;
+    let value_context = match (diff.actual_f32, diff.expected_f32) {
+        (Some(actual), Some(expected)) => {
+            format!(" actual_f32={actual:.8e} expected_f32={expected:.8e}")
+        }
+        _ => String::new(),
+    };
+    let row_context = |row_stride: usize| {
+        if row_stride == 0 {
+            return None;
+        }
+        let row = float_index / row_stride;
+        let elem = float_index % row_stride;
+        Some((row, base_position + row, elem))
+    };
+    match diff.family {
+        "fa_bridge_q" | "fa_bridge_q_norm" | "fa_bridge_attn_raw" | "fa_bridge_attn_out" => {
+            if let Some((row, logical_pos, elem)) = row_context(tape.fa_q_dim) {
+                let head = elem / config.head_dim;
+                let dim = elem % config.head_dim;
+                format!(
+                    " row={} logical_pos={} elem={} head={} head_dim={} byte_in_f32={}{}",
+                    row, logical_pos, elem, head, dim, byte_in_float, value_context
+                )
+            } else {
+                format!(" byte_in_f32={byte_in_float}{value_context}")
+            }
+        }
+        "fa_bridge_q_full" => {
+            if let Some((row, logical_pos, elem)) = row_context(tape.fa_q_full_dim) {
+                let gate_split = if elem >= tape.fa_q_dim { "gate" } else { "q" };
+                let split_elem = elem % tape.fa_q_dim;
+                let head = split_elem / config.head_dim;
+                let dim = split_elem % config.head_dim;
+                format!(
+                    " row={} logical_pos={} elem={} split={} split_elem={} head={} head_dim={} byte_in_f32={}{}",
+                    row, logical_pos, elem, gate_split, split_elem, head, dim, byte_in_float, value_context
+                )
+            } else {
+                format!(" byte_in_f32={byte_in_float}{value_context}")
+            }
+        }
+        "fa_bridge_k" | "fa_bridge_v" => {
+            if let Some((row, logical_pos, elem)) = row_context(tape.fa_kv_dim) {
+                let head = elem / config.head_dim;
+                let dim = elem % config.head_dim;
+                format!(
+                    " row={} logical_pos={} elem={} kv_head={} head_dim={} byte_in_f32={}{}",
+                    row, logical_pos, elem, head, dim, byte_in_float, value_context
+                )
+            } else {
+                format!(" byte_in_f32={byte_in_float}{value_context}")
+            }
+        }
+        "fa_bridge_input" | "fa_bridge_x" | "fa_bridge_wo_residual" | "fa_bridge_layer_out" => {
+            if let Some((row, logical_pos, elem)) = row_context(tape.x_in_dim) {
+                format!(
+                    " row={} logical_pos={} hidden_elem={} byte_in_f32={}{}",
+                    row, logical_pos, elem, byte_in_float, value_context
+                )
+            } else {
+                format!(" byte_in_f32={byte_in_float}{value_context}")
+            }
+        }
+        "x_in" | "wo_residual_in" | "attn_residual" | "ffn_input" | "w_down_residual_in"
+        | "layer_out" => {
+            if let Some((row, logical_pos, elem)) = row_context(tape.x_in_dim) {
+                format!(
+                    " row={} logical_pos={} hidden_elem={} byte_in_f32={}{}",
+                    row, logical_pos, elem, byte_in_float, value_context
+                )
+            } else {
+                format!(" byte_in_f32={byte_in_float}{value_context}")
+            }
+        }
+        "qkv" => {
+            if let Some((row, logical_pos, elem)) = row_context(tape.qkv_dim) {
+                format!(
+                    " row={} logical_pos={} qkv_elem={} byte_in_f32={}{}",
+                    row, logical_pos, elem, byte_in_float, value_context
+                )
+            } else {
+                format!(" byte_in_f32={byte_in_float}{value_context}")
+            }
+        }
+        "ffn_gate" | "ffn_up" | "w_down_input" => {
+            if let Some((row, logical_pos, elem)) = row_context(tape.ffn_dim) {
+                format!(
+                    " row={} logical_pos={} ffn_elem={} byte_in_f32={}{}",
+                    row, logical_pos, elem, byte_in_float, value_context
+                )
+            } else {
+                format!(" byte_in_f32={byte_in_float}{value_context}")
+            }
+        }
+        _ => format!(" byte_in_f32={byte_in_float}{value_context}"),
+    }
 }
 
 /// A series of `n_slots` `DeltaNetSnapshot` slots, used by the tape-replay
@@ -5895,19 +6017,24 @@ pub fn spec_step_dflash(
             serial_result.save_from(&target.dn_state, gpu)?;
             let serial_frame_end = gpu.debug_gdn_requant_frame();
             match serial_tape.compare_captured_inputs_to(gpu, tape, accept_len + 1)? {
-                Some(diff) => eprintln!(
-                    "[dflash-rollback-input-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}",
-                    position,
-                    accept_len,
-                    accept_len + 1,
-                    diff.family,
-                    diff.index,
-                    diff.bytes,
-                    diff.differing_bytes,
-                    diff.first_offset,
-                    diff.actual_byte,
-                    diff.expected_byte,
-                ),
+                Some(diff) => {
+                    let context =
+                        rollback_input_diff_context(&target.config, tape, &diff, position);
+                    eprintln!(
+                        "[dflash-rollback-input-compare] pos={} accepted={} replay_steps={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}{}",
+                        position,
+                        accept_len,
+                        accept_len + 1,
+                        diff.family,
+                        diff.index,
+                        diff.bytes,
+                        diff.differing_bytes,
+                        diff.first_offset,
+                        diff.actual_byte,
+                        diff.expected_byte,
+                        context,
+                    );
+                }
                 None => eprintln!(
                     "[dflash-rollback-input-compare] pos={} accepted={} replay_steps={} match",
                     position,

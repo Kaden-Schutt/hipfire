@@ -161,7 +161,10 @@
     `kv_cache_write_q8_0(V)`, and scalar `attention_q8_0_kv` in row order; it also reproduces the same `fa_bridge_attn_raw[3]` mismatch
     (`bytes=24576`, `differing_bytes=6347`, `first_offset=0`, `serial_byte=69`, `gdn_byte=66`). This rules out batched Q8 KV write timing as
     the active split. The next cut should compare the serial replay oracle semantics and FA bridge row/position materialization around the raw
-    attention capture, or add an explicit serial-vs-batched raw attention oracle before the tape comparison.
+    attention capture, or add an explicit serial-vs-batched raw attention oracle before the tape comparison. Adding coordinate/value context to
+    the same compare shows the first differing word is the first FA raw output element for replay row 0 at logical position 120, head 0/dim 0:
+    serial `actual_f32=2.97952801e-1` versus GDN tape `expected_f32=2.97952712e-1`. The tiny first-value delta with many differing bytes points
+    at reduction/order or oracle-tolerance semantics for the FA raw attention stage, not a wrong row, wrong logical position, or wrong head slice.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
