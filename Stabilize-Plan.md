@@ -502,6 +502,13 @@
     still identifies the root blocker as `projection_family_mismatch`: `x_in` matches the prior boundary, then `qkv` diverges because serial
     capture routes through `forward_scratch_capture_gdn_tape:fused_qkvza` while verify capture routes through `verify_dflash_block:gemm_qkvza`.
     Token-major replay therefore fixes only replay cadence; the production blocker remains serial-equivalent tape content for the whole layer chain.
+    The qkvza repair diagnostic now routes MQ4/HFQ4 repair through the serial single-row fused qkvza path instead of the batched comparison path.
+    Fresh evidence `/tmp/coherence-dflash-20260613-221326.md` plus `/tmp/coherence-dflash-20260613-221326.dflash_trace.json` kept the
+    conservative forced-serial/full-prefill branch AR-clean while showing that qkvza-only repair still cannot promote fast tape rollback:
+    `rollback_qkvza_repair_compare` now reaches `qkvza_repair_replay_state_mismatch` for both `source=verify` and `source=serial` at position 59
+    (`s_matrix[0]`, `replay_steps=2`), and `rollback_x_in_compare` records a downstream `x_in[1]` mismatch at the same position
+    (`max_abs=1.87955722e-2`). That rules out the batched qkvza repair route itself as the only blocker; a live replacement must produce
+    serial-equivalent downstream layer inputs and recurrent state for the whole tape chain, not just patch LA0 qkvza rows.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

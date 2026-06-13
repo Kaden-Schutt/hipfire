@@ -3254,9 +3254,38 @@ impl GdnTape {
                 let x =
                     source.x_in_bufs[la_idx].sub_offset(step * source.x_in_dim, source.x_in_dim);
                 let qkv = self.qkv_bufs[la_idx].sub_offset(step * self.qkv_dim, self.qkv_dim);
-                match compare_batched_qkvza_dispatch(
-                    gpu, wqkv, wz, w_beta, w_alpha, &x, &qkv, &z, &beta_raw, &alpha_raw, 1,
-                )? {
+                let route = match wqkv.gpu_dtype {
+                    DType::MQ4G256 | DType::HFQ4G256 => {
+                        let same_dtype = wz.gpu_dtype == wqkv.gpu_dtype
+                            && w_beta.gpu_dtype == wqkv.gpu_dtype
+                            && w_alpha.gpu_dtype == wqkv.gpu_dtype;
+                        if same_dtype {
+                            gpu.fused_qkvza_hfq4g256(
+                                &wqkv.buf,
+                                &wz.buf,
+                                &w_beta.buf,
+                                &w_alpha.buf,
+                                &x,
+                                &qkv,
+                                &z,
+                                &beta_raw,
+                                &alpha_raw,
+                                wqkv.m,
+                                wz.m,
+                                w_beta.m,
+                                w_alpha.m,
+                                wqkv.k,
+                            )?;
+                            QkvzaRouteCompare::Match
+                        } else {
+                            QkvzaRouteCompare::Unsupported("mixed_qkvza_dtype")
+                        }
+                    }
+                    _ => compare_batched_qkvza_dispatch(
+                        gpu, wqkv, wz, w_beta, w_alpha, &x, &qkv, &z, &beta_raw, &alpha_raw, 1,
+                    )?,
+                };
+                match route {
                     QkvzaRouteCompare::Match => {}
                     other => {
                         let _ = gpu.free_tensor(z);
