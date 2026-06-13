@@ -415,6 +415,12 @@
     `/tmp/coherence-dflash-20260613-201250.md`, is not a fix: it breaks prose AR parity at token 62 (`57874` vs `6511`), moves the first
     input split to `attn_residual` (`max_abs=1.47056580e-3`), and still rejects one-step fast replay at `s_matrix[1]`. The next cut is therefore
     not a qkvza-fast opt-out policy; it is proving or eliminating the one-step captured-row drift under production projection routing.
+    The admission report now ingests `rollback_input_compare` directly. A focused rerun,
+    `/tmp/coherence-dflash-20260613-201700.md` plus `/tmp/coherence-dflash-20260613-201700.dflash_trace.json`, keeps the same position-66 verdict
+    but records the root blocker in one object: `rollback_fast_replay_admission.blockers` includes `rollback_input_mismatch`, `input_checked=2`,
+    `input_mismatch_counts={"input":1,"gdn-input-all":1}`, and `first_input_mismatch.family="qkv"` at row 0/logical position 66. This makes
+    captured-row parity a first-class admission condition; any future fast rollback promotion must clear both the input blocker and recurrent-state
+    blocker in the same evidence row.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

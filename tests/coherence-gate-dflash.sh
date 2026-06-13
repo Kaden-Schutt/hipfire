@@ -1132,12 +1132,13 @@ PYEOF
 
 ROLLBACK_FAST_REPLAY_ADMISSION_PY=$(cat <<'PYEOF'
 import sys, json
-if len(sys.argv) != 3:
+if len(sys.argv) not in (3, 4):
     print(json.dumps({"verdict": "not_evaluated", "reason": "usage"}))
     sys.exit(0)
 try:
     logit = json.loads(sys.argv[1])
     state = json.loads(sys.argv[2])
+    input_compare = json.loads(sys.argv[3]) if len(sys.argv) == 4 else {}
 except json.JSONDecodeError as exc:
     print(json.dumps({"verdict": "not_evaluated", "reason": f"json_decode_error:{exc}"}))
     sys.exit(0)
@@ -1145,6 +1146,7 @@ except json.JSONDecodeError as exc:
 blockers = []
 logit_checked = int(logit.get("checked", 0) or 0)
 state_checked = int(state.get("checked", 0) or 0)
+input_checked = int(input_compare.get("checked", 0) or 0)
 
 if logit_checked <= 0:
     blockers.append("missing_logit_compare")
@@ -1160,11 +1162,15 @@ elif not state.get("ok", False):
     if int(state.get("single_step_mismatches", 0) or 0) > 0:
         blockers.append("single_step_recurrent_state_mismatch")
 
+if input_checked > 0 and not input_compare.get("ok", False):
+    blockers.append(input_compare.get("reason", "captured_input_mismatch"))
+
 payload = {
     "verdict": "not_evaluated" if logit_checked <= 0 and state_checked <= 0 else ("admitted" if not blockers else "rejected"),
     "blockers": blockers,
     "logit_checked": logit_checked,
     "state_checked": state_checked,
+    "input_checked": input_checked,
 }
 shape_keys = [
     "min_replay_steps",
@@ -1187,6 +1193,10 @@ if state.get("first_multi_step_mismatch"):
     payload["first_multi_step_state_mismatch"] = state["first_multi_step_mismatch"]
 if logit.get("first_mismatch"):
     payload["first_logit_mismatch"] = logit["first_mismatch"]
+if input_compare.get("first_mismatch"):
+    payload["first_input_mismatch"] = input_compare["first_mismatch"]
+if input_compare.get("mismatch_counts"):
+    payload["input_mismatch_counts"] = input_compare["mismatch_counts"]
 if logit.get("max_abs_over_margin") is not None:
     payload["max_abs_over_margin"] = logit["max_abs_over_margin"]
 if logit.get("max_abs_over_margin_row"):
@@ -1299,7 +1309,7 @@ for entry in "${tests[@]}"; do
         rollback_prefill_compare=$(python3 -c "$ROLLBACK_PREFILL_COMPARE_PY" "$out_file")
         rollback_input_compare=$(python3 -c "$ROLLBACK_INPUT_COMPARE_PY" "$out_file")
         rollback_fast_token_major_compare=$(python3 -c "$ROLLBACK_FAST_TOKEN_MAJOR_COMPARE_PY" "$out_file")
-        rollback_fast_replay_admission=$(python3 -c "$ROLLBACK_FAST_REPLAY_ADMISSION_PY" "$rollback_logit_compare" "$rollback_state_compare")
+        rollback_fast_replay_admission=$(python3 -c "$ROLLBACK_FAST_REPLAY_ADMISSION_PY" "$rollback_logit_compare" "$rollback_state_compare" "$rollback_input_compare")
     fi
 
     if [ "$mode" = "dflash" ]; then
