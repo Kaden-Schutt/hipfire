@@ -1236,6 +1236,132 @@ print(json.dumps(payload, sort_keys=True))
 PYEOF
 )
 
+ROLLBACK_QKVZA_REPAIR_COMPARE_PY=$(cat <<'PYEOF'
+import sys, re, json, math
+if len(sys.argv) != 2:
+    print(json.dumps({"ok": False, "reason": "usage"}))
+    sys.exit(0)
+out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+
+match_pattern = re.compile(
+    r"^\[dflash-rollback-qkvza-repair-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 source=([A-Za-z0-9_]+) match$",
+    re.MULTILINE,
+)
+unsupported_pattern = re.compile(
+    r"^\[dflash-rollback-qkvza-repair-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 source=([A-Za-z0-9_]+) unsupported reason=([A-Za-z0-9_]+)$",
+    re.MULTILINE,
+)
+repair_mismatch_pattern = re.compile(
+    r"^\[dflash-rollback-qkvza-repair-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 source=([A-Za-z0-9_]+) repair_mismatch "
+    r"family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) differing_bytes=(\d+) "
+    r"first_offset=(\d+) expected_byte=(\d+) actual_byte=(\d+)(.*)$",
+    re.MULTILINE,
+)
+state_mismatch_pattern = re.compile(
+    r"^\[dflash-rollback-qkvza-repair-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 source=([A-Za-z0-9_]+) mismatch "
+    r"family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) differing_bytes=(\d+) "
+    r"first_offset=(\d+) serial_byte=(\d+) repaired_byte=(\d+)(.*)$",
+    re.MULTILINE,
+)
+frame_pattern = re.compile(
+    r"^\[dflash-rollback-qkvza-repair-frame-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) forced_serial=1 "
+    r"source=([A-Za-z0-9_]+) serial_start=(\d+) serial_end=(\d+) replay_end=(\d+)$",
+    re.MULTILINE,
+)
+
+def parse_context(context):
+    parsed = {}
+    if not context:
+        return parsed
+    for key, raw in re.findall(r"\b([A-Za-z0-9_]+)=([+\-0-9.eE]+|NaN|nan|inf|-inf)", context):
+        if key in {"f32_words", "f32_bit_diff_words"}:
+            parsed[key] = int(raw)
+        else:
+            value = float(raw)
+            parsed[key] = value if math.isfinite(value) else raw
+    return parsed
+
+events = []
+for m in match_pattern.finditer(out):
+    events.append((m.start(), {
+        "ok": True,
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+        "source": m.group(4),
+    }))
+for m in unsupported_pattern.finditer(out):
+    events.append((m.start(), {
+        "ok": False,
+        "unsupported": True,
+        "reason": "qkvza_repair_unsupported",
+        "unsupported_reason": m.group(5),
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+        "source": m.group(4),
+    }))
+for pattern, reason in [
+    (repair_mismatch_pattern, "qkvza_repair_projection_mismatch"),
+    (state_mismatch_pattern, "qkvza_repair_replay_state_mismatch"),
+]:
+    for m in pattern.finditer(out):
+        context = m.group(12).strip() or None
+        events.append((m.start(), {
+            "ok": False,
+            "reason": reason,
+            "pos": int(m.group(1)),
+            "accepted": int(m.group(2)),
+            "replay_steps": int(m.group(3)),
+            "source": m.group(4),
+            "family": m.group(5),
+            "index": int(m.group(6)),
+            "bytes": int(m.group(7)),
+            "differing_bytes": int(m.group(8)),
+            "first_offset": int(m.group(9)),
+            "expected_byte": int(m.group(10)),
+            "actual_byte": int(m.group(11)),
+            "context": context,
+            "stats": parse_context(context),
+        }))
+
+frames = [
+    {
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+        "source": m.group(4),
+        "serial_start": int(m.group(5)),
+        "serial_end": int(m.group(6)),
+        "replay_end": int(m.group(7)),
+    }
+    for m in frame_pattern.finditer(out)
+]
+events.sort(key=lambda event: event[0])
+checks = [event for _, event in events]
+mismatches = [event for event in checks if not event.get("ok", False)]
+payload = {
+    "ok": len(checks) > 0 and not mismatches,
+    "checked": len(checks),
+    "matches": sum(1 for event in checks if event.get("ok", False)),
+    "mismatches": len(mismatches),
+    "frames": frames,
+    "checks": checks,
+}
+if not checks:
+    payload["ok"] = True
+if mismatches:
+    payload["first_mismatch"] = mismatches[0]
+    payload["reason"] = mismatches[0].get("reason", "qkvza_repair_mismatch")
+print(json.dumps(payload, sort_keys=True))
+PYEOF
+)
+
 ROLLBACK_FAST_REPLAY_ADMISSION_PY=$(cat <<'PYEOF'
 import sys, json
 if len(sys.argv) not in (3, 4):
@@ -1396,6 +1522,7 @@ for entry in "${tests[@]}"; do
     rollback_prefill_compare="not_checked"
     rollback_input_compare="not_checked"
     rollback_qkvza_route_compare="not_checked"
+    rollback_qkvza_repair_compare="not_checked"
     rollback_fast_token_major_compare="not_checked"
     rollback_fast_replay_admission="not_checked"
     if [ "$AR_PARITY" = "1" ] && [ "$mode" = "dflash" ]; then
@@ -1422,15 +1549,16 @@ for entry in "${tests[@]}"; do
         rollback_prefill_compare=$(python3 -c "$ROLLBACK_PREFILL_COMPARE_PY" "$out_file")
         rollback_input_compare=$(python3 -c "$ROLLBACK_INPUT_COMPARE_PY" "$out_file")
         rollback_qkvza_route_compare=$(python3 -c "$ROLLBACK_QKVZA_ROUTE_COMPARE_PY" "$out_file")
+        rollback_qkvza_repair_compare=$(python3 -c "$ROLLBACK_QKVZA_REPAIR_COMPARE_PY" "$out_file")
         rollback_fast_token_major_compare=$(python3 -c "$ROLLBACK_FAST_TOKEN_MAJOR_COMPARE_PY" "$out_file")
         rollback_fast_replay_admission=$(python3 -c "$ROLLBACK_FAST_REPLAY_ADMISSION_PY" "$rollback_logit_compare" "$rollback_state_compare" "$rollback_input_compare")
     fi
 
     if [ "$mode" = "dflash" ]; then
-        record_json=$(python3 - "$label" "$mode" "$status" "$detect" "$parity" "$rollback_replay" "$rollback_logit_compare" "$rollback_prefill_logit_compare" "$rollback_state_compare" "$rollback_prefill_compare" "$rollback_input_compare" "$rollback_qkvza_route_compare" "$rollback_fast_token_major_compare" "$rollback_fast_replay_admission" "$verify_graph" "$wall" <<'PYEOF'
+        record_json=$(python3 - "$label" "$mode" "$status" "$detect" "$parity" "$rollback_replay" "$rollback_logit_compare" "$rollback_prefill_logit_compare" "$rollback_state_compare" "$rollback_prefill_compare" "$rollback_input_compare" "$rollback_qkvza_route_compare" "$rollback_qkvza_repair_compare" "$rollback_fast_token_major_compare" "$rollback_fast_replay_admission" "$verify_graph" "$wall" <<'PYEOF'
 import json, sys
 
-label, mode, status, detect, parity, rollback_replay, rollback_logit, rollback_prefill_logit, rollback_state, rollback_prefill, rollback_input, qkvza_route, token_major, admission, verify_graph, wall = sys.argv[1:]
+label, mode, status, detect, parity, rollback_replay, rollback_logit, rollback_prefill_logit, rollback_state, rollback_prefill, rollback_input, qkvza_route, qkvza_repair, token_major, admission, verify_graph, wall = sys.argv[1:]
 
 def decode(value):
     if value in {"not_checked", "not_requested"}:
@@ -1452,6 +1580,7 @@ metrics = {
     "rollback_prefill_compare": decode(rollback_prefill),
     "rollback_input_compare": decode(rollback_input),
     "rollback_qkvza_route_compare": decode(qkvza_route),
+    "rollback_qkvza_repair_compare": decode(qkvza_repair),
     "rollback_fast_token_major_compare": decode(token_major),
     "rollback_fast_replay_admission": decode(admission),
     "verify_graph": decode(verify_graph),
@@ -1480,6 +1609,7 @@ PYEOF
         echo "- rollback_prefill_compare: \`$rollback_prefill_compare\`"
         echo "- rollback_input_compare: \`$rollback_input_compare\`"
         echo "- rollback_qkvza_route_compare: \`$rollback_qkvza_route_compare\`"
+        echo "- rollback_qkvza_repair_compare: \`$rollback_qkvza_repair_compare\`"
         echo "- rollback_fast_token_major_compare: \`$rollback_fast_token_major_compare\`"
         echo "- rollback_fast_replay_admission: \`$rollback_fast_replay_admission\`"
         echo "- verify_graph: \`$verify_graph\`"

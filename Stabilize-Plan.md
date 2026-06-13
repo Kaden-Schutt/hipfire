@@ -443,6 +443,14 @@
     captured-input split. That proves the qkv split is reproduced by the batch-size qkvza route itself when fed serial `x_in`; it is not a hidden
     tape copy, replay order, or earlier projection-input capture issue. The next implementation cut must either make the batched qkvza kernel family
     serial-equivalent for these rows, or keep fast rollback rejected behind the existing recurrent/logit admission blockers.
+    A repaired-tape diagnostic now recomputes qkv/alpha/beta rows one token at a time from captured `x_in`, gates alpha/beta, then reuses the
+    production `replay_gdn` path. Focused validation `/tmp/coherence-dflash-20260613-204644.md` plus
+    `/tmp/coherence-dflash-20260613-204644.dflash_trace.json` passed strict AR parity and recorded both repair sources in
+    `rollback_qkvza_repair_compare`: `source=serial` matched the serial rollback state, proving the repair machinery is serial-equivalent, while
+    `source=verify` still mismatched at `s_matrix[1]` with `differing_bytes=4762`. This rules out a simple LA0 qkvza-row repair as a live
+    replacement for full-prefill rollback; after LA0 is repaired, downstream verify-captured LA inputs are already divergent. Fast rollback remains
+    diagnostic-only until the verify path can produce serial-equivalent per-layer captured inputs or a broader live repair/admission policy proves
+    recurrent-state parity across layers.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

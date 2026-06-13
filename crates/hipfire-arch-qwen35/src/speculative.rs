@@ -3197,6 +3197,98 @@ impl GdnTapeShards {
 //      replay-side methods stay where they were. No behavior change
 //      vs pre-Stage-2b.) ──────────────────────────────────────────────
 impl GdnTape {
+    fn repair_qkvza_from_captured_x_single_row(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &qwen35::Qwen35Weights,
+        source: &GdnTape,
+        n_positions: usize,
+    ) -> HipResult<QkvzaRouteCompare> {
+        if n_positions > self.max_n || n_positions > source.max_n {
+            return Ok(QkvzaRouteCompare::Unsupported(
+                "repair_positions_exceed_tape",
+            ));
+        }
+        if self.x_in_dim != source.x_in_dim
+            || self.qkv_dim != source.qkv_dim
+            || self.v_dim != source.v_dim
+            || self.n_v_heads != source.n_v_heads
+        {
+            return Ok(QkvzaRouteCompare::Unsupported("repair_tape_shape_mismatch"));
+        }
+
+        let z = gpu.alloc_tensor(&[self.v_dim], DType::F32)?;
+        let beta_raw = gpu.alloc_tensor(&[self.n_v_heads], DType::F32)?;
+        let alpha_raw = gpu.alloc_tensor(&[self.n_v_heads], DType::F32)?;
+        let mut la_idx = 0usize;
+        for layer in &weights.layers {
+            let (wqkv, wz, w_beta, w_alpha, dt_bias, a_log) = match layer {
+                qwen35::LayerWeights::DeltaNet(l) => {
+                    (&l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.dt_bias, &l.a_log)
+                }
+                qwen35::LayerWeights::DeltaNetMoe(l) => {
+                    (&l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &l.dt_bias, &l.a_log)
+                }
+                _ => continue,
+            };
+
+            for step in 0..n_positions {
+                let x =
+                    source.x_in_bufs[la_idx].sub_offset(step * source.x_in_dim, source.x_in_dim);
+                let qkv = self.qkv_bufs[la_idx].sub_offset(step * self.qkv_dim, self.qkv_dim);
+                match compare_batched_qkvza_dispatch(
+                    gpu, wqkv, wz, w_beta, w_alpha, &x, &qkv, &z, &beta_raw, &alpha_raw, 1,
+                )? {
+                    QkvzaRouteCompare::Match => {}
+                    other => {
+                        let _ = gpu.free_tensor(z);
+                        let _ = gpu.free_tensor(beta_raw);
+                        let _ = gpu.free_tensor(alpha_raw);
+                        return Ok(other);
+                    }
+                }
+
+                let gate_offset = step * self.n_v_heads;
+                gpu.hip.memcpy_dtod_at(
+                    &self.alpha_raw_bufs[la_idx].buf,
+                    gate_offset * 4,
+                    &alpha_raw.buf,
+                    0,
+                    self.n_v_heads * 4,
+                )?;
+                gpu.hip.memcpy_dtod_at(
+                    &self.beta_raw_bufs[la_idx].buf,
+                    gate_offset * 4,
+                    &beta_raw.buf,
+                    0,
+                    self.n_v_heads * 4,
+                )?;
+                gpu.hip.memcpy_dtod_at(
+                    &self.alpha_bufs[la_idx].buf,
+                    gate_offset * 4,
+                    &alpha_raw.buf,
+                    0,
+                    self.n_v_heads * 4,
+                )?;
+                gpu.hip.memcpy_dtod_at(
+                    &self.beta_bufs[la_idx].buf,
+                    gate_offset * 4,
+                    &beta_raw.buf,
+                    0,
+                    self.n_v_heads * 4,
+                )?;
+                let alpha = self.alpha_bufs[la_idx].sub_offset(gate_offset, self.n_v_heads);
+                let beta = self.beta_bufs[la_idx].sub_offset(gate_offset, self.n_v_heads);
+                gpu.fused_sigmoid_alpha_gate_f32(&beta, &alpha, dt_bias, a_log, self.n_v_heads)?;
+            }
+            la_idx += 1;
+        }
+        let _ = gpu.free_tensor(z);
+        let _ = gpu.free_tensor(beta_raw);
+        let _ = gpu.free_tensor(alpha_raw);
+        Ok(QkvzaRouteCompare::Match)
+    }
+
     fn compare_batched_qkvza_from_captured_x_to_serial(
         &self,
         gpu: &mut Gpu,
@@ -7164,6 +7256,106 @@ pub fn spec_step_dflash(
                 }
                 let mut fast_replay_result = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
                 fast_replay_result.save_from(&target.dn_state, gpu)?;
+
+                for (repair_source_name, repair_source_tape) in
+                    [("verify", tape), ("serial", &serial_tape)]
+                {
+                    let mut repaired_tape =
+                        GdnTape::new_for_config(gpu, &target.config, accept_len + 1)?;
+                    match repaired_tape.repair_qkvza_from_captured_x_single_row(
+                        gpu,
+                        &target.weights,
+                        repair_source_tape,
+                        accept_len + 1,
+                    )? {
+                        QkvzaRouteCompare::Match => {
+                            target_snap.restore_to(&mut target.dn_state, gpu)?;
+                            gpu.debug_set_gdn_requant_frame(serial_frame_start);
+                            repaired_tape.replay_gdn(
+                                gpu,
+                                &target.weights,
+                                &target.config,
+                                &mut target.dn_state,
+                                accept_len + 1,
+                            )?;
+                            let repaired_frame_end = gpu.debug_gdn_requant_frame();
+                            eprintln!(
+                                "[dflash-rollback-qkvza-repair-frame-compare] pos={} accepted={} replay_steps={} forced_serial=1 source={} serial_start={} serial_end={} replay_end={}",
+                                position,
+                                accept_len,
+                                accept_len + 1,
+                                repair_source_name,
+                                serial_frame_start,
+                                serial_frame_end,
+                                repaired_frame_end,
+                            );
+                            gpu.debug_set_gdn_requant_frame(serial_frame_end);
+                            match compare_delta_net_state_to_snapshot(
+                                gpu,
+                                &target.dn_state,
+                                &serial_result,
+                            )? {
+                                Some(diff) => {
+                                    let context = rollback_snapshot_diff_context(&diff);
+                                    eprintln!(
+                                        "[dflash-rollback-qkvza-repair-compare] pos={} accepted={} replay_steps={} forced_serial=1 source={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} repaired_byte={}{}",
+                                        position,
+                                        accept_len,
+                                        accept_len + 1,
+                                        repair_source_name,
+                                        diff.family,
+                                        diff.index,
+                                        diff.bytes,
+                                        diff.differing_bytes,
+                                        diff.first_offset,
+                                        diff.expected_byte,
+                                        diff.actual_byte,
+                                        context,
+                                    );
+                                }
+                                None => eprintln!(
+                                    "[dflash-rollback-qkvza-repair-compare] pos={} accepted={} replay_steps={} forced_serial=1 source={} match",
+                                    position,
+                                    accept_len,
+                                    accept_len + 1,
+                                    repair_source_name,
+                                ),
+                            }
+                        }
+                        QkvzaRouteCompare::Mismatch(diff) => {
+                            let context = rollback_input_diff_context(
+                                &target.config,
+                                repair_source_tape,
+                                &diff,
+                                position,
+                            );
+                            eprintln!(
+                                "[dflash-rollback-qkvza-repair-compare] pos={} accepted={} replay_steps={} forced_serial=1 source={} repair_mismatch family={} index={} bytes={} differing_bytes={} first_offset={} expected_byte={} actual_byte={}{}",
+                                position,
+                                accept_len,
+                                accept_len + 1,
+                                repair_source_name,
+                                diff.family,
+                                diff.index,
+                                diff.bytes,
+                                diff.differing_bytes,
+                                diff.first_offset,
+                                diff.expected_byte,
+                                diff.actual_byte,
+                                context,
+                            );
+                        }
+                        QkvzaRouteCompare::Unsupported(reason) => eprintln!(
+                            "[dflash-rollback-qkvza-repair-compare] pos={} accepted={} replay_steps={} forced_serial=1 source={} unsupported reason={}",
+                            position,
+                            accept_len,
+                            accept_len + 1,
+                            repair_source_name,
+                            reason,
+                        ),
+                    }
+                    repaired_tape.free_gpu(gpu);
+                }
 
                 target_snap.restore_to(&mut target.dn_state, gpu)?;
                 gpu.debug_set_gdn_requant_frame(serial_frame_start);
