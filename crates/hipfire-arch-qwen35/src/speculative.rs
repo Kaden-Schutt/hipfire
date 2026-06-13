@@ -3387,9 +3387,25 @@ impl GdnTape {
 
         match layer {
             qwen35::LayerWeights::DeltaNet(l) => eprintln!(
-                "[dflash-rollback-qkvza-route-meta] layer={} dtype={:?} qkv_m={} z_m={} beta_m={} alpha_m={} k={} n_positions={} batch_n={}",
+                "[dflash-rollback-qkvza-route-meta] layer={} dtype={:?} route={} qkv_m={} z_m={} beta_m={} alpha_m={} k={} n_positions={} batch_n={}",
                 layer_index,
                 l.wqkv.gpu_dtype,
+                if matches!(l.wqkv.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256) {
+                    gpu.gemm_qkvza_hfq4g256_route_label(
+                        &l.wqkv.buf,
+                        &l.wz.buf,
+                        &l.w_beta.buf,
+                        &l.w_alpha.buf,
+                        l.wqkv.m,
+                        l.wz.m,
+                        l.w_beta.m,
+                        l.w_alpha.m,
+                        l.wqkv.k,
+                        batch_n,
+                    )
+                } else {
+                    "non_hfq4_route"
+                },
                 l.wqkv.m,
                 l.wz.m,
                 l.w_beta.m,
@@ -3399,9 +3415,25 @@ impl GdnTape {
                 batch_n,
             ),
             qwen35::LayerWeights::DeltaNetMoe(l) => eprintln!(
-                "[dflash-rollback-qkvza-route-meta] layer={} dtype={:?} qkv_m={} z_m={} beta_m={} alpha_m={} k={} n_positions={} batch_n={}",
+                "[dflash-rollback-qkvza-route-meta] layer={} dtype={:?} route={} qkv_m={} z_m={} beta_m={} alpha_m={} k={} n_positions={} batch_n={}",
                 layer_index,
                 l.wqkv.gpu_dtype,
+                if matches!(l.wqkv.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256) {
+                    gpu.gemm_qkvza_hfq4g256_route_label(
+                        &l.wqkv.buf,
+                        &l.wz.buf,
+                        &l.w_beta.buf,
+                        &l.w_alpha.buf,
+                        l.wqkv.m,
+                        l.wz.m,
+                        l.w_beta.m,
+                        l.w_alpha.m,
+                        l.wqkv.k,
+                        batch_n,
+                    )
+                } else {
+                    "non_hfq4_route"
+                },
                 l.wqkv.m,
                 l.wz.m,
                 l.w_beta.m,

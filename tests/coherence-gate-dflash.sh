@@ -1210,7 +1210,7 @@ mismatch_pattern = re.compile(
 )
 meta_pattern = re.compile(
     r"^\[dflash-rollback-qkvza-route-meta\] "
-    r"layer=(\d+) dtype=([A-Za-z0-9_]+) qkv_m=(\d+) z_m=(\d+) beta_m=(\d+) "
+    r"layer=(\d+) dtype=([A-Za-z0-9_]+)(?: route=([A-Za-z0-9_]+))? qkv_m=(\d+) z_m=(\d+) beta_m=(\d+) "
     r"alpha_m=(\d+) k=(\d+) n_positions=(\d+) batch_n=(\d+)$",
     re.MULTILINE,
 )
@@ -1277,14 +1277,16 @@ for m in meta_pattern.finditer(out):
     meta = {
         "layer": int(m.group(1)),
         "dtype": m.group(2),
-        "qkv_m": int(m.group(3)),
-        "z_m": int(m.group(4)),
-        "beta_m": int(m.group(5)),
-        "alpha_m": int(m.group(6)),
-        "k": int(m.group(7)),
-        "n_positions": int(m.group(8)),
-        "batch_n": int(m.group(9)),
+        "qkv_m": int(m.group(4)),
+        "z_m": int(m.group(5)),
+        "beta_m": int(m.group(6)),
+        "alpha_m": int(m.group(7)),
+        "k": int(m.group(8)),
+        "n_positions": int(m.group(9)),
+        "batch_n": int(m.group(10)),
     }
+    if m.group(3):
+        meta["route"] = m.group(3)
     route_meta.append(meta)
     last_meta_by_layer[meta["layer"]] = meta
 for m in match_pattern.finditer(out):

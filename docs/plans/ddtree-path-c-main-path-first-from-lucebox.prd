@@ -527,6 +527,16 @@ Latest rollback diagnostic evidence:
   and `projection_family_mismatch`; the qkvza route mismatch remains
   LA0 `qkv`, `first_offset=0`, after exact tape `x_in`. Dense DFlash
   still used verify graph capture/replay by default (`direct=0`).
+- `/tmp/coherence-dflash-20260614-011447.md` added an explicit qkvza
+  route label to the rollback diagnostic and parser. The focused
+  position-59 run passed prose/code AR parity. Prose fast replay
+  admission still rejects on `fast_replay_recurrent_state_mismatch`,
+  `rollback_input_mismatch`, and `projection_family_mismatch`, but the
+  projection-family blocker is now tied to route
+  `gemm_qkvza_hfq4g256_wmma`: LA0 `qkv`, `first_offset=0`,
+  `max_abs=0.010219574`, with exact serial self checks and exact tape
+  `x_in`. Dense DFlash still used verify graph capture/replay by default
+  (`direct=0`).
 - `/tmp/coherence-dflash-20260614-003019.md` repeated the row-aware
   diagnostic with `HIPFIRE_HFQ4_QKVZA_FAST=0`. Prose hard-failed AR
   parity at token 62 and the qkvza route mismatch persisted, changing
