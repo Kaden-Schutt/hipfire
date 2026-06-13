@@ -408,6 +408,17 @@ Latest rollback diagnostic evidence:
   projection family as the active blocker under the slow-route control:
   the remaining issue is the captured GDN/attention output stream and
   recurrent-state replay cadence.
+- `/tmp/coherence-dflash-la0-gdn-input2-20260613-230807.md` combined
+  the qkvza slow route with `HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN=1` and
+  extended rollback input parsing to include `la0-gdn-input`. Prose AR
+  parity still failed at token 62. The qkvza route still matched through
+  `layer=47`, and `la0-gdn-input` matched at position 59, but the first
+  rollback input and hidden-boundary mismatch remained LA0 `attn_out`
+  (`max_abs=1.23062134e-2`, `mean_abs=1.38604482e-5`), while the
+  all-layer GDN input check next failed at `gdn_q` for LA1. This narrows
+  the fast-replay blocker past qkvza and LA0 GDN inputs: LA0 GDN output
+  or the replay/capture cadence for its `attn_out` is the next active
+  site.
 
 ## References
 

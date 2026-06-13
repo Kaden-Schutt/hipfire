@@ -7418,6 +7418,32 @@ pub fn spec_step_dflash(
                         reason,
                     ),
                 }
+                match serial_tape.compare_gdn_inputs_layer_to(gpu, tape, 0, replay_tokens.len())? {
+                    Some(diff) => {
+                        let context =
+                            rollback_input_diff_context(&target.config, tape, &diff, position);
+                        eprintln!(
+                            "[dflash-rollback-la0-gdn-input-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}{}",
+                            position,
+                            accept_len,
+                            replay_tokens.len(),
+                            diff.family,
+                            diff.index,
+                            diff.bytes,
+                            diff.differing_bytes,
+                            diff.first_offset,
+                            diff.actual_byte,
+                            diff.expected_byte,
+                            context,
+                        );
+                    }
+                    None => eprintln!(
+                        "[dflash-rollback-la0-gdn-input-compare] pos={} accepted={} replay_steps={} serial_tape_live=1 match",
+                        position,
+                        accept_len,
+                        replay_tokens.len(),
+                    ),
+                }
                 match serial_tape.compare_gdn_inputs_to(gpu, tape, replay_tokens.len())? {
                     Some(diff) => {
                         let context =
@@ -7856,6 +7882,32 @@ pub fn spec_step_dflash(
                         accept_len + 1,
                         qkvza_layer,
                         reason,
+                    ),
+                }
+                match serial_tape.compare_gdn_inputs_layer_to(gpu, tape, 0, accept_len + 1)? {
+                    Some(diff) => {
+                        let context =
+                            rollback_input_diff_context(&target.config, tape, &diff, position);
+                        eprintln!(
+                            "[dflash-rollback-la0-gdn-input-compare] pos={} accepted={} replay_steps={} forced_serial=1 mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} gdn_byte={}{}",
+                            position,
+                            accept_len,
+                            accept_len + 1,
+                            diff.family,
+                            diff.index,
+                            diff.bytes,
+                            diff.differing_bytes,
+                            diff.first_offset,
+                            diff.actual_byte,
+                            diff.expected_byte,
+                            context,
+                        );
+                    }
+                    None => eprintln!(
+                        "[dflash-rollback-la0-gdn-input-compare] pos={} accepted={} replay_steps={} forced_serial=1 match",
+                        position,
+                        accept_len,
+                        accept_len + 1,
                     ),
                 }
                 match serial_tape.compare_gdn_inputs_to(gpu, tape, accept_len + 1)? {

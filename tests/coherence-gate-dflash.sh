@@ -927,12 +927,12 @@ frame_pattern = re.compile(
     re.MULTILINE,
 )
 match_pattern = re.compile(
-    r"^\[(dflash-rollback-(?:input|gdn-input-all)-compare)\] "
+    r"^\[(dflash-rollback-(?:input|la0-gdn-input|gdn-input-all)-compare)\] "
     r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?match$",
     re.MULTILINE,
 )
 mismatch_pattern = re.compile(
-    r"^\[(dflash-rollback-(?:input|gdn-input-all)-compare)\] "
+    r"^\[(dflash-rollback-(?:input|la0-gdn-input|gdn-input-all)-compare)\] "
     r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
     r"mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) "
     r"differing_bytes=(\d+) first_offset=(\d+) serial_byte=(\d+) gdn_byte=(\d+)(.*)$",
