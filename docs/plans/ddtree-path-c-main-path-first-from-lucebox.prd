@@ -545,6 +545,24 @@ Latest rollback diagnostic evidence:
   remains on conservative serial-source tape/full-prefill fallback, and
   fast GDN-tape replay remains diagnostic-only until the projection
   route split is repaired.
+- `/tmp/coherence-dflash-20260614-012843.md` added an explicit
+  serial-exact HFQ4/MQ4 qkvza dispatch for tape-producing dense verify
+  and routed the rollback qkvza diagnostic through it. Prose/code AR
+  parity passed, `rollback_qkvza_route_compare` matched through all LA
+  layers with route `gemm_qkvza_hfq4g256_exact`, and the fast replay
+  admission blocker list dropped `projection_family_mismatch`. The
+  remaining prose blockers were `fast_replay_recurrent_state_mismatch`
+  and `rollback_input_mismatch`: position 59 first mismatched row 1 of
+  LA0 `attn_out` (`max_abs=0.0105993748`) and LA1 `gdn_q`.
+- `/tmp/coherence-dflash-20260614-013337.md` repeated the focused
+  diagnostic at position 226 (`accepted=0`, `replay_steps=1`). Qkvza
+  still matched on the exact route, and direct/no-graph verify was still
+  not used (`verify_graph direct=0`). Fast replay was still rejected,
+  now with `single_step_recurrent_state_mismatch` plus
+  `rollback_input_mismatch`; the first input mismatch was
+  `attn_residual` before LA1 (`max_abs=0.00144004822`). This keeps live
+  DFlash rollback on conservative serial-source tape/full-prefill
+  fallback while fast GDN-tape replay remains diagnostic-only.
 
 ## References
 

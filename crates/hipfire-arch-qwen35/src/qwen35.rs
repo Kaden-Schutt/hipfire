@@ -15752,6 +15752,24 @@ fn forward_prefill_chunk(
                         layer.wqkv.k,
                         n,
                     )?;
+                } else if gdn_tape.is_some() {
+                    gpu.gemm_qkvza_hfq4g256_exact(
+                        &layer.wqkv.buf,
+                        &layer.wz.buf,
+                        &layer.w_beta.buf,
+                        &layer.w_alpha.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch,
+                        &pbs.dn_z_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        layer.wqkv.m,
+                        layer.wz.m,
+                        layer.w_beta.m,
+                        layer.w_alpha.m,
+                        layer.wqkv.k,
+                        n,
+                    )?;
                 } else {
                     gpu.gemm_qkvza_hfq4g256(
                         &layer.wqkv.buf,

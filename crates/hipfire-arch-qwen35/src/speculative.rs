@@ -1359,7 +1359,7 @@ fn compare_batched_qkvza_dispatch(
             )?;
         }
         DType::MQ4G256 | DType::HFQ4G256 => {
-            gpu.gemm_qkvza_hfq4g256(
+            gpu.gemm_qkvza_hfq4g256_exact(
                 &wqkv.buf,
                 &wz.buf,
                 &w_beta.buf,
@@ -3391,18 +3391,7 @@ impl GdnTape {
                 layer_index,
                 l.wqkv.gpu_dtype,
                 if matches!(l.wqkv.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256) {
-                    gpu.gemm_qkvza_hfq4g256_route_label(
-                        &l.wqkv.buf,
-                        &l.wz.buf,
-                        &l.w_beta.buf,
-                        &l.w_alpha.buf,
-                        l.wqkv.m,
-                        l.wz.m,
-                        l.w_beta.m,
-                        l.w_alpha.m,
-                        l.wqkv.k,
-                        batch_n,
-                    )
+                    "gemm_qkvza_hfq4g256_exact"
                 } else {
                     "non_hfq4_route"
                 },
@@ -3419,18 +3408,7 @@ impl GdnTape {
                 layer_index,
                 l.wqkv.gpu_dtype,
                 if matches!(l.wqkv.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256) {
-                    gpu.gemm_qkvza_hfq4g256_route_label(
-                        &l.wqkv.buf,
-                        &l.wz.buf,
-                        &l.w_beta.buf,
-                        &l.w_alpha.buf,
-                        l.wqkv.m,
-                        l.wz.m,
-                        l.w_beta.m,
-                        l.w_alpha.m,
-                        l.wqkv.k,
-                        batch_n,
-                    )
+                    "gemm_qkvza_hfq4g256_exact"
                 } else {
                     "non_hfq4_route"
                 },
