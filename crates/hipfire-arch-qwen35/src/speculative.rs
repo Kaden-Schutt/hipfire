@@ -961,6 +961,47 @@ struct F32DiffStats {
 }
 
 #[derive(Debug)]
+struct LogitDiffStats {
+    words: usize,
+    bit_different_words: usize,
+    max_abs: f32,
+    mean_abs: f32,
+    max_rel: f32,
+}
+
+fn logit_diff_stats(actual: &[f32], expected: &[f32]) -> LogitDiffStats {
+    let mut words = 0usize;
+    let mut bit_different_words = 0usize;
+    let mut max_abs = 0.0f32;
+    let mut sum_abs = 0.0f64;
+    let mut max_rel = 0.0f32;
+    for (&actual_value, &expected_value) in actual.iter().zip(expected.iter()) {
+        words += 1;
+        if actual_value.to_bits() != expected_value.to_bits() {
+            bit_different_words += 1;
+        }
+        let abs = (actual_value - expected_value).abs();
+        if abs.is_finite() {
+            max_abs = max_abs.max(abs);
+            sum_abs += abs as f64;
+            let denom = expected_value.abs().max(1.0e-12);
+            max_rel = max_rel.max(abs / denom);
+        }
+    }
+    LogitDiffStats {
+        words,
+        bit_different_words,
+        max_abs,
+        mean_abs: if words == 0 {
+            0.0
+        } else {
+            (sum_abs / words as f64) as f32
+        },
+        max_rel,
+    }
+}
+
+#[derive(Debug)]
 struct DeltaNetSnapshotDiff {
     family: &'static str,
     index: usize,
@@ -6395,6 +6436,52 @@ pub fn spec_step_dflash(
                         accept_len + 1,
                     ),
                 }
+                let bonus_position = position + accept_len + 1;
+                qwen35::forward_scratch(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    bonus_token,
+                    bonus_position,
+                    &mut target.kv_cache,
+                    &mut target.dn_state,
+                    &target.scratch,
+                )?;
+                let fast_logits = gpu.download_f32(&target.scratch.logits)?;
+
+                serial_result.restore_to(&mut target.dn_state, gpu)?;
+                qwen35::forward_scratch(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    bonus_token,
+                    bonus_position,
+                    &mut target.kv_cache,
+                    &mut target.dn_state,
+                    &target.scratch,
+                )?;
+                let serial_logits = gpu.download_f32(&target.scratch.logits)?;
+                let logit_stats = logit_diff_stats(&fast_logits, &serial_logits);
+                let fast_argmax = argmax_u32(&fast_logits);
+                let serial_argmax = argmax_u32(&serial_logits);
+                let bonus_idx = bonus_token as usize;
+                let serial_bonus_logit = serial_logits.get(bonus_idx).copied().unwrap_or(f32::NAN);
+                let fast_bonus_logit = fast_logits.get(bonus_idx).copied().unwrap_or(f32::NAN);
+                eprintln!(
+                    "[dflash-rollback-next-logit-compare] pos={} bonus_pos={} bonus_token={} serial_argmax={} fast_argmax={} serial_bonus_logit={:.8e} fast_bonus_logit={:.8e} f32_words={} f32_bit_diff_words={} max_abs={:.8e} mean_abs={:.8e} max_rel={:.8e}",
+                    position,
+                    bonus_position,
+                    bonus_token,
+                    serial_argmax,
+                    fast_argmax,
+                    serial_bonus_logit,
+                    fast_bonus_logit,
+                    logit_stats.words,
+                    logit_stats.bit_different_words,
+                    logit_stats.max_abs,
+                    logit_stats.mean_abs,
+                    logit_stats.max_rel,
+                );
                 serial_result.restore_to(&mut target.dn_state, gpu)?;
                 serial_tape.free_gpu(gpu);
                 serial_result.free_gpu(gpu);

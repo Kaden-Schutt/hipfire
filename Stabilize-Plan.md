@@ -240,6 +240,11 @@
     reduces the final compare to two subnormal `s_matrix[3]` byte differences (`max_abs=2.40741243e-35`), and adding FA raw tolerance again moves
     the first visible input drift to tiny `x_in[4]` (`max_abs=3.57627869e-7`). These are still diagnostic-only controls: verify-graph off changes
     the trajectory count (`replay_full_prefill=57` vs `59`) and is not promotion evidence for fast tape replay.
+    The forced-serial diagnostic now also compares the next-token logits after applying the fast tape state versus the serial-restored state. On the
+    default path at position 120, the immediate next-logit argmax still matches (`303`) but drift is large (`max_abs=1.76373720e-2`,
+    `mean_abs=1.97809376e-3`). Under all projection-fast-off controls the same probe keeps the next-logit argmax matched (`13`) and reduces logit
+    drift to `max_abs=5.16176224e-5`, `mean_abs=4.74912758e-6`, while final recurrent state still differs. This is useful bounded-effect evidence
+    for one cycle, but it is not enough to admit fast replay because multi-cycle recurrent/logit parity remains unproven.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
