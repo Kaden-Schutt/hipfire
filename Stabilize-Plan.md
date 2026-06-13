@@ -394,6 +394,13 @@
     still rejected on recurrent-state mismatch and `max_abs_over_margin=1.8169`. Fast GDN-tape rollback therefore remains diagnostic-only; the next
     production-grade cut is eliminating the captured-row drift or building a live fail-closed hybrid that proves recurrent-state and continuation
     margin bounds before using fast replay.
+    The rollback admission report now carries replay-shape evidence (`min/max_replay_steps`, step histograms, and single-/multi-step mismatch
+    counts) inside both `rollback_state_compare` and `rollback_fast_replay_admission`. Fresh diagnostic evidence
+    `/tmp/coherence-dflash-20260613-195656.md` plus `/tmp/coherence-dflash-20260613-195656.dflash_trace.json` rejects a trivial cycle-shape hybrid:
+    prose mismatched every recurrent-state probe, including all 31 single-step rollback cycles (`single_step_checked=31`,
+    `single_step_mismatches=31`) and every multi-step cycle through replay depth 5, while code only exercised multi-step cycles
+    (`replay_steps=5/6/8/9`) and also mismatched every recurrent-state probe. A live fast path therefore cannot be admitted by limiting it to
+    one-step partial/reject rollback; it still needs captured-row parity or a per-cycle runtime proof stronger than replay-step shape.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq

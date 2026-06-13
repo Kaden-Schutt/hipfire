@@ -741,12 +741,33 @@ checked = len(matches) + len(mismatches)
 if checked == 0:
     print(json.dumps({"ok": True, "checked": 0}))
     sys.exit(0)
+all_rows = matches + mismatches
+single_step_matches = [r for r in matches if r["replay_steps"] == 1]
+single_step_mismatches = [r for r in mismatches if r["replay_steps"] == 1]
+multi_step_matches = [r for r in matches if r["replay_steps"] > 1]
+multi_step_mismatches = [r for r in mismatches if r["replay_steps"] > 1]
+replay_step_counts = {}
+for r in all_rows:
+    key = str(r["replay_steps"])
+    replay_step_counts[key] = replay_step_counts.get(key, 0) + 1
+mismatch_replay_step_counts = {}
+for r in mismatches:
+    key = str(r["replay_steps"])
+    mismatch_replay_step_counts[key] = mismatch_replay_step_counts.get(key, 0) + 1
 payload = {
     "ok": not mismatches,
     "checked": checked,
     "matches": len(matches),
     "mismatches": len(mismatches),
     "positions": sorted(set([r["pos"] for r in matches] + [r["pos"] for r in mismatches])),
+    "min_replay_steps": min(r["replay_steps"] for r in all_rows),
+    "max_replay_steps": max(r["replay_steps"] for r in all_rows),
+    "replay_step_counts": replay_step_counts,
+    "mismatch_replay_step_counts": mismatch_replay_step_counts,
+    "single_step_checked": len(single_step_matches) + len(single_step_mismatches),
+    "single_step_mismatches": len(single_step_mismatches),
+    "multi_step_checked": len(multi_step_matches) + len(multi_step_mismatches),
+    "multi_step_mismatches": len(multi_step_mismatches),
 }
 if mismatches:
     first = mismatches[0]
@@ -1113,6 +1134,19 @@ payload = {
     "logit_checked": logit_checked,
     "state_checked": state_checked,
 }
+shape_keys = [
+    "min_replay_steps",
+    "max_replay_steps",
+    "replay_step_counts",
+    "mismatch_replay_step_counts",
+    "single_step_checked",
+    "single_step_mismatches",
+    "multi_step_checked",
+    "multi_step_mismatches",
+]
+shape = {key: state[key] for key in shape_keys if key in state}
+if shape:
+    payload["replay_shape"] = shape
 if state.get("first_mismatch"):
     payload["first_state_mismatch"] = state["first_mismatch"]
 if logit.get("first_mismatch"):
