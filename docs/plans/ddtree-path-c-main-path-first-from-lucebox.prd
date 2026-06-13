@@ -455,6 +455,16 @@ Latest rollback diagnostic evidence:
   row-wise fused" lever as sufficient; the remaining investigation needs
   to isolate why the verify-captured raw gate stream remains different
   even when the slow-route flag is present.
+- `/tmp/coherence-dflash-qkvza-single-row-20260613-234907.md` added
+  qkvza route metadata and a row-0 single-row recompute inside the same
+  diagnostic. The failing route is MQ4G256 with `batch_n=2`,
+  `qkv_m=10240`, `z_m=6144`, `beta_m=48`, `alpha_m=48`, `k=5120`.
+  The single-row fused MQ4 recompute still mismatched serial
+  (`qkvza_single_beta_raw_mismatch`, `single_byte=66`,
+  `serial_byte=159`), matching the batched route byte. This rules out a
+  simple batch-size-2 qkvza dispatch artifact; the remaining isolate is
+  whether the serial raw-gate capture site is observing a different
+  beta/alpha source than the serial `x_in` plus weights imply.
 
 ## References
 

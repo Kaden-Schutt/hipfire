@@ -1206,6 +1206,26 @@ mismatch_pattern = re.compile(
     r"differing_bytes=(\d+) first_offset=(\d+) serial_byte=(\d+) batched_byte=(\d+)(.*)$",
     re.MULTILINE,
 )
+meta_pattern = re.compile(
+    r"^\[dflash-rollback-qkvza-route-meta\] "
+    r"layer=(\d+) dtype=([A-Za-z0-9_]+) qkv_m=(\d+) z_m=(\d+) beta_m=(\d+) "
+    r"alpha_m=(\d+) k=(\d+) n_positions=(\d+) batch_n=(\d+)$",
+    re.MULTILINE,
+)
+single_match_pattern = re.compile(
+    r"^\[dflash-rollback-qkvza-single-row-compare\] layer=(\d+) match$",
+    re.MULTILINE,
+)
+single_unsupported_pattern = re.compile(
+    r"^\[dflash-rollback-qkvza-single-row-compare\] layer=(\d+) unsupported reason=([A-Za-z0-9_]+)(?: dtype=([A-Za-z0-9_]+))?$",
+    re.MULTILINE,
+)
+single_mismatch_pattern = re.compile(
+    r"^\[dflash-rollback-qkvza-single-row-compare\] layer=(\d+) mismatch family=([A-Za-z0-9_]+) "
+    r"index=(\d+) bytes=(\d+) differing_bytes=(\d+) first_offset=(\d+) "
+    r"serial_byte=(\d+) single_byte=(\d+)$",
+    re.MULTILINE,
+)
 
 def parse_context(context):
     parsed = {}
@@ -1220,16 +1240,67 @@ def parse_context(context):
     return parsed
 
 events = []
+route_meta = []
+single_row_checks = []
+last_meta_by_layer = {}
+for m in meta_pattern.finditer(out):
+    meta = {
+        "layer": int(m.group(1)),
+        "dtype": m.group(2),
+        "qkv_m": int(m.group(3)),
+        "z_m": int(m.group(4)),
+        "beta_m": int(m.group(5)),
+        "alpha_m": int(m.group(6)),
+        "k": int(m.group(7)),
+        "n_positions": int(m.group(8)),
+        "batch_n": int(m.group(9)),
+    }
+    route_meta.append(meta)
+    last_meta_by_layer[meta["layer"]] = meta
 for m in match_pattern.finditer(out):
-    events.append((m.start(), {
+    layer = int(m.group(4))
+    event = {
         "ok": True,
         "pos": int(m.group(1)),
         "accepted": int(m.group(2)),
         "replay_steps": int(m.group(3)),
-        "layer": int(m.group(4)),
-    }))
+        "layer": layer,
+    }
+    if layer in last_meta_by_layer:
+        event["route_meta"] = last_meta_by_layer[layer]
+    events.append((m.start(), event))
+
+for m in single_match_pattern.finditer(out):
+    single_row_checks.append({
+        "ok": True,
+        "layer": int(m.group(1)),
+    })
+for m in single_unsupported_pattern.finditer(out):
+    event = {
+        "ok": False,
+        "unsupported": True,
+        "layer": int(m.group(1)),
+        "reason": m.group(2),
+    }
+    if m.group(3):
+        event["dtype"] = m.group(3)
+    single_row_checks.append(event)
+for m in single_mismatch_pattern.finditer(out):
+    single_row_checks.append({
+        "ok": False,
+        "layer": int(m.group(1)),
+        "family": m.group(2),
+        "index": int(m.group(3)),
+        "bytes": int(m.group(4)),
+        "differing_bytes": int(m.group(5)),
+        "first_offset": int(m.group(6)),
+        "serial_byte": int(m.group(7)),
+        "single_byte": int(m.group(8)),
+        "reason": f"{m.group(2)}_mismatch",
+    })
 for m in unsupported_pattern.finditer(out):
-    events.append((m.start(), {
+    layer = int(m.group(4))
+    event = {
         "ok": False,
         "unsupported": True,
         "reason": "qkvza_route_compare_unsupported",
@@ -1237,18 +1308,22 @@ for m in unsupported_pattern.finditer(out):
         "pos": int(m.group(1)),
         "accepted": int(m.group(2)),
         "replay_steps": int(m.group(3)),
-        "layer": int(m.group(4)),
-    }))
+        "layer": layer,
+    }
+    if layer in last_meta_by_layer:
+        event["route_meta"] = last_meta_by_layer[layer]
+    events.append((m.start(), event))
 for m in mismatch_pattern.finditer(out):
     context = m.group(12).strip() or None
     family = m.group(5)
-    events.append((m.start(), {
+    layer = int(m.group(4))
+    event = {
         "ok": False,
         "reason": f"{family}_mismatch",
         "pos": int(m.group(1)),
         "accepted": int(m.group(2)),
         "replay_steps": int(m.group(3)),
-        "layer": int(m.group(4)),
+        "layer": layer,
         "family": family,
         "index": int(m.group(6)),
         "bytes": int(m.group(7)),
@@ -1258,7 +1333,10 @@ for m in mismatch_pattern.finditer(out):
         "batched_byte": int(m.group(11)),
         "context": context,
         "stats": parse_context(context),
-    }))
+    }
+    if layer in last_meta_by_layer:
+        event["route_meta"] = last_meta_by_layer[layer]
+    events.append((m.start(), event))
 
 events.sort(key=lambda event: event[0])
 checks = [event for _, event in events]
@@ -1270,6 +1348,10 @@ payload = {
     "mismatches": len(mismatches),
     "checks": checks,
 }
+if route_meta:
+    payload["route_meta"] = route_meta
+if single_row_checks:
+    payload["single_row_checks"] = single_row_checks
 if not checks:
     payload["ok"] = True
 if mismatches:

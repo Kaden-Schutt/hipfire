@@ -3377,6 +3377,34 @@ impl GdnTape {
             )?;
         }
 
+        match layer {
+            qwen35::LayerWeights::DeltaNet(l) => eprintln!(
+                "[dflash-rollback-qkvza-route-meta] layer={} dtype={:?} qkv_m={} z_m={} beta_m={} alpha_m={} k={} n_positions={} batch_n={}",
+                layer_index,
+                l.wqkv.gpu_dtype,
+                l.wqkv.m,
+                l.wz.m,
+                l.w_beta.m,
+                l.w_alpha.m,
+                l.wqkv.k,
+                n_positions,
+                batch_n,
+            ),
+            qwen35::LayerWeights::DeltaNetMoe(l) => eprintln!(
+                "[dflash-rollback-qkvza-route-meta] layer={} dtype={:?} qkv_m={} z_m={} beta_m={} alpha_m={} k={} n_positions={} batch_n={}",
+                layer_index,
+                l.wqkv.gpu_dtype,
+                l.wqkv.m,
+                l.wz.m,
+                l.w_beta.m,
+                l.w_alpha.m,
+                l.wqkv.k,
+                n_positions,
+                batch_n,
+            ),
+            _ => {}
+        }
+
         let dispatch = match layer {
             qwen35::LayerWeights::DeltaNet(l) => compare_batched_qkvza_dispatch(
                 gpu, &l.wqkv, &l.wz, &l.w_beta, &l.w_alpha, &x, &qkv, &z, &beta, &alpha, batch_n,
@@ -3426,7 +3454,14 @@ impl GdnTape {
                     }
                 }
                 match mismatch {
-                    Some(diff) => QkvzaRouteCompare::Mismatch(diff),
+                    Some(diff) => {
+                        self.log_single_row_qkvza_from_captured_x_to_serial(
+                            gpu,
+                            layer,
+                            layer_index,
+                        )?;
+                        QkvzaRouteCompare::Mismatch(diff)
+                    }
                     None => QkvzaRouteCompare::Match,
                 }
             }
@@ -3439,6 +3474,121 @@ impl GdnTape {
         let _ = gpu.free_tensor(beta);
         let _ = gpu.free_tensor(alpha);
         Ok(result)
+    }
+
+    fn log_single_row_qkvza_from_captured_x_to_serial(
+        &self,
+        gpu: &mut Gpu,
+        layer: &qwen35::LayerWeights,
+        layer_index: usize,
+    ) -> HipResult<()> {
+        let (wqkv, wz, w_beta, w_alpha) = match layer {
+            qwen35::LayerWeights::DeltaNet(l) => (&l.wqkv, &l.wz, &l.w_beta, &l.w_alpha),
+            qwen35::LayerWeights::DeltaNetMoe(l) => (&l.wqkv, &l.wz, &l.w_beta, &l.w_alpha),
+            _ => return Ok(()),
+        };
+        let same_dtype = wz.gpu_dtype == wqkv.gpu_dtype
+            && w_beta.gpu_dtype == wqkv.gpu_dtype
+            && w_alpha.gpu_dtype == wqkv.gpu_dtype;
+        if !same_dtype {
+            eprintln!(
+                "[dflash-rollback-qkvza-single-row-compare] layer={} unsupported reason=mixed_qkvza_dtype",
+                layer_index,
+            );
+            return Ok(());
+        }
+        if !matches!(wqkv.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256) {
+            eprintln!(
+                "[dflash-rollback-qkvza-single-row-compare] layer={} unsupported reason=unsupported_qkvza_dtype dtype={:?}",
+                layer_index,
+                wqkv.gpu_dtype,
+            );
+            return Ok(());
+        }
+
+        let x = self.x_in_bufs[layer_index].sub_offset(0, self.x_in_dim);
+        let qkv = gpu.alloc_tensor(&[self.qkv_dim], DType::F32)?;
+        let z = gpu.alloc_tensor(&[self.v_dim], DType::F32)?;
+        let beta = gpu.alloc_tensor(&[self.n_v_heads], DType::F32)?;
+        let alpha = gpu.alloc_tensor(&[self.n_v_heads], DType::F32)?;
+        gpu.fused_qkvza_hfq4g256(
+            &wqkv.buf,
+            &wz.buf,
+            &w_beta.buf,
+            &w_alpha.buf,
+            &x,
+            &qkv,
+            &z,
+            &beta,
+            &alpha,
+            wqkv.m,
+            wz.m,
+            w_beta.m,
+            w_alpha.m,
+            wqkv.k,
+        )?;
+        std::mem::forget(x);
+
+        let qkv_bytes = self.qkv_dim * 4;
+        let alpha_beta_bytes = self.n_v_heads * 4;
+        let mut mismatch = None;
+        for (family, actual, expected, bytes) in [
+            (
+                "qkvza_single_qkv",
+                &qkv.buf,
+                &self.qkv_bufs[layer_index].buf,
+                qkv_bytes,
+            ),
+            (
+                "qkvza_single_beta_raw",
+                &beta.buf,
+                &self.beta_raw_bufs[layer_index].buf,
+                alpha_beta_bytes,
+            ),
+            (
+                "qkvza_single_alpha_raw",
+                &alpha.buf,
+                &self.alpha_raw_bufs[layer_index].buf,
+                alpha_beta_bytes,
+            ),
+        ] {
+            if let Some(diff) = compare_device_buffer_prefix_to_snapshot(
+                gpu,
+                family,
+                layer_index,
+                actual,
+                expected,
+                bytes,
+            )? {
+                mismatch = Some(diff);
+                break;
+            }
+        }
+        match mismatch {
+            Some(diff) => {
+                eprintln!(
+                    "[dflash-rollback-qkvza-single-row-compare] layer={} mismatch family={} index={} bytes={} differing_bytes={} first_offset={} serial_byte={} single_byte={}",
+                    layer_index,
+                    diff.family,
+                    diff.index,
+                    diff.bytes,
+                    diff.differing_bytes,
+                    diff.first_offset,
+                    diff.expected_byte,
+                    diff.actual_byte,
+                );
+            }
+            None => eprintln!(
+                "[dflash-rollback-qkvza-single-row-compare] layer={} match",
+                layer_index,
+            ),
+        }
+
+        let _ = gpu.free_tensor(qkv);
+        let _ = gpu.free_tensor(z);
+        let _ = gpu.free_tensor(beta);
+        let _ = gpu.free_tensor(alpha);
+        Ok(())
     }
 
     fn compare_first_batched_qkvza_from_captured_x_to_serial(
