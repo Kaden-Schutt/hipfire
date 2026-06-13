@@ -341,6 +341,12 @@
     but multi-token recurrent snapshots remained non-admissible (prose `matches=32`, `mismatches=60`; code `mismatches=4`). This confirms the
     global `HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN=1` workaround is not a production fix and that partial/reject rollback must stay on conservative
     serial/full-prefill until multi-step recurrent parity is proven.
+    A narrower continuation check on the first multi-token mismatch cycle, `/tmp/coherence-dflash-20260613-184539.md`, traced position 59
+    (`accepted=1`, `replay_steps=2`) with `HIPFIRE_DFLASH_ROLLBACK_LOGIT_COMPARE_STEPS=8`. AR parity still passed and both fast-tape and scoped
+    prefill continuation compares kept `argmax_mismatches=0` for all 8 greedy serial continuation steps, but the recurrent snapshots remained
+    mismatched (`s_matrix[0]`, `differing_bytes=175503`) and the upstream accepted-prefix inputs still diverged (`qkv max_abs=1.02e-2`,
+    `gdn_q max_abs=2.46e-5`). This is useful tolerance evidence, but not yet production admission: the next cut is to run the same multi-step
+    continuation over all mismatching cycles or define an explicit bounded-logit tolerance policy that can fail closed when margins are too small.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
