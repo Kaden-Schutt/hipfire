@@ -843,6 +843,14 @@ fn dflash_rollback_fa_raw_atol_from_env() -> f32 {
         .unwrap_or(0.0)
 }
 
+fn dflash_rollback_x_in_atol_from_env() -> f32 {
+    std::env::var("HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(0.0)
+}
+
 /// Backing storage for a DeltaNetState snapshot. Holds device buffers sized
 /// to match the source state's tensors. Allocate once per slot, reuse across
 /// all speculative cycles.
@@ -2649,6 +2657,7 @@ impl GdnTape {
         n_positions: usize,
     ) -> HipResult<Option<DeltaNetSnapshotDiff>> {
         let fa_raw_atol = dflash_rollback_fa_raw_atol_from_env();
+        let x_in_atol = dflash_rollback_x_in_atol_from_env();
         let x_in_bytes = n_positions * self.x_in_dim * 4;
         let qkv_bytes = n_positions * self.qkv_dim * 4;
         let alpha_beta_bytes = n_positions * self.n_v_heads * 4;
@@ -2787,6 +2796,14 @@ impl GdnTape {
                 &expected.x_in_bufs[i].buf,
                 x_in_bytes,
             )? {
+                if x_in_atol > 0.0
+                    && diff
+                        .f32_stats
+                        .as_ref()
+                        .is_some_and(|stats| stats.max_abs <= x_in_atol)
+                {
+                    continue;
+                }
                 return Ok(Some(diff));
             }
             if let Some(diff) = compare_device_buffer_prefix_to_snapshot(

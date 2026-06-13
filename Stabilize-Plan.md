@@ -177,8 +177,14 @@
     f32 stats to the recurrent-state compare proves that tolerance alone is not admission evidence: the same run's final `s_matrix[0]` diff has
     `f32_words=196608`, `f32_bit_diff_words=110835`, `actual_f32=-1.08794908e37`, `expected_f32=-1.08791663e37`,
     `max_abs=3.40205476e38`, `mean_abs=2.42472451e36`, and `max_rel=inf`. The next blocker is to localize where the tiny FA/input drift is
-    amplified inside the following GDN recurrence, or prove a bounded rescale/quantization policy that preserves logits. Fast rollback replay
-    remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity evidence.
+    amplified inside the following GDN recurrence, or prove a bounded rescale/quantization policy that preserves logits. A second narrow
+    tolerance walk with `HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL=0.000001` skips the `x_in[4]` drift and exposes another tiny hidden-boundary mismatch
+    at `fa_bridge_input[6]` (`bytes=20480`, `differing_bytes=4512`, `first_offset=0`, row 0/logical position 120/hidden elem 0) with
+    `actual_f32=-2.74384245e-2`, `expected_f32=-2.74384618e-2`, `max_abs=1.19209290e-7`, `mean_abs=2.20296901e-8`, and
+    `max_rel=1.42053526e-3`; the final `s_matrix[0]` diff is unchanged. That rules out the previous `x_in[4]` boundary as the sole
+    amplification point. The next useful cut is a hidden-boundary tolerance walk or a per-LA state compare to identify the first recurrent layer
+    whose state magnitude diverges. Fast rollback replay remains diagnostic-only until tolerance semantics are tied to final recurrent/logit parity
+    evidence.
 
   - Define the first backend module contract for one Qwen35 dense FFN/SwiGLU/down segment:
       - CPU backend is oracle.
