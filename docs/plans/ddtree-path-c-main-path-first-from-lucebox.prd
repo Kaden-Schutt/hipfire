@@ -514,6 +514,19 @@ Latest rollback diagnostic evidence:
   active qkvza route mismatch remains LA0 `qkv`, `first_offset=0`,
   with exact serial self checks and exact tape `x_in`; dense DFlash
   still used verify graph capture/replay by default (`direct=0`).
+- `/tmp/coherence-dflash-20260614-010756.md` extended the active
+  serial-tape rollback diagnostic to emit next-logit evidence and
+  restored the GDN requant frame after the compare. The focused
+  position-59 run passed prose/code AR parity, and the prose
+  `rollback_logit_compare` now checked one next-token row with no argmax
+  mismatch (`serial_argmax=fast_argmax=314`,
+  `max_abs_over_margin=0.00668554`). This removes the previous
+  `missing_logit_compare` blocker from the measured prose admission.
+  Fast replay admission still rejects on
+  `fast_replay_recurrent_state_mismatch`, `rollback_input_mismatch`,
+  and `projection_family_mismatch`; the qkvza route mismatch remains
+  LA0 `qkv`, `first_offset=0`, after exact tape `x_in`. Dense DFlash
+  still used verify graph capture/replay by default (`direct=0`).
 - `/tmp/coherence-dflash-20260614-003019.md` repeated the row-aware
   diagnostic with `HIPFIRE_HFQ4_QKVZA_FAST=0`. Prose hard-failed AR
   parity at token 62 and the qkvza route mismatch persisted, changing

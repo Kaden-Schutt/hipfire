@@ -7877,6 +7877,120 @@ pub fn spec_step_dflash(
                         replay_tokens.len(),
                     ),
                 }
+                let mut fast_replay_result = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
+                fast_replay_result.save_from(&target.dn_state, gpu)?;
+                let serial_accepted_kv_rows = KvCacheRowsSnapshot::new_for(
+                    gpu,
+                    &target.kv_cache,
+                    position,
+                    replay_tokens.len(),
+                )?;
+                let logit_compare_steps = dflash_rollback_logit_compare_steps_from_env();
+                let bonus_position = position + accept_len + 1;
+                let kv_rows = KvCacheRowsSnapshot::new_for(
+                    gpu,
+                    &target.kv_cache,
+                    bonus_position,
+                    logit_compare_steps,
+                )?;
+                let mut serial_logit_rows = Vec::with_capacity(logit_compare_steps);
+                let mut compare_token = bonus_token;
+                serial_result.restore_to(&mut target.dn_state, gpu)?;
+                serial_accepted_kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                gpu.debug_set_gdn_requant_frame(serial_frame_end);
+                for step in 0..logit_compare_steps {
+                    let step_position = bonus_position + step;
+                    qwen35::forward_scratch(
+                        gpu,
+                        &target.weights,
+                        &target.config,
+                        compare_token,
+                        step_position,
+                        &mut target.kv_cache,
+                        &mut target.dn_state,
+                        &target.scratch,
+                    )?;
+                    let serial_logits = gpu.download_f32(&target.scratch.logits)?;
+                    let (
+                        serial_argmax,
+                        serial_argmax_logit,
+                        serial_runner_up_logit,
+                        serial_argmax_margin,
+                    ) = argmax_u32_with_margin(&serial_logits);
+                    serial_logit_rows.push((
+                        compare_token,
+                        step_position,
+                        serial_argmax,
+                        serial_argmax_logit,
+                        serial_runner_up_logit,
+                        serial_argmax_margin,
+                        serial_logits,
+                    ));
+                    compare_token = serial_argmax;
+                }
+
+                fast_replay_result.restore_to(&mut target.dn_state, gpu)?;
+                serial_accepted_kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                gpu.debug_set_gdn_requant_frame(serial_frame_end);
+                for (
+                    step,
+                    (
+                        step_token,
+                        step_position,
+                        serial_argmax,
+                        serial_argmax_logit,
+                        serial_runner_up_logit,
+                        serial_argmax_margin,
+                        serial_logits,
+                    ),
+                ) in serial_logit_rows.iter().enumerate()
+                {
+                    qwen35::forward_scratch(
+                        gpu,
+                        &target.weights,
+                        &target.config,
+                        *step_token,
+                        *step_position,
+                        &mut target.kv_cache,
+                        &mut target.dn_state,
+                        &target.scratch,
+                    )?;
+                    let fast_logits = gpu.download_f32(&target.scratch.logits)?;
+                    let logit_stats = logit_diff_stats(&fast_logits, serial_logits);
+                    let fast_argmax = argmax_u32(&fast_logits);
+                    let token_idx = *step_token as usize;
+                    let serial_token_logit =
+                        serial_logits.get(token_idx).copied().unwrap_or(f32::NAN);
+                    let fast_token_logit = fast_logits.get(token_idx).copied().unwrap_or(f32::NAN);
+                    eprintln!(
+                        "[dflash-rollback-next-logit-compare] pos={} step={} compare_steps={} token_pos={} token={} serial_argmax={} fast_argmax={} serial_token_logit={:.8e} fast_token_logit={:.8e} f32_words={} f32_bit_diff_words={} max_abs={:.8e} mean_abs={:.8e} max_rel={:.8e} serial_argmax_logit={:.8e} serial_runner_up_logit={:.8e} serial_argmax_margin={:.8e}",
+                        position,
+                        step,
+                        logit_compare_steps,
+                        step_position,
+                        step_token,
+                        serial_argmax,
+                        fast_argmax,
+                        serial_token_logit,
+                        fast_token_logit,
+                        logit_stats.words,
+                        logit_stats.bit_different_words,
+                        logit_stats.max_abs,
+                        logit_stats.mean_abs,
+                        logit_stats.max_rel,
+                        serial_argmax_logit,
+                        serial_runner_up_logit,
+                        serial_argmax_margin,
+                    );
+                }
+                fast_replay_result.free_gpu(gpu);
+                serial_accepted_kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                kv_rows.restore_to(&mut target.kv_cache, gpu)?;
+                serial_accepted_kv_rows.free_gpu(gpu);
+                kv_rows.free_gpu(gpu);
+                gpu.debug_set_gdn_requant_frame(serial_frame_end);
                 production_result.restore_to(&mut target.dn_state, gpu)?;
             }
         }
