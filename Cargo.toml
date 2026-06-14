@@ -10,6 +10,7 @@ members = [
     "crates/hipfire-generate",
     "crates/hipfire-model",
     "crates/hipfire-prompt",
+    "crates/hipfire-rocm",
     "crates/hipfire-runtime",
     "crates/hipfire-scheduler",
     "crates/hipfire-state",

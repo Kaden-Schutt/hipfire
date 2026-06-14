@@ -1,0 +1,10 @@
+[package]
+name = "hipfire-rocm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ROCm backend contracts and evidence adapters for hipfire"
+
+[dependencies]
+hipfire-cpu = { path = "../hipfire-cpu" }
+serde_json = "1"

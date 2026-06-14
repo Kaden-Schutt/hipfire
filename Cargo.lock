@@ -625,8 +625,9 @@ name = "hipfire-arch-qwen35"
 version = "0.2.1"
 dependencies = [
  "hip-bridge",
- "hipfire-dispatch",
  "hipfire-cpu",
+ "hipfire-dispatch",
+ "hipfire-rocm",
  "hipfire-runtime",
  "libc",
  "libloading",
@@ -675,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-cpu"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
 ]
@@ -736,7 +737,7 @@ version = "0.2.1"
 
 [[package]]
 name = "hipfire-generate"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hipfire-prompt",
  "serde",
@@ -768,6 +769,14 @@ dependencies = [
  "serde",
  "serde_json",
  "twox-hash",
+]
+
+[[package]]
+name = "hipfire-rocm"
+version = "0.2.1"
+dependencies = [
+ "hipfire-cpu",
+ "serde_json",
 ]
 
 [[package]]
@@ -809,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-scheduler"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "hipfire-server"

@@ -1672,6 +1672,10 @@ fn ffn_bf16_selected_shadow<'a>(
     })
 }
 
+fn qwen35_rocm_device_identity(gpu: &Gpu) -> hipfire_rocm::RocmDeviceIdentity {
+    hipfire_rocm::rocm_device_identity(gpu.device_id, gpu.arch.clone(), gpu.integrated)
+}
+
 fn weight_gemv_swiglu_residual_bf16_probe(
     gpu: &mut Gpu,
     layer_idx: usize,
@@ -1722,8 +1726,15 @@ fn weight_gemv_swiglu_residual_bf16_probe(
         if result.is_ok() && ffn_bf16::config().trace {
             let output = ffn_bf16::dense_ffn_module_output(&invocation, None);
             let evidence_json = ffn_bf16::dense_ffn_module_output_json(&output);
+            let rocm_output = hipfire_rocm::rocm_dense_ffn_module_output(
+                &invocation,
+                qwen35_rocm_device_identity(gpu),
+                "weight_gemv_swiglu_residual",
+                None,
+            );
+            let rocm_evidence_json = hipfire_rocm::rocm_module_output_json(&rocm_output);
             eprintln!(
-                "[qwen35 ffn module] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={} evidence_json={}",
+                "[qwen35 ffn module] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={} evidence_json={} rocm_evidence_json={}",
                 output.evidence.module_id,
                 invocation.contract.preferred_backend.as_str(),
                 output.evidence.selected_backend.as_str(),
@@ -1731,6 +1742,7 @@ fn weight_gemv_swiglu_residual_bf16_probe(
                 output.evidence.fallback_reason.unwrap_or("none"),
                 output.mutates_residual,
                 evidence_json,
+                rocm_evidence_json,
             );
         }
         return result;
@@ -1774,8 +1786,15 @@ fn weight_gemv_swiglu_residual_bf16_probe(
                     let stats = ffn_bf16::diff_stats(&gpu_out, &cpu_out);
                     let output = ffn_bf16::dense_ffn_module_output(&invocation, Some(stats));
                     let evidence_json = ffn_bf16::dense_ffn_module_output_json(&output);
+                    let rocm_output = hipfire_rocm::rocm_dense_ffn_module_output(
+                        &invocation,
+                        qwen35_rocm_device_identity(gpu),
+                        "weight_gemv_swiglu_residual",
+                        Some(stats),
+                    );
+                    let rocm_evidence_json = hipfire_rocm::rocm_module_output_json(&rocm_output);
                     eprintln!(
-                        "[qwen35 ffn bf16] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} n={} max_abs={:.6e} mean_abs={:.6e} rms={:.6e} nan={} inf={} evidence_json={}",
+                        "[qwen35 ffn bf16] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} n={} max_abs={:.6e} mean_abs={:.6e} rms={:.6e} nan={} inf={} evidence_json={} rocm_evidence_json={}",
                         output.evidence.module_id,
                         invocation.contract.preferred_backend.as_str(),
                         output.evidence.selected_backend.as_str(),
@@ -1788,6 +1807,7 @@ fn weight_gemv_swiglu_residual_bf16_probe(
                         stats.n_nan,
                         stats.n_inf,
                         evidence_json,
+                        rocm_evidence_json,
                     );
                     if ffn_bf16::config().trace {
                         eprintln!(
