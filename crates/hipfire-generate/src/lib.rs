@@ -665,6 +665,56 @@ impl Qwen35PrefillBatchBackend {
     }
 }
 
+pub fn select_qwen35_prefill_batch_backend(
+    plan: GenerateBatchPrefillPlan,
+    requested: Option<&str>,
+    fused_grouped_moe_supported: Result<(), String>,
+) -> Result<Qwen35PrefillBatchBackend, String> {
+    match requested.unwrap_or("auto") {
+        "auto" | "" => match plan {
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate => {
+                Ok(Qwen35PrefillBatchBackend::FusedDense)
+            }
+            GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate => {
+                if fused_grouped_moe_supported.is_ok() {
+                    Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
+                } else {
+                    Ok(Qwen35PrefillBatchBackend::SerialReference)
+                }
+            }
+            GenerateBatchPrefillPlan::SerialExact => Ok(Qwen35PrefillBatchBackend::SerialReference),
+        },
+        "serial" | "serial_reference" => Ok(Qwen35PrefillBatchBackend::SerialReference),
+        "fused" | "fused_dense" => {
+            if plan == GenerateBatchPrefillPlan::FusedDenseQwen35Candidate {
+                Ok(Qwen35PrefillBatchBackend::FusedDense)
+            } else if plan == GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
+                fused_grouped_moe_supported?;
+                Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
+            } else {
+                Err(format!(
+                    "qwen35 fused prefill-session batch requested, but plan={} is not fused-eligible",
+                    plan.as_str()
+                ))
+            }
+        }
+        "fused_moe" | "grouped_moe" | "fused_grouped_moe" => {
+            if plan == GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
+                fused_grouped_moe_supported?;
+                Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
+            } else {
+                Err(format!(
+                    "qwen35 grouped-MoE fused prefill-session batch requested, but plan={} is not grouped-MoE eligible",
+                    plan.as_str()
+                ))
+            }
+        }
+        other => Err(format!(
+            "unsupported HIPFIRE_QWEN35_PREFILL_SESSION_BATCH={other}; expected auto, serial, fused, or fused_moe"
+        )),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Qwen35DecodeBatchBackend {
     SerialReference,
@@ -1055,6 +1105,44 @@ mod tests {
         assert!(select_qwen35_decode_batch_backend("grouped_moe", 6, 1)
             .unwrap_err()
             .contains("at least two sessions"));
+    }
+
+    #[test]
+    fn qwen35_prefill_backend_selection_matches_daemon_policy() {
+        assert_eq!(
+            select_qwen35_prefill_batch_backend(
+                GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+                None,
+                Ok(())
+            )
+            .unwrap(),
+            Qwen35PrefillBatchBackend::FusedDense
+        );
+        assert_eq!(
+            select_qwen35_prefill_batch_backend(
+                GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
+                None,
+                Err("capability missing".to_string())
+            )
+            .unwrap(),
+            Qwen35PrefillBatchBackend::SerialReference
+        );
+        assert_eq!(
+            select_qwen35_prefill_batch_backend(
+                GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
+                Some("fused"),
+                Ok(())
+            )
+            .unwrap(),
+            Qwen35PrefillBatchBackend::FusedGroupedMoe
+        );
+        assert!(select_qwen35_prefill_batch_backend(
+            GenerateBatchPrefillPlan::SerialExact,
+            Some("fused_grouped_moe"),
+            Ok(())
+        )
+        .unwrap_err()
+        .contains("grouped-MoE eligible"));
     }
 
     #[test]
