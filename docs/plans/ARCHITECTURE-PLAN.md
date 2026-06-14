@@ -48,6 +48,7 @@ Current scheduler boundary status:
 
 Current generate boundary status:
 - `hipfire-generate` owns typed generation sampling policy, text generation request/event structs, generate-batch prefill/decode envelopes, Qwen3.5 prefill/decode backend plan enums, and scheduler metadata helpers.
+- `hipfire-daemon-protocol` re-exports the generate-owned text request and token/done/error event structs for daemon JSONL generate traffic, so the protocol crate no longer owns duplicate generate contracts.
 - `hipfire-daemon` still owns concrete validation, model-specific execution, Qwen3.5 runtime orchestration, and JSONL adapter dispatch until later migration slices consume the shared contracts.
 
 Current CPU/backend boundary status:

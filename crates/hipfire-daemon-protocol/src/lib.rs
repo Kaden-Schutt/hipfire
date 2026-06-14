@@ -5,7 +5,11 @@
 //! Daemon JSONL protocol contracts.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+
+pub use hipfire_generate::{
+    DoneEvent as DoneResponse, ErrorEvent as ErrorResponse, GenerateTextRequest as GenerateRequest,
+    GenerationSamplingPolicy, TokenEvent as TokenResponse,
+};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -41,32 +45,6 @@ pub struct LoadParams {
     pub cask_sidecar: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct GenerateRequest {
-    pub id: String,
-    pub prompt: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub messages: Option<Vec<hipfire_prompt::Message>>,
-    pub temperature: f64,
-    pub max_tokens: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repeat_penalty: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_key_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_think_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonResponse {
@@ -88,37 +66,6 @@ pub struct LoadedResponse {
     pub layers: Option<u32>,
     pub vocab: Option<u32>,
     pub model_worker: Option<serde_json::Value>,
-    #[serde(default)]
-    pub response_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TokenResponse {
-    pub id: String,
-    pub text: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DoneResponse {
-    pub id: String,
-    pub tokens: u32,
-    pub tok_s: Option<f64>,
-    pub prefill_tokens: Option<u32>,
-    pub prefill_ms: Option<f64>,
-    pub prefill_tok_s: Option<f64>,
-    pub decode_tok_s: Option<f64>,
-    pub ttft_ms: Option<f64>,
-    pub finish_reason: Option<String>,
-    #[serde(default)]
-    pub response_id: Option<String>,
-    #[serde(flatten)]
-    pub extra: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ErrorResponse {
-    pub id: Option<String>,
-    pub message: String,
     #[serde(default)]
     pub response_id: Option<String>,
 }
@@ -148,10 +95,12 @@ mod tests {
                     tool_call_id: None,
                 },
             ]),
-            temperature: 0.7,
-            max_tokens: 32,
-            top_p: None,
-            repeat_penalty: None,
+            sampling: GenerationSamplingPolicy {
+                temperature: 0.7,
+                max_tokens: 32,
+                top_p: None,
+                repeat_penalty: None,
+            },
             worker_key_id: Some("worker-a".to_string()),
             tools: None,
             system: None,
@@ -193,7 +142,7 @@ mod tests {
         assert_eq!(req.id, "req-1");
         assert_eq!(req.prompt, "last user text");
         assert_eq!(req.messages.as_ref().unwrap()[0].role, Role::System);
-        assert_eq!(req.top_p, Some(0.8));
+        assert_eq!(req.sampling.top_p, Some(0.8));
         assert_eq!(req.worker_key_id.as_deref(), Some("worker-a"));
     }
 

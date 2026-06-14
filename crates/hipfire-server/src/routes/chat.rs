@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::config::HipfireConfig;
 use crate::daemon::engine::{find_daemon_bin, DaemonEngine};
-use crate::daemon::protocol::{GenerateRequest, LoadParams};
+use crate::daemon::protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
 use crate::model::discovery::find_model;
 use crate::state::SharedState;
 
@@ -173,10 +173,12 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
             id: req_id.clone(),
             prompt: last_user_prompt(&body.messages),
             messages: Some(messages_to_daemon(&body.messages)),
-            temperature: body.temperature.unwrap_or(cfg.temperature),
-            max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
-            top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
-            repeat_penalty: Some(cfg.repeat_penalty),
+            sampling: GenerationSamplingPolicy {
+                temperature: body.temperature.unwrap_or(cfg.temperature),
+                max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
+                top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
+                repeat_penalty: Some(cfg.repeat_penalty),
+            },
             worker_key_id,
             tools: body.tools,
             system: body.system,
@@ -263,10 +265,12 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                 id: req_id.clone(),
                 prompt: last_user_prompt(&body.messages),
                 messages: Some(messages_to_daemon(&body.messages)),
-                temperature: body.temperature.unwrap_or(cfg.temperature),
-                max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
-                top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
-                repeat_penalty: Some(cfg.repeat_penalty),
+                sampling: GenerationSamplingPolicy {
+                    temperature: body.temperature.unwrap_or(cfg.temperature),
+                    max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
+                    top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
+                    repeat_penalty: Some(cfg.repeat_penalty),
+                },
                 worker_key_id,
                 tools: body.tools,
                 system: body.system,
@@ -361,10 +365,12 @@ mod tests {
             id: "req".to_string(),
             prompt: last_user_prompt(&messages),
             messages: Some(messages_to_daemon(&messages)),
-            temperature: 0.3,
-            max_tokens: 16,
-            top_p: Some(0.8),
-            repeat_penalty: Some(1.0),
+            sampling: GenerationSamplingPolicy {
+                temperature: 0.3,
+                max_tokens: 16,
+                top_p: Some(0.8),
+                repeat_penalty: Some(1.0),
+            },
             worker_key_id: None,
             tools: None,
             system: None,

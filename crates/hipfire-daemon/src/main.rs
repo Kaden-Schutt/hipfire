@@ -9714,7 +9714,7 @@ fn main() {
                         .unwrap_or("Hello");
                     let max_tokens = protocol_generate
                         .as_ref()
-                        .map(|req| req.max_tokens as usize)
+                        .map(|req| req.sampling.max_tokens as usize)
                         .or_else(|| {
                             msg.get("max_tokens")
                                 .and_then(|v| v.as_u64())
@@ -9896,12 +9896,12 @@ fn main() {
                 };
                 let temp = protocol_generate
                     .as_ref()
-                    .map(|req| req.temperature)
+                    .map(|req| req.sampling.temperature)
                     .or_else(|| msg.get("temperature").and_then(|v| v.as_f64()))
                     .unwrap_or(default_temp) as f32;
                 let max_tokens = protocol_generate
                     .as_ref()
-                    .map(|req| req.max_tokens as usize)
+                    .map(|req| req.sampling.max_tokens as usize)
                     .or_else(|| {
                         msg.get("max_tokens")
                             .and_then(|v| v.as_u64())
@@ -9910,7 +9910,7 @@ fn main() {
                     .unwrap_or(512);
                 let top_p = protocol_generate
                     .as_ref()
-                    .and_then(|req| req.top_p)
+                    .and_then(|req| req.sampling.top_p)
                     .or_else(|| msg.get("top_p").and_then(|v| v.as_f64()))
                     .unwrap_or(default_top_p) as f32;
                 // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
@@ -9929,7 +9929,7 @@ fn main() {
                 let default_repeat_penalty = if m.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
                 let repeat_penalty = protocol_generate
                     .as_ref()
-                    .and_then(|req| req.repeat_penalty)
+                    .and_then(|req| req.sampling.repeat_penalty)
                     .or_else(|| msg.get("repeat_penalty").and_then(|v| v.as_f64()))
                     .unwrap_or(default_repeat_penalty) as f32;
                 // OpenAI-compatible `reasoning_effort` (also accept our custom

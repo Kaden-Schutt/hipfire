@@ -723,6 +723,7 @@ dependencies = [
 name = "hipfire-daemon-protocol"
 version = "0.2.0"
 dependencies = [
+ "hipfire-generate",
  "hipfire-prompt",
  "serde",
  "serde_json",

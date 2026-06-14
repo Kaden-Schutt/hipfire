@@ -278,6 +278,7 @@ pub fn find_daemon_bin() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_daemon_protocol::GenerationSamplingPolicy;
     use std::collections::VecDeque;
 
     struct MockTransport {
@@ -380,10 +381,12 @@ mod tests {
             id: "req-1".to_string(),
             prompt: "hello".to_string(),
             messages: None,
-            temperature: 0.7,
-            max_tokens: 8,
-            top_p: None,
-            repeat_penalty: None,
+            sampling: GenerationSamplingPolicy {
+                temperature: 0.7,
+                max_tokens: 8,
+                top_p: None,
+                repeat_penalty: None,
+            },
             worker_key_id: Some("worker-a".to_string()),
             tools: None,
             system: None,
