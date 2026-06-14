@@ -4,6 +4,7 @@
 
 //! Shared model artifact identity helpers and model-source contracts.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Extension preferred order for fuzzy model discovery.
@@ -142,6 +143,35 @@ pub fn model_display_name(path: &Path) -> String {
         .to_string()
 }
 
+/// Shared typed contract for loading a model into a runtime worker.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ModelLoadRequest {
+    pub model: String,
+    pub params: ModelLoadParams,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+/// Common load parameters shared by daemon protocol clients and future direct
+/// library adapters. Daemon-only tuning fields remain in the daemon raw JSON
+/// path until they have stable library ownership.
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct ModelLoadParams {
+    pub max_seq: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_cap: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flash_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dflash_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cask_sidecar: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +226,33 @@ mod tests {
             detect_model_artifact_format(Path::new("model.bin")),
             ModelArtifactFormat::Unknown
         );
+    }
+
+    #[test]
+    fn model_load_request_serializes_common_daemon_wire_shape() {
+        let req = ModelLoadRequest {
+            model: "model.hfq".to_string(),
+            params: ModelLoadParams {
+                max_seq: 4096,
+                physical_cap: Some(2048),
+                kv_cache: Some("asym3".to_string()),
+                flash_mode: None,
+                dflash_mode: Some("off".to_string()),
+                draft: Some("draft.hfq".to_string()),
+                cask_sidecar: Some("model.triattn.hfq".to_string()),
+            },
+            request_id: Some("load-1".to_string()),
+        };
+
+        let value = serde_json::to_value(req).unwrap();
+        assert_eq!(value["model"], "model.hfq");
+        assert_eq!(value["params"]["max_seq"], 4096);
+        assert_eq!(value["params"]["physical_cap"], 2048);
+        assert_eq!(value["params"]["kv_cache"], "asym3");
+        assert_eq!(value["params"]["dflash_mode"], "off");
+        assert_eq!(value["params"]["draft"], "draft.hfq");
+        assert_eq!(value["params"]["cask_sidecar"], "model.triattn.hfq");
+        assert!(value["params"].get("flash_mode").is_none());
+        assert_eq!(value["request_id"], "load-1");
     }
 }

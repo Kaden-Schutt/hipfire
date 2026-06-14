@@ -10,6 +10,7 @@ pub use hipfire_generate::{
     DoneEvent as DoneResponse, ErrorEvent as ErrorResponse, GenerateTextRequest as GenerateRequest,
     GenerationSamplingPolicy, TokenEvent as TokenResponse,
 };
+pub use hipfire_model::{ModelLoadParams as LoadParams, ModelLoadRequest as LoadRequest};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -18,31 +19,6 @@ pub enum DaemonRequest {
     Unload,
     Ping,
     Generate(GenerateRequest),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct LoadRequest {
-    pub model: String,
-    pub params: LoadParams,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Default)]
-pub struct LoadParams {
-    pub max_seq: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub physical_cap: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kv_cache: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub flash_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dflash_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub draft: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cask_sidecar: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-daemon-adapter"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -721,9 +721,10 @@ dependencies = [
 
 [[package]]
 name = "hipfire-daemon-protocol"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hipfire-generate",
+ "hipfire-model",
  "hipfire-prompt",
  "serde",
  "serde_json",
@@ -772,6 +773,10 @@ dependencies = [
 [[package]]
 name = "hipfire-model"
 version = "0.2.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "hipfire-prompt"
