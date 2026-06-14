@@ -20,14 +20,14 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
-    admission_metric_is_quality, directory_hash, evidence_artifact_index_entry_from_value_json,
-    evidence_artifact_index_entry_json, evidence_metric_direction, evidence_record_json,
-    extract_external_evidence_records_json, file_hash, list_files, model_hash, read_hfq_metadata,
-    required_admission_evidence_requirements, run_metadata_artifact_json, run_provenance_json,
-    stable_hash_bytes, stable_hash_file_fallback, standard_evidence_paths_in_dir,
-    EvidenceArtifactIndexContext, EvidenceRecord, RunMetadataArtifact, RunMetadataConfig,
-    RunMetadataModels, RunProvenance, OBSERVED_ADMISSION_EVIDENCE_KINDS,
-    STANDARD_EVIDENCE_ARTIFACT_SPECS,
+    admission_metric_is_quality, admission_verdict_policy, directory_hash,
+    evidence_artifact_index_entry_from_value_json, evidence_artifact_index_entry_json,
+    evidence_metric_direction, evidence_record_json, extract_external_evidence_records_json,
+    file_hash, list_files, model_hash, read_hfq_metadata, required_admission_evidence_requirements,
+    run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
+    standard_evidence_paths_in_dir, EvidenceArtifactIndexContext, EvidenceRecord,
+    RunMetadataArtifact, RunMetadataConfig, RunMetadataModels, RunProvenance,
+    OBSERVED_ADMISSION_EVIDENCE_KINDS, STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
 use hipfire_model::{discover_dflash_draft_for_model, model_artifact_stem};
 
@@ -4405,31 +4405,26 @@ fn build_admission_artifact(
     }
     let has_reject = findings.iter().any(|f| f.severity == "reject");
     let has_review = findings.iter().any(|f| f.severity == "review");
-    let (status, verdict, reason) = if has_reject {
-        (
-            EvalStatus::Fail,
-            "reject",
-            Some("quality or correctness regression detected"),
-        )
-    } else if has_review {
-        (
-            EvalStatus::Pass,
-            "review",
-            Some("performance regression detected; quality evidence did not reject"),
-        )
-    } else {
-        (EvalStatus::Pass, "promote", None)
-    };
+    let verdict_policy = admission_verdict_policy(has_reject, has_review);
 
     AdmissionArtifact {
         schema: 1,
         provenance: run_provenance(ctx),
-        status,
-        verdict: verdict.to_string(),
-        reason: reason.map(str::to_string),
+        status: eval_status_from_artifact_status(verdict_policy.status),
+        verdict: verdict_policy.verdict.to_string(),
+        reason: verdict_policy.reason.map(str::to_string),
         required_evidence,
         observed_evidence,
         findings,
+    }
+}
+
+fn eval_status_from_artifact_status(status: &str) -> EvalStatus {
+    match status {
+        "pass" => EvalStatus::Pass,
+        "fail" => EvalStatus::Fail,
+        "skip" => EvalStatus::Skip,
+        _ => EvalStatus::Skip,
     }
 }
 

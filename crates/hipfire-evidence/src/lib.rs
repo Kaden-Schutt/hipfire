@@ -117,6 +117,13 @@ pub struct AdmissionEvidenceRequirement {
     pub batteries: Vec<&'static str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionVerdictPolicy {
+    pub status: &'static str,
+    pub verdict: &'static str,
+    pub reason: Option<&'static str>,
+}
+
 pub const OBSERVED_ADMISSION_EVIDENCE_KINDS: &[&str] = &[
     "phase_timings",
     "launch_counts",
@@ -424,6 +431,28 @@ pub fn required_admission_evidence_requirements(
         });
     }
     required
+}
+
+pub fn admission_verdict_policy(has_reject: bool, has_review: bool) -> AdmissionVerdictPolicy {
+    if has_reject {
+        AdmissionVerdictPolicy {
+            status: "fail",
+            verdict: "reject",
+            reason: Some("quality or correctness regression detected"),
+        }
+    } else if has_review {
+        AdmissionVerdictPolicy {
+            status: "pass",
+            verdict: "review",
+            reason: Some("performance regression detected; quality evidence did not reject"),
+        }
+    } else {
+        AdmissionVerdictPolicy {
+            status: "pass",
+            verdict: "promote",
+            reason: None,
+        }
+    }
 }
 
 pub fn extract_external_evidence_records_json(
@@ -902,6 +931,35 @@ mod tests {
                 "profiling",
             ]
         );
+    }
+
+    #[test]
+    fn admission_verdict_policy_preserves_eval_outcomes() {
+        assert_eq!(
+            admission_verdict_policy(true, false),
+            AdmissionVerdictPolicy {
+                status: "fail",
+                verdict: "reject",
+                reason: Some("quality or correctness regression detected"),
+            }
+        );
+        assert_eq!(
+            admission_verdict_policy(false, true),
+            AdmissionVerdictPolicy {
+                status: "pass",
+                verdict: "review",
+                reason: Some("performance regression detected; quality evidence did not reject"),
+            }
+        );
+        assert_eq!(
+            admission_verdict_policy(false, false),
+            AdmissionVerdictPolicy {
+                status: "pass",
+                verdict: "promote",
+                reason: None,
+            }
+        );
+        assert_eq!(admission_verdict_policy(true, true).verdict, "reject");
     }
 
     #[test]
