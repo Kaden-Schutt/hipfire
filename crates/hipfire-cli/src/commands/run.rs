@@ -4,6 +4,7 @@ use clap::Args;
 use hipfire_daemon_adapter::{find_daemon_bin, DaemonEngine};
 use hipfire_daemon_protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
 use hipfire_server::HipfireConfig;
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::find_model;
@@ -32,6 +33,22 @@ fn load_params_from_config(config: &HipfireConfig) -> LoadParams {
     )
 }
 
+fn generate_request_from_prompt(
+    id: String,
+    prompt: &str,
+    sampling: GenerationSamplingPolicy,
+    worker_key_id: Option<String>,
+) -> GenerateRequest {
+    let prompt = Value::String(prompt.to_string());
+    let mut request = GenerateRequest::from_openai_chat_messages(
+        id,
+        std::iter::once(("user", Some(&prompt))),
+        sampling,
+    );
+    request.worker_key_id = worker_key_id;
+    request
+}
+
 pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
     let model_path = find_model(&args.model)
         .ok_or_else(|| anyhow::anyhow!("model not found: {}", args.model))?;
@@ -52,28 +69,17 @@ pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
         )
         .await?;
 
-    let prompt = format!(
-        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-        args.prompt
-    );
-
-    let gen_req = GenerateRequest {
-        id: Uuid::new_v4().to_string(),
-        prompt,
-        messages: None,
-        sampling: GenerationSamplingPolicy {
+    let gen_req = generate_request_from_prompt(
+        Uuid::new_v4().to_string(),
+        &args.prompt,
+        GenerationSamplingPolicy {
             temperature: args.temperature.unwrap_or(config.temperature),
             max_tokens: args.max_tokens.unwrap_or(config.max_tokens),
             top_p: Some(config.top_p),
             repeat_penalty: Some(config.repeat_penalty),
         },
-        worker_key_id: engine.worker_key_id.clone(),
-        tools: None,
-        system: None,
-        thinking: None,
-        max_think_tokens: None,
-        request_id: None,
-    };
+        engine.worker_key_id.clone(),
+    );
 
     let done = engine
         .generate_streaming(gen_req, |token| {
@@ -136,5 +142,23 @@ mod tests {
         assert_eq!(params.flash_mode, None);
         assert_eq!(params.dflash_mode, None);
         assert_eq!(params.cask_sidecar, None);
+    }
+
+    #[test]
+    fn generate_request_from_prompt_preserves_structured_boundary() {
+        let req = generate_request_from_prompt(
+            "req-1".to_string(),
+            "hello",
+            GenerationSamplingPolicy::greedy(8),
+            Some("worker-a".to_string()),
+        );
+
+        assert_eq!(req.prompt, "hello");
+        assert!(!req.prompt.contains("<|im_start|>"));
+        assert_eq!(req.worker_key_id.as_deref(), Some("worker-a"));
+        let messages = req.messages.as_ref().expect("structured messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(serde_json::to_value(&messages[0]).unwrap()["role"], "user");
+        assert_eq!(messages[0].content, "hello");
     }
 }
