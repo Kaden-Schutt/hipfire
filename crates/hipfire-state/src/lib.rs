@@ -204,6 +204,12 @@ pub struct SequenceStateReleaseRequest {
     pub handles: Vec<ParsedSequenceStateHandle>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateReleaseSessionsRequest {
+    pub worker_id: String,
+    pub sessions: Vec<String>,
+}
+
 pub fn validate_checkpoint_source_resident(
     source_session_id: &str,
     resident: bool,
@@ -855,6 +861,23 @@ pub fn parse_release_sequence_state_request(
     }
 }
 
+pub fn parse_release_sessions_request(
+    msg: &serde_json::Value,
+    worker_id: &str,
+) -> Result<SequenceStateReleaseSessionsRequest, String> {
+    let sessions = msg
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "release_sessions.sessions must be an array of session ids".to_string())?
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    Ok(SequenceStateReleaseSessionsRequest {
+        worker_id: worker_id.to_string(),
+        sessions,
+    })
+}
+
 pub fn generic_state_reservation_descriptors(
     worker_id: &str,
     handle: &SequenceStateHandle,
@@ -1142,6 +1165,38 @@ mod tests {
             "type": "release_state"
         }));
         assert!(empty.handles.is_empty());
+    }
+
+    #[test]
+    fn parse_release_sessions_request_preserves_filtered_session_list() {
+        let request = parse_release_sessions_request(
+            &serde_json::json!({
+                "type": "release_sessions",
+                "sessions": ["session-a", 7, "session-b", null]
+            }),
+            "worker-a",
+        )
+        .unwrap();
+        assert_eq!(request.worker_id, "worker-a");
+        assert_eq!(
+            request.sessions,
+            vec!["session-a".to_string(), "session-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_release_sessions_request_reports_existing_missing_sessions_error() {
+        let err = parse_release_sessions_request(
+            &serde_json::json!({
+                "type": "release_sessions"
+            }),
+            "worker-a",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "release_sessions.sessions must be an array of session ids"
+        );
     }
 
     #[test]
