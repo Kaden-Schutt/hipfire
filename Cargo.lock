@@ -687,6 +687,7 @@ dependencies = [
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
  "hipfire-runtime",
+ "hipfire-state",
  "libc",
  "rdna-compute",
  "serde_json",
@@ -727,7 +728,7 @@ version = "0.2.1"
 
 [[package]]
 name = "hipfire-model"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "hipfire-prompt"
@@ -809,6 +810,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "hipfire-state"
+version = "0.2.1"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
