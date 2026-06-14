@@ -50,6 +50,26 @@ pub struct GenerateTextRequest {
     pub request_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageSource<'a> {
+    Path(&'a str),
+    Base64(&'a str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GenerateVLParams<'a> {
+    pub id: &'a str,
+    pub prompt: &'a str,
+    pub system_prompt: Option<&'a str>,
+    pub image_source: ImageSource<'a>,
+    pub temp: f32,
+    pub top_p: f32,
+    pub max_tokens: usize,
+    pub repeat_penalty: f32,
+    pub repeat_window: usize,
+    pub max_think_tokens: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GenerationEvent {
