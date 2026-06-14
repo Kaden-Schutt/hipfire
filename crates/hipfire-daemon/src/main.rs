@@ -11849,16 +11849,31 @@ fn hfq_has_bf16_weights(hfq: &HfqFile) -> bool {
     hfq.tensors().iter().any(|t| t.quant_type == 16)
 }
 
-fn warn_tiny_model_state(hfq: &HfqFile, q: hipfire_arch_qwen35::qwen35::StateQuant) {
+// Auto-upgrade DeltaNet state to FP32 for small models when the caller has
+// not made an explicit non-default choice. Q8/Q4 state accumulates quality
+// drift on long outputs in sub-2B models; FP32 is stable.
+// An explicit override (state_quant="q8" or "q4" in the JSON params) is
+// honoured as-is so operators can still force lower precision if desired.
+fn resolve_tiny_model_state(
+    hfq: &HfqFile,
+    override_str: Option<&str>,
+    q: hipfire_arch_qwen35::qwen35::StateQuant,
+) -> hipfire_arch_qwen35::qwen35::StateQuant {
     use hipfire_arch_qwen35::qwen35::StateQuant;
     const TINY_MODEL_PARAMS: u128 = 2_000_000_000;
+    // "Explicit" means the caller passed a non-default token; system default
+    // tokens (None, "", "auto", "q8", "int8") all count as unspecified.
+    let explicit = matches!(override_str,
+        Some(s) if !matches!(s.to_ascii_lowercase().as_str(), "" | "auto" | "q8" | "int8"));
     let params = hfq_parameter_count(hfq);
-    if params < TINY_MODEL_PARAMS && q != StateQuant::FP32 {
+    if params < TINY_MODEL_PARAMS && !explicit && q != StateQuant::FP32 {
         eprintln!(
-            "  warning: model has ~{:.2}B params; FP32 DeltaNet state is recommended below 2B for long-generation coherence (current: {})",
+            "  DeltaNet state: auto-upgraded to FP32 ({:.2}B params — FP32 required below 2B for stable long generation; pass state_quant=q8 to override)",
             params as f64 / 1.0e9,
-            state_quant_label(q)
         );
+        StateQuant::FP32
+    } else {
+        q
     }
 }
 
@@ -12753,10 +12768,10 @@ fn load_model(
         let dn_quant = if is_bf16_artifact {
             hipfire_arch_qwen35::qwen35::StateQuant::FP32
         } else {
-            parse_state_quant(state_quant_override)?
+            let parsed = parse_state_quant(state_quant_override)?;
+            resolve_tiny_model_state(&hfq, state_quant_override, parsed)
         };
         eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
-        warn_tiny_model_state(&hfq, dn_quant);
         let dn =
             DeltaNetState::new_with_quant(gpu, &config, dn_quant).map_err(|e| format!("{e}"))?;
         // Flash partials size with physical_cap (bounds the max_tiles the
@@ -13480,10 +13495,10 @@ fn load_model_pp(
     let dn_quant = if is_bf16_artifact {
         hipfire_arch_qwen35::qwen35::StateQuant::FP32
     } else {
-        parse_state_quant(state_quant_override)?
+        let parsed = parse_state_quant(state_quant_override)?;
+        resolve_tiny_model_state(&hfq, state_quant_override, parsed)
     };
     eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
-    warn_tiny_model_state(&hfq, dn_quant);
     let (dn, la_to_device) = DeltaNetState::new_with_quant_multi(&mut gpus, &config, dn_quant)
         .map_err(|e| format!("{e}"))?;
 
