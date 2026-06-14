@@ -5,6 +5,9 @@
 //! Typed generation request, event, and batch-plan contracts.
 
 use hipfire_model::{is_qwen35_dense_arch_id, is_qwen35_moe_arch_id, ARCH_ID_QWEN35_MOE};
+use hipfire_prompt::{
+    openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message,
+};
 pub use hipfire_state::SequenceStatePrefixHash as GenerateBatchPrefillPrefixHash;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -35,7 +38,7 @@ pub struct GenerateTextRequest {
     pub id: String,
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub messages: Option<Vec<hipfire_prompt::Message>>,
+    pub messages: Option<Vec<Message>>,
     #[serde(flatten)]
     pub sampling: GenerationSamplingPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,6 +53,33 @@ pub struct GenerateTextRequest {
     pub max_think_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+}
+
+impl GenerateTextRequest {
+    pub fn from_openai_chat_messages<'a, I>(
+        id: String,
+        messages: I,
+        sampling: GenerationSamplingPolicy,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, Option<&'a serde_json::Value>)>,
+    {
+        let messages = messages.into_iter().collect::<Vec<_>>();
+        Self {
+            id,
+            prompt: openai_chat_last_user_prompt(messages.iter().copied()),
+            messages: Some(openai_chat_messages_to_prompt_messages(
+                messages.iter().copied(),
+            )),
+            sampling,
+            worker_key_id: None,
+            tools: None,
+            system: None,
+            thinking: None,
+            max_think_tokens: None,
+            request_id: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1234,6 +1264,48 @@ mod tests {
                 prefix_hash: None,
             },
         }
+    }
+
+    #[test]
+    fn openai_chat_generate_request_preserves_structured_prompt_boundary() {
+        let system = serde_json::Value::String("be brief".to_string());
+        let first = serde_json::Value::String("first".to_string());
+        let answer = serde_json::Value::String("ok".to_string());
+        let second = serde_json::json!({"type": "text", "text": "second"});
+        let request = GenerateTextRequest::from_openai_chat_messages(
+            "req-1".to_string(),
+            [
+                ("system", Some(&system)),
+                ("user", Some(&first)),
+                ("assistant", Some(&answer)),
+                ("user", Some(&second)),
+            ],
+            GenerationSamplingPolicy {
+                temperature: 0.3,
+                max_tokens: 16,
+                top_p: Some(0.8),
+                repeat_penalty: Some(1.0),
+            },
+        );
+
+        assert_eq!(request.id, "req-1");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&request.prompt)
+                .expect("structured fallback prompt json"),
+            serde_json::json!({"type": "text", "text": "second"})
+        );
+        assert!(!request.prompt.contains("<|im_start|>"));
+        let messages = request.messages.as_ref().unwrap();
+        assert_eq!(messages[0].role, hipfire_prompt::Role::System);
+        assert_eq!(messages[0].content, "be brief");
+        assert_eq!(messages[1].role, hipfire_prompt::Role::User);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&messages[3].content)
+                .expect("structured message json"),
+            serde_json::json!({"type": "text", "text": "second"})
+        );
+        assert_eq!(request.sampling.max_tokens, 16);
+        assert!(request.worker_key_id.is_none());
     }
 
     #[test]
