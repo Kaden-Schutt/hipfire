@@ -48,7 +48,7 @@ use hipfire_generate::{
     validate_prefix_hash_preflight, GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession,
     GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan, GenerateBatchPrefillPrefixHash,
     GenerateBatchPrefillSession, PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope,
-    Qwen35DecodeBatchBackend, Qwen35PrefillBatchBackend,
+    Qwen35DecodeBatchBackend, Qwen35PrefillBatchBackend, Qwen35SemanticBoundaryCheckpoint,
 };
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -3686,15 +3686,6 @@ struct Qwen35PreparedPrefillSession {
     assistant_prefix: String,
     max_think_tokens: usize,
     boundary_checkpoints: Vec<Qwen35SemanticBoundaryCheckpoint>,
-}
-
-#[derive(Clone, Debug)]
-struct Qwen35SemanticBoundaryCheckpoint {
-    checkpoint_id: Option<String>,
-    prefix_len: usize,
-    hash: GenerateBatchPrefillPrefixHash,
-    boundary: String,
-    boundary_index: usize,
 }
 
 struct Qwen35PrefillSessionResult {
