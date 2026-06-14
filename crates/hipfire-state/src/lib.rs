@@ -210,6 +210,11 @@ pub struct SequenceStateReleaseSessionsRequest {
     pub sessions: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateUnloadWorkerRequest {
+    pub worker_id: String,
+}
+
 pub fn validate_checkpoint_source_resident(
     source_session_id: &str,
     resident: bool,
@@ -878,6 +883,20 @@ pub fn parse_release_sessions_request(
     })
 }
 
+pub fn parse_unload_worker_request(
+    msg: &serde_json::Value,
+    default_worker_id: &str,
+) -> SequenceStateUnloadWorkerRequest {
+    let worker_id = msg
+        .get("worker_id")
+        .or_else(|| msg.get("worker_key_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_worker_id)
+        .to_string();
+    SequenceStateUnloadWorkerRequest { worker_id }
+}
+
 pub fn generic_state_reservation_descriptors(
     worker_id: &str,
     handle: &SequenceStateHandle,
@@ -1197,6 +1216,48 @@ mod tests {
             err,
             "release_sessions.sessions must be an array of session ids"
         );
+    }
+
+    #[test]
+    fn parse_unload_worker_request_accepts_worker_aliases() {
+        let worker_id = parse_unload_worker_request(
+            &serde_json::json!({
+                "type": "unload_worker",
+                "worker_id": "worker-a",
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_id.worker_id, "worker-a");
+
+        let worker_key_id = parse_unload_worker_request(
+            &serde_json::json!({
+                "type": "unload_worker",
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_key_id.worker_id, "worker-b");
+    }
+
+    #[test]
+    fn parse_unload_worker_request_falls_back_to_default_worker() {
+        let missing = parse_unload_worker_request(
+            &serde_json::json!({
+                "type": "unload_worker"
+            }),
+            "__default__",
+        );
+        assert_eq!(missing.worker_id, "__default__");
+
+        let empty = parse_unload_worker_request(
+            &serde_json::json!({
+                "type": "unload_worker",
+                "worker_id": ""
+            }),
+            "__default__",
+        );
+        assert_eq!(empty.worker_id, "__default__");
     }
 
     #[test]

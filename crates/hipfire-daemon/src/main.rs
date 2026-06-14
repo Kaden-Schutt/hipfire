@@ -71,11 +71,12 @@ use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
     model_worker_runtime_view_json, parse_describe_sequence_state_request,
     parse_release_sequence_state_request, parse_release_sessions_request,
-    parse_reserve_session_state_request, parsed_handle_may_target_generic,
-    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
-    release_sessions_done_json, release_state_done_json, reserve_session_state_done_json,
-    reserve_session_state_rejected_json, session_state_reservation_describe_json,
-    unload_worker_done_json, validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
+    parse_reserve_session_state_request, parse_unload_worker_request,
+    parsed_handle_may_target_generic, parsed_handle_may_target_loaded_state,
+    qwen35_sequence_state_handle, release_sessions_done_json, release_state_done_json,
+    reserve_session_state_done_json, reserve_session_state_rejected_json,
+    session_state_reservation_describe_json, unload_worker_done_json,
+    validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
     validate_checkpoint_source_resident, DescribedSequenceState, GenericSequenceStateArena,
     ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
     ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
@@ -9301,7 +9302,8 @@ fn main() {
                     .get("id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unload_worker");
-                let worker_id = message_worker_id(&msg);
+                let request = parse_unload_worker_request(&msg, DEFAULT_MODEL_WORKER_ID);
+                let worker_id = request.worker_id;
                 let mut unloaded = false;
                 generic_state_arena.release_worker(&worker_id);
                 if worker_id == active_worker_id {
