@@ -13,10 +13,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::config::HipfireConfig;
-use crate::daemon::engine::{find_daemon_bin, DaemonEngine};
-use crate::daemon::protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
 use crate::model::discovery::find_model;
 use crate::state::SharedState;
+use hipfire_daemon_adapter::{find_daemon_bin, DaemonEngine};
+use hipfire_daemon_protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
