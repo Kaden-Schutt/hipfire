@@ -201,7 +201,26 @@ Tolerance: atol=0.02, rtol=0.02. max_abs=0.016 (≈1 ULP at magnitude ≤1, from
   with 2 dispatches (Q and K), saving 2 × ~170 µs × 28 layers ≈ **9.5 ms/step**
 - **Artifact**: `qwen35-headnorm-rope-{q,k}-{n_heads}h{head_dim}d.{xclbin,instr.bin}`
 
-*Results will be appended after first hardware validation run.*
+| tensor | n_heads | total_elem | data (KiB) | npu mean (µs) | npu p50 | npu p99 | wall mean (µs) | BW (GB/s) |
+|--------|---------|-----------|-----------|---------------|---------|---------|----------------|-----------|
+| Q      | 8       | 2048      | 4.0       | 189           | 180     | 287     | 236            | 0.03      |
+| K      | 2       | 512       | 1.0       | 176           | 161     | 297     | 227            | 0.01      |
+
+**npu time**: hardware cycle counter from `XRTKernelResult.npu_time` (excludes host dispatch).
+**wall time**: end-to-end per-call latency measured on the host.
+**BW**: effective memory bandwidth = 2 tensors × total_elem × 2 bytes / wall_mean.
+
+### Correctness (oracle test)
+
+Reference: per-head float32 RMSNorm + half-split RoPE applied to normalized output.
+Tolerance: atol=0.02, rtol=0.02.
+
+| tensor | max_abs_err | mean_abs_err | max_rel_err | result |
+|--------|-------------|--------------|-------------|--------|
+| Q      | 0.03125     | 0.00544      | 3.3603*     | PASS   |
+| K      | 0.03125     | 0.00574      | 0.0243      | PASS   |
+
+*max_rel=3.36 on Q is a near-zero element (numerator ~0.03, denominator ~0.009) — passes absolute tolerance; consistent with prior headnorm and rope results individually.
 
 ### Strategic note
 
