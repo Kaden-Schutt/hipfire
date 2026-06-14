@@ -496,6 +496,21 @@ pub fn release_sessions_done_json(
     done
 }
 
+pub fn unload_worker_done_json(
+    id: &str,
+    worker_id: &str,
+    unloaded: bool,
+    resident_workers: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "unload_worker_done",
+        "id": id,
+        "worker_key_id": worker_id,
+        "unloaded": unloaded,
+        "resident_workers": resident_workers,
+    })
+}
+
 impl GenericSequenceStateArena {
     pub fn new() -> Self {
         Self {
@@ -1091,6 +1106,16 @@ mod tests {
             "qwen35_wrapped"
         );
         assert_eq!(json["model_worker"]["runtime_state_bytes"], 70);
+    }
+
+    #[test]
+    fn unload_worker_done_json_preserves_daemon_wire_shape() {
+        let json = unload_worker_done_json("unload-1", "worker:arch6:pp1:q8", true, 2);
+        assert_eq!(json["type"], "unload_worker_done");
+        assert_eq!(json["id"], "unload-1");
+        assert_eq!(json["worker_key_id"], "worker:arch6:pp1:q8");
+        assert_eq!(json["unloaded"], true);
+        assert_eq!(json["resident_workers"], 2);
     }
 
     #[test]

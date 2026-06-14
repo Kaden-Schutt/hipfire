@@ -74,10 +74,10 @@ use hipfire_state::{
     parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
     release_sessions_done_json, release_state_done_json, reserve_session_state_done_json,
     reserve_session_state_rejected_json, session_state_reservation_describe_json,
-    DescribedSequenceState, GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId,
-    ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
-    ReleaseStateResponseKind, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
-    SequenceStatePageDescriptor, SequenceStatePageKind,
+    unload_worker_done_json, DescribedSequenceState, GenericSequenceStateArena,
+    ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
+    ParsedSequenceStateHandle, ReleaseStateResponseKind, SequenceStateArenaBackend,
+    SequenceStateCheckpointRequest, SequenceStatePageDescriptor, SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -9363,13 +9363,12 @@ fn main() {
                     unload_model(m, &mut gpu);
                     unloaded = true;
                 }
-                let done = serde_json::json!({
-                    "type": "unload_worker_done",
-                    "id": id,
-                    "worker_key_id": worker_id,
-                    "unloaded": unloaded,
-                    "resident_workers": resident_models.len() + usize::from(model.is_some()),
-                });
+                let done = unload_worker_done_json(
+                    id,
+                    &worker_id,
+                    unloaded,
+                    resident_models.len() + usize::from(model.is_some()),
+                );
                 let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
             }
