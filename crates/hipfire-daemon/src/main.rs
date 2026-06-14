@@ -40,14 +40,14 @@ use hipfire_arch_qwen35::speculative::{
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_generate::{
-    plan_generate_batch_prefill_qwen35, qwen35_decode_batch_requested_auto,
-    qwen35_decode_batch_scheduler_metadata, qwen35_grouped_moe_decode_auto_latency_gate_passed,
-    select_qwen35_decode_batch_backend, select_qwen35_prefill_batch_backend,
-    validate_generate_batch_decode, validate_generate_batch_prefill,
-    validate_prefix_hash_preflight, GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession,
-    GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan, GenerateBatchPrefillPrefixHash,
-    GenerateBatchPrefillSession, PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope,
-    Qwen35DecodeBatchBackend, Qwen35PrefillBatchBackend,
+    compute_qwen35_prefix_hash, generate_prefix_hash_json, plan_generate_batch_prefill_qwen35,
+    qwen35_decode_batch_requested_auto, qwen35_decode_batch_scheduler_metadata,
+    qwen35_grouped_moe_decode_auto_latency_gate_passed, select_qwen35_decode_batch_backend,
+    select_qwen35_prefill_batch_backend, validate_generate_batch_decode,
+    validate_generate_batch_prefill, validate_prefix_hash_preflight, GenerateBatchDecodeEnvelope,
+    GenerateBatchDecodeSession, GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan,
+    GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession, PrefixHashPreflightCandidate,
+    PrefixHashPreflightEnvelope, Qwen35DecodeBatchBackend, Qwen35PrefillBatchBackend,
 };
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -1288,14 +1288,6 @@ fn parse_assistant_prefix_label(
         "closed_think" => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
         _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
     }
-}
-
-fn generate_prefix_hash_json(hash: &GenerateBatchPrefillPrefixHash) -> serde_json::Value {
-    serde_json::json!({
-        "algorithm": hash.algorithm,
-        "value": hash.value,
-        "prefix_len": hash.prefix_len,
-    })
 }
 
 fn emit_generate_batch_prefill_ready(
@@ -5224,48 +5216,6 @@ fn emit_qwen35_prefill_checkpoint(
         },
     )?;
     Ok(checkpoint_id)
-}
-
-fn push_hash_field(buf: &mut Vec<u8>, label: &str, value: &str) {
-    buf.extend_from_slice(label.as_bytes());
-    buf.push(b'=');
-    buf.extend_from_slice(value.as_bytes());
-    buf.push(0);
-}
-
-fn compute_qwen35_prefix_hash(
-    arch_id: u32,
-    kv_mode: Option<&str>,
-    state_kinds: &[String],
-    assistant_prefix: &str,
-    max_think_tokens: usize,
-    tokens: &[u32],
-) -> GenerateBatchPrefillPrefixHash {
-    let mut buf = Vec::with_capacity(128 + tokens.len() * 4);
-    push_hash_field(
-        &mut buf,
-        "domain",
-        "hipfire.generate_batch_prefill.prefix.v1",
-    );
-    push_hash_field(&mut buf, "algorithm", "xxh128");
-    push_hash_field(&mut buf, "arch_id", &arch_id.to_string());
-    push_hash_field(&mut buf, "kv_mode", kv_mode.unwrap_or("unknown"));
-    push_hash_field(&mut buf, "assistant_prefix", assistant_prefix);
-    push_hash_field(&mut buf, "max_think_tokens", &max_think_tokens.to_string());
-    let mut normalized_kinds = state_kinds.to_vec();
-    normalized_kinds.sort();
-    normalized_kinds.dedup();
-    push_hash_field(&mut buf, "state_kinds", &normalized_kinds.join("+"));
-    push_hash_field(&mut buf, "token_encoding", "u32le");
-    for token in tokens {
-        buf.extend_from_slice(&token.to_le_bytes());
-    }
-    let value = twox_hash::XxHash3_128::oneshot(&buf);
-    GenerateBatchPrefillPrefixHash {
-        algorithm: "xxh128".to_string(),
-        value: format!("{value:032x}"),
-        prefix_len: tokens.len(),
-    }
 }
 
 fn qwen35_prefill_active_session(
