@@ -6,20 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
-use std::time::UNIX_EPOCH;
 
+pub use hipfire_model::HfqMetadata;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HfqMetadata {
-    pub arch_id: u32,
-    pub metadata_json: String,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvidenceArtifactSpec {
@@ -705,19 +698,7 @@ pub fn file_hash(path: &Path) -> Option<String> {
 }
 
 pub fn model_hash(model: &str) -> Option<String> {
-    static CACHE: OnceLock<Mutex<BTreeMap<String, Option<String>>>> = OnceLock::new();
-    let key = model_hash_cache_key(model);
-    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    if let Ok(cache) = cache.lock() {
-        if let Some(hash) = cache.get(&key) {
-            return hash.clone();
-        }
-    }
-    let hash = model_hash_uncached(model);
-    if let Ok(mut cache) = cache.lock() {
-        cache.insert(key, hash.clone());
-    }
-    hash
+    hipfire_model::model_hash(model)
 }
 
 pub fn stable_hash_file_fallback(path: &Path) -> String {
@@ -758,64 +739,7 @@ pub fn directory_hash(path: &Path) -> Option<String> {
 }
 
 pub fn read_hfq_metadata(path: &Path) -> Result<HfqMetadata, String> {
-    let mut f = File::open(path).map_err(|e| format!("open model: {e}"))?;
-    let mut header = [0u8; 32];
-    f.read_exact(&mut header)
-        .map_err(|e| format!("read HFQ header: {e}"))?;
-    if &header[0..4] != b"HFQM" {
-        return Err("not an HFQ container".to_string());
-    }
-    let arch_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
-    let metadata_offset = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
-    let data_offset = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
-    let span_len = data_offset.saturating_sub(metadata_offset);
-    if span_len == 0 || span_len > 256 * 1024 * 1024 {
-        return Err(format!(
-            "invalid or too-large metadata span: {metadata_offset}..{data_offset}"
-        ));
-    }
-    f.seek(SeekFrom::Start(metadata_offset as u64))
-        .map_err(|e| format!("seek HFQ metadata span: {e}"))?;
-    let mut span = vec![0u8; span_len];
-    f.read_exact(&mut span)
-        .map_err(|e| format!("read HFQ metadata span: {e}"))?;
-    let json_end = find_json_object_end(&span)
-        .ok_or_else(|| "HFQ metadata JSON object was not terminated".to_string())?;
-    let metadata_json = String::from_utf8(span[..json_end].to_vec())
-        .map_err(|e| format!("HFQ metadata is not UTF-8: {e}"))?;
-    Ok(HfqMetadata {
-        arch_id,
-        metadata_json,
-    })
-}
-
-fn model_hash_uncached(model: &str) -> Option<String> {
-    let p = Path::new(model);
-    if p.exists() {
-        file_hash(p)
-    } else {
-        Some(format!("tag:{}", stable_hash_bytes(model.as_bytes())))
-    }
-}
-
-fn model_hash_cache_key(model: &str) -> String {
-    let p = Path::new(model);
-    if let Ok(meta) = fs::metadata(p) {
-        let modified = meta
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let canonical = p
-            .canonicalize()
-            .unwrap_or_else(|_| p.to_path_buf())
-            .display()
-            .to_string();
-        format!("file:{canonical}:{}:{modified}", meta.len())
-    } else {
-        format!("tag:{model}")
-    }
+    hipfire_model::read_hfq_metadata(path)
 }
 
 fn select_external_evidence_value<'a>(
@@ -881,38 +805,6 @@ fn command_digest(tool: &str, path: &Path) -> Option<String> {
         .split_whitespace()
         .next()
         .map(str::to_string)
-}
-
-fn find_json_object_end(bytes: &[u8]) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if b == b'\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if b == b'"' {
-            in_string = !in_string;
-            continue;
-        }
-        if in_string {
-            continue;
-        }
-        if b == b'{' {
-            depth += 1;
-        } else if b == b'}' {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i + 1);
-            }
-        }
-    }
-    None
 }
 
 struct Fnv64(u64);
@@ -1641,7 +1533,7 @@ mod tests {
             "{}-{}",
             name,
             std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+                .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         );

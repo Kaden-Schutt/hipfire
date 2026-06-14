@@ -26,6 +26,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Generate Qwen3.5 dense/MoE batch backend selection now reuses `hipfire-model` architecture classification instead of local numeric arch checks.
 - Eval output and runtime-evidence model stems now reuse `hipfire-model` artifact identity helpers instead of eval-local stem sanitization.
 - Eval model manifests now reuse `hipfire-model` row construction for file/tag identity, HFQ metadata hashes, architecture IDs, and embedded quantization hashes.
+- Evidence model/tag hash and HFQ metadata compatibility helpers now delegate to `hipfire-model` instead of carrying duplicate model-specific parsing.
 - Daemon model-worker id construction and sequence-state arena support policy now reuse `hipfire-state` ownership instead of daemon-local policy helpers.
 - Daemon startup resource lease policy and lock helpers now reuse `hipfire-daemon-adapter` ownership instead of daemon-local helpers.
 - Eval artifact row records now reuse `hipfire-evidence` record contracts instead of eval-local JSON construction.
