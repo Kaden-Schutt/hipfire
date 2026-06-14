@@ -27,9 +27,9 @@ co-shipped DFlash draft.
 
 Mirrors `findings-archive/path-d-vs-path-c.md` methodology with the model pair changed:
 
-  - Target: `~/.hipfire/models/qwen3.6-27b.mq4` (15 GB, 64-layer Qwen3.6 with
+  - Target: `~/.hipfire/models/qwen3.6-27b-mq4.hfq` (15 GB, 64-layer Qwen3.6 with
     1:4 LinearAttention:FullAttention pattern, KV asym3, max_seq=544).
-  - Draft: `~/.hipfire/models/qwen36-27b-dflash-mq4.hfq` (919 MB, 5-layer
+  - Draft: `~/.hipfire/models/qwen3.6-27b-mq4.dflash.hfq` (919 MB, 5-layer
     co-shipped DFlash draft with `target_layers=[1, 16, 31, 46, 61]`, MQ4
     weights with FWHT rotation).
   - Code prompt: `benchmarks/prompts/lru_cache_pep8_strict.txt`, `--max 120`.
@@ -130,9 +130,9 @@ Per #151's action items:
 >    pipelining track scoped to that regime
 > 3. If Path C also loses on Qwen3.6, close #38 permanently
 
-Path C loses on Qwen3.6-27B. The **A3B variant** (`qwen3.6-35b-a3b.mq4`)
+Path C loses on Qwen3.6-27B. The **A3B variant** (`qwen3.6-35b-a3b-mq4.hfq`)
 is present in `~/.hipfire/models/`, but **no matching DFlash draft is
-available**: the only Qwen3.6 draft on hand is `qwen36-27b-dflash-mq4.hfq`,
+available**: the only Qwen3.6 draft on hand is `qwen3.6-27b-mq4.dflash.hfq`,
 trained against the 27B target. A3B is a different topology (35B-param MoE
 with ~3B active) so its draft-target distribution alignment is not implied
 by the 27B draft, and τ on the cross-pair would conflate draft mismatch
@@ -158,8 +158,8 @@ source scripts/gpu-lock.sh && gpu_acquire "your-branch-tag"
 
 # Chain mode (baseline):
 HIPFIRE_DPM_WARMUP_SECS=3 ./target/release/examples/dflash_spec_demo \
-    --target ~/.hipfire/models/qwen3.6-27b.mq4 \
-    --draft  ~/.hipfire/models/qwen36-27b-dflash-mq4.hfq \
+    --target ~/.hipfire/models/qwen3.6-27b-mq4.hfq \
+    --draft  ~/.hipfire/models/qwen3.6-27b-mq4.dflash.hfq \
     --prompt "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
     --max 120 --no-chatml --kv-mode asym3
 

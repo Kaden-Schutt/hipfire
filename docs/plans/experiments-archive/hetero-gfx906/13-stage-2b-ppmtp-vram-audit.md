@@ -2,7 +2,7 @@
 
 Date: 2026-05-28
 Branch: fix/q8-batched-masked-no-lds-cap (post commits 0c0889d4 + 4b6bd48b)
-Model: `/local/hipfire/qwen3.6-27b.mq4` (qwen3.6-27b, 64 layers, dim=5120, 248k vocab)
+Model: `/local/hipfire/qwen3.6-27b-mq4.hfq` (qwen3.6-27b, 64 layers, dim=5120, 248k vocab)
 MTP head: `/data/hipfire/qwen3.6-27b-cvs16384.mtp` (k=3, cvs=16384)
 Hardware: gfx906 (MI50, 32 GiB, HIP idx 0) + gfx1031 (RX 6700 XT, 12 GiB, HIP idx 1)
 
@@ -95,7 +95,7 @@ That's a load-time config change, not a kernel/runtime change.
 
 ```bash
 EXE=./target/release/examples/daemon
-MODEL=/local/hipfire/qwen3.6-27b.mq4
+MODEL=/local/hipfire/qwen3.6-27b-mq4.hfq
 MTP=/data/hipfire/qwen3.6-27b-cvs16384.mtp
 
 # Test A: pp=1 baseline

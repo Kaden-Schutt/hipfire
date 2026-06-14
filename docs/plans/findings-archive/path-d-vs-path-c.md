@@ -174,8 +174,8 @@ Specific PR actions:
 ```sh
 # Chain mode (baseline):
 HIPFIRE_DPM_WARMUP_SECS=3 ./target/release/examples/dflash_spec_demo \
-    --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-    --draft  ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
+    --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
+    --draft  ~/.hipfire/models/qwen3.5-27b-mq4.dflash.hfq \
     --prompt "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
     --max 120 --no-chatml --kv-mode asym3
 

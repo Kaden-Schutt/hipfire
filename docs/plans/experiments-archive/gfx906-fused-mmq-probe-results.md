@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-23
 **Hardware:** MI50 (gfx906), ROCm 6.4, isolated to `ROCR_VISIBLE_DEVICES=0`
-**Model:** /local/hipfire/qwen3.5-9b.mq4 (md5 from `bench_qwen35_speed` runs)
+**Model:** /local/hipfire/qwen3.5-9b-mq4.hfq (md5 from `bench_qwen35_speed` runs)
 **Prompt:** synthetic 256-token deterministic stream (tokens 0..255)
 **Path:** `forward_prefill_batch` at B=256, kv_mode=asym3, warmup=2 then 1 profiled iter
 **Profiler:** in-process `rdna_compute::profile::{start,stop}` (hipEvent-based;
@@ -90,7 +90,7 @@ bench on the same hardware shows:
 | **mean** | **726.9** | **779.9** |
 | Δ   | — | **+7.3%** |
 
-`bench_qwen35_speed /local/hipfire/qwen3.5-9b.mq4 --prefill 256 --prefill-runs 3 --gen 10 --warmup 2`
+`bench_qwen35_speed /local/hipfire/qwen3.5-9b-mq4.hfq --prefill 256 --prefill-runs 3 --gen 10 --warmup 2`
 on `ROCR_VISIBLE_DEVICES=0` (MI50 / gfx906).
 
 Decode tok/s unchanged (~56.0 ±0.4) — the kernels touch only the batched
@@ -126,7 +126,7 @@ occupancy.
 | prefill wall (ms)         | 328.5               | 347.9               |
 | per-call gate_up wall (µs)| 2683                | 3012 (**+12.3%**)   |
 
-`bench_qwen35_speed /local/hipfire/qwen3.5-9b.mq4 --prefill 256 --prefill-runs 3 --gen 10 --warmup 2`
+`bench_qwen35_speed /local/hipfire/qwen3.5-9b-mq4.hfq --prefill 256 --prefill-runs 3 --gen 10 --warmup 2`
 `HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1 HIPFIRE_HFQ4_MMQ_GFX906_Y64=1`.
 
 Byte-exact A/B (greedy_dump) confirms numerical equivalence — both
@@ -181,13 +181,13 @@ canonical validation suite to clear the env-gate for default-on shipping.
 9 model/prompt cells exercised (4 MQ4 — the kernels' direct surface;
 5 MQ3 / MQ6 — collateral coverage), no hard errors. Sample cells:
 
-  qwen3.5-0.8b.mq4 / cap         → "Paris."                       OK
-  qwen3.5-9b.mq4 / reason        → correct sheep answer (9)        OK
-  qwen3.5-9b.mq4 / tool-call     → clean <tool_call> JSON shape    OK
+  qwen3.5-0.8b-mq4.hfq / cap         → "Paris."                       OK
+  qwen3.5-9b-mq4.hfq / reason        → correct sheep answer (9)        OK
+  qwen3.5-9b-mq4.hfq / tool-call     → clean <tool_call> JSON shape    OK
 
 ### KLD eval (n=50)
 
-`eval_hipfire --max-chunks 50` on `/local/hipfire/qwen3.5-9b.mq4`,
+`eval_hipfire --max-chunks 50` on `/local/hipfire/qwen3.5-9b-mq4.hfq`,
 asym3 KV, prefill scoring, with fused-by-default active. Compared
 against the canonical §1.1 mq4-base entry from
 `docs/plans/kld-measurements-master.md` (on `data/kld-measurements`

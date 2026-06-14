@@ -226,15 +226,15 @@ code — revert.
 # Code (LRU PEP-8):
 PROMPT=$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)
 DFLASH_LIVE_TAU=1 ./target/release/examples/dflash_spec_demo \
-    --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-    --draft  ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
+    --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
+    --draft  ~/.hipfire/models/qwen3.5-27b-mq4.dflash.hfq \
     --prompt "$PROMPT" --max 120 --no-chatml --kv-mode asym3
 
 # Prose (merge sort thinking-off):
 PROMPT=$(cat benchmarks/prompts/merge_sort_thinking_off.txt)
 DFLASH_LIVE_TAU=1 ./target/release/examples/dflash_spec_demo \
-    --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-    --draft  ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
+    --target ~/.hipfire/models/qwen3.5-27b-mq4.hfq \
+    --draft  ~/.hipfire/models/qwen3.5-27b-mq4.dflash.hfq \
     --prompt "$PROMPT" --max 256 --no-chatml --kv-mode asym3
 ```
 

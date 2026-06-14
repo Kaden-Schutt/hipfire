@@ -185,7 +185,7 @@ answered yes — same per-call magnitude as gfx1151. Single-acc is the
 universally correct choice; multi-acc reorder noise is intrinsic to
 the kernel structure, not arch-specific.
 
-Full-coverage PPL drift on gfx1100, `qwen3.5-9b.mq3-lloyd`,
+Full-coverage PPL drift on gfx1100, `qwen3.5-9b-lloyd-mq3.hfq`,
 ctx=2048 warmup=8 offset=0, calib-5m corpus:
 
 | Variant | NLL/tok | PPL | Δ vs slow |
@@ -203,7 +203,7 @@ never a structural MQ4 bug — re-confirmed.
 
 Decode perf cost of porting MQ3-Lloyd to single-acc on gfx1100
 (`probe_commits.sh` cross-process A/B, 3 samples each, gen=30
-GRAPH=1 KV=asym3, qwen3.5-9b.mq3-lloyd):
+GRAPH=1 KV=asym3, qwen3.5-9b-lloyd-mq3.hfq):
 
 | Variant | Mean | Δ vs multi-acc |
 |---|---:|---:|
@@ -222,10 +222,10 @@ at issue #188. Single-acc implementation is on branch
 ```sh
 # Per-call multi-acc-vs-CPU drift (real Qwen3.5-9B weights):
 ./target/release/examples/diag_mq4_lloyd_multiacc \
-  ~/.hipfire/models/qwen3.5-9b.mq4-lloyd \
+  ~/.hipfire/models/qwen3.5-9b-lloyd-mq4.hfq \
   model.language_model.layers.0.mlp.down_proj.weight --rows 1024
 ./target/release/examples/diag_mq3_lloyd_multiacc \
-  ~/.hipfire/models/qwen3.5-9b.mq3-lloyd \
+  ~/.hipfire/models/qwen3.5-9b-lloyd-mq3.hfq \
   model.language_model.layers.0.mlp.down_proj.weight --rows 1024
 
 # Full-coverage PPL drift reproduction:
@@ -235,7 +235,7 @@ at issue #188. Single-acc implementation is on branch
 #    DOG4_LDS to (a) += form, merge as `(acc0+acc1)+(acc2+acc3)` before
 #    wave reduction)
 #  - rebuild perplexity, run with --ctx 2048 --warmup 8 --offset 0 against
-#    qwen3.5-9b.mq4-lloyd → drift surfaces in NLL/tok (0.0166 above slow).
+#    qwen3.5-9b-lloyd-mq4.hfq → drift surfaces in NLL/tok (0.0166 above slow).
 #  - restoring single-acc returns to byte-equal.
 ```
 

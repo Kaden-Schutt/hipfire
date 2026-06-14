@@ -7,7 +7,7 @@ Only `--target-device`/`--drafter-device` bench flags replayed (d9b08cb8).
 
 - branch `feat/hetero-pflash-decode-v2`, 1 commit ahead of master `117c9c78`
 - target: gfx906 (MI50), drafter: gfx1031 (RX 6700 XT), ROCm runtime 1.15
-- target = `qwen3.5-9b.mq4-awq-gptq-f2-lmhead-a100.hfq`, drafter = `qwen3.5-0.8b.mq4`
+- target = `qwen3.5-9b-awq-gptq-f2-lmhead-a100-mq4.hfq`, drafter = `qwen3.5-0.8b-mq4.hfq`
 - fixture niah_16k (10881 tok), keep_ratio 0.30, asym3 KV, maxgen 16
 
 ## Result: PFlash compress on drafter, AR prefill+decode on main

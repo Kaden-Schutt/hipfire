@@ -3,7 +3,7 @@
 **Date:** 2026-04-30
 **Ref:** Kaden-Schutt/hipfire#87 (auto-MMQ regression on tool-call output)
 **Hardware:** AMD Strix Halo gfx1151, 131.1 GB VRAM, HIP 7.2
-**Model:** qwen3.6-27b.mq4 (64 layers: 48 DeltaNet + 16 FullAttn, dim=5120)
+**Model:** qwen3.6-27b-mq4.hfq (64 layers: 48 DeltaNet + 16 FullAttn, dim=5120)
 **Binary:** `channel_test_mmq --batch 128 --threshold 0.01`
 
 ## Stage 1: site-scan — residual site across all 64 layers
