@@ -23,6 +23,7 @@ use hipfire_evidence::{
     directory_hash, file_hash, list_files, model_hash, read_hfq_metadata, stable_hash_bytes,
     stable_hash_file_fallback, standard_evidence_paths_in_dir, STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
+use hipfire_model::discover_dflash_draft_for_model;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -862,7 +863,8 @@ where
     suites.sort();
     suites.dedup();
     if draft.is_none() && matches!(dflash, DflashMode::Auto | DflashMode::On) {
-        draft = discover_dflash_draft(&model);
+        draft = discover_dflash_draft_for_model(Path::new(&model))
+            .map(|path| path.display().to_string());
     }
     let out_dir = out_dir.unwrap_or_else(|| default_output_dir(&model, tier));
     let dataset_cache = dataset_cache.unwrap_or_else(default_dataset_cache);
@@ -11288,65 +11290,6 @@ fn model_stem(model: &str) -> String {
 
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
-}
-
-fn discover_dflash_draft(model: &str) -> Option<String> {
-    let path = Path::new(model);
-    if !path.is_file() {
-        return None;
-    }
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let filename = path.file_name().and_then(OsStr::to_str)?;
-    for candidate in dflash_draft_candidates(filename) {
-        let candidate_path = dir.join(candidate);
-        if candidate_path.is_file() {
-            return Some(candidate_path.display().to_string());
-        }
-    }
-    None
-}
-
-fn dflash_draft_candidates(filename: &str) -> Vec<String> {
-    let Some((family, version, size, quant)) = parse_qwen_dflash_target(filename) else {
-        return Vec::new();
-    };
-    let dotted_family = format!("{family}{version}");
-    vec![
-        format!("{dotted_family}-{size}-{quant}.dflash.hfq"),
-        format!("{dotted_family}-{size}-{quant}.draft.hfq"),
-    ]
-}
-
-fn parse_qwen_dflash_target(filename: &str) -> Option<(&'static str, String, String, String)> {
-    let mut quant_from_ext = None;
-    let stem = if let Some(stem) = filename.strip_suffix(".hfq") {
-        stem
-    } else if let Some(stem) = filename.strip_suffix("-mq4.hfq") {
-        quant_from_ext = Some("mq4".to_string());
-        stem
-    } else if let Some(stem) = filename.strip_suffix("-mq3.hfq") {
-        quant_from_ext = Some("mq3".to_string());
-        stem
-    } else if let Some(stem) = filename.strip_suffix("-mq6.hfq") {
-        quant_from_ext = Some("mq6".to_string());
-        stem
-    } else {
-        filename
-    };
-    let parts: Vec<_> = stem.split('-').collect();
-    if parts.len() < 2 || !parts[0].starts_with("qwen3.") {
-        return None;
-    }
-    let version = parts[0].trim_start_matches("qwen").to_string();
-    let size = parts[1].to_string();
-    let quant = quant_from_ext.or_else(|| {
-        parts
-            .iter()
-            .rev()
-            .find(|part| matches!(**part, "mq3" | "mq4" | "mq6" | "mq8"))
-            .map(|part| (*part).to_string())
-    })?;
-    Some(("qwen", version, size, quant))
 }
 
 fn sanitize_path_component(raw: &str) -> String {

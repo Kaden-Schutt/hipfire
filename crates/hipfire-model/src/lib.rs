@@ -201,6 +201,63 @@ pub fn list_local_models_in(models_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Discover a DFlash draft sidecar next to a target model artifact.
+pub fn discover_dflash_draft_for_model(model: &Path) -> Option<PathBuf> {
+    if !model.is_file() {
+        return None;
+    }
+    let dir = model.parent().unwrap_or_else(|| Path::new("."));
+    let filename = model.file_name().and_then(|name| name.to_str())?;
+    dflash_draft_candidates(filename)
+        .into_iter()
+        .map(|candidate| dir.join(candidate))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Return candidate DFlash draft sidecar filenames for a target model filename.
+pub fn dflash_draft_candidates(filename: &str) -> Vec<String> {
+    let Some((family, version, size, quant)) = parse_qwen_dflash_target(filename) else {
+        return Vec::new();
+    };
+    let dotted_family = format!("{family}{version}");
+    vec![
+        format!("{dotted_family}-{size}-{quant}.dflash.hfq"),
+        format!("{dotted_family}-{size}-{quant}.draft.hfq"),
+    ]
+}
+
+fn parse_qwen_dflash_target(filename: &str) -> Option<(&'static str, String, String, String)> {
+    let mut quant_from_ext = None;
+    let stem = if let Some(stem) = filename.strip_suffix(".hfq") {
+        stem
+    } else if let Some(stem) = filename.strip_suffix("-mq4.hfq") {
+        quant_from_ext = Some("mq4".to_string());
+        stem
+    } else if let Some(stem) = filename.strip_suffix("-mq3.hfq") {
+        quant_from_ext = Some("mq3".to_string());
+        stem
+    } else if let Some(stem) = filename.strip_suffix("-mq6.hfq") {
+        quant_from_ext = Some("mq6".to_string());
+        stem
+    } else {
+        filename
+    };
+    let parts: Vec<_> = stem.split('-').collect();
+    if parts.len() < 2 || !parts[0].starts_with("qwen3.") {
+        return None;
+    }
+    let version = parts[0].trim_start_matches("qwen").to_string();
+    let size = parts[1].to_string();
+    let quant = quant_from_ext.or_else(|| {
+        parts
+            .iter()
+            .rev()
+            .find(|part| matches!(**part, "mq3" | "mq4" | "mq6" | "mq8"))
+            .map(|part| (*part).to_string())
+    })?;
+    Some(("qwen", version, size, quant))
+}
+
 fn scan_models_dir(dir: &Path, stem: &str) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -407,6 +464,33 @@ mod tests {
         let listed = list_local_models_in(&models);
         assert_eq!(listed, vec![mq6]);
         assert!(!listed.contains(&sidecar));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dflash_draft_discovery_uses_adjacent_qwen_sidecar_names() {
+        assert_eq!(
+            dflash_draft_candidates("qwen3.5-27b-mq4.hfq"),
+            vec![
+                "qwen3.5-27b-mq4.dflash.hfq".to_string(),
+                "qwen3.5-27b-mq4.draft.hfq".to_string()
+            ]
+        );
+        assert!(dflash_draft_candidates("llama-8b-mq4.hfq").is_empty());
+
+        let root = temp_dir("hipfire-dflash-draft-discovery");
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("qwen3.5-27b-mq4.hfq");
+        let draft = root.join("qwen3.5-27b-mq4.dflash.hfq");
+        fs::write(&target, "target").unwrap();
+        fs::write(&draft, "draft").unwrap();
+
+        assert_eq!(discover_dflash_draft_for_model(&target), Some(draft));
+        assert_eq!(
+            discover_dflash_draft_for_model(&root.join("missing.hfq")),
+            None
+        );
 
         let _ = fs::remove_dir_all(root);
     }
