@@ -61,6 +61,7 @@ pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
         system: None,
         thinking: None,
         max_think_tokens: None,
+        request_id: None,
     };
 
     let done = engine

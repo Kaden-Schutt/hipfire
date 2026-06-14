@@ -18,6 +18,8 @@ pub enum DaemonRequest {
 pub struct LoadRequest {
     pub model: String,
     pub params: LoadParams,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -57,6 +59,8 @@ pub struct GenerateRequest {
     pub thinking: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_think_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +88,8 @@ pub struct LoadedResponse {
     pub layers: Option<u32>,
     pub vocab: Option<u32>,
     pub model_worker: Option<serde_json::Value>,
+    #[serde(default)]
+    pub response_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,6 +109,8 @@ pub struct DoneResponse {
     pub decode_tok_s: Option<f64>,
     pub ttft_ms: Option<f64>,
     pub finish_reason: Option<String>,
+    #[serde(default)]
+    pub response_id: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -111,4 +119,6 @@ pub struct DoneResponse {
 pub struct ErrorResponse {
     pub id: Option<String>,
     pub message: String,
+    #[serde(default)]
+    pub response_id: Option<String>,
 }

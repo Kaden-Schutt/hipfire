@@ -1,21 +1,29 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use futures::future::BoxFuture;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tracing::debug;
 
 use super::protocol::{DaemonRequest, DaemonResponse};
 
-pub struct DaemonEngine {
+trait DaemonTransport: Send {
+    fn send_json<'a>(
+        &'a mut self,
+        req: &'a DaemonRequest,
+    ) -> BoxFuture<'a, anyhow::Result<()>>;
+    fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>>;
+}
+
+struct StdioTransport {
     _child: Child,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
-    pub worker_key_id: Option<String>,
 }
 
-impl DaemonEngine {
-    pub async fn spawn(bin: &Path) -> anyhow::Result<Self> {
+impl StdioTransport {
+    async fn spawn(bin: &Path) -> anyhow::Result<Self> {
         let mut child = Command::new(bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -30,28 +38,56 @@ impl DaemonEngine {
             _child: child,
             stdin,
             stdout,
+        })
+    }
+}
+
+impl DaemonTransport for StdioTransport {
+    fn send_json<'a>(&'a mut self, req: &'a DaemonRequest) -> BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            let line = serde_json::to_string(req)?;
+            debug!("> {line}");
+            self.stdin.write_all(line.as_bytes()).await?;
+            self.stdin.write_all(b"\n").await?;
+            self.stdin.flush().await?;
+            Ok(())
+        })
+    }
+
+    fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>> {
+        Box::pin(async move {
+            let mut line = String::new();
+            self.stdout.read_line(&mut line).await?;
+            if line.is_empty() {
+                anyhow::bail!("daemon stdout closed unexpectedly");
+            }
+            let line = line.trim_end();
+            debug!("< {line}");
+            Ok(serde_json::from_str(line)?)
+        })
+    }
+}
+
+pub struct DaemonEngine {
+    transport: Box<dyn DaemonTransport>,
+    pub worker_key_id: Option<String>,
+}
+
+impl DaemonEngine {
+    pub async fn spawn(bin: &Path) -> anyhow::Result<Self> {
+        let transport = StdioTransport::spawn(bin).await?;
+        Ok(Self {
+            transport: Box::new(transport),
             worker_key_id: None,
         })
     }
 
     async fn send(&mut self, req: &DaemonRequest) -> anyhow::Result<()> {
-        let line = serde_json::to_string(req)?;
-        debug!("> {line}");
-        self.stdin.write_all(line.as_bytes()).await?;
-        self.stdin.write_all(b"\n").await?;
-        self.stdin.flush().await?;
-        Ok(())
+        self.transport.send_json(req).await
     }
 
     async fn recv(&mut self) -> anyhow::Result<DaemonResponse> {
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).await?;
-        if line.is_empty() {
-            anyhow::bail!("daemon stdout closed unexpectedly");
-        }
-        let line = line.trim_end();
-        debug!("< {line}");
-        Ok(serde_json::from_str(line)?)
+        self.transport.recv_response().await
     }
 
     /// Send `load` and wait for `loaded`.
@@ -60,15 +96,27 @@ impl DaemonEngine {
         model_path: &str,
         params: super::protocol::LoadParams,
     ) -> anyhow::Result<super::protocol::LoadedResponse> {
+        let request_id = uuid::Uuid::new_v4().to_string();
         self.send(&DaemonRequest::Load(super::protocol::LoadRequest {
             model: model_path.to_string(),
             params,
+            request_id: Some(request_id.clone()),
         }))
         .await?;
+        let expected_response = Some(request_id);
 
         loop {
             match self.recv().await? {
                 DaemonResponse::Loaded(r) => {
+                    if let Some(expected) = &expected_response {
+                        if matches!(r.response_id.as_deref(), Some(actual) if actual != expected) {
+                            tracing::warn!(
+                                "stale load response: got response_id={:?} expected={:?}",
+                                r.response_id, expected_response
+                            );
+                            continue;
+                        }
+                    }
                     self.worker_key_id = Some(r.worker_key_id.clone());
                     return Ok(r);
                 }
@@ -118,12 +166,22 @@ impl DaemonEngine {
         &mut self,
         req: super::protocol::GenerateRequest,
     ) -> anyhow::Result<(String, super::protocol::DoneResponse)> {
+        let request_id = req.id.clone();
         self.send(&DaemonRequest::Generate(req)).await?;
         let mut text = String::new();
         loop {
             match self.recv().await? {
-                DaemonResponse::Token(t) => text.push_str(&t.text),
-                DaemonResponse::Done(d) => return Ok((text, d)),
+                DaemonResponse::Token(t) => {
+                    if t.id == request_id {
+                        text.push_str(&t.text)
+                    }
+                }
+                DaemonResponse::Done(d) => {
+                    if d.id == request_id {
+                        return Ok((text, d));
+                    }
+                    tracing::warn!("stale done response: got id={} expected={}", d.id, request_id);
+                }
                 DaemonResponse::Error(e) => anyhow::bail!("daemon generate error: {}", e.message),
                 DaemonResponse::Unknown => {}
                 other => {
@@ -142,11 +200,21 @@ impl DaemonEngine {
     where
         F: FnMut(String),
     {
+        let request_id = req.id.clone();
         self.send(&DaemonRequest::Generate(req)).await?;
         loop {
             match self.recv().await? {
-                DaemonResponse::Token(t) => on_token(t.text),
-                DaemonResponse::Done(d) => return Ok(d),
+                DaemonResponse::Token(t) => {
+                    if t.id == request_id {
+                        on_token(t.text)
+                    }
+                }
+                DaemonResponse::Done(d) => {
+                    if d.id == request_id {
+                        return Ok(d);
+                    }
+                    tracing::warn!("stale done response: got id={} expected={}", d.id, request_id);
+                }
                 DaemonResponse::Error(e) => anyhow::bail!("daemon generate error: {}", e.message),
                 DaemonResponse::Unknown => {}
                 other => {

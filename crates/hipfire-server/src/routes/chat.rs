@@ -145,6 +145,7 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
             system: body.system,
             thinking: None,
             max_think_tokens: None,
+            request_id: None,
         }
     };
 
@@ -233,6 +234,7 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                 system: body.system,
                 thinking: None,
                 max_think_tokens: None,
+                request_id: None,
             }
         };
 
