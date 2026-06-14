@@ -1,9 +1,9 @@
-# Architectural Roadmap: hipfire v1.0
+# Canonical Pointer
 
-This roadmap has been merged into
-[`modular-runtime-architecture.md`](modular-runtime-architecture.md).
+This index points to the current canonical source in the archive.
 
-The consolidated plan covers the stabilize-first rule, Rust CLI/Axum serving,
-backend engine crates, prompt/state/generation/scheduler/evidence libraries,
-NPU integration, metrics, and staged migration.
+- [docs-old/plans/v1-architecture-roadmap.md](../docs-old/plans/v1-architecture-roadmap.md)
 
+## Why this file exists
+
+The historical implementation record is preserved in `docs-old`; this page is kept as an explicit stable pointer for workflow tooling and review references.

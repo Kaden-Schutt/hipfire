@@ -1,9 +1,9 @@
-# Stabilize Before Extraction
+# Canonical Pointer
 
-This plan has been merged into
-[`modular-runtime-architecture.md`](modular-runtime-architecture.md).
+This index points to the current canonical source in the archive.
 
-The short version remains unchanged: stabilize correctness gates and typed
-boundaries before splitting large hot-path files such as `qwen35.rs`,
-`dispatch.rs`, or daemon serving state.
+- [docs-old/plans/stabilize-before-extraction.md](../docs-old/plans/stabilize-before-extraction.md)
 
+## Why this file exists
+
+The historical implementation record is preserved in `docs-old`; this page is kept as an explicit stable pointer for workflow tooling and review references.
