@@ -12,6 +12,8 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
+use serde_json::{json, Value};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HfqMetadata {
     pub arch_id: u32,
@@ -107,6 +109,59 @@ pub const STANDARD_EVIDENCE_ARTIFACT_SPECS: &[EvidenceArtifactSpec] = &[
         ],
     },
 ];
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvidenceRecord {
+    pub battery: String,
+    pub suite: Option<String>,
+    pub case_id: String,
+    pub dataset_item_id: Option<String>,
+    pub dataset_source: Option<String>,
+    pub dataset_repo_id: Option<String>,
+    pub dataset_revision: Option<String>,
+    pub dataset_digest: Option<String>,
+    pub dataset_license: Option<String>,
+    pub dataset_cache_path: Option<String>,
+    pub model: String,
+    pub model_hash: Option<String>,
+    pub draft: Option<String>,
+    pub draft_hash: Option<String>,
+    pub baseline: Option<String>,
+    pub baseline_hash: Option<String>,
+    pub reference: Option<String>,
+    pub reference_hash: Option<String>,
+    pub prompt_hash: Option<String>,
+    pub prompt_path: Option<String>,
+    pub metrics: BTreeMap<String, Value>,
+    pub elapsed_ms: u128,
+}
+
+pub fn evidence_record_json(record: EvidenceRecord) -> Value {
+    json!({
+        "battery": record.battery,
+        "suite": record.suite,
+        "case_id": record.case_id,
+        "dataset_item_id": record.dataset_item_id,
+        "dataset_source": record.dataset_source,
+        "dataset_repo_id": record.dataset_repo_id,
+        "dataset_revision": record.dataset_revision,
+        "dataset_digest": record.dataset_digest,
+        "dataset_license": record.dataset_license,
+        "dataset_cache_path": record.dataset_cache_path,
+        "model": record.model,
+        "model_hash": record.model_hash,
+        "draft": record.draft,
+        "draft_hash": record.draft_hash,
+        "baseline": record.baseline,
+        "baseline_hash": record.baseline_hash,
+        "reference": record.reference,
+        "reference_hash": record.reference_hash,
+        "prompt_hash": record.prompt_hash,
+        "prompt_path": record.prompt_path,
+        "metrics": record.metrics,
+        "elapsed_ms": record.elapsed_ms,
+    })
+}
 
 pub fn standard_evidence_artifact_kind_for_path(path: &Path) -> Option<&'static str> {
     let file_name = path.file_name()?.to_str()?;
@@ -393,6 +448,47 @@ mod tests {
         assert!(STANDARD_EVIDENCE_ARTIFACT_SPECS
             .iter()
             .all(|spec| !spec.expected_metrics.is_empty()));
+    }
+
+    #[test]
+    fn evidence_record_json_preserves_artifact_row_shape() {
+        let mut metrics = BTreeMap::new();
+        metrics.insert("tok_s".to_string(), json!(123.4));
+        let record = EvidenceRecord {
+            battery: "speed".to_string(),
+            suite: Some("smoke".to_string()),
+            case_id: "case-a".to_string(),
+            dataset_item_id: Some("item-a".to_string()),
+            dataset_source: None,
+            dataset_repo_id: None,
+            dataset_revision: None,
+            dataset_digest: None,
+            dataset_license: None,
+            dataset_cache_path: None,
+            model: "model.hfq".to_string(),
+            model_hash: Some("sha256:model".to_string()),
+            draft: None,
+            draft_hash: None,
+            baseline: Some("baseline.hfq".to_string()),
+            baseline_hash: Some("sha256:baseline".to_string()),
+            reference: None,
+            reference_hash: None,
+            prompt_hash: Some("fnv64:prompt".to_string()),
+            prompt_path: Some("benchmarks/prompts/smoke.txt".to_string()),
+            metrics,
+            elapsed_ms: 42,
+        };
+
+        let json = evidence_record_json(record);
+        assert_eq!(json["battery"], "speed");
+        assert_eq!(json["suite"], "smoke");
+        assert_eq!(json["case_id"], "case-a");
+        assert_eq!(json["dataset_item_id"], "item-a");
+        assert_eq!(json["model_hash"], "sha256:model");
+        assert_eq!(json["baseline_hash"], "sha256:baseline");
+        assert_eq!(json["prompt_path"], "benchmarks/prompts/smoke.txt");
+        assert_eq!(json["metrics"]["tok_s"], 123.4);
+        assert_eq!(json["elapsed_ms"], 42);
     }
 
     #[test]

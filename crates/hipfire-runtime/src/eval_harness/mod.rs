@@ -20,8 +20,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
-    directory_hash, file_hash, list_files, model_hash, read_hfq_metadata, stable_hash_bytes,
-    stable_hash_file_fallback, standard_evidence_paths_in_dir, STANDARD_EVIDENCE_ARTIFACT_SPECS,
+    directory_hash, evidence_record_json, file_hash, list_files, model_hash, read_hfq_metadata,
+    stable_hash_bytes, stable_hash_file_fallback, standard_evidence_paths_in_dir, EvidenceRecord,
+    STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
 use hipfire_model::{discover_dflash_draft_for_model, model_artifact_stem};
 
@@ -3866,29 +3867,29 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
                 "module_evidence" => module_evidence_metrics(row),
                 _ => row.metrics.clone(),
             };
-            json!({
-                "battery": row.battery.as_str(),
-                "suite": row.suite.map(|s| s.as_str()),
-                "case_id": row.case_id,
-                "dataset_item_id": row.dataset_item_id,
-                "dataset_source": row.dataset_source,
-                "dataset_repo_id": row.dataset_repo_id,
-                "dataset_revision": row.dataset_revision,
-                "dataset_digest": row.dataset_digest,
-                "dataset_license": row.dataset_license,
-                "dataset_cache_path": row.dataset_cache_path,
-                "model": row.model,
-                "model_hash": row.model_hash,
-                "draft": row.draft,
-                "draft_hash": row.draft_hash,
-                "baseline": row.baseline,
-                "baseline_hash": row.baseline_hash,
-                "reference": row.reference,
-                "reference_hash": row.reference_hash,
-                "prompt_hash": row.prompt_hash,
-                "prompt_path": row.prompt_path,
-                "metrics": metrics,
-                "elapsed_ms": row.elapsed_ms,
+            evidence_record_json(EvidenceRecord {
+                battery: row.battery.as_str().to_string(),
+                suite: row.suite.map(|s| s.as_str().to_string()),
+                case_id: row.case_id.clone(),
+                dataset_item_id: row.dataset_item_id.clone(),
+                dataset_source: row.dataset_source.clone(),
+                dataset_repo_id: row.dataset_repo_id.clone(),
+                dataset_revision: row.dataset_revision.clone(),
+                dataset_digest: row.dataset_digest.clone(),
+                dataset_license: row.dataset_license.clone(),
+                dataset_cache_path: row.dataset_cache_path.clone(),
+                model: row.model.clone(),
+                model_hash: row.model_hash.clone(),
+                draft: row.draft.clone(),
+                draft_hash: row.draft_hash.clone(),
+                baseline: row.baseline.clone(),
+                baseline_hash: row.baseline_hash.clone(),
+                reference: row.reference.clone(),
+                reference_hash: row.reference_hash.clone(),
+                prompt_hash: row.prompt_hash.clone(),
+                prompt_path: row.prompt_path.clone(),
+                metrics,
+                elapsed_ms: row.elapsed_ms,
             })
         })
         .collect()

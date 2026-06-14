@@ -893,6 +893,9 @@ dependencies = [
 [[package]]
 name = "hipfire-evidence"
 version = "0.2.1"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "hipfire-generate"
