@@ -4226,22 +4226,11 @@ fn loaded_model_memory_view(
 }
 
 fn loaded_model_worker_id(m: &LoadedModel) -> ModelWorkerId {
-    ModelWorkerId {
-        value: format!(
-            "worker:arch{}:pp{}:{}",
-            m.arch_id,
-            m.pp,
-            m.q35_kv_mode.as_deref().unwrap_or("unknown")
-        ),
-    }
+    ModelWorkerId::from_runtime_parts(m.arch_id, m.pp, m.q35_kv_mode.as_deref())
 }
 
 fn loaded_model_state_arena_backend(m: &LoadedModel) -> SequenceStateArenaBackend {
-    if (m.arch_id == 5 || m.arch_id == 6) && m.pp == 1 {
-        SequenceStateArenaBackend::Qwen35Wrapped
-    } else {
-        SequenceStateArenaBackend::Unsupported
-    }
+    SequenceStateArenaBackend::for_worker_parts(m.arch_id, m.pp)
 }
 
 fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
@@ -4846,13 +4835,7 @@ fn ensure_sequence_state_arena_backend_supported(
     m: &LoadedModel,
     op: &str,
 ) -> Result<(), String> {
-    match arena_backend {
-        SequenceStateArenaBackend::Qwen35Wrapped => Ok(()),
-        SequenceStateArenaBackend::Unsupported => Err(format!(
-            "{op} requires a supported sequence-state arena (arch_id={} pp={})",
-            m.arch_id, m.pp
-        )),
-    }
+    arena_backend.require_supported(m.arch_id, m.pp, op)
 }
 
 fn sequence_state_arena_resident_session_count(
