@@ -43,6 +43,10 @@ Current scheduler boundary status:
 - `hipfire-scheduler` owns Rust parity contracts for priority classes, prefill/decode scheduler policy, model-worker compatibility, request-session drafts, prefill queue selection, decode active-set batching, backpressure, opportunistic dispatch, and deadline aging.
 - Bun scheduler code remains the live server control plane until Rust server paths consume the shared scheduler crate.
 
+Current generate boundary status:
+- `hipfire-generate` owns typed generation sampling policy, text generation request/event structs, generate-batch prefill/decode envelopes, Qwen3.5 prefill/decode backend plan enums, and scheduler metadata helpers.
+- `hipfire-daemon` still owns concrete validation, model-specific execution, Qwen3.5 runtime orchestration, and JSONL adapter dispatch until later migration slices consume the shared contracts.
+
 Current evidence boundary status:
 - `hipfire-evidence` owns stable hash, model/tag hash, directory digest, file hash, and HFQ metadata extraction helpers.
 - `hipfire-runtime::eval_harness` still owns eval execution and artifact writing, but now consumes the shared evidence provenance helpers.
