@@ -87,8 +87,8 @@ Current evidence boundary status:
 - `hipfire-eval` owns the `hipfire-eval` binary adapter and delegates to `hipfire-runtime::eval_harness` until the harness implementation can move without a runtime/coherence dependency cycle.
 
 Current coherence boundary status:
-- `hipfire-coherence` owns detector profile selection, detector-bank construction, agentic prompt detection, coherence run input/output contracts, report row serialization, and coherence artifact serialization.
-- `hipfire-runtime::coherence_runtime` still owns daemon orchestration, prompt execution, and token event capture.
+- `hipfire-coherence` owns detector profile selection, detector-bank construction, agentic prompt detection, coherence run input/output contracts, report row serialization, coherence artifact serialization, daemon binary discovery, daemon-backed coherence execution, prompt execution, token event capture, and detector report assembly.
+- `hipfire-runtime::coherence_runtime` remains a compatibility facade for existing `coherence_probe` and eval-harness callers while coherence ownership lives in `hipfire-coherence`.
 
 ## 3) Execution sequence
 
