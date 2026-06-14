@@ -23,7 +23,7 @@ use hipfire_evidence::{
     directory_hash, file_hash, list_files, model_hash, read_hfq_metadata, stable_hash_bytes,
     stable_hash_file_fallback, standard_evidence_paths_in_dir, STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
-use hipfire_model::discover_dflash_draft_for_model;
+use hipfire_model::{discover_dflash_draft_for_model, model_artifact_stem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -1094,7 +1094,7 @@ pub fn default_suites(tier: EvalTier) -> Vec<SuiteId> {
 }
 
 pub fn default_output_dir(model: &str, tier: EvalTier) -> PathBuf {
-    let stem = model_stem(model);
+    let stem = model_artifact_stem(model);
     let leaf = format!("{}-{}-{}", utc_stamp_compact(), stem, tier.as_str());
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -4939,7 +4939,7 @@ fn quality_json_rows(config: &EvalConfig, ctx: &EvalContext) -> Option<Vec<EvalR
     let candidate_variant = config
         .candidate_variant
         .clone()
-        .unwrap_or_else(|| model_stem(&config.model));
+        .unwrap_or_else(|| model_artifact_stem(&config.model));
     out.push(quality_json_row_for_variant(
         path,
         &rows,
@@ -4953,7 +4953,7 @@ fn quality_json_rows(config: &EvalConfig, ctx: &EvalContext) -> Option<Vec<EvalR
         let variant = config
             .baseline_variant
             .clone()
-            .unwrap_or_else(|| model_stem(model));
+            .unwrap_or_else(|| model_artifact_stem(model));
         out.push(quality_json_row_for_variant(
             path, &rows, "baseline", &variant, model, config, ctx,
         ));
@@ -4962,7 +4962,7 @@ fn quality_json_rows(config: &EvalConfig, ctx: &EvalContext) -> Option<Vec<EvalR
         let variant = config
             .reference_variant
             .clone()
-            .unwrap_or_else(|| model_stem(model));
+            .unwrap_or_else(|| model_artifact_stem(model));
         out.push(quality_json_row_for_variant(
             path,
             &rows,
@@ -5116,7 +5116,7 @@ fn run_kld_reference_row(config: &EvalConfig, ctx: &EvalContext, model: String) 
 
     let evidence_dir = runtime_evidence_dir(config, "kld_reference_slice", &model);
     let _ = fs::create_dir_all(&evidence_dir);
-    let output_path = evidence_dir.join(format!("{}.kldseq", model_stem(&model)));
+    let output_path = evidence_dir.join(format!("{}.kldseq", model_artifact_stem(&model)));
     let mut args = vec![
         "--model".to_string(),
         model.clone(),
@@ -5307,7 +5307,7 @@ fn resolve_kldref_for_model(config: &EvalConfig, model: &str) -> Option<PathBuf>
 }
 
 fn kldref_name_for_model(model: &str) -> Option<String> {
-    let stem = model_stem(model);
+    let stem = model_artifact_stem(model);
     if let Some(idx) = stem.find("-bf16") {
         return Some(format!("{}.kldref.hfq", &stem[..idx + "-bf16".len()]));
     }
@@ -5450,7 +5450,7 @@ fn performance_json_rows(config: &EvalConfig, ctx: &EvalContext) -> Option<Vec<E
         .performance_candidate_variant
         .clone()
         .or_else(|| config.candidate_variant.clone())
-        .unwrap_or_else(|| model_stem(&config.model));
+        .unwrap_or_else(|| model_artifact_stem(&config.model));
     out.push(performance_json_row_for_variant(
         path,
         &rows,
@@ -5465,7 +5465,7 @@ fn performance_json_rows(config: &EvalConfig, ctx: &EvalContext) -> Option<Vec<E
             .performance_baseline_variant
             .clone()
             .or_else(|| config.baseline_variant.clone())
-            .unwrap_or_else(|| model_stem(model));
+            .unwrap_or_else(|| model_artifact_stem(model));
         out.push(performance_json_row_for_variant(
             path, &rows, "baseline", &variant, model, config, ctx,
         ));
@@ -5475,7 +5475,7 @@ fn performance_json_rows(config: &EvalConfig, ctx: &EvalContext) -> Option<Vec<E
             .performance_reference_variant
             .clone()
             .or_else(|| config.reference_variant.clone())
-            .unwrap_or_else(|| model_stem(model));
+            .unwrap_or_else(|| model_artifact_stem(model));
         out.push(performance_json_row_for_variant(
             path,
             &rows,
@@ -6346,7 +6346,7 @@ fn run_examples_qwen35_speed_model(
     command.args(&args);
     command.env("HIPFIRE_KV_MODE", kv_mode);
     command.env("HIPFIRE_DPM_WARMUP_SECS", "3");
-    if !model_stem(&model).contains("0.8b") {
+    if !model_artifact_stem(&model).contains("0.8b") {
         command.env("HIPFIRE_GRAPH", "1");
     }
     let output = match command.output() {
@@ -6391,7 +6391,7 @@ fn run_examples_qwen35_speed_model(
         metrics.insert("command".to_string(), json!(command_display.clone()));
         metrics.insert(
             "graph_enabled".to_string(),
-            json!(!model_stem(&model).contains("0.8b")),
+            json!(!model_artifact_stem(&model).contains("0.8b")),
         );
         metrics.insert("stdout_hash".to_string(), json!(stdout_hash));
         metrics.insert("stderr_hash".to_string(), json!(stderr_hash));
@@ -6717,11 +6717,11 @@ fn resolve_perf_baseline_path(ctx: &EvalContext) -> Result<Option<PathBuf>, Stri
 }
 
 fn speed_model_id(model: &str) -> String {
-    model_stem(model).to_ascii_lowercase()
+    model_artifact_stem(model).to_ascii_lowercase()
 }
 
 fn speed_model_size(model: &str) -> Option<String> {
-    let stem = model_stem(model).to_ascii_lowercase();
+    let stem = model_artifact_stem(model).to_ascii_lowercase();
     for size in ["0.8b", "4b", "9b", "27b", "35b-a3b"] {
         if stem.contains(size) {
             return Some(size.to_string());
@@ -11270,24 +11270,6 @@ fn write_summary(
     fs::write(path, body).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
-fn model_stem(model: &str) -> String {
-    let name = Path::new(model)
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .unwrap_or(model);
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    sanitized.trim_matches('-').to_string()
-}
-
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_default()
 }
@@ -11314,7 +11296,7 @@ fn runtime_evidence_dir(config: &EvalConfig, label: &str, model: &str) -> PathBu
         .join(format!(
             "{}-{}",
             sanitize_path_component(label),
-            sanitize_path_component(&model_stem(model))
+            sanitize_path_component(&model_artifact_stem(model))
         ))
 }
 

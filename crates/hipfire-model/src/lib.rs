@@ -259,6 +259,25 @@ pub fn model_display_name(path: &Path) -> String {
         .to_string()
 }
 
+/// Derive a filesystem-safe identity stem from a model path or tag.
+pub fn model_artifact_stem(model: &str) -> String {
+    let name = Path::new(model)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(model);
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    sanitized.trim_matches('-').to_string()
+}
+
 /// Resolve a model identifier to a file path using the standard Hipfire local
 /// lookup order.
 pub fn find_model_in(arg: &str, models_dir: &Path, aliases_path: Option<&Path>) -> Option<PathBuf> {
@@ -541,6 +560,16 @@ mod tests {
             model_display_name(Path::new("qwen3.5-9b-mq4.hfq.tmp")),
             "qwen3.5-9b-mq4.hfq"
         );
+    }
+
+    #[test]
+    fn model_artifact_stem_sanitizes_paths_and_tags() {
+        assert_eq!(
+            model_artifact_stem("/tmp/qwen3.5-9b-awq-mq4.hfq"),
+            "qwen3.5-9b-awq-mq4"
+        );
+        assert_eq!(model_artifact_stem("qwen3.5:9b"), "qwen3");
+        assert_eq!(model_artifact_stem("***"), "");
     }
 
     #[test]
