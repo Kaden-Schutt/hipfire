@@ -43,7 +43,7 @@ use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_generate::validate_qwen35_fused_dense_prefill_batch_preflight;
 use hipfire_generate::{
     build_qwen35_fused_dense_prefill_batch_contract, compute_qwen35_prefix_hash,
-    generate_prefix_hash_json, plan_generate_batch_prefill_qwen35,
+    generate_prefix_hash_json, plan_generate_batch_prefill_qwen35, prefix_hash_preflight_done_json,
     qwen35_decode_batch_requested_auto, qwen35_decode_batch_scheduler_metadata,
     qwen35_fused_prefill_boundary_cuts, qwen35_grouped_moe_decode_auto_latency_gate_passed,
     qwen35_prefill_checkpoint_boundary_kind, qwen35_prefill_checkpoint_session_id,
@@ -4839,33 +4839,8 @@ fn run_prefix_hash_preflight_qwen35(
         );
     }
     let candidates = qwen35_prefix_hash_candidates(m, &envelope.session)?;
-    let full = candidates
-        .last()
-        .ok_or_else(|| "prefix_hash_preflight produced no candidates".to_string())?;
-    let prefixes: Vec<serde_json::Value> = candidates
-        .iter()
-        .map(|candidate| {
-            serde_json::json!({
-                "algorithm": candidate.hash.algorithm,
-                "value": candidate.hash.value,
-                "prefix_len": candidate.hash.prefix_len,
-                "boundary": candidate.boundary,
-                "boundary_index": candidate.boundary_index,
-            })
-        })
-        .collect();
-    let line = serde_json::json!({
-        "type": "prefix_hash_preflight_done",
-        "id": envelope.id,
-        "algorithm": "xxh128",
-        "boundary_policy": envelope.boundary_policy,
-        "prefixes": prefixes,
-        "full": {
-            "algorithm": full.hash.algorithm,
-            "value": full.hash.value,
-            "prefix_len": full.hash.prefix_len,
-        },
-    });
+    let line =
+        prefix_hash_preflight_done_json(&envelope.id, &envelope.boundary_policy, &candidates)?;
     let _ = writeln!(stdout, "{line}");
     let _ = stdout.flush();
     Ok(())

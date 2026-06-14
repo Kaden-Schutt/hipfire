@@ -259,6 +259,33 @@ pub struct PrefixHashPreflightCandidate {
     pub checkpoint_id: Option<String>,
 }
 
+pub fn prefix_hash_preflight_done_json(
+    id: &str,
+    boundary_policy: &str,
+    candidates: &[PrefixHashPreflightCandidate],
+) -> Result<serde_json::Value, String> {
+    let full = candidates
+        .last()
+        .ok_or_else(|| "prefix_hash_preflight produced no candidates".to_string())?;
+    let prefixes = candidates
+        .iter()
+        .map(|candidate| {
+            let mut value = generate_prefix_hash_json(&candidate.hash);
+            value["boundary"] = serde_json::Value::String(candidate.boundary.clone());
+            value["boundary_index"] = serde_json::Value::from(candidate.boundary_index);
+            value
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "type": "prefix_hash_preflight_done",
+        "id": id,
+        "algorithm": "xxh128",
+        "boundary_policy": boundary_policy,
+        "prefixes": prefixes,
+        "full": generate_prefix_hash_json(&full.hash),
+    }))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Qwen35SemanticBoundaryCheckpoint {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1568,6 +1595,64 @@ mod tests {
                 "algorithm": "xxh128",
                 "value": "0123456789abcdef0123456789abcdef",
                 "prefix_len": 7
+            })
+        );
+    }
+
+    #[test]
+    fn prefix_hash_preflight_done_json_shape_is_stable() {
+        let candidates = vec![
+            PrefixHashPreflightCandidate {
+                hash: GenerateBatchPrefillPrefixHash {
+                    algorithm: "xxh128".to_string(),
+                    value: "11111111111111111111111111111111".to_string(),
+                    prefix_len: 3,
+                },
+                boundary: "message_end".to_string(),
+                boundary_index: 0,
+                checkpoint_id: None,
+            },
+            PrefixHashPreflightCandidate {
+                hash: GenerateBatchPrefillPrefixHash {
+                    algorithm: "xxh128".to_string(),
+                    value: "22222222222222222222222222222222".to_string(),
+                    prefix_len: 8,
+                },
+                boundary: "full".to_string(),
+                boundary_index: 1,
+                checkpoint_id: None,
+            },
+        ];
+
+        assert_eq!(
+            prefix_hash_preflight_done_json("prefix-1", "semantic_chat_template", &candidates)
+                .expect("preflight response"),
+            serde_json::json!({
+                "type": "prefix_hash_preflight_done",
+                "id": "prefix-1",
+                "algorithm": "xxh128",
+                "boundary_policy": "semantic_chat_template",
+                "prefixes": [
+                    {
+                        "algorithm": "xxh128",
+                        "value": "11111111111111111111111111111111",
+                        "prefix_len": 3,
+                        "boundary": "message_end",
+                        "boundary_index": 0
+                    },
+                    {
+                        "algorithm": "xxh128",
+                        "value": "22222222222222222222222222222222",
+                        "prefix_len": 8,
+                        "boundary": "full",
+                        "boundary_index": 1
+                    }
+                ],
+                "full": {
+                    "algorithm": "xxh128",
+                    "value": "22222222222222222222222222222222",
+                    "prefix_len": 8
+                }
             })
         );
     }
