@@ -23,8 +23,9 @@ use hipfire_evidence::{
     directory_hash, evidence_artifact_index_entry_from_value_json,
     evidence_artifact_index_entry_json, evidence_record_json,
     extract_external_evidence_records_json, file_hash, list_files, model_hash, read_hfq_metadata,
-    run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
-    standard_evidence_paths_in_dir, EvidenceArtifactIndexContext, EvidenceRecord, RunProvenance,
+    run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
+    standard_evidence_paths_in_dir, EvidenceArtifactIndexContext, EvidenceRecord,
+    RunMetadataArtifact, RunMetadataConfig, RunMetadataModels, RunProvenance,
     STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
 use hipfire_model::{discover_dflash_draft_for_model, model_artifact_stem};
@@ -3477,54 +3478,44 @@ fn run_provenance_value(ctx: &EvalContext) -> Value {
 }
 
 fn run_metadata_artifact_value(config: &EvalConfig, ctx: &EvalContext) -> Value {
-    json!({
-        "schema": 1,
-        "kind": "run_metadata",
-        "status": "collected",
-        "runner": "hipfire-eval",
-        "runner_version": env!("CARGO_PKG_VERSION"),
-        "hipfire_version": env!("CARGO_PKG_VERSION"),
-        "created_utc": utc_now(),
-        "git": {
-            "commit": ctx.commit_sha,
-            "branch": ctx.git_branch,
-            "describe": ctx.git_describe,
-            "dirty": ctx.git_dirty,
+    run_metadata_artifact_json(RunMetadataArtifact {
+        created_utc: utc_now(),
+        provenance: run_provenance(ctx),
+        host_profile: serde_json::to_value(&ctx.host_profile).unwrap_or_else(|_| json!({})),
+        host_profile_hash: ctx.host_profile.host_profile_hash.clone(),
+        hardware_bucket: ctx.host_profile.hardware_bucket.clone(),
+        config: RunMetadataConfig {
+            tier: config.tier.as_str().to_string(),
+            tier_budget: serde_json::to_value(config.tier.budget()).unwrap_or_else(|_| json!({})),
+            batteries: config
+                .batteries
+                .iter()
+                .map(|b| b.as_str().to_string())
+                .collect(),
+            suites: config
+                .suites
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect(),
+            executor: config.executor.as_str().to_string(),
+            kv_mode: config.kv_mode.clone(),
+            max_tokens: config.max_tokens,
+            profile: config.profile.as_str().to_string(),
+            dflash: config.dflash.as_str().to_string(),
+            runs: config.runs,
+            warmup_runs: config.warmup_runs,
+            benchmark: config.benchmark,
+            host_memory_class: config.host_memory_class.clone(),
+            host_memory_width_bits: config.host_memory_width_bits,
+            host_memory_bandwidth_gbps: config.host_memory_bandwidth_gbps,
+            result_cache: config.result_cache.display().to_string(),
+            cache_mode: config.cache_mode.as_str().to_string(),
         },
-        "binary": {
-            "hash": ctx.binary_hash,
-        },
-        "host": {
-            "arch": ctx.arch,
-            "rocm": ctx.rocm,
-            "profile": ctx.host_profile,
-            "host_profile_hash": ctx.host_profile.host_profile_hash,
-            "hardware_bucket": ctx.host_profile.hardware_bucket,
-        },
-        "config": {
-            "tier": config.tier.as_str(),
-            "tier_budget": config.tier.budget(),
-            "batteries": config.batteries.iter().map(|b| b.as_str()).collect::<Vec<_>>(),
-            "suites": config.suites.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            "executor": config.executor.as_str(),
-            "kv_mode": config.kv_mode,
-            "max_tokens": config.max_tokens,
-            "profile": config.profile.as_str(),
-            "dflash": config.dflash.as_str(),
-            "runs": config.runs,
-            "warmup_runs": config.warmup_runs,
-            "benchmark": config.benchmark,
-            "host_memory_class": config.host_memory_class,
-            "host_memory_width_bits": config.host_memory_width_bits,
-            "host_memory_bandwidth_gbps": config.host_memory_bandwidth_gbps,
-            "result_cache": config.result_cache.display().to_string(),
-            "cache_mode": config.cache_mode.as_str(),
-        },
-        "models": {
-            "candidate": config.model,
-            "draft": config.draft,
-            "baseline": config.baseline,
-            "reference": config.reference,
+        models: RunMetadataModels {
+            candidate: config.model.clone(),
+            draft: config.draft.clone(),
+            baseline: config.baseline.clone(),
+            reference: config.reference.clone(),
         },
     })
 }
