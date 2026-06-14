@@ -85,7 +85,8 @@ Current daemon protocol boundary status:
 
 Current daemon adapter boundary status:
 - `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery, load/ping/unload/generate response loops, stale-response filtering, and daemon startup resource lease policy/helpers.
-- `hipfire-server::daemon::engine` remains a compatibility re-export for server and CLI callers while the adapter becomes reusable outside the HTTP server crate.
+- `hipfire-cli run` consumes `hipfire-daemon-adapter` and `hipfire-daemon-protocol` directly for daemon-backed execution instead of reaching those contracts through the server crate.
+- `hipfire-server::daemon::engine` remains a compatibility re-export for server callers while the adapter becomes reusable outside the HTTP server crate.
 
 Current evidence boundary status:
 - `hipfire-evidence` owns stable evidence hash helpers, directory digest, file hash, eval status, host-profile and sourced-field contracts, host-profile hardware-kind/bucket/bandwidth/hash policy, model/tag hash and HFQ metadata compatibility wrappers that delegate to `hipfire-model`, eval reference/slice/llama integrity verifiers, the standard evidence artifact catalog, catalog-based evidence artifact directory discovery, evidence artifact collection status policy, standard evidence artifact contract/JSON rendering, comparison/admission artifact contract rendering, admission required/observed evidence catalogs, the generic evidence artifact record contract/JSON renderer, external evidence record selection/annotation, comparison metric-direction policy, admission quality/review policy, admission verdict policy, run-provenance contract/JSON rendering, run-metadata artifact contract/JSON rendering, and artifact-index entry contract/JSON rendering.

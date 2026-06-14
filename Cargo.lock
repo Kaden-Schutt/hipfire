@@ -787,6 +787,8 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
+ "hipfire-daemon-adapter",
+ "hipfire-daemon-protocol",
  "hipfire-model",
  "hipfire-server",
  "indicatif",
