@@ -5570,9 +5570,8 @@ fn main() {
     // MQ4 (HFQ4G256), no runtime changes. Measures whether 2-bit noise on
     // routed experts survives the MoE sparse-usage rescue, before sinking
     // a week into new MoE-2bit GEMV kernels.
-    let use_mq4_routed_lloyd_mq2_exp = format == "mq4-routed-lloyd-mq2-exp"
-        || format == "mq4-routed-lloyd-mq2-experts"
-        ;
+    let use_mq4_routed_lloyd_mq2_exp =
+        format == "mq4-routed-lloyd-mq2-exp" || format == "mq4-routed-lloyd-mq2-experts";
     if use_mq4_routed_lloyd_mq2_exp {
         eprintln!(
             "note: --format mq4-routed-lloyd-mq2-exp is a quality probe — routed MoE\n\
@@ -5654,8 +5653,9 @@ fn main() {
     // direction because it writes back into the residual stream — gate/up
     // errors get partially absorbed by silu. Mirror that asymmetry in
     // MQ-family: 2-bit on gate_up, 3-bit on down.
-    let use_mq4_routed_lloyd_mq_antirez =
-        format == "mq4-routed-lloyd-mq-antirez" || format == "mq4-routed-lloyd-mq-asym" || format == "antirez-mq";
+    let use_mq4_routed_lloyd_mq_antirez = format == "mq4-routed-lloyd-mq-antirez"
+        || format == "mq4-routed-lloyd-mq-asym"
+        || format == "antirez-mq";
     // Lever 2: same recipe as antirez but with sequential-GPTQ Lloyd
     // on the gate_up_proj path instead of plain imatrix-weighted Lloyd.
     // Aims to reduce attractor risk at 2 bpw — if successful, opens path
@@ -6599,7 +6599,8 @@ fn main() {
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
                 let unit_col_weights: Vec<f32> = vec![1.0; k];
-                let q = if use_mq4_routed_lloyd_mq2_gptq_all || use_mq4_routed_lloyd_mq_antirez_gptq {
+                let q = if use_mq4_routed_lloyd_mq2_gptq_all || use_mq4_routed_lloyd_mq_antirez_gptq
+                {
                     quantize_mq2g256_lloyd_gptq(&f32_data, &unit_col_weights, &signs1, &signs2)
                 } else {
                     quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2)
@@ -7192,10 +7193,12 @@ fn main() {
             // Antirez-style: gate_up → MQ2, down → MQ3 (kmap-respecting).
             // Selects based on `base_name` ("gate_up_proj" vs "down_proj").
             let is_gate_up = base_name == "gate_up_proj";
-            let antirez_mq3 = (use_mq4_routed_lloyd_mq_antirez || use_mq4_routed_lloyd_mq_antirez_gptq)
+            let antirez_mq3 = (use_mq4_routed_lloyd_mq_antirez
+                || use_mq4_routed_lloyd_mq_antirez_gptq)
                 && !kmap_promote
                 && !is_gate_up;
-            let antirez_mq2 = (use_mq4_routed_lloyd_mq_antirez || use_mq4_routed_lloyd_mq_antirez_gptq)
+            let antirez_mq2 = (use_mq4_routed_lloyd_mq_antirez
+                || use_mq4_routed_lloyd_mq_antirez_gptq)
                 && !kmap_promote
                 && is_gate_up;
             // Lever 2: GPTQ-style sequential Lloyd specifically for the
@@ -7247,9 +7250,10 @@ fn main() {
             // Phase 5 tiered variant: also MQ3-Lloyd on hot non-promoted
             // layers (the ones in `mq3_tier_layers`, decided above by imatrix
             // .counts ranking).
-            let expert_lloyd_mq3_native =
-                ((use_mq4_routed_lloyd_mq3_kmap && !kmap_promote) || tiered_layer_is_mq3 || antirez_mq3)
-                    && supports_g256;
+            let expert_lloyd_mq3_native = ((use_mq4_routed_lloyd_mq3_kmap && !kmap_promote)
+                || tiered_layer_is_mq3
+                || antirez_mq3)
+                && supports_g256;
             // Per-expert column-weights from the imatrix file, used only by
             // the imatrix variant. Built once per parent (cheap), then sliced
             // per expert inside the rayon loop. Falls back to None when the
@@ -7272,7 +7276,10 @@ fn main() {
             } else {
                 None
             };
-            if use_mq4_routed_lloyd_mq2_imatrix && expert_lloyd_mq2_native && imatrix_per_expert.is_none() {
+            if use_mq4_routed_lloyd_mq2_imatrix
+                && expert_lloyd_mq2_native
+                && imatrix_per_expert.is_none()
+            {
                 eprintln!(
                     "  imatrix: no entry for {} → falling back to uniform Lloyd",
                     imatrix_lookup_name

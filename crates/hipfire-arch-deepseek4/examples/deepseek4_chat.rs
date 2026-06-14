@@ -151,8 +151,9 @@ fn sample_token(logits: &[f32], temp: f32, top_k: usize, rng: &mut Xorshift) -> 
 }
 
 fn main() -> Result<(), String> {
-    let path = std::env::var("HIPFIRE_DEEPSEEK4_MODEL")
-        .unwrap_or_else(|_| "/home/nick/.hipfire/models/deepseek-v4-flash-lloyd-mq2.hfq".to_string());
+    let path = std::env::var("HIPFIRE_DEEPSEEK4_MODEL").unwrap_or_else(|_| {
+        "/home/nick/.hipfire/models/deepseek-v4-flash-lloyd-mq2.hfq".to_string()
+    });
     let max_gen: u32 = std::env::var("HIPFIRE_DEEPSEEK4_GEN_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
