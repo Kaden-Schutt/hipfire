@@ -39,6 +39,10 @@ Current state boundary status:
 - `hipfire-state` owns sequence-state handles, parsed handle contracts, page descriptors, worker memory/runtime view structs, generic reservation helpers, and JSON rendering for state descriptors.
 - `hipfire-daemon` still owns loaded-model state maps, Qwen3.5 checkpoint attach/fork/release behavior, and backend-specific GPU state materialization.
 
+Current scheduler boundary status:
+- `hipfire-scheduler` owns Rust parity contracts for priority classes, prefill/decode scheduler policy, model-worker compatibility, request-session drafts, prefill queue selection, decode active-set batching, backpressure, opportunistic dispatch, and deadline aging.
+- Bun scheduler code remains the live server control plane until Rust server paths consume the shared scheduler crate.
+
 Current evidence boundary status:
 - `hipfire-evidence` owns stable hash, model/tag hash, directory digest, file hash, and HFQ metadata extraction helpers.
 - `hipfire-runtime::eval_harness` still owns eval execution and artifact writing, but now consumes the shared evidence provenance helpers.

@@ -791,6 +791,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-scheduler"
+version = "0.2.0"
+
+[[package]]
 name = "hipfire-server"
 version = "0.2.1"
 dependencies = [
