@@ -4,6 +4,7 @@
 
 //! Typed generation request, event, and batch-plan contracts.
 
+use hipfire_model::{is_qwen35_dense_arch_id, is_qwen35_moe_arch_id, ARCH_ID_QWEN35_MOE};
 pub use hipfire_state::SequenceStatePrefixHash as GenerateBatchPrefillPrefixHash;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -790,10 +791,15 @@ pub fn plan_generate_batch_prefill_qwen35(
     arch_id: u32,
     session_count: usize,
 ) -> GenerateBatchPrefillPlan {
-    match (arch_id, session_count > 1) {
-        (5, true) => GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
-        (6, true) => GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
-        _ => GenerateBatchPrefillPlan::SerialExact,
+    if session_count <= 1 {
+        return GenerateBatchPrefillPlan::SerialExact;
+    }
+    if is_qwen35_dense_arch_id(arch_id) {
+        GenerateBatchPrefillPlan::FusedDenseQwen35Candidate
+    } else if is_qwen35_moe_arch_id(arch_id) {
+        GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate
+    } else {
+        GenerateBatchPrefillPlan::SerialExact
     }
 }
 
@@ -1097,7 +1103,7 @@ pub fn select_qwen35_decode_batch_backend(
             "generate_batch_decode_step disabled by HIPFIRE_QWEN35_DECODE_BATCH=off".to_string(),
         ),
         "fused" | "fused_dense" | "fused_dense_layer_chunked" => {
-            if arch_id != 5 {
+            if !is_qwen35_dense_arch_id(arch_id) {
                 return Err(format!(
                     "qwen35 fused dense decode batch requested, but arch_id={arch_id} is not dense Qwen35"
                 ));
@@ -1105,7 +1111,7 @@ pub fn select_qwen35_decode_batch_backend(
             Ok(Qwen35DecodeBatchBackend::FusedDenseLayerChunked)
         }
         "fused_grouped_moe" | "grouped_moe" | "fused_grouped_moe_layer_chunked" => {
-            if arch_id != 6 {
+            if !is_qwen35_moe_arch_id(arch_id) {
                 return Err(format!(
                     "qwen35 grouped-MoE decode batch requested, but arch_id={arch_id} is not Qwen35 grouped-MoE"
                 ));
@@ -1167,12 +1173,12 @@ pub fn qwen35_decode_batch_scheduler_metadata(
 ) -> Qwen35DecodeBatchSchedulerMetadata {
     let fallback_reason = if qwen35_decode_batch_requested_auto(requested) {
         match (arch_id, backend) {
-            (6, Qwen35DecodeBatchBackend::SerialReference)
+            (ARCH_ID_QWEN35_MOE, Qwen35DecodeBatchBackend::SerialReference)
                 if !qwen35_grouped_moe_decode_auto_latency_gate_passed(batch_size) =>
             {
                 "auto_grouped_moe_serial_small_batch_latency_gate"
             }
-            (6, Qwen35DecodeBatchBackend::SerialReference) => {
+            (ARCH_ID_QWEN35_MOE, Qwen35DecodeBatchBackend::SerialReference) => {
                 "auto_grouped_moe_serial_pending_latency_gate"
             }
             (_, Qwen35DecodeBatchBackend::SerialReference) if batch_size < 2 => {
@@ -1207,6 +1213,7 @@ pub struct GenerationTiming {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_model::ARCH_ID_QWEN35_DENSE;
 
     fn prefill_session(id: &str) -> GenerateBatchPrefillSession {
         GenerateBatchPrefillSession {
@@ -1568,20 +1575,22 @@ mod tests {
     #[test]
     fn qwen35_decode_backend_selection_matches_daemon_policy() {
         assert_eq!(
-            select_qwen35_decode_batch_backend("auto", 6, 4).unwrap(),
+            select_qwen35_decode_batch_backend("auto", ARCH_ID_QWEN35_MOE, 4).unwrap(),
             Qwen35DecodeBatchBackend::SerialReference
         );
         assert_eq!(
-            select_qwen35_decode_batch_backend("fused", 5, 1).unwrap(),
+            select_qwen35_decode_batch_backend("fused", ARCH_ID_QWEN35_DENSE, 1).unwrap(),
             Qwen35DecodeBatchBackend::FusedDenseLayerChunked
         );
         assert_eq!(
-            select_qwen35_decode_batch_backend("grouped_moe", 6, 2).unwrap(),
+            select_qwen35_decode_batch_backend("grouped_moe", ARCH_ID_QWEN35_MOE, 2).unwrap(),
             Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked
         );
-        assert!(select_qwen35_decode_batch_backend("grouped_moe", 6, 1)
-            .unwrap_err()
-            .contains("at least two sessions"));
+        assert!(
+            select_qwen35_decode_batch_backend("grouped_moe", ARCH_ID_QWEN35_MOE, 1)
+                .unwrap_err()
+                .contains("at least two sessions")
+        );
     }
 
     #[test]
@@ -1644,7 +1653,7 @@ mod tests {
     fn qwen35_decode_scheduler_metadata_reports_fallback_reason() {
         let metadata = qwen35_decode_batch_scheduler_metadata(
             "auto",
-            6,
+            ARCH_ID_QWEN35_MOE,
             Qwen35DecodeBatchBackend::SerialReference,
             2,
             16,
@@ -1660,7 +1669,7 @@ mod tests {
 
         let requested = qwen35_decode_batch_scheduler_metadata(
             "serial",
-            5,
+            ARCH_ID_QWEN35_DENSE,
             Qwen35DecodeBatchBackend::SerialReference,
             2,
             8,

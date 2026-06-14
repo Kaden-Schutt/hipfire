@@ -51,6 +51,60 @@ pub struct ModelWorkerKey {
     pub feature_flags: Vec<String>,
 }
 
+pub const ARCH_ID_LLAMA_MISTRAL: u32 = 0;
+pub const ARCH_ID_QWEN3_QWEN2_LEGACY: u32 = 1;
+pub const ARCH_ID_QWEN35_DENSE: u32 = 5;
+pub const ARCH_ID_QWEN35_MOE: u32 = 6;
+pub const ARCH_ID_QWEN2: u32 = 7;
+pub const ARCH_ID_DOTS_OCR: u32 = 8;
+pub const ARCH_ID_DEEPSEEK4_FLASH: u32 = 9;
+pub const ARCH_ID_MINIMAX_M2: u32 = 10;
+pub const ARCH_ID_LFM2_MOE: u32 = 11;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelArchFamily {
+    LlamaMistral,
+    Qwen3Qwen2Legacy,
+    Qwen35Dense,
+    Qwen35Moe,
+    Qwen2,
+    DotsOcr,
+    DeepSeek4Flash,
+    MiniMaxM2,
+    Lfm2Moe,
+    Unknown,
+}
+
+pub fn model_arch_family(arch_id: u32) -> ModelArchFamily {
+    match arch_id {
+        ARCH_ID_LLAMA_MISTRAL => ModelArchFamily::LlamaMistral,
+        ARCH_ID_QWEN3_QWEN2_LEGACY => ModelArchFamily::Qwen3Qwen2Legacy,
+        ARCH_ID_QWEN35_DENSE => ModelArchFamily::Qwen35Dense,
+        ARCH_ID_QWEN35_MOE => ModelArchFamily::Qwen35Moe,
+        ARCH_ID_QWEN2 => ModelArchFamily::Qwen2,
+        ARCH_ID_DOTS_OCR => ModelArchFamily::DotsOcr,
+        ARCH_ID_DEEPSEEK4_FLASH => ModelArchFamily::DeepSeek4Flash,
+        ARCH_ID_MINIMAX_M2 => ModelArchFamily::MiniMaxM2,
+        ARCH_ID_LFM2_MOE => ModelArchFamily::Lfm2Moe,
+        _ => ModelArchFamily::Unknown,
+    }
+}
+
+pub fn is_qwen35_dense_arch_id(arch_id: u32) -> bool {
+    model_arch_family(arch_id) == ModelArchFamily::Qwen35Dense
+}
+
+pub fn is_qwen35_moe_arch_id(arch_id: u32) -> bool {
+    model_arch_family(arch_id) == ModelArchFamily::Qwen35Moe
+}
+
+pub fn is_qwen35_family_arch_id(arch_id: u32) -> bool {
+    matches!(
+        model_arch_family(arch_id),
+        ModelArchFamily::Qwen35Dense | ModelArchFamily::Qwen35Moe
+    )
+}
+
 pub fn normalize_feature_flags(flags: &[String]) -> Vec<String> {
     let mut flags = flags.to_vec();
     flags.sort();
@@ -439,6 +493,24 @@ mod tests {
         );
         assert_eq!(model_worker_key_id(&base), model_worker_key_id(&shuffled));
         assert!(same_model_worker_key(&base, &shuffled));
+    }
+
+    #[test]
+    fn arch_id_classification_identifies_qwen35_variants() {
+        assert_eq!(
+            model_arch_family(ARCH_ID_QWEN35_DENSE),
+            ModelArchFamily::Qwen35Dense
+        );
+        assert_eq!(
+            model_arch_family(ARCH_ID_QWEN35_MOE),
+            ModelArchFamily::Qwen35Moe
+        );
+        assert!(is_qwen35_dense_arch_id(ARCH_ID_QWEN35_DENSE));
+        assert!(is_qwen35_moe_arch_id(ARCH_ID_QWEN35_MOE));
+        assert!(is_qwen35_family_arch_id(ARCH_ID_QWEN35_DENSE));
+        assert!(is_qwen35_family_arch_id(ARCH_ID_QWEN35_MOE));
+        assert!(!is_qwen35_family_arch_id(ARCH_ID_QWEN2));
+        assert_eq!(model_arch_family(999), ModelArchFamily::Unknown);
     }
 
     #[test]

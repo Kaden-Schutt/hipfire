@@ -6,6 +6,7 @@ license.workspace = true
 description = "Typed generation request, event, and batch-plan contracts for hipfire"
 
 [dependencies]
+hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hipfire-state = { path = "../hipfire-state" }
 serde = { version = "1", features = ["derive"] }

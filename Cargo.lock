@@ -896,6 +896,7 @@ version = "0.2.1"
 name = "hipfire-generate"
 version = "0.2.1"
 dependencies = [
+ "hipfire-model",
  "hipfire-prompt",
  "hipfire-state",
  "serde",
