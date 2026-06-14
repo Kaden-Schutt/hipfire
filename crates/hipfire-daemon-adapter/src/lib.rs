@@ -4,8 +4,10 @@
 
 //! Async daemon JSONL process adapter.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use hipfire_daemon_protocol::{
@@ -275,11 +277,332 @@ pub fn find_daemon_bin() -> Option<PathBuf> {
     None
 }
 
+#[derive(Debug)]
+pub struct ResourceLease {
+    dirs: Vec<PathBuf>,
+}
+
+impl Drop for ResourceLease {
+    fn drop(&mut self) {
+        for dir in self.dirs.drain(..).rev() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+pub fn sanitize_resource_id(id: &str) -> String {
+    let mut out = String::with_capacity(id.len().max(1));
+    for ch in id.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
+fn parse_csv_ids(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+pub fn parse_cpu_core_list(raw: Option<String>) -> Result<Vec<usize>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut out = BTreeSet::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = trimmed.split_once('-') {
+            let start = start
+                .parse::<usize>()
+                .map_err(|_| format!("invalid CPU core id: {trimmed}"))?;
+            let end = end
+                .parse::<usize>()
+                .map_err(|_| format!("invalid CPU core id: {trimmed}"))?;
+            if end < start {
+                return Err(format!("invalid CPU core range: {trimmed}"));
+            }
+            for core in start..=end {
+                out.insert(core);
+            }
+        } else {
+            out.insert(
+                trimmed
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid CPU core id: {trimmed}"))?,
+            );
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
+fn resolve_visible_hip_ids() -> Vec<String> {
+    std::env::var("HIP_VISIBLE_DEVICES")
+        .ok()
+        .or_else(|| std::env::var("ROCR_VISIBLE_DEVICES").ok())
+        .map(|raw| parse_csv_ids(&raw))
+        .filter(|ids| !ids.is_empty())
+        .unwrap_or_default()
+}
+
+pub fn resolve_hip_lock_ids() -> Vec<String> {
+    let visible = resolve_visible_hip_ids();
+    if let Ok(raw) = std::env::var("HIPFIRE_DEVICES") {
+        let ids = parse_csv_ids(&raw);
+        if !ids.is_empty() {
+            return ids
+                .into_iter()
+                .map(|id| {
+                    id.parse::<usize>()
+                        .ok()
+                        .and_then(|idx| visible.get(idx).cloned())
+                        .unwrap_or(id)
+                })
+                .collect();
+        }
+    }
+    visible.into_iter().next().into_iter().collect::<Vec<_>>()
+}
+
+fn discover_npu_lock_ids() -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for root in ["/sys/class/accel", "/dev/accel"] {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    ids.insert(name.to_string());
+                }
+            }
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn resolve_npu_lock_ids() -> Vec<String> {
+    // HIPFIRE_RESOURCE_LOCK_NPUS=1 leases every detected NPU; comma lists lease explicit NPU IDs.
+    let Ok(raw) = std::env::var("HIPFIRE_RESOURCE_LOCK_NPUS") else {
+        return Vec::new();
+    };
+    let trimmed = raw.trim();
+    if matches!(
+        trimmed,
+        "" | "0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO"
+    ) {
+        return Vec::new();
+    }
+    if matches!(trimmed, "1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES") {
+        return discover_npu_lock_ids();
+    }
+    parse_csv_ids(trimmed)
+}
+
+pub fn resource_lock_requests() -> Result<Vec<String>, String> {
+    let mut resources = Vec::new();
+    let hip_ids = resolve_hip_lock_ids();
+    if hip_ids.is_empty() {
+        resources.push("hip-gpu-0".to_string());
+    } else {
+        resources.extend(
+            hip_ids
+                .into_iter()
+                .map(|id| format!("hip-gpu-{}", sanitize_resource_id(&id))),
+        );
+    }
+    resources.extend(
+        resolve_npu_lock_ids()
+            .into_iter()
+            .map(|id| format!("npu-{}", sanitize_resource_id(&id))),
+    );
+    resources.extend(
+        // HIPFIRE_RESOURCE_LOCK_CPU_CORES=0,2-4 adds daemon startup leases for CPU cores.
+        parse_cpu_core_list(std::env::var("HIPFIRE_RESOURCE_LOCK_CPU_CORES").ok())?
+            .into_iter()
+            .map(|core| format!("cpu-core-{core}")),
+    );
+    resources.sort();
+    resources.dedup();
+    Ok(resources)
+}
+
+#[cfg(unix)]
+fn pid_is_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: i64) -> bool {
+    true
+}
+
+fn read_lock_owner(lock_dir: &Path) -> Option<serde_json::Value> {
+    std::fs::read_to_string(lock_dir.join("owner.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+}
+
+fn current_hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn write_lock_owner(lock_dir: &Path, resource: &str) -> std::io::Result<()> {
+    let command = std::env::args().collect::<Vec<_>>().join(" ");
+    let owner = serde_json::json!({
+        "pid": std::process::id(),
+        "host": current_hostname(),
+        "command": command,
+        "started_at_unix_ms": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        "resource": resource,
+    });
+    let path = lock_dir.join("owner.json");
+    std::fs::write(path, format!("{owner:#}\n"))
+}
+
+pub fn try_acquire_resource_lock(root: &Path, resource: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(root).map_err(|e| format!("create {}: {e}", root.display()))?;
+    let lock_dir = root.join(format!("{resource}.lock"));
+    match std::fs::create_dir(&lock_dir) {
+        Ok(()) => {
+            write_lock_owner(&lock_dir, resource)
+                .map_err(|e| format!("write {}: {e}", lock_dir.join("owner.json").display()))?;
+            return Ok(lock_dir);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("create {}: {e}", lock_dir.display())),
+    }
+
+    let owner = read_lock_owner(&lock_dir);
+    let owner_pid = owner
+        .as_ref()
+        .and_then(|v| v.get("pid"))
+        .and_then(|v| v.as_i64());
+    if owner_pid.is_some_and(|pid| !pid_is_alive(pid)) {
+        let _ = std::fs::remove_dir_all(&lock_dir);
+        match std::fs::create_dir(&lock_dir) {
+            Ok(()) => {
+                write_lock_owner(&lock_dir, resource)
+                    .map_err(|e| format!("write {}: {e}", lock_dir.join("owner.json").display()))?;
+                return Ok(lock_dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("create {}: {e}", lock_dir.display())),
+        }
+    }
+
+    let owner_text = owner
+        .as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "unknown owner".to_string());
+    Err(format!(
+        "hipfire resource {resource} is already locked by {owner_text}"
+    ))
+}
+
+pub fn acquire_resource_lease_or_exit() -> ResourceLease {
+    // HIPFIRE_RESOURCE_LOCK=0 disables daemon startup resource leases.
+    if std::env::var("HIPFIRE_RESOURCE_LOCK").ok().as_deref() == Some("0") {
+        return ResourceLease { dirs: Vec::new() };
+    }
+
+    let resources = match resource_lock_requests() {
+        Ok(resources) => resources,
+        Err(e) => {
+            eprintln!("FATAL: invalid hipfire resource lock config: {e}");
+            std::process::exit(1);
+        }
+    };
+    if resources.is_empty() {
+        return ResourceLease { dirs: Vec::new() };
+    }
+
+    // HIPFIRE_RESOURCE_LOCK_DIR overrides the daemon resource-lock root directory.
+    let root = std::env::var("HIPFIRE_RESOURCE_LOCK_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("hipfire-resource-locks"));
+    // HIPFIRE_RESOURCE_LOCK_WAIT_MS waits for busy daemon resource leases before failing startup.
+    let wait_ms = std::env::var("HIPFIRE_RESOURCE_LOCK_WAIT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(0);
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
+    let mut dirs = Vec::new();
+
+    for resource in &resources {
+        loop {
+            match try_acquire_resource_lock(&root, resource) {
+                Ok(dir) => {
+                    dirs.push(dir);
+                    break;
+                }
+                Err(_) if wait_ms > 0 && Instant::now() < deadline => {
+                    std::thread::sleep(
+                        Duration::from_millis(250)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    for dir in dirs.drain(..).rev() {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                    eprintln!("FATAL: {e}");
+                    eprintln!(
+                        "Set HIPFIRE_RESOURCE_LOCK_WAIT_MS to wait, or HIPFIRE_RESOURCE_LOCK=0 to bypass."
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[hipfire] resource locks acquired: {}",
+        resources.join(", ")
+    );
+    ResourceLease { dirs }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hipfire_daemon_protocol::GenerationSamplingPolicy;
     use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn temp_lock_root(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "hipfire-daemon-lock-test-{label}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
 
     struct MockTransport {
         sent: Vec<String>,
@@ -397,5 +720,55 @@ mod tests {
         let (text, done) = engine.generate(req).await.unwrap();
         assert_eq!(text, "hello world");
         assert_eq!(done.tokens, 2);
+    }
+
+    #[test]
+    fn resource_lock_cpu_core_list_parser_matches_cli_shape() {
+        assert_eq!(
+            parse_cpu_core_list(Some("0,2-4,3".to_string())).unwrap(),
+            vec![0, 2, 3, 4]
+        );
+        assert!(parse_cpu_core_list(Some("4-2".to_string()))
+            .unwrap_err()
+            .contains("invalid CPU core range"));
+        assert!(parse_cpu_core_list(Some("gpu0".to_string()))
+            .unwrap_err()
+            .contains("invalid CPU core id"));
+    }
+
+    #[test]
+    fn resource_lock_maps_logical_hipfire_devices_through_visible_devices() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("HIP_VISIBLE_DEVICES", "3,5");
+            std::env::remove_var("ROCR_VISIBLE_DEVICES");
+            std::env::set_var("HIPFIRE_DEVICES", "1");
+        }
+        assert_eq!(resolve_hip_lock_ids(), vec!["5".to_string()]);
+        unsafe {
+            std::env::remove_var("HIP_VISIBLE_DEVICES");
+            std::env::remove_var("HIPFIRE_DEVICES");
+        }
+    }
+
+    #[test]
+    fn resource_lock_rejects_live_owner_and_reclaims_stale_owner() {
+        let root = temp_lock_root("reclaim");
+        let first = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap();
+        let busy = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap_err();
+        assert!(busy.contains("hipfire resource hip-gpu-0 is already locked"));
+        std::fs::remove_dir_all(&first).unwrap();
+
+        let stale = root.join("hip-gpu-0.lock");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(
+            stale.join("owner.json"),
+            r#"{"pid":-1,"host":"test","command":"old","resource":"hip-gpu-0"}"#,
+        )
+        .unwrap();
+        let replacement = try_acquire_resource_lock(&root, "hip-gpu-0").unwrap();
+        let owner = std::fs::read_to_string(replacement.join("owner.json")).unwrap();
+        assert!(owner.contains(&format!("\"pid\": {}", std::process::id())));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
