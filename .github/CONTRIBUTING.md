@@ -172,7 +172,7 @@ llama.cpp's `ggml-quants.c` into
 | Feature | `feature/<short-name>` |
 | Bug fix | `fix/<short-name>` |
 | Arch port | `port/<arch>-<kernel>` |
-| Benchmark contribution | `bench/<gpu-name>` |
+| Benchmark contribution | `perf/<gpu-name>` |
 
 ### PR template
 
