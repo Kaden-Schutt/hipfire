@@ -4209,6 +4209,12 @@ fn dflash_trace_metrics(row: &EvalResult) -> BTreeMap<String, Value> {
         "rollback_fast_replay_admission",
         "rollback_fast_replay_admission",
     );
+    copy_json_metric(
+        &row.metrics,
+        &mut metrics,
+        "rollback_wo_delta_compare",
+        "rollback_wo_delta_compare",
+    );
 
     if let Some(ar_baseline) = row.metrics.get("ar_baseline").and_then(Value::as_bool) {
         metrics.insert(

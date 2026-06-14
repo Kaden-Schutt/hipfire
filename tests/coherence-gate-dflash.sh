@@ -1058,13 +1058,19 @@ serial_tape_frame_pattern = re.compile(
     r"serial_start=(\d+) serial_end=(\d+) replay_end=(\d+)$",
     re.MULTILINE,
 )
+layer_major_frame_pattern = re.compile(
+    r"^\[dflash-rollback-fast-token-major-layer-major-frame-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) "
+    r"serial_start=(\d+) serial_end=(\d+) replay_end=(\d+)$",
+    re.MULTILINE,
+)
 match_pattern = re.compile(
-    r"^\[(dflash-rollback-fast-token-major-(?:attn-out|serial-tape-attn-out|serial|vs-production|prefix-serial)-compare)\] "
+    r"^\[(dflash-rollback-fast-token-major-(?:attn-out|serial-tape-attn-out|serial|vs-production|prefix-serial|prefix-la0-serial|layer-major-frame-attn-out|layer-major-frame-serial)-compare)\] "
     r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?match$",
     re.MULTILINE,
 )
 mismatch_pattern = re.compile(
-    r"^\[(dflash-rollback-fast-token-major-(?:attn-out|serial-tape-attn-out|serial|vs-production|prefix-serial)-compare)\] "
+    r"^\[(dflash-rollback-fast-token-major-(?:attn-out|serial-tape-attn-out|serial|vs-production|prefix-serial|prefix-la0-serial|layer-major-frame-attn-out|layer-major-frame-serial)-compare)\] "
     r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
     r"(?:step=(\d+) )?mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) "
     r"differing_bytes=(\d+) first_offset=(\d+) "
@@ -1155,6 +1161,18 @@ frames.extend([
         "replay_end": int(m.group(6)),
     }
     for m in serial_tape_frame_pattern.finditer(out)
+])
+frames.extend([
+    {
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+        "kind": "layer-major",
+        "serial_start": int(m.group(4)),
+        "serial_end": int(m.group(5)),
+        "replay_end": int(m.group(6)),
+    }
+    for m in layer_major_frame_pattern.finditer(out)
 ])
 
 events.sort(key=lambda event: event[0])
@@ -1798,6 +1816,84 @@ print(json.dumps(payload, sort_keys=True))
 PYEOF
 )
 
+ROLLBACK_WO_DELTA_COMPARE_PY=$(cat <<'PYEOF'
+import sys, re, json, math
+if len(sys.argv) != 2:
+    print(json.dumps({"ok": False, "reason": "usage"}))
+    sys.exit(0)
+out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+
+match_pattern = re.compile(
+    r"^\[dflash-rollback-wo-delta-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?match$",
+    re.MULTILINE,
+)
+mismatch_pattern = re.compile(
+    r"^\[dflash-rollback-wo-delta-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
+    r"mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) differing_bytes=(\d+) "
+    r"first_offset=(\d+) serial_byte=(\d+) verify_byte=(\d+)(.*)$",
+    re.MULTILINE,
+)
+
+def parse_context(context):
+    parsed = {}
+    if not context:
+        return parsed
+    for key, raw in re.findall(r"\b([A-Za-z0-9_]+)=([+\-0-9.eE]+|NaN|nan|inf|-inf)", context):
+        if key in {"f32_words", "f32_bit_diff_words"}:
+            parsed[key] = int(raw)
+        else:
+            value = float(raw)
+            parsed[key] = value if math.isfinite(value) else raw
+    return parsed
+
+events = []
+for m in match_pattern.finditer(out):
+    events.append((m.start(), {
+        "ok": True,
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+    }))
+for m in mismatch_pattern.finditer(out):
+    context = m.group(11).strip() or None
+    events.append((m.start(), {
+        "ok": False,
+        "reason": "rollback_wo_delta_mismatch",
+        "pos": int(m.group(1)),
+        "accepted": int(m.group(2)),
+        "replay_steps": int(m.group(3)),
+        "family": m.group(4),
+        "index": int(m.group(5)),
+        "bytes": int(m.group(6)),
+        "differing_bytes": int(m.group(7)),
+        "first_offset": int(m.group(8)),
+        "serial_byte": int(m.group(9)),
+        "verify_byte": int(m.group(10)),
+        "context": context,
+        "stats": parse_context(context),
+    }))
+
+events.sort(key=lambda event: event[0])
+checks = [event for _, event in events]
+mismatches = [event for event in checks if not event.get("ok", False)]
+payload = {
+    "ok": len(checks) > 0 and not mismatches,
+    "checked": len(checks),
+    "matches": sum(1 for event in checks if event.get("ok", False)),
+    "mismatches": len(mismatches),
+    "checks": checks,
+}
+if not checks:
+    payload["ok"] = True
+if mismatches:
+    payload["first_mismatch"] = mismatches[0]
+    payload["reason"] = mismatches[0].get("reason", "rollback_wo_delta_mismatch")
+print(json.dumps(payload, sort_keys=True))
+PYEOF
+)
+
 ROLLBACK_FAST_REPLAY_ADMISSION_PY=$(cat <<'PYEOF'
 import sys, json
 if len(sys.argv) not in (3, 4):
@@ -1875,6 +1971,110 @@ if logit.get("max_abs_over_margin") is not None:
     payload["max_abs_over_margin"] = logit["max_abs_over_margin"]
 if logit.get("max_abs_over_margin_row"):
     payload["max_abs_over_margin_row"] = logit["max_abs_over_margin_row"]
+print(json.dumps(payload, sort_keys=True))
+PYEOF
+)
+
+ROLLBACK_SERIAL_TAPE_ADMISSION_PY=$(cat <<'PYEOF'
+import sys, re, json
+if len(sys.argv) != 2:
+    print(json.dumps({"verdict": "not_evaluated", "reason": "usage"}))
+    sys.exit(0)
+out = open(sys.argv[1], "rb").read().decode("utf-8", "replace")
+
+attn_match_pattern = re.compile(
+    r"^\[dflash-rollback-fast-token-major-serial-tape-attn-out-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?match$",
+    re.MULTILINE,
+)
+attn_mismatch_pattern = re.compile(
+    r"^\[dflash-rollback-fast-token-major-serial-tape-attn-out-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
+    r"step=(\d+) mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) "
+    r"differing_bytes=(\d+) first_offset=(\d+) replay_byte=(\d+) tape_byte=(\d+)(.*)$",
+    re.MULTILINE,
+)
+state_match_pattern = re.compile(
+    r"^\[dflash-rollback-serial-tape-state-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?match$",
+    re.MULTILINE,
+)
+state_mismatch_pattern = re.compile(
+    r"^\[dflash-rollback-serial-tape-state-compare\] "
+    r"pos=(\d+) accepted=(\d+) replay_steps=(\d+) (?:(?:forced_serial|serial_tape_live)=1 )?"
+    r"mismatch family=([A-Za-z0-9_]+) index=(\d+) bytes=(\d+) differing_bytes=(\d+) "
+    r"first_offset=(\d+) serial_byte=(\d+) serial_tape_byte=(\d+)(.*)$",
+    re.MULTILINE,
+)
+
+def event(kind, ok, match):
+    base = {
+        "kind": kind,
+        "ok": ok,
+        "pos": int(match.group(1)),
+        "accepted": int(match.group(2)),
+        "replay_steps": int(match.group(3)),
+    }
+    return base
+
+events = []
+for m in attn_match_pattern.finditer(out):
+    events.append((m.start(), event("attn_out", True, m)))
+for m in state_match_pattern.finditer(out):
+    events.append((m.start(), event("state", True, m)))
+for m in attn_mismatch_pattern.finditer(out):
+    e = event("attn_out", False, m)
+    e.update({
+        "step": int(m.group(4)),
+        "family": m.group(5),
+        "index": int(m.group(6)),
+        "bytes": int(m.group(7)),
+        "differing_bytes": int(m.group(8)),
+        "first_offset": int(m.group(9)),
+        "actual_byte": int(m.group(10)),
+        "expected_byte": int(m.group(11)),
+        "context": m.group(12).strip() or None,
+    })
+    events.append((m.start(), e))
+for m in state_mismatch_pattern.finditer(out):
+    e = event("state", False, m)
+    e.update({
+        "family": m.group(4),
+        "index": int(m.group(5)),
+        "bytes": int(m.group(6)),
+        "differing_bytes": int(m.group(7)),
+        "first_offset": int(m.group(8)),
+        "expected_byte": int(m.group(9)),
+        "actual_byte": int(m.group(10)),
+        "context": m.group(11).strip() or None,
+    })
+    events.append((m.start(), e))
+
+events.sort(key=lambda event: event[0])
+checks = [event for _, event in events]
+mismatches = [event for event in checks if not event.get("ok", False)]
+attn_checked = sum(1 for event in checks if event["kind"] == "attn_out")
+state_checked = sum(1 for event in checks if event["kind"] == "state")
+blockers = []
+if attn_checked <= 0:
+    blockers.append("missing_serial_tape_attn_out_compare")
+if state_checked <= 0:
+    blockers.append("missing_serial_tape_state_compare")
+if any(event["kind"] == "attn_out" for event in mismatches):
+    blockers.append("serial_tape_attn_out_mismatch")
+if any(event["kind"] == "state" for event in mismatches):
+    blockers.append("serial_tape_state_mismatch")
+payload = {
+    "verdict": "admitted" if not blockers else ("not_evaluated" if len(checks) == 0 else "rejected"),
+    "blockers": blockers,
+    "checked": len(checks),
+    "attn_out_checked": attn_checked,
+    "state_checked": state_checked,
+    "matches": sum(1 for event in checks if event.get("ok", False)),
+    "mismatches": len(mismatches),
+}
+if mismatches:
+    payload["first_mismatch"] = mismatches[0]
 print(json.dumps(payload, sort_keys=True))
 PYEOF
 )
@@ -1961,8 +2161,10 @@ for entry in "${tests[@]}"; do
     rollback_x_in_compare="not_checked"
     rollback_qkvza_repair_compare="not_checked"
     rollback_hidden_boundary_compare="not_checked"
+    rollback_wo_delta_compare="not_checked"
     rollback_fast_token_major_compare="not_checked"
     rollback_fast_replay_admission="not_checked"
+    rollback_serial_tape_admission="not_checked"
     if [ "$AR_PARITY" = "1" ] && [ "$mode" = "dflash" ]; then
         rollback_replay=$(python3 -c "$ROLLBACK_REPLAY_PY" "$out_file")
         rollback_replay_ok=$(echo "$rollback_replay" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))")
@@ -1990,8 +2192,15 @@ for entry in "${tests[@]}"; do
         rollback_x_in_compare=$(python3 -c "$ROLLBACK_X_IN_COMPARE_PY" "$out_file")
         rollback_qkvza_repair_compare=$(python3 -c "$ROLLBACK_QKVZA_REPAIR_COMPARE_PY" "$out_file")
         rollback_hidden_boundary_compare=$(python3 -c "$ROLLBACK_HIDDEN_BOUNDARY_COMPARE_PY" "$out_file")
+        rollback_wo_delta_compare=$(python3 -c "$ROLLBACK_WO_DELTA_COMPARE_PY" "$out_file")
         rollback_fast_token_major_compare=$(python3 -c "$ROLLBACK_FAST_TOKEN_MAJOR_COMPARE_PY" "$out_file")
         rollback_fast_replay_admission=$(python3 -c "$ROLLBACK_FAST_REPLAY_ADMISSION_PY" "$rollback_logit_compare" "$rollback_state_compare" "$rollback_input_compare")
+        rollback_serial_tape_admission=$(python3 -c "$ROLLBACK_SERIAL_TAPE_ADMISSION_PY" "$out_file")
+        rollback_serial_tape_verdict=$(echo "$rollback_serial_tape_admission" | python3 -c "import sys,json; print(json.load(sys.stdin).get('verdict', 'not_evaluated'))")
+        if [ "$rollback_serial_tape_verdict" != "admitted" ]; then
+            status="HARD_ERROR (serial tape replay: $rollback_serial_tape_admission)"
+            hard_errors=$((hard_errors + 1))
+        fi
     fi
 
     if [ "$mode" = "dflash" ]; then
@@ -2002,8 +2211,10 @@ for entry in "${tests[@]}"; do
             "$rollback_state_compare" "$rollback_prefill_compare" \
             "$rollback_input_compare" "$rollback_qkvza_route_compare" \
             "$rollback_x_in_compare" "$rollback_qkvza_repair_compare" \
-            "$rollback_hidden_boundary_compare" "$rollback_fast_token_major_compare" \
-            "$rollback_fast_replay_admission" "$verify_graph" "$wall" \
+            "$rollback_hidden_boundary_compare" "$rollback_wo_delta_compare" \
+            "$rollback_fast_token_major_compare" \
+            "$rollback_fast_replay_admission" "$rollback_serial_tape_admission" \
+            "$verify_graph" "$wall" \
             > "$record_input_file"
         record_json=$(python3 - "$record_input_file" <<'PYEOF'
 import json, sys
@@ -2027,8 +2238,10 @@ values = [part.decode("utf-8", "replace") for part in parts[:-1]]
     x_in_compare,
     qkvza_repair,
     hidden_boundary,
+    wo_delta,
     token_major,
     admission,
+    serial_tape_admission,
     verify_graph,
     wall,
 ) = values
@@ -2056,8 +2269,10 @@ metrics = {
     "rollback_x_in_compare": decode(x_in_compare),
     "rollback_qkvza_repair_compare": decode(qkvza_repair),
     "rollback_hidden_boundary_compare": decode(hidden_boundary),
+    "rollback_wo_delta_compare": decode(wo_delta),
     "rollback_fast_token_major_compare": decode(token_major),
     "rollback_fast_replay_admission": decode(admission),
+    "rollback_serial_tape_admission": decode(serial_tape_admission),
     "verify_graph": decode(verify_graph),
 }
 print(json.dumps({
@@ -2088,8 +2303,10 @@ PYEOF
         echo "- rollback_x_in_compare: \`$rollback_x_in_compare\`"
         echo "- rollback_qkvza_repair_compare: \`$rollback_qkvza_repair_compare\`"
         echo "- rollback_hidden_boundary_compare: \`$rollback_hidden_boundary_compare\`"
+        echo "- rollback_wo_delta_compare: \`$rollback_wo_delta_compare\`"
         echo "- rollback_fast_token_major_compare: \`$rollback_fast_token_major_compare\`"
         echo "- rollback_fast_replay_admission: \`$rollback_fast_replay_admission\`"
+        echo "- rollback_serial_tape_admission: \`$rollback_serial_tape_admission\`"
         echo "- verify_graph: \`$verify_graph\`"
         if [ -n "$stats" ]; then
             echo "- stats:"

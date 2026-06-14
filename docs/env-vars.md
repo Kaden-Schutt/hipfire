@@ -130,6 +130,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY" | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:10303` |
 | `HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY` | Used to configure runtime execution by explicitly setting "HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY" | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:10271` |
 | `HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE` | DFlash rollback uses conservative serial-source GDN tape replay by default; set to 0/false/off/no to opt out to the older fallback | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:10327` |
+| `HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES` | Diagnostic-only: replay verify-captured GDN tape with the tape's Q8 stochastic requant frame base, then restore the global frame counter | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:913` |
 | `HIPFIRE_DFLASH_ROLLBACK_X_IN_ATOL` | Diagnostic-only absolute tolerance for x_in rollback input compare | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:944` |
 | `HIPFIRE_DFLASH_SEED_ORACLE` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/speculative.rs:6884` |
 | `HIPFIRE_DFLASH_SPEC_DEMO_BIN` | Runtime variable controlling dflash spec demo bin in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-runtime/src/eval_harness/mod.rs:9658` |
@@ -323,6 +324,7 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_Q8_GATE_UP_4W` | gfx1151 Q8 gate+up 4w control: unset auto-routes aligned N>=128, "0" forces single-wave WMMA, "1" forces 4w for aligned N%64==0 experiments | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:130` |
 | `HIPFIRE_Q8_GATE_UP_BENCH` | Enabled when set to 1 | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs:129` |
 | `HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN` | Diagnostic: route batched Q8 GDN verify updates through per-token GDN kernels | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11778` |
+| `HIPFIRE_Q8_GDN_VERIFY_SERIAL_FRAMES` | Diagnostic: with per-token Q8 GDN verify, consume stochastic requant frames in serial token-major order | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:11790` |
 | `HIPFIRE_Q8_TOKPAR` | (A) NEW token-parallel | `/home/sadara/.hipfire/src/crates/rdna-compute/examples/q8_batched_attn_microbench.rs:174` |
 | `HIPFIRE_Q8_WMMA_4W` | originally shipped default-ON on gfx11/gfx12, but the auto-enable | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28542` |
 | `HIPFIRE_Q8_WMMA_X64` | Environment toggle value controls runtime behavior | `/home/sadara/.hipfire/src/crates/rdna-compute/src/dispatch.rs:28353` |

@@ -11783,6 +11783,18 @@ fn q8_gdn_verify_per_token_enabled() -> bool {
     })
 }
 
+fn q8_gdn_verify_serial_frames_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("HIPFIRE_Q8_GDN_VERIFY_SERIAL_FRAMES")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "on" | "ON" | "yes" | "YES")
+        )
+    })
+}
+
 fn kld_fp32_gqa4_attention_eligible(
     gpu: &Gpu,
     kv_cache: &llama::KvCache,
@@ -15120,7 +15132,7 @@ fn forward_prefill_chunk(
     pbs: &PrefillBatchScratch,
     hidden_rb: Option<&HiddenStateRingBuffer>,
     per_token_hidden_out: Option<(&GpuTensor, usize)>,
-    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tape_offset: usize,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pre_uploaded: bool,
@@ -15429,6 +15441,29 @@ fn forward_prefill_chunk(
     // tree_verify.pre_rope_k_capture[]. Increments alongside each
     // FullAttention layer iteration regardless of MoE/non-MoE variant.
     let mut fa_layer_idx = band.map(|b| b.fa_layer_offset).unwrap_or(0);
+    let use_q8_gdn_per_token =
+        force_q8_gdn_per_token || (gdn_tape.is_some() && q8_gdn_verify_per_token_enabled());
+    let q8_gdn_serial_frame_base = if use_q8_gdn_per_token
+        && q8_gdn_verify_serial_frames_enabled()
+        && gdn_tape.is_some()
+        && tree_verify.is_none()
+        && band.is_none()
+    {
+        Some(gpu.debug_gdn_requant_frame())
+    } else {
+        None
+    };
+    let q8_gdn_serial_frame_layers = config
+        .layer_types
+        .iter()
+        .filter(|&&lt| lt == LayerType::LinearAttention)
+        .count();
+    if let Some(frame_base) = q8_gdn_serial_frame_base {
+        if let Some(tape) = gdn_tape.as_deref_mut() {
+            tape.q8_requant_frame_base = Some(frame_base);
+            tape.q8_requant_frame_layers = q8_gdn_serial_frame_layers;
+        }
+    }
 
     for layer_idx in layer_start..layer_end {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
@@ -16036,10 +16071,13 @@ fn forward_prefill_chunk(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
-                } else if force_q8_gdn_per_token
-                    || (gdn_tape.is_some() && q8_gdn_verify_per_token_enabled())
-                {
+                } else if use_q8_gdn_per_token {
                     for step in 0..n {
+                        if let Some(frame_base) = q8_gdn_serial_frame_base {
+                            gpu.debug_set_gdn_requant_frame(frame_base.wrapping_add(
+                                (step * q8_gdn_serial_frame_layers + delta_layer_idx) as u32,
+                            ));
+                        }
                         let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
                         let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
                         let v = pbs.dn_v_batch.sub_offset(step * v_dim, v_dim);
@@ -16059,6 +16097,11 @@ fn forward_prefill_chunk(
                             n_v_heads,
                             config.linear_value_head_dim,
                         )?;
+                    }
+                    if let Some(frame_base) = q8_gdn_serial_frame_base {
+                        gpu.debug_set_gdn_requant_frame(
+                            frame_base.wrapping_add((n * q8_gdn_serial_frame_layers) as u32),
+                        );
                     }
                 } else {
                     gpu.gated_delta_net_q8_batch_seq(
@@ -18835,10 +18878,13 @@ fn forward_prefill_chunk(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?;
-                } else if force_q8_gdn_per_token
-                    || (gdn_tape.is_some() && q8_gdn_verify_per_token_enabled())
-                {
+                } else if use_q8_gdn_per_token {
                     for step in 0..n {
+                        if let Some(frame_base) = q8_gdn_serial_frame_base {
+                            gpu.debug_set_gdn_requant_frame(frame_base.wrapping_add(
+                                (step * q8_gdn_serial_frame_layers + delta_layer_idx) as u32,
+                            ));
+                        }
                         let q = pbs.dn_q_batch.sub_offset(step * v_dim, v_dim);
                         let k = pbs.dn_k_batch.sub_offset(step * v_dim, v_dim);
                         let v = pbs.dn_v_batch.sub_offset(step * v_dim, v_dim);
@@ -18859,6 +18905,11 @@ fn forward_prefill_chunk(
                             config.linear_value_head_dim,
                         )?;
                     }
+                    if let Some(frame_base) = q8_gdn_serial_frame_base {
+                        gpu.debug_set_gdn_requant_frame(
+                            frame_base.wrapping_add((n * q8_gdn_serial_frame_layers) as u32),
+                        );
+                    }
                 } else {
                     gpu.gated_delta_net_q8_batch_seq(
                         &pbs.dn_q_batch,
@@ -18875,6 +18926,17 @@ fn forward_prefill_chunk(
                     )?;
                 }
                 debug_stop_after!("gdn", layer_idx);
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let v_row_bytes = tape.v_dim * 4;
+                    let off_v = tape_offset * v_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.attn_out_bufs[delta_layer_idx].buf,
+                        off_v,
+                        &pbs.dn_attn_out_batch.buf,
+                        0,
+                        n * v_row_bytes,
+                    )?;
+                }
                 gpu.gated_norm_f32_batched(
                     &pbs.dn_attn_out_batch,
                     &pbs.dn_z_batch,
@@ -18886,6 +18948,28 @@ fn forward_prefill_chunk(
                     n,
                 )?;
                 debug_stop_after!("gated_norm", layer_idx);
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let v_row_bytes = tape.v_dim * 4;
+                    let off_v = tape_offset * v_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.normed_bufs[delta_layer_idx].buf,
+                        off_v,
+                        &pbs.dn_normed_batch.buf,
+                        0,
+                        n * v_row_bytes,
+                    )?;
+                }
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    let off_hidden = tape_offset * hidden_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.wo_residual_in_bufs[delta_layer_idx].buf,
+                        off_hidden,
+                        &pbs.x_batch.buf,
+                        0,
+                        n * hidden_row_bytes,
+                    )?;
+                }
                 // wo + residual. Q8 wo lands un-rotated (Q8 weights were
                 // quantized against un-rotated activations); MQ4/MQ6 wo
                 // require FWHT(awq_scale-adjusted) rotation. Mirrors the
@@ -18929,6 +19013,17 @@ fn forward_prefill_chunk(
                     )?;
                     &pbs.dn_normed_rot_batch
                 };
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let v_row_bytes = tape.v_dim * 4;
+                    let off_v = tape_offset * v_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.wo_input_bufs[delta_layer_idx].buf,
+                        off_v,
+                        &dn_wo_input.buf,
+                        0,
+                        n * v_row_bytes,
+                    )?;
+                }
                 if dn_wo_is_6bit {
                     gpu.gemm_hfq6g256_residual(
                         &layer.wo.buf,
@@ -18990,6 +19085,17 @@ fn forward_prefill_chunk(
                     )?;
                 }
                 debug_stop_after!("wo", layer_idx);
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    let off_hidden = tape_offset * hidden_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.attn_residual_bufs[delta_layer_idx].buf,
+                        off_hidden,
+                        &pbs.x_batch.buf,
+                        0,
+                        n * hidden_row_bytes,
+                    )?;
+                }
 
                 // Batched MoE FFN replaces the dense (rmsnorm + gate+up +
                 // silu_mul + w_down) block. Takes pbs.x_batch as input AND
@@ -18997,6 +19103,17 @@ fn forward_prefill_chunk(
                 // batched indexed down kernel's atomicAdd path.
                 if debug_stop_after_la_layer == Some(layer_idx) {
                     return Ok(());
+                }
+                if let Some(tape) = gdn_tape.as_ref() {
+                    let hidden_row_bytes = tape.x_in_dim * 4;
+                    let off_hidden = tape_offset * hidden_row_bytes;
+                    gpu.memcpy_dtod_at_auto(
+                        &tape.ffn_input_bufs[delta_layer_idx].buf,
+                        off_hidden,
+                        &pbs.x_batch.buf,
+                        0,
+                        n * hidden_row_bytes,
+                    )?;
                 }
                 prefill_moe_ffn_body_batched(
                     gpu,
