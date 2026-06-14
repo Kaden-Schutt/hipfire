@@ -111,3 +111,30 @@ into full investigations here.
 - Suggested fix: Validate buffer initialization before attempting unsafe aliasing and provide safe abstractions for GPU memory management.
 - Scope: Architectural
 - Confidence: High
+
+## Collated Findings from Gemini/Docs Review
+
+- [Critical] Global state coupling is spreading across runtime and architecture crates:
+  - `OnceLock` / `thread_local!` are used for environment-derived behavior in hot and shared code paths (`crates/hipfire-arch-deepseek4/src/forward.rs`, `crates/rdna-compute/src/dispatch.rs`, `crates/hipfire-arch-qwen35/src/qwen35.rs`, `crates/hip-bridge/src/ffi.rs`).
+  - This hides explicit configuration inputs and increases hidden coupling.
+  - Suggested triage: list all env-backed globals and move them behind explicit config contexts when touching module boundaries.
+
+- [High] Potential panic hazard in `crates/hipfire-runtime/src/triattn.rs`:
+  - Uses `TAP_STATE.lock().unwrap()` in hot sections.
+  - A poisoned mutex now can take the process down during unrelated thread panics.
+  - Suggested triage: convert to recoverable lock error handling and include lock-loss telemetry.
+
+- [High] Unchecked `unwrap()`/`as_ref().unwrap()` patterns are still concentrated in project-critical paths:
+  - `crates/hipfire-runtime/src/weight_pager.rs` (`as_ref`, `PreadH2DTransport::open`, `pop_front`)
+  - `crates/hipfire-runtime/src/llama.rs` around unsafe blocks.
+  - Recommended: replace with explicit `Option`/`Result` handling and actionable error messages before crash.
+
+- [High] Architectural correctness bug candidates remain explicitly referenced in comments:
+  - `crates/hipfire-arch-deepseek4/src/spec_decode.rs` and `crates/hipfire-arch-deepseek4/src/forward.rs`: chunk/ring overwrite edge-case comments.
+  - `crates/hipfire-arch-dots-ocr/src/dots_ocr.rs`: lane write-size mismatch comment (16-element target vs larger writes) and decoded prompt divergence.
+  - `crates/hipfire-arch-qwen35-vl/tests/channel_order.rs`: `(C,T,h,w)` vs `(T,C,h,w)` transpose path in `extract_patches`.
+  - Suggested triage: validate each as still-reproducible and either close with explicit evidence or move to fixed list if already mitigated.
+
+- [Medium] Documentation-driven bug in archive guidance:
+  - `docs/CLI.md` in the legacy archive still indicates `.triattn.bin` extension as canonical.
+  - `AGENTS.md` and CLI code now require/allow canonical `.triattn.hfq` while continuing to parse legacy `.triattn.bin` for compatibility.

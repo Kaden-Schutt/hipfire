@@ -38,6 +38,17 @@
   paged parity on a smaller artifact, and grouped routed batches still need
   explicit coverage before removing the guarded execution flag.
 
+- [Documentation debt] Refresh docs drift where active behavior has changed:
+  - `docs/CHAT.md` is missing the `/set <key> <val>` command that `cli/chat.ts`
+    supports for live session parameter updates.
+  - TriAttention sidecar examples and naming in docs should consistently use
+    `.triattn.hfq` as canonical; `.triattn.bin` is allowed only for explicit
+    legacy compatibility.
+  - `docs/QUANTIZATION.md` still claims MQ3 prefill is non-WMMA in places; the
+    runtime now contains WMMA prefill paths for MQ3 on supported RDNA3/4 targets.
+  - `docs/env-vars.md` is behind the current source surface and should be
+    regenerated from `./scripts/regen-env-vars-doc.sh` after this cycle.
+
 ### Deferred
 
 - Finish full daemon-backed `hipfire bench` replacement after eval-backed speed
@@ -52,6 +63,17 @@
   analysis packages into metadata-rich HFQM containers after the KLD reference
   package format is settled.
 
+## PFLASH Review Debt (migrated from MANUAL_REVIEW)
+
+- Investigate and close the remaining long-context pflash score kernel regression:
+  - `qwen3.5-4b` + drafter paths currently exhibit `ScoringDegenerate { non-finite
+    scores: 337 NaN, 0 inf }` at 32K NIAH source (`21551` tokens) despite 8K/16K pass.
+  - Work to isolate root cause (drafter forward numerical blow-up vs score kernel)
+    and add targeted diagnostics in `pflash::compute_scores_batched_gpu`.
+- Keep the historical full-coherence/speed hang trace in `MANUAL_REVIEW.md` as
+  an execution quirk note, and re-run the gate from a clean environment when
+  the next session reset is available.
+
 ## FWHT Residual QJL Transform
 
 Status: deferred.
@@ -62,3 +84,6 @@ Status: deferred.
 
 ## Check all hot paths for graph safety
 >>> One issue surfaced before verification: gemm_f16_x_f32_wmma currently launches with raw stack kernargs rather than the graph-safe blob helper. I’m tightening the env gate so this experimental route only runs outside hipGraph capture; captured paths will keep using the scalar default until the dispatcher wrapper is made graph-safe.
+
+
+## hipfire-eval is still loading model multiple times rather than reseting state between tests.
