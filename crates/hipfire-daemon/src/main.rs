@@ -43,21 +43,22 @@ use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_generate::validate_qwen35_fused_dense_prefill_batch_preflight;
 use hipfire_generate::{
     build_qwen35_fused_dense_prefill_batch_contract, compute_qwen35_prefix_hash,
-    generate_prefix_hash_json, plan_generate_batch_prefill_qwen35, prefix_hash_preflight_done_json,
+    plan_generate_batch_prefill_qwen35, prefix_hash_preflight_done_json,
     qwen35_decode_batch_requested_auto, qwen35_decode_batch_scheduler_metadata,
-    qwen35_fused_prefill_boundary_cuts, qwen35_grouped_moe_decode_auto_latency_gate_passed,
-    qwen35_prefill_checkpoint_boundary_kind, qwen35_prefill_checkpoint_session_id,
-    qwen35_prefill_scratch_target_batch, select_qwen35_decode_batch_backend,
-    select_qwen35_prefill_batch_backend, validate_generate_batch_decode,
-    validate_generate_batch_prefill, validate_prefix_hash_preflight,
-    validate_qwen35_fused_grouped_moe_prefill_batch_preflight, GenerateBatchDecodeEnvelope,
-    GenerateBatchDecodeSession, GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan,
-    GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession, GenerateVLParams, ImageSource,
-    PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope, Qwen35DecodeBatchBackend,
-    Qwen35DecodeBatchStepResult, Qwen35DecodeTokenOutcome, Qwen35FusedDensePrefillInputKind,
-    Qwen35PrefillBatchBackend, Qwen35PrefillBatchResult, Qwen35PrefillCheckpointHook,
-    Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult, Qwen35PreparedPrefillSession,
-    Qwen35SemanticBoundaryCheckpoint,
+    qwen35_fused_prefill_boundary_cuts, qwen35_generate_batch_prefill_done_json,
+    qwen35_generate_batch_prefill_session_done_json,
+    qwen35_grouped_moe_decode_auto_latency_gate_passed, qwen35_prefill_checkpoint_boundary_kind,
+    qwen35_prefill_checkpoint_session_id, qwen35_prefill_scratch_target_batch,
+    select_qwen35_decode_batch_backend, select_qwen35_prefill_batch_backend,
+    validate_generate_batch_decode, validate_generate_batch_prefill,
+    validate_prefix_hash_preflight, validate_qwen35_fused_grouped_moe_prefill_batch_preflight,
+    GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession, GenerateBatchPrefillEnvelope,
+    GenerateBatchPrefillPlan, GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession,
+    GenerateVLParams, ImageSource, PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope,
+    Qwen35DecodeBatchBackend, Qwen35DecodeBatchStepResult, Qwen35DecodeTokenOutcome,
+    Qwen35FusedDensePrefillInputKind, Qwen35PrefillBatchBackend, Qwen35PrefillBatchResult,
+    Qwen35PrefillCheckpointHook, Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult,
+    Qwen35PreparedPrefillSession, Qwen35SemanticBoundaryCheckpoint,
 };
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -6164,72 +6165,25 @@ fn run_generate_batch_prefill_serial_qwen35(
                     session.id, checkpoint_id_for_error, e
                 )
             })?;
-        let mut line = serde_json::json!({
-            "type": "generate_batch_prefill_session_done",
-            "id": envelope.id,
-            "batch_id": envelope.batch_id,
-            "session_id": session.id,
-            "prefill_tokens": session.prefill_tokens,
-            "logical_position": session.logical_position,
-            "cached_prefix_tokens": session.cached_prefix_tokens,
-            "state_handle": {
-                "kind": "qwen35_session",
-                "runtime_state": "resident",
-                "session_id": session.id,
-                "checkpoint_id": checkpoint_id,
-                "checkpoint_runtime_state": "attachable",
-                "logical_position": session.logical_position,
-                "cached_prefix_tokens": session.cached_prefix_tokens,
-                "prefix_hash": generate_prefix_hash_json(&session.prefix_hash),
-                "prefix_len": session.prefix_hash.prefix_len,
-            },
-            "mode": result.mode,
-            "plan": result.plan.as_str(),
-            "backend": result.backend.as_str(),
-        });
-        let prefix_checkpoints: Vec<serde_json::Value> = session
-            .boundary_checkpoints
-            .iter()
-            .filter_map(|checkpoint| {
-                checkpoint.checkpoint_id.as_ref().map(|checkpoint_id| {
-                    serde_json::json!({
-                        "checkpoint_id": checkpoint_id,
-                        "checkpoint_runtime_state": "attachable",
-                        "logical_position": checkpoint.prefix_len,
-                        "cached_prefix_tokens": checkpoint.prefix_len,
-                        "prefix_hash": generate_prefix_hash_json(&checkpoint.hash),
-                        "prefix_len": checkpoint.hash.prefix_len,
-                        "boundary": checkpoint.boundary,
-                        "boundary_index": checkpoint.boundary_index,
-                    })
-                })
-            })
-            .collect();
-        if !prefix_checkpoints.is_empty() {
-            line["state_handle"]["prefix_checkpoints"] = serde_json::json!(prefix_checkpoints);
-        }
-        if let Some(debug_sample_token) = session.debug_sample_token {
-            line["debug_sample_token"] = serde_json::json!(debug_sample_token);
-        }
+        let line = qwen35_generate_batch_prefill_session_done_json(
+            envelope,
+            session,
+            &checkpoint_id,
+            &result,
+        );
         let _ = writeln!(stdout, "{line}");
         let _ = stdout.flush();
     }
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let worker = loaded_model_worker_runtime_view(m);
-    let done = serde_json::json!({
-        "type": "generate_batch_prefill_done",
-        "id": envelope.id,
-        "batch_id": envelope.batch_id,
-        "sessions": envelope.session_count,
-        "prefill_tokens": result.total_prefill_tokens,
-        "elapsed_ms": elapsed_ms,
-        "mode": result.mode,
-        "plan": result.plan.as_str(),
-        "backend": result.backend.as_str(),
-        "resident_sessions": sequence_state_arena_resident_session_count(arena_backend, m),
-        "model_worker": model_worker_runtime_view_json(&worker),
-    });
+    let done = qwen35_generate_batch_prefill_done_json(
+        envelope,
+        &result,
+        elapsed_ms,
+        sequence_state_arena_resident_session_count(arena_backend, m),
+        model_worker_runtime_view_json(&worker),
+    );
     let _ = writeln!(stdout, "{done}");
     let _ = stdout.flush();
     Ok(())
