@@ -29,3 +29,4 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon startup resource lease policy and lock helpers now reuse `hipfire-daemon-adapter` ownership instead of daemon-local helpers.
 - Eval artifact row records now reuse `hipfire-evidence` record contracts instead of eval-local JSON construction.
 - Eval comparison, admission, and evidence artifacts now reuse `hipfire-evidence` run-provenance contracts instead of eval-local provenance structs.
+- Eval artifact index entries now reuse `hipfire-evidence` index rendering instead of eval-local JSON construction.
