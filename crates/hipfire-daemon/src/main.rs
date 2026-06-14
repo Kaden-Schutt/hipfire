@@ -78,7 +78,8 @@ use hipfire_state::{
     validate_checkpoint_source_resident, DescribedSequenceState, GenericSequenceStateArena,
     ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
     ParsedSequenceStateHandle, ReleaseStateResponseKind, SequenceStateArenaBackend,
-    SequenceStateCheckpointRequest, SequenceStatePageDescriptor, SequenceStatePageKind,
+    SequenceStateCheckpointRequest, SequenceStateForkRequest, SequenceStatePageDescriptor,
+    SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -4324,34 +4325,35 @@ fn qwen35_activate_session(
 fn qwen35_fork_session_state(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    source_session_id: &str,
-    dest_session_id: &str,
-    requested_prefix_hash: Option<&GenerateBatchPrefillPrefixHash>,
+    request: SequenceStateForkRequest<'_>,
 ) -> Result<(), String> {
-    if source_session_id == dest_session_id {
+    if request.source_session_id == request.dest_session_id {
         return Ok(());
     }
-    let source_is_active = m.q35_active_session_id.as_deref() == Some(source_session_id);
+    let source_is_active = m.q35_active_session_id.as_deref() == Some(request.source_session_id);
     if !source_is_active {
-        qwen35_validate_prefix_hash(m, source_session_id, requested_prefix_hash)?;
+        qwen35_validate_prefix_hash(m, request.source_session_id, request.requested_prefix_hash)?;
     }
     qwen35_save_active_session(m, gpu)?;
     if source_is_active {
-        if let Err(err) = qwen35_validate_prefix_hash(m, source_session_id, requested_prefix_hash) {
-            let _ = qwen35_activate_session(m, gpu, source_session_id);
+        if let Err(err) =
+            qwen35_validate_prefix_hash(m, request.source_session_id, request.requested_prefix_hash)
+        {
+            let _ = qwen35_activate_session(m, gpu, request.source_session_id);
             return Err(err);
         }
     }
     validate_checkpoint_source_resident(
-        source_session_id,
-        m.q35_sessions.contains_key(source_session_id),
+        request.source_session_id,
+        m.q35_sessions.contains_key(request.source_session_id),
     )?;
     let source = m
         .q35_sessions
-        .get(source_session_id)
+        .get(request.source_session_id)
         .expect("source residency was validated");
     let forked = Qwen35RequestSessionState::fork_from(gpu, source)?;
-    m.q35_sessions.insert(dest_session_id.to_string(), forked);
+    m.q35_sessions
+        .insert(request.dest_session_id.to_string(), forked);
     Ok(())
 }
 
@@ -4388,9 +4390,11 @@ fn qwen35_checkpoint_session_state(
     qwen35_fork_session_state(
         m,
         gpu,
-        request.source_session_id,
-        request.dest_session_id,
-        request.requested_prefix_hash,
+        SequenceStateForkRequest {
+            source_session_id: request.source_session_id,
+            dest_session_id: request.dest_session_id,
+            requested_prefix_hash: request.requested_prefix_hash,
+        },
     )
 }
 
@@ -4513,19 +4517,11 @@ fn sequence_state_arena_fork_session_state(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    source_session_id: &str,
-    dest_session_id: &str,
-    requested_prefix_hash: Option<&GenerateBatchPrefillPrefixHash>,
+    request: SequenceStateForkRequest<'_>,
 ) -> Result<(), String> {
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "fork_session_state")?;
     match arena_backend {
-        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_fork_session_state(
-            m,
-            gpu,
-            source_session_id,
-            dest_session_id,
-            requested_prefix_hash,
-        ),
+        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_fork_session_state(m, gpu, request),
         SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
 }
@@ -6201,9 +6197,11 @@ fn run_generate_batch_prefill_serial_qwen35(
                 arena_backend,
                 m,
                 gpu,
-                runtime_state_handle,
-                &session.id,
-                session.state_handle.prefix_hash.as_ref(),
+                SequenceStateForkRequest {
+                    source_session_id: runtime_state_handle,
+                    dest_session_id: &session.id,
+                    requested_prefix_hash: session.state_handle.prefix_hash.as_ref(),
+                },
             )
             .map_err(|e| {
                 format!(

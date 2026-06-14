@@ -176,6 +176,13 @@ pub struct SequenceStateCheckpointRequest<'a> {
     pub checkpoint_prefix_hash: Option<&'a SequenceStatePrefixHash>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SequenceStateForkRequest<'a> {
+    pub source_session_id: &'a str,
+    pub dest_session_id: &'a str,
+    pub requested_prefix_hash: Option<&'a SequenceStatePrefixHash>,
+}
+
 pub fn validate_checkpoint_source_resident(
     source_session_id: &str,
     resident: bool,
@@ -1357,5 +1364,22 @@ mod tests {
             err,
             "qwen35 checkpoint source session checkpoint-a is not resident"
         );
+    }
+
+    #[test]
+    fn sequence_state_fork_request_preserves_attach_contract() {
+        let hash = SequenceStatePrefixHash {
+            algorithm: "xxh3_128".to_string(),
+            value: "abc".to_string(),
+            prefix_len: 12,
+        };
+        let request = SequenceStateForkRequest {
+            source_session_id: "checkpoint-a",
+            dest_session_id: "session-b",
+            requested_prefix_hash: Some(&hash),
+        };
+        assert_eq!(request.source_session_id, "checkpoint-a");
+        assert_eq!(request.dest_session_id, "session-b");
+        assert_eq!(request.requested_prefix_hash.unwrap().prefix_len, 12);
     }
 }
