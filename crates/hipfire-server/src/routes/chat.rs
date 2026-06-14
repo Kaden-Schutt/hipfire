@@ -49,17 +49,13 @@ pub async fn post_chat_completions(
 }
 
 fn load_params_from_config(cfg: &HipfireConfig) -> LoadParams {
-    LoadParams {
-        max_seq: cfg.max_seq,
-        kv_cache: Some(cfg.kv_cache.clone()).filter(|s| s != "auto"),
-        flash_mode: Some(cfg.flash_mode.clone()).filter(|s| s != "auto"),
-        dflash_mode: Some(cfg.dflash_mode.clone()).filter(|s| s != "auto"),
-        cask_sidecar: cfg
-            .cask_sidecar
-            .clone()
-            .filter(|sidecar| !sidecar.is_empty()),
-        ..Default::default()
-    }
+    LoadParams::from_common_config_values(
+        cfg.max_seq,
+        &cfg.kv_cache,
+        &cfg.flash_mode,
+        &cfg.dflash_mode,
+        cfg.cask_sidecar.as_deref(),
+    )
 }
 
 fn generate_request_from_chat(
