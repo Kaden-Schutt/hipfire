@@ -696,6 +696,7 @@ dependencies = [
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
  "hipfire-daemon-protocol",
+ "hipfire-generate",
  "hipfire-runtime",
  "hipfire-state",
  "libc",

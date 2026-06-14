@@ -160,6 +160,8 @@ pub struct PrefixHashPreflightCandidate {
     pub hash: GenerateBatchPrefillPrefixHash,
     pub boundary: String,
     pub boundary_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

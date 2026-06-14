@@ -39,6 +39,13 @@ use hipfire_arch_qwen35::speculative::{
 };
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_generate::{
+    plan_generate_batch_prefill_qwen35, select_qwen35_decode_batch_backend,
+    GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession, GenerateBatchPrefillEnvelope,
+    GenerateBatchPrefillPlan, GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession,
+    GenerateBatchPrefillStateHandle, PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope,
+    Qwen35DecodeBatchBackend, Qwen35PrefillBatchBackend,
+};
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
@@ -1034,187 +1041,6 @@ fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
     });
     let _ = writeln!(stdout, "{line}");
     let _ = stdout.flush();
-}
-
-fn generate_batch_prefill_is_probe(envelope: &GenerateBatchPrefillEnvelope) -> bool {
-    envelope.id == "prefill-batch-probe" && envelope.batch_id == "prefill-batch-probe"
-}
-
-struct GenerateBatchPrefillEnvelope {
-    id: String,
-    batch_id: String,
-    session_count: usize,
-    sessions: Vec<GenerateBatchPrefillSession>,
-}
-
-impl std::fmt::Debug for GenerateBatchPrefillEnvelope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GenerateBatchPrefillEnvelope")
-            .field("id", &self.id)
-            .field("batch_id", &self.batch_id)
-            .field("session_count", &self.session_count)
-            .finish()
-    }
-}
-
-#[derive(Clone)]
-struct GenerateBatchPrefillSession {
-    id: String,
-    prompt: Option<String>,
-    suffix_tokens: Option<Vec<u32>>,
-    system_prompt: Option<String>,
-    tools: Option<Vec<serde_json::Value>>,
-    messages_history: Option<Vec<hipfire_runtime::prompt_frame::Message>>,
-    assistant_prefix: String,
-    max_think_tokens: usize,
-    semantic_boundary_checkpoints: bool,
-    state_handle: GenerateBatchPrefillStateHandle,
-}
-
-struct PrefixHashPreflightEnvelope {
-    id: String,
-    boundary_policy: String,
-    session: GenerateBatchPrefillSession,
-}
-
-struct PrefixHashPreflightCandidate {
-    hash: GenerateBatchPrefillPrefixHash,
-    boundary: String,
-    boundary_index: usize,
-}
-
-#[derive(Clone)]
-struct GenerateBatchPrefillStateHandle {
-    state_kinds: Vec<String>,
-    logical_position: usize,
-    cached_prefix_tokens: usize,
-    runtime_state_handle: Option<String>,
-    prefix_hash: Option<GenerateBatchPrefillPrefixHash>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct GenerateBatchPrefillPrefixHash {
-    algorithm: String,
-    value: String,
-    prefix_len: usize,
-}
-
-#[derive(Clone, Debug)]
-struct GenerateBatchDecodeEnvelope {
-    id: String,
-    batch_id: String,
-    session_count: usize,
-    cached_prefix_tokens: usize,
-    sessions: Vec<GenerateBatchDecodeSession>,
-}
-
-#[derive(Clone, Debug)]
-struct GenerateBatchDecodeSession {
-    id: String,
-    session_id: String,
-    max_tokens_remaining: usize,
-    logical_position: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GenerateBatchPrefillPlan {
-    SerialExact,
-    FusedDenseQwen35Candidate,
-    GroupedMoeQwen35Candidate,
-}
-
-impl GenerateBatchPrefillPlan {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::SerialExact => "serial_exact",
-            Self::FusedDenseQwen35Candidate => "fused_dense_qwen35_candidate",
-            Self::GroupedMoeQwen35Candidate => "grouped_moe_qwen35_candidate",
-        }
-    }
-}
-
-fn plan_generate_batch_prefill_qwen35(
-    arch_id: u32,
-    envelope: &GenerateBatchPrefillEnvelope,
-) -> GenerateBatchPrefillPlan {
-    match (arch_id, envelope.session_count > 1) {
-        (5, true) => GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
-        (6, true) => GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate,
-        _ => GenerateBatchPrefillPlan::SerialExact,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Qwen35PrefillBatchBackend {
-    SerialReference,
-    FusedDense,
-    FusedGroupedMoe,
-}
-
-impl Qwen35PrefillBatchBackend {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::SerialReference => "serial_reference",
-            Self::FusedDense => "fused_dense",
-            Self::FusedGroupedMoe => "fused_grouped_moe",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Qwen35DecodeBatchBackend {
-    SerialReference,
-    FusedDenseLayerChunked,
-    FusedGroupedMoeLayerChunked,
-}
-
-impl Qwen35DecodeBatchBackend {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::SerialReference => "serial_reference",
-            Self::FusedDenseLayerChunked => "fused_dense_layer_chunked",
-            Self::FusedGroupedMoeLayerChunked => "fused_grouped_moe_layer_chunked",
-        }
-    }
-}
-
-fn select_qwen35_decode_batch_backend(
-    requested: &str,
-    arch_id: u32,
-    session_count: usize,
-) -> Result<Qwen35DecodeBatchBackend, String> {
-    match requested {
-        "" | "auto" | "serial" | "serial_reference" => {
-            Ok(Qwen35DecodeBatchBackend::SerialReference)
-        }
-        "off" => Err(
-            "generate_batch_decode_step disabled by HIPFIRE_QWEN35_DECODE_BATCH=off".to_string(),
-        ),
-        "fused" | "fused_dense" | "fused_dense_layer_chunked" => {
-            if arch_id != 5 {
-                return Err(format!(
-                    "qwen35 fused dense decode batch requested, but arch_id={arch_id} is not dense Qwen35"
-                ));
-            }
-            Ok(Qwen35DecodeBatchBackend::FusedDenseLayerChunked)
-        }
-        "fused_grouped_moe" | "grouped_moe" | "fused_grouped_moe_layer_chunked" => {
-            if arch_id != 6 {
-                return Err(format!(
-                    "qwen35 grouped-MoE decode batch requested, but arch_id={arch_id} is not Qwen35 grouped-MoE"
-                ));
-            }
-            if session_count < 2 {
-                return Err(
-                    "qwen35 grouped-MoE decode batch requires at least two sessions".to_string(),
-                );
-            }
-            Ok(Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked)
-        }
-        other => Err(format!(
-            "unsupported HIPFIRE_QWEN35_DECODE_BATCH={other}; expected auto, serial, fused, fused_grouped_moe, or off"
-        )),
-    }
 }
 
 fn qwen35_decode_batch_requested_auto(requested: &str) -> bool {
@@ -3436,7 +3262,7 @@ mod generate_batch_prefill_tests {
 
         let envelope = validate_generate_batch_prefill(&msg).expect("valid envelope");
         assert_eq!(
-            plan_generate_batch_prefill_qwen35(5, &envelope),
+            plan_generate_batch_prefill_qwen35(5, envelope.session_count),
             GenerateBatchPrefillPlan::FusedDenseQwen35Candidate
         );
     }
@@ -3459,7 +3285,7 @@ mod generate_batch_prefill_tests {
         });
         let singleton = validate_generate_batch_prefill(&singleton).expect("valid envelope");
         assert_eq!(
-            plan_generate_batch_prefill_qwen35(5, &singleton),
+            plan_generate_batch_prefill_qwen35(5, singleton.session_count),
             GenerateBatchPrefillPlan::SerialExact
         );
 
@@ -3489,7 +3315,7 @@ mod generate_batch_prefill_tests {
         });
         let moe = validate_generate_batch_prefill(&moe).expect("valid envelope");
         assert_eq!(
-            plan_generate_batch_prefill_qwen35(6, &moe),
+            plan_generate_batch_prefill_qwen35(6, moe.session_count),
             GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate
         );
     }
@@ -6244,6 +6070,7 @@ fn qwen35_prefix_hash_candidates_for_tokens(
                 hash,
                 boundary: boundary.to_string(),
                 boundary_index,
+                checkpoint_id: None,
             });
             boundary_index += 1;
         }
@@ -6281,6 +6108,7 @@ fn qwen35_prefix_hash_candidates_for_tokens(
         hash: full_hash,
         boundary: "full".to_string(),
         boundary_index: candidates.len(),
+        checkpoint_id: None,
     });
     candidates.sort_by_key(|candidate| candidate.hash.prefix_len);
     Ok(candidates)
@@ -7688,7 +7516,7 @@ fn run_generate_batch_prefill_serial_qwen35(
     }
     let arena_backend = loaded_model_state_arena_backend(m);
 
-    let plan = plan_generate_batch_prefill_qwen35(m.arch_id, envelope);
+    let plan = plan_generate_batch_prefill_qwen35(m.arch_id, envelope.session_count);
     let requested_backend = std::env::var("HIPFIRE_QWEN35_PREFILL_SESSION_BATCH").ok();
     let fused_grouped_moe_supported =
         validate_qwen35_fused_grouped_moe_prefill_model_capability(m, envelope.session_count);
@@ -10226,7 +10054,7 @@ fn main() {
                             }
                         }
                     }
-                    if generate_batch_prefill_is_probe(&envelope) {
+                    if envelope.is_probe() {
                         if dummy_model.is_some() {
                             emit_dummy_generate_batch_prefill_ready(&mut stdout, &envelope);
                             continue;
