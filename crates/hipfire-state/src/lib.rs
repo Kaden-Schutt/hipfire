@@ -193,6 +193,11 @@ pub struct SequenceStateReservationRequest {
     pub budget_bytes: Option<usize>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateDescribeRequest {
+    pub handle: ParsedSequenceStateHandle,
+}
+
 pub fn validate_checkpoint_source_resident(
     source_session_id: &str,
     resident: bool,
@@ -817,6 +822,19 @@ pub fn parse_reserve_session_state_request(
     })
 }
 
+pub fn parse_describe_sequence_state_request(
+    msg: &serde_json::Value,
+) -> Result<SequenceStateDescribeRequest, String> {
+    let handle_value = msg
+        .get("runtime_state_handle")
+        .or_else(|| msg.get("reservation_id"))
+        .or_else(|| msg.get("handle"));
+    let Some(handle) = handle_value.and_then(parse_sequence_state_handle) else {
+        return Err("describe_state requires runtime_state_handle".to_string());
+    };
+    Ok(SequenceStateDescribeRequest { handle })
+}
+
 pub fn generic_state_reservation_descriptors(
     worker_id: &str,
     handle: &SequenceStateHandle,
@@ -1006,6 +1024,53 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "reserve_session_state.physical_cap must be > 0");
+    }
+
+    #[test]
+    fn parse_describe_sequence_state_request_accepts_handle_aliases() {
+        let runtime = parse_describe_sequence_state_request(&serde_json::json!({
+            "type": "describe_state",
+            "runtime_state_handle": "state-a"
+        }))
+        .unwrap();
+        assert_eq!(runtime.handle.id, "state-a");
+        assert_eq!(runtime.handle.generation, None);
+
+        let reservation = parse_describe_sequence_state_request(&serde_json::json!({
+            "type": "describe_state",
+            "reservation_id": {
+                "id": "reserve-a",
+                "kind": "generic_reserved_state",
+                "generation": 3
+            }
+        }))
+        .unwrap();
+        assert_eq!(reservation.handle.id, "reserve-a");
+        assert_eq!(
+            reservation.handle.kind.as_deref(),
+            Some("generic_reserved_state")
+        );
+        assert_eq!(reservation.handle.generation, Some(3));
+
+        let handle = parse_describe_sequence_state_request(&serde_json::json!({
+            "type": "describe_state",
+            "handle": {
+                "id": "checkpoint-a",
+                "allocation_epoch": 9
+            }
+        }))
+        .unwrap();
+        assert_eq!(handle.handle.id, "checkpoint-a");
+        assert_eq!(handle.handle.generation, Some(9));
+    }
+
+    #[test]
+    fn parse_describe_sequence_state_request_reports_existing_missing_handle_error() {
+        let err = parse_describe_sequence_state_request(&serde_json::json!({
+            "type": "describe_state"
+        }))
+        .unwrap_err();
+        assert_eq!(err, "describe_state requires runtime_state_handle");
     }
 
     #[test]

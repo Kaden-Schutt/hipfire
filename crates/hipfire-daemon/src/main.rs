@@ -69,8 +69,8 @@ use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
-    model_worker_runtime_view_json, parse_reserve_session_state_request,
-    parse_sequence_state_handle, parse_sequence_state_handle_list,
+    model_worker_runtime_view_json, parse_describe_sequence_state_request,
+    parse_reserve_session_state_request, parse_sequence_state_handle_list,
     parsed_handle_may_target_generic, parsed_handle_may_target_loaded_state,
     qwen35_sequence_state_handle, release_sessions_done_json, release_state_done_json,
     reserve_session_state_done_json, reserve_session_state_rejected_json,
@@ -85,8 +85,8 @@ use hipfire_state::{
 #[cfg(test)]
 use hipfire_state::{
     generic_state_reservation_descriptors, parse_reserve_session_state_kinds,
-    sequence_state_handle_id, sequence_state_handle_parts, sequence_state_page_descriptor_json,
-    SequenceStateHandle,
+    parse_sequence_state_handle, sequence_state_handle_id, sequence_state_handle_parts,
+    sequence_state_page_descriptor_json, SequenceStateHandle,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
@@ -9027,21 +9027,16 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .unwrap_or("describe-state");
                 generic_state_arena.purge_expired();
-                let handle_value = msg
-                    .get("runtime_state_handle")
-                    .or_else(|| msg.get("reservation_id"))
-                    .or_else(|| msg.get("handle"));
-                let Some(handle) = handle_value.and_then(parse_sequence_state_handle) else {
-                    emit_error_with_id(
-                        &mut stdout,
-                        id,
-                        "describe_state requires runtime_state_handle",
-                    );
-                    continue;
+                let request = match parse_describe_sequence_state_request(&msg) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, id, e);
+                        continue;
+                    }
                 };
-                if parsed_handle_may_target_generic(&handle) {
+                if parsed_handle_may_target_generic(&request.handle) {
                     if let Some(reservation) =
-                        generic_state_arena.describe(&handle.id, handle.generation)
+                        generic_state_arena.describe(&request.handle.id, request.handle.generation)
                     {
                         let done = session_state_reservation_describe_json(id, reservation);
                         let _ = writeln!(stdout, "{done}");
@@ -9053,12 +9048,15 @@ fn main() {
                     &active_worker_id,
                     model.as_ref(),
                     &resident_models,
-                    &handle,
+                    &request.handle,
                 ) else {
                     emit_error_with_id(
                         &mut stdout,
                         id,
-                        format!("describe_state unknown runtime_state_handle {}", handle.id),
+                        format!(
+                            "describe_state unknown runtime_state_handle {}",
+                            request.handle.id
+                        ),
                     );
                     continue;
                 };
