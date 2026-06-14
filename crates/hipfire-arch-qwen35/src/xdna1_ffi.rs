@@ -62,6 +62,10 @@ pub struct Xdna1Lib {
     pub fn_attn_gate_create: Option<FnCreate>,
     pub fn_attn_gate_run_handle: Option<FnRunHandle>,
     pub fn_attn_gate_destroy: Option<FnDestroy>,
+    // Softmax symbol is optional — one xclbin per (n_heads, ctx_len) bucket.
+    pub fn_softmax_create: Option<FnCreate>,
+    pub fn_softmax_run_handle: Option<FnRunHandle>,
+    pub fn_softmax_destroy: Option<FnDestroy>,
 }
 
 // Library holds only raw fn-ptrs and a Library — all Send+Sync.
@@ -158,6 +162,19 @@ impl Xdna1Lib {
                 .get::<FnDestroy>(b"xdna1_bf16_attn_gate_destroy\0")
                 .ok()
                 .map(|s| *s);
+            // Softmax: optional, one xclbin per (n_heads, ctx_len) bucket.
+            let fn_softmax_create = lib
+                .get::<FnCreate>(b"xdna1_bf16_softmax_create\0")
+                .ok()
+                .map(|s| *s);
+            let fn_softmax_run_handle = lib
+                .get::<FnRunHandle>(b"xdna1_bf16_softmax_run_handle\0")
+                .ok()
+                .map(|s| *s);
+            let fn_softmax_destroy = lib
+                .get::<FnDestroy>(b"xdna1_bf16_softmax_destroy\0")
+                .ok()
+                .map(|s| *s);
             Ok(Xdna1Lib {
                 fn_swiglu_create: *fn_swiglu_create,
                 fn_swiglu_run_handle: *fn_swiglu_run_handle,
@@ -180,6 +197,9 @@ impl Xdna1Lib {
                 fn_attn_gate_create,
                 fn_attn_gate_run_handle,
                 fn_attn_gate_destroy,
+                fn_softmax_create,
+                fn_softmax_run_handle,
+                fn_softmax_destroy,
                 _lib: lib,
             })
         }
@@ -755,6 +775,96 @@ pub unsafe fn attn_gate_run(
         len,
         out.as_mut_ptr(),
         len,
+    );
+    !ret.is_null()
+}
+
+// ─── Softmax handle cache (keyed by (layer_idx, ctx_len)) ────────────────────
+//
+// Each (layer, ctx_len) pair needs its own handle because the xclbin is built
+// for a fixed context window size.  Callers pick the smallest supported bucket
+// that covers the current sequence length and pad unused positions with -inf.
+
+static SOFTMAX_HANDLES: OnceLock<Mutex<HashMap<(usize, usize), RawHandle>>> = OnceLock::new();
+
+fn softmax_handles() -> &'static Mutex<HashMap<(usize, usize), RawHandle>> {
+    SOFTMAX_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Create (or reuse cached) softmax handle for `(layer_idx, ctx_len)`.
+///
+/// `ctx_len` must match the xclbin built with `build_qwen35_softmax.py`.
+/// Returns `None` if the library isn't loaded, softmax symbols are absent
+/// (older .so), or the create call returns null.
+pub fn softmax_handle_for(
+    layer_idx: usize,
+    ctx_len: usize,
+    n_total: usize,
+    xclbin_path: &str,
+    instr_path: &str,
+) -> Option<*mut c_void> {
+    let lib = get_lib()?;
+    let fn_create = lib.fn_softmax_create?;
+    let mut map = softmax_handles().lock().unwrap();
+    let key = (layer_idx, ctx_len);
+    if let Some(h) = map.get(&key) {
+        return Some(h.0);
+    }
+    let xclbin_c = CString::new(xclbin_path).ok()?;
+    let instr_c = CString::new(instr_path).ok()?;
+    let handle = unsafe {
+        fn_create(
+            xclbin_c.as_ptr(),
+            instr_c.as_ptr(),
+            n_total,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() {
+        eprintln!(
+            "[xdna1] softmax_create returned null for layer={layer_idx} \
+             ctx_len={ctx_len} n_total={n_total} xclbin={xclbin_path}"
+        );
+        return None;
+    }
+    map.insert(key, RawHandle(handle));
+    Some(handle)
+}
+
+/// Call `xdna1_bf16_softmax_run_handle`.
+///
+/// `input` is BF16 attention scores [n_heads × ctx_len], padded to ctx_len
+/// with -inf for positions beyond the current sequence length.
+/// `out` receives the BF16 per-head softmax probabilities.
+///
+/// # Safety
+/// Caller guarantees all slices are valid and sizes match the handle shape.
+pub unsafe fn softmax_run(
+    handle: *mut c_void,
+    input: &[u16],
+    out: &mut [u16],
+) -> bool {
+    let lib = match get_lib() {
+        Some(l) => l,
+        None => return false,
+    };
+    let fn_run = match lib.fn_softmax_run_handle {
+        Some(f) => f,
+        None => return false,
+    };
+    let n = input.len();
+    debug_assert_eq!(out.len(), n);
+    // Binary-op signature: (handle, in, in_n, unused, 0, out, out_n)
+    // Softmax is unary; we pass input twice to satisfy the FnRunHandle signature
+    // and let the runtime ignore the second input pointer.
+    let ret = fn_run(
+        handle,
+        input.as_ptr(),
+        n,
+        input.as_ptr(),
+        0,
+        out.as_mut_ptr(),
+        n,
     );
     !ret.is_null()
 }

@@ -168,3 +168,21 @@ Tolerance: atol=0.02, rtol=0.02. max_abs=0.016 (≈1 ULP at magnitude ≤1, from
 | q_dim | max_abs_err | mean_abs_err | max_rel_err | result |
 |-------|-------------|--------------|-------------|--------|
 | 2048  | 0.01562     | 0.00211      | 0.0216      | PASS   |
+
+## Kernel 7: Softmax (`softmax_bf16`)
+
+- **Date**: 2026-06-14
+- **Status**: PASS (all ctx_len variants)
+- **Config**: n_heads=8, Qwen3.5-1.5B dense, NPU1 (Phoenix/AIE2)
+- **Algorithm**: 3-pass scalar poly-exp (from mlir-aie bf16_softmax.cc), + max-subtraction pre-pass
+- **Exp method**: range-reduction `2^trunc(x*log2e) * 2^frac(x*log2e)`, degree-2 poly for fractional; clamped for underflow (`ix < -127 → 0`). Handles masked -inf positions correctly (produce exactly 0).
+- **Note on LUT exp**: `getExpBf16` from lut_based_ops.h only handles positive inputs (LUT covers [0, 7.97]); negative inputs (all values after max-subtraction) give `exp(7.97)` via truncation — unusable here.
+
+| ctx_len | max_abs  | npu_mean | wall_mean |
+|---------|----------|----------|-----------|
+| 64      | 0.00391  | 608 µs   | 672 µs    |
+| 128     | 0.00269  | 1343 µs  | 1486 µs   |
+| 256     | 0.00122  | 1881 µs  | 1953 µs   |
+| 512     | 0.00073  | 3860 µs  | 4134 µs   |
+
+**Dispatch floor: ~170 µs; compute scales ~7.4 µs/element (scalar loop).** Softmax is compute-heavy (exp + sum + normalize) and the scalar implementation dominates. Not NPU-competitive with GPU DFlash for typical decode contexts (DFlash fuses QK^T + softmax + AV in one kernel). Useful only for the non-DFlash fallback paths (Q8 FA, gqa4) at short context lengths (≤128) where standalone GPU softmax dispatch overhead dominates.

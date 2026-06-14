@@ -13,10 +13,12 @@
 //   HIPFIRE_NPU_RMSNORM_SIZES  — model hidden sizes for RMSNorm (default: "1536,3584")
 //   HIPFIRE_NPU_ROPE_CONFIGS   — "n_heads:n_kv_heads:head_dim:n_rot" tuples,
 //                                comma-separated (default: "8:2:256:64")
-//   HIPFIRE_NPU_TARGETS        — comma-separated NPU targets: auto|npu1|npu2
-//                                (default: "auto")
-//   HIPFIRE_NPU_PYTHON         — Python interpreter to use (default: ~/.venv/bin/python
-//                                falling back to python3)
+//   HIPFIRE_NPU_TARGETS         — comma-separated NPU targets: auto|npu1|npu2
+//                                 (default: "auto")
+//   HIPFIRE_NPU_PYTHON          — Python interpreter to use (default: ~/.venv/bin/python
+//                                 falling back to python3)
+//   HIPFIRE_NPU_SOFTMAX_CONFIGS — "n_heads:ctx_len1+ctx_len2+..." tuples,
+//                                 comma-separated (default: "8:64+128+256+512")
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -202,6 +204,48 @@ fn main() {
     for npu in &targets {
         for &(nh, hd) in &attn_gate_configs {
             run_attn_gate_build(&python, &attn_gate_script, &out_dir, npu, nh, hd);
+        }
+    }
+
+    // ── Softmax kernel ────────────────────────────────────────────────────────
+    // HIPFIRE_NPU_SOFTMAX_CONFIGS: "n_heads:ctx_lens" pairs where ctx_lens is a
+    // '+'-separated list of window sizes (default "8:64+128+256+512").
+    // One xclbin per (n_heads, ctx_len) is emitted; caller pads with -inf.
+    let softmax_script = workspace.join("tools/npu/build_qwen35_softmax.py");
+    let softmax_src = workspace.join("tools/npu/softmax_bf16.cc");
+
+    println!("cargo:rerun-if-changed={}", softmax_script.display());
+    println!("cargo:rerun-if-changed={}", softmax_src.display());
+    println!("cargo:rerun-if-env-changed=HIPFIRE_NPU_SOFTMAX_CONFIGS");
+
+    if !softmax_script.exists() {
+        println!(
+            "cargo:warning=npu-kernels: softmax build script not found at {} — skipping",
+            softmax_script.display()
+        );
+        return;
+    }
+
+    // Parse "n_heads:ctx_len1+ctx_len2+..." entries.
+    let softmax_configs: Vec<(u32, Vec<u32>)> = std::env::var("HIPFIRE_NPU_SOFTMAX_CONFIGS")
+        .unwrap_or_else(|_| "8:64+128+256+512".to_string())
+        .split(',')
+        .filter_map(|s| {
+            let s = s.trim();
+            let mut parts = s.splitn(2, ':');
+            let nh: u32 = parts.next()?.trim().parse().ok()?;
+            let ctx_lens: Vec<u32> = parts
+                .next()?
+                .split('+')
+                .filter_map(|c| c.trim().parse().ok())
+                .collect();
+            if ctx_lens.is_empty() { None } else { Some((nh, ctx_lens)) }
+        })
+        .collect();
+
+    for npu in &targets {
+        for (nh, ctx_lens) in &softmax_configs {
+            run_softmax_build(&python, &softmax_script, &out_dir, npu, *nh, ctx_lens);
         }
     }
 }
@@ -396,6 +440,59 @@ fn run_rope_build(
         Err(e) => {
             println!(
                 "cargo:warning=npu-kernels: could not launch Python for rope {npu}: {e}"
+            );
+        }
+    }
+}
+
+fn run_softmax_build(
+    python: &Path,
+    script: &Path,
+    out_dir: &Path,
+    npu: &str,
+    n_heads: u32,
+    ctx_lens: &[u32],
+) {
+    let ctx_lens_str = ctx_lens
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let result = Command::new(python)
+        .arg(script)
+        .arg("--n-heads")
+        .arg(n_heads.to_string())
+        .arg("--ctx-lens")
+        .arg(&ctx_lens_str)
+        .arg("--npu")
+        .arg(npu)
+        .arg("--out-dir")
+        .arg(out_dir)
+        .output();
+
+    match result {
+        Ok(out) if out.status.success() => {
+            println!(
+                "cargo:warning=npu-kernels: softmax {npu} n_heads={n_heads} \
+                 ctx_lens={ctx_lens_str} → {}",
+                out_dir.display()
+            );
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let first_err = stderr
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("(no output)");
+            println!(
+                "cargo:warning=npu-kernels: softmax {npu} n_heads={n_heads} \
+                 ctx_lens={ctx_lens_str} failed (exit {}): {first_err}",
+                out.status
+            );
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=npu-kernels: could not launch Python for softmax {npu}: {e}"
             );
         }
     }
