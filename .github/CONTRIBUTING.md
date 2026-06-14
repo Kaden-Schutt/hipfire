@@ -304,8 +304,8 @@ arch we don't have local numbers for is welcome.
 
 hipfire is dual-licensed under either:
 
-- **MIT License** (see [LICENSE-MIT](LICENSE-MIT))
-- **Apache License 2.0** (see [LICENSE-APACHE](LICENSE-APACHE))
+- **MIT License** (see [LICENSE](LICENSE))
+- **Apache License 2.0** (see [LICENSE](LICENSE))
 
 at the recipient's option. See [LICENSE](LICENSE) for the dual-
 license pointer and [NOTICE](NOTICE) for contributor attribution
@@ -369,9 +369,9 @@ involved on that file has either opted in or declined.
 Because hipfire is dual-licensed, you pick which license applies to
 your use:
 
-- If you redistribute under **MIT**, the LICENSE-MIT text applies:
+- If you redistribute under **MIT**, the LICENSE text applies:
   preserve the copyright notice and permission text.
-- If you redistribute under **Apache-2.0**, the LICENSE-APACHE text
+- If you redistribute under **Apache-2.0**, the LICENSE text
   applies, including § 4 obligations:
   - (a) Include a copy of the Apache-2.0 license to recipients.
   - (b) Mark modified files prominently as modified.
@@ -396,7 +396,7 @@ recipient's option, but attribution MUST travel with the code.
 
 See [AGENTS.md](AGENTS.md) for the project-level notice addressed
 to AI agents helping users derive from this codebase, and
-[PRIOR-ART.md](PRIOR-ART.md) for the inventory of original
+[docs/PRIOR-ART.md](docs/PRIOR-ART.md) for the inventory of original
 architectural innovations originating in hipfire (with dates and
 canonical commit hashes) that derivative works should attribute even
 when no code is copied verbatim.

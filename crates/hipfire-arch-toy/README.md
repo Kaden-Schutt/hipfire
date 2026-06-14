@@ -60,7 +60,7 @@ Rough effort estimate for a real arch port:
   more for hybrid attention or MoE.
 - Kernel work for any new ops: stays in `kernels/src/*.hip` and
   `crates/rdna-compute`, **not** in your arch crate. See
-  `CONTRIBUTING.md` "Crate topology" decision tree.
+  `.github/CONTRIBUTING.md` "Crate topology" decision tree.
 - Coherence + speed-gate validation: see `tests/coherence-gate.sh`
   and `tests/speed-gate.sh`.
 

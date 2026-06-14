@@ -7,8 +7,8 @@
 """Apply SPDX + copyright headers to first-party hipfire source files.
 
 hipfire is dual-licensed under MIT OR Apache-2.0 (Rust ecosystem
-norm; see LICENSE, LICENSE-MIT, LICENSE-APACHE, and NOTICE at the
-repo root). The per-file SPDX-License-Identifier reflects ACTUAL
+norm; see LICENSE and NOTICE at the repo root). The per-file
+SPDX-License-Identifier reflects ACTUAL
 authorship, not a project-wide blanket relicense:
 
     * Apache-2.0       — file's substantive authors (>= secondary

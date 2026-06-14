@@ -22,9 +22,7 @@
 - `BUGS.md`
 - `CHANGELOG.md`
 - `CLAUDE.md`
-- `CONTRIBUTING.md`
 - `CREDITS.md`
-- `PRIOR-ART.md`
 - `README.md`
 - `TODO.md`
 

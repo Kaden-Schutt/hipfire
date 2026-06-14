@@ -8,7 +8,7 @@ description = "Reference template for new arch crates: minimum-viable Architectu
 # This crate is INTENTIONALLY tiny. It exists so contributors adding a new
 # model architecture have a copy-paste starting point with all the pieces
 # that pass the workspace build, plus heavy explanatory comments. It is
-# NOT consumed by the daemon / runtime examples — see CONTRIBUTING.md
+# NOT consumed by the daemon / runtime examples — see .github/CONTRIBUTING.md
 # "Crate topology" for where it fits.
 
 [dependencies]

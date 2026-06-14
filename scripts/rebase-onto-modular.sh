@@ -177,7 +177,7 @@ if ! git diff --quiet; then
       use engine::*  → use hipfire_runtime::*  (or arch crate)
       Cargo deps:     engine = ...  → hipfire-runtime = ...
 
-    See CHANGELOG.md and CONTRIBUTING.md for the full topology.
+    See CHANGELOG.md and .github/CONTRIBUTING.md for the full topology.
     "
 else
     echo "    (no changes to commit — branch already aligned)"

@@ -18,7 +18,7 @@ abstract: >-
   original quantization family (HFQ4-G256, MagnumQuant MQ4/MQ8 with
   offline FWHT rotation, HFP4/MFP4 FP4), an asym3 KV cache with
   asym-aware flash attention, and a DDTree-RDNA tree-speculative
-  decode path on top of DFlash. See PRIOR-ART.md for the full
+  decode path on top of DFlash. See docs/PRIOR-ART.md for the full
   inventory of original architectural innovations with first-commit
   dates and canonical hashes.
 keywords:

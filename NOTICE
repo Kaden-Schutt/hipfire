@@ -6,13 +6,13 @@ CREDITS.md, and per-file SPDX/copyright headers).
 
 hipfire is dual-licensed under either:
 
-    MIT License            (see LICENSE-MIT)
-    Apache License 2.0     (see LICENSE-APACHE)
+    MIT License            (see LICENSE)
+    Apache License 2.0     (see LICENSE)
 
 at your option. This matches the Rust ecosystem norm and respects
 contributor agency: existing contributors who submitted under MIT are
 NOT relicensed in absentia; new contributions default to Apache 2.0
-via the DCO sign-off described in CONTRIBUTING.md, and individual
+via the DCO sign-off described in .github/CONTRIBUTING.md, and individual
 contributors may elect MIT-only for their own contributions.
 
 This NOTICE file is provided pursuant to Apache License 2.0 § 4(d)
@@ -57,7 +57,7 @@ The authoritative, per-contributor record of substantive code
 contributions is maintained in CREDITS.md (regenerated from merged
 PRs by scripts/refresh-credits.sh). The summary below reflects the
 state at the time of dual licensing (2026-05) and is informational;
-CREDITS.md, the per-file SPDX/copyright headers, and PRIOR-ART.md
+CREDITS.md, the per-file SPDX/copyright headers, and docs/PRIOR-ART.md
 together govern attribution.
 
 - crates/{hip-bridge, hsa-bridge, rdna-compute, hipfire-runtime,
@@ -86,7 +86,7 @@ together govern attribution.
 
 - All other files: per git blame and CREDITS.md.
 
-PRIOR-ART.md documents original architectural innovations
+docs/PRIOR-ART.md documents original architectural innovations
 originating in hipfire (with dates and commit hashes) so that
 derivative works can attribute them correctly.
 
@@ -115,7 +115,7 @@ copyright-infringement remedies, not just contract damages.
 == Attribution requirements (when distributing under MIT) ==
 
 For portions distributed under MIT, the MIT license text in
-LICENSE-MIT applies: redistribution must preserve the copyright
+LICENSE applies: redistribution must preserve the copyright
 notice and the MIT permission text. The per-file SPDX/copyright
 headers satisfy this when carried through the source.
 

@@ -133,8 +133,7 @@ new PRs merge). Hand-edits inside the auto block will be overwritten.
 ## License
 
 hipfire is dual-licensed under MIT or Apache-2.0 at your option (see
-[LICENSE](LICENSE), [LICENSE-MIT](LICENSE-MIT),
-[LICENSE-APACHE](LICENSE-APACHE), and [NOTICE](NOTICE)). The
+[LICENSE](LICENSE) and [NOTICE](NOTICE)). The
 canonical repository transitioned from MIT-only to dual-licensing in
 May 2026; see
 [docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md)

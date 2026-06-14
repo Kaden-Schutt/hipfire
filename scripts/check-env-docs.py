@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DOC = ROOT / "docs" / "env-vars.md"
-REFERENCE_DOCS = [ROOT / "AGENTS.md", ROOT / "README.md", ROOT / "CONTRIBUTING.md"]
+REFERENCE_DOCS = [ROOT / "AGENTS.md", ROOT / "README.md", ROOT / ".github" / "CONTRIBUTING.md"]
 
 
 def env_vars(path: Path) -> set[str]:

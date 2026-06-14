@@ -86,7 +86,7 @@ jobs:
             correct, coherent, or faster; instead flag what the GPU gates
             (test_kernels / coherence-gate / speed-gate) must confirm.
 
-            Read CLAUDE.md and CONTRIBUTING.md first (source of truth). Then
+            Read CLAUDE.md and .github/CONTRIBUTING.md first (source of truth). Then
             review the diff, prioritizing the failure modes that have ACTUALLY
             bitten this repo — ordered by how often they recur in its git
             history. Comment only when something is off:
