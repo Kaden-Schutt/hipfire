@@ -8,6 +8,7 @@ members = [
     "crates/hipfire-cpu",
     "crates/hipfire-daemon-adapter",
     "crates/hipfire-daemon-protocol",
+    "crates/hipfire-eval",
     "crates/hipfire-evidence",
     "crates/hipfire-generate",
     "crates/hipfire-model",

@@ -376,7 +376,8 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
     Push-Location $RepoDir
     try {
         cargo build --release --features deltanet -p hipfire-daemon --bin hipfire-daemon
-        cargo build --release --features deltanet -p hipfire-runtime --example infer --example infer_hfq --bin hipfire-eval --bin hipfire-host-profile
+        cargo build --release -p hipfire-eval
+        cargo build --release --features deltanet -p hipfire-runtime --example infer --example infer_hfq --bin hipfire-host-profile
     } finally {
         Pop-Location
     }

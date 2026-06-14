@@ -1,0 +1,13 @@
+[package]
+name = "hipfire-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Evaluation runner adapter for hipfire"
+
+[[bin]]
+name = "hipfire-eval"
+path = "src/main.rs"
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }

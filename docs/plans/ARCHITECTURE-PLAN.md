@@ -16,6 +16,7 @@ It is intentionally compact and backed by evidence links into the historical arc
 
 The target crates for modular boundaries remain:
 - `hipfire-daemon`
+- `hipfire-eval` (created; owns the eval runner binary adapter)
 - `hipfire-model` (created; owns model-source contracts and artifact identity helpers)
 - `hipfire-prompt` (created; owns prompt framing and Jinja rendering)
 - `hipfire-state`
@@ -83,6 +84,7 @@ Current daemon adapter boundary status:
 Current evidence boundary status:
 - `hipfire-evidence` owns stable evidence hash helpers, directory digest, file hash, model/tag hash and HFQ metadata compatibility wrappers that delegate to `hipfire-model`, eval reference/slice/llama integrity verifiers, the standard evidence artifact catalog, catalog-based evidence artifact directory discovery, evidence artifact collection status policy, standard evidence artifact contract/JSON rendering, comparison/admission artifact contract rendering, admission required/observed evidence catalogs, the generic evidence artifact record contract/JSON renderer, external evidence record selection/annotation, comparison metric-direction policy, admission quality/review policy, admission verdict policy, run-provenance contract/JSON rendering, run-metadata artifact contract/JSON rendering, and artifact-index entry contract/JSON rendering.
 - `hipfire-runtime::eval_common` remains a compatibility facade for evidence-owned eval integrity verifiers, and `hipfire-runtime::eval_harness` still owns eval execution and artifact writing, but now consumes the shared evidence provenance helpers, artifact catalog, artifact path discovery, evidence artifact collection status policy, standard evidence artifact rendering, comparison/admission artifact rendering, admission required/observed evidence catalogs, evidence record rendering, external evidence record selection/annotation, comparison metric-direction policy, admission quality/review policy, admission verdict policy, run-provenance contract, run-metadata artifact rendering, and artifact-index entry rendering.
+- `hipfire-eval` owns the `hipfire-eval` binary adapter and delegates to `hipfire-runtime::eval_harness` until the harness implementation can move without a runtime/coherence dependency cycle.
 
 Current coherence boundary status:
 - `hipfire-coherence` owns detector profile selection, detector-bank construction, agentic prompt detection, coherence run input/output contracts, report row serialization, and coherence artifact serialization.

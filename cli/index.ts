@@ -6288,11 +6288,17 @@ switch (cmd) {
     console.error("  CLI updated ✓");
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
-    const build = Bun.spawnSync(
-      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "-p", "hipfire-runtime"],
+    const runtimeBuild = Bun.spawnSync(
+      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "--bin", "hipfire-host-profile", "-p", "hipfire-runtime"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
-    if (build.exitCode !== 0) {
+    const evalBuild = runtimeBuild.exitCode === 0
+      ? Bun.spawnSync(
+          [CARGO_BIN, "build", "--release", "-p", "hipfire-eval"],
+          { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
+        )
+      : runtimeBuild;
+    if (runtimeBuild.exitCode !== 0 || evalBuild.exitCode !== 0) {
       console.error("");
       console.error("  Daemon build failed. CLI is updated (so `hipfire pull`,");
       console.error("  `hipfire list`, `hipfire config` still work), but the");

@@ -62,7 +62,7 @@ pick_eval_bin() {
             return 0
         fi
     done
-    echo "eval-smoke: hipfire-eval binary not found; run cargo build -p hipfire-runtime --bin hipfire-eval" >&2
+    echo "eval-smoke: hipfire-eval binary not found; run cargo build -p hipfire-eval" >&2
     return 1
 }
 

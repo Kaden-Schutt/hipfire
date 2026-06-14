@@ -216,9 +216,11 @@ cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-daemon --root "$HIPFIRE
 # hipfire: the CLI (serve / run / list)
 cargo install "${INSTALL_OPTS[@]}" --path crates/hipfire-cli --root "$HIPFIRE_DIR"
 
-# Auxiliary runtime tools
+# Auxiliary eval/runtime tools
+cargo install --path crates/hipfire-eval \
+    "${INSTALL_OPTS[@]}" \
+    --root "$HIPFIRE_DIR"
 cargo install --path crates/hipfire-runtime \
-    --bin hipfire-eval \
     --bin hipfire-host-profile \
     "${INSTALL_OPTS[@]}" \
     --root "$HIPFIRE_DIR"

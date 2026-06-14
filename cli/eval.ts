@@ -51,7 +51,7 @@ Common options:
   --fail-on-admission     Exit non-zero unless admission verdict is promote
 
 Build runner:
-  cargo build --release -p hipfire-runtime --bin hipfire-eval`;
+  cargo build --release -p hipfire-eval`;
 
 export function isEvalHelp(args: string[]): boolean {
   return args.length === 0 || args.some((a) => a === "-h" || a === "--help");
@@ -98,7 +98,7 @@ export async function runEvalCommand(args: string[]): Promise<void> {
   }
   if (!cmd) {
     console.error("hipfire-eval not found.");
-    console.error("Build it with: cargo build --release -p hipfire-runtime --bin hipfire-eval");
+    console.error("Build it with: cargo build --release -p hipfire-eval");
     process.exit(1);
   }
 

@@ -159,7 +159,7 @@ select_baseline() {
 
 if ! EVAL_BIN="$(resolve_eval_bin)"; then
     echo "speed-gate: building hipfire-eval..."
-    cargo build -p hipfire-runtime --bin hipfire-eval >/dev/null || exit 2
+    cargo build -p hipfire-eval >/dev/null || exit 2
     EVAL_BIN="$(resolve_eval_bin)" || { echo "speed-gate: hipfire-eval build did not produce a binary" >&2; exit 2; }
 fi
 

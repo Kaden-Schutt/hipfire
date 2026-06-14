@@ -399,11 +399,6 @@ path = "src/bin/collect_hessian.rs"
 required-features = []
 
 [[bin]]
-name = "hipfire-eval"
-path = "src/bin/hipfire_eval.rs"
-required-features = []
-
-[[bin]]
 name = "hipfire-host-profile"
 path = "src/bin/hipfire_host_profile.rs"
 required-features = []
