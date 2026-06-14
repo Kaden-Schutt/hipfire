@@ -18,6 +18,7 @@ Do not add one-off experiments here unless they are accepted as canonical. Those
 - [plans/ARCHITECTURE-PLAN.md](./plans/ARCHITECTURE-PLAN.md) — current architecture + modularization plan.
 - [reference/STATUS.md](./reference/STATUS.md) — current doc quality and drift state.
 - [reference/CHECKLIST.md](./reference/CHECKLIST.md) — required doc updates for active work.
+- [REVIEW-AUDIT-2026-06-14.md](./REVIEW-AUDIT-2026-06-14.md) — one-shot full markdown audit record.
 
 ## Canonical Modularization Set (read first for ongoing implementation)
 
