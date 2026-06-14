@@ -5,7 +5,11 @@
 //! Shared model artifact identity helpers and model-source contracts.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Extension preferred order for fuzzy model discovery.
 pub const QUANT_PREFERENCE: &[&str] =
@@ -35,6 +39,27 @@ pub struct QuantConfig {
     pub krot: u8,
     /// Regex patterns for layers excluded from quantization (kept FP16).
     pub dynamic_excludes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelManifestEntry {
+    pub role: String,
+    pub identifier: String,
+    pub path_exists: bool,
+    pub file_size: Option<u64>,
+    pub file_hash: Option<String>,
+    pub tag_hash: Option<String>,
+    pub hfq_arch_id: Option<u32>,
+    pub hfq_metadata_hash: Option<String>,
+    pub quantization_hash: Option<Value>,
+    pub metadata_status: String,
+    pub metadata_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfqMetadata {
+    pub arch_id: u32,
+    pub metadata_json: String,
 }
 
 /// Stable identity for routing requests to a compatible loaded model worker.
@@ -278,6 +303,133 @@ pub fn model_artifact_stem(model: &str) -> String {
     sanitized.trim_matches('-').to_string()
 }
 
+pub fn model_manifest_entry(role: &str, identifier: &str) -> ModelManifestEntry {
+    let path = Path::new(identifier);
+    let path_exists = path.exists();
+    let file_size = if path_exists {
+        fs::metadata(path).ok().map(|m| m.len())
+    } else {
+        None
+    };
+    let file_hash = if path_exists {
+        model_hash(identifier)
+    } else {
+        None
+    };
+    let tag_hash = if path_exists {
+        None
+    } else {
+        Some(format!("tag:{}", stable_hash_bytes(identifier.as_bytes())))
+    };
+    let (hfq_arch_id, hfq_metadata_hash, quantization_hash, metadata_status, metadata_reason) =
+        if path_exists {
+            match read_hfq_metadata(path) {
+                Ok(meta) => {
+                    let parsed: Value =
+                        serde_json::from_str(&meta.metadata_json).unwrap_or(Value::Null);
+                    (
+                        Some(meta.arch_id),
+                        Some(stable_hash_bytes(meta.metadata_json.as_bytes())),
+                        parsed.get("quantization_hash").cloned(),
+                        "pass".to_string(),
+                        None,
+                    )
+                }
+                Err(reason) => (None, None, None, "skip".to_string(), Some(reason)),
+            }
+        } else {
+            (
+                None,
+                None,
+                None,
+                "skip".to_string(),
+                Some("identifier is not a local file path; treating as model tag".to_string()),
+            )
+        };
+
+    ModelManifestEntry {
+        role: role.to_string(),
+        identifier: identifier.to_string(),
+        path_exists,
+        file_size,
+        file_hash,
+        tag_hash,
+        hfq_arch_id,
+        hfq_metadata_hash,
+        quantization_hash,
+        metadata_status,
+        metadata_reason,
+    }
+}
+
+pub fn model_hash(model: &str) -> Option<String> {
+    let p = Path::new(model);
+    if p.exists() {
+        file_hash(p)
+    } else {
+        Some(format!("tag:{}", stable_hash_bytes(model.as_bytes())))
+    }
+}
+
+pub fn file_hash(path: &Path) -> Option<String> {
+    command_digest("sha256sum", path).or_else(|| Some(stable_hash_file_fallback(path)))
+}
+
+pub fn stable_hash_file_fallback(path: &Path) -> String {
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return "unavailable".to_string(),
+    };
+    let mut state = Fnv64::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => state.update(&buf[..n]),
+            Err(_) => return "unavailable".to_string(),
+        }
+    }
+    format!("fnv64:{:016x}", state.finish())
+}
+
+pub fn stable_hash_bytes(bytes: &[u8]) -> String {
+    let mut state = Fnv64::new();
+    state.update(bytes);
+    format!("fnv64:{:016x}", state.finish())
+}
+
+pub fn read_hfq_metadata(path: &Path) -> Result<HfqMetadata, String> {
+    let mut f = File::open(path).map_err(|e| format!("open model: {e}"))?;
+    let mut header = [0u8; 32];
+    f.read_exact(&mut header)
+        .map_err(|e| format!("read HFQ header: {e}"))?;
+    if &header[0..4] != b"HFQM" {
+        return Err("not an HFQ container".to_string());
+    }
+    let arch_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    let metadata_offset = u64::from_le_bytes(header[16..24].try_into().unwrap()) as usize;
+    let data_offset = u64::from_le_bytes(header[24..32].try_into().unwrap()) as usize;
+    let span_len = data_offset.saturating_sub(metadata_offset);
+    if span_len == 0 || span_len > 256 * 1024 * 1024 {
+        return Err(format!(
+            "invalid or too-large metadata span: {metadata_offset}..{data_offset}"
+        ));
+    }
+    f.seek(SeekFrom::Start(metadata_offset as u64))
+        .map_err(|e| format!("seek HFQ metadata span: {e}"))?;
+    let mut span = vec![0u8; span_len];
+    f.read_exact(&mut span)
+        .map_err(|e| format!("read HFQ metadata span: {e}"))?;
+    let json_end = find_json_object_end(&span)
+        .ok_or_else(|| "HFQ metadata JSON object was not terminated".to_string())?;
+    let metadata_json = String::from_utf8(span[..json_end].to_vec())
+        .map_err(|e| format!("HFQ metadata is not UTF-8: {e}"))?;
+    Ok(HfqMetadata {
+        arch_id,
+        metadata_json,
+    })
+}
+
 /// Resolve a model identifier to a file path using the standard Hipfire local
 /// lookup order.
 pub fn find_model_in(arg: &str, models_dir: &Path, aliases_path: Option<&Path>) -> Option<PathBuf> {
@@ -420,6 +572,68 @@ fn maybe_push_model_candidate(out: &mut Vec<PathBuf>, path: &Path, stem: &str) {
         .to_lowercase();
     if name.ends_with(".hfq") && !is_role_sidecar_name(&name) && name.contains(stem) {
         out.push(path.to_path_buf());
+    }
+}
+
+fn command_digest(tool: &str, path: &Path) -> Option<String> {
+    let out = Command::new(tool).arg(path).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+fn find_json_object_end(bytes: &[u8]) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if b == b'\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if b == b'"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if b == b'{' {
+            depth += 1;
+        } else if b == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+    }
+    None
+}
+
+struct Fnv64(u64);
+
+impl Fnv64 {
+    fn new() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.0
     }
 }
 
@@ -684,6 +898,64 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_manifest_entry_extracts_embedded_hfq_quantization_hash() {
+        let root = temp_dir("hipfire-model-manifest-hfq");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("candidate.hfq");
+        let metadata = json!({
+            "architecture": "qwen3",
+            "quantization_hash": {
+                "algorithm": "xxh64",
+                "seed": 0,
+                "scope": "hfq_tensor_index_and_payload_v1",
+                "value": "0123456789abcdef",
+            }
+        });
+        write_minimal_hfq(&path, &metadata);
+
+        let entry = model_manifest_entry("candidate", path.to_str().unwrap());
+        assert_eq!(entry.role, "candidate");
+        assert!(entry.path_exists);
+        assert_eq!(entry.hfq_arch_id, Some(1));
+        assert_eq!(entry.metadata_status, "pass");
+        assert_eq!(
+            entry
+                .quantization_hash
+                .as_ref()
+                .and_then(|v| v.get("value"))
+                .and_then(Value::as_str),
+            Some("0123456789abcdef")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_manifest_entry_records_tags_without_hfq_metadata() {
+        let entry = model_manifest_entry("candidate", "qwen3.5:9b");
+        assert!(!entry.path_exists);
+        assert!(entry.file_hash.is_none());
+        assert!(entry.tag_hash.as_deref().unwrap_or("").starts_with("tag:"));
+        assert_eq!(entry.metadata_status, "skip");
+        assert!(entry.quantization_hash.is_none());
+    }
+
+    fn write_minimal_hfq(path: &Path, metadata: &serde_json::Value) {
+        let metadata_bytes = serde_json::to_vec(metadata).unwrap();
+        let metadata_offset = 32u64;
+        let data_offset = metadata_offset + metadata_bytes.len() as u64;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"HFQM");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&metadata_offset.to_le_bytes());
+        bytes.extend_from_slice(&data_offset.to_le_bytes());
+        bytes.extend_from_slice(&metadata_bytes);
+        fs::write(path, bytes).unwrap();
     }
 
     #[test]

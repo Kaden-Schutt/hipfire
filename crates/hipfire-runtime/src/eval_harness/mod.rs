@@ -24,8 +24,8 @@ use hipfire_evidence::{
     comparison_artifact_json, directory_hash, evidence_artifact_index_entry_from_value_json,
     evidence_artifact_index_entry_json, evidence_artifact_json, evidence_collection_policy,
     evidence_metric_direction, evidence_record_json, extract_external_evidence_records_json,
-    file_hash, list_files, model_hash, read_hfq_metadata, required_admission_evidence_requirements,
-    run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
+    file_hash, list_files, required_admission_evidence_requirements, run_metadata_artifact_json,
+    run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
     standard_evidence_paths_in_dir, AdmissionArtifact as EvidenceAdmissionArtifact,
     AdmissionEvidence as EvidenceAdmissionEvidence,
     ComparisonArtifact as EvidenceComparisonArtifact, EvidenceArtifact, EvidenceArtifactCollection,
@@ -34,7 +34,10 @@ use hipfire_evidence::{
     RunMetadataModels, RunProvenance, OBSERVED_ADMISSION_EVIDENCE_KINDS,
     STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
-use hipfire_model::{discover_dflash_draft_for_model, model_artifact_stem};
+use hipfire_model::{
+    discover_dflash_draft_for_model, model_artifact_stem, model_hash, model_manifest_entry,
+    ModelManifestEntry,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -448,21 +451,6 @@ pub struct DatasetManifestEntry {
     pub selected_item_ids: Vec<String>,
     pub status: EvalStatus,
     pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelManifestEntry {
-    pub role: String,
-    pub identifier: String,
-    pub path_exists: bool,
-    pub file_size: Option<u64>,
-    pub file_hash: Option<String>,
-    pub tag_hash: Option<String>,
-    pub hfq_arch_id: Option<u32>,
-    pub hfq_metadata_hash: Option<String>,
-    pub quantization_hash: Option<Value>,
-    pub metadata_status: EvalStatus,
-    pub metadata_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11004,7 +10992,7 @@ fn write_summary(
     body.push_str("|---|---|---|---|---|---|---|\n");
     for model in model_manifest_entries(config) {
         body.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {:?} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
             model.role,
             model.identifier,
             model.path_exists,
@@ -11256,65 +11244,6 @@ fn model_manifest_entries(config: &EvalConfig) -> Vec<ModelManifestEntry> {
         out.push(model_manifest_entry("reference", reference));
     }
     out
-}
-
-fn model_manifest_entry(role: &str, identifier: &str) -> ModelManifestEntry {
-    let path = Path::new(identifier);
-    let path_exists = path.exists();
-    let file_size = if path_exists {
-        fs::metadata(path).ok().map(|m| m.len())
-    } else {
-        None
-    };
-    let file_hash = if path_exists {
-        model_hash(identifier)
-    } else {
-        None
-    };
-    let tag_hash = if path_exists {
-        None
-    } else {
-        Some(format!("tag:{}", stable_hash_bytes(identifier.as_bytes())))
-    };
-    let (hfq_arch_id, hfq_metadata_hash, quantization_hash, metadata_status, metadata_reason) =
-        if path_exists {
-            match read_hfq_metadata(path) {
-                Ok(meta) => {
-                    let parsed: Value =
-                        serde_json::from_str(&meta.metadata_json).unwrap_or(Value::Null);
-                    (
-                        Some(meta.arch_id),
-                        Some(stable_hash_bytes(meta.metadata_json.as_bytes())),
-                        parsed.get("quantization_hash").cloned(),
-                        EvalStatus::Pass,
-                        None,
-                    )
-                }
-                Err(reason) => (None, None, None, EvalStatus::Skip, Some(reason)),
-            }
-        } else {
-            (
-                None,
-                None,
-                None,
-                EvalStatus::Skip,
-                Some("identifier is not a local file path; treating as model tag".to_string()),
-            )
-        };
-
-    ModelManifestEntry {
-        role: role.to_string(),
-        identifier: identifier.to_string(),
-        path_exists,
-        file_size,
-        file_hash,
-        tag_hash,
-        hfq_arch_id,
-        hfq_metadata_hash,
-        quantization_hash,
-        metadata_status,
-        metadata_reason,
-    }
 }
 
 fn detect_arch() -> Option<String> {
@@ -12558,7 +12487,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
         assert_eq!(entry.role, "candidate");
         assert!(entry.path_exists);
         assert_eq!(entry.hfq_arch_id, Some(1));
-        assert_eq!(entry.metadata_status, EvalStatus::Pass);
+        assert_eq!(entry.metadata_status, "pass");
         assert_eq!(
             entry
                 .quantization_hash
@@ -12577,7 +12506,7 @@ gemm<foo,bar>,2,1000000,500000,33.3,450000,550000,10000
         assert!(!entry.path_exists);
         assert!(entry.file_hash.is_none());
         assert!(entry.tag_hash.as_deref().unwrap_or("").starts_with("tag:"));
-        assert_eq!(entry.metadata_status, EvalStatus::Skip);
+        assert_eq!(entry.metadata_status, "skip");
         assert!(entry.quantization_hash.is_none());
     }
 
