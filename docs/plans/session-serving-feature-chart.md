@@ -62,6 +62,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval artifact row records now reuse `hipfire-evidence` record contracts instead of eval-local JSON construction.
 - Eval comparison, admission, and evidence artifacts now reuse `hipfire-evidence` run-provenance contracts instead of eval-local provenance structs.
 - Eval artifact index entries now reuse `hipfire-evidence` index rendering instead of eval-local JSON construction.
+- Eval comparison, admission, prompt-ledger, and host-profile artifact index entries now reuse `hipfire-evidence` variant renderers instead of eval-local JSON mutation.
 - Eval external evidence ingestion now reuses `hipfire-evidence` record selection and annotation helpers instead of eval-local JSON mapping.
 - Eval run metadata artifacts now reuse `hipfire-evidence` run metadata contracts and JSON rendering instead of eval-local schema construction.
 - Eval comparison artifacts now reuse `hipfire-evidence` metric-direction policy instead of eval-local metric classification.

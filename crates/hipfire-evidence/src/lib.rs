@@ -577,6 +577,61 @@ pub fn evidence_artifact_index_entry_from_value_json(
     entry
 }
 
+pub fn comparison_artifact_index_entry_json(
+    path: impl Into<String>,
+    status: impl Into<String>,
+    case_count: usize,
+    context: &EvidenceArtifactIndexContext,
+) -> Value {
+    let mut entry = evidence_artifact_index_entry_json(path, status, context);
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("case_count".to_string(), json!(case_count));
+    }
+    entry
+}
+
+pub fn admission_artifact_index_entry_json(
+    path: impl Into<String>,
+    status: impl Into<String>,
+    verdict: impl Into<String>,
+    finding_count: usize,
+    context: &EvidenceArtifactIndexContext,
+) -> Value {
+    let mut entry = evidence_artifact_index_entry_json(path, status, context);
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("verdict".to_string(), json!(verdict.into()));
+        object.insert("finding_count".to_string(), json!(finding_count));
+    }
+    entry
+}
+
+pub fn prompt_artifact_index_entry_json(
+    path: impl Into<String>,
+    status: impl Into<String>,
+    kind: impl Into<String>,
+    row_count: usize,
+    context: &EvidenceArtifactIndexContext,
+) -> Value {
+    let mut entry = evidence_artifact_index_entry_json(path, status, context);
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("row_count".to_string(), json!(row_count));
+        object.insert("kind".to_string(), json!(kind.into()));
+    }
+    entry
+}
+
+pub fn host_profile_artifact_index_entry_json(
+    path: impl Into<String>,
+    status: impl Into<String>,
+    context: &EvidenceArtifactIndexContext,
+) -> Value {
+    let mut entry = evidence_artifact_index_entry_json(path, status, context);
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("kind".to_string(), json!("host_capability_profile"));
+    }
+    entry
+}
+
 pub fn evidence_record_json(record: EvidenceRecord) -> Value {
     json!({
         "battery": record.battery,
@@ -1854,6 +1909,58 @@ mod tests {
         assert_eq!(json["reason"], "ok");
         assert_eq!(json["expected_metrics"][0], "tok_s");
         assert_eq!(json["kind"], "performance");
+    }
+
+    #[test]
+    fn artifact_index_variant_entries_add_owned_counts_and_kinds() {
+        let context = EvidenceArtifactIndexContext {
+            provenance: RunProvenance {
+                runner: "hipfire-eval".to_string(),
+                runner_version: "0.2.0".to_string(),
+                hipfire_version: "0.2.0".to_string(),
+                git_commit: Some("abc123".to_string()),
+                git_branch: None,
+                git_describe: None,
+                git_dirty: Some(false),
+                binary_hash: None,
+                arch: None,
+                rocm: None,
+            },
+            host_profile_hash: "host:abc".to_string(),
+            hardware_bucket: "gfx1151:64g".to_string(),
+        };
+
+        let comparison =
+            comparison_artifact_index_entry_json("artifacts/comparisons.json", "pass", 3, &context);
+        assert_eq!(comparison["case_count"], 3);
+        assert_eq!(comparison["status"], "pass");
+
+        let admission = admission_artifact_index_entry_json(
+            "artifacts/admission.json",
+            "fail",
+            "reject",
+            2,
+            &context,
+        );
+        assert_eq!(admission["verdict"], "reject");
+        assert_eq!(admission["finding_count"], 2);
+
+        let prompts = prompt_artifact_index_entry_json(
+            "artifacts/barrage_prompts.jsonl",
+            "materialized",
+            "barrage_prompts",
+            5,
+            &context,
+        );
+        assert_eq!(prompts["row_count"], 5);
+        assert_eq!(prompts["kind"], "barrage_prompts");
+
+        let host = host_profile_artifact_index_entry_json(
+            "artifacts/host_profile.json",
+            "collected",
+            &context,
+        );
+        assert_eq!(host["kind"], "host_capability_profile");
     }
 
     #[test]

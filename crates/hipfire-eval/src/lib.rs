@@ -20,12 +20,14 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
-    admission_artifact_json, admission_metric_is_quality, admission_verdict_policy,
-    classify_hardware_kind, comparison_artifact_json, compute_peak_bandwidth_gbps, directory_hash,
+    admission_artifact_index_entry_json, admission_artifact_json, admission_metric_is_quality,
+    admission_verdict_policy, classify_hardware_kind, comparison_artifact_index_entry_json,
+    comparison_artifact_json, compute_peak_bandwidth_gbps, directory_hash,
     evidence_artifact_index_entry_from_value_json, evidence_artifact_index_entry_json,
     evidence_artifact_json, evidence_collection_policy, evidence_metric_direction,
     evidence_record_json, extract_external_evidence_records_json, file_hash, hardware_bucket,
-    host_profile_hash, list_files, required_admission_evidence_requirements,
+    host_profile_artifact_index_entry_json, host_profile_hash, list_files,
+    prompt_artifact_index_entry_json, required_admission_evidence_requirements,
     run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
     standard_evidence_paths_in_dir, AdmissionArtifact as EvidenceAdmissionArtifact,
     AdmissionEvidence as EvidenceAdmissionEvidence,
@@ -3212,41 +3214,41 @@ fn write_evidence_artifacts(
     }
     let comparison_json = comparison_artifact_value(comparison)?;
     write_json_pretty(&dir.join("comparisons.json"), &comparison_json)?;
-    let mut comparisons_entry = artifact_index_entry(
+    let comparisons_entry = comparison_artifact_index_entry_json(
         "artifacts/comparisons.json",
         format!("{:?}", comparison.status).to_lowercase(),
-        ctx,
+        comparison.cases.len(),
+        &artifact_index_context(ctx),
     );
-    if let Some(entry) = comparisons_entry.as_object_mut() {
-        entry.insert("case_count".to_string(), json!(comparison.cases.len()));
-    }
     out.insert("comparisons".to_string(), comparisons_entry);
     let admission_json = admission_artifact_value(admission)?;
     write_json_pretty(&dir.join("admission.json"), &admission_json)?;
-    let mut admission_entry = artifact_index_entry(
+    let admission_entry = admission_artifact_index_entry_json(
         "artifacts/admission.json",
         format!("{:?}", admission.status).to_lowercase(),
-        ctx,
+        admission.verdict.clone(),
+        admission.findings.len(),
+        &artifact_index_context(ctx),
     );
-    if let Some(entry) = admission_entry.as_object_mut() {
-        entry.insert("verdict".to_string(), json!(admission.verdict));
-        entry.insert("finding_count".to_string(), json!(admission.findings.len()));
-    }
     out.insert("admission".to_string(), admission_entry);
     if let Some((path, row_count)) = write_gpqa_prompt_artifact(dir, config, datasets)? {
-        let mut entry = artifact_index_entry(path, "materialized", ctx);
-        if let Some(object) = entry.as_object_mut() {
-            object.insert("row_count".to_string(), json!(row_count));
-            object.insert("kind".to_string(), json!("gpqa_prompts"));
-        }
+        let entry = prompt_artifact_index_entry_json(
+            path,
+            "materialized",
+            "gpqa_prompts",
+            row_count,
+            &artifact_index_context(ctx),
+        );
         out.insert("gpqa_prompts".to_string(), entry);
     }
     if let Some((path, row_count)) = write_barrage_prompt_artifact(dir, datasets)? {
-        let mut entry = artifact_index_entry(path, "materialized", ctx);
-        if let Some(object) = entry.as_object_mut() {
-            object.insert("row_count".to_string(), json!(row_count));
-            object.insert("kind".to_string(), json!("barrage_prompts"));
-        }
+        let entry = prompt_artifact_index_entry_json(
+            path,
+            "materialized",
+            "barrage_prompts",
+            row_count,
+            &artifact_index_context(ctx),
+        );
         out.insert("barrage_prompts".to_string(), entry);
     }
     let run_metadata = run_metadata_artifact_value(config, ctx);
@@ -3266,10 +3268,11 @@ fn write_evidence_artifacts(
                     .map(str::to_string)
             })
             .unwrap_or_else(|| "collected".to_string());
-        let mut entry = artifact_index_entry("artifacts/host_profile.json", artifact_status, ctx);
-        if let Some(object) = entry.as_object_mut() {
-            object.insert("kind".to_string(), json!("host_capability_profile"));
-        }
+        let entry = host_profile_artifact_index_entry_json(
+            "artifacts/host_profile.json",
+            artifact_status,
+            &artifact_index_context(ctx),
+        );
         out.insert("host_profile".to_string(), entry);
     }
     Ok(out)
