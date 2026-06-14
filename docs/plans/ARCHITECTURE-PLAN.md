@@ -47,6 +47,10 @@ Current generate boundary status:
 - `hipfire-generate` owns typed generation sampling policy, text generation request/event structs, generate-batch prefill/decode envelopes, Qwen3.5 prefill/decode backend plan enums, and scheduler metadata helpers.
 - `hipfire-daemon` still owns concrete validation, model-specific execution, Qwen3.5 runtime orchestration, and JSONL adapter dispatch until later migration slices consume the shared contracts.
 
+Current CPU/backend boundary status:
+- `hipfire-cpu` owns deterministic BF16 CPU oracle helpers, dense FFN/projection module contracts, backend selection evidence structs, and JSON rendering for module outputs.
+- `hipfire-arch-qwen35::ffn_bf16` remains the compatibility facade for Qwen3.5 mode/env parsing and re-exports the shared CPU oracle contracts.
+
 Current evidence boundary status:
 - `hipfire-evidence` owns stable hash, model/tag hash, directory digest, file hash, and HFQ metadata extraction helpers.
 - `hipfire-runtime::eval_harness` still owns eval execution and artifact writing, but now consumes the shared evidence provenance helpers.

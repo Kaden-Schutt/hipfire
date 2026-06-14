@@ -5,6 +5,7 @@ members = [
     "crates/hsa-bridge",
     "crates/rdna-compute",
     "crates/hipfire-coherence",
+    "crates/hipfire-cpu",
     "crates/hipfire-evidence",
     "crates/hipfire-generate",
     "crates/hipfire-model",
