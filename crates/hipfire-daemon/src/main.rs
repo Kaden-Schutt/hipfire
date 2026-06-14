@@ -229,110 +229,6 @@ fn block_attractor_unclosed_cpu(
 // Off by default — env var read once on first call. The probe binary
 // (`examples/coherence_probe.rs`) sets the env on the daemon child it
 // spawns. Existing JSONL clients see no change.
-/// Stable fingerprint over an assistant turn — pair of (text content,
-/// tool_calls canonical JSON). Output is identical for two messages
-/// that have the same content+tool_calls regardless of how the
-/// surrounding bytes (e.g. whitespace inside JSON args) were rendered
-/// upstream. Used by the V4F prefix-cache to identify "this is the
-/// same assistant turn the model previously emitted, so reuse the
-/// emitted token IDs verbatim instead of re-encoding via the DSML
-/// renderer + BPE (which is not bijective)."
-fn asst_turn_fingerprint(
-    content: &str,
-    tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
-) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    "assistant".hash(&mut h);
-    if tool_calls.is_empty() {
-        // Pure-text turn — content IS the message. Trim whitespace
-        // to absorb minor formatting drift between store (model's
-        // verbatim emission) and lookup (whatever the client preserved).
-        content.trim().hash(&mut h);
-    } else {
-        // Mixed turn (text + tool_calls) or pure tool_call. Hash ONLY
-        // the tool_calls — pi-coding-agent (and most OpenAI-compat
-        // clients) sends `content: null` on assistant messages that
-        // carry tool_calls, even when the model originally emitted
-        // prose ahead of the tool block (e.g. "Let me check the
-        // structure first.<｜DSML｜tool_calls>…"). The store-side
-        // sees the prose in `emit_text_buf`; the lookup-side sees
-        // content=`""`. Excluding content from the fingerprint when
-        // tool_calls is non-empty matches the client's effective
-        // identity for tool-call turns and lets the cache hit.
-        //
-        // Collision risk: two distinct turns with identical
-        // tool_calls hash to the same key; the later store wins,
-        // and a replay of the earlier turn replays the later turn's
-        // tokens. In practice this only matters when the model emits
-        // the SAME tool_call twice with different surrounding prose
-        // in the same conversation — uncommon for agent flows, and
-        // the worst-case effect is the model seeing slightly altered
-        // prose in its own history.
-    }
-    for tc in tool_calls {
-        tc.name.hash(&mut h);
-        // Serialize args in a CANONICAL form: walk the Value tree and
-        // emit objects with keys sorted lexically (recursively). The
-        // upstream `serde_json::Map` uses insertion order — fine for
-        // round-tripping a single payload, but two clients (or two
-        // parser passes on the same payload) can yield different
-        // insertion orders for the same logical args. Without
-        // canonicalization those two turns hash to DIFFERENT keys,
-        // dropping cache hit rate on otherwise-identical tool calls.
-        let args = canonical_json(&tc.arguments);
-        args.hash(&mut h);
-    }
-    h.finish()
-}
-
-/// Walk a [`serde_json::Value`] and produce a canonical-key
-/// representation: objects emit keys in lexical order (recursively),
-/// arrays preserve order. Used by [`asst_turn_fingerprint`] so two
-/// messages with the same logical tool args hash identically
-/// regardless of source-side insertion order.
-fn canonical_json(v: &serde_json::Value) -> String {
-    let mut out = String::new();
-    write_canonical_json(v, &mut out);
-    out
-}
-
-fn write_canonical_json(v: &serde_json::Value, out: &mut String) {
-    match v {
-        serde_json::Value::Null => out.push_str("null"),
-        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
-        serde_json::Value::String(s) => {
-            out.push_str(&serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()))
-        }
-        serde_json::Value::Array(arr) => {
-            out.push('[');
-            for (i, item) in arr.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_canonical_json(item, out);
-            }
-            out.push(']');
-        }
-        serde_json::Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push('{');
-            for (i, k) in keys.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push_str(&serde_json::to_string(*k).unwrap_or_else(|_| "\"\"".to_string()));
-                out.push(':');
-                write_canonical_json(&map[*k], out);
-            }
-            out.push('}');
-        }
-    }
-}
-
 /// Safely emit a `{"type":"error", …}` JSONL line. Builds the envelope
 /// through `serde_json::json!` so embedded `"` / `\` / control chars in
 /// the message or `id` can't corrupt the line and trigger a client-side
@@ -15115,7 +15011,10 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     // `tokenizer.encode(render(...))` as a longer
                     // sequence with different boundaries, capping the
                     // LCP at the assistant-turn boundary).
-                    let fp = asst_turn_fingerprint(&msg.content, &msg.tool_calls);
+                    let fp = hipfire_runtime::prompt_frame::assistant_turn_fingerprint(
+                        &msg.content,
+                        &msg.tool_calls,
+                    );
                     if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                         .ok()
                         .as_deref()
@@ -15845,7 +15744,10 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             && m.conversation_tokens.len() > decode_start_tokens_idx
         {
             let cached_seq: Vec<u32> = m.conversation_tokens[decode_start_tokens_idx..].to_vec();
-            let fp = asst_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
+            let fp = hipfire_runtime::prompt_frame::assistant_turn_fingerprint(
+                &emit_text_buf,
+                &emit_tool_calls_buf,
+            );
             if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                 .ok()
                 .as_deref()

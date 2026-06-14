@@ -400,6 +400,74 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Stable canonical JSON representation for prompt-identity fingerprints.
+///
+/// Objects emit keys in lexical order recursively; arrays preserve order.
+/// This is intentionally narrower than a full JSON canonicalization standard:
+/// it only needs to make semantically identical tool-call argument objects hash
+/// identically when source-side insertion order differs.
+pub fn canonical_json(value: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_canonical_json(value, &mut out);
+    out
+}
+
+fn write_canonical_json(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+        serde_json::Value::String(s) => {
+            out.push_str(&serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()))
+        }
+        serde_json::Value::Array(arr) => {
+            out.push('[');
+            for (idx, item) in arr.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            out.push('{');
+            for (idx, key) in keys.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(*key).unwrap_or_else(|_| "\"\"".to_string()));
+                out.push(':');
+                write_canonical_json(&map[*key], out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Stable fingerprint for assistant-turn prompt-history identity.
+///
+/// Pure text turns hash trimmed content. Tool-call turns hash only the
+/// canonicalized tool calls, matching OpenAI-compatible clients that often send
+/// `content: null` or an empty string for assistant messages with tool calls.
+pub fn assistant_turn_fingerprint(content: &str, tool_calls: &[ToolCall]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h = DefaultHasher::new();
+    "assistant".hash(&mut h);
+    if tool_calls.is_empty() {
+        content.trim().hash(&mut h);
+    }
+    for tool_call in tool_calls {
+        tool_call.name.hash(&mut h);
+        canonical_json(&tool_call.arguments).hash(&mut h);
+    }
+    h.finish()
+}
+
 pub fn openai_chat_role_to_prompt_role(role: &str) -> Option<Role> {
     match role {
         "system" => Some(Role::System),
@@ -1323,6 +1391,46 @@ mod tests {
         assert_eq!(
             m.tool_calls[0].arguments,
             serde_json::json!({"city":"SF","unit":"f"}),
+        );
+    }
+
+    #[test]
+    fn canonical_json_sorts_object_keys_recursively() {
+        let left = serde_json::json!({
+            "b": [{"z": 1, "a": true}],
+            "a": {"d": null, "c": "x"},
+        });
+        let right = serde_json::json!({
+            "a": {"c": "x", "d": null},
+            "b": [{"a": true, "z": 1}],
+        });
+
+        assert_eq!(canonical_json(&left), canonical_json(&right));
+        assert_eq!(
+            canonical_json(&left),
+            r#"{"a":{"c":"x","d":null},"b":[{"a":true,"z":1}]}"#
+        );
+    }
+
+    #[test]
+    fn assistant_turn_fingerprint_matches_prompt_history_identity_policy() {
+        let text_a = assistant_turn_fingerprint(" answer \n", &[]);
+        let text_b = assistant_turn_fingerprint("answer", &[]);
+        let text_c = assistant_turn_fingerprint("different", &[]);
+        assert_eq!(text_a, text_b);
+        assert_ne!(text_a, text_c);
+
+        let calls_a = vec![ToolCall {
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": "/tmp/a", "opts": {"tail": 5, "raw": false}}),
+        }];
+        let calls_b = vec![ToolCall {
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"opts": {"raw": false, "tail": 5}, "path": "/tmp/a"}),
+        }];
+        assert_eq!(
+            assistant_turn_fingerprint("Let me inspect that.", &calls_a),
+            assistant_turn_fingerprint("", &calls_b)
         );
     }
 
