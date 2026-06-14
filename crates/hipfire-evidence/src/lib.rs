@@ -357,6 +357,83 @@ impl<T> SourcedField<T> {
     }
 }
 
+pub fn compute_peak_bandwidth_gbps(
+    clock_mhz: f64,
+    width_bits: u32,
+    memory_class: &str,
+) -> Option<f64> {
+    let transfers_per_clock = match memory_class.to_ascii_lowercase().as_str() {
+        "gddr6" | "gddr6x" => 8.0,
+        "lpddr5" | "lpddr5x" => 8.0,
+        "ddr5" | "ddr4" => 2.0,
+        "hbm" | "hbm2" | "hbm2e" | "hbm3" => 2.0,
+        _ => return None,
+    };
+    Some(clock_mhz * transfers_per_clock * width_bits as f64 / 8.0 / 1000.0)
+}
+
+pub fn classify_hardware_kind(vram_bytes: Option<u64>, gtt_bytes: Option<u64>) -> String {
+    match (vram_bytes, gtt_bytes) {
+        (Some(vram), Some(gtt)) if vram <= 1024 * 1024 * 1024 && gtt > vram * 8 => {
+            "apu_uma".to_string()
+        }
+        (Some(vram), _) if vram > 1024 * 1024 * 1024 => "dgpu".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+pub fn hardware_bucket(
+    hardware_kind: &str,
+    gfx: Option<&str>,
+    device_id: Option<&str>,
+    cu_count: Option<u32>,
+    vram_bytes: Option<u64>,
+    memory_class: Option<&str>,
+    memory_width_bits: Option<u32>,
+    peak_bandwidth_gbps: Option<f64>,
+) -> String {
+    let vram_gib = vram_bytes.map(|bytes| (bytes + (1 << 30) - 1) >> 30);
+    let bandwidth = peak_bandwidth_gbps.map(|value| format!("{value:.0}gbps"));
+    [
+        hardware_kind.to_string(),
+        gfx.unwrap_or("gfx_unknown").to_string(),
+        device_id.unwrap_or("dev_unknown").to_string(),
+        cu_count
+            .map(|value| format!("{value}cu"))
+            .unwrap_or_else(|| "cu_unknown".to_string()),
+        vram_gib
+            .map(|value| format!("{value}gib"))
+            .unwrap_or_else(|| "vram_unknown".to_string()),
+        memory_class.unwrap_or("mem_unknown").to_string(),
+        memory_width_bits
+            .map(|value| format!("{value}bit"))
+            .unwrap_or_else(|| "width_unknown".to_string()),
+        bandwidth.unwrap_or_else(|| "bw_unknown".to_string()),
+    ]
+    .join(":")
+}
+
+pub fn host_profile_hash(profile: &HostProfile) -> String {
+    let doc = json!({
+        "schema": profile.schema,
+        "hardware_kind": profile.hardware_kind,
+        "hardware_bucket": profile.hardware_bucket,
+        "gpu_model": profile.gpu_model,
+        "gfx": profile.gfx,
+        "vendor_id": profile.vendor_id,
+        "device_id": profile.device_id,
+        "cu_count": profile.cu_count,
+        "vram_bytes": profile.vram_bytes,
+        "gtt_bytes": profile.gtt_bytes,
+        "system_memory_bytes": profile.system_memory_bytes,
+        "memory_class": profile.memory_class,
+        "memory_width_bits": profile.memory_width_bits,
+        "memory_clock_mhz": profile.memory_clock_mhz,
+        "peak_bandwidth_gbps": profile.peak_bandwidth_gbps,
+    });
+    stable_hash_bytes(serde_json::to_string(&doc).unwrap_or_default().as_bytes())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunMetadataConfig {
     pub tier: String,
@@ -1159,6 +1236,82 @@ mod tests {
         assert_eq!(stable_hash_bytes(b"abc"), "fnv64:e71fa2190541574b");
         assert_eq!(stable_hash_bytes(b"abc"), stable_hash_bytes(b"abc"));
         assert_ne!(stable_hash_bytes(b"abc"), stable_hash_bytes(b"abcd"));
+    }
+
+    #[test]
+    fn computes_peak_bandwidth_from_normalized_memory_fields() {
+        assert_eq!(
+            compute_peak_bandwidth_gbps(937.5, 256, "lpddr5x"),
+            Some(240.0)
+        );
+        assert_eq!(
+            compute_peak_bandwidth_gbps(2500.0, 256, "gddr6"),
+            Some(640.0)
+        );
+        assert_eq!(compute_peak_bandwidth_gbps(1000.0, 128, "mystery"), None);
+    }
+
+    #[test]
+    fn classifies_hardware_kind_from_vram_and_gtt_shape() {
+        assert_eq!(
+            classify_hardware_kind(Some(512 * 1024 * 1024), Some(16 * 1024 * 1024 * 1024)),
+            "apu_uma"
+        );
+        assert_eq!(
+            classify_hardware_kind(Some(16 * 1024 * 1024 * 1024), Some(32 * 1024 * 1024 * 1024)),
+            "dgpu"
+        );
+        assert_eq!(classify_hardware_kind(None, None), "unknown");
+    }
+
+    #[test]
+    fn hardware_bucket_includes_portability_fields() {
+        let bucket = hardware_bucket(
+            "dgpu",
+            Some("gfx1201"),
+            Some("0x7550"),
+            Some(64),
+            Some(16 * 1024 * 1024 * 1024),
+            Some("gddr6"),
+            Some(256),
+            Some(640.0),
+        );
+        assert_eq!(
+            bucket,
+            "dgpu:gfx1201:0x7550:64cu:16gib:gddr6:256bit:640gbps"
+        );
+    }
+
+    #[test]
+    fn host_profile_hash_ignores_probe_source_and_reason() {
+        let mut profile = HostProfile {
+            schema: 1,
+            source: "linux-kfd-drm-sysfs".to_string(),
+            probe_status: EvalStatus::Pass,
+            reason: None,
+            hardware_kind: "dgpu".to_string(),
+            hardware_bucket: "dgpu:gfx1201:0x7550:64cu:16gib:gddr6:256bit:640gbps".to_string(),
+            host_profile_hash: String::new(),
+            gpu_model: Some("AMD Radeon".to_string()),
+            gfx: Some("gfx1201".to_string()),
+            vendor_id: Some("0x1002".to_string()),
+            device_id: Some("0x7550".to_string()),
+            render_node: Some("/dev/dri/renderD128".to_string()),
+            cu_count: Some(64),
+            vram_bytes: Some(16 * 1024 * 1024 * 1024),
+            gtt_bytes: Some(32 * 1024 * 1024 * 1024),
+            system_memory_bytes: Some(64 * 1024 * 1024 * 1024),
+            memory_class: SourcedField::libdrm_value("gddr6".to_string()),
+            memory_width_bits: SourcedField::libdrm_value(256),
+            memory_clock_mhz: SourcedField::libdrm_value(2500.0),
+            peak_bandwidth_gbps: SourcedField::computed_value(640.0),
+        };
+        let hash = host_profile_hash(&profile);
+
+        profile.source = "override".to_string();
+        profile.reason = Some("metadata source changed".to_string());
+
+        assert_eq!(hash, host_profile_hash(&profile));
     }
 
     #[test]
