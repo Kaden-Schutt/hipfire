@@ -7,7 +7,9 @@ use axum::{
         IntoResponse, Json, Response,
     },
 };
-use hipfire_prompt::{Message as DaemonMessage, Role};
+use hipfire_prompt::{
+    openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message as DaemonMessage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -49,45 +51,20 @@ pub async fn post_chat_completions(
     }
 }
 
-fn message_content_to_text(content: &Option<Value>) -> String {
-    match content {
-        Some(Value::String(s)) => s.clone(),
-        Some(other) => other.to_string(),
-        None => String::new(),
-    }
-}
-
-fn chat_role_to_daemon(role: &str) -> Option<Role> {
-    match role {
-        "system" => Some(Role::System),
-        "user" => Some(Role::User),
-        "assistant" => Some(Role::Assistant),
-        "tool" => Some(Role::Tool),
-        _ => None,
-    }
-}
-
 fn messages_to_daemon(messages: &[ChatMessage]) -> Vec<DaemonMessage> {
-    messages
-        .iter()
-        .filter_map(|m| {
-            Some(DaemonMessage {
-                role: chat_role_to_daemon(&m.role)?,
-                content: message_content_to_text(&m.content),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            })
-        })
-        .collect()
+    openai_chat_messages_to_prompt_messages(
+        messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_ref())),
+    )
 }
 
 fn last_user_prompt(messages: &[ChatMessage]) -> String {
-    messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| message_content_to_text(&m.content))
-        .unwrap_or_default()
+    openai_chat_last_user_prompt(
+        messages
+            .iter()
+            .map(|m| (m.role.as_str(), m.content.as_ref())),
+    )
 }
 
 fn load_params_from_config(cfg: &HipfireConfig) -> LoadParams {
@@ -339,6 +316,7 @@ fn sse_error(msg: &str) -> Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_prompt::Role;
 
     #[test]
     fn chat_messages_forward_as_structured_daemon_messages() {
