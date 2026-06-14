@@ -28,7 +28,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval model manifests now reuse `hipfire-model` row construction for file/tag identity, HFQ metadata hashes, architecture IDs, and embedded quantization hashes.
 - Evidence model/tag hash and HFQ metadata compatibility helpers now delegate to `hipfire-model` instead of carrying duplicate model-specific parsing.
 - Eval reference/slice/llama integrity verifiers now reuse `hipfire-evidence` ownership while `hipfire-runtime::eval_common` keeps the existing import path.
-- `hipfire-eval` now owns the `hipfire-eval` binary adapter; the adapter still delegates to `hipfire-runtime::eval_harness` until harness internals move.
+- `hipfire-eval` now owns the `hipfire-eval` binary adapter and eval harness implementation while `hipfire-runtime::eval_harness` keeps the existing import path.
 - Daemon model-worker id construction and sequence-state arena support policy now reuse `hipfire-state` ownership instead of daemon-local policy helpers.
 - Daemon startup resource lease policy and lock helpers now reuse `hipfire-daemon-adapter` ownership instead of daemon-local helpers.
 - Eval artifact row records now reuse `hipfire-evidence` record contracts instead of eval-local JSON construction.

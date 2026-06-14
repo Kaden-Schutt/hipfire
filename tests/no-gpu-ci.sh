@@ -13,7 +13,7 @@ cargo check -p hipfire-eval
 echo "== Rust no-GPU unit tests =="
 cargo test -p rdna-compute --lib
 cargo test -p hipfire-arch-qwen35 --lib moe_prefill
-cargo test -p hipfire-runtime eval_harness --lib
+cargo test -p hipfire-eval --lib
 cargo test -p hipfire-quantize xxh64_provenance_tests
 
 echo "== Eval harness no-GPU smoke =="

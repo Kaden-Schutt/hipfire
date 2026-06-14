@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 fn main() {
-    if let Err(e) = hipfire_runtime::eval_harness::run_from_env() {
+    if let Err(e) = hipfire_eval::run_from_env() {
         eprintln!("{e}");
         std::process::exit(1);
     }
