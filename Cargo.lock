@@ -705,6 +705,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-daemon-protocol"
+version = "0.2.0"
+dependencies = [
+ "hipfire-prompt",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-detect"
 version = "0.2.1"
 dependencies = [
@@ -829,6 +838,7 @@ dependencies = [
  "axum",
  "dirs",
  "futures",
+ "hipfire-daemon-protocol",
  "hipfire-model",
  "hipfire-prompt",
  "reqwest",

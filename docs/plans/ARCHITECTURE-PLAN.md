@@ -22,6 +22,7 @@ The target crates for modular boundaries remain:
 - `hipfire-generate`
 - `hipfire-coherence` (created; owns detector policy and report row serialization helpers)
 - `hipfire-rocm` (created; owns ROCm backend evidence contracts)
+- `hipfire-daemon-protocol` (created; owns daemon JSONL request/response contracts)
 - `hipfire-evidence` (created; owns evidence provenance and hash helpers)
 
 A `bun`-free control plane remains desirable but is deferred behind verified seam extraction.
@@ -54,6 +55,10 @@ Current CPU/backend boundary status:
 Current ROCm/backend boundary status:
 - `hipfire-rocm` owns ROCm device identity, backend-path classification, dense FFN/projection module execution evidence, and JSON rendering for ROCm module outputs.
 - Qwen3.5 dense FFN trace output records shared ROCm evidence for the existing `weight_gemv_swiglu_residual` path without moving HIP dispatch or kernel code.
+
+Current daemon protocol boundary status:
+- `hipfire-daemon-protocol` owns typed daemon JSONL request/response structs, including load/generate request envelopes and token/done/error responses.
+- `hipfire-server::daemon::protocol` remains a compatibility re-export so server callers keep their current paths while the wire JSON stays unchanged.
 
 Current evidence boundary status:
 - `hipfire-evidence` owns stable hash, model/tag hash, directory digest, file hash, and HFQ metadata extraction helpers.
