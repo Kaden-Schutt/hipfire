@@ -129,6 +129,44 @@ fn main() {
             run_rope_build(&python, &rope_script, &out_dir, npu, nh, nkv, hd, nr);
         }
     }
+
+    // ── Head norm kernel ──────────────────────────────────────────────────────
+    // HIPFIRE_NPU_HEADNORM_CONFIGS: same format as ROPE_CONFIGS but n_rot unused —
+    // "n_heads:n_kv_heads:head_dim" (n_rot field ignored if present for compat).
+    let headnorm_script = workspace.join("tools/npu/build_qwen35_headnorm.py");
+    let headnorm_src = workspace.join("tools/npu/rms_norm_head_bf16.cc");
+
+    println!("cargo:rerun-if-changed={}", headnorm_script.display());
+    println!("cargo:rerun-if-changed={}", headnorm_src.display());
+    println!("cargo:rerun-if-env-changed=HIPFIRE_NPU_HEADNORM_CONFIGS");
+
+    if !headnorm_script.exists() {
+        println!(
+            "cargo:warning=npu-kernels: headnorm build script not found at {} — skipping",
+            headnorm_script.display()
+        );
+        return;
+    }
+
+    // Parse "n_heads:n_kv_heads:head_dim" tuples (n_rot field ignored if present).
+    let headnorm_configs: Vec<(u32, u32, u32)> = std::env::var("HIPFIRE_NPU_HEADNORM_CONFIGS")
+        .unwrap_or_else(|_| "8:2:256".to_string())
+        .split(',')
+        .filter_map(|s| {
+            let parts: Vec<u32> = s.trim().split(':').filter_map(|p| p.parse().ok()).collect();
+            if parts.len() >= 3 {
+                Some((parts[0], parts[1], parts[2]))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for npu in &targets {
+        for &(nh, nkv, hd) in &headnorm_configs {
+            run_headnorm_build(&python, &headnorm_script, &out_dir, npu, nh, nkv, hd);
+        }
+    }
 }
 
 fn run_build(python: &Path, script: &Path, out_dir: &Path, npu: &str, hidden_size: u32) {
@@ -166,6 +204,58 @@ fn run_build(python: &Path, script: &Path, out_dir: &Path, npu: &str, hidden_siz
             println!(
                 "cargo:warning=npu-kernels: could not launch Python for {npu} \
                  hidden_size={hidden_size}: {e}"
+            );
+        }
+    }
+}
+
+fn run_headnorm_build(
+    python: &Path,
+    script: &Path,
+    out_dir: &Path,
+    npu: &str,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+) {
+    let result = Command::new(python)
+        .arg(script)
+        .arg("--n-heads")
+        .arg(n_heads.to_string())
+        .arg("--n-kv-heads")
+        .arg(n_kv_heads.to_string())
+        .arg("--head-dim")
+        .arg(head_dim.to_string())
+        .arg("--npu")
+        .arg(npu)
+        .arg("--out-dir")
+        .arg(out_dir)
+        .output();
+
+    match result {
+        Ok(out) if out.status.success() => {
+            println!(
+                "cargo:warning=npu-kernels: headnorm {npu} n_heads={n_heads} \
+                 n_kv_heads={n_kv_heads} head_dim={head_dim} → {}",
+                out_dir.display()
+            );
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let first_err = stderr
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("(no output)");
+            println!(
+                "cargo:warning=npu-kernels: headnorm {npu} n_heads={n_heads} \
+                 n_kv_heads={n_kv_heads} head_dim={head_dim} \
+                 failed (exit {}): {first_err}",
+                out.status
+            );
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=npu-kernels: could not launch Python for headnorm {npu}: {e}"
             );
         }
     }

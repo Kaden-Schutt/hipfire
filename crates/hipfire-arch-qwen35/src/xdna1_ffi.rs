@@ -50,6 +50,13 @@ pub struct Xdna1Lib {
     pub fn_rope_k_create: Option<FnCreate>,
     pub fn_rope_k_run_handle: Option<FnRunHandle>,
     pub fn_rope_k_destroy: Option<FnDestroy>,
+    // Head norm Q/K symbols are optional — absent when the .so predates the headnorm kernel.
+    pub fn_headnorm_q_create: Option<FnCreate>,
+    pub fn_headnorm_q_run_handle: Option<FnRunHandle>,
+    pub fn_headnorm_q_destroy: Option<FnDestroy>,
+    pub fn_headnorm_k_create: Option<FnCreate>,
+    pub fn_headnorm_k_run_handle: Option<FnRunHandle>,
+    pub fn_headnorm_k_destroy: Option<FnDestroy>,
 }
 
 // Library holds only raw fn-ptrs and a Library — all Send+Sync.
@@ -108,6 +115,31 @@ impl Xdna1Lib {
                 .get::<FnDestroy>(b"xdna1_bf16_rope_k_destroy\0")
                 .ok()
                 .map(|s| *s);
+            // Head norm Q/K symbols: allowed to be absent (graceful degradation).
+            let fn_headnorm_q_create = lib
+                .get::<FnCreate>(b"xdna1_bf16_headnorm_q_create\0")
+                .ok()
+                .map(|s| *s);
+            let fn_headnorm_q_run_handle = lib
+                .get::<FnRunHandle>(b"xdna1_bf16_headnorm_q_run_handle\0")
+                .ok()
+                .map(|s| *s);
+            let fn_headnorm_q_destroy = lib
+                .get::<FnDestroy>(b"xdna1_bf16_headnorm_q_destroy\0")
+                .ok()
+                .map(|s| *s);
+            let fn_headnorm_k_create = lib
+                .get::<FnCreate>(b"xdna1_bf16_headnorm_k_create\0")
+                .ok()
+                .map(|s| *s);
+            let fn_headnorm_k_run_handle = lib
+                .get::<FnRunHandle>(b"xdna1_bf16_headnorm_k_run_handle\0")
+                .ok()
+                .map(|s| *s);
+            let fn_headnorm_k_destroy = lib
+                .get::<FnDestroy>(b"xdna1_bf16_headnorm_k_destroy\0")
+                .ok()
+                .map(|s| *s);
             Ok(Xdna1Lib {
                 fn_swiglu_create: *fn_swiglu_create,
                 fn_swiglu_run_handle: *fn_swiglu_run_handle,
@@ -121,6 +153,12 @@ impl Xdna1Lib {
                 fn_rope_k_create,
                 fn_rope_k_run_handle,
                 fn_rope_k_destroy,
+                fn_headnorm_q_create,
+                fn_headnorm_q_run_handle,
+                fn_headnorm_q_destroy,
+                fn_headnorm_k_create,
+                fn_headnorm_k_run_handle,
+                fn_headnorm_k_destroy,
                 _lib: lib,
             })
         }
@@ -454,6 +492,165 @@ pub unsafe fn rope_k_run(
         n,
         cs.as_ptr(),
         cs.len(),
+        out.as_mut_ptr(),
+        n,
+    );
+    !ret.is_null()
+}
+
+// ─── Head norm Q handle cache ─────────────────────────────────────────────────
+
+static HEADNORM_Q_HANDLES: OnceLock<Mutex<HashMap<usize, RawHandle>>> = OnceLock::new();
+
+fn headnorm_q_handles() -> &'static Mutex<HashMap<usize, RawHandle>> {
+    HEADNORM_Q_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Create (or reuse cached) headnorm_q handle for `layer_idx`.
+///
+/// Returns `None` if the library isn't loaded, the headnorm_q symbols are absent
+/// (older .so), paths aren't configured, or the create call returns null.
+pub fn headnorm_q_handle_for(
+    layer_idx: usize,
+    n_total: usize,
+    xclbin_path: &str,
+    instr_path: &str,
+) -> Option<*mut c_void> {
+    let lib = get_lib()?;
+    let fn_create = lib.fn_headnorm_q_create?;
+    let mut map = headnorm_q_handles().lock().unwrap();
+    if let Some(h) = map.get(&layer_idx) {
+        return Some(h.0);
+    }
+    let xclbin_c = CString::new(xclbin_path).ok()?;
+    let instr_c = CString::new(instr_path).ok()?;
+    let handle = unsafe {
+        fn_create(
+            xclbin_c.as_ptr(),
+            instr_c.as_ptr(),
+            n_total,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() {
+        eprintln!(
+            "[xdna1] headnorm_q_create returned null for layer={layer_idx} \
+             n_total={n_total} xclbin={xclbin_path} instr={instr_path}"
+        );
+        return None;
+    }
+    map.insert(layer_idx, RawHandle(handle));
+    Some(handle)
+}
+
+/// Call `xdna1_bf16_headnorm_q_run_handle`.
+///
+/// `input` is BF16 Q tensor (n_heads × head_dim elements).
+/// `weight` is the shared per-head norm weight ([head_dim] elements).
+/// `out` receives the BF16 normalized Q tensor.
+///
+/// # Safety
+/// Caller guarantees all slices are valid and sizes match the handle shape.
+pub unsafe fn headnorm_q_run(
+    handle: *mut c_void,
+    input: &[u16],
+    weight: &[u16],
+    out: &mut [u16],
+) -> bool {
+    let lib = match get_lib() {
+        Some(l) => l,
+        None => return false,
+    };
+    let fn_run = match lib.fn_headnorm_q_run_handle {
+        Some(f) => f,
+        None => return false,
+    };
+    let n = input.len();
+    debug_assert_eq!(out.len(), n);
+    let ret = fn_run(
+        handle,
+        input.as_ptr(),
+        n,
+        weight.as_ptr(),
+        weight.len(),
+        out.as_mut_ptr(),
+        n,
+    );
+    !ret.is_null()
+}
+
+// ─── Head norm K handle cache ─────────────────────────────────────────────────
+
+static HEADNORM_K_HANDLES: OnceLock<Mutex<HashMap<usize, RawHandle>>> = OnceLock::new();
+
+fn headnorm_k_handles() -> &'static Mutex<HashMap<usize, RawHandle>> {
+    HEADNORM_K_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Create (or reuse cached) headnorm_k handle for `layer_idx`.
+pub fn headnorm_k_handle_for(
+    layer_idx: usize,
+    n_total: usize,
+    xclbin_path: &str,
+    instr_path: &str,
+) -> Option<*mut c_void> {
+    let lib = get_lib()?;
+    let fn_create = lib.fn_headnorm_k_create?;
+    let mut map = headnorm_k_handles().lock().unwrap();
+    if let Some(h) = map.get(&layer_idx) {
+        return Some(h.0);
+    }
+    let xclbin_c = CString::new(xclbin_path).ok()?;
+    let instr_c = CString::new(instr_path).ok()?;
+    let handle = unsafe {
+        fn_create(
+            xclbin_c.as_ptr(),
+            instr_c.as_ptr(),
+            n_total,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() {
+        eprintln!(
+            "[xdna1] headnorm_k_create returned null for layer={layer_idx} \
+             n_total={n_total} xclbin={xclbin_path} instr={instr_path}"
+        );
+        return None;
+    }
+    map.insert(layer_idx, RawHandle(handle));
+    Some(handle)
+}
+
+/// Call `xdna1_bf16_headnorm_k_run_handle`.
+///
+/// `input` is BF16 K tensor (n_kv_heads × head_dim elements).
+/// `weight` is the shared per-head norm weight ([head_dim] elements).
+/// `out` receives the BF16 normalized K tensor.
+///
+/// # Safety
+/// Caller guarantees all slices are valid and sizes match the handle shape.
+pub unsafe fn headnorm_k_run(
+    handle: *mut c_void,
+    input: &[u16],
+    weight: &[u16],
+    out: &mut [u16],
+) -> bool {
+    let lib = match get_lib() {
+        Some(l) => l,
+        None => return false,
+    };
+    let fn_run = match lib.fn_headnorm_k_run_handle {
+        Some(f) => f,
+        None => return false,
+    };
+    let n = input.len();
+    debug_assert_eq!(out.len(), n);
+    let ret = fn_run(
+        handle,
+        input.as_ptr(),
+        n,
+        weight.as_ptr(),
+        weight.len(),
         out.as_mut_ptr(),
         n,
     );

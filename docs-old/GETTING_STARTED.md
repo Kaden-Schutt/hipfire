@@ -83,6 +83,8 @@ python tools/npu/build_qwen35_rmsnorm.py --hidden-size 1536  # Qwen3.5-1.5B
 python tools/npu/build_qwen35_rmsnorm.py --hidden-size 3584  # Qwen3.5-7B
 # RoPE (Q + K xclbins, Qwen3.5-1.5B dense config):
 python tools/npu/build_qwen35_rope.py --n-heads 8 --n-kv-heads 2 --head-dim 256 --n-rot 64
+# QK head norm (Q + K xclbins):
+python tools/npu/build_qwen35_headnorm.py --n-heads 8 --n-kv-heads 2 --head-dim 256
 ```
 
 ## Verify

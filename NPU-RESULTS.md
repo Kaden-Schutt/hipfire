@@ -109,3 +109,34 @@ Tolerance: atol=0.02, rtol=0.02. max_abs ≤ 1 bfloat16 ULP (0.03125 at magnitud
 |--------|-------------|--------------|-------------|--------|
 | Q      | 0.03125     | 0.00064      | 0.1034      | PASS   |
 | K      | 0.01562     | 0.00057      | 0.0667      | PASS   |
+
+## QK Head Norm (rms_norm_head_bf16) — per-head RMSNorm on Q and K
+
+Kernel: `tools/npu/rms_norm_head_bf16.cc`, AIE2, single-tile design.
+Applies `out[h][i] = (x[h][i] / rms(x[h])) * weight[i]` per head in BF16.
+Shared weight `[head_dim]` is a tensor param acquired once for all head iterations.
+Mirrors `gpu.rmsnorm_batched()` in the Qwen3.5 forward pass (runs after QKV projection, before RoPE).
+Warmup: 20 iterations. Timed: 200 iterations. Config: n_heads=8, n_kv_heads=2, head_dim=256.
+
+| tensor | n_heads | total_elem | data (KiB) | npu mean (µs) | npu p50 | npu p99 | wall mean (µs) | BW (GB/s) |
+|--------|---------|-----------|-----------|---------------|---------|---------|----------------|-----------|
+| Q      | 8       | 2048      | 4.0       | 187           | 177     | 291     | 235            | 0.05      |
+| K      | 2       | 512       | 1.0       | 175           | 169     | 259     | 218            | 0.01      |
+
+**npu time**: hardware cycle counter from `XRTKernelResult.npu_time` (excludes host dispatch).  
+**wall time**: end-to-end per-call latency measured on the host.  
+**BW**: effective memory bandwidth = 3 tensors × total_elem × 2 bytes / wall_mean.
+
+### Observations
+
+Same ~170–190 µs dispatch floor. The weight tensor param pattern (acquired once, reused across 8 or 2 head iterations) amortizes the weight DMA cost rather than paying it per head. Single-tile design — each head requires the full vector for the reduction pass.
+
+### Correctness (oracle test)
+
+Reference: per-head float32 RMSNorm, `eps=1e-5`, random weight in [0.5, 1.5].  
+Tolerance: atol=0.02, rtol=0.02.
+
+| tensor | max_abs_err | mean_abs_err | max_rel_err | result |
+|--------|-------------|--------------|-------------|--------|
+| Q      | 0.04688     | 0.00448      | 0.0199      | PASS   |
+| K      | 0.06250     | 0.00449      | 0.0148      | PASS   |
