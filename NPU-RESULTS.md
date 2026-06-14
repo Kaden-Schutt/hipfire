@@ -140,3 +140,31 @@ Tolerance: atol=0.02, rtol=0.02.
 |--------|-------------|--------------|-------------|--------|
 | Q      | 0.04688     | 0.00448      | 0.0199      | PASS   |
 | K      | 0.06250     | 0.00449      | 0.0148      | PASS   |
+
+## Attn Output Gate (sigmoid_mul_bf16) — Qwen3.5 attention gating
+
+Kernel: `tools/npu/sigmoid_mul_bf16.cc`, AIE2 LUT-based tanh.
+Computes `out[i] = sigmoid(gate[i]) * x[i]` across all 4 NPU columns.
+Replaces `gpu.sigmoid_f32 + gpu.mul_f32` when `config.attn_output_gate=true`.
+Warmup: 20 iterations. Timed: 200 iterations. Config: n_heads=8, head_dim=256, q_dim=2048.
+
+| q_dim | n_heads | data (KiB) | npu mean (µs) | npu p50 | npu p99 | wall mean (µs) | BW (GB/s) |
+|-------|---------|-----------|---------------|---------|---------|----------------|-----------|
+| 2048  | 8       | 4.0       | 183           | 176     | 268     | 227            | 0.05      |
+
+**npu time**: hardware cycle counter from `XRTKernelResult.npu_time` (excludes host dispatch).  
+**wall time**: end-to-end per-call latency measured on the host.  
+**BW**: effective memory bandwidth = 3 × q_dim × 2 bytes / wall_mean.
+
+### Observations
+
+Same ~183 µs dispatch floor. Uses 4 NPU columns (parallel), same as SwiGLU. Data footprint (3 × 4 KiB = 12 KiB) is small; BW-dominated by dispatch. One kernel per decode step (only present when `attn_output_gate=true`).
+
+### Correctness (oracle test)
+
+Reference: `sigmoid(gate) * x` in float32 where `sigmoid(x) = 1/(1+exp(-x))`.  
+Tolerance: atol=0.02, rtol=0.02. max_abs=0.016 (≈1 ULP at magnitude ≤1, from LUT tanh rounding).
+
+| q_dim | max_abs_err | mean_abs_err | max_rel_err | result |
+|-------|-------------|--------------|-------------|--------|
+| 2048  | 0.01562     | 0.00211      | 0.0216      | PASS   |

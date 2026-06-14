@@ -167,6 +167,43 @@ fn main() {
             run_headnorm_build(&python, &headnorm_script, &out_dir, npu, nh, nkv, hd);
         }
     }
+
+    // ── Attn output gate kernel ───────────────────────────────────────────────
+    // HIPFIRE_NPU_ATTN_GATE_CONFIGS: "n_heads:head_dim" pairs (default "8:256").
+    // Only needed when config.attn_output_gate=true.
+    let attn_gate_script = workspace.join("tools/npu/build_qwen35_attn_gate.py");
+    let attn_gate_src = workspace.join("tools/npu/sigmoid_mul_bf16.cc");
+
+    println!("cargo:rerun-if-changed={}", attn_gate_script.display());
+    println!("cargo:rerun-if-changed={}", attn_gate_src.display());
+    println!("cargo:rerun-if-env-changed=HIPFIRE_NPU_ATTN_GATE_CONFIGS");
+
+    if !attn_gate_script.exists() {
+        println!(
+            "cargo:warning=npu-kernels: attn-gate build script not found at {} — skipping",
+            attn_gate_script.display()
+        );
+        return;
+    }
+
+    let attn_gate_configs: Vec<(u32, u32)> = std::env::var("HIPFIRE_NPU_ATTN_GATE_CONFIGS")
+        .unwrap_or_else(|_| "8:256".to_string())
+        .split(',')
+        .filter_map(|s| {
+            let parts: Vec<u32> = s.trim().split(':').filter_map(|p| p.parse().ok()).collect();
+            if parts.len() >= 2 {
+                Some((parts[0], parts[1]))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for npu in &targets {
+        for &(nh, hd) in &attn_gate_configs {
+            run_attn_gate_build(&python, &attn_gate_script, &out_dir, npu, nh, hd);
+        }
+    }
 }
 
 fn run_build(python: &Path, script: &Path, out_dir: &Path, npu: &str, hidden_size: u32) {
@@ -204,6 +241,54 @@ fn run_build(python: &Path, script: &Path, out_dir: &Path, npu: &str, hidden_siz
             println!(
                 "cargo:warning=npu-kernels: could not launch Python for {npu} \
                  hidden_size={hidden_size}: {e}"
+            );
+        }
+    }
+}
+
+fn run_attn_gate_build(
+    python: &Path,
+    script: &Path,
+    out_dir: &Path,
+    npu: &str,
+    n_heads: u32,
+    head_dim: u32,
+) {
+    let result = Command::new(python)
+        .arg(script)
+        .arg("--n-heads")
+        .arg(n_heads.to_string())
+        .arg("--head-dim")
+        .arg(head_dim.to_string())
+        .arg("--npu")
+        .arg(npu)
+        .arg("--out-dir")
+        .arg(out_dir)
+        .output();
+
+    match result {
+        Ok(out) if out.status.success() => {
+            println!(
+                "cargo:warning=npu-kernels: attn-gate {npu} n_heads={n_heads} \
+                 head_dim={head_dim} → {}",
+                out_dir.display()
+            );
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let first_err = stderr
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("(no output)");
+            println!(
+                "cargo:warning=npu-kernels: attn-gate {npu} n_heads={n_heads} \
+                 head_dim={head_dim} failed (exit {}): {first_err}",
+                out.status
+            );
+        }
+        Err(e) => {
+            println!(
+                "cargo:warning=npu-kernels: could not launch Python for attn-gate {npu}: {e}"
             );
         }
     }

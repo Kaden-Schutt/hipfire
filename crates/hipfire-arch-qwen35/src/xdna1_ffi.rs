@@ -57,6 +57,11 @@ pub struct Xdna1Lib {
     pub fn_headnorm_k_create: Option<FnCreate>,
     pub fn_headnorm_k_run_handle: Option<FnRunHandle>,
     pub fn_headnorm_k_destroy: Option<FnDestroy>,
+    // Attn output gate symbol is optional — absent when the .so predates this kernel,
+    // and unused when config.attn_output_gate is false.
+    pub fn_attn_gate_create: Option<FnCreate>,
+    pub fn_attn_gate_run_handle: Option<FnRunHandle>,
+    pub fn_attn_gate_destroy: Option<FnDestroy>,
 }
 
 // Library holds only raw fn-ptrs and a Library — all Send+Sync.
@@ -140,6 +145,19 @@ impl Xdna1Lib {
                 .get::<FnDestroy>(b"xdna1_bf16_headnorm_k_destroy\0")
                 .ok()
                 .map(|s| *s);
+            // Attn gate: optional, only for configs where attn_output_gate=true.
+            let fn_attn_gate_create = lib
+                .get::<FnCreate>(b"xdna1_bf16_attn_gate_create\0")
+                .ok()
+                .map(|s| *s);
+            let fn_attn_gate_run_handle = lib
+                .get::<FnRunHandle>(b"xdna1_bf16_attn_gate_run_handle\0")
+                .ok()
+                .map(|s| *s);
+            let fn_attn_gate_destroy = lib
+                .get::<FnDestroy>(b"xdna1_bf16_attn_gate_destroy\0")
+                .ok()
+                .map(|s| *s);
             Ok(Xdna1Lib {
                 fn_swiglu_create: *fn_swiglu_create,
                 fn_swiglu_run_handle: *fn_swiglu_run_handle,
@@ -159,6 +177,9 @@ impl Xdna1Lib {
                 fn_headnorm_k_create,
                 fn_headnorm_k_run_handle,
                 fn_headnorm_k_destroy,
+                fn_attn_gate_create,
+                fn_attn_gate_run_handle,
+                fn_attn_gate_destroy,
                 _lib: lib,
             })
         }
@@ -653,6 +674,87 @@ pub unsafe fn headnorm_k_run(
         weight.len(),
         out.as_mut_ptr(),
         n,
+    );
+    !ret.is_null()
+}
+
+// ─── Attn output gate handle cache ───────────────────────────────────────────
+
+static ATTN_GATE_HANDLES: OnceLock<Mutex<HashMap<usize, RawHandle>>> = OnceLock::new();
+
+fn attn_gate_handles() -> &'static Mutex<HashMap<usize, RawHandle>> {
+    ATTN_GATE_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Create (or reuse cached) attn_gate handle for `layer_idx`.
+///
+/// Returns `None` if the library isn't loaded, the attn_gate symbols are absent
+/// (older .so or model without attn_output_gate), or the create call returns null.
+pub fn attn_gate_handle_for(
+    layer_idx: usize,
+    q_dim: usize,
+    xclbin_path: &str,
+    instr_path: &str,
+) -> Option<*mut c_void> {
+    let lib = get_lib()?;
+    let fn_create = lib.fn_attn_gate_create?;
+    let mut map = attn_gate_handles().lock().unwrap();
+    if let Some(h) = map.get(&layer_idx) {
+        return Some(h.0);
+    }
+    let xclbin_c = CString::new(xclbin_path).ok()?;
+    let instr_c = CString::new(instr_path).ok()?;
+    let handle = unsafe {
+        fn_create(
+            xclbin_c.as_ptr(),
+            instr_c.as_ptr(),
+            q_dim,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() {
+        eprintln!(
+            "[xdna1] attn_gate_create returned null for layer={layer_idx} \
+             q_dim={q_dim} xclbin={xclbin_path} instr={instr_path}"
+        );
+        return None;
+    }
+    map.insert(layer_idx, RawHandle(handle));
+    Some(handle)
+}
+
+/// Call `xdna1_bf16_attn_gate_run_handle`.
+///
+/// `gate` and `x` are BF16 Q-dim tensors (n_heads × head_dim elements each).
+/// `out` receives sigmoid(gate) * x in BF16.
+///
+/// # Safety
+/// Caller guarantees all slices are valid and `len` matches the handle shape.
+pub unsafe fn attn_gate_run(
+    handle: *mut c_void,
+    gate: &[u16],
+    x: &[u16],
+    out: &mut [u16],
+) -> bool {
+    let lib = match get_lib() {
+        Some(l) => l,
+        None => return false,
+    };
+    let fn_run = match lib.fn_attn_gate_run_handle {
+        Some(f) => f,
+        None => return false,
+    };
+    let len = gate.len();
+    debug_assert_eq!(x.len(), len);
+    debug_assert_eq!(out.len(), len);
+    let ret = fn_run(
+        handle,
+        gate.as_ptr(),
+        len,
+        x.as_ptr(),
+        len,
+        out.as_mut_ptr(),
+        len,
     );
     !ret.is_null()
 }
