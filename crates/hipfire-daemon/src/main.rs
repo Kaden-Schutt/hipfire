@@ -42,13 +42,15 @@ use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_generate::{
     compute_qwen35_prefix_hash, generate_prefix_hash_json, plan_generate_batch_prefill_qwen35,
     qwen35_decode_batch_requested_auto, qwen35_decode_batch_scheduler_metadata,
-    qwen35_grouped_moe_decode_auto_latency_gate_passed, qwen35_prefill_scratch_target_batch,
+    qwen35_grouped_moe_decode_auto_latency_gate_passed, qwen35_prefill_checkpoint_boundary_kind,
+    qwen35_prefill_checkpoint_session_id, qwen35_prefill_scratch_target_batch,
     select_qwen35_decode_batch_backend, select_qwen35_prefill_batch_backend,
     validate_generate_batch_decode, validate_generate_batch_prefill,
     validate_prefix_hash_preflight, GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession,
     GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan, GenerateBatchPrefillPrefixHash,
     GenerateBatchPrefillSession, PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope,
-    Qwen35DecodeBatchBackend, Qwen35PrefillBatchBackend, Qwen35SemanticBoundaryCheckpoint,
+    Qwen35DecodeBatchBackend, Qwen35PrefillBatchBackend, Qwen35PrefillCheckpointHook,
+    Qwen35PrefillCheckpointKind, Qwen35SemanticBoundaryCheckpoint,
 };
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -1774,49 +1776,6 @@ mod generate_batch_prefill_tests {
         assert_eq!(base.prefix_len, 3);
         assert_ne!(base, different_tokens);
         assert_ne!(base, different_think);
-    }
-
-    #[test]
-    fn qwen35_prefill_checkpoint_hook_preserves_handle_contract() {
-        let hash = GenerateBatchPrefillPrefixHash {
-            algorithm: "xxh128".to_string(),
-            value: "0123456789abcdef0123456789abcdef".to_string(),
-            prefix_len: 12,
-        };
-        let final_hook = Qwen35PrefillCheckpointHook {
-            batch_id: "batch-a",
-            session_id: "req-1",
-            source_state_handle: "req-1",
-            logical_position: 12,
-            kind: Qwen35PrefillCheckpointKind::Final,
-            prefix_hash: &hash,
-        };
-
-        assert_eq!(final_hook.source_state_handle, "req-1");
-        assert_eq!(final_hook.prefix_hash.prefix_len, 12);
-        assert_eq!(qwen35_prefill_checkpoint_boundary_kind(final_hook), "full");
-        assert_eq!(
-            qwen35_prefill_checkpoint_session_id(final_hook),
-            "qwen35-checkpoint:batch-a:req-1:12"
-        );
-
-        let boundary_hook = Qwen35PrefillCheckpointHook {
-            logical_position: 8,
-            kind: Qwen35PrefillCheckpointKind::SemanticBoundary {
-                boundary: "message_end",
-                boundary_index: 3,
-            },
-            ..final_hook
-        };
-
-        assert_eq!(
-            qwen35_prefill_checkpoint_boundary_kind(boundary_hook),
-            "message_end"
-        );
-        assert_eq!(
-            qwen35_prefill_checkpoint_session_id(boundary_hook),
-            "qwen35-checkpoint:batch-a:req-1:boundary:3:8"
-        );
     }
 
     fn test_prefill_boundary_session(
@@ -3646,25 +3605,6 @@ struct SequenceStateCheckpointRequest<'a> {
     checkpoint_prefix_hash: Option<&'a GenerateBatchPrefillPrefixHash>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Qwen35PrefillCheckpointKind<'a> {
-    Final,
-    SemanticBoundary {
-        boundary: &'a str,
-        boundary_index: usize,
-    },
-}
-
-#[derive(Clone, Copy)]
-struct Qwen35PrefillCheckpointHook<'a> {
-    batch_id: &'a str,
-    session_id: &'a str,
-    source_state_handle: &'a str,
-    logical_position: usize,
-    kind: Qwen35PrefillCheckpointKind<'a>,
-    prefix_hash: &'a GenerateBatchPrefillPrefixHash,
-}
-
 struct Qwen35RequestSessionState {
     seq_pos: usize,
     conversation_tokens: Vec<u32>,
@@ -5129,48 +5069,6 @@ fn qwen35_restore_or_error(
             id,
             &format!("failed to restore qwen35 request session: {e}"),
         );
-    }
-}
-
-fn qwen35_checkpoint_session_id(
-    batch_id: &str,
-    session_id: &str,
-    logical_position: usize,
-) -> String {
-    format!("qwen35-checkpoint:{batch_id}:{session_id}:{logical_position}")
-}
-
-fn qwen35_boundary_checkpoint_session_id(
-    batch_id: &str,
-    session_id: &str,
-    logical_position: usize,
-    boundary_index: usize,
-) -> String {
-    format!(
-        "qwen35-checkpoint:{batch_id}:{session_id}:boundary:{boundary_index}:{logical_position}"
-    )
-}
-
-fn qwen35_prefill_checkpoint_session_id(hook: Qwen35PrefillCheckpointHook<'_>) -> String {
-    match hook.kind {
-        Qwen35PrefillCheckpointKind::Final => {
-            qwen35_checkpoint_session_id(hook.batch_id, hook.session_id, hook.logical_position)
-        }
-        Qwen35PrefillCheckpointKind::SemanticBoundary { boundary_index, .. } => {
-            qwen35_boundary_checkpoint_session_id(
-                hook.batch_id,
-                hook.session_id,
-                hook.logical_position,
-                boundary_index,
-            )
-        }
-    }
-}
-
-fn qwen35_prefill_checkpoint_boundary_kind(hook: Qwen35PrefillCheckpointHook<'_>) -> &'_ str {
-    match hook.kind {
-        Qwen35PrefillCheckpointKind::Final => "full",
-        Qwen35PrefillCheckpointKind::SemanticBoundary { boundary, .. } => boundary,
     }
 }
 
