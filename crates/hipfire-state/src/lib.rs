@@ -419,6 +419,28 @@ pub fn reserve_session_state_done_json(
     })
 }
 
+pub fn reserve_session_state_rejected_json(
+    id: &str,
+    worker_id: &str,
+    reserved_bytes: usize,
+    current_session_bytes: usize,
+    outstanding_reserved_bytes: usize,
+    projected_reserved_bytes: usize,
+    budget_bytes: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "reserve_session_state_rejected",
+        "id": id,
+        "worker_key_id": worker_id,
+        "reason": "memory_pressure",
+        "reserved_bytes": reserved_bytes,
+        "current_session_bytes": current_session_bytes,
+        "outstanding_reserved_bytes": outstanding_reserved_bytes,
+        "projected_reserved_bytes": projected_reserved_bytes,
+        "budget_bytes": budget_bytes,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseStateResponseKind {
     ReleaseState,
@@ -946,6 +968,28 @@ mod tests {
         assert_eq!(json["outstanding_reserved_bytes"], 2048);
         assert_eq!(json["projected_reserved_bytes"], 11264);
         assert_eq!(json["budget_bytes"], 16384);
+    }
+
+    #[test]
+    fn reserve_session_state_rejected_json_preserves_daemon_wire_shape() {
+        let json = reserve_session_state_rejected_json(
+            "reserve-2",
+            "worker-a",
+            8192,
+            1024,
+            2048,
+            11264,
+            4096,
+        );
+        assert_eq!(json["type"], "reserve_session_state_rejected");
+        assert_eq!(json["id"], "reserve-2");
+        assert_eq!(json["worker_key_id"], "worker-a");
+        assert_eq!(json["reason"], "memory_pressure");
+        assert_eq!(json["reserved_bytes"], 8192);
+        assert_eq!(json["current_session_bytes"], 1024);
+        assert_eq!(json["outstanding_reserved_bytes"], 2048);
+        assert_eq!(json["projected_reserved_bytes"], 11264);
+        assert_eq!(json["budget_bytes"], 4096);
     }
 
     #[test]

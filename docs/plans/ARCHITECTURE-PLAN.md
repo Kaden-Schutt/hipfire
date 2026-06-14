@@ -48,7 +48,7 @@ Current model boundary status:
 - `hipfire-runtime::model_source` remains a compatibility facade and still owns concrete HFQ/safetensors opener constructors until those loaders move.
 
 Current state boundary status:
-- `hipfire-state` owns sequence-state handles, Qwen3.5 session/checkpoint handle policy, parsed handle contracts, prefix-hash data shapes, checkpoint request metadata, page descriptors, model artifact memory accounting, worker memory/runtime view structs, model-worker id/policy helpers, arena backend support policy, generic reservation helpers, and JSON rendering for state descriptors, reserve-session success responses, `describe_state_done` responses, and release-state responses.
+- `hipfire-state` owns sequence-state handles, Qwen3.5 session/checkpoint handle policy, parsed handle contracts, prefix-hash data shapes, checkpoint request metadata, page descriptors, model artifact memory accounting, worker memory/runtime view structs, model-worker id/policy helpers, arena backend support policy, generic reservation helpers, and JSON rendering for state descriptors, reserve-session success/rejection responses, `describe_state_done` responses, and release-state responses.
 - `hipfire-daemon` consumes the shared checkpoint request metadata while still owning loaded-model state maps, Qwen3.5 checkpoint attach/fork/release behavior, and backend-specific GPU state materialization.
 
 Current scheduler boundary status:
