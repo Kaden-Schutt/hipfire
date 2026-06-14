@@ -228,3 +228,47 @@ This kernel is Stage 1 of the MLIR-AIE migration roadmap approved 2026-06-14.
 The remaining 2-dispatch reduction (Q and K in a single dispatch) requires raw
 MLIR-AIE to assign different weight tensors to separate tile columns; that is
 Stage 2 (single pre-attention dispatch per layer).
+
+## Inference Integration — Qwen3.5-0.8B SwiGLU NPU Bench
+
+- **Date**: 2026-06-14
+- **Model**: `qwen3.5-0.8b.mq4.hfq` (MQ4 quantized, 0.50 GiB HFQ payload)
+- **xclbin**: `qwen35-swiglu-3584.xclbin` (hidden_size=3584, intermediate FFN dim)
+- **Activation**: `HIPFIRE_QWEN35_FFN_BF16=xdna1 HIPFIRE_QWEN35_FFN_BF16_LAYER=all`
+- **Path**: `forward_scratch_layers` → `weight_gemv_swiglu_residual_bf16_probe` → xdna1
+
+### Changes needed to wire xdna1 on MQ4 models
+
+1. **Load bypass**: `load_bf16_down_shadow_for` returned error for non-BF16 tensors when `FFN_BF16=xdna1`.
+   Fixed: early-return `Ok(None)` for xdna1 mode — the down GEMV uses the original MQ4 tensor on GPU, the shadow w_down data is never needed.
+
+2. **Forward-pass bypass**: `weight_gemv_swiglu_residual_bf16_probe` gated on shadow presence.
+   Fixed: dispatch to xdna1 path before the shadow guard, using `w_down.k` for hidden_size.
+
+3. **XRT session limit**: creating one XRT handle per layer_idx (24 total) hits the NPU context limit on NPU1, crashing with `free(): invalid pointer` after the 2nd handle.
+   Fixed: all layers with the same hidden_size share one handle (cache key = hidden_size).
+
+### Results
+
+| mode                         | decode tok/s | ms/tok | wall tok/s |
+|------------------------------|-------------|--------|------------|
+| GPU only (baseline)          | 60.8        | 16.45  | 59.9       |
+| SwiGLU NPU, layer=0 only     | 60.6        | 16.50  | 59.7       |
+| SwiGLU NPU, all 24 layers    | 59.3        | 16.85  | 54.3       |
+
+**The NPU SwiGLU path is ~2.4% slower than GPU-only on the 0.8B model.**
+
+### Analysis
+
+The 24 × ~180 µs dispatch floor = ~4.3 ms extra per token (serial host→NPU→GPU→NPU...).
+The GPU SwiGLU for 24 layers takes ~0.3 ms total (tiny elementwise op on RDNA).
+Net: +4.0 ms/token = -1.5 tok/s.
+
+NPU SwiGLU only makes sense when:
+- GPU is fully compute-saturated by GEMVs and the elementwise SwiGLU contends for waves
+- Dispatches overlap with concurrent GPU work (not currently the case — dispatch is synchronous)
+- On larger models where GEMV latency makes the ~4 ms dispatch overhead small relative to step time
+
+For the 0.8B model (16 ms/tok baseline), the dispatch overhead is 25% of step time — not viable.
+For a 7B model (~100 ms/tok), the same 4 ms would be ~4% — marginal.
+Real NPU benefit requires async NPU dispatch or hardware-level DMA overlap.

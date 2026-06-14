@@ -6,6 +6,7 @@
 //! Feature-gated behind `deltanet`.
 
 use crate::ffn_bf16::{self, Bf16DownShadow, FfnBf16Mode};
+use crate::xdna1_ffi;
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::{HipError, HipResult};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
@@ -1540,6 +1541,12 @@ fn load_bf16_down_shadow_for(
     if !ffn_bf16::enabled() || !ffn_bf16::layer_selected(layer_idx) {
         return Ok(None);
     }
+    // Xdna1 mode only needs the hidden_size dimension, not the actual F32/BF16 weight
+    // data — the down GEMV runs on GPU with the original (quantized) tensor. Skip the
+    // shadow decode for xdna1 so MQ4 and other quantized models load without error.
+    if ffn_bf16::config().mode == FfnBf16Mode::Xdna1 {
+        return Ok(None);
+    }
     let (info, data) =
         qwen35_tensor_data_vec(hfq, name).unwrap_or_else(|| panic!("tensor not found: {name}"));
     ffn_bf16::decode_w_down_shadow(&data, info.quant_type, m, k)
@@ -1620,6 +1627,26 @@ fn weight_gemv_swiglu_residual_bf16_probe(
     ffn_hidden: &GpuTensor,
     x: &GpuTensor,
 ) -> HipResult<()> {
+    // Xdna1 mode does not require a BF16 shadow — only w_down.k (hidden_size)
+    // is needed to size the xclbin handle, and the down GEMV uses the original
+    // (quantized) w_down on GPU. Skip the shadow guard for this mode so MQ4
+    // and other quantized models can use the NPU SwiGLU activation path.
+    if ffn_bf16::enabled()
+        && ffn_bf16::layer_selected(layer_idx)
+        && ffn_bf16::config().mode == FfnBf16Mode::Xdna1
+    {
+        let invocation = ffn_bf16::dense_ffn_module_invocation_from_shape(
+            layer_idx,
+            w_down.m,
+            w_down.k,
+            ffn_bf16::DenseFfnBackendPreference::NpuOptIn,
+            false,
+        );
+        return weight_gemv_swiglu_residual_xdna1(
+            gpu, layer_idx, w_down.k, gate, up, ffn_hidden, w_down, x, &invocation,
+        );
+    }
+
     let Some(shadow) = ffn_bf16_selected_shadow(layer_idx, shadow)? else {
         let invocation = ffn_bf16::dense_ffn_module_invocation_from_shape(
             layer_idx,
@@ -1655,22 +1682,9 @@ fn weight_gemv_swiglu_residual_bf16_probe(
             let invocation =
                 ffn_bf16::dense_ffn_module_invocation(layer_idx, shadow, preferred_backend, false);
             if mode == FfnBf16Mode::Xdna1 {
-                let result = weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x);
-                if result.is_ok() {
-                    let output = ffn_bf16::dense_ffn_module_output(&invocation, None);
-                    let evidence_json = ffn_bf16::dense_ffn_module_output_json(&output);
-                    eprintln!(
-                        "[qwen35 ffn bf16] module={} preferred_backend={} selected_backend={} oracle_backend={} fallback_reason={} mutates_residual={} evidence_json={}",
-                        output.evidence.module_id,
-                        invocation.contract.preferred_backend.as_str(),
-                        output.evidence.selected_backend.as_str(),
-                        output.evidence.oracle_backend.as_str(),
-                        output.evidence.fallback_reason.unwrap_or("none"),
-                        output.mutates_residual,
-                        evidence_json,
-                    );
-                }
-                return result;
+                return weight_gemv_swiglu_residual_xdna1(
+                    gpu, layer_idx, shadow.k, gate, up, ffn_hidden, w_down, x, &invocation,
+                );
             }
             let t0 = std::time::Instant::now();
             let residual_pre = gpu.download_f32(x)?;
@@ -1731,10 +1745,116 @@ fn weight_gemv_swiglu_residual_bf16_probe(
                     }
                     Ok(())
                 }
-                FfnBf16Mode::Off | FfnBf16Mode::Xdna1 => unreachable!(),
+                FfnBf16Mode::Off => unreachable!(),
+                FfnBf16Mode::Xdna1 => unreachable!(),
             }
         }
     }
+}
+
+/// NPU SwiGLU dispatch for `FfnBf16Mode::Xdna1`.
+///
+/// Hybrid path: NPU handles the elementwise SwiGLU activation
+/// (`silu(gate) * up → ffn_hidden`), then falls back to the GPU for the
+/// w_down matmul (`x += w_down @ ffn_hidden`).  When the NPU paths are not
+/// configured or the handle can't be created the function falls back to the
+/// full GPU path so callers always get a valid result.
+#[allow(clippy::too_many_arguments)]
+fn weight_gemv_swiglu_residual_xdna1(
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    hidden_size: usize,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    ffn_hidden: &GpuTensor,
+    w_down: &WeightTensor,
+    x: &GpuTensor,
+    invocation: &ffn_bf16::DenseFfnModuleInvocation,
+) -> HipResult<()> {
+    let cfg = ffn_bf16::config();
+    let (xclbin, instr) = match (cfg.xdna1_xclbin.as_deref(), cfg.xdna1_instr.as_deref()) {
+        (Some(xc), Some(ins)) => (xc, ins),
+        _ => {
+            if cfg.trace {
+                eprintln!(
+                    "[qwen35 xdna1] layer={layer_idx} HIPFIRE_QWEN35_XDNA1_XCLBIN / \
+                     HIPFIRE_QWEN35_XDNA1_INSTR not set — falling back to GPU"
+                );
+            }
+            return weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x);
+        }
+    };
+    // All layers with the same hidden_size share one XRT handle — XRT contexts
+    // are limited, and there is no per-layer state in the SwiGLU kernel.
+    let handle = xdna1_ffi::swiglu_handle_for(hidden_size, hidden_size, xclbin, instr);
+    let handle = match handle {
+        Some(h) => h,
+        None => {
+            if cfg.trace {
+                eprintln!(
+                    "[qwen35 xdna1] layer={layer_idx} handle unavailable — falling back to GPU"
+                );
+            }
+            return weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x);
+        }
+    };
+
+    let t0 = std::time::Instant::now();
+    let gate_f32 = gpu.download_f32(gate)?;
+    let up_f32 = gpu.download_f32(up)?;
+    let download_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // f32 → bf16 conversion for NPU inputs
+    let gate_bf16: Vec<u16> = gate_f32
+        .iter()
+        .map(|&v| ffn_bf16::f32_to_bf16_bits_rne(v))
+        .collect();
+    let up_bf16: Vec<u16> = up_f32
+        .iter()
+        .map(|&v| ffn_bf16::f32_to_bf16_bits_rne(v))
+        .collect();
+    let mut out_bf16: Vec<u16> = vec![0u16; hidden_size];
+
+    let npu_t0 = std::time::Instant::now();
+    let ok = unsafe { xdna1_ffi::swiglu_run(handle, &gate_bf16, &up_bf16, &mut out_bf16) };
+    let npu_ms = npu_t0.elapsed().as_secs_f64() * 1000.0;
+
+    if !ok {
+        if cfg.trace {
+            eprintln!(
+                "[qwen35 xdna1] layer={layer_idx} run_handle failed — falling back to GPU"
+            );
+        }
+        return weight_gemv_swiglu_residual(gpu, w_down, gate, up, ffn_hidden, x);
+    }
+
+    // bf16 → f32 then upload to GPU ffn_hidden for the w_down matmul
+    let out_f32: Vec<f32> = out_bf16
+        .iter()
+        .map(|&b| ffn_bf16::bf16_bits_to_f32(b))
+        .collect();
+    let upload_t0 = std::time::Instant::now();
+    let bytes = unsafe {
+        std::slice::from_raw_parts(out_f32.as_ptr().cast::<u8>(), out_f32.len() * 4)
+    };
+    gpu.hip.memcpy_htod(&ffn_hidden.buf, bytes)?;
+
+    // Down matmul on GPU: x += w_down @ ffn_hidden
+    weight_gemv_residual(gpu, w_down, ffn_hidden, x)?;
+    let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+
+    if cfg.trace {
+        let output = ffn_bf16::dense_ffn_module_output(invocation, None);
+        let evidence_json = ffn_bf16::dense_ffn_module_output_json(&output);
+        eprintln!(
+            "[qwen35 xdna1] layer={layer_idx} selected_backend={} \
+             download_ms={download_ms:.3} npu_ms={npu_ms:.3} upload_ms={upload_ms:.3} \
+             evidence_json={}",
+            output.evidence.selected_backend.as_str(),
+            evidence_json,
+        );
+    }
+    Ok(())
 }
 
 fn bf16_to_f32(bits: u16) -> f32 {
