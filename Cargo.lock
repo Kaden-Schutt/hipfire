@@ -978,6 +978,9 @@ dependencies = [
 [[package]]
 name = "hipfire-scheduler"
 version = "0.2.1"
+dependencies = [
+ "hipfire-model",
+]
 
 [[package]]
 name = "hipfire-server"

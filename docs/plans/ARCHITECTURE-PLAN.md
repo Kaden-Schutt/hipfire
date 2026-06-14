@@ -37,6 +37,7 @@ Current prompt boundary status:
 
 Current model boundary status:
 - `hipfire-model` owns `ModelSource`, `TensorInfo`, `QuantConfig`, model artifact format detection, role-sidecar filtering, display-name derivation, and quant preference ranking.
+- `hipfire-model` owns `ModelWorkerKey` identity, feature-flag normalization, worker-key id construction, and worker-key compatibility comparison used by scheduler/control-plane adapters.
 - `hipfire-model` owns parameterized local model discovery helpers for direct paths, model-directory lookup, aliases, fuzzy scans, quant preference ranking, sidecar exclusion, and adjacent DFlash draft sidecar discovery; server, CLI, and eval adapters provide environment-specific paths.
 - `hipfire-model` owns common model-load request/parameter and loaded-response contracts used by daemon protocol clients and future direct library adapters.
 - `hipfire-runtime::model_source` remains a compatibility facade and still owns concrete HFQ/safetensors openers until those loaders move.
@@ -47,6 +48,7 @@ Current state boundary status:
 
 Current scheduler boundary status:
 - `hipfire-scheduler` owns Rust parity contracts for priority classes, prefill/decode scheduler policy, model-worker compatibility, request-session drafts, prefill queue selection, decode active-set batching, backpressure, opportunistic dispatch, and deadline aging.
+- `hipfire-scheduler` re-exports model-owned worker-key identity helpers so existing scheduler callers keep stable paths while model placement identity ownership moves into `hipfire-model`.
 - Bun scheduler code remains the live server control plane until Rust server paths consume the shared scheduler crate.
 
 Current generate boundary status:

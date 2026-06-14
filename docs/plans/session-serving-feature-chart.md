@@ -22,4 +22,5 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon load request/parameter and loaded-response protocol types now reuse `hipfire-model` contracts instead of duplicating common model-load structs in `hipfire-daemon-protocol`.
 - Rust server and CLI model discovery now reuse `hipfire-model` local artifact discovery helpers instead of server-local scanning.
 - Eval DFlash draft auto-discovery now reuses `hipfire-model` sidecar discovery instead of eval-local candidate parsing.
+- Rust scheduler worker-key identity and compatibility helpers now reuse `hipfire-model` ownership instead of scheduler-local model identity code.
 - Daemon model-worker id construction and sequence-state arena support policy now reuse `hipfire-state` ownership instead of daemon-local policy helpers.

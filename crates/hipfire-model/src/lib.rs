@@ -37,6 +37,68 @@ pub struct QuantConfig {
     pub dynamic_excludes: Vec<String>,
 }
 
+/// Stable identity for routing requests to a compatible loaded model worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelWorkerKey {
+    pub artifact_path: String,
+    pub artifact_digest: Option<String>,
+    pub arch_id: String,
+    pub quant_family: String,
+    pub state_mode: String,
+    pub max_seq_bucket: usize,
+    pub accelerator_kind: Option<String>,
+    pub device_id: Option<String>,
+    pub feature_flags: Vec<String>,
+}
+
+pub fn normalize_feature_flags(flags: &[String]) -> Vec<String> {
+    let mut flags = flags.to_vec();
+    flags.sort();
+    flags.dedup();
+    flags
+}
+
+pub fn normalize_model_worker_key(key: &ModelWorkerKey) -> ModelWorkerKey {
+    ModelWorkerKey {
+        artifact_path: key.artifact_path.clone(),
+        artifact_digest: key.artifact_digest.clone(),
+        arch_id: key.arch_id.clone(),
+        quant_family: key.quant_family.clone(),
+        state_mode: key.state_mode.clone(),
+        max_seq_bucket: key.max_seq_bucket,
+        accelerator_kind: Some(
+            key.accelerator_kind
+                .clone()
+                .unwrap_or_else(|| "hip".to_string()),
+        ),
+        device_id: Some(key.device_id.clone().unwrap_or_else(|| "0".to_string())),
+        feature_flags: normalize_feature_flags(&key.feature_flags),
+    }
+}
+
+pub fn model_worker_key_id(key: &ModelWorkerKey) -> String {
+    let normalized = normalize_model_worker_key(key);
+    [
+        normalized
+            .artifact_digest
+            .unwrap_or(normalized.artifact_path),
+        normalized.arch_id,
+        normalized.quant_family,
+        normalized.state_mode,
+        normalized.max_seq_bucket.to_string(),
+        normalized
+            .accelerator_kind
+            .unwrap_or_else(|| "hip".to_string()),
+        normalized.device_id.unwrap_or_else(|| "0".to_string()),
+        normalized.feature_flags.join("+"),
+    ]
+    .join("|")
+}
+
+pub fn same_model_worker_key(a: &ModelWorkerKey, b: &ModelWorkerKey) -> bool {
+    model_worker_key_id(a) == model_worker_key_id(b)
+}
+
 /// Unified interface for reading model data from HFQ files or safetensors
 /// directories. Concrete loaders live in backend/runtime crates.
 pub trait ModelSource {
@@ -349,6 +411,34 @@ mod tests {
     fn normalizes_tag_stems_for_fuzzy_lookup() {
         assert_eq!(normalize_tag_stem("qwen3.6:35b-a3b"), "qwen3.6-35b-a3b");
         assert_eq!(normalize_tag_stem("QWEN3.5:9B"), "qwen3.5-9b");
+    }
+
+    #[test]
+    fn model_worker_key_id_normalizes_feature_flags_and_default_placement() {
+        let base = ModelWorkerKey {
+            artifact_path: "/models/qwen3.5-9b-mq4.hfq".to_string(),
+            artifact_digest: Some("model-digest".to_string()),
+            arch_id: "5".to_string(),
+            quant_family: "mq4".to_string(),
+            state_mode: "attention_kv+deltanet_recurrent".to_string(),
+            max_seq_bucket: 8192,
+            accelerator_kind: None,
+            device_id: None,
+            feature_flags: vec!["prefill_batch".to_string(), "qwen35".to_string()],
+        };
+        let shuffled = ModelWorkerKey {
+            feature_flags: vec!["qwen35".to_string(), "prefill_batch".to_string()],
+            accelerator_kind: Some("hip".to_string()),
+            device_id: Some("0".to_string()),
+            ..base.clone()
+        };
+
+        assert_eq!(
+            normalize_feature_flags(&base.feature_flags),
+            vec!["prefill_batch".to_string(), "qwen35".to_string()]
+        );
+        assert_eq!(model_worker_key_id(&base), model_worker_key_id(&shuffled));
+        assert!(same_model_worker_key(&base, &shuffled));
     }
 
     #[test]
