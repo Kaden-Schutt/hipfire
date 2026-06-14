@@ -69,7 +69,7 @@ use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
-    model_worker_runtime_view_json, parse_describe_sequence_state_request,
+    model_worker_runtime_view_json, parse_describe_sequence_state_request, parse_model_worker_id,
     parse_release_sequence_state_request, parse_release_sessions_request,
     parse_reserve_session_state_request, parse_unload_worker_request,
     parsed_handle_may_target_generic, parsed_handle_may_target_loaded_state,
@@ -3853,12 +3853,7 @@ fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
 }
 
 fn message_worker_id(msg: &serde_json::Value) -> String {
-    msg.get("worker_id")
-        .or_else(|| msg.get("worker_key_id"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_MODEL_WORKER_ID)
-        .to_string()
+    parse_model_worker_id(msg, DEFAULT_MODEL_WORKER_ID).value
 }
 
 fn park_active_model(

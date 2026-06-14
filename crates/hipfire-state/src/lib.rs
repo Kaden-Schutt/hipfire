@@ -41,6 +41,17 @@ impl ModelWorkerId {
     }
 }
 
+pub fn parse_model_worker_id(msg: &serde_json::Value, default_worker_id: &str) -> ModelWorkerId {
+    let value = msg
+        .get("worker_id")
+        .or_else(|| msg.get("worker_key_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_worker_id)
+        .to_string();
+    ModelWorkerId { value }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SequenceStateArenaBackend {
     Qwen35Wrapped,
@@ -887,13 +898,7 @@ pub fn parse_unload_worker_request(
     msg: &serde_json::Value,
     default_worker_id: &str,
 ) -> SequenceStateUnloadWorkerRequest {
-    let worker_id = msg
-        .get("worker_id")
-        .or_else(|| msg.get("worker_key_id"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(default_worker_id)
-        .to_string();
+    let worker_id = parse_model_worker_id(msg, default_worker_id).value;
     SequenceStateUnloadWorkerRequest { worker_id }
 }
 
@@ -1024,6 +1029,41 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("unsupported kind bogus"));
+    }
+
+    #[test]
+    fn parse_model_worker_id_preserves_daemon_alias_priority() {
+        let worker_id = parse_model_worker_id(
+            &serde_json::json!({
+                "worker_id": "worker-a",
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_id.value, "worker-a");
+
+        let worker_key_id = parse_model_worker_id(
+            &serde_json::json!({
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_key_id.value, "worker-b");
+    }
+
+    #[test]
+    fn parse_model_worker_id_falls_back_to_default_worker() {
+        let missing = parse_model_worker_id(&serde_json::json!({}), "__default__");
+        assert_eq!(missing.value, "__default__");
+
+        let empty = parse_model_worker_id(
+            &serde_json::json!({
+                "worker_id": "",
+                "worker_key_id": ""
+            }),
+            "__default__",
+        );
+        assert_eq!(empty.value, "__default__");
     }
 
     #[test]
