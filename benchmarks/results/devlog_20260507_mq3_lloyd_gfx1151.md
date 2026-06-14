@@ -31,7 +31,7 @@ When this enablement was first attempted (during the MQ4-Lloyd
 investigation), I gated to **basic-GEMV-only** on gfx1151 because the
 all-5 enablement produced a 0.9% PPL drift on Qwen3.5-9B.
 
-The follow-up [`findings/mq4-lloyd-multiacc-investigation.md`](../../findings/mq4-lloyd-multiacc-investigation.md)
+The follow-up [`docs/plans/findings-archive/mq4-lloyd-multiacc-investigation.md`](../../docs/plans/findings-archive/mq4-lloyd-multiacc-investigation.md)
 root-caused that drift to fp32 reorder noise from the K4
 multi-accumulator pattern `(acc0+acc1)+(acc2+acc3)`, compounded
 across ~200 GEMVs/token × 2K tokens × softmax non-linearity. **A
@@ -166,7 +166,7 @@ HIPFIRE_LLOYD_FORCE_BASELINE=1 ./target/release/examples/perplexity \
 
 ## Cross-references
 
-- `findings/mq4-lloyd-multiacc-investigation.md` — multi-acc drift
+- `docs/plans/findings-archive/mq4-lloyd-multiacc-investigation.md` — multi-acc drift
   root-cause + universal-on-gfx11 confirmation. (This findings doc
   lives on the MQ4-Lloyd branch; will be on master after that PR
   lands.)

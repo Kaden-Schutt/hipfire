@@ -2378,7 +2378,6 @@ fn main() {
 
             // Stop on any terminator (eos_id OR eot_id). Checking only eos_id
             // misses `<|endoftext|>` when running --no-chatml on a raw-text draft
-            // — see findings/dflash-benchmark-2026-04-24.md §3.5 (post-EOT
             // attractor loop). `is_terminator` covers both.
             if step
                 .committed

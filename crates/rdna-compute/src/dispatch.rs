@@ -23833,7 +23833,7 @@ impl Gpu {
     /// and amortizing L2 hits on the Q8_1 batch tile across the three
     /// outputs. See `kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_body.cuh`
     /// for the kernel design and
-    /// `experiments/gfx906-fused-mmq/probe-results.md` for the §6.1
+    /// `docs/plans/experiments-archive/gfx906-fused-mmq-probe-results.md` for the §6.1
     /// probe that motivated this work.
     ///
     /// Caller invariants:

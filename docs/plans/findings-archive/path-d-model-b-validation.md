@@ -81,7 +81,7 @@ them and the GPU work is wasted.
 Wall-time math:
 
   - **Best-case savings** when pipelining helps: ~11.8 % per cycle
-    (D0-bandwidth contention bench, `findings/path-d-bandwidth-
+    (D0-bandwidth contention bench, `findings-archive/path-d-bandwidth-
     contention.md`).
   - **Regression cost** when pipelining is wasted: bandwidth contention
     on shared GDDR6 slows verify by ~5 % (D0-bandwidth bench, run 2).

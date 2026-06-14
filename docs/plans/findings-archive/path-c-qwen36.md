@@ -10,7 +10,7 @@
 
 ## Why this exists
 
-`findings/path-d-vs-path-c.md` (gfx1100, Qwen3.5-27B) closed pipelining as a dead
+`findings-archive/path-d-vs-path-c.md` (gfx1100, Qwen3.5-27B) closed pipelining as a dead
 end *on that regime* but explicitly hedged:
 
 > "Tree-mode pipelining on this model regime is structurally dominated by chain
@@ -25,7 +25,7 @@ co-shipped DFlash draft.
 
 ## Method
 
-Mirrors `findings/path-d-vs-path-c.md` methodology with the model pair changed:
+Mirrors `findings-archive/path-d-vs-path-c.md` methodology with the model pair changed:
 
   - Target: `~/.hipfire/models/qwen3.6-27b.mq4` (15 GB, 64-layer Qwen3.6 with
     1:4 LinearAttention:FullAttention pattern, KV asym3, max_seq=544).
@@ -81,7 +81,7 @@ is on equal-length output.
   - **Prose:** Path C phase 1 is **−6.0 %** (65.20 vs 69.36); phase 2 is
     **−14.5 %** (59.32 vs 69.36).
 
-Same structural conclusion as `findings/path-d-vs-path-c.md` on Qwen3.5-27B
+Same structural conclusion as `findings-archive/path-d-vs-path-c.md` on Qwen3.5-27B
 (gfx1100): tree-verify per-cycle overhead exceeds the τ benefit, even when
 the full-path-accept fraction rises (prose: 44 % chain → 63 % Path C
 phase 1).
@@ -109,7 +109,7 @@ pair.
 ### Cross-arch caveat (gfx1151 vs gfx1100)
 
 This bench was run on gfx1151 (Strix Halo APU, shared LPDDR5x). The
-prior `findings/path-d-vs-path-c.md` measurements are on gfx1100 (RX
+prior `findings-archive/path-d-vs-path-c.md` measurements are on gfx1100 (RX
 7900 XT, GDDR6). Absolute tok/s differs by ~4×, which is expected
 hardware delta — the comparison here is **within-host** (chain vs Path C
 on the same gfx1151 machine in the same session), not cross-arch.

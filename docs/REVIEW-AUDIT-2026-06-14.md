@@ -32,7 +32,7 @@ This list now excludes `BUGS-GEMINI.md`, `DOCS-GEMINI.md`, and `MANUAL_REVIEW.md
 
 - `benchmarks/`
 - `crates/`
-- `experiments/`
+- `docs/plans/experiments-archive/`
 - `scripts/`
 - `tests/`
 - `third_party/`
@@ -41,13 +41,13 @@ This list now excludes `BUGS-GEMINI.md`, `DOCS-GEMINI.md`, and `MANUAL_REVIEW.md
 
 1. Do not edit historical files in `docs-old` unless explicitly needed for migration tasks.
 2. Add or revise canonical guidance only in `docs/`.
-3. For active work in `benchmarks/`, `experiments/`, `crates/`, and `tests/`, treat each markdown file as a status artifact tied to local code, and refresh links/headings if they feed canonical decisions.
+3. For active work in `benchmarks/`, `docs/plans/experiments-archive/`, `crates/`, and `tests/`, treat each markdown file as a status artifact tied to local code, and refresh links/headings if they feed canonical decisions.
 4. When a sub-tree document contains reusable standard process, migrate it into `docs/` and replace the old file with a pointer note.
 
 ## Next consolidation target
 
 - Produce a curated second pass for high-leverage non-archive markdown roots:
   - `README.md`, `TODO.md`, `BUGS.md`
-  - modularization-related notes in `benchmarks/`, `experiments/`, and `crates/`
+- modularization-related notes in `benchmarks/`, `docs/plans/experiments-archive/`, and `crates/`
   - test procedure docs in `tests/README.md` and `tests/smoke/README.md`
 - Promote any process that drives repeated decisions into `docs/reference/` and `docs/plans/`.

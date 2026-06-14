@@ -359,12 +359,12 @@ search space.
 4. Check what's already installed: `dpkg -l | grep -i rocm`, `which hipcc`, `pip list | grep torch`
 5. Initialize git repo, commit initial scaffold
 6. Run `./tests/harness.sh` to get baseline (expect most tiers to fail — that's the point)
-7. Document starting state in `findings/phase0-baseline.md`
+7. Document starting state in `docs/plans/findings-archive/phase0-baseline.md`
 
 ### Phase 1: Mapping (~2-4 hrs)
 
 Parallelize focused probe tasks where useful. Each probe should write
-structured findings to `findings/phase1-*.md`.
+structured findings to `docs/plans/findings-archive/phase1-*.md`.
 
 **Hardware probing agents (4):**
 - Agent 1: Full hardware inventory — PCIe topology, IOMMU groups, power states, clock ranges, firmware versions. Dump everything from sysfs.
@@ -390,7 +390,7 @@ structured findings to `findings/phase1-*.md`.
 
 **Note:** Vulkan/wgpu/RADV is explicitly **out of scope** as of 2026-04-25 (issue #44 closed). hipfire ships a single HIP/ROCm-direct backend; cross-vendor compute is not a goal.
 
-**After all agents complete:** Synthesize findings into `findings/phase1-synthesis.md`.
+**After all agents complete:** Synthesize findings into `docs/plans/findings-archive/phase1-synthesis.md`.
 Identify the actual blocking points (not folklore). Rank the viable paths forward.
 
 ### Phase 2: Theory & Competing Approaches (~1-2 hrs)
@@ -440,7 +440,7 @@ The harness tiers (see `tests/harness.sh` for implementation):
 **Key decision point:** After testing all ranked approaches, which path has the best
 Tier reached + portability + Rust-native potential? That's your Phase 4 foundation.
 
-Write decision to `experiments/phase3-decision.md`.
+Write decision to `docs/REVIEW-AUDIT-2026-06-14.md`.
 
 ### Phase 4: Build the Engine (remaining time)
 

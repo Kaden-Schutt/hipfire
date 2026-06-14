@@ -47,7 +47,7 @@ outcomes and the multi-accumulator bug bisect.
 
 ## Phase 1 — quantizer + slow GEMV + viability PPL
 
-(Detailed methodology: [`findings/lloyd-mq4-9b-ppl.md`](../../findings/lloyd-mq4-9b-ppl.md).)
+(Detailed methodology: [`docs/plans/findings-archive/lloyd-mq4-9b-ppl.md`](../../docs/plans/findings-archive/lloyd-mq4-9b-ppl.md).)
 
 Implemented in commit `7ef567d`:
 
@@ -150,7 +150,7 @@ drift on real model. PPL byte-equality is the decisive gate.
 
 ## Multi-accumulator bisect — what we learned
 
-(Full writeup: [`findings/lloyd-mq4-multiacc-investigation.md`](../../findings/lloyd-mq4-multiacc-investigation.md).)
+(Full writeup: [`docs/plans/findings-archive/lloyd-mq4-multiacc-investigation.md`](../../docs/plans/findings-archive/lloyd-mq4-multiacc-investigation.md).)
 
 **Initial framing:** during P2-B bring-up, the K4 multi-accumulator
 pattern (4 separate `acc0..acc3` registers + final
@@ -280,7 +280,7 @@ larger 160 B/group bandwidth. To be measured.
    magnitude ~5e-7 to 2e-6 on real Qwen3.5-9B weights). Full-coverage
    PPL drift on gfx1100 is the *same magnitude* as gfx1151 but
    *opposite sign* — fp32 reorder direction is essentially random per
-   arch. See `findings/lloyd-mq4-multiacc-investigation.md` "Update
+   arch. See `docs/plans/findings-archive/lloyd-mq4-multiacc-investigation.md` "Update
    2026-05-07" section for the data. Conclusion: single-acc is
    universally correct for MQ4-Lloyd (already shipping); MQ3-Lloyd
    would benefit too at ~2% decode cost (issue #188).
@@ -319,8 +319,8 @@ Diagnostic infrastructure (kept for future bisects):
 
 Findings docs:
 
-- `findings/lloyd-mq4-9b-ppl.md` — Phase 1 viability + quality projection
-- `findings/lloyd-mq4-multiacc-investigation.md` — multi-acc bisect
+- `docs/plans/findings-archive/lloyd-mq4-9b-ppl.md` — Phase 1 viability + quality projection
+- `docs/plans/findings-archive/lloyd-mq4-multiacc-investigation.md` — multi-acc bisect
 
 Sibling PR (out of MQ4-Lloyd scope):
 

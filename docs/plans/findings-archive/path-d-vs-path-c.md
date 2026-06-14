@@ -9,7 +9,7 @@ PR #72 (Path C tree-mode orchestrator on gfx1100).
 
 ## Why this exists
 
-The model-B validation in `findings/path-d-model-b-validation.md`
+The model-B validation in `findings-archive/path-d-model-b-validation.md`
 measured chain-mode `spec_step_dflash` only. The PR's recommendation
 hedged: *"if Path C tree mode lifts the full-accept fraction enough,
 the chain-mode regression on code might not apply to the production-
@@ -107,7 +107,7 @@ This **strengthens option C** (stop pursuing pipelining):
 
   - Chain mode is the production-default path on Qwen3.5-27B.
   - Pipelining model B regresses on chain-mode code by ~2.2 %
-    (`findings/path-d-model-b-validation.md`).
+    (`findings-archive/path-d-model-b-validation.md`).
   - Path C tree mode doesn't change this conclusion — it's a slower
     alternative on the model pair plan §1 targets.
 

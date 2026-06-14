@@ -30,7 +30,7 @@
 // Floor for this kernel's contribution: 5% prefill-wide; ceiling 8-12%
 // once gate_up_2way and qkvza-head_2way also land (since the 2-way
 // pattern fires far more frequently than 3-way QKV on Qwen3.5 9B).
-// See experiments/gfx906-fused-mmq/probe-results.md.
+// See docs/plans/experiments-archive/gfx906-fused-mmq-probe-results.md.
 //
 // ═══ KERNEL INVARIANTS — caller MUST satisfy ═══
 //
