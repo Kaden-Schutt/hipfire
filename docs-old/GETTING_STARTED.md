@@ -89,6 +89,8 @@ python tools/npu/build_qwen35_headnorm.py --n-heads 8 --n-kv-heads 2 --head-dim 
 python tools/npu/build_qwen35_attn_gate.py --n-heads 8 --head-dim 256
 # Attention score softmax (builds xclbins for ctx_len ∈ {64,128,256,512}):
 python tools/npu/build_qwen35_softmax.py --n-heads 8 --ctx-lens 64,128,256,512
+# Fused QK head norm + RoPE (replaces separate headnorm + rope dispatches; 4 → 2 per layer):
+python tools/npu/build_qwen35_headnorm_rope.py --n-heads 8 --n-kv-heads 2 --head-dim 256
 ```
 
 ## Verify

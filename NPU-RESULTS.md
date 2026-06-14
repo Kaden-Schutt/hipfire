@@ -186,3 +186,26 @@ Tolerance: atol=0.02, rtol=0.02. max_abs=0.016 (≈1 ULP at magnitude ≤1, from
 | 512     | 0.00073  | 3860 µs  | 4134 µs   |
 
 **Dispatch floor: ~170 µs; compute scales ~7.4 µs/element (scalar loop).** Softmax is compute-heavy (exp + sum + normalize) and the scalar implementation dominates. Not NPU-competitive with GPU DFlash for typical decode contexts (DFlash fuses QK^T + softmax + AV in one kernel). Useful only for the non-DFlash fallback paths (Q8 FA, gqa4) at short context lengths (≤128) where standalone GPU softmax dispatch overhead dominates.
+
+## Kernel 8: Fused HeadNorm + RoPE (`headnorm_rope_bf16`)
+
+- **Date**: 2026-06-14 (built; awaiting hardware run)
+- **Status**: pending first run
+- **Config**: n_heads=8, n_kv_heads=2, head_dim=256, Qwen3.5-1.5B dense, NPU1 (Phoenix/AIE2)
+- **Algorithm**: 3-pass vectorized (VEC=16):
+  - Pass 1: `sum_sq = Σ x_i²`, `inv_rms = 1/sqrt(mean_sq + 1e-5)` via `aie::invsqrt`
+  - Pass 2 (rotation region [0, n_rot)): normalize (x * inv_rms * weight) then rope-rotate (half-split layout)
+  - Pass 3 (passthrough [n_rot, head_dim)): normalize only
+- **Tensor param**: single packed buffer `[weight (head_dim), cs (n_rot)]` — avoids a new FFI signature
+- **Dispatch savings**: replaces 4 separate dispatches (headnorm_q + rope_q + headnorm_k + rope_k)
+  with 2 dispatches (Q and K), saving 2 × ~170 µs × 28 layers ≈ **9.5 ms/step**
+- **Artifact**: `qwen35-headnorm-rope-{q,k}-{n_heads}h{head_dim}d.{xclbin,instr.bin}`
+
+*Results will be appended after first hardware validation run.*
+
+### Strategic note
+
+This kernel is Stage 1 of the MLIR-AIE migration roadmap approved 2026-06-14.
+The remaining 2-dispatch reduction (Q and K in a single dispatch) requires raw
+MLIR-AIE to assign different weight tensors to separate tile columns; that is
+Stage 2 (single pre-attention dispatch per layer).

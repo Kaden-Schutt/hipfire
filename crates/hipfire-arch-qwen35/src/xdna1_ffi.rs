@@ -66,6 +66,14 @@ pub struct Xdna1Lib {
     pub fn_softmax_create: Option<FnCreate>,
     pub fn_softmax_run_handle: Option<FnRunHandle>,
     pub fn_softmax_destroy: Option<FnDestroy>,
+    // Fused headnorm+rope Q/K — replaces 4 dispatches (headnorm_q + rope_q + headnorm_k +
+    // rope_k) with 2.  Second input slot carries the packed [weight, cs] tensor param.
+    pub fn_headnorm_rope_q_create: Option<FnCreate>,
+    pub fn_headnorm_rope_q_run_handle: Option<FnRunHandle>,
+    pub fn_headnorm_rope_q_destroy: Option<FnDestroy>,
+    pub fn_headnorm_rope_k_create: Option<FnCreate>,
+    pub fn_headnorm_rope_k_run_handle: Option<FnRunHandle>,
+    pub fn_headnorm_rope_k_destroy: Option<FnDestroy>,
 }
 
 // Library holds only raw fn-ptrs and a Library — all Send+Sync.
@@ -175,6 +183,31 @@ impl Xdna1Lib {
                 .get::<FnDestroy>(b"xdna1_bf16_softmax_destroy\0")
                 .ok()
                 .map(|s| *s);
+            // Fused headnorm+rope Q/K: optional, absent when .so predates this kernel.
+            let fn_headnorm_rope_q_create = lib
+                .get::<FnCreate>(b"xdna1_bf16_headnorm_rope_q_create\0")
+                .ok()
+                .map(|s| *s);
+            let fn_headnorm_rope_q_run_handle = lib
+                .get::<FnRunHandle>(b"xdna1_bf16_headnorm_rope_q_run_handle\0")
+                .ok()
+                .map(|s| *s);
+            let fn_headnorm_rope_q_destroy = lib
+                .get::<FnDestroy>(b"xdna1_bf16_headnorm_rope_q_destroy\0")
+                .ok()
+                .map(|s| *s);
+            let fn_headnorm_rope_k_create = lib
+                .get::<FnCreate>(b"xdna1_bf16_headnorm_rope_k_create\0")
+                .ok()
+                .map(|s| *s);
+            let fn_headnorm_rope_k_run_handle = lib
+                .get::<FnRunHandle>(b"xdna1_bf16_headnorm_rope_k_run_handle\0")
+                .ok()
+                .map(|s| *s);
+            let fn_headnorm_rope_k_destroy = lib
+                .get::<FnDestroy>(b"xdna1_bf16_headnorm_rope_k_destroy\0")
+                .ok()
+                .map(|s| *s);
             Ok(Xdna1Lib {
                 fn_swiglu_create: *fn_swiglu_create,
                 fn_swiglu_run_handle: *fn_swiglu_run_handle,
@@ -200,6 +233,12 @@ impl Xdna1Lib {
                 fn_softmax_create,
                 fn_softmax_run_handle,
                 fn_softmax_destroy,
+                fn_headnorm_rope_q_create,
+                fn_headnorm_rope_q_run_handle,
+                fn_headnorm_rope_q_destroy,
+                fn_headnorm_rope_k_create,
+                fn_headnorm_rope_k_run_handle,
+                fn_headnorm_rope_k_destroy,
                 _lib: lib,
             })
         }
@@ -863,6 +902,185 @@ pub unsafe fn softmax_run(
         n,
         input.as_ptr(),
         0,
+        out.as_mut_ptr(),
+        n,
+    );
+    !ret.is_null()
+}
+
+// ─── Fused headnorm+rope Q handle cache ──────────────────────────────────────
+//
+// The "second input" slot in FnRunHandle carries the packed [weight, cs] tensor
+// param (head_dim + n_rot elements).  This avoids a new FFI signature while
+// letting the kernel receive both normalization weight and rotary embedding in
+// one DMA transfer.
+
+static HEADNORM_ROPE_Q_HANDLES: OnceLock<Mutex<HashMap<usize, RawHandle>>> = OnceLock::new();
+
+fn headnorm_rope_q_handles() -> &'static Mutex<HashMap<usize, RawHandle>> {
+    HEADNORM_ROPE_Q_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Create (or reuse cached) headnorm_rope_q handle for `layer_idx`.
+///
+/// `n_total` = n_heads × head_dim (element count for Q, not bytes).
+pub fn headnorm_rope_q_handle_for(
+    layer_idx: usize,
+    n_total: usize,
+    xclbin_path: &str,
+    instr_path: &str,
+) -> Option<*mut c_void> {
+    let lib = get_lib()?;
+    let fn_create = lib.fn_headnorm_rope_q_create?;
+    let mut map = headnorm_rope_q_handles().lock().unwrap();
+    if let Some(h) = map.get(&layer_idx) {
+        return Some(h.0);
+    }
+    let xclbin_c = CString::new(xclbin_path).ok()?;
+    let instr_c = CString::new(instr_path).ok()?;
+    let handle = unsafe {
+        fn_create(
+            xclbin_c.as_ptr(),
+            instr_c.as_ptr(),
+            n_total,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() {
+        eprintln!(
+            "[xdna1] headnorm_rope_q_create returned null for layer={layer_idx} \
+             n_total={n_total} xclbin={xclbin_path}"
+        );
+        return None;
+    }
+    map.insert(layer_idx, RawHandle(handle));
+    Some(handle)
+}
+
+/// Call `xdna1_bf16_headnorm_rope_q_run_handle`.
+///
+/// `input` is BF16 Q tensor [n_heads × head_dim].
+/// `weight` is the per-head norm weight [head_dim] (q_norm).
+/// `cs` is the cos/sin buffer [n_rot] for the current token position.
+/// `out` receives the normalized + rotated Q tensor.
+///
+/// Weight and cs are packed into a temporary contiguous buffer to satisfy
+/// the binary FnRunHandle signature; the kernel splits them at `head_dim`.
+///
+/// # Safety
+/// Caller guarantees all slices are valid and sizes match the handle shape.
+pub unsafe fn headnorm_rope_q_run(
+    handle: *mut c_void,
+    input: &[u16],
+    weight: &[u16],
+    cs: &[u16],
+    out: &mut [u16],
+) -> bool {
+    let lib = match get_lib() {
+        Some(l) => l,
+        None => return false,
+    };
+    let fn_run = match lib.fn_headnorm_rope_q_run_handle {
+        Some(f) => f,
+        None => return false,
+    };
+    let n = input.len();
+    debug_assert_eq!(out.len(), n);
+    // Pack weight + cs into a contiguous slice for the second FnRunHandle arg.
+    let mut packed = Vec::with_capacity(weight.len() + cs.len());
+    packed.extend_from_slice(weight);
+    packed.extend_from_slice(cs);
+    let ret = fn_run(
+        handle,
+        input.as_ptr(),
+        n,
+        packed.as_ptr(),
+        packed.len(),
+        out.as_mut_ptr(),
+        n,
+    );
+    !ret.is_null()
+}
+
+// ─── Fused headnorm+rope K handle cache ──────────────────────────────────────
+
+static HEADNORM_ROPE_K_HANDLES: OnceLock<Mutex<HashMap<usize, RawHandle>>> = OnceLock::new();
+
+fn headnorm_rope_k_handles() -> &'static Mutex<HashMap<usize, RawHandle>> {
+    HEADNORM_ROPE_K_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Create (or reuse cached) headnorm_rope_k handle for `layer_idx`.
+///
+/// `n_total` = n_kv_heads × head_dim.
+pub fn headnorm_rope_k_handle_for(
+    layer_idx: usize,
+    n_total: usize,
+    xclbin_path: &str,
+    instr_path: &str,
+) -> Option<*mut c_void> {
+    let lib = get_lib()?;
+    let fn_create = lib.fn_headnorm_rope_k_create?;
+    let mut map = headnorm_rope_k_handles().lock().unwrap();
+    if let Some(h) = map.get(&layer_idx) {
+        return Some(h.0);
+    }
+    let xclbin_c = CString::new(xclbin_path).ok()?;
+    let instr_c = CString::new(instr_path).ok()?;
+    let handle = unsafe {
+        fn_create(
+            xclbin_c.as_ptr(),
+            instr_c.as_ptr(),
+            n_total,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() {
+        eprintln!(
+            "[xdna1] headnorm_rope_k_create returned null for layer={layer_idx} \
+             n_total={n_total} xclbin={xclbin_path}"
+        );
+        return None;
+    }
+    map.insert(layer_idx, RawHandle(handle));
+    Some(handle)
+}
+
+/// Call `xdna1_bf16_headnorm_rope_k_run_handle`.
+///
+/// `input` is BF16 K tensor [n_kv_heads × head_dim].
+/// `weight` is the per-head norm weight [head_dim] (k_norm).
+/// `cs` is the cos/sin buffer [n_rot] for the current token position.
+/// `out` receives the normalized + rotated K tensor.
+///
+/// # Safety
+/// Caller guarantees all slices are valid and sizes match the handle shape.
+pub unsafe fn headnorm_rope_k_run(
+    handle: *mut c_void,
+    input: &[u16],
+    weight: &[u16],
+    cs: &[u16],
+    out: &mut [u16],
+) -> bool {
+    let lib = match get_lib() {
+        Some(l) => l,
+        None => return false,
+    };
+    let fn_run = match lib.fn_headnorm_rope_k_run_handle {
+        Some(f) => f,
+        None => return false,
+    };
+    let n = input.len();
+    debug_assert_eq!(out.len(), n);
+    let mut packed = Vec::with_capacity(weight.len() + cs.len());
+    packed.extend_from_slice(weight);
+    packed.extend_from_slice(cs);
+    let ret = fn_run(
+        handle,
+        input.as_ptr(),
+        n,
+        packed.as_ptr(),
+        packed.len(),
         out.as_mut_ptr(),
         n,
     );
