@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -243,6 +244,29 @@ pub fn detect_model_artifact_format(path: &Path) -> ModelArtifactFormat {
             Some("gguf") => ModelArtifactFormat::Gguf,
             _ => ModelArtifactFormat::Unknown,
         }
+    }
+}
+
+/// Apply the shared model-source opening policy while concrete loader crates
+/// provide the actual HFQ and safetensors constructors.
+pub fn open_model_source_with<T, HfqErr, SafetensorsErr>(
+    path: &Path,
+    open_hfq: impl FnOnce(&Path) -> Result<T, HfqErr>,
+    open_safetensors: impl FnOnce(&Path) -> Result<T, SafetensorsErr>,
+) -> Result<T, String>
+where
+    HfqErr: Display,
+    SafetensorsErr: Display,
+{
+    if path.is_dir() {
+        let config_path = path.join("config.json");
+        if config_path.exists() {
+            open_safetensors(path).map_err(|e| format!("safetensors open failed: {e}"))
+        } else {
+            Err(format!("{}: directory has no config.json", path.display()))
+        }
+    } else {
+        open_hfq(path).map_err(|e| format!("{e}"))
     }
 }
 
@@ -800,6 +824,74 @@ mod tests {
             detect_model_artifact_format(Path::new("model.bin")),
             ModelArtifactFormat::Unknown
         );
+    }
+
+    #[test]
+    fn open_model_source_policy_routes_files_to_hfq_loader() {
+        let path = Path::new("model.hfq");
+        let opened = open_model_source_with(
+            path,
+            |path| Ok::<_, String>(format!("hfq:{}", path.display())),
+            |_| Err::<String, _>("unexpected safetensors loader".to_string()),
+        )
+        .unwrap();
+        assert_eq!(opened, "hfq:model.hfq");
+    }
+
+    #[test]
+    fn open_model_source_policy_routes_config_dirs_to_safetensors_loader() {
+        let root = temp_dir("hipfire-model-open-policy");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.json"), "{}").unwrap();
+
+        let opened = open_model_source_with(
+            &root,
+            |_| Err::<String, _>("unexpected hfq loader".to_string()),
+            |path| Ok::<_, String>(format!("safetensors:{}", path.display())),
+        )
+        .unwrap();
+
+        assert!(opened.starts_with("safetensors:"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_model_source_policy_rejects_non_model_dirs() {
+        let root = temp_dir("hipfire-model-open-policy-no-config");
+        fs::create_dir_all(&root).unwrap();
+
+        let err = open_model_source_with(
+            &root,
+            |_| Ok::<_, String>("unexpected hfq loader".to_string()),
+            |_| Ok::<_, String>("unexpected safetensors loader".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(err.ends_with("directory has no config.json"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_model_source_policy_preserves_loader_error_shape() {
+        let file_err = open_model_source_with(
+            Path::new("bad.hfq"),
+            |_| Err::<String, _>("hfq failed".to_string()),
+            |_| Ok::<_, String>("unexpected safetensors loader".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(file_err, "hfq failed");
+
+        let root = temp_dir("hipfire-model-open-policy-loader-error");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.json"), "{}").unwrap();
+        let dir_err = open_model_source_with(
+            &root,
+            |_| Ok::<_, String>("unexpected hfq loader".to_string()),
+            |_| Err::<String, _>("safetensors failed".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(dir_err, "safetensors open failed: safetensors failed");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

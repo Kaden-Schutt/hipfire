@@ -41,9 +41,10 @@ Current model boundary status:
 - `hipfire-model` owns `ModelWorkerKey` identity, feature-flag normalization, worker-key id construction, and worker-key compatibility comparison used by scheduler/control-plane adapters.
 - `hipfire-model` owns model architecture id constants and family classification helpers used by generate/backend-selection contracts.
 - `hipfire-model` owns parameterized local model discovery helpers for direct paths, model-directory lookup, aliases, fuzzy scans, quant preference ranking, sidecar exclusion, and adjacent DFlash draft sidecar discovery; server, CLI, and eval adapters provide environment-specific paths.
+- `hipfire-model` owns model-source opening policy for HFQ files and safetensors directories while runtime supplies the concrete loader constructors.
 - `hipfire-model` owns common model-load request/parameter and loaded-response contracts used by daemon protocol clients and future direct library adapters.
 - `hipfire-model` owns eval model-manifest row construction for local-file/tag identity, file/tag hashes, HFQ metadata hashes, architecture IDs, embedded quantization hashes, and model-specific hash/HFQ metadata compatibility helpers consumed by evidence/runtime paths.
-- `hipfire-runtime::model_source` remains a compatibility facade and still owns concrete HFQ/safetensors openers until those loaders move.
+- `hipfire-runtime::model_source` remains a compatibility facade and still owns concrete HFQ/safetensors opener constructors until those loaders move.
 
 Current state boundary status:
 - `hipfire-state` owns sequence-state handles, parsed handle contracts, prefix-hash data shapes, checkpoint request metadata, page descriptors, model artifact memory accounting, worker memory/runtime view structs, model-worker id/policy helpers, arena backend support policy, generic reservation helpers, and JSON rendering for state descriptors.
