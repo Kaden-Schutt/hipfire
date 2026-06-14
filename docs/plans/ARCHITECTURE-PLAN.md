@@ -25,7 +25,7 @@ The target crates for modular boundaries remain:
 - `hipfire-rocm` (created; owns ROCm backend evidence contracts)
 - `hipfire-daemon-adapter` (created; owns daemon JSONL process-client adapter)
 - `hipfire-daemon-protocol` (created; owns daemon JSONL request/response contracts)
-- `hipfire-evidence` (created; owns evidence provenance and hash helpers)
+- `hipfire-evidence` (created; owns evidence provenance, host-profile contracts, and hash helpers)
 
 A `bun`-free control plane remains desirable but is deferred behind verified seam extraction.
 
@@ -82,7 +82,7 @@ Current daemon adapter boundary status:
 - `hipfire-server::daemon::engine` remains a compatibility re-export for server and CLI callers while the adapter becomes reusable outside the HTTP server crate.
 
 Current evidence boundary status:
-- `hipfire-evidence` owns stable evidence hash helpers, directory digest, file hash, model/tag hash and HFQ metadata compatibility wrappers that delegate to `hipfire-model`, eval reference/slice/llama integrity verifiers, the standard evidence artifact catalog, catalog-based evidence artifact directory discovery, evidence artifact collection status policy, standard evidence artifact contract/JSON rendering, comparison/admission artifact contract rendering, admission required/observed evidence catalogs, the generic evidence artifact record contract/JSON renderer, external evidence record selection/annotation, comparison metric-direction policy, admission quality/review policy, admission verdict policy, run-provenance contract/JSON rendering, run-metadata artifact contract/JSON rendering, and artifact-index entry contract/JSON rendering.
+- `hipfire-evidence` owns stable evidence hash helpers, directory digest, file hash, eval status, host-profile and sourced-field contracts, model/tag hash and HFQ metadata compatibility wrappers that delegate to `hipfire-model`, eval reference/slice/llama integrity verifiers, the standard evidence artifact catalog, catalog-based evidence artifact directory discovery, evidence artifact collection status policy, standard evidence artifact contract/JSON rendering, comparison/admission artifact contract rendering, admission required/observed evidence catalogs, the generic evidence artifact record contract/JSON renderer, external evidence record selection/annotation, comparison metric-direction policy, admission quality/review policy, admission verdict policy, run-provenance contract/JSON rendering, run-metadata artifact contract/JSON rendering, and artifact-index entry contract/JSON rendering.
 - `hipfire-eval` owns the `hipfire-eval` binary adapter, eval execution, artifact writing, and harness implementation. It consumes shared model, evidence, and coherence crates directly for model identity, artifact/provenance rendering, and daemon-backed coherence rows.
 - `hipfire-runtime::eval_common` remains a compatibility facade for evidence-owned eval integrity verifiers, and `hipfire-runtime::eval_harness` remains a compatibility facade for the `hipfire-eval` harness while downstream callers migrate.
 

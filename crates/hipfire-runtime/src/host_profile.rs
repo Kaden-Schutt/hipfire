@@ -8,8 +8,9 @@
 //! CPU memory copy bandwidth, the storage path used for `~/.hipfire/models`,
 //! and optional HIP copy bandwidth when a GPU is available.
 
-use crate::eval_harness::{collect_default_host_profile, HostProfile};
+use crate::eval_harness::collect_default_host_profile;
 use hip_bridge::HipRuntime;
+use hipfire_evidence::HostProfile;
 use rdna_compute::KernelCompiler;
 use serde::{Deserialize, Serialize};
 use std::ffi::c_void;

@@ -34,6 +34,7 @@ use hipfire_evidence::{
     RunMetadataModels, RunProvenance, OBSERVED_ADMISSION_EVIDENCE_KINDS,
     STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
+pub use hipfire_evidence::{EvalStatus, HostProfile, SourcedField};
 use hipfire_model::{
     discover_dflash_draft_for_model, model_artifact_stem, model_hash, model_manifest_entry,
     ModelManifestEntry,
@@ -399,38 +400,6 @@ pub struct EvalConfig {
     pub fail_on_admission: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HostProfile {
-    pub schema: u32,
-    pub source: String,
-    pub probe_status: EvalStatus,
-    pub reason: Option<String>,
-    pub hardware_kind: String,
-    pub hardware_bucket: String,
-    pub host_profile_hash: String,
-    pub gpu_model: Option<String>,
-    pub gfx: Option<String>,
-    pub vendor_id: Option<String>,
-    pub device_id: Option<String>,
-    pub render_node: Option<String>,
-    pub cu_count: Option<u32>,
-    pub vram_bytes: Option<u64>,
-    pub gtt_bytes: Option<u64>,
-    pub system_memory_bytes: Option<u64>,
-    pub memory_class: SourcedField<String>,
-    pub memory_width_bits: SourcedField<u32>,
-    pub memory_clock_mhz: SourcedField<f64>,
-    pub peak_bandwidth_gbps: SourcedField<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SourcedField<T> {
-    pub value: Option<T>,
-    pub source: String,
-    pub confidence: String,
-    pub note: Option<String>,
-}
-
 #[derive(Debug, Clone, Default)]
 struct HostProfileOverrides {
     memory_class: Option<String>,
@@ -594,20 +563,8 @@ pub struct AdmissionFinding {
     pub relative_delta: Option<f64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EvalStatus {
-    Pass,
-    Fail,
-    Skip,
-}
-
 fn eval_status_str(status: EvalStatus) -> &'static str {
-    match status {
-        EvalStatus::Pass => "pass",
-        EvalStatus::Fail => "fail",
-        EvalStatus::Skip => "skip",
-    }
+    status.as_str()
 }
 
 pub fn parse_args_from<I, S>(args: I) -> Result<EvalConfig, String>
@@ -2009,53 +1966,6 @@ fn collect_host_profile(arch: Option<String>, overrides: HostProfileOverrides) -
     };
     profile.host_profile_hash = host_profile_hash(&profile);
     profile
-}
-
-impl<T> SourcedField<T> {
-    fn unknown() -> Self {
-        Self {
-            value: None,
-            source: "unavailable".to_string(),
-            confidence: "unknown".to_string(),
-            note: None,
-        }
-    }
-
-    fn override_value(value: T) -> Self {
-        Self {
-            value: Some(value),
-            source: "cli_override".to_string(),
-            confidence: "operator_supplied".to_string(),
-            note: None,
-        }
-    }
-
-    fn sysfs_value(value: T) -> Self {
-        Self {
-            value: Some(value),
-            source: "linux_sysfs".to_string(),
-            confidence: "medium".to_string(),
-            note: None,
-        }
-    }
-
-    fn libdrm_value(value: T) -> Self {
-        Self {
-            value: Some(value),
-            source: "libdrm_amdgpu".to_string(),
-            confidence: "high".to_string(),
-            note: None,
-        }
-    }
-
-    fn computed_value(value: T) -> Self {
-        Self {
-            value: Some(value),
-            source: "computed".to_string(),
-            confidence: "medium".to_string(),
-            note: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

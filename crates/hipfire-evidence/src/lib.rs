@@ -260,6 +260,103 @@ pub struct EvidenceArtifactIndexContext {
     pub hardware_bucket: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EvalStatus {
+    Pass,
+    Fail,
+    Skip,
+}
+
+impl EvalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EvalStatus::Pass => "pass",
+            EvalStatus::Fail => "fail",
+            EvalStatus::Skip => "skip",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HostProfile {
+    pub schema: u32,
+    pub source: String,
+    pub probe_status: EvalStatus,
+    pub reason: Option<String>,
+    pub hardware_kind: String,
+    pub hardware_bucket: String,
+    pub host_profile_hash: String,
+    pub gpu_model: Option<String>,
+    pub gfx: Option<String>,
+    pub vendor_id: Option<String>,
+    pub device_id: Option<String>,
+    pub render_node: Option<String>,
+    pub cu_count: Option<u32>,
+    pub vram_bytes: Option<u64>,
+    pub gtt_bytes: Option<u64>,
+    pub system_memory_bytes: Option<u64>,
+    pub memory_class: SourcedField<String>,
+    pub memory_width_bits: SourcedField<u32>,
+    pub memory_clock_mhz: SourcedField<f64>,
+    pub peak_bandwidth_gbps: SourcedField<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourcedField<T> {
+    pub value: Option<T>,
+    pub source: String,
+    pub confidence: String,
+    pub note: Option<String>,
+}
+
+impl<T> SourcedField<T> {
+    pub fn unknown() -> Self {
+        Self {
+            value: None,
+            source: "unavailable".to_string(),
+            confidence: "unknown".to_string(),
+            note: None,
+        }
+    }
+
+    pub fn override_value(value: T) -> Self {
+        Self {
+            value: Some(value),
+            source: "cli_override".to_string(),
+            confidence: "operator_supplied".to_string(),
+            note: None,
+        }
+    }
+
+    pub fn libdrm_value(value: T) -> Self {
+        Self {
+            value: Some(value),
+            source: "libdrm_amdgpu".to_string(),
+            confidence: "high".to_string(),
+            note: None,
+        }
+    }
+
+    pub fn sysfs_value(value: T) -> Self {
+        Self {
+            value: Some(value),
+            source: "linux_sysfs".to_string(),
+            confidence: "medium".to_string(),
+            note: None,
+        }
+    }
+
+    pub fn computed_value(value: T) -> Self {
+        Self {
+            value: Some(value),
+            source: "computed".to_string(),
+            confidence: "medium".to_string(),
+            note: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunMetadataConfig {
     pub tier: String,
