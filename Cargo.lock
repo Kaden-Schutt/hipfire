@@ -273,6 +273,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-coherence"
+version = "0.2.1"
+dependencies = [
+ "hipfire-detect",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-detect"
 version = "0.2.1"
 dependencies = [
@@ -343,6 +351,7 @@ dependencies = [
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
  "hipfire-atlas",
+ "hipfire-coherence",
  "hipfire-detect",
  "hipfire-dispatch",
  "hipfire-evidence",

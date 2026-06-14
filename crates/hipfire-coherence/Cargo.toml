@@ -1,0 +1,10 @@
+[package]
+name = "hipfire-coherence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Coherence detector orchestration helpers for hipfire"
+
+[dependencies]
+hipfire-detect = { path = "../hipfire-detect" }
+serde_json = "1"
