@@ -6416,6 +6416,8 @@ fn run_examples_qwen35_speed_case(
         model.clone(),
         "--prefill".to_string(),
         case.prefill.to_string(),
+        "--prefill-runs".to_string(),
+        "2".to_string(),
         "--warmup".to_string(),
         "5".to_string(),
         "--gen".to_string(),

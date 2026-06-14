@@ -87,3 +87,5 @@ Status: deferred.
 
 
 ## hipfire-eval is still loading model multiple times rather than reseting state between tests.
+
+## further investigate using packed 4 bit operations on gfx1151/RDNA3/RDNA3.5
