@@ -522,6 +522,80 @@
     records `rollback_hidden_boundary_compare.first_mismatch.family="attn_residual"` at LA index 0, position 59 (`max_abs=3.70693207e-3`,
     `mean_abs=2.62928981e-4`). That narrows the downstream `x_in[1]` blocker to the LA0 output-projection/residual path after the qkv/GDN input
     drift, not to the following layer's rmsnorm/rotation alone.
+    A follow-up diagnostic now emits `rollback_wo_delta_compare`, comparing `(attn_residual - wo_residual_in)` between serial-source and
+    verify-captured tapes so the report separates residual-base drift from the LA `wo` projection delta. Fresh default validation after dropping
+    the unproven serial-frame remap experiment, `/tmp/coherence-dflash-20260614-040317.md` plus
+    `/tmp/coherence-dflash-20260614-040317.dflash_trace.json`, passed strict prose/code AR parity with production rollback still conservative
+    (`replay_gdn_tape=0`, `replay_serial_tape=92/4`, `replay_full_prefill=0`). The first default
+    hidden-boundary split is still LA0 `attn_out` (prose position 59 `max_abs=1.05993748e-2`, code position 123 `max_abs=2.81143188e-2`), and
+    the new projection-delta probe also mismatches downstream (`wo_projection_delta`, prose position 59 `max_abs=3.62593681e-3`, code position
+    123 `max_abs=2.26917267e-2`). A matched `HIPFIRE_Q8_GDN_VERIFY_PER_TOKEN=1` A/B
+    `/tmp/coherence-dflash-20260614-034839.md` failed prose AR parity at token 62 (`57874` vs `6511`) while still reporting `attn_out` and
+    `wo_projection_delta` mismatches, so per-token verify GDN remains diagnostic-only and is not a production promotion path.
+    Forcing the serial/per-token prefill comparison path without enabling serial-tape rollback,
+    `/tmp/coherence-dflash-20260614-040905.md` plus `/tmp/coherence-dflash-20260614-040905.dflash_trace.json`, kept the conservative
+    full-prefill/verify-complete safety route AR-clean but still rejected fast replay. Prose `rollback_prefill_compare` checked 92 rows with only
+    32 matches and first split at `s_matrix[0]` position 59 (`replay_steps=2`); code checked four rows, all mismatching, first at `s_matrix[0]`
+    position 123 (`replay_steps=6`). That rules out the current `forward_prefill_batch_force_q8_gdn_per_token` wrapper as a promotion path by
+    itself: it does not make verify-derived tape state serial-equivalent.
+    The default graph-on validation after adding frame-order context,
+    `/tmp/coherence-dflash-20260614-042658.md` plus `/tmp/coherence-dflash-20260614-042658.dflash_trace.json`, still passes strict prose/code AR
+    parity through the conservative serial-source tape fallback (`replay_gdn_tape=0`, `replay_serial_tape=92/4`, `replay_full_prefill=0`;
+    verify graph prose `direct=0 warmup=5 capture=5 replay=82`, code `direct=0 warmup=1 capture=1 replay=3`). Fast GDN-tape replay remains
+    rejected, and the first LA0 `attn_out` split now carries the frame-order signature `serial_frame=144 layer_major_frame=97 frame_delta=-47`
+    at both prose position 59 and code position 123; the `wo_projection_delta` split now carries the same frame-order signature at prose position
+    59 and code position 123. That points the next fix at token-major-equivalent verify capture or an exact deterministic frame policy for the
+    whole downstream tape chain, not at replacing the conservative fallback.
+    A diagnostic `HIPFIRE_Q8_GDN_VERIFY_SERIAL_FRAMES=1` A/B tested that frame-policy hypothesis by pairing per-token Q8 verify GDN with
+    serial token-major stochastic frame ids while forcing live fast replay
+    (`HIPFIRE_DFLASH_ROLLBACK_SERIAL_TAPE=0 HIPFIRE_DFLASH_ROLLBACK_SERIAL_REPLAY=0`). The gate report
+    `/tmp/coherence-dflash-20260614-042416.md` plus `/tmp/coherence-dflash-20260614-042416.dflash_trace.json` failed as expected rather than
+    promoting the path: prose used `replay_gdn_tape=85` with no serial/full-prefill fallback, but failed AR parity at token 93 (`11770` vs
+    `1599`) and remained hard-error rejected as `fast_gdn_tape_replay_is_diagnostic_only`; code used `replay_gdn_tape=4` plus one
+    verify-complete rollback and stayed AR-clean, but was still hard-error rejected for the same diagnostic-only reason. Admission still reports
+    `fast_replay_recurrent_state_mismatch` plus `rollback_input_mismatch`, with prose first state split at `s_matrix[0]` position 59
+    (`replay_steps=2`) and code first state split at `s_matrix[0]` position 123 (`replay_steps=6`). The serial-frame policy alone is therefore
+    not the missing production fix; verify capture still needs serial-equivalent downstream tape content or a stronger whole-chain admission proof.
+    A follow-up capture audit filled the DeltaNetMoe batched tape's downstream boundary rows (`attn_out`, `normed`, `wo_input`,
+    `wo_residual_in`, `attn_residual`, and `ffn_input`) to mirror the dense DeltaNet tape capture. The forced fast-replay diagnostic
+    `/tmp/coherence-dflash-20260614-043329.md` plus `/tmp/coherence-dflash-20260614-043329.dflash_trace.json` still rejected fast GDN replay:
+    prose used `replay_gdn_tape=85` and failed AR parity at token 93 (`11770` vs `1599`), while code used `replay_gdn_tape=4` plus one
+    verify-complete rollback and stayed AR-clean but remained hard-error diagnostic-only. The unchanged blockers show this model path is not missing
+    only MoE boundary captures; the first replay mismatch is still LA0 `attn_out`, followed by recurrent `s_matrix` drift.
+    `HIPFIRE_DFLASH_ROLLBACK_PREFIX_VERIFY=1` was also retested with serial rollback disabled in
+    `/tmp/coherence-dflash-20260614-043637.md` plus `/tmp/coherence-dflash-20260614-043637.dflash_trace.json`. Prefix-verify rollback was internally
+    coherent (`rollback_replay.ok=true`, prose `replay_prefix_verify=31`, code `replay_prefix_verify=4`) but failed prose AR parity at token 9
+    (`4777` vs `2166`), so committed-prefix recapture is not a production replacement for the conservative serial-source tape path.
+    A second default-off diagnostic now records the Q8 stochastic requant frame base on verify-captured tapes and lets
+    `HIPFIRE_DFLASH_ROLLBACK_VERIFY_FRAMES=1` replay that tape against the same frame base while restoring the global frame counter afterward. The A/B
+    `/tmp/coherence-dflash-20260614-044050.md` plus `/tmp/coherence-dflash-20260614-044050.dflash_trace.json` still rejected fast replay
+    (prose AR mismatch at token 31, code AR-clean but diagnostic-only), with `fast_replay_recurrent_state_mismatch` and `rollback_input_mismatch`
+    unchanged. Reusing verify frames alone is therefore not sufficient; the accepted fix still needs a serial-equivalent downstream tape/state chain
+    or a separately proven admission rule.
+    Fresh default graph-on validation after these diagnostics,
+    `/tmp/coherence-dflash-20260614-044305.md` plus `/tmp/coherence-dflash-20260614-044305.dflash_trace.json`, passed strict prose/code AR parity
+    with conservative rollback intact (`replay_gdn_tape=0`, `replay_serial_tape=92/4`, `replay_full_prefill=0`; verify graph prose
+    `direct=0 warmup=5 capture=5 replay=82`, code `direct=0 warmup=1 capture=1 replay=3`). Fast replay admission remains rejected on the same
+    LA0 `attn_out` and recurrent-state blockers, so production defaults stay serial-source tape rollback.
+    The direct/no-graph control was then repeated with per-token verify GDN, serial frame ids, and verify-frame replay enabled:
+    `/tmp/coherence-dflash-20260614-045623.md` plus `/tmp/coherence-dflash-20260614-045623.dflash_trace.json` still hard-failed as diagnostic-only
+    (`verify_graph.direct=88/5`) and rejected fast replay. Prose failed AR parity at token 62 (`57874` vs `6511`), code stayed AR-clean, and both
+    rows retained `fast_replay_recurrent_state_mismatch` plus `rollback_input_mismatch`. The new LA0-only prefix-state diagnostic reports
+    `prefix-la0-serial.ok=true`, while the global one-token prefix compare still mismatches at `s_matrix[3]` and the later full replay still
+    mismatches LA0 `attn_out`/`s_matrix[0]`. That rules out graph capture, frame restoration, and LA0 row-0 state as sufficient explanations for
+    the remaining fast-verify-tape drift; the fast path remains rejected until downstream tape rows or final recurrent/logit parity are proven
+    separately. Layer-major-frame replay was then tested directly in
+    `/tmp/coherence-dflash-20260614-050954.md` and failed at the same `attn_out` boundary as natural token-major replay while diverging differently
+    from serial recurrent state, so frame ordering alone is not the missing fix. The gate now also admits the serial-source GDN replay path
+    separately from raw verify-tape replay: `/tmp/coherence-dflash-20260614-051620.md` passed strict graph-on prose/code AR parity with
+    `rollback_serial_tape_admission.verdict=admitted` (prose 92/92 state rows and 92/92 `attn_out` rows matched; code 4/4 and 4/4 matched) while
+    keeping `rollback_fast_replay_admission.verdict=rejected` for the verify-derived tape. Production therefore has an admitted GDN replay path
+    sourced from serial-equivalent captures plus the existing serial fallback/opt-out, without promoting the unsafe verify-derived tape.
+    serial-equivalent.
+    A same-worktree default recheck, `/tmp/coherence-dflash-20260614-045913.md` plus
+    `/tmp/coherence-dflash-20260614-045913.dflash_trace.json`, passed strict prose/code AR parity after the new parser field was added:
+    graph verify stayed active (`direct=0`, prose `warmup=5 capture=5 replay=82`, code `warmup=1 capture=1 replay=3`), live rollback stayed
+    conservative (`replay_gdn_tape=0`, `replay_serial_tape=92/4`), and fast replay admission stayed rejected on recurrent-state and input blockers.
     The Path C verify-graph A/B smoke now emits machine-readable graph-vs-nograph tok/s and tau deltas in its report instead of requiring manual
     extraction from paired rows. Current gfx1151 evidence (2026-06-13) with
     `TARGET=$HOME/.hipfire/models/qwen3.6-27b-mq4.hfq DRAFT=$HOME/.hipfire/drafts/qwen3.6-27b-mq4.dflash.hfq
@@ -692,6 +766,14 @@
     `dflash_rollback_compare_is_opt_in_diagnostic`, `dflash_rollback_logit_compare_steps_default_and_cap`). The GPU AR-parity gate
     `HIPFIRE_DFLASH_AR_PARITY=1 ./tests/coherence-gate-dflash.sh --fast` now hard-fails if fast GDN-tape replay is used or if direct/no-graph
     DFlash verify appears in an AR-parity row.
+    2026-06-14 diagnostic update: `HIPFIRE_DFLASH_AR_PARITY=1 HIPFIRE_DFLASH_ROLLBACK_COMPARE=1 ./tests/coherence-gate-dflash.sh --fast`
+    passed hard graph-on AR parity at `/tmp/coherence-dflash-20260614-050954.md` with verify graph replay active (prose direct=0/warmup=5/capture=5/replay=82,
+    code direct=0/warmup=1/capture=1/replay=3) and conservative serial-source rollback still in use. The added layer-major-frame replay A/B
+    produced structured `layer-major-frame-*` rows, but it failed at the same `attn_out` boundary as natural token-major replay and also diverged
+    from serial recurrent state, so frame ordering alone is not a sufficient fix. Fast GDN replay remains rejected by recurrent-state and rollback-input
+    blockers; keep the serial fallback as the production default. A follow-up gate at `/tmp/coherence-dflash-20260614-051620.md` adds a separate
+    `rollback_serial_tape_admission` surface and admits the serial-source GDN replay path for both prompts while leaving raw verify-tape replay
+    rejected.
 
   - Add backend module contract tests:
       - dense FFN/SwiGLU/down contract shape and statelessness,
