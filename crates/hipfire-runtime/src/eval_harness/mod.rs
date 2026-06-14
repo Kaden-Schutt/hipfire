@@ -20,7 +20,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
-    directory_hash, evidence_artifact_index_entry_from_value_json,
+    admission_metric_is_quality, directory_hash, evidence_artifact_index_entry_from_value_json,
     evidence_artifact_index_entry_json, evidence_metric_direction, evidence_record_json,
     extract_external_evidence_records_json, file_hash, list_files, model_hash, read_hfq_metadata,
     run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
@@ -4531,7 +4531,7 @@ fn collect_admission_findings(
         if delta.direction != "regressed" {
             continue;
         }
-        let severity = if admission_metric_is_quality(case.battery, metric) {
+        let severity = if admission_metric_is_quality(case.battery.as_str(), metric) {
             "reject"
         } else {
             "review"
@@ -4549,14 +4549,6 @@ fn collect_admission_findings(
             relative_delta: delta.relative_delta,
         });
     }
-}
-
-fn admission_metric_is_quality(battery: BatteryId, metric: &str) -> bool {
-    matches!(battery, BatteryId::Quality | BatteryId::Barrage)
-        || matches!(
-            metric,
-            "mean_kld" | "p99_kld" | "ppl" | "nll" | "accuracy" | "exact_match"
-        )
 }
 
 fn mock_battery_rows(

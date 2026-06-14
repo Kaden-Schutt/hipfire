@@ -375,6 +375,14 @@ pub fn evidence_metric_direction(metric: &str, delta: f64) -> String {
     }
 }
 
+pub fn admission_metric_is_quality(battery: &str, metric: &str) -> bool {
+    matches!(battery, "quality" | "barrage")
+        || matches!(
+            metric,
+            "mean_kld" | "p99_kld" | "ppl" | "nll" | "accuracy" | "exact_match"
+        )
+}
+
 pub fn extract_external_evidence_records_json(
     kind: &str,
     path: &Path,
@@ -798,6 +806,18 @@ mod tests {
         );
         assert_eq!(evidence_metric_direction("custom_metric", 1.0), "changed");
         assert_eq!(evidence_metric_direction("custom_metric", 0.0), "unchanged");
+    }
+
+    #[test]
+    fn admission_metric_quality_policy_classifies_reject_metrics() {
+        assert!(admission_metric_is_quality("quality", "tok_s"));
+        assert!(admission_metric_is_quality("barrage", "latency_ms"));
+        assert!(admission_metric_is_quality("speed", "mean_kld"));
+        assert!(admission_metric_is_quality("dflash", "accuracy"));
+        assert!(admission_metric_is_quality("coherence", "exact_match"));
+        assert!(!admission_metric_is_quality("speed", "tok_s"));
+        assert!(!admission_metric_is_quality("dflash", "accept_rate"));
+        assert!(!admission_metric_is_quality("coherence", "hard_fails"));
     }
 
     #[test]
