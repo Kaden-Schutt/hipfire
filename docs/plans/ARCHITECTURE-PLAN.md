@@ -78,8 +78,8 @@ Current evidence boundary status:
 - `hipfire-runtime::eval_harness` still owns eval execution and artifact writing, but now consumes the shared evidence provenance helpers and artifact catalog.
 
 Current coherence boundary status:
-- `hipfire-coherence` owns detector profile selection, detector-bank construction, agentic prompt detection, and report row serialization.
-- `hipfire-runtime::coherence_runtime` still owns daemon orchestration, prompt execution, token event capture, and artifact assembly.
+- `hipfire-coherence` owns detector profile selection, detector-bank construction, agentic prompt detection, coherence run input/output contracts, report row serialization, and coherence artifact serialization.
+- `hipfire-runtime::coherence_runtime` still owns daemon orchestration, prompt execution, and token event capture.
 
 ## 3) Execution sequence
 

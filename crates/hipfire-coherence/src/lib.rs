@@ -43,6 +43,68 @@ impl DetectorProfile {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CoherenceRunConfig {
+    pub model: String,
+    pub prompt: String,
+    pub prompt_label: String,
+    pub system: Option<String>,
+    pub tools: Option<Value>,
+    pub assistant_prefix: Option<String>,
+    pub force_jinja_chat: bool,
+    pub max_tokens: usize,
+    pub temperature: f64,
+    pub repeat_penalty: Option<f64>,
+    pub repeat_window: Option<usize>,
+    pub max_seq: usize,
+    pub state: Option<String>,
+    pub profile: DetectorProfile,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoherenceRunOutput {
+    pub report: Report,
+    pub generated_text: String,
+    pub token_ids: Vec<u32>,
+    pub max_seq: usize,
+    pub max_tokens: usize,
+    pub temperature: f64,
+    pub repeat_penalty: Option<f64>,
+    pub repeat_window: Option<usize>,
+    pub state: Option<String>,
+    pub tools_present: bool,
+    pub force_jinja_chat: bool,
+}
+
+impl CoherenceRunOutput {
+    pub fn hard_fails(&self) -> usize {
+        self.report.hard_fails
+    }
+
+    pub fn soft_warns(&self) -> usize {
+        self.report.soft_warns
+    }
+
+    pub fn artifact_value(&self) -> Value {
+        json!({
+            "schema": 1,
+            "kind": "coherence",
+            "status": if self.hard_fails() > 0 { "fail" } else { "collected" },
+            "report": self.report,
+            "generated_text": self.generated_text,
+            "token_ids": self.token_ids,
+            "state": self.state,
+            "tools_present": self.tools_present,
+            "force_jinja_chat": self.force_jinja_chat,
+            "max_seq": self.max_seq,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "repeat_penalty": self.repeat_penalty,
+            "repeat_window": self.repeat_window,
+        })
+    }
+}
+
 pub fn build_detector_bank(profile: &DetectorProfile) -> DetectorBank {
     let mut bank = DetectorBank::new();
     bank.add(Box::new(AttractorFirst128::new()));
@@ -171,5 +233,37 @@ mod tests {
                 json!({"detector": "hard", "status": "fail", "detail": "loop detected"}),
             ]
         );
+    }
+
+    #[test]
+    fn run_output_artifact_value_matches_runtime_schema() {
+        let output = CoherenceRunOutput {
+            report: Report::new(header(), vec![("clean", Verdict::Ok)]),
+            generated_text: "Paris".to_string(),
+            token_ids: vec![100, 200],
+            max_seq: 4096,
+            max_tokens: 32,
+            temperature: 0.0,
+            repeat_penalty: Some(1.05),
+            repeat_window: Some(128),
+            state: Some("mq4".to_string()),
+            tools_present: true,
+            force_jinja_chat: false,
+        };
+
+        let artifact = output.artifact_value();
+        assert_eq!(artifact["schema"], json!(1));
+        assert_eq!(artifact["kind"], json!("coherence"));
+        assert_eq!(artifact["status"], json!("collected"));
+        assert_eq!(artifact["generated_text"], json!("Paris"));
+        assert_eq!(artifact["token_ids"], json!([100, 200]));
+        assert_eq!(artifact["state"], json!("mq4"));
+        assert_eq!(artifact["tools_present"], json!(true));
+        assert_eq!(artifact["force_jinja_chat"], json!(false));
+        assert_eq!(artifact["max_seq"], json!(4096));
+        assert_eq!(artifact["max_tokens"], json!(32));
+        assert_eq!(artifact["temperature"], json!(0.0));
+        assert_eq!(artifact["repeat_penalty"], json!(1.05));
+        assert_eq!(artifact["repeat_window"], json!(128));
     }
 }

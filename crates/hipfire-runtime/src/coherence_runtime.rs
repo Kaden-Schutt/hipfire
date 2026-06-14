@@ -8,7 +8,10 @@
 //! evidence should see the same prompt framing, EosFilter behavior, token-id
 //! emission, runtime config, and unload lifecycle that users exercise.
 
-pub use hipfire_coherence::{build_detector_bank, decide_agentic, detector_rows, DetectorProfile};
+pub use hipfire_coherence::{
+    build_detector_bank, decide_agentic, detector_rows, CoherenceRunConfig, CoherenceRunOutput,
+    DetectorProfile,
+};
 use hipfire_detect::{
     report::{prompt_md5, Report, ReportHeader},
     DetectorBank, Event,
@@ -18,68 +21,6 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
-
-#[derive(Debug, Clone)]
-pub struct CoherenceRunConfig {
-    pub model: String,
-    pub prompt: String,
-    pub prompt_label: String,
-    pub system: Option<String>,
-    pub tools: Option<Value>,
-    pub assistant_prefix: Option<String>,
-    pub force_jinja_chat: bool,
-    pub max_tokens: usize,
-    pub temperature: f64,
-    pub repeat_penalty: Option<f64>,
-    pub repeat_window: Option<usize>,
-    pub max_seq: usize,
-    pub state: Option<String>,
-    pub profile: DetectorProfile,
-}
-
-#[derive(Debug, Clone)]
-pub struct CoherenceRunOutput {
-    pub report: Report,
-    pub generated_text: String,
-    pub token_ids: Vec<u32>,
-    pub max_seq: usize,
-    pub max_tokens: usize,
-    pub temperature: f64,
-    pub repeat_penalty: Option<f64>,
-    pub repeat_window: Option<usize>,
-    pub state: Option<String>,
-    pub tools_present: bool,
-    pub force_jinja_chat: bool,
-}
-
-impl CoherenceRunOutput {
-    pub fn hard_fails(&self) -> usize {
-        self.report.hard_fails
-    }
-
-    pub fn soft_warns(&self) -> usize {
-        self.report.soft_warns
-    }
-
-    pub fn artifact_value(&self) -> Value {
-        json!({
-            "schema": 1,
-            "kind": "coherence",
-            "status": if self.hard_fails() > 0 { "fail" } else { "collected" },
-            "report": self.report,
-            "generated_text": self.generated_text,
-            "token_ids": self.token_ids,
-            "state": self.state,
-            "tools_present": self.tools_present,
-            "force_jinja_chat": self.force_jinja_chat,
-            "max_seq": self.max_seq,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "repeat_penalty": self.repeat_penalty,
-            "repeat_window": self.repeat_window,
-        })
-    }
-}
 
 #[derive(Debug, Default)]
 struct DoneStats {
