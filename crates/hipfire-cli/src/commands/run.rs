@@ -52,6 +52,7 @@ pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
     let gen_req = GenerateRequest {
         id: Uuid::new_v4().to_string(),
         prompt,
+        messages: None,
         temperature: args.temperature.unwrap_or(config.temperature),
         max_tokens: args.max_tokens.unwrap_or(config.max_tokens),
         top_p: Some(config.top_p),

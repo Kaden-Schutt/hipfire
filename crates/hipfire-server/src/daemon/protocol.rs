@@ -43,6 +43,8 @@ pub struct LoadParams {
 pub struct GenerateRequest {
     pub id: String,
     pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<hipfire_prompt::Message>>,
     pub temperature: f64,
     pub max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
