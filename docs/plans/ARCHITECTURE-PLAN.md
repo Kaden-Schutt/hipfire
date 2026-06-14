@@ -36,7 +36,7 @@ Current prompt boundary status:
 
 Current model boundary status:
 - `hipfire-model` owns `ModelSource`, `TensorInfo`, `QuantConfig`, model artifact format detection, role-sidecar filtering, display-name derivation, and quant preference ranking.
-- `hipfire-model` owns common model-load request/parameter contracts used by daemon protocol clients and future direct library adapters.
+- `hipfire-model` owns common model-load request/parameter and loaded-response contracts used by daemon protocol clients and future direct library adapters.
 - `hipfire-runtime::model_source` remains a compatibility facade and still owns concrete HFQ/safetensors openers until those loaders move.
 
 Current state boundary status:
@@ -62,12 +62,12 @@ Current ROCm/backend boundary status:
 - Qwen3.5 dense FFN trace output records shared ROCm evidence for the existing `weight_gemv_swiglu_residual` path without moving HIP dispatch or kernel code.
 
 Current daemon protocol boundary status:
-- `hipfire-daemon-protocol` owns typed daemon JSONL request/response structs, including load/generate request envelopes and token/done/error responses.
+- `hipfire-daemon-protocol` owns typed daemon JSONL request/response envelopes while model load request/loaded-response and generate token/done/error payloads live in shared boundary crates.
 - `hipfire-server::daemon::protocol` remains a compatibility re-export so server callers keep their current paths while the wire JSON stays unchanged.
 - `hipfire-daemon` consumes the shared generate request contract opportunistically for common generate fields while preserving raw-JSON fallbacks for legacy/daemon-only fields.
 - `hipfire-daemon` also consumes generate-owned batch prefill/preflight/decode contracts, validators, prefix-hash helpers, selector policy, scratch sizing policy, scheduler metadata, and state-owned prefix-hash/checkpoint metadata so daemon-local duplicate batch structs, hash helpers, validation helpers, checkpoint request structs, and Qwen3.5 batch policy helpers are retired.
 - `hipfire-daemon` also consumes the shared load request contract for common load fields (`model`, `max_seq`, `physical_cap`, `dflash_mode`, `draft`, `kv_cache`, `cask_sidecar`) while preserving raw-JSON fallbacks for legacy/daemon-only load fields.
-- `hipfire-daemon-protocol` re-exports the model-owned load request/params so protocol callers keep stable paths while load contract ownership moves into `hipfire-model`.
+- `hipfire-daemon-protocol` re-exports the model-owned load request/params and loaded response so protocol callers keep stable paths while load contract ownership moves into `hipfire-model`.
 
 Current daemon adapter boundary status:
 - `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery, load/ping/unload/generate response loops, and stale-response filtering.
