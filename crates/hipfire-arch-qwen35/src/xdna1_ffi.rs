@@ -253,7 +253,12 @@ pub fn get_lib() -> Option<&'static Xdna1Lib> {
     LIB.get_or_init(|| {
         let path = std::env::var("HIPFIRE_XDNA1_LIB")
             .unwrap_or_else(|_| "target/npu/libhipfire_xdna1.so".to_string());
-        Xdna1Lib::load_from(&path)
+        let result = Xdna1Lib::load_from(&path);
+        match &result {
+            Ok(_) => eprintln!("  [xdna1] loaded: {path}"),
+            Err(e) => eprintln!("  [xdna1] not available: {e}"),
+        }
+        result
     })
     .as_ref()
     .ok()
@@ -302,6 +307,7 @@ pub fn swiglu_handle_for(
         );
         return None;
     }
+    eprintln!("  [xdna1] swiglu loaded: layer={layer_idx} hidden_size={hidden_size}");
     map.insert(layer_idx, RawHandle(handle));
     Some(handle)
 }
@@ -379,6 +385,7 @@ pub fn rmsnorm_handle_for(
         );
         return None;
     }
+    eprintln!("  [xdna1] rmsnorm loaded: layer={layer_idx} hidden_size={hidden_size}");
     map.insert(layer_idx, RawHandle(handle));
     Some(handle)
 }
@@ -460,6 +467,7 @@ pub fn rope_q_handle_for(
         );
         return None;
     }
+    eprintln!("  [xdna1] rope_q loaded: layer={layer_idx} n_total={n_total}");
     map.insert(layer_idx, RawHandle(handle));
     Some(handle)
 }
@@ -538,6 +546,7 @@ pub fn rope_k_handle_for(
         );
         return None;
     }
+    eprintln!("  [xdna1] rope_k loaded: layer={layer_idx} n_total={n_total}");
     map.insert(layer_idx, RawHandle(handle));
     Some(handle)
 }
@@ -619,6 +628,7 @@ pub fn headnorm_q_handle_for(
         );
         return None;
     }
+    eprintln!("  [xdna1] headnorm_q loaded: layer={layer_idx} n_total={n_total}");
     map.insert(layer_idx, RawHandle(handle));
     Some(handle)
 }
@@ -697,6 +707,7 @@ pub fn headnorm_k_handle_for(
         );
         return None;
     }
+    eprintln!("  [xdna1] headnorm_k loaded: layer={layer_idx} n_total={n_total}");
     map.insert(layer_idx, RawHandle(handle));
     Some(handle)
 }
@@ -778,6 +789,7 @@ pub fn attn_gate_handle_for(
         );
         return None;
     }
+    eprintln!("  [xdna1] attn_gate loaded: layer={layer_idx} q_dim={q_dim}");
     map.insert(layer_idx, RawHandle(handle));
     Some(handle)
 }
@@ -866,6 +878,7 @@ pub fn softmax_handle_for(
         );
         return None;
     }
+    eprintln!("  [xdna1] softmax loaded: layer={layer_idx} ctx_len={ctx_len} n_total={n_total}");
     map.insert(key, RawHandle(handle));
     Some(handle)
 }
@@ -953,6 +966,7 @@ pub fn headnorm_rope_q_handle_for(
         );
         return None;
     }
+    eprintln!("  [xdna1] headnorm_rope_q loaded: layer={layer_idx} n_total={n_total}");
     map.insert(layer_idx, RawHandle(handle));
     Some(handle)
 }
@@ -1042,6 +1056,7 @@ pub fn headnorm_rope_k_handle_for(
         );
         return None;
     }
+    eprintln!("  [xdna1] headnorm_rope_k loaded: layer={layer_idx} n_total={n_total}");
     map.insert(layer_idx, RawHandle(handle));
     Some(handle)
 }
