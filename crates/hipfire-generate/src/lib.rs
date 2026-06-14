@@ -786,6 +786,50 @@ impl Qwen35PrefillBatchBackend {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen35PrefillSessionResult {
+    pub id: String,
+    pub prefill_tokens: usize,
+    pub logical_position: usize,
+    pub cached_prefix_tokens: usize,
+    pub prefix_hash: GenerateBatchPrefillPrefixHash,
+    pub debug_sample_token: Option<u32>,
+    pub boundary_checkpoints: Vec<Qwen35SemanticBoundaryCheckpoint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen35PrefillBatchResult {
+    pub mode: &'static str,
+    pub plan: GenerateBatchPrefillPlan,
+    pub backend: Qwen35PrefillBatchBackend,
+    pub total_prefill_tokens: usize,
+    pub sessions: Vec<Qwen35PrefillSessionResult>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Qwen35FusedDensePrefillInputKind {
+    FullPrompt,
+    GeneratedSuffixReplay,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen35FusedDensePrefillSessionSpec<'a> {
+    pub id: &'a str,
+    pub tokens: &'a [u32],
+    pub cached_prefix_tokens: usize,
+    pub replay_as_generated_suffix: bool,
+    pub state_kinds: &'a [String],
+    pub assistant_prefix: &'a str,
+    pub max_think_tokens: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen35FusedDensePrefillBatchContract<'a> {
+    pub input_kind: Qwen35FusedDensePrefillInputKind,
+    pub total_tokens: usize,
+    pub sessions: Vec<Qwen35FusedDensePrefillSessionSpec<'a>>,
+}
+
 pub fn select_qwen35_prefill_batch_backend(
     plan: GenerateBatchPrefillPlan,
     requested: Option<&str>,

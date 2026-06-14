@@ -49,8 +49,10 @@ use hipfire_generate::{
     validate_prefix_hash_preflight, GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession,
     GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan, GenerateBatchPrefillPrefixHash,
     GenerateBatchPrefillSession, PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope,
-    Qwen35DecodeBatchBackend, Qwen35PrefillBatchBackend, Qwen35PrefillCheckpointHook,
-    Qwen35PrefillCheckpointKind, Qwen35SemanticBoundaryCheckpoint,
+    Qwen35DecodeBatchBackend, Qwen35FusedDensePrefillBatchContract,
+    Qwen35FusedDensePrefillInputKind, Qwen35FusedDensePrefillSessionSpec,
+    Qwen35PrefillBatchBackend, Qwen35PrefillBatchResult, Qwen35PrefillCheckpointHook,
+    Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult, Qwen35SemanticBoundaryCheckpoint,
 };
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -3626,46 +3628,6 @@ struct Qwen35PreparedPrefillSession {
     assistant_prefix: String,
     max_think_tokens: usize,
     boundary_checkpoints: Vec<Qwen35SemanticBoundaryCheckpoint>,
-}
-
-struct Qwen35PrefillSessionResult {
-    id: String,
-    prefill_tokens: usize,
-    logical_position: usize,
-    cached_prefix_tokens: usize,
-    prefix_hash: GenerateBatchPrefillPrefixHash,
-    debug_sample_token: Option<u32>,
-    boundary_checkpoints: Vec<Qwen35SemanticBoundaryCheckpoint>,
-}
-
-struct Qwen35PrefillBatchResult {
-    mode: &'static str,
-    plan: GenerateBatchPrefillPlan,
-    backend: Qwen35PrefillBatchBackend,
-    total_prefill_tokens: usize,
-    sessions: Vec<Qwen35PrefillSessionResult>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Qwen35FusedDensePrefillInputKind {
-    FullPrompt,
-    GeneratedSuffixReplay,
-}
-
-struct Qwen35FusedDensePrefillSessionSpec<'a> {
-    id: &'a str,
-    tokens: &'a [u32],
-    cached_prefix_tokens: usize,
-    replay_as_generated_suffix: bool,
-    state_kinds: &'a [String],
-    assistant_prefix: &'a str,
-    max_think_tokens: usize,
-}
-
-struct Qwen35FusedDensePrefillBatchContract<'a> {
-    input_kind: Qwen35FusedDensePrefillInputKind,
-    total_tokens: usize,
-    sessions: Vec<Qwen35FusedDensePrefillSessionSpec<'a>>,
 }
 
 impl Qwen35RequestSessionState {
