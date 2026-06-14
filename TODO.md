@@ -70,8 +70,8 @@
     scores: 337 NaN, 0 inf }` at 32K NIAH source (`21551` tokens) despite 8K/16K pass.
   - Work to isolate root cause (drafter forward numerical blow-up vs score kernel)
     and add targeted diagnostics in `pflash::compute_scores_batched_gpu`.
-- Keep the historical full-coherence/speed hang trace in `MANUAL_REVIEW.md` as
-  an execution quirk note, and re-run the gate from a clean environment when
+- Keep the historical full-coherence/speed hang trace in the historical docs index
+  as an execution quirk note, and re-run the gate from a clean environment when
   the next session reset is available.
 
 ## FWHT Residual QJL Transform

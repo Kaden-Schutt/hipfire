@@ -20,16 +20,15 @@
 - `AGENTS.md`
 - `AGENTS.local.md`
 - `BUGS.md`
-- `BUGS-GEMINI.md`
 - `CHANGELOG.md`
 - `CLAUDE.md`
 - `CONTRIBUTING.md`
 - `CREDITS.md`
-- `DOCS-GEMINI.md`
-- `MANUAL_REVIEW.md`
 - `PRIOR-ART.md`
 - `README.md`
 - `TODO.md`
+
+This list now excludes `BUGS-GEMINI.md`, `DOCS-GEMINI.md`, and `MANUAL_REVIEW.md`, which have been superseded and removed.
 
 ## Non-archive subtrees
 
