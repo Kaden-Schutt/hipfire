@@ -17,14 +17,12 @@ Tensor param layout (packed_weight_cs, shape [head_dim + n_rot]):
   [head_dim, head_dim+n_rot) = cos/sin buffer (bf16) for the current token
                                layout: [cos_0..cos_{n_rot2-1}, sin_0..sin_{n_rot2-1}]
 
-n_rot is derived inside the kernel as head_dim / 4 (Qwen3.5 partial_rotary_factor=0.25).
-
 Design: _transform_gen (single-core), tile_size=head_dim, one tensor param.
 N_div_n = n_heads (Q) or n_kv_heads (K).
 
 Usage:
     python tools/npu/build_qwen35_headnorm_rope.py \\
-        --n-heads 8 --n-kv-heads 2 --head-dim 256
+        --n-heads 8 --n-kv-heads 2 --head-dim 256 --n-rot 64
 """
 
 import argparse
@@ -94,9 +92,8 @@ def detect_npu() -> str:
 
 
 def build_one(label: str, n_total: int, n_heads_label: int,
-              head_dim: int, out_dir: Path,
+              head_dim: int, n_rot: int, out_dir: Path,
               target_arch: str, device_cls) -> None:
-    n_rot = head_dim // 4   # Qwen3.5 partial_rotary_factor = 0.25
 
     xclbin_name = f"qwen35-headnorm-rope-{label}-{n_heads_label}h{head_dim}d.xclbin"
     instr_name  = f"qwen35-headnorm-rope-{label}-{n_heads_label}h{head_dim}d-instr.bin"
@@ -167,7 +164,7 @@ def build_one(label: str, n_total: int, n_heads_label: int,
     print(f"  instr:  {instr_path.stat().st_size} bytes")
 
 
-def build(n_heads: int, n_kv_heads: int, head_dim: int,
+def build(n_heads: int, n_kv_heads: int, head_dim: int, n_rot: int,
           out_dir: Path, npu: str = "auto") -> None:
     if npu == "auto":
         npu = detect_npu()
@@ -182,8 +179,8 @@ def build(n_heads: int, n_kv_heads: int, head_dim: int,
     out_dir.mkdir(parents=True, exist_ok=True)
     set_current_device(device_cls())
 
-    build_one("q", n_heads    * head_dim, n_heads,    head_dim, out_dir, target_arch, device_cls)
-    build_one("k", n_kv_heads * head_dim, n_kv_heads, head_dim, out_dir, target_arch, device_cls)
+    build_one("q", n_heads    * head_dim, n_heads,    head_dim, n_rot, out_dir, target_arch, device_cls)
+    build_one("k", n_kv_heads * head_dim, n_kv_heads, head_dim, n_rot, out_dir, target_arch, device_cls)
 
     print(f"\n[build_qwen35_headnorm_rope] done")
     print("Set env vars to activate the NPU fused headnorm+rope path:")
@@ -200,10 +197,11 @@ def main() -> None:
     parser.add_argument("--n-heads",    type=int, required=True, help="Number of Q heads")
     parser.add_argument("--n-kv-heads", type=int, required=True, help="Number of KV heads")
     parser.add_argument("--head-dim",   type=int, default=256,   help="Head dimension (default: 256)")
+    parser.add_argument("--n-rot",      type=int, default=64,    help="Number of dims to rotate (default: 64)")
     parser.add_argument("--out-dir",    type=Path, default=Path("target/npu"))
     parser.add_argument("--npu", choices=["auto"] + list(_NPU_DEVICES), default="auto")
     args = parser.parse_args()
-    build(args.n_heads, args.n_kv_heads, args.head_dim, args.out_dir, args.npu)
+    build(args.n_heads, args.n_kv_heads, args.head_dim, args.n_rot, args.out_dir, args.npu)
 
 
 if __name__ == "__main__":
