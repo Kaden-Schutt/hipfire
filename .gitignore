@@ -114,3 +114,5 @@ result-table.md
 # benchmarks/results remain tracked by explicit filename.
 benchmarks/results/eval/
 benchmarks/results/eval-smoke/
+
+flake.lock
