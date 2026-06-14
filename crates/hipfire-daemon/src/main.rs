@@ -884,16 +884,6 @@ fn validate_qwen35_fused_dense_decode_resident_sessions(
         .map_err(|e| format!("qwen35 fused dense decode unsupported resident state: {e}"))
 }
 
-fn parse_assistant_prefix_label(
-    label: Option<&str>,
-) -> hipfire_runtime::prompt_frame::AssistantPrefix {
-    match label.unwrap_or("plain") {
-        "open_think" => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
-        "closed_think" => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
-        _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-    }
-}
-
 fn emit_generate_batch_prefill_ready(
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchPrefillEnvelope,
@@ -4590,7 +4580,8 @@ fn qwen35_materialize_batch_prefill_prompt(
     } else {
         m.seq_pos
     };
-    let assistant_prefix = parse_assistant_prefix_label(Some(&session.assistant_prefix));
+    let assistant_prefix =
+        hipfire_runtime::prompt_frame::AssistantPrefix::from_label(Some(&session.assistant_prefix));
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
     let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
     let system_prompt = session.system_prompt.as_deref();
@@ -8352,15 +8343,9 @@ fn main() {
                 // Controls the ChatML framing after the assistant role header.
                 // Consumed by the text path; VL path does not yet propagate
                 // it (tracked as a follow-up to the post-#169 rebase).
-                let assistant_prefix = match msg
-                    .get("assistant_prefix")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("plain")
-                {
-                    "open_think" => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
-                    "closed_think" => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
-                    _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                };
+                let assistant_prefix = hipfire_runtime::prompt_frame::AssistantPrefix::from_label(
+                    msg.get("assistant_prefix").and_then(|v| v.as_str()),
+                );
 
                 let has_image = image_base64.is_some() || image.is_some();
                 let is_dots_ocr = m.arch_id == 8;

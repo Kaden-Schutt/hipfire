@@ -51,7 +51,7 @@ pub trait PromptTokenizer {
 }
 
 /// Chooses what goes after the assistant role-and-newline opener.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssistantPrefix {
     /// Plain assistant turn opener: `<|im_start|>assistant\n`.
     Plain,
@@ -77,6 +77,24 @@ pub enum AssistantPrefix {
     /// Requires both `<think>` and `</think>` as single special
     /// tokens. Falls back to `Plain` if either is absent.
     ClosedThink,
+}
+
+impl AssistantPrefix {
+    pub fn from_label(label: Option<&str>) -> Self {
+        match label.unwrap_or("plain") {
+            "open_think" => Self::OpenThink,
+            "closed_think" => Self::ClosedThink,
+            _ => Self::Plain,
+        }
+    }
+
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::OpenThink => "open_think",
+            Self::ClosedThink => "closed_think",
+        }
+    }
 }
 
 /// Role of a multi-turn history entry. `User` / `Assistant` are
@@ -1360,6 +1378,28 @@ mod tests {
             via_string, via_tokens,
             "build_with_user_tokens must match build() when tokens align"
         );
+    }
+
+    #[test]
+    fn assistant_prefix_labels_match_daemon_wire_policy() {
+        assert_eq!(AssistantPrefix::from_label(None), AssistantPrefix::Plain);
+        assert_eq!(
+            AssistantPrefix::from_label(Some("plain")),
+            AssistantPrefix::Plain
+        );
+        assert_eq!(
+            AssistantPrefix::from_label(Some("open_think")),
+            AssistantPrefix::OpenThink
+        );
+        assert_eq!(
+            AssistantPrefix::from_label(Some("closed_think")),
+            AssistantPrefix::ClosedThink
+        );
+        assert_eq!(
+            AssistantPrefix::from_label(Some("unknown")),
+            AssistantPrefix::Plain
+        );
+        assert_eq!(AssistantPrefix::ClosedThink.as_label(), "closed_think");
     }
 
     #[test]
