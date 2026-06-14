@@ -72,10 +72,10 @@ use hipfire_state::{
     parse_reserve_session_state_kinds, parse_sequence_state_handle,
     parse_sequence_state_handle_list, parsed_handle_may_target_generic,
     parsed_handle_may_target_loaded_state, sequence_state_page_descriptor_json,
-    DescribedSequenceState, GenericSequenceStateArena, ModelWorkerId, ModelWorkerMemoryView,
-    ModelWorkerRuntimeView, ParsedSequenceStateHandle, SequenceStateArenaBackend,
-    SequenceStateCheckpointRequest, SequenceStateHandle, SequenceStatePageDescriptor,
-    SequenceStatePageKind,
+    DescribedSequenceState, GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId,
+    ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
+    SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStateHandle,
+    SequenceStatePageDescriptor, SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -3558,7 +3558,7 @@ struct LoadedModel {
     // HfqFile mmap to construct a transient ModelSlot without reloading
     // weights. `HfqFile::open` is a cheap mmap operation.
     model_path: String,
-    memory: LoadedModelMemory,
+    memory: ModelArtifactMemory,
     // DFlash speculative decoding state (populated when load supplied a draft).
     dflash: Option<DflashState>,
     // Upstream HF Jinja chat_template, extracted from the HFQ
@@ -3578,12 +3578,6 @@ static QWEN35_STATE_ALLOCATION_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 fn next_qwen35_state_allocation_epoch() -> u64 {
     QWEN35_STATE_ALLOCATION_EPOCH.fetch_add(1, Ordering::Relaxed)
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct LoadedModelMemory {
-    model_file_bytes: usize,
-    model_weight_bytes: usize,
 }
 
 struct Qwen35RequestSessionState {
@@ -4020,8 +4014,8 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
     descriptors
 }
 
-fn hfq_model_memory(path: &str, hfq: &hipfire_runtime::hfq::HfqFile) -> LoadedModelMemory {
-    LoadedModelMemory {
+fn hfq_model_memory(path: &str, hfq: &hipfire_runtime::hfq::HfqFile) -> ModelArtifactMemory {
+    ModelArtifactMemory {
         model_file_bytes: std::fs::metadata(path)
             .map(|metadata| metadata.len() as usize)
             .unwrap_or(0),
@@ -4033,8 +4027,8 @@ fn hfq_model_memory(path: &str, hfq: &hipfire_runtime::hfq::HfqFile) -> LoadedMo
     }
 }
 
-fn unknown_model_memory(path: &str) -> LoadedModelMemory {
-    LoadedModelMemory {
+fn unknown_model_memory(path: &str) -> ModelArtifactMemory {
+    ModelArtifactMemory {
         model_file_bytes: std::fs::metadata(path)
             .map(|metadata| metadata.len() as usize)
             .unwrap_or(0),
@@ -4227,16 +4221,8 @@ fn loaded_model_memory_view(
         .iter()
         .map(|descriptor| descriptor.resident_bytes)
         .sum::<usize>();
-    let runtime_state_bytes = runtime_base_bytes + runtime_session_bytes;
-    ModelWorkerMemoryView {
-        model_file_bytes: m.memory.model_file_bytes,
-        model_weight_bytes: m.memory.model_weight_bytes,
-        runtime_base_bytes,
-        runtime_session_bytes,
-        runtime_state_bytes,
-        total_resident_bytes: m.memory.model_weight_bytes + runtime_state_bytes,
-        evictable_state_bytes: runtime_session_bytes,
-    }
+    m.memory
+        .worker_memory_view(runtime_base_bytes, runtime_session_bytes)
 }
 
 fn loaded_model_worker_id(m: &LoadedModel) -> ModelWorkerId {
