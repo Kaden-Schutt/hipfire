@@ -16,7 +16,7 @@ It is intentionally compact and backed by evidence links into the historical arc
 
 The target crates for modular boundaries remain:
 - `hipfire-daemon`
-- `hipfire-model`
+- `hipfire-model` (created; owns model-source contracts and artifact identity helpers)
 - `hipfire-prompt` (created; owns prompt framing and Jinja rendering)
 - `hipfire-state`
 - `hipfire-generate`
@@ -30,6 +30,10 @@ Current prompt boundary status:
 - `hipfire-prompt` owns `AssistantPrefix`, `Role`, `Message`, `ToolCall`, `ChatFrame`, and `JinjaChatFrame`.
 - `hipfire-runtime::prompt_frame` remains a compatibility re-export and implements the prompt tokenizer trait for the runtime tokenizer.
 - The Rust server forwards structured chat `messages` to the daemon and keeps `prompt` as the last-user-text compatibility fallback, avoiding nested ChatML.
+
+Current model boundary status:
+- `hipfire-model` owns `ModelSource`, `TensorInfo`, `QuantConfig`, model artifact format detection, role-sidecar filtering, display-name derivation, and quant preference ranking.
+- `hipfire-runtime::model_source` remains a compatibility facade and still owns concrete HFQ/safetensors openers until those loaders move.
 
 Current evidence boundary status:
 - `hipfire-evidence` owns stable hash, model/tag hash, directory digest, file hash, and HFQ metadata extraction helpers.

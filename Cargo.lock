@@ -726,6 +726,10 @@ name = "hipfire-evidence"
 version = "0.2.1"
 
 [[package]]
+name = "hipfire-model"
+version = "0.2.0"
+
+[[package]]
 name = "hipfire-prompt"
 version = "0.2.1"
 dependencies = [
@@ -769,6 +773,7 @@ dependencies = [
  "hipfire-detect",
  "hipfire-dispatch",
  "hipfire-evidence",
+ "hipfire-model",
  "hipfire-prompt",
  "libc",
  "memmap2",
@@ -793,6 +798,7 @@ dependencies = [
  "axum",
  "dirs",
  "futures",
+ "hipfire-model",
  "hipfire-prompt",
  "reqwest",
  "serde",

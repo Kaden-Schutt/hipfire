@@ -1,0 +1,8 @@
+[package]
+name = "hipfire-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model artifact identity and source contracts for hipfire"
+
+[dependencies]

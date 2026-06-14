@@ -54,6 +54,7 @@ experimental-examples = []
 [dependencies]
 hipfire-coherence = { path = "../hipfire-coherence" }
 hipfire-evidence = { path = "../hipfire-evidence" }
+hipfire-model = { path = "../hipfire-model" }
 hipfire-prompt = { path = "../hipfire-prompt" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
