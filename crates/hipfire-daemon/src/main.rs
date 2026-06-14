@@ -9016,6 +9016,11 @@ fn main() {
         };
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let protocol_load = if msg_type == "load" {
+            serde_json::from_value::<hipfire_daemon_protocol::LoadRequest>(msg.clone()).ok()
+        } else {
+            None
+        };
 
         match msg_type {
             "load" => {
@@ -9061,7 +9066,11 @@ fn main() {
                 }
                 dummy_model = None;
 
-                let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                let path = protocol_load
+                    .as_ref()
+                    .map(|req| req.model.as_str())
+                    .or_else(|| msg.get("model").and_then(|v| v.as_str()))
+                    .unwrap_or("");
                 let dummy_requested = msg
                     .get("params")
                     .and_then(|p| p.get("dummy_model"))
@@ -9088,17 +9097,35 @@ fn main() {
                     continue;
                 }
 
-                let max_seq = msg
-                    .get("params")
-                    .and_then(|p| p.get("max_seq"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(4096) as usize;
-                let requested_physical_cap = msg
-                    .get("params")
-                    .and_then(|p| p.get("physical_cap"))
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
+                let max_seq = protocol_load
+                    .as_ref()
+                    .map(|req| req.params.max_seq as usize)
+                    .or_else(|| {
+                        msg.get("params")
+                            .and_then(|p| p.get("max_seq"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                    })
+                    .unwrap_or(4096);
+                let requested_physical_cap = protocol_load
+                    .as_ref()
+                    .and_then(|req| req.params.physical_cap.map(|v| v as usize))
+                    .or_else(|| {
+                        msg.get("params")
+                            .and_then(|p| p.get("physical_cap"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                    })
                     .filter(|v| *v > 0);
+                let raw_dflash_mode = msg
+                    .get("params")
+                    .and_then(|p| p.get("dflash_mode"))
+                    .and_then(|v| v.as_str());
+                let raw_draft_param = msg
+                    .get("params")
+                    .and_then(|p| p.get("draft"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
                 // Optional DFlash draft model path. When supplied AND the target
                 // is a Qwen3.5 arch (5 or 6), we load draft weights + scratch
                 // alongside the target and the temp=0 generate fast path routes
@@ -9111,15 +9138,15 @@ fn main() {
                 // primary path (saves the wire round-trip for the draft path
                 // string), but this guard makes the flag durable when the
                 // daemon is driven by a non-hipfire-CLI client.
-                let dflash_mode = msg
-                    .get("params")
-                    .and_then(|p| p.get("dflash_mode"))
-                    .and_then(|v| v.as_str())
+                let dflash_mode = protocol_load
+                    .as_ref()
+                    .and_then(|req| req.params.dflash_mode.as_deref())
+                    .or(raw_dflash_mode)
                     .unwrap_or("auto");
-                let raw_draft = msg
-                    .get("params")
-                    .and_then(|p| p.get("draft"))
-                    .and_then(|v| v.as_str())
+                let raw_draft = protocol_load
+                    .as_ref()
+                    .and_then(|req| req.params.draft.as_deref())
+                    .or(raw_draft_param)
                     .filter(|s| !s.is_empty());
                 let draft_path = if dflash_mode == "off" {
                     if raw_draft.is_some() {
@@ -9132,10 +9159,14 @@ fn main() {
                 } else {
                     raw_draft.map(|s| s.to_string())
                 };
-                let kv_mode_override = msg
-                    .get("params")
-                    .and_then(|p| p.get("kv_mode"))
-                    .and_then(|v| v.as_str())
+                let kv_mode_override = protocol_load
+                    .as_ref()
+                    .and_then(|req| req.params.kv_cache.as_deref())
+                    .or_else(|| {
+                        msg.get("params")
+                            .and_then(|p| p.get("kv_mode"))
+                            .and_then(|v| v.as_str())
+                    })
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
@@ -9173,10 +9204,14 @@ fn main() {
                 // That decouples advertised context length from VRAM footprint —
                 // a 128K max_seq can run in ~1K-slot physical buffer when the
                 // operator opts in.
-                let cask_sidecar = msg
-                    .get("params")
-                    .and_then(|p| p.get("cask_sidecar"))
-                    .and_then(|v| v.as_str())
+                let cask_sidecar = protocol_load
+                    .as_ref()
+                    .and_then(|req| req.params.cask_sidecar.as_deref())
+                    .or_else(|| {
+                        msg.get("params")
+                            .and_then(|p| p.get("cask_sidecar"))
+                            .and_then(|v| v.as_str())
+                    })
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
                 let cask_enabled = msg

@@ -198,6 +198,41 @@ mod tests {
     }
 
     #[test]
+    fn load_request_deserializes_jsonl_wire_shape() {
+        let req: DaemonRequest = serde_json::from_value(json!({
+            "type": "load",
+            "model": "model.hfq",
+            "params": {
+                "max_seq": 4096,
+                "physical_cap": 2048,
+                "kv_cache": "fp16",
+                "dflash_mode": "off",
+                "draft": "draft.hfq",
+                "cask_sidecar": "sidecar.triattn.hfq",
+                "ignored": true
+            },
+            "request_id": "load-1",
+            "ignored_legacy_field": true
+        }))
+        .unwrap();
+
+        let DaemonRequest::Load(req) = req else {
+            panic!("expected load request");
+        };
+        assert_eq!(req.model, "model.hfq");
+        assert_eq!(req.params.max_seq, 4096);
+        assert_eq!(req.params.physical_cap, Some(2048));
+        assert_eq!(req.params.kv_cache.as_deref(), Some("fp16"));
+        assert_eq!(req.params.dflash_mode.as_deref(), Some("off"));
+        assert_eq!(req.params.draft.as_deref(), Some("draft.hfq"));
+        assert_eq!(
+            req.params.cask_sidecar.as_deref(),
+            Some("sidecar.triattn.hfq")
+        );
+        assert_eq!(req.request_id.as_deref(), Some("load-1"));
+    }
+
+    #[test]
     fn done_response_preserves_unknown_metrics_in_extra() {
         let done: DaemonResponse = serde_json::from_value(json!({
             "type": "done",
