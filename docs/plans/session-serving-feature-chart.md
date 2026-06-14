@@ -35,6 +35,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - `hipfire-eval` now owns the `hipfire-eval` binary adapter and eval harness implementation while `hipfire-runtime::eval_harness` keeps the existing import path.
 - Daemon model-worker id construction and sequence-state arena support policy now reuse `hipfire-state` ownership instead of daemon-local policy helpers.
 - Daemon Qwen3.5 sequence-state session/checkpoint handle construction now reuses `hipfire-state` ownership instead of daemon-local policy helpers.
+- Daemon `reserve_session_state` request parsing now consumes `hipfire-state` reserve request metadata instead of daemon-local loose fields.
 - Daemon Qwen3.5 checkpoint attach/fork calls now consume `hipfire-state` fork request metadata instead of daemon-local loose parameters.
 - Daemon Qwen3.5 checkpoint source-residency validation now reuses `hipfire-state` policy instead of daemon-local missing-source handling.
 - Daemon Qwen3.5 checkpoint prefix-hash validation now reuses `hipfire-state` policy instead of daemon-local mismatch handling.

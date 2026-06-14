@@ -183,6 +183,16 @@ pub struct SequenceStateForkRequest<'a> {
     pub requested_prefix_hash: Option<&'a SequenceStatePrefixHash>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateReservationRequest {
+    pub worker_id: String,
+    pub reservation_id: Option<String>,
+    pub state_kinds: Vec<SequenceStatePageKind>,
+    pub physical_cap: usize,
+    pub ttl_ms: u64,
+    pub budget_bytes: Option<usize>,
+}
+
 pub fn validate_checkpoint_source_resident(
     source_session_id: &str,
     resident: bool,
@@ -774,6 +784,39 @@ pub fn parse_reserve_session_state_kinds(
     Ok(kinds)
 }
 
+pub fn parse_reserve_session_state_request(
+    msg: &serde_json::Value,
+    worker_id: &str,
+) -> Result<SequenceStateReservationRequest, String> {
+    let physical_cap = msg
+        .get("physical_cap")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(0);
+    if physical_cap == 0 {
+        return Err("reserve_session_state.physical_cap must be > 0".to_string());
+    }
+    let state_kinds = parse_reserve_session_state_kinds(msg)?;
+    let reservation_id = msg
+        .get("reservation_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let ttl_ms = msg.get("ttl_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
+    let budget_bytes = msg
+        .get("budget_bytes")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    Ok(SequenceStateReservationRequest {
+        worker_id: worker_id.to_string(),
+        reservation_id,
+        state_kinds,
+        physical_cap,
+        ttl_ms,
+        budget_bytes,
+    })
+}
+
 pub fn generic_state_reservation_descriptors(
     worker_id: &str,
     handle: &SequenceStateHandle,
@@ -901,6 +944,68 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("unsupported kind bogus"));
+    }
+
+    #[test]
+    fn parse_reserve_session_state_request_preserves_daemon_defaults() {
+        let request = parse_reserve_session_state_request(
+            &serde_json::json!({
+                "type": "reserve_session_state",
+                "physical_cap": 4096
+            }),
+            "worker-a",
+        )
+        .unwrap();
+        assert_eq!(request.worker_id, "worker-a");
+        assert_eq!(request.reservation_id, None);
+        assert_eq!(
+            request.state_kinds,
+            vec![SequenceStatePageKind::Kv, SequenceStatePageKind::DeltaNet]
+        );
+        assert_eq!(request.physical_cap, 4096);
+        assert_eq!(request.ttl_ms, 30_000);
+        assert_eq!(request.budget_bytes, None);
+    }
+
+    #[test]
+    fn parse_reserve_session_state_request_preserves_optional_fields() {
+        let request = parse_reserve_session_state_request(
+            &serde_json::json!({
+                "type": "reserve_session_state",
+                "reservation_id": "reserve-a",
+                "physical_cap": 8192,
+                "ttl_ms": 0,
+                "budget_bytes": 16384,
+                "state_kinds": ["attention_kv", "mamba_ssm", "attention_kv"]
+            }),
+            "worker-b",
+        )
+        .unwrap();
+        assert_eq!(request.worker_id, "worker-b");
+        assert_eq!(request.reservation_id.as_deref(), Some("reserve-a"));
+        assert_eq!(
+            request.state_kinds,
+            vec![
+                SequenceStatePageKind::Kv,
+                SequenceStatePageKind::BackendPrivate
+            ]
+        );
+        assert_eq!(request.physical_cap, 8192);
+        assert_eq!(request.ttl_ms, 0);
+        assert_eq!(request.budget_bytes, Some(16384));
+    }
+
+    #[test]
+    fn parse_reserve_session_state_request_rejects_missing_physical_cap_first() {
+        let err = parse_reserve_session_state_request(
+            &serde_json::json!({
+                "type": "reserve_session_state",
+                "state_kinds": ["bogus"]
+            }),
+            "worker-a",
+        )
+        .unwrap_err();
+        assert_eq!(err, "reserve_session_state.physical_cap must be > 0");
     }
 
     #[test]
