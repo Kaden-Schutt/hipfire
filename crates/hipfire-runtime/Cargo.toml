@@ -136,6 +136,10 @@ name = "coherence_probe"
 required-features = ["experimental-examples"]
 
 [[example]]
+name = "debug_minimax_batch"
+required-features = ["experimental-examples", "arch-minimax"]
+
+[[example]]
 name = "gpus_smoke"
 required-features = []
 
@@ -266,6 +270,10 @@ required-features = ["arch-qwen35"]
 [[example]]
 name = "profile_prefill_qwen35"
 required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "profile_prefill_deepseek4"
+required-features = ["experimental-examples", "arch-deepseek4", "deltanet"]
 
 [[example]]
 name = "test_inference"

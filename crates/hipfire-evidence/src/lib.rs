@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
@@ -107,6 +107,30 @@ pub const STANDARD_EVIDENCE_ARTIFACT_SPECS: &[EvidenceArtifactSpec] = &[
         ],
     },
 ];
+
+pub fn standard_evidence_artifact_kind_for_path(path: &Path) -> Option<&'static str> {
+    let file_name = path.file_name()?.to_str()?;
+    STANDARD_EVIDENCE_ARTIFACT_SPECS
+        .iter()
+        .find(|spec| spec.file == file_name)
+        .map(|spec| spec.kind)
+}
+
+pub fn standard_evidence_paths_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    let entries =
+        fs::read_dir(dir).map_err(|err| format!("read evidence dir {}: {err}", dir.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| format!("read evidence dir entry {}: {err}", dir.display()))?;
+        let path = entry.path();
+        if path.is_file() && standard_evidence_artifact_kind_for_path(&path).is_some() {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
 
 pub fn file_hash(path: &Path) -> Option<String> {
     command_digest("sha256sum", path).or_else(|| Some(stable_hash_file_fallback(path)))
@@ -369,6 +393,34 @@ mod tests {
         assert!(STANDARD_EVIDENCE_ARTIFACT_SPECS
             .iter()
             .all(|spec| !spec.expected_metrics.is_empty()));
+    }
+
+    #[test]
+    fn standard_evidence_path_discovery_uses_shared_catalog() {
+        let root = temp_dir("hipfire-evidence-standard-paths");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("quality.json"), "{}").unwrap();
+        fs::write(root.join("module_evidence.json"), "{}").unwrap();
+        fs::write(root.join("not_evidence.json"), "{}").unwrap();
+        fs::create_dir_all(root.join("performance.json")).unwrap();
+
+        assert_eq!(
+            standard_evidence_artifact_kind_for_path(&root.join("quality.json")),
+            Some("quality")
+        );
+        assert_eq!(
+            standard_evidence_artifact_kind_for_path(&root.join("not_evidence.json")),
+            None
+        );
+
+        let paths = standard_evidence_paths_in_dir(&root).unwrap();
+        let names: Vec<_> = paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["module_evidence.json", "quality.json"]);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

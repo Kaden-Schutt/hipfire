@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
     directory_hash, file_hash, list_files, model_hash, read_hfq_metadata, stable_hash_bytes,
-    stable_hash_file_fallback, STANDARD_EVIDENCE_ARTIFACT_SPECS,
+    stable_hash_file_fallback, standard_evidence_paths_in_dir, STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3687,39 +3687,7 @@ fn runtime_evidence_dirs_from_results(results: &[EvalResult]) -> Vec<PathBuf> {
 }
 
 fn runtime_evidence_paths_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut out = Vec::new();
-    let entries =
-        fs::read_dir(dir).map_err(|err| format!("read evidence dir {}: {err}", dir.display()))?;
-    for entry in entries {
-        let entry =
-            entry.map_err(|err| format!("read evidence dir entry {}: {err}", dir.display()))?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or("");
-        let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
-        if ext == "json"
-            && matches!(
-                stem,
-                "launch_counts"
-                    | "moe_router_histogram"
-                    | "profiling"
-                    | "phase_timings"
-                    | "memory"
-                    | "performance"
-                    | "coherence"
-                    | "dflash_trace"
-                    | "path_c_trace"
-                    | "module_evidence"
-                    | "quality"
-            )
-        {
-            out.push(path);
-        }
-    }
-    out.sort();
-    Ok(out)
+    standard_evidence_paths_in_dir(dir)
 }
 
 fn external_evidence_records_from_path(

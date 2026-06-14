@@ -530,17 +530,27 @@ pub fn execute_steps(
 /// op to have an arm (spec F4 — a missing arm would be a silent runtime error).
 fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), DispatchError> {
     match step {
-        Step::Gemv { w, input: GemvInput::Raw(x), out } => {
+        Step::Gemv {
+            w,
+            input: GemvInput::Raw(x),
+            out,
+        } => {
             if w.dtype == DType::BF16 {
-                return gpu.gemm_bf16_x_bf16_wmma(w.buf, x, out, w.m, w.k, 1)
+                return gpu
+                    .gemm_bf16_x_bf16_wmma(w.buf, x, out, w.m, w.k, 1)
                     .map_err(|e| DispatchError::Hip(e.to_string()));
             }
             let gemv = GEMV.get_or_init(GemvFamily::new);
             gemv.run_auto(ctx, gpu, w, x, out)
         }
-        Step::Gemv { w, input: GemvInput::Prerotated(xr), out } => {
+        Step::Gemv {
+            w,
+            input: GemvInput::Prerotated(xr),
+            out,
+        } => {
             if w.dtype == DType::BF16 {
-                return gpu.gemm_bf16_x_bf16_wmma(w.buf, xr, out, w.m, w.k, 1)
+                return gpu
+                    .gemm_bf16_x_bf16_wmma(w.buf, xr, out, w.m, w.k, 1)
                     .map_err(|e| DispatchError::Hip(e.to_string()));
             }
             let gemv = GEMV.get_or_init(GemvFamily::new);
@@ -596,13 +606,15 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
             // &s.x), a fresh temp is allocated instead. See the aliasing guard below.
             // Nothing reads `out` after this step in any model decode path.
             if w.dtype == DType::BF16 {
-                let tmp = gpu.alloc_tensor(&[w.m], DType::F32)
+                let tmp = gpu
+                    .alloc_tensor(&[w.m], DType::F32)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 gpu.gemm_bf16_x_bf16_wmma(w.buf, x, &tmp, w.m, w.k, 1)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
                 gpu.add_inplace_f32(residual, &tmp)
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;
-                return gpu.free_tensor(tmp)
+                return gpu
+                    .free_tensor(tmp)
                     .map_err(|e| DispatchError::Hip(e.to_string()));
             }
             let gemv = GEMV.get_or_init(GemvFamily::new);
