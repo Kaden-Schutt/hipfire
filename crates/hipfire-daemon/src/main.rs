@@ -70,7 +70,7 @@ use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
     model_worker_runtime_view_json, parse_describe_sequence_state_request,
-    parse_reserve_session_state_request, parse_sequence_state_handle_list,
+    parse_release_sequence_state_request, parse_reserve_session_state_request,
     parsed_handle_may_target_generic, parsed_handle_may_target_loaded_state,
     qwen35_sequence_state_handle, release_sessions_done_json, release_state_done_json,
     reserve_session_state_done_json, reserve_session_state_rejected_json,
@@ -78,9 +78,8 @@ use hipfire_state::{
     validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
     validate_checkpoint_source_resident, DescribedSequenceState, GenericSequenceStateArena,
     ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
-    ParsedSequenceStateHandle, ReleaseStateResponseKind, SequenceStateArenaBackend,
-    SequenceStateCheckpointRequest, SequenceStateForkRequest, SequenceStatePageDescriptor,
-    SequenceStatePageKind,
+    ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
+    SequenceStateForkRequest, SequenceStatePageDescriptor, SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -9070,10 +9069,9 @@ fn main() {
                     .get("id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("release-reservation");
-                let is_release_state =
-                    msg.get("type").and_then(|v| v.as_str()) == Some("release_state");
-                let handles = parse_sequence_state_handle_list(&msg);
-                let generic_handles = handles
+                let request = parse_release_sequence_state_request(&msg);
+                let generic_handles = request
+                    .handles
                     .iter()
                     .filter(|handle| parsed_handle_may_target_generic(handle))
                     .map(|handle| (handle.id.clone(), handle.generation))
@@ -9085,7 +9083,7 @@ fn main() {
                         &mut model,
                         &mut resident_models,
                         &mut gpu,
-                        &handles,
+                        &request.handles,
                     ) {
                         Ok(released) => released,
                         Err(e) => {
@@ -9093,13 +9091,8 @@ fn main() {
                             continue;
                         }
                     };
-                let kind = if is_release_state {
-                    ReleaseStateResponseKind::ReleaseState
-                } else {
-                    ReleaseStateResponseKind::ReleaseSessionStateReservation
-                };
                 let done = release_state_done_json(
-                    kind,
+                    request.response_kind,
                     id,
                     generic_released,
                     generic_released_bytes,

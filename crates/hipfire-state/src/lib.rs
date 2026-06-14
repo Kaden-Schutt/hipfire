@@ -198,6 +198,12 @@ pub struct SequenceStateDescribeRequest {
     pub handle: ParsedSequenceStateHandle,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateReleaseRequest {
+    pub response_kind: ReleaseStateResponseKind,
+    pub handles: Vec<ParsedSequenceStateHandle>,
+}
+
 pub fn validate_checkpoint_source_resident(
     source_session_id: &str,
     resident: bool,
@@ -835,6 +841,20 @@ pub fn parse_describe_sequence_state_request(
     Ok(SequenceStateDescribeRequest { handle })
 }
 
+pub fn parse_release_sequence_state_request(
+    msg: &serde_json::Value,
+) -> SequenceStateReleaseRequest {
+    let response_kind = if msg.get("type").and_then(|v| v.as_str()) == Some("release_state") {
+        ReleaseStateResponseKind::ReleaseState
+    } else {
+        ReleaseStateResponseKind::ReleaseSessionStateReservation
+    };
+    SequenceStateReleaseRequest {
+        response_kind,
+        handles: parse_sequence_state_handle_list(msg),
+    }
+}
+
 pub fn generic_state_reservation_descriptors(
     worker_id: &str,
     handle: &SequenceStateHandle,
@@ -1071,6 +1091,57 @@ mod tests {
         }))
         .unwrap_err();
         assert_eq!(err, "describe_state requires runtime_state_handle");
+    }
+
+    #[test]
+    fn parse_release_sequence_state_request_preserves_response_kind() {
+        let release_state = parse_release_sequence_state_request(&serde_json::json!({
+            "type": "release_state",
+            "runtime_state_handle": "state-a"
+        }));
+        assert_eq!(
+            release_state.response_kind,
+            ReleaseStateResponseKind::ReleaseState
+        );
+        assert_eq!(release_state.handles[0].id, "state-a");
+
+        let reservation = parse_release_sequence_state_request(&serde_json::json!({
+            "type": "release_session_state_reservation",
+            "reservation_id": "reserve-a"
+        }));
+        assert_eq!(
+            reservation.response_kind,
+            ReleaseStateResponseKind::ReleaseSessionStateReservation
+        );
+        assert_eq!(reservation.handles[0].id, "reserve-a");
+    }
+
+    #[test]
+    fn parse_release_sequence_state_request_preserves_handle_sources() {
+        let handles = parse_release_sequence_state_request(&serde_json::json!({
+            "type": "release_state",
+            "handles": [
+                {
+                    "id": "checkpoint-a",
+                    "kind": "qwen35_checkpoint",
+                    "allocation_epoch": 8
+                },
+                "reserve-a"
+            ]
+        }));
+        assert_eq!(handles.handles.len(), 2);
+        assert_eq!(handles.handles[0].id, "checkpoint-a");
+        assert_eq!(
+            handles.handles[0].kind.as_deref(),
+            Some("qwen35_checkpoint")
+        );
+        assert_eq!(handles.handles[0].generation, Some(8));
+        assert_eq!(handles.handles[1].id, "reserve-a");
+
+        let empty = parse_release_sequence_state_request(&serde_json::json!({
+            "type": "release_state"
+        }));
+        assert!(empty.handles.is_empty());
     }
 
     #[test]
