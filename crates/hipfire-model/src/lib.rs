@@ -270,6 +270,39 @@ where
     }
 }
 
+/// Stable tokenizer fingerprint used for compatibility checks between target
+/// and draft tokenizers. The caller supplies vocabulary in token-id order and
+/// special tokens in the tokenizer's canonical matching order.
+pub fn tokenizer_signature(
+    vocab: &[String],
+    special_tokens: &[(String, u32)],
+    bos_id: u32,
+    eos_id: u32,
+    eot_id: Option<u32>,
+) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h ^= 0xff;
+        h = h.wrapping_mul(0x100000001b3);
+    };
+
+    for tok in vocab {
+        mix(tok.as_bytes());
+    }
+    for (token, id) in special_tokens {
+        mix(token.as_bytes());
+        mix(&id.to_le_bytes());
+    }
+    mix(&bos_id.to_le_bytes());
+    mix(&eos_id.to_le_bytes());
+    mix(&eot_id.unwrap_or(u32::MAX).to_le_bytes());
+    h
+}
+
 /// Normalize a user-facing model tag into the fuzzy filename search stem.
 pub fn normalize_tag_stem(tag: &str) -> String {
     tag.replace(':', "-").to_lowercase()
@@ -892,6 +925,38 @@ mod tests {
         .unwrap_err();
         assert_eq!(dir_err, "safetensors open failed: safetensors failed");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tokenizer_signature_is_stable_for_vocab_specials_and_sentinel_ids() {
+        let vocab = vec!["a".to_string(), "b".to_string(), "<eos>".to_string()];
+        let specials = vec![("<eos>".to_string(), 2)];
+
+        assert_eq!(
+            tokenizer_signature(&vocab, &specials, 0, 2, None),
+            tokenizer_signature(&vocab, &specials, 0, 2, None)
+        );
+        assert_ne!(
+            tokenizer_signature(&vocab, &specials, 0, 2, None),
+            tokenizer_signature(&vocab, &specials, 0, 2, Some(3))
+        );
+    }
+
+    #[test]
+    fn tokenizer_signature_preserves_vocab_and_special_token_order() {
+        let vocab = vec!["a".to_string(), "b".to_string()];
+        let reversed_vocab = vec!["b".to_string(), "a".to_string()];
+        let specials = vec![("<a>".to_string(), 10), ("<aa>".to_string(), 11)];
+        let reversed_specials = vec![("<aa>".to_string(), 11), ("<a>".to_string(), 10)];
+
+        assert_ne!(
+            tokenizer_signature(&vocab, &specials, 0, 1, None),
+            tokenizer_signature(&reversed_vocab, &specials, 0, 1, None)
+        );
+        assert_ne!(
+            tokenizer_signature(&vocab, &specials, 0, 1, None),
+            tokenizer_signature(&vocab, &reversed_specials, 0, 1, None)
+        );
     }
 
     #[test]
