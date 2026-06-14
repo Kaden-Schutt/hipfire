@@ -235,6 +235,28 @@ pub fn evidence_record_json(record: EvidenceRecord) -> Value {
     })
 }
 
+pub fn extract_external_evidence_records_json(
+    kind: &str,
+    path: &Path,
+    value: &Value,
+    context: Value,
+) -> Vec<Value> {
+    let Some(selected) = select_external_evidence_value(kind, path, value) else {
+        return Vec::new();
+    };
+    let records = if let Some(records) = selected.get("records").and_then(Value::as_array) {
+        records.clone()
+    } else if let Some(records) = selected.as_array() {
+        records.clone()
+    } else {
+        vec![selected.clone()]
+    };
+    records
+        .into_iter()
+        .map(|record| annotate_external_evidence_record_json(kind, path, record, &context))
+        .collect()
+}
+
 pub fn standard_evidence_artifact_kind_for_path(path: &Path) -> Option<&'static str> {
     let file_name = path.file_name()?.to_str()?;
     STANDARD_EVIDENCE_ARTIFACT_SPECS
@@ -374,6 +396,60 @@ fn model_hash_cache_key(model: &str) -> String {
         format!("file:{canonical}:{}:{modified}", meta.len())
     } else {
         format!("tag:{model}")
+    }
+}
+
+fn select_external_evidence_value<'a>(
+    kind: &str,
+    path: &Path,
+    value: &'a Value,
+) -> Option<&'a Value> {
+    if value
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|k| k == kind)
+    {
+        return Some(value);
+    }
+    if let Some(mapped) = value.get(kind) {
+        return Some(mapped);
+    }
+    if path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem == kind)
+    {
+        return Some(value);
+    }
+    None
+}
+
+fn annotate_external_evidence_record_json(
+    kind: &str,
+    path: &Path,
+    record: Value,
+    context: &Value,
+) -> Value {
+    let source_path = path.display().to_string();
+    match record {
+        Value::Object(mut object) => {
+            object
+                .entry("kind".to_string())
+                .or_insert_with(|| json!(kind));
+            object
+                .entry("source_path".to_string())
+                .or_insert_with(|| json!(source_path));
+            object
+                .entry("hipfire_eval_context".to_string())
+                .or_insert_with(|| context.clone());
+            Value::Object(object)
+        }
+        other => json!({
+            "kind": kind,
+            "source_path": source_path,
+            "hipfire_eval_context": context,
+            "value": other,
+        }),
     }
 }
 
@@ -635,6 +711,78 @@ mod tests {
         assert_eq!(json["reason"], "ok");
         assert_eq!(json["expected_metrics"][0], "tok_s");
         assert_eq!(json["kind"], "performance");
+    }
+
+    #[test]
+    fn external_evidence_records_selects_kind_mapping_and_annotates_context() {
+        let path = Path::new("/tmp/evidence.json");
+        let value = json!({
+            "launch_counts": {
+                "records": [
+                    {"metrics": {"kernel_launches": 3}}
+                ]
+            }
+        });
+        let records = extract_external_evidence_records_json(
+            "launch_counts",
+            path,
+            &value,
+            json!({"runner": "hipfire-eval"}),
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["kind"], "launch_counts");
+        assert_eq!(records[0]["source_path"], "/tmp/evidence.json");
+        assert_eq!(records[0]["hipfire_eval_context"]["runner"], "hipfire-eval");
+        assert_eq!(records[0]["metrics"]["kernel_launches"], 3);
+    }
+
+    #[test]
+    fn external_evidence_records_preserves_existing_annotation_fields() {
+        let path = Path::new("/tmp/launch_counts.json");
+        let value = json!({
+            "kind": "launch_counts",
+            "records": [
+                {
+                    "kind": "custom",
+                    "source_path": "/already/set.json",
+                    "hipfire_eval_context": {"runner": "custom-runner"},
+                    "metrics": {"kernel_launches": 7}
+                }
+            ]
+        });
+        let records = extract_external_evidence_records_json(
+            "launch_counts",
+            path,
+            &value,
+            json!({"runner": "hipfire-eval"}),
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["kind"], "custom");
+        assert_eq!(records[0]["source_path"], "/already/set.json");
+        assert_eq!(
+            records[0]["hipfire_eval_context"]["runner"],
+            "custom-runner"
+        );
+        assert_eq!(records[0]["metrics"]["kernel_launches"], 7);
+    }
+
+    #[test]
+    fn external_evidence_records_uses_path_stem_and_wraps_scalars() {
+        let path = Path::new("/tmp/performance.json");
+        let records = extract_external_evidence_records_json(
+            "performance",
+            path,
+            &json!(123.4),
+            json!({"runner": "hipfire-eval"}),
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["kind"], "performance");
+        assert_eq!(records[0]["source_path"], "/tmp/performance.json");
+        assert_eq!(records[0]["hipfire_eval_context"]["runner"], "hipfire-eval");
+        assert_eq!(records[0]["value"], 123.4);
     }
 
     #[test]

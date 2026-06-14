@@ -21,8 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
     directory_hash, evidence_artifact_index_entry_from_value_json,
-    evidence_artifact_index_entry_json, evidence_record_json, file_hash, list_files, model_hash,
-    read_hfq_metadata, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
+    evidence_artifact_index_entry_json, evidence_record_json,
+    extract_external_evidence_records_json, file_hash, list_files, model_hash, read_hfq_metadata,
+    run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
     standard_evidence_paths_in_dir, EvidenceArtifactIndexContext, EvidenceRecord, RunProvenance,
     STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
@@ -3669,86 +3670,12 @@ fn external_evidence_records_from_path(
     let body = fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
     let value: Value =
         serde_json::from_str(&body).map_err(|err| format!("parse {}: {err}", path.display()))?;
-    extract_external_evidence_records(kind, path, &value, config, ctx)
-}
-
-fn extract_external_evidence_records(
-    kind: &str,
-    path: &Path,
-    value: &Value,
-    config: &EvalConfig,
-    ctx: &EvalContext,
-) -> Result<Vec<Value>, String> {
-    let Some(selected) = select_external_evidence_value(kind, path, value) else {
-        return Ok(Vec::new());
-    };
-    let records = if let Some(records) = selected.get("records").and_then(Value::as_array) {
-        records.clone()
-    } else if let Some(records) = selected.as_array() {
-        records.clone()
-    } else {
-        vec![selected.clone()]
-    };
-    Ok(records
-        .into_iter()
-        .map(|record| annotate_external_evidence_record(kind, path, record, config, ctx))
-        .collect())
-}
-
-fn select_external_evidence_value<'a>(
-    kind: &str,
-    path: &Path,
-    value: &'a Value,
-) -> Option<&'a Value> {
-    if value
-        .get("kind")
-        .and_then(Value::as_str)
-        .is_some_and(|k| k == kind)
-    {
-        return Some(value);
-    }
-    if let Some(mapped) = value.get(kind) {
-        return Some(mapped);
-    }
-    if path
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .is_some_and(|stem| stem == kind)
-    {
-        return Some(value);
-    }
-    None
-}
-
-fn annotate_external_evidence_record(
-    kind: &str,
-    path: &Path,
-    record: Value,
-    config: &EvalConfig,
-    ctx: &EvalContext,
-) -> Value {
-    let source_path = path.display().to_string();
-    let context = external_evidence_context(config, ctx);
-    match record {
-        Value::Object(mut object) => {
-            object
-                .entry("kind".to_string())
-                .or_insert_with(|| json!(kind));
-            object
-                .entry("source_path".to_string())
-                .or_insert_with(|| json!(source_path));
-            object
-                .entry("hipfire_eval_context".to_string())
-                .or_insert_with(|| context.clone());
-            Value::Object(object)
-        }
-        other => json!({
-            "kind": kind,
-            "source_path": source_path,
-            "hipfire_eval_context": context,
-            "value": other,
-        }),
-    }
+    Ok(extract_external_evidence_records_json(
+        kind,
+        path,
+        &value,
+        external_evidence_context(config, ctx),
+    ))
 }
 
 fn external_evidence_context(config: &EvalConfig, ctx: &EvalContext) -> Value {
