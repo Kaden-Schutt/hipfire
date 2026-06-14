@@ -4,6 +4,7 @@
 
 //! Typed generation request, event, and batch-plan contracts.
 
+pub use hipfire_state::SequenceStatePrefixHash as GenerateBatchPrefillPrefixHash;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -159,13 +160,6 @@ pub struct GenerateBatchPrefillStateHandle {
     pub runtime_state_handle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_hash: Option<GenerateBatchPrefillPrefixHash>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct GenerateBatchPrefillPrefixHash {
-    pub algorithm: String,
-    pub value: String,
-    pub prefix_len: usize,
 }
 
 pub fn generate_prefix_hash_json(hash: &GenerateBatchPrefillPrefixHash) -> serde_json::Value {
