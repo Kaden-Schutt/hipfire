@@ -22,11 +22,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hipfire_evidence::{
     admission_metric_is_quality, admission_verdict_policy, directory_hash,
     evidence_artifact_index_entry_from_value_json, evidence_artifact_index_entry_json,
-    evidence_collection_policy, evidence_metric_direction, evidence_record_json,
-    extract_external_evidence_records_json, file_hash, list_files, model_hash, read_hfq_metadata,
-    required_admission_evidence_requirements, run_metadata_artifact_json, run_provenance_json,
-    stable_hash_bytes, stable_hash_file_fallback, standard_evidence_paths_in_dir,
-    EvidenceArtifactIndexContext, EvidenceRecord, RunMetadataArtifact, RunMetadataConfig,
+    evidence_artifact_json, evidence_collection_policy, evidence_metric_direction,
+    evidence_record_json, extract_external_evidence_records_json, file_hash, list_files,
+    model_hash, read_hfq_metadata, required_admission_evidence_requirements,
+    run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
+    standard_evidence_paths_in_dir, EvidenceArtifact, EvidenceArtifactCollection,
+    EvidenceArtifactConfig, EvidenceArtifactDatasetStatus, EvidenceArtifactIndexContext,
+    EvidenceArtifactModels, EvidenceRecord, RunMetadataArtifact, RunMetadataConfig,
     RunMetadataModels, RunProvenance, OBSERVED_ADMISSION_EVIDENCE_KINDS,
     STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
@@ -3539,43 +3541,68 @@ fn evidence_artifact_value(
         &external_errors,
         config.profile.as_str(),
     );
-    let dataset_status = json!({
-        "total": datasets.len(),
-        "pass": datasets.iter().filter(|d| d.status == EvalStatus::Pass).count(),
-        "skip": datasets.iter().filter(|d| d.status == EvalStatus::Skip).count(),
-        "fail": datasets.iter().filter(|d| d.status == EvalStatus::Fail).count(),
-    });
-    json!({
-        "schema": 1,
-        "kind": kind,
-        "provenance": run_provenance_value(ctx),
-        "status": collection_policy.status,
-        "reason": collection_policy.reason,
-        "collection": {
-            "source": "hipfire-eval",
-            "executor": config.executor.as_str(),
-            "evidence_json": config.evidence_json.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            "evidence_dirs": config.evidence_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            "requires_model_execution": true,
-            "profiling_mode": config.profile.as_str(),
-            "dflash_mode": config.dflash.as_str(),
+    evidence_artifact_json(EvidenceArtifact {
+        kind: kind.to_string(),
+        provenance: run_provenance_value(ctx),
+        collection_policy,
+        collection: EvidenceArtifactCollection {
+            source: "hipfire-eval".to_string(),
+            executor: config.executor.as_str().to_string(),
+            evidence_json: config
+                .evidence_json
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            evidence_dirs: config
+                .evidence_dirs
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            requires_model_execution: true,
+            profiling_mode: config.profile.as_str().to_string(),
+            dflash_mode: config.dflash.as_str().to_string(),
         },
-        "config": {
-            "tier": config.tier.as_str(),
-            "batteries": config.batteries.iter().map(|b| b.as_str()).collect::<Vec<_>>(),
-            "suites": config.suites.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            "kv_mode": config.kv_mode,
-            "max_tokens": config.max_tokens,
+        config: EvidenceArtifactConfig {
+            tier: config.tier.as_str().to_string(),
+            batteries: config
+                .batteries
+                .iter()
+                .map(|b| b.as_str().to_string())
+                .collect(),
+            suites: config
+                .suites
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect(),
+            kv_mode: config.kv_mode.clone(),
+            max_tokens: config.max_tokens,
         },
-        "models": {
-            "candidate": config.model,
-            "draft": config.draft,
-            "baseline": config.baseline,
-            "reference": config.reference,
+        models: EvidenceArtifactModels {
+            candidate: config.model.clone(),
+            draft: config.draft.clone(),
+            baseline: config.baseline.clone(),
+            reference: config.reference.clone(),
         },
-        "datasets": dataset_status,
-        "expected_metrics": expected_metrics,
-        "records": records,
+        datasets: EvidenceArtifactDatasetStatus {
+            total: datasets.len(),
+            pass: datasets
+                .iter()
+                .filter(|d| d.status == EvalStatus::Pass)
+                .count(),
+            skip: datasets
+                .iter()
+                .filter(|d| d.status == EvalStatus::Skip)
+                .count(),
+            fail: datasets
+                .iter()
+                .filter(|d| d.status == EvalStatus::Fail)
+                .count(),
+        },
+        expected_metrics: expected_metrics
+            .iter()
+            .map(|metric| (*metric).to_string())
+            .collect(),
+        records,
     })
 }
 
