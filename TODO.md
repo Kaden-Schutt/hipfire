@@ -37,6 +37,36 @@
   modular/lazy expert smoke: multi-token prefill, decode continuation, eager vs
   paged parity on a smaller artifact, and grouped routed batches still need
   explicit coverage before removing the guarded execution flag.
+- Convert eval execution from “examples sub-process fan-out” toward daemon-backed,
+  reusable model processes before the next modularization step:
+  - The user-visible symptom is repeated model loading in `--tier fast` runs:
+    same model path is reloaded in separate subprocesses for smoke/coherence/
+    speed/pflash/dflash rows because examples executor launches one process per row.
+  - Evidence from latest run:
+    - command line `hipfire-eval --model <hfq> --tier fast` emitted multiple
+      `loading weights: ... HFQ payload` blocks in logs for the same model.
+    - per-row commands in results showed duplicated `examples/run` plus speed cases.
+  - Root cause hypothesis:
+    - evaluator still routes key batteries to `examples` binaries (new subprocesses)
+      not a resident daemon/service boundary.
+    - no shared model lifecycle exists across battery rows; every row independently
+      executes `run`/`run --session-reset-smoke`/`bench_qwen35_speed` etc.
+  - What to finish to align with daemon/lib+IPC direction:
+    - finish `EvalClient` transport in eval harness with request batching for same
+      model across batteries where semantics allow;
+    - add a daemon-backed fast-path for smoke/coherence/speed where command
+      arguments map directly to long-lived session actions;
+    - add process and handle ownership so one model-load maps to one resident daemon
+      process per loaded quant/placement;
+    - make battery rows consume a shared model cache key and avoid repeated
+      `hfq` opens.
+  - Success criteria:
+      - `--tier fast` on a single model produces a single model-load event per
+        daemon-backed model per run.
+      - row metrics still preserve current throughput correctness and hard-fail
+        semantics.
+      - no functional regression in `--battery speed`, while retaining the
+        command-level `--prefill-list` optimization already in `bench_qwen35_speed`.
 
 - [Documentation debt] Refresh docs drift where active behavior has changed:
   - `docs/CHAT.md` is missing the `/set <key> <val>` command that `cli/chat.ts`
