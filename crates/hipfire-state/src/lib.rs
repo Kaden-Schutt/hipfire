@@ -385,6 +385,41 @@ pub fn described_sequence_state_json(
     )
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseStateResponseKind {
+    ReleaseState,
+    ReleaseSessionStateReservation,
+}
+
+impl ReleaseStateResponseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReleaseState => "release_state_done",
+            Self::ReleaseSessionStateReservation => "release_session_state_reservation_done",
+        }
+    }
+}
+
+pub fn release_state_done_json(
+    kind: ReleaseStateResponseKind,
+    id: &str,
+    generic_released: usize,
+    generic_released_bytes: usize,
+    loaded_released: usize,
+    loaded_released_bytes: usize,
+) -> serde_json::Value {
+    let released = generic_released + loaded_released;
+    let released_bytes = generic_released_bytes.saturating_add(loaded_released_bytes);
+    serde_json::json!({
+        "type": kind.as_str(),
+        "id": id,
+        "released": released,
+        "released_bytes": released_bytes,
+        "generic_released": generic_released,
+        "loaded_released": loaded_released,
+    })
+}
+
 impl GenericSequenceStateArena {
     pub fn new() -> Self {
         Self {
@@ -847,6 +882,41 @@ mod tests {
         assert_eq!(json["state_arena_owns_pages"], true);
         assert_eq!(json["reserved_bytes"], 4096);
         assert_eq!(json["state_page_descriptors"][0]["owns_pages"], true);
+    }
+
+    #[test]
+    fn release_state_done_json_preserves_daemon_wire_shape() {
+        let json = release_state_done_json(
+            ReleaseStateResponseKind::ReleaseState,
+            "release-1",
+            2,
+            4096,
+            1,
+            2048,
+        );
+        assert_eq!(json["type"], "release_state_done");
+        assert_eq!(json["id"], "release-1");
+        assert_eq!(json["released"], 3);
+        assert_eq!(json["released_bytes"], 6144);
+        assert_eq!(json["generic_released"], 2);
+        assert_eq!(json["loaded_released"], 1);
+        assert!(json.get("generic_released_bytes").is_none());
+        assert!(json.get("loaded_released_bytes").is_none());
+    }
+
+    #[test]
+    fn release_session_state_reservation_done_json_uses_reservation_response_type() {
+        let json = release_state_done_json(
+            ReleaseStateResponseKind::ReleaseSessionStateReservation,
+            "release-2",
+            0,
+            usize::MAX,
+            1,
+            8,
+        );
+        assert_eq!(json["type"], "release_session_state_reservation_done");
+        assert_eq!(json["released"], 1);
+        assert_eq!(json["released_bytes"], usize::MAX);
     }
 
     #[test]

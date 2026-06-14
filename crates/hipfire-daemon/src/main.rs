@@ -71,12 +71,12 @@ use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
     model_worker_runtime_view_json, parse_reserve_session_state_kinds, parse_sequence_state_handle,
     parse_sequence_state_handle_list, parsed_handle_may_target_generic,
-    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
+    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle, release_state_done_json,
     sequence_state_page_descriptor_json, session_state_reservation_describe_json,
     DescribedSequenceState, GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId,
     ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
-    SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStatePageDescriptor,
-    SequenceStatePageKind,
+    ReleaseStateResponseKind, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
+    SequenceStatePageDescriptor, SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -9145,20 +9145,19 @@ fn main() {
                             continue;
                         }
                     };
-                let released = generic_released + loaded_released;
-                let released_bytes = generic_released_bytes.saturating_add(loaded_released_bytes);
-                let done = serde_json::json!({
-                    "type": if is_release_state {
-                        "release_state_done"
-                    } else {
-                        "release_session_state_reservation_done"
-                    },
-                    "id": id,
-                    "released": released,
-                    "released_bytes": released_bytes,
-                    "generic_released": generic_released,
-                    "loaded_released": loaded_released,
-                });
+                let kind = if is_release_state {
+                    ReleaseStateResponseKind::ReleaseState
+                } else {
+                    ReleaseStateResponseKind::ReleaseSessionStateReservation
+                };
+                let done = release_state_done_json(
+                    kind,
+                    id,
+                    generic_released,
+                    generic_released_bytes,
+                    loaded_released,
+                    loaded_released_bytes,
+                );
                 let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
             }

@@ -36,6 +36,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon model-worker id construction and sequence-state arena support policy now reuse `hipfire-state` ownership instead of daemon-local policy helpers.
 - Daemon Qwen3.5 sequence-state session/checkpoint handle construction now reuses `hipfire-state` ownership instead of daemon-local policy helpers.
 - Daemon `describe_state` response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
+- Daemon release-state response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
 - Daemon startup resource lease policy and lock helpers now reuse `hipfire-daemon-adapter` ownership instead of daemon-local helpers.
 - Eval artifact row records now reuse `hipfire-evidence` record contracts instead of eval-local JSON construction.
 - Eval comparison, admission, and evidence artifacts now reuse `hipfire-evidence` run-provenance contracts instead of eval-local provenance structs.
