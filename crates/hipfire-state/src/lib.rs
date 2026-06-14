@@ -385,6 +385,40 @@ pub fn described_sequence_state_json(
     )
 }
 
+pub fn reserve_session_state_done_json(
+    id: &str,
+    reservation: &SessionStateReservation,
+    current_session_bytes: usize,
+    outstanding_reserved_bytes: usize,
+    projected_reserved_bytes: usize,
+    budget_bytes: usize,
+) -> serde_json::Value {
+    let state_page_descriptors = reservation
+        .state_page_descriptors
+        .iter()
+        .map(sequence_state_page_descriptor_json)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "type": "reserve_session_state_done",
+        "id": id,
+        "worker_key_id": &reservation.worker_id,
+        "reservation_id": &reservation.handle.id,
+        "runtime_state_handle": &reservation.handle.id,
+        "handle": {
+            "id": &reservation.handle.id,
+            "kind": &reservation.handle.kind,
+            "generation": reservation.handle.generation,
+        },
+        "state_arena_owns_pages": true,
+        "state_page_descriptors": state_page_descriptors,
+        "reserved_bytes": reservation.reserved_bytes,
+        "current_session_bytes": current_session_bytes,
+        "outstanding_reserved_bytes": outstanding_reserved_bytes,
+        "projected_reserved_bytes": projected_reserved_bytes,
+        "budget_bytes": budget_bytes,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseStateResponseKind {
     ReleaseState,
@@ -882,6 +916,36 @@ mod tests {
         assert_eq!(json["state_arena_owns_pages"], true);
         assert_eq!(json["reserved_bytes"], 4096);
         assert_eq!(json["state_page_descriptors"][0]["owns_pages"], true);
+    }
+
+    #[test]
+    fn reserve_session_state_done_json_preserves_daemon_wire_shape() {
+        let mut arena = GenericSequenceStateArena::new();
+        let reservation = arena.reserve(
+            "worker-a",
+            "reserve-a".to_string(),
+            &[SequenceStatePageKind::Kv, SequenceStatePageKind::DeltaNet],
+            256,
+            8192,
+            0,
+        );
+
+        let json =
+            reserve_session_state_done_json("reserve-1", &reservation, 1024, 2048, 11264, 16384);
+        assert_eq!(json["type"], "reserve_session_state_done");
+        assert_eq!(json["id"], "reserve-1");
+        assert_eq!(json["worker_key_id"], "worker-a");
+        assert_eq!(json["reservation_id"], "reserve-a");
+        assert_eq!(json["runtime_state_handle"], "reserve-a");
+        assert_eq!(json["handle"]["kind"], "generic_reserved_state");
+        assert_eq!(json["handle"]["generation"], 1);
+        assert_eq!(json["state_arena_owns_pages"], true);
+        assert_eq!(json["state_page_descriptors"].as_array().unwrap().len(), 2);
+        assert_eq!(json["reserved_bytes"], 8192);
+        assert_eq!(json["current_session_bytes"], 1024);
+        assert_eq!(json["outstanding_reserved_bytes"], 2048);
+        assert_eq!(json["projected_reserved_bytes"], 11264);
+        assert_eq!(json["budget_bytes"], 16384);
     }
 
     #[test]
