@@ -48,9 +48,9 @@ Current scheduler boundary status:
 - Bun scheduler code remains the live server control plane until Rust server paths consume the shared scheduler crate.
 
 Current generate boundary status:
-- `hipfire-generate` owns typed generation sampling policy, text generation request/event structs, generate-batch prefill/decode envelopes, Qwen3.5 prefill/decode backend plan enums, and scheduler metadata helpers.
+- `hipfire-generate` owns typed generation sampling policy, text generation request/event structs, generate-batch prefill/decode envelopes, batch/preflight JSON validation, Qwen3.5 prefill/decode backend plan enums, and scheduler metadata helpers.
 - `hipfire-daemon-protocol` re-exports the generate-owned text request and token/done/error event structs for daemon JSONL generate traffic, so the protocol crate no longer owns duplicate generate contracts.
-- `hipfire-daemon` consumes the shared generate-batch prefill, prefix-hash preflight, decode envelope, and Qwen3.5 backend-plan contracts while preserving its existing validation and execution paths.
+- `hipfire-daemon` consumes the shared generate-batch prefill, prefix-hash preflight, decode envelope, validation, and Qwen3.5 backend-plan contracts while preserving its existing execution paths.
 - `hipfire-daemon` still owns model-specific execution, Qwen3.5 runtime orchestration, and JSONL adapter dispatch until later migration slices consume more shared logic.
 
 Current CPU/backend boundary status:
@@ -65,7 +65,7 @@ Current daemon protocol boundary status:
 - `hipfire-daemon-protocol` owns typed daemon JSONL request/response structs, including load/generate request envelopes and token/done/error responses.
 - `hipfire-server::daemon::protocol` remains a compatibility re-export so server callers keep their current paths while the wire JSON stays unchanged.
 - `hipfire-daemon` consumes the shared generate request contract opportunistically for common generate fields while preserving raw-JSON fallbacks for legacy/daemon-only fields.
-- `hipfire-daemon` also consumes generate-owned batch prefill/preflight/decode contracts so daemon-local duplicate batch structs and Qwen3.5 batch backend selectors are retired.
+- `hipfire-daemon` also consumes generate-owned batch prefill/preflight/decode contracts and validators so daemon-local duplicate batch structs, validation helpers, and Qwen3.5 batch backend selectors are retired.
 - `hipfire-daemon` also consumes the shared load request contract for common load fields (`model`, `max_seq`, `physical_cap`, `dflash_mode`, `draft`, `kv_cache`, `cask_sidecar`) while preserving raw-JSON fallbacks for legacy/daemon-only load fields.
 - `hipfire-daemon-protocol` re-exports the model-owned load request/params so protocol callers keep stable paths while load contract ownership moves into `hipfire-model`.
 
