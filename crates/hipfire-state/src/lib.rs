@@ -329,6 +329,62 @@ pub fn sequence_state_page_descriptor_json(
     })
 }
 
+pub fn describe_state_done_json(
+    id: &str,
+    worker_id: &str,
+    handle: &SequenceStateHandle,
+    state_arena_owns_pages: bool,
+    reserved_bytes: usize,
+    state_page_descriptors: &[SequenceStatePageDescriptor],
+) -> serde_json::Value {
+    let state_page_descriptors = state_page_descriptors
+        .iter()
+        .map(sequence_state_page_descriptor_json)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "type": "describe_state_done",
+        "id": id,
+        "worker_key_id": worker_id,
+        "runtime_state_handle": &handle.id,
+        "handle": {
+            "id": &handle.id,
+            "kind": &handle.kind,
+            "generation": handle.generation,
+        },
+        "state_arena_owns_pages": state_arena_owns_pages,
+        "reserved_bytes": reserved_bytes,
+        "state_page_descriptors": state_page_descriptors,
+    })
+}
+
+pub fn session_state_reservation_describe_json(
+    id: &str,
+    reservation: &SessionStateReservation,
+) -> serde_json::Value {
+    describe_state_done_json(
+        id,
+        &reservation.worker_id,
+        &reservation.handle,
+        true,
+        reservation.reserved_bytes,
+        &reservation.state_page_descriptors,
+    )
+}
+
+pub fn described_sequence_state_json(
+    id: &str,
+    described: &DescribedSequenceState,
+) -> serde_json::Value {
+    describe_state_done_json(
+        id,
+        &described.worker_id,
+        &described.handle,
+        described.state_arena_owns_pages,
+        described.reserved_bytes,
+        &described.state_page_descriptors,
+    )
+}
+
 impl GenericSequenceStateArena {
     pub fn new() -> Self {
         Self {
@@ -726,6 +782,71 @@ mod tests {
             "attention_kv"
         );
         assert_eq!(json["state_page_descriptors"][0]["handle"]["generation"], 7);
+    }
+
+    #[test]
+    fn describe_state_done_json_preserves_daemon_wire_shape() {
+        let handle = qwen35_sequence_state_handle("qwen35-checkpoint:batch:req:16", 41);
+        let descriptor = SequenceStatePageDescriptor {
+            session_id: handle.id.clone(),
+            handle: handle.clone(),
+            kind: SequenceStatePageKind::Kv,
+            label: "qwen35.kv_cache".to_string(),
+            logical_position: 16,
+            resident_bytes: 1024,
+            allocation_epoch: 41,
+            owns_pages: true,
+            shape: vec![2, 16, 4, 32],
+            placement: "hip:arch6:device0".to_string(),
+            role: "resident".to_string(),
+        };
+        let described = DescribedSequenceState {
+            worker_id: "worker:arch6:pp1:q8".to_string(),
+            handle,
+            state_arena_owns_pages: true,
+            reserved_bytes: 1024,
+            state_page_descriptors: vec![descriptor],
+        };
+
+        let json = described_sequence_state_json("describe-1", &described);
+        assert_eq!(json["type"], "describe_state_done");
+        assert_eq!(json["id"], "describe-1");
+        assert_eq!(json["worker_key_id"], "worker:arch6:pp1:q8");
+        assert_eq!(
+            json["runtime_state_handle"],
+            "qwen35-checkpoint:batch:req:16"
+        );
+        assert_eq!(json["handle"]["kind"], "qwen35_checkpoint");
+        assert_eq!(json["handle"]["generation"], 41);
+        assert_eq!(json["state_arena_owns_pages"], true);
+        assert_eq!(json["reserved_bytes"], 1024);
+        assert_eq!(
+            json["state_page_descriptors"][0]["state_kind"],
+            "attention_kv"
+        );
+    }
+
+    #[test]
+    fn reservation_describe_json_preserves_generic_owned_shape() {
+        let mut arena = GenericSequenceStateArena::new();
+        let reservation = arena.reserve(
+            "worker-a",
+            "reserve-a".to_string(),
+            &[SequenceStatePageKind::Kv],
+            128,
+            4096,
+            0,
+        );
+
+        let json = session_state_reservation_describe_json("describe-2", &reservation);
+        assert_eq!(json["type"], "describe_state_done");
+        assert_eq!(json["id"], "describe-2");
+        assert_eq!(json["worker_key_id"], "worker-a");
+        assert_eq!(json["runtime_state_handle"], "reserve-a");
+        assert_eq!(json["handle"]["kind"], "generic_reserved_state");
+        assert_eq!(json["state_arena_owns_pages"], true);
+        assert_eq!(json["reserved_bytes"], 4096);
+        assert_eq!(json["state_page_descriptors"][0]["owns_pages"], true);
     }
 
     #[test]
