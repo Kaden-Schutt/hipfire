@@ -34,3 +34,4 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval run metadata artifacts now reuse `hipfire-evidence` run metadata contracts and JSON rendering instead of eval-local schema construction.
 - Eval comparison artifacts now reuse `hipfire-evidence` metric-direction policy instead of eval-local metric classification.
 - Eval admission findings now reuse `hipfire-evidence` quality/review policy instead of eval-local rejection classification.
+- Eval admission required/observed evidence catalogs now reuse `hipfire-evidence` ownership instead of eval-local hard-coded lists.

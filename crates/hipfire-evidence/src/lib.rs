@@ -111,6 +111,24 @@ pub const STANDARD_EVIDENCE_ARTIFACT_SPECS: &[EvidenceArtifactSpec] = &[
     },
 ];
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionEvidenceRequirement {
+    pub kind: &'static str,
+    pub batteries: Vec<&'static str>,
+}
+
+pub const OBSERVED_ADMISSION_EVIDENCE_KINDS: &[&str] = &[
+    "phase_timings",
+    "launch_counts",
+    "moe_router_histogram",
+    "memory",
+    "dflash_trace",
+    "path_c_trace",
+    "module_evidence",
+    "coherence",
+    "profiling",
+];
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvidenceRecord {
     pub battery: String,
@@ -381,6 +399,31 @@ pub fn admission_metric_is_quality(battery: &str, metric: &str) -> bool {
             metric,
             "mean_kld" | "p99_kld" | "ppl" | "nll" | "accuracy" | "exact_match"
         )
+}
+
+pub fn required_admission_evidence_requirements(
+    selected_batteries: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Vec<AdmissionEvidenceRequirement> {
+    let mut required = vec![
+        AdmissionEvidenceRequirement {
+            kind: "quality",
+            batteries: vec!["quality"],
+        },
+        AdmissionEvidenceRequirement {
+            kind: "performance",
+            batteries: vec!["speed", "dflash", "pflash"],
+        },
+    ];
+    if selected_batteries
+        .into_iter()
+        .any(|battery| battery.as_ref() == "barrage")
+    {
+        required.push(AdmissionEvidenceRequirement {
+            kind: "barrage",
+            batteries: vec!["barrage"],
+        });
+    }
+    required
 }
 
 pub fn extract_external_evidence_records_json(
@@ -818,6 +861,47 @@ mod tests {
         assert!(!admission_metric_is_quality("speed", "tok_s"));
         assert!(!admission_metric_is_quality("dflash", "accept_rate"));
         assert!(!admission_metric_is_quality("coherence", "hard_fails"));
+    }
+
+    #[test]
+    fn required_admission_evidence_catalog_preserves_eval_policy() {
+        let default = required_admission_evidence_requirements(["quality", "speed"]);
+        assert_eq!(
+            default,
+            vec![
+                AdmissionEvidenceRequirement {
+                    kind: "quality",
+                    batteries: vec!["quality"],
+                },
+                AdmissionEvidenceRequirement {
+                    kind: "performance",
+                    batteries: vec!["speed", "dflash", "pflash"],
+                },
+            ]
+        );
+
+        let with_barrage = required_admission_evidence_requirements(["quality", "barrage"]);
+        assert_eq!(with_barrage.len(), 3);
+        assert_eq!(with_barrage[2].kind, "barrage");
+        assert_eq!(with_barrage[2].batteries, vec!["barrage"]);
+    }
+
+    #[test]
+    fn observed_admission_evidence_catalog_preserves_runtime_telemetry_kinds() {
+        assert_eq!(
+            OBSERVED_ADMISSION_EVIDENCE_KINDS,
+            &[
+                "phase_timings",
+                "launch_counts",
+                "moe_router_histogram",
+                "memory",
+                "dflash_trace",
+                "path_c_trace",
+                "module_evidence",
+                "coherence",
+                "profiling",
+            ]
+        );
     }
 
     #[test]
