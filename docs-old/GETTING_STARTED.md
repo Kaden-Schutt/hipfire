@@ -57,6 +57,34 @@ cargo build --release -p hipfire-quantize
 For normal source-checkout builds, `make build` is the short form for the
 release build.
 
+On machines with an AMD XDNA NPU (Ryzen AI), enable the NPU SwiGLU, RMSNorm,
+and RoPE kernels by adding the `npu-kernels` feature. This requires XRT 2.x and
+the `mlir_aie` Python package in `~/.venv`; the build scripts auto-detect the
+NPU generation via pyxrt and write xclbin artifacts to `target/npu/`:
+
+```bash
+cargo build --release --features npu-kernels
+```
+
+To target specific generations or override the default sizes:
+
+```bash
+HIPFIRE_NPU_TARGETS=npu1,npu2 HIPFIRE_NPU_HIDDEN_SIZES=8960,18944 \
+    HIPFIRE_NPU_RMSNORM_SIZES=1536,3584 \
+    HIPFIRE_NPU_ROPE_CONFIGS=8:2:256:64 \
+    cargo build --release --features npu-kernels
+```
+
+You can also build individual xclbins directly without Cargo:
+
+```bash
+python tools/npu/build_qwen35_swiglu.py --hidden-size 8960   # auto-detects NPU
+python tools/npu/build_qwen35_rmsnorm.py --hidden-size 1536  # Qwen3.5-1.5B
+python tools/npu/build_qwen35_rmsnorm.py --hidden-size 3584  # Qwen3.5-7B
+# RoPE (Q + K xclbins, Qwen3.5-1.5B dense config):
+python tools/npu/build_qwen35_rope.py --n-heads 8 --n-kv-heads 2 --head-dim 256 --n-rot 64
+```
+
 ## Verify
 
 ```bash
