@@ -134,6 +134,25 @@ pub struct SequenceStateHandle {
     pub generation: u64,
 }
 
+pub fn qwen35_state_handle_kind(session_id: &str) -> &'static str {
+    if session_id.starts_with("qwen35-checkpoint:") {
+        "qwen35_checkpoint"
+    } else {
+        "qwen35_session"
+    }
+}
+
+pub fn qwen35_sequence_state_handle(
+    session_id: &str,
+    allocation_epoch: u64,
+) -> SequenceStateHandle {
+    SequenceStateHandle {
+        id: session_id.to_string(),
+        kind: qwen35_state_handle_kind(session_id).to_string(),
+        generation: allocation_epoch,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedSequenceStateHandle {
     pub id: String,
@@ -760,6 +779,19 @@ mod tests {
             sequence_state_handle_id(&serde_json::json!({"kind": "missing_id"})),
             None
         );
+    }
+
+    #[test]
+    fn qwen35_sequence_state_handles_classify_sessions_and_checkpoints() {
+        let session = qwen35_sequence_state_handle("request-a", 7);
+        assert_eq!(session.id, "request-a");
+        assert_eq!(session.kind, "qwen35_session");
+        assert_eq!(session.generation, 7);
+
+        let checkpoint = qwen35_sequence_state_handle("qwen35-checkpoint:batch:req:16", 41);
+        assert_eq!(checkpoint.id, "qwen35-checkpoint:batch:req:16");
+        assert_eq!(checkpoint.kind, "qwen35_checkpoint");
+        assert_eq!(checkpoint.generation, 41);
     }
 
     #[test]

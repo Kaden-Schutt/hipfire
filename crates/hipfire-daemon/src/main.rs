@@ -71,15 +71,16 @@ use hipfire_state::{
     describe_sequence_state_descriptors, model_worker_runtime_view_json,
     parse_reserve_session_state_kinds, parse_sequence_state_handle,
     parse_sequence_state_handle_list, parsed_handle_may_target_generic,
-    parsed_handle_may_target_loaded_state, sequence_state_page_descriptor_json,
-    DescribedSequenceState, GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId,
-    ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
-    SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStateHandle,
+    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
+    sequence_state_page_descriptor_json, DescribedSequenceState, GenericSequenceStateArena,
+    ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
+    ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
     SequenceStatePageDescriptor, SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
     generic_state_reservation_descriptors, sequence_state_handle_id, sequence_state_handle_parts,
+    SequenceStateHandle,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
@@ -3409,22 +3410,6 @@ fn qwen35_request_session_count(m: &LoadedModel) -> usize {
     saved + active
 }
 
-fn qwen35_state_handle_kind(session_id: &str) -> &'static str {
-    if session_id.starts_with("qwen35-checkpoint:") {
-        "qwen35_checkpoint"
-    } else {
-        "qwen35_session"
-    }
-}
-
-fn qwen35_sequence_state_handle(session_id: &str, allocation_epoch: u64) -> SequenceStateHandle {
-    SequenceStateHandle {
-        id: session_id.to_string(),
-        kind: qwen35_state_handle_kind(session_id).to_string(),
-        generation: allocation_epoch,
-    }
-}
-
 fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
     let mut descriptors = Vec::new();
     let placement = format!("hip:arch{}:device0", m.arch_id);
@@ -3527,13 +3512,10 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             let logical_position = m.seq_pos + compact_offset;
             let allocation_epoch = m.q35_active_state_allocation_epoch;
             let owns_pages = allocation_epoch != 0;
+            let handle = qwen35_sequence_state_handle(active_id, allocation_epoch);
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
-                handle: SequenceStateHandle {
-                    id: active_id.to_string(),
-                    kind: "qwen35_session".to_string(),
-                    generation: allocation_epoch,
-                },
+                handle: handle.clone(),
                 kind: SequenceStatePageKind::Kv,
                 label: "qwen35.kv_cache.active".to_string(),
                 logical_position,
@@ -3562,11 +3544,7 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             });
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
-                handle: SequenceStateHandle {
-                    id: active_id.to_string(),
-                    kind: "qwen35_session".to_string(),
-                    generation: allocation_epoch,
-                },
+                handle: handle.clone(),
                 kind: SequenceStatePageKind::DeltaNet,
                 label: "qwen35.deltanet_state.active".to_string(),
                 logical_position,
@@ -3594,11 +3572,7 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             });
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
-                handle: SequenceStateHandle {
-                    id: active_id.to_string(),
-                    kind: "qwen35_session".to_string(),
-                    generation: allocation_epoch,
-                },
+                handle: handle.clone(),
                 kind: SequenceStatePageKind::Logits,
                 label: "qwen35.logits_snapshot.active".to_string(),
                 logical_position,
@@ -3619,11 +3593,7 @@ fn qwen35_state_page_descriptors(m: &LoadedModel) -> Vec<SequenceStatePageDescri
             });
             descriptors.push(SequenceStatePageDescriptor {
                 session_id: active_id.to_string(),
-                handle: SequenceStateHandle {
-                    id: active_id.to_string(),
-                    kind: "qwen35_session".to_string(),
-                    generation: allocation_epoch,
-                },
+                handle,
                 kind: SequenceStatePageKind::BackendPrivate,
                 label: "qwen35.prefix_metadata.active".to_string(),
                 logical_position,
