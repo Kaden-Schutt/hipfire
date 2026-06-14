@@ -300,6 +300,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-evidence"
+version = "0.2.1"
+
+[[package]]
 name = "hipfire-prompt"
 version = "0.2.1"
 dependencies = [
@@ -341,6 +345,7 @@ dependencies = [
  "hipfire-atlas",
  "hipfire-detect",
  "hipfire-dispatch",
+ "hipfire-evidence",
  "hipfire-prompt",
  "libc",
  "memmap2",

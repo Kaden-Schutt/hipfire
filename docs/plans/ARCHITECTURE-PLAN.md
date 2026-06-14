@@ -22,7 +22,7 @@ The target crates for modular boundaries remain:
 - `hipfire-generate`
 - `hipfire-coherence`
 - `hipfire-rocm`
-- `hipfire-evidence`
+- `hipfire-evidence` (created; owns evidence provenance and hash helpers)
 
 A `bun`-free control plane remains desirable but is deferred behind verified seam extraction.
 
@@ -30,6 +30,10 @@ Current prompt boundary status:
 - `hipfire-prompt` owns `AssistantPrefix`, `Role`, `Message`, `ToolCall`, `ChatFrame`, and `JinjaChatFrame`.
 - `hipfire-runtime::prompt_frame` remains a compatibility re-export and implements the prompt tokenizer trait for the runtime tokenizer.
 - The Rust server forwards structured chat `messages` to the daemon and keeps `prompt` as the last-user-text compatibility fallback, avoiding nested ChatML.
+
+Current evidence boundary status:
+- `hipfire-evidence` owns stable hash, model/tag hash, directory digest, file hash, and HFQ metadata extraction helpers.
+- `hipfire-runtime::eval_harness` still owns eval execution and artifact writing, but now consumes the shared evidence provenance helpers.
 
 ## 3) Execution sequence
 
