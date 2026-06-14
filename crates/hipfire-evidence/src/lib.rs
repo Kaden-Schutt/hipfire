@@ -12,6 +12,7 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +135,24 @@ pub struct EvidenceRecord {
     pub prompt_path: Option<String>,
     pub metrics: BTreeMap<String, Value>,
     pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunProvenance {
+    pub runner: String,
+    pub runner_version: String,
+    pub hipfire_version: String,
+    pub git_commit: Option<String>,
+    pub git_branch: Option<String>,
+    pub git_describe: Option<String>,
+    pub git_dirty: Option<bool>,
+    pub binary_hash: Option<String>,
+    pub arch: Option<String>,
+    pub rocm: Option<String>,
+}
+
+pub fn run_provenance_json(provenance: RunProvenance) -> Value {
+    serde_json::to_value(provenance).unwrap_or_else(|_| json!({}))
 }
 
 pub fn evidence_record_json(record: EvidenceRecord) -> Value {
@@ -489,6 +508,32 @@ mod tests {
         assert_eq!(json["prompt_path"], "benchmarks/prompts/smoke.txt");
         assert_eq!(json["metrics"]["tok_s"], 123.4);
         assert_eq!(json["elapsed_ms"], 42);
+    }
+
+    #[test]
+    fn run_provenance_json_preserves_artifact_shape() {
+        let provenance = RunProvenance {
+            runner: "hipfire-eval".to_string(),
+            runner_version: "0.2.0".to_string(),
+            hipfire_version: "0.2.0".to_string(),
+            git_commit: Some("abc123".to_string()),
+            git_branch: Some("main".to_string()),
+            git_describe: Some("v0.2.0-1-gabc123".to_string()),
+            git_dirty: Some(false),
+            binary_hash: Some("sha256:binary".to_string()),
+            arch: Some("gfx1151".to_string()),
+            rocm: Some("6.4".to_string()),
+        };
+
+        let json = run_provenance_json(provenance);
+        assert_eq!(json["runner"], "hipfire-eval");
+        assert_eq!(json["runner_version"], "0.2.0");
+        assert_eq!(json["hipfire_version"], "0.2.0");
+        assert_eq!(json["git_commit"], "abc123");
+        assert_eq!(json["git_dirty"], false);
+        assert_eq!(json["binary_hash"], "sha256:binary");
+        assert_eq!(json["arch"], "gfx1151");
+        assert_eq!(json["rocm"], "6.4");
     }
 
     #[test]

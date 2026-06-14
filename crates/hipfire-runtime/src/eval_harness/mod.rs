@@ -21,7 +21,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
     directory_hash, evidence_record_json, file_hash, list_files, model_hash, read_hfq_metadata,
-    stable_hash_bytes, stable_hash_file_fallback, standard_evidence_paths_in_dir, EvidenceRecord,
+    run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
+    standard_evidence_paths_in_dir, EvidenceRecord, RunProvenance,
     STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
 use hipfire_model::{discover_dflash_draft_for_model, model_artifact_stem};
@@ -572,20 +573,6 @@ pub struct AdmissionArtifact {
     pub required_evidence: Vec<AdmissionEvidence>,
     pub observed_evidence: Vec<AdmissionEvidence>,
     pub findings: Vec<AdmissionFinding>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunProvenance {
-    pub runner: String,
-    pub runner_version: String,
-    pub hipfire_version: String,
-    pub git_commit: Option<String>,
-    pub git_branch: Option<String>,
-    pub git_describe: Option<String>,
-    pub git_dirty: Option<bool>,
-    pub binary_hash: Option<String>,
-    pub arch: Option<String>,
-    pub rocm: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3505,7 +3492,7 @@ fn run_provenance(ctx: &EvalContext) -> RunProvenance {
 }
 
 fn run_provenance_value(ctx: &EvalContext) -> Value {
-    serde_json::to_value(run_provenance(ctx)).unwrap_or_else(|_| json!({}))
+    run_provenance_json(run_provenance(ctx))
 }
 
 fn run_metadata_artifact_value(config: &EvalConfig, ctx: &EvalContext) -> Value {

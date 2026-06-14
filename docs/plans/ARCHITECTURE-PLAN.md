@@ -80,8 +80,8 @@ Current daemon adapter boundary status:
 - `hipfire-server::daemon::engine` remains a compatibility re-export for server and CLI callers while the adapter becomes reusable outside the HTTP server crate.
 
 Current evidence boundary status:
-- `hipfire-evidence` owns stable hash, model/tag hash, directory digest, file hash, HFQ metadata extraction helpers, the standard evidence artifact catalog, catalog-based evidence artifact directory discovery, and the generic evidence artifact record contract/JSON renderer.
-- `hipfire-runtime::eval_harness` still owns eval execution and artifact writing, but now consumes the shared evidence provenance helpers, artifact catalog, artifact path discovery, and evidence record rendering.
+- `hipfire-evidence` owns stable hash, model/tag hash, directory digest, file hash, HFQ metadata extraction helpers, the standard evidence artifact catalog, catalog-based evidence artifact directory discovery, the generic evidence artifact record contract/JSON renderer, and run-provenance contract/JSON rendering.
+- `hipfire-runtime::eval_harness` still owns eval execution and artifact writing, but now consumes the shared evidence provenance helpers, artifact catalog, artifact path discovery, evidence record rendering, and run-provenance contract.
 
 Current coherence boundary status:
 - `hipfire-coherence` owns detector profile selection, detector-bank construction, agentic prompt detection, coherence run input/output contracts, report row serialization, and coherence artifact serialization.
