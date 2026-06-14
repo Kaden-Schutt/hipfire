@@ -328,6 +328,53 @@ pub fn evidence_record_json(record: EvidenceRecord) -> Value {
     })
 }
 
+pub fn evidence_metric_direction(metric: &str, delta: f64) -> String {
+    let lower_is_better = [
+        "mean_kld",
+        "p99_kld",
+        "ppl",
+        "nll",
+        "ttft_ms",
+        "decode_ms",
+        "prefill_ms",
+        "elapsed_ms",
+    ]
+    .iter()
+    .any(|prefix| metric == *prefix || metric.ends_with(prefix));
+    let higher_is_better = [
+        "tok_s",
+        "tokens_per_second",
+        "accept_rate",
+        "tau",
+        "accuracy",
+        "exact_match",
+    ]
+    .iter()
+    .any(|prefix| metric == *prefix || metric.ends_with(prefix));
+
+    if lower_is_better {
+        if delta < 0.0 {
+            "improved".to_string()
+        } else if delta > 0.0 {
+            "regressed".to_string()
+        } else {
+            "unchanged".to_string()
+        }
+    } else if higher_is_better {
+        if delta > 0.0 {
+            "improved".to_string()
+        } else if delta < 0.0 {
+            "regressed".to_string()
+        } else {
+            "unchanged".to_string()
+        }
+    } else if delta == 0.0 {
+        "unchanged".to_string()
+    } else {
+        "changed".to_string()
+    }
+}
+
 pub fn extract_external_evidence_records_json(
     kind: &str,
     path: &Path,
@@ -730,6 +777,27 @@ mod tests {
         assert_eq!(json["prompt_path"], "benchmarks/prompts/smoke.txt");
         assert_eq!(json["metrics"]["tok_s"], 123.4);
         assert_eq!(json["elapsed_ms"], 42);
+    }
+
+    #[test]
+    fn evidence_metric_direction_classifies_known_metric_semantics() {
+        assert_eq!(evidence_metric_direction("mean_kld", -0.01), "improved");
+        assert_eq!(evidence_metric_direction("mean_kld", 0.01), "regressed");
+        assert_eq!(evidence_metric_direction("decode_ms", -1.0), "improved");
+        assert_eq!(evidence_metric_direction("tok_s", 10.0), "improved");
+        assert_eq!(evidence_metric_direction("tok_s", -10.0), "regressed");
+        assert_eq!(evidence_metric_direction("accuracy", 0.1), "improved");
+        assert_eq!(evidence_metric_direction("exact_match", -0.1), "regressed");
+        assert_eq!(
+            evidence_metric_direction("phase_prefill_ms", 0.1),
+            "regressed"
+        );
+        assert_eq!(
+            evidence_metric_direction("decode_tokens_per_second", 0.1),
+            "improved"
+        );
+        assert_eq!(evidence_metric_direction("custom_metric", 1.0), "changed");
+        assert_eq!(evidence_metric_direction("custom_metric", 0.0), "unchanged");
     }
 
     #[test]

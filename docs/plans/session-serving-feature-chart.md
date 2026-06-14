@@ -32,3 +32,4 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval artifact index entries now reuse `hipfire-evidence` index rendering instead of eval-local JSON construction.
 - Eval external evidence ingestion now reuses `hipfire-evidence` record selection and annotation helpers instead of eval-local JSON mapping.
 - Eval run metadata artifacts now reuse `hipfire-evidence` run metadata contracts and JSON rendering instead of eval-local schema construction.
+- Eval comparison artifacts now reuse `hipfire-evidence` metric-direction policy instead of eval-local metric classification.

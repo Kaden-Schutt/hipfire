@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
     directory_hash, evidence_artifact_index_entry_from_value_json,
-    evidence_artifact_index_entry_json, evidence_record_json,
+    evidence_artifact_index_entry_json, evidence_metric_direction, evidence_record_json,
     extract_external_evidence_records_json, file_hash, list_files, model_hash, read_hfq_metadata,
     run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
     standard_evidence_paths_in_dir, EvidenceArtifactIndexContext, EvidenceRecord,
@@ -4304,7 +4304,7 @@ fn compare_metric_maps(
                 comparator: comparator_num,
                 delta,
                 relative_delta,
-                direction: metric_direction(name, delta),
+                direction: evidence_metric_direction(name, delta),
             },
         );
     }
@@ -4315,53 +4315,6 @@ fn compare_metric_maps(
             model: comparator.model.clone(),
             metrics,
         })
-    }
-}
-
-fn metric_direction(metric: &str, delta: f64) -> String {
-    let lower_is_better = [
-        "mean_kld",
-        "p99_kld",
-        "ppl",
-        "nll",
-        "ttft_ms",
-        "decode_ms",
-        "prefill_ms",
-        "elapsed_ms",
-    ]
-    .iter()
-    .any(|prefix| metric == *prefix || metric.ends_with(prefix));
-    let higher_is_better = [
-        "tok_s",
-        "tokens_per_second",
-        "accept_rate",
-        "tau",
-        "accuracy",
-        "exact_match",
-    ]
-    .iter()
-    .any(|prefix| metric == *prefix || metric.ends_with(prefix));
-
-    if lower_is_better {
-        if delta < 0.0 {
-            "improved".to_string()
-        } else if delta > 0.0 {
-            "regressed".to_string()
-        } else {
-            "unchanged".to_string()
-        }
-    } else if higher_is_better {
-        if delta > 0.0 {
-            "improved".to_string()
-        } else if delta < 0.0 {
-            "regressed".to_string()
-        } else {
-            "unchanged".to_string()
-        }
-    } else if delta == 0.0 {
-        "unchanged".to_string()
-    } else {
-        "changed".to_string()
     }
 }
 
