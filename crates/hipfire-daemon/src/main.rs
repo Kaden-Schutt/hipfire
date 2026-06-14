@@ -74,11 +74,11 @@ use hipfire_state::{
     parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
     release_sessions_done_json, release_state_done_json, reserve_session_state_done_json,
     reserve_session_state_rejected_json, session_state_reservation_describe_json,
-    unload_worker_done_json, validate_checkpoint_prefix_hash, DescribedSequenceState,
-    GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView,
-    ModelWorkerRuntimeView, ParsedSequenceStateHandle, ReleaseStateResponseKind,
-    SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStatePageDescriptor,
-    SequenceStatePageKind,
+    unload_worker_done_json, validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
+    DescribedSequenceState, GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId,
+    ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
+    ReleaseStateResponseKind, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
+    SequenceStatePageDescriptor, SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -4370,12 +4370,11 @@ fn qwen35_checkpoint_session_state(
                 )
             })?;
         let logical_position = source.seq_pos + source.kv_cache.compact_offset;
-        if logical_position != request.expected_logical_position {
-            return Err(format!(
-                "qwen35 checkpoint source session {} logical_position mismatch: expected={} resident={}",
-                request.source_session_id, request.expected_logical_position, logical_position
-            ));
-        }
+        validate_checkpoint_logical_position(
+            request.source_session_id,
+            request.expected_logical_position,
+            logical_position,
+        )?;
     }
     if let Some(prefix_hash) = request.checkpoint_prefix_hash {
         if let Some(source) = m.q35_sessions.get_mut(request.source_session_id) {

@@ -199,6 +199,19 @@ pub fn validate_checkpoint_prefix_hash(
     Ok(())
 }
 
+pub fn validate_checkpoint_logical_position(
+    source_session_id: &str,
+    expected_logical_position: usize,
+    resident_logical_position: usize,
+) -> Result<(), String> {
+    if resident_logical_position != expected_logical_position {
+        return Err(format!(
+            "qwen35 checkpoint source session {source_session_id} logical_position mismatch: expected={expected_logical_position} resident={resident_logical_position}"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SequenceStatePageKind {
     Kv,
@@ -1303,6 +1316,20 @@ mod tests {
         assert_eq!(
             err,
             "prefix hash mismatch for checkpoint checkpoint-a: request=requested len=12 stored=stored len=10"
+        );
+    }
+
+    #[test]
+    fn checkpoint_logical_position_validation_accepts_match() {
+        validate_checkpoint_logical_position("checkpoint-a", 16, 16).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_logical_position_validation_reports_mismatch() {
+        let err = validate_checkpoint_logical_position("checkpoint-a", 16, 12).unwrap_err();
+        assert_eq!(
+            err,
+            "qwen35 checkpoint source session checkpoint-a logical_position mismatch: expected=16 resident=12"
         );
     }
 }
