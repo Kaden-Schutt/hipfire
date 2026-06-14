@@ -86,6 +86,4 @@ Status: deferred.
 >>> One issue surfaced before verification: gemm_f16_x_f32_wmma currently launches with raw stack kernargs rather than the graph-safe blob helper. I’m tightening the env gate so this experimental route only runs outside hipGraph capture; captured paths will keep using the scalar default until the dispatcher wrapper is made graph-safe.
 
 
-## hipfire-eval is still loading model multiple times rather than reseting state between tests.
-
 ## further investigate using packed 4 bit operations on gfx1151/RDNA3/RDNA3.5

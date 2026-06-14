@@ -13,6 +13,7 @@ use std::path::Path;
 
 pub struct SpeedBenchArgs {
     pub model_path: String,
+    pub prefill_list: Option<Vec<usize>>,
     pub prefill_len: usize,
     pub prefill_runs: usize,
     pub gen_len: usize,
@@ -32,6 +33,7 @@ impl SpeedBenchArgs {
 
         let mut parsed = Self {
             model_path: args[1].clone(),
+            prefill_list: None,
             prefill_len: 32,
             prefill_runs: 1,
             gen_len: 100,
@@ -44,6 +46,15 @@ impl SpeedBenchArgs {
             match args[i].as_str() {
                 "--prefill" => {
                     parsed.prefill_len = parse_value(&args, i, "--prefill");
+                    i += 2;
+                }
+                "--prefill-list" => {
+                    parsed.prefill_list = Some(
+                        value_arg(&args, i, "--prefill-list")
+                            .split(',')
+                            .filter_map(|raw| raw.trim().parse::<usize>().ok())
+                            .collect(),
+                    );
                     i += 2;
                 }
                 "--prefill-runs" => {
@@ -70,6 +81,17 @@ impl SpeedBenchArgs {
         }
 
         parsed
+    }
+}
+
+impl SpeedBenchArgs {
+    pub fn prefill_lengths(&self) -> Vec<usize> {
+        if let Some(list) = &self.prefill_list {
+            if !list.is_empty() {
+                return list.clone();
+            }
+        }
+        vec![self.prefill_len]
     }
 }
 

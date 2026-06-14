@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_void, CString, OsStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -1355,7 +1355,7 @@ fn run_host_capability_profile_anchor(config: &EvalConfig, ctx: &EvalContext) ->
 fn run_rocprof_speed_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalResult {
     let prompt_path = "benchmarks/prompts/dflash_resident_smoke.txt";
     let prompt_ref = prompt(prompt_path);
-    let mut base_metrics = BTreeMap::from([
+    let base_metrics = BTreeMap::from([
         ("executor".to_string(), json!("examples")),
         ("profiling_requested".to_string(), json!(true)),
         ("profiling_collector".to_string(), json!("rocprofv3")),
@@ -1503,7 +1503,8 @@ fn run_rocprof_speed_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalResul
     let output = match command.output() {
         Ok(output) => output,
         Err(err) => {
-            base_metrics.insert("command".to_string(), json!(command_display));
+            let mut metrics = base_metrics.clone();
+            metrics.insert("command".to_string(), json!(command_display));
             return skip_row_with_metrics(
                 BatteryId::Profile,
                 None,
@@ -1513,33 +1514,34 @@ fn run_rocprof_speed_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalResul
                 config,
                 ctx,
                 prompt_ref,
-                base_metrics,
+                metrics,
             );
         }
     };
     let elapsed_ms = elapsed_since_ms(started);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    base_metrics.extend(parse_bench_metrics(&stderr));
-    base_metrics.insert("command".to_string(), json!(command_display));
-    base_metrics.insert(
+    let mut metrics = base_metrics.clone();
+    metrics.extend(parse_bench_metrics(&stderr));
+    metrics.insert("command".to_string(), json!(command_display));
+    metrics.insert(
         "rocprof_bin".to_string(),
         json!(rocprof.display().to_string()),
     );
-    base_metrics.insert(
+    metrics.insert(
         "rocprof_output_dir".to_string(),
         json!(raw_dir.display().to_string()),
     );
-    base_metrics.insert("rocprof_prefix".to_string(), json!(prefix));
-    base_metrics.insert(
+    metrics.insert("rocprof_prefix".to_string(), json!(prefix));
+    metrics.insert(
         "runtime_evidence_dir".to_string(),
         json!(evidence_dir.display().to_string()),
     );
-    base_metrics.insert(
+    metrics.insert(
         "stdout_hash".to_string(),
         json!(stable_hash_bytes(stdout.as_bytes())),
     );
-    base_metrics.insert(
+    metrics.insert(
         "stderr_hash".to_string(),
         json!(stable_hash_bytes(stderr.as_bytes())),
     );
@@ -1551,7 +1553,7 @@ fn run_rocprof_speed_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalResul
             None,
             EvalStatus::Skip,
             Some(format!("rocprofv3 exited with {}", output.status)),
-            base_metrics,
+            metrics,
             config,
             ctx,
             prompt_ref,
@@ -1559,9 +1561,9 @@ fn run_rocprof_speed_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalResul
         );
     }
 
-    match write_rocprof_profile_evidence(&raw_dir, &evidence_dir, config, ctx, &base_metrics) {
+    match write_rocprof_profile_evidence(&raw_dir, &evidence_dir, config, ctx, &metrics) {
         Ok(count) if count > 0 => {
-            base_metrics.insert("rocprof_kernel_rows".to_string(), json!(count));
+            metrics.insert("rocprof_kernel_rows".to_string(), json!(count));
             row(
                 BatteryId::Profile,
                 None,
@@ -1569,7 +1571,7 @@ fn run_rocprof_speed_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalResul
                 None,
                 EvalStatus::Pass,
                 None,
-                base_metrics,
+                metrics,
                 config,
                 ctx,
                 prompt_ref,
@@ -1583,7 +1585,7 @@ fn run_rocprof_speed_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalResul
             None,
             EvalStatus::Skip,
             Some("rocprofv3 completed but no kernel stats CSV rows were found".to_string()),
-            base_metrics,
+            metrics,
             config,
             ctx,
             prompt_ref,
@@ -1596,7 +1598,7 @@ fn run_rocprof_speed_anchor(config: &EvalConfig, ctx: &EvalContext) -> EvalResul
             None,
             EvalStatus::Skip,
             Some(err),
-            base_metrics,
+            metrics,
             config,
             ctx,
             prompt_ref,
@@ -6354,68 +6356,81 @@ fn qwen35_speed_cases() -> &'static [Qwen35SpeedCase] {
 fn run_examples_qwen35_speed_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
     evaluation_models(config)
         .into_iter()
-        .flat_map(|model| {
-            qwen35_speed_cases()
-                .iter()
-                .map(move |case| run_examples_qwen35_speed_case(config, ctx, model.clone(), *case))
-        })
+        .flat_map(|model| run_examples_qwen35_speed_model(config, ctx, model))
         .collect()
 }
 
-fn run_examples_qwen35_speed_case(
+fn run_examples_qwen35_speed_model(
     config: &EvalConfig,
     ctx: &EvalContext,
     model: String,
-    case: Qwen35SpeedCase,
-) -> EvalResult {
+) -> Vec<EvalResult> {
+    let cases = qwen35_speed_cases();
     let prompt_ref = prompt("benchmarks/prompts/lru_cache_single_blank.txt");
-    let mut metrics = BTreeMap::from([
+    let kv_mode = config.kv_mode.as_deref().unwrap_or("asym3").to_string();
+    let mut rows = Vec::new();
+    let base_metrics = BTreeMap::from([
         ("implemented".to_string(), json!(true)),
         ("executor".to_string(), json!("examples")),
         ("suite".to_string(), json!("qwen35_speed_gate")),
-        ("prefill_tokens".to_string(), json!(case.prefill)),
-        (
-            "kv_mode".to_string(),
-            json!(config.kv_mode.as_deref().unwrap_or("asym3")),
-        ),
+        ("kv_mode".to_string(), json!(kv_mode.as_str())),
     ]);
+
     if !Path::new(&model).exists() {
-        return row_for_model(
-            BatteryId::Speed,
-            None,
-            case.label,
-            None,
-            EvalStatus::Skip,
-            Some("bench_qwen35_speed requires --model to be a local filesystem path".to_string()),
-            metrics,
-            config,
-            ctx,
-            prompt_ref,
-            0,
-            model,
-        );
+        for case in cases {
+            rows.push(row_for_model(
+                BatteryId::Speed,
+                None,
+                case.label,
+                None,
+                EvalStatus::Skip,
+                Some(
+                    "bench_qwen35_speed requires --model to be a local filesystem path".to_string(),
+                ),
+                {
+                    let mut m = base_metrics.clone();
+                    m.insert("prefill_tokens".to_string(), json!(case.prefill));
+                    m
+                },
+                config,
+                ctx,
+                prompt_ref.clone(),
+                0,
+                model.clone(),
+            ));
+        }
+        return rows;
     }
+
     let Some(bin) = resolve_bench_qwen35_speed_bin() else {
-        return row_for_model(
-            BatteryId::Speed,
-            None,
-            case.label,
-            None,
-            EvalStatus::Skip,
-            Some("bench_qwen35_speed example binary not found; build with `cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_speed`".to_string()),
-            metrics,
-            config,
-            ctx,
-            prompt_ref,
-            0,
-            model,
-        );
+        for case in cases {
+            rows.push(row_for_model(
+                BatteryId::Speed,
+                None,
+                case.label,
+                None,
+                EvalStatus::Skip,
+                Some("bench_qwen35_speed example binary not found; build with `cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_speed`".to_string()),
+                {
+                    let mut m = base_metrics.clone();
+                    m.insert("prefill_tokens".to_string(), json!(case.prefill));
+                    m
+                },
+                config,
+                ctx,
+                prompt_ref.clone(),
+                0,
+                model.clone(),
+            ));
+        }
+        return rows;
     };
 
+    let prefill_list: Vec<String> = cases.iter().map(|case| case.prefill.to_string()).collect();
     let args = vec![
         model.clone(),
-        "--prefill".to_string(),
-        case.prefill.to_string(),
+        "--prefill-list".to_string(),
+        prefill_list.join(","),
         "--prefill-runs".to_string(),
         "2".to_string(),
         "--warmup".to_string(),
@@ -6424,107 +6439,153 @@ fn run_examples_qwen35_speed_case(
         config.max_tokens.max(50).to_string(),
     ];
     let command_display = format!("{} {}", bin.display(), args.join(" "));
-    metrics.insert("command".to_string(), json!(command_display.clone()));
     let started = SystemTime::now();
     let mut command = Command::new(&bin);
     command.args(&args);
-    command.env(
-        "HIPFIRE_KV_MODE",
-        config.kv_mode.as_deref().unwrap_or("asym3"),
-    );
+    command.env("HIPFIRE_KV_MODE", kv_mode);
     command.env("HIPFIRE_DPM_WARMUP_SECS", "3");
     if !model_stem(&model).contains("0.8b") {
         command.env("HIPFIRE_GRAPH", "1");
-        metrics.insert("graph_enabled".to_string(), json!(true));
-    } else {
-        metrics.insert("graph_enabled".to_string(), json!(false));
     }
     let output = match command.output() {
         Ok(output) => output,
         Err(err) => {
-            return row_for_model(
-                BatteryId::Speed,
-                None,
-                case.label,
-                None,
-                EvalStatus::Fail,
-                Some(format!("spawn bench_qwen35_speed: {err}")),
-                metrics,
-                config,
-                ctx,
-                prompt_ref,
-                elapsed_since_ms(started),
-                model,
-            );
+            for case in cases {
+                rows.push(row_for_model(
+                    BatteryId::Speed,
+                    None,
+                    case.label,
+                    None,
+                    EvalStatus::Fail,
+                    Some(format!("spawn bench_qwen35_speed: {err}")),
+                    {
+                        let mut m = base_metrics.clone();
+                        m.insert("prefill_tokens".to_string(), json!(case.prefill));
+                        m.insert("command".to_string(), json!(command_display.clone()));
+                        m.insert("graph_enabled".to_string(), json!(false));
+                        m
+                    },
+                    config,
+                    ctx,
+                    prompt_ref.clone(),
+                    elapsed_since_ms(started),
+                    model.clone(),
+                ));
+            }
+            return rows;
         }
     };
     let elapsed_ms = elapsed_since_ms(started);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    metrics.extend(parse_summary_kv_metrics(&stderr));
-    metrics.insert(
-        "stdout_hash".to_string(),
-        json!(stable_hash_bytes(stdout.as_bytes())),
-    );
-    metrics.insert(
-        "stderr_hash".to_string(),
-        json!(stable_hash_bytes(stderr.as_bytes())),
-    );
-    if let Some(v) = metrics.get("gen_tok_s").cloned() {
-        metrics.entry("tok_s".to_string()).or_insert(v);
-    }
-    let baseline_check = apply_speed_baseline(&mut metrics, &model, case.prefill, ctx);
-    let baseline_failed = baseline_check
-        .as_ref()
-        .map(|check| check.failed)
-        .unwrap_or(false);
-    let baseline_error = baseline_check
-        .as_ref()
-        .and_then(|check| check.error.as_deref());
-    if output.status.success()
-        && metrics.contains_key("prefill_tok_s")
-        && !baseline_failed
-        && baseline_error.is_none()
-    {
-        row_for_model(
-            BatteryId::Speed,
-            None,
-            case.label,
-            None,
-            EvalStatus::Pass,
-            None,
-            metrics,
-            config,
-            ctx,
-            prompt_ref,
-            elapsed_ms,
-            model,
-        )
-    } else {
-        let reason = if let Some(error) = baseline_error {
-            error.to_string()
-        } else if baseline_failed {
-            "bench_qwen35_speed fell below perf baseline floor".to_string()
-        } else if output.status.success() {
-            "bench_qwen35_speed did not emit SUMMARY metrics".to_string()
+    let case_metrics = parse_case_summary_metrics(&stderr);
+    let shared_metrics = parse_summary_kv_metrics(&stderr);
+    let stdout_hash = stable_hash_bytes(stdout.as_bytes());
+    let stderr_hash = stable_hash_bytes(stderr.as_bytes());
+
+    for case in cases {
+        let mut metrics = base_metrics.clone();
+        metrics.insert("prefill_tokens".to_string(), json!(case.prefill));
+        metrics.insert("command".to_string(), json!(command_display.clone()));
+        metrics.insert(
+            "graph_enabled".to_string(),
+            json!(!model_stem(&model).contains("0.8b")),
+        );
+        metrics.insert("stdout_hash".to_string(), json!(stdout_hash));
+        metrics.insert("stderr_hash".to_string(), json!(stderr_hash));
+        if let Some(case_row_metrics) = case_metrics.get(case.label) {
+            metrics.extend(case_row_metrics.clone());
         } else {
-            format!("bench_qwen35_speed exited with {}", output.status)
+            metrics.extend(shared_metrics.clone());
+        }
+        if let Some(v) = metrics.get("gen_tok_s").cloned() {
+            metrics.entry("tok_s".to_string()).or_insert(v);
+        }
+        let baseline_check = apply_speed_baseline(&mut metrics, &model, case.prefill, ctx);
+        let baseline_failed = baseline_check
+            .as_ref()
+            .map(|check| check.failed)
+            .unwrap_or(false);
+        let baseline_error = baseline_check
+            .and_then(|check| check.error)
+            .or_else(|| None);
+        let status = if output.status.success()
+            && metrics.contains_key("prefill_tok_s")
+            && !baseline_failed
+            && baseline_error.is_none()
+        {
+            EvalStatus::Pass
+        } else {
+            EvalStatus::Fail
         };
-        row_for_model(
+        let reason = if let Some(error) = &baseline_error {
+            Some(error.to_string())
+        } else if baseline_failed {
+            Some("bench_qwen35_speed fell below perf baseline floor".to_string())
+        } else if !case_metrics.contains_key(case.label) || !metrics.contains_key("prefill_tok_s") {
+            Some(format!(
+                "bench_qwen35_speed did not emit case metrics for {}",
+                case.label
+            ))
+        } else if !output.status.success() {
+            Some(format!("bench_qwen35_speed exited with {}", output.status))
+        } else {
+            None
+        };
+        rows.push(row_for_model(
             BatteryId::Speed,
             None,
             case.label,
             None,
-            EvalStatus::Fail,
-            Some(reason),
+            status,
+            reason,
             metrics,
             config,
             ctx,
-            prompt_ref,
+            prompt_ref.clone(),
             elapsed_ms,
-            model,
-        )
+            model.clone(),
+        ));
     }
+    rows
+}
+
+fn parse_case_summary_metrics(output: &str) -> HashMap<&'static str, BTreeMap<String, Value>> {
+    let mut per_case: HashMap<&'static str, BTreeMap<String, Value>> = HashMap::new();
+    for raw_line in output.lines() {
+        let line = raw_line.trim();
+        if !line.starts_with("CASE_SUMMARY") {
+            continue;
+        }
+        let mut label = None;
+        let mut metrics = BTreeMap::new();
+        for part in line.split_whitespace().skip(1) {
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            if key == "label" {
+                label = Some(match value {
+                    "pp32_prefill_decode" => "pp32_prefill_decode",
+                    "pp128_prefill_decode" => "pp128_prefill_decode",
+                    _ => "",
+                });
+                continue;
+            }
+            let value = value.trim_end_matches(',');
+            if let Ok(v) = value.parse::<u64>() {
+                metrics.insert(key.to_string(), json!(v));
+            } else if let Ok(v) = value.parse::<f64>() {
+                metrics.insert(key.to_string(), json!(v));
+            } else {
+                metrics.insert(key.to_string(), json!(value));
+            }
+        }
+        if let Some("pp32_prefill_decode" | "pp128_prefill_decode") = label {
+            let key = label.unwrap();
+            per_case.insert(key, metrics);
+        }
+    }
+    per_case
 }
 
 struct SpeedBaselineCheck {
