@@ -124,6 +124,12 @@ pub struct AdmissionVerdictPolicy {
     pub reason: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceCollectionPolicy {
+    pub status: &'static str,
+    pub reason: Option<String>,
+}
+
 pub const OBSERVED_ADMISSION_EVIDENCE_KINDS: &[&str] = &[
     "phase_timings",
     "launch_counts",
@@ -452,6 +458,47 @@ pub fn admission_verdict_policy(has_reject: bool, has_review: bool) -> Admission
             verdict: "promote",
             reason: None,
         }
+    }
+}
+
+pub fn evidence_collection_policy(
+    kind: &str,
+    record_count: usize,
+    external_errors: &[String],
+    profile_mode: &str,
+) -> EvidenceCollectionPolicy {
+    if !external_errors.is_empty() {
+        return EvidenceCollectionPolicy {
+            status: "fail",
+            reason: Some(external_errors.join("; ")),
+        };
+    }
+    if record_count > 0 {
+        return EvidenceCollectionPolicy {
+            status: "collected",
+            reason: None,
+        };
+    }
+    if kind == "profiling" && profile_mode == "off" {
+        return EvidenceCollectionPolicy {
+            status: "disabled",
+            reason: Some("profiling disabled by --profile off".to_string()),
+        };
+    }
+    if kind == "profiling" && profile_mode == "passive" {
+        return EvidenceCollectionPolicy {
+            status: "requested",
+            reason: Some(
+                "passive profiling requested; model-backed profiler collector is not implemented in this harness revision"
+                    .to_string(),
+            ),
+        };
+    }
+    EvidenceCollectionPolicy {
+        status: "not_collected",
+        reason: Some(
+            "model-backed collection is not implemented in this harness revision".to_string(),
+        ),
     }
 }
 
@@ -960,6 +1007,51 @@ mod tests {
             }
         );
         assert_eq!(admission_verdict_policy(true, true).verdict, "reject");
+    }
+
+    #[test]
+    fn evidence_collection_policy_preserves_eval_artifact_status() {
+        assert_eq!(
+            evidence_collection_policy("quality", 2, &[], "off"),
+            EvidenceCollectionPolicy {
+                status: "collected",
+                reason: None,
+            }
+        );
+        assert_eq!(
+            evidence_collection_policy("quality", 0, &["bad external evidence".to_string()], "off"),
+            EvidenceCollectionPolicy {
+                status: "fail",
+                reason: Some("bad external evidence".to_string()),
+            }
+        );
+        assert_eq!(
+            evidence_collection_policy("profiling", 0, &[], "off"),
+            EvidenceCollectionPolicy {
+                status: "disabled",
+                reason: Some("profiling disabled by --profile off".to_string()),
+            }
+        );
+        assert_eq!(
+            evidence_collection_policy("profiling", 0, &[], "passive"),
+            EvidenceCollectionPolicy {
+                status: "requested",
+                reason: Some(
+                    "passive profiling requested; model-backed profiler collector is not implemented in this harness revision"
+                        .to_string(),
+                ),
+            }
+        );
+        assert_eq!(
+            evidence_collection_policy("phase_timings", 0, &[], "off"),
+            EvidenceCollectionPolicy {
+                status: "not_collected",
+                reason: Some(
+                    "model-backed collection is not implemented in this harness revision"
+                        .to_string()
+                ),
+            }
+        );
     }
 
     #[test]

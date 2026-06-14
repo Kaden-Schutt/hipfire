@@ -22,12 +22,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hipfire_evidence::{
     admission_metric_is_quality, admission_verdict_policy, directory_hash,
     evidence_artifact_index_entry_from_value_json, evidence_artifact_index_entry_json,
-    evidence_metric_direction, evidence_record_json, extract_external_evidence_records_json,
-    file_hash, list_files, model_hash, read_hfq_metadata, required_admission_evidence_requirements,
-    run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
-    standard_evidence_paths_in_dir, EvidenceArtifactIndexContext, EvidenceRecord,
-    RunMetadataArtifact, RunMetadataConfig, RunMetadataModels, RunProvenance,
-    OBSERVED_ADMISSION_EVIDENCE_KINDS, STANDARD_EVIDENCE_ARTIFACT_SPECS,
+    evidence_collection_policy, evidence_metric_direction, evidence_record_json,
+    extract_external_evidence_records_json, file_hash, list_files, model_hash, read_hfq_metadata,
+    required_admission_evidence_requirements, run_metadata_artifact_json, run_provenance_json,
+    stable_hash_bytes, stable_hash_file_fallback, standard_evidence_paths_in_dir,
+    EvidenceArtifactIndexContext, EvidenceRecord, RunMetadataArtifact, RunMetadataConfig,
+    RunMetadataModels, RunProvenance, OBSERVED_ADMISSION_EVIDENCE_KINDS,
+    STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
 use hipfire_model::{discover_dflash_draft_for_model, model_artifact_stem};
 
@@ -3532,31 +3533,12 @@ fn evidence_artifact_value(
     let mut records = evidence_records(kind, results);
     let (external_records, external_errors) = external_evidence_records(kind, config, results, ctx);
     records.extend(external_records);
-    let status = if !external_errors.is_empty() {
-        "fail"
-    } else if !records.is_empty() {
-        "collected"
-    } else if kind == "profiling" && config.profile == ProfileMode::Off {
-        "disabled"
-    } else if kind == "profiling" && config.profile == ProfileMode::Passive {
-        "requested"
-    } else {
-        "not_collected"
-    };
-    let reason = if !external_errors.is_empty() {
-        Some(external_errors.join("; "))
-    } else if !records.is_empty() {
-        None
-    } else if kind == "profiling" && config.profile == ProfileMode::Off {
-        Some("profiling disabled by --profile off".to_string())
-    } else if kind == "profiling" && config.profile == ProfileMode::Passive {
-        Some(
-            "passive profiling requested; model-backed profiler collector is not implemented in this harness revision"
-                .to_string(),
-        )
-    } else {
-        Some("model-backed collection is not implemented in this harness revision".to_string())
-    };
+    let collection_policy = evidence_collection_policy(
+        kind,
+        records.len(),
+        &external_errors,
+        config.profile.as_str(),
+    );
     let dataset_status = json!({
         "total": datasets.len(),
         "pass": datasets.iter().filter(|d| d.status == EvalStatus::Pass).count(),
@@ -3567,8 +3549,8 @@ fn evidence_artifact_value(
         "schema": 1,
         "kind": kind,
         "provenance": run_provenance_value(ctx),
-        "status": status,
-        "reason": reason,
+        "status": collection_policy.status,
+        "reason": collection_policy.reason,
         "collection": {
             "source": "hipfire-eval",
             "executor": config.executor.as_str(),
