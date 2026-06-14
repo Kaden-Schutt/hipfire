@@ -38,3 +38,4 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval admission verdicts now reuse `hipfire-evidence` verdict policy instead of eval-local promote/review/reject mapping.
 - Eval evidence artifacts now reuse `hipfire-evidence` collection status policy instead of eval-local collected/requested/disabled/not-collected mapping.
 - Eval standard evidence artifacts now reuse `hipfire-evidence` JSON rendering instead of eval-local schema construction.
+- Eval comparison/admission artifacts now reuse `hipfire-evidence` JSON rendering instead of direct eval-local struct serialization.

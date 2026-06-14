@@ -20,13 +20,15 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
-    admission_metric_is_quality, admission_verdict_policy, directory_hash,
-    evidence_artifact_index_entry_from_value_json, evidence_artifact_index_entry_json,
-    evidence_artifact_json, evidence_collection_policy, evidence_metric_direction,
-    evidence_record_json, extract_external_evidence_records_json, file_hash, list_files,
-    model_hash, read_hfq_metadata, required_admission_evidence_requirements,
+    admission_artifact_json, admission_metric_is_quality, admission_verdict_policy,
+    comparison_artifact_json, directory_hash, evidence_artifact_index_entry_from_value_json,
+    evidence_artifact_index_entry_json, evidence_artifact_json, evidence_collection_policy,
+    evidence_metric_direction, evidence_record_json, extract_external_evidence_records_json,
+    file_hash, list_files, model_hash, read_hfq_metadata, required_admission_evidence_requirements,
     run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
-    standard_evidence_paths_in_dir, EvidenceArtifact, EvidenceArtifactCollection,
+    standard_evidence_paths_in_dir, AdmissionArtifact as EvidenceAdmissionArtifact,
+    AdmissionEvidence as EvidenceAdmissionEvidence,
+    ComparisonArtifact as EvidenceComparisonArtifact, EvidenceArtifact, EvidenceArtifactCollection,
     EvidenceArtifactConfig, EvidenceArtifactDatasetStatus, EvidenceArtifactIndexContext,
     EvidenceArtifactModels, EvidenceRecord, RunMetadataArtifact, RunMetadataConfig,
     RunMetadataModels, RunProvenance, OBSERVED_ADMISSION_EVIDENCE_KINDS,
@@ -610,6 +612,14 @@ pub enum EvalStatus {
     Pass,
     Fail,
     Skip,
+}
+
+fn eval_status_str(status: EvalStatus) -> &'static str {
+    match status {
+        EvalStatus::Pass => "pass",
+        EvalStatus::Fail => "fail",
+        EvalStatus::Skip => "skip",
+    }
 }
 
 pub fn parse_args_from<I, S>(args: I) -> Result<EvalConfig, String>
@@ -3374,7 +3384,8 @@ fn write_evidence_artifacts(
             ),
         );
     }
-    write_json_pretty(&dir.join("comparisons.json"), comparison)?;
+    let comparison_json = comparison_artifact_value(comparison)?;
+    write_json_pretty(&dir.join("comparisons.json"), &comparison_json)?;
     let mut comparisons_entry = artifact_index_entry(
         "artifacts/comparisons.json",
         format!("{:?}", comparison.status).to_lowercase(),
@@ -3384,7 +3395,8 @@ fn write_evidence_artifacts(
         entry.insert("case_count".to_string(), json!(comparison.cases.len()));
     }
     out.insert("comparisons".to_string(), comparisons_entry);
-    write_json_pretty(&dir.join("admission.json"), admission)?;
+    let admission_json = admission_artifact_value(admission)?;
+    write_json_pretty(&dir.join("admission.json"), &admission_json)?;
     let mut admission_entry = artifact_index_entry(
         "artifacts/admission.json",
         format!("{:?}", admission.status).to_lowercase(),
@@ -3435,6 +3447,56 @@ fn write_evidence_artifacts(
         out.insert("host_profile".to_string(), entry);
     }
     Ok(out)
+}
+
+fn comparison_artifact_value(comparison: &ComparisonArtifact) -> Result<Value, String> {
+    let cases = serde_json::to_value(&comparison.cases)
+        .map_err(|err| format!("serialize comparison cases: {err}"))?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    Ok(comparison_artifact_json(EvidenceComparisonArtifact {
+        provenance: comparison.provenance.clone(),
+        status: eval_status_str(comparison.status).to_string(),
+        reason: comparison.reason.clone(),
+        baseline: comparison.baseline.clone(),
+        reference: comparison.reference.clone(),
+        cases,
+    }))
+}
+
+fn admission_artifact_value(admission: &AdmissionArtifact) -> Result<Value, String> {
+    let findings = serde_json::to_value(&admission.findings)
+        .map_err(|err| format!("serialize admission findings: {err}"))?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    Ok(admission_artifact_json(EvidenceAdmissionArtifact {
+        provenance: admission.provenance.clone(),
+        status: eval_status_str(admission.status).to_string(),
+        verdict: admission.verdict.clone(),
+        reason: admission.reason.clone(),
+        required_evidence: admission
+            .required_evidence
+            .iter()
+            .map(evidence_admission_evidence)
+            .collect(),
+        observed_evidence: admission
+            .observed_evidence
+            .iter()
+            .map(evidence_admission_evidence)
+            .collect(),
+        findings,
+    }))
+}
+
+fn evidence_admission_evidence(evidence: &AdmissionEvidence) -> EvidenceAdmissionEvidence {
+    EvidenceAdmissionEvidence {
+        kind: evidence.kind.clone(),
+        status: eval_status_str(evidence.status).to_string(),
+        rows: evidence.rows,
+        reason: evidence.reason.clone(),
+    }
 }
 
 fn artifact_index_entry(

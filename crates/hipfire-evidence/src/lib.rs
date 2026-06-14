@@ -179,6 +179,35 @@ pub struct EvidenceArtifact {
     pub records: Vec<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComparisonArtifact {
+    pub provenance: RunProvenance,
+    pub status: String,
+    pub reason: Option<String>,
+    pub baseline: Option<String>,
+    pub reference: Option<String>,
+    pub cases: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdmissionEvidence {
+    pub kind: String,
+    pub status: String,
+    pub rows: usize,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdmissionArtifact {
+    pub provenance: RunProvenance,
+    pub status: String,
+    pub verdict: String,
+    pub reason: Option<String>,
+    pub required_evidence: Vec<AdmissionEvidence>,
+    pub observed_evidence: Vec<AdmissionEvidence>,
+    pub findings: Vec<Value>,
+}
+
 pub const OBSERVED_ADMISSION_EVIDENCE_KINDS: &[&str] = &[
     "phase_timings",
     "launch_counts",
@@ -588,6 +617,40 @@ pub fn evidence_artifact_json(artifact: EvidenceArtifact) -> Value {
         },
         "expected_metrics": artifact.expected_metrics,
         "records": artifact.records,
+    })
+}
+
+pub fn comparison_artifact_json(artifact: ComparisonArtifact) -> Value {
+    json!({
+        "schema": 1,
+        "provenance": artifact.provenance,
+        "status": artifact.status,
+        "reason": artifact.reason,
+        "baseline": artifact.baseline,
+        "reference": artifact.reference,
+        "cases": artifact.cases,
+    })
+}
+
+pub fn admission_artifact_json(artifact: AdmissionArtifact) -> Value {
+    json!({
+        "schema": 1,
+        "provenance": artifact.provenance,
+        "status": artifact.status,
+        "verdict": artifact.verdict,
+        "reason": artifact.reason,
+        "required_evidence": artifact.required_evidence.into_iter().map(admission_evidence_json).collect::<Vec<_>>(),
+        "observed_evidence": artifact.observed_evidence.into_iter().map(admission_evidence_json).collect::<Vec<_>>(),
+        "findings": artifact.findings,
+    })
+}
+
+fn admission_evidence_json(evidence: AdmissionEvidence) -> Value {
+    json!({
+        "kind": evidence.kind,
+        "status": evidence.status,
+        "rows": evidence.rows,
+        "reason": evidence.reason,
     })
 }
 
@@ -1198,19 +1261,97 @@ mod tests {
     }
 
     #[test]
-    fn run_provenance_json_preserves_artifact_shape() {
-        let provenance = RunProvenance {
-            runner: "hipfire-eval".to_string(),
-            runner_version: "0.2.0".to_string(),
-            hipfire_version: "0.2.0".to_string(),
-            git_commit: Some("abc123".to_string()),
-            git_branch: Some("main".to_string()),
-            git_describe: Some("v0.2.0-1-gabc123".to_string()),
-            git_dirty: Some(false),
-            binary_hash: Some("sha256:binary".to_string()),
-            arch: Some("gfx1151".to_string()),
-            rocm: Some("6.4".to_string()),
+    fn comparison_artifact_json_preserves_eval_artifact_shape() {
+        let artifact = ComparisonArtifact {
+            provenance: sample_provenance(),
+            status: "pass".to_string(),
+            reason: None,
+            baseline: Some("baseline.hfq".to_string()),
+            reference: Some("reference.hfq".to_string()),
+            cases: vec![json!({
+                "key": "quality||kld_reference_slice|",
+                "battery": "quality",
+                "suite": null,
+                "case_id": "kld_reference_slice",
+                "dataset_item_id": null,
+                "baseline": {
+                    "model": "baseline.hfq",
+                    "metrics": {
+                        "mean_kld": {
+                            "candidate": 0.01,
+                            "comparator": 0.02,
+                            "delta": -0.01,
+                            "relative_delta": -0.5,
+                            "direction": "improved",
+                        }
+                    }
+                },
+                "reference": null,
+            })],
         };
+
+        let value = comparison_artifact_json(artifact);
+        assert_eq!(value["schema"], json!(1));
+        assert_eq!(value["status"], json!("pass"));
+        assert_eq!(value["reason"], Value::Null);
+        assert_eq!(value["baseline"], json!("baseline.hfq"));
+        assert_eq!(value["reference"], json!("reference.hfq"));
+        assert_eq!(value["cases"][0]["battery"], json!("quality"));
+        assert_eq!(
+            value["cases"][0]["baseline"]["metrics"]["mean_kld"]["direction"],
+            json!("improved")
+        );
+    }
+
+    #[test]
+    fn admission_artifact_json_preserves_eval_artifact_shape() {
+        let artifact = AdmissionArtifact {
+            provenance: sample_provenance(),
+            status: "fail".to_string(),
+            verdict: "reject".to_string(),
+            reason: Some("quality or correctness regression detected".to_string()),
+            required_evidence: vec![AdmissionEvidence {
+                kind: "quality".to_string(),
+                status: "pass".to_string(),
+                rows: 1,
+                reason: None,
+            }],
+            observed_evidence: vec![AdmissionEvidence {
+                kind: "profiling".to_string(),
+                status: "skip".to_string(),
+                rows: 0,
+                reason: Some("profiling disabled by --profile off".to_string()),
+            }],
+            findings: vec![json!({
+                "severity": "reject",
+                "battery": "quality",
+                "suite": null,
+                "case_id": "kld_reference_slice",
+                "dataset_item_id": null,
+                "comparator": "baseline",
+                "metric": "mean_kld",
+                "direction": "regressed",
+                "delta": 0.1,
+                "relative_delta": 0.25,
+            })],
+        };
+
+        let value = admission_artifact_json(artifact);
+        assert_eq!(value["schema"], json!(1));
+        assert_eq!(value["status"], json!("fail"));
+        assert_eq!(value["verdict"], json!("reject"));
+        assert_eq!(
+            value["reason"],
+            json!("quality or correctness regression detected")
+        );
+        assert_eq!(value["required_evidence"][0]["status"], json!("pass"));
+        assert_eq!(value["observed_evidence"][0]["status"], json!("skip"));
+        assert_eq!(value["findings"][0]["metric"], json!("mean_kld"));
+    }
+
+    #[test]
+    fn run_provenance_json_preserves_artifact_shape() {
+        let provenance = sample_provenance();
 
         let json = run_provenance_json(provenance);
         assert_eq!(json["runner"], "hipfire-eval");
@@ -1221,6 +1362,21 @@ mod tests {
         assert_eq!(json["binary_hash"], "sha256:binary");
         assert_eq!(json["arch"], "gfx1151");
         assert_eq!(json["rocm"], "6.4");
+    }
+
+    fn sample_provenance() -> RunProvenance {
+        RunProvenance {
+            runner: "hipfire-eval".to_string(),
+            runner_version: "0.2.0".to_string(),
+            hipfire_version: "0.2.0".to_string(),
+            git_commit: Some("abc123".to_string()),
+            git_branch: Some("main".to_string()),
+            git_describe: Some("v0.2.0-1-gabc123".to_string()),
+            git_dirty: Some(false),
+            binary_hash: Some("sha256:binary".to_string()),
+            arch: Some("gfx1151".to_string()),
+            rocm: Some("6.4".to_string()),
+        }
     }
 
     #[test]
