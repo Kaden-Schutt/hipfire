@@ -81,6 +81,13 @@
 
 ### Deferred
 
+- Adapt the build system to autodiscover GPUs the same way NPU detection now
+  works: query HIP/ROCm at `cargo build --features npu-kernels` time (or a
+  new `gpu-kernels` feature) to identify installed GPU arch(s) and select
+  kernel tuning parameters automatically, rather than requiring the user to
+  pass an explicit arch flag. The NPU precedent is `detect_npu()` in
+  `tools/npu/build_qwen35_swiglu.py` + `HIPFIRE_NPU_TARGETS` env override in
+  `crates/hipfire-arch-qwen35/build.rs`.
 - Finish full daemon-backed `hipfire bench` replacement after eval-backed speed
   rows match the current public output shape.
 - Promote long-context, vision, CASK/TriAttention, DFlash resident, cold-process

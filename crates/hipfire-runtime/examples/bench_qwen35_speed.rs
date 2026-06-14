@@ -89,6 +89,13 @@ fn main() {
     };
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
+    let dn_quant = match std::env::var("HIPFIRE_DELTANET_STATE").ok().as_deref() {
+        Some("fp32" | "f32") => qwen35::StateQuant::FP32,
+        Some("q4" | "int4") => qwen35::StateQuant::Q4,
+        _ => qwen35::StateQuant::Q8,
+    };
+    eprintln!("DeltaNet state: {dn_quant:?}");
+
     for &prefill_len in prefill_lengths.iter() {
         let kv_seq = kv_seq_len(prefill_len, warmup_len, gen_len);
         let case_label = match prefill_len {
@@ -109,7 +116,7 @@ fn main() {
             kv_seq,
         )
         .unwrap();
-        let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+        let mut dn_state = DeltaNetState::new_with_quant(&mut gpu, &config, dn_quant).unwrap();
         let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
 
         // Deterministic fake-prompt: token 0, 1, 2, ... prefill_len-1. Keeps the
@@ -154,7 +161,7 @@ fn main() {
             )
             .expect("warmup prefill failed");
             // Reset DeltaNet state for the profiled run
-            dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+            dn_state = DeltaNetState::new_with_quant(&mut gpu, &config, dn_quant).unwrap();
             kv_cache = new_kv_cache(
                 &mut gpu,
                 &kv_mode,
@@ -270,7 +277,7 @@ fn main() {
         } else {
             for run in 0..prefill_runs {
                 if run > 0 {
-                    dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+                    dn_state = DeltaNetState::new_with_quant(&mut gpu, &config, dn_quant).unwrap();
                     kv_cache = new_kv_cache(
                         &mut gpu,
                         &kv_mode,

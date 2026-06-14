@@ -272,3 +272,49 @@ NPU SwiGLU only makes sense when:
 For the 0.8B model (16 ms/tok baseline), the dispatch overhead is 25% of step time — not viable.
 For a 7B model (~100 ms/tok), the same 4 ms would be ~4% — marginal.
 Real NPU benefit requires async NPU dispatch or hardware-level DMA overlap.
+
+---
+
+## Performance Tuning — Qwen3.5-0.8B Decode (2026-06-14)
+
+Systematic A/B benchmarks to identify easy decode gains. Baseline: FP32 state (previous session, run.rs).
+
+Bench tool: `bench_qwen35_speed`, MQ4, gfx1103, `--gen 80 --warmup 5 --prefill 64`.
+
+### DeltaNet State Quantization
+
+| State quant | tok/s (gen) | vs Q8 |
+|-------------|-------------|-------|
+| Q8 (daemon default) | 62.2 | — |
+| FP32 | 58.9 | -5.4% |
+| Q4 | 58.7 | -5.6% |
+
+**Q8 is optimal.** FP32 wastes 18 × 1MB = 18MB/step of bandwidth (read+write per DeltaNet layer).
+Q4 is slower than Q8 — requant overhead outweighs bandwidth savings at this scale.
+
+### KV Cache Mode
+
+| KV mode | tok/s (gen) |
+|---------|-------------|
+| q8 | 62.0 |
+| asym3 | 62.2 |
+| asym4 | 61.1 |
+
+Negligible on 0.8B — only 6 FullAttention layers, 2 KV heads, tiny KV footprint.
+
+### Weight Format
+
+| Format | tok/s |
+|--------|-------|
+| MQ4 | 62.2 |
+| MQ6 | 51.2 |
+
+MQ4 already correct choice. MQ6 = -18% (higher dequant cost per weight).
+
+### hipGraph
+
+Hardcoded `let use_graph = false;` at qwen35.rs:8331 (disabled 2026-05-15, token-0 attractor on gfx11+ROCm 7.x). `HIPFIRE_GRAPH=1` is a no-op on this branch. Would be +0.6–0.7% per prior measurements if re-enabled.
+
+### Takeaway
+
+The daemon already uses Q8 state by default. The 60.8 tok/s in the previous session was from `run.rs` which forced FP32 state. Real decode ceiling with current code: **~62 tok/s on gfx1103 MQ4**. Further gains require re-enabling hipGraph (needs bug investigation) or kernel-level optimization.

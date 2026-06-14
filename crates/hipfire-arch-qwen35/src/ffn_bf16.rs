@@ -21,6 +21,12 @@ pub struct FfnBf16Config {
     pub mode: FfnBf16Mode,
     pub layer: LayerSelect,
     pub trace: bool,
+    /// Path to the xclbin file for the NPU SwiGLU kernel.
+    /// Set via `HIPFIRE_QWEN35_XDNA1_XCLBIN`. Required when mode=xdna1.
+    pub xdna1_xclbin: Option<String>,
+    /// Path to the NPU instruction binary for the SwiGLU operation.
+    /// Set via `HIPFIRE_QWEN35_XDNA1_INSTR`. Required when mode=xdna1.
+    pub xdna1_instr: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +212,9 @@ pub fn config() -> &'static FfnBf16Config {
         let trace = std::env::var("HIPFIRE_QWEN35_FFN_BF16_TRACE")
             .map(|v| !matches!(v.trim(), "" | "0" | "false" | "False" | "FALSE"))
             .unwrap_or(false);
-        FfnBf16Config { mode, layer, trace }
+        let xdna1_xclbin = std::env::var("HIPFIRE_QWEN35_XDNA1_XCLBIN").ok();
+        let xdna1_instr = std::env::var("HIPFIRE_QWEN35_XDNA1_INSTR").ok();
+        FfnBf16Config { mode, layer, trace, xdna1_xclbin, xdna1_instr }
     })
 }
 

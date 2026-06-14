@@ -340,6 +340,9 @@ Generated automatically from source and inline comments by `scripts/gen-env-docs
 | `HIPFIRE_QWEN35_FFN_BF16` | Selects behavior from recognized values | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/ffn_bf16.rs:180` |
 | `HIPFIRE_QWEN35_FFN_BF16_LAYER` | Selects behavior from recognized values | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/ffn_bf16.rs:194` |
 | `HIPFIRE_QWEN35_FFN_BF16_TRACE` | Parses "HIPFIRE_QWEN35_FFN_BF16_TRACE" with fallback defaults | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/ffn_bf16.rs:206` |
+| `HIPFIRE_QWEN35_XDNA1_INSTR` | Path to the pre-built NPU instruction binary for the Qwen3.5 BF16 SwiGLU kernel; required with `HIPFIRE_QWEN35_XDNA1_XCLBIN` when `HIPFIRE_QWEN35_FFN_BF16=xdna1` | `crates/hipfire-arch-qwen35/src/ffn_bf16.rs` |
+| `HIPFIRE_QWEN35_XDNA1_XCLBIN` | Path to the compiled AIE tile program (xclbin) for the Qwen3.5 BF16 SwiGLU NPU path; loaded via `xrt::xclbin` | `crates/hipfire-arch-qwen35/src/ffn_bf16.rs` |
+| `HIPFIRE_XDNA1_LIB` | Path to `libhipfire_xdna1.so`; defaults to `target/npu/libhipfire_xdna1.so`; loaded lazily on first NPU dispatch | `crates/hipfire-arch-qwen35/src/xdna1_ffi.rs` |
 | `HIPFIRE_QWEN35_FINITE_TRACE` | Runtime variable controlling qwen35 finite trace in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:12989` |
 | `HIPFIRE_QWEN35_PAGED_EXPERTS` | Interprets "HIPFIRE_QWEN35_PAGED_EXPERTS" from environment to select behavior | `/home/sadara/.hipfire/src/crates/hipfire-arch-qwen35/src/qwen35.rs:3475` |
 | `HIPFIRE_QWEN35_PREFILL_SESSION_BATCH` | Runtime variable controlling qwen35 prefill session batch in hipfire | `/home/sadara/.hipfire/src/crates/hipfire-daemon/src/main.rs:8185` |

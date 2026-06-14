@@ -15,8 +15,23 @@ For detailed notices, project operating guides, and testing playbooks, see the c
 - **Run the no-GPU subset.** `./tests/no-gpu-ci.sh` before handing off workflow-only changes.
 - **Resource Lock Protocol:** `hipfire-daemon` acquires `/tmp/hipfire-resource-locks/*.lock` leases before HIP init. Use `HIPFIRE_RESOURCE_LOCK_WAIT_MS` to wait for busy GPU/NPU/CPU leases; legacy shell gates may still wrap `scripts/gpu-lock.sh`.
 
-## Skills (`docs/skills/`)
-Reusable how-tos live in `docs/skills/` to keep this root file focused. Reach for it by name when the situation matches.
+## Skills (`.agents/skills/`)
+Reusable how-tos live in `.agents/skills/<name>/`. Each has a `SKILL.md` (and optionally `skill.json`) with full context. Load one by reading its files when the situation matches.
+
+| Skill | When to use |
+|-------|-------------|
+| `astrea` | Quant calibration, imatrix-driven experiments, KLD/PPL quality eval |
+| `hipfire-amd-matrix-calculator` | Vendored AMD Matrix Instruction Calculator queries |
+| `hipfire-arch-port` | Porting compute kernels to a new RDNA/CDNA arch |
+| `hipfire-autoheal` | Triage daemon hangs, kernel JIT failures, port conflicts |
+| `hipfire-diag` | GPU diagnostics — interpret results and suggest fixes |
+| `hipfire-eval-harness` | Running or interpreting the unified eval harness |
+| `hipfire-kernel-atlas` | Phase-aware Kernel Atlas rows and ISA Fit View |
+| `hipfire-kernel-tuning` | Optimize HIP kernels — tuning levers, multi-row, WMMA, wave-size |
+| `hipfire-tester` | Bring-up, smoke tests, DFlash opt-in, MQ format checks |
+| `npu-kernel-build` | Compile MLIR-AIE kernels for the XDNA NPU via IRON + aiecc |
+| `rebase-onto-modular` | Port feature branches from pre-0.1.20 master |
+| `run-model` | Load a model and generate tokens via the daemon JSON-lines protocol |
 
 ## Hipfire artifact naming convention
 Canonical shape:
@@ -39,4 +54,4 @@ Rules:
 
 ---
 
-@AGENTS.local.md
+@./AGENTS.local.md

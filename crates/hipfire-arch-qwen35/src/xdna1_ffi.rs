@@ -332,7 +332,11 @@ pub unsafe fn swiglu_run(
     let len = gate.len();
     debug_assert_eq!(up.len(), len);
     debug_assert_eq!(out.len(), len);
-    let ret = (lib.fn_swiglu_run_handle)(
+    // run_handle always returns the handle pointer (non-null) even on XRT exception —
+    // the wrapper catches and records the error on the handle but doesn't expose it.
+    // Detect silent failure by checking whether any output element was written:
+    // a successful run always produces at least one non-zero output for realistic inputs.
+    (lib.fn_swiglu_run_handle)(
         handle,
         gate.as_ptr(),
         len,
@@ -341,7 +345,7 @@ pub unsafe fn swiglu_run(
         out.as_mut_ptr(),
         len,
     );
-    !ret.is_null()
+    out.iter().any(|&v| v != 0)
 }
 
 // ─── RMSNorm handle cache (per layer_idx) ────────────────────────────────────

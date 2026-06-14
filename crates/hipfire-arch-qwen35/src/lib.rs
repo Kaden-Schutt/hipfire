@@ -45,6 +45,8 @@ pub mod pflash;
 pub mod qwen35;
 #[cfg(feature = "deltanet")]
 pub mod speculative;
+#[cfg(feature = "deltanet")]
+pub mod xdna1_ffi;
 
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;

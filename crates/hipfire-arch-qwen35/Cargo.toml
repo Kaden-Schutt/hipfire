@@ -11,6 +11,11 @@ description = "Qwen3.5 architecture (dense + MoE) for hipfire"
 default = ["deltanet"]
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 ffn_bf16 = []
+# Build NPU kernel xclbin+instr.bin artifacts for all supported NPU generations
+# via tools/npu/build_qwen35_swiglu.py.  Requires the MLIR-AIE venv at ~/.venv
+# and xclbinutil from XRT.  Soft-fails (cargo warning) if toolchain is absent.
+# Hidden sizes built: HIPFIRE_NPU_HIDDEN_SIZES env var (comma-sep, default 8960).
+npu-kernels = []
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
@@ -19,6 +24,7 @@ rdna-compute = { path = "../rdna-compute" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
+libloading = "0.8"
 
 [[example]]
 name = "test_qwen35_load_multi"
