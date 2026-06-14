@@ -22,6 +22,7 @@ The target crates for modular boundaries remain:
 - `hipfire-generate`
 - `hipfire-coherence` (created; owns detector policy and report row serialization helpers)
 - `hipfire-rocm` (created; owns ROCm backend evidence contracts)
+- `hipfire-daemon-adapter` (created; owns daemon JSONL process-client adapter)
 - `hipfire-daemon-protocol` (created; owns daemon JSONL request/response contracts)
 - `hipfire-evidence` (created; owns evidence provenance and hash helpers)
 
@@ -59,6 +60,10 @@ Current ROCm/backend boundary status:
 Current daemon protocol boundary status:
 - `hipfire-daemon-protocol` owns typed daemon JSONL request/response structs, including load/generate request envelopes and token/done/error responses.
 - `hipfire-server::daemon::protocol` remains a compatibility re-export so server callers keep their current paths while the wire JSON stays unchanged.
+
+Current daemon adapter boundary status:
+- `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery, load/ping/unload/generate response loops, and stale-response filtering.
+- `hipfire-server::daemon::engine` remains a compatibility re-export for server and CLI callers while the adapter becomes reusable outside the HTTP server crate.
 
 Current evidence boundary status:
 - `hipfire-evidence` owns stable hash, model/tag hash, directory digest, file hash, and HFQ metadata extraction helpers.
