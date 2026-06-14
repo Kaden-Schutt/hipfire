@@ -71,12 +71,13 @@ use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
     model_worker_runtime_view_json, parse_reserve_session_state_kinds, parse_sequence_state_handle,
     parse_sequence_state_handle_list, parsed_handle_may_target_generic,
-    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle, release_state_done_json,
-    reserve_session_state_done_json, reserve_session_state_rejected_json,
-    session_state_reservation_describe_json, DescribedSequenceState, GenericSequenceStateArena,
-    ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
-    ParsedSequenceStateHandle, ReleaseStateResponseKind, SequenceStateArenaBackend,
-    SequenceStateCheckpointRequest, SequenceStatePageDescriptor, SequenceStatePageKind,
+    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
+    release_sessions_done_json, release_state_done_json, reserve_session_state_done_json,
+    reserve_session_state_rejected_json, session_state_reservation_describe_json,
+    DescribedSequenceState, GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId,
+    ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
+    ReleaseStateResponseKind, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
+    SequenceStatePageDescriptor, SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -8885,13 +8886,13 @@ fn main() {
                 };
                 if let Some(dummy) = dummy_model.as_mut() {
                     let released = dummy.release_sessions(&sessions);
-                    let done = serde_json::json!({
-                        "type": "release_sessions_done",
-                        "id": id,
-                        "requested": sessions.len(),
-                        "released": released,
-                        "resident_sessions": dummy.session_count(),
-                    });
+                    let done = release_sessions_done_json(
+                        id,
+                        sessions.len(),
+                        released,
+                        dummy.session_count(),
+                        None,
+                    );
                     let _ = writeln!(stdout, "{done}");
                     let _ = stdout.flush();
                     continue;
@@ -8907,17 +8908,13 @@ fn main() {
                 match sequence_state_arena_release_sessions(arena_backend, m, &mut gpu, &sessions) {
                     Ok(released) => {
                         let worker = loaded_model_worker_runtime_view(m);
-                        let done = serde_json::json!({
-                            "type": "release_sessions_done",
-                            "id": id,
-                            "requested": sessions.len(),
-                            "released": released,
-                            "resident_sessions": sequence_state_arena_resident_session_count(
-                                arena_backend,
-                                m
-                            ),
-                            "model_worker": model_worker_runtime_view_json(&worker),
-                        });
+                        let done = release_sessions_done_json(
+                            id,
+                            sessions.len(),
+                            released,
+                            sequence_state_arena_resident_session_count(arena_backend, m),
+                            Some(&worker),
+                        );
                         let _ = writeln!(stdout, "{done}");
                         let _ = stdout.flush();
                     }

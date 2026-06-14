@@ -476,6 +476,26 @@ pub fn release_state_done_json(
     })
 }
 
+pub fn release_sessions_done_json(
+    id: &str,
+    requested: usize,
+    released: usize,
+    resident_sessions: usize,
+    model_worker: Option<&ModelWorkerRuntimeView>,
+) -> serde_json::Value {
+    let mut done = serde_json::json!({
+        "type": "release_sessions_done",
+        "id": id,
+        "requested": requested,
+        "released": released,
+        "resident_sessions": resident_sessions,
+    });
+    if let Some(worker) = model_worker {
+        done["model_worker"] = model_worker_runtime_view_json(worker);
+    }
+    done
+}
+
 impl GenericSequenceStateArena {
     pub fn new() -> Self {
         Self {
@@ -1025,6 +1045,52 @@ mod tests {
         assert_eq!(json["type"], "release_session_state_reservation_done");
         assert_eq!(json["released"], 1);
         assert_eq!(json["released_bytes"], usize::MAX);
+    }
+
+    #[test]
+    fn release_sessions_done_json_preserves_dummy_wire_shape() {
+        let json = release_sessions_done_json("release-sessions-1", 3, 2, 1, None);
+        assert_eq!(json["type"], "release_sessions_done");
+        assert_eq!(json["id"], "release-sessions-1");
+        assert_eq!(json["requested"], 3);
+        assert_eq!(json["released"], 2);
+        assert_eq!(json["resident_sessions"], 1);
+        assert!(json.get("model_worker").is_none());
+    }
+
+    #[test]
+    fn release_sessions_done_json_includes_model_worker_when_present() {
+        let worker = ModelWorkerRuntimeView {
+            worker_id: ModelWorkerId::from_runtime_parts(6, 1, Some("q8")),
+            max_seq: 256,
+            physical_cap: 128,
+            resident_workers: 1,
+            max_resident_workers: 2,
+            state_arena_backend: SequenceStateArenaBackend::Qwen35Wrapped,
+            resident_sessions: 4,
+            state_page_descriptors: Vec::new(),
+            memory: ModelWorkerMemoryView {
+                model_file_bytes: 10,
+                model_weight_bytes: 20,
+                runtime_base_bytes: 30,
+                runtime_session_bytes: 40,
+                runtime_state_bytes: 70,
+                total_resident_bytes: 90,
+                evictable_state_bytes: 40,
+            },
+        };
+
+        let json = release_sessions_done_json("release-sessions-2", 2, 1, 4, Some(&worker));
+        assert_eq!(json["type"], "release_sessions_done");
+        assert_eq!(json["requested"], 2);
+        assert_eq!(json["released"], 1);
+        assert_eq!(json["resident_sessions"], 4);
+        assert_eq!(json["model_worker"]["id"], "worker:arch6:pp1:q8");
+        assert_eq!(
+            json["model_worker"]["state_arena_backend"],
+            "qwen35_wrapped"
+        );
+        assert_eq!(json["model_worker"]["runtime_state_bytes"], 70);
     }
 
     #[test]
