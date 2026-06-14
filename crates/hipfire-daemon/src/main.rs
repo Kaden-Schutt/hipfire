@@ -75,10 +75,10 @@ use hipfire_state::{
     release_sessions_done_json, release_state_done_json, reserve_session_state_done_json,
     reserve_session_state_rejected_json, session_state_reservation_describe_json,
     unload_worker_done_json, validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
-    DescribedSequenceState, GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId,
-    ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
-    ReleaseStateResponseKind, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
-    SequenceStatePageDescriptor, SequenceStatePageKind,
+    validate_checkpoint_source_resident, DescribedSequenceState, GenericSequenceStateArena,
+    ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
+    ParsedSequenceStateHandle, ReleaseStateResponseKind, SequenceStateArenaBackend,
+    SequenceStateCheckpointRequest, SequenceStatePageDescriptor, SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -4342,9 +4342,14 @@ fn qwen35_fork_session_state(
             return Err(err);
         }
     }
-    let source = m.q35_sessions.get(source_session_id).ok_or_else(|| {
-        format!("qwen35 checkpoint source session {source_session_id} is not resident")
-    })?;
+    validate_checkpoint_source_resident(
+        source_session_id,
+        m.q35_sessions.contains_key(source_session_id),
+    )?;
+    let source = m
+        .q35_sessions
+        .get(source_session_id)
+        .expect("source residency was validated");
     let forked = Qwen35RequestSessionState::fork_from(gpu, source)?;
     m.q35_sessions.insert(dest_session_id.to_string(), forked);
     Ok(())
@@ -4360,15 +4365,14 @@ fn qwen35_checkpoint_session_state(
     }
     qwen35_save_active_session(m, gpu)?;
     {
+        validate_checkpoint_source_resident(
+            request.source_session_id,
+            m.q35_sessions.contains_key(request.source_session_id),
+        )?;
         let source = m
             .q35_sessions
             .get(request.source_session_id)
-            .ok_or_else(|| {
-                format!(
-                    "qwen35 checkpoint source session {} is not resident",
-                    request.source_session_id
-                )
-            })?;
+            .expect("source residency was validated");
         let logical_position = source.seq_pos + source.kv_cache.compact_offset;
         validate_checkpoint_logical_position(
             request.source_session_id,
@@ -4395,9 +4399,14 @@ fn qwen35_validate_prefix_hash(
     source_session_id: &str,
     requested: Option<&GenerateBatchPrefillPrefixHash>,
 ) -> Result<(), String> {
-    let source = m.q35_sessions.get(source_session_id).ok_or_else(|| {
-        format!("qwen35 checkpoint source session {source_session_id} is not resident")
-    })?;
+    validate_checkpoint_source_resident(
+        source_session_id,
+        m.q35_sessions.contains_key(source_session_id),
+    )?;
+    let source = m
+        .q35_sessions
+        .get(source_session_id)
+        .expect("source residency was validated");
     validate_checkpoint_prefix_hash(source_session_id, source.prefix_hash.as_ref(), requested)
 }
 

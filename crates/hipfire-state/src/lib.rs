@@ -176,6 +176,18 @@ pub struct SequenceStateCheckpointRequest<'a> {
     pub checkpoint_prefix_hash: Option<&'a SequenceStatePrefixHash>,
 }
 
+pub fn validate_checkpoint_source_resident(
+    source_session_id: &str,
+    resident: bool,
+) -> Result<(), String> {
+    if !resident {
+        return Err(format!(
+            "qwen35 checkpoint source session {source_session_id} is not resident"
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_checkpoint_prefix_hash(
     source_session_id: &str,
     stored: Option<&SequenceStatePrefixHash>,
@@ -1330,6 +1342,20 @@ mod tests {
         assert_eq!(
             err,
             "qwen35 checkpoint source session checkpoint-a logical_position mismatch: expected=16 resident=12"
+        );
+    }
+
+    #[test]
+    fn checkpoint_source_resident_validation_accepts_resident_source() {
+        validate_checkpoint_source_resident("checkpoint-a", true).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_source_resident_validation_reports_missing_source() {
+        let err = validate_checkpoint_source_resident("checkpoint-a", false).unwrap_err();
+        assert_eq!(
+            err,
+            "qwen35 checkpoint source session checkpoint-a is not resident"
         );
     }
 }
