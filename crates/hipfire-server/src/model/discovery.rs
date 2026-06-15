@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::config::{hipfire_dir, models_dir};
+use hipfire_config::{hipfire_dir, models_dir};
 use hipfire_model::find_model_in;
 pub use hipfire_model::{list_local_models_in, model_display_name};
 

@@ -213,6 +213,394 @@ pub const OBSERVED_ADMISSION_EVIDENCE_KINDS: &[&str] = &[
     "profiling",
 ];
 
+pub const MODULE_EVIDENCE_TRIGGER_METRICS: &[&str] = &[
+    "module_kind",
+    "module_id",
+    "preferred_backend",
+    "selected_backend",
+    "oracle_backend",
+    "fallback_reason",
+    "evidence",
+    "evidence_json",
+];
+
+pub const MODULE_EVIDENCE_JSON_METRICS: &[&str] = &[
+    "module_kind",
+    "module_id",
+    "preferred_backend",
+    "selected_backend",
+    "oracle_backend",
+    "fallback_reason",
+    "drift",
+    "shape",
+    "contract",
+    "evidence",
+    "evidence_json",
+    "mutates_residual",
+];
+
+pub const MODULE_EVIDENCE_NUMERIC_METRICS: &[&str] = &[
+    "layer",
+    "hidden",
+    "intermediate",
+    "n",
+    "max_abs",
+    "mean_abs",
+    "rms",
+    "nan",
+    "inf",
+];
+
+pub const LAUNCH_COUNT_METRICS: &[&str] = &[
+    "kernel_launches",
+    "graph_launches",
+    "memcpy_ops",
+    "launch_count",
+    "hip_kernel_launches",
+    "hip_graph_launches",
+    "hip_memcpy_ops",
+];
+
+pub const MOE_ROUTER_METRICS: &[&str] = &[
+    "expert_hits",
+    "shared_expert_hits",
+    "router_entropy",
+    "router_top1_histogram",
+    "router_top2_histogram",
+    "router_topk_histogram",
+    "router_dropped_tokens",
+];
+
+pub const PROFILING_METRICS: &[&str] = &[
+    "kernel_name",
+    "duration_us",
+    "occupancy",
+    "waves",
+    "lds_bytes",
+    "vgpr_count",
+    "sgpr_count",
+];
+
+pub const PHASE_TIMING_TRIGGER_METRICS: &[&str] = &[
+    "load_ms",
+    "prefill_ms",
+    "prefill_secs",
+    "decode_ms",
+    "decode_secs",
+    "teardown_ms",
+    "ttft_ms",
+    "elapsed_ms",
+];
+
+pub const MEMORY_TRIGGER_METRICS: &[&str] = &[
+    "vram_peak_bytes",
+    "vram_used_bytes",
+    "vram_used_mb",
+    "vram_loaded_mb",
+    "kv_bytes",
+    "workspace_bytes",
+];
+
+pub const PERFORMANCE_TRIGGER_METRICS: &[&str] = &[
+    "tok_s",
+    "tokens_per_second",
+    "ttft_ms",
+    "decode_ms",
+    "decode_secs",
+    "decode_tok_s",
+    "prefill_ms",
+    "prefill_secs",
+    "prefill_tok_s",
+    "total_ms",
+    "elapsed_ms",
+    "launch_count",
+];
+
+pub const QUALITY_TRIGGER_METRICS: &[&str] = &[
+    "mean_kld",
+    "p99_kld",
+    "ppl",
+    "nll",
+    "argmax_match_rate",
+    "accuracy",
+    "exact_match",
+];
+
+pub const DFLASH_TRACE_NUMERIC_METRICS: &[&str] =
+    &["ar_tok_s", "dflash_tok_s", "tau", "accept_rate", "tok_s"];
+
+pub const DFLASH_TRACE_BOOL_METRICS: &[&str] = &["ar_baseline"];
+
+pub const DFLASH_TRACE_JSON_METRICS: &[&str] = &[
+    "rollback_logit_compare",
+    "rollback_state_compare",
+    "rollback_fast_replay_admission",
+    "rollback_wo_delta_compare",
+];
+
+pub const DFLASH_TRACE_TRIGGER_METRICS: &[&str] = &[
+    "ar_tok_s",
+    "dflash_tok_s",
+    "tok_s",
+    "ar_baseline",
+    "rollback_logit_compare",
+    "rollback_state_compare",
+    "rollback_fast_replay_admission",
+    "rollback_wo_delta_compare",
+];
+
+pub const PATH_C_TRACE_JSON_METRICS: &[&str] = &[
+    "mode",
+    "phase",
+    "graph_mode",
+    "detector",
+    "verify_graph",
+    "path_c_counters",
+    "promotion_verdict",
+    "blockers",
+    "pairs",
+    "extra_args",
+    "token_attractor_detector",
+];
+
+pub const PATH_C_TRACE_NUMERIC_METRICS: &[&str] = &[
+    "tok_s",
+    "tau",
+    "accept_rate",
+    "emitted_tokens",
+    "wall_s",
+    "paired_cases",
+    "tok_s_min_delta_pct",
+    "tau_min_delta_pct",
+    "max_tokens",
+];
+
+pub const PATH_C_TRACE_TRIGGER_METRICS: &[&str] = &["promotion_verdict"];
+
+pub fn has_any_metric(metrics: &BTreeMap<String, Value>, keys: &[&str]) -> bool {
+    keys.iter().any(|key| metrics.contains_key(*key))
+}
+
+pub fn select_metrics(metrics: &BTreeMap<String, Value>, keys: &[&str]) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for key in keys {
+        if let Some(value) = metrics.get(*key) {
+            out.insert((*key).to_string(), value.clone());
+        }
+    }
+    out
+}
+
+pub fn has_launch_count_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, LAUNCH_COUNT_METRICS)
+}
+
+pub fn launch_count_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    select_metrics(metrics, LAUNCH_COUNT_METRICS)
+}
+
+pub fn has_moe_router_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, MOE_ROUTER_METRICS)
+}
+
+pub fn moe_router_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    select_metrics(metrics, MOE_ROUTER_METRICS)
+}
+
+pub fn has_profiling_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, PROFILING_METRICS)
+}
+
+pub fn profiling_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    select_metrics(metrics, PROFILING_METRICS)
+}
+
+pub fn has_phase_timing_metric(metrics: &BTreeMap<String, Value>, elapsed_ms: u128) -> bool {
+    has_any_metric(metrics, PHASE_TIMING_TRIGGER_METRICS) || elapsed_ms > 0
+}
+
+pub fn phase_timing_metrics(
+    metrics: &BTreeMap<String, Value>,
+    elapsed_ms: u128,
+) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    copy_numeric_metric(metrics, &mut out, "load_ms", "load_ms");
+    copy_numeric_metric(metrics, &mut out, "prefill_ms", "prefill_ms");
+    copy_secs_as_ms(metrics, &mut out, "prefill_secs", "prefill_ms");
+    copy_numeric_metric(metrics, &mut out, "decode_ms", "decode_ms");
+    copy_secs_as_ms(metrics, &mut out, "decode_secs", "decode_ms");
+    copy_numeric_metric(metrics, &mut out, "teardown_ms", "teardown_ms");
+    copy_numeric_metric(metrics, &mut out, "ttft_ms", "ttft_ms");
+    if !out.contains_key("elapsed_ms") {
+        out.insert("elapsed_ms".to_string(), json!(elapsed_ms));
+    }
+    out
+}
+
+pub fn has_memory_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, MEMORY_TRIGGER_METRICS)
+}
+
+pub fn has_performance_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, PERFORMANCE_TRIGGER_METRICS)
+}
+
+pub fn has_quality_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, QUALITY_TRIGGER_METRICS)
+}
+
+pub fn memory_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    copy_numeric_metric(metrics, &mut out, "vram_peak_bytes", "vram_peak_bytes");
+    copy_numeric_metric(metrics, &mut out, "vram_used_bytes", "vram_peak_bytes");
+    copy_mb_as_bytes(metrics, &mut out, "vram_used_mb", "vram_peak_bytes");
+    copy_mb_as_bytes(metrics, &mut out, "vram_loaded_mb", "vram_peak_bytes");
+    copy_numeric_metric(metrics, &mut out, "kv_bytes", "kv_bytes");
+    copy_numeric_metric(metrics, &mut out, "workspace_bytes", "workspace_bytes");
+    out
+}
+
+pub fn has_module_evidence_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    MODULE_EVIDENCE_TRIGGER_METRICS
+        .iter()
+        .any(|key| metrics.contains_key(*key))
+}
+
+pub fn module_evidence_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for key in MODULE_EVIDENCE_JSON_METRICS {
+        copy_json_metric(metrics, &mut out, key, key);
+    }
+    for key in MODULE_EVIDENCE_NUMERIC_METRICS {
+        copy_numeric_metric(metrics, &mut out, key, key);
+    }
+    out
+}
+
+pub fn has_dflash_trace_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, DFLASH_TRACE_TRIGGER_METRICS)
+}
+
+pub fn dflash_trace_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for key in DFLASH_TRACE_NUMERIC_METRICS {
+        copy_numeric_metric(metrics, &mut out, key, key);
+    }
+    for key in DFLASH_TRACE_BOOL_METRICS {
+        copy_bool_metric(metrics, &mut out, key, key);
+    }
+    for key in DFLASH_TRACE_JSON_METRICS {
+        copy_json_metric(metrics, &mut out, key, key);
+    }
+
+    if let Some(ar_baseline) = metrics.get("ar_baseline").and_then(Value::as_bool) {
+        out.insert(
+            "mode".to_string(),
+            json!(if ar_baseline { "ar" } else { "dflash" }),
+        );
+        if ar_baseline {
+            if !out.contains_key("ar_tok_s") {
+                copy_numeric_metric(metrics, &mut out, "tok_s", "ar_tok_s");
+            }
+        } else if !out.contains_key("dflash_tok_s") {
+            copy_numeric_metric(metrics, &mut out, "tok_s", "dflash_tok_s");
+        }
+    } else if metrics.contains_key("ar_tok_s") || metrics.contains_key("dflash_tok_s") {
+        out.insert("mode".to_string(), json!("aggregate"));
+    }
+
+    out
+}
+
+pub fn has_path_c_trace_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    metrics
+        .get("mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode.starts_with("path-c"))
+        || has_any_metric(metrics, PATH_C_TRACE_TRIGGER_METRICS)
+}
+
+pub fn path_c_trace_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for key in PATH_C_TRACE_JSON_METRICS {
+        copy_json_metric(metrics, &mut out, key, key);
+    }
+    for key in PATH_C_TRACE_NUMERIC_METRICS {
+        copy_numeric_metric(metrics, &mut out, key, key);
+    }
+    out
+}
+
+fn copy_json_metric(
+    source: &BTreeMap<String, Value>,
+    dest: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    dest_key: &str,
+) {
+    if dest.contains_key(dest_key) {
+        return;
+    }
+    if let Some(value) = source.get(source_key) {
+        dest.insert(dest_key.to_string(), value.clone());
+    }
+}
+
+fn copy_numeric_metric(
+    source: &BTreeMap<String, Value>,
+    dest: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    dest_key: &str,
+) {
+    if dest.contains_key(dest_key) {
+        return;
+    }
+    if let Some(value) = source.get(source_key).and_then(Value::as_f64) {
+        dest.insert(dest_key.to_string(), json!(value));
+    }
+}
+
+fn copy_bool_metric(
+    source: &BTreeMap<String, Value>,
+    dest: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    dest_key: &str,
+) {
+    if dest.contains_key(dest_key) {
+        return;
+    }
+    if let Some(value) = source.get(source_key).and_then(Value::as_bool) {
+        dest.insert(dest_key.to_string(), json!(value));
+    }
+}
+
+fn copy_secs_as_ms(
+    source: &BTreeMap<String, Value>,
+    dest: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    dest_key: &str,
+) {
+    if dest.contains_key(dest_key) {
+        return;
+    }
+    if let Some(value) = source.get(source_key).and_then(Value::as_f64) {
+        dest.insert(dest_key.to_string(), json!(value * 1000.0));
+    }
+}
+
+fn copy_mb_as_bytes(
+    source: &BTreeMap<String, Value>,
+    dest: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    dest_key: &str,
+) {
+    if dest.contains_key(dest_key) {
+        return;
+    }
+    if let Some(value) = source.get(source_key).and_then(Value::as_f64) {
+        dest.insert(dest_key.to_string(), json!(value * 1024.0 * 1024.0));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvidenceRecord {
     pub battery: String,
@@ -573,6 +961,61 @@ pub fn evidence_artifact_index_entry_from_value_json(
         if let Some(kind) = value.get("kind").cloned() {
             object.insert("kind".to_string(), kind);
         }
+    }
+    entry
+}
+
+pub fn comparison_artifact_index_entry_json(
+    path: impl Into<String>,
+    status: impl Into<String>,
+    case_count: usize,
+    context: &EvidenceArtifactIndexContext,
+) -> Value {
+    let mut entry = evidence_artifact_index_entry_json(path, status, context);
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("case_count".to_string(), json!(case_count));
+    }
+    entry
+}
+
+pub fn admission_artifact_index_entry_json(
+    path: impl Into<String>,
+    status: impl Into<String>,
+    verdict: impl Into<String>,
+    finding_count: usize,
+    context: &EvidenceArtifactIndexContext,
+) -> Value {
+    let mut entry = evidence_artifact_index_entry_json(path, status, context);
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("verdict".to_string(), json!(verdict.into()));
+        object.insert("finding_count".to_string(), json!(finding_count));
+    }
+    entry
+}
+
+pub fn prompt_artifact_index_entry_json(
+    path: impl Into<String>,
+    status: impl Into<String>,
+    kind: impl Into<String>,
+    row_count: usize,
+    context: &EvidenceArtifactIndexContext,
+) -> Value {
+    let mut entry = evidence_artifact_index_entry_json(path, status, context);
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("row_count".to_string(), json!(row_count));
+        object.insert("kind".to_string(), json!(kind.into()));
+    }
+    entry
+}
+
+pub fn host_profile_artifact_index_entry_json(
+    path: impl Into<String>,
+    status: impl Into<String>,
+    context: &EvidenceArtifactIndexContext,
+) -> Value {
+    let mut entry = evidence_artifact_index_entry_json(path, status, context);
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("kind".to_string(), json!("host_capability_profile"));
     }
     entry
 }
@@ -1404,6 +1847,208 @@ mod tests {
     }
 
     #[test]
+    fn module_evidence_metrics_select_owned_schema_fields() {
+        let mut metrics = BTreeMap::new();
+        metrics.insert("module_kind".to_string(), json!("dense_ffn_swiglu_down"));
+        metrics.insert("module_id".to_string(), json!("qwen35.layer4"));
+        metrics.insert("preferred_backend".to_string(), json!("gpu_production"));
+        metrics.insert("selected_backend".to_string(), json!("gpu_production"));
+        metrics.insert("oracle_backend".to_string(), json!("cpu_oracle"));
+        metrics.insert("fallback_reason".to_string(), json!("none"));
+        metrics.insert("drift".to_string(), json!({"max_abs": 0.001}));
+        metrics.insert("shape".to_string(), json!([1, 4096]));
+        metrics.insert("mutates_residual".to_string(), json!(false));
+        metrics.insert("layer".to_string(), json!(4));
+        metrics.insert("max_abs".to_string(), json!(0.001));
+        metrics.insert("nan".to_string(), json!(0));
+        metrics.insert("unrelated".to_string(), json!("drop"));
+
+        assert!(has_module_evidence_metric(&metrics));
+        let selected = module_evidence_metrics(&metrics);
+        assert_eq!(selected["module_kind"], json!("dense_ffn_swiglu_down"));
+        assert_eq!(selected["drift"]["max_abs"], json!(0.001));
+        assert_eq!(selected["layer"], json!(4.0));
+        assert_eq!(selected["max_abs"], json!(0.001));
+        assert_eq!(selected["nan"], json!(0.0));
+        assert!(!selected.contains_key("unrelated"));
+    }
+
+    #[test]
+    fn runtime_metric_projections_select_owned_schema_fields() {
+        let mut metrics = BTreeMap::new();
+        metrics.insert("kernel_launches".to_string(), json!(12));
+        metrics.insert("hip_graph_launches".to_string(), json!(2));
+        metrics.insert("expert_hits".to_string(), json!([1, 2, 3]));
+        metrics.insert("router_entropy".to_string(), json!(0.7));
+        metrics.insert("kernel_name".to_string(), json!("gemv"));
+        metrics.insert("duration_us".to_string(), json!(42.5));
+        metrics.insert("unrelated".to_string(), json!("drop"));
+
+        assert!(has_launch_count_metric(&metrics));
+        assert!(has_moe_router_metric(&metrics));
+        assert!(has_profiling_metric(&metrics));
+
+        let launch = launch_count_metrics(&metrics);
+        assert_eq!(launch["kernel_launches"], json!(12));
+        assert_eq!(launch["hip_graph_launches"], json!(2));
+        assert!(!launch.contains_key("expert_hits"));
+        assert!(!launch.contains_key("unrelated"));
+
+        let moe = moe_router_metrics(&metrics);
+        assert_eq!(moe["expert_hits"], json!([1, 2, 3]));
+        assert_eq!(moe["router_entropy"], json!(0.7));
+        assert!(!moe.contains_key("kernel_name"));
+
+        let profiling = profiling_metrics(&metrics);
+        assert_eq!(profiling["kernel_name"], json!("gemv"));
+        assert_eq!(profiling["duration_us"], json!(42.5));
+        assert!(!profiling.contains_key("kernel_launches"));
+    }
+
+    #[test]
+    fn phase_and_memory_metric_projections_preserve_eval_aliases() {
+        let mut phase = BTreeMap::new();
+        phase.insert("prefill_secs".to_string(), json!(1.25));
+        phase.insert("decode_ms".to_string(), json!(9.0));
+        phase.insert("ttft_ms".to_string(), json!(3.0));
+
+        assert!(has_phase_timing_metric(&phase, 42));
+        let selected_phase = phase_timing_metrics(&phase, 42);
+        assert_eq!(selected_phase["prefill_ms"], json!(1250.0));
+        assert_eq!(selected_phase["decode_ms"], json!(9.0));
+        assert_eq!(selected_phase["ttft_ms"], json!(3.0));
+        assert_eq!(selected_phase["elapsed_ms"], json!(42));
+
+        let mut memory = BTreeMap::new();
+        memory.insert("vram_used_mb".to_string(), json!(2.5));
+        memory.insert("kv_bytes".to_string(), json!(1024));
+        memory.insert("workspace_bytes".to_string(), json!(2048));
+
+        assert!(has_memory_metric(&memory));
+        let selected_memory = memory_metrics(&memory);
+        assert_eq!(
+            selected_memory["vram_peak_bytes"],
+            json!(2.5 * 1024.0 * 1024.0)
+        );
+        assert_eq!(selected_memory["kv_bytes"], json!(1024.0));
+        assert_eq!(selected_memory["workspace_bytes"], json!(2048.0));
+    }
+
+    #[test]
+    fn performance_metric_detection_preserves_eval_aliases() {
+        for key in PERFORMANCE_TRIGGER_METRICS {
+            let metrics = BTreeMap::from([((*key).to_string(), json!(1.0))]);
+            assert!(has_performance_metric(&metrics), "{key}");
+        }
+
+        let unrelated = BTreeMap::from([("mean_kld".to_string(), json!(0.01))]);
+        assert!(!has_performance_metric(&unrelated));
+    }
+
+    #[test]
+    fn quality_metric_detection_preserves_eval_aliases() {
+        for key in QUALITY_TRIGGER_METRICS {
+            let metrics = BTreeMap::from([((*key).to_string(), json!(1.0))]);
+            assert!(has_quality_metric(&metrics), "{key}");
+        }
+
+        let unrelated = BTreeMap::from([("tok_s".to_string(), json!(128.0))]);
+        assert!(!has_quality_metric(&unrelated));
+    }
+
+    #[test]
+    fn dflash_trace_metrics_normalize_ar_and_dflash_rows() {
+        let ar = BTreeMap::from([
+            ("tok_s".to_string(), json!(90.0)),
+            ("ar_baseline".to_string(), json!(true)),
+        ]);
+        assert!(has_dflash_trace_metric(&ar));
+        let ar_trace = dflash_trace_metrics(&ar);
+        assert_eq!(ar_trace.get("mode"), Some(&json!("ar")));
+        assert_eq!(ar_trace.get("ar_tok_s"), Some(&json!(90.0)));
+
+        let dflash = BTreeMap::from([
+            ("tok_s".to_string(), json!(130.0)),
+            ("ar_baseline".to_string(), json!(false)),
+            ("tau".to_string(), json!(2.5)),
+            ("accept_rate".to_string(), json!(0.6)),
+            (
+                "rollback_state_compare".to_string(),
+                json!({
+                    "ok": false,
+                    "reason": "fast_replay_recurrent_state_mismatch",
+                }),
+            ),
+        ]);
+        let dflash_trace = dflash_trace_metrics(&dflash);
+        assert_eq!(dflash_trace.get("mode"), Some(&json!("dflash")));
+        assert_eq!(dflash_trace.get("dflash_tok_s"), Some(&json!(130.0)));
+        assert_eq!(dflash_trace.get("tau"), Some(&json!(2.5)));
+        assert_eq!(
+            dflash_trace
+                .get("rollback_state_compare")
+                .and_then(|value| value.get("reason")),
+            Some(&json!("fast_replay_recurrent_state_mismatch"))
+        );
+
+        let aggregate = BTreeMap::from([("dflash_tok_s".to_string(), json!(144.0))]);
+        assert_eq!(
+            dflash_trace_metrics(&aggregate).get("mode"),
+            Some(&json!("aggregate"))
+        );
+    }
+
+    #[test]
+    fn path_c_trace_metrics_select_owned_schema_fields() {
+        let dflash = BTreeMap::from([
+            ("mode".to_string(), json!("dflash")),
+            ("tok_s".to_string(), json!(130.0)),
+        ]);
+        assert!(!has_path_c_trace_metric(&dflash));
+
+        let path_c = BTreeMap::from([
+            ("mode".to_string(), json!("path-c-phase1")),
+            ("tok_s".to_string(), json!(5.86)),
+            ("tau".to_string(), json!(1.23)),
+            ("max_tokens".to_string(), json!(192)),
+            (
+                "verify_graph".to_string(),
+                json!({
+                    "direct": 0,
+                    "warmup": 3,
+                    "capture": 3,
+                    "replay": 81,
+                }),
+            ),
+            ("ignored".to_string(), json!("not exported")),
+        ]);
+        assert!(has_path_c_trace_metric(&path_c));
+        let trace = path_c_trace_metrics(&path_c);
+        assert_eq!(trace.get("mode"), Some(&json!("path-c-phase1")));
+        assert_eq!(trace.get("tok_s"), Some(&json!(5.86)));
+        assert_eq!(
+            trace
+                .get("verify_graph")
+                .and_then(|value| value.get("replay")),
+            Some(&json!(81))
+        );
+        assert!(!trace.contains_key("ignored"));
+
+        let promotion = BTreeMap::from([
+            ("promotion_verdict".to_string(), json!("NOT_PROMOTED")),
+            (
+                "blockers".to_string(),
+                json!(["path-c-phase2-code: tok/s delta -3.732% < 5.000%"]),
+            ),
+        ]);
+        assert!(has_path_c_trace_metric(&promotion));
+        assert_eq!(
+            path_c_trace_metrics(&promotion).get("promotion_verdict"),
+            Some(&json!("NOT_PROMOTED"))
+        );
+    }
+
+    #[test]
     fn evidence_metric_direction_classifies_known_metric_semantics() {
         assert_eq!(evidence_metric_direction("mean_kld", -0.01), "improved");
         assert_eq!(evidence_metric_direction("mean_kld", 0.01), "regressed");
@@ -1854,6 +2499,58 @@ mod tests {
         assert_eq!(json["reason"], "ok");
         assert_eq!(json["expected_metrics"][0], "tok_s");
         assert_eq!(json["kind"], "performance");
+    }
+
+    #[test]
+    fn artifact_index_variant_entries_add_owned_counts_and_kinds() {
+        let context = EvidenceArtifactIndexContext {
+            provenance: RunProvenance {
+                runner: "hipfire-eval".to_string(),
+                runner_version: "0.2.0".to_string(),
+                hipfire_version: "0.2.0".to_string(),
+                git_commit: Some("abc123".to_string()),
+                git_branch: None,
+                git_describe: None,
+                git_dirty: Some(false),
+                binary_hash: None,
+                arch: None,
+                rocm: None,
+            },
+            host_profile_hash: "host:abc".to_string(),
+            hardware_bucket: "gfx1151:64g".to_string(),
+        };
+
+        let comparison =
+            comparison_artifact_index_entry_json("artifacts/comparisons.json", "pass", 3, &context);
+        assert_eq!(comparison["case_count"], 3);
+        assert_eq!(comparison["status"], "pass");
+
+        let admission = admission_artifact_index_entry_json(
+            "artifacts/admission.json",
+            "fail",
+            "reject",
+            2,
+            &context,
+        );
+        assert_eq!(admission["verdict"], "reject");
+        assert_eq!(admission["finding_count"], 2);
+
+        let prompts = prompt_artifact_index_entry_json(
+            "artifacts/barrage_prompts.jsonl",
+            "materialized",
+            "barrage_prompts",
+            5,
+            &context,
+        );
+        assert_eq!(prompts["row_count"], 5);
+        assert_eq!(prompts["kind"], "barrage_prompts");
+
+        let host = host_profile_artifact_index_entry_json(
+            "artifacts/host_profile.json",
+            "collected",
+            &context,
+        );
+        assert_eq!(host["kind"], "host_capability_profile");
     }
 
     #[test]

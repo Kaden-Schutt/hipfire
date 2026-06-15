@@ -41,6 +41,17 @@ impl ModelWorkerId {
     }
 }
 
+pub fn parse_model_worker_id(msg: &serde_json::Value, default_worker_id: &str) -> ModelWorkerId {
+    let value = msg
+        .get("worker_id")
+        .or_else(|| msg.get("worker_key_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_worker_id)
+        .to_string();
+    ModelWorkerId { value }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SequenceStateArenaBackend {
     Qwen35Wrapped,
@@ -177,6 +188,93 @@ pub struct SequenceStateCheckpointRequest<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SequenceStateForkRequest<'a> {
+    pub source_session_id: &'a str,
+    pub dest_session_id: &'a str,
+    pub requested_prefix_hash: Option<&'a SequenceStatePrefixHash>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateReservationRequest {
+    pub worker_id: String,
+    pub reservation_id: Option<String>,
+    pub state_kinds: Vec<SequenceStatePageKind>,
+    pub physical_cap: usize,
+    pub ttl_ms: u64,
+    pub budget_bytes: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateDescribeRequest {
+    pub handle: ParsedSequenceStateHandle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateReleaseRequest {
+    pub response_kind: ReleaseStateResponseKind,
+    pub handles: Vec<ParsedSequenceStateHandle>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateReleaseSessionsRequest {
+    pub worker_id: String,
+    pub sessions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateUnloadWorkerRequest {
+    pub worker_id: String,
+}
+
+pub fn validate_checkpoint_source_resident(
+    source_session_id: &str,
+    resident: bool,
+) -> Result<(), String> {
+    if !resident {
+        return Err(format!(
+            "qwen35 checkpoint source session {source_session_id} is not resident"
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_checkpoint_prefix_hash(
+    source_session_id: &str,
+    stored: Option<&SequenceStatePrefixHash>,
+    requested: Option<&SequenceStatePrefixHash>,
+) -> Result<(), String> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let stored = stored.ok_or_else(|| {
+        format!("qwen35 checkpoint source session {source_session_id} has no prefix hash")
+    })?;
+    if stored != requested {
+        return Err(format!(
+            "prefix hash mismatch for checkpoint {source_session_id}: request={} len={} stored={} len={}",
+            requested.value,
+            requested.prefix_len,
+            stored.value,
+            stored.prefix_len
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_checkpoint_logical_position(
+    source_session_id: &str,
+    expected_logical_position: usize,
+    resident_logical_position: usize,
+) -> Result<(), String> {
+    if resident_logical_position != expected_logical_position {
+        return Err(format!(
+            "qwen35 checkpoint source session {source_session_id} logical_position mismatch: expected={expected_logical_position} resident={resident_logical_position}"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SequenceStatePageKind {
     Kv,
     DeltaNet,
@@ -220,6 +318,129 @@ pub struct SequenceStatePageDescriptor {
     pub shape: Vec<usize>,
     pub placement: String,
     pub role: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SequenceStatePageOwnership {
+    ArenaOwned,
+    BackendWrapped,
+    Unsupported,
+}
+
+impl SequenceStatePageOwnership {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ArenaOwned => "arena_owned",
+            Self::BackendWrapped => "backend_wrapped",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SequenceStateEvictionPolicy {
+    ManualReleaseOnly,
+    LruCheckpoint,
+}
+
+impl SequenceStateEvictionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ManualReleaseOnly => "manual_release_only",
+            Self::LruCheckpoint => "lru_checkpoint",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SequenceStateSpillTarget {
+    Disabled,
+    Disk,
+}
+
+impl SequenceStateSpillTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Disk => "disk",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SequenceStateAllocatorPolicy {
+    pub page_ownership: SequenceStatePageOwnership,
+    pub eviction_policy: SequenceStateEvictionPolicy,
+    pub spill_target: SequenceStateSpillTarget,
+    pub copy_on_write_attach: bool,
+}
+
+impl SequenceStateAllocatorPolicy {
+    pub fn for_backend(
+        backend: SequenceStateArenaBackend,
+        descriptors: &[SequenceStatePageDescriptor],
+    ) -> Self {
+        let page_ownership = match backend {
+            SequenceStateArenaBackend::Unsupported => SequenceStatePageOwnership::Unsupported,
+            SequenceStateArenaBackend::Qwen35Wrapped => {
+                if descriptors.iter().any(|descriptor| descriptor.owns_pages) {
+                    SequenceStatePageOwnership::ArenaOwned
+                } else {
+                    SequenceStatePageOwnership::BackendWrapped
+                }
+            }
+        };
+        Self {
+            page_ownership,
+            eviction_policy: SequenceStateEvictionPolicy::ManualReleaseOnly,
+            spill_target: SequenceStateSpillTarget::Disabled,
+            copy_on_write_attach: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateEvictionCandidate {
+    pub handle: SequenceStateHandle,
+    pub resident_bytes: usize,
+    pub last_touched_ms: u64,
+}
+
+pub fn sequence_state_allocator_policy_json(
+    policy: SequenceStateAllocatorPolicy,
+) -> serde_json::Value {
+    serde_json::json!({
+        "page_ownership": policy.page_ownership.as_str(),
+        "eviction_policy": policy.eviction_policy.as_str(),
+        "spill_target": policy.spill_target.as_str(),
+        "copy_on_write_attach": policy.copy_on_write_attach,
+    })
+}
+
+pub fn select_lru_sequence_state_eviction_candidates(
+    mut candidates: Vec<SequenceStateEvictionCandidate>,
+    target_bytes: usize,
+) -> Vec<SequenceStateEvictionCandidate> {
+    candidates.sort_by(|a, b| {
+        a.last_touched_ms
+            .cmp(&b.last_touched_ms)
+            .then_with(|| b.resident_bytes.cmp(&a.resident_bytes))
+            .then_with(|| a.handle.id.cmp(&b.handle.id))
+            .then_with(|| a.handle.generation.cmp(&b.handle.generation))
+    });
+    if target_bytes == 0 {
+        return candidates;
+    }
+    let mut selected = Vec::new();
+    let mut selected_bytes = 0usize;
+    for candidate in candidates {
+        selected_bytes = selected_bytes.saturating_add(candidate.resident_bytes);
+        selected.push(candidate);
+        if selected_bytes >= target_bytes {
+            break;
+        }
+    }
+    selected
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -278,6 +499,11 @@ pub fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_
         .iter()
         .map(sequence_state_page_descriptor_json)
         .collect();
+    let state_allocator =
+        sequence_state_allocator_policy_json(SequenceStateAllocatorPolicy::for_backend(
+            worker.state_arena_backend,
+            &worker.state_page_descriptors,
+        ));
     serde_json::json!({
         "id": worker.worker_id.value,
         "max_seq": worker.max_seq,
@@ -293,6 +519,7 @@ pub fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_
             .map(|op| op.as_str())
             .collect::<Vec<_>>(),
         "resident_sessions": worker.resident_sessions,
+        "state_allocator": state_allocator,
         "state_page_descriptor_entries": worker.state_page_descriptors.len(),
         "state_page_descriptor_bytes": descriptor_bytes,
         "state_page_descriptors": descriptors,
@@ -385,6 +612,62 @@ pub fn described_sequence_state_json(
     )
 }
 
+pub fn reserve_session_state_done_json(
+    id: &str,
+    reservation: &SessionStateReservation,
+    current_session_bytes: usize,
+    outstanding_reserved_bytes: usize,
+    projected_reserved_bytes: usize,
+    budget_bytes: usize,
+) -> serde_json::Value {
+    let state_page_descriptors = reservation
+        .state_page_descriptors
+        .iter()
+        .map(sequence_state_page_descriptor_json)
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "type": "reserve_session_state_done",
+        "id": id,
+        "worker_key_id": &reservation.worker_id,
+        "reservation_id": &reservation.handle.id,
+        "runtime_state_handle": &reservation.handle.id,
+        "handle": {
+            "id": &reservation.handle.id,
+            "kind": &reservation.handle.kind,
+            "generation": reservation.handle.generation,
+        },
+        "state_arena_owns_pages": true,
+        "state_page_descriptors": state_page_descriptors,
+        "reserved_bytes": reservation.reserved_bytes,
+        "current_session_bytes": current_session_bytes,
+        "outstanding_reserved_bytes": outstanding_reserved_bytes,
+        "projected_reserved_bytes": projected_reserved_bytes,
+        "budget_bytes": budget_bytes,
+    })
+}
+
+pub fn reserve_session_state_rejected_json(
+    id: &str,
+    worker_id: &str,
+    reserved_bytes: usize,
+    current_session_bytes: usize,
+    outstanding_reserved_bytes: usize,
+    projected_reserved_bytes: usize,
+    budget_bytes: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "reserve_session_state_rejected",
+        "id": id,
+        "worker_key_id": worker_id,
+        "reason": "memory_pressure",
+        "reserved_bytes": reserved_bytes,
+        "current_session_bytes": current_session_bytes,
+        "outstanding_reserved_bytes": outstanding_reserved_bytes,
+        "projected_reserved_bytes": projected_reserved_bytes,
+        "budget_bytes": budget_bytes,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseStateResponseKind {
     ReleaseState,
@@ -417,6 +700,41 @@ pub fn release_state_done_json(
         "released_bytes": released_bytes,
         "generic_released": generic_released,
         "loaded_released": loaded_released,
+    })
+}
+
+pub fn release_sessions_done_json(
+    id: &str,
+    requested: usize,
+    released: usize,
+    resident_sessions: usize,
+    model_worker: Option<&ModelWorkerRuntimeView>,
+) -> serde_json::Value {
+    let mut done = serde_json::json!({
+        "type": "release_sessions_done",
+        "id": id,
+        "requested": requested,
+        "released": released,
+        "resident_sessions": resident_sessions,
+    });
+    if let Some(worker) = model_worker {
+        done["model_worker"] = model_worker_runtime_view_json(worker);
+    }
+    done
+}
+
+pub fn unload_worker_done_json(
+    id: &str,
+    worker_id: &str,
+    unloaded: bool,
+    resident_workers: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "unload_worker_done",
+        "id": id,
+        "worker_key_id": worker_id,
+        "unloaded": unloaded,
+        "resident_workers": resident_workers,
     })
 }
 
@@ -628,6 +946,91 @@ pub fn parse_reserve_session_state_kinds(
     Ok(kinds)
 }
 
+pub fn parse_reserve_session_state_request(
+    msg: &serde_json::Value,
+    worker_id: &str,
+) -> Result<SequenceStateReservationRequest, String> {
+    let physical_cap = msg
+        .get("physical_cap")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(0);
+    if physical_cap == 0 {
+        return Err("reserve_session_state.physical_cap must be > 0".to_string());
+    }
+    let state_kinds = parse_reserve_session_state_kinds(msg)?;
+    let reservation_id = msg
+        .get("reservation_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let ttl_ms = msg.get("ttl_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
+    let budget_bytes = msg
+        .get("budget_bytes")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    Ok(SequenceStateReservationRequest {
+        worker_id: worker_id.to_string(),
+        reservation_id,
+        state_kinds,
+        physical_cap,
+        ttl_ms,
+        budget_bytes,
+    })
+}
+
+pub fn parse_describe_sequence_state_request(
+    msg: &serde_json::Value,
+) -> Result<SequenceStateDescribeRequest, String> {
+    let handle_value = msg
+        .get("runtime_state_handle")
+        .or_else(|| msg.get("reservation_id"))
+        .or_else(|| msg.get("handle"));
+    let Some(handle) = handle_value.and_then(parse_sequence_state_handle) else {
+        return Err("describe_state requires runtime_state_handle".to_string());
+    };
+    Ok(SequenceStateDescribeRequest { handle })
+}
+
+pub fn parse_release_sequence_state_request(
+    msg: &serde_json::Value,
+) -> SequenceStateReleaseRequest {
+    let response_kind = if msg.get("type").and_then(|v| v.as_str()) == Some("release_state") {
+        ReleaseStateResponseKind::ReleaseState
+    } else {
+        ReleaseStateResponseKind::ReleaseSessionStateReservation
+    };
+    SequenceStateReleaseRequest {
+        response_kind,
+        handles: parse_sequence_state_handle_list(msg),
+    }
+}
+
+pub fn parse_release_sessions_request(
+    msg: &serde_json::Value,
+    worker_id: &str,
+) -> Result<SequenceStateReleaseSessionsRequest, String> {
+    let sessions = msg
+        .get("sessions")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "release_sessions.sessions must be an array of session ids".to_string())?
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    Ok(SequenceStateReleaseSessionsRequest {
+        worker_id: worker_id.to_string(),
+        sessions,
+    })
+}
+
+pub fn parse_unload_worker_request(
+    msg: &serde_json::Value,
+    default_worker_id: &str,
+) -> SequenceStateUnloadWorkerRequest {
+    let worker_id = parse_model_worker_id(msg, default_worker_id).value;
+    SequenceStateUnloadWorkerRequest { worker_id }
+}
+
 pub fn generic_state_reservation_descriptors(
     worker_id: &str,
     handle: &SequenceStateHandle,
@@ -758,6 +1161,275 @@ mod tests {
     }
 
     #[test]
+    fn parse_model_worker_id_preserves_daemon_alias_priority() {
+        let worker_id = parse_model_worker_id(
+            &serde_json::json!({
+                "worker_id": "worker-a",
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_id.value, "worker-a");
+
+        let worker_key_id = parse_model_worker_id(
+            &serde_json::json!({
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_key_id.value, "worker-b");
+    }
+
+    #[test]
+    fn parse_model_worker_id_falls_back_to_default_worker() {
+        let missing = parse_model_worker_id(&serde_json::json!({}), "__default__");
+        assert_eq!(missing.value, "__default__");
+
+        let empty = parse_model_worker_id(
+            &serde_json::json!({
+                "worker_id": "",
+                "worker_key_id": ""
+            }),
+            "__default__",
+        );
+        assert_eq!(empty.value, "__default__");
+    }
+
+    #[test]
+    fn parse_reserve_session_state_request_preserves_daemon_defaults() {
+        let request = parse_reserve_session_state_request(
+            &serde_json::json!({
+                "type": "reserve_session_state",
+                "physical_cap": 4096
+            }),
+            "worker-a",
+        )
+        .unwrap();
+        assert_eq!(request.worker_id, "worker-a");
+        assert_eq!(request.reservation_id, None);
+        assert_eq!(
+            request.state_kinds,
+            vec![SequenceStatePageKind::Kv, SequenceStatePageKind::DeltaNet]
+        );
+        assert_eq!(request.physical_cap, 4096);
+        assert_eq!(request.ttl_ms, 30_000);
+        assert_eq!(request.budget_bytes, None);
+    }
+
+    #[test]
+    fn parse_reserve_session_state_request_preserves_optional_fields() {
+        let request = parse_reserve_session_state_request(
+            &serde_json::json!({
+                "type": "reserve_session_state",
+                "reservation_id": "reserve-a",
+                "physical_cap": 8192,
+                "ttl_ms": 0,
+                "budget_bytes": 16384,
+                "state_kinds": ["attention_kv", "mamba_ssm", "attention_kv"]
+            }),
+            "worker-b",
+        )
+        .unwrap();
+        assert_eq!(request.worker_id, "worker-b");
+        assert_eq!(request.reservation_id.as_deref(), Some("reserve-a"));
+        assert_eq!(
+            request.state_kinds,
+            vec![
+                SequenceStatePageKind::Kv,
+                SequenceStatePageKind::BackendPrivate
+            ]
+        );
+        assert_eq!(request.physical_cap, 8192);
+        assert_eq!(request.ttl_ms, 0);
+        assert_eq!(request.budget_bytes, Some(16384));
+    }
+
+    #[test]
+    fn parse_reserve_session_state_request_rejects_missing_physical_cap_first() {
+        let err = parse_reserve_session_state_request(
+            &serde_json::json!({
+                "type": "reserve_session_state",
+                "state_kinds": ["bogus"]
+            }),
+            "worker-a",
+        )
+        .unwrap_err();
+        assert_eq!(err, "reserve_session_state.physical_cap must be > 0");
+    }
+
+    #[test]
+    fn parse_describe_sequence_state_request_accepts_handle_aliases() {
+        let runtime = parse_describe_sequence_state_request(&serde_json::json!({
+            "type": "describe_state",
+            "runtime_state_handle": "state-a"
+        }))
+        .unwrap();
+        assert_eq!(runtime.handle.id, "state-a");
+        assert_eq!(runtime.handle.generation, None);
+
+        let reservation = parse_describe_sequence_state_request(&serde_json::json!({
+            "type": "describe_state",
+            "reservation_id": {
+                "id": "reserve-a",
+                "kind": "generic_reserved_state",
+                "generation": 3
+            }
+        }))
+        .unwrap();
+        assert_eq!(reservation.handle.id, "reserve-a");
+        assert_eq!(
+            reservation.handle.kind.as_deref(),
+            Some("generic_reserved_state")
+        );
+        assert_eq!(reservation.handle.generation, Some(3));
+
+        let handle = parse_describe_sequence_state_request(&serde_json::json!({
+            "type": "describe_state",
+            "handle": {
+                "id": "checkpoint-a",
+                "allocation_epoch": 9
+            }
+        }))
+        .unwrap();
+        assert_eq!(handle.handle.id, "checkpoint-a");
+        assert_eq!(handle.handle.generation, Some(9));
+    }
+
+    #[test]
+    fn parse_describe_sequence_state_request_reports_existing_missing_handle_error() {
+        let err = parse_describe_sequence_state_request(&serde_json::json!({
+            "type": "describe_state"
+        }))
+        .unwrap_err();
+        assert_eq!(err, "describe_state requires runtime_state_handle");
+    }
+
+    #[test]
+    fn parse_release_sequence_state_request_preserves_response_kind() {
+        let release_state = parse_release_sequence_state_request(&serde_json::json!({
+            "type": "release_state",
+            "runtime_state_handle": "state-a"
+        }));
+        assert_eq!(
+            release_state.response_kind,
+            ReleaseStateResponseKind::ReleaseState
+        );
+        assert_eq!(release_state.handles[0].id, "state-a");
+
+        let reservation = parse_release_sequence_state_request(&serde_json::json!({
+            "type": "release_session_state_reservation",
+            "reservation_id": "reserve-a"
+        }));
+        assert_eq!(
+            reservation.response_kind,
+            ReleaseStateResponseKind::ReleaseSessionStateReservation
+        );
+        assert_eq!(reservation.handles[0].id, "reserve-a");
+    }
+
+    #[test]
+    fn parse_release_sequence_state_request_preserves_handle_sources() {
+        let handles = parse_release_sequence_state_request(&serde_json::json!({
+            "type": "release_state",
+            "handles": [
+                {
+                    "id": "checkpoint-a",
+                    "kind": "qwen35_checkpoint",
+                    "allocation_epoch": 8
+                },
+                "reserve-a"
+            ]
+        }));
+        assert_eq!(handles.handles.len(), 2);
+        assert_eq!(handles.handles[0].id, "checkpoint-a");
+        assert_eq!(
+            handles.handles[0].kind.as_deref(),
+            Some("qwen35_checkpoint")
+        );
+        assert_eq!(handles.handles[0].generation, Some(8));
+        assert_eq!(handles.handles[1].id, "reserve-a");
+
+        let empty = parse_release_sequence_state_request(&serde_json::json!({
+            "type": "release_state"
+        }));
+        assert!(empty.handles.is_empty());
+    }
+
+    #[test]
+    fn parse_release_sessions_request_preserves_filtered_session_list() {
+        let request = parse_release_sessions_request(
+            &serde_json::json!({
+                "type": "release_sessions",
+                "sessions": ["session-a", 7, "session-b", null]
+            }),
+            "worker-a",
+        )
+        .unwrap();
+        assert_eq!(request.worker_id, "worker-a");
+        assert_eq!(
+            request.sessions,
+            vec!["session-a".to_string(), "session-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_release_sessions_request_reports_existing_missing_sessions_error() {
+        let err = parse_release_sessions_request(
+            &serde_json::json!({
+                "type": "release_sessions"
+            }),
+            "worker-a",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "release_sessions.sessions must be an array of session ids"
+        );
+    }
+
+    #[test]
+    fn parse_unload_worker_request_accepts_worker_aliases() {
+        let worker_id = parse_unload_worker_request(
+            &serde_json::json!({
+                "type": "unload_worker",
+                "worker_id": "worker-a",
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_id.worker_id, "worker-a");
+
+        let worker_key_id = parse_unload_worker_request(
+            &serde_json::json!({
+                "type": "unload_worker",
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_key_id.worker_id, "worker-b");
+    }
+
+    #[test]
+    fn parse_unload_worker_request_falls_back_to_default_worker() {
+        let missing = parse_unload_worker_request(
+            &serde_json::json!({
+                "type": "unload_worker"
+            }),
+            "__default__",
+        );
+        assert_eq!(missing.worker_id, "__default__");
+
+        let empty = parse_unload_worker_request(
+            &serde_json::json!({
+                "type": "unload_worker",
+                "worker_id": ""
+            }),
+            "__default__",
+        );
+        assert_eq!(empty.worker_id, "__default__");
+    }
+
+    #[test]
     fn model_worker_runtime_view_json_reports_state_page_descriptors() {
         let handle = SequenceStateHandle {
             id: "session-a".to_string(),
@@ -817,6 +1489,88 @@ mod tests {
             "attention_kv"
         );
         assert_eq!(json["state_page_descriptors"][0]["handle"]["generation"], 7);
+        assert_eq!(json["state_allocator"]["page_ownership"], "arena_owned");
+        assert_eq!(
+            json["state_allocator"]["eviction_policy"],
+            "manual_release_only"
+        );
+        assert_eq!(json["state_allocator"]["spill_target"], "disabled");
+        assert_eq!(json["state_allocator"]["copy_on_write_attach"], false);
+    }
+
+    #[test]
+    fn allocator_policy_reports_backend_wrapped_and_unsupported_modes() {
+        let wrapped = SequenceStateAllocatorPolicy::for_backend(
+            SequenceStateArenaBackend::Qwen35Wrapped,
+            &[SequenceStatePageDescriptor {
+                session_id: "legacy".to_string(),
+                handle: SequenceStateHandle {
+                    id: "legacy".to_string(),
+                    kind: "qwen35_session".to_string(),
+                    generation: 0,
+                },
+                kind: SequenceStatePageKind::Kv,
+                label: "qwen35.kv_cache".to_string(),
+                logical_position: 1,
+                resident_bytes: 1024,
+                allocation_epoch: 0,
+                owns_pages: false,
+                shape: vec![1],
+                placement: "hip:arch5:device0".to_string(),
+                role: "resident".to_string(),
+            }],
+        );
+        assert_eq!(
+            wrapped.page_ownership,
+            SequenceStatePageOwnership::BackendWrapped
+        );
+        assert_eq!(
+            wrapped.eviction_policy,
+            SequenceStateEvictionPolicy::ManualReleaseOnly
+        );
+        assert_eq!(wrapped.spill_target, SequenceStateSpillTarget::Disabled);
+        assert!(!wrapped.copy_on_write_attach);
+
+        let unsupported =
+            SequenceStateAllocatorPolicy::for_backend(SequenceStateArenaBackend::Unsupported, &[]);
+        assert_eq!(
+            unsupported.page_ownership,
+            SequenceStatePageOwnership::Unsupported
+        );
+        assert_eq!(
+            unsupported.eviction_policy,
+            SequenceStateEvictionPolicy::ManualReleaseOnly
+        );
+    }
+
+    #[test]
+    fn lru_eviction_candidates_order_by_touch_then_bytes_then_handle() {
+        let candidate =
+            |id: &str, bytes: usize, last_touched_ms: u64| SequenceStateEvictionCandidate {
+                handle: SequenceStateHandle {
+                    id: id.to_string(),
+                    kind: "qwen35_checkpoint".to_string(),
+                    generation: 1,
+                },
+                resident_bytes: bytes,
+                last_touched_ms,
+            };
+        let selected = select_lru_sequence_state_eviction_candidates(
+            vec![
+                candidate("newer", 4096, 20),
+                candidate("old-small-b", 1024, 10),
+                candidate("old-large", 8192, 10),
+                candidate("old-small-a", 1024, 10),
+            ],
+            9000,
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.handle.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-large", "old-small-a"]
+        );
     }
 
     #[test]
@@ -885,6 +1639,58 @@ mod tests {
     }
 
     #[test]
+    fn reserve_session_state_done_json_preserves_daemon_wire_shape() {
+        let mut arena = GenericSequenceStateArena::new();
+        let reservation = arena.reserve(
+            "worker-a",
+            "reserve-a".to_string(),
+            &[SequenceStatePageKind::Kv, SequenceStatePageKind::DeltaNet],
+            256,
+            8192,
+            0,
+        );
+
+        let json =
+            reserve_session_state_done_json("reserve-1", &reservation, 1024, 2048, 11264, 16384);
+        assert_eq!(json["type"], "reserve_session_state_done");
+        assert_eq!(json["id"], "reserve-1");
+        assert_eq!(json["worker_key_id"], "worker-a");
+        assert_eq!(json["reservation_id"], "reserve-a");
+        assert_eq!(json["runtime_state_handle"], "reserve-a");
+        assert_eq!(json["handle"]["kind"], "generic_reserved_state");
+        assert_eq!(json["handle"]["generation"], 1);
+        assert_eq!(json["state_arena_owns_pages"], true);
+        assert_eq!(json["state_page_descriptors"].as_array().unwrap().len(), 2);
+        assert_eq!(json["reserved_bytes"], 8192);
+        assert_eq!(json["current_session_bytes"], 1024);
+        assert_eq!(json["outstanding_reserved_bytes"], 2048);
+        assert_eq!(json["projected_reserved_bytes"], 11264);
+        assert_eq!(json["budget_bytes"], 16384);
+    }
+
+    #[test]
+    fn reserve_session_state_rejected_json_preserves_daemon_wire_shape() {
+        let json = reserve_session_state_rejected_json(
+            "reserve-2",
+            "worker-a",
+            8192,
+            1024,
+            2048,
+            11264,
+            4096,
+        );
+        assert_eq!(json["type"], "reserve_session_state_rejected");
+        assert_eq!(json["id"], "reserve-2");
+        assert_eq!(json["worker_key_id"], "worker-a");
+        assert_eq!(json["reason"], "memory_pressure");
+        assert_eq!(json["reserved_bytes"], 8192);
+        assert_eq!(json["current_session_bytes"], 1024);
+        assert_eq!(json["outstanding_reserved_bytes"], 2048);
+        assert_eq!(json["projected_reserved_bytes"], 11264);
+        assert_eq!(json["budget_bytes"], 4096);
+    }
+
+    #[test]
     fn release_state_done_json_preserves_daemon_wire_shape() {
         let json = release_state_done_json(
             ReleaseStateResponseKind::ReleaseState,
@@ -917,6 +1723,62 @@ mod tests {
         assert_eq!(json["type"], "release_session_state_reservation_done");
         assert_eq!(json["released"], 1);
         assert_eq!(json["released_bytes"], usize::MAX);
+    }
+
+    #[test]
+    fn release_sessions_done_json_preserves_dummy_wire_shape() {
+        let json = release_sessions_done_json("release-sessions-1", 3, 2, 1, None);
+        assert_eq!(json["type"], "release_sessions_done");
+        assert_eq!(json["id"], "release-sessions-1");
+        assert_eq!(json["requested"], 3);
+        assert_eq!(json["released"], 2);
+        assert_eq!(json["resident_sessions"], 1);
+        assert!(json.get("model_worker").is_none());
+    }
+
+    #[test]
+    fn release_sessions_done_json_includes_model_worker_when_present() {
+        let worker = ModelWorkerRuntimeView {
+            worker_id: ModelWorkerId::from_runtime_parts(6, 1, Some("q8")),
+            max_seq: 256,
+            physical_cap: 128,
+            resident_workers: 1,
+            max_resident_workers: 2,
+            state_arena_backend: SequenceStateArenaBackend::Qwen35Wrapped,
+            resident_sessions: 4,
+            state_page_descriptors: Vec::new(),
+            memory: ModelWorkerMemoryView {
+                model_file_bytes: 10,
+                model_weight_bytes: 20,
+                runtime_base_bytes: 30,
+                runtime_session_bytes: 40,
+                runtime_state_bytes: 70,
+                total_resident_bytes: 90,
+                evictable_state_bytes: 40,
+            },
+        };
+
+        let json = release_sessions_done_json("release-sessions-2", 2, 1, 4, Some(&worker));
+        assert_eq!(json["type"], "release_sessions_done");
+        assert_eq!(json["requested"], 2);
+        assert_eq!(json["released"], 1);
+        assert_eq!(json["resident_sessions"], 4);
+        assert_eq!(json["model_worker"]["id"], "worker:arch6:pp1:q8");
+        assert_eq!(
+            json["model_worker"]["state_arena_backend"],
+            "qwen35_wrapped"
+        );
+        assert_eq!(json["model_worker"]["runtime_state_bytes"], 70);
+    }
+
+    #[test]
+    fn unload_worker_done_json_preserves_daemon_wire_shape() {
+        let json = unload_worker_done_json("unload-1", "worker:arch6:pp1:q8", true, 2);
+        assert_eq!(json["type"], "unload_worker_done");
+        assert_eq!(json["id"], "unload-1");
+        assert_eq!(json["worker_key_id"], "worker:arch6:pp1:q8");
+        assert_eq!(json["unloaded"], true);
+        assert_eq!(json["resident_workers"], 2);
     }
 
     #[test]
@@ -1035,5 +1897,97 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("attach_checkpoint requires a supported sequence-state arena"));
         assert!(err.contains("arch_id=7 pp=1"));
+    }
+
+    #[test]
+    fn checkpoint_prefix_hash_validation_accepts_matching_or_absent_request() {
+        let stored = SequenceStatePrefixHash {
+            algorithm: "xxh3_128".to_string(),
+            value: "abc".to_string(),
+            prefix_len: 12,
+        };
+        let requested = stored.clone();
+        validate_checkpoint_prefix_hash("checkpoint-a", Some(&stored), None).unwrap();
+        validate_checkpoint_prefix_hash("checkpoint-a", Some(&stored), Some(&requested)).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_prefix_hash_validation_reports_missing_stored_hash() {
+        let requested = SequenceStatePrefixHash {
+            algorithm: "xxh3_128".to_string(),
+            value: "abc".to_string(),
+            prefix_len: 12,
+        };
+        let err =
+            validate_checkpoint_prefix_hash("checkpoint-a", None, Some(&requested)).unwrap_err();
+        assert_eq!(
+            err,
+            "qwen35 checkpoint source session checkpoint-a has no prefix hash"
+        );
+    }
+
+    #[test]
+    fn checkpoint_prefix_hash_validation_reports_mismatch() {
+        let stored = SequenceStatePrefixHash {
+            algorithm: "xxh3_128".to_string(),
+            value: "stored".to_string(),
+            prefix_len: 10,
+        };
+        let requested = SequenceStatePrefixHash {
+            algorithm: "xxh3_128".to_string(),
+            value: "requested".to_string(),
+            prefix_len: 12,
+        };
+        let err = validate_checkpoint_prefix_hash("checkpoint-a", Some(&stored), Some(&requested))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "prefix hash mismatch for checkpoint checkpoint-a: request=requested len=12 stored=stored len=10"
+        );
+    }
+
+    #[test]
+    fn checkpoint_logical_position_validation_accepts_match() {
+        validate_checkpoint_logical_position("checkpoint-a", 16, 16).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_logical_position_validation_reports_mismatch() {
+        let err = validate_checkpoint_logical_position("checkpoint-a", 16, 12).unwrap_err();
+        assert_eq!(
+            err,
+            "qwen35 checkpoint source session checkpoint-a logical_position mismatch: expected=16 resident=12"
+        );
+    }
+
+    #[test]
+    fn checkpoint_source_resident_validation_accepts_resident_source() {
+        validate_checkpoint_source_resident("checkpoint-a", true).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_source_resident_validation_reports_missing_source() {
+        let err = validate_checkpoint_source_resident("checkpoint-a", false).unwrap_err();
+        assert_eq!(
+            err,
+            "qwen35 checkpoint source session checkpoint-a is not resident"
+        );
+    }
+
+    #[test]
+    fn sequence_state_fork_request_preserves_attach_contract() {
+        let hash = SequenceStatePrefixHash {
+            algorithm: "xxh3_128".to_string(),
+            value: "abc".to_string(),
+            prefix_len: 12,
+        };
+        let request = SequenceStateForkRequest {
+            source_session_id: "checkpoint-a",
+            dest_session_id: "session-b",
+            requested_prefix_hash: Some(&hash),
+        };
+        assert_eq!(request.source_session_id, "checkpoint-a");
+        assert_eq!(request.dest_session_id, "session-b");
+        assert_eq!(request.requested_prefix_hash.unwrap().prefix_len, 12);
     }
 }

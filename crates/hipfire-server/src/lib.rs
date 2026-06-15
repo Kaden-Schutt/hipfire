@@ -1,10 +1,10 @@
 pub mod config;
-pub mod daemon;
 pub mod model;
 pub mod routes;
 pub mod state;
 
-pub use config::{load_config, HipfireConfig};
+pub use config::{config_path, hipfire_dir, load_config, models_dir};
+pub use hipfire_config::HipfireConfig;
 pub use state::{AppState, SharedState};
 
 use axum::{

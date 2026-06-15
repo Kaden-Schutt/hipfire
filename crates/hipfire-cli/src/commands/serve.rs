@@ -1,5 +1,5 @@
 use clap::Args;
-use hipfire_server::HipfireConfig;
+use hipfire_config::HipfireConfig;
 
 #[derive(Debug, Args)]
 pub struct ServeArgs {

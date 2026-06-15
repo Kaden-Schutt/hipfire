@@ -43,22 +43,24 @@ use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_generate::validate_qwen35_fused_dense_prefill_batch_preflight;
 use hipfire_generate::{
     build_qwen35_fused_dense_prefill_batch_contract, compute_qwen35_prefix_hash,
-    generate_prefix_hash_json, plan_generate_batch_prefill_qwen35,
+    plan_generate_batch_prefill_qwen35, prefix_hash_preflight_done_json,
     qwen35_decode_batch_requested_auto, qwen35_decode_batch_scheduler_metadata,
-    qwen35_fused_prefill_boundary_cuts, qwen35_grouped_moe_decode_auto_latency_gate_passed,
-    qwen35_prefill_checkpoint_boundary_kind, qwen35_prefill_checkpoint_session_id,
-    qwen35_prefill_scratch_target_batch, select_qwen35_decode_batch_backend,
-    select_qwen35_prefill_batch_backend, validate_generate_batch_decode,
-    validate_generate_batch_prefill, validate_prefix_hash_preflight,
-    validate_qwen35_fused_grouped_moe_prefill_batch_preflight, GenerateBatchDecodeEnvelope,
-    GenerateBatchDecodeSession, GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan,
-    GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession, GenerateVLParams, ImageSource,
-    PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope, Qwen35DecodeBatchBackend,
-    Qwen35DecodeBatchStepResult, Qwen35DecodeTokenOutcome, Qwen35FusedDensePrefillInputKind,
-    Qwen35PrefillBatchBackend, Qwen35PrefillBatchResult, Qwen35PrefillCheckpointHook,
-    Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult, Qwen35PreparedPrefillSession,
-    Qwen35SemanticBoundaryCheckpoint,
+    qwen35_fused_prefill_boundary_cuts, qwen35_generate_batch_decode_step_done_json,
+    qwen35_generate_batch_prefill_done_json, qwen35_generate_batch_prefill_session_done_json,
+    qwen35_grouped_moe_decode_auto_latency_gate_passed, qwen35_prefill_checkpoint_boundary_kind,
+    qwen35_prefill_checkpoint_session_id, qwen35_prefill_scratch_target_batch,
+    select_qwen35_decode_batch_backend, select_qwen35_prefill_batch_backend,
+    validate_generate_batch_decode, validate_generate_batch_prefill,
+    validate_prefix_hash_preflight, validate_qwen35_fused_grouped_moe_prefill_batch_preflight,
+    GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession, GenerateBatchPrefillEnvelope,
+    GenerateBatchPrefillPlan, GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession,
+    GenerateVLParams, ImageSource, PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope,
+    Qwen35DecodeBatchBackend, Qwen35DecodeBatchStepResult, Qwen35DecodeTokenOutcome,
+    Qwen35FusedDensePrefillInputKind, Qwen35PrefillBatchBackend, Qwen35PrefillBatchResult,
+    Qwen35PrefillCheckpointHook, Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult,
+    Qwen35PreparedPrefillSession, Qwen35SemanticBoundaryCheckpoint,
 };
+use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
@@ -69,19 +71,24 @@ use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
-    model_worker_runtime_view_json, parse_reserve_session_state_kinds, parse_sequence_state_handle,
-    parse_sequence_state_handle_list, parsed_handle_may_target_generic,
-    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle, release_state_done_json,
-    sequence_state_page_descriptor_json, session_state_reservation_describe_json,
-    DescribedSequenceState, GenericSequenceStateArena, ModelArtifactMemory, ModelWorkerId,
-    ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
-    ReleaseStateResponseKind, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
-    SequenceStatePageDescriptor, SequenceStatePageKind,
+    model_worker_runtime_view_json, parse_describe_sequence_state_request, parse_model_worker_id,
+    parse_release_sequence_state_request, parse_release_sessions_request,
+    parse_reserve_session_state_request, parse_unload_worker_request,
+    parsed_handle_may_target_generic, parsed_handle_may_target_loaded_state,
+    qwen35_sequence_state_handle, release_sessions_done_json, release_state_done_json,
+    reserve_session_state_done_json, reserve_session_state_rejected_json,
+    session_state_reservation_describe_json, unload_worker_done_json,
+    validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
+    validate_checkpoint_source_resident, DescribedSequenceState, GenericSequenceStateArena,
+    ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
+    ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
+    SequenceStateForkRequest, SequenceStatePageDescriptor, SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
-    generic_state_reservation_descriptors, sequence_state_handle_id, sequence_state_handle_parts,
-    SequenceStateHandle,
+    generic_state_reservation_descriptors, parse_reserve_session_state_kinds,
+    parse_sequence_state_handle, sequence_state_handle_id, sequence_state_handle_parts,
+    sequence_state_page_descriptor_json, SequenceStateHandle,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
@@ -224,110 +231,6 @@ fn block_attractor_unclosed_cpu(
 // Off by default — env var read once on first call. The probe binary
 // (`examples/coherence_probe.rs`) sets the env on the daemon child it
 // spawns. Existing JSONL clients see no change.
-/// Stable fingerprint over an assistant turn — pair of (text content,
-/// tool_calls canonical JSON). Output is identical for two messages
-/// that have the same content+tool_calls regardless of how the
-/// surrounding bytes (e.g. whitespace inside JSON args) were rendered
-/// upstream. Used by the V4F prefix-cache to identify "this is the
-/// same assistant turn the model previously emitted, so reuse the
-/// emitted token IDs verbatim instead of re-encoding via the DSML
-/// renderer + BPE (which is not bijective)."
-fn asst_turn_fingerprint(
-    content: &str,
-    tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
-) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    "assistant".hash(&mut h);
-    if tool_calls.is_empty() {
-        // Pure-text turn — content IS the message. Trim whitespace
-        // to absorb minor formatting drift between store (model's
-        // verbatim emission) and lookup (whatever the client preserved).
-        content.trim().hash(&mut h);
-    } else {
-        // Mixed turn (text + tool_calls) or pure tool_call. Hash ONLY
-        // the tool_calls — pi-coding-agent (and most OpenAI-compat
-        // clients) sends `content: null` on assistant messages that
-        // carry tool_calls, even when the model originally emitted
-        // prose ahead of the tool block (e.g. "Let me check the
-        // structure first.<｜DSML｜tool_calls>…"). The store-side
-        // sees the prose in `emit_text_buf`; the lookup-side sees
-        // content=`""`. Excluding content from the fingerprint when
-        // tool_calls is non-empty matches the client's effective
-        // identity for tool-call turns and lets the cache hit.
-        //
-        // Collision risk: two distinct turns with identical
-        // tool_calls hash to the same key; the later store wins,
-        // and a replay of the earlier turn replays the later turn's
-        // tokens. In practice this only matters when the model emits
-        // the SAME tool_call twice with different surrounding prose
-        // in the same conversation — uncommon for agent flows, and
-        // the worst-case effect is the model seeing slightly altered
-        // prose in its own history.
-    }
-    for tc in tool_calls {
-        tc.name.hash(&mut h);
-        // Serialize args in a CANONICAL form: walk the Value tree and
-        // emit objects with keys sorted lexically (recursively). The
-        // upstream `serde_json::Map` uses insertion order — fine for
-        // round-tripping a single payload, but two clients (or two
-        // parser passes on the same payload) can yield different
-        // insertion orders for the same logical args. Without
-        // canonicalization those two turns hash to DIFFERENT keys,
-        // dropping cache hit rate on otherwise-identical tool calls.
-        let args = canonical_json(&tc.arguments);
-        args.hash(&mut h);
-    }
-    h.finish()
-}
-
-/// Walk a [`serde_json::Value`] and produce a canonical-key
-/// representation: objects emit keys in lexical order (recursively),
-/// arrays preserve order. Used by [`asst_turn_fingerprint`] so two
-/// messages with the same logical tool args hash identically
-/// regardless of source-side insertion order.
-fn canonical_json(v: &serde_json::Value) -> String {
-    let mut out = String::new();
-    write_canonical_json(v, &mut out);
-    out
-}
-
-fn write_canonical_json(v: &serde_json::Value, out: &mut String) {
-    match v {
-        serde_json::Value::Null => out.push_str("null"),
-        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
-        serde_json::Value::String(s) => {
-            out.push_str(&serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()))
-        }
-        serde_json::Value::Array(arr) => {
-            out.push('[');
-            for (i, item) in arr.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                write_canonical_json(item, out);
-            }
-            out.push(']');
-        }
-        serde_json::Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push('{');
-            for (i, k) in keys.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push_str(&serde_json::to_string(*k).unwrap_or_else(|_| "\"\"".to_string()));
-                out.push(':');
-                write_canonical_json(&map[*k], out);
-            }
-            out.push('}');
-        }
-    }
-}
-
 /// Safely emit a `{"type":"error", …}` JSONL line. Builds the envelope
 /// through `serde_json::json!` so embedded `"` / `\` / control chars in
 /// the message or `id` can't corrupt the line and trigger a client-side
@@ -983,16 +886,6 @@ fn validate_qwen35_fused_dense_decode_resident_sessions(
         .map_err(|e| format!("qwen35 fused dense decode unsupported resident state: {e}"))
 }
 
-fn parse_assistant_prefix_label(
-    label: Option<&str>,
-) -> hipfire_runtime::prompt_frame::AssistantPrefix {
-    match label.unwrap_or("plain") {
-        "open_think" => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
-        "closed_think" => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
-        _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-    }
-}
-
 fn emit_generate_batch_prefill_ready(
     stdout: &mut std::io::Stdout,
     envelope: &GenerateBatchPrefillEnvelope,
@@ -1580,6 +1473,13 @@ mod generate_batch_prefill_tests {
         let json = model_worker_runtime_view_json(&worker);
         assert_eq!(json["state_arena_backend"], "qwen35_wrapped");
         assert_eq!(json["state_arena_owns_pages"], true);
+        assert_eq!(json["state_allocator"]["page_ownership"], "backend_wrapped");
+        assert_eq!(
+            json["state_allocator"]["eviction_policy"],
+            "manual_release_only"
+        );
+        assert_eq!(json["state_allocator"]["spill_target"], "disabled");
+        assert_eq!(json["state_allocator"]["copy_on_write_attach"], false);
         assert_eq!(
             json["state_arena_operations"],
             serde_json::json!([
@@ -3848,12 +3748,7 @@ fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
 }
 
 fn message_worker_id(msg: &serde_json::Value) -> String {
-    msg.get("worker_id")
-        .or_else(|| msg.get("worker_key_id"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_MODEL_WORKER_ID)
-        .to_string()
+    parse_model_worker_id(msg, DEFAULT_MODEL_WORKER_ID).value
 }
 
 fn park_active_model(
@@ -4322,29 +4217,35 @@ fn qwen35_activate_session(
 fn qwen35_fork_session_state(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    source_session_id: &str,
-    dest_session_id: &str,
-    requested_prefix_hash: Option<&GenerateBatchPrefillPrefixHash>,
+    request: SequenceStateForkRequest<'_>,
 ) -> Result<(), String> {
-    if source_session_id == dest_session_id {
+    if request.source_session_id == request.dest_session_id {
         return Ok(());
     }
-    let source_is_active = m.q35_active_session_id.as_deref() == Some(source_session_id);
+    let source_is_active = m.q35_active_session_id.as_deref() == Some(request.source_session_id);
     if !source_is_active {
-        qwen35_validate_prefix_hash(m, source_session_id, requested_prefix_hash)?;
+        qwen35_validate_prefix_hash(m, request.source_session_id, request.requested_prefix_hash)?;
     }
     qwen35_save_active_session(m, gpu)?;
     if source_is_active {
-        if let Err(err) = qwen35_validate_prefix_hash(m, source_session_id, requested_prefix_hash) {
-            let _ = qwen35_activate_session(m, gpu, source_session_id);
+        if let Err(err) =
+            qwen35_validate_prefix_hash(m, request.source_session_id, request.requested_prefix_hash)
+        {
+            let _ = qwen35_activate_session(m, gpu, request.source_session_id);
             return Err(err);
         }
     }
-    let source = m.q35_sessions.get(source_session_id).ok_or_else(|| {
-        format!("qwen35 checkpoint source session {source_session_id} is not resident")
-    })?;
+    validate_checkpoint_source_resident(
+        request.source_session_id,
+        m.q35_sessions.contains_key(request.source_session_id),
+    )?;
+    let source = m
+        .q35_sessions
+        .get(request.source_session_id)
+        .expect("source residency was validated");
     let forked = Qwen35RequestSessionState::fork_from(gpu, source)?;
-    m.q35_sessions.insert(dest_session_id.to_string(), forked);
+    m.q35_sessions
+        .insert(request.dest_session_id.to_string(), forked);
     Ok(())
 }
 
@@ -4358,22 +4259,20 @@ fn qwen35_checkpoint_session_state(
     }
     qwen35_save_active_session(m, gpu)?;
     {
+        validate_checkpoint_source_resident(
+            request.source_session_id,
+            m.q35_sessions.contains_key(request.source_session_id),
+        )?;
         let source = m
             .q35_sessions
             .get(request.source_session_id)
-            .ok_or_else(|| {
-                format!(
-                    "qwen35 checkpoint source session {} is not resident",
-                    request.source_session_id
-                )
-            })?;
+            .expect("source residency was validated");
         let logical_position = source.seq_pos + source.kv_cache.compact_offset;
-        if logical_position != request.expected_logical_position {
-            return Err(format!(
-                "qwen35 checkpoint source session {} logical_position mismatch: expected={} resident={}",
-                request.source_session_id, request.expected_logical_position, logical_position
-            ));
-        }
+        validate_checkpoint_logical_position(
+            request.source_session_id,
+            request.expected_logical_position,
+            logical_position,
+        )?;
     }
     if let Some(prefix_hash) = request.checkpoint_prefix_hash {
         if let Some(source) = m.q35_sessions.get_mut(request.source_session_id) {
@@ -4383,9 +4282,11 @@ fn qwen35_checkpoint_session_state(
     qwen35_fork_session_state(
         m,
         gpu,
-        request.source_session_id,
-        request.dest_session_id,
-        request.requested_prefix_hash,
+        SequenceStateForkRequest {
+            source_session_id: request.source_session_id,
+            dest_session_id: request.dest_session_id,
+            requested_prefix_hash: request.requested_prefix_hash,
+        },
     )
 }
 
@@ -4394,25 +4295,15 @@ fn qwen35_validate_prefix_hash(
     source_session_id: &str,
     requested: Option<&GenerateBatchPrefillPrefixHash>,
 ) -> Result<(), String> {
-    let Some(requested) = requested else {
-        return Ok(());
-    };
-    let source = m.q35_sessions.get(source_session_id).ok_or_else(|| {
-        format!("qwen35 checkpoint source session {source_session_id} is not resident")
-    })?;
-    let stored = source.prefix_hash.as_ref().ok_or_else(|| {
-        format!("qwen35 checkpoint source session {source_session_id} has no prefix hash")
-    })?;
-    if stored != requested {
-        return Err(format!(
-            "prefix hash mismatch for checkpoint {source_session_id}: request={} len={} stored={} len={}",
-            requested.value,
-            requested.prefix_len,
-            stored.value,
-            stored.prefix_len
-        ));
-    }
-    Ok(())
+    validate_checkpoint_source_resident(
+        source_session_id,
+        m.q35_sessions.contains_key(source_session_id),
+    )?;
+    let source = m
+        .q35_sessions
+        .get(source_session_id)
+        .expect("source residency was validated");
+    validate_checkpoint_prefix_hash(source_session_id, source.prefix_hash.as_ref(), requested)
 }
 
 fn qwen35_reset_active_session(
@@ -4518,19 +4409,11 @@ fn sequence_state_arena_fork_session_state(
     arena_backend: SequenceStateArenaBackend,
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    source_session_id: &str,
-    dest_session_id: &str,
-    requested_prefix_hash: Option<&GenerateBatchPrefillPrefixHash>,
+    request: SequenceStateForkRequest<'_>,
 ) -> Result<(), String> {
     ensure_sequence_state_arena_backend_supported(arena_backend, m, "fork_session_state")?;
     match arena_backend {
-        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_fork_session_state(
-            m,
-            gpu,
-            source_session_id,
-            dest_session_id,
-            requested_prefix_hash,
-        ),
+        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_fork_session_state(m, gpu, request),
         SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
 }
@@ -4706,7 +4589,8 @@ fn qwen35_materialize_batch_prefill_prompt(
     } else {
         m.seq_pos
     };
-    let assistant_prefix = parse_assistant_prefix_label(Some(&session.assistant_prefix));
+    let assistant_prefix =
+        prompt_frame::AssistantPrefix::from_label(Some(&session.assistant_prefix));
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
     let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
     let system_prompt = session.system_prompt.as_deref();
@@ -4715,7 +4599,7 @@ fn qwen35_materialize_batch_prefill_prompt(
 
     if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+        let frame = prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
             system: system_prompt,
@@ -4724,21 +4608,21 @@ fn qwen35_materialize_batch_prefill_prompt(
             bos_token: None,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+            let synthesized: Vec<prompt_frame::Message>;
+            let messages_slice: &[prompt_frame::Message] = match messages_history {
                 Some(m) => m,
                 None => {
                     let mut v = Vec::new();
                     if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::System,
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                         });
                     }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
+                    v.push(prompt_frame::Message {
+                        role: prompt_frame::Role::User,
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
@@ -4757,7 +4641,7 @@ fn qwen35_materialize_batch_prefill_prompt(
                 eprintln!(
                     "[daemon] batch-prefill jinja render failed ({e}) -- falling back to Plain"
                 );
-                Ok(hipfire_runtime::prompt_frame::ChatFrame {
+                Ok(prompt_frame::ChatFrame {
                     tokenizer,
                     system: system_prompt,
                     user: "",
@@ -4768,7 +4652,7 @@ fn qwen35_materialize_batch_prefill_prompt(
             }
         }
     } else {
-        Ok(hipfire_runtime::prompt_frame::ChatFrame {
+        Ok(prompt_frame::ChatFrame {
             tokenizer,
             system: if seq_pos_for_prompt == 0 {
                 system_prompt
@@ -4964,33 +4848,8 @@ fn run_prefix_hash_preflight_qwen35(
         );
     }
     let candidates = qwen35_prefix_hash_candidates(m, &envelope.session)?;
-    let full = candidates
-        .last()
-        .ok_or_else(|| "prefix_hash_preflight produced no candidates".to_string())?;
-    let prefixes: Vec<serde_json::Value> = candidates
-        .iter()
-        .map(|candidate| {
-            serde_json::json!({
-                "algorithm": candidate.hash.algorithm,
-                "value": candidate.hash.value,
-                "prefix_len": candidate.hash.prefix_len,
-                "boundary": candidate.boundary,
-                "boundary_index": candidate.boundary_index,
-            })
-        })
-        .collect();
-    let line = serde_json::json!({
-        "type": "prefix_hash_preflight_done",
-        "id": envelope.id,
-        "algorithm": "xxh128",
-        "boundary_policy": envelope.boundary_policy,
-        "prefixes": prefixes,
-        "full": {
-            "algorithm": full.hash.algorithm,
-            "value": full.hash.value,
-            "prefix_len": full.hash.prefix_len,
-        },
-    });
+    let line =
+        prefix_hash_preflight_done_json(&envelope.id, &envelope.boundary_policy, &candidates)?;
     let _ = writeln!(stdout, "{line}");
     let _ = stdout.flush();
     Ok(())
@@ -6206,9 +6065,11 @@ fn run_generate_batch_prefill_serial_qwen35(
                 arena_backend,
                 m,
                 gpu,
-                runtime_state_handle,
-                &session.id,
-                session.state_handle.prefix_hash.as_ref(),
+                SequenceStateForkRequest {
+                    source_session_id: runtime_state_handle,
+                    dest_session_id: &session.id,
+                    requested_prefix_hash: session.state_handle.prefix_hash.as_ref(),
+                },
             )
             .map_err(|e| {
                 format!(
@@ -6312,72 +6173,25 @@ fn run_generate_batch_prefill_serial_qwen35(
                     session.id, checkpoint_id_for_error, e
                 )
             })?;
-        let mut line = serde_json::json!({
-            "type": "generate_batch_prefill_session_done",
-            "id": envelope.id,
-            "batch_id": envelope.batch_id,
-            "session_id": session.id,
-            "prefill_tokens": session.prefill_tokens,
-            "logical_position": session.logical_position,
-            "cached_prefix_tokens": session.cached_prefix_tokens,
-            "state_handle": {
-                "kind": "qwen35_session",
-                "runtime_state": "resident",
-                "session_id": session.id,
-                "checkpoint_id": checkpoint_id,
-                "checkpoint_runtime_state": "attachable",
-                "logical_position": session.logical_position,
-                "cached_prefix_tokens": session.cached_prefix_tokens,
-                "prefix_hash": generate_prefix_hash_json(&session.prefix_hash),
-                "prefix_len": session.prefix_hash.prefix_len,
-            },
-            "mode": result.mode,
-            "plan": result.plan.as_str(),
-            "backend": result.backend.as_str(),
-        });
-        let prefix_checkpoints: Vec<serde_json::Value> = session
-            .boundary_checkpoints
-            .iter()
-            .filter_map(|checkpoint| {
-                checkpoint.checkpoint_id.as_ref().map(|checkpoint_id| {
-                    serde_json::json!({
-                        "checkpoint_id": checkpoint_id,
-                        "checkpoint_runtime_state": "attachable",
-                        "logical_position": checkpoint.prefix_len,
-                        "cached_prefix_tokens": checkpoint.prefix_len,
-                        "prefix_hash": generate_prefix_hash_json(&checkpoint.hash),
-                        "prefix_len": checkpoint.hash.prefix_len,
-                        "boundary": checkpoint.boundary,
-                        "boundary_index": checkpoint.boundary_index,
-                    })
-                })
-            })
-            .collect();
-        if !prefix_checkpoints.is_empty() {
-            line["state_handle"]["prefix_checkpoints"] = serde_json::json!(prefix_checkpoints);
-        }
-        if let Some(debug_sample_token) = session.debug_sample_token {
-            line["debug_sample_token"] = serde_json::json!(debug_sample_token);
-        }
+        let line = qwen35_generate_batch_prefill_session_done_json(
+            envelope,
+            session,
+            &checkpoint_id,
+            &result,
+        );
         let _ = writeln!(stdout, "{line}");
         let _ = stdout.flush();
     }
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let worker = loaded_model_worker_runtime_view(m);
-    let done = serde_json::json!({
-        "type": "generate_batch_prefill_done",
-        "id": envelope.id,
-        "batch_id": envelope.batch_id,
-        "sessions": envelope.session_count,
-        "prefill_tokens": result.total_prefill_tokens,
-        "elapsed_ms": elapsed_ms,
-        "mode": result.mode,
-        "plan": result.plan.as_str(),
-        "backend": result.backend.as_str(),
-        "resident_sessions": sequence_state_arena_resident_session_count(arena_backend, m),
-        "model_worker": model_worker_runtime_view_json(&worker),
-    });
+    let done = qwen35_generate_batch_prefill_done_json(
+        envelope,
+        &result,
+        elapsed_ms,
+        sequence_state_arena_resident_session_count(arena_backend, m),
+        model_worker_runtime_view_json(&worker),
+    );
     let _ = writeln!(stdout, "{done}");
     let _ = stdout.flush();
     Ok(())
@@ -6482,7 +6296,7 @@ fn run_generate_batch_decode_step_qwen35(
             )?
         }
     };
-    for line in step_result.session_lines {
+    for line in &step_result.session_lines {
         let _ = writeln!(stdout, "{line}");
     }
     let worker = loaded_model_worker_runtime_view(m);
@@ -6493,26 +6307,15 @@ fn run_generate_batch_decode_step_qwen35(
         envelope.session_count,
         envelope.cached_prefix_tokens,
     );
-    let done = serde_json::json!({
-        "type": "generate_batch_decode_step_done",
-        "id": envelope.id,
-        "batch_id": envelope.batch_id,
-        "sessions": envelope.session_count,
-        "backend": backend.as_str(),
-        "selected_backend": scheduler_metadata.selected_backend,
-        "batch_size": scheduler_metadata.batch_size,
-        "compatible_state_kinds": scheduler_metadata.compatible_state_kinds,
-        "cached_prefix_tokens": scheduler_metadata.cached_prefix_tokens,
-        "fallback_reason": scheduler_metadata.fallback_reason,
-        "chunk_count": step_result.chunk_count,
-        "chunk_size": step_result.chunk_size,
-        "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0,
-        "resident_sessions": sequence_state_arena_resident_session_count(
-            loaded_model_state_arena_backend(m),
-            m
-        ),
-        "model_worker": model_worker_runtime_view_json(&worker),
-    });
+    let done = qwen35_generate_batch_decode_step_done_json(
+        envelope,
+        &step_result,
+        backend,
+        &scheduler_metadata,
+        t0.elapsed().as_secs_f64() * 1000.0,
+        sequence_state_arena_resident_session_count(loaded_model_state_arena_backend(m), m),
+        model_worker_runtime_view_json(&worker),
+    );
     let _ = writeln!(stdout, "{done}");
     let _ = stdout.flush();
     Ok(())
@@ -8296,18 +8099,16 @@ fn main() {
                         None => None,
                     }
                 };
-                let messages_history: Option<Vec<hipfire_runtime::prompt_frame::Message>> =
-                    if let Some(messages) = protocol_generate
+                let messages_history: Option<Vec<prompt_frame::Message>> = if let Some(messages) =
+                    protocol_generate
                         .as_ref()
                         .and_then(|req| req.messages.clone())
-                    {
-                        Some(messages)
-                    } else {
-                        match msg.get("messages") {
-                            Some(v) => match serde_json::from_value::<
-                                Vec<hipfire_runtime::prompt_frame::Message>,
-                            >(v.clone())
-                            {
+                {
+                    Some(messages)
+                } else {
+                    match msg.get("messages") {
+                        Some(v) => {
+                            match serde_json::from_value::<Vec<prompt_frame::Message>>(v.clone()) {
                                 Ok(m) => Some(m),
                                 Err(e) => {
                                     let _ = writeln!(
@@ -8319,10 +8120,11 @@ fn main() {
                                     let _ = stdout.flush();
                                     continue;
                                 }
-                            },
-                            None => None,
+                            }
                         }
-                    };
+                        None => None,
+                    }
+                };
                 // Sampling defaults differ by arch: qwen35 family was tuned
                 // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
                 // DeepSeek V4 Flash's HF card recommends `temp=1.0, top_p=1.0`
@@ -8466,15 +8268,9 @@ fn main() {
                 // Controls the ChatML framing after the assistant role header.
                 // Consumed by the text path; VL path does not yet propagate
                 // it (tracked as a follow-up to the post-#169 rebase).
-                let assistant_prefix = match msg
-                    .get("assistant_prefix")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("plain")
-                {
-                    "open_think" => hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink,
-                    "closed_think" => hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink,
-                    _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                };
+                let assistant_prefix = prompt_frame::AssistantPrefix::from_label(
+                    msg.get("assistant_prefix").and_then(|v| v.as_str()),
+                );
 
                 let has_image = image_base64.is_some() || image.is_some();
                 let is_dots_ocr = m.arch_id == 8;
@@ -8869,29 +8665,22 @@ fn main() {
                         }
                     }
                 }
-                let sessions: Vec<String> = match msg.get("sessions").and_then(|v| v.as_array()) {
-                    Some(values) => values
-                        .iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect(),
-                    None => {
-                        emit_error_with_id(
-                            &mut stdout,
-                            id,
-                            "release_sessions.sessions must be an array of session ids",
-                        );
+                let request = match parse_release_sessions_request(&msg, &target_worker_id) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, id, e);
                         continue;
                     }
                 };
                 if let Some(dummy) = dummy_model.as_mut() {
-                    let released = dummy.release_sessions(&sessions);
-                    let done = serde_json::json!({
-                        "type": "release_sessions_done",
-                        "id": id,
-                        "requested": sessions.len(),
-                        "released": released,
-                        "resident_sessions": dummy.session_count(),
-                    });
+                    let released = dummy.release_sessions(&request.sessions);
+                    let done = release_sessions_done_json(
+                        id,
+                        request.sessions.len(),
+                        released,
+                        dummy.session_count(),
+                        None,
+                    );
                     let _ = writeln!(stdout, "{done}");
                     let _ = stdout.flush();
                     continue;
@@ -8904,20 +8693,21 @@ fn main() {
                     }
                 };
                 let arena_backend = loaded_model_state_arena_backend(m);
-                match sequence_state_arena_release_sessions(arena_backend, m, &mut gpu, &sessions) {
+                match sequence_state_arena_release_sessions(
+                    arena_backend,
+                    m,
+                    &mut gpu,
+                    &request.sessions,
+                ) {
                     Ok(released) => {
                         let worker = loaded_model_worker_runtime_view(m);
-                        let done = serde_json::json!({
-                            "type": "release_sessions_done",
-                            "id": id,
-                            "requested": sessions.len(),
-                            "released": released,
-                            "resident_sessions": sequence_state_arena_resident_session_count(
-                                arena_backend,
-                                m
-                            ),
-                            "model_worker": model_worker_runtime_view_json(&worker),
-                        });
+                        let done = release_sessions_done_json(
+                            id,
+                            request.sessions.len(),
+                            released,
+                            sequence_state_arena_resident_session_count(arena_backend, m),
+                            Some(&worker),
+                        );
                         let _ = writeln!(stdout, "{done}");
                         let _ = stdout.flush();
                     }
@@ -8956,60 +8746,37 @@ fn main() {
                         }
                     }
                 }
-                let physical_cap = msg
-                    .get("physical_cap")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .unwrap_or(0);
-                if physical_cap == 0 {
-                    emit_error_with_id(
-                        &mut stdout,
-                        id,
-                        "reserve_session_state.physical_cap must be > 0",
-                    );
-                    continue;
-                }
-                let state_kinds = match parse_reserve_session_state_kinds(&msg) {
-                    Ok(kinds) => kinds,
+                let request = match parse_reserve_session_state_request(&msg, &target_worker_id) {
+                    Ok(request) => request,
                     Err(e) => {
                         emit_error_with_id(&mut stdout, id, e);
                         continue;
                     }
                 };
-                let ttl_ms = msg.get("ttl_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
-                let reservation_id = msg
-                    .get("reservation_id")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| {
-                        format!(
-                            "reserve:{}:{}",
-                            target_worker_id,
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_nanos())
-                                .unwrap_or(0)
-                        )
-                    });
+                let reservation_id = request.reservation_id.clone().unwrap_or_else(|| {
+                    format!(
+                        "reserve:{}:{}",
+                        request.worker_id,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0)
+                    )
+                });
                 let (reserved_bytes, current_session_bytes, outstanding_bytes, budget_bytes) =
                     if let Some(m) = model.as_ref() {
-                        let budget = msg
-                            .get("budget_bytes")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as usize)
+                        let budget = request
+                            .budget_bytes
                             .unwrap_or_else(resident_state_reservation_budget_bytes);
                         (
-                            estimate_session_state_reservation_bytes(m, physical_cap),
+                            estimate_session_state_reservation_bytes(m, request.physical_cap),
                             current_worker_session_state_bytes(m),
-                            generic_state_arena.outstanding_bytes_for_worker(&target_worker_id),
+                            generic_state_arena.outstanding_bytes_for_worker(&request.worker_id),
                             budget,
                         )
                     } else if dummy_model.is_some() {
-                        let budget = msg
-                            .get("budget_bytes")
-                            .and_then(|v| v.as_u64())
-                            .map(|v| v as usize)
+                        let budget = request
+                            .budget_bytes
                             .unwrap_or_else(resident_state_reservation_budget_bytes);
                         (1024usize, 0usize, 0usize, budget)
                     } else {
@@ -9020,53 +8787,35 @@ fn main() {
                     .saturating_add(outstanding_bytes)
                     .saturating_add(reserved_bytes);
                 if budget_bytes > 0 && projected > budget_bytes {
-                    let rejected = serde_json::json!({
-                        "type": "reserve_session_state_rejected",
-                        "id": id,
-                        "worker_key_id": target_worker_id,
-                        "reason": "memory_pressure",
-                        "reserved_bytes": reserved_bytes,
-                        "current_session_bytes": current_session_bytes,
-                        "outstanding_reserved_bytes": outstanding_bytes,
-                        "projected_reserved_bytes": projected,
-                        "budget_bytes": budget_bytes,
-                    });
+                    let rejected = reserve_session_state_rejected_json(
+                        id,
+                        &request.worker_id,
+                        reserved_bytes,
+                        current_session_bytes,
+                        outstanding_bytes,
+                        projected,
+                        budget_bytes,
+                    );
                     let _ = writeln!(stdout, "{rejected}");
                     let _ = stdout.flush();
                     continue;
                 }
                 let reservation = generic_state_arena.reserve(
-                    &target_worker_id,
+                    &request.worker_id,
                     reservation_id.clone(),
-                    &state_kinds,
-                    physical_cap,
+                    &request.state_kinds,
+                    request.physical_cap,
                     reserved_bytes,
-                    ttl_ms,
+                    request.ttl_ms,
                 );
-                let state_page_descriptor_values: Vec<serde_json::Value> = reservation
-                    .state_page_descriptors
-                    .iter()
-                    .map(sequence_state_page_descriptor_json)
-                    .collect();
-                let done = serde_json::json!({
-                    "type": "reserve_session_state_done",
-                    "id": id,
-                    "worker_key_id": target_worker_id,
-                    "reservation_id": reservation_id,
-                    "runtime_state_handle": &reservation.handle.id,
-                    "handle": {
-                        "id": &reservation.handle.id,
-                        "kind": &reservation.handle.kind,
-                        "generation": reservation.handle.generation,
-                    },
-                    "state_arena_owns_pages": true,
-                    "state_page_descriptors": state_page_descriptor_values,
-                    "reserved_bytes": reserved_bytes,
-                    "current_session_bytes": current_session_bytes,
-                    "outstanding_reserved_bytes": outstanding_bytes,
-                    "projected_reserved_bytes": projected,
-                    "budget_bytes": budget_bytes,
-                });
+                let done = reserve_session_state_done_json(
+                    id,
+                    &reservation,
+                    current_session_bytes,
+                    outstanding_bytes,
+                    projected,
+                    budget_bytes,
+                );
                 let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
             }
@@ -9077,21 +8826,16 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .unwrap_or("describe-state");
                 generic_state_arena.purge_expired();
-                let handle_value = msg
-                    .get("runtime_state_handle")
-                    .or_else(|| msg.get("reservation_id"))
-                    .or_else(|| msg.get("handle"));
-                let Some(handle) = handle_value.and_then(parse_sequence_state_handle) else {
-                    emit_error_with_id(
-                        &mut stdout,
-                        id,
-                        "describe_state requires runtime_state_handle",
-                    );
-                    continue;
+                let request = match parse_describe_sequence_state_request(&msg) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        emit_error_with_id(&mut stdout, id, e);
+                        continue;
+                    }
                 };
-                if parsed_handle_may_target_generic(&handle) {
+                if parsed_handle_may_target_generic(&request.handle) {
                     if let Some(reservation) =
-                        generic_state_arena.describe(&handle.id, handle.generation)
+                        generic_state_arena.describe(&request.handle.id, request.handle.generation)
                     {
                         let done = session_state_reservation_describe_json(id, reservation);
                         let _ = writeln!(stdout, "{done}");
@@ -9103,12 +8847,15 @@ fn main() {
                     &active_worker_id,
                     model.as_ref(),
                     &resident_models,
-                    &handle,
+                    &request.handle,
                 ) else {
                     emit_error_with_id(
                         &mut stdout,
                         id,
-                        format!("describe_state unknown runtime_state_handle {}", handle.id),
+                        format!(
+                            "describe_state unknown runtime_state_handle {}",
+                            request.handle.id
+                        ),
                     );
                     continue;
                 };
@@ -9122,10 +8869,9 @@ fn main() {
                     .get("id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("release-reservation");
-                let is_release_state =
-                    msg.get("type").and_then(|v| v.as_str()) == Some("release_state");
-                let handles = parse_sequence_state_handle_list(&msg);
-                let generic_handles = handles
+                let request = parse_release_sequence_state_request(&msg);
+                let generic_handles = request
+                    .handles
                     .iter()
                     .filter(|handle| parsed_handle_may_target_generic(handle))
                     .map(|handle| (handle.id.clone(), handle.generation))
@@ -9137,7 +8883,7 @@ fn main() {
                         &mut model,
                         &mut resident_models,
                         &mut gpu,
-                        &handles,
+                        &request.handles,
                     ) {
                         Ok(released) => released,
                         Err(e) => {
@@ -9145,13 +8891,8 @@ fn main() {
                             continue;
                         }
                     };
-                let kind = if is_release_state {
-                    ReleaseStateResponseKind::ReleaseState
-                } else {
-                    ReleaseStateResponseKind::ReleaseSessionStateReservation
-                };
                 let done = release_state_done_json(
-                    kind,
+                    request.response_kind,
                     id,
                     generic_released,
                     generic_released_bytes,
@@ -9362,7 +9103,8 @@ fn main() {
                     .get("id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unload_worker");
-                let worker_id = message_worker_id(&msg);
+                let request = parse_unload_worker_request(&msg, DEFAULT_MODEL_WORKER_ID);
+                let worker_id = request.worker_id;
                 let mut unloaded = false;
                 generic_state_arena.release_worker(&worker_id);
                 if worker_id == active_worker_id {
@@ -9384,13 +9126,12 @@ fn main() {
                     unload_model(m, &mut gpu);
                     unloaded = true;
                 }
-                let done = serde_json::json!({
-                    "type": "unload_worker_done",
-                    "id": id,
-                    "worker_key_id": worker_id,
-                    "unloaded": unloaded,
-                    "resident_workers": resident_models.len() + usize::from(model.is_some()),
-                });
+                let done = unload_worker_done_json(
+                    id,
+                    &worker_id,
+                    unloaded,
+                    resident_models.len() + usize::from(model.is_some()),
+                );
                 let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
             }
@@ -12005,11 +11746,11 @@ fn generate_dflash(
     system_prompt: Option<&str>,
     max_tokens: usize,
     max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    assistant_prefix: prompt_frame::AssistantPrefix,
     pflash_bypass_reason: Option<&str>,
     pflash_alpha: Option<f32>,
     tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    messages_history: Option<&[prompt_frame::Message]>,
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
@@ -12031,7 +11772,7 @@ fn generate_dflash(
     let try_jinja = jinja_enabled && m.chat_template.is_some();
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+        let frame = prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
             system: system_prompt,
@@ -12040,21 +11781,21 @@ fn generate_dflash(
             bos_token: None,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+            let synthesized: Vec<prompt_frame::Message>;
+            let messages_slice: &[prompt_frame::Message] = match messages_history {
                 Some(m) => m,
                 None => {
                     let mut v = Vec::new();
                     if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::System,
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                         });
                     }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
+                    v.push(prompt_frame::Message {
+                        role: prompt_frame::Role::User,
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
@@ -12073,7 +11814,7 @@ fn generate_dflash(
                 eprintln!(
                     "[daemon] jinja render failed in dflash path ({e}) — falling back to Plain"
                 );
-                hipfire_runtime::prompt_frame::ChatFrame {
+                prompt_frame::ChatFrame {
                     tokenizer,
                     system: system_prompt,
                     user: prompt,
@@ -12084,7 +11825,7 @@ fn generate_dflash(
             }
         }
     } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
+        prompt_frame::ChatFrame {
             tokenizer,
             system: system_prompt,
             user: prompt,
@@ -12701,9 +12442,9 @@ fn generate_multi(
     budget_alert_at_tok: usize,
     budget_alert_text: &str,
     max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    assistant_prefix: prompt_frame::AssistantPrefix,
     tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    messages_history: Option<&[prompt_frame::Message]>,
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
@@ -12837,7 +12578,7 @@ fn generate_multi(
     let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+        let frame = prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
             system: system_prompt,
@@ -12846,21 +12587,21 @@ fn generate_multi(
             bos_token: None,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+            let synthesized: Vec<prompt_frame::Message>;
+            let messages_slice: &[prompt_frame::Message] = match messages_history {
                 Some(m) => m,
                 None => {
                     let mut v = Vec::new();
                     if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::System,
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                         });
                     }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
+                    v.push(prompt_frame::Message {
+                        role: prompt_frame::Role::User,
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
@@ -12877,7 +12618,7 @@ fn generate_multi(
             Ok(rendered) => tokenizer.encode(&rendered),
             Err(e) => {
                 eprintln!("[daemon] jinja render failed in pp path ({e}) — falling back to Plain");
-                hipfire_runtime::prompt_frame::ChatFrame {
+                prompt_frame::ChatFrame {
                     tokenizer,
                     system: if m.seq_pos == 0 { system_prompt } else { None },
                     user: "",
@@ -12888,7 +12629,7 @@ fn generate_multi(
             }
         }
     } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
+        prompt_frame::ChatFrame {
             tokenizer,
             system: if m.seq_pos == 0 { system_prompt } else { None },
             user: "",
@@ -13390,11 +13131,11 @@ fn generate(
     budget_alert_at_tok: usize,
     budget_alert_text: &str,
     max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    assistant_prefix: prompt_frame::AssistantPrefix,
     pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
     pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
     tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    messages_history: Option<&[prompt_frame::Message]>,
     think_mode: ThinkMode,
     prefill_already_done: bool,
     prefilled_prompt_tokens: Option<usize>,
@@ -13582,10 +13323,7 @@ fn generate(
     // splices </think> through KV and continues generation, so route budgeted
     // thinking requests there until DFlash continuation is implemented.
     let budgeted_thinking_needs_ar = max_think_tokens > 0
-        && !matches!(
-            assistant_prefix,
-            hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
-        );
+        && !matches!(assistant_prefix, prompt_frame::AssistantPrefix::ClosedThink);
     if prefill_already_done && m.dflash.is_some() {
         write_error(
             stdout,
@@ -13703,7 +13441,7 @@ fn generate(
 
     // `nl` is needed for the trailer write after natural <|im_end|>
     // termination; `im_end` derives the EOS-check token id. Other
-    // ChatML scaffolding tokens are now built inside hipfire_runtime::prompt_frame.
+    // ChatML scaffolding tokens are now built inside hipfire-prompt.
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
     let raw_q_tokens = tokenizer.encode(prompt);
@@ -13925,7 +13663,7 @@ fn generate(
     let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+        let frame = prompt_frame::JinjaChatFrame {
             tokenizer,
             template,
             system: system_prompt,
@@ -13944,21 +13682,21 @@ fn generate(
             // Synthesize [system?, user] when no explicit history was
             // provided. Tools-with-legacy-prompt is the natural OpenAI
             // function-calling shape (one turn + tool definitions).
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+            let synthesized: Vec<prompt_frame::Message>;
+            let messages_slice: &[prompt_frame::Message] = match messages_history {
                 Some(m) => m,
                 None => {
                     let mut v = Vec::new();
                     if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::System,
                             content: sys.to_string(),
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                         });
                     }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
+                    v.push(prompt_frame::Message {
+                        role: prompt_frame::Role::User,
                         content: prompt.to_string(),
                         tool_calls: Vec::new(),
                         tool_call_id: None,
@@ -13975,7 +13713,7 @@ fn generate(
             Ok(rendered) => tokenizer.encode(&rendered),
             Err(e) => {
                 eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
-                hipfire_runtime::prompt_frame::ChatFrame {
+                prompt_frame::ChatFrame {
                     tokenizer,
                     system: system_prompt,
                     user: "",
@@ -13986,7 +13724,7 @@ fn generate(
             }
         }
     } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
+        prompt_frame::ChatFrame {
             tokenizer,
             system: if seq_pos_for_prompt == 0 {
                 system_prompt
@@ -14989,7 +14727,7 @@ fn generate_deepseek4(
     max_tokens: usize,
     think_mode: ThinkMode,
     tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    messages_history: Option<&[prompt_frame::Message]>,
 ) {
     let tokenizer = match m.tokenizer.as_ref() {
         Some(t) => t,
@@ -15105,7 +14843,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // Skip the trailing user prompt — we add it explicitly after.
         // Heuristic: if last message is role=user, treat its content as
         // the live prompt and drop it here.
-        use hipfire_runtime::prompt_frame::Role;
+        use prompt_frame::Role;
         let trim_end = if matches!(history.last().map(|m| m.role), Some(Role::User)) {
             1
         } else {
@@ -15180,7 +14918,8 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     // `tokenizer.encode(render(...))` as a longer
                     // sequence with different boundaries, capping the
                     // LCP at the assistant-turn boundary).
-                    let fp = asst_turn_fingerprint(&msg.content, &msg.tool_calls);
+                    let fp =
+                        prompt_frame::assistant_turn_fingerprint(&msg.content, &msg.tool_calls);
                     if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                         .ok()
                         .as_deref()
@@ -15563,12 +15302,12 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             .map(|v| v.as_slice())
             .unwrap_or(&empty_vocab);
         let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
-        let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+        let mut emit_tool_calls_buf: Vec<prompt_frame::ToolCall> = Vec::new();
         use hipfire_arch_deepseek4::dsml::StreamEvent;
         let mut absorb_event = |ev: &StreamEvent| {
             if let StreamEvent::ToolCalls(calls) = ev {
                 for c in calls {
-                    emit_tool_calls_buf.push(hipfire_runtime::prompt_frame::ToolCall {
+                    emit_tool_calls_buf.push(prompt_frame::ToolCall {
                         name: c.name.clone(),
                         arguments: c.arguments.clone(),
                     });
@@ -15803,7 +15542,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // second tokenizer pass.
         let decode_start_tokens_idx = m.conversation_tokens.len();
         let mut emit_text_buf = String::new();
-        let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+        let mut emit_tool_calls_buf: Vec<prompt_frame::ToolCall> = Vec::new();
         use hipfire_arch_deepseek4::dsml::StreamEvent;
         let mut absorb_event = |ev: &StreamEvent| {
             match ev {
@@ -15823,7 +15562,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 StreamEvent::Reasoning(_) => {}
                 StreamEvent::ToolCalls(calls) => {
                     for c in calls {
-                        emit_tool_calls_buf.push(hipfire_runtime::prompt_frame::ToolCall {
+                        emit_tool_calls_buf.push(prompt_frame::ToolCall {
                             name: c.name.clone(),
                             arguments: c.arguments.clone(),
                         });
@@ -15910,7 +15649,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             && m.conversation_tokens.len() > decode_start_tokens_idx
         {
             let cached_seq: Vec<u32> = m.conversation_tokens[decode_start_tokens_idx..].to_vec();
-            let fp = asst_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
+            let fp = prompt_frame::assistant_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
             if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                 .ok()
                 .as_deref()
@@ -16218,7 +15957,7 @@ fn generate_minimax(
     max_tokens: usize,
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    messages_history: Option<&[prompt_frame::Message]>,
 ) {
     if m.tokenizer.is_none() {
         let _ = writeln!(
@@ -16251,7 +15990,7 @@ fn generate_minimax(
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            let frame = prompt_frame::JinjaChatFrame {
                 tokenizer,
                 template,
                 system: system_prompt,
@@ -16260,30 +15999,29 @@ fn generate_minimax(
                 bos_token: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                    match messages_history {
-                        Some(h) => h,
-                        None => {
-                            let mut v = Vec::new();
-                            if let Some(sys) = system_prompt {
-                                v.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: sys.to_string(),
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                });
-                            }
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
+                let synthesized: Vec<prompt_frame::Message>;
+                let messages_slice: &[prompt_frame::Message] = match messages_history {
+                    Some(h) => h,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(prompt_frame::Message {
+                                role: prompt_frame::Role::System,
+                                content: sys.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                             });
-                            synthesized = v;
-                            &synthesized
                         }
-                    };
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
                 frame.render_messages(messages_slice, tools, None)
             } else {
                 frame.render()
@@ -16295,22 +16033,22 @@ fn generate_minimax(
                 }
                 Err(e) => {
                     eprintln!("[daemon] jinja render failed in minimax path ({e}) — falling back to Plain");
-                    hipfire_runtime::prompt_frame::ChatFrame {
+                    prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
                         user: prompt,
-                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                         raw: false,
                     }
                     .build()
                 }
             }
         } else {
-            hipfire_runtime::prompt_frame::ChatFrame {
+            prompt_frame::ChatFrame {
                 tokenizer,
                 system: system_prompt,
                 user: prompt,
-                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                 raw: false,
             }
             .build()
@@ -16488,7 +16226,7 @@ fn generate_lfm2moe(
     max_tokens: usize,
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    messages_history: Option<&[prompt_frame::Message]>,
 ) {
     if m.tokenizer.is_none() {
         let _ = writeln!(
@@ -16516,7 +16254,7 @@ fn generate_lfm2moe(
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            let frame = prompt_frame::JinjaChatFrame {
                 tokenizer,
                 template,
                 system: system_prompt,
@@ -16525,30 +16263,29 @@ fn generate_lfm2moe(
                 bos_token: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                    match messages_history {
-                        Some(h) => h,
-                        None => {
-                            let mut v = Vec::new();
-                            if let Some(sys) = system_prompt {
-                                v.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: sys.to_string(),
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                });
-                            }
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
+                let synthesized: Vec<prompt_frame::Message>;
+                let messages_slice: &[prompt_frame::Message] = match messages_history {
+                    Some(h) => h,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(prompt_frame::Message {
+                                role: prompt_frame::Role::System,
+                                content: sys.to_string(),
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                             });
-                            synthesized = v;
-                            &synthesized
                         }
-                    };
+                        v.push(prompt_frame::Message {
+                            role: prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
                 frame.render_messages(messages_slice, tools, None)
             } else {
                 frame.render()
@@ -16557,22 +16294,22 @@ fn generate_lfm2moe(
                 Ok(rendered) => tokenizer.encode(&rendered),
                 Err(e) => {
                     eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
-                    hipfire_runtime::prompt_frame::ChatFrame {
+                    prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
                         user: prompt,
-                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                         raw: false,
                     }
                     .build()
                 }
             }
         } else {
-            hipfire_runtime::prompt_frame::ChatFrame {
+            prompt_frame::ChatFrame {
                 tokenizer,
                 system: system_prompt,
                 user: prompt,
-                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                 raw: false,
             }
             .build()
@@ -16880,11 +16617,11 @@ fn generate_vl(
     user_body.extend_from_slice(&nl);
     user_body.extend_from_slice(&q_tokens);
 
-    let prompt_tokens = hipfire_runtime::prompt_frame::ChatFrame {
+    let prompt_tokens = prompt_frame::ChatFrame {
         tokenizer,
         system: if m.seq_pos == 0 { system_prompt } else { None },
         user: "", // unused: we pass tokens directly via build_with_user_tokens
-        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain, // VL always uses Plain
+        assistant_prefix: prompt_frame::AssistantPrefix::Plain, // VL always uses Plain
         raw: false,
     }
     .build_with_user_tokens(&user_body);

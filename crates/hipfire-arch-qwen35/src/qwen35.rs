@@ -1863,7 +1863,8 @@ fn weight_gemv_swiglu_residual_xdna1(
     invocation: &ffn_bf16::DenseFfnModuleInvocation,
 ) -> HipResult<()> {
     let cfg = ffn_bf16::config();
-    let (xclbin, instr) = match (cfg.xdna1_xclbin.as_deref(), cfg.xdna1_instr.as_deref()) {
+    let artifacts = &cfg.xdna1_artifacts;
+    let (xclbin, instr) = match (artifacts.xclbin.as_deref(), artifacts.instr.as_deref()) {
         (Some(xc), Some(ins)) => (xc, ins),
         _ => {
             if cfg.trace {

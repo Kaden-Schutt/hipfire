@@ -723,6 +723,33 @@ pub struct ModelLoadParams {
     pub cask_sidecar: Option<String>,
 }
 
+impl ModelLoadParams {
+    pub fn from_common_config_values(
+        max_seq: u32,
+        kv_cache: &str,
+        flash_mode: &str,
+        dflash_mode: &str,
+        cask_sidecar: Option<&str>,
+    ) -> Self {
+        Self {
+            max_seq,
+            kv_cache: non_auto_value(kv_cache),
+            flash_mode: non_auto_value(flash_mode),
+            dflash_mode: non_auto_value(dflash_mode),
+            cask_sidecar: cask_sidecar.and_then(non_empty_value),
+            ..Default::default()
+        }
+    }
+}
+
+fn non_auto_value(value: &str) -> Option<String> {
+    (value != "auto").then(|| value.to_string())
+}
+
+fn non_empty_value(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 /// Shared typed contract for the daemon's `loaded` response payload.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ModelLoadedResponse {
@@ -985,6 +1012,38 @@ mod tests {
         assert_eq!(value["params"]["cask_sidecar"], "model.triattn.hfq");
         assert!(value["params"].get("flash_mode").is_none());
         assert_eq!(value["request_id"], "load-1");
+    }
+
+    #[test]
+    fn model_load_params_from_common_config_preserves_explicit_dflash_off() {
+        let params = ModelLoadParams::from_common_config_values(
+            8192,
+            "auto",
+            "auto",
+            "off",
+            Some("/models/qwen3.5-27b.triattn.hfq"),
+        );
+
+        assert_eq!(params.max_seq, 8192);
+        assert_eq!(params.kv_cache, None);
+        assert_eq!(params.flash_mode, None);
+        assert_eq!(params.dflash_mode.as_deref(), Some("off"));
+        assert_eq!(
+            params.cask_sidecar.as_deref(),
+            Some("/models/qwen3.5-27b.triattn.hfq")
+        );
+    }
+
+    #[test]
+    fn model_load_params_from_common_config_omits_auto_and_empty_sidecar() {
+        let params =
+            ModelLoadParams::from_common_config_values(4096, "asym3", "auto", "auto", Some(""));
+
+        assert_eq!(params.max_seq, 4096);
+        assert_eq!(params.kv_cache.as_deref(), Some("asym3"));
+        assert_eq!(params.flash_mode, None);
+        assert_eq!(params.dflash_mode, None);
+        assert_eq!(params.cask_sidecar, None);
     }
 
     #[test]

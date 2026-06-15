@@ -7,19 +7,16 @@ use axum::{
         IntoResponse, Json, Response,
     },
 };
-use hipfire_prompt::{
-    openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message as DaemonMessage,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::config::HipfireConfig;
-use crate::daemon::engine::{find_daemon_bin, DaemonEngine};
-use crate::daemon::protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
 use crate::model::discovery::find_model;
 use crate::state::SharedState;
+use hipfire_config::HipfireConfig;
+use hipfire_daemon_adapter::{find_daemon_bin, DaemonEngine};
+use hipfire_daemon_protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -51,34 +48,35 @@ pub async fn post_chat_completions(
     }
 }
 
-fn messages_to_daemon(messages: &[ChatMessage]) -> Vec<DaemonMessage> {
-    openai_chat_messages_to_prompt_messages(
-        messages
-            .iter()
-            .map(|m| (m.role.as_str(), m.content.as_ref())),
-    )
-}
-
-fn last_user_prompt(messages: &[ChatMessage]) -> String {
-    openai_chat_last_user_prompt(
-        messages
-            .iter()
-            .map(|m| (m.role.as_str(), m.content.as_ref())),
-    )
-}
-
 fn load_params_from_config(cfg: &HipfireConfig) -> LoadParams {
-    LoadParams {
-        max_seq: cfg.max_seq,
-        kv_cache: Some(cfg.kv_cache.clone()).filter(|s| s != "auto"),
-        flash_mode: Some(cfg.flash_mode.clone()).filter(|s| s != "auto"),
-        dflash_mode: Some(cfg.dflash_mode.clone()).filter(|s| s != "auto"),
-        cask_sidecar: cfg
-            .cask_sidecar
-            .clone()
-            .filter(|sidecar| !sidecar.is_empty()),
-        ..Default::default()
-    }
+    LoadParams::from_common_config_values(
+        cfg.max_seq,
+        &cfg.kv_cache,
+        &cfg.flash_mode,
+        &cfg.dflash_mode,
+        cfg.cask_sidecar.as_deref(),
+    )
+}
+
+fn generate_request_from_chat(
+    id: String,
+    messages: &[ChatMessage],
+    sampling: GenerationSamplingPolicy,
+    worker_key_id: Option<String>,
+    tools: Option<Value>,
+    system: Option<String>,
+) -> GenerateRequest {
+    let mut req = GenerateRequest::from_openai_chat_messages(
+        id,
+        messages
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_ref())),
+        sampling,
+    );
+    req.worker_key_id = worker_key_id;
+    req.tools = tools;
+    req.system = system;
+    req
 }
 
 async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(), String> {
@@ -146,23 +144,19 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
             .await
             .as_ref()
             .and_then(|e| e.worker_key_id.clone());
-        GenerateRequest {
-            id: req_id.clone(),
-            prompt: last_user_prompt(&body.messages),
-            messages: Some(messages_to_daemon(&body.messages)),
-            sampling: GenerationSamplingPolicy {
+        generate_request_from_chat(
+            req_id.clone(),
+            &body.messages,
+            GenerationSamplingPolicy {
                 temperature: body.temperature.unwrap_or(cfg.temperature),
                 max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
                 top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
                 repeat_penalty: Some(cfg.repeat_penalty),
             },
             worker_key_id,
-            tools: body.tools,
-            system: body.system,
-            thinking: None,
-            max_think_tokens: None,
-            request_id: None,
-        }
+            body.tools,
+            body.system,
+        )
     };
 
     let mut engine_guard = state.engine.lock().await;
@@ -238,23 +232,19 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                 .await
                 .as_ref()
                 .and_then(|e| e.worker_key_id.clone());
-            GenerateRequest {
-                id: req_id.clone(),
-                prompt: last_user_prompt(&body.messages),
-                messages: Some(messages_to_daemon(&body.messages)),
-                sampling: GenerationSamplingPolicy {
+            generate_request_from_chat(
+                req_id.clone(),
+                &body.messages,
+                GenerationSamplingPolicy {
                     temperature: body.temperature.unwrap_or(cfg.temperature),
                     max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
                     top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
                     repeat_penalty: Some(cfg.repeat_penalty),
                 },
                 worker_key_id,
-                tools: body.tools,
-                system: body.system,
-                thinking: None,
-                max_think_tokens: None,
-                request_id: None,
-            }
+                body.tools,
+                body.system,
+            )
         };
 
         let req_id_cb = req_id.clone();
@@ -339,23 +329,19 @@ mod tests {
             },
         ];
 
-        let req = GenerateRequest {
-            id: "req".to_string(),
-            prompt: last_user_prompt(&messages),
-            messages: Some(messages_to_daemon(&messages)),
-            sampling: GenerationSamplingPolicy {
+        let req = generate_request_from_chat(
+            "req".to_string(),
+            &messages,
+            GenerationSamplingPolicy {
                 temperature: 0.3,
                 max_tokens: 16,
                 top_p: Some(0.8),
                 repeat_penalty: Some(1.0),
             },
-            worker_key_id: None,
-            tools: None,
-            system: None,
-            thinking: None,
-            max_think_tokens: None,
-            request_id: None,
-        };
+            Some("worker-a".to_string()),
+            Some(json!([{"type":"function"}])),
+            Some("system override".to_string()),
+        );
         let v = serde_json::to_value(&req).expect("serialize generate request");
 
         assert_eq!(v["prompt"], "second");
@@ -364,6 +350,9 @@ mod tests {
         assert_eq!(v["messages"][0]["content"], "be brief");
         assert_eq!(v["messages"][1]["role"], "user");
         assert_eq!(v["messages"][3]["content"], "second");
+        assert_eq!(v["worker_key_id"], "worker-a");
+        assert_eq!(v["tools"][0]["type"], "function");
+        assert_eq!(v["system"], "system override");
     }
 
     #[test]
@@ -383,10 +372,19 @@ mod tests {
             },
         ];
 
+        let req = generate_request_from_chat(
+            "req".to_string(),
+            &messages,
+            GenerationSamplingPolicy::greedy(8),
+            None,
+            None,
+            None,
+        );
+
         let prompt_value: Value =
-            serde_json::from_str(&last_user_prompt(&messages)).expect("structured prompt json");
+            serde_json::from_str(&req.prompt).expect("structured prompt json");
         assert_eq!(prompt_value, json!({"type":"text","text":"second"}));
-        let daemon_messages = messages_to_daemon(&messages);
+        let daemon_messages = req.messages.unwrap();
         assert_eq!(daemon_messages.len(), 3);
         assert_eq!(daemon_messages[2].role, Role::User);
     }

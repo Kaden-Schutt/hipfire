@@ -2,7 +2,7 @@ mod commands;
 mod model;
 
 use clap::{Parser, Subcommand};
-use hipfire_server::load_config;
+use hipfire_config::load_config;
 
 #[derive(Debug, Parser)]
 #[command(name = "hipfire", version, about = "hipfire LLM inference CLI")]

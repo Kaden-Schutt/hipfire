@@ -5,6 +5,9 @@
 //! Typed generation request, event, and batch-plan contracts.
 
 use hipfire_model::{is_qwen35_dense_arch_id, is_qwen35_moe_arch_id, ARCH_ID_QWEN35_MOE};
+use hipfire_prompt::{
+    openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message,
+};
 pub use hipfire_state::SequenceStatePrefixHash as GenerateBatchPrefillPrefixHash;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -35,7 +38,7 @@ pub struct GenerateTextRequest {
     pub id: String,
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub messages: Option<Vec<hipfire_prompt::Message>>,
+    pub messages: Option<Vec<Message>>,
     #[serde(flatten)]
     pub sampling: GenerationSamplingPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,6 +53,33 @@ pub struct GenerateTextRequest {
     pub max_think_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+}
+
+impl GenerateTextRequest {
+    pub fn from_openai_chat_messages<'a, I>(
+        id: String,
+        messages: I,
+        sampling: GenerationSamplingPolicy,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, Option<&'a serde_json::Value>)>,
+    {
+        let messages = messages.into_iter().collect::<Vec<_>>();
+        Self {
+            id,
+            prompt: openai_chat_last_user_prompt(messages.iter().copied()),
+            messages: Some(openai_chat_messages_to_prompt_messages(
+                messages.iter().copied(),
+            )),
+            sampling,
+            worker_key_id: None,
+            tools: None,
+            system: None,
+            thinking: None,
+            max_think_tokens: None,
+            request_id: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -227,6 +257,33 @@ pub struct PrefixHashPreflightCandidate {
     pub boundary_index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint_id: Option<String>,
+}
+
+pub fn prefix_hash_preflight_done_json(
+    id: &str,
+    boundary_policy: &str,
+    candidates: &[PrefixHashPreflightCandidate],
+) -> Result<serde_json::Value, String> {
+    let full = candidates
+        .last()
+        .ok_or_else(|| "prefix_hash_preflight produced no candidates".to_string())?;
+    let prefixes = candidates
+        .iter()
+        .map(|candidate| {
+            let mut value = generate_prefix_hash_json(&candidate.hash);
+            value["boundary"] = serde_json::Value::String(candidate.boundary.clone());
+            value["boundary_index"] = serde_json::Value::from(candidate.boundary_index);
+            value
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "type": "prefix_hash_preflight_done",
+        "id": id,
+        "algorithm": "xxh128",
+        "boundary_policy": boundary_policy,
+        "prefixes": prefixes,
+        "full": generate_prefix_hash_json(&full.hash),
+    }))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -840,6 +897,84 @@ pub struct Qwen35PrefillBatchResult {
     pub sessions: Vec<Qwen35PrefillSessionResult>,
 }
 
+pub fn qwen35_generate_batch_prefill_session_done_json(
+    envelope: &GenerateBatchPrefillEnvelope,
+    session: &Qwen35PrefillSessionResult,
+    checkpoint_id: &str,
+    result: &Qwen35PrefillBatchResult,
+) -> serde_json::Value {
+    let mut line = serde_json::json!({
+        "type": "generate_batch_prefill_session_done",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "session_id": session.id,
+        "prefill_tokens": session.prefill_tokens,
+        "logical_position": session.logical_position,
+        "cached_prefix_tokens": session.cached_prefix_tokens,
+        "state_handle": {
+            "kind": "qwen35_session",
+            "runtime_state": "resident",
+            "session_id": session.id,
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_runtime_state": "attachable",
+            "logical_position": session.logical_position,
+            "cached_prefix_tokens": session.cached_prefix_tokens,
+            "prefix_hash": generate_prefix_hash_json(&session.prefix_hash),
+            "prefix_len": session.prefix_hash.prefix_len,
+        },
+        "mode": result.mode,
+        "plan": result.plan.as_str(),
+        "backend": result.backend.as_str(),
+    });
+    let prefix_checkpoints = session
+        .boundary_checkpoints
+        .iter()
+        .filter_map(|checkpoint| {
+            checkpoint.checkpoint_id.as_ref().map(|checkpoint_id| {
+                serde_json::json!({
+                    "checkpoint_id": checkpoint_id,
+                    "checkpoint_runtime_state": "attachable",
+                    "logical_position": checkpoint.prefix_len,
+                    "cached_prefix_tokens": checkpoint.prefix_len,
+                    "prefix_hash": generate_prefix_hash_json(&checkpoint.hash),
+                    "prefix_len": checkpoint.hash.prefix_len,
+                    "boundary": checkpoint.boundary,
+                    "boundary_index": checkpoint.boundary_index,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    if !prefix_checkpoints.is_empty() {
+        line["state_handle"]["prefix_checkpoints"] = serde_json::json!(prefix_checkpoints);
+    }
+    if let Some(debug_sample_token) = session.debug_sample_token {
+        line["debug_sample_token"] = serde_json::json!(debug_sample_token);
+    }
+    line
+}
+
+pub fn qwen35_generate_batch_prefill_done_json(
+    envelope: &GenerateBatchPrefillEnvelope,
+    result: &Qwen35PrefillBatchResult,
+    elapsed_ms: f64,
+    resident_sessions: usize,
+    model_worker: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "generate_batch_prefill_done",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "sessions": envelope.session_count,
+        "prefill_tokens": result.total_prefill_tokens,
+        "elapsed_ms": elapsed_ms,
+        "mode": result.mode,
+        "plan": result.plan.as_str(),
+        "backend": result.backend.as_str(),
+        "resident_sessions": resident_sessions,
+        "model_worker": model_worker,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Qwen35PreparedPrefillSession {
     pub id: String,
@@ -1201,6 +1336,34 @@ pub fn qwen35_decode_batch_scheduler_metadata(
     }
 }
 
+pub fn qwen35_generate_batch_decode_step_done_json(
+    envelope: &GenerateBatchDecodeEnvelope,
+    step_result: &Qwen35DecodeBatchStepResult,
+    backend: Qwen35DecodeBatchBackend,
+    scheduler_metadata: &Qwen35DecodeBatchSchedulerMetadata,
+    elapsed_ms: f64,
+    resident_sessions: usize,
+    model_worker: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "generate_batch_decode_step_done",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "sessions": envelope.session_count,
+        "backend": backend.as_str(),
+        "selected_backend": scheduler_metadata.selected_backend,
+        "batch_size": scheduler_metadata.batch_size,
+        "compatible_state_kinds": scheduler_metadata.compatible_state_kinds,
+        "cached_prefix_tokens": scheduler_metadata.cached_prefix_tokens,
+        "fallback_reason": scheduler_metadata.fallback_reason,
+        "chunk_count": step_result.chunk_count,
+        "chunk_size": step_result.chunk_size,
+        "elapsed_ms": elapsed_ms,
+        "resident_sessions": resident_sessions,
+        "model_worker": model_worker,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationTiming {
     pub prefill_tokens: Option<u32>,
@@ -1234,6 +1397,48 @@ mod tests {
                 prefix_hash: None,
             },
         }
+    }
+
+    #[test]
+    fn openai_chat_generate_request_preserves_structured_prompt_boundary() {
+        let system = serde_json::Value::String("be brief".to_string());
+        let first = serde_json::Value::String("first".to_string());
+        let answer = serde_json::Value::String("ok".to_string());
+        let second = serde_json::json!({"type": "text", "text": "second"});
+        let request = GenerateTextRequest::from_openai_chat_messages(
+            "req-1".to_string(),
+            [
+                ("system", Some(&system)),
+                ("user", Some(&first)),
+                ("assistant", Some(&answer)),
+                ("user", Some(&second)),
+            ],
+            GenerationSamplingPolicy {
+                temperature: 0.3,
+                max_tokens: 16,
+                top_p: Some(0.8),
+                repeat_penalty: Some(1.0),
+            },
+        );
+
+        assert_eq!(request.id, "req-1");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&request.prompt)
+                .expect("structured fallback prompt json"),
+            serde_json::json!({"type": "text", "text": "second"})
+        );
+        assert!(!request.prompt.contains("<|im_start|>"));
+        let messages = request.messages.as_ref().unwrap();
+        assert_eq!(messages[0].role, hipfire_prompt::Role::System);
+        assert_eq!(messages[0].content, "be brief");
+        assert_eq!(messages[1].role, hipfire_prompt::Role::User);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&messages[3].content)
+                .expect("structured message json"),
+            serde_json::json!({"type": "text", "text": "second"})
+        );
+        assert_eq!(request.sampling.max_tokens, 16);
+        assert!(request.worker_key_id.is_none());
     }
 
     #[test]
@@ -1501,6 +1706,64 @@ mod tests {
     }
 
     #[test]
+    fn prefix_hash_preflight_done_json_shape_is_stable() {
+        let candidates = vec![
+            PrefixHashPreflightCandidate {
+                hash: GenerateBatchPrefillPrefixHash {
+                    algorithm: "xxh128".to_string(),
+                    value: "11111111111111111111111111111111".to_string(),
+                    prefix_len: 3,
+                },
+                boundary: "message_end".to_string(),
+                boundary_index: 0,
+                checkpoint_id: None,
+            },
+            PrefixHashPreflightCandidate {
+                hash: GenerateBatchPrefillPrefixHash {
+                    algorithm: "xxh128".to_string(),
+                    value: "22222222222222222222222222222222".to_string(),
+                    prefix_len: 8,
+                },
+                boundary: "full".to_string(),
+                boundary_index: 1,
+                checkpoint_id: None,
+            },
+        ];
+
+        assert_eq!(
+            prefix_hash_preflight_done_json("prefix-1", "semantic_chat_template", &candidates)
+                .expect("preflight response"),
+            serde_json::json!({
+                "type": "prefix_hash_preflight_done",
+                "id": "prefix-1",
+                "algorithm": "xxh128",
+                "boundary_policy": "semantic_chat_template",
+                "prefixes": [
+                    {
+                        "algorithm": "xxh128",
+                        "value": "11111111111111111111111111111111",
+                        "prefix_len": 3,
+                        "boundary": "message_end",
+                        "boundary_index": 0
+                    },
+                    {
+                        "algorithm": "xxh128",
+                        "value": "22222222222222222222222222222222",
+                        "prefix_len": 8,
+                        "boundary": "full",
+                        "boundary_index": 1
+                    }
+                ],
+                "full": {
+                    "algorithm": "xxh128",
+                    "value": "22222222222222222222222222222222",
+                    "prefix_len": 8
+                }
+            })
+        );
+    }
+
+    #[test]
     fn semantic_boundary_checkpoint_json_shape_is_stable() {
         let checkpoint = Qwen35SemanticBoundaryCheckpoint {
             checkpoint_id: Some("qwen35-checkpoint:batch:req-1:7".to_string()),
@@ -1525,6 +1788,140 @@ mod tests {
                 },
                 "boundary": "message_end",
                 "boundary_index": 1
+            })
+        );
+    }
+
+    #[test]
+    fn qwen35_prefill_session_done_json_shape_is_stable() {
+        let envelope = GenerateBatchPrefillEnvelope {
+            id: "prefill-1".to_string(),
+            batch_id: "batch-1".to_string(),
+            session_count: 1,
+            sessions: Vec::new(),
+        };
+        let hash = GenerateBatchPrefillPrefixHash {
+            algorithm: "xxh128".to_string(),
+            value: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            prefix_len: 12,
+        };
+        let result = Qwen35PrefillBatchResult {
+            mode: "serial",
+            plan: GenerateBatchPrefillPlan::SerialExact,
+            backend: Qwen35PrefillBatchBackend::SerialReference,
+            total_prefill_tokens: 12,
+            sessions: Vec::new(),
+        };
+        let session = Qwen35PrefillSessionResult {
+            id: "req-1".to_string(),
+            prefill_tokens: 12,
+            logical_position: 12,
+            cached_prefix_tokens: 4,
+            prefix_hash: hash.clone(),
+            debug_sample_token: Some(42),
+            boundary_checkpoints: vec![Qwen35SemanticBoundaryCheckpoint {
+                checkpoint_id: Some("qwen35-checkpoint:batch-1:req-1:boundary:0:8".to_string()),
+                prefix_len: 8,
+                hash: GenerateBatchPrefillPrefixHash {
+                    algorithm: "xxh128".to_string(),
+                    value: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                    prefix_len: 8,
+                },
+                boundary: "message_end".to_string(),
+                boundary_index: 0,
+            }],
+        };
+
+        assert_eq!(
+            qwen35_generate_batch_prefill_session_done_json(
+                &envelope,
+                &session,
+                "qwen35-checkpoint:batch-1:req-1:12",
+                &result,
+            ),
+            serde_json::json!({
+                "type": "generate_batch_prefill_session_done",
+                "id": "prefill-1",
+                "batch_id": "batch-1",
+                "session_id": "req-1",
+                "prefill_tokens": 12,
+                "logical_position": 12,
+                "cached_prefix_tokens": 4,
+                "state_handle": {
+                    "kind": "qwen35_session",
+                    "runtime_state": "resident",
+                    "session_id": "req-1",
+                    "checkpoint_id": "qwen35-checkpoint:batch-1:req-1:12",
+                    "checkpoint_runtime_state": "attachable",
+                    "logical_position": 12,
+                    "cached_prefix_tokens": 4,
+                    "prefix_hash": {
+                        "algorithm": "xxh128",
+                        "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "prefix_len": 12
+                    },
+                    "prefix_len": 12,
+                    "prefix_checkpoints": [
+                        {
+                            "checkpoint_id": "qwen35-checkpoint:batch-1:req-1:boundary:0:8",
+                            "checkpoint_runtime_state": "attachable",
+                            "logical_position": 8,
+                            "cached_prefix_tokens": 8,
+                            "prefix_hash": {
+                                "algorithm": "xxh128",
+                                "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                                "prefix_len": 8
+                            },
+                            "prefix_len": 8,
+                            "boundary": "message_end",
+                            "boundary_index": 0
+                        }
+                    ]
+                },
+                "mode": "serial",
+                "plan": "serial_exact",
+                "backend": "serial_reference",
+                "debug_sample_token": 42
+            })
+        );
+    }
+
+    #[test]
+    fn qwen35_prefill_done_json_shape_is_stable() {
+        let envelope = GenerateBatchPrefillEnvelope {
+            id: "prefill-1".to_string(),
+            batch_id: "batch-1".to_string(),
+            session_count: 2,
+            sessions: Vec::new(),
+        };
+        let result = Qwen35PrefillBatchResult {
+            mode: "batched",
+            plan: GenerateBatchPrefillPlan::FusedDenseQwen35Candidate,
+            backend: Qwen35PrefillBatchBackend::FusedDense,
+            total_prefill_tokens: 24,
+            sessions: Vec::new(),
+        };
+
+        assert_eq!(
+            qwen35_generate_batch_prefill_done_json(
+                &envelope,
+                &result,
+                3.5,
+                7,
+                serde_json::json!({"id": "worker-a"}),
+            ),
+            serde_json::json!({
+                "type": "generate_batch_prefill_done",
+                "id": "prefill-1",
+                "batch_id": "batch-1",
+                "sessions": 2,
+                "prefill_tokens": 24,
+                "elapsed_ms": 3.5,
+                "mode": "batched",
+                "plan": "fused_dense_qwen35_candidate",
+                "backend": "fused_dense",
+                "resident_sessions": 7,
+                "model_worker": {"id": "worker-a"}
             })
         );
     }
@@ -1675,5 +2072,57 @@ mod tests {
             8,
         );
         assert_eq!(requested.fallback_reason, "requested_serial_reference");
+    }
+
+    #[test]
+    fn qwen35_decode_step_done_json_shape_is_stable() {
+        let envelope = GenerateBatchDecodeEnvelope {
+            id: "decode-1".to_string(),
+            batch_id: "batch-1".to_string(),
+            session_count: 2,
+            cached_prefix_tokens: 16,
+            sessions: Vec::new(),
+        };
+        let step_result = Qwen35DecodeBatchStepResult {
+            session_lines: Vec::new(),
+            chunk_count: 2,
+            chunk_size: 1,
+        };
+        let metadata = qwen35_decode_batch_scheduler_metadata(
+            "auto",
+            ARCH_ID_QWEN35_DENSE,
+            Qwen35DecodeBatchBackend::FusedDenseLayerChunked,
+            2,
+            16,
+        );
+
+        assert_eq!(
+            qwen35_generate_batch_decode_step_done_json(
+                &envelope,
+                &step_result,
+                Qwen35DecodeBatchBackend::FusedDenseLayerChunked,
+                &metadata,
+                4.25,
+                3,
+                serde_json::json!({"id": "worker-a"}),
+            ),
+            serde_json::json!({
+                "type": "generate_batch_decode_step_done",
+                "id": "decode-1",
+                "batch_id": "batch-1",
+                "sessions": 2,
+                "backend": "fused_dense_layer_chunked",
+                "selected_backend": "fused_dense_layer_chunked",
+                "batch_size": 2,
+                "compatible_state_kinds": ["attention_kv", "deltanet_recurrent"],
+                "cached_prefix_tokens": 16,
+                "fallback_reason": "none",
+                "chunk_count": 2,
+                "chunk_size": 1,
+                "elapsed_ms": 4.25,
+                "resident_sessions": 3,
+                "model_worker": {"id": "worker-a"}
+            })
+        );
     }
 }

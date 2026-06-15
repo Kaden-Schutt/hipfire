@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::config::HipfireConfig;
-use crate::daemon::engine::DaemonEngine;
+use hipfire_config::HipfireConfig;
+use hipfire_daemon_adapter::DaemonEngine;
 
 pub struct AppState {
     /// Serializes all daemon I/O. Phase A: one request at a time.

@@ -1,0 +1,10 @@
+[package]
+name = "hipfire-npu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NPU module opt-in contracts and artifact admission policy for hipfire"
+
+[dependencies]
+hipfire-cpu = { path = "../hipfire-cpu" }
+serde_json = "1"

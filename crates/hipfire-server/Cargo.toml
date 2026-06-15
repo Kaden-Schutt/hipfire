@@ -19,7 +19,7 @@ reqwest = { version = "0.12", features = ["stream", "json"] }
 futures = "0.3"
 async-stream = "0.3"
 anyhow = "1"
-dirs = "5"
+hipfire-config = { path = "../hipfire-config" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-model = { path = "../hipfire-model" }

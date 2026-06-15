@@ -921,6 +921,88 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_policy_matches_realtime_and_interactive_bun_parity() {
+        let realtime = scheduler_policy_for_priority(0, &SchedulerPolicyEnv::empty());
+        let interactive = scheduler_policy_for_priority(64, &SchedulerPolicyEnv::empty());
+        assert_eq!(realtime.priority_class, SchedulerPriorityClass::Realtime);
+        assert_eq!(realtime.coalesce_wait_ms, 0);
+        assert_eq!(realtime.max_batch_size, 1);
+        assert_eq!(realtime.resident_state_max, 1);
+        assert_eq!(realtime.spillable_batch_max, 1);
+        assert!(realtime.max_processing_ms < interactive.max_processing_ms);
+
+        let configured = scheduler_policy_for_priority(
+            64,
+            &env(&[
+                ("HIPFIRE_SCHED_PREFILL_BATCH_MAX", "16"),
+                ("HIPFIRE_SCHED_PREFILL_WAIT_MS_INTERACTIVE", "7"),
+            ]),
+        );
+        assert_eq!(
+            configured.priority_class,
+            SchedulerPriorityClass::Interactive
+        );
+        assert_eq!(configured.coalesce_wait_ms, 7);
+        assert_eq!(configured.max_batch_size, 16);
+        assert_eq!(configured.target_pair_tokens, 64);
+    }
+
+    #[test]
+    fn scheduler_policy_matches_legacy_wait_and_opportunistic_bun_parity() {
+        let legacy = env(&[("HIPFIRE_SERVER_PREFILL_BATCH_WAIT_MS", "9")]);
+        let interactive = scheduler_policy_for_priority(64, &legacy);
+        let background = scheduler_policy_for_priority(128, &legacy);
+        assert_eq!(interactive.coalesce_wait_ms, 9);
+        assert_eq!(background.coalesce_wait_ms, 18);
+
+        let opportunistic = scheduler_policy_for_priority(
+            255,
+            &env(&[
+                ("HIPFIRE_SCHED_PREFILL_WAIT_MS_BACKGROUND", "20"),
+                ("HIPFIRE_SCHED_OPPORTUNISTIC_MIN_PAIR_TOKENS", "512"),
+            ]),
+        );
+        let default_background = scheduler_policy_for_priority(128, &SchedulerPolicyEnv::empty());
+        assert_eq!(
+            opportunistic.priority_class,
+            SchedulerPriorityClass::Opportunistic
+        );
+        assert_eq!(opportunistic.coalesce_wait_ms, 80);
+        assert_eq!(opportunistic.target_pair_tokens, 512);
+        assert!(opportunistic.max_processing_ms > default_background.max_processing_ms);
+    }
+
+    #[test]
+    fn scheduler_policy_matches_state_residency_and_spill_bun_parity() {
+        let batch_env = env(&[("HIPFIRE_SCHED_PREFILL_BATCH_MAX", "16")]);
+        let realtime = scheduler_policy_for_priority(0, &batch_env);
+        let high = scheduler_policy_for_priority(1, &batch_env);
+        assert_eq!(realtime.max_batch_size, 1);
+        assert_eq!(realtime.resident_state_max, 1);
+        assert_eq!(realtime.spillable_batch_max, 1);
+        assert_eq!(high.max_batch_size, 4);
+        assert_eq!(high.resident_state_max, 4);
+        assert_eq!(high.spillable_batch_max, 4);
+
+        let disk_spill = env(&[("HIPFIRE_SCHED_STATE_CACHE_DISK", "1")]);
+        assert!(!scheduler_policy_for_priority(64, &disk_spill).disk_spill_allowed);
+        assert!(scheduler_policy_for_priority(128, &disk_spill).disk_spill_allowed);
+
+        let legacy_disk_spill = env(&[("HIPFIRE_SERVER_PREFILL_BATCH_STATE_CACHE_DISK", "true")]);
+        assert!(scheduler_policy_for_priority(255, &legacy_disk_spill).disk_spill_allowed);
+
+        let clamped = scheduler_policy_for_priority(
+            64,
+            &env(&[
+                ("HIPFIRE_SCHED_RESIDENT_STATE_MAX", "80"),
+                ("HIPFIRE_SCHED_SPILLABLE_BATCH_MAX", "2"),
+            ]),
+        );
+        assert_eq!(clamped.resident_state_max, 64);
+        assert_eq!(clamped.spillable_batch_max, 64);
+    }
+
+    #[test]
     fn opportunistic_dispatch_waits_for_pairing_unless_clear() {
         assert!(!should_dispatch_opportunistic(OpportunisticDispatchInput {
             compatible_queued_tokens: 255,

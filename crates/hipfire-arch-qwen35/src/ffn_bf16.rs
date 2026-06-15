@@ -20,6 +20,7 @@ pub use hipfire_cpu::{
     ProjectionModuleInvocation, ProjectionModuleOutput, ProjectionStateContract,
     ProjectionTensorContract,
 };
+pub use hipfire_npu::Xdna1ModuleArtifacts;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfnBf16Mode {
@@ -40,6 +41,7 @@ pub struct FfnBf16Config {
     /// Path to the NPU instruction binary for the SwiGLU operation.
     /// Set via `HIPFIRE_QWEN35_XDNA1_INSTR`. Required when mode=xdna1.
     pub xdna1_instr: Option<String>,
+    pub xdna1_artifacts: Xdna1ModuleArtifacts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +88,7 @@ pub fn config() -> &'static FfnBf16Config {
             mode,
             layer,
             trace,
+            xdna1_artifacts: Xdna1ModuleArtifacts::new(xdna1_xclbin.clone(), xdna1_instr.clone()),
             xdna1_xclbin,
             xdna1_instr,
         }

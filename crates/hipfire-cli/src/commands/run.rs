@@ -1,13 +1,10 @@
 use std::io::Write;
 
 use clap::Args;
-use hipfire_server::{
-    daemon::{
-        engine::{find_daemon_bin, DaemonEngine},
-        protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams},
-    },
-    HipfireConfig,
-};
+use hipfire_config::HipfireConfig;
+use hipfire_daemon_adapter::{find_daemon_bin, DaemonEngine};
+use hipfire_daemon_protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::model::find_model;
@@ -26,6 +23,32 @@ pub struct RunArgs {
     pub temperature: Option<f64>,
 }
 
+fn load_params_from_config(config: &HipfireConfig) -> LoadParams {
+    LoadParams::from_common_config_values(
+        config.max_seq,
+        &config.kv_cache,
+        &config.flash_mode,
+        &config.dflash_mode,
+        config.cask_sidecar.as_deref(),
+    )
+}
+
+fn generate_request_from_prompt(
+    id: String,
+    prompt: &str,
+    sampling: GenerationSamplingPolicy,
+    worker_key_id: Option<String>,
+) -> GenerateRequest {
+    let prompt = Value::String(prompt.to_string());
+    let mut request = GenerateRequest::from_openai_chat_messages(
+        id,
+        std::iter::once(("user", Some(&prompt))),
+        sampling,
+    );
+    request.worker_key_id = worker_key_id;
+    request
+}
+
 pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
     let model_path = find_model(&args.model)
         .ok_or_else(|| anyhow::anyhow!("model not found: {}", args.model))?;
@@ -39,34 +62,24 @@ pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
     eprintln!("Loading {}…", model_path.display());
     let mut engine = DaemonEngine::spawn(&bin).await?;
 
-    let params = LoadParams {
-        max_seq: config.max_seq,
-        ..Default::default()
-    };
-    engine.load(&model_path.to_string_lossy(), params).await?;
+    engine
+        .load(
+            &model_path.to_string_lossy(),
+            load_params_from_config(&config),
+        )
+        .await?;
 
-    let prompt = format!(
-        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-        args.prompt
-    );
-
-    let gen_req = GenerateRequest {
-        id: Uuid::new_v4().to_string(),
-        prompt,
-        messages: None,
-        sampling: GenerationSamplingPolicy {
+    let gen_req = generate_request_from_prompt(
+        Uuid::new_v4().to_string(),
+        &args.prompt,
+        GenerationSamplingPolicy {
             temperature: args.temperature.unwrap_or(config.temperature),
             max_tokens: args.max_tokens.unwrap_or(config.max_tokens),
             top_p: Some(config.top_p),
             repeat_penalty: Some(config.repeat_penalty),
         },
-        worker_key_id: engine.worker_key_id.clone(),
-        tools: None,
-        system: None,
-        thinking: None,
-        max_think_tokens: None,
-        request_id: None,
-    };
+        engine.worker_key_id.clone(),
+    );
 
     let done = engine
         .generate_streaming(gen_req, |token| {
@@ -82,4 +95,70 @@ pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
         done.decode_tok_s.unwrap_or(0.0)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_params_from_config_preserves_cli_load_policy() {
+        let config = HipfireConfig {
+            max_seq: 8192,
+            kv_cache: "asym3".to_string(),
+            flash_mode: "auto".to_string(),
+            dflash_mode: "off".to_string(),
+            cask_sidecar: Some("/models/qwen3.5-27b.triattn.hfq".to_string()),
+            ..Default::default()
+        };
+
+        let params = load_params_from_config(&config);
+
+        assert_eq!(params.max_seq, 8192);
+        assert_eq!(params.kv_cache.as_deref(), Some("asym3"));
+        assert_eq!(params.flash_mode, None);
+        assert_eq!(params.dflash_mode.as_deref(), Some("off"));
+        assert_eq!(
+            params.cask_sidecar.as_deref(),
+            Some("/models/qwen3.5-27b.triattn.hfq")
+        );
+    }
+
+    #[test]
+    fn load_params_from_config_omits_auto_and_empty_sidecar() {
+        let config = HipfireConfig {
+            max_seq: 4096,
+            kv_cache: "auto".to_string(),
+            flash_mode: "auto".to_string(),
+            dflash_mode: "auto".to_string(),
+            cask_sidecar: Some(String::new()),
+            ..Default::default()
+        };
+
+        let params = load_params_from_config(&config);
+
+        assert_eq!(params.max_seq, 4096);
+        assert_eq!(params.kv_cache, None);
+        assert_eq!(params.flash_mode, None);
+        assert_eq!(params.dflash_mode, None);
+        assert_eq!(params.cask_sidecar, None);
+    }
+
+    #[test]
+    fn generate_request_from_prompt_preserves_structured_boundary() {
+        let req = generate_request_from_prompt(
+            "req-1".to_string(),
+            "hello",
+            GenerationSamplingPolicy::greedy(8),
+            Some("worker-a".to_string()),
+        );
+
+        assert_eq!(req.prompt, "hello");
+        assert!(!req.prompt.contains("<|im_start|>"));
+        assert_eq!(req.worker_key_id.as_deref(), Some("worker-a"));
+        let messages = req.messages.as_ref().expect("structured messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(serde_json::to_value(&messages[0]).unwrap()["role"], "user");
+        assert_eq!(messages[0].content, "hello");
+    }
 }
