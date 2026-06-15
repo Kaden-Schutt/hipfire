@@ -4,6 +4,8 @@
 
 //! Shared model artifact identity helpers and model-source contracts.
 
+pub mod gguf;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::Display;

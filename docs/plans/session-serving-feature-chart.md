@@ -60,8 +60,8 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval output and runtime-evidence model stems now reuse `hipfire-model` artifact identity helpers instead of eval-local stem sanitization.
 - Eval model manifests now reuse `hipfire-model` row construction for file/tag identity, HFQ metadata hashes, architecture IDs, and embedded quantization hashes.
 - `hipfire-model` now consumes `hipfire-hash` directly for file/tag hashes and no longer re-exports generic hash helpers.
-- Runtime model-source opening now reuses `hipfire-model` HFQ/safetensors path policy while keeping concrete loader constructors in `hipfire-runtime`.
-- Runtime and arch callers now consume `hipfire-model` model-source contracts directly; `hipfire-runtime::model_source` remains only the concrete HFQ/safetensors opener adapter.
+- Runtime model-source opening now reuses `hipfire-model` HFQ/safetensors path policy while keeping remaining concrete HFQ/safetensors loader constructors in `hipfire-runtime`.
+- Runtime and arch callers now consume `hipfire-model` model-source contracts directly; the concrete GGUF parser lives in `hipfire-model`, `hipfire-runtime::gguf` remains a compatibility re-export, and `hipfire-runtime::model_source` remains only the concrete HFQ/safetensors opener adapter.
 - Evidence model/tag hash and HFQ metadata compatibility helpers now delegate to `hipfire-model` instead of carrying duplicate model-specific parsing.
 - Eval deterministic mock scoring now consumes `hipfire-hash` directly, and `hipfire-evidence` no longer re-exports hash helpers or HFQ metadata.
 - Qwen3.5 BF16 FFN mode/env parsing now exposes `hipfire-cpu` and `hipfire-npu` helper contracts only within the arch crate instead of publicly re-exporting them through the arch module.

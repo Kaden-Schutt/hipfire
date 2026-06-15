@@ -956,8 +956,10 @@ version = "0.2.1"
 name = "hipfire-model"
 version = "0.2.1"
 dependencies = [
+ "byteorder",
  "hipfire-config",
  "hipfire-hash",
+ "memmap2",
  "serde",
  "serde_json",
 ]
@@ -1006,7 +1008,6 @@ name = "hipfire-runtime"
 version = "0.2.1"
 dependencies = [
  "base64",
- "byteorder",
  "csv",
  "hip-bridge",
  "hipfire-arch-llama",

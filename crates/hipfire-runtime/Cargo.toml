@@ -61,7 +61,6 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
-byteorder = "1"
 serde = { version = "1", features = ["derive"] }
 csv = "1"
 # preserve_order: keep JSON object key insertion-order (IndexMap) instead of the

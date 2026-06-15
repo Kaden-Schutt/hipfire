@@ -8,6 +8,8 @@ description = "Model artifact identity and source contracts for hipfire"
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
 hipfire-hash = { path = "../hipfire-hash" }
+byteorder = "1"
+memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
