@@ -5,11 +5,11 @@
 //! Evidence provenance helpers shared by Hipfire eval and gate tooling.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback, stable_score};
 pub use hipfire_model::HfqMetadata;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1310,41 +1310,8 @@ pub fn standard_evidence_paths_in_dir(dir: &Path) -> Result<Vec<PathBuf>, String
     Ok(out)
 }
 
-pub fn file_hash(path: &Path) -> Option<String> {
-    command_digest("sha256sum", path).or_else(|| Some(stable_hash_file_fallback(path)))
-}
-
 pub fn model_hash(model: &str) -> Option<String> {
     hipfire_model::model_hash(model)
-}
-
-pub fn stable_hash_file_fallback(path: &Path) -> String {
-    let mut f = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return "unavailable".to_string(),
-    };
-    let mut state = Fnv64::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        match f.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => state.update(&buf[..n]),
-            Err(_) => return "unavailable".to_string(),
-        }
-    }
-    format!("fnv64:{:016x}", state.finish())
-}
-
-pub fn stable_hash_bytes(bytes: &[u8]) -> String {
-    let mut state = Fnv64::new();
-    state.update(bytes);
-    format!("fnv64:{:016x}", state.finish())
-}
-
-pub fn stable_score(input: &str) -> f64 {
-    let mut state = Fnv64::new();
-    state.update(input.as_bytes());
-    (state.finish() as f64) / (u64::MAX as f64)
 }
 
 pub fn directory_hash(path: &Path) -> Option<String> {
@@ -1616,36 +1583,6 @@ fn annotate_external_evidence_record_json(
     }
 }
 
-fn command_digest(tool: &str, path: &Path) -> Option<String> {
-    let out = Command::new(tool).arg(path).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .map(str::to_string)
-}
-
-struct Fnv64(u64);
-
-impl Fnv64 {
-    fn new() -> Self {
-        Self(0xcbf29ce484222325)
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= b as u64;
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
-
-    fn finish(self) -> u64 {
-        self.0
-    }
-}
-
 pub fn list_files(path: &Path) -> Vec<String> {
     let mut out = Vec::new();
     collect_files_relative(path, path, &mut out);
@@ -1672,6 +1609,7 @@ fn collect_files_relative(root: &Path, path: &Path, out: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::Write;
 
     #[test]

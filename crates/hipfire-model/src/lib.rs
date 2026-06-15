@@ -10,7 +10,8 @@ use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+pub use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback};
 
 /// Extension preferred order for fuzzy model discovery.
 pub const QUANT_PREFERENCE: &[&str] =
@@ -428,33 +429,6 @@ pub fn model_hash(model: &str) -> Option<String> {
     }
 }
 
-pub fn file_hash(path: &Path) -> Option<String> {
-    command_digest("sha256sum", path).or_else(|| Some(stable_hash_file_fallback(path)))
-}
-
-pub fn stable_hash_file_fallback(path: &Path) -> String {
-    let mut f = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return "unavailable".to_string(),
-    };
-    let mut state = Fnv64::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        match f.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => state.update(&buf[..n]),
-            Err(_) => return "unavailable".to_string(),
-        }
-    }
-    format!("fnv64:{:016x}", state.finish())
-}
-
-pub fn stable_hash_bytes(bytes: &[u8]) -> String {
-    let mut state = Fnv64::new();
-    state.update(bytes);
-    format!("fnv64:{:016x}", state.finish())
-}
-
 pub fn read_hfq_metadata(path: &Path) -> Result<HfqMetadata, String> {
     let mut f = File::open(path).map_err(|e| format!("open model: {e}"))?;
     let mut header = [0u8; 32];
@@ -632,17 +606,6 @@ fn maybe_push_model_candidate(out: &mut Vec<PathBuf>, path: &Path, stem: &str) {
     }
 }
 
-fn command_digest(tool: &str, path: &Path) -> Option<String> {
-    let out = Command::new(tool).arg(path).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .map(str::to_string)
-}
-
 fn find_json_object_end(bytes: &[u8]) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_string = false;
@@ -673,25 +636,6 @@ fn find_json_object_end(bytes: &[u8]) -> Option<usize> {
         }
     }
     None
-}
-
-struct Fnv64(u64);
-
-impl Fnv64 {
-    fn new() -> Self {
-        Self(0xcbf29ce484222325)
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= b as u64;
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
-
-    fn finish(self) -> u64 {
-        self.0
-    }
 }
 
 /// Shared typed contract for loading a model into a runtime worker.

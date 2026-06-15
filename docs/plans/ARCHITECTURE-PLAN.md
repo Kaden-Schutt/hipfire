@@ -18,6 +18,7 @@ The target crates for modular boundaries remain:
 - `hipfire-daemon`
 - `hipfire-config` (created; owns shared CLI/server config and local path helpers)
 - `hipfire-eval` (created; owns the eval runner binary adapter and harness implementation)
+- `hipfire-hash` (created; owns stable file/byte hash primitives shared by model and evidence contracts)
 - `hipfire-model` (created; owns model-source contracts and artifact identity helpers)
 - `hipfire-prompt` (created; owns prompt framing and Jinja rendering)
 - `hipfire-state`
@@ -27,7 +28,7 @@ The target crates for modular boundaries remain:
 - `hipfire-npu` (created; owns NPU opt-in artifact/admission contracts)
 - `hipfire-daemon-adapter` (created; owns daemon JSONL process-client adapter)
 - `hipfire-daemon-protocol` (created; owns daemon JSONL request/response contracts)
-- `hipfire-evidence` (created; owns evidence provenance, host-profile contracts/policy, and hash helpers)
+- `hipfire-evidence` (created; owns evidence provenance, host-profile contracts/policy, and evidence hash policy)
 
 A `bun`-free control plane remains desirable but is deferred behind verified seam extraction.
 
@@ -51,7 +52,7 @@ Current model boundary status:
 - `hipfire-model` owns model-source opening policy for HFQ files and safetensors directories while runtime supplies the concrete loader constructors.
 - `hipfire-model` owns common model-load request/parameter and loaded-response contracts used by daemon protocol clients and future direct library adapters.
 - `hipfire-model` owns common model-load parameter construction from config values, including `auto` mode elision, explicit `dflash_mode=off`, and empty sidecar filtering, now consumed by both Rust server and CLI run load paths.
-- `hipfire-model` owns eval model-manifest row construction for local-file/tag identity, file/tag hashes, HFQ metadata hashes, architecture IDs, embedded quantization hashes, and model-specific hash/HFQ metadata compatibility helpers consumed by evidence/runtime paths.
+- `hipfire-model` owns eval model-manifest row construction for local-file/tag identity, file/tag hashes, HFQ metadata hashes, architecture IDs, embedded quantization hashes, and model-specific hash/HFQ metadata compatibility helpers consumed by evidence/runtime paths. Its public hash helpers are compatibility re-exports from `hipfire-hash`.
 - `hipfire-runtime::model_source` remains a compatibility facade and still owns concrete HFQ/safetensors opener constructors until those loaders move.
 
 Current state boundary status:
@@ -104,7 +105,8 @@ Current config boundary status:
 - `hipfire-cli` consumes `hipfire-config` directly for config and local model discovery paths; `hipfire-server::config` remains a compatibility facade for existing imports.
 
 Current evidence boundary status:
-- `hipfire-evidence` owns stable evidence hash helpers, directory digest, file hash, eval status, host-profile and sourced-field contracts, host-profile hardware-kind/bucket/bandwidth/hash policy, model/tag hash and HFQ metadata compatibility wrappers that delegate to `hipfire-model`, eval reference/slice/llama integrity verifiers, the standard evidence artifact catalog, catalog-based evidence artifact directory discovery, evidence artifact collection status policy, standard evidence artifact contract/JSON rendering, comparison/admission artifact contract rendering, admission required/observed evidence catalogs, the generic evidence artifact record contract/JSON renderer, external evidence record selection/annotation, quality/performance/phase-timing/memory/launch-count/MoE-router/profiling/module-evidence/DFlash-trace/Path-C-trace metric detection/projection policies, comparison metric-direction policy, admission quality/review policy, admission verdict policy, run-provenance contract/JSON rendering, run-metadata artifact contract/JSON rendering, and artifact-index entry contract/JSON rendering.
+- `hipfire-hash` owns stable byte hash, file hash, fallback file hash, and deterministic score primitives used by model identity and evidence records.
+- `hipfire-evidence` owns stable evidence hash policy, directory digest, eval status, host-profile and sourced-field contracts, host-profile hardware-kind/bucket/bandwidth/hash policy, model/tag hash and HFQ metadata compatibility wrappers that delegate to `hipfire-model`, compatibility hash helper exports from `hipfire-hash`, eval reference/slice/llama integrity verifiers, the standard evidence artifact catalog, catalog-based evidence artifact directory discovery, evidence artifact collection status policy, standard evidence artifact contract/JSON rendering, comparison/admission artifact contract rendering, admission required/observed evidence catalogs, the generic evidence artifact record contract/JSON renderer, external evidence record selection/annotation, quality/performance/phase-timing/memory/launch-count/MoE-router/profiling/module-evidence/DFlash-trace/Path-C-trace metric detection/projection policies, comparison metric-direction policy, admission quality/review policy, admission verdict policy, run-provenance contract/JSON rendering, run-metadata artifact contract/JSON rendering, and artifact-index entry contract/JSON rendering.
 - `hipfire-evidence` owns comparison, admission, prompt-ledger, and host-profile artifact-index entry variants so eval no longer mutates those index JSON shapes locally.
 - `hipfire-eval` owns the `hipfire-eval` binary adapter, eval execution, artifact writing, and harness implementation. It consumes shared model, evidence, and coherence crates directly for model identity, artifact/provenance rendering, and daemon-backed coherence rows.
 - `hipfire-runtime::eval_common` remains a compatibility facade for evidence-owned eval integrity verifiers, and `hipfire-runtime::eval_harness` remains a compatibility facade for the `hipfire-eval` harness while downstream callers migrate.
