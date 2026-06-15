@@ -28,6 +28,7 @@ members = [
     "crates/hipfire-quantize",
     "crates/hipfire-detect",
     "crates/hipfire-atlas",
+    "crates/hipfire-cli",
     "crates/hipfire-server",
     "crates/hipfire-daemon",
     "crates/redline",

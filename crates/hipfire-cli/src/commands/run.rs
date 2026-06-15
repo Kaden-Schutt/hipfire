@@ -6,10 +6,11 @@ use hipfire_server::{
         engine::{find_daemon_bin, DaemonEngine},
         protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams},
     },
-    model::discovery::find_model,
     HipfireConfig,
 };
 use uuid::Uuid;
+
+use crate::model::find_model;
 
 #[derive(Debug, Args)]
 pub struct RunArgs {

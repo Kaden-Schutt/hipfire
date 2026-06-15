@@ -10,6 +10,7 @@ name = "hipfire"
 path = "src/main.rs"
 
 [dependencies]
+hipfire-model = { path = "../hipfire-model" }
 hipfire-server = { path = "../hipfire-server" }
 clap = { version = "4", features = ["derive", "cargo"] }
 tokio = { version = "1", features = ["full"] }

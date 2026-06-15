@@ -143,6 +143,94 @@ pub fn model_display_name(path: &Path) -> String {
         .to_string()
 }
 
+/// Resolve a model identifier to a file path using the standard Hipfire local
+/// lookup order.
+pub fn find_model_in(arg: &str, models_dir: &Path, aliases_path: Option<&Path>) -> Option<PathBuf> {
+    let direct = PathBuf::from(arg);
+    if direct.exists() {
+        return Some(direct);
+    }
+
+    let in_models = models_dir.join(arg);
+    if in_models.exists() {
+        return Some(in_models);
+    }
+
+    let with_ext = models_dir.join(format!("{arg}.hfq"));
+    if with_ext.exists() {
+        return Some(with_ext);
+    }
+
+    if let Some(aliases_path) = aliases_path {
+        if let Ok(s) = std::fs::read_to_string(aliases_path) {
+            if let Ok(map) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(path_str) = map.get(arg).and_then(|v| v.as_str()) {
+                    let p = PathBuf::from(path_str);
+                    if p.exists() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+
+    let tag_stem = normalize_tag_stem(arg);
+    let mut candidates = scan_models_dir(models_dir, &tag_stem);
+    candidates.sort_by_key(|p| quant_preference_rank(p));
+    candidates.into_iter().next()
+}
+
+/// List all non-sidecar `.hfq` files directly under a models directory.
+pub fn list_local_models_in(models_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(models_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let n = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
+            n.ends_with(".hfq") && !is_role_sidecar_name(&n)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn scan_models_dir(dir: &Path, stem: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        maybe_push_model_candidate(&mut out, &path, stem);
+        if path.is_dir() {
+            if let Ok(sub) = std::fs::read_dir(&path) {
+                for se in sub.flatten() {
+                    maybe_push_model_candidate(&mut out, &se.path(), stem);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn maybe_push_model_candidate(out: &mut Vec<PathBuf>, path: &Path, stem: &str) {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    if name.ends_with(".hfq") && !is_role_sidecar_name(&name) && name.contains(stem) {
+        out.push(path.to_path_buf());
+    }
+}
+
 /// Shared typed contract for loading a model into a runtime worker.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ModelLoadRequest {
@@ -189,6 +277,16 @@ pub struct ModelLoadedResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}-{}-{stamp}", std::process::id()))
+    }
 
     #[test]
     fn normalizes_tag_stems_for_fuzzy_lookup() {
@@ -268,6 +366,49 @@ mod tests {
         assert_eq!(value["params"]["cask_sidecar"], "model.triattn.hfq");
         assert!(value["params"].get("flash_mode").is_none());
         assert_eq!(value["request_id"], "load-1");
+    }
+
+    #[test]
+    fn local_model_discovery_uses_direct_alias_and_fuzzy_lookup() {
+        let root = temp_dir("hipfire-model-discovery");
+        let models = root.join("models");
+        let nested = models.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let direct = root.join("direct.hfq");
+        let alias_target = root.join("alias-target.hfq");
+        let mq6 = models.join("qwen3.5-9b-mq6.hfq");
+        let mq4 = nested.join("qwen3.5-9b-mq4.hfq");
+        let sidecar = models.join("qwen3.5-9b-mq4.mtp.hfq");
+        fs::write(&direct, "").unwrap();
+        fs::write(&alias_target, "").unwrap();
+        fs::write(&mq6, "").unwrap();
+        fs::write(&mq4, "").unwrap();
+        fs::write(&sidecar, "").unwrap();
+        let aliases = root.join("models.json");
+        fs::write(
+            &aliases,
+            serde_json::to_string(&json!({"alias": alias_target.display().to_string()})).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_model_in(direct.to_str().unwrap(), &models, Some(&aliases)),
+            Some(direct.clone())
+        );
+        assert_eq!(
+            find_model_in("alias", &models, Some(&aliases)),
+            Some(alias_target)
+        );
+        assert_eq!(
+            find_model_in("qwen3.5:9b", &models, Some(&aliases)),
+            Some(mq4)
+        );
+
+        let listed = list_local_models_in(&models);
+        assert_eq!(listed, vec![mq6]);
+        assert!(!listed.contains(&sidecar));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

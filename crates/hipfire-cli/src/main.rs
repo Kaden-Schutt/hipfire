@@ -1,4 +1,5 @@
 mod commands;
+mod model;
 
 use clap::{Parser, Subcommand};
 use hipfire_server::load_config;
