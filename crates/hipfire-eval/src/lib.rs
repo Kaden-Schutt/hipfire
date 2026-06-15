@@ -28,12 +28,13 @@ use hipfire_evidence::{
     evidence_record_json, extract_external_evidence_records_json, file_hash, hardware_bucket,
     has_launch_count_metric, has_memory_metric, has_module_evidence_metric, has_moe_router_metric,
     has_path_c_trace_metric, has_performance_metric, has_phase_timing_metric, has_profiling_metric,
-    host_profile_artifact_index_entry_json, host_profile_hash, launch_count_metrics, list_files,
-    memory_metrics, module_evidence_metrics, moe_router_metrics, path_c_trace_metrics,
-    phase_timing_metrics, profiling_metrics, prompt_artifact_index_entry_json,
-    required_admission_evidence_requirements, run_metadata_artifact_json, run_provenance_json,
-    stable_hash_bytes, stable_hash_file_fallback, standard_evidence_paths_in_dir,
-    AdmissionArtifact as EvidenceAdmissionArtifact, AdmissionEvidence as EvidenceAdmissionEvidence,
+    has_quality_metric as has_quality_signal_metric, host_profile_artifact_index_entry_json,
+    host_profile_hash, launch_count_metrics, list_files, memory_metrics, module_evidence_metrics,
+    moe_router_metrics, path_c_trace_metrics, phase_timing_metrics, profiling_metrics,
+    prompt_artifact_index_entry_json, required_admission_evidence_requirements,
+    run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
+    standard_evidence_paths_in_dir, AdmissionArtifact as EvidenceAdmissionArtifact,
+    AdmissionEvidence as EvidenceAdmissionEvidence,
     ComparisonArtifact as EvidenceComparisonArtifact, EvidenceArtifact, EvidenceArtifactCollection,
     EvidenceArtifactConfig, EvidenceArtifactDatasetStatus, EvidenceArtifactIndexContext,
     EvidenceArtifactModels, EvidenceRecord, RunMetadataArtifact, RunMetadataConfig,
@@ -3685,23 +3686,7 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
 }
 
 fn has_quality_metric(row: &EvalResult) -> bool {
-    row.battery == BatteryId::Quality
-        || has_any_metric(
-            row,
-            &[
-                "mean_kld",
-                "p99_kld",
-                "ppl",
-                "nll",
-                "argmax_match_rate",
-                "accuracy",
-                "exact_match",
-            ],
-        )
-}
-
-fn has_any_metric(row: &EvalResult, keys: &[&str]) -> bool {
-    keys.iter().any(|key| row.metrics.contains_key(*key))
+    row.battery == BatteryId::Quality || has_quality_signal_metric(&row.metrics)
 }
 
 fn metric_string(metrics: &BTreeMap<String, Value>, key: &str) -> Option<String> {

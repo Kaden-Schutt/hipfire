@@ -316,6 +316,16 @@ pub const PERFORMANCE_TRIGGER_METRICS: &[&str] = &[
     "launch_count",
 ];
 
+pub const QUALITY_TRIGGER_METRICS: &[&str] = &[
+    "mean_kld",
+    "p99_kld",
+    "ppl",
+    "nll",
+    "argmax_match_rate",
+    "accuracy",
+    "exact_match",
+];
+
 pub const DFLASH_TRACE_NUMERIC_METRICS: &[&str] =
     &["ar_tok_s", "dflash_tok_s", "tau", "accept_rate", "tok_s"];
 
@@ -433,6 +443,10 @@ pub fn has_memory_metric(metrics: &BTreeMap<String, Value>) -> bool {
 
 pub fn has_performance_metric(metrics: &BTreeMap<String, Value>) -> bool {
     has_any_metric(metrics, PERFORMANCE_TRIGGER_METRICS)
+}
+
+pub fn has_quality_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    has_any_metric(metrics, QUALITY_TRIGGER_METRICS)
 }
 
 pub fn memory_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
@@ -1929,6 +1943,17 @@ mod tests {
 
         let unrelated = BTreeMap::from([("mean_kld".to_string(), json!(0.01))]);
         assert!(!has_performance_metric(&unrelated));
+    }
+
+    #[test]
+    fn quality_metric_detection_preserves_eval_aliases() {
+        for key in QUALITY_TRIGGER_METRICS {
+            let metrics = BTreeMap::from([((*key).to_string(), json!(1.0))]);
+            assert!(has_quality_metric(&metrics), "{key}");
+        }
+
+        let unrelated = BTreeMap::from([("tok_s".to_string(), json!(128.0))]);
+        assert!(!has_quality_metric(&unrelated));
     }
 
     #[test]
