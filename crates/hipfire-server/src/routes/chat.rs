@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::model::discovery::find_model;
 use crate::state::SharedState;
 use hipfire_config::HipfireConfig;
-use hipfire_daemon_adapter::{find_daemon_bin, DaemonEngine};
+use hipfire_daemon_adapter::{find_daemon_bin_or_error, DaemonEngine};
 use hipfire_daemon_protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
 
 #[derive(Debug, Deserialize)]
@@ -88,10 +88,7 @@ async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(),
         }
     }
 
-    let bin = find_daemon_bin().ok_or_else(|| {
-        "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`"
-            .to_string()
-    })?;
+    let bin = find_daemon_bin_or_error().map_err(|e| e.to_string())?;
 
     let mut engine = DaemonEngine::spawn(&bin).await.map_err(|e| e.to_string())?;
 

@@ -6,5 +6,6 @@ license.workspace = true
 description = "Coherence detector orchestration helpers for hipfire"
 
 [dependencies]
+hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-detect = { path = "../hipfire-detect" }
 serde_json = "1"

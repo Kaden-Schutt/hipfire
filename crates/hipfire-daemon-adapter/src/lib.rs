@@ -244,37 +244,68 @@ impl DaemonEngine {
 /// Locate the daemon binary. Priority:
 /// 1. `HIPFIRE_DAEMON_BIN` env var
 /// 2. `~/.hipfire/bin/daemon`
-/// 3. `./target/release/hipfire-daemon`
-/// 4. `./target/debug/hipfire-daemon`
+/// 3. repo-root `target/release/hipfire-daemon`
+/// 4. repo-root `target/debug/hipfire-daemon`
 pub fn find_daemon_bin() -> Option<PathBuf> {
+    find_daemon_bin_candidates()
+        .into_iter()
+        .find(|p| p.exists())
+}
+
+pub fn find_daemon_bin_or_error() -> anyhow::Result<PathBuf> {
+    find_daemon_bin().ok_or_else(|| {
+        anyhow::anyhow!(
+            "daemon binary not found; build with: cargo build -p hipfire-daemon --bin hipfire-daemon"
+        )
+    })
+}
+
+fn find_daemon_bin_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
     if let Ok(p) = std::env::var("HIPFIRE_DAEMON_BIN") {
-        let path = PathBuf::from(p);
-        if path.exists() {
-            return Some(path);
-        }
+        candidates.push(PathBuf::from(p));
     }
 
     if let Some(home) = dirs::home_dir() {
         let hipfire_bin = home.join(".hipfire").join("bin");
         for name in &["hipfire-daemon", "daemon"] {
-            let p = hipfire_bin.join(name);
-            if p.exists() {
-                return Some(p);
+            candidates.push(hipfire_bin.join(name));
+        }
+    }
+
+    let exe = std::env::consts::EXE_SUFFIX;
+    let repo = repo_root().unwrap_or_else(|| PathBuf::from("."));
+    for rel in &[
+        format!("target/release/hipfire-daemon{exe}"),
+        format!("target/debug/hipfire-daemon{exe}"),
+    ] {
+        candidates.push(repo.join(rel));
+    }
+
+    candidates
+}
+
+fn repo_root() -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok();
+    if let Some(out) = out {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(PathBuf::from(s));
             }
         }
     }
 
-    for rel in &[
-        "target/release/hipfire-daemon",
-        "target/debug/hipfire-daemon",
-    ] {
-        let p = PathBuf::from(rel);
-        if p.exists() {
-            return Some(p);
-        }
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fallback = manifest_dir.join("../..");
+    if fallback.join("Cargo.toml").exists() {
+        fallback.canonicalize().ok().or(Some(fallback))
+    } else {
+        None
     }
-
-    None
 }
 
 #[derive(Debug)]
@@ -637,6 +668,29 @@ mod tests {
             }),
             worker_key_id: None,
         }
+    }
+
+    #[test]
+    fn daemon_binary_candidates_include_env_home_and_repo_targets() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("HIPFIRE_DAEMON_BIN", "/tmp/custom-hipfire-daemon");
+        }
+        let candidates = find_daemon_bin_candidates();
+        unsafe {
+            std::env::remove_var("HIPFIRE_DAEMON_BIN");
+        }
+
+        assert_eq!(candidates[0], PathBuf::from("/tmp/custom-hipfire-daemon"));
+        assert!(candidates
+            .iter()
+            .any(|path| path.ends_with(".hipfire/bin/hipfire-daemon")));
+        assert!(candidates
+            .iter()
+            .any(|path| path.ends_with("target/release/hipfire-daemon")));
+        assert!(candidates
+            .iter()
+            .any(|path| path.ends_with("target/debug/hipfire-daemon")));
     }
 
     #[tokio::test]

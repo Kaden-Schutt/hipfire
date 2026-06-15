@@ -2,7 +2,7 @@ use std::io::Write;
 
 use clap::Args;
 use hipfire_config::HipfireConfig;
-use hipfire_daemon_adapter::{find_daemon_bin, DaemonEngine};
+use hipfire_daemon_adapter::{find_daemon_bin_or_error, DaemonEngine};
 use hipfire_daemon_protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
 use uuid::Uuid;
 
@@ -39,11 +39,7 @@ pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
     let model_path = find_model(&args.model)
         .ok_or_else(|| anyhow::anyhow!("model not found: {}", args.model))?;
 
-    let bin = find_daemon_bin().ok_or_else(|| {
-        anyhow::anyhow!(
-            "daemon binary not found; build with: cargo build -p hipfire-daemon --bin hipfire-daemon"
-        )
-    })?;
+    let bin = find_daemon_bin_or_error()?;
 
     eprintln!("Loading {}…", model_path.display());
     let mut engine = DaemonEngine::spawn(&bin).await?;

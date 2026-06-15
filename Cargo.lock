@@ -804,6 +804,7 @@ dependencies = [
 name = "hipfire-coherence"
 version = "0.2.1"
 dependencies = [
+ "hipfire-daemon-adapter",
  "hipfire-detect",
  "serde_json",
 ]
