@@ -1046,6 +1046,7 @@ dependencies = [
  "hipfire-daemon-protocol",
  "hipfire-model",
  "hipfire-prompt",
+ "hipfire-scheduler",
  "reqwest",
  "serde",
  "serde_json",
