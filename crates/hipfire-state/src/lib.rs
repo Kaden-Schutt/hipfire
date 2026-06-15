@@ -177,6 +177,16 @@ pub struct SequenceStateReservationRequest {
     pub budget_bytes: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SequenceStateReservationPlan {
+    pub reserved_bytes: usize,
+    pub current_session_bytes: usize,
+    pub outstanding_reserved_bytes: usize,
+    pub projected_reserved_bytes: usize,
+    pub budget_bytes: usize,
+    pub rejected_for_memory_pressure: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SequenceStateDescribeRequest {
     pub handle: ParsedSequenceStateHandle,
@@ -324,6 +334,59 @@ pub fn qwen35_kv_deltanet_state_kind_labels() -> Vec<&'static str> {
         SequenceStatePageKind::Kv.as_str(),
         SequenceStatePageKind::DeltaNet.as_str(),
     ]
+}
+
+pub fn sequence_state_descriptor_bytes(descriptors: &[SequenceStatePageDescriptor]) -> usize {
+    descriptors
+        .iter()
+        .map(|descriptor| descriptor.resident_bytes)
+        .sum()
+}
+
+pub fn estimate_session_state_reservation_bytes(
+    descriptors: &[SequenceStatePageDescriptor],
+    physical_cap: usize,
+) -> usize {
+    if !descriptors.is_empty() {
+        let total = sequence_state_descriptor_bytes(descriptors);
+        return (total / descriptors.len().max(1)).max(16 * 1024 * 1024);
+    }
+    (physical_cap.saturating_mul(256 * 1024)).max(64 * 1024 * 1024)
+}
+
+pub fn sequence_state_reservation_plan(
+    descriptors: &[SequenceStatePageDescriptor],
+    physical_cap: usize,
+    outstanding_reserved_bytes: usize,
+    budget_bytes: usize,
+) -> SequenceStateReservationPlan {
+    let reserved_bytes = estimate_session_state_reservation_bytes(descriptors, physical_cap);
+    let current_session_bytes = sequence_state_descriptor_bytes(descriptors);
+    sequence_state_reservation_plan_for_reserved_bytes(
+        reserved_bytes,
+        current_session_bytes,
+        outstanding_reserved_bytes,
+        budget_bytes,
+    )
+}
+
+pub fn sequence_state_reservation_plan_for_reserved_bytes(
+    reserved_bytes: usize,
+    current_session_bytes: usize,
+    outstanding_reserved_bytes: usize,
+    budget_bytes: usize,
+) -> SequenceStateReservationPlan {
+    let projected_reserved_bytes = current_session_bytes
+        .saturating_add(outstanding_reserved_bytes)
+        .saturating_add(reserved_bytes);
+    SequenceStateReservationPlan {
+        reserved_bytes,
+        current_session_bytes,
+        outstanding_reserved_bytes,
+        projected_reserved_bytes,
+        budget_bytes,
+        rejected_for_memory_pressure: budget_bytes > 0 && projected_reserved_bytes > budget_bytes,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1336,6 +1399,63 @@ mod tests {
             qwen35_kv_deltanet_state_kind_labels(),
             vec!["attention_kv", "deltanet_recurrent"]
         );
+    }
+
+    #[test]
+    fn reservation_plan_uses_descriptor_average_and_current_bytes() {
+        let handle = qwen35_sequence_state_handle("session-a", 7);
+        let descriptors = vec![
+            SequenceStatePageDescriptor {
+                session_id: "session-a".to_string(),
+                handle: handle.clone(),
+                kind: SequenceStatePageKind::Kv,
+                label: "kv".to_string(),
+                logical_position: 128,
+                resident_bytes: 40 * 1024 * 1024,
+                allocation_epoch: 7,
+                owns_pages: true,
+                shape: vec![4096],
+                placement: "gpu:0".to_string(),
+                role: "active".to_string(),
+            },
+            SequenceStatePageDescriptor {
+                session_id: "session-a".to_string(),
+                handle,
+                kind: SequenceStatePageKind::DeltaNet,
+                label: "deltanet".to_string(),
+                logical_position: 128,
+                resident_bytes: 24 * 1024 * 1024,
+                allocation_epoch: 7,
+                owns_pages: true,
+                shape: vec![4096],
+                placement: "gpu:0".to_string(),
+                role: "active".to_string(),
+            },
+        ];
+
+        let plan =
+            sequence_state_reservation_plan(&descriptors, 4096, 8 * 1024 * 1024, 128 * 1024 * 1024);
+
+        assert_eq!(plan.reserved_bytes, 32 * 1024 * 1024);
+        assert_eq!(plan.current_session_bytes, 64 * 1024 * 1024);
+        assert_eq!(plan.outstanding_reserved_bytes, 8 * 1024 * 1024);
+        assert_eq!(plan.projected_reserved_bytes, 104 * 1024 * 1024);
+        assert_eq!(plan.budget_bytes, 128 * 1024 * 1024);
+        assert!(!plan.rejected_for_memory_pressure);
+    }
+
+    #[test]
+    fn reservation_plan_fallback_rejects_memory_pressure() {
+        let plan = sequence_state_reservation_plan(&[], 16, 32 * 1024 * 1024, 80 * 1024 * 1024);
+
+        assert_eq!(plan.reserved_bytes, 64 * 1024 * 1024);
+        assert_eq!(plan.current_session_bytes, 0);
+        assert_eq!(plan.projected_reserved_bytes, 96 * 1024 * 1024);
+        assert!(plan.rejected_for_memory_pressure);
+
+        let unlimited = sequence_state_reservation_plan(&[], 16, usize::MAX - 1, 0);
+        assert_eq!(unlimited.projected_reserved_bytes, usize::MAX);
+        assert!(!unlimited.rejected_for_memory_pressure);
     }
 
     #[test]

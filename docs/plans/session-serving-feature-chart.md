@@ -91,6 +91,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon `release_sessions` response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
 - Daemon `unload_worker` response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
 - Daemon worker-status allocator policy reporting now reuses `hipfire-state` allocator/spill vocabulary, including page ownership, manual-release eviction status, disabled spill target, and copy-on-write attach status.
+- Daemon `reserve_session_state` sizing and memory-pressure projection now reuse `hipfire-state` reservation planning policy instead of daemon-local byte math.
 - Daemon startup resource lease policy and lock helpers now reuse `hipfire-daemon-adapter` ownership instead of daemon-local helpers.
 - Coherence daemon binary discovery now reuses `hipfire-daemon-adapter` ownership instead of coherence-local repository probing.
 - Eval artifact row records now reuse `hipfire-evidence` record contracts instead of eval-local JSON construction.

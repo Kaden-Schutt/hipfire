@@ -81,7 +81,8 @@ use hipfire_state::{
     parse_unload_worker_request, parsed_handle_may_target_generic,
     parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
     release_sessions_done_json, release_state_done_json, reserve_session_state_done_json,
-    reserve_session_state_rejected_json, session_state_reservation_describe_json,
+    reserve_session_state_rejected_json, sequence_state_reservation_plan,
+    sequence_state_reservation_plan_for_reserved_bytes, session_state_reservation_describe_json,
     unload_worker_done_json, validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
     validate_checkpoint_source_resident, DescribedSequenceState, GenericSequenceStateArena,
     ModelArtifactMemory, ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
@@ -4009,27 +4010,6 @@ fn release_loaded_sequence_state_handles(
         released_bytes = released_bytes.saturating_add(bytes);
     }
     Ok((released, released_bytes))
-}
-
-fn estimate_session_state_reservation_bytes(m: &LoadedModel, physical_cap: usize) -> usize {
-    let arena_backend = loaded_model_state_arena_backend(m);
-    let descriptors = sequence_state_arena_page_descriptors(arena_backend, m);
-    if !descriptors.is_empty() {
-        let total = descriptors
-            .iter()
-            .map(|descriptor| descriptor.resident_bytes)
-            .sum::<usize>();
-        return (total / descriptors.len().max(1)).max(16 * 1024 * 1024);
-    }
-    (physical_cap.saturating_mul(256 * 1024)).max(64 * 1024 * 1024)
-}
-
-fn current_worker_session_state_bytes(m: &LoadedModel) -> usize {
-    let arena_backend = loaded_model_state_arena_backend(m);
-    sequence_state_arena_page_descriptors(arena_backend, m)
-        .iter()
-        .map(|descriptor| descriptor.resident_bytes)
-        .sum()
 }
 
 fn qwen35_release_sessions(
@@ -8794,38 +8774,36 @@ fn main() {
                             .unwrap_or(0)
                     )
                 });
-                let (reserved_bytes, current_session_bytes, outstanding_bytes, budget_bytes) =
-                    if let Some(m) = model.as_ref() {
-                        let budget = request
-                            .budget_bytes
-                            .unwrap_or_else(resident_state_reservation_budget_bytes);
-                        (
-                            estimate_session_state_reservation_bytes(m, request.physical_cap),
-                            current_worker_session_state_bytes(m),
-                            generic_state_arena.outstanding_bytes_for_worker(&request.worker_id),
-                            budget,
-                        )
-                    } else if dummy_model.is_some() {
-                        let budget = request
-                            .budget_bytes
-                            .unwrap_or_else(resident_state_reservation_budget_bytes);
-                        (1024usize, 0usize, 0usize, budget)
-                    } else {
-                        emit_error_with_id(&mut stdout, id, "no model loaded");
-                        continue;
-                    };
-                let projected = current_session_bytes
-                    .saturating_add(outstanding_bytes)
-                    .saturating_add(reserved_bytes);
-                if budget_bytes > 0 && projected > budget_bytes {
+                let reservation_plan = if let Some(m) = model.as_ref() {
+                    let budget = request
+                        .budget_bytes
+                        .unwrap_or_else(resident_state_reservation_budget_bytes);
+                    let arena_backend = loaded_model_state_arena_backend(m);
+                    let descriptors = sequence_state_arena_page_descriptors(arena_backend, m);
+                    sequence_state_reservation_plan(
+                        &descriptors,
+                        request.physical_cap,
+                        generic_state_arena.outstanding_bytes_for_worker(&request.worker_id),
+                        budget,
+                    )
+                } else if dummy_model.is_some() {
+                    let budget = request
+                        .budget_bytes
+                        .unwrap_or_else(resident_state_reservation_budget_bytes);
+                    sequence_state_reservation_plan_for_reserved_bytes(1024, 0, 0, budget)
+                } else {
+                    emit_error_with_id(&mut stdout, id, "no model loaded");
+                    continue;
+                };
+                if reservation_plan.rejected_for_memory_pressure {
                     let rejected = reserve_session_state_rejected_json(
                         id,
                         &request.worker_id,
-                        reserved_bytes,
-                        current_session_bytes,
-                        outstanding_bytes,
-                        projected,
-                        budget_bytes,
+                        reservation_plan.reserved_bytes,
+                        reservation_plan.current_session_bytes,
+                        reservation_plan.outstanding_reserved_bytes,
+                        reservation_plan.projected_reserved_bytes,
+                        reservation_plan.budget_bytes,
                     );
                     let _ = writeln!(stdout, "{rejected}");
                     let _ = stdout.flush();
@@ -8836,16 +8814,16 @@ fn main() {
                     reservation_id.clone(),
                     &request.state_kinds,
                     request.physical_cap,
-                    reserved_bytes,
+                    reservation_plan.reserved_bytes,
                     request.ttl_ms,
                 );
                 let done = reserve_session_state_done_json(
                     id,
                     &reservation,
-                    current_session_bytes,
-                    outstanding_bytes,
-                    projected,
-                    budget_bytes,
+                    reservation_plan.current_session_bytes,
+                    reservation_plan.outstanding_reserved_bytes,
+                    reservation_plan.projected_reserved_bytes,
+                    reservation_plan.budget_bytes,
                 );
                 let _ = writeln!(stdout, "{done}");
                 let _ = stdout.flush();
