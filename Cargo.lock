@@ -959,7 +959,9 @@ dependencies = [
  "byteorder",
  "hipfire-config",
  "hipfire-hash",
+ "hipfire-prompt",
  "memmap2",
+ "regex",
  "serde",
  "serde_json",
 ]
@@ -1028,7 +1030,6 @@ dependencies = [
  "minijinja-contrib",
  "rayon",
  "rdna-compute",
- "regex",
  "serde",
  "serde_json",
  "tracing",

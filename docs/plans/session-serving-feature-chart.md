@@ -55,8 +55,8 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server `/health` now consumes scheduler-owned JSON builders for scheduler-derived prefill/decode/state-cache metadata while live Rust request handling remains daemon-serial.
 - Rust server `/health.runtime_workers` now consumes `hipfire-state` runtime-worker health summary rendering, currently reporting an empty adapter state until Rust owns resident workers.
 - Generate Qwen3.5 dense/MoE batch backend selection and decode scheduler fallback metadata now reuse `hipfire-model` architecture classification instead of local numeric arch checks.
-- Runtime tokenizer compatibility signatures now reuse `hipfire-model` fingerprint policy while tokenizer parsing and encode/decode stay in `hipfire-runtime`.
-- Runtime HFQ tokenizer metadata selection, optional safetensors `tokenizer.json` sidecar read policy, and HFQ chat-template extraction now reuse `hipfire-model`; tokenizer parsing, encode/decode, and GGUF runtime adapters stay in `hipfire-runtime`.
+- Runtime tokenizer compatibility signatures now reuse `hipfire-model` fingerprint policy, and tokenizer parsing plus encode/decode now live in `hipfire-model` behind the `hipfire-runtime::tokenizer` compatibility re-export.
+- Runtime HFQ tokenizer metadata selection, optional safetensors `tokenizer.json` sidecar read policy, and HFQ chat-template extraction now reuse `hipfire-model`; GGUF and tokenizer runtime adapters stay as compatibility re-exports in `hipfire-runtime`.
 - Eval output and runtime-evidence model stems now reuse `hipfire-model` artifact identity helpers instead of eval-local stem sanitization.
 - Eval model manifests now reuse `hipfire-model` row construction for file/tag identity, HFQ metadata hashes, architecture IDs, and embedded quantization hashes.
 - `hipfire-model` now consumes `hipfire-hash` directly for file/tag hashes and no longer re-exports generic hash helpers.

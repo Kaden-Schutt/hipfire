@@ -5,6 +5,7 @@
 //! Shared model artifact identity helpers and model-source contracts.
 
 pub mod gguf;
+pub mod tokenizer;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
