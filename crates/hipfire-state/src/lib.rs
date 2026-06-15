@@ -28,6 +28,19 @@ pub struct ModelWorkerId {
     pub value: String,
 }
 
+impl ModelWorkerId {
+    pub fn from_runtime_parts(arch_id: u32, pp: usize, kv_mode: Option<&str>) -> Self {
+        Self {
+            value: format!(
+                "worker:arch{}:pp{}:{}",
+                arch_id,
+                pp,
+                kv_mode.unwrap_or("unknown")
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SequenceStateArenaBackend {
     Qwen35Wrapped,
@@ -80,6 +93,23 @@ impl SequenceStateArenaBackend {
                 SequenceStateArenaOperation::DescribeState,
             ],
             Self::Unsupported => &[],
+        }
+    }
+
+    pub fn for_worker_parts(arch_id: u32, pp: usize) -> Self {
+        if matches!(arch_id, 5 | 6) && pp == 1 {
+            Self::Qwen35Wrapped
+        } else {
+            Self::Unsupported
+        }
+    }
+
+    pub fn require_supported(self, arch_id: u32, pp: usize, op: &str) -> Result<(), String> {
+        match self {
+            Self::Qwen35Wrapped => Ok(()),
+            Self::Unsupported => Err(format!(
+                "{op} requires a supported sequence-state arena (arch_id={arch_id} pp={pp})"
+            )),
         }
     }
 }
@@ -750,5 +780,37 @@ mod tests {
         .unwrap();
         assert!(!parsed_handle_may_target_generic(&qwen35));
         assert!(parsed_handle_may_target_loaded_state(&qwen35));
+    }
+
+    #[test]
+    fn worker_id_and_arena_policy_follow_runtime_shape() {
+        assert_eq!(
+            ModelWorkerId::from_runtime_parts(6, 1, Some("q8")).value,
+            "worker:arch6:pp1:q8"
+        );
+        assert_eq!(
+            ModelWorkerId::from_runtime_parts(5, 2, None).value,
+            "worker:arch5:pp2:unknown"
+        );
+        assert_eq!(
+            SequenceStateArenaBackend::for_worker_parts(5, 1),
+            SequenceStateArenaBackend::Qwen35Wrapped
+        );
+        assert_eq!(
+            SequenceStateArenaBackend::for_worker_parts(6, 1),
+            SequenceStateArenaBackend::Qwen35Wrapped
+        );
+        assert_eq!(
+            SequenceStateArenaBackend::for_worker_parts(5, 2),
+            SequenceStateArenaBackend::Unsupported
+        );
+        assert!(SequenceStateArenaBackend::Qwen35Wrapped
+            .require_supported(5, 1, "attach_checkpoint")
+            .is_ok());
+        let err = SequenceStateArenaBackend::Unsupported
+            .require_supported(7, 1, "attach_checkpoint")
+            .unwrap_err();
+        assert!(err.contains("attach_checkpoint requires a supported sequence-state arena"));
+        assert!(err.contains("arch_id=7 pp=1"));
     }
 }

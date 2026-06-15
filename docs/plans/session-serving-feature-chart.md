@@ -18,3 +18,4 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval evidence artifact kinds and expected-metric catalogs now reuse `hipfire-evidence` ownership instead of runtime-local lists.
 - Coherence run contracts and artifact serialization now reuse `hipfire-coherence` ownership while runtime keeps daemon execution.
 - Daemon load request/parameter and loaded-response protocol types now reuse `hipfire-model` contracts instead of duplicating common model-load structs in `hipfire-daemon-protocol`.
+- Daemon model-worker id construction and sequence-state arena support policy now reuse `hipfire-state` ownership instead of daemon-local policy helpers.
