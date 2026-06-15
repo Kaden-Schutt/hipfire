@@ -1,9 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::models_dir;
-
-/// Extension preferred order for fuzzy scan (most-to-least preferred quant).
-static QUANT_PREFERENCE: &[&str] = &["-mq4", "-hf4", "-mq3", "-lloyd-mq2", "-mq6", "-hf6", "-q8"];
+pub use hipfire_model::model_display_name;
+use hipfire_model::{is_role_sidecar_name, normalize_tag_stem, quant_preference_rank};
 
 /// Resolve a model identifier to an absolute file path.
 ///
@@ -50,25 +49,8 @@ pub fn find_model(arg: &str) -> Option<PathBuf> {
     // 5. Fuzzy scan — find all .hfq files whose name contains the tag stem
     let tag_stem = normalize_tag_stem(arg);
     let mut candidates = scan_models_dir(&mdir, &tag_stem);
-    candidates.sort_by_key(|p| quant_rank(p));
+    candidates.sort_by_key(|p| quant_preference_rank(p));
     candidates.into_iter().next()
-}
-
-/// Strip known version/size suffixes to get a fuzzy match stem.
-fn normalize_tag_stem(tag: &str) -> String {
-    tag.replace(':', "-").to_lowercase()
-}
-
-fn quant_rank(path: &Path) -> usize {
-    let name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_lowercase();
-    QUANT_PREFERENCE
-        .iter()
-        .position(|q| name.contains(q))
-        .unwrap_or(QUANT_PREFERENCE.len())
 }
 
 fn scan_models_dir(dir: &Path, stem: &str) -> Vec<PathBuf> {
@@ -83,7 +65,7 @@ fn scan_models_dir(dir: &Path, stem: &str) -> Vec<PathBuf> {
             .unwrap_or_default()
             .to_string_lossy()
             .to_lowercase();
-        if name.ends_with(".hfq") && !is_role_sidecar(&name) && name.contains(stem) {
+        if name.ends_with(".hfq") && !is_role_sidecar_name(&name) && name.contains(stem) {
             out.push(path.clone());
         }
         // One level deep
@@ -96,7 +78,7 @@ fn scan_models_dir(dir: &Path, stem: &str) -> Vec<PathBuf> {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_lowercase();
-                    if sn.ends_with(".hfq") && !is_role_sidecar(&sn) && sn.contains(stem) {
+                    if sn.ends_with(".hfq") && !is_role_sidecar_name(&sn) && sn.contains(stem) {
                         out.push(sp);
                     }
                 }
@@ -104,14 +86,6 @@ fn scan_models_dir(dir: &Path, stem: &str) -> Vec<PathBuf> {
         }
     }
     out
-}
-
-fn is_role_sidecar(name: &str) -> bool {
-    name.ends_with(".triattn.hfq")
-        || name.ends_with(".dflash.hfq")
-        || name.ends_with(".mtp.hfq")
-        || name.ends_with(".hfqm2.hfq")
-        || name.ends_with(".hfqm2.hfq.tmp")
 }
 
 /// List all non-sidecar .hfq files in the models directory.
@@ -129,19 +103,9 @@ pub fn list_local_models() -> Vec<PathBuf> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_lowercase();
-            n.ends_with(".hfq") && !is_role_sidecar(&n)
+            n.ends_with(".hfq") && !is_role_sidecar_name(&n)
         })
         .collect();
     out.sort();
     out
-}
-
-/// Derive a display name (tag) from a model file path.
-pub fn model_display_name(path: &Path) -> String {
-    path.file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .trim_end_matches(".hfq")
-        .trim_end_matches(".tmp")
-        .to_string()
 }

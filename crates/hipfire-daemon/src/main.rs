@@ -47,6 +47,19 @@ use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
+use hipfire_state::{
+    describe_sequence_state_descriptors, model_worker_runtime_view_json,
+    parse_reserve_session_state_kinds, parse_sequence_state_handle,
+    parse_sequence_state_handle_list, parsed_handle_may_target_generic,
+    parsed_handle_may_target_loaded_state, sequence_state_page_descriptor_json,
+    DescribedSequenceState, GenericSequenceStateArena, ModelWorkerId, ModelWorkerMemoryView,
+    ModelWorkerRuntimeView, ParsedSequenceStateHandle, SequenceStateArenaBackend,
+    SequenceStateHandle, SequenceStatePageDescriptor, SequenceStatePageKind,
+};
+#[cfg(test)]
+use hipfire_state::{
+    generic_state_reservation_descriptors, sequence_state_handle_id, sequence_state_handle_parts,
+};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -4339,166 +4352,6 @@ struct LoadedModelMemory {
     model_weight_bytes: usize,
 }
 
-#[derive(Clone, Debug)]
-struct SessionStateReservation {
-    worker_id: String,
-    reserved_bytes: usize,
-    handle: SequenceStateHandle,
-    state_page_descriptors: Vec<SequenceStatePageDescriptor>,
-    expires_at: Option<std::time::Instant>,
-}
-
-#[derive(Default)]
-struct GenericSequenceStateArena {
-    reservations: std::collections::HashMap<String, SessionStateReservation>,
-    next_generation: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ModelWorkerId {
-    value: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SequenceStateArenaBackend {
-    Qwen35Wrapped,
-    Unsupported,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SequenceStateArenaOperation {
-    ReserveSessionState,
-    AttachCheckpoint,
-    ForkCheckpoint,
-    ReleaseState,
-    DescribeState,
-}
-
-impl SequenceStateArenaOperation {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ReserveSessionState => "reserve_session_state",
-            Self::AttachCheckpoint => "attach_checkpoint",
-            Self::ForkCheckpoint => "fork_checkpoint",
-            Self::ReleaseState => "release_state",
-            Self::DescribeState => "describe_state",
-        }
-    }
-}
-
-impl SequenceStateArenaBackend {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Qwen35Wrapped => "qwen35_wrapped",
-            Self::Unsupported => "unsupported",
-        }
-    }
-
-    fn owns_state_pages(self) -> bool {
-        match self {
-            Self::Qwen35Wrapped => true,
-            Self::Unsupported => false,
-        }
-    }
-
-    fn supported_operations(self) -> &'static [SequenceStateArenaOperation] {
-        match self {
-            Self::Qwen35Wrapped => &[
-                SequenceStateArenaOperation::ReserveSessionState,
-                SequenceStateArenaOperation::AttachCheckpoint,
-                SequenceStateArenaOperation::ForkCheckpoint,
-                SequenceStateArenaOperation::ReleaseState,
-                SequenceStateArenaOperation::DescribeState,
-            ],
-            Self::Unsupported => &[],
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ModelWorkerRuntimeView {
-    worker_id: ModelWorkerId,
-    max_seq: usize,
-    physical_cap: usize,
-    max_resident_workers: usize,
-    resident_workers: usize,
-    state_arena_backend: SequenceStateArenaBackend,
-    resident_sessions: usize,
-    state_page_descriptors: Vec<SequenceStatePageDescriptor>,
-    memory: ModelWorkerMemoryView,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SequenceStateHandle {
-    id: String,
-    kind: String,
-    generation: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ParsedSequenceStateHandle {
-    id: String,
-    kind: Option<String>,
-    generation: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SequenceStatePageKind {
-    Kv,
-    DeltaNet,
-    Logits,
-    BackendPrivate,
-}
-
-impl SequenceStatePageKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Kv => "attention_kv",
-            Self::DeltaNet => "deltanet_recurrent",
-            Self::Logits => "logits",
-            Self::BackendPrivate => "backend_private",
-        }
-    }
-
-    fn from_state_kind(kind: &str) -> Option<Self> {
-        match kind {
-            "attention_kv" => Some(Self::Kv),
-            "deltanet_recurrent" => Some(Self::DeltaNet),
-            "logits" => Some(Self::Logits),
-            "backend_private" | "architecture_specific" | "mamba_ssm" | "mamba_conv" => {
-                Some(Self::BackendPrivate)
-            }
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SequenceStatePageDescriptor {
-    session_id: String,
-    handle: SequenceStateHandle,
-    kind: SequenceStatePageKind,
-    label: String,
-    logical_position: usize,
-    resident_bytes: usize,
-    allocation_epoch: u64,
-    owns_pages: bool,
-    shape: Vec<usize>,
-    placement: String,
-    role: String,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ModelWorkerMemoryView {
-    model_file_bytes: usize,
-    model_weight_bytes: usize,
-    runtime_base_bytes: usize,
-    runtime_session_bytes: usize,
-    runtime_state_bytes: usize,
-    total_resident_bytes: usize,
-    evictable_state_bytes: usize,
-}
-
 #[derive(Clone, Copy)]
 struct SequenceStateCheckpointRequest<'a> {
     source_session_id: &'a str,
@@ -5262,8 +5115,8 @@ fn loaded_model_state_arena_backend(m: &LoadedModel) -> SequenceStateArenaBacken
 
 fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
     let state_arena_backend = loaded_model_state_arena_backend(m);
-    let resident_sessions = state_arena_backend.resident_session_count(m);
-    let state_page_descriptors = state_arena_backend.state_page_descriptors(m);
+    let resident_sessions = sequence_state_arena_resident_session_count(state_arena_backend, m);
+    let state_page_descriptors = sequence_state_arena_page_descriptors(state_arena_backend, m);
     let memory = loaded_model_memory_view(m, &state_page_descriptors);
     ModelWorkerRuntimeView {
         worker_id: loaded_model_worker_id(m),
@@ -5276,68 +5129,6 @@ fn loaded_model_worker_runtime_view(m: &LoadedModel) -> ModelWorkerRuntimeView {
         state_page_descriptors,
         memory,
     }
-}
-
-fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_json::Value {
-    let descriptor_bytes = worker
-        .state_page_descriptors
-        .iter()
-        .map(|descriptor| descriptor.resident_bytes)
-        .sum::<usize>();
-    let descriptors: Vec<serde_json::Value> = worker
-        .state_page_descriptors
-        .iter()
-        .map(sequence_state_page_descriptor_json)
-        .collect();
-    serde_json::json!({
-        "id": worker.worker_id.value,
-        "max_seq": worker.max_seq,
-        "physical_cap": worker.physical_cap,
-        "resident_workers": worker.resident_workers,
-        "max_resident_workers": worker.max_resident_workers,
-        "state_arena_backend": worker.state_arena_backend.as_str(),
-        "state_arena_owns_pages": worker.state_arena_backend.owns_state_pages(),
-        "state_arena_operations": worker
-            .state_arena_backend
-            .supported_operations()
-            .iter()
-            .map(|op| op.as_str())
-            .collect::<Vec<_>>(),
-        "resident_sessions": worker.resident_sessions,
-        "state_page_descriptor_entries": worker.state_page_descriptors.len(),
-        "state_page_descriptor_bytes": descriptor_bytes,
-        "state_page_descriptors": descriptors,
-        "model_file_bytes": worker.memory.model_file_bytes,
-        "model_weight_bytes": worker.memory.model_weight_bytes,
-        "runtime_base_bytes": worker.memory.runtime_base_bytes,
-        "runtime_session_bytes": worker.memory.runtime_session_bytes,
-        "runtime_state_bytes": worker.memory.runtime_state_bytes,
-        "total_resident_bytes": worker.memory.total_resident_bytes,
-        "evictable_state_bytes": worker.memory.evictable_state_bytes,
-    })
-}
-
-fn sequence_state_page_descriptor_json(
-    descriptor: &SequenceStatePageDescriptor,
-) -> serde_json::Value {
-    serde_json::json!({
-        "session_id": &descriptor.session_id,
-        "handle": {
-            "id": &descriptor.handle.id,
-            "kind": &descriptor.handle.kind,
-            "generation": descriptor.handle.generation,
-        },
-        "state_kind": descriptor.kind.as_str(),
-        "page_kind": descriptor.kind.as_str(),
-        "label": &descriptor.label,
-        "logical_position": descriptor.logical_position,
-        "resident_bytes": descriptor.resident_bytes,
-        "allocation_epoch": descriptor.allocation_epoch,
-        "owns_pages": descriptor.owns_pages,
-        "shape": &descriptor.shape,
-        "placement": &descriptor.placement,
-        "role": &descriptor.role,
-    })
 }
 
 fn message_worker_id(msg: &serde_json::Value) -> String {
@@ -5506,314 +5297,6 @@ fn resident_state_reservation_budget_bytes() -> usize {
         .unwrap_or(16 * 1024 * 1024 * 1024)
 }
 
-impl GenericSequenceStateArena {
-    fn new() -> Self {
-        Self {
-            reservations: std::collections::HashMap::new(),
-            next_generation: 1,
-        }
-    }
-
-    fn purge_expired(&mut self) {
-        let now = std::time::Instant::now();
-        self.reservations.retain(|_, reservation| {
-            reservation
-                .expires_at
-                .map(|expires_at| expires_at > now)
-                .unwrap_or(true)
-        });
-    }
-
-    fn release_worker(&mut self, worker_id: &str) {
-        self.reservations
-            .retain(|_, reservation| reservation.worker_id != worker_id);
-    }
-
-    fn clear(&mut self) {
-        self.reservations.clear();
-    }
-
-    fn outstanding_bytes_for_worker(&self, worker_id: &str) -> usize {
-        self.reservations
-            .values()
-            .filter(|reservation| reservation.worker_id == worker_id)
-            .map(|reservation| reservation.reserved_bytes)
-            .sum()
-    }
-
-    fn reserve(
-        &mut self,
-        worker_id: &str,
-        reservation_id: String,
-        state_kinds: &[SequenceStatePageKind],
-        physical_cap: usize,
-        reserved_bytes: usize,
-        ttl_ms: u64,
-    ) -> SessionStateReservation {
-        let generation = self.next_generation;
-        self.next_generation = self.next_generation.saturating_add(1).max(1);
-        let handle = SequenceStateHandle {
-            id: reservation_id.clone(),
-            kind: "generic_reserved_state".to_string(),
-            generation,
-        };
-        let state_page_descriptors = generic_state_reservation_descriptors(
-            worker_id,
-            &handle,
-            state_kinds,
-            physical_cap,
-            reserved_bytes,
-        );
-        let reservation = SessionStateReservation {
-            worker_id: worker_id.to_string(),
-            reserved_bytes,
-            handle,
-            state_page_descriptors,
-            expires_at: if ttl_ms == 0 {
-                None
-            } else {
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(ttl_ms))
-            },
-        };
-        self.reservations
-            .insert(reservation_id, reservation.clone());
-        reservation
-    }
-
-    fn describe(
-        &self,
-        handle_id: &str,
-        generation: Option<u64>,
-    ) -> Option<&SessionStateReservation> {
-        let reservation = self.reservations.get(handle_id)?;
-        if generation
-            .map(|generation| generation == reservation.handle.generation)
-            .unwrap_or(true)
-        {
-            Some(reservation)
-        } else {
-            None
-        }
-    }
-
-    fn release<I>(&mut self, handles: I) -> (usize, usize)
-    where
-        I: IntoIterator<Item = (String, Option<u64>)>,
-    {
-        let mut released = 0usize;
-        let mut released_bytes = 0usize;
-        for (handle_id, generation) in handles {
-            let matches_generation = self
-                .reservations
-                .get(&handle_id)
-                .map(|reservation| {
-                    generation
-                        .map(|generation| generation == reservation.handle.generation)
-                        .unwrap_or(true)
-                })
-                .unwrap_or(false);
-            if matches_generation {
-                if let Some(reservation) = self.reservations.remove(&handle_id) {
-                    released += 1;
-                    released_bytes = released_bytes.saturating_add(reservation.reserved_bytes);
-                }
-            }
-        }
-        (released, released_bytes)
-    }
-}
-
-fn sequence_state_handle_id(value: &serde_json::Value) -> Option<&str> {
-    sequence_state_handle_parts(value).map(|(id, _)| id)
-}
-
-fn sequence_state_handle_parts(value: &serde_json::Value) -> Option<(&str, Option<u64>)> {
-    if let Some(id) = value.as_str().filter(|s| !s.is_empty()) {
-        return Some((id, None));
-    }
-    let id = value.get("id").and_then(|v| v.as_str())?.trim();
-    if id.is_empty() {
-        return None;
-    }
-    let generation = value
-        .get("generation")
-        .or_else(|| value.get("allocation_epoch"))
-        .and_then(|v| v.as_u64());
-    Some((id, generation))
-}
-
-fn parse_sequence_state_handle(value: &serde_json::Value) -> Option<ParsedSequenceStateHandle> {
-    let (id, generation) = sequence_state_handle_parts(value)?;
-    let kind = value
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .filter(|kind| !kind.is_empty())
-        .map(|kind| kind.to_string());
-    Some(ParsedSequenceStateHandle {
-        id: id.to_string(),
-        kind,
-        generation,
-    })
-}
-
-fn parse_sequence_state_handle_list(msg: &serde_json::Value) -> Vec<ParsedSequenceStateHandle> {
-    msg.get("reservations")
-        .or_else(|| msg.get("handles"))
-        .and_then(|v| v.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(parse_sequence_state_handle)
-                .collect()
-        })
-        .or_else(|| {
-            msg.get("reservation_id")
-                .and_then(parse_sequence_state_handle)
-                .map(|handle| vec![handle])
-        })
-        .or_else(|| {
-            msg.get("runtime_state_handle")
-                .and_then(parse_sequence_state_handle)
-                .map(|handle| vec![handle])
-        })
-        .or_else(|| {
-            msg.get("handle")
-                .and_then(parse_sequence_state_handle)
-                .map(|handle| vec![handle])
-        })
-        .unwrap_or_default()
-}
-
-fn parse_reserve_session_state_kinds(
-    msg: &serde_json::Value,
-) -> Result<Vec<SequenceStatePageKind>, String> {
-    let Some(value) = msg.get("state_kinds") else {
-        return Ok(vec![
-            SequenceStatePageKind::Kv,
-            SequenceStatePageKind::DeltaNet,
-        ]);
-    };
-    let values = value
-        .as_array()
-        .ok_or_else(|| "reserve_session_state.state_kinds must be an array".to_string())?;
-    if values.is_empty() {
-        return Err("reserve_session_state.state_kinds must not be empty".to_string());
-    }
-    let mut kinds = Vec::with_capacity(values.len());
-    for value in values {
-        let raw = value
-            .as_str()
-            .ok_or_else(|| "reserve_session_state.state_kinds must be strings".to_string())?;
-        let kind = SequenceStatePageKind::from_state_kind(raw).ok_or_else(|| {
-            format!("reserve_session_state.state_kinds contains unsupported kind {raw}")
-        })?;
-        if !kinds.contains(&kind) {
-            kinds.push(kind);
-        }
-    }
-    Ok(kinds)
-}
-
-fn generic_state_reservation_descriptors(
-    worker_id: &str,
-    handle: &SequenceStateHandle,
-    kinds: &[SequenceStatePageKind],
-    physical_cap: usize,
-    reserved_bytes: usize,
-) -> Vec<SequenceStatePageDescriptor> {
-    let count = kinds.len().max(1);
-    let base_bytes = reserved_bytes / count;
-    let remainder = reserved_bytes % count;
-    kinds
-        .iter()
-        .enumerate()
-        .map(|(idx, &kind)| {
-            let resident_bytes = base_bytes + usize::from(idx < remainder);
-            let label = match kind {
-                SequenceStatePageKind::Kv => "generic.attention_kv",
-                SequenceStatePageKind::DeltaNet => "generic.deltanet_recurrent",
-                SequenceStatePageKind::Logits => "generic.logits",
-                SequenceStatePageKind::BackendPrivate => "generic.backend_private",
-            };
-            let shape = match kind {
-                SequenceStatePageKind::Kv | SequenceStatePageKind::DeltaNet => vec![physical_cap],
-                SequenceStatePageKind::Logits | SequenceStatePageKind::BackendPrivate => vec![1],
-            };
-            SequenceStatePageDescriptor {
-                session_id: handle.id.clone(),
-                handle: handle.clone(),
-                kind,
-                label: label.to_string(),
-                logical_position: 0,
-                resident_bytes,
-                allocation_epoch: handle.generation,
-                owns_pages: true,
-                shape,
-                placement: format!("host:reserved:{worker_id}"),
-                role: "reserved".to_string(),
-            }
-        })
-        .collect()
-}
-
-#[derive(Clone, Debug)]
-struct DescribedSequenceState {
-    worker_id: String,
-    handle: SequenceStateHandle,
-    state_arena_owns_pages: bool,
-    reserved_bytes: usize,
-    state_page_descriptors: Vec<SequenceStatePageDescriptor>,
-}
-
-fn sequence_state_descriptor_matches_handle(
-    descriptor: &SequenceStatePageDescriptor,
-    handle: &ParsedSequenceStateHandle,
-) -> bool {
-    if descriptor.handle.id != handle.id {
-        return false;
-    }
-    if let Some(kind) = handle.kind.as_deref() {
-        if descriptor.handle.kind != kind {
-            return false;
-        }
-    }
-    handle
-        .generation
-        .map(|generation| descriptor.handle.generation == generation)
-        .unwrap_or(true)
-}
-
-fn describe_sequence_state_descriptors(
-    descriptors: Vec<SequenceStatePageDescriptor>,
-    handle: &ParsedSequenceStateHandle,
-) -> Option<Vec<SequenceStatePageDescriptor>> {
-    let matched = descriptors
-        .into_iter()
-        .filter(|descriptor| sequence_state_descriptor_matches_handle(descriptor, handle))
-        .collect::<Vec<_>>();
-    if matched.is_empty() {
-        None
-    } else {
-        Some(matched)
-    }
-}
-
-fn parsed_handle_may_target_generic(handle: &ParsedSequenceStateHandle) -> bool {
-    handle
-        .kind
-        .as_deref()
-        .map(|kind| kind == "generic_reserved_state")
-        .unwrap_or(true)
-}
-
-fn parsed_handle_may_target_loaded_state(handle: &ParsedSequenceStateHandle) -> bool {
-    handle
-        .kind
-        .as_deref()
-        .map(|kind| matches!(kind, "qwen35_session" | "qwen35_checkpoint"))
-        .unwrap_or(true)
-}
-
 fn describe_loaded_model_sequence_state(
     worker_id: &str,
     m: &LoadedModel,
@@ -5823,8 +5306,10 @@ fn describe_loaded_model_sequence_state(
         return None;
     }
     let arena_backend = loaded_model_state_arena_backend(m);
-    let descriptors =
-        describe_sequence_state_descriptors(arena_backend.state_page_descriptors(m), handle)?;
+    let descriptors = describe_sequence_state_descriptors(
+        sequence_state_arena_page_descriptors(arena_backend, m),
+        handle,
+    )?;
     let state_arena_owns_pages = descriptors.iter().any(|descriptor| descriptor.owns_pages);
     let reserved_bytes = descriptors
         .iter()
@@ -5873,9 +5358,10 @@ fn release_loaded_model_sequence_state_handles(
         {
             continue;
         }
-        let Some(descriptors) =
-            describe_sequence_state_descriptors(arena_backend.state_page_descriptors(m), handle)
-        else {
+        let Some(descriptors) = describe_sequence_state_descriptors(
+            sequence_state_arena_page_descriptors(arena_backend, m),
+            handle,
+        ) else {
             continue;
         };
         let descriptor_bytes = descriptors
@@ -5883,7 +5369,8 @@ fn release_loaded_model_sequence_state_handles(
             .map(|descriptor| descriptor.resident_bytes)
             .sum::<usize>();
         let session_ids = vec![handle.id.clone()];
-        let session_released = arena_backend.release_sessions(m, gpu, &session_ids)?;
+        let session_released =
+            sequence_state_arena_release_sessions(arena_backend, m, gpu, &session_ids)?;
         if session_released > 0 {
             released += session_released;
             released_bytes = released_bytes.saturating_add(descriptor_bytes);
@@ -5915,7 +5402,8 @@ fn release_loaded_sequence_state_handles(
 }
 
 fn estimate_session_state_reservation_bytes(m: &LoadedModel, physical_cap: usize) -> usize {
-    let descriptors = loaded_model_state_arena_backend(m).state_page_descriptors(m);
+    let arena_backend = loaded_model_state_arena_backend(m);
+    let descriptors = sequence_state_arena_page_descriptors(arena_backend, m);
     if !descriptors.is_empty() {
         let total = descriptors
             .iter()
@@ -5927,8 +5415,8 @@ fn estimate_session_state_reservation_bytes(m: &LoadedModel, physical_cap: usize
 }
 
 fn current_worker_session_state_bytes(m: &LoadedModel) -> usize {
-    loaded_model_state_arena_backend(m)
-        .state_page_descriptors(m)
+    let arena_backend = loaded_model_state_arena_backend(m);
+    sequence_state_arena_page_descriptors(arena_backend, m)
         .iter()
         .map(|descriptor| descriptor.resident_bytes)
         .sum()
@@ -6239,116 +5727,133 @@ fn qwen35_reset_active_session(
     Ok(())
 }
 
-impl SequenceStateArenaBackend {
-    fn ensure_supported(self, m: &LoadedModel, op: &str) -> Result<(), String> {
-        match self {
-            Self::Qwen35Wrapped => Ok(()),
-            Self::Unsupported => Err(format!(
-                "{op} requires a supported sequence-state arena (arch_id={} pp={})",
-                m.arch_id, m.pp
-            )),
-        }
+fn ensure_sequence_state_arena_backend_supported(
+    arena_backend: SequenceStateArenaBackend,
+    m: &LoadedModel,
+    op: &str,
+) -> Result<(), String> {
+    match arena_backend {
+        SequenceStateArenaBackend::Qwen35Wrapped => Ok(()),
+        SequenceStateArenaBackend::Unsupported => Err(format!(
+            "{op} requires a supported sequence-state arena (arch_id={} pp={})",
+            m.arch_id, m.pp
+        )),
     }
+}
 
-    fn resident_session_count(self, m: &LoadedModel) -> usize {
-        match self {
-            Self::Qwen35Wrapped => qwen35_request_session_count(m),
-            Self::Unsupported => 0,
-        }
+fn sequence_state_arena_resident_session_count(
+    arena_backend: SequenceStateArenaBackend,
+    m: &LoadedModel,
+) -> usize {
+    match arena_backend {
+        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_request_session_count(m),
+        SequenceStateArenaBackend::Unsupported => 0,
     }
+}
 
-    fn state_page_descriptors(self, m: &LoadedModel) -> Vec<SequenceStatePageDescriptor> {
-        match self {
-            Self::Qwen35Wrapped => qwen35_state_page_descriptors(m),
-            Self::Unsupported => Vec::new(),
-        }
+fn sequence_state_arena_page_descriptors(
+    arena_backend: SequenceStateArenaBackend,
+    m: &LoadedModel,
+) -> Vec<SequenceStatePageDescriptor> {
+    match arena_backend {
+        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_state_page_descriptors(m),
+        SequenceStateArenaBackend::Unsupported => Vec::new(),
     }
+}
 
-    fn is_session_resident(self, m: &LoadedModel, session_id: &str) -> bool {
-        match self {
-            Self::Qwen35Wrapped => qwen35_session_resident(m, session_id),
-            Self::Unsupported => false,
-        }
+fn sequence_state_arena_is_session_resident(
+    arena_backend: SequenceStateArenaBackend,
+    m: &LoadedModel,
+    session_id: &str,
+) -> bool {
+    match arena_backend {
+        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_session_resident(m, session_id),
+        SequenceStateArenaBackend::Unsupported => false,
     }
+}
 
-    fn release_sessions(
-        self,
-        m: &mut LoadedModel,
-        gpu: &mut rdna_compute::Gpu,
-        session_ids: &[String],
-    ) -> Result<usize, String> {
-        self.ensure_supported(m, "release_sessions")?;
-        match self {
-            Self::Qwen35Wrapped => qwen35_release_sessions(m, gpu, session_ids),
-            Self::Unsupported => unreachable!("unsupported arena rejected above"),
-        }
+fn sequence_state_arena_release_sessions(
+    arena_backend: SequenceStateArenaBackend,
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    session_ids: &[String],
+) -> Result<usize, String> {
+    ensure_sequence_state_arena_backend_supported(arena_backend, m, "release_sessions")?;
+    match arena_backend {
+        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_release_sessions(m, gpu, session_ids),
+        SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
+}
 
-    fn activate_session(
-        self,
-        m: &mut LoadedModel,
-        gpu: &mut rdna_compute::Gpu,
-        session_id: &str,
-    ) -> Result<bool, String> {
-        self.ensure_supported(m, "activate_session")?;
-        match self {
-            Self::Qwen35Wrapped => qwen35_activate_session(m, gpu, session_id),
-            Self::Unsupported => unreachable!("unsupported arena rejected above"),
-        }
+fn sequence_state_arena_activate_session(
+    arena_backend: SequenceStateArenaBackend,
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    session_id: &str,
+) -> Result<bool, String> {
+    ensure_sequence_state_arena_backend_supported(arena_backend, m, "activate_session")?;
+    match arena_backend {
+        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_activate_session(m, gpu, session_id),
+        SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
+}
 
-    fn reset_active_session(
-        self,
-        m: &mut LoadedModel,
-        gpu: &mut rdna_compute::Gpu,
-    ) -> Result<(), String> {
-        self.ensure_supported(m, "reset_active_session")?;
-        match self {
-            Self::Qwen35Wrapped => qwen35_reset_active_session(m, gpu),
-            Self::Unsupported => unreachable!("unsupported arena rejected above"),
-        }
+fn sequence_state_arena_reset_active_session(
+    arena_backend: SequenceStateArenaBackend,
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), String> {
+    ensure_sequence_state_arena_backend_supported(arena_backend, m, "reset_active_session")?;
+    match arena_backend {
+        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_reset_active_session(m, gpu),
+        SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
+}
 
-    fn active_logical_position(self, m: &LoadedModel) -> Result<usize, String> {
-        self.ensure_supported(m, "active_logical_position")?;
-        match self {
-            Self::Qwen35Wrapped => qwen35_active_logical_position(m),
-            Self::Unsupported => unreachable!("unsupported arena rejected above"),
-        }
+fn sequence_state_arena_active_logical_position(
+    arena_backend: SequenceStateArenaBackend,
+    m: &LoadedModel,
+) -> Result<usize, String> {
+    ensure_sequence_state_arena_backend_supported(arena_backend, m, "active_logical_position")?;
+    match arena_backend {
+        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_active_logical_position(m),
+        SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
+}
 
-    fn fork_session_state(
-        self,
-        m: &mut LoadedModel,
-        gpu: &mut rdna_compute::Gpu,
-        source_session_id: &str,
-        dest_session_id: &str,
-        requested_prefix_hash: Option<&GenerateBatchPrefillPrefixHash>,
-    ) -> Result<(), String> {
-        self.ensure_supported(m, "fork_session_state")?;
-        match self {
-            Self::Qwen35Wrapped => qwen35_fork_session_state(
-                m,
-                gpu,
-                source_session_id,
-                dest_session_id,
-                requested_prefix_hash,
-            ),
-            Self::Unsupported => unreachable!("unsupported arena rejected above"),
-        }
+fn sequence_state_arena_fork_session_state(
+    arena_backend: SequenceStateArenaBackend,
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    source_session_id: &str,
+    dest_session_id: &str,
+    requested_prefix_hash: Option<&GenerateBatchPrefillPrefixHash>,
+) -> Result<(), String> {
+    ensure_sequence_state_arena_backend_supported(arena_backend, m, "fork_session_state")?;
+    match arena_backend {
+        SequenceStateArenaBackend::Qwen35Wrapped => qwen35_fork_session_state(
+            m,
+            gpu,
+            source_session_id,
+            dest_session_id,
+            requested_prefix_hash,
+        ),
+        SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
+}
 
-    fn checkpoint_session_state(
-        self,
-        m: &mut LoadedModel,
-        gpu: &mut rdna_compute::Gpu,
-        request: SequenceStateCheckpointRequest<'_>,
-    ) -> Result<(), String> {
-        self.ensure_supported(m, "checkpoint_session_state")?;
-        match self {
-            Self::Qwen35Wrapped => qwen35_checkpoint_session_state(m, gpu, request),
-            Self::Unsupported => unreachable!("unsupported arena rejected above"),
+fn sequence_state_arena_checkpoint_session_state(
+    arena_backend: SequenceStateArenaBackend,
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    request: SequenceStateCheckpointRequest<'_>,
+) -> Result<(), String> {
+    ensure_sequence_state_arena_backend_supported(arena_backend, m, "checkpoint_session_state")?;
+    match arena_backend {
+        SequenceStateArenaBackend::Qwen35Wrapped => {
+            qwen35_checkpoint_session_state(m, gpu, request)
         }
+        SequenceStateArenaBackend::Unsupported => unreachable!("unsupported arena rejected above"),
     }
 }
 
@@ -6420,7 +5925,8 @@ fn emit_qwen35_prefill_checkpoint(
         return Err("qwen35 prefill checkpoint boundary kind is empty".to_string());
     }
     let checkpoint_id = qwen35_prefill_checkpoint_session_id(hook);
-    arena_backend.checkpoint_session_state(
+    sequence_state_arena_checkpoint_session_state(
+        arena_backend,
         m,
         gpu,
         SequenceStateCheckpointRequest {
@@ -8230,23 +7736,23 @@ fn run_generate_batch_prefill_serial_qwen35(
         }
 
         if let Some(runtime_state_handle) = session.state_handle.runtime_state_handle.as_deref() {
-            arena_backend
-                .fork_session_state(
-                    m,
-                    gpu,
-                    runtime_state_handle,
-                    &session.id,
-                    session.state_handle.prefix_hash.as_ref(),
+            sequence_state_arena_fork_session_state(
+                arena_backend,
+                m,
+                gpu,
+                runtime_state_handle,
+                &session.id,
+                session.state_handle.prefix_hash.as_ref(),
+            )
+            .map_err(|e| {
+                format!(
+                    "generate_batch_prefill session {} failed to attach checkpoint {}: {}",
+                    session.id, runtime_state_handle, e
                 )
-                .map_err(|e| {
-                    format!(
-                        "generate_batch_prefill session {} failed to attach checkpoint {}: {}",
-                        session.id, runtime_state_handle, e
-                    )
-                })?;
+            })?;
         }
 
-        let resident = arena_backend.is_session_resident(m, &session.id);
+        let resident = sequence_state_arena_is_session_resident(arena_backend, m, &session.id);
         if !resident
             && (session.state_handle.logical_position > 0
                 || session.state_handle.cached_prefix_tokens > 0)
@@ -8259,7 +7765,7 @@ fn run_generate_batch_prefill_serial_qwen35(
             ));
         }
 
-        let created = arena_backend.activate_session(m, gpu, &session.id)?;
+        let created = sequence_state_arena_activate_session(arena_backend, m, gpu, &session.id)?;
         let mut boundary_checkpoints = Vec::new();
         let tokens: Vec<u32> = if session.prompt.is_some() {
             let full_tokens = qwen35_materialize_batch_prefill_prompt(m, session)?;
@@ -8288,13 +7794,13 @@ fn run_generate_batch_prefill_serial_qwen35(
                 ));
             } else {
                 let _ = created;
-                arena_backend.reset_active_session(m, gpu)?;
+                sequence_state_arena_reset_active_session(arena_backend, m, gpu)?;
                 boundary_checkpoints =
                     qwen35_semantic_boundary_checkpoints(m, session, &full_tokens)?;
                 full_tokens
             }
         } else {
-            let current_position = arena_backend.active_logical_position(m)?;
+            let current_position = sequence_state_arena_active_logical_position(arena_backend, m)?;
             if created && session.state_handle.logical_position != 0 {
                 return Err(format!(
                     "generate_batch_prefill suffix session {} is new but logical_position={} (expected 0)",
@@ -8403,7 +7909,7 @@ fn run_generate_batch_prefill_serial_qwen35(
         "mode": result.mode,
         "plan": result.plan.as_str(),
         "backend": result.backend.as_str(),
-        "resident_sessions": arena_backend.resident_session_count(m),
+        "resident_sessions": sequence_state_arena_resident_session_count(arena_backend, m),
         "model_worker": model_worker_runtime_view_json(&worker),
     });
     let _ = writeln!(stdout, "{done}");
@@ -8535,7 +8041,10 @@ fn run_generate_batch_decode_step_qwen35(
         "chunk_count": step_result.chunk_count,
         "chunk_size": step_result.chunk_size,
         "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0,
-        "resident_sessions": loaded_model_state_arena_backend(m).resident_session_count(m),
+        "resident_sessions": sequence_state_arena_resident_session_count(
+            loaded_model_state_arena_backend(m),
+            m
+        ),
         "model_worker": model_worker_runtime_view_json(&worker),
     });
     let _ = writeln!(stdout, "{done}");
@@ -10854,7 +10363,7 @@ fn main() {
                     }
                 };
                 let arena_backend = loaded_model_state_arena_backend(m);
-                match arena_backend.release_sessions(m, &mut gpu, &sessions) {
+                match sequence_state_arena_release_sessions(arena_backend, m, &mut gpu, &sessions) {
                     Ok(released) => {
                         let worker = loaded_model_worker_runtime_view(m);
                         let done = serde_json::json!({
@@ -10862,7 +10371,10 @@ fn main() {
                             "id": id,
                             "requested": sessions.len(),
                             "released": released,
-                            "resident_sessions": arena_backend.resident_session_count(m),
+                            "resident_sessions": sequence_state_arena_resident_session_count(
+                                arena_backend,
+                                m
+                            ),
                             "model_worker": model_worker_runtime_view_json(&worker),
                         });
                         let _ = writeln!(stdout, "{done}");
