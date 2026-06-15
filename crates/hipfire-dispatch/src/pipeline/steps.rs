@@ -577,10 +577,10 @@ fn launch_fused(
 
         // ── Paro fused Paro4G128T ────────────────────────────────────────
         // For all three Paro fused keys, we allocate rotation scratch from
-        // gpu.scratch.paro_fused_scratch (4 × [k] F32 buffers). The QKVZA
+        // gpu.paro_fused_scratch (4 × [k] F32 buffers). The QKVZA
         // path passes all 4; the QKV (3-way) passes 4 with m3=0 via aliasing;
         // the gate+up path passes 1 (x_rot_gate), with the kernel using
-        // gpu.scratch.mq_x_rot internally for x_rot_up.
+        // gpu.mq_x_rot internally for x_rot_up.
         //
         // Build aliased GpuTensor descriptors before the mutable borrow of
         // gpu (fused_qkv.run takes &mut Gpu). DeviceBuffer::alias() creates
@@ -596,7 +596,7 @@ fn launch_fused(
             // Also ensure mq_x_rot >= k (the kernel aliases it for x_rot_up).
             gpu.ensure_mq_signs()
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            let rot_aliases: Vec<GpuTensor> = gpu.scratch.paro_fused_scratch.as_ref().unwrap()
+            let rot_aliases: Vec<GpuTensor> = gpu.paro_fused_scratch.as_ref().unwrap()
                 .iter()
                 .map(|t| GpuTensor {
                     buf: unsafe { t.buf.alias() },
@@ -606,8 +606,8 @@ fn launch_fused(
                 .collect();
             #[cfg(debug_assertions)]
             {
-                let gate_buf = &gpu.scratch.paro_fused_scratch.as_ref().unwrap()[0];
-                let up_internal = gpu.scratch.mq_x_rot.as_ref().unwrap();
+                let gate_buf = &gpu.paro_fused_scratch.as_ref().unwrap()[0];
+                let up_internal = gpu.mq_x_rot.as_ref().unwrap();
                 debug_assert!(gate_buf.buf.as_ptr() != up_internal.buf.as_ptr(),
                     "Paro gate+up: x_rot_gate must not alias mq_x_rot");
             }
@@ -632,7 +632,7 @@ fn launch_fused(
             eprintln!("[dispatch] QKVZA Paro: k={}, mqkv={}, mz={}, mbeta={}, malpha={}", k, wqkv.m, wz.m, wb.m, wa.m);
             gpu.ensure_paro_fused_scratch(k)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            let rot_aliases: Vec<GpuTensor> = gpu.scratch.paro_fused_scratch.as_ref().unwrap()
+            let rot_aliases: Vec<GpuTensor> = gpu.paro_fused_scratch.as_ref().unwrap()
                 .iter()
                 .map(|t| GpuTensor {
                     buf: unsafe { t.buf.alias() },
@@ -660,7 +660,7 @@ fn launch_fused(
             eprintln!("[dispatch] QKV Paro: k={}, mq={}, mk={}, mv={}", kk, wq.m, wk.m, wv.m);
             gpu.ensure_paro_fused_scratch(kk)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            let rot_aliases: Vec<GpuTensor> = gpu.scratch.paro_fused_scratch.as_ref().unwrap()
+            let rot_aliases: Vec<GpuTensor> = gpu.paro_fused_scratch.as_ref().unwrap()
                 .iter()
                 .map(|t| GpuTensor {
                     buf: unsafe { t.buf.alias() },

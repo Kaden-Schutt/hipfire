@@ -69,7 +69,7 @@ pub fn execute_pipeline(
                 gpu.ensure_mq_signs().map_err(|e| DispatchError::Hip(e.to_string()))?;
                 let x_rot = unsafe {
                     GpuTensor {
-                        buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
+                        buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
                         shape: vec![params.k],
                         dtype: rdna_compute::DType::F32,
                     }
@@ -337,8 +337,8 @@ pub fn run_moe_decode(
         if p.shared_down_w.dtype == DType::MQ4G256 {
             hip!(gpu.ensure_mq_signs())?;
             let x_rot_alias = unsafe { GpuTensor {
-                buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
-                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             }};
             if let Some(awq) = p.shared_down_w.awq_scale {
@@ -534,8 +534,8 @@ fn run_moe_decode_cpu_fallback(
     if p.shared_down_w.dtype == DType::MQ4G256 {
         hip!(gpu.ensure_mq_signs())?;
         let x_rot_alias = unsafe { GpuTensor {
-            buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
-            shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+            buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
+            shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
             dtype: DType::F32,
         }};
         if let Some(awq) = p.shared_down_w.awq_scale {
@@ -1184,7 +1184,7 @@ pub fn dispatch_fused(
             gpu.ensure_mq_signs().map_err(|e| DispatchError::Hip(e.to_string()))?;
             let x_rot = unsafe {
                 GpuTensor {
-                    buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
+                    buf: gpu.mq_x_rot.as_ref().unwrap().buf.alias(),
                     shape: vec![params.k],
                     dtype: rdna_compute::DType::F32,
                 }

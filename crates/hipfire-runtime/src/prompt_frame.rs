@@ -400,6 +400,7 @@ fn strip_generation_tags(template: &str) -> String {
     let re = RE
         .get_or_init(|| regex::Regex::new(r"[ \t]*\{%-?\s*(?:end)?generation\s*-?%\}\n?").unwrap());
     re.replace_all(template, "").into_owned()
+}
 /// JSON formatter matching HuggingFace's `json.dumps(..., ensure_ascii=False)`
 /// default separators — `", "` between elements and `": "` after keys — the
 /// exact form the model's chat_template was trained on. minijinja's builtin

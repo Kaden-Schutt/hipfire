@@ -598,6 +598,8 @@ pub struct Gpu {
     /// dispatch threads (one `Gpu` per device, all routing into a single
     /// per-tensor accumulator).
     pub capture_handler: Option<Arc<dyn ActivationCapture>>,
+    /// Paro fused gate+up/qkvza scratch: 4 × [k] F32 buffers.
+    pub paro_fused_scratch: Option<Vec<GpuTensor>>,
 }
 
 /// Generate `n` FWHT sign values (+1.0 / -1.0) from a simple LCG seeded with `seed`.
@@ -857,54 +859,7 @@ impl Gpu {
             replay_graph_cache: HashMap::new(),
             replay_warmed_up: HashSet::new(),
             replay_capturing_n: None,
-            scratch: crate::scratch::ScratchState {
-                mq_signs1: None,
-                mq_signs2: None,
-                mq_signs1_128: None,
-                mq_signs2_128: None,
-                mq_x_rot: None,
-                mq_x_rot_fp8: None,
-                mq_x_rot_fp8_bytes: 0,
-                mq_x_q8: None,
-                mq_x_scales: None,
-                paro_x_scratch: None,
-                paro_fused_scratch: None,
-                fp16_x_scratch: None,
-                fp16_x_scratch_bytes: 0,
-                fp16_x_source_ptr: std::ptr::null_mut(),
-                fp8_x_scratch: None,
-                fp8_x_scratch_bytes: 0,
-                fp8_x_source_ptr: std::ptr::null_mut(),
-                q8_1_mmq_x_scratch: None,
-                q8_1_mmq_x_scratch_bytes: 0,
-                ksplit_det_partials: None,
-                ksplit_det_partials_bytes: 0,
-            },
-            mmq_screen: MmqScreenState {
-                cache: HashMap::new(),
-                enabled: mmq_screen,
-                threshold: mmq_screen_threshold,
-            },
-            graphs: crate::graph::GraphState {
-                capture_mode: false,
-                capture_blobs: Vec::new(),
-                graph_exec: None,
-                captured_graph: None,
-                ar_forward_kernel_dirty: true,
-                ar_forward_replay_enabled: false,
-                verify: crate::graph::PerBGraphCache {
-                    cache: std::collections::HashMap::new(),
-                    warmed_up: std::collections::HashSet::new(),
-                    capturing: None,
-                    lmhead_argmax: std::collections::HashSet::new(),
-                },
-                replay: crate::graph::PerBGraphCache {
-                    cache: std::collections::HashMap::new(),
-                    warmed_up: std::collections::HashSet::new(),
-                    capturing: None,
-                    lmhead_argmax: std::collections::HashSet::new(),
-                },
-            },
+            paro_fused_scratch: None,
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
             capture_handler: None,
@@ -2782,11 +2737,6 @@ impl Gpu {
         self.graph_destroy();
         self.verify_graph_destroy_all();
         self.replay_graph_destroy_all();
-        self.graphs.graph_destroy(&self.hip, self.device_id);
-        self.graphs
-            .verify_graph_destroy_all(&self.hip, self.device_id);
-        self.graphs
-            .replay_graph_destroy_all(&self.hip, self.device_id);
     }
 
     /// Drop captured graph state after a live KV layout switch so the next
@@ -3270,7 +3220,7 @@ impl Gpu {
         ];
 
         let grid_x = (m / 8) as u32;
-        let bytes = crate::profile::gemv_paro4g128_bytes(m, k);
+        let bytes = crate::profile::gemv_paro4g128_prerotated_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_paro4g128", bytes);
         let result = self.launch_maybe_blob(
             "gemv_paro4g128",
@@ -3336,7 +3286,7 @@ impl Gpu {
         ];
 
         let grid_x = (m / 8) as u32;
-        let bytes = crate::profile::gemv_paro4g128_bytes(m, k) + m * 4;
+        let bytes = crate::profile::gemv_paro4g128_prerotated_bytes(m, k) + m * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemv", "gemv_paro4g128_residual", bytes);
         let result = self.launch_maybe_blob(
@@ -3406,7 +3356,7 @@ impl Gpu {
         ];
 
         let grid_x = (m / 8) as u32;
-        let bytes = crate::profile::gemv_paro4g128_bytes(m, k) + k * 4 + m * 4;
+        let bytes = crate::profile::gemv_paro4g128_prerotated_bytes(m, k) + k * 4 + m * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemv", "gemv_paro4g128_swiglu_residual", bytes);
         let result = self.launch_maybe_blob(
@@ -3474,7 +3424,7 @@ impl Gpu {
         ];
 
         let grid_x = (m / 8) as u32;
-        let bytes = crate::profile::gemv_paro4g128_bytes(m, k);
+        let bytes = crate::profile::gemv_paro4g128_prerotated_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_paro4g128t_direct", bytes);
         let result = self.launch_maybe_blob(
             "gemv_paro4g128t_direct",
@@ -3539,7 +3489,7 @@ impl Gpu {
         ];
 
         let grid_x = (m / 8) as u32;
-        let bytes = crate::profile::gemv_paro4g128_bytes(m, k) + m * 4;
+        let bytes = crate::profile::gemv_paro4g128_prerotated_bytes(m, k) + m * 4;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "gemv",
@@ -3616,7 +3566,7 @@ impl Gpu {
         ];
 
         let groups = (k / 128) as u32;
-        let bytes = crate::profile::paro4g128_rotate_bytes(m, k);
+        let bytes = crate::profile::paro4g128t_rotate_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "format", "paro4g128_rotate", bytes);
         let result = self.launch_maybe_blob(
             "paro4g128_rotate",
@@ -3691,7 +3641,7 @@ impl Gpu {
         ];
 
         let groups = (k / 128) as u32;
-        let bytes = crate::profile::paro4g128_rotate_bytes(m, k) + k * 4;
+        let bytes = crate::profile::paro4g128t_rotate_bytes(m, k) + k * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "format", "paro4g128_swiglu_rotate", bytes);
         let result = self.launch_maybe_blob(
@@ -33434,6 +33384,7 @@ impl Gpu {
         signs2: &GpuTensor,
         n_kv_heads: usize,
         head_dim: usize,
+        _v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_givens4_kernel(
@@ -33542,6 +33493,7 @@ impl Gpu {
         signs2: &GpuTensor,
         n_kv_heads: usize,
         head_dim: usize,
+        _v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_givens4_kernel(
@@ -33861,6 +33813,7 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         batch_size: usize,
+        _v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_k_batched(
@@ -33923,6 +33876,7 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         batch_size: usize,
+        _v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_k_batched(
@@ -34072,6 +34026,7 @@ impl Gpu {
             None,
             0,
             0,
+            0,
         )
     }
 
@@ -34097,6 +34052,7 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        _v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -34185,6 +34141,7 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
         partials: &GpuTensor,
+        _v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -34290,6 +34247,7 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         batch_size: usize,
+        _v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_givens4_kernel(
@@ -34470,6 +34428,7 @@ impl Gpu {
             None,
             0,
             0,
+            0,
         )
     }
 
@@ -34494,6 +34453,7 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        _v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -34538,6 +34498,7 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
         partials: &GpuTensor,
+        _v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -34813,6 +34774,7 @@ impl Gpu {
         signs2: &GpuTensor,
         n_kv_heads: usize,
         head_dim: usize,
+        _v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_givens4_kernel(
@@ -34987,6 +34949,7 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
         partials: &GpuTensor,
+        _v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -35103,6 +35066,7 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
         partials: &GpuTensor,
+        _v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -42586,6 +42550,80 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    // ── Stubs for dispatch-unification features not yet implemented ───────
+
+    pub fn attention_dflash_wmma_m64_n32_f16kv_v5_f32(
+        &mut self,
+        _q: &GpuTensor, _k: &GpuTensor, _v: &GpuTensor, _out: &GpuTensor,
+        _n: usize, _seq_len: usize, _n_heads: usize, _n_kv_heads: usize, _head_dim: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(801, "not yet implemented"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_asym4_wmma_tile_batched(
+        &mut self,
+        _q: &GpuTensor, _k_cache: &GpuTensor, _v_cache: &GpuTensor,
+        _out: &GpuTensor, _positions: &GpuTensor,
+        _ct: &GpuTensor, _st: &GpuTensor,
+        _n_heads: usize, _n_kv_heads: usize, _head_dim: usize,
+        _physical_cap: usize, _max_ctx_len: usize, _batch_size: usize,
+        _partials: &GpuTensor, _tree_bias: Option<&GpuTensor>,
+        _block_start: usize, _block_cols: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(801, "not yet implemented"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_asym4_wmma_tile_batched_gfx12(
+        &mut self,
+        _q: &GpuTensor, _k_cache: &GpuTensor, _v_cache: &GpuTensor,
+        _out: &GpuTensor, _positions: &GpuTensor,
+        _ct: &GpuTensor, _st: &GpuTensor,
+        _n_heads: usize, _n_kv_heads: usize, _head_dim: usize,
+        _physical_cap: usize, _max_ctx_len: usize, _batch_size: usize,
+        _partials: &GpuTensor, _tree_bias: Option<&GpuTensor>,
+        _block_start: usize, _block_cols: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(801, "not yet implemented"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_gate_up_q8_0(
+        &mut self,
+        _w_gate: &GpuTensor, _w_up: &GpuTensor, _x: &GpuTensor,
+        _gate: &GpuTensor, _up: &GpuTensor,
+        _m_gate: usize, _m_up: usize, _k: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(801, "not yet implemented"))
+    }
+
+    pub fn gemm_f16_wmma_mb4(
+        &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.gemm_f16(w, x, y, m, k, n)
+    }
+
+    pub fn gemm_f16_wmma_mb8(
+        &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.gemm_f16(w, x, y, m, k, n)
+    }
+
+    pub fn ensure_paro_fused_scratch(&mut self, k: usize) -> HipResult<()> {
+        if self.paro_fused_scratch.is_none() || self.paro_fused_scratch.as_ref().unwrap()[0].shape[0] < k {
+            let mut bufs = Vec::with_capacity(4);
+            for _ in 0..4 {
+                let buf = self.pool.alloc(&self.hip, k * 4)?;
+                bufs.push(GpuTensor { buf, shape: vec![k], dtype: crate::DType::F32 });
+            }
+            self.paro_fused_scratch = Some(bufs);
+        }
+        Ok(())
     }
 }
 

@@ -1793,6 +1793,7 @@ fn mtp_head_block_post_embedding(
                 st,
                 cfg.n_head_kv,
                 cfg.head_dim,
+                0,
             )?;
             gpu.attention_flash_fwht4(
                 &scratch.q,
@@ -1808,6 +1809,7 @@ fn mtp_head_block_post_embedding(
                 cfg.head_dim,
                 kv.inner.physical_cap,
                 &scratch.flash_partials,
+                0,
             )?;
         }
     }

@@ -41,8 +41,6 @@ description = "Inference orchestrator for RDNA GPUs"
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
 default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-lfm2moe", "arch-dots-ocr", "deltanet"]
-deltanet = ["rdna-compute/deltanet"]
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr", "deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
@@ -59,7 +57,6 @@ hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 csv = "1"
 # preserve_order: keep JSON object key insertion-order (IndexMap) instead of the
 # default BTreeMap alphabetic sort. Required so request tool-definition key order
@@ -113,8 +110,6 @@ hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
-hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
-hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-atlas = { path = "../hipfire-atlas" }
 

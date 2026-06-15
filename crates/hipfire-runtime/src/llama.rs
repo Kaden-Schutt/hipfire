@@ -635,6 +635,16 @@ pub use hipfire_dispatch::types::ShapeInfo;
 pub use hipfire_dispatch::types::KernelKey;
 pub use hipfire_dispatch::types::{GemvVariant, dtype_post_rotation_variant, dtype_rotation_plan};
 
+/// V-cache quantization tier for adaptive KV cache precision scaling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VMode { Q8, Lloyd2, Lloyd3, Lloyd4 }
+
+impl VMode {
+    pub fn bits(self) -> u32 {
+        match self { VMode::Q8 => 8, VMode::Lloyd2 => 2, VMode::Lloyd3 => 3, VMode::Lloyd4 => 4 }
+    }
+}
+
 /// How the embedding table is stored on GPU.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EmbeddingFormat {
@@ -761,7 +771,12 @@ fn dense_swiglu_residual_route(dtype: DType) -> DenseSwigluResidualRoute {
     }
 }
 
-pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
+fn _weight_gemv_legacy_deleted(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
+    // Replaced by dispatch-based weight_gemv. Kept as dead stub to avoid orphaned call sites.
+    weight_gemv(gpu, w, x, y)
+}
+
+fn _weight_gemv_legacy_deleted_old_match_stub(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
     match dense_gemv_route(w.gpu_dtype) {
         DenseGemvRoute::Mq6RotateThenMq6Prerotated => {
             gpu.ensure_mq_signs()?;
@@ -793,7 +808,7 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         DType::Q8HFQ => gpu.gemv_q8hfq(&w.buf, x, y, w.m, w.k, w.row_stride),
         DType::HFQ4G256 => gpu.gemv_hfq4g256(&w.buf, x, y, w.m, w.k),
         DType::HFQ4G128 => gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k),
-        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
+        DType::ParoQ4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -802,8 +817,7 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             };
             gpu.gemv_paro4g128_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
         }
-        DType::PARO4G128 => gpu.gemv_paro4g128(&w.buf, x, y, w.m, w.k),
-        DType::PARO4G128T => {
+        DType::ParoQ4G128 => {
             if paro_small_direct_limit().is_some_and(|limit| w.m <= limit) {
                 return gpu.gemv_paro4g128t_direct(&w.buf, x, y, w.m, w.k);
             }
@@ -923,7 +937,9 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
             gpu.gemv_mq4g256_lloyd(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
-
+        _ => weight_gemv(gpu, w, x, y),
+    }
+}
 
 pub fn weight_gemv(
     gpu: &mut Gpu,
@@ -947,8 +963,8 @@ pub fn weight_gemv(
     macro_rules! xr {
         () => {{
             GpuTensor {
-                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             }
         }};
@@ -1009,10 +1025,8 @@ pub fn weight_gemv(
                 .expect("ParoQ4G128 weight missing ParoRotation metadata");
             gpu.ensure_paro_scratch(w.k)?;
             // Alias the scratch buffer to avoid borrow conflicts with gpu methods
-            let scratch_alias = GpuTensor {
-                buf: unsafe { gpu.paro_x_scratch.as_ref().unwrap().buf.alias() },
             let xr = GpuTensor {
-                buf: unsafe { gpu.scratch.paro_x_scratch.as_ref().unwrap().buf.alias() },
+                buf: unsafe { gpu.paro_x_scratch.as_ref().unwrap().buf.alias() },
                 shape: vec![w.k],
                 dtype: DType::F32,
             };
@@ -1145,7 +1159,7 @@ pub fn fused_rmsnorm_rotate_for_paro<'a>(
         return Ok(None);
     }
     match next_linear.gpu_dtype {
-        DType::PARO4G128T => {
+        DType::ParoQ4G128 => {
             // Fast path: fused kernel emits x_rot (for next_linear's
             // prerotated GEMV) + tmp (post-rmsnorm x for subsequent linears).
             // Math identity: the kernel computes the same rmsnorm into tmp
@@ -1415,58 +1429,6 @@ pub fn weight_gemv_prerotated(
         return weight_gemv(gpu, w, x, y);
     }
 
-    match w.gpu_dtype {
-        DType::MQ4G256 => {
-            if let Some(xr) = x_rot {
-                gpu.gemv_mq4g256_prerotated(&w.buf, xr, y, w.m, w.k)
-            } else {
-                weight_gemv(gpu, w, x, y)
-            }
-        }
-        DType::MFP4G32 => {
-            if let Some(xr) = x_rot {
-                gpu.gemv_mfp4g32_prerotated(&w.buf, xr, y, w.m, w.k)
-            } else {
-                weight_gemv(gpu, w, x, y)
-            }
-        }
-        DType::MQ3G256 => {
-            if let Some(xr) = x_rot {
-                gpu.gemv_mq3g256_prerotated(&w.buf, xr, y, w.m, w.k)
-            } else {
-                weight_gemv(gpu, w, x, y)
-            }
-        }
-        DType::MQ2G256 => {
-            if let Some(xr) = x_rot {
-                gpu.gemv_mq2g256_prerotated(&w.buf, xr, y, w.m, w.k)
-            } else {
-                weight_gemv(gpu, w, x, y)
-            }
-        }
-        DType::MQ2G256Lloyd => {
-            if let Some(xr) = x_rot {
-                gpu.gemv_mq2g256_lloyd(&w.buf, xr, y, w.m, w.k)
-            } else {
-                weight_gemv(gpu, w, x, y)
-            }
-        }
-        DType::MQ3G256Lloyd => {
-            if let Some(xr) = x_rot {
-                gpu.gemv_mq3g256_lloyd(&w.buf, xr, y, w.m, w.k)
-            } else {
-                weight_gemv(gpu, w, x, y)
-            }
-        }
-        DType::MQ4G256Lloyd => {
-            if let Some(xr) = x_rot {
-                gpu.gemv_mq4g256_lloyd(&w.buf, xr, y, w.m, w.k)
-            } else {
-                weight_gemv(gpu, w, x, y)
-            }
-        }
-        DType::MQ8G256 => gpu.gemv_mq8g256_prerotated(&w.buf, y, w.m, w.k),
-        _ => weight_gemv(gpu, w, x, y),
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::WeightRef;
     use hipfire_dispatch::types::dtype_needs_rotation;
@@ -1568,7 +1530,7 @@ pub fn weight_gemv_residual(
     match w.gpu_dtype {
         DType::F16 => gpu.gemv_f16_xf32_residual(&w.buf, x, y, w.m, w.k),
         DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
-        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
+        DType::ParoQ4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -1577,19 +1539,7 @@ pub fn weight_gemv_residual(
             };
             gpu.gemv_paro4g128_residual_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
         }
-        DType::PARO4G128 => gpu.gemv_paro4g128_residual(&w.buf, x, y, w.m, w.k),
-        DType::PARO4G128T => {
-            if paro_small_direct_limit().is_some_and(|limit| w.m <= limit) {
-                return gpu.gemv_paro4g128t_direct_residual(&w.buf, x, y, w.m, w.k);
-            }
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            gpu.gemv_paro4g128t_residual_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
-        }
+        DType::ParoQ4G128 => gpu.gemv_paro4g128_residual(&w.buf, x, y, w.m, w.k),
         DType::HFQ3G256 => gpu.gemv_hfq3g256_residual(&w.buf, x, y, w.m, w.k),
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
@@ -1651,42 +1601,8 @@ pub fn weight_gemv_residual(
             };
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
             gpu.gemv_mq4g256_lloyd_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
-    use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
-    use hipfire_dispatch::types::GemvVariant;
-
-    let gemv = crate::llama::gemv_family();
-    let ctx = DispatchCtx::new(gpu);
-    let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
-
-    match w.gpu_dtype {
-        DType::HFQ4G256 | DType::HFQ3G256 | DType::HFQ6G256 => {
-            gemv.run(&ctx, gpu, &GemvParams {
-                w: &wr, x, y,
-                variant: GemvVariant::WithResidual,
-                residual: None, gate: None, up: None,
-            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
-        }
-        DType::MQ6G256 | DType::MQ4G256 | DType::MQ3G256
-        | DType::MQ3G256Lloyd | DType::MQ4G256Lloyd => {
-            gpu.ensure_mq_signs()?;
-            let xr = GpuTensor {
-                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            rotate_x_mq_for(gpu, w, x, &xr, w.k)?;
-            gemv.run(&ctx, gpu, &GemvParams {
-                w: &wr,
-                x: &xr,
-                y,
-                variant: GemvVariant::WithResidual,
-                residual: None, gate: None, up: None,
-            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
         _ => {
-            // Fallback: plain weight_gemv into a scratch, then add_inplace.
-            // Allocates a scratch each call; only used for niche dtypes.
             let tmp = gpu.alloc_tensor(&[w.m], DType::F32)?;
             weight_gemv(gpu, w, x, &tmp)?;
             gpu.add_inplace_f32(y, &tmp)?;
@@ -1803,7 +1719,7 @@ pub fn weight_gemv_swiglu_residual(
             fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_mq4g256_lloyd_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
-        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
+        DType::ParoQ4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -1820,10 +1736,10 @@ pub fn weight_gemv_swiglu_residual(
                 w_down.k,
             )
         }
-        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_SWIGLU_FUSED").is_some() => {
+        DType::ParoQ4G128 if std::env::var_os("HIPFIRE_PARO_SWIGLU_FUSED").is_some() => {
             gpu.gemv_paro4g128_swiglu_residual(&w_down.buf, gate, up, x, w_down.m, w_down.k)
         }
-        DType::PARO4G128T => {
+        DType::ParoQ4G128 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -1839,21 +1755,6 @@ pub fn weight_gemv_swiglu_residual(
                 w_down.m,
                 w_down.k,
             )
-            let xr = GpuTensor {
-                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &xr, w_down.k)?;
-            gemv.run(&ctx, gpu, &GemvParams {
-                w: &wr,
-                x: &xr,
-                y: x,
-                variant: GemvVariant::WithSwiGLUResidual,
-                residual: Some(x),
-                gate: Some(&xr),
-                up: None,
-            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
         _ => {
             // Non-MQ fallback: plain two-step.
@@ -4835,6 +4736,14 @@ impl KvCache {
     /// Check if a given KV layer ordinal is a boundary layer (first N + last N).
     pub fn is_boundary(&self, kv_ordinal: usize) -> bool {
         kv_ordinal < self.layer_is_boundary.len() && self.layer_is_boundary[kv_ordinal]
+    }
+
+    pub fn transcode_v_step(&mut self, _gpu: &mut Gpu, _new_v: crate::llama::VMode, _seq_pos: usize) -> hip_bridge::HipResult<()> {
+        Err(hip_bridge::HipError::new(801, "transcode_v_step not yet implemented"))
+    }
+
+    pub fn transcode_k_step(&mut self, _gpu: &mut Gpu, _new_k_bits: u32, _seq_pos: usize) -> hip_bridge::HipResult<()> {
+        Err(hip_bridge::HipError::new(801, "transcode_k_step not yet implemented"))
     }
 }
 
