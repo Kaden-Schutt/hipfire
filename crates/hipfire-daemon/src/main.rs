@@ -52,11 +52,12 @@ use hipfire_generate::{
     validate_generate_batch_prefill, validate_prefix_hash_preflight,
     validate_qwen35_fused_grouped_moe_prefill_batch_preflight, GenerateBatchDecodeEnvelope,
     GenerateBatchDecodeSession, GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan,
-    GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession, PrefixHashPreflightCandidate,
-    PrefixHashPreflightEnvelope, Qwen35DecodeBatchBackend, Qwen35DecodeBatchStepResult,
-    Qwen35DecodeTokenOutcome, Qwen35FusedDensePrefillInputKind, Qwen35PrefillBatchBackend,
-    Qwen35PrefillBatchResult, Qwen35PrefillCheckpointHook, Qwen35PrefillCheckpointKind,
-    Qwen35PrefillSessionResult, Qwen35PreparedPrefillSession, Qwen35SemanticBoundaryCheckpoint,
+    GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession, GenerateVLParams, ImageSource,
+    PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope, Qwen35DecodeBatchBackend,
+    Qwen35DecodeBatchStepResult, Qwen35DecodeTokenOutcome, Qwen35FusedDensePrefillInputKind,
+    Qwen35PrefillBatchBackend, Qwen35PrefillBatchResult, Qwen35PrefillCheckpointHook,
+    Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult, Qwen35PreparedPrefillSession,
+    Qwen35SemanticBoundaryCheckpoint,
 };
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -3332,24 +3333,6 @@ mod generate_batch_prefill_tests {
         assert_eq!(contract.sessions[0].cached_prefix_tokens, 8);
         assert!(contract.sessions[1].replay_as_generated_suffix);
     }
-}
-
-enum ImageSource<'a> {
-    Path(&'a str),
-    Base64(&'a str),
-}
-
-struct GenerateVLParams<'a> {
-    id: &'a str,
-    prompt: &'a str,
-    system_prompt: Option<&'a str>,
-    image_source: ImageSource<'a>,
-    temp: f32,
-    top_p: f32,
-    max_tokens: usize,
-    repeat_penalty: f32,
-    repeat_window: usize,
-    max_think_tokens: usize,
 }
 
 /// Optional DFlash speculative-decoding state. Populated when `load` supplies
