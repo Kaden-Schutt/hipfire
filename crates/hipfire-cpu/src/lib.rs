@@ -167,6 +167,110 @@ pub struct ProjectionModuleOutput {
     pub mutates_residual: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleInvocation {
+    DenseFfn(DenseFfnModuleInvocation),
+    Projection(ProjectionModuleInvocation),
+}
+
+impl ModuleInvocation {
+    pub fn module_kind(&self) -> &'static str {
+        match self {
+            Self::DenseFfn(invocation) => invocation.contract.module_kind,
+            Self::Projection(invocation) => invocation.contract.module_kind,
+        }
+    }
+
+    pub fn module_id(&self) -> &str {
+        match self {
+            Self::DenseFfn(invocation) => &invocation.contract.module_id,
+            Self::Projection(invocation) => &invocation.contract.module_id,
+        }
+    }
+
+    pub fn layer_idx(&self) -> usize {
+        match self {
+            Self::DenseFfn(invocation) => invocation.contract.layer_idx,
+            Self::Projection(invocation) => invocation.contract.layer_idx,
+        }
+    }
+
+    pub fn backend_selection(&self) -> BackendSelection {
+        match self {
+            Self::DenseFfn(invocation) => BackendSelection::new(
+                invocation.contract.preferred_backend,
+                invocation.selected_backend,
+                invocation.fallback_reason,
+            ),
+            Self::Projection(invocation) => BackendSelection::new(
+                invocation.contract.preferred_backend,
+                invocation.selected_backend,
+                invocation.fallback_reason,
+            ),
+        }
+    }
+}
+
+impl From<DenseFfnModuleInvocation> for ModuleInvocation {
+    fn from(invocation: DenseFfnModuleInvocation) -> Self {
+        Self::DenseFfn(invocation)
+    }
+}
+
+impl From<ProjectionModuleInvocation> for ModuleInvocation {
+    fn from(invocation: ProjectionModuleInvocation) -> Self {
+        Self::Projection(invocation)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ModuleOutput {
+    DenseFfn(DenseFfnModuleOutput),
+    Projection(ProjectionModuleOutput),
+}
+
+impl ModuleOutput {
+    pub fn module_kind(&self) -> &'static str {
+        match self {
+            Self::DenseFfn(output) => output.evidence.module_kind,
+            Self::Projection(output) => output.module_kind,
+        }
+    }
+
+    pub fn module_id(&self) -> &str {
+        match self {
+            Self::DenseFfn(output) => &output.evidence.module_id,
+            Self::Projection(output) => &output.module_id,
+        }
+    }
+
+    pub fn mutates_residual(&self) -> bool {
+        match self {
+            Self::DenseFfn(output) => output.mutates_residual,
+            Self::Projection(output) => output.mutates_residual,
+        }
+    }
+
+    pub fn backend_selection(&self) -> BackendSelection {
+        match self {
+            Self::DenseFfn(output) => dense_ffn_module_backend_selection(&output.evidence),
+            Self::Projection(output) => projection_module_backend_selection(output),
+        }
+    }
+}
+
+impl From<DenseFfnModuleOutput> for ModuleOutput {
+    fn from(output: DenseFfnModuleOutput) -> Self {
+        Self::DenseFfn(output)
+    }
+}
+
+impl From<ProjectionModuleOutput> for ModuleOutput {
+    fn from(output: ProjectionModuleOutput) -> Self {
+        Self::Projection(output)
+    }
+}
+
 #[derive(Debug)]
 pub struct Bf16DownShadow {
     pub w_down: Vec<f32>,
@@ -704,6 +808,27 @@ mod tests {
         assert_eq!(invocation.contract.tensor.down_cols, 11008);
         assert_eq!(invocation.selected_backend, DenseFfnBackend::GpuProduction);
         assert_eq!(invocation.fallback_reason, None);
+
+        let generic = ModuleInvocation::from(invocation.clone());
+        assert_eq!(generic.module_kind(), "qwen35_dense_ffn_swiglu_down");
+        assert_eq!(generic.module_id(), "qwen35.layers.5.mlp.swiglu_down");
+        assert_eq!(generic.layer_idx(), 5);
+        assert_eq!(
+            generic.backend_selection().selected_backend,
+            DenseFfnBackend::GpuProduction
+        );
+
+        let generic_output = ModuleOutput::from(dense_ffn_module_output(&invocation, None));
+        assert_eq!(generic_output.module_kind(), "qwen35_dense_ffn_swiglu_down");
+        assert_eq!(
+            generic_output.module_id(),
+            "qwen35.layers.5.mlp.swiglu_down"
+        );
+        assert!(generic_output.mutates_residual());
+        assert_eq!(
+            generic_output.backend_selection().oracle_backend,
+            DenseFfnBackend::CpuOracle
+        );
     }
 
     #[test]
@@ -736,6 +861,17 @@ mod tests {
         assert_eq!(
             projection_module_backend_selection(&output).preferred_backend,
             DenseFfnBackendPreference::GpuProduction
+        );
+        let generic = ModuleInvocation::from(invocation);
+        assert_eq!(generic.module_kind(), "qwen35_attention_wo_residual");
+        assert_eq!(generic.module_id(), "qwen35.layers.7.attention.wo_residual");
+        assert_eq!(generic.layer_idx(), 7);
+
+        let generic_output = ModuleOutput::from(output.clone());
+        assert_eq!(generic_output.module_kind(), "qwen35_attention_wo_residual");
+        assert_eq!(
+            generic_output.backend_selection().selected_backend,
+            DenseFfnBackend::GpuProduction
         );
         let json = projection_module_output_json(&output);
         assert_eq!(json["module_kind"], "qwen35_attention_wo_residual");
