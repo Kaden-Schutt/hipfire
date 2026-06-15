@@ -213,6 +213,89 @@ pub const OBSERVED_ADMISSION_EVIDENCE_KINDS: &[&str] = &[
     "profiling",
 ];
 
+pub const MODULE_EVIDENCE_TRIGGER_METRICS: &[&str] = &[
+    "module_kind",
+    "module_id",
+    "preferred_backend",
+    "selected_backend",
+    "oracle_backend",
+    "fallback_reason",
+    "evidence",
+    "evidence_json",
+];
+
+pub const MODULE_EVIDENCE_JSON_METRICS: &[&str] = &[
+    "module_kind",
+    "module_id",
+    "preferred_backend",
+    "selected_backend",
+    "oracle_backend",
+    "fallback_reason",
+    "drift",
+    "shape",
+    "contract",
+    "evidence",
+    "evidence_json",
+    "mutates_residual",
+];
+
+pub const MODULE_EVIDENCE_NUMERIC_METRICS: &[&str] = &[
+    "layer",
+    "hidden",
+    "intermediate",
+    "n",
+    "max_abs",
+    "mean_abs",
+    "rms",
+    "nan",
+    "inf",
+];
+
+pub fn has_module_evidence_metric(metrics: &BTreeMap<String, Value>) -> bool {
+    MODULE_EVIDENCE_TRIGGER_METRICS
+        .iter()
+        .any(|key| metrics.contains_key(*key))
+}
+
+pub fn module_evidence_metrics(metrics: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for key in MODULE_EVIDENCE_JSON_METRICS {
+        copy_json_metric(metrics, &mut out, key, key);
+    }
+    for key in MODULE_EVIDENCE_NUMERIC_METRICS {
+        copy_numeric_metric(metrics, &mut out, key, key);
+    }
+    out
+}
+
+fn copy_json_metric(
+    source: &BTreeMap<String, Value>,
+    dest: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    dest_key: &str,
+) {
+    if dest.contains_key(dest_key) {
+        return;
+    }
+    if let Some(value) = source.get(source_key) {
+        dest.insert(dest_key.to_string(), value.clone());
+    }
+}
+
+fn copy_numeric_metric(
+    source: &BTreeMap<String, Value>,
+    dest: &mut BTreeMap<String, Value>,
+    source_key: &str,
+    dest_key: &str,
+) {
+    if dest.contains_key(dest_key) {
+        return;
+    }
+    if let Some(value) = source.get(source_key).and_then(Value::as_f64) {
+        dest.insert(dest_key.to_string(), json!(value));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EvidenceRecord {
     pub battery: String,
@@ -1456,6 +1539,33 @@ mod tests {
         assert_eq!(json["prompt_path"], "benchmarks/prompts/smoke.txt");
         assert_eq!(json["metrics"]["tok_s"], 123.4);
         assert_eq!(json["elapsed_ms"], 42);
+    }
+
+    #[test]
+    fn module_evidence_metrics_select_owned_schema_fields() {
+        let mut metrics = BTreeMap::new();
+        metrics.insert("module_kind".to_string(), json!("dense_ffn_swiglu_down"));
+        metrics.insert("module_id".to_string(), json!("qwen35.layer4"));
+        metrics.insert("preferred_backend".to_string(), json!("gpu_production"));
+        metrics.insert("selected_backend".to_string(), json!("gpu_production"));
+        metrics.insert("oracle_backend".to_string(), json!("cpu_oracle"));
+        metrics.insert("fallback_reason".to_string(), json!("none"));
+        metrics.insert("drift".to_string(), json!({"max_abs": 0.001}));
+        metrics.insert("shape".to_string(), json!([1, 4096]));
+        metrics.insert("mutates_residual".to_string(), json!(false));
+        metrics.insert("layer".to_string(), json!(4));
+        metrics.insert("max_abs".to_string(), json!(0.001));
+        metrics.insert("nan".to_string(), json!(0));
+        metrics.insert("unrelated".to_string(), json!("drop"));
+
+        assert!(has_module_evidence_metric(&metrics));
+        let selected = module_evidence_metrics(&metrics);
+        assert_eq!(selected["module_kind"], json!("dense_ffn_swiglu_down"));
+        assert_eq!(selected["drift"]["max_abs"], json!(0.001));
+        assert_eq!(selected["layer"], json!(4.0));
+        assert_eq!(selected["max_abs"], json!(0.001));
+        assert_eq!(selected["nan"], json!(0.0));
+        assert!(!selected.contains_key("unrelated"));
     }
 
     #[test]

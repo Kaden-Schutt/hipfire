@@ -26,11 +26,11 @@ use hipfire_evidence::{
     evidence_artifact_index_entry_from_value_json, evidence_artifact_index_entry_json,
     evidence_artifact_json, evidence_collection_policy, evidence_metric_direction,
     evidence_record_json, extract_external_evidence_records_json, file_hash, hardware_bucket,
-    host_profile_artifact_index_entry_json, host_profile_hash, list_files,
-    prompt_artifact_index_entry_json, required_admission_evidence_requirements,
-    run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
-    standard_evidence_paths_in_dir, AdmissionArtifact as EvidenceAdmissionArtifact,
-    AdmissionEvidence as EvidenceAdmissionEvidence,
+    has_module_evidence_metric, host_profile_artifact_index_entry_json, host_profile_hash,
+    list_files, module_evidence_metrics, prompt_artifact_index_entry_json,
+    required_admission_evidence_requirements, run_metadata_artifact_json, run_provenance_json,
+    stable_hash_bytes, stable_hash_file_fallback, standard_evidence_paths_in_dir,
+    AdmissionArtifact as EvidenceAdmissionArtifact, AdmissionEvidence as EvidenceAdmissionEvidence,
     ComparisonArtifact as EvidenceComparisonArtifact, EvidenceArtifact, EvidenceArtifactCollection,
     EvidenceArtifactConfig, EvidenceArtifactDatasetStatus, EvidenceArtifactIndexContext,
     EvidenceArtifactModels, EvidenceRecord, RunMetadataArtifact, RunMetadataConfig,
@@ -3636,7 +3636,7 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
                 } else if kind == "path_c_trace" {
                     has_path_c_trace_metric(row)
                 } else if kind == "module_evidence" {
-                    has_module_evidence_metric(row)
+                    has_module_evidence_metric(&row.metrics)
                 } else {
                     batteries.contains(&row.battery)
                 }
@@ -3650,7 +3650,7 @@ fn evidence_records(kind: &str, results: &[EvalResult]) -> Vec<Value> {
                 "profiling" => select_metrics(row, PROFILING_METRICS),
                 "dflash_trace" => dflash_trace_metrics(row),
                 "path_c_trace" => path_c_trace_metrics(row),
-                "module_evidence" => module_evidence_metrics(row),
+                "module_evidence" => module_evidence_metrics(&row.metrics),
                 _ => row.metrics.clone(),
             };
             evidence_record_json(EvidenceRecord {
@@ -3764,22 +3764,6 @@ fn has_path_c_trace_metric(row: &EvalResult) -> bool {
         .and_then(Value::as_str)
         .is_some_and(|mode| mode.starts_with("path-c"))
         || row.metrics.contains_key("promotion_verdict")
-}
-
-fn has_module_evidence_metric(row: &EvalResult) -> bool {
-    has_any_metric(
-        row,
-        &[
-            "module_kind",
-            "module_id",
-            "preferred_backend",
-            "selected_backend",
-            "oracle_backend",
-            "fallback_reason",
-            "evidence",
-            "evidence_json",
-        ],
-    )
 }
 
 fn has_any_metric(row: &EvalResult, keys: &[&str]) -> bool {
@@ -3955,40 +3939,6 @@ fn path_c_trace_metrics(row: &EvalResult) -> BTreeMap<String, Value> {
         "tok_s_min_delta_pct",
         "tau_min_delta_pct",
         "max_tokens",
-    ] {
-        copy_numeric_metric(&row.metrics, &mut metrics, key, key);
-    }
-    metrics
-}
-
-fn module_evidence_metrics(row: &EvalResult) -> BTreeMap<String, Value> {
-    let mut metrics = BTreeMap::new();
-    for key in [
-        "module_kind",
-        "module_id",
-        "preferred_backend",
-        "selected_backend",
-        "oracle_backend",
-        "fallback_reason",
-        "drift",
-        "shape",
-        "contract",
-        "evidence",
-        "evidence_json",
-        "mutates_residual",
-    ] {
-        copy_json_metric(&row.metrics, &mut metrics, key, key);
-    }
-    for key in [
-        "layer",
-        "hidden",
-        "intermediate",
-        "n",
-        "max_abs",
-        "mean_abs",
-        "rms",
-        "nan",
-        "inf",
     ] {
         copy_numeric_metric(&row.metrics, &mut metrics, key, key);
     }
