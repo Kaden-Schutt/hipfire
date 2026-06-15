@@ -89,14 +89,21 @@ This is the known reason QTIP/trellis is the *only* viable 2-bit path. Do
     `encode_group` + reference `decode_group`. Consumes FWHT-rotated groups
     (`cpu_fwht_256` = the incoherence step). Unit-tested: beats uniform
     2-bit MSE by >15% on synthetic Gaussian.
-  - **C1b — real-weights quality gate (next).** Per-tensor reconstruction
-    error (QTIP vs MQ4/MQ3/MQ2) on actual 0.8B weights — a CPU proxy for
-    KLD/PPL that sidesteps the kernel chicken-and-egg (measure fidelity, not
-    a full forward).
-  - **C1c — full-model wiring.** New `--format qtip2` (per-group
-    `encode_group` across 2D weights; beam-search variant for throughput) →
-    QTIP `.hfq` + DType.
-  - **Gate:** `astrea` (or C1b proxy) vs MQ4/MQ3 BEFORE the decode kernel.
+  - **C1b ✅ DONE** — env-gated real-weights reconstruction gate
+    (`HIPFIRE_QTIP_EVAL_ST`) + `optimal_scale` (closed-form per-group LS
+    scale to store). Result on 0.8B weights: **QTIP-2/uniform-2 = 0.26
+    (~4× lower MSE), QTIP-2/uniform-3 = 1.41** (within 1.4× of 3-bit, at 2
+    bits). Decisive iso-bpw win; not yet uniform-3 parity.
+  - **C1c — better codebook (next, the gating blocker).** Reaching uniform-3
+    parity is the quality bar before the kernel. Measured: scale refit and
+    STATE_BITS=16 give little (1.41→1.34 for 16× cost). The lever is the
+    QTIP paper's tuned hash (1MAD/3INST) / structured trellis — not brute
+    force. This is the open C1 research item.
+  - **C1d — full-model wiring.** New `--format qtip2` (per-group
+    `encode_group` across 2D weights; beam-search encoder for throughput —
+    per-group Viterbi is too slow at model scale) → QTIP `.hfq` + DType.
+  - **Gate:** uniform-3-parity reconstruction (C1c) + `astrea` KLD/PPL on a
+    wired model (C1d) BEFORE the decode kernel.
 - **C2 — fused QTIP decode GEMV.** Variant of `gemv_mq2g256_lloyd.hip` with
   sliding-window trellis hash (computed codebook → ~zero LDS), reusing
   `rotate_x_mq_awq.hip`. Friction is sub-byte bit-window unpack (LDS stage
