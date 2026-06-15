@@ -7934,7 +7934,12 @@ pub fn spec_step_dflash(
         )?;
         prefix_tape.free_gpu(gpu);
         SpecRollbackReplayKind::PrefixVerify
-    } else if dflash_serial_tape_rollback_replay_from_env() && gdn_tape_opt.is_some() {
+    } else if dflash_serial_tape_rollback_replay_from_env()
+        && gdn_tape_opt.is_some()
+        // gfx115x serial-tape replay can corrupt DeltaNet state and feed NaNs
+        // into the next verifier cycle; use the conservative replay path here.
+        && !gpu.arch_caps.is_rdna3p5()
+    {
         let replay_tokens = &committed[..accept_len + 1];
         let serial_frame_start = gpu.debug_gdn_requant_frame();
         let mut serial_tape = GdnTape::new_for_config(gpu, &target.config, replay_tokens.len())?;

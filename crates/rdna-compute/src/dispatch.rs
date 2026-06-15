@@ -40613,6 +40613,11 @@ impl Gpu {
         head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // The gfx11 M16 WMMA kernel is not launch-stable on RDNA3.5 today;
+        // keep gfx115x on the scalar tiled kernel until it has its own port.
+        if self.arch_caps.is_rdna3p5() {
+            return self.attention_dflash_f32(q, k, v, out, b, l, n_heads, n_kv_heads, head_dim);
+        }
         assert!(
             head_dim % 16 == 0,
             "attention_dflash_wmma_f32: head_dim={head_dim} must be a multiple of 16 \
