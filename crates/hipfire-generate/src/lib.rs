@@ -215,6 +215,16 @@ pub struct PrefixHashPreflightCandidate {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct Qwen35SemanticBoundaryCheckpoint {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<String>,
+    pub prefix_len: usize,
+    pub hash: GenerateBatchPrefillPrefixHash,
+    pub boundary: String,
+    pub boundary_index: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct GenerateBatchDecodeEnvelope {
     pub id: String,
     pub batch_id: String,
@@ -1187,6 +1197,35 @@ mod tests {
                 "algorithm": "xxh128",
                 "value": "0123456789abcdef0123456789abcdef",
                 "prefix_len": 7
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_boundary_checkpoint_json_shape_is_stable() {
+        let checkpoint = Qwen35SemanticBoundaryCheckpoint {
+            checkpoint_id: Some("qwen35-checkpoint:batch:req-1:7".to_string()),
+            prefix_len: 7,
+            hash: GenerateBatchPrefillPrefixHash {
+                algorithm: "xxh128".to_string(),
+                value: "0123456789abcdef0123456789abcdef".to_string(),
+                prefix_len: 7,
+            },
+            boundary: "message_end".to_string(),
+            boundary_index: 1,
+        };
+        assert_eq!(
+            serde_json::to_value(checkpoint).unwrap(),
+            serde_json::json!({
+                "checkpoint_id": "qwen35-checkpoint:batch:req-1:7",
+                "prefix_len": 7,
+                "hash": {
+                    "algorithm": "xxh128",
+                    "value": "0123456789abcdef0123456789abcdef",
+                    "prefix_len": 7
+                },
+                "boundary": "message_end",
+                "boundary_index": 1
             })
         );
     }
