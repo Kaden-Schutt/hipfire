@@ -666,7 +666,6 @@ dependencies = [
  "thiserror 2.0.18",
 ]
 
-[[package]]
 name = "hipfire-arch-deepseek4"
 version = "0.2.1"
 dependencies = [
@@ -788,6 +787,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
+ "hipfire-config",
  "hipfire-daemon-adapter",
  "hipfire-daemon-protocol",
  "hipfire-model",
@@ -805,6 +805,15 @@ name = "hipfire-coherence"
 version = "0.2.1"
 dependencies = [
  "hipfire-detect",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-config"
+version = "0.2.0"
+dependencies = [
+ "dirs",
+ "serde",
  "serde_json",
 ]
 
@@ -832,6 +841,7 @@ dependencies = [
  "hipfire-daemon-adapter",
  "hipfire-daemon-protocol",
  "hipfire-generate",
+ "hipfire-prompt",
  "hipfire-runtime",
  "hipfire-state",
  "libc",
@@ -1022,8 +1032,8 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
- "dirs",
  "futures",
+ "hipfire-config",
  "hipfire-daemon-adapter",
  "hipfire-daemon-protocol",
  "hipfire-model",

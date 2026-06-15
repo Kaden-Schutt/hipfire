@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
 hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
+hipfire-config = { path = "../hipfire-config" }
 hipfire-model = { path = "../hipfire-model" }
 hipfire-server = { path = "../hipfire-server" }
 clap = { version = "4", features = ["derive", "cargo"] }

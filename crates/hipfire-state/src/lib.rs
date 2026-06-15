@@ -320,6 +320,129 @@ pub struct SequenceStatePageDescriptor {
     pub role: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SequenceStatePageOwnership {
+    ArenaOwned,
+    BackendWrapped,
+    Unsupported,
+}
+
+impl SequenceStatePageOwnership {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ArenaOwned => "arena_owned",
+            Self::BackendWrapped => "backend_wrapped",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SequenceStateEvictionPolicy {
+    ManualReleaseOnly,
+    LruCheckpoint,
+}
+
+impl SequenceStateEvictionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ManualReleaseOnly => "manual_release_only",
+            Self::LruCheckpoint => "lru_checkpoint",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SequenceStateSpillTarget {
+    Disabled,
+    Disk,
+}
+
+impl SequenceStateSpillTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Disk => "disk",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SequenceStateAllocatorPolicy {
+    pub page_ownership: SequenceStatePageOwnership,
+    pub eviction_policy: SequenceStateEvictionPolicy,
+    pub spill_target: SequenceStateSpillTarget,
+    pub copy_on_write_attach: bool,
+}
+
+impl SequenceStateAllocatorPolicy {
+    pub fn for_backend(
+        backend: SequenceStateArenaBackend,
+        descriptors: &[SequenceStatePageDescriptor],
+    ) -> Self {
+        let page_ownership = match backend {
+            SequenceStateArenaBackend::Unsupported => SequenceStatePageOwnership::Unsupported,
+            SequenceStateArenaBackend::Qwen35Wrapped => {
+                if descriptors.iter().any(|descriptor| descriptor.owns_pages) {
+                    SequenceStatePageOwnership::ArenaOwned
+                } else {
+                    SequenceStatePageOwnership::BackendWrapped
+                }
+            }
+        };
+        Self {
+            page_ownership,
+            eviction_policy: SequenceStateEvictionPolicy::ManualReleaseOnly,
+            spill_target: SequenceStateSpillTarget::Disabled,
+            copy_on_write_attach: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SequenceStateEvictionCandidate {
+    pub handle: SequenceStateHandle,
+    pub resident_bytes: usize,
+    pub last_touched_ms: u64,
+}
+
+pub fn sequence_state_allocator_policy_json(
+    policy: SequenceStateAllocatorPolicy,
+) -> serde_json::Value {
+    serde_json::json!({
+        "page_ownership": policy.page_ownership.as_str(),
+        "eviction_policy": policy.eviction_policy.as_str(),
+        "spill_target": policy.spill_target.as_str(),
+        "copy_on_write_attach": policy.copy_on_write_attach,
+    })
+}
+
+pub fn select_lru_sequence_state_eviction_candidates(
+    mut candidates: Vec<SequenceStateEvictionCandidate>,
+    target_bytes: usize,
+) -> Vec<SequenceStateEvictionCandidate> {
+    candidates.sort_by(|a, b| {
+        a.last_touched_ms
+            .cmp(&b.last_touched_ms)
+            .then_with(|| b.resident_bytes.cmp(&a.resident_bytes))
+            .then_with(|| a.handle.id.cmp(&b.handle.id))
+            .then_with(|| a.handle.generation.cmp(&b.handle.generation))
+    });
+    if target_bytes == 0 {
+        return candidates;
+    }
+    let mut selected = Vec::new();
+    let mut selected_bytes = 0usize;
+    for candidate in candidates {
+        selected_bytes = selected_bytes.saturating_add(candidate.resident_bytes);
+        selected.push(candidate);
+        if selected_bytes >= target_bytes {
+            break;
+        }
+    }
+    selected
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ModelWorkerMemoryView {
     pub model_file_bytes: usize,
@@ -376,6 +499,11 @@ pub fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_
         .iter()
         .map(sequence_state_page_descriptor_json)
         .collect();
+    let state_allocator =
+        sequence_state_allocator_policy_json(SequenceStateAllocatorPolicy::for_backend(
+            worker.state_arena_backend,
+            &worker.state_page_descriptors,
+        ));
     serde_json::json!({
         "id": worker.worker_id.value,
         "max_seq": worker.max_seq,
@@ -391,6 +519,7 @@ pub fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_
             .map(|op| op.as_str())
             .collect::<Vec<_>>(),
         "resident_sessions": worker.resident_sessions,
+        "state_allocator": state_allocator,
         "state_page_descriptor_entries": worker.state_page_descriptors.len(),
         "state_page_descriptor_bytes": descriptor_bytes,
         "state_page_descriptors": descriptors,
@@ -1360,6 +1489,88 @@ mod tests {
             "attention_kv"
         );
         assert_eq!(json["state_page_descriptors"][0]["handle"]["generation"], 7);
+        assert_eq!(json["state_allocator"]["page_ownership"], "arena_owned");
+        assert_eq!(
+            json["state_allocator"]["eviction_policy"],
+            "manual_release_only"
+        );
+        assert_eq!(json["state_allocator"]["spill_target"], "disabled");
+        assert_eq!(json["state_allocator"]["copy_on_write_attach"], false);
+    }
+
+    #[test]
+    fn allocator_policy_reports_backend_wrapped_and_unsupported_modes() {
+        let wrapped = SequenceStateAllocatorPolicy::for_backend(
+            SequenceStateArenaBackend::Qwen35Wrapped,
+            &[SequenceStatePageDescriptor {
+                session_id: "legacy".to_string(),
+                handle: SequenceStateHandle {
+                    id: "legacy".to_string(),
+                    kind: "qwen35_session".to_string(),
+                    generation: 0,
+                },
+                kind: SequenceStatePageKind::Kv,
+                label: "qwen35.kv_cache".to_string(),
+                logical_position: 1,
+                resident_bytes: 1024,
+                allocation_epoch: 0,
+                owns_pages: false,
+                shape: vec![1],
+                placement: "hip:arch5:device0".to_string(),
+                role: "resident".to_string(),
+            }],
+        );
+        assert_eq!(
+            wrapped.page_ownership,
+            SequenceStatePageOwnership::BackendWrapped
+        );
+        assert_eq!(
+            wrapped.eviction_policy,
+            SequenceStateEvictionPolicy::ManualReleaseOnly
+        );
+        assert_eq!(wrapped.spill_target, SequenceStateSpillTarget::Disabled);
+        assert!(!wrapped.copy_on_write_attach);
+
+        let unsupported =
+            SequenceStateAllocatorPolicy::for_backend(SequenceStateArenaBackend::Unsupported, &[]);
+        assert_eq!(
+            unsupported.page_ownership,
+            SequenceStatePageOwnership::Unsupported
+        );
+        assert_eq!(
+            unsupported.eviction_policy,
+            SequenceStateEvictionPolicy::ManualReleaseOnly
+        );
+    }
+
+    #[test]
+    fn lru_eviction_candidates_order_by_touch_then_bytes_then_handle() {
+        let candidate =
+            |id: &str, bytes: usize, last_touched_ms: u64| SequenceStateEvictionCandidate {
+                handle: SequenceStateHandle {
+                    id: id.to_string(),
+                    kind: "qwen35_checkpoint".to_string(),
+                    generation: 1,
+                },
+                resident_bytes: bytes,
+                last_touched_ms,
+            };
+        let selected = select_lru_sequence_state_eviction_candidates(
+            vec![
+                candidate("newer", 4096, 20),
+                candidate("old-small-b", 1024, 10),
+                candidate("old-large", 8192, 10),
+                candidate("old-small-a", 1024, 10),
+            ],
+            9000,
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.handle.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-large", "old-small-a"]
+        );
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use std::io::Write;
 
 use clap::Args;
+use hipfire_config::HipfireConfig;
 use hipfire_daemon_adapter::{find_daemon_bin, DaemonEngine};
 use hipfire_daemon_protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
-use hipfire_server::HipfireConfig;
 use serde_json::Value;
 use uuid::Uuid;
 
