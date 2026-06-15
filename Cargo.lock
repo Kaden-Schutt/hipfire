@@ -1048,6 +1048,7 @@ dependencies = [
  "hipfire-model",
  "hipfire-prompt",
  "hipfire-scheduler",
+ "hipfire-state",
  "reqwest",
  "serde",
  "serde_json",
