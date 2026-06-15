@@ -533,6 +533,72 @@ pub fn model_worker_runtime_view_json(worker: &ModelWorkerRuntimeView) -> serde_
     })
 }
 
+pub fn runtime_workers_health_json(
+    workers: &[ModelWorkerRuntimeView],
+    max_resident_workers: usize,
+    current_worker_key_id: Option<&str>,
+    resident_state_budget_bytes: usize,
+    memory_pressure_rejected_total: usize,
+    memory_pressure_last_reason: &str,
+) -> serde_json::Value {
+    let resident_workers = workers.len();
+    let state_page_descriptor_entries = workers
+        .iter()
+        .map(|worker| worker.state_page_descriptors.len())
+        .sum::<usize>();
+    let state_page_descriptor_bytes = workers
+        .iter()
+        .flat_map(|worker| worker.state_page_descriptors.iter())
+        .map(|descriptor| descriptor.resident_bytes)
+        .sum::<usize>();
+    let total_model_weight_bytes = workers
+        .iter()
+        .map(|worker| worker.memory.model_weight_bytes)
+        .sum::<usize>();
+    let total_runtime_state_bytes = workers
+        .iter()
+        .map(|worker| worker.memory.runtime_state_bytes)
+        .sum::<usize>();
+    let total_resident_bytes = workers
+        .iter()
+        .map(|worker| worker.memory.total_resident_bytes)
+        .sum::<usize>();
+    let total_evictable_state_bytes = workers
+        .iter()
+        .map(|worker| worker.memory.evictable_state_bytes)
+        .sum::<usize>();
+    let generic_state_arena = workers
+        .iter()
+        .any(|worker| worker.state_arena_backend.owns_state_pages());
+    let state_arena_backend = match workers.first() {
+        Some(worker) if workers.len() == 1 => worker.state_arena_backend.as_str(),
+        Some(_) => "mixed",
+        None => "none",
+    };
+    let worker_rows = workers
+        .iter()
+        .map(model_worker_runtime_view_json)
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "resident_workers": resident_workers,
+        "max_resident_workers": max_resident_workers,
+        "current_worker_key_id": current_worker_key_id,
+        "state_arena_backend": state_arena_backend,
+        "generic_state_arena": generic_state_arena,
+        "state_page_descriptor_entries": state_page_descriptor_entries,
+        "state_page_descriptor_bytes": state_page_descriptor_bytes,
+        "total_model_weight_bytes": total_model_weight_bytes,
+        "total_runtime_state_bytes": total_runtime_state_bytes,
+        "total_resident_bytes": total_resident_bytes,
+        "total_evictable_state_bytes": total_evictable_state_bytes,
+        "resident_state_budget_bytes": resident_state_budget_bytes,
+        "memory_pressure_rejected_total": memory_pressure_rejected_total,
+        "memory_pressure_last_reason": memory_pressure_last_reason,
+        "workers": worker_rows,
+    })
+}
+
 pub fn sequence_state_page_descriptor_json(
     descriptor: &SequenceStatePageDescriptor,
 ) -> serde_json::Value {
@@ -1496,6 +1562,86 @@ mod tests {
         );
         assert_eq!(json["state_allocator"]["spill_target"], "disabled");
         assert_eq!(json["state_allocator"]["copy_on_write_attach"], false);
+    }
+
+    #[test]
+    fn runtime_workers_health_json_reports_empty_adapter_state() {
+        let json = runtime_workers_health_json(&[], 0, None, 0, 0, "none");
+
+        assert_eq!(json["resident_workers"], 0);
+        assert_eq!(json["max_resident_workers"], 0);
+        assert_eq!(json["current_worker_key_id"], serde_json::Value::Null);
+        assert_eq!(json["state_arena_backend"], "none");
+        assert_eq!(json["generic_state_arena"], false);
+        assert_eq!(json["state_page_descriptor_entries"], 0);
+        assert_eq!(json["state_page_descriptor_bytes"], 0);
+        assert_eq!(json["workers"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn runtime_workers_health_json_aggregates_worker_views() {
+        let worker = ModelWorkerRuntimeView {
+            worker_id: ModelWorkerId {
+                value: "worker:arch6:pp1:q8".to_string(),
+            },
+            max_seq: 4096,
+            physical_cap: 2048,
+            max_resident_workers: 2,
+            resident_workers: 1,
+            state_arena_backend: SequenceStateArenaBackend::Qwen35Wrapped,
+            resident_sessions: 1,
+            state_page_descriptors: vec![SequenceStatePageDescriptor {
+                session_id: "session-a".to_string(),
+                handle: SequenceStateHandle {
+                    id: "session-a".to_string(),
+                    kind: "qwen35_session".to_string(),
+                    generation: 9,
+                },
+                kind: SequenceStatePageKind::DeltaNet,
+                label: "qwen35.deltanet".to_string(),
+                logical_position: 16,
+                resident_bytes: 2048,
+                allocation_epoch: 9,
+                owns_pages: true,
+                shape: vec![2, 16, 128],
+                placement: "hip:arch6:device0".to_string(),
+                role: "resident".to_string(),
+            }],
+            memory: ModelWorkerMemoryView {
+                model_file_bytes: 10,
+                model_weight_bytes: 20,
+                runtime_base_bytes: 30,
+                runtime_session_bytes: 40,
+                runtime_state_bytes: 70,
+                total_resident_bytes: 90,
+                evictable_state_bytes: 40,
+            },
+        };
+
+        let json = runtime_workers_health_json(
+            &[worker],
+            2,
+            Some("worker:arch6:pp1:q8"),
+            4096,
+            3,
+            "budget",
+        );
+
+        assert_eq!(json["resident_workers"], 1);
+        assert_eq!(json["max_resident_workers"], 2);
+        assert_eq!(json["current_worker_key_id"], "worker:arch6:pp1:q8");
+        assert_eq!(json["state_arena_backend"], "qwen35_wrapped");
+        assert_eq!(json["generic_state_arena"], true);
+        assert_eq!(json["state_page_descriptor_entries"], 1);
+        assert_eq!(json["state_page_descriptor_bytes"], 2048);
+        assert_eq!(json["total_model_weight_bytes"], 20);
+        assert_eq!(json["total_runtime_state_bytes"], 70);
+        assert_eq!(json["total_resident_bytes"], 90);
+        assert_eq!(json["total_evictable_state_bytes"], 40);
+        assert_eq!(json["resident_state_budget_bytes"], 4096);
+        assert_eq!(json["memory_pressure_rejected_total"], 3);
+        assert_eq!(json["memory_pressure_last_reason"], "budget");
+        assert_eq!(json["workers"][0]["state_page_descriptor_bytes"], 2048);
     }
 
     #[test]

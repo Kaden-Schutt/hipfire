@@ -135,12 +135,12 @@ fn main() {
     let args = parse_args();
 
     // 0. Sanity checks (H1 + M4): pinned llama.cpp commit + slice md5.
-    hipfire_runtime::eval_common::verify_llama_commit(
+    hipfire_evidence::verify_llama_commit(
         &args.llama_perplexity_bin,
         PINNED_LLAMACPP_COMMIT,
         "build_kld_ref",
     );
-    hipfire_runtime::eval_common::verify_slice_md5(&args.slice, "build_kld_ref");
+    hipfire_evidence::verify_slice_md5(&args.slice, "build_kld_ref");
 
     // 1. mkfifo
     let fifo_path = PathBuf::from(format!("/tmp/hipfire-kldref-{}.fifo", std::process::id()));
@@ -354,5 +354,5 @@ fn main() {
 }
 
 // verify_llama_commit and verify_slice_md5 now live in
-// hipfire_runtime::eval_common (crates/hipfire-runtime/src/eval_common.rs)
+// hipfire_evidence (crates/hipfire-evidence/src/lib.rs)
 // so the same fix applies across eval_hipfire / eval_gguf / build_kld_ref.

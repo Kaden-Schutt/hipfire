@@ -31,6 +31,23 @@ impl GenerationSamplingPolicy {
             max_tokens,
         }
     }
+
+    pub fn from_defaults(
+        default_temperature: f64,
+        default_top_p: f64,
+        default_repeat_penalty: f64,
+        default_max_tokens: u32,
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            temperature: temperature.unwrap_or(default_temperature),
+            top_p: Some(top_p.unwrap_or(default_top_p)),
+            repeat_penalty: Some(default_repeat_penalty),
+            max_tokens: max_tokens.unwrap_or(default_max_tokens),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,6 +73,20 @@ pub struct GenerateTextRequest {
 }
 
 impl GenerateTextRequest {
+    pub fn from_prompt(
+        id: String,
+        prompt: impl Into<String>,
+        sampling: GenerationSamplingPolicy,
+    ) -> Self {
+        let prompt = prompt.into();
+        let prompt_value = serde_json::Value::String(prompt.clone());
+        Self::from_openai_chat_messages(
+            id,
+            std::iter::once(("user", Some(&prompt_value))),
+            sampling,
+        )
+    }
+
     pub fn from_openai_chat_messages<'a, I>(
         id: String,
         messages: I,
@@ -79,6 +110,21 @@ impl GenerateTextRequest {
             max_think_tokens: None,
             request_id: None,
         }
+    }
+
+    pub fn with_worker_key_id(mut self, worker_key_id: Option<String>) -> Self {
+        self.worker_key_id = worker_key_id;
+        self
+    }
+
+    pub fn with_tools(mut self, tools: Option<serde_json::Value>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub fn with_system(mut self, system: Option<String>) -> Self {
+        self.system = system;
+        self
     }
 }
 
@@ -147,6 +193,70 @@ pub struct ErrorEvent {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+}
+
+pub fn openai_chat_completion_response_json(
+    req_id: &str,
+    model: &str,
+    text: &str,
+    done: &DoneEvent,
+) -> serde_json::Value {
+    let prompt_tokens = done.prefill_tokens.unwrap_or(0);
+    let completion_tokens = done.tokens;
+
+    serde_json::json!({
+        "id": format!("chatcmpl-{req_id}"),
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": text },
+            "finish_reason": openai_finish_reason(done),
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+    })
+}
+
+pub fn openai_chat_completion_token_chunk_json(
+    req_id: &str,
+    model: &str,
+    token: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("chatcmpl-{req_id}"),
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": token },
+            "finish_reason": null
+        }]
+    })
+}
+
+pub fn openai_chat_completion_done_chunk_json(
+    req_id: &str,
+    model: &str,
+    done: &DoneEvent,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("chatcmpl-{req_id}"),
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": openai_finish_reason(done)
+        }]
+    })
+}
+
+fn openai_finish_reason(done: &DoneEvent) -> &str {
+    done.finish_reason.as_deref().unwrap_or("stop")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1442,6 +1552,35 @@ mod tests {
     }
 
     #[test]
+    fn prompt_generate_request_preserves_structured_boundary() {
+        let request = GenerateTextRequest::from_prompt(
+            "req-1".to_string(),
+            "hello",
+            GenerationSamplingPolicy::greedy(8),
+        )
+        .with_worker_key_id(Some("worker-a".to_string()));
+
+        assert_eq!(request.prompt, "hello");
+        assert!(!request.prompt.contains("<|im_start|>"));
+        assert_eq!(request.worker_key_id.as_deref(), Some("worker-a"));
+        let messages = request.messages.as_ref().expect("structured messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, hipfire_prompt::Role::User);
+        assert_eq!(messages[0].content, "hello");
+    }
+
+    #[test]
+    fn sampling_policy_applies_generation_overrides() {
+        let sampling =
+            GenerationSamplingPolicy::from_defaults(0.7, 0.9, 1.05, 128, Some(0.2), None, Some(8));
+
+        assert_eq!(sampling.temperature, 0.2);
+        assert_eq!(sampling.top_p, Some(0.9));
+        assert_eq!(sampling.repeat_penalty, Some(1.05));
+        assert_eq!(sampling.max_tokens, 8);
+    }
+
+    #[test]
     fn generation_events_serialize_to_daemon_jsonl_shapes() {
         let token = GenerationEvent::Token(TokenEvent {
             id: "r1".to_string(),
@@ -1473,6 +1612,86 @@ mod tests {
                 "tokens": 42,
                 "tok_s": 44.5,
                 "finish_reason": "stop"
+            })
+        );
+    }
+
+    #[test]
+    fn openai_chat_completion_response_json_matches_server_shape() {
+        let done = DoneEvent {
+            id: "r1".to_string(),
+            tokens: 12,
+            tok_s: Some(20.0),
+            prefill_tokens: Some(5),
+            prefill_ms: None,
+            prefill_tok_s: None,
+            decode_tok_s: None,
+            ttft_ms: None,
+            finish_reason: Some("length".to_string()),
+            response_id: None,
+            extra: HashMap::new(),
+        };
+
+        assert_eq!(
+            openai_chat_completion_response_json("req-1", "qwen", "hello", &done),
+            serde_json::json!({
+                "id": "chatcmpl-req-1",
+                "object": "chat.completion",
+                "model": "qwen",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "hello" },
+                    "finish_reason": "length"
+                }],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 12,
+                    "total_tokens": 17
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn openai_chat_completion_stream_chunks_match_server_shape() {
+        let done = DoneEvent {
+            id: "r1".to_string(),
+            tokens: 1,
+            tok_s: None,
+            prefill_tokens: None,
+            prefill_ms: None,
+            prefill_tok_s: None,
+            decode_tok_s: None,
+            ttft_ms: None,
+            finish_reason: None,
+            response_id: None,
+            extra: HashMap::new(),
+        };
+
+        assert_eq!(
+            openai_chat_completion_token_chunk_json("req-1", "qwen", "T"),
+            serde_json::json!({
+                "id": "chatcmpl-req-1",
+                "object": "chat.completion.chunk",
+                "model": "qwen",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": "T" },
+                    "finish_reason": null
+                }]
+            })
+        );
+        assert_eq!(
+            openai_chat_completion_done_chunk_json("req-1", "qwen", &done),
+            serde_json::json!({
+                "id": "chatcmpl-req-1",
+                "object": "chat.completion.chunk",
+                "model": "qwen",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
             })
         );
     }

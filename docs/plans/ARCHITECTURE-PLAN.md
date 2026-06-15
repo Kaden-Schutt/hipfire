@@ -18,6 +18,7 @@ The target crates for modular boundaries remain:
 - `hipfire-daemon`
 - `hipfire-config` (created; owns shared CLI/server config and local path helpers)
 - `hipfire-eval` (created; owns the eval runner binary adapter and harness implementation)
+- `hipfire-hash` (created; owns stable file/byte hash primitives shared by model and evidence contracts)
 - `hipfire-model` (created; owns model-source contracts and artifact identity helpers)
 - `hipfire-prompt` (created; owns prompt framing and Jinja rendering)
 - `hipfire-state`
@@ -27,7 +28,7 @@ The target crates for modular boundaries remain:
 - `hipfire-npu` (created; owns NPU opt-in artifact/admission contracts)
 - `hipfire-daemon-adapter` (created; owns daemon JSONL process-client adapter)
 - `hipfire-daemon-protocol` (created; owns daemon JSONL request/response contracts)
-- `hipfire-evidence` (created; owns evidence provenance, host-profile contracts/policy, and hash helpers)
+- `hipfire-evidence` (created; owns evidence provenance, host-profile contracts/policy, and evidence hash policy)
 
 A `bun`-free control plane remains desirable but is deferred behind verified seam extraction.
 
@@ -36,6 +37,7 @@ Current prompt boundary status:
 - `hipfire-prompt` owns OpenAI chat-role/content conversion helpers used by the Rust server to build structured daemon messages and last-user prompt fallbacks.
 - `hipfire-prompt` owns assistant-turn prompt-history fingerprinting and canonical tool-call argument JSON used by daemon multi-turn prefix-cache identity.
 - `hipfire-prompt` owns assistant-prefix wire-label parsing for `plain`, `open_think`, and `closed_think` request paths.
+- `hipfire-prompt` owns load-time chat-template source resolution for env-file, per-model override file, and embedded model-template precedence.
 - `hipfire-runtime::prompt_frame` remains a compatibility re-export and implements the prompt tokenizer trait for the runtime tokenizer.
 - `hipfire-daemon` now consumes `hipfire-prompt` directly for daemon prompt framing, assistant-prefix labels, tool-call fingerprints, and structured message history instead of routing those types through the runtime compatibility facade.
 - The Rust server forwards structured chat `messages` to the daemon and keeps `prompt` as the last-user-text compatibility fallback, avoiding nested ChatML.
@@ -50,21 +52,25 @@ Current model boundary status:
 - `hipfire-model` owns model-source opening policy for HFQ files and safetensors directories while runtime supplies the concrete loader constructors.
 - `hipfire-model` owns common model-load request/parameter and loaded-response contracts used by daemon protocol clients and future direct library adapters.
 - `hipfire-model` owns common model-load parameter construction from config values, including `auto` mode elision, explicit `dflash_mode=off`, and empty sidecar filtering, now consumed by both Rust server and CLI run load paths.
-- `hipfire-model` owns eval model-manifest row construction for local-file/tag identity, file/tag hashes, HFQ metadata hashes, architecture IDs, embedded quantization hashes, and model-specific hash/HFQ metadata compatibility helpers consumed by evidence/runtime paths.
+- `hipfire-model` owns eval model-manifest row construction for local-file/tag identity, file/tag hashes, HFQ metadata hashes, architecture IDs, embedded quantization hashes, and model-specific hash/HFQ metadata compatibility helpers consumed by evidence/runtime paths. Its public hash helpers are compatibility re-exports from `hipfire-hash`.
+- `hipfire-model` owns OpenAI-compatible `/v1/models` list response rendering consumed by the Rust server.
 - `hipfire-runtime::model_source` remains a compatibility facade and still owns concrete HFQ/safetensors opener constructors until those loaders move.
 
 Current state boundary status:
-- `hipfire-state` owns sequence-state handles, Qwen3.5 session/checkpoint handle policy, parsed handle contracts, prefix-hash data shapes, reserve/describe/release/release-sessions/unload-worker/fork/checkpoint request metadata, checkpoint source-residency, prefix-hash, and logical-position validation policy, page descriptors, model artifact memory accounting, worker memory/runtime view structs, model-worker id/request alias policy helpers, arena backend support policy, generic reservation helpers, allocator/spill policy vocabulary, LRU checkpoint eviction candidate ordering, and JSON rendering for state descriptors, reserve-session success/rejection responses, `describe_state_done` responses, release-state responses, release-sessions responses, unload-worker responses, and worker allocator policy status.
+- `hipfire-state` owns sequence-state handles, Qwen3.5 session/checkpoint handle policy, parsed handle contracts, prefix-hash data shapes, reserve/describe/release/release-sessions/unload-worker/fork/checkpoint request metadata, checkpoint source-residency, prefix-hash, and logical-position validation policy, page descriptors, model artifact memory accounting, worker memory/runtime view structs, model-worker id/request alias policy helpers, arena backend support policy, generic reservation helpers, allocator/spill policy vocabulary, LRU checkpoint eviction candidate ordering, and JSON rendering for state descriptors, reserve-session success/rejection responses, `describe_state_done` responses, release-state responses, release-sessions responses, unload-worker responses, worker allocator policy status, and runtime-workers health summaries.
 - `hipfire-daemon` consumes the shared checkpoint request metadata while still owning loaded-model state maps, Qwen3.5 checkpoint attach/fork/release behavior, and backend-specific GPU state materialization.
 
 Current scheduler boundary status:
-- `hipfire-scheduler` owns Rust parity contracts for priority classes, prefill/decode scheduler policy, model-worker compatibility, request-session drafts, prefill queue selection, decode active-set batching, backpressure, opportunistic dispatch, and deadline aging.
+- `hipfire-scheduler` owns Rust parity contracts for priority classes, prefill/decode scheduler policy, model-worker compatibility, request-session drafts, prefill queue selection, decode active-set batching, backpressure, opportunistic dispatch, deadline aging, and server health JSON contracts for scheduler-derived prefill/decode/state-cache metadata.
 - `hipfire-scheduler` re-exports model-owned worker-key identity helpers so existing scheduler callers keep stable paths while model placement identity ownership moves into `hipfire-model`.
-- Bun scheduler code remains the live server control plane until Rust server paths consume the shared scheduler crate.
+- Rust server `/health` consumes scheduler-owned health JSON builders while live Rust request queuing remains daemon-serial.
+- Bun scheduler code remains the live batching control plane until Rust server request paths consume the shared scheduler queue/session contracts.
 
 Current generate boundary status:
 - `hipfire-generate` owns typed generation sampling policy, text/VL generation request structs, generation event structs, generate-batch prefill/decode envelopes, semantic boundary checkpoint and prefill checkpoint hook contracts, prepared prefill/result and fused dense batch contract types, decode step result contracts, batch/preflight JSON validation, `prefix_hash_preflight_done` response rendering, Qwen3.5 `generate_batch_prefill_session_done`/`generate_batch_prefill_done` response rendering, Qwen3.5 `generate_batch_decode_step_done` response rendering, Qwen3.5 prefix-hash compute/JSON helpers over the state-owned hash shape, Qwen3.5 prefill/decode backend plan and selector policy, fused prefill preflight helpers, prefill scratch batch sizing policy, and scheduler metadata helpers.
 - `hipfire-generate` owns OpenAI chat-message to structured text-generate request construction, including the last-user `prompt` compatibility fallback and full `messages` forwarding.
+- `hipfire-generate` owns OpenAI chat completion and streaming chunk JSON response rendering consumed by the Rust server.
+- `hipfire-generate` owns prompt-only structured text-generate request construction, generation sampling default/override merging, and worker/tools/system request decoration consumed by Rust server and CLI daemon adapters.
 - `hipfire-cli run` consumes `hipfire-generate` structured text-generate request construction through the daemon protocol re-export instead of pre-rendering ChatML locally.
 - `hipfire-generate` consumes model-owned architecture classification for Qwen3.5 dense/MoE batch backend decisions instead of owning local arch-id constants.
 - `hipfire-daemon-protocol` re-exports the generate-owned text request and token/done/error event structs for daemon JSONL generate traffic, so the protocol crate no longer owns duplicate generate contracts.
@@ -92,23 +98,25 @@ Current daemon protocol boundary status:
 - `hipfire-daemon-protocol` re-exports the model-owned load request/params and loaded response so protocol callers keep stable paths while load contract ownership moves into `hipfire-model`.
 
 Current daemon adapter boundary status:
-- `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery, load/ping/unload/generate response loops, stale-response filtering, and daemon startup resource lease policy/helpers.
+- `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery and missing-binary diagnostics, load/ping/unload/generate response loops, stale-response filtering, and daemon startup resource lease policy/helpers.
 - `hipfire-cli run` consumes `hipfire-daemon-adapter` and `hipfire-daemon-protocol` directly for daemon-backed execution instead of reaching those contracts through the server crate.
 - `hipfire-server` consumes `hipfire-daemon-adapter` directly for daemon-backed execution; the old server-local engine re-export has been retired.
+- `hipfire-coherence` consumes `hipfire-daemon-adapter` for daemon binary discovery while retaining its coherence-specific raw JSONL runner and detector orchestration.
 
 Current config boundary status:
 - `hipfire-config` owns `HipfireConfig`, config-file loading, per-model override merging, and `~/.hipfire` / model-directory path helpers.
-- `hipfire-cli` consumes `hipfire-config` directly for config and local model discovery paths; `hipfire-server::config` remains a compatibility facade for existing imports.
+- `hipfire-cli` and `hipfire-server` consume `hipfire-config` directly for config and local model discovery paths; the old `hipfire-server::config` compatibility facade has been retired.
 
 Current evidence boundary status:
-- `hipfire-evidence` owns stable evidence hash helpers, directory digest, file hash, eval status, host-profile and sourced-field contracts, host-profile hardware-kind/bucket/bandwidth/hash policy, model/tag hash and HFQ metadata compatibility wrappers that delegate to `hipfire-model`, eval reference/slice/llama integrity verifiers, the standard evidence artifact catalog, catalog-based evidence artifact directory discovery, evidence artifact collection status policy, standard evidence artifact contract/JSON rendering, comparison/admission artifact contract rendering, admission required/observed evidence catalogs, the generic evidence artifact record contract/JSON renderer, external evidence record selection/annotation, quality/performance/phase-timing/memory/launch-count/MoE-router/profiling/module-evidence/DFlash-trace/Path-C-trace metric detection/projection policies, comparison metric-direction policy, admission quality/review policy, admission verdict policy, run-provenance contract/JSON rendering, run-metadata artifact contract/JSON rendering, and artifact-index entry contract/JSON rendering.
+- `hipfire-hash` owns stable byte hash, file hash, fallback file hash, and deterministic score primitives used by model identity and evidence records.
+- `hipfire-evidence` owns stable evidence hash policy, directory digest, eval status, host-profile and sourced-field contracts, host-profile hardware-kind/bucket/bandwidth/hash policy, model/tag hash and HFQ metadata compatibility wrappers that delegate to `hipfire-model`, compatibility hash helper exports from `hipfire-hash`, eval reference/slice/llama integrity verifiers, the standard evidence artifact catalog, catalog-based evidence artifact directory discovery, evidence artifact collection status policy, standard evidence artifact contract/JSON rendering, comparison/admission artifact contract rendering, admission required/observed evidence catalogs, the generic evidence artifact record contract/JSON renderer, external evidence record selection/annotation, quality/performance/phase-timing/memory/launch-count/MoE-router/profiling/module-evidence/DFlash-trace/Path-C-trace metric detection/projection policies, comparison metric-direction policy, admission quality/review policy, admission verdict policy, run-provenance contract/JSON rendering, run-metadata artifact contract/JSON rendering, and artifact-index entry contract/JSON rendering.
 - `hipfire-evidence` owns comparison, admission, prompt-ledger, and host-profile artifact-index entry variants so eval no longer mutates those index JSON shapes locally.
 - `hipfire-eval` owns the `hipfire-eval` binary adapter, eval execution, artifact writing, and harness implementation. It consumes shared model, evidence, and coherence crates directly for model identity, artifact/provenance rendering, and daemon-backed coherence rows.
-- `hipfire-runtime::eval_common` remains a compatibility facade for evidence-owned eval integrity verifiers, and `hipfire-runtime::eval_harness` remains a compatibility facade for the `hipfire-eval` harness while downstream callers migrate.
+- Runtime examples now consume `hipfire-evidence` eval integrity verifiers directly, and the old `hipfire-runtime::eval_common` compatibility facade has been retired; `hipfire-runtime::eval_harness` remains a compatibility facade for the `hipfire-eval` harness while downstream callers migrate.
 
 Current coherence boundary status:
-- `hipfire-coherence` owns detector profile selection, detector-bank construction, agentic prompt detection, coherence run input/output contracts, report row serialization, coherence artifact serialization, daemon binary discovery, daemon-backed coherence execution, prompt execution, token event capture, and detector report assembly.
-- `hipfire-runtime::coherence_runtime` remains a compatibility facade for existing `coherence_probe` and eval-harness callers while coherence ownership lives in `hipfire-coherence`.
+- `hipfire-coherence` owns detector profile selection, detector-bank construction, agentic prompt detection, coherence run input/output contracts, report row serialization, coherence artifact serialization, daemon-backed coherence execution, prompt execution, token event capture, and detector report assembly.
+- Runtime `coherence_probe` and eval harness paths now consume `hipfire-coherence` directly; the old `hipfire-runtime::coherence_runtime` compatibility facade has been retired.
 
 ## 3) Execution sequence
 

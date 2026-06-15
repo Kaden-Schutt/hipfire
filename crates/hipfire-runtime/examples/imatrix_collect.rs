@@ -43,7 +43,6 @@
 //! Output: a GGUF file at `--output`. Consumed in Step 5 (L5c
 //! activation-weighted LS) by reading via the existing `gguf_input.rs`.
 
-use hipfire_runtime::eval_common;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -175,7 +174,7 @@ fn main() {
     // GGUF anchor numbers — otherwise tokenization (which differs across
     // llama.cpp versions in subtle ways) yields different activation
     // statistics and the imatrix is silently miscalibrated.
-    eval_common::verify_llama_commit(
+    hipfire_evidence::verify_llama_commit(
         &args.llama_imatrix_bin,
         PINNED_LLAMACPP_COMMIT,
         "imatrix_collect",

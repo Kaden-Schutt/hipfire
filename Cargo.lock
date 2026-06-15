@@ -805,6 +805,7 @@ dependencies = [
 name = "hipfire-coherence"
 version = "0.2.1"
 dependencies = [
+ "hipfire-daemon-adapter",
  "hipfire-detect",
  "serde_json",
 ]
@@ -921,6 +922,7 @@ dependencies = [
 name = "hipfire-evidence"
 version = "0.2.1"
 dependencies = [
+ "hipfire-hash",
  "hipfire-model",
  "serde",
  "serde_json",
@@ -939,9 +941,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-hash"
+version = "0.2.1"
+
+[[package]]
 name = "hipfire-model"
 version = "0.2.1"
 dependencies = [
+ "hipfire-config",
+ "hipfire-hash",
  "serde",
  "serde_json",
 ]
@@ -1024,6 +1032,7 @@ name = "hipfire-scheduler"
 version = "0.2.1"
 dependencies = [
  "hipfire-model",
+ "serde_json",
 ]
 
 [[package]]
@@ -1037,8 +1046,11 @@ dependencies = [
  "hipfire-config",
  "hipfire-daemon-adapter",
  "hipfire-daemon-protocol",
+ "hipfire-generate",
  "hipfire-model",
  "hipfire-prompt",
+ "hipfire-scheduler",
+ "hipfire-state",
  "reqwest",
  "serde",
  "serde_json",

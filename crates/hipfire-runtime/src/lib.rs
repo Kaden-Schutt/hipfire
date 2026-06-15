@@ -17,7 +17,6 @@ pub mod arch;
 pub mod bf16_loader;
 #[cfg(feature = "deltanet")]
 pub mod cask;
-pub mod coherence_runtime;
 pub mod config;
 #[cfg(feature = "deltanet")]
 pub mod cpu_router;
@@ -28,7 +27,6 @@ pub mod dflash;
 pub mod env_docs;
 pub mod eos_filter;
 pub mod ep;
-pub mod eval_common;
 pub mod eval_harness;
 pub mod gguf;
 pub mod hfq;

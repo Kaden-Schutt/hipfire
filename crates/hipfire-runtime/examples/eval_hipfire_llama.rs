@@ -130,7 +130,7 @@ fn main() {
     );
 
     // -------- ref sha256 sanity (shared with eval_hipfire) --------
-    hipfire_runtime::eval_common::verify_ref_sha256(&args.ref_path, "eval_hipfire_llama");
+    hipfire_evidence::verify_ref_sha256(&args.ref_path, "eval_hipfire_llama");
 
     // -------- load model via Architecture trait --------
     let mut hfq = HfqFile::open(&args.model).expect("open model");

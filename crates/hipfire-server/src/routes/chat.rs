@@ -15,8 +15,12 @@ use uuid::Uuid;
 use crate::model::discovery::find_model;
 use crate::state::SharedState;
 use hipfire_config::HipfireConfig;
-use hipfire_daemon_adapter::{find_daemon_bin, DaemonEngine};
+use hipfire_daemon_adapter::{find_daemon_bin_or_error, DaemonEngine};
 use hipfire_daemon_protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
+use hipfire_generate::{
+    openai_chat_completion_done_chunk_json, openai_chat_completion_response_json,
+    openai_chat_completion_token_chunk_json,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -49,13 +53,7 @@ pub async fn post_chat_completions(
 }
 
 fn load_params_from_config(cfg: &HipfireConfig) -> LoadParams {
-    LoadParams::from_common_config_values(
-        cfg.max_seq,
-        &cfg.kv_cache,
-        &cfg.flash_mode,
-        &cfg.dflash_mode,
-        cfg.cask_sidecar.as_deref(),
-    )
+    LoadParams::from_hipfire_config(cfg)
 }
 
 fn generate_request_from_chat(
@@ -66,17 +64,16 @@ fn generate_request_from_chat(
     tools: Option<Value>,
     system: Option<String>,
 ) -> GenerateRequest {
-    let mut req = GenerateRequest::from_openai_chat_messages(
+    GenerateRequest::from_openai_chat_messages(
         id,
         messages
             .iter()
             .map(|message| (message.role.as_str(), message.content.as_ref())),
         sampling,
-    );
-    req.worker_key_id = worker_key_id;
-    req.tools = tools;
-    req.system = system;
-    req
+    )
+    .with_worker_key_id(worker_key_id)
+    .with_tools(tools)
+    .with_system(system)
 }
 
 async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(), String> {
@@ -95,10 +92,7 @@ async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(),
         }
     }
 
-    let bin = find_daemon_bin().ok_or_else(|| {
-        "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`"
-            .to_string()
-    })?;
+    let bin = find_daemon_bin_or_error().map_err(|e| e.to_string())?;
 
     let mut engine = DaemonEngine::spawn(&bin).await.map_err(|e| e.to_string())?;
 
@@ -147,12 +141,15 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
         generate_request_from_chat(
             req_id.clone(),
             &body.messages,
-            GenerationSamplingPolicy {
-                temperature: body.temperature.unwrap_or(cfg.temperature),
-                max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
-                top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
-                repeat_penalty: Some(cfg.repeat_penalty),
-            },
+            GenerationSamplingPolicy::from_defaults(
+                cfg.temperature,
+                cfg.top_p,
+                cfg.repeat_penalty,
+                cfg.max_tokens,
+                body.temperature,
+                body.top_p,
+                body.max_tokens,
+            ),
             worker_key_id,
             body.tools,
             body.system,
@@ -171,27 +168,10 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
     };
 
     match engine.generate(gen_req).await {
-        Ok((text, done)) => {
-            let finish_reason = done.finish_reason.as_deref().unwrap_or("stop");
-            let prompt_tokens = done.prefill_tokens.unwrap_or(0);
-            let completion_tokens = done.tokens;
-            Json(json!({
-                "id": format!("chatcmpl-{req_id}"),
-                "object": "chat.completion",
-                "model": model_arg,
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": text },
-                    "finish_reason": finish_reason,
-                }],
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens,
-                }
-            }))
-            .into_response()
-        }
+        Ok((text, done)) => Json(openai_chat_completion_response_json(
+            &req_id, &model_arg, &text, &done,
+        ))
+        .into_response(),
         Err(e) => Json(json!({"error": {"message": e.to_string(), "type": "server_error"}}))
             .into_response(),
     }
@@ -235,12 +215,15 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
             generate_request_from_chat(
                 req_id.clone(),
                 &body.messages,
-                GenerationSamplingPolicy {
-                    temperature: body.temperature.unwrap_or(cfg.temperature),
-                    max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
-                    top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
-                    repeat_penalty: Some(cfg.repeat_penalty),
-                },
+                GenerationSamplingPolicy::from_defaults(
+                    cfg.temperature,
+                    cfg.top_p,
+                    cfg.repeat_penalty,
+                    cfg.max_tokens,
+                    body.temperature,
+                    body.top_p,
+                    body.max_tokens,
+                ),
                 worker_key_id,
                 body.tools,
                 body.system,
@@ -263,24 +246,15 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
 
         let result = engine
             .generate_streaming(gen_req, move |token| {
-                let chunk = json!({
-                    "id": format!("chatcmpl-{req_id_cb}"),
-                    "object": "chat.completion.chunk",
-                    "model": model_cb,
-                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": null}]
-                });
-                let _ = tx_cb.try_send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                let chunk = openai_chat_completion_token_chunk_json(&req_id_cb, &model_cb, &token);
+                let _ = tx_cb.try_send(Ok(
+                    Event::default().data(serde_json::to_string(&chunk).unwrap())
+                ));
             })
             .await;
 
         if let Ok(done) = result {
-            let finish_reason = done.finish_reason.as_deref().unwrap_or("stop");
-            let final_chunk = json!({
-                "id": format!("chatcmpl-{req_id}"),
-                "object": "chat.completion.chunk",
-                "model": model_arg,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
-            });
+            let final_chunk = openai_chat_completion_done_chunk_json(&req_id, &model_arg, &done);
             let _ = tx
                 .send(Ok(
                     Event::default().data(serde_json::to_string(&final_chunk).unwrap())

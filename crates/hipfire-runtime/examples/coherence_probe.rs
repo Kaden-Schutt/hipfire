@@ -36,6 +36,7 @@
 //! Self-check (no GPU needed):
 //!     coherence_probe --self-check
 
+use hipfire_coherence::{run_coherence, CoherenceRunConfig, DetectorProfile};
 use hipfire_detect::{self_check, Severity, Verdict};
 
 #[derive(Debug, Default)]
@@ -505,15 +506,12 @@ fn run() -> Result<i32, String> {
             .map(|s| format!(" + {}", s))
             .unwrap_or_default()
     );
-    let mut profile = hipfire_runtime::coherence_runtime::DetectorProfile::default_for_prompt(
-        &prompt,
-        system.as_deref(),
-    );
+    let mut profile = DetectorProfile::default_for_prompt(&prompt, system.as_deref());
     profile.agentic |= args.agentic;
     profile.stall_tokens = args.stall_tokens;
     profile.detect_timing = args.detect_timing;
 
-    let run_config = hipfire_runtime::coherence_runtime::CoherenceRunConfig {
+    let run_config = CoherenceRunConfig {
         model,
         prompt,
         prompt_label,
@@ -529,7 +527,7 @@ fn run() -> Result<i32, String> {
         state: args.state.clone(),
         profile,
     };
-    let output = hipfire_runtime::coherence_runtime::run_coherence(&run_config)?;
+    let output = run_coherence(&run_config)?;
 
     // Markdown to stdout.
     println!("{}", output.report.to_markdown());

@@ -10,7 +10,8 @@ use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+pub use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback};
 
 /// Extension preferred order for fuzzy model discovery.
 pub const QUANT_PREFERENCE: &[&str] =
@@ -341,6 +342,24 @@ pub fn model_display_name(path: &Path) -> String {
         .to_string()
 }
 
+pub fn openai_model_list_json<I, P>(models: I) -> Value
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let data: Vec<Value> = models
+        .into_iter()
+        .map(|path| {
+            serde_json::json!({
+                "id": model_display_name(path.as_ref()),
+                "object": "model",
+            })
+        })
+        .collect();
+
+    serde_json::json!({ "object": "list", "data": data })
+}
+
 /// Derive a filesystem-safe identity stem from a model path or tag.
 pub fn model_artifact_stem(model: &str) -> String {
     let name = Path::new(model)
@@ -426,33 +445,6 @@ pub fn model_hash(model: &str) -> Option<String> {
     } else {
         Some(format!("tag:{}", stable_hash_bytes(model.as_bytes())))
     }
-}
-
-pub fn file_hash(path: &Path) -> Option<String> {
-    command_digest("sha256sum", path).or_else(|| Some(stable_hash_file_fallback(path)))
-}
-
-pub fn stable_hash_file_fallback(path: &Path) -> String {
-    let mut f = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return "unavailable".to_string(),
-    };
-    let mut state = Fnv64::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        match f.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => state.update(&buf[..n]),
-            Err(_) => return "unavailable".to_string(),
-        }
-    }
-    format!("fnv64:{:016x}", state.finish())
-}
-
-pub fn stable_hash_bytes(bytes: &[u8]) -> String {
-    let mut state = Fnv64::new();
-    state.update(bytes);
-    format!("fnv64:{:016x}", state.finish())
 }
 
 pub fn read_hfq_metadata(path: &Path) -> Result<HfqMetadata, String> {
@@ -632,17 +624,6 @@ fn maybe_push_model_candidate(out: &mut Vec<PathBuf>, path: &Path, stem: &str) {
     }
 }
 
-fn command_digest(tool: &str, path: &Path) -> Option<String> {
-    let out = Command::new(tool).arg(path).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .map(str::to_string)
-}
-
 fn find_json_object_end(bytes: &[u8]) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_string = false;
@@ -675,25 +656,6 @@ fn find_json_object_end(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-struct Fnv64(u64);
-
-impl Fnv64 {
-    fn new() -> Self {
-        Self(0xcbf29ce484222325)
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= b as u64;
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
-
-    fn finish(self) -> u64 {
-        self.0
-    }
-}
-
 /// Shared typed contract for loading a model into a runtime worker.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ModelLoadRequest {
@@ -724,6 +686,16 @@ pub struct ModelLoadParams {
 }
 
 impl ModelLoadParams {
+    pub fn from_hipfire_config(config: &hipfire_config::HipfireConfig) -> Self {
+        Self::from_common_config_values(
+            config.max_seq,
+            &config.kv_cache,
+            &config.flash_mode,
+            &config.dflash_mode,
+            config.cask_sidecar.as_deref(),
+        )
+    }
+
     pub fn from_common_config_values(
         max_seq: u32,
         kv_cache: &str,
@@ -857,6 +829,25 @@ mod tests {
         assert_eq!(
             model_display_name(Path::new("qwen3.5-9b-mq4.hfq.tmp")),
             "qwen3.5-9b-mq4.hfq"
+        );
+    }
+
+    #[test]
+    fn openai_model_list_json_matches_server_shape() {
+        let models = [
+            PathBuf::from("/models/qwen3.5-9b-mq4.hfq"),
+            PathBuf::from("/models/qwen3.5-9b-q8.hfq"),
+        ];
+
+        assert_eq!(
+            openai_model_list_json(models.iter()),
+            serde_json::json!({
+                "object": "list",
+                "data": [
+                    { "id": "qwen3.5-9b-mq4", "object": "model" },
+                    { "id": "qwen3.5-9b-q8", "object": "model" }
+                ]
+            })
         );
     }
 
@@ -1026,6 +1017,29 @@ mod tests {
 
         assert_eq!(params.max_seq, 8192);
         assert_eq!(params.kv_cache, None);
+        assert_eq!(params.flash_mode, None);
+        assert_eq!(params.dflash_mode.as_deref(), Some("off"));
+        assert_eq!(
+            params.cask_sidecar.as_deref(),
+            Some("/models/qwen3.5-27b.triattn.hfq")
+        );
+    }
+
+    #[test]
+    fn model_load_params_from_hipfire_config_preserves_load_policy() {
+        let config = hipfire_config::HipfireConfig {
+            max_seq: 8192,
+            kv_cache: "asym3".to_string(),
+            flash_mode: "auto".to_string(),
+            dflash_mode: "off".to_string(),
+            cask_sidecar: Some("/models/qwen3.5-27b.triattn.hfq".to_string()),
+            ..Default::default()
+        };
+
+        let params = ModelLoadParams::from_hipfire_config(&config);
+
+        assert_eq!(params.max_seq, 8192);
+        assert_eq!(params.kv_cache.as_deref(), Some("asym3"));
         assert_eq!(params.flash_mode, None);
         assert_eq!(params.dflash_mode.as_deref(), Some("off"));
         assert_eq!(

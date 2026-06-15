@@ -18,7 +18,7 @@ use hipfire_detect::{
 };
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
 
@@ -138,7 +138,7 @@ impl DaemonChild {
 
 pub fn run_coherence(config: &CoherenceRunConfig) -> Result<CoherenceRunOutput, String> {
     let mut bank = build_detector_bank(&config.profile);
-    let daemon = find_daemon_binary()?;
+    let daemon = hipfire_daemon_adapter::find_daemon_bin_or_error().map_err(|e| e.to_string())?;
     let mut child = spawn_daemon(&daemon, config.force_jinja_chat)?;
 
     let mut params = serde_json::Map::new();
@@ -218,7 +218,7 @@ pub fn run_coherence(config: &CoherenceRunConfig) -> Result<CoherenceRunOutput, 
 }
 
 pub fn daemon_binary_available() -> bool {
-    find_daemon_binary().is_ok()
+    hipfire_daemon_adapter::find_daemon_bin().is_some()
 }
 
 pub fn build_detector_bank(profile: &DetectorProfile) -> DetectorBank {
@@ -399,24 +399,6 @@ fn drive_generate(
     }
 }
 
-fn find_daemon_binary() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("HIPFIRE_DAEMON_BIN") {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-    let exe = std::env::consts::EXE_SUFFIX;
-    let repo = repo_root();
-    newest_existing_path([
-        repo.join(format!("target/release/hipfire-daemon{exe}")),
-        repo.join(format!("target/debug/hipfire-daemon{exe}")),
-    ])
-    .ok_or_else(|| {
-        "daemon binary not found; run `cargo build --release --features deltanet -p hipfire-daemon --bin hipfire-daemon` first".to_string()
-    })
-}
-
 fn spawn_daemon(daemon: &Path, force_jinja_chat: bool) -> Result<DaemonChild, String> {
     let mut cmd = Command::new(daemon);
     cmd.env("HIPFIRE_EMIT_TOKEN_IDS", "1")
@@ -499,30 +481,6 @@ fn arch_host() -> (String, String) {
             .unwrap_or_else(|| "unknown".to_string())
     });
     (arch, host)
-}
-
-fn newest_existing_path<const N: usize>(paths: [PathBuf; N]) -> Option<PathBuf> {
-    paths
-        .into_iter()
-        .filter(|p| p.exists())
-        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
-}
-
-fn repo_root() -> PathBuf {
-    let out = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok();
-    if let Some(out) = out {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return PathBuf::from(s);
-            }
-        }
-    }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir.join("../..")
 }
 
 #[cfg(test)]
