@@ -10,7 +10,10 @@ pub use hipfire_generate::{
     DoneEvent as DoneResponse, ErrorEvent as ErrorResponse, GenerateTextRequest as GenerateRequest,
     GenerationSamplingPolicy, TokenEvent as TokenResponse,
 };
-pub use hipfire_model::{ModelLoadParams as LoadParams, ModelLoadRequest as LoadRequest};
+pub use hipfire_model::{
+    ModelLoadParams as LoadParams, ModelLoadRequest as LoadRequest,
+    ModelLoadedResponse as LoadedResponse,
+};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -32,18 +35,6 @@ pub enum DaemonResponse {
     Error(ErrorResponse),
     #[serde(other)]
     Unknown,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LoadedResponse {
-    pub worker_key_id: String,
-    pub arch: Option<String>,
-    pub dim: Option<u32>,
-    pub layers: Option<u32>,
-    pub vocab: Option<u32>,
-    pub model_worker: Option<serde_json::Value>,
-    #[serde(default)]
-    pub response_id: Option<String>,
 }
 
 #[cfg(test)]

@@ -172,9 +172,23 @@ pub struct ModelLoadParams {
     pub cask_sidecar: Option<String>,
 }
 
+/// Shared typed contract for the daemon's `loaded` response payload.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ModelLoadedResponse {
+    pub worker_key_id: String,
+    pub arch: Option<String>,
+    pub dim: Option<u32>,
+    pub layers: Option<u32>,
+    pub vocab: Option<u32>,
+    pub model_worker: Option<serde_json::Value>,
+    #[serde(default)]
+    pub response_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn normalizes_tag_stems_for_fuzzy_lookup() {
@@ -254,5 +268,36 @@ mod tests {
         assert_eq!(value["params"]["cask_sidecar"], "model.triattn.hfq");
         assert!(value["params"].get("flash_mode").is_none());
         assert_eq!(value["request_id"], "load-1");
+    }
+
+    #[test]
+    fn model_loaded_response_deserializes_daemon_wire_shape() {
+        let loaded: ModelLoadedResponse = serde_json::from_value(json!({
+            "worker_key_id": "worker:arch5:pp1:mq4",
+            "arch": "qwen35",
+            "dim": 4096,
+            "layers": 32,
+            "vocab": 248320,
+            "model_worker": {
+                "worker_id": {
+                    "value": "worker:arch5:pp1:mq4",
+                    "model": "qwen3.5-9b-mq4.hfq",
+                    "arch_id": 5
+                }
+            },
+            "response_id": "load-1"
+        }))
+        .unwrap();
+
+        assert_eq!(loaded.worker_key_id, "worker:arch5:pp1:mq4");
+        assert_eq!(loaded.arch.as_deref(), Some("qwen35"));
+        assert_eq!(loaded.dim, Some(4096));
+        assert_eq!(loaded.layers, Some(32));
+        assert_eq!(loaded.vocab, Some(248320));
+        assert_eq!(
+            loaded.model_worker.unwrap()["worker_id"]["model"],
+            "qwen3.5-9b-mq4.hfq"
+        );
+        assert_eq!(loaded.response_id.as_deref(), Some("load-1"));
     }
 }
