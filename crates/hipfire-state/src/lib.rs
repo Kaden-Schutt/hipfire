@@ -184,6 +184,31 @@ pub struct ModelWorkerMemoryView {
     pub evictable_state_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ModelArtifactMemory {
+    pub model_file_bytes: usize,
+    pub model_weight_bytes: usize,
+}
+
+impl ModelArtifactMemory {
+    pub fn worker_memory_view(
+        self,
+        runtime_base_bytes: usize,
+        runtime_session_bytes: usize,
+    ) -> ModelWorkerMemoryView {
+        let runtime_state_bytes = runtime_base_bytes.saturating_add(runtime_session_bytes);
+        ModelWorkerMemoryView {
+            model_file_bytes: self.model_file_bytes,
+            model_weight_bytes: self.model_weight_bytes,
+            runtime_base_bytes,
+            runtime_session_bytes,
+            runtime_state_bytes,
+            total_resident_bytes: self.model_weight_bytes.saturating_add(runtime_state_bytes),
+            evictable_state_bytes: runtime_session_bytes,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DescribedSequenceState {
     pub worker_id: String,
