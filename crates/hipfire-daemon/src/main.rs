@@ -42,12 +42,13 @@ use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_generate::{
     compute_qwen35_prefix_hash, generate_prefix_hash_json, plan_generate_batch_prefill_qwen35,
     qwen35_decode_batch_requested_auto, qwen35_decode_batch_scheduler_metadata,
-    qwen35_grouped_moe_decode_auto_latency_gate_passed, select_qwen35_decode_batch_backend,
-    select_qwen35_prefill_batch_backend, validate_generate_batch_decode,
-    validate_generate_batch_prefill, validate_prefix_hash_preflight, GenerateBatchDecodeEnvelope,
-    GenerateBatchDecodeSession, GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan,
-    GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession, PrefixHashPreflightCandidate,
-    PrefixHashPreflightEnvelope, Qwen35DecodeBatchBackend, Qwen35PrefillBatchBackend,
+    qwen35_grouped_moe_decode_auto_latency_gate_passed, qwen35_prefill_scratch_target_batch,
+    select_qwen35_decode_batch_backend, select_qwen35_prefill_batch_backend,
+    validate_generate_batch_decode, validate_generate_batch_prefill,
+    validate_prefix_hash_preflight, GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession,
+    GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan, GenerateBatchPrefillPrefixHash,
+    GenerateBatchPrefillSession, PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope,
+    Qwen35DecodeBatchBackend, Qwen35PrefillBatchBackend,
 };
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -3205,14 +3206,20 @@ mod generate_batch_prefill_tests {
 
     #[test]
     fn paged_prefill_scratch_defaults_to_live_rows() {
-        assert_eq!(qwen35_prefill_scratch_target_batch(true, 16, None), 16);
-        assert_eq!(qwen35_prefill_scratch_target_batch(true, 1, None), 2);
         assert_eq!(
-            qwen35_prefill_scratch_target_batch(true, 16, Some("64")),
+            qwen35_prefill_scratch_target_batch(true, 16, None, qwen35::PREFILL_MAX_BATCH),
+            16
+        );
+        assert_eq!(
+            qwen35_prefill_scratch_target_batch(true, 1, None, qwen35::PREFILL_MAX_BATCH),
+            2
+        );
+        assert_eq!(
+            qwen35_prefill_scratch_target_batch(true, 16, Some("64"), qwen35::PREFILL_MAX_BATCH),
             64
         );
         assert_eq!(
-            qwen35_prefill_scratch_target_batch(false, 16, None),
+            qwen35_prefill_scratch_target_batch(false, 16, None, qwen35::PREFILL_MAX_BATCH),
             qwen35::PREFILL_MAX_BATCH
         );
     }
@@ -4478,23 +4485,6 @@ fn validate_qwen35_fused_grouped_moe_prefill_model_capability(
         }
     }
     Ok(())
-}
-
-fn qwen35_prefill_scratch_target_batch(
-    paged_experts: bool,
-    required_rows: usize,
-    env: Option<&str>,
-) -> usize {
-    let configured = env
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v >= 2);
-    if let Some(configured) = configured {
-        return configured.max(required_rows);
-    }
-    if paged_experts {
-        return required_rows.max(2);
-    }
-    qwen35::PREFILL_MAX_BATCH.max(required_rows)
 }
 
 fn activate_model_worker(
@@ -5961,6 +5951,7 @@ fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                     config.paged_experts,
                     total_tokens,
                     std::env::var("HIPFIRE_PREFILL_MAX_BATCH").ok().as_deref(),
+                    qwen35::PREFILL_MAX_BATCH,
                 );
                 let needs_scratch = scratch
                     .prefill_batch
@@ -6098,6 +6089,7 @@ fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             config.paged_experts,
             total_tokens,
             std::env::var("HIPFIRE_PREFILL_MAX_BATCH").ok().as_deref(),
+            qwen35::PREFILL_MAX_BATCH,
         );
         let needs_scratch = scratch
             .prefill_batch

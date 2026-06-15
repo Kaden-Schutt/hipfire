@@ -829,6 +829,24 @@ pub fn qwen35_grouped_moe_decode_auto_latency_gate_passed(session_count: usize) 
     session_count >= 4
 }
 
+pub fn qwen35_prefill_scratch_target_batch(
+    paged_experts: bool,
+    required_rows: usize,
+    configured_max_batch: Option<&str>,
+    default_max_batch: usize,
+) -> usize {
+    let configured = configured_max_batch
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v >= 2);
+    if let Some(configured) = configured {
+        return configured.max(required_rows);
+    }
+    if paged_experts {
+        return required_rows.max(2);
+    }
+    default_max_batch.max(required_rows)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Qwen35DecodeBatchSchedulerMetadata {
     pub selected_backend: &'static str,
@@ -1228,6 +1246,24 @@ mod tests {
         )
         .unwrap_err()
         .contains("grouped-MoE eligible"));
+    }
+
+    #[test]
+    fn qwen35_prefill_scratch_target_batch_matches_daemon_policy() {
+        assert_eq!(qwen35_prefill_scratch_target_batch(true, 16, None, 256), 16);
+        assert_eq!(qwen35_prefill_scratch_target_batch(true, 1, None, 256), 2);
+        assert_eq!(
+            qwen35_prefill_scratch_target_batch(true, 16, Some("64"), 256),
+            64
+        );
+        assert_eq!(
+            qwen35_prefill_scratch_target_batch(false, 16, None, 256),
+            256
+        );
+        assert_eq!(
+            qwen35_prefill_scratch_target_batch(false, 300, None, 256),
+            300
+        );
     }
 
     #[test]
