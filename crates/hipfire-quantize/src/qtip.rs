@@ -1,0 +1,269 @@
+// SPDX-License-Identifier: Apache-2.0
+// hipfire — QTIP (Quantization with Trellises and Incoherence Processing)
+//
+// Phase C1 (NEXT-STEPS.md): the offline QTIP encoder core. Scalar/Lloyd 2-bit
+// is quality-collapse (MQ2-Lloyd 0.8B ppl≈19,651); trellis-coded quantization
+// is the only route to *usable* 2 bpw because it approaches the Gaussian
+// rate-distortion bound instead of quantizing each weight independently.
+//
+// This module is the CPU encoder/decoder core, intentionally decoupled from
+// any GPU kernel:
+//   * Incoherence processing (the Hadamard/FWHT rotation that Gaussianizes a
+//     weight group) is ALREADY applied upstream by `cpu_fwht_256` — QTIP
+//     consumes the rotated group, same as `quantize_mq2g256`.
+//   * **Bitshift trellis** (QTIP §3): the per-weight codebook is *computed*,
+//     not stored. The trellis "state" is a sliding window of the last
+//     `STATE_BITS` code bits; the decoded value is a hash of that window into
+//     an (approximately) unit-variance Gaussian. Because the state is a sliding
+//     window, **decode is embarrassingly parallel** (each position hashes its
+//     own bit-window) — the GPU kernel (C2) exploits exactly this. The Viterbi
+//     search is OFFLINE encode only.
+//
+// Quality is validated here against uniform 2-bit on synthetic Gaussian data
+// (the post-rotation weight distribution). Full-model wiring + `astrea`
+// KLD/PPL gating vs MQ4/MQ3 is the next increment, BEFORE the decode kernel.
+
+/// Bits per weight (2-bit target).
+pub const BITS_PER_WEIGHT: u32 = 2;
+
+/// Trellis state width in bits. State = last `STATE_BITS` code bits =
+/// a sliding window of `STATE_BITS / BITS_PER_WEIGHT` symbols. Larger =
+/// richer computed codebook (2^STATE_BITS distinct Gaussian values) and
+/// better rate-distortion, at O(2^STATE_BITS) Viterbi cost per group.
+pub const STATE_BITS: u32 = 12;
+
+const NUM_STATES: usize = 1 << STATE_BITS;
+const STATE_MASK: u32 = (NUM_STATES as u32) - 1;
+const NUM_SYMBOLS: usize = 1 << BITS_PER_WEIGHT;
+
+/// splitmix64 finalizer → u53 → [0,1). Deterministic state→uniform map; the
+/// avalanche decorrelates adjacent states so the computed codebook covers the
+/// Gaussian well rather than being monotone in the state integer.
+#[inline]
+fn hash_u01(state: u32) -> f64 {
+    let mut z = (state as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    ((z >> 11) as f64) / ((1u64 << 53) as f64)
+}
+
+/// Acklam's rational approximation of the inverse standard-normal CDF.
+/// |error| < 1.15e-9. Maps u∈(0,1) → N(0,1) quantile.
+fn inv_norm_cdf(p: f64) -> f64 {
+    // Coefficients.
+    const A: [f64; 6] = [
+        -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+        1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00,
+    ];
+    const B: [f64; 5] = [
+        -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+        6.680131188771972e+01, -1.328068155288572e+01,
+    ];
+    const C: [f64; 6] = [
+        -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+        -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00,
+    ];
+    const D: [f64; 4] = [
+        7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+        3.754408661907416e+00,
+    ];
+    const P_LOW: f64 = 0.02425;
+    const P_HIGH: f64 = 1.0 - P_LOW;
+    let p = p.clamp(1e-12, 1.0 - 1e-12);
+    if p < P_LOW {
+        let q = (-2.0 * p.ln()).sqrt();
+        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else if p <= P_HIGH {
+        let q = p - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    } else {
+        let q = (-2.0 * (1.0 - p).ln()).sqrt();
+        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    }
+}
+
+/// Build the computed Gaussian codebook: `codebook[state]` ≈ a unit-variance
+/// normal sample deterministically derived from `state`. Renormalized to exact
+/// zero mean / unit variance so a single per-group `scale` reconstructs the
+/// rotated (≈Gaussian, zero-mean) weights as `scale * codebook[state]`.
+pub fn build_codebook() -> Vec<f32> {
+    let mut cb: Vec<f64> = (0..NUM_STATES as u32)
+        .map(|s| inv_norm_cdf(hash_u01(s)))
+        .collect();
+    let mean = cb.iter().sum::<f64>() / cb.len() as f64;
+    for v in cb.iter_mut() {
+        *v -= mean;
+    }
+    let var = cb.iter().map(|v| v * v).sum::<f64>() / cb.len() as f64;
+    let inv_std = if var > 0.0 { 1.0 / var.sqrt() } else { 1.0 };
+    cb.iter().map(|v| (v * inv_std) as f32).collect()
+}
+
+/// Decode a packed symbol stream back to weights: walk the bitshift trellis,
+/// hashing each sliding-window state through the codebook. This is the exact
+/// computation the GPU decode kernel (C2) will perform per lane — sequential
+/// here only for the reference; each output depends solely on its own bit
+/// window, so it is parallelizable.
+pub fn decode_group(symbols: &[u8], scale: f32, codebook: &[f32]) -> Vec<f32> {
+    let mut state: u32 = 0;
+    let mut out = Vec::with_capacity(symbols.len());
+    for &sym in symbols {
+        state = ((state << BITS_PER_WEIGHT) | (sym as u32 & (NUM_SYMBOLS as u32 - 1))) & STATE_MASK;
+        out.push(scale * codebook[state as usize]);
+    }
+    out
+}
+
+/// Viterbi encode one group of (FWHT-rotated) weights into a bitshift-trellis
+/// symbol stream that minimizes Σ(w_i − scale·codebook[state_i])². OFFLINE.
+///
+/// Cost: `weights.len() × NUM_STATES × NUM_SYMBOLS`. With STATE_BITS=12 and a
+/// 256-wide group that is ~4M float ops/group — fine offline; a beam-search
+/// variant will replace it for full-model throughput in a later increment.
+pub fn encode_group(weights: &[f32], scale: f32, codebook: &[f32]) -> Vec<u8> {
+    let n = weights.len();
+    let inf = f64::INFINITY;
+    // dp[state] = min cost of any path reaching `state` after the current step.
+    let mut dp = vec![inf; NUM_STATES];
+    // Virtual start: state 0 with leading-zero history (decoder uses the same).
+    dp[0] = 0.0;
+    // backptr[step][state] = predecessor state.
+    let mut back: Vec<Vec<u32>> = vec![vec![0u32; NUM_STATES]; n];
+
+    let mut next = vec![inf; NUM_STATES];
+    for (step, &w) in weights.iter().enumerate() {
+        for v in next.iter_mut() {
+            *v = inf;
+        }
+        let w = w as f64;
+        for s_prev in 0..NUM_STATES {
+            let c_prev = dp[s_prev];
+            if c_prev == inf {
+                continue;
+            }
+            let base = ((s_prev as u32) << BITS_PER_WEIGHT) & STATE_MASK;
+            for sym in 0..NUM_SYMBOLS as u32 {
+                let s_new = (base | sym) as usize;
+                let diff = w - scale as f64 * codebook[s_new] as f64;
+                let c = c_prev + diff * diff;
+                if c < next[s_new] {
+                    next[s_new] = c;
+                    back[step][s_new] = s_prev as u32;
+                }
+            }
+        }
+        std::mem::swap(&mut dp, &mut next);
+    }
+
+    // Best final state, then backtrack to recover symbols.
+    let mut best_state = 0usize;
+    let mut best_cost = inf;
+    for (s, &c) in dp.iter().enumerate() {
+        if c < best_cost {
+            best_cost = c;
+            best_state = s;
+        }
+    }
+    let mut symbols = vec![0u8; n];
+    let mut state = best_state as u32;
+    for step in (0..n).rev() {
+        symbols[step] = (state & (NUM_SYMBOLS as u32 - 1)) as u8;
+        state = back[step][state as usize];
+    }
+    symbols
+}
+
+/// Per-group scale: RMS of the rotated weights (codebook is unit-variance,
+/// zero-mean, so RMS ≈ the optimal single scale for ≈Gaussian input).
+pub fn group_scale(weights: &[f32]) -> f32 {
+    if weights.is_empty() {
+        return 1.0;
+    }
+    let ss: f64 = weights.iter().map(|&w| (w as f64) * (w as f64)).sum();
+    (ss / weights.len() as f64).sqrt() as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Deterministic LCG → standard-normal via Box–Muller. Avoids a dev-dep on
+    // `rand`; we only need a reproducible Gaussian sample for the quality test.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u01(&mut self) -> f64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+        }
+        fn next_normal(&mut self) -> f32 {
+            let u1 = self.next_u01().max(1e-12);
+            let u2 = self.next_u01();
+            ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()) as f32
+        }
+    }
+
+    fn mse(a: &[f32], b: &[f32]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| ((x - y) as f64) * ((x - y) as f64))
+            .sum::<f64>()
+            / a.len() as f64
+    }
+
+    /// Uniform 2-bit (4-level) per-group quantize+dequant, matching the
+    /// `quantize_mq2g256` packing math — the baseline QTIP must beat.
+    fn uniform2_roundtrip(group: &[f32]) -> Vec<f32> {
+        let min_v = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_v = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let range = max_v - min_v;
+        let scale = if range > 0.0 { range / 3.0 } else { 1.0 };
+        let inv = if range > 0.0 { 1.0 / scale } else { 0.0 };
+        group
+            .iter()
+            .map(|&w| {
+                let q = (((w - min_v) * inv + 0.5) as i32).clamp(0, 3) as f32;
+                min_v + q * scale
+            })
+            .collect()
+    }
+
+    #[test]
+    fn codebook_is_zero_mean_unit_variance() {
+        let cb = build_codebook();
+        let mean = cb.iter().map(|&v| v as f64).sum::<f64>() / cb.len() as f64;
+        let var = cb.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / cb.len() as f64;
+        assert!(mean.abs() < 1e-5, "codebook mean {mean}");
+        assert!((var - 1.0).abs() < 1e-3, "codebook var {var}");
+    }
+
+    #[test]
+    fn encode_decode_roundtrips_and_beats_uniform_2bit() {
+        let cb = build_codebook();
+        let mut rng = Lcg(0xDEADBEEF);
+        let group: Vec<f32> = (0..256).map(|_| rng.next_normal()).collect();
+        let scale = group_scale(&group);
+
+        let symbols = encode_group(&group, scale, &cb);
+        assert_eq!(symbols.len(), 256);
+        let recon = decode_group(&symbols, scale, &cb);
+        let qtip_mse = mse(&group, &recon);
+
+        let uni = uniform2_roundtrip(&group);
+        let uni_mse = mse(&group, &uni);
+
+        // Trellis-coded 2-bit must beat uniform 2-bit on Gaussian input — the
+        // whole premise of Phase C. (Empirically a large margin; require a
+        // clear win, not just ≤.)
+        assert!(
+            qtip_mse < uni_mse * 0.85,
+            "QTIP MSE {qtip_mse:.5} not < 0.85 × uniform2 MSE {uni_mse:.5}"
+        );
+    }
+}

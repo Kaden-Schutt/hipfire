@@ -32,6 +32,10 @@
 //! RDNA-native quantized weights.
 
 mod gguf_input;
+// QTIP (Phase C1) encoder core — wired into the quantize dispatch in a
+// follow-up increment; allow dead_code until then.
+#[allow(dead_code)]
+mod qtip;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
