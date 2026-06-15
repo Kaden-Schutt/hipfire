@@ -81,6 +81,16 @@
 
 ### Deferred
 
+- `crates/hipfire-runtime/src/kv_adaptive.rs` — adaptive KV precision downshift
+  module, written but not yet wired in. Missing pieces before use:
+  - `KvCache::transcode_v_step` and `transcode_k_step` methods (called by
+    `maybe_downshift`) are not yet implemented.
+  - Module is not declared in `crates/hipfire-runtime/src/lib.rs`.
+  - `Conservative` and `Aggressive` presets share the same floor values
+    (both Fwht2/Lloyd2) — likely a placeholder; floors should differ.
+  - No integration site in the decode loop (`maybe_downshift` must be called
+    after each committed token write alongside `maybe_evict`).
+
 - Adapt the build system to autodiscover GPUs the same way NPU detection now
   works: query HIP/ROCm at `cargo build --features npu-kernels` time (or a
   new `gpu-kernels` feature) to identify installed GPU arch(s) and select
