@@ -30,6 +30,11 @@ pub const BITS_PER_WEIGHT: u32 = 2;
 /// a sliding window of `STATE_BITS / BITS_PER_WEIGHT` symbols. Larger =
 /// richer computed codebook (2^STATE_BITS distinct Gaussian values) and
 /// better rate-distortion, at O(2^STATE_BITS) Viterbi cost per group.
+// 12 is the cost/quality sweet spot. STATE_BITS=16 was measured: real-weights
+// QTIP-2/uniform-3 improved only 1.41→1.34 for ~16× the Viterbi cost (297s vs
+// 19s for 256 groups) — infeasible at model scale, diminishing returns. Closing
+// the residual gap to uniform-3 parity needs a *better codebook* (the QTIP paper
+// 1MAD/3INST hashes / structured trellis), not brute-force state width.
 pub const STATE_BITS: u32 = 12;
 
 const NUM_STATES: usize = 1 << STATE_BITS;
@@ -181,13 +186,34 @@ pub fn encode_group(weights: &[f32], scale: f32, codebook: &[f32]) -> Vec<u8> {
 }
 
 /// Per-group scale: RMS of the rotated weights (codebook is unit-variance,
-/// zero-mean, so RMS ≈ the optimal single scale for ≈Gaussian input).
+/// zero-mean, so RMS ≈ the optimal single scale for ≈Gaussian input). Used to
+/// drive the Viterbi search; refine with `optimal_scale` after encoding.
 pub fn group_scale(weights: &[f32]) -> f32 {
     if weights.is_empty() {
         return 1.0;
     }
     let ss: f64 = weights.iter().map(|&w| (w as f64) * (w as f64)).sum();
     (ss / weights.len() as f64).sqrt() as f32
+}
+
+/// Closed-form least-squares scale for a fixed symbol stream: minimizes
+/// Σ(w_i − s·c_i)² over s ⇒ s* = ⟨w,c⟩ / ⟨c,c⟩, where c_i = codebook[state_i].
+/// Strictly ≤ the MSE of any other scale (including the RMS seed), near-free.
+/// This is the scale that should be STORED per group.
+pub fn optimal_scale(weights: &[f32], symbols: &[u8], codebook: &[f32]) -> f32 {
+    let mut state: u32 = 0;
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for (i, &sym) in symbols.iter().enumerate() {
+        state = ((state << BITS_PER_WEIGHT) | (sym as u32 & (NUM_SYMBOLS as u32 - 1))) & STATE_MASK;
+        let c = codebook[state as usize] as f64;
+        num += weights[i] as f64 * c;
+        den += c * c;
+    }
+    if den > 0.0 {
+        (num / den) as f32
+    } else {
+        group_scale(weights)
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +241,14 @@ mod tests {
             .map(|(&x, &y)| ((x - y) as f64) * ((x - y) as f64))
             .sum::<f64>()
             / a.len() as f64
+    }
+
+    /// Full QTIP roundtrip MSE: Viterbi-encode at the RMS seed scale, then
+    /// store the closed-form optimal scale and decode with it.
+    fn qtip_mse(group: &[f32], cb: &[f32]) -> f64 {
+        let sym = encode_group(group, group_scale(group), cb);
+        let s = optimal_scale(group, &sym, cb);
+        mse(group, &decode_group(&sym, s, cb))
     }
 
     /// Uniform n-bit (`2^bits`-level) per-group quantize+dequant, matching the
@@ -262,8 +296,7 @@ mod tests {
         let cb = build_codebook();
         let mut rng = Lcg(0x1234_5678);
         let group: Vec<f32> = (0..256).map(|_| rng.next_normal()).collect();
-        let scale = group_scale(&group);
-        let qtip = mse(&group, &decode_group(&encode_group(&group, scale, &cb), scale, &cb));
+        let qtip = qtip_mse(&group, &cb);
         let u2 = mse(&group, &uniform_nbit_roundtrip(&group, 2));
         let u3 = mse(&group, &uniform_nbit_roundtrip(&group, 3));
         eprintln!(
@@ -337,8 +370,7 @@ mod tests {
             let mut g = [0.0f32; 256];
             g.copy_from_slice(chunk);
             crate::cpu_fwht_256(&mut g, &signs1, &signs2);
-            let scale = group_scale(&g);
-            q_acc += mse(&g, &decode_group(&encode_group(&g, scale, &cb), scale, &cb));
+            q_acc += qtip_mse(&g, &cb);
             u2_acc += mse(&g, &uniform_nbit_roundtrip(&g, 2));
             u3_acc += mse(&g, &uniform_nbit_roundtrip(&g, 3));
             groups += 1;
