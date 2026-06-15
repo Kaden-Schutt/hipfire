@@ -73,8 +73,8 @@ struct RawLfm2MoeConfig {
     num_key_value_heads: usize,
     #[serde(default)]
     head_dim: Option<usize>,
-    #[serde(default = "default_conv_l")]
-    conv_L_cache: usize,
+    #[serde(default = "default_conv_l", rename = "conv_L_cache")]
+    conv_l_cache: usize,
     intermediate_size: usize,
     // MoE fields — present on lfm2_moe (A1B), ABSENT on dense lfm2 (350M/1.2B).
     #[serde(default)]
@@ -208,7 +208,7 @@ impl Lfm2MoeConfig {
             num_attention_heads: raw.num_attention_heads,
             num_key_value_heads: raw.num_key_value_heads,
             head_dim,
-            conv_kernel_size: raw.conv_L_cache,
+            conv_kernel_size: raw.conv_l_cache,
             intermediate_size,
             moe_intermediate_size: raw.moe_intermediate_size,
             num_experts: raw.num_experts,

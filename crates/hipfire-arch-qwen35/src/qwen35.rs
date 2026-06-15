@@ -2041,6 +2041,7 @@ fn rope_cs_halfsplit_bf16(pos: usize, n_rot: usize, rope_theta: f32) -> Vec<u16>
 /// The NPU rope kernel uses the half-split layout (pairs at `d` and `d+n_rot/2`)
 /// which matches the xclbin produced by `build_qwen35_rope.py`.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn try_npu_rope(
     gpu: &mut Gpu,
     layer_idx: usize,
@@ -6405,6 +6406,7 @@ impl<'a> MoeScratchRef<'a> {
 /// debug `forward()` path). Allocates 11 tensors, runs moe_ffn_decode_impl,
 /// frees. NOT hipGraph-compatible. For hot-path decode, callers should go
 /// through moe_ffn_decode_with_scratch which reuses pre-allocated buffers.
+#[allow(dead_code)]
 fn moe_ffn_decode(
     gpu: &mut Gpu,
     pager: Option<&RefCell<hipfire_runtime::weight_pager::WeightPager>>,
@@ -15609,10 +15611,6 @@ fn forward_prefill_chunk(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
     let dim_row_bytes = dim * 4;
-    // Build one DispatchCtx per chunk (decision-only, threaded through
-    // MoE prefill family calls). Ship 4.2.
-    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
-
     let do_embed = band.map(|b| b.is_first_band).unwrap_or(true);
     let layer_start = band.map(|b| b.layer_start).unwrap_or(0);
     // `max_layer = Some(N)` early-exits at layer N (exclusive). pflash uses
@@ -20982,27 +20980,9 @@ fn run_fa_layer_body(
     // Cross-arch fast path: fused 3-way projection for wq+wk+wv.
     let dt = layer.wq.gpu_dtype;
     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
-    let fused_fa3_mq4 = config.attn_output_gate
-        && fa3_same_dtype
-        && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
     let fused_fa3_f16 = config.attn_output_gate && fa3_same_dtype && dt == DType::F16;
-    let fused_fa3_lloyd_mq3 =
-        config.attn_output_gate && fa3_same_dtype && dt == DType::MQ3G256Lloyd;
-    let fused_fa3_lloyd_mq4 =
-        config.attn_output_gate && fa3_same_dtype && dt == DType::MQ4G256Lloyd;
-    // Lever 1 disables the env-gated fused_fa3_paro4t path so the fused rmsnorm
-    // path takes precedence. To re-enable the fused QKV path instead, set
-    // HIPFIRE_PARO_FUSE_RMSNORM=0 AND HIPFIRE_PARO_FA3_FUSED=1.
-    let fused_fa3_paro4t = config.attn_output_gate
-        && fa3_same_dtype
-        && dt == DType::ParoQ4G128
-        && x_rot_paro.is_none()
-        && std::env::var("HIPFIRE_PARO_FA3_FUSED")
-            .map(|v| v != "0")
-            .unwrap_or(true);
     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
-    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
     let fused_fa3_hfq6 = config.attn_output_gate
@@ -21498,14 +21478,6 @@ fn run_fa_layer_body(
     let fused_gu_f16 = same_dtype && dt_g == DType::F16;
     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-    let fused_gu_paro4t = same_dtype
-        && dt_g == DType::ParoQ4G128
-        && layer.w_gate.m == layer.w_up.m
-        && layer.w_gate.k == layer.w_up.k
-        && x_rot_paro.is_none()
-        && std::env::var("HIPFIRE_PARO_GATE_UP_FUSED")
-            .map(|v| v != "0")
-            .unwrap_or(true);
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
     let fused_gu_hfq6 = same_dtype
         && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
@@ -21849,7 +21821,7 @@ fn forward_scratch_layers(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
     s: &Qwen35Scratch,
-    mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
     needs_last_token_logits: bool,
     mut gdn_tape_capture: Option<(&mut crate::speculative::GdnTape, usize)>,
 ) -> HipResult<()> {

@@ -264,7 +264,6 @@ fn gemv_auto_batched_wmma(
                     // Kernel hard requires M%64==0, K%32==0, B%64==0.
                     // Opt out via HIPFIRE_DEEPSEEK4_Q8_4W=0 for diagnosis.
                     let opt_out = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
-                    let opt_out = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
                     let use_4w = !opt_out
                         && batch_size >= 256
                         && m >= 4096

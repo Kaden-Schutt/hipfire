@@ -91,14 +91,6 @@ fn main() {
                 measure_iters = argv[i + 1].parse().expect("--measure-iters");
                 i += 2;
             }
-            "--warmup-iters" => {
-                warmup_iters = argv[i + 1].parse().expect("--warmup-iters");
-                i += 2;
-            }
-            "--measure-iters" => {
-                measure_iters = argv[i + 1].parse().expect("--measure-iters");
-                i += 2;
-            }
             "--prefill-only" => {
                 prefill_only = true;
                 i += 1;

@@ -701,12 +701,14 @@ impl LlamaWeights {
 /// Dispatch GEMV for a weight tensor (quantized or F32).
 /// y = W * x where W is the weight tensor, x is F32 input, y is F32 output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum DenseGemvRoute {
     Mq6RotateThenMq6Prerotated,
     Hfq6Direct,
     Unclassified,
 }
 
+#[cfg(test)]
 fn dense_gemv_route(dtype: DType) -> DenseGemvRoute {
     match dtype {
         DType::MQ6G256 => DenseGemvRoute::Mq6RotateThenMq6Prerotated,

@@ -69,17 +69,6 @@ fn has_wmma_variant(key: KernelKey) -> KernelVariant {
     }
 }
 
-fn dp4a_variant(key: KernelKey) -> KernelVariant {
-    KernelVariant {
-        key,
-        arch_required: ArchPredicate::HasDot2F32F16,
-        shape_gate: None,
-        steps: &[],
-        has_awq: false,
-        tile: TileImpl::None,
-    }
-}
-
 // ── ShapePredicate::eval ──────────────────────────────────────────────────────
 
 #[test]
@@ -283,7 +272,7 @@ fn registry_resolve_happy_path() {
 
 #[test]
 fn registry_resolve_unregistered_key_returns_not_found() {
-    let mut reg = KernelRegistry::new();
+    let reg = KernelRegistry::new();
     let ctx = ctx_rdna1();
     let err = reg.resolve(KernelKey::GemvF32, &ctx, None).unwrap_err();
     assert!(matches!(err, DispatchError::NotFound { .. }));
@@ -1032,9 +1021,7 @@ fn match_prefix_guard_receives_correct_window() {
 // ── FUSED_TABLE guard tests ──────────────────────────────────────────────────
 
 use crate::pipeline::steps::{
-    guard_gate_up_hfq4g256, guard_gate_up_hfq6g256, guard_gate_up_mq3g256lloyd,
-    guard_gate_up_mq4g256lloyd, guard_qkv_hfq4g256, guard_qkv_hfq6g256, guard_qkv_mq3g256lloyd,
-    guard_qkv_mq4g256lloyd,
+    guard_gate_up_mq4g256lloyd, guard_qkv_hfq4g256, guard_qkv_hfq6g256, guard_qkv_mq4g256lloyd,
 };
 
 fn make_qkv3_steps<'a>(

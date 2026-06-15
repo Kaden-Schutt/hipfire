@@ -60,19 +60,32 @@ fn hash_u01(state: u32) -> f64 {
 fn inv_norm_cdf(p: f64) -> f64 {
     // Coefficients.
     const A: [f64; 6] = [
-        -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
-        1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00,
+        -3.969683028665376e+01,
+        2.209460984245205e+02,
+        -2.759285104469687e+02,
+        1.383577518672690e+02,
+        -3.066479806614716e+01,
+        2.506628277459239e+00,
     ];
     const B: [f64; 5] = [
-        -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
-        6.680131188771972e+01, -1.328068155288572e+01,
+        -5.447609879822406e+01,
+        1.615858368580409e+02,
+        -1.556989798598866e+02,
+        6.680131188771972e+01,
+        -1.328068155288572e+01,
     ];
     const C: [f64; 6] = [
-        -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
-        -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00,
+        -7.784894002430293e-03,
+        -3.223964580411365e-01,
+        -2.400758277161838e+00,
+        -2.549732539343734e+00,
+        4.374664141464968e+00,
+        2.938163982698783e+00,
     ];
     const D: [f64; 4] = [
-        7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+        7.784695709041462e-03,
+        3.224671290700398e-01,
+        2.445134137142996e+00,
         3.754408661907416e+00,
     ];
     const P_LOW: f64 = 0.02425;
@@ -222,8 +235,10 @@ pub fn beam_encode_group(
                 }
             }
         }
-        let mut cand: Vec<(u32, f64, u32, u8)> =
-            best.into_iter().map(|(st, (c, pi, sy))| (st, c, pi, sy)).collect();
+        let mut cand: Vec<(u32, f64, u32, u8)> = best
+            .into_iter()
+            .map(|(st, (c, pi, sy))| (st, c, pi, sy))
+            .collect();
         cand.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         cand.truncate(beam_width);
         let mut rec = Vec::with_capacity(cand.len());
@@ -295,7 +310,10 @@ mod tests {
     struct Lcg(u64);
     impl Lcg {
         fn next_u01(&mut self) -> f64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
         }
         fn next_normal(&mut self) -> f32 {
@@ -329,7 +347,11 @@ mod tests {
         let min_v = group.iter().cloned().fold(f32::INFINITY, f32::min);
         let max_v = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let range = max_v - min_v;
-        let scale = if range > 0.0 { range / (levels - 1.0) } else { 1.0 };
+        let scale = if range > 0.0 {
+            range / (levels - 1.0)
+        } else {
+            1.0
+        };
         let inv = if range > 0.0 { 1.0 / scale } else { 0.0 };
         group
             .iter()
@@ -520,7 +542,8 @@ mod tests {
                 let mut g = [0.0f32; 256];
                 for (j, slot) in g.iter_mut().enumerate() {
                     let o = base + j * 2;
-                    *slot = f32::from_bits((u16::from_le_bytes([bytes[o], bytes[o + 1]]) as u32) << 16);
+                    *slot =
+                        f32::from_bits((u16::from_le_bytes([bytes[o], bytes[o + 1]]) as u32) << 16);
                 }
                 crate::cpu_fwht_256(&mut g, &signs1, &signs2);
                 let var = g.iter().map(|&w| (w as f64) * (w as f64)).sum::<f64>() / 256.0;
@@ -553,15 +576,24 @@ mod tests {
         let mut rng = Lcg(0xBEEF_F00D);
         let group: Vec<f32> = (0..256).map(|_| rng.next_normal()).collect();
         let scale = group_scale(&group);
-        let vit = mse(&group, &decode_group(&encode_group(&group, scale, &cb), scale, &cb));
+        let vit = mse(
+            &group,
+            &decode_group(&encode_group(&group, scale, &cb), scale, &cb),
+        );
         let beam = mse(
             &group,
             &decode_group(&beam_encode_group(&group, scale, &cb, 128), scale, &cb),
         );
-        eprintln!("viterbi MSE={vit:.6}  beam128 MSE={beam:.6}  (beam/vit={:.4})", beam / vit);
+        eprintln!(
+            "viterbi MSE={vit:.6}  beam128 MSE={beam:.6}  (beam/vit={:.4})",
+            beam / vit
+        );
         // Beam (128) within ~6% of full Viterbi — the price for ~30× speed that
         // makes full-model encoding feasible. (beam=64 measured ~5.3%.)
-        assert!(beam <= vit * 1.06, "beam128 MSE {beam:.6} not within 6% of Viterbi {vit:.6}");
+        assert!(
+            beam <= vit * 1.06,
+            "beam128 MSE {beam:.6} not within 6% of Viterbi {vit:.6}"
+        );
     }
 
     #[test]

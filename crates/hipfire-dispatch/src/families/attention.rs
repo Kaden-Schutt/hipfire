@@ -1115,6 +1115,7 @@ fn dispatch_attend(
 /// All `KernelKey` variants handled by `dispatch_kv_write`.
 /// If you add a new KV write key and forget to add a dispatch arm, the
 /// completeness test will fail.
+#[cfg(test)]
 pub(crate) const DISPATCHED_KV_WRITE_KEYS: &[KernelKey] = &[
     // Single-token
     KernelKey::KvWriteF32,
@@ -1139,6 +1140,7 @@ pub(crate) const DISPATCHED_KV_WRITE_KEYS: &[KernelKey] = &[
 ];
 
 /// All `KernelKey` variants handled by `dispatch_attend`.
+#[cfg(test)]
 pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     // Single-token
     KernelKey::AttnF32,
@@ -1165,6 +1167,7 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
 ];
 
 /// All `KernelKey` variants handled by `dispatch_full_attention`.
+#[cfg(test)]
 const DISPATCHED_FULL_ATTENTION_KEYS: &[KernelKey] = &[
     KernelKey::AttnFullF16,
     KernelKey::AttnFullF32,

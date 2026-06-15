@@ -7740,10 +7740,9 @@ fn main() {
                             .ok()
                             .flatten()
                             .is_some();
-                            let sidecar = std::path::Path::new(
-                                &m.model_path.replace(".hfq", ".mtp.hfq"),
-                            )
-                            .exists();
+                            let sidecar =
+                                std::path::Path::new(&m.model_path.replace(".hfq", ".mtp.hfq"))
+                                    .exists();
                             bundled || sidecar
                         };
                         m.mtp_weights_present = qwen35_mtp_present
@@ -11881,11 +11880,7 @@ fn generate_mtp(
     }
 
     // Load the MTP head from the bundled trailer (or a sibling .mtp.hfq).
-    let head = match mtp_head::load_mtp_head_bundled(
-        Path::new(&m.model_path),
-        gpu,
-        max_seq_total,
-    ) {
+    let head = match mtp_head::load_mtp_head_bundled(Path::new(&m.model_path), gpu, max_seq_total) {
         Ok(Some(h)) => h,
         Ok(None) => {
             // No bundled trailer — try a sibling "<stem>.mtp.hfq".
@@ -11972,13 +11967,13 @@ fn generate_mtp(
 
         // Helper closure semantics inlined: stream one committed token, return
         // (hit_eos, think_cap_hit).
-        let mut emit_token = |stdout: &mut std::io::Stdout,
-                              tok: u32,
-                              streamed_tokens: &mut Vec<u32>,
-                              bytes_fed_to_filter: &mut usize,
-                              filter: &mut EosFilter,
-                              think_count: &mut usize,
-                              prev_in_think: &mut bool|
+        let emit_token = |stdout: &mut std::io::Stdout,
+                          tok: u32,
+                          streamed_tokens: &mut Vec<u32>,
+                          bytes_fed_to_filter: &mut usize,
+                          filter: &mut EosFilter,
+                          think_count: &mut usize,
+                          prev_in_think: &mut bool|
          -> (bool, bool) {
             streamed_tokens.push(tok);
             emit_committed_event(
@@ -12102,7 +12097,13 @@ fn generate_mtp(
                 hit_eos = true;
             }
         }
-        Ok((hit_eos, generated, cycles, accepted_total, t_decode.elapsed().as_secs_f64()))
+        Ok((
+            hit_eos,
+            generated,
+            cycles,
+            accepted_total,
+            t_decode.elapsed().as_secs_f64(),
+        ))
     })();
 
     // Cleanup: free MTP state + head, put trunk pieces back on the model.

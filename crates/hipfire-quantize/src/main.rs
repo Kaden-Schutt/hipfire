@@ -6101,11 +6101,6 @@ fn main() {
         // shared expert; FP8 E4M3 + F32 weight_scale_inv block-128 storage;
         // split per-expert w1/w3/w2 (like deepseek_v4). Crate hipfire-arch-minimax.
         "minimax_m2" => 10,
-        // LFM2.5-MoE (LiquidAI): hybrid 18 short-conv + 6 GQA-attn layers; 2 dense
-        // SwiGLU MLP + 22 top-4 MoE layers; sigmoid + expert_bias routing. bf16
-        // source, per-expert pre-split w1/w2/w3 (like minimax). Conv filter +
-        // expert_bias stay high precision. Crate hipfire-arch-lfm2moe.
-        "lfm2_moe" => 11,
         // LFM2.5 (LiquidAI): hybrid short-conv + GQA-attn layers, SwiGLU FFN.
         //   "lfm2_moe" = A1B (dense MLP head layers + top-4 MoE); per-expert
         //               pre-split w1/w2/w3 → MQ4G256, everything else → Q8.

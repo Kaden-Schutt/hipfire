@@ -75,7 +75,6 @@ pub struct RcclComms {
     _lib: Library,
     comms: Vec<NcclComm>,
 
-    fn_comm_init_all: unsafe extern "C" fn(*mut NcclComm, c_int, *const c_int) -> u32,
     fn_comm_destroy: unsafe extern "C" fn(NcclComm) -> u32,
     fn_all_reduce: unsafe extern "C" fn(
         *const c_void, // sendbuff
@@ -189,7 +188,6 @@ impl RcclComms {
         Ok(Self {
             _lib: lib,
             comms,
-            fn_comm_init_all,
             fn_comm_destroy,
             fn_all_reduce,
             fn_group_start,

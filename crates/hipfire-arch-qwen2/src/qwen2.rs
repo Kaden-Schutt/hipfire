@@ -28,16 +28,16 @@
 //! crate shares one implementation. Marked individually below.
 
 use hip_bridge::{DeviceBuffer, HipResult};
-use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{
-    f16_to_f32, gemv_family, weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor,
-};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
     self, EscapeKind, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::{dtype_rotation_plan, DispatchError};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::{
+    f16_to_f32, gemv_family, weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.

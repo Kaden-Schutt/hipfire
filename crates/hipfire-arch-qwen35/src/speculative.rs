@@ -5244,19 +5244,6 @@ impl GdnTape {
                         )?;
                     }
                 }
-                qwen35::StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
-                    &self.q_scratch,
-                    &self.k_scratch,
-                    &self.v_scratch,
-                    &self.alpha_bufs[la_idx],
-                    &self.beta_bufs[la_idx],
-                    &dn_state.s_matrices[la_idx],
-                    &dn_state.s_scales[la_idx],
-                    &self.attn_scratch,
-                    n_steps,
-                    n_v_heads,
-                    value_head_dim,
-                )?,
                 qwen35::StateQuant::Q4 => gpu.gated_delta_net_q4(
                     &self.q_scratch,
                     &self.k_scratch,

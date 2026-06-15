@@ -57,10 +57,6 @@ struct Args {
 fn parse_args() -> Args {
     let mut out = Args {
         max_new_tokens: 16,
-        ..Default::default()
-    };
-    let mut out = Args {
-        max_new_tokens: 16,
         max_seq: 512,
         ..Default::default()
     };
@@ -70,9 +66,6 @@ fn parse_args() -> Args {
             "--hfq" => out.hfq = it.next(),
             "--prompt-file" => out.prompt_file = it.next(),
             "--reference" => out.reference = it.next(),
-            "--max-new-tokens" => {
-                out.max_new_tokens = it.next().and_then(|s| s.parse().ok()).unwrap_or(16)
-            }
             "--max-new-tokens" => {
                 out.max_new_tokens = it.next().and_then(|s| s.parse().ok()).unwrap_or(16)
             }

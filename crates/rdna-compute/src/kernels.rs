@@ -1601,6 +1601,7 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC: &str =
 // stuck on the dot2 fp16 fallback before this).
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gfx12/gemm_hfq4g256_residual_wmma.gfx12.hip");
+#[allow(dead_code)]
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx12_bt.hip");
 pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str =
@@ -1613,6 +1614,7 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.hip");
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
+#[allow(dead_code)]
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.gfx12.hip");
 // gfx906 MMQ kernel (see docs/plans/gfx906-mmq-prd.md and
@@ -1700,6 +1702,7 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC: &str =
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gfx12/gemm_gate_up_hfq4g256_wmma.gfx12.hip");
+#[allow(dead_code)]
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_gfx12_bt.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str =
@@ -1708,6 +1711,7 @@ pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str =
 // routing for the DeltaNet LinearAttention preamble.
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gfx12/gemm_qkvza_hfq4g256_wmma.gfx12.hip");
+#[allow(dead_code)]
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma_gfx12_bt.hip");
 // HFQ3-G256 sister of GEMM_QKVZA_HFQ4G256_WMMA_SRC. Same WMMA shape +
@@ -2758,6 +2762,7 @@ pub const ATTENTION_DFLASH_WMMA_SRC: &str =
 /// gfx11 `_w32` builtin does not lower on gfx12 — "Cannot select intrinsic").
 /// Routed via `has_wmma_w32_gfx12()` in `attention_dflash_wmma_f32`. See
 /// `kernels/src/attention_dflash_wmma.gfx12.hip`.
+#[allow(dead_code)]
 pub const ATTENTION_DFLASH_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/attention_dflash_wmma.gfx12.hip");
 
@@ -2774,6 +2779,7 @@ pub const ATTENTION_DFLASH_WMMA_M32_SRC: &str =
 /// WMMA, K split across wave-halves). Routed via `has_wmma_w32_gfx12()`
 /// in `attention_dflash_wmma_m32_f32`. See
 /// `kernels/src/attention_dflash_wmma_m32.gfx12.hip`.
+#[allow(dead_code)]
 pub const ATTENTION_DFLASH_WMMA_M32_GFX12_SRC: &str =
     include_str!("../../../kernels/src/attention_dflash_wmma_m32.gfx12.hip");
 
@@ -2933,6 +2939,7 @@ pub const GATED_DELTA_NET_Q8_ROUTED_BATCH_SEQ_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_q8_routed_batch_seq.hip");
 /// Fast variant for the default MQ4/HFQ4 path: no per-token requant,
 /// requant outside the loop. Supports EF residual. Lower VGPR pressure.
+#[allow(dead_code)]
 pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip");
 
@@ -3680,11 +3687,13 @@ pub const V4F_ATTN_SWA_TOPK_DIRECT_BATCHED_SRC: &str =
 /// Head-batched f16-WMMA port of the direct-batched DSA attention (gfx1151).
 /// Same joint-softmax math; 16 heads/block so the score/output GEMVs become
 /// WMMA GEMMs reading the shared K/V once. See deepseek4_attn_swa_topk_direct_wmma.hip.
+#[allow(dead_code)]
 pub const V4F_ATTN_SWA_TOPK_DIRECT_WMMA_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_attn_swa_topk_direct_wmma.hip");
 
 /// Head-batched f16-WMMA port of the gathered DSA attention (top-K staged into
 /// topk_kv[B,D,topk_win]). Sibling of the direct WMMA kernel.
+#[allow(dead_code)]
 pub const V4F_ATTN_SWA_TOPK_BATCHED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_attn_swa_topk_batched_wmma.hip");
 
@@ -3784,14 +3793,14 @@ mod dispatch_tests {
                 let caps = make_caps(arch);
                 match arch {
                     "gfx1200" | "gfx1201" => {
-                        let (src, mod_name) = gemm_mq4g256_lloyd_residual_wmma_for_arch(&caps);
+                        let (_src, mod_name) = gemm_mq4g256_lloyd_residual_wmma_for_arch(&caps);
                         assert!(
                             mod_name.contains("rdna4"),
                             "{arch}: expected rdna4, got {mod_name}"
                         );
                     }
                     "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
-                        let (src, mod_name) = gemm_mq4g256_lloyd_residual_wmma_for_arch(&caps);
+                        let (_src, mod_name) = gemm_mq4g256_lloyd_residual_wmma_for_arch(&caps);
                         assert!(
                             mod_name.contains("rdna3"),
                             "{arch}: expected rdna3, got {mod_name}"

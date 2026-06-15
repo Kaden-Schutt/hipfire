@@ -667,7 +667,7 @@ impl KernelKey {
             MQ3G256 => ArchPredicate::HasWmma,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWmma,
-            Q8HFQ | Raw | BF16 => ArchPredicate::Always,
+            Q8HFQ | Raw => ArchPredicate::Always,
         }
     }
 

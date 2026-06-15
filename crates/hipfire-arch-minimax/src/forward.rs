@@ -30,7 +30,7 @@
 use crate::minimax::{MiniMaxConfig, MiniMaxLayerWeights, MiniMaxState, MiniMaxWeights};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
-    self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
+    self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind,
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::llama::{

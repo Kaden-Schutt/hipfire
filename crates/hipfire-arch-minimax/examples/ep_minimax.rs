@@ -75,7 +75,7 @@ fn main() {
     let model = model.expect("--model required");
 
     // ── config + tokenizer (per-rank loads reopen the file) ─────────────────
-    let mut hfq0 = HfqFile::open(&model).expect("open model");
+    let hfq0 = HfqFile::open(&model).expect("open model");
     let cfg = MiniMaxConfig::from_hfq(&hfq0).expect("config");
     let tok = Tokenizer::from_hfq_metadata(&hfq0.metadata_json).expect("tokenizer");
     let n_exp = cfg.num_local_experts;
