@@ -11,6 +11,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 ## Current Overlay
 
 - Rust server chat requests now forward structured daemon `messages` while keeping `prompt` as the last-user-text compatibility fallback.
+- Rust server OpenAI chat-message conversion now reuses `hipfire-prompt` helpers instead of route-local prompt-boundary mapping.
 - Rust server model loads now build typed daemon `LoadParams` from config, preserving explicit DFlash mode and configured TriAttention sidecars over the shared JSONL contract.
 - The daemon now opportunistically consumes shared typed generate and load request contracts while keeping raw JSON fallbacks for legacy and daemon-only fields.
 - Daemon generate request/token/done/error protocol types now reuse `hipfire-generate` contracts instead of duplicating generate structs in `hipfire-daemon-protocol`.

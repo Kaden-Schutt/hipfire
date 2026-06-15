@@ -400,6 +400,59 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+pub fn openai_chat_role_to_prompt_role(role: &str) -> Option<Role> {
+    match role {
+        "system" => Some(Role::System),
+        "user" => Some(Role::User),
+        "assistant" => Some(Role::Assistant),
+        "tool" => Some(Role::Tool),
+        _ => None,
+    }
+}
+
+pub fn openai_chat_content_to_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+pub fn openai_chat_message_to_prompt_message(
+    role: &str,
+    content: Option<&serde_json::Value>,
+) -> Option<Message> {
+    Some(Message {
+        role: openai_chat_role_to_prompt_role(role)?,
+        content: openai_chat_content_to_text(content),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    })
+}
+
+pub fn openai_chat_messages_to_prompt_messages<'a, I>(messages: I) -> Vec<Message>
+where
+    I: IntoIterator<Item = (&'a str, Option<&'a serde_json::Value>)>,
+{
+    messages
+        .into_iter()
+        .filter_map(|(role, content)| openai_chat_message_to_prompt_message(role, content))
+        .collect()
+}
+
+pub fn openai_chat_last_user_prompt<'a, I>(messages: I) -> String
+where
+    I: IntoIterator<Item = (&'a str, Option<&'a serde_json::Value>)>,
+{
+    let mut last = None;
+    for (role, content) in messages {
+        if role == "user" {
+            last = Some(openai_chat_content_to_text(content));
+        }
+    }
+    last.unwrap_or_default()
+}
+
 /// Remove HF `{% generation %}` / `{% endgeneration %}` tags (with optional
 /// whitespace-control dashes and the line they sit on) from a chat template.
 /// These mark the assistant-token span for training-data masking and emit
@@ -1132,6 +1185,47 @@ mod tests {
         let got = frame.build();
         let expected = t.encode("completion text");
         assert_eq!(got, expected, "raw=true should bypass ChatML scaffolding");
+    }
+
+    #[test]
+    fn openai_chat_helpers_build_prompt_messages_and_last_user_fallback() {
+        let messages = vec![
+            ("system", Some(serde_json::json!("be brief"))),
+            ("user", Some(serde_json::json!("first"))),
+            ("assistant", Some(serde_json::json!("ok"))),
+            ("ignored", Some(serde_json::json!("drop me"))),
+            (
+                "user",
+                Some(serde_json::json!({"type": "text", "text": "second"})),
+            ),
+        ];
+
+        let prompt_messages = openai_chat_messages_to_prompt_messages(
+            messages
+                .iter()
+                .map(|(role, content)| (*role, content.as_ref())),
+        );
+        assert_eq!(prompt_messages.len(), 4);
+        assert_eq!(prompt_messages[0].role, Role::System);
+        assert_eq!(prompt_messages[0].content, "be brief");
+        assert_eq!(prompt_messages[2].role, Role::Assistant);
+        assert_eq!(prompt_messages[3].role, Role::User);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&prompt_messages[3].content)
+                .expect("structured prompt message json"),
+            serde_json::json!({"type": "text", "text": "second"})
+        );
+
+        let fallback = openai_chat_last_user_prompt(
+            messages
+                .iter()
+                .map(|(role, content)| (*role, content.as_ref())),
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fallback)
+                .expect("structured fallback prompt json"),
+            serde_json::json!({"type": "text", "text": "second"})
+        );
     }
 
     #[test]
