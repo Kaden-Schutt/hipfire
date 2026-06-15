@@ -19,11 +19,11 @@
 
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipResult, Stream};
+use hipfire_model::tokenizer::{Tokenizer, TokenizerError};
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
 use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};

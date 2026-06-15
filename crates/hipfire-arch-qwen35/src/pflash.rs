@@ -17,9 +17,9 @@
 //! selection land in subsequent phases.
 
 use hip_bridge::HipResult;
+use hipfire_model::tokenizer::Tokenizer;
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
-use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{DType, Gpu};
 use std::path::Path;
 

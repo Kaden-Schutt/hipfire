@@ -21,10 +21,10 @@
 use hipfire_arch_qwen35::qwen35::{
     self, DeltaNetState, Qwen35Scratch, Qwen35ScratchSet, StateQuant,
 };
+use hipfire_model::tokenizer::Tokenizer;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
 use std::path::Path;
 

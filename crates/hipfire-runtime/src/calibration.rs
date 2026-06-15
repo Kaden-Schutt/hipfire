@@ -39,7 +39,7 @@
 //! `TODO(subagent-X)` below are the single-line wire-in points.
 
 use crate::bf16_loader::is_gptq_target;
-use crate::tokenizer::Tokenizer;
+use hipfire_model::tokenizer::Tokenizer;
 use rdna_compute::{ActivationCapture, DType, Gpu, GpuTensor};
 use std::collections::HashMap;
 use std::ffi::c_void;

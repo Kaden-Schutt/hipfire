@@ -3040,7 +3040,7 @@ struct LoadedModel {
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
     // Shared
-    tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
+    tokenizer: Option<hipfire_model::tokenizer::Tokenizer>,
     // Multi-turn conversation state
     //
     // `seq_pos` is the *physical* write position in the KV cache (the value
@@ -9651,7 +9651,7 @@ fn load_model(
         }
         kv_mode = "fp32".to_string();
     }
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+    let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
     // DFlash speculative-decode requires the target's lm_head to have a
@@ -10785,7 +10785,7 @@ fn load_model_safetensors(
 
     // Tokenizer from tokenizer.json
     let tokenizer = if let Some(tok_path) = source.tokenizer_json_path() {
-        hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
+        hipfire_model::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
             .map_err(|e| format!("failed to parse tokenizer at {}: {e}", tok_path.display()))?
             .ok_or_else(|| format!("failed to load tokenizer from {}", tok_path.display()))?
     } else {
@@ -11071,7 +11071,7 @@ fn load_model_pp(
         }
         kv_mode = "fp32".to_string();
     }
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+    let tokenizer = hipfire_model::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
     if !is_qwen35_family_arch_id(hfq.arch_id) {
