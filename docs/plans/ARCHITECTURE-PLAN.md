@@ -36,6 +36,7 @@ Current prompt boundary status:
 - `hipfire-prompt` owns OpenAI chat-role/content conversion helpers used by the Rust server to build structured daemon messages and last-user prompt fallbacks.
 - `hipfire-prompt` owns assistant-turn prompt-history fingerprinting and canonical tool-call argument JSON used by daemon multi-turn prefix-cache identity.
 - `hipfire-prompt` owns assistant-prefix wire-label parsing for `plain`, `open_think`, and `closed_think` request paths.
+- `hipfire-prompt` owns load-time chat-template source resolution for env-file, per-model override file, and embedded model-template precedence.
 - `hipfire-runtime::prompt_frame` remains a compatibility re-export and implements the prompt tokenizer trait for the runtime tokenizer.
 - `hipfire-daemon` now consumes `hipfire-prompt` directly for daemon prompt framing, assistant-prefix labels, tool-call fingerprints, and structured message history instead of routing those types through the runtime compatibility facade.
 - The Rust server forwards structured chat `messages` to the daemon and keeps `prompt` as the last-user-text compatibility fallback, avoiding nested ChatML.

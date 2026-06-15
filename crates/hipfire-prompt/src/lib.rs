@@ -37,6 +37,103 @@
 //! against a base model where any `<|im_start|>` token would be
 //! out-of-distribution.
 
+use std::path::Path;
+
+/// Resolved model chat template plus the source selected by the load-time
+/// precedence chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedChatTemplate {
+    pub template: String,
+    pub source: ChatTemplateSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatTemplateSource {
+    EnvFile(String),
+    PerModelFile(String),
+    Embedded,
+}
+
+/// Resolve the chat template to use for a loaded model.
+///
+/// Precedence:
+/// 1. `HIPFIRE_CHAT_TEMPLATE_FILE`, when set and readable.
+/// 2. Per-model file at `$HOME/.hipfire/templates/<model-basename>.j2`.
+/// 3. Embedded model template.
+///
+/// Read failures on override files are non-fatal and fall through to the next
+/// source, matching the daemon's historical behavior.
+pub fn resolve_chat_template(
+    model_path: &str,
+    embedded_template: Option<String>,
+) -> Option<ResolvedChatTemplate> {
+    if let Ok(env_path) = std::env::var("HIPFIRE_CHAT_TEMPLATE_FILE") {
+        if !env_path.is_empty() {
+            match std::fs::read_to_string(&env_path) {
+                Ok(template) => {
+                    return Some(ResolvedChatTemplate {
+                        template,
+                        source: ChatTemplateSource::EnvFile(env_path),
+                    });
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[chat_template] HIPFIRE_CHAT_TEMPLATE_FILE={env_path} failed to read ({e}); falling through"
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let basename = Path::new(model_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if !basename.is_empty() {
+            let per_model = Path::new(&home)
+                .join(".hipfire")
+                .join("templates")
+                .join(format!("{basename}.j2"));
+            if per_model.is_file() {
+                match std::fs::read_to_string(&per_model) {
+                    Ok(template) => {
+                        return Some(ResolvedChatTemplate {
+                            template,
+                            source: ChatTemplateSource::PerModelFile(
+                                per_model.display().to_string(),
+                            ),
+                        });
+                    }
+                    Err(e) => eprintln!(
+                        "[chat_template] per-model file {} failed to read ({e}); falling through",
+                        per_model.display()
+                    ),
+                }
+            }
+        }
+    }
+
+    embedded_template.map(|template| ResolvedChatTemplate {
+        template,
+        source: ChatTemplateSource::Embedded,
+    })
+}
+
+pub fn log_resolved_chat_template_source(source: &ChatTemplateSource) {
+    match source {
+        ChatTemplateSource::EnvFile(path) => {
+            eprintln!("[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE={path}");
+        }
+        ChatTemplateSource::PerModelFile(path) => {
+            eprintln!("[chat_template] using per-model override {path}");
+        }
+        ChatTemplateSource::Embedded => {
+            eprintln!("[chat_template] using HFQ-embedded tokenizer_config.chat_template");
+        }
+    }
+}
+
 /// Minimal tokenizer surface needed by prompt framing.
 ///
 /// Keeping this trait in `hipfire-prompt` lets the prompt crate own chat
@@ -916,6 +1013,49 @@ pub fn build_cached_history_jinja(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvSnapshot {
+        hipfire_chat_template_file: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+    }
+
+    impl EnvSnapshot {
+        fn capture() -> Self {
+            Self {
+                hipfire_chat_template_file: std::env::var_os("HIPFIRE_CHAT_TEMPLATE_FILE"),
+                home: std::env::var_os("HOME"),
+            }
+        }
+
+        fn restore(self) {
+            unsafe {
+                match self.hipfire_chat_template_file {
+                    Some(value) => std::env::set_var("HIPFIRE_CHAT_TEMPLATE_FILE", value),
+                    None => std::env::remove_var("HIPFIRE_CHAT_TEMPLATE_FILE"),
+                }
+                match self.home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-prompt-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     struct TestTokenizer {
         include_think: bool,
@@ -1450,6 +1590,68 @@ mod tests {
             canonical_json(&left),
             r#"{"a":{"c":"x","d":null},"b":[{"a":true,"z":1}]}"#
         );
+    }
+
+    #[test]
+    fn chat_template_resolution_prefers_env_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let snapshot = EnvSnapshot::capture();
+        let root = temp_dir("env-template");
+        let env_file = root.join("env.j2");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(&env_file, "env-template").unwrap();
+        unsafe {
+            std::env::set_var("HIPFIRE_CHAT_TEMPLATE_FILE", &env_file);
+            std::env::set_var("HOME", &home);
+        }
+
+        let resolved =
+            resolve_chat_template("/models/qwen3.5-9b-mq4.hfq", Some("embedded".to_string()))
+                .expect("template");
+
+        assert_eq!(resolved.template, "env-template");
+        assert_eq!(
+            resolved.source,
+            ChatTemplateSource::EnvFile(env_file.display().to_string())
+        );
+        snapshot.restore();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn chat_template_resolution_falls_back_to_per_model_then_embedded() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let snapshot = EnvSnapshot::capture();
+        let root = temp_dir("per-model-template");
+        let home = root.join("home");
+        let templates = home.join(".hipfire").join("templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        let per_model = templates.join("qwen3.5-9b-mq4.hfq.j2");
+        std::fs::write(&per_model, "per-model-template").unwrap();
+        unsafe {
+            std::env::set_var("HIPFIRE_CHAT_TEMPLATE_FILE", root.join("missing.j2"));
+            std::env::set_var("HOME", &home);
+        }
+
+        let resolved =
+            resolve_chat_template("/models/qwen3.5-9b-mq4.hfq", Some("embedded".to_string()))
+                .expect("template");
+
+        assert_eq!(resolved.template, "per-model-template");
+        assert_eq!(
+            resolved.source,
+            ChatTemplateSource::PerModelFile(per_model.display().to_string())
+        );
+
+        std::fs::remove_file(&per_model).unwrap();
+        let resolved =
+            resolve_chat_template("/models/qwen3.5-9b-mq4.hfq", Some("embedded".to_string()))
+                .expect("embedded template");
+        assert_eq!(resolved.template, "embedded");
+        assert_eq!(resolved.source, ChatTemplateSource::Embedded);
+        snapshot.restore();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

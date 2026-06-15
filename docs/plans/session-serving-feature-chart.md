@@ -14,6 +14,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server OpenAI chat-message conversion now reuses `hipfire-prompt` helpers instead of route-local prompt-boundary mapping.
 - Daemon assistant-turn prefix-cache identity now reuses `hipfire-prompt` fingerprinting and canonical tool-call argument JSON instead of daemon-local helpers.
 - Daemon assistant-prefix request labels now reuse `hipfire-prompt` parsing for `plain`, `open_think`, and `closed_think`.
+- Daemon load-time chat-template env/per-model/embedded precedence now reuses `hipfire-prompt` resolution instead of daemon-local file probing.
 - Daemon prompt framing now consumes `hipfire-prompt` directly instead of routing prompt types through `hipfire-runtime::prompt_frame`.
 - Rust server model loads now build typed daemon `LoadParams` from config, preserving explicit DFlash mode and configured TriAttention sidecars over the shared JSONL contract.
 - The daemon now opportunistically consumes shared typed generate and load request contracts while keeping raw JSON fallbacks for legacy and daemon-only fields.
