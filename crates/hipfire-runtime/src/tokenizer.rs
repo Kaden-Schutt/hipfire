@@ -5,7 +5,7 @@
 //! BPE tokenizer loaded from GGUF metadata.
 //! Supports encode (text → token IDs) and decode (token IDs → text).
 
-use crate::gguf::{GgufFile, MetaValue};
+use hipfire_model::gguf::{GgufFile, MetaValue};
 use regex::Regex;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};

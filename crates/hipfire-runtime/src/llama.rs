@@ -5,9 +5,9 @@
 //! LLaMA model implementation using RDNA GPU compute.
 //! Supports loading from GGUF files and running inference.
 
-use crate::gguf::{GgmlType, GgufFile, TensorInfo};
 use crate::multi_gpu::Gpus;
 use hip_bridge::HipResult;
+use hipfire_model::gguf::{GgmlType, GgufFile, TensorInfo};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Model architecture type.
