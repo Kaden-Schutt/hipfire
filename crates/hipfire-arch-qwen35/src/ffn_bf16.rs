@@ -6,7 +6,8 @@
 
 use std::sync::OnceLock;
 
-pub use hipfire_cpu::{
+#[allow(unused_imports)]
+pub(crate) use hipfire_cpu::{
     attention_wo_module_id, attention_wo_residual_contract_from_shape,
     attention_wo_residual_invocation_from_shape, bf16_bits_to_f32, decode_w_down_shadow,
     dense_ffn_backend_decision, dense_ffn_module_evidence, dense_ffn_module_evidence_json,
@@ -16,11 +17,11 @@ pub use hipfire_cpu::{
     projection_module_output, projection_module_output_json, round_f32_to_bf16,
     swiglu_down_bf16_cpu, Bf16DownShadow, DenseFfnBackend, DenseFfnBackendPreference,
     DenseFfnModuleContract, DenseFfnModuleEvidence, DenseFfnModuleInvocation, DenseFfnModuleOutput,
-    DenseFfnStateContract, DenseFfnTensorContract, DiffStats, ProjectionModuleContract,
-    ProjectionModuleInvocation, ProjectionModuleOutput, ProjectionStateContract,
-    ProjectionTensorContract,
+    DenseFfnStateContract, DenseFfnTensorContract, DiffStats, ModuleInvocation,
+    ProjectionModuleContract, ProjectionModuleInvocation, ProjectionModuleOutput,
+    ProjectionStateContract, ProjectionTensorContract,
 };
-pub use hipfire_npu::Xdna1ModuleArtifacts;
+pub(crate) use hipfire_npu::{xdna1_swiglu_admission, Xdna1ModuleArtifacts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfnBf16Mode {
@@ -103,6 +104,27 @@ pub fn dense_ffn_backend_preference_for_mode(
         FfnBf16Mode::Compare => Some(DenseFfnBackendPreference::GpuProduction),
         FfnBf16Mode::Cpu => Some(DenseFfnBackendPreference::CpuOracle),
         FfnBf16Mode::Xdna1 => Some(DenseFfnBackendPreference::NpuOptIn),
+    }
+}
+
+pub(crate) fn xdna1_dense_ffn_module_invocation_from_shape(
+    layer_idx: usize,
+    residual_len: usize,
+    hidden_size: usize,
+    artifacts: &Xdna1ModuleArtifacts,
+) -> DenseFfnModuleInvocation {
+    let base = dense_ffn_module_invocation_from_shape(
+        layer_idx,
+        residual_len,
+        hidden_size,
+        DenseFfnBackendPreference::NpuOptIn,
+        false,
+    );
+    let admission = xdna1_swiglu_admission(&ModuleInvocation::from(base.clone()), artifacts);
+    DenseFfnModuleInvocation {
+        selected_backend: admission.selection.selected_backend,
+        fallback_reason: admission.selection.fallback_reason,
+        ..base
     }
 }
 
@@ -310,15 +332,23 @@ mod tests {
             dense_ffn_backend_preference_for_mode(FfnBf16Mode::Xdna1),
             Some(DenseFfnBackendPreference::NpuOptIn)
         );
-        let invocation = dense_ffn_module_invocation_from_shape(
+        let missing = xdna1_dense_ffn_module_invocation_from_shape(
             2,
             4096,
             11008,
-            dense_ffn_backend_preference_for_mode(FfnBf16Mode::Xdna1).unwrap(),
-            false,
+            &Xdna1ModuleArtifacts::new(None, None),
         );
-        assert_eq!(invocation.selected_backend, DenseFfnBackend::GpuProduction);
-        assert_eq!(invocation.fallback_reason, Some("npu_backend_unavailable"));
+        assert_eq!(missing.selected_backend, DenseFfnBackend::GpuProduction);
+        assert_eq!(missing.fallback_reason, Some("npu_artifacts_missing"));
+
+        let admitted = xdna1_dense_ffn_module_invocation_from_shape(
+            2,
+            4096,
+            11008,
+            &Xdna1ModuleArtifacts::new(Some("a.xclbin".to_string()), Some("a.instr".to_string())),
+        );
+        assert_eq!(admitted.selected_backend, DenseFfnBackend::NpuXdna1);
+        assert_eq!(admitted.fallback_reason, None);
     }
 
     #[test]

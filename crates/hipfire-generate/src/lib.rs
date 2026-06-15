@@ -4,11 +4,14 @@
 
 //! Typed generation request, event, and batch-plan contracts.
 
-use hipfire_model::{is_qwen35_dense_arch_id, is_qwen35_moe_arch_id, ARCH_ID_QWEN35_MOE};
+use hipfire_model::{has_worker_or_model_identity, is_qwen35_dense_arch_id, is_qwen35_moe_arch_id};
 use hipfire_prompt::{
     openai_chat_last_user_prompt, openai_chat_messages_to_prompt_messages, Message,
 };
-pub use hipfire_state::SequenceStatePrefixHash as GenerateBatchPrefillPrefixHash;
+use hipfire_state::{
+    canonical_generate_state_kind_hash_label, qwen35_kv_deltanet_state_kind_labels,
+    SequenceStatePageKind, SequenceStatePrefixHash,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -300,10 +303,10 @@ pub struct GenerateBatchPrefillStateHandle {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_state_handle: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix_hash: Option<GenerateBatchPrefillPrefixHash>,
+    pub prefix_hash: Option<SequenceStatePrefixHash>,
 }
 
-pub fn generate_prefix_hash_json(hash: &GenerateBatchPrefillPrefixHash) -> serde_json::Value {
+pub fn generate_prefix_hash_json(hash: &SequenceStatePrefixHash) -> serde_json::Value {
     serde_json::json!({
         "algorithm": hash.algorithm,
         "value": hash.value,
@@ -325,7 +328,7 @@ pub fn compute_qwen35_prefix_hash(
     assistant_prefix: &str,
     max_think_tokens: usize,
     tokens: &[u32],
-) -> GenerateBatchPrefillPrefixHash {
+) -> SequenceStatePrefixHash {
     let mut buf = Vec::with_capacity(128 + tokens.len() * 4);
     push_hash_field(
         &mut buf,
@@ -337,16 +340,17 @@ pub fn compute_qwen35_prefix_hash(
     push_hash_field(&mut buf, "kv_mode", kv_mode.unwrap_or("unknown"));
     push_hash_field(&mut buf, "assistant_prefix", assistant_prefix);
     push_hash_field(&mut buf, "max_think_tokens", &max_think_tokens.to_string());
-    let mut normalized_kinds = state_kinds.to_vec();
-    normalized_kinds.sort();
-    normalized_kinds.dedup();
-    push_hash_field(&mut buf, "state_kinds", &normalized_kinds.join("+"));
+    push_hash_field(
+        &mut buf,
+        "state_kinds",
+        &canonical_generate_state_kind_hash_label(state_kinds),
+    );
     push_hash_field(&mut buf, "token_encoding", "u32le");
     for token in tokens {
         buf.extend_from_slice(&token.to_le_bytes());
     }
     let value = twox_hash::XxHash3_128::oneshot(&buf);
-    GenerateBatchPrefillPrefixHash {
+    SequenceStatePrefixHash {
         algorithm: "xxh128".to_string(),
         value: format!("{value:032x}"),
         prefix_len: tokens.len(),
@@ -362,7 +366,7 @@ pub struct PrefixHashPreflightEnvelope {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PrefixHashPreflightCandidate {
-    pub hash: GenerateBatchPrefillPrefixHash,
+    pub hash: SequenceStatePrefixHash,
     pub boundary: String,
     pub boundary_index: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -401,7 +405,7 @@ pub struct Qwen35SemanticBoundaryCheckpoint {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint_id: Option<String>,
     pub prefix_len: usize,
-    pub hash: GenerateBatchPrefillPrefixHash,
+    pub hash: SequenceStatePrefixHash,
     pub boundary: String,
     pub boundary_index: usize,
 }
@@ -422,7 +426,7 @@ pub struct Qwen35PrefillCheckpointHook<'a> {
     pub source_state_handle: &'a str,
     pub logical_position: usize,
     pub kind: Qwen35PrefillCheckpointKind<'a>,
-    pub prefix_hash: &'a GenerateBatchPrefillPrefixHash,
+    pub prefix_hash: &'a SequenceStatePrefixHash,
 }
 
 pub fn qwen35_checkpoint_session_id(
@@ -515,7 +519,7 @@ fn parse_u32_array(value: &serde_json::Value, field: &str) -> Result<Vec<u32>, S
 fn parse_prefix_hash(
     value: &serde_json::Value,
     field: &str,
-) -> Result<GenerateBatchPrefillPrefixHash, String> {
+) -> Result<SequenceStatePrefixHash, String> {
     let obj = value
         .as_object()
         .ok_or_else(|| format!("{field} must be an object"))?;
@@ -541,7 +545,7 @@ fn parse_prefix_hash(
         obj.get("prefix_len")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| format!("{field}.prefix_len must be an integer >= 0"))? as usize;
-    Ok(GenerateBatchPrefillPrefixHash {
+    Ok(SequenceStatePrefixHash {
         algorithm: algorithm.to_string(),
         value: hash_value.to_string(),
         prefix_len,
@@ -563,17 +567,7 @@ pub fn validate_generate_batch_prefill(
         .ok_or_else(|| "generate_batch_prefill.batch_id must be a non-empty string".to_string())?
         .to_string();
 
-    let has_worker = msg
-        .get("worker_key_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .is_some()
-        || msg
-            .get("model")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .is_some();
-    if !has_worker {
+    if !has_worker_or_model_identity(msg) {
         return Err("generate_batch_prefill requires worker_key_id or model identity".to_string());
     }
 
@@ -639,19 +633,12 @@ pub fn validate_generate_batch_prefill(
                 "{prefix}.state_handle.state_kinds must be a non-empty array"
             ));
         }
-        let valid_state_kinds = [
-            "attention_kv",
-            "deltanet_recurrent",
-            "mamba_ssm",
-            "mamba_conv",
-            "architecture_specific",
-        ];
         let mut parsed_state_kinds = Vec::with_capacity(state_kinds.len());
         for kind in state_kinds.iter() {
             let kind = kind
                 .as_str()
                 .ok_or_else(|| format!("{prefix}.state_handle.state_kinds must be strings"))?;
-            if !valid_state_kinds.contains(&kind) {
+            if SequenceStatePageKind::from_generate_state_kind(kind).is_none() {
                 return Err(format!(
                     "{prefix}.state_handle.state_kinds contains unsupported kind {kind}"
                 ));
@@ -851,17 +838,7 @@ pub fn validate_generate_batch_decode(
             "generate_batch_decode_step.batch_id must be a non-empty string".to_string()
         })?
         .to_string();
-    let has_worker = msg
-        .get("worker_key_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .is_some()
-        || msg
-            .get("model")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .is_some();
-    if !has_worker {
+    if !has_worker_or_model_identity(msg) {
         return Err(
             "generate_batch_decode_step requires worker_key_id or model identity".to_string(),
         );
@@ -993,7 +970,7 @@ pub struct Qwen35PrefillSessionResult {
     pub prefill_tokens: usize,
     pub logical_position: usize,
     pub cached_prefix_tokens: usize,
-    pub prefix_hash: GenerateBatchPrefillPrefixHash,
+    pub prefix_hash: SequenceStatePrefixHash,
     pub debug_sample_token: Option<u32>,
     pub boundary_checkpoints: Vec<Qwen35SemanticBoundaryCheckpoint>,
 }
@@ -1417,19 +1394,20 @@ pub fn qwen35_decode_batch_scheduler_metadata(
     cached_prefix_tokens: usize,
 ) -> Qwen35DecodeBatchSchedulerMetadata {
     let fallback_reason = if qwen35_decode_batch_requested_auto(requested) {
-        match (arch_id, backend) {
-            (ARCH_ID_QWEN35_MOE, Qwen35DecodeBatchBackend::SerialReference)
+        let is_moe = is_qwen35_moe_arch_id(arch_id);
+        match (is_moe, backend) {
+            (true, Qwen35DecodeBatchBackend::SerialReference)
                 if !qwen35_grouped_moe_decode_auto_latency_gate_passed(batch_size) =>
             {
                 "auto_grouped_moe_serial_small_batch_latency_gate"
             }
-            (ARCH_ID_QWEN35_MOE, Qwen35DecodeBatchBackend::SerialReference) => {
+            (true, Qwen35DecodeBatchBackend::SerialReference) => {
                 "auto_grouped_moe_serial_pending_latency_gate"
             }
-            (_, Qwen35DecodeBatchBackend::SerialReference) if batch_size < 2 => {
+            (false, Qwen35DecodeBatchBackend::SerialReference) if batch_size < 2 => {
                 "auto_requires_multi_session"
             }
-            (_, Qwen35DecodeBatchBackend::SerialReference) => "auto_serial_reference",
+            (false, Qwen35DecodeBatchBackend::SerialReference) => "auto_serial_reference",
             _ => "none",
         }
     } else if backend == Qwen35DecodeBatchBackend::SerialReference {
@@ -1440,7 +1418,7 @@ pub fn qwen35_decode_batch_scheduler_metadata(
     Qwen35DecodeBatchSchedulerMetadata {
         selected_backend: backend.as_str(),
         batch_size,
-        compatible_state_kinds: vec!["attention_kv", "deltanet_recurrent"],
+        compatible_state_kinds: qwen35_kv_deltanet_state_kind_labels(),
         cached_prefix_tokens,
         fallback_reason,
     }
@@ -1486,7 +1464,7 @@ pub struct GenerationTiming {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hipfire_model::ARCH_ID_QWEN35_DENSE;
+    use hipfire_model::{ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE};
 
     fn prefill_session(id: &str) -> GenerateBatchPrefillSession {
         GenerateBatchPrefillSession {
@@ -1800,6 +1778,27 @@ mod tests {
     }
 
     #[test]
+    fn generate_batch_prefill_rejects_backend_private_state_kind() {
+        let msg = serde_json::json!({
+            "type": "generate_batch_prefill",
+            "id": "prefill-1",
+            "batch_id": "batch-1",
+            "worker_key_id": "worker-a",
+            "sessions": [{
+                "id": "req-1",
+                "suffix_tokens": [4, 5],
+                "state_handle": {
+                    "state_kinds": ["backend_private"],
+                    "logical_position": 0
+                }
+            }]
+        });
+
+        let err = validate_generate_batch_prefill(&msg).unwrap_err();
+        assert!(err.contains("state_handle.state_kinds contains unsupported kind backend_private"));
+    }
+
+    #[test]
     fn validates_prefix_hash_preflight_json_contract() {
         let msg = serde_json::json!({
             "type": "prefix_hash_preflight",
@@ -1909,7 +1908,7 @@ mod tests {
 
     #[test]
     fn prefix_hash_json_shape_is_stable() {
-        let hash = GenerateBatchPrefillPrefixHash {
+        let hash = SequenceStatePrefixHash {
             algorithm: "xxh128".to_string(),
             value: "0123456789abcdef0123456789abcdef".to_string(),
             prefix_len: 7,
@@ -1928,7 +1927,7 @@ mod tests {
     fn prefix_hash_preflight_done_json_shape_is_stable() {
         let candidates = vec![
             PrefixHashPreflightCandidate {
-                hash: GenerateBatchPrefillPrefixHash {
+                hash: SequenceStatePrefixHash {
                     algorithm: "xxh128".to_string(),
                     value: "11111111111111111111111111111111".to_string(),
                     prefix_len: 3,
@@ -1938,7 +1937,7 @@ mod tests {
                 checkpoint_id: None,
             },
             PrefixHashPreflightCandidate {
-                hash: GenerateBatchPrefillPrefixHash {
+                hash: SequenceStatePrefixHash {
                     algorithm: "xxh128".to_string(),
                     value: "22222222222222222222222222222222".to_string(),
                     prefix_len: 8,
@@ -1987,7 +1986,7 @@ mod tests {
         let checkpoint = Qwen35SemanticBoundaryCheckpoint {
             checkpoint_id: Some("qwen35-checkpoint:batch:req-1:7".to_string()),
             prefix_len: 7,
-            hash: GenerateBatchPrefillPrefixHash {
+            hash: SequenceStatePrefixHash {
                 algorithm: "xxh128".to_string(),
                 value: "0123456789abcdef0123456789abcdef".to_string(),
                 prefix_len: 7,
@@ -2019,7 +2018,7 @@ mod tests {
             session_count: 1,
             sessions: Vec::new(),
         };
-        let hash = GenerateBatchPrefillPrefixHash {
+        let hash = SequenceStatePrefixHash {
             algorithm: "xxh128".to_string(),
             value: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             prefix_len: 12,
@@ -2041,7 +2040,7 @@ mod tests {
             boundary_checkpoints: vec![Qwen35SemanticBoundaryCheckpoint {
                 checkpoint_id: Some("qwen35-checkpoint:batch-1:req-1:boundary:0:8".to_string()),
                 prefix_len: 8,
-                hash: GenerateBatchPrefillPrefixHash {
+                hash: SequenceStatePrefixHash {
                     algorithm: "xxh128".to_string(),
                     value: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
                     prefix_len: 8,
@@ -2147,7 +2146,7 @@ mod tests {
 
     #[test]
     fn qwen35_prefill_checkpoint_hook_preserves_handle_contract() {
-        let hash = GenerateBatchPrefillPrefixHash {
+        let hash = SequenceStatePrefixHash {
             algorithm: "xxh128".to_string(),
             value: "0123456789abcdef0123456789abcdef".to_string(),
             prefix_len: 12,

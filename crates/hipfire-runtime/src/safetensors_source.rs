@@ -4,7 +4,7 @@
 //! Reads config.json for architecture detection and quantization config.
 //! Mmaps .safetensors files and serves tensor data by name.
 
-use crate::model_source::{ModelSource, QuantConfig, TensorInfo};
+use hipfire_model::{ModelSource, QuantConfig, TensorInfo};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;

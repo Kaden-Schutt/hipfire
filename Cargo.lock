@@ -742,6 +742,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-cpu",
  "hipfire-dispatch",
+ "hipfire-model",
  "hipfire-npu",
  "hipfire-rocm",
  "hipfire-runtime",
@@ -790,7 +791,7 @@ dependencies = [
  "clap",
  "hipfire-config",
  "hipfire-daemon-adapter",
- "hipfire-daemon-protocol",
+ "hipfire-generate",
  "hipfire-model",
  "hipfire-server",
  "indicatif",
@@ -841,8 +842,8 @@ dependencies = [
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
  "hipfire-daemon-adapter",
- "hipfire-daemon-protocol",
  "hipfire-generate",
+ "hipfire-model",
  "hipfire-prompt",
  "hipfire-runtime",
  "hipfire-state",
@@ -860,6 +861,8 @@ dependencies = [
  "dirs",
  "futures",
  "hipfire-daemon-protocol",
+ "hipfire-generate",
+ "hipfire-model",
  "libc",
  "serde_json",
  "tokio",
@@ -912,6 +915,7 @@ dependencies = [
  "csv",
  "hipfire-coherence",
  "hipfire-evidence",
+ "hipfire-hash",
  "hipfire-model",
  "libc",
  "serde",
@@ -1032,6 +1036,7 @@ name = "hipfire-scheduler"
 version = "0.2.1"
 dependencies = [
  "hipfire-model",
+ "hipfire-state",
  "serde_json",
 ]
 
@@ -1045,7 +1050,6 @@ dependencies = [
  "futures",
  "hipfire-config",
  "hipfire-daemon-adapter",
- "hipfire-daemon-protocol",
  "hipfire-generate",
  "hipfire-model",
  "hipfire-prompt",
@@ -1066,6 +1070,7 @@ dependencies = [
 name = "hipfire-state"
 version = "0.2.1"
 dependencies = [
+ "hipfire-model",
  "serde",
  "serde_json",
 ]

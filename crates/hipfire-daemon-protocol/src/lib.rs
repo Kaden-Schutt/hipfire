@@ -6,33 +6,27 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use hipfire_generate::{
-    DoneEvent as DoneResponse, ErrorEvent as ErrorResponse, GenerateTextRequest as GenerateRequest,
-    GenerationSamplingPolicy, TokenEvent as TokenResponse,
-};
-pub use hipfire_model::{
-    ModelLoadParams as LoadParams, ModelLoadRequest as LoadRequest,
-    ModelLoadedResponse as LoadedResponse,
-};
+use hipfire_generate::{DoneEvent, ErrorEvent, GenerateTextRequest, TokenEvent};
+use hipfire_model::{ModelLoadRequest, ModelLoadedResponse};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
-    Load(LoadRequest),
+    Load(ModelLoadRequest),
     Unload,
     Ping,
-    Generate(GenerateRequest),
+    Generate(GenerateTextRequest),
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonResponse {
-    Loaded(LoadedResponse),
+    Loaded(ModelLoadedResponse),
     Unloaded,
     Pong,
-    Token(TokenResponse),
-    Done(DoneResponse),
-    Error(ErrorResponse),
+    Token(TokenEvent),
+    Done(DoneEvent),
+    Error(ErrorEvent),
     #[serde(other)]
     Unknown,
 }
@@ -40,12 +34,13 @@ pub enum DaemonResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_generate::{GenerateTextRequest, GenerationSamplingPolicy};
     use hipfire_prompt::{Message, Role};
     use serde_json::json;
 
     #[test]
     fn generate_request_serializes_structured_messages_without_nested_prompt() {
-        let req = DaemonRequest::Generate(GenerateRequest {
+        let req = DaemonRequest::Generate(GenerateTextRequest {
             id: "req-1".to_string(),
             prompt: "last user text".to_string(),
             messages: Some(vec![

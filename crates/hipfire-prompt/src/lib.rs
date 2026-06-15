@@ -39,6 +39,142 @@
 
 use std::path::Path;
 
+/// Normalize pasted or file-backed prompt text before tokenization.
+///
+/// The transform is deliberately byte-stable for already-clean input and
+/// returns `Cow::Borrowed` when no rewrite is needed. Callers own the policy
+/// decision for whether normalization is enabled.
+///
+/// Pipeline order:
+/// 1. `\r\n` / `\r` line endings become `\n`.
+/// 2. U+00A0 becomes a plain space.
+/// 3. Space/tab runs immediately before `\n` are stripped.
+/// 4. Runs of three or more newlines collapse to exactly two.
+pub fn normalize_prompt_text(s: &str) -> std::borrow::Cow<'_, str> {
+    normalize_prompt_text_with_policy(s, true)
+}
+
+/// Normalize prompt text when `enabled` is true; otherwise borrow unchanged.
+pub fn normalize_prompt_text_with_policy(s: &str, enabled: bool) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if !enabled {
+        return Cow::Borrowed(s);
+    }
+
+    let mut cur: Cow<'_, str> = Cow::Borrowed(s);
+    if needs_line_ending_normalize(&cur) {
+        cur = Cow::Owned(normalize_line_endings(&cur));
+    }
+    if needs_nbsp_replace(&cur) {
+        cur = Cow::Owned(replace_nbsp_with_space(&cur));
+    }
+    if needs_trailing_ws_strip(&cur) {
+        cur = Cow::Owned(strip_trailing_line_ws(&cur));
+    }
+    if needs_newline_collapse(&cur) {
+        cur = Cow::Owned(collapse_newline_runs(&cur));
+    }
+    cur
+}
+
+pub fn needs_newline_collapse(s: &str) -> bool {
+    let mut nl_run: usize = 0;
+    for b in s.bytes() {
+        if b == b'\n' {
+            nl_run += 1;
+            if nl_run >= 3 {
+                return true;
+            }
+        } else {
+            nl_run = 0;
+        }
+    }
+    false
+}
+
+pub fn needs_line_ending_normalize(s: &str) -> bool {
+    s.as_bytes().contains(&b'\r')
+}
+
+pub fn needs_nbsp_replace(s: &str) -> bool {
+    let b = s.as_bytes();
+    for i in 0..b.len().saturating_sub(1) {
+        if b[i] == 0xC2 && b[i + 1] == 0xA0 {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn needs_trailing_ws_strip(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'\n' && i > 0 {
+            let prev = bytes[i - 1];
+            if prev == b' ' || prev == b'\t' {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn collapse_newline_runs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut nl_run: usize = 0;
+    for ch in s.chars() {
+        if ch == '\n' {
+            nl_run += 1;
+            if nl_run <= 2 {
+                out.push(ch);
+            }
+        } else {
+            nl_run = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub fn normalize_line_endings(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if matches!(chars.peek(), Some('\n')) {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+pub fn replace_nbsp_with_space(s: &str) -> String {
+    s.replace('\u{00A0}', " ")
+}
+
+pub fn strip_trailing_line_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for i in 0..bytes.len() {
+        if bytes[i] == b'\n' {
+            let mut end = i;
+            while end > start && (bytes[end - 1] == b' ' || bytes[end - 1] == b'\t') {
+                end -= 1;
+            }
+            out.push_str(&s[start..end]);
+            out.push('\n');
+            start = i + 1;
+        }
+    }
+    out.push_str(&s[start..]);
+    out
+}
+
 /// Resolved model chat template plus the source selected by the load-time
 /// precedence chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1953,5 +2089,36 @@ mod tests {
             with_sys, expected,
             "system message should be a prefix of the rest of the frame"
         );
+    }
+
+    #[test]
+    fn prompt_normalization_pipeline_rewrites_known_cold_tokens() {
+        let s = "def foo():   \r\n    return\u{00A0}1   \r\n\n\nbar";
+        let out = normalize_prompt_text(s);
+        assert_eq!(out.as_ref(), "def foo():\n    return 1\n\nbar");
+    }
+
+    #[test]
+    fn prompt_normalization_preserves_completion_suffix_space() {
+        let s = "def foo():\n    return ";
+        let out = normalize_prompt_text(s);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), s);
+    }
+
+    #[test]
+    fn prompt_normalization_can_be_disabled() {
+        let s = "a\r\nb\u{00A0}c   \nd\n\n\ne";
+        let out = normalize_prompt_text_with_policy(s, false);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), s);
+    }
+
+    #[test]
+    fn prompt_normalization_clean_input_is_borrowed() {
+        let s = "Plain prompt.\nSecond line.\n\nThird paragraph.\n";
+        let out = normalize_prompt_text(s);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), s);
     }
 }

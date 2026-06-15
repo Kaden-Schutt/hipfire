@@ -27,7 +27,6 @@ pub mod dflash;
 pub mod env_docs;
 pub mod eos_filter;
 pub mod ep;
-pub mod eval_harness;
 pub mod gguf;
 pub mod hfq;
 pub mod hfq_modules;
@@ -48,25 +47,22 @@ pub mod tp_shard;
 pub mod triattn;
 #[cfg(feature = "deltanet")]
 pub mod weight_pager;
-pub mod prompt_frame {
-    pub use hipfire_prompt::*;
 
-    impl hipfire_prompt::PromptTokenizer for crate::tokenizer::Tokenizer {
-        fn encode(&self, text: &str) -> Vec<u32> {
-            crate::tokenizer::Tokenizer::encode(self, text)
-        }
+impl hipfire_prompt::PromptTokenizer for tokenizer::Tokenizer {
+    fn encode(&self, text: &str) -> Vec<u32> {
+        tokenizer::Tokenizer::encode(self, text)
+    }
 
-        fn special_token_id(&self, content: &str) -> Option<u32> {
-            crate::tokenizer::Tokenizer::special_token_id(self, content)
-        }
+    fn special_token_id(&self, content: &str) -> Option<u32> {
+        tokenizer::Tokenizer::special_token_id(self, content)
+    }
 
-        fn special_tokens(&self) -> &[(String, u32)] {
-            crate::tokenizer::Tokenizer::special_tokens(self)
-        }
+    fn special_tokens(&self) -> &[(String, u32)] {
+        tokenizer::Tokenizer::special_tokens(self)
+    }
 
-        fn bos_token_text(&self) -> String {
-            let bytes = self.decode_bytes(&[self.bos_id]);
-            String::from_utf8_lossy(&bytes).to_string()
-        }
+    fn bos_token_text(&self) -> String {
+        let bytes = self.decode_bytes(&[self.bos_id]);
+        String::from_utf8_lossy(&bytes).to_string()
     }
 }

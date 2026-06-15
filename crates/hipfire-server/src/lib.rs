@@ -2,13 +2,13 @@ pub mod model;
 pub mod routes;
 pub mod state;
 
-pub use hipfire_config::HipfireConfig;
 pub use state::{AppState, SharedState};
 
 use axum::{
     routing::{get, post},
     Router,
 };
+use hipfire_config::HipfireConfig;
 use tower_http::cors::{Any, CorsLayer};
 
 pub fn build_router(state: SharedState) -> Router {

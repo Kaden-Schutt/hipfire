@@ -4,10 +4,10 @@
 
 //! Priority scheduling and session batching policy shared by control planes.
 
-pub use hipfire_model::{
-    model_worker_key_id, normalize_feature_flags, normalize_model_worker_key,
-    same_model_worker_key, ModelWorkerKey,
-};
+#[cfg(test)]
+use hipfire_model::model_worker_key_id;
+use hipfire_model::{normalize_model_worker_key, same_model_worker_key, ModelWorkerKey};
+use hipfire_state::generate_state_kind_sets_match_exactly;
 use std::collections::{BTreeMap, HashSet};
 
 pub const SCHED_PRIORITY_REALTIME: u8 = 0;
@@ -517,11 +517,7 @@ pub fn sessions_compatible_for_prefill(a: &RequestSessionDraft, b: &RequestSessi
     if !same_model_worker_key(&a.worker_key, &b.worker_key) {
         return false;
     }
-    let mut a_kinds = a.state_handle.state_kinds.clone();
-    let mut b_kinds = b.state_handle.state_kinds.clone();
-    a_kinds.sort();
-    b_kinds.sort();
-    a_kinds == b_kinds
+    generate_state_kind_sets_match_exactly(&a.state_handle.state_kinds, &b.state_handle.state_kinds)
 }
 
 #[derive(Clone, Debug)]

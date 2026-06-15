@@ -472,44 +472,45 @@ impl Tokenizer {
     /// Returns `Ok(None)` if the file is missing or unreadable; `Err` if the
     /// file exists but fails to parse as a valid tokenizer.
     pub fn from_tokenizer_json(path: &std::path::Path) -> Result<Option<Self>, TokenizerError> {
-        let json_str = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
+        let Some(json_str) = hipfire_model::read_optional_tokenizer_json(path) else {
+            return Ok(None);
         };
         Self::from_hf_json(&json_str).map(Some)
     }
 
     pub fn from_hfq_metadata(metadata_json: &str) -> Result<Self, TokenizerError> {
         let meta: serde_json::Value = serde_json::from_str(metadata_json)?;
-        if let Some(tok_str) = meta.get("tokenizer").and_then(|v| v.as_str()) {
-            let mut t = Self::from_hf_json(tok_str)?;
-            // `from_hf_json` infers bos/eos from vocab heuristics (it defaults bos
-            // to `<|endoftext|>`), which is WRONG for models whose BOS differs —
-            // e.g. LFM2.5 bos = `<|startoftext|>` (id 1), not `<|endoftext|>`
-            // (id 2). `generation_config.{bos,eos}_token_id` is the authoritative
-            // HF source; override from it when present + scalar (an array eos =
-            // multi-eos: keep the heuristic). Embedded by the quantizer at convert
-            // time. (LFM2.5-350M daemon bring-up, 2026-06-07.)
-            if let Some(gc) = meta.get("generation_config") {
-                if let Some(b) = gc.get("bos_token_id").and_then(|v| v.as_u64()) {
-                    if (b as usize) < t.vocab.len() {
-                        t.bos_id = b as u32;
+        match hipfire_model::hfq_tokenizer_metadata(metadata_json)? {
+            Some(hipfire_model::HfqTokenizerMetadata::HfJson(tok_str)) => {
+                let mut t = Self::from_hf_json(&tok_str)?;
+                // `from_hf_json` infers bos/eos from vocab heuristics (it defaults bos
+                // to `<|endoftext|>`), which is WRONG for models whose BOS differs —
+                // e.g. LFM2.5 bos = `<|startoftext|>` (id 1), not `<|endoftext|>`
+                // (id 2). `generation_config.{bos,eos}_token_id` is the authoritative
+                // HF source; override from it when present + scalar (an array eos =
+                // multi-eos: keep the heuristic). Embedded by the quantizer at convert
+                // time. (LFM2.5-350M daemon bring-up, 2026-06-07.)
+                if let Some(gc) = meta.get("generation_config") {
+                    if let Some(b) = gc.get("bos_token_id").and_then(|v| v.as_u64()) {
+                        if (b as usize) < t.vocab.len() {
+                            t.bos_id = b as u32;
+                        }
+                    }
+                    if let Some(e) = gc.get("eos_token_id").and_then(|v| v.as_u64()) {
+                        if (e as usize) < t.vocab.len() {
+                            t.eos_id = e as u32;
+                        }
                     }
                 }
-                if let Some(e) = gc.get("eos_token_id").and_then(|v| v.as_u64()) {
-                    if (e as usize) < t.vocab.len() {
-                        t.eos_id = e as u32;
-                    }
-                }
+                Ok(t)
             }
-            return Ok(t);
+            Some(hipfire_model::HfqTokenizerMetadata::GgufMeta(gguf_meta)) => {
+                Self::from_gguf_meta_json(&gguf_meta)
+            }
+            None => Err(TokenizerError::MetadataMissing {
+                field: "tokenizer | gguf_meta",
+            }),
         }
-        if let Some(gguf_meta) = meta.get("gguf_meta") {
-            return Self::from_gguf_meta_json(gguf_meta);
-        }
-        Err(TokenizerError::MetadataMissing {
-            field: "tokenizer | gguf_meta",
-        })
     }
 
     /// Load tokenizer from a JSON-serialized GGUF metadata tree. Mirrors
@@ -1322,20 +1323,7 @@ impl Tokenizer {
 ///
 /// Single newlines and double newlines pass through unchanged.
 pub fn collapse_newline_runs(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut nl_run: usize = 0;
-    for ch in s.chars() {
-        if ch == '\n' {
-            nl_run += 1;
-            if nl_run <= 2 {
-                out.push('\n');
-            }
-        } else {
-            nl_run = 0;
-            out.push(ch);
-        }
-    }
-    out
+    hipfire_prompt::collapse_newline_runs(s)
 }
 
 /// Replace `\r\n` and bare `\r` with `\n`.
@@ -1351,20 +1339,7 @@ pub fn collapse_newline_runs(s: &str) -> String {
 /// silently survive as a cold byte. `\n\r` (extremely rare, looks like a
 /// blank line under reverse-CR convention) becomes `\n\n`.
 pub fn normalize_line_endings(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\r' {
-            out.push('\n');
-            // Skip an immediately-following \n to avoid CRLF → \n\n.
-            if chars.peek() == Some(&'\n') {
-                chars.next();
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    hipfire_prompt::normalize_line_endings(s)
 }
 
 /// Replace U+00A0 NO-BREAK SPACE with regular ASCII space.
@@ -1375,7 +1350,7 @@ pub fn normalize_line_endings(s: &str) -> String {
 /// tokenizes as a high-rank merge (often `Â ` artifacts) rather than the
 /// hot ` ` (id 220). Visually identical, semantically equivalent.
 pub fn replace_nbsp_with_space(s: &str) -> String {
-    s.replace('\u{00A0}', " ")
+    hipfire_prompt::replace_nbsp_with_space(s)
 }
 
 /// Strip trailing whitespace runs (` ` and `\t`) that immediately precede a `\n`.
@@ -1389,36 +1364,27 @@ pub fn replace_nbsp_with_space(s: &str) -> String {
 /// Codebases run through formatters strip these — but copy-pasted snippets
 /// or hand-edited prompts often retain them.
 pub fn strip_trailing_line_ws(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    // Buffer each pending whitespace character verbatim. A naive `count`
-    // approach corrupts tab indentation: `"a\tb"` would flush as `"a b"`,
-    // silently downgrading non-trailing tabs to spaces and breaking
-    // tab-significant content (Makefiles, TSV, mixed-indent Python).
-    let mut pending: Vec<char> = Vec::new();
-    for ch in s.chars() {
-        match ch {
-            ' ' | '\t' => pending.push(ch),
-            '\n' => {
-                // Drop pending whitespace before the newline.
-                pending.clear();
-                out.push('\n');
-            }
-            _ => {
-                // Flush pending whitespace verbatim — it's mid-line, keep it
-                // exactly as it appeared (tabs stay tabs, spaces stay spaces).
-                for &p in &pending {
-                    out.push(p);
-                }
-                pending.clear();
-                out.push(ch);
-            }
-        }
-    }
-    // End-of-string trailing whitespace: PRESERVE for completion-style prompts.
-    for &p in &pending {
-        out.push(p);
-    }
-    out
+    hipfire_prompt::strip_trailing_line_ws(s)
+}
+
+#[cfg(test)]
+fn needs_newline_collapse(s: &str) -> bool {
+    hipfire_prompt::needs_newline_collapse(s)
+}
+
+#[cfg(test)]
+fn needs_line_ending_normalize(s: &str) -> bool {
+    hipfire_prompt::needs_line_ending_normalize(s)
+}
+
+#[cfg(test)]
+fn needs_nbsp_replace(s: &str) -> bool {
+    hipfire_prompt::needs_nbsp_replace(s)
+}
+
+#[cfg(test)]
+fn needs_trailing_ws_strip(s: &str) -> bool {
+    hipfire_prompt::needs_trailing_ws_strip(s)
 }
 
 /// Prompt normalization for higher DFlash τ.
@@ -1457,67 +1423,7 @@ pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
         return Cow::Borrowed(s);
     }
 
-    let mut cur: Cow<'_, str> = Cow::Borrowed(s);
-    if needs_line_ending_normalize(&cur) {
-        cur = Cow::Owned(normalize_line_endings(&cur));
-    }
-    if needs_nbsp_replace(&cur) {
-        cur = Cow::Owned(replace_nbsp_with_space(&cur));
-    }
-    if needs_trailing_ws_strip(&cur) {
-        cur = Cow::Owned(strip_trailing_line_ws(&cur));
-    }
-    if needs_newline_collapse(&cur) {
-        cur = Cow::Owned(collapse_newline_runs(&cur));
-    }
-    cur
-}
-
-fn needs_newline_collapse(s: &str) -> bool {
-    let mut nl_run: usize = 0;
-    for b in s.bytes() {
-        if b == b'\n' {
-            nl_run += 1;
-            if nl_run >= 3 {
-                return true;
-            }
-        } else {
-            nl_run = 0;
-        }
-    }
-    false
-}
-
-fn needs_line_ending_normalize(s: &str) -> bool {
-    s.as_bytes().contains(&b'\r')
-}
-
-fn needs_nbsp_replace(s: &str) -> bool {
-    // UTF-8 of U+00A0 is 0xC2 0xA0. Cheap two-byte scan beats Unicode-aware
-    // contains() for the common no-NBSP case.
-    let b = s.as_bytes();
-    for i in 0..b.len().saturating_sub(1) {
-        if b[i] == 0xC2 && b[i + 1] == 0xA0 {
-            return true;
-        }
-    }
-    false
-}
-
-fn needs_trailing_ws_strip(s: &str) -> bool {
-    // True iff any line in `s` has ` ` or `\t` immediately before `\n`.
-    // (End-of-string trailing whitespace is preserved by `strip_trailing_line_ws`,
-    // so it doesn't count as "needs strip".)
-    let bytes = s.as_bytes();
-    for i in 0..bytes.len() {
-        if bytes[i] == b'\n' && i > 0 {
-            let prev = bytes[i - 1];
-            if prev == b' ' || prev == b'\t' {
-                return true;
-            }
-        }
-    }
-    false
+    hipfire_prompt::normalize_prompt_text_with_policy(s, true)
 }
 
 #[cfg(test)]
@@ -1838,6 +1744,27 @@ mod consistency_tests {
             other => panic!("expected MetadataMissing, got {other:?}"),
         }
     }
+
+    #[test]
+    fn rejects_hfq_metadata_without_tokenizer_payload() {
+        let err = match Tokenizer::from_hfq_metadata("{\"architecture\":\"qwen3\"}") {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err, got Ok"),
+        };
+        match err {
+            TokenizerError::MetadataMissing { field } => {
+                assert_eq!(field, "tokenizer | gguf_meta");
+            }
+            other => panic!("expected MetadataMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tokenizer_json_missing_file_remains_absent() {
+        let missing = std::path::Path::new("/tmp/hipfire-tokenizer-json-missing-for-test.json");
+        let _ = std::fs::remove_file(missing);
+        assert!(Tokenizer::from_tokenizer_json(missing).unwrap().is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1919,6 +1846,12 @@ mod sp_tests {
 #[cfg(test)]
 mod prompt_norm_tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn collapse_three_to_two() {
@@ -1972,6 +1905,7 @@ mod prompt_norm_tests {
 
     #[test]
     fn default_on_collapses_when_env_unset() {
+        let _guard = env_lock().lock().unwrap();
         // Default flipped to ON 2026-04-26 — env unset → still collapses.
         std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "a\n\n\nb";
@@ -1982,6 +1916,7 @@ mod prompt_norm_tests {
 
     #[test]
     fn explicit_zero_opts_out() {
+        let _guard = env_lock().lock().unwrap();
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         let s = "a\n\n\nb";
         let out = maybe_normalize_prompt(s);
@@ -1992,6 +1927,7 @@ mod prompt_norm_tests {
 
     #[test]
     fn cow_borrowed_when_no_runs() {
+        let _guard = env_lock().lock().unwrap();
         // Even with default-ON, no `\n{3,}` runs means no rewrite needed.
         std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "a\n\nb"; // already single-blank
@@ -2167,6 +2103,7 @@ mod prompt_norm_tests {
 
     #[test]
     fn pipeline_crlf_and_trailing_ws() {
+        let _guard = env_lock().lock().unwrap();
         // Windows-pasted snippet with trailing whitespace.
         std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "def foo():   \r\n    return 1   \r\n";
@@ -2176,6 +2113,7 @@ mod prompt_norm_tests {
 
     #[test]
     fn pipeline_blank_line_indent_then_collapse() {
+        let _guard = env_lock().lock().unwrap();
         // Indented blank line between top-level defs:
         //   "a\n    \n\nb" — line 2 is whitespace-only, lines 2-3 form a `\n\n\n`
         //   run after stripping. Collapse should reduce to `\n\n`.
@@ -2187,6 +2125,7 @@ mod prompt_norm_tests {
 
     #[test]
     fn pipeline_nbsp_in_prose() {
+        let _guard = env_lock().lock().unwrap();
         std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "Use\u{00A0}foo()\u{00A0}for\u{00A0}this.";
         let out = maybe_normalize_prompt(s);
@@ -2195,6 +2134,7 @@ mod prompt_norm_tests {
 
     #[test]
     fn pipeline_clean_input_is_borrowed() {
+        let _guard = env_lock().lock().unwrap();
         // No CRLF, no NBSP, no trailing ws, no \n{3,} — must stay Borrowed.
         std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "Plain prompt.\nSecond line.\n\nThird paragraph.\n";
@@ -2205,6 +2145,7 @@ mod prompt_norm_tests {
 
     #[test]
     fn pipeline_explicit_opt_out_skips_all_rules() {
+        let _guard = env_lock().lock().unwrap();
         // Opt-out must skip CRLF/NBSP/trailing-ws too, not just newline collapse.
         std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
         let s = "a\r\nb\u{00A0}c   \nd\n\n\ne";

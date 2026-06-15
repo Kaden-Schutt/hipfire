@@ -11,7 +11,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-pub use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback};
+use hipfire_hash::{file_hash, stable_hash_bytes};
 
 /// Extension preferred order for fuzzy model discovery.
 pub const QUANT_PREFERENCE: &[&str] =
@@ -64,6 +64,12 @@ pub struct HfqMetadata {
     pub metadata_json: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum HfqTokenizerMetadata {
+    HfJson(String),
+    GgufMeta(Value),
+}
+
 /// Stable identity for routing requests to a compatible loaded model worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelWorkerKey {
@@ -76,6 +82,47 @@ pub struct ModelWorkerKey {
     pub accelerator_kind: Option<String>,
     pub device_id: Option<String>,
     pub feature_flags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelWorkerId {
+    pub value: String,
+}
+
+impl ModelWorkerId {
+    pub fn from_runtime_parts(arch_id: u32, pp: usize, kv_mode: Option<&str>) -> Self {
+        Self {
+            value: format!(
+                "worker:arch{}:pp{}:{}",
+                arch_id,
+                pp,
+                kv_mode.unwrap_or("unknown")
+            ),
+        }
+    }
+}
+
+pub fn parse_model_worker_id(msg: &Value, default_worker_id: &str) -> ModelWorkerId {
+    let value = msg
+        .get("worker_id")
+        .or_else(|| msg.get("worker_key_id"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_worker_id)
+        .to_string();
+    ModelWorkerId { value }
+}
+
+pub fn has_worker_or_model_identity(msg: &Value) -> bool {
+    msg.get("worker_key_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .is_some()
+        || msg
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .is_some()
 }
 
 pub const ARCH_ID_LLAMA_MISTRAL: u32 = 0;
@@ -302,6 +349,44 @@ pub fn tokenizer_signature(
     mix(&eos_id.to_le_bytes());
     mix(&eot_id.unwrap_or(u32::MAX).to_le_bytes());
     h
+}
+
+/// Extract the tokenizer payload embedded in HFQ metadata.
+///
+/// Safetensors-origin HFQ files store a HuggingFace `tokenizer.json` blob in
+/// `tokenizer`; GGUF-origin HFQ files preserve the original GGUF tokenizer
+/// metadata under `gguf_meta`. Runtime still owns the actual encoder, but the
+/// model crate owns this artifact metadata selection policy.
+pub fn hfq_tokenizer_metadata(
+    metadata_json: &str,
+) -> Result<Option<HfqTokenizerMetadata>, serde_json::Error> {
+    let meta: Value = serde_json::from_str(metadata_json)?;
+    if let Some(tok_str) = meta.get("tokenizer").and_then(Value::as_str) {
+        return Ok(Some(HfqTokenizerMetadata::HfJson(tok_str.to_string())));
+    }
+    if let Some(gguf_meta) = meta.get("gguf_meta") {
+        return Ok(Some(HfqTokenizerMetadata::GgufMeta(gguf_meta.clone())));
+    }
+    Ok(None)
+}
+
+/// Extract the upstream HuggingFace Jinja chat template from HFQ metadata.
+pub fn hfq_chat_template(metadata_json: &str) -> Option<String> {
+    let meta: Value = serde_json::from_str(metadata_json).ok()?;
+    meta.get("tokenizer_config")?
+        .get("chat_template")?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+/// Read an optional HuggingFace `tokenizer.json` file from a model directory.
+///
+/// Safetensors directories carry tokenizer configuration as a sidecar file.
+/// Existing runtime behavior treats a missing or unreadable sidecar as absent
+/// and reserves hard errors for successfully-read but malformed tokenizer
+/// content.
+pub fn read_optional_tokenizer_json(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok()
 }
 
 /// Normalize a user-facing model tag into the fuzzy filename search stem.
@@ -975,6 +1060,148 @@ mod tests {
             tokenizer_signature(&vocab, &specials, 0, 1, None),
             tokenizer_signature(&vocab, &reversed_specials, 0, 1, None)
         );
+    }
+
+    #[test]
+    fn model_worker_id_follows_runtime_shape() {
+        assert_eq!(
+            ModelWorkerId::from_runtime_parts(6, 1, Some("q8")).value,
+            "worker:arch6:pp1:q8"
+        );
+        assert_eq!(
+            ModelWorkerId::from_runtime_parts(5, 2, None).value,
+            "worker:arch5:pp2:unknown"
+        );
+    }
+
+    #[test]
+    fn parse_model_worker_id_preserves_daemon_alias_priority() {
+        let worker_id = parse_model_worker_id(
+            &json!({
+                "worker_id": "worker-a",
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_id.value, "worker-a");
+
+        let worker_key_id = parse_model_worker_id(
+            &json!({
+                "worker_key_id": "worker-b"
+            }),
+            "__default__",
+        );
+        assert_eq!(worker_key_id.value, "worker-b");
+    }
+
+    #[test]
+    fn parse_model_worker_id_falls_back_to_default_worker() {
+        let missing = parse_model_worker_id(&json!({}), "__default__");
+        assert_eq!(missing.value, "__default__");
+
+        let empty = parse_model_worker_id(
+            &json!({
+                "worker_id": "",
+                "worker_key_id": ""
+            }),
+            "__default__",
+        );
+        assert_eq!(empty.value, "__default__");
+    }
+
+    #[test]
+    fn worker_or_model_identity_requires_non_empty_worker_key_or_model() {
+        assert!(has_worker_or_model_identity(&json!({
+            "worker_key_id": "worker-a"
+        })));
+        assert!(has_worker_or_model_identity(&json!({
+            "model": "qwen3.5-9b-mq4"
+        })));
+        assert!(!has_worker_or_model_identity(&json!({
+            "worker_key_id": "",
+            "model": ""
+        })));
+        assert!(!has_worker_or_model_identity(&json!({
+            "worker_id": "legacy-worker"
+        })));
+    }
+
+    #[test]
+    fn hfq_tokenizer_metadata_prefers_hf_tokenizer_json() {
+        let metadata = json!({
+            "tokenizer": "{\"model\":{\"vocab\":{},\"merges\":[]}}",
+            "gguf_meta": {
+                "tokenizer.ggml.tokens": ["<s>", "</s>"]
+            }
+        });
+
+        let extracted = hfq_tokenizer_metadata(&metadata.to_string()).unwrap();
+        assert_eq!(
+            extracted,
+            Some(HfqTokenizerMetadata::HfJson(
+                "{\"model\":{\"vocab\":{},\"merges\":[]}}".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn hfq_tokenizer_metadata_falls_back_to_gguf_metadata() {
+        let gguf_meta = json!({
+            "tokenizer.ggml.tokens": ["<s>", "</s>"],
+            "tokenizer.ggml.model": "llama"
+        });
+        let metadata = json!({ "gguf_meta": gguf_meta.clone() });
+
+        let extracted = hfq_tokenizer_metadata(&metadata.to_string()).unwrap();
+        assert_eq!(extracted, Some(HfqTokenizerMetadata::GgufMeta(gguf_meta)));
+    }
+
+    #[test]
+    fn hfq_tokenizer_metadata_reports_missing_payload() {
+        let metadata = json!({ "architecture": "qwen3" });
+
+        assert_eq!(hfq_tokenizer_metadata(&metadata.to_string()).unwrap(), None);
+    }
+
+    #[test]
+    fn hfq_chat_template_reads_tokenizer_config_template() {
+        let metadata = json!({
+            "tokenizer_config": {
+                "chat_template": "{% for message in messages %}{{ message.content }}{% endfor %}"
+            }
+        });
+
+        assert_eq!(
+            hfq_chat_template(&metadata.to_string()).as_deref(),
+            Some("{% for message in messages %}{{ message.content }}{% endfor %}")
+        );
+        assert_eq!(hfq_chat_template("{\"tokenizer_config\":{}}"), None);
+    }
+
+    #[test]
+    fn read_optional_tokenizer_json_treats_missing_sidecar_as_absent() {
+        let root = temp_dir("hipfire-model-tokenizer-json-missing");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("tokenizer.json");
+
+        assert_eq!(read_optional_tokenizer_json(&path), None);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_optional_tokenizer_json_returns_existing_sidecar_content() {
+        let root = temp_dir("hipfire-model-tokenizer-json-existing");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("tokenizer.json");
+        fs::write(&path, "{\"model\":{\"vocab\":{}}}").unwrap();
+
+        assert_eq!(
+            read_optional_tokenizer_json(&path).as_deref(),
+            Some("{\"model\":{\"vocab\":{}}}")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

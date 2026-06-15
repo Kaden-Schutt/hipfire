@@ -16,15 +16,25 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon assistant-prefix request labels now reuse `hipfire-prompt` parsing for `plain`, `open_think`, and `closed_think`.
 - Daemon load-time chat-template env/per-model/embedded precedence now reuses `hipfire-prompt` resolution instead of daemon-local file probing.
 - Daemon prompt framing now consumes `hipfire-prompt` directly instead of routing prompt types through `hipfire-runtime::prompt_frame`.
+- Daemon prompt normalization now consumes `hipfire-prompt` directly while preserving the runtime config/env opt-out policy.
+- Runtime examples now consume `hipfire-prompt` directly, and the old `hipfire-runtime::prompt_frame` compatibility re-export has been retired while runtime keeps the tokenizer trait implementation.
 - Rust server model loads now build typed daemon `LoadParams` from config, preserving explicit DFlash mode and configured TriAttention sidecars over the shared JSONL contract.
 - The daemon now opportunistically consumes shared typed generate and load request contracts while keeping raw JSON fallbacks for legacy and daemon-only fields.
 - Daemon generate request/token/done/error protocol types now reuse `hipfire-generate` contracts instead of duplicating generate structs in `hipfire-daemon-protocol`.
+- CLI, server, daemon, and daemon-adapter now consume generate/model request contracts directly from `hipfire-generate` and `hipfire-model`; `hipfire-daemon-protocol` no longer re-exports those contracts as compatibility aliases.
 - Rust server daemon request/response and process-client paths now consume `hipfire-daemon-protocol` and `hipfire-daemon-adapter` directly instead of server-local compatibility re-exports.
 - Rust server chat generate requests now reuse `hipfire-generate` OpenAI chat request construction instead of server-local prompt/message assembly.
 - Rust CLI run generate requests now reuse `hipfire-generate` OpenAI chat request construction instead of CLI-local ChatML rendering.
 - Rust server and CLI generation sampling defaults, prompt-only request construction, worker binding, tools, and system request decoration now reuse `hipfire-generate` helpers instead of adapter-local assembly.
 - Rust server OpenAI chat completion and streaming chunk responses now reuse `hipfire-generate` renderers instead of route-local JSON construction.
 - Daemon text/VL generation request contracts, generate-batch prefill/preflight/decode contracts, semantic boundary checkpoints, prefill checkpoint hooks, prepared prefill/result, decode result, and fused dense batch contracts, validators, prefix-hash helpers, Qwen3.5 batch backend selectors, fused prefill preflight helpers, scratch sizing policy, and decode scheduler metadata now reuse `hipfire-generate` ownership; prefix-hash data shapes, checkpoint request metadata, and model artifact memory accounting now reuse `hipfire-state` ownership instead of daemon-local duplicates.
+- Generate decode scheduler metadata now renders compatible KV/DeltaNet state-kind names through `hipfire-state` instead of local string literals.
+- Generate batch-prefill session validation now uses `hipfire-state` generate-session state-kind parsing instead of a generate-local whitelist.
+- Daemon Qwen3.5 batch-prefill required state-kind checks now use `hipfire-state` required-kind policy instead of daemon-local string scans.
+- Rust scheduler prefill compatibility now uses `hipfire-state` state-kind set comparison instead of scheduler-local sorting.
+- Generate prefix-hash state-kind canonicalization now uses `hipfire-state` sorting/dedup policy instead of generate-local normalization.
+- Generate decode scheduler metadata now uses `hipfire-state` Qwen3.5 compatible-kind labels instead of generate-local vector construction.
+- Runtime prompt normalization now delegates the pure text transform to `hipfire-prompt` while preserving the existing env/config wrapper.
 - Eval evidence artifact kinds and expected-metric catalogs now reuse `hipfire-evidence` ownership instead of runtime-local lists.
 - Eval runtime-evidence directory ingestion now uses `hipfire-evidence` catalog-based artifact path discovery instead of runtime-local filename lists.
 - Coherence run contracts, artifact serialization, daemon-backed execution, prompt execution, token capture, and detector report assembly now reuse `hipfire-coherence` ownership directly; the old `hipfire-runtime::coherence_runtime` import path has been retired.
@@ -32,25 +42,37 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust server model-load config conversion now reuses `hipfire-model` parameter construction instead of route-local filtering.
 - Rust CLI run model-load config conversion now reuses `hipfire-model` parameter construction instead of sending a max-seq-only load bundle.
 - Rust CLI and server config loading and local path helpers now reuse `hipfire-config` directly; the old `hipfire-server::config` compatibility re-export has been retired.
+- Rust CLI and server model modules no longer re-export model display/list helpers; callers use `hipfire-model` directly.
 - Rust server and CLI model discovery now reuse `hipfire-model` local artifact discovery helpers instead of server-local scanning.
 - Rust server `/v1/models` response rendering now reuses `hipfire-model` OpenAI-compatible list rendering instead of route-local JSON construction.
 - Eval DFlash draft auto-discovery now reuses `hipfire-model` sidecar discovery instead of eval-local candidate parsing.
 - Rust scheduler worker-key identity and compatibility helpers now reuse `hipfire-model` ownership instead of scheduler-local model identity code.
+- Rust scheduler now consumes model-worker identity helpers directly from `hipfire-model` instead of re-exporting them through scheduler.
+- Daemon and state runtime-worker views now consume model-worker runtime id construction and `worker_id` / `worker_key_id` alias parsing from `hipfire-model` instead of `hipfire-state`.
+- Generate batch validators now use `hipfire-model` worker/model identity requirement policy instead of local `worker_key_id` / `model` checks.
+- Daemon Qwen3.5 family, dense, and MoE runtime guards now use `hipfire-model` architecture classifiers instead of daemon-local arch-id predicates.
 - Rust scheduler policy parity tests now cover remaining Bun policy cases for realtime dispatch, legacy wait mapping, opportunistic pairing, spill gating, and clamped residency/spill limits.
 - Rust server `/health` now consumes scheduler-owned JSON builders for scheduler-derived prefill/decode/state-cache metadata while live Rust request handling remains daemon-serial.
 - Rust server `/health.runtime_workers` now consumes `hipfire-state` runtime-worker health summary rendering, currently reporting an empty adapter state until Rust owns resident workers.
-- Generate Qwen3.5 dense/MoE batch backend selection now reuses `hipfire-model` architecture classification instead of local numeric arch checks.
+- Generate Qwen3.5 dense/MoE batch backend selection and decode scheduler fallback metadata now reuse `hipfire-model` architecture classification instead of local numeric arch checks.
 - Runtime tokenizer compatibility signatures now reuse `hipfire-model` fingerprint policy while tokenizer parsing and encode/decode stay in `hipfire-runtime`.
+- Runtime HFQ tokenizer metadata selection, optional safetensors `tokenizer.json` sidecar read policy, and HFQ chat-template extraction now reuse `hipfire-model`; tokenizer parsing, encode/decode, and GGUF runtime adapters stay in `hipfire-runtime`.
 - Eval output and runtime-evidence model stems now reuse `hipfire-model` artifact identity helpers instead of eval-local stem sanitization.
 - Eval model manifests now reuse `hipfire-model` row construction for file/tag identity, HFQ metadata hashes, architecture IDs, and embedded quantization hashes.
+- `hipfire-model` now consumes `hipfire-hash` directly for file/tag hashes and no longer re-exports generic hash helpers.
 - Runtime model-source opening now reuses `hipfire-model` HFQ/safetensors path policy while keeping concrete loader constructors in `hipfire-runtime`.
+- Runtime and arch callers now consume `hipfire-model` model-source contracts directly; `hipfire-runtime::model_source` remains only the concrete HFQ/safetensors opener adapter.
 - Evidence model/tag hash and HFQ metadata compatibility helpers now delegate to `hipfire-model` instead of carrying duplicate model-specific parsing.
+- Eval deterministic mock scoring now consumes `hipfire-hash` directly, and `hipfire-evidence` no longer re-exports hash helpers or HFQ metadata.
+- Qwen3.5 BF16 FFN mode/env parsing now exposes `hipfire-cpu` and `hipfire-npu` helper contracts only within the arch crate instead of publicly re-exporting them through the arch module.
+- Qwen3.5 XDNA1 SwiGLU mode now uses `hipfire-npu` admission to select NPU vs GPU fallback and report missing-artifact fallback reasons.
 - Eval reference/slice/llama integrity verifiers now reuse `hipfire-evidence` ownership directly from runtime examples; the old `hipfire-runtime::eval_common` import path has been retired.
-- Eval and host-profile reporting now reuse `hipfire-evidence` eval-status, host-profile, and sourced-field contracts instead of eval-harness-local JSON shapes.
+- Eval and host-profile reporting now consume `hipfire-evidence` eval-status, host-profile, and sourced-field contracts directly instead of eval-harness-local JSON shapes or `hipfire-eval` re-exports.
 - Eval host-profile hardware-kind, bucket, bandwidth, and hash policy now reuse `hipfire-evidence` ownership instead of eval-harness-local helpers.
-- `hipfire-eval` now owns the `hipfire-eval` binary adapter and eval harness implementation while `hipfire-runtime::eval_harness` keeps the existing import path.
-- Daemon model-worker id construction and sequence-state arena support policy now reuse `hipfire-state` ownership instead of daemon-local policy helpers.
-- Daemon model-worker request id alias parsing now reuses `hipfire-state` ownership instead of daemon-local `worker_id` / `worker_key_id` policy.
+- Runtime host-profile code now consumes `hipfire-eval` directly, and the old `hipfire-runtime::eval_harness` compatibility facade has been retired.
+- Daemon model-worker id construction now reuses `hipfire-model` ownership and sequence-state arena support policy now reuses `hipfire-state` ownership instead of daemon-local policy helpers.
+- State sequence-arena support policy now consumes model-owned Qwen3.5 architecture classification instead of local numeric arch checks.
+- Daemon model-worker request id alias parsing now reuses `hipfire-model` ownership instead of daemon-local `worker_id` / `worker_key_id` policy.
 - Daemon Qwen3.5 sequence-state session/checkpoint handle construction now reuses `hipfire-state` ownership instead of daemon-local policy helpers.
 - Daemon `reserve_session_state` request parsing now consumes `hipfire-state` reserve request metadata instead of daemon-local loose fields.
 - Daemon `describe_state` request parsing now consumes `hipfire-state` describe request metadata instead of daemon-local loose handle aliases.
@@ -63,6 +85,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Daemon Qwen3.5 checkpoint logical-position validation now reuses `hipfire-state` policy instead of daemon-local mismatch handling.
 - Daemon `reserve_session_state` success/rejection response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
 - Daemon `describe_state` response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
+- Generate/daemon prefix-hash contracts now consume `hipfire-state`'s `SequenceStatePrefixHash` directly instead of a `hipfire-generate` compatibility alias.
 - Daemon release-state response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
 - Daemon `release_sessions` response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.
 - Daemon `unload_worker` response rendering now reuses `hipfire-state` JSON helpers instead of daemon-local JSON construction.

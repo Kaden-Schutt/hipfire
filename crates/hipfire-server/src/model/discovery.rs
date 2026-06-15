@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 
 use hipfire_config::{hipfire_dir, models_dir};
-use hipfire_model::find_model_in;
-pub use hipfire_model::{list_local_models_in, model_display_name};
+use hipfire_model::{find_model_in, list_local_models_in};
 
 /// Resolve a model identifier to an absolute file path.
 ///

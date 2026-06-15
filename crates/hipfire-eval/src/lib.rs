@@ -25,23 +25,22 @@ use hipfire_evidence::{
     comparison_artifact_json, compute_peak_bandwidth_gbps, dflash_trace_metrics, directory_hash,
     evidence_artifact_index_entry_from_value_json, evidence_artifact_index_entry_json,
     evidence_artifact_json, evidence_collection_policy, evidence_metric_direction,
-    evidence_record_json, extract_external_evidence_records_json, file_hash, hardware_bucket,
+    evidence_record_json, extract_external_evidence_records_json, hardware_bucket,
     has_launch_count_metric, has_memory_metric, has_module_evidence_metric, has_moe_router_metric,
     has_path_c_trace_metric, has_performance_metric, has_phase_timing_metric, has_profiling_metric,
     has_quality_metric as has_quality_signal_metric, host_profile_artifact_index_entry_json,
     host_profile_hash, launch_count_metrics, list_files, memory_metrics, module_evidence_metrics,
     moe_router_metrics, path_c_trace_metrics, phase_timing_metrics, profiling_metrics,
     prompt_artifact_index_entry_json, required_admission_evidence_requirements,
-    run_metadata_artifact_json, run_provenance_json, stable_hash_bytes, stable_hash_file_fallback,
-    standard_evidence_paths_in_dir, AdmissionArtifact as EvidenceAdmissionArtifact,
-    AdmissionEvidence as EvidenceAdmissionEvidence,
-    ComparisonArtifact as EvidenceComparisonArtifact, EvidenceArtifact, EvidenceArtifactCollection,
-    EvidenceArtifactConfig, EvidenceArtifactDatasetStatus, EvidenceArtifactIndexContext,
-    EvidenceArtifactModels, EvidenceRecord, RunMetadataArtifact, RunMetadataConfig,
-    RunMetadataModels, RunProvenance, OBSERVED_ADMISSION_EVIDENCE_KINDS,
-    STANDARD_EVIDENCE_ARTIFACT_SPECS,
+    run_metadata_artifact_json, run_provenance_json, standard_evidence_paths_in_dir,
+    AdmissionArtifact as EvidenceAdmissionArtifact, AdmissionEvidence as EvidenceAdmissionEvidence,
+    ComparisonArtifact as EvidenceComparisonArtifact, EvalStatus, EvidenceArtifact,
+    EvidenceArtifactCollection, EvidenceArtifactConfig, EvidenceArtifactDatasetStatus,
+    EvidenceArtifactIndexContext, EvidenceArtifactModels, EvidenceRecord, HostProfile,
+    RunMetadataArtifact, RunMetadataConfig, RunMetadataModels, RunProvenance, SourcedField,
+    OBSERVED_ADMISSION_EVIDENCE_KINDS, STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
-pub use hipfire_evidence::{EvalStatus, HostProfile, SourcedField};
+use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback};
 use hipfire_model::{
     discover_dflash_draft_for_model, model_artifact_stem, model_hash, model_manifest_entry,
     ModelManifestEntry,
@@ -5292,7 +5291,7 @@ fn mock_bool_metric(model: &str, salt: &str) -> f64 {
 }
 
 fn stable_score(input: &str) -> f64 {
-    hipfire_evidence::stable_score(input)
+    hipfire_hash::stable_score(input)
 }
 
 fn examples_battery_rows(

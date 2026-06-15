@@ -102,7 +102,7 @@ fn main() {
         Err(Error::new(ErrorKind::InvalidOperation, msg))
     });
     // Mirror render_messages: HF-spaced tojson override.
-    env.add_filter("tojson", hipfire_runtime::prompt_frame::hf_tojson);
+    env.add_filter("tojson", hipfire_prompt::hf_tojson);
     env.add_template("chat", &template).expect("template parse");
     let tmpl = env.get_template("chat").expect("template lookup");
 

@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use hipfire_model::{is_qwen35_family_arch_id, parse_model_worker_id, ModelWorkerId};
+
 #[derive(Clone, Debug)]
 pub struct SessionStateReservation {
     pub worker_id: String,
@@ -21,35 +23,6 @@ pub struct SessionStateReservation {
 pub struct GenericSequenceStateArena {
     reservations: HashMap<String, SessionStateReservation>,
     next_generation: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModelWorkerId {
-    pub value: String,
-}
-
-impl ModelWorkerId {
-    pub fn from_runtime_parts(arch_id: u32, pp: usize, kv_mode: Option<&str>) -> Self {
-        Self {
-            value: format!(
-                "worker:arch{}:pp{}:{}",
-                arch_id,
-                pp,
-                kv_mode.unwrap_or("unknown")
-            ),
-        }
-    }
-}
-
-pub fn parse_model_worker_id(msg: &serde_json::Value, default_worker_id: &str) -> ModelWorkerId {
-    let value = msg
-        .get("worker_id")
-        .or_else(|| msg.get("worker_key_id"))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(default_worker_id)
-        .to_string();
-    ModelWorkerId { value }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,7 +81,7 @@ impl SequenceStateArenaBackend {
     }
 
     pub fn for_worker_parts(arch_id: u32, pp: usize) -> Self {
-        if matches!(arch_id, 5 | 6) && pp == 1 {
+        if is_qwen35_family_arch_id(arch_id) && pp == 1 {
             Self::Qwen35Wrapped
         } else {
             Self::Unsupported
@@ -303,6 +276,54 @@ impl SequenceStatePageKind {
             _ => None,
         }
     }
+
+    pub fn from_generate_state_kind(kind: &str) -> Option<Self> {
+        match kind {
+            "attention_kv" => Some(Self::Kv),
+            "deltanet_recurrent" => Some(Self::DeltaNet),
+            "mamba_ssm" | "mamba_conv" | "architecture_specific" => Some(Self::BackendPrivate),
+            _ => None,
+        }
+    }
+}
+
+pub fn generate_state_kinds_include_required(
+    state_kinds: &[String],
+    required: SequenceStatePageKind,
+) -> bool {
+    state_kinds.iter().any(|kind| match required {
+        SequenceStatePageKind::Kv => kind == "attention_kv",
+        SequenceStatePageKind::DeltaNet => kind == "deltanet_recurrent",
+        SequenceStatePageKind::BackendPrivate => {
+            matches!(
+                kind.as_str(),
+                "mamba_ssm" | "mamba_conv" | "architecture_specific"
+            )
+        }
+        SequenceStatePageKind::Logits => false,
+    })
+}
+
+pub fn generate_state_kind_sets_match_exactly(a: &[String], b: &[String]) -> bool {
+    let mut a = a.to_vec();
+    let mut b = b.to_vec();
+    a.sort();
+    b.sort();
+    a == b
+}
+
+pub fn canonical_generate_state_kind_hash_label(state_kinds: &[String]) -> String {
+    let mut normalized = state_kinds.to_vec();
+    normalized.sort();
+    normalized.dedup();
+    normalized.join("+")
+}
+
+pub fn qwen35_kv_deltanet_state_kind_labels() -> Vec<&'static str> {
+    vec![
+        SequenceStatePageKind::Kv.as_str(),
+        SequenceStatePageKind::DeltaNet.as_str(),
+    ]
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1227,38 +1248,94 @@ mod tests {
     }
 
     #[test]
-    fn parse_model_worker_id_preserves_daemon_alias_priority() {
-        let worker_id = parse_model_worker_id(
-            &serde_json::json!({
-                "worker_id": "worker-a",
-                "worker_key_id": "worker-b"
-            }),
-            "__default__",
+    fn generate_state_kind_parser_preserves_generate_wire_surface() {
+        assert_eq!(
+            SequenceStatePageKind::from_generate_state_kind("attention_kv"),
+            Some(SequenceStatePageKind::Kv)
         );
-        assert_eq!(worker_id.value, "worker-a");
-
-        let worker_key_id = parse_model_worker_id(
-            &serde_json::json!({
-                "worker_key_id": "worker-b"
-            }),
-            "__default__",
+        assert_eq!(
+            SequenceStatePageKind::from_generate_state_kind("deltanet_recurrent"),
+            Some(SequenceStatePageKind::DeltaNet)
         );
-        assert_eq!(worker_key_id.value, "worker-b");
+        assert_eq!(
+            SequenceStatePageKind::from_generate_state_kind("mamba_ssm"),
+            Some(SequenceStatePageKind::BackendPrivate)
+        );
+        assert_eq!(
+            SequenceStatePageKind::from_generate_state_kind("mamba_conv"),
+            Some(SequenceStatePageKind::BackendPrivate)
+        );
+        assert_eq!(
+            SequenceStatePageKind::from_generate_state_kind("architecture_specific"),
+            Some(SequenceStatePageKind::BackendPrivate)
+        );
+        assert_eq!(
+            SequenceStatePageKind::from_generate_state_kind("backend_private"),
+            None
+        );
     }
 
     #[test]
-    fn parse_model_worker_id_falls_back_to_default_worker() {
-        let missing = parse_model_worker_id(&serde_json::json!({}), "__default__");
-        assert_eq!(missing.value, "__default__");
+    fn generate_state_kind_requirement_uses_generate_wire_labels() {
+        let kinds = vec![
+            "attention_kv".to_string(),
+            "deltanet_recurrent".to_string(),
+            "architecture_specific".to_string(),
+        ];
 
-        let empty = parse_model_worker_id(
-            &serde_json::json!({
-                "worker_id": "",
-                "worker_key_id": ""
-            }),
-            "__default__",
+        assert!(generate_state_kinds_include_required(
+            &kinds,
+            SequenceStatePageKind::Kv
+        ));
+        assert!(generate_state_kinds_include_required(
+            &kinds,
+            SequenceStatePageKind::DeltaNet
+        ));
+        assert!(generate_state_kinds_include_required(
+            &kinds,
+            SequenceStatePageKind::BackendPrivate
+        ));
+        assert!(!generate_state_kinds_include_required(
+            &["backend_private".to_string()],
+            SequenceStatePageKind::BackendPrivate
+        ));
+    }
+
+    #[test]
+    fn generate_state_kind_set_matching_preserves_wire_label_identity() {
+        let a = vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()];
+        let b = vec!["deltanet_recurrent".to_string(), "attention_kv".to_string()];
+        let c = vec![
+            "attention_kv".to_string(),
+            "architecture_specific".to_string(),
+        ];
+        let d = vec!["attention_kv".to_string(), "mamba_ssm".to_string()];
+
+        assert!(generate_state_kind_sets_match_exactly(&a, &b));
+        assert!(!generate_state_kind_sets_match_exactly(&c, &d));
+    }
+
+    #[test]
+    fn canonical_generate_state_kind_hash_label_sorts_and_deduplicates_wire_labels() {
+        let kinds = vec![
+            "deltanet_recurrent".to_string(),
+            "attention_kv".to_string(),
+            "attention_kv".to_string(),
+            "architecture_specific".to_string(),
+        ];
+
+        assert_eq!(
+            canonical_generate_state_kind_hash_label(&kinds),
+            "architecture_specific+attention_kv+deltanet_recurrent"
         );
-        assert_eq!(empty.value, "__default__");
+    }
+
+    #[test]
+    fn qwen35_kv_deltanet_state_kind_labels_preserve_wire_order() {
+        assert_eq!(
+            qwen35_kv_deltanet_state_kind_labels(),
+            vec!["attention_kv", "deltanet_recurrent"]
+        );
     }
 
     #[test]
@@ -2014,15 +2091,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_id_and_arena_policy_follow_runtime_shape() {
-        assert_eq!(
-            ModelWorkerId::from_runtime_parts(6, 1, Some("q8")).value,
-            "worker:arch6:pp1:q8"
-        );
-        assert_eq!(
-            ModelWorkerId::from_runtime_parts(5, 2, None).value,
-            "worker:arch5:pp2:unknown"
-        );
+    fn arena_policy_follows_runtime_shape() {
         assert_eq!(
             SequenceStateArenaBackend::for_worker_parts(5, 1),
             SequenceStateArenaBackend::Qwen35Wrapped

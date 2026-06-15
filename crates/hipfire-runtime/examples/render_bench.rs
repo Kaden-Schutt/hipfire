@@ -19,8 +19,8 @@
 //! (Path J1), which is correct for Stage 0 dead-code but a real cost we
 //! must cache before wiring into the daemon (tracked: Stage 2 follow-up).
 
+use hipfire_prompt::{AssistantPrefix, ChatFrame, JinjaChatFrame};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame, JinjaChatFrame};
 use hipfire_runtime::tokenizer::Tokenizer;
 use minijinja::{context, Environment, Error, ErrorKind, Value};
 use minijinja_contrib::pycompat::unknown_method_callback;

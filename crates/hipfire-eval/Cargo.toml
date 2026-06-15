@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 hipfire-coherence = { path = "../hipfire-coherence" }
 hipfire-evidence = { path = "../hipfire-evidence" }
+hipfire-hash = { path = "../hipfire-hash" }
 hipfire-model = { path = "../hipfire-model" }
 csv = "1"
 libc = "0.2"

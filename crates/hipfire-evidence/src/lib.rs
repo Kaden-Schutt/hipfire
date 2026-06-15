@@ -9,8 +9,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback, stable_score};
-pub use hipfire_model::HfqMetadata;
+use hipfire_hash::stable_hash_bytes;
+use hipfire_model::HfqMetadata;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 

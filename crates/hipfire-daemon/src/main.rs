@@ -53,12 +53,16 @@ use hipfire_generate::{
     validate_generate_batch_decode, validate_generate_batch_prefill,
     validate_prefix_hash_preflight, validate_qwen35_fused_grouped_moe_prefill_batch_preflight,
     GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession, GenerateBatchPrefillEnvelope,
-    GenerateBatchPrefillPlan, GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession,
-    GenerateVLParams, ImageSource, PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope,
-    Qwen35DecodeBatchBackend, Qwen35DecodeBatchStepResult, Qwen35DecodeTokenOutcome,
-    Qwen35FusedDensePrefillInputKind, Qwen35PrefillBatchBackend, Qwen35PrefillBatchResult,
-    Qwen35PrefillCheckpointHook, Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult,
-    Qwen35PreparedPrefillSession, Qwen35SemanticBoundaryCheckpoint,
+    GenerateBatchPrefillPlan, GenerateBatchPrefillSession, GenerateVLParams, ImageSource,
+    PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope, Qwen35DecodeBatchBackend,
+    Qwen35DecodeBatchStepResult, Qwen35DecodeTokenOutcome, Qwen35FusedDensePrefillInputKind,
+    Qwen35PrefillBatchBackend, Qwen35PrefillBatchResult, Qwen35PrefillCheckpointHook,
+    Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult, Qwen35PreparedPrefillSession,
+    Qwen35SemanticBoundaryCheckpoint,
+};
+use hipfire_model::{
+    is_qwen35_dense_arch_id, is_qwen35_family_arch_id, is_qwen35_moe_arch_id,
+    parse_model_worker_id, ModelWorkerId,
 };
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
@@ -71,18 +75,18 @@ use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_state::{
     describe_sequence_state_descriptors, described_sequence_state_json,
-    model_worker_runtime_view_json, parse_describe_sequence_state_request, parse_model_worker_id,
-    parse_release_sequence_state_request, parse_release_sessions_request,
-    parse_reserve_session_state_request, parse_unload_worker_request,
-    parsed_handle_may_target_generic, parsed_handle_may_target_loaded_state,
-    qwen35_sequence_state_handle, release_sessions_done_json, release_state_done_json,
-    reserve_session_state_done_json, reserve_session_state_rejected_json,
-    session_state_reservation_describe_json, unload_worker_done_json,
-    validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
+    generate_state_kinds_include_required, model_worker_runtime_view_json,
+    parse_describe_sequence_state_request, parse_release_sequence_state_request,
+    parse_release_sessions_request, parse_reserve_session_state_request,
+    parse_unload_worker_request, parsed_handle_may_target_generic,
+    parsed_handle_may_target_loaded_state, qwen35_sequence_state_handle,
+    release_sessions_done_json, release_state_done_json, reserve_session_state_done_json,
+    reserve_session_state_rejected_json, session_state_reservation_describe_json,
+    unload_worker_done_json, validate_checkpoint_logical_position, validate_checkpoint_prefix_hash,
     validate_checkpoint_source_resident, DescribedSequenceState, GenericSequenceStateArena,
-    ModelArtifactMemory, ModelWorkerId, ModelWorkerMemoryView, ModelWorkerRuntimeView,
-    ParsedSequenceStateHandle, SequenceStateArenaBackend, SequenceStateCheckpointRequest,
-    SequenceStateForkRequest, SequenceStatePageDescriptor, SequenceStatePageKind,
+    ModelArtifactMemory, ModelWorkerMemoryView, ModelWorkerRuntimeView, ParsedSequenceStateHandle,
+    SequenceStateArenaBackend, SequenceStateCheckpointRequest, SequenceStateForkRequest,
+    SequenceStatePageDescriptor, SequenceStatePageKind, SequenceStatePrefixHash,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -95,6 +99,18 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+fn normalize_daemon_prompt(prompt: &str) -> std::borrow::Cow<'_, str> {
+    if matches!(
+        std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    ) || !hipfire_runtime::config::get().normalize_prompt
+    {
+        return std::borrow::Cow::Borrowed(prompt);
+    }
+
+    hipfire_prompt::normalize_prompt_text_with_policy(prompt, true)
+}
 
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
 enum Eviction {
@@ -658,7 +674,7 @@ fn validate_qwen35_decode_batch_runtime_surface(
     dflash_loaded: bool,
     eviction_active: bool,
 ) -> Result<(), String> {
-    if !(arch_id == 5 || arch_id == 6) || pp != 1 {
+    if !is_qwen35_family_arch_id(arch_id) || pp != 1 {
         return Err(format!(
             "generate_batch_decode_step currently supports single-GPU qwen35/qwen35-moe only (arch_id={arch_id} pp={pp})"
         ));
@@ -742,7 +758,7 @@ fn validate_qwen35_fused_dense_decode_model_capability(
     m: &LoadedModel,
     session_count: usize,
 ) -> Result<(), String> {
-    if m.arch_id != 5 {
+    if !is_qwen35_dense_arch_id(m.arch_id) {
         return Err(format!(
             "qwen35 fused dense decode requires dense Qwen35 arch_id=5; loaded arch_id={}",
             m.arch_id
@@ -793,7 +809,7 @@ fn validate_qwen35_grouped_moe_decode_model_capability(
     session_count: usize,
     arch: &str,
 ) -> Result<(), String> {
-    if m.arch_id != 6 {
+    if !is_qwen35_moe_arch_id(m.arch_id) {
         return Err(format!(
             "qwen35 grouped-MoE decode requires Qwen35 MoE arch_id=6; loaded arch_id={}",
             m.arch_id
@@ -1326,7 +1342,7 @@ mod generate_batch_prefill_tests {
                     |(boundary_index, &prefix_len)| Qwen35SemanticBoundaryCheckpoint {
                         checkpoint_id: None,
                         prefix_len,
-                        hash: GenerateBatchPrefillPrefixHash {
+                        hash: SequenceStatePrefixHash {
                             algorithm: "xxh128".to_string(),
                             value: format!("{prefix_len:032x}"),
                             prefix_len,
@@ -3110,7 +3126,7 @@ fn next_qwen35_state_allocation_epoch() -> u64 {
 struct Qwen35RequestSessionState {
     seq_pos: usize,
     conversation_tokens: Vec<u32>,
-    prefix_hash: Option<GenerateBatchPrefillPrefixHash>,
+    prefix_hash: Option<SequenceStatePrefixHash>,
     kv_cache: llama::KvCache,
     dn_state: DeltaNetState,
     logits: rdna_compute::GpuTensor,
@@ -3758,7 +3774,7 @@ fn park_active_model(
     resident_models: &mut std::collections::HashMap<String, LoadedModel>,
 ) -> Result<(), String> {
     if let Some(m) = model.as_mut() {
-        if (m.arch_id == 5 || m.arch_id == 6) && m.pp == 1 {
+        if is_qwen35_family_arch_id(m.arch_id) && m.pp == 1 {
             qwen35_save_active_session(m, gpu)?;
         }
     }
@@ -3772,7 +3788,7 @@ fn validate_qwen35_fused_grouped_moe_prefill_model_capability(
     m: &LoadedModel,
     session_count: usize,
 ) -> Result<(), String> {
-    if m.arch_id != 6 {
+    if !is_qwen35_moe_arch_id(m.arch_id) {
         return Err(format!(
             "qwen35 grouped-MoE fused prefill-session batch worker requires arch_id=6, got {}",
             m.arch_id
@@ -4021,7 +4037,7 @@ fn qwen35_release_sessions(
     gpu: &mut rdna_compute::Gpu,
     session_ids: &[String],
 ) -> Result<usize, String> {
-    if !(m.arch_id == 5 || m.arch_id == 6) || m.pp != 1 {
+    if !is_qwen35_family_arch_id(m.arch_id) || m.pp != 1 {
         return Err(format!(
             "release_sessions currently supports single-GPU qwen35/qwen35-moe only (arch_id={} pp={})",
             m.arch_id, m.pp
@@ -4293,7 +4309,7 @@ fn qwen35_checkpoint_session_state(
 fn qwen35_validate_prefix_hash(
     m: &LoadedModel,
     source_session_id: &str,
-    requested: Option<&GenerateBatchPrefillPrefixHash>,
+    requested: Option<&SequenceStatePrefixHash>,
 ) -> Result<(), String> {
     validate_checkpoint_source_resident(
         source_session_id,
@@ -4573,7 +4589,7 @@ fn qwen35_materialize_batch_prefill_prompt(
         .as_ref()
         .ok_or_else(|| "tokenizer not loaded".to_string())?;
     let prompt = session.prompt.as_deref().unwrap_or("");
-    let prompt_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(prompt);
+    let prompt_norm = normalize_daemon_prompt(prompt);
     let prompt = prompt_norm.as_ref();
     let raw_q_tokens = tokenizer.encode(prompt);
     // Prompt-hash/preload sessions that declare a zero logical position need
@@ -4836,7 +4852,7 @@ fn run_prefix_hash_preflight_qwen35(
     stdout: &mut std::io::Stdout,
     envelope: &PrefixHashPreflightEnvelope,
 ) -> Result<(), String> {
-    if !(m.arch_id == 5 || m.arch_id == 6) {
+    if !is_qwen35_family_arch_id(m.arch_id) {
         return Err(format!(
             "prefix_hash_preflight currently supports qwen35/qwen35-moe only (arch_id={})",
             m.arch_id
@@ -5989,7 +6005,7 @@ fn run_generate_batch_prefill_serial_qwen35(
     envelope: &GenerateBatchPrefillEnvelope,
     pflash_active: bool,
 ) -> Result<(), String> {
-    if !(m.arch_id == 5 || m.arch_id == 6) {
+    if !is_qwen35_family_arch_id(m.arch_id) {
         return Err(format!(
             "generate_batch_prefill currently supports qwen35/qwen35-moe only (arch_id={})",
             m.arch_id
@@ -6037,23 +6053,19 @@ fn run_generate_batch_prefill_serial_qwen35(
     let t0 = Instant::now();
     let mut prepared = Vec::with_capacity(envelope.sessions.len());
     for session in &envelope.sessions {
-        if !session
-            .state_handle
-            .state_kinds
-            .iter()
-            .any(|kind| kind == "attention_kv")
-        {
+        if !generate_state_kinds_include_required(
+            &session.state_handle.state_kinds,
+            SequenceStatePageKind::Kv,
+        ) {
             return Err(format!(
                 "generate_batch_prefill session {} missing attention_kv state kind",
                 session.id
             ));
         }
-        if !session
-            .state_handle
-            .state_kinds
-            .iter()
-            .any(|kind| kind == "deltanet_recurrent")
-        {
+        if !generate_state_kinds_include_required(
+            &session.state_handle.state_kinds,
+            SequenceStatePageKind::DeltaNet,
+        ) {
             return Err(format!(
                 "generate_batch_prefill session {} missing deltanet_recurrent state kind",
                 session.id
@@ -7274,7 +7286,7 @@ fn main() {
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let protocol_load = if msg_type == "load" {
-            serde_json::from_value::<hipfire_daemon_protocol::LoadRequest>(msg.clone()).ok()
+            serde_json::from_value::<hipfire_model::ModelLoadRequest>(msg.clone()).ok()
         } else {
             None
         };
@@ -7919,7 +7931,7 @@ fn main() {
 
             "generate" => {
                 let protocol_generate =
-                    serde_json::from_value::<hipfire_daemon_protocol::GenerateRequest>(msg.clone())
+                    serde_json::from_value::<hipfire_generate::GenerateTextRequest>(msg.clone())
                         .ok();
                 let id = protocol_generate
                     .as_ref()
@@ -8016,7 +8028,7 @@ fn main() {
                     .get("prefilled_prompt_tokens")
                     .and_then(|v| v.as_u64())
                     .map(|v| v as usize);
-                if (m.arch_id == 5 || m.arch_id == 6) && m.pp == 1 {
+                if is_qwen35_family_arch_id(m.arch_id) && m.pp == 1 {
                     let target_session_id = session_id.unwrap_or(QWEN35_LEGACY_SESSION_ID);
                     if let Err(e) = qwen35_activate_session(m, &mut gpu, target_session_id) {
                         emit_error_with_id(&mut stdout, id, e);
@@ -8035,7 +8047,7 @@ fn main() {
                     .map(|req| req.prompt.as_str())
                     .or_else(|| msg.get("prompt").and_then(|v| v.as_str()))
                     .unwrap_or("Hello");
-                let prompt_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(prompt);
+                let prompt_norm = normalize_daemon_prompt(prompt);
                 let prompt: &str = &prompt_norm;
                 if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
                     if let Some(tok) = m.tokenizer.as_ref() {
@@ -8482,7 +8494,7 @@ fn main() {
                             continue;
                         }
                         match model.as_ref() {
-                            Some(m) if (m.arch_id == 5 || m.arch_id == 6) && m.pp == 1 => {
+                            Some(m) if is_qwen35_family_arch_id(m.arch_id) && m.pp == 1 => {
                                 emit_generate_batch_prefill_ready(&mut stdout, &envelope);
                             }
                             Some(m) => {
@@ -8957,7 +8969,7 @@ fn main() {
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
                     m.q35_sessions.clear();
-                    m.q35_active_session_id = if (m.arch_id == 5 || m.arch_id == 6)
+                    m.q35_active_session_id = if is_qwen35_family_arch_id(m.arch_id)
                         && m.pp == 1
                         && m.kv_cache.is_some()
                         && m.dn_state.is_some()
@@ -9305,7 +9317,7 @@ fn main() {
                 // completion (kernel launches are async by default).
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
-                let run_ok = if m.arch_id == 5 || m.arch_id == 6 {
+                let run_ok = if is_qwen35_family_arch_id(m.arch_id) {
                     let config = m.q35_config.as_ref().unwrap();
                     let weights = m.q35_weights.as_ref().unwrap();
                     let scratch = m.q35_scratch.as_ref().unwrap();
@@ -9697,7 +9709,7 @@ fn load_model(
         //     104-vs-136 byte stride. (Future: wire MQ3 into the MoE
         //     batched branches and the MoE FFN expert kernels.)
         // MQ2 body still has no batched WMMA kernels anywhere.
-        let arch_is_dense_qwen35 = hfq.arch_id == 5;
+        let arch_is_dense_qwen35 = is_qwen35_dense_arch_id(hfq.arch_id);
         let mq3_supported = arch_is_gfx11 && arch_is_dense_qwen35;
         let mq_unsupported = hfq
             .first_tensor_with_quant_type(18)
@@ -10305,7 +10317,7 @@ fn load_model(
         }
     }
 
-    if hfq.arch_id == 5 || hfq.arch_id == 6 {
+    if is_qwen35_family_arch_id(hfq.arch_id) {
         // Qwen3.5 DeltaNet (arch=5 dense, arch=6 MoE/A3B). PR 8: dispatch
         // through the `Architecture` trait for the bring-up triple
         // (config → load → state). Forward passes below still call
@@ -10734,7 +10746,7 @@ fn load_model_safetensors(
     kv_mode: &str,
     gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
-    use hipfire_runtime::model_source::ModelSource;
+    use hipfire_model::ModelSource;
     use hipfire_runtime::safetensors_source::SafetensorsSource;
 
     eprintln!("  opening safetensors directory: {path}");
@@ -10895,7 +10907,7 @@ fn load_model_safetensors(
         });
     }
 
-    if arch_id != 5 && arch_id != 6 {
+    if !is_qwen35_family_arch_id(arch_id) {
         return Err(format!("safetensors loading only supports LLaMA/Qwen3 (arch_id 0/1) and Qwen3.5/3.6 (arch_id 5/6), got {arch_id}"));
     }
 
@@ -11040,7 +11052,7 @@ fn load_model_pp(
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
 
-    if hfq.arch_id != 5 && hfq.arch_id != 6 {
+    if !is_qwen35_family_arch_id(hfq.arch_id) {
         return Err(format!(
             "pp>1 supports Qwen3.5 dense (arch_id=5) and Qwen3.5-MoE / \
              Qwen3.6-A3B (arch_id=6) only; got arch_id={}. LLaMA / Qwen3 \
@@ -13275,7 +13287,7 @@ fn generate(
 
     if m.dflash.is_some()
         && temp <= 1e-6
-        && (m.arch_id == 5 || m.arch_id == 6)
+        && is_qwen35_family_arch_id(m.arch_id)
         && !budgeted_thinking_needs_ar
     {
         // PFlash + DFlash decode path is not yet wired -- the DFlash spec
@@ -13331,7 +13343,7 @@ fn generate(
         return;
     }
 
-    let is_qwen35_ar = m.arch_id == 5 || m.arch_id == 6;
+    let is_qwen35_ar = is_qwen35_family_arch_id(m.arch_id);
     let mut q35_session = if is_qwen35_ar {
         match Qwen35RequestSessionState::take_from_loaded(m, gpu) {
             Ok(session) => Some(session),
@@ -13742,7 +13754,7 @@ fn generate(
     let prefill_tokens = new_tokens.len();
     let t0 = Instant::now();
 
-    if m.arch_id == 5 || m.arch_id == 6 {
+    if is_qwen35_family_arch_id(m.arch_id) {
         // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
         // continuing from session.seq_pos (KV cache + DeltaNet state are cumulative)
         let mut session = q35_session.take().expect("qwen35 request session state");

@@ -7,7 +7,7 @@
 //!
 //! `--guards` (default: off) opts the bare example into the production
 //! generation guards owned by the daemon: ChatML framing via
-//! `hipfire_runtime::prompt_frame::ChatFrame`, top-p sampling via
+//! `hipfire_prompt::ChatFrame`, top-p sampling via
 //! `hipfire_runtime::sampler::sample`, output-stream filtering via
 //! `hipfire_runtime::eos_filter::EosFilter`, and the n-gram repetition detector
 //! via `hipfire_runtime::loop_guard::LoopGuard`. The default keeps today's bare
@@ -15,11 +15,11 @@
 
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::DeltaNetState;
+use hipfire_prompt::{AssistantPrefix, ChatFrame};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::loop_guard::LoopGuard;
-use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use std::io::Write;
 use std::path::Path;
@@ -99,7 +99,7 @@ fn main() {
         });
 
     let prompt_tokens = if use_guards {
-        // Production framing path: route through hipfire_runtime::prompt_frame so
+        // Production framing path: route through hipfire_prompt so
         // the example's prompt assembly matches the daemon byte-for-byte.
         // OpenThink keeps the `<think>` opener for thinking-mode models;
         // it falls back to Plain when the tokenizer doesn't register

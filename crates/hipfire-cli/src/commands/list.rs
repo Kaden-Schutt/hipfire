@@ -1,4 +1,5 @@
-use crate::model::{list_local_models, model_display_name};
+use crate::model::list_local_models;
+use hipfire_model::model_display_name;
 
 pub fn run() {
     let models = list_local_models();

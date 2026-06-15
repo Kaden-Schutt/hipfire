@@ -3,7 +3,8 @@ use std::io::Write;
 use clap::Args;
 use hipfire_config::HipfireConfig;
 use hipfire_daemon_adapter::{find_daemon_bin_or_error, DaemonEngine};
-use hipfire_daemon_protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
+use hipfire_generate::{GenerateTextRequest, GenerationSamplingPolicy};
+use hipfire_model::ModelLoadParams;
 use uuid::Uuid;
 
 use crate::model::find_model;
@@ -22,8 +23,8 @@ pub struct RunArgs {
     pub temperature: Option<f64>,
 }
 
-fn load_params_from_config(config: &HipfireConfig) -> LoadParams {
-    LoadParams::from_hipfire_config(config)
+fn load_params_from_config(config: &HipfireConfig) -> ModelLoadParams {
+    ModelLoadParams::from_hipfire_config(config)
 }
 
 fn generate_request_from_prompt(
@@ -31,8 +32,8 @@ fn generate_request_from_prompt(
     prompt: &str,
     sampling: GenerationSamplingPolicy,
     worker_key_id: Option<String>,
-) -> GenerateRequest {
-    GenerateRequest::from_prompt(id, prompt, sampling).with_worker_key_id(worker_key_id)
+) -> GenerateTextRequest {
+    GenerateTextRequest::from_prompt(id, prompt, sampling).with_worker_key_id(worker_key_id)
 }
 
 pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {

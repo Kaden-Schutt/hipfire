@@ -241,7 +241,7 @@ pub struct SamplerOverrides {
 
 /// Per-arch overrides for prompt framing.
 ///
-/// `hipfire_runtime::prompt_frame` owns the `<|im_start|>` / `<|im_end|>`
+/// `hipfire-prompt` owns the `<|im_start|>` / `<|im_end|>`
 /// scaffolding plus `<think>` injection for thinking-mode models.
 #[derive(Debug, Clone, Default)]
 pub struct PromptFrameOverrides {

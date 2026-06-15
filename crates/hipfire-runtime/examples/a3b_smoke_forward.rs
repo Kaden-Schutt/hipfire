@@ -47,7 +47,7 @@ fn main() {
     // eval_hipfire.rs:165-176 and daemon.rs:1500-1504. HFQ files take the
     // canonical HFQ path below.
     let (config, weights, tokenizer) = if model_path.is_dir() {
-        use hipfire_runtime::model_source::ModelSource;
+        use hipfire_model::ModelSource;
         use hipfire_runtime::safetensors_source::SafetensorsSource;
         let source = SafetensorsSource::open(model_path).expect("safetensors open");
         let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");

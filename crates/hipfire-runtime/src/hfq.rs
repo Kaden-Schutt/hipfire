@@ -9,6 +9,7 @@ use crate::llama::{
     f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
 };
 use hip_bridge::{HipError, HipResult};
+use hipfire_model::{ModelSource, QuantConfig, TensorInfo};
 use memmap2::Mmap;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
@@ -651,13 +652,9 @@ impl HfqFile {
     /// did not ship a chat_template (rare for instruct models, common
     /// for base models). The runtime renders this when present so prompt
     /// framing matches the model's training-time expectation; absent or
-    /// failing renders fall back to the hand-rolled `prompt_frame` path.
+    /// failing renders fall back to the hand-rolled `ChatFrame` path.
     pub fn chat_template(&self) -> Option<String> {
-        let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
-        meta.get("tokenizer_config")?
-            .get("chat_template")?
-            .as_str()
-            .map(|s| s.to_string())
+        hipfire_model::hfq_chat_template(&self.metadata_json)
     }
 
     /// Resolve a tensor name, trying common prefix variants.
@@ -990,7 +987,7 @@ fn read_exact_at_portable(file: &File, dst: &mut [u8], offset: u64) -> std::io::
 
 // ─── ModelSource impl for HfqFile ───────────────────────────────────────────
 
-impl crate::model_source::ModelSource for HfqFile {
+impl ModelSource for HfqFile {
     fn metadata_json(&self) -> &str {
         &self.metadata_json
     }
@@ -999,11 +996,11 @@ impl crate::model_source::ModelSource for HfqFile {
         self.arch_id
     }
 
-    fn quant_config(&self) -> Option<&crate::model_source::QuantConfig> {
+    fn quant_config(&self) -> Option<&QuantConfig> {
         None // HFQ files encode quant_type per-tensor, not via a global config
     }
 
-    fn tensor_data(&self, _name: &str) -> Option<(&crate::model_source::TensorInfo, &[u8])> {
+    fn tensor_data(&self, _name: &str) -> Option<(&TensorInfo, &[u8])> {
         // HfqFile's tensor_data returns (&HfqTensorInfo, &[u8]).
         // We can't return a reference to a TensorInfo we don't own,
         // so this method is not directly usable for HFQ. The HFQ path
@@ -1012,7 +1009,7 @@ impl crate::model_source::ModelSource for HfqFile {
         None
     }
 
-    fn tensor_info(&self, _name: &str) -> Option<&crate::model_source::TensorInfo> {
+    fn tensor_info(&self, _name: &str) -> Option<&TensorInfo> {
         None // HFQ uses its own HfqTensorInfo type
     }
 
@@ -1847,9 +1844,7 @@ mod tests {
 
 /// Parse a LlamaConfig from a SafetensorsSource's metadata JSON.
 /// The metadata JSON has structure: `{ "config": { ...config.json... } }`.
-pub fn config_from_safetensors_llama(
-    source: &dyn crate::model_source::ModelSource,
-) -> Option<LlamaConfig> {
+pub fn config_from_safetensors_llama(source: &dyn ModelSource) -> Option<LlamaConfig> {
     let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
     let config = meta.get("config")?;
 
@@ -1999,7 +1994,7 @@ fn repack_awq_to_hfq4g128(
 /// Load a ParoQuant-quantized weight tensor from a safetensors source.
 /// Repacks AWQ INT4 data to HFQ4G128 and uploads ParoQuant rotation metadata.
 fn load_paroquant_weight_from_source(
-    source: &dyn crate::model_source::ModelSource,
+    source: &dyn ModelSource,
     gpu: &Gpu,
     tensor_prefix: &str, // e.g. "model.layers.0.mlp.gate_proj"
     out_dim: usize,      // M
@@ -2070,7 +2065,7 @@ fn load_paroquant_weight_from_source(
 
 /// Load an FP16 weight tensor from safetensors as F32 on GPU.
 fn load_fp16_weight_tensor_from_source(
-    source: &dyn crate::model_source::ModelSource,
+    source: &dyn ModelSource,
     gpu: &Gpu,
     name: &str,
     m: usize,
@@ -2099,7 +2094,7 @@ fn load_fp16_weight_tensor_from_source(
 
 /// Load a ParoQuant weight (quantized or FP16 fallback) using `model.` tensor prefix.
 fn paro_load_llama_wt(
-    source: &dyn crate::model_source::ModelSource,
+    source: &dyn ModelSource,
     gpu: &Gpu,
     prefix: &str, // e.g. "layers.0.self_attn.q_proj"
     m: usize,
@@ -2117,7 +2112,7 @@ fn paro_load_llama_wt(
 
 /// Load an F16 norm weight as F32 on GPU (raw, no +1.0 bias — HF convention).
 fn paro_load_llama_norm_raw(
-    source: &dyn crate::model_source::ModelSource,
+    source: &dyn ModelSource,
     gpu: &mut Gpu,
     name: &str, // e.g. "layers.0.input_layernorm.weight"
     shape: &[usize],
@@ -2143,7 +2138,7 @@ fn paro_load_llama_norm_raw(
 /// Tensor naming convention: `model.layers.{i}.self_attn.q_proj.{qweight,...}`
 /// (no `model.language_model.` prefix — that's Qwen3.5-specific).
 pub fn load_weights_paroquant_llama(
-    source: &dyn crate::model_source::ModelSource,
+    source: &dyn ModelSource,
     config: &LlamaConfig,
     gpu: &mut Gpu,
 ) -> HipResult<LlamaWeights> {

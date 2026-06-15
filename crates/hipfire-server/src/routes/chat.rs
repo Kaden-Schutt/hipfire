@@ -16,11 +16,11 @@ use crate::model::discovery::find_model;
 use crate::state::SharedState;
 use hipfire_config::HipfireConfig;
 use hipfire_daemon_adapter::{find_daemon_bin_or_error, DaemonEngine};
-use hipfire_daemon_protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
 use hipfire_generate::{
     openai_chat_completion_done_chunk_json, openai_chat_completion_response_json,
-    openai_chat_completion_token_chunk_json,
+    openai_chat_completion_token_chunk_json, GenerateTextRequest, GenerationSamplingPolicy,
 };
+use hipfire_model::ModelLoadParams;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -52,8 +52,8 @@ pub async fn post_chat_completions(
     }
 }
 
-fn load_params_from_config(cfg: &HipfireConfig) -> LoadParams {
-    LoadParams::from_hipfire_config(cfg)
+fn load_params_from_config(cfg: &HipfireConfig) -> ModelLoadParams {
+    ModelLoadParams::from_hipfire_config(cfg)
 }
 
 fn generate_request_from_chat(
@@ -63,8 +63,8 @@ fn generate_request_from_chat(
     worker_key_id: Option<String>,
     tools: Option<Value>,
     system: Option<String>,
-) -> GenerateRequest {
-    GenerateRequest::from_openai_chat_messages(
+) -> GenerateTextRequest {
+    GenerateTextRequest::from_openai_chat_messages(
         id,
         messages
             .iter()

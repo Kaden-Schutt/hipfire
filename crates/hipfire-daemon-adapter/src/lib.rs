@@ -10,10 +10,9 @@ use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
-use hipfire_daemon_protocol::{
-    DaemonRequest, DaemonResponse, DoneResponse, GenerateRequest, LoadParams, LoadRequest,
-    LoadedResponse,
-};
+use hipfire_daemon_protocol::{DaemonRequest, DaemonResponse};
+use hipfire_generate::{DoneEvent, GenerateTextRequest};
+use hipfire_model::{ModelLoadParams, ModelLoadRequest, ModelLoadedResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tracing::debug;
@@ -101,10 +100,10 @@ impl DaemonEngine {
     pub async fn load(
         &mut self,
         model_path: &str,
-        params: LoadParams,
-    ) -> anyhow::Result<LoadedResponse> {
+        params: ModelLoadParams,
+    ) -> anyhow::Result<ModelLoadedResponse> {
         let request_id = uuid::Uuid::new_v4().to_string();
-        self.send(&DaemonRequest::Load(LoadRequest {
+        self.send(&DaemonRequest::Load(ModelLoadRequest {
             model: model_path.to_string(),
             params,
             request_id: Some(request_id.clone()),
@@ -172,8 +171,8 @@ impl DaemonEngine {
     /// Send `generate` and collect all tokens. Returns (text, done).
     pub async fn generate(
         &mut self,
-        req: GenerateRequest,
-    ) -> anyhow::Result<(String, DoneResponse)> {
+        req: GenerateTextRequest,
+    ) -> anyhow::Result<(String, DoneEvent)> {
         let request_id = req.id.clone();
         self.send(&DaemonRequest::Generate(req)).await?;
         let mut text = String::new();
@@ -206,9 +205,9 @@ impl DaemonEngine {
     /// Send `generate` and stream tokens via a callback. Returns done.
     pub async fn generate_streaming<F>(
         &mut self,
-        req: GenerateRequest,
+        req: GenerateTextRequest,
         mut on_token: F,
-    ) -> anyhow::Result<DoneResponse>
+    ) -> anyhow::Result<DoneEvent>
     where
         F: FnMut(String),
     {
@@ -618,7 +617,7 @@ pub fn acquire_resource_lease_or_exit() -> ResourceLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hipfire_daemon_protocol::GenerationSamplingPolicy;
+    use hipfire_generate::GenerationSamplingPolicy;
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
@@ -696,7 +695,7 @@ mod tests {
     #[tokio::test]
     async fn load_ignores_stale_response_id_and_records_worker() {
         let mut engine = mock_engine(vec![
-            DaemonResponse::Loaded(LoadedResponse {
+            DaemonResponse::Loaded(ModelLoadedResponse {
                 worker_key_id: "stale-worker".to_string(),
                 arch: None,
                 dim: None,
@@ -705,7 +704,7 @@ mod tests {
                 model_worker: None,
                 response_id: Some("stale".to_string()),
             }),
-            DaemonResponse::Loaded(LoadedResponse {
+            DaemonResponse::Loaded(ModelLoadedResponse {
                 worker_key_id: "worker-a".to_string(),
                 arch: Some("qwen35".to_string()),
                 dim: Some(4096),
@@ -717,7 +716,7 @@ mod tests {
         ]);
 
         let loaded = engine
-            .load("model.hfq", LoadParams::default())
+            .load("model.hfq", ModelLoadParams::default())
             .await
             .unwrap();
         assert_eq!(loaded.worker_key_id, "worker-a");
@@ -727,19 +726,19 @@ mod tests {
     #[tokio::test]
     async fn generate_collects_only_matching_tokens_until_matching_done() {
         let mut engine = mock_engine(vec![
-            DaemonResponse::Token(hipfire_daemon_protocol::TokenResponse {
+            DaemonResponse::Token(hipfire_generate::TokenEvent {
                 id: "other".to_string(),
                 text: "skip".to_string(),
             }),
-            DaemonResponse::Token(hipfire_daemon_protocol::TokenResponse {
+            DaemonResponse::Token(hipfire_generate::TokenEvent {
                 id: "req-1".to_string(),
                 text: "hello".to_string(),
             }),
-            DaemonResponse::Token(hipfire_daemon_protocol::TokenResponse {
+            DaemonResponse::Token(hipfire_generate::TokenEvent {
                 id: "req-1".to_string(),
                 text: " world".to_string(),
             }),
-            DaemonResponse::Done(DoneResponse {
+            DaemonResponse::Done(DoneEvent {
                 id: "req-1".to_string(),
                 tokens: 2,
                 tok_s: None,
@@ -754,7 +753,7 @@ mod tests {
             }),
         ]);
 
-        let req = GenerateRequest {
+        let req = GenerateTextRequest {
             id: "req-1".to_string(),
             prompt: "hello".to_string(),
             messages: None,

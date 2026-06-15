@@ -1,15 +1,11 @@
-//! Compatibility facade for model-source contracts.
+//! Runtime adapter for concrete model-source opening.
 //!
 //! Core model-source traits, artifact identity helpers, and opening policy
 //! live in `hipfire-model`. Runtime still owns concrete HFQ/safetensors
 //! openers in this slice, so `open_model` remains here until those loaders
 //! move.
 
-pub use hipfire_model::{
-    detect_model_artifact_format, is_role_sidecar_name, model_display_name, normalize_tag_stem,
-    open_model_source_with, quant_preference_rank, ModelArtifactFormat, ModelSource, QuantConfig,
-    TensorInfo, QUANT_PREFERENCE,
-};
+use hipfire_model::{open_model_source_with, ModelSource};
 
 /// Open a model from a path, auto-detecting the format.
 /// - If path is a directory with config.json: opens as SafetensorsSource

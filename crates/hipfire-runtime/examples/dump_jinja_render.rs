@@ -2,8 +2,8 @@
 //! Dump the daemon's JinjaChatFrame render of an HFQ's embedded chat_template,
 //! for byte-comparison against HF apply_chat_template. CPU-only.
 //! Usage: dump_jinja_render --model <hfq> [--user <text>] [--think 0|1]
+use hipfire_prompt::JinjaChatFrame;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::prompt_frame::JinjaChatFrame;
 use hipfire_runtime::tokenizer::Tokenizer;
 fn main() {
     let a: Vec<String> = std::env::args().collect();

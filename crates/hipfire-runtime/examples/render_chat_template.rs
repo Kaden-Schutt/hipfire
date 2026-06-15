@@ -14,8 +14,8 @@
 //! Prints rendered length + first/last bytes. Compare against the
 //! Python jinja2 reference render to confirm parity.
 
+use hipfire_prompt::JinjaChatFrame;
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::prompt_frame::JinjaChatFrame;
 use hipfire_runtime::tokenizer::Tokenizer;
 use std::fs;
 use std::path::Path;
