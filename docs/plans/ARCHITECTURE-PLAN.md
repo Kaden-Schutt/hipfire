@@ -60,9 +60,9 @@ Current state boundary status:
 - `hipfire-daemon` consumes the shared checkpoint request metadata while still owning loaded-model state maps, Qwen3.5 checkpoint attach/fork/release behavior, and backend-specific GPU state materialization.
 
 Current scheduler boundary status:
-- `hipfire-scheduler` owns Rust parity contracts for priority classes, prefill/decode scheduler policy, model-worker compatibility, request-session drafts, prefill queue selection, decode active-set batching, backpressure, opportunistic dispatch, and deadline aging.
+- `hipfire-scheduler` owns Rust parity contracts for priority classes, prefill/decode scheduler policy, model-worker compatibility, request-session drafts, prefill queue selection, decode active-set batching, backpressure, opportunistic dispatch, deadline aging, and server health JSON contracts for scheduler-derived prefill/decode/state-cache metadata.
 - `hipfire-scheduler` re-exports model-owned worker-key identity helpers so existing scheduler callers keep stable paths while model placement identity ownership moves into `hipfire-model`.
-- Rust server `/health` consumes `hipfire-scheduler` policy and state-cache controls to expose scheduler-derived prefill/decode/state-cache metadata while live Rust request queuing remains daemon-serial.
+- Rust server `/health` consumes scheduler-owned health JSON builders while live Rust request queuing remains daemon-serial.
 - Bun scheduler code remains the live batching control plane until Rust server request paths consume the shared scheduler queue/session contracts.
 
 Current generate boundary status:
