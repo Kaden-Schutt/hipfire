@@ -4,6 +4,7 @@
 
 //! Shared sequence-state handles, descriptors, and reservation helpers.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -108,6 +109,22 @@ pub struct ParsedSequenceStateHandle {
     pub id: String,
     pub kind: Option<String>,
     pub generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SequenceStatePrefixHash {
+    pub algorithm: String,
+    pub value: String,
+    pub prefix_len: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SequenceStateCheckpointRequest<'a> {
+    pub source_session_id: &'a str,
+    pub dest_session_id: &'a str,
+    pub expected_logical_position: usize,
+    pub requested_prefix_hash: Option<&'a SequenceStatePrefixHash>,
+    pub checkpoint_prefix_hash: Option<&'a SequenceStatePrefixHash>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

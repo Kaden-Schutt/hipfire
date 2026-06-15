@@ -74,7 +74,8 @@ use hipfire_state::{
     parsed_handle_may_target_loaded_state, sequence_state_page_descriptor_json,
     DescribedSequenceState, GenericSequenceStateArena, ModelWorkerId, ModelWorkerMemoryView,
     ModelWorkerRuntimeView, ParsedSequenceStateHandle, SequenceStateArenaBackend,
-    SequenceStateHandle, SequenceStatePageDescriptor, SequenceStatePageKind,
+    SequenceStateCheckpointRequest, SequenceStateHandle, SequenceStatePageDescriptor,
+    SequenceStatePageKind,
 };
 #[cfg(test)]
 use hipfire_state::{
@@ -3583,15 +3584,6 @@ fn next_qwen35_state_allocation_epoch() -> u64 {
 struct LoadedModelMemory {
     model_file_bytes: usize,
     model_weight_bytes: usize,
-}
-
-#[derive(Clone, Copy)]
-struct SequenceStateCheckpointRequest<'a> {
-    source_session_id: &'a str,
-    dest_session_id: &'a str,
-    expected_logical_position: usize,
-    requested_prefix_hash: Option<&'a GenerateBatchPrefillPrefixHash>,
-    checkpoint_prefix_hash: Option<&'a GenerateBatchPrefillPrefixHash>,
 }
 
 struct Qwen35RequestSessionState {
