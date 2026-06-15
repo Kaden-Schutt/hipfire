@@ -774,8 +774,11 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
     };
 
     if !dtype_needs_rotation(w.gpu_dtype) {
-        return gemv
-            .run_auto(&ctx, gpu, &wr, x, y)
+        // BF16 weights use WMMA GEMM directly (dispatch family has no BF16 GEMV entry).
+        if w.gpu_dtype == DType::BF16 {
+            return gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, 1);
+        }
+        return gemv.run_auto(&ctx, gpu, &wr, x, y)
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
     }
 

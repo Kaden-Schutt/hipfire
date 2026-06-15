@@ -112,10 +112,10 @@ hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
-hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
-hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
-hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
-hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+# hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }   # chaingun: needs gpu.graphs (not yet on this branch)
+# hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }    # chaingun: needs gpu.graphs (not yet on this branch)
+# hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" } # chaingun: needs swa_topk_wmma methods (not yet on this branch)
+# hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }  # chaingun: unclosed delimiter from merge
 hipfire-atlas = { path = "../hipfire-atlas" }
 
 # Each example below carries `required-features` listing the cargo

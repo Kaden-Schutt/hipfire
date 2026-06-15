@@ -920,11 +920,13 @@ fn headnorm_rope_q_handles() -> &'static Mutex<HashMap<usize, RawHandle>> {
     HEADNORM_ROPE_Q_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Create (or reuse cached) headnorm_rope_q handle for `layer_idx`.
+/// Create (or reuse cached) headnorm_rope_q handle keyed by `n_total`.
 ///
+/// All FullAttention layers with the same shape share one XRT context to avoid
+/// hitting NPU1's context limit (≤3 simultaneous contexts per session).
 /// `n_total` = n_heads × head_dim (element count for Q, not bytes).
 pub fn headnorm_rope_q_handle_for(
-    layer_idx: usize,
+    _layer_idx: usize,
     n_total: usize,
     xclbin_path: &str,
     instr_path: &str,
@@ -932,7 +934,7 @@ pub fn headnorm_rope_q_handle_for(
     let lib = get_lib()?;
     let fn_create = lib.fn_headnorm_rope_q_create?;
     let mut map = headnorm_rope_q_handles().lock().unwrap();
-    if let Some(h) = map.get(&layer_idx) {
+    if let Some(h) = map.get(&n_total) {
         return Some(h.0);
     }
     let xclbin_c = CString::new(xclbin_path).ok()?;
@@ -947,13 +949,13 @@ pub fn headnorm_rope_q_handle_for(
     };
     if handle.is_null() {
         eprintln!(
-            "[xdna1] headnorm_rope_q_create returned null for layer={layer_idx} \
-             n_total={n_total} xclbin={xclbin_path}"
+            "[xdna1] headnorm_rope_q_create returned null for n_total={n_total} \
+             xclbin={xclbin_path}"
         );
         return None;
     }
-    eprintln!("  [xdna1] headnorm_rope_q loaded: layer={layer_idx} n_total={n_total}");
-    map.insert(layer_idx, RawHandle(handle));
+    eprintln!("  [xdna1] headnorm_rope_q loaded: n_total={n_total}");
+    map.insert(n_total, RawHandle(handle));
     Some(handle)
 }
 
@@ -1010,11 +1012,12 @@ fn headnorm_rope_k_handles() -> &'static Mutex<HashMap<usize, RawHandle>> {
     HEADNORM_ROPE_K_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Create (or reuse cached) headnorm_rope_k handle for `layer_idx`.
+/// Create (or reuse cached) headnorm_rope_k handle keyed by `n_total`.
 ///
+/// All FullAttention layers with the same shape share one XRT context.
 /// `n_total` = n_kv_heads × head_dim.
 pub fn headnorm_rope_k_handle_for(
-    layer_idx: usize,
+    _layer_idx: usize,
     n_total: usize,
     xclbin_path: &str,
     instr_path: &str,
@@ -1022,7 +1025,7 @@ pub fn headnorm_rope_k_handle_for(
     let lib = get_lib()?;
     let fn_create = lib.fn_headnorm_rope_k_create?;
     let mut map = headnorm_rope_k_handles().lock().unwrap();
-    if let Some(h) = map.get(&layer_idx) {
+    if let Some(h) = map.get(&n_total) {
         return Some(h.0);
     }
     let xclbin_c = CString::new(xclbin_path).ok()?;
@@ -1037,13 +1040,13 @@ pub fn headnorm_rope_k_handle_for(
     };
     if handle.is_null() {
         eprintln!(
-            "[xdna1] headnorm_rope_k_create returned null for layer={layer_idx} \
-             n_total={n_total} xclbin={xclbin_path}"
+            "[xdna1] headnorm_rope_k_create returned null for n_total={n_total} \
+             xclbin={xclbin_path}"
         );
         return None;
     }
-    eprintln!("  [xdna1] headnorm_rope_k loaded: layer={layer_idx} n_total={n_total}");
-    map.insert(layer_idx, RawHandle(handle));
+    eprintln!("  [xdna1] headnorm_rope_k loaded: n_total={n_total}");
+    map.insert(n_total, RawHandle(handle));
     Some(handle)
 }
 

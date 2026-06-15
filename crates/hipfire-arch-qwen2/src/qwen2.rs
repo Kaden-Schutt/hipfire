@@ -28,6 +28,8 @@
 //! crate shares one implementation. Marked individually below.
 
 use hip_bridge::{DeviceBuffer, HipResult};
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama::{f16_to_f32, gemv_family, weight_gemm, weight_gemv, EmbeddingFormat, WeightTensor};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
     self, EscapeKind, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
@@ -770,19 +772,19 @@ impl Qwen2State {
         let x_rot_len = dim.max(hidden_dim);
 
         Ok(Self {
-            x: gpu.alloc_tensor(&[dim], DType::F32)?,
-            tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
-            x_rot: gpu.alloc_tensor(&[x_rot_len], DType::F32)?,
-            q: gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            k: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
-            v: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
-            attn_out: gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            o: gpu.alloc_tensor(&[dim], DType::F32)?,
-            gate: gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
-            up: gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
-            ffn_hidden: gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
-            ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
-            logits: gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)?,
+            x:           gpu.alloc_tensor(&[dim], DType::F32)?,
+            tmp:         gpu.alloc_tensor(&[dim], DType::F32)?,
+            x_rot:       gpu.alloc_tensor(&[x_rot_len], DType::F32)?,
+            q:           gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            k:           gpu.alloc_tensor(&[kv_dim], DType::F32)?,
+            v:           gpu.alloc_tensor(&[kv_dim], DType::F32)?,
+            attn_out:    gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            o:           gpu.alloc_tensor(&[dim], DType::F32)?,
+            gate:        gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
+            up:          gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
+            ffn_hidden:  gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
+            ffn_out:     gpu.alloc_tensor(&[dim], DType::F32)?,
+            logits:      gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)?,
             attn_partials: gpu.alloc_tensor(&[attn_partials_len], DType::F32)?,
             pos_buf: gpu.hip.malloc(4)?,
             k_cache,
@@ -807,22 +809,9 @@ impl Qwen2State {
     /// Release every GPU buffer back to the pool. Consumes self.
     /// Mirrors `ForwardScratch::free_gpu` in `hipfire_runtime::llama`.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        for t in [
-            self.x,
-            self.tmp,
-            self.x_rot,
-            self.q,
-            self.k,
-            self.v,
-            self.attn_out,
-            self.o,
-            self.gate,
-            self.up,
-            self.ffn_hidden,
-            self.ffn_out,
-            self.logits,
-            self.attn_partials,
-        ] {
+        for t in [self.x, self.tmp, self.x_rot, self.q, self.k, self.v, self.attn_out,
+                  self.o, self.gate, self.up, self.ffn_hidden,
+                  self.ffn_out, self.logits, self.attn_partials] {
             let _ = gpu.free_tensor(t);
         }
         for t in self.k_cache {
@@ -1726,11 +1715,7 @@ impl<'a> ForwardBindings for Qwen2Bindings<'a> {
                 &self.state.k_cache[l],
                 &self.state.v_cache[l],
                 &self.state.attn_out,
-                self.seq_len,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                self.state.max_seq,
+                self.seq_len, n_heads, n_kv_heads, head_dim, self.state.max_seq,
             )
         } else if n_kv_heads < n_heads && self.seq_len >= 4096 {
             Gpu::attention_flash_gqa(
