@@ -40,7 +40,9 @@ use hipfire_arch_qwen35::speculative::{
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_generate::{
-    plan_generate_batch_prefill_qwen35, select_qwen35_decode_batch_backend,
+    plan_generate_batch_prefill_qwen35, qwen35_decode_batch_requested_auto,
+    qwen35_decode_batch_scheduler_metadata, qwen35_grouped_moe_decode_auto_latency_gate_passed,
+    select_qwen35_decode_batch_backend, select_qwen35_prefill_batch_backend,
     validate_generate_batch_decode, validate_generate_batch_prefill,
     validate_prefix_hash_preflight, GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession,
     GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan, GenerateBatchPrefillPrefixHash,
@@ -1044,14 +1046,6 @@ fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
     let _ = stdout.flush();
 }
 
-fn qwen35_decode_batch_requested_auto(requested: &str) -> bool {
-    matches!(requested, "" | "auto")
-}
-
-fn qwen35_grouped_moe_decode_auto_latency_gate_passed(session_count: usize) -> bool {
-    session_count >= 4
-}
-
 fn validate_qwen35_decode_batch_runtime_surface(
     arch_id: u32,
     pp: usize,
@@ -1074,52 +1068,6 @@ fn validate_qwen35_decode_batch_runtime_surface(
         );
     }
     Ok(())
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Qwen35DecodeBatchSchedulerMetadata {
-    selected_backend: &'static str,
-    batch_size: usize,
-    compatible_state_kinds: Vec<&'static str>,
-    cached_prefix_tokens: usize,
-    fallback_reason: &'static str,
-}
-
-fn qwen35_decode_batch_scheduler_metadata(
-    requested: &str,
-    arch_id: u32,
-    backend: Qwen35DecodeBatchBackend,
-    batch_size: usize,
-    cached_prefix_tokens: usize,
-) -> Qwen35DecodeBatchSchedulerMetadata {
-    let fallback_reason = if qwen35_decode_batch_requested_auto(requested) {
-        match (arch_id, backend) {
-            (6, Qwen35DecodeBatchBackend::SerialReference)
-                if !qwen35_grouped_moe_decode_auto_latency_gate_passed(batch_size) =>
-            {
-                "auto_grouped_moe_serial_small_batch_latency_gate"
-            }
-            (6, Qwen35DecodeBatchBackend::SerialReference) => {
-                "auto_grouped_moe_serial_pending_latency_gate"
-            }
-            (_, Qwen35DecodeBatchBackend::SerialReference) if batch_size < 2 => {
-                "auto_requires_multi_session"
-            }
-            (_, Qwen35DecodeBatchBackend::SerialReference) => "auto_serial_reference",
-            _ => "none",
-        }
-    } else if backend == Qwen35DecodeBatchBackend::SerialReference {
-        "requested_serial_reference"
-    } else {
-        "none"
-    };
-    Qwen35DecodeBatchSchedulerMetadata {
-        selected_backend: backend.as_str(),
-        batch_size,
-        compatible_state_kinds: vec!["attention_kv", "deltanet_recurrent"],
-        cached_prefix_tokens,
-        fallback_reason,
-    }
 }
 
 fn qwen35_fused_dense_decode_signature(
@@ -1330,56 +1278,6 @@ fn validate_qwen35_fused_dense_decode_resident_sessions(
     }
     validate_qwen35_fused_dense_decode_session_signatures(config, &signatures, signatures.len())
         .map_err(|e| format!("qwen35 fused dense decode unsupported resident state: {e}"))
-}
-
-fn select_qwen35_prefill_batch_backend(
-    plan: GenerateBatchPrefillPlan,
-    requested: Option<&str>,
-    fused_grouped_moe_supported: Result<(), String>,
-) -> Result<Qwen35PrefillBatchBackend, String> {
-    match requested.unwrap_or("auto") {
-        "auto" | "" => match plan {
-            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate => {
-                Ok(Qwen35PrefillBatchBackend::FusedDense)
-            }
-            GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate => {
-                if fused_grouped_moe_supported.is_ok() {
-                    Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
-                } else {
-                    Ok(Qwen35PrefillBatchBackend::SerialReference)
-                }
-            }
-            GenerateBatchPrefillPlan::SerialExact => Ok(Qwen35PrefillBatchBackend::SerialReference),
-        },
-        "serial" | "serial_reference" => Ok(Qwen35PrefillBatchBackend::SerialReference),
-        "fused" | "fused_dense" => {
-            if plan == GenerateBatchPrefillPlan::FusedDenseQwen35Candidate {
-                Ok(Qwen35PrefillBatchBackend::FusedDense)
-            } else if plan == GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
-                fused_grouped_moe_supported?;
-                Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
-            } else {
-                Err(format!(
-                    "qwen35 fused prefill-session batch requested, but plan={} is not fused-eligible",
-                    plan.as_str()
-                ))
-            }
-        }
-        "fused_moe" | "grouped_moe" | "fused_grouped_moe" => {
-            if plan == GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
-                fused_grouped_moe_supported?;
-                Ok(Qwen35PrefillBatchBackend::FusedGroupedMoe)
-            } else {
-                Err(format!(
-                    "qwen35 grouped-MoE fused prefill-session batch requested, but plan={} is not grouped-MoE eligible",
-                    plan.as_str()
-                ))
-            }
-        }
-        other => Err(format!(
-            "unsupported HIPFIRE_QWEN35_PREFILL_SESSION_BATCH={other}; expected auto, serial, fused, or fused_moe"
-        )),
-    }
 }
 
 fn parse_assistant_prefix_label(
