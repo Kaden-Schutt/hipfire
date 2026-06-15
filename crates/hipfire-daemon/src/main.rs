@@ -39,20 +39,24 @@ use hipfire_arch_qwen35::speculative::{
 };
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+#[cfg(test)]
+use hipfire_generate::validate_qwen35_fused_dense_prefill_batch_preflight;
 use hipfire_generate::{
-    compute_qwen35_prefix_hash, generate_prefix_hash_json, plan_generate_batch_prefill_qwen35,
+    build_qwen35_fused_dense_prefill_batch_contract, compute_qwen35_prefix_hash,
+    generate_prefix_hash_json, plan_generate_batch_prefill_qwen35,
     qwen35_decode_batch_requested_auto, qwen35_decode_batch_scheduler_metadata,
-    qwen35_grouped_moe_decode_auto_latency_gate_passed, qwen35_prefill_checkpoint_boundary_kind,
-    qwen35_prefill_checkpoint_session_id, qwen35_prefill_scratch_target_batch,
-    select_qwen35_decode_batch_backend, select_qwen35_prefill_batch_backend,
-    validate_generate_batch_decode, validate_generate_batch_prefill,
-    validate_prefix_hash_preflight, GenerateBatchDecodeEnvelope, GenerateBatchDecodeSession,
-    GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan, GenerateBatchPrefillPrefixHash,
-    GenerateBatchPrefillSession, PrefixHashPreflightCandidate, PrefixHashPreflightEnvelope,
-    Qwen35DecodeBatchBackend, Qwen35FusedDensePrefillBatchContract,
-    Qwen35FusedDensePrefillInputKind, Qwen35FusedDensePrefillSessionSpec,
+    qwen35_fused_prefill_boundary_cuts, qwen35_grouped_moe_decode_auto_latency_gate_passed,
+    qwen35_prefill_checkpoint_boundary_kind, qwen35_prefill_checkpoint_session_id,
+    qwen35_prefill_scratch_target_batch, select_qwen35_decode_batch_backend,
+    select_qwen35_prefill_batch_backend, validate_generate_batch_decode,
+    validate_generate_batch_prefill, validate_prefix_hash_preflight,
+    validate_qwen35_fused_grouped_moe_prefill_batch_preflight, GenerateBatchDecodeEnvelope,
+    GenerateBatchDecodeSession, GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan,
+    GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession, PrefixHashPreflightCandidate,
+    PrefixHashPreflightEnvelope, Qwen35DecodeBatchBackend, Qwen35FusedDensePrefillInputKind,
     Qwen35PrefillBatchBackend, Qwen35PrefillBatchResult, Qwen35PrefillCheckpointHook,
-    Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult, Qwen35SemanticBoundaryCheckpoint,
+    Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult, Qwen35PreparedPrefillSession,
+    Qwen35SemanticBoundaryCheckpoint,
 };
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -3618,18 +3622,6 @@ struct Qwen35RequestSessionState {
     allocation_epoch: u64,
 }
 
-#[derive(Clone)]
-struct Qwen35PreparedPrefillSession {
-    id: String,
-    tokens: Vec<u32>,
-    cached_prefix_tokens: usize,
-    replay_as_generated_suffix: bool,
-    state_kinds: Vec<String>,
-    assistant_prefix: String,
-    max_think_tokens: usize,
-    boundary_checkpoints: Vec<Qwen35SemanticBoundaryCheckpoint>,
-}
-
 impl Qwen35RequestSessionState {
     fn clone_gpu_tensor(
         gpu: &mut rdna_compute::Gpu,
@@ -5588,48 +5580,6 @@ fn qwen35_prefill_suffix_batch(
     }
 }
 
-fn qwen35_fused_prefill_boundary_cuts(
-    prepared: &[Qwen35PreparedPrefillSession],
-) -> Result<Option<Vec<usize>>, String> {
-    if prepared
-        .iter()
-        .all(|session| session.boundary_checkpoints.is_empty())
-    {
-        return Ok(None);
-    }
-    if prepared.iter().any(|session| {
-        session.replay_as_generated_suffix && !session.boundary_checkpoints.is_empty()
-    }) {
-        return Err(
-            "qwen35 fused prefill boundary checkpoints are only supported for full-prompt prefill"
-                .to_string(),
-        );
-    }
-    let mut cuts: Vec<usize> = prepared
-        .iter()
-        .flat_map(|session| {
-            session
-                .boundary_checkpoints
-                .iter()
-                .map(|checkpoint| checkpoint.prefix_len)
-        })
-        .collect();
-    cuts.sort_unstable();
-    cuts.dedup();
-    let max_len = prepared
-        .iter()
-        .map(|session| session.tokens.len())
-        .max()
-        .unwrap_or(0);
-    if max_len == 0 {
-        return Ok(None);
-    }
-    if cuts.last().copied() != Some(max_len) {
-        cuts.push(max_len);
-    }
-    Ok(Some(cuts))
-}
-
 fn emit_qwen35_owned_prefill_checkpoint(
     sessions: &mut HashMap<String, Qwen35RequestSessionState>,
     gpu: &mut rdna_compute::Gpu,
@@ -6067,42 +6017,6 @@ fn qwen35_prefill_suffix_batch_fused_grouped_moe(
     })
 }
 
-fn validate_qwen35_fused_grouped_moe_prefill_batch_preflight(
-    prepared: &[Qwen35PreparedPrefillSession],
-    plan: GenerateBatchPrefillPlan,
-) -> Result<(), String> {
-    if plan != GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
-        return Err(format!(
-            "qwen35 grouped-MoE fused prefill-session batch worker requires plan={}, got {}",
-            GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate.as_str(),
-            plan.as_str()
-        ));
-    }
-    if prepared.len() < 2 {
-        return Err(
-            "qwen35 grouped-MoE fused prefill-session batch worker requires at least two sessions"
-                .to_string(),
-        );
-    }
-    if prepared.iter().any(|session| session.tokens.is_empty()) {
-        return Err(
-            "qwen35 grouped-MoE fused prefill-session batch worker requires non-empty session token slices"
-                .to_string(),
-        );
-    }
-    let replay_as_generated_suffix = prepared[0].replay_as_generated_suffix;
-    if prepared
-        .iter()
-        .any(|session| session.replay_as_generated_suffix != replay_as_generated_suffix)
-    {
-        return Err(
-            "qwen35 grouped-MoE fused prefill-session batch worker cannot mix full-prompt prefill and generated-suffix replay sessions"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
 fn qwen35_prefill_suffix_batch_fused_dense(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -6514,75 +6428,6 @@ fn qwen35_prefill_suffix_batch_fused_dense(
         plan,
         backend,
         total_prefill_tokens: shape.total_tokens,
-        sessions,
-    })
-}
-
-fn validate_qwen35_fused_dense_prefill_batch_preflight(
-    prepared: &[Qwen35PreparedPrefillSession],
-    plan: GenerateBatchPrefillPlan,
-) -> Result<(), String> {
-    if plan != GenerateBatchPrefillPlan::FusedDenseQwen35Candidate {
-        return Err(format!(
-            "qwen35 fused dense prefill-session batch worker requires plan={}, got {}",
-            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate.as_str(),
-            plan.as_str()
-        ));
-    }
-    if prepared.len() < 2 {
-        return Err(
-            "qwen35 fused dense prefill-session batch worker requires at least two sessions"
-                .to_string(),
-        );
-    }
-    if prepared.iter().any(|session| session.tokens.is_empty()) {
-        return Err(
-            "qwen35 fused dense prefill-session batch worker requires non-empty session token slices"
-                .to_string(),
-        );
-    }
-    let replay_as_generated_suffix = prepared[0].replay_as_generated_suffix;
-    if prepared
-        .iter()
-        .any(|session| session.replay_as_generated_suffix != replay_as_generated_suffix)
-    {
-        return Err(
-            "qwen35 fused dense prefill-session batch worker cannot mix full-prompt prefill and generated-suffix replay sessions"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn build_qwen35_fused_dense_prefill_batch_contract<'a>(
-    prepared: &'a [Qwen35PreparedPrefillSession],
-    plan: GenerateBatchPrefillPlan,
-) -> Result<Qwen35FusedDensePrefillBatchContract<'a>, String> {
-    validate_qwen35_fused_dense_prefill_batch_preflight(prepared, plan)?;
-    let input_kind = if prepared[0].replay_as_generated_suffix {
-        Qwen35FusedDensePrefillInputKind::GeneratedSuffixReplay
-    } else {
-        Qwen35FusedDensePrefillInputKind::FullPrompt
-    };
-    let mut total_tokens = 0usize;
-    let sessions = prepared
-        .iter()
-        .map(|session| {
-            total_tokens += session.tokens.len();
-            Qwen35FusedDensePrefillSessionSpec {
-                id: &session.id,
-                tokens: &session.tokens,
-                cached_prefix_tokens: session.cached_prefix_tokens,
-                replay_as_generated_suffix: session.replay_as_generated_suffix,
-                state_kinds: &session.state_kinds,
-                assistant_prefix: &session.assistant_prefix,
-                max_think_tokens: session.max_think_tokens,
-            }
-        })
-        .collect();
-    Ok(Qwen35FusedDensePrefillBatchContract {
-        input_kind,
-        total_tokens,
         sessions,
     })
 }

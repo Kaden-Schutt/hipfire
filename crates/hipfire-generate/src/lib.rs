@@ -806,6 +806,18 @@ pub struct Qwen35PrefillBatchResult {
     pub sessions: Vec<Qwen35PrefillSessionResult>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen35PreparedPrefillSession {
+    pub id: String,
+    pub tokens: Vec<u32>,
+    pub cached_prefix_tokens: usize,
+    pub replay_as_generated_suffix: bool,
+    pub state_kinds: Vec<String>,
+    pub assistant_prefix: String,
+    pub max_think_tokens: usize,
+    pub boundary_checkpoints: Vec<Qwen35SemanticBoundaryCheckpoint>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Qwen35FusedDensePrefillInputKind {
     FullPrompt,
@@ -828,6 +840,153 @@ pub struct Qwen35FusedDensePrefillBatchContract<'a> {
     pub input_kind: Qwen35FusedDensePrefillInputKind,
     pub total_tokens: usize,
     pub sessions: Vec<Qwen35FusedDensePrefillSessionSpec<'a>>,
+}
+
+pub fn qwen35_fused_prefill_boundary_cuts(
+    prepared: &[Qwen35PreparedPrefillSession],
+) -> Result<Option<Vec<usize>>, String> {
+    if prepared
+        .iter()
+        .all(|session| session.boundary_checkpoints.is_empty())
+    {
+        return Ok(None);
+    }
+    if prepared.iter().any(|session| {
+        session.replay_as_generated_suffix && !session.boundary_checkpoints.is_empty()
+    }) {
+        return Err(
+            "qwen35 fused prefill boundary checkpoints are only supported for full-prompt prefill"
+                .to_string(),
+        );
+    }
+    let mut cuts: Vec<usize> = prepared
+        .iter()
+        .flat_map(|session| {
+            session
+                .boundary_checkpoints
+                .iter()
+                .map(|checkpoint| checkpoint.prefix_len)
+        })
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let max_len = prepared
+        .iter()
+        .map(|session| session.tokens.len())
+        .max()
+        .unwrap_or(0);
+    if max_len == 0 {
+        return Ok(None);
+    }
+    if cuts.last().copied() != Some(max_len) {
+        cuts.push(max_len);
+    }
+    Ok(Some(cuts))
+}
+
+pub fn validate_qwen35_fused_grouped_moe_prefill_batch_preflight(
+    prepared: &[Qwen35PreparedPrefillSession],
+    plan: GenerateBatchPrefillPlan,
+) -> Result<(), String> {
+    if plan != GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
+        return Err(format!(
+            "qwen35 grouped-MoE fused prefill-session batch worker requires plan={}, got {}",
+            GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate.as_str(),
+            plan.as_str()
+        ));
+    }
+    if prepared.len() < 2 {
+        return Err(
+            "qwen35 grouped-MoE fused prefill-session batch worker requires at least two sessions"
+                .to_string(),
+        );
+    }
+    if prepared.iter().any(|session| session.tokens.is_empty()) {
+        return Err(
+            "qwen35 grouped-MoE fused prefill-session batch worker requires non-empty session token slices"
+                .to_string(),
+        );
+    }
+    let replay_as_generated_suffix = prepared[0].replay_as_generated_suffix;
+    if prepared
+        .iter()
+        .any(|session| session.replay_as_generated_suffix != replay_as_generated_suffix)
+    {
+        return Err(
+            "qwen35 grouped-MoE fused prefill-session batch worker cannot mix full-prompt prefill and generated-suffix replay sessions"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_qwen35_fused_dense_prefill_batch_preflight(
+    prepared: &[Qwen35PreparedPrefillSession],
+    plan: GenerateBatchPrefillPlan,
+) -> Result<(), String> {
+    if plan != GenerateBatchPrefillPlan::FusedDenseQwen35Candidate {
+        return Err(format!(
+            "qwen35 fused dense prefill-session batch worker requires plan={}, got {}",
+            GenerateBatchPrefillPlan::FusedDenseQwen35Candidate.as_str(),
+            plan.as_str()
+        ));
+    }
+    if prepared.len() < 2 {
+        return Err(
+            "qwen35 fused dense prefill-session batch worker requires at least two sessions"
+                .to_string(),
+        );
+    }
+    if prepared.iter().any(|session| session.tokens.is_empty()) {
+        return Err(
+            "qwen35 fused dense prefill-session batch worker requires non-empty session token slices"
+                .to_string(),
+        );
+    }
+    let replay_as_generated_suffix = prepared[0].replay_as_generated_suffix;
+    if prepared
+        .iter()
+        .any(|session| session.replay_as_generated_suffix != replay_as_generated_suffix)
+    {
+        return Err(
+            "qwen35 fused dense prefill-session batch worker cannot mix full-prompt prefill and generated-suffix replay sessions"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub fn build_qwen35_fused_dense_prefill_batch_contract<'a>(
+    prepared: &'a [Qwen35PreparedPrefillSession],
+    plan: GenerateBatchPrefillPlan,
+) -> Result<Qwen35FusedDensePrefillBatchContract<'a>, String> {
+    validate_qwen35_fused_dense_prefill_batch_preflight(prepared, plan)?;
+    let input_kind = if prepared[0].replay_as_generated_suffix {
+        Qwen35FusedDensePrefillInputKind::GeneratedSuffixReplay
+    } else {
+        Qwen35FusedDensePrefillInputKind::FullPrompt
+    };
+    let mut total_tokens = 0usize;
+    let sessions = prepared
+        .iter()
+        .map(|session| {
+            total_tokens += session.tokens.len();
+            Qwen35FusedDensePrefillSessionSpec {
+                id: &session.id,
+                tokens: &session.tokens,
+                cached_prefix_tokens: session.cached_prefix_tokens,
+                replay_as_generated_suffix: session.replay_as_generated_suffix,
+                state_kinds: &session.state_kinds,
+                assistant_prefix: &session.assistant_prefix,
+                max_think_tokens: session.max_think_tokens,
+            }
+        })
+        .collect();
+    Ok(Qwen35FusedDensePrefillBatchContract {
+        input_kind,
+        total_tokens,
+        sessions,
+    })
 }
 
 pub fn select_qwen35_prefill_batch_backend(
