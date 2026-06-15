@@ -21,7 +21,9 @@ The target crates for modular boundaries remain:
 - `hipfire-state`
 - `hipfire-generate`
 - `hipfire-coherence` (created; owns detector policy and report row serialization helpers)
-- `hipfire-rocm`
+- `hipfire-rocm` (created; owns ROCm backend evidence contracts)
+- `hipfire-daemon-adapter` (created; owns daemon JSONL process-client adapter)
+- `hipfire-daemon-protocol` (created; owns daemon JSONL request/response contracts)
 - `hipfire-evidence` (created; owns evidence provenance and hash helpers)
 
 A `bun`-free control plane remains desirable but is deferred behind verified seam extraction.
@@ -30,14 +32,44 @@ Current prompt boundary status:
 - `hipfire-prompt` owns `AssistantPrefix`, `Role`, `Message`, `ToolCall`, `ChatFrame`, and `JinjaChatFrame`.
 - `hipfire-runtime::prompt_frame` remains a compatibility re-export and implements the prompt tokenizer trait for the runtime tokenizer.
 - The Rust server forwards structured chat `messages` to the daemon and keeps `prompt` as the last-user-text compatibility fallback, avoiding nested ChatML.
+- The Rust server builds typed daemon load parameters from config and preserves explicit DFlash mode plus configured TriAttention sidecars through `hipfire-daemon-protocol`.
 
 Current model boundary status:
 - `hipfire-model` owns `ModelSource`, `TensorInfo`, `QuantConfig`, model artifact format detection, role-sidecar filtering, display-name derivation, and quant preference ranking.
+- `hipfire-model` owns common model-load request/parameter contracts used by daemon protocol clients and future direct library adapters.
 - `hipfire-runtime::model_source` remains a compatibility facade and still owns concrete HFQ/safetensors openers until those loaders move.
 
 Current state boundary status:
 - `hipfire-state` owns sequence-state handles, parsed handle contracts, page descriptors, worker memory/runtime view structs, generic reservation helpers, and JSON rendering for state descriptors.
 - `hipfire-daemon` still owns loaded-model state maps, Qwen3.5 checkpoint attach/fork/release behavior, and backend-specific GPU state materialization.
+
+Current scheduler boundary status:
+- `hipfire-scheduler` owns Rust parity contracts for priority classes, prefill/decode scheduler policy, model-worker compatibility, request-session drafts, prefill queue selection, decode active-set batching, backpressure, opportunistic dispatch, and deadline aging.
+- Bun scheduler code remains the live server control plane until Rust server paths consume the shared scheduler crate.
+
+Current generate boundary status:
+- `hipfire-generate` owns typed generation sampling policy, text generation request/event structs, generate-batch prefill/decode envelopes, Qwen3.5 prefill/decode backend plan enums, and scheduler metadata helpers.
+- `hipfire-daemon-protocol` re-exports the generate-owned text request and token/done/error event structs for daemon JSONL generate traffic, so the protocol crate no longer owns duplicate generate contracts.
+- `hipfire-daemon` still owns concrete validation, model-specific execution, Qwen3.5 runtime orchestration, and JSONL adapter dispatch until later migration slices consume the shared contracts.
+
+Current CPU/backend boundary status:
+- `hipfire-cpu` owns deterministic BF16 CPU oracle helpers, dense FFN/projection module contracts, backend selection evidence structs, and JSON rendering for module outputs.
+- `hipfire-arch-qwen35::ffn_bf16` remains the compatibility facade for Qwen3.5 mode/env parsing and re-exports the shared CPU oracle contracts.
+
+Current ROCm/backend boundary status:
+- `hipfire-rocm` owns ROCm device identity, backend-path classification, dense FFN/projection module execution evidence, and JSON rendering for ROCm module outputs.
+- Qwen3.5 dense FFN trace output records shared ROCm evidence for the existing `weight_gemv_swiglu_residual` path without moving HIP dispatch or kernel code.
+
+Current daemon protocol boundary status:
+- `hipfire-daemon-protocol` owns typed daemon JSONL request/response structs, including load/generate request envelopes and token/done/error responses.
+- `hipfire-server::daemon::protocol` remains a compatibility re-export so server callers keep their current paths while the wire JSON stays unchanged.
+- `hipfire-daemon` consumes the shared generate request contract opportunistically for common generate fields while preserving raw-JSON fallbacks for legacy/daemon-only fields.
+- `hipfire-daemon` also consumes the shared load request contract for common load fields (`model`, `max_seq`, `physical_cap`, `dflash_mode`, `draft`, `kv_cache`, `cask_sidecar`) while preserving raw-JSON fallbacks for legacy/daemon-only load fields.
+- `hipfire-daemon-protocol` re-exports the model-owned load request/params so protocol callers keep stable paths while load contract ownership moves into `hipfire-model`.
+
+Current daemon adapter boundary status:
+- `hipfire-daemon-adapter` owns the async stdio JSONL process client, daemon binary discovery, load/ping/unload/generate response loops, and stale-response filtering.
+- `hipfire-server::daemon::engine` remains a compatibility re-export for server and CLI callers while the adapter becomes reusable outside the HTTP server crate.
 
 Current evidence boundary status:
 - `hipfire-evidence` owns stable hash, model/tag hash, directory digest, file hash, and HFQ metadata extraction helpers.

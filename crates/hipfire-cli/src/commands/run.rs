@@ -4,7 +4,7 @@ use clap::Args;
 use hipfire_server::{
     daemon::{
         engine::{find_daemon_bin, DaemonEngine},
-        protocol::{GenerateRequest, LoadParams},
+        protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams},
     },
     model::discovery::find_model,
     HipfireConfig,
@@ -53,10 +53,12 @@ pub async fn run(args: RunArgs, config: HipfireConfig) -> anyhow::Result<()> {
         id: Uuid::new_v4().to_string(),
         prompt,
         messages: None,
-        temperature: args.temperature.unwrap_or(config.temperature),
-        max_tokens: args.max_tokens.unwrap_or(config.max_tokens),
-        top_p: Some(config.top_p),
-        repeat_penalty: Some(config.repeat_penalty),
+        sampling: GenerationSamplingPolicy {
+            temperature: args.temperature.unwrap_or(config.temperature),
+            max_tokens: args.max_tokens.unwrap_or(config.max_tokens),
+            top_p: Some(config.top_p),
+            repeat_penalty: Some(config.repeat_penalty),
+        },
         worker_key_id: engine.worker_key_id.clone(),
         tools: None,
         system: None,

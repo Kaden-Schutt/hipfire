@@ -1,0 +1,8 @@
+[package]
+name = "hipfire-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Priority scheduling and session batching policy for hipfire"
+
+[dependencies]

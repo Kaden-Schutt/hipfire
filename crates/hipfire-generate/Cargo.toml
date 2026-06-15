@@ -1,12 +1,11 @@
 [package]
-name = "hipfire-model"
+name = "hipfire-generate"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Model artifact identity and source contracts for hipfire"
+description = "Typed generation request, event, and batch-plan contracts for hipfire"
 
 [dependencies]
+hipfire-prompt = { path = "../hipfire-prompt" }
 serde = { version = "1", features = ["derive"] }
-
-[dev-dependencies]
 serde_json = "1"

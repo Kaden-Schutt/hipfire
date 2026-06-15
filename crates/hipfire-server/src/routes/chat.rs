@@ -13,8 +13,9 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::config::HipfireConfig;
 use crate::daemon::engine::{find_daemon_bin, DaemonEngine};
-use crate::daemon::protocol::{GenerateRequest, LoadParams};
+use crate::daemon::protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
 use crate::model::discovery::find_model;
 use crate::state::SharedState;
 
@@ -89,6 +90,20 @@ fn last_user_prompt(messages: &[ChatMessage]) -> String {
         .unwrap_or_default()
 }
 
+fn load_params_from_config(cfg: &HipfireConfig) -> LoadParams {
+    LoadParams {
+        max_seq: cfg.max_seq,
+        kv_cache: Some(cfg.kv_cache.clone()).filter(|s| s != "auto"),
+        flash_mode: Some(cfg.flash_mode.clone()).filter(|s| s != "auto"),
+        dflash_mode: Some(cfg.dflash_mode.clone()).filter(|s| s != "auto"),
+        cask_sidecar: cfg
+            .cask_sidecar
+            .clone()
+            .filter(|sidecar| !sidecar.is_empty()),
+        ..Default::default()
+    }
+}
+
 async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(), String> {
     let model_path =
         find_model(model_arg).ok_or_else(|| format!("model not found: {model_arg}"))?;
@@ -114,13 +129,7 @@ async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(),
 
     let params = {
         let cfg = state.config.lock().await;
-        LoadParams {
-            max_seq: cfg.max_seq,
-            kv_cache: Some(cfg.kv_cache.clone()).filter(|s| s != "auto"),
-            flash_mode: Some(cfg.flash_mode.clone()).filter(|s| s != "auto"),
-            dflash_mode: Some(cfg.dflash_mode.clone()).filter(|s| s == "on"),
-            ..Default::default()
-        }
+        load_params_from_config(&cfg)
     };
 
     engine
@@ -164,10 +173,12 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
             id: req_id.clone(),
             prompt: last_user_prompt(&body.messages),
             messages: Some(messages_to_daemon(&body.messages)),
-            temperature: body.temperature.unwrap_or(cfg.temperature),
-            max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
-            top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
-            repeat_penalty: Some(cfg.repeat_penalty),
+            sampling: GenerationSamplingPolicy {
+                temperature: body.temperature.unwrap_or(cfg.temperature),
+                max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
+                top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
+                repeat_penalty: Some(cfg.repeat_penalty),
+            },
             worker_key_id,
             tools: body.tools,
             system: body.system,
@@ -254,10 +265,12 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                 id: req_id.clone(),
                 prompt: last_user_prompt(&body.messages),
                 messages: Some(messages_to_daemon(&body.messages)),
-                temperature: body.temperature.unwrap_or(cfg.temperature),
-                max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
-                top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
-                repeat_penalty: Some(cfg.repeat_penalty),
+                sampling: GenerationSamplingPolicy {
+                    temperature: body.temperature.unwrap_or(cfg.temperature),
+                    max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
+                    top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
+                    repeat_penalty: Some(cfg.repeat_penalty),
+                },
                 worker_key_id,
                 tools: body.tools,
                 system: body.system,
@@ -352,10 +365,12 @@ mod tests {
             id: "req".to_string(),
             prompt: last_user_prompt(&messages),
             messages: Some(messages_to_daemon(&messages)),
-            temperature: 0.3,
-            max_tokens: 16,
-            top_p: Some(0.8),
-            repeat_penalty: Some(1.0),
+            sampling: GenerationSamplingPolicy {
+                temperature: 0.3,
+                max_tokens: 16,
+                top_p: Some(0.8),
+                repeat_penalty: Some(1.0),
+            },
             worker_key_id: None,
             tools: None,
             system: None,
@@ -396,5 +411,48 @@ mod tests {
         let daemon_messages = messages_to_daemon(&messages);
         assert_eq!(daemon_messages.len(), 3);
         assert_eq!(daemon_messages[2].role, Role::User);
+    }
+
+    #[test]
+    fn load_params_from_config_preserves_explicit_dflash_off() {
+        let cfg = HipfireConfig {
+            max_seq: 8192,
+            kv_cache: "auto".to_string(),
+            flash_mode: "auto".to_string(),
+            dflash_mode: "off".to_string(),
+            cask_sidecar: Some("/models/qwen3.5-27b.triattn.hfq".to_string()),
+            ..Default::default()
+        };
+
+        let params = load_params_from_config(&cfg);
+
+        assert_eq!(params.max_seq, 8192);
+        assert_eq!(params.kv_cache, None);
+        assert_eq!(params.flash_mode, None);
+        assert_eq!(params.dflash_mode.as_deref(), Some("off"));
+        assert_eq!(
+            params.cask_sidecar.as_deref(),
+            Some("/models/qwen3.5-27b.triattn.hfq")
+        );
+    }
+
+    #[test]
+    fn load_params_from_config_omits_auto_and_empty_sidecar() {
+        let cfg = HipfireConfig {
+            max_seq: 4096,
+            kv_cache: "asym3".to_string(),
+            flash_mode: "auto".to_string(),
+            dflash_mode: "auto".to_string(),
+            cask_sidecar: Some(String::new()),
+            ..Default::default()
+        };
+
+        let params = load_params_from_config(&cfg);
+
+        assert_eq!(params.max_seq, 4096);
+        assert_eq!(params.kv_cache.as_deref(), Some("asym3"));
+        assert_eq!(params.flash_mode, None);
+        assert_eq!(params.dflash_mode, None);
+        assert_eq!(params.cask_sidecar, None);
     }
 }

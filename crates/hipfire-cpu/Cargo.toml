@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic CPU oracle backends and module evidence contracts for hipfire"
+
+[dependencies]
+serde_json = "1"

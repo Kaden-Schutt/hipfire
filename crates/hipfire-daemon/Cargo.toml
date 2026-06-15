@@ -24,6 +24,7 @@ hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
 hipfire-arch-minimax   = { path = "../hipfire-arch-minimax" }
 hipfire-arch-dots-ocr  = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-lfm2moe   = { path = "../hipfire-arch-lfm2moe", optional = true }
+hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-state = { path = "../hipfire-state" }
 hip-bridge    = { path = "../hip-bridge" }
 rdna-compute  = { path = "../rdna-compute" }

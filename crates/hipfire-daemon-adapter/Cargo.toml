@@ -1,0 +1,16 @@
+[package]
+name = "hipfire-daemon-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Async daemon JSONL process adapter for hipfire"
+
+[dependencies]
+anyhow = "1"
+dirs = "5"
+futures = "0.3"
+hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }

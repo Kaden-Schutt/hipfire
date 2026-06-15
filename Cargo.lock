@@ -625,7 +625,9 @@ name = "hipfire-arch-qwen35"
 version = "0.2.1"
 dependencies = [
  "hip-bridge",
+ "hipfire-cpu",
  "hipfire-dispatch",
+ "hipfire-rocm",
  "hipfire-runtime",
  "libc",
  "libloading",
@@ -673,6 +675,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-cpu"
+version = "0.2.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-daemon"
 version = "0.2.1"
 dependencies = [
@@ -686,6 +695,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-daemon-protocol",
  "hipfire-runtime",
  "hipfire-state",
  "libc",
@@ -693,6 +703,31 @@ dependencies = [
  "serde_json",
  "tracing",
  "twox-hash",
+]
+
+[[package]]
+name = "hipfire-daemon-adapter"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "futures",
+ "hipfire-daemon-protocol",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "hipfire-daemon-protocol"
+version = "0.2.1"
+dependencies = [
+ "hipfire-generate",
+ "hipfire-model",
+ "hipfire-prompt",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -727,8 +762,21 @@ name = "hipfire-evidence"
 version = "0.2.1"
 
 [[package]]
+name = "hipfire-generate"
+version = "0.2.1"
+dependencies = [
+ "hipfire-prompt",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-model"
 version = "0.2.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "hipfire-prompt"
@@ -751,6 +799,14 @@ dependencies = [
  "serde",
  "serde_json",
  "twox-hash",
+]
+
+[[package]]
+name = "hipfire-rocm"
+version = "0.2.1"
+dependencies = [
+ "hipfire-cpu",
+ "serde_json",
 ]
 
 [[package]]
@@ -791,6 +847,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-scheduler"
+version = "0.2.1"
+
+[[package]]
 name = "hipfire-server"
 version = "0.2.1"
 dependencies = [
@@ -799,6 +859,8 @@ dependencies = [
  "axum",
  "dirs",
  "futures",
+ "hipfire-daemon-adapter",
+ "hipfire-daemon-protocol",
  "hipfire-model",
  "hipfire-prompt",
  "reqwest",

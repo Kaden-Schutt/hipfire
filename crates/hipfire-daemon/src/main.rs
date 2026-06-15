@@ -9016,6 +9016,11 @@ fn main() {
         };
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let protocol_load = if msg_type == "load" {
+            serde_json::from_value::<hipfire_daemon_protocol::LoadRequest>(msg.clone()).ok()
+        } else {
+            None
+        };
 
         match msg_type {
             "load" => {
@@ -9061,7 +9066,11 @@ fn main() {
                 }
                 dummy_model = None;
 
-                let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                let path = protocol_load
+                    .as_ref()
+                    .map(|req| req.model.as_str())
+                    .or_else(|| msg.get("model").and_then(|v| v.as_str()))
+                    .unwrap_or("");
                 let dummy_requested = msg
                     .get("params")
                     .and_then(|p| p.get("dummy_model"))
@@ -9088,17 +9097,35 @@ fn main() {
                     continue;
                 }
 
-                let max_seq = msg
-                    .get("params")
-                    .and_then(|p| p.get("max_seq"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(4096) as usize;
-                let requested_physical_cap = msg
-                    .get("params")
-                    .and_then(|p| p.get("physical_cap"))
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
+                let max_seq = protocol_load
+                    .as_ref()
+                    .map(|req| req.params.max_seq as usize)
+                    .or_else(|| {
+                        msg.get("params")
+                            .and_then(|p| p.get("max_seq"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                    })
+                    .unwrap_or(4096);
+                let requested_physical_cap = protocol_load
+                    .as_ref()
+                    .and_then(|req| req.params.physical_cap.map(|v| v as usize))
+                    .or_else(|| {
+                        msg.get("params")
+                            .and_then(|p| p.get("physical_cap"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                    })
                     .filter(|v| *v > 0);
+                let raw_dflash_mode = msg
+                    .get("params")
+                    .and_then(|p| p.get("dflash_mode"))
+                    .and_then(|v| v.as_str());
+                let raw_draft_param = msg
+                    .get("params")
+                    .and_then(|p| p.get("draft"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
                 // Optional DFlash draft model path. When supplied AND the target
                 // is a Qwen3.5 arch (5 or 6), we load draft weights + scratch
                 // alongside the target and the temp=0 generate fast path routes
@@ -9111,15 +9138,15 @@ fn main() {
                 // primary path (saves the wire round-trip for the draft path
                 // string), but this guard makes the flag durable when the
                 // daemon is driven by a non-hipfire-CLI client.
-                let dflash_mode = msg
-                    .get("params")
-                    .and_then(|p| p.get("dflash_mode"))
-                    .and_then(|v| v.as_str())
+                let dflash_mode = protocol_load
+                    .as_ref()
+                    .and_then(|req| req.params.dflash_mode.as_deref())
+                    .or(raw_dflash_mode)
                     .unwrap_or("auto");
-                let raw_draft = msg
-                    .get("params")
-                    .and_then(|p| p.get("draft"))
-                    .and_then(|v| v.as_str())
+                let raw_draft = protocol_load
+                    .as_ref()
+                    .and_then(|req| req.params.draft.as_deref())
+                    .or(raw_draft_param)
                     .filter(|s| !s.is_empty());
                 let draft_path = if dflash_mode == "off" {
                     if raw_draft.is_some() {
@@ -9132,10 +9159,14 @@ fn main() {
                 } else {
                     raw_draft.map(|s| s.to_string())
                 };
-                let kv_mode_override = msg
-                    .get("params")
-                    .and_then(|p| p.get("kv_mode"))
-                    .and_then(|v| v.as_str())
+                let kv_mode_override = protocol_load
+                    .as_ref()
+                    .and_then(|req| req.params.kv_cache.as_deref())
+                    .or_else(|| {
+                        msg.get("params")
+                            .and_then(|p| p.get("kv_mode"))
+                            .and_then(|v| v.as_str())
+                    })
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
@@ -9173,10 +9204,14 @@ fn main() {
                 // That decouples advertised context length from VRAM footprint —
                 // a 128K max_seq can run in ~1K-slot physical buffer when the
                 // operator opts in.
-                let cask_sidecar = msg
-                    .get("params")
-                    .and_then(|p| p.get("cask_sidecar"))
-                    .and_then(|v| v.as_str())
+                let cask_sidecar = protocol_load
+                    .as_ref()
+                    .and_then(|req| req.params.cask_sidecar.as_deref())
+                    .or_else(|| {
+                        msg.get("params")
+                            .and_then(|p| p.get("cask_sidecar"))
+                            .and_then(|v| v.as_str())
+                    })
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
                 let cask_enabled = msg
@@ -9626,7 +9661,14 @@ fn main() {
             }
 
             "generate" => {
-                let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+                let protocol_generate =
+                    serde_json::from_value::<hipfire_daemon_protocol::GenerateRequest>(msg.clone())
+                        .ok();
+                let id = protocol_generate
+                    .as_ref()
+                    .map(|req| req.id.as_str())
+                    .or_else(|| msg.get("id").and_then(|v| v.as_str()))
+                    .unwrap_or("0");
                 let target_worker_id = message_worker_id(&msg);
                 if dummy_model.is_none() {
                     match activate_model_worker(
@@ -9665,14 +9707,20 @@ fn main() {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if let Some(dummy) = dummy_model.as_mut() {
-                    let prompt = msg
-                        .get("prompt")
-                        .and_then(|v| v.as_str())
+                    let prompt = protocol_generate
+                        .as_ref()
+                        .map(|req| req.prompt.as_str())
+                        .or_else(|| msg.get("prompt").and_then(|v| v.as_str()))
                         .unwrap_or("Hello");
-                    let max_tokens = msg
-                        .get("max_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(512) as usize;
+                    let max_tokens = protocol_generate
+                        .as_ref()
+                        .map(|req| req.sampling.max_tokens as usize)
+                        .or_else(|| {
+                            msg.get("max_tokens")
+                                .and_then(|v| v.as_u64())
+                                .map(|v| v as usize)
+                        })
+                        .unwrap_or(512);
                     tracing::debug!(
                         request_id = id,
                         session_id,
@@ -9725,9 +9773,10 @@ fn main() {
                     );
                     continue;
                 }
-                let prompt = msg
-                    .get("prompt")
-                    .and_then(|v| v.as_str())
+                let prompt = protocol_generate
+                    .as_ref()
+                    .map(|req| req.prompt.as_str())
+                    .or_else(|| msg.get("prompt").and_then(|v| v.as_str()))
                     .unwrap_or("Hello");
                 let prompt_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(prompt);
                 let prompt: &str = &prompt_norm;
@@ -9736,7 +9785,10 @@ fn main() {
                         tok.dump_prompt_heat(prompt);
                     }
                 }
-                let system = msg.get("system").and_then(|v| v.as_str());
+                let system = protocol_generate
+                    .as_ref()
+                    .and_then(|req| req.system.as_deref())
+                    .or_else(|| msg.get("system").and_then(|v| v.as_str()));
                 let image = msg.get("image").and_then(|v| v.as_str());
                 let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
 
@@ -9754,8 +9806,10 @@ fn main() {
                 //
                 // Parse errors emit a structured error event and skip the
                 // request (rather than silently dropping the fields).
-                let tools_json: Option<Vec<serde_json::Value>> = match msg.get("tools") {
-                    Some(v) => match serde_json::from_value::<Vec<serde_json::Value>>(v.clone()) {
+                let tools_json: Option<Vec<serde_json::Value>> = if let Some(tools) =
+                    protocol_generate.as_ref().and_then(|req| req.tools.clone())
+                {
+                    match serde_json::from_value::<Vec<serde_json::Value>>(tools) {
                         Ok(t) => Some(t),
                         Err(e) => {
                             let _ = writeln!(
@@ -9767,28 +9821,53 @@ fn main() {
                             let _ = stdout.flush();
                             continue;
                         }
-                    },
-                    None => None,
+                    }
+                } else {
+                    match msg.get("tools") {
+                        Some(v) => {
+                            match serde_json::from_value::<Vec<serde_json::Value>>(v.clone()) {
+                                Ok(t) => Some(t),
+                                Err(e) => {
+                                    let _ = writeln!(
+                                        stdout,
+                                        r#"{{"type":"error","id":"{}","message":"invalid tools field: {}"}}"#,
+                                        id,
+                                        e.to_string().replace('"', "'"),
+                                    );
+                                    let _ = stdout.flush();
+                                    continue;
+                                }
+                            }
+                        }
+                        None => None,
+                    }
                 };
                 let messages_history: Option<Vec<hipfire_runtime::prompt_frame::Message>> =
-                    match msg.get("messages") {
-                        Some(v) => match serde_json::from_value::<
-                            Vec<hipfire_runtime::prompt_frame::Message>,
-                        >(v.clone())
-                        {
-                            Ok(m) => Some(m),
-                            Err(e) => {
-                                let _ = writeln!(
-                                    stdout,
-                                    r#"{{"type":"error","id":"{}","message":"invalid messages field: {}"}}"#,
-                                    id,
-                                    e.to_string().replace('"', "'"),
-                                );
-                                let _ = stdout.flush();
-                                continue;
-                            }
-                        },
-                        None => None,
+                    if let Some(messages) = protocol_generate
+                        .as_ref()
+                        .and_then(|req| req.messages.clone())
+                    {
+                        Some(messages)
+                    } else {
+                        match msg.get("messages") {
+                            Some(v) => match serde_json::from_value::<
+                                Vec<hipfire_runtime::prompt_frame::Message>,
+                            >(v.clone())
+                            {
+                                Ok(m) => Some(m),
+                                Err(e) => {
+                                    let _ = writeln!(
+                                        stdout,
+                                        r#"{{"type":"error","id":"{}","message":"invalid messages field: {}"}}"#,
+                                        id,
+                                        e.to_string().replace('"', "'"),
+                                    );
+                                    let _ = stdout.flush();
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        }
                     };
                 // Sampling defaults differ by arch: qwen35 family was tuned
                 // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
@@ -9815,17 +9894,24 @@ fn main() {
                 } else {
                     (0.3_f64, 0.8_f64)
                 };
-                let temp = msg
-                    .get("temperature")
-                    .and_then(|v| v.as_f64())
+                let temp = protocol_generate
+                    .as_ref()
+                    .map(|req| req.sampling.temperature)
+                    .or_else(|| msg.get("temperature").and_then(|v| v.as_f64()))
                     .unwrap_or(default_temp) as f32;
-                let max_tokens = msg
-                    .get("max_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(512) as usize;
-                let top_p = msg
-                    .get("top_p")
-                    .and_then(|v| v.as_f64())
+                let max_tokens = protocol_generate
+                    .as_ref()
+                    .map(|req| req.sampling.max_tokens as usize)
+                    .or_else(|| {
+                        msg.get("max_tokens")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                    })
+                    .unwrap_or(512);
+                let top_p = protocol_generate
+                    .as_ref()
+                    .and_then(|req| req.sampling.top_p)
+                    .or_else(|| msg.get("top_p").and_then(|v| v.as_f64()))
                     .unwrap_or(default_top_p) as f32;
                 // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
                 // and HF transformers `generate(repetition_penalty=1.0)`
@@ -9841,9 +9927,10 @@ fn main() {
                 // LFM2.5-MoE (arch_id 11): Liquid's card recommends
                 // repetition_penalty=1.05; default to it (others stay 1.0/off).
                 let default_repeat_penalty = if m.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
-                let repeat_penalty = msg
-                    .get("repeat_penalty")
-                    .and_then(|v| v.as_f64())
+                let repeat_penalty = protocol_generate
+                    .as_ref()
+                    .and_then(|req| req.sampling.repeat_penalty)
+                    .or_else(|| msg.get("repeat_penalty").and_then(|v| v.as_f64()))
                     .unwrap_or(default_repeat_penalty) as f32;
                 // OpenAI-compatible `reasoning_effort` (also accept our custom
                 // `thinking_mode` alias) — only consumed by arch_id=9 today.
