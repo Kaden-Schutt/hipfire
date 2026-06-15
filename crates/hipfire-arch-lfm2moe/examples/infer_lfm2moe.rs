@@ -81,8 +81,16 @@ fn main() {
     } else {
         tok.encode(&prompt)
     };
-    eprintln!("prompt {:?} → {} tokens (src: {})", prompt, prompt_ids.len(),
-        if tokens_path.is_some() { "--tokens" } else { "embedded tokenizer" });
+    eprintln!(
+        "prompt {:?} → {} tokens (src: {})",
+        prompt,
+        prompt_ids.len(),
+        if tokens_path.is_some() {
+            "--tokens"
+        } else {
+            "embedded tokenizer"
+        }
+    );
     let max_seq = prompt_ids.len() + max + 16;
     let mut state = Lfm2MoeState::new_with_max_seq(&mut gpu, &cfg, max_seq).expect("state");
 

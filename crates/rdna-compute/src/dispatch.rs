@@ -184,7 +184,9 @@ impl GpuTensor {
     #[doc(hidden)]
     pub fn null_for_test() -> Self {
         GpuTensor {
-            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut::<std::ffi::c_void>(), 0) },
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut::<std::ffi::c_void>(), 0)
+            },
             shape: vec![0],
             dtype: crate::DType::F32,
         }
@@ -428,7 +430,8 @@ pub struct Gpu {
     pub mq_signs2_128: Option<GpuTensor>,
     pub mq_x_rot: Option<GpuTensor>, // scratch for rotated x, sized to max K
     pub paro_x_scratch: Option<GpuTensor>, // ParoQuant: scratch for rotated activation copy
-    pub mq_x_q8: Option<hip_bridge::DeviceBuffer>, // INT8 quantized rotated x for dp4a
+    pub paro_fused_scratch: Option<Vec<GpuTensor>>, // ParoQuant fused paths: multiple rotation scratch buffers
+    pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,  // INT8 quantized rotated x for dp4a
     pub mq_x_scales: Option<hip_bridge::DeviceBuffer>, // per-group f32 scales for x quantization
     /// FP16 scratch buffer for prefill X conversion. Sized to max(batch_size × K) × 2 bytes.
     fp16_x_scratch: Option<hip_bridge::DeviceBuffer>,
@@ -598,8 +601,6 @@ pub struct Gpu {
     /// dispatch threads (one `Gpu` per device, all routing into a single
     /// per-tensor accumulator).
     pub capture_handler: Option<Arc<dyn ActivationCapture>>,
-    /// Paro fused gate+up/qkvza scratch: 4 × [k] F32 buffers.
-    pub paro_fused_scratch: Option<Vec<GpuTensor>>,
 }
 
 /// Generate `n` FWHT sign values (+1.0 / -1.0) from a simple LCG seeded with `seed`.
@@ -825,6 +826,7 @@ impl Gpu {
             mq_signs2_128: None,
             mq_x_rot: None,
             paro_x_scratch: None,
+            paro_fused_scratch: None,
             mq_x_q8: None,
             mq_x_scales: None,
             fp16_x_scratch: None,
@@ -859,7 +861,6 @@ impl Gpu {
             replay_graph_cache: HashMap::new(),
             replay_warmed_up: HashSet::new(),
             replay_capturing_n: None,
-            paro_fused_scratch: None,
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
             capture_handler: None,
@@ -3152,6 +3153,26 @@ impl Gpu {
             shape: vec![dim],
             dtype: DType::F32,
         });
+        Ok(())
+    }
+
+    /// Ensure the ParoQuant fused rotation scratch buffers are allocated.
+    ///
+    /// Fused QKVZA needs four independent rotated activation buffers; gate+up
+    /// uses the first explicit buffer and aliases `mq_x_rot` internally for the
+    /// second rotation.
+    pub fn ensure_paro_fused_scratch(&mut self, dim: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        if let Some(ref scratch) = self.paro_fused_scratch {
+            if scratch.len() >= 4 && scratch.iter().all(|s| s.buf.size() >= dim * 4) {
+                return Ok(());
+            }
+        }
+        let mut scratch = Vec::with_capacity(4);
+        for _ in 0..4 {
+            scratch.push(self.alloc_tensor(&[dim], DType::F32)?);
+        }
+        self.paro_fused_scratch = Some(scratch);
         Ok(())
     }
 
@@ -42556,8 +42577,15 @@ impl Gpu {
 
     pub fn attention_dflash_wmma_m64_n32_f16kv_v5_f32(
         &mut self,
-        _q: &GpuTensor, _k: &GpuTensor, _v: &GpuTensor, _out: &GpuTensor,
-        _n: usize, _seq_len: usize, _n_heads: usize, _n_kv_heads: usize, _head_dim: usize,
+        _q: &GpuTensor,
+        _k: &GpuTensor,
+        _v: &GpuTensor,
+        _out: &GpuTensor,
+        _n: usize,
+        _seq_len: usize,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
     ) -> HipResult<()> {
         Err(hip_bridge::HipError::new(801, "not yet implemented"))
     }
@@ -42565,13 +42593,23 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym4_wmma_tile_batched(
         &mut self,
-        _q: &GpuTensor, _k_cache: &GpuTensor, _v_cache: &GpuTensor,
-        _out: &GpuTensor, _positions: &GpuTensor,
-        _ct: &GpuTensor, _st: &GpuTensor,
-        _n_heads: usize, _n_kv_heads: usize, _head_dim: usize,
-        _physical_cap: usize, _max_ctx_len: usize, _batch_size: usize,
-        _partials: &GpuTensor, _tree_bias: Option<&GpuTensor>,
-        _block_start: usize, _block_cols: usize,
+        _q: &GpuTensor,
+        _k_cache: &GpuTensor,
+        _v_cache: &GpuTensor,
+        _out: &GpuTensor,
+        _positions: &GpuTensor,
+        _ct: &GpuTensor,
+        _st: &GpuTensor,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _physical_cap: usize,
+        _max_ctx_len: usize,
+        _batch_size: usize,
+        _partials: &GpuTensor,
+        _tree_bias: Option<&GpuTensor>,
+        _block_start: usize,
+        _block_cols: usize,
     ) -> HipResult<()> {
         Err(hip_bridge::HipError::new(801, "not yet implemented"))
     }
@@ -42579,13 +42617,23 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym4_wmma_tile_batched_gfx12(
         &mut self,
-        _q: &GpuTensor, _k_cache: &GpuTensor, _v_cache: &GpuTensor,
-        _out: &GpuTensor, _positions: &GpuTensor,
-        _ct: &GpuTensor, _st: &GpuTensor,
-        _n_heads: usize, _n_kv_heads: usize, _head_dim: usize,
-        _physical_cap: usize, _max_ctx_len: usize, _batch_size: usize,
-        _partials: &GpuTensor, _tree_bias: Option<&GpuTensor>,
-        _block_start: usize, _block_cols: usize,
+        _q: &GpuTensor,
+        _k_cache: &GpuTensor,
+        _v_cache: &GpuTensor,
+        _out: &GpuTensor,
+        _positions: &GpuTensor,
+        _ct: &GpuTensor,
+        _st: &GpuTensor,
+        _n_heads: usize,
+        _n_kv_heads: usize,
+        _head_dim: usize,
+        _physical_cap: usize,
+        _max_ctx_len: usize,
+        _batch_size: usize,
+        _partials: &GpuTensor,
+        _tree_bias: Option<&GpuTensor>,
+        _block_start: usize,
+        _block_cols: usize,
     ) -> HipResult<()> {
         Err(hip_bridge::HipError::new(801, "not yet implemented"))
     }
@@ -42593,37 +42641,40 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn fused_gate_up_q8_0(
         &mut self,
-        _w_gate: &GpuTensor, _w_up: &GpuTensor, _x: &GpuTensor,
-        _gate: &GpuTensor, _up: &GpuTensor,
-        _m_gate: usize, _m_up: usize, _k: usize,
+        _w_gate: &GpuTensor,
+        _w_up: &GpuTensor,
+        _x: &GpuTensor,
+        _gate: &GpuTensor,
+        _up: &GpuTensor,
+        _m_gate: usize,
+        _m_up: usize,
+        _k: usize,
     ) -> HipResult<()> {
         Err(hip_bridge::HipError::new(801, "not yet implemented"))
     }
 
     pub fn gemm_f16_wmma_mb4(
-        &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
-        m: usize, k: usize, n: usize,
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
     ) -> HipResult<()> {
         self.gemm_f16(w, x, y, m, k, n)
     }
 
     pub fn gemm_f16_wmma_mb8(
-        &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
-        m: usize, k: usize, n: usize,
+        &mut self,
+        w: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
     ) -> HipResult<()> {
         self.gemm_f16(w, x, y, m, k, n)
-    }
-
-    pub fn ensure_paro_fused_scratch(&mut self, k: usize) -> HipResult<()> {
-        if self.paro_fused_scratch.is_none() || self.paro_fused_scratch.as_ref().unwrap()[0].shape[0] < k {
-            let mut bufs = Vec::with_capacity(4);
-            for _ in 0..4 {
-                let buf = self.pool.alloc(&self.hip, k * 4)?;
-                bufs.push(GpuTensor { buf, shape: vec![k], dtype: crate::DType::F32 });
-            }
-            self.paro_fused_scratch = Some(bufs);
-        }
-        Ok(())
     }
 }
 

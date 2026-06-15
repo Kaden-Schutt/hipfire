@@ -113,7 +113,7 @@ this shape come from" has a stable answer dated 2026-03-22.
 | Date                | 2026-04-08 |
 | Originator          | Kaden Schutt |
 | Research scaffold   | `e221a022` (2026-04-09) "feat(magnum): add MagnumQuant + butterfly rotation research crate" |
-| MQ4 registry + .mq4 file format | `b3b7c7b8` (2026-04-10) "feat(cli): MQ4 family registry + .mq4 extension support" |
+| MQ4 registry + .hfq file format | `b3b7c7b8` (2026-04-10) "feat(cli): MQ4 family registry + MQ-family extension support" |
 | MQ4-Lloyd extension | `5b3de4d0` (2026-05-07) "feat(mq4-lloyd): Phase 1 — quantizer + slow GEMV + 9B PPL viability" |
 | Canonical files     | `crates/hipfire-quantize/src/{mq4,mq8,fwht}.rs`, `crates/magnum/`, `kernels/src/{rotate_x_mq,fused_rmsnorm_mq_rotate,gemv_mq4*}.hip` |
 
@@ -132,7 +132,7 @@ pieces:
    so the FWHT cost amortizes against work the model was already
    doing.
 
-The `.mq4` and `.mq8` file formats and the MagnumQuant naming are
+The `-mq4.hfq` and `-mq8.hfq` artifact formats and the MagnumQuant naming are
 hipfire-originated. The MQ4-Lloyd extension (Lloyd-Max codebook +
 LDS-codebook GEMV) extends the family without breaking the MQ4
 on-disk format.

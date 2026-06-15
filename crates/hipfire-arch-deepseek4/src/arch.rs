@@ -171,7 +171,11 @@ impl DeepseekV4 {
         // EP shard: precompute owned set + compact-slot mapping. `shard = None`
         // ⇒ every expert owned, `local_of_global[e] == e`, n_owned == n_exp →
         // identical layout to the unsharded path.
-        let owns = |e: usize| shard.map(|(s, rank)| s.owns_expert(rank, e)).unwrap_or(true);
+        let owns = |e: usize| {
+            shard
+                .map(|(s, rank)| s.owns_expert(rank, e))
+                .unwrap_or(true)
+        };
         let mut local_of_global = vec![usize::MAX; n_exp];
         let mut n_owned = 0usize;
         for e in 0..n_exp {

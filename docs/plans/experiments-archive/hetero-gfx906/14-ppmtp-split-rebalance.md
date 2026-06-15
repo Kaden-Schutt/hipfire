@@ -2,7 +2,7 @@
 
 Date: 2026-05-29
 Branch: fix/q8-batched-masked-no-lds-cap (working tree at e6a25615 + bench script)
-Model: `/local/hipfire/qwen3.6-27b.mq4` (qwen3.6-27b, 64 layers, dim=5120)
+Model: `/local/hipfire/qwen3.6-27b-mq4.hfq` (qwen3.6-27b, 64 layers, dim=5120)
 MTP head: `/data/hipfire/qwen3.6-27b-cvs16384.mtp` (k=3, cvs=16384)
 Hardware: gfx906 (MI50, 32 GiB, HIP idx 0) + gfx1031 (RX 6700 XT, 12 GiB, HIP idx 1)
 Prompt md5: `b385bda5fdf47185ab32ca7acabbf057` (committed LRU-cache prompt)

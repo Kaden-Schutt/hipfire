@@ -79,8 +79,8 @@ echo "=== smoke-dispatch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null) @ $(git
 echo
 
 # 1. DS4 MQ2Lloyd
-DS4_BASE="$MODELS/deepseek-v4-flash.mq2lloyd"
-DS4_MTP="$MODELS/deepseek-v4-flash-mtp.mq2lloyd"
+DS4_BASE="$MODELS/deepseek-v4-flash-lloyd-mq2.hfq"
+DS4_MTP="$MODELS/deepseek-v4-flash-mtp-lloyd-mq2.hfq"
 if [ -f "$DS4_MTP" ]; then
     run_case "DS4 MQ2Lloyd (+MTP)" "$DS4_BASE" "HIPFIRE_DEEPSEEK4_MTP_ADDON=$DS4_MTP"
 else
@@ -88,10 +88,10 @@ else
 fi
 
 # 2. Qwen3.6 MQ4
-run_case "Qwen3.6-27B MQ4" "$MODELS/qwen3.6-27b.mq4"
+run_case "Qwen3.6-27B MQ4" "$MODELS/qwen3.6-27b-mq4.hfq"
 
 # 3. MQ6 — use 9B as format proxy (no qwen3.6-27b-mq6 in registry)
-run_case "Qwen3.5-9B MQ6" "$MODELS/qwen3.5-9b.mq6"
+run_case "Qwen3.5-9B MQ6" "$MODELS/qwen3.5-9b-mq6.hfq"
 
 # 4. PARO (Qwen3.6-35B-A3B shisa packed)
 run_case "PARO Qwen3.6-35B-A3B" "$MODELS/shisa-Qwen3.6-35B-A3B-PARO-packed"

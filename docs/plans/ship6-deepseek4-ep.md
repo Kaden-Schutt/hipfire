@@ -1,8 +1,8 @@
 # DeepSeek-V4-Flash EP port (Ship 6 substrate-EP, #16)
 
 Mirror of the MiniMax EP port (`forward_ep` + shard-aware load), with DeepSeek's
-extra structure. Model: `deepseek-v4-flash.mq2lloyd` (81 GB, on hipx → transfer
-to hiptrx; an MTP variant `deepseek-v4-flash-mtp.mq2lloyd` 1.9 GB exists for
+extra structure. Model: `deepseek-v4-flash-lloyd-mq2.hfq` (81 GB, on hipx → transfer
+to hiptrx; an MTP variant `deepseek-v4-flash-mtp-lloyd-mq2.hfq` 1.9 GB exists for
 later spec-decode). Needs EP N=4 on hiptrx (doesn't fit one 32 GB card).
 
 ## Arch structure (forward.rs)

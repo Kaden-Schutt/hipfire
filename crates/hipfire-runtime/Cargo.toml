@@ -50,7 +50,11 @@ arch-deepseek4 = []
 arch-minimax = []
 arch-lfm2moe = []
 arch-dots-ocr = []
+experimental-examples = []
 [dependencies]
+hipfire-coherence = { path = "../hipfire-coherence" }
+hipfire-evidence = { path = "../hipfire-evidence" }
+hipfire-prompt = { path = "../hipfire-prompt" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
@@ -128,7 +132,7 @@ required-features = []
 
 [[example]]
 name = "coherence_probe"
-required-features = []
+required-features = ["experimental-examples"]
 
 [[example]]
 name = "gpus_smoke"
@@ -327,6 +331,10 @@ required-features = []
 [[example]]
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "ep_decode_parity"
+required-features = ["experimental-examples", "arch-qwen35"]
 
 # eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen3 /
 # Qwen2 / Llama / Mistral / TinyLlama). Same HFKSEQ output as

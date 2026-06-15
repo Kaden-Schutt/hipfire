@@ -37,7 +37,18 @@
 //! against a base model where any `<|im_start|>` token would be
 //! out-of-distribution.
 
-use crate::tokenizer::Tokenizer;
+/// Minimal tokenizer surface needed by prompt framing.
+///
+/// Keeping this trait in `hipfire-prompt` lets the prompt crate own chat
+/// rendering without depending back on `hipfire-runtime`.
+pub trait PromptTokenizer {
+    fn encode(&self, text: &str) -> Vec<u32>;
+    fn special_token_id(&self, content: &str) -> Option<u32>;
+    fn special_tokens(&self) -> &[(String, u32)] {
+        &[]
+    }
+    fn bos_token_text(&self) -> String;
+}
 
 /// Chooses what goes after the assistant role-and-newline opener.
 #[derive(Debug, Clone, Copy)]
@@ -90,12 +101,13 @@ pub enum Role {
 /// and the textual content; the builder methods produce owned
 /// `Vec<u32>` token sequences.
 ///
-/// Not `#[derive(Debug)]` because `Tokenizer` doesn't implement
+/// Not `#[derive(Debug)]` because tokenizer implementations don't have to
+/// implement
 /// `Debug`. Callers that need a printable struct should format the
 /// non-tokenizer fields manually.
 #[derive(Clone)]
 pub struct ChatFrame<'a> {
-    pub tokenizer: &'a Tokenizer,
+    pub tokenizer: &'a dyn PromptTokenizer,
     pub system: Option<&'a str>,
     pub user: &'a str,
     pub assistant_prefix: AssistantPrefix,
@@ -194,7 +206,7 @@ impl<'a> ChatFrame<'a> {
 /// `<|im_end|>`) are encoded once up front; per-turn content gets
 /// encoded inside the append helpers as it's appended.
 struct ChatScaffold<'a> {
-    tokenizer: &'a Tokenizer,
+    tokenizer: &'a dyn PromptTokenizer,
     im_start: Vec<u32>,
     im_end: Vec<u32>,
     nl: Vec<u32>,
@@ -212,7 +224,7 @@ struct ChatScaffold<'a> {
 }
 
 impl<'a> ChatScaffold<'a> {
-    fn for_tokenizer(t: &'a Tokenizer) -> Self {
+    fn for_tokenizer(t: &'a dyn PromptTokenizer) -> Self {
         Self {
             tokenizer: t,
             im_start: t.encode("<|im_start|>"),
@@ -323,7 +335,7 @@ impl<'a> ChatScaffold<'a> {
 /// token sequence. Use when the .hfq carries a chat_template; fall back
 /// to `ChatFrame::Plain` when it doesn't or when render fails.
 pub struct JinjaChatFrame<'a> {
-    pub tokenizer: &'a Tokenizer,
+    pub tokenizer: &'a dyn PromptTokenizer,
     /// The Jinja template source string from the model's
     /// `tokenizer_config.json:chat_template` field.
     pub template: &'a str,
@@ -401,6 +413,7 @@ fn strip_generation_tags(template: &str) -> String {
         .get_or_init(|| regex::Regex::new(r"[ \t]*\{%-?\s*(?:end)?generation\s*-?%\}\n?").unwrap());
     re.replace_all(template, "").into_owned()
 }
+
 /// JSON formatter matching HuggingFace's `json.dumps(..., ensure_ascii=False)`
 /// default separators — `", "` between elements and `": "` after keys — the
 /// exact form the model's chat_template was trained on. minijinja's builtin
@@ -442,12 +455,20 @@ impl serde_json::ser::Formatter for HfJsonFormatter {
 /// `serde_json` is built with `preserve_order` (without it, the request-parse
 /// `BTreeMap` has already alphabetized object keys before render). Register with
 /// `env.add_filter("tojson", hf_tojson)` to override minijinja's compact builtin.
-pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
+pub fn hf_tojson(
+    value: minijinja::Value,
+    kwargs: minijinja::value::Kwargs,
+) -> Result<String, minijinja::Error> {
     use serde::Serialize;
+    let _ = kwargs.get::<Option<bool>>("ensure_ascii");
+    let _ = kwargs.get::<Option<i64>>("indent");
     let mut buf = Vec::new();
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, HfJsonFormatter);
     value.serialize(&mut ser).map_err(|e| {
-        minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, format!("tojson: {e}"))
+        minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            format!("tojson: {e}"),
+        )
     })?;
     String::from_utf8(buf).map_err(|e| {
         minijinja::Error::new(
@@ -529,11 +550,6 @@ impl<'a> JinjaChatFrame<'a> {
         // PR #175 "missing required var" concern doesn't regress.
         let mut env = Environment::new();
         env.set_undefined_behavior(minijinja::UndefinedBehavior::Chainable);
-        // Strict-undefined: a missing context variable raises Err instead of
-        // silently rendering empty/partial output. Without this, malformed
-        // prompts could propagate to the model unnoticed (Codex review on
-        // PR #175 flagged this; we apply it here in the same port).
-        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
         // Match HuggingFace's apply_chat_template Jinja environment, which is
         // constructed with `trim_blocks=True, lstrip_blocks=True`. Without these,
         // block tags (`{% … %}`) leak their surrounding source whitespace into
@@ -560,28 +576,9 @@ impl<'a> JinjaChatFrame<'a> {
         env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
-        // Some HF templates call `tojson(ensure_ascii=False)` (MiniMax-M2's tool
-        // block) or `tojson(indent=…)`. minijinja's builtin `tojson` rejects
-        // unknown kwargs, so the whole template fails to render and we silently
-        // fall back to the Plain frame — the model then never sees its native
-        // tool format (observed e2e on MiniMax-M2: template render failed on
-        // `ensure_ascii`, Plain fallback, model emitted a Qwen-ish `<tool_call>`
-        // instead of `<minimax:tool_call>`). Override `tojson` with a serde_json
-        // serializer that accepts + ignores those kwargs; serde_json emits raw
-        // UTF-8 (== ensure_ascii=False), which is what chat templates want.
-        env.add_filter(
-            "tojson",
-            |value: Value, kwargs: minijinja::value::Kwargs| -> Result<Value, Error> {
-                let _ = kwargs.get::<Option<bool>>("ensure_ascii");
-                let _ = kwargs.get::<Option<i64>>("indent");
-                let s = serde_json::to_string(&value)
-                    .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("tojson: {e}")))?;
-                Ok(Value::from_safe_string(s))
-            },
-        );
         // Override minijinja's compact builtin `tojson` with the HF-spaced form
-        // (`", "` / `": "`) the model trained on, so tool-definition and
-        // mapping-arg rendering byte-matches transformers' apply_chat_template.
+        // (`", "` / `": "`) the model trained on. Some HF templates pass kwargs
+        // such as `ensure_ascii=False`; `hf_tojson` accepts and ignores them.
         env.add_filter("tojson", hf_tojson);
 
         // Strip HF `{% generation %}` / `{% endgeneration %}` training-mask
@@ -607,10 +604,7 @@ impl<'a> JinjaChatFrame<'a> {
         // to text (works for Qwen / LLaMA).
         let bos_token: String = match self.bos_token {
             Some(s) => s.to_string(),
-            None => {
-                let bytes = self.tokenizer.decode_bytes(&[self.tokenizer.bos_id]);
-                String::from_utf8_lossy(&bytes).to_string()
-            }
+            None => self.tokenizer.bos_token_text(),
         };
         // Strict-undefined empty defaults so templates that probe
         // `tools` / `documents` / `tool_call_kwargs` on plain turns
@@ -649,31 +643,47 @@ impl<'a> JinjaChatFrame<'a> {
 /// / `pad` in the name) and otherwise take any non-structural special token
 /// that round-trips atomically. Returns `None` when the tokenizer exposes no
 /// usable sentinel — the caller then falls back to a plain (retokenized) render.
-fn pick_splice_sentinel(tok: &Tokenizer) -> Option<String> {
+fn pick_splice_sentinel(tok: &dyn PromptTokenizer) -> Option<String> {
     // Tokens the chat templates emit structurally — never use these as a
     // sentinel (their post-render count wouldn't equal the spliced-turn count).
     const STRUCTURAL: &[&str] = &[
-        "<|im_start|>", "<|im_end|>", "<think>", "</think>",
-        "<|endoftext|>", "<|begin_of_text|>", "<|end_of_text|>",
-        "<s>", "</s>", "<bos>", "<eos>", "<unk>", "<pad>", "<|file_separator|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<think>",
+        "</think>",
+        "<|endoftext|>",
+        "<|begin_of_text|>",
+        "<|end_of_text|>",
+        "<s>",
+        "</s>",
+        "<bos>",
+        "<eos>",
+        "<unk>",
+        "<pad>",
+        "<|file_separator|>",
     ];
     let atomic = |s: &str| -> bool {
-        tok.special_token_id(s).map_or(false, |id| tok.encode(s) == vec![id])
+        tok.special_token_id(s)
+            .map_or(false, |id| tok.encode(s) == vec![id])
     };
     // First pass: obviously-reserved scratch tokens.
     for (s, _id) in tok.special_tokens() {
-        if STRUCTURAL.contains(&s.as_str()) { continue; }
+        if STRUCTURAL.contains(&s.as_str()) {
+            continue;
+        }
         let ls = s.to_ascii_lowercase();
-        if (ls.contains("reserved") || ls.contains("unused") || ls.contains("pad"))
-            && atomic(s)
-        {
+        if (ls.contains("reserved") || ls.contains("unused") || ls.contains("pad")) && atomic(s) {
             return Some(s.clone());
         }
     }
     // Second pass: any non-structural special token that round-trips atomically.
     for (s, _id) in tok.special_tokens() {
-        if STRUCTURAL.contains(&s.as_str()) { continue; }
-        if atomic(s) { return Some(s.clone()); }
+        if STRUCTURAL.contains(&s.as_str()) {
+            continue;
+        }
+        if atomic(s) {
+            return Some(s.clone());
+        }
     }
     None
 }
@@ -750,7 +760,8 @@ pub fn build_cached_history_jinja(
     if toks.iter().filter(|&&t| t == sentinel_id).count() != cached.len() {
         return plain(frame);
     }
-    let mut out: Vec<u32> = Vec::with_capacity(toks.len() + cached.iter().map(|c| c.len()).sum::<usize>());
+    let mut out: Vec<u32> =
+        Vec::with_capacity(toks.len() + cached.iter().map(|c| c.len()).sum::<usize>());
     let mut k = 0usize;
     for &t in &toks {
         if t == sentinel_id {
@@ -767,146 +778,77 @@ pub fn build_cached_history_jinja(
 mod tests {
     use super::*;
 
-    /// Build a hermetic test tokenizer. Uses the `from_hf_json` path
-    /// with a minimal vocabulary that is sufficient to round-trip the
-    /// ChatML special tokens and a few simple ASCII strings. The test
-    /// does NOT depend on any GGUF fixture.
-    ///
-    /// Strategy: GPT-2-BPE flavor (triggered by adding `Ġ` to the
-    /// vocab). The byte-level fallback in `encode_gpt2_bpe` will
-    /// convert any unmapped string into per-byte token IDs without
-    /// the SentencePiece `▁`-prepending quirk that complicates
-    /// equality checks.
-    ///
-    /// IMPORTANT: the tests below build their *expected* byte
-    /// sequences using the same `tokenizer.encode()` call that
-    /// `ChatFrame::build` uses internally, so any quirks of the
-    /// encoder cancel out. The tests verify *structural* properties
-    /// (system block precedes user turn; assistant prefix appears at
-    /// end; raw bypasses scaffolding; multi-turn concatenates
-    /// turns), not exact-byte oracles against a hand-rolled string.
-    fn make_tokenizer() -> Tokenizer {
-        // Vocab includes:
-        // - chatml special tokens
-        // - role names ("system", "user", "assistant")
-        // - common ascii bytes for short strings ("hello", "hi", "world", etc.)
-        // - the `Ġ` trigger that puts the tokenizer in GPT-2 BPE mode
-        // - all 256 single bytes (mapped via byte_to_gpt2_char) for
-        //   robust fallback on arbitrary content
-        let mut entries: Vec<String> = Vec::new();
-        entries.push(r#""<|im_start|>": 0"#.to_string());
-        entries.push(r#""<|im_end|>": 1"#.to_string());
-        entries.push(r#""<think>": 2"#.to_string());
-        entries.push(r#""</think>": 3"#.to_string());
-        entries.push(r#""system": 4"#.to_string());
-        entries.push(r#""user": 5"#.to_string());
-        entries.push(r#""assistant": 6"#.to_string());
-        entries.push(r#""\n": 7"#.to_string());
-        entries.push(r#""Ġ": 8"#.to_string()); // gpt-2 mode trigger
-                                               // All 256 GPT-2-byte characters get unique ids 100..356 so
-                                               // any short string round-trips byte-by-byte.
-        entries.push(r#""<|reserved_0|>": 9"#.to_string()); // splice sentinel (atomic special)
-        // All 256 GPT-2-byte characters get unique ids 100..356 so
-        // any short string round-trips byte-by-byte.
-        for b in 0u32..=255u32 {
-            // Use rust escape; the encoder will look up the GPT-2 char
-            // form of each byte directly.
-            let ch = byte_to_gpt2_char_test(b as u8);
-            // JSON-escape the char carefully — only `\`, `"`, control
-            // chars need it; the GPT-2 byte mapping uses non-ASCII
-            // unicode chars for the printable byte range.
-            let escaped = json_escape(&ch.to_string());
-            entries.push(format!(r#""{}": {}"#, escaped, 100 + b));
-        }
-        let vocab_block = entries.join(", ");
-        let json = format!(
-            r#"{{
-                "model": {{"type": "BPE", "vocab": {{ {vocab} }}, "merges": []}},
-                "added_tokens": [
-                    {{"id": 0, "content": "<|im_start|>", "special": true}},
-                    {{"id": 1, "content": "<|im_end|>", "special": true}},
-                    {{"id": 2, "content": "<think>", "special": true}},
-                    {{"id": 3, "content": "</think>", "special": true}},
-                    {{"id": 9, "content": "<|reserved_0|>", "special": true}}
-                ]
-            }}"#,
-            vocab = vocab_block,
-        );
-        Tokenizer::from_hf_json(&json).expect("test tokenizer")
+    struct TestTokenizer {
+        include_think: bool,
+        special_tokens: Vec<(String, u32)>,
     }
 
-    /// Like `make_tokenizer` but WITHOUT `<think>` / `</think>`
-    /// as special added tokens — used to verify ClosedThink fallback.
-    fn test_tokenizer_no_think() -> Tokenizer {
-        let mut entries: Vec<String> = Vec::new();
-        entries.push(r#""<|im_start|>": 0"#.to_string());
-        entries.push(r#""<|im_end|>": 1"#.to_string());
-        entries.push(r#""system": 4"#.to_string());
-        entries.push(r#""user": 5"#.to_string());
-        entries.push(r#""assistant": 6"#.to_string());
-        entries.push(r#""\n": 7"#.to_string());
-        entries.push(r#""Ġ": 8"#.to_string());
-        for b in 0u32..=255u32 {
-            let ch = byte_to_gpt2_char_test(b as u8);
-            let escaped = json_escape(&ch.to_string());
-            entries.push(format!(r#""{}": {}"#, escaped, 100 + b));
+    impl PromptTokenizer for TestTokenizer {
+        fn encode(&self, text: &str) -> Vec<u32> {
+            let specials = [
+                ("<|im_start|>", 0),
+                ("<|im_end|>", 1),
+                ("<think>", 2),
+                ("</think>", 3),
+                ("system", 4),
+                ("user", 5),
+                ("assistant", 6),
+                ("\n", 7),
+                ("<|reserved_0|>", 8),
+            ];
+            let mut out = Vec::new();
+            let mut i = 0usize;
+            while i < text.len() {
+                let rest = &text[i..];
+                if let Some((s, id)) = specials
+                    .iter()
+                    .filter(|(s, _)| *s != "<think>" && *s != "</think>" || self.include_think)
+                    .find(|(s, _)| rest.starts_with(*s))
+                {
+                    out.push(*id);
+                    i += s.len();
+                    continue;
+                }
+                let ch = rest.chars().next().expect("non-empty rest");
+                let mut buf = [0u8; 4];
+                for b in ch.encode_utf8(&mut buf).as_bytes() {
+                    out.push(100 + u32::from(*b));
+                }
+                i += ch.len_utf8();
+            }
+            out
         }
-        let vocab_block = entries.join(", ");
-        let json = format!(
-            r#"{{
-                "model": {{"type": "BPE", "vocab": {{ {vocab} }}, "merges": []}},
-                "added_tokens": [
-                    {{"id": 0, "content": "<|im_start|>", "special": true}},
-                    {{"id": 1, "content": "<|im_end|>", "special": true}}
-                ]
-            }}"#,
-            vocab = vocab_block,
-        );
-        Tokenizer::from_hf_json(&json).expect("test tokenizer without think tokens")
-    }
 
-    /// Mirror of `byte_to_gpt2_char` from tokenizer.rs (private). The
-    /// GPT-2 byte-to-char mapping leaves printable ASCII (33..127, 161..173,
-    /// 174..256) untouched and renumbers the rest above 256.
-    fn byte_to_gpt2_char_test(b: u8) -> char {
-        // Standard GPT-2 byte_to_unicode table. We only need it stable
-        // across the test tokenizer + the production tokenizer; the
-        // production code reuses the same canonical table.
-        let mut bs: Vec<u32> = Vec::new();
-        bs.extend((b'!' as u32)..=(b'~' as u32));
-        bs.extend((0xA1u32)..=(0xACu32));
-        bs.extend((0xAEu32)..=(0xFFu32));
-        let mut cs: Vec<u32> = bs.clone();
-        let mut n: u32 = 0;
-        for byte in 0u32..=255u32 {
-            if !bs.contains(&byte) {
-                bs.push(byte);
-                cs.push(256 + n);
-                n += 1;
+        fn special_token_id(&self, content: &str) -> Option<u32> {
+            match content {
+                "<think>" if self.include_think => Some(2),
+                "</think>" if self.include_think => Some(3),
+                "<|reserved_0|>" => Some(8),
+                _ => None,
             }
         }
-        let idx = bs
-            .iter()
-            .position(|&x| x == b as u32)
-            .expect("byte in table");
-        char::from_u32(cs[idx]).expect("valid char")
+
+        fn special_tokens(&self) -> &[(String, u32)] {
+            &self.special_tokens
+        }
+
+        fn bos_token_text(&self) -> String {
+            "<bos>".to_string()
+        }
     }
 
-    fn json_escape(s: &str) -> String {
-        // Only escape what JSON requires: backslash, quote, control.
-        let mut out = String::new();
-        for c in s.chars() {
-            match c {
-                '\\' => out.push_str("\\\\"),
-                '"' => out.push_str("\\\""),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-                c => out.push(c),
-            }
+    fn make_tokenizer() -> TestTokenizer {
+        TestTokenizer {
+            include_think: true,
+            special_tokens: vec![("<|reserved_0|>".to_string(), 8)],
         }
-        out
+    }
+
+    fn test_tokenizer_no_think() -> TestTokenizer {
+        TestTokenizer {
+            include_think: false,
+            special_tokens: vec![("<|reserved_0|>".to_string(), 8)],
+        }
     }
 
     #[test]
@@ -1315,14 +1257,27 @@ mod tests {
         // the assistant turn and (thinking-on) primes `<think>\n`.
         let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking %}<think>\n{% endif %}{% endif %}";
         let frame = JinjaChatFrame {
-            tokenizer: &t, template, system: None, user: "",
-            enable_thinking: true, bos_token: Some(""),
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
         };
 
         // Turn 1: daemon prefills R1 (prompt, ends with the primed `<think>\n`)
         // then generates `reason</think>ok`.
-        let u1 = Message { role: Role::User, content: "hi".to_string(), tool_calls: vec![], tool_call_id: None };
-        let r1 = t.encode(&frame.render_messages(std::slice::from_ref(&u1), None, None).unwrap());
+        let u1 = Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        };
+        let r1 = t.encode(
+            &frame
+                .render_messages(std::slice::from_ref(&u1), None, None)
+                .unwrap(),
+        );
         let t1_gen = t.encode("reason</think>ok");
         let mut conv_after_t1 = r1.clone();
         conv_after_t1.extend_from_slice(&t1_gen);
@@ -1335,27 +1290,50 @@ mod tests {
             v.extend_from_slice(&t1_gen);
             v
         };
-        let a1 = Message { role: Role::Assistant, content: "ok".to_string(), tool_calls: vec![], tool_call_id: None };
-        let u2 = Message { role: Role::User, content: "again".to_string(), tool_calls: vec![], tool_call_id: None };
+        let a1 = Message {
+            role: Role::Assistant,
+            content: "ok".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        };
+        let u2 = Message {
+            role: Role::User,
+            content: "again".to_string(),
+            tool_calls: vec![],
+            tool_call_id: None,
+        };
         let messages_t2 = vec![u1.clone(), a1, u2];
 
-        let rendered_t2 = build_cached_history_jinja(
-            &frame, &messages_t2, None,
-            |m| if matches!(m.role, Role::Assistant) { Some(asst_slot.clone()) } else { None },
-        ).expect("jinja splice render");
+        let rendered_t2 = build_cached_history_jinja(&frame, &messages_t2, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(asst_slot.clone())
+            } else {
+                None
+            }
+        })
+        .expect("jinja splice render");
 
         // No sentinel leaked.
         let sentinel_id = t.special_token_id("<|reserved_0|>").unwrap();
-        assert!(!rendered_t2.contains(&sentinel_id), "sentinel must be fully replaced: {rendered_t2:?}");
+        assert!(
+            !rendered_t2.contains(&sentinel_id),
+            "sentinel must be fully replaced: {rendered_t2:?}"
+        );
         // Verbatim splice happened.
         assert!(
-            rendered_t2.windows(asst_slot.len()).any(|w| w == asst_slot.as_slice()),
+            rendered_t2
+                .windows(asst_slot.len())
+                .any(|w| w == asst_slot.as_slice()),
             "cached assistant slot must be spliced verbatim",
         );
         // THE KEY PROPERTY: turn 2 strictly extends turn 1's conversation_tokens.
-        assert!(rendered_t2.len() > conv_after_t1.len(), "turn 2 must be longer than turn 1");
+        assert!(
+            rendered_t2.len() > conv_after_t1.len(),
+            "turn 2 must be longer than turn 1"
+        );
         assert_eq!(
-            &rendered_t2[..conv_after_t1.len()], conv_after_t1.as_slice(),
+            &rendered_t2[..conv_after_t1.len()],
+            conv_after_t1.as_slice(),
             "turn 2 render must extend turn 1's conversation_tokens as a strict prefix",
         );
 

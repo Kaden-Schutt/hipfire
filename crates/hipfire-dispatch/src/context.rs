@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
-use std::sync::Arc;
+use crate::resource::ResourceManager;
 use rdna_compute::arch_caps::ArchCaps;
 use rdna_compute::feature_flags::FeatureFlags;
 use rdna_compute::Gpu;
-use crate::resource::ResourceManager;
+use std::sync::Arc;
 
 /// Per-session context resolved once at Gpu::init().
 /// Shared immutably across all dispatch calls.

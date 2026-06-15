@@ -8,48 +8,16 @@
 //! evidence should see the same prompt framing, EosFilter behavior, token-id
 //! emission, runtime config, and unload lifecycle that users exercise.
 
+pub use hipfire_coherence::{build_detector_bank, decide_agentic, detector_rows, DetectorProfile};
 use hipfire_detect::{
-    attractor::{AttractorFirst128, AttractorLast128, LongStateCollapse},
-    eos_immediate::EosImmediate,
-    ngram::{LoopGuardMirror, NgramDensity},
     report::{prompt_md5, Report, ReportHeader},
-    special_leak::SpecialLeak,
-    think::{ThinkEmpty, ThinkStall},
-    timing::StepTimeSpike,
-    toolcall::ToolcallShape,
-    whitespace_only::WhitespaceOnly,
-    DetectorBank, Event, Severity, Verdict,
+    DetectorBank, Event,
 };
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Instant;
-
-#[derive(Debug, Clone)]
-pub struct DetectorProfile {
-    pub agentic: bool,
-    pub stall_tokens: Option<usize>,
-    pub detect_timing: bool,
-}
-
-impl DetectorProfile {
-    pub fn default_for_prompt(prompt: &str, system: Option<&str>) -> Self {
-        Self {
-            agentic: decide_agentic(prompt, system),
-            stall_tokens: None,
-            detect_timing: false,
-        }
-    }
-
-    pub fn long_state() -> Self {
-        Self {
-            agentic: false,
-            stall_tokens: None,
-            detect_timing: false,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct CoherenceRunConfig {
@@ -138,37 +106,6 @@ impl DaemonChild {
     fn close_stdin(&mut self) {
         self.stdin = None;
     }
-}
-
-pub fn build_detector_bank(profile: &DetectorProfile) -> DetectorBank {
-    let mut bank = DetectorBank::new();
-    bank.add(Box::new(AttractorFirst128::new()));
-    bank.add(Box::new(AttractorLast128::new()));
-    bank.add(Box::new(LongStateCollapse::new()));
-    bank.add(Box::new(NgramDensity::new()));
-    bank.add(Box::new(LoopGuardMirror::new()));
-    bank.add(Box::new(ThinkEmpty::new()));
-    if let Some(budget) = profile.stall_tokens {
-        bank.add(Box::new(ThinkStall::new(budget)));
-    }
-    bank.add(Box::new(SpecialLeak::new()));
-    if profile.agentic {
-        bank.add(Box::new(ToolcallShape::new()));
-    }
-    bank.add(Box::new(EosImmediate::new()));
-    bank.add(Box::new(WhitespaceOnly::new()));
-    if profile.detect_timing {
-        bank.add(Box::new(StepTimeSpike::new()));
-    }
-    bank
-}
-
-pub fn decide_agentic(prompt: &str, system: Option<&str>) -> bool {
-    let combined = format!("{}\n{}", system.unwrap_or(""), prompt);
-    let s = combined.to_ascii_lowercase();
-    s.contains("<tool_call>")
-        || (s.contains("\"name\"") && s.contains("\"arguments\""))
-        || (s.contains("function") && s.contains("\"arguments\""))
 }
 
 pub fn run_coherence(config: &CoherenceRunConfig) -> Result<CoherenceRunOutput, String> {
@@ -504,35 +441,4 @@ fn repo_root() -> PathBuf {
     }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir.join("../..")
-}
-
-pub fn detector_rows(report: &Report) -> Vec<Value> {
-    report
-        .rows
-        .iter()
-        .map(|row| {
-            let status = match &row.verdict {
-                Verdict::Ok => "pass",
-                Verdict::Skip { .. } => "skip",
-                Verdict::Fired {
-                    severity: Severity::Warn,
-                    ..
-                } => "warn",
-                Verdict::Fired {
-                    severity: Severity::Fail,
-                    ..
-                } => "fail",
-            };
-            let detail = match &row.verdict {
-                Verdict::Ok => None,
-                Verdict::Skip { reason } => Some(reason.clone()),
-                Verdict::Fired { detail, .. } => Some(detail.clone()),
-            };
-            json!({
-                "detector": row.name,
-                "status": status,
-                "detail": detail,
-            })
-        })
-        .collect()
 }

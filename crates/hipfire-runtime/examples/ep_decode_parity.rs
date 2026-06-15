@@ -23,10 +23,10 @@
 //! Run (hiptrx; TP=1 reference then TP=2 sharded):
 //!   HIP_VISIBLE_DEVICES=0 cargo run --release --features deltanet \
 //!       -p hipfire-runtime --example ep_decode_parity -- \
-//!       ~/.hipfire/models/qwen3.6-35b-a3b.mq4 1 24 "The capital of France is"
+//!       ~/.hipfire/models/qwen3.6-35b-a3b-mq4.hfq 1 24 "The capital of France is"
 //!   HIP_VISIBLE_DEVICES=0,1 cargo run --release --features deltanet \
 //!       -p hipfire-runtime --example ep_decode_parity -- \
-//!       ~/.hipfire/models/qwen3.6-35b-a3b.mq4 2 24 "The capital of France is"
+//!       ~/.hipfire/models/qwen3.6-35b-a3b-mq4.hfq 2 24 "The capital of France is"
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -57,7 +57,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: ep_decode_parity <model.mq4> [tp_size=2] [steps=24] [prompt]");
+        eprintln!("Usage: ep_decode_parity <model-mq4.hfq> [tp_size=2] [steps=24] [prompt]");
         std::process::exit(1);
     }
     let model_path = Path::new(&args[1]);
@@ -75,14 +75,21 @@ fn main() {
     // ── config + tokenizer (one open; per-rank loads reopen below) ──────────
     let hfq0 = HfqFile::open(model_path).expect("open model");
     let config = qwen35::config_from_hfq(&hfq0).expect("read config");
-    assert!(config.num_experts > 0, "ep_decode_parity expects a MoE (A3B) model");
+    assert!(
+        config.num_experts > 0,
+        "ep_decode_parity expects a MoE (A3B) model"
+    );
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq0.metadata_json)
         .expect("tokenizer");
     drop(hfq0);
     eprintln!(
         "config: layers={} dim={} experts={} top_k={} n_kv_heads={} head_dim={}",
-        config.n_layers, config.dim, config.num_experts, config.num_experts_per_tok,
-        config.n_kv_heads, config.head_dim,
+        config.n_layers,
+        config.dim,
+        config.num_experts,
+        config.num_experts_per_tok,
+        config.n_kv_heads,
+        config.head_dim,
     );
     // Prefill mode: HIPFIRE_EP_PREFILL=batched → WMMA batched prefill EP (E6b)
     // via forward_prefill_batch_ep; default (sequential) → token-by-token via
@@ -90,32 +97,48 @@ fn main() {
     let batched_prefill = std::env::var("HIPFIRE_EP_PREFILL").as_deref() == Ok("batched");
     eprintln!(
         "EP: tp_size={tp} steps={steps} kv_seq={kv_seq} prefill={} prompt={prompt:?}",
-        if batched_prefill { "batched-WMMA" } else { "sequential" },
+        if batched_prefill {
+            "batched-WMMA"
+        } else {
+            "sequential"
+        },
     );
 
     // ── tokenize (early — sizes the prefill batch + routed partials) ─────────
     let prompt_tokens: Vec<u32> = tokenizer.encode(&prompt);
     assert!(!prompt_tokens.is_empty(), "empty prompt tokenization");
     let max_batch = prompt_tokens.len().max(2);
-    eprintln!("prompt tokenizes to {} tokens (max_batch={max_batch})", prompt_tokens.len());
+    eprintln!(
+        "prompt tokenizes to {} tokens (max_batch={max_batch})",
+        prompt_tokens.len()
+    );
 
     // ── bring up N ranks ────────────────────────────────────────────────────
     let mut gpus = Gpus::init_tp(tp, config.n_layers).expect("init_tp");
     let n = gpus.devices.len();
-    assert_eq!(n, tp, "init_tp gave {n} devices, expected {tp} (check HIP_VISIBLE_DEVICES)");
+    assert_eq!(
+        n, tp,
+        "init_tp gave {n} devices, expected {tp} (check HIP_VISIBLE_DEVICES)"
+    );
     for (r, d) in gpus.devices.iter().enumerate() {
         eprintln!("  rank {r}: device_id={} arch={}", d.device_id, d.arch);
     }
 
     // ── replicated load + per-rank expert shard ─────────────────────────────
-    let shard = ShardConfig::new(tp, /*tp_kv_replicate=*/ true, config.num_experts, ExpertAssign::Stride)
-        .expect("ShardConfig");
+    let shard = ShardConfig::new(
+        tp,
+        /*tp_kv_replicate=*/ true,
+        config.num_experts,
+        ExpertAssign::Stride,
+    )
+    .expect("ShardConfig");
     let mut weights_per_rank = Vec::with_capacity(n);
     for r in 0..n {
         gpus.devices[r].bind_thread().expect("bind rank");
         let mut hfq = HfqFile::open(model_path).expect("reopen model");
         eprintln!("  [rank {r}] loading replicated weights ...");
-        let mut w = qwen35::load_weights(&mut hfq, &config, &mut gpus.devices[r]).expect("load_weights");
+        let mut w =
+            qwen35::load_weights(&mut hfq, &config, &mut gpus.devices[r]).expect("load_weights");
         qwen35::shard_all_moe_layers(&mut gpus.devices[r], &mut w, &shard, r, config.num_experts)
             .expect("shard_all_moe_layers");
         weights_per_rank.push(w);
@@ -140,15 +163,24 @@ fn main() {
         gpus.devices[r].bind_thread().expect("bind rank");
         let g = &mut gpus.devices[r];
         kv_per_rank.push(
-            KvCache::new_gpu_q8(g, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq)
-                .expect("kv"),
+            KvCache::new_gpu_q8(
+                g,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            )
+            .expect("kv"),
         );
         dn_per_rank.push(DeltaNetState::new(g, &config).expect("dn"));
         scratch_per_rank.push(Qwen35Scratch::new(g, &config, 64).expect("scratch"));
         partials.push(g.zeros(&[config.dim], DType::F32).expect("partial"));
         if batched_prefill {
             pbs_per_rank.push(PrefillBatchScratch::new(g, &config, max_batch).expect("pbs"));
-            prefill_partials.push(g.zeros(&[max_batch * config.dim], DType::F32).expect("prefill partial"));
+            prefill_partials.push(
+                g.zeros(&[max_batch * config.dim], DType::F32)
+                    .expect("prefill partial"),
+            );
         }
     }
     if n > 1 {
@@ -159,27 +191,50 @@ fn main() {
 
     // ── EP prefill (batched-WMMA or sequential) — timed (TTFT ≈ prefill wall) ─
     use std::time::Instant;
-    eprintln!("\n=== EP forward (prefill {} toks → decode {steps}) ===", prompt_tokens.len());
+    eprintln!(
+        "\n=== EP forward (prefill {} toks → decode {steps}) ===",
+        prompt_tokens.len()
+    );
     let t_prefill = Instant::now();
     if batched_prefill {
         qwen35::forward_prefill_batch_ep(
-            &mut gpus, &weights_per_rank, &config, &prompt_tokens, 0,
-            &mut kv_per_rank, &mut dn_per_rank, &scratch_per_rank, &pbs_per_rank, &prefill_partials,
+            &mut gpus,
+            &weights_per_rank,
+            &config,
+            &prompt_tokens,
+            0,
+            &mut kv_per_rank,
+            &mut dn_per_rank,
+            &scratch_per_rank,
+            &pbs_per_rank,
+            &prefill_partials,
         )
         .expect("forward_prefill_batch_ep");
     } else {
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
             qwen35::forward_ep(
-                &mut gpus, &weights_per_rank, &config, tok, pos,
-                &mut kv_per_rank, &dn_per_rank, &scratch_per_rank, &partials,
+                &mut gpus,
+                &weights_per_rank,
+                &config,
+                tok,
+                pos,
+                &mut kv_per_rank,
+                &dn_per_rank,
+                &scratch_per_rank,
+                &partials,
             )
             .expect("forward_ep prefill");
         }
     }
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     gpus.devices[0].bind_thread().expect("bind 0");
-    let mut logits = gpus.devices[0].download_f32(&scratch_per_rank[0].logits).expect("dl");
-    assert!(!logits.iter().any(|v| v.is_nan() || v.is_infinite()), "NaN/Inf in EP prefill logits");
+    let mut logits = gpus.devices[0]
+        .download_f32(&scratch_per_rank[0].logits)
+        .expect("dl");
+    assert!(
+        !logits.iter().any(|v| v.is_nan() || v.is_infinite()),
+        "NaN/Inf in EP prefill logits"
+    );
     let mut gen_ep: Vec<u32> = Vec::with_capacity(steps);
     let mut step_ms: Vec<f64> = Vec::with_capacity(steps);
     let mut next = llama::argmax(&logits);
@@ -188,14 +243,26 @@ fn main() {
     for step in 1..steps {
         let t = Instant::now();
         qwen35::forward_ep(
-            &mut gpus, &weights_per_rank, &config, next, base + step - 1,
-            &mut kv_per_rank, &dn_per_rank, &scratch_per_rank, &partials,
+            &mut gpus,
+            &weights_per_rank,
+            &config,
+            next,
+            base + step - 1,
+            &mut kv_per_rank,
+            &dn_per_rank,
+            &scratch_per_rank,
+            &partials,
         )
         .expect("forward_ep decode");
         gpus.devices[0].bind_thread().expect("bind 0");
-        logits = gpus.devices[0].download_f32(&scratch_per_rank[0].logits).expect("dl");
+        logits = gpus.devices[0]
+            .download_f32(&scratch_per_rank[0].logits)
+            .expect("dl");
         step_ms.push(t.elapsed().as_secs_f64() * 1000.0);
-        assert!(!logits.iter().any(|v| v.is_nan() || v.is_infinite()), "NaN/Inf at EP step {step}");
+        assert!(
+            !logits.iter().any(|v| v.is_nan() || v.is_infinite()),
+            "NaN/Inf at EP step {step}"
+        );
         next = llama::argmax(&logits);
         gen_ep.push(next);
     }
@@ -229,30 +296,51 @@ fn main() {
     if n == 1 && !batched_prefill {
         eprintln!("\n=== tp=1 anchor: production forward_scratch (unsharded rank 0) ===");
         let mut kv_ref = KvCache::new_gpu_q8(
-            &mut gpus.devices[0], config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
+            &mut gpus.devices[0],
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
         )
         .expect("kv ref");
         let mut dn_ref = DeltaNetState::new(&mut gpus.devices[0], &config).expect("dn ref");
-        let scratch_ref = Qwen35Scratch::new(&mut gpus.devices[0], &config, 64).expect("scratch ref");
+        let scratch_ref =
+            Qwen35Scratch::new(&mut gpus.devices[0], &config, 64).expect("scratch ref");
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
             qwen35::forward_scratch(
-                &mut gpus.devices[0], &weights_per_rank[0], &config, tok, pos,
-                &mut kv_ref, &mut dn_ref, &scratch_ref,
+                &mut gpus.devices[0],
+                &weights_per_rank[0],
+                &config,
+                tok,
+                pos,
+                &mut kv_ref,
+                &mut dn_ref,
+                &scratch_ref,
             )
             .expect("forward_scratch prefill");
         }
-        let ref_logits = gpus.devices[0].download_f32(&scratch_ref.logits).expect("dl ref");
+        let ref_logits = gpus.devices[0]
+            .download_f32(&scratch_ref.logits)
+            .expect("dl ref");
         let ref_max_logit = ref_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut gen_ref: Vec<u32> = Vec::with_capacity(steps);
         let mut nref = llama::argmax(&ref_logits);
         gen_ref.push(nref);
         for step in 1..steps {
             qwen35::forward_scratch(
-                &mut gpus.devices[0], &weights_per_rank[0], &config, nref, base + step - 1,
-                &mut kv_ref, &mut dn_ref, &scratch_ref,
+                &mut gpus.devices[0],
+                &weights_per_rank[0],
+                &config,
+                nref,
+                base + step - 1,
+                &mut kv_ref,
+                &mut dn_ref,
+                &scratch_ref,
             )
             .expect("forward_scratch decode");
-            let l = gpus.devices[0].download_f32(&scratch_ref.logits).expect("dl ref");
+            let l = gpus.devices[0]
+                .download_f32(&scratch_ref.logits)
+                .expect("dl ref");
             nref = llama::argmax(&l);
             gen_ref.push(nref);
         }

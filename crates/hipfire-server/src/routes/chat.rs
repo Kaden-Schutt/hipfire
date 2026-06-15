@@ -7,6 +7,7 @@ use axum::{
         IntoResponse, Json, Response,
     },
 };
+use hipfire_prompt::{Message as DaemonMessage, Role};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -47,19 +48,45 @@ pub async fn post_chat_completions(
     }
 }
 
-fn messages_to_prompt(messages: &[ChatMessage]) -> String {
+fn message_content_to_text(content: &Option<Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+fn chat_role_to_daemon(role: &str) -> Option<Role> {
+    match role {
+        "system" => Some(Role::System),
+        "user" => Some(Role::User),
+        "assistant" => Some(Role::Assistant),
+        "tool" => Some(Role::Tool),
+        _ => None,
+    }
+}
+
+fn messages_to_daemon(messages: &[ChatMessage]) -> Vec<DaemonMessage> {
     messages
         .iter()
-        .map(|m| {
-            let content = match &m.content {
-                Some(Value::String(s)) => s.clone(),
-                Some(other) => other.to_string(),
-                None => String::new(),
-            };
-            format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, content)
+        .filter_map(|m| {
+            Some(DaemonMessage {
+                role: chat_role_to_daemon(&m.role)?,
+                content: message_content_to_text(&m.content),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            })
         })
-        .collect::<String>()
-        + "<|im_start|>assistant\n"
+        .collect()
+}
+
+fn last_user_prompt(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| message_content_to_text(&m.content))
+        .unwrap_or_default()
 }
 
 async fn ensure_model_loaded(state: &SharedState, model_arg: &str) -> Result<(), String> {
@@ -135,7 +162,8 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
             .and_then(|e| e.worker_key_id.clone());
         GenerateRequest {
             id: req_id.clone(),
-            prompt: messages_to_prompt(&body.messages),
+            prompt: last_user_prompt(&body.messages),
+            messages: Some(messages_to_daemon(&body.messages)),
             temperature: body.temperature.unwrap_or(cfg.temperature),
             max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
             top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
@@ -224,7 +252,8 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
                 .and_then(|e| e.worker_key_id.clone());
             GenerateRequest {
                 id: req_id.clone(),
-                prompt: messages_to_prompt(&body.messages),
+                prompt: last_user_prompt(&body.messages),
+                messages: Some(messages_to_daemon(&body.messages)),
                 temperature: body.temperature.unwrap_or(cfg.temperature),
                 max_tokens: body.max_tokens.unwrap_or(cfg.max_tokens),
                 top_p: Some(body.top_p.unwrap_or(cfg.top_p)),
@@ -292,4 +321,80 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
 
 fn sse_error(msg: &str) -> Event {
     Event::default().data(serde_json::to_string(&json!({"error": {"message": msg}})).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_messages_forward_as_structured_daemon_messages() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(Value::String("be brief".to_string())),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String("first".to_string())),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(Value::String("ok".to_string())),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String("second".to_string())),
+            },
+        ];
+
+        let req = GenerateRequest {
+            id: "req".to_string(),
+            prompt: last_user_prompt(&messages),
+            messages: Some(messages_to_daemon(&messages)),
+            temperature: 0.3,
+            max_tokens: 16,
+            top_p: Some(0.8),
+            repeat_penalty: Some(1.0),
+            worker_key_id: None,
+            tools: None,
+            system: None,
+            thinking: None,
+            max_think_tokens: None,
+            request_id: None,
+        };
+        let v = serde_json::to_value(&req).expect("serialize generate request");
+
+        assert_eq!(v["prompt"], "second");
+        assert!(!v["prompt"].as_str().unwrap().contains("<|im_start|>"));
+        assert_eq!(v["messages"][0]["role"], "system");
+        assert_eq!(v["messages"][0]["content"], "be brief");
+        assert_eq!(v["messages"][1]["role"], "user");
+        assert_eq!(v["messages"][3]["content"], "second");
+    }
+
+    #[test]
+    fn last_user_prompt_is_compatibility_fallback_only() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String("first".to_string())),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(Value::String("answer".to_string())),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!({"type":"text","text":"second"})),
+            },
+        ];
+
+        let prompt_value: Value =
+            serde_json::from_str(&last_user_prompt(&messages)).expect("structured prompt json");
+        assert_eq!(prompt_value, json!({"type":"text","text":"second"}));
+        let daemon_messages = messages_to_daemon(&messages);
+        assert_eq!(daemon_messages.len(), 3);
+        assert_eq!(daemon_messages[2].role, Role::User);
+    }
 }

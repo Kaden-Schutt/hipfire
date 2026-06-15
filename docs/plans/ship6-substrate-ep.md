@@ -181,7 +181,7 @@ proven byte-/argmax-exact.
 runs production `forward_scratch` on the unsharded rank-0 replica as an
 in-process anchor).
 
-**Results** (`qwen3.6-35b-a3b.mq4`, prompt "The capital of France is", 16 steps):
+**Results** (`qwen3.6-35b-a3b-mq4.hfq`, prompt "The capital of France is", 16 steps):
 
 | box / arch | run | experts/rank | all-reduce | gen FNV | output |
 |---|---|---|---|---|---|
@@ -216,7 +216,7 @@ all-reduce; routed combine → zeroed `[n×dim]` partial (owned experts only, Pa
 `x_batch` replicated, then `all_reduce_sum_f32([n×dim])` + add into each rank's
 residual. `HIPFIRE_EP_PREFILL=batched` in `ep_decode_parity`.
 
-**Results** (`qwen3.6-35b-a3b.mq4`, "The capital of France is", 16 steps):
+**Results** (`qwen3.6-35b-a3b-mq4.hfq`, "The capital of France is", 16 steps):
 
 | box / arch | run | gen FNV |
 |---|---|---|
@@ -248,7 +248,7 @@ MiniMax-M2 EP (#15) then DeepSeek-V4 EP (#16).
 
 ## PERF REALITY CHECK — E6b prefill is CORRECT but SLOW (2026-06-07)
 
-Measured on hiptrx gfx1201, qwen3.6-35b-a3b.mq4, q8 KV:
+Measured on hiptrx gfx1201, qwen3.6-35b-a3b-mq4.hfq, q8 KV:
 
 | metric | normal single-card | EP tp=2 | ratio |
 |---|---|---|---|
@@ -327,7 +327,7 @@ small per-token all-reduce is ~0.3 ms, fine).
 
 ## VALIDATED — MiniMax-M2 EP on hiptrx (#15), 2026-06-08
 
-The 86 GB `minimax-m2.mq2lloyd` tier (does NOT fit one 32 GB card) runs COHERENT
+The 86 GB `minimax-m2-lloyd-mq2.hfq` tier (does NOT fit one 32 GB card) runs COHERENT
 across **4× gfx1201** via EP:
 
 ```

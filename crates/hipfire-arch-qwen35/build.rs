@@ -241,7 +241,11 @@ fn main() {
                 .split('+')
                 .filter_map(|c| c.trim().parse().ok())
                 .collect();
-            if ctx_lens.is_empty() { None } else { Some((nh, ctx_lens)) }
+            if ctx_lens.is_empty() {
+                None
+            } else {
+                Some((nh, ctx_lens))
+            }
         })
         .collect();
 
@@ -274,8 +278,7 @@ fn main() {
             .unwrap_or_else(|_| "8:2:256".to_string())
             .split(',')
             .filter_map(|s| {
-                let parts: Vec<u32> =
-                    s.trim().split(':').filter_map(|p| p.parse().ok()).collect();
+                let parts: Vec<u32> = s.trim().split(':').filter_map(|p| p.parse().ok()).collect();
                 if parts.len() >= 3 {
                     Some((parts[0], parts[1], parts[2]))
                 } else {
@@ -372,9 +375,7 @@ fn run_attn_gate_build(
             );
         }
         Err(e) => {
-            println!(
-                "cargo:warning=npu-kernels: could not launch Python for attn-gate {npu}: {e}"
-            );
+            println!("cargo:warning=npu-kernels: could not launch Python for attn-gate {npu}: {e}");
         }
     }
 }
@@ -424,9 +425,7 @@ fn run_headnorm_build(
             );
         }
         Err(e) => {
-            println!(
-                "cargo:warning=npu-kernels: could not launch Python for headnorm {npu}: {e}"
-            );
+            println!("cargo:warning=npu-kernels: could not launch Python for headnorm {npu}: {e}");
         }
     }
 }
@@ -479,9 +478,7 @@ fn run_rope_build(
             );
         }
         Err(e) => {
-            println!(
-                "cargo:warning=npu-kernels: could not launch Python for rope {npu}: {e}"
-            );
+            println!("cargo:warning=npu-kernels: could not launch Python for rope {npu}: {e}");
         }
     }
 }
@@ -532,9 +529,7 @@ fn run_softmax_build(
             );
         }
         Err(e) => {
-            println!(
-                "cargo:warning=npu-kernels: could not launch Python for softmax {npu}: {e}"
-            );
+            println!("cargo:warning=npu-kernels: could not launch Python for softmax {npu}: {e}");
         }
     }
 }
@@ -605,8 +600,7 @@ fn find_python() -> PathBuf {
     if let Ok(p) = std::env::var("HIPFIRE_NPU_PYTHON") {
         return PathBuf::from(p);
     }
-    let venv = PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".venv/bin/python");
+    let venv = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".venv/bin/python");
     if venv.exists() {
         return venv;
     }

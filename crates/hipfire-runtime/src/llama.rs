@@ -563,7 +563,7 @@ impl WeightTensor {
     /// Logic-free adapter to the dispatch-layer WeightRef. Wires Givens +
     /// AWQ + row_stride so GemvFamily sees everything a weight needs.
     pub fn dispatch_ref(&self) -> hipfire_dispatch::families::gemv::WeightRef<'_> {
-        use hipfire_dispatch::families::gemv::{WeightRef, GivensRef};
+        use hipfire_dispatch::families::gemv::{GivensRef, WeightRef};
         WeightRef {
             buf: &self.buf,
             dtype: self.gpu_dtype,
@@ -571,7 +571,9 @@ impl WeightTensor {
             k: self.k,
             row_stride: self.row_stride,
             rotation: self.paro.as_ref().map(|p| GivensRef {
-                pairs: &p.pairs, theta: &p.theta, scales: &p.channel_scales,
+                pairs: &p.pairs,
+                theta: &p.theta,
+                scales: &p.channel_scales,
                 krot: p.krot as usize,
             }),
             awq_scale: self.awq_scale.as_ref(),
@@ -601,7 +603,8 @@ pub fn gemm_family() -> &'static hipfire_dispatch::families::gemm::GemmFamily {
 /// centralized dispatch tables (arch gating + 1:1 KernelKey→kernel launch).
 pub fn fused_qkv_family() -> &'static hipfire_dispatch::families::fused_qkv::FusedQkvFamily {
     use std::sync::OnceLock;
-    static FUSED_QKV: OnceLock<hipfire_dispatch::families::fused_qkv::FusedQkvFamily> = OnceLock::new();
+    static FUSED_QKV: OnceLock<hipfire_dispatch::families::fused_qkv::FusedQkvFamily> =
+        OnceLock::new();
     FUSED_QKV.get_or_init(hipfire_dispatch::families::fused_qkv::FusedQkvFamily::new)
 }
 
@@ -621,29 +624,20 @@ pub fn moe_family() -> &'static hipfire_dispatch::families::moe::MoeFamily {
 /// lives in the dispatch crate rather than per-model inline match trees.
 pub fn attention_family() -> &'static hipfire_dispatch::families::attention::AttentionFamily {
     use std::sync::OnceLock;
-    static ATTENTION: OnceLock<hipfire_dispatch::families::attention::AttentionFamily> = OnceLock::new();
+    static ATTENTION: OnceLock<hipfire_dispatch::families::attention::AttentionFamily> =
+        OnceLock::new();
     ATTENTION.get_or_init(hipfire_dispatch::families::attention::AttentionFamily::new)
 }
 
-pub use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
-pub use hipfire_dispatch::families::gemv::{RotInput, RotateInputs, RotatedActivation};
+pub use hipfire_dispatch::context::DispatchCtx;
 pub use hipfire_dispatch::families::attention::AttnParams;
 pub use hipfire_dispatch::families::attention::FullAttnParams;
-pub use hipfire_dispatch::families::kv_tier::{KvTierPlan, KvTierInputs};
-pub use hipfire_dispatch::context::DispatchCtx;
-pub use hipfire_dispatch::types::ShapeInfo;
+pub use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
+pub use hipfire_dispatch::families::gemv::{RotInput, RotateInputs, RotatedActivation};
+pub use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 pub use hipfire_dispatch::types::KernelKey;
-pub use hipfire_dispatch::types::{GemvVariant, dtype_post_rotation_variant, dtype_rotation_plan};
-
-/// V-cache quantization tier for adaptive KV cache precision scaling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VMode { Q8, Lloyd2, Lloyd3, Lloyd4 }
-
-impl VMode {
-    pub fn bits(self) -> u32 {
-        match self { VMode::Q8 => 8, VMode::Lloyd2 => 2, VMode::Lloyd3 => 3, VMode::Lloyd4 => 4 }
-    }
-}
+pub use hipfire_dispatch::types::ShapeInfo;
+pub use hipfire_dispatch::types::{dtype_post_rotation_variant, dtype_rotation_plan, GemvVariant};
 
 /// How the embedding table is stored on GPU.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -706,15 +700,6 @@ impl LlamaWeights {
 
 /// Dispatch GEMV for a weight tensor (quantized or F32).
 /// y = W * x where W is the weight tensor, x is F32 input, y is F32 output.
-fn paro_small_direct_limit() -> Option<usize> {
-    let raw = std::env::var_os("HIPFIRE_PARO_SMALL_DIRECT")?;
-    let text = raw.to_string_lossy();
-    if text.is_empty() || text == "1" {
-        return Some(64);
-    }
-    text.parse::<usize>().ok()
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DenseGemvRoute {
     Mq6RotateThenMq6Prerotated,
@@ -771,192 +756,26 @@ fn dense_swiglu_residual_route(dtype: DType) -> DenseSwigluResidualRoute {
     }
 }
 
-fn _weight_gemv_legacy_deleted(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
-    // Replaced by dispatch-based weight_gemv. Kept as dead stub to avoid orphaned call sites.
-    weight_gemv(gpu, w, x, y)
-}
-
-fn _weight_gemv_legacy_deleted_old_match_stub(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
-    match dense_gemv_route(w.gpu_dtype) {
-        DenseGemvRoute::Mq6RotateThenMq6Prerotated => {
-            gpu.ensure_mq_signs()?;
-            // TODO(scratch-alias-safety): centralize these scratch views behind
-            // a non-owning Gpu helper. The repeated `alias()` calls in this file
-            // are safe only while all mq_x_rot users are stream-ordered and the
-            // aliases never outlive or free the backing scratch allocation.
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
-            return gpu.gemv_mq6g256_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k);
-        }
-        DenseGemvRoute::Hfq6Direct => {
-            return gpu.gemv_hfq6g256(&w.buf, x, y, w.m, w.k);
-        }
-        DenseGemvRoute::Unclassified => {}
-    }
-
-    match w.gpu_dtype {
-        DType::F32 => gpu.gemv_f32(&w.buf, x, y),
-        DType::F16 => gpu.gemv_f16_xf32(&w.buf, x, y, w.m, w.k),
-        DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, 1),
-        DType::Q4K => gpu.gemv_q4k(&w.buf, x, y, w.m, w.k),
-        DType::Q6K => gpu.gemv_q6k(&w.buf, x, y, w.m, w.k),
-        DType::Q8_0 => gpu.gemv_q8_0(&w.buf, x, y, w.m, w.k),
-        DType::Q8HFQ => gpu.gemv_q8hfq(&w.buf, x, y, w.m, w.k, w.row_stride),
-        DType::HFQ4G256 => gpu.gemv_hfq4g256(&w.buf, x, y, w.m, w.k),
-        DType::HFQ4G128 => gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k),
-        DType::ParoQ4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            gpu.gemv_paro4g128_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
-        }
-        DType::ParoQ4G128 => {
-            if paro_small_direct_limit().is_some_and(|limit| w.m <= limit) {
-                return gpu.gemv_paro4g128t_direct(&w.buf, x, y, w.m, w.k);
-            }
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            gpu.gemv_paro4g128t_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
-        }
-        DType::HFP4G32 => gpu.gemv_hfp4g32(&w.buf, x, y, w.m, w.k),
-        // ── MQ-family GEMVs ─────────────────────────────────────────
-        // F2 fix (2026-05-14): the `_with_rotate` variants below all
-        // internally call bare `gpu.rotate_x_mq` (non-AWQ). When the
-        // weight carries an AWQ sidecar, that produces `(W·s)·x ≠ W·x`
-        // corruption. Route AWQ-carrying weights through
-        // `rotate_x_mq_for` (AWQ-aware) + prerotated GEMV instead. When
-        // no AWQ scale is present, the helper falls through to the
-        // non-AWQ rotate kernel — byte-identical to the prior
-        // `_with_rotate` path.
-        //
-        // Today only MQ4G256 can carry AWQ sidecars (the quantizer
-        // gates AWQ to that branch — see hipfire-quantize/src/main.rs
-        // §"Phase A Stage A: AWQ"). The other MQ-family arms still
-        // route through `rotate_x_mq_for`, which is correct by virtue
-        // of `awq_scale` being None on those tensors today — and
-        // remains correct if AWQ support is ever extended to other
-        // MQ formats.
-        DType::MFP4G32 => {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            // Preserve the gfx12 dual-FP8 fast path inside
-            // `gemv_mfp4g32_with_rotate` when AWQ is not in play. AWQ
-            // is currently gated by `DType::supports_awq_sidecar`
-            // (`MQ4G256 | MQ3G256` today), so the `is_some()` branch
-            // is unreachable from today's pipeline — kept for forward
-            // compatibility if MFP4G32 ever joins the AWQ allow-list.
-            if w.awq_scale.is_some() {
-                rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
-                gpu.gemv_mfp4g32_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
-            } else {
-                gpu.gemv_mfp4g32_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
-            }
-        }
-        DType::MQ4G256 => {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
-            gpu.gemv_mq4g256_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
-        }
-        DType::MQ4G128 => {
-            gpu.ensure_mq_signs_128()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            rotate_x_mq_128_for(gpu, w, x, &x_rot_alias, w.k)?;
-            gpu.gemv_mq4g128_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
-        }
-        DType::MQ3G256 => {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
-            gpu.gemv_mq3g256_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
-        }
-        DType::MQ2G256 => {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
-            gpu.gemv_mq2g256_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
-        }
-        DType::MQ2G256Lloyd => {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
-            gpu.gemv_mq2g256_lloyd(&w.buf, &x_rot_alias, y, w.m, w.k)
-        }
-        DType::MQ3G256Lloyd => {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
-            gpu.gemv_mq3g256_lloyd(&w.buf, &x_rot_alias, y, w.m, w.k)
-        }
-        DType::MQ4G256Lloyd => {
-            gpu.ensure_mq_signs()?;
-            let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-                dtype: DType::F32,
-            };
-            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
-            gpu.gemv_mq4g256_lloyd(&w.buf, &x_rot_alias, y, w.m, w.k)
-        }
-        _ => weight_gemv(gpu, w, x, y),
-    }
-}
-
-pub fn weight_gemv(
-    gpu: &mut Gpu,
-    w: &WeightTensor,
-    x: &GpuTensor,
-    y: &GpuTensor,
-) -> HipResult<()> {
+pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
     use hipfire_dispatch::types::{dtype_needs_rotation, GemvVariant};
 
     let gemv = crate::llama::gemv_family();
     let ctx = DispatchCtx::new(gpu);
-    let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
+    let wr = WeightRef {
+        buf: &w.buf,
+        dtype: w.gpu_dtype,
+        m: w.m,
+        k: w.k,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
 
     if !dtype_needs_rotation(w.gpu_dtype) {
-        return gemv.run_auto(&ctx, gpu, &wr, x, y)
+        return gemv
+            .run_auto(&ctx, gpu, &wr, x, y)
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
     }
 
@@ -985,68 +804,109 @@ pub fn weight_gemv(
         DType::Q4F16G32 => gpu.gemv_q4f16_g32(&w.buf, x, y, w.m, w.k),
         // MQ4G128 uses G128 rotation (rotate_x_mq_128, sign seeds 43/1043)
         DType::MQ4G128 => {
-            use std::sync::OnceLock;
             use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
+            use std::sync::OnceLock;
             static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
             let rotation = ROTATION.get_or_init(|| RotationFamily::new());
             let xr = xr!();
-            rotation.run(&ctx, gpu, RotationParams {
-                x, x_up: None, w_norm: None,
-                x_plain: &xr, x_rot: &xr,
-                awq_scale: None, k: w.k,
-                eps: 1e-6, batch_size: 1,
-                variant: hipfire_dispatch::types::RotationVariant::PlainG128,
-                givens_pairs: None,
-                givens_theta: None,
-                givens_scales: None,
-                givens_krot: None,
-            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            rotation
+                .run(
+                    &ctx,
+                    gpu,
+                    RotationParams {
+                        x,
+                        x_up: None,
+                        w_norm: None,
+                        x_plain: &xr,
+                        x_rot: &xr,
+                        awq_scale: None,
+                        k: w.k,
+                        eps: 1e-6,
+                        batch_size: 1,
+                        variant: hipfire_dispatch::types::RotationVariant::PlainG128,
+                        givens_pairs: None,
+                        givens_theta: None,
+                        givens_scales: None,
+                        givens_krot: None,
+                    },
+                )
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
             // xr is ALREADY FWHT-rotated by rotate_x_mq_for above. Use the
             // Prerotated GEMV directly — calling run_auto here would re-rotate
             // (dtype_rotation_plan(MQ*) != None), double-applying the involutory
             // FWHT and feeding effectively-unrotated activations to the
             // prerotated kernel (garbage logits). Mirrors master's
             // rotate_x_mq_for + gemv_*_prerotated.
-            gemv.run(&ctx, gpu, &GemvParams {
-                w: &wr, x: &xr, y,
-                variant: GemvVariant::Prerotated,
-                residual: None, gate: None, up: None,
-            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+            gemv.run(
+                &ctx,
+                gpu,
+                &GemvParams {
+                    w: &wr,
+                    x: &xr,
+                    y,
+                    variant: GemvVariant::Prerotated,
+                    residual: None,
+                    gate: None,
+                    up: None,
+                },
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
         // ParoQ4G128: Givens rotation (model-layer ParoRotation metadata) +
         // HFQ4-G128 GEMV. Uses RotationFamily::run(Givens) which calls
         // givens_rotate_to (copy_d2d + rotate in one kernel).
         DType::ParoQ4G128 => {
-            use std::sync::OnceLock;
             use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
+            use std::sync::OnceLock;
             static ROTATION: OnceLock<RotationFamily> = OnceLock::new();
             let rotation = ROTATION.get_or_init(|| RotationFamily::new());
-            let paro = w.paro.as_ref()
+            let paro = w
+                .paro
+                .as_ref()
                 .expect("ParoQ4G128 weight missing ParoRotation metadata");
             gpu.ensure_paro_scratch(w.k)?;
-            // Alias the scratch buffer to avoid borrow conflicts with gpu methods
             let xr = GpuTensor {
                 buf: unsafe { gpu.paro_x_scratch.as_ref().unwrap().buf.alias() },
                 shape: vec![w.k],
                 dtype: DType::F32,
             };
-            rotation.run(&ctx, gpu, RotationParams {
-                x, x_up: None, w_norm: None,
-                x_plain: &xr, x_rot: &xr,
-                awq_scale: None, k: w.k,
-                eps: 1e-6, batch_size: 1,
-                variant: hipfire_dispatch::types::RotationVariant::Givens,
-                givens_pairs: Some(&paro.pairs),
-                givens_theta: Some(&paro.theta),
-                givens_scales: Some(&paro.channel_scales),
-                givens_krot: Some(paro.krot as usize),
-            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            rotation
+                .run(
+                    &ctx,
+                    gpu,
+                    RotationParams {
+                        x,
+                        x_up: None,
+                        w_norm: None,
+                        x_plain: &xr,
+                        x_rot: &xr,
+                        awq_scale: None,
+                        k: w.k,
+                        eps: 1e-6,
+                        batch_size: 1,
+                        variant: hipfire_dispatch::types::RotationVariant::Givens,
+                        givens_pairs: Some(&paro.pairs),
+                        givens_theta: Some(&paro.theta),
+                        givens_scales: Some(&paro.channel_scales),
+                        givens_krot: Some(paro.krot as usize),
+                    },
+                )
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
             // After Givens rotation xr is ready; use Plain (HFQ4G128 kernel), not Prerotated.
-            gemv.run(&ctx, gpu, &GemvParams {
-                w: &wr, x: &xr, y,
-                variant: GemvVariant::Plain,
-                residual: None, gate: None, up: None,
-            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+            gemv.run(
+                &ctx,
+                gpu,
+                &GemvParams {
+                    w: &wr,
+                    x: &xr,
+                    y,
+                    variant: GemvVariant::Plain,
+                    residual: None,
+                    gate: None,
+                    up: None,
+                },
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
         // All other FWHT-requiring dtypes (MQ4G256, MQ6G256, MQ3G256, MQ2G256,
         // MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd, MFP4G32):
@@ -1063,11 +923,20 @@ pub fn weight_gemv(
             // FWHT and feeding effectively-unrotated activations to the
             // prerotated kernel (garbage logits). Mirrors master's
             // rotate_x_mq_for + gemv_*_prerotated.
-            gemv.run(&ctx, gpu, &GemvParams {
-                w: &wr, x: &xr, y,
-                variant: GemvVariant::Prerotated,
-                residual: None, gate: None, up: None,
-            }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+            gemv.run(
+                &ctx,
+                gpu,
+                &GemvParams {
+                    w: &wr,
+                    x: &xr,
+                    y,
+                    variant: GemvVariant::Prerotated,
+                    residual: None,
+                    gate: None,
+                    up: None,
+                },
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
     }
 }
@@ -1429,63 +1298,60 @@ pub fn weight_gemv_prerotated(
         return weight_gemv(gpu, w, x, y);
     }
 
-    use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::gemv::WeightRef;
-    use hipfire_dispatch::types::dtype_needs_rotation;
-
-    let gemv = crate::llama::gemv_family();
-    let ctx = DispatchCtx::new(gpu);
-
-    if w.gpu_dtype == DType::MQ8G256 {
-        gpu.ensure_mq_signs()?;
-        let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
-        return gemv.run_auto(&ctx, gpu, &wr, x, y)
-            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
-    }
-
-    if dtype_needs_rotation(w.gpu_dtype) {
-        if let Some(xr) = x_rot {
-            // `xr` is ALREADY FWHT/Givens-rotated by the caller (the whole
-            // point of `weight_gemv_prerotated`: rotate once, reuse across the
-            // Q/K/V or gate/up projections that share this input). It MUST go
-            // straight into the `gemv_*_prerotated` kernel — i.e. through
-            // `run` with `GemvVariant::Prerotated`.
-            //
-            // `run_auto` here would be a DOUBLE-ROTATION bug: it takes
-            // `RotInput::Raw(xr)` and, because every rotation-needing dtype has
-            // a non-None `dtype_rotation_plan`, re-rotates `xr`. FWHT is
-            // involutory → the second rotation silently UN-rotates the
-            // activation, producing wrong-but-non-crashing output (e.g. MQ6
-            // DeltaNet projections in the multi-GPU branch). #393 introduced
-            // this when it swapped master's explicit
-            // `gemv_mq6g256_prerotated(&w.buf, xr, ..)` for `run_auto`.
-            // `GemvVariant::Prerotated` restores master's behavior exactly.
-            debug_assert!(
-                hipfire_dispatch::types::dtype_post_rotation_variant(w.gpu_dtype)
-                    == GemvVariant::Prerotated,
-                "weight_gemv_prerotated: dtype {:?} needs rotation but its \
-                 post-rotation variant is not Prerotated — passing an \
-                 already-rotated xr would double-rotate",
-                w.gpu_dtype,
-            );
-            let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
-            return gemv
-                .run(&ctx, gpu, &hipfire_dispatch::families::gemv::GemvParams {
-                    w: &wr, x: xr, y,
-                    variant: GemvVariant::Prerotated,
-                    residual: None, gate: None, up: None,
-                })
-                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
+    match w.gpu_dtype {
+        DType::MQ4G256 => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq4g256_prerotated(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
         }
-        return weight_gemv(gpu, w, x, y);
+        DType::MFP4G32 => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mfp4g32_prerotated(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
+        DType::MQ3G256 => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq3g256_prerotated(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
+        DType::MQ2G256 => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq2g256_prerotated(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
+        DType::MQ2G256Lloyd => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq2g256_lloyd(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
+        DType::MQ3G256Lloyd => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq3g256_lloyd(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
+        DType::MQ4G256Lloyd => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq4g256_lloyd(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
+        DType::MQ8G256 => gpu.gemv_mq8g256_prerotated(&w.buf, y, w.m, w.k),
+        _ => weight_gemv(gpu, w, x, y),
     }
-
-    let wr = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: 0, rotation: None, awq_scale: None };
-    gemv.run_auto(&ctx, gpu, &wr, x, y)
-        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
 }
-
-
 
 /// Weight GEMV with fused residual add: `y += W * x`.
 ///
@@ -1612,8 +1478,6 @@ pub fn weight_gemv_residual(
     }
 }
 
-
-
 /// SwiGLU FFN epilogue fused into the w_down input stage for MQ4 weights.
 ///
 /// Replaces:
@@ -1652,17 +1516,8 @@ pub fn weight_gemv_swiglu_residual(
         fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
         return gpu.gemv_hfq6g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k);
     }
-    use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
-    use hipfire_dispatch::types::GemvVariant;
-
-    let gemv = crate::llama::gemv_family();
-    let ctx = DispatchCtx::new(gpu);
-    let wr = WeightRef { buf: &w_down.buf, dtype: w_down.gpu_dtype, m: w_down.m, k: w_down.k, row_stride: 0, rotation: None, awq_scale: None };
-
     match w_down.gpu_dtype {
-        DType::MQ4G256 | DType::MQ3G256 | DType::MQ6G256
-        | DType::MQ3G256Lloyd | DType::MQ4G256Lloyd => {
+        DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -1763,7 +1618,6 @@ pub fn weight_gemv_swiglu_residual(
         }
     }
 }
-
 
 /// Batched weight GEMM: y[b] = W * x[b] for all batch elements.
 /// x: [batch_size × K], y: [batch_size × M]. Falls back to repeated GEMV for unsupported formats.
@@ -4736,14 +4590,6 @@ impl KvCache {
     /// Check if a given KV layer ordinal is a boundary layer (first N + last N).
     pub fn is_boundary(&self, kv_ordinal: usize) -> bool {
         kv_ordinal < self.layer_is_boundary.len() && self.layer_is_boundary[kv_ordinal]
-    }
-
-    pub fn transcode_v_step(&mut self, _gpu: &mut Gpu, _new_v: crate::llama::VMode, _seq_pos: usize) -> hip_bridge::HipResult<()> {
-        Err(hip_bridge::HipError::new(801, "transcode_v_step not yet implemented"))
-    }
-
-    pub fn transcode_k_step(&mut self, _gpu: &mut Gpu, _new_k_bits: u32, _seq_pos: usize) -> hip_bridge::HipResult<()> {
-        Err(hip_bridge::HipError::new(801, "transcode_k_step not yet implemented"))
     }
 }
 

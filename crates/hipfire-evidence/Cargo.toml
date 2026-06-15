@@ -1,0 +1,8 @@
+[package]
+name = "hipfire-evidence"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Evidence provenance and hashing helpers for hipfire"
+
+[dependencies]

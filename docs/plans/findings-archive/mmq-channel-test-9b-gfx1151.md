@@ -3,7 +3,7 @@
 **Date:** 2026-04-30
 **Ref:** Kaden-Schutt/hipfire#87 (auto-MMQ regression on tool-call output)
 **Hardware:** AMD Strix Halo gfx1151, 131.1 GB VRAM, HIP 7.2
-**Model:** qwen3.5-9b.mq4 (32 layers: 24 DeltaNet + 8 FullAttn, dim=4096)
+**Model:** qwen3.5-9b-mq4.hfq (32 layers: 24 DeltaNet + 8 FullAttn, dim=4096)
 **Binary:** `channel_test_mmq --stage site-scan --batch 128 --threshold 0.01`
 
 ## Stage 1: site-scan — all layers x all sites
@@ -148,7 +148,7 @@ MMQ path.
 - [x] Run channel-map on residual at layers 0, 1, 3, 6 — row 3994
       confirmed as consistent outlier
 - [x] Channel-map on layer 27 qkv.v — row 265 confirmed as outlier
-- [x] Run site-scan on qwen3.6-27b.mq4 — confirmed, worse peaks (0.91)
+- [x] Run site-scan on qwen3.6-27b-mq4.hfq — confirmed, worse peaks (0.91)
 - [x] Prototype per-row screening fix — implemented and validated
 - [ ] Investigate row 3994's HFQ4 weight statistics (scale/zero/range)
 - [ ] End-to-end validation: run daemon with MMQ+screening on tool-call prompt

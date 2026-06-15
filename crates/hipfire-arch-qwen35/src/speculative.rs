@@ -85,7 +85,12 @@ fn run_spec_gemm_key(
         rotation: None,
         awq_scale: None,
     };
-    let params = GemmParams { w: &w, x, y, batch_size: n };
+    let params = GemmParams {
+        w: &w,
+        x,
+        y,
+        batch_size: n,
+    };
     SPEC_CTX.with(|cell| {
         let needs_rebuild = {
             let slot = cell.borrow();

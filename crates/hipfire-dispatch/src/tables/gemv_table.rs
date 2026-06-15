@@ -151,4 +151,3 @@ fn register_swiglu_residual(registry: &mut KernelRegistry) {
         });
     }
 }
-

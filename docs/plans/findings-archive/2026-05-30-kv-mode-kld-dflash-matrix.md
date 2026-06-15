@@ -1,7 +1,7 @@
 # KV-mode investigation: filtered trunk KV + fwht-vs-asym (KLD + DFlash matrix)
 
 **Date:** 2026-05-30 · **Branch:** `fix/kv-filtered-trunk-fwht-default` · **GPU:** RX 7900 XTX (gfx1100)
-**Model:** qwen3.6-27b.mq4 (+ qwen35-27b-dflash.mq4 draft) · 27B hybrid (48 DeltaNet LinearAttention + 16 FullAttention layers)
+**Model:** qwen3.6-27b-mq4.hfq (+ qwen3.5-27b-mq4.dflash.hfq draft) · 27B hybrid (48 DeltaNet LinearAttention + 16 FullAttention layers)
 
 ## Origin
 Discord users reported KV-cache VRAM far larger than llama.cpp ("32k ctx = 6GB",
@@ -29,7 +29,7 @@ FullAttention layers ever read it. Switched the serving arms to the existing
 - Conclusion: DFlash behavior does **not** distinguish the modes → τ is the wrong
   axis to justify a default change. Accuracy (KLD) is.
 
-## KLD sweep — qwen3.6-27b.mq4 vs bf16 (HFKLDR `qwen3.6-27b-MASTER-small`), 24-chunk paired
+## KLD sweep — qwen3.6-27b-mq4.hfq vs bf16 (HFKLDR `qwen3.6-27b-MASTER-small`), 24-chunk paired
 | rank | mode | KLD | PPL | same-tier Δ |
 |---|---|---|---|---|
 | 1 | q8 | 0.01038 | 3.4372 | reference |
@@ -56,7 +56,7 @@ by the CLI validator; `turbo*` aliased to `asym*` (misleading).
   bootstrap-CI run would nail the asym3→fwht3 gap to publication precision.
 - Run locally on RDNA (kldref local; fwht kernels RDNA-tuned). KV-mode KLD ranking
   is arch-robust; a MI300X/CDNA cross-check is optional.
-- Scope: HFQ (.mq4) path only. **safetensors + multi-GPU paths still fall back to
+- Scope: HFQ (-mq4.hfq) path only. **safetensors + multi-GPU paths still fall back to
   q8 for an `fwht3` request** (DFlash-safe) — wire fwht arms there as follow-up.
 - `sizeAwareKvMode` (asym3→asym4 deep-stack bump) is now dead for the default path
   (default is fwht3); leave for explicit-asym3 users or clean up.

@@ -20,3 +20,4 @@ futures = "0.3"
 async-stream = "0.3"
 anyhow = "1"
 dirs = "5"
+hipfire-prompt = { path = "../hipfire-prompt" }

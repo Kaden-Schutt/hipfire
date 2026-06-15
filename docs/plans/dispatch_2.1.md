@@ -197,7 +197,7 @@ differ); `probe_commits.sh master HEAD` ±1–3%; `coherence-gate.sh`.
    - `/data/hipfire/qwen2-1.5b.hfq4-q8ffn.hfq` (`--format hfq4-q8ffn`, Qwen2-1.5B) → **A2
      linchpin**: HFQ4 q/k/v/o + Q8_0 mlp → exercises `FusedQkvHfq4G256` **and**
      `FusedGateUpQ8_0`. Dense Qwen2 (no QK-norm) for the qwen2 crate. mean err 2e-4.
-   - `/data/hipfire/qwen3-0.6b.hfq4.hfq` (`--format hfq4`, Qwen3-0.6B) → `FusedQkvHfq4G256` +
+   - `/data/hipfire/qwen3-0.6b-hf4.hfq` (`--format hfq4`, Qwen3-0.6B) → `FusedQkvHfq4G256` +
      `FusedGateUpHfq4G256`; q_norm/k_norm present (`has_qk_norm`), llama arch.
    - `/data/hipfire/qwen3-0.6b.q4k.hfq` (`--format q4k`, Qwen3-0.6B) → all-Q4_K → **A3**
      `FusedQkvQ4K` + `FusedGateUpQ4K`. *(Q4K **is** producible via `--format q4k`/`use_q4k_all`.)*

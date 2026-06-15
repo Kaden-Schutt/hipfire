@@ -11,9 +11,18 @@ fn deepseek4_prefill_batchable_formats() {
     use hipfire_runtime::llama::is_batchable_la;
     // DeepSeek V4 uses MQ4, Q8_0, and F16/F32 for its layers.
     for &arch in &["gfx1100", "gfx942"] {
-        assert!(is_batchable_la(DType::MQ4G256, arch), "MQ4G256 batchable on {arch}");
-        assert!(is_batchable_la(DType::HFQ4G256, arch), "HFQ4G256 batchable on {arch}");
-        assert!(is_batchable_la(DType::Q8_0, arch), "Q8_0 batchable on {arch}");
+        assert!(
+            is_batchable_la(DType::MQ4G256, arch),
+            "MQ4G256 batchable on {arch}"
+        );
+        assert!(
+            is_batchable_la(DType::HFQ4G256, arch),
+            "HFQ4G256 batchable on {arch}"
+        );
+        assert!(
+            is_batchable_la(DType::Q8_0, arch),
+            "Q8_0 batchable on {arch}"
+        );
     }
 }
 

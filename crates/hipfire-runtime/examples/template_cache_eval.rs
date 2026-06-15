@@ -41,8 +41,11 @@ fn render(
     env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
         Err(Error::new(ErrorKind::InvalidOperation, msg))
     });
-    env.add_template("chat", template).map_err(|e| format!("parse: {e}"))?;
-    let tmpl = env.get_template("chat").map_err(|e| format!("lookup: {e}"))?;
+    env.add_template("chat", template)
+        .map_err(|e| format!("parse: {e}"))?;
+    let tmpl = env
+        .get_template("chat")
+        .map_err(|e| format!("lookup: {e}"))?;
     let empty: Vec<serde_json::Value> = Vec::new();
     let ctx = context! {
         messages => Value::from_serialize(messages),
@@ -68,7 +71,9 @@ fn lcp(a: &[u32], b: &[u32]) -> usize {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let model_path = args.get(1).expect("usage: <model.hfq> <template.jinja> <preserve:true|false>");
+    let model_path = args
+        .get(1)
+        .expect("usage: <model.hfq> <template.jinja> <preserve:true|false>");
     let tmpl_path = args.get(2).expect("template path");
     let preserve = args.get(3).map(|s| s == "true").unwrap_or(false);
 
@@ -111,9 +116,16 @@ fn main() {
 
     let l = lcp(&t1_kv, &t2);
     let forward_ext = l == t1_kv.len();
-    let pct = if t1_kv.is_empty() { 0.0 } else { 100.0 * l as f64 / t1_kv.len() as f64 };
+    let pct = if t1_kv.is_empty() {
+        0.0
+    } else {
+        100.0 * l as f64 / t1_kv.len() as f64
+    };
 
-    println!("template       : {}", Path::new(tmpl_path).file_name().unwrap().to_string_lossy());
+    println!(
+        "template       : {}",
+        Path::new(tmpl_path).file_name().unwrap().to_string_lossy()
+    );
     println!("preserve_thinking: {preserve}");
     println!("turn1_kv tokens : {}", t1_kv.len());
     println!("turn2    tokens : {}", t2.len());

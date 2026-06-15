@@ -25,11 +25,19 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp_f32 = ((bits >> 23) & 0xff) as i32;
     let mant = bits & 0x7fffff;
-    if exp_f32 == 0 { return sign; }
-    if exp_f32 == 0xff { return sign | 0x7c00 | if mant != 0 { 1 } else { 0 }; }
+    if exp_f32 == 0 {
+        return sign;
+    }
+    if exp_f32 == 0xff {
+        return sign | 0x7c00 | if mant != 0 { 1 } else { 0 };
+    }
     let exp = exp_f32 - 127 + 15;
-    if exp <= 0 { return sign; }
-    if exp >= 31 { return sign | 0x7c00; }
+    if exp <= 0 {
+        return sign;
+    }
+    if exp >= 31 {
+        return sign | 0x7c00;
+    }
     sign | ((exp as u16) << 10) | ((mant >> 13) as u16)
 }
 
@@ -49,9 +57,9 @@ fn main() {
     eprintln!("  arch = {}", gpu.arch);
 
     let b_n: usize = 256; // batch
-    let h: usize = 64;    // heads
-    let d: usize = 512;   // head_dim
-    let n: usize = 512;   // n_total keys
+    let h: usize = 64; // heads
+    let d: usize = 512; // head_dim
+    let n: usize = 512; // n_total keys
     eprintln!("  shape: B={b_n} H={h} D={d} N={n}  (K/V shared across heads per batch)");
 
     gpu.ensure_kernel_public("dsa_attn_f32_baseline", SRC, "dsa_attn_f32_baseline")
@@ -84,9 +92,15 @@ fn main() {
     let d_q = gpu.upload_f32(&q, &[b_n * h * d]).unwrap();
     let d_k = gpu.upload_f32(&k, &[b_n * n * d]).unwrap();
     let d_v = gpu.upload_f32(&v, &[b_n * n * d]).unwrap();
-    let d_qf16 = gpu.upload_raw(&to_f16_bytes(&q), &[b_n * h * d * 2]).unwrap();
-    let d_kf16 = gpu.upload_raw(&to_f16_bytes(&k), &[b_n * n * d * 2]).unwrap();
-    let d_vtf16 = gpu.upload_raw(&to_f16_bytes(&vt), &[b_n * d * n * 2]).unwrap();
+    let d_qf16 = gpu
+        .upload_raw(&to_f16_bytes(&q), &[b_n * h * d * 2])
+        .unwrap();
+    let d_kf16 = gpu
+        .upload_raw(&to_f16_bytes(&k), &[b_n * n * d * 2])
+        .unwrap();
+    let d_vtf16 = gpu
+        .upload_raw(&to_f16_bytes(&vt), &[b_n * d * n * 2])
+        .unwrap();
     let d_o_base = gpu.zeros(&[b_n * h * d], DType::F32).unwrap();
     let d_o_wmma = gpu.zeros(&[b_n * h * d], DType::F32).unwrap();
 
@@ -103,17 +117,26 @@ fn main() {
             for p in 0..n {
                 let koff = (bb * n + p) * d;
                 let mut s = 0f32;
-                for i in 0..d { s += q[qoff + i] * k[koff + i]; }
+                for i in 0..d {
+                    s += q[qoff + i] * k[koff + i];
+                }
                 s *= inv_scale;
                 scores[p] = s;
-                if s > mx { mx = s; }
+                if s > mx {
+                    mx = s;
+                }
             }
             let mut sum = 0f32;
-            for p in 0..n { scores[p] = (scores[p] - mx).exp(); sum += scores[p]; }
+            for p in 0..n {
+                scores[p] = (scores[p] - mx).exp();
+                sum += scores[p];
+            }
             let inv = 1.0 / sum;
             for dd in 0..d {
                 let mut acc = 0f32;
-                for p in 0..n { acc += scores[p] * inv * v[(bb * n + p) * d + dd]; }
+                for p in 0..n {
+                    acc += scores[p] * inv * v[(bb * n + p) * d + dd];
+                }
                 o_ref[(bb * h + hh) * d + dd] = acc;
             }
         }
@@ -132,8 +155,14 @@ fn main() {
         kb.push_i32(b_n as i32);
         kb.pad_to(16);
         let lds = (d + n) * 4;
-        gpu.launch_kernel_blob("dsa_attn_f32_baseline",
-            [h as u32, b_n as u32, 1], [512, 1, 1], lds as u32, kb.as_mut_slice()).unwrap();
+        gpu.launch_kernel_blob(
+            "dsa_attn_f32_baseline",
+            [h as u32, b_n as u32, 1],
+            [512, 1, 1],
+            lds as u32,
+            kb.as_mut_slice(),
+        )
+        .unwrap();
     };
     let launch_wmma = |gpu: &Gpu| {
         let mut kb = KernargBlob::new();
@@ -147,8 +176,14 @@ fn main() {
         kb.push_i32(b_n as i32);
         kb.pad_to(16);
         let lds = 16 * n * 4; // S f32 (exp-scores); P normalized inline
-        gpu.launch_kernel_blob("dsa_attn_wmma_hb",
-            [(h / 16) as u32, b_n as u32, 1], [32, 1, 1], lds as u32, kb.as_mut_slice()).unwrap();
+        gpu.launch_kernel_blob(
+            "dsa_attn_wmma_hb",
+            [(h / 16) as u32, b_n as u32, 1],
+            [32, 1, 1],
+            lds as u32,
+            kb.as_mut_slice(),
+        )
+        .unwrap();
     };
 
     // ── Run once for correctness ──
@@ -169,10 +204,14 @@ fn main() {
             let r = o_ref[i];
             let g = got[i];
             let dd = (r - g).abs();
-            if dd > max_abs { max_abs = dd; }
+            if dd > max_abs {
+                max_abs = dd;
+            }
             if r.abs() > thr {
                 let rel = dd / r.abs();
-                if rel > max_rel { max_rel = rel; }
+                if rel > max_rel {
+                    max_rel = rel;
+                }
                 sum_rel += rel as f64;
                 cnt += 1;
             }
@@ -190,14 +229,19 @@ fn main() {
     // ── Timing ──
     const WARM: usize = 10;
     const IT: usize = 100;
-    for _ in 0..WARM { launch_base(&gpu); launch_wmma(&gpu); }
+    for _ in 0..WARM {
+        launch_base(&gpu);
+        launch_wmma(&gpu);
+    }
     gpu.hip.device_synchronize().unwrap();
 
     let time = |gpu: &Gpu, f: &dyn Fn(&Gpu)| -> f64 {
         let e0 = gpu.hip.event_create().unwrap();
         let e1 = gpu.hip.event_create().unwrap();
         gpu.hip.event_record(&e0, None).unwrap();
-        for _ in 0..IT { f(gpu); }
+        for _ in 0..IT {
+            f(gpu);
+        }
         gpu.hip.event_record(&e1, None).unwrap();
         gpu.hip.event_synchronize(&e1).unwrap();
         gpu.hip.event_elapsed_ms(&e0, &e1).unwrap() as f64 * 1000.0 / IT as f64

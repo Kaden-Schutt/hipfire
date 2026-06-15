@@ -69,7 +69,7 @@ fi
 
 EXE="./target/release/examples/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
-V4F_MODEL="$MODELS_DIR/deepseek-v4-flash.mq2lloyd"
+V4F_MODEL="$MODELS_DIR/deepseek-v4-flash-lloyd-mq2.hfq"
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-deepseek4-recall-$(date +%Y%m%d-%H%M%S).md}"
 CASE_TIMEOUT="${HIPFIRE_COHERENCE_TIMEOUT:-420}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"

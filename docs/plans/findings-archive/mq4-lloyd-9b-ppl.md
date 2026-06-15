@@ -9,7 +9,7 @@
 
 ## Why this exists
 
-Issue #182's Phase 1 deliverable: produce a `qwen3.5-9b.mq4-lloyd` artifact
+Issue #182's Phase 1 deliverable: produce a `qwen3.5-9b-lloyd-mq4.hfq` artifact
 and measure PPL to gate the kernel-fast-path work in Phase 2 (5 fused
 kernel files, 13 qwen35.rs call sites). Quality answer:
 
@@ -178,7 +178,7 @@ source scripts/rocm-env.sh
 # Quantize:
 ./target/release/hipfire-quantize \
   --input /data/models/qwen/Qwen3.5-9B \
-  --output ~/.hipfire/models/qwen3.5-9b.mq4-lloyd \
+  --output ~/.hipfire/models/qwen3.5-9b-lloyd-mq4.hfq \
   --format mq4-lloyd --allow-mq4-lloyd
 
 # Build perplexity binary:
@@ -187,7 +187,7 @@ cargo build -p hipfire-runtime --example perplexity --release
 # Score:
 source scripts/gpu-lock.sh && gpu_acquire "ppl-mq4-lloyd"
 ./target/release/examples/perplexity \
-  ~/.hipfire/models/qwen3.5-9b.mq4-lloyd \
+  ~/.hipfire/models/qwen3.5-9b-lloyd-mq4.hfq \
   benchmarks/calib/calib-5m.txt \
   --ctx 2048 --warmup 8 --offset 0
 gpu_release

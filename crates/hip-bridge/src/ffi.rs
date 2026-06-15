@@ -1425,6 +1425,8 @@ impl Stream {
         Self(ptr::null_mut())
     }
 
+    /// Alias for `as_raw` used by TP/RCCL collective callers that hand a raw
+    /// stream pointer to `ncclAllReduce`.
     pub fn raw_ptr(&self) -> *mut c_void {
         self.0
     }

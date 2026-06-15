@@ -6,7 +6,7 @@ env (trim_blocks + lstrip_blocks + strict + pycompat). NOT yet wired as the
 production qwen render path.
 
 - **qwen35-official-reference.jinja** — the official Qwen3.5/3.6 chat_template,
-  extracted verbatim from `qwen3.5-0.8b.tier1.mq4.hfq` metadata. Interleaved
+  extracted verbatim from `qwen3.5-0.8b-tier1-mq4.hfq` metadata. Interleaved
   thinking (drops prior-turn reasoning once a new user turn arrives). Reference
   for comparison.
 - **qwen35-froggeric-v20.jinja** — froggeric/Qwen-Fixed-Chat-Templates

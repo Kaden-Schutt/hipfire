@@ -21,10 +21,10 @@
 //! 3. Pass the multi-GPU coherence gate.
 
 use hip_bridge::{
-    DeviceBuffer, Event, HipError, HipResult, RcclComms,
-    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    DeviceBuffer, Event, HipError, HipResult, RcclComms, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
+    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
 /// device has an active stream, `completion` holds a HIP event recorded
@@ -520,11 +520,7 @@ impl Gpus {
     /// immediately; the buffers are valid only after a subsequent
     /// `stream_synchronize` (or a downstream dispatch that's already
     /// ordered behind the same stream).
-    pub fn all_reduce_sum_f32(
-        &mut self,
-        buffers: &[&DeviceBuffer],
-        count: usize,
-    ) -> HipResult<()> {
+    pub fn all_reduce_sum_f32(&mut self, buffers: &[&DeviceBuffer], count: usize) -> HipResult<()> {
         if buffers.len() != self.devices.len() {
             return Err(HipError::new(
                 0,
@@ -592,7 +588,10 @@ impl Gpus {
         }
         // Free the old (too-small) set on its owning devices before regrowing.
         if !self.peer_ar_tmp.is_empty() {
-            for (r, row) in std::mem::take(&mut self.peer_ar_tmp).into_iter().enumerate() {
+            for (r, row) in std::mem::take(&mut self.peer_ar_tmp)
+                .into_iter()
+                .enumerate()
+            {
                 let _ = self.devices[r].bind_thread();
                 for buf in row {
                     let _ = self.devices[r].hip.free(buf);
@@ -637,7 +636,10 @@ impl Gpus {
         if buffers.len() != n {
             return Err(HipError::new(
                 0,
-                &format!("all_reduce_sum_f32_peer: buffers.len()={} != n_devices={n}", buffers.len()),
+                &format!(
+                    "all_reduce_sum_f32_peer: buffers.len()={} != n_devices={n}",
+                    buffers.len()
+                ),
             ));
         }
         if n == 1 {
@@ -654,7 +656,8 @@ impl Gpus {
                 if j == r {
                     continue;
                 }
-                let evt = self.boundary_copy(j, r, buffers[j], &self.peer_ar_tmp[r][slot], bytes)?;
+                let evt =
+                    self.boundary_copy(j, r, buffers[j], &self.peer_ar_tmp[r][slot], bytes)?;
                 evts.push(evt);
                 slot += 1;
             }

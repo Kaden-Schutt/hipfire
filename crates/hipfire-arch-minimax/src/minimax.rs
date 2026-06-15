@@ -383,7 +383,11 @@ impl MiniMaxWeights {
             // EP shard: only upload rank-owned experts into the compact blob.
             // `local_of_global[e]` maps a global expert id to its slot in the
             // compact (owned-only) blob, or usize::MAX if not owned by this rank.
-            let owns = |e: usize| shard.map(|(s, rank)| s.owns_expert(rank, e)).unwrap_or(true);
+            let owns = |e: usize| {
+                shard
+                    .map(|(s, rank)| s.owns_expert(rank, e))
+                    .unwrap_or(true)
+            };
             let mut local_of_global = vec![usize::MAX; n_exp];
             let mut n_owned = 0usize;
             for e in 0..n_exp {
@@ -397,7 +401,9 @@ impl MiniMaxWeights {
                     dn_stride = w2.len();
                     qt_gu = qt1;
                     qt_dn = qt2;
-                    let cap = shard.map(|(s, _)| s.experts_per_rank(n_exp)).unwrap_or(n_exp);
+                    let cap = shard
+                        .map(|(s, _)| s.experts_per_rank(n_exp))
+                        .unwrap_or(n_exp);
                     gu_combined.reserve(gu_len * cap);
                     dn_combined.reserve(w2.len() * cap);
                 } else if gu_len != gu_stride || w2.len() != dn_stride {

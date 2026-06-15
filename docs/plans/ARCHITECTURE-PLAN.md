@@ -17,14 +17,27 @@ It is intentionally compact and backed by evidence links into the historical arc
 The target crates for modular boundaries remain:
 - `hipfire-daemon`
 - `hipfire-model`
-- `hipfire-prompt`
+- `hipfire-prompt` (created; owns prompt framing and Jinja rendering)
 - `hipfire-state`
 - `hipfire-generate`
-- `hipfire-coherence`
+- `hipfire-coherence` (created; owns detector policy and report row serialization helpers)
 - `hipfire-rocm`
-- `hipfire-evidence`
+- `hipfire-evidence` (created; owns evidence provenance and hash helpers)
 
 A `bun`-free control plane remains desirable but is deferred behind verified seam extraction.
+
+Current prompt boundary status:
+- `hipfire-prompt` owns `AssistantPrefix`, `Role`, `Message`, `ToolCall`, `ChatFrame`, and `JinjaChatFrame`.
+- `hipfire-runtime::prompt_frame` remains a compatibility re-export and implements the prompt tokenizer trait for the runtime tokenizer.
+- The Rust server forwards structured chat `messages` to the daemon and keeps `prompt` as the last-user-text compatibility fallback, avoiding nested ChatML.
+
+Current evidence boundary status:
+- `hipfire-evidence` owns stable hash, model/tag hash, directory digest, file hash, and HFQ metadata extraction helpers.
+- `hipfire-runtime::eval_harness` still owns eval execution and artifact writing, but now consumes the shared evidence provenance helpers.
+
+Current coherence boundary status:
+- `hipfire-coherence` owns detector profile selection, detector-bank construction, agentic prompt detection, and report row serialization.
+- `hipfire-runtime::coherence_runtime` still owns daemon orchestration, prompt execution, token event capture, and artifact assembly.
 
 ## 3) Execution sequence
 

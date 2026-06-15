@@ -36,10 +36,10 @@
 //! (default off) in later steps, validated byte-identical via the
 //! `HIPFIRE_FORWARD_ORACLE` dual-run.
 
-use crate::context::DispatchCtx;
-use crate::types::{KernelKey, PipelineOp};
 use super::steps::{match_fused_prefix, step_op_kind, Step};
+use crate::context::DispatchCtx;
 use crate::types::DispatchError;
+use crate::types::{KernelKey, PipelineOp};
 use rdna_compute::{Gpu, GpuTensor};
 
 /// Index into the model's per-layer weight table (resolved at lower time, stable
@@ -75,9 +75,13 @@ pub enum ActFlavor {
 pub enum RopeFlavor {
     None,
     /// Standard rotate-half (most archs). `theta` = rope base.
-    HalfRotate { theta: f32 },
+    HalfRotate {
+        theta: f32,
+    },
     /// Interleaved full-dim RoPE (e.g. cohere2moe).
-    Interleaved { theta: f32 },
+    Interleaved {
+        theta: f32,
+    },
 }
 
 /// Attention-block flavor — everything that distinguishes one arch's attention
@@ -186,7 +190,10 @@ pub struct LoweredForward {
 
 impl LoweredForward {
     pub fn new(weight_gen: u64) -> Self {
-        Self { layers: Vec::new(), weight_gen }
+        Self {
+            layers: Vec::new(),
+            weight_gen,
+        }
     }
 }
 
@@ -274,14 +281,55 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
 /// inside the impl (the "Fallback") — so there is NO `UnsupportedVariant`
 /// catch-all on the executor; the match is total over `SuperOpKind`.
 pub trait ForwardBindings {
-    fn run_proj(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_residual_gemv(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_norm(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_attend(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_moe(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_recurrent(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_conv(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding) -> Result<(), DispatchError>;
-    fn run_escape(&mut self, gpu: &mut Gpu, ctx: &DispatchCtx, op: &OpBinding, kind: EscapeKind) -> Result<(), DispatchError>;
+    fn run_proj(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_residual_gemv(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_norm(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_attend(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_moe(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_recurrent(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_conv(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+    ) -> Result<(), DispatchError>;
+    fn run_escape(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        op: &OpBinding,
+        kind: EscapeKind,
+    ) -> Result<(), DispatchError>;
 
     // ── Expert-parallel (Ship 6 substrate-EP) hooks ─────────────────────────
     // Default to unsupported; only EP-target MoE arches (qwen3.6-A3B, MiniMax,
@@ -376,7 +424,9 @@ pub fn run_layer_program<B: ForwardBindings>(
 mod tests {
     use super::*;
 
-    fn fk() -> KernelKey { KernelKey::FusedQkvHfq4G256 }
+    fn fk() -> KernelKey {
+        KernelKey::FusedQkvHfq4G256
+    }
 
     #[test]
     fn lower_walk_collapses_fused_and_passes_through_unfused() {
@@ -384,7 +434,13 @@ mod tests {
         // step 5 unfused GemvResidual→ResidualGemv.
         let prog = lower_walk(
             6,
-            |i| if i == 5 { SuperOpKind::ResidualGemv } else { SuperOpKind::Proj },
+            |i| {
+                if i == 5 {
+                    SuperOpKind::ResidualGemv
+                } else {
+                    SuperOpKind::Proj
+                }
+            },
             |pos| if pos == 0 { Some((fk(), 4)) } else { None },
         );
         assert_eq!(prog.len(), 3);
@@ -405,9 +461,17 @@ mod tests {
 
     #[test]
     fn lower_walk_single_cluster_spans_to_end() {
-        let prog = lower_walk(4, |_| SuperOpKind::Proj, |pos| {
-            if pos == 0 { Some((fk(), 4)) } else { None }
-        });
+        let prog = lower_walk(
+            4,
+            |_| SuperOpKind::Proj,
+            |pos| {
+                if pos == 0 {
+                    Some((fk(), 4))
+                } else {
+                    None
+                }
+            },
+        );
         assert_eq!(prog.len(), 1);
         assert_eq!(prog[0].binding.key, Some(fk()));
     }

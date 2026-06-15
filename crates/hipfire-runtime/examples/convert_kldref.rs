@@ -128,8 +128,7 @@ fn main() {
             r.read_exact(&mut block).expect("read block");
             let out_pos = (c * scored_per_chunk + s) * top_k;
             // top_indices: offsets 0 .. top_k*4
-            indices_buf[out_pos * 4..(out_pos + top_k) * 4]
-                .copy_from_slice(&block[0..top_k * 4]);
+            indices_buf[out_pos * 4..(out_pos + top_k) * 4].copy_from_slice(&block[0..top_k * 4]);
             // top_log_probs: offsets top_k*4 .. top_k*8
             log_probs_buf[out_pos * 4..(out_pos + top_k) * 4]
                 .copy_from_slice(&block[top_k * 4..top_k * 8]);

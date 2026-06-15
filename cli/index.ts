@@ -540,7 +540,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   //
   // 2. Auto-match: look alongside the target for a file named
   //    `qwen35-<size>-dflash-<quant>.hfq`. Size is extracted from the target
-  //    path (e.g. `qwen3.5-27b.mq4` → size=27b). Only runs when #1 is unset.
+  //    path (e.g. `qwen3.5-27b-mq4.hfq` → size=27b). Only runs when #1 is unset.
   //
   // If the draft file is missing the daemon logs a warning and falls back
   // to AR (no client-visible error).
@@ -809,15 +809,14 @@ const REGISTRY: Record<string, ModelEntry> = registryData.models as Record<strin
 const ALIASES: Record<string, string>    = registryData.aliases as Record<string, string>;
 
 export function resolveModelTag(input: string): string {
-  // Backward compat: old hfq4/hfq6 tags → hf4/hf6
-  const normalized = input.replace(/-hfq(\d)/, "-hf$1").replace(/\.hfq$/, ".hf4");
+  const normalized = input;
   // Direct registry match
   if (REGISTRY[normalized]) return normalized;
   // Alias
   if (ALIASES[normalized]) return ALIASES[normalized];
   // Try adding "qwen3.5:" prefix
   if (REGISTRY[`qwen3.5:${normalized}`]) return `qwen3.5:${normalized}`;
-  // Reverse-resolve: if input looks like a filename (e.g. "qwen3.6-35b-a3b.mq4"),
+  // Reverse-resolve: if input looks like a filename (e.g. "qwen3.6-35b-a3b-mq4.hfq"),
   // find the registry entry whose .file matches and return its tag. Without this,
   // per-model config is silently ignored when the user passes a raw filename.
   for (const [tag, entry] of Object.entries(REGISTRY)) {
@@ -3862,7 +3861,7 @@ interface ModelsCatalog {
   models: Record<string, LocalModelRecord>;
 }
 
-const MODEL_EXT_RE = /\.(hf4|hf6|hfq|mq3|mq4|mq6|mq2lloyd)$/i;
+const MODEL_EXT_RE = /\.hfq$/i;
 
 function readJsonFile(path: string): any | null {
   try {
@@ -3995,12 +3994,7 @@ function scanFiles(dir: string, pred: (name: string) => boolean): string[] {
 }
 
 function registryTagForFile(file: string): string | null {
-  const fNorm = file
-    .replace(/\.q4\.hfq$/i, ".hf4")
-    .replace(/\.hfq6\.hfq$/i, ".hf6")
-    .replace(/-hfq4\.hfq$/i, ".hf4")
-    .replace(/\.hfq$/i, ".hf4");
-  return Object.entries(REGISTRY).find(([_, e]) => e.file === file || e.file === fNorm)?.[0] ?? null;
+  return Object.entries(REGISTRY).find(([_, e]) => e.file === file)?.[0] ?? null;
 }
 
 function modelFamily(id: string): string | null {
@@ -4013,7 +4007,7 @@ function templateMatchesModel(templatePath: string, modelId: string): boolean {
   const t = basename(templatePath).toLowerCase();
   const tStem = t.replace(/\.(j2|jinja2|jinja)$/i, "");
   const lowerId = modelId.toLowerCase();
-  const modelStem = lowerId.replace(/\.(hf4|hf6|hfq|mq3|mq4|mq6|mq2lloyd)$/i, "");
+  const modelStem = lowerId.replace(/\.hfq$/i, "");
   if (tStem === lowerId || tStem === modelStem) return true;
   const family = modelFamily(modelId);
   if (!family) return false;
@@ -4025,9 +4019,9 @@ function templateMatchesModel(templatePath: string, modelId: string): boolean {
 function draftMatchesModel(draftPath: string, modelId: string): boolean {
   const d = basename(draftPath).toLowerCase();
   if (!d.endsWith(".hfq")) return false;
-  const m = modelId.toLowerCase().match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq3|mq4|mq6|hf4|hf6|hfq|mq2lloyd)/);
+  const m = modelId.toLowerCase().match(/qwen3\.(5|6)-(.+?)-(?:hf|mq|lloyd-mq)[1-8][a-z0-9-]*\.hfq$/);
   if (!m) return false;
-  return d.startsWith(`qwen3${m[1]}-${m[2].toLowerCase()}-dflash-`);
+  return d.startsWith(`qwen3.${m[1]}-${m[2].toLowerCase()}-`) && d.endsWith(".dflash.hfq");
 }
 
 function triattnMatchesModel(sidecarPath: string, modelId: string): boolean {
@@ -4166,42 +4160,27 @@ export function findModel(name: string): string | null {
   if (entry) {
     const p = join(MODELS_DIR, entry.file);
     if (existsSync(p)) return p;
-    // Backward compat: try old .hfq naming for the SAME quant level only
-    // (only applies to .hf4 / .hf6 — .mq4 has no legacy alias)
-    if (entry.file.endsWith(".hf4") || entry.file.endsWith(".hf6")) {
-      const base = entry.file.replace(/\.(hf4|hf6)$/, "");
-      const isHf6 = entry.file.endsWith(".hf6");
-      const oldNames = isHf6
-        ? [base + ".hfq6.hfq"]                              // HF6 → only try old hfq6
-        : [base + ".q4.hfq", base + "-hfq4.hfq", base + ".hfq"];  // HF4 → only try old q4/hfq4
-      for (const old of oldNames) {
-        const op = join(MODELS_DIR, old);
-        if (existsSync(op)) return op;
-      }
-    }
   }
 
   // Fuzzy search local dirs (top-level + one level of subdirectories)
   // If the name includes a quant hint (hf4/hf6/mq4/mq6), match exactly.
-  // Otherwise prefer .mq4 (default quant: FWHT-rotated 4-bit, quality-gated,
-  // WMMA-accelerated on RDNA3+). Fall back to .hf4 only if no .mq4 is found
-  // so Qwen3 (which currently ships only .hf4) still resolves.
+  // Otherwise prefer mq4 (default quant: FWHT-rotated 4-bit, quality-gated),
+  // then hf4 for smaller dense checkpoints.
   const searchName = name.replace(":", "-");
-  const hasQuantHint = /\.(hf[46]|mq[46])$|-(hf[46]|mq[46])$/.test(name);
+  const hasQuantHint = /-(hf[46]|mq[346]|lloyd-mq[23])(?:\.hfq)?$/i.test(name);
   const matchesName = (f: string) => f === name || f === searchName
     || f.includes(name) || f.includes(searchName);
-  const hasValidExt = (f: string) => f.endsWith(".mq4") || f.endsWith(".mq6")
-    || f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq2lloyd");
+  const hasValidExt = (f: string) => f.endsWith(".hfq");
 
-  // Preference order when no quant hint: .mq4 → .hf4 → .hf6 → .mq6 → .hfq
+  // Preference order when no quant hint: mq4 → hf4 → mq3 → lloyd-mq2 → mq6 → hf6.
   // (MQ6 only if explicitly asked; HF6 ditto — both are larger files.)
   const extPriority = (f: string): number => {
-    if (f.endsWith(".mq4")) return 0;
-    if (f.endsWith(".hf4")) return 1;
-    if (f.endsWith(".hfq")) return 2; // legacy HF4 naming
-    if (f.endsWith(".mq2lloyd")) return 3;
-    if (f.endsWith(".mq6")) return 4;
-    if (f.endsWith(".hf6")) return 5;
+    if (f.endsWith("-mq4.hfq")) return 0;
+    if (f.endsWith("-hf4.hfq")) return 1;
+    if (f.endsWith("-mq3.hfq")) return 2;
+    if (f.endsWith("-lloyd-mq2.hfq")) return 3;
+    if (f.endsWith("-mq6.hfq")) return 4;
+    if (f.endsWith("-hf6.hfq")) return 5;
     return 99;
   };
 
@@ -4211,15 +4190,7 @@ export function findModel(name: string): string | null {
     if (f === name || f === searchName) return true;
     // With a quant hint in the name, caller is explicit — any matching file is fine.
     if (hasQuantHint) return true;
-    // No hint: accept any valid extension; extPriority picks the best one.
-    // Still filter .hfq to default-q4 flavor (.q4.hfq / -hfq4.hfq stems) so
-    // we don't return an experimental -hfq4g128.hfq instead of a proper .mq4.
-    if (f.endsWith(".hfq")) {
-      const stem = f.slice(0, -4);
-      const isDefaultQ4 = stem.endsWith(".q4") || stem.endsWith("-hfq4")
-        || stem === searchName || stem === name;
-      if (!isDefaultQ4) return false;
-    }
+    // No hint: accept any canonical artifact; extPriority picks the best one.
     return true;
   };
 
@@ -5173,7 +5144,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     prefill_drafter: {
       label: "prefill_drafter",
-      desc: "Path to PFlash drafter HFQ (e.g. ~/.hipfire/models/qwen3-0.6b.hf4). Tokenizer must match the target's. Empty = disabled.",
+      desc: "Path to PFlash drafter HFQ (e.g. ~/.hipfire/models/qwen3-0.6b-hf4.hfq). Tokenizer must match the target's. Empty = disabled.",
     },
     prefill_drafter_device: {
       label: "prefill_drafter_device",
@@ -6392,23 +6363,6 @@ switch (cmd) {
         console.error(`  Updated ${gpuArch} kernels ✓ (cache cleared)`);
       }
     }
-    // Rename legacy .hfq model files to .hf4/.hf6
-    const { renameSync } = await import("fs");
-    try {
-      for (const f of readdirSync(MODELS_DIR)) {
-        if (!f.endsWith(".hfq")) continue;
-        let newName = "";
-        if (f.endsWith(".q4.hfq")) newName = f.replace(/\.q4\.hfq$/, ".hf4");
-        else if (f.endsWith(".hfq6.hfq")) newName = f.replace(/\.hfq6\.hfq$/, ".hf6");
-        else if (f.match(/-hfq4\.hfq$/)) newName = f.replace(/-hfq4\.hfq$/, ".hf4");
-        else if (f.match(/-hfq4g\d+\.hfq$/)) continue; // skip experimental variants
-        else newName = f.replace(/\.hfq$/, ".hf4"); // bare .hfq → assume hf4
-        if (newName && newName !== f && !existsSync(join(MODELS_DIR, newName))) {
-          renameSync(join(MODELS_DIR, f), join(MODELS_DIR, newName));
-          console.error(`  Renamed ${f} → ${newName}`);
-        }
-      }
-    } catch {}
     // Pre-compile GPU kernels so `hipfire serve` starts instantly
     const daemonForPrecompile = join(binDir, `daemon${exe}`) ;
     if (existsSync(daemonForPrecompile)) {
@@ -6707,10 +6661,10 @@ Q4_0 / Q6_K / F16 / BF16 / F32) and re-quantized to the chosen
 format. Pick by model architecture:
 
   hf4 / hf6:   dense (Llama / Mistral / Gemma / older Qwen). DEFAULT.
-               Output extensions: .hf4 / .hf6.
+               Output artifacts: *-hf4.hfq / *-hf6.hfq.
   mq4 / mq6:   Qwen3.5+ family (DeltaNet hot path). Override only when
                the source GGUF is a Qwen3.5+ model.
-               Output extensions: .mq4 / .mq6.
+               Output artifacts: *-mq4.hfq / *-mq6.hfq.
 
 Quality is lower than quantizing from full-precision safetensors due
 to the double-quant roundtrip; raise to hf6 / mq6 if you can spare
@@ -6723,11 +6677,11 @@ Examples:
       --install --register qwopus:4b
 
   # Local fine-tune → MQ4:
-  hipfire quantize ./my-finetune --format mq4 -o finetune.mq4
+  hipfire quantize ./my-finetune --format mq4 -o finetune-mq4.hfq
 
   # GGUF → HF4 (one-shot, install into ~/.hipfire/models):
   hipfire quantize ./tinyllama.Q4_K_M.gguf --install --register tinyllama:1b-gguf
-  # → ~/.hipfire/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.hf4
+  # → ~/.hipfire/models/tinyllama-1.1b-chat-v1.0.Q4_K_M-hf4.hfq
 
   # Qwen3.5+ GGUF → MQ4 (DeltaNet hot path):
   hipfire quantize ./qwen3.5.Q4_K_M.gguf --format mq4 --install --register q35:9b-gguf
@@ -6820,7 +6774,7 @@ Generate a TriAttention calibration sidecar (.triattn.bin) for the given model.
 The sidecar enables automatic KV-cache eviction and is required for CASK
 generation on large-context models (e.g. 27B with >16K max_position_embeddings).
 
-The sidecar file is saved next to the model file (same directory as the .mq4/.hf4)
+The sidecar file is saved next to the model file.
 so the daemon auto-discovers it.
 
 Model:
@@ -6838,8 +6792,8 @@ Flags:
 
 Examples:
   hipfire sidecar-gen qwen3.5:9b
-  hipfire sidecar-gen ./my-model.mq4 --corpus wikipedia.txt --max-tokens 100000
-  hipfire sidecar-gen ~/.hipfire/models/qwen3.6-27b.mq4 -o /tmp/sidecar.bin`);
+  hipfire sidecar-gen ./my-model-mq4.hfq --corpus wikipedia.txt --max-tokens 100000
+  hipfire sidecar-gen ~/.hipfire/models/qwen3.6-27b-mq4.hfq -o /tmp/sidecar.bin`);
       process.exit(tag ? 0 : 1);
     }
     let corpusPath: string | undefined;
@@ -7302,7 +7256,7 @@ Quantize any Qwen 3.5 HF model (or local dir) — one-shot download + upload:
   hipfire quantize Jackrong/Qwopus3.5-4B-v3 --both \\
         --upload schuttdev/hipfire-qwopus-4b --create-repo \\
         --install --register qwopus:4b
-  hipfire quantize ./my-finetune --format mq6 -o my-finetune.mq6`);
+  hipfire quantize ./my-finetune --format mq6 -o my-finetune-mq6.hfq`);
     break;
   }
 }
