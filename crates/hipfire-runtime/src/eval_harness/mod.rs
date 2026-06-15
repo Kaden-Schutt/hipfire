@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hipfire_evidence::{
     directory_hash, file_hash, list_files, model_hash, read_hfq_metadata, stable_hash_bytes,
-    stable_hash_file_fallback,
+    stable_hash_file_fallback, STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3351,100 +3351,30 @@ fn write_evidence_artifacts(
     admission: &AdmissionArtifact,
     ctx: &EvalContext,
 ) -> Result<BTreeMap<String, Value>, String> {
-    let specs = [
-        (
-            "quality.json",
-            "quality",
-            &[
-                "mean_kld",
-                "p99_kld",
-                "ppl",
-                "argmax_match_rate",
-                "accuracy",
-                "exact_match",
-            ][..],
-        ),
-        (
-            "performance.json",
-            "performance",
-            &["pp32_ms", "pp128_ms", "ttft_ms", "tok_s"][..],
-        ),
-        (
-            "phase_timings.json",
-            "phase_timings",
-            &["load_ms", "prefill_ms", "decode_ms", "teardown_ms"][..],
-        ),
-        (
-            "launch_counts.json",
-            "launch_counts",
-            &["kernel_launches", "graph_launches", "memcpy_ops"][..],
-        ),
-        (
-            "moe_router_histogram.json",
-            "moe_router_histogram",
-            &["expert_hits", "shared_expert_hits", "router_entropy"][..],
-        ),
-        (
-            "memory.json",
-            "memory",
-            &["vram_peak_bytes", "kv_bytes", "workspace_bytes"][..],
-        ),
-        (
-            "dflash_trace.json",
-            "dflash_trace",
-            &["ar_tok_s", "dflash_tok_s", "accept_rate", "tau"][..],
-        ),
-        (
-            "path_c_trace.json",
-            "path_c_trace",
-            &[
-                "tok_s",
-                "tau",
-                "promotion_verdict",
-                "tok_s_delta_pct",
-                "tau_delta_pct",
-            ][..],
-        ),
-        (
-            "module_evidence.json",
-            "module_evidence",
-            &[
-                "module_kind",
-                "module_id",
-                "preferred_backend",
-                "selected_backend",
-                "oracle_backend",
-                "fallback_reason",
-            ][..],
-        ),
-        (
-            "profiling.json",
-            "profiling",
-            &["kernel_name", "duration_us", "occupancy", "waves"][..],
-        ),
-        (
-            "coherence.json",
-            "coherence",
-            &[
-                "hard_fails",
-                "soft_warns",
-                "detector_count",
-                "coherence_status",
-            ][..],
-        ),
-    ];
     let mut out = BTreeMap::new();
-    for (file, kind, expected_metrics) in specs {
-        let value = evidence_artifact_value(kind, expected_metrics, config, datasets, results, ctx);
+    for spec in STANDARD_EVIDENCE_ARTIFACT_SPECS {
+        let value = evidence_artifact_value(
+            spec.kind,
+            spec.expected_metrics,
+            config,
+            datasets,
+            results,
+            ctx,
+        );
         let status = value
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("not_collected")
             .to_string();
-        write_json_pretty(&dir.join(file), &value)?;
+        write_json_pretty(&dir.join(spec.file), &value)?;
         out.insert(
-            kind.to_string(),
-            artifact_index_entry_from_value(format!("artifacts/{file}"), status, &value, ctx),
+            spec.kind.to_string(),
+            artifact_index_entry_from_value(
+                format!("artifacts/{}", spec.file),
+                status,
+                &value,
+                ctx,
+            ),
         );
     }
     write_json_pretty(&dir.join("comparisons.json"), comparison)?;

@@ -18,6 +18,96 @@ pub struct HfqMetadata {
     pub metadata_json: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvidenceArtifactSpec {
+    pub file: &'static str,
+    pub kind: &'static str,
+    pub expected_metrics: &'static [&'static str],
+}
+
+pub const STANDARD_EVIDENCE_ARTIFACT_SPECS: &[EvidenceArtifactSpec] = &[
+    EvidenceArtifactSpec {
+        file: "quality.json",
+        kind: "quality",
+        expected_metrics: &[
+            "mean_kld",
+            "p99_kld",
+            "ppl",
+            "argmax_match_rate",
+            "accuracy",
+            "exact_match",
+        ],
+    },
+    EvidenceArtifactSpec {
+        file: "performance.json",
+        kind: "performance",
+        expected_metrics: &["pp32_ms", "pp128_ms", "ttft_ms", "tok_s"],
+    },
+    EvidenceArtifactSpec {
+        file: "phase_timings.json",
+        kind: "phase_timings",
+        expected_metrics: &["load_ms", "prefill_ms", "decode_ms", "teardown_ms"],
+    },
+    EvidenceArtifactSpec {
+        file: "launch_counts.json",
+        kind: "launch_counts",
+        expected_metrics: &["kernel_launches", "graph_launches", "memcpy_ops"],
+    },
+    EvidenceArtifactSpec {
+        file: "moe_router_histogram.json",
+        kind: "moe_router_histogram",
+        expected_metrics: &["expert_hits", "shared_expert_hits", "router_entropy"],
+    },
+    EvidenceArtifactSpec {
+        file: "memory.json",
+        kind: "memory",
+        expected_metrics: &["vram_peak_bytes", "kv_bytes", "workspace_bytes"],
+    },
+    EvidenceArtifactSpec {
+        file: "dflash_trace.json",
+        kind: "dflash_trace",
+        expected_metrics: &["ar_tok_s", "dflash_tok_s", "accept_rate", "tau"],
+    },
+    EvidenceArtifactSpec {
+        file: "path_c_trace.json",
+        kind: "path_c_trace",
+        expected_metrics: &[
+            "tok_s",
+            "tau",
+            "promotion_verdict",
+            "tok_s_delta_pct",
+            "tau_delta_pct",
+        ],
+    },
+    EvidenceArtifactSpec {
+        file: "module_evidence.json",
+        kind: "module_evidence",
+        expected_metrics: &[
+            "module_kind",
+            "module_id",
+            "preferred_backend",
+            "selected_backend",
+            "oracle_backend",
+            "fallback_reason",
+        ],
+    },
+    EvidenceArtifactSpec {
+        file: "profiling.json",
+        kind: "profiling",
+        expected_metrics: &["kernel_name", "duration_us", "occupancy", "waves"],
+    },
+    EvidenceArtifactSpec {
+        file: "coherence.json",
+        kind: "coherence",
+        expected_metrics: &[
+            "hard_fails",
+            "soft_warns",
+            "detector_count",
+            "coherence_status",
+        ],
+    },
+];
+
 pub fn file_hash(path: &Path) -> Option<String> {
     command_digest("sha256sum", path).or_else(|| Some(stable_hash_file_fallback(path)))
 }
@@ -252,6 +342,33 @@ mod tests {
             stable_hash_bytes(b"a.txt\nnested/b.txt")
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn standard_artifact_catalog_preserves_schema_names() {
+        let specs: Vec<_> = STANDARD_EVIDENCE_ARTIFACT_SPECS
+            .iter()
+            .map(|spec| (spec.file, spec.kind))
+            .collect();
+        assert_eq!(
+            specs,
+            vec![
+                ("quality.json", "quality"),
+                ("performance.json", "performance"),
+                ("phase_timings.json", "phase_timings"),
+                ("launch_counts.json", "launch_counts"),
+                ("moe_router_histogram.json", "moe_router_histogram"),
+                ("memory.json", "memory"),
+                ("dflash_trace.json", "dflash_trace"),
+                ("path_c_trace.json", "path_c_trace"),
+                ("module_evidence.json", "module_evidence"),
+                ("profiling.json", "profiling"),
+                ("coherence.json", "coherence"),
+            ]
+        );
+        assert!(STANDARD_EVIDENCE_ARTIFACT_SPECS
+            .iter()
+            .all(|spec| !spec.expected_metrics.is_empty()));
     }
 
     #[test]
