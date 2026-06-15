@@ -185,6 +185,76 @@ pub fn encode_group(weights: &[f32], scale: f32, codebook: &[f32]) -> Vec<u8> {
     symbols
 }
 
+/// Beam-search trellis encoder: keeps the top `beam_width` states per step
+/// instead of all 2^STATE_BITS, cutting per-group cost from
+/// `n × 2^STATE_BITS × NUM_SYMBOLS` to `n × beam_width × NUM_SYMBOLS`
+/// (~60× at beam=64, STATE_BITS=12) — what makes full-model encoding feasible.
+/// Near-Viterbi-optimal for moderate beams. Same bitshift-trellis semantics as
+/// `encode_group`, so `decode_group` reconstructs identically.
+pub fn beam_encode_group(
+    weights: &[f32],
+    scale: f32,
+    codebook: &[f32],
+    beam_width: usize,
+) -> Vec<u8> {
+    use std::collections::HashMap;
+    let n = weights.len();
+    // Active beam: (state, cumulative_cost). Start at state 0 (leading zeros).
+    let mut beam: Vec<(u32, f64)> = vec![(0u32, 0.0)];
+    // Per-step records for backtrack: (state, prev_beam_idx, symbol).
+    let mut steps: Vec<Vec<(u32, u32, u8)>> = Vec::with_capacity(n);
+
+    for &w in weights {
+        let w = w as f64;
+        // For each reachable next state keep the single cheapest predecessor.
+        let mut best: HashMap<u32, (f64, u32, u8)> = HashMap::new();
+        for (bi, &(s_prev, c_prev)) in beam.iter().enumerate() {
+            let base = (s_prev << BITS_PER_WEIGHT) & STATE_MASK;
+            for sym in 0..NUM_SYMBOLS as u32 {
+                let s_new = base | sym;
+                let diff = w - scale as f64 * codebook[s_new as usize] as f64;
+                let c = c_prev + diff * diff;
+                match best.get(&s_new) {
+                    Some(&(bc, _, _)) if bc <= c => {}
+                    _ => {
+                        best.insert(s_new, (c, bi as u32, sym as u8));
+                    }
+                }
+            }
+        }
+        let mut cand: Vec<(u32, f64, u32, u8)> =
+            best.into_iter().map(|(st, (c, pi, sy))| (st, c, pi, sy)).collect();
+        cand.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        cand.truncate(beam_width);
+        let mut rec = Vec::with_capacity(cand.len());
+        let mut next_beam = Vec::with_capacity(cand.len());
+        for (st, c, pi, sy) in cand {
+            rec.push((st, pi, sy));
+            next_beam.push((st, c));
+        }
+        steps.push(rec);
+        beam = next_beam;
+    }
+
+    // Best final beam slot, then backtrack.
+    let mut best_idx = 0usize;
+    let mut best_cost = f64::INFINITY;
+    for (i, &(_, c)) in beam.iter().enumerate() {
+        if c < best_cost {
+            best_cost = c;
+            best_idx = i;
+        }
+    }
+    let mut symbols = vec![0u8; n];
+    let mut idx = best_idx;
+    for step in (0..n).rev() {
+        let (_, prev_idx, sym) = steps[step][idx];
+        symbols[step] = sym;
+        idx = prev_idx as usize;
+    }
+    symbols
+}
+
 /// Per-group scale: RMS of the rotated weights (codebook is unit-variance,
 /// zero-mean, so RMS ≈ the optimal single scale for ≈Gaussian input). Used to
 /// drive the Viterbi search; refine with `optimal_scale` after encoding.
@@ -391,6 +461,23 @@ mod tests {
             q / bound,
         );
         assert!(q < u2, "QTIP-2 must beat uniform-2 on real weights");
+    }
+
+    #[test]
+    fn beam_encode_is_near_viterbi() {
+        let cb = build_codebook();
+        let mut rng = Lcg(0xBEEF_F00D);
+        let group: Vec<f32> = (0..256).map(|_| rng.next_normal()).collect();
+        let scale = group_scale(&group);
+        let vit = mse(&group, &decode_group(&encode_group(&group, scale, &cb), scale, &cb));
+        let beam = mse(
+            &group,
+            &decode_group(&beam_encode_group(&group, scale, &cb, 128), scale, &cb),
+        );
+        eprintln!("viterbi MSE={vit:.6}  beam128 MSE={beam:.6}  (beam/vit={:.4})", beam / vit);
+        // Beam (128) within ~6% of full Viterbi — the price for ~30× speed that
+        // makes full-model encoding feasible. (beam=64 measured ~5.3%.)
+        assert!(beam <= vit * 1.06, "beam128 MSE {beam:.6} not within 6% of Viterbi {vit:.6}");
     }
 
     #[test]
