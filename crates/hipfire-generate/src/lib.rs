@@ -224,6 +224,67 @@ pub struct Qwen35SemanticBoundaryCheckpoint {
     pub boundary_index: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Qwen35PrefillCheckpointKind<'a> {
+    Final,
+    SemanticBoundary {
+        boundary: &'a str,
+        boundary_index: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen35PrefillCheckpointHook<'a> {
+    pub batch_id: &'a str,
+    pub session_id: &'a str,
+    pub source_state_handle: &'a str,
+    pub logical_position: usize,
+    pub kind: Qwen35PrefillCheckpointKind<'a>,
+    pub prefix_hash: &'a GenerateBatchPrefillPrefixHash,
+}
+
+pub fn qwen35_checkpoint_session_id(
+    batch_id: &str,
+    session_id: &str,
+    logical_position: usize,
+) -> String {
+    format!("qwen35-checkpoint:{batch_id}:{session_id}:{logical_position}")
+}
+
+pub fn qwen35_boundary_checkpoint_session_id(
+    batch_id: &str,
+    session_id: &str,
+    logical_position: usize,
+    boundary_index: usize,
+) -> String {
+    format!(
+        "qwen35-checkpoint:{batch_id}:{session_id}:boundary:{boundary_index}:{logical_position}"
+    )
+}
+
+pub fn qwen35_prefill_checkpoint_session_id(hook: Qwen35PrefillCheckpointHook<'_>) -> String {
+    match hook.kind {
+        Qwen35PrefillCheckpointKind::Final => {
+            qwen35_checkpoint_session_id(hook.batch_id, hook.session_id, hook.logical_position)
+        }
+        Qwen35PrefillCheckpointKind::SemanticBoundary { boundary_index, .. } => {
+            qwen35_boundary_checkpoint_session_id(
+                hook.batch_id,
+                hook.session_id,
+                hook.logical_position,
+                boundary_index,
+            )
+        }
+    }
+}
+
+pub fn qwen35_prefill_checkpoint_boundary_kind(hook: Qwen35PrefillCheckpointHook<'_>) -> &'_ str {
+    match hook.kind {
+        Qwen35PrefillCheckpointKind::Final => "full",
+        Qwen35PrefillCheckpointKind::SemanticBoundary { boundary, .. } => boundary,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct GenerateBatchDecodeEnvelope {
     pub id: String,
@@ -1227,6 +1288,49 @@ mod tests {
                 "boundary": "message_end",
                 "boundary_index": 1
             })
+        );
+    }
+
+    #[test]
+    fn qwen35_prefill_checkpoint_hook_preserves_handle_contract() {
+        let hash = GenerateBatchPrefillPrefixHash {
+            algorithm: "xxh128".to_string(),
+            value: "0123456789abcdef0123456789abcdef".to_string(),
+            prefix_len: 12,
+        };
+        let final_hook = Qwen35PrefillCheckpointHook {
+            batch_id: "batch-a",
+            session_id: "req-1",
+            source_state_handle: "req-1",
+            logical_position: 12,
+            kind: Qwen35PrefillCheckpointKind::Final,
+            prefix_hash: &hash,
+        };
+
+        assert_eq!(final_hook.source_state_handle, "req-1");
+        assert_eq!(final_hook.prefix_hash.prefix_len, 12);
+        assert_eq!(qwen35_prefill_checkpoint_boundary_kind(final_hook), "full");
+        assert_eq!(
+            qwen35_prefill_checkpoint_session_id(final_hook),
+            "qwen35-checkpoint:batch-a:req-1:12"
+        );
+
+        let boundary_hook = Qwen35PrefillCheckpointHook {
+            logical_position: 8,
+            kind: Qwen35PrefillCheckpointKind::SemanticBoundary {
+                boundary: "message_end",
+                boundary_index: 3,
+            },
+            ..final_hook
+        };
+
+        assert_eq!(
+            qwen35_prefill_checkpoint_boundary_kind(boundary_hook),
+            "message_end"
+        );
+        assert_eq!(
+            qwen35_prefill_checkpoint_session_id(boundary_hook),
+            "qwen35-checkpoint:batch-a:req-1:boundary:3:8"
         );
     }
 
