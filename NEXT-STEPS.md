@@ -82,10 +82,21 @@ dense MQ2-Lloyd (0.8B wikitext2 ppl≈19,651; 9B=2,163 vs MQ4=10, MQ3=42).
 This is the known reason QTIP/trellis is the *only* viable 2-bit path. Do
 **not** build kernels for lloyd-mq2 (or lloyd-mq3) — they're dead ends.
 
-- **C1 — QTIP quantizer (offline, first).** New encoder: incoherence
-  (Hadamard) rotation + bitshift-trellis Viterbi encode + computed-codebook
-  design → a QTIP `.hfq` format. Gate iso-bpw `astrea` KLD/PPL vs MQ4/MQ3
-  **before** writing any decode kernel.
+- **C1 — QTIP quantizer (offline).**
+  - **C1a ✅ DONE** — trellis encoder core `crates/hipfire-quantize/src/qtip.rs`:
+    computed Gaussian codebook (splitmix64 hash → Acklam inv-normal-CDF,
+    zero-mean/unit-var), bitshift-trellis sliding-window state, Viterbi
+    `encode_group` + reference `decode_group`. Consumes FWHT-rotated groups
+    (`cpu_fwht_256` = the incoherence step). Unit-tested: beats uniform
+    2-bit MSE by >15% on synthetic Gaussian.
+  - **C1b — real-weights quality gate (next).** Per-tensor reconstruction
+    error (QTIP vs MQ4/MQ3/MQ2) on actual 0.8B weights — a CPU proxy for
+    KLD/PPL that sidesteps the kernel chicken-and-egg (measure fidelity, not
+    a full forward).
+  - **C1c — full-model wiring.** New `--format qtip2` (per-group
+    `encode_group` across 2D weights; beam-search variant for throughput) →
+    QTIP `.hfq` + DType.
+  - **Gate:** `astrea` (or C1b proxy) vs MQ4/MQ3 BEFORE the decode kernel.
 - **C2 — fused QTIP decode GEMV.** Variant of `gemv_mq2g256_lloyd.hip` with
   sliding-window trellis hash (computed codebook → ~zero LDS), reusing
   `rotate_x_mq_awq.hip`. Friction is sub-byte bit-window unpack (LDS stage
