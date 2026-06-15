@@ -135,3 +135,37 @@ Status: deferred.
 
 
 ## further investigate using packed 4 bit operations on gfx1151/RDNA3/RDNA3.5
+
+## DeltaNet state precision (follow-ups to Phase A gate, 2026-06-15)
+
+Phase A made the DeltaNet recurrent state default to **FP32** for all
+current models, gated on redundancy (`head_dim × n_heads`) via
+`qwen35::default_state_quant` (env: `HIPFIRE_DN_STATE_QUANT`,
+`HIPFIRE_DN_STATE_FP32_BELOW`). Two kernels are missing to generalize it:
+
+1. **Real FP16 DeltaNet state kernel.** `StateQuant` is only
+   `{FP32, Q8, Q4}`; there is no `gated_delta_net_f16`. The plan wants
+   FP16 for high-redundancy models (cheaper than FP32, safer than Q8),
+   but it doesn't exist, so the gate currently selects FP32 for the whole
+   upper tier (threshold `usize::MAX`). To finish:
+   - add `StateQuant::FP16` + alloc path in `DeltaNetState::new_with_quant`;
+   - add `gpu.gated_delta_net_f16(...)` + `_batch_seq` / `_routed_batch_seq`
+     dispatch (mirror the FP32 kernels);
+   - coherence-gate the f16 state numerics, then lower the default
+     `HIPFIRE_DN_STATE_FP32_BELOW` so big models use FP16.
+
+2. **Higher-precision tree DeltaNet replay (FP32 *and* FP16).** Tree-mode
+   spec-decode hard-errors on FP32 state (`qwen35.rs`: *"FP32-state batched
+   prefill does not support tree DeltaNet replay yet"*); only
+   `gated_delta_net_q8_tree_batch_seq` exists. Consequence: with the FP32
+   default, tree-based spec-decode (DDTree, DFlash-tree,
+   `spec_step_dflash_mtp_tree`) cannot run — Phase B MTP drafting must use
+   the **non-tree** `spec_step_mtp` path. Future work, both precisions:
+   - `gated_delta_net_f32_tree_batch_seq` — FP32 S-tape replay, unblocks
+     tree drafting at full anchor precision (serves the FP32-forced
+     low-redundancy models like 0.8B directly).
+   - `gated_delta_net_f16_tree_batch_seq` — FP16 S-tape replay, pairs with
+     the FP16 state kernel (item 1) so high-redundancy models can run tree
+     drafting at the cheaper FP16 tier once FP16 coherence is established.
+   Until either lands, tree drafting needs `state_quant=q8` (only safe on
+   high-redundancy models, never 0.8B/2B).

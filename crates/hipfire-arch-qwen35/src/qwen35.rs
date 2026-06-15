@@ -1286,6 +1286,46 @@ pub enum StateQuant {
     Q4,
 }
 
+/// Redundancy proxy for DeltaNet recurrent-state precision:
+/// `linear_key_head_dim × linear_num_value_heads`. The recurrent state is the
+/// most precision-sensitive tensor in the model — its quant error compounds
+/// across the sequence — so low-redundancy models (small `head_dim × n_heads`)
+/// lack the slack to absorb Q8 noise and develop attractors on long decode
+/// (observed on 0.8B/2B). State traffic is only ~1–3% of per-token bandwidth,
+/// so paying FP32 here is nearly free.
+pub fn deltanet_state_redundancy(config: &Qwen35Config) -> usize {
+    config.linear_key_head_dim * config.linear_num_value_heads
+}
+
+/// Redundancy threshold below which the DeltaNet state defaults to FP32.
+/// Env-tunable via `HIPFIRE_DN_STATE_FP32_BELOW`; defaults to `usize::MAX`
+/// ⇒ **FP32 for all current models** (2026-06-15 decision: Q8 caused
+/// long-decode attractors on low-redundancy models and there is no FP16 state
+/// kernel yet — see TODO.md). Lower it (e.g. 3000) to put 0.8B (redundancy
+/// 2048) on FP32 while 9B (4096) / 27B (6144) use Q8.
+pub fn deltanet_state_fp32_below() -> usize {
+    std::env::var("HIPFIRE_DN_STATE_FP32_BELOW")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(usize::MAX)
+}
+
+/// Default DeltaNet state precision, gated on redundancy (`head_dim × n_heads`)
+/// rather than parameter count. Below the threshold → FP32 (the numerical
+/// anchor); at/above → Q8 (+error-feedback). Explicit operator overrides are
+/// handled upstream (daemon `state_quant` param / `HIPFIRE_QWEN35_STATE_QUANT`).
+///
+/// NOTE: FP32 state is unsupported by the **tree** DeltaNet replay path
+/// (`gated_delta_net_q8_tree_batch_seq`); tree-based spec-decode requires Q8.
+/// Use the non-tree MTP/DFlash draft paths with FP32 state. See TODO.md.
+pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
+    if deltanet_state_redundancy(config) < deltanet_state_fp32_below() {
+        StateQuant::FP32
+    } else {
+        StateQuant::Q8
+    }
+}
+
 pub struct DeltaNetState {
     /// S matrix storage — FP32 or Q8 depending on quant mode
     pub s_matrices: Vec<GpuTensor>,
@@ -1312,7 +1352,7 @@ impl DeltaNetState {
     }
 
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config) -> HipResult<Self> {
-        Self::new_with_quant(gpu, config, StateQuant::Q8)
+        Self::new_with_quant(gpu, config, default_state_quant(config))
     }
 
     pub fn new_with_quant(
@@ -28692,6 +28732,24 @@ mod tests {
             shape: vec![1],
             dtype: DType::F32,
         }
+    }
+
+    #[test]
+    fn deltanet_state_gate_keys_on_redundancy() {
+        let cfg = test_qwen35_config_with_layers(vec![LayerType::LinearAttention]);
+        // redundancy = linear_key_head_dim (8) × linear_num_value_heads (1) = 8
+        assert_eq!(deltanet_state_redundancy(&cfg), 8);
+
+        // Default threshold (usize::MAX) ⇒ FP32 for every real model.
+        std::env::remove_var("HIPFIRE_DN_STATE_FP32_BELOW");
+        assert_eq!(default_state_quant(&cfg), StateQuant::FP32);
+
+        // Boundary: redundancy < threshold ⇒ FP32; otherwise Q8.
+        std::env::set_var("HIPFIRE_DN_STATE_FP32_BELOW", "9");
+        assert_eq!(default_state_quant(&cfg), StateQuant::FP32); // 8 < 9
+        std::env::set_var("HIPFIRE_DN_STATE_FP32_BELOW", "8");
+        assert_eq!(default_state_quant(&cfg), StateQuant::Q8); // 8 < 8 is false
+        std::env::remove_var("HIPFIRE_DN_STATE_FP32_BELOW");
     }
 
     #[test]
