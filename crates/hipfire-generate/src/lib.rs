@@ -195,6 +195,70 @@ pub struct ErrorEvent {
     pub response_id: Option<String>,
 }
 
+pub fn openai_chat_completion_response_json(
+    req_id: &str,
+    model: &str,
+    text: &str,
+    done: &DoneEvent,
+) -> serde_json::Value {
+    let prompt_tokens = done.prefill_tokens.unwrap_or(0);
+    let completion_tokens = done.tokens;
+
+    serde_json::json!({
+        "id": format!("chatcmpl-{req_id}"),
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": text },
+            "finish_reason": openai_finish_reason(done),
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+    })
+}
+
+pub fn openai_chat_completion_token_chunk_json(
+    req_id: &str,
+    model: &str,
+    token: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("chatcmpl-{req_id}"),
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": { "role": "assistant", "content": token },
+            "finish_reason": null
+        }]
+    })
+}
+
+pub fn openai_chat_completion_done_chunk_json(
+    req_id: &str,
+    model: &str,
+    done: &DoneEvent,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("chatcmpl-{req_id}"),
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": openai_finish_reason(done)
+        }]
+    })
+}
+
+fn openai_finish_reason(done: &DoneEvent) -> &str {
+    done.finish_reason.as_deref().unwrap_or("stop")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GenerateBatchPrefillEnvelope {
     pub id: String,
@@ -1548,6 +1612,86 @@ mod tests {
                 "tokens": 42,
                 "tok_s": 44.5,
                 "finish_reason": "stop"
+            })
+        );
+    }
+
+    #[test]
+    fn openai_chat_completion_response_json_matches_server_shape() {
+        let done = DoneEvent {
+            id: "r1".to_string(),
+            tokens: 12,
+            tok_s: Some(20.0),
+            prefill_tokens: Some(5),
+            prefill_ms: None,
+            prefill_tok_s: None,
+            decode_tok_s: None,
+            ttft_ms: None,
+            finish_reason: Some("length".to_string()),
+            response_id: None,
+            extra: HashMap::new(),
+        };
+
+        assert_eq!(
+            openai_chat_completion_response_json("req-1", "qwen", "hello", &done),
+            serde_json::json!({
+                "id": "chatcmpl-req-1",
+                "object": "chat.completion",
+                "model": "qwen",
+                "choices": [{
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "hello" },
+                    "finish_reason": "length"
+                }],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 12,
+                    "total_tokens": 17
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn openai_chat_completion_stream_chunks_match_server_shape() {
+        let done = DoneEvent {
+            id: "r1".to_string(),
+            tokens: 1,
+            tok_s: None,
+            prefill_tokens: None,
+            prefill_ms: None,
+            prefill_tok_s: None,
+            decode_tok_s: None,
+            ttft_ms: None,
+            finish_reason: None,
+            response_id: None,
+            extra: HashMap::new(),
+        };
+
+        assert_eq!(
+            openai_chat_completion_token_chunk_json("req-1", "qwen", "T"),
+            serde_json::json!({
+                "id": "chatcmpl-req-1",
+                "object": "chat.completion.chunk",
+                "model": "qwen",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": "T" },
+                    "finish_reason": null
+                }]
+            })
+        );
+        assert_eq!(
+            openai_chat_completion_done_chunk_json("req-1", "qwen", &done),
+            serde_json::json!({
+                "id": "chatcmpl-req-1",
+                "object": "chat.completion.chunk",
+                "model": "qwen",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
             })
         );
     }

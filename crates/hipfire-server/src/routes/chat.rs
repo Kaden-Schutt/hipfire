@@ -17,6 +17,10 @@ use crate::state::SharedState;
 use hipfire_config::HipfireConfig;
 use hipfire_daemon_adapter::{find_daemon_bin_or_error, DaemonEngine};
 use hipfire_daemon_protocol::{GenerateRequest, GenerationSamplingPolicy, LoadParams};
+use hipfire_generate::{
+    openai_chat_completion_done_chunk_json, openai_chat_completion_response_json,
+    openai_chat_completion_token_chunk_json,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
@@ -164,27 +168,10 @@ async fn blocking_chat(state: SharedState, body: ChatRequest) -> impl IntoRespon
     };
 
     match engine.generate(gen_req).await {
-        Ok((text, done)) => {
-            let finish_reason = done.finish_reason.as_deref().unwrap_or("stop");
-            let prompt_tokens = done.prefill_tokens.unwrap_or(0);
-            let completion_tokens = done.tokens;
-            Json(json!({
-                "id": format!("chatcmpl-{req_id}"),
-                "object": "chat.completion",
-                "model": model_arg,
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": text },
-                    "finish_reason": finish_reason,
-                }],
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens,
-                }
-            }))
-            .into_response()
-        }
+        Ok((text, done)) => Json(openai_chat_completion_response_json(
+            &req_id, &model_arg, &text, &done,
+        ))
+        .into_response(),
         Err(e) => Json(json!({"error": {"message": e.to_string(), "type": "server_error"}}))
             .into_response(),
     }
@@ -259,24 +246,15 @@ async fn stream_chat(state: SharedState, body: ChatRequest) -> impl IntoResponse
 
         let result = engine
             .generate_streaming(gen_req, move |token| {
-                let chunk = json!({
-                    "id": format!("chatcmpl-{req_id_cb}"),
-                    "object": "chat.completion.chunk",
-                    "model": model_cb,
-                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": null}]
-                });
-                let _ = tx_cb.try_send(Ok(Event::default().data(serde_json::to_string(&chunk).unwrap())));
+                let chunk = openai_chat_completion_token_chunk_json(&req_id_cb, &model_cb, &token);
+                let _ = tx_cb.try_send(Ok(
+                    Event::default().data(serde_json::to_string(&chunk).unwrap())
+                ));
             })
             .await;
 
         if let Ok(done) = result {
-            let finish_reason = done.finish_reason.as_deref().unwrap_or("stop");
-            let final_chunk = json!({
-                "id": format!("chatcmpl-{req_id}"),
-                "object": "chat.completion.chunk",
-                "model": model_arg,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
-            });
+            let final_chunk = openai_chat_completion_done_chunk_json(&req_id, &model_arg, &done);
             let _ = tx
                 .send(Ok(
                     Event::default().data(serde_json::to_string(&final_chunk).unwrap())

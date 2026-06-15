@@ -1045,6 +1045,7 @@ dependencies = [
  "hipfire-config",
  "hipfire-daemon-adapter",
  "hipfire-daemon-protocol",
+ "hipfire-generate",
  "hipfire-model",
  "hipfire-prompt",
  "hipfire-scheduler",
