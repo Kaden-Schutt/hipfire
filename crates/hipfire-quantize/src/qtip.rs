@@ -217,21 +217,27 @@ mod tests {
             / a.len() as f64
     }
 
-    /// Uniform 2-bit (4-level) per-group quantize+dequant, matching the
-    /// `quantize_mq2g256` packing math — the baseline QTIP must beat.
-    fn uniform2_roundtrip(group: &[f32]) -> Vec<f32> {
+    /// Uniform n-bit (`2^bits`-level) per-group quantize+dequant, matching the
+    /// MQ packing math — the baseline QTIP must beat. `bits=2` is the iso-bpw
+    /// rival; `bits=3` is the quality target (QTIP-2 ≈ uniform-3 = the win).
+    fn uniform_nbit_roundtrip(group: &[f32], bits: u32) -> Vec<f32> {
+        let levels = (1u32 << bits) as f32;
         let min_v = group.iter().cloned().fold(f32::INFINITY, f32::min);
         let max_v = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let range = max_v - min_v;
-        let scale = if range > 0.0 { range / 3.0 } else { 1.0 };
+        let scale = if range > 0.0 { range / (levels - 1.0) } else { 1.0 };
         let inv = if range > 0.0 { 1.0 / scale } else { 0.0 };
         group
             .iter()
             .map(|&w| {
-                let q = (((w - min_v) * inv + 0.5) as i32).clamp(0, 3) as f32;
+                let q = (((w - min_v) * inv + 0.5) as i32).clamp(0, (levels as i32) - 1) as f32;
                 min_v + q * scale
             })
             .collect()
+    }
+
+    fn uniform2_roundtrip(group: &[f32]) -> Vec<f32> {
+        uniform_nbit_roundtrip(group, 2)
     }
 
     #[test]
@@ -241,6 +247,115 @@ mod tests {
         let var = cb.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / cb.len() as f64;
         assert!(mean.abs() < 1e-5, "codebook mean {mean}");
         assert!((var - 1.0).abs() < 1e-3, "codebook var {var}");
+    }
+
+    /// Position QTIP-2 between uniform-2 (iso-bpw rival, must beat) and
+    /// uniform-3 (quality target). CURRENT first-cut codebook (random-hash
+    /// Gaussian, STATE_BITS=12, RMS scale): beats uniform-2 but does NOT yet
+    /// reach uniform-3 — ~1.9× its MSE on Gaussian. Closing that gap to
+    /// uniform-3 parity (the bandwidth win) is C1 codebook/trellis tuning:
+    /// tuned hash (paper's 1MAD/3INST), larger STATE_BITS, joint scale search.
+    /// This test asserts only the validated claim (beats uniform-2) and
+    /// reports the uniform-3 gap so regressions/improvements are visible.
+    #[test]
+    fn qtip2_beats_uniform2_reports_uniform3_gap() {
+        let cb = build_codebook();
+        let mut rng = Lcg(0x1234_5678);
+        let group: Vec<f32> = (0..256).map(|_| rng.next_normal()).collect();
+        let scale = group_scale(&group);
+        let qtip = mse(&group, &decode_group(&encode_group(&group, scale, &cb), scale, &cb));
+        let u2 = mse(&group, &uniform_nbit_roundtrip(&group, 2));
+        let u3 = mse(&group, &uniform_nbit_roundtrip(&group, 3));
+        eprintln!(
+            "QTIP-2 MSE={qtip:.5}  uniform-2={u2:.5}  uniform-3={u3:.5}  \
+             (QTIP/u2={:.3}, QTIP/u3={:.3})",
+            qtip / u2,
+            qtip / u3,
+        );
+        assert!(qtip < u2, "QTIP-2 must beat uniform-2 (iso-bpw)");
+    }
+
+    /// C1b real-weights quality gate. Env-gated (needs a local safetensors
+    /// file); skips cleanly in CI. Reads the first large 2D BF16 weight,
+    /// FWHT-rotates each 256-group via the engine's sign tables, and reports
+    /// aggregate reconstruction MSE for QTIP-2 vs uniform 2/3-bit.
+    ///   HIPFIRE_QTIP_EVAL_ST=<model.safetensors> cargo test -p hipfire-quantize \
+    ///       real_weights_quality_gate -- --nocapture
+    #[test]
+    fn real_weights_quality_gate() {
+        let path = match std::env::var("HIPFIRE_QTIP_EVAL_ST") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("skip real_weights_quality_gate (set HIPFIRE_QTIP_EVAL_ST)");
+                return;
+            }
+        };
+        let file = std::fs::File::open(&path).expect("open safetensors");
+        let mmap = unsafe { memmap2::Mmap::map(&file).expect("mmap") };
+        let hlen = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value =
+            serde_json::from_slice(&mmap[8..8 + hlen]).expect("parse header");
+        let data_base = 8 + hlen;
+        let obj = header.as_object().unwrap();
+        let mut chosen: Option<(String, Vec<usize>)> = None;
+        for (name, meta) in obj {
+            if name == "__metadata__" {
+                continue;
+            }
+            let dt = meta["dtype"].as_str().unwrap_or("");
+            let shape = meta["shape"].as_array().map(|a| a.len()).unwrap_or(0);
+            if shape == 2 && dt == "BF16" {
+                let off: Vec<usize> = meta["data_offsets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_u64().unwrap() as usize)
+                    .collect();
+                if off[1] - off[0] >= 262144 * 2 {
+                    chosen = Some((name.clone(), off));
+                    break;
+                }
+            }
+        }
+        let (name, off) = chosen.expect("no large 2D BF16 weight found");
+        let bytes = &mmap[data_base + off[0]..data_base + off[1]];
+        // BF16 → f32; cap at 256 groups (65536 weights) for a fast gate.
+        let weights: Vec<f32> = bytes
+            .chunks_exact(2)
+            .take(256 * 256)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect();
+
+        let cb = build_codebook();
+        let signs1 = crate::gen_fwht_signs(42, 256);
+        let signs2 = crate::gen_fwht_signs(1042, 256);
+        let (mut q_acc, mut u2_acc, mut u3_acc, mut groups) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+        for chunk in weights.chunks(256) {
+            if chunk.len() < 256 {
+                break;
+            }
+            let mut g = [0.0f32; 256];
+            g.copy_from_slice(chunk);
+            crate::cpu_fwht_256(&mut g, &signs1, &signs2);
+            let scale = group_scale(&g);
+            q_acc += mse(&g, &decode_group(&encode_group(&g, scale, &cb), scale, &cb));
+            u2_acc += mse(&g, &uniform_nbit_roundtrip(&g, 2));
+            u3_acc += mse(&g, &uniform_nbit_roundtrip(&g, 3));
+            groups += 1;
+        }
+        let (q, u2, u3) = (
+            q_acc / groups as f64,
+            u2_acc / groups as f64,
+            u3_acc / groups as f64,
+        );
+        eprintln!(
+            "QTIP real-weights gate: tensor={name} groups={groups}\n  \
+             QTIP-2 MSE={q:.6}  uniform-2 MSE={u2:.6}  uniform-3 MSE={u3:.6}\n  \
+             QTIP-2/uniform-2={:.3}  QTIP-2/uniform-3={:.3}",
+            q / u2,
+            q / u3,
+        );
+        assert!(q < u2, "QTIP-2 must beat uniform-2 on real weights");
     }
 
     #[test]
