@@ -2100,10 +2100,22 @@ fn try_npu_headnorm_rope(
     let k_f32 = gpu.download_f32(fa_k)?;
     let qw_f32 = gpu.download_f32(q_norm)?;
     let kw_f32 = gpu.download_f32(k_norm)?;
-    let q_bf16: Vec<u16> = q_f32.iter().map(|&v| ffn_bf16::f32_to_bf16_bits_rne(v)).collect();
-    let k_bf16: Vec<u16> = k_f32.iter().map(|&v| ffn_bf16::f32_to_bf16_bits_rne(v)).collect();
-    let qw_bf16: Vec<u16> = qw_f32.iter().map(|&v| ffn_bf16::f32_to_bf16_bits_rne(v)).collect();
-    let kw_bf16: Vec<u16> = kw_f32.iter().map(|&v| ffn_bf16::f32_to_bf16_bits_rne(v)).collect();
+    let q_bf16: Vec<u16> = q_f32
+        .iter()
+        .map(|&v| ffn_bf16::f32_to_bf16_bits_rne(v))
+        .collect();
+    let k_bf16: Vec<u16> = k_f32
+        .iter()
+        .map(|&v| ffn_bf16::f32_to_bf16_bits_rne(v))
+        .collect();
+    let qw_bf16: Vec<u16> = qw_f32
+        .iter()
+        .map(|&v| ffn_bf16::f32_to_bf16_bits_rne(v))
+        .collect();
+    let kw_bf16: Vec<u16> = kw_f32
+        .iter()
+        .map(|&v| ffn_bf16::f32_to_bf16_bits_rne(v))
+        .collect();
     let mut q_out = vec![0u16; q_n];
     let mut k_out = vec![0u16; k_n];
     let q_ok = unsafe { xdna1_ffi::headnorm_rope_q_run(hq, &q_bf16, &qw_bf16, &cs, &mut q_out) };
@@ -2113,12 +2125,10 @@ fn try_npu_headnorm_rope(
     }
     let q_f32_out: Vec<f32> = q_out.iter().map(|&b| bf16_to_f32(b)).collect();
     let k_f32_out: Vec<f32> = k_out.iter().map(|&b| bf16_to_f32(b)).collect();
-    let q_bytes = unsafe {
-        std::slice::from_raw_parts(q_f32_out.as_ptr().cast::<u8>(), q_f32_out.len() * 4)
-    };
-    let k_bytes = unsafe {
-        std::slice::from_raw_parts(k_f32_out.as_ptr().cast::<u8>(), k_f32_out.len() * 4)
-    };
+    let q_bytes =
+        unsafe { std::slice::from_raw_parts(q_f32_out.as_ptr().cast::<u8>(), q_f32_out.len() * 4) };
+    let k_bytes =
+        unsafe { std::slice::from_raw_parts(k_f32_out.as_ptr().cast::<u8>(), k_f32_out.len() * 4) };
     gpu.hip.memcpy_htod(&fa_q.buf, q_bytes)?;
     gpu.hip.memcpy_htod(&fa_k.buf, k_bytes)?;
     eprintln!("[xdna1] layer={layer_idx} npu headnorm_rope q+k ok");
@@ -21068,11 +21078,18 @@ fn run_fa_layer_body(
         false
     } else {
         try_npu_headnorm_rope(
-            gpu, layer_idx,
-            &s.fa_q, &s.fa_k,
-            &layer.q_norm, &layer.k_norm,
-            config.n_heads, config.n_kv_heads,
-            config.head_dim, n_rot, config.rope_theta, pos,
+            gpu,
+            layer_idx,
+            &s.fa_q,
+            &s.fa_k,
+            &layer.q_norm,
+            &layer.k_norm,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            n_rot,
+            config.rope_theta,
+            pos,
         )?
     };
     if !npu_hnr_ok {
@@ -22976,25 +22993,49 @@ fn forward_scratch_layers(
                     config.norm_eps,
                 )?;
 
-                gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate,
-                    config.n_heads, config.head_dim)?;
+                gpu.deinterleave_f32(
+                    &s.fa_q_full,
+                    &s.fa_q,
+                    &s.fa_gate,
+                    config.n_heads,
+                    config.head_dim,
+                )?;
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 let npu_hnr_ok = if hipfire_runtime::triattn::tap_enabled() {
                     false
                 } else {
                     try_npu_headnorm_rope(
-                        gpu, layer_idx,
-                        &s.fa_q, &s.fa_k,
-                        &layer.q_norm, &layer.k_norm,
-                        config.n_heads, config.n_kv_heads,
-                        config.head_dim, n_rot, config.rope_theta, pos,
+                        gpu,
+                        layer_idx,
+                        &s.fa_q,
+                        &s.fa_k,
+                        &layer.q_norm,
+                        &layer.k_norm,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n_rot,
+                        config.rope_theta,
+                        pos,
                     )?
                 };
                 if !npu_hnr_ok {
-                    gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q,
-                        config.n_heads, config.head_dim, config.norm_eps)?;
-                    gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k,
-                        config.n_kv_heads, config.head_dim, config.norm_eps)?;
+                    gpu.rmsnorm_batched(
+                        &s.fa_q,
+                        &layer.q_norm,
+                        &s.fa_q,
+                        config.n_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    )?;
+                    gpu.rmsnorm_batched(
+                        &s.fa_k,
+                        &layer.k_norm,
+                        &s.fa_k,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    )?;
                     if hipfire_runtime::triattn::tap_enabled() {
                         triattn_tap(gpu, layer_idx, &s, config)?;
                     }
@@ -24189,25 +24230,49 @@ fn forward_scratch_layers(
                     gpu,
                     &format!("layer {layer_idx} FullAttnMoe k norm done"),
                 )?;
-                gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate,
-                    config.n_heads, config.head_dim)?;
+                gpu.deinterleave_f32(
+                    &s.fa_q_full,
+                    &s.fa_q,
+                    &s.fa_gate,
+                    config.n_heads,
+                    config.head_dim,
+                )?;
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 let npu_hnr_ok = if hipfire_runtime::triattn::tap_enabled() {
                     false
                 } else {
                     try_npu_headnorm_rope(
-                        gpu, layer_idx,
-                        &s.fa_q, &s.fa_k,
-                        &layer.q_norm, &layer.k_norm,
-                        config.n_heads, config.n_kv_heads,
-                        config.head_dim, n_rot, config.rope_theta, pos,
+                        gpu,
+                        layer_idx,
+                        &s.fa_q,
+                        &s.fa_k,
+                        &layer.q_norm,
+                        &layer.k_norm,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n_rot,
+                        config.rope_theta,
+                        pos,
                     )?
                 };
                 if !npu_hnr_ok {
-                    gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q,
-                        config.n_heads, config.head_dim, config.norm_eps)?;
-                    gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k,
-                        config.n_kv_heads, config.head_dim, config.norm_eps)?;
+                    gpu.rmsnorm_batched(
+                        &s.fa_q,
+                        &layer.q_norm,
+                        &s.fa_q,
+                        config.n_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    )?;
+                    gpu.rmsnorm_batched(
+                        &s.fa_k,
+                        &layer.k_norm,
+                        &s.fa_k,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    )?;
                     if hipfire_runtime::triattn::tap_enabled() {
                         triattn_tap(gpu, layer_idx, s, config)?;
                     }
@@ -25663,21 +25728,49 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     LayerWeights::FullAttnMoe(l) => (&l.q_norm, &l.k_norm),
                     _ => return Err(HipError::new(0, "ATTEND_FULL on non-FullAttn layer")),
                 };
-                gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
+                gpu.deinterleave_f32(
+                    &s.fa_q_full,
+                    &s.fa_q,
+                    &s.fa_gate,
+                    config.n_heads,
+                    config.head_dim,
+                )?;
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 let npu_hnr_ok = if hipfire_runtime::triattn::tap_enabled() {
                     false
                 } else {
                     try_npu_headnorm_rope(
-                        gpu, self.layer_idx,
-                        &s.fa_q, &s.fa_k, q_norm, k_norm,
-                        config.n_heads, config.n_kv_heads,
-                        config.head_dim, n_rot, config.rope_theta, self.pos,
+                        gpu,
+                        self.layer_idx,
+                        &s.fa_q,
+                        &s.fa_k,
+                        q_norm,
+                        k_norm,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n_rot,
+                        config.rope_theta,
+                        self.pos,
                     )?
                 };
                 if !npu_hnr_ok {
-                    gpu.rmsnorm_batched(&s.fa_q, q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
-                    gpu.rmsnorm_batched(&s.fa_k, k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+                    gpu.rmsnorm_batched(
+                        &s.fa_q,
+                        q_norm,
+                        &s.fa_q,
+                        config.n_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    )?;
+                    gpu.rmsnorm_batched(
+                        &s.fa_k,
+                        k_norm,
+                        &s.fa_k,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        config.norm_eps,
+                    )?;
                     if hipfire_runtime::triattn::tap_enabled() {
                         triattn_tap(gpu, self.layer_idx, s, config)?;
                     }
@@ -25686,8 +25779,14 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
                     }
                     gpu.rope_partial_interleaved_f32(
-                        &s.fa_q, &s.fa_k, &s.pos_buf, config.n_heads, config.n_kv_heads,
-                        config.head_dim, n_rot, config.rope_theta,
+                        &s.fa_q,
+                        &s.fa_k,
+                        &s.pos_buf,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n_rot,
+                        config.rope_theta,
                     )?;
                 }
                 if self.kv_cache.compact_offset > 0 {

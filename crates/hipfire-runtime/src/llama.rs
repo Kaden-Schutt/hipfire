@@ -778,7 +778,8 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         if w.gpu_dtype == DType::BF16 {
             return gpu.gemm_bf16_x_bf16_wmma(&w.buf, x, y, w.m, w.k, 1);
         }
-        return gemv.run_auto(&ctx, gpu, &wr, x, y)
+        return gemv
+            .run_auto(&ctx, gpu, &wr, x, y)
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
     }
 
