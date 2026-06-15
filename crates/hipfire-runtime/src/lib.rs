@@ -45,6 +45,10 @@ pub mod prompt_frame {
             crate::tokenizer::Tokenizer::special_token_id(self, content)
         }
 
+        fn special_tokens(&self) -> &[(String, u32)] {
+            crate::tokenizer::Tokenizer::special_tokens(self)
+        }
+
         fn bos_token_text(&self) -> String {
             let bytes = self.decode_bytes(&[self.bos_id]);
             String::from_utf8_lossy(&bytes).to_string()
