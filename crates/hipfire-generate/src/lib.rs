@@ -1336,6 +1336,34 @@ pub fn qwen35_decode_batch_scheduler_metadata(
     }
 }
 
+pub fn qwen35_generate_batch_decode_step_done_json(
+    envelope: &GenerateBatchDecodeEnvelope,
+    step_result: &Qwen35DecodeBatchStepResult,
+    backend: Qwen35DecodeBatchBackend,
+    scheduler_metadata: &Qwen35DecodeBatchSchedulerMetadata,
+    elapsed_ms: f64,
+    resident_sessions: usize,
+    model_worker: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "generate_batch_decode_step_done",
+        "id": envelope.id,
+        "batch_id": envelope.batch_id,
+        "sessions": envelope.session_count,
+        "backend": backend.as_str(),
+        "selected_backend": scheduler_metadata.selected_backend,
+        "batch_size": scheduler_metadata.batch_size,
+        "compatible_state_kinds": scheduler_metadata.compatible_state_kinds,
+        "cached_prefix_tokens": scheduler_metadata.cached_prefix_tokens,
+        "fallback_reason": scheduler_metadata.fallback_reason,
+        "chunk_count": step_result.chunk_count,
+        "chunk_size": step_result.chunk_size,
+        "elapsed_ms": elapsed_ms,
+        "resident_sessions": resident_sessions,
+        "model_worker": model_worker,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerationTiming {
     pub prefill_tokens: Option<u32>,
@@ -2044,5 +2072,57 @@ mod tests {
             8,
         );
         assert_eq!(requested.fallback_reason, "requested_serial_reference");
+    }
+
+    #[test]
+    fn qwen35_decode_step_done_json_shape_is_stable() {
+        let envelope = GenerateBatchDecodeEnvelope {
+            id: "decode-1".to_string(),
+            batch_id: "batch-1".to_string(),
+            session_count: 2,
+            cached_prefix_tokens: 16,
+            sessions: Vec::new(),
+        };
+        let step_result = Qwen35DecodeBatchStepResult {
+            session_lines: Vec::new(),
+            chunk_count: 2,
+            chunk_size: 1,
+        };
+        let metadata = qwen35_decode_batch_scheduler_metadata(
+            "auto",
+            ARCH_ID_QWEN35_DENSE,
+            Qwen35DecodeBatchBackend::FusedDenseLayerChunked,
+            2,
+            16,
+        );
+
+        assert_eq!(
+            qwen35_generate_batch_decode_step_done_json(
+                &envelope,
+                &step_result,
+                Qwen35DecodeBatchBackend::FusedDenseLayerChunked,
+                &metadata,
+                4.25,
+                3,
+                serde_json::json!({"id": "worker-a"}),
+            ),
+            serde_json::json!({
+                "type": "generate_batch_decode_step_done",
+                "id": "decode-1",
+                "batch_id": "batch-1",
+                "sessions": 2,
+                "backend": "fused_dense_layer_chunked",
+                "selected_backend": "fused_dense_layer_chunked",
+                "batch_size": 2,
+                "compatible_state_kinds": ["attention_kv", "deltanet_recurrent"],
+                "cached_prefix_tokens": 16,
+                "fallback_reason": "none",
+                "chunk_count": 2,
+                "chunk_size": 1,
+                "elapsed_ms": 4.25,
+                "resident_sessions": 3,
+                "model_worker": {"id": "worker-a"}
+            })
+        );
     }
 }

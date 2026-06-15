@@ -45,8 +45,8 @@ use hipfire_generate::{
     build_qwen35_fused_dense_prefill_batch_contract, compute_qwen35_prefix_hash,
     plan_generate_batch_prefill_qwen35, prefix_hash_preflight_done_json,
     qwen35_decode_batch_requested_auto, qwen35_decode_batch_scheduler_metadata,
-    qwen35_fused_prefill_boundary_cuts, qwen35_generate_batch_prefill_done_json,
-    qwen35_generate_batch_prefill_session_done_json,
+    qwen35_fused_prefill_boundary_cuts, qwen35_generate_batch_decode_step_done_json,
+    qwen35_generate_batch_prefill_done_json, qwen35_generate_batch_prefill_session_done_json,
     qwen35_grouped_moe_decode_auto_latency_gate_passed, qwen35_prefill_checkpoint_boundary_kind,
     qwen35_prefill_checkpoint_session_id, qwen35_prefill_scratch_target_batch,
     select_qwen35_decode_batch_backend, select_qwen35_prefill_batch_backend,
@@ -6288,7 +6288,7 @@ fn run_generate_batch_decode_step_qwen35(
             )?
         }
     };
-    for line in step_result.session_lines {
+    for line in &step_result.session_lines {
         let _ = writeln!(stdout, "{line}");
     }
     let worker = loaded_model_worker_runtime_view(m);
@@ -6299,26 +6299,15 @@ fn run_generate_batch_decode_step_qwen35(
         envelope.session_count,
         envelope.cached_prefix_tokens,
     );
-    let done = serde_json::json!({
-        "type": "generate_batch_decode_step_done",
-        "id": envelope.id,
-        "batch_id": envelope.batch_id,
-        "sessions": envelope.session_count,
-        "backend": backend.as_str(),
-        "selected_backend": scheduler_metadata.selected_backend,
-        "batch_size": scheduler_metadata.batch_size,
-        "compatible_state_kinds": scheduler_metadata.compatible_state_kinds,
-        "cached_prefix_tokens": scheduler_metadata.cached_prefix_tokens,
-        "fallback_reason": scheduler_metadata.fallback_reason,
-        "chunk_count": step_result.chunk_count,
-        "chunk_size": step_result.chunk_size,
-        "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0,
-        "resident_sessions": sequence_state_arena_resident_session_count(
-            loaded_model_state_arena_backend(m),
-            m
-        ),
-        "model_worker": model_worker_runtime_view_json(&worker),
-    });
+    let done = qwen35_generate_batch_decode_step_done_json(
+        envelope,
+        &step_result,
+        backend,
+        &scheduler_metadata,
+        t0.elapsed().as_secs_f64() * 1000.0,
+        sequence_state_arena_resident_session_count(loaded_model_state_arena_backend(m), m),
+        model_worker_runtime_view_json(&worker),
+    );
     let _ = writeln!(stdout, "{done}");
     let _ = stdout.flush();
     Ok(())
