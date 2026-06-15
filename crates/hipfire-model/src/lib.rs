@@ -342,6 +342,24 @@ pub fn model_display_name(path: &Path) -> String {
         .to_string()
 }
 
+pub fn openai_model_list_json<I, P>(models: I) -> Value
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    let data: Vec<Value> = models
+        .into_iter()
+        .map(|path| {
+            serde_json::json!({
+                "id": model_display_name(path.as_ref()),
+                "object": "model",
+            })
+        })
+        .collect();
+
+    serde_json::json!({ "object": "list", "data": data })
+}
+
 /// Derive a filesystem-safe identity stem from a model path or tag.
 pub fn model_artifact_stem(model: &str) -> String {
     let name = Path::new(model)
@@ -811,6 +829,25 @@ mod tests {
         assert_eq!(
             model_display_name(Path::new("qwen3.5-9b-mq4.hfq.tmp")),
             "qwen3.5-9b-mq4.hfq"
+        );
+    }
+
+    #[test]
+    fn openai_model_list_json_matches_server_shape() {
+        let models = [
+            PathBuf::from("/models/qwen3.5-9b-mq4.hfq"),
+            PathBuf::from("/models/qwen3.5-9b-q8.hfq"),
+        ];
+
+        assert_eq!(
+            openai_model_list_json(models.iter()),
+            serde_json::json!({
+                "object": "list",
+                "data": [
+                    { "id": "qwen3.5-9b-mq4", "object": "model" },
+                    { "id": "qwen3.5-9b-q8", "object": "model" }
+                ]
+            })
         );
     }
 

@@ -53,6 +53,7 @@ Current model boundary status:
 - `hipfire-model` owns common model-load request/parameter and loaded-response contracts used by daemon protocol clients and future direct library adapters.
 - `hipfire-model` owns common model-load parameter construction from config values, including `auto` mode elision, explicit `dflash_mode=off`, and empty sidecar filtering, now consumed by both Rust server and CLI run load paths.
 - `hipfire-model` owns eval model-manifest row construction for local-file/tag identity, file/tag hashes, HFQ metadata hashes, architecture IDs, embedded quantization hashes, and model-specific hash/HFQ metadata compatibility helpers consumed by evidence/runtime paths. Its public hash helpers are compatibility re-exports from `hipfire-hash`.
+- `hipfire-model` owns OpenAI-compatible `/v1/models` list response rendering consumed by the Rust server.
 - `hipfire-runtime::model_source` remains a compatibility facade and still owns concrete HFQ/safetensors opener constructors until those loaders move.
 
 Current state boundary status:

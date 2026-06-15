@@ -33,6 +33,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Rust CLI run model-load config conversion now reuses `hipfire-model` parameter construction instead of sending a max-seq-only load bundle.
 - Rust CLI config loading and local model path helpers now reuse `hipfire-config` directly instead of importing those helpers through `hipfire-server`; server keeps a compatibility re-export.
 - Rust server and CLI model discovery now reuse `hipfire-model` local artifact discovery helpers instead of server-local scanning.
+- Rust server `/v1/models` response rendering now reuses `hipfire-model` OpenAI-compatible list rendering instead of route-local JSON construction.
 - Eval DFlash draft auto-discovery now reuses `hipfire-model` sidecar discovery instead of eval-local candidate parsing.
 - Rust scheduler worker-key identity and compatibility helpers now reuse `hipfire-model` ownership instead of scheduler-local model identity code.
 - Rust scheduler policy parity tests now cover remaining Bun policy cases for realtime dispatch, legacy wait mapping, opportunistic pairing, spill gating, and clamped residency/spill limits.
