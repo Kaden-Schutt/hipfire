@@ -51,6 +51,29 @@ impl DenseFfnBackend {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendSelection {
+    pub preferred_backend: DenseFfnBackendPreference,
+    pub selected_backend: DenseFfnBackend,
+    pub oracle_backend: DenseFfnBackend,
+    pub fallback_reason: Option<&'static str>,
+}
+
+impl BackendSelection {
+    pub fn new(
+        preferred_backend: DenseFfnBackendPreference,
+        selected_backend: DenseFfnBackend,
+        fallback_reason: Option<&'static str>,
+    ) -> Self {
+        Self {
+            preferred_backend,
+            selected_backend,
+            oracle_backend: DenseFfnBackend::CpuOracle,
+            fallback_reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseFfnTensorContract {
     pub residual_len: usize,
     pub gate_len: usize,
@@ -208,6 +231,15 @@ pub fn dense_ffn_backend_decision(
     }
 }
 
+pub fn dense_ffn_backend_selection(
+    preferred_backend: DenseFfnBackendPreference,
+    npu_available: bool,
+) -> BackendSelection {
+    let (selected_backend, fallback_reason) =
+        dense_ffn_backend_decision(preferred_backend, npu_available);
+    BackendSelection::new(preferred_backend, selected_backend, fallback_reason)
+}
+
 pub fn dense_ffn_module_invocation(
     layer_idx: usize,
     shadow: &Bf16DownShadow,
@@ -262,6 +294,15 @@ pub fn dense_ffn_module_evidence(
     }
 }
 
+pub fn dense_ffn_module_backend_selection(evidence: &DenseFfnModuleEvidence) -> BackendSelection {
+    BackendSelection {
+        preferred_backend: evidence.preferred_backend,
+        selected_backend: evidence.selected_backend,
+        oracle_backend: evidence.oracle_backend,
+        fallback_reason: evidence.fallback_reason,
+    }
+}
+
 pub fn dense_ffn_module_output(
     invocation: &DenseFfnModuleInvocation,
     drift: Option<DiffStats>,
@@ -288,14 +329,24 @@ pub fn diff_stats_json(stats: DiffStats) -> Value {
     })
 }
 
+pub fn backend_selection_json(selection: BackendSelection) -> Value {
+    json!({
+        "preferred_backend": selection.preferred_backend.as_str(),
+        "selected_backend": selection.selected_backend.as_str(),
+        "oracle_backend": selection.oracle_backend.as_str(),
+        "fallback_reason": selection.fallback_reason,
+    })
+}
+
 pub fn dense_ffn_module_evidence_json(evidence: &DenseFfnModuleEvidence) -> Value {
+    let selection = backend_selection_json(dense_ffn_module_backend_selection(evidence));
     let mut value = json!({
         "module_kind": evidence.module_kind,
         "module_id": evidence.module_id,
-        "preferred_backend": evidence.preferred_backend.as_str(),
-        "selected_backend": evidence.selected_backend.as_str(),
-        "oracle_backend": evidence.oracle_backend.as_str(),
-        "fallback_reason": evidence.fallback_reason,
+        "preferred_backend": selection["preferred_backend"].clone(),
+        "selected_backend": selection["selected_backend"].clone(),
+        "oracle_backend": selection["oracle_backend"].clone(),
+        "fallback_reason": selection["fallback_reason"].clone(),
     });
     if let Some(drift) = evidence.drift {
         value["drift"] = diff_stats_json(drift);
@@ -373,14 +424,24 @@ pub fn projection_module_output(invocation: &ProjectionModuleInvocation) -> Proj
     }
 }
 
+pub fn projection_module_backend_selection(output: &ProjectionModuleOutput) -> BackendSelection {
+    BackendSelection {
+        preferred_backend: output.preferred_backend,
+        selected_backend: output.selected_backend,
+        oracle_backend: output.oracle_backend,
+        fallback_reason: output.fallback_reason,
+    }
+}
+
 pub fn projection_module_output_json(output: &ProjectionModuleOutput) -> Value {
+    let selection = backend_selection_json(projection_module_backend_selection(output));
     json!({
         "module_kind": output.module_kind,
         "module_id": output.module_id,
-        "preferred_backend": output.preferred_backend.as_str(),
-        "selected_backend": output.selected_backend.as_str(),
-        "oracle_backend": output.oracle_backend.as_str(),
-        "fallback_reason": output.fallback_reason,
+        "preferred_backend": selection["preferred_backend"].clone(),
+        "selected_backend": selection["selected_backend"].clone(),
+        "oracle_backend": selection["oracle_backend"].clone(),
+        "fallback_reason": selection["fallback_reason"].clone(),
         "mutates_residual": output.mutates_residual,
     })
 }
@@ -559,6 +620,19 @@ mod tests {
                 Some("npu_backend_unavailable")
             )
         );
+
+        let selection = dense_ffn_backend_selection(DenseFfnBackendPreference::NpuOptIn, false);
+        assert_eq!(
+            selection.preferred_backend,
+            DenseFfnBackendPreference::NpuOptIn
+        );
+        assert_eq!(selection.selected_backend, DenseFfnBackend::GpuProduction);
+        assert_eq!(selection.oracle_backend, DenseFfnBackend::CpuOracle);
+        assert_eq!(selection.fallback_reason, Some("npu_backend_unavailable"));
+        assert_eq!(
+            backend_selection_json(selection)["fallback_reason"],
+            "npu_backend_unavailable"
+        );
     }
 
     #[test]
@@ -590,6 +664,10 @@ mod tests {
         assert_eq!(evidence.oracle_backend, DenseFfnBackend::CpuOracle);
         assert_eq!(evidence.fallback_reason, Some("test_fallback"));
         assert_eq!(evidence.drift.unwrap().max_abs, 0.25);
+        assert_eq!(
+            dense_ffn_module_backend_selection(&evidence).selected_backend,
+            DenseFfnBackend::GpuProduction
+        );
 
         let json = dense_ffn_module_evidence_json(&evidence);
         assert_eq!(json["module_kind"], "qwen35_dense_ffn_swiglu_down");
@@ -655,6 +733,10 @@ mod tests {
         assert_eq!(invocation.selected_backend, DenseFfnBackend::GpuProduction);
 
         let output = projection_module_output(&invocation);
+        assert_eq!(
+            projection_module_backend_selection(&output).preferred_backend,
+            DenseFfnBackendPreference::GpuProduction
+        );
         let json = projection_module_output_json(&output);
         assert_eq!(json["module_kind"], "qwen35_attention_wo_residual");
         assert_eq!(json["module_id"], "qwen35.layers.7.attention.wo_residual");

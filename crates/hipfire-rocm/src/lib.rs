@@ -8,7 +8,8 @@
 //! typed boundary for describing which existing ROCm path handled a module.
 
 use hipfire_cpu::{
-    DenseFfnBackend, DenseFfnModuleInvocation, DiffStats, ProjectionModuleInvocation,
+    backend_selection_json, BackendSelection, DenseFfnBackend, DenseFfnBackendPreference,
+    DenseFfnModuleInvocation, DiffStats, ProjectionModuleInvocation,
 };
 use serde_json::{json, Value};
 
@@ -74,6 +75,7 @@ pub struct RocmModuleContract {
 #[derive(Debug, Clone)]
 pub struct RocmModuleOutput {
     pub contract: RocmModuleContract,
+    pub preferred_backend: DenseFfnBackendPreference,
     pub selected_backend: DenseFfnBackend,
     pub backend_path: RocmBackendPath,
     pub drift: Option<DiffStats>,
@@ -137,6 +139,7 @@ pub fn rocm_dense_ffn_module_output(
     let backend_path = rocm_backend_path_for_selected_backend(invocation.selected_backend);
     RocmModuleOutput {
         contract: rocm_dense_ffn_module_contract(invocation, device, kernel_path),
+        preferred_backend: invocation.contract.preferred_backend,
         selected_backend: invocation.selected_backend,
         backend_path,
         drift,
@@ -152,6 +155,7 @@ pub fn rocm_projection_module_output(
     let backend_path = rocm_backend_path_for_selected_backend(invocation.selected_backend);
     RocmModuleOutput {
         contract: rocm_projection_module_contract(invocation, device, kernel_path),
+        preferred_backend: invocation.contract.preferred_backend,
         selected_backend: invocation.selected_backend,
         backend_path,
         drift: None,
@@ -171,14 +175,15 @@ pub fn diff_stats_json(stats: DiffStats) -> Value {
 }
 
 pub fn rocm_module_output_json(output: &RocmModuleOutput) -> Value {
+    let selection = backend_selection_json(rocm_module_backend_selection(output));
     let mut value = json!({
         "module_kind": output.contract.module_kind.as_str(),
         "module_id": output.contract.module_id,
         "layer_idx": output.contract.layer_idx,
         "kernel_path": output.contract.kernel_path,
-        "selected_backend": output.selected_backend.as_str(),
+        "selected_backend": selection["selected_backend"].clone(),
         "backend_path": output.backend_path.as_str(),
-        "fallback_reason": output.fallback_reason,
+        "fallback_reason": selection["fallback_reason"].clone(),
         "mutates_residual": output.contract.mutates_residual,
         "device": {
             "device_id": output.contract.device.device_id,
@@ -190,6 +195,14 @@ pub fn rocm_module_output_json(output: &RocmModuleOutput) -> Value {
         value["drift"] = diff_stats_json(drift);
     }
     value
+}
+
+pub fn rocm_module_backend_selection(output: &RocmModuleOutput) -> BackendSelection {
+    BackendSelection::new(
+        output.preferred_backend,
+        output.selected_backend,
+        output.fallback_reason,
+    )
 }
 
 #[cfg(test)]
@@ -236,5 +249,35 @@ mod tests {
             rocm_backend_path_for_selected_backend(DenseFfnBackend::NpuXdna1),
             RocmBackendPath::NpuHybridFallback
         );
+    }
+
+    #[test]
+    fn rocm_output_preserves_preferred_backend_for_npu_fallback_selection() {
+        let invocation = dense_ffn_module_invocation_from_shape(
+            4,
+            4096,
+            11008,
+            DenseFfnBackendPreference::NpuOptIn,
+            false,
+        );
+        let output = rocm_dense_ffn_module_output(
+            &invocation,
+            rocm_device_identity(0, "gfx1151", false),
+            "weight_gemv_swiglu_residual",
+            None,
+        );
+        let selection = rocm_module_backend_selection(&output);
+        assert_eq!(
+            selection.preferred_backend,
+            DenseFfnBackendPreference::NpuOptIn
+        );
+        assert_eq!(selection.selected_backend, DenseFfnBackend::GpuProduction);
+        assert_eq!(selection.oracle_backend, DenseFfnBackend::CpuOracle);
+        assert_eq!(selection.fallback_reason, Some("npu_backend_unavailable"));
+
+        let json = rocm_module_output_json(&output);
+        assert_eq!(json["selected_backend"], "gpu_production");
+        assert_eq!(json["fallback_reason"], "npu_backend_unavailable");
+        assert!(json.get("preferred_backend").is_none());
     }
 }

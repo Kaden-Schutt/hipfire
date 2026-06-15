@@ -69,7 +69,7 @@ Current generate boundary status:
 - `hipfire-daemon` still owns model-specific execution, Qwen3.5 runtime orchestration, and JSONL adapter dispatch until later migration slices consume more shared logic.
 
 Current CPU/backend boundary status:
-- `hipfire-cpu` owns deterministic BF16 CPU oracle helpers, dense FFN/projection module contracts, backend selection evidence structs, and JSON rendering for module outputs.
+- `hipfire-cpu` owns deterministic BF16 CPU oracle helpers, dense FFN/projection module contracts, the shared `BackendSelection` contract, backend selection evidence structs, and JSON rendering for module outputs.
 - `hipfire-arch-qwen35::ffn_bf16` remains the compatibility facade for Qwen3.5 mode/env parsing and re-exports the shared CPU oracle contracts.
 
 Current ROCm/backend boundary status:
