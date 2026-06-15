@@ -672,7 +672,7 @@ fn main() {
         eprintln!("--slice path not found: {}", args.slice.display());
         std::process::exit(1);
     }
-    hipfire_runtime::eval_common::verify_slice_md5(&args.slice, "build_kld_ref_hipfire");
+    hipfire_evidence::verify_slice_md5(&args.slice, "build_kld_ref_hipfire");
 
     let use_kld_graph = std::env::var("HIPFIRE_KLD_GRAPH").ok().as_deref() != Some("0");
 

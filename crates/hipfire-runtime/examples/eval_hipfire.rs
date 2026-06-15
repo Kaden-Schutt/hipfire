@@ -369,7 +369,7 @@ fn main() {
     );
 
     // -------- ref sha256 sanity (M1) --------
-    hipfire_runtime::eval_common::verify_ref_sha256(&args.ref_path, "eval_hipfire");
+    hipfire_evidence::verify_ref_sha256(&args.ref_path, "eval_hipfire");
 
     // -------- load model --------
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
@@ -842,5 +842,5 @@ fn main() {
     eprintln!("eval_hipfire: wrote {}", args.output.display());
 }
 
-// (verify_ref_sha256 now lives in hipfire_runtime::eval_common — see
-// crates/hipfire-runtime/src/eval_common.rs)
+// (verify_ref_sha256 now lives in hipfire_evidence — see
+// crates/hipfire-evidence/src/lib.rs)

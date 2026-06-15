@@ -132,13 +132,13 @@ fn main() {
     let args = parse_args();
 
     // ---------- Sanity (H1 + M1 + M4) ----------
-    hipfire_runtime::eval_common::verify_llama_commit(
+    hipfire_evidence::verify_llama_commit(
         &args.llama_perplexity_bin,
         PINNED_LLAMACPP_COMMIT,
         "eval_gguf",
     );
-    hipfire_runtime::eval_common::verify_slice_md5(&args.slice, "eval_gguf");
-    hipfire_runtime::eval_common::verify_ref_sha256(&args.ref_path, "eval_gguf");
+    hipfire_evidence::verify_slice_md5(&args.slice, "eval_gguf");
+    hipfire_evidence::verify_ref_sha256(&args.ref_path, "eval_gguf");
 
     // ---------- Open ref file, read header + tokens ----------
     let ref_file = File::open(&args.ref_path).expect("open ref");
@@ -522,4 +522,4 @@ fn main() {
 }
 
 // (verify_llama_commit / verify_slice_md5 / verify_ref_sha256 now live in
-// hipfire_runtime::eval_common — see crates/hipfire-runtime/src/eval_common.rs)
+// hipfire_evidence — see crates/hipfire-evidence/src/lib.rs)
