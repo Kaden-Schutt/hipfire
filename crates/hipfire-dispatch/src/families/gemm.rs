@@ -155,8 +155,8 @@ impl GemmFamily {
             // `(a, x, y, m, k, batch_size)` signature.
             K::GemmF16 => hip!(gpu.gemm_f16(w.buf, x, y, m, k, batch_size)),
             K::GemmF16Tiled => hip!(gpu.gemm_f16_tiled(w.buf, x, y, m, k, batch_size)),
-            K::GemmF16WmmaMb4 => hip!(gpu.gemm_f16_wmma_mb4(w.buf, x, y, m, k, batch_size)),
-            K::GemmF16WmmaMb8 => hip!(gpu.gemm_f16_wmma_mb8(w.buf, x, y, m, k, batch_size)),
+            K::GemmF16WmmaMb4 => hip!(gpu.gemm_f16_wmma(w.buf, x, y, m, k, batch_size)),
+            K::GemmF16WmmaMb8 => hip!(gpu.gemm_f16_wmma(w.buf, x, y, m, k, batch_size)),
             K::GemmF32Batched => hip!(gpu.gemm_f32_batched(w.buf, x, y, m, k, batch_size)),
             K::GemmQ8_0WmmaX64 => hip!(gpu.gemm_q8_0_wmma_x64(w.buf, x, y, m, k, batch_size)),
             K::GemmQ8_0ResidualWmma => hip!(gpu.gemm_q8_0_residual_wmma(w.buf, x, y, m, k, batch_size)),

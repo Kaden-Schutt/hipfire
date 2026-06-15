@@ -141,7 +141,7 @@ impl KvTierPlan {
 
         // Select batched keys when batch_size > 1.
         let (write_key, attend_key) = if batch_size > 1 {
-            let (w, a) = batched_keys(write_single, attend_single, is_tree, batch_size)?;;
+            let (w, a) = batched_keys(write_single, attend_single, is_tree, batch_size)?;
             (w, a)
         } else {
             (write_single, attend_single)

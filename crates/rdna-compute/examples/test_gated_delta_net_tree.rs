@@ -102,7 +102,7 @@ fn main() {
             &q1, &k1, &v1, &g1, &b1, &sq_ref, &sc_ref, &o1, 1, N_HEADS, HD,
         )
         .unwrap();
-        gpu.gated_delta_net_q8_batch_seq(&q1, &k1, &v1, &g1, &b1, &sq_ref, &sc_ref, &o1, 1, N_HEADS, HD, None).unwrap();
+        gpu.gated_delta_net_q8_batch_seq(&q1, &k1, &v1, &g1, &b1, &sq_ref, &sc_ref, &o1, 1, N_HEADS, HD).unwrap();
         // Scatter o1 back into out_ref[t].
         let row_bytes = N_HEADS * HD * 4;
         gpu.hip

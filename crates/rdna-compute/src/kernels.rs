@@ -1269,7 +1269,6 @@ pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
 pub const GEMV_HFQ6G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_moe_down_k8_indexed_batched_expanded.hip");
 
-
 /// Combine kernel for the atomic-free MoE down path. Sums K_TOP expert
 /// slots per (token, m) with topk_weights applied; accumulates into the
 /// per-token residual row. No cross-token contention.

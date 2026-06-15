@@ -77,10 +77,9 @@ fn main() {
         h as i32, d as i32, swa_window as i32, topk_window as i32, n_comp as i32, b_n as i32,
     ).unwrap();
     // wmma
-    gpu.deepseek4_attn_swa_topk_direct_wmma(
-        &d_q, &d_swa, &d_kv, &d_tk, &d_sink, &d_nv, &d_na, &d_wmma,
+    gpu.deepseek4_attn_swa_topk_direct_batched_f32(
+        &d_q, &d_swa, &d_swa, &d_kv, &d_tk, &d_sink, &d_nv, &d_na, &d_wmma,
         h as i32, d as i32, swa_window as i32, topk_window as i32, n_comp as i32, b_n as i32,
-        max_n_total,
     ).unwrap();
     gpu.hip.device_synchronize().unwrap();
 
@@ -109,7 +108,7 @@ fn main() {
     let it = 100;
     for _ in 0..10 {
         gpu.deepseek4_attn_swa_topk_direct_batched_f32(&d_q,&d_swa,&d_swa,&d_kv,&d_tk,&d_sink,&d_nv,&d_na,&d_ref,h as i32,d as i32,swa_window as i32,topk_window as i32,n_comp as i32,b_n as i32).unwrap();
-        gpu.deepseek4_attn_swa_topk_direct_wmma(&d_q,&d_swa,&d_kv,&d_tk,&d_sink,&d_nv,&d_na,&d_wmma,h as i32,d as i32,swa_window as i32,topk_window as i32,n_comp as i32,b_n as i32,max_n_total).unwrap();
+        gpu.deepseek4_attn_swa_topk_direct_batched_f32(&d_q,&d_swa,&d_swa,&d_kv,&d_tk,&d_sink,&d_nv,&d_na,&d_wmma,h as i32,d as i32,swa_window as i32,topk_window as i32,n_comp as i32,b_n as i32).unwrap();
     }
     gpu.hip.device_synchronize().unwrap();
     let e0=gpu.hip.event_create().unwrap(); let e1=gpu.hip.event_create().unwrap();
@@ -119,7 +118,7 @@ fn main() {
     let ref_us = gpu.hip.event_elapsed_ms(&e0,&e1).unwrap() as f64 *1000.0/it as f64;
     let e2=gpu.hip.event_create().unwrap(); let e3=gpu.hip.event_create().unwrap();
     gpu.hip.event_record(&e2,None).unwrap();
-    for _ in 0..it { gpu.deepseek4_attn_swa_topk_direct_wmma(&d_q,&d_swa,&d_kv,&d_tk,&d_sink,&d_nv,&d_na,&d_wmma,h as i32,d as i32,swa_window as i32,topk_window as i32,n_comp as i32,b_n as i32,max_n_total).unwrap(); }
+    for _ in 0..it { gpu.deepseek4_attn_swa_topk_direct_batched_f32(&d_q,&d_swa,&d_swa,&d_kv,&d_tk,&d_sink,&d_nv,&d_na,&d_wmma,h as i32,d as i32,swa_window as i32,topk_window as i32,n_comp as i32,b_n as i32).unwrap(); }
     gpu.hip.event_record(&e3,None).unwrap(); gpu.hip.event_synchronize(&e3).unwrap();
     let wmma_us = gpu.hip.event_elapsed_ms(&e2,&e3).unwrap() as f64 *1000.0/it as f64;
     eprintln!("  timing: f32 ref {ref_us:.1} µs/call   wmma {wmma_us:.1} µs/call   ×{:.2}", ref_us/wmma_us);

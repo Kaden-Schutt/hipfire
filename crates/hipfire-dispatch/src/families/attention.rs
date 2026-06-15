@@ -195,7 +195,7 @@ fn dispatch_full_attention(
         // ── Non-causal, F16 K/V ──
         TileImpl::DflashV5 | TileImpl::DflashV5Gfx12 => {
             debug_assert_eq!(key, AttnFullF16);
-            hip!(gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(
+            hip!(gpu.attention_dflash_wmma_m64_n128_f16kv_v3_f32(
                 io.q, io.k, io.v, io.out,
                 io.n, io.seq_len, io.n_heads, io.n_kv_heads, io.head_dim,
             ))?;
@@ -297,7 +297,7 @@ fn dispatch_kv_write(
             let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_fwht4_fused(
                 io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
-                ct, st, io.n_kv_heads, io.head_dim, plan.v_mode_bits,
+                ct, st, io.n_kv_heads, io.head_dim,
             ))
         }
         KernelKey::KvWriteAsym3 => {
@@ -315,7 +315,7 @@ fn dispatch_kv_write(
             let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_fwht3_fused(
                 io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
-                ct, st, io.n_kv_heads, io.head_dim, plan.v_mode_bits,
+                ct, st, io.n_kv_heads, io.head_dim,
             ))
         }
         KernelKey::KvWriteAsym2 => {
@@ -333,7 +333,7 @@ fn dispatch_kv_write(
             let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_fwht2_fused(
                 io.k_cache, io.v_cache, io.k, io.v, io.pos_buf,
-                ct, st, io.n_kv_heads, io.head_dim, plan.v_mode_bits,
+                ct, st, io.n_kv_heads, io.head_dim,
             ))
         }
 
@@ -351,7 +351,7 @@ fn dispatch_kv_write(
             let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_fwht4_batched(
                 io.k_cache, io.v_cache, io.k, io.v, io.positions(),
-                ct, st, io.n_kv_heads, io.head_dim, io.batch_size, plan.v_mode_bits,
+                ct, st, io.n_kv_heads, io.head_dim, io.batch_size,
             ))
         }
         KernelKey::KvWriteAsym3Batched => {
@@ -367,7 +367,7 @@ fn dispatch_kv_write(
             let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_fwht3_batched(
                 io.k_cache, io.v_cache, io.k, io.v, io.positions(),
-                ct, st, io.n_kv_heads, io.head_dim, io.batch_size, plan.v_mode_bits,
+                ct, st, io.n_kv_heads, io.head_dim, io.batch_size,
             ))
         }
         KernelKey::KvWriteAsym2Batched => {
@@ -383,7 +383,7 @@ fn dispatch_kv_write(
             let st = io.givens_sin.unwrap();
             hip!(gpu.kv_cache_write_fwht2_batched(
                 io.k_cache, io.v_cache, io.k, io.v, io.positions(),
-                ct, st, io.n_kv_heads, io.head_dim, io.batch_size, plan.v_mode_bits,
+                ct, st, io.n_kv_heads, io.head_dim, io.batch_size,
             ))
         }
         KernelKey::KvWriteQ8_0Batched => {
@@ -443,7 +443,7 @@ fn dispatch_attend(
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
             let fp = io.flash_partials.unwrap();
-            hip!(gpu.attention_flash_asym4_wmma_tile_batched(
+            hip!(gpu.attention_flash_asym4_batched_masked(
                 io.q, io.k_cache, io.v_cache, io.output, io.positions(),
                 ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
                 io.physical_cap, io.max_ctx_len, io.batch_size, fp,
@@ -455,7 +455,7 @@ fn dispatch_attend(
             let ct = io.givens_cos.unwrap();
             let st = io.givens_sin.unwrap();
             let fp = io.flash_partials.unwrap();
-            hip!(gpu.attention_flash_asym4_wmma_tile_batched_gfx12(
+            hip!(gpu.attention_flash_asym4_batched_masked(
                 io.q, io.k_cache, io.v_cache, io.output, io.positions(),
                 ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
                 io.physical_cap, io.max_ctx_len, io.batch_size, fp,
@@ -509,7 +509,6 @@ fn dispatch_attend(
             hip!(gpu.attention_flash_fwht4(
                 io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
                 ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
-                plan.v_mode_bits,
             ))
         }
         KernelKey::AttnFlashAsym3 => {
@@ -532,7 +531,6 @@ fn dispatch_attend(
             hip!(gpu.attention_flash_fwht3(
                 io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
                 ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
-                plan.v_mode_bits,
             ))
         }
         KernelKey::AttnFlashAsym2 => {
@@ -555,7 +553,6 @@ fn dispatch_attend(
             hip!(gpu.attention_flash_fwht2(
                 io.q, io.k_cache, io.v_cache, io.output, io.pos_buf,
                 ct, st, seq_len, io.n_heads, io.n_kv_heads, io.head_dim, io.physical_cap, fp,
-                plan.v_mode_bits,
             ))
         }
         KernelKey::AttnGqaFused => {
@@ -605,7 +602,7 @@ fn dispatch_attend(
                 io.q, io.k_cache, io.v_cache, io.output, io.positions(),
                 ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
                 io.physical_cap, io.max_ctx_len, io.batch_size, fp,
-                io.tree_bias, io.block_start, io.block_cols, plan.v_mode_bits,
+                io.tree_bias, io.block_start, io.block_cols,
             ))
         }
         KernelKey::AttnFlashAsym3BatchedMasked => {
@@ -627,7 +624,7 @@ fn dispatch_attend(
                 io.q, io.k_cache, io.v_cache, io.output, io.positions(),
                 ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
                 io.physical_cap, io.max_ctx_len, io.batch_size, fp,
-                io.tree_bias, io.block_start, io.block_cols, plan.v_mode_bits,
+                io.tree_bias, io.block_start, io.block_cols,
             ))
         }
         // 2-bit: _batched only (no _masked — tree-verify gap)
@@ -651,7 +648,6 @@ fn dispatch_attend(
                 io.q, io.k_cache, io.v_cache, io.output, io.positions(),
                 ct, st, io.n_heads, io.n_kv_heads, io.head_dim,
                 io.physical_cap, io.max_ctx_len, io.batch_size, fp,
-                plan.v_mode_bits,
             ))
         }
         // Q8_0 batched: use old batched kernel for short ctx (fewer dispatches,

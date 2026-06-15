@@ -184,7 +184,9 @@ impl GpuTensor {
     #[doc(hidden)]
     pub fn null_for_test() -> Self {
         GpuTensor {
-            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut::<std::ffi::c_void>(), 0) },
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut::<std::ffi::c_void>(), 0)
+            },
             shape: vec![0],
             dtype: crate::DType::F32,
         }
@@ -428,7 +430,8 @@ pub struct Gpu {
     pub mq_signs2_128: Option<GpuTensor>,
     pub mq_x_rot: Option<GpuTensor>, // scratch for rotated x, sized to max K
     pub paro_x_scratch: Option<GpuTensor>, // ParoQuant: scratch for rotated activation copy
-    pub mq_x_q8: Option<hip_bridge::DeviceBuffer>, // INT8 quantized rotated x for dp4a
+    pub paro_fused_scratch: Option<Vec<GpuTensor>>, // ParoQuant fused paths: multiple rotation scratch buffers
+    pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,  // INT8 quantized rotated x for dp4a
     pub mq_x_scales: Option<hip_bridge::DeviceBuffer>, // per-group f32 scales for x quantization
     /// FP16 scratch buffer for prefill X conversion. Sized to max(batch_size × K) × 2 bytes.
     fp16_x_scratch: Option<hip_bridge::DeviceBuffer>,
@@ -598,8 +601,6 @@ pub struct Gpu {
     /// dispatch threads (one `Gpu` per device, all routing into a single
     /// per-tensor accumulator).
     pub capture_handler: Option<Arc<dyn ActivationCapture>>,
-    /// Paro fused gate+up/qkvza scratch: 4 × [k] F32 buffers.
-    pub paro_fused_scratch: Option<Vec<GpuTensor>>,
 }
 
 /// Generate `n` FWHT sign values (+1.0 / -1.0) from a simple LCG seeded with `seed`.
@@ -825,6 +826,7 @@ impl Gpu {
             mq_signs2_128: None,
             mq_x_rot: None,
             paro_x_scratch: None,
+            paro_fused_scratch: None,
             mq_x_q8: None,
             mq_x_scales: None,
             fp16_x_scratch: None,
@@ -3152,6 +3154,26 @@ impl Gpu {
             shape: vec![dim],
             dtype: DType::F32,
         });
+        Ok(())
+    }
+
+    /// Ensure the ParoQuant fused rotation scratch buffers are allocated.
+    ///
+    /// Fused QKVZA needs four independent rotated activation buffers; gate+up
+    /// uses the first explicit buffer and aliases `mq_x_rot` internally for the
+    /// second rotation.
+    pub fn ensure_paro_fused_scratch(&mut self, dim: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        if let Some(ref scratch) = self.paro_fused_scratch {
+            if scratch.len() >= 4 && scratch.iter().all(|s| s.buf.size() >= dim * 4) {
+                return Ok(());
+            }
+        }
+        let mut scratch = Vec::with_capacity(4);
+        for _ in 0..4 {
+            scratch.push(self.alloc_tensor(&[dim], DType::F32)?);
+        }
+        self.paro_fused_scratch = Some(scratch);
         Ok(())
     }
 

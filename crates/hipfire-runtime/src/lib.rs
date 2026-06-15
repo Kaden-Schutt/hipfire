@@ -15,13 +15,15 @@
 
 pub mod arch;
 pub mod bf16_loader;
+#[cfg(feature = "deltanet")]
+pub mod cask;
 pub mod coherence_runtime;
 pub mod config;
 pub mod env_docs;
 pub mod eos_filter;
-pub mod eval_harness;
 pub mod ep;
 pub mod eval_common;
+pub mod eval_harness;
 pub mod gguf;
 pub mod hfq;
 pub mod hfq_modules;
@@ -33,6 +35,22 @@ pub mod loop_guard;
 pub mod model_source;
 pub mod mtp_mirror;
 pub mod multi_gpu;
+pub mod safetensors_source;
+pub mod sampler;
+pub mod speed_bench;
+pub mod tokenizer;
+pub mod tool_call;
+pub mod tp_shard;
+#[cfg(feature = "deltanet")]
+pub mod cpu_router;
+#[cfg(feature = "deltanet")]
+pub mod ddtree;
+#[cfg(feature = "deltanet")]
+pub mod dflash;
+#[cfg(feature = "deltanet")]
+pub mod triattn;
+#[cfg(feature = "deltanet")]
+pub mod weight_pager;
 pub mod prompt_frame {
     pub use hipfire_prompt::*;
 
@@ -55,22 +73,3 @@ pub mod prompt_frame {
         }
     }
 }
-pub mod safetensors_source;
-pub mod sampler;
-pub mod speed_bench;
-pub mod tokenizer;
-pub mod tool_call;
-pub mod tp_shard;
-
-#[cfg(feature = "deltanet")]
-pub mod cask;
-#[cfg(feature = "deltanet")]
-pub mod cpu_router;
-#[cfg(feature = "deltanet")]
-pub mod ddtree;
-#[cfg(feature = "deltanet")]
-pub mod dflash;
-#[cfg(feature = "deltanet")]
-pub mod triattn;
-#[cfg(feature = "deltanet")]
-pub mod weight_pager;

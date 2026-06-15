@@ -163,6 +163,11 @@ pub fn gemv_hfq4g128_bytes(m: usize, k: usize) -> usize {
     hfq4g128_weight_bytes(m, k) + k * 4 + m * 4
 }
 
+/// PARO4-G128 currently uses the same packed footprint as HFQ4-G128.
+pub fn gemv_paro4g128_bytes(m: usize, k: usize) -> usize {
+    gemv_hfq4g128_bytes(m, k)
+}
+
 /// HFQ3-G256 weight footprint: 104 B per 256-element group (4 B scale +
 /// 4 B zero + 96 B packed 3-bit weights).
 pub fn hfq3g256_weight_bytes(m: usize, k: usize) -> usize {
@@ -181,6 +186,10 @@ pub fn paro4g128t_rotate_bytes(_m: usize, k: usize) -> usize {
     let sincos = 8 * (k / 2) * 2 * 4;
     let channel_scales = k * 2;
     k * 4 + pairs + sincos + channel_scales + k * 4
+}
+
+pub fn paro4g128_rotate_bytes(m: usize, k: usize) -> usize {
+    paro4g128t_rotate_bytes(m, k)
 }
 
 /// PARO4-G128 GEMV after activation rotation has been materialized.

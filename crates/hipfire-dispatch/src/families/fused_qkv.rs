@@ -334,7 +334,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 // (`gemm_gate_up_q8_0_wmma`); the non-WMMA arch case stays as two
                 // plain GemmQ8_0BatchedChunked GEMMs at the call site (slice 1).
                 Some(n) => hip!(gpu.gemm_gate_up_q8_0_wmma(w_gate, w_up, x, gate, up, mg, mu, k, n)),
-                None => hip!(gpu.fused_gate_up_q8_0(w_gate, w_up, x, gate, up, mg, mu, k)),
+                None => hip!(gpu.gemm_gate_up_q8_0_wmma(w_gate, w_up, x, gate, up, mg, mu, k, 1)),
             }
         }
         // ── HFQ3G256 gate+up — prefill-only key (#397 Ship 5.2 slice 2) ──
@@ -375,7 +375,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
         KernelKey::FusedGateUpParo4G128T => {
             let [w_gate, w_up] = <[&GpuTensor; 2]>::try_from(params.weights).map_err(|_| err_wrong_arity(params.kind, 2))?;
             let [gate, up] = <[&GpuTensor; 2]>::try_from(params.outputs).map_err(|_| err_wrong_arity(params.kind, 2))?;
-            let [mg, mu] = <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, _mu] = <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
             let rs = params.rot_scratch;
             assert!(rs.len() >= 1, "FusedGateUpParo4G128T needs >= 1 rotation scratch buffer, got {}", rs.len());
             assert!(mg % 8 == 0 && k % 128 == 0,
