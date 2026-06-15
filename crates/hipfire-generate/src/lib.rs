@@ -302,6 +302,20 @@ pub struct GenerateBatchDecodeSession {
     pub logical_position: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen35DecodeTokenOutcome {
+    pub token: u32,
+    pub text: String,
+    pub stop: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Qwen35DecodeBatchStepResult {
+    pub session_lines: Vec<serde_json::Value>,
+    pub chunk_count: usize,
+    pub chunk_size: usize,
+}
+
 fn parse_u32_array(value: &serde_json::Value, field: &str) -> Result<Vec<u32>, String> {
     let arr = value
         .as_array()

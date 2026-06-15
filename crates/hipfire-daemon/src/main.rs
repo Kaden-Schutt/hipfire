@@ -53,10 +53,10 @@ use hipfire_generate::{
     validate_qwen35_fused_grouped_moe_prefill_batch_preflight, GenerateBatchDecodeEnvelope,
     GenerateBatchDecodeSession, GenerateBatchPrefillEnvelope, GenerateBatchPrefillPlan,
     GenerateBatchPrefillPrefixHash, GenerateBatchPrefillSession, PrefixHashPreflightCandidate,
-    PrefixHashPreflightEnvelope, Qwen35DecodeBatchBackend, Qwen35FusedDensePrefillInputKind,
-    Qwen35PrefillBatchBackend, Qwen35PrefillBatchResult, Qwen35PrefillCheckpointHook,
-    Qwen35PrefillCheckpointKind, Qwen35PrefillSessionResult, Qwen35PreparedPrefillSession,
-    Qwen35SemanticBoundaryCheckpoint,
+    PrefixHashPreflightEnvelope, Qwen35DecodeBatchBackend, Qwen35DecodeBatchStepResult,
+    Qwen35DecodeTokenOutcome, Qwen35FusedDensePrefillInputKind, Qwen35PrefillBatchBackend,
+    Qwen35PrefillBatchResult, Qwen35PrefillCheckpointHook, Qwen35PrefillCheckpointKind,
+    Qwen35PrefillSessionResult, Qwen35PreparedPrefillSession, Qwen35SemanticBoundaryCheckpoint,
 };
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -6976,18 +6976,6 @@ fn run_generate_batch_decode_step_qwen35(
     let _ = writeln!(stdout, "{done}");
     let _ = stdout.flush();
     Ok(())
-}
-
-struct Qwen35DecodeTokenOutcome {
-    token: u32,
-    text: String,
-    stop: bool,
-}
-
-struct Qwen35DecodeBatchStepResult {
-    session_lines: Vec<serde_json::Value>,
-    chunk_count: usize,
-    chunk_size: usize,
 }
 
 fn qwen35_decode_batch_max_chunk_size(session_count: usize) -> usize {
