@@ -91,19 +91,26 @@ This is the known reason QTIP/trellis is the *only* viable 2-bit path. Do
     2-bit MSE by >15% on synthetic Gaussian.
   - **C1b ✅ DONE** — env-gated real-weights reconstruction gate
     (`HIPFIRE_QTIP_EVAL_ST`) + `optimal_scale` (closed-form per-group LS
-    scale to store). Result on 0.8B weights: **QTIP-2/uniform-2 = 0.26
-    (~4× lower MSE), QTIP-2/uniform-3 = 1.41** (within 1.4× of 3-bit, at 2
-    bits). Decisive iso-bpw win; not yet uniform-3 parity.
-  - **C1c — better codebook (next, the gating blocker).** Reaching uniform-3
-    parity is the quality bar before the kernel. Measured: scale refit and
-    STATE_BITS=16 give little (1.41→1.34 for 16× cost). The lever is the
-    QTIP paper's tuned hash (1MAD/3INST) / structured trellis — not brute
-    force. This is the open C1 research item.
-  - **C1d — full-model wiring.** New `--format qtip2` (per-group
-    `encode_group` across 2D weights; beam-search encoder for throughput —
-    per-group Viterbi is too slow at model scale) → QTIP `.hfq` + DType.
-  - **Gate:** uniform-3-parity reconstruction (C1c) + `astrea` KLD/PPL on a
-    wired model (C1d) BEFORE the decode kernel.
+    scale to store) + correct yardstick (the **2-bit rate-distortion bound**
+    σ²/16, not uniform-3 — uniform-3 parity is information-theoretically
+    impossible at 2 bits). Result on 0.8B weights: **QTIP-2/bound = 1.21**
+    (within 21% of the optimal 2-bit floor), **QTIP-2/uniform-2 = 0.26**
+    (uniform-2 ≈ 4.6× the bound — why MQ2-Lloyd collapses). QTIP makes 2-bit
+    *near-optimal*.
+  - **C1c — codebook tuning: DEPRIORITIZED.** Headroom to the floor is only
+    ~20% (already at 1.21× bound); scale refit + STATE_BITS=16 barely move
+    it. The paper's 1MAD/3INST codebook could shave some, but it won't change
+    the verdict — that's set by the *usability* question below, not
+    reconstruction.
+  - **C1d — full-model wiring + PPL (the real gate, NEXT).** New
+    `--format qtip2` (per-group `encode_group` across 2D weights;
+    beam-search encoder — per-group Viterbi too slow at model scale) → QTIP
+    `.hfq` + DType. Then measure full-model **PPL** (the only test of whether
+    near-optimal-2-bit is usable). PPL needs a forward → either a CPU dequant
+    path or the C2 kernel; the chicken-and-egg means C2 may have to land
+    before the final quality verdict.
+  - **Gate:** full-model PPL via C1d (reconstruction is settled: near
+    bound).
 - **C2 — fused QTIP decode GEMV.** Variant of `gemv_mq2g256_lloyd.hip` with
   sliding-window trellis hash (computed codebook → ~zero LDS), reusing
   `rotate_x_mq_awq.hip`. Friction is sub-byte bit-window unpack (LDS stage
