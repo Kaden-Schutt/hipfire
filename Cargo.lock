@@ -912,14 +912,18 @@ dependencies = [
 name = "hipfire-eval"
 version = "0.2.1"
 dependencies = [
+ "anyhow",
  "csv",
  "hipfire-coherence",
+ "hipfire-daemon-adapter",
  "hipfire-evidence",
+ "hipfire-generate",
  "hipfire-hash",
  "hipfire-model",
  "libc",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

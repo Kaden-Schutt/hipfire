@@ -40,10 +40,11 @@ use hipfire_evidence::{
     RunMetadataArtifact, RunMetadataConfig, RunMetadataModels, RunProvenance, SourcedField,
     OBSERVED_ADMISSION_EVIDENCE_KINDS, STANDARD_EVIDENCE_ARTIFACT_SPECS,
 };
+use hipfire_generate::{GenerateTextRequest, GenerationSamplingPolicy};
 use hipfire_hash::{file_hash, stable_hash_bytes, stable_hash_file_fallback};
 use hipfire_model::{
     discover_dflash_draft_for_model, model_artifact_stem, model_hash, model_manifest_entry,
-    ModelManifestEntry,
+    ModelLoadParams, ModelManifestEntry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +311,7 @@ pub enum EvalExecutorMode {
     Auto,
     None,
     Examples,
+    Daemon,
     Direct,
     Mock,
 }
@@ -320,6 +322,7 @@ impl EvalExecutorMode {
             "auto" => Ok(Self::Auto),
             "none" => Ok(Self::None),
             "examples" | "example" | "subprocess" => Ok(Self::Examples),
+            "daemon" | "jsonl" | "adapter" => Ok(Self::Daemon),
             "direct" | "runtime" | "session" => Ok(Self::Direct),
             "mock" => Ok(Self::Mock),
             other => Err(format!("unknown executor mode: {other}")),
@@ -331,6 +334,7 @@ impl EvalExecutorMode {
             Self::Auto => "auto",
             Self::None => "none",
             Self::Examples => "examples",
+            Self::Daemon => "daemon",
             Self::Direct => "direct",
             Self::Mock => "mock",
         }
@@ -893,7 +897,7 @@ pub fn usage() -> String {
        --performance-candidate-variant <v> performance-json variant for --model\n\
        --performance-baseline-variant <v>  performance-json variant for --baseline\n\
        --performance-reference-variant <v> performance-json variant for --reference\n\
-       --executor <auto|none|examples|direct|mock> execution backend (default: auto; examples/direct run Hipfire example binaries; mock is no-GPU test-only)\n\
+       --executor <auto|none|examples|daemon|direct|mock> execution backend (default: auto; daemon uses the JSONL adapter; examples/direct run Hipfire example binaries; mock is no-GPU test-only)\n\
        --fetch-datasets         opt in to Hugging Face dataset fetches\n\
        --offline                forbid network fetches\n\
        --dataset-cache <dir>    dataset cache root (default: ~/.hipfire/eval/datasets)\n\
@@ -5407,6 +5411,272 @@ fn direct_battery_rows(
     }
 }
 
+fn daemon_battery_rows(
+    battery: BatteryId,
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    datasets: &[DatasetManifestEntry],
+) -> Option<Vec<EvalResult>> {
+    match battery {
+        BatteryId::Smoke => Some(run_daemon_smoke_rows(config, ctx)),
+        BatteryId::Coherence | BatteryId::Longctx | BatteryId::Agentic => {
+            examples_battery_rows(battery, config, ctx, datasets)
+        }
+        _ => None,
+    }
+}
+
+fn daemon_model_load_params(config: &EvalConfig, max_seq: usize) -> ModelLoadParams {
+    ModelLoadParams {
+        max_seq: max_seq.min(u32::MAX as usize) as u32,
+        kv_cache: config.kv_mode.clone(),
+        dflash_mode: Some(config.dflash.as_str().to_string()),
+        draft: config.draft.clone(),
+        ..Default::default()
+    }
+}
+
+fn daemon_generate_request(
+    id: String,
+    prompt_text: String,
+    max_tokens: usize,
+    worker_key_id: Option<String>,
+) -> GenerateTextRequest {
+    GenerateTextRequest::from_prompt(
+        id,
+        prompt_text,
+        GenerationSamplingPolicy::greedy(max_tokens.min(u32::MAX as usize) as u32),
+    )
+    .with_worker_key_id(worker_key_id)
+}
+
+fn daemon_smoke_skip_rows(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    load_reason: &str,
+    decode_reason: &str,
+) -> Vec<EvalResult> {
+    vec![
+        skip_row_with_metrics(
+            BatteryId::Smoke,
+            None,
+            "load_metadata",
+            None,
+            load_reason,
+            config,
+            ctx,
+            None,
+            BTreeMap::from([("executor".to_string(), json!("daemon"))]),
+        ),
+        skip_row_with_metrics(
+            BatteryId::Smoke,
+            None,
+            "finite_greedy_decode",
+            None,
+            decode_reason,
+            config,
+            ctx,
+            prompt("benchmarks/prompts/qwen2_smoke.txt"),
+            BTreeMap::from([("executor".to_string(), json!("daemon"))]),
+        ),
+        skip_row_with_metrics(
+            BatteryId::Smoke,
+            None,
+            "multi_turn_reset_recall",
+            None,
+            "daemon-backed multi-turn session is not implemented yet",
+            config,
+            ctx,
+            prompt("benchmarks/prompts/trains-meet.txt"),
+            BTreeMap::from([("executor".to_string(), json!("daemon"))]),
+        ),
+    ]
+}
+
+fn run_daemon_smoke_rows(config: &EvalConfig, ctx: &EvalContext) -> Vec<EvalResult> {
+    if !Path::new(&config.model).exists() {
+        return daemon_smoke_skip_rows(
+            config,
+            ctx,
+            "daemon executor requires --model to be a local filesystem path",
+            "daemon executor requires --model to be a local filesystem path",
+        );
+    }
+
+    let Some(bin) = hipfire_daemon_adapter::find_daemon_bin() else {
+        return daemon_smoke_skip_rows(
+            config,
+            ctx,
+            "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
+            "daemon binary not found; build with `cargo build -p hipfire-daemon --bin hipfire-daemon`",
+        );
+    };
+
+    let started = SystemTime::now();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            return daemon_smoke_skip_rows(
+                config,
+                ctx,
+                &format!("create daemon executor runtime: {err}"),
+                "daemon executor runtime creation failed before decode",
+            );
+        }
+    };
+
+    match runtime.block_on(run_daemon_smoke_rows_async(config, ctx, &bin)) {
+        Ok(mut rows) => {
+            let elapsed_ms = elapsed_since_ms(started);
+            for row in &mut rows {
+                row.elapsed_ms = elapsed_ms;
+            }
+            rows.push(skip_row_with_metrics(
+                BatteryId::Smoke,
+                None,
+                "multi_turn_reset_recall",
+                None,
+                "daemon-backed multi-turn session is not implemented yet",
+                config,
+                ctx,
+                prompt("benchmarks/prompts/trains-meet.txt"),
+                BTreeMap::from([
+                    ("executor".to_string(), json!("daemon")),
+                    ("shared_model_loads".to_string(), json!(1)),
+                ]),
+            ));
+            rows
+        }
+        Err(err) => vec![
+            row(
+                BatteryId::Smoke,
+                None,
+                "load_metadata",
+                None,
+                EvalStatus::Fail,
+                Some(format!("daemon-backed smoke executor failed: {err}")),
+                BTreeMap::from([
+                    ("executor".to_string(), json!("daemon")),
+                    ("daemon_bin".to_string(), json!(bin.display().to_string())),
+                ]),
+                config,
+                ctx,
+                None,
+                elapsed_since_ms(started),
+            ),
+            row(
+                BatteryId::Smoke,
+                None,
+                "finite_greedy_decode",
+                None,
+                EvalStatus::Skip,
+                Some("daemon-backed load failed before decode".to_string()),
+                BTreeMap::from([("executor".to_string(), json!("daemon"))]),
+                config,
+                ctx,
+                prompt("benchmarks/prompts/qwen2_smoke.txt"),
+                elapsed_since_ms(started),
+            ),
+            skip_row_with_metrics(
+                BatteryId::Smoke,
+                None,
+                "multi_turn_reset_recall",
+                None,
+                "daemon-backed multi-turn session is not implemented yet",
+                config,
+                ctx,
+                prompt("benchmarks/prompts/trains-meet.txt"),
+                BTreeMap::from([("executor".to_string(), json!("daemon"))]),
+            ),
+        ],
+    }
+}
+
+async fn run_daemon_smoke_rows_async(
+    config: &EvalConfig,
+    ctx: &EvalContext,
+    bin: &Path,
+) -> anyhow::Result<Vec<EvalResult>> {
+    let max_seq = (config.max_tokens + 2048).max(4096);
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
+    let loaded = engine
+        .load(&config.model, daemon_model_load_params(config, max_seq))
+        .await?;
+    let worker_key_id = loaded.worker_key_id.clone();
+
+    let prompt_path = "benchmarks/prompts/qwen2_smoke.txt";
+    let prompt_file = resolve_repo_path(prompt_path)
+        .ok_or_else(|| anyhow::anyhow!("resolve {prompt_path} from repo root"))?;
+    let prompt_text =
+        fs::read_to_string(&prompt_file).map_err(|e| anyhow::anyhow!("read {prompt_path}: {e}"))?;
+    let request = daemon_generate_request(
+        "eval-smoke-greedy".to_string(),
+        prompt_text,
+        config.max_tokens,
+        Some(worker_key_id.clone()),
+    );
+    let (text, done) = engine.generate(request).await?;
+    let finite = !text.is_empty() && !text.contains('\u{fffd}');
+    let decode_status = if finite {
+        EvalStatus::Pass
+    } else {
+        EvalStatus::Fail
+    };
+    let decode_reason =
+        (!finite).then(|| "daemon returned empty or replacement-character output".to_string());
+
+    Ok(vec![
+        row(
+            BatteryId::Smoke,
+            None,
+            "load_metadata",
+            None,
+            EvalStatus::Pass,
+            None,
+            BTreeMap::from([
+                ("executor".to_string(), json!("daemon")),
+                ("daemon_bin".to_string(), json!(bin.display().to_string())),
+                ("shared_model_loads".to_string(), json!(1)),
+                ("worker_key_id".to_string(), json!(worker_key_id)),
+                ("arch".to_string(), json!(loaded.arch)),
+                ("dim".to_string(), json!(loaded.dim)),
+                ("layers".to_string(), json!(loaded.layers)),
+                ("vocab".to_string(), json!(loaded.vocab)),
+                ("max_seq".to_string(), json!(max_seq)),
+            ]),
+            config,
+            ctx,
+            None,
+            0,
+        ),
+        row(
+            BatteryId::Smoke,
+            None,
+            "finite_greedy_decode",
+            None,
+            decode_status,
+            decode_reason,
+            BTreeMap::from([
+                ("executor".to_string(), json!("daemon")),
+                ("shared_model_loads".to_string(), json!(1)),
+                ("worker_key_id".to_string(), json!(loaded.worker_key_id)),
+                ("tokens".to_string(), json!(done.tokens)),
+                ("text_bytes".to_string(), json!(text.len())),
+                ("tok_s".to_string(), json!(done.tok_s)),
+                ("ttft_ms".to_string(), json!(done.ttft_ms)),
+                ("max_tokens".to_string(), json!(config.max_tokens)),
+            ]),
+            config,
+            ctx,
+            prompt(prompt_path),
+            0,
+        ),
+    ])
+}
+
 fn examples_executor_available_for(battery: BatteryId) -> bool {
     match battery {
         BatteryId::Coherence => hipfire_coherence::daemon_binary_available(),
@@ -9636,6 +9906,11 @@ fn run_battery(
             return rows;
         }
     }
+    if config.executor == EvalExecutorMode::Daemon {
+        if let Some(rows) = daemon_battery_rows(battery, config, ctx, datasets) {
+            return rows;
+        }
+    }
     if config.executor == EvalExecutorMode::Examples
         || (config.executor == EvalExecutorMode::Auto && examples_executor_available_for(battery))
     {
@@ -11096,6 +11371,89 @@ mod tests {
         let direct =
             parse_args_from(["hipfire-eval", "--model", "m.hfq", "--executor", "direct"]).unwrap();
         assert_eq!(direct.executor, EvalExecutorMode::Direct);
+        let daemon =
+            parse_args_from(["hipfire-eval", "--model", "m.hfq", "--executor", "daemon"]).unwrap();
+        assert_eq!(daemon.executor, EvalExecutorMode::Daemon);
+        assert_eq!(daemon.executor.as_str(), "daemon");
+    }
+
+    #[test]
+    fn daemon_executor_builds_shared_load_and_generate_contracts() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "m.hfq",
+            "--executor",
+            "daemon",
+            "--kv-mode",
+            "fp32",
+            "--dflash",
+            "auto",
+            "--draft",
+            "m.dflash.hfq",
+            "--max-tokens",
+            "17",
+        ])
+        .unwrap();
+        let params = daemon_model_load_params(&cfg, 8192);
+        assert_eq!(params.max_seq, 8192);
+        assert_eq!(params.kv_cache.as_deref(), Some("fp32"));
+        assert_eq!(params.dflash_mode.as_deref(), Some("auto"));
+        assert_eq!(params.draft.as_deref(), Some("m.dflash.hfq"));
+
+        let req = daemon_generate_request(
+            "eval-smoke".to_string(),
+            "What is 2+2?".to_string(),
+            cfg.max_tokens,
+            Some("worker-key".to_string()),
+        );
+        assert_eq!(req.id, "eval-smoke");
+        assert_eq!(req.prompt, "What is 2+2?");
+        assert_eq!(req.worker_key_id.as_deref(), Some("worker-key"));
+        assert_eq!(req.sampling.max_tokens, 17);
+        assert!(req
+            .messages
+            .as_ref()
+            .is_some_and(|messages| messages.len() == 1));
+    }
+
+    #[test]
+    fn daemon_executor_smoke_missing_model_is_explicit_skip() {
+        let cfg = parse_args_from([
+            "hipfire-eval",
+            "--model",
+            "missing-local-model.hfq",
+            "--executor",
+            "daemon",
+            "--battery",
+            "smoke",
+        ])
+        .unwrap();
+        let ctx = EvalContext {
+            commit_sha: None,
+            git_branch: None,
+            git_describe: None,
+            git_dirty: None,
+            binary_hash: None,
+            arch: None,
+            rocm: None,
+            host_profile: test_host_profile(),
+        };
+
+        let rows = daemon_battery_rows(BatteryId::Smoke, &cfg, &ctx, &[]).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].case_id, "load_metadata");
+        assert_eq!(rows[1].case_id, "finite_greedy_decode");
+        assert_eq!(rows[2].case_id, "multi_turn_reset_recall");
+        assert!(rows.iter().all(|row| row.status == EvalStatus::Skip));
+        assert!(rows
+            .iter()
+            .all(|row| row.metrics.get("executor").and_then(Value::as_str) == Some("daemon")));
+        assert!(rows[0]
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("local filesystem path"));
     }
 
     #[test]

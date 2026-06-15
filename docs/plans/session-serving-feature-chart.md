@@ -69,6 +69,7 @@ The historical implementation record is preserved in `docs-old`; this page is ke
 - Eval reference/slice/llama integrity verifiers now reuse `hipfire-evidence` ownership directly from runtime examples; the old `hipfire-runtime::eval_common` import path has been retired.
 - Eval and host-profile reporting now consume `hipfire-evidence` eval-status, host-profile, and sourced-field contracts directly instead of eval-harness-local JSON shapes or `hipfire-eval` re-exports.
 - Eval host-profile hardware-kind, bucket, bandwidth, and hash policy now reuse `hipfire-evidence` ownership instead of eval-harness-local helpers.
+- Eval `--executor daemon` now runs smoke model-load and finite greedy decode rows through the shared daemon JSONL adapter, model load params, and generate request contracts with one resident daemon load; multi-turn and speed rows remain explicit follow-up work.
 - Runtime host-profile code now consumes `hipfire-eval` directly, and the old `hipfire-runtime::eval_harness` compatibility facade has been retired.
 - Daemon model-worker id construction now reuses `hipfire-model` ownership and sequence-state arena support policy now reuses `hipfire-state` ownership instead of daemon-local policy helpers.
 - State sequence-arena support policy now consumes model-owned Qwen3.5 architecture classification instead of local numeric arch checks.
