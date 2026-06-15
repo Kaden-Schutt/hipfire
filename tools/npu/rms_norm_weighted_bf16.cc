@@ -2,13 +2,53 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// AIE2 BF16 kernel: out[i] = (x[i] / rms(x)) * weight[i]
+// AIE2 BF16 weighted RMSNorm kernel (hidden layer norm)
 //
 // Weighted RMSNorm — adds a learned per-element scale (gamma) to the
 // mlir_aie reference aie2p/rms_norm.cc which hardcodes gamma=1.
 // Ported from the AIE2P reference; works on AIE2 as-is since
-// aie::invsqrt() is available on AIE2, AIE2P, and AIE1 — no arch guard needed.
-// cols must be a multiple of 16.
+// aie::invsqrt() is available on both generations.
+//
+// ── Inputs / output ──────────────────────────────────────────────────────────
+//   input  : [hidden_size] bf16   — layer input (entire row in one tile)
+//   weight : [hidden_size] bf16   — learned RMSNorm scale (gamma)
+//   output : [hidden_size] bf16   — (x / rms(x)) * weight
+//   cols   : int32                — hidden_size (auto-appended by IRON)
+//
+// ── Computation ──────────────────────────────────────────────────────────────
+//   rms(x)    = sqrt(mean(x²) + ε),   ε = 1e-5
+//   out[i]    = (x[i] / rms(x)) * weight[i]
+//
+// ── IRON dispatch pattern ────────────────────────────────────────────────────
+//   _transform_gen, single-core: tile_size = hidden_size (entire row per tile).
+//   RMSNorm requires a global reduction over all elements before any output
+//   can be written, so the work cannot be split across columns. With
+//   tile_size=hidden_size the AIE core holds the full row in its local memory
+//   and computes sum(x²) before the normalize pass.
+//   Memory budget: 3 × hidden_size × 2 B = 9 KB at 1536, 21 KB at 3584 —
+//   both fit in the 32 KB AIE2 local memory.
+//
+// ── Shape constraints ────────────────────────────────────────────────────────
+//   hidden_size % 16 == 0   (vector width)
+//   hidden_size × 6 B ≤ 32 KB   (3 buffers fit in AIE local memory)
+//
+// ── Built xclbins (target/npu/) ──────────────────────────────────────────────
+//   qwen35-rmsnorm-1024.xclbin  — 0.8B  hidden size
+//   qwen35-rmsnorm-1536.xclbin  — 1.5B  hidden size
+//   qwen35-rmsnorm-2048.xclbin  — 2B    hidden size
+//   qwen35-rmsnorm-2560.xclbin  — 4B    hidden size
+//   qwen35-rmsnorm-3584.xclbin  — 7B    hidden size (also used for future sizes)
+//   qwen35-rmsnorm-4096.xclbin  — 9B    hidden size
+//   Naming: qwen35-rmsnorm-{hidden_size}.xclbin + -instr.bin
+//
+// ── Integration status ───────────────────────────────────────────────────────
+//   NOT wired in the active decode path. The MQ4 hot path uses fused
+//   fused_rmsnorm_rotate_mq (GPU), which combines rmsnorm + FWHT rotation.
+//   This kernel is only useful when weights are non-MQ (BF16 hidden norms)
+//   and the GPU is saturated. See project_npu_kernel_map.md for economics.
+//
+//   Compare rms_norm_head_bf16.cc: that kernel takes weight as a tensor param
+//   (same weight reused for all heads); here both input and weight are tiled.
 
 #include "aie_kernels/aie_kernel_utils.h"
 #include <aie_api/aie.hpp>

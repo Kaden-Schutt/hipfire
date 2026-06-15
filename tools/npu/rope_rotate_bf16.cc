@@ -2,27 +2,69 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// AIE2 BF16 kernel: RoPE rotation (half-split convention)
+// AIE2 BF16 RoPE rotation kernel (half-split convention)
 //
 // Adapted from the mlir_aie aie2p/rope.cc reference, which uses interleaved
-// pair layout. This kernel uses the **half-split** layout matching hipfire's
-// GPU rope_partial_halfsplit_f32 kernel:
-//   - Positions [0, n_rot/2): the "x" component of each pair
-//   - Positions [n_rot/2, n_rot): the "y" component of each pair
-//   - Positions [n_rot, head_dim): pass-through (no rotation)
+// pair layout. This kernel uses the half-split layout matching hipfire's GPU
+// rope_partial_halfsplit_f32 kernel so that the cos/sin tensor param and the
+// output can be compared byte-for-byte with GPU reference runs.
 //
-// cos/sin are pre-computed by the caller and passed in cs[]:
-//   cs[0..n_rot/2)       = cos values for each pair
-//   cs[n_rot/2..n_rot)   = sin values for each pair
+// Qwen3.5-specific: partial_rotary_factor = 0.25, so only the first n_rot =
+// head_dim / 4 dimensions are rotated. The remaining [n_rot, head_dim) are
+// copied unchanged (passthrough). n_rot is derived at runtime from head_dim;
+// no separate runtime parameter is needed.
 //
-// Qwen3.5-specific: n_rot = head_dim * partial_rotary_factor = head_dim / 4.
-// The IRON _transform_gen framework does not support runtime scalar params beyond
-// the auto-appended tile size, so n_rot is derived at runtime from head_dim.
-// head_dim must be a multiple of 4 (holds for all Qwen3.5 configs).
+// ── Inputs / output ──────────────────────────────────────────────────────────
+//   input    : [head_dim] bf16   — one attention head (tiled by IRON)
+//   output   : [head_dim] bf16   — rotated head
+//   cs       : [n_rot]    bf16   — cos/sin tensor param (const, acquired once)
+//   head_dim : int32             — tile size (auto-appended by IRON as 'n')
 //
-// Called per head: the IRON framework iterates over all n_heads / n_kv_heads
-// invocations, delivering one head (head_dim elements) per call.
-// No __AIE_ARCH__ guard needed — no trig, no tanh, no arch-specific ops.
+//   n_rot  = head_dim / 4       (partial_rotary_factor = 0.25)
+//   n_rot2 = n_rot / 2          (number of (x, y) pairs)
+//
+// ── cos/sin buffer layout ────────────────────────────────────────────────────
+//   Half-split: all cos first, all sin second.
+//   cs[0 .. n_rot2)       = cos values for positions 0 .. n_rot2-1
+//   cs[n_rot2 .. n_rot)   = sin values for positions 0 .. n_rot2-1
+//
+//   This matches the GPU rope_partial_halfsplit_f32 tensor format produced by
+//   qwen35.rs `build_rope_cs()` so the same precomputed cs buffer can be used
+//   on both GPU and NPU without reformatting.
+//
+// ── Rotation math (per pair i) ───────────────────────────────────────────────
+//   x  = input[i],         y  = input[i + n_rot2]
+//   x' = x * cos[i] - y * sin[i]
+//   y' = y * cos[i] + x * sin[i]
+//   output[i]        = x'
+//   output[i+n_rot2] = y'
+//   output[n_rot..head_dim] = input[n_rot..head_dim]   (passthrough)
+//
+// ── IRON dispatch pattern ────────────────────────────────────────────────────
+//   _transform_gen, single-core: tile_size = head_dim, N_div_n = n_heads or n_kv_heads.
+//   cs is a tensor param (same cos/sin for all heads at this token position,
+//   acquired once before the head loop). No arch-specific guard needed — no
+//   trig, no tanh, only arithmetic that is identical on AIE2 and AIE2P.
+//
+// ── Shape constraints ────────────────────────────────────────────────────────
+//   n_rot2            % 16 == 0   (rotation region, vector width)
+//   head_dim - n_rot  % 16 == 0   (passthrough region, vector width)
+//   For Qwen3.5 head_dim=256: n_rot2=32, passthrough=192 — both ✓
+//
+// ── Built xclbins (target/npu/) ──────────────────────────────────────────────
+//   Q rope (n_heads Q heads):
+//     qwen35-rope-q-8h256d.xclbin   — 0.8B/1.5B/2B  (8 Q heads, head_dim=256)
+//     qwen35-rope-q-16h256d.xclbin  — 4B/9B          (16 Q heads, head_dim=256)
+//   K rope (n_kv_heads KV heads):
+//     qwen35-rope-k-2h256d.xclbin   — 0.8B/1.5B/2B  (2 KV heads, head_dim=256)
+//     qwen35-rope-k-4h256d.xclbin   — 4B/9B          (4 KV heads, head_dim=256)
+//   Naming: qwen35-rope-{q|k}-{n_heads}h{head_dim}d.xclbin + -instr.bin
+//
+// ── Integration status ───────────────────────────────────────────────────────
+//   NOT wired in the active path. Was wired via try_npu_rope() but superseded
+//   by headnorm_rope_bf16.cc, which fuses this rotation with the preceding
+//   QK head norm in a single dispatch. Keeping these xclbins around as a
+//   fallback for ablation studies or models without QK norm.
 
 #include "aie_kernels/aie_kernel_utils.h"
 #include <aie_api/aie.hpp>

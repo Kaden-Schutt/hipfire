@@ -2,36 +2,71 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// AIE2 BF16 fused per-head QK norm + RoPE rotation kernel.
+// AIE2 BF16 fused per-head QK norm + RoPE rotation kernel (ACTIVE)
 //
-// Replaces two sequential NPU dispatches (headnorm + rope) with a single
-// kernel invocation per head.  At 28 layers × 4 dispatches saved per layer,
-// this recovers ~9.5 ms per decode step on Phoenix APU.
+// Fuses two operations that would otherwise require separate NPU dispatches
+// (headnorm then rope) into a single kernel invocation per head. At 28 layers
+// × 4 dispatches saved per layer, this recovers ~9.5 ms per decode step on
+// Phoenix APU relative to running rms_norm_head_bf16 + rope_rotate_bf16.
 //
-// Inputs / tensor param layout:
-//   input           : [head_dim] bf16   — one head (tiled by IRON)
-//   output          : [head_dim] bf16
-//   packed_weight_cs: [head_dim + n_rot] bf16 — tensor param acquired once
-//                       [0, head_dim)  = per-head norm weight
+// ── Inputs / output ──────────────────────────────────────────────────────────
+//   input           : [head_dim] bf16   — one attention head (tiled by IRON)
+//   output          : [head_dim] bf16   — normed + rotated head
+//   packed_weight_cs: [head_dim + n_rot] bf16 — tensor param, acquired once:
+//                       [0, head_dim)            = per-head norm weight (gamma)
 //                       [head_dim, head_dim+n_rot) = cos/sin buffer
-//                       (n_rot = head_dim / 4; Qwen3.5 partial_rotary_factor=0.25)
-//   head_dim        : int32 (auto-appended by IRON as 'n')
+//   head_dim        : int32             — tile size (auto-appended by IRON)
 //
-// cos/sin buffer layout: [cos_0..cos_{n_rot2-1}, sin_0..sin_{n_rot2-1}]
-// where n_rot2 = n_rot / 2 = head_dim / 8.
+//   n_rot  = head_dim / 4   (Qwen3.5 partial_rotary_factor = 0.25)
+//   n_rot2 = n_rot / 2      (head_dim / 8; number of (x, y) pairs)
 //
-// Algorithm per head:
-//   Pass 1: compute sum(x_i^2) for RMS → inv_rms = 1/sqrt(mean_sq + eps)
-//   Pass 2 (rotation region [0, n_rot)):
-//     x_n   = x[i]       * weight[i]       * inv_rms
-//     y_n   = x[i+n_rot2]* weight[i+n_rot2]* inv_rms
-//     out[i]       = x_n*cos[i] - y_n*sin[i]
-//     out[i+n_rot2] = y_n*cos[i] + x_n*sin[i]
-//   Pass 3 (passthrough region [n_rot, head_dim)):
-//     out[j] = x[j] * weight[j] * inv_rms
+// ── cos/sin sub-buffer layout ────────────────────────────────────────────────
+//   cs[0 .. n_rot2)         = cos values for positions 0 .. n_rot2-1
+//   cs[n_rot2 .. n_rot)     = sin values for positions 0 .. n_rot2-1
+//   Half-split layout, matching the GPU rope_partial_halfsplit_f32 format
+//   produced by qwen35.rs build_rope_cs().
 //
-// Constraints (all hold for Qwen3.5 default head_dim=256, n_rot=64):
-//   head_dim divisible by 16; n_rot2 divisible by 16; (head_dim-n_rot) divisible by 16.
+// ── Algorithm per head ───────────────────────────────────────────────────────
+//   Pass 1: sum(x[i]²) for i in [0, head_dim) → inv_rms = 1/sqrt(mean + ε)
+//   Pass 2 (rotation region, i in [0, n_rot2)):
+//     x_n = x[i]       * weight[i]       * inv_rms
+//     y_n = x[i+n_rot2]* weight[i+n_rot2]* inv_rms
+//     output[i]        = x_n * cos[i] - y_n * sin[i]
+//     output[i+n_rot2] = y_n * cos[i] + x_n * sin[i]
+//   Pass 3 (passthrough region, i in [n_rot, head_dim)):
+//     output[i] = x[i] * weight[i] * inv_rms
+//
+// ── IRON dispatch pattern ────────────────────────────────────────────────────
+//   _transform_gen, single-core: tile_size = head_dim,
+//   N_div_n = n_heads (for Q) or n_kv_heads (for K).
+//   packed_weight_cs is a tensor param — same buffer reused for all heads.
+//   The norm weight is shared across all Q (or K) heads; cos/sin is per-token
+//   and updated by the host before each decode step.
+//
+// ── Shape constraints ────────────────────────────────────────────────────────
+//   head_dim           % 16 == 0   (VEC=16, all passes)
+//   n_rot2 = head_dim/8 % 16 == 0  (rotation region in pass 2)
+//   head_dim - n_rot   % 16 == 0   (passthrough region in pass 3)
+//   For Qwen3.5 head_dim=256: n_rot2=32, passthrough=192 — all ✓
+//
+// ── Built xclbins (target/npu/) ──────────────────────────────────────────────
+//   Q (n_heads Q heads):
+//     qwen35-headnorm-rope-q-8h256d.xclbin   — 0.8B/1.5B/2B (8 Q, head_dim=256)
+//     qwen35-headnorm-rope-q-16h256d.xclbin  — 4B/9B         (16 Q, head_dim=256)
+//   K (n_kv_heads KV heads):
+//     qwen35-headnorm-rope-k-2h256d.xclbin   — 0.8B/1.5B/2B (2 KV, head_dim=256)
+//     qwen35-headnorm-rope-k-4h256d.xclbin   — 4B/9B         (4 KV, head_dim=256)
+//   Naming: qwen35-headnorm-rope-{q|k}-{n_heads}h{head_dim}d.xclbin + -instr.bin
+//
+// ── Integration status ───────────────────────────────────────────────────────
+//   ACTIVE — wired via try_npu_headnorm_rope() in qwen35.rs FullAttention path.
+//   Called at 4 sites per layer (Q-pre-rope, K-pre-rope dispatches for both
+//   Q and K tensors). Data path: GPU F32 → BF16 → NPU → BF16 → F32 → GPU.
+//   Confirmed working: 0.8B, 4B, 9B BF16 and MQ4.
+//
+// ── AIE2 vs AIE2P ───────────────────────────────────────────────────────────
+//   No arch-specific code. aie::invsqrt() is available on AIE2 (NPU1/Phoenix),
+//   AIE2P (NPU2/Strix), and AIE1. No tanh/exp — only arithmetic operations.
 
 #include <aie_api/aie.hpp>
 

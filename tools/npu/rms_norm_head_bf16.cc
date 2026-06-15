@@ -2,21 +2,58 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// AIE2 BF16 kernel: per-head RMSNorm (QK head norm)
+// AIE2 BF16 per-head RMSNorm kernel (QK head norm)
 //
-// Applies weighted RMSNorm to a single head's data [head_dim] using a shared
-// weight vector that is the same for all heads. The IRON _transform_gen
-// framework calls this once per head; the weight is a tensor param acquired
-// once for all head iterations (rather than a tiled input duplicated n_heads
-// times).
+// Applies weighted RMSNorm independently to each head in Q or K using a
+// shared weight vector that is the same for every head. The IRON
+// _transform_gen framework calls this once per head; the weight is a tensor
+// param acquired once and reused across all head iterations, rather than
+// being duplicated n_heads times in the input stream.
 //
-// C signature follows the _transform_gen arg order:
-//   (input=elem_in, output=elem_out, weight=param0, head_dim=auto-n)
-// Compare rms_norm_weighted_bf16.cc which uses (input, weight, output, cols)
-// — input and weight are both tiled there; here weight is a tensor param.
+// This is a stepping-stone kernel superseded by headnorm_rope_bf16.cc, which
+// fuses this norm with the subsequent RoPE rotation in a single dispatch.
 //
-// Same math as rms_norm_weighted_bf16: two-pass, float32 accumulator.
-// head_dim must be a multiple of 16.
+// ── Inputs / output ──────────────────────────────────────────────────────────
+//   input    : [head_dim] bf16   — one attention head's activations (tiled)
+//   output   : [head_dim] bf16   — (x / rms(x)) * weight
+//   weight   : [head_dim] bf16   — learned norm scale (tensor param, const)
+//   head_dim : int32             — tile size (auto-appended by IRON as 'n')
+//
+//   C signature: rms_norm_head_bf16(input, output, weight, head_dim)
+//   Note: arg order differs from rms_norm_weighted_bf16(input, weight, output, cols)
+//   because _transform_gen places the tensor param after both I/O pointers.
+//
+// ── Computation ──────────────────────────────────────────────────────────────
+//   rms(x)   = sqrt(mean(x²) + ε),   ε = 1e-5
+//   out[i]   = (x[i] / rms(x)) * weight[i]
+//   Same math as rms_norm_weighted_bf16; only the IRON wiring differs.
+//
+// ── IRON dispatch pattern ────────────────────────────────────────────────────
+//   _transform_gen, single-core: tile_size = head_dim, N_div_n = n_heads or n_kv_heads.
+//   Weight is a tensor param (buffer acquired once before the head loop, held
+//   across all N_div_n invocations). Contrast with rms_norm_weighted_bf16.cc
+//   where both input AND weight are tiled in the input stream.
+//   IRON calls this kernel N_div_n times with:
+//     - different input/output pointers (one head each)
+//     - the same weight pointer (tensor param, no copy)
+//
+// ── Shape constraints ────────────────────────────────────────────────────────
+//   head_dim % 16 == 0   (vector width)
+//
+// ── Built xclbins (target/npu/) ──────────────────────────────────────────────
+//   Q norm (n_heads Q heads):
+//     qwen35-headnorm-q-8h256d.xclbin   — 0.8B/1.5B/2B  (8 Q heads, head_dim=256)
+//     qwen35-headnorm-q-16h256d.xclbin  — 4B/9B          (16 Q heads, head_dim=256)
+//   K norm (n_kv_heads KV heads):
+//     qwen35-headnorm-k-2h256d.xclbin   — 0.8B/1.5B/2B  (2 KV heads, head_dim=256)
+//     qwen35-headnorm-k-4h256d.xclbin   — 4B/9B          (4 KV heads, head_dim=256)
+//   Naming: qwen35-headnorm-{q|k}-{n_heads}h{head_dim}d.xclbin + -instr.bin
+//
+// ── Integration status ───────────────────────────────────────────────────────
+//   NOT wired in the active path. Superseded by headnorm_rope_bf16.cc (#5),
+//   which fuses this norm with RoPE rotation in one dispatch and avoids a
+//   second xclbin load plus separate host round-trip for cos/sin.
+//   At 28 layers × 4 heads × 2 (Q+K) = 224 fewer dispatches per decode step.
 
 #include "aie_kernels/aie_kernel_utils.h"
 #include <aie_api/aie.hpp>

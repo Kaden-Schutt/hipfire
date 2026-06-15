@@ -2,14 +2,50 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// AIE2 BF16 kernel: out[i] = silu(gate[i]) * up[i]
+// AIE2 BF16 SwiGLU kernel: out[i] = silu(gate[i]) * up[i]
 //
 // Used in the Qwen3.5 dense FFN NPU path after the gate/up projections have
 // already been computed on the GPU.  Adapted from the aie2/swiglu.cc kernel
 // shipped with mlir_aie; simplified to remove the weight-matmul fuse.
-// tile_size (n) must be a multiple of 16.
 //
-// AIE2 note: uses getTanhBf16() (LUT-based) not aie::tanh() (AIE2P hardware).
+// ── Inputs / output ──────────────────────────────────────────────────────────
+//   gate   : [hidden_size] bf16   — gate projection output (tiled by IRON)
+//   up     : [hidden_size] bf16   — up projection output   (tiled by IRON)
+//   out    : [hidden_size] bf16   — silu(gate) * up
+//   n      : int32               — tile_size (auto-appended by IRON)
+//
+// ── Computation ──────────────────────────────────────────────────────────────
+//   sigmoid(g) = 0.5 * (1 + tanh(0.5 * g))
+//   silu(g)    = g * sigmoid(g)
+//   out[i]     = silu(gate[i]) * up[i]
+//
+// ── IRON dispatch pattern ────────────────────────────────────────────────────
+//   transform_parallel_binary — work split equally across all 4 NPU columns.
+//   Default tile_size=16; hidden_size must be divisible by tile_size × num_cols
+//   = 64 on NPU1 (4 compute columns).
+//
+// ── Shape constraints ────────────────────────────────────────────────────────
+//   tile_size   % 16 == 0   (vector alignment)
+//   hidden_size % 64 == 0   (tile_size × 4 columns; NPU1 has 4 compute cols)
+//
+// ── Built xclbins (target/npu/) ──────────────────────────────────────────────
+//   qwen35-swiglu-3584.xclbin   — 0.8B FFN intermediate (hidden=1024)
+//   qwen35-swiglu-6144.xclbin   — 2B   FFN intermediate (hidden=2048)
+//   qwen35-swiglu-8960.xclbin   — 1.5B FFN intermediate (hidden=1536)
+//   qwen35-swiglu-9216.xclbin   — 4B   FFN intermediate (hidden=2560)
+//   qwen35-swiglu-12288.xclbin  — (reserved)
+//   qwen35-swiglu-18944.xclbin  — 9B   FFN intermediate (hidden=4096)
+//   Naming: qwen35-swiglu-{hidden_size}.xclbin + -instr.bin
+//
+// ── Integration status ───────────────────────────────────────────────────────
+//   Wired: HIPFIRE_QWEN35_FFN_BF16=xdna1  (opt-in env var)
+//   Perf note: net-slower than GPU at 0.8B — dispatch overhead (~180 µs × 24
+//   layers = 4.3 ms) exceeds GPU SwiGLU cost (~0.3 ms total). Only beneficial
+//   when GPU is fully saturated or model decode is >100 ms/tok.
+//
+// ── AIE2 vs AIE2P ───────────────────────────────────────────────────────────
+//   AIE2  (__AIE_ARCH__==20, NPU1/Phoenix): getTanhBf16() LUT-based tanh
+//   AIE2P (__AIE_ARCH__==21, NPU2/Strix+): aie::tanh() hardware instruction
 
 #include "aie_kernels/aie_kernel_utils.h"
 #include <aie_api/aie.hpp>
@@ -45,7 +81,6 @@ static void silu_mul_bf16_inner(bfloat16 *restrict gate, bfloat16 *restrict up,
     // Use explicit vector<bfloat16,16> for all intermediates — aie::mul returns
     // accum<__accfloat,16> and using auto keeps it as accum, which breaks chained
     // mul/add calls (no vec×accum overload exists).
-    // sigmoid(g) = 0.5 * (1 + tanh(0.5*g))
     //
     // The two paths have different intermediate types so the whole block is
     // gated.  AIE2: aie::mul returns accum but we must use explicit

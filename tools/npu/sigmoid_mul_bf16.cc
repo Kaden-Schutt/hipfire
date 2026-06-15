@@ -2,23 +2,49 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// AIE2 BF16 kernel: out[i] = sigmoid(gate[i]) * x[i]
+// AIE2 BF16 attention output gate kernel: out[i] = sigmoid(gate[i]) * x[i]
 //
-// Used for the Qwen3.5 attention output gate:
-//   gate_vec = sigmoid(gate_vec)   [in-place on GPU: gpu.sigmoid_f32]
-//   attn_out = attn_out * gate_vec [gpu.mul_f32]
-// Here they are fused into a single NPU dispatch.
+// Fuses two GPU ops that the Qwen3.5 FullAttention path runs after attention:
+//   gpu.sigmoid_f32(gate)          [in-place sigmoid on gate vector]
+//   gpu.mul_f32(attn_out, gate)    [elementwise multiply]
+// Both are replaced by a single NPU dispatch of this kernel.
 //
-// sigmoid(g) = 0.5 * (1 + tanh(0.5 * g))
-//   AIE2  (__AIE_ARCH__==20): getLUT-based getTanhBf16
-//   AIE2P (__AIE_ARCH__==21): hardware aie::tanh
+// ── Inputs / output ──────────────────────────────────────────────────────────
+//   gate   : [n_heads × head_dim] bf16   — attention gate vector (tiled)
+//   x      : [n_heads × head_dim] bf16   — attention output to scale (tiled)
+//   out    : [n_heads × head_dim] bf16   — sigmoid(gate) * x
+//   n      : int32                       — tile_size (auto-appended by IRON)
 //
-// Contrast with silu_mul_bf16.cc (SwiGLU):
-//   SwiGLU: out = (gate * sigmoid(gate)) * up   [2 muls per element]
-//   This:   out = sigmoid(gate) * x             [1 mul per element]
+// ── Computation ──────────────────────────────────────────────────────────────
+//   sigmoid(g) = 0.5 * (1 + tanh(0.5 * g))
+//   out[i]     = sigmoid(gate[i]) * x[i]
 //
-// tile_size (n) must be a multiple of 16.
-// Total elements (n_heads × head_dim) must be a multiple of tile_size × 4.
+//   Contrast with silu_mul_bf16.cc (SwiGLU):
+//     SwiGLU: out = (g * sigmoid(g)) * up   — gate multiplied back in (2 muls)
+//     This:   out = sigmoid(gate) * x        — plain sigmoid gate (1 mul)
+//
+// ── IRON dispatch pattern ────────────────────────────────────────────────────
+//   transform_parallel_binary — work split across all 4 NPU columns.
+//   Default tile_size=16; (n_heads × head_dim) must be divisible by 64.
+//   For 0.8B: 8h × 256d = 2048 elements, 2048 % 64 == 0 ✓
+//   For 4B/9B: 16h × 256d = 4096 elements, 4096 % 64 == 0 ✓
+//
+// ── Shape constraints ────────────────────────────────────────────────────────
+//   tile_size              % 16 == 0   (vector alignment)
+//   n_heads × head_dim     % 64 == 0   (tile_size × 4 columns)
+//
+// ── Built xclbins (target/npu/) ──────────────────────────────────────────────
+//   qwen35-attn-gate-8h256d.xclbin   — 0.8B/1.5B/2B  (8 Q heads, 256 head_dim)
+//   qwen35-attn-gate-16h256d.xclbin  — 4B/9B          (16 Q heads, 256 head_dim)
+//   Naming: qwen35-attn-gate-{n_heads}h{head_dim}d.xclbin + -instr.bin
+//
+// ── Integration status ───────────────────────────────────────────────────────
+//   Wired: try_npu_attn_gate() in qwen35.rs FullAttention path (after attention
+//   output, before residual add). Active when xclbin is present in target/npu/.
+//
+// ── AIE2 vs AIE2P ───────────────────────────────────────────────────────────
+//   AIE2  (__AIE_ARCH__==20, NPU1/Phoenix): getTanhBf16() LUT-based tanh
+//   AIE2P (__AIE_ARCH__==21, NPU2/Strix+): aie::tanh() hardware instruction
 
 #include "aie_kernels/aie_kernel_utils.h"
 #include <aie_api/aie.hpp>
